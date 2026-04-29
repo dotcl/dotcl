@@ -1,0 +1,46 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <!-- net10.0-windows so the MonoGame.Framework.WindowsDX package
+         (ships against net8.0-windows7.0) resolves via NuGet's compat
+         layer. Plain net10.0 doesn't match. -->
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <!-- MonoGame.Library.SDL ships SDL2.dll only for win-x64; on Snapdragon
+         Windows ARM64 the native-arm64 build doesn't exist, so force x64
+         and let Prism emulation run the whole process. Performance hit is
+         acceptable for a dev sample. -->
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <RootNamespace>MonoGameLispDemo</RootNamespace>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RollForward>Major</RollForward>
+
+    <!-- #166 project-core flow: Dotcl.targets walks .asd, compiles main.lisp,
+         writes manifest. Runtime side just calls Initialize + LoadFromManifest. -->
+    <DotclProjectAsd>$(MSBuildProjectDirectory)/MonoGameLispDemo.asd</DotclProjectAsd>
+    <DotclRuntimeProject>$(MSBuildProjectDirectory)/../../runtime/runtime.csproj</DotclRuntimeProject>
+    <DotclBaseCore>$(MSBuildProjectDirectory)/../../compiler/dotcl.core</DotclBaseCore>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Remove="main.lisp" />
+    <None Remove="MonoGameLispDemo.asd" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- DesktopGL = SDL2 + OpenGL backend. WindowsDX (SharpDX) didn't render
+         on Snapdragon Windows ARM64; DesktopGL has better ARM64 coverage
+         since SDL2 is multi-arch. -->
+    <PackageReference Include="MonoGame.Framework.DesktopGL" Version="3.8.*" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\runtime\runtime.csproj">
+      <AdditionalProperties>DotclAsLibrary=true;RuntimeIdentifier=</AdditionalProperties>
+    </ProjectReference>
+  </ItemGroup>
+
+  <Import Project="..\..\runtime\build\Dotcl.targets" />
+
+</Project>

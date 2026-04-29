@@ -1,0 +1,40 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+	<PropertyGroup>
+		<OutputType>Exe</OutputType>
+		<TargetFramework>net10.0</TargetFramework>
+		<RootNamespace>McpServerDemo</RootNamespace>
+		<ImplicitUsings>enable</ImplicitUsings>
+		<Nullable>enable</Nullable>
+	</PropertyGroup>
+
+	<ItemGroup>
+		<!-- C# MCP SDK (modelcontextprotocol/csharp-sdk).
+		     ModelContextProtocol = Core + Hosting/DI (stdio) 一式。 -->
+		<PackageReference Include="ModelContextProtocol" Version="1.2.0" />
+		<PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.0" />
+	</ItemGroup>
+
+	<!-- dotcl runtime (Library) を参照。CoreCLR で Reflection.Emit ベースの
+	     コンパイラ/ランタイムがそのまま動く。 -->
+	<ItemGroup>
+		<ProjectReference Include="..\..\runtime\runtime.csproj" />
+	</ItemGroup>
+
+	<!-- Bundle dotcl.core next to the exe so DotclHost.FindCore() picks it
+	     up at startup. -->
+	<ItemGroup>
+		<None Include="..\..\compiler\dotcl.core" Link="dotcl.core"
+		      Condition="Exists('..\..\compiler\dotcl.core')">
+			<CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+		</None>
+	</ItemGroup>
+
+	<!-- Bundle contrib/ (for any (require :dotnet-class) etc.). -->
+	<ItemGroup>
+		<None Include="..\..\contrib\**\*.lisp" LinkBase="contrib">
+			<CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+		</None>
+	</ItemGroup>
+
+</Project>

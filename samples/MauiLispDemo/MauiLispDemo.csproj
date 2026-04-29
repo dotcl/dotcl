@@ -1,0 +1,106 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+	<PropertyGroup>
+		<!-- Windows desktop default. Android support is opt-in via
+		     /p:UseAndroid=true (requires `dotnet workload install
+		     maui-android` + Android SDK/emulator). Android uses Mono
+		     backend where Reflection.Emit still works, so dotcl (compiler
+		     and runtime both Emit-based) runs natively. iOS / MacCatalyst
+		     are out of scope (Phase 3 / issue #161 tracks IL2CPP). -->
+		<TargetFramework Condition="'$(UseAndroid)' != 'true'">net10.0-windows10.0.19041.0</TargetFramework>
+		<TargetFrameworks Condition="'$(UseAndroid)' == 'true'">net10.0-windows10.0.19041.0;net10.0-android</TargetFrameworks>
+
+		<OutputType>Exe</OutputType>
+		<RootNamespace>MauiLispDemo</RootNamespace>
+		<UseMaui>true</UseMaui>
+		<SingleProject>true</SingleProject>
+		<ImplicitUsings>enable</ImplicitUsings>
+		<Nullable>enable</Nullable>
+
+		<!-- Runtime XAML inflation so MAUI doesn't run the source-gen pass
+		     (which expects x:Class to resolve to a C# partial class —
+		     Lisp-defined types don't exist until dotcl starts). -->
+		<MauiXamlInflator>Runtime</MauiXamlInflator>
+
+		<ApplicationTitle>MauiLispDemo</ApplicationTitle>
+		<ApplicationId>com.dotcl.mauilispdemo</ApplicationId>
+		<ApplicationDisplayVersion>0.1</ApplicationDisplayVersion>
+		<ApplicationVersion>1</ApplicationVersion>
+
+		<WindowsPackageType>None</WindowsPackageType>
+
+		<!-- #166 project-core build: Dotcl.targets walks MauiLispDemo.asd's
+		     :depends-on, copies dependency fasls + dotcl.core into a bundle
+		     dir, compiles main.lisp into MauiLispDemo.fasl, writes a manifest,
+		     and injects the lot as <None>/<MauiAsset> items so they land in
+		     the published output / APK. -->
+		<DotclProjectAsd>$(MSBuildProjectDirectory)/MauiLispDemo.asd</DotclProjectAsd>
+		<DotclRuntimeProject>$(MSBuildProjectDirectory)/../../runtime/runtime.csproj</DotclRuntimeProject>
+		<DotclBaseCore>$(MSBuildProjectDirectory)/../../compiler/dotcl.core</DotclBaseCore>
+	</PropertyGroup>
+
+	<!-- Platform-version pinning (Windows vs Android は意味が違うので分ける) -->
+	<PropertyGroup Condition="$(TargetFramework.Contains('-windows'))">
+		<SupportedOSPlatformVersion>10.0.17763.0</SupportedOSPlatformVersion>
+		<TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
+	</PropertyGroup>
+	<PropertyGroup Condition="$(TargetFramework.Contains('-android'))">
+		<!-- Android 5.0 (API 21) minimum; 多くのデバイスをカバー -->
+		<SupportedOSPlatformVersion>21.0</SupportedOSPlatformVersion>
+		<!-- Embed .NET assemblies inside the APK. Default in Debug is
+		     false (Fast Deployment expects a separate adb push step that
+		     plain `adb install` doesn't perform), and the runtime aborts
+		     with "No assemblies found in /data/.../files/.__override__/arm64-v8a"
+		     when assemblies are missing. Force on for a self-contained APK. -->
+		<EmbedAssembliesIntoApk>true</EmbedAssembliesIntoApk>
+	</PropertyGroup>
+
+	<ItemGroup>
+		<MauiIcon Include="Resources\AppIcon\appicon.svg" ForegroundFile="Resources\AppIcon\appiconfg.svg" Color="#512BD4" />
+		<MauiSplashScreen Include="Resources\Splash\splash.svg" Color="#512BD4" BaseSize="128,128" />
+	</ItemGroup>
+
+	<ItemGroup>
+		<PackageReference Include="Microsoft.Maui.Controls" Version="$(MauiVersion)" />
+		<PackageReference Include="Microsoft.Extensions.Logging.Debug" Version="10.0.0" />
+	</ItemGroup>
+
+	<!-- main.lisp is registered with ASDF (MauiLispDemo.asd's :components),
+	     so Dotcl.targets compiles it into MauiLispDemo.fasl at build time.
+	     Stop the SDK's default <None> from picking it up as a copyable
+	     content file. -->
+	<ItemGroup>
+		<None Remove="main.lisp" />
+		<None Remove="MauiLispDemo.asd" />
+	</ItemGroup>
+
+	<!-- dotcl runtime.
+	     - DotclAsLibrary=true: OutputType=Library 化 (Exe 参照不可な MAUI Android
+	       self-contained 環境で NETSDK1150 を回避)
+	     - RuntimeIdentifier=: inner build で RID を空にリセット。runtime は
+	       pure managed なので per-RID build 不要、no-RID の runtime.dll を
+	       MAUI 側が全 RID で使い回す。 -->
+	<ItemGroup>
+		<ProjectReference Include="..\..\runtime\runtime.csproj">
+			<AdditionalProperties>DotclAsLibrary=true;RuntimeIdentifier=</AdditionalProperties>
+		</ProjectReference>
+	</ItemGroup>
+
+	<!-- MainPage.xaml embedded as an assembly manifest resource (D795).
+	     Bypasses the MauiXaml / XamlC pipeline (which expects x:Class to
+	     be a C# partial class), while still giving us the conventional
+	     single-binary distribution. Lisp pulls it via
+	     Assembly.GetManifestResourceStream. -->
+	<ItemGroup>
+		<MauiXaml Remove="MainPage.xaml" />
+		<Content Remove="MainPage.xaml" />
+		<None Remove="MainPage.xaml" />
+		<EmbeddedResource Remove="MainPage.xaml" />
+		<EmbeddedResource Include="MainPage.xaml">
+			<LogicalName>MauiLispDemo.MainPage.xaml</LogicalName>
+		</EmbeddedResource>
+	</ItemGroup>
+
+	<Import Project="..\..\runtime\build\Dotcl.targets" />
+
+</Project>

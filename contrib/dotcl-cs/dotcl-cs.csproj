@@ -1,0 +1,34 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <OutputType>Library</OutputType>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>DotCL.Contrib.DotclCs</AssemblyName>
+    <RootNamespace>DotCL.Contrib.DotclCs</RootNamespace>
+    <!-- Don't pollute the runtime's PackAsTool metadata -->
+    <PackAsTool>false</PackAsTool>
+    <!-- We ship only Roslyn + our helper DLL via lib/ — the runtime DLL is
+         already in the tool package, so suppress its copy. -->
+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+    <!-- Keep only English satellite resources; Roslyn ships translations in
+         14 locales which adds ~4MB of bloat we don't need. -->
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="4.11.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Need LispObject / IlDisasm types at compile time. Private=false keeps
+         runtime.dll out of the published output (already in tool package). -->
+    <ProjectReference Include="..\..\runtime\runtime.csproj">
+      <Private>false</Private>
+      <ExcludeAssets>runtime</ExcludeAssets>
+    </ProjectReference>
+  </ItemGroup>
+
+</Project>

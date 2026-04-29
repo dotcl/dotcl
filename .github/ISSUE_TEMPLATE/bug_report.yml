@@ -1,0 +1,51 @@
+name: Bug report
+description: Something doesn't work as expected
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a bug! Please fill in the fields below.
+  - type: input
+    id: dotnet-version
+    attributes:
+      label: .NET SDK version
+      description: Output of `dotnet --version`
+      placeholder: "10.0.100"
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: OS / CPU architecture
+      placeholder: "Ubuntu 24.04 / x86_64"
+    validations:
+      required: true
+  - type: input
+    id: dotcl-version
+    attributes:
+      label: dotcl version or commit hash
+      placeholder: "v0.1.0 or abc1234"
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: A minimal Lisp form, file, or command sequence that triggers the bug.
+      render: lisp
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behaviour
+      description: Include error messages, stack traces, or unexpected output.
+    validations:
+      required: true

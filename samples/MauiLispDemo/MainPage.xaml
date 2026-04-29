@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ContentPage xmlns="http://schemas.microsoft.com/dotnet/2021/maui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2009/xaml"
+             x:Class="MauiLispDemo.MainPage"
+             Title="dotcl Lisp demo">
+    <Grid RowDefinitions="Auto,2*,3*,Auto,Auto"
+          Padding="12" RowSpacing="8">
+
+        <Label Grid.Row="0"
+               Text="dotcl Lisp demo — select a snippet, edit, evaluate"
+               FontSize="16"
+               HorizontalOptions="Center" />
+
+        <CollectionView Grid.Row="1"
+                        ItemsSource="{Binding Snippets}"
+                        SelectedItem="{Binding SelectedSnippet, Mode=TwoWay}"
+                        SelectionMode="Single">
+            <CollectionView.ItemTemplate>
+                <DataTemplate>
+                    <Label Text="{Binding Title}"
+                           FontSize="16"
+                           Padding="8,6" />
+                </DataTemplate>
+            </CollectionView.ItemTemplate>
+        </CollectionView>
+
+        <Editor Grid.Row="2"
+                Text="{Binding SelectedSnippet.Source, Mode=TwoWay}"
+                FontSize="13"
+                IsSpellCheckEnabled="False"
+                IsTextPredictionEnabled="False" />
+
+        <HorizontalStackLayout Grid.Row="3"
+                               HorizontalOptions="End"
+                               Spacing="8">
+            <Button Text="🌐"
+                    Command="{Binding ToggleLanguageCommand}" />
+            <Button Text="▶ Run my-click"
+                    Command="{Binding RunCommand}" />
+            <Button Text="{Binding EvaluateButtonText}"
+                    Command="{Binding EvaluateCommand}" />
+        </HorizontalStackLayout>
+
+        <Label Grid.Row="4"
+               Text="{Binding Result}"
+               FontSize="13"
+               LineBreakMode="CharacterWrap" />
+    </Grid>
+</ContentPage>

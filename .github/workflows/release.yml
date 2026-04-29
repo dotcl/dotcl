@@ -1,0 +1,132 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # ── Job 1: run regression tests (subset of CI) ──────────────────────────
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Setup Roswell
+        run: |
+          curl -L https://raw.githubusercontent.com/roswell/roswell/master/scripts/install-for-ci.sh | bash
+          echo "$HOME/.roswell/bin" >> $GITHUB_PATH
+
+      - name: Cross-compile
+        run: make cross-compile
+
+      - name: Build
+        run: make build
+
+      - name: Regression tests (170/170 required)
+        run: make test-regression
+
+  # ── Job 2: build nupkg and create GitHub Release ────────────────────────
+  release:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write   # required by softprops/action-gh-release
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Setup Roswell
+        run: |
+          curl -L https://raw.githubusercontent.com/roswell/roswell/master/scripts/install-for-ci.sh | bash
+          echo "$HOME/.roswell/bin" >> $GITHUB_PATH
+
+      - name: Extract version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+
+      # ── Compiler SIL output ──────────────────────────────────────────────
+      - name: Cross-compile (generate cil-out.sil)
+        run: make cross-compile
+
+      # ── FASL artifacts ───────────────────────────────────────────────────
+      # compile-core-fasl: cil-out.sil → compiler/dotcl.core (PE assembly)
+      - name: Compile core FASL
+        run: make compile-core-fasl
+
+      # compile-asdf-fasl: contrib/asdf/asdf.lisp → contrib/asdf/asdf.fasl
+      - name: Compile asdf FASL
+        run: make compile-asdf-fasl
+
+      # contrib-dotcl-cs: publish Roslyn helper DLL into contrib/dotcl-cs/lib/
+      - name: Build dotcl-cs contrib
+        run: make contrib-dotcl-cs
+
+      # ── Stage runtime/contrib/ (mirrors the pack target, minus R2R) ──────
+      # This replicates what `make pack` does but intentionally omits the
+      # win-arm64 R2R steps (compile-core-fasl-r2r-win-arm64 / crossgen2)
+      # that require Windows tooling.  Multi-RID R2R support is tracked in
+      # issue #131 and will be added as a follow-up.
+      - name: Stage contrib for packing
+        run: |
+          rm -rf runtime/contrib
+          cp compiler/dotcl.core runtime/dotcl.core
+          mkdir -p runtime/contrib/asdf
+          cp -r contrib/*/ runtime/contrib/
+          rm -f runtime/contrib/asdf/asdf.lisp runtime/contrib/asdf/asdf.sil
+          rm -rf runtime/contrib/dotcl-cs/bin runtime/contrib/dotcl-cs/obj
+          rm -f runtime/contrib/dotcl-cs/*.csproj runtime/contrib/dotcl-cs/*.cs
+          cp contrib/asdf/asdf.fasl runtime/contrib/asdf/asdf.fasl
+
+      # ── dotnet pack (any RID, no R2R) ────────────────────────────────────
+      - name: Pack NuGet package
+        run: |
+          mkdir -p out
+          dotnet pack runtime/runtime.csproj \
+            --configuration Release \
+            -o out/ \
+            -p:Version=${{ steps.version.outputs.VERSION }} \
+            -p:RuntimeIdentifiers=any \
+            -p:PublishReadyToRun=false
+
+      # ── Clean up staged runtime files ────────────────────────────────────
+      - name: Clean staged artifacts from runtime/
+        run: |
+          rm -f runtime/dotcl.core
+
+      # ── Create GitHub Release and upload nupkg ───────────────────────────
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: out/*.nupkg
+          generate_release_notes: true
+
+      # TODO (NuGet publish): Once NUGET_API_KEY is added as a repository
+      # secret, uncomment the step below to publish to NuGet.org automatically.
+      #
+      # - name: Publish to NuGet.org
+      #   run: |
+      #     dotnet nuget push out/*.nupkg \
+      #       --api-key ${{ secrets.NUGET_API_KEY }} \
+      #       --source https://api.nuget.org/v3/index.json \
+      #       --skip-duplicate

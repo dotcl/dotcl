@@ -1,0 +1,120 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+    paths-ignore:
+      - 'ansi-state.json'
+      - 'bench-state.json'
+      - 'docs/decisions/**'
+  pull_request:
+    branches: [master]
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Runner info
+        run: |
+          echo "=== CPU ===" && lscpu | grep -E 'Model name|^CPU\(s\)|Thread'
+          echo "=== Memory ===" && free -h
+          echo "=== Disk ===" && df -h /
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Setup Roswell
+        run: |
+          curl -L https://raw.githubusercontent.com/roswell/roswell/master/scripts/install-for-ci.sh | bash
+          echo "$HOME/.roswell/bin" >> $GITHUB_PATH
+
+      - name: Cross-compile
+        run: make cross-compile
+
+      - name: Build
+        run: make build
+
+      - name: ANSI tests
+        run: make test-ansi-all STDBUF="stdbuf -oL" 2>&1 | tee /tmp/ansi-summary.txt || true
+
+      - name: Generate failure details
+        if: always()
+        run: |
+          for f in /tmp/ansi-*.txt; do
+            [ -f "$f" ] || continue
+            grep -a -A 8 "^Test .* failed" "$f" 2>/dev/null | grep -a -E "^Test .* failed|^Form:|^Expected|^Actual|^          " | grep -v "^--$"
+          done > /tmp/ansi-failures.txt || true
+
+      - name: Upload test outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ansi-test-outputs
+          path: |
+            /tmp/ansi-*.txt
+            /tmp/ansi-failures.txt
+            /tmp/ansi-summary.txt
+
+      - name: Update ansi-state.json
+        run: make update-ansi-state
+
+      - name: Benchmarks
+        run: make bench-state || true
+
+      - name: Disk usage (after)
+        if: always()
+        run: df -h / && du -sh /tmp/ansi-*.txt 2>/dev/null || true
+
+      - name: Show results
+        if: always()
+        run: |
+          {
+            echo "## ANSI Test Results"
+            echo ""
+            if [ -f /tmp/ansi-summary.txt ]; then
+              echo '### Per-category (pass / elapsed / alloc)'
+              echo '```'
+              # Keep only result + TOTAL lines, drop build noise
+              grep -E '^(cons|strings|sequences|data-and-control-flow|hash-tables|symbols|arrays|types-and-classes|characters|pathnames|files|system-construction|iteration|eval-and-compile|conditions|printer|environment|structures|packages|objects|reader|numbers|streams|misc):|^TOTAL:|^GC TOTAL:' /tmp/ansi-summary.txt
+              echo '```'
+              echo ''
+            fi
+            if [ -f ansi-state.json ]; then
+              echo '```json'
+              cat ansi-state.json
+              echo '```'
+            else
+              echo "ansi-state.json not generated"
+            fi
+            echo ""
+            echo "## Failed Tests (details)"
+            echo ""
+            if [ -s /tmp/ansi-failures.txt ]; then
+              echo '```'
+              head -1000 /tmp/ansi-failures.txt
+              echo '```'
+            else
+              echo "No failures found in output files"
+            fi
+            echo ""
+            echo "## Benchmark Results"
+            echo ""
+            if [ -f bench-state.json ]; then
+              echo '```json'
+              cat bench-state.json
+              echo '```'
+            else
+              echo "bench-state.json not generated"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
