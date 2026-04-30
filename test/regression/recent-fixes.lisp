@@ -1080,3 +1080,100 @@
           (with-open-file (s file :direction :input)
             (read-line s))))
   (t t "longpath-ok"))
+
+;;; D899 (#125) — TCO for labels self-recursion: should not stack overflow
+(deftest d899-labels-self-tco-basic
+  (labels ((count-down (n)
+             (if (= n 0) :done (count-down (- n 1)))))
+    (count-down 200000))
+  :done)
+
+;;; D899 (#125) — labels self-TCO with accumulator
+(deftest d899-labels-self-tco-acc
+  (labels ((sum (n acc)
+             (if (= n 0) acc (sum (- n 1) (+ acc n)))))
+    (sum 100000 0))
+  5000050000)
+
+;;; D899 (#125) — defun with inner labels self-TCO
+(defun d899-count-down-helper (n)
+  (labels ((loop-fn (i)
+             (if (= i 0) :done (loop-fn (- i 1)))))
+    (loop-fn n)))
+
+(deftest d899-labels-in-defun
+  (d899-count-down-helper 200000)
+  :done)
+
+;;; D900 (#126) — TCO inside handler-case: should not stack overflow
+(defun %d900-count-safe (n)
+  (handler-case
+      (if (= n 0) :done (%d900-count-safe (- n 1)))
+    (error (e) (list :error e))))
+
+(deftest d900-handler-case-self-tco
+  (%d900-count-safe 200000)
+  :done)
+
+;;; D900 (#126) — handler-case TCO with accumulator
+(defun %d900-sum-safe (n acc)
+  (handler-case
+      (if (= n 0) acc (%d900-sum-safe (- n 1) (+ acc n)))
+    (error (e) (list :error e))))
+
+(deftest d900-handler-case-tco-acc
+  (%d900-sum-safe 100000 0)
+  5000050000)
+
+;;; D902 (#129) — return type inference from body (fixnum declared vars + if branches)
+(defun %d902-tak (x y z)
+  (declare (fixnum x y z))
+  (if (not (< y x))
+      z
+      (%d902-tak (%d902-tak (- x 1) y z)
+                 (%d902-tak (- y 1) z x)
+                 (%d902-tak (- z 1) x y))))
+
+(deftest d902-tak-inferred-fixnum
+  (%d902-tak 18 12 6)
+  7)
+
+(defun %d902-double (n) (declare (fixnum n)) (* n 2))
+
+(deftest d902-fixnum-arith-return-type
+  (%d902-double 21)
+  42)
+
+;;; D903 (#130) — native fixnum self-call path (box/unbox elimination)
+;;; tak with all fixnum params + fixnum return → native body compiled,
+;;; inner recursive calls use InvokeNative3 instead of boxing round-trip
+(defun %d903-tak (x y z)
+  (declare (fixnum x y z))
+  (if (not (< y x))
+      z
+      (%d903-tak (1- x)
+                 (%d903-tak (1- y) z x)
+                 (%d903-tak (1- z) x y))))
+
+(deftest d903-native-tak
+  (%d903-tak 18 12 6)
+  7)
+
+;;; Verify native 1-arg and 2-arg variants work
+(defun %d903-fib (n)
+  (declare (fixnum n))
+  (if (< n 2) n (+ (%d903-fib (- n 1)) (%d903-fib (- n 2)))))
+
+(deftest d903-native-fib
+  (%d903-fib 20)
+  6765)
+
+(defun %d903-ack (m n)
+  (declare (fixnum m n))
+  (cond ((= m 0) (+ n 1))
+        ((= n 0) (%d903-ack (- m 1) 1))
+        (t (%d903-ack (- m 1) (%d903-ack m (- n 1))))))
+
+(deftest d903-native-ackermann
+  (%d903-ack 3 4)
+  125)

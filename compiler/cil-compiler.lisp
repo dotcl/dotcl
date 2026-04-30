@@ -463,7 +463,11 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
               (if (boxed-var-p sym)
                   ;; Boxed: load box, then element 0
                   `((:ldloc ,key) (:ldc-i4 0) (:ldelem-ref))
-                  `((:ldloc ,key)))
+                  ;; Native Int64 param: box back to Fixnum for LispObject context (#130)
+                  (if (and (boundp '*long-locals*) *long-locals*
+                           (member (symbol-name sym) *long-locals* :test #'string=))
+                      `((:ldloc ,key) (:call "Fixnum.Make"))
+                      `((:ldloc ,key))))
               ;; No lexical binding — check special (includes locally declared specials)
               `(,@(compile-sym-lookup sym)
                 (:castclass "Symbol") (:call "DynamicBindings.Get")))))))
@@ -717,6 +721,13 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
    themselves fixnum-typed."
   (cond
     ((integerp expr) (and (<= -4611686018427387904 expr 4611686018427387903)))
+    ;; Direct Int64 local in native function body — already long, no unbox needed (#130)
+    ((and (symbolp expr)
+          (boundp '*long-locals*)
+          *long-locals*
+          (member (symbol-name expr) *long-locals* :test #'string=)
+          (lookup-local expr))
+     t)
     ;; Local var declared fixnum — must be a non-captured simple local
     ((and (symbolp expr)
           (boundp '*fixnum-locals*)
@@ -755,6 +766,30 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
   (cond
     ((integerp expr)
      `((:ldc-i8 ,expr)))
+    ;; Direct Int64 local in native body — already long, no unbox (#130)
+    ((and (symbolp expr)
+          (boundp '*long-locals*)
+          *long-locals*
+          (member (symbol-name expr) *long-locals* :test #'string=)
+          (lookup-local expr))
+     `((:ldloc ,(lookup-local expr))))
+    ;; Native self-call: long args avoid boxing; InvokeNativeN returns LispObject,
+    ;; so unbox-fixnum extracts the long back for the caller (#130).
+    ((and (consp expr) (symbolp (car expr))
+          (boundp '*native-self-name*) *native-self-name*
+          (boundp '*self-fn-local*) *self-fn-local*
+          (string= (mangle-name (car expr)) *native-self-name*)
+          (not (assoc (mangle-name (car expr)) *local-functions* :test #'string=))
+          (let ((n (length (cdr expr)))) (and (>= n 1) (<= n 4)))
+          (every #'fixnum-typed-p (cdr expr)))
+     (let ((n-args (length (cdr expr))))
+       `((:ldloc ,*self-fn-local*)
+         ,@(mapcan (lambda (arg)
+                     (let ((*in-tail-position* nil) (*in-mv-context* nil))
+                       (compile-as-long arg)))
+                   (cdr expr))
+         (:callvirt ,(format nil "LispFunction.InvokeNative~D" n-args))
+         (:unbox-fixnum))))
     ;; Declared-fixnum local: load slot (LispObject) then unbox.
     ((and (symbolp expr)
           (boundp '*fixnum-locals*)

@@ -14,6 +14,20 @@
 (defvar *tco-param-entries* nil
   "List of (key . boxed-p) in param order, for rewriting TCO self-call args.
    key = gen-local string; boxed-p = T if the local is a LispObject[] box.")
+(defvar *tco-local-fn-key* nil
+  "Box key (gen-local string) of the labels function currently being compiled
+   for self-TCO, or NIL if compiling a defun. Allows compile-named-call to
+   permit self-TCO despite the function name appearing in *local-functions*.")
+(defvar *tco-leave-instrs* nil
+  "List of CIL instructions to emit BEFORE the TCO branch (br or leave).
+   Used when the TCO site is inside a try block that requires explicit cleanup
+   before branching back (e.g. handler-case must call HandlerClusterStack.PopCluster
+   before leaving the catch-protected region). NIL for ordinary TCO.")
+(defvar *tco-in-try-catch* nil
+  "T when the current TCO site is inside a handler-case try/catch body (not
+   a try/finally). In this case, TCO uses `leave` to exit the protected region
+   instead of `br`. Distinct from *in-try-block* which signals try/finally
+   (special-variable LET / unwind-protect) and always suppresses TCO (#126).")
 (defvar *in-tail-position* nil
   "T when the currently-being-compiled expression is in tail position
    within the TCO scope. Reset to NIL at function entry; compile-progn
@@ -47,6 +61,16 @@
 (defvar *single-float-locals* '()
   "Like *double-float-locals* but for single-float declarations. Enables native
    r4 arithmetic on (declare (single-float x)) locals and references.")
+
+(defvar *long-locals* '()
+  "List of symbol-name strings whose local slots hold Int64 directly (not boxed
+   LispObject). Set in native function bodies where params are long-typed.
+   compile-as-long skips :unbox-fixnum for these; fixnum-typed-p returns T (#130).")
+
+(defvar *native-self-name* nil
+  "Mangled name of the current function if it is native-eligible (all fixnum params
+   + fixnum return, no captures, no specials). Enables native self-call path
+   in compile-as-long and native TCO arg evaluation (#130).")
 
 (defvar *compile-time-flet-defs* nil
   "List of flet function source definitions active during compilation.
@@ -99,6 +123,19 @@
                                  (*in-mv-context* nil))
                              (compile-expr arg)) (:stloc ,tmp))))))
 
+(defun compile-direct-call-args-long (args)
+  "Like compile-direct-call-args but evaluates each arg via compile-as-long → Int64.
+   Used in native function bodies for TCO self-call argument evaluation (#130)."
+  (let ((temps (loop for a in args collect (gen-local "DA"))))
+    (cons temps
+          (loop for arg in args
+                for tmp in temps
+                append `((:declare-local ,tmp "Int64")
+                         ,@(let ((*in-tail-position* nil)
+                                 (*in-mv-context* nil))
+                             (compile-as-long arg))
+                         (:stloc ,tmp))))))
+
 (defun compile-named-call (name args)
   (block compile-named-call
     ;; Self-TCO: if in tail position and calling current function, emit loop
@@ -108,27 +145,47 @@
     (let ((name-str (mangle-name name))
           (n-args (length args)))
       (when (and *in-tail-position*
-                 (not *in-try-block*)
+                 ;; try/finally (special-var LET) suppresses TCO, but handler-case's
+                 ;; try/catch allows it via *tco-in-try-catch* (uses `leave`, not `br`)
+                 (or *tco-in-try-catch* (not *in-try-block*))
                  *tco-self-name*
-                 (not (assoc name-str *local-functions* :test #'string=))
+                 ;; Skip TCO when a different local function shadows the name;
+                 ;; allow when the shadow IS the labels fn being compiled (#125).
+                 (let ((lf (assoc name-str *local-functions* :test #'string=)))
+                   (or (null lf)
+                       (and *tco-local-fn-key* (string= (second lf) *tco-local-fn-key*))))
                  (if *tco-self-symbol*
                      (eq name *tco-self-symbol*)
                      (string= name-str *tco-self-name*))
                  (= n-args (length *tco-param-entries*)))
-        (let* ((da (compile-direct-call-args args))
+        (let* ((use-native-tco (and *native-self-name* (every #'fixnum-typed-p args)))
+               (da (if use-native-tco
+                       (compile-direct-call-args-long args)
+                       (compile-direct-call-args args)))
                (temps (car da))
                (eval-instrs (cdr da))
                (store-instrs
-                 (loop for tmp in temps
-                       for (key . boxed-p) in *tco-param-entries*
-                       if boxed-p
-                         append `((:ldloc ,key) (:ldc-i4 0) (:ldloc ,tmp) (:stelem-ref))
-                       else
-                         append `((:ldloc ,tmp) (:stloc ,key)))))
+                 (if use-native-tco
+                     ;; Native body: all params are Int64, temps are Int64 → direct store
+                     (loop for tmp in temps
+                           for (key . boxed-p) in *tco-param-entries*
+                           append `((:ldloc ,tmp) (:stloc ,key)))
+                     ;; Normal body: LispObject temps → LispObject or boxed params
+                     (loop for tmp in temps
+                           for (key . boxed-p) in *tco-param-entries*
+                           if boxed-p
+                             append `((:ldloc ,key) (:ldc-i4 0) (:ldloc ,tmp) (:stelem-ref))
+                           else
+                             append `((:ldloc ,tmp) (:stloc ,key))))))
           (return-from compile-named-call
             `(,@eval-instrs
               ,@store-instrs
-              (:br ,*tco-loop-label*)))))
+              ,@*tco-leave-instrs*
+              ;; handler-case try/catch: use `leave` to exit cleanly (#126).
+              ;; try/finally (special-var LET) already suppressed above via *in-try-block*.
+              ,(if *tco-in-try-catch*
+                   `(:leave ,*tco-loop-label*)
+                   `(:br ,*tco-loop-label*))))))
       ;; Non-tail self-call fast path: reuse LispFunction cached at body entry.
       (when (and *self-fn-local*
                  (not (assoc name-str *local-functions* :test #'string=))
@@ -632,6 +689,12 @@
 
 (defun compile-defun (name params body)
   "Compile (defun name (params) body...) → :defmethod directive + return symbol."
+  ;; Pre-pass: infer return type before body compilation so self-calls inside the
+  ;; body benefit from the D685 single-value elision path (#129).
+  (when (and (symbolp name) (not (gethash name *function-return-types*)))
+    (let ((inferred (infer-body-return-type body (mangle-name name))))
+      (when inferred
+        (setf (gethash name *function-return-types*) inferred))))
   (multiple-value-bind (required optional key rest-param) (parse-lambda-list params)
     (declare (ignore optional key rest-param))
     (let* ((param-names (mapcar #'symbol-name required))
@@ -708,16 +771,33 @@
                    (:ldstr ,(mangle-name name)) (:call "Startup.Sym"))))
             ;; Direct params: simple required-only functions
             (use-direct
-              `((:defmethod-direct ,(mangle-name name)
-                 ,@pkg-spec
-                 :params ,param-names
-                 :body ,(compile-function-body-direct
-                         params wrapped-body (mangle-name name)
-                         (cadr pkg-spec)))
-                ,@uninterned-fixup
-                ,@(if (symbolp name)
-                      (compile-sym-lookup name)
-                      `((:ldstr ,(mangle-name name)) (:call "Startup.Sym")))))
+             (let* ((mangled (mangle-name name))
+                    (pkg-name (cadr pkg-spec))
+                    ;; Native eligibility: all fixnum params, fixnum return, ≤4 params,
+                    ;; no special-declared params (#130)
+                    (native-eligible
+                      (and (symbolp name)
+                           (<= (length required) 4)
+                           (all-params-fixnum-p params wrapped-body)
+                           (eq 'fixnum (gethash name *function-return-types*))
+                           (null (fn-body-special-params wrapped-body
+                                                         (mapcar #'symbol-name required)))
+                           (null (remove-if-not #'global-special-p required)))))
+               `(,(if native-eligible
+                      `(:defmethod-native ,mangled
+                         ,@pkg-spec
+                         :params ,param-names
+                         :body ,(compile-function-body-direct
+                                 params wrapped-body mangled pkg-name name))
+                      `(:defmethod-direct ,mangled
+                         ,@pkg-spec
+                         :params ,param-names
+                         :body ,(compile-function-body-direct
+                                 params wrapped-body mangled pkg-name name)))
+                 ,@uninterned-fixup
+                 ,@(if (symbolp name)
+                       (compile-sym-lookup name)
+                       `((:ldstr ,mangled) (:call "Startup.Sym"))))))
             ;; Standard defmethod
             (t
               `((:defmethod ,(mangle-name name)
@@ -932,12 +1012,23 @@
     (and (<= (length required) 8)
          (null optional) (null key) (not has-key-p) (null rest-param) (null aux))))
 
-(defun compile-function-body-direct (params body &optional (fn-name "") fn-pkg)
+(defun all-params-fixnum-p (params body)
+  "Return T if PARAMS is all required fixnum-declared args with no optional/key/rest.
+   Used to determine native-eligibility for #130 native self-call path."
+  (multiple-value-bind (required optional key rest-param) (parse-lambda-list params)
+    (and (null optional) (null key) (null rest-param)
+         (not (null required))
+         (let ((fxlocals (extract-fixnum-locals body)))
+           (every (lambda (p) (member (symbol-name p) fxlocals :test #'string=))
+                  required)))))
+
+(defun compile-function-body-direct (params body &optional (fn-name "") fn-pkg fn-symbol)
   "Compile function body with direct parameter passing (no args array).
    Only for functions with exactly required params, no optional/key/rest.
    Params are accessed via (:ldarg 0), (:ldarg 1), ... directly.
    FN-PKG, if given, is the defining package name — used by the self-call
-   symbol-lookup cache."
+   symbol-lookup cache.
+   FN-SYMBOL, if given, is the defun symbol — used for native eligibility check (#130)."
   (multiple-value-bind (required optional key rest-param aux) (parse-lambda-list params)
     (declare (ignore optional key rest-param aux))
     (let* ((all-params required)
@@ -949,22 +1040,43 @@
            (local-keys (mapcar (lambda (p) (cons p (gen-local (symbol-name p)))) all-params))
            (mutated (find-mutated-vars body))
            (captured (find-captured-vars body (mapcar #'symbol-name all-params)))
-           (needs-boxing (intersection mutated captured :test #'string=)))
+           (needs-boxing (intersection mutated captured :test #'string=))
+           ;; Pre-check native eligibility: all fixnum params, fixnum return, no captures
+           ;; Full check (including no specials) happens after special-param-syms is computed,
+           ;; but we need this early for param-instrs type selection (#130).
+           (pre-special-syms
+             (when (and fn-symbol (null needs-boxing) (all-params-fixnum-p params body))
+               (union (fn-body-special-params body (mapcar #'symbol-name all-params))
+                      (remove-if-not #'global-special-p all-params))))
+           (pre-native-eligible
+             (and fn-symbol
+                  (null needs-boxing)
+                  (all-params-fixnum-p params body)
+                  (null pre-special-syms)
+                  (eq 'fixnum (gethash fn-symbol *function-return-types*)))))
       (let ((*locals* local-keys)
             (*boxed-vars* (mapcar (lambda (name) (find name all-params :key #'symbol-name :test #'string=))
                                   needs-boxing)))
         (let ((param-instrs
-                (loop for p in required
-                      for key = (cdr (assoc p local-keys))
-                      for i from 0
-                      if (boxed-var-p p)
-                        append `((:declare-local ,key "LispObject[]")
-                                 (:ldc-i4 1) (:newarr "LispObject") (:dup)
-                                 (:ldc-i4 0) (:ldarg ,i)
-                                 (:stelem-ref) (:stloc ,key))
-                      else
-                        append `((:declare-local ,key "LispObject")
-                                 (:ldarg ,i) (:stloc ,key)))))
+                (if pre-native-eligible
+                    ;; Native body: params come in as long, store into Int64 locals (#130)
+                    (loop for p in required
+                          for key = (cdr (assoc p local-keys))
+                          for i from 0
+                          append `((:declare-local ,key "Int64")
+                                   (:ldarg ,i) (:stloc ,key)))
+                    ;; Normal body: params as LispObject (with boxed-var support)
+                    (loop for p in required
+                          for key = (cdr (assoc p local-keys))
+                          for i from 0
+                          if (boxed-var-p p)
+                            append `((:declare-local ,key "LispObject[]")
+                                     (:ldc-i4 1) (:newarr "LispObject") (:dup)
+                                     (:ldc-i4 0) (:ldarg ,i)
+                                     (:stelem-ref) (:stloc ,key))
+                          else
+                            append `((:declare-local ,key "LispObject")
+                                     (:ldarg ,i) (:stloc ,key))))))
           (let* ((special-param-syms
                    (union (fn-body-special-params body (mapcar #'symbol-name all-params))
                           (remove-if-not #'global-special-p all-params)))
@@ -993,7 +1105,8 @@
                    (tco-loop-label (when use-tco (gen-label "TCOLOOP")))
                    (*tco-self-name* (if use-tco fn-name nil))
                    (*tco-loop-label* (if use-tco tco-loop-label nil))
-                   (*self-fn-local* (when use-tco (gen-local "SELF-FN")))
+                   ;; Labels functions are stored in boxes, not symbols — skip self-fn caching (#125)
+                   (*self-fn-local* (when (and use-tco (null *tco-local-fn-key*)) (gen-local "SELF-FN")))
                    ;; Self-fn caching: for (SETF NAME) functions, look up SetfFunction
                    ;; on the target NAME symbol rather than Function on "(SETF NAME)"
                    ;; (D698: fix broken GetFunctionBySymbol call for setf functions).
@@ -1039,6 +1152,14 @@
                                                   *double-float-locals*))
                    (*single-float-locals* (append (extract-single-float-locals body)
                                                   *single-float-locals*))
+                   ;; Native body: params are Int64, enabling compile-as-long without
+                   ;; unbox and native self-calls via InvokeNativeN (#130).
+                   (*long-locals* (if (and pre-native-eligible use-tco)
+                                      (mapcar #'symbol-name all-params)
+                                      *long-locals*))
+                   (*native-self-name* (if (and pre-native-eligible use-tco)
+                                           fn-name
+                                           *native-self-name*))
                    ;; If we'll wrap in try/finally for DynamicBindings.Pop, body
                    ;; compilation must know — so tail-position calls don't emit
                    ;; the `.tail` prefix (illegal in CIL inside try) and TCO
@@ -1079,8 +1200,13 @@
            (*tco-self-name* nil)
            (*tco-loop-label* nil)
            (*tco-param-entries* nil)
+           (*tco-leave-instrs* nil)
+           (*tco-in-try-catch* nil)
            (*self-fn-local* nil)
            (*in-tail-position* nil)
+           ;; Reset native state: inner lambdas don't inherit outer native context (#130)
+           (*long-locals* nil)
+           (*native-self-name* nil)
            (local-keys (mapcar (lambda (p) (cons p (gen-local (symbol-name p)))) all-params))
            ;; Pre-scan for mutable captures
            (mutated (find-mutated-vars body))
@@ -1422,6 +1548,84 @@
              (dolist (v (cddr decl))
                (when (symbolp v) (pushnew (symbol-name v) result :test #'string=))))))))
     result))
+
+;;; ============================================================
+;;; Return type inference (#129)
+;;; ============================================================
+
+(defun extract-declared-var-types (body)
+  "Return alist of (var-symbol . type) from declare forms at head of BODY.
+  Recognizes (fixnum x y), (double-float x), (type fixnum x y)."
+  (let ((types '()))
+    (dolist (form body)
+      (unless (and (consp form) (eq (car form) 'declare)) (return))
+      (dolist (decl (cdr form))
+        (when (consp decl)
+          (let ((dtype
+                  (cond
+                    ((member (car decl) '(fixnum double-float single-float
+                                                 character boolean bit))
+                     (car decl))
+                    ((and (eq (car decl) 'type) (symbolp (cadr decl)))
+                     (cadr decl))
+                    (t nil))))
+            (when dtype
+              (dolist (v (if (eq (car decl) 'type) (cddr decl) (cdr decl)))
+                (when (symbolp v) (push (cons v dtype) types))))))))
+    types))
+
+(defun infer-expr-return-type (expr var-types self-name)
+  "Conservatively infer the return type of EXPR.
+  VAR-TYPES is an alist (sym . type). SELF-NAME is the mangled fn name for
+  self-recursion detection. Returns 'fixnum, 'double-float, :self-recursive,
+  or NIL (unknown). :self-recursive means 'same as the enclosing function',
+  handled by meet-inferred-types."
+  (cond
+    ((integerp expr)
+     (when (<= most-negative-fixnum expr most-positive-fixnum) 'fixnum))
+    ((symbolp expr)
+     (cdr (assoc expr var-types)))
+    ((and (consp expr) (eq (car expr) 'the) (symbolp (cadr expr)))
+     (cadr expr))
+    ((and (consp expr) (eq (car expr) 'progn))
+     (when (cdr expr)
+       (infer-expr-return-type (car (last expr)) var-types self-name)))
+    ((and (consp expr) (eq (car expr) 'if))
+     (let* ((then-t (infer-expr-return-type (caddr expr) var-types self-name))
+            (else-t (if (cdddr expr)
+                        (infer-expr-return-type (cadddr expr) var-types self-name)
+                        nil)))
+       (meet-inferred-types then-t else-t)))
+    ;; Fixnum arithmetic on fixnum-typed operands
+    ((and (consp expr) (symbolp (car expr))
+          (member (car expr) '(+ - * 1+ 1- ash logand logior logxor min max abs))
+          (every (lambda (a)
+                   (eq 'fixnum (infer-expr-return-type a var-types self-name)))
+                 (cdr expr)))
+     'fixnum)
+    ;; Self-recursive call
+    ((and (consp expr) (symbolp (car expr)) self-name
+          (string= (mangle-name (car expr)) self-name))
+     :self-recursive)
+    (t nil)))
+
+(defun meet-inferred-types (t1 t2)
+  "Merge two inferred types. :self-recursive is compatible with any concrete type."
+  (cond
+    ((equal t1 t2) t1)
+    ((eq t1 :self-recursive) t2)
+    ((eq t2 :self-recursive) t1)
+    (t nil)))
+
+(defun infer-body-return-type (body self-name)
+  "Infer the return type of a function with BODY and mangled name SELF-NAME.
+  Returns a concrete type symbol (e.g. 'fixnum) or NIL if unknown."
+  (let* ((var-types (extract-declared-var-types body))
+         (last-form (and body (car (last body)))))
+    (when last-form
+      (let ((ty (infer-expr-return-type last-form var-types self-name)))
+        (when (and ty (not (eq ty :self-recursive)))
+          ty)))))
 
 (defun compile-let (bindings body sequential-p)
   "Compile (let bindings body...) or (let* bindings body...)."
@@ -1831,8 +2035,8 @@
       (scan-lambda-list-defaults params nil free-ht)
       (let ((keys '())) (maphash (lambda (k v) (declare (ignore v)) (push k keys)) free-ht) keys))))
 
-(defun compile-lambda (params body)
-  "Compile (lambda (params) body...)."
+(defun compile-lambda (params body &optional (fn-name ""))
+  "Compile (lambda (params) body...). FN-NAME enables self-TCO when non-empty."
   (multiple-value-bind (required optional key rest-param) (parse-lambda-list params)
     (declare (ignore optional key))
     (let ((free-vars (find-free-vars-with-defaults params body)))
@@ -1841,7 +2045,7 @@
           (if (simple-required-only-p params)
               `((:make-function-direct
                  :param-count ,(length required)
-                 :body ,(compile-function-body-direct params body)))
+                 :body ,(compile-function-body-direct params body fn-name)))
               `((:make-function
                  :param-count ,(length required)
                  :body ,(compile-function-body params body))))
@@ -1946,7 +2150,13 @@
            (*tco-self-name* nil)
            (*tco-loop-label* nil)
            (*tco-param-entries* nil)
+           (*tco-local-fn-key* nil)
+           (*tco-leave-instrs* nil)
+           (*tco-in-try-catch* nil)
            (*self-fn-local* nil)
+           ;; Reset native state: closures don't inherit outer native body context (#130)
+           (*long-locals* nil)
+           (*native-self-name* nil)
            ;; Closure body's last form is in tail position (D638): MV propagation
            (*in-tail-position* t)
            (n-required (length required))
@@ -2639,18 +2849,21 @@
            (*boxed-vars* (append (mapcar #'car new-locals)
                                  *boxed-vars*))
            (store-instrs '()))
-      ;; Compile each function and store into its box
-      ;; CL spec: labels creates an implicit block named after the function
-      ;; For (setf sym) names, use progn instead of block (block requires a symbol)
+      ;; Compile each function and store into its box.
+      ;; CL spec: labels creates an implicit block named after the function.
+      ;; For (setf sym) names, use progn instead of block (block requires a symbol).
+      ;; Pass name-str + set *tco-local-fn-key* so compile-lambda enables self-TCO (#125).
       (dolist (entry fn-compile-list)
         (let ((name (first entry))
               (params (second entry))
               (fn-body (third entry))
               (key (fourth entry)))
-          (let ((lambda-instrs (if (and (symbolp name)
-                                          (some (lambda (f) (form-has-return-from-p name f)) fn-body))
-                                   (compile-lambda params `((block ,name ,@fn-body)))
-                                   (compile-lambda params fn-body))))
+          (let* ((name-str (mangle-name name))
+                 (lambda-instrs (let ((*tco-local-fn-key* key))
+                                  (if (and (symbolp name)
+                                           (some (lambda (f) (form-has-return-from-p name f)) fn-body))
+                                      (compile-lambda params `((block ,name ,@fn-body)) name-str)
+                                      (compile-lambda params fn-body name-str)))))
             (setf store-instrs
                   (append store-instrs
                           `((:ldloc ,key) (:ldc-i4 0)
@@ -3053,8 +3266,18 @@
       ;; executed after unwinding, outside the handler's dynamic scope).
       (:begin-exception-block)
       ;; Body in MV-propagating position: handler-case returns body's values (CL spec).
-      ;; *in-tail-position* must be nil (TCO illegal across try boundary).
-      ,@(let ((*in-tail-position* nil) (*in-mv-context* t)) (compile-expr body-form))
+      ;; Self-TCO inside handler-case: use `leave` to exit the try block and prepend
+      ;; PopCluster so each iteration has a clean handler stack (#126).
+      ,@(let ((*in-try-block* t)         ; protect: :ret invalid in try/catch region
+              (*tco-in-try-catch* (if *tco-self-name* t *tco-in-try-catch*))
+              (*in-mv-context* t)
+              ;; When TCO is active, prepend PopCluster to *tco-leave-instrs* so the
+              ;; self-call emits PopCluster before `leave TCOLOOP` (#126).
+              (*tco-leave-instrs*
+               (if *tco-self-name*
+                   (cons '(:call "HandlerClusterStack.PopCluster") *tco-leave-instrs*)
+                   *tco-leave-instrs*)))
+          (compile-expr body-form))
       (:stloc ,result-key)
       (:leave ,inner-end-label)
       ;; Catch 1: HandlerCaseInvocationException (main path via HandlerClusterStack.Signal)

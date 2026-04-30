@@ -36,11 +36,19 @@ public class FaslAssembler
         typeof(Startup).GetMethod("SymInPkg")!;
     internal static readonly MethodInfo SetDirectDelegateMI =
         typeof(LispFunction).GetMethod("SetDirectDelegate")!;
+    internal static readonly MethodInfo SetNativeDelegateMI =
+        typeof(LispFunction).GetMethod("SetNativeDelegate")!;
     internal static readonly MethodInfo CheckArityExactMI =
         typeof(Runtime).GetMethod("CheckArityExact")!;
+    internal static readonly MethodInfo FixnumValueGetterMI =
+        typeof(Fixnum).GetProperty("Value")!.GetGetMethod()!;
+    internal static readonly MethodInfo FixnumMakeMI =
+        typeof(Fixnum).GetMethod("Make")!;
 
     // Typed delegate constructors for arities 0..8 (index 0 = Func<LispObject>, etc.)
     internal static readonly ConstructorInfo[] TypedFuncCtors = BuildTypedFuncCtors();
+    // Native long→long delegate constructors for arities 1..4 (index 0 = Func<long,long>, etc.)
+    internal static readonly ConstructorInfo[] NativeTypedFuncCtors = BuildNativeTypedFuncCtors();
 
     private static ConstructorInfo[] BuildTypedFuncCtors()
     {
@@ -59,6 +67,22 @@ public class FaslAssembler
         };
         var result = new ConstructorInfo[9];
         for (int i = 0; i < 9; i++)
+            result[i] = types[i].GetConstructor(ctorArgs)!;
+        return result;
+    }
+
+    private static ConstructorInfo[] BuildNativeTypedFuncCtors()
+    {
+        var ctorArgs = new[] { typeof(object), typeof(IntPtr) };
+        var types = new Type[]
+        {
+            typeof(Func<long, LispObject>),
+            typeof(Func<long, long, LispObject>),
+            typeof(Func<long, long, long, LispObject>),
+            typeof(Func<long, long, long, long, LispObject>),
+        };
+        var result = new ConstructorInfo[4];
+        for (int i = 0; i < 4; i++)
             result[i] = types[i].GetConstructor(ctorArgs)!;
         return result;
     }
@@ -114,7 +138,7 @@ public class FaslAssembler
         {
             if (c.Car is Cons inner && inner.Car is Symbol sym)
             {
-                if (sym.Name == "DEFMETHOD-DIRECT" || sym.Name == "DEFMETHOD")
+                if (sym.Name == "DEFMETHOD-DIRECT" || sym.Name == "DEFMETHOD" || sym.Name == "DEFMETHOD-NATIVE")
                     hasDefmethod = true;
                 else if (sym.Name == "DECLARE-LOCAL"
                          || sym.Name == "LDLOC" || sym.Name == "STLOC"
@@ -157,7 +181,7 @@ public class FaslAssembler
             while (cur is Cons c)
             {
                 if (c.Car is Cons inner && inner.Car is Symbol sym
-                    && (sym.Name == "DEFMETHOD-DIRECT" || sym.Name == "DEFMETHOD"))
+                    && (sym.Name == "DEFMETHOD-DIRECT" || sym.Name == "DEFMETHOD" || sym.Name == "DEFMETHOD-NATIVE"))
                 {
                     // Flush any pending non-defmethod instructions BEFORE this defmethod
                     if (pendingHead != null)
@@ -170,6 +194,9 @@ public class FaslAssembler
                     int id = _methodCount++;
                     if (sym.Name == "DEFMETHOD-DIRECT")
                         EmitDefmethodDirectInto(_tb, _initIl, _structInternMap,
+                            name, paramNames.Count, bodyInstrs, defPkg, id);
+                    else if (sym.Name == "DEFMETHOD-NATIVE")
+                        EmitDefmethodNativeInto(_tb, _initIl, _structInternMap,
                             name, paramNames.Count, bodyInstrs, defPkg, id);
                     else
                         EmitDefmethodInto(_tb, _initIl, _structInternMap,
@@ -390,6 +417,81 @@ public class FaslAssembler
     }
 
     /// <summary>
+    /// Emit a DEFMETHOD-NATIVE (native long→long body) into the TypeBuilder.
+    /// Generates: native body method (long params), direct LispObject wrapper,
+    /// array wrapper, and registration with both _funcN and _nativeFuncN set.
+    /// </summary>
+    internal static void EmitDefmethodNativeInto(
+        TypeBuilder tb, ILGenerator initIl, CilAssembler.FaslStructInternMap structMap,
+        string name, int paramCount, LispObject bodyInstrs, string? defPkg, int id)
+    {
+        if (paramCount < 1 || paramCount > 4)
+            throw new Exception($"FASL DEFMETHOD-NATIVE: param-count {paramCount} not supported (1-4)");
+
+        // 1. Native body: static LispObject Name_native_N(long p0, ...)
+        // Long params avoid arg boxing; body returns LispObject (arithmetic boxes via Fixnum.Make).
+        var nativeParamTypes = new Type[paramCount];
+        for (int i = 0; i < paramCount; i++) nativeParamTypes[i] = typeof(long);
+
+        string nativeMethodName = SanitizeName(name) + "_native_" + id;
+        var nativeMethod = tb.DefineMethod(nativeMethodName,
+            MethodAttributes.Public | MethodAttributes.Static,
+            typeof(LispObject), nativeParamTypes);
+
+        var nativeAsm = new CilAssembler();
+        nativeAsm._il = nativeMethod.GetILGenerator();
+        nativeAsm._faslMode = true;
+        nativeAsm._faslTypeBuilder = tb;
+        nativeAsm._faslStructMap = structMap;
+        nativeAsm.Assemble(bodyInstrs);
+
+        // 2. Direct LispObject wrapper: static LispObject Name_direct_N(LispObject p0, ...)
+        var directParamTypes = new Type[paramCount];
+        for (int i = 0; i < paramCount; i++) directParamTypes[i] = typeof(LispObject);
+
+        string directMethodName = SanitizeName(name) + "_direct_" + id;
+        var directMethod = tb.DefineMethod(directMethodName,
+            MethodAttributes.Public | MethodAttributes.Static,
+            typeof(LispObject), directParamTypes);
+        var dil = directMethod.GetILGenerator();
+
+        for (int i = 0; i < paramCount; i++)
+        {
+            dil.Emit(OpCodes.Ldarg, i);
+            dil.Emit(OpCodes.Castclass, typeof(Fixnum));
+            dil.Emit(OpCodes.Call, FixnumValueGetterMI);
+        }
+        dil.Emit(OpCodes.Call, nativeMethod);
+        // native body already returns LispObject; no Fixnum.Make wrapping needed
+        dil.Emit(OpCodes.Ret);
+
+        // 3. Array wrapper: static LispObject Name_wrap_N(LispObject[] args)
+        string wrapperName = SanitizeName(name) + "_" + id;
+        var wrapperMethod = tb.DefineMethod(wrapperName,
+            MethodAttributes.Public | MethodAttributes.Static,
+            typeof(LispObject), new[] { typeof(LispObject[]) });
+        var wil = wrapperMethod.GetILGenerator();
+
+        wil.Emit(OpCodes.Ldstr, name);
+        wil.Emit(OpCodes.Ldarg_0);
+        wil.Emit(OpCodes.Ldc_I4, paramCount);
+        wil.Emit(OpCodes.Call, CheckArityExactMI);
+
+        for (int i = 0; i < paramCount; i++)
+        {
+            wil.Emit(OpCodes.Ldarg_0);
+            wil.Emit(OpCodes.Ldc_I4, i);
+            wil.Emit(OpCodes.Ldelem_Ref);
+        }
+        wil.Emit(OpCodes.Call, directMethod);
+        wil.Emit(OpCodes.Ret);
+
+        // 4. Registration: _funcN = directMethod, _nativeFuncN = nativeMethod
+        EmitRegistrationInto(initIl, name, wrapperMethod, paramCount, defPkg,
+            directBodyMethod: directMethod, nativeBodyMethod: nativeMethod);
+    }
+
+    /// <summary>
     /// Emit IL to register a function: build Func&lt;LispObject[], LispObject&gt;
     /// delegate from wrapperMethod, wrap in LispFunction, optionally install a
     /// typed _funcN delegate (when directBodyMethod != null and arity ≤ 8),
@@ -401,7 +503,7 @@ public class FaslAssembler
     /// </summary>
     private static void EmitRegistrationInto(
         ILGenerator il, string name, MethodBuilder wrapperMethod, int paramCount,
-        string? defPkg, MethodBuilder? directBodyMethod)
+        string? defPkg, MethodBuilder? directBodyMethod, MethodBuilder? nativeBodyMethod = null)
     {
         var fnLocal = il.DeclareLocal(typeof(LispFunction));
 
@@ -424,6 +526,16 @@ public class FaslAssembler
             il.Emit(OpCodes.Ldftn, directBodyMethod);
             il.Emit(OpCodes.Newobj, TypedFuncCtors[paramCount]);
             il.Emit(OpCodes.Callvirt, SetDirectDelegateMI);
+        }
+
+        // Install _nativeFuncN for native long→long fast path (#130)
+        if (nativeBodyMethod != null && paramCount >= 1 && paramCount <= 4)
+        {
+            il.Emit(OpCodes.Ldloc, fnLocal);
+            il.Emit(OpCodes.Ldnull);
+            il.Emit(OpCodes.Ldftn, nativeBodyMethod);
+            il.Emit(OpCodes.Newobj, NativeTypedFuncCtors[paramCount - 1]);
+            il.Emit(OpCodes.Callvirt, SetNativeDelegateMI);
         }
 
         // Dispatch registration by name shape.

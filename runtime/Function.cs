@@ -26,6 +26,14 @@ public class LispFunction : LispObject
     internal Func<LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject>? _func7;
     internal Func<LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject>? _func8;
 
+    // Native delegates: long args → LispObject return.
+    // Avoids boxing of ARGUMENTS (the main allocation bottleneck in fixnum recursion).
+    // Return is still LispObject so the body compiles unchanged (#130).
+    internal Func<long, LispObject>? _nativeFunc1;
+    internal Func<long, long, LispObject>? _nativeFunc2;
+    internal Func<long, long, long, LispObject>? _nativeFunc3;
+    internal Func<long, long, long, long, LispObject>? _nativeFunc4;
+
     public LispFunction(Func<LispObject[], LispObject> func, string? name = null, int arity = -1)
     {
         _func = func;
@@ -102,6 +110,25 @@ public class LispFunction : LispObject
 
     public LispObject Invoke8(LispObject a, LispObject b, LispObject c, LispObject d, LispObject e, LispObject f, LispObject g, LispObject h)
         => _func8 != null ? _func8(a, b, c, d, e, f, g, h) : InvokeSlow(new[] { a, b, c, d, e, f, g, h });
+
+    // Native fixnum invoke: long args avoid boxing, LispObject return is body result (#130)
+    public LispObject InvokeNative1(long a) => _nativeFunc1!(a);
+    public LispObject InvokeNative2(long a, long b) => _nativeFunc2!(a, b);
+    public LispObject InvokeNative3(long a, long b, long c) => _nativeFunc3!(a, b, c);
+    public LispObject InvokeNative4(long a, long b, long c, long d) => _nativeFunc4!(a, b, c, d);
+
+    // Install a native long→LispObject delegate for the appropriate arity.
+    public void SetNativeDelegate(Delegate del)
+    {
+        switch (del)
+        {
+            case Func<long, LispObject> f1: _nativeFunc1 = f1; break;
+            case Func<long, long, LispObject> f2: _nativeFunc2 = f2; break;
+            case Func<long, long, long, LispObject> f3: _nativeFunc3 = f3; break;
+            case Func<long, long, long, long, LispObject> f4: _nativeFunc4 = f4; break;
+            default: throw new ArgumentException($"SetNativeDelegate: unsupported type {del.GetType().Name}");
+        }
+    }
 
     // Install a typed direct-call delegate for the appropriate arity.
     // Public so FASL-emitted code (in a separate assembly) can bypass the

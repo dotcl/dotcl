@@ -3,6 +3,24 @@
 User-facing release notes for dotcl. Each section corresponds to a tagged
 release on the public mirror (dotcl/dotcl).
 
+## v0.1.1 — 2026-04-30
+
+RID expansion release.
+
+### Changed
+
+- **R2R AOT FASLs now ship for win-x64, win-arm64, linux-x64, linux-arm64,
+  osx-x64, osx-arm64.** v0.1.0 only had R2R for win-arm64; other
+  platforms used the framework-dependent FASL (slower cold start).
+- Added per-RID nupkgs: `dotcl.win-x64`, `dotcl.linux-x64`,
+  `dotcl.linux-arm64`, `dotcl.osx-x64`, `dotcl.osx-arm64`.
+
+### Notes
+
+- 32-bit builds (win-x86) intentionally not shipped.
+- crossgen2 cross-compile is used; FASLs for non-host RIDs are produced
+  on the win-arm64 dev machine.
+
 ## v0.1.0 — 2026-04-29
 
 Initial public release.

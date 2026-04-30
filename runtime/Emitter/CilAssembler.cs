@@ -620,6 +620,9 @@ public class CilAssembler
             case "DEFMETHOD-DIRECT":
                 HandleDefmethodDirect(c);
                 break;
+            case "DEFMETHOD-NATIVE":
+                HandleDefmethodNative(c);
+                break;
             case "MAKE-FUNCTION":
                 HandleMakeFunction(c);
                 break;
@@ -1309,6 +1312,180 @@ public class CilAssembler
         if (setfTargetSym != null)
         {
             // Setf function runtime re-registration via sym.SetfFunction (#58 Phase 1)
+            int setfSymIdx = AddConstant(setfTargetSym);
+            _il.Emit(OpCodes.Ldc_I4, setfSymIdx);
+            _il.Emit(OpCodes.Call, _getConstant);
+            _il.Emit(OpCodes.Castclass, typeof(Symbol));
+            _il.Emit(OpCodes.Ldc_I4, fnIdx);
+            _il.Emit(OpCodes.Call, _getConstant);
+            _il.Emit(OpCodes.Castclass, typeof(LispFunction));
+            _il.Emit(OpCodes.Call, _registerSetfFunctionOnSymbol);
+        }
+    }
+
+    // (:defmethod-native "NAME" [:pkg "PKG"] :params ("P1" ...) :body (...))
+    // Body uses Int64 params (declared via (:declare-local KEY "Int64")).
+    // Self-calls via (:callvirt "LispFunction.InvokeNativeN") leave long on stack.
+    private void HandleDefmethodNative(Cons instr)
+    {
+        var plist = instr.Cdr;
+        var name = GetString(Car(plist));
+        plist = Cdr(plist);
+
+        var paramNames = new List<string>();
+        LispObject? bodyInstrs = null;
+        string? defPkg = null;
+
+        while (plist is Cons pc)
+        {
+            var key = GetSymbolName(pc.Car);
+            var val = Cadr(pc);
+            switch (key)
+            {
+                case "PARAMS":
+                    var cur = val;
+                    while (cur is Cons lc) { paramNames.Add(GetString(lc.Car)); cur = lc.Cdr; }
+                    break;
+                case "BODY": bodyInstrs = val; break;
+                case "PKG": defPkg = GetString(val); break;
+            }
+            plist = Cddr(pc);
+        }
+
+        if (bodyInstrs == null) throw new Exception("DEFMETHOD-NATIVE: missing :body");
+        int paramCount = paramNames.Count;
+        if (paramCount < 1 || paramCount > 4)
+            throw new Exception($"DEFMETHOD-NATIVE: param-count {paramCount} not supported (1-4 only)");
+
+        if (_faslMode && _faslTypeBuilder != null)
+        {
+            int faslId = Interlocked.Increment(ref _faslClosureCount);
+            FaslAssembler.EmitDefmethodNativeInto(_faslTypeBuilder, _il, _faslStructMap!,
+                name, paramCount, bodyInstrs, defPkg, faslId);
+            return;
+        }
+
+        // Native DynamicMethod: LispObject Name_native(long p0, ...)
+        // Long params avoid arg boxing; body returns LispObject (arithmetic already boxes via Fixnum.Make).
+        var nativeParamTypes = new Type[paramCount];
+        for (int i = 0; i < paramCount; i++) nativeParamTypes[i] = typeof(long);
+        var nativeDm = new DynamicMethod(name + "_native", typeof(LispObject), nativeParamTypes,
+            typeof(CilAssembler).Module, true);
+        var innerAsm = new CilAssembler();
+        innerAsm._il = nativeDm.GetILGenerator();
+        innerAsm.Assemble(bodyInstrs);
+
+        // Create LispFunction with wrapper lambdas (unbox args; native returns LispObject directly)
+        LispFunction fn;
+        switch (paramCount)
+        {
+            case 1:
+            {
+                var d = (Func<long, LispObject>)nativeDm.CreateDelegate(typeof(Func<long, LispObject>));
+                var n = name;
+                fn = new LispFunction(
+                    args => { Runtime.CheckArityExact(n, args, 1); return d(((Fixnum)args[0]).Value); },
+                    name, 1);
+                fn._func1 = a => d(((Fixnum)a).Value);
+                fn._nativeFunc1 = d;
+                break;
+            }
+            case 2:
+            {
+                var d = (Func<long, long, LispObject>)nativeDm.CreateDelegate(typeof(Func<long, long, LispObject>));
+                var n = name;
+                fn = new LispFunction(
+                    args => { Runtime.CheckArityExact(n, args, 2); return d(((Fixnum)args[0]).Value, ((Fixnum)args[1]).Value); },
+                    name, 2);
+                fn._func2 = (a, b) => d(((Fixnum)a).Value, ((Fixnum)b).Value);
+                fn._nativeFunc2 = d;
+                break;
+            }
+            case 3:
+            {
+                var d = (Func<long, long, long, LispObject>)nativeDm.CreateDelegate(typeof(Func<long, long, long, LispObject>));
+                var n = name;
+                fn = new LispFunction(
+                    args => { Runtime.CheckArityExact(n, args, 3); return d(((Fixnum)args[0]).Value, ((Fixnum)args[1]).Value, ((Fixnum)args[2]).Value); },
+                    name, 3);
+                fn._func3 = (a, b, c) => d(((Fixnum)a).Value, ((Fixnum)b).Value, ((Fixnum)c).Value);
+                fn._nativeFunc3 = d;
+                break;
+            }
+            case 4:
+            {
+                var d = (Func<long, long, long, long, LispObject>)nativeDm.CreateDelegate(typeof(Func<long, long, long, long, LispObject>));
+                var n = name;
+                fn = new LispFunction(
+                    args => { Runtime.CheckArityExact(n, args, 4); return d(((Fixnum)args[0]).Value, ((Fixnum)args[1]).Value, ((Fixnum)args[2]).Value, ((Fixnum)args[3]).Value); },
+                    name, 4);
+                fn._func4 = (a, b, c, dd) => d(((Fixnum)a).Value, ((Fixnum)b).Value, ((Fixnum)c).Value, ((Fixnum)dd).Value);
+                fn._nativeFunc4 = d;
+                break;
+            }
+            default: throw new Exception("unreachable");
+        }
+
+        // SIL storage
+        try
+        {
+            var saveSilSym = Startup.SymInPkg("*SAVE-SIL*", "DOTCL");
+            if (DynamicBindings.Get(saveSilSym) is not Nil)
+                fn.Sil = bodyInstrs;
+        }
+        catch { }
+
+        // Symbol registration (same as HandleDefmethodDirect)
+        Symbol? pkgSym = null;
+        Symbol? setfTargetSym = null;
+        if (!name.StartsWith("("))
+        {
+            try
+            {
+                Package? pkg = defPkg != null ? Package.FindPackage(defPkg)
+                    : DynamicBindings.Get(Startup.Sym("*PACKAGE*")) as Package;
+                if (pkg != null)
+                {
+                    var (s, _) = pkg.Intern(name);
+                    var homePkg = s.HomePackage;
+                    bool isForeignCL = homePkg != null && homePkg != pkg && homePkg.Name == "COMMON-LISP";
+                    s.Function = fn;
+                    if (!isForeignCL) pkgSym = s;
+                }
+            }
+            catch { }
+        }
+        else if (name.StartsWith("(SETF ") && name.EndsWith(")"))
+        {
+            var targetName = name.Substring(6, name.Length - 7);
+            try
+            {
+                Package? pkg = defPkg != null ? Package.FindPackage(defPkg)
+                    : DynamicBindings.Get(Startup.Sym("*PACKAGE*")) as Package;
+                if (pkg != null)
+                {
+                    var (s, _) = pkg.Intern(targetName);
+                    s.SetfFunction = fn;
+                    setfTargetSym = s;
+                }
+            }
+            catch { }
+        }
+
+        int fnIdx = AddConstant(fn);
+        if (pkgSym != null)
+        {
+            int symIdx = AddConstant(pkgSym);
+            _il.Emit(OpCodes.Ldc_I4, symIdx);
+            _il.Emit(OpCodes.Call, _getConstant);
+            _il.Emit(OpCodes.Castclass, typeof(Symbol));
+            _il.Emit(OpCodes.Ldc_I4, fnIdx);
+            _il.Emit(OpCodes.Call, _getConstant);
+            _il.Emit(OpCodes.Castclass, typeof(LispFunction));
+            _il.Emit(OpCodes.Call, _registerFunctionOnSymbol);
+        }
+        if (setfTargetSym != null)
+        {
             int setfSymIdx = AddConstant(setfTargetSym);
             _il.Emit(OpCodes.Ldc_I4, setfSymIdx);
             _il.Emit(OpCodes.Call, _getConstant);
@@ -2357,6 +2534,10 @@ public class CilAssembler
             ["LispFunction.Invoke6"] = typeof(LispFunction).GetMethod("Invoke6")!,
             ["LispFunction.Invoke7"] = typeof(LispFunction).GetMethod("Invoke7")!,
             ["LispFunction.Invoke8"] = typeof(LispFunction).GetMethod("Invoke8")!,
+            ["LispFunction.InvokeNative1"] = typeof(LispFunction).GetMethod("InvokeNative1")!,
+            ["LispFunction.InvokeNative2"] = typeof(LispFunction).GetMethod("InvokeNative2")!,
+            ["LispFunction.InvokeNative3"] = typeof(LispFunction).GetMethod("InvokeNative3")!,
+            ["LispFunction.InvokeNative4"] = typeof(LispFunction).GetMethod("InvokeNative4")!,
             ["LispFunction.get_RawFunction"] =
                 typeof(LispFunction).GetProperty("RawFunction")!.GetGetMethod()!,
 

@@ -325,38 +325,64 @@ $(DOTCL_ROOT)compiler/dotcl.core: $(DOTCL_ROOT)compiler/cil-out.sil
 
 compile-core-fasl: $(DOTCL_ROOT)compiler/dotcl.core
 
-# R2R-compile dotcl.core for win-arm64 via crossgen2 so the RID nupkg ships
-# a pre-native FASL. Cold RunCore drops from ~3.37s to ~50ms, warm from
-# ~107ms to ~16ms (D704). crossgen2 is downloaded as a NuGet pack during
-# any prior PublishReadyToRun build; we pick whichever version is cached.
-CROSSGEN2_WIN_ARM64 := $(firstword $(wildcard $(HOME)/.nuget/packages/microsoft.netcore.app.crossgen2.win-arm64/*/tools/crossgen2.exe))
-DOTNET_RUNTIME_REF_DIR := C:\Program Files\dotnet\shared\Microsoft.NETCore.App\10.0.5
+# R2R-compile dotcl.core / asdf.fasl per RID via crossgen2 cross-compile so
+# each RID nupkg ships pre-native FASLs. Cold RunCore drops from ~3.37s to
+# ~50ms, warm from ~107ms to ~16ms (D704/D705). crossgen2 host tool is
+# always the dev machine's (win-arm64); --targetos / --targetarch produce
+# code for any target. (D914 で win-arm64 から全 RID に拡張)
+R2R_RIDS := win-x64 win-arm64 linux-x64 linux-arm64 osx-x64 osx-arm64
 
-compile-core-fasl-r2r-win-arm64: compile-core-fasl
-	@test -n "$(CROSSGEN2_WIN_ARM64)" || (echo "error: crossgen2 for win-arm64 not found. Run 'dotnet publish -r win-arm64 -c Release /p:PublishReadyToRun=true' from runtime/ once to seed the NuGet cache." && exit 1)
-	dotnet publish $(DOTCL_ROOT)runtime/runtime.csproj -c Release -r win-arm64 --self-contained false -p:PublishReadyToRun=true >/dev/null
-	cp $(DOTCL_ROOT)compiler/dotcl.core $(DOTCL_ROOT)compiler/dotcl.core.dll
-	"$(CROSSGEN2_WIN_ARM64)" $(DOTCL_ROOT)compiler/dotcl.core.dll \
-	  -r "$(DOTNET_RUNTIME_REF_DIR)\*.dll" \
-	  -r "$(DOTCL_ROOT)runtime/bin/Release/net10.0/win-arm64/publish/runtime.dll" \
-	  --targetos windows --targetarch arm64 -O \
-	  -o $(DOTCL_ROOT)compiler/dotcl-r2r-win-arm64.core
-	rm -f $(DOTCL_ROOT)compiler/dotcl.core.dll
+# Map RID → (targetos, targetarch) for crossgen2 cross-compile flags.
+TARGETOS_win-x64 := windows
+TARGETARCH_win-x64 := x64
+TARGETOS_win-arm64 := windows
+TARGETARCH_win-arm64 := arm64
+TARGETOS_linux-x64 := linux
+TARGETARCH_linux-x64 := x64
+TARGETOS_linux-arm64 := linux
+TARGETARCH_linux-arm64 := arm64
+TARGETOS_osx-x64 := osx
+TARGETARCH_osx-x64 := x64
+TARGETOS_osx-arm64 := osx
+TARGETARCH_osx-arm64 := arm64
 
-# Same crossgen2 treatment for asdf.fasl. asdf references dotcl.core
-# (defpackage/defmacro etc come from there), so we pass the IL dotcl.core
-# as a reference. (D705)
-compile-asdf-fasl-r2r-win-arm64: compile-asdf-fasl compile-core-fasl-r2r-win-arm64
-	@test -n "$(CROSSGEN2_WIN_ARM64)" || (echo "error: crossgen2 not found" && exit 1)
-	cp $(DOTCL_ROOT)contrib/asdf/asdf.fasl $(DOTCL_ROOT)contrib/asdf/asdf.fasl.dll
-	cp $(DOTCL_ROOT)compiler/dotcl.core $(DOTCL_ROOT)compiler/dotcl.core.dll
-	"$(CROSSGEN2_WIN_ARM64)" $(DOTCL_ROOT)contrib/asdf/asdf.fasl.dll \
-	  -r "$(DOTNET_RUNTIME_REF_DIR)\*.dll" \
-	  -r "$(DOTCL_ROOT)runtime/bin/Release/net10.0/win-arm64/publish/runtime.dll" \
-	  -r "$(DOTCL_ROOT)compiler/dotcl.core.dll" \
-	  --targetos windows --targetarch arm64 -O \
-	  -o $(DOTCL_ROOT)contrib/asdf/asdf-r2r-win-arm64.fasl
-	rm -f $(DOTCL_ROOT)contrib/asdf/asdf.fasl.dll $(DOTCL_ROOT)compiler/dotcl.core.dll
+# crossgen2 host tool (dev machine = win-arm64).
+CROSSGEN2 := $(firstword $(wildcard $(HOME)/.nuget/packages/microsoft.netcore.app.crossgen2.win-arm64/*/tools/crossgen2.exe))
+
+# Per-RID runtime ref dir (NuGet cache; populated by `dotnet publish -r <rid>`).
+runtime_ref = $(firstword $(wildcard $(HOME)/.nuget/packages/microsoft.netcore.app.runtime.$(1)/*/runtimes/$(1)/lib/net10.0))
+
+# Generate compile-{core,asdf}-fasl-r2r-<rid> targets for each RID.
+define R2R_RULES
+compile-core-fasl-r2r-$(1): compile-core-fasl
+	@test -n "$$(CROSSGEN2)" || (echo "error: crossgen2 not found. Seed: 'dotnet publish -r $(1) -c Release /p:PublishReadyToRun=true'" && exit 1)
+	@test -n "$$(call runtime_ref,$(1))" || (echo "error: runtime ref for $(1) not found. Seed: 'dotnet publish -r $(1) ...'" && exit 1)
+	dotnet publish $$(DOTCL_ROOT)runtime/runtime.csproj -c Release -r $(1) --self-contained false -p:PublishReadyToRun=true >/dev/null
+	cp $$(DOTCL_ROOT)compiler/dotcl.core $$(DOTCL_ROOT)compiler/dotcl.core.dll
+	"$$(CROSSGEN2)" $$(DOTCL_ROOT)compiler/dotcl.core.dll \
+	  -r "$$(call runtime_ref,$(1))/*.dll" \
+	  -r "$$(DOTCL_ROOT)runtime/bin/Release/net10.0/$(1)/publish/runtime.dll" \
+	  --targetos $(TARGETOS_$(1)) --targetarch $(TARGETARCH_$(1)) -O \
+	  -o $$(DOTCL_ROOT)compiler/dotcl-r2r-$(1).core
+	rm -f $$(DOTCL_ROOT)compiler/dotcl.core.dll
+
+compile-asdf-fasl-r2r-$(1): compile-asdf-fasl compile-core-fasl-r2r-$(1)
+	@test -n "$$(CROSSGEN2)" || (echo "error: crossgen2 not found" && exit 1)
+	cp $$(DOTCL_ROOT)contrib/asdf/asdf.fasl $$(DOTCL_ROOT)contrib/asdf/asdf.fasl.dll
+	cp $$(DOTCL_ROOT)compiler/dotcl.core $$(DOTCL_ROOT)compiler/dotcl.core.dll
+	"$$(CROSSGEN2)" $$(DOTCL_ROOT)contrib/asdf/asdf.fasl.dll \
+	  -r "$$(call runtime_ref,$(1))/*.dll" \
+	  -r "$$(DOTCL_ROOT)runtime/bin/Release/net10.0/$(1)/publish/runtime.dll" \
+	  -r "$$(DOTCL_ROOT)compiler/dotcl.core.dll" \
+	  --targetos $(TARGETOS_$(1)) --targetarch $(TARGETARCH_$(1)) -O \
+	  -o $$(DOTCL_ROOT)contrib/asdf/asdf-r2r-$(1).fasl
+	rm -f $$(DOTCL_ROOT)contrib/asdf/asdf.fasl.dll $$(DOTCL_ROOT)compiler/dotcl.core.dll
+endef
+
+$(foreach rid,$(R2R_RIDS),$(eval $(call R2R_RULES,$(rid))))
+
+compile-core-fasl-r2r-all: $(addprefix compile-core-fasl-r2r-,$(R2R_RIDS))
+compile-asdf-fasl-r2r-all: $(addprefix compile-asdf-fasl-r2r-,$(R2R_RIDS))
 
 # Publish contrib/dotcl-cs helper DLL + Roslyn deps into
 # contrib/dotcl-cs/lib/. Invoked during `make pack` so the tool NuGet
@@ -373,11 +399,13 @@ contrib-dotcl-cs:
 # Nuke runtime/contrib first so a contrib directory deleted from source
 # stops shipping in the nupkg (fixes D691: old dotcl-repl/ stayed in the
 # installed tool for at least one release after its source was removed).
-pack: compile-asdf-fasl compile-core-fasl compile-contrib-fasls contrib-dotcl-cs compile-core-fasl-r2r-win-arm64 compile-asdf-fasl-r2r-win-arm64
+pack: compile-asdf-fasl compile-core-fasl compile-contrib-fasls contrib-dotcl-cs compile-core-fasl-r2r-all compile-asdf-fasl-r2r-all
 	rm -rf $(DOTCL_ROOT)runtime/contrib
 	cp $(DOTCL_ROOT)compiler/dotcl.core $(DOTCL_ROOT)runtime/dotcl.core
-	cp $(DOTCL_ROOT)compiler/dotcl-r2r-win-arm64.core $(DOTCL_ROOT)runtime/dotcl-r2r-win-arm64.core
-	cp $(DOTCL_ROOT)contrib/asdf/asdf-r2r-win-arm64.fasl $(DOTCL_ROOT)runtime/asdf-r2r-win-arm64.fasl
+	@for rid in $(R2R_RIDS); do \
+		cp $(DOTCL_ROOT)compiler/dotcl-r2r-$$rid.core $(DOTCL_ROOT)runtime/dotcl-r2r-$$rid.core; \
+		cp $(DOTCL_ROOT)contrib/asdf/asdf-r2r-$$rid.fasl $(DOTCL_ROOT)runtime/asdf-r2r-$$rid.fasl; \
+	done
 	mkdir -p $(DOTCL_ROOT)runtime/contrib/asdf
 	cp -r $(DOTCL_ROOT)contrib/*/ $(DOTCL_ROOT)runtime/contrib/
 	rm -f $(DOTCL_ROOT)runtime/contrib/asdf/asdf.lisp $(DOTCL_ROOT)runtime/contrib/asdf/asdf.sil
@@ -385,7 +413,10 @@ pack: compile-asdf-fasl compile-core-fasl compile-contrib-fasls contrib-dotcl-cs
 	rm -f $(DOTCL_ROOT)runtime/contrib/dotcl-cs/*.csproj $(DOTCL_ROOT)runtime/contrib/dotcl-cs/*.cs
 	cp $(DOTCL_ROOT)contrib/asdf/asdf.fasl $(DOTCL_ROOT)runtime/contrib/asdf/asdf.fasl
 	dotnet pack $(DOTCL_ROOT)runtime/runtime.csproj --configuration Release -o $(DOTCL_ROOT)out/
-	rm -f $(DOTCL_ROOT)runtime/dotcl.core $(DOTCL_ROOT)runtime/dotcl-r2r-win-arm64.core $(DOTCL_ROOT)runtime/asdf-r2r-win-arm64.fasl
+	rm -f $(DOTCL_ROOT)runtime/dotcl.core
+	@for rid in $(R2R_RIDS); do \
+		rm -f $(DOTCL_ROOT)runtime/dotcl-r2r-$$rid.core $(DOTCL_ROOT)runtime/asdf-r2r-$$rid.fasl; \
+	done
 
 # Install as global dotnet tool from local package
 install: pack
