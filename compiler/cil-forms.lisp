@@ -33,6 +33,13 @@
    within the TCO scope. Reset to NIL at function entry; compile-progn
    and compile-if set it appropriately.")
 
+(defvar *labels-mutual-tco* nil
+  "Dispatch table for labels mutual TCO (#124/D919). Each entry:
+   (name-str fn-index which-fn-key tcoloop-label shared-param-keys).
+   NIL outside a mutual-TCO labels group. Reset to NIL in every
+   compile-function-body-*/compile-closure-body so closures compiled
+   within the group never emit br-to-outer-TCOLOOP.")
+
 (defvar *in-try-block* nil
   "Non-NIL when the currently-being-compiled expression is inside a try/
    finally region whose finally must run on exit (e.g. special-variable
@@ -186,6 +193,31 @@
               ,(if *tco-in-try-catch*
                    `(:leave ,*tco-loop-label*)
                    `(:br ,*tco-loop-label*))))))
+      ;; Mutual-TCO: tail call to a labels sibling → update shared params + br TCOLOOP (#124/D919)
+      (when (and *in-tail-position*
+                 (or *tco-in-try-catch* (not *in-try-block*))
+                 *labels-mutual-tco*)
+        (let ((mtco (assoc name-str *labels-mutual-tco* :test #'string=)))
+          (when mtco
+            (let* ((fn-index (second mtco))
+                   (which-fn-key (third mtco))
+                   (tcoloop-label (fourth mtco))
+                   (shared-param-keys (fifth mtco)))
+              (when (= n-args (length shared-param-keys))
+                (let* ((da (compile-direct-call-args args))
+                       (temps (car da))
+                       (eval-instrs (cdr da)))
+                  (return-from compile-named-call
+                    `(,@eval-instrs
+                      ,@(loop for tmp in temps
+                              for key in shared-param-keys
+                              append `((:ldloc ,tmp) (:stloc ,key)))
+                      (:ldc-i4 ,fn-index)
+                      (:stloc ,which-fn-key)
+                      ,@*tco-leave-instrs*
+                      ,(if *tco-in-try-catch*
+                           `(:leave ,tcoloop-label)
+                           `(:br ,tcoloop-label))))))))))
       ;; Non-tail self-call fast path: reuse LispFunction cached at body entry.
       (when (and *self-fn-local*
                  (not (assoc name-str *local-functions* :test #'string=))
@@ -193,13 +225,14 @@
                      (eq name *tco-self-symbol*)
                      (string= name-str *tco-self-name*))
                  (<= n-args 8))
-        (let* ((da (compile-direct-call-args args))
+        (let* ((skip-reset (single-value-form-p (cons name args)))
+               (da (compile-direct-call-args args))
                (temps (car da))
                (eval-instrs (cdr da)))
           (return-from compile-named-call
             `(,@eval-instrs
               (:ldloc ,*self-fn-local*)
-              (:call "MultipleValues.Reset")
+              ,@(unless skip-reset '((:call "MultipleValues.Reset")))
               ,@(loop for tmp in temps append `((:ldloc ,tmp)))
               (:callvirt ,(format nil "LispFunction.Invoke~D" n-args)))))))
     ;; Inline struct accessor: (accessor-name obj) → StructRefI with raw int index
@@ -220,7 +253,8 @@
     (let ((args-tmp (gen-local "NCARGS"))
           (name-str (mangle-name name))
           (n-args (length args))
-          (local-fn (assoc (mangle-name name) *local-functions* :test #'string=)))
+          (local-fn (assoc (mangle-name name) *local-functions* :test #'string=))
+          (skip-reset (single-value-form-p (cons name args))))
     (if local-fn
         ;; Local function (flet/labels): load from local or box, cast, invoke
         (let ((key (second local-fn))
@@ -235,7 +269,7 @@
                         `((:ldloc ,key) (:ldc-i4 0) (:ldelem-ref))
                         `((:ldloc ,key)))
                   (:castclass "LispFunction")
-                  (:call "MultipleValues.Reset")
+                  ,@(unless skip-reset '((:call "MultipleValues.Reset")))
                   ,@(loop for tmp in temps append `((:ldloc ,tmp)))
                   (:callvirt ,(format nil "LispFunction.Invoke~D" n-args))))
               `((:declare-local ,args-tmp "LispObject[]")
@@ -244,7 +278,7 @@
                       `((:ldloc ,key) (:ldc-i4 0) (:ldelem-ref))
                       `((:ldloc ,key)))
                 (:castclass "LispFunction")
-                (:call "MultipleValues.Reset")
+                ,@(unless skip-reset '((:call "MultipleValues.Reset")))
                 (:ldloc ,args-tmp)
                 (:callvirt "LispFunction.Invoke"))))
         ;; Check if it's a captured boxed local (e.g. labels functions captured in closure)
@@ -260,14 +294,14 @@
                       `(,@eval-instrs
                         (:ldloc ,key) (:ldc-i4 0) (:ldelem-ref)
                         (:castclass "LispFunction")
-                        (:call "MultipleValues.Reset")
+                        ,@(unless skip-reset '((:call "MultipleValues.Reset")))
                         ,@(loop for tmp in temps append `((:ldloc ,tmp)))
                         (:callvirt ,(format nil "LispFunction.Invoke~D" n-args))))
                     `((:declare-local ,args-tmp "LispObject[]")
                       ,@(compile-args-array args) (:stloc ,args-tmp)
                       (:ldloc ,key) (:ldc-i4 0) (:ldelem-ref)
                       (:castclass "LispFunction")
-                      (:call "MultipleValues.Reset")
+                      ,@(unless skip-reset '((:call "MultipleValues.Reset")))
                       (:ldloc ,args-tmp)
                       (:callvirt "LispFunction.Invoke"))))
               ;; Global function — use symbol-based lookup (D115: fixes flat namespace collision)
@@ -278,7 +312,7 @@
                           `(,@(compile-sym-lookup name)
                             (:castclass "Symbol")
                             (:call "CilAssembler.GetFunctionBySymbol")
-                            (:call "MultipleValues.Reset")
+                            ,@(unless skip-reset '((:call "MultipleValues.Reset")))
                             ,@(loop for arg in args
                                     append (let ((*in-tail-position* nil)) (compile-expr arg)))
                             (:callvirt ,(format nil "LispFunction.Invoke~D" n-args)))
@@ -289,7 +323,7 @@
                               ,@(compile-sym-lookup name)
                               (:castclass "Symbol")
                               (:call "CilAssembler.GetFunctionBySymbol")
-                              (:call "MultipleValues.Reset")
+                              ,@(unless skip-reset '((:call "MultipleValues.Reset")))
                               ,@(loop for tmp in temps append `((:ldloc ,tmp)))
                               (:callvirt ,(format nil "LispFunction.Invoke~D" n-args)))))
                       `((:declare-local ,args-tmp "LispObject[]")
@@ -297,7 +331,7 @@
                         ,@(compile-sym-lookup name)
                         (:castclass "Symbol")
                         (:call "CilAssembler.GetFunctionBySymbol")
-                        (:call "MultipleValues.Reset")
+                        ,@(unless skip-reset '((:call "MultipleValues.Reset")))
                         (:ldloc ,args-tmp)
                         (:callvirt "LispFunction.Invoke")))
                   (if (<= n-args 8)
@@ -307,14 +341,14 @@
                         `(,@eval-instrs
                           (:ldstr ,(mangle-name name))
                           (:call "CilAssembler.GetFunction")
-                          (:call "MultipleValues.Reset")
+                          ,@(unless skip-reset '((:call "MultipleValues.Reset")))
                           ,@(loop for tmp in temps append `((:ldloc ,tmp)))
                           (:callvirt ,(format nil "LispFunction.Invoke~D" n-args))))
                       `((:declare-local ,args-tmp "LispObject[]")
                         ,@(compile-args-array args) (:stloc ,args-tmp)
                         (:ldstr ,(mangle-name name))
                         (:call "CilAssembler.GetFunction")
-                        (:call "MultipleValues.Reset")
+                        ,@(unless skip-reset '((:call "MultipleValues.Reset")))
                         (:ldloc ,args-tmp)
                         (:callvirt "LispFunction.Invoke"))))))))))
 
@@ -1105,6 +1139,9 @@
                    (tco-loop-label (when use-tco (gen-label "TCOLOOP")))
                    (*tco-self-name* (if use-tco fn-name nil))
                    (*tco-loop-label* (if use-tco tco-loop-label nil))
+                   ;; Reset mutual-TCO: closures compiled within labels group must not
+                   ;; emit br-to-outer-TCOLOOP (#124/D919).
+                   (*labels-mutual-tco* nil)
                    ;; Labels functions are stored in boxes, not symbols — skip self-fn caching (#125)
                    (*self-fn-local* (when (and use-tco (null *tco-local-fn-key*)) (gen-local "SELF-FN")))
                    ;; Self-fn caching: for (SETF NAME) functions, look up SetfFunction
@@ -1204,6 +1241,8 @@
            (*tco-in-try-catch* nil)
            (*self-fn-local* nil)
            (*in-tail-position* nil)
+           ;; Reset mutual-TCO: closures within labels group must not emit br-to-outer-TCOLOOP
+           (*labels-mutual-tco* nil)
            ;; Reset native state: inner lambdas don't inherit outer native context (#130)
            (*long-locals* nil)
            (*native-self-name* nil)
@@ -1894,7 +1933,7 @@
 (defun compile-let-with-specials (init-instrs bind-instrs body-instrs special-syms)
   "Wrap body with try/finally for special variable cleanup if needed."
   (if (null special-syms)
-      `(,@init-instrs ,@bind-instrs ,@body-instrs)
+      (eliminate-single-ref-locals `(,@init-instrs ,@bind-instrs ,@body-instrs))
       (let ((result-key (gen-local "RESULT")))
         `(,@init-instrs
           ,@bind-instrs
@@ -2154,6 +2193,8 @@
            (*tco-leave-instrs* nil)
            (*tco-in-try-catch* nil)
            (*self-fn-local* nil)
+           ;; Reset mutual-TCO: closures within labels group must not emit br-to-outer-TCOLOOP
+           (*labels-mutual-tco* nil)
            ;; Reset native state: closures don't inherit outer native body context (#130)
            (*long-locals* nil)
            (*native-self-name* nil)
@@ -2803,9 +2844,25 @@
       `(,@fn-instrs
         ,@(compile-progn body)))))
 
+(defun labels-required-only-params-p (params)
+  "Return T if PARAMS is a required-only lambda list with no &optional/&key/&rest/&aux."
+  (not (some (lambda (p) (member p '(&optional &key &rest &aux &allow-other-keys)))
+             params)))
+
 (defun compile-labels (fn-defs body)
   "Compile (labels ((name (params) body...) ...) body...).
-   Uses boxed locals for mutual recursion."
+   When all functions have the same required-only arity (>= 2 fns), uses a dispatch
+   loop for mutual tail call optimization (#124/D919). Otherwise uses boxed closures."
+  (let* ((n-fns (length fn-defs))
+         (first-arity (and fn-defs (length (cadr (first fn-defs))))))
+    (if (and (>= n-fns 2)
+             (every (lambda (f) (labels-required-only-params-p (cadr f))) fn-defs)
+             (every (lambda (f) (= (length (cadr f)) first-arity)) fn-defs))
+        (compile-labels-mutual-tco fn-defs body first-arity)
+        (compile-labels-boxed fn-defs body))))
+
+(defun compile-labels-boxed (fn-defs body)
+  "Compile (labels ...) using boxed closures (no mutual-TCO optimization)."
   (let ((box-instrs '())
         (new-local-fns '())
         (fn-compile-list '()))
@@ -2873,6 +2930,162 @@
       `(,@box-instrs
         ,@store-instrs
         ,@(compile-progn body)))))
+
+(defun compile-labels-build-new-locals (new-local-fns)
+  "Shared helper: build the *locals* additions for a labels group (box-as-variable bindings)."
+  (remove nil
+    (mapcar (lambda (lf)
+              (let* ((name-str (first lf)))
+                (unless (char= (char name-str 0) #\()
+                  (let* ((sym (intern name-str :dotcl.cil-compiler))
+                         (clash-p (assoc name-str *locals*
+                                         :key (lambda (k) (if (symbolp k) (symbol-name k) nil))
+                                         :test #'string=))
+                         (local-sym (if clash-p
+                                        (intern (concatenate 'string "__LABELFN_" name-str)
+                                                :dotcl.cil-compiler)
+                                        sym)))
+                    (cons local-sym (second lf))))))
+            new-local-fns)))
+
+(defun compile-labels-mutual-tco (fn-defs body arity)
+  "Compile (labels ...) where all functions have the same required ARITY.
+   Emits closures in boxes for non-tail calls, plus a dispatch loop for
+   mutual tail call optimization (#124/D919).
+   Dispatch loop structure:
+     TCOLOOP: dispatch by WHICH_FN index → fn body sections
+     Each fn body section: tail calls to siblings → br TCOLOOP; normal return → br TCOEND.
+   The labels body is compiled with *labels-mutual-tco* active so its own
+   tail calls to labels fns also enter the dispatch loop directly."
+  ;; Phase 1: allocate boxes (for non-tail calls), same as compile-labels-boxed
+  (let ((box-instrs '())
+        (new-local-fns '())
+        (fn-compile-list '()))
+    (dolist (fdef fn-defs)
+      (let* ((name (car fdef))
+             (name-str (mangle-name name))
+             (key (gen-local name-str)))
+        (setf box-instrs
+              (append box-instrs
+                      `((:declare-local ,key "LispObject[]")
+                        (:ldc-i4 1) (:newarr "LispObject")
+                        (:stloc ,key))))
+        (push (list name-str key t) new-local-fns)
+        (push (list name (cadr fdef) (cddr fdef) key) fn-compile-list)))
+    (setf new-local-fns (nreverse new-local-fns))
+    (setf fn-compile-list (nreverse fn-compile-list))
+    ;; Phase 2: compile closures into boxes; *labels-mutual-tco* is NIL here
+    ;; (compile-function-body-* resets it) so closures don't emit br-to-outer-TCOLOOP
+    (let* ((*local-functions* (append new-local-fns *local-functions*))
+           (new-locals (compile-labels-build-new-locals new-local-fns))
+           (*locals* (append new-locals *locals*))
+           (*boxed-vars* (append (mapcar #'car new-locals) *boxed-vars*))
+           (store-instrs '()))
+      (dolist (entry fn-compile-list)
+        (let ((name (first entry))
+              (params (second entry))
+              (fn-body (third entry))
+              (key (fourth entry)))
+          (let* ((name-str (mangle-name name))
+                 (lambda-instrs (let ((*tco-local-fn-key* key))
+                                  (if (and (symbolp name)
+                                           (some (lambda (f) (form-has-return-from-p name f)) fn-body))
+                                      (compile-lambda params `((block ,name ,@fn-body)) name-str)
+                                      (compile-lambda params fn-body name-str)))))
+            (setf store-instrs
+                  (append store-instrs
+                          `((:ldloc ,key) (:ldc-i4 0)
+                            ,@lambda-instrs
+                            (:stelem-ref)))))))
+      ;; Phase 3: dispatch loop infrastructure
+      ;; shared-param-keys: one LispObject local per param position, shared across all fn bodies
+      ;; which-fn-key: System.Int32 local that selects which fn to dispatch to
+      (let* ((shared-param-keys
+               (loop for i from 0 below arity
+                     collect (gen-local (format nil "LMARG~D" i))))
+             (which-fn-key (gen-local "LMWFN"))
+             (tcoloop-label (gen-label "LMTCO"))
+             (tcoend-label (gen-label "LMEND"))
+             ;; mtco-table: (name-str fn-index which-fn-key tcoloop-label shared-param-keys)
+             (mtco-table
+               (loop for fdef in fn-defs
+                     for i from 0
+                     collect (list (mangle-name (car fdef))
+                                   i
+                                   which-fn-key
+                                   tcoloop-label
+                                   shared-param-keys)))
+             ;; Int32 type string recognized by CilAssembler
+             (int32-type "Int32")
+             ;; Per-fn CIL labels for dispatch targets
+             (fn-labels
+               (loop for i from 0 below (length fn-defs)
+                     collect (gen-label (format nil "LMF~D" i)))))
+        ;; Phase 4: compile labels body with *labels-mutual-tco* active
+        ;; Tail calls to labels fns emit: store args, set which-fn, br tcoloop-label
+        (let* ((*labels-mutual-tco* (append mtco-table *labels-mutual-tco*))
+               (body-instrs (compile-progn body)))
+          ;; Phase 5: dispatch instructions (beq for fns 0..N-2; fn N-1 falls through)
+          (let ((dispatch-instrs
+                  (loop for lbl in (butlast fn-labels)
+                        for i from 0
+                        append `((:ldloc ,which-fn-key)
+                                 (:ldc-i4 ,i)
+                                 (:beq ,lbl)))))
+            ;; Phase 6: compile fn body sections inline (no compile-lambda wrapper)
+            ;; Each section: fn's params bound to shared-param-keys, *labels-mutual-tco* active
+            ;; Sections emitted in order: fn[N-1] (fall-through target), fn[0], ..., fn[N-2]
+            (let* ((fn-body-sections
+                     (loop for fdef in fn-defs
+                           for lbl in fn-labels
+                           collect
+                           (let* ((params (cadr fdef))
+                                  (fn-body (cddr fdef))
+                                  (fn-instrs
+                                    (let ((*locals*
+                                            (append (loop for p in params
+                                                          for key in shared-param-keys
+                                                          collect (cons p key))
+                                                    *locals*))
+                                          ;; Reset outer self-TCO: dispatch bodies have their own context
+                                          (*tco-self-name* nil)
+                                          (*tco-self-symbol* nil)
+                                          (*tco-loop-label* nil)
+                                          (*tco-param-entries* nil)
+                                          (*self-fn-local* nil)
+                                          (*tco-local-fn-key* nil)
+                                          ;; Dispatch body is always in tail position;
+                                          ;; its result IS the result of the labels form
+                                          (*in-tail-position* t)
+                                          (*labels-mutual-tco* (append mtco-table *labels-mutual-tco*)))
+                                      (let ((name (car fdef)))
+                                        (if (and (symbolp name)
+                                                 (some (lambda (f) (form-has-return-from-p name f))
+                                                       fn-body))
+                                            (compile-progn `((block ,name ,@fn-body)))
+                                            (compile-progn fn-body))))))
+                             (cons lbl fn-instrs))))
+                   ;; Emit order: fn[N-1] first (fall-through from dispatch), then fn[0]..fn[N-2]
+                   (sections-in-emit-order
+                     (append (last fn-body-sections) (butlast fn-body-sections)))
+                   ;; All section code: label + body + br to TCOEND
+                   (all-section-code
+                     (loop for (lbl . body-code) in sections-in-emit-order
+                           append `((:label ,lbl)
+                                    ,@body-code
+                                    (:br ,tcoend-label)))))
+              ;; Assemble complete instruction list
+              `(,@(loop for key in shared-param-keys
+                        collect `(:declare-local ,key "LispObject"))
+                (:declare-local ,which-fn-key ,int32-type)
+                ,@box-instrs
+                ,@store-instrs
+                ,@body-instrs
+                (:br ,tcoend-label)
+                (:label ,tcoloop-label)
+                ,@dispatch-instrs
+                ,@all-section-code
+                (:label ,tcoend-label)))))))))
 
 ;;; ============================================================
 ;;; block / return-from
@@ -3372,7 +3585,9 @@
                              (:call "HandlerClusterStack.PopCluster")
                              ,@(cond
                                  (var-is-special
-                                  ;; Bind as special (dynamic) variable with try/finally
+                                  ;; Bind as special (dynamic) variable with try/finally.
+                                  ;; Set *in-try-block* before compiling body so TCO hooks
+                                  ;; emit `leave` instead of `br` (mirrors compile-let, D920).
                                   (let ((tmp-key (gen-local "HCTMP")))
                                     `((:declare-local ,tmp-key "LispObject")
                                       (:ldloc ,cond-key) (:stloc ,tmp-key)
@@ -3382,7 +3597,8 @@
                                            (:castclass "Symbol")
                                            (:ldloc ,tmp-key)
                                            (:call "DynamicBindings.Push"))
-                                         (compile-progn real-body)
+                                         (let ((*in-try-block* (or *in-try-block* (list var))))
+                                           (compile-progn real-body))
                                          (list var)))))
                                  (var
                                   `((:declare-local ,var-key "LispObject")
@@ -3839,8 +4055,9 @@
            (:label ,end-label)
            (:ldloc ,result-key))))))
 
-(defun compile-cond (clauses)
-  "Compile (cond (test1 body1...) ...) to nested conditional."
+(defun compile-cond (clauses &optional shared-tmp)
+  "Compile (cond (test1 body1...) ...) to nested conditional.
+   shared-tmp: shared LispObject local for no-body arms (#114)."
   (if (null clauses)
       (emit-nil)
       (let* ((clause (car clauses))
@@ -3868,7 +4085,7 @@
                           ,@(compile-progn body)
                           (:br ,end-label)
                           (:label ,else-label)
-                          ,@(compile-cond (cdr clauses))
+                          ,@(compile-cond (cdr clauses) shared-tmp)
                           (:label ,end-label)))
                       ;; (cond ((and ...) body) ...): chain boolean branches
                       ((and (consp test) (member (car test) '(and or)) (cddr test))
@@ -3876,7 +4093,7 @@
                          ,@(compile-progn body)
                          (:br ,end-label)
                          (:label ,else-label)
-                         ,@(compile-cond (cdr clauses))
+                         ,@(compile-cond (cdr clauses) shared-tmp)
                          (:label ,end-label)))
                       (t
                         ;; Default: normalize MV state, then IsTruthy
@@ -3887,11 +4104,11 @@
                           ,@(compile-progn body)
                           (:br ,end-label)
                           (:label ,else-label)
-                          ,@(compile-cond (cdr clauses))
+                          ,@(compile-cond (cdr clauses) shared-tmp)
                           (:label ,end-label))))
-                    ;; No body: normalize test to single value; return it if truthy
-                    (let ((tmp (gen-local "CTMP")))
-                      `((:declare-local ,tmp "LispObject")
+                    ;; No body: all no-body arms share one CTMP slot (#114)
+                    (let ((tmp (or shared-tmp (gen-local "CTMP"))))
+                      `(,@(unless shared-tmp `((:declare-local ,tmp "LispObject")))
                         ,@(compile-expr test)
                         (:call "MultipleValues.Primary")
                         (:stloc ,tmp)
@@ -3901,7 +4118,7 @@
                         (:ldloc ,tmp)
                         (:br ,end-label)
                         (:label ,else-label)
-                        ,@(compile-cond (cdr clauses))
+                        ,@(compile-cond (cdr clauses) tmp)
                         (:label ,end-label))))))))))
 
 ;;; ============================================================

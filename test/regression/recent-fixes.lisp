@@ -1004,6 +1004,10 @@
 (defun %d827-absolute-p (p)
   (funcall (find-symbol "ABSOLUTE-PATHNAME-P" :uiop) p))
 
+;; D827 tests are Windows-specific: drive letter `C:\` style paths only
+;; mean "absolute" on Windows. On Linux/macOS the same string is just a
+;; relative-looking name, so the assertions don't hold. Gate with #+windows.
+#+windows
 (deftest d827-uiop-parse-unix-namestring-mixed-separator
   (let* ((bs (code-char 92))
          (s (format nil "C:~Cfoo/bar/baz.lisp" bs))
@@ -1011,6 +1015,7 @@
     (car (pathname-directory p)))
   :absolute)
 
+#+windows
 (deftest d827-uiop-parse-unix-namestring-pure-backslash
   (let* ((bs (code-char 92))
          (s (format nil "C:~Cfoo~Cbar~Cbaz.lisp" bs bs bs))
@@ -1020,6 +1025,7 @@
           (pathname-type p)))
   (:absolute "baz" "lisp"))
 
+#+windows
 (deftest d827-uiop-absolute-pathname-p-mixed
   (let* ((bs (code-char 92))
          (s (format nil "C:~Cfoo/bar/baz.asd" bs)))
@@ -1177,3 +1183,102 @@
 (deftest d903-native-ackermann
   (%d903-ack 3 4)
   125)
+
+;;; D914 — cond no-body arms share one CTMP slot (#114)
+;;; Correctness: shared slot must not bleed across arms
+
+(deftest d914-cond-no-body-first-truthy
+  (cond ((+ 1 2)) ((error "not reached")))
+  3)
+
+(deftest d914-cond-no-body-second-truthy
+  (cond (nil) ((+ 3 4)))
+  7)
+
+(deftest d914-cond-no-body-three-arms
+  (list (cond (nil) (nil) (t))
+        (cond (nil) (42) (t))
+        (cond (1) (2) (3)))
+  (t 42 1))
+
+(deftest d914-cond-no-body-mixed-with-body
+  (cond (nil) ((oddp 4) :even) ((+ 5 6)))
+  11)
+
+;;; D917 — fixnum multiply bignum promotion (#154)
+(deftest d917-fixnum-mul-bignum-literal
+  ;; Large literal * large literal must NOT silently wrap
+  (= (* 10000000000 10000000000) 100000000000000000000)
+  t)
+
+(deftest d917-fixnum-mul-declared-bignum
+  ;; Declared fixnum vars whose product overflows must promote to bignum
+  (let ((a 10000000000) (b 10000000000))
+    (declare (type fixnum a b))
+    (= (* a b) 100000000000000000000))
+  t)
+
+(deftest d917-fixnum-mul-small-stays-fixnum
+  (let ((a 1000) (b 1000))
+    (declare (type fixnum a b))
+    (= (* a b) 1000000))
+  t)
+
+;;; D916 — MultipleValues.Reset elision for known-single-value calls (#128)
+(declaim (ftype (function (fixnum fixnum) fixnum) d916-add2))
+(defun d916-add2 (a b) (+ a b))
+
+(deftest d916-single-value-correctness
+  (d916-add2 3 4)
+  7)
+
+(deftest d916-mvb-single-value
+  (multiple-value-bind (x y)
+      (d916-add2 10 20)
+    (list x y))
+  (30 nil))
+
+(deftest d916-mvl-single-value
+  (multiple-value-list (d916-add2 5 6))
+  (11))
+
+(deftest d916-nth-value
+  (nth-value 0 (d916-add2 7 8))
+  15)
+
+(deftest d916-mv-after-single
+  ;; MV state after a skip-reset call should not pollute next MV consumer
+  (progn
+    (d916-add2 1 2)
+    (multiple-value-list (values 10 20 30)))
+  (10 20 30))
+
+;;; D919 — labels mutual TCO dispatch loop (#124)
+(deftest d919-labels-mutual-tco-basic
+  ;; even?/odd? via labels dispatch loop: no stack overflow at large N
+  (labels ((even? (n) (if (= n 0) t (odd? (- n 1))))
+           (odd?  (n) (if (= n 0) nil (even? (- n 1)))))
+    (list (even? 0) (even? 1) (even? 4) (odd? 3) (even? 100000)))
+  (t nil t t t))
+
+(deftest d919-labels-mutual-tco-correctness
+  ;; Verify both values correct for small N
+  (labels ((my-even (n) (if (zerop n) t (my-odd (1- n))))
+           (my-odd  (n) (if (zerop n) nil (my-even (1- n)))))
+    (list (my-even 10) (my-odd 7) (my-even 3)))
+  (t t nil))
+
+(deftest d919-labels-same-fn-multiple-args
+  ;; Same-arity 2-arg labels mutual TCO
+  (labels ((f (a b) (if (= a 0) b (g (1- a) (+ b 1))))
+           (g (a b) (if (= a 0) b (f (1- a) (+ b 2)))))
+    (f 4 0))
+  6)
+
+(deftest d919-labels-non-tail-call-still-works
+  ;; Non-tail calls to labels fns use boxes (closures) — still correct
+  (labels ((double (n) (if (= n 0) 0 (+ 2 (double (1- n)))))
+           (triple (n) (if (= n 0) 0 (+ 3 (triple (1- n)))))
+           )
+    (list (double 3) (triple 2)))
+  (6 6))

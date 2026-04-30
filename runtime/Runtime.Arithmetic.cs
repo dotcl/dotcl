@@ -66,6 +66,15 @@ public static partial class Runtime
         return Arithmetic.Subtract(AsNumber(a), Fixnum.Make(1));
     }
 
+    /// <summary>Checked fixnum multiply: returns Fixnum or Bignum. (#154/D917)</summary>
+    public static LispObject MultiplyFixnum(long a, long b)
+    {
+        long hi = Math.BigMul(a, b, out long lo);
+        if (hi == (lo >> 63))
+            return Fixnum.Make(lo);
+        return Bignum.MakeInteger(new System.Numerics.BigInteger(a) * b);
+    }
+
     public static LispObject Multiply(LispObject a, LispObject b)
     {
         if (a is Fixnum fa && b is Fixnum fb)

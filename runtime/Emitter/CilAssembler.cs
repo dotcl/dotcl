@@ -256,11 +256,10 @@ public class CilAssembler
             targetSym.SetfFunction = fn;
             return;
         }
-        // Foreign-package override of a CL built-in: only set sym.Function on the
-        // current-package symbol (runtime dispatch), don't clobber the CL symbol's
-        // function slot. Without the flat _functions table this is now just the
-        // always-set at the end.
-        var checkedSym = Startup.Sym(name);
+        // Use bridge-free lookup: only CL + DOTCL-INTERNAL.
+        // Prevents RegisterFunction from silently overwriting another package's
+        // Function slot via the cross-package bridge (#158/D918).
+        var checkedSym = Startup.SymForRegistration(name);
         Runtime.CheckPackageLock(checkedSym, "DEFUN");  // may throw if locked
         checkedSym.Function = fn;
     }
@@ -2269,6 +2268,7 @@ public class CilAssembler
             ["Runtime.Increment"] = typeof(Runtime).GetMethod("Increment")!,
             ["Runtime.Decrement"] = typeof(Runtime).GetMethod("Decrement")!,
             ["Runtime.Multiply"] = typeof(Runtime).GetMethod("Multiply")!,
+            ["Runtime.MultiplyFixnum"] = typeof(Runtime).GetMethod("MultiplyFixnum")!,
             ["Runtime.Divide"] = typeof(Runtime).GetMethod("Divide")!,
             ["Runtime.AddN"] = typeof(Runtime).GetMethod("AddN")!,
             ["Runtime.SubtractN"] = typeof(Runtime).GetMethod("SubtractN")!,

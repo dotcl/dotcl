@@ -899,6 +899,21 @@ public static class Startup
         return newSym;
     }
 
+    /// <summary>
+    /// Bridge-free symbol lookup for C# function registration (write path).
+    /// Only looks in CL and DOTCL-INTERNAL; never adopts symbols from other packages.
+    /// Prevents RegisterFunction from silently overwriting other packages' Function slots. (#158/D918)
+    /// </summary>
+    internal static Symbol SymForRegistration(string name)
+    {
+        var (sym, status) = CL.FindSymbol(name);
+        if (status != SymbolStatus.None) return sym;
+        var (sym2, status2) = Internal.FindSymbol(name);
+        if (status2 != SymbolStatus.None) return sym2;
+        var (newSym, _) = Internal.Intern(name);
+        return newSym;
+    }
+
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<(string, string), Symbol> _symInPkgCache = new();
 
     public static Symbol SymInPkg(string name, string pkgName)

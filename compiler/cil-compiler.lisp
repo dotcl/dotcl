@@ -823,11 +823,16 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
        (:unbox-fixnum)))))
 
 (defun compile-fixnum-binop (args op)
-  "Emit: compile-as-long a, compile-as-long b, <op>, Fixnum.Make."
-  `(,@(compile-as-long (first args))
-    ,@(compile-as-long (second args))
-    (,op)
-    (:call "Fixnum.Make")))
+  "Emit native int64 binop, boxing result back to LispObject.
+   * uses Runtime.MultiplyFixnum which promotes to Bignum on overflow (#154/D917)."
+  (if (eq op :mul)
+      `(,@(compile-as-long (first args))
+        ,@(compile-as-long (second args))
+        (:call "Runtime.MultiplyFixnum"))
+      `(,@(compile-as-long (first args))
+        ,@(compile-as-long (second args))
+        (,op)
+        (:call "Fixnum.Make"))))
 
 (defun compile-fixnum-cmp (args op)
   "Emit native int64 comparison. OP is :lt :le :gt :ge :eq :ne.

@@ -409,6 +409,13 @@ pack: compile-asdf-fasl compile-core-fasl compile-contrib-fasls contrib-dotcl-cs
 	mkdir -p $(DOTCL_ROOT)runtime/contrib/asdf
 	cp -r $(DOTCL_ROOT)contrib/*/ $(DOTCL_ROOT)runtime/contrib/
 	rm -f $(DOTCL_ROOT)runtime/contrib/asdf/asdf.lisp $(DOTCL_ROOT)runtime/contrib/asdf/asdf.sil
+	# Strip cross-RID R2R fasls from contrib/asdf/ so each RID nupkg only ships
+	# its own R2R copy (overlaid by ReplaceFaslsWithR2R via runtime/asdf-r2r-<rid>.fasl
+	# which is at runtime/ top-level, separate from contrib/). Without this the
+	# `<None Include="contrib/**" PackagePath="tools/net10.0/any/contrib/">` glob
+	# packs all 6 R2R fasls into every RID's nupkg, and dotnet publish further
+	# duplicates them under tools/net10.0/<rid>/contrib/. (D922)
+	rm -f $(DOTCL_ROOT)runtime/contrib/asdf/asdf-r2r-*.fasl
 	rm -rf $(DOTCL_ROOT)runtime/contrib/dotcl-cs/bin $(DOTCL_ROOT)runtime/contrib/dotcl-cs/obj
 	rm -f $(DOTCL_ROOT)runtime/contrib/dotcl-cs/*.csproj $(DOTCL_ROOT)runtime/contrib/dotcl-cs/*.cs
 	cp $(DOTCL_ROOT)contrib/asdf/asdf.fasl $(DOTCL_ROOT)runtime/contrib/asdf/asdf.fasl

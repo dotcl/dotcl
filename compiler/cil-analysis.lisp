@@ -628,6 +628,63 @@
                         (push (cons sub (cons in-lambda mdepth)) worklist)))))))))))))
 
 ;;; ============================================================
+;;; Copy propagation: eliminate single-reference let locals (#198)
+;;; ============================================================
+
+(defun eliminate-single-ref-locals (instrs)
+  "Peephole: remove :declare-local / :stloc / :ldloc for single-reference locals.
+   A local KEY is eligible when:
+     - exactly 1 (:stloc KEY) and 1 (:ldloc KEY) appear in INSTRS
+     - type in the corresponding :declare-local is \"LispObject\" (not a box array)
+     - (:stloc KEY) and (:ldloc KEY) are consecutive in the non-:declare-local
+       instruction subsequence (only :declare-local instructions may appear between)
+   Preserves CIL stack semantics and evaluation order."
+  (let ((stloc-count (make-hash-table :test #'equal))
+        (ldloc-count (make-hash-table :test #'equal))
+        (local-type  (make-hash-table :test #'equal)))
+    (dolist (instr instrs)
+      (when (consp instr)
+        (let ((op (car instr)) (key (cadr instr)))
+          (cond
+            ((eq op :declare-local) (setf (gethash key local-type) (caddr instr)))
+            ((eq op :stloc) (incf (gethash key stloc-count 0)))
+            ((eq op :ldloc) (incf (gethash key ldloc-count 0)))))))
+    ;; Eligible keys: single stloc, single ldloc, LispObject type
+    (let ((single-ref (make-hash-table :test #'equal)))
+      (maphash (lambda (key sc)
+                 (when (and (= sc 1)
+                            (= (gethash key ldloc-count 0) 1)
+                            (string= (gethash key local-type "") "LispObject"))
+                   (setf (gethash key single-ref) t)))
+               stloc-count)
+      (when (zerop (hash-table-count single-ref))
+        (return-from eliminate-single-ref-locals instrs))
+      ;; Find consecutive (stloc KEY)(ldloc KEY) pairs skipping :declare-local
+      (let ((removable (make-hash-table :test #'equal))
+            (prev nil))
+        (dolist (instr instrs)
+          (when (consp instr)
+            (let ((op (car instr)) (key (cadr instr)))
+              (cond
+                ((eq op :declare-local))        ; transparent: don't reset prev
+                ((eq op :stloc)
+                 (setf prev (and (gethash key single-ref) key)))
+                ((eq op :ldloc)
+                 (cond
+                   ((and prev (equal prev key))
+                    (setf (gethash key removable) t)
+                    (setf prev nil))
+                   (t (setf prev nil))))
+                (t (setf prev nil))))))
+        (if (zerop (hash-table-count removable))
+            instrs
+            (remove-if (lambda (instr)
+                         (and (consp instr)
+                              (gethash (cadr instr) removable)
+                              (member (car instr) '(:declare-local :stloc :ldloc))))
+                       instrs))))))
+
+;;; ============================================================
 ;;; Top-level compilation
 ;;; ============================================================
 

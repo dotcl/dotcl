@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
 
 defaults:
   run:
@@ -35,7 +36,10 @@ jobs:
       - name: Build
         run: make build
 
-      - name: Regression tests (170/170 required)
+      - name: Compile asdf FASL (required by some regression tests)
+        run: make compile-asdf-fasl
+
+      - name: Regression tests
         run: make test-regression
 
   # ── Job 2: build nupkg and create GitHub Release ────────────────────────
@@ -61,9 +65,16 @@ jobs:
           curl -L https://raw.githubusercontent.com/roswell/roswell/master/scripts/install-for-ci.sh | bash
           echo "$HOME/.roswell/bin" >> $GITHUB_PATH
 
-      - name: Extract version from tag
+      - name: Extract version
         id: version
-        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "VERSION=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+          else
+            # workflow_dispatch on a branch — use a sentinel version so pack
+            # produces a recognisably-not-a-real-release artifact.
+            echo "VERSION=0.0.0-dispatch" >> "$GITHUB_OUTPUT"
+          fi
 
       # ── Compiler SIL output ──────────────────────────────────────────────
       - name: Cross-compile (generate cil-out.sil)
@@ -115,18 +126,26 @@ jobs:
           rm -f runtime/dotcl.core
 
       # ── Create GitHub Release and upload nupkg ───────────────────────────
+      # Tag push のみ。workflow_dispatch (manual / experiment) では skip
+      # (tag が存在しないので action-gh-release が動かない、また誤って
+      # 不正バージョンを release として残さないためにも skip 推奨)。
       - name: Create GitHub Release
+        if: github.event_name == 'push'
         uses: softprops/action-gh-release@v2
         with:
           files: out/*.nupkg
           generate_release_notes: true
 
-      # TODO (NuGet publish): Once NUGET_API_KEY is added as a repository
-      # secret, uncomment the step below to publish to NuGet.org automatically.
-      #
-      # - name: Publish to NuGet.org
-      #   run: |
-      #     dotnet nuget push out/*.nupkg \
-      #       --api-key ${{ secrets.NUGET_API_KEY }} \
-      #       --source https://api.nuget.org/v3/index.json \
-      #       --skip-duplicate
+      # ── Publish to NuGet.org ─────────────────────────────────────────────
+      # Requires NUGET_API_KEY repository secret.
+      # Runs only on tag push (real release); workflow_dispatch (manual /
+      # experiment runs) skips this step to avoid accidental publishes.
+      # --skip-duplicate makes the step idempotent if a re-run happens.
+      - name: Publish to NuGet.org
+        if: github.event_name == 'push'
+        run: |
+          dotnet nuget push out/*.nupkg \
+            --api-key ${{ secrets.NUGET_API_KEY }} \
+            --source https://api.nuget.org/v3/index.json \
+            --skip-duplicate \
+            --timeout 900
