@@ -401,6 +401,13 @@ public static class Startup
             featuresList = new Cons(Keyword(f), featuresList);
         starFeatures.Value = featuresList;
 
+        // *host-features* = snapshot of *features* at startup (host platform).
+        // compile-file may rebind *features* to target-features for cross-compilation,
+        // but *host-features* always reflects the actual running OS/arch.
+        var starHostFeatures = InternExport("*HOST-FEATURES*");
+        starHostFeatures.IsSpecial = true;
+        starHostFeatures.Value = featuresList;
+
         // Load-related special variables
         var loadPathname = InternExport("*LOAD-PATHNAME*");
         loadPathname.IsSpecial = true;

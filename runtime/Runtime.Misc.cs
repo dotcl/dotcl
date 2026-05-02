@@ -416,8 +416,27 @@ public static partial class Runtime
 
         string[] extensions = { ".fasl", ".sil", ".lisp" };
 
+        // OS key for per-OS fasl lookup (runtimes/{os}/name.fasl).
+        string osKey = OperatingSystem.IsWindows() ? "win"
+                     : OperatingSystem.IsMacOS()   ? "osx"
+                     : "linux";
+
         foreach (var dir in searchDirs)
         {
+            // Per-OS fasl: contrib/name/runtimes/{os}/name.fasl (checked before generic).
+            var osPath = Path.GetFullPath(Path.Combine(dir, name, "runtimes", osKey, name + ".fasl"));
+            if (File.Exists(osPath))
+            {
+                Load(new LispObject[] { new LispString(osPath) });
+                if (name == "asdf")
+                {
+                    RegisterContribWithAsdf(searchDirs.ToArray());
+                    RegisterStandardSourceRegistries();
+                    RegisterUserAsdSearchPaths();
+                }
+                return T.Instance;
+            }
+
             foreach (var ext in extensions)
             {
                 // contrib/name/name.ext
@@ -1163,6 +1182,7 @@ public static partial class Runtime
         LispObject? outputFileArg = null;
         LispObject? verboseArg = null;
         LispObject? printArg = null;
+        LispObject? targetFeaturesArg = null;
         bool emitSil = false; // default: PE assembly (.fasl); :sil t → also write text SIL
         bool allowOtherKeys = false;
 
@@ -1196,6 +1216,7 @@ public static partial class Runtime
                 case "SIL":
                     emitSil = args[i + 1] is not Nil;
                     break;
+                case "TARGET-FEATURES": targetFeaturesArg ??= args[i + 1]; break;
                 case "EXTERNAL-FORMAT": break; // accepted but ignored
                 case "ALLOW-OTHER-KEYS": break; // already handled
                 default:
@@ -1290,6 +1311,14 @@ public static partial class Runtime
         var compileFileModeSym = Startup.Sym("*COMPILE-FILE-MODE*");
         var oldCompileFileMode = DynamicBindings.Get(compileFileModeSym);
         DynamicBindings.Set(compileFileModeSym, Startup.Sym("T"));
+
+        // :target-features — rebind *features* so reader conditionals (#+/#-) and
+        // os-cond macro expansions see the target platform, not the host.
+        // Used for cross-compiling asdf.fasl for Linux/Win/macOS from any host.
+        var featuresSym = Startup.Sym("*FEATURES*");
+        var oldFeatures = DynamicBindings.Get(featuresSym);
+        if (targetFeaturesArg != null && targetFeaturesArg is not Nil)
+            DynamicBindings.Set(featuresSym, targetFeaturesArg);
 
         // Snapshot Function / SetfFunction state for all symbols. compile-file
         // may evaluate defun / (defun (setf x) ...) at compile-time so that
@@ -1430,8 +1459,10 @@ public static partial class Runtime
                 }
             }
 
-            // Restore *compile-file-mode*
+            // Restore *compile-file-mode* and dynamic bindings
             DynamicBindings.Set(compileFileModeSym, oldCompileFileMode);
+            if (targetFeaturesArg != null && targetFeaturesArg is not Nil)
+                DynamicBindings.Set(featuresSym, oldFeatures);
             DynamicBindings.Set(cfpSym, oldCfp);
             DynamicBindings.Set(cftSym, oldCft);
             DynamicBindings.Set(packageSym, oldPackage);

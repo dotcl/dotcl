@@ -4,7 +4,7 @@ INPUT ?= test/test1.lisp
 STDBUF ?=
 SETSID ?= $(shell which setsid 2>/dev/null)
 
-.PHONY: all build run clean repl test-a2 test-ansi test-ansi-all test-ansi-full test-regression test-mop update-ansi-state commit-ansi-state cross-compile loc publish pack install setup-ansi-test setup-asdf setup-cl-bench bench bench-state test-sbcl-host2 compile-asdf-fasl compile-core-fasl compile-contrib-fasls contrib-dotcl-cs
+.PHONY: all build run clean repl test-a2 test-ansi test-ansi-all test-ansi-full test-regression test-mop update-ansi-state commit-ansi-state cross-compile loc publish pack install setup-ansi-test setup-asdf setup-cl-bench bench bench-state test-sbcl-host2 compile-asdf-fasl compile-asdf-fasls compile-core-fasl compile-contrib-fasls contrib-dotcl-cs
 
 # Source files for cross-compile. Listed once; the recipe and dependency
 # tracking both reference this so adding a file is a single-edit change.
@@ -300,6 +300,34 @@ $(DOTCL_ROOT)contrib/asdf/asdf.fasl: $(DOTCL_ROOT)compiler/cil-out.sil $(DOTCL_R
 
 compile-asdf-fasl: setup-asdf $(DOTCL_ROOT)contrib/asdf/asdf.fasl
 
+# Per-OS asdf fasls: compile asdf.lisp with target-features for each platform.
+# These land in contrib/asdf/runtimes/{os}/asdf.fasl and are loaded by
+# module-provide-contrib in preference to the generic asdf.fasl.
+ASDF_TARGET_LINUX := (quote (:cl :common-lisp :dotcl :unix :linux :x86-64 :64-bit :little-endian))
+ASDF_TARGET_WIN   := (quote (:cl :common-lisp :dotcl :windows :win32 :x86-64 :64-bit :little-endian))
+ASDF_TARGET_OSX   := (quote (:cl :common-lisp :dotcl :unix :macos :darwin :bsd :x86-64 :64-bit :little-endian))
+
+$(DOTCL_ROOT)contrib/asdf/runtimes/linux/asdf.fasl: setup-asdf $(DOTCL_ROOT)compiler/cil-out.sil
+	mkdir -p $(DOTCL_ROOT)contrib/asdf/runtimes/linux
+	dotnet run --project $(DOTCL_ROOT)runtime -- --asm $(DOTCL_ROOT)compiler/cil-out.sil \
+	  --eval '(compile-file "$(DOTCL_ROOT)contrib/asdf/asdf.lisp" :output-file "$(DOTCL_ROOT)contrib/asdf/runtimes/linux/asdf.fasl" :target-features $(ASDF_TARGET_LINUX))'
+
+$(DOTCL_ROOT)contrib/asdf/runtimes/win/asdf.fasl: setup-asdf $(DOTCL_ROOT)compiler/cil-out.sil
+	mkdir -p $(DOTCL_ROOT)contrib/asdf/runtimes/win
+	LOCALAPPDATA=/tmp/dotcl-cross-win APPDATA=/tmp/dotcl-cross-win \
+	dotnet run --project $(DOTCL_ROOT)runtime -- --asm $(DOTCL_ROOT)compiler/cil-out.sil \
+	  --eval '(compile-file "$(DOTCL_ROOT)contrib/asdf/asdf.lisp" :output-file "$(DOTCL_ROOT)contrib/asdf/runtimes/win/asdf.fasl" :target-features $(ASDF_TARGET_WIN))'
+
+$(DOTCL_ROOT)contrib/asdf/runtimes/osx/asdf.fasl: setup-asdf $(DOTCL_ROOT)compiler/cil-out.sil
+	mkdir -p $(DOTCL_ROOT)contrib/asdf/runtimes/osx
+	dotnet run --project $(DOTCL_ROOT)runtime -- --asm $(DOTCL_ROOT)compiler/cil-out.sil \
+	  --eval '(compile-file "$(DOTCL_ROOT)contrib/asdf/asdf.lisp" :output-file "$(DOTCL_ROOT)contrib/asdf/runtimes/osx/asdf.fasl" :target-features $(ASDF_TARGET_OSX))'
+
+compile-asdf-fasls: \
+  $(DOTCL_ROOT)contrib/asdf/runtimes/linux/asdf.fasl \
+  $(DOTCL_ROOT)contrib/asdf/runtimes/win/asdf.fasl \
+  $(DOTCL_ROOT)contrib/asdf/runtimes/osx/asdf.fasl
+
 # Pre-build IL fasls for every contrib that ships a .asd. Project-core
 # builds (#166) consume these as ready artifacts instead of recompiling
 # contrib source per project. Pattern rule matches contrib/<name>/<name>.lisp
@@ -399,7 +427,7 @@ contrib-dotcl-cs:
 # Nuke runtime/contrib first so a contrib directory deleted from source
 # stops shipping in the nupkg (fixes D691: old dotcl-repl/ stayed in the
 # installed tool for at least one release after its source was removed).
-pack: compile-asdf-fasl compile-core-fasl compile-contrib-fasls contrib-dotcl-cs compile-core-fasl-r2r-all compile-asdf-fasl-r2r-all
+pack: compile-asdf-fasl compile-asdf-fasls compile-core-fasl compile-contrib-fasls contrib-dotcl-cs compile-core-fasl-r2r-all compile-asdf-fasl-r2r-all
 	rm -rf $(DOTCL_ROOT)runtime/contrib
 	cp $(DOTCL_ROOT)compiler/dotcl.core $(DOTCL_ROOT)runtime/dotcl.core
 	@for rid in $(R2R_RIDS); do \
