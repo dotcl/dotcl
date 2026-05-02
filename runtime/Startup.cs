@@ -113,7 +113,7 @@ public static class Startup
     // Features list
     private static readonly HashSet<string> _features = new()
     {
-        "DOTCL", "COMMON-LISP", "NET", "UNICODE"
+        "DOTCL", "COMMON-LISP", "NET", "UNICODE", "PACKAGE-LOCAL-NICKNAMES"
     };
 
     private static bool _initialized;
