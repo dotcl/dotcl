@@ -304,10 +304,10 @@ compile-asdf-fasl: setup-asdf $(DOTCL_ROOT)contrib/asdf/asdf.fasl
 # builds (#166) consume these as ready artifacts instead of recompiling
 # contrib source per project. Pattern rule matches contrib/<name>/<name>.lisp
 # → contrib/<name>/<name>.fasl. asdf is handled separately above.
-CONTRIB_NAMES := \
-  dotcl-cs dotcl-gray dotcl-socket dotcl-thread dotnet-class micros \
-  flexi-streams trivial-features trivial-garbage trivial-gray-streams \
-  trivial-package-local-nicknames trivial-sockets
+# CONTRIB_NAMES is auto-detected from contrib/*/ subdirs so that public
+# mirror builds (where externally-sourced contribs are excluded via
+# mirror-exclude) skip the missing dirs gracefully (dotcl/dotcl issue #2).
+CONTRIB_NAMES := $(filter-out asdf,$(notdir $(patsubst %/,%,$(wildcard $(DOTCL_ROOT)contrib/*/))))
 
 CONTRIB_FASLS := $(foreach n,$(CONTRIB_NAMES),$(DOTCL_ROOT)contrib/$(n)/$(n).fasl)
 

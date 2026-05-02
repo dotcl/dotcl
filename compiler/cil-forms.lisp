@@ -1037,7 +1037,7 @@
 (defun compile-function-body (params body &optional (fn-name ""))
   "Compile a function body. Params are bound from args array (arg 0).
    Handles &rest/&optional/&key parameters."
-  (compile-function-body-inner params body 0 fn-name))
+  (merge-disjoint-locals (compile-function-body-inner params body 0 fn-name)))
 
 (defun simple-required-only-p (params)
   "Return T if params is a simple required-only lambda list with <= 8 params."
@@ -1203,17 +1203,18 @@
                    ;; branches don't try to cross the try boundary (D683).
                    (*in-try-block* (or *in-try-block* (not (null special-param-syms))))
                    (body-instrs (compile-progn body)))
-              (if special-param-syms
-                  `(,@param-instrs
-                    ,@self-fn-prelude
-                    ,@(when use-tco `((:label ,tco-loop-label)))
-                    ,@(compile-let-with-specials '() special-push-instrs body-instrs special-param-syms)
-                    (:ret))
-                  `(,@param-instrs
-                    ,@self-fn-prelude
-                    ,@(when use-tco `((:label ,tco-loop-label)))
-                    ,@(maybe-tail-callvirt body-instrs)
-                    (:ret))))))))))
+              (merge-disjoint-locals
+               (if special-param-syms
+                   `(,@param-instrs
+                     ,@self-fn-prelude
+                     ,@(when use-tco `((:label ,tco-loop-label)))
+                     ,@(compile-let-with-specials '() special-push-instrs body-instrs special-param-syms)
+                     (:ret))
+                   `(,@param-instrs
+                     ,@self-fn-prelude
+                     ,@(when use-tco `((:label ,tco-loop-label)))
+                     ,@(maybe-tail-callvirt body-instrs)
+                     (:ret)))))))))))
 
 (defun compile-function-body-inner (params body args-arg-idx &optional (fn-name ""))
   "Compile function body, loading args from (:ldarg ARGS-ARG-IDX).
@@ -1495,17 +1496,18 @@
                   ;; D638: tail position preserves MvReturn for multi-value callers
                   (*in-tail-position* t)
                   (body-instrs (compile-progn body)))
-             (if special-param-syms
-                 `(,@arity-instrs
-                   ,@key-check-instrs
-                   ,@param-instrs
-                   ,@(compile-let-with-specials '() special-push-instrs body-instrs special-param-syms)
-                   (:ret))
-                 `(,@arity-instrs
-                   ,@key-check-instrs
-                   ,@param-instrs
-                   ,@body-instrs
-                   (:ret)))))))))))
+             (merge-disjoint-locals
+              (if special-param-syms
+                  `(,@arity-instrs
+                    ,@key-check-instrs
+                    ,@param-instrs
+                    ,@(compile-let-with-specials '() special-push-instrs body-instrs special-param-syms)
+                    (:ret))
+                  `(,@arity-instrs
+                    ,@key-check-instrs
+                    ,@param-instrs
+                    ,@body-instrs
+                    (:ret))))))))))))
 
 ;;; ============================================================
 ;;; let / let*
@@ -2512,17 +2514,18 @@
                                                 all-special-names :test #'string=))
                                       *locals*))
                  (body-instrs (compile-progn body)))
-            (if special-param-syms
-                `(,@arity-instrs
-                  ,@key-check-instrs
-                  ,@env-instrs ,@param-instrs
-                  ,@(compile-let-with-specials '() special-push-instrs body-instrs special-param-syms)
-                  (:ret))
-                `(,@arity-instrs
-                  ,@key-check-instrs
-                  ,@env-instrs ,@param-instrs
-                  ,@body-instrs
-                  (:ret))))))))))
+            (merge-disjoint-locals
+             (if special-param-syms
+                 `(,@arity-instrs
+                   ,@key-check-instrs
+                   ,@env-instrs ,@param-instrs
+                   ,@(compile-let-with-specials '() special-push-instrs body-instrs special-param-syms)
+                   (:ret))
+                 `(,@arity-instrs
+                   ,@key-check-instrs
+                   ,@env-instrs ,@param-instrs
+                   ,@body-instrs
+                   (:ret)))))))))))
 
 
 

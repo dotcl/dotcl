@@ -685,6 +685,104 @@
                        instrs))))))
 
 ;;; ============================================================
+;;; Slot sharing: merge LispObject locals with disjoint flat ranges (#199)
+;;; ============================================================
+
+(defun merge-disjoint-locals (instrs)
+  "Linear-scan slot sharing: merge LispObject locals whose flat live ranges
+   do not overlap. When last-use(K1) < first-def(K2) in flat instruction order,
+   K2 can reuse K1's slot. Reduces local variable count across exclusive cond arms.
+   Applied once per function body. Does NOT recurse into nested :body lists.
+   Skipped entirely when any backward branch is present (loops, TCO)."
+  ;; Pre-scan: bail out if any backward branch is present.
+  ;; A backward branch targets a label whose position <= the branch's own position.
+  (let ((label-pos (make-hash-table :test #'equal))
+        (scan-pos 0))
+    (dolist (instr instrs)
+      (when (and (consp instr) (eq (car instr) :label))
+        (setf (gethash (cadr instr) label-pos) scan-pos))
+      (incf scan-pos))
+    (let ((fwd-pos 0))
+      (dolist (instr instrs)
+        (when (and (consp instr)
+                   (member (car instr) '(:br :brtrue :brfalse))
+                   (let ((tgt (gethash (cadr instr) label-pos)))
+                     (and tgt (<= tgt fwd-pos))))
+          (return-from merge-disjoint-locals instrs))
+        (incf fwd-pos))))
+  (let ((first-pos  (make-hash-table :test #'equal))
+        (last-pos   (make-hash-table :test #'equal))
+        (local-type (make-hash-table :test #'equal))
+        (pos 0))
+    ;; Pass 1: collect types and compute [first-pos, last-pos] for each key
+    (dolist (instr instrs)
+      (when (consp instr)
+        (let ((op (car instr)) (key (cadr instr)))
+          (cond
+            ((eq op :declare-local)
+             (setf (gethash key local-type) (caddr instr)))
+            ((or (eq op :stloc) (eq op :ldloc))
+             (unless (gethash key first-pos)
+               (setf (gethash key first-pos) pos))
+             (setf (gethash key last-pos) pos)))))
+      (incf pos))
+    ;; Collect eligible candidates: LispObject type with at least one use
+    (let ((candidates nil))
+      (maphash (lambda (key type)
+                 (when (and (string= type "LispObject")
+                            (gethash key first-pos)
+                            (gethash key last-pos))
+                   (push (list (gethash key first-pos)
+                               (gethash key last-pos)
+                               key)
+                         candidates)))
+               local-type)
+      (when (< (length candidates) 2)
+        (return-from merge-disjoint-locals instrs))
+      ;; Sort by first-pos ascending
+      (setf candidates (sort candidates #'< :key #'first))
+      ;; Linear scan: for each key in order, find an expired free slot to reuse
+      ;; free-slots: list of (last-pos . canonical-key) cons cells
+      (let ((rename (make-hash-table :test #'equal))
+            (free-slots nil))
+        (dolist (cand candidates)
+          (let* ((fp (first cand))
+                 (lp (second cand))
+                 (key (third cand))
+                 (slot (find-if (lambda (s) (< (car s) fp)) free-slots)))
+            (if slot
+                (let ((canonical (cdr slot)))
+                  (setf (gethash key rename) canonical)
+                  (setf free-slots (delete slot free-slots :test #'eq))
+                  (push (cons lp canonical) free-slots))
+                (push (cons lp key) free-slots))))
+        (when (zerop (hash-table-count rename))
+          (return-from merge-disjoint-locals instrs))
+        ;; Pass 2: rename stloc/ldloc for merged keys; deduplicate :declare-local
+        (let ((seen-declare (make-hash-table :test #'equal)))
+          (remove nil
+                  (mapcar (lambda (instr)
+                            (cond
+                              ((not (consp instr)) instr)
+                              (t
+                               (let ((op (car instr)) (key (cadr instr)))
+                                 (cond
+                                   ((eq op :declare-local)
+                                    (let ((canonical (or (gethash key rename) key)))
+                                      (if (gethash canonical seen-declare)
+                                          nil
+                                          (progn
+                                            (setf (gethash canonical seen-declare) t)
+                                            `(:declare-local ,canonical ,(caddr instr))))))
+                                   ((or (eq op :stloc) (eq op :ldloc))
+                                    (let ((canonical (gethash key rename)))
+                                      (if canonical
+                                          `(,op ,canonical)
+                                          instr)))
+                                   (t instr))))))
+                          instrs)))))))
+
+;;; ============================================================
 ;;; Top-level compilation
 ;;; ============================================================
 

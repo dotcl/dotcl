@@ -50,10 +50,10 @@
        追従して platform-not-supported エラーになる。
        Startup.cs は #if DOTCL_NO_WINFORMS で UI-INVOKE / UI-POST 登録を
        skip する (DotNetWinForms 型自体が無いので参照しただけで CS0103)。 -->
-  <PropertyGroup Condition="$(RuntimeIdentifier.StartsWith('android')) Or $(RuntimeIdentifier.StartsWith('linux')) Or $(RuntimeIdentifier.StartsWith('osx'))">
+  <PropertyGroup Condition="$(RuntimeIdentifier.StartsWith('android')) Or $(RuntimeIdentifier.StartsWith('linux')) Or $(RuntimeIdentifier.StartsWith('osx')) Or '$(OS)' != 'Windows_NT'">
     <DefineConstants>$(DefineConstants);DOTCL_NO_WINFORMS</DefineConstants>
   </PropertyGroup>
-  <ItemGroup Condition="$(RuntimeIdentifier.StartsWith('android')) Or $(RuntimeIdentifier.StartsWith('linux')) Or $(RuntimeIdentifier.StartsWith('osx'))">
+  <ItemGroup Condition="$(RuntimeIdentifier.StartsWith('android')) Or $(RuntimeIdentifier.StartsWith('linux')) Or $(RuntimeIdentifier.StartsWith('osx')) Or '$(OS)' != 'Windows_NT'">
     <Compile Remove="Runtime.WinForms.cs" />
   </ItemGroup>
 

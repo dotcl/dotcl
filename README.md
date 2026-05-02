@@ -95,8 +95,7 @@ Each sample's `README.md` walks through the boot pattern.
   dotcl can rebuild itself.
 
 Architectural detail and design history are in
-[`DESIGN.md`](DESIGN.md). Per-change rationale is recorded under
-[`docs/decisions/`](docs/decisions/).
+[`DESIGN.md`](DESIGN.md).
 
 ## Platform notes
 
