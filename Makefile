@@ -356,7 +356,7 @@ compile-core-fasl: $(DOTCL_ROOT)compiler/dotcl.core
 # R2R-compile dotcl.core / asdf.fasl per RID via crossgen2 cross-compile so
 # each RID nupkg ships pre-native FASLs. Cold RunCore drops from ~3.37s to
 # ~50ms, warm from ~107ms to ~16ms (D704/D705). crossgen2 host tool is
-# always the dev machine's (win-arm64); --targetos / --targetarch produce
+# whatever RID the build machine is on; --targetos / --targetarch produce
 # code for any target. (D914 で win-arm64 から全 RID に拡張)
 R2R_RIDS := win-x64 win-arm64 linux-x64 linux-arm64 osx-x64 osx-arm64
 
@@ -374,8 +374,11 @@ TARGETARCH_osx-x64 := x64
 TARGETOS_osx-arm64 := osx
 TARGETARCH_osx-arm64 := arm64
 
-# crossgen2 host tool (dev machine = win-arm64).
-CROSSGEN2 := $(firstword $(wildcard $(HOME)/.nuget/packages/microsoft.netcore.app.crossgen2.win-arm64/*/tools/crossgen2.exe))
+# crossgen2 host tool. RID is auto-detected from `dotnet --info`; binary
+# name is `crossgen2.exe` on Windows, `crossgen2` elsewhere.
+HOST_RID := $(shell dotnet --info 2>/dev/null | awk '/^[[:space:]]*RID:/ {print $$2; exit}')
+CROSSGEN2_EXE := $(if $(filter win-%,$(HOST_RID)),crossgen2.exe,crossgen2)
+CROSSGEN2 := $(firstword $(wildcard $(HOME)/.nuget/packages/microsoft.netcore.app.crossgen2.$(HOST_RID)/*/tools/$(CROSSGEN2_EXE)))
 
 # Per-RID runtime ref dir (NuGet cache; populated by `dotnet publish -r <rid>`).
 runtime_ref = $(firstword $(wildcard $(HOME)/.nuget/packages/microsoft.netcore.app.runtime.$(1)/*/runtimes/$(1)/lib/net10.0))
