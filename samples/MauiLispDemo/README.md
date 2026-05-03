@@ -156,6 +156,7 @@ runtime emit するので XamlC を通すと "type not found" になる。csproj
 
 ```sh
 cd samples/MauiLispDemo
+dotnet workload restore       # Load necessary libraries
 dotnet build                  # Debug
 dotnet run -c Release         # Release (warm boot ~1s, debug は 5-10s)
 ```
