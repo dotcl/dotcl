@@ -19,6 +19,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+          fetch-depth: 0
 
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
@@ -42,11 +43,11 @@ jobs:
       - name: Regression tests
         run: make test-regression
 
-  # ── Job 2: build nupkg and create GitHub Release ────────────────────────
+  # ── Job 2: build nupkg + tbz and create GitHub Release ──────────────────
   release:
     needs: test
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     permissions:
       contents: write   # required by softprops/action-gh-release
 
@@ -54,6 +55,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+          fetch-depth: 0
 
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
@@ -94,10 +96,7 @@ jobs:
         run: make contrib-dotcl-cs
 
       # ── Stage runtime/contrib/ (mirrors the pack target, minus R2R) ──────
-      # This replicates what `make pack` does but intentionally omits the
-      # win-arm64 R2R steps (compile-core-fasl-r2r-win-arm64 / crossgen2)
-      # that require Windows tooling.  Multi-RID R2R support is tracked in
-      # issue #131 and will be added as a follow-up.
+      # R2R support is tracked in issue #131 and will be added as a follow-up.
       - name: Stage contrib for packing
         run: |
           rm -rf runtime/contrib
@@ -120,26 +119,49 @@ jobs:
             -p:RuntimeIdentifiers=any \
             -p:PublishReadyToRun=false
 
+      # ── Per-RID tbz for Roswell (no R2R; R2R tracked in issue #131) ──────
+      # dotnet publish -r <rid> --self-contained false cross-compiles on Linux
+      # for all 6 RIDs.  contrib/ and dotcl.core are injected after publish.
+      - name: Build per-RID tbz
+        run: |
+          VER=${{ steps.version.outputs.VERSION }}
+          mkdir -p out
+          for rid in win-x64 win-arm64 linux-x64 linux-arm64 osx-x64 osx-arm64; do
+            echo "=== publishing $rid ==="
+            dotnet publish runtime/runtime.csproj \
+              -c Release -r $rid --self-contained false \
+              -p:Version=$VER \
+              -p:PublishReadyToRun=false \
+              -o out/publish-$rid/
+            # inject contrib and dotcl.core
+            cp -r runtime/contrib out/publish-$rid/contrib
+            cp compiler/dotcl.core out/publish-$rid/dotcl.core
+            chmod +x out/publish-$rid/runtime 2>/dev/null || true
+            tar -cjf out/dotcl-$rid-$VER.tar.bz2 -C out/publish-$rid .
+            size=$(du -h out/dotcl-$rid-$VER.tar.bz2 | awk '{print $1}')
+            echo "==> out/dotcl-$rid-$VER.tar.bz2 ($size)"
+            rm -rf out/publish-$rid
+          done
+
       # ── Clean up staged runtime files ────────────────────────────────────
       - name: Clean staged artifacts from runtime/
         run: |
           rm -f runtime/dotcl.core
+          rm -rf runtime/contrib
 
-      # ── Create GitHub Release and upload nupkg ───────────────────────────
-      # Tag push のみ。workflow_dispatch (manual / experiment) では skip
-      # (tag が存在しないので action-gh-release が動かない、また誤って
-      # 不正バージョンを release として残さないためにも skip 推奨)。
+      # ── Create GitHub Release and upload nupkg + tbz ─────────────────────
+      # Tag push のみ。workflow_dispatch (manual / experiment) では skip。
       - name: Create GitHub Release
         if: github.event_name == 'push'
         uses: softprops/action-gh-release@v2
         with:
-          files: out/*.nupkg
+          files: |
+            out/*.nupkg
+            out/*.tar.bz2
           generate_release_notes: true
 
       # ── Publish to NuGet.org ─────────────────────────────────────────────
       # Requires NUGET_API_KEY repository secret.
-      # Runs only on tag push (real release); workflow_dispatch (manual /
-      # experiment runs) skips this step to avoid accidental publishes.
       # --skip-duplicate makes the step idempotent if a re-run happens.
       - name: Publish to NuGet.org
         if: github.event_name == 'push'

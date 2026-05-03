@@ -1405,6 +1405,19 @@ public static class Startup
             return Nil.Instance; // unreachable
         }));
 
+        // dotcl:command-line-arguments — full process argv (matches sb-ext:*posix-argv*).
+        // uiop:raw-command-line-arguments delegates here on dotcl. Includes argv[0]
+        // (the host executable / dotnet host path); user code typically wants
+        // uiop:command-line-arguments which strips implementation flags.
+        RegisterDotcl("COMMAND-LINE-ARGUMENTS", new LispFunction(args => {
+            var argv = System.Environment.GetCommandLineArgs();
+            LispObject result = Nil.Instance;
+            for (int i = argv.Length - 1; i >= 0; i--) {
+                result = new Cons(new LispString(argv[i]), result);
+            }
+            return result;
+        }));
+
         // dotcl:save-application — SBCL-style save-lisp-and-die for dotcl.
         // MVP: :executable nil only. See docs/plans/2026-04-21-save-application-design.md.
         RegisterDotcl("SAVE-APPLICATION", new LispFunction(
@@ -1472,9 +1485,10 @@ public static class Startup
             return Nil.Instance;
         }, "ALLOC-RESET", 0));
 
-        // dotcl:%run-process — run external process, return (list exit-code stdout-string stderr-string)
-        // Used by uiop:run-program in contrib/asdf/asdf.lisp
-        RegisterDotcl("%RUN-PROCESS", new LispFunction(args => {
+        // dotcl:run-process — run external process, return (list exit-code stdout-string stderr-string).
+        // Public API used by uiop:run-program in dotcl/asdf. Takes (exe args-list)
+        // where args-list is a list of strings. No shell wrapping; caller decides.
+        var runProcess = new LispFunction(args => {
             var exe = args[0] is LispString es ? es.Value : args[0].ToString();
             var argList = args.Length > 1 ? args[1] : Nil.Instance;
             var argStrings = new System.Collections.Generic.List<string>();
@@ -1502,7 +1516,9 @@ public static class Startup
             } catch (System.Exception ex) {
                 return Runtime.List(new Fixnum(1), new LispString(ex.Message), new LispString(""));
             }
-        }));
+        });
+        RegisterDotcl("RUN-PROCESS", runProcess);
+        RegisterDotcl("%RUN-PROCESS", runProcess); // backward-compat alias
 
         // DOTNET package functions
         RegisterDotNet(DotNetPkg, "LOAD-ASSEMBLY", new LispFunction(Runtime.DotNetLoadAssembly, "DOTNET:LOAD-ASSEMBLY", -1));

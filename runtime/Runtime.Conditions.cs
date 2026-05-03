@@ -56,37 +56,10 @@ public static partial class Runtime
         }
         if (args[0] is not LispString fmt)
             return ConditionSystem.Error(new LispError(args[0].ToString()));
-        string template = fmt.Value;
-        int argIdx = 1;
-        var sb = new System.Text.StringBuilder();
-        for (int i = 0; i < template.Length; i++)
-        {
-            if (i + 1 < template.Length && template[i] == '~')
-            {
-                char directive = char.ToUpper(template[i + 1]);
-                if (directive == 'A' || directive == 'S')
-                {
-                    if (argIdx < args.Length)
-                    {
-                        if (directive == 'A' && args[argIdx] is LispString s)
-                            sb.Append(s.Value);
-                        else
-                            sb.Append(args[argIdx]);
-                        argIdx++;
-                    }
-                    i++; // skip directive char
-                    continue;
-                }
-                else if (directive == '%')
-                {
-                    sb.Append('\n');
-                    i++;
-                    continue;
-                }
-            }
-            sb.Append(template[i]);
-        }
-        var err = new LispError(sb.ToString());
+        string message;
+        try { message = ((LispString)Format(Nil.Instance, args)).Value; }
+        catch { message = fmt.Value; }
+        var err = new LispError(message);
         err.ConditionTypeName = "SIMPLE-ERROR";
         err.FormatControl = fmt;
         err.FormatArguments = Runtime.List(args[1..]);
@@ -518,38 +491,10 @@ public static partial class Runtime
         }
         if (args[0] is not LispString fmt)
             return ConditionSystem.Warn(new LispWarning(args[0].ToString() ?? ""));
-        // Format the message (reuse the same logic as LispErrorFormat)
-        string template = fmt.Value;
-        int argIdx = 1;
-        var sb = new System.Text.StringBuilder();
-        for (int i = 0; i < template.Length; i++)
-        {
-            if (i + 1 < template.Length && template[i] == '~')
-            {
-                char directive = char.ToUpper(template[i + 1]);
-                if (directive == 'A' || directive == 'S')
-                {
-                    if (argIdx < args.Length)
-                    {
-                        if (directive == 'A' && args[argIdx] is LispString s)
-                            sb.Append(s.Value);
-                        else
-                            sb.Append(args[argIdx]);
-                        argIdx++;
-                    }
-                    i++;
-                    continue;
-                }
-                else if (directive == '%')
-                {
-                    sb.Append('\n');
-                    i++;
-                    continue;
-                }
-            }
-            sb.Append(template[i]);
-        }
-        var warn = new LispWarning(sb.ToString());
+        string message;
+        try { message = ((LispString)Format(Nil.Instance, args)).Value; }
+        catch { message = fmt.Value; }
+        var warn = new LispWarning(message);
         warn.ConditionTypeName = "SIMPLE-WARNING";
         warn.FormatControl = fmt;
         warn.FormatArguments = Runtime.List(args[1..]);

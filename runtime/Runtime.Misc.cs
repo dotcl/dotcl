@@ -433,6 +433,7 @@ public static partial class Runtime
                     RegisterContribWithAsdf(searchDirs.ToArray());
                     RegisterStandardSourceRegistries();
                     RegisterUserAsdSearchPaths();
+                    PatchUiopWindowsPath();
                 }
                 return T.Instance;
             }
@@ -449,6 +450,7 @@ public static partial class Runtime
                         RegisterContribWithAsdf(searchDirs.ToArray());
                         RegisterStandardSourceRegistries();
                         RegisterUserAsdSearchPaths();
+                        PatchUiopWindowsPath();
                     }
                     return T.Instance;
                 }
@@ -491,6 +493,51 @@ public static partial class Runtime
             }
         }
         PushDirsToCentralRegistry(dirs);
+    }
+
+    /// <summary>
+    /// On Windows hosts, wrap uiop:parse-unix-namestring so that strings
+    /// containing `\` separators or a drive-letter prefix are normalized
+    /// to UNIX form before reaching ASDF's parser. .NET's Path APIs return
+    /// native separators, so user code feeding `Path.Combine`-style results
+    /// straight into asdf:load-asd / asdf:load-system would otherwise hit
+    /// "Expected an absolute pathname" because the UNIX parser sees `\` as
+    /// a filename character. Runtime patch (no asdf source change), so the
+    /// behavior stays scoped to dotcl-on-Windows.
+    /// </summary>
+    private static void PatchUiopWindowsPath()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        const string patch = @"
+(let ((orig (fdefinition 'uiop:parse-unix-namestring)))
+  (setf (fdefinition 'uiop:parse-unix-namestring)
+        (lambda (name &rest keys)
+          (apply orig
+                 (if (and (stringp name)
+                          (>= (length name) 2)
+                          (or (find #\\ name)
+                              (and (alpha-char-p (char name 0))
+                                   (eql (char name 1) #\:))))
+                     (let ((s name))
+                       (when (find #\\ s)
+                         (setf s (substitute #\/ #\\ s)))
+                       (when (and (alpha-char-p (char s 0))
+                                  (eql (char s 1) #\:))
+                         (setf s
+                               (if (and (>= (length s) 3)
+                                        (eql (char s 2) #\/))
+                                   (subseq s 2)
+                                   (concatenate 'string ""/"" (subseq s 2)))))
+                       s)
+                     name)
+                 keys))))";
+        try
+        {
+            var read = MultipleValues.Primary(
+                Runtime.ReadFromString(new LispObject[] { new LispString(patch) }));
+            Runtime.Eval(read);
+        }
+        catch { /* ignore if uiop symbols missing */ }
     }
 
     /// <summary>
