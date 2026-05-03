@@ -2,8 +2,16 @@
 
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
-    <!-- net10.0-windows so the MonoGame.Framework.WindowsDX package
-         (ships against net8.0-windows7.0) resolves via NuGet's compat
+    <RootNamespace>MonoGameLispDemo</RootNamespace>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RollForward>Major</RollForward>
+  </PropertyGroup>
+
+  <!-- Platform-conditional TFM and RID. -->
+  <PropertyGroup Condition="$([MSBuild]::IsOSPlatform('Windows'))">
+    <!-- net10.0-windows lets the MonoGame.Framework.WindowsDX package
+         (ships against net8.0-windows7.0) resolve via NuGet's compat
          layer. Plain net10.0 doesn't match. -->
     <TargetFramework>net10.0-windows</TargetFramework>
     <!-- MonoGame.Library.SDL ships SDL2.dll only for win-x64; on Snapdragon
@@ -11,10 +19,16 @@
          and let Prism emulation run the whole process. Performance hit is
          acceptable for a dev sample. -->
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
-    <RootNamespace>MonoGameLispDemo</RootNamespace>
-    <ImplicitUsings>enable</ImplicitUsings>
-    <Nullable>enable</Nullable>
-    <RollForward>Major</RollForward>
+  </PropertyGroup>
+  <PropertyGroup Condition="!$([MSBuild]::IsOSPlatform('Windows'))">
+    <TargetFramework>net10.0</TargetFramework>
+    <!-- Use the SDK's detected host RID (linux-x64, linux-arm64, osx-x64,
+         osx-arm64). MonoGame.Framework.DesktopGL ships native libs for
+         all of these. -->
+    <RuntimeIdentifier>$(NETCoreSdkRuntimeIdentifier)</RuntimeIdentifier>
+  </PropertyGroup>
+
+  <PropertyGroup>
 
     <!-- #166 project-core flow: Dotcl.targets walks .asd, compiles main.lisp,
          writes manifest. Runtime side just calls Initialize + LoadFromManifest. -->
