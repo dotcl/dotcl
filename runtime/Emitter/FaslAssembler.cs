@@ -101,6 +101,9 @@ public class FaslAssembler
         _initIl = initMethod.GetILGenerator();
 
         _structInternMap = new CilAssembler.FaslStructInternMap(moduleName);
+        // Wire TypeBuilder + init ILGenerator so CilAssembler can deduplicate uninterned symbols.
+        _structInternMap.UninternedTypeBuilder = _tb;
+        _structInternMap.UninternedInitIl = _initIl;
     }
 
     /// <summary>Expose the TypeBuilder for CilAssembler FASL-mode branches that need to define methods.</summary>

@@ -430,10 +430,10 @@ public static partial class Runtime
                 Load(new LispObject[] { new LispString(osPath) });
                 if (name == "asdf")
                 {
-                    RegisterContribWithAsdf(searchDirs.ToArray());
                     RegisterStandardSourceRegistries();
                     RegisterUserAsdSearchPaths();
                     PatchUiopWindowsPath();
+                    RegisterContribWithAsdf(searchDirs.ToArray());
                 }
                 return T.Instance;
             }
@@ -447,10 +447,10 @@ public static partial class Runtime
                     Load(new LispObject[] { new LispString(path) });
                     if (name == "asdf")
                     {
-                        RegisterContribWithAsdf(searchDirs.ToArray());
                         RegisterStandardSourceRegistries();
                         RegisterUserAsdSearchPaths();
                         PatchUiopWindowsPath();
+                        RegisterContribWithAsdf(searchDirs.ToArray());
                     }
                     return T.Instance;
                 }
@@ -1492,17 +1492,29 @@ public static partial class Runtime
         finally
         {
             // Strip newly-defined Function / SetfFunction values that escaped
-            // from compile-time defun try-eval. Anything that was already
+            // from compile-time defun/defmethod try-eval. Anything that was already
             // fbound before compile-file is left untouched — only WE clean up
             // the side-effects WE introduced.
+            // Also clear the GF registry for stripped symbols so that when the
+            // compiled fasl is later loaded, %find-gf returns NIL and the GF is
+            // properly re-registered (and sym.Function re-set). Without this,
+            // defclass accessors defined at compile-time would be in _gfRegistry
+            // but not in sym.Function after the cleanup, causing %find-gf to skip
+            // re-registration and leaving the accessor unbound.
             foreach (var pkg in Package.AllPackages.ToList())
             {
                 foreach (var s in pkg.ExternalSymbols.Concat(pkg.InternalSymbols).ToList())
                 {
                     if (s.Function != null && !preFn.Contains(s))
+                    {
                         s.Function = null;
+                        Runtime.RemoveGfRegistryEntry(s);
+                    }
                     if (s.SetfFunction != null && !preSetf.Contains(s))
+                    {
                         s.SetfFunction = null;
+                        Runtime.RemoveGfRegistryEntry(s, isSetf: true);
+                    }
                 }
             }
 
@@ -2217,6 +2229,21 @@ public static partial class Runtime
         ("Fs",  '\x1c'), ("Gs",  '\x1d'), ("Rs",  '\x1e'), ("Us",  '\x1f'),
         // Unicode names that appear in real Lisp libraries
         ("No-break_space", ' '),
+        ("Ideographic_space", (char)0x3000),        // U+3000 CJK IDEOGRAPHIC SPACE (cl-str)
+        ("Zero_width_no-break_space", (char)0xfeff), // U+FEFF BOM/ZWNBSP (id3v2)
+        ("Greek_small_letter_lamda", (char)0x03bb),  // U+03BB GREEK SMALL LETTER LAMDA (fn)
+        ("Colon", ':'),                             // U+003A COLON
+        ("Nel", (char)0x0085),                        // U+0085 NEXT LINE
+        ("Next_line", (char)0x0085),                  // U+0085 NEXT LINE alias
+        ("Hyphen-minus", '-'),                       // U+002D HYPHEN-MINUS
+        ("Tilde", '~'),                             // U+007E TILDE
+        ("Full_stop", '.'),                         // U+002E FULL STOP
+        ("Semicolon", ';'),                         // U+003B SEMICOLON
+        ("Comma", ','),                             // U+002C COMMA
+        ("Solidus", '/'),                           // U+002F SOLIDUS (slash)
+        ("Reverse_solidus", (char)0x005c),            // U+005C REVERSE SOLIDUS
+        ("Vertical_line", '|'),                     // U+007C VERTICAL LINE
+        ("Quotation_mark", '"'),                   // U+0022 QUOTATION MARK
     };
 
     public static string? CharName(char c)
@@ -2225,6 +2252,8 @@ public static partial class Runtime
             if (ch == c && name != "Linefeed" && name != "Delete" && name != "Nul"
                 && name != "Altmode") // only canonical names
                 return name;
+        if (Ucd.CharToName.TryGetValue(c, out string? ucdName))
+            return ucdName;
         // Non-graphic characters get U+XXXX names
         if (char.IsControl(c) || char.GetUnicodeCategory(c) == System.Globalization.UnicodeCategory.Format
             || char.GetUnicodeCategory(c) == System.Globalization.UnicodeCategory.Surrogate
@@ -2239,12 +2268,30 @@ public static partial class Runtime
         var upper = s.ToUpper();
         foreach (var (name, ch) in _charNames)
             if (name.ToUpper() == upper) return ch;
+        // UCD lookup: normalize underscores to spaces (e.g. "LATIN_SMALL_LETTER_A" → "LATIN SMALL LETTER A")
+        if (Ucd.NameToChar.TryGetValue(upper.Replace('_', ' '), out char ucdCh))
+            return ucdCh;
         // Handle U+XXXX format names
         if (upper.StartsWith("U+") && upper.Length >= 3)
         {
             if (int.TryParse(upper.Substring(2), System.Globalization.NumberStyles.HexNumber, null, out int code)
                 && code >= 0 && code <= char.MaxValue)
                 return (char)code;
+        }
+        // Handle UXXXX or UXXXXXXXX format (no plus: e.g., u000C, u0085, u0001FFFE)
+        // Lengths: 5 (4 hex: u0085), 7 (6 hex: u00FFFF), 9 (8 hex: u0001FFFE)
+        if (upper.Length >= 5 && upper[0] == 'U' && upper[1] != '+')
+        {
+            if (int.TryParse(upper.Substring(1), System.Globalization.NumberStyles.HexNumber, null, out int code2)
+                && code2 >= 0 && code2 <= 0x10FFFF)
+            {
+                // BMP characters: return directly
+                if (code2 <= char.MaxValue) return (char)code2;
+                // Non-BMP: dotcl's char type is 16-bit; substitute U+FFFD (replacement char).
+                // cl-html5-parser uses these as noncharacter sentinels; U+FFFD is an acceptable
+                // proxy since it never appears as valid parsed content either.
+                return '�';
+            }
         }
         return null;
     }

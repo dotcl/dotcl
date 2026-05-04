@@ -171,12 +171,31 @@ public static class Mop
 
         RegisterMop("GENERIC-FUNCTION-LAMBDA-LIST", 1, args =>
         {
-            // Reconstruct a placeholder lambda list from arity info. Not exact
-            // (parameter names are lost) but good enough for arity-checking
-            // consumers like trivial-arguments.
             if (args[0] is not GenericFunction gf) return Nil.Instance;
+            if (gf.StoredLambdaList != null) return gf.StoredLambdaList;
+            // Reconstruct a placeholder lambda list from arity info when no stored lambda-list.
             return BuildLambdaListPlaceholder(gf.RequiredCount, gf.OptionalCount,
                 gf.HasRest, gf.HasKey, gf.KeywordNames, gf.HasAllowOtherKeys);
+        });
+
+        RegisterMop("GENERIC-FUNCTION-ARGUMENT-PRECEDENCE-ORDER", 1, args =>
+        {
+            if (args[0] is not GenericFunction gf) return Nil.Instance;
+            // Collect required-parameter names from stored lambda-list
+            var ll = gf.StoredLambdaList ?? BuildLambdaListPlaceholder(gf.RequiredCount,
+                gf.OptionalCount, gf.HasRest, gf.HasKey, gf.KeywordNames, gf.HasAllowOtherKeys);
+            LispObject result = Nil.Instance;
+            var reqNames = new List<LispObject>();
+            var cur = ll;
+            while (cur is Cons c)
+            {
+                if (c.Car is Symbol sym && sym.Name[0] != '&') reqNames.Add(sym);
+                else break;
+                cur = c.Cdr;
+            }
+            for (int i = reqNames.Count - 1; i >= 0; i--)
+                result = new Cons(reqNames[i], result);
+            return result;
         });
 
         RegisterMop("METHOD-GENERIC-FUNCTION", 1, args =>
@@ -201,11 +220,31 @@ public static class Mop
         RegisterMop("INTERN-EQL-SPECIALIZER", 1, args =>
             new Cons(Startup.Sym("EQL"), new Cons(args[0], Nil.Instance)));
 
-        // -- Protocol stubs (not customizable yet) ------------------------
-        // These return successful default values so closer-mop and lib code
-        // that just queries them (without :method customization) works.
-        RegisterMop("VALIDATE-SUPERCLASS", 2, args => T.Instance);
-        RegisterMop("FINALIZE-INHERITANCE", 1, args => Nil.Instance);     // already eager
+        // -- Protocol GFs (extensible via defmethod) ----------------------
+        // VALIDATE-SUPERCLASS: default = standard-class/standard-class → T, else NIL
+        {
+            var cls2     = (LispClass)Runtime.FindClass(Startup.Sym("CLASS"));
+            var stdCls2  = (LispClass)Runtime.FindClass(Startup.Sym("STANDARD-CLASS"));
+            var builtIn2 = (LispClass)Runtime.FindClass(Startup.Sym("BUILT-IN-CLASS"));
+            // (class class) → NIL  (least-specific default)
+            RegisterMopGF("VALIDATE-SUPERCLASS", 2,
+                new LispClass[] { cls2, cls2 }, args => Nil.Instance);
+            // (standard-class standard-class) → T
+            RegisterMopGFMethod("VALIDATE-SUPERCLASS",
+                new LispClass[] { stdCls2, stdCls2 }, args => T.Instance);
+        }
+        // FINALIZE-INHERITANCE: dotcl finalizes eagerly; default method is a no-op
+        RegisterMopGF("FINALIZE-INHERITANCE", 1,
+            new LispClass[] { (LispClass)Runtime.FindClass(Startup.Sym("CLASS")) },
+            args => Nil.Instance);
+        // ADD-DEPENDENT / REMOVE-DEPENDENT / MAP-DEPENDENTS / UPDATE-DEPENDENT (stubs)
+        {
+            var tCls = (LispClass)Runtime.FindClass(Startup.Sym("T"));
+            RegisterMopGF("ADD-DEPENDENT", 2, new LispClass[] { tCls, tCls }, args => Nil.Instance);
+            RegisterMopGF("REMOVE-DEPENDENT", 2, new LispClass[] { tCls, tCls }, args => Nil.Instance);
+            RegisterMopGF("MAP-DEPENDENTS", 2, new LispClass[] { tCls, tCls }, args => Nil.Instance);
+            RegisterMopGF("UPDATE-DEPENDENT", -1, new LispClass[] { tCls, tCls }, args => Nil.Instance);
+        }
         RegisterMop("ENSURE-FINALIZED", -1, args =>                        // (ensure-finalized class &optional errorp)
             args.Length >= 1 ? args[0] : Nil.Instance);
 
@@ -242,9 +281,42 @@ public static class Mop
             }
             return Runtime.List(result.ToArray());
         });
+
     }
 
     // --- helpers -------------------------------------------------------------
+
+    // Create a MOP GF with a single default method specializing on the given classes.
+    private static void RegisterMopGF(string name, int arity, LispClass[] specializers,
+        Func<LispObject[], LispObject> defaultImpl)
+    {
+        var (sym, _) = MopPkg.Intern(name);
+        MopPkg.Export(sym);
+        var gf = (GenericFunction)Runtime.MakeGF(sym, new Fixnum(arity));
+        gf.RequiredCount = specializers.Length;
+        gf.LambdaListInfoSet = true;
+        if (arity < 0) gf.HasRest = true;
+        Runtime.RegisterGF(sym, gf);
+        sym.Function = gf;
+        var specs = Runtime.List(specializers.Cast<LispObject>().ToArray());
+        var method = (LispMethod)Runtime.MakeMethod(specs, Nil.Instance,
+            new LispFunction(defaultImpl));
+        method.RequiredCount = specializers.Length;
+        if (arity < 0) method.HasRest = true;
+        Runtime.AddMethod(gf, method);
+    }
+
+    private static void RegisterMopGFMethod(string name, LispClass[] specializers,
+        Func<LispObject[], LispObject> impl)
+    {
+        var (sym, _) = MopPkg.Intern(name);
+        if (sym.Function is not GenericFunction gf)
+            throw new InvalidOperationException($"RegisterMopGFMethod: {name} is not a GF");
+        var specs = Runtime.List(specializers.Cast<LispObject>().ToArray());
+        var method = (LispMethod)Runtime.MakeMethod(specs, Nil.Instance, new LispFunction(impl));
+        method.RequiredCount = specializers.Length;
+        Runtime.AddMethod(gf, method);
+    }
 
     private static void RegisterMop(string name, int arity, Func<LispObject[], LispObject> fn)
     {

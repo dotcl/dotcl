@@ -750,6 +750,23 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
           (member (car expr) '(1+ 1-))
           (fixnum-typed-p (cadr expr)))
      t)
+    ;; logand/logior/logxor with fixnum operands → fixnum result
+    ((and (consp expr) (= (length expr) 3)
+          (member (car expr) '(logand logior logxor))
+          (fixnum-typed-p (cadr expr))
+          (fixnum-typed-p (caddr expr)))
+     t)
+    ;; lognot with fixnum operand → fixnum result
+    ((and (consp expr) (= (length expr) 2)
+          (eq (car expr) 'lognot)
+          (fixnum-typed-p (cadr expr)))
+     t)
+    ;; ash with fixnum value and constant shift → fixnum result
+    ((and (consp expr) (= (length expr) 3)
+          (eq (car expr) 'ash)
+          (fixnum-typed-p (cadr expr))
+          (integerp (caddr expr)))
+     t)
     ;; Declared-fixnum function return: (name ...) where name has an
     ;; ftype declaration promising a fixnum result.
     ((and (consp expr) (symbolp (car expr))
@@ -815,6 +832,25 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
      `(,@(compile-as-long (cadr expr))
        (:ldc-i8 1)
        (:sub)))
+    ;; Bitwise ops — leaves int64 on stack (callers box if needed)
+    ((and (consp expr) (= (length expr) 3) (member (car expr) '(logand logior logxor)))
+     (let ((op (ecase (car expr) (logand :and) (logior :or) (logxor :xor))))
+       `(,@(compile-as-long (cadr expr))
+         ,@(compile-as-long (caddr expr))
+         (,op))))
+    ((and (consp expr) (= (length expr) 2) (eq (car expr) 'lognot))
+     `(,@(compile-as-long (cadr expr))
+       (:not)))
+    ;; ash with constant shift — SHL (n≥0) or SHR/arithmetic (n<0)
+    ((and (consp expr) (= (length expr) 3) (eq (car expr) 'ash) (integerp (caddr expr)))
+     (let ((n (caddr expr)))
+       (if (>= n 0)
+           `(,@(compile-as-long (cadr expr))
+             (:ldc-i4 ,n)
+             (:shl))
+           `(,@(compile-as-long (cadr expr))
+             (:ldc-i4 ,(- n))
+             (:shr)))))
     (t
      ;; Fallback — compile as LispObject and unbox. Shouldn't hit this
      ;; if fixnum-typed-p was checked first.
@@ -833,6 +869,35 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
         ,@(compile-as-long (second args))
         (,op)
         (:call "Fixnum.Make"))))
+
+(defun compile-fixbit-binop (args op)
+  "Emit native int64 bitwise binop (AND/OR/XOR), boxing result back to LispObject."
+  `(,@(compile-as-long (first args))
+    ,@(compile-as-long (second args))
+    (,op)
+    (:call "Fixnum.Make")))
+
+(defun compile-fixbit-not (args)
+  "Emit native int64 bitwise NOT, boxing result back to LispObject."
+  `(,@(compile-as-long (first args))
+    (:not)
+    (:call "Fixnum.Make")))
+
+(defun compile-ash-fast (args)
+  "Emit native int64 ash when shift amount is a compile-time constant integer.
+   Returns NIL if not applicable (non-constant shift)."
+  (let ((x (first args))
+        (n (second args)))
+    (when (and (fixnum-typed-p x) (integerp n))
+      (if (>= n 0)
+          `(,@(compile-as-long x)
+            (:ldc-i4 ,n)
+            (:shl)
+            (:call "Fixnum.Make"))
+          `(,@(compile-as-long x)
+            (:ldc-i4 ,(- n))
+            (:shr)
+            (:call "Fixnum.Make"))))))
 
 (defun compile-fixnum-cmp (args op)
   "Emit native int64 comparison. OP is :lt :le :gt :ge :eq :ne.

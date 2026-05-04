@@ -1282,3 +1282,29 @@
            )
     (list (double 3) (triple 2)))
   (6 6))
+
+;;; D976 — UCD char-name テーブル (name-char / char-name)
+(deftest d976-name-char-ucd-spaces
+  ;; UCD 名（スペース区切り）で name-char が引ける
+  (char-code (name-char "LATIN SMALL LETTER A"))
+  97)
+
+(deftest d976-name-char-ucd-underscores
+  ;; アンダースコアをスペースに正規化して引ける
+  (char-code (name-char "LATIN_SMALL_LETTER_A"))
+  97)
+
+(deftest d976-name-char-ucd-non-ascii
+  ;; 非 ASCII UCD エントリ
+  (char-code (name-char "GREEK SMALL LETTER ALPHA"))
+  #x03B1)
+
+(deftest d976-char-name-ucd
+  ;; char-name が UCD 名を返す（_charNames 優先: Space は "Space" のまま）
+  (char-name (code-char 97))
+  "LATIN SMALL LETTER A")
+
+(deftest d976-charnames-priority
+  ;; _charNames のエントリは UCD より優先される
+  (char-name #\Space)
+  "Space")

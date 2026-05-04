@@ -2050,6 +2050,14 @@
                (supers-spec (caddr form))
                (slot-specs (cadddr form))
                (class-options (cddddr form))
+               ;; Extract metaclass name for slot-option validation
+               (metaclass-name
+                 (let ((mc (assoc :metaclass class-options)))
+                   (and mc (cadr mc))))
+               (custom-metaclass-p
+                 (and metaclass-name
+                      (not (eq metaclass-name 'standard-class))
+                      (not (eq metaclass-name 'cl:standard-class))))
                ;; Validation 1: Check for duplicate slot names
                (_dup-slot-check
                  (let ((slot-names nil))
@@ -2103,9 +2111,10 @@
                                     ((eq key :writer) nil)
                                     ((eq key :accessor) nil)
                                     (t
-                                     (error 'program-error
-                                            :format-control "DEFCLASS ~S: unknown slot option ~S in slot ~S"
-                                            :format-arguments (list name key sname))))))))))
+                                     (unless custom-metaclass-p
+                                       (error 'program-error
+                                              :format-control "DEFCLASS ~S: unknown slot option ~S in slot ~S"
+                                              :format-arguments (list name key sname)))))))))))
                ;; Validation 4: Unknown class options signal program-error (CLHS 7.7 DEFCLASS)
                (_unknown-class-opt-check
                  (dolist (opt class-options)
@@ -2451,6 +2460,13 @@
                                                   (symbolp (car opt))
                                                   (string= (symbol-name (car opt)) "METHOD")))
                                            options))
+               ;; Extract :generic-function-class option
+               (gf-class-opt (find-if (lambda (opt)
+                                        (and (consp opt)
+                                             (symbolp (car opt))
+                                             (string= (symbol-name (car opt)) "GENERIC-FUNCTION-CLASS")))
+                                      options))
+               (gf-class-name (if gf-class-opt (cadr gf-class-opt) nil))
                ;; Known option keywords
                (known-opts '("DOCUMENTATION" "METHOD-COMBINATION" "METHOD"
                              "ARGUMENT-PRECEDENCE-ORDER" "DECLARE" "GENERIC-FUNCTION-CLASS"
@@ -2561,12 +2577,20 @@
                    (when (macro-function ',name)
                      (error 'program-error :format-control "DEFGENERIC: ~S names a macro"
                             :format-arguments (list ',name)))))
-             ;; CLHS: signal error if name is an ordinary function (not GF)
+             ;; CLHS says signal error, but SBCL/others replace with a warning.
+             ;; Match SBCL behavior: warn and replace (many libs depend on this).
              (when (and (fboundp ',name)
                         (not (typep (fdefinition ',name) 'generic-function)))
-               (error 'program-error :format-control "DEFGENERIC: ~S names an ordinary function"
-                      :format-arguments (list ',name)))
-             (let ((%gf (or (%find-gf ',name) (%make-gf ',name ,arity))))
+               (warn "DEFGENERIC: ~S names an ordinary function; replacing with generic function"
+                     ',name))
+             (let ((%gf ,(if gf-class-name
+                            ;; :generic-function-class specified: always create a new instance of
+                            ;; that class, even if a GF already exists with a different class.
+                            `(let ((%new-gf (make-instance ',gf-class-name :lambda-list ',params)))
+                               (%register-gf ',name %new-gf)
+                               %new-gf)
+                            ;; No :generic-function-class: reuse existing GF or create standard one.
+                            `(or (%find-gf ',name) (%make-gf ',name ,arity)))))
                ;; CLHS: "methods defined by previous defgeneric forms are removed"
                (%clear-defgeneric-inline-methods %gf)
                (%register-gf ',name %gf)
@@ -3340,8 +3364,10 @@
                          (progn ,@real-body)
                          (close ,var))))
                 ;; No string-form: create new stream, return accumulated string
+                ;; declare var special so eval can see the binding (SBCL-compatible)
                 `(let ((,var (make-string-output-stream
                                ,@(when element-type `(:element-type ,element-type)))))
+                   (declare (special ,var))
                    ,@decls
                    (unwind-protect
                      (progn ,@real-body
@@ -3469,11 +3495,22 @@
 
 ;;; --- fresh-line --- (now compiled directly in cil-compiler.lisp)
 
-;;; --- with-compilation-unit (no-op) ---
+;;; --- with-compilation-unit ---
 (setf (gethash 'with-compilation-unit *macros*)
       (lambda (form)
-        ;; (with-compilation-unit (&key override) body...) → progn body...
-        `(progn ,@(cddr form))))
+        (let* ((options (cadr form))
+               (body (cddr form))
+               (override-form (and (listp options)
+                                   (let ((pos (member :override options)))
+                                     (if pos (cadr pos) nil)))))
+          `(if (or ,override-form (zerop *compilation-unit-depth*))
+               (let ((*compilation-unit-depth* 1)
+                     (*deferred-compilation-warnings* '()))
+                 (multiple-value-prog1 (progn ,@body)
+                   (dolist (w (nreverse *deferred-compilation-warnings*))
+                     (warn w))))
+               (let ((*compilation-unit-depth* (1+ *compilation-unit-depth*)))
+                 (progn ,@body))))))
 
 ;;; --- with-standard-io-syntax ---
 

@@ -1052,6 +1052,9 @@ Also expands element types within compound type specifiers like (VECTOR etype si
 ;; Global storage: (cons object doc-type) → string
 (defvar *%pprint-level* 0)
 
+(defvar *compilation-unit-depth* 0)
+(defvar *deferred-compilation-warnings* nil)
+
 (defvar *documentation-table* (make-hash-table :test #'equal))
 
 ;; Helper to make a key for the documentation table
@@ -1232,4 +1235,25 @@ Also expands element types within compound type specifiers like (VECTOR etype si
           (%register-gf name gf)
           (setf (fdefinition name) gf)
           gf))))
+
+;;; --- MOP: allow AMOP initargs for standard-generic-function and standard-method ---
+;;; Per AMOP, make-instance 'standard-generic-function and 'standard-method accept
+;;; these keyword args. The :before methods accept &allow-other-keys so that
+;;; ValidateInitargs passes; the actual protocol implementation is a stub.
+
+(defmethod initialize-instance :before ((gf standard-generic-function)
+                                        &rest all-keys
+                                        &key lambda-list argument-precedence-order
+                                        declarations documentation method-class
+                                        method-combination name
+                                        &allow-other-keys)
+  (declare (ignore all-keys lambda-list argument-precedence-order declarations
+                   documentation method-class method-combination name)))
+
+(defmethod initialize-instance :before ((m standard-method)
+                                        &rest all-keys
+                                        &key qualifiers lambda-list specializers
+                                        function documentation
+                                        &allow-other-keys)
+  (declare (ignore all-keys qualifiers lambda-list specializers function documentation)))
 

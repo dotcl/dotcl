@@ -60,6 +60,7 @@ sandbox/
 ## Internal notes
 docs/*
 !docs/decisions/
+!docs/talks/
 out/
 runtime/contrib/
 contrib/asdf/
@@ -76,3 +77,10 @@ samples/*/obj/
 ## Source Generator (build artifacts)
 runtime.docgen/bin/
 runtime.docgen/obj/
+
+## Unicode codegen cache
+scripts/UnicodeData.txt
+scripts/gen-utils-out/
+scripts/GenUtils/bin/
+scripts/GenUtils/obj/
+runtime/Generated/

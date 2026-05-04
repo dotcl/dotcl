@@ -7,6 +7,7 @@ public class LispThread : LispObject
 {
     public Thread Thread { get; }
     public string ThreadName { get; }
+    public LispObject? ReturnValue { get; set; }
 
     public LispThread(Thread thread, string name)
     {
@@ -76,6 +77,9 @@ public partial class Runtime
     [ThreadStatic]
     private static LispThread? _currentLispThread;
 
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<int, LispThread>
+        _threadRegistry = new();
+
     /// <summary>
     /// (bt:make-thread function &key name)
     /// Creates and starts a new thread running FUNCTION.
@@ -104,12 +108,13 @@ public partial class Runtime
             _currentLispThread = lispThread;
             // Restore parent's bindings in the new thread
             DynamicBindings.Restore(snapshot);
+            LispObject? result = null;
             try
             {
                 if (fn is LispFunction lfn)
-                    lfn.Invoke();
+                    result = lfn.Invoke();
                 else if (fn is Symbol sym && sym.Function is LispFunction sfn)
-                    sfn.Invoke();
+                    result = sfn.Invoke();
             }
             catch (Exception ex)
             {
@@ -118,6 +123,14 @@ public partial class Runtime
                 w.WriteLine($"Thread \"{name}\" error: {ex.Message}");
                 w.Flush();
             }
+            finally
+            {
+                if (lispThread != null)
+                {
+                    lispThread.ReturnValue = result ?? Nil.Instance;
+                    _threadRegistry.TryRemove(lispThread.Thread.ManagedThreadId, out _);
+                }
+            }
         })
         {
             Name = name,
@@ -125,6 +138,7 @@ public partial class Runtime
         };
 
         lispThread = new LispThread(thread, name);
+        _threadRegistry[thread.ManagedThreadId] = lispThread;
         thread.Start();
         return lispThread;
     }
@@ -132,8 +146,12 @@ public partial class Runtime
     /// <summary>(bt:current-thread) → thread object</summary>
     public static LispObject CurrentThread(LispObject[] args)
     {
-        return _currentLispThread ??=
-            new LispThread(Thread.CurrentThread, Thread.CurrentThread.Name ?? "main");
+        if (_currentLispThread == null)
+        {
+            _currentLispThread = new LispThread(Thread.CurrentThread, Thread.CurrentThread.Name ?? "main");
+            _threadRegistry[Thread.CurrentThread.ManagedThreadId] = _currentLispThread;
+        }
+        return _currentLispThread;
     }
 
     /// <summary>(bt:thread-alive-p thread) → boolean</summary>
@@ -176,12 +194,28 @@ public partial class Runtime
         return new LispLock(name);
     }
 
-    /// <summary>(bt:acquire-lock lock &optional wait-p) → boolean</summary>
+    /// <summary>(bt:acquire-lock lock &optional wait-p timeout-sec) → boolean</summary>
     public static LispObject AcquireLock(LispObject[] args)
     {
         if (args.Length < 1 || args[0] is not LispLock lk)
             throw new LispErrorException(new LispProgramError("ACQUIRE-LOCK: requires a lock"));
         bool wait = args.Length < 2 || args[1] is not Nil;
+        // Optional 3rd arg: timeout in seconds
+        if (args.Length >= 3 && args[2] is not Nil)
+        {
+            var v = args[2];
+            double timeoutSec = v switch
+            {
+                Fixnum f => (double)f.Value,
+                SingleFloat sf => sf.Value,
+                DoubleFloat df => df.Value,
+                Ratio r => (double)r.Numerator / (double)r.Denominator,
+                _ => 0.0
+            };
+            int timeoutMs = Math.Max(0, (int)(timeoutSec * 1000));
+            bool entered = System.Threading.Monitor.TryEnter(lk.Monitor, timeoutMs);
+            return entered ? T.Instance : Nil.Instance;
+        }
         if (wait)
         {
             System.Threading.Monitor.Enter(lk.Monitor);
@@ -199,13 +233,13 @@ public partial class Runtime
         return T.Instance;
     }
 
-    /// <summary>(bt:thread-join thread) → result</summary>
+    /// <summary>(bt:thread-join thread) → thread's return value</summary>
     public static LispObject ThreadJoin(LispObject[] args)
     {
         if (args.Length < 1 || args[0] is not LispThread lt)
             throw new LispErrorException(new LispProgramError("THREAD-JOIN: requires a thread"));
         lt.Thread.Join();
-        return T.Instance;
+        return lt.ReturnValue ?? Nil.Instance;
     }
 
     /// <summary>(bt:thread-yield) — hint to scheduler</summary>
@@ -368,6 +402,16 @@ public partial class Runtime
         }
         sem.Sem.Wait();
         return T.Instance;
+    }
+
+    /// <summary>(dotcl:all-threads) → list of all live LispThread objects</summary>
+    public static LispObject AllThreads(LispObject[] args)
+    {
+        CurrentThread([]);  // Ensure main thread is registered
+        LispObject result = Nil.Instance;
+        foreach (var lt in _threadRegistry.Values)
+            result = new Cons(lt, result);
+        return result;
     }
 
     internal static void RegisterThreadBuiltins()

@@ -40,6 +40,27 @@ public static partial class Runtime
             };
             if (name == "VALUES")
                 throw new LispErrorException(new LispTypeError("TYPEP: VALUES is not a valid type specifier", typeSpec));
+            // Package-aware CLOS instance check: resolve symbol to a LispClass to avoid
+            // cross-package false positives from bare-name ClassMatchesCPL in CheckSimpleType.
+            if (typeSpec is Symbol clsSym && (obj is LispInstance || obj is LispInstanceCondition))
+            {
+                var resolvedCls = FindClassOrNil(clsSym) as LispClass;
+                if (resolvedCls != null)
+                {
+                    if (obj is LispInstance liPkg)
+                    {
+                        foreach (var c in liPkg.Class.ClassPrecedenceList)
+                            if (ReferenceEquals(c, resolvedCls)) return T.Instance;
+                        return Nil.Instance;
+                    }
+                    if (obj is LispInstanceCondition licPkg)
+                    {
+                        foreach (var c in licPkg.Instance.Class.ClassPrecedenceList)
+                            if (ReferenceEquals(c, resolvedCls)) return T.Instance;
+                        return Nil.Instance;
+                    }
+                }
+            }
             if (CheckSimpleType(obj, name)) return T.Instance;
             // Try user-defined type expander
             if (TypeExpanders.TryGetValue(name, out var expSymExpander))
@@ -504,6 +525,7 @@ public static partial class Runtime
           || (obj is LispInstance inst && ClassMatchesCPL(inst.Class, typeName))
           || (obj is LispInstanceCondition lic && ClassMatchesCPL(lic.Instance.Class, typeName))
           || (obj is LispCondition cond && ConditionTypeMatches(cond.ConditionTypeName, typeName))
+          || (obj is GenericFunction gf2 && gf2.StoredClass != null && ClassMatchesCPL(gf2.StoredClass, typeName))
     };
 
     /// <summary>Check if obj is a LispStruct that satisfies FLOAT type (for cross-compilation target-float structs).</summary>

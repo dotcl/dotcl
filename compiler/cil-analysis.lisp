@@ -63,22 +63,32 @@
              (if old-entry
                  (setf (gethash name *macros*) old-entry)
                  (remhash name *macros*))))
-          ;; Restore-symbol-macros sentinel: restore *symbol-macros* after symbol-macrolet body
-          ((eq e :restore-symbol-macros)
+          ;; Restore-symbol-macros sentinel: restore *symbol-macros* after symbol-macrolet body.
+          ;; Guard: real sentinels have (cdr item) = old-*symbol-macros* = nil or proper alist,
+          ;; so (cddr item) is nil or a list. Collisions (when analyzed code contains the literal
+          ;; keyword :restore-symbol-macros) have (cdr item) = (bnd . mdepth) so (cddr item) = integer.
+          ((and (eq e :restore-symbol-macros) (not (integerp (cddr item))))
            (setf *symbol-macros* (cdr item)))
           (t
            (let ((bnd (cadr item))
                  (mdepth (cddr item)))
              (cond
-               ;; Symbol: check if it's a free variable reference
+               ;; Symbol: check if it's a free variable reference.
+               ;; If the symbol is a symbol-macro (and not shadowed by a local binding),
+               ;; walk the expansion instead of treating it as a variable reference.
                ((symbolp e)
-                (when (and e
-                           (or (not (eq e t)) (local-bound-p e))
-                           (or (not (keywordp e)) (local-bound-p e))
-                           (not (member (symbol-name e) bnd :test #'string=))
-                           (not (gethash (symbol-name e) free-ht))
-                           (local-bound-p e))
-                  (setf (gethash (symbol-name e) free-ht) t)))
+                (let ((sm (and e
+                               (not (member (symbol-name e) bnd :test #'string=))
+                               (assoc e *symbol-macros* :test #'eq))))
+                  (if sm
+                      (push (cons (cdr sm) (cons bnd mdepth)) worklist)
+                      (when (and e
+                                 (or (not (eq e t)) (local-bound-p e))
+                                 (or (not (keywordp e)) (local-bound-p e))
+                                 (not (member (symbol-name e) bnd :test #'string=))
+                                 (not (gethash (symbol-name e) free-ht))
+                                 (local-bound-p e))
+                        (setf (gethash (symbol-name e) free-ht) t)))))
                ;; Cons: dispatch on head
                ((consp e)
                 (let ((head (car e)))
@@ -379,8 +389,10 @@
              (e (car item))
              (mdepth (cdr item)))
         (cond
-          ;; Restore-symbol-macros sentinel: mdepth slot holds old *symbol-macros*
-          ((eq e :restore-symbol-macros)
+          ;; Restore-symbol-macros sentinel: mdepth slot holds old *symbol-macros*.
+          ;; Guard: real sentinels have mdepth = old-*symbol-macros* = nil or alist (not integer).
+          ;; Collisions have mdepth = integer (the actual macro depth from analyzed code).
+          ((and (eq e :restore-symbol-macros) (not (integerp mdepth)))
            (setf *symbol-macros* mdepth))
           ;; Restore-macro sentinel: mdepth slot holds (name . old-entry).
           ;; Guard consp so that a bare :restore-macro keyword from analyzed source
@@ -520,8 +532,10 @@
              (in-lambda (cadr item))
              (mdepth (cddr item)))
         (cond
-          ;; Restore-symbol-macros sentinel: in-lambda slot holds old *symbol-macros*
-          ((eq e :restore-symbol-macros)
+          ;; Restore-symbol-macros sentinel: in-lambda slot holds old *symbol-macros*.
+          ;; Guard: real sentinels have in-lambda = old-*symbol-macros* = list (not boolean t).
+          ;; Collisions have in-lambda = t (inside lambda) which must be excluded.
+          ((and (eq e :restore-symbol-macros) (not (eq in-lambda t)))
            (setf *symbol-macros* in-lambda))
           ;; Restore-macro sentinel: in-lambda slot holds (name . old-entry).
           ;; Guard consp so that a bare :restore-macro keyword from analyzed source

@@ -325,9 +325,9 @@ public class LispInstance : LispObject
 /// </summary>
 public class LispMethod : LispObject
 {
-    public LispObject[] Specializers { get; }  // LispClass or (eql value) cons
-    public Symbol[] Qualifiers { get; }         // :BEFORE, :AFTER, :AROUND, or empty
-    public LispFunction Function { get; }
+    public LispObject[] Specializers { get; set; }  // LispClass or (eql value) cons
+    public Symbol[] Qualifiers { get; set; }         // :BEFORE, :AFTER, :AROUND, or empty
+    public LispFunction Function { get; set; }
     public int RequiredCount { get; set; }
     public int OptionalCount { get; set; }
     public bool HasRest { get; set; }
@@ -343,6 +343,12 @@ public class LispMethod : LispObject
         Specializers = specializers;
         Qualifiers = qualifiers;
         Function = function;
+    }
+
+    public LispMethod() {
+        Specializers = Array.Empty<LispObject>();
+        Qualifiers = Array.Empty<Symbol>();
+        Function = null!;
     }
 
     public override string ToString() => "#<METHOD>";
@@ -386,6 +392,17 @@ public class GenericFunction : LispFunction
     public bool HasAllowOtherKeys { get; set; }
     public List<string> KeywordNames { get; set; } = new();
     public bool LambdaListInfoSet { get; set; }
+    /// <summary>Stored lambda-list from :lambda-list initarg (MOP accessor).</summary>
+    public LispObject? StoredLambdaList { get; set; }
+    /// <summary>Actual Lisp class of this GF instance (for subclasses of standard-generic-function).</summary>
+    public LispClass? StoredClass { get; set; }
+
+    /// <summary>When a GF auto-created by defmethod replaces an ordinary function, the
+    /// original is saved here. The dispatcher uses it as a last-resort fallback when
+    /// no applicable method is found, preserving built-in behaviour for CL functions
+    /// (e.g. CLOSE, STREAM-ELEMENT-TYPE) that have user-defined Gray-stream methods
+    /// without losing the original C# implementation for non-Gray streams.</summary>
+    public LispFunction? FallbackFunction { get; set; }
 
     /// <summary>Single-entry dispatch cache (monomorphic inline cache).
     /// Caches the last successful dispatch result for quick reuse.</summary>

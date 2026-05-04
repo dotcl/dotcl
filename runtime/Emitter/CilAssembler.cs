@@ -151,6 +151,17 @@ public class CilAssembler
         }
         var sym = Startup.Sym(name);
         if (sym.Function is LispFunction symFn) return symFn;
+        // Cross-package bridge: uninterned-fixup calls this during FASL loading when
+        // *PACKAGE* may differ from the package where the function was registered
+        // (e.g. LEXICAL-CONTEXTS vs DOTCL-INTERNAL). Search all packages (same as
+        // GetFunctionBySymbol / CoerceToFunction).
+        foreach (var pkg in Package.AllPackages)
+        {
+            if (pkg == sym.HomePackage) continue;
+            var (other, status) = pkg.FindSymbol(name);
+            if (status != SymbolStatus.None && other.Function is LispFunction otherFn)
+                return otherFn;
+        }
         throw new LispErrorException(new LispUndefinedFunction(sym));
     }
 
@@ -485,6 +496,24 @@ public class CilAssembler
                 break;
             case "DIV":
                 _il.Emit(OpCodes.Div);
+                break;
+            case "AND":
+                _il.Emit(OpCodes.And);
+                break;
+            case "OR":
+                _il.Emit(OpCodes.Or);
+                break;
+            case "XOR":
+                _il.Emit(OpCodes.Xor);
+                break;
+            case "NOT":
+                _il.Emit(OpCodes.Not);
+                break;
+            case "SHL":
+                _il.Emit(OpCodes.Shl);
+                break;
+            case "SHR":
+                _il.Emit(OpCodes.Shr);
                 break;
             case "CLT":
                 _il.Emit(OpCodes.Clt);
@@ -1738,6 +1767,16 @@ public class CilAssembler
         private readonly HashSet<string> _uniqueStrings = new();
         public long UniqueStringBytes { get; private set; }
 
+        // Per-FASL uninterned symbol deduplication: same Symbol object → same static field.
+        // Set by FaslAssembler after construction.
+        internal System.Reflection.Emit.TypeBuilder? UninternedTypeBuilder;
+        internal System.Reflection.Emit.ILGenerator? UninternedInitIl;
+        private readonly Dictionary<Symbol, System.Reflection.Emit.FieldBuilder> _uninternedFields =
+            new(ReferenceEqualityComparer.Instance);
+        private static readonly System.Reflection.ConstructorInfo _symbolCtor2 =
+            typeof(Symbol).GetConstructor(new[] { typeof(string), typeof(Package) })!;
+        private int _uninternedCounter;
+
         public FaslStructInternMap(string modulePrefix)
         {
             _prefix = modulePrefix;
@@ -1754,6 +1793,27 @@ public class CilAssembler
             return key;
         }
 
+        /// <summary>
+        /// Get or create a static field for an uninterned symbol so that all uses within
+        /// this FASL resolve to the SAME Symbol object (preserves EQ-ness across make-load-form).
+        /// </summary>
+        public System.Reflection.Emit.FieldBuilder GetOrCreateUninternedSymbolField(Symbol sym)
+        {
+            if (_uninternedFields.TryGetValue(sym, out var field))
+                return field;
+            var tb = UninternedTypeBuilder!;
+            var il = UninternedInitIl!;
+            field = tb.DefineField($"_gsym_{_uninternedCounter++}",
+                typeof(Symbol), System.Reflection.FieldAttributes.Public | System.Reflection.FieldAttributes.Static);
+            // Emit init: new Symbol(name, null); stsfld field
+            il.Emit(System.Reflection.Emit.OpCodes.Ldstr, sym.Name);
+            il.Emit(System.Reflection.Emit.OpCodes.Ldnull);
+            il.Emit(System.Reflection.Emit.OpCodes.Newobj, _symbolCtor2);
+            il.Emit(System.Reflection.Emit.OpCodes.Stsfld, field);
+            _uninternedFields[sym] = field;
+            return field;
+        }
+
         /// <summary>Track a string being emitted via Ldstr. Returns the string.</summary>
         public string TrackString(string s)
         {
@@ -1767,7 +1827,7 @@ public class CilAssembler
         _faslStructMap?.TrackString(s) ?? s;
 
     /// <summary>Emit IL to construct a constant value inline (for FASL mode).</summary>
-    private void EmitLoadConstInline(LispObject val)
+    internal void EmitLoadConstInline(LispObject val)
     {
         _inlineDepth++;
         try
@@ -1810,9 +1870,17 @@ public class CilAssembler
                     _il.Emit(OpCodes.Ldstr, Track(sym.HomePackage.Name));
                     _il.Emit(OpCodes.Call, _methodCache["Startup.SymInPkg"]);
                 }
+                else if (_faslMode && _faslStructMap?.UninternedTypeBuilder != null)
+                {
+                    // FASL mode: uninterned symbols must be deduplicated so the same
+                    // Symbol object is used everywhere in this assembly (preserves EQ-ness
+                    // across make-load-form boundaries — e.g. gensym'd ctor names in defcontext).
+                    var field = _faslStructMap.GetOrCreateUninternedSymbolField(sym);
+                    _il.Emit(OpCodes.Ldsfld, field);
+                }
                 else
                 {
-                    // Uninterned symbol — create new
+                    // AssembleAndRun (non-FASL): each occurrence creates a new Symbol.
                     _il.Emit(OpCodes.Ldstr, Track(sym.Name));
                     _il.Emit(OpCodes.Ldnull); // null for homePackage
                     _il.Emit(OpCodes.Newobj, typeof(Symbol).GetConstructor(new[] { typeof(string), typeof(Package) })!);
@@ -2004,15 +2072,23 @@ public class CilAssembler
             case LispHashTable ht:
             {
                 // Small hash tables: inline construction (≤20 entries)
-                // Large ones: fall back to constant pool (too much IL/strings)
+                // Large ones: in FASL mode, emit as helper methods (self-contained, no _constants).
+                // In non-FASL (AssembleAndRun), fall back to constant pool (same-process, ok).
                 const int MaxHtInline = 20;
                 var htEntries = ht.Entries.ToList();
                 if (htEntries.Count > MaxHtInline)
                 {
-                    int idxHt = AddConstant(val);
-                    _il.Emit(OpCodes.Ldc_I4, idxHt);
-                    _il.Emit(OpCodes.Call, _getConstant);
-                    _il.Emit(OpCodes.Castclass, typeof(LispObject));
+                    if (_faslMode && _faslTypeBuilder != null)
+                    {
+                        EmitFaslLargeHashTable(ht, htEntries);
+                    }
+                    else
+                    {
+                        int idxHt = AddConstant(val);
+                        _il.Emit(OpCodes.Ldc_I4, idxHt);
+                        _il.Emit(OpCodes.Call, _getConstant);
+                        _il.Emit(OpCodes.Castclass, typeof(LispObject));
+                    }
                     break;
                 }
                 // Inline hash table: create empty, populate entries
@@ -2069,6 +2145,76 @@ public class CilAssembler
         }
         }
         finally { _inlineDepth--; }
+    }
+
+    /// <summary>
+    /// FASL mode: emit a large hash table as a set of static helper methods in the FASL assembly.
+    /// Splits entries into chunks to stay within .NET IL method size limits (~64KB body).
+    /// Each chunk method takes a LispHashTable, populates a slice, returns void.
+    /// The top-level method creates the HT and calls all chunk methods.
+    /// This makes the FASL self-contained (no _constants cross-process dependency).
+    /// </summary>
+    private void EmitFaslLargeHashTable(LispHashTable ht, List<KeyValuePair<LispObject, LispObject>> entries)
+    {
+        const int ChunkSize = 1500; // ~1500 entries × ~30 bytes/entry = ~45KB, safely under 64KB IL limit
+        int htId = Interlocked.Increment(ref _faslClosureCount);
+        var setMethod = typeof(LispHashTable).GetMethod("Set",
+            new[] { typeof(LispObject), typeof(LispObject) })!;
+        var htType = typeof(LispHashTable);
+        var htCtor = htType.GetConstructor(new[] { typeof(string) })!;
+
+        // Emit chunk methods: static void _ht_N_chunk_C(LispHashTable ht)
+        var chunkMethods = new List<MethodBuilder>();
+        for (int chunkStart = 0; chunkStart < entries.Count; chunkStart += ChunkSize)
+        {
+            int chunkEnd = Math.Min(chunkStart + ChunkSize, entries.Count);
+            int chunkId = chunkMethods.Count;
+            var chunkMethod = _faslTypeBuilder!.DefineMethod(
+                $"_ht_{htId}_chunk_{chunkId}",
+                MethodAttributes.Private | MethodAttributes.Static,
+                typeof(void), new[] { typeof(LispHashTable) });
+            chunkMethods.Add(chunkMethod);
+
+            var chunkIl = chunkMethod.GetILGenerator();
+            // Create a temporary inner assembler to emit keys/values into this method
+            var inner = new CilAssembler();
+            inner._il = chunkIl;
+            inner._faslMode = true;
+            inner._faslTypeBuilder = _faslTypeBuilder;
+            inner._faslStructMap = _faslStructMap;
+            inner._skipStructIntern = true;
+
+            for (int i = chunkStart; i < chunkEnd; i++)
+            {
+                chunkIl.Emit(OpCodes.Ldarg_0);          // push ht
+                inner.EmitLoadConstInline(entries[i].Key);
+                inner.EmitLoadConstInline(entries[i].Value);
+                chunkIl.Emit(OpCodes.Callvirt, setMethod);
+            }
+            chunkIl.Emit(OpCodes.Ret);
+        }
+
+        // Emit top-level builder: static LispHashTable _ht_N()
+        var builderMethod = _faslTypeBuilder!.DefineMethod(
+            $"_ht_{htId}",
+            MethodAttributes.Private | MethodAttributes.Static,
+            typeof(LispHashTable), Type.EmptyTypes);
+        var builderIl = builderMethod.GetILGenerator();
+        builderIl.Emit(OpCodes.Ldstr, ht.TestName);
+        builderIl.Emit(OpCodes.Newobj, htCtor);
+        var htLocal = builderIl.DeclareLocal(typeof(LispHashTable));
+        builderIl.Emit(OpCodes.Stloc, htLocal);
+        foreach (var chunkMethod in chunkMethods)
+        {
+            builderIl.Emit(OpCodes.Ldloc, htLocal);
+            builderIl.Emit(OpCodes.Call, chunkMethod);
+        }
+        builderIl.Emit(OpCodes.Ldloc, htLocal);
+        builderIl.Emit(OpCodes.Ret);
+
+        // Call the builder method from the current context
+        _il.Emit(OpCodes.Call, builderMethod);
+        _il.Emit(OpCodes.Castclass, typeof(LispObject));
     }
 
     /// <summary>Compute a deterministic content key for LispStruct interning.</summary>

@@ -113,7 +113,8 @@ public static class Startup
     // Features list
     private static readonly HashSet<string> _features = new()
     {
-        "DOTCL", "COMMON-LISP", "NET", "UNICODE", "PACKAGE-LOCAL-NICKNAMES"
+        "DOTCL", "COMMON-LISP", "NET", "UNICODE", "PACKAGE-LOCAL-NICKNAMES",
+        "THREAD-SUPPORT"
     };
 
     private static bool _initialized;
@@ -404,7 +405,9 @@ public static class Startup
         // *host-features* = snapshot of *features* at startup (host platform).
         // compile-file may rebind *features* to target-features for cross-compilation,
         // but *host-features* always reflects the actual running OS/arch.
-        var starHostFeatures = InternExport("*HOST-FEATURES*");
+        // Lives in DOTCL package (not CL) to avoid polluting CL's exported symbols.
+        var (starHostFeatures, _) = DotclPkg.Intern("*HOST-FEATURES*");
+        DotclPkg.Export(starHostFeatures);
         starHostFeatures.IsSpecial = true;
         starHostFeatures.Value = featuresList;
 
@@ -1148,10 +1151,12 @@ public static class Startup
         standardGenericFunction.IsBuiltIn = false;
         var class_ = MakeClass("CLASS", stdObj);
         class_.IsBuiltIn = false;
-        MakeClass("BUILT-IN-CLASS", class_);
+        var builtInClass = MakeClass("BUILT-IN-CLASS", class_);
+        builtInClass.IsBuiltIn = false;  // BUILT-IN-CLASS is a metaclass, not a built-in type
         var standardClass = MakeClass("STANDARD-CLASS", class_);
         standardClass.IsBuiltIn = false;
-        MakeClass("STRUCTURE-CLASS", class_);
+        var structureClass = MakeClass("STRUCTURE-CLASS", class_);
+        structureClass.IsBuiltIn = false;  // STRUCTURE-CLASS is a metaclass, not a built-in type
         var method_ = MakeClass("METHOD", stdObj);
         method_.IsBuiltIn = false;
         var standardMethod = MakeClass("STANDARD-METHOD", method_);
@@ -1185,6 +1190,20 @@ public static class Startup
         specializer.IsBuiltIn = false;
         var eqlSpecializer = MakeClass("EQL-SPECIALIZER", specializer);
         eqlSpecializer.IsBuiltIn = false;
+
+        // MOP: AMOP-required classes not yet in the hierarchy
+        // METAOBJECT — base class for all metaobjects (classes, GFs, methods, slot defs)
+        var metaobject = MakeClass("METAOBJECT", stdObj);
+        metaobject.IsBuiltIn = false;
+        // FUNCALLABLE-STANDARD-OBJECT — funcallable instances; base of GFs
+        var funcallableStdObj = MakeClass("FUNCALLABLE-STANDARD-OBJECT", stdObj, function_);
+        funcallableStdObj.IsBuiltIn = false;
+        // FORWARD-REFERENCED-CLASS — placeholder for not-yet-defined classes
+        var forwardRefClass = MakeClass("FORWARD-REFERENCED-CLASS", class_);
+        forwardRefClass.IsBuiltIn = false;
+        // FUNCALLABLE-STANDARD-CLASS — metaclass for funcallable standard classes
+        var funcallableStdClass = MakeClass("FUNCALLABLE-STANDARD-CLASS", standardClass);
+        funcallableStdClass.IsBuiltIn = false;
 
         // ===== Environment functions =====
         Emitter.CilAssembler.RegisterFunction("LISP-IMPLEMENTATION-TYPE",
@@ -1519,6 +1538,58 @@ public static class Startup
         });
         RegisterDotcl("RUN-PROCESS", runProcess);
         RegisterDotcl("%RUN-PROCESS", runProcess); // backward-compat alias
+
+        // Threading primitives — public dotcl: API backed by Runtime.Thread.cs.
+        // bordeaux-threads impl-dotcl.lisp delegates to these.
+        RegisterDotcl("MAKE-THREAD",
+            new LispFunction(Runtime.MakeThread, "MAKE-THREAD", -1));
+        RegisterDotcl("CURRENT-THREAD",
+            new LispFunction(Runtime.CurrentThread, "CURRENT-THREAD", 0));
+        RegisterDotcl("THREADP",
+            new LispFunction(Runtime.Threadp, "THREADP", 1));
+        RegisterDotcl("THREAD-NAME",
+            new LispFunction(Runtime.ThreadName, "THREAD-NAME", 1));
+        RegisterDotcl("THREAD-ALIVE-P",
+            new LispFunction(Runtime.ThreadAliveP, "THREAD-ALIVE-P", 1));
+        RegisterDotcl("THREAD-JOIN",
+            new LispFunction(Runtime.ThreadJoin, "THREAD-JOIN", 1));
+        RegisterDotcl("THREAD-YIELD",
+            new LispFunction(Runtime.ThreadYield, "THREAD-YIELD", 0));
+        RegisterDotcl("DESTROY-THREAD",
+            new LispFunction(Runtime.DestroyThread, "DESTROY-THREAD", 1));
+        RegisterDotcl("ALL-THREADS",
+            new LispFunction(Runtime.AllThreads, "ALL-THREADS", 0));
+        RegisterDotcl("MAKE-LOCK",
+            new LispFunction(Runtime.MakeLock, "MAKE-LOCK", -1));
+        RegisterDotcl("ACQUIRE-LOCK",
+            new LispFunction(Runtime.AcquireLock, "ACQUIRE-LOCK", -1));
+        RegisterDotcl("RELEASE-LOCK",
+            new LispFunction(Runtime.ReleaseLock, "RELEASE-LOCK", 1));
+        RegisterDotcl("LOCKP",
+            new LispFunction(args => args.Length > 0 && args[0] is LispLock
+                ? (LispObject)T.Instance : Nil.Instance, "LOCKP", 1));
+        RegisterDotcl("MAKE-RECURSIVE-LOCK",
+            new LispFunction(Runtime.MakeRecursiveLock, "MAKE-RECURSIVE-LOCK", -1));
+        RegisterDotcl("RECURSIVE-LOCK-P",
+            new LispFunction(args => args.Length > 0 && args[0] is LispLock lk && lk.Recursive
+                ? (LispObject)T.Instance : Nil.Instance, "RECURSIVE-LOCK-P", 1));
+        RegisterDotcl("CONDITION-VARIABLE-P",
+            new LispFunction(args => args.Length > 0 && args[0] is LispConditionVariable
+                ? (LispObject)T.Instance : Nil.Instance, "CONDITION-VARIABLE-P", 1));
+        RegisterDotcl("MAKE-CONDITION-VARIABLE",
+            new LispFunction(Runtime.MakeConditionVariable, "MAKE-CONDITION-VARIABLE", -1));
+        RegisterDotcl("CONDITION-WAIT",
+            new LispFunction(Runtime.ConditionWait, "CONDITION-WAIT", -1));
+        RegisterDotcl("CONDITION-NOTIFY",
+            new LispFunction(Runtime.ConditionNotify, "CONDITION-NOTIFY", 1));
+        RegisterDotcl("CONDITION-BROADCAST",
+            new LispFunction(Runtime.ConditionBroadcast, "CONDITION-BROADCAST", 1));
+        RegisterDotcl("MAKE-SEMAPHORE",
+            new LispFunction(Runtime.MakeSemaphore, "MAKE-SEMAPHORE", -1));
+        RegisterDotcl("SIGNAL-SEMAPHORE",
+            new LispFunction(Runtime.SignalSemaphore, "SIGNAL-SEMAPHORE", -1));
+        RegisterDotcl("WAIT-ON-SEMAPHORE",
+            new LispFunction(Runtime.WaitOnSemaphore, "WAIT-ON-SEMAPHORE", -1));
 
         // DOTNET package functions
         RegisterDotNet(DotNetPkg, "LOAD-ASSEMBLY", new LispFunction(Runtime.DotNetLoadAssembly, "DOTNET:LOAD-ASSEMBLY", -1));

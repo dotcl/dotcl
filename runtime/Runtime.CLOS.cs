@@ -197,13 +197,23 @@ public static partial class Runtime
             cur = c2.Cdr;
         }
 
-        // CLHS: cannot subclass built-in classes with DEFCLASS
-        foreach (var s in supers)
+
+        // Validate each superclass via validate-superclass GF (AMOP)
+        // Must be done before finalization. The new class being defined has a temporary LispClass
+        // for dispatch purposes; use a placeholder that has the right metaclass (standard-class).
+        var validateGF = Startup.Sym("VALIDATE-SUPERCLASS").Function as LispFunction;
+        if (validateGF != null)
         {
-            // T is always a valid superclass (root of the class hierarchy)
-            if (s.IsBuiltIn && s.Name.Name != "T")
-                throw new LispErrorException(new LispError(
-                    $"Cannot use built-in class {s.Name.Name} as a superclass in DEFCLASS"));
+            var tempCls = new LispClass(sym, Array.Empty<SlotDefinition>(), supers.ToArray());
+            foreach (var super in supers)
+            {
+                // Skip T — always valid
+                if (super.Name.Name == "T") continue;
+                var result = validateGF.Invoke(new LispObject[] { tempCls, super });
+                if (result is Nil)
+                    throw new LispErrorException(new LispError(
+                        $"DEFCLASS {sym.Name}: validate-superclass rejected superclass {super.Name.Name}"));
+            }
         }
 
         var cls = new LispClass(sym, slots.ToArray(), supers.ToArray());
@@ -301,6 +311,12 @@ public static partial class Runtime
             if (_classRegistry.TryGetValue(Startup.Sym(metaName), out var meta)) return meta;
             return Nil.Instance;
         }
+        if (obj is GenericFunction gf)
+        {
+            if (gf.StoredClass != null) return gf.StoredClass;
+            if (_classRegistry.TryGetValue(Startup.Sym("STANDARD-GENERIC-FUNCTION"), out var sgfClass)) return sgfClass;
+            return Nil.Instance;
+        }
         if (obj is LispMethod)
         {
             if (_classRegistry.TryGetValue(Startup.Sym("STANDARD-METHOD"), out var methodClass)) return methodClass;
@@ -367,13 +383,16 @@ public static partial class Runtime
     public static LispObject SlotValue(LispObject obj, LispObject slotName)
     {
         if (obj is LispInstanceCondition lic) obj = lic.Instance;
+        string name = slotName switch { Symbol sym => sym.Name, _ => slotName.ToString() };
+        if (obj is LispStruct st)
+        {
+            var stCls = FindClassOrNil(st.TypeName) as LispClass;
+            if (stCls != null && stCls.SlotIndex.TryGetValue(name, out int stIdx) && stIdx < st.Slots.Length)
+                return st.Slots[stIdx] ?? Nil.Instance;
+            throw new LispErrorException(new LispError($"SLOT-VALUE: no slot named {name} in struct {st.TypeName.Name}"));
+        }
         if (obj is not LispInstance inst)
             throw new LispErrorException(new LispTypeError("SLOT-VALUE: not a CLOS instance", obj));
-        string name = slotName switch
-        {
-            Symbol sym => sym.Name,
-            _ => slotName.ToString()
-        };
         if (!inst.Class.SlotIndex.TryGetValue(name, out int idx))
         {
             if (Startup.Sym("SLOT-MISSING").Function is LispFunction slotMissing)
@@ -420,13 +439,19 @@ public static partial class Runtime
     public static LispObject SetSlotValue(LispObject obj, LispObject slotName, LispObject value)
     {
         if (obj is LispInstanceCondition lic) obj = lic.Instance;
+        string name = slotName switch { Symbol sym => sym.Name, _ => slotName.ToString() };
+        if (obj is LispStruct st)
+        {
+            var stCls = FindClassOrNil(st.TypeName) as LispClass;
+            if (stCls != null && stCls.SlotIndex.TryGetValue(name, out int stIdx) && stIdx < st.Slots.Length)
+            {
+                st.Slots[stIdx] = value;
+                return value;
+            }
+            throw new LispErrorException(new LispError($"SET-SLOT-VALUE: no slot named {name} in struct {st.TypeName.Name}"));
+        }
         if (obj is not LispInstance inst)
             throw new LispErrorException(new LispTypeError("SET-SLOT-VALUE: not a CLOS instance", obj));
-        string name = slotName switch
-        {
-            Symbol sym => sym.Name,
-            _ => slotName.ToString()
-        };
         if (!inst.Class.SlotIndex.TryGetValue(name, out int idx))
         {
             if (Startup.Sym("SLOT-MISSING").Function is LispFunction slotMissing)
@@ -452,13 +477,16 @@ public static partial class Runtime
     public static LispObject SlotBoundp(LispObject obj, LispObject slotName)
     {
         if (obj is LispInstanceCondition lic) obj = lic.Instance;
+        string name = slotName switch { Symbol sym => sym.Name, _ => slotName.ToString() };
+        if (obj is LispStruct st)
+        {
+            var stCls = FindClassOrNil(st.TypeName) as LispClass;
+            if (stCls != null && stCls.SlotIndex.TryGetValue(name, out int stIdx) && stIdx < st.Slots.Length)
+                return st.Slots[stIdx] != null ? T.Instance : Nil.Instance;
+            return Nil.Instance;
+        }
         if (obj is not LispInstance inst)
             throw new LispErrorException(new LispTypeError("SLOT-BOUNDP: not a CLOS instance", obj));
-        string name = slotName switch
-        {
-            Symbol sym => sym.Name,
-            _ => slotName.ToString()
-        };
         if (!inst.Class.SlotIndex.TryGetValue(name, out int idx))
         {
             if (Startup.Sym("SLOT-MISSING").Function is LispFunction slotMissing)
@@ -515,6 +543,19 @@ public static partial class Runtime
     public static LispObject ReinitializeInstance(LispObject[] args)
     {
         // args[0] = instance, args[1..] = initargs
+        // Class objects: re-finalize if :direct-superclasses or :direct-slots provided, else no-op.
+        if (args[0] is LispClass lc)
+        {
+            bool hasRelevantArgs = false;
+            for (int i = 1; i + 1 < args.Length; i += 2)
+            {
+                if (args[i] is Symbol ks &&
+                    (ks.Name == "DIRECT-SUPERCLASSES" || ks.Name == "DIRECT-SLOTS"))
+                { hasRelevantArgs = true; break; }
+            }
+            if (hasRelevantArgs) lc.FinalizeClass();
+            return lc;
+        }
         // Per CLHS 7.1.2: validate initargs against slots + applicable method &key params.
         if (args[0] is LispInstance li)
         {
@@ -786,6 +827,46 @@ public static partial class Runtime
         if (cls.IsBuiltIn)
             throw new LispErrorException(new LispError(
                 $"Cannot create instances of built-in class {cls.Name.Name} with MAKE-INSTANCE"));
+
+        // For classes that need specialized C# allocation (generic-function, method subtypes),
+        // create the right C# object directly and then call initialize-instance.
+        // (allocate-instance GF dispatch uses class-of(cls)=STANDARD-CLASS so can't specialize on subclass names.)
+        if (HasSpecializedAllocator(cls))
+        {
+            LispObject? allocated2 = null;
+            // Walk CPL to find the most specific recognized type
+            foreach (var cplCls in cls.ClassPrecedenceList)
+            {
+                if (cplCls.Name.Name == "STANDARD-GENERIC-FUNCTION" || cplCls.Name.Name == "GENERIC-FUNCTION")
+                {
+                    GenericFunction? newGf = null;
+                    newGf = new GenericFunction(Startup.Sym("UNNAMED"), -1,
+                        callArgs => Runtime.DispatchGF(newGf!, callArgs));
+                    newGf.RequiredCount = 0;
+                    newGf.LambdaListInfoSet = true;
+                    newGf.StoredClass = cls;  // track actual Lisp class (may be substandard-generic-function etc.)
+                    allocated2 = newGf;
+                    break;
+                }
+                if (cplCls.Name.Name == "METHOD")
+                {
+                    allocated2 = new LispMethod();
+                    break;
+                }
+            }
+            if (allocated2 != null)
+            {
+                var iiSym2 = Startup.Sym("INITIALIZE-INSTANCE");
+                if (iiSym2.Function is LispFunction iiFn2)
+                {
+                    var iiArgs2 = new LispObject[1 + initargs.Length];
+                    iiArgs2[0] = allocated2;
+                    Array.Copy(initargs, 0, iiArgs2, 1, initargs.Length);
+                    iiFn2.Invoke(iiArgs2);
+                }
+                return allocated2;
+            }
+        }
 
         // Ultra-fast path: bypass GF dispatch for simple classes with no custom methods
         if (cls.HasSimpleInitialization && CanUseSimplePath(cls))
@@ -1192,6 +1273,11 @@ public static partial class Runtime
         if (gfObj is not GenericFunction gf)
             throw new LispErrorException(new LispTypeError("REGISTER-GF: not a generic function", gfObj));
         _gfRegistry[sym] = gf;
+        // When replacing an ordinary function, save it as a fallback so the GF
+        // dispatcher can call the original C# implementation for types that have no
+        // applicable method (e.g. built-in streams when Gray-stream methods exist).
+        if (sym.Function is LispFunction existing && existing is not GenericFunction)
+            gf.FallbackFunction ??= existing;
         // Also install as the symbol's function so calls dispatch through the GF.
         // This bypasses CheckPackageLock since extending a CL generic function with
         // user-defined methods (defmethod auto-create case) is allowed even when
@@ -1205,6 +1291,29 @@ public static partial class Runtime
             accessor.SetfFunction = gf;
         }
         return gfObj;
+    }
+
+    /// <summary>
+    /// Remove a symbol's GF registry entry (used by compile-file cleanup to ensure
+    /// that when the compiled fasl is loaded, %find-gf returns NIL and the GF is
+    /// properly re-registered with sym.Function set).
+    /// </summary>
+    public static void RemoveGfRegistryEntry(Symbol sym, bool isSetf = false)
+    {
+        if (!isSetf)
+        {
+            _gfRegistry.TryRemove(sym, out _);
+        }
+        // For setf GFs, the registry key is a cons (setf name), not the symbol itself.
+        // We can't easily look up the cons key, so scan for entries whose accessor matches.
+        // This is a rare cleanup path so linear scan is acceptable.
+        else
+        {
+            foreach (var kv in _gfRegistry)
+            {
+                if (kv.Key is Symbol s && s == sym) { _gfRegistry.TryRemove(kv.Key, out _); break; }
+            }
+        }
     }
 
     /// <summary>
@@ -1344,8 +1453,11 @@ public static partial class Runtime
                 $"The method lambda list for {gf.Name.Name} has {method.RequiredCount} required " +
                 $"parameter(s) but the generic function requires {gf.RequiredCount}"));
 
-        // Rule 2: Same number of optional parameters
-        if (gf.OptionalCount != method.OptionalCount)
+        // Rule 2: Optional parameter count — method may have fewer optionals than the GF
+        // (SBCL allows this; a method with fewer optionals is only called in patterns
+        // where the optional args are not provided, e.g. getter-only stream-file-position).
+        // A method with MORE optionals than the GF is still an error unless it has &rest/&key.
+        if (method.OptionalCount > gf.OptionalCount)
         {
             if (!(method.HasRest || method.HasKey))
                 throw new LispErrorException(new LispProgramError(
@@ -1737,8 +1849,15 @@ public static partial class Runtime
         }
 
         if (applicable.Count == 0)
+        {
+            // Fall back to the saved original ordinary function (e.g. the C# built-in
+            // for CL functions like CLOSE or STREAM-ELEMENT-TYPE when called with a
+            // type that has no user-defined Gray-stream method).
+            if (gf.FallbackFunction != null)
+                return gf.FallbackFunction.Invoke(args);
             throw new LispErrorException(new LispError(
                 $"No applicable method for generic function {gf.Name.Name}"));
+        }
 
         // Keyword argument validation (CLHS 7.6.5)
         if (gf.LambdaListInfoSet && gf.HasKey && !gf.HasAllowOtherKeys)
@@ -2652,6 +2771,70 @@ public static partial class Runtime
         return Nil.Instance;
     }
 
+    private static bool HasSpecializedAllocator(LispClass cls)
+    {
+        foreach (var s in cls.ClassPrecedenceList)
+            if (s.Name.Name == "GENERIC-FUNCTION" || s.Name.Name == "METHOD") return true;
+        return false;
+    }
+
+    private static void ParseLambdaListIntoGF(GenericFunction gf, LispObject ll)
+    {
+        int req = 0; bool rest = false; bool key = false;
+        var cur = ll;
+        while (cur is Cons c)
+        {
+            var sym = c.Car as Symbol;
+            if (sym?.Name == "&REST" || sym?.Name == "&BODY") { rest = true; }
+            else if (sym?.Name == "&KEY") { key = true; }
+            else if (sym?.Name == "&OPTIONAL" || sym?.Name == "&AUX" ||
+                     sym?.Name == "&ALLOW-OTHER-KEYS") { }
+            else if (sym != null && sym.Name[0] != '&') { if (!rest && !key) req++; }
+            cur = c.Cdr;
+        }
+        gf.RequiredCount = req;
+        gf.HasRest = rest;
+        gf.HasKey = key;
+        gf.LambdaListInfoSet = true;
+        gf.StoredLambdaList = ll;
+    }
+
+    private static void ParseLambdaListIntoMethod(LispMethod m, LispObject ll)
+    {
+        int req = 0; bool rest = false; bool key = false;
+        var cur = ll;
+        while (cur is Cons c)
+        {
+            var elem = c.Car;
+            Symbol? sym = elem is Symbol s ? s : elem is Cons sc ? sc.Car as Symbol : null;
+            if (sym?.Name == "&REST" || sym?.Name == "&BODY") { rest = true; }
+            else if (sym?.Name == "&KEY") { key = true; }
+            else if (sym?.Name == "&OPTIONAL" || sym?.Name == "&AUX" ||
+                     sym?.Name == "&ALLOW-OTHER-KEYS") { }
+            else if (sym != null && sym.Name[0] != '&') { if (!rest && !key) req++; }
+            cur = c.Cdr;
+        }
+        m.RequiredCount = req;
+        m.HasRest = rest;
+        m.HasKey = key;
+    }
+
+    private static LispObject[] CollectList(LispObject lst)
+    {
+        var result = new List<LispObject>();
+        var cur = lst;
+        while (cur is Cons c) { result.Add(c.Car); cur = c.Cdr; }
+        return result.ToArray();
+    }
+
+    private static Symbol[] CollectSymbols(LispObject lst)
+    {
+        var result = new List<Symbol>();
+        var cur = lst;
+        while (cur is Cons c) { if (c.Car is Symbol s) result.Add(s); cur = c.Cdr; }
+        return result.ToArray();
+    }
+
     internal static void RegisterCLOSBuiltins()
     {
         // CLOS internal primitives
@@ -2746,7 +2929,31 @@ public static partial class Runtime
             ((LispMethod)aiDefaultMethod).RequiredCount = 1;
             ((LispMethod)aiDefaultMethod).HasRest = true;
             Runtime.AddMethod(aiGF, aiDefaultMethod);
+
+            // allocate-instance (standard-generic-function) → real GenericFunction
+            var sgfCls = Runtime.FindClass(Startup.Sym("STANDARD-GENERIC-FUNCTION"));
+            var sgfAllocM = Runtime.MakeMethod(new Cons(sgfCls, Nil.Instance), Nil.Instance,
+                new LispFunction(allocArgs => {
+                    GenericFunction? newGf = null;
+                    newGf = new GenericFunction(Startup.Sym("UNNAMED"), -1,
+                        callArgs => Runtime.DispatchGF(newGf!, callArgs));
+                    newGf.RequiredCount = 0;
+                    newGf.LambdaListInfoSet = true;
+                    return newGf;
+                }));
+            ((LispMethod)sgfAllocM).RequiredCount = 1;
+            ((LispMethod)sgfAllocM).HasRest = true;
+            Runtime.AddMethod(aiGF, sgfAllocM);
+
+            // allocate-instance (standard-method) → raw LispMethod
+            var smCls = Runtime.FindClass(Startup.Sym("STANDARD-METHOD"));
+            var smAllocM = Runtime.MakeMethod(new Cons(smCls, Nil.Instance), Nil.Instance,
+                new LispFunction(allocArgs => new LispMethod()));
+            ((LispMethod)smAllocM).RequiredCount = 1;
+            ((LispMethod)smAllocM).HasRest = true;
+            Runtime.AddMethod(aiGF, smAllocM);
         }
+
         // METHOD-QUALIFIERS as a proper GF
         {
             var mqSym = Startup.Sym("METHOD-QUALIFIERS");
@@ -3157,6 +3364,86 @@ public static partial class Runtime
             var defaultMethod = Runtime.MakeMethod(specializers, qualifiers,
                 new LispFunction(Runtime.InitializeInstance));
             Runtime.AddMethod(gf, defaultMethod);
+
+            // initialize-instance primary for GENERIC-FUNCTION — skip shared-initialize (no Lisp slots)
+            {
+                var gfPrimCls = Runtime.FindClass(Startup.Sym("GENERIC-FUNCTION"));
+                var gfPrimM = Runtime.MakeMethod(new Cons(gfPrimCls, Nil.Instance), Nil.Instance,
+                    new LispFunction(args => args[0]));
+                ((LispMethod)gfPrimM).RequiredCount = 1;
+                ((LispMethod)gfPrimM).HasRest = true;
+                ((LispMethod)gfPrimM).HasAllowOtherKeys = true;
+                Runtime.AddMethod(gf, gfPrimM);
+            }
+
+            // initialize-instance primary for METHOD — skip shared-initialize (no Lisp slots)
+            {
+                var mPrimCls = Runtime.FindClass(Startup.Sym("METHOD"));
+                var mPrimM = Runtime.MakeMethod(new Cons(mPrimCls, Nil.Instance), Nil.Instance,
+                    new LispFunction(args => args[0]));
+                ((LispMethod)mPrimM).RequiredCount = 1;
+                ((LispMethod)mPrimM).HasRest = true;
+                ((LispMethod)mPrimM).HasAllowOtherKeys = true;
+                Runtime.AddMethod(gf, mPrimM);
+            }
+
+            // initialize-instance :after for GenericFunction — apply initargs
+            {
+                var afterQuals = new Cons(Startup.Keyword("AFTER"), Nil.Instance);
+                var gfCls2 = Runtime.FindClass(Startup.Sym("GENERIC-FUNCTION"));
+                var gfAfterM = Runtime.MakeMethod(new Cons(gfCls2, Nil.Instance), afterQuals,
+                    new LispFunction(args => {
+                        if (args[0] is not GenericFunction ugf) return args[0];
+                        for (int i = 1; i + 1 < args.Length; i += 2)
+                        {
+                            if (args[i] is not Symbol ks) continue;
+                            if (ks.Name == "LAMBDA-LIST")
+                                ParseLambdaListIntoGF(ugf, args[i + 1]);
+                            else if (ks.Name == "NAME" && args[i + 1] is Symbol ns
+                                     && ugf.Name.Name == "UNNAMED")
+                            {
+                                ns.Function = ugf;
+                                Runtime.RegisterGF(ns, ugf);
+                            }
+                        }
+                        return ugf;
+                    }));
+                ((LispMethod)gfAfterM).RequiredCount = 1;
+                ((LispMethod)gfAfterM).HasRest = true;
+                ((LispMethod)gfAfterM).HasAllowOtherKeys = true;
+                Runtime.AddMethod(gf, gfAfterM);
+
+                // initialize-instance :after for standard-method — set qualifiers/specializers/function
+                var smCls2 = Runtime.FindClass(Startup.Sym("STANDARD-METHOD"));
+                var smAfterM = Runtime.MakeMethod(new Cons(smCls2, Nil.Instance), afterQuals,
+                    new LispFunction(args => {
+                        if (args[0] is not LispMethod m) return args[0];
+                        for (int i = 1; i + 1 < args.Length; i += 2)
+                        {
+                            if (args[i] is not Symbol ks) continue;
+                            switch (ks.Name)
+                            {
+                                case "QUALIFIERS":
+                                    m.Qualifiers = CollectSymbols(args[i + 1]);
+                                    break;
+                                case "SPECIALIZERS":
+                                    m.Specializers = CollectList(args[i + 1]);
+                                    break;
+                                case "FUNCTION":
+                                    if (args[i + 1] is LispFunction mf) m.Function = mf;
+                                    break;
+                                case "LAMBDA-LIST":
+                                    ParseLambdaListIntoMethod(m, args[i + 1]);
+                                    break;
+                            }
+                        }
+                        return m;
+                    }));
+                ((LispMethod)smAfterM).RequiredCount = 1;
+                ((LispMethod)smAfterM).HasRest = true;
+                ((LispMethod)smAfterM).HasAllowOtherKeys = true;
+                Runtime.AddMethod(gf, smAfterM);
+            }
         }
 
         // reinitialize-instance as GF

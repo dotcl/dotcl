@@ -309,6 +309,7 @@ public static partial class Runtime
         LispChar c when IsStandardChar(c.Value) => Startup.Sym("STANDARD-CHAR"),
         LispChar c when c.Value <= '\x7F' => Startup.Sym("BASE-CHAR"),
         LispChar => Startup.Sym("CHARACTER"),
+        GenericFunction gf when gf.StoredClass != null => gf.StoredClass.Name,
         GenericFunction => Startup.Sym("STANDARD-GENERIC-FUNCTION"),
         LispFunction => Startup.Sym("COMPILED-FUNCTION"),
         LispVector v when v.IsBitVector && !v.HasFillPointer && v.Rank == 1 => Startup.Sym("SIMPLE-BIT-VECTOR"),

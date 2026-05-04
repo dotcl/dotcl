@@ -2234,6 +2234,20 @@
                      collect (let ((key (gen-local (symbol-name p))))
                                (cons p key))))
              (*locals* (append param-locals env-locals))
+             ;; Shadow symbol-macros whose names match captured env variables or params.
+             ;; When a variable like X is both a symbol-macro (x → (svref #:inst 0)) AND
+             ;; captured in the env, accessing X inside the closure must use the local
+             ;; variable, not the expansion. Without this shadow, the expansion would be
+             ;; compiled but its free variables (e.g. #:inst) wouldn't be in *locals*.
+             (*symbol-macros*
+              (let ((all-local-names
+                     (append (mapcar (lambda (p) (symbol-name p)) all-params)
+                             free-vars)))
+                (remove-if (lambda (entry)
+                             (let ((k (car entry)))
+                               (member (if (symbolp k) (symbol-name k) "")
+                                       all-local-names :test #'string=)))
+                           *symbol-macros*)))
              (*boxed-vars* (append
                             (mapcar (lambda (name)
                                       (or (find name all-params :key #'symbol-name :test #'string=)
@@ -2681,9 +2695,14 @@
            (let ((builtin-instrs (compile-builtin-function-ref (symbol-name thing))))
              (if builtin-instrs
                  builtin-instrs
-                 ;; Global user-defined function
-                 `((:ldstr ,(mangle-name thing))
-                   (:call "CilAssembler.GetFunction")))))))
+                 ;; Global user-defined function — use symbol-based lookup so that
+                 ;; package-qualified names (e.g. #'bt2:current-thread) resolve to
+                 ;; the correct package's symbol, not a same-named symbol in another
+                 ;; package (e.g. dotcl:current-thread). GetFunctionBySymbol checks
+                 ;; sym.Function first, then falls back to cross-package search.
+                 `(,@(compile-sym-lookup thing)
+                   (:castclass "Symbol")
+                   (:call "CilAssembler.GetFunctionBySymbol")))))))
     (t (error "FUNCTION: unsupported argument ~s" thing))))
 
 (defun compile-macrolet (macro-defs body)
@@ -4582,14 +4601,20 @@
               (compile-named-call 'expt (cdr expr)))))
   (setf (gethash 'ash h)
         (lambda (expr)
-          (if (= (length (cdr expr)) 2)
-              (compile-binary-call (cdr expr) "Runtime.Ash")
-              (compile-named-call 'ash (cdr expr)))))
+          (let ((args (cdr expr)))
+            (if (= (length args) 2)
+                (or (compile-ash-fast args)
+                    (compile-binary-call args "Runtime.Ash"))
+                (compile-named-call 'ash args)))))
   (setf (gethash 'lognot h)
         (lambda (expr)
-          (if (= (length (cdr expr)) 1)
-              (compile-unary-call (cdr expr) "Runtime.Lognot")
-              (compile-named-call 'lognot (cdr expr)))))
+          (let ((args (cdr expr)))
+            (cond
+              ((and (= (length args) 1) (fixnum-typed-p (first args)))
+               (compile-fixbit-not args))
+              ((= (length args) 1)
+               (compile-unary-call args "Runtime.Lognot"))
+              (t (compile-named-call 'lognot args))))))
   (setf (gethash 'integer-length h)
         (lambda (expr)
           (if (= (length (cdr expr)) 1)
@@ -4600,17 +4625,21 @@
           (if (= (length (cdr expr)) 2)
               (compile-binary-call (cdr expr) "Runtime.Logbitp")
               (compile-named-call 'logbitp (cdr expr)))))
-  (dolist (item '((logior "Runtime.Logior2" "Runtime.Logior" 0)
-                   (logand "Runtime.Logand2" "Runtime.Logand" -1)
-                   (logxor "Runtime.Logxor2" "Runtime.Logxor" 0)))
-    (let ((op (first item)) (method2 (second item)) (methodN (third item)) (zero-val (fourth item)))
+  (dolist (item (list (list 'logior "Runtime.Logior2" "Runtime.Logior" 0 :or)
+                      (list 'logand "Runtime.Logand2" "Runtime.Logand" -1 :and)
+                      (list 'logxor "Runtime.Logxor2" "Runtime.Logxor" 0 :xor)))
+    (let ((op (first item)) (method2 (second item)) (methodN (third item))
+          (zero-val (fourth item)) (cil-op (fifth item)))
       (setf (gethash op h)
             (lambda (expr)
               (let ((args (cdr expr)))
                 (case (length args)
                   (0 (emit-fixnum zero-val))
                   (1 (let ((*in-tail-position* nil)) (compile-expr (first args))))
-                  (2 (compile-binary-call args method2))
+                  (2 (if (and (fixnum-typed-p (first args))
+                              (fixnum-typed-p (second args)))
+                         (compile-fixbit-binop args cil-op)
+                         (compile-binary-call args method2)))
                   (t `(,@(compile-args-array args) (:call ,methodN)))))))))
 
   ;; I/O

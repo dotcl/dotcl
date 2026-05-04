@@ -322,15 +322,43 @@ public static partial class Runtime
                     throw new LispErrorException(new LispTypeError("CONCATENATE: cannot coerce non-empty sequence to NULL", seq));
             return Nil.Instance;
         }
-        if (typeName == "VECTOR" || typeName == "SIMPLE-VECTOR" || typeName == "ARRAY")
+        if (typeName == "VECTOR" || typeName == "SIMPLE-VECTOR" || typeName == "ARRAY" || typeName == "SIMPLE-ARRAY")
         {
             var items = new List<LispObject>();
             foreach (var seq in sequences) CollectSequenceElements(seq, items);
-            // Check compound size constraint: (vector * N) where N is the required length
-            if (resultType is Cons vc && vc.Cdr is Cons vc2 && vc2.Cdr is Cons vc3 && vc3.Car is Fixnum sizeF)
-                if (items.Count != (int)sizeF.Value)
-                    throw new LispErrorException(new LispTypeError($"CONCATENATE: result has {items.Count} elements, type requires {sizeF.Value}", resultType));
-            return new LispVector(items.ToArray(), "T");
+            // For (simple-array element-type dims) or (vector element-type n): parse element type
+            string elemTypeName = "T";
+            if (resultType is Cons rtc0)
+            {
+                var etSpec = (rtc0.Cdr as Cons)?.Car;  // element-type arg
+                if (etSpec != null && !(etSpec is T) && !(etSpec is Symbol wtSym && wtSym.Name == "*"))
+                    elemTypeName = ParseElementTypeName(etSpec);
+                // Check compound size constraint: (vector * N) where N is the required length
+                var dimsSpec = (rtc0.Cdr as Cons)?.Cdr as Cons;
+                var sizeArg = dimsSpec?.Car;
+                if (sizeArg is Fixnum sizeF)
+                    if (items.Count != (int)sizeF.Value)
+                        throw new LispErrorException(new LispTypeError($"CONCATENATE: result has {items.Count} elements, type requires {sizeF.Value}", resultType));
+                else if (sizeArg is Cons sizeList && sizeList.Car is Fixnum dimFix)
+                    if (items.Count != (int)dimFix.Value)
+                        throw new LispErrorException(new LispTypeError($"CONCATENATE: result has {items.Count} elements, type requires {dimFix.Value}", resultType));
+            }
+            return new LispVector(items.ToArray(), elemTypeName);
+        }
+        // Try deftype expansion for compound or named sequence types
+        if (resultType is Symbol typeAlias && TypeExpanders.TryGetValue(typeAlias.Name, out var concatExpander))
+        {
+            var expanded = Funcall(concatExpander);
+            if (expanded is not Symbol es || es.Name != typeAlias.Name)
+                return Concatenate(expanded, sequences);
+        }
+        if (resultType is Cons compAlias && compAlias.Car is Symbol compHead
+            && TypeExpanders.TryGetValue(compHead.Name, out var compConcatExpander))
+        {
+            var compArgs = ToList(compAlias.Cdr).ToArray();
+            var compExpanded = Funcall(compConcatExpander, compArgs);
+            if (!ReferenceEquals(compExpanded, resultType))
+                return Concatenate(compExpanded, sequences);
         }
         if (typeName == "BIT-VECTOR" || typeName == "SIMPLE-BIT-VECTOR")
         {
@@ -504,13 +532,32 @@ public static partial class Runtime
             string head = headSym.Name;
             if (head is "VECTOR" or "SIMPLE-VECTOR" or "ARRAY" or "SIMPLE-ARRAY")
             {
-                // Extract size from (vector * n) or (array * (n)) — 3rd arg for vectors
-                var rest1 = compType.Cdr as Cons;
-                var rest2 = rest1?.Cdr as Cons;
-                var sizeSpec = rest2?.Car;  // could be a Fixnum for vectors or a list for arrays
-                // Coerce to vector type
-                var result = Coerce(obj, Startup.Sym(head is "SIMPLE-ARRAY" or "ARRAY" ? "VECTOR" : "VECTOR"));
-                // Check size constraint if specified (for 1D vectors)
+                // (simple-array element-type dims) or (vector element-type size)
+                var rest1 = compType.Cdr as Cons;       // (element-type . rest)
+                var elemTypeSpec = rest1?.Car;           // element-type or * or T
+                var rest2 = rest1?.Cdr as Cons;          // (dims) or (size)
+                var sizeSpec = rest2?.Car;               // dims list (*) or fixnum size or *
+
+                // Parse element type — * and T both mean "any element"
+                string elemTypeName = "T";
+                if (elemTypeSpec != null && !(elemTypeSpec is T) && !(elemTypeSpec is Symbol wc && wc.Name == "*"))
+                    elemTypeName = ParseElementTypeName(elemTypeSpec);
+
+                // Get the base vector (using generic coerce path)
+                var result = Coerce(obj, Startup.Sym("VECTOR"));
+
+                // If a specific element type was requested, re-wrap with that type
+                if (elemTypeName != "T" && result is LispVector tv)
+                {
+                    if (tv.ElementTypeName != elemTypeName)
+                    {
+                        var items = new LispObject[tv.Length];
+                        for (int i = 0; i < tv.Length; i++) items[i] = tv.ElementAt(i);
+                        result = new LispVector(items, elemTypeName);
+                    }
+                }
+
+                // Check size constraint if specified
                 if (sizeSpec is Fixnum sizeFix)
                 {
                     int expectedLen = (int)sizeFix.Value;
@@ -518,7 +565,22 @@ public static partial class Runtime
                     if (actualLen != expectedLen)
                         throw new LispErrorException(new LispTypeError($"COERCE: result length {actualLen} does not match required length {expectedLen}", obj));
                 }
+                else if (sizeSpec is Cons sizeList && sizeList.Car is Fixnum dimFix)
+                {
+                    int expectedLen = (int)dimFix.Value;
+                    int actualLen = result is LispVector rv2 ? rv2.Length : (result is LispString rs2 ? rs2.Length : 0);
+                    if (actualLen != expectedLen)
+                        throw new LispErrorException(new LispTypeError($"COERCE: result length {actualLen} does not match required length {expectedLen}", obj));
+                }
                 return result;
+            }
+            // Try compound deftype expansion: (my-type args...) → expanded type
+            if (TypeExpanders.TryGetValue(headSym.Name, out var compExpander))
+            {
+                var compArgs = ToList(compType.Cdr).ToArray();
+                var compExpanded = Funcall(compExpander, compArgs);
+                if (!ReferenceEquals(compExpanded, resultType))
+                    return Coerce(obj, compExpanded);
             }
             if (head is "LIST") return Coerce(obj, Startup.Sym("LIST"));
             if (head is "STRING" or "SIMPLE-STRING" or "BASE-STRING") return Coerce(obj, Startup.Sym(head));
@@ -707,6 +769,13 @@ public static partial class Runtime
             default:
                 // If already of the target type, return as-is
                 if (IsTruthy(Typep(obj, resultType))) return obj;
+                // Try deftype expansion for named type aliases
+                if (TypeExpanders.TryGetValue(typeName, out var symExpander))
+                {
+                    var symExpanded = Funcall(symExpander);
+                    if (symExpanded is not Symbol se || se.Name != typeName)
+                        return Coerce(obj, symExpanded);
+                }
                 throw new LispErrorException(new LispTypeError($"COERCE: cannot coerce to {typeName}", obj));
         }
     }

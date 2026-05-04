@@ -216,6 +216,32 @@
     (car errors))
   0)
 
+;;; D952 — thread identity and all-threads registry
+
+(deftest d952-thread-join-returns-value
+  ;; join-thread must return the thread function's return value
+  (let ((th (dotcl-thread:make-thread (lambda () 42))))
+    (dotcl-thread:thread-join th))
+  42)
+
+(deftest d952-current-thread-identity
+  ;; current-thread inside thread must be eql to the object returned by make-thread
+  (let ((th (dotcl-thread:make-thread #'dotcl:current-thread)))
+    (eql th (dotcl-thread:thread-join th)))
+  t)
+
+(deftest d952-all-threads-contains-new-thread
+  ;; a live thread must appear in all-threads
+  (let* ((sem (dotcl-thread:make-semaphore :count 0))
+         (th (dotcl-thread:make-thread
+              (lambda ()
+                (dotcl-thread:wait-on-semaphore sem)))))
+    (let ((found (not (null (member th (dotcl:all-threads))))))
+      (dotcl-thread:signal-semaphore sem)
+      (dotcl-thread:thread-join th)
+      found))
+  t)
+
 ;;; D660 soak — multi-pattern concurrent stress tests on dotcl-thread.
 
 ;;; Dining philosophers: N=5, ordered-acquire avoids deadlock.

@@ -4,7 +4,7 @@ INPUT ?= test/test1.lisp
 STDBUF ?=
 SETSID ?= $(shell which setsid 2>/dev/null)
 
-.PHONY: all build run clean repl test-a2 test-ansi test-ansi-all test-ansi-full test-regression test-mop update-ansi-state commit-ansi-state cross-compile loc publish pack install setup-ansi-test setup-asdf setup-cl-bench bench bench-state test-sbcl-host2 compile-asdf-fasl compile-asdf-fasls compile-core-fasl compile-contrib-fasls contrib-dotcl-cs
+.PHONY: all build run clean repl test-a2 test-ansi test-ansi-all test-ansi-full test-regression test-mop update-ansi-state commit-ansi-state cross-compile loc publish pack install setup-ansi-test setup-asdf setup-cl-bench bench bench-state test-sbcl-host2 compile-asdf-fasl compile-asdf-fasls compile-core-fasl compile-contrib-fasls contrib-dotcl-cs gen-char-names
 
 # Source files for cross-compile. Listed once; the recipe and dependency
 # tracking both reference this so adding a file is a single-edit change.
@@ -18,7 +18,7 @@ CIL_SOURCES := \
 
 all: cross-compile build
 
-build:
+build: $(DOTCL_ROOT)runtime/Generated/UnicodeCharNames.g.cs
 	dotnet build $(DOTCL_ROOT)runtime/runtime.csproj
 
 run:
@@ -378,6 +378,24 @@ TARGETARCH_osx-arm64 := arm64
 # name is `crossgen2.exe` on Windows, `crossgen2` elsewhere.
 HOST_RID := $(shell dotnet --info 2>/dev/null | awk '/^[[:space:]]*RID:/ {print $$2; exit}')
 CROSSGEN2_EXE := $(if $(filter win-%,$(HOST_RID)),crossgen2.exe,crossgen2)
+
+# gen-utils: C# codegen tool (download + char-names subcommands)
+GEN_UTILS_EXE_NAME := $(if $(filter win-%,$(HOST_RID)),gen-utils.exe,gen-utils)
+GEN_UTILS_OUT      := $(DOTCL_ROOT)scripts/gen-utils-out
+GEN_UTILS_EXE      := $(GEN_UTILS_OUT)/$(GEN_UTILS_EXE_NAME)
+GEN_UTILS_SRCS     := $(DOTCL_ROOT)scripts/GenUtils/Program.cs \
+                      $(DOTCL_ROOT)scripts/GenUtils/GenUtils.csproj
+
+$(GEN_UTILS_EXE): $(GEN_UTILS_SRCS)
+	dotnet publish $(DOTCL_ROOT)scripts/GenUtils/GenUtils.csproj -o $(GEN_UTILS_OUT)/
+
+$(DOTCL_ROOT)scripts/UnicodeData.txt: $(GEN_UTILS_EXE)
+	$(GEN_UTILS_EXE) download https://unicode.org/Public/UCD/latest/ucd/UnicodeData.txt $@
+
+$(DOTCL_ROOT)runtime/Generated/UnicodeCharNames.g.cs: $(DOTCL_ROOT)scripts/UnicodeData.txt $(GEN_UTILS_EXE)
+	$(GEN_UTILS_EXE) char-names $< $@
+
+gen-char-names: $(DOTCL_ROOT)runtime/Generated/UnicodeCharNames.g.cs
 CROSSGEN2 := $(firstword $(wildcard $(HOME)/.nuget/packages/microsoft.netcore.app.crossgen2.$(HOST_RID)/*/tools/$(CROSSGEN2_EXE)))
 
 # Per-RID runtime ref dir (NuGet cache; populated by `dotnet publish -r <rid>`).

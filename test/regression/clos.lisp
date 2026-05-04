@@ -98,3 +98,19 @@
   ;; :no-such-key is not a valid initarg — should signal an error (no custom methods on this class)
   (signals-error (reinitialize-instance (make-instance 'clos-ri-obj) :no-such-key 42) error)
   t)
+
+;;; Cross-package typep: pa:widget and pb:widget are distinct classes (#204)
+(defpackage :typep-test-pa (:use :cl) (:export :widget))
+(defpackage :typep-test-pb (:use :cl) (:export :widget))
+(defclass typep-test-pa:widget () ())
+(defclass typep-test-pb:widget () ())
+
+(deftest clos-typep-cross-package-no-false-positive
+  ;; pb:widget instance must NOT satisfy pa:widget
+  (typep (make-instance 'typep-test-pb:widget) 'typep-test-pa:widget)
+  nil)
+
+(deftest clos-typep-cross-package-positive
+  ;; pa:widget instance must satisfy pa:widget
+  (typep (make-instance 'typep-test-pa:widget) 'typep-test-pa:widget)
+  t)
