@@ -62,8 +62,8 @@ public static partial class Runtime
 
     public static LispObject Nth(LispObject n, LispObject list)
     {
-        if (n is not Fixnum f)
-            throw new LispErrorException(new LispTypeError("NTH: not an integer", n));
+        if (n is not Fixnum f || f.Value < 0)
+            throw new LispErrorException(new LispTypeError("NTH: index must be a non-negative integer", n, Startup.Sym("UNSIGNED-BYTE")));
         int idx = (int)f.Value;
         LispObject current = list;
         for (int i = 0; i < idx; i++)
@@ -366,6 +366,8 @@ public static partial class Runtime
             args.Add(c.Car);
             current = c.Cdr;
         }
+        if (current is not Nil)
+            throw new LispErrorException(new LispTypeError("APPLY: last argument is not a proper list", argList, Startup.Sym("LIST")));
         return fn.Invoke(args.ToArray());
     }
 
@@ -1082,7 +1084,7 @@ public static partial class Runtime
                     n >= 0 ? (LispObject)Fixnum.Make(n) : Nil.Instance
                 });
                 return (result is Nil && MultipleValues.Count == 0) ? null : result;
-            });
+            }, lispFn);
             return T.Instance;
         }));
         Emitter.CilAssembler.RegisterFunction("GET-DISPATCH-MACRO-CHARACTER", new LispFunction(args => {
@@ -1093,8 +1095,12 @@ public static partial class Runtime
                 : (LispReadtable)DynamicBindings.Get(Startup.Sym("*READTABLE*"));
             if (rt.GetDispatchTable(dispChar) == null)
                 throw new LispErrorException(new LispError($"{dispChar} is not a dispatching macro character in the current readtable"));
-            var fn = rt.GetDispatchMacroCharacter(dispChar, subChar);
-            return fn != null ? (LispObject)T.Instance : Nil.Instance;
+            // Digit sub-chars return nil per CLHS
+            if (char.IsAsciiDigit(subChar)) return Nil.Instance;
+            var lispFn2 = rt.GetLispDispatchMacroFunction(dispChar, subChar);
+            if (lispFn2 != null) return lispFn2;
+            // Built-in C# dispatch functions have no Lisp counterpart; return nil
+            return Nil.Instance;
         }));
     }
 

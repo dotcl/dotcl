@@ -4,7 +4,7 @@ INPUT ?= test/test1.lisp
 STDBUF ?=
 SETSID ?= $(shell which setsid 2>/dev/null)
 
-.PHONY: all build run clean repl test-a2 test-ansi test-ansi-all test-ansi-full test-regression test-mop update-ansi-state commit-ansi-state cross-compile loc publish pack install setup-ansi-test setup-asdf setup-cl-bench bench bench-state test-sbcl-host2 compile-asdf-fasl compile-asdf-fasls compile-core-fasl compile-contrib-fasls contrib-dotcl-cs gen-char-names
+.PHONY: all build run clean repl test-a2 test-ansi test-ansi-all test-ansi-full test-ansi-extra test-regression test-mop update-ansi-state commit-ansi-state cross-compile loc publish pack install setup-ansi-test setup-asdf setup-cl-bench bench bench-state test-sbcl-host2 compile-asdf-fasl compile-asdf-fasls compile-core-fasl compile-contrib-fasls contrib-dotcl-cs gen-char-names
 
 # Source files for cross-compile. Listed once; the recipe and dependency
 # tracking both reference this so adding a file is a single-edit change.
@@ -30,6 +30,10 @@ repl:
 test-regression: build $(DOTCL_ROOT)compiler/cil-out.sil
 	@echo "=== Running dotcl regression tests ==="
 	$(SETSID) dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --asm $(DOTCL_ROOT)compiler/cil-out.sil $(DOTCL_ROOT)test/regression/run.lisp
+
+test-ansi-extra: build $(DOTCL_ROOT)compiler/cil-out.sil
+	@echo "=== Running CLHS audit extra tests ==="
+	$(SETSID) dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --asm $(DOTCL_ROOT)compiler/cil-out.sil $(DOTCL_ROOT)test/test-ansi-extra.lisp
 
 test-mop: build $(DOTCL_ROOT)compiler/cil-out.sil
 	@echo "=== Running AMOP protocol conformance tests ==="
@@ -341,6 +345,10 @@ CONTRIB_FASLS := $(foreach n,$(CONTRIB_NAMES),$(DOTCL_ROOT)contrib/$(n)/$(n).fas
 
 $(DOTCL_ROOT)contrib/%.fasl: $(DOTCL_ROOT)contrib/%.lisp $(DOTCL_ROOT)compiler/cil-out.sil
 	dotnet run --project $(DOTCL_ROOT)runtime -- --asm $(DOTCL_ROOT)compiler/cil-out.sil --eval '(compile-file "$<")'
+	@n=$$(echo '$*' | cut -d/ -f1); \
+	if [ -d "$(DOTCL_ROOT)runtime/contrib/$$n" ]; then \
+	  cp "$@" "$(DOTCL_ROOT)runtime/contrib/$$n/$$n.fasl"; \
+	fi
 
 compile-contrib-fasls: $(CONTRIB_FASLS)
 

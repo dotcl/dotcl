@@ -240,7 +240,7 @@
     (when (and (symbolp name)
                (= (length args) 1)
                (not (assoc (mangle-name name) *local-functions* :test #'string=)))
-      (let ((slot-idx (gethash (symbol-name name) *struct-accessors*)))
+      (let ((slot-idx (gethash name *struct-accessors*)))
         (when slot-idx
           (return-from compile-named-call
             `(,@(let ((*in-tail-position* nil)) (compile-expr (car args)))
@@ -984,7 +984,12 @@
         (*cross-compiling*
          (when (or ct-p ex-p)
            (dolist (form body)
-             (eval form))))
+             ;; Skip %register-struct-class: dotcl runtime function absent in SBCL.
+             ;; During compile-file, the cross-package bridge resolves it correctly.
+             (unless (and (consp form)
+                          (symbolp (car form))
+                          (string= (symbol-name (car form)) "%REGISTER-STRUCT-CLASS"))
+               (eval form)))))
         (*compile-file-mode*
          (when ct-p
            (dolist (form body)
@@ -2108,14 +2113,15 @@
          ;; Determine which free vars are boxed in outer scope
          (outer-boxed-fvs
            (remove-if-not (lambda (fv)
-                            (or (let ((entry (assoc fv *locals*
-                                                    :key (lambda (k) (symbol-name k))
-                                                    :test #'string=)))
-                                  (and entry (boxed-var-p (car entry))))
-                                ;; Also check *local-functions* for boxed labels functions
-                                (let ((lf (find fv *local-functions*
-                                                :key #'first :test #'string=)))
-                                  (and lf (third lf)))))
+                            (let ((entry (assoc fv *locals*
+                                               :key (lambda (k) (symbol-name k))
+                                               :test #'string=)))
+                              (if entry
+                                  (boxed-var-p (car entry))
+                                  ;; Only check *local-functions* when not in *locals*
+                                  (let ((lf (find fv *local-functions*
+                                                  :key #'first :test #'string=)))
+                                    (and lf (third lf))))))
                           free-vars))
          ;; Compile inner body with env slots
          (inner-body (compile-closure-body params body free-vars outer-boxed-fvs)))
@@ -2128,9 +2134,11 @@
                        collect (let ((entry (assoc fv *locals*
                                                    :key (lambda (k) (symbol-name k))
                                                    :test #'string=)))
-                                 (if (and entry (boxed-var-p (car entry)))
-                                     (list fv i "boxed")
-                                     ;; Check *local-functions* for boxed labels functions
+                                 (if entry
+                                     (if (boxed-var-p (car entry))
+                                         (list fv i "boxed")
+                                         (list fv i "value"))
+                                     ;; Only check *local-functions* when not in *locals*
                                      (let ((lf (find fv *local-functions*
                                                      :key #'first :test #'string=)))
                                        (if (and lf (third lf))
@@ -2906,24 +2914,10 @@
     (let* ((*local-functions* (append new-local-fns *local-functions*))
            ;; Also make boxes available as locals for capture (only symbol names).
            ;; CL is a Lisp-2: function and variable namespaces are separate.
-           ;; When a labels function name clashes with a lexical variable, use a
-           ;; mangled name (__LABELFN_xxx) so both can coexist in *locals* without
-           ;; the function box shadowing the variable binding.
-           (new-locals (remove nil
-                         (mapcar (lambda (lf)
-                                   (let* ((name-str (first lf)))
-                                     (unless (char= (char name-str 0) #\()
-                                       (let* ((sym (intern name-str :dotcl.cil-compiler))
-                                              ;; Check for name clash using string= (package-independent)
-                                              (clash-p (assoc name-str *locals*
-                                                              :key (lambda (k) (if (symbolp k) (symbol-name k) nil))
-                                                              :test #'string=))
-                                              (local-sym (if clash-p
-                                                             (intern (concatenate 'string "__LABELFN_" name-str)
-                                                                     :dotcl.cil-compiler)
-                                                             sym)))
-                                         (cons local-sym (second lf))))))
-                                 new-local-fns)))
+           ;; Always use __LABELFN_ prefix so labels boxes and let variables with
+           ;; the same name can coexist in *locals*. find-free-vars-expr detects the
+           ;; __LABELFN_ entry when a labels function appears in function position.
+           (new-locals (compile-labels-build-new-locals new-local-fns))
            (*locals* (append new-locals *locals*))
            (*boxed-vars* (append (mapcar #'car new-locals)
                                  *boxed-vars*))
@@ -2959,14 +2953,8 @@
     (mapcar (lambda (lf)
               (let* ((name-str (first lf)))
                 (unless (char= (char name-str 0) #\()
-                  (let* ((sym (intern name-str :dotcl.cil-compiler))
-                         (clash-p (assoc name-str *locals*
-                                         :key (lambda (k) (if (symbolp k) (symbol-name k) nil))
-                                         :test #'string=))
-                         (local-sym (if clash-p
-                                        (intern (concatenate 'string "__LABELFN_" name-str)
-                                                :dotcl.cil-compiler)
-                                        sym)))
+                  (let* ((local-sym (intern (concatenate 'string "__LABELFN_" name-str)
+                                            :dotcl.cil-compiler)))
                     (cons local-sym (second lf))))))
             new-local-fns)))
 
@@ -5031,7 +5019,27 @@
           (when (and *compile-was-toplevel* *compile-file-mode*
                      (not *cross-compiling*))
             (try-eval expr))
-          (compile-defun (cadr expr) (caddr expr) (cdddr expr))))
+          ;; CLHS 3.4.11: extract docstring (first form if string AND more forms follow).
+          ;; Skip during cross-compile because cil-stdlib's own defuns may precede
+          ;; (setf documentation) GF definition; runtime user defuns are fine.
+          (let* ((name (cadr expr))
+                 (params (caddr expr))
+                 (body (cdddr expr))
+                 (has-docstring (and (not *cross-compiling*)
+                                     (consp body) (stringp (car body)) (cdr body)))
+                 (docstring (when has-docstring (car body)))
+                 (real-body (if has-docstring (cdr body) body))
+                 (defun-instrs (compile-defun name params real-body)))
+            (if has-docstring
+                ;; defun-instrs ends with sym on stack. Set documentation
+                ;; via (funcall #'(setf documentation) docstring 'name 'function),
+                ;; then leave sym on stack as the form's value.
+                `(,@defun-instrs
+                  (:pop)
+                  ,@(compile-and-pop
+                      `(funcall #'(setf documentation) ,docstring ',name 'function))
+                  ,@(compile-sym-lookup name))
+                defun-instrs))))
   ;; %inline-cs-spliced: dotcl-cs:inline-cs macro expansion target.
   ;; Form: (%inline-cs-spliced ((arg1 arg2 ...)) :returns long ((:LDARG-0) ...))
   ;;   ARGN are Lisp value forms (compiled to LispObject Fixnum).

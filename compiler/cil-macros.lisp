@@ -155,11 +155,11 @@
   "Table of custom setf expanders: accessor-name-string → (lambda (place value) expanded-form)")
 
 ;;; --- struct info table for :include support ---
-(defvar *struct-info* (make-hash-table :test #'equal)
-  "Table of struct metadata: struct-name-string → plist (:slots :parent :conc-prefix)")
+(defvar *struct-info* (make-hash-table :test #'eq)
+  "Table of struct metadata: symbol → plist (:slots :parent :conc-prefix)")
 
-(defvar *struct-accessors* (make-hash-table :test #'equal)
-  "Maps accessor name (string) to slot index (integer) for compile-time inlining.
+(defvar *struct-accessors* (make-hash-table :test #'eq)
+  "Maps accessor symbol to slot index (integer) for compile-time inlining.
    Only populated for standard (non-typed) structs.")
 
 (defvar *setf-expansion-fns* (make-hash-table :test #'equal)
@@ -374,12 +374,24 @@
 
 (setf (gethash "SYMBOL-FUNCTION" *setf-expanders*)
       (lambda (place value)
-        `(%set-fdefinition ,(second place) ,value)))
+        (let ((sym-var (gensym "SYM"))
+              (val-var (gensym "VAL")))
+          `(let ((,sym-var ,(second place))
+                 (,val-var ,value))
+             (unless (symbolp ,sym-var)
+               (error 'type-error :datum ,sym-var :expected-type 'symbol))
+             (%set-fdefinition ,sym-var ,val-var)))))
 
 ;; (setf (compiler-macro-function name) fn) — delegate to %register-compiler-macro-rt.
 (setf (gethash "COMPILER-MACRO-FUNCTION" *setf-expanders*)
       (lambda (place value)
         `(%register-compiler-macro-rt ,(second place) ,value)))
+
+;;; (setf (the type place) value) → (setf place value)
+;;; CLHS requires THE to be a valid setf place; strip the type annotation.
+(setf (gethash "THE" *setf-expanders*)
+      (lambda (place value)
+        `(setf ,(third place) ,value)))
 
 ;;; setf for car/cdr and compound cXXXr forms
 (setf (gethash "CAR" *setf-expanders*)
@@ -970,6 +982,9 @@
           (values (list n lst) (list (cadr place) (caddr place)) (list s)
                   `(progn (rplaca (nthcdr ,n ,lst) ,s) ,s)
                   `(nth ,n ,lst))))
+       (the
+        ;; (the type place) — type is not a form; recurse on actual place
+        (%get-setf-expansion (caddr place)))
        (t
         ;; Check for define-setf-expander first (5-value protocol), package-aware
         (let ((dse-fn (and (symbolp (car place))
@@ -1690,8 +1705,10 @@
                (base-offset (+ (or initial-offset 0) (if named-p 1 0)))
                (raw-slots-with-doc (cddr form))
                ;; Filter out documentation string (first element if it's a string)
-               (raw-slots (if (and raw-slots-with-doc
-                                   (stringp (car raw-slots-with-doc)))
+               (struct-doc (when (and raw-slots-with-doc
+                                      (stringp (car raw-slots-with-doc)))
+                             (car raw-slots-with-doc)))
+               (raw-slots (if struct-doc
                               (cdr raw-slots-with-doc)
                               raw-slots-with-doc))
                ;; Parse slots: each is either symbol or (symbol default :key val ...)
@@ -1708,7 +1725,7 @@
                (include-overrides (when include-name
                                     (cddr include-raw)))
                (include-info (when include-name
-                               (gethash (symbol-name include-name) *struct-info*)))
+                               (gethash include-name *struct-info*)))
                (include-parent-conc-prefix (when include-info
                                              (getf include-info :conc-prefix)))
                ;; Parent slots from :include, with overrides applied
@@ -1867,12 +1884,14 @@
           ;; Register setf expanders as side-effect of macro expansion
           (loop for acc in accessor-names
                 for idx in slot-indices
+                for s in all-slots
                 for i from 0
+                unless (getf (cddr s) :read-only)
                 do (let ((index idx)
                          (raw-index i))
                      ;; Register for compile-time struct accessor inlining (non-typed structs only)
                      (when (null type-option)
-                       (setf (gethash (symbol-name acc) *struct-accessors*) raw-index))
+                       (setf (gethash acc *struct-accessors*) raw-index))
                      (setf (gethash (symbol-name acc) *setf-expanders*)
                            (cond
                              ((null type-option)
@@ -1897,7 +1916,7 @@
                                      (setf (aref ,(cadr place) ,index) ,tmp)
                                      ,tmp))))))))
           ;; Store struct info for :include lookups (at macro-expansion time)
-          (setf (gethash (symbol-name name) *struct-info*)
+          (setf (gethash name *struct-info*)
                 (list :slots (mapcar #'copy-list all-slots)
                       :parent include-name
                       :conc-prefix conc-prefix
@@ -1910,9 +1929,12 @@
                       :ctor-layout (when ctor-layout
                                      (mapcar #'identity ctor-layout))))
           `(progn
-             ;; Register struct type in CLOS class registry (only for non-typed structs)
+             ;; Register struct type in CLOS class registry (only for non-typed structs).
+             ;; eval-when :compile-toplevel ensures struct inheritance is visible during
+             ;; compile-file macro expansions (e.g. coalton's (assert (subtypep type 'node))).
              ,@(unless type-option
-                 `((%register-struct-class ',name ',(or include-name nil) ,@(mapcar (lambda (s) `',(car s)) all-slots))))
+                 `((eval-when (:compile-toplevel :load-toplevel :execute)
+                     (%register-struct-class ',name ',(or include-name nil) ,@(mapcar (lambda (s) `',(car s)) all-slots)))))
              ;; Constructors
              ,@(let ((ctor-forms nil))
                  (dolist (spec constructor-specs)
@@ -2038,6 +2060,9 @@
                     `((defun ,copy-name (obj) (copy-list obj))))
                    (t
                     `((defun ,copy-name (obj) (copy-seq obj))))))
+             ;; Documentation (CLHS 8.1)
+             ,@(when struct-doc
+                 (list `(funcall #'(setf documentation) ,struct-doc ',name 'structure)))
              ;; Return type name
              ',name))))
 
@@ -2174,6 +2199,13 @@
                                do (let ((key (pop pairs))
                                         (val (pop pairs)))
                                     (push (list key val) result))))))))
+               ;; Extract :documentation class option (string or nil)
+               (class-doc
+                 (let ((result nil))
+                   (dolist (opt class-options result)
+                     (when (and (consp opt) (eq (car opt) :documentation)
+                                (stringp (cadr opt)))
+                       (setf result (cadr opt))))))
                ;; Build super classes list expression
                (supers-expr (if (null supers-spec)
                                 'nil
@@ -2250,6 +2282,8 @@
           `(progn
              (%register-class (%make-class ',name ,supers-expr ,slotdefs-expr))
              ,@(when default-initargs-form (list default-initargs-form))
+             ,@(when class-doc
+                 (list `(funcall #'(setf documentation) ,class-doc ',name 'type)))
              ,@accessor-defs
              (find-class ',name)))))
 
@@ -2970,7 +3004,7 @@
                       ((member key '(:local-nicknames) :test #'eq)
                        (dolist (pair args)
                          (push `(%add-local-nickname ,(string (car pair))
-                                                     (find-package ,(string (cadr pair)))
+                                                     ,(string (cadr pair))
                                                      ,pkg-var)
                                local-nickname-forms)))))))
               ;; 3. Emit runtime nickname conflict checks
@@ -3869,24 +3903,27 @@
               ((null r))
             (cond ((eq (car r) :type) (setf type-flag (cadr r)))
                   ((eq (car r) :identity) (setf identity-flag (cadr r)))))
-          `(let ((,obj-var ,object-form)
-                 (,stream-var (let ((.s. ,stream-form))
-                                (cond ((eq .s. t) *terminal-io*)
-                                      ((null .s.) *standard-output*)
-                                      (t .s.)))))
-             (when *print-readably*
-               (error 'print-not-readable :object ,obj-var))
-             (write-string "#<" ,stream-var)
-             ,@(when type-flag
-                 `((format ,stream-var "~A" (type-of ,obj-var))
-                   (write-char #\Space ,stream-var)))
-             ,@(when body
-                 `((progn ,@body)))
-             ,@(when identity-flag
-                 `((write-char #\Space ,stream-var)
+          (let ((type-printed-var (gensym "TYPE-PRINTED")))
+            `(let ((,obj-var ,object-form)
+                   (,stream-var (let ((.s. ,stream-form))
+                                  (cond ((eq .s. t) *terminal-io*)
+                                        ((null .s.) *standard-output*)
+                                        (t .s.)))))
+               (when *print-readably*
+                 (error 'print-not-readable :object ,obj-var))
+               (write-string "#<" ,stream-var)
+               (let ((,type-printed-var (when ,type-flag
+                                          (format ,stream-var "~A" (type-of ,obj-var))
+                                          t)))
+                 ;; Always write a space after type (gives "#<TYPE >" when no body/identity)
+                 (when ,type-printed-var (write-char #\Space ,stream-var))
+                 ,@body
+                 (when ,identity-flag
+                   ;; Always write a space before identity (gives "#< addr>" when no type/body)
+                   (write-char #\Space ,stream-var)
                    (format ,stream-var "~D" (%object-id ,obj-var))))
-             (write-char #\> ,stream-var)
-             nil))))
+               (write-char #\> ,stream-var)
+               nil)))))
 
 ;;; MULTIPLE-VALUE-PROG1: evaluate first-form, save all its values,
 ;;; evaluate remaining forms for side effects, then return saved values.

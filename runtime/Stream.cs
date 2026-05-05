@@ -230,6 +230,19 @@ public class LispStringInputStream : LispInputStream
     public override string ToString() => "#<STRING-INPUT-STREAM>";
 }
 
+/// <summary>TextWriter that multiplexes writes to multiple writers (for broadcast streams).</summary>
+public class BroadcastTextWriter : TextWriter
+{
+    private readonly TextWriter[] _writers;
+    public BroadcastTextWriter(TextWriter[] writers) => _writers = writers;
+    public override System.Text.Encoding Encoding => _writers.Length > 0 ? _writers[^1].Encoding : System.Text.Encoding.Unicode;
+    public override void Write(char value) { foreach (var w in _writers) w.Write(value); }
+    public override void Write(string? value) { foreach (var w in _writers) w.Write(value); }
+    public override void Write(char[] buffer, int index, int count) { foreach (var w in _writers) w.Write(buffer, index, count); }
+    public override void WriteLine(string? value) { foreach (var w in _writers) w.WriteLine(value); }
+    public override void Flush() { foreach (var w in _writers) w.Flush(); }
+}
+
 /// <summary>Broadcast stream: output goes to all component streams.</summary>
 public class LispBroadcastStream : LispStream
 {

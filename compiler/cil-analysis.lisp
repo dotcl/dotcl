@@ -413,6 +413,9 @@
                          do (cond
                               ((and var (symbolp var))
                                (setf (gethash (symbol-name var) result-ht) t))
+                              ;; (setf (the type var) ...) — unwrap the type annotation
+                              ((and (consp var) (eq (car var) 'the) (symbolp (caddr var)))
+                               (setf (gethash (symbol-name (caddr var)) result-ht) t))
                               ((consp var)
                                (push (cons var mdepth) worklist)))
                             (when val (push (cons val mdepth) worklist))))
@@ -426,14 +429,18 @@
                      (push (cons (caddr e) mdepth) worklist)))
                   ((and (symbolp head) (member (symbol-name head) '("PUSH" "PUSHNEW") :test #'string=))
                    (let ((place (caddr e)))
-                     (when (and place (symbolp place) (not (eq place t)))
-                       (setf (gethash (symbol-name place) result-ht) t)))
+                     (let ((sym (if (symbolp place) place
+                                    (and (consp place) (eq (car place) 'the) (caddr place)))))
+                       (when (and sym (symbolp sym) (not (eq sym t)))
+                         (setf (gethash (symbol-name sym) result-ht) t))))
                    (do-list-safe (sub (cdr e))
                      (push (cons sub mdepth) worklist)))
                   ((and (symbolp head) (member (symbol-name head) '("POP" "INCF" "DECF") :test #'string=))
                    (let ((place (cadr e)))
-                     (when (and place (symbolp place) (not (eq place t)))
-                       (setf (gethash (symbol-name place) result-ht) t)))
+                     (let ((sym (if (symbolp place) place
+                                    (and (consp place) (eq (car place) 'the) (caddr place)))))
+                       (when (and sym (symbolp sym) (not (eq sym t)))
+                         (setf (gethash (symbol-name sym) result-ht) t))))
                    (do-list-safe (sub (cdr e))
                      (push (cons sub mdepth) worklist)))
                   ((and (symbolp head) (member (symbol-name head) '("ROTATEF" "SHIFTF") :test #'string=))

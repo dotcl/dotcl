@@ -86,7 +86,7 @@ public static partial class Runtime
             restart = RestartClusterStack.FindRestartByName(restartName);
         }
         if (restart == null)
-            throw new LispErrorException(new LispError($"Restart ~{name}~ not found"));
+            throw new LispErrorException(new LispControlError($"INVOKE-RESTART: restart not found: {name}"));
         if (restart.IsBindRestart)
         {
             // For restart-bind: call handler directly in current dynamic context
@@ -818,7 +818,7 @@ public static partial class Runtime
                 restart = RestartClusterStack.FindRestartByName(name) as LispRestart;
             }
             if (restart == null)
-                throw new LispErrorException(new LispError($"INVOKE-RESTART-INTERACTIVELY: restart not found: {obj}"));
+                throw new LispErrorException(new LispControlError($"INVOKE-RESTART-INTERACTIVELY: restart not found: {obj}"));
             LispObject[] args;
             if (restart.InteractiveFunction != null)
             {

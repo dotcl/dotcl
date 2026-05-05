@@ -346,16 +346,13 @@ public static partial class Runtime
         Startup.RegisterUnary("NAME-CHAR", obj => {
             string s;
             if (obj is LispString ls) s = ls.Value;
+            else if (obj is Nil) s = "NIL";
+            else if (obj is T) s = "T";
             else if (obj is Symbol sym) s = sym.Name;
             else if (obj is LispChar lc) s = new string(lc.Value, 1);
-            else if (obj is LispVector vec && (vec.ElementTypeName == "CHARACTER" || vec.ElementTypeName == "BASE-CHAR" || vec.ElementTypeName == "STANDARD-CHAR"))
-            {
-                var chars = new char[vec.Length];
-                for (int i = 0; i < vec.Length; i++)
-                    chars[i] = ((LispChar)vec.ElementAt(i)).Value;
-                s = new string(chars);
-            }
-            else s = obj?.ToString() ?? "";
+            else if (obj is LispVector vec && vec.IsCharVector)
+                s = vec.ToCharString();
+            else throw new LispErrorException(new LispTypeError("NAME-CHAR: not a string designator", obj));
             return Runtime.NameChar(s) is char c2 ? (LispObject)LispChar.Make(c2) : Nil.Instance;
         });
     }

@@ -712,6 +712,9 @@ public static partial class Runtime
         }
 
         // Step 1: Apply initargs (leftmost wins for duplicate keys)
+        // CLHS: initargs always override existing slot values (not just unbound slots).
+        // Track which slot indices were already set by an earlier initarg in THIS call.
+        var slotsSetByInitarg = new HashSet<int>();
         for (int i = 2; i + 1 < args.Length; i += 2)
         {
             string initargName = args[i] switch
@@ -733,11 +736,11 @@ public static partial class Runtime
                                 if (!ownerClass.ClassSlotValues.ContainsKey(slot.Name.Name) || ownerClass.ClassSlotValues[slot.Name.Name] == null)
                                     ownerClass.ClassSlotValues[slot.Name.Name] = args[i + 1];
                             }
-                            else
+                            else if (!slotsSetByInitarg.Contains(idx))
                             {
-                                // First initarg value wins — skip if already set by earlier initarg
-                                if (inst.Slots[idx] == null)
-                                    inst.Slots[idx] = args[i + 1];
+                                // First initarg wins among duplicate initarg names in this call
+                                inst.Slots[idx] = args[i + 1];
+                                slotsSetByInitarg.Add(idx);
                             }
                         }
                         break; // Found matching initarg for this slot, no need to check more

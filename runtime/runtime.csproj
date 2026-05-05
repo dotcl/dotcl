@@ -19,7 +19,7 @@
     <PackAsTool>true</PackAsTool>
     <ToolCommandName>dotcl</ToolCommandName>
     <PackageId>dotcl</PackageId>
-    <Version>0.1.4</Version>
+    <Version>0.1.5</Version>
     <!-- InformationalVersion is computed at build time by SetGitCommitVersion
          from git describe (D934, originally D782):
            * tagged commit:  "0.1.2"

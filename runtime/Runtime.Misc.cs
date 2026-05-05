@@ -19,15 +19,24 @@ public static partial class Runtime
     /// LispTwoWayStream, LispEchoStream, LispSynonymStream, and
     /// LispConcatenatedStream (first component).
     /// </summary>
+    private static LispError MakeStreamError(LispObject stream, string op) =>
+        new LispError($"{op}: stream is closed") { ConditionTypeName = "STREAM-ERROR", StreamErrorStreamRef = stream };
+
     public static TextReader GetTextReader(LispObject stream)
     {
         while (true)
         {
             switch (stream)
             {
-                case LispInputStream ins: return ins.Reader;
-                case LispFileStream fs when fs.IsInput: return fs.InputReader!;
-                case LispBidirectionalStream bidi: return bidi.Reader;
+                case LispInputStream ins:
+                    if (ins.IsClosed) throw new LispErrorException(MakeStreamError(stream, "READ"));
+                    return ins.Reader;
+                case LispFileStream fs when fs.IsInput:
+                    if (fs.IsClosed) throw new LispErrorException(MakeStreamError(stream, "READ"));
+                    return fs.InputReader!;
+                case LispBidirectionalStream bidi:
+                    if (bidi.IsClosed) throw new LispErrorException(MakeStreamError(stream, "READ"));
+                    return bidi.Reader;
                 case LispTwoWayStream tws:
                     stream = tws.InputStream;
                     continue;
@@ -68,19 +77,24 @@ public static partial class Runtime
         {
             switch (stream)
             {
-                case LispOutputStream outs: return outs.Writer;
-                case LispFileStream fs when fs.IsOutput: return fs.OutputWriter!;
-                case LispBidirectionalStream bidi: return bidi.Writer;
+                case LispOutputStream outs:
+                    if (outs.IsClosed) throw new LispErrorException(MakeStreamError(stream, "WRITE"));
+                    return outs.Writer;
+                case LispFileStream fs when fs.IsOutput:
+                    if (fs.IsClosed) throw new LispErrorException(MakeStreamError(stream, "WRITE"));
+                    return fs.OutputWriter!;
+                case LispBidirectionalStream bidi:
+                    if (bidi.IsClosed) throw new LispErrorException(MakeStreamError(stream, "WRITE"));
+                    return bidi.Writer;
                 case LispTwoWayStream tws: stream = tws.OutputStream; continue;
                 case LispEchoStream es: stream = es.OutputStream; continue;
                 case LispSynonymStream syn: stream = DynamicBindings.Get(syn.Symbol); continue;
                 case LispBroadcastStream bc:
-                    if (bc.Streams.Length > 0)
-                    {
-                        stream = bc.Streams[bc.Streams.Length - 1];
-                        continue;
-                    }
-                    return TextWriter.Null;
+                    if (bc.Streams.Length == 0) return TextWriter.Null;
+                    if (bc.Streams.Length == 1) { stream = bc.Streams[0]; continue; }
+                    var bcWriters = new TextWriter[bc.Streams.Length];
+                    for (int i = 0; i < bc.Streams.Length; i++) bcWriters[i] = GetTextWriter(bc.Streams[i]);
+                    return new BroadcastTextWriter(bcWriters);
                 case LispInstance gi when IsGrayOutputStream(gi):
                     return new GrayStreamTextWriter(gi);
                 default: return Console.Out;
@@ -485,11 +499,18 @@ public static partial class Runtime
         foreach (var root in roots)
         {
             if (!Directory.Exists(root)) continue;
-            foreach (var sub in Directory.GetDirectories(root))
+            foreach (var pkg in Directory.GetDirectories(root))
             {
-                // Only register subdirs that actually contain a .asd file.
-                if (!Directory.EnumerateFiles(sub, "*.asd").Any()) continue;
-                dirs.Add(sub);
+                // Register the package dir itself if it has .asd files.
+                if (Directory.EnumerateFiles(pkg, "*.asd").Any())
+                    dirs.Add(pkg);
+                // Also register immediate subdirectories that contain .asd files
+                // (e.g. mgl-pax-20260101-git/autoload/, coalton/source-error/).
+                foreach (var sub in Directory.GetDirectories(pkg))
+                {
+                    if (Directory.EnumerateFiles(sub, "*.asd").Any())
+                        dirs.Add(sub);
+                }
             }
         }
         PushDirsToCentralRegistry(dirs);
@@ -2958,15 +2979,27 @@ public static partial class Runtime
                     throw new LispErrorException(new LispTypeError("%SET-FDEFINITION: not a function", args[1]));
                 if (args[0] is Cons)
                 {
-                    var key = Runtime.GetFunctionNameKey(args[0], "%SET-FDEFINITION");
-                    // For (setf foo) style names, the checked symbol is the bare FOO
+                    // For (setf foo) style names: nameSym.SetfFunction is the authoritative
+                    // storage. Do NOT call CilAssembler.RegisterFunction with the bare
+                    // "(SETF FOO)" key — that would set Startup.Sym("FOO").SetfFunction
+                    // (i.e., cl:documentation) instead of the actual nameSym's SetfFunction,
+                    // causing package-crossing corruption (e.g. acclimation:documentation's
+                    // 4-arg setf GF overwriting cl:documentation.SetfFunction).
                     if (args[0] is Cons nc && nc.Cdr is Cons nc2 && nc2.Car is Symbol nameSym)
                     {
                         Runtime.CheckPackageLock(nameSym, "%SET-FDEFINITION");
-                        // Also update sym.SetfFunction as authoritative storage (#58 Phase 1)
                         nameSym.SetfFunction = fn;
+                        // Also register on the CL-package canonical symbol so string-based
+                        // GetFunction("(SETF name)") can find it for uninterned gensyms.
+                        var canonSym = Startup.Sym(nameSym.Name);
+                        if (canonSym != nameSym) canonSym.SetfFunction = fn;
                     }
-                    Emitter.CilAssembler.RegisterFunction(key, fn);
+                    else
+                    {
+                        // Unusual (setf ...) form without a symbol accessor: fall back to key-based
+                        var key = Runtime.GetFunctionNameKey(args[0], "%SET-FDEFINITION");
+                        Emitter.CilAssembler.RegisterFunction(key, fn);
+                    }
                 }
                 else
                 {
@@ -3052,7 +3085,7 @@ public static partial class Runtime
             "WITH-SIMPLE-RESTART", "WITH-HASH-TABLE-ITERATOR", "WITH-PACKAGE-ITERATOR",
             "DECLAIM", "DO-SYMBOLS", "DO-EXTERNAL-SYMBOLS", "DO-ALL-SYMBOLS",
             "CASE", "TYPECASE", "ECASE", "WHEN", "UNLESS",
-            "AND", "OR", "COND", "IF"
+            "AND", "OR", "COND"
         };
         foreach (var m in standardMacros)
         {

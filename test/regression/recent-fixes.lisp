@@ -1308,3 +1308,30 @@
   ;; _charNames のエントリは UCD より優先される
   (char-name #\Space)
   "Space")
+
+;;; D1002 — code-char NIL for codes >= char-code-limit
+(deftest d1002-code-char-above-limit
+  (code-char 65536)
+  nil)
+
+(deftest d1002-code-char-max-valid
+  (characterp (code-char 65535))
+  t)
+
+;;; D1003 — closed stream raises stream-error
+(deftest d1003-closed-stream-error
+  (let ((s (make-string-input-stream "abc")))
+    (close s)
+    (typep
+      (handler-case (read-char s)
+        (stream-error (e) e))
+      'stream-error))
+  t)
+
+;;; D1004 — nth type-error for negative index
+(deftest d1004-nth-negative-index
+  (typep
+    (handler-case (nth -1 '(a b c))
+      (type-error (e) e))
+    'type-error)
+  t)

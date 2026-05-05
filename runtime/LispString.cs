@@ -140,7 +140,9 @@ public class LispChar : LispObject
 
     public override string ToString()
     {
-        // Use Runtime.CharName for named characters to ensure consistency with char-name
+        // Use Runtime.CharName for named characters to ensure consistency with char-name.
+        // Multi-word UCD names (e.g. "SOFT HYPHEN") are now readable: the reader handles
+        // #\SOFT HYPHEN by consuming words until it finds a NameChar match.
         var name = Runtime.CharName(Value);
         if (name != null)
             return $"#\\{name}";

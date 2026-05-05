@@ -33,7 +33,7 @@ qlfile
 qlfile.lock
 .qlot/
 
-## Local secrets (e.g. NUGET_API_KEY, loaded by Makefile.release)
+## Local secrets (e.g. NUGET_API_KEY)
 .env
 
 ## Coordinator logs

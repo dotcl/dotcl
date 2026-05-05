@@ -135,4 +135,62 @@
       (%wait-on-semaphore semaphore 'timeout timeout)
       (%wait-on-semaphore semaphore)))
 
+;;; Atomic operations (CAS, atomic-incf, atomic-decf)
+;;; Lock-based: correct for all setfable place forms, not truly lock-free.
+;;; Defined in DOTCL package so the atomics portability library can delegate here.
+
+(in-package :cl-user)
+
+;; Use double-colon (internal access) throughout this definition section so that
+;; the reader does not require COMPARE-AND-SWAP to be external at read time.
+;; The load-time export below makes them single-colon accessible afterwards.
+
+(defvar dotcl::%atomics-lock nil)
+
+(defmacro dotcl::compare-and-swap (place old new)
+  (let ((o (gensym "OLD")) (n (gensym "NEW")) (c (gensym "CUR")))
+    (multiple-value-bind (temps vals stores writer reader)
+        (get-setf-expansion place)
+      `(let* (,@(mapcar #'list temps vals) (,o ,old) (,n ,new))
+         (dotcl:acquire-lock dotcl::%atomics-lock)
+         (unwind-protect
+           (let ((,c ,reader))
+             (if (eq ,c ,o)
+               (let ((,(car stores) ,n))
+                 ,writer
+                 t)
+               nil))
+           (dotcl:release-lock dotcl::%atomics-lock))))))
+
+(defmacro dotcl::atomic-incf (place &optional (delta 1))
+  (let ((d (gensym "DELTA")))
+    (multiple-value-bind (temps vals stores writer reader)
+        (get-setf-expansion place)
+      `(let* (,@(mapcar #'list temps vals) (,d ,delta))
+         (dotcl:acquire-lock dotcl::%atomics-lock)
+         (unwind-protect
+           (let ((,(car stores) (+ ,reader ,d)))
+             ,writer
+             ,(car stores))
+           (dotcl:release-lock dotcl::%atomics-lock))))))
+
+(defmacro dotcl::atomic-decf (place &optional (delta 1))
+  (let ((d (gensym "DELTA")))
+    (multiple-value-bind (temps vals stores writer reader)
+        (get-setf-expansion place)
+      `(let* (,@(mapcar #'list temps vals) (,d ,delta))
+         (dotcl:acquire-lock dotcl::%atomics-lock)
+         (unwind-protect
+           (let ((,(car stores) (- ,reader ,d)))
+             ,writer
+             ,(car stores))
+           (dotcl:release-lock dotcl::%atomics-lock))))))
+
+;; Export and initialize at load time
+(dolist (sym '("COMPARE-AND-SWAP" "ATOMIC-INCF" "ATOMIC-DECF"))
+  (export (intern sym :dotcl) :dotcl))
+(setf dotcl::%atomics-lock (dotcl:make-lock "atomics"))
+
+(in-package :dotcl-thread)
+
 (provide "dotcl-thread")

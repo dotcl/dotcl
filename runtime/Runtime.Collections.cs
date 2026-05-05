@@ -323,6 +323,7 @@ public static partial class Runtime
         LispVector v => VectorTypeOf(v),
         LispReadtable => Startup.Sym("READTABLE"),
         LispRandomState => Startup.Sym("RANDOM-STATE"),
+        LispPprintDispatchTable => Startup.Sym("PPRINT-DISPATCH-TABLE"),
         LispMethod => Startup.Sym("STANDARD-METHOD"),
         LispHashTable => Startup.Sym("HASH-TABLE"),
         Package => Startup.Sym("PACKAGE"),
@@ -682,6 +683,7 @@ public static partial class Runtime
         {
             if (sym.IsBound) newSym.Value = sym.Value;
             if (sym.Function != null) newSym.Function = sym.Function;
+            if (sym.SetfFunction != null) newSym.SetfFunction = sym.SetfFunction;
             newSym.Plist = CopyList(sym.Plist);
         }
         return newSym;
@@ -1112,8 +1114,14 @@ public static partial class Runtime
 
     public static LispObject CodeChar(LispObject obj)
     {
-        if (obj is Fixnum f && f.Value >= 0 && f.Value <= 0x10FFFF)
-            return LispChar.Make((char)f.Value);
+        if (obj is Fixnum f)
+        {
+            if (f.Value >= 0 && f.Value <= char.MaxValue)
+                return LispChar.Make((char)f.Value);
+            // Values >= char-code-limit (65536) return NIL per CLHS
+            if (f.Value > char.MaxValue)
+                return Nil.Instance;
+        }
         throw new LispErrorException(new LispTypeError("CODE-CHAR: not a valid character code", obj));
     }
 

@@ -157,13 +157,18 @@ public class ClassCType : CType
 
 public static class TypeParser
 {
-    // Cache: symbol → parsed CType (invalidated on deftype). ConcurrentDictionary for #83.
-    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, CType> _symbolCache = new();
+    // Cache: symbol identity → parsed CType. Uses symbol reference equality so that
+    // pkg1::FOO and pkg2::FOO (same name, different packages) cache independently.
+    // ConcurrentDictionary for #83. Symbol does not override Equals, so default
+    // reference equality applies without a custom comparer.
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<Symbol, CType> _symbolCache = new();
 
     /// <summary>Clear cache for a specific type name (called when deftype is registered).</summary>
     public static void InvalidateCache(string name)
     {
-        _symbolCache.TryRemove(name, out _);
+        // Remove all cached entries whose symbol has the given name (any package).
+        foreach (var key in _symbolCache.Keys.Where(k => k.Name == name).ToList())
+            _symbolCache.TryRemove(key, out _);
     }
 
     /// <summary>Parse a Lisp type specifier into a CType.</summary>
@@ -200,15 +205,15 @@ public static class TypeParser
     {
         var name = sym.Name;
 
-        // Check cache
-        if (_symbolCache.TryGetValue(name, out var cached))
+        // Check cache (keyed by symbol identity — package-aware)
+        if (_symbolCache.TryGetValue(sym, out var cached))
             return cached;
 
         // Built-in type names — return singleton NamedType
         if (Runtime.IsBuiltinTypeName(name) || name == "T" || name == "NIL" || name == "*")
         {
             var nt = NamedType.Get(name);
-            _symbolCache[name] = nt;
+            _symbolCache[sym] = nt;
             return nt;
         }
 
@@ -221,7 +226,7 @@ public static class TypeParser
             {
                 // Circular — return as named type (best effort)
                 var nt = NamedType.Get(name);
-                _symbolCache[name] = nt;
+                _symbolCache[sym] = nt;
                 return nt;
             }
 
@@ -232,18 +237,18 @@ public static class TypeParser
                 if (expanded is Symbol rs && rs.Name == name)
                 {
                     var nt = NamedType.Get(name);
-                    _symbolCache[name] = nt;
+                    _symbolCache[sym] = nt;
                     return nt;
                 }
                 var result = Parse(expanded, expanding);
-                _symbolCache[name] = result;
+                _symbolCache[sym] = result;
                 return result;
             }
             catch
             {
                 // Expansion failed — treat as named type
                 var nt = NamedType.Get(name);
-                _symbolCache[name] = nt;
+                _symbolCache[sym] = nt;
                 return nt;
             }
             finally
@@ -252,18 +257,20 @@ public static class TypeParser
             }
         }
 
-        // Check CLOS class registry
-        var cls = Runtime.FindClassByName(name);
+        // Check CLOS class registry — exact symbol lookup first (respects package),
+        // then fallback by name for symbols without home package or unregistered packages.
+        var cls = Runtime.FindClassOrNil(sym) as LispClass
+                  ?? Runtime.FindClassByName(name);
         if (cls != null)
         {
             var ct = new ClassCType(cls);
-            _symbolCache[name] = ct;
+            _symbolCache[sym] = ct;
             return ct;
         }
 
         // Unknown type — keep as NamedType
         var named = NamedType.Get(name);
-        _symbolCache[name] = named;
+        _symbolCache[sym] = named;
         return named;
     }
 

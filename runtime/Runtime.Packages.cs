@@ -374,7 +374,21 @@ public static partial class Runtime
         else throw new LispErrorException(new LispTypeError("INTERN: invalid package designator", pkg));
 
         var (resultSym, isNew) = p.Intern(symName);
-        MultipleValues.Set(resultSym, isNew ? Nil.Instance : T.Instance);
+        LispObject status;
+        if (isNew)
+        {
+            status = Nil.Instance;
+        }
+        else
+        {
+            var (_, symStatus) = p.FindSymbol(symName);
+            status = symStatus switch {
+                SymbolStatus.External  => Startup.Keyword("EXTERNAL"),
+                SymbolStatus.Inherited => Startup.Keyword("INHERITED"),
+                _                      => Startup.Keyword("INTERNAL"),
+            };
+        }
+        MultipleValues.Set(resultSym, status);
         return resultSym;
     }
 

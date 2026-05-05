@@ -994,18 +994,88 @@ public static partial class Runtime
         {
             if (c.Car is Cons rule)
             {
-                // rule = (from-pattern to-pattern)
-                var toPattern = (rule.Cdr is Cons cdr2) ? cdr2.Car : null;
-                if (toPattern is LispPathname toPn)
+                // rule = (from-wildcard to-wildcard) — elements may be strings or pathnames
+                var fromObj = rule.Car;
+                var toObj = (rule.Cdr is Cons cdr2) ? cdr2.Car : null;
+                if (toObj == null) { cur = c.Cdr; continue; }
+
+                // Resolve from-pattern to a logical pathname wildcard
+                LispLogicalPathname? fromPn = fromObj as LispLogicalPathname;
+                if (fromPn == null && fromObj is LispString fStr)
                 {
-                    // Simple translation: replace wild components with actual components
-                    return TranslateWithPattern(lp, toPn);
+                    var fVal = fStr.Value;
+                    if (!fVal.Contains(':')) fVal = hostStr + ":" + fVal;
+                    fromPn = LispLogicalPathname.FromLogicalString(fVal);
                 }
+
+                // Resolve to-pattern to a physical pathname
+                LispPathname? toPn = toObj as LispPathname;
+                if (toPn == null && toObj is LispString tStr)
+                    toPn = LispPathname.FromString(tStr.Value);
+
+                if (fromPn != null && toPn != null && LogicalPathnameMatchesWildcard(lp, fromPn))
+                    return TranslateWithPattern(lp, toPn);
             }
             cur = c.Cdr;
         }
 
         throw new LispErrorException(new LispError($"No matching translation for logical pathname \"{lp}\"") { ConditionTypeName = "FILE-ERROR" });
+    }
+
+    private static bool LogicalPathnameMatchesWildcard(LispLogicalPathname lp, LispLogicalPathname wildcard)
+    {
+        // Host must match
+        if (wildcard.Host is LispString wh && lp.Host is LispString lh)
+            if (!string.Equals(wh.Value, lh.Value, StringComparison.OrdinalIgnoreCase)) return false;
+
+        if (!WildComponentMatches(lp.NameComponent, wildcard.NameComponent)) return false;
+        if (!WildComponentMatches(lp.TypeComponent, wildcard.TypeComponent)) return false;
+        return WildDirectoryMatches(lp.DirectoryComponent, wildcard.DirectoryComponent);
+    }
+
+    private static bool WildComponentMatches(LispObject? actual, LispObject? pattern)
+    {
+        if (pattern is Symbol ps && ps.Name is "WILD") return true;
+        if (pattern is null || pattern is Nil) return actual is null || actual is Nil;
+        if (actual is LispString a && pattern is LispString p)
+            return string.Equals(a.Value, p.Value, StringComparison.OrdinalIgnoreCase);
+        return false;
+    }
+
+    private static bool WildDirectoryMatches(LispObject? actual, LispObject? pattern)
+    {
+        // Collect components (skip leading :absolute/:relative keyword)
+        static List<LispObject> GetComps(LispObject? d)
+        {
+            var list = new List<LispObject>();
+            if (d is not Cons) return list;
+            var cur = (LispObject)((Cons)d).Cdr; // skip :absolute/:relative
+            while (cur is Cons c) { list.Add(c.Car); cur = c.Cdr; }
+            return list;
+        }
+
+        var ac = GetComps(actual);
+        var pc = GetComps(pattern);
+        return MatchDirLists(ac, 0, pc, 0);
+    }
+
+    private static bool MatchDirLists(List<LispObject> ac, int ai, List<LispObject> pc, int pi)
+    {
+        while (pi < pc.Count)
+        {
+            var p = pc[pi];
+            if (p is Symbol ps && ps.Name == "WILD-INFERIORS")
+            {
+                // ** can match zero or more components
+                for (int k = ai; k <= ac.Count; k++)
+                    if (MatchDirLists(ac, k, pc, pi + 1)) return true;
+                return false;
+            }
+            if (ai >= ac.Count) return false;
+            if (!WildComponentMatches(ac[ai], p)) return false;
+            ai++; pi++;
+        }
+        return ai == ac.Count;
     }
 
     private static LispPathname TranslateWithPattern(LispLogicalPathname logical, LispPathname toPattern)
@@ -1028,13 +1098,16 @@ public static partial class Runtime
             {
                 if (dc.Car is Symbol ws && ws.Name == "WILD-INFERIORS")
                 {
-                    // Insert logical pathname's directory components here (without :absolute/:relative)
+                    // Insert logical pathname's directory components here (without :absolute/:relative), lowercased
                     if (logical.DirectoryComponent is Cons logDir)
                     {
                         var logCur = (LispObject)logDir.Cdr; // skip :absolute/:relative
                         while (logCur is Cons lc)
                         {
-                            resultDirs.Add(lc.Car);
+                            var comp = lc.Car is LispString ds
+                                ? (LispObject)new LispString(ds.Value.ToLowerInvariant())
+                                : lc.Car;
+                            resultDirs.Add(comp);
                             logCur = lc.Cdr;
                         }
                     }

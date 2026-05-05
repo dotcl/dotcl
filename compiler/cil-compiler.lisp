@@ -215,27 +215,29 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
 
 (defun mangle-name (symbol)
   "Convert a Lisp symbol/name to a display string (for defmethod names).
-   Handles (setf foo), (cas foo), string names, and (\"c-name\" lisp-name) pairs."
+   Handles (setf foo), (cas foo), string names, and (\"c-name\" lisp-name) pairs.
+   Preserves symbol-name case exactly so that multi-escaped symbols like |#{-reader|
+   register under the same case-sensitive name that the reader interns them with."
   (cond
-    ;; String: use directly (e.g. C name strings from define-alien-routine)
+    ;; String: upcase (e.g. C name strings from define-alien-routine)
     ((stringp symbol) (string-upcase symbol))
     ((and (consp symbol) (eq (car symbol) 'setf))
-     (format nil "(SETF ~A)" (string-upcase (symbol-name (cadr symbol)))))
+     (format nil "(SETF ~A)" (symbol-name (cadr symbol))))
     ((and (consp symbol) (stringp (car symbol)))
      ;; ("c-name" lisp-name) pair from define-alien-routine → use the Lisp name
      (if (symbolp (cadr symbol))
-         (string-upcase (symbol-name (cadr symbol)))
+         (symbol-name (cadr symbol))
          (string-upcase (car symbol))))
     ((consp symbol)
      ;; Generic compound function name: (OP NAME) e.g. (cas car)
      (format nil "(~A~{ ~A~})"
              (if (symbolp (car symbol))
-                 (string-upcase (symbol-name (car symbol)))
+                 (symbol-name (car symbol))
                  (prin1-to-string (car symbol)))
-             (mapcar (lambda (s) (if (symbolp s) (string-upcase (symbol-name s))
+             (mapcar (lambda (s) (if (symbolp s) (symbol-name s)
                                      (prin1-to-string s)))
                      (cdr symbol))))
-    (t (string-upcase (symbol-name symbol)))))
+    (t (symbol-name symbol))))
 
 (defun parse-lambda-list (params)
   "Parse lambda list → (values required optional key rest-param aux allow-other-keys-p has-key-p).
@@ -670,7 +672,23 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
                  (:call "Runtime.InternSymbolV")))
               ;; defmacro: string= match to catch cross-package variants (e.g. SB-XC:DEFMACRO)
               ((and (symbolp op) (string= (symbol-name op) "DEFMACRO"))
-               (compile-defmacro (cadr expr) (caddr expr) (cdddr expr)))
+               ;; CLHS 3.4.11: extract docstring (first form if string AND more forms follow).
+               ;; Skip during cross-compile (bootstrap concern, see compile-defun handler).
+               (let* ((name (cadr expr))
+                      (lambda-list (caddr expr))
+                      (body (cdddr expr))
+                      (has-docstring (and (not *cross-compiling*)
+                                          (consp body) (stringp (car body)) (cdr body)))
+                      (docstring (when has-docstring (car body)))
+                      (real-body (if has-docstring (cdr body) body))
+                      (defm-instrs (compile-defmacro name lambda-list real-body)))
+                 (if has-docstring
+                     `(,@defm-instrs
+                       (:pop)
+                       ,@(compile-and-pop
+                           `(funcall #'(setf documentation) ,docstring ',name 'function))
+                       ,@(compile-sym-lookup name))
+                     defm-instrs)))
 
               ;; Macro expansion (after string= checks, before named-call).
               ;; Preserves top-level-ness per CLHS 3.2.3.1.

@@ -1102,10 +1102,34 @@ public static partial class Runtime
         return Nil.Instance;
     }
 
+    private static bool IsIntegerElementType(LispObject? et)
+    {
+        if (et == null) return false;
+        // Quick path: standard binary element types
+        if (et is Symbol s2 && (s2.Name is "UNSIGNED-BYTE" or "SIGNED-BYTE" or "BIT" or "INTEGER")) return true;
+        if (et is Cons c && c.Car is Symbol sym &&
+            (sym.Name is "UNSIGNED-BYTE" or "SIGNED-BYTE" or "INTEGER" or "MOD")) return true;
+        // General: subtype of INTEGER but not CHARACTER
+        if (et is Nil || et is T) return false;
+        try { return Runtime.IsTruthy(Runtime.Subtypep(et, Startup.Sym("INTEGER"))); } catch { return false; }
+    }
+
+    private static bool IsBinaryOutputStream(LispObject s) => s switch {
+        LispBinaryStream => true,
+        LispFileStream fs => fs.IsOutput && IsIntegerElementType(fs.ElementType),
+        LispBroadcastStream bs => bs.Streams.Length > 0 && IsBinaryOutputStream(bs.Streams[^1]),
+        LispTwoWayStream tw => IsBinaryOutputStream(tw.OutputStream),
+        LispEchoStream es => IsBinaryOutputStream(es.OutputStream),
+        LispSynonymStream ss => IsBinaryOutputStream(DynamicBindings.Get(ss.Symbol)),
+        _ => false
+    };
+
     public static LispObject WriteByte(LispObject byteObj, LispObject stream)
     {
         if (stream is not LispStream)
             throw new LispErrorException(new LispTypeError("WRITE-BYTE: not a stream", stream, Startup.Sym("STREAM")));
+        if (!IsBinaryOutputStream(stream))
+            throw new LispErrorException(new LispTypeError("WRITE-BYTE: not a binary output stream", stream, Startup.Sym("STREAM")));
         if (byteObj is not (Fixnum or Bignum))
             throw new LispErrorException(new LispTypeError("WRITE-BYTE: not an integer", byteObj));
         int byteWidth = GetBinaryByteWidth(stream);
@@ -1830,10 +1854,9 @@ public static partial class Runtime
             {
                 if ((char)stream.UnreadCharValue == targetChar.Value)
                     return LispChar.Make((char)stream.UnreadCharValue);
-                // Consume the unread char (it doesn't match) - echo it
-                char consumed = (char)stream.UnreadCharValue;
+                // Consume unread char (doesn't match). Per CLHS, unread chars are assumed
+                // already echoed — don't echo again.
                 stream.UnreadCharValue = -1;
-                echoWriter?.Write(consumed);
             }
             int ch;
             while ((ch = PeekCharFromStream(streamObj)) != -1 && (char)ch != targetChar.Value)
@@ -1859,10 +1882,9 @@ public static partial class Runtime
             {
                 if (readtable.GetSyntaxType((char)stream.UnreadCharValue) != SyntaxType.Whitespace)
                     return LispChar.Make((char)stream.UnreadCharValue);
-                // Consume whitespace unread char - echo it
-                char consumed = (char)stream.UnreadCharValue;
+                // Consume whitespace unread char. Per CLHS, unread chars are assumed
+                // already echoed — don't echo again.
                 stream.UnreadCharValue = -1;
-                echoWriter?.Write(consumed);
             }
             int ch;
             while ((ch = PeekCharFromStream(streamObj)) != -1 && readtable.GetSyntaxType((char)ch) == SyntaxType.Whitespace)
@@ -2048,6 +2070,18 @@ public static partial class Runtime
         return GetTextWriter(stream);
     }
 
+    /// <summary>Update AtLineStart on the underlying LispStream after writing lastChar.</summary>
+    internal static void UpdateAtLineStart(LispObject stream, char lastChar)
+    {
+        LispObject resolved = stream;
+        if (resolved is Nil) resolved = DynamicBindings.Get(Startup.Sym("*STANDARD-OUTPUT*"));
+        else if (resolved is T) resolved = DynamicBindings.Get(Startup.Sym("*TERMINAL-IO*"));
+        while (resolved is LispEchoStream es) resolved = es.OutputStream;
+        while (resolved is LispTwoWayStream tw) resolved = tw.OutputStream;
+        while (resolved is LispSynonymStream syn) resolved = DynamicBindings.Get(syn.Symbol);
+        if (resolved is LispStream ls) ls.AtLineStart = (lastChar == '\n');
+    }
+
     public static LispObject WriteChar(LispObject ch, LispObject stream)
     {
         if (ch is not LispChar lc)
@@ -2057,6 +2091,7 @@ public static partial class Runtime
         PprintFlushPendingBreak(writer);
         writer.Write(lc.Value);
         PprintTrackWriteChar(lc.Value);
+        UpdateAtLineStart(stream, lc.Value);
         if (lc.Value == '\n')
             PprintAfterNewline(writer);
         return ch;
@@ -2124,6 +2159,7 @@ public static partial class Runtime
         var substr = s.Substring(start, end - start);
         writer.Write(substr);
         PprintTrackWrite(substr);
+        if (substr.Length > 0) UpdateAtLineStart(stream, substr[substr.Length - 1]);
         return str;
     }
 
@@ -2187,6 +2223,7 @@ public static partial class Runtime
         var writer = ResolveOutputStreamDesignator(stream);
         writer.Write(s.Substring(start, end - start));
         writer.Write('\n');
+        UpdateAtLineStart(stream, '\n');
         return str;
     }
 
@@ -2605,13 +2642,15 @@ public static partial class Runtime
             err.FileErrorPathnameRef = pn;
             throw new LispErrorException(err);
         }
+        // CLHS: returns the pathname (coerced from designator, not the raw string input)
+        LispPathname resultPn = pn;
         var dir = Path.GetDirectoryName(filePath);
         if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
         {
             Directory.CreateDirectory(dir);
-            return MultipleValues.Values(pathSpec, T.Instance);
+            return MultipleValues.Values(resultPn, T.Instance);
         }
-        return MultipleValues.Values(pathSpec, Nil.Instance);
+        return MultipleValues.Values(resultPn, Nil.Instance);
     }
 
     public static LispObject DeleteFile(LispObject path)

@@ -1376,6 +1376,57 @@ public static partial class Runtime
                             argIdx++;
                         }
                         break;
+                    case '$': // monetary floating point ~d,n,w,padchar$
+                        if (argIdx < args.Length)
+                        {
+                            var dArg = args[argIdx];
+                            double dDv = dArg switch
+                            {
+                                SingleFloat sfD => (double)sfD.Value,
+                                DoubleFloat dfD => dfD.Value,
+                                Fixnum fiD => (double)fiD.Value,
+                                Ratio raD => (double)raD.Numerator / (double)raD.Denominator,
+                                _ => double.NaN
+                            };
+                            int dDecimalDigits = GetIntParam(0) ?? 2;
+                            int dMinInt = GetIntParam(1) ?? 1;
+                            int dWidth = GetIntParam(2) ?? 0;
+                            char dPadChar = GetCharParam(3, ' ');
+
+                            if (double.IsNaN(dDv))
+                            {
+                                // Non-numeric: print in decimal with width
+                                string fallback = args[argIdx].ToString() ?? "";
+                                sb.Append(fallback.PadLeft(dWidth > 0 ? dWidth : fallback.Length));
+                            }
+                            else
+                            {
+                                bool negative = dDv < 0;
+                                double absVal = Math.Abs(dDv);
+                                // Format fractional part
+                                string fracStr = absVal.ToString("F" + dDecimalDigits,
+                                    System.Globalization.CultureInfo.InvariantCulture);
+                                // Split integer and fractional
+                                int dotIdx = fracStr.IndexOf('.');
+                                string intPart = dotIdx >= 0 ? fracStr[..dotIdx] : fracStr;
+                                string fracPart = dotIdx >= 0 ? fracStr[(dotIdx + 1)..] : new string('0', dDecimalDigits);
+                                // Pad integer part to dMinInt
+                                if (intPart.Length < dMinInt)
+                                    intPart = intPart.PadLeft(dMinInt, '0');
+                                string numStr = intPart + "." + fracPart;
+                                // Sign
+                                string sign = negative ? "-" : (atMod ? "+" : "");
+                                int totalLen = sign.Length + numStr.Length;
+                                int padLen = Math.Max(0, dWidth - totalLen);
+                                string padding = new string(dPadChar, padLen);
+                                if (colonMod)
+                                    sb.Append(sign).Append(padding).Append(numStr);
+                                else
+                                    sb.Append(padding).Append(sign).Append(numStr);
+                            }
+                            argIdx++;
+                        }
+                        break;
                     case 'F': // fixed-format floating point ~w,d,k,overflowchar,padcharF
                         if (argIdx < args.Length)
                         {
@@ -1430,6 +1481,57 @@ public static partial class Runtime
                             argIdx++;
                         }
                         break;
+                    case 'G': // general floating point: ~w,d,e,k,overflowchar,padchar,exponentcharG
+                        if (argIdx < args.Length)
+                        {
+                            var gArg = args[argIdx];
+                            bool gIsSingle = gArg is SingleFloat;
+                            bool gIsDouble = gArg is DoubleFloat;
+                            double gdv = gArg switch
+                            {
+                                SingleFloat sf4 => (double)sf4.Value,
+                                DoubleFloat df4 => df4.Value,
+                                Fixnum fi4 => fi4.Value,
+                                Bignum bg4 => (double)bg4.Value,
+                                Ratio r4 => (double)r4.Numerator / (double)r4.Denominator,
+                                _ => 0.0
+                            };
+                            int? gW = GetIntParam(0);
+                            int? gD = GetIntParam(1);
+                            int? gE = GetIntParam(2);
+                            int gK = GetIntParam(3) ?? 1;
+                            char? gOverflowChar = null;
+                            if (4 < resolvedParams.Length && resolvedParams[4] is char goc) gOverflowChar = goc;
+                            char gPadChar = GetCharParam(5, ' ');
+                            char? gExpChar = null;
+                            if (6 < resolvedParams.Length && resolvedParams[6] is char gxc) gExpChar = gxc;
+
+                            // CLHS 22.3.3.3 ~G algorithm:
+                            // ee = e+2 (or 4 if e omitted)
+                            int gEE = gE.HasValue ? gE.Value + 2 : 4;
+                            // ww = w - ee (or nil)
+                            int? gWW = gW.HasValue ? gW.Value - gEE : (int?)null;
+                            // n = floor(log10(|x|)) + 1, 0 if x==0
+                            int gN = 0;
+                            double gAbs = Math.Abs(gdv);
+                            if (gAbs > 0 && !double.IsInfinity(gAbs) && !double.IsNaN(gAbs))
+                                gN = (int)Math.Floor(Math.Log10(gAbs)) + 1;
+                            // default d: significant digits for the float type
+                            int gDeff = gD ?? (gIsSingle ? 7 : 15);
+                            int gDD = gDeff - gN;
+                            // If 0 <= dd <= d, use ~F; otherwise use ~E
+                            if (!double.IsNaN(gdv) && !double.IsInfinity(gdv) && gDD >= 0 && gDD <= gDeff)
+                            {
+                                sb.Append(FormatFixedFloat(gdv, gWW, gDD, 0, gOverflowChar, gPadChar, atMod, gIsSingle, gIsDouble));
+                                sb.Append(new string(gPadChar, gEE));
+                            }
+                            else
+                            {
+                                sb.Append(FormatExponentialFloat(gdv, gW, gD, gE, gK, gOverflowChar, gPadChar, gExpChar, atMod, gIsSingle, gIsDouble));
+                            }
+                            argIdx++;
+                        }
+                        break;
                     case 'C': // character
                         if (argIdx < args.Length)
                         {
@@ -1447,17 +1549,22 @@ public static partial class Runtime
                                 }
                                 else if (atMod)
                                 {
-                                    // ~@C - output in #\name syntax
+                                    // ~@C - output in #\name syntax (must be readable).
+                                    // Multi-word UCD names are now readable (#\SOFT HYPHEN)
+                                    // because the reader handles multi-word character names.
                                     string? cname = GetCharacterName(lc.Value);
                                     if (cname != null)
                                         sb.Append("#\\" + cname);
-                                    else
+                                    else if (lc.Value > ' ' && lc.Value < 127)
                                         sb.Append("#\\" + lc.Value);
+                                    else
+                                        sb.Append($"#\\U+{(int)lc.Value:X4}");
                                 }
                                 else if (colonMod)
                                 {
                                     // ~:C - output character name for non-graphic chars and Space
                                     // CLHS 22.3.1.2: "spells out names of characters that are not textual"
+                                    // FORMAT.C.4A: must equal (char-name c), so use full UCD name.
                                     string? cname = GetCharacterName(lc.Value);
                                     if ((!isGraphic || lc.Value == ' ') && cname != null)
                                         sb.Append(cname);

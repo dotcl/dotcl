@@ -314,6 +314,19 @@ public static partial class Runtime
                     }
                     return T.Instance;
                 }
+                case "MOD":
+                {
+                    // (mod n) = (integer 0 (n-1)); obj must be non-negative integer < n
+                    if (obj is not Fixnum && obj is not Bignum) return Nil.Instance;
+                    if (compound.Cdr is not Cons modArg) return T.Instance; // bare (mod) = non-neg int
+                    if (modArg.Car is Symbol modStar && modStar.Name == "*") return T.Instance;
+                    var modN = modArg.Car as Number;
+                    if (modN == null) return Nil.Instance;
+                    var numModObj = (Number)obj;
+                    if (Arithmetic.Compare(numModObj, new Fixnum(0)) < 0) return Nil.Instance;
+                    if (Arithmetic.Compare(numModObj, modN) >= 0) return Nil.Instance;
+                    return T.Instance;
+                }
                 case "INTEGER":
                 {
                     // Range type: (integer low high) — use Arithmetic.Compare for exact comparison
@@ -479,6 +492,7 @@ public static partial class Runtime
         "PATHNAME" => obj is LispPathname,
         "LOGICAL-PATHNAME" => obj is LispLogicalPathname,
         "RANDOM-STATE" => obj is LispRandomState,
+        "PPRINT-DISPATCH-TABLE" => obj is LispPprintDispatchTable,
         "READTABLE" => obj is LispReadtable || (obj is LispInstance ri && ClassMatchesCPL(ri.Class, "READTABLE")),
         "INPUT-STREAM" => obj is LispStream s1 && s1.IsInput,
         "OUTPUT-STREAM" => obj is LispStream s2 && s2.IsOutput,
@@ -1877,6 +1891,7 @@ public static partial class Runtime
             ["STANDARD-GENERIC-FUNCTION"] = new[] { "GENERIC-FUNCTION", "FUNCTION", "T" },
             ["HASH-TABLE"] = new[] { "T" },
             ["RANDOM-STATE"] = new[] { "T" },
+            ["PPRINT-DISPATCH-TABLE"] = new[] { "T" },
             ["PACKAGE"] = new[] { "T" },
             ["STREAM"] = new[] { "STANDARD-OBJECT", "T" },
             ["INPUT-STREAM"] = new[] { "STREAM", "STANDARD-OBJECT", "T" },

@@ -44,6 +44,10 @@ public class LispReadtable : LispObject
     // Dispatch tables: dispatching-char → (sub-char → dispatch function(stream, sub-char, numarg))
     private readonly Dictionary<char, Dictionary<char, Func<Reader, char, int, LispObject?>>> _dispatchTables = new();
 
+    // Original Lisp function objects for user-set dispatch macro sub-characters
+    // Used by GET-DISPATCH-MACRO-CHARACTER to return the function the user passed to SET-DISPATCH-MACRO-CHARACTER
+    private readonly Dictionary<char, Dictionary<char, LispObject>> _lispDispatchFunctions = new();
+
     public ReadtableCase Case { get; set; } = ReadtableCase.Upcase;
 
     /// <summary>Get the syntax type of a character.</summary>
@@ -119,18 +123,39 @@ public class LispReadtable : LispObject
     }
 
     /// <summary>Set a dispatch sub-character function.</summary>
-    public void SetDispatchMacroCharacter(char dispChar, char subChar, Func<Reader, char, int, LispObject?> fn)
+    public void SetDispatchMacroCharacter(char dispChar, char subChar, Func<Reader, char, int, LispObject?> fn, LispObject? lispFn = null)
     {
         if (!_dispatchTables.TryGetValue(dispChar, out var table))
             throw new Exception($"{dispChar} is not a dispatching macro character");
-        table[char.ToUpperInvariant(subChar)] = fn;
+        var upper = char.ToUpperInvariant(subChar);
+        table[upper] = fn;
+        if (lispFn != null)
+        {
+            if (!_lispDispatchFunctions.TryGetValue(dispChar, out var lispTable))
+            {
+                lispTable = new Dictionary<char, LispObject>();
+                _lispDispatchFunctions[dispChar] = lispTable;
+            }
+            lispTable[upper] = lispFn;
+        }
+        else if (_lispDispatchFunctions.TryGetValue(dispChar, out var lispTable2))
+        {
+            lispTable2.Remove(upper);
+        }
     }
 
-    /// <summary>Get a dispatch sub-character function.</summary>
+    /// <summary>Get a dispatch sub-character C# function, or null.</summary>
     public Func<Reader, char, int, LispObject?>? GetDispatchMacroCharacter(char dispChar, char subChar)
     {
         if (!_dispatchTables.TryGetValue(dispChar, out var table)) return null;
         return table.TryGetValue(char.ToUpperInvariant(subChar), out var fn) ? fn : null;
+    }
+
+    /// <summary>Get the Lisp function object for a dispatch sub-character, or null if built-in or unset.</summary>
+    public LispObject? GetLispDispatchMacroFunction(char dispChar, char subChar)
+    {
+        if (!_lispDispatchFunctions.TryGetValue(dispChar, out var lispTable)) return null;
+        return lispTable.TryGetValue(char.ToUpperInvariant(subChar), out var fn) ? fn : null;
     }
 
     /// <summary>
@@ -193,6 +218,9 @@ public class LispReadtable : LispObject
         _dispatchTables.Clear();
         foreach (var kv in source._dispatchTables)
             _dispatchTables[kv.Key] = new Dictionary<char, Func<Reader, char, int, LispObject?>>(kv.Value);
+        _lispDispatchFunctions.Clear();
+        foreach (var kv in source._lispDispatchFunctions)
+            _lispDispatchFunctions[kv.Key] = new Dictionary<char, LispObject>(kv.Value);
         // Re-register DispatchMacro closures to reference this readtable (not source)
         foreach (var kv in _dispatchTables)
         {
@@ -212,6 +240,8 @@ public class LispReadtable : LispObject
         foreach (var ch in _nonTerminating) copy._nonTerminating.Add(ch);
         foreach (var kv in _dispatchTables)
             copy._dispatchTables[kv.Key] = new Dictionary<char, Func<Reader, char, int, LispObject?>>(kv.Value);
+        foreach (var kv in _lispDispatchFunctions)
+            copy._lispDispatchFunctions[kv.Key] = new Dictionary<char, LispObject>(kv.Value);
         // Re-register DispatchMacro closures to reference the copy (not source)
         foreach (var kv in copy._dispatchTables)
         {

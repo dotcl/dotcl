@@ -154,7 +154,21 @@ public static partial class Runtime
     private static bool DirectoryMatchP(LispObject? pathDir, LispObject? wildDir)
     {
         if (wildDir == null || wildDir is Nil) return true;
-        if (pathDir == null || pathDir is Nil) return wildDir == null || wildDir is Nil;
+        if (pathDir == null || pathDir is Nil)
+        {
+            // A nil path directory can match a pattern that only contains ** (zero dirs allowed)
+            if (wildDir is Cons wc)
+            {
+                // Check: (:absolute :wild-inferiors) or (:relative :wild-inferiors) — ** matches zero dirs
+                var wFirst = wc.Car;
+                bool isAbsOrRel = wFirst is Symbol ws0 && (ws0.Name == "ABSOLUTE" || ws0.Name == "RELATIVE");
+                if (isAbsOrRel && wc.Cdr is Cons wRest
+                    && wRest.Car is Symbol wi0 && wi0.Name == "WILD-INFERIORS"
+                    && wRest.Cdr is Nil)
+                    return true;
+            }
+            return wildDir == null || wildDir is Nil;
+        }
 
         var pList = new List<LispObject>();
         var wList = new List<LispObject>();
@@ -220,23 +234,20 @@ public static partial class Runtime
     public static LispObject TranslatePathname(LispObject source, LispObject fromWild, LispObject toWild)
     {
         LispPathname s, f, t;
-        if (source is LispPathname sp) s = sp;
-        else if (source is LispString ss) s = LispPathname.FromString(ss.Value);
-        else if (source is LispVector sv && sv.IsCharVector) s = LispPathname.FromString(sv.ToCharString());
-        else if (source is LispFileStream sfs) s = LispPathname.FromString(sfs.FilePath);
-        else throw new LispErrorException(new LispTypeError("TRANSLATE-PATHNAME: not a pathname designator", source));
-
-        if (fromWild is LispPathname fp) f = fp;
-        else if (fromWild is LispString fs) f = LispPathname.FromString(fs.Value);
-        else if (fromWild is LispVector fv && fv.IsCharVector) f = LispPathname.FromString(fv.ToCharString());
-        else if (fromWild is LispFileStream ffs) f = LispPathname.FromString(ffs.FilePath);
-        else throw new LispErrorException(new LispTypeError("TRANSLATE-PATHNAME: not a pathname designator", fromWild));
-
-        if (toWild is LispPathname tp) t = tp;
-        else if (toWild is LispString ts2) t = LispPathname.FromString(ts2.Value);
-        else if (toWild is LispVector tv && tv.IsCharVector) t = LispPathname.FromString(tv.ToCharString());
-        else if (toWild is LispFileStream tfs) t = LispPathname.FromString(tfs.FilePath);
-        else throw new LispErrorException(new LispTypeError("TRANSLATE-PATHNAME: not a pathname designator", toWild));
+        static LispPathname ToPn(LispObject obj, string who) => obj switch {
+            LispPathname p => p,
+            LispString s => IsLogicalPathnameString(s.Value)
+                ? LispLogicalPathname.FromLogicalString(s.Value)
+                : LispPathname.FromString(s.Value),
+            LispVector v when v.IsCharVector => IsLogicalPathnameString(v.ToCharString())
+                ? LispLogicalPathname.FromLogicalString(v.ToCharString())
+                : LispPathname.FromString(v.ToCharString()),
+            LispFileStream fs => LispPathname.FromString(fs.FilePath),
+            _ => throw new LispErrorException(new LispTypeError($"{who}: not a pathname designator", obj))
+        };
+        s = ToPn(source, "TRANSLATE-PATHNAME");
+        f = ToPn(fromWild, "TRANSLATE-PATHNAME");
+        t = ToPn(toWild, "TRANSLATE-PATHNAME");
 
         // Translate directory: replace the from-wild prefix with to-wild prefix,
         // keeping the subdirectories that matched :wild-inferiors
@@ -247,8 +258,19 @@ public static partial class Runtime
 
         var newVersion = TranslateComponent(s.Version, f.Version, t.Version);
 
+        // When source is a logical pathname, lowercase string components in physical result
+        bool srcIsLogical = s is LispLogicalPathname;
+        if (srcIsLogical)
+        {
+            if (newName is LispString ns && t.NameComponent is Symbol wn && wn.Name == "WILD")
+                newName = new LispString(ns.Value.ToLowerInvariant());
+            if (newType is LispString nt && t.TypeComponent is Symbol wt && wt.Name == "WILD")
+                newType = new LispString(nt.Value.ToLowerInvariant());
+            newDir = LowercaseDirectoryStrings(newDir);
+        }
+
         return new LispPathname(
-            t.Host ?? s.Host,
+            t.Host is LispString th && th.Value.Length > 0 ? t.Host : s.Host is LispLogicalPathname ? null : s.Host,
             t.Device ?? s.Device,
             newDir, newName, newType,
             newVersion);
@@ -260,6 +282,19 @@ public static partial class Runtime
         if (to is Symbol ts && ts.Name == "WILD") return src; // :wild in dest → use source
         if (to is LispString tstr && tstr.Value == "*") return src; // "*" in dest → use source
         return to;
+    }
+
+    private static LispObject? LowercaseDirectoryStrings(LispObject? dir)
+    {
+        if (dir is not Cons) return dir;
+        var items = new List<LispObject>();
+        var cur = (LispObject)dir;
+        while (cur is Cons c)
+        {
+            items.Add(c.Car is LispString ds ? new LispString(ds.Value.ToLowerInvariant()) : c.Car);
+            cur = c.Cdr;
+        }
+        return List(items.ToArray());
     }
 
     private static LispObject? TranslateDirectory(LispObject? srcDir, LispObject? fromDir, LispObject? toDir)

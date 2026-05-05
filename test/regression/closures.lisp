@@ -59,3 +59,42 @@
              (lambda () n)))
     (funcall (counter 42)))
   42)
+
+;;; (setf (the type place) value) must correctly assign through type annotation
+(deftest setf-the-basic
+  (let ((x 0))
+    (setf (the fixnum x) 42)
+    x)
+  42)
+
+;;; (incf (the fixnum var)) must correctly mutate variable
+(deftest incf-the-basic
+  (let ((n 5))
+    (incf (the fixnum n))
+    n)
+  6)
+
+;;; (decf (the fixnum var)) must correctly mutate variable
+(deftest decf-the-basic
+  (let ((n 5))
+    (decf (the fixnum n))
+    n)
+  4)
+
+;;; (incf (the fixnum n)) in a closure must mutate captured var (D978)
+;;; Bug: mutation analysis didn't unwrap (the type var), so n wasn't boxed.
+(deftest incf-the-in-closure
+  (let ((n 0))
+    (let ((incr (lambda () (incf (the fixnum n)))))
+      (funcall incr)
+      (funcall incr)
+      (funcall incr)
+      n))
+  3)
+
+;;; (setf (the fixnum n) val) in a closure must mutate captured var
+(deftest setf-the-in-closure
+  (let ((x 0))
+    (funcall (lambda () (setf (the fixnum x) 99)))
+    x)
+  99)

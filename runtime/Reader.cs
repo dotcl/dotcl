@@ -62,6 +62,9 @@ public class Reader
     private readonly TextReader _input;
     private int _pushedBack;
     private bool _hasPushback;
+    // Multi-char pushback for ReadCharacterLiteral longest-match (must be checked before _pushedBack)
+    private string _inputPrefix = "";
+    private int _inputPrefixPos = 0;
     private bool _readSuppress;
     private int _line = 1;
     private Dictionary<int, LispObject> _shareLabels = new();
@@ -129,6 +132,7 @@ public class Reader
 
     internal int Peek()
     {
+        if (_inputPrefixPos < _inputPrefix.Length) return _inputPrefix[_inputPrefixPos];
         if (_hasPushback) return _pushedBack;
         return _input.Peek();
     }
@@ -143,6 +147,13 @@ public class Reader
 
     internal int ReadChar()
     {
+        if (_inputPrefixPos < _inputPrefix.Length)
+        {
+            var ch2 = _inputPrefix[_inputPrefixPos++];
+            if (ch2 == '\n') _line++;
+            Position++;
+            return ch2;
+        }
         if (_hasPushback)
         {
             _hasPushback = false;
@@ -154,6 +165,17 @@ public class Reader
         if (ch == '\n') _line++;
         if (ch != -1) Position++;
         return ch;
+    }
+
+    // Multi-char pushback: prepend s to the read stream and adjust Position.
+    // Used by ReadCharacterLiteral for longest-match: unconsumed words go back.
+    internal void PrependToInput(string s)
+    {
+        if (s.Length == 0) return;
+        var remaining = _inputPrefix.Substring(_inputPrefixPos);
+        _inputPrefix = s + remaining;
+        _inputPrefixPos = 0;
+        Position -= s.Length;
     }
 
     internal void UnreadChar(int ch)
@@ -1201,15 +1223,26 @@ public class Reader
 
     internal LispObject ReadCharacterLiteral()
     {
-        // #\x or #\Space etc.
+        // #\x, #\Space, #\SOFT HYPHEN, #\L B BAR SYMBOL, #\GREEK CAPITAL LETTER ALPHA WITH OXIA, …
+        // Algorithm: read the first char; if not followed by anything interesting, return it.
+        // Otherwise read all space-separated words eagerly, then find the LONGEST name match.
+        // This handles both single-word standard names (Space, Newline) and multi-word UCD
+        // names, including those where a shorter prefix is also a valid name.
         int first = ReadChar();
         if (first == -1) throw MakeEndOfFileError("Unexpected end of input in character literal");
 
-        // Check if the next character is also a constituent (multi-char name)
         int peeked = Peek();
-        bool multiChar = peeked != -1 && !IsTerminating(peeked) && !char.IsWhiteSpace((char)peeked);
 
-        if (multiChar)
+        // Quick return: single char followed by a non-space terminator or EOF
+        // (e.g. #\L) or #\L" or #\L; — never the start of a multi-word name)
+        if (peeked == -1 || (IsTerminating(peeked) && peeked != ' '))
+            return _readSuppress ? (LispObject)Nil.Instance : LispChar.Make((char)first);
+
+        // Build the first word:
+        // - if next is a constituent (non-terminating, non-whitespace), read until terminator
+        // - if next is a space, first word is just the single initial char
+        string firstName;
+        if (!IsTerminating(peeked))
         {
             var sb = new StringBuilder();
             sb.Append((char)first);
@@ -1220,21 +1253,61 @@ public class Reader
                 ReadChar();
                 sb.Append((char)next);
             }
-
-            var name = sb.ToString();
-            if (_readSuppress) return Nil.Instance;
-
-            if (name.Length == 1)
-                return LispChar.Make(name[0]);
-
-            // Use Runtime.NameChar for unified character name lookup
-            var ch = Runtime.NameChar(name);
-            if (ch.HasValue)
-                return LispChar.Make(ch.Value);
-            throw MakeReaderError($"Unknown character name: {name}");
+            firstName = sb.ToString();
+        }
+        else
+        {
+            // peeked == ' ' (the only remaining case after the quick-return above)
+            firstName = ((char)first).ToString();
         }
 
-        return _readSuppress ? (LispObject)Nil.Instance : LispChar.Make((char)first);
+        if (_readSuppress) return Nil.Instance;
+
+        // Collect all space-separated words for longest-match.
+        // For each space we tentatively consume: if no word follows, push the space back.
+        var allWords = new List<string> { firstName };
+        while (Peek() == ' ')
+        {
+            ReadChar(); // consume space
+            var wordSb = new StringBuilder();
+            while (true)
+            {
+                int next = Peek();
+                if (next == -1 || IsTerminating(next)) break;
+                ReadChar();
+                wordSb.Append((char)next);
+            }
+            if (wordSb.Length == 0)
+            {
+                PrependToInput(" "); // push the space back — nothing followed it
+                break;
+            }
+            allWords.Add(wordSb.ToString());
+        }
+
+        // Try from longest to shortest; push back unconsumed words on a shorter match.
+        // Fallback: a single initial char that matches no named character is itself.
+        for (int len = allWords.Count; len >= 1; len--)
+        {
+            var candidate = string.Join(" ", allWords.Take(len));
+            var ch = Runtime.NameChar(candidate);
+            if (ch.HasValue)
+            {
+                if (len < allWords.Count)
+                    PrependToInput(" " + string.Join(" ", allWords.Skip(len)));
+                return LispChar.Make(ch.Value);
+            }
+            // Single-char fallback: the initial char with no name match is the char itself.
+            // Push back any speculatively consumed words.
+            if (len == 1 && candidate.Length == 1)
+            {
+                if (allWords.Count > 1)
+                    PrependToInput(" " + string.Join(" ", allWords.Skip(1)));
+                return LispChar.Make(candidate[0]);
+            }
+        }
+
+        throw MakeReaderError($"Unknown character name: {string.Join(" ", allWords)}");
     }
 
     internal LispObject ReadVector(int numArg = -1)
@@ -1343,13 +1416,17 @@ public class Reader
         if (feature is Symbol sym)
         {
             // Check the *features* dynamic variable (CLHS 24.1.2.1)
-            // Features are compared using EQ (symbol identity)
+            // The feature reader reads feature names in the KEYWORD package.
+            // Match: same name (string=) AND same home package (so CL-TEST::X
+            // does not match #+X which is read as :X in keyword package).
             var featuresSym = Startup.Sym("*FEATURES*");
             var featuresList = DynamicBindings.Get(featuresSym);
             var cur = featuresList;
             while (cur is Cons c)
             {
-                if (ReferenceEquals(c.Car, sym))
+                if (c.Car is Symbol fs
+                    && string.Equals(fs.Name, sym.Name, StringComparison.Ordinal)
+                    && ReferenceEquals(fs.HomePackage, sym.HomePackage))
                     return true;
                 cur = c.Cdr;
             }

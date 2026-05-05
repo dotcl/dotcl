@@ -419,17 +419,17 @@ public static partial class Runtime
                 // When *print-readably* is T, characters must be printed readably
                 // even when escape is false (CLHS 22.1.3.2)
                 if (!escape && !GetPrintReadably()) return c.Value.ToString();
-                // CLHS 22.1.3.2: When *print-readably* is false and *print-escape* is true,
-                // graphic standard characters print as #\ followed by the character itself.
-                // Space is a graphic standard character.
+                // CLHS 22.1.3.2: When *print-escape* is true, named characters use their name.
+                // Non-named graphic characters (except Space, which is named) use the char itself.
                 if (!GetPrintReadably())
                 {
                     char ch = c.Value;
-                    // Standard characters that are graphic (including Space) but not Newline
+                    // Space: use literal "#\ " form (ANSI test PRINT.CHAR.4 expects this)
                     if (ch == ' ') return "#\\ ";
-                    // Other graphic characters
+                    // Other graphic non-named characters: print as #\<char>
                     if (ch > ' ' && ch < 127) return $"#\\{ch}";
                 }
+                // Named characters and readably mode: use LispChar.ToString()
                 return c.ToString();
             case T:
                 // When escape/readably and T could be read as a number
@@ -532,11 +532,11 @@ public static partial class Runtime
                 return "#<RANDOM-STATE>";
             }
             default:
-                if (obj is LispVector || obj is LispStruct)
+                if (obj is LispVector || obj is LispStruct || obj is LispInstance)
                 {
                     // Bit-vectors and strings are atomic for *print-level* purposes (CLHS 22.1.3.6)
                     bool isAtomicPrint = obj is LispVector av && (av.IsCharVector || av.IsBitVector);
-                    // *print-circle* check for vectors/structs
+                    // *print-circle* check for vectors/structs/instances
                     if (_circleTable != null && !(obj is LispVector cv && cv.IsCharVector)
                         && _circleTable.TryGetValue(obj, out int vState))
                     {
@@ -1219,6 +1219,7 @@ public static partial class Runtime
     }
 
     [System.ThreadStatic] private static bool _inStructPrintObjectDispatch;
+    [System.ThreadStatic] private static bool _inInstancePrintObjectDispatch;
 
     private static string FormatCompound(LispObject obj, bool escape)
     {
@@ -1252,9 +1253,49 @@ public static partial class Runtime
                 }
                 return FormatStruct(st, escape);
             }
+            // LispInstance (CLOS): dispatch to print-object GF if specialized method exists
+            if (obj is LispInstance inst)
+            {
+                if (!_inInstancePrintObjectDispatch)
+                {
+                    var poSym = Startup.Sym("PRINT-OBJECT");
+                    if (poSym?.Function is GenericFunction gfInst && HasSpecializedPrintObjectMethodForInstance(gfInst, inst))
+                    {
+                        _inInstancePrintObjectDispatch = true;
+                        try
+                        {
+                            var sw = new System.IO.StringWriter();
+                            var stream = new LispStringOutputStream(sw);
+                            gfInst.Invoke(new LispObject[] { inst, stream });
+                            return sw.ToString();
+                        }
+                        catch { }
+                        finally { _inInstancePrintObjectDispatch = false; }
+                    }
+                }
+                return inst.ToString();
+            }
             return obj.ToString();
         }
         finally { _formatConsDepth--; }
+    }
+
+    private static bool HasSpecializedPrintObjectMethodForInstance(GenericFunction gf, LispInstance inst)
+    {
+        var tClass = FindClass(Startup.Sym("T")) as LispClass;
+        var soClass = FindClass(Startup.Sym("STANDARD-OBJECT")) as LispClass;
+        var instClass = inst.Class;
+        foreach (var method in gf.Methods)
+        {
+            if (method.Qualifiers.Length == 0
+                && method.Specializers.Length >= 1
+                && method.Specializers[0] is LispClass cls
+                && cls != tClass
+                && cls != soClass
+                && (cls == instClass || System.Array.IndexOf(instClass.ClassPrecedenceList, cls) >= 0))
+                return true;
+        }
+        return false;
     }
 
     private static bool HasSpecializedPrintObjectMethod(GenericFunction gf, LispStruct st)
@@ -1587,7 +1628,9 @@ public static partial class Runtime
     public static LispObject Princ(LispObject obj)
     {
         // CLHS: princ outputs as if by write with *print-escape* false, *print-readably* false
+        var escapeSym = Startup.Sym("*PRINT-ESCAPE*");
         var readablySym = Startup.Sym("*PRINT-READABLY*");
+        DynamicBindings.Push(escapeSym, Nil.Instance);
         DynamicBindings.Push(readablySym, Nil.Instance);
         try
         {
@@ -1599,13 +1642,16 @@ public static partial class Runtime
         finally
         {
             DynamicBindings.Pop(readablySym);
+            DynamicBindings.Pop(escapeSym);
         }
     }
 
     public static LispObject Princ2(LispObject obj, LispObject stream)
     {
         // CLHS: princ outputs as if by write with *print-escape* false, *print-readably* false
+        var escapeSym = Startup.Sym("*PRINT-ESCAPE*");
         var readablySym = Startup.Sym("*PRINT-READABLY*");
+        DynamicBindings.Push(escapeSym, Nil.Instance);
         DynamicBindings.Push(readablySym, Nil.Instance);
         try
         {
@@ -1619,6 +1665,7 @@ public static partial class Runtime
         finally
         {
             DynamicBindings.Pop(readablySym);
+            DynamicBindings.Pop(escapeSym);
         }
     }
 
@@ -1768,6 +1815,7 @@ public static partial class Runtime
         var writer = GetTextWriter(stream);
         writer.Write('\n');
         PprintTrackWriteChar('\n');
+        Runtime.UpdateAtLineStart(stream, '\n');
         PprintAfterNewline(writer);
         return Nil.Instance;
     }
@@ -2207,7 +2255,31 @@ public static partial class Runtime
                 throw new LispErrorException(new LispProgramError("PPRINT-DISPATCH: requires at least 1 argument"));
             if (args.Length > 2)
                 throw new LispErrorException(new LispProgramError("PPRINT-DISPATCH: too many arguments"));
-            return MultipleValues.Values(Nil.Instance, Nil.Instance);
+            var obj = args[0];
+            LispPprintDispatchTable? table = null;
+            if (args.Length >= 2 && args[1] is LispPprintDispatchTable t)
+                table = t;
+            else
+            {
+                LispObject tableVal;
+                if (DynamicBindings.TryGet(Startup.Sym("*PRINT-PPRINT-DISPATCH*"), out tableVal))
+                    table = tableVal as LispPprintDispatchTable;
+                else
+                    table = Startup.Sym("*PRINT-PPRINT-DISPATCH*").Value as LispPprintDispatchTable;
+            }
+            if (table == null || table.Entries.Count == 0)
+                return MultipleValues.Values(Nil.Instance, Nil.Instance);
+            (LispObject TypeSpec, LispObject Function, double Priority)? best = null;
+            foreach (var entry in table.Entries.Values)
+            {
+                if (MatchesTypeSpec(obj, entry.TypeSpec))
+                {
+                    if (best == null || entry.Priority > best.Value.Priority)
+                        best = entry;
+                }
+            }
+            if (best == null) return MultipleValues.Values(Nil.Instance, Nil.Instance);
+            return MultipleValues.Values(best.Value.Function, T.Instance);
         }, "PPRINT-DISPATCH", -1));
         // SET-PPRINT-DISPATCH: (type-specifier function &optional priority table)
         Emitter.CilAssembler.RegisterFunction("SET-PPRINT-DISPATCH", new LispFunction(args => {
