@@ -3218,6 +3218,8 @@ public static partial class Runtime
                 var stream = args.Length > 0 ? args[0] : DynamicBindings.Get(Startup.Sym("*STANDARD-INPUT*"));
                 var eofErrorP = args.Length > 1 ? args[1] : T.Instance;
                 var eofValue = args.Length > 2 ? args[2] : Nil.Instance;
+                var recursiveP = args.Length > 3 ? args[3] : Nil.Instance;
+                if (recursiveP is not Nil) eofErrorP = T.Instance;
                 return Runtime.ReadCharNoHang(stream, eofErrorP, eofValue);
             }));
         Emitter.CilAssembler.RegisterFunction("READ-CHAR",
@@ -3226,6 +3228,7 @@ public static partial class Runtime
                 var stream = args.Length > 0 ? args[0] : DynamicBindings.Get(Startup.Sym("*STANDARD-INPUT*"));
                 var eofErrorP = args.Length > 1 ? args[1] : T.Instance;
                 var eofValue = args.Length > 2 ? args[2] : Nil.Instance;
+                // recursive-p (args[3]) does NOT override eof-error-p (CLHS)
                 return Runtime.ReadChar(stream, eofErrorP, eofValue);
             }));
         Emitter.CilAssembler.RegisterFunction("PEEK-CHAR",
@@ -3235,6 +3238,7 @@ public static partial class Runtime
                 var stream = args.Length > 1 ? args[1] : DynamicBindings.Get(Startup.Sym("*STANDARD-INPUT*"));
                 var eofErrorP = args.Length > 2 ? args[2] : T.Instance;
                 var eofValue = args.Length > 3 ? args[3] : Nil.Instance;
+                // recursive-p (args[4]) does NOT override eof-error-p (CLHS)
                 return Runtime.PeekChar(peekType, stream, eofErrorP, eofValue);
             }));
         Emitter.CilAssembler.RegisterFunction("UNREAD-CHAR",
@@ -3256,6 +3260,8 @@ public static partial class Runtime
                 var stream = args.Length > 0 ? args[0] : DynamicBindings.Get(Startup.Sym("*STANDARD-INPUT*"));
                 var eofErrorP = args.Length > 1 ? args[1] : T.Instance;
                 var eofValue = args.Length > 2 ? args[2] : Nil.Instance;
+                var recursiveP = args.Length > 3 ? args[3] : Nil.Instance;
+                if (recursiveP is not Nil) eofErrorP = T.Instance;
                 return Runtime.ReadPreservingWhitespace(stream, eofErrorP, eofValue);
             }));
 
@@ -3286,6 +3292,8 @@ public static partial class Runtime
                 var stream = args.Length > 0 ? args[0] : DynamicBindings.Get(Startup.Sym("*STANDARD-INPUT*"));
                 var eofErrorP = args.Length > 1 ? args[1] : T.Instance;
                 var eofValue = args.Length > 2 ? args[2] : Nil.Instance;
+                var recursiveP = args.Length > 3 ? args[3] : Nil.Instance;
+                if (recursiveP is not Nil) eofErrorP = T.Instance;
                 return Runtime.ReadFromStream(stream, eofErrorP, eofValue);
             }, "READ", -1));
         Emitter.CilAssembler.RegisterFunction("READ-LINE",
@@ -3293,6 +3301,8 @@ public static partial class Runtime
                 var stream = args.Length > 0 ? args[0] : DynamicBindings.Get(Startup.Sym("*STANDARD-INPUT*"));
                 var eofErrorP = args.Length > 1 ? args[1] : T.Instance;
                 var eofValue = args.Length > 2 ? args[2] : Nil.Instance;
+                var recursiveP = args.Length > 3 ? args[3] : Nil.Instance;
+                if (recursiveP is not Nil) eofErrorP = T.Instance;
                 return Runtime.ReadLine(stream, eofErrorP, eofValue);
             }, "READ-LINE", -1));
 

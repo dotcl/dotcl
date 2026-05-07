@@ -25,7 +25,7 @@
   <ItemGroup>
     <!-- Need LispObject / IlDisasm types at compile time. Private=false keeps
          runtime.dll out of the published output (already in tool package). -->
-    <ProjectReference Include="..\..\runtime\runtime.csproj">
+    <ProjectReference Include="..\..\runtime\DotCL.Runtime.csproj">
       <Private>false</Private>
       <ExcludeAssets>runtime</ExcludeAssets>
     </ProjectReference>

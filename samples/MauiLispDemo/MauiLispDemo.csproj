@@ -81,9 +81,7 @@
 	       pure managed なので per-RID build 不要、no-RID の runtime.dll を
 	       MAUI 側が全 RID で使い回す。 -->
 	<ItemGroup>
-		<ProjectReference Include="..\..\runtime\runtime.csproj">
-			<AdditionalProperties>DotclAsLibrary=true;RuntimeIdentifier=</AdditionalProperties>
-		</ProjectReference>
+		<ProjectReference Include="..\..\runtime\DotCL.Runtime.csproj" />
 	</ItemGroup>
 
 	<!-- MainPage.xaml embedded as an assembly manifest resource (D795).

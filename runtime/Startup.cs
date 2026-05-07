@@ -1348,6 +1348,11 @@ public static class Startup
             return Nil.Instance;
         }));
 
+        // dotcl:getcwd — current working directory as a pathname (uiop:getcwd delegate)
+        RegisterDotcl("GETCWD", new LispFunction(args => {
+            return LispPathname.FromString(Directory.GetCurrentDirectory() + "/");
+        }));
+
         // dotcl:getenv — get environment variable (like sb-posix:getenv on SBCL)
         RegisterDotcl("GETENV", new LispFunction(args => {
             var name = args[0] is LispString s ? s.Value : args[0].ToString();

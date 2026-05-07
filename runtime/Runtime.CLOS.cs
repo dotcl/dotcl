@@ -156,6 +156,23 @@ public static partial class Runtime
     }
 
     public static void SetClassByName(string name, LispClass cls) => _classRegistry[Startup.Sym(name)] = cls;
+
+    /// <summary>Reconstruct a LispInstance from fasl — called by fasl load-time code.</summary>
+    public static LispObject MakeFaslInstance(string pkgName, string symName, LispObject[] slots)
+    {
+        var sym = Startup.SymInPkg(symName, pkgName);
+        var cls = FindClassOrNil(sym) as LispClass ?? FindClassByName(symName);
+        if (cls == null)
+        {
+            Console.Error.WriteLine($"[FASL WARNING] MakeFaslInstance: class not found: {pkgName}:{symName}");
+            return Nil.Instance;
+        }
+        var inst = new LispInstance(cls);
+        int count = Math.Min(slots.Length, inst.Slots.Length);
+        for (int i = 0; i < count; i++)
+            inst.Slots[i] = slots[i] is Nil ? null : slots[i];
+        return inst;
+    }
     public static void RemoveClass(string name) => _classRegistry.TryRemove(Startup.Sym(name), out _);
 
     /// <summary>Iterate all registered classes. Used by DOTCL-MOP:CLASS-DIRECT-SUBCLASSES
@@ -1456,17 +1473,13 @@ public static partial class Runtime
                 $"The method lambda list for {gf.Name.Name} has {method.RequiredCount} required " +
                 $"parameter(s) but the generic function requires {gf.RequiredCount}"));
 
-        // Rule 2: Optional parameter count — method may have fewer optionals than the GF
-        // (SBCL allows this; a method with fewer optionals is only called in patterns
-        // where the optional args are not provided, e.g. getter-only stream-file-position).
-        // A method with MORE optionals than the GF is still an error unless it has &rest/&key.
-        if (method.OptionalCount > gf.OptionalCount)
-        {
-            if (!(method.HasRest || method.HasKey))
-                throw new LispErrorException(new LispProgramError(
-                    $"The method lambda list for {gf.Name.Name} has {method.OptionalCount} optional " +
-                    $"parameter(s) but the generic function requires {gf.OptionalCount}"));
-        }
+        // Rule 2: Optional parameter count (CLHS 7.6.4).
+        // Method may NOT have MORE optionals than the GF unless it also has &rest or &key.
+        // Method MAY have fewer optionals (common pattern: getter method omits setter optional).
+        if (method.OptionalCount > gf.OptionalCount && !(method.HasRest || method.HasKey))
+            throw new LispErrorException(new LispProgramError(
+                $"The method lambda list for {gf.Name.Name} has {method.OptionalCount} optional " +
+                $"parameter(s) but the generic function accepts only {gf.OptionalCount}"));
 
         // Rule 3: If ANY lambda list mentions &rest or &key, EACH must mention one or both
         // (bidirectional check per CLHS 7.6.4)

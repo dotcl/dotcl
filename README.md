@@ -28,11 +28,8 @@ against the
 ## Quick start
 
 ```bash
-# One-time bootstrap: cross-compile dotcl's compiler with Roswell/SBCL.
-make cross-compile
-
-# Install as a `dotnet tool`-style global command.
-make install
+# Install dotcl as a global .NET tool (works on any host with .NET SDK 10+).
+dotnet tool install --global dotcl
 
 # REPL
 dotcl repl
@@ -44,14 +41,29 @@ dotcl --eval "(format t \"hello, ~a~%\" (lisp-implementation-type))"
 dotcl --load my-program.lisp
 ```
 
-After the first cross-compile, dotcl can self-host: `DOTCL_LISP=dotcl
-make cross-compile` rebuilds the compiler using dotcl itself.
+The framework-dependent `dotcl` package is portable across OS / arch but
+JIT-compiles the core on first launch (~3 s cold start). For faster
+startup, install the RID-specific package — it bundles ahead-of-time
+(R2R) FASLs:
+
+```bash
+# Pick the one matching your host:
+dotnet tool install --global dotcl.win-x64
+dotnet tool install --global dotcl.win-arm64
+dotnet tool install --global dotcl.linux-x64
+dotnet tool install --global dotcl.linux-arm64
+dotnet tool install --global dotcl.osx-x64
+dotnet tool install --global dotcl.osx-arm64
+```
+
+The two variants share the `dotcl` command name, so install only one.
+
+For Roswell users, per-RID tarballs are also published on each
+[release page](https://github.com/dotcl/dotcl/releases).
 
 ### Prerequisites
 
 - **.NET SDK 10+** — see install table below
-- [Roswell](https://github.com/roswell/roswell) (only for the initial
-  cross-compile bootstrap — once dotcl is built it can rebuild itself)
 
 #### Installing .NET SDK 10
 
@@ -64,6 +76,19 @@ make cross-compile` rebuilds the compiler using dotcl itself.
 | Windows (Scoop) | `scoop install dotnet-sdk` |
 | Cross-platform script | [`dotnet-install.sh` / `dotnet-install.ps1`](https://learn.microsoft.com/dotnet/core/tools/dotnet-install-script) |
 | Other | https://dotnet.microsoft.com/download |
+
+### Building from source
+
+If you want to hack on dotcl itself rather than just use it, clone the
+repo and bootstrap with [Roswell](https://github.com/roswell/roswell):
+
+```bash
+make cross-compile   # uses Roswell/SBCL to bootstrap the compiler
+make install         # builds and installs the local nupkg as `dotcl`
+```
+
+After the first cross-compile, dotcl can self-host: `DOTCL_LISP=dotcl
+make cross-compile` rebuilds the compiler using dotcl itself.
 
 ## Samples
 

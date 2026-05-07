@@ -939,6 +939,9 @@ public static partial class Runtime
     /// </summary>
     private static IEnumerable<LispObject> FlattenTopLevel(LispObject form)
     {
+        // Defensive: if a reader macro or macro expander leaked MvReturn, take primary value.
+        if (form is MvReturn mvr)
+            form = mvr.Values.Length > 0 ? mvr.Values[0] : Nil.Instance;
         if (form is Cons c && c.Car is Symbol sym)
         {
             if (sym.Name == "EVAL-WHEN" && c.Cdr is Cons rest)
@@ -1013,11 +1016,18 @@ public static partial class Runtime
             // Check runtime macro table
             var runtimeMacroFn = Runtime.MacroFunction(sym);
             if (runtimeMacroFn is LispFunction rmf)
-                return rmf.Invoke(new LispObject[] { form, Nil.Instance });
+            {
+                var result = rmf.Invoke(new LispObject[] { form, Nil.Instance });
+                // Macro functions in CL return single value; unwrap MvReturn if present
+                return result is MvReturn mv ? (mv.Values.Length > 0 ? mv.Values[0] : Nil.Instance) : result;
+            }
             // Check compiler macro table
             var compilerFn = Startup.LookupCompilerMacro(sym);
             if (compilerFn != null)
-                return compilerFn.Invoke(new LispObject[] { form });
+            {
+                var result2 = compilerFn.Invoke(new LispObject[] { form });
+                return result2 is MvReturn mv2 ? (mv2.Values.Length > 0 ? mv2.Values[0] : Nil.Instance) : result2;
+            }
         }
         catch
         {
@@ -1552,7 +1562,7 @@ public static partial class Runtime
 
     // --- save-application (#62 MVP) ---
 
-    /// <lispdoc>(dotcl:save-application output-path &amp;key load system toplevel executable target runtime-csproj) -- Bundle Lisp sources into a .fasl or self-contained exe. :system collects ASDF transitive deps; :target :linux-arm64 etc. for cross-platform publish; :runtime-csproj or DOTCL_RUNTIME_CSPROJ env var for installed-tool use.</lispdoc>
+    /// <lispdoc>(dotcl:save-application output-path &amp;key load system toplevel executable r2r no-self-contained target runtime-csproj) -- Bundle Lisp sources into a .fasl or self-contained exe. :system collects ASDF transitive deps; :r2r t enables ReadyToRun ahead-of-time compilation; :no-self-contained t omits the .NET runtime (smaller binary, requires .NET on target); :target :linux-arm64 etc. for cross-platform publish; :runtime-csproj or DOTCL_RUNTIME_CSPROJ env var for installed-tool use.</lispdoc>
     /// <summary>
     /// <c>(dotcl:save-application output-path &amp;key load system toplevel executable target runtime-csproj)</c>
     ///
@@ -1602,6 +1612,8 @@ public static partial class Runtime
         LispObject? loadArg = null;
         LispObject? toplevelArg = null;
         bool isExecutable = false;
+        bool isR2r = false;
+        bool noSelfContained = false;
         string? targetRid = null;
         string? runtimeCsprojOverride = null;
         LispObject? systemArg = null;
@@ -1617,6 +1629,8 @@ public static partial class Runtime
                 case "LOAD": loadArg = args[i + 1]; break;
                 case "TOPLEVEL": toplevelArg = args[i + 1]; break;
                 case "EXECUTABLE": isExecutable = args[i + 1] is not Nil; break;
+                case "R2R": isR2r = args[i + 1] is not Nil; break;
+                case "NO-SELF-CONTAINED": noSelfContained = args[i + 1] is not Nil; break;
                 case "SYSTEM":
                     if (args[i + 1] is not Nil)
                         systemArg = args[i + 1];
@@ -1687,7 +1701,7 @@ public static partial class Runtime
         {
             BuildFaslFromSources(faslPath, sources, toplevelDesignator);
             if (isExecutable)
-                BuildExecutableFromFasl(faslPath, outputPath, targetRid, runtimeCsprojOverride);
+                BuildExecutableFromFasl(faslPath, outputPath, targetRid, runtimeCsprojOverride, isR2r, noSelfContained);
         }
         finally
         {
@@ -1719,6 +1733,15 @@ public static partial class Runtime
 
         try
         {
+            // Prepend (require "asdf") so UIOP is available when sources
+            // compiled with ASDF deps load in a standalone exe context.
+            if (sources.Count > 0)
+            {
+                var requireForm = new Cons(Startup.Sym("REQUIRE"),
+                    new Cons(new LispString("asdf"), Nil.Instance));
+                faslAsm.AddTopLevelForm(CompileTopLevel(requireForm));
+            }
+
             foreach (var src in sources)
                 CompileSourceInto(src, faslAsm);
 
@@ -1733,6 +1756,22 @@ public static partial class Runtime
                     _ => throw new LispErrorException(new LispProgramError(
                         "SAVE-APPLICATION: :toplevel must be a symbol or string"))
                 };
+
+                // Set *image-dumped-p* to :executable so uiop:command-line-arguments
+                // returns user args correctly (without looking for -- separator).
+                // Uses find-package/find-symbol to avoid compile-time symbol interning
+                // issues across fresh runtimes (dotcl serializes symbols by name+pkg).
+                // uiop:getcwd is now implemented via dotcl:getcwd in UIOP's os.lisp patch.
+                {
+                    const string patchUiop =
+                        "(let ((uiop-pkg (find-package \"UIOP\")))" +
+                        "  (when uiop-pkg" +
+                        "    (let ((dumped-sym (find-symbol \"*IMAGE-DUMPED-P*\" uiop-pkg)))" +
+                        "      (when dumped-sym (setf (symbol-value dumped-sym) :executable)))))";
+                    var patchReader = new Reader(new System.IO.StringReader(patchUiop));
+                    if (patchReader.TryRead(out var patchForm) && patchForm != null)
+                        faslAsm.AddTopLevelForm(CompileTopLevel(patchForm));
+                }
 
                 // Append `(funcall (symbol-function 'TOPLEVEL))` — late-bound
                 // so redefinitions (e.g. by asdf) resolve to the current definition
@@ -1767,7 +1806,8 @@ public static partial class Runtime
     /// </summary>
     private static void BuildExecutableFromFasl(
         string userFaslPath, string outputExe,
-        string? targetRid = null, string? runtimeCsprojOverride = null)
+        string? targetRid = null, string? runtimeCsprojOverride = null,
+        bool readyToRun = false, bool noSelfContained = false)
     {
         var runtimeCsproj = runtimeCsprojOverride
             ?? FindRuntimeCsproj()
@@ -1809,10 +1849,14 @@ public static partial class Runtime
             psi.ArgumentList.Add(runtimeCsproj);
             psi.ArgumentList.Add("-c"); psi.ArgumentList.Add("Release");
             psi.ArgumentList.Add("-r"); psi.ArgumentList.Add(rid);
-            psi.ArgumentList.Add("--self-contained");
+            psi.ArgumentList.Add(noSelfContained ? "--no-self-contained" : "--self-contained");
             psi.ArgumentList.Add("-p:PublishSingleFile=true");
+            if (!noSelfContained)
+                psi.ArgumentList.Add("-p:EnableCompressionInSingleFile=true");
             psi.ArgumentList.Add("-p:PackAsTool=false");
             psi.ArgumentList.Add($"-p:DotclUserFasl={userFaslPath}");
+            if (readyToRun)
+                psi.ArgumentList.Add("-p:PublishReadyToRun=true");
             psi.ArgumentList.Add("-o"); psi.ArgumentList.Add(publishOut);
 
             using var proc = System.Diagnostics.Process.Start(psi)
@@ -1834,6 +1878,36 @@ public static partial class Runtime
                     $"SAVE-APPLICATION: expected publish output at {producedExe}"));
 
             File.Copy(producedExe, outputExe, overwrite: true);
+
+            // Copy dotcl.core and contrib/ alongside the output exe.
+            // These are needed at runtime: dotcl.core for the stdlib,
+            // contrib/ for (require "asdf") and other modules.
+            var outputDir = Path.GetDirectoryName(outputExe)!;
+
+            var publishedCore = Path.Combine(publishOut, "dotcl.core");
+            var coreDestPath = Path.Combine(outputDir, "dotcl.core");
+            if (File.Exists(publishedCore))
+                File.Copy(publishedCore, coreDestPath, overwrite: true);
+            else
+            {
+                var coreSrcFallback = FindBuiltCore();
+                if (coreSrcFallback != null)
+                    File.Copy(coreSrcFallback, coreDestPath, overwrite: true);
+            }
+
+            // Copy contrib/ (module fasls including asdf) so require works at runtime.
+            // Prefer the publish output's contrib; fall back to the runtime source tree.
+            var publishedContrib = Path.Combine(publishOut, "contrib");
+            var contribDest = Path.Combine(outputDir, "contrib");
+            if (Directory.Exists(publishedContrib))
+                CopyDirectory(publishedContrib, contribDest);
+
+            // The publish output may omit runtime/contrib/asdf (gitignored, not in
+            // Content items). Copy it explicitly from the runtime source tree.
+            var runtimeContribAsdf = Path.Combine(runtimeDir, "contrib", "asdf");
+            var destContribAsdf = Path.Combine(contribDest, "asdf");
+            if (Directory.Exists(runtimeContribAsdf) && !Directory.Exists(destContribAsdf))
+                CopyDirectory(runtimeContribAsdf, destContribAsdf);
         }
         finally
         {
@@ -1896,12 +1970,12 @@ public static partial class Runtime
             _             => systemDesignator.ToString().ToLowerInvariant()
         };
 
-        // Evaluate: (mapcar #'namestring
+        // Evaluate: (mapcar (lambda (c) (namestring (asdf:component-pathname c)))
         //              (remove-if-not (lambda (c) (typep c 'asdf:cl-source-file))
         //                (asdf:required-components (asdf:find-system "<name>")
         //                  :other-systems t)))
         // Returns a Lisp list of namestring strings.
-        var exprStr = $@"(mapcar #'namestring
+        var exprStr = $@"(mapcar (lambda (c) (namestring (asdf:component-pathname c)))
                            (remove-if-not
                              (lambda (c) (typep c 'asdf:cl-source-file))
                              (asdf:required-components
@@ -1955,6 +2029,15 @@ public static partial class Runtime
         var lines = s.TrimEnd().Split('\n');
         int start = Math.Max(0, lines.Length - n);
         return string.Join('\n', lines.Skip(start));
+    }
+
+    private static void CopyDirectory(string src, string dst)
+    {
+        Directory.CreateDirectory(dst);
+        foreach (var file in Directory.GetFiles(src))
+            File.Copy(file, Path.Combine(dst, Path.GetFileName(file)), overwrite: true);
+        foreach (var dir in Directory.GetDirectories(src))
+            CopyDirectory(dir, Path.Combine(dst, Path.GetFileName(dir)));
     }
 
     /// <summary>
@@ -2135,16 +2218,24 @@ public static partial class Runtime
 
     public static LispObject Gensym(LispObject prefix)
     {
-        // prefix must be a string or non-negative integer (unsigned-byte)
+        // prefix must be a string or non-negative integer (unsigned-byte).
+        // CL strings include simple-strings AND character vectors of any element-type
+        // CHARACTER/BASE-CHAR/STANDARD-CHAR — accept both LispString and IsCharVector.
         if (prefix is Fixnum fi && fi.Value >= 0)
             return new Symbol($"G{fi.Value}");
         if (prefix is Bignum bi && bi.Value >= 0)
             return new Symbol($"G{bi.Value}");
-        if (prefix is LispString s)
+        string? prefixStr = prefix switch
+        {
+            LispString s => s.Value,
+            LispVector v when v.IsCharVector => v.ToCharString(),
+            _ => null,
+        };
+        if (prefixStr != null)
         {
             ValidateGensymCounter();
             var counter = GetGensymCounter();
-            var name = $"{s.Value}{counter}";
+            var name = $"{prefixStr}{counter}";
             SetGensymCounter(counter + 1);
             return new Symbol(name);
         }
@@ -2989,10 +3080,17 @@ public static partial class Runtime
                     {
                         Runtime.CheckPackageLock(nameSym, "%SET-FDEFINITION");
                         nameSym.SetfFunction = fn;
-                        // Also register on the CL-package canonical symbol so string-based
-                        // GetFunction("(SETF name)") can find it for uninterned gensyms.
-                        var canonSym = Startup.Sym(nameSym.Name);
-                        if (canonSym != nameSym) canonSym.SetfFunction = fn;
+                        // For uninterned gensyms (no home package) ONLY: ALSO register on the
+                        // CL-package canonical symbol so string-based GetFunction("(SETF name)")
+                        // can find it (FDEFINITION.5 / D1001). For interned symbols in other
+                        // packages (e.g. acclimation:documentation), DO NOT pollute the CL
+                        // canonical symbol — that would overwrite cl:documentation.SetfFunction
+                        // and break unrelated callers (D981 cross-package pollution regression).
+                        if (nameSym.HomePackage == null)
+                        {
+                            var canonSym = Startup.Sym(nameSym.Name);
+                            if (canonSym != nameSym) canonSym.SetfFunction = fn;
+                        }
                     }
                     else
                     {

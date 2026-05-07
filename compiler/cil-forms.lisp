@@ -4684,28 +4684,31 @@
         (lambda (expr)
           (let ((nargs (length (cdr expr))))
             (cond
+              ((= nargs 4) (compile-named-call 'read-line (cdr expr)))
               ((= nargs 0) `(,@(compile-expr '*standard-input*) ,@(emit-t) ,@(emit-nil) (:call "Runtime.ReadLine")))
               ((= nargs 1) `(,@(compile-expr (cadr expr)) ,@(emit-t) ,@(emit-nil) (:call "Runtime.ReadLine")))
               ((= nargs 2) `(,@(compile-expr (cadr expr)) ,@(compile-expr (caddr expr)) ,@(emit-nil) (:call "Runtime.ReadLine")))
-              ((<= nargs 4) `(,@(compile-expr (cadr expr)) ,@(compile-expr (caddr expr)) ,@(compile-expr (cadddr expr)) (:call "Runtime.ReadLine")))
+              ((= nargs 3) `(,@(compile-expr (cadr expr)) ,@(compile-expr (caddr expr)) ,@(compile-expr (cadddr expr)) (:call "Runtime.ReadLine")))
               (t (compile-static-program-error (format nil "READ-LINE: wrong number of arguments: ~a (expected 0-4)" nargs)))))))
   (setf (gethash 'read-char h)
         (lambda (expr)
           (let ((nargs (length (cdr expr))))
             (cond
+              ((= nargs 4) (compile-named-call 'read-char (cdr expr)))
               ((= nargs 0) `(,@(compile-expr '*standard-input*) ,@(emit-t) ,@(emit-nil) (:call "Runtime.ReadChar")))
               ((= nargs 1) `(,@(compile-expr (cadr expr)) ,@(emit-t) ,@(emit-nil) (:call "Runtime.ReadChar")))
               ((= nargs 2) `(,@(compile-expr (cadr expr)) ,@(compile-expr (caddr expr)) ,@(emit-nil) (:call "Runtime.ReadChar")))
-              ((<= nargs 4) `(,@(compile-expr (cadr expr)) ,@(compile-expr (caddr expr)) ,@(compile-expr (cadddr expr)) (:call "Runtime.ReadChar")))
+              ((= nargs 3) `(,@(compile-expr (cadr expr)) ,@(compile-expr (caddr expr)) ,@(compile-expr (cadddr expr)) (:call "Runtime.ReadChar")))
               (t (compile-static-program-error (format nil "READ-CHAR: wrong number of arguments: ~a (expected 0-4)" nargs)))))))
   (setf (gethash 'read-char-no-hang h)
         (lambda (expr)
           (let ((nargs (length (cdr expr))))
             (cond
+              ((= nargs 4) (compile-named-call 'read-char-no-hang (cdr expr)))
               ((= nargs 0) `(,@(compile-expr '*standard-input*) ,@(emit-t) ,@(emit-nil) (:call "Runtime.ReadCharNoHang")))
               ((= nargs 1) `(,@(compile-expr (cadr expr)) ,@(emit-t) ,@(emit-nil) (:call "Runtime.ReadCharNoHang")))
               ((= nargs 2) `(,@(compile-expr (cadr expr)) ,@(compile-expr (caddr expr)) ,@(emit-nil) (:call "Runtime.ReadCharNoHang")))
-              ((<= nargs 4) `(,@(compile-expr (cadr expr)) ,@(compile-expr (caddr expr)) ,@(compile-expr (cadddr expr)) (:call "Runtime.ReadCharNoHang")))
+              ((= nargs 3) `(,@(compile-expr (cadr expr)) ,@(compile-expr (caddr expr)) ,@(compile-expr (cadddr expr)) (:call "Runtime.ReadCharNoHang")))
               (t (compile-static-program-error (format nil "READ-CHAR-NO-HANG: wrong number of arguments: ~a (expected 0-4)" nargs)))))))
   (setf (gethash 'listen h)
         (lambda (expr)
@@ -4722,11 +4725,12 @@
         (lambda (expr)
           (let ((nargs (length (cdr expr))))
             (cond
+              ((= nargs 5) (compile-named-call 'peek-char (cdr expr)))
               ((= nargs 0) `(,@(emit-nil) ,@(compile-expr '*standard-input*) ,@(emit-t) ,@(emit-nil) (:call "Runtime.PeekChar")))
               ((= nargs 1) `(,@(compile-expr (cadr expr)) ,@(compile-expr '*standard-input*) ,@(emit-t) ,@(emit-nil) (:call "Runtime.PeekChar")))
               ((= nargs 2) `(,@(compile-expr (cadr expr)) ,@(compile-expr (caddr expr)) ,@(emit-t) ,@(emit-nil) (:call "Runtime.PeekChar")))
               ((= nargs 3) `(,@(compile-expr (cadr expr)) ,@(compile-expr (caddr expr)) ,@(compile-expr (cadddr expr)) ,@(emit-nil) (:call "Runtime.PeekChar")))
-              ((<= nargs 5) `(,@(compile-expr (cadr expr)) ,@(compile-expr (caddr expr)) ,@(compile-expr (cadddr expr)) ,@(compile-expr (car (cddddr expr))) (:call "Runtime.PeekChar")))
+              ((= nargs 4) `(,@(compile-expr (cadr expr)) ,@(compile-expr (caddr expr)) ,@(compile-expr (cadddr expr)) ,@(compile-expr (car (cddddr expr))) (:call "Runtime.PeekChar")))
               (t (compile-static-program-error (format nil "PEEK-CHAR: wrong number of arguments: ~a (expected 0-5)" nargs)))))))
   (setf (gethash 'unread-char h)
         (lambda (expr)
@@ -4767,9 +4771,11 @@
           (let ((nargs (length (cdr expr))))
             (cond
               ((> nargs 4) (compile-static-program-error (format nil "READ: too many arguments: ~D (expected at most 4)" nargs)))
+              ;; With recursive-p: fall through to generic dispatch (registered LispFunction handles it)
+              ((= nargs 4) (compile-named-call 'read (cdr expr)))
               ((= nargs 0) `(,@(compile-expr '*standard-input*) ,@(emit-t) ,@(emit-nil) (:call "Runtime.ReadFromStream")))
               ((= nargs 1) `(,@(compile-expr (cadr expr)) ,@(emit-t) ,@(emit-nil) (:call "Runtime.ReadFromStream")))
-              ((>= nargs 3) `(,@(compile-expr (cadr expr)) ,@(compile-expr (caddr expr)) ,@(compile-expr (cadddr expr)) (:call "Runtime.ReadFromStream")))
+              ((= nargs 3) `(,@(compile-expr (cadr expr)) ,@(compile-expr (caddr expr)) ,@(compile-expr (cadddr expr)) (:call "Runtime.ReadFromStream")))
               (t `(,@(compile-expr (cadr expr)) ,@(compile-expr (caddr expr)) ,@(emit-nil) (:call "Runtime.ReadFromStream")))))))
   (setf (gethash 'read-from-string h) (lambda (expr) `(,@(compile-args-array (cdr expr)) (:call "Runtime.ReadFromString"))))
   (setf (gethash 'read-preserving-whitespace h)
@@ -4777,9 +4783,11 @@
           (let ((nargs (length (cdr expr))))
             (cond
               ((> nargs 4) (compile-static-program-error (format nil "READ-PRESERVING-WHITESPACE: too many arguments: ~D (expected at most 4)" nargs)))
+              ;; With recursive-p: fall through to generic dispatch
+              ((= nargs 4) (compile-named-call 'read-preserving-whitespace (cdr expr)))
               ((= nargs 0) `(,@(compile-expr '*standard-input*) ,@(emit-t) ,@(emit-nil) (:call "Runtime.ReadPreservingWhitespace")))
               ((= nargs 1) `(,@(compile-expr (cadr expr)) ,@(emit-t) ,@(emit-nil) (:call "Runtime.ReadPreservingWhitespace")))
-              ((>= nargs 3) `(,@(compile-expr (cadr expr)) ,@(compile-expr (caddr expr)) ,@(compile-expr (cadddr expr)) (:call "Runtime.ReadPreservingWhitespace")))
+              ((= nargs 3) `(,@(compile-expr (cadr expr)) ,@(compile-expr (caddr expr)) ,@(compile-expr (cadddr expr)) (:call "Runtime.ReadPreservingWhitespace")))
               (t `(,@(compile-expr (cadr expr)) ,@(compile-expr (caddr expr)) ,@(emit-nil) (:call "Runtime.ReadPreservingWhitespace")))))))
 
   ;; Eval / gensym / misc
@@ -5025,7 +5033,11 @@
           (let* ((name (cadr expr))
                  (params (caddr expr))
                  (body (cdddr expr))
+                 ;; Only attach docstring for plain symbol names; (setf foo) /
+                 ;; other function-name forms are skipped because compile-sym-lookup
+                 ;; expects a symbol (would error: SYMBOL-PACKAGE on cons).
                  (has-docstring (and (not *cross-compiling*)
+                                     (symbolp name)
                                      (consp body) (stringp (car body)) (cdr body)))
                  (docstring (when has-docstring (car body)))
                  (real-body (if has-docstring (cdr body) body))

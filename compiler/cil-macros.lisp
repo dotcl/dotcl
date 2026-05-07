@@ -1688,6 +1688,8 @@
                (type-raw (find-defstruct-option :type options))
                (named-raw (find-defstruct-option :named options))
                (offset-raw (find-defstruct-option :initial-offset options))
+               (print-fn-raw (find-defstruct-option :print-function options))
+               (print-obj-raw (find-defstruct-option :print-object options))
                ;; Parse :type option
                ;; (:type list) -> LIST, (:type vector) -> VECTOR, (:type (vector bit)) -> (VECTOR BIT)
                (type-option (when type-raw
@@ -2060,6 +2062,15 @@
                     `((defun ,copy-name (obj) (copy-list obj))))
                    (t
                     `((defun ,copy-name (obj) (copy-seq obj))))))
+             ;; Print-function / print-object (CLHS 8.1.3)
+             ,@(when (and (null type-option)
+                          print-fn-raw (not (eq print-fn-raw :bare)))
+                 `((defmethod print-object ((obj ,name) stream)
+                     (funcall ,(cadr print-fn-raw) obj stream *print-level*))))
+             ,@(when (and (null type-option)
+                          print-obj-raw (not (eq print-obj-raw :bare)))
+                 `((defmethod print-object ((obj ,name) stream)
+                     (funcall ,(cadr print-obj-raw) obj stream))))
              ;; Documentation (CLHS 8.1)
              ,@(when struct-doc
                  (list `(funcall #'(setf documentation) ,struct-doc ',name 'structure)))
@@ -2611,12 +2622,13 @@
                    (when (macro-function ',name)
                      (error 'program-error :format-control "DEFGENERIC: ~S names a macro"
                             :format-arguments (list ',name)))))
-             ;; CLHS says signal error, but SBCL/others replace with a warning.
-             ;; Match SBCL behavior: warn and replace (many libs depend on this).
+             ;; CLHS 7.6.1 recommends signaling program-error, but SBCL-compatible
+             ;; behavior is to warn and replace (many real libraries rely on this).
              (when (and (fboundp ',name)
                         (not (typep (fdefinition ',name) 'generic-function)))
-               (warn "DEFGENERIC: ~S names an ordinary function; replacing with generic function"
-                     ',name))
+               (warn "DEFGENERIC: ~S is being redefined as a generic function, but it was previously defined as an ordinary function."
+                     ',name)
+               (fmakunbound ',name))
              (let ((%gf ,(if gf-class-name
                             ;; :generic-function-class specified: always create a new instance of
                             ;; that class, even if a GF already exists with a different class.
@@ -2673,6 +2685,9 @@
               (progn
                 (setf specialized-params (car rest))
                 (setf body (cdr rest))))
+          ;; Extract docstring: first body form is a string with more forms following
+          (let* ((docstring (and (consp body) (stringp (car body)) (cdr body) (car body)))
+                 (body (if docstring (cdr body) body)))
           ;; Parse specialized parameters: ((p1 class1) p2 ...)
           ;; Build: specializers list, plain parameter names
           ;; Only required params can be specialized; stop at &key/&optional/&rest/etc.
@@ -2771,7 +2786,9 @@
                                                    ,(if m-has-allow-other-keys t nil)
                                                    (list ,@(mapcar (lambda (k) `',k) m-keyword-names)))
                      (%add-method (%find-gf ',name) %m)
-                     %m))))))))
+                     ,@(when (and docstring (not *cross-compiling*))
+                         `((funcall #'(setf documentation) ,docstring %m t)))
+                     %m)))))))))
 
 ;;; --- defpackage ---
 

@@ -109,7 +109,7 @@ jobs:
           cp contrib/asdf/asdf.fasl runtime/contrib/asdf/asdf.fasl
 
       # ── dotnet pack (any RID, no R2R) ────────────────────────────────────
-      - name: Pack NuGet package
+      - name: Pack NuGet packages
         run: |
           mkdir -p out
           dotnet pack runtime/runtime.csproj \
@@ -118,6 +118,10 @@ jobs:
             -p:Version=${{ steps.version.outputs.VERSION }} \
             -p:RuntimeIdentifiers=any \
             -p:PublishReadyToRun=false
+          dotnet pack runtime/DotCL.Runtime.csproj \
+            --configuration Release \
+            -o out/ \
+            -p:Version=${{ steps.version.outputs.VERSION }}
 
       # ── Per-RID tbz for Roswell (no R2R; R2R tracked in issue #131) ──────
       # dotnet publish -r <rid> --self-contained false cross-compiles on Linux

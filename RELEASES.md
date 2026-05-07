@@ -3,6 +3,55 @@
 User-facing release notes for dotcl. Each section corresponds to a tagged
 release on the public mirror (dotcl/dotcl).
 
+## v0.1.6 — 2026-05-07
+
+### New: `DotCL.Runtime` embeddable library NuGet package
+
+`DotCL.Runtime` is now published as a separate NuGet package
+(`PackageId=DotCL.Runtime`, `OutputType=Library`). Projects that embed
+dotcl can now reference it without the `NU1212` error:
+
+```xml
+<PackageReference Include="DotCL.Runtime" Version="0.1.6" />
+```
+
+The package bundles `dotcl.core` as a content file, so it is automatically
+copied to the consuming project's output directory. The `DotclAsLibrary=true`
+workaround used by the sample projects is eliminated.
+
+### New: `save-application` improvements
+
+- `:r2r t` enables ReadyToRun AOT compilation (`--self-contained` only).
+- `:no-self-contained t` now correctly passes `--no-self-contained` to
+  `dotnet publish` (was silently ignored before).
+- Single-file compression is applied automatically for self-contained builds.
+
+### New: `save-application :executable` — ASDF/UIOP standalone exe
+
+`save-application` with `:executable t` produces a standalone executable
+that invokes the Lisp image's top-level entry point. `--help` and
+`--version` flags are forwarded to the Lisp side rather than intercepted
+by dotcl.
+
+### New: `dotcl:getcwd`
+
+`(dotcl:getcwd)` returns the current working directory as a pathname,
+matching the behaviour of `uiop:getcwd`.
+
+### Changed: ANSI conformance 21791/21791 (100%)
+
+- `defmethod` docstrings are retrievable via `(documentation name 'method)`.
+- `defgeneric` / `defmethod` CLHS error conditions tightened (#217, #218).
+- `read-char` / `peek-char`: `recursive-p` no longer overrides `eof-error-p`.
+- `reader`: `recursive-p` argument implemented (#211).
+- `defstruct`: `:print-function` / `:print-object` options implemented (#230).
+- `defgeneric`: `RegisterFunctionOnSymbol` skips package lock for GFs (#234).
+- `defmethod`: optional arity may be less than the GF's (#235).
+- `reader`: `SET-MACRO-CHARACTER` / `FlattenTopLevel` unwrap `MvReturn` leak.
+- `asdf`: `:package-local-nicknames` added to target features; `defgeneric`
+  redefinition demoted to a warning for ASDF compatibility.
+- Symbol reference in non-FASL mode changed to inline lookup (#106).
+
 ## v0.1.5 — 2026-05-06
 
 CLHS conformance pass: completed a chapter-by-chapter audit of CLHS

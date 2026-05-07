@@ -86,8 +86,14 @@ class Program
             // else: default behavior — process exits with SIGINT
         };
 
-        // --help / --version: handled before core loading for fast response
-        if (args.Any(a => a == "--help"))
+        // --help / --version: handled before core loading for fast response.
+        // Skip for save-application :executable t outputs — those embed a
+        // "dotcl.user.fasl" manifest resource and handle their own --help.
+        bool hasEmbeddedFasl =
+            typeof(Program).Assembly
+                .GetManifestResourceStream("dotcl.user.fasl") != null;
+
+        if (!hasEmbeddedFasl && args.Any(a => a == "--help"))
         {
             Console.WriteLine(@"dotcl [options] [script-file [arguments...]]
 
@@ -124,7 +130,7 @@ Example:
   dotcl --resolve-deps MyApp.asd --manifest-out obj/dotcl-deps.txt");
             return;
         }
-        if (args.Any(a => a == "--version"))
+        if (!hasEmbeddedFasl && args.Any(a => a == "--version"))
         {
             var version = typeof(Program).Assembly
                 .GetCustomAttribute<System.Reflection.AssemblyInformationalVersionAttribute>()

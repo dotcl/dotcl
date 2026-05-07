@@ -1056,6 +1056,9 @@ public static partial class Runtime
                 // CLHS: reader macro returning zero values means "skip" (like a comment).
                 // Returning NIL means the read object is NIL. Check MultipleValues.Count
                 // to distinguish (values) from returning nil.
+                // Unwrap MvReturn: per CLHS, only the primary value of a reader macro matters.
+                if (result is MvReturn mv)
+                    return mv.Values.Length > 0 ? mv.Values[0] : null;
                 return (result is Nil && MultipleValues.Count == 0) ? null : result;
             }, nonTerm, lispFn);
             return T.Instance;
@@ -1083,6 +1086,9 @@ public static partial class Runtime
                     stream, LispChar.Make(c),
                     n >= 0 ? (LispObject)Fixnum.Make(n) : Nil.Instance
                 });
+                // Unwrap MvReturn: per CLHS, only the primary value of a reader macro matters.
+                if (result is MvReturn mv)
+                    return mv.Values.Length > 0 ? mv.Values[0] : null;
                 return (result is Nil && MultipleValues.Count == 0) ? null : result;
             }, lispFn);
             return T.Instance;
@@ -1099,7 +1105,28 @@ public static partial class Runtime
             if (char.IsAsciiDigit(subChar)) return Nil.Instance;
             var lispFn2 = rt.GetLispDispatchMacroFunction(dispChar, subChar);
             if (lispFn2 != null) return lispFn2;
-            // Built-in C# dispatch functions have no Lisp counterpart; return nil
+            // Built-in C# dispatch functions: wrap on-the-fly so named-readtables can copy them
+            var csFn2 = rt.GetDispatchMacroCharacter(dispChar, subChar);
+            if (csFn2 != null)
+            {
+                var capturedCsFn = csFn2;
+                return new LispFunction(fargs => {
+                    var textReader2 = Runtime.GetTextReader(fargs[0]);
+                    var reader2 = new Reader(textReader2) { LispStreamRef = fargs[0] };
+                    if (fargs[0] is LispStream ls6)
+                        reader2.AdoptStreamShareTables(ls6);
+                    if (fargs[0] is LispStream ls7 && ls7.UnreadCharValue != -1)
+                    {
+                        reader2.UnreadChar(ls7.UnreadCharValue);
+                        ls7.UnreadCharValue = -1;
+                    }
+                    char sc = ((LispChar)fargs[1]).Value;
+                    int narg = fargs.Length > 2 && fargs[2] is Fixnum fi2 ? (int)fi2.Value : -1;
+                    var res2 = capturedCsFn(reader2, sc, narg);
+                    if (res2 == null) { MultipleValues.Set(); return Nil.Instance; }
+                    return res2;
+                });
+            }
             return Nil.Instance;
         }));
     }

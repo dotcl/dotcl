@@ -1,6 +1,6 @@
 namespace DotCL;
 
-internal static class CliCompletion
+public static class CliCompletion
 {
     private static readonly string[] Flags = new[]
     {

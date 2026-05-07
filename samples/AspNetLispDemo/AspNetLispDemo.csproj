@@ -21,9 +21,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\..\runtime\runtime.csproj">
-      <AdditionalProperties>DotclAsLibrary=true;RuntimeIdentifier=</AdditionalProperties>
-    </ProjectReference>
+    <ProjectReference Include="..\..\runtime\DotCL.Runtime.csproj" />
   </ItemGroup>
 
   <Import Project="..\..\runtime\build\Dotcl.targets" />

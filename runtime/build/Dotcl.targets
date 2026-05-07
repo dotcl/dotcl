@@ -68,7 +68,7 @@
       <DotclDeployedManifest>$(DotclBundleDir)dotcl-deps.txt</DotclDeployedManifest>
       <DotclRootFasl>$(DotclBundleDir)$(MSBuildProjectName).fasl</DotclRootFasl>
       <_DotclCmdPrefix Condition="'$(DotclTool)' != ''">&quot;$(DotclTool)&quot;</_DotclCmdPrefix>
-      <_DotclCmdPrefix Condition="'$(DotclTool)' == '' and '$(DotclRuntimeProject)' != ''">dotnet run --project &quot;$(DotclRuntimeProject)&quot; -p:DotclAsLibrary=false --</_DotclCmdPrefix>
+      <_DotclCmdPrefix Condition="'$(DotclTool)' == '' and '$(DotclRuntimeProject)' != ''">dotnet run --project &quot;$(DotclRuntimeProject)&quot; --</_DotclCmdPrefix>
     </PropertyGroup>
     <MakeDir Directories="$(DotclBundleDir)" />
   </Target>

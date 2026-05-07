@@ -231,7 +231,7 @@ bench: setup-cl-bench
 	@EVAL_ARGS=""; \
 	if [ -n "$(SUITE)" ]; then EVAL_ARGS="--eval '(setq *bench-suite* :$(SUITE))'"; fi; \
 	if [ -n "$(BENCH)" ]; then EVAL_ARGS="$$EVAL_ARGS --eval '(setq *bench-name* \"$(BENCH)\")'"; fi; \
-	eval DOTNET_gcServer=0 $(SETSID) timeout $(BENCH_TIMEOUT) dotnet run --project $(DOTCL_ROOT)runtime -- --asm $(DOTCL_ROOT)compiler/cil-out.sil $$EVAL_ARGS $(DOTCL_ROOT)bench/run.lisp; \
+	eval DOTNET_gcServer=0 $(SETSID) timeout $(BENCH_TIMEOUT) dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --asm $(DOTCL_ROOT)compiler/cil-out.sil $$EVAL_ARGS $(DOTCL_ROOT)bench/run.lisp; \
 	rc=$$?; if [ $$rc -eq 124 ]; then echo ";; TIMEOUT after $(BENCH_TIMEOUT)s"; fi
 
 # Generate bench-state.json with dotcl and SBCL results side by side
@@ -240,7 +240,7 @@ bench-state: setup-cl-bench
 	@EVAL_ARGS=""; \
 	if [ -n "$(SUITE)" ]; then EVAL_ARGS="--eval '(setq *bench-suite* :$(SUITE))'"; fi; \
 	if [ -n "$(BENCH)" ]; then EVAL_ARGS="$$EVAL_ARGS --eval '(setq *bench-name* \"$(BENCH)\")'"; fi; \
-	eval DOTNET_gcServer=0 $(SETSID) timeout $(BENCH_TIMEOUT) dotnet run --project $(DOTCL_ROOT)runtime -- --asm $(DOTCL_ROOT)compiler/cil-out.sil $$EVAL_ARGS $(DOTCL_ROOT)bench/run.lisp 2>/tmp/bench-dotcl.txt; \
+	eval DOTNET_gcServer=0 $(SETSID) timeout $(BENCH_TIMEOUT) dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --asm $(DOTCL_ROOT)compiler/cil-out.sil $$EVAL_ARGS $(DOTCL_ROOT)bench/run.lisp 2>/tmp/bench-dotcl.txt; \
 	rc=$$?; if [ $$rc -eq 124 ]; then echo ";; dotcl TIMEOUT after $(BENCH_TIMEOUT)s"; fi
 	@echo "=== Running benchmarks on SBCL ==="
 	@EVAL_ARGS=""; \
@@ -266,7 +266,7 @@ bench-survey: setup-cl-bench
 	@EVAL_ARGS="--eval '(setq *bench-runs* $(RUNS))' --eval '(setq *bench-warmup* $(WARMUP))'"; \
 	if [ -n "$(SUITE)" ]; then EVAL_ARGS="$$EVAL_ARGS --eval '(setq *bench-suite* :$(SUITE))'"; fi; \
 	if [ -n "$(BENCH)" ]; then EVAL_ARGS="$$EVAL_ARGS --eval '(setq *bench-name* \"$(BENCH)\")'"; fi; \
-	eval DOTNET_gcServer=0 $(SETSID) timeout $(BENCH_TIMEOUT) dotnet run --project $(DOTCL_ROOT)runtime -- --asm $(DOTCL_ROOT)compiler/cil-out.sil $$EVAL_ARGS $(DOTCL_ROOT)bench/run.lisp 2>/tmp/bench-survey-dotcl.txt; \
+	eval DOTNET_gcServer=0 $(SETSID) timeout $(BENCH_TIMEOUT) dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --asm $(DOTCL_ROOT)compiler/cil-out.sil $$EVAL_ARGS $(DOTCL_ROOT)bench/run.lisp 2>/tmp/bench-survey-dotcl.txt; \
 	rc=$$?; if [ $$rc -eq 124 ]; then echo ";; dotcl TIMEOUT after $(BENCH_TIMEOUT)s"; fi
 	@echo "=== Survey SBCL (runs=$(RUNS) warmup=$(WARMUP)) ==="
 	@EVAL_ARGS="--eval '(setq *bench-runs* $(RUNS))' --eval '(setq *bench-warmup* $(WARMUP))'"; \
@@ -300,31 +300,31 @@ publish:
 # itself. .fasl is the shipped artifact (fastest load); .sil and .lisp are
 # not distributed. All 3 are gitignored. D675 (was D673: .sil shipping).
 $(DOTCL_ROOT)contrib/asdf/asdf.fasl: $(DOTCL_ROOT)compiler/cil-out.sil $(DOTCL_ROOT)contrib/asdf/asdf.lisp
-	dotnet run --project $(DOTCL_ROOT)runtime -- --asm $(DOTCL_ROOT)compiler/cil-out.sil --eval '(compile-file "$(DOTCL_ROOT)contrib/asdf/asdf.lisp")'
+	dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --asm $(DOTCL_ROOT)compiler/cil-out.sil --eval '(compile-file "$(DOTCL_ROOT)contrib/asdf/asdf.lisp")'
 
 compile-asdf-fasl: setup-asdf $(DOTCL_ROOT)contrib/asdf/asdf.fasl
 
 # Per-OS asdf fasls: compile asdf.lisp with target-features for each platform.
 # These land in contrib/asdf/runtimes/{os}/asdf.fasl and are loaded by
 # module-provide-contrib in preference to the generic asdf.fasl.
-ASDF_TARGET_LINUX := (quote (:cl :common-lisp :dotcl :unix :linux :x86-64 :64-bit :little-endian))
-ASDF_TARGET_WIN   := (quote (:cl :common-lisp :dotcl :windows :win32 :x86-64 :64-bit :little-endian))
-ASDF_TARGET_OSX   := (quote (:cl :common-lisp :dotcl :unix :macos :darwin :bsd :x86-64 :64-bit :little-endian))
+ASDF_TARGET_LINUX := (quote (:cl :common-lisp :dotcl :unix :linux :x86-64 :64-bit :little-endian :package-local-nicknames :unicode :thread-support))
+ASDF_TARGET_WIN   := (quote (:cl :common-lisp :dotcl :windows :win32 :x86-64 :64-bit :little-endian :package-local-nicknames :unicode :thread-support))
+ASDF_TARGET_OSX   := (quote (:cl :common-lisp :dotcl :unix :macos :darwin :bsd :x86-64 :64-bit :little-endian :package-local-nicknames :unicode :thread-support))
 
 $(DOTCL_ROOT)contrib/asdf/runtimes/linux/asdf.fasl: setup-asdf $(DOTCL_ROOT)compiler/cil-out.sil
 	mkdir -p $(DOTCL_ROOT)contrib/asdf/runtimes/linux
-	dotnet run --project $(DOTCL_ROOT)runtime -- --asm $(DOTCL_ROOT)compiler/cil-out.sil \
+	dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --asm $(DOTCL_ROOT)compiler/cil-out.sil \
 	  --eval '(compile-file "$(DOTCL_ROOT)contrib/asdf/asdf.lisp" :output-file "$(DOTCL_ROOT)contrib/asdf/runtimes/linux/asdf.fasl" :target-features $(ASDF_TARGET_LINUX))'
 
 $(DOTCL_ROOT)contrib/asdf/runtimes/win/asdf.fasl: setup-asdf $(DOTCL_ROOT)compiler/cil-out.sil
 	mkdir -p $(DOTCL_ROOT)contrib/asdf/runtimes/win
 	LOCALAPPDATA=/tmp/dotcl-cross-win APPDATA=/tmp/dotcl-cross-win \
-	dotnet run --project $(DOTCL_ROOT)runtime -- --asm $(DOTCL_ROOT)compiler/cil-out.sil \
+	dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --asm $(DOTCL_ROOT)compiler/cil-out.sil \
 	  --eval '(compile-file "$(DOTCL_ROOT)contrib/asdf/asdf.lisp" :output-file "$(DOTCL_ROOT)contrib/asdf/runtimes/win/asdf.fasl" :target-features $(ASDF_TARGET_WIN))'
 
 $(DOTCL_ROOT)contrib/asdf/runtimes/osx/asdf.fasl: setup-asdf $(DOTCL_ROOT)compiler/cil-out.sil
 	mkdir -p $(DOTCL_ROOT)contrib/asdf/runtimes/osx
-	dotnet run --project $(DOTCL_ROOT)runtime -- --asm $(DOTCL_ROOT)compiler/cil-out.sil \
+	dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --asm $(DOTCL_ROOT)compiler/cil-out.sil \
 	  --eval '(compile-file "$(DOTCL_ROOT)contrib/asdf/asdf.lisp" :output-file "$(DOTCL_ROOT)contrib/asdf/runtimes/osx/asdf.fasl" :target-features $(ASDF_TARGET_OSX))'
 
 compile-asdf-fasls: \
@@ -339,12 +339,15 @@ compile-asdf-fasls: \
 # CONTRIB_NAMES is auto-detected from contrib/*/ subdirs so that public
 # mirror builds (where externally-sourced contribs are excluded via
 # mirror-exclude) skip the missing dirs gracefully (dotcl/dotcl issue #2).
-CONTRIB_NAMES := $(filter-out asdf,$(notdir $(patsubst %/,%,$(wildcard $(DOTCL_ROOT)contrib/*/))))
+# atomics is a patched copy of an upstream library and is mirror-excluded;
+# it also depends on dotcl-thread being loaded, which the per-contrib
+# isolated compile-file does not provide. Skip it here too.
+CONTRIB_NAMES := $(filter-out asdf atomics,$(notdir $(patsubst %/,%,$(wildcard $(DOTCL_ROOT)contrib/*/))))
 
 CONTRIB_FASLS := $(foreach n,$(CONTRIB_NAMES),$(DOTCL_ROOT)contrib/$(n)/$(n).fasl)
 
 $(DOTCL_ROOT)contrib/%.fasl: $(DOTCL_ROOT)contrib/%.lisp $(DOTCL_ROOT)compiler/cil-out.sil
-	dotnet run --project $(DOTCL_ROOT)runtime -- --asm $(DOTCL_ROOT)compiler/cil-out.sil --eval '(compile-file "$<")'
+	dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --asm $(DOTCL_ROOT)compiler/cil-out.sil --eval '(compile-file "$<")'
 	@n=$$(echo '$*' | cut -d/ -f1); \
 	if [ -d "$(DOTCL_ROOT)runtime/contrib/$$n" ]; then \
 	  cp "$@" "$(DOTCL_ROOT)runtime/contrib/$$n/$$n.fasl"; \
@@ -356,8 +359,8 @@ compile-contrib-fasls: $(CONTRIB_FASLS)
 # dotcl:sil-to-fasl. The resulting .fasl loads in ~0.3s vs ~1.0s for .sil
 # because Reader parse (~1.1s) + CIL assemble (~170ms) are both skipped.
 # Ships in the pack as the default core. (D677)
-$(DOTCL_ROOT)compiler/dotcl.core: $(DOTCL_ROOT)compiler/cil-out.sil
-	dotnet run --project $(DOTCL_ROOT)runtime -- --asm $(DOTCL_ROOT)compiler/cil-out.sil --eval '(dotcl:sil-to-fasl "$(DOTCL_ROOT)compiler/cil-out.sil" "$(DOTCL_ROOT)compiler/dotcl.core")'
+$(DOTCL_ROOT)compiler/dotcl.core: $(DOTCL_ROOT)compiler/cil-out.sil $(DOTCL_ROOT)runtime/Generated/UnicodeCharNames.g.cs
+	dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --asm $(DOTCL_ROOT)compiler/cil-out.sil --eval '(dotcl:sil-to-fasl "$(DOTCL_ROOT)compiler/cil-out.sil" "$(DOTCL_ROOT)compiler/dotcl.core")'
 
 compile-core-fasl: $(DOTCL_ROOT)compiler/dotcl.core
 
@@ -477,6 +480,7 @@ pack: compile-asdf-fasl compile-asdf-fasls compile-core-fasl compile-contrib-fas
 	rm -f $(DOTCL_ROOT)runtime/contrib/dotcl-cs/*.csproj $(DOTCL_ROOT)runtime/contrib/dotcl-cs/*.cs
 	cp $(DOTCL_ROOT)contrib/asdf/asdf.fasl $(DOTCL_ROOT)runtime/contrib/asdf/asdf.fasl
 	dotnet pack $(DOTCL_ROOT)runtime/runtime.csproj --configuration Release -o $(DOTCL_ROOT)out/
+	dotnet pack $(DOTCL_ROOT)runtime/DotCL.Runtime.csproj --configuration Release -o $(DOTCL_ROOT)out/
 	rm -f $(DOTCL_ROOT)runtime/dotcl.core
 	@for rid in $(R2R_RIDS); do \
 		rm -f $(DOTCL_ROOT)runtime/dotcl-r2r-$$rid.core $(DOTCL_ROOT)runtime/asdf-r2r-$$rid.fasl; \

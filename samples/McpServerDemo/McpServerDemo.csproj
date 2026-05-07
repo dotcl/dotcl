@@ -18,7 +18,7 @@
 	<!-- dotcl runtime (Library) を参照。CoreCLR で Reflection.Emit ベースの
 	     コンパイラ/ランタイムがそのまま動く。 -->
 	<ItemGroup>
-		<ProjectReference Include="..\..\runtime\runtime.csproj" />
+		<ProjectReference Include="..\..\runtime\DotCL.Runtime.csproj" />
 	</ItemGroup>
 
 	<!-- Bundle dotcl.core next to the exe so DotclHost.FindCore() picks it

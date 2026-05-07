@@ -225,7 +225,10 @@ public class CilAssembler
     /// <summary>Register a function on a specific Symbol object (package-aware).</summary>
     public static void RegisterFunctionOnSymbol(Symbol sym, LispFunction fn)
     {
-        Runtime.CheckPackageLock(sym, "DEFUN");
+        // GenericFunctions may replace CL symbols (e.g. for gray-streams wrapping).
+        // The DEFGENERIC macro already warns when replacing a CL standard function.
+        if (fn is not GenericFunction)
+            Runtime.CheckPackageLock(sym, "DEFUN");
         sym.Function = fn;
     }
 
@@ -594,41 +597,19 @@ public class CilAssembler
             case "LOAD-SYM-KEYWORD":
             {
                 var kwName = GetString(Cadr(c));
-                if (_faslMode)
-                {
-                    _il.Emit(OpCodes.Ldstr, Track(kwName));
-                    _il.Emit(OpCodes.Call, _methodCache["Startup.Keyword"]);
-                    _il.Emit(OpCodes.Castclass, typeof(LispObject));
-                }
-                else
-                {
-                    var sym = Startup.Keyword(kwName);
-                    int idx = AddConstant(sym);
-                    _il.Emit(OpCodes.Ldc_I4, idx);
-                    _il.Emit(OpCodes.Call, _getConstant);
-                    _il.Emit(OpCodes.Castclass, typeof(LispObject));
-                }
+                _il.Emit(OpCodes.Ldstr, _faslMode ? Track(kwName) : kwName);
+                _il.Emit(OpCodes.Call, _methodCache["Startup.Keyword"]);
+                _il.Emit(OpCodes.Castclass, typeof(LispObject));
                 break;
             }
             case "LOAD-SYM-PKG":
             {
                 var spName = GetString(Cadr(c));
                 var spPkg = GetString(Caddr(c));
-                if (_faslMode)
-                {
-                    _il.Emit(OpCodes.Ldstr, Track(spName));
-                    _il.Emit(OpCodes.Ldstr, Track(spPkg));
-                    _il.Emit(OpCodes.Call, _methodCache["Startup.SymInPkg"]);
-                    _il.Emit(OpCodes.Castclass, typeof(LispObject));
-                }
-                else
-                {
-                    var sym = Startup.SymInPkg(spName, spPkg);
-                    int idx = AddConstant(sym);
-                    _il.Emit(OpCodes.Ldc_I4, idx);
-                    _il.Emit(OpCodes.Call, _getConstant);
-                    _il.Emit(OpCodes.Castclass, typeof(LispObject));
-                }
+                _il.Emit(OpCodes.Ldstr, _faslMode ? Track(spName) : spName);
+                _il.Emit(OpCodes.Ldstr, _faslMode ? Track(spPkg) : spPkg);
+                _il.Emit(OpCodes.Call, _methodCache["Startup.SymInPkg"]);
+                _il.Emit(OpCodes.Castclass, typeof(LispObject));
                 break;
             }
             case "LOAD-ENV":
@@ -797,10 +778,11 @@ public class CilAssembler
         int fnIdx = AddConstant(fn);
         if (pkgSym != null)
         {
-            // Symbol-based runtime re-registration (package-aware)
-            int symIdx = AddConstant(pkgSym);
-            _il.Emit(OpCodes.Ldc_I4, symIdx);
-            _il.Emit(OpCodes.Call, _getConstant);
+            // Symbol-based runtime re-registration (package-aware).
+            // Look up symbol by name+package inline to avoid accumulating symbols in _constants.
+            _il.Emit(OpCodes.Ldstr, pkgSym.Name);
+            _il.Emit(OpCodes.Ldstr, pkgSym.HomePackage?.Name ?? defPkg ?? "");
+            _il.Emit(OpCodes.Call, _methodCache["Startup.SymInPkg"]);
             _il.Emit(OpCodes.Castclass, typeof(Symbol));
             _il.Emit(OpCodes.Ldc_I4, fnIdx);
             _il.Emit(OpCodes.Call, _getConstant);
@@ -810,9 +792,9 @@ public class CilAssembler
         if (setfTargetSym != null)
         {
             // Setf function runtime re-registration via sym.SetfFunction (#58 Phase 1)
-            int setfSymIdx = AddConstant(setfTargetSym);
-            _il.Emit(OpCodes.Ldc_I4, setfSymIdx);
-            _il.Emit(OpCodes.Call, _getConstant);
+            _il.Emit(OpCodes.Ldstr, setfTargetSym.Name);
+            _il.Emit(OpCodes.Ldstr, setfTargetSym.HomePackage?.Name ?? defPkg ?? "");
+            _il.Emit(OpCodes.Call, _methodCache["Startup.SymInPkg"]);
             _il.Emit(OpCodes.Castclass, typeof(Symbol));
             _il.Emit(OpCodes.Ldc_I4, fnIdx);
             _il.Emit(OpCodes.Call, _getConstant);
@@ -1328,9 +1310,9 @@ public class CilAssembler
         int fnIdx = AddConstant(fn);
         if (pkgSym != null)
         {
-            int symIdx = AddConstant(pkgSym);
-            _il.Emit(OpCodes.Ldc_I4, symIdx);
-            _il.Emit(OpCodes.Call, _getConstant);
+            _il.Emit(OpCodes.Ldstr, pkgSym.Name);
+            _il.Emit(OpCodes.Ldstr, pkgSym.HomePackage?.Name ?? defPkg ?? "");
+            _il.Emit(OpCodes.Call, _methodCache["Startup.SymInPkg"]);
             _il.Emit(OpCodes.Castclass, typeof(Symbol));
             _il.Emit(OpCodes.Ldc_I4, fnIdx);
             _il.Emit(OpCodes.Call, _getConstant);
@@ -1339,10 +1321,9 @@ public class CilAssembler
         }
         if (setfTargetSym != null)
         {
-            // Setf function runtime re-registration via sym.SetfFunction (#58 Phase 1)
-            int setfSymIdx = AddConstant(setfTargetSym);
-            _il.Emit(OpCodes.Ldc_I4, setfSymIdx);
-            _il.Emit(OpCodes.Call, _getConstant);
+            _il.Emit(OpCodes.Ldstr, setfTargetSym.Name);
+            _il.Emit(OpCodes.Ldstr, setfTargetSym.HomePackage?.Name ?? defPkg ?? "");
+            _il.Emit(OpCodes.Call, _methodCache["Startup.SymInPkg"]);
             _il.Emit(OpCodes.Castclass, typeof(Symbol));
             _il.Emit(OpCodes.Ldc_I4, fnIdx);
             _il.Emit(OpCodes.Call, _getConstant);
@@ -1503,9 +1484,9 @@ public class CilAssembler
         int fnIdx = AddConstant(fn);
         if (pkgSym != null)
         {
-            int symIdx = AddConstant(pkgSym);
-            _il.Emit(OpCodes.Ldc_I4, symIdx);
-            _il.Emit(OpCodes.Call, _getConstant);
+            _il.Emit(OpCodes.Ldstr, pkgSym.Name);
+            _il.Emit(OpCodes.Ldstr, pkgSym.HomePackage?.Name ?? defPkg ?? "");
+            _il.Emit(OpCodes.Call, _methodCache["Startup.SymInPkg"]);
             _il.Emit(OpCodes.Castclass, typeof(Symbol));
             _il.Emit(OpCodes.Ldc_I4, fnIdx);
             _il.Emit(OpCodes.Call, _getConstant);
@@ -1514,9 +1495,9 @@ public class CilAssembler
         }
         if (setfTargetSym != null)
         {
-            int setfSymIdx = AddConstant(setfTargetSym);
-            _il.Emit(OpCodes.Ldc_I4, setfSymIdx);
-            _il.Emit(OpCodes.Call, _getConstant);
+            _il.Emit(OpCodes.Ldstr, setfTargetSym.Name);
+            _il.Emit(OpCodes.Ldstr, setfTargetSym.HomePackage?.Name ?? defPkg ?? "");
+            _il.Emit(OpCodes.Call, _methodCache["Startup.SymInPkg"]);
             _il.Emit(OpCodes.Castclass, typeof(Symbol));
             _il.Emit(OpCodes.Ldc_I4, fnIdx);
             _il.Emit(OpCodes.Call, _getConstant);
@@ -2132,6 +2113,20 @@ public class CilAssembler
                 }
                 break;
             }
+            case LispInstance li:
+            {
+                if (_faslMode && _faslTypeBuilder != null)
+                    EmitFaslInstanceInline(li);
+                else
+                {
+                    // Non-fasl mode: constant pool is fine (same process)
+                    int idxLi = AddConstant(val);
+                    _il.Emit(OpCodes.Ldc_I4, idxLi);
+                    _il.Emit(OpCodes.Call, _getConstant);
+                    _il.Emit(OpCodes.Castclass, typeof(LispObject));
+                }
+                break;
+            }
             default:
                 // Fallback: use constant pool (won't work across processes, but
                 // allows compilation to proceed for unsupported constant types)
@@ -2145,6 +2140,28 @@ public class CilAssembler
         }
         }
         finally { _inlineDepth--; }
+    }
+
+    private void EmitFaslInstanceInline(LispInstance li)
+    {
+        // Emit: Runtime.MakeFaslInstance(pkgName, symName, new LispObject[] { slot0, slot1, ... })
+        string pkgName = li.Class.Name.HomePackage?.Name ?? "COMMON-LISP";
+        string symName = li.Class.Name.Name;
+        _il.Emit(OpCodes.Ldstr, pkgName);
+        _il.Emit(OpCodes.Ldstr, symName);
+        int slotCount = li.Slots.Length;
+        _il.Emit(OpCodes.Ldc_I4, slotCount);
+        _il.Emit(OpCodes.Newarr, typeof(LispObject));
+        for (int i = 0; i < slotCount; i++)
+        {
+            _il.Emit(OpCodes.Dup);
+            _il.Emit(OpCodes.Ldc_I4, i);
+            var slotVal = li.Slots[i] ?? Nil.Instance;
+            EmitLoadConstInline(slotVal);
+            _il.Emit(OpCodes.Stelem_Ref);
+        }
+        _il.Emit(OpCodes.Call, _makeFaslInstance);
+        _il.Emit(OpCodes.Castclass, typeof(LispObject));
     }
 
     /// <summary>
@@ -2393,6 +2410,7 @@ public class CilAssembler
     private static readonly Dictionary<string, ConstructorInfo> _ctorCache;
     private static readonly Dictionary<string, Type> _typeCache;
     private static readonly MethodInfo _getConstant;
+    private static readonly MethodInfo _makeFaslInstance;
     private static readonly MethodInfo _makeClosure;
     private static readonly MethodInfo _registerFunction;
     private static readonly MethodInfo _registerFunctionOnSymbol;
@@ -2747,6 +2765,8 @@ public class CilAssembler
             ["Runtime.ComputeRestartsN"] = typeof(Runtime).GetMethod("ComputeRestartsN")!,
 
             // CLOS operations
+            ["Runtime.MakeFaslInstance"] = typeof(Runtime).GetMethod("MakeFaslInstance",
+                new[] { typeof(string), typeof(string), typeof(LispObject[]) })!,
             ["Runtime.FindClass"] = typeof(Runtime).GetMethod("FindClass")!,
             ["Runtime.FindClassOrNil"] = typeof(Runtime).GetMethod("FindClassOrNil")!,
             ["Runtime.RegisterClass"] = typeof(Runtime).GetMethod("RegisterClass")!,
@@ -3014,6 +3034,8 @@ public class CilAssembler
         };
 
         _getConstant = typeof(CilAssembler).GetMethod("GetConstant")!;
+        _makeFaslInstance = typeof(Runtime).GetMethod("MakeFaslInstance",
+            new[] { typeof(string), typeof(string), typeof(LispObject[]) })!;
         _makeClosure = typeof(CilAssembler).GetMethod("MakeClosure")!;
         _registerFunction = typeof(CilAssembler).GetMethod("RegisterFunction")!;
         _registerFunctionOnSymbol = typeof(CilAssembler).GetMethod("RegisterFunctionOnSymbol")!;
