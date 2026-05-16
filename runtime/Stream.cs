@@ -222,6 +222,11 @@ public class LispStringInputStream : LispInputStream
         StartOffset = startOffset;
         TrackingReader = (PositionTrackingReader)Reader;
     }
+    public LispStringInputStream(PositionTrackingReader trackingReader, int startOffset = 0) : base(trackingReader)
+    {
+        StartOffset = startOffset;
+        TrackingReader = trackingReader;
+    }
 
     /// <summary>Current position in the original string.</summary>
     public int Position => StartOffset + (TrackingReader?.Position ?? 0);

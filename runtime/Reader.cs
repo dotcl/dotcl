@@ -66,6 +66,7 @@ public class Reader
     private string _inputPrefix = "";
     private int _inputPrefixPos = 0;
     private bool _readSuppress;
+    public bool ReadSuppress { get => _readSuppress; set => _readSuppress = value; }
     private int _line = 1;
     private Dictionary<int, LispObject> _shareLabels = new();
     private Dictionary<int, SharePlaceholder> _sharePlaceholders = new();
@@ -1396,11 +1397,16 @@ public class Reader
         if (shouldInclude)
             return Read();
 
-        // Feature not matched — read in suppressed mode (tolerates unknown packages)
+        // Feature not matched — read in suppressed mode (tolerates unknown packages).
+        // Must bind the Lisp *READ-SUPPRESS* dynamic variable in addition to the C# field,
+        // so that Lisp reader macros (e.g. Coalton's readtable open-paren handler) also see
+        // suppression and skip eclector-based parsing of the excluded form.
         var saved = _readSuppress;
         _readSuppress = true;
+        var rsSym = Startup.Sym("*READ-SUPPRESS*");
+        DynamicBindings.Push(rsSym, T.Instance);
         try { Read(); }
-        finally { _readSuppress = saved; }
+        finally { _readSuppress = saved; DynamicBindings.Pop(rsSym); }
         return null;
     }
 

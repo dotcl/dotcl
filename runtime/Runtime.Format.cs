@@ -39,11 +39,14 @@ public static partial class Runtime
             }
         }
 
-        var formatString = args[0] switch
-        {
-            LispString s => s.Value,
-            _ => throw new LispErrorException(new LispTypeError("FORMAT: format string must be a string", args[0]))
-        };
+        // Format control must be a string (LispString or character vector per CLHS)
+        string formatString;
+        if (args[0] is LispString ls0)
+            formatString = ls0.Value;
+        else if (args[0] is LispVector lv0 && lv0.IsCharVector)
+            formatString = lv0.ToCharString();
+        else
+            throw new LispErrorException(new LispTypeError("FORMAT: format string must be a string", args[0]));
 
         var formatArgs2 = new LispObject[args.Length - 1];
         Array.Copy(args, 1, formatArgs2, 0, formatArgs2.Length);

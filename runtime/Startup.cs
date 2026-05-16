@@ -957,7 +957,7 @@ public static class Startup
             _symInPkgCache[key] = newSym;
             return newSym;
         }
-        // Fallback to CL
+        // Fallback to CL — package doesn't exist yet
         return Sym(name);
     }
 
@@ -1232,17 +1232,17 @@ public static class Startup
             new LispFunction(Runtime.Describe, "DESCRIBE", -1));
         Emitter.CilAssembler.RegisterFunction("ROOM",
             new LispFunction(Runtime.Room, "ROOM", -1));
-        // SB-EXT:GC — trigger .NET GC (useful to reduce memory during SBCL XC build)
+        // DOTCL:GC — trigger .NET GC
         {
             var gcFn = new LispFunction(_ => {
                 GC.Collect(2, GCCollectionMode.Aggressive, true, true);
                 GC.WaitForPendingFinalizers();
                 GC.Collect(2, GCCollectionMode.Aggressive, true, true);
                 return Nil.Instance;
-            }, "SB-EXT:GC", -1);
-            var gcSym = SymInPkg("GC", "SB-EXT");
+            }, "DOTCL:GC", -1);
+            var gcSym = SymInPkg("GC", "DOTCL");
             gcSym.Function = gcFn;
-            Emitter.CilAssembler.RegisterFunction("SB-EXT:GC", gcFn);
+            Emitter.CilAssembler.RegisterFunction("DOTCL:GC", gcFn);
         }
         // RUN-WITH-TIMEOUT: (run-with-timeout seconds thunk) — run THUNK with per-stem timeout
         // If THUNK does not complete within SECONDS, throws a Lisp error and moves on.

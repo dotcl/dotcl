@@ -158,6 +158,18 @@
 (defvar *struct-info* (make-hash-table :test #'eq)
   "Table of struct metadata: symbol → plist (:slots :parent :conc-prefix)")
 
+(defun %register-struct-info (name parent conc-prefix base-offset slots)
+  "Re-register struct info at load time (called from eval-when in defstruct expansion)."
+  (setf (gethash name *struct-info*)
+        (list :slots slots
+              :parent parent
+              :conc-prefix conc-prefix
+              :type-option nil
+              :named-p nil
+              :initial-offset 0
+              :base-offset base-offset
+              :ctor-layout nil)))
+
 (defvar *struct-accessors* (make-hash-table :test #'eq)
   "Maps accessor symbol to slot index (integer) for compile-time inlining.
    Only populated for standard (non-typed) structs.")
@@ -1936,7 +1948,14 @@
              ;; compile-file macro expansions (e.g. coalton's (assert (subtypep type 'node))).
              ,@(unless type-option
                  `((eval-when (:compile-toplevel :load-toplevel :execute)
-                     (%register-struct-class ',name ',(or include-name nil) ,@(mapcar (lambda (s) `',(car s)) all-slots)))))
+                     (%register-struct-class ',name ',(or include-name nil) ,@(mapcar (lambda (s) `',(car s)) all-slots))
+                     ;; Re-register *struct-info* at load time so that (:include name) works
+                     ;; even when this file is loaded from FASL without recompilation.
+                     ;; Full slot info is preserved (including default forms) so child constructors
+                     ;; inherit correct defaults.
+                     (dotcl.cil-compiler::%register-struct-info
+                       ',name ',(or include-name nil) ',conc-prefix ',base-offset
+                       ',(mapcar #'copy-list all-slots)))))
              ;; Constructors
              ,@(let ((ctor-forms nil))
                  (dolist (spec constructor-specs)
@@ -2563,10 +2582,16 @@
                       (error 'program-error :format-control "DEFGENERIC ~S: duplicate in :argument-precedence-order: ~S"
                              :format-arguments (list name p)))
                     (push p seen)))
-                ;; Check completeness: must mention all required params
-                (unless (= (length apo-params) (length plain-params))
-                  (error 'program-error :format-control "DEFGENERIC ~S: :argument-precedence-order must list all required parameters"
-                         :format-arguments (list name))))))
+                ;; Check that all listed params are required params
+                (dolist (p apo-params)
+                  (unless (member p plain-params)
+                    (error 'program-error :format-control "DEFGENERIC ~S: :argument-precedence-order names ~S which is not a required parameter"
+                           :format-arguments (list name p))))
+                ;; CLHS 7.1.4: :argument-precedence-order must be a permutation of ALL required params
+                (dolist (p plain-params)
+                  (unless (member p apo-params)
+                    (error 'program-error :format-control "DEFGENERIC ~S: :argument-precedence-order is missing required parameter ~S"
+                           :format-arguments (list name p)))))))
           ;; Check lambda list congruency for inline :method forms (CLHS 7.6.4)
           (dolist (mopt method-opts)
             (let ((mparams (if (and (cdr mopt) (symbolp (cadr mopt)) (not (listp (cadr mopt))) (listp (caddr mopt)))

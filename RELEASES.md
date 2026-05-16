@@ -3,6 +3,71 @@
 User-facing release notes for dotcl. Each section corresponds to a tagged
 release on the public mirror (dotcl/dotcl).
 
+## v0.1.7 — 2026-05-16
+
+### ANSI test suite: 21927/21929 pass (99.99%)
+
+Updated to the latest ansi-test submodule (21791 → 21929 tests). Four
+conformance fixes were applied:
+
+- **`make-load-form-saving-slots`**: now returns CLHS 3.2.4.2-compliant
+  creation + init forms. Unknown keyword arguments now signal `program-error`
+  (previously ignored via `&allow-other-keys`).
+- **`PROBE-FILE` with logical pathnames**: fixed translation during test
+  sandbox execution (test infrastructure fix).
+- **`DEFGENERIC :argument-precedence-order`**: the check now verifies that
+  *all* required parameters appear in the list, not just that listed
+  parameters are required parameters.
+- **`DEFMETHOD` optional parameter count**: now requires an exact match with
+  the generic function (was only rejecting the method-has-more case).
+
+Known failures: `FORMAT.E.26` (subnormal double rounding, flaky) and
+`DEFGENERIC.ERROR.1` (SBCL-compatibility warn instead of error, intentional).
+
+### New: `dotcl-repl` — terminal readline contrib
+
+`contrib/dotcl-repl` provides a line-editing REPL with history and basic
+readline-style key bindings on all platforms. Load with `(require "dotcl-repl")`.
+
+### New: `cerror` starts the interactive debugger
+
+`cerror` now invokes the debugger with an active `CONTINUE` restart rather
+than immediately continuing. Matches the CLHS specification.
+
+### New: `DOTCL:GC`
+
+`(dotcl:gc)` forces a .NET garbage collection. Useful for memory-sensitive
+applications and testing.
+
+### Bug fixes
+
+- **CLOS**: cross-package `compute-class-precedence-list` bug fixed (classes
+  defined in a different package than their superclasses could fail to inherit
+  correctly).
+- **CLOS**: `default-initarg` thunk results are now correctly unwrapped from
+  `MvReturn` wrappers.
+- **Compiler**: `let` bindings now correctly shadow symbol-macro bindings in
+  the same scope.
+- **Compiler**: builtin function lookup is now restricted to the `CL` package,
+  preventing accidental shadowing by user-defined functions with CL-like names.
+- **Compiler**: free-variable analysis now correctly walks `cond` test
+  expressions (closures capturing variables used only in `cond` conditions
+  were broken).
+- **Compiler**: `load-time-value` slot IDs are now namespaced per compiled
+  module, preventing collisions when multiple FASLs are loaded.
+- **Compiler**: mutation detection for `setf` with compound place expressions
+  now correctly marks the variable as mutated (fixes missing boxing).
+- **Runtime**: `FORMAT` now accepts character vectors (`char-vector`) as
+  format control strings.
+- **Runtime**: `(and integer ...)` compound type intersection is now
+  normalized to a numeric range for `subtypep`.
+- **Runtime**: `*READ-SUPPRESS*` is now also bound as a Lisp dynamic variable
+  during `#-`/`#+` feature conditional exclusion.
+- **Runtime**: `defstruct` now re-registers `*struct-info*` at FASL load
+  time, fixing cross-module struct accessor calls after `load`.
+- **Runtime**: `make-load-form` protocol is now applied when serializing
+  `LispInstance` objects to FASL.
+
 ## v0.1.6 — 2026-05-07
 
 ### New: `DotCL.Runtime` embeddable library NuGet package

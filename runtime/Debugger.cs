@@ -21,26 +21,6 @@ public static class Debugger
         var restarts = CollectRestarts(condition);
         PrintRestarts(restarts);
 
-        // Show abbreviated backtrace
-        try
-        {
-            var trace = Environment.StackTrace;
-            Console.Error.WriteLine("; Backtrace (use :bt to re-display):");
-            var lines = trace.Split('\n');
-            int shown = 0;
-            foreach (var line in lines)
-            {
-                var trimmed = line.Trim();
-                if (trimmed.StartsWith("at DotCL.") && shown < 10)
-                {
-                    Console.Error.WriteLine($";   {trimmed}");
-                    shown++;
-                }
-            }
-            Console.Error.WriteLine(";");
-        }
-        catch { }
-
         int level = _nestLevel;
         _nestLevel++;
         try
@@ -180,14 +160,14 @@ public static class Debugger
 
     private static void PrintBacktrace()
     {
-        var trace = Environment.StackTrace;
-        var lines = trace.Split('\n');
-        foreach (var line in lines)
+        var frames = LispFunction.GetCallStack();
+        if (frames.Length == 0)
         {
-            var trimmed = line.Trim();
-            if (trimmed.StartsWith("at DotCL."))
-                Console.Error.WriteLine($";   {trimmed}");
+            Console.Error.WriteLine("; (no Lisp frames)");
+            return;
         }
+        foreach (var frame in frames)
+            Console.Error.WriteLine($";   {frame}");
     }
 
     private static void PrintHelp()
@@ -208,9 +188,7 @@ public static class Debugger
         for (int i = 0; i < restarts.Count; i++)
         {
             var r = restarts[i];
-            var desc = r.ToString();
-            if (desc.StartsWith("#<RESTART"))
-                desc = r.Name;
+            var desc = r.Description ?? r.Name;
             Console.Error.WriteLine($";   {i}: [{r.Name}] {desc}");
         }
         Console.Error.WriteLine(";");

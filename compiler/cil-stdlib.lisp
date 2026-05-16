@@ -1236,6 +1236,36 @@ Also expands element types within compound type specifiers like (VECTOR etype si
           (setf (fdefinition name) gf)
           gf))))
 
+;;; --- CLHS 3.2.4.2: make-load-form protocol ---
+
+(defgeneric make-load-form (object &optional environment))
+
+(defun make-load-form-saving-slots (object &key slot-names environment allow-other-keys)
+  (declare (ignore environment allow-other-keys))
+  (let* ((class (class-of object))
+         (all-slots (class-slots class))
+         (slots (if slot-names
+                    (remove-if-not (lambda (sd)
+                                     (member (slot-definition-name sd) slot-names))
+                                   all-slots)
+                    all-slots))
+         (bound-slots (remove-if-not (lambda (sd)
+                                       (slot-boundp object (slot-definition-name sd)))
+                                     slots))
+         (new-var (gensym "NEW")))
+    ;; Return a single combined creation form with nil init form (CLHS-compliant).
+    ;; Using allocate-instance + slot-value setf in one let form avoids the need
+    ;; for the FASL emitter to handle a separate init form for struct objects.
+    (values
+     `(let ((,new-var (allocate-instance (find-class ',(class-name class)))))
+        ,@(mapcar (lambda (sd)
+                    (let ((name (slot-definition-name sd)))
+                      `(setf (slot-value ,new-var ',name)
+                             ',(slot-value object name))))
+                  bound-slots)
+        ,new-var)
+     nil)))
+
 ;;; --- MOP: allow AMOP initargs for standard-generic-function and standard-method ---
 ;;; Per AMOP, make-instance 'standard-generic-function and 'standard-method accept
 ;;; these keyword args. The :before methods accept &allow-other-keys so that

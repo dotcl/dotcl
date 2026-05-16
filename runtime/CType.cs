@@ -772,16 +772,75 @@ public static class CTypeOps
 
     private static (bool, bool) SubtypepIntersection1(IntersectionType inter1, CType ct2)
     {
-        // (AND a b c) <: ct2 iff ANY member <: ct2 (conservative)
+        // (AND a b c) <: ct2: sufficient if ANY member <: ct2
         foreach (var member in inter1.Types)
         {
             var (sub, _) = Subtypep(member, ct2);
             if (sub) return (true, true);
         }
-        // Check if intersection is empty: (AND X (NOT X)) = NIL, which is subtype of everything
+        // Check if intersection is empty
         if (IsEmptyIntersection(inter1))
             return (true, true);
+        // Try reducing the intersection to a single numeric range.
+        // e.g., (AND FIXNUM UNSIGNED-BYTE) → (INTEGER 0 most-positive-fixnum)
+        var reduced = ReduceIntersectionToNumeric(inter1);
+        if (reduced != null)
+        {
+            var (sub2, cert2) = Subtypep(reduced, ct2);
+            if (cert2) return (sub2, true);
+        }
         return (false, false);
+    }
+
+    /// <summary>
+    /// Try to reduce all members of an IntersectionType to a single INTEGER range.
+    /// Returns null if any member cannot be expressed as an integer range.
+    /// </summary>
+    private static NumericType? ReduceIntersectionToNumeric(IntersectionType inter)
+    {
+        LispObject? low = null; bool lowExcl = false;
+        LispObject? high = null; bool highExcl = false;
+
+        foreach (var member in inter.Types)
+        {
+            NumericType? num = member is NumericType n ? n
+                             : member is NamedType named ? NamedToNumericType(named.Name)
+                             : null;
+            if (num == null || num.NumClass != "INTEGER") return null;
+
+            // Intersect lower bounds: take the maximum
+            if (num.Low != null)
+            {
+                if (low == null)
+                {
+                    low = num.Low; lowExcl = num.LowExclusiveP;
+                }
+                else
+                {
+                    int cmp = CompareBounds(num.Low, low);
+                    if (cmp == int.MinValue) return null;
+                    if (cmp > 0) { low = num.Low; lowExcl = num.LowExclusiveP; }
+                    else if (cmp == 0 && num.LowExclusiveP) lowExcl = true;
+                }
+            }
+
+            // Intersect upper bounds: take the minimum
+            if (num.High != null)
+            {
+                if (high == null)
+                {
+                    high = num.High; highExcl = num.HighExclusiveP;
+                }
+                else
+                {
+                    int cmp = CompareBounds(num.High, high);
+                    if (cmp == int.MinValue) return null;
+                    if (cmp < 0) { high = num.High; highExcl = num.HighExclusiveP; }
+                    else if (cmp == 0 && num.HighExclusiveP) highExcl = true;
+                }
+            }
+        }
+        return new NumericType("INTEGER", low, lowExcl, high, highExcl);
     }
 
     /// <summary>

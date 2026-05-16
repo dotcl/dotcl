@@ -164,14 +164,3 @@ jobs:
             out/*.tar.bz2
           generate_release_notes: true
 
-      # ── Publish to NuGet.org ─────────────────────────────────────────────
-      # Requires NUGET_API_KEY repository secret.
-      # --skip-duplicate makes the step idempotent if a re-run happens.
-      - name: Publish to NuGet.org
-        if: github.event_name == 'push'
-        run: |
-          dotnet nuget push out/*.nupkg \
-            --api-key ${{ secrets.NUGET_API_KEY }} \
-            --source https://api.nuget.org/v3/index.json \
-            --skip-duplicate \
-            --timeout 900

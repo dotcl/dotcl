@@ -1,0 +1,42 @@
+name: Publish to NuGet.org
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to publish (e.g. 0.1.6)'
+        required: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  nuget-push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Download nupkg from GitHub Release
+        run: |
+          gh release download "v${{ inputs.version }}" \
+            --repo ${{ github.repository }} \
+            --pattern "*.nupkg" \
+            --dir out/
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: List packages to push
+        run: ls -lh out/*.nupkg
+
+      - name: Publish to NuGet.org
+        run: |
+          dotnet nuget push out/*.nupkg \
+            --api-key ${{ secrets.NUGET_API_KEY }} \
+            --source https://api.nuget.org/v3/index.json \
+            --skip-duplicate \
+            --timeout 900

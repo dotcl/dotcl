@@ -122,13 +122,6 @@ Each sample's `README.md` walks through the boot pattern.
 Architectural detail and design history are in
 [`DESIGN.md`](DESIGN.md).
 
-## Platform notes
-
-- **Windows**: see [`docs/windows.md`](docs/windows.md) for
-  installation, encoding (UTF-8 stdin/stdout always), pathname
-  conventions, and Windows-side .NET interop (Registry / WMI / WinForms
-  / MAUI / COM).
-
 ## License
 
 MIT. See [`LICENSE`](LICENSE).

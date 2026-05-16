@@ -364,9 +364,37 @@
                                             (not (member mangled bnd :test #'string=))
                                             (not (gethash mangled free-ht)))
                                    (setf (gethash mangled free-ht) t))))
-                             ;; Generic: push all sub-expressions
-                             (do-list-safe (sub e)
-                               (push (cons sub (cons bnd mdepth)) worklist)))))))))))))))))
+                             ;; Generic walk. The car is in function position only when
+                             ;; it is a SYMBOL (function name) or a (setf sym) / (lambda ...)
+                             ;; compound form. Symbols in function position must NOT be pushed
+                             ;; as variable references — doing so would loop on symbol-macros
+                             ;; from with-accessors (e.g. (disabled-commands #:OBJ) →
+                             ;; push disabled-commands symbol → expand to (disabled-commands
+                             ;; #:OBJ) → repeat). Lambda-car means immediate application —
+                             ;; scan it. (setf sym) is a compound function name — skip it.
+                             ;; Any OTHER cons in car position means the form is NOT a function
+                             ;; call (e.g. a cond clause ((test-form ...) result)), so we push
+                             ;; all sub-expressions including the car.
+                             (let ((car-e (car e)))
+                               (cond
+                                 ((symbolp car-e)
+                                  ;; Symbol car: function name. Push args only.
+                                  (do-list-safe (sub (cdr e))
+                                    (push (cons sub (cons bnd mdepth)) worklist)))
+                                 ((and (consp car-e) (eq (car car-e) 'lambda))
+                                  ;; Immediate application: scan lambda and args.
+                                  (push (cons car-e (cons bnd mdepth)) worklist)
+                                  (do-list-safe (sub (cdr e))
+                                    (push (cons sub (cons bnd mdepth)) worklist)))
+                                 ((and (consp car-e) (eq (car car-e) 'setf))
+                                  ;; Compound function name: push args only.
+                                  (do-list-safe (sub (cdr e))
+                                    (push (cons sub (cons bnd mdepth)) worklist)))
+                                 (t
+                                  ;; Non-function-call form (e.g. cond clause, case clause):
+                                  ;; push all sub-expressions including the car.
+                                  (do-list-safe (sub e)
+                                    (push (cons sub (cons bnd mdepth)) worklist))))))))))))))))))))
 
 ;;; ============================================================
 ;;; Mutated/captured variable analysis (for boxing)
@@ -417,6 +445,21 @@
                               ((and (consp var) (eq (car var) 'the) (symbolp (caddr var)))
                                (setf (gethash (symbol-name (caddr var)) result-ht) t))
                               ((consp var)
+                               ;; Complex place (e.g. (getf p key)): macro-expand the
+                               ;; setf form so the generated (setq p ...) is detected.
+                               ;; Without this, variables mutated via compound accessors
+                               ;; aren't recognized as mutated and skip boxing.
+                               (when (and (or (eq head 'setf) (eq head 'psetf))
+                                          (< mdepth *macro-expand-depth-limit*)
+                                          (%stack-space-available-p)
+                                          (find-macro-expander head))
+                                 (let* ((single-form `(,head ,var ,val))
+                                        (expander (find-macro-expander head))
+                                        (expanded (handler-case
+                                                      (cached-macroexpand single-form expander)
+                                                    (error () nil))))
+                                   (when expanded
+                                     (push (cons expanded (1+ mdepth)) worklist))))
                                (push (cons var mdepth) worklist)))
                             (when val (push (cons val mdepth) worklist))))
                   ((and (symbolp head) (string= (symbol-name head) "MULTIPLE-VALUE-SETQ"))

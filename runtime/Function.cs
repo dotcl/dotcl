@@ -54,6 +54,11 @@ public class LispFunction : LispObject
         DotCL.Diagnostics.AllocCounter.Inc("LispFunction+Closure");
     }
 
+    // Lisp-level call stack for debugger backtrace
+    [ThreadStatic] private static Stack<string>? s_callStack;
+    internal static string[] GetCallStack() =>
+        s_callStack is { Count: > 0 } s ? s.ToArray() : Array.Empty<string>();
+
     // Backward compat: existing Generated.cs uses Invoke(params)
     // Includes stack overflow guard for C#-implemented functions that can recurse via Lisp dispatch
     [ThreadStatic] private static int _stackCheckCounter;
@@ -85,31 +90,66 @@ public class LispFunction : LispObject
     }
 
     public LispObject Invoke0()
-        => _func0 != null ? _func0() : InvokeSlow(Array.Empty<LispObject>());
+    {
+        if (_func0 != null) return Track(_func0);
+        return InvokeSlow(Array.Empty<LispObject>());
+    }
 
     public LispObject Invoke1(LispObject a)
-        => _func1 != null ? _func1(a) : InvokeSlow(new[] { a });
+    {
+        if (_func1 != null) return Track(() => _func1(a));
+        return InvokeSlow(new[] { a });
+    }
 
     public LispObject Invoke2(LispObject a, LispObject b)
-        => _func2 != null ? _func2(a, b) : InvokeSlow(new[] { a, b });
+    {
+        if (_func2 != null) return Track(() => _func2(a, b));
+        return InvokeSlow(new[] { a, b });
+    }
 
     public LispObject Invoke3(LispObject a, LispObject b, LispObject c)
-        => _func3 != null ? _func3(a, b, c) : InvokeSlow(new[] { a, b, c });
+    {
+        if (_func3 != null) return Track(() => _func3(a, b, c));
+        return InvokeSlow(new[] { a, b, c });
+    }
 
     public LispObject Invoke4(LispObject a, LispObject b, LispObject c, LispObject d)
-        => _func4 != null ? _func4(a, b, c, d) : InvokeSlow(new[] { a, b, c, d });
+    {
+        if (_func4 != null) return Track(() => _func4(a, b, c, d));
+        return InvokeSlow(new[] { a, b, c, d });
+    }
 
     public LispObject Invoke5(LispObject a, LispObject b, LispObject c, LispObject d, LispObject e)
-        => _func5 != null ? _func5(a, b, c, d, e) : InvokeSlow(new[] { a, b, c, d, e });
+    {
+        if (_func5 != null) return Track(() => _func5(a, b, c, d, e));
+        return InvokeSlow(new[] { a, b, c, d, e });
+    }
 
     public LispObject Invoke6(LispObject a, LispObject b, LispObject c, LispObject d, LispObject e, LispObject f)
-        => _func6 != null ? _func6(a, b, c, d, e, f) : InvokeSlow(new[] { a, b, c, d, e, f });
+    {
+        if (_func6 != null) return Track(() => _func6(a, b, c, d, e, f));
+        return InvokeSlow(new[] { a, b, c, d, e, f });
+    }
 
     public LispObject Invoke7(LispObject a, LispObject b, LispObject c, LispObject d, LispObject e, LispObject f, LispObject g)
-        => _func7 != null ? _func7(a, b, c, d, e, f, g) : InvokeSlow(new[] { a, b, c, d, e, f, g });
+    {
+        if (_func7 != null) return Track(() => _func7(a, b, c, d, e, f, g));
+        return InvokeSlow(new[] { a, b, c, d, e, f, g });
+    }
 
     public LispObject Invoke8(LispObject a, LispObject b, LispObject c, LispObject d, LispObject e, LispObject f, LispObject g, LispObject h)
-        => _func8 != null ? _func8(a, b, c, d, e, f, g, h) : InvokeSlow(new[] { a, b, c, d, e, f, g, h });
+    {
+        if (_func8 != null) return Track(() => _func8(a, b, c, d, e, f, g, h));
+        return InvokeSlow(new[] { a, b, c, d, e, f, g, h });
+    }
+
+    private LispObject Track(Func<LispObject> call)
+    {
+        if (Name == null) return call();
+        (s_callStack ??= new Stack<string>()).Push(Name);
+        try { return call(); }
+        finally { s_callStack.TryPop(out _); }
+    }
 
     // Native fixnum invoke: long args avoid boxing, LispObject return is body result (#130)
     public LispObject InvokeNative1(long a) => _nativeFunc1!(a);
@@ -154,7 +194,10 @@ public class LispFunction : LispObject
     private LispObject InvokeSlow(LispObject[] args)
     {
         PeriodicStackCheck();
-        return _func(args);
+        if (Name == null) return _func(args);
+        (s_callStack ??= new Stack<string>()).Push(Name);
+        try { return _func(args); }
+        finally { s_callStack.TryPop(out _); }
     }
 
     public override string ToString() =>

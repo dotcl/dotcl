@@ -318,6 +318,28 @@ public class LispInstance : LispObject
     }
 
     public override string ToString() => $"#<{Class.Name.Name}>";
+
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, System.WeakReference<LispInstance>>
+        _internCache = new();
+
+    public static void PreRegisterIntern(string key, LispInstance inst)
+        => _internCache.TryAdd(key, new System.WeakReference<LispInstance>(inst));
+
+    /// <summary>FASL load-time: evaluate make-load-form creation form once and cache by key.</summary>
+    public static LispObject InternViaEval(string key, LispObject creationForm)
+    {
+        if (_internCache.TryGetValue(key, out var weakRef) && weakRef.TryGetTarget(out var existing))
+            return existing;
+        // Nil means "just look up" — creation form already evaluated elsewhere
+        if (creationForm is Nil) return Nil.Instance;
+        var obj = Runtime.Eval(creationForm);
+        if (obj is LispInstance result)
+        {
+            _internCache[key] = new System.WeakReference<LispInstance>(result);
+            return result;
+        }
+        return obj;
+    }
 }
 
 /// <summary>

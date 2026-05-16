@@ -112,6 +112,30 @@ public static partial class Runtime
             RefinalizeDependents(existing);
             return existing;
         }
+        // Cross-package forward-ref fix: FindOrForwardClass normalizes class names to
+        // DOTCL-INTERNAL:: via ToClassSymbol, but MakeClass preserves the original package
+        // (e.g. CLIM-INTERNALS::). When the class is first defined, RegisterClass is called
+        // with CLIM-INTERNALS::FOO but the forward-ref was stored under DOTCL-INTERNAL::FOO.
+        // Without this check, the forward-ref is never updated, leaving dependent classes
+        // (which hold a reference to the stale forward-ref placeholder) with empty CPLs.
+        if (existing == null)
+        {
+            var normalizedSym = Startup.Sym(lc.Name.Name);
+            if (!ReferenceEquals(normalizedSym, lc.Name) &&
+                _classRegistry.TryGetValue(normalizedSym, out var fwdRef) &&
+                fwdRef != null && fwdRef.IsForwardReferenced)
+            {
+                fwdRef.DirectSlots = lc.DirectSlots;
+                fwdRef.DirectSuperclasses = lc.DirectSuperclasses;
+                fwdRef.DirectDefaultInitargs = lc.DirectDefaultInitargs;
+                fwdRef.IsForwardReferenced = false;
+                fwdRef.FinalizeClass();
+                // Also register under the original package-qualified name for package-aware lookups
+                _classRegistry[lc.Name] = fwdRef;
+                RefinalizeDependents(fwdRef);
+                return fwdRef;
+            }
+        }
         _classRegistry[lc.Name] = lc;
         // Re-finalize any classes that have this as a forward-referenced superclass
         RefinalizeDependents(lc);
@@ -139,7 +163,10 @@ public static partial class Runtime
                         if (s.IsForwardReferenced) { allReady = false; break; }
                     }
                     if (allReady && !c.IsForwardReferenced)
+                    {
                         c.FinalizeClass();
+                        RefinalizeDependents(c); // propagate through deeper inheritance chains
+                    }
                     break;
                 }
             }
@@ -988,7 +1015,9 @@ public static partial class Runtime
                 if (!suppliedKeys.Contains(key.Name))
                 {
                     extras.Add(key);
-                    extras.Add(thunk.Invoke(Array.Empty<LispObject>()));
+                    // Unwrap MvReturn: default-initarg thunks may return multiple values
+                    // (e.g. ensure-gethash returns (values value present-p)); use primary value only.
+                    extras.Add(UnwrapMv(thunk.Invoke(Array.Empty<LispObject>())));
                 }
             }
 
@@ -1473,13 +1502,12 @@ public static partial class Runtime
                 $"The method lambda list for {gf.Name.Name} has {method.RequiredCount} required " +
                 $"parameter(s) but the generic function requires {gf.RequiredCount}"));
 
-        // Rule 2: Optional parameter count (CLHS 7.6.4).
-        // Method may NOT have MORE optionals than the GF unless it also has &rest or &key.
-        // Method MAY have fewer optionals (common pattern: getter method omits setter optional).
-        if (method.OptionalCount > gf.OptionalCount && !(method.HasRest || method.HasKey))
+        // Rule 2: Optional parameter count must match exactly (CLHS 7.6.4),
+        // unless the method has &rest or &key which subsumes optional parameters.
+        if (method.OptionalCount != gf.OptionalCount && !(method.HasRest || method.HasKey))
             throw new LispErrorException(new LispProgramError(
                 $"The method lambda list for {gf.Name.Name} has {method.OptionalCount} optional " +
-                $"parameter(s) but the generic function accepts only {gf.OptionalCount}"));
+                $"parameter(s) but the generic function has {gf.OptionalCount}"));
 
         // Rule 3: If ANY lambda list mentions &rest or &key, EACH must mention one or both
         // (bidirectional check per CLHS 7.6.4)
@@ -3849,20 +3877,20 @@ public static partial class Runtime
             return args[2];  // return the lambda form as-is
         }, "MAKE-METHOD-LAMBDA"));
 
-        // ENSURE-CLASS — minimal stub that calls defclass infrastructure
+        // ENSURE-CLASS — stub supporting symbol and list names, ignoring :metaclass
         Emitter.CilAssembler.RegisterFunction("ENSURE-CLASS", new LispFunction(args => {
-            // (ensure-class name &key direct-superclasses direct-slots ...)
+            // (ensure-class name &key metaclass direct-superclasses ...)
             if (args.Length < 1) throw new LispErrorException(new LispProgramError("ENSURE-CLASS: wrong arg count"));
             var name = args[0];
-            if (name is Symbol sym2) {
-                var existing = Runtime.FindClassOrNil(sym2);
-                if (existing is LispClass) return existing;
-                // Create a minimal class
-                var newCls = new LispClass(sym2, Array.Empty<SlotDefinition>(), Array.Empty<LispClass>());
-                Runtime.RegisterClass(newCls);
-                return newCls;
-            }
-            return Nil.Instance;
+            // Normalize name to a symbol (list names become their print-name symbol)
+            Symbol nameSym = name is Symbol s ? s : Startup.Sym(name.ToString() ?? "");
+            var existing = Runtime.FindClassOrNil(nameSym);
+            if (existing is LispClass existingCls) return existingCls;
+            // Create a minimal class under the (possibly list-stringified) name
+            var newCls = new LispClass(nameSym, Array.Empty<SlotDefinition>(), Array.Empty<LispClass>());
+            newCls.FinalizeClass();
+            Runtime._classRegistry[nameSym] = newCls;
+            return newCls;
         }, "ENSURE-CLASS"));
     }
 }

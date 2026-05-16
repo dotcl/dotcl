@@ -1037,6 +1037,7 @@ public static partial class Runtime
         return null;
     }
 
+
     // Compile a single top-level form using the Lisp compiler
     // Cached at first use to prevent user code (e.g. SB-C::COMPILE-TOPLEVEL)
     // from overwriting the compiler's function in the flat name table.
@@ -1421,11 +1422,30 @@ public static partial class Runtime
             }
         }
 
+        // FASL module name must be computed before the module-ID binding (declared below).
+        var faslModuleName = Path.GetFileNameWithoutExtension(outputPath)
+            + "_" + Guid.NewGuid().ToString("N").Substring(0, 8);
+
+        // Bind *current-module-id* to the FASL's unique module name (D1038).
+        // The load-time-value compiler handler uses this to namespace LTV slot IDs per module,
+        // preventing cross-run collisions when FASLs compiled in different sessions share IDs.
+        // Use Startup.Sym (not SymInPkg) so we get the same symbol object that cil-out.sil's
+        // (:LOAD-SYM "*CURRENT-MODULE-ID*") resolves to — cross-compiled code uses bare LOAD-SYM
+        // (because *cross-compiling* suppresses LOAD-SYM-PKG emission), so the symbol lives in
+        // DOTCL-INTERNAL, not DOTCL.CIL-COMPILER.
+        Symbol? moduleIdSym = null;
+        try { moduleIdSym = Startup.Sym("*CURRENT-MODULE-ID*"); }
+        catch { /* should not throw, but guard defensively */ }
+        if (moduleIdSym != null)
+            DynamicBindings.Push(moduleIdSym, new LispString(faslModuleName));
+
         try
         {
             // Read source, compile each form, and write instrList to .sil
             var source = File.ReadAllText(inputPath);
-            var reader = new Reader(new StringReader(source));
+            var trackingReader = new PositionTrackingReader(new StringReader(source));
+            var reader = new Reader(trackingReader);
+            reader.LispStreamRef = new LispStringInputStream(trackingReader, 0);
 
             var dir = Path.GetDirectoryName(outputPath);
             if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
@@ -1450,8 +1470,6 @@ public static partial class Runtime
             HandlerClusterStack.PushCluster(handlerCluster);
 
             // FASL assembler (always — .fasl is the default output)
-            var faslModuleName = Path.GetFileNameWithoutExtension(outputPath)
-                + "_" + Guid.NewGuid().ToString("N").Substring(0, 8);
             var faslAsm = new DotCL.Emitter.FaslAssembler(faslModuleName);
 
             try
@@ -1485,6 +1503,7 @@ public static partial class Runtime
                             {
                                 writer?.WriteLine(bodyInstrList.ToString());
                                 faslAsm.AddTopLevelForm(bodyInstrList);
+                                faslAsm.FlushInitForms();
                             }
                         }
                         else
@@ -1494,6 +1513,7 @@ public static partial class Runtime
                                 DotCL.Emitter.CilAssembler.AssembleAndRun(instrList);
                             writer?.WriteLine(instrList.ToString());
                             faslAsm.AddTopLevelForm(instrList);
+                            faslAsm.FlushInitForms();
                         }
 
                         if (isPrint)
@@ -1504,6 +1524,9 @@ public static partial class Runtime
                         }
                     }
                 }
+
+                // Emit any remaining init forms (cycle members, etc.)
+                faslAsm.FlushRemainingInitForms();
 
                 faslAsm.Save(outputPath);
                 }
@@ -1557,6 +1580,8 @@ public static partial class Runtime
             DynamicBindings.Set(cftSym, oldCft);
             DynamicBindings.Set(packageSym, oldPackage);
             DynamicBindings.Set(readtableSym, oldReadtable);
+            if (moduleIdSym != null)
+                DynamicBindings.Pop(moduleIdSym);
         }
     }
 
@@ -3054,10 +3079,9 @@ public static partial class Runtime
         // FUNCALL
         Emitter.CilAssembler.RegisterFunction("FUNCALL",
             new LispFunction(args => {
-                var fn = args[0] is LispFunction f ? f
-                    : args[0] is Symbol s ? (LispFunction)Runtime.Fdefinition(s)
-                    : throw new LispErrorException(new LispTypeError("FUNCALL: not a function designator", args[0]));
-                return fn.Invoke(args[1..]);
+                if (args[0] is LispFunction f) return f.Invoke(args[1..]);
+                if (args[0] is Symbol s) return ((LispFunction)Runtime.Fdefinition(s)).Invoke(args[1..]);
+                throw new LispErrorException(new LispTypeError("FUNCALL: not a function designator", args[0]));
             }));
 
         // SYMBOL-FUNCTION, FDEFINITION, %SET-FDEFINITION, FMAKUNBOUND, MAKUNBOUND
@@ -3681,7 +3705,7 @@ public static partial class Runtime
             return sym;
         });
 
-        // Load-time-value slot access
+        // Load-time-value slot access (legacy global slots)
         Startup.RegisterUnary("%HAS-LTV-SLOT", id => {
             var slotId = (int)((Fixnum)id).Value;
             return Runtime.HasLtvSlot(slotId) ? T.Instance : Nil.Instance;
@@ -3695,6 +3719,24 @@ public static partial class Runtime
             Runtime.SetLtvSlot(slotId, value);
             return value;
         });
+
+        // Load-time-value slot access (per-module namespaced — prevents cross-run collisions)
+        Emitter.CilAssembler.RegisterFunction("%HAS-LTV-SLOT-IN", new LispFunction(args => {
+            var moduleId = ((LispString)args[0]).Value;
+            var slotId = (int)((Fixnum)args[1]).Value;
+            return Runtime.HasLtvSlotIn(moduleId, slotId) ? T.Instance : Nil.Instance;
+        }, "%HAS-LTV-SLOT-IN"));
+        Emitter.CilAssembler.RegisterFunction("%GET-LTV-SLOT-IN", new LispFunction(args => {
+            var moduleId = ((LispString)args[0]).Value;
+            var slotId = (int)((Fixnum)args[1]).Value;
+            return Runtime.GetLtvSlotIn(moduleId, slotId);
+        }, "%GET-LTV-SLOT-IN"));
+        Emitter.CilAssembler.RegisterFunction("%SET-LTV-SLOT-IN", new LispFunction(args => {
+            var moduleId = ((LispString)args[0]).Value;
+            var slotId = (int)((Fixnum)args[1]).Value;
+            Runtime.SetLtvSlotIn(moduleId, slotId, args[2]);
+            return args[2];
+        }, "%SET-LTV-SLOT-IN"));
 
         // Time functions
         Emitter.CilAssembler.RegisterFunction("GET-UNIVERSAL-TIME", new LispFunction(_ => {

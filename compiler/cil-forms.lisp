@@ -2699,8 +2699,14 @@
              (if boxed-p
                  `((:ldloc ,key) (:ldc-i4 0) (:ldelem-ref))
                  `((:ldloc ,key))))
-           ;; Check builtin
-           (let ((builtin-instrs (compile-builtin-function-ref (symbol-name thing))))
+           ;; Check builtin — only for COMMON-LISP package symbols (or uninterned).
+           ;; A symbol like CONCRETE-SYNTAX-TREE:CONSP shadows CL:CONSP; looking it
+           ;; up by name alone would wrongly return the CL built-in wrapper (D1028).
+           (let* ((home-pkg (symbol-package thing))
+                  (is-cl-pkg (or (null home-pkg)
+                                 (string= (package-name home-pkg) "COMMON-LISP")))
+                  (builtin-instrs (and is-cl-pkg
+                                       (compile-builtin-function-ref (symbol-name thing)))))
              (if builtin-instrs
                  builtin-instrs
                  ;; Global user-defined function — use symbol-based lookup so that
@@ -2862,9 +2868,19 @@
                           ,@lambda-instrs
                           (:stloc ,key))))
           (push (list name-str key nil) new-local-fns)
-          ;; Also track symbolp names in *locals* so closures can capture flet functions
+          ;; Track in *locals* so closures can capture flet functions.
+          ;; Use BOTH the plain name and the __LABELFN_ prefix (same key):
+          ;; - Plain name: backward compat (#'flet-fn value capture)
+          ;; - __LABELFN_ prefix: capture in function call position without
+          ;;   conflicting with a same-named let/let* variable (Lisp-2 separation).
+          ;;   The free var analysis detects __LABELFN_ entries in function position
+          ;;   (see find-free-vars-expr), and compile-closure-body prefers it.
           (when (symbolp name)
-            (push (cons (intern (symbol-name name) :dotcl.cil-compiler) key) new-locals)))))
+            (push (cons (intern (symbol-name name) :dotcl.cil-compiler) key) new-locals)
+            (push (cons (intern (concatenate 'string "__LABELFN_" (symbol-name name))
+                                :dotcl.cil-compiler)
+                        key)
+                  new-locals)))))
     ;; Compile body with extended local-functions AND locals.
     ;; Also track flet source defs so compile-defmacro can wrap its eval
     ;; with flet bindings (e.g. SBCL macros.lisp wraps defmacro in flet).
@@ -5142,10 +5158,17 @@
   (setf (gethash 'the h) (lambda (expr) (compile-expr (caddr expr))))
   (setf (gethash 'load-time-value h)
         (lambda (expr)
-          (let ((ltv-id (incf *ltv-counter*)))
-            (compile-expr `(if (%has-ltv-slot ,ltv-id)
-                               (%get-ltv-slot ,ltv-id)
-                               (%set-ltv-slot ,ltv-id ,(cadr expr)))))))
+          (let ((ltv-id (incf *ltv-counter*))
+                (mod-id *current-module-id*))
+            (if mod-id
+                ;; Per-module namespaced LTV — prevents cross-run slot ID collisions
+                (compile-expr `(if (%has-ltv-slot-in ,mod-id ,ltv-id)
+                                   (%get-ltv-slot-in ,mod-id ,ltv-id)
+                                   (%set-ltv-slot-in ,mod-id ,ltv-id ,(cadr expr))))
+                ;; Legacy path (eval, compile without compile-file context)
+                (compile-expr `(if (%has-ltv-slot ,ltv-id)
+                                   (%get-ltv-slot ,ltv-id)
+                                   (%set-ltv-slot ,ltv-id ,(cadr expr))))))))
   (setf (gethash 'declare h) (lambda (expr) (declare (ignore expr)) (emit-nil)))
   (setf (gethash 'declaim h)
         (lambda (expr)

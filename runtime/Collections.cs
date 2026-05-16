@@ -42,6 +42,24 @@ public class LispStruct : LispObject
         _internCache.TryAdd(key, new WeakReference<LispStruct>(original));
     }
 
+    /// <summary>
+    /// Evaluate a make-load-form creation form at FASL load time, then intern
+    /// the resulting struct by key for EQ preservation across loads.
+    /// Called from IL emitted by the make-load-form protocol path in EmitLoadConstInline.
+    /// </summary>
+    public static LispObject InternViaEval(string key, LispObject form)
+    {
+        if (_internCache.TryGetValue(key, out var weakRef) && weakRef.TryGetTarget(out var existing))
+            return existing;
+        var obj = Runtime.Eval(form);
+        if (obj is LispStruct result)
+        {
+            _internCache[key] = new WeakReference<LispStruct>(result);
+            return result;
+        }
+        return obj;
+    }
+
     [ThreadStatic] private static HashSet<LispStruct>? _printing;
 
     public override string ToString()

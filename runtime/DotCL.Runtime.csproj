@@ -42,6 +42,14 @@
     <Compile Remove="Program.cs" />
   </ItemGroup>
 
+  <!-- Ensure generated file is always in @(Compile) even if it doesn't exist yet at
+       item-evaluation time (the GenerateUnicodeCharNames target creates it before CoreCompile).
+       Remove first to avoid duplicate with the SDK default glob when the file already exists. -->
+  <ItemGroup>
+    <Compile Remove="Generated/UnicodeCharNames.g.cs" />
+    <Compile Include="Generated/UnicodeCharNames.g.cs" />
+  </ItemGroup>
+
   <!-- Windows-only sources excluded for non-Windows RID builds -->
   <PropertyGroup Condition="$(RuntimeIdentifier.StartsWith('android')) Or $(RuntimeIdentifier.StartsWith('linux')) Or $(RuntimeIdentifier.StartsWith('osx')) Or '$(OS)' != 'Windows_NT'">
     <DefineConstants>$(DefineConstants);DOTCL_NO_WINFORMS</DefineConstants>
@@ -55,6 +63,23 @@
                       OutputItemType="Analyzer"
                       ReferenceOutputAssembly="false" />
   </ItemGroup>
+
+  <!-- Auto-generate UnicodeCharNames.g.cs if missing.
+       Runs only when the output file does not exist (Condition on the target).
+       Downloads UnicodeData.txt on first use, then generates the C# source. -->
+  <Target Name="GenerateUnicodeCharNames"
+          BeforeTargets="BeforeCompile"
+          Condition="!Exists('$(MSBuildThisFileDirectory)Generated/UnicodeCharNames.g.cs')">
+    <PropertyGroup>
+      <_GenUtilsProj>$(MSBuildThisFileDirectory)../scripts/GenUtils/GenUtils.csproj</_GenUtilsProj>
+      <_UnicodeDataTxt>$(MSBuildThisFileDirectory)../scripts/UnicodeData.txt</_UnicodeDataTxt>
+      <_GenOutPath>$(MSBuildThisFileDirectory)Generated/UnicodeCharNames.g.cs</_GenOutPath>
+    </PropertyGroup>
+    <MakeDir Directories="$(MSBuildThisFileDirectory)Generated" />
+    <Exec Command="dotnet run --project &quot;$(_GenUtilsProj)&quot; -- download https://unicode.org/Public/UCD/latest/ucd/UnicodeData.txt &quot;$(_UnicodeDataTxt)&quot;"
+          Condition="!Exists('$(_UnicodeDataTxt)')" />
+    <Exec Command="dotnet run --project &quot;$(_GenUtilsProj)&quot; -- char-names &quot;$(_UnicodeDataTxt)&quot; &quot;$(_GenOutPath)&quot;" />
+  </Target>
 
   <Target Name="SetGitCommitVersion" BeforeTargets="GetAssemblyVersion;BeforeBuild">
     <Exec Command="git describe --tags --long --abbrev=7 --dirty --match v*"

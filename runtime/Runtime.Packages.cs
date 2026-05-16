@@ -231,7 +231,9 @@ public static partial class Runtime
         else if (name is LispChar lc) pkgName = lc.Value.ToString();
         else if (name is LispVector v && v.IsCharVector) pkgName = v.ToCharString();
         else pkgName = name.ToString()!;
-        var pkg = Package.FindPackage(pkgName);
+        // Check local nicknames of *package* first (SBCL compat: find-package resolves local nicknames)
+        var curPkg = DynamicBindings.Get(Startup.Sym("*PACKAGE*")) as Package;
+        var pkg = curPkg?.FindLocalNickname(pkgName) ?? Package.FindPackage(pkgName);
         return pkg ?? (LispObject)Nil.Instance;
     }
 

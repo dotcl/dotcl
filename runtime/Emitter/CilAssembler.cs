@@ -1774,6 +1774,95 @@ public class CilAssembler
             return key;
         }
 
+        // --- LispInstance make-load-form registry ---
+        private record InstanceEntry(string Key, LispObject? InitForm, List<LispInstance> InitDeps);
+        private readonly Dictionary<LispInstance, InstanceEntry> _instanceMap =
+            new(ReferenceEqualityComparer.Instance);
+        private readonly List<LispInstance> _instanceOrder = new();
+
+        public bool TryGetInstanceKey(LispInstance li, out string key)
+        {
+            if (_instanceMap.TryGetValue(li, out var entry)) { key = entry.Key; return true; }
+            key = ""; return false;
+        }
+
+        public string RegisterInstance(LispInstance li, LispObject? initForm)
+        {
+            if (_instanceMap.TryGetValue(li, out var existing))
+                return existing.Key;
+            var key = _prefix + ".inst." + _instanceOrder.Count;
+            var deps = new List<LispInstance>();
+            if (initForm != null && initForm is not Nil)
+                CollectInstanceRefs(initForm, deps, new HashSet<LispInstance>(ReferenceEqualityComparer.Instance));
+            _instanceMap[li] = new InstanceEntry(key, initForm, deps);
+            _instanceOrder.Add(li);
+            LispInstance.PreRegisterIntern(key, li);
+            return key;
+        }
+
+        private static void CollectInstanceRefs(LispObject form, List<LispInstance> result,
+            HashSet<LispInstance> seen)
+        {
+            if (form is LispInstance li) { if (seen.Add(li)) result.Add(li); return; }
+            if (form is Cons c) { CollectInstanceRefs(c.Car, result, seen); CollectInstanceRefs(c.Cdr, result, seen); }
+        }
+
+        // Track which instances are "created" (creation form emitted) and "initialized" (init form emitted)
+        private readonly HashSet<LispInstance> _created = new(ReferenceEqualityComparer.Instance);
+        private readonly HashSet<LispInstance> _initialized = new(ReferenceEqualityComparer.Instance);
+
+        public void MarkCreated(LispInstance li) => _created.Add(li);
+
+        /// <summary>Pop all init forms whose external dependencies are now fully initialized.
+        /// Repeats until no more unblocked forms. Call after each creation form is emitted.</summary>
+        public List<(string key, LispObject initForm)> PopEagerInitForms()
+        {
+            var result = new List<(string, LispObject)>();
+            bool found;
+            do
+            {
+                found = false;
+                foreach (var li in _instanceOrder)
+                {
+                    if (_initialized.Contains(li)) continue;
+                    if (!_created.Contains(li)) continue;
+                    if (!_instanceMap.TryGetValue(li, out var entry)) continue;
+                    if (entry.InitForm == null || entry.InitForm is Nil)
+                    {
+                        _initialized.Add(li); // no init form needed
+                        continue;
+                    }
+                    bool ready = true;
+                    foreach (var dep in entry.InitDeps)
+                    {
+                        if (ReferenceEquals(dep, li)) continue; // self-ref OK
+                        if (!_initialized.Contains(dep)) { ready = false; break; }
+                    }
+                    if (ready)
+                    {
+                        _initialized.Add(li);
+                        result.Add((entry.Key, entry.InitForm));
+                        found = true;
+                    }
+                }
+            } while (found);
+            return result;
+        }
+
+        /// <summary>Emit remaining init forms (those still pending, e.g. from cyclic deps).</summary>
+        public List<(string key, LispObject initForm)> FlushRemainingInitForms()
+        {
+            var result = new List<(string, LispObject)>();
+            foreach (var li in _instanceOrder)
+            {
+                if (_initialized.Contains(li)) continue;
+                _initialized.Add(li);
+                if (_instanceMap.TryGetValue(li, out var entry) && entry.InitForm != null && entry.InitForm is not Nil)
+                    result.Add((entry.Key, entry.InitForm));
+            }
+            return result;
+        }
+
         /// <summary>
         /// Get or create a static field for an uninterned symbol so that all uses within
         /// this FASL resolve to the SAME Symbol object (preserves EQ-ness across make-load-form).
@@ -2023,23 +2112,32 @@ public class CilAssembler
                         string internKey = _faslStructMap != null
                             ? _faslStructMap.GetOrCreate(ls)
                             : ComputeStructInternKey(ls);
-                        if (_faslStructMap == null)
-                            LispStruct.PreRegisterIntern(internKey, ls);
-                        _il.Emit(OpCodes.Ldstr, Track(internKey));
-                        EmitLoadConstInline(ls.TypeName);
-                        var slotsArr = ls.Slots;
-                        _il.Emit(OpCodes.Ldc_I4, slotsArr.Length);
-                        _il.Emit(OpCodes.Newarr, typeof(LispObject));
-                        for (int si = 0; si < slotsArr.Length; si++)
+                        // CLHS 3.2.4.2: if make-load-form is defined for this type, use the
+                        // returned creation form rather than directly serializing raw slots.
+                        if (_faslMode && TryEmitViaLoadForm(ls, internKey))
                         {
-                            _il.Emit(OpCodes.Dup);
-                            _il.Emit(OpCodes.Ldc_I4, si);
-                            EmitLoadConstInline(slotsArr[si]);
-                            _il.Emit(OpCodes.Stelem_Ref);
+                            // done — IL emitted by TryEmitViaLoadForm
                         }
-                        _il.Emit(OpCodes.Call, typeof(LispStruct).GetMethod("Intern",
-                            new[] { typeof(string), typeof(LispObject), typeof(LispObject[]) })!);
-                        _il.Emit(OpCodes.Castclass, typeof(LispObject));
+                        else
+                        {
+                            if (_faslStructMap == null)
+                                LispStruct.PreRegisterIntern(internKey, ls);
+                            _il.Emit(OpCodes.Ldstr, Track(internKey));
+                            EmitLoadConstInline(ls.TypeName);
+                            var slotsArr = ls.Slots;
+                            _il.Emit(OpCodes.Ldc_I4, slotsArr.Length);
+                            _il.Emit(OpCodes.Newarr, typeof(LispObject));
+                            for (int si = 0; si < slotsArr.Length; si++)
+                            {
+                                _il.Emit(OpCodes.Dup);
+                                _il.Emit(OpCodes.Ldc_I4, si);
+                                EmitLoadConstInline(slotsArr[si]);
+                                _il.Emit(OpCodes.Stelem_Ref);
+                            }
+                            _il.Emit(OpCodes.Call, typeof(LispStruct).GetMethod("Intern",
+                                new[] { typeof(string), typeof(LispObject), typeof(LispObject[]) })!);
+                            _il.Emit(OpCodes.Castclass, typeof(LispObject));
+                        }
                     }
                 }
                 finally { _inlineVisited.Remove(ls); }
@@ -2144,7 +2242,49 @@ public class CilAssembler
 
     private void EmitFaslInstanceInline(LispInstance li)
     {
-        // Emit: Runtime.MakeFaslInstance(pkgName, symName, new LispObject[] { slot0, slot1, ... })
+        if (_faslStructMap == null) { EmitFaslInstanceFallback(li); return; }
+        // make-load-form protocol (CLHS 3.2.4.2)
+        if (_faslStructMap.TryGetInstanceKey(li, out var existingKey))
+        {
+            // Already registered: emit lookup (creation form already emitted or in progress)
+            _il.Emit(OpCodes.Ldstr, Track(existingKey));
+            _il.Emit(OpCodes.Ldsfld, typeof(Nil).GetField("Instance")!);
+            _il.Emit(OpCodes.Call, _internViaEvalInstance);
+            _il.Emit(OpCodes.Castclass, typeof(LispObject));
+            return;
+        }
+        var mlfSym = Startup.Sym("MAKE-LOAD-FORM");
+        if (mlfSym?.Function != null)
+        {
+            try
+            {
+                var raw = Runtime.Funcall(mlfSym.Function, li);
+                LispObject creationForm, initForm;
+                if (raw is MvReturn mv && mv.Values.Length >= 1)
+                {
+                    creationForm = mv.Values[0];
+                    initForm = mv.Values.Length >= 2 ? mv.Values[1] : Nil.Instance;
+                }
+                else { creationForm = raw; initForm = Nil.Instance; }
+
+                var key = _faslStructMap.RegisterInstance(li, initForm is Nil ? null : initForm);
+                _faslStructMap.MarkCreated(li);
+                _il.Emit(OpCodes.Ldstr, Track(key));
+                EmitLoadConstInline(creationForm);
+                _il.Emit(OpCodes.Call, _internViaEvalInstance);
+                _il.Emit(OpCodes.Castclass, typeof(LispObject));
+                return;
+            }
+            catch { /* fall through to fallback */ }
+        }
+        // No make-load-form defined: fallback to direct slot serialization
+        _faslStructMap.RegisterInstance(li, null);
+        _faslStructMap.MarkCreated(li);
+        EmitFaslInstanceFallback(li);
+    }
+
+    private void EmitFaslInstanceFallback(LispInstance li)
+    {
         string pkgName = li.Class.Name.HomePackage?.Name ?? "COMMON-LISP";
         string symName = li.Class.Name.Name;
         _il.Emit(OpCodes.Ldstr, pkgName);
@@ -2235,6 +2375,34 @@ public class CilAssembler
     }
 
     /// <summary>Compute a deterministic content key for LispStruct interning.</summary>
+    /// <summary>
+    /// Try to emit IL for a struct constant via the make-load-form protocol (CLHS 3.2.4.2).
+    /// Returns true and emits a LispStruct.InternViaEval call if make-load-form is defined
+    /// for the struct's type; returns false to fall back to the direct Intern path.
+    /// </summary>
+    private bool TryEmitViaLoadForm(LispStruct ls, string internKey)
+    {
+        var mlfSym = Startup.Sym("MAKE-LOAD-FORM");
+        if (mlfSym?.Function == null)
+            return false;
+        try
+        {
+            var raw = Runtime.Funcall(mlfSym.Function, ls);
+            LispObject form = raw is MvReturn mv && mv.Values.Length > 0 ? mv.Values[0] : raw;
+            if (form is Nil) return false;
+            _il.Emit(OpCodes.Ldstr, Track(internKey));
+            EmitLoadConstInline(form);
+            _il.Emit(OpCodes.Call, typeof(LispStruct).GetMethod("InternViaEval",
+                new[] { typeof(string), typeof(LispObject) })!);
+            _il.Emit(OpCodes.Castclass, typeof(LispObject));
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
     private static string ComputeStructInternKey(LispStruct ls)
     {
         var sb = new System.Text.StringBuilder();
@@ -2411,6 +2579,7 @@ public class CilAssembler
     private static readonly Dictionary<string, Type> _typeCache;
     private static readonly MethodInfo _getConstant;
     private static readonly MethodInfo _makeFaslInstance;
+    private static readonly MethodInfo _internViaEvalInstance;
     private static readonly MethodInfo _makeClosure;
     private static readonly MethodInfo _registerFunction;
     private static readonly MethodInfo _registerFunctionOnSymbol;
@@ -3036,6 +3205,8 @@ public class CilAssembler
         _getConstant = typeof(CilAssembler).GetMethod("GetConstant")!;
         _makeFaslInstance = typeof(Runtime).GetMethod("MakeFaslInstance",
             new[] { typeof(string), typeof(string), typeof(LispObject[]) })!;
+        _internViaEvalInstance = typeof(LispInstance).GetMethod("InternViaEval",
+            new[] { typeof(string), typeof(LispObject) })!;
         _makeClosure = typeof(CilAssembler).GetMethod("MakeClosure")!;
         _registerFunction = typeof(CilAssembler).GetMethod("RegisterFunction")!;
         _registerFunctionOnSymbol = typeof(CilAssembler).GetMethod("RegisterFunctionOnSymbol")!;

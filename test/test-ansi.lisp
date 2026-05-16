@@ -64,11 +64,11 @@
 (format t "=== Loading universe ===~%")
 (load "ansi-test/universe.lsp")
 
-;;; Override CLTEST: to map to CWD (not sandbox/).
-;;; universe.lsp sets CLTEST: -> CWD/sandbox/, but our DPD = CWD during do-tests,
-;;; so CLTEST:probe-file.txt must equal (truename #p"probe-file.txt") = CWD/probe-file.txt.
+;;; Override CLTEST: to map to sandbox/.
+;;; rt.lsp sets *default-pathname-defaults* = *sandbox-path* during do-entries (line 427),
+;;; so CLTEST:probe-file.txt must resolve inside sandbox/ for PROBE-FILE tests to work.
 (setf (logical-pathname-translations "CLTEST")
-  `(("**;*.*.*" ,(make-pathname :directory (pathname-directory (truename #p"./"))
+  `(("**;*.*.*" ,(make-pathname :directory (pathname-directory regression-test::*sandbox-path*)
                                 :name :wild :type :wild :version :wild))))
 
 ;;; Load cl-symbol-names.lsp (provides *cl-symbol-names*, *cl-non-function-macro-special-operator-symbols*, etc.)

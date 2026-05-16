@@ -290,12 +290,19 @@ public static partial class Runtime
     }
 
     // --- Load-time-value slots ---
-    // Each load-time-value gets a unique integer ID. The slot stores the evaluated result.
+    // Two storage paths:
+    //   1. Per-module (namespaced): FASLs compiled with *current-module-id* bound use
+    //      _ltvSlotsPerModule[moduleId][slotId].  Each FASL has a unique moduleId so
+    //      cross-run LTV slot ID collisions are impossible.
+    //   2. Legacy (global): FASLs compiled without module context (old FASLs, eval, compile).
     private static readonly Dictionary<int, LispObject> _ltvSlots = new();
+    private static readonly Dictionary<string, Dictionary<int, LispObject>> _ltvSlotsPerModule = new();
     private static int _ltvNextId;
 
     public static int AllocateLtvSlot() => Interlocked.Increment(ref _ltvNextId);
+    public static int MaxLtvId => _ltvNextId;
 
+    // Legacy API (global slots)
     public static LispObject GetLtvSlot(int id)
     {
         return _ltvSlots.TryGetValue(id, out var val) ? val : Nil.Instance;
@@ -304,9 +311,31 @@ public static partial class Runtime
     public static void SetLtvSlot(int id, LispObject value)
     {
         _ltvSlots[id] = value;
+        if (id >= _ltvNextId)
+            _ltvNextId = id + 1;
     }
 
     public static bool HasLtvSlot(int id) => _ltvSlots.ContainsKey(id);
+
+    // Per-module API (namespaced by FASL module ID)
+    public static bool HasLtvSlotIn(string moduleId, int id)
+    {
+        return _ltvSlotsPerModule.TryGetValue(moduleId, out var slots) && slots.ContainsKey(id);
+    }
+
+    public static LispObject GetLtvSlotIn(string moduleId, int id)
+    {
+        if (_ltvSlotsPerModule.TryGetValue(moduleId, out var slots) && slots.TryGetValue(id, out var v))
+            return v;
+        return Nil.Instance;
+    }
+
+    public static void SetLtvSlotIn(string moduleId, int id, LispObject value)
+    {
+        if (!_ltvSlotsPerModule.TryGetValue(moduleId, out var slots))
+            _ltvSlotsPerModule[moduleId] = slots = new Dictionary<int, LispObject>();
+        slots[id] = value;
+    }
 
     // --- Multiple values ---
 
@@ -1019,6 +1048,11 @@ public static partial class Runtime
                 lispFn = new LispFunction(fargs => {
                     var textReader = Runtime.GetTextReader(fargs[0]);
                     var reader = new Reader(textReader) { LispStreamRef = fargs[0] };
+                    // Propagate *read-suppress* from Lisp dynamic variable into the new Reader.
+                    // ReadList/ReadStep1 don't re-sync from the dynamic var, so a new Reader
+                    // created here would otherwise start with ReadSuppress=false even inside #+/#-.
+                    if (DynamicBindings.Get(Startup.Sym("*READ-SUPPRESS*")) is not Nil)
+                        reader.ReadSuppress = true;
                     // Share #n=/#n# label tables with the stream so share references
                     // work across Reader instances (e.g. when SBCL's Lisp reader calls
                     // C# dispatch macros through GET-MACRO-CHARACTER)

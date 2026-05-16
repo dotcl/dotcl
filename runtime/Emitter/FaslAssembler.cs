@@ -296,6 +296,47 @@ public class FaslAssembler
         return last is Cons lc && lc.Car is Symbol s && s.Name == "RET";
     }
 
+    private static readonly System.Reflection.MethodInfo _evalMI =
+        typeof(Runtime).GetMethod("Eval", new[] { typeof(LispObject) })!;
+
+    /// <summary>Emit a FASL top-level entry that calls Runtime.Eval(form) at load time.
+    /// Used to emit deferred make-load-form init forms after all creation forms.</summary>
+    public void EmitEvalTopLevel(LispObject form)
+    {
+        int id = _methodCount++;
+        string methodName = "_initform_" + id;
+        var method = _tb.DefineMethod(methodName,
+            MethodAttributes.Public | MethodAttributes.Static,
+            typeof(LispObject), Type.EmptyTypes);
+        var il = method.GetILGenerator();
+        var innerAsm = new CilAssembler();
+        innerAsm._il = il;
+        innerAsm._faslMode = true;
+        innerAsm._faslTypeBuilder = _tb;
+        innerAsm._faslStructMap = _structInternMap;
+        innerAsm.EmitLoadConstInline(form);
+        il.Emit(OpCodes.Call, _evalMI);
+        il.Emit(OpCodes.Pop);
+        il.Emit(OpCodes.Ldsfld, typeof(Nil).GetField("Instance")!);
+        il.Emit(OpCodes.Ret);
+        _initIl.Emit(OpCodes.Call, method);
+        _initIl.Emit(OpCodes.Pop);
+    }
+
+    /// <summary>Emit init forms whose creation dependencies are now satisfied. Call after each AddTopLevelForm.</summary>
+    public void FlushInitForms()
+    {
+        foreach (var (_, initForm) in _structInternMap.PopEagerInitForms())
+            EmitEvalTopLevel(initForm);
+    }
+
+    /// <summary>Emit any remaining init forms (e.g. cycle members). Call once before Save.</summary>
+    public void FlushRemainingInitForms()
+    {
+        foreach (var (_, initForm) in _structInternMap.FlushRemainingInitForms())
+            EmitEvalTopLevel(initForm);
+    }
+
     // --- Shared parsing helper used by both FaslAssembler and CilAssembler FASL branch ---
 
     internal static (string name, List<string> paramNames, LispObject body, string? defPkg)

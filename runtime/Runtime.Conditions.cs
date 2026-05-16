@@ -594,7 +594,26 @@ public static partial class Runtime
                 try
                 {
                     HandlerClusterStack.Signal(condition);
-                    throw new LispErrorException(condition);
+                    // No handler took it — enter debugger with CONTINUE restart still on stack.
+                    // *debugger-hook* is called first (matching invoke-debugger behaviour).
+                    var hookSym = Startup.Sym("*DEBUGGER-HOOK*");
+                    if (DynamicBindings.TryGet(hookSym, out var hookVal) && hookVal is not Nil)
+                    {
+                        DynamicBindings.Push(hookSym, Nil.Instance);
+                        try
+                        {
+                            if (hookVal is LispFunction hookFn)
+                                hookFn.Invoke(condition, hookVal);
+                            else
+                                Runtime.Funcall(hookVal, new[] { condition, hookVal });
+                        }
+                        finally
+                        {
+                            DynamicBindings.Pop(hookSym);
+                        }
+                    }
+                    Debugger.Enter(condition);
+                    throw new LispErrorException(condition);  // defensive; Debugger.Enter shouldn't return
                 }
                 catch (RestartInvocationException rie) when (ReferenceEquals(rie.Tag, restart.Tag))
                 {

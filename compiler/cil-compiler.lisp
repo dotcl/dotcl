@@ -85,6 +85,10 @@
 (defvar *ltv-counter* 0
   "Counter for load-time-value slot IDs. Incremented for each load-time-value form.")
 
+(defvar *current-module-id* nil
+  "Set by compile-file to the current FASL module's unique name.
+   Used to namespace LTV slot IDs per module, preventing cross-run collisions.")
+
 (defvar *at-toplevel* nil
   "T when compiling a form at top level (per CLHS 3.2.3.1).
    Only progn, eval-when, locally, macrolet, and symbol-macrolet preserve
@@ -455,21 +459,19 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
 
 (defun compile-var-ref (sym)
   "Compile a variable reference."
-  ;; Check symbol-macro first
-  (let ((sm-exp (lookup-symbol-macro sym)))
-    (if sm-exp
-        (compile-expr sm-exp)
-        ;; Check lexical binding BEFORE special — allows inner let to shadow outer declare
-        (let ((key (lookup-local sym)))
-          (if key
-              (if (boxed-var-p sym)
-                  ;; Boxed: load box, then element 0
-                  `((:ldloc ,key) (:ldc-i4 0) (:ldelem-ref))
-                  ;; Native Int64 param: box back to Fixnum for LispObject context (#130)
-                  (if (and (boundp '*long-locals*) *long-locals*
-                           (member (symbol-name sym) *long-locals* :test #'string=))
-                      `((:ldloc ,key) (:call "Fixnum.Make"))
-                      `((:ldloc ,key))))
+  ;; Local variable bindings shadow symbol macros (CLHS 5.1.2.1).
+  (let ((key (lookup-local sym)))
+    (if key
+        (if (boxed-var-p sym)
+            `((:ldloc ,key) (:ldc-i4 0) (:ldelem-ref))
+            (if (and (boundp '*long-locals*) *long-locals*
+                     (member (symbol-name sym) *long-locals* :test #'string=))
+                `((:ldloc ,key) (:call "Fixnum.Make"))
+                `((:ldloc ,key))))
+        ;; No local binding — check symbol-macro (let/let* shadow these too)
+        (let ((sm-exp (lookup-symbol-macro sym)))
+          (if sm-exp
+              (compile-expr sm-exp)
               ;; No lexical binding — check special (includes locally declared specials)
               `(,@(compile-sym-lookup sym)
                 (:castclass "Symbol") (:call "DynamicBindings.Get")))))))

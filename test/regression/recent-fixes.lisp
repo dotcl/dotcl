@@ -1335,3 +1335,38 @@
       (type-error (e) e))
     'type-error)
   t)
+
+;;; CLHS 3.2.4.2 — make-load-form protocol in FASL compiler
+;;; When a struct constant is embedded in compiled code and make-load-form
+;;; is defined for its type, the FASL loader must invoke the creation form
+;;; rather than directly serializing raw slots.
+(defstruct %mlf-box val)
+(defmethod make-load-form ((self %mlf-box) &optional env)
+  (make-load-form-saving-slots self))
+
+(deftest make-load-form-saving-slots-roundtrip
+  ;; CLHS-compliant: returns (values combined-creation-form nil).
+  ;; Evaluate the creation form; use subst pattern from ANSI test suite.
+  (let* ((box (make-%mlf-box :val 42))
+         (forms (multiple-value-list (make-load-form-saving-slots box)))
+         (newobj (eval (first forms))))
+    (eval (subst newobj box (second forms)))
+    (and (= (length forms) 2)
+         (null (second forms))
+         (eql (class-of box) (class-of newobj))
+         (eql (%mlf-box-val newobj) 42)))
+  t)
+
+(deftest make-load-form-fasl-roundtrip
+  (let* ((tmp (uiop:temporary-directory))
+         (src (merge-pathnames "mlf-fasl-test.lisp" tmp))
+         (out (merge-pathnames "mlf-fasl-test.fasl" tmp)))
+    (with-open-file (f src :direction :output :if-exists :supersede)
+      (write-string "(defstruct %mlf-box2 val)
+(defmethod make-load-form ((self %mlf-box2) &optional env)
+  (make-load-form-saving-slots self))
+(defvar *mlf-test-val* '#.(make-%mlf-box2 :val 99))" f))
+    (compile-file src :output-file out)
+    (load out)
+    (eql (%mlf-box2-val (symbol-value (find-symbol "*MLF-TEST-VAL*"))) 99))
+  t)
