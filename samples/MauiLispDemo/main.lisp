@@ -1,14 +1,13 @@
 ;;; main.lisp — Entry point for the MauiLispDemo sample.
 ;;;
-;;; Step 8 / D797: REPL-style demo.
+;;; REPL-style demo.
 ;;;
 ;;; - Snippet is a Lisp-defined class with Title + Source properties.
 ;;; - MainVM exposes:
 ;;;     Snippets              — ObservableCollection<object> of Snippet
 ;;;     SelectedSnippet        — two-way bound to CollectionView.SelectedItem
 ;;;     Result                 — string displayed below the Evaluate button
-;;;     EvaluateCommand        — ICommand; D797 just echoes the source,
-;;;                              actual (eval) comes in D798
+;;;     EvaluateCommand        — ICommand; evaluates the selected snippet
 ;;; - MainPage is a ContentPage whose XAML (embedded resource) has a
 ;;;   CollectionView + Editor + Button + Result Label. Editor is bound to
 ;;;   SelectedSnippet.Source so selecting a row shows its source.
@@ -33,7 +32,7 @@
 
 ;; -------------------------------------------------------------------------
 ;; LispCommand — ICommand whose Execute body funcalls a Lisp lambda stored
-;; in the Action field (D792). Unchanged from earlier steps.
+;; in the Action field.
 
 (dotnet:define-class "MauiLispDemo.LispCommand" (Object)
   (:implements ICommand)
@@ -61,14 +60,13 @@
     (dotnet:%set-invoke s "Source" source)
     s))
 
-;; Button ラベルのトグル候補 (D799/D800). 押すたび 1 歩進む。
+;; Toggle candidates for the button label. Advances one step each press.
 (defparameter *evaluate-button-labels*
   '("Evaluate" "評価" "평가" "Evaluar" "Evaluasi"))
 
-;; D800: snippet が評価時に走るときに VM を触れるように特殊変数で公開。
-;; MainVM の ctor で (setq *main-vm* self) される。snippet からは
-;; (dotnet:%set-invoke *main-vm* "EvaluateButtonText" ...) 等で UI を
-;; 直接書き換えられる。
+;; Exposed as a special variable so snippets can reach the VM at eval time.
+;; Set to self in MainVM's ctor via (setq *main-vm* self). Snippets can then
+;; directly update the UI, e.g. (dotnet:%set-invoke *main-vm* "EvaluateButtonText" ...).
 (defvar *main-vm* nil)
 
 ;; -------------------------------------------------------------------------
@@ -77,10 +75,10 @@
 ;; Any read-time or eval-time error propagates; callers wrap with handler-case.
 
 (defun %eval-all-forms (source)
-  ;; snippet の read/eval は常に cl-user で行う。デフォルトの *package*
-  ;; が何かに切り替わっていると `*main-vm*` のような unqualified symbol
-  ;; が別 package に intern されて defvar と別物になってしまう (D800
-  ;; で発覚、snippet が UI を書き換えない原因)。
+  ;; Always read/eval snippets in cl-user. If *package* were switched to something
+  ;; else, unqualified symbols like `*main-vm*` would be interned in the wrong
+  ;; package and become distinct from the defvar (root cause: snippets
+  ;; failed to update the UI).
   (let* ((*package* (find-package :cl-user))
          (input (make-string-input-stream source))
          (last-value nil)
@@ -110,7 +108,7 @@
     ("ToggleLanguageCommand" ICommand)
     ("RunCommand" ICommand))
   (:ctor ()
-    ;; snippet からアクセスできるように global に自身を晒す。
+    ;; Expose self globally so snippets can reach the VM.
     (setq *main-vm* self)
     (let ((snippets (dotnet:static "MauiLispDemo.XamlHelper"
                                    "NewObservableCollection"))
@@ -127,10 +125,9 @@
       (dotnet:invoke snippets "Add"
                      (%make-snippet
                       "Rename Evaluate button"
-                      (format nil ";; snippet が UI を書き換えるデモ。~%;; 評価すると Evaluate ボタンのラベルが書き換わる。~%;; 🌐 を押せば次の言語で cycle 再開。~%(dotnet:%set-invoke *main-vm* \"EvaluateButtonText\"~%                    (format nil \"🎉 ~~D\" (random 1000)))")))
-      ;; Live-coding (#162) 用の defun サンプル。Evaluate で関数を定義、
-      ;; 次に Run ボタンでその定義が走る。書き換えて Evaluate → Run で
-      ;; 新挙動が見える。
+                      (format nil ";; Demo: snippet rewrites the UI.~%;; Evaluate changes the Evaluate button label.~%;; Press 🌐 to restart the language cycle.~%(dotnet:%set-invoke *main-vm* \"EvaluateButtonText\"~%                    (format nil \"🎉 ~~D\" (random 1000)))")))
+      ;; Live-coding example. Evaluate defines the function,
+      ;; then Run executes it. Edit and re-Evaluate to see the new behaviour.
       (dotnet:invoke snippets "Add"
                      (%make-snippet
                       "Define my-click (greet)"
@@ -164,7 +161,7 @@
         (dotnet:%set-invoke self "RunCommand" run-cmd))))
   (:methods
     ("RunEvaluate" () :returns Void
-      ;; D798: read → eval → prin1. Every read/eval error is caught so the
+      ;; read → eval → prin1. Every read/eval error is caught so the
       ;; Button press can never crash the window; the message surfaces in
       ;; the Result label instead.
       (let* ((snip (dotnet:invoke self "SelectedSnippet"))
@@ -176,18 +173,18 @@
            (error (c)
              (format nil "ERROR (~A):~%~A" (type-of c) c))))))
     ("CycleLanguage" () :returns Void
-      ;; D799: Evaluate ボタンのラベルを *evaluate-button-labels* で
-      ;; cycle する。`:notify t` 付き EvaluateButtonText の setter が
-      ;; PropertyChanged を発火し、XAML Button.Text が追従する。
+      ;; Cycle the Evaluate button label through *evaluate-button-labels*.
+      ;; The EvaluateButtonText setter (`:notify t`) fires PropertyChanged,
+      ;; which XAML Button.Text follows automatically.
       (let* ((idx (dotnet:invoke self "LabelIndex"))
              (next (mod (1+ idx) (length *evaluate-button-labels*))))
         (dotnet:%set-invoke self "LabelIndex" next)
         (dotnet:%set-invoke self "EvaluateButtonText"
                             (nth next *evaluate-button-labels*))))
     ("RunHook" () :returns Void
-      ;; Live-coding hook (#162): call CL-USER::MY-CLICK if defined.
-      ;; Snippet で `(defun my-click ...)` 評価 → この Run ボタンで実行。
-      ;; Editor で書き換えて再評価すれば次の Run から新定義で動く。
+      ;; Live-coding hook: call CL-USER::MY-CLICK if defined.
+      ;; Evaluate `(defun my-click ...)` in a snippet, then Run executes it.
+      ;; Edit and re-evaluate to pick up the new definition on the next Run.
       (let ((sym (find-symbol "MY-CLICK" :cl-user)))
         (if (and sym (fboundp sym))
             (handler-case
@@ -212,8 +209,8 @@
       (dotnet:%set-invoke self "BindingContext" vm))))
 
 (defun build-main-page ()
-  "Instantiate MauiLispDemo.MainPage. The ctor body (D783) already applied
-   the XAML and set up the BindingContext, so the caller (App.CreateWindow)
+  "Instantiate MauiLispDemo.MainPage. The ctor body applies the XAML
+   and sets up the BindingContext, so the caller (App.CreateWindow)
    can wrap this directly in a Window."
   (dotnet:new "MauiLispDemo.MainPage"))
 

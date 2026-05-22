@@ -407,6 +407,27 @@ public static partial class Runtime
     /// </summary>
     public static readonly List<string> ContribExtraSearchPaths = new();
 
+    public static LispObject ContribParent(LispObject[] args)
+    {
+        var baseDir = AppContext.BaseDirectory;
+        var searchDirs = new List<string>();
+        searchDirs.AddRange(ContribExtraSearchPaths);
+        searchDirs.Add(Path.Combine(baseDir, "contrib"));
+        searchDirs.Add(Path.Combine(baseDir, "..", "..", "..", "contrib"));
+        searchDirs.Add(Path.Combine(baseDir, "..", "..", "..", "..", "contrib"));
+        foreach (var dir in searchDirs)
+        {
+            var full = Path.GetFullPath(dir);
+            if (Directory.Exists(full))
+            {
+                var parent = Directory.GetParent(full)?.FullName;
+                if (parent != null)
+                    return LispPathname.FromString(parent + Path.DirectorySeparatorChar);
+            }
+        }
+        return Nil.Instance;
+    }
+
     /// <summary>
     /// Default module provider: searches contrib/ directory relative to the binary.
     /// Tries .fasl, .sil, then .lisp extensions (like SBCL's module-provide-contrib).

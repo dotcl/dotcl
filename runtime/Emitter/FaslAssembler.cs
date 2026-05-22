@@ -117,7 +117,7 @@ public class FaslAssembler
         Console.Error.Flush();
     }
 
-    /// <summary>SIL 命令リストを処理して .fasl に追加</summary>
+    /// <summary>Process a SIL instruction list and append it to the .fasl</summary>
     public void AddTopLevelForm(LispObject instrList)
     {
         try { AddTopLevelFormImpl(instrList); }
@@ -618,7 +618,7 @@ public class FaslAssembler
         }
     }
 
-    /// <summary>.fasl ファイルに保存</summary>
+    /// <summary>Write the assembled .fasl to the given output path</summary>
     public void Save(string outputPath)
     {
         // return Nil.Instance

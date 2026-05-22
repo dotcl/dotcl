@@ -370,6 +370,23 @@ public static partial class Runtime
         var type = target.GetType();
         var callArgs = LispArgsToDotNetGeneric(args.Skip(2).ToArray());
 
+        // C# arrays don't expose get_Item/set_Item as named methods; route to
+        // Array.GetValue / Array.SetValue instead.
+        if (target is Array arr)
+        {
+            if (memberName == "get_Item")
+            {
+                var indices = callArgs.Select(Convert.ToInt32).ToArray();
+                return DotNetToLisp(arr.GetValue(indices));
+            }
+            if (memberName == "set_Item")
+            {
+                var indices = callArgs.Take(callArgs.Length - 1).Select(Convert.ToInt32).ToArray();
+                arr.SetValue(callArgs[callArgs.Length - 1], indices);
+                return DotNetToLisp(callArgs[callArgs.Length - 1]);
+            }
+        }
+
         try
         {
             var result = type.InvokeMember(memberName, InstanceReadFlags, null, target, callArgs);
@@ -477,9 +494,9 @@ public static partial class Runtime
     /// Returns the full name as a LispString on success.</summary>
     public static LispObject DotNetDefineClass(LispObject[] args)
     {
-        if (args.Length < 1 || args.Length > 9)
+        if (args.Length < 1 || args.Length > 11)
             throw new LispErrorException(new LispProgramError(
-                "DOTNET:%DEFINE-CLASS: requires 1-9 arguments (full-name &optional base-type-name field-specs attr-specs method-specs ctor-body property-specs interface-specs event-specs)"));
+                "DOTNET:%DEFINE-CLASS: requires 1-11 arguments (full-name &optional base-type-name field-specs attr-specs method-specs ctor-body property-specs interface-specs event-specs ctor-param-types base-ctor-arg-indices)"));
 
         string fullName = args[0] switch
         {
@@ -775,11 +792,44 @@ public static partial class Runtime
             }
         }
 
+        List<Type>? userCtorParamTypes = null;
+        if (args.Length >= 10 && args[9] != Nil.Instance)
+        {
+            userCtorParamTypes = new List<Type>();
+            var cur = args[9];
+            while (cur is Cons c)
+            {
+                string tname = c.Car switch
+                {
+                    LispString ls => ls.Value,
+                    _ => c.Car.ToString() ?? ""
+                };
+                userCtorParamTypes.Add(ResolveDotNetType(tname));
+                cur = c.Cdr;
+            }
+        }
+
+        List<int>? baseCtorArgIndices = null;
+        if (args.Length >= 11 && args[10] != Nil.Instance)
+        {
+            baseCtorArgIndices = new List<int>();
+            var cur = args[10];
+            while (cur is Cons c)
+            {
+                if (c.Car is not Fixnum fi)
+                    throw new LispErrorException(new LispTypeError(
+                        "DOTNET:%DEFINE-CLASS: base-ctor-arg-indices must be a list of integers",
+                        c.Car));
+                baseCtorArgIndices.Add((int)fi.Value);
+                cur = c.Cdr;
+            }
+        }
+
         try
         {
             var type = Emitter.DynamicClassBuilder.DefineMinimalClass(
                 fullName, baseType, fields, attrs, methods, ctorBody, propertySpecs,
-                interfaceSpecs, eventSpecs);
+                interfaceSpecs, eventSpecs, userCtorParamTypes, baseCtorArgIndices);
             return new LispString(type.FullName ?? fullName);
         }
         catch (ArgumentException ae)
@@ -787,6 +837,70 @@ public static partial class Runtime
             throw new LispErrorException(new LispError(
                 $"DOTNET:%DEFINE-CLASS: {ae.Message}"));
         }
+    }
+
+    // Cache: (selfType, methodName, paramTypeSig) → DynamicMethod for non-virtual base call.
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<(Type, string, string), System.Reflection.Emit.DynamicMethod>
+        _baseCallCache = new();
+
+    /// <summary>(dotnet:call-base self "Method" &rest args)
+    /// Call the base class implementation of a virtual method non-virtually
+    /// (equivalent to C# base.Method(args)). self must be a dotcl-defined class
+    /// instance; base type is self.GetType().BaseType.</summary>
+    public static LispObject DotNetCallBase(LispObject[] args)
+    {
+        if (args.Length < 2)
+            throw new LispErrorException(new LispProgramError(
+                "DOTNET:CALL-BASE: requires at least 2 arguments (self method-name &rest args)"));
+        if (args[0] is not LispDotNetObject dno)
+            throw new LispErrorException(new LispTypeError(
+                "DOTNET:CALL-BASE: first argument must be a .NET object", args[0]));
+
+        var target    = dno.Value;
+        var selfType  = target.GetType();
+        var baseType  = selfType.BaseType
+            ?? throw new LispErrorException(new LispError(
+                $"DOTNET:CALL-BASE: {selfType.FullName} has no base type"));
+        string methodName = args[1] switch { LispString ls => ls.Value, _ => args[1].ToString() ?? "" };
+        var callArgs  = LispArgsToDotNetGeneric(args.Skip(2).ToArray());
+
+        // Find best-matching method on base type by name + arg count.
+        var candidates = baseType.GetMethods(
+            System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)
+            .Where(m => m.Name == methodName && m.GetParameters().Length == callArgs.Length)
+            .ToArray();
+        if (candidates.Length == 0)
+            throw new LispErrorException(new LispError(
+                $"DOTNET:CALL-BASE: no method {baseType.Name}.{methodName} with {callArgs.Length} args"));
+        var baseMethod = candidates[0];
+        var paramInfos = baseMethod.GetParameters();
+
+        // Convert args to expected parameter types.
+        var convertedArgs = new object?[callArgs.Length];
+        for (int i = 0; i < callArgs.Length; i++)
+            convertedArgs[i] = callArgs[i] == null ? null
+                : Convert.ChangeType(callArgs[i], paramInfos[i].ParameterType,
+                    System.Globalization.CultureInfo.InvariantCulture);
+
+        // Get or create a DynamicMethod that emits `call` (non-virtual) to baseMethod.
+        var sig = string.Join(",", paramInfos.Select(p => p.ParameterType.FullName));
+        var dm = _baseCallCache.GetOrAdd((selfType, methodName, sig), _ =>
+        {
+            var pTypes   = new[] { selfType }.Concat(paramInfos.Select(p => p.ParameterType)).ToArray();
+            var dynMethod = new System.Reflection.Emit.DynamicMethod(
+                "__base_" + methodName, baseMethod.ReturnType, pTypes, selfType, skipVisibility: true);
+            var il = dynMethod.GetILGenerator();
+            il.Emit(System.Reflection.Emit.OpCodes.Ldarg_0);
+            for (int i = 0; i < paramInfos.Length; i++)
+                il.Emit(System.Reflection.Emit.OpCodes.Ldarg, i + 1);
+            il.Emit(System.Reflection.Emit.OpCodes.Call, baseMethod);
+            il.Emit(System.Reflection.Emit.OpCodes.Ret);
+            return dynMethod;
+        });
+
+        var allArgs = new object?[] { target }.Concat(convertedArgs).ToArray();
+        var result  = dm.Invoke(null, allArgs);
+        return DotNetToLisp(result);
     }
 
     public static LispObject DotNetBox(LispObject[] args)

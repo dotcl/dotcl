@@ -189,6 +189,11 @@ Example:
                 Console.Error.WriteLine(lse.FormatTrace());
                 Environment.Exit(1);
             }
+            catch (LispErrorException lee)
+            {
+                Console.Error.WriteLine($"Error: {lee.Message}");
+                Environment.Exit(1);
+            }
             return;
         }
 
@@ -771,8 +776,17 @@ Example:
             var primary = $"{pkgName}> ";
             var prompt = buffer.Length == 0 ? primary : new string(' ', primary.Length);
 
-            Console.Write(prompt);
-            string? line = Console.ReadLine();
+            string? line;
+            if (Startup.ReadlineHook != null)
+            {
+                var result = Startup.ReadlineHook.Invoke(new LispObject[] { new LispString(prompt) });
+                line = result is Nil ? null : (result as LispString)?.Value ?? result.ToString();
+            }
+            else
+            {
+                Console.Write(prompt);
+                line = Console.ReadLine();
+            }
 
             if (line == null)
             {

@@ -90,7 +90,7 @@
 ;;; -------------------------------------------------------------------------
 ;;; D773 — Step 3: public instance fields
 
-;;; 単一フィールド (int) の set/get roundtrip
+;;; Single field (int) set/get roundtrip
 (deftest d773-int-field-roundtrip
   (progn
     (dotnet:%define-class "DotclTest.FieldClassA" nil
@@ -100,7 +100,7 @@
       (dotnet:invoke obj "Count")))
   42)
 
-;;; 文字列フィールド
+;;; String field
 (deftest d773-string-field-roundtrip
   (progn
     (dotnet:%define-class "DotclTest.FieldClassB" nil
@@ -110,7 +110,7 @@
       (dotnet:invoke obj "Label")))
   "hello")
 
-;;; 複数フィールド — 独立に保持される
+;;; Multiple fields — each stored independently
 (deftest d773-multiple-fields
   (progn
     (dotnet:%define-class "DotclTest.FieldClassC" nil
@@ -126,7 +126,7 @@
             (dotnet:invoke obj "Tag"))))
   (10 20 "origin"))
 
-;;; 重複 field 名は拒否される
+;;; Duplicate field name is rejected
 (deftest d773-duplicate-field-rejected
   (signals-error
     (dotnet:%define-class "DotclTest.BadFieldClass" nil
@@ -134,7 +134,7 @@
     error)
   t)
 
-;;; Nil field-specs は 2 引数形と同等 (NEW 可能)
+;;; Nil field-specs behaves like the 2-arg form (NEW is possible)
 (deftest d773-nil-fields-behaves-like-2arg
   (progn
     (dotnet:%define-class "DotclTest.FieldClassD" nil nil)
@@ -144,7 +144,7 @@
 ;;; -------------------------------------------------------------------------
 ;;; D774 — Step 4: type-level custom attributes
 
-;;; 引数なし attribute の付与
+;;; Applying an attribute with no arguments
 (deftest d774-attribute-applied
   (progn
     (dotnet:%define-class "DotclTest.AttrClassA" nil nil
@@ -155,7 +155,7 @@
       (dotnet:invoke attrs "get_Length")))
   1)
 
-;;; 属性なしなら空
+;;; No attributes means empty
 (deftest d774-attribute-absent
   (progn
     (dotnet:%define-class "DotclTest.AttrClassB")
@@ -165,7 +165,7 @@
       (dotnet:invoke attrs "get_Length")))
   0)
 
-;;; string ctor 引数
+;;; String constructor argument
 (deftest d774-attribute-ctor-string-arg
   (progn
     (dotnet:%define-class "DotclTest.AttrClassC" nil nil
@@ -177,7 +177,7 @@
       (dotnet:invoke first "get_Message")))
   "do not use this")
 
-;;; 複数 attribute
+;;; Multiple attributes
 (deftest d774-multiple-attributes
   (progn
     (dotnet:%define-class "DotclTest.AttrClassD" nil nil
@@ -189,7 +189,7 @@
       (dotnet:invoke attrs "get_Length")))
   2)
 
-;;; 存在しない attribute 型名はエラー
+;;; Unknown attribute type name is an error
 (deftest d774-unknown-attribute-rejected
   (signals-error
     (dotnet:%define-class "DotclTest.BadAttrClass" nil nil
@@ -223,7 +223,7 @@
       (dotnet:invoke obj "Double" 21)))
   42)
 
-;;; 2 引数メソッド
+;;; Two-parameter method
 (deftest d776-two-params
   (progn
     (dotnet:%define-class "DotclTest.MethodClassC" nil nil nil
@@ -233,7 +233,7 @@
       (dotnet:invoke obj "Add" 10 32)))
   42)
 
-;;; String param + string return — 参照型の castclass 経路
+;;; String param + string return — castclass path for reference types
 (deftest d776-string-param-string-return
   (progn
     (dotnet:%define-class "DotclTest.MethodClassD" nil nil nil
@@ -243,7 +243,7 @@
       (dotnet:invoke obj "Echo" "hello world")))
   "hello world")
 
-;;; self にアクセスして自分のフィールドを読める。Fields + Methods の統合。
+;;; Can access self to read own fields. Integration of Fields + Methods.
 (deftest d776-self-accesses-fields
   (progn
     (dotnet:%define-class "DotclTest.MethodClassE" nil
@@ -256,7 +256,7 @@
       (dotnet:invoke obj "GetX")))
   7)
 
-;;; 複数メソッド定義
+;;; Multiple method definitions
 (deftest d776-multiple-methods
   (progn
     (dotnet:%define-class "DotclTest.MethodClassF" nil nil nil
@@ -269,7 +269,7 @@
             (dotnet:invoke obj "Plus2" 10))))
   (11 12))
 
-;;; void 戻り値
+;;; Void return value
 (deftest d776-void-return
   (progn
     (dotnet:%define-class "DotclTest.MethodClassG" nil
@@ -287,7 +287,7 @@
       (dotnet:invoke obj "Counter")))
   3)
 
-;;; 重複 method 名はエラー
+;;; Duplicate method name is an error
 (deftest d776-duplicate-method-rejected
   (signals-error
     (dotnet:%define-class "DotclTest.BadMethodClass" nil nil nil
@@ -296,7 +296,7 @@
     error)
   t)
 
-;;; method spec の lambda 部が non-function ならエラー
+;;; Non-function in the lambda part of a method spec is an error
 (deftest d776-non-function-body-rejected
   (signals-error
     (dotnet:%define-class "DotclTest.BadMethodClass2" nil nil nil
@@ -307,18 +307,18 @@
 ;;; -------------------------------------------------------------------------
 ;;; D777 — Step 5b: dotnet:define-class macro (syntactic sugar over %define-class)
 
-;;; Macro は contrib にある。require 経由でロード (D778)。
+;;; The macro lives in contrib. Load it via require (D778).
 (require :dotnet-class)
 
-;;; Minimal form: 名前と superclass だけ。fields/attrs/methods 省略。
+;;; Minimal form: name and superclass only. fields/attrs/methods omitted.
 (deftest d777-macro-minimal
   (progn
     (dotnet:define-class "DotclTest.MacroClassA" ("System.Object"))
     (not (null (dotnet:new "DotclTest.MacroClassA"))))
   t)
 
-;;; Fields + methods 経由。self で自フィールドを読む古典的ユースケース。
-;;; param 名は symbol (lexical var), type は string。
+;;; Via fields + methods. Classic use case of reading own fields via self.
+;;; Param names are symbols (lexical vars), types are strings.
 (deftest d777-macro-fields-and-methods
   (progn
     (dotnet:define-class "DotclTest.MacroClassB" ("System.Object")
@@ -335,7 +335,7 @@
             (dotnet:invoke obj "Add" 10))))
   (5 15))
 
-;;; Attributes 経由 — macro の 3rd option
+;;; Via attributes — 3rd option of the macro
 (deftest d777-macro-attributes
   (progn
     (dotnet:define-class "DotclTest.MacroClassC" ("System.Object")
@@ -348,7 +348,7 @@
       (dotnet:invoke first "get_Message")))
   "macro-attached")
 
-;;; 基底クラス継承経路は macro でも OK — 2nd 引数の第 1 要素が base
+;;; Base class inheritance also works via macro — 1st element of 2nd arg is the base
 (deftest d777-macro-inheritance
   (progn
     (dotnet:define-class "DotclTest.MacroException" ("System.Exception"))
@@ -358,7 +358,7 @@
       (dotnet:invoke base "get_FullName")))
   "System.Exception")
 
-;;; Void 戻り + 副作用 — method 本体で他メソッドを呼べる
+;;; Void return + side effects — method body can call other methods
 (deftest d777-macro-void-method
   (progn
     (dotnet:define-class "DotclTest.MacroClassD" ("System.Object")
@@ -378,7 +378,7 @@
 ;;; -------------------------------------------------------------------------
 ;;; D778 — Step 5c: type short-name resolution + require integration
 
-;;; BCL 型の symbol short-name が有効 (Int32 / String / Void / Object)
+;;; BCL type symbol short-names are valid (Int32 / String / Void / Object)
 (deftest d778-shortnames-primitive
   (progn
     (dotnet:define-class "DotclTest.ShortClassA" (Object)
@@ -399,7 +399,7 @@
             (dotnet:invoke obj "Add" 3 4))))
   (100 "stored" "hello" 7))
 
-;;; symbol と string 混在可
+;;; Symbols and strings can be mixed
 (deftest d778-shortnames-mixed
   (progn
     (dotnet:define-class "DotclTest.ShortClassB" ("System.Object")
@@ -412,7 +412,7 @@
       (+ (dotnet:invoke obj "X") (dotnet:invoke obj "Y"))))
   3)
 
-;;; BCL BaseType を symbol で指定
+;;; Specifying BCL BaseType with a symbol
 (deftest d778-shortname-base
   (progn
     (dotnet:define-class "DotclTest.ShortException" (Exception))
@@ -422,15 +422,15 @@
       (dotnet:invoke base "get_FullName")))
   "System.Exception")
 
-;;; 未知の short-name symbol は展開時エラー
+;;; Unknown short-name symbol is a macro-expansion error
 (deftest d778-unknown-shortname-rejected
   (signals-error
     (macroexpand-1 '(dotnet:define-class "DotclTest.Bad" (NoSuchType)))
     error)
   t)
 
-;;; ユーザ拡張: テーブルに追加すれば自分の alias が使える。
-;;; setf は macro 展開より前に評価される必要があるので top-level に置く。
+;;; User extension: adding to the table lets you use your own alias.
+;;; setf must be evaluated before macro expansion, so it goes at top level.
 (setf (gethash "MYHANDLER" dotnet::*type-aliases*) "DotclTest.UserAliasBase")
 (dotnet:define-class "DotclTest.UserAliasBase" (Object))
 
@@ -446,7 +446,7 @@
 ;;; -------------------------------------------------------------------------
 ;;; D783 — Step 7a: ctor body (Lisp lambda invoked after base.ctor)
 
-;;; ctor body が呼ばれ、self 経由で自分のフィールドを初期化できる
+;;; The ctor body is called and can initialize own fields via self
 (deftest d783-ctor-body-initializes-field
   (progn
     (dotnet:%define-class "DotclTest.CtorClassA" nil
@@ -459,7 +459,7 @@
       (dotnet:invoke obj "Count")))
   99)
 
-;;; ctor body と method が共存して、method が ctor で初期化された値を読める
+;;; ctor body and method coexist; the method can read the value initialized in ctor
 (deftest d783-ctor-then-method
   (progn
     (dotnet:%define-class "DotclTest.CtorClassB" nil
@@ -473,7 +473,7 @@
       (dotnet:invoke obj "Get")))
   7)
 
-;;; 2 回 new したらそれぞれ独立に ctor body が走る
+;;; Each call to new runs the ctor body independently
 (deftest d783-ctor-runs-per-new
   (progn
     (dotnet:%define-class "DotclTest.CtorClassC" nil
@@ -488,14 +488,14 @@
             (dotnet:invoke b "Tag"))))
   ("initialized" "initialized"))
 
-;;; nil ctor-body は省略と同じ (デフォルト空 ctor)
+;;; nil ctor-body is the same as omitting it (default empty ctor)
 (deftest d783-nil-ctor-body
   (progn
     (dotnet:%define-class "DotclTest.CtorClassD" nil nil nil nil nil)
     (not (null (dotnet:new "DotclTest.CtorClassD"))))
   t)
 
-;;; non-function の ctor body はエラー
+;;; Non-function ctor body is an error
 (deftest d783-non-function-ctor-rejected
   (signals-error
     (dotnet:%define-class "DotclTest.BadCtorClass" nil nil nil nil
@@ -503,7 +503,7 @@
     error)
   t)
 
-;;; macro (:ctor ...) 経由で同じことができる
+;;; The same can be done via macro (:ctor ...)
 (deftest d783-macro-ctor-option
   (progn
     (dotnet:define-class "DotclTest.MacroCtorA" (Object)
@@ -521,8 +521,8 @@
 ;;; -------------------------------------------------------------------------
 ;;; D785 — Step 7b: auto-properties (private backing field + public get/set)
 
-;;; Int プロパティの set/get roundtrip (DOTNET:INVOKE が get_X/set_X を
-;;; 見つけて InvokeMember で呼ぶ)
+;;; Int property set/get roundtrip (DOTNET:INVOKE finds get_X/set_X
+;;; and calls them via InvokeMember)
 (deftest d785-int-property-roundtrip
   (progn
     (dotnet:%define-class "DotclTest.PropClassA" nil nil nil nil nil
@@ -532,7 +532,7 @@
       (dotnet:invoke obj "Count")))
   42)
 
-;;; String プロパティ
+;;; String property
 (deftest d785-string-property-roundtrip
   (progn
     (dotnet:%define-class "DotclTest.PropClassB" nil nil nil nil nil
@@ -542,7 +542,7 @@
       (dotnet:invoke obj "Message")))
   "hello properties")
 
-;;; プロパティ型が reflection から public property として見える
+;;; Property type is visible as a public property via reflection
 (deftest d785-property-visible-via-reflection
   (progn
     (dotnet:%define-class "DotclTest.PropClassC" nil nil nil nil nil
@@ -550,11 +550,11 @@
     (let* ((obj (dotnet:new "DotclTest.PropClassC"))
            (type (dotnet:invoke obj "GetType"))
            (props (dotnet:invoke type "GetProperties")))
-      ;; GetProperties で少なくとも 1 つは取れる
+      ;; GetProperties returns at least 1
       (< 0 (dotnet:invoke props "get_Length"))))
   t)
 
-;;; 重複 property 名は拒否
+;;; Duplicate property name is rejected
 (deftest d785-duplicate-property-rejected
   (signals-error
     (dotnet:%define-class "DotclTest.BadPropClass" nil nil nil nil nil
@@ -562,7 +562,7 @@
     error)
   t)
 
-;;; macro (:properties ...) 経由
+;;; Via macro (:properties ...)
 (deftest d785-macro-properties
   (progn
     (dotnet:define-class "DotclTest.MacroProp" (Object)
@@ -578,7 +578,7 @@
 ;;; -------------------------------------------------------------------------
 ;;; D786 — Step 7c: virtual method override via DefineMethodOverride
 
-;;; 基本: System.Object.ToString() を上書き。virtual dispatch が override を選ぶ。
+;;; Basic: overriding System.Object.ToString(). Virtual dispatch selects the override.
 (deftest d786-override-tostring
   (progn
     (dotnet:%define-class "DotclTest.OverrideA" nil nil nil
@@ -589,10 +589,10 @@
       (dotnet:invoke obj "ToString")))
   "custom-tostring")
 
-;;; :override t 無しのメソッドは new の shadow なので base を型経由で呼ぶと base が返る
-;;; のが本来だが、ここでは単純に override 版と non-override 版で挙動が分かれることを確認
-;;; しない (dotnet:invoke は名前解決ベース)。代わりに override 時は Virtual bit が
-;;; 立つことを reflection で確認する。
+;;; A method without :override t is a new shadow, so calling base through the type
+;;; would normally return the base — but here we do not verify the behavioral split
+;;; between override and non-override versions (dotnet:invoke is name-resolution based).
+;;; Instead we verify via reflection that the Virtual bit is set when overriding.
 (deftest d786-override-method-is-virtual
   (progn
     (dotnet:%define-class "DotclTest.OverrideB" nil nil nil
@@ -605,7 +605,7 @@
       (dotnet:invoke mi "get_IsVirtual")))
   t)
 
-;;; 引数付き override — System.Object.Equals(Object)
+;;; Override with an argument — System.Object.Equals(Object)
 (deftest d786-override-equals
   (progn
     (dotnet:%define-class "DotclTest.OverrideC" nil nil nil
@@ -618,7 +618,7 @@
       (dotnet:invoke obj "Equals" obj)))
   t)
 
-;;; 非 virtual なメソッド (Object.GetType) を override しようとするとエラー
+;;; Attempting to override a non-virtual method (Object.GetType) is an error
 (deftest d786-override-non-virtual-rejected
   (signals-error
     (dotnet:%define-class "DotclTest.BadOverrideA" nil nil nil
@@ -628,7 +628,7 @@
     error)
   t)
 
-;;; 存在しないメソッド名を override しようとするとエラー
+;;; Attempting to override a non-existent method name is an error
 (deftest d786-override-missing-rejected
   (signals-error
     (dotnet:%define-class "DotclTest.BadOverrideB" nil nil nil
@@ -638,7 +638,7 @@
     error)
   t)
 
-;;; 戻り値型が base と合わないとエラー
+;;; Return type mismatch with base is an error
 (deftest d786-override-return-type-mismatch-rejected
   (signals-error
     (dotnet:%define-class "DotclTest.BadOverrideC" nil nil nil
@@ -648,7 +648,7 @@
     error)
   t)
 
-;;; 祖父型の virtual を override できる (Exception を経由して Object.ToString)
+;;; Can override a grandparent virtual (Object.ToString via Exception)
 (deftest d786-override-from-grandparent
   (progn
     (dotnet:%define-class "DotclTest.OverrideExc" "System.Exception" nil nil
@@ -659,7 +659,7 @@
       (dotnet:invoke obj "ToString")))
   "exc-override")
 
-;;; macro (:override t) 経路
+;;; Via macro (:override t) path
 (deftest d786-macro-override
   (progn
     (dotnet:define-class "DotclTest.MacroOverride" (Object)
@@ -670,7 +670,7 @@
       (dotnet:invoke obj "ToString")))
   "macro-override")
 
-;;; macro で :override 未指定は通常メソッド (既存 d777 との両立確認)
+;;; No :override in macro means a normal method (confirms compatibility with existing d777)
 (deftest d786-macro-no-override-still-works
   (progn
     (dotnet:define-class "DotclTest.MacroNoOverride" (Object)
@@ -684,7 +684,7 @@
 ;;; -------------------------------------------------------------------------
 ;;; D787 — Step 7d: interface implementations
 
-;;; IDisposable を実装。型は IDisposable を is-a として見える。
+;;; Implement IDisposable. The type is visible as an is-a IDisposable.
 (deftest d787-implement-idisposable
   (progn
     (dotnet:%define-class "DotclTest.DisposableA" nil nil nil
@@ -698,7 +698,7 @@
       (dotnet:invoke iface "IsAssignableFrom" type)))
   t)
 
-;;; 実装メソッドの Lisp body が interface dispatch 経由で呼ばれる
+;;; The Lisp body of the implemented method is called via interface dispatch
 (deftest d787-interface-method-dispatches
   (progn
     (dotnet:%define-class "DotclTest.CloneableA" nil
@@ -710,11 +710,11 @@
       '("System.ICloneable"))
     (let ((obj (dotnet:new "DotclTest.CloneableA")))
       (dotnet:%set-invoke obj "Tag" "cloned-via-iface")
-      ;; Clone は ICloneable.Clone の実装。直接呼べる。
+      ;; Clone is the implementation of ICloneable.Clone. Can be called directly.
       (dotnet:invoke obj "Clone")))
   "cloned-via-iface")
 
-;;; 実装メソッドは Virtual|Final (sealed override) で emit される
+;;; Implemented method is emitted as Virtual|Final (sealed override)
 (deftest d787-impl-method-is-virtual-and-final
   (progn
     (dotnet:%define-class "DotclTest.DisposableB" nil nil nil
@@ -729,7 +729,7 @@
             (dotnet:invoke mi "get_IsFinal"))))
   (t t))
 
-;;; 複数 interface 同時実装
+;;; Implementing multiple interfaces simultaneously
 (deftest d787-multiple-interfaces
   (progn
     (dotnet:%define-class "DotclTest.DualIface" nil nil nil
@@ -745,7 +745,7 @@
       (dotnet:invoke ifaces "get_Length")))
   2)
 
-;;; 非 interface を :implements に渡すとエラー (System.Object はクラス)
+;;; Passing a non-interface to :implements is an error (System.Object is a class)
 (deftest d787-non-interface-rejected
   (signals-error
     (dotnet:%define-class "DotclTest.BadIface1" nil nil nil nil nil nil
@@ -753,7 +753,7 @@
     error)
   t)
 
-;;; 重複 interface はエラー
+;;; Duplicate interface is an error
 (deftest d787-duplicate-interface-rejected
   (signals-error
     (dotnet:%define-class "DotclTest.BadIface2" nil nil nil nil nil nil
@@ -761,8 +761,8 @@
     error)
   t)
 
-;;; interface method に合致しないメソッドは従来通り普通の public method で
-;;; 通る (Foo はどの interface にもない名前なので virtual にならない)
+;;; A method that does not match any interface method remains a plain public method
+;;; (Foo is not in any interface, so it does not become virtual)
 (deftest d787-nonmatching-method-stays-plain
   (progn
     (dotnet:%define-class "DotclTest.MixedIface" nil nil nil
@@ -776,7 +776,7 @@
       (dotnet:invoke obj "Extra")))
   "extra-value")
 
-;;; macro (:implements ...) 経路 — symbol short-name も OK
+;;; Via macro (:implements ...) path — symbol short-names are also OK
 (deftest d787-macro-implements
   (progn
     (dotnet:define-class "DotclTest.MacroDisposable" (Object)
@@ -790,7 +790,7 @@
       (dotnet:invoke iface "IsAssignableFrom" type)))
   t)
 
-;;; macro で複数 interface + properties + methods 統合
+;;; Macro integrating multiple interfaces + properties + methods
 (deftest d787-macro-mvvm-scaffold
   (progn
     (dotnet:define-class "DotclTest.VMScaffold" (Object)
@@ -815,7 +815,7 @@
 ;;; -------------------------------------------------------------------------
 ;;; D788 — Step 7e: events (delegate field + add_/remove_ accessors + EventBuilder)
 
-;;; 基本: event が reflection で見える
+;;; Basic: event is visible via reflection
 (deftest d788-event-visible-via-reflection
   (progn
     (dotnet:%define-class "DotclTest.EventA" nil nil nil nil nil nil nil
@@ -826,7 +826,7 @@
       (dotnet:invoke events "get_Length")))
   1)
 
-;;; add_Name / remove_Name accessor が emit される
+;;; add_Name / remove_Name accessors are emitted
 (deftest d788-event-add-remove-accessors-exist
   (progn
     (dotnet:%define-class "DotclTest.EventB" nil nil nil nil nil nil nil
@@ -838,7 +838,7 @@
       (list (not (null am)) (not (null rm)))))
   (t t))
 
-;;; 非 delegate 型は reject
+;;; Non-delegate type is rejected
 (deftest d788-event-non-delegate-rejected
   (signals-error
     (dotnet:%define-class "DotclTest.BadEventA" nil nil nil nil nil nil nil
@@ -846,7 +846,7 @@
     error)
   t)
 
-;;; 重複 event 名 reject
+;;; Duplicate event name is rejected
 (deftest d788-event-duplicate-rejected
   (signals-error
     (dotnet:%define-class "DotclTest.BadEventB" nil nil nil nil nil nil nil
@@ -855,7 +855,7 @@
     error)
   t)
 
-;;; add_Name が methods と名前衝突したら reject
+;;; Rejected when add_Name collides in name with an existing method
 (deftest d788-event-method-collision-rejected
   (signals-error
     (dotnet:%define-class "DotclTest.BadEventC" nil nil nil
@@ -866,11 +866,11 @@
     error)
   t)
 
-;;; INotifyPropertyChanged を実装して PropertyChanged event を付ける
-;;; → add_/remove_PropertyChanged が interface slot を満たす
-;;; (Type.GetType は assembly-qualified name が無いと System.ObjectModel の
-;;;  INotifyPropertyChanged を解決できないので、ここでは GetInterfaces を
-;;;  reflection して Fullname で照合する)
+;;; Implement INotifyPropertyChanged and attach a PropertyChanged event
+;;; → add_/remove_PropertyChanged satisfies the interface slot
+;;; (Type.GetType cannot resolve System.ObjectModel's INotifyPropertyChanged
+;;;  without an assembly-qualified name, so here we use GetInterfaces via
+;;;  reflection and match by FullName)
 (deftest d788-inotifypropertychanged-implemented
   (progn
     (dotnet:%define-class "DotclTest.NotifyA" nil nil nil nil nil nil
@@ -883,7 +883,7 @@
       (dotnet:invoke first "get_FullName")))
   "System.ComponentModel.INotifyPropertyChanged")
 
-;;; interface slot にフィットすると add_/remove_ は Virtual|Final
+;;; When fitting an interface slot, add_/remove_ become Virtual|Final
 (deftest d788-iface-event-accessors-are-virtual-and-final
   (progn
     (dotnet:%define-class "DotclTest.NotifyB" nil nil nil nil nil nil
@@ -896,8 +896,8 @@
             (dotnet:invoke am "get_IsFinal"))))
   (t t))
 
-;;; dotnet:add-event / remove-event がクラッシュせず通る
-;;; (実際に handler が呼ばれるかは D789 の raiser 実装後でないと確認できない)
+;;; dotnet:add-event / remove-event complete without crashing
+;;; (whether the handler is actually called cannot be verified until D789's raiser is implemented)
 (deftest d788-add-remove-event-roundtrip
   (progn
     (dotnet:%define-class "DotclTest.EventC" nil nil nil nil nil nil nil
@@ -910,7 +910,7 @@
       t))
   t)
 
-;;; macro (:events ...) 経路 — symbol short-name も OK
+;;; Via macro (:events ...) path — symbol short-names are also OK
 (deftest d788-macro-events
   (progn
     (dotnet:define-class "DotclTest.EventMacro" (Object)
@@ -922,7 +922,7 @@
       (dotnet:invoke events "get_Length")))
   1)
 
-;;; macro で INotifyPropertyChanged 完全統合 (interface + event + property)
+;;; Full INotifyPropertyChanged integration via macro (interface + event + property)
 (deftest d788-macro-inpc-scaffold
   (progn
     (dotnet:define-class "DotclTest.NotifyScaffold" (Object)
@@ -944,7 +944,7 @@
 ;;; -------------------------------------------------------------------------
 ;;; D789 — Step 7f: event raiser auto-generation (OnName)
 
-;;; OnName が public method として emit される (sender-pattern)
+;;; OnName is emitted as a public method (sender-pattern)
 (deftest d789-raiser-method-exists
   (progn
     (dotnet:%define-class "DotclTest.RaiserA" nil nil nil nil nil nil nil
@@ -955,7 +955,7 @@
       (not (null mi))))
   t)
 
-;;; OnName は virtual
+;;; OnName is virtual
 (deftest d789-raiser-is-virtual
   (progn
     (dotnet:%define-class "DotclTest.RaiserB" nil nil nil nil nil nil nil
@@ -966,7 +966,7 @@
       (dotnet:invoke mi "get_IsVirtual")))
   t)
 
-;;; sender-pattern: OnName(args) のパラメタ数は delegate Invoke の params - 1
+;;; sender-pattern: parameter count of OnName(args) is delegate Invoke params - 1
 ;;; (System.EventHandler.Invoke(object,EventArgs) → OnClicked(EventArgs))
 (deftest d789-sender-pattern-strips-first
   (progn
@@ -979,9 +979,8 @@
       (dotnet:invoke ps "get_Length")))
   1)
 
-;;; handler が非 null の時 raiser で発火し side-effect が観測できる
-;;; (dotnet:add-event で handler を載せ、OnClicked を呼び、closure の
-;;;  counter が増える)
+;;; When handler is non-null, the raiser fires and the side-effect is observable
+;;; (add handler via dotnet:add-event, call OnClicked, closure counter increments)
 (deftest d789-raiser-fires-handler
   (progn
     (dotnet:%define-class "DotclTest.FireA" nil nil nil nil nil nil nil
@@ -997,7 +996,7 @@
       counter))
   2)
 
-;;; handler が null の時は OnName を呼んでもクラッシュしない
+;;; When handler is null, calling OnName does not crash
 (deftest d789-raiser-null-handler-is-noop
   (progn
     (dotnet:%define-class "DotclTest.FireB" nil nil nil nil nil nil nil
@@ -1007,8 +1006,8 @@
       t))
   t)
 
-;;; D794 (#160 fix): bare Lisp lambda を渡しても remove-event が
-;;; 実際に delegate を取り外せる。handler 同一性をキャッシュ経由で解決。
+;;; D794 (#160 fix): remove-event can actually detach the delegate even when
+;;; a bare Lisp lambda is passed. Handler identity is resolved via cache.
 (deftest d794-remove-event-bare-lambda
   (progn
     (dotnet:%define-class "DotclTest.RemoveA" nil nil nil nil nil nil nil
@@ -1023,7 +1022,7 @@
       counter))
   1)
 
-;;; 複数 handler のうち特定 1 つだけ remove できる
+;;; Can remove one specific handler out of multiple handlers
 (deftest d794-remove-specific-handler-among-many
   (progn
     (dotnet:%define-class "DotclTest.RemoveB" nil nil nil nil nil nil nil
@@ -1041,7 +1040,7 @@
       (list a-counter b-counter)))
   (1 2))
 
-;;; 未登録 handler の remove は noop (エラーにならない)
+;;; Removing an unregistered handler is a noop (no error)
 (deftest d794-remove-unregistered-noop
   (progn
     (dotnet:%define-class "DotclTest.RemoveC" nil nil nil nil nil nil nil
@@ -1052,7 +1051,7 @@
       t))
   t)
 
-;;; raiser 名が methods と衝突したら reject (OnClicked が予約済み)
+;;; Rejected when the raiser name collides with a method (OnClicked is reserved)
 (deftest d789-raiser-method-collision-rejected
   (signals-error
     (dotnet:%define-class "DotclTest.BadRaiser" nil nil nil
@@ -1063,7 +1062,7 @@
     error)
   t)
 
-;;; 複数 handler: Combine されて全部呼ばれる
+;;; Multiple handlers: all are called via Combine
 (deftest d789-multiple-handlers
   (progn
     (dotnet:%define-class "DotclTest.FireD" nil nil nil nil nil nil nil
@@ -1079,8 +1078,8 @@
       (list a-counter b-counter)))
   (1 1))
 
-;;; 真の INotifyPropertyChanged: property setter 風に OnPropertyChanged を
-;;; 呼んで handler が発火する end-to-end テスト
+;;; True INotifyPropertyChanged: end-to-end test that calls OnPropertyChanged
+;;; in property-setter fashion and verifies the handler fires
 (deftest d789-inpc-end-to-end
   (progn
     (dotnet:define-class "DotclTest.NotifyVM" (Object)
@@ -1106,9 +1105,9 @@
   ("new-title" "Title"))
 
 ;;; -------------------------------------------------------------------------
-;;; D790 — Step 7g: :notify t で setter が OnPropertyChanged を自動呼び出し
+;;; D790 — Step 7g: :notify t makes setter auto-call OnPropertyChanged
 
-;;; :notify t 指定で property set 時に PropertyChanged が発火する
+;;; With :notify t specified, PropertyChanged fires on property set
 (deftest d790-notify-fires-property-changed
   (progn
     (dotnet:define-class "DotclTest.NotifyProp1" (Object)
@@ -1126,7 +1125,7 @@
       last-name))
   "Title")
 
-;;; :notify t でも通常の get/set は壊れない
+;;; Normal get/set still works correctly when :notify t is specified
 (deftest d790-notify-get-set-roundtrip
   (progn
     (dotnet:define-class "DotclTest.NotifyProp2" (Object)
@@ -1139,7 +1138,7 @@
       (dotnet:invoke obj "Count")))
   42)
 
-;;; :notify 指定 property と :notify 未指定 property が混在できる
+;;; Properties with :notify and without :notify can coexist
 (deftest d790-mixed-notify-and-plain
   (progn
     (dotnet:define-class "DotclTest.NotifyProp3" (Object)
@@ -1152,12 +1151,12 @@
            (fired 0))
       (dotnet:add-event obj "PropertyChanged"
                         (lambda (s a) (declare (ignore s a)) (incf fired)))
-      (dotnet:%set-invoke obj "Internal" 10)  ; notify なし → 発火しない
-      (dotnet:%set-invoke obj "Title" "x")    ; notify あり → 発火
+      (dotnet:%set-invoke obj "Internal" 10)  ; no notify → does not fire
+      (dotnet:%set-invoke obj "Title" "x")    ; notify → fires
       fired))
   1)
 
-;;; PropertyChanged event を宣言しないで :notify t はエラー
+;;; Using :notify t without declaring a PropertyChanged event is an error
 (deftest d790-notify-without-event-rejected
   (signals-error
     (dotnet:%define-class "DotclTest.BadNotify" nil nil nil nil nil
@@ -1166,7 +1165,7 @@
     error)
   t)
 
-;;; 複数 :notify property — 各 set で正しい name が通知される
+;;; Multiple :notify properties — correct name is notified on each set
 (deftest d790-multiple-notify-properties
   (progn
     (dotnet:define-class "DotclTest.NotifyProp4" (Object)
@@ -1187,7 +1186,7 @@
       (reverse names)))
   ("A" "B" "A"))
 
-;;; 完全な MVVM scaffold — SetX wrapper なしで boilerplate が消える
+;;; Full MVVM scaffold — boilerplate eliminated without SetX wrappers
 (deftest d790-mvvm-no-boilerplate
   (progn
     (dotnet:define-class "DotclTest.CleanVM" (Object)
@@ -1210,9 +1209,9 @@
   ("hello" 3 (("Title") ("Count"))))
 
 ;;; -------------------------------------------------------------------------
-;;; 以下、D785 integration（先頭 comment は旧版のまま）
+;;; D785 integration (leading comment left as-is from the original)
 
-;;; properties + ctor + methods 統合 — ViewModel 相当のパターン
+;;; Integration of properties + ctor + methods — ViewModel equivalent pattern
 (deftest d785-integration-viewmodel
   (progn
     (dotnet:define-class "DotclTest.ViewModel" (Object)
@@ -1288,3 +1287,49 @@
   (dotnet:using ()
     42)
   42)
+
+;;; -------------------------------------------------------------------------
+;;; D1081 — parameterized constructors via (:ctor (params...) body...)
+
+;;; Single Int32 param: value passed to new is forwarded to ctor body
+(deftest d1081-ctor-single-int-param
+  (progn
+    (dotnet:define-class "DotclTest.ParamCtorA" (Object)
+      (:properties ("Value" Int32))
+      (:ctor ((val Int32))
+        (dotnet:invoke self "set_Value" val)))
+    (dotnet:invoke (dotnet:new "DotclTest.ParamCtorA" 42) "get_Value"))
+  42)
+
+;;; Two params: both forwarded correctly
+(deftest d1081-ctor-two-params
+  (progn
+    (dotnet:define-class "DotclTest.ParamCtorB" (Object)
+      (:properties ("X" Int32) ("Y" Int32))
+      (:ctor ((x Int32) (y Int32))
+        (dotnet:invoke self "set_X" x)
+        (dotnet:invoke self "set_Y" y)))
+    (let ((obj (dotnet:new "DotclTest.ParamCtorB" 3 7)))
+      (list (dotnet:invoke obj "get_X")
+            (dotnet:invoke obj "get_Y"))))
+  (3 7))
+
+;;; String param
+(deftest d1081-ctor-string-param
+  (progn
+    (dotnet:define-class "DotclTest.ParamCtorC" (Object)
+      (:properties ("Label" String))
+      (:ctor ((s String))
+        (dotnet:invoke self "set_Label" s)))
+    (dotnet:invoke (dotnet:new "DotclTest.ParamCtorC" "hello") "get_Label"))
+  "hello")
+
+;;; Zero-param ctor still works (no regression)
+(deftest d1081-ctor-zero-params-unchanged
+  (progn
+    (dotnet:define-class "DotclTest.ParamCtorD" (Object)
+      (:properties ("N" Int32))
+      (:ctor ()
+        (dotnet:invoke self "set_N" 7)))
+    (dotnet:invoke (dotnet:new "DotclTest.ParamCtorD") "get_N"))
+  7)

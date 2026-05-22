@@ -51,7 +51,7 @@ checks if something fails:
 - **`No assemblies found in ...override...`** — missing
   `EmbedAssembliesIntoApk=true`.
 - **`PlatformNotSupportedException` at startup** — outdated dotcl runtime,
-  pre-D820. The Console.In/Out/Error guard there is required for
+  The Console.In/Out/Error guard there is required for
   no-console hosts (Android, services).
 - **`BUILD-MAIN-PAGE has no function binding`** — `main.lisp` failed to
   load. Read `adb shell run-as com.dotcl.mauilispdemo cat

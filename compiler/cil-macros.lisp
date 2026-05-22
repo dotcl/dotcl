@@ -2310,7 +2310,10 @@
                        (find-class ',name)
                        (list ,@args))))))
           `(progn
-             (%register-class (%make-class ',name ,supers-expr ,slotdefs-expr))
+             (%register-class ,(if custom-metaclass-p
+                                   `(%make-class-full ',name ,supers-expr ,slotdefs-expr
+                                                      (%find-or-forward-class ',metaclass-name))
+                                   `(%make-class ',name ,supers-expr ,slotdefs-expr)))
              ,@(when default-initargs-form (list default-initargs-form))
              ,@(when class-doc
                  (list `(funcall #'(setf documentation) ,class-doc ',name 'type)))
@@ -2499,7 +2502,9 @@
         (let* ((name (cadr form))
                (params (caddr form))
                (options (cdddr form))
-               (plain-params (remove-if (lambda (p) (member p '(&rest &optional &key &allow-other-keys))) params))
+               (plain-params (loop for p in params
+                                   until (member p '(&optional &rest &key &aux &body &allow-other-keys))
+                                   collect p))
                (arity (length plain-params))
                ;; Parse lambda list structure for congruence checking (CLHS 7.6.4)
                (gf-required-count 0)
@@ -2689,6 +2694,67 @@
                        method-opts)
              (fdefinition ',name)))))
 
+;;; ---------------------------------------------------------------------------
+;;; call-next-method / next-method-p capture helpers for defmethod
+;;;
+;;; Problem: dotcl compiled (call-next-method) emits (:call "Runtime.CallNextMethod")
+;;; which reads _nextMethodChain / _nextMethodIndex from thread-statics at CALL TIME.
+;;; When a method body passes a continuation (e.g. via with-sheet-medium) to an inner
+;;; generic function, that inner dispatch overwrites the thread-statics with its own
+;;; chain.  Any compiled (call-next-method) inside the continuation then sees the
+;;; wrong chain → "no next method" error.
+;;;
+;;; Fix: at method entry, capture the current cnm/nmp symbol-functions (which are
+;;; closures created by InvokeWithNextMethods that capture the correct chain in locals)
+;;; into ordinary Lisp local variables.  Replace all (call-next-method ...) /
+;;; (next-method-p) / #'call-next-method / #'next-method-p in the body with funcall
+;;; of these locals.  Nested lambdas in the body close over these locals, so the
+;;; correct chain is available regardless of any nested GF dispatch.
+;;;
+;;; %has-cnm-p -- predicate: does FORM (recursively) use call-next-method or next-method-p?
+;;; %walk-replace-cnm -- replace CNM/NMP forms with (funcall CNM-VAR ...) etc.
+;;; ---------------------------------------------------------------------------
+
+(defun %has-cnm-p (form)
+  (cond ((atom form) nil)
+        ((or (eq (car form) 'call-next-method)
+             (eq (car form) 'next-method-p)) t)
+        ((and (eq (car form) 'function)
+              (consp (cdr form))
+              (member (cadr form) '(call-next-method next-method-p) :test #'eq)) t)
+        ;; Don't descend into nested defmethod — it has its own CNM context
+        ((eq (car form) 'defmethod) nil)
+        ;; Use do-loop instead of `some` to handle improper lists safely
+        (t (do ((x form (cdr x)))
+               ((not (consp x)) nil)
+             (when (%has-cnm-p (car x)) (return t))))))
+
+(defun %walk-replace-cnm (form cv nv)
+  "Replace CNM/NMP occurrences in FORM with funcall of CV/NV (local variables)."
+  (cond ((atom form) form)
+        ;; #'call-next-method → cv
+        ((and (eq (car form) 'function) (consp (cdr form)) (null (cddr form))
+              (eq (cadr form) 'call-next-method))
+         cv)
+        ;; #'next-method-p → nv
+        ((and (eq (car form) 'function) (consp (cdr form)) (null (cddr form))
+              (eq (cadr form) 'next-method-p))
+         nv)
+        ;; (call-next-method ...) → (funcall cv ...)
+        ((eq (car form) 'call-next-method)
+         `(funcall ,cv ,@(mapcar (lambda (x) (%walk-replace-cnm x cv nv)) (cdr form))))
+        ;; (next-method-p) with no args → (funcall nv)
+        ;; With args: leave as-is so runtime arity check signals program-error
+        ((and (eq (car form) 'next-method-p) (null (cdr form)))
+         `(funcall ,nv))
+        ;; Don't descend into nested defmethod
+        ((eq (car form) 'defmethod) form)
+        ;; General recursion — use cons recursion to handle improper lists safely
+        (t (cons (%walk-replace-cnm (car form) cv nv)
+                 (if (consp (cdr form))
+                     (%walk-replace-cnm (cdr form) cv nv)
+                     (cdr form))))))
+
 ;;; --- defmethod ---
 (setf (gethash 'defmethod *macros*)
       (lambda (form)
@@ -2800,11 +2866,21 @@
                    (let ((%m (%make-method
                                (list ,@specializers)
                                ,qual-list
-                               (lambda ,plain-params
-                                 (block ,(if (and (consp name) (eq (car name) 'setf))
-                                             (cadr name)
-                                             name)
-                                   ,@body)))))
+                               ,(let* ((bn (if (and (consp name) (eq (car name) 'setf))
+                                              (cadr name)
+                                              name))
+                                       (cv (gensym "CNM-"))
+                                       (nv (gensym "NMP-")))
+                                  (if (some #'%has-cnm-p body)
+                                      `(lambda ,plain-params
+                                         (let ((,cv (symbol-function 'call-next-method))
+                                               (,nv (symbol-function 'next-method-p)))
+                                           (block ,bn
+                                             ,@(mapcar (lambda (b)
+                                                         (%walk-replace-cnm b cv nv))
+                                                       body))))
+                                      `(lambda ,plain-params
+                                         (block ,bn ,@body)))))))
                      (%set-method-lambda-list-info %m ,m-required-count ,m-optional-count
                                                    ,(if m-has-rest t nil)
                                                    ,(if m-has-key t nil)

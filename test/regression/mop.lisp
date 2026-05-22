@@ -143,3 +143,49 @@
   (let ((spec (dotcl-mop:intern-eql-specializer 42)))
     (dotcl-mop:eql-specializer-object spec))
   42)
+
+;;; --- slot-value-using-class dispatch (issue #259, AMOP §5.4) ---
+
+(defclass svuc-meta (standard-class) ())
+(defmethod validate-superclass ((c svuc-meta) (s standard-class)) t)
+
+(let ((svuc-log nil))
+  (defmethod slot-value-using-class ((c svuc-meta) obj slotd)
+    (push :read svuc-log)
+    (call-next-method))
+  (defmethod (setf slot-value-using-class) (v (c svuc-meta) obj slotd)
+    (push :write svuc-log)
+    (call-next-method))
+  (defclass svuc-obj ()
+    ((x :initarg :x :accessor svuc-x))
+    (:metaclass svuc-meta))
+
+  (deftest mop-svuc-read-dispatch
+    (progn (setq svuc-log nil)
+           (let ((o (make-instance 'svuc-obj :x 1)))
+             (svuc-x o))
+           (member :read svuc-log))
+    (:read))
+
+  (deftest mop-svuc-write-dispatch
+    (progn (setq svuc-log nil)
+           (let ((o (make-instance 'svuc-obj :x 1)))
+             (setf (svuc-x o) 2))
+           (member :write svuc-log))
+    (:write)))
+
+;;; --- setf GF cross-package bleed guard (issue #261, D1082) ---
+;;; A (setf pkg:documentation) GF with a different arity must NOT mutate
+;;; the existing (setf cl:documentation) GF lambda-list.
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (unless (find-package "DOCBLEED-TEST")
+    (make-package "DOCBLEED-TEST" :use '())))
+
+(deftest mop-setf-gf-no-cross-package-bleed
+  (let* ((before (length (generic-function-lambda-list #'(setf documentation))))
+         (other-doc (intern "DOCUMENTATION" (find-package "DOCBLEED-TEST"))))
+    ;; Define a 4-arg (setf docbleed-test:documentation) GF - must not affect CL's
+    (ensure-generic-function (list 'setf other-doc)
+                             :lambda-list '(new-value name doc-type language))
+    (length (generic-function-lambda-list #'(setf documentation))))
+  3)

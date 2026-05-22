@@ -3,8 +3,7 @@
 ;;; Demonstrates `dotnet:define-class` against the MonoGame `Game` class.
 ;;; Update + Draw are overridden to animate the background color over
 ;;; time. main.lisp is compiled into MonoGameLispDemo.fasl by the
-;;; project-core build target (#166); main.lisp itself doesn't ship at
-;;; runtime.
+;;; project-core build target; main.lisp itself doesn't ship at runtime.
 
 (in-package :cl-user)
 

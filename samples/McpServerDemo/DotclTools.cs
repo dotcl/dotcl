@@ -5,16 +5,16 @@ using ModelContextProtocol.Server;
 namespace McpServerDemo;
 
 /// <summary>
-/// dotcl を MCP 経由の tool として公開する最小 collection。
-/// LLM (Claude Desktop / Cursor / etc.) が <c>lisp_eval</c> を tool として
-/// 呼ぶと、このプロセス内の dotcl image で Lisp form を評価、結果を
-/// prin1-to-string した文字列で返す。
+/// Minimal MCP tool collection that exposes dotcl as a tool.
+/// When an LLM (Claude Desktop / Cursor / etc.) calls <c>lisp_eval</c>,
+/// the Lisp form is evaluated inside the in-process dotcl image and the
+/// result is returned as a prin1-to-string string.
 /// </summary>
 [McpServerToolType]
 public sealed class DotclTools
 {
-    // boot は 1 回だけ (FASL core load に 0.3s ほどかかるため)。eval の
-    // 並行直列化は dotcl runtime が暗黙に行うので host 側 _evalLock 不要 (D870)。
+    // Boot once only (FASL core load takes ~0.3s). The dotcl runtime serialises
+    // concurrent evals internally, so no host-side _evalLock is needed.
     private static readonly object _bootLock = new();
     private static bool _booted;
 
@@ -48,8 +48,8 @@ public sealed class DotclTools
         try
         {
             // (prin1-to-string (progn <user-code>))
-            // progn で multi-form 入力に対応、prin1 でエスケープ込みの
-            // readable 形式にしてから C# に戻す。
+            // progn handles multi-form input; prin1-to-string returns an
+            // escaped readable representation back to C#.
             var wrapped = $"(prin1-to-string (progn {code}))";
             var result = DotclHost.EvalString(wrapped);
             return result is LispString ls ? ls.Value

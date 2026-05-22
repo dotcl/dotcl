@@ -2,9 +2,8 @@
 
 dotcl を ASP.NET Core プロセスのインプロセスランタイムとして埋め込み、
 **`Microsoft.AspNetCore.Mvc.ControllerBase` 派生型を Lisp 側で定義** して
-HTTP endpoint を serve する最小サンプル (#164)。MAUI demo (#161 phase 2)
-と同じ「.NET framework type を Lisp で継承」パターンを web 側に展開した
-形。
+HTTP endpoint を serve する最小サンプル。MAUI demo と同じ
+「.NET framework type を Lisp で継承」パターンを web 側に展開した形。
 
 ## 動作
 
@@ -41,7 +40,7 @@ $ curl http://localhost:5180/api/hello
                   "hello from lisp"))))
 ```
 
-- `dotnet:define-class` の `:attributes` (D845) でクラスに `[Route]`、
+- `dotnet:define-class` の `:attributes` でクラスに `[Route]`、
   メソッドに `[HttpGet]` を載せる
 - メソッドの戻り値は `IActionResult`、body で `OkObjectResult` を
   返すと MVC がそのまま JSON / text として serialize
@@ -68,7 +67,7 @@ app.MapControllers();
 app.Run("http://localhost:5180");
 ```
 
-## 組込みかた (#166 project-core)
+## 組込みかた
 
 `AspNetLispDemo.csproj` は MauiLispDemo と同じ `<DotclProjectAsd>` +
 `<Import Project="...Dotcl.targets" />` パターン。`AspNetLispDemo.asd`
@@ -90,8 +89,5 @@ app.Run("http://localhost:5180");
 
 ## 関連
 
-- #164 (本 demo の主旨)
-- D845 (`define-class` の method-level :attributes 拡張、本 demo の前提)
-- MauiLispDemo (#161 / D771-D795): 同じ "Lisp で .NET type を継承" の
-  パターンを desktop / mobile に適用
-- D820-D843 (#166 project-core): build pipeline はそのまま流用
+- MauiLispDemo: 同じ "Lisp で .NET type を継承" のパターンを desktop / mobile に適用
+- build pipeline は MauiLispDemo と同じ `<DotclProjectAsd>` パターンを流用

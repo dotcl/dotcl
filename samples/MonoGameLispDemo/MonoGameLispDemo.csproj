@@ -30,7 +30,7 @@
 
   <PropertyGroup>
 
-    <!-- #166 project-core flow: Dotcl.targets walks .asd, compiles main.lisp,
+    <!-- project-core flow: Dotcl.targets walks .asd, compiles main.lisp,
          writes manifest. Runtime side just calls Initialize + LoadFromManifest. -->
     <DotclProjectAsd>$(MSBuildProjectDirectory)/MonoGameLispDemo.asd</DotclProjectAsd>
     <DotclRuntimeProject>$(MSBuildProjectDirectory)/../../runtime/runtime.csproj</DotclRuntimeProject>

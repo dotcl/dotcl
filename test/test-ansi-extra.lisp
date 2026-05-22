@@ -1,8 +1,8 @@
-;;; test-ansi-extra.lisp — CLHS audit で発見したカバレッジの穴を補う追加テスト
-;;; ansi-test スイートに含まれていない振る舞いを検証する。
+;;; test-ansi-extra.lisp — additional tests covering gaps found during CLHS audit.
+;;; Verifies behaviour not covered by the ansi-test suite.
 ;;;
-;;; 各テストは (assert ...) または (unless ... (error ...)) 形式で記述し、
-;;; 失敗したらエラーを signaling する。
+;;; Each test uses (assert ...) or (unless ... (error ...)) and signals an
+;;; error on failure.
 
 (in-package :cl-user)
 
@@ -16,7 +16,7 @@
 
 ;;; ============================================================
 ;;; Ch.23 Reader: with-standard-io-syntax
-;;; CLHS Figure 23-1 の全変数が仕様値にバインドされることを確認
+;;; Verify all variables in CLHS Figure 23-1 are bound to their specified values
 ;;; ============================================================
 
 (check "with-standard-io-syntax/*print-readably*=t"
@@ -376,7 +376,7 @@
       (assert (char= (char buf 4) #\-) () "pos 4 should be unchanged"))))
 
 ;;; ============================================================
-;;; 結果サマリ
+;;; Result summary
 ;;; ============================================================
 
 (format t "~%=== test-ansi-extra results: ~a passed, ~a failed ===~%"

@@ -3,6 +3,80 @@
 User-facing release notes for dotcl. Each section corresponds to a tagged
 release on the public mirror (dotcl/dotcl).
 
+## v0.1.8 — 2026-05-22
+
+### ANSI test suite: 21928/21929 pass (99.995%)
+
+One additional conformance fix since 0.1.7: `FORMAT ~E` subnormal double
+rounding now passes consistently (was flaky). Known failure: `DEFGENERIC.ERROR.1`
+(SBCL-compatibility warn instead of error, intentional).
+
+### New: `dotnet:call-base` — invoke base class methods
+
+`(dotnet:call-base self "MethodName" arg1 arg2 ...)` calls the base class
+implementation of a virtual method non-virtually, equivalent to C# `base.Method(args)`.
+Useful in `dotnet:define-class` method overrides for MonoGame, MAUI, etc.:
+
+```lisp
+(:methods
+  ("Draw" ((gt "Microsoft.Xna.Framework.GameTime")) :returns Void :override t
+    (dotnet:call-base self "Draw" gt)
+    ;; custom drawing logic
+    ))
+```
+
+### New: `dotnet:define-class` — base constructor arguments
+
+`:ctor` bodies may now start with `(:base arg1 arg2 ...)` to pass arguments
+to the base class constructor (C# `: base(...)`):
+
+```lisp
+(dotnet:define-class "MyRenderer" ("SomeBaseRenderer")
+  (:ctor ((device "GraphicsDevice"))
+    (:base device)
+    (initialize-renderer self device)))
+```
+
+### New: `dotnet:ref` works on C# arrays
+
+`(dotnet:ref arr index)` and `(setf (dotnet:ref arr index) val)` now work
+on plain C# arrays (`T[]`), in addition to indexed collections like `List<T>`
+and `Dictionary<K,V>`.
+
+### New: `compile-macrolet` is NativeAOT-compatible
+
+`compile-macrolet` no longer uses `Reflection.Emit` internally. Macro
+expanders are now interpreted via a lightweight evaluator, making
+`macrolet` available in NativeAOT and IL2CPP builds.
+
+### New: MOP `slot-value-using-class`
+
+`slot-value-using-class` generic function dispatch is now supported for
+custom metaclasses, enabling MOP-level slot access interception.
+
+### New: `dotcl:dotcl-homedir-pathname` — ASDF source-registry integration
+
+`dotcl:dotcl-homedir-pathname` returns the parent directory of dotcl's
+`contrib/` folder as a pathname, analogous to SBCL's `sbcl-homedir-pathname`.
+This enables ASDF's `wrapping-source-registry` to discover dotcl's contrib
+systems automatically, so libraries that depend on `dotcl-thread` (e.g.
+bordeaux-threads) can be loaded without manual registry configuration.
+
+### Bug fixes
+
+- **Build**: `make install` now correctly finds `crossgen2` on Linux with
+  .NET 8+ (Ubuntu 22.04/24.04 reported `RID: ubuntu.xx.xx-x64`; the Makefile
+  now normalizes to the portable `linux-x64` NuGet package name).
+- **Build**: `(setf documentation)` error when running `make compile-asdf-fasl`
+  with an installed `dotcl` binary against a fresh source checkout is fixed.
+- **CLOS**: `next-method-p` now returns `nil` correctly in all call paths,
+  including `(funcall #'next-method-p)` inside primary methods when no
+  next method exists.
+- **Compiler**: `defgeneric` lambda-list congruence check now correctly
+  identifies required parameters when `&optional` is present.
+- **Compiler**: `(setf documentation)` on `cl:` symbols no longer mutates
+  the wrong slot due to package-qualified setf key lookup.
+
 ## v0.1.7 — 2026-05-16
 
 ### ANSI test suite: 21927/21929 pass (99.99%)
@@ -106,16 +180,16 @@ matching the behaviour of `uiop:getcwd`.
 ### Changed: ANSI conformance 21791/21791 (100%)
 
 - `defmethod` docstrings are retrievable via `(documentation name 'method)`.
-- `defgeneric` / `defmethod` CLHS error conditions tightened (#217, #218).
+- `defgeneric` / `defmethod` CLHS error conditions tightened.
 - `read-char` / `peek-char`: `recursive-p` no longer overrides `eof-error-p`.
-- `reader`: `recursive-p` argument implemented (#211).
-- `defstruct`: `:print-function` / `:print-object` options implemented (#230).
-- `defgeneric`: `RegisterFunctionOnSymbol` skips package lock for GFs (#234).
-- `defmethod`: optional arity may be less than the GF's (#235).
+- `reader`: `recursive-p` argument implemented.
+- `defstruct`: `:print-function` / `:print-object` options implemented.
+- `defgeneric`: `RegisterFunctionOnSymbol` skips package lock for GFs.
+- `defmethod`: optional arity may be less than the GF's.
 - `reader`: `SET-MACRO-CHARACTER` / `FlattenTopLevel` unwrap `MvReturn` leak.
 - `asdf`: `:package-local-nicknames` added to target features; `defgeneric`
   redefinition demoted to a warning for ASDF compatibility.
-- Symbol reference in non-FASL mode changed to inline lookup (#106).
+- Symbol reference in non-FASL mode changed to inline lookup.
 
 ## v0.1.5 — 2026-05-06
 

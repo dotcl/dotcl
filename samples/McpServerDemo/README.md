@@ -73,4 +73,3 @@ DEFUN なども:
 
 - [ModelContextProtocol C# SDK](https://github.com/modelcontextprotocol/csharp-sdk) (1.2.0, stable)
 - [MCP spec](https://modelcontextprotocol.io/)
-- dotcl issue #163: `Demo: MCP server で dotcl REPL を LLM の tool にする`

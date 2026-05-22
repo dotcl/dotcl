@@ -2719,6 +2719,254 @@
                    (:call "CilAssembler.GetFunctionBySymbol")))))))
     (t (error "FUNCTION: unsupported argument ~s" thing))))
 
+;;;; Mini S-expression interpreter for compile-macrolet (#172)
+;;;; Interprets the expander lambda without Reflection.Emit (NativeAOT/IL2CPP safe).
+
+;; puthash is a compiler intrinsic (no CL standard equivalent). Define a Lisp
+;; wrapper here (in dotcl.cil-compiler package) so %mini-eval can call it via
+;; symbol-function. The body compiles to (:call "Runtime.Puthash") directly.
+(defun puthash (key ht val) (puthash key ht val))
+
+(defun %mini-bind-params (params args env)
+  "Bind PARAMS to ARGS, extending ENV alist. Handles required, &optional, &rest."
+  (cond
+    ((null params) env)
+    ((eq (car params) '&rest)
+     (acons (cadr params) args env))
+    ((eq (car params) '&optional)
+     (let ((new-env env) (rest-args args))
+       (dolist (p (cdr params) new-env)
+         (cond
+           ((member p '(&rest &key &allow-other-keys &aux))
+            (return new-env))
+           (t
+            (let ((var (if (consp p) (car p) p)))
+              (setq new-env (acons var (when rest-args (pop rest-args)) new-env))))))))
+    ((member (car params) '(&key &allow-other-keys &aux)) env)
+    (t (acons (car params) (car args)
+              (%mini-bind-params (cdr params) (cdr args) env)))))
+
+(defun %mini-eval-progn (forms env)
+  ;; Collect vars from (declare (special ...)) that are in env alist,
+  ;; then bind them dynamically so closures can see their values.
+  (let ((dyn-vars '()) (dyn-vals '()))
+    (dolist (f forms)
+      (when (and (consp f) (eq (car f) 'declare))
+        (dolist (d (cdr f))
+          (when (and (consp d) (eq (car d) 'special))
+            (dolist (v (cdr d))
+              (let ((b (assoc v env)))
+                (when b
+                  (push v dyn-vars)
+                  (push (cdr b) dyn-vals))))))))
+    (if dyn-vars
+        (progv dyn-vars dyn-vals
+          (let (result)
+            (dolist (f forms result)
+              (setq result (%mini-eval f env)))))
+        (let (result)
+          (dolist (f forms result)
+            (setq result (%mini-eval f env)))))))
+
+(defun %mini-make-closure (lambda-form env)
+  "Return a Lisp function that interprets LAMBDA-FORM in captured ENV."
+  (let ((params (cadr lambda-form))
+        (body   (cddr lambda-form)))
+    (lambda (&rest call-args)
+      (%mini-eval-progn body (%mini-bind-params params call-args env)))))
+
+(defvar *%mini-eval-depth* 0)
+
+(defun %mini-eval (form env)
+  "Interpret FORM in ENV (alist of (sym . val)). No Reflection.Emit needed."
+  (incf *%mini-eval-depth*)
+  (unwind-protect
+  (cond
+    ;; Self-evaluating
+    ((null form) nil)
+    ((or (numberp form) (stringp form) (characterp form)) form)
+    ((keywordp form) form)
+    ;; Variable lookup (also check symbol-macrolet bindings via lookup-symbol-macro)
+    ((symbolp form)
+     (let ((b (assoc form env)))
+       (if b
+           ;; Could be (SYMBOL-MACRO expansion) from symbol-macrolet
+           (let ((v (cdr b)))
+             (if (and (consp v) (eq (car v) 'SYMBOL-MACRO))
+                 (%mini-eval (cadr v) env)
+                 v))
+           (let ((sm (lookup-symbol-macro form)))
+             (if sm (%mini-eval sm env) (symbol-value form))))))
+    ((consp form)
+     ;; First try macroexpand-1: handles destructuring-bind, when, cond, etc.
+     (multiple-value-bind (expanded expandedp) (macroexpand-1 form)
+       (if expandedp
+           (%mini-eval expanded env)
+           ;; Dispatch on special form operators
+           (let ((op (car form)))
+             (case op
+               (quote   (cadr form))
+               (if      (if (%mini-eval (cadr form) env)
+                            (%mini-eval (caddr form) env)
+                            (when (cdddr form) (%mini-eval (cadddr form) env))))
+               (progn   (%mini-eval-progn (cdr form) env))
+               (let
+                (let* ((pairs (mapcar (lambda (b)
+                                        (cons (if (consp b) (car b) b)
+                                              (when (consp b) (%mini-eval (cadr b) env))))
+                                      (cadr form)))
+                       (new-env (append pairs env)))
+                  (%mini-eval-progn (cddr form) new-env)))
+               (let*
+                (let ((new-env env))
+                  (dolist (b (cadr form))
+                    (push (cons (if (consp b) (car b) b)
+                                (when (consp b) (%mini-eval (cadr b) new-env)))
+                          new-env))
+                  (%mini-eval-progn (cddr form) new-env)))
+               (setq
+                (let (result)
+                  (let ((pairs (cdr form)))
+                    (loop while pairs do
+                      (let* ((var (car pairs))
+                             (val (%mini-eval (cadr pairs) env))
+                             (b   (assoc var env)))
+                        (if b (setf (cdr b) val) (set var val))
+                        (setq result val)
+                        (setq pairs (cddr pairs)))))
+                  result))
+               (function
+                (let ((fn (cadr form)))
+                  (if (symbolp fn)
+                      (symbol-function fn)
+                      (if (and (consp fn) (eq (car fn) 'setf))
+                          (fdefinition fn)
+                          (%mini-make-closure fn env)))))
+               (lambda
+                (%mini-make-closure form env))
+               (flet
+                (let ((new-env env))
+                  (dolist (def (cadr form))
+                    (push (cons (car def)
+                                (%mini-make-closure
+                                 `(lambda ,(cadr def) ,@(cddr def)) env))
+                          new-env))
+                  (%mini-eval-progn (cddr form) new-env)))
+               (labels
+                (let ((cells '()) (new-env env))
+                  ;; Pre-allocate cells so closures can mutually reference each other
+                  (dolist (def (cadr form))
+                    (let ((cell (cons (car def) nil)))
+                      (push cell cells)
+                      (push cell new-env)))
+                  ;; Fill in closures (they capture new-env which already has all names)
+                  (dolist (def (cadr form))
+                    (let ((cell (assoc (car def) cells)))
+                      (setf (cdr cell)
+                            (%mini-make-closure
+                             `(lambda ,(cadr def) ,@(cddr def)) new-env))))
+                  (%mini-eval-progn (cddr form) new-env)))
+               (block
+                ;; Use the block name as catch tag (correct for non-escaped returns)
+                (catch (cadr form)
+                  (%mini-eval-progn (cddr form) env)))
+               (return-from
+                (throw (cadr form)
+                       (when (cddr form) (%mini-eval (caddr form) env))))
+               (the    (%mini-eval (caddr form) env))
+               (locally (%mini-eval-progn (cdr form) env))
+               (symbol-macrolet
+                ;; Extend env with symbol macro bindings
+                (let ((new-env env))
+                  (dolist (binding (cadr form))
+                    (push (cons (car binding) (list 'SYMBOL-MACRO (cadr binding))) new-env))
+                  (%mini-eval-progn (cddr form) new-env)))
+               (macrolet
+                ;; Temporarily extend *macros* with local macros, then eval body.
+                ;; Handles the case where a macro (e.g. collect) expands into macrolet
+                ;; inside a %mini-eval closure (e.g. in a compile-macrolet expander).
+                (let ((saved-macros '()))
+                  (unwind-protect
+                      (progn
+                        (dolist (def (cadr form))
+                          (let* ((name (car def))
+                                 (params (cadr def))
+                                 (mbody (cddr def))
+                                 (old (gethash name *macros*))
+                                 (expander-fn
+                                  (%mini-eval
+                                   `(lambda (form)
+                                      (destructuring-bind ,params (cdr form)
+                                        ,@mbody))
+                                   env)))
+                            (push (cons name old) saved-macros)
+                            (setf (gethash name *macros*) expander-fn)))
+                        (%mini-eval-progn (cddr form) env))
+                    (dolist (entry saved-macros)
+                      (if (cdr entry)
+                          (setf (gethash (car entry) *macros*) (cdr entry))
+                          (remhash (car entry) *macros*))))))
+               (tagbody
+                (let* ((tb-id (list 'tagbody))
+                       ;; Parse body into segments: list of (tag . forms)
+                       (segs
+                        (let ((cur-tag nil) (cur-forms '()) (result '()))
+                          (dolist (item (cdr form))
+                            (if (or (symbolp item) (integerp item))
+                                (progn
+                                  (push (cons cur-tag (nreverse cur-forms)) result)
+                                  (setq cur-tag item cur-forms '()))
+                                (push item cur-forms)))
+                          (push (cons cur-tag (nreverse cur-forms)) result)
+                          (nreverse result)))
+                       ;; Extend env with (tag . (GO-TARGET tb-id idx)) for each tag
+                       (tagged-env
+                        (let ((e env) (idx 0))
+                          (dolist (seg segs)
+                            (when (car seg)
+                              (push (cons (car seg) (list 'GO-TARGET tb-id idx)) e))
+                            (incf idx))
+                          e))
+                       (done-marker (list 'done))
+                       (start-idx 0))
+                  (loop
+                    (let ((result (catch tb-id
+                                    (let ((idx 0))
+                                      (dolist (seg segs)
+                                        (when (>= idx start-idx)
+                                          (dolist (f (cdr seg))
+                                            (%mini-eval f tagged-env)))
+                                        (incf idx)))
+                                    done-marker)))
+                      (if (eq result done-marker)
+                          (return nil)
+                          (setq start-idx result))))))
+               (go
+                (let* ((tag (cadr form))
+                       (b (assoc tag env)))
+                  (if (and b (consp (cdr b)) (eq (car (cdr b)) 'GO-TARGET))
+                      (throw (cadr (cdr b)) (caddr (cdr b)))
+                      (error "%mini-eval: go tag ~S not found" tag))))
+               (declare nil)
+               (multiple-value-list
+                (multiple-value-list (%mini-eval (cadr form) env)))
+               (%make-instance-with-initargs
+                ;; Compiler intrinsic for (make-instance 'class ...): delegate to GF.
+                (apply (symbol-function 'make-instance)
+                       (mapcar (lambda (a) (%mini-eval a env)) (cdr form))))
+               (t
+                ;; Function call: check local env first, then symbol-function
+                (let* ((fn (if (symbolp op)
+                               (let ((b (assoc op env)))
+                                 (if (and b (functionp (cdr b)))
+                                     (cdr b)
+                                     (symbol-function op)))
+                               (%mini-eval op env)))
+                       (args (mapcar (lambda (a) (%mini-eval a env)) (cdr form))))
+                  (apply fn args))))))))
+    (t form))
+  (decf *%mini-eval-depth*)))
+
 (defun compile-macrolet (macro-defs body)
   "Compile (macrolet ((name (params) body...) ...) body...).
    Temporarily registers local macros in *macros*, compiles body, then restores."
@@ -2777,14 +3025,13 @@
                        `(lambda (form)
                           (destructuring-bind ,clean-params (cdr form)
                             ,@mbody)))))
-                   ;; Wrap with surrounding flet/labels so macrolet body can call
-                   ;; enclosing locally-defined functions at expansion time (issue #76)
-                   ;; NOTE: eval here requires Reflection.Emit (unavailable in NativeAOT).
-                   ;; For NativeAOT compatibility, replace with an S-expression interpreter.
+                   ;; Wrap with surrounding flet so macrolet body can call
+                   ;; enclosing locally-defined functions at expansion time (issue #76).
+                   ;; Use %mini-eval instead of eval: no Reflection.Emit needed (#172).
                    (eval-form (if *compile-time-flet-defs*
                                   `(flet ,*compile-time-flet-defs* ,expander-form)
                                   expander-form))
-                   (expander-fn (eval eval-form)))
+                   (expander-fn (%mini-eval eval-form nil)))
               (setf (gethash name *macros*) expander-fn))))))
     ;; Compile body with local macros active
     ;; Handle (declare (special ...)) in body — remove those vars from *locals*
@@ -2796,14 +3043,13 @@
                                               (mapcar #'symbol-name declared-specials)
                                               :test #'string=))
                                     *locals*)
-                         *locals*))
-           (result (compile-progn real-body)))
-      ;; Restore original macro entries
-      (dolist (entry saved)
-        (if (cdr entry)
-            (setf (gethash (car entry) *macros*) (cdr entry))
-            (remhash (car entry) *macros*)))
-      result))))
+                         *locals*)))
+      (unwind-protect
+          (compile-progn real-body)
+        (dolist (entry saved)
+          (if (cdr entry)
+              (setf (gethash (car entry) *macros*) (cdr entry))
+              (remhash (car entry) *macros*))))))))
 
 (defun compile-symbol-macrolet (bindings body)
   "Compile (symbol-macrolet ((sym expansion)...) body...).
@@ -4446,6 +4692,13 @@
             ,@(compile-expr (third expr))
             ,@(compile-expr (fourth expr))
             (:call "Runtime.MakeClass"))))
+  (setf (gethash '%make-class-full h)
+        (lambda (expr)
+          `(,@(compile-expr (second expr))
+            ,@(compile-expr (third expr))
+            ,@(compile-expr (fourth expr))
+            ,@(compile-expr (fifth expr))
+            (:call "Runtime.MakeClassFull"))))
   (setf (gethash '%make-slot-def h)
         (lambda (expr)
           `(,@(compile-expr (second expr))

@@ -83,8 +83,9 @@ If you want to hack on dotcl itself rather than just use it, clone the
 repo and bootstrap with [Roswell](https://github.com/roswell/roswell):
 
 ```bash
-make cross-compile   # uses Roswell/SBCL to bootstrap the compiler
-make install         # builds and installs the local nupkg as `dotcl`
+make cross-compile        # uses Roswell/SBCL to bootstrap the compiler
+make compile-asdf-fasl    # pre-compiles ASDF (required by samples)
+make install              # builds and installs the local nupkg as `dotcl`
 ```
 
 After the first cross-compile, dotcl can self-host: `DOTCL_LISP=dotcl

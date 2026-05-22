@@ -8,7 +8,7 @@ public static class MauiProgram
 	public static MauiApp CreateMauiApp()
 	{
 		// Boot dotcl BEFORE constructing MAUI pages. The project-core flow
-		// (#166) ships a single bundle dir alongside the app: dotcl.core,
+		// ships a single bundle dir alongside the app: dotcl.core,
 		// the contrib dependency FASLs (just dotnet-class for this demo),
 		// and MauiLispDemo.fasl (compiled from main.lisp at build time).
 		// LoadFromManifest reads the manifest and loads them in order — so

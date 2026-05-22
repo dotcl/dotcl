@@ -214,6 +214,12 @@ public static partial class Runtime
     }
 
     public static LispObject MakeClass(LispObject name, LispObject supersList, LispObject slotDefsList)
+        => MakeClassCore(name, supersList, slotDefsList, null);
+
+    public static LispObject MakeClassFull(LispObject name, LispObject supersList, LispObject slotDefsList, LispObject metaclassObj)
+        => MakeClassCore(name, supersList, slotDefsList, metaclassObj as LispClass);
+
+    private static LispObject MakeClassCore(LispObject name, LispObject supersList, LispObject slotDefsList, LispClass? metaclass)
     {
         if (name is not Symbol sym)
             throw new LispErrorException(new LispTypeError("MAKE-CLASS: name must be a symbol", name));
@@ -241,14 +247,14 @@ public static partial class Runtime
             cur = c2.Cdr;
         }
 
-
         // Validate each superclass via validate-superclass GF (AMOP)
         // Must be done before finalization. The new class being defined has a temporary LispClass
-        // for dispatch purposes; use a placeholder that has the right metaclass (standard-class).
+        // for dispatch purposes; use a placeholder that has the right metaclass.
         var validateGF = Startup.Sym("VALIDATE-SUPERCLASS").Function as LispFunction;
         if (validateGF != null)
         {
             var tempCls = new LispClass(sym, Array.Empty<SlotDefinition>(), supers.ToArray());
+            tempCls.Metaclass = metaclass; // needed for validate-superclass dispatch on (c mm)
             foreach (var super in supers)
             {
                 // Skip T — always valid
@@ -261,6 +267,7 @@ public static partial class Runtime
         }
 
         var cls = new LispClass(sym, slots.ToArray(), supers.ToArray());
+        cls.Metaclass = metaclass;
         // Skip finalization if any superclass is forward-referenced
         bool hasForwardRef = false;
         foreach (var s in supers)
@@ -346,9 +353,12 @@ public static partial class Runtime
             return inst.Class;
         if (obj is LispInstanceCondition lic)
             return lic.Instance.Class;
-        // LispClass objects: return their metaclass (BUILT-IN-CLASS or STANDARD-CLASS)
+        // LispClass objects: return their metaclass
         if (obj is LispClass lc)
         {
+            // Custom metaclass takes priority
+            if (!lc.IsBuiltIn && !lc.IsStructureClass && lc.Metaclass != null)
+                return lc.Metaclass;
             string metaName = lc.IsBuiltIn ? "BUILT-IN-CLASS"
                             : lc.IsStructureClass ? "STRUCTURE-CLASS"
                             : "STANDARD-CLASS";
@@ -400,6 +410,7 @@ public static partial class Runtime
             LispReadtable => "READTABLE",
             Package => "PACKAGE",
             LispRandomState => "RANDOM-STATE",
+            SlotDefinition sd when sd.IsEffective => "STANDARD-EFFECTIVE-SLOT-DEFINITION",
             SlotDefinition => "STANDARD-DIRECT-SLOT-DEFINITION",
             LispStream s when s.StreamTypeName != null => s.StreamTypeName,
             LispStream => "STREAM",
@@ -444,6 +455,14 @@ public static partial class Runtime
             throw new LispErrorException(new LispError(
                 $"SLOT-VALUE: no slot named {name} in class {inst.Class.Name.Name}"));
         }
+        // AMOP §5.4: dispatch through slot-value-using-class for custom metaclasses
+        if (inst.Class.Metaclass != null && Startup.Sym("SLOT-VALUE-USING-CLASS").Function is LispFunction svucFn)
+            return svucFn.Invoke(new LispObject[] { inst.Class, inst, inst.Class.EffectiveSlots[idx] });
+        return SlotValueDirect(inst, idx, slotName, name);
+    }
+
+    internal static LispObject SlotValueDirect(LispInstance inst, int idx, LispObject slotName, string name)
+    {
         LispObject? val;
         if (inst.Class.EffectiveSlots[idx].IsClassAllocation)
         {
@@ -506,6 +525,14 @@ public static partial class Runtime
             throw new LispErrorException(new LispError(
                 $"SET-SLOT-VALUE: no slot named {name} in class {inst.Class.Name.Name}"));
         }
+        // AMOP §5.4: dispatch through (setf slot-value-using-class) for custom metaclasses
+        if (inst.Class.Metaclass != null && Startup.Sym("SLOT-VALUE-USING-CLASS").SetfFunction is LispFunction setfSvucFn)
+            return setfSvucFn.Invoke(new LispObject[] { value, inst.Class, inst, inst.Class.EffectiveSlots[idx] });
+        return SetSlotValueDirect(inst, idx, name, value);
+    }
+
+    internal static LispObject SetSlotValueDirect(LispInstance inst, int idx, string name, LispObject value)
+    {
         if (inst.Class.EffectiveSlots[idx].IsClassAllocation)
         {
             var ownerClass = FindClassSlotOwner(inst.Class, name);
@@ -1285,13 +1312,17 @@ public static partial class Runtime
 
     private static string SetfKeyFor(Symbol accessor)
     {
-        // Include package for non-CL/non-internal packages so that e.g.
-        // (setf acclimation:documentation) and (setf cl:documentation) get
-        // distinct GF registry entries and don't collide.
+        // Only DOTCL-INTERNAL (and null) symbols get the bare "(SETF NAME)" key;
+        // all other packages (including COMMON-LISP) get a package-qualified key.
+        // This ensures that the FindGF setf fallback — which searches for bare
+        // "(SETF NAME)" keys — can only ever match C#-startup-registered GFs
+        // (whose accessor is always a DOTCL-INTERNAL symbol), never user-created
+        // GFs like (setf cl:documentation).  Without this, (setf acclimation:doc)
+        // bleeds into (setf cl:documentation) via the fallback (issue #261).
         var pkg = accessor.HomePackage;
-        if (pkg != null && pkg.Name != "COMMON-LISP" && pkg.Name != "DOTCL-INTERNAL")
-            return $"(SETF {pkg.Name}:{accessor.Name})";
-        return $"(SETF {accessor.Name})";
+        if (pkg == null || pkg.Name == "DOTCL-INTERNAL")
+            return $"(SETF {accessor.Name})";
+        return $"(SETF {pkg.Name}:{accessor.Name})";
     }
 
     private static Symbol ToFunctionNameSymbol(LispObject name, string context)
@@ -1579,15 +1610,42 @@ public static partial class Runtime
     public static LispObject FindGF(LispObject name)
     {
         Symbol sym;
+        string? setfBaseName = null;
         if (name is Symbol s)
             sym = s;
         else if (name is Cons c && c.Car is Symbol setfSym && setfSym.Name == "SETF"
                  && c.Cdr is Cons c2 && c2.Car is Symbol accessor)
+        {
             sym = Startup.Sym(SetfKeyFor(accessor));
+            setfBaseName = accessor.Name; // save base name for fallback
+        }
         else
             return Nil.Instance;
         if (_gfRegistry.TryGetValue(sym, out var gf))
             return gf;
+        // Fallback: name-based search for GFs registered under a different package.
+        // Restricted to DOTCL-INTERNAL entries only: handles C#-startup GFs registered
+        // under DOTCL-INTERNAL::NAME when Lisp code refers to the same name from another
+        // package (e.g. CL-USER::SLOT-VALUE-USING-CLASS finding DOTCL-INTERNAL's GF).
+        // The bare "(SETF NAME)" canonical key is ONLY used for DOTCL-INTERNAL accessors
+        // (by SetfKeyFor); CL and other packages now get package-qualified keys, so this
+        // fallback can never accidentally match user-created GFs like (setf cl:documentation).
+        if (setfBaseName != null)
+        {
+            string canonicalKey = $"(SETF {setfBaseName})";
+            foreach (var entry in _gfRegistry)
+                if (entry.Key.Name == canonicalKey
+                    && (entry.Key.HomePackage == null || entry.Key.HomePackage.Name == "DOTCL-INTERNAL"))
+                    return entry.Value;
+        }
+        else
+        {
+            string symName = sym.Name;
+            foreach (var entry in _gfRegistry)
+                if (entry.Key.Name == symName
+                    && (entry.Key.HomePackage == null || entry.Key.HomePackage.Name == "DOTCL-INTERNAL"))
+                    return entry.Value;
+        }
         return Nil.Instance;
     }
 
@@ -2469,6 +2527,17 @@ public static partial class Runtime
             _nextMethodIndex = 1;
             _currentGFArgs = args;
             _nextMethodFallback = null;
+            // Also fix up nmpSym/cnmSym in case an outer around method left them
+            // pointing at stale closures (next-method-p.6/.7 and McCLIM-style code
+            // that calls #'next-method-p via funcall rather than inline).
+            var nmpSym = NmpSym;
+            var cnmSym = CnmSym;
+            var savedNmpFunc = nmpSym.Function;
+            var savedCnmFunc = cnmSym.Function;
+            nmpSym.Function = new LispFunction(_ => Nil.Instance, "NEXT-METHOD-P", 0);
+            cnmSym.Function = new LispFunction(
+                _ => throw new LispErrorException(new LispError("CALL-NEXT-METHOD: no next method")),
+                "CALL-NEXT-METHOD", -1);
             try
             {
                 return primary[0].Function.Invoke(args);
@@ -2479,6 +2548,8 @@ public static partial class Runtime
                 _nextMethodIndex = savedIndex;
                 _currentGFArgs = savedArgs;
                 _nextMethodFallback = savedFallback;
+                nmpSym.Function = savedNmpFunc;
+                cnmSym.Function = savedCnmFunc;
             }
         }
 
@@ -2535,12 +2606,23 @@ public static partial class Runtime
         var closureFallback = fallback;
 
         var nmpClosure = new LispFunction(
-            _ => (closureIdx < closureChain.Count || closureFallback != null)
-                ? (LispObject)T.Instance : Nil.Instance,
+            nmpArgs => {
+                if (nmpArgs.Length != 0)
+                    throw new LispErrorException(new LispProgramError(
+                        $"NEXT-METHOD-P: wrong number of arguments: {nmpArgs.Length} (expected 0)"));
+                return (closureIdx < closureChain.Count || closureFallback != null)
+                    ? (LispObject)T.Instance : Nil.Instance;
+            },
             "NEXT-METHOD-P", 0);
+        var currentMethod = methods[startIdx];
         var cnmClosure = new LispFunction(
-            cnmArgs => CallNextMethodWithChain(closureChain, closureIdx,
-                cnmArgs.Length > 0 ? cnmArgs : closureArgs, closureFallback),
+            cnmArgs => {
+                var actualArgs = cnmArgs.Length > 0 ? cnmArgs : closureArgs;
+                if (cnmArgs.Length > 0 && !IsMethodApplicable(currentMethod, actualArgs))
+                    throw new LispErrorException(new LispProgramError(
+                        "CALL-NEXT-METHOD: changed arguments are not applicable to the current method"));
+                return CallNextMethodWithChain(closureChain, closureIdx, actualArgs, closureFallback);
+            },
             "CALL-NEXT-METHOD", -1);
 
         // Bind closures to symbol functions and function table so
@@ -2634,7 +2716,18 @@ public static partial class Runtime
             {
                 // T class matches everything
                 if (cls.Name.Name == "T") continue;
-                if (!IsTruthy(Typep(args[i], cls.Name)))
+                // Use CPL-based check so that metaclass dispatch (LispClass as arg)
+                // works correctly. ArgDispatchClass returns ClassOf(obj) for non-instances,
+                // which includes the Metaclass for custom-metaclass LispClass objects.
+                var argClass = ArgDispatchClass(args[i]);
+                if (argClass != null)
+                {
+                    bool found = false;
+                    foreach (var c in argClass.ClassPrecedenceList)
+                        if (ReferenceEquals(c, cls)) { found = true; break; }
+                    if (!found) return false;
+                }
+                else if (!IsTruthy(Typep(args[i], cls.Name)))
                     return false;
             }
             // EQL specializer: (eql value)
@@ -3024,6 +3117,56 @@ public static partial class Runtime
         }
         Startup.RegisterBinary("SLOT-BOUNDP", Runtime.SlotBoundp);
         Startup.RegisterBinary("SLOT-VALUE", Runtime.SlotValue);
+        // SLOT-VALUE-USING-CLASS and (SETF SLOT-VALUE-USING-CLASS) as proper GFs (AMOP §5.4)
+        {
+            var tCls = Runtime.FindClass(Startup.Sym("T"));
+            // SLOT-VALUE-USING-CLASS (class instance slot-def) → value
+            var svucSym = Startup.Sym("SLOT-VALUE-USING-CLASS");
+            var svucGF = (GenericFunction)Runtime.MakeGF(svucSym, new Fixnum(3));
+            svucGF.RequiredCount = 3;
+            svucGF.LambdaListInfoSet = true;
+            Runtime.RegisterGF(svucSym, svucGF);
+            svucSym.Function = svucGF;
+            Emitter.CilAssembler.RegisterFunction("SLOT-VALUE-USING-CLASS", svucGF);
+            var svucSpec = new Cons(tCls, new Cons(tCls, new Cons(tCls, Nil.Instance)));
+            var svucDefault = Runtime.MakeMethod(svucSpec, Nil.Instance, new LispFunction(args => {
+                if (args.Length < 3)
+                    throw new LispErrorException(new LispProgramError("SLOT-VALUE-USING-CLASS: wrong number of arguments"));
+                var obj = args[1] is LispInstanceCondition lic2 ? lic2.Instance : args[1];
+                if (obj is not LispInstance inst)
+                    throw new LispErrorException(new LispTypeError("SLOT-VALUE-USING-CLASS: not a CLOS instance", args[1]));
+                if (args[2] is not SlotDefinition slotDef)
+                    throw new LispErrorException(new LispTypeError("SLOT-VALUE-USING-CLASS: slot-def is not a slot definition", args[2]));
+                if (!inst.Class.SlotIndex.TryGetValue(slotDef.Name.Name, out int idx))
+                    throw new LispErrorException(new LispError($"SLOT-VALUE-USING-CLASS: no slot named {slotDef.Name.Name} in {inst.Class.Name.Name}"));
+                return Runtime.SlotValueDirect(inst, idx, slotDef.Name, slotDef.Name.Name);
+            }));
+            ((LispMethod)svucDefault).RequiredCount = 3;
+            Runtime.AddMethod(svucGF, svucDefault);
+            // (SETF SLOT-VALUE-USING-CLASS) (new-value class instance slot-def) → new-value
+            var setfSvucName = new Cons(Startup.Sym("SETF"), new Cons(svucSym, Nil.Instance));
+            var setfSvucGF = (GenericFunction)Runtime.MakeGF(setfSvucName, new Fixnum(4));
+            setfSvucGF.RequiredCount = 4;
+            setfSvucGF.LambdaListInfoSet = true;
+            Runtime.RegisterGF(setfSvucName, setfSvucGF); // also sets svucSym.SetfFunction
+            Emitter.CilAssembler.RegisterFunction("(SETF SLOT-VALUE-USING-CLASS)", setfSvucGF);
+            var setfSvucSpec = new Cons(tCls, new Cons(tCls, new Cons(tCls, new Cons(tCls, Nil.Instance))));
+            var setfSvucDefault = Runtime.MakeMethod(setfSvucSpec, Nil.Instance, new LispFunction(args => {
+                if (args.Length < 4)
+                    throw new LispErrorException(new LispProgramError("(SETF SLOT-VALUE-USING-CLASS): wrong number of arguments"));
+                var newVal = args[0];
+                var obj = args[2] is LispInstanceCondition lic3 ? lic3.Instance : args[2];
+                if (obj is not LispInstance inst)
+                    throw new LispErrorException(new LispTypeError("(SETF SLOT-VALUE-USING-CLASS): not a CLOS instance", args[2]));
+                if (args[3] is not SlotDefinition slotDef)
+                    throw new LispErrorException(new LispTypeError("(SETF SLOT-VALUE-USING-CLASS): slot-def is not a slot definition", args[3]));
+                if (!inst.Class.SlotIndex.TryGetValue(slotDef.Name.Name, out int idx))
+                    throw new LispErrorException(new LispError($"(SETF SLOT-VALUE-USING-CLASS): no slot named {slotDef.Name.Name} in {inst.Class.Name.Name}"));
+                return Runtime.SetSlotValueDirect(inst, idx, slotDef.Name.Name, newVal);
+            }));
+            ((LispMethod)setfSvucDefault).RequiredCount = 4;
+            Runtime.AddMethod(setfSvucGF, setfSvucDefault);
+        }
         Emitter.CilAssembler.RegisterFunction("SLOT-MAKUNBOUND", new LispFunction(args => {
             if (args.Length != 2) throw new LispErrorException(new LispProgramError("SLOT-MAKUNBOUND requires exactly 2 arguments"));
             var obj0 = args[0] is LispInstanceCondition lic0 ? lic0.Instance : args[0];

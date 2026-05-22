@@ -114,3 +114,112 @@
   ;; pa:widget instance must satisfy pa:widget
   (typep (make-instance 'typep-test-pa:widget) 'typep-test-pa:widget)
   t)
+
+;;; D1085: next-method-p fast path — funcall #'next-method-p must agree with
+;;; compiled (next-method-p) even when an :around method for the same GF was
+;;; dispatched previously (which set nmpSym.Function to a stale closure).
+
+(defgeneric nmp-gf (x))
+(defclass nmp-base ())
+(defclass nmp-derived (nmp-base) ())
+
+;; Primary only for nmp-base (fast path: 1 primary, no before/after)
+(defmethod nmp-gf ((x nmp-base))
+  (list (next-method-p) (funcall #'next-method-p)))
+
+;; :around + primary for nmp-derived — exercises InvokeWithNextMethods which
+;; sets nmpSym.Function; after this dispatch nmpSym.Function must be restored
+(defmethod nmp-gf :around ((x nmp-derived))
+  (call-next-method))
+(defmethod nmp-gf ((x nmp-derived))
+  :derived-primary)
+
+;; Compiled (next-method-p) and (funcall #'next-method-p) must both be NIL
+;; when there is no next method (fast path).
+(deftest nmp-fast-path-both-nil
+  (nmp-gf (make-instance 'nmp-base))
+  (nil nil))
+
+;; After dispatching via :around (sets nmpSym.Function stale), the fast path
+;; must reset nmpSym.Function so (funcall #'next-method-p) still returns NIL.
+;; This was the D1085 regression.
+(deftest nmp-fast-path-nil-after-around
+  (progn
+    (nmp-gf (make-instance 'nmp-derived))   ; pollutes nmpSym.Function
+    (nmp-gf (make-instance 'nmp-base)))     ; fast path must reset it
+  (nil nil))
+
+;; next-method-p must return T when there IS a next method (via call-next-method
+;; inside :around calling the primary for nmp-base).
+(defgeneric nmp-has-next (x))
+(defclass nmp-hn-base ())
+(defclass nmp-hn-sub (nmp-hn-base) ())
+
+(defvar *nmp-has-next-result* nil)
+(defmethod nmp-has-next ((x nmp-hn-base)) :base-primary)
+(defmethod nmp-has-next :around ((x nmp-hn-sub))
+  (setf *nmp-has-next-result* (list (next-method-p) (funcall #'next-method-p)))
+  (call-next-method))
+
+(deftest nmp-has-next-method-both-t
+  (progn
+    (nmp-has-next (make-instance 'nmp-hn-sub))
+    *nmp-has-next-result*)
+  (t t))
+
+;;; CNM capture: (call-next-method) inside a continuation passed to a GF.
+;;; Without the capture fix, the inner GF dispatch overwrites _nextMethodChain,
+;;; so (call-next-method) inside the thunk errors with "no next method".
+
+(defgeneric cnm-call-thunk (fn))
+(defmethod cnm-call-thunk (fn) (funcall fn))
+
+(defgeneric cnm-capture-gf (x))
+(defclass cnm-capture-base ())
+(defclass cnm-capture-derived (cnm-capture-base) ())
+
+(defmethod cnm-capture-gf ((x cnm-capture-base)) :base)
+(defmethod cnm-capture-gf :around ((x cnm-capture-derived))
+  ;; (call-next-method) inside the lambda must call the base primary,
+  ;; even though cnm-call-thunk dispatch happens in between.
+  (cnm-call-thunk (lambda () (call-next-method))))
+
+(deftest cnm-capture-via-thunk
+  (cnm-capture-gf (make-instance 'cnm-capture-derived))
+  :base)
+
+;;; Same but using #'call-next-method as a first-class value.
+(defgeneric cnm-capture-gf2 (x))
+(defclass cnm-capture-base2 ())
+(defclass cnm-capture-derived2 (cnm-capture-base2) ())
+
+(defmethod cnm-capture-gf2 ((x cnm-capture-base2)) :base2)
+(defmethod cnm-capture-gf2 :around ((x cnm-capture-derived2))
+  (cnm-call-thunk #'call-next-method))
+
+(deftest cnm-capture-funcref-thunk
+  (cnm-capture-gf2 (make-instance 'cnm-capture-derived2))
+  :base2)
+
+;;; D1097: next-method-p with args must signal program-error
+(defgeneric nmp-arity-gf (x))
+(defmethod nmp-arity-gf ((x t)) nil)
+
+(deftest nmp-error-with-args
+  (handler-case
+    (progn (eval '(defmethod nmp-arity-gf ((x t)) (next-method-p nil)))
+           (nmp-arity-gf nil)
+           :no-error)
+    (program-error () :ok))
+  :ok)
+
+;;; D1097: call-next-method with args that change applicable method set must error
+(defgeneric cnm-applicability-gf (x))
+(defmethod cnm-applicability-gf ((x (eql 0))) (call-next-method 1))
+(defmethod cnm-applicability-gf ((x t)) :base)
+
+(deftest cnm-applicability-check
+  (handler-case
+    (cnm-applicability-gf 0)
+    (error () :ok))
+  :ok)

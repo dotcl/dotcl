@@ -76,6 +76,13 @@ public static class Startup
     public static bool DebugStacktrace =>
         DotclPkg?.FindSymbol("*DEBUG-STACKTRACE*") is var (sym, _) && sym?.Value is not Nil and not null;
 
+    /// <summary>
+    /// When non-null, called by the REPL instead of Console.ReadLine().
+    /// Receives the prompt string; returns the input line or NIL for EOF.
+    /// Set by (dotcl-repl:enable) via dotcl:%set-repl-readline-hook.
+    /// </summary>
+    public static LispFunction? ReadlineHook { get; set; }
+
     // Well-known symbols
     public static Symbol NIL_SYM = null!;
     public static Symbol T_SYM = null!;
@@ -318,10 +325,9 @@ public static class Startup
         starPackage.IsSpecial = true;
         starPackage.Value = CLUser;
 
-        // Console.In は Android (no-console host) では PlatformNotSupportedException
-        // を投げるので、fallback として StringReader/StringWriter で代用する。
-        // Console.Out / Console.Error も同様に守って一貫させる (両方一緒に
-        // 失敗する想定のホストもあるため)。
+        // Console.In throws PlatformNotSupportedException on Android (no-console host),
+        // so fall back to StringReader/StringWriter. Console.Out/Console.Error are
+        // guarded the same way for consistency (some hosts fail all three together).
         TextReader hostStdin;
         TextWriter hostStdout;
         TextWriter hostStderr;
@@ -1422,6 +1428,8 @@ public static class Startup
             return new Cons(letSym, new Cons(bindings, body));
         }, "WITHOUT-PACKAGE-LOCKS"));
 
+        RegisterDotcl("DOTCL-HOMEDIR-PATHNAME", new LispFunction(Runtime.ContribParent));
+
         // dotcl:quit — exit the process (like sb-ext:exit on SBCL)
         RegisterDotcl("QUIT", new LispFunction(args => {
             int code = args.Length > 0 && args[0] is Fixnum n ? (int)n.Value : 0;
@@ -1596,6 +1604,16 @@ public static class Startup
         RegisterDotcl("WAIT-ON-SEMAPHORE",
             new LispFunction(Runtime.WaitOnSemaphore, "WAIT-ON-SEMAPHORE", -1));
 
+        // REPL readline hook — set by (dotcl-repl:enable)
+        RegisterDotclInternal("%SET-REPL-READLINE-HOOK", new LispFunction(args =>
+        {
+            if (args.Length != 1)
+                throw new LispErrorException(new LispProgramError(
+                    "DOTCL:%SET-REPL-READLINE-HOOK: requires 1 argument"));
+            ReadlineHook = args[0] is Nil ? null : args[0] as LispFunction;
+            return args[0];
+        }, "DOTCL:%SET-REPL-READLINE-HOOK", 1));
+
         // DOTNET package functions
         RegisterDotNet(DotNetPkg, "LOAD-ASSEMBLY", new LispFunction(Runtime.DotNetLoadAssembly, "DOTNET:LOAD-ASSEMBLY", -1));
         RegisterDotNet(DotNetPkg, "MAKE-DELEGATE", new LispFunction(Runtime.DotNetMakeDelegate, "DOTNET:MAKE-DELEGATE", 2));
@@ -1612,6 +1630,7 @@ public static class Startup
         RegisterDotNet(DotNetPkg, "%SET-STATIC", new LispFunction(Runtime.DotNetSetStatic, "DOTNET:%SET-STATIC", -1));
         RegisterDotNet(DotNetPkg, "INVOKE", new LispFunction(Runtime.DotNetInvoke, "DOTNET:INVOKE", -1));
         RegisterDotNet(DotNetPkg, "%SET-INVOKE", new LispFunction(Runtime.DotNetSetInvoke, "DOTNET:%SET-INVOKE", -1));
+        RegisterDotNet(DotNetPkg, "CALL-BASE", new LispFunction(Runtime.DotNetCallBase, "DOTNET:CALL-BASE", -1));
         RegisterDotNet(DotNetPkg, "NEW", new LispFunction(Runtime.DotNetNew, "DOTNET:NEW", -1));
         RegisterDotNet(DotNetPkg, "%DEFINE-CLASS", new LispFunction(Runtime.DotNetDefineClass, "DOTNET:%DEFINE-CLASS", -1));
         RegisterDotNet(DotNetPkg, "BOX", new LispFunction(Runtime.DotNetBox, "DOTNET:BOX", -1));

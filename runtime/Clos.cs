@@ -11,6 +11,10 @@ public class SlotDefinition : LispObject
     /// <summary>True when :allocation :class was specified (shared slot stored on class, not instance).</summary>
     public bool IsClassAllocation { get; set; }
 
+    /// <summary>True for effective slot definitions (STANDARD-EFFECTIVE-SLOT-DEFINITION),
+    /// false for direct slot definitions (STANDARD-DIRECT-SLOT-DEFINITION).</summary>
+    public bool IsEffective { get; set; }
+
     public SlotDefinition(Symbol name, Symbol[]? initargs = null, LispFunction? initformThunk = null, bool isClassAllocation = false)
     {
         Name = name;
@@ -30,6 +34,8 @@ public class LispClass : LispObject
     public Symbol Name { get; set; }
     /// <summary>True when (setf (class-name ...) nil) was called to clear the proper name.</summary>
     public bool NameCleared { get; set; }
+    /// <summary>The metaclass of this class. Null means STANDARD-CLASS (default).</summary>
+    public LispClass? Metaclass { get; set; }
     public SlotDefinition[] DirectSlots { get; set; }
     public LispClass[] DirectSuperclasses { get; set; }
     public LispClass[] ClassPrecedenceList { get; set; }
@@ -292,7 +298,7 @@ public class LispClass : LispObject
                 primary.Name,
                 allInitargs.Count > 0 ? allInitargs.ToArray() : null,
                 initform,
-                primary.IsClassAllocation);
+                primary.IsClassAllocation) { IsEffective = true };
             slots.Add(effective);
         }
         return slots.ToArray();

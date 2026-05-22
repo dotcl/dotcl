@@ -6,7 +6,7 @@
 		     maui-android` + Android SDK/emulator). Android uses Mono
 		     backend where Reflection.Emit still works, so dotcl (compiler
 		     and runtime both Emit-based) runs natively. iOS / MacCatalyst
-		     are out of scope (Phase 3 / issue #161 tracks IL2CPP). -->
+		     are out of scope (NativeAOT / IL2CPP support is a future goal). -->
 		<TargetFramework Condition="'$(UseAndroid)' != 'true'">net10.0-windows10.0.19041.0</TargetFramework>
 		<TargetFrameworks Condition="'$(UseAndroid)' == 'true'">net10.0-windows10.0.19041.0;net10.0-android</TargetFrameworks>
 
@@ -29,7 +29,7 @@
 
 		<WindowsPackageType>None</WindowsPackageType>
 
-		<!-- #166 project-core build: Dotcl.targets walks MauiLispDemo.asd's
+		<!-- project-core build: Dotcl.targets walks MauiLispDemo.asd's
 		     :depends-on, copies dependency fasls + dotcl.core into a bundle
 		     dir, compiles main.lisp into MauiLispDemo.fasl, writes a manifest,
 		     and injects the lot as <None>/<MauiAsset> items so they land in
@@ -84,7 +84,7 @@
 		<ProjectReference Include="..\..\runtime\DotCL.Runtime.csproj" />
 	</ItemGroup>
 
-	<!-- MainPage.xaml embedded as an assembly manifest resource (D795).
+	<!-- MainPage.xaml embedded as an assembly manifest resource.
 	     Bypasses the MauiXaml / XamlC pipeline (which expects x:Class to
 	     be a C# partial class), while still giving us the conventional
 	     single-binary distribution. Lisp pulls it via

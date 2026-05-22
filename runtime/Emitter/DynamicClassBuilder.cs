@@ -68,7 +68,9 @@ public static class DynamicClassBuilder
         LispObject? ctorBody = null,
         IReadOnlyList<(string Name, Type Type, bool Notify)>? properties = null,
         IReadOnlyList<Type>? interfaces = null,
-        IReadOnlyList<(string Name, Type DelegateType)>? events = null)
+        IReadOnlyList<(string Name, Type DelegateType)>? events = null,
+        IReadOnlyList<Type>? ctorParamTypes = null,
+        IReadOnlyList<int>? baseCtorArgIndices = null)
     {
         if (string.IsNullOrEmpty(fullName))
             throw new ArgumentException("fullName must be non-empty", nameof(fullName));
@@ -82,13 +84,28 @@ public static class DynamicClassBuilder
             throw new ArgumentException(
                 $"Base type must be a class, not interface: {baseType.FullName}", nameof(baseType));
 
-        var baseCtor = baseType.GetConstructor(
-            BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance,
-            binder: null, types: Type.EmptyTypes, modifiers: null);
-        if (baseCtor == null)
-            throw new ArgumentException(
-                $"Base type {baseType.FullName} has no accessible parameterless constructor",
-                nameof(baseType));
+        ConstructorInfo? baseCtor;
+        if (baseCtorArgIndices != null && baseCtorArgIndices.Count > 0 && ctorParamTypes != null)
+        {
+            var baseCtorTypes = baseCtorArgIndices.Select(i => ctorParamTypes[i]).ToArray();
+            baseCtor = baseType.GetConstructor(
+                BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance,
+                binder: null, types: baseCtorTypes, modifiers: null);
+            if (baseCtor == null)
+                throw new ArgumentException(
+                    $"Base type {baseType.FullName} has no accessible constructor matching types ({string.Join(", ", baseCtorTypes.Select(t => t.Name))})",
+                    nameof(baseType));
+        }
+        else
+        {
+            baseCtor = baseType.GetConstructor(
+                BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance,
+                binder: null, types: Type.EmptyTypes, modifiers: null);
+            if (baseCtor == null)
+                throw new ArgumentException(
+                    $"Base type {baseType.FullName} has no accessible parameterless constructor",
+                    nameof(baseType));
+        }
 
         int id = System.Threading.Interlocked.Increment(ref _assemblyCounter);
         var asmName = new AssemblyName("DotclDynamic_" + id);
@@ -195,26 +212,41 @@ public static class DynamicClassBuilder
             }
         }
 
-        // public .ctor() : base() { <optional Lisp body> }
+        // public .ctor([params]) : base([base-args]) { <optional Lisp body> }
+        var ctorTypes = (ctorParamTypes != null && ctorParamTypes.Count > 0)
+            ? ctorParamTypes.ToArray() : Type.EmptyTypes;
         var ctor = tb.DefineConstructor(
             MethodAttributes.Public | MethodAttributes.SpecialName | MethodAttributes.RTSpecialName,
-            CallingConventions.Standard, Type.EmptyTypes);
+            CallingConventions.Standard, ctorTypes);
         var cil = ctor.GetILGenerator();
         cil.Emit(OpCodes.Ldarg_0);
+        if (baseCtorArgIndices != null && baseCtorArgIndices.Count > 0)
+        {
+            foreach (var idx in baseCtorArgIndices)
+                cil.Emit(OpCodes.Ldarg, idx + 1); // +1: arg 0 is 'this'
+        }
         cil.Emit(OpCodes.Call, baseCtor);
 
         if (ctorBody != null)
         {
-            // After base.ctor has run, `this` is a valid derived instance and
-            // can be passed to the Lisp lambda as self. The lambda takes one
-            // arg (self) and returns whatever — we discard the result.
+            // After base.ctor has run, dispatch to Lisp body with (self arg1 arg2 ...).
             cil.Emit(OpCodes.Ldstr, fullName);
             cil.Emit(OpCodes.Ldstr, CtorKey);
             cil.Emit(OpCodes.Ldtoken, typeof(void));
             cil.Emit(OpCodes.Call, GetTypeFromHandleMI);
             cil.Emit(OpCodes.Ldarg_0); // self
-            cil.Emit(OpCodes.Ldc_I4_0); // empty args
+            // Build object[] with ctor params (empty for zero-arg ctor)
+            cil.Emit(OpCodes.Ldc_I4, ctorTypes.Length);
             cil.Emit(OpCodes.Newarr, typeof(object));
+            for (int i = 0; i < ctorTypes.Length; i++)
+            {
+                cil.Emit(OpCodes.Dup);
+                cil.Emit(OpCodes.Ldc_I4, i);
+                cil.Emit(OpCodes.Ldarg, i + 1); // arg 0 = this
+                if (ctorTypes[i].IsValueType)
+                    cil.Emit(OpCodes.Box, ctorTypes[i]);
+                cil.Emit(OpCodes.Stelem_Ref);
+            }
             cil.Emit(OpCodes.Call, DispatchMI);
             cil.Emit(OpCodes.Pop); // void discard
         }

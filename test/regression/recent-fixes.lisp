@@ -967,10 +967,10 @@
   (99 t))
 
 
-;;; D803 — make-string-input-stream で CR (0x0D) / CRLF を LF (0x0A) に正規化
-;;;         WinUI TextBox / MAUI Editor は CR のみで改行を返すので、
-;;;         stream 層で正規化しないと reader の line-comment が form を
-;;;         食い潰すバグがある (SBCL 流儀: reader は LF 厳守、stream で畳む)。
+;;; D803 — make-string-input-stream normalises CR (0x0D) / CRLF to LF (0x0A).
+;;;         WinUI TextBox / MAUI Editor return CR-only line endings, so without
+;;;         stream-level normalisation the reader's line-comment handler consumes
+;;;         the following form (SBCL convention: reader expects LF, stream folds).
 (deftest d803-make-string-input-stream-cr-terminates-line-comment
   (let ((src (format nil ";; comment~C42" #\Return)))
     (with-input-from-string (s src)
@@ -1065,8 +1065,8 @@
           nconc (%m (copy-seq x))))
   (a b c d e f g i))
 
-;;; D850 — Windows long path (>MAX_PATH=260) — .NET 10 が透明に処理する
-;;; ことの回帰検証 (#138)。LongPathsEnabled registry が 0 でも動く。
+;;; D850 — Windows long path (>MAX_PATH=260) — regression check that .NET 10
+;;; handles these transparently (#138). Works even when LongPathsEnabled=0.
 #+windows
 (deftest d850-windows-long-path
   (let* ((tmp (dotnet:static "System.IO.Path" "GetTempPath"))
@@ -1283,29 +1283,29 @@
     (list (double 3) (triple 2)))
   (6 6))
 
-;;; D976 — UCD char-name テーブル (name-char / char-name)
+;;; D976 — UCD char-name table (name-char / char-name)
 (deftest d976-name-char-ucd-spaces
-  ;; UCD 名（スペース区切り）で name-char が引ける
+  ;; name-char accepts UCD names (space-separated)
   (char-code (name-char "LATIN SMALL LETTER A"))
   97)
 
 (deftest d976-name-char-ucd-underscores
-  ;; アンダースコアをスペースに正規化して引ける
+  ;; underscores are normalised to spaces
   (char-code (name-char "LATIN_SMALL_LETTER_A"))
   97)
 
 (deftest d976-name-char-ucd-non-ascii
-  ;; 非 ASCII UCD エントリ
+  ;; non-ASCII UCD entry
   (char-code (name-char "GREEK SMALL LETTER ALPHA"))
   #x03B1)
 
 (deftest d976-char-name-ucd
-  ;; char-name が UCD 名を返す（_charNames 優先: Space は "Space" のまま）
+  ;; char-name returns the UCD name (_charNames entries take priority: Space stays "Space")
   (char-name (code-char 97))
   "LATIN SMALL LETTER A")
 
 (deftest d976-charnames-priority
-  ;; _charNames のエントリは UCD より優先される
+  ;; _charNames entries take priority over UCD
   (char-name #\Space)
   "Space")
 
@@ -1369,4 +1369,12 @@
     (compile-file src :output-file out)
     (load out)
     (eql (%mlf-box2-val (symbol-value (find-symbol "*MLF-TEST-VAL*"))) 99))
+  t)
+
+;;; D1096/D1097: ASDF source-registry で dotcl-thread がロードできること
+(deftest asdf-load-dotcl-thread
+  (progn
+    (require "asdf")
+    (asdf:load-system "dotcl-thread")
+    (not (null (find-package "DOTCL-THREAD"))))
   t)

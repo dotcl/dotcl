@@ -16,7 +16,9 @@
   (:export #:readline
            #:*history*
            #:*history-max*
-           #:*completer*))
+           #:*completer*
+           #:enable
+           #:disable))
 
 (in-package :dotcl-repl)
 
@@ -302,3 +304,13 @@
                              (subseq buf point)))
            (incf point)
            (redraw prompt-col buf point)))))))
+
+;;; ── REPL integration ────────────────────────────────────────────────────────
+
+(defun enable ()
+  "Wire dotcl-repl:readline into the REPL read loop."
+  (dotcl::%set-repl-readline-hook #'readline))
+
+(defun disable ()
+  "Restore the default Console.ReadLine-based REPL read."
+  (dotcl::%set-repl-readline-hook nil))

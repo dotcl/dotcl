@@ -10,7 +10,7 @@
            #:*cross-compiling* #:*compile-file-mode*))
 
 ;; %INLINE-CS-SPLICED is the dispatch symbol for the dotcl-cs:inline-cs
-;; macro (#122 Phase 2; D903 で contrib 統合). It needs to be reachable
+;; macro (#122 Phase 2; D903 contrib integration). It needs to be reachable
 ;; via Startup.Sym (which
 ;; checks CL → DOTCL-INTERNAL → cross-package bridge) so that the
 ;; runtime LOAD-SYM resolution and the cross-compiled handler

@@ -7,7 +7,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
 
-    <!-- #166 project-core: walk AspNetLispDemo.asd's :depends-on, compile
+    <!-- project-core: walk AspNetLispDemo.asd's :depends-on, compile
          main.lisp into AspNetLispDemo.fasl, write a manifest. The runtime
          only needs DotclHost.Initialize + LoadFromManifest. -->
     <DotclProjectAsd>$(MSBuildProjectDirectory)/AspNetLispDemo.asd</DotclProjectAsd>

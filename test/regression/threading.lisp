@@ -65,7 +65,7 @@
     t)
   t)
 
-;;; D657 Phase D — bordeaux-threads API補完: condition-var, semaphore,
+;;; D657 Phase D — bordeaux-threads API additions: condition-var, semaphore,
 ;;; recursive-lock, thread-yield.
 
 (deftest d657-recursive-lock-reentry

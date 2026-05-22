@@ -33,7 +33,7 @@ MonoGameLispDemo/
 
 `MonoGameLispDemo.csproj` 内の `<Import Project=".../Dotcl.targets" />`
 が `main.lisp` をビルド時に compile-file → `bin/.../dotcl-fasl/` に
-配置する (#166 project-core flow)。実行時は `DotclHost.LoadFromManifest`
+配置する (project-core flow)。実行時は `DotclHost.LoadFromManifest`
 が manifest を読んでまとめて load する。
 
 ## なぜ DesktopGL / win-x64 か

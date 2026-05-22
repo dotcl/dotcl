@@ -38,7 +38,7 @@ Lisp 関数を上書きしてから押せば挙動が差し替わる、という
 
 ```xml
 <ProjectReference Include="..\..\runtime\runtime.csproj">
-  <!-- Library として参照 (dotnet tool 兼用 Exe を抑止)。D820 -->
+  <!-- Library として参照 (dotnet tool 兼用 Exe を抑止) -->
   <AdditionalProperties>DotclAsLibrary=true;RuntimeIdentifier=</AdditionalProperties>
 </ProjectReference>
 
@@ -105,7 +105,7 @@ protected override Window CreateWindow(IActivationState? state)
 ```
 
 - `:notify t` が auto-property の setter 末尾に PropertyChanged 発火を
-  挿入 (D790)
+  挿入
 - `ICommand` プロパティは `LispCommand` で wrap した
   Lisp lambda を入れる (XAML 側は `Command="{Binding IncrementCommand}"`)
 
@@ -184,7 +184,3 @@ adb / scrcpy、トラブルシューティング)。
 
 - `runtime/DotclHost.cs` — embedding API 一式
 - `contrib/dotnet-class/` — `dotnet:define-class` 等のマクロ
-- `docs/decisions/D820-D822` — Android 対応で踏んだ罠 (Library mode、
-  Console.In fallback、EmbedAssembliesIntoApk、etc.)
-- `docs/decisions/D785-D795` — `dotnet:define-class` の各 Step
-  (auto-property、INotifyPropertyChanged 自動配線、XAML embed)

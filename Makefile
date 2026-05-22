@@ -209,7 +209,7 @@ setup-ansi-test:
 setup-asdf:
 	@if [ ! -d $(DOTCL_ROOT)asdf ]; then \
 		echo "Cloning asdf..."; \
-		git clone https://github.com/dotcl/asdf.git $(DOTCL_ROOT)asdf; \
+		git clone --branch dotcl https://github.com/dotcl/asdf.git $(DOTCL_ROOT)asdf; \
 	else \
 		echo "asdf/ already exists"; \
 	fi
@@ -342,7 +342,7 @@ compile-asdf-fasls: \
 # atomics is a patched copy of an upstream library and is mirror-excluded;
 # it also depends on dotcl-thread being loaded, which the per-contrib
 # isolated compile-file does not provide. Skip it here too.
-CONTRIB_NAMES := $(filter-out asdf atomics,$(notdir $(patsubst %/,%,$(wildcard $(DOTCL_ROOT)contrib/*/))))
+CONTRIB_NAMES := $(filter-out asdf atomics cil-from-cs,$(notdir $(patsubst %/,%,$(wildcard $(DOTCL_ROOT)contrib/*/))))
 
 CONTRIB_FASLS := $(foreach n,$(CONTRIB_NAMES),$(DOTCL_ROOT)contrib/$(n)/$(n).fasl)
 
@@ -387,7 +387,14 @@ TARGETARCH_osx-arm64 := arm64
 
 # crossgen2 host tool. RID is auto-detected from `dotnet --info`; binary
 # name is `crossgen2.exe` on Windows, `crossgen2` elsewhere.
-HOST_RID := $(shell dotnet --info 2>/dev/null | awk '/^[[:space:]]*RID:/ {print $$2; exit}')
+# .NET 8+ reports distro-specific RIDs (e.g. ubuntu.24.04-x64); normalize to
+# portable form (linux-x64) that matches NuGet crossgen2 package names.
+_DOTNET_RID := $(shell dotnet --info 2>/dev/null | awk '/^[[:space:]]*RID:/ {print $$2; exit}')
+_HOST_ARCH  := $(lastword $(subst -, ,$(_DOTNET_RID)))
+_HOST_OS    := $(if $(filter win-%,$(_DOTNET_RID)),win,\
+               $(if $(findstring osx,$(_DOTNET_RID)),osx,\
+               $(if $(findstring alpine,$(_DOTNET_RID)),linux-musl,linux)))
+HOST_RID    := $(_HOST_OS)-$(_HOST_ARCH)
 CROSSGEN2_EXE := $(if $(filter win-%,$(HOST_RID)),crossgen2.exe,crossgen2)
 
 # gen-utils: C# codegen tool (download + char-names subcommands)
@@ -407,7 +414,7 @@ $(DOTCL_ROOT)runtime/Generated/UnicodeCharNames.g.cs: $(DOTCL_ROOT)scripts/Unico
 	$(GEN_UTILS_EXE) char-names $< $@
 
 gen-char-names: $(DOTCL_ROOT)runtime/Generated/UnicodeCharNames.g.cs
-CROSSGEN2 := $(firstword $(wildcard $(HOME)/.nuget/packages/microsoft.netcore.app.crossgen2.$(HOST_RID)/*/tools/$(CROSSGEN2_EXE)))
+CROSSGEN2 = $(firstword $(wildcard $(HOME)/.nuget/packages/microsoft.netcore.app.crossgen2.$(HOST_RID)/*/tools/$(CROSSGEN2_EXE)))
 
 # Per-RID runtime ref dir (NuGet cache; populated by `dotnet publish -r <rid>`).
 runtime_ref = $(firstword $(wildcard $(HOME)/.nuget/packages/microsoft.netcore.app.runtime.$(1)/*/runtimes/$(1)/lib/net10.0))
@@ -415,9 +422,9 @@ runtime_ref = $(firstword $(wildcard $(HOME)/.nuget/packages/microsoft.netcore.a
 # Generate compile-{core,asdf}-fasl-r2r-<rid> targets for each RID.
 define R2R_RULES
 compile-core-fasl-r2r-$(1): compile-core-fasl
-	@test -n "$$(CROSSGEN2)" || (echo "error: crossgen2 not found. Seed: 'dotnet publish -r $(1) -c Release /p:PublishReadyToRun=true'" && exit 1)
-	@test -n "$$(call runtime_ref,$(1))" || (echo "error: runtime ref for $(1) not found. Seed: 'dotnet publish -r $(1) ...'" && exit 1)
 	dotnet publish $$(DOTCL_ROOT)runtime/runtime.csproj -c Release -r $(1) --self-contained false -p:PublishReadyToRun=true >/dev/null
+	@test -n "$$(CROSSGEN2)" || (echo "error: crossgen2 not found (HOST_RID=$(HOST_RID)). Is 'dotnet --info' showing the correct RID?" && exit 1)
+	@test -n "$$(call runtime_ref,$(1))" || (echo "error: runtime ref for $(1) not found" && exit 1)
 	cp $$(DOTCL_ROOT)compiler/dotcl.core $$(DOTCL_ROOT)compiler/dotcl.core.dll
 	"$$(CROSSGEN2)" $$(DOTCL_ROOT)compiler/dotcl.core.dll \
 	  -r "$$(call runtime_ref,$(1))/*.dll" \
