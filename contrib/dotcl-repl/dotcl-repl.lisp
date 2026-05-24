@@ -67,6 +67,27 @@
   "Read a ConsoleKeyInfo without echo. Returns the .NET object."
   (dotnet:static "System.Console" "ReadKey" t))
 
+(defun console-read-key-interruptable ()
+  "Read a ConsoleKeyInfo without echo, with a busy wait so the
+   thread can be interrupted. Returns the .NET object, or nil
+   if the thread was interrupted."
+  (handler-case
+      ;; Busy-wait loop: Check Console.KeyAvailable periodically,
+      ;; sleeping for 50ms at a time if no key is available.
+      ;; This allows System.Threading.ThreadInterruptedException to be
+      ;; thrown during Thread.Sleep when the REPL thread is interrupted,
+      ;; which we can then catch and handle.
+      (loop
+        (if (dotnet:static "System.Console" "get_KeyAvailable")
+            ;; A key is ready; read it without echoing it to the console.
+            (return (dotnet:static "System.Console" "ReadKey" t))
+            ;; No key is available; sleep for 50ms to yield execution time.
+            (dotnet:static "System.Threading.Thread" "Sleep" 50)))
+    ;; Catch any .NET System.Exception (which gets wrapped by the runtime
+    ;; as a Lisp LispProgramError/error). In case of a ThreadInterruptedException,
+    ;; we return nil to notify the caller that reading was interrupted.
+    (error () nil)))
+
 (defun key-char (ki)
   (dotnet:invoke ki "KeyChar"))
 
@@ -166,7 +187,8 @@
 ;;; ── Main readline ───────────────────────────────────────────────────────────
 
 (defun readline (prompt)
-  "Read a line with editing. Returns the string, or NIL on EOF (Ctrl+D)."
+  "Read a line with editing. Returns the string, or NIL on EOF (Ctrl+D)
+   or thread interruption."
   (write-str prompt)
   (let ((prompt-col (cursor-col))
         (buf '())          ; list of chars, left-to-right
@@ -175,8 +197,13 @@
         (saved-buf '()))   ; saved buf when browsing history
 
     (loop
-      (let* ((ki (console-read-key))
-             (ch (key-char ki)))
+      ;; Fetch next key in an interruptable manner.
+      (let* ((ki (console-read-key-interruptable))
+            (ch (when ki (key-char ki))))
+        ;; If console-read-key-interruptable returned nil, the thread was interrupted
+        ;; (e.g., a ThreadInterruptedException was trapped). Break the loop and return nil.
+        (unless ki
+          (return nil))
 
         (cond
           ;; Enter
