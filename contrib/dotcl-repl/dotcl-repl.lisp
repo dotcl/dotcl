@@ -252,7 +252,7 @@
 
           ;; Up arrow — history previous
           ((console-key= ki "UpArrow")
-           (let ((history (reverse *history*))
+           (let ((history *history*)
                  (next-idx (1+ hist-idx)))
              (when (< next-idx (length history))
                (when (= hist-idx -1)
@@ -267,7 +267,7 @@
            (cond
              ((> hist-idx 0)
               (decf hist-idx)
-              (let ((history (reverse *history*)))
+              (let ((history *history*))
                 (setf buf (coerce (nth hist-idx history) 'list))
                 (setf point (length buf))
                 (redraw prompt-col buf point)))
