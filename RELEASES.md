@@ -37,6 +37,14 @@ to the base class constructor (C# `: base(...)`):
     (initialize-renderer self device)))
 ```
 
+### New: `dotnet:define-class` — constructors with arguments supported
+
+`:ctor` can have arguments as per the previous example.
+The parameter list consists of `(<name> <type>)` pairs.
+
+However, only one constructor is currently supported; any additional
+constructors after the first will be silently ignored.
+
 ### New: `dotnet:ref` works on C# arrays
 
 `(dotnet:ref arr index)` and `(setf (dotnet:ref arr index) val)` now work
