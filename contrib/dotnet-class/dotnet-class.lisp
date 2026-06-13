@@ -112,12 +112,17 @@
 
 (defun dotnet::%resolve-type (spec)
   "Resolve a type reference: string passes through unchanged; symbol is
-   looked up in *TYPE-ALIASES* (keyed by symbol-name). Unknown symbol is
-   a (hopefully compile-time) error."
+   looked up in *TYPE-ALIASES* (keyed by symbol-name). Symbols that are
+   registered CLOS classes (e.g. from a previous dotnet:define-class) also
+   pass through to let C# resolve them in the dynamic assembly. Truly unknown
+   symbols remain compile-time errors."
   (cond
     ((stringp spec) spec)
     ((symbolp spec)
      (or (gethash (symbol-name spec) dotnet::*type-aliases*)
+         ;; Dynamically-defined classes registered in CLOS by a previous
+         ;; dotnet:define-class — pass the symbol-name through for C# resolution.
+         (and (find-class spec nil) (symbol-name spec))
          (error "dotnet:define-class: unknown type short-name ~S.~%  ~
                  Register via (setf (gethash ~S dotnet::*type-aliases*) \"Namespace.Full.Name\") ~
                  or supply a full-name string."
@@ -125,123 +130,128 @@
     ((null spec) nil)
     (t (error "dotnet:define-class: type spec must be a symbol or string: ~S" spec))))
 
+(defun dotnet::%process-ctor-form (ctor-form)
+  "Process one (:ctor params body...) form and return a list-generating form
+   suitable for the ctor-specs-list arg of dotnet:%define-class.
+   Each result is (list lambda param-types base-arg-indices)."
+  (let* ((ctor-params (first ctor-form))
+         (ctor-body-raw (rest ctor-form))
+         ;; Extract optional (:base ...) leading form
+         (base-form (when (and ctor-body-raw
+                               (consp (first ctor-body-raw))
+                               (eq (car (first ctor-body-raw)) :base))
+                      (first ctor-body-raw)))
+         (ctor-body (if base-form (rest ctor-body-raw) ctor-body-raw))
+         (base-arg-names (if base-form (cdr base-form) nil))
+         (ctor-param-names (mapcar #'first ctor-params))
+         (ctor-param-types (mapcar (lambda (p) (dotnet::%resolve-type (second p)))
+                                   ctor-params))
+         (base-arg-indices (mapcar (lambda (n)
+                                     (or (position n ctor-param-names :test #'eq)
+                                         (error "dotnet:define-class: (:base ~S) — ~S is not a ctor param" n n)))
+                                   base-arg-names)))
+    `(list (lambda (self ,@ctor-param-names)
+             (declare (ignorable self))
+             ,@ctor-body)
+           (list ,@ctor-param-types)
+           (list ,@base-arg-indices))))
+
 (defmacro dotnet:define-class (full-name supers &body options)
   (let* ((base-type-spec (first supers))
          (base-type (dotnet::%resolve-type base-type-spec))
          (fields-opt (cdr (assoc :fields options)))
          (attrs-opt  (cdr (assoc :attributes options)))
          (methods-opt (cdr (assoc :methods options)))
-         (ctor-spec (cdr (assoc :ctor options)))
+         ;; D1106: collect ALL :ctor forms (supports overloading)
+         (ctor-forms (mapcar #'cdr
+                             (remove-if-not (lambda (opt) (eq (car opt) :ctor))
+                                            options)))
          (properties-opt (cdr (assoc :properties options)))
          (implements-opt (cdr (assoc :implements options)))
          (events-opt (cdr (assoc :events options))))
-    ;; ctor-spec is of shape (params [:base arg...] body...) where params is a
-    ;; list of (name type) pairs. (:base arg1 arg2) as the first body form
-    ;; passes those params to the base class constructor (C# `: base(arg1,arg2)`).
-    (let* ((ctor-params (if ctor-spec (first ctor-spec) nil))
-           (ctor-body-raw (if ctor-spec (rest ctor-spec) nil))
-           ;; Extract optional (:base ...) leading form
-           (base-form (when (and ctor-body-raw
-                                 (consp (first ctor-body-raw))
-                                 (eq (car (first ctor-body-raw)) :base))
-                        (first ctor-body-raw)))
-           (ctor-body (if base-form (rest ctor-body-raw) ctor-body-raw))
-           (base-arg-names (if base-form (cdr base-form) nil))
-           (ctor-param-names (mapcar #'first ctor-params))
-           (ctor-param-types (mapcar (lambda (p) (dotnet::%resolve-type (second p)))
-                                     ctor-params))
-           ;; Indices into ctor-params for the base ctor args
-           (base-arg-indices (mapcar (lambda (n)
-                                       (or (position n ctor-param-names :test #'eq)
-                                           (error "dotnet:define-class: (:base ~S) — ~S is not a ctor param" n n)))
-                                     base-arg-names)))
-      `(dotnet:%define-class
-        ,full-name
-        ,base-type
-        ,(if fields-opt
-             `(list ,@(mapcar (lambda (f)
-                                `(list ,(first f)
-                                       ,(dotnet::%resolve-type (second f))))
-                              fields-opt))
-             'nil)
-        ,(if attrs-opt
-             `(list ,@(mapcar (lambda (a)
-                                `(list ,@a))
-                              attrs-opt))
-             'nil)
-        ,(if methods-opt
-             `(list
-               ,@(mapcar
-                  (lambda (m)
-                    (destructuring-bind (name params &rest tail) m
-                      (unless (eq (first tail) :returns)
-                        (error "dotnet:define-class: method spec ~S must start with :returns after params" name))
-                      (let ((return-type (second tail))
-                            (override nil)
-                            (method-attrs nil)
-                            (body (cddr tail)))
-                        ;; Optional keyword options between :returns and body.
-                        (loop while (and body (keywordp (first body)))
-                              do (case (first body)
-                                   (:override (setf override (second body)))
-                                   (:attributes (setf method-attrs (second body)))
-                                   (otherwise
-                                    (error "dotnet:define-class: unknown method option ~S in ~S"
-                                           (first body) name)))
-                                 (setf body (cddr body)))
-                        (let ((param-names (mapcar #'first params))
-                              (param-types (mapcar (lambda (p) (dotnet::%resolve-type (second p)))
-                                                   params)))
-                          `(list ,name ,(dotnet::%resolve-type return-type)
-                                 (list ,@param-types)
-                                 (lambda (self ,@param-names)
-                                   (declare (ignorable self))
-                                   ,@body)
-                                 ,override
-                                 ,(if method-attrs
-                                      `(list ,@(mapcar (lambda (a) `(list ,@a))
-                                                       method-attrs))
-                                      'nil))))))
-                  methods-opt))
-             'nil)
-        ,(if ctor-spec
-             `(lambda (self ,@ctor-param-names)
-                (declare (ignorable self))
-                ,@ctor-body)
-             'nil)
-        ,(if properties-opt
-             `(list ,@(mapcar
-                       (lambda (p)
-                         (destructuring-bind (pname ptype &rest tail) p
-                           (let ((notify nil))
-                             (loop while tail
-                                   do (case (first tail)
-                                        (:notify (setf notify (second tail)))
-                                        (otherwise
-                                         (error "dotnet:define-class: unknown property option ~S in ~S"
-                                                (first tail) pname)))
-                                      (setf tail (cddr tail)))
-                             `(list ,pname
-                                    ,(dotnet::%resolve-type ptype)
-                                    ,notify))))
-                       properties-opt))
-             'nil)
-        ,(if implements-opt
-             `(list ,@(mapcar (lambda (i) (dotnet::%resolve-type i))
-                              implements-opt))
-             'nil)
-        ,(if events-opt
-             `(list ,@(mapcar (lambda (e)
-                                `(list ,(first e)
-                                       ,(dotnet::%resolve-type (second e))))
-                              events-opt))
-             'nil)
-        ,(if (and ctor-spec ctor-params)
-             `(list ,@ctor-param-types)
-             'nil)
-        ,(if base-arg-indices
-             `(list ,@base-arg-indices)
-             'nil)))))
+    `(dotnet:%define-class
+      ,full-name
+      ,base-type
+      ,(if fields-opt
+           `(list ,@(mapcar (lambda (f)
+                              `(list ,(first f)
+                                     ,(dotnet::%resolve-type (second f))))
+                            fields-opt))
+           'nil)
+      ,(if attrs-opt
+           `(list ,@(mapcar (lambda (a)
+                              `(list ,@a))
+                            attrs-opt))
+           'nil)
+      ,(if methods-opt
+           `(list
+             ,@(mapcar
+                (lambda (m)
+                  (destructuring-bind (name params &rest tail) m
+                    (unless (eq (first tail) :returns)
+                      (error "dotnet:define-class: method spec ~S must start with :returns after params" name))
+                    (let ((return-type (second tail))
+                          (override nil)
+                          (method-attrs nil)
+                          (body (cddr tail)))
+                      ;; Optional keyword options between :returns and body.
+                      (loop while (and body (keywordp (first body)))
+                            do (case (first body)
+                                 (:override (setf override (second body)))
+                                 (:attributes (setf method-attrs (second body)))
+                                 (otherwise
+                                  (error "dotnet:define-class: unknown method option ~S in ~S"
+                                         (first body) name)))
+                               (setf body (cddr body)))
+                      (let ((param-names (mapcar #'first params))
+                            (param-types (mapcar (lambda (p) (dotnet::%resolve-type (second p)))
+                                                 params)))
+                        `(list ,name ,(dotnet::%resolve-type return-type)
+                               (list ,@param-types)
+                               (lambda (self ,@param-names)
+                                 (declare (ignorable self))
+                                 ,@body)
+                               ,override
+                               ,(if method-attrs
+                                    `(list ,@(mapcar (lambda (a) `(list ,@a))
+                                                     method-attrs))
+                                    'nil))))))
+                methods-opt))
+           'nil)
+      nil   ; arg 5: single ctor-body (unused; ctors go via arg 11)
+      ,(if properties-opt
+           `(list ,@(mapcar
+                     (lambda (p)
+                       (destructuring-bind (pname ptype &rest tail) p
+                         (let ((notify nil))
+                           (loop while tail
+                                 do (case (first tail)
+                                      (:notify (setf notify (second tail)))
+                                      (otherwise
+                                       (error "dotnet:define-class: unknown property option ~S in ~S"
+                                              (first tail) pname)))
+                                    (setf tail (cddr tail)))
+                           `(list ,pname
+                                  ,(dotnet::%resolve-type ptype)
+                                  ,notify))))
+                     properties-opt))
+           'nil)
+      ,(if implements-opt
+           `(list ,@(mapcar (lambda (i) (dotnet::%resolve-type i))
+                            implements-opt))
+           'nil)
+      ,(if events-opt
+           `(list ,@(mapcar (lambda (e)
+                              `(list ,(first e)
+                                     ,(dotnet::%resolve-type (second e))))
+                            events-opt))
+           'nil)
+      nil   ; arg 9: ctor-param-types (unused; ctors go via arg 11)
+      nil   ; arg 10: base-ctor-arg-indices (unused; ctors go via arg 11)
+      ;; arg 11: ctor-specs-list — one entry per :ctor form (D1106)
+      ,(if ctor-forms
+           `(list ,@(mapcar #'dotnet::%process-ctor-form ctor-forms))
+           'nil))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; D892 — dotnet:ref: indexer sugar (get_Item / set_Item)

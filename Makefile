@@ -4,7 +4,7 @@ INPUT ?= test/test1.lisp
 STDBUF ?=
 SETSID ?= $(shell which setsid 2>/dev/null)
 
-.PHONY: all build run clean repl test-a2 test-ansi test-ansi-all test-ansi-full test-ansi-extra test-regression test-mop update-ansi-state commit-ansi-state cross-compile loc publish pack install setup-ansi-test setup-asdf setup-cl-bench bench bench-state test-sbcl-host2 compile-asdf-fasl compile-asdf-fasls compile-core-fasl compile-contrib-fasls contrib-dotcl-cs gen-char-names
+.PHONY: all build run clean repl test-a2 test-ansi test-ansi-all test-ansi-full test-ansi-extra test-regression test-mop update-ansi-state commit-ansi-state cross-compile loc publish pack install setup-ansi-test setup-asdf setup-cl-bench bench bench-state test-sbcl-host2 compile-asdf-fasl compile-asdf-fasls compile-core-fasl compile-contrib-fasls contrib-dotcl-cs contrib-dotcl-jitdisasm gen-char-names
 
 # Source files for cross-compile. Listed once; the recipe and dependency
 # tracking both reference this so adding a file is a single-edit change.
@@ -391,9 +391,15 @@ TARGETARCH_osx-arm64 := arm64
 # portable form (linux-x64) that matches NuGet crossgen2 package names.
 _DOTNET_RID := $(shell dotnet --info 2>/dev/null | awk '/^[[:space:]]*RID:/ {print $$2; exit}')
 _HOST_ARCH  := $(lastword $(subst -, ,$(_DOTNET_RID)))
-_HOST_OS    := $(if $(filter win-%,$(_DOTNET_RID)),win,\
+# $(strip ...) is REQUIRED: the multi-line $(if) below collapses each `\`
+# continuation's indentation to a leading space, so without strip _HOST_OS
+# becomes " linux" (leading space) on non-Windows hosts → HOST_RID " linux-x64"
+# → the crossgen2 wildcard path gets a space and matches nothing
+# ("crossgen2 not found (HOST_RID=  linux-x64)", #21). Windows takes the first
+# (non-continued) branch so it was unaffected.
+_HOST_OS    := $(strip $(if $(filter win-%,$(_DOTNET_RID)),win,\
                $(if $(findstring osx,$(_DOTNET_RID)),osx,\
-               $(if $(findstring alpine,$(_DOTNET_RID)),linux-musl,linux)))
+               $(if $(findstring alpine,$(_DOTNET_RID)),linux-musl,linux))))
 HOST_RID    := $(_HOST_OS)-$(_HOST_ARCH)
 CROSSGEN2_EXE := $(if $(filter win-%,$(HOST_RID)),crossgen2.exe,crossgen2)
 
@@ -461,6 +467,14 @@ contrib-dotcl-cs:
 	dotnet publish $(DOTCL_ROOT)contrib/dotcl-cs/dotcl-cs.csproj -c Release -o $(DOTCL_ROOT)contrib/dotcl-cs/lib/ --self-contained false
 	rm -f $(DOTCL_ROOT)contrib/dotcl-cs/lib/*.pdb $(DOTCL_ROOT)contrib/dotcl-cs/lib/*.deps.json
 	rm -rf $(DOTCL_ROOT)contrib/dotcl-cs/bin $(DOTCL_ROOT)contrib/dotcl-cs/obj
+
+# Build dotcl-jitdisasm contrib (dev tool; NOT included in make pack).
+# After building, use: (require "dotcl-jitdisasm") then (dotcl:jit-disassemble #'fn)
+contrib-dotcl-jitdisasm:
+	rm -rf $(DOTCL_ROOT)contrib/dotcl-jitdisasm/lib $(DOTCL_ROOT)contrib/dotcl-jitdisasm/bin $(DOTCL_ROOT)contrib/dotcl-jitdisasm/obj
+	dotnet publish $(DOTCL_ROOT)contrib/dotcl-jitdisasm/dotcl-jitdisasm.csproj -c Release -o $(DOTCL_ROOT)contrib/dotcl-jitdisasm/lib/ --self-contained false
+	rm -f $(DOTCL_ROOT)contrib/dotcl-jitdisasm/lib/*.pdb $(DOTCL_ROOT)contrib/dotcl-jitdisasm/lib/*.deps.json
+	rm -rf $(DOTCL_ROOT)contrib/dotcl-jitdisasm/bin $(DOTCL_ROOT)contrib/dotcl-jitdisasm/obj
 
 # Build NuGet package (requires cross-compile to have been run first).
 # Nuke runtime/contrib first so a contrib directory deleted from source

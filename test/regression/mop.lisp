@@ -160,17 +160,28 @@
     ((x :initarg :x :accessor svuc-x))
     (:metaclass svuc-meta))
 
+  ;; Clear the log AFTER make-instance: per AMOP, shared-initialize sets slots
+  ;; from initargs via (setf slot-value-using-class), so construction itself
+  ;; dispatches a :write (required for #264 / McCLIM dynamic slots). These tests
+  ;; isolate the read / write dispatch of the operation under test.
   (deftest mop-svuc-read-dispatch
-    (progn (setq svuc-log nil)
-           (let ((o (make-instance 'svuc-obj :x 1)))
-             (svuc-x o))
-           (member :read svuc-log))
+    (let ((o (make-instance 'svuc-obj :x 1)))
+      (setq svuc-log nil)
+      (svuc-x o)
+      (member :read svuc-log))
     (:read))
 
   (deftest mop-svuc-write-dispatch
+    (let ((o (make-instance 'svuc-obj :x 1)))
+      (setq svuc-log nil)
+      (setf (svuc-x o) 2)
+      (member :write svuc-log))
+    (:write))
+
+  ;; Construction dispatches (setf slot-value-using-class) for the initarg slot.
+  (deftest mop-svuc-init-dispatch
     (progn (setq svuc-log nil)
-           (let ((o (make-instance 'svuc-obj :x 1)))
-             (setf (svuc-x o) 2))
+           (make-instance 'svuc-obj :x 1)
            (member :write svuc-log))
     (:write)))
 
@@ -189,3 +200,24 @@
                              :lambda-list '(new-value name doc-type language))
     (length (generic-function-lambda-list #'(setf documentation))))
   3)
+
+;;; D1110/#270: standard GF stores its lambda-list; MOP readers return the
+;;; actual parameter names, not gensym placeholders (#:R0 ...).
+(defgeneric mop-llnames (alpha beta)
+  (:argument-precedence-order beta alpha))
+(defmethod mop-llnames ((alpha t) (beta t)) nil)
+
+(deftest d1110-gf-lambda-list-real-names
+  (generic-function-lambda-list #'mop-llnames)
+  (alpha beta))
+
+(deftest d1110-gf-apo-real-names
+  (generic-function-argument-precedence-order #'mop-llnames)
+  (beta alpha))
+
+(defgeneric mop-ll-opt (x y &optional z))
+(defmethod mop-ll-opt ((x t) (y t) &optional z) z)
+
+(deftest d1110-gf-lambda-list-with-optional
+  (generic-function-lambda-list #'mop-ll-opt)
+  (x y &optional z))

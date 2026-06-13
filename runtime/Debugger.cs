@@ -160,7 +160,7 @@ public static class Debugger
 
     private static void PrintBacktrace()
     {
-        var frames = LispFunction.GetCallStack();
+        var frames = LispFunction.GetCallStackForms();
         if (frames.Length == 0)
         {
             Console.Error.WriteLine("; (no Lisp frames)");

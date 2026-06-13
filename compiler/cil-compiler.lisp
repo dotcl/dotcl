@@ -727,10 +727,140 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
 ;;; intermediate values stay on the evaluation stack as raw longs.
 ;;;
 ;;; Trigger: fixnum-typed-p => all operands statically fixnum => long path.
-;;; Unsafe for overflow (behaves like SBCL at (optimize (safety 0) (speed 3)));
-;;; two adjacent long values that overflow produce a wrapped result rather
-;;; than a bignum. Acceptable for the opt-in (the fixnum ...) contract.
+;;; Overflow safety: the raw int64 path is only taken when a static value-range
+;;; analysis (expr-int-range) proves every intermediate +/-/*/1+/1- result fits
+;;; in int64. dotcl's fixnum is full int64 (most-positive-fixnum = 2^63-1) with no
+;;; tag headroom, so bare (declare (fixnum ...)) operands have the full int64 range
+;;; and nested arithmetic over them is NOT provably safe — it falls back to the
+;;; boxed promoting path (Runtime.Add/Subtract/Multiply) which yields a bignum on
+;;; overflow. Tightly-declared operands ((the (integer lo hi) ...)) keep the fast
+;;; unboxed path when their composed range stays in int64 (#271).
 ;;; ============================================================
+
+;;; int64 bounds, as exact host integers.
+(defconstant +int64-min+ -9223372036854775808)
+(defconstant +int64-max+ +9223372036854775807)
+
+(defun range-fits-int64-p (r)
+  "True if range R = (lo . hi) lies entirely within int64."
+  (and r (<= +int64-min+ (car r)) (<= (cdr r) +int64-max+)))
+
+(defun small-int-local-range (expr)
+  "If EXPR is a reference to a small-int local (see *small-int-locals*) that is a
+   plain non-captured slot, return its proven (LO . HI) range; else NIL. These
+   slots hold a boxed Fixnum, so compile-as-long can unbox them inline."
+  (and (symbolp expr)
+       (boundp '*small-int-locals*)
+       (not (boxed-var-p expr))
+       (lookup-local expr)
+       (cdr (assoc (symbol-name expr) *small-int-locals* :test #'string=))))
+
+(defun integer-type-range (type)
+  "Inclusive (LO . HI) for a bounded integer TYPE specifier, or NIL if TYPE is
+   not a bounded integer type. Recognizes bit, (signed-byte N), (unsigned-byte N),
+   and (integer LO HI) with constant bounds. The caller gates on range-fits-int64-p,
+   so e.g. (unsigned-byte 64) (whose HI exceeds int64) is rejected downstream."
+  (cond
+    ((eq type 'bit) (cons 0 1))
+    ((and (consp type) (eq (car type) 'signed-byte) (integerp (cadr type)))
+     (let ((n (cadr type)))
+       (cons (- (ash 1 (1- n))) (1- (ash 1 (1- n))))))
+    ((and (consp type) (eq (car type) 'unsigned-byte) (integerp (cadr type)))
+     (cons 0 (1- (ash 1 (cadr type)))))
+    ((and (consp type) (eq (car type) 'integer)
+          (integerp (cadr type)) (integerp (caddr type)))
+     (cons (cadr type) (caddr type)))
+    (t nil)))
+
+(defun range-arith (op ra rb)
+  "Interval arithmetic for OP over ranges RA=(lo . hi) and RB. Host bignums keep
+   the bounds exact; the caller checks whether the result still fits int64."
+  (let ((alo (car ra)) (ahi (cdr ra)) (blo (car rb)) (bhi (cdr rb)))
+    (ecase op
+      (+ (cons (+ alo blo) (+ ahi bhi)))
+      (- (cons (- alo bhi) (- ahi blo)))
+      (* (let ((c1 (* alo blo)) (c2 (* alo bhi)) (c3 (* ahi blo)) (c4 (* ahi bhi)))
+           (cons (min c1 c2 c3 c4) (max c1 c2 c3 c4)))))))
+
+(defun fixnum-leaf-range (expr)
+  "Range (lo . hi) for a non-arithmetic fixnum-typed leaf, or NIL if EXPR is not
+   such a leaf. Locals / calls / bitwise results take the full fixnum (int64) range;
+   (the (integer lo hi) ...) contributes its declared bounds (#271)."
+  (cond
+    ;; Local with a proven bounded int64 range → its TIGHT range (checked before
+    ;; the full-range fixnum/long clauses so a tighter bound wins). This is what
+    ;; lets e.g. (* rmdr 2) on a (signed-byte 56) prove int64-safety (#271).
+    ((small-int-local-range expr))
+    ;; Raw int64 local (native body) or declared-fixnum local → full int64 range.
+    ((and (symbolp expr)
+          (boundp '*long-locals*) *long-locals*
+          (member (symbol-name expr) *long-locals* :test #'string=)
+          (lookup-local expr))
+     (cons +int64-min+ +int64-max+))
+    ((and (symbolp expr)
+          (boundp '*fixnum-locals*)
+          (member (symbol-name expr) *fixnum-locals* :test #'string=)
+          (not (boxed-var-p expr))
+          (lookup-local expr))
+     (cons +int64-min+ +int64-max+))
+    ;; (the (integer lo hi) E) / (the (signed-byte N) E) etc. with constant
+    ;; bounds → declared bounds (only when they fit int64); otherwise
+    ;; (the fixnum E) / (the (integer lo *) E) → full fixnum range.
+    ((and (consp expr) (eq (car expr) 'the))
+     (let ((ty (cadr expr)))
+       (cond
+         ((let ((r (integer-type-range ty))) (and r (range-fits-int64-p r) r)))
+         ((or (eq ty 'fixnum) (and (consp ty) (eq (car ty) 'integer)))
+          (cons +int64-min+ +int64-max+))
+         (t nil))))
+    ;; Bitwise results stay within int64 (conservatively the full range).
+    ((and (consp expr) (= (length expr) 3)
+          (member (car expr) '(logand logior logxor))
+          (fixnum-typed-p (cadr expr)) (fixnum-typed-p (caddr expr)))
+     (cons +int64-min+ +int64-max+))
+    ((and (consp expr) (= (length expr) 2) (eq (car expr) 'lognot)
+          (fixnum-typed-p (cadr expr)))
+     (cons +int64-min+ +int64-max+))
+    ;; ash with a constant shift is admitted by fixnum-typed-p only when it stays
+    ;; in int64; mirror that here as the full range.
+    ((and (consp expr) (= (length expr) 3) (eq (car expr) 'ash)
+          (fixnum-typed-p expr))
+     (cons +int64-min+ +int64-max+))
+    ;; Declared-fixnum function return.
+    ((and (consp expr) (symbolp (car expr))
+          (boundp '*function-return-types*)
+          (eq (gethash (car expr) *function-return-types*) 'fixnum)
+          (not (assoc (mangle-name (car expr)) *local-functions* :test #'string=)))
+     (cons +int64-min+ +int64-max+))
+    (t nil)))
+
+(defun expr-int-range (expr)
+  "Provable inclusive integer range (lo . hi) for EXPR computed entirely within
+   int64, or NIL if unknown or any intermediate +/-/*/1+/1- result could exceed
+   int64. Used to gate the raw unboxed arithmetic path (#271)."
+  (cond
+    ((integerp expr) (cons expr expr))
+    ((and (consp expr) (= (length expr) 3) (member (car expr) '(+ - *)))
+     (let ((ra (expr-int-range (cadr expr)))
+           (rb (expr-int-range (caddr expr))))
+       (and ra rb
+            (let ((r (range-arith (car expr) ra rb)))
+              (and (range-fits-int64-p r) r)))))
+    ((and (consp expr) (= (length expr) 2) (member (car expr) '(1+ 1-)))
+     (let ((ra (expr-int-range (cadr expr))))
+       (and ra
+            (let ((r (range-arith (if (eq (car expr) '1+) '+ '-) ra '(1 . 1))))
+              (and (range-fits-int64-p r) r)))))
+    (t (fixnum-leaf-range expr))))
+
+(defun fixnum-arith-unboxed-safe-p (expr)
+  "True when the BOXED fixnum fast path may compute EXPR with raw int64 ops and box
+   the result. Safe only when a static value-range proof shows every intermediate
+   +/-/*/1+/1- result fits int64; otherwise the caller must use the generic
+   promoting path (Runtime.Add/Subtract/Multiply) so overflow yields a bignum.
+   (The unsafe raw long path inside #130 native bodies is gated separately by
+   compile-as-long / fixnum-typed-p and is NOT routed through here.) (#271)"
+  (and (expr-int-range expr) t))
 
 (defun fixnum-typed-p (expr)
   "Return T if EXPR is statically known to produce a Fixnum value.
@@ -756,10 +886,19 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
           (not (boxed-var-p expr))
           (lookup-local expr))
      t)
+    ;; Local with a proven bounded int64 range (signed-byte/unsigned-byte/bit
+    ;; declaration or let-init inference). Slot holds a boxed Fixnum.
+    ((small-int-local-range expr) t)
     ((and (consp expr) (eq (car expr) 'the)
           (let ((ty (cadr expr)))
             (or (eq ty 'fixnum)
-                (and (consp ty) (eq (car ty) 'integer)))))
+                (and (consp ty) (eq (car ty) 'integer))
+                ;; (the (signed-byte N) E) etc. — only int64-fitting widths.
+                ;; A wide type like (signed-byte 100) can hold a bignum at
+                ;; runtime; bitwise/compare ops skip the overflow gate, so a
+                ;; bare unbox-fixnum there would corrupt the value.
+                (let ((r (integer-type-range ty)))
+                  (and r (range-fits-int64-p r))))))
      t)
     ((and (consp expr) (= (length expr) 3)
           (member (car expr) '(+ - *))
@@ -781,11 +920,19 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
           (eq (car expr) 'lognot)
           (fixnum-typed-p (cadr expr)))
      t)
-    ;; ash with fixnum value and constant shift → fixnum result
+    ;; ash with fixnum value and constant shift → fixnum result.
+    ;; A non-negative shift can overflow int64 (and a raw CIL shl masks the count
+    ;; mod 64), so it is only safe to treat as a raw long when both operands are
+    ;; constants and the folded result fits in int64. Negative shifts (right
+    ;; shift) always shrink and stay in range (D1111).
     ((and (consp expr) (= (length expr) 3)
           (eq (car expr) 'ash)
           (fixnum-typed-p (cadr expr))
-          (integerp (caddr expr)))
+          (integerp (caddr expr))
+          (let ((n (caddr expr)))
+            (or (< n 0)
+                (and (integerp (cadr expr))
+                     (typep (ash (cadr expr) n) '(signed-byte 64))))))
      t)
     ;; Declared-fixnum function return: (name ...) where name has an
     ;; ftype declaration promising a fixnum result.
@@ -820,7 +967,7 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
           (let ((n (length (cdr expr)))) (and (>= n 1) (<= n 4)))
           (every #'fixnum-typed-p (cdr expr)))
      (let ((n-args (length (cdr expr))))
-       `((:ldloc ,*self-fn-local*)
+       `(,(if (eq *self-fn-local* :arg0) '(:ldarg 0) `(:ldloc ,*self-fn-local*))
          ,@(mapcan (lambda (arg)
                      (let ((*in-tail-position* nil) (*in-mv-context* nil))
                        (compile-as-long arg)))
@@ -834,11 +981,18 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
           (lookup-local expr))
      `((:ldloc ,(lookup-local expr))
        (:unbox-fixnum)))
-    ((and (consp expr) (eq (car expr) 'the))
-     ;; (the fixnum E): compile E as LispObject, then unbox.
-     `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
-           (compile-expr (caddr expr)))
+    ;; Small-int local (bounded range): slot holds a boxed Fixnum — load + unbox.
+    ((small-int-local-range expr)
+     `((:ldloc ,(lookup-local expr))
        (:unbox-fixnum)))
+    ((and (consp expr) (eq (car expr) 'the))
+     ;; (the fixnum E): the declaration asserts E is a fixnum, so lower E
+     ;; natively via compile-as-long — it handles +/-/*/1+/1-/locals as raw
+     ;; int64 and falls back to compile-expr+unbox for forms it doesn't know.
+     ;; Previously this always took compile-expr+unbox, forcing e.g.
+     ;; (the fixnum (1- x)) through a box→Runtime.Decrement→unbox round-trip
+     ;; (a method call) in hot fixnum loops like tak/stak (D1129).
+     (compile-as-long (caddr expr)))
     ((and (consp expr) (= (length expr) 3) (member (car expr) '(+ - *)))
      (let ((op (ecase (car expr) (+ :add) (- :sub) (* :mul))))
        `(,@(compile-as-long (cadr expr))
@@ -861,16 +1015,23 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
     ((and (consp expr) (= (length expr) 2) (eq (car expr) 'lognot))
      `(,@(compile-as-long (cadr expr))
        (:not)))
-    ;; ash with constant shift — SHL (n≥0) or SHR/arithmetic (n<0)
+    ;; ash with constant shift. fixnum-typed-p guarantees we only get here for a
+    ;; negative shift (right shift, always safe) or a constant base whose folded
+    ;; result fits int64 — fold that to a literal so no overflowing SHL is emitted.
     ((and (consp expr) (= (length expr) 3) (eq (car expr) 'ash) (integerp (caddr expr)))
-     (let ((n (caddr expr)))
-       (if (>= n 0)
-           `(,@(compile-as-long (cadr expr))
-             (:ldc-i4 ,n)
-             (:shl))
-           `(,@(compile-as-long (cadr expr))
-             (:ldc-i4 ,(- n))
-             (:shr)))))
+     (let ((n (caddr expr)) (x (cadr expr)))
+       (cond
+         ((< n 0)
+          `(,@(compile-as-long x)
+            (:ldc-i4 ,(- n))
+            (:shr)))
+         ((integerp x)
+          `((:ldc-i8 ,(ash x n))))
+         (t
+          ;; Unreachable: fixnum-typed-p rejects non-constant non-negative shifts.
+          `(,@(compile-as-long x)
+            (:ldc-i4 ,n)
+            (:shl))))))
     (t
      ;; Fallback — compile as LispObject and unbox. Shouldn't hit this
      ;; if fixnum-typed-p was checked first.
@@ -879,16 +1040,17 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
        (:unbox-fixnum)))))
 
 (defun compile-fixnum-binop (args op)
-  "Emit native int64 binop, boxing result back to LispObject.
-   * uses Runtime.MultiplyFixnum which promotes to Bignum on overflow (#154/D917)."
-  (if (eq op :mul)
-      `(,@(compile-as-long (first args))
-        ,@(compile-as-long (second args))
-        (:call "Runtime.MultiplyFixnum"))
-      `(,@(compile-as-long (first args))
-        ,@(compile-as-long (second args))
-        (,op)
-        (:call "Fixnum.Make"))))
+  "Emit native int64 binop, boxing result back to LispObject. All of +/-/*
+   promote to Bignum on int64 overflow via Runtime.{Add,Subtract,Multiply}Fixnum
+   (#154/D917, D1112). A raw native :add/:sub would silently wrap, so even the
+   fixnum fast path must go through the promoting (AggressiveInlining) helper."
+  (let ((helper (ecase op
+                  (:add "Runtime.AddFixnum")
+                  (:sub "Runtime.SubtractFixnum")
+                  (:mul "Runtime.MultiplyFixnum"))))
+    `(,@(compile-as-long (first args))
+      ,@(compile-as-long (second args))
+      (:call ,helper))))
 
 (defun compile-fixbit-binop (args op)
   "Emit native int64 bitwise binop (AND/OR/XOR), boxing result back to LispObject."
@@ -910,10 +1072,12 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
         (n (second args)))
     (when (and (fixnum-typed-p x) (integerp n))
       (if (>= n 0)
+          ;; Left shift can overflow int64 (and raw CIL shl masks count mod 64),
+          ;; so route through Runtime.AshLeftLong which promotes to Bignum (D1111).
           `(,@(compile-as-long x)
             (:ldc-i4 ,n)
-            (:shl)
-            (:call "Fixnum.Make"))
+            (:call "Runtime.AshLeftLong"))
+          ;; Right shift of a fixnum-typed long always fits — native SHR is safe.
           `(,@(compile-as-long x)
             (:ldc-i4 ,(- n))
             (:shr)
@@ -943,10 +1107,15 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
 (defun double-float-typed-p (expr)
   "Return T if EXPR is statically known to produce a DoubleFloat value.
    Recognizes: (the double-float E), local vars declared double-float
-   (via *double-float-locals*), and recursive arithmetic (+, -, *, /)
-   whose operands are themselves double-float-typed. Literal floats are
-   NOT auto-detected to avoid single/double ambiguity from the reader."
+   (via *double-float-locals*), recursive binary arithmetic (+, -, *, /)
+   and unary negate (- x) whose operands are themselves double-float-typed.
+   A literal whose value IS a double-float (e.g. 2.0d0) is recognized: the
+   read object already has a definite type, so there is no single/double
+   ambiguity — only the reader's choice for an unsuffixed 2.0 was ambiguous,
+   and that produces a single-float object here, not a double."
   (cond
+    ;; Literal double-float constant — unambiguous (the object is a double).
+    ((typep expr 'double-float) t)
     ((and (symbolp expr)
           (boundp '*double-float-locals*)
           (member (symbol-name expr) *double-float-locals* :test #'string=)
@@ -962,6 +1131,10 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
           (member (car expr) '(+ - * /))
           (double-float-typed-p (cadr expr))
           (double-float-typed-p (caddr expr)))
+     t)
+    ;; Unary negate: (- x) where x is double-typed → double.
+    ((and (consp expr) (= (length expr) 2) (eq (car expr) '-)
+          (double-float-typed-p (cadr expr)))
      t)
     (t nil)))
 
@@ -984,6 +1157,9 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
        `(,@(compile-as-double (cadr expr))
          ,@(compile-as-double (caddr expr))
          (,op))))
+    ;; Unary negate: (- x) → native r8 neg.
+    ((and (consp expr) (= (length expr) 2) (eq (car expr) '-))
+     `(,@(compile-as-double (cadr expr)) (:neg)))
     (t
      `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
            (compile-expr expr))
@@ -1020,8 +1196,12 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
   "Return T if EXPR is statically known to produce a SingleFloat value.
    Recognizes: (the single-float E), local vars declared single-float
    (via *single-float-locals*), and recursive arithmetic (+, -, *, /)
-   whose operands are themselves single-float-typed."
+   whose operands are themselves single-float-typed. A literal single-float
+   object (e.g. 2.0f0, or 2.0 under the default read format) is recognized;
+   its type is already definite."
   (cond
+    ;; Literal single-float constant — unambiguous (the object is a single).
+    ((typep expr 'single-float) t)
     ((and (symbolp expr)
           (boundp '*single-float-locals*)
           (member (symbol-name expr) *single-float-locals* :test #'string=)
@@ -1037,6 +1217,10 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
           (member (car expr) '(+ - * /))
           (single-float-typed-p (cadr expr))
           (single-float-typed-p (caddr expr)))
+     t)
+    ;; Unary negate: (- x) where x is single-typed → single.
+    ((and (consp expr) (= (length expr) 2) (eq (car expr) '-)
+          (single-float-typed-p (cadr expr)))
      t)
     (t nil)))
 
@@ -1059,6 +1243,9 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
        `(,@(compile-as-single (cadr expr))
          ,@(compile-as-single (caddr expr))
          (,op))))
+    ;; Unary negate: (- x) → native r4 neg.
+    ((and (consp expr) (= (length expr) 2) (eq (car expr) '-))
+     `(,@(compile-as-single (cadr expr)) (:neg)))
     (t
      `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
            (compile-expr expr))
@@ -1098,8 +1285,11 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
        ;; Fast path: both args known single-float → native r4 add (D736)
        ((and (single-float-typed-p (first args)) (single-float-typed-p (second args)))
         (compile-single-binop args :add))
-       ;; Fast path: both args known fixnum → native int64 add
-       ((and (fixnum-typed-p (first args)) (fixnum-typed-p (second args)))
+       ;; Fast path: both args known fixnum AND no intermediate int64 overflow
+       ;; provable → native int64 add. Otherwise fall to the promoting Runtime.Add
+       ;; so an overflowing result becomes a bignum (#271).
+       ((and (fixnum-typed-p (first args)) (fixnum-typed-p (second args))
+             (fixnum-arith-unboxed-safe-p (cons '+ args)))
         (compile-fixnum-binop args :add))
        ;; Optimize (+ x 1) and (+ 1 x) to Increment
        ((eql (second args) 1)
@@ -1114,14 +1304,21 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
 (defun compile-sub (args)
   (case (length args)
     (0 (compile-static-program-error "-: too few arguments: 0 (expected at least 1)"))
-    (1 (compile-binary-call (list 0 (first args)) "Runtime.Subtract"))
+    (1 (cond
+         ;; Native unary negate for float-typed operand.
+         ((double-float-typed-p (first args))
+          `(,@(compile-as-double (first args)) (:neg) (:newobj "DoubleFloat")))
+         ((single-float-typed-p (first args))
+          `(,@(compile-as-single (first args)) (:neg) (:conv-r4) (:newobj "SingleFloat")))
+         (t (compile-binary-call (list 0 (first args)) "Runtime.Subtract"))))
     (2
      (cond
        ((and (double-float-typed-p (first args)) (double-float-typed-p (second args)))
         (compile-double-binop args :sub))
        ((and (single-float-typed-p (first args)) (single-float-typed-p (second args)))
         (compile-single-binop args :sub))
-       ((and (fixnum-typed-p (first args)) (fixnum-typed-p (second args)))
+       ((and (fixnum-typed-p (first args)) (fixnum-typed-p (second args))
+             (fixnum-arith-unboxed-safe-p (cons '- args)))
         (compile-fixnum-binop args :sub))
        ((eql (second args) 1)
         (compile-unary-call (list (first args)) "Runtime.Decrement" "1-"))
@@ -1140,7 +1337,8 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
         (compile-double-binop args :mul))
        ((and (single-float-typed-p (first args)) (single-float-typed-p (second args)))
         (compile-single-binop args :mul))
-       ((and (fixnum-typed-p (first args)) (fixnum-typed-p (second args)))
+       ((and (fixnum-typed-p (first args)) (fixnum-typed-p (second args))
+             (fixnum-arith-unboxed-safe-p (cons '* args)))
         (compile-fixnum-binop args :mul))
        (t (compile-binary-call args "Runtime.Multiply"))))
     (t (if (<= (length args) 8)

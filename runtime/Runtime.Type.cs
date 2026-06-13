@@ -61,6 +61,19 @@ public static partial class Runtime
                     }
                 }
             }
+            // Slot-definition metaobjects dispatch by their (possibly customized)
+            // CLOS class — walk its CPL so (typep slotd 'standard-effective-slot-
+            // definition) and dispatch on a custom slot-def class both work (#264).
+            if (typeSpec is Symbol sdClsSym && obj is SlotDefinition)
+            {
+                var resolvedCls = FindClassOrNil(sdClsSym) as LispClass;
+                if (resolvedCls != null && ClassOf(obj) is LispClass sdClass)
+                {
+                    foreach (var c in sdClass.ClassPrecedenceList)
+                        if (ReferenceEquals(c, resolvedCls)) return T.Instance;
+                    // No match against a known class — fall through (could be T/ATOM).
+                }
+            }
             if (CheckSimpleType(obj, name)) return T.Instance;
             // Try user-defined type expander
             if (TypeExpanders.TryGetValue(name, out var expSymExpander))
@@ -75,11 +88,14 @@ public static partial class Runtime
         {
             if (obj is LispInstance inst)
             {
-                // Walk the class precedence list to check subtype relationship
                 foreach (var c in inst.Class.ClassPrecedenceList)
-                {
                     if (ReferenceEquals(c, lcSpec)) return T.Instance;
-                }
+            }
+            else if (obj is LispDotNetObject dn)
+            {
+                var dnCls = EnsureDotNetTypeClass(dn.Type);
+                foreach (var c in dnCls.ClassPrecedenceList)
+                    if (ReferenceEquals(c, lcSpec)) return T.Instance;
             }
             return CheckSimpleType(obj, lcSpec.Name.Name) ? T.Instance : Nil.Instance;
         }

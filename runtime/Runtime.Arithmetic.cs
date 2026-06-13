@@ -75,6 +75,33 @@ public static partial class Runtime
         return Bignum.MakeInteger(new System.Numerics.BigInteger(a) * b);
     }
 
+    /// <summary>
+    /// Add two int64s, promoting to Bignum on signed overflow (D1112). Mirrors
+    /// MultiplyFixnum so the fixnum fast path for + can't silently wrap. Marked
+    /// AggressiveInlining: the JIT inlines the add + overflow branch, keeping the
+    /// non-overflowing common case as straight-line code with a cold promote path.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static LispObject AddFixnum(long a, long b)
+    {
+        long r = unchecked(a + b);
+        // Signed overflow iff a,b share a sign that differs from the result's.
+        if (((a ^ r) & (b ^ r)) < 0)
+            return Bignum.MakeInteger((System.Numerics.BigInteger)a + b);
+        return Fixnum.Make(r);
+    }
+
+    /// <summary>Subtract int64s, promoting to Bignum on signed overflow (D1112).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static LispObject SubtractFixnum(long a, long b)
+    {
+        long r = unchecked(a - b);
+        // Signed overflow iff a,b differ in sign and the result's sign differs from a.
+        if (((a ^ b) & (a ^ r)) < 0)
+            return Bignum.MakeInteger((System.Numerics.BigInteger)a - b);
+        return Fixnum.Make(r);
+    }
+
     public static LispObject Multiply(LispObject a, LispObject b)
     {
         if (a is Fixnum fa && b is Fixnum fb)
@@ -792,6 +819,24 @@ public static partial class Runtime
     public static LispObject Lognot(LispObject a) =>
         a is Fixnum f ? Fixnum.Make(~f.Value) : MakeInteger(~GetBigInt(a));
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    /// <summary>
+    /// Left-shift a native int64 by a non-negative constant count, promoting to
+    /// Bignum on overflow. Used by compile-ash-fast for fixnum-typed bases so a
+    /// raw CIL `shl` (which masks count mod 64 and silently overflows) is never
+    /// emitted. count must be >= 0 (caller guarantees; negative shifts use SHR).
+    /// </summary>
+    public static LispObject AshLeftLong(long value, int count)
+    {
+        if (value == 0 || count == 0) return Fixnum.Make(value);
+        if (count < 63)
+        {
+            if (value > 0 && value <= (long.MaxValue >> count)) return Fixnum.Make(value << count);
+            if (value < 0 && value >= (long.MinValue >> count)) return Fixnum.Make(value << count);
+        }
+        // count >= 63 or the shift would overflow int64: do it in BigInteger.
+        return Bignum.MakeInteger((System.Numerics.BigInteger)value << count);
+    }
+
     public static LispObject Ash(LispObject integer, LispObject count)
     {
         integer = Primary(integer); count = Primary(count);
@@ -1150,6 +1195,16 @@ public static partial class Runtime
     public static LispObject GetVariableDocumentation(LispObject sym)
     {
         if (sym is Symbol s && _docs.TryGetValue((s.Name, "VARIABLE"), out var doc))
+            return doc;
+        return Nil.Instance;
+    }
+
+    /// <summary>Fallback used by the Lisp DOCUMENTATION GF (function method) to surface
+    /// docstrings registered from [LispDoc] attributes / SetFunctionDoc, mirroring the
+    /// variable path. Keyed by the symbol's bare name (#25 follow-up).</summary>
+    public static LispObject GetFunctionDocumentation(LispObject sym)
+    {
+        if (sym is Symbol s && _docs.TryGetValue((s.Name, "FUNCTION"), out var doc))
             return doc;
         return Nil.Instance;
     }

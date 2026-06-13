@@ -15,6 +15,30 @@ public class SlotDefinition : LispObject
     /// false for direct slot definitions (STANDARD-DIRECT-SLOT-DEFINITION).</summary>
     public bool IsEffective { get; set; }
 
+    /// <summary>Index of this slot in the instance layout (LispInstance.Slots),
+    /// set during class finalization. -1 for :class-allocation slots and direct
+    /// slot definitions (not in any instance layout). Returned by the AMOP
+    /// SLOT-DEFINITION-LOCATION accessor and used by STANDARD-INSTANCE-ACCESS (#264).</summary>
+    public int Location { get; set; } = -1;
+
+    /// <summary>The CLOS class of this slot-definition metaobject when customized
+    /// via direct-/effective-slot-definition-class (a subclass of standard-{direct,
+    /// effective}-slot-definition). null = the standard class implied by IsEffective.
+    /// CLASS-OF and TYPEP consult this so methods can dispatch on the slotd's class
+    /// (e.g. slot-value-using-class specialized on a custom effective-slot) (#264).</summary>
+    public LispClass? MetaClass { get; set; }
+
+    /// <summary>Storage for the Lisp-level slots introduced by a custom slot-definition
+    /// class (e.g. McCLIM's DYNAMIC-DIRECT-SLOT/DYNAMIC-EFFECTIVE-SLOT add a DYNAMIC
+    /// slot). Keyed by slot name; null until the slotd gets a custom MetaClass. SLOT-VALUE
+    /// / (SETF SLOT-VALUE) / SLOT-BOUNDP route through this for SlotDefinition objects (#264).</summary>
+    public Dictionary<string, LispObject?>? ExtraSlots { get; set; }
+
+    /// <summary>The canonical slot-option plist (a Lisp list :key val ...) captured from the
+    /// DEFCLASS slot specifier, used as the &rest initargs when DIRECT-SLOT-DEFINITION-CLASS
+    /// is consulted for a custom metaclass. Null for slots defined under STANDARD-CLASS (#264).</summary>
+    public LispObject? RawOptions { get; set; }
+
     public SlotDefinition(Symbol name, Symbol[]? initargs = null, LispFunction? initformThunk = null, bool isClassAllocation = false)
     {
         Name = name;
@@ -141,7 +165,12 @@ public class LispClass : LispObject
         CachedValidInitargKeys = null;
         SlotIndex.Clear();
         for (int i = 0; i < EffectiveSlots.Length; i++)
+        {
             SlotIndex[EffectiveSlots[i].Name.Name] = i;
+            // Instance-allocated slots get their layout index as location; :class
+            // allocation slots are not in the per-instance vector (#264).
+            EffectiveSlots[i].Location = EffectiveSlots[i].IsClassAllocation ? -1 : i;
+        }
         ComputeEffectiveDefaultInitargs();
 
         // Build initarg-to-slot cache for fast make-instance path
@@ -248,6 +277,45 @@ public class LispClass : LispObject
         return result.ToArray();
     }
 
+    /// <summary>Hook for the COMPUTE-EFFECTIVE-SLOT-DEFINITION metaobject protocol.
+    /// Set by Runtime CLOS init. When a class has a custom metaclass, FinalizeClass
+    /// routes each slot's effective-definition construction through this delegate
+    /// (which calls the Lisp GF) instead of building it directly in C# (#264).</summary>
+    public static Func<LispClass, Symbol, SlotDefinition[], SlotDefinition?>? ComputeEffectiveSlotHook;
+
+    /// <summary>Build the standard effective slot definition by merging the per-name
+    /// direct slot definitions (most-specific first), per CLHS 7.5.3. Shared by the
+    /// default C# path and the default COMPUTE-EFFECTIVE-SLOT-DEFINITION method.</summary>
+    public static SlotDefinition BuildEffectiveSlot(Symbol name, IReadOnlyList<SlotDefinition> defs)
+    {
+        var primary = defs[0]; // most specific
+
+        // Union of all initargs
+        var allInitargs = new List<Symbol>();
+        var seenInitargs = new HashSet<string>();
+        foreach (var d in defs)
+            foreach (var ia in d.Initargs)
+                if (seenInitargs.Add(ia.Name))
+                    allInitargs.Add(ia);
+
+        // Most specific initform (first one that has it)
+        LispFunction? initform = null;
+        foreach (var d in defs)
+        {
+            if (d.InitformThunk != null)
+            {
+                initform = d.InitformThunk;
+                break;
+            }
+        }
+
+        return new SlotDefinition(
+            name,
+            allInitargs.Count > 0 ? allInitargs.ToArray() : null,
+            initform,
+            primary.IsClassAllocation) { IsEffective = true };
+    }
+
     private SlotDefinition[] ComputeEffectiveSlots()
     {
         // Per CLHS 7.5.3: merge slot definitions from CPL
@@ -269,36 +337,19 @@ public class LispClass : LispObject
             }
         }
 
+        // For a custom metaclass, drive each slot through the COMPUTE-EFFECTIVE-SLOT-DEFINITION
+        // protocol (AMOP). Standard classes (Metaclass == null) keep the direct C# path,
+        // which also avoids GF calls during bootstrap and for the common case (#264).
+        bool useProtocol = Metaclass != null && ComputeEffectiveSlotHook != null;
+
         var slots = new List<SlotDefinition>();
         foreach (var name in slotOrder)
         {
             var defs = slotDefs[name];
-            var primary = defs[0]; // most specific
-
-            // Union of all initargs
-            var allInitargs = new List<Symbol>();
-            var seenInitargs = new HashSet<string>();
-            foreach (var d in defs)
-                foreach (var ia in d.Initargs)
-                    if (seenInitargs.Add(ia.Name))
-                        allInitargs.Add(ia);
-
-            // Most specific initform (first one that has it)
-            LispFunction? initform = null;
-            foreach (var d in defs)
-            {
-                if (d.InitformThunk != null)
-                {
-                    initform = d.InitformThunk;
-                    break;
-                }
-            }
-
-            var effective = new SlotDefinition(
-                primary.Name,
-                allInitargs.Count > 0 ? allInitargs.ToArray() : null,
-                initform,
-                primary.IsClassAllocation) { IsEffective = true };
+            SlotDefinition? effective = null;
+            if (useProtocol)
+                effective = ComputeEffectiveSlotHook!(this, defs[0].Name, defs.ToArray());
+            effective ??= BuildEffectiveSlot(defs[0].Name, defs);
             slots.Add(effective);
         }
         return slots.ToArray();
@@ -404,12 +455,32 @@ internal class CachedDispatch
 public class GenericFunction : LispFunction
 {
     public new Symbol Name { get; }
-    public List<LispMethod> Methods { get; } = new();
+
+    // Method list is copy-on-write for thread safety (#278): dispatch reads an
+    // immutable snapshot (the `Methods` property returns the current array, which
+    // foreach/Count/[i] enumerate consistently even if a concurrent defmethod swaps
+    // it), while mutations (ADD-METHOD / REMOVE-METHOD / defgeneric-inline clear)
+    // build a new array under `MethodsLock` and atomically publish it via the
+    // volatile field. A plain List<T> here let concurrent enumerate-vs-Add corrupt
+    // the applicable-method set → spurious "CALL-NEXT-METHOD: no next method".
+    private readonly object _methodsLock = new();
+    private volatile LispMethod[] _methods = System.Array.Empty<LispMethod>();
+    /// <summary>Read-only snapshot of the GF's methods. Enumeration is consistent:
+    /// the property reads the volatile array reference once, so a concurrent
+    /// ReplaceMethods swap cannot tear an in-progress loop.</summary>
+    public IReadOnlyList<LispMethod> Methods => _methods;
+    /// <summary>Lock held while building+publishing a new method array (write path only).</summary>
+    internal object MethodsLock => _methodsLock;
+    /// <summary>Publish a new method array (volatile write). Call under MethodsLock.</summary>
+    internal void ReplaceMethods(LispMethod[] methods) => _methods = methods;
     public LispFunction? DispatchFunction { get; set; }
     /// <summary>Method combination type: null means STANDARD, otherwise the operator symbol (+, LIST, APPEND, etc.)</summary>
     public Symbol? MethodCombination { get; set; }
     /// <summary>Method combination arguments from defgeneric (:method-combination name arg1 arg2 ...)</summary>
     public LispObject[]? MethodCombinationArgs { get; set; }
+    /// <summary>:argument-precedence-order as a permutation of required-parameter
+    /// indices (CLHS 7.6.6.1.2). null means natural left-to-right order (#268).</summary>
+    public int[]? ArgumentPrecedenceOrder { get; set; }
     /// <summary>Method combination order: true = most-specific-first (default), false = most-specific-last</summary>
     public bool MostSpecificFirst { get; set; } = true;
     /// <summary>Lambda list structure for congruence checking (CLHS 7.6.4)</summary>
@@ -433,8 +504,11 @@ public class GenericFunction : LispFunction
     public LispFunction? FallbackFunction { get; set; }
 
     /// <summary>Single-entry dispatch cache (monomorphic inline cache).
-    /// Caches the last successful dispatch result for quick reuse.</summary>
-    internal CachedDispatch? LastDispatch;
+    /// Caches the last successful dispatch result for quick reuse. `volatile` so a
+    /// concurrent InvalidateCache (defmethod) / cache-fill is visible across threads
+    /// and reads never tear — worst case a reader uses a complete but slightly stale
+    /// CachedDispatch, never a corrupt one (#278).</summary>
+    internal volatile CachedDispatch? LastDispatch;
 
     /// <summary>Invalidate dispatch cache when methods are added/removed.</summary>
     internal void InvalidateCache() => LastDispatch = null;

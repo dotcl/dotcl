@@ -199,7 +199,7 @@
     (loop
       ;; Fetch next key in an interruptable manner.
       (let* ((ki (console-read-key-interruptable))
-            (ch (when ki (key-char ki))))
+             (ch (when ki (key-char ki))))
         ;; If console-read-key-interruptable returned nil, the thread was interrupted
         ;; (e.g., a ThreadInterruptedException was trapped). Break the loop and return nil.
         (unless ki

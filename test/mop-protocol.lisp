@@ -283,16 +283,44 @@
 ;;; ============================================================
 
 (deftest mop/slot-definition-location-non-negative-integer
-  ;; AMOP: should return a non-negative integer (index in instance data).
-  ;; dotcl: returns the slot name symbol as an opaque locator instead.
-  ;; Test documents current (non-conformant) behavior.
+  ;; AMOP: returns a non-negative integer (index into the instance layout)
+  ;; for instance-allocated slots (#264).
   (let ((slotd (find-if (lambda (s)
                           (eq (dotcl-mop:slot-definition-name s) 'x))
                         (dotcl-mop:class-slots (find-class 'mop/a)))))
     (let ((loc (dotcl-mop:slot-definition-location slotd)))
-      ;; dotcl returns slot name as opaque locator
-      (eq loc 'x)))           ; TODO: should be (integerp loc) per AMOP
+      (and (integerp loc) (>= loc 0))))
   t)
+
+(deftest mop/standard-instance-access-roundtrip
+  ;; AMOP: standard-instance-access reads/writes the slot at an integer location (#264)
+  (let* ((obj (make-instance 'mop/a))
+         (slotd (find-if (lambda (s) (eq (dotcl-mop:slot-definition-name s) 'x))
+                         (dotcl-mop:class-slots (find-class 'mop/a))))
+         (loc (dotcl-mop:slot-definition-location slotd)))
+    (setf (dotcl-mop:standard-instance-access obj loc) 'sentinel)
+    (list (dotcl-mop:standard-instance-access obj loc)
+          (slot-value obj 'x)))
+  (sentinel sentinel))
+
+(deftest mop/slot-definition-typep-consistent
+  ;; class-of and typep must agree on slot-definition metaobjects (#264)
+  (let ((eslotd (first (dotcl-mop:class-slots (find-class 'mop/a))))
+        (dslotd (first (dotcl-mop:class-direct-slots (find-class 'mop/a)))))
+    (list (typep eslotd 'dotcl-mop:standard-effective-slot-definition)
+          (typep eslotd 'dotcl-mop:standard-direct-slot-definition)
+          (typep dslotd 'dotcl-mop:standard-direct-slot-definition)
+          (typep eslotd t)))
+  (t nil t t))
+
+(deftest mop/slot-definition-method-dispatch
+  ;; methods can dispatch on a slot-definition's class (#264)
+  (progn
+    (eval '(defgeneric mop/slotd-kind (s)))
+    (eval '(defmethod mop/slotd-kind ((s dotcl-mop:standard-effective-slot-definition)) :effective))
+    (eval '(defmethod mop/slotd-kind ((s t)) :other))
+    (funcall 'mop/slotd-kind (first (dotcl-mop:class-slots (find-class 'mop/a)))))
+  :effective)
 
 (deftest mop/slot-definition-location-distinct
   ;; Distinct slots must have distinct locations (regardless of representation)

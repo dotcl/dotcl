@@ -1680,6 +1680,39 @@ public static partial class Runtime
         return new LispString(FormatTop(obj, true));
     }
 
+    [ThreadStatic] private static bool _inBacktraceRender;
+    /// <summary>Render one backtrace argument: bounded depth/length, cycle-safe, and
+    /// guarded against re-entry and printer errors (e.g. a print-object method that
+    /// itself signals). Called only while formatting a backtrace, never on the call
+    /// hot path (#251).</summary>
+    public static string BacktraceArgString(LispObject obj)
+    {
+        if (_inBacktraceRender) return "#";   // a nested print escaped back here
+        _inBacktraceRender = true;
+        var lvl = Startup.Sym("*PRINT-LEVEL*");
+        var len = Startup.Sym("*PRINT-LENGTH*");
+        var cir = Startup.Sym("*PRINT-CIRCLE*");
+        DynamicBindings.Push(lvl, Fixnum.Make(4));
+        DynamicBindings.Push(len, Fixnum.Make(8));
+        DynamicBindings.Push(cir, T.Instance);
+        try
+        {
+            var s = FormatTop(obj, true);
+            return s.Length > 80 ? s.Substring(0, 79) + "…" : s;
+        }
+        catch
+        {
+            return "#<" + obj.GetType().Name + ">";
+        }
+        finally
+        {
+            DynamicBindings.Pop(cir);
+            DynamicBindings.Pop(len);
+            DynamicBindings.Pop(lvl);
+            _inBacktraceRender = false;
+        }
+    }
+
     public static LispObject PrincToString(LispObject obj)
     {
         // CLHS: princ-to-string ≡ (write-to-string obj :escape nil :readably nil)

@@ -1107,6 +1107,7 @@ public class CilAssembler
         var paramNames = new List<string>();
         LispObject? bodyInstrs = null;
         string? defPkg = null;
+        bool selfArg0 = false;
 
         while (plist is Cons pc)
         {
@@ -1128,6 +1129,11 @@ public class CilAssembler
                 case "PKG":
                     defPkg = GetString(val);
                     break;
+                case "SELF":
+                    // D1144: this direct fn does a non-tail self-call; the body expects
+                    // the self LispFunction as arg0 (params shifted to ldarg 1..n).
+                    selfArg0 = val is not Nil;
+                    break;
             }
             plist = Cddr(pc);
         }
@@ -1143,13 +1149,23 @@ public class CilAssembler
             // (including _funcN direct-call fast path) into the current ILGenerator.
             int faslId = Interlocked.Increment(ref _faslClosureCount);
             FaslAssembler.EmitDefmethodDirectInto(_faslTypeBuilder, _il, _faslStructMap!,
-                name, paramCount, bodyInstrs, defPkg, faslId);
+                name, paramCount, bodyInstrs, defPkg, faslId, selfArg0);
             return;
         }
 
-        // Create DynamicMethod with direct LispObject params
-        var directParamTypes = new Type[paramCount];
-        for (int i = 0; i < paramCount; i++) directParamTypes[i] = typeof(LispObject);
+        // Create DynamicMethod with direct LispObject params. When selfArg0 (D1144), the
+        // method takes a leading LispFunction self so a non-tail self-call reaches the
+        // receiver from arg0 instead of re-resolving #'NAME each recursive entry.
+        var directParamTypes = new Type[selfArg0 ? paramCount + 1 : paramCount];
+        if (selfArg0)
+        {
+            directParamTypes[0] = typeof(LispFunction);
+            for (int i = 0; i < paramCount; i++) directParamTypes[i + 1] = typeof(LispObject);
+        }
+        else
+        {
+            for (int i = 0; i < paramCount; i++) directParamTypes[i] = typeof(LispObject);
+        }
 
         var directDm = new DynamicMethod(name + "_direct", typeof(LispObject),
             directParamTypes, typeof(CilAssembler).Module, true);
@@ -1160,6 +1176,11 @@ public class CilAssembler
         // Create array-based wrapper with arity check and LispFunction with direct delegate
         Func<LispObject[], LispObject> arrayDel;
         LispFunction fn;
+        if (selfArg0)
+        {
+            fn = BuildSelfDirectFunction(directDm, name, paramCount);
+        }
+        else
         switch (paramCount)
         {
             case 0:
@@ -1340,6 +1361,97 @@ public class CilAssembler
         }
     }
 
+    // Build the LispFunction for a self-threaded direct function (D1144), arities 0-8.
+    // directDm is the static method LispObject M(LispFunction self, LispObject p0...).
+    // _funcN gets a closed delegate over fn (self bound) so a non-tail self-call
+    // (LispFunction.InvokeN → _funcN) reaches the receiver with no per-entry symbol
+    // lookup. The array wrapper is the slow apply/arity-mismatch fallback; it can't
+    // capture fn at construction so it uses fnRef, assigned right after construction.
+    private static LispFunction BuildSelfDirectFunction(DynamicMethod directDm, string name, int paramCount)
+    {
+        var n = name;
+        LispFunction fnRef = null!;
+        LispFunction fn;
+        switch (paramCount)
+        {
+            case 0:
+            {
+                var o = (Func<LispFunction, LispObject>)directDm.CreateDelegate(typeof(Func<LispFunction, LispObject>));
+                fn = new LispFunction(args => { Runtime.CheckArityExact(n, args, 0); return o(fnRef); }, name, 0);
+                fnRef = fn;
+                fn._func0 = (Func<LispObject>)directDm.CreateDelegate(typeof(Func<LispObject>), fn);
+                break;
+            }
+            case 1:
+            {
+                var o = (Func<LispFunction, LispObject, LispObject>)directDm.CreateDelegate(typeof(Func<LispFunction, LispObject, LispObject>));
+                fn = new LispFunction(args => { Runtime.CheckArityExact(n, args, 1); return o(fnRef, args[0]); }, name, 1);
+                fnRef = fn;
+                fn._func1 = (Func<LispObject, LispObject>)directDm.CreateDelegate(typeof(Func<LispObject, LispObject>), fn);
+                break;
+            }
+            case 2:
+            {
+                var o = (Func<LispFunction, LispObject, LispObject, LispObject>)directDm.CreateDelegate(typeof(Func<LispFunction, LispObject, LispObject, LispObject>));
+                fn = new LispFunction(args => { Runtime.CheckArityExact(n, args, 2); return o(fnRef, args[0], args[1]); }, name, 2);
+                fnRef = fn;
+                fn._func2 = (Func<LispObject, LispObject, LispObject>)directDm.CreateDelegate(typeof(Func<LispObject, LispObject, LispObject>), fn);
+                break;
+            }
+            case 3:
+            {
+                var o = (Func<LispFunction, LispObject, LispObject, LispObject, LispObject>)directDm.CreateDelegate(typeof(Func<LispFunction, LispObject, LispObject, LispObject, LispObject>));
+                fn = new LispFunction(args => { Runtime.CheckArityExact(n, args, 3); return o(fnRef, args[0], args[1], args[2]); }, name, 3);
+                fnRef = fn;
+                fn._func3 = (Func<LispObject, LispObject, LispObject, LispObject>)directDm.CreateDelegate(typeof(Func<LispObject, LispObject, LispObject, LispObject>), fn);
+                break;
+            }
+            case 4:
+            {
+                var o = (Func<LispFunction, LispObject, LispObject, LispObject, LispObject, LispObject>)directDm.CreateDelegate(typeof(Func<LispFunction, LispObject, LispObject, LispObject, LispObject, LispObject>));
+                fn = new LispFunction(args => { Runtime.CheckArityExact(n, args, 4); return o(fnRef, args[0], args[1], args[2], args[3]); }, name, 4);
+                fnRef = fn;
+                fn._func4 = (Func<LispObject, LispObject, LispObject, LispObject, LispObject>)directDm.CreateDelegate(typeof(Func<LispObject, LispObject, LispObject, LispObject, LispObject>), fn);
+                break;
+            }
+            case 5:
+            {
+                var o = (Func<LispFunction, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject>)directDm.CreateDelegate(typeof(Func<LispFunction, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject>));
+                fn = new LispFunction(args => { Runtime.CheckArityExact(n, args, 5); return o(fnRef, args[0], args[1], args[2], args[3], args[4]); }, name, 5);
+                fnRef = fn;
+                fn._func5 = (Func<LispObject, LispObject, LispObject, LispObject, LispObject, LispObject>)directDm.CreateDelegate(typeof(Func<LispObject, LispObject, LispObject, LispObject, LispObject, LispObject>), fn);
+                break;
+            }
+            case 6:
+            {
+                var o = (Func<LispFunction, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject>)directDm.CreateDelegate(typeof(Func<LispFunction, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject>));
+                fn = new LispFunction(args => { Runtime.CheckArityExact(n, args, 6); return o(fnRef, args[0], args[1], args[2], args[3], args[4], args[5]); }, name, 6);
+                fnRef = fn;
+                fn._func6 = (Func<LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject>)directDm.CreateDelegate(typeof(Func<LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject>), fn);
+                break;
+            }
+            case 7:
+            {
+                var o = (Func<LispFunction, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject>)directDm.CreateDelegate(typeof(Func<LispFunction, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject>));
+                fn = new LispFunction(args => { Runtime.CheckArityExact(n, args, 7); return o(fnRef, args[0], args[1], args[2], args[3], args[4], args[5], args[6]); }, name, 7);
+                fnRef = fn;
+                fn._func7 = (Func<LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject>)directDm.CreateDelegate(typeof(Func<LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject>), fn);
+                break;
+            }
+            case 8:
+            {
+                var o = (Func<LispFunction, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject>)directDm.CreateDelegate(typeof(Func<LispFunction, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject>));
+                fn = new LispFunction(args => { Runtime.CheckArityExact(n, args, 8); return o(fnRef, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7]); }, name, 8);
+                fnRef = fn;
+                fn._func8 = (Func<LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject>)directDm.CreateDelegate(typeof(Func<LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject>), fn);
+                break;
+            }
+            default:
+                throw new Exception($"DEFMETHOD-DIRECT :self unsupported param-count {paramCount}");
+        }
+        return fn;
+    }
+
     // (:defmethod-native "NAME" [:pkg "PKG"] :params ("P1" ...) :body (...))
     // Body uses Int64 params (declared via (:declare-local KEY "Int64")).
     // Self-calls via (:callvirt "LispFunction.InvokeNativeN") leave long on stack.
@@ -1382,61 +1494,72 @@ public class CilAssembler
             return;
         }
 
-        // Native DynamicMethod: LispObject Name_native(long p0, ...)
-        // Long params avoid arg boxing; body returns LispObject (arithmetic already boxes via Fixnum.Make).
-        var nativeParamTypes = new Type[paramCount];
-        for (int i = 0; i < paramCount; i++) nativeParamTypes[i] = typeof(long);
+        // Native DynamicMethod: LispObject Name_native(LispFunction self, long p0, ...)
+        // arg0 is the LispFunction itself, threaded through so a native self-call reaches
+        // the receiver from arg0 instead of re-resolving #'NAME from its symbol each call
+        // (the old per-call self-fn prelude, D1143). Long params avoid arg boxing; body
+        // returns LispObject (arithmetic already boxes via Fixnum.Make).
+        var nativeParamTypes = new Type[paramCount + 1];
+        nativeParamTypes[0] = typeof(LispFunction);
+        for (int i = 0; i < paramCount; i++) nativeParamTypes[i + 1] = typeof(long);
         var nativeDm = new DynamicMethod(name + "_native", typeof(LispObject), nativeParamTypes,
             typeof(CilAssembler).Module, true);
         var innerAsm = new CilAssembler();
         innerAsm._il = nativeDm.GetILGenerator();
         innerAsm.Assemble(bodyInstrs);
 
-        // Create LispFunction with wrapper lambdas (unbox args; native returns LispObject directly)
+        // Create LispFunction with wrapper lambdas (unbox args; native returns LispObject
+        // directly). Wrappers pass `fn` as the leading self argument. fnRef is assigned
+        // after construction so the array-arg lambda can capture it before any call runs.
         LispFunction fn;
+        LispFunction fnRef = null!;
         switch (paramCount)
         {
             case 1:
             {
-                var d = (Func<long, LispObject>)nativeDm.CreateDelegate(typeof(Func<long, LispObject>));
+                var d = (Func<LispFunction, long, LispObject>)nativeDm.CreateDelegate(typeof(Func<LispFunction, long, LispObject>));
                 var n = name;
                 fn = new LispFunction(
-                    args => { Runtime.CheckArityExact(n, args, 1); return d(((Fixnum)args[0]).Value); },
+                    args => { Runtime.CheckArityExact(n, args, 1); return d(fnRef, ((Fixnum)args[0]).Value); },
                     name, 1);
-                fn._func1 = a => d(((Fixnum)a).Value);
+                fnRef = fn;
+                fn._func1 = a => d(fn, ((Fixnum)a).Value);
                 fn._nativeFunc1 = d;
                 break;
             }
             case 2:
             {
-                var d = (Func<long, long, LispObject>)nativeDm.CreateDelegate(typeof(Func<long, long, LispObject>));
+                var d = (Func<LispFunction, long, long, LispObject>)nativeDm.CreateDelegate(typeof(Func<LispFunction, long, long, LispObject>));
                 var n = name;
                 fn = new LispFunction(
-                    args => { Runtime.CheckArityExact(n, args, 2); return d(((Fixnum)args[0]).Value, ((Fixnum)args[1]).Value); },
+                    args => { Runtime.CheckArityExact(n, args, 2); return d(fnRef, ((Fixnum)args[0]).Value, ((Fixnum)args[1]).Value); },
                     name, 2);
-                fn._func2 = (a, b) => d(((Fixnum)a).Value, ((Fixnum)b).Value);
+                fnRef = fn;
+                fn._func2 = (a, b) => d(fn, ((Fixnum)a).Value, ((Fixnum)b).Value);
                 fn._nativeFunc2 = d;
                 break;
             }
             case 3:
             {
-                var d = (Func<long, long, long, LispObject>)nativeDm.CreateDelegate(typeof(Func<long, long, long, LispObject>));
+                var d = (Func<LispFunction, long, long, long, LispObject>)nativeDm.CreateDelegate(typeof(Func<LispFunction, long, long, long, LispObject>));
                 var n = name;
                 fn = new LispFunction(
-                    args => { Runtime.CheckArityExact(n, args, 3); return d(((Fixnum)args[0]).Value, ((Fixnum)args[1]).Value, ((Fixnum)args[2]).Value); },
+                    args => { Runtime.CheckArityExact(n, args, 3); return d(fnRef, ((Fixnum)args[0]).Value, ((Fixnum)args[1]).Value, ((Fixnum)args[2]).Value); },
                     name, 3);
-                fn._func3 = (a, b, c) => d(((Fixnum)a).Value, ((Fixnum)b).Value, ((Fixnum)c).Value);
+                fnRef = fn;
+                fn._func3 = (a, b, c) => d(fn, ((Fixnum)a).Value, ((Fixnum)b).Value, ((Fixnum)c).Value);
                 fn._nativeFunc3 = d;
                 break;
             }
             case 4:
             {
-                var d = (Func<long, long, long, long, LispObject>)nativeDm.CreateDelegate(typeof(Func<long, long, long, long, LispObject>));
+                var d = (Func<LispFunction, long, long, long, long, LispObject>)nativeDm.CreateDelegate(typeof(Func<LispFunction, long, long, long, long, LispObject>));
                 var n = name;
                 fn = new LispFunction(
-                    args => { Runtime.CheckArityExact(n, args, 4); return d(((Fixnum)args[0]).Value, ((Fixnum)args[1]).Value, ((Fixnum)args[2]).Value, ((Fixnum)args[3]).Value); },
+                    args => { Runtime.CheckArityExact(n, args, 4); return d(fnRef, ((Fixnum)args[0]).Value, ((Fixnum)args[1]).Value, ((Fixnum)args[2]).Value, ((Fixnum)args[3]).Value); },
                     name, 4);
-                fn._func4 = (a, b, c, dd) => d(((Fixnum)a).Value, ((Fixnum)b).Value, ((Fixnum)c).Value, ((Fixnum)dd).Value);
+                fnRef = fn;
+                fn._func4 = (a, b, c, dd) => d(fn, ((Fixnum)a).Value, ((Fixnum)b).Value, ((Fixnum)c).Value, ((Fixnum)dd).Value);
                 fn._nativeFunc4 = d;
                 break;
             }
@@ -2610,6 +2733,8 @@ public class CilAssembler
             ["Runtime.Decrement"] = typeof(Runtime).GetMethod("Decrement")!,
             ["Runtime.Multiply"] = typeof(Runtime).GetMethod("Multiply")!,
             ["Runtime.MultiplyFixnum"] = typeof(Runtime).GetMethod("MultiplyFixnum")!,
+            ["Runtime.AddFixnum"] = typeof(Runtime).GetMethod("AddFixnum")!,
+            ["Runtime.SubtractFixnum"] = typeof(Runtime).GetMethod("SubtractFixnum")!,
             ["Runtime.Divide"] = typeof(Runtime).GetMethod("Divide")!,
             ["Runtime.AddN"] = typeof(Runtime).GetMethod("AddN")!,
             ["Runtime.SubtractN"] = typeof(Runtime).GetMethod("SubtractN")!,
@@ -2743,6 +2868,7 @@ public class CilAssembler
             ["Runtime.Logxor2"] = typeof(Runtime).GetMethod("Logxor2")!,
             ["Runtime.Lognot"] = typeof(Runtime).GetMethod("Lognot")!,
             ["Runtime.Ash"] = typeof(Runtime).GetMethod("Ash")!,
+            ["Runtime.AshLeftLong"] = typeof(Runtime).GetMethod("AshLeftLong")!,
             ["Runtime.IntegerLength"] = typeof(Runtime).GetMethod("IntegerLength")!,
             ["Runtime.Logbitp"] = typeof(Runtime).GetMethod("Logbitp")!,
 
@@ -2951,6 +3077,7 @@ public class CilAssembler
             ["Runtime.MakeClassFull"] = typeof(Runtime).GetMethod("MakeClassFull")!,
             ["Runtime.MakeSlotDef"] = typeof(Runtime).GetMethod("MakeSlotDef")!,
             ["Runtime.MakeSlotDefWithAllocation"] = typeof(Runtime).GetMethod("MakeSlotDefWithAllocation")!,
+            ["Runtime.SetSlotDefRawOptions"] = typeof(Runtime).GetMethod("SetSlotDefRawOptions")!,
             ["Runtime.SetClassDefaultInitargs"] = typeof(Runtime).GetMethod("SetClassDefaultInitargs")!,
             ["Runtime.ClassOf"] = typeof(Runtime).GetMethod("ClassOf")!,
             ["Runtime.ClassName"] = typeof(Runtime).GetMethod("ClassName")!,

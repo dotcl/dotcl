@@ -10,7 +10,7 @@
     <PackAsTool>true</PackAsTool>
     <ToolCommandName>dotcl</ToolCommandName>
     <PackageId>dotcl</PackageId>
-    <Version>0.1.8</Version>
+    <Version>0.1.9</Version>
     <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
     <Description>Common Lisp on .NET — compiles CL to CIL and runs via .NET JIT</Description>
     <Authors>SANO Masatoshi</Authors>

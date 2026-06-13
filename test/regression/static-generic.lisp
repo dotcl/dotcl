@@ -50,3 +50,27 @@
     (dotnet:static-generic "System.Linq.Enumerable" "Where" '() nil nil)
     error)
   t)
+
+;;; D1122 (dotcl/dotcl#23) — dotnet:invoke-generic: generic INSTANCE methods.
+;;; List<int>.ConvertAll<string>(Converter<int,string>) via a Lisp delegate.
+(deftest d1122-invoke-generic-convertall
+  (let ((lst (dotnet:new "System.Collections.Generic.List`1[System.Int32]")))
+    (dotnet:invoke lst "Add" 5)
+    (dotnet:invoke lst "Add" 10)
+    (let* ((conv (dotnet:make-delegate "System.Converter`2[System.Int32,System.String]"
+                                       (lambda (x) (format nil "n~a" x))))
+           (res (dotnet:invoke-generic lst "ConvertAll" '("System.String") conv)))
+      (list (dotnet:invoke res "get_Item" 0)
+            (dotnet:invoke res "get_Item" 1))))
+  ("n5" "n10"))
+
+;;; Error: no matching generic instance method.
+(deftest d1122-invoke-generic-no-method-error
+  (signals-error
+    (dotnet:invoke-generic (dotnet:new "System.Object") "NoSuch" '("System.Int32") 1)
+    error)
+  t)
+
+(deftest d1122-invoke-generic-has-doc
+  (and (stringp (documentation 'dotnet:invoke-generic 'function)) t)
+  t)

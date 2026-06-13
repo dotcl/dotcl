@@ -752,7 +752,82 @@
 ;;; Slot sharing: merge LispObject locals with disjoint flat ranges (#199)
 ;;; ============================================================
 
+(defun peephole-optimize (instrs)
+  "Local peephole pass over a finalized SIL instruction list. Removes
+   instruction sequences that codegen emits but that are semantically
+   no-ops, iterating to a fixpoint so cascades collapse.
+
+   Patterns:
+     P1  (:ldloc X) (:stloc X)        ->  {}          ; dead self-copy (n-ary
+                                                       ; arithmetic lowering)
+     P2  (:dup) (:stloc X) (:pop)     ->  (:stloc X)   ; discarded-assignment
+                                                       ; idiom (setq/dolist/loop
+                                                       ; in statement position)
+     P3  (:ldsfld \"Nil.Instance\")
+           (:call \"Runtime.UnwrapMv\") -> (:ldsfld \"Nil.Instance\")  ; UnwrapMv of a
+                                          ; statically-Nil value is identity with no
+                                          ; side effect (Nil is not an MvReturn)
+     P4  (:ldsfld \"Nil.Instance\") (:pop) -> {}        ; push-Nil-then-discard is dead
+   (P3+P4 compose across the fixpoint to delete the dead nil/unwrap/pop preamble
+    that codegen emits at the top of every TCO loop body.)
+
+   Matches only strictly-adjacent instructions. A :label (the only branch
+   target form in SIL) between instructions breaks adjacency in the list, so
+   it naturally blocks a match — no control-flow analysis needed, and the
+   rewrites are valid even inside loops/TCO."
+  (let ((changed t))
+    (loop while changed do
+      (setf changed nil)
+      (let ((out '())
+            (cur instrs))
+        (loop while cur do
+          (let ((i1 (first cur))
+                (i2 (second cur))
+                (i3 (third cur)))
+            (cond
+              ;; P1: load a local then immediately store it back to itself.
+              ((and (consp i1) (eq (car i1) :ldloc)
+                    (consp i2) (eq (car i2) :stloc)
+                    (equal (cadr i1) (cadr i2)))
+               (setf changed t)
+               (setf cur (cddr cur)))
+              ;; P2: dup a value, store it, discard the duplicate. The dup/pop
+              ;; bracket cancels — stack-equivalent to a bare store. (Assignment
+              ;; forms leave their value on the stack; in statement position it
+              ;; is then popped, so codegen emits dup;stloc;pop.)
+              ((and (consp i1) (eq (car i1) :dup)
+                    (consp i2) (eq (car i2) :stloc)
+                    (consp i3) (eq (car i3) :pop))
+               (setf changed t)
+               (push i2 out)
+               (setf cur (cdddr cur)))
+              ;; P3: UnwrapMv of a statically-Nil value is a no-op identity call.
+              ((and (consp i1) (eq (car i1) :ldsfld) (equal (cadr i1) "Nil.Instance")
+                    (consp i2) (eq (car i2) :call) (equal (cadr i2) "Runtime.UnwrapMv"))
+               (setf changed t)
+               (push i1 out)
+               (setf cur (cddr cur)))
+              ;; P4: push a Nil constant then immediately discard it — dead.
+              ((and (consp i1) (eq (car i1) :ldsfld) (equal (cadr i1) "Nil.Instance")
+                    (consp i2) (eq (car i2) :pop))
+               (setf changed t)
+               (setf cur (cddr cur)))
+              (t
+               (push i1 out)
+               (setf cur (cdr cur))))))
+        (setf instrs (nreverse out))))
+    instrs))
+
 (defun merge-disjoint-locals (instrs)
+  "Linear-scan slot-share locals, then peephole-optimize. Thin wrapper so all
+   callers get the peephole pass; the slot-merge logic lives in
+   %merge-disjoint-locals. Peephole runs AFTER slot merging: %merge dedups
+   :declare-local entries, which can bring an (:ldloc X)(:stloc X) pair
+   (separated by a declare in the raw stream) into adjacency where the
+   peephole can collapse it."
+  (peephole-optimize (%merge-disjoint-locals instrs)))
+
+(defun %merge-disjoint-locals (instrs)
   "Linear-scan slot sharing: merge LispObject locals whose flat live ranges
    do not overlap. When last-use(K1) < first-def(K2) in flat instruction order,
    K2 can reuse K1's slot. Reduces local variable count across exclusive cond arms.
@@ -760,6 +835,12 @@
    Skipped entirely when any backward branch is present (loops, TCO)."
   ;; Pre-scan: bail out if any backward branch is present.
   ;; A backward branch targets a label whose position <= the branch's own position.
+  ;; :leave counts: a tagbody that elides its GoException try/catch (compile-tagbody
+  ;; no-catch path) uses (:leave loop-label) for its backward loop edge and has no
+  ;; trailing (:br loop-label), so :leave is the only backward-branch signal. Missing
+  ;; it lets the linear scan treat a loop as straight-line code and wrongly merge
+  ;; live-overlapping slots. Forward :leave (block / handler-case exit) has target >
+  ;; position and does not trip this.
   (let ((label-pos (make-hash-table :test #'equal))
         (scan-pos 0))
     (dolist (instr instrs)
@@ -769,10 +850,10 @@
     (let ((fwd-pos 0))
       (dolist (instr instrs)
         (when (and (consp instr)
-                   (member (car instr) '(:br :brtrue :brfalse))
+                   (member (car instr) '(:br :brtrue :brfalse :leave))
                    (let ((tgt (gethash (cadr instr) label-pos)))
                      (and tgt (<= tgt fwd-pos))))
-          (return-from merge-disjoint-locals instrs))
+          (return-from %merge-disjoint-locals instrs))
         (incf fwd-pos))))
   (let ((first-pos  (make-hash-table :test #'equal))
         (last-pos   (make-hash-table :test #'equal))
@@ -802,7 +883,7 @@
                          candidates)))
                local-type)
       (when (< (length candidates) 2)
-        (return-from merge-disjoint-locals instrs))
+        (return-from %merge-disjoint-locals instrs))
       ;; Sort by first-pos ascending
       (setf candidates (sort candidates #'< :key #'first))
       ;; Linear scan: for each key in order, find an expired free slot to reuse
@@ -821,7 +902,7 @@
                   (push (cons lp canonical) free-slots))
                 (push (cons lp key) free-slots))))
         (when (zerop (hash-table-count rename))
-          (return-from merge-disjoint-locals instrs))
+          (return-from %merge-disjoint-locals instrs))
         ;; Pass 2: rename stloc/ldloc for merged keys; deduplicate :declare-local
         (let ((seen-declare (make-hash-table :test #'equal)))
           (remove nil

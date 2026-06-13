@@ -1280,6 +1280,21 @@ public static class Startup
         }
         Emitter.CilAssembler.RegisterFunction("DISASSEMBLE",
             new LispFunction(Runtime.Disassemble, "DISASSEMBLE", -1));
+        {
+            var jitDasmFn = new LispFunction(Runtime.JitDisassemble, "DOTCL:JIT-DISASSEMBLE", -1);
+            RegisterDotcl("JIT-DISASSEMBLE", jitDasmFn);
+            Emitter.CilAssembler.RegisterFunction("DOTCL:JIT-DISASSEMBLE", jitDasmFn);
+        }
+        {
+            // Name omitted on purpose: a named fn would push its own frame onto
+            // the call stack and appear in its own backtrace output.
+            var btFn = new LispFunction(Runtime.Backtrace);
+            RegisterDotcl("BACKTRACE", btFn);
+            Emitter.CilAssembler.RegisterFunction("DOTCL:BACKTRACE", btFn);
+            var pbtFn = new LispFunction(Runtime.PrintBacktrace);
+            RegisterDotcl("PRINT-BACKTRACE", pbtFn);
+            Emitter.CilAssembler.RegisterFunction("DOTCL:PRINT-BACKTRACE", pbtFn);
+        }
         Emitter.CilAssembler.RegisterFunction("%TRACE",
             new LispFunction(Runtime.Trace, "%TRACE", -1));
         Emitter.CilAssembler.RegisterFunction("%UNTRACE",
@@ -1564,6 +1579,8 @@ public static class Startup
             new LispFunction(Runtime.ThreadName, "THREAD-NAME", 1));
         RegisterDotcl("THREAD-ALIVE-P",
             new LispFunction(Runtime.ThreadAliveP, "THREAD-ALIVE-P", 1));
+        RegisterDotcl("THREAD-OBJECT",
+            new LispFunction(Runtime.ThreadObject, "THREAD-OBJECT", 1));
         RegisterDotcl("THREAD-JOIN",
             new LispFunction(Runtime.ThreadJoin, "THREAD-JOIN", 1));
         RegisterDotcl("THREAD-YIELD",
@@ -1615,48 +1632,98 @@ public static class Startup
         }, "DOTCL:%SET-REPL-READLINE-HOOK", 1));
 
         // DOTNET package functions
-        RegisterDotNet(DotNetPkg, "LOAD-ASSEMBLY", new LispFunction(Runtime.DotNetLoadAssembly, "DOTNET:LOAD-ASSEMBLY", -1));
-        RegisterDotNet(DotNetPkg, "MAKE-DELEGATE", new LispFunction(Runtime.DotNetMakeDelegate, "DOTNET:MAKE-DELEGATE", 2));
-        RegisterDotNet(DotNetPkg, "CALL-OUT", new LispFunction(Runtime.DotNetCallOut, "DOTNET:CALL-OUT", -1));
-        RegisterDotNet(DotNetPkg, "STATIC-GENERIC", new LispFunction(Runtime.DotNetStaticGeneric, "DOTNET:STATIC-GENERIC", -1));
-        RegisterDotNet(DotNetPkg, "REQUIRE", new LispFunction(DotNetNuGet.Require, "DOTNET:REQUIRE", -1));
+        RegisterDotNet(DotNetPkg, "LOAD-ASSEMBLY", new LispFunction(Runtime.DotNetLoadAssembly, "DOTNET:LOAD-ASSEMBLY", -1),
+            "(dotnet:load-assembly name-or-path) => assembly\nLoad a .NET assembly by simple name, file path, or partial name so its types\nbecome resolvable (cf. dotnet:resolve-type) and callable.");
+        RegisterDotNet(DotNetPkg, "MAKE-DELEGATE", new LispFunction(Runtime.DotNetMakeDelegate, "DOTNET:MAKE-DELEGATE", 2),
+            "(dotnet:make-delegate delegate-type fn) => delegate\nWrap a Lisp function FN as a .NET delegate of DELEGATE-TYPE (a type name string).\nEach delegate call marshals the .NET args to Lisp, calls FN, and marshals the\nresult back to the delegate's return type.");
+        RegisterDotNet(DotNetPkg, "CALL-OUT", new LispFunction(Runtime.DotNetCallOut, "DOTNET:CALL-OUT", -1),
+            "(dotnet:call-out object \"Method\" &rest args) => value, out1, out2, ...\nInvoke an instance method that has out/ref parameters. Returns the method's\nreturn value (T for void) as the primary value, followed by each out/ref\nargument as additional values.");
+        RegisterDotNet(DotNetPkg, "STATIC-GENERIC", new LispFunction(Runtime.DotNetStaticGeneric, "DOTNET:STATIC-GENERIC", -1),
+            "(dotnet:static-generic \"Type\" \"Method\" (type-arg ...) &rest args) => value\nInvoke a generic static method, instantiating it with the given type arguments\n(MakeGenericMethod) before calling it.");
+        RegisterDotNet(DotNetPkg, "INVOKE-GENERIC", new LispFunction(Runtime.DotNetInvokeGeneric, "DOTNET:INVOKE-GENERIC", -1),
+            "(dotnet:invoke-generic object \"Method\" (type-arg ...) &rest args) => value\nInstance counterpart of dotnet:static-generic: invoke a generic instance method on\nOBJECT, instantiating it with the given type-argument name strings before the\ncall (e.g. (dotnet:invoke-generic cm \"Load\" '(\"Texture2D\") \"images/logo\")).");
+        RegisterDotNet(DotNetPkg, "RESOLVE-TYPE", new LispFunction(Runtime.DotNetResolveType, "DOTNET:RESOLVE-TYPE", 1),
+            "(dotnet:resolve-type type-name) => type\nResolve a .NET System.Type from a name string, searching loaded assemblies\n(loading by namespace prefix, and COM ProgIDs on Windows). The result can be\ninspected or passed anywhere a System.Type is expected. Errors if not found.");
+        RegisterDotNet(DotNetPkg, "REQUIRE", new LispFunction(DotNetNuGet.Require, "DOTNET:REQUIRE", -1),
+            "(dotnet:require package &optional version) => t\nDownload (if needed) and load a NuGet package and its dependencies, making the\nassemblies available for resolution and calls.");
 #if !DOTCL_NO_WINFORMS
-        RegisterDotNet(DotNetPkg, "UI-INVOKE", new LispFunction(DotNetWinForms.UiInvoke, "DOTNET:UI-INVOKE", -1));
-        RegisterDotNet(DotNetPkg, "UI-POST", new LispFunction(DotNetWinForms.UiPost, "DOTNET:UI-POST", -1));
+        RegisterDotNet(DotNetPkg, "UI-INVOKE", new LispFunction(DotNetWinForms.UiInvoke, "DOTNET:UI-INVOKE", -1),
+            "(dotnet:ui-invoke fn) => value\nRun FN on the UI (message-loop) thread and wait for it, returning its value.\nUse for code that must touch UI controls from a background thread.");
+        RegisterDotNet(DotNetPkg, "UI-POST", new LispFunction(DotNetWinForms.UiPost, "DOTNET:UI-POST", -1),
+            "(dotnet:ui-post fn) => nil\nQueue FN to run on the UI (message-loop) thread asynchronously and return\nimmediately without waiting for the result.");
 #endif
-        RegisterDotNet(DotNetPkg, "ADD-EVENT", new LispFunction(DotNetEvents.AddEvent, "DOTNET:ADD-EVENT", -1));
-        RegisterDotNet(DotNetPkg, "REMOVE-EVENT", new LispFunction(DotNetEvents.RemoveEvent, "DOTNET:REMOVE-EVENT", -1));
-        RegisterDotNet(DotNetPkg, "STATIC", new LispFunction(Runtime.DotNetStatic, "DOTNET:STATIC", -1));
+        RegisterDotNet(DotNetPkg, "ADD-EVENT", new LispFunction(DotNetEvents.AddEvent, "DOTNET:ADD-EVENT", -1),
+            "(dotnet:add-event object \"EventName\" handler) => handler\nSubscribe HANDLER (a Lisp function) to a .NET event on OBJECT. The handler is\ncalled with the event's arguments. Keep the returned handler to remove it later.");
+        RegisterDotNet(DotNetPkg, "REMOVE-EVENT", new LispFunction(DotNetEvents.RemoveEvent, "DOTNET:REMOVE-EVENT", -1),
+            "(dotnet:remove-event object \"EventName\" handler) => nil\nUnsubscribe a HANDLER previously attached with dotnet:add-event.");
+        RegisterDotNet(DotNetPkg, "STATIC", new LispFunction(Runtime.DotNetStatic, "DOTNET:STATIC", -1),
+            "(dotnet:static \"Type\" \"Member\" &rest args) => value\nRead-side access to a static method, property, or field. Dispatch is chosen by\nmember kind and argument count. Settable with (setf (dotnet:static ...) value).");
         RegisterDotNet(DotNetPkg, "%SET-STATIC", new LispFunction(Runtime.DotNetSetStatic, "DOTNET:%SET-STATIC", -1));
-        RegisterDotNet(DotNetPkg, "INVOKE", new LispFunction(Runtime.DotNetInvoke, "DOTNET:INVOKE", -1));
+        RegisterDotNet(DotNetPkg, "INVOKE", new LispFunction(Runtime.DotNetInvoke, "DOTNET:INVOKE", -1),
+            "(dotnet:invoke object \"Member\" &rest args) => value\nRead-side access to an instance method, property, field, or COM IDispatch member\non OBJECT. Dispatch is chosen by member kind and argument count. Settable with\n(setf (dotnet:invoke ...) value).");
         RegisterDotNet(DotNetPkg, "%SET-INVOKE", new LispFunction(Runtime.DotNetSetInvoke, "DOTNET:%SET-INVOKE", -1));
-        RegisterDotNet(DotNetPkg, "CALL-BASE", new LispFunction(Runtime.DotNetCallBase, "DOTNET:CALL-BASE", -1));
-        RegisterDotNet(DotNetPkg, "NEW", new LispFunction(Runtime.DotNetNew, "DOTNET:NEW", -1));
+        RegisterDotNet(DotNetPkg, "CALL-BASE", new LispFunction(Runtime.DotNetCallBase, "DOTNET:CALL-BASE", -1),
+            "(dotnet:call-base self \"Method\" &rest args) => value\nCall the base-class implementation of a virtual method non-virtually (like C#\nbase.Method(args)). SELF must be an instance of a dotcl-defined class; the base\ntype is self's BaseType.");
+        RegisterDotNet(DotNetPkg, "NEW", new LispFunction(Runtime.DotNetNew, "DOTNET:NEW", -1),
+            "(dotnet:new type-name &rest args) => instance\nConstruct a new instance of the named .NET type, selecting the constructor by\nargument count and types. ARGS are marshalled from Lisp values.");
         RegisterDotNet(DotNetPkg, "%DEFINE-CLASS", new LispFunction(Runtime.DotNetDefineClass, "DOTNET:%DEFINE-CLASS", -1));
-        RegisterDotNet(DotNetPkg, "BOX", new LispFunction(Runtime.DotNetBox, "DOTNET:BOX", -1));
-        RegisterDotNet(DotNetPkg, "TO-STREAM", new LispFunction(Runtime.DotNetToStream, "DOTNET:TO-STREAM", -1));
+        RegisterDotNet(DotNetPkg, "BOX", new LispFunction(Runtime.DotNetBox, "DOTNET:BOX", -1),
+            "(dotnet:box value type-name) => boxed-value\nMarshal a Lisp VALUE to the named .NET type and keep it boxed at that static\ntype, so the right overload is chosen when it is passed to a subsequent call.");
+        RegisterDotNet(DotNetPkg, "TO-STREAM", new LispFunction(Runtime.DotNetToStream, "DOTNET:TO-STREAM", -1),
+            "(dotnet:to-stream object) => stream\nAdapt OBJECT (a Lisp stream or an existing .NET stream object) to a\nSystem.IO.Stream usable by .NET APIs.");
         RegisterDotNet(DotNetPkg, "%FFI-CALL", new LispFunction(Runtime.FfiCall, "DOTNET:%FFI-CALL", -1));
-        RegisterDotNet(DotNetPkg, "FFI", new LispFunction(Runtime.FfiCallKeyword, "DOTNET:FFI", -1));
+        RegisterDotNet(DotNetPkg, "FFI", new LispFunction(Runtime.FfiCallKeyword, "DOTNET:FFI", -1),
+            "(dotnet:ffi dll func :args '(type ...) :ret type &rest args) => value\nCall a native (P/Invoke) function FUNC in shared library DLL. :args gives the\nparameter types and :ret the return type; ARGS are marshalled accordingly.");
         RegisterDotNet(DotNetPkg, "%FFI-CALL-PTR", new LispFunction(Runtime.FfiCallPtr, "DOTNET:%FFI-CALL-PTR", -1));
-        RegisterDotNet(DotNetPkg, "ALLOC-MEM", new LispFunction(Runtime.AllocMem, "DOTNET:ALLOC-MEM", -1));
-        RegisterDotNet(DotNetPkg, "FREE-MEM", new LispFunction(Runtime.FreeMem, "DOTNET:FREE-MEM", -1));
-        RegisterDotNet(DotNetPkg, "MEM-READ", new LispFunction(Runtime.MemRead, "DOTNET:MEM-READ", -1));
-        RegisterDotNet(DotNetPkg, "MEM-WRITE", new LispFunction(Runtime.MemWrite, "DOTNET:MEM-WRITE", -1));
-        RegisterDotNet(DotNetPkg, "TYPE-SIZE", new LispFunction(Runtime.TypeSize, "DOTNET:TYPE-SIZE", -1));
-        RegisterDotNet(DotNetPkg, "TYPE-ALIGN", new LispFunction(Runtime.TypeAlign, "DOTNET:TYPE-ALIGN", -1));
-        RegisterDotNet(DotNetPkg, "LOAD-LIBRARY", new LispFunction(Runtime.LoadLibrary, "DOTNET:LOAD-LIBRARY", -1));
-        RegisterDotNet(DotNetPkg, "FREE-LIBRARY", new LispFunction(Runtime.FreeLibrary, "DOTNET:FREE-LIBRARY", -1));
-        RegisterDotNet(DotNetPkg, "FIND-SYMBOL", new LispFunction(Runtime.FindSymbolInLib, "DOTNET:FIND-SYMBOL", -1));
-        RegisterDotNet(DotNetPkg, "FIND-SYMBOL-ANY", new LispFunction(Runtime.FindSymbolAny, "DOTNET:FIND-SYMBOL-ANY", -1));
-        RegisterDotNet(DotNetPkg, "LIBRARY-PATH", new LispFunction(Runtime.LibraryPath, "DOTNET:LIBRARY-PATH", -1));
+        RegisterDotNet(DotNetPkg, "ALLOC-MEM", new LispFunction(Runtime.AllocMem, "DOTNET:ALLOC-MEM", -1),
+            "(dotnet:alloc-mem size) => pointer\nAllocate SIZE bytes of unmanaged memory and return a pointer. Free it with\ndotnet:free-mem.");
+        RegisterDotNet(DotNetPkg, "FREE-MEM", new LispFunction(Runtime.FreeMem, "DOTNET:FREE-MEM", -1),
+            "(dotnet:free-mem pointer) => nil\nFree unmanaged memory previously allocated with dotnet:alloc-mem.");
+        RegisterDotNet(DotNetPkg, "MEM-READ", new LispFunction(Runtime.MemRead, "DOTNET:MEM-READ", -1),
+            "(dotnet:mem-read pointer type &optional offset) => value\nRead a value of TYPE (e.g. \"int\", \"double\", \"pointer\") from unmanaged memory at\nPOINTER plus optional OFFSET bytes.");
+        RegisterDotNet(DotNetPkg, "MEM-WRITE", new LispFunction(Runtime.MemWrite, "DOTNET:MEM-WRITE", -1),
+            "(dotnet:mem-write pointer type value &optional offset) => value\nWrite VALUE as TYPE into unmanaged memory at POINTER plus optional OFFSET bytes.");
+        RegisterDotNet(DotNetPkg, "TYPE-SIZE", new LispFunction(Runtime.TypeSize, "DOTNET:TYPE-SIZE", -1),
+            "(dotnet:type-size type) => bytes\nReturn the marshalled size in bytes of TYPE (cf. C sizeof).");
+        RegisterDotNet(DotNetPkg, "TYPE-ALIGN", new LispFunction(Runtime.TypeAlign, "DOTNET:TYPE-ALIGN", -1),
+            "(dotnet:type-align type) => bytes\nReturn the alignment requirement in bytes of TYPE (cf. C alignof).");
+        RegisterDotNet(DotNetPkg, "LOAD-LIBRARY", new LispFunction(Runtime.LoadLibrary, "DOTNET:LOAD-LIBRARY", -1),
+            "(dotnet:load-library name) => handle\nLoad a native shared library (.dll/.so/.dylib) by name or path and return its\nhandle for use with dotnet:find-symbol / dotnet:free-library.");
+        RegisterDotNet(DotNetPkg, "FREE-LIBRARY", new LispFunction(Runtime.FreeLibrary, "DOTNET:FREE-LIBRARY", -1),
+            "(dotnet:free-library handle) => nil\nUnload a native library previously loaded with dotnet:load-library.");
+        RegisterDotNet(DotNetPkg, "FIND-SYMBOL", new LispFunction(Runtime.FindSymbolInLib, "DOTNET:FIND-SYMBOL", -1),
+            "(dotnet:find-symbol handle name) => pointer\nLook up exported symbol NAME in the native library HANDLE, returning its address.");
+        RegisterDotNet(DotNetPkg, "FIND-SYMBOL-ANY", new LispFunction(Runtime.FindSymbolAny, "DOTNET:FIND-SYMBOL-ANY", -1),
+            "(dotnet:find-symbol-any name) => pointer\nLook up exported symbol NAME across already-loaded native libraries.");
+        RegisterDotNet(DotNetPkg, "LIBRARY-PATH", new LispFunction(Runtime.LibraryPath, "DOTNET:LIBRARY-PATH", -1),
+            "(dotnet:library-path handle) => path\nReturn the file path of the native library identified by HANDLE.");
+        // Accessor the stdlib uses to install the above docstrings into the Lisp
+        // *documentation-table* once DOCUMENTATION is defined (#25).
+        Emitter.CilAssembler.RegisterFunction("%DOTNET-DOC-ALIST",
+            new LispFunction(DotnetDocAlist, "%DOTNET-DOC-ALIST", 0));
     }
 
-    private static void RegisterDotNet(Package pkg, string name, LispFunction fn)
+    // Docstrings for DOTNET: built-ins, applied into the Lisp *documentation-table* after
+    // the stdlib (which defines DOCUMENTATION) loads, via %DOTNET-DOC-ALIST (#25).
+    private static readonly List<(Symbol Sym, string Doc)> _dotnetDocs = new();
+
+    private static void RegisterDotNet(Package pkg, string name, LispFunction fn, string? doc = null)
     {
         var (sym, _) = pkg.Intern(name);
         pkg.Export(sym);
         Emitter.CilAssembler.RegisterFunction($"DOTNET:{name}", fn);
         sym.Function = fn;
+        if (doc != null) _dotnetDocs.Add((sym, doc));
+    }
+
+    /// <summary>(%dotnet-doc-alist) => ((symbol . docstring) ...). The stdlib applies these
+    /// via (setf (documentation sym 'function) doc) once DOCUMENTATION is defined (#25).</summary>
+    public static LispObject DotnetDocAlist(LispObject[] args)
+    {
+        LispObject result = Nil.Instance;
+        for (int i = _dotnetDocs.Count - 1; i >= 0; i--)
+            result = new Cons(new Cons(_dotnetDocs[i].Sym, new LispString(_dotnetDocs[i].Doc)), result);
+        return result;
     }
 
     internal static Symbol InternExport(string name)

@@ -335,6 +335,7 @@ public static partial class Runtime
         LispPathname => Startup.Sym("PATHNAME"),
         LispStruct s => s.TypeName,
         LispInstance inst => !inst.Class.NameCleared && inst.Class.Name is Symbol name && Runtime.FindClassOrNil(name) is LispClass foundClass && ReferenceEquals(foundClass, inst.Class) ? name : (LispObject)inst.Class,
+        LispDotNetObject dn => Runtime.EnsureDotNetTypeClass(dn.Type).Name,
         _ => Startup.Sym("T")
     };
 

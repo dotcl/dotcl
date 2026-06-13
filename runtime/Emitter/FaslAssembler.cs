@@ -34,6 +34,10 @@ public class FaslAssembler
         typeof(CilAssembler).GetMethod("RegisterSetfFunctionOnSymbol")!;
     internal static readonly MethodInfo SymInPkgMI =
         typeof(Startup).GetMethod("SymInPkg")!;
+    internal static readonly MethodInfo GetFunctionBySymbolMI =
+        typeof(CilAssembler).GetMethod("GetFunctionBySymbol")!;
+    internal static readonly MethodInfo GetSetfFunctionBySymbolMI =
+        typeof(CilAssembler).GetMethod("GetSetfFunctionBySymbol")!;
     internal static readonly MethodInfo SetDirectDelegateMI =
         typeof(LispFunction).GetMethod("SetDirectDelegate")!;
     internal static readonly MethodInfo SetNativeDelegateMI =
@@ -47,7 +51,9 @@ public class FaslAssembler
 
     // Typed delegate constructors for arities 0..8 (index 0 = Func<LispObject>, etc.)
     internal static readonly ConstructorInfo[] TypedFuncCtors = BuildTypedFuncCtors();
-    // Native long→long delegate constructors for arities 1..4 (index 0 = Func<long,long>, etc.)
+    // Native delegate constructors for arities 1..4. The leading LispFunction is the
+    // self argument threaded through native self-calls (D1143); index 0 =
+    // Func<LispFunction,long,LispObject>, etc.
     internal static readonly ConstructorInfo[] NativeTypedFuncCtors = BuildNativeTypedFuncCtors();
 
     private static ConstructorInfo[] BuildTypedFuncCtors()
@@ -76,10 +82,10 @@ public class FaslAssembler
         var ctorArgs = new[] { typeof(object), typeof(IntPtr) };
         var types = new Type[]
         {
-            typeof(Func<long, LispObject>),
-            typeof(Func<long, long, LispObject>),
-            typeof(Func<long, long, long, LispObject>),
-            typeof(Func<long, long, long, long, LispObject>),
+            typeof(Func<LispFunction, long, LispObject>),
+            typeof(Func<LispFunction, long, long, LispObject>),
+            typeof(Func<LispFunction, long, long, long, LispObject>),
+            typeof(Func<LispFunction, long, long, long, long, LispObject>),
         };
         var result = new ConstructorInfo[4];
         for (int i = 0; i < 4; i++)
@@ -193,11 +199,11 @@ public class FaslAssembler
                         pendingHead = null;
                         pendingTail = null;
                     }
-                    var (name, paramNames, bodyInstrs, defPkg) = ParseDefmethodForm(inner);
+                    var (name, paramNames, bodyInstrs, defPkg, selfArg0) = ParseDefmethodForm(inner);
                     int id = _methodCount++;
                     if (sym.Name == "DEFMETHOD-DIRECT")
                         EmitDefmethodDirectInto(_tb, _initIl, _structInternMap,
-                            name, paramNames.Count, bodyInstrs, defPkg, id);
+                            name, paramNames.Count, bodyInstrs, defPkg, id, selfArg0);
                     else if (sym.Name == "DEFMETHOD-NATIVE")
                         EmitDefmethodNativeInto(_tb, _initIl, _structInternMap,
                             name, paramNames.Count, bodyInstrs, defPkg, id);
@@ -339,10 +345,10 @@ public class FaslAssembler
 
     // --- Shared parsing helper used by both FaslAssembler and CilAssembler FASL branch ---
 
-    internal static (string name, List<string> paramNames, LispObject body, string? defPkg)
+    internal static (string name, List<string> paramNames, LispObject body, string? defPkg, bool selfArg0)
         ParseDefmethodForm(Cons instr)
     {
-        // Parse: (:defmethod[-direct] "NAME" [:pkg "PKG"] :params ("P1" ...) :body (...))
+        // Parse: (:defmethod[-direct] "NAME" [:pkg "PKG"] [:self T] :params ("P1" ...) :body (...))
         var plist = instr.Cdr;
         var name = CilAssembler.GetString(CilAssembler.Car(plist));
         plist = CilAssembler.Cdr(plist);
@@ -350,6 +356,7 @@ public class FaslAssembler
         var paramNames = new List<string>();
         LispObject? bodyInstrs = null;
         string? defPkg = null;
+        bool selfArg0 = false;
 
         while (plist is Cons pc)
         {
@@ -371,12 +378,15 @@ public class FaslAssembler
                 case "PKG":
                     defPkg = CilAssembler.GetString(val);
                     break;
+                case "SELF":
+                    selfArg0 = val is not Nil;  // D1144: self threaded as arg0
+                    break;
             }
             plist = CilAssembler.Cddr(pc);
         }
 
         if (bodyInstrs == null) throw new Exception("FASL DEFMETHOD: missing :body");
-        return (name, paramNames, bodyInstrs, defPkg);
+        return (name, paramNames, bodyInstrs, defPkg, selfArg0);
     }
 
     // --- Core static emitters, callable from both FaslAssembler and CilAssembler FASL mode ---
@@ -388,14 +398,26 @@ public class FaslAssembler
     /// </summary>
     internal static void EmitDefmethodDirectInto(
         TypeBuilder tb, ILGenerator initIl, CilAssembler.FaslStructInternMap structMap,
-        string name, int paramCount, LispObject bodyInstrs, string? defPkg, int id)
+        string name, int paramCount, LispObject bodyInstrs, string? defPkg, int id,
+        bool selfArg0 = false)
     {
         if (paramCount > 8)
             throw new Exception($"FASL DEFMETHOD-DIRECT: param-count {paramCount} > 8 not supported");
 
         // 1. Body method with direct typed params: static LispObject Name_body(LispObject p0, ...)
-        var directParamTypes = new Type[paramCount];
-        for (int i = 0; i < paramCount; i++) directParamTypes[i] = typeof(LispObject);
+        // When selfArg0 (D1144), arg0 is the self LispFunction (threaded so a non-tail
+        // self-call reaches its receiver from arg0 instead of re-resolving #'NAME each
+        // recursive entry); the direct params then start at ldarg 1.
+        var directParamTypes = new Type[selfArg0 ? paramCount + 1 : paramCount];
+        if (selfArg0)
+        {
+            directParamTypes[0] = typeof(LispFunction);
+            for (int i = 0; i < paramCount; i++) directParamTypes[i + 1] = typeof(LispObject);
+        }
+        else
+        {
+            for (int i = 0; i < paramCount; i++) directParamTypes[i] = typeof(LispObject);
+        }
 
         string bodyMethodName = SanitizeName(name) + "_body_" + id;
         var bodyMethod = tb.DefineMethod(bodyMethodName,
@@ -421,6 +443,27 @@ public class FaslAssembler
         wil.Emit(OpCodes.Ldc_I4, paramCount);
         wil.Emit(OpCodes.Call, CheckArityExactMI);
 
+        // selfArg0: resolve self via the symbol once for this slow apply/array path
+        // (the hot _funcN delegate is bound to fn; the array wrapper builds fn so can't
+        // capture it). Mirrors EmitDefmethodNativeInto's wrapper.
+        if (selfArg0)
+        {
+            bool isSetf = name.StartsWith("(SETF ") && name.EndsWith(")");
+            if (isSetf)
+            {
+                wil.Emit(OpCodes.Ldstr, name.Substring(6, name.Length - 7));
+                wil.Emit(OpCodes.Ldstr, defPkg ?? "CL-USER");
+                wil.Emit(OpCodes.Call, SymInPkgMI);
+                wil.Emit(OpCodes.Call, GetSetfFunctionBySymbolMI);
+            }
+            else
+            {
+                wil.Emit(OpCodes.Ldstr, name);
+                wil.Emit(OpCodes.Ldstr, defPkg ?? "CL-USER");
+                wil.Emit(OpCodes.Call, SymInPkgMI);
+                wil.Emit(OpCodes.Call, GetFunctionBySymbolMI);
+            }
+        }
         for (int i = 0; i < paramCount; i++)
         {
             wil.Emit(OpCodes.Ldarg_0);
@@ -430,8 +473,10 @@ public class FaslAssembler
         wil.Emit(OpCodes.Call, bodyMethod);
         wil.Emit(OpCodes.Ret);
 
-        // 3. Registration IL (includes _funcN for direct-call fast path).
-        EmitRegistrationInto(initIl, name, wrapperMethod, paramCount, defPkg, bodyMethod);
+        // 3. Registration IL (includes _funcN for direct-call fast path). selfArg0 binds
+        // the direct delegate's target to fn (open-instance, self bound).
+        EmitRegistrationInto(initIl, name, wrapperMethod, paramCount, defPkg, bodyMethod,
+            selfBound: selfArg0);
     }
 
     /// <summary>
@@ -472,10 +517,17 @@ public class FaslAssembler
         if (paramCount < 1 || paramCount > 4)
             throw new Exception($"FASL DEFMETHOD-NATIVE: param-count {paramCount} not supported (1-4)");
 
-        // 1. Native body: static LispObject Name_native_N(long p0, ...)
+        // arg0 of every method below is the self LispFunction, threaded so a native
+        // self-call reaches its receiver from arg0 instead of re-resolving #'NAME from
+        // its symbol each recursive entry (D1143). The direct/array wrappers are bound
+        // as delegates with `fn` as target (EmitRegistrationInto), so they receive self
+        // implicitly; the native delegate is unbound and gets self from InvokeNativeN.
+
+        // 1. Native body: static LispObject Name_native_N(LispFunction self, long p0, ...)
         // Long params avoid arg boxing; body returns LispObject (arithmetic boxes via Fixnum.Make).
-        var nativeParamTypes = new Type[paramCount];
-        for (int i = 0; i < paramCount; i++) nativeParamTypes[i] = typeof(long);
+        var nativeParamTypes = new Type[paramCount + 1];
+        nativeParamTypes[0] = typeof(LispFunction);
+        for (int i = 0; i < paramCount; i++) nativeParamTypes[i + 1] = typeof(long);
 
         string nativeMethodName = SanitizeName(name) + "_native_" + id;
         var nativeMethod = tb.DefineMethod(nativeMethodName,
@@ -489,9 +541,10 @@ public class FaslAssembler
         nativeAsm._faslStructMap = structMap;
         nativeAsm.Assemble(bodyInstrs);
 
-        // 2. Direct LispObject wrapper: static LispObject Name_direct_N(LispObject p0, ...)
-        var directParamTypes = new Type[paramCount];
-        for (int i = 0; i < paramCount; i++) directParamTypes[i] = typeof(LispObject);
+        // 2. Direct LispObject wrapper: static LispObject Name_direct_N(LispFunction self, LispObject p0, ...)
+        var directParamTypes = new Type[paramCount + 1];
+        directParamTypes[0] = typeof(LispFunction);
+        for (int i = 0; i < paramCount; i++) directParamTypes[i + 1] = typeof(LispObject);
 
         string directMethodName = SanitizeName(name) + "_direct_" + id;
         var directMethod = tb.DefineMethod(directMethodName,
@@ -499,9 +552,10 @@ public class FaslAssembler
             typeof(LispObject), directParamTypes);
         var dil = directMethod.GetILGenerator();
 
+        dil.Emit(OpCodes.Ldarg_0);                   // self
         for (int i = 0; i < paramCount; i++)
         {
-            dil.Emit(OpCodes.Ldarg, i);
+            dil.Emit(OpCodes.Ldarg, i + 1);
             dil.Emit(OpCodes.Castclass, typeof(Fixnum));
             dil.Emit(OpCodes.Call, FixnumValueGetterMI);
         }
@@ -510,6 +564,11 @@ public class FaslAssembler
         dil.Emit(OpCodes.Ret);
 
         // 3. Array wrapper: static LispObject Name_wrap_N(LispObject[] args)
+        // This is the slow fallback (apply / arity-mismatched calls); the hot paths are
+        // _funcN (self bound to fn) and _nativeFuncN (self passed by InvokeNativeN). Since
+        // the LispFunction is built FROM this delegate, it can't capture fn — so resolve
+        // self here via the symbol once per array call (cheap relative to the array path).
+        bool isSetf = name.StartsWith("(SETF ") && name.EndsWith(")");
         string wrapperName = SanitizeName(name) + "_" + id;
         var wrapperMethod = tb.DefineMethod(wrapperName,
             MethodAttributes.Public | MethodAttributes.Static,
@@ -517,10 +576,25 @@ public class FaslAssembler
         var wil = wrapperMethod.GetILGenerator();
 
         wil.Emit(OpCodes.Ldstr, name);
-        wil.Emit(OpCodes.Ldarg_0);
+        wil.Emit(OpCodes.Ldarg_0);                   // args array
         wil.Emit(OpCodes.Ldc_I4, paramCount);
         wil.Emit(OpCodes.Call, CheckArityExactMI);
 
+        // self = (Get[Setf]FunctionBySymbol)(SymInPkg(selfName, pkg))
+        if (isSetf)
+        {
+            wil.Emit(OpCodes.Ldstr, name.Substring(6, name.Length - 7));
+            wil.Emit(OpCodes.Ldstr, defPkg ?? "CL-USER");
+            wil.Emit(OpCodes.Call, SymInPkgMI);
+            wil.Emit(OpCodes.Call, GetSetfFunctionBySymbolMI);
+        }
+        else
+        {
+            wil.Emit(OpCodes.Ldstr, name);
+            wil.Emit(OpCodes.Ldstr, defPkg ?? "CL-USER");
+            wil.Emit(OpCodes.Call, SymInPkgMI);
+            wil.Emit(OpCodes.Call, GetFunctionBySymbolMI);
+        }
         for (int i = 0; i < paramCount; i++)
         {
             wil.Emit(OpCodes.Ldarg_0);
@@ -530,9 +604,12 @@ public class FaslAssembler
         wil.Emit(OpCodes.Call, directMethod);
         wil.Emit(OpCodes.Ret);
 
-        // 4. Registration: _funcN = directMethod, _nativeFuncN = nativeMethod
+        // 4. Registration: _funcN = directMethod (self bound to fn), _nativeFuncN =
+        // nativeMethod (self passed by InvokeNativeN). selfBound shifts the direct
+        // delegate's target from null to fn.
         EmitRegistrationInto(initIl, name, wrapperMethod, paramCount, defPkg,
-            directBodyMethod: directMethod, nativeBodyMethod: nativeMethod);
+            directBodyMethod: directMethod, nativeBodyMethod: nativeMethod,
+            selfBound: true);
     }
 
     /// <summary>
@@ -547,7 +624,8 @@ public class FaslAssembler
     /// </summary>
     private static void EmitRegistrationInto(
         ILGenerator il, string name, MethodBuilder wrapperMethod, int paramCount,
-        string? defPkg, MethodBuilder? directBodyMethod, MethodBuilder? nativeBodyMethod = null)
+        string? defPkg, MethodBuilder? directBodyMethod, MethodBuilder? nativeBodyMethod = null,
+        bool selfBound = false)
     {
         var fnLocal = il.DeclareLocal(typeof(LispFunction));
 
@@ -563,10 +641,13 @@ public class FaslAssembler
         il.Emit(OpCodes.Stloc, fnLocal);
 
         // Install _funcN for direct-call fast path when we have a typed body method.
+        // For native (selfBound) functions, directBodyMethod takes a leading LispFunction
+        // self param; bind it to fn so the open delegate signature still matches Func<...>
+        // (D1143). Non-native direct methods have no self param and bind to null.
         if (directBodyMethod != null && paramCount >= 0 && paramCount <= 8)
         {
             il.Emit(OpCodes.Ldloc, fnLocal);
-            il.Emit(OpCodes.Ldnull);
+            if (selfBound) il.Emit(OpCodes.Ldloc, fnLocal); else il.Emit(OpCodes.Ldnull);
             il.Emit(OpCodes.Ldftn, directBodyMethod);
             il.Emit(OpCodes.Newobj, TypedFuncCtors[paramCount]);
             il.Emit(OpCodes.Callvirt, SetDirectDelegateMI);

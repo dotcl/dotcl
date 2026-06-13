@@ -41,16 +41,30 @@ public static class DynamicClassBuilder
 {
     private static int _assemblyCounter;
 
-    // Global dispatch table: Lisp lambda bodies keyed by (typeFullName, methodName).
-    // Populated at DefineClass time and consulted by DispatchLispMethod on every
-    // invocation of a Lisp-backed method. Keeping the lambda alive keeps its
-    // lexical closure alive.
+    // Global dispatch table: Lisp lambda bodies keyed by (typeFullName, dispatchKey).
+    // dispatchKey = methodName for no-param methods; methodName + "#" + "|"-joined
+    // FullNames for parameterized methods. Populated at DefineClass time and
+    // consulted by DispatchLispMethod on every invocation. Keeping the lambda
+    // alive keeps its lexical closure alive.
     private static readonly Dictionary<(string, string), LispObject> _methodHandlers
         = new();
 
     public record MethodSpec(string Name, Type ReturnType, IReadOnlyList<Type> ParamTypes,
                              LispObject LispBody, bool IsOverride = false,
                              IReadOnlyList<CustomAttributeBuilder>? Attributes = null);
+
+    // D1106 — multi-ctor support: one spec per constructor overload.
+    public record CtorSpec(
+        LispObject? Body,
+        IReadOnlyList<Type>? ParamTypes,
+        IReadOnlyList<int>? BaseArgIndices);
+
+    // Build the runtime dispatch key for a method / ctor.
+    // No-param methods use just the name so existing single-overload code is unaffected.
+    internal static string MethodDispatchKey(string methodName, IReadOnlyList<Type> paramTypes)
+        => paramTypes.Count == 0
+           ? methodName
+           : methodName + "#" + string.Join("|", paramTypes.Select(t => t.FullName!));
 
     /// <summary>
     /// Define a public class. See roadmap in the type doc-comment for what
@@ -70,7 +84,8 @@ public static class DynamicClassBuilder
         IReadOnlyList<Type>? interfaces = null,
         IReadOnlyList<(string Name, Type DelegateType)>? events = null,
         IReadOnlyList<Type>? ctorParamTypes = null,
-        IReadOnlyList<int>? baseCtorArgIndices = null)
+        IReadOnlyList<int>? baseCtorArgIndices = null,
+        IReadOnlyList<CtorSpec>? ctorSpecs = null)
     {
         if (string.IsNullOrEmpty(fullName))
             throw new ArgumentException("fullName must be non-empty", nameof(fullName));
@@ -84,27 +99,31 @@ public static class DynamicClassBuilder
             throw new ArgumentException(
                 $"Base type must be a class, not interface: {baseType.FullName}", nameof(baseType));
 
-        ConstructorInfo? baseCtor;
-        if (baseCtorArgIndices != null && baseCtorArgIndices.Count > 0 && ctorParamTypes != null)
+        // Single-ctor path resolves baseCtor eagerly; multi-ctor path resolves per spec.
+        ConstructorInfo? baseCtor = null;
+        if (ctorSpecs == null)
         {
-            var baseCtorTypes = baseCtorArgIndices.Select(i => ctorParamTypes[i]).ToArray();
-            baseCtor = baseType.GetConstructor(
-                BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance,
-                binder: null, types: baseCtorTypes, modifiers: null);
-            if (baseCtor == null)
-                throw new ArgumentException(
-                    $"Base type {baseType.FullName} has no accessible constructor matching types ({string.Join(", ", baseCtorTypes.Select(t => t.Name))})",
-                    nameof(baseType));
-        }
-        else
-        {
-            baseCtor = baseType.GetConstructor(
-                BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance,
-                binder: null, types: Type.EmptyTypes, modifiers: null);
-            if (baseCtor == null)
-                throw new ArgumentException(
-                    $"Base type {baseType.FullName} has no accessible parameterless constructor",
-                    nameof(baseType));
+            if (baseCtorArgIndices != null && baseCtorArgIndices.Count > 0 && ctorParamTypes != null)
+            {
+                var baseCtorTypes = baseCtorArgIndices.Select(i => ctorParamTypes[i]).ToArray();
+                baseCtor = baseType.GetConstructor(
+                    BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance,
+                    binder: null, types: baseCtorTypes, modifiers: null);
+                if (baseCtor == null)
+                    throw new ArgumentException(
+                        $"Base type {baseType.FullName} has no accessible constructor matching types ({string.Join(", ", baseCtorTypes.Select(t => t.Name))})",
+                        nameof(baseType));
+            }
+            else
+            {
+                baseCtor = baseType.GetConstructor(
+                    BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance,
+                    binder: null, types: Type.EmptyTypes, modifiers: null);
+                if (baseCtor == null)
+                    throw new ArgumentException(
+                        $"Base type {baseType.FullName} has no accessible parameterless constructor",
+                        nameof(baseType));
+            }
         }
 
         int id = System.Threading.Interlocked.Increment(ref _assemblyCounter);
@@ -212,50 +231,124 @@ public static class DynamicClassBuilder
             }
         }
 
-        // public .ctor([params]) : base([base-args]) { <optional Lisp body> }
-        var ctorTypes = (ctorParamTypes != null && ctorParamTypes.Count > 0)
-            ? ctorParamTypes.ToArray() : Type.EmptyTypes;
-        var ctor = tb.DefineConstructor(
-            MethodAttributes.Public | MethodAttributes.SpecialName | MethodAttributes.RTSpecialName,
-            CallingConventions.Standard, ctorTypes);
-        var cil = ctor.GetILGenerator();
-        cil.Emit(OpCodes.Ldarg_0);
-        if (baseCtorArgIndices != null && baseCtorArgIndices.Count > 0)
+        // Constructor(s). Two paths:
+        //   ctorSpecs != null → multi-ctor: one tb.DefineConstructor per spec (D1106).
+        //   ctorSpecs == null → single-ctor: backward-compat path using ctorBody /
+        //                       ctorParamTypes / baseCtorArgIndices.
+        if (ctorSpecs != null && ctorSpecs.Count > 0)
         {
-            foreach (var idx in baseCtorArgIndices)
-                cil.Emit(OpCodes.Ldarg, idx + 1); // +1: arg 0 is 'this'
-        }
-        cil.Emit(OpCodes.Call, baseCtor);
-
-        if (ctorBody != null)
-        {
-            // After base.ctor has run, dispatch to Lisp body with (self arg1 arg2 ...).
-            cil.Emit(OpCodes.Ldstr, fullName);
-            cil.Emit(OpCodes.Ldstr, CtorKey);
-            cil.Emit(OpCodes.Ldtoken, typeof(void));
-            cil.Emit(OpCodes.Call, GetTypeFromHandleMI);
-            cil.Emit(OpCodes.Ldarg_0); // self
-            // Build object[] with ctor params (empty for zero-arg ctor)
-            cil.Emit(OpCodes.Ldc_I4, ctorTypes.Length);
-            cil.Emit(OpCodes.Newarr, typeof(object));
-            for (int i = 0; i < ctorTypes.Length; i++)
+            var pendingCtorHandlers = new List<(string Key, LispObject Body)>();
+            foreach (var spec in ctorSpecs)
             {
-                cil.Emit(OpCodes.Dup);
-                cil.Emit(OpCodes.Ldc_I4, i);
-                cil.Emit(OpCodes.Ldarg, i + 1); // arg 0 = this
-                if (ctorTypes[i].IsValueType)
-                    cil.Emit(OpCodes.Box, ctorTypes[i]);
-                cil.Emit(OpCodes.Stelem_Ref);
-            }
-            cil.Emit(OpCodes.Call, DispatchMI);
-            cil.Emit(OpCodes.Pop); // void discard
-        }
+                var specCtorTypes = spec.ParamTypes?.ToArray() ?? Type.EmptyTypes;
 
-        cil.Emit(OpCodes.Ret);
+                ConstructorInfo specBaseCtor;
+                if (spec.BaseArgIndices != null && spec.BaseArgIndices.Count > 0)
+                {
+                    var baseCtorTypes = spec.BaseArgIndices.Select(i => specCtorTypes[i]).ToArray();
+                    specBaseCtor = baseType.GetConstructor(
+                        BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance,
+                        binder: null, types: baseCtorTypes, modifiers: null)
+                        ?? throw new ArgumentException(
+                            $"Base type {baseType.FullName} has no accessible constructor matching types ({string.Join(", ", baseCtorTypes.Select(t => t.Name))})",
+                            nameof(ctorSpecs));
+                }
+                else
+                {
+                    specBaseCtor = baseType.GetConstructor(
+                        BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance,
+                        binder: null, types: Type.EmptyTypes, modifiers: null)
+                        ?? throw new ArgumentException(
+                            $"Base type {baseType.FullName} has no accessible parameterless constructor",
+                            nameof(ctorSpecs));
+                }
+
+                var ctorDef = tb.DefineConstructor(
+                    MethodAttributes.Public | MethodAttributes.SpecialName | MethodAttributes.RTSpecialName,
+                    CallingConventions.Standard, specCtorTypes);
+                var ctorIl = ctorDef.GetILGenerator();
+                ctorIl.Emit(OpCodes.Ldarg_0);
+                if (spec.BaseArgIndices != null && spec.BaseArgIndices.Count > 0)
+                    foreach (var idx in spec.BaseArgIndices)
+                        ctorIl.Emit(OpCodes.Ldarg, idx + 1);
+                ctorIl.Emit(OpCodes.Call, specBaseCtor);
+
+                if (spec.Body != null)
+                {
+                    var ctorKey = MethodDispatchKey(CtorKey, spec.ParamTypes ?? Array.Empty<Type>());
+                    ctorIl.Emit(OpCodes.Ldstr, fullName);
+                    ctorIl.Emit(OpCodes.Ldstr, ctorKey);
+                    ctorIl.Emit(OpCodes.Ldtoken, typeof(void));
+                    ctorIl.Emit(OpCodes.Call, GetTypeFromHandleMI);
+                    ctorIl.Emit(OpCodes.Ldarg_0);
+                    ctorIl.Emit(OpCodes.Ldc_I4, specCtorTypes.Length);
+                    ctorIl.Emit(OpCodes.Newarr, typeof(object));
+                    for (int i = 0; i < specCtorTypes.Length; i++)
+                    {
+                        ctorIl.Emit(OpCodes.Dup);
+                        ctorIl.Emit(OpCodes.Ldc_I4, i);
+                        ctorIl.Emit(OpCodes.Ldarg, i + 1);
+                        if (specCtorTypes[i].IsValueType)
+                            ctorIl.Emit(OpCodes.Box, specCtorTypes[i]);
+                        ctorIl.Emit(OpCodes.Stelem_Ref);
+                    }
+                    ctorIl.Emit(OpCodes.Call, DispatchMI);
+                    ctorIl.Emit(OpCodes.Pop);
+                    pendingCtorHandlers.Add((ctorKey, spec.Body));
+                }
+                ctorIl.Emit(OpCodes.Ret);
+            }
+            foreach (var (key, body) in pendingCtorHandlers)
+                _methodHandlers[(fullName, key)] = body;
+        }
+        else
+        {
+            // Single-ctor path (backward compat).
+            var ctorTypes = (ctorParamTypes != null && ctorParamTypes.Count > 0)
+                ? ctorParamTypes.ToArray() : Type.EmptyTypes;
+            var ctor = tb.DefineConstructor(
+                MethodAttributes.Public | MethodAttributes.SpecialName | MethodAttributes.RTSpecialName,
+                CallingConventions.Standard, ctorTypes);
+            var cil = ctor.GetILGenerator();
+            cil.Emit(OpCodes.Ldarg_0);
+            if (baseCtorArgIndices != null && baseCtorArgIndices.Count > 0)
+            {
+                foreach (var idx in baseCtorArgIndices)
+                    cil.Emit(OpCodes.Ldarg, idx + 1); // +1: arg 0 is 'this'
+            }
+            cil.Emit(OpCodes.Call, baseCtor!);
+
+            if (ctorBody != null)
+            {
+                cil.Emit(OpCodes.Ldstr, fullName);
+                cil.Emit(OpCodes.Ldstr, CtorKey);
+                cil.Emit(OpCodes.Ldtoken, typeof(void));
+                cil.Emit(OpCodes.Call, GetTypeFromHandleMI);
+                cil.Emit(OpCodes.Ldarg_0);
+                cil.Emit(OpCodes.Ldc_I4, ctorTypes.Length);
+                cil.Emit(OpCodes.Newarr, typeof(object));
+                for (int i = 0; i < ctorTypes.Length; i++)
+                {
+                    cil.Emit(OpCodes.Dup);
+                    cil.Emit(OpCodes.Ldc_I4, i);
+                    cil.Emit(OpCodes.Ldarg, i + 1); // arg 0 = this
+                    if (ctorTypes[i].IsValueType)
+                        cil.Emit(OpCodes.Box, ctorTypes[i]);
+                    cil.Emit(OpCodes.Stelem_Ref);
+                }
+                cil.Emit(OpCodes.Call, DispatchMI);
+                cil.Emit(OpCodes.Pop);
+            }
+            cil.Emit(OpCodes.Ret);
+
+            if (ctorBody != null)
+                _methodHandlers[(fullName, CtorKey)] = ctorBody;
+        }
 
         // User-defined instance methods (D776). Each body dispatches to the
         // corresponding Lisp lambda through DispatchLispMethod.
-        var pendingMethods = new List<(string MethodName, LispObject Lambda)>();
+        // dispatch key = method name for no-param; name#Type1|Type2 for parameterized (D1106).
+        var pendingMethods = new List<(string DispatchKey, LispObject Lambda)>();
         if (methods != null)
         {
             var seenMethods = new HashSet<string>(StringComparer.Ordinal);
@@ -263,31 +356,26 @@ public static class DynamicClassBuilder
             {
                 if (string.IsNullOrEmpty(m.Name))
                     throw new ArgumentException("method name must be non-empty", nameof(methods));
-                if (!seenMethods.Add(m.Name))
+                var dispatchKey = MethodDispatchKey(m.Name, m.ParamTypes);
+                if (!seenMethods.Add(dispatchKey))
                     throw new ArgumentException(
-                        $"duplicate method name: {m.Name}", nameof(methods));
+                        $"duplicate method overload: {dispatchKey}", nameof(methods));
                 if (reservedMethodNames.Contains(m.Name))
                     throw new ArgumentException(
                         $"method name {m.Name} collides with an auto-generated event accessor",
                         nameof(methods));
-                EmitLispDispatchMethod(tb, fullName, baseType, interfaces, m);
-                pendingMethods.Add((m.Name, m.LispBody));
+                EmitLispDispatchMethod(tb, fullName, baseType, interfaces, m, dispatchKey);
+                pendingMethods.Add((dispatchKey, m.LispBody));
             }
         }
-
-        // Register ctor body BEFORE CreateType so it is available when the
-        // first Activator.CreateInstance fires (CreateInstance may JIT-compile
-        // the ctor which doesn't itself call it, but defensive ordering).
-        if (ctorBody != null)
-            _methodHandlers[(fullName, CtorKey)] = ctorBody;
 
         var createdType = tb.CreateType()!;
 
         // Register method handlers AFTER CreateType so first call to the method
         // (e.g. from a test's DOTNET:INVOKE) finds its Lisp body. A re-define of
         // the same full name overwrites (matches Step 1 "fresh assembly per call").
-        foreach (var (methodName, lambda) in pendingMethods)
-            _methodHandlers[(fullName, methodName)] = lambda;
+        foreach (var (dispatchKey, lambda) in pendingMethods)
+            _methodHandlers[(fullName, dispatchKey)] = lambda;
 
         return createdType;
     }
@@ -363,7 +451,7 @@ public static class DynamicClassBuilder
     /// DefineMethodOverride for each matched interface method.
     /// </summary>
     private static void EmitLispDispatchMethod(TypeBuilder tb, string fullName,
-        Type baseType, IReadOnlyList<Type>? interfaces, MethodSpec m)
+        Type baseType, IReadOnlyList<Type>? interfaces, MethodSpec m, string dispatchKey)
     {
         var paramArr = m.ParamTypes.ToArray();
 
@@ -395,9 +483,9 @@ public static class DynamicClassBuilder
 
         var il = method.GetILGenerator();
 
-        // DispatchLispMethod(typeName, methodName, returnType, self, object[] args)
+        // DispatchLispMethod(typeName, dispatchKey, returnType, self, object[] args)
         il.Emit(OpCodes.Ldstr, fullName);
-        il.Emit(OpCodes.Ldstr, m.Name);
+        il.Emit(OpCodes.Ldstr, dispatchKey);
 
         // ldtoken + GetTypeFromHandle → Type
         il.Emit(OpCodes.Ldtoken, m.ReturnType);

@@ -322,3 +322,55 @@
   ;; Expected = sum of [0..199] + sum of [10000..10199]
   ;;         = 19900      + 2019900 = 2039800
   2039800)
+
+;;; D1124 (dotcl/dotcl#26) — dotcl:thread-object exposes the underlying .NET Thread.
+(deftest d1124-thread-object-managed-id
+  (let ((th (dotcl:make-thread (lambda () 42) :name "d1124")))
+    (prog1 (integerp (dotnet:invoke (dotcl:thread-object th) "get_ManagedThreadId"))
+      (dotcl:thread-join th)))
+  t)
+
+(deftest d1124-thread-object-name
+  (let ((th (dotcl:make-thread (lambda () 42) :name "d1124-named")))
+    (prog1 (dotnet:invoke (dotcl:thread-object th) "get_Name")
+      (dotcl:thread-join th)))
+  "d1124-named")
+
+(deftest d1124-thread-object-requires-thread
+  (handler-case (progn (dotcl:thread-object 42) nil)
+    (error () t))
+  t)
+
+;;; D1145 (#278) — concurrent GF dispatch must not tear the method set.
+;;; GenericFunction.Methods was a plain List<T>; a dispatch enumerating it while
+;;; another thread ADD/REMOVE-METHOD mutated it threw "Collection was modified"
+;;; (surfacing in McCLIM as spurious CALL-NEXT-METHOD: no next method). Now the
+;;; method list is copy-on-write (immutable snapshot read, atomic publish on write).
+;;; A (t) base method is always applicable, so a correct dispatch NEVER errors here.
+(defgeneric %d1145-foo (x))
+(defmethod %d1145-foo ((x t)) :base)
+(defmethod %d1145-foo ((x integer)) :int)
+(defparameter *%d1145-int-method*
+  (find-method #'%d1145-foo '() (list (find-class 'integer))))
+(defparameter *%d1145-err* nil)
+
+(deftest d1145-concurrent-gf-dispatch-vs-method-mutation
+  (progn
+    (setf *%d1145-err* nil)
+    (flet ((worker ()
+             (dotimes (i 100000)
+               (handler-case
+                   (let ((r (%d1145-foo 5)))
+                     (unless (or (eq r :base) (eq r :int))
+                       (setf *%d1145-err* (list :bad-result r))))
+                 (error (e) (setf *%d1145-err* (princ-to-string e))))))
+           (churner ()
+             (dotimes (i 40000)
+               (remove-method #'%d1145-foo *%d1145-int-method*)
+               (add-method #'%d1145-foo *%d1145-int-method*))))
+      (let ((ths (list (dotcl:make-thread #'worker :name "d1145-w1")
+                       (dotcl:make-thread #'worker :name "d1145-w2")
+                       (dotcl:make-thread #'churner :name "d1145-churn"))))
+        (dolist (th ths) (dotcl:thread-join th))))
+    *%d1145-err*)
+  nil)

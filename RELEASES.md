@@ -3,6 +3,80 @@
 User-facing release notes for dotcl. Each section corresponds to a tagged
 release on the public mirror (dotcl/dotcl).
 
+## v0.1.9 — 2026-06-13
+
+### Performance: native int64 fixnum arithmetic
+
+Fixnum-declared numeric code now compiles to native `int64` operations instead
+of boxing every intermediate value. This covers `(the fixnum ...)` expressions,
+`(signed-byte N)` / `(unsigned-byte N)` / `bit` declared locals, and locals whose
+value range is inferred from their initializer. A new SIL peephole pass removes
+redundant load/store and dead stack traffic. `+` / `-` / `*` / `ash` still promote
+to bignum on int64 overflow (a value-range proof gates the unboxed path), so the
+optimization is transparent to correctness.
+
+Self-recursive calls no longer re-resolve the function from its symbol on every
+entry (the function is threaded through as a hidden argument). Combined with the
+above, tight recursive/numeric benchmarks improve substantially (e.g. `tak` and
+`trtak` are several times faster; `ackermann` ~25% faster). `double-float` and
+`single-float` literals and unary negation now use native r8/r4 arithmetic.
+
+### Thread-safe generic-function dispatch
+
+Calling a generic function from multiple threads while another thread defines
+methods on it no longer corrupts dispatch. Previously a concurrent `defmethod`
+during dispatch could surface as a spurious `CALL-NEXT-METHOD: no next method`
+error or a hang/crash (notably when driving a GUI from a separate thread). The
+method list is now copy-on-write.
+
+### CLOS / MOP
+
+- Method dispatch honors `:argument-precedence-order` from `defgeneric`.
+- Standard generic functions preserve their lambda list, and the MOP readers
+  (`generic-function-lambda-list`, etc.) return the real names.
+- `slot-definition` metaobjects are dispatchable; `slot-definition-class`,
+  `standard-instance-access`, integer `slot-definition-location`, and
+  `slot-boundp`/`slot-makunbound-using-class` are wired up — enough MOP for
+  custom-metaclass dynamic slots.
+- `defmethod` specializers work on `dotnet:define-class` instances and on raw
+  CLR types (dispatch on a .NET object's class).
+
+### .NET interop
+
+- `dotnet:resolve-type` is now public — turn a type-name string into a
+  `System.Type` (#17).
+- `dotnet:invoke-generic` — call generic instance methods (#23).
+- `dotnet:invoke` / `dotnet:static` may omit trailing parameters that have C#
+  default values (#24).
+- `dotnet:define-class` supports method/constructor overloading.
+- `type-of` / `class-of` on a wrapped CLR object now report the CLR type instead
+  of `T`, and `typep` against it works (#31).
+- Lisp strings backed by a character vector now marshal to a .NET `String` when
+  passed to `dotnet:` calls (previously they could reach .NET as the raw vector).
+- `dotcl:thread-object` returns the underlying `System.Thread` of a dotcl thread
+  (#26).
+- Built-in `dotnet:` functions carry docstrings, surfaced through `documentation`
+  (and `(setf documentation)` is now a callable function) (#25).
+
+### Debugging
+
+- `dotcl:backtrace` and `dotcl:print-backtrace` — Lisp-callable backtraces; the
+  printed form now includes call arguments.
+- `dotcl:jit-disassemble` (contrib) — view the JIT-generated native code of a
+  compiled function.
+- REPL: readline is interruptible, and UP/DOWN history direction is fixed.
+
+### Fixes
+
+- A leading `~` in a file name string passed to `load` / `open` / `probe-file`
+  now expands to the user's home directory, not just `(pathname "~/...")` (#19).
+- `make install` on Linux/macOS no longer fails to locate `crossgen2` (a host-RID
+  detection bug added stray whitespace to the lookup path) (#21).
+- `+` / `-` / `*` fast paths and `ash` with a constant shift promote to bignum
+  correctly on int64 overflow instead of wrapping.
+- `(setf accessor)` calls resolve by symbol identity, fixing cross-package
+  mis-dispatch of same-named accessors.
+
 ## v0.1.8 — 2026-05-22
 
 ### ANSI test suite: 21928/21929 pass (99.995%)

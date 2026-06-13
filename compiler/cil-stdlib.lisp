@@ -1081,9 +1081,11 @@ Also expands element types within compound type specifiers like (VECTOR etype si
 (defmethod documentation ((x function) (doc-type (eql 'function)))
   (documentation x t))
 
-;; (documentation <symbol> 'function) — via symbol-function
+;; (documentation <symbol> 'function) — user-set docs first, then built-in docs
+;; registered via [LispDoc]/SetFunctionDoc (mirrors the variable path) (#25).
 (defmethod documentation ((x symbol) (doc-type (eql 'function)))
-  (%get-doc x 'function))
+  (or (%get-doc x 'function)
+      (%get-function-documentation x)))
 
 ;; (documentation <symbol> 'variable)
 (defmethod documentation ((x symbol) (doc-type (eql 'variable)))
@@ -1206,6 +1208,11 @@ Also expands element types within compound type specifiers like (VECTOR etype si
 ;; (documentation <symbol> 't) — check function, then variable
 (defmethod documentation ((x symbol) (doc-type (eql t)))
   (%get-doc x t))
+
+;; Install docstrings for the DOTNET: built-in functions (#25). The C# registration
+;; collects (symbol . docstring) pairs; apply them now that DOCUMENTATION is defined.
+(dolist (%dn-doc (%dotnet-doc-alist))
+  (setf (documentation (car %dn-doc) 'function) (cdr %dn-doc)))
 
 ;;; --- ensure-generic-function ---
 (defun ensure-generic-function (name &rest args)

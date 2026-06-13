@@ -842,6 +842,8 @@ public static partial class Runtime
         });
         // %GET-VARIABLE-DOCUMENTATION
         Startup.RegisterUnary("%GET-VARIABLE-DOCUMENTATION", Runtime.GetVariableDocumentation);
+        // %GET-FUNCTION-DOCUMENTATION — bridge [LispDoc]/SetFunctionDoc to the DOCUMENTATION GF
+        Startup.RegisterUnary("%GET-FUNCTION-DOCUMENTATION", Runtime.GetFunctionDocumentation);
 
         // SPECIAL-OPERATOR-P (re-register as variadic for funcall compatibility)
         Startup.RegisterUnary("SPECIAL-OPERATOR-P", Runtime.SpecialOperatorP);

@@ -12,10 +12,12 @@
 (load "test/regression/recent-fixes.lisp")
 (load "test/regression/threading.lisp")
 (load "test/regression/mop.lisp")
+(load "test/regression/dynamic-slots.lisp")
 (load "test/regression/net-class.lisp")
 (load "test/regression/delegate-marshal.lisp")
 (load "test/regression/call-out.lisp")
 (load "test/regression/static-generic.lisp")
+(load "test/regression/native-int-arith.lisp")
 
 (do-tests-summary)
 (if (= *fail-count* 0)

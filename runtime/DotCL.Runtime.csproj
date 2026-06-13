@@ -42,6 +42,15 @@
     <Compile Remove="Program.cs" />
   </ItemGroup>
 
+  <!-- contrib/ sources are separate assemblies (e.g. dotcl-jitdisasm needs Iced +
+       /unsafe) shipped as package CONTENT, not compiled into the runtime. The
+       release/pack flow copies contrib/ under runtime/, where the SDK default glob
+       would otherwise sweep their .cs into this project and fail the pack
+       (CS0246 'Iced' / CS0227 unsafe). Exclude them from Compile. -->
+  <ItemGroup>
+    <Compile Remove="contrib/**/*.cs" />
+  </ItemGroup>
+
   <!-- Ensure generated file is always in @(Compile) even if it doesn't exist yet at
        item-evaluation time (the GenerateUnicodeCharNames target creates it before CoreCompile).
        Remove first to avoid duplicate with the SDK default glob when the file already exists. -->

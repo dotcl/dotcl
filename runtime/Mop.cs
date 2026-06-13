@@ -146,10 +146,51 @@ public static class Mop
         RegisterMop("SLOT-DEFINITION-WRITERS", 1, args => Nil.Instance);         // not tracked
         RegisterMop("SLOT-DEFINITION-LOCATION", 1, args =>
         {
-            // For instance-allocated slots return the index in the layout.
+            // AMOP: a non-negative integer index into the instance layout for
+            // instance-allocated slots; NIL for :class allocation (#264).
             if (args[0] is not SlotDefinition s) return Nil.Instance;
-            return s.IsClassAllocation ? (LispObject)Nil.Instance : s.Name;  // a Symbol works as opaque locator too
+            return s.Location >= 0 ? (LispObject)Fixnum.Make(s.Location) : Nil.Instance;
         });
+
+        // STANDARD-INSTANCE-ACCESS (instance location): read the slot at the given
+        // integer layout index directly, bypassing slot-value-using-class (#264).
+        RegisterMop("STANDARD-INSTANCE-ACCESS", 2, args =>
+        {
+            if (args[0] is not LispInstance inst)
+                throw new LispErrorException(new LispTypeError(
+                    "STANDARD-INSTANCE-ACCESS: not an instance", args[0]));
+            if (args[1] is not Fixnum loc)
+                throw new LispErrorException(new LispTypeError(
+                    "STANDARD-INSTANCE-ACCESS: location must be an integer", args[1]));
+            int i = (int)loc.Value;
+            if (i < 0 || i >= inst.Slots.Length)
+                throw new LispErrorException(new LispProgramError(
+                    $"STANDARD-INSTANCE-ACCESS: location {i} out of range [0,{inst.Slots.Length})"));
+            // AMOP returns an unbound marker for unbound slots; dotcl has none
+            // exposed, so NIL stands in (callers writing before reading are fine).
+            return inst.Slots[i] ?? Nil.Instance;
+        });
+        // (setf (standard-instance-access instance location) new-value)
+        {
+            var (siaSym, _) = MopPkg.Intern("STANDARD-INSTANCE-ACCESS");
+            siaSym.SetfFunction = new LispFunction(args =>
+            {
+                // setf-function arg order: (new-value instance location)
+                var newValue = args[0];
+                if (args[1] is not LispInstance inst)
+                    throw new LispErrorException(new LispTypeError(
+                        "(SETF STANDARD-INSTANCE-ACCESS): not an instance", args[1]));
+                if (args[2] is not Fixnum loc)
+                    throw new LispErrorException(new LispTypeError(
+                        "(SETF STANDARD-INSTANCE-ACCESS): location must be an integer", args[2]));
+                int i = (int)loc.Value;
+                if (i < 0 || i >= inst.Slots.Length)
+                    throw new LispErrorException(new LispProgramError(
+                        $"(SETF STANDARD-INSTANCE-ACCESS): location {i} out of range [0,{inst.Slots.Length})"));
+                inst.Slots[i] = newValue;
+                return newValue;
+            }, "(SETF DOTCL-MOP:STANDARD-INSTANCE-ACCESS)", 3);
+        }
 
         // -- Generic function / method introspection ----------------------
         RegisterMop("GENERIC-FUNCTION-NAME", 1, args =>
@@ -193,8 +234,19 @@ public static class Mop
                 else break;
                 cur = c.Cdr;
             }
-            for (int i = reqNames.Count - 1; i >= 0; i--)
-                result = new Cons(reqNames[i], result);
+            // Return in argument-precedence-order when declared, else declaration order (#268).
+            int[]? apo = gf.ArgumentPrecedenceOrder;
+            if (apo != null)
+            {
+                for (int k = apo.Length - 1; k >= 0; k--)
+                    if (apo[k] >= 0 && apo[k] < reqNames.Count)
+                        result = new Cons(reqNames[apo[k]], result);
+            }
+            else
+            {
+                for (int i = reqNames.Count - 1; i >= 0; i--)
+                    result = new Cons(reqNames[i], result);
+            }
             return result;
         });
 
@@ -237,6 +289,54 @@ public static class Mop
         RegisterMopGF("FINALIZE-INHERITANCE", 1,
             new LispClass[] { (LispClass)Runtime.FindClass(Startup.Sym("CLASS")) },
             args => Nil.Instance);
+
+        // -- Slot-definition-class protocol (AMOP) ------------------------
+        // These drive custom slot-definition classes (e.g. McCLIM's class-with-dynamic-slots).
+        // Defaults specialize on CLASS so user metaclasses override via more-specific methods.
+        // Only invoked for classes with a custom metaclass (see Runtime.MakeClassCore /
+        // LispClass.ComputeEffectiveSlots), so standard CLOS is untouched (#264).
+        {
+            var classCls = (LispClass)Runtime.FindClass(Startup.Sym("CLASS"));
+            var tCls = (LispClass)Runtime.FindClass(Startup.Sym("T"));
+            var stdDirect = (LispClass)Runtime.FindClass(Startup.Sym("STANDARD-DIRECT-SLOT-DEFINITION"));
+            var stdEffective = (LispClass)Runtime.FindClass(Startup.Sym("STANDARD-EFFECTIVE-SLOT-DEFINITION"));
+
+            // DIRECT-SLOT-DEFINITION-CLASS (class &rest initargs) → STANDARD-DIRECT-SLOT-DEFINITION
+            RegisterMopGF("DIRECT-SLOT-DEFINITION-CLASS", -1,
+                new LispClass[] { classCls }, args => stdDirect);
+            // EFFECTIVE-SLOT-DEFINITION-CLASS (class &rest initargs) → STANDARD-EFFECTIVE-SLOT-DEFINITION
+            RegisterMopGF("EFFECTIVE-SLOT-DEFINITION-CLASS", -1,
+                new LispClass[] { classCls }, args => stdEffective);
+            // COMPUTE-EFFECTIVE-SLOT-DEFINITION (class name direct-slot-definitions)
+            // The default builds the standard merged effective slot, then consults
+            // EFFECTIVE-SLOT-DEFINITION-CLASS; a non-standard result becomes the slotd's
+            // MetaClass and its extra Lisp slots are initialized (their initforms run inside
+            // any dynamic binding a user method established before call-next-method).
+            RegisterMopGF("COMPUTE-EFFECTIVE-SLOT-DEFINITION", 3,
+                new LispClass[] { classCls, tCls, tCls }, args =>
+            {
+                if (args[0] is not LispClass cls)
+                    throw new LispErrorException(new LispTypeError(
+                        "COMPUTE-EFFECTIVE-SLOT-DEFINITION: not a class", args[0]));
+                var name = args[1] as Symbol ?? Startup.Sym(args[1].ToString() ?? "NIL");
+                var defs = new List<SlotDefinition>();
+                for (var c = args[2]; c is Cons cc; c = cc.Cdr)
+                    if (cc.Car is SlotDefinition sd) defs.Add(sd);
+                var eslot = LispClass.BuildEffectiveSlot(name, defs);
+
+                if (Startup.Sym("EFFECTIVE-SLOT-DEFINITION-CLASS").Function is LispFunction esdcFn)
+                {
+                    var effClass = esdcFn.Invoke(new LispObject[] {
+                        cls, Startup.Keyword("NAME"), name });
+                    if (effClass is LispClass ec && !ReferenceEquals(ec, stdEffective))
+                    {
+                        eslot.MetaClass = ec;
+                        Runtime.InitializeSlotdExtraSlots(eslot, ec, null);
+                    }
+                }
+                return eslot;
+            });
+        }
         // ADD-DEPENDENT / REMOVE-DEPENDENT / MAP-DEPENDENTS / UPDATE-DEPENDENT (stubs)
         {
             var tCls = (LispClass)Runtime.FindClass(Startup.Sym("T"));
@@ -282,6 +382,16 @@ public static class Mop
             return Runtime.List(result.ToArray());
         });
 
+        // Wire the COMPUTE-EFFECTIVE-SLOT-DEFINITION protocol into class finalization.
+        // The GF is resolved lazily so user methods (added later) participate (#264).
+        LispClass.ComputeEffectiveSlotHook = (cls, name, defs) =>
+        {
+            if (Startup.Sym("COMPUTE-EFFECTIVE-SLOT-DEFINITION").Function is not LispFunction gf)
+                return null;
+            var defsList = Runtime.List(defs.Cast<LispObject>().ToArray());
+            var result = MultipleValues.Primary(gf.Invoke(new LispObject[] { cls, name, defsList }));
+            return result as SlotDefinition;
+        };
     }
 
     // --- helpers -------------------------------------------------------------

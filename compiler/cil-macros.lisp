@@ -2197,7 +2197,7 @@
                (parsed-slots
                  (mapcar (lambda (spec)
                            (if (symbolp spec)
-                               (list spec nil nil nil nil nil nil nil) ; (name initargs initform-present initform accessor reader writer allocation)
+                               (list spec nil nil nil nil nil nil nil nil) ; (name initargs initform-present initform accessor reader writer allocation custom-opts)
                                (let* ((sname (car spec))
                                       (props (cdr spec))
                                       (initargs nil)
@@ -2206,7 +2206,8 @@
                                       (accessors nil)
                                       (readers nil)
                                       (writers nil)
-                                      (allocation nil))
+                                      (allocation nil)
+                                      (custom-opts nil))
                                  (loop while props
                                        do (let ((key (pop props))
                                                 (val (pop props)))
@@ -2216,8 +2217,13 @@
                                               ((eq key :accessor) (push val accessors))
                                               ((eq key :reader) (push val readers))
                                               ((eq key :writer) (push val writers))
-                                              ((eq key :allocation) (setf allocation val)))))
-                                 (list sname initargs initform-present initform accessors readers writers allocation))))
+                                              ((eq key :allocation) (setf allocation val))
+                                              ;; Non-standard slot options (allowed under a custom
+                                              ;; metaclass) are passed to DIRECT-SLOT-DEFINITION-CLASS
+                                              ;; and seed the custom slotd's Lisp slots (#264).
+                                              (t (push (cons key val) custom-opts)))))
+                                 (list sname initargs initform-present initform accessors readers writers allocation
+                                       (nreverse custom-opts)))))
                          (or slot-specs '())))
                ;; Parse class options for :default-initargs
                (default-initargs-forms
@@ -2243,29 +2249,42 @@
                ;; Build slot-def list expression
                (slotdefs-expr
                  `(list ,@(mapcar (lambda (ps)
-                                    (let ((sname (first ps))
-                                          (initargs (second ps))
-                                          (initform-present (third ps))
-                                          (initform (fourth ps))
-                                          (allocation (eighth ps)))
-                                      (if (eq allocation :class)
-                                          `(%make-slot-def-with-allocation
-                                            ',sname
-                                            ,(if initargs
-                                                 `(list ,@(mapcar (lambda (ia) `',ia) (reverse initargs)))
-                                                 'nil)
-                                            ,(if initform-present
-                                                 `(lambda () ,initform)
-                                                 'nil)
-                                            'class)
-                                          `(%make-slot-def
-                                            ',sname
-                                            ,(if initargs
-                                                 `(list ,@(mapcar (lambda (ia) `',ia) (reverse initargs)))
-                                                 'nil)
-                                            ,(if initform-present
-                                                 `(lambda () ,initform)
-                                                 'nil)))))
+                                    (let* ((sname (first ps))
+                                           (initargs (second ps))
+                                           (initform-present (third ps))
+                                           (initform (fourth ps))
+                                           (allocation (eighth ps))
+                                           (custom-opts (ninth ps))
+                                           (base
+                                             (if (eq allocation :class)
+                                                 `(%make-slot-def-with-allocation
+                                                   ',sname
+                                                   ,(if initargs
+                                                        `(list ,@(mapcar (lambda (ia) `',ia) (reverse initargs)))
+                                                        'nil)
+                                                   ,(if initform-present
+                                                        `(lambda () ,initform)
+                                                        'nil)
+                                                   'class)
+                                                 `(%make-slot-def
+                                                   ',sname
+                                                   ,(if initargs
+                                                        `(list ,@(mapcar (lambda (ia) `',ia) (reverse initargs)))
+                                                        'nil)
+                                                   ,(if initform-present
+                                                        `(lambda () ,initform)
+                                                        'nil)))))
+                                      ;; Under a custom metaclass, attach the non-standard slot
+                                      ;; options so DIRECT-SLOT-DEFINITION-CLASS can dispatch on
+                                      ;; them. Values are quoted (CLOS does not evaluate slot
+                                      ;; option values) (#264).
+                                      (if (and custom-metaclass-p custom-opts)
+                                          `(%slot-def-raw-options
+                                            ,base
+                                            (list ,@(mapcan (lambda (kv)
+                                                              (list `',(car kv) `',(cdr kv)))
+                                                            custom-opts)))
+                                          base)))
                                   parsed-slots)))
                ;; Accessor definitions
                (accessor-defs
@@ -2513,6 +2532,9 @@
                (gf-has-key nil)
                (gf-has-allow-other-keys nil)
                (gf-keyword-names nil)
+               ;; :argument-precedence-order as a permutation of required-param
+               ;; indices (#268). nil = natural order. Computed below after validation.
+               (apo-order nil)
                ;; Extract :method-combination option: (:method-combination name [arg1 arg2 ...])
                (mc-opt (find-if (lambda (opt)
                                   (and (consp opt)
@@ -2596,7 +2618,9 @@
                 (dolist (p plain-params)
                   (unless (member p apo-params)
                     (error 'program-error :format-control "DEFGENERIC ~S: :argument-precedence-order is missing required parameter ~S"
-                           :format-arguments (list name p)))))))
+                           :format-arguments (list name p))))
+                ;; Permutation of required-param positions in precedence order (#268)
+                (setf apo-order (mapcar (lambda (p) (position p plain-params)) apo-params)))))
           ;; Check lambda list congruency for inline :method forms (CLHS 7.6.4)
           (dolist (mopt method-opts)
             (let ((mparams (if (and (cdr mopt) (symbolp (cadr mopt)) (not (listp (cadr mopt))) (listp (caddr mopt)))
@@ -2674,7 +2698,9 @@
                                          ,(if gf-has-rest t nil)
                                          ,(if gf-has-key t nil)
                                          ,(if gf-has-allow-other-keys t nil)
-                                         (list ,@(mapcar (lambda (k) `',k) gf-keyword-names)))
+                                         (list ,@(mapcar (lambda (k) `',k) gf-keyword-names))
+                                         (list ,@apo-order)
+                                         ',params)
                ,@(if (and mc-name (not (string= (symbol-name mc-name) "STANDARD")))
                      `((%set-method-combination %gf ',mc-name))
                      nil)

@@ -223,3 +223,23 @@
     (cnm-applicability-gf 0)
     (error () :ok))
   :ok)
+
+;;; D1109/#268: method dispatch honours :argument-precedence-order (CLHS 7.6.6.1.2)
+(defgeneric apo-foo (a b)
+  (:argument-precedence-order b a))
+(defmethod apo-foo ((a t) (b null)) :a-null-b)
+(defmethod apo-foo ((a integer) (b t)) :b-integer-a)
+
+;; b is weighed first; for (5 nil), b=nil's class NULL beats T -> method A
+(deftest d1109-apo-respected
+  (apo-foo 5 nil)
+  :a-null-b)
+
+;; natural-order GF (no APO) still weighs a first -> method B
+(defgeneric apo-natural (a b))
+(defmethod apo-natural ((a t) (b null)) :a-null-b)
+(defmethod apo-natural ((a integer) (b t)) :b-integer-a)
+
+(deftest d1109-natural-order-unchanged
+  (apo-natural 5 nil)
+  :b-integer-a)

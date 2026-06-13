@@ -38,10 +38,27 @@ public class LispPathname : LispObject
         return component is Symbol s && s.Name == "WILD";
     }
 
+    /// <summary>Expand a leading ~ / ~/ (and ~\ on Windows) to the user home
+    /// directory (shell/SBCL convention). No-op otherwise. Shared by FromString
+    /// and Runtime.ResolvePhysicalPath so LOAD/OPEN/PROBE-FILE with a "~/..."
+    /// STRING expand too, not only (pathname "~/...") (#19).</summary>
+    internal static string ExpandHome(string path)
+    {
+        if (path != "~" && !path.StartsWith("~/") && !path.StartsWith("~\\"))
+            return path;
+        var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        if (string.IsNullOrEmpty(home))
+            home = Environment.GetEnvironmentVariable("HOME") ?? "/";
+        return home.Replace('\\', '/') + path[1..].Replace('\\', '/');
+    }
+
     public static LispPathname FromString(string path)
     {
         // Normalize path separators
         path = path.Replace('\\', '/');
+
+        // Expand leading ~ to user home directory (shell convention)
+        path = ExpandHome(path);
 
         LispObject? device = null;
         LispObject? host = null;

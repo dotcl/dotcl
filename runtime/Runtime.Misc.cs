@@ -2763,6 +2763,80 @@ public static partial class Runtime
         return Nil.Instance;
     }
 
+    // Hook set by dotcl-jitdisasm contrib at (require "dotcl-jitdisasm") time.
+    public static Action<LispFunction, TextWriter>? JitDisassembleHook;
+
+    public static LispObject JitDisassemble(LispObject[] args)
+    {
+        if (args.Length != 1)
+            throw new LispErrorException(new LispProgramError(
+                $"DOTCL:JIT-DISASSEMBLE: wrong number of arguments: {args.Length} (expected 1)"));
+        var arg = args[0];
+
+        LispFunction? fn = null;
+        if (arg is LispFunction lf)
+            fn = lf;
+        else if (arg is Symbol sym)
+        {
+            fn = sym.Function as LispFunction;
+            if (fn == null)
+                throw new LispErrorException(new LispUndefinedFunction(sym));
+        }
+        else if (arg is Cons c && c.Car is Symbol cs && cs.Name == "SETF"
+                 && c.Cdr is Cons c2 && c2.Car is Symbol setfSym && c2.Cdr is Nil)
+            fn = setfSym.SetfFunction as LispFunction;
+
+        if (fn == null)
+            throw new LispErrorException(new LispTypeError(
+                "DOTCL:JIT-DISASSEMBLE: not a valid function designator", arg,
+                Startup.Sym("FUNCTION-DESIGNATOR")));
+
+        if (JitDisassembleHook == null)
+            throw new LispErrorException(new LispProgramError(
+                "DOTCL:JIT-DISASSEMBLE: not available; load the contrib first: (require \"dotcl-jitdisasm\")"));
+
+        var writer = GetStandardOutputWriter();
+        JitDisassembleHook(fn, writer);
+        writer.Flush();
+        return Nil.Instance;
+    }
+
+    /// <summary>
+    /// DOTCL:BACKTRACE — return the current Lisp call stack as a list of
+    /// function-name strings, innermost (most recent) frame first. Only named
+    /// functions are tracked (see LispFunction call-stack push/pop); anonymous
+    /// lambdas and native-fixnum self-calls do not appear. This function itself
+    /// is registered without a Name, so it never shows up in its own result.
+    /// </summary>
+    public static LispObject Backtrace(LispObject[] args)
+    {
+        var frames = LispFunction.GetCallStack();
+        LispObject result = Nil.Instance;
+        for (int i = frames.Length - 1; i >= 0; i--)
+            result = new Cons(new LispString(frames[i]), result);
+        return result;
+    }
+
+    /// <summary>
+    /// DOTCL:PRINT-BACKTRACE (&amp;optional stream) — print the current call stack
+    /// as numbered frames. Defaults to *ERROR-OUTPUT* (cf. sb-debug:print-backtrace).
+    /// </summary>
+    public static LispObject PrintBacktrace(LispObject[] args)
+    {
+        LispObject streamArg = args.Length >= 1 ? args[0] : Nil.Instance;
+        if (streamArg is Nil)
+            streamArg = DynamicBindings.Get(Startup.Sym("*ERROR-OUTPUT*"));
+        var writer = GetTextWriter(streamArg);
+        var frames = LispFunction.GetCallStackForms();
+        if (frames.Length == 0)
+            writer.Write("; (no Lisp frames)\n");
+        else
+            for (int i = 0; i < frames.Length; i++)
+                writer.Write($"{i,3}: {frames[i]}\n");
+        writer.Flush();
+        return Nil.Instance;
+    }
+
     private static void DisassembleSil(TextWriter writer, LispObject sil)
     {
         // SIL is a flat list of instructions: ((:INSTR args...) (:INSTR args...) ...)
@@ -2905,6 +2979,16 @@ public static partial class Runtime
                 symN.Function = wrapper;
                 Emitter.CilAssembler.RegisterFunction(key, wrapper);
             }
+            else if (name is Cons setfC && setfC.Car is Symbol setfS && setfS.Name == "SETF"
+                     && setfC.Cdr is Cons setfC2 && setfC2.Car is Symbol setfTargetSym)
+            {
+                // (setf SYM): install on the ACTUAL target symbol's SetfFunction, not
+                // Startup.Sym(name-string)'s. Compiled call sites resolve (setf sym)
+                // via GetSetfFunctionBySymbol on the source-code symbol (which preserves
+                // package, #274/D1139); installing on a same-named default-package symbol
+                // would leave those calls hitting the untraced original (TRACE.8).
+                setfTargetSym.SetfFunction = wrapper;
+            }
             else
             {
                 Emitter.CilAssembler.RegisterFunction(key, wrapper);
@@ -2944,6 +3028,14 @@ public static partial class Runtime
 
     private static void RestoreTracedFunction(string key, LispFunction original, LispObject? tracedName)
     {
+        // (setf SYM): restore on the ACTUAL target symbol's SetfFunction (mirror of
+        // the package-correct install in Trace), not Startup.Sym(name-string)'s.
+        if (tracedName is Cons setfC && setfC.Car is Symbol setfS && setfS.Name == "SETF"
+            && setfC.Cdr is Cons setfC2 && setfC2.Car is Symbol setfTargetSym)
+        {
+            setfTargetSym.SetfFunction = original;
+            return;
+        }
         Emitter.CilAssembler.RegisterFunction(key, original);
         // Restore on the original symbol that was traced
         if (tracedName is Symbol origSym)

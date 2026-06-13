@@ -61,6 +61,18 @@
    the slot; unboxing happens inline in compile-as-long (castclass Fixnum
    + get_Value). Caller-side guarantee: the user's declaration contract.")
 
+(defvar *small-int-locals* '()
+  "Alist (name-string . (LO . HI)) for lexical locals whose value is statically
+   known to lie in the inclusive int64 range [LO,HI]. Two sources: bounded
+   integer type declarations ((signed-byte N) / (unsigned-byte N) / bit /
+   (integer c c)) and let-binding init range inference (compile-let). Like
+   *fixnum-locals* the slot holds a boxed LispObject (a Fixnum, since the range
+   fits int64), so compile-as-long unboxes inline. Unlike *fixnum-locals* the
+   tracked range is TIGHT, which is what lets expr-int-range prove a product
+   stays in int64 and emit native arithmetic; an overflowing product instead
+   falls back to the promoting path and yields a bignum (CL-compliant). Mutated
+   locals are excluded — a setf could move the value out of [LO,HI].")
+
 (defvar *double-float-locals* '()
   "Like *fixnum-locals* but for double-float declarations. Enables native
    r8 arithmetic on (declare (double-float x)) locals and references.")
@@ -231,7 +243,7 @@
                (eval-instrs (cdr da)))
           (return-from compile-named-call
             `(,@eval-instrs
-              (:ldloc ,*self-fn-local*)
+              ,(if (eq *self-fn-local* :arg0) '(:ldarg 0) `(:ldloc ,*self-fn-local*))
               ,@(unless skip-reset '((:call "MultipleValues.Reset")))
               ,@(loop for tmp in temps append `((:ldloc ,tmp)))
               (:callvirt ,(format nil "LispFunction.Invoke~D" n-args)))))))
@@ -304,53 +316,47 @@
                       ,@(unless skip-reset '((:call "MultipleValues.Reset")))
                       (:ldloc ,args-tmp)
                       (:callvirt "LispFunction.Invoke"))))
-              ;; Global function — use symbol-based lookup (D115: fixes flat namespace collision)
-              (if (symbolp name)
-                  (if (<= n-args 8)
-                      (if (every #'simple-expr-p args)
-                          ;; Fast path: simple args → skip temps, push directly
-                          `(,@(compile-sym-lookup name)
-                            (:castclass "Symbol")
-                            (:call "CilAssembler.GetFunctionBySymbol")
-                            ,@(unless skip-reset '((:call "MultipleValues.Reset")))
-                            ,@(loop for arg in args
-                                    append (let ((*in-tail-position* nil)) (compile-expr arg)))
-                            (:callvirt ,(format nil "LispFunction.Invoke~D" n-args)))
-                          (let* ((da (compile-direct-call-args args))
-                                 (temps (car da))
-                                 (eval-instrs (cdr da)))
-                            `(,@eval-instrs
-                              ,@(compile-sym-lookup name)
-                              (:castclass "Symbol")
-                              (:call "CilAssembler.GetFunctionBySymbol")
-                              ,@(unless skip-reset '((:call "MultipleValues.Reset")))
-                              ,@(loop for tmp in temps append `((:ldloc ,tmp)))
-                              (:callvirt ,(format nil "LispFunction.Invoke~D" n-args)))))
-                      `((:declare-local ,args-tmp "LispObject[]")
-                        ,@(compile-args-array args) (:stloc ,args-tmp)
-                        ,@(compile-sym-lookup name)
-                        (:castclass "Symbol")
-                        (:call "CilAssembler.GetFunctionBySymbol")
-                        ,@(unless skip-reset '((:call "MultipleValues.Reset")))
-                        (:ldloc ,args-tmp)
-                        (:callvirt "LispFunction.Invoke")))
-                  (if (<= n-args 8)
-                      (let* ((da (compile-direct-call-args args))
-                             (temps (car da))
-                             (eval-instrs (cdr da)))
-                        `(,@eval-instrs
-                          (:ldstr ,(mangle-name name))
-                          (:call "CilAssembler.GetFunction")
+              ;; Global function — use symbol-based lookup (D115: fixes flat namespace
+              ;; collision). A (setf SYM) name resolves via the TARGET symbol's
+              ;; SetfFunction (symbol identity), NOT via the "(SETF NAME)" string path:
+              ;; CilAssembler.GetFunction does a cross-package name search for (setf ...)
+              ;; names, so a same-named accessor in another package (e.g. clump's
+              ;; (setf parent) vs spatial-trees' (setf parent)) could be picked up by
+              ;; iteration order, dispatching to the wrong GF (#274).
+              (let* ((setf-sym-p (and (consp name) (eq (car name) 'setf) (symbolp (cadr name))))
+                     (load-fn (cond (setf-sym-p
+                                     `(,@(compile-sym-lookup (cadr name))
+                                       (:castclass "Symbol")
+                                       (:call "CilAssembler.GetSetfFunctionBySymbol")))
+                                    ((symbolp name)
+                                     `(,@(compile-sym-lookup name)
+                                       (:castclass "Symbol")
+                                       (:call "CilAssembler.GetFunctionBySymbol")))
+                                    (t
+                                     `((:ldstr ,(mangle-name name))
+                                       (:call "CilAssembler.GetFunction"))))))
+                (if (<= n-args 8)
+                    (if (and (symbolp name) (every #'simple-expr-p args))
+                        ;; Fast path: simple args → skip temps, push directly
+                        `(,@load-fn
                           ,@(unless skip-reset '((:call "MultipleValues.Reset")))
-                          ,@(loop for tmp in temps append `((:ldloc ,tmp)))
-                          (:callvirt ,(format nil "LispFunction.Invoke~D" n-args))))
-                      `((:declare-local ,args-tmp "LispObject[]")
-                        ,@(compile-args-array args) (:stloc ,args-tmp)
-                        (:ldstr ,(mangle-name name))
-                        (:call "CilAssembler.GetFunction")
-                        ,@(unless skip-reset '((:call "MultipleValues.Reset")))
-                        (:ldloc ,args-tmp)
-                        (:callvirt "LispFunction.Invoke"))))))))))
+                          ,@(loop for arg in args
+                                  append (let ((*in-tail-position* nil)) (compile-expr arg)))
+                          (:callvirt ,(format nil "LispFunction.Invoke~D" n-args)))
+                        (let* ((da (compile-direct-call-args args))
+                               (temps (car da))
+                               (eval-instrs (cdr da)))
+                          `(,@eval-instrs
+                            ,@load-fn
+                            ,@(unless skip-reset '((:call "MultipleValues.Reset")))
+                            ,@(loop for tmp in temps append `((:ldloc ,tmp)))
+                            (:callvirt ,(format nil "LispFunction.Invoke~D" n-args)))))
+                    `((:declare-local ,args-tmp "LispObject[]")
+                      ,@(compile-args-array args) (:stloc ,args-tmp)
+                      ,@load-fn
+                      ,@(unless skip-reset '((:call "MultipleValues.Reset")))
+                      (:ldloc ,args-tmp)
+                      (:callvirt "LispFunction.Invoke"))))))))))
 
 
 ;;; ============================================================
@@ -404,6 +410,15 @@
                                         (>= . "Runtime.IsTrueGe")
                                         (<= . "Runtime.IsTrueLe")
                                         (= . "Runtime.IsTrueNumEq")))) args))
+        ;; Fixnum-typed unary sign predicate → native i8 compare against 0.
+        ;; (zerop (logand ...)) etc. lower the arg via compile-as-long, so a
+        ;; native logand feeds ceq directly with no Fixnum.Make round-trip.
+        ((and (= nargs 1)
+              (member op '(zerop minusp plusp))
+              (fixnum-typed-p (first args)))
+         (list :fixnum-cmp
+               (ecase op (zerop :eq) (minusp :lt) (plusp :gt))
+               (list (first args) 0)))
         ;; Unary predicates: zerop, minusp, plusp
         ((and (= nargs 1)
               (member op '(zerop minusp plusp)))
@@ -735,22 +750,46 @@
            (block-name (cond ((and (consp name) (eq (car name) 'setf)) (cadr name))
                              ((consp name) (cadr name)) ; (cas foo) → block named foo
                              (t name)))
-           (has-literal-return-from
-            (or (some (lambda (f) (form-has-return-from-p block-name f)) body)
-                ;; Also check macro-expanded forms: a local macro call like (def 10)
-                ;; might expand to contain (return-from block-name ...).
-                (some (lambda (f)
-                        (and (consp f)
-                             (symbolp (car f))
-                             (gethash (car f) *macros*)
-                             (handler-case
-                                 (let ((expanded (cached-macroexpand f (gethash (car f) *macros*))))
-                                   (and (not (equal expanded f))
-                                        (form-has-return-from-p block-name expanded)))
-                               (error () t))))  ; on expansion error, be conservative
-                      body)))
+           ;; Establish the enclosing function's numeric type-declaration context
+           ;; for the macro expansions performed during this analysis pass. The
+           ;; *macroexpand-cache* shares ONE expansion between the analysis and
+           ;; the later code-gen pass (so gensyms stay identical). A context-
+           ;; dependent macro such as dotimes consults fixnum-typed-p on its
+           ;; count-form to decide whether to inject (declare (fixnum ...)); if
+           ;; the analysis expansion runs with these vars unbound, the cached
+           ;; form lacks the declaration and the native int64 loop path can never
+           ;; fire at code-gen. Bind them (and a dummy *locals* so lookup-local
+           ;; reports params as bound) only around the analysis computations —
+           ;; the dummy keys never reach emission. Code-gen re-validates each
+           ;; declaration against the real boxed/captured-var context, so an
+           ;; over-eager declaration on a captured var is harmlessly ignored.
+           (analysis-context-vals
+            (let ((*fixnum-locals* (append (extract-fixnum-locals body) *fixnum-locals*))
+                  (*small-int-locals* (append (extract-small-int-locals body) *small-int-locals*))
+                  (*double-float-locals* (append (extract-double-float-locals body)
+                                                 *double-float-locals*))
+                  (*single-float-locals* (append (extract-single-float-locals body)
+                                                 *single-float-locals*))
+                  (*locals* (append (mapcar (lambda (p) (cons p (symbol-name p))) required)
+                                    *locals*)))
+              (cons
+               (or (some (lambda (f) (form-has-return-from-p block-name f)) body)
+                   ;; Also check macro-expanded forms: a local macro call like (def 10)
+                   ;; might expand to contain (return-from block-name ...).
+                   (some (lambda (f)
+                           (and (consp f)
+                                (symbolp (car f))
+                                (gethash (car f) *macros*)
+                                (handler-case
+                                    (let ((expanded (cached-macroexpand f (gethash (car f) *macros*))))
+                                      (and (not (equal expanded f))
+                                           (form-has-return-from-p block-name expanded)))
+                                  (error () t))))  ; on expansion error, be conservative
+                         body))
+               (find-free-vars-with-defaults params body))))
+           (has-literal-return-from (car analysis-context-vals))
            ;; Check for free variables from original body (block wrapper doesn't add free vars)
-           (free-vars (find-free-vars-with-defaults params body))
+           (free-vars (cdr analysis-context-vals))
            ;; Use direct params for simple required-only functions with no return-from
            (use-direct (and (null free-vars)
                             (simple-required-only-p params)
@@ -817,21 +856,25 @@
                            (null (fn-body-special-params wrapped-body
                                                          (mapcar #'symbol-name required)))
                            (null (remove-if-not #'global-special-p required)))))
-               `(,(if native-eligible
-                      `(:defmethod-native ,mangled
-                         ,@pkg-spec
-                         :params ,param-names
-                         :body ,(compile-function-body-direct
-                                 params wrapped-body mangled pkg-name name))
-                      `(:defmethod-direct ,mangled
-                         ,@pkg-spec
-                         :params ,param-names
-                         :body ,(compile-function-body-direct
-                                 params wrapped-body mangled pkg-name name)))
-                 ,@uninterned-fixup
-                 ,@(if (symbolp name)
-                       (compile-sym-lookup name)
-                       `((:ldstr ,mangled) (:call "Startup.Sym"))))))
+               (multiple-value-bind (direct-body direct-self-p)
+                   (compile-function-body-direct params wrapped-body mangled pkg-name name)
+                 `(,(if native-eligible
+                        `(:defmethod-native ,mangled
+                           ,@pkg-spec
+                           :params ,param-names
+                           :body ,direct-body)
+                        ;; :self t (D1144) — self-recursive non-native direct fn: the
+                        ;; backend gives the direct method a leading LispFunction self
+                        ;; param (threaded for non-tail self-calls, no per-entry lookup).
+                        `(:defmethod-direct ,mangled
+                           ,@pkg-spec
+                           ,@(when direct-self-p '(:self t))
+                           :params ,param-names
+                           :body ,direct-body))
+                   ,@uninterned-fixup
+                   ,@(if (symbolp name)
+                         (compile-sym-lookup name)
+                         `((:ldstr ,mangled) (:call "Startup.Sym")))))))
             ;; Standard defmethod
             (t
               `((:defmethod ,(mangle-name name)
@@ -1061,6 +1104,34 @@
            (every (lambda (p) (member (symbol-name p) fxlocals :test #'string=))
                   required)))))
 
+(defun %sil-references-local-p (tree key)
+  "Return T if the SIL TREE contains an instruction (:ldloc KEY).
+   Used to detect whether a non-native direct body actually performs a
+   non-tail self-call (the only producer of (:ldloc *self-fn-local*)).
+   Walks via a local recursion that visits car and cdr as separate
+   statements (NOT `(or (f car) (f cdr))`): the latter mixes a non-tail
+   self-call with a tail self-call in one form and the tail call's TCO
+   loop drops the non-tail call's result on the long body spine."
+  (labels ((walk (x)
+             (when (consp x)
+               (if (and (eq (car x) :ldloc) (consp (cdr x)) (eq (cadr x) key))
+                   (return-from %sil-references-local-p t)
+                   (progn (walk (car x)) (walk (cdr x)))))))
+    (walk tree)
+    nil))
+
+(defun %sil-subst-self-arg0 (tree key)
+  "Replace every (:ldloc KEY) leaf in SIL TREE with (:ldarg 0). KEY is the
+   unique self-fn gen-local, so this rewrites exactly the non-tail self-call
+   receivers to read the self LispFunction threaded in as arg0 (D1144)."
+  (cond ((atom tree) tree)
+        ((and (eq (car tree) :ldloc) (consp (cdr tree))
+              (eq (cadr tree) key) (null (cddr tree)))
+         '(:ldarg 0))
+        (t (let ((a (%sil-subst-self-arg0 (car tree) key))
+                 (d (%sil-subst-self-arg0 (cdr tree) key)))
+             (if (and (eq a (car tree)) (eq d (cdr tree))) tree (cons a d))))))
+
 (defun compile-function-body-direct (params body &optional (fn-name "") fn-pkg fn-symbol)
   "Compile function body with direct parameter passing (no args array).
    Only for functions with exactly required params, no optional/key/rest.
@@ -1098,10 +1169,11 @@
                                   needs-boxing)))
         (let ((param-instrs
                 (if pre-native-eligible
-                    ;; Native body: params come in as long, store into Int64 locals (#130)
+                    ;; Native body: arg0 is the self LispFunction (threaded for self-calls,
+                    ;; D1143), so the long params start at ldarg 1. Store into Int64 locals (#130).
                     (loop for p in required
                           for key = (cdr (assoc p local-keys))
-                          for i from 0
+                          for i from 1
                           append `((:declare-local ,key "Int64")
                                    (:ldarg ,i) (:stloc ,key)))
                     ;; Normal body: params as LispObject (with boxed-var support)
@@ -1147,18 +1219,24 @@
                    ;; Reset mutual-TCO: closures compiled within labels group must not
                    ;; emit br-to-outer-TCOLOOP (#124/D919).
                    (*labels-mutual-tco* nil)
-                   ;; Labels functions are stored in boxes, not symbols — skip self-fn caching (#125)
-                   (*self-fn-local* (when (and use-tco (null *tco-local-fn-key*)) (gen-local "SELF-FN")))
+                   ;; Self-fn local: holds the LispFunction used by non-tail self-calls.
+                   ;; - Native bodies (D1143): the self LispFunction arrives as arg0, so use
+                   ;;   the sentinel :ARG0 — self-call sites load (:ldarg 0) and NO prelude
+                   ;;   symbol-lookup runs per recursive entry.
+                   ;; - Labels functions are stored in boxes, not symbols — skip (#125).
+                   (*self-fn-local* (cond ((and pre-native-eligible use-tco) :arg0)
+                                          ((and use-tco (null *tco-local-fn-key*))
+                                           (gen-local "SELF-FN"))))
                    ;; Self-fn caching: for (SETF NAME) functions, look up SetfFunction
                    ;; on the target NAME symbol rather than Function on "(SETF NAME)"
                    ;; (D698: fix broken GetFunctionBySymbol call for setf functions).
-                   (setf-fn-p (and *self-fn-local*
+                   (setf-fn-p (and *self-fn-local* (not (eq *self-fn-local* :arg0))
                                    (> (length fn-name) 7)
                                    (string= fn-name "(SETF " :end1 6)))
                    (setf-target-name (when setf-fn-p
                                        (subseq fn-name 6 (1- (length fn-name)))))
                    (self-fn-prelude
-                     (when *self-fn-local*
+                     (when (and *self-fn-local* (not (eq *self-fn-local* :arg0)))
                        (if setf-fn-p
                            ;; (SETF NAME): look up SetfFunction on the target symbol
                            `((:declare-local ,*self-fn-local* "LispFunction")
@@ -1189,6 +1267,10 @@
                    ;; Fixnum type declarations on params — consulted by fixnum-typed-p
                    ;; and compile-as-long for native int64 paths (D669).
                    (*fixnum-locals* (append (extract-fixnum-locals body) *fixnum-locals*))
+                   ;; Bounded-integer type declarations on params (signed-byte/
+                   ;; unsigned-byte/bit) → tight range gating native int64 arith.
+                   (*small-int-locals* (append (extract-small-int-locals body)
+                                               *small-int-locals*))
                    ;; Double-float type declarations on params (D672).
                    (*double-float-locals* (append (extract-double-float-locals body)
                                                   *double-float-locals*))
@@ -1207,19 +1289,54 @@
                    ;; the `.tail` prefix (illegal in CIL inside try) and TCO
                    ;; branches don't try to cross the try boundary (D683).
                    (*in-try-block* (or *in-try-block* (not (null special-param-syms))))
-                   (body-instrs (compile-progn body)))
-              (merge-disjoint-locals
-               (if special-param-syms
-                   `(,@param-instrs
-                     ,@self-fn-prelude
-                     ,@(when use-tco `((:label ,tco-loop-label)))
-                     ,@(compile-let-with-specials '() special-push-instrs body-instrs special-param-syms)
-                     (:ret))
-                   `(,@param-instrs
-                     ,@self-fn-prelude
-                     ,@(when use-tco `((:label ,tco-loop-label)))
-                     ,@(maybe-tail-callvirt body-instrs)
-                     (:ret)))))))))))
+                   (body-instrs (compile-progn body))
+                   ;; D1144: extend D1143's self-as-arg0 threading to NON-native direct
+                   ;; functions. The per-entry self-fn-prelude (load-sym→castclass→
+                   ;; GetFunctionBySymbol) only survives JIT DCE when the body does a
+                   ;; non-tail self-call (= references *self-fn-local*). For exactly those
+                   ;; functions, thread the self LispFunction in as a hidden arg0 (shift
+                   ;; the LispObject params to ldarg 1..n, rewrite the self-call receiver
+                   ;; to ldarg 0, drop the prelude). The caller emits :self t so the
+                   ;; backend gives the direct method a leading LispFunction param and
+                   ;; binds _funcN's target to fn. Non-recursive direct functions keep
+                   ;; arg0 = first param so their apply/array path needs no symbol lookup.
+                   (self-arg0-p (and (not pre-native-eligible)
+                                     *self-fn-local*
+                                     (not (eq *self-fn-local* :arg0))
+                                     (null special-param-syms)
+                                     (%sil-references-local-p body-instrs *self-fn-local*)))
+                   (eff-param-instrs
+                     (if self-arg0-p
+                         (loop for p in required
+                               for key = (cdr (assoc p local-keys))
+                               for i from 1
+                               if (boxed-var-p p)
+                                 append `((:declare-local ,key "LispObject[]")
+                                          (:ldc-i4 1) (:newarr "LispObject") (:dup)
+                                          (:ldc-i4 0) (:ldarg ,i)
+                                          (:stelem-ref) (:stloc ,key))
+                               else
+                                 append `((:declare-local ,key "LispObject")
+                                          (:ldarg ,i) (:stloc ,key)))
+                         param-instrs))
+                   (eff-self-fn-prelude (if self-arg0-p '() self-fn-prelude))
+                   (eff-body-instrs (if self-arg0-p
+                                        (%sil-subst-self-arg0 body-instrs *self-fn-local*)
+                                        body-instrs)))
+              (values
+               (merge-disjoint-locals
+                (if special-param-syms
+                    `(,@param-instrs
+                      ,@self-fn-prelude
+                      ,@(when use-tco `((:label ,tco-loop-label)))
+                      ,@(compile-let-with-specials '() special-push-instrs body-instrs special-param-syms)
+                      (:ret))
+                    `(,@eff-param-instrs
+                      ,@eff-self-fn-prelude
+                      ,@(when use-tco `((:label ,tco-loop-label)))
+                      ,@(maybe-tail-callvirt eff-body-instrs)
+                      (:ret))))
+               self-arg0-p))))))))
 
 (defun compile-function-body-inner (params body args-arg-idx &optional (fn-name ""))
   "Compile function body, loading args from (:ldarg ARGS-ARG-IDX).
@@ -1561,6 +1678,54 @@
                (when (symbolp v) (pushnew (symbol-name v) result :test #'string=))))))))
     result))
 
+(defun extract-small-int-locals (body)
+  "Scan head (declare ...) forms for bounded integer type hints —
+   (signed-byte N) / (unsigned-byte N) / bit / (integer LO HI) — on locals.
+   Returns an alist (name-string . (LO . HI)) for those whose range fits int64.
+   Unlike extract-fixnum-locals these carry a TIGHT range, so expr-int-range can
+   prove a product stays in int64 (native) or, when it can't, fall back to the
+   promoting path (bignum). This is the CL-compliant generalization of the case
+   extract-fixnum-locals deliberately punted on before the #271 range gate."
+  (let ((result '()))
+    (dolist (form body)
+      (unless (and (consp form) (eq (car form) 'declare))
+        (return))
+      (dolist (decl (cdr form))
+        (when (consp decl)
+          (multiple-value-bind (type vars)
+              (if (eq (car decl) 'type)
+                  (values (cadr decl) (cddr decl))
+                  (values (car decl) (cdr decl)))
+            (let ((range (integer-type-range type)))
+              (when (and range (range-fits-int64-p range))
+                (dolist (v vars)
+                  (when (symbolp v)
+                    (pushnew (cons (symbol-name v) range) result
+                             :key #'car :test #'string=)))))))))
+    result))
+
+(defun infer-small-int-bindings (binding-info needs-boxing mutated)
+  "For plain lexical (non-special, non-boxed, non-mutated) let bindings whose
+   init has a statically provable int64 range (expr-int-range), return an alist
+   (name-string . (LO . HI)) to extend *small-int-locals* for the body. This is
+   what makes an undeclared let var like crc's new-rmdr = (logior bit (* rmdr 2))
+   participate in native int64 arithmetic. Mutated bindings are excluded: a setf
+   could move the value outside the init range, breaking the range gate's
+   soundness (and the inline unbox-fixnum, which assumes a Fixnum). Init ranges
+   are evaluated against the enclosing *small-int-locals* (callers leave the
+   prior binding in effect), so the result is sound for both let and let*."
+  (let ((result '()))
+    (dolist (b binding-info)
+      (let ((var (first b)) (init (second b)) (is-special (third b)))
+        (when (and (not is-special)
+                   init
+                   (not (member (symbol-name var) needs-boxing :test #'string=))
+                   (not (member (symbol-name var) mutated :test #'string=)))
+          (let ((r (expr-int-range init)))
+            (when (and r (range-fits-int64-p r))
+              (push (cons (symbol-name var) r) result))))))
+    result))
+
 (defun extract-double-float-locals (body)
   "Parallel to extract-fixnum-locals for double-float."
   (let ((result '()))
@@ -1644,10 +1809,22 @@
        (meet-inferred-types then-t else-t)))
     ;; Fixnum arithmetic on fixnum-typed operands
     ((and (consp expr) (symbolp (car expr))
-          (member (car expr) '(+ - * 1+ 1- ash logand logior logxor min max abs))
+          (member (car expr) '(+ - * 1+ 1- logand logior logxor min max abs))
           (every (lambda (a)
                    (eq 'fixnum (infer-expr-return-type a var-types self-name)))
                  (cdr expr)))
+     'fixnum)
+    ;; ash: a non-negative shift can overflow int64, so only infer fixnum when
+    ;; the value provably fits — negative shift (right shift), or a constant base
+    ;; and shift whose folded result is in int64 range. Must match fixnum-typed-p
+    ;; so the native-long return ABI never compiles an overflowing SHL (D1111).
+    ((and (consp expr) (= (length expr) 3) (eq (car expr) 'ash)
+          (eq 'fixnum (infer-expr-return-type (cadr expr) var-types self-name))
+          (integerp (caddr expr))
+          (let ((n (caddr expr)))
+            (or (< n 0)
+                (and (integerp (cadr expr))
+                     (typep (ash (cadr expr) n) '(signed-byte 64))))))
      'fixnum)
     ;; Self-recursive call
     ((and (consp expr) (symbolp (car expr)) self-name
@@ -1831,6 +2008,11 @@
                                          (*fixnum-locals*
                                           (append (extract-fixnum-locals body)
                                                   *fixnum-locals*))
+                                         (*small-int-locals*
+                                          (append (extract-small-int-locals body)
+                                                  (infer-small-int-bindings
+                                                   binding-info needs-boxing mutated)
+                                                  *small-int-locals*))
                                          (*double-float-locals*
                                           (append (extract-double-float-locals body)
                                                   *double-float-locals*))
@@ -1926,6 +2108,11 @@
                                         (*fixnum-locals*
                                          (append (extract-fixnum-locals body)
                                                  *fixnum-locals*))
+                                        (*small-int-locals*
+                                         (append (extract-small-int-locals body)
+                                                 (infer-small-int-bindings
+                                                  binding-info needs-boxing mutated)
+                                                 *small-int-locals*))
                                         (*double-float-locals*
                                          (append (extract-double-float-locals body)
                                                  *double-float-locals*))
@@ -2297,7 +2484,10 @@
                                           :key (lambda (k) (symbol-name k))
                                           :test #'string=)
                     when env-entry
-                    collect (list tag-name tb-var-name (cdr env-entry) label-idx)))
+                    ;; 5th/6th nil (closure go → throw path); 7th preserves the
+                    ;; outer tagbody's needs-catch cell so the throw flags it.
+                    collect (list tag-name tb-var-name (cdr env-entry) label-idx
+                                  nil nil (seventh gt-entry))))
              (param-instrs
                (append
                 ;; Required params: use :load-arg i (expands to ldarg 1; ldc i; ldelem-ref)
@@ -3524,6 +3714,18 @@
     (push (cons current-label (reverse current-forms)) segments)
     (reverse segments)))
 
+(defun sil-references-symbol-p (instrs sym)
+  "Deep scan: does SYM appear anywhere in the SIL tree INSTRS (including nested
+   :body lists for hoisted closures)? Used by compile-tagbody to decide whether
+   the tagbody id local is referenced — by a non-local go's GoException throw
+   OR by a closure capturing the id into its env — in which case the GoException
+   try/catch must be kept. A structural check, immune to compile ordering."
+  (labels ((walk (x)
+             (cond ((eq x sym) t)
+                   ((consp x) (or (walk (car x)) (walk (cdr x))))
+                   (t nil))))
+    (walk instrs)))
+
 (defun compile-tagbody (forms)
   "Compile (tagbody forms...).
    Local go (same tagbody, not in closure) uses index + leave instead of exceptions.
@@ -3553,59 +3755,85 @@
          (tb-var-name (concatenate 'string "%TBID-" (symbol-name tb-id-key) "%"))
          (tb-var-sym (intern tb-var-name :dotcl.cil-compiler))
          (*locals* (acons tb-var-sym tb-id-key *locals*))
-         ;; Extended format: (tag-name tb-var-name tb-id-key label-idx index-key leave-label)
-         ;; 5th & 6th elements enable local go optimization
+         ;; needs-catch: shared cell flagged by compile-go when it emits a
+         ;; NON-LOCAL (GoException throw) go targeting this tagbody. If none is
+         ;; emitted while compiling the segments, the catch is dead and omitted
+         ;; (mirrors compile-block). Eliding the per-iteration try is a large
+         ;; win for hot loops (dotimes/do/loop → tagbody).
+         (needs-catch (list nil))
+         ;; Extended format: (tag-name tb-var-name tb-id-key label-idx index-key
+         ;;                    leave-label needs-catch). 5th/6th enable local go;
+         ;; 7th lets a captured non-local go flag this tagbody's needs-catch.
          (*go-tags* (append
                      (mapcar (lambda (ti) (list (car ti) tb-var-name tb-id-key (cdr ti)
-                                                index-key loop-label))
+                                                index-key loop-label needs-catch))
                              tag-indices)
-                     *go-tags*)))
-    `((:declare-local ,tb-id-key "LispObject")
-      ;; Use a unique Cons cell as the tagbody ID (LispObject, capturable by closures)
-      (:ldsfld "Nil.Instance") (:ldsfld "Nil.Instance") (:call "Runtime.MakeCons")
-      (:stloc ,tb-id-key)
-      (:declare-local ,index-key "Int32")
-      (:ldc-i4 0) (:stloc ,index-key)
-      (:declare-local ,done-key "Boolean")
-      (:ldc-i4 0) (:stloc ,done-key)
-      ;; Outer loop
-      (:label ,loop-label)
-      (:ldloc ,done-key) (:brtrue ,end-label)
-      (:begin-exception-block)
-      ;; Switch on index
-      (:ldloc ,index-key)
-      (:switch ,seg-labels)
-      (:br ,leave-label)
-      ;; Segments (fall-through)
-      ,@(let ((*in-tail-position* nil))
-           (loop for seg in segments
-                 for label in seg-labels
-                 append `((:label ,label)
-                          ,@(loop for form in (cdr seg)
-                                  append (compile-and-pop form)))))
-      ;; Normal completion
-      (:label ,leave-label)
-      (:ldc-i4 1) (:stloc ,done-key)
-      (:leave ,loop-label)
-      ;; Catch GoException (for non-local go from closures)
-      (:begin-catch-block "GoException")
-      (:declare-local ,ex-key "GoException")
-      (:stloc ,ex-key)
-      ;; Check tagbody identity
-      (:ldloc ,ex-key) (:callvirt "GoException.get_TagbodyId")
-      (:ldloc ,tb-id-key)
-      (:beq ,match-label)
-      (:rethrow)
-      (:label ,match-label)
-      (:ldloc ,ex-key) (:callvirt "GoException.get_TargetLabel")
-      (:stloc ,index-key)
-      (:leave ,loop-label)
-      (:end-exception-block)
-      (:br ,loop-label)
-      ;; End: tagbody always returns NIL as single value
-      (:label ,end-label)
-      (:call "MultipleValues.Reset")  ; tagbody return is always single NIL
-      ,@(emit-nil))))
+                     *go-tags*))
+         ;; Compile segments NOW so compile-go runs (and may flag needs-catch)
+         ;; before we decide whether the GoException try/catch is needed.
+         (seg-instrs (let ((*in-tail-position* nil))
+                       (loop for seg in segments
+                             for label in seg-labels
+                             append `((:label ,label)
+                                      ,@(loop for form in (cdr seg)
+                                              append (compile-and-pop form)))))))
+    (if (or (car needs-catch)
+            ;; tb-id-key referenced in the body ⇒ a non-local go's throw or a
+            ;; closure capturing the tagbody id ⇒ the catch is required. This
+            ;; structural check backs up the needs-catch side-effect flag.
+            (sil-references-symbol-p seg-instrs tb-id-key))
+        ;; A non-local go can land here: keep the GoException try/catch.
+        `((:declare-local ,tb-id-key "LispObject")
+          (:ldsfld "Nil.Instance") (:ldsfld "Nil.Instance") (:call "Runtime.MakeCons")
+          (:stloc ,tb-id-key)
+          (:declare-local ,index-key "Int32")
+          (:ldc-i4 0) (:stloc ,index-key)
+          (:declare-local ,done-key "Boolean")
+          (:ldc-i4 0) (:stloc ,done-key)
+          (:label ,loop-label)
+          (:ldloc ,done-key) (:brtrue ,end-label)
+          (:begin-exception-block)
+          (:ldloc ,index-key)
+          (:switch ,seg-labels)
+          (:br ,leave-label)
+          ,@seg-instrs
+          (:label ,leave-label)
+          (:ldc-i4 1) (:stloc ,done-key)
+          (:leave ,loop-label)
+          (:begin-catch-block "GoException")
+          (:declare-local ,ex-key "GoException")
+          (:stloc ,ex-key)
+          (:ldloc ,ex-key) (:callvirt "GoException.get_TagbodyId")
+          (:ldloc ,tb-id-key)
+          (:beq ,match-label)
+          (:rethrow)
+          (:label ,match-label)
+          (:ldloc ,ex-key) (:callvirt "GoException.get_TargetLabel")
+          (:stloc ,index-key)
+          (:leave ,loop-label)
+          (:end-exception-block)
+          (:br ,loop-label)
+          (:label ,end-label)
+          (:call "MultipleValues.Reset")  ; tagbody return is always single NIL
+          ,@(emit-nil))
+        ;; All go's are local: no GoException can target this tagbody. Skip the
+        ;; try/catch entirely. tb-id-key is unreferenced and needs no slot.
+        `((:declare-local ,index-key "Int32")
+          (:ldc-i4 0) (:stloc ,index-key)
+          (:declare-local ,done-key "Boolean")
+          (:ldc-i4 0) (:stloc ,done-key)
+          (:label ,loop-label)
+          (:ldloc ,done-key) (:brtrue ,end-label)
+          (:ldloc ,index-key)
+          (:switch ,seg-labels)
+          (:br ,leave-label)
+          ,@seg-instrs
+          (:label ,leave-label)
+          (:ldc-i4 1) (:stloc ,done-key)
+          (:leave ,loop-label)
+          (:label ,end-label)
+          (:call "MultipleValues.Reset")
+          ,@(emit-nil)))))
 
 (defun compile-go (tag)
   "Compile (go tag).
@@ -3617,17 +3845,21 @@
     (let ((tb-id-key (third entry))
           (label-idx (fourth entry))
           (local-index-key (fifth entry))
-          (local-loop-label (sixth entry)))
+          (local-loop-label (sixth entry))
+          (needs-catch (seventh entry)))
       (if (and local-index-key (not *in-finally-block*))
           ;; Local go: set index and leave try block — no exception
           `((:ldc-i4 ,label-idx)
             (:stloc ,local-index-key)
             (:leave ,local-loop-label))
-          ;; Non-local go (or go from finally block): throw GoException
-          `((:ldloc ,tb-id-key)
-            (:ldc-i4 ,label-idx)
-            (:newobj "GoException")
-            (:throw))))))
+          ;; Non-local go (or go from finally block): throw GoException. Flag the
+          ;; target tagbody so it keeps its GoException catch.
+          (progn
+            (when needs-catch (setf (car needs-catch) t))
+            `((:ldloc ,tb-id-key)
+              (:ldc-i4 ,label-idx)
+              (:newobj "GoException")
+              (:throw)))))))
 
 ;;; ============================================================
 ;;; unwind-protect
@@ -4712,6 +4944,14 @@
             ,@(compile-expr (fourth expr))
             ,@(compile-expr (fifth expr))
             (:call "Runtime.MakeSlotDefWithAllocation"))))
+  ;; (%slot-def-raw-options slotd options-plist) → slotd  (#264)
+  ;; Attaches the canonical slot-option plist for DIRECT-SLOT-DEFINITION-CLASS dispatch
+  ;; under a custom metaclass; returns the slotd so it wraps %make-slot-def transparently.
+  (setf (gethash '%slot-def-raw-options h)
+        (lambda (expr)
+          `(,@(compile-expr (second expr))
+            ,@(compile-expr (third expr))
+            (:call "Runtime.SetSlotDefRawOptions"))))
   (setf (gethash '%register-class h) (lambda (expr) (compile-unary-call (cdr expr) "Runtime.RegisterClass")))
   (setf (gethash '%set-class-default-initargs h)
         (lambda (expr)
@@ -5233,7 +5473,8 @@
         (lambda (expr)
           (cond
             ((and (= (length (cdr expr)) 1)
-                  (fixnum-typed-p (cadr expr)))
+                  (fixnum-typed-p (cadr expr))
+                  (fixnum-arith-unboxed-safe-p expr))
              ;; Native: unbox arg, add 1, box
              `(,@(compile-as-long (cadr expr))
                (:ldc-i8 1) (:add)
@@ -5245,7 +5486,8 @@
         (lambda (expr)
           (cond
             ((and (= (length (cdr expr)) 1)
-                  (fixnum-typed-p (cadr expr)))
+                  (fixnum-typed-p (cadr expr))
+                  (fixnum-arith-unboxed-safe-p expr))
              `(,@(compile-as-long (cadr expr))
                (:ldc-i8 1) (:sub)
                (:call "Fixnum.Make")))

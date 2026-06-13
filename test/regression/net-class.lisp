@@ -1333,3 +1333,135 @@
         (dotnet:invoke self "set_N" 7)))
     (dotnet:invoke (dotnet:new "DotclTest.ParamCtorD") "get_N"))
   7)
+
+;;; -------------------------------------------------------------------------
+;;; D1101 — CLOS dispatch on dotnet:define-class instances
+
+;;; Top-level class definitions so macro expansion of subclasses sees the parent.
+(dotnet:define-class "DotclTest.ClsBase1" (Object))
+(dotnet:define-class "DotclTest.ClsBase2" (Object))
+(dotnet:define-class "DotclTest.ClsBase3" (Object))
+(dotnet:define-class "DotclTest.ClsAnimal" (Object))
+(dotnet:define-class "DotclTest.ClsDog" (ClsAnimal))
+(dotnet:define-class "DotclTest.ClsCat" (ClsAnimal))
+(dotnet:define-class "DotclTest.ClsBird" (ClsAnimal))
+
+(defgeneric d1101-speak (x))
+(defmethod d1101-speak ((x clsanimal)) :animal)
+(defmethod d1101-speak ((x clsdog)) :dog)
+
+;;; type-of returns a symbol whose name matches the C# simple type name
+(deftest d1101-type-of-returns-class-name
+  (string= (symbol-name (type-of (dotnet:new "DotclTest.ClsBase1")))
+           "ClsBase1")
+  t)
+
+;;; class-of returns a CLOS class object (built-in-class for dotnet:define-class types)
+(deftest d1101-class-of-returns-class
+  (typep (class-of (dotnet:new "DotclTest.ClsBase2")) 'built-in-class)
+  t)
+
+;;; find-class works via the uppercase Lisp symbol (reader upcases ClsBase3 → CLSBASE3)
+(deftest d1101-find-class-works
+  (string= (symbol-name (class-name (find-class 'clsbase3))) "ClsBase3")
+  t)
+
+;;; defmethod dispatch selects the most specific method
+(deftest d1101-defmethod-dispatch
+  (list (d1101-speak (dotnet:new "DotclTest.ClsAnimal"))
+        (d1101-speak (dotnet:new "DotclTest.ClsDog")))
+  (:animal :dog))
+
+;;; typep with a class object checks CPL correctly
+(deftest d1101-typep-cpl
+  (let ((cat (dotnet:new "DotclTest.ClsCat")))
+    (list (typep cat (find-class 'clscat))
+          (typep cat (find-class 'clsanimal))
+          (typep cat (find-class 'clsdog))))
+  (t t nil))
+
+;;; Inherited method fires when no specific method for subclass
+(deftest d1101-inherited-method-fires
+  (d1101-speak (dotnet:new "DotclTest.ClsBird"))
+  :animal)
+
+;;; -------------------------------------------------------------------------
+;;; D1106 — method overloading and constructor overloading
+
+;;; Same method name, different arity → each dispatches correctly
+(deftest d1106-method-overload-by-arity
+  (progn
+    (dotnet:%define-class "DotclTest.OverloadA" nil nil nil
+      (list (list "Add" "System.Int32" '("System.Int32")
+                  (lambda (self x) (declare (ignore self)) x))
+            (list "Add" "System.Int32" '("System.Int32" "System.Int32")
+                  (lambda (self x y) (declare (ignore self)) (+ x y)))))
+    (let ((obj (dotnet:new "DotclTest.OverloadA")))
+      (list (dotnet:invoke obj "Add" 10)
+            (dotnet:invoke obj "Add" 3 4))))
+  (10 7))
+
+;;; Same method name, different param types → different body
+(deftest d1106-method-overload-by-type
+  (progn
+    (dotnet:%define-class "DotclTest.OverloadB" nil nil nil
+      (list (list "Describe" "System.String" '("System.String")
+                  (lambda (self s) (declare (ignore self)) (concatenate 'string "str:" s)))
+            (list "Describe" "System.String" '("System.Int32")
+                  (lambda (self n) (declare (ignore self)) (format nil "int:~A" n)))))
+    (let ((obj (dotnet:new "DotclTest.OverloadB")))
+      (list (dotnet:invoke obj "Describe" "hello")
+            (dotnet:invoke obj "Describe" 42))))
+  ("str:hello" "int:42"))
+
+;;; Method overloading via macro
+(deftest d1106-macro-method-overload
+  (progn
+    (dotnet:define-class "DotclTest.OverloadC" (Object)
+      (:methods
+        ("Greet" () :returns String
+          "hello")
+        ("Greet" ((name String)) :returns String
+          (concatenate 'string "hello " name))))
+    (let ((obj (dotnet:new "DotclTest.OverloadC")))
+      (list (dotnet:invoke obj "Greet")
+            (dotnet:invoke obj "Greet" "world"))))
+  ("hello" "hello world"))
+
+;;; Constructor overloading via macro: no-arg and one-arg ctor
+(deftest d1106-ctor-overload
+  (progn
+    (dotnet:define-class "DotclTest.OverloadCtorA" (Object)
+      (:properties ("N" Int32))
+      (:ctor ()
+        (dotnet:invoke self "set_N" 0))
+      (:ctor ((n Int32))
+        (dotnet:invoke self "set_N" n)))
+    (list (dotnet:invoke (dotnet:new "DotclTest.OverloadCtorA") "get_N")
+          (dotnet:invoke (dotnet:new "DotclTest.OverloadCtorA" 42) "get_N")))
+  (0 42))
+
+;;; D1125 — char-backed LispVector strings (BASE-STRING) marshal to System.String.
+;;; CL strings have two runtime reprs (LispString and fill-pointered/adjustable
+;;; char LispVector); both report type-of SIMPLE-BASE-STRING / BASE-STRING. Only
+;;; LispString marshaled to System.String, so a char-vector string passed to a
+;;; .NET method (e.g. Graphics.DrawString, here StringBuilder.Append) failed
+;;; overload resolution with "Method not found". Repro'd via McCLIM
+;;; replay-output-record, where text records store the string as a char vector.
+
+;;; A fill-pointered char vector is NOT a LispString.
+(deftest d1125-char-vector-is-base-string
+  (let ((cv (make-array 5 :element-type 'character :fill-pointer 0 :adjustable t)))
+    (loop for c across "Hello" do (vector-push-extend c cv))
+    (type-of cv))
+  base-string)
+
+;;; Passing that char-vector string to a .NET method binds the (string,...)
+;;; overload and round-trips its characters.
+(deftest d1125-char-vector-marshals-to-dotnet-string
+  (let ((cv (make-array 5 :element-type 'character :fill-pointer 0 :adjustable t)))
+    (loop for c across "Hello" do (vector-push-extend c cv))
+    (let ((sb (dotnet:new "System.Text.StringBuilder")))
+      (dotnet:invoke sb "Append" cv)
+      (dotnet:invoke sb "ToString")))
+  "Hello")

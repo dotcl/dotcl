@@ -2612,6 +2612,11 @@ public static partial class Runtime
         else if (pathSpec is LispVector v && v.IsCharVector) raw = v.ToCharString();
         else return pathSpec.ToString();
 
+        // Expand a leading ~ for STRING/char-vector specs (LispPathname args were
+        // already expanded by FromString). Without this, LOAD/OPEN/PROBE-FILE on
+        // "~/foo" treated ~ as a relative segment → cwd/~/foo (#19).
+        raw = LispPathname.ExpandHome(raw);
+
         if (IsLogicalPathnameString(raw))
         {
             var logPn = LispLogicalPathname.FromLogicalString(raw);

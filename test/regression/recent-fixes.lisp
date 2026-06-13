@@ -1378,3 +1378,164 @@
     (asdf:load-system "dotcl-thread")
     (not (null (find-package "DOTCL-THREAD"))))
   t)
+
+;;; D1108: dotcl:backtrace — named-function call stack, innermost first
+(defun %bt-c () (dotcl:backtrace))
+(defun %bt-b () (%bt-c))
+(defun %bt-a () (%bt-b))
+
+(deftest d1108-backtrace-chain
+  (%bt-a)
+  ("%BT-C" "%BT-B" "%BT-A"))
+
+(deftest d1108-backtrace-self-excluded
+  ;; dotcl:backtrace is registered without a Name, so it never appears
+  (member "BACKTRACE" (%bt-c) :test #'string=)
+  nil)
+
+(deftest d1108-print-backtrace-returns-nil
+  (dotcl:print-backtrace (make-string-output-stream))
+  nil)
+
+;;; D1111: ash with non-negative constant shift must not overflow int64 / mask
+;;; count mod 64 (raw CIL shl bug). Constant base, nested, and overflow cases.
+(deftest d1111-ash-const-shift-64
+  (ash 1 64)
+  #.(expt 2 64))
+
+(deftest d1111-ash-const-shift-211
+  (ash 1 211)
+  #.(expt 2 211))
+
+(deftest d1111-ash-const-base-overflow
+  (ash 3 62)            ; 3*2^62 overflows int64 -> must promote to bignum
+  #.(* 3 (expt 2 62)))
+
+(deftest d1111-ash-nested-constant
+  (integer-length (* 1 (ash 1 210)))
+  211)
+
+(deftest d1111-ash-variable-base-overflow
+  (let ((x 7)) (ash x 60))
+  #.(* 7 (expt 2 60)))
+
+(deftest d1111-ash-right-shift-still-ok
+  (ash 1024 -5)
+  32)
+
+(deftest d1111-ash-small-constant-ok
+  (ash 5 3)
+  40)
+
+;;; D1112: fixnum fast-path +/- must promote to bignum on int64 overflow
+;;; (compile-fixnum-binop emitted raw :add/:sub that silently wrapped). * already
+;;; promoted via MultiplyFixnum; +/- now match via Add/SubtractFixnum.
+(defun %d1112-add (a b) (declare (fixnum a b)) (+ a b))
+(defun %d1112-sub (a b) (declare (fixnum a b)) (- a b))
+
+(deftest d1112-add-overflow-promotes
+  (%d1112-add #.(1- (expt 2 63)) 1)
+  #.(expt 2 63))
+
+(deftest d1112-sub-underflow-promotes
+  (%d1112-sub #.(- (expt 2 63)) 1)
+  #.(- (1+ (expt 2 63))))
+
+(deftest d1112-the-fixnum-operands-promote
+  (+ (the fixnum #.(1- (expt 2 63))) (the fixnum 1))
+  #.(expt 2 63))
+
+(deftest d1112-no-overflow-still-correct
+  (+ (the fixnum 1000000) (the fixnum 2000000))
+  3000000)
+
+;;; D1117 (#271) — NESTED unboxed fixnum arithmetic must promote on int64 overflow.
+;;; The boxed fixnum fast path (compile-fixnum-binop / 1+ / 1-) now uses a static
+;;; value-range proof (expr-int-range): the raw int64 path is taken only when every
+;;; intermediate +/-/*/1+/1- result provably fits int64; otherwise it falls back to
+;;; the promoting Runtime.Add/Subtract/Multiply so the result becomes a bignum.
+;;; (The #130 native-long self-call path keeps its opt-in unsafe contract; verified
+;;; intact by d903-native-tak above.)
+(defun %d1117-nest+ (a b c) (declare (fixnum a b c)) (+ (+ a b) c))
+(defun %d1117-nest* (a b) (declare (fixnum a b)) (* (+ a b) 1))
+(defun %d1117-nest- (a b) (declare (fixnum a b)) (- (- a b) b))
+(defun %d1117-nest1+ (a b) (declare (fixnum a b)) (+ (1+ a) b))
+
+(deftest d1117-nested-add-overflow-promotes
+  (%d1117-nest+ #.(1- (expt 2 63)) 1 0)
+  #.(expt 2 63))
+
+(deftest d1117-nested-mul-overflow-promotes
+  (%d1117-nest* #.(1- (expt 2 63)) 1)
+  #.(expt 2 63))
+
+(deftest d1117-nested-sub-underflow-promotes
+  (%d1117-nest- #.(- (expt 2 63)) 1)
+  #.(- (+ 2 (expt 2 63))))
+
+(deftest d1117-nested-1+-overflow-promotes
+  (%d1117-nest1+ #.(1- (expt 2 63)) 1)
+  #.(1+ (expt 2 63)))
+
+;;; Bounded operand declarations keep the fast unboxed path AND stay correct.
+(defun %d1117-bounded (a b)
+  (declare (type (integer 0 1000) a) (type (integer 0 1000) b))
+  (+ (+ a b) a))
+
+(deftest d1117-bounded-stays-correct
+  (%d1117-bounded 1000 1000)
+  3000)
+
+;;; Non-overflowing nested fixnum arithmetic is unchanged.
+(deftest d1117-small-nested-correct
+  (%d1117-nest+ 1 2 3)
+  6)
+
+;;; D1118 (#251) — :bt / print-backtrace show call forms with arguments.
+;;; Frames now carry args (alloc-free inline for <=4); dotcl:print-backtrace renders
+;;; "(NAME arg1 arg2 ...)" while dotcl:backtrace keeps bare names (see d1108 above).
+(defun %d1118-bt-leaf (a b)
+  (declare (ignore a b))
+  (let ((s (make-string-output-stream)))
+    (dotcl:print-backtrace s)
+    (get-output-stream-string s)))
+(defun %d1118-bt-mid (x) (%d1118-bt-leaf x (list x)))
+
+(deftest d1118-backtrace-shows-args
+  (let ((out (%d1118-bt-mid 7)))
+    (and (search "(%D1118-BT-LEAF 7 (7))" out)
+         (search "(%D1118-BT-MID 7)" out)
+         t))
+  t)
+
+(deftest d1118-backtrace-names-unchanged
+  ;; dotcl:backtrace stays bare names for programmatic use.
+  (%bt-a)
+  ("%BT-C" "%BT-B" "%BT-A"))
+
+;;; D1121 (#25 follow-up) — [LispDoc]/SetFunctionDoc docstrings now surface through
+;;; the DOCUMENTATION GF's function method (it falls back to _docs like the variable
+;;; method does). dotcl:save-application carries a [LispDoc] docstring.
+(deftest d1121-builtin-lispdoc-function-doc
+  (and (stringp (documentation 'dotcl:save-application 'function)) t)
+  t)
+
+;;; User-set docs still take precedence over the built-in fallback.
+(deftest d1121-user-doc-precedence
+  (progn (setf (documentation 'dotcl:save-application 'function) "user override")
+         (prog1 (documentation 'dotcl:save-application 'function)
+           ;; restore: clearing the table entry falls back to the [LispDoc] doc
+           (setf (documentation 'dotcl:save-application 'function) nil)))
+  "user override")
+
+;;; D1146 (#19) — a leading ~ in a STRING file spec must expand to the user home
+;;; on the LOAD/OPEN/PROBE-FILE path (ResolvePhysicalPath), not just for
+;;; (pathname "~/..."). Previously (load "~/x") treated ~ as a relative segment
+;;; → cwd/~/x. probe-file "~" exercises ResolvePhysicalPath; home always exists,
+;;; so a correct expansion returns a non-nil pathname with no literal ~.
+(deftest d1146-tilde-string-expands-on-file-ops
+  (let ((p (probe-file "~")))
+    (and (not (null p))
+         (not (find #\~ (namestring p)))
+         t))
+  t)

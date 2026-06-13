@@ -162,6 +162,16 @@ public partial class Runtime
         return lt.Thread.IsAlive ? T.Instance : Nil.Instance;
     }
 
+    /// <summary>(dotcl:thread-object thread) → the underlying System.Threading.Thread,
+    /// wrapped as a .NET object so it can be inspected or passed to .NET APIs
+    /// (e.g. ManagedThreadId, Priority, IsBackground) (dotcl/dotcl#26).</summary>
+    public static LispObject ThreadObject(LispObject[] args)
+    {
+        if (args.Length < 1 || args[0] is not LispThread lt)
+            throw new LispErrorException(new LispProgramError("THREAD-OBJECT: requires a thread"));
+        return new LispDotNetObject(lt.Thread);
+    }
+
     /// <summary>(bt:destroy-thread thread)</summary>
     public static LispObject DestroyThread(LispObject[] args)
     {
