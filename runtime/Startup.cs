@@ -1567,6 +1567,77 @@ public static class Startup
         RegisterDotcl("RUN-PROCESS", runProcess);
         RegisterDotcl("%RUN-PROCESS", runProcess); // backward-compat alias
 
+        // launch-process — streaming process handle for UIOP launch-program/process-info.
+        // Unlike run-process (collect-all), this exposes the child's stdin/stdout/
+        // stderr as live Lisp streams so the full run-program contract (incl. :input and
+        // every output spec) can be built on UIOP's slurp-input-stream.
+        // (launch-process exe arg-list &optional directory) -> #<PROCESS>
+        RegisterDotcl("LAUNCH-PROCESS", new LispFunction(args => {
+            var exe = args[0] is LispString es ? es.Value : args[0].ToString();
+            var argStrings = new System.Collections.Generic.List<string>();
+            if (args.Length > 1) {
+                var cur = args[1];
+                while (cur is Cons c) {
+                    argStrings.Add(c.Car is LispString ls ? ls.Value : c.Car.ToString());
+                    cur = c.Cdr;
+                }
+            }
+            var psi = new System.Diagnostics.ProcessStartInfo(exe) {
+                RedirectStandardInput = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+            };
+            foreach (var a in argStrings) psi.ArgumentList.Add(a);
+            if (args.Length > 2 && args[2] is LispString dir && dir.Value.Length > 0)
+                psi.WorkingDirectory = dir.Value;
+            var proc = System.Diagnostics.Process.Start(psi)!;
+            // Wrap stdout/stderr so a tight CL read loop blocks until true EOF
+            // instead of truncating on a transient empty-pipe read.
+            return new LispProcess(proc,
+                new LispOutputStream(proc.StandardInput),
+                new LispInputStream(new ProcessStreamReader(proc.StandardOutput, proc)),
+                new LispInputStream(new ProcessStreamReader(proc.StandardError, proc)));
+        }));
+        RegisterDotcl("PROCESS-INPUT", new LispFunction(args =>
+            args[0] is LispProcess p ? p.InputStream
+            : throw new LispErrorException(new LispTypeError("PROCESS-INPUT: not a process", args[0]))));
+        RegisterDotcl("PROCESS-OUTPUT", new LispFunction(args =>
+            args[0] is LispProcess p ? p.OutputStream
+            : throw new LispErrorException(new LispTypeError("PROCESS-OUTPUT: not a process", args[0]))));
+        RegisterDotcl("PROCESS-ERROR", new LispFunction(args =>
+            args[0] is LispProcess p ? p.ErrorStream
+            : throw new LispErrorException(new LispTypeError("PROCESS-ERROR: not a process", args[0]))));
+        RegisterDotcl("PROCESS-PID", new LispFunction(args =>
+            args[0] is LispProcess p ? (LispObject)new Fixnum(p.Process.Id)
+            : throw new LispErrorException(new LispTypeError("PROCESS-PID: not a process", args[0]))));
+        // process-wait: block until exit, return exit code (fixnum).
+        RegisterDotcl("PROCESS-WAIT", new LispFunction(args => {
+            if (args[0] is not LispProcess p)
+                throw new LispErrorException(new LispTypeError("PROCESS-WAIT: not a process", args[0]));
+            p.Process.WaitForExit();
+            return new Fixnum(p.Process.ExitCode);
+        }));
+        // process-alive-p: T while running, NIL once exited.
+        RegisterDotcl("PROCESS-ALIVE-P", new LispFunction(args =>
+            args[0] is LispProcess p
+                ? (p.Process.HasExited ? (LispObject)Nil.Instance : T.Instance)
+                : throw new LispErrorException(new LispTypeError("PROCESS-ALIVE-P: not a process", args[0]))));
+        // process-exit-code: fixnum if exited, NIL if still running.
+        RegisterDotcl("PROCESS-EXIT-CODE", new LispFunction(args => {
+            if (args[0] is not LispProcess p)
+                throw new LispErrorException(new LispTypeError("PROCESS-EXIT-CODE: not a process", args[0]));
+            return p.Process.HasExited ? (LispObject)new Fixnum(p.Process.ExitCode) : Nil.Instance;
+        }));
+        // process-kill: terminate the process (and its tree); returns NIL.
+        RegisterDotcl("PROCESS-KILL", new LispFunction(args => {
+            if (args[0] is not LispProcess p)
+                throw new LispErrorException(new LispTypeError("PROCESS-KILL: not a process", args[0]));
+            try { if (!p.Process.HasExited) p.Process.Kill(entireProcessTree: true); } catch { }
+            return Nil.Instance;
+        }));
+
         // Threading primitives — public dotcl: API backed by Runtime.Thread.cs.
         // bordeaux-threads impl-dotcl.lisp delegates to these.
         RegisterDotcl("MAKE-THREAD",
