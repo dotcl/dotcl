@@ -18,6 +18,7 @@
 (load "test/regression/call-out.lisp")
 (load "test/regression/static-generic.lisp")
 (load "test/regression/native-int-arith.lisp")
+(load "test/regression/process.lisp")
 
 (do-tests-summary)
 (if (= *fail-count* 0)
