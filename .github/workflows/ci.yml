@@ -46,6 +46,16 @@ jobs:
       - name: Build
         run: make build
 
+      - name: Compile asdf FASL (required by some regression tests)
+        run: make compile-asdf-fasl
+
+      # Gating: catches Linux-only regressions on every push. Previously only the
+      # release workflow ran test-regression, so a Linux-only break (e.g. a
+      # registration-order bug that left generic-function-lambda-list returning NIL
+      # only on Linux) slipped through master CI and surfaced only at release time.
+      - name: Regression tests
+        run: make test-regression
+
       - name: ANSI tests
         run: make test-ansi-all STDBUF="stdbuf -oL" 2>&1 | tee /tmp/ansi-summary.txt || true
 

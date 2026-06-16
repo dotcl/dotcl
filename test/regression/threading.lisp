@@ -85,13 +85,19 @@
   (t t nil))
 
 (deftest d657-semaphore-producer-consumer
-  (let ((sem (dotcl-thread:make-semaphore :count 0))
+  ;; Both worker threads accumulate into ACC, so the increments must be guarded by a
+  ;; lock — an unsynchronized (incf acc) read-modify-write loses an update and the
+  ;; sum flakes to 1 or 10 instead of 11.
+  (let ((sem  (dotcl-thread:make-semaphore :count 0))
+        (lock (dotcl-thread:make-lock))
         (acc 0))
-    (dotcl-thread:make-thread (lambda () (dotcl-thread:wait-on-semaphore sem) (incf acc 1)))
-    (dotcl-thread:make-thread (lambda () (dotcl-thread:wait-on-semaphore sem) (incf acc 10)))
+    (dotcl-thread:make-thread (lambda () (dotcl-thread:wait-on-semaphore sem)
+                                (dotcl-thread:with-lock-held (lock) (incf acc 1))))
+    (dotcl-thread:make-thread (lambda () (dotcl-thread:wait-on-semaphore sem)
+                                (dotcl-thread:with-lock-held (lock) (incf acc 10))))
     (sleep 0.05)
     (dotcl-thread:signal-semaphore sem 2)
-    (sleep 0.1)
+    (sleep 0.2)
     acc)
   11)
 

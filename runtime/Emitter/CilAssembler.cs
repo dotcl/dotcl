@@ -31,6 +31,23 @@ public class CilAssembler
     private static int _constantsSize;
     private static readonly object _constantsLock = new();
 
+    /// <summary>Precompiled-only mode: when true, any attempt to generate code at
+    /// runtime (eval/compile of compound forms, dotnet:define-class, native FFI
+    /// thunks) throws instead of emitting. Lets a host run a precompiled-only
+    /// image and fail loudly if something tries to JIT — the same constraint an
+    /// AOT/IL2CPP target imposes. Running already-compiled code is unaffected.</summary>
+    public static bool PrecompiledOnly;
+
+    /// <summary>Throws if <see cref="PrecompiledOnly"/> is set. Call at runtime
+    /// code-generation entry points.</summary>
+    internal static void EnsureEmitAllowed(string what)
+    {
+        if (PrecompiledOnly)
+            throw new LispErrorException(new LispProgramError(
+                $"precompiled-only mode (dotcl:precompiled-only): {what} requires runtime " +
+                "code generation, which is disabled; only precompiled code can run here"));
+    }
+
     // --- Public API ---
 
     public static LispObject AssembleAndRun(LispObject instrList)
@@ -51,6 +68,7 @@ public class CilAssembler
 
     private static LispObject AssembleAndRunSingle(LispObject instrList)
     {
+        EnsureEmitAllowed("eval/compile of a compound form");
         var asm = new CilAssembler();
         var dm = new DynamicMethod("toplevel", typeof(LispObject),
             Type.EmptyTypes, typeof(CilAssembler).Module, true);
@@ -127,7 +145,7 @@ public class CilAssembler
 
     public static LispFunction GetFunction(string name)
     {
-        // (SETF NAME) form: look up SetfFunction on the target symbol (D697).
+        // (SETF NAME) form: look up SetfFunction on the target symbol.
         // compile-named-call emits (:ldstr "(SETF NAME)") (:call "CilAssembler.GetFunction")
         // for non-symbol names like (setf foo). After D683 removed _functions fallback,
         // we must route to SetfFunction explicitly here.
@@ -168,7 +186,7 @@ public class CilAssembler
     /// <summary>
     /// Symbol-based function lookup. sym.Function is primary. If empty,
     /// fall back to any same-named symbol in another package that has a
-    /// Function (D683, #113 Phase 3) — replaces the old _functions flat
+    /// Function (D683 Phase 3) — replaces the old _functions flat
     /// table as a cross-package bridge. Caches the result on sym.Function
     /// to make subsequent lookups O(1).
     /// </summary>
@@ -243,7 +261,7 @@ public class CilAssembler
     /// <summary>
     /// Package-aware function registration that protects inherited CL symbols.
     /// If the symbol's home package is CL but defPkg is different, skip function slot update
-    /// (a foreign-package defun must not overwrite an inherited CL symbol, D427).
+    /// (a foreign-package defun must not overwrite an inherited CL symbol).
     /// </summary>
     public static void RegisterFunctionOnSymbolGuarded(Symbol sym, LispFunction fn, string defPkg)
     {
@@ -270,7 +288,7 @@ public class CilAssembler
     public static void RegisterFunction(string name, LispFunction fn)
     {
         // Handle (SETF NAME) functions: register on the target symbol's SetfFunction
-        // slot so that #'(setf name) / GetSetfFunctionBySymbol can find them (D693).
+        // slot so that #'(setf name) / GetSetfFunctionBySymbol can find them.
         if (name.StartsWith("(SETF ", StringComparison.Ordinal) && name.EndsWith(")"))
         {
             var targetName = name.Substring(6, name.Length - 7);
@@ -420,11 +438,17 @@ public class CilAssembler
             case "CALLVIRT":
                 EmitCallvirt(GetString(Cadr(c)));
                 break;
+            case "DOTNET-CALL-DIRECT":
+                EmitDotnetCallDirect(GetString(Cadr(c)), GetString(Caddr(c)));
+                break;
+            case "DOTNET-CALL-DIRECT-N":
+                EmitDotnetCallDirectN(c);
+                break;
             case "TAIL-PREFIX":
                 // CIL tail-call prefix. Must be immediately followed by a call/callvirt/calli
                 // whose next instruction is `ret`. CLR JIT may or may not honor it, but it's
                 // a safe hint. The compiler only emits this when *in-tail-position* is T and
-                // the call site isn't inside a try/finally region (D683).
+                // the call site isn't inside a try/finally region.
                 _il.Emit(OpCodes.Tailcall);
                 break;
             case "NEWOBJ":
@@ -595,7 +619,7 @@ public class CilAssembler
                 // defmethod-direct registrations on the symbol's home
                 // package are picked up. Pre-resolving here would pin
                 // a Function-less placeholder in the constants pool
-                // before the defun has run (D683, #113 Phase 3).
+                // before the defun has run (D683 Phase 3).
                 var symName = GetString(Cadr(c));
                 _il.Emit(OpCodes.Ldstr, _faslMode ? Track(symName) : symName);
                 _il.Emit(OpCodes.Call, _methodCache["Startup.Sym"]);
@@ -729,7 +753,7 @@ public class CilAssembler
         // Register on the correct symbol for package-aware lookup.
         // If :pkg was specified, use that package (the defun name's home package).
         // Otherwise fall back to *package* (D115 fix for flat namespace collision).
-        // Check foreign CL BEFORE updating flat table to prevent overwriting host builtins (D427).
+        // Check foreign CL BEFORE updating flat table to prevent overwriting host builtins.
         Symbol? pkgSym = null;
         bool isForeignCL2 = false;
         Symbol? setfTargetSym = null;  // for (SETF NAME) functions: the target NAME symbol
@@ -745,7 +769,7 @@ public class CilAssembler
                 if (pkg != null)
                 {
                     var (s, _) = pkg.Intern(name);
-                    // Don't overwrite inherited CL-package symbol functions (D421).
+                    // Don't overwrite inherited CL-package symbol functions.
                     var homePkg2 = s.HomePackage;
                     isForeignCL2 = homePkg2 != null && homePkg2 != pkg
                         && homePkg2.Name == "COMMON-LISP";
@@ -1153,7 +1177,7 @@ public class CilAssembler
             return;
         }
 
-        // Create DynamicMethod with direct LispObject params. When selfArg0 (D1144), the
+        // Create DynamicMethod with direct LispObject params. When selfArg0, the
         // method takes a leading LispFunction self so a non-tail self-call reaches the
         // receiver from arg0 instead of re-resolving #'NAME each recursive entry.
         var directParamTypes = new Type[selfArg0 ? paramCount + 1 : paramCount];
@@ -1279,7 +1303,7 @@ public class CilAssembler
         // Register on the correct symbol for package-aware lookup.
         // If :pkg was specified, use that package (the defun name's home package).
         // Otherwise fall back to *package*.
-        // Check foreign CL BEFORE updating flat table to prevent overwriting host builtins (D427).
+        // Check foreign CL BEFORE updating flat table to prevent overwriting host builtins.
         Symbol? pkgSym = null;
         bool isForeignCL = false;
         Symbol? setfTargetSym = null;  // for (SETF NAME) functions: the target NAME symbol
@@ -1314,7 +1338,7 @@ public class CilAssembler
         }
         else if (name.StartsWith("(SETF ") && name.EndsWith(")"))
         {
-            // (SETF NAME): register fn on the target NAME symbol's SetfFunction slot (D697)
+            // (SETF NAME): register fn on the target NAME symbol's SetfFunction slot
             // HandleDefun had this, but HandleDefunDirect was missing it — causing
             // (defun (setf foo) ...) to silently fail to register when use-direct=true.
             var targetName = name.Substring(6, name.Length - 7);
@@ -1361,7 +1385,7 @@ public class CilAssembler
         }
     }
 
-    // Build the LispFunction for a self-threaded direct function (D1144), arities 0-8.
+    // Build the LispFunction for a self-threaded direct function, arities 0-8.
     // directDm is the static method LispObject M(LispFunction self, LispObject p0...).
     // _funcN gets a closed delegate over fn (self bound) so a non-tail self-call
     // (LispFunction.InvokeN → _funcN) reaches the receiver with no per-entry symbol
@@ -1497,7 +1521,7 @@ public class CilAssembler
         // Native DynamicMethod: LispObject Name_native(LispFunction self, long p0, ...)
         // arg0 is the LispFunction itself, threaded through so a native self-call reaches
         // the receiver from arg0 instead of re-resolving #'NAME from its symbol each call
-        // (the old per-call self-fn prelude, D1143). Long params avoid arg boxing; body
+        // (the old per-call self-fn prelude). Long params avoid arg boxing; body
         // returns LispObject (arithmetic already boxes via Fixnum.Make).
         var nativeParamTypes = new Type[paramCount + 1];
         nativeParamTypes[0] = typeof(LispFunction);
@@ -1796,6 +1820,93 @@ public class CilAssembler
             return;
         }
         throw new Exception($"Unknown method for callvirt: {name}");
+    }
+
+    private void EmitDotnetCallDirect(string typeName, string methodName)
+    {
+        // Stack on entry: [ receiver : LispObject ]. Direct dispatch for a
+        // known-typed, zero-argument dotnet:invoke: unwrap the receiver to its
+        // static .NET type and callvirt the resolved method — no runtime member
+        // lookup / InvokeMember. Reference-type receivers only for now (the codegen
+        // spine for type-declared invoke; args and value-type receivers come next).
+        var type = Runtime.ResolveDotNetType(typeName);
+        if (type.IsValueType)
+            throw new Exception($"dotnet-call-direct: value-type receiver not yet supported: {typeName}");
+        var method = type.GetMethod(methodName, Type.EmptyTypes)
+            ?? throw new Exception($"dotnet-call-direct: no zero-arg method {typeName}.{methodName}");
+
+        // ((LispDotNetObject)receiver).Value, then cast to the static receiver type.
+        _il.Emit(OpCodes.Castclass, typeof(LispDotNetObject));
+        _il.Emit(OpCodes.Callvirt, typeof(LispDotNetObject).GetMethod("get_Value")!);
+        _il.Emit(OpCodes.Castclass, type);
+        // Callvirt works for both virtual and non-virtual instance methods on a
+        // reference type (and gives the desired null check).
+        _il.Emit(OpCodes.Callvirt, method);
+        EmitDotnetResultMarshal(method);
+    }
+
+    private void EmitDotnetCallDirectN(LispObject c)
+    {
+        // (:dotnet-call-direct-n "Type.FullName" "Method" "Param1.Type" ...)
+        // Entry stack: [ args : LispObject[], receiver : LispObject ]. Direct dispatch
+        // for a known-typed dotnet:invoke with arguments: resolve the exact overload by
+        // param types, marshal each LispObject arg to its parameter type, and callvirt
+        // directly (no InvokeMember). Reference-type receiver only for now.
+        string typeName = GetString(Cadr(c));
+        string methodName = GetString(Caddr(c));
+        var paramTypeNames = new System.Collections.Generic.List<string>();
+        for (var cur = Cdr(Cdr(Cdr(c))); cur is Cons cc; cur = cc.Cdr)
+            paramTypeNames.Add(GetString(cc.Car));
+
+        var type = Runtime.ResolveDotNetType(typeName);
+        if (type.IsValueType)
+            throw new Exception($"dotnet-call-direct-n: value-type receiver not yet supported: {typeName}");
+        var paramTypes = new Type[paramTypeNames.Count];
+        for (int i = 0; i < paramTypes.Length; i++) paramTypes[i] = Runtime.ResolveDotNetType(paramTypeNames[i]);
+        var method = type.GetMethod(methodName, paramTypes)
+            ?? throw new Exception($"dotnet-call-direct-n: no method {typeName}.{methodName}({string.Join(",", paramTypeNames)})");
+
+        var recvLocal = _il.DeclareLocal(typeof(LispObject));
+        _il.Emit(OpCodes.Stloc, recvLocal);     // [ args ]
+        var argsLocal = _il.DeclareLocal(typeof(LispObject[]));
+        _il.Emit(OpCodes.Stloc, argsLocal);     // [ ]
+
+        // Typed receiver: ((T)((LispDotNetObject)recv).Value)
+        _il.Emit(OpCodes.Ldloc, recvLocal);
+        _il.Emit(OpCodes.Castclass, typeof(LispDotNetObject));
+        _il.Emit(OpCodes.Callvirt, typeof(LispDotNetObject).GetMethod("get_Value")!);
+        _il.Emit(OpCodes.Castclass, type);
+
+        // Each argument: Runtime.LispToDotNet(args[i], paramTypes[i]) then cast/unbox.
+        var lispToDotNet = typeof(Runtime).GetMethod("LispToDotNet", new[] { typeof(LispObject), typeof(Type) })!;
+        var getTypeFromHandle = typeof(Type).GetMethod("GetTypeFromHandle", new[] { typeof(RuntimeTypeHandle) })!;
+        for (int i = 0; i < paramTypes.Length; i++)
+        {
+            _il.Emit(OpCodes.Ldloc, argsLocal);
+            _il.Emit(OpCodes.Ldc_I4, i);
+            _il.Emit(OpCodes.Ldelem_Ref);
+            _il.Emit(OpCodes.Ldtoken, paramTypes[i]);
+            _il.Emit(OpCodes.Call, getTypeFromHandle);
+            _il.Emit(OpCodes.Call, lispToDotNet);
+            if (paramTypes[i].IsValueType) _il.Emit(OpCodes.Unbox_Any, paramTypes[i]);
+            else _il.Emit(OpCodes.Castclass, paramTypes[i]);
+        }
+        _il.Emit(OpCodes.Callvirt, method);
+        EmitDotnetResultMarshal(method);
+    }
+
+    private void EmitDotnetResultMarshal(MethodInfo method)
+    {
+        if (method.ReturnType == typeof(void))
+        {
+            _il.Emit(OpCodes.Ldsfld, typeof(Nil).GetField("Instance")!);
+        }
+        else
+        {
+            if (method.ReturnType.IsValueType)
+                _il.Emit(OpCodes.Box, method.ReturnType);
+            _il.Emit(OpCodes.Call, typeof(Runtime).GetMethod("DotNetToLisp", new[] { typeof(object) })!);
+        }
     }
 
     private void EmitNewobj(string name)

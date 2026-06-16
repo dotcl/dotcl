@@ -191,4 +191,66 @@ public static class DotclHost
             lispArgs[i] = Runtime.DotNetToLisp(args[i]);
         return fn.Invoke(lispArgs);
     }
+
+    /// <summary>
+    /// Convert a Lisp result to its natural .NET representation: NIL → null,
+    /// T → true, integers → int (or long when out of int range), floats →
+    /// double/float, strings → string, a wrapped .NET object → the object
+    /// itself. Values without a natural scalar counterpart (lists, symbols,
+    /// hash-tables, …) are returned as the underlying <see cref="LispObject"/>,
+    /// which the caller can inspect or walk directly. Inverse of the
+    /// <see cref="Runtime.DotNetToLisp"/> conversion used on the way in.
+    /// </summary>
+    public static object? ToClr(LispObject value) => Runtime.LispToDotNetGeneric(value);
+
+    /// <summary>
+    /// Convert a Lisp result to the requested .NET type <typeparamref name="T"/>,
+    /// using the same marshalling applied to .NET method arguments (so e.g. a
+    /// small integer can be requested as <c>long</c>, a keyword as an enum, etc.).
+    /// Returns <c>default</c> for NIL; throws <see cref="InvalidCastException"/>
+    /// when the value cannot be represented as T.
+    /// </summary>
+    public static T ToClr<T>(LispObject value)
+    {
+        var converted = Runtime.LispToDotNet(value, typeof(T));
+        if (converted is null) return default!;
+        if (converted is T t) return t;
+        throw new InvalidCastException(
+            $"DotclHost.ToClr<{typeof(T).Name}>: cannot represent {converted.GetType().Name} as {typeof(T).Name}");
+    }
+
+    /// <summary>
+    /// Precompiled-only mode. When enabled, any attempt to generate code at
+    /// runtime — eval/compile of compound forms, dotnet:define-class, native FFI
+    /// thunks — throws instead of emitting. A host that loads a precompiled image
+    /// can set this after loading to assert it never JITs, mirroring an AOT/IL2CPP
+    /// target. Running already-compiled code is unaffected.
+    /// </summary>
+    public static bool PrecompiledOnly
+    {
+        get => Emitter.CilAssembler.PrecompiledOnly;
+        set => Emitter.CilAssembler.PrecompiledOnly = value;
+    }
+
+    /// <summary>
+    /// Expose a host .NET function to Lisp under NAME, callable like any Lisp
+    /// function (the counterpart of <see cref="Call"/>'s Lisp→C# direction).
+    /// The symbol is interned in CL-USER, so Lisp code reads <c>(name ...)</c>
+    /// without a package prefix. Arguments arrive as natural .NET values (same
+    /// conversion as <see cref="ToClr"/>) and the return is converted back via
+    /// <see cref="Runtime.DotNetToLisp"/>; return null for a Lisp NIL. Registering
+    /// a function does not generate code, so it is allowed under PrecompiledOnly.
+    /// </summary>
+    public static void Register(string name, Func<object?[], object?> fn)
+    {
+        var pkg = Package.FindPackage("CL-USER") ?? Startup.CLUser;
+        var (sym, _) = pkg.Intern(name.ToUpperInvariant());
+        sym.Function = new LispFunction(args =>
+        {
+            var clrArgs = new object?[args.Length];
+            for (int i = 0; i < args.Length; i++)
+                clrArgs[i] = Runtime.LispToDotNetGeneric(args[i]);
+            return Runtime.DotNetToLisp(fn(clrArgs));
+        });
+    }
 }

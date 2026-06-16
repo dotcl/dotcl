@@ -167,6 +167,7 @@ static class NativeFFI
         LispObject argTypesList, LispObject retTypeKw,
         LispObject[] nativeArgs)
     {
+        Emitter.CilAssembler.EnsureEmitAllowed("native FFI call");
         // Parse arg types
         var argTypes = new List<Type>();
         for (var cur = argTypesList; cur is Cons c; cur = c.Cdr)
@@ -228,6 +229,7 @@ static class NativeFFI
         LispObject argTypesList, LispObject retTypeKw,
         LispObject[] nativeArgs)
     {
+        Emitter.CilAssembler.EnsureEmitAllowed("native FFI call");
         var argTypes = new List<Type>();
         for (var cur = argTypesList; cur is Cons c; cur = c.Cdr)
             argTypes.Add(KeyToType(c.Car));

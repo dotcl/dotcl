@@ -190,13 +190,25 @@ public static partial class Runtime
     public static LispClass EnsureDotNetTypeClass(Type type)
     {
         if (_dotNetTypeRegistry.TryGetValue(type, out var existing)) return existing;
-        // Use the simple type name as the class name symbol
-        var sym = Startup.Sym(type.Name);
-        // Find or create a class for this type
-        if (_classRegistry.TryGetValue(sym, out var existingByName))
+        // Prefer the simple type name for the class symbol (friendly, and what
+        // unquoted Lisp symbols resolve to). But simple names are ambiguous across
+        // namespaces, so guard against collisions below.
+        var simpleSym = Startup.Sym(type.Name);
+        if (_classRegistry.TryGetValue(simpleSym, out var existingByName))
         {
-            _dotNetTypeRegistry[type] = existingByName;
-            return existingByName;
+            // The simple name is already taken. Adopt that class only if it is NOT
+            // another .NET type's class — otherwise two same-named types from
+            // different namespaces (e.g. System.Collections.ArrayList vs Other.ArrayList)
+            // would share one Lisp class and misdirect class-of/typep/dispatch.
+            // existingByName cannot be THIS type's class: the _dotNetTypeRegistry
+            // lookup above missed.
+            bool collidesWithOtherDotNetType =
+                _dotNetTypeRegistry.Values.Any(c => ReferenceEquals(c, existingByName));
+            if (!collidesWithOtherDotNetType)
+            {
+                _dotNetTypeRegistry[type] = existingByName;
+                return existingByName;
+            }
         }
         // Get or create the base class
         LispClass baseCls;
@@ -207,19 +219,36 @@ public static partial class Runtime
         else
             baseCls = _classRegistry.Values.First(); // fallback
 
-        var cls = new LispClass(sym, Array.Empty<SlotDefinition>(), new[] { baseCls });
+        // Name the class by simple name when that slot is free; on a cross-type
+        // collision use the unique FullName so the colliding types stay distinct and
+        // the first claimant keeps the friendly simple/uppercase names.
+        bool simpleFree = !_classRegistry.ContainsKey(simpleSym);
+        var classSym = simpleFree
+            ? simpleSym
+            : Startup.Sym(type.FullName
+                ?? (type.Namespace is null ? type.Name : type.Namespace + "." + type.Name));
+
+        var cls = new LispClass(classSym, Array.Empty<SlotDefinition>(), new[] { baseCls });
         var cpl = new List<LispClass> { cls };
         cpl.AddRange(baseCls.ClassPrecedenceList);
         cls.ClassPrecedenceList = cpl.ToArray();
         cls.EffectiveSlots = Array.Empty<SlotDefinition>();
         cls.IsBuiltIn = true;
-        _classRegistry[sym] = cls;
-        // Also register under the uppercase name so unquoted Lisp symbols
-        // (e.g. (ClsAnimal) read as CLSANIMAL) find the class correctly.
-        var upperSym = Startup.Sym(type.Name.ToUpperInvariant());
-        if (!ReferenceEquals(upperSym, sym))
-            _classRegistry[upperSym] = cls;
         _dotNetTypeRegistry[type] = cls;
+        if (simpleFree)
+        {
+            _classRegistry[simpleSym] = cls;
+            // Also register under the uppercase name so unquoted Lisp symbols
+            // (e.g. (ClsAnimal) read as CLSANIMAL) find the class correctly.
+            var upperSym = Startup.Sym(type.Name.ToUpperInvariant());
+            if (!ReferenceEquals(upperSym, simpleSym) && !_classRegistry.ContainsKey(upperSym))
+                _classRegistry[upperSym] = cls;
+        }
+        else if (!_classRegistry.ContainsKey(classSym))
+        {
+            // Make the FullName-qualified class findable by its unique symbol.
+            _classRegistry[classSym] = cls;
+        }
         return cls;
     }
 
@@ -309,7 +338,7 @@ public static partial class Runtime
         cls.Metaclass = metaclass;
         // AMOP: for a custom metaclass, consult DIRECT-SLOT-DEFINITION-CLASS for each
         // direct slot. A non-standard return class becomes the slot's MetaClass and its
-        // Lisp-level slots are initialized from the slot's options (#264).
+        // Lisp-level slots are initialized from the slot's options.
         if (metaclass != null)
             ApplyDirectSlotDefinitionClass(cls);
         // Skip finalization if any superclass is forward-referenced
@@ -361,7 +390,7 @@ public static partial class Runtime
 
     /// <summary>Attach the canonical slot-option plist (a Lisp list :key val ...) captured
     /// from a DEFCLASS slot specifier under a custom metaclass. Returns the slotd so the
-    /// DEFCLASS expansion can wrap %make-slot-def transparently (#264).</summary>
+    /// DEFCLASS expansion can wrap %make-slot-def transparently.</summary>
     public static LispObject SetSlotDefRawOptions(LispObject slotdObj, LispObject options)
     {
         if (slotdObj is SlotDefinition sd)
@@ -372,7 +401,7 @@ public static partial class Runtime
     /// <summary>AMOP DIRECT-SLOT-DEFINITION-CLASS protocol: for each direct slot of a class
     /// with a custom metaclass, ask the GF which class the direct slot definition should be.
     /// A non-standard answer becomes the slot's MetaClass and its extra Lisp slots are
-    /// initialized from the slot's options (#264).</summary>
+    /// initialized from the slot's options.</summary>
     private static void ApplyDirectSlotDefinitionClass(LispClass cls)
     {
         if (Startup.Sym("DIRECT-SLOT-DEFINITION-CLASS").Function is not LispFunction gf)
@@ -404,7 +433,7 @@ public static partial class Runtime
     /// For each effective slot of <paramref name="metaClass"/>, take the value from a matching
     /// initarg in <paramref name="optionsPlist"/> if provided, otherwise evaluate its initform.
     /// Used for both direct (options from the slot spec) and effective (options empty, initforms
-    /// only — e.g. McCLIM's DYNAMIC slot reads a dynamically-bound special) slot defs (#264).</summary>
+    /// only — e.g. McCLIM's DYNAMIC slot reads a dynamically-bound special) slot defs.</summary>
     internal static void InitializeSlotdExtraSlots(SlotDefinition slotd, LispClass metaClass, LispObject? optionsPlist)
     {
         foreach (var es in metaClass.EffectiveSlots)
@@ -473,7 +502,7 @@ public static partial class Runtime
             return EnsureDotNetTypeClass(dn.Type);
         // Slot-definition metaobject with a customized class (direct-/effective-
         // slot-definition-class). Falls through to the name-based default below
-        // when MetaClass is null (#264).
+        // when MetaClass is null.
         if (obj is SlotDefinition sdmc && sdmc.MetaClass != null)
             return sdmc.MetaClass;
         // LispClass objects: return their metaclass
@@ -560,7 +589,7 @@ public static partial class Runtime
 
     /// <summary>Allocate an instance through the ALLOCATE-INSTANCE GF so user overrides
     /// for a custom metaclass run (e.g. McCLIM seeds dynamic slots with their dvars).
-    /// Falls back to a raw instance if the GF is missing or returns a non-instance (#264).</summary>
+    /// Falls back to a raw instance if the GF is missing or returns a non-instance.</summary>
     private static LispInstance AllocateViaGF(LispClass cls, LispObject[] initargs)
     {
         if (Startup.Sym("ALLOCATE-INSTANCE").Function is LispFunction aiFn)
@@ -586,7 +615,7 @@ public static partial class Runtime
             throw new LispErrorException(new LispError($"SLOT-VALUE: no slot named {name} in struct {st.TypeName.Name}"));
         }
         // Slot-definition metaobjects with a custom slot-definition class carry their
-        // extra Lisp slots in ExtraSlots (e.g. McCLIM's DYNAMIC slot) (#264).
+        // extra Lisp slots in ExtraSlots (e.g. McCLIM's DYNAMIC slot).
         if (obj is SlotDefinition slotd)
         {
             if (slotd.ExtraSlots != null && slotd.ExtraSlots.TryGetValue(name, out var sv) && sv != null)
@@ -736,7 +765,7 @@ public static partial class Runtime
 
     /// <summary>Raw slot-boundness check against the instance layout / class-allocation
     /// store, without slot-value-using-class dispatch. Shared by SLOT-BOUNDP and the
-    /// default SLOT-BOUNDP-USING-CLASS method (#264).</summary>
+    /// default SLOT-BOUNDP-USING-CLASS method.</summary>
     internal static bool SlotBoundpDirect(LispInstance inst, int idx, string name)
     {
         if (inst.Class.EffectiveSlots[idx].IsClassAllocation)
@@ -749,7 +778,7 @@ public static partial class Runtime
 
     /// <summary>Raw slot-makunbound against the instance layout / class-allocation store,
     /// without slot-value-using-class dispatch. Shared by SLOT-MAKUNBOUND and the default
-    /// SLOT-MAKUNBOUND-USING-CLASS method (#264).</summary>
+    /// SLOT-MAKUNBOUND-USING-CLASS method.</summary>
     internal static void SlotMakunboundDirect(LispInstance inst, int idx, string name)
     {
         if (inst.Class.EffectiveSlots[idx].IsClassAllocation)
@@ -953,7 +982,7 @@ public static partial class Runtime
         // For a custom metaclass, instance-allocated slot writes must go through
         // (setf slot-value-using-class) so overrides (e.g. McCLIM's dynamic slots, which
         // store into a per-instance dynamic variable seeded by allocate-instance) run
-        // instead of clobbering the raw slot vector (#264).
+        // instead of clobbering the raw slot vector.
         bool customMeta = cls.Metaclass != null;
         LispFunction? setfSvuc = customMeta
             ? Startup.Sym("SLOT-VALUE-USING-CLASS").SetfFunction as LispFunction
@@ -1150,7 +1179,7 @@ public static partial class Runtime
         // Custom metaclass: honor the full ALLOCATE-INSTANCE / SLOT-VALUE-USING-CLASS
         // protocol (e.g. McCLIM's class-with-dynamic-slots). Skip every fast path so the
         // instance is allocated via the GF and slot writes go through SHARED-INITIALIZE,
-        // which routes through (setf slot-value-using-class) for custom metaclasses (#264).
+        // which routes through (setf slot-value-using-class) for custom metaclasses.
         bool customMeta = cls.Metaclass != null;
 
         // Ultra-fast path: bypass GF dispatch for simple classes with no custom methods
@@ -1576,7 +1605,7 @@ public static partial class Runtime
         // the CL package is locked (#93 / D561).
         sym.Function = gf;
         // For (setf accessor) GFs: ALSO install on the target symbol's SetfFunction slot
-        // so that #'(setf accessor) and GetSetfFunctionBySymbol can find it (D699).
+        // so that #'(setf accessor) and GetSetfFunctionBySymbol can find it.
         if (name is Cons c && c.Car is Symbol setfKw && setfKw.Name == "SETF"
             && c.Cdr is Cons c2 && c2.Car is Symbol accessor)
         {
@@ -1616,7 +1645,7 @@ public static partial class Runtime
     {
         if (gfObj is not GenericFunction gf)
             throw new LispErrorException(new LispTypeError("CLEAR-DEFGENERIC-INLINE-METHODS: not a generic function", gfObj));
-        // Copy-on-write removal of defgeneric-inline methods under MethodsLock (#278).
+        // Copy-on-write removal of defgeneric-inline methods under MethodsLock.
         lock (gf.MethodsLock)
         {
             var cur = gf.Methods;
@@ -1708,7 +1737,7 @@ public static partial class Runtime
             gf.KeywordNames = newKeywordNames;
         }
 
-        // Argument precedence order (#268): a permutation of required-parameter
+        // Argument precedence order: a permutation of required-parameter
         // indices. Absent/empty -> null = natural left-to-right order. Reset on
         // every defgeneric re-evaluation.
         int[]? apo = null;
@@ -1726,7 +1755,7 @@ public static partial class Runtime
         gf.ArgumentPrecedenceOrder = apo;
 
         // Store the full lambda-list as written so MOP readers return the actual
-        // parameter names instead of gensym placeholders (#270). Standard GFs
+        // parameter names instead of gensym placeholders. Standard GFs
         // created via %make-gf otherwise have no lambda-list.
         if (args.Length > 8 && args[8] is not Nil)
             gf.StoredLambdaList = args[8];
@@ -1936,7 +1965,7 @@ public static partial class Runtime
         CheckLambdaListCongruence(gf, method);
 
         // Copy-on-write under MethodsLock so a concurrent dispatch always sees a
-        // consistent method array (#278). Replace an existing method with matching
+        // consistent method array. Replace an existing method with matching
         // specializers+qualifiers, else append.
         lock (gf.MethodsLock)
         {
@@ -1982,7 +2011,7 @@ public static partial class Runtime
             throw new LispErrorException(new LispTypeError("REMOVE-METHOD: not a generic function", gfObj));
         if (methodObj is not LispMethod method)
             throw new LispErrorException(new LispTypeError("REMOVE-METHOD: not a method", methodObj));
-        // Copy-on-write removal under MethodsLock (#278).
+        // Copy-on-write removal under MethodsLock.
         lock (gf.MethodsLock)
         {
             var cur = gf.Methods;
@@ -3011,7 +3040,7 @@ public static partial class Runtime
     {
         // More specific = class appears earlier in CPL of the argument's class.
         // Parameters are weighed in the GF's argument-precedence-order (CLHS
-        // 7.6.6.1.2); null = natural left-to-right order (#268). Both methods
+        // 7.6.6.1.2); null = natural left-to-right order. Both methods
         // share the same owner GF, so reading it off `a` is sufficient.
         int n = Math.Min(a.Specializers.Length, b.Specializers.Length);
         int[]? apo = a.Owner?.ArgumentPrecedenceOrder;
@@ -4099,7 +4128,7 @@ public static partial class Runtime
             ((LispMethod)fkDefaultMethod).RequiredCount = 1;
             Runtime.AddMethod(fkGF, fkDefaultMethod);
         }
-        // PRINT-OBJECT as a proper GF with default method on T (D600)
+        // PRINT-OBJECT as a proper GF with default method on T
         {
             var poSym = Startup.Sym("PRINT-OBJECT");
             var poGF = (GenericFunction)Runtime.MakeGF(poSym, new Fixnum(2));

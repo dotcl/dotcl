@@ -1,0 +1,4 @@
+# Build outputs of the PrecompileLisp target (generated from app.lisp / the dev
+# core). Not committed — produced by `dotnet build`.
+/app.fasl
+/dotcl.core

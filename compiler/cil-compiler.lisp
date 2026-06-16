@@ -563,11 +563,26 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
            (let ((mf (macro-function sym)))
              (and mf (lambda (form) (funcall mf form nil)))))))
 
+(defun maybe-expand-compiler-macro (op expr)
+  "If OP names a compiler macro and isn't shadowed by a local function, apply it to
+   the call form EXPR (CLHS 3.2.2.1). Return the expansion, or NIL when there is no
+   compiler macro, it declines (returns the &whole form unchanged), or OP is shadowed.
+   Skipped during cross-compile so we never pick up the host (SBCL) compiler macros."
+  (when (and (not *cross-compiling*)
+             (symbolp op)
+             (not (assoc (symbol-name op) *local-functions* :test #'string=)))
+    (let ((expander (compiler-macro-function op)))
+      (when (functionp expander)
+        ;; Expander takes (whole-form environment). Returning the original form
+        ;; (eq) is the standard way to decline expansion.
+        (let ((expansion (funcall expander expr nil)))
+          (unless (eq expansion expr) expansion))))))
+
 (defun compile-form (expr)
   "Compile a list form (op args...).
    Dispatch: quote fast-path → flet-override check → hash table (O(1), ~250 ops)
    → cons-op cases → string=-based ops → macro expansion → named-call."
-  ;; Guard to catch runaway macro expansion loops (D412). Raised to 500 from
+  ;; Guard to catch runaway macro expansion loops. Raised to 500 from
   ;; the original 200 because legitimate large literal quasiquote forms
   ;; (e.g. cl-durian's 63-entry entity-map alist) can exceed 200 naturally,
   ;; while real infinite expansion loops still trip well before 500.
@@ -599,13 +614,36 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
               (funcall handler expr)
             ;; Fallback: cons-op cases, string=-based ops, macro expansion, named-call
             (cond
+              ;; Direct dispatch for a known-typed dotnet:invoke (typed direct callvirt).
+              ;; (%dotnet-call-direct "Type.FullName" "Method" (param-type-strings...)
+              ;;                      recv-expr arg-expr...)
+              ;; emits unwrap + per-arg marshal + direct callvirt to the resolved
+              ;; overload (no InvokeMember). Dispatched by NAME to avoid cross-package
+              ;; symbol identity fragility for this internal lowering target.
+              ((and (symbolp op) (string= (symbol-name op) "%DOTNET-CALL-DIRECT"))
+               (let ((type (cadr expr)) (method (caddr expr))
+                     (param-types (cadddr expr)) (recv (nth 4 expr)) (args (nthcdr 5 expr)))
+                 (if (null args)
+                     ;; zero-arg fast path: receiver only, no args array
+                     `(,@(compile-for-single-value recv)
+                       (:dotnet-call-direct ,type ,method))
+                     ;; n-arg: stash receiver in a local (so the args array can be
+                     ;; built with an empty stack — CIL try-block safety), build the
+                     ;; args array, reload receiver, then the typed direct call.
+                     (let ((recv-tmp (gen-local "DRCV")))
+                       `((:declare-local ,recv-tmp "LispObject")
+                         ,@(compile-for-single-value recv)
+                         (:stloc ,recv-tmp)
+                         ,@(compile-args-array args)
+                         (:ldloc ,recv-tmp)
+                         (:dotnet-call-direct-n ,type ,method ,@param-types))))))
               ;; (setf name) function call: ((setf foo) args...) → named call
               ((and (consp op) (symbolp (car op)) (string= (symbol-name (car op)) "SETF"))
                (compile-named-call op (cdr expr)))
               ;; ((lambda ...) args) — immediate lambda application
               ;; Store the function to a local before evaluating args so the stack is
               ;; empty during arg evaluation. CIL requires empty stack at try-block entry;
-              ;; loop/return in args would fail if the function is on the stack (D767).
+              ;; loop/return in args would fail if the function is on the stack.
               ((and (consp op) (eq (car op) 'lambda))
                (let ((fn-tmp (gen-local "FN")) (arr-tmp (gen-local "FNARR")))
                  `(,@(compile-expr op)
@@ -702,8 +740,15 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
                       (*at-toplevel* *compile-was-toplevel*))
                  (compile-expr expanded)))
 
-              ;; General function call (user-defined)
-              ((symbolp op) (compile-named-call op (cdr expr)))
+              ;; General function call (user-defined) — apply a compiler macro first
+              ;; (CLHS 3.2.2.1) when one is defined and the operator isn't shadowed by
+              ;; a local function; otherwise compile the call directly.
+              ((symbolp op)
+               (let ((cm-expansion (maybe-expand-compiler-macro op expr)))
+                 (if cm-expansion
+                     (let ((*at-toplevel* *compile-was-toplevel*))
+                       (compile-expr cm-expansion))
+                     (compile-named-call op (cdr expr)))))
 
               (t (error "Cannot compile form: ~s" expr)))))))))
 
@@ -734,7 +779,7 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
 ;;; and nested arithmetic over them is NOT provably safe — it falls back to the
 ;;; boxed promoting path (Runtime.Add/Subtract/Multiply) which yields a bignum on
 ;;; overflow. Tightly-declared operands ((the (integer lo hi) ...)) keep the fast
-;;; unboxed path when their composed range stays in int64 (#271).
+;;; unboxed path when their composed range stays in int64.
 ;;; ============================================================
 
 ;;; int64 bounds, as exact host integers.
@@ -785,11 +830,11 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
 (defun fixnum-leaf-range (expr)
   "Range (lo . hi) for a non-arithmetic fixnum-typed leaf, or NIL if EXPR is not
    such a leaf. Locals / calls / bitwise results take the full fixnum (int64) range;
-   (the (integer lo hi) ...) contributes its declared bounds (#271)."
+   (the (integer lo hi) ...) contributes its declared bounds."
   (cond
     ;; Local with a proven bounded int64 range → its TIGHT range (checked before
     ;; the full-range fixnum/long clauses so a tighter bound wins). This is what
-    ;; lets e.g. (* rmdr 2) on a (signed-byte 56) prove int64-safety (#271).
+    ;; lets e.g. (* rmdr 2) on a (signed-byte 56) prove int64-safety.
     ((small-int-local-range expr))
     ;; Raw int64 local (native body) or declared-fixnum local → full int64 range.
     ((and (symbolp expr)
@@ -837,7 +882,7 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
 (defun expr-int-range (expr)
   "Provable inclusive integer range (lo . hi) for EXPR computed entirely within
    int64, or NIL if unknown or any intermediate +/-/*/1+/1- result could exceed
-   int64. Used to gate the raw unboxed arithmetic path (#271)."
+   int64. Used to gate the raw unboxed arithmetic path."
   (cond
     ((integerp expr) (cons expr expr))
     ((and (consp expr) (= (length expr) 3) (member (car expr) '(+ - *)))
@@ -859,7 +904,7 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
    +/-/*/1+/1- result fits int64; otherwise the caller must use the generic
    promoting path (Runtime.Add/Subtract/Multiply) so overflow yields a bignum.
    (The unsafe raw long path inside #130 native bodies is gated separately by
-   compile-as-long / fixnum-typed-p and is NOT routed through here.) (#271)"
+   compile-as-long / fixnum-typed-p and is NOT routed through here.)"
   (and (expr-int-range expr) t))
 
 (defun fixnum-typed-p (expr)
@@ -871,7 +916,7 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
    themselves fixnum-typed."
   (cond
     ((integerp expr) (and (<= -4611686018427387904 expr 4611686018427387903)))
-    ;; Direct Int64 local in native function body — already long, no unbox needed (#130)
+    ;; Direct Int64 local in native function body — already long, no unbox needed
     ((and (symbolp expr)
           (boundp '*long-locals*)
           *long-locals*
@@ -924,7 +969,7 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
     ;; A non-negative shift can overflow int64 (and a raw CIL shl masks the count
     ;; mod 64), so it is only safe to treat as a raw long when both operands are
     ;; constants and the folded result fits in int64. Negative shifts (right
-    ;; shift) always shrink and stay in range (D1111).
+    ;; shift) always shrink and stay in range.
     ((and (consp expr) (= (length expr) 3)
           (eq (car expr) 'ash)
           (fixnum-typed-p (cadr expr))
@@ -950,7 +995,7 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
   (cond
     ((integerp expr)
      `((:ldc-i8 ,expr)))
-    ;; Direct Int64 local in native body — already long, no unbox (#130)
+    ;; Direct Int64 local in native body — already long, no unbox
     ((and (symbolp expr)
           (boundp '*long-locals*)
           *long-locals*
@@ -958,7 +1003,7 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
           (lookup-local expr))
      `((:ldloc ,(lookup-local expr))))
     ;; Native self-call: long args avoid boxing; InvokeNativeN returns LispObject,
-    ;; so unbox-fixnum extracts the long back for the caller (#130).
+    ;; so unbox-fixnum extracts the long back for the caller.
     ((and (consp expr) (symbolp (car expr))
           (boundp '*native-self-name*) *native-self-name*
           (boundp '*self-fn-local*) *self-fn-local*
@@ -991,7 +1036,7 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
      ;; int64 and falls back to compile-expr+unbox for forms it doesn't know.
      ;; Previously this always took compile-expr+unbox, forcing e.g.
      ;; (the fixnum (1- x)) through a box→Runtime.Decrement→unbox round-trip
-     ;; (a method call) in hot fixnum loops like tak/stak (D1129).
+     ;; (a method call) in hot fixnum loops like tak/stak.
      (compile-as-long (caddr expr)))
     ((and (consp expr) (= (length expr) 3) (member (car expr) '(+ - *)))
      (let ((op (ecase (car expr) (+ :add) (- :sub) (* :mul))))
@@ -1041,8 +1086,8 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
 
 (defun compile-fixnum-binop (args op)
   "Emit native int64 binop, boxing result back to LispObject. All of +/-/*
-   promote to Bignum on int64 overflow via Runtime.{Add,Subtract,Multiply}Fixnum
-   (#154/D917, D1112). A raw native :add/:sub would silently wrap, so even the
+   promote to Bignum on int64 overflow via Runtime.{Add,Subtract,Multiply}Fixnum.
+   A raw native :add/:sub would silently wrap, so even the
    fixnum fast path must go through the promoting (AggressiveInlining) helper."
   (let ((helper (ecase op
                   (:add "Runtime.AddFixnum")
@@ -1073,7 +1118,7 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
     (when (and (fixnum-typed-p x) (integerp n))
       (if (>= n 0)
           ;; Left shift can overflow int64 (and raw CIL shl masks count mod 64),
-          ;; so route through Runtime.AshLeftLong which promotes to Bignum (D1111).
+          ;; so route through Runtime.AshLeftLong which promotes to Bignum.
           `(,@(compile-as-long x)
             (:ldc-i4 ,n)
             (:call "Runtime.AshLeftLong"))
@@ -1099,7 +1144,7 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
       ,@body)))
 
 ;;; ============================================================
-;;; Double-float native arithmetic (D672)
+;;; Double-float native arithmetic
 ;;; Parallel to the fixnum path above, but emits native r8 (IEEE 754
 ;;; double) arithmetic with a final newobj DoubleFloat to box the result.
 ;;; ============================================================
@@ -1187,7 +1232,7 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
       ,@body)))
 
 ;;; ============================================================
-;;; Single-float native arithmetic (D736)
+;;; Single-float native arithmetic
 ;;; Parallel to the double-float path above, but emits native r4 (IEEE 754
 ;;; single) arithmetic with a final conv.r4 + newobj SingleFloat to box.
 ;;; ============================================================
@@ -1279,15 +1324,15 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
     (1 (let ((*in-tail-position* nil)) (compile-expr (first args))))
     (2
      (cond
-       ;; Fast path: both args known double-float → native r8 add (D672)
+       ;; Fast path: both args known double-float → native r8 add
        ((and (double-float-typed-p (first args)) (double-float-typed-p (second args)))
         (compile-double-binop args :add))
-       ;; Fast path: both args known single-float → native r4 add (D736)
+       ;; Fast path: both args known single-float → native r4 add
        ((and (single-float-typed-p (first args)) (single-float-typed-p (second args)))
         (compile-single-binop args :add))
        ;; Fast path: both args known fixnum AND no intermediate int64 overflow
        ;; provable → native int64 add. Otherwise fall to the promoting Runtime.Add
-       ;; so an overflowing result becomes a bignum (#271).
+       ;; so an overflowing result becomes a bignum.
        ((and (fixnum-typed-p (first args)) (fixnum-typed-p (second args))
              (fixnum-arith-unboxed-safe-p (cons '+ args)))
         (compile-fixnum-binop args :add))

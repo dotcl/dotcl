@@ -2,12 +2,16 @@
 
   <PropertyGroup>
     <OutputType>Library</OutputType>
-    <TargetFramework>net10.0</TargetFramework>
+    <!-- net10.0 = full dev runtime (compiler/emitter). net8.0 = embeddable runtime
+         for broader reach incl. AOT (NativeAOT/IL2CPP) and Unity's CoreCLR backend;
+         the FASL emitter (PersistedAssemblyBuilder, .NET 9+) is #if'd out there, so
+         the net8.0 build runs precompiled .fasl but cannot compile-file. -->
+    <TargetFrameworks>net10.0;net8.0</TargetFrameworks>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
 
     <PackageId>DotCL.Runtime</PackageId>
-    <Version>0.1.6</Version>
+    <!-- <Version> comes from runtime/Directory.Build.props (single source of truth). -->
     <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
     <Description>Common Lisp on .NET — embeddable runtime library</Description>
     <Authors>SANO Masatoshi</Authors>

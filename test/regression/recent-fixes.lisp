@@ -24,6 +24,27 @@
     expanded)
   10)
 
+;;; The compiler now AUTO-APPLIES compiler macros during compilation (previously
+;;; they were registered but never consulted). Foundation for type-hinted dispatch.
+(defun %cm-auto-fn (x) (* x 1000))                  ; real function multiplies by 1000
+(define-compiler-macro %cm-auto-fn (x) `(* ,x 2))   ; compiler macro multiplies by 2
+(deftest cm-auto-applied-in-compiled-call
+  (%cm-auto-fn 5)                                    ; compiled call uses the CM -> 10
+  10)
+
+;;; A compiler macro that declines (returns the &whole form) leaves the call intact.
+(defun %cm-decline-fn (x) (+ x 7))
+(define-compiler-macro %cm-decline-fn (&whole form x) (declare (ignore x)) form)
+(deftest cm-decline-keeps-call
+  (%cm-decline-fn 10)                                ; declines -> real function -> 17
+  17)
+
+;;; A local function shadowing the name suppresses the compiler macro (CLHS 3.2.2.1).
+(deftest cm-local-shadow-suppresses
+  (flet ((%cm-auto-fn (x) (- x 1)))
+    (%cm-auto-fn 5))                                 ; flet wins -> 4 (not CM's 10)
+  4)
+
 ;;; D579 — (setf compiler-macro-function)
 (deftest d579-setf-compiler-macro-function
   (progn

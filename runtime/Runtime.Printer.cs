@@ -1110,6 +1110,19 @@ public static partial class Runtime
         _circleTable = null;
     }
 
+    /// <summary>
+    /// Format the content of a Cons that has already been labeled in the circle table
+    /// (state < 0). Bypasses the top-level label-assignment check so we can print
+    /// "#n=CONTENT" after emitting the "#n=" prefix ourselves.
+    /// For non-Cons objects falls back to FormatObject.
+    /// </summary>
+    public static string FormatCircleContent(LispObject obj, bool escape)
+    {
+        if (obj is Cons cons)
+            return FormatCons(cons, escape);
+        return FormatObject(obj, escape);
+    }
+
     /// <summary>Whether circle detection is currently active.</summary>
     public static bool HasCircleTable => _circleTable != null;
 
@@ -2200,6 +2213,13 @@ public static partial class Runtime
             var label = Runtime.PprintCircleCheckList(args[0]);
             return label != null ? (LispObject)new LispString(label) : Nil.Instance;
         }, "%PPRINT-CIRCLE-CHECK", -1));
+        // %PPRINT-FORMAT-CONTENT: format a cons content bypassing circle-table label check
+        // Used by pprint-pop macro to write "#n=CONTENT" after emitting "#n=" prefix
+        Emitter.CilAssembler.RegisterFunction("%PPRINT-FORMAT-CONTENT", new LispFunction(args => {
+            if (args.Length < 1) return new LispString("");
+            bool escape = Runtime.GetPrintEscapePublic();
+            return new LispString(Runtime.FormatCircleContent(args[0], escape));
+        }, "%PPRINT-FORMAT-CONTENT", -1));
         // PPRINT-TAB: requires 3-4 args (kind colnum colinc &optional stream)
         Emitter.CilAssembler.RegisterFunction("PPRINT-TAB", new LispFunction(args => {
             if (args.Length < 3)

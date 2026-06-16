@@ -3,6 +3,44 @@
 User-facing release notes for dotcl. Each section corresponds to a tagged
 release on the public mirror (dotcl/dotcl).
 
+## v0.1.10 — 2026-06-16
+
+### Faster .NET interop calls
+
+`dotnet:invoke` and `dotnet:static` now cache the resolved method per call shape
+(receiver type, member name, argument types), so a hot interop loop pays member
+lookup and overload resolution only once — roughly 4.6x faster on repeated calls.
+COM/IDispatch targets, `params` / by-ref methods, and calls with `nil` arguments
+keep the previous dynamic dispatch, so behavior is unchanged.
+
+### External processes via uiop:run-program
+
+A new `dotcl:launch-process` primitive exposes a streaming child-process handle
+(stdin/stdout/stderr, wait, exit code), and `uiop:run-program` /
+`uiop:launch-program` are implemented on top of it.
+
+### Compiler macros are applied during compilation
+
+Compiler macros defined with `define-compiler-macro` (or via
+`(setf (compiler-macro-function ...) ...)`) are now expanded while compiling call
+forms, per CLHS 3.2.2.1 — previously they were registered but never consulted. A
+macro that declines (returns the original form) or a locally shadowed operator
+leaves the call untouched.
+
+### Correct class identity for same-named .NET types
+
+Two .NET types that share a simple name in different namespaces (e.g.
+`System.Collections.ArrayList` vs. another `ArrayList`) now map to distinct Lisp
+classes, so `class-of`, `typep`, and method dispatch no longer conflate them.
+
+### Embedding (DotCL.Runtime)
+
+The embeddable runtime library gains `DotclHost.ToClr` (convert a Lisp value to a
+.NET object), `DotclHost.Register` (expose a host function to Lisp), and a
+precompiled-only mode that forbids runtime code generation — for hosts where
+dynamic code is unavailable (AOT / IL2CPP-style targets). `DotCL.Runtime` now
+multi-targets `net8.0` in addition to `net10.0`.
+
 ## v0.1.9 — 2026-06-13
 
 ### Performance: native int64 fixnum arithmetic

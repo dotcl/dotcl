@@ -231,7 +231,7 @@ public static partial class Runtime
 
     /// <summary>Resolve a .NET type by full name, searching loaded assemblies.
     /// Falls back to COM ProgID lookup (Windows only) for names like "Excel.Application".</summary>
-    private static Type ResolveDotNetType(string typeName)
+    internal static Type ResolveDotNetType(string typeName)
     {
         var type = Type.GetType(typeName);
         if (type != null) return type;
@@ -283,7 +283,7 @@ public static partial class Runtime
     /// <summary>Best-fit conversion when target parameter type is unknown
     /// (InvokeMember path). Default Binder picks the overload from these
     /// runtime types.</summary>
-    private static object? LispToDotNetGeneric(LispObject arg)
+    internal static object? LispToDotNetGeneric(LispObject arg)
     {
         return arg switch
         {
@@ -337,6 +337,127 @@ public static partial class Runtime
         | System.Reflection.BindingFlags.Static
         | System.Reflection.BindingFlags.SetProperty
         | System.Reflection.BindingFlags.SetField;
+
+    // ── dotnet:invoke / dotnet:static method-resolution cache ────────────────────
+    // Type.InvokeMember re-runs member-name lookup + default-Binder overload
+    // resolution on every call. Cache the resolved MethodInfo keyed by (runtime
+    // type OBJECT, member name, arg runtime types) — exactly the inputs the binder
+    // uses — so a hot interop loop pays resolution only once and then goes straight
+    // to MethodInfo.Invoke (which .NET 8+ backs with a cached fast invoker stub).
+    // Pure reflection, no Reflection.Emit, so the fast path is AOT/IL2CPP-safe.
+    //
+    // Only plain fixed-arity method calls are cached. COM/IDispatch targets (one
+    // shared __ComObject type, per-object member set), params / by-ref methods,
+    // generic definitions, null args, and property/field access all fall through to
+    // the unchanged InvokeMember path — the cache can never alter overload
+    // resolution, COM dispatch, or the #24 optional-argument fallback.
+    //
+    // Keying on the Type OBJECT (not its name) makes class redefinition safe: a
+    // redefined type is a new object = a new key, so old entries are never served.
+    // A RuntimeType's member set is otherwise immutable, so entries don't go stale
+    // (the one runtime-mutation path, Hot Reload via MetadataUpdater.ApplyUpdate, is
+    // dev-only; wire a MetadataUpdateHandler to flush this if it ever matters).
+    private readonly struct InvokeKey : IEquatable<InvokeKey>
+    {
+        public readonly Type Owner;
+        public readonly string Name;
+        public readonly Type[] ArgTypes;
+        public InvokeKey(Type owner, string name, Type[] argTypes)
+        { Owner = owner; Name = name; ArgTypes = argTypes; }
+
+        public bool Equals(InvokeKey o)
+        {
+            if (!ReferenceEquals(Owner, o.Owner) || Name != o.Name
+                || ArgTypes.Length != o.ArgTypes.Length) return false;
+            for (int i = 0; i < ArgTypes.Length; i++)
+                if (!ReferenceEquals(ArgTypes[i], o.ArgTypes[i])) return false;
+            return true;
+        }
+        public override bool Equals(object? o) => o is InvokeKey k && Equals(k);
+        public override int GetHashCode()
+        {
+            var h = new HashCode();
+            h.Add(Owner);
+            h.Add(Name);
+            for (int i = 0; i < ArgTypes.Length; i++) h.Add(ArgTypes[i]);
+            return h.ToHashCode();
+        }
+    }
+
+    // null value = "this signature is not cacheable; always use InvokeMember".
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<InvokeKey, System.Reflection.MethodInfo?>
+        _invokeMethodCache = new();
+
+    /// <summary>Fast path for dotnet:invoke / dotnet:static plain method calls:
+    /// resolve the MethodInfo once (cached) then invoke it directly, skipping
+    /// InvokeMember's per-call name lookup and overload resolution. Returns false
+    /// (caller falls back to InvokeMember) for anything not safe to cache. A
+    /// TargetInvocationException from the invoked method propagates unchanged so the
+    /// caller's existing handler wraps it identically.</summary>
+    private static bool TryCachedInvoke(
+        Type type, string name, object? target, object?[] callArgs, bool isStatic, out object? result)
+    {
+        result = null;
+
+        // COM IDispatch: every __ComObject shares one Type but resolves members
+        // per-object. Caching by Type would serve another object's dispatch.
+        if (type.IsCOMObject) return false;
+
+        // A null arg has no runtime type → can't key it or overload-resolve it; let
+        // InvokeMember's binder handle null matching.
+        var argTypes = new Type[callArgs.Length];
+        for (int i = 0; i < callArgs.Length; i++)
+        {
+            if (callArgs[i] is null) return false;
+            argTypes[i] = callArgs[i]!.GetType();
+        }
+
+        var key = new InvokeKey(type, name, argTypes);
+        if (!_invokeMethodCache.TryGetValue(key, out var method))
+        {
+            method = ResolveCacheableMethod(type, name, argTypes, isStatic);
+            _invokeMethodCache[key] = method;
+        }
+        if (method is null) return false;
+
+        result = method.Invoke(target, callArgs);
+        return true;
+    }
+
+    /// <summary>Pick the method InvokeMember's default binder would select, but only
+    /// when it is a plain fixed-arity method (no params / by-ref params, not a
+    /// generic definition). Returns null otherwise so the caller keeps the
+    /// InvokeMember path (which also handles property/field access and #24 optional
+    /// defaults).</summary>
+    private static System.Reflection.MethodInfo? ResolveCacheableMethod(
+        Type type, string name, Type[] argTypes, bool isStatic)
+    {
+        var flags = System.Reflection.BindingFlags.Public
+            | (isStatic ? System.Reflection.BindingFlags.Static : System.Reflection.BindingFlags.Instance);
+
+        System.Collections.Generic.List<System.Reflection.MethodBase>? candidates = null;
+        foreach (var m in type.GetMethods(flags))
+        {
+            if (m.Name != name || m.IsGenericMethodDefinition) continue;
+            var ps = m.GetParameters();
+            if (ps.Length != argTypes.Length) continue;          // omitted optionals -> InvokeMember
+            bool ok = true;
+            foreach (var p in ps)
+                if (p.ParameterType.IsByRef
+                    || System.Attribute.IsDefined(p, typeof(ParamArrayAttribute)))
+                { ok = false; break; }                            // ref/out and params -> InvokeMember
+            if (!ok) continue;
+            (candidates ??= new System.Collections.Generic.List<System.Reflection.MethodBase>()).Add(m);
+        }
+        if (candidates is null) return null;
+
+        try
+        {
+            return (System.Reflection.MethodInfo?)Type.DefaultBinder.SelectMethod(
+                flags, candidates.ToArray(), argTypes, null);
+        }
+        catch (System.Reflection.AmbiguousMatchException) { return null; }
+    }
 
     /// <summary>Fallback for dotnet:invoke / dotnet:static when InvokeMember finds no
     /// matching overload: locate a method NAME whose first parameters take the supplied
@@ -399,6 +520,8 @@ public static partial class Runtime
 
         try
         {
+            if (TryCachedInvoke(type, memberName, null, callArgs, true, out var cached))
+                return DotNetToLisp(cached);
             var result = type.InvokeMember(memberName, StaticReadFlags, null, null, callArgs);
             return DotNetToLisp(result);
         }
@@ -480,6 +603,8 @@ public static partial class Runtime
 
         try
         {
+            if (TryCachedInvoke(type, memberName, target, callArgs, false, out var cached))
+                return DotNetToLisp(cached);
             var result = type.InvokeMember(memberName, InstanceReadFlags, null, target, callArgs);
             return DotNetToLisp(result);
         }
@@ -572,8 +697,8 @@ public static partial class Runtime
     }
 
     /// <summary>(dotnet:%define-class "Full.Name" &optional "Base.Type" field-specs attr-specs method-specs ctor-body property-specs interface-specs event-specs)
-    /// Emit a named public class. Shapes: D773 (fields), D774 (attrs),
-    /// D776 (methods), D783 (ctor-body: 1-arg Lisp fn called after base.ctor),
+    /// Emit a named public class. Shapes: D773 (fields) (attrs),
+    /// D776 (methods) (ctor-body: 1-arg Lisp fn called after base.ctor),
     /// D785 (property-specs: list of ("Name" "TypeName") for auto-properties).
     /// D786 — method-spec accepts optional 5th element override-flag; when truthy,
     /// the method is emitted as an override of a matching base virtual method.
@@ -1111,7 +1236,7 @@ public static partial class Runtime
         return new LispBidirectionalStream(reader, writer);
     }
 
-    // --- Delegate marshal (#188) ---
+    // --- Delegate marshal ---
 
     /// <summary>
     /// <lispdoc>(dotnet:make-delegate type-name function) -- Wrap a Lisp function as a .NET delegate. type-name is e.g. "System.Func`2[System.String,System.Boolean]". The delegate can be passed to any .NET method expecting that delegate type. LispFunction arguments are auto-converted via dotnet:call when the target parameter type is a delegate.</lispdoc>

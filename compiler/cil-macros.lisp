@@ -4001,13 +4001,15 @@
                                                                    (list 'write-string "..." ',actual-stream)
                                                                    '(return))
                                                              (list 'setf ',count-var (list '+ ',count-var 1))
-                                                             ;; Circle check: if list-var is a cons back-reference, print ". #n#" and stop
+                                                             ;; Circle check: back-ref (#n#) or forward-ref (#n=) → print ". #n#" or ". #n=CONTENT"
                                                              (list 'let (list (list '.cdr-circle. (list '%pprint-circle-check ',list-var)))
                                                                (list 'when (list 'and (list 'stringp '.cdr-circle.)
-                                                                                      (list '> (list 'length '.cdr-circle.) 0)
-                                                                                      (list 'char= (list 'char '.cdr-circle. (list '1- (list 'length '.cdr-circle.))) '#\#))
+                                                                                      (list '> (list 'length '.cdr-circle.) 0))
                                                                      (list 'write-string ". " ',actual-stream)
                                                                      (list 'write-string '.cdr-circle. ',actual-stream)
+                                                                     ;; forward-ref: also write the cons content after the "#n=" prefix
+                                                                     (list 'when (list 'char= (list 'char '.cdr-circle. (list '1- (list 'length '.cdr-circle.))) '#\=)
+                                                                           (list 'write-string (list '%pprint-format-content ',list-var) ',actual-stream))
                                                                      (list 'setf ',list-var nil)
                                                                      '(return)))
                                                              (list 'cond

@@ -9,7 +9,9 @@ namespace DotCL.Emitter;
 /// </summary>
 public class FaslAssembler
 {
+#if NET9_0_OR_GREATER
     private readonly PersistedAssemblyBuilder _ab;
+#endif
     private readonly ModuleBuilder _mb;
     private readonly TypeBuilder _tb;
     private readonly ILGenerator _initIl;
@@ -95,6 +97,11 @@ public class FaslAssembler
 
     public FaslAssembler(string moduleName)
     {
+#if !NET9_0_OR_GREATER
+        throw new PlatformNotSupportedException(
+            "FASL emission (compile-file) requires .NET 9+ (PersistedAssemblyBuilder); " +
+            "this runtime build runs precompiled .fasl only");
+#else
         _ab = new PersistedAssemblyBuilder(
             new AssemblyName(moduleName), typeof(object).Assembly);
         _mb = _ab.DefineDynamicModule(moduleName);
@@ -110,6 +117,7 @@ public class FaslAssembler
         // Wire TypeBuilder + init ILGenerator so CilAssembler can deduplicate uninterned symbols.
         _structInternMap.UninternedTypeBuilder = _tb;
         _structInternMap.UninternedInitIl = _initIl;
+#endif
     }
 
     /// <summary>Expose the TypeBuilder for CilAssembler FASL-mode branches that need to define methods.</summary>
@@ -702,6 +710,10 @@ public class FaslAssembler
     /// <summary>Write the assembled .fasl to the given output path</summary>
     public void Save(string outputPath)
     {
+#if !NET9_0_OR_GREATER
+        throw new PlatformNotSupportedException(
+            "FASL emission (compile-file) requires .NET 9+; this runtime build runs precompiled .fasl only");
+#else
         // return Nil.Instance
         _initIl.Emit(OpCodes.Ldsfld,
             typeof(Nil).GetField("Instance")!);
@@ -718,6 +730,7 @@ public class FaslAssembler
             Console.Error.WriteLine($"[FaslAssembler] Unique string bytes tracked: {_structInternMap.UniqueStringBytes:N0}");
             throw;
         }
+#endif
     }
 
     internal static string SanitizeName(string name)

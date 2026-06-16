@@ -1,5 +1,9 @@
 DOTCL_ROOT := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
-DOTCL_LISP ?= ros run
+# Cross-compile host. Pin SBCL via Roswell so the build doesn't silently use
+# whatever `ros` default the user happens to have (installing another impl, e.g.
+# ABCL, flips the default and breaks cross-compile, dotcl/dotcl #35). Still
+# overridable, e.g. `DOTCL_LISP=dotcl make cross-compile` to self-host.
+DOTCL_LISP ?= ros -L sbcl-bin run
 INPUT ?= test/test1.lisp
 STDBUF ?=
 SETSID ?= $(shell which setsid 2>/dev/null)
@@ -246,7 +250,7 @@ bench-state: setup-cl-bench
 	@EVAL_ARGS=""; \
 	if [ -n "$(SUITE)" ]; then EVAL_ARGS="--eval '(setq *bench-suite* :$(SUITE))'"; fi; \
 	if [ -n "$(BENCH)" ]; then EVAL_ARGS="$$EVAL_ARGS --eval '(setq *bench-name* \"$(BENCH)\")'"; fi; \
-	eval timeout $(BENCH_TIMEOUT) ros run $$EVAL_ARGS --load $(DOTCL_ROOT)bench/run.lisp --eval "'(quit)'" 2>/tmp/bench-sbcl.txt; \
+	eval timeout $(BENCH_TIMEOUT) $(SBCL_RUN) $$EVAL_ARGS --load $(DOTCL_ROOT)bench/run.lisp --eval "'(quit)'" 2>/tmp/bench-sbcl.txt; \
 	rc=$$?; if [ $$rc -eq 124 ]; then echo ";; SBCL TIMEOUT after $(BENCH_TIMEOUT)s"; fi
 	@$(DOTCL_ROOT)bench/make-state.sh /tmp/bench-dotcl.txt /tmp/bench-sbcl.txt $(DOTCL_ROOT)bench-state.json > /tmp/bench-state-new.json && mv /tmp/bench-state-new.json $(DOTCL_ROOT)bench-state.json
 	@echo "Updated bench-state.json"
@@ -260,7 +264,9 @@ bench-state: setup-cl-bench
 RUNS ?= 5
 WARMUP ?= 1
 PYTHON ?= python3
-SBCL_RUN ?= ros run
+# Pin SBCL (see DOTCL_LISP note) so the bench "sbcl" column is really SBCL and
+# not whatever the Roswell default happens to be (#35).
+SBCL_RUN ?= ros -L sbcl-bin run
 bench-survey: setup-cl-bench
 	@echo "=== Survey dotcl (runs=$(RUNS) warmup=$(WARMUP)) ==="
 	@EVAL_ARGS="--eval '(setq *bench-runs* $(RUNS))' --eval '(setq *bench-warmup* $(WARMUP))'"; \

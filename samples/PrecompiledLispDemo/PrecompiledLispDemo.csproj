@@ -1,0 +1,33 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <!-- The whole point of this sample: it embeds dotcl and runs precompiled
+         Lisp with no runtime code generation (PrecompiledOnly). -->
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\runtime\DotCL.Runtime.csproj" />
+  </ItemGroup>
+
+  <!-- Build step: precompile app.lisp -> app.fasl using the dotcl compiler
+       (the compiler uses Reflection.Emit; that is the dev/build side). The
+       shipped app only loads the resulting .fasl. Incremental via Inputs/Outputs. -->
+  <Target Name="PrecompileLisp" BeforeTargets="Build"
+          Inputs="app.lisp;precompile.lisp;..\..\compiler\cil-out.sil"
+          Outputs="app.fasl;dotcl.core">
+    <Exec WorkingDirectory="$(MSBuildProjectDirectory)"
+          Command="dotnet run --project &quot;$(MSBuildProjectDirectory)\..\..\runtime\runtime.csproj&quot; -- --asm &quot;$(MSBuildProjectDirectory)\..\..\compiler\cil-out.sil&quot; precompile.lisp" />
+  </Target>
+
+  <!-- Ship app.fasl and the FASL core next to the executable (both load emit-less). -->
+  <Target Name="CopyLispArtifacts" AfterTargets="Build" DependsOnTargets="PrecompileLisp">
+    <Copy SourceFiles="$(MSBuildProjectDirectory)\app.fasl;$(MSBuildProjectDirectory)\dotcl.core"
+          DestinationFolder="$(OutDir)"
+          SkipUnchangedFiles="true" />
+  </Target>
+
+</Project>

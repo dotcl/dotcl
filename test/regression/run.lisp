@@ -16,9 +16,13 @@
 (load "test/regression/net-class.lisp")
 (load "test/regression/delegate-marshal.lisp")
 (load "test/regression/call-out.lisp")
+(load "test/regression/dotnet-invoke-cache.lisp")
+(load "test/regression/dotnet-type-collision.lisp")
+(load "test/regression/dotnet-direct-dispatch.lisp")
 (load "test/regression/static-generic.lisp")
 (load "test/regression/native-int-arith.lisp")
 (load "test/regression/process.lisp")
+(load "test/regression/precompiled-only.lisp")
 
 (do-tests-summary)
 (if (= *fail-count* 0)

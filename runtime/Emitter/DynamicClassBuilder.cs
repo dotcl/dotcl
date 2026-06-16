@@ -87,6 +87,7 @@ public static class DynamicClassBuilder
         IReadOnlyList<int>? baseCtorArgIndices = null,
         IReadOnlyList<CtorSpec>? ctorSpecs = null)
     {
+        CilAssembler.EnsureEmitAllowed("dotnet:define-class");
         if (string.IsNullOrEmpty(fullName))
             throw new ArgumentException("fullName must be non-empty", nameof(fullName));
 

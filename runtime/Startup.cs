@@ -1638,6 +1638,14 @@ public static class Startup
             return Nil.Instance;
         }));
 
+        // precompiled-only toggle: when set, runtime code generation
+        // (eval/compile, define-class, FFI) throws. Mirrors DotclHost.PrecompiledOnly.
+        RegisterDotcl("PRECOMPILED-ONLY", new LispFunction(args => {
+            if (args.Length > 0)
+                Emitter.CilAssembler.PrecompiledOnly = args[0] is not Nil;
+            return Emitter.CilAssembler.PrecompiledOnly ? (LispObject)T.Instance : Nil.Instance;
+        }));
+
         // Threading primitives — public dotcl: API backed by Runtime.Thread.cs.
         // bordeaux-threads impl-dotcl.lisp delegates to these.
         RegisterDotcl("MAKE-THREAD",
