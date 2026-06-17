@@ -1,7 +1,7 @@
 ;;;; Task Scheduler demo for dotcl on Windows
 ;;;;
 ;;;; Drives the Schedule.Service COM API from Lisp via dotnet:invoke /
-;;;; dotnet:new (D741). Registers two tasks — one logon-trigger, one event-
+;;;; dotnet:new. Registers two tasks — one logon-trigger, one event-
 ;;;; trigger reacting to USB plug events — runs the logon one on-demand for
 ;;;; instant audible feedback (SAPI.SpVoice via task-scheduler-payload.lisp),
 ;;;; waits for Enter, then unregisters both.

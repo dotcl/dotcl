@@ -211,9 +211,14 @@ setup-ansi-test:
 	fi
 
 setup-asdf:
+	@# dotcl-0.1.11 is the compat-generation bundle branch: it pairs with the
+	@# launch-process keyword API and the run-time os-cond / single-FASL
+	@# work. Updated in place going forward; a new dotcl-X.Y.Z branch is cut
+	@# only on the next hard #+dotcl incompatibility. The old `dotcl` branch stays
+	@# frozen so pre-0.1.11 source builds keep cloning a matching asdf.
 	@if [ ! -d $(DOTCL_ROOT)asdf ]; then \
 		echo "Cloning asdf..."; \
-		git clone --branch dotcl https://github.com/dotcl/asdf.git $(DOTCL_ROOT)asdf; \
+		git clone --branch dotcl-0.1.11 https://github.com/dotcl/asdf.git $(DOTCL_ROOT)asdf; \
 	else \
 		echo "asdf/ already exists"; \
 	fi
@@ -304,42 +309,19 @@ publish:
 
 # Compile contrib/asdf/asdf.lisp → asdf.fasl (.NET IL assembly) with dotcl
 # itself. .fasl is the shipped artifact (fastest load); .sil and .lisp are
-# not distributed. All 3 are gitignored. D675 (was D673: .sil shipping).
+# not distributed. All 3 are gitignored.
 $(DOTCL_ROOT)contrib/asdf/asdf.fasl: $(DOTCL_ROOT)compiler/cil-out.sil $(DOTCL_ROOT)contrib/asdf/asdf.lisp
 	dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --asm $(DOTCL_ROOT)compiler/cil-out.sil --eval '(compile-file "$(DOTCL_ROOT)contrib/asdf/asdf.lisp")'
 
 compile-asdf-fasl: setup-asdf $(DOTCL_ROOT)contrib/asdf/asdf.fasl
 
-# Per-OS asdf fasls: compile asdf.lisp with target-features for each platform.
-# These land in contrib/asdf/runtimes/{os}/asdf.fasl and are loaded by
-# module-provide-contrib in preference to the generic asdf.fasl.
-ASDF_TARGET_LINUX := (quote (:cl :common-lisp :dotcl :unix :linux :x86-64 :64-bit :little-endian :package-local-nicknames :unicode :thread-support))
-ASDF_TARGET_WIN   := (quote (:cl :common-lisp :dotcl :windows :win32 :x86-64 :64-bit :little-endian :package-local-nicknames :unicode :thread-support))
-ASDF_TARGET_OSX   := (quote (:cl :common-lisp :dotcl :unix :macos :darwin :bsd :x86-64 :64-bit :little-endian :package-local-nicknames :unicode :thread-support))
-
-$(DOTCL_ROOT)contrib/asdf/runtimes/linux/asdf.fasl: setup-asdf $(DOTCL_ROOT)compiler/cil-out.sil
-	mkdir -p $(DOTCL_ROOT)contrib/asdf/runtimes/linux
-	dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --asm $(DOTCL_ROOT)compiler/cil-out.sil \
-	  --eval '(compile-file "$(DOTCL_ROOT)contrib/asdf/asdf.lisp" :output-file "$(DOTCL_ROOT)contrib/asdf/runtimes/linux/asdf.fasl" :target-features $(ASDF_TARGET_LINUX))'
-
-$(DOTCL_ROOT)contrib/asdf/runtimes/win/asdf.fasl: setup-asdf $(DOTCL_ROOT)compiler/cil-out.sil
-	mkdir -p $(DOTCL_ROOT)contrib/asdf/runtimes/win
-	LOCALAPPDATA=/tmp/dotcl-cross-win APPDATA=/tmp/dotcl-cross-win \
-	dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --asm $(DOTCL_ROOT)compiler/cil-out.sil \
-	  --eval '(compile-file "$(DOTCL_ROOT)contrib/asdf/asdf.lisp" :output-file "$(DOTCL_ROOT)contrib/asdf/runtimes/win/asdf.fasl" :target-features $(ASDF_TARGET_WIN))'
-
-$(DOTCL_ROOT)contrib/asdf/runtimes/osx/asdf.fasl: setup-asdf $(DOTCL_ROOT)compiler/cil-out.sil
-	mkdir -p $(DOTCL_ROOT)contrib/asdf/runtimes/osx
-	dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --asm $(DOTCL_ROOT)compiler/cil-out.sil \
-	  --eval '(compile-file "$(DOTCL_ROOT)contrib/asdf/asdf.lisp" :output-file "$(DOTCL_ROOT)contrib/asdf/runtimes/osx/asdf.fasl" :target-features $(ASDF_TARGET_OSX))'
-
-compile-asdf-fasls: \
-  $(DOTCL_ROOT)contrib/asdf/runtimes/linux/asdf.fasl \
-  $(DOTCL_ROOT)contrib/asdf/runtimes/win/asdf.fasl \
-  $(DOTCL_ROOT)contrib/asdf/runtimes/osx/asdf.fasl
+# Per-OS asdf fasls retired: a single OS-agnostic asdf.fasl is shipped.
+# The .NET IL is portable and all OS-divergent behavior is resolved at run time
+# (os-cond is runtime for dotcl), so target-features-per-OS baking is unnecessary.
+compile-asdf-fasls: compile-asdf-fasl
 
 # Pre-build IL fasls for every contrib that ships a .asd. Project-core
-# builds (#166) consume these as ready artifacts instead of recompiling
+# builds consume these as ready artifacts instead of recompiling
 # contrib source per project. Pattern rule matches contrib/<name>/<name>.lisp
 # → contrib/<name>/<name>.fasl. asdf is handled separately above.
 # CONTRIB_NAMES is auto-detected from contrib/*/ subdirs so that public
@@ -364,7 +346,7 @@ compile-contrib-fasls: $(CONTRIB_FASLS)
 # Convert cil-out.sil → dotcl.core (PE assembly, FASL format) via
 # dotcl:sil-to-fasl. The resulting .fasl loads in ~0.3s vs ~1.0s for .sil
 # because Reader parse (~1.1s) + CIL assemble (~170ms) are both skipped.
-# Ships in the pack as the default core. (D677)
+# Ships in the pack as the default core.
 $(DOTCL_ROOT)compiler/dotcl.core: $(DOTCL_ROOT)compiler/cil-out.sil $(DOTCL_ROOT)runtime/Generated/UnicodeCharNames.g.cs
 	dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --asm $(DOTCL_ROOT)compiler/cil-out.sil --eval '(dotcl:sil-to-fasl "$(DOTCL_ROOT)compiler/cil-out.sil" "$(DOTCL_ROOT)compiler/dotcl.core")'
 
@@ -372,9 +354,9 @@ compile-core-fasl: $(DOTCL_ROOT)compiler/dotcl.core
 
 # R2R-compile dotcl.core / asdf.fasl per RID via crossgen2 cross-compile so
 # each RID nupkg ships pre-native FASLs. Cold RunCore drops from ~3.37s to
-# ~50ms, warm from ~107ms to ~16ms (D704/D705). crossgen2 host tool is
+# ~50ms, warm from ~107ms to ~16ms. crossgen2 host tool is
 # whatever RID the build machine is on; --targetos / --targetarch produce
-# code for any target. (D914 で win-arm64 から全 RID に拡張)
+# code for any target.
 R2R_RIDS := win-x64 win-arm64 linux-x64 linux-arm64 osx-x64 osx-arm64
 
 # Map RID → (targetos, targetarch) for crossgen2 cross-compile flags.
@@ -467,7 +449,7 @@ compile-asdf-fasl-r2r-all: $(addprefix compile-asdf-fasl-r2r-,$(R2R_RIDS))
 # contrib/dotcl-cs/lib/. Invoked during `make pack` so the tool NuGet
 # bundles them under tools/net10.0/any/contrib/dotcl-cs/lib/.
 # Users who never (require "dotcl-cs") never pay for loading these
-# (~9MB of Roslyn). (D686, D903 で cil-from-cs / inline-cs 統合)
+# (~9MB of Roslyn).
 contrib-dotcl-cs:
 	rm -rf $(DOTCL_ROOT)contrib/dotcl-cs/lib $(DOTCL_ROOT)contrib/dotcl-cs/bin $(DOTCL_ROOT)contrib/dotcl-cs/obj
 	dotnet publish $(DOTCL_ROOT)contrib/dotcl-cs/dotcl-cs.csproj -c Release -o $(DOTCL_ROOT)contrib/dotcl-cs/lib/ --self-contained false
@@ -484,7 +466,7 @@ contrib-dotcl-jitdisasm:
 
 # Build NuGet package (requires cross-compile to have been run first).
 # Nuke runtime/contrib first so a contrib directory deleted from source
-# stops shipping in the nupkg (fixes D691: old dotcl-repl/ stayed in the
+# stops shipping in the nupkg (old dotcl-repl/ stayed in the
 # installed tool for at least one release after its source was removed).
 pack: compile-asdf-fasl compile-asdf-fasls compile-core-fasl compile-contrib-fasls contrib-dotcl-cs compile-core-fasl-r2r-all compile-asdf-fasl-r2r-all
 	rm -rf $(DOTCL_ROOT)runtime/contrib
@@ -501,7 +483,7 @@ pack: compile-asdf-fasl compile-asdf-fasls compile-core-fasl compile-contrib-fas
 	# which is at runtime/ top-level, separate from contrib/). Without this the
 	# `<None Include="contrib/**" PackagePath="tools/net10.0/any/contrib/">` glob
 	# packs all 6 R2R fasls into every RID's nupkg, and dotnet publish further
-	# duplicates them under tools/net10.0/<rid>/contrib/. (D922)
+	# duplicates them under tools/net10.0/<rid>/contrib/.
 	rm -f $(DOTCL_ROOT)runtime/contrib/asdf/asdf-r2r-*.fasl
 	rm -rf $(DOTCL_ROOT)runtime/contrib/dotcl-cs/bin $(DOTCL_ROOT)runtime/contrib/dotcl-cs/obj
 	rm -f $(DOTCL_ROOT)runtime/contrib/dotcl-cs/*.csproj $(DOTCL_ROOT)runtime/contrib/dotcl-cs/*.cs

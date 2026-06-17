@@ -86,6 +86,22 @@ class Program
             // else: default behavior — process exits with SIGINT
         };
 
+        // Restore the terminal on exit (Unix). .NET's Console driver switches
+        // the terminal into "application" keypad / cursor-key mode (terminfo
+        // smkx: ESC[?1h ESC=) the first time it reads interactively, but does
+        // not reliably emit the matching reset (rmkx: ESC[?1l ESC>) when the
+        // process exits via Environment.Exit / EOF / signal. The terminal is
+        // then left in application mode, so arrow keys send ESC O A instead of
+        // ESC [ A — this conflicts with rlwrap's readline (garbled / "16R"
+        // cursor-report fragments) and requires `stty sane` after a crash.
+        // We emit the reset ourselves on ProcessExit. Best-effort, TTY only,
+        // opt-out via DOTCL_NO_TTY_RESTORE=1.
+        if (!OperatingSystem.IsWindows() &&
+            Environment.GetEnvironmentVariable("DOTCL_NO_TTY_RESTORE") != "1")
+        {
+            AppDomain.CurrentDomain.ProcessExit += (_, _) => RestoreTerminal();
+        }
+
         // --help / --version: handled before core loading for fast response.
         // Skip for save-application :executable t outputs — those embed a
         // "dotcl.user.fasl" manifest resource and handle their own --help.
@@ -225,7 +241,7 @@ Example:
         bool scriptMode = scriptFile != null;
 
         // Extract --resolve-deps <asd> [--manifest-out <path>] [--root-sources-out <path>]
-        // Used by build tooling (#166): walk the .asd's :depends-on graph,
+        // Used by build tooling: walk the .asd's :depends-on graph,
         // emit one fasl path per line in load order. Optionally also writes
         // the root system's component source files (one per line) to a
         // separate file, used by MSBuild as Inputs for the root compile.
@@ -262,7 +278,7 @@ Example:
 
         // --target-rid <rid>: when set, --resolve-deps prefers
         // <dir>/<name>-r2r-<rid>.fasl over plain <dir>/<name>.fasl. Used by
-        // release pack pipelines that pre-compile per-RID R2R fasls (#170).
+        // release pack pipelines that pre-compile per-RID R2R fasls.
         // Falls back to the IL-only fasl silently if the R2R variant is
         // missing, so dev builds without R2R artifacts keep working.
         string? targetRid = null;
@@ -362,7 +378,7 @@ Example:
         // save-application :executable t output: run the embedded user.fasl
         // then exit. Produced via `dotnet publish /p:DotclUserFasl=...` which
         // bundles the user's compiled .fasl as a manifest resource named
-        // "dotcl.user.fasl" (see runtime.csproj, D679). Skipped for normal
+        // "dotcl.user.fasl" (see runtime.csproj). Skipped for normal
         // runs — the resource is only present in save-application-built exes.
         if (TryRunEmbeddedUserFasl())
             return;
@@ -370,7 +386,7 @@ Example:
         // --resolve-deps <asd> [--manifest-out <p>] [--root-sources-out <p>]:
         // walk the .asd's :depends-on graph and emit one fasl path per line.
         // With --root-sources-out, also write the root system's component
-        // source files. Project-core build tools (#166) invoke this.
+        // source files. Project-core build tools invoke this.
         if (resolveDepsAsd != null)
         {
             try { RunResolveDeps(resolveDepsAsd, resolveDepsManifestOut, resolveDepsRootSourcesOut, targetRid); }
@@ -608,7 +624,7 @@ Example:
                     (name (asdf:component-name sys))
                     ;; If --target-rid is given, prefer the R2R variant
                     ;; <dir>/<name>-r2r-<rid>.fasl when it exists. Falls
-                    ;; back to plain <dir>/<name>.fasl otherwise (#170).
+                    ;; back to plain <dir>/<name>.fasl otherwise.
                     (r2r-fasl {(targetRid == null
                         ? "nil"
                         : $"(concatenate 'string dir name \"-r2r-\" \"{targetRid}\" \".fasl\")")})
@@ -889,6 +905,37 @@ Example:
 
     [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool SetConsoleMode(IntPtr hConsoleHandle, uint dwMode);
+
+    [System.Runtime.InteropServices.DllImport("libc", SetLastError = true)]
+    private static extern int isatty(int fd);
+
+    // Track whether we already restored, so multiple exit paths don't double-write.
+    private static int _terminalRestored;
+
+    /// <summary>
+    /// Emit the terminfo rmkx reset (DECCKM reset ESC[?1l + DECKPNM ESC>) so the
+    /// terminal leaves the "application" keypad / cursor-key mode that .NET's
+    /// Console driver enters on interactive read. Only acts when stdout is a TTY.
+    /// </summary>
+    private static void RestoreTerminal()
+    {
+        if (System.Threading.Interlocked.Exchange(ref _terminalRestored, 1) != 0) return;
+        try
+        {
+            // fd 1 = stdout — the same fd .NET wrote the smkx (ESC[?1h ESC=) to.
+            // Only act when it is a real terminal, so redirected output stays clean.
+            if (isatty(1) != 1) return;
+            // ESC[?1l = normal cursor keys, ESC> = numeric keypad.
+            var reset = new byte[] { 0x1b, (byte)'[', (byte)'?', (byte)'1', (byte)'l', 0x1b, (byte)'>' };
+            using var stdout = Console.OpenStandardOutput();
+            stdout.Write(reset, 0, reset.Length);
+            stdout.Flush();
+        }
+        catch
+        {
+            // Best-effort: ignore if the write fails (closed handle, redirected, etc.).
+        }
+    }
 
     private static void EnableWindowsVtMode()
     {

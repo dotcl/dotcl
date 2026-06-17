@@ -66,7 +66,7 @@ public static partial class Runtime
         return Arithmetic.Subtract(AsNumber(a), Fixnum.Make(1));
     }
 
-    /// <summary>Checked fixnum multiply: returns Fixnum or Bignum. (#154/D917)</summary>
+    /// <summary>Checked fixnum multiply: returns Fixnum or Bignum.</summary>
     public static LispObject MultiplyFixnum(long a, long b)
     {
         long hi = Math.BigMul(a, b, out long lo);
@@ -76,7 +76,7 @@ public static partial class Runtime
     }
 
     /// <summary>
-    /// Add two int64s, promoting to Bignum on signed overflow (D1112). Mirrors
+    /// Add two int64s, promoting to Bignum on signed overflow. Mirrors
     /// MultiplyFixnum so the fixnum fast path for + can't silently wrap. Marked
     /// AggressiveInlining: the JIT inlines the add + overflow branch, keeping the
     /// non-overflowing common case as straight-line code with a cold promote path.
@@ -91,7 +91,7 @@ public static partial class Runtime
         return Fixnum.Make(r);
     }
 
-    /// <summary>Subtract int64s, promoting to Bignum on signed overflow (D1112).</summary>
+    /// <summary>Subtract int64s, promoting to Bignum on signed overflow.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static LispObject SubtractFixnum(long a, long b)
     {

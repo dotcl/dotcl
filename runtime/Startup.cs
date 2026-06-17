@@ -131,6 +131,20 @@ public static class Startup
         if (_initialized) return;
         _initialized = true;
 
+        // Resolve shared-framework assemblies by simple name when the default loader
+        // can't satisfy a strong-name reference. The dotcl runtime is a plain net10.0
+        // app (not a WindowsDesktop app), so WPF's internal references — e.g.
+        // PresentationCore -> "WindowsBase, Version=10.0.0.0" — would otherwise fail
+        // with a version mismatch. Probing Microsoft.WindowsDesktop.App (and the other
+        // shared frameworks) by name lets WPF/WinForms actually be used, not just
+        // loaded. Fires only on resolution failure, so it's a safe fallback.
+        System.Runtime.Loader.AssemblyLoadContext.Default.Resolving += (ctx, name) =>
+        {
+            if (name.Name == null) return null;
+            var dll = Runtime.FindSharedFrameworkDll(name.Name);
+            return dll != null ? ctx.LoadFromAssemblyPath(dll) : null;
+        };
+
         // Create packages
         CL = new Package("COMMON-LISP", "CL");
         CLUser = new Package("COMMON-LISP-USER", "CL-USER");
@@ -891,7 +905,7 @@ public static class Startup
         // Avoids polluting CL or CL-USER. Will be resolved by self-hosting.
         var (sym2, status2) = Internal.FindSymbol(name);
         if (status2 != SymbolStatus.None) { _symCache[name] = sym2; return sym2; }
-        // Cross-package bridge (replaces the old flat _functions table, D683 / #113):
+        // Cross-package bridge (replaces the old flat _functions table):
         // cross-compiled code emits LOAD-SYM with the bare function name even when the
         // defun's home package is e.g. DOTCL.CIL-COMPILER. Check if any package has a
         // symbol by that name with a Function bound, and adopt it. Without this bridge
@@ -910,7 +924,7 @@ public static class Startup
         // later defun/defmethod-direct in another package may register the
         // function on a different symbol, and a subsequent Sym() call needs
         // to re-search the packages to find it. Caching here would pin a
-        // Function-less bogus symbol forever (D683, cache-pollution fix).
+        // Function-less bogus symbol forever (cache-pollution fix).
         var (newSym, _) = Internal.Intern(name);
         return newSym;
     }
@@ -918,7 +932,7 @@ public static class Startup
     /// <summary>
     /// Bridge-free symbol lookup for C# function registration (write path).
     /// Only looks in CL and DOTCL-INTERNAL; never adopts symbols from other packages.
-    /// Prevents RegisterFunction from silently overwriting other packages' Function slots. (#158/D918)
+    /// Prevents RegisterFunction from silently overwriting other packages' Function slots.
     /// </summary>
     internal static Symbol SymForRegistration(string name)
     {
@@ -943,7 +957,7 @@ public static class Startup
             if (status != SymbolStatus.None) { _symInPkgCache[key] = sym; return sym; }
             var (newSym, _) = pkg.Intern(name);
             // Cross-package Function bridge (replaces the old _functions flat
-            // table, D683 / #113 Phase 3): when newly interning into a user
+            // table) Phase 3: when newly interning into a user
             // package (e.g., DOTCL-THREAD), inherit the Function slot from any
             // existing same-named symbol that has one (e.g. DOTCL-INTERNAL's
             // runtime-registered helper). Copy-on-intern only.
@@ -1321,7 +1335,7 @@ public static class Startup
         Runtime.RegisterArithmeticBuiltins();
         Runtime.RegisterIOBuiltins();
         Runtime.RegisterCLOSBuiltins();
-        // DOTCL-MOP package (#144 phase 1: AMOP introspection on top of dotcl CLOS).
+        // DOTCL-MOP package (AMOP introspection on top of dotcl CLOS).
         // MUST run AFTER RegisterCLOSBuiltins — that registers bare-name functions
         // (e.g. GENERIC-FUNCTION-NAME) via Sym() whose cross-package bridge would
         // otherwise find any existing DOTCL-MOP::GENERIC-FUNCTION-NAME with a
@@ -1392,7 +1406,7 @@ public static class Startup
             return new LispString(Runtime.CTypeStats());
         }));
 
-        // Package lock API (#93). *PACKAGE-LOCKS-DISABLED*: when bound to T,
+        // Package lock API. *PACKAGE-LOCKS-DISABLED*: when bound to T,
         // CheckPackageLock becomes a no-op (used by WITHOUT-PACKAGE-LOCKS).
         var disabledSym = SymInPkg("*PACKAGE-LOCKS-DISABLED*", "DOTCL");
         DotclPkg.Export(disabledSym);
@@ -1470,7 +1484,7 @@ public static class Startup
         RegisterDotcl("SAVE-APPLICATION", new LispFunction(
             Runtime.SaveApplication, "SAVE-APPLICATION"));
 
-        // (dotcl-cs lives entirely in contrib/dotcl-cs/ as of D686 / D903 —
+        // (dotcl-cs lives entirely in contrib/dotcl-cs/ —
         // no runtime registration here. IlDisasm.cs stays in runtime as a
         // reusable primitive.)
 
@@ -1571,34 +1585,52 @@ public static class Startup
         // Unlike run-process (collect-all), this exposes the child's stdin/stdout/
         // stderr as live Lisp streams so the full run-program contract (incl. :input and
         // every output spec) can be built on UIOP's slurp-input-stream.
-        // (launch-process exe arg-list &optional directory) -> #<PROCESS>
+        //   (launch-process program arguments
+        //      &key directory input output error
+        //           if-input-does-not-exist if-output-exists if-error-output-exists) -> #<PROCESS>
+        // Each of input/output/error is :stream (default), a pathname (file
+        // redirection), nil (EOF / discard), or t/:inherit (inherit parent handle).
+        // All the file/null plumbing lives in LispProcess.Launch so the UIOP
+        // #+dotcl branch stays small.
         RegisterDotcl("LAUNCH-PROCESS", new LispFunction(args => {
-            var exe = args[0] is LispString es ? es.Value : args[0].ToString();
+            var program = args[0] is LispString es ? es.Value : args[0].ToString();
             var argStrings = new System.Collections.Generic.List<string>();
-            if (args.Length > 1) {
-                var cur = args[1];
-                while (cur is Cons c) {
-                    argStrings.Add(c.Car is LispString ls ? ls.Value : c.Car.ToString());
-                    cur = c.Cdr;
-                }
+            var cur = args.Length > 1 ? args[1] : (LispObject)Nil.Instance;
+            while (cur is Cons c) {
+                argStrings.Add(c.Car is LispString ls ? ls.Value : c.Car.ToString());
+                cur = c.Cdr;
             }
-            var psi = new System.Diagnostics.ProcessStartInfo(exe) {
-                RedirectStandardInput = true,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                UseShellExecute = false,
-                CreateNoWindow = true,
+            LispObject input = Keyword("STREAM"), output = Keyword("STREAM"), error = Keyword("STREAM");
+            LispObject directory = Nil.Instance;
+            LispObject ifInputDne = Keyword("ERROR"),
+                       ifOutputExists = Keyword("SUPERSEDE"),
+                       ifErrorExists = Keyword("SUPERSEDE");
+            // First-wins per target: UIOP's launch-program apply passes the
+            // normalized specs explicitly, then appends the original `keys` plist,
+            // so the same keyword can appear twice — the first (normalized) must win.
+            // Accept upstream's :error/:if-error-exists names and their
+            // :error-output/:if-error-output-exists aliases. :wait, :element-type,
+            // :external-format, :allow-other-keys, :search are tolerated and ignored.
+            bool haveIn = false, haveOut = false, haveErr = false, haveDir = false,
+                 haveIfIn = false, haveIfOut = false, haveIfErr = false;
+            for (int i = 2; i + 1 < args.Length; i += 2) {
+                if (args[i] is not Symbol k) continue;
+                var v = args[i + 1];
+                if (!haveDir && k == Keyword("DIRECTORY")) { directory = v; haveDir = true; }
+                else if (!haveIn && k == Keyword("INPUT")) { input = v; haveIn = true; }
+                else if (!haveOut && k == Keyword("OUTPUT")) { output = v; haveOut = true; }
+                else if (!haveErr && (k == Keyword("ERROR") || k == Keyword("ERROR-OUTPUT"))) { error = v; haveErr = true; }
+                else if (!haveIfIn && k == Keyword("IF-INPUT-DOES-NOT-EXIST")) { ifInputDne = v; haveIfIn = true; }
+                else if (!haveIfOut && k == Keyword("IF-OUTPUT-EXISTS")) { ifOutputExists = v; haveIfOut = true; }
+                else if (!haveIfErr && (k == Keyword("IF-ERROR-EXISTS") || k == Keyword("IF-ERROR-OUTPUT-EXISTS"))) { ifErrorExists = v; haveIfErr = true; }
+            }
+            string? dir = directory switch {
+                LispString ds when ds.Value.Length > 0 => ds.Value,
+                LispPathname dp => dp.ToNamestring(),
+                _ => null
             };
-            foreach (var a in argStrings) psi.ArgumentList.Add(a);
-            if (args.Length > 2 && args[2] is LispString dir && dir.Value.Length > 0)
-                psi.WorkingDirectory = dir.Value;
-            var proc = System.Diagnostics.Process.Start(psi)!;
-            // Wrap stdout/stderr so a tight CL read loop blocks until true EOF
-            // instead of truncating on a transient empty-pipe read.
-            return new LispProcess(proc,
-                new LispOutputStream(proc.StandardInput),
-                new LispInputStream(new ProcessStreamReader(proc.StandardOutput, proc)),
-                new LispInputStream(new ProcessStreamReader(proc.StandardError, proc)));
+            return LispProcess.Launch(program, argStrings, dir, input, output, error,
+                                      ifInputDne, ifOutputExists, ifErrorExists);
         }));
         RegisterDotcl("PROCESS-INPUT", new LispFunction(args =>
             args[0] is LispProcess p ? p.InputStream
@@ -1612,12 +1644,12 @@ public static class Startup
         RegisterDotcl("PROCESS-PID", new LispFunction(args =>
             args[0] is LispProcess p ? (LispObject)new Fixnum(p.Process.Id)
             : throw new LispErrorException(new LispTypeError("PROCESS-PID: not a process", args[0]))));
-        // process-wait: block until exit, return exit code (fixnum).
+        // process-wait: block until exit (and until redirection helpers finish
+        // copying, so file output is fully written), return exit code (fixnum).
         RegisterDotcl("PROCESS-WAIT", new LispFunction(args => {
             if (args[0] is not LispProcess p)
                 throw new LispErrorException(new LispTypeError("PROCESS-WAIT: not a process", args[0]));
-            p.Process.WaitForExit();
-            return new Fixnum(p.Process.ExitCode);
+            return new Fixnum(p.Wait());
         }));
         // process-alive-p: T while running, NIL once exited.
         RegisterDotcl("PROCESS-ALIVE-P", new LispFunction(args =>

@@ -1393,7 +1393,7 @@ public static partial class Runtime
                         else if (kw.Name == "WEAKNESS")
                         {
                             // Accept :value (SBCL extension); other modes
-                            // throw at LispHashTable construction (#147).
+                            // throw at LispHashTable construction.
                             if (args[i + 1] is Symbol ws) weakness = ws.Name;
                             else if (args[i + 1] is Nil) weakness = null;
                         }

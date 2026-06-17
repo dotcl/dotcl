@@ -10,7 +10,7 @@
            #:*cross-compiling* #:*compile-file-mode*))
 
 ;; %INLINE-CS-SPLICED is the dispatch symbol for the dotcl-cs:inline-cs
-;; macro (#122 Phase 2; D903 contrib integration). It needs to be reachable
+;; macro. It needs to be reachable
 ;; via Startup.Sym (which
 ;; checks CL → DOTCL-INTERNAL → cross-package bridge) so that the
 ;; runtime LOAD-SYM resolution and the cross-compiled handler
@@ -903,7 +903,7 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
    the result. Safe only when a static value-range proof shows every intermediate
    +/-/*/1+/1- result fits int64; otherwise the caller must use the generic
    promoting path (Runtime.Add/Subtract/Multiply) so overflow yields a bignum.
-   (The unsafe raw long path inside #130 native bodies is gated separately by
+   (The unsafe raw long path inside native bodies is gated separately by
    compile-as-long / fixnum-typed-p and is NOT routed through here.)"
   (and (expr-int-range expr) t))
 

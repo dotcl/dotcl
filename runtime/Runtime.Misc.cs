@@ -7,7 +7,7 @@ namespace DotCL;
 public static partial class Runtime
 {
     // Compiler macro functions registered via define-compiler-macro.
-    // ConcurrentDictionary for thread-safe concurrent DEFUN/registration (#83).
+    // ConcurrentDictionary for thread-safe concurrent DEFUN/registration.
     private static readonly ConcurrentDictionary<Symbol, LispFunction> _compilerMacroFunctions = new();
     private static readonly ConcurrentDictionary<Symbol, LispFunction> _setfCompilerMacros = new();
 
@@ -281,7 +281,7 @@ public static partial class Runtime
     // doing (require "x") may invoke user code (the provider) while
     // holding the lock, so all other concurrent require/provide calls
     // wait. This is heavy but correct; finer-grained per-module locking
-    // is reserved for a follow-up if contention shows up (#171 Step 3).
+    // is reserved for a follow-up if contention shows up.
     private static readonly object _modulesLock = new();
 
     public static LispObject Provide(LispObject moduleName)
@@ -313,7 +313,7 @@ public static partial class Runtime
 
         // Hold _modulesLock for the entire snapshot/load/republish sequence
         // so concurrent (require "x") calls cannot both fall past the
-        // already-loaded check and invoke the provider twice (#171 Step 3).
+        // already-loaded check and invoke the provider twice.
         lock (_modulesLock)
         {
 
@@ -452,27 +452,12 @@ public static partial class Runtime
         string[] extensions = { ".fasl", ".sil", ".lisp" };
 
         // OS key for per-OS fasl lookup (runtimes/{os}/name.fasl).
-        string osKey = OperatingSystem.IsWindows() ? "win"
-                     : OperatingSystem.IsMacOS()   ? "osx"
-                     : "linux";
-
+        // dotcl ships a single OS-agnostic asdf.fasl: the .NET IL is portable and all
+        // OS-divergent behavior is resolved at run time (os-cond is runtime for dotcl,
+        // and dotcl-reachable read-time #+os-* are impl-gated/invariant), so there is no
+        // per-OS runtimes/{os}/ variant to prefer.
         foreach (var dir in searchDirs)
         {
-            // Per-OS fasl: contrib/name/runtimes/{os}/name.fasl (checked before generic).
-            var osPath = Path.GetFullPath(Path.Combine(dir, name, "runtimes", osKey, name + ".fasl"));
-            if (File.Exists(osPath))
-            {
-                Load(new LispObject[] { new LispString(osPath) });
-                if (name == "asdf")
-                {
-                    RegisterStandardSourceRegistries();
-                    RegisterUserAsdSearchPaths();
-                    PatchUiopWindowsPath();
-                    RegisterContribWithAsdf(searchDirs.ToArray());
-                }
-                return T.Instance;
-            }
-
             foreach (var ext in extensions)
             {
                 // contrib/name/name.ext
@@ -504,7 +489,7 @@ public static partial class Runtime
     /// Push standard QL / Common Lisp source registry locations to
     /// asdf:*central-registry*. Each library subdir under the QL software
     /// dir is registered individually so asdf can resolve :depends-on
-    /// without manual CL_SOURCE_REGISTRY config (#174).
+    /// without manual CL_SOURCE_REGISTRY config.
     /// </summary>
     private static void RegisterStandardSourceRegistries()
     {
@@ -550,29 +535,28 @@ public static partial class Runtime
     private static void PatchUiopWindowsPath()
     {
         if (!OperatingSystem.IsWindows()) return;
+        // ASDF coerces pathname designators through uiop:parse-unix-namestring, which
+        // is UNIX-only and cannot represent a drive letter, so a native Windows path
+        // (backslashes or a C: drive) fails ASDF's absolute-pathname check.
+        // dotcl's own CL parse-namestring already parses native Windows paths
+        // correctly (drive -> device), so on Windows we route native paths through it
+        // (lossless — the drive is preserved) and let genuine unix-style namestrings
+        // fall through to the original. This replaces an earlier lossy version that
+        // stripped the drive (wrong on non-C: drives).
         const string patch = @"
 (let ((orig (fdefinition 'uiop:parse-unix-namestring)))
   (setf (fdefinition 'uiop:parse-unix-namestring)
         (lambda (name &rest keys)
-          (apply orig
-                 (if (and (stringp name)
-                          (>= (length name) 2)
-                          (or (find #\\ name)
-                              (and (alpha-char-p (char name 0))
-                                   (eql (char name 1) #\:))))
-                     (let ((s name))
-                       (when (find #\\ s)
-                         (setf s (substitute #\/ #\\ s)))
-                       (when (and (alpha-char-p (char s 0))
-                                  (eql (char s 1) #\:))
-                         (setf s
-                               (if (and (>= (length s) 3)
-                                        (eql (char s 2) #\/))
-                                   (subseq s 2)
-                                   (concatenate 'string ""/"" (subseq s 2)))))
-                       s)
-                     name)
-                 keys))))";
+          (if (and (stringp name)
+                   (>= (length name) 2)
+                   (or (find #\\ name)
+                       (and (alpha-char-p (char name 0))
+                            (eql (char name 1) #\:))))
+              (let ((pn (parse-namestring name)))
+                (if (getf keys :ensure-directory)
+                    (uiop:ensure-directory-pathname pn)
+                    pn))
+              (apply orig name keys)))))";
         try
         {
             var read = MultipleValues.Primary(
@@ -1423,7 +1407,7 @@ public static partial class Runtime
         // Snapshot Function / SetfFunction state for all symbols. compile-file
         // may evaluate defun / (defun (setf x) ...) at compile-time so that
         // sibling macros can reference the function during the same file
-        // (D847 try-eval), but per ANSI 3.2.3.1 those definitions must NOT
+        // (try-eval), but per ANSI 3.2.3.1 those definitions must NOT
         // leak into the global environment after compile-file returns
         // (otherwise (compile-file foo.lisp) would side-effect (fboundp 'bar)
         // for any defun in foo.lisp — failing pfdietz COMPILE-FILE.* tests).
@@ -1447,7 +1431,7 @@ public static partial class Runtime
         var faslModuleName = Path.GetFileNameWithoutExtension(outputPath)
             + "_" + Guid.NewGuid().ToString("N").Substring(0, 8);
 
-        // Bind *current-module-id* to the FASL's unique module name (D1038).
+        // Bind *current-module-id* to the FASL's unique module name.
         // The load-time-value compiler handler uses this to namespace LTV slot IDs per module,
         // preventing cross-run collisions when FASLs compiled in different sessions share IDs.
         // Use Startup.Sym (not SymInPkg) so we get the same symbol object that cil-out.sil's
@@ -1606,7 +1590,7 @@ public static partial class Runtime
         }
     }
 
-    // --- save-application (#62 MVP) ---
+    // --- save-application (MVP) ---
 
     /// <lispdoc>(dotcl:save-application output-path &amp;key load system toplevel executable r2r no-self-contained target runtime-csproj) -- Bundle Lisp sources into a .fasl or self-contained exe. :system collects ASDF transitive deps; :r2r t enables ReadyToRun ahead-of-time compilation; :no-self-contained t omits the .NET runtime (smaller binary, requires .NET on target); :target :linux-arm64 etc. for cross-platform publish; :runtime-csproj or DOTCL_RUNTIME_CSPROJ env var for installed-tool use.</lispdoc>
     /// <summary>
@@ -1642,7 +1626,7 @@ public static partial class Runtime
     /// </description></item>
     /// </list>
     ///
-    /// State reconstruction note (#119): defvar/defpackage/reader-macros defined in
+    /// State reconstruction note: defvar/defpackage/reader-macros defined in
     /// the compiled sources are re-evaluated as part of the fasl's ModuleInit, so
     /// they are reconstructed naturally. Runtime-only state mutations are not captured.
     /// </summary>
@@ -2160,8 +2144,8 @@ public static partial class Runtime
     /// controllers) do not need to add their own _evalLock.
     /// `lock` is reentrant on the same thread, so Lisp → C# → Lisp
     /// callbacks (e.g. dotnet:funcall, condition handlers) work fine.
-    /// Removing this serialization is tracked by #176; #171 was the
-    /// preparation work to make individual operations race-free.
+    /// Removing this serialization is future work; the preparation to make
+    /// individual operations race-free is already in place.
     /// </summary>
     private static readonly object _evalLock = new();
 
@@ -2191,7 +2175,7 @@ public static partial class Runtime
     private static LispObject EvalCompound(LispObject form)
     {
         // Use eval-specific compile path that preserves MvReturn at tail
-        // so callers can observe multiple values from form (D638, #19).
+        // so callers can observe multiple values from form.
         var instrList = CompileTopLevelEval(form);
         try
         {
@@ -2200,7 +2184,7 @@ public static partial class Runtime
         catch (CatchThrowException cte)
         {
             // If a matching (catch tag ...) exists outside this eval, let the exception
-            // propagate so the outer catch can handle it (D696).
+            // propagate so the outer catch can handle it.
             if (CatchTagStack.HasMatchingCatch(cte.Tag))
                 throw;
             // Unmatched THROW at eval boundary: signal control-error per CL spec
@@ -2738,7 +2722,7 @@ public static partial class Runtime
             }
             else if (cs.Name == "SETF" && c.Cdr is Cons c2 && c2.Car is Symbol setfSym && c2.Cdr is Nil)
             {
-                // sym.SetfFunction is authoritative (D683, #113 Phase 3).
+                // sym.SetfFunction is authoritative.
                 fn = setfSym.SetfFunction as LispFunction;
                 fnName = $"(SETF {setfSym.Name})";
             }
@@ -2985,7 +2969,7 @@ public static partial class Runtime
                 // (setf SYM): install on the ACTUAL target symbol's SetfFunction, not
                 // Startup.Sym(name-string)'s. Compiled call sites resolve (setf sym)
                 // via GetSetfFunctionBySymbol on the source-code symbol (which preserves
-                // package, #274/D1139); installing on a same-named default-package symbol
+                // package); installing on a same-named default-package symbol
                 // would leave those calls hitting the untraced original (TRACE.8).
                 setfTargetSym.SetfFunction = wrapper;
             }
@@ -3219,10 +3203,10 @@ public static partial class Runtime
                         nameSym.SetfFunction = fn;
                         // For uninterned gensyms (no home package) ONLY: ALSO register on the
                         // CL-package canonical symbol so string-based GetFunction("(SETF name)")
-                        // can find it (FDEFINITION.5 / D1001). For interned symbols in other
+                        // can find it (FDEFINITION.5). For interned symbols in other
                         // packages (e.g. acclimation:documentation), DO NOT pollute the CL
                         // canonical symbol — that would overwrite cl:documentation.SetfFunction
-                        // and break unrelated callers (D981 cross-package pollution regression).
+                        // and break unrelated callers (cross-package pollution regression).
                         if (nameSym.HomePackage == null)
                         {
                             var canonSym = Startup.Sym(nameSym.Name);
@@ -3497,7 +3481,7 @@ public static partial class Runtime
                     throw new LispErrorException(new LispTypeError("FBOUNDP: invalid (setf ...) form", obj));
                 if (setfRest.Car is not Symbol setfName)
                     throw new LispErrorException(new LispTypeError("FBOUNDP: second element of (setf ...) must be a symbol", setfRest.Car));
-                // sym.SetfFunction is authoritative (D683, #113 Phase 3).
+                // sym.SetfFunction is authoritative.
                 return setfName.SetfFunction != null ? T.Instance : Nil.Instance;
             }
             Symbol s;
@@ -3726,7 +3710,7 @@ public static partial class Runtime
             var key = (pkg == null || pkg.Name is "COMMON-LISP" or "CL")
                 ? name
                 : $"{pkg.Name}:{name}";
-            // Protect CL macros from foreign package overwrite (D433).
+            // Protect CL macros from foreign package overwrite.
             // If the symbol is a CL symbol and the macro already has an expander registered,
             // skip to preserve host builtins (e.g., DEFSTRUCT) from SBCL cross-compiler overwrite.
             if (pkg?.Name is "COMMON-LISP" or "CL")

@@ -28,10 +28,10 @@ public class LispFunction : LispObject
 
     // Native delegates: (self, long args) → LispObject return.
     // Avoids boxing of ARGUMENTS (the main allocation bottleneck in fixnum recursion).
-    // Return is still LispObject so the body compiles unchanged (#130).
+    // Return is still LispObject so the body compiles unchanged.
     // The leading LispFunction is the function itself, threaded through so a native
     // self-call can reach the receiver from arg0 instead of re-resolving #'NAME from
-    // its symbol on every recursive entry (the old per-call self-fn prelude, D1143).
+    // its symbol on every recursive entry (the old per-call self-fn prelude).
     internal Func<LispFunction, long, LispObject>? _nativeFunc1;
     internal Func<LispFunction, long, long, LispObject>? _nativeFunc2;
     internal Func<LispFunction, long, long, long, LispObject>? _nativeFunc3;
@@ -60,7 +60,7 @@ public class LispFunction : LispObject
     // Lisp-level call stack for debugger backtrace. Each frame keeps the callee
     // name plus its arguments. To preserve the alloc-free push on the hot path,
     // Frame is a struct stored inline in Stack<Frame>'s backing array, with up to
-    // four arguments inline; only 5+ argument calls (rare) reference an array (#251).
+    // four arguments inline; only 5+ argument calls (rare) reference an array.
     internal readonly struct Frame
     {
         public readonly string Name;
@@ -103,7 +103,7 @@ public class LispFunction : LispObject
 
     /// <summary>Backtrace as printed call forms "(NAME arg1 arg2 ...)", innermost
     /// first. Used by the :bt debugger command and DOTCL:PRINT-BACKTRACE. Argument
-    /// rendering happens here (off the call hot path) and is bounded/cycle-safe (#251).</summary>
+    /// rendering happens here (off the call hot path) and is bounded/cycle-safe.</summary>
     internal static string[] GetCallStackForms()
     {
         if (s_callStack is not { Count: > 0 } s) return Array.Empty<string>();
@@ -264,7 +264,7 @@ public class LispFunction : LispObject
         return InvokeSlow(new[] { a, b, c, d, e, f, g, h });
     }
 
-    // Native fixnum invoke: long args avoid boxing, LispObject return is body result (#130)
+    // Native fixnum invoke: long args avoid boxing, LispObject return is body result
     public LispObject InvokeNative1(long a) => _nativeFunc1!(this, a);
     public LispObject InvokeNative2(long a, long b) => _nativeFunc2!(this, a, b);
     public LispObject InvokeNative3(long a, long b, long c) => _nativeFunc3!(this, a, b, c);

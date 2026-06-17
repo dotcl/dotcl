@@ -74,24 +74,153 @@ public sealed class ProcessStreamReader : System.IO.TextReader
 /// Wraps System.Diagnostics.Process and exposes its redirected stdio as Lisp
 /// streams, so UIOP's launch-program/process-info protocol (and thus the full
 /// run-program contract via slurp-input-stream) can be implemented on top of it
-/// instead of the collect-all dotcl:run-process.</summary>
+/// instead of the collect-all dotcl:run-process.
+///
+/// Each of stdin/stdout/stderr is given a redirection spec:
+///   :stream    pipe exposed as a live Lisp stream (PROCESS-INPUT/-OUTPUT/-ERROR)
+///   a pathname redirect to/from that file (a background helper thread copies
+///              file&lt;-&gt;pipe, since .NET's ProcessStartInfo cannot attach a file
+///              handle directly)
+///   nil        no input (stdin gets EOF) / output discarded (drained so a chatty
+///              child never blocks on a full pipe)
+///   t/:inherit inherit the parent's handle (no redirection)
+/// Keeping the file/null plumbing here lets the UIOP #+dotcl launch-program
+/// branch stay a small clause, like the other implementations'.</summary>
 public sealed class LispProcess : LispObject
 {
     public System.Diagnostics.Process Process { get; }
-    /// <summary>Writable stream to the child's stdin (LispOutputStream over StandardInput).</summary>
+    /// <summary>Writable stream to the child's stdin when input is :stream, else NIL.</summary>
     public LispObject InputStream { get; }
-    /// <summary>Readable stream from the child's stdout (LispInputStream over StandardOutput).</summary>
+    /// <summary>Readable stream from the child's stdout when output is :stream, else NIL.</summary>
     public LispObject OutputStream { get; }
-    /// <summary>Readable stream from the child's stderr (LispInputStream over StandardError).</summary>
+    /// <summary>Readable stream from the child's stderr when error is :stream, else NIL.</summary>
     public LispObject ErrorStream { get; }
+    private readonly System.Collections.Generic.List<System.Threading.Thread> _helpers;
 
-    public LispProcess(System.Diagnostics.Process process,
-                       LispObject input, LispObject output, LispObject error)
+    private LispProcess(System.Diagnostics.Process process,
+                        LispObject input, LispObject output, LispObject error,
+                        System.Collections.Generic.List<System.Threading.Thread> helpers)
     {
         Process = process;
         InputStream = input;
         OutputStream = output;
         ErrorStream = error;
+        _helpers = helpers;
+    }
+
+    /// <summary>Block until the child exits AND every redirection helper thread has
+    /// finished copying, so a file output target is fully written before the caller
+    /// reads it back. Returns the exit code.</summary>
+    public int Wait()
+    {
+        Process.WaitForExit();
+        foreach (var h in _helpers) { try { h.Join(); } catch { } }
+        return Process.ExitCode;
+    }
+
+    private static bool IsKw(LispObject o, string name) => o is Symbol s && s == Startup.Keyword(name);
+    private static bool IsInherit(LispObject o) => o is T || IsKw(o, "INHERIT");
+
+    /// <summary>A file redirection target: a namestring or a pathname. UIOP's
+    /// %normalize-io-specifier turns string specs into pathnames, so both arrive here.
+    /// Returns null for non-file specs (:stream, nil, t, a stream).</summary>
+    private static string? FilePath(LispObject spec) =>
+        spec is LispString s ? s.Value :
+        spec is LispPathname p ? p.ToNamestring() : null;
+
+    private static System.Threading.Thread Spawn(string name, System.Action body)
+    {
+        var t = new System.Threading.Thread(() => { try { body(); } catch { /* pipe/file closed */ } })
+        { IsBackground = true, Name = name };
+        t.Start();
+        return t;
+    }
+
+    private static void Copy(System.IO.TextReader r, System.IO.TextWriter w)
+    {
+        var buf = new char[4096];
+        int n;
+        while ((n = r.Read(buf, 0, buf.Length)) > 0) w.Write(buf, 0, n);
+        w.Flush();
+    }
+
+    /// <summary>Spawn PROGRAM with ARGUMENTS, wiring stdin/stdout/stderr per the
+    /// given redirection specs. File dispositions are validated up front so errors
+    /// surface synchronously (before the child runs), as the other implementations rely on.
+    /// NOTE: character streams only — :element-type (unsigned-byte 8) is not yet handled.</summary>
+    public static LispProcess Launch(
+        string program, System.Collections.Generic.List<string> arguments, string? directory,
+        LispObject input, LispObject output, LispObject error,
+        LispObject ifInputDoesNotExist, LispObject ifOutputExists, LispObject ifErrorOutputExists)
+    {
+        if (FilePath(input) is string inPath0) EnsureInputExists(inPath0, ifInputDoesNotExist);
+        if (FilePath(output) is string outPath0) CheckOutputExists(outPath0, ifOutputExists);
+        if (FilePath(error) is string errPath0) CheckOutputExists(errPath0, ifErrorOutputExists);
+
+        var psi = new System.Diagnostics.ProcessStartInfo(program)
+        {
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardInput = !IsInherit(input),
+            RedirectStandardOutput = !IsInherit(output),
+            RedirectStandardError = !IsInherit(error),
+        };
+        foreach (var a in arguments) psi.ArgumentList.Add(a);
+        if (!string.IsNullOrEmpty(directory)) psi.WorkingDirectory = directory;
+
+        var proc = System.Diagnostics.Process.Start(psi)!;
+        var helpers = new System.Collections.Generic.List<System.Threading.Thread>();
+        LispObject inStream = Nil.Instance, outStream = Nil.Instance, errStream = Nil.Instance;
+
+        // --- stdin ---
+        if (IsKw(input, "STREAM"))
+            inStream = new LispOutputStream(proc.StandardInput);
+        else if (FilePath(input) is string inPath)
+            helpers.Add(Spawn("dotcl-feed-stdin", () => {
+                try { using var f = new System.IO.StreamReader(inPath); Copy(f, proc.StandardInput); }
+                finally { try { proc.StandardInput.Close(); } catch { } }
+            }));
+        else if (!IsInherit(input))
+            try { proc.StandardInput.Close(); } catch { }   // nil: child sees EOF
+
+        // --- stdout ---
+        outStream = WireOutput(output, ifOutputExists, "dotcl-drain-stdout",
+                               () => proc.StandardOutput, proc, helpers);
+        // --- stderr ---
+        errStream = WireOutput(error, ifErrorOutputExists, "dotcl-drain-stderr",
+                               () => proc.StandardError, proc, helpers);
+
+        return new LispProcess(proc, inStream, outStream, errStream, helpers);
+    }
+
+    private static LispObject WireOutput(
+        LispObject spec, LispObject ifExists, string threadName,
+        System.Func<System.IO.TextReader> source, System.Diagnostics.Process proc,
+        System.Collections.Generic.List<System.Threading.Thread> helpers)
+    {
+        if (IsKw(spec, "STREAM"))
+            return new LispInputStream(new ProcessStreamReader(source(), proc));
+        if (FilePath(spec) is string path)
+        {
+            var w = new System.IO.StreamWriter(path, append: IsKw(ifExists, "APPEND"));
+            helpers.Add(Spawn(threadName, () => { using (w) Copy(source(), w); }));
+        }
+        else if (!IsInherit(spec))   // nil: drain & discard so a full pipe can't block the child
+            helpers.Add(Spawn(threadName, () => Copy(source(), System.IO.TextWriter.Null)));
+        return Nil.Instance;
+    }
+
+    private static void EnsureInputExists(string path, LispObject ifDoesNotExist)
+    {
+        if (System.IO.File.Exists(path)) return;
+        if (ifDoesNotExist is Nil) return;   // treated as no input
+        throw new LispErrorException(new LispError($"LAUNCH-PROCESS: input file does not exist: {path}"));
+    }
+
+    private static void CheckOutputExists(string path, LispObject ifExists)
+    {
+        if (IsKw(ifExists, "ERROR") && System.IO.File.Exists(path))
+            throw new LispErrorException(new LispError($"LAUNCH-PROCESS: output file already exists: {path}"));
     }
 
     public override string ToString()

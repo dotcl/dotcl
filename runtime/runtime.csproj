@@ -56,12 +56,12 @@
     </Content>
   </ItemGroup>
 
-  <!-- save-application :executable t hook (D679) -->
+  <!-- save-application :executable t hook -->
   <ItemGroup Condition="'$(DotclUserFasl)' != ''">
     <EmbeddedResource Include="$(DotclUserFasl)" LogicalName="dotcl.user.fasl" />
   </ItemGroup>
 
-  <!-- D934: derive InformationalVersion from git describe -->
+  <!-- derive InformationalVersion from git describe -->
   <Target Name="SetGitCommitVersion" BeforeTargets="GetAssemblyVersion;BeforeBuild">
     <Exec Command="git describe --tags --long --abbrev=7 --dirty --match v*"
           ConsoleToMsBuild="true"
@@ -95,7 +95,7 @@
     </PropertyGroup>
   </Target>
 
-  <!-- D704/D705: overwrite IL-only FASLs with R2R versions after publish -->
+  <!-- overwrite IL-only FASLs with R2R versions after publish -->
   <Target Name="ReplaceFaslsWithR2R"
           AfterTargets="Publish"
           Condition="'$(RuntimeIdentifier)' != ''">

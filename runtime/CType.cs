@@ -22,7 +22,7 @@ public class NamedType : CType
     private NamedType(string name) { Name = name; }
     public override string ToSpecifier() => Name;
 
-    // Singleton registry for built-in type names (ConcurrentDictionary for #83).
+    // Singleton registry for built-in type names (ConcurrentDictionary for thread safety).
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, NamedType> _instances = new();
     public static NamedType Get(string name)
     {
@@ -159,7 +159,7 @@ public static class TypeParser
 {
     // Cache: symbol identity → parsed CType. Uses symbol reference equality so that
     // pkg1::FOO and pkg2::FOO (same name, different packages) cache independently.
-    // ConcurrentDictionary for #83. Symbol does not override Equals, so default
+    // ConcurrentDictionary for thread safety. Symbol does not override Equals, so default
     // reference equality applies without a custom comparer.
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<Symbol, CType> _symbolCache = new();
 
@@ -1224,7 +1224,7 @@ public static class CTypeOps
         // and the exception is swallowed as false.  Returning (false, true) in that
         // case incorrectly claims certainty.  Use uncertain (false, false) instead
         // when the type involves SATISFIES, per CLHS permission to return NIL NIL
-        // for satisfies-involving types (D694).
+        // for satisfies-involving types.
         bool hasSatisfies = ContainsSatisfies(ct2);
         foreach (var obj in mem.Members)
         {

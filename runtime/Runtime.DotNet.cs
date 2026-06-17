@@ -192,7 +192,7 @@ public static partial class Runtime
         return new LispString(asm.FullName ?? path);
     }
 
-    private static string? FindSharedFrameworkDll(string assemblyName)
+    internal static string? FindSharedFrameworkDll(string assemblyName)
     {
         // RuntimeEnvironment.GetRuntimeDirectory() returns e.g.
         // C:\Program Files\dotnet\shared\Microsoft.NETCore.App\10.0.5\
@@ -662,8 +662,25 @@ public static partial class Runtime
 
         if (args.Length == 1)
         {
-            var obj = Activator.CreateInstance(type)!;
-            return new LispDotNetObject(obj);
+            // A true parameterless ctor (value types always have one).
+            if (type.IsValueType || type.GetConstructor(Type.EmptyTypes) != null)
+                return new LispDotNetObject(Activator.CreateInstance(type)!);
+            // Otherwise fall back to an all-optional ctor, supplying its defaults —
+            // C#'s `new T()` does the same (e.g. FluentTheme(Uri? baseUri = null)).
+            var optCtor = type.GetConstructors()
+                .Where(c => c.GetParameters().Length > 0 && c.GetParameters().All(p => p.IsOptional))
+                .OrderBy(c => c.GetParameters().Length)
+                .FirstOrDefault();
+            if (optCtor != null)
+            {
+                var ps = optCtor.GetParameters();
+                var defaults = new object?[ps.Length];
+                for (int i = 0; i < ps.Length; i++)
+                    defaults[i] = ps[i].HasDefaultValue ? ps[i].DefaultValue : Type.Missing;
+                return new LispDotNetObject(optCtor.Invoke(defaults)!);
+            }
+            // No usable ctor — let Activator throw its descriptive error.
+            return new LispDotNetObject(Activator.CreateInstance(type)!);
         }
 
         var lispArgs = args.Skip(1).ToArray();
@@ -697,20 +714,20 @@ public static partial class Runtime
     }
 
     /// <summary>(dotnet:%define-class "Full.Name" &optional "Base.Type" field-specs attr-specs method-specs ctor-body property-specs interface-specs event-specs)
-    /// Emit a named public class. Shapes: D773 (fields) (attrs),
-    /// D776 (methods) (ctor-body: 1-arg Lisp fn called after base.ctor),
-    /// D785 (property-specs: list of ("Name" "TypeName") for auto-properties).
-    /// D786 — method-spec accepts optional 5th element override-flag; when truthy,
+    /// Emit a named public class. Shapes: (fields) (attrs),
+    /// (methods) (ctor-body: 1-arg Lisp fn called after base.ctor),
+    /// (property-specs: list of ("Name" "TypeName") for auto-properties).
+    /// method-spec accepts optional 5th element override-flag; when truthy,
     /// the method is emitted as an override of a matching base virtual method.
-    /// D787 — 8th arg interface-specs is a list of fully qualified interface
+    /// 8th arg interface-specs is a list of fully qualified interface
     /// type names; each declared, and any method in method-specs whose
     /// name+signature matches an interface method is emitted as the implicit
     /// implementation of that slot.
-    /// D788 — 9th arg event-specs is a list of ("Name" "DelegateTypeName"); each
+    /// 9th arg event-specs is a list of ("Name" "DelegateTypeName"); each
     /// emits a private delegate field + public add_/remove_ accessors +
     /// EventBuilder. If a declared interface carries a matching add_/remove_
     /// slot, the accessors are wired up as implicit implementations.
-    /// D790 — property-specs accepts optional 3rd element (notify-flag); when
+    /// property-specs accepts optional 3rd element (notify-flag); when
     /// truthy, the setter additionally calls OnPropertyChanged with a
     /// PropertyChangedEventArgs carrying the property name. Requires a
     /// matching PropertyChanged event to be declared via event-specs.
@@ -1048,7 +1065,7 @@ public static partial class Runtime
             }
         }
 
-        // D1106 — arg 11: ctor-specs-list: list of (lambda param-types base-arg-indices) triples.
+        // arg 11: ctor-specs-list: list of (lambda param-types base-arg-indices) triples.
         // When non-nil, overrides the single-ctor path (args 5/9/10).
         List<Emitter.DynamicClassBuilder.CtorSpec>? ctorSpecs = null;
         if (args.Length >= 12 && args[11] != Nil.Instance)

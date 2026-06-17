@@ -8,7 +8,7 @@
 ;;;   dotcl-cs:inline-cs (bindings &key returns body)
 ;;;     → macro that splices C# IL inline into the enclosing dotcl function.
 ;;;
-;;; Implementation (D686 + D875, unified in D903):
+;;; Implementation:
 ;;;   Loads the contrib's own lib/ directory (Roslyn + a small C# helper
 ;;;   DotCL.Contrib.DotclCs.RoslynCompiler) via dotnet:load-assembly and
 ;;;   calls CompileAndDisassemble in-process. inline-cs uses disassemble-cs
@@ -27,7 +27,7 @@
 (in-package :dotcl-cs)
 
 ;;; ---------------------------------------------------------------------------
-;;; disassemble-cs (Phase 1 — D680/D681/D686)
+;;; disassemble-cs (Phase 1)
 
 ;; Captured at load time; *load-pathname* is only bound during Load.
 (defvar *contrib-dir*
@@ -65,7 +65,7 @@
                  "CompileAndDisassemble" body))
 
 ;;; ---------------------------------------------------------------------------
-;;; inline-cs (Phase 2 — D875)
+;;; inline-cs (Phase 2)
 
 (defmacro inline-cs (bindings &key returns body)
   "Compile BODY (a C# string) at macro-expansion time and splice the IL
@@ -105,8 +105,8 @@
            (intern "%INLINE-CS-SPLICED" "DOTCL-INTERNAL"))
        ,lisp-vals :returns ,returns ,sil)))
 
-;; Intentionally NO (provide "dotcl-cs") here — D688 regression test relies
+;; Intentionally NO (provide "dotcl-cs") here — a regression test relies
 ;; on this contrib being a module that forgets to call provide, so that
 ;; require's auto-push behaviour can be exercised. If you add provide here,
-;; update test/regression/recent-fixes.lisp:d688-* to use a different
+;; update the corresponding regression test to use a different
 ;; provide-less contrib.

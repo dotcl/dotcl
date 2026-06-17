@@ -1560,3 +1560,18 @@
          (not (find #\~ (namestring p)))
          t))
   t)
+
+;;; #292: dotnet:new with only a type name must work for a type that has no
+;;; parameterless ctor but an all-optional one (mirrors C# `new T()`). JsonObject
+;;; has only JsonObject(JsonNodeOptions? options = null).
+(deftest d1181-dotnet-new-all-optional-ctor
+  (let ((o (dotnet:new "System.Text.Json.Nodes.JsonObject")))
+    (notnot (typep (dotnet:invoke o "ToString") 'string)))
+  t)
+
+;;; Regression guard: a genuine parameterless ctor still works.
+(deftest d1181-dotnet-new-parameterless-ctor
+  (let ((sb (dotnet:new "System.Text.StringBuilder")))
+    (dotnet:invoke sb "Append" "ok")
+    (dotnet:invoke sb "ToString"))
+  "ok")

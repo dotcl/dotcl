@@ -11,7 +11,7 @@ namespace DotCL.Emitter;
 /// can be diffed directly.
 ///
 /// Primary use case: comparing C# compiler output against dotcl's own codegen
-/// to drive optimizer work (#122 Phase 1).
+/// to drive optimizer work (Phase 1).
 /// </summary>
 public static class IlDisasm
 {

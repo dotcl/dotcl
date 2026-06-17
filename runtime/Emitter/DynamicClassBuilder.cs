@@ -6,32 +6,32 @@ namespace DotCL.Emitter;
 /// <summary>
 /// Runtime emission of named public .NET classes via AssemblyBuilder +
 /// TypeBuilder. Part of the defclass-cil roadmap:
-///   D771 — Step 1: named class, default ctor, fixed Greet() method
-///   D772 — Step 2: optional base class (SetParent + base ctor call)
-///   D773 — Step 3: optional public instance fields (XAML x:Name targets)
-///   D774 — Step 4: optional type-level custom attributes
-///   D776 — Step 5a: user-supplied instance methods whose bodies dispatch
-///                   back to a Lisp lambda (Greet auto-injection removed)
-///   D783 — Step 7a: optional ctor body (Lisp lambda invoked after base.ctor)
-///   D785 — Step 7b: optional auto-properties (backing field + get_X/set_X)
-///   D786 — Step 7c: optional virtual-method override (DefineMethodOverride +
-///                   MethodAttributes.Virtual matching a base virtual method)
-///   D787 — Step 7d: optional interface implementations. AddInterfaceImplementation
-///                   + methods that match an interface method by name+signature
-///                   are emitted as implicit interface impls (NewSlot|Final|Virtual)
-///   D788 — Step 7e: optional events (private delegate field + public add_/
-///                   remove_ accessors + EventBuilder). add_/remove_ automatically
-///                   wire to interface slots when the type declares a matching
-///                   event-bearing interface (INotifyPropertyChanged etc.)
-///   D789 — Step 7f: event raisers (public virtual OnName). For each event,
-///                   a method that invokes the delegate if non-null is emitted.
-///                   EventHandler-shaped delegates (first param == object) use
-///                   this as sender automatically; other delegate shapes pass
-///                   all params through.
-///   D790 — Step 7g: auto-property setters with :notify flag. When set, the
-///                   setter calls OnPropertyChanged(PropertyChangedEventArgs)
-///                   after stfld, so `(dotnet:%set-invoke vm "Title" v)` alone
-///                   fires the INotifyPropertyChanged notification.
+///   Step 1: named class, default ctor, fixed Greet() method
+///   Step 2: optional base class (SetParent + base ctor call)
+///   Step 3: optional public instance fields (XAML x:Name targets)
+///   Step 4: optional type-level custom attributes
+///   Step 5a: user-supplied instance methods whose bodies dispatch
+///            back to a Lisp lambda (Greet auto-injection removed)
+///   Step 7a: optional ctor body (Lisp lambda invoked after base.ctor)
+///   Step 7b: optional auto-properties (backing field + get_X/set_X)
+///   Step 7c: optional virtual-method override (DefineMethodOverride +
+///            MethodAttributes.Virtual matching a base virtual method)
+///   Step 7d: optional interface implementations. AddInterfaceImplementation
+///            + methods that match an interface method by name+signature
+///            are emitted as implicit interface impls (NewSlot|Final|Virtual)
+///   Step 7e: optional events (private delegate field + public add_/
+///            remove_ accessors + EventBuilder). add_/remove_ automatically
+///            wire to interface slots when the type declares a matching
+///            event-bearing interface (INotifyPropertyChanged etc.)
+///   Step 7f: event raisers (public virtual OnName). For each event,
+///            a method that invokes the delegate if non-null is emitted.
+///            EventHandler-shaped delegates (first param == object) use
+///            this as sender automatically; other delegate shapes pass
+///            all params through.
+///   Step 7g: auto-property setters with :notify flag. When set, the
+///            setter calls OnPropertyChanged(PropertyChangedEventArgs)
+///            after stfld, so `(dotnet:%set-invoke vm "Title" v)` alone
+///            fires the INotifyPropertyChanged notification.
 ///
 /// Each call creates a fresh dynamic assembly holding one type. That assembly
 /// becomes visible to Type.GetType lookup through AppDomain.CurrentDomain
@@ -53,7 +53,7 @@ public static class DynamicClassBuilder
                              LispObject LispBody, bool IsOverride = false,
                              IReadOnlyList<CustomAttributeBuilder>? Attributes = null);
 
-    // D1106 — multi-ctor support: one spec per constructor overload.
+    // multi-ctor support: one spec per constructor overload.
     public record CtorSpec(
         LispObject? Body,
         IReadOnlyList<Type>? ParamTypes,
@@ -137,7 +137,7 @@ public static class DynamicClassBuilder
                 | TypeAttributes.AnsiClass | TypeAttributes.BeforeFieldInit,
             baseType);
 
-        // D787 — declared interfaces. Each is a reference type that must be
+        // Declared interfaces. Each is a reference type that must be
         // an interface; duplicates are rejected to catch user typos early.
         if (interfaces != null)
         {
@@ -174,10 +174,10 @@ public static class DynamicClassBuilder
             }
         }
 
-        // Events (D788): private delegate field + public add_/remove_ accessors
+        // Events: private delegate field + public add_/remove_ accessors
         // + EventBuilder. Reserved accessor names go into reservedMethodNames so
         // the user cannot collide them with explicit methods below. We emit
-        // events BEFORE properties because D790's :notify flag causes property
+        // events BEFORE properties because the :notify flag causes property
         // setters to reference the OnPropertyChanged raiser MethodBuilder.
         var reservedMethodNames = new HashSet<string>(StringComparer.Ordinal);
         var raisersByEvent = new Dictionary<string, (MethodBuilder Raiser, Type[] ParamTypes)>(
@@ -203,11 +203,11 @@ public static class DynamicClassBuilder
             }
         }
 
-        // Auto-properties (D785): private backing field + public get_X/set_X
+        // Auto-properties: private backing field + public get_X/set_X
         // wired to a PropertyBuilder. Reflection-based frameworks (MAUI
         // Binding, JSON serializers, etc.) discover these as regular .NET
-        // properties. When `notify` is true, D790 appends an
-        // OnPropertyChanged(PropertyChangedEventArgs) call to the setter body.
+        // properties. When `notify` is true, an
+        // OnPropertyChanged(PropertyChangedEventArgs) call is appended to the setter body.
         if (properties != null)
         {
             var seenProps = new HashSet<string>(StringComparer.Ordinal);
@@ -233,7 +233,7 @@ public static class DynamicClassBuilder
         }
 
         // Constructor(s). Two paths:
-        //   ctorSpecs != null → multi-ctor: one tb.DefineConstructor per spec (D1106).
+        //   ctorSpecs != null → multi-ctor: one tb.DefineConstructor per spec.
         //   ctorSpecs == null → single-ctor: backward-compat path using ctorBody /
         //                       ctorParamTypes / baseCtorArgIndices.
         if (ctorSpecs != null && ctorSpecs.Count > 0)
@@ -346,9 +346,9 @@ public static class DynamicClassBuilder
                 _methodHandlers[(fullName, CtorKey)] = ctorBody;
         }
 
-        // User-defined instance methods (D776). Each body dispatches to the
+        // User-defined instance methods. Each body dispatches to the
         // corresponding Lisp lambda through DispatchLispMethod.
-        // dispatch key = method name for no-param; name#Type1|Type2 for parameterized (D1106).
+        // dispatch key = method name for no-param; name#Type1|Type2 for parameterized.
         var pendingMethods = new List<(string DispatchKey, LispObject Lambda)>();
         if (methods != null)
         {
@@ -445,10 +445,10 @@ public static class DynamicClassBuilder
     /// unboxes/casts the result to the declared return type.
     /// If <c>m.IsOverride</c> is true, the method is emitted as Virtual and
     /// explicitly tied to a matching base virtual method via
-    /// <see cref="TypeBuilder.DefineMethodOverride"/> (D786).
+    /// <see cref="TypeBuilder.DefineMethodOverride"/>.
     /// Otherwise, if the type declares any interfaces and the method matches
     /// an interface method by name+signature, it is emitted as an implicit
-    /// interface implementation (D787): Virtual|NewSlot|Final|HideBySig plus
+    /// interface implementation: Virtual|NewSlot|Final|HideBySig plus
     /// DefineMethodOverride for each matched interface method.
     /// </summary>
     private static void EmitLispDispatchMethod(TypeBuilder tb, string fullName,
@@ -537,7 +537,7 @@ public static class DynamicClassBuilder
     }
 
     /// <summary>
-    /// Emit a public event (D788): a private delegate backing field, public
+    /// Emit a public event: a private delegate backing field, public
     /// <c>add_Name</c>/<c>remove_Name</c> accessors that combine/remove the
     /// handler, and an <see cref="EventBuilder"/> tying them together. If a
     /// declared interface carries a matching add_/remove_ slot (same name and
@@ -585,7 +585,7 @@ public static class DynamicClassBuilder
         eb.SetAddOnMethod(add);
         eb.SetRemoveOnMethod(rem);
 
-        // D789 — raiser: public virtual OnName(args...). Fires the delegate
+        // Raiser: public virtual OnName(args...). Fires the delegate
         // with a null check. For (object sender, TArgs e) shaped delegates
         // (EventHandler etc.) the method is OnName(TArgs e) and passes `this`
         // as the sender. For other shapes it takes the delegate's full param

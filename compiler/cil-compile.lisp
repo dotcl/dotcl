@@ -122,7 +122,7 @@
     (setf forms (mapcar #'preprocess-sbcl-quasiquotes forms))
     ;; If we're building a SIL that includes cil-stdlib.lisp (i.e. the canonical
     ;; cross-compile of the dotcl core), append a runtime form that locks the
-    ;; CL package after stdlib load completes (#93 step 3a). The form is built
+    ;; CL package after stdlib load completes. The form is built
     ;; with intern/find-package so it doesn't reference the DOTCL package at
     ;; read time on the SBCL host.
     (when (some (lambda (p) (search "cil-stdlib" (namestring p))) input-files)

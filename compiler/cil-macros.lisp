@@ -352,9 +352,9 @@
       (lambda (place value)
         ;; (setf (macro-function name) fn)
         ;; Update both C# _macroFunctions and *macros* Lisp table
-        ;; D433: protect CL macros from foreign package overwrite
-        ;; D594: if called via a non-CL shadow (e.g. SB-XC:MACRO-FUNCTION), skip dotcl *macros* update
-        ;;       to prevent infinite recursion when the stored lambda calls cl:macro-function
+        ;; protect CL macros from foreign package overwrite
+        ;; if called via a non-CL shadow (e.g. SB-XC:MACRO-FUNCTION), skip dotcl *macros* update
+        ;; to prevent infinite recursion when the stored lambda calls cl:macro-function
         (let ((fn-sym (first place)))
           (if (and (symbolp fn-sym)
                    (let ((pkg (symbol-package fn-sym)))
@@ -365,7 +365,7 @@
               `(let ((v ,value) (n ,(second place)))
                  (if v
                      (let ((mkey (macro-key-for-symbol n)))
-                       ;; D433: skip if CL macro already registered
+                       ;; skip if CL macro already registered
                        (if (and (let ((pkg (symbol-package n)))
                                   (and pkg (string= (package-name pkg) "COMMON-LISP")))
                                 (gethash mkey *macros*))
@@ -1361,9 +1361,9 @@
                (body (cddr form))
                (limit-var (gensym "LIMIT"))
                (loop-tag (gensym "DOTIMES-LOOP"))
-               ;; D670: when count-form is statically fixnum, inject fixnum
+               ;; when count-form is statically fixnum, inject fixnum
                ;; declarations so the generated compare/increment hits the
-               ;; native int64 path introduced in D667-D669. Conservative:
+               ;; native int64 path. Conservative:
                ;; only when count-form is statically known fixnum; otherwise
                ;; bignum inputs would InvalidCastException on unbox.
                (fx-count (fixnum-typed-p count-form))
@@ -2220,7 +2220,7 @@
                                               ((eq key :allocation) (setf allocation val))
                                               ;; Non-standard slot options (allowed under a custom
                                               ;; metaclass) are passed to DIRECT-SLOT-DEFINITION-CLASS
-                                              ;; and seed the custom slotd's Lisp slots (#264).
+                                              ;; and seed the custom slotd's Lisp slots.
                                               (t (push (cons key val) custom-opts)))))
                                  (list sname initargs initform-present initform accessors readers writers allocation
                                        (nreverse custom-opts)))))
@@ -2277,7 +2277,7 @@
                                       ;; Under a custom metaclass, attach the non-standard slot
                                       ;; options so DIRECT-SLOT-DEFINITION-CLASS can dispatch on
                                       ;; them. Values are quoted (CLOS does not evaluate slot
-                                      ;; option values) (#264).
+                                      ;; option values).
                                       (if (and custom-metaclass-p custom-opts)
                                           `(%slot-def-raw-options
                                             ,base
@@ -2533,7 +2533,7 @@
                (gf-has-allow-other-keys nil)
                (gf-keyword-names nil)
                ;; :argument-precedence-order as a permutation of required-param
-               ;; indices (#268). nil = natural order. Computed below after validation.
+               ;; indices. nil = natural order. Computed below after validation.
                (apo-order nil)
                ;; Extract :method-combination option: (:method-combination name [arg1 arg2 ...])
                (mc-opt (find-if (lambda (opt)
@@ -2619,7 +2619,7 @@
                   (unless (member p apo-params)
                     (error 'program-error :format-control "DEFGENERIC ~S: :argument-precedence-order is missing required parameter ~S"
                            :format-arguments (list name p))))
-                ;; Permutation of required-param positions in precedence order (#268)
+                ;; Permutation of required-param positions in precedence order
                 (setf apo-order (mapcar (lambda (p) (position p plain-params)) apo-params)))))
           ;; Check lambda list congruency for inline :method forms (CLHS 7.6.4)
           (dolist (mopt method-opts)

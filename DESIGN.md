@@ -199,7 +199,7 @@ package-local-nicknames を `_localNicknames` で実装。volatile
 
 **ANSI / SBCL との差分**: `setf` 関数を専用レジストリではなくシンボル
 直属の `SetfFunction` フィールドに置く ((setf foo) を高速に解決する
-ための選択、#58 Phase 1)。それ以外は ANSI 通り。
+ための選択、Phase 1)。それ以外は ANSI 通り。
 
 ### 3.3 Reader
 

@@ -1208,7 +1208,7 @@ public class Reader
         var form = Read();
         if (_readSuppress) return new Symbol("NIL"); // suppress mode: return dummy
         // #. only uses the primary value; unwrap MvReturn so it doesn't leak
-        // into source data (D641, issue #19).
+        // into source data.
         return MultipleValues.Primary(Runtime.Eval(form));
     }
 

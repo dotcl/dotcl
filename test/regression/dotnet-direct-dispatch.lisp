@@ -52,3 +52,26 @@
     (%dotnet-call-direct "System.Text.StringBuilder" "Append" ("System.Int32") sb 7)
     (dotnet:invoke sb "ToString"))
   "77")
+
+;;; --- typed surface: (dotnet:invoke (the (dotnet "T") r) "M" ...) lowering (#285) ---
+;; A type-declared receiver lowers to %dotnet-call-direct via the compiler macro.
+(deftest direct-surface-length
+  (let ((sb (dotnet:new "System.Text.StringBuilder")))
+    (dotnet:invoke (the (dotnet "System.Text.StringBuilder") sb) "Append"
+                   (the (dotnet "System.String") "abcde"))
+    (dotnet:invoke (the (dotnet "System.Text.StringBuilder") sb) "get_Length"))
+  5)
+
+(deftest direct-surface-tostring
+  (let ((sb (dotnet:new "System.Text.StringBuilder")))
+    (dotnet:invoke (the (dotnet "System.Text.StringBuilder") sb) "Append"
+                   (the (dotnet "System.String") "hi"))
+    (dotnet:invoke (the (dotnet "System.Text.StringBuilder") sb) "ToString"))
+  "hi")
+
+;; Untyped receiver: the compiler macro declines and the dynamic path is used.
+(deftest direct-surface-untyped-declines
+  (let ((sb (dotnet:new "System.Text.StringBuilder")))
+    (dotnet:invoke sb "Append" "world")
+    (dotnet:invoke sb "ToString"))
+  "world")

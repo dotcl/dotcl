@@ -4,7 +4,7 @@ public class Symbol : LispObject
 {
     public string Name { get; }
     public Package? HomePackage { get; set; }
-    // Mutable Symbol slots are public volatile fields (#171 Step 1) so cross-
+    // Mutable Symbol slots are public volatile fields so cross-
     // thread reads see a consistent reference. Reference assignment to a
     // volatile field on .NET is atomic, and the volatile modifier emits the
     // memory barriers that keep one thread's defun/setf-symbol-value visible
@@ -17,7 +17,7 @@ public class Symbol : LispObject
     /// <summary>
     /// The (setf name) function for this symbol.
     /// E.g. for symbol CAR, SetfFunction holds the function defined by (defun (setf car) ...).
-    /// This is the authoritative storage for setf functions (Phase 1 of issue #58).
+    /// This is the authoritative storage for setf functions (Phase 1).
     /// </summary>
     public volatile LispObject? SetfFunction;
     public LispObject Plist { get; set; }

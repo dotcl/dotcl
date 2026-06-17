@@ -7,7 +7,7 @@ public static partial class Runtime
 {
     // --- CLOS operations ---
 
-    // ConcurrentDictionary so concurrent DEFCLASS / FIND-CLASS doesn't corrupt the table (#83).
+    // ConcurrentDictionary so concurrent DEFCLASS / FIND-CLASS doesn't corrupt the table.
     private static readonly ConcurrentDictionary<Symbol, LispClass> _classRegistry = new(SymbolIdentityComparer.Instance);
     // Maps .NET runtime Type to its CLOS class (for dotnet:define-class and dotnet:new instances).
     private static readonly ConcurrentDictionary<Type, LispClass> _dotNetTypeRegistry = new();
@@ -109,6 +109,12 @@ public static partial class Runtime
             existing.DirectSuperclasses = lc.DirectSuperclasses;
             existing.DirectDefaultInitargs = lc.DirectDefaultInitargs;
             existing.IsForwardReferenced = false;
+            // Carry over a (changed) metaclass and its slot values, so re-defining /
+            // re-ensure-class'ing a class under a different :metaclass actually switches
+            // it — e.g. McCLIM resolving a forward-referenced-class to its real
+            // presentation-type-class metaclass.
+            existing.Metaclass = lc.Metaclass;
+            existing.ExtraSlots = lc.ExtraSlots;
             existing.FinalizeClass();
             // Re-finalize any classes that have this as a superclass
             RefinalizeDependents(existing);
@@ -131,6 +137,8 @@ public static partial class Runtime
                 fwdRef.DirectSuperclasses = lc.DirectSuperclasses;
                 fwdRef.DirectDefaultInitargs = lc.DirectDefaultInitargs;
                 fwdRef.IsForwardReferenced = false;
+                fwdRef.Metaclass = lc.Metaclass;   // metaclass change on forward-ref resolve
+                fwdRef.ExtraSlots = lc.ExtraSlots;
                 fwdRef.FinalizeClass();
                 // Also register under the original package-qualified name for package-aware lookups
                 _classRegistry[lc.Name] = fwdRef;
@@ -340,7 +348,16 @@ public static partial class Runtime
         // direct slot. A non-standard return class becomes the slot's MetaClass and its
         // Lisp-level slots are initialized from the slot's options.
         if (metaclass != null)
+        {
             ApplyDirectSlotDefinitionClass(cls);
+            // A class is an instance of its metaclass. Run the real CLOS init protocol
+            // on the class object so the metaclass's added slots get their initforms
+            // AND any inherited initialize-instance / shared-initialize :after
+            // methods fire — e.g. a slot computed by an :after method. The
+            // shared-initialize primary handles a LispClass's ExtraSlots above.
+            if (Startup.Sym("INITIALIZE-INSTANCE").Function is LispFunction iiFn)
+                iiFn.Invoke(new LispObject[] { cls });
+        }
         // Skip finalization if any superclass is forward-referenced
         bool hasForwardRef = false;
         foreach (var s in supers)
@@ -626,6 +643,17 @@ public static partial class Runtime
             throw new LispErrorException(new LispError(
                 $"SLOT-VALUE: slot {name} is unbound in slot-definition"));
         }
+        // A class metaobject under a custom metaclass holds the metaclass-added slots
+        // in ExtraSlots, mirroring the SlotDefinition case above.
+        if (obj is LispClass klass && klass.Metaclass != null)
+        {
+            if (klass.ExtraSlots != null && klass.ExtraSlots.TryGetValue(name, out var cv))
+                return cv ?? Nil.Instance;
+            if (klass.Metaclass.SlotIndex.ContainsKey(name)
+                && Startup.Sym("SLOT-UNBOUND").Function is LispFunction csu)
+                return MultipleValues.Primary(csu.Invoke(new LispObject[] {
+                    klass.Metaclass, klass, slotName is Symbol ? slotName : Startup.Sym(name) }));
+        }
         if (obj is not LispInstance inst)
             throw new LispErrorException(new LispTypeError("SLOT-VALUE: not a CLOS instance", obj));
         if (!inst.Class.SlotIndex.TryGetValue(name, out int idx))
@@ -698,6 +726,12 @@ public static partial class Runtime
             (slotd.ExtraSlots ??= new Dictionary<string, LispObject?>())[name] = value;
             return value;
         }
+        // Metaclass-added slot on a class metaobject.
+        if (obj is LispClass klass && klass.Metaclass != null && klass.Metaclass.SlotIndex.ContainsKey(name))
+        {
+            (klass.ExtraSlots ??= new Dictionary<string, LispObject?>())[name] = value;
+            return value;
+        }
         if (obj is not LispInstance inst)
             throw new LispErrorException(new LispTypeError("SET-SLOT-VALUE: not a CLOS instance", obj));
         if (!inst.Class.SlotIndex.TryGetValue(name, out int idx))
@@ -743,6 +777,9 @@ public static partial class Runtime
         }
         if (obj is SlotDefinition slotd)
             return slotd.ExtraSlots != null && slotd.ExtraSlots.TryGetValue(name, out var bv) && bv != null
+                ? T.Instance : Nil.Instance;
+        if (obj is LispClass klass && klass.Metaclass != null)
+            return klass.ExtraSlots != null && klass.ExtraSlots.TryGetValue(name, out var cbv) && cbv != null
                 ? T.Instance : Nil.Instance;
         if (obj is not LispInstance inst)
             throw new LispErrorException(new LispTypeError("SLOT-BOUNDP: not a CLOS instance", obj));
@@ -974,6 +1011,33 @@ public static partial class Runtime
         // args[0] = instance, args[1] = slot-names (NIL, T, or list of symbols), args[2..] = initargs
         LispObject obj = args[0];
         if (obj is LispInstanceCondition lic) obj = lic.Instance;
+        // A class metaobject under a custom metaclass: initialize the metaclass-added
+        // slots (those beyond standard-class) from initargs, else their initforms —
+        // the shared-initialize contract applied to ExtraSlots. Reached via the
+        // real initialize-instance protocol so inherited :after methods run.
+        if (obj is LispClass klass && klass.Metaclass != null)
+        {
+            var meta = klass.Metaclass;
+            var stdNames = new HashSet<string>();
+            if (_classRegistry.TryGetValue(Startup.Sym("STANDARD-CLASS"), out var scO) && scO is LispClass scC)
+                foreach (var es0 in scC.EffectiveSlots) stdNames.Add(es0.Name.Name);
+            foreach (var es in meta.EffectiveSlots)
+            {
+                string sn = es.Name.Name;
+                if (stdNames.Contains(sn)) continue;
+                bool fromInitarg = false;
+                for (int i = 2; i + 1 < args.Length; i += 2)
+                    if (args[i] is Symbol k && Array.Exists(es.Initargs, ia => ia.Name == k.Name))
+                    { (klass.ExtraSlots ??= new Dictionary<string, LispObject?>())[sn] = args[i + 1]; fromInitarg = true; break; }
+                if (fromInitarg) continue;
+                bool inNames = args[1] is T;
+                if (!inNames) for (var c = args[1]; c is Cons cc; c = cc.Cdr) if (cc.Car is Symbol s2 && s2.Name == sn) { inNames = true; break; }
+                bool bound = klass.ExtraSlots != null && klass.ExtraSlots.TryGetValue(sn, out var ev) && ev != null;
+                if (inNames && !bound && es.InitformThunk is { } thunk)
+                    (klass.ExtraSlots ??= new Dictionary<string, LispObject?>())[sn] = MultipleValues.Primary(thunk.Invoke(Array.Empty<LispObject>()));
+            }
+            return klass;
+        }
         if (obj is not LispInstance inst)
             throw new LispErrorException(new LispTypeError("SHARED-INITIALIZE: not a CLOS instance", args[0]));
         var cls = inst.Class;
@@ -1062,7 +1126,7 @@ public static partial class Runtime
                 // Custom metaclass: an instance slot's boundness is defined by
                 // slot-boundp-using-class, not the raw vector (the slot may be seeded with
                 // a backing object that is itself still "unbound", e.g. McCLIM's dvar). This
-                // lets initforms apply through (setf slot-value-using-class) (#264 / #272).
+                // lets initforms apply through (setf slot-value-using-class).
                 isBound = IsTruthy(Primary(sbucBoundFn.Invoke(new LispObject[] { cls, inst, slotDef })));
             }
             else
@@ -1559,7 +1623,7 @@ public static partial class Runtime
         // "(SETF NAME)" keys — can only ever match C#-startup-registered GFs
         // (whose accessor is always a DOTCL-INTERNAL symbol), never user-created
         // GFs like (setf cl:documentation).  Without this, (setf acclimation:doc)
-        // bleeds into (setf cl:documentation) via the fallback (issue #261).
+        // bleeds into (setf cl:documentation) via the fallback.
         var pkg = accessor.HomePackage;
         if (pkg == null || pkg.Name == "DOTCL-INTERNAL")
             return $"(SETF {accessor.Name})";
@@ -1602,7 +1666,7 @@ public static partial class Runtime
         // Also install as the symbol's function so calls dispatch through the GF.
         // This bypasses CheckPackageLock since extending a CL generic function with
         // user-defined methods (defmethod auto-create case) is allowed even when
-        // the CL package is locked (#93 / D561).
+        // the CL package is locked.
         sym.Function = gf;
         // For (setf accessor) GFs: ALSO install on the target symbol's SetfFunction slot
         // so that #'(setf accessor) and GetSetfFunctionBySymbol can find it.
@@ -3472,7 +3536,7 @@ public static partial class Runtime
             // SLOT-BOUNDP-USING-CLASS (class instance slot-def) → boolean (AMOP §5.4).
             // The default consults the raw slot vector; custom metaclasses (e.g. McCLIM's
             // dynamic slots) override to consult their own backing store so initforms and
-            // slot-boundp see the right state (#264 / #272).
+            // slot-boundp see the right state.
             var sbucSym = Startup.Sym("SLOT-BOUNDP-USING-CLASS");
             var sbucGF = (GenericFunction)Runtime.MakeGF(sbucSym, new Fixnum(3));
             sbucGF.RequiredCount = 3;
@@ -3523,12 +3587,18 @@ public static partial class Runtime
         Emitter.CilAssembler.RegisterFunction("SLOT-MAKUNBOUND", new LispFunction(args => {
             if (args.Length != 2) throw new LispErrorException(new LispProgramError("SLOT-MAKUNBOUND requires exactly 2 arguments"));
             var obj0 = args[0] is LispInstanceCondition lic0 ? lic0.Instance : args[0];
-            if (obj0 is not LispInstance inst)
-                throw new LispErrorException(new LispTypeError("SLOT-MAKUNBOUND: not a CLOS instance", args[0]));
             string name = args[1] switch {
                 Symbol sym => sym.Name,
                 _ => args[1].ToString()
             };
+            // Metaclass-added slot on a class metaobject.
+            if (obj0 is LispClass klass && klass.Metaclass != null)
+            {
+                klass.ExtraSlots?.Remove(name);
+                return klass;
+            }
+            if (obj0 is not LispInstance inst)
+                throw new LispErrorException(new LispTypeError("SLOT-MAKUNBOUND: not a CLOS instance", args[0]));
             if (!inst.Class.SlotIndex.TryGetValue(name, out int idx))
             {
                 if (Startup.Sym("SLOT-MISSING").Function is LispFunction slotMissing)
@@ -4333,8 +4403,8 @@ public static partial class Runtime
         // lambda-list / arity placeholder). A leftover stub here returned NIL for any
         // GF and, depending on startup registration order, shadowed the real one on
         // some platforms (Linux) but not others (Windows) — making
-        // generic-function-lambda-list return NIL only on Linux (D1110 regression
-        // tests, caught by the release workflow). Removed so only Mop.cs registers it.
+        // generic-function-lambda-list return NIL only on Linux. Removed so only
+        // Mop.cs registers it.
 
         // METHOD-QUALIFIERS is already registered as a proper GenericFunction above (lines ~2659-2685)
 
@@ -4371,20 +4441,87 @@ public static partial class Runtime
             return args[2];  // return the lambda form as-is
         }, "MAKE-METHOD-LAMBDA"));
 
-        // ENSURE-CLASS — stub supporting symbol and list names, ignoring :metaclass
+        // ENSURE-CLASS — create/redefine a class honoring :metaclass,
+        // :direct-superclasses, and :direct-slots, then register it. Mirrors what
+        // DEFCLASS expands to (%register-class (%make-class-full ...)) so a custom
+        // metaclass is preserved (AMOP). Previously a stub that ignored them.
         Emitter.CilAssembler.RegisterFunction("ENSURE-CLASS", new LispFunction(args => {
-            // (ensure-class name &key metaclass direct-superclasses ...)
+            // (ensure-class name &key metaclass direct-superclasses direct-slots ...)
             if (args.Length < 1) throw new LispErrorException(new LispProgramError("ENSURE-CLASS: wrong arg count"));
             var name = args[0];
             // Normalize name to a symbol (list names become their print-name symbol)
             Symbol nameSym = name is Symbol s ? s : Startup.Sym(name.ToString() ?? "");
-            var existing = Runtime.FindClassOrNil(nameSym);
-            if (existing is LispClass existingCls) return existingCls;
-            // Create a minimal class under the (possibly list-stringified) name
-            var newCls = new LispClass(nameSym, Array.Empty<SlotDefinition>(), Array.Empty<LispClass>());
-            newCls.FinalizeClass();
-            Runtime._classRegistry[nameSym] = newCls;
-            return newCls;
+            LispObject metaclassSpec = Nil.Instance, supersSpec = Nil.Instance, slotsSpec = Nil.Instance;
+            var extra = new List<LispObject>();   // metaclass-slot initargs, e.g. :type-name
+            for (int i = 1; i + 1 < args.Length; i += 2)
+            {
+                if (args[i] is not Symbol k) continue;
+                if (k == Startup.Keyword("METACLASS")) metaclassSpec = args[i + 1];
+                else if (k == Startup.Keyword("DIRECT-SUPERCLASSES")) supersSpec = args[i + 1];
+                else if (k == Startup.Keyword("DIRECT-SLOTS")) slotsSpec = args[i + 1];
+                else { extra.Add(k); extra.Add(args[i + 1]); }
+            }
+            // Resolve the metaclass (a class object or a class name); null => STANDARD-CLASS.
+            LispClass? metaclass = metaclassSpec switch
+            {
+                LispClass mc => mc,
+                Symbol ms => Runtime.FindClassOrNil(ms) as LispClass,
+                _ => null
+            };
+            // Resolve superclasses: each entry is a class object or a class name.
+            LispObject supersList = Nil.Instance;
+            {
+                var resolved = new List<LispObject>();
+                for (var c = supersSpec; c is Cons cc; c = cc.Cdr)
+                {
+                    LispObject sup = cc.Car switch
+                    {
+                        LispClass sc => sc,
+                        Symbol sn => Runtime.FindClassOrNil(sn),
+                        _ => Nil.Instance
+                    };
+                    if (sup is LispClass) resolved.Add(sup);
+                }
+                for (int i = resolved.Count - 1; i >= 0; i--) supersList = new Cons(resolved[i], supersList);
+            }
+            // Convert canonical direct-slot plists (:name N :initargs (..) :initfunction fn ..)
+            // to SlotDefinitions.
+            LispObject slotDefsList = Nil.Instance;
+            {
+                var sds = new List<LispObject>();
+                for (var c = slotsSpec; c is Cons cc; c = cc.Cdr)
+                {
+                    if (cc.Car is not Cons) continue;
+                    LispObject sName = Nil.Instance, sInitargs = Nil.Instance, sInitfn = Nil.Instance;
+                    for (var p = cc.Car; p is Cons pc && pc.Cdr is Cons pv; p = pv.Cdr)
+                    {
+                        if (pc.Car is Symbol pk)
+                        {
+                            if (pk == Startup.Keyword("NAME")) sName = pv.Car;
+                            else if (pk == Startup.Keyword("INITARGS")) sInitargs = pv.Car;
+                            else if (pk == Startup.Keyword("INITFUNCTION")) sInitfn = pv.Car;
+                        }
+                    }
+                    if (sName is Symbol) sds.Add(Runtime.MakeSlotDef(sName, sInitargs, sInitfn));
+                }
+                for (int i = sds.Count - 1; i >= 0; i--) slotDefsList = new Cons(sds[i], slotDefsList);
+            }
+            var clsObj = Runtime.MakeClassFull(nameSym, supersList, slotDefsList,
+                                               (LispObject?)metaclass ?? Nil.Instance);
+            LispObject registered = clsObj is LispClass cls ? Runtime.RegisterClass(cls) : clsObj;
+            // Apply metaclass-slot initargs (e.g. :type-name) through the init protocol so
+            // they reach the class metaobject's metaclass-defined slots (and :after runs).
+            // RegisterClass's in-place path already switched the metaclass for an existing
+            // class, so this works for re-ensure / forward-ref resolution too.
+            if (metaclass != null && extra.Count > 0 && registered is LispClass rc
+                && Startup.Sym("INITIALIZE-INSTANCE").Function is LispFunction iiFn)
+            {
+                var iiArgs = new LispObject[1 + extra.Count];
+                iiArgs[0] = rc;
+                for (int i = 0; i < extra.Count; i++) iiArgs[i + 1] = extra[i];
+                iiFn.Invoke(iiArgs);
+            }
+            return registered;
         }, "ENSURE-CLASS"));
     }
 }

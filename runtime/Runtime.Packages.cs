@@ -264,7 +264,7 @@ public static partial class Runtime
         return Nil.Instance;
     }
 
-    // Package lock enforcement (#93 step 2).
+    // Package lock enforcement (step 2).
     // Called from %SET-FDEFINITION and RegisterMacroFunction. Signals an error
     // if the symbol's home package is locked, the symbol is external, and
     // DOTCL:*PACKAGE-LOCKS-DISABLED* is nil.
@@ -288,7 +288,7 @@ public static partial class Runtime
         throw new LispErrorException(err);
     }
 
-    // Package lock API (DOTCL:LOCK-PACKAGE etc.) — step 1 of #93: plumbing, no enforcement.
+    // Package lock API (DOTCL:LOCK-PACKAGE etc.) — step 1: plumbing, no enforcement.
     public static LispObject LockPackage(LispObject pkg)
     {
         var p = ResolvePackage(pkg, "LOCK-PACKAGE");

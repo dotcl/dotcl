@@ -1,16 +1,5 @@
 ;;; dotnet:define-class — user-facing macro wrapping DOTNET:%DEFINE-CLASS.
 ;;;
-;;; Part of the defclass-cil roadmap:
-;;;   D776 = Step 5a runtime primitive
-;;;   D777 = Step 5b macro
-;;;   D778 = Step 5c short-name resolution + (require :dotnet-class)
-;;;   D783 = Step 7a (:ctor ...) option in macro
-;;;   D785 = Step 7b (:properties ...) auto-properties
-;;;   D786 = Step 7c :override keyword on method spec
-;;;   D787 = Step 7d (:implements ...) for interface implementations
-;;;   D788 = Step 7e (:events ...) for events (delegate field + add_/remove_)
-;;;   D790 = Step 7g :notify keyword on property spec (auto-fires PropertyChanged)
-;;;
 ;;; Loaded via `(require :dotnet-class)` (module-provide-contrib finds
 ;;; contrib/dotnet-class/dotnet-class.lisp) or explicit (load ...).
 ;;;
@@ -162,7 +151,7 @@
          (fields-opt (cdr (assoc :fields options)))
          (attrs-opt  (cdr (assoc :attributes options)))
          (methods-opt (cdr (assoc :methods options)))
-         ;; D1106: collect ALL :ctor forms (supports overloading)
+         ;; collect ALL :ctor forms (supports overloading)
          (ctor-forms (mapcar #'cdr
                              (remove-if-not (lambda (opt) (eq (car opt) :ctor))
                                             options)))
@@ -248,13 +237,13 @@
            'nil)
       nil   ; arg 9: ctor-param-types (unused; ctors go via arg 11)
       nil   ; arg 10: base-ctor-arg-indices (unused; ctors go via arg 11)
-      ;; arg 11: ctor-specs-list — one entry per :ctor form (D1106)
+      ;; arg 11: ctor-specs-list — one entry per :ctor form
       ,(if ctor-forms
            `(list ,@(mapcar #'dotnet::%process-ctor-form ctor-forms))
            'nil))))
 
 ;;; ---------------------------------------------------------------------------
-;;; D892 — dotnet:ref: indexer sugar (get_Item / set_Item)
+;;; dotnet:ref: indexer sugar (get_Item / set_Item)
 ;;;
 ;;; (dotnet:ref obj key)           → (dotnet:invoke obj "get_Item" key)
 ;;; (setf (dotnet:ref obj key) val)→ (dotnet:invoke obj "set_Item" key val)
@@ -271,7 +260,7 @@
   `(dotnet:invoke ,obj "set_Item" ,@keys ,val))
 
 ;;; ---------------------------------------------------------------------------
-;;; D893 — dotnet:using: IDisposable resource cleanup macro
+;;; dotnet:using: IDisposable resource cleanup macro
 ;;;
 ;;; (dotnet:using ((var init-expr) ...) body...)
 ;;;

@@ -1697,7 +1697,7 @@ public static partial class Runtime
     /// <summary>Render one backtrace argument: bounded depth/length, cycle-safe, and
     /// guarded against re-entry and printer errors (e.g. a print-object method that
     /// itself signals). Called only while formatting a backtrace, never on the call
-    /// hot path (#251).</summary>
+    /// hot path.</summary>
     public static string BacktraceArgString(LispObject obj)
     {
         if (_inBacktraceRender) return "#";   // a nested print escaped back here

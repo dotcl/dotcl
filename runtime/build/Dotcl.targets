@@ -1,5 +1,5 @@
 <!--
-  Dotcl.targets : MSBuild integration for project-core builds (#166)
+  Dotcl.targets : MSBuild integration for project-core builds
 
   Consumers import this in their .csproj and set DotclProjectAsd:
 
@@ -38,7 +38,7 @@
        Add base core + bundle dir contents as build items: <None> on
        Windows desktop, <MauiAsset> on Android.
 
-  Runtime side: DotclHost.LoadFromManifest (D837) consumes the manifest
+  Runtime side: DotclHost.LoadFromManifest consumes the manifest
   and loads everything in order — including the base core, so the host
   C# code only needs Initialize + LoadFromManifest + LoadLispFile (for
   any user `.lisp` left as source).

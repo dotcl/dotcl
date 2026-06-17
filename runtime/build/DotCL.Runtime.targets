@@ -1,0 +1,28 @@
+<Project>
+  <!-- Injected into PackageReference consumers (direct and, via buildTransitive,
+       transitive). Copies the packaged dotcl.core and contrib tree into the
+       consumer's build output so DotclHost.FindCore() finds dotcl.core at
+       AppContext.BaseDirectory and (require :dotnet-class) etc. resolve from
+       AppContext.BaseDirectory/contrib.
+       contentFiles/copyToOutput is unreliable on plain `dotnet build`, so we
+       inject explicit copy-to-output items here instead. -->
+  <PropertyGroup>
+    <_DotCLRuntimeAssets>$(MSBuildThisFileDirectory)../dotclassets/</_DotCLRuntimeAssets>
+  </PropertyGroup>
+
+  <ItemGroup Condition="Exists('$(_DotCLRuntimeAssets)dotcl.core')">
+    <None Include="$(_DotCLRuntimeAssets)dotcl.core">
+      <Link>dotcl.core</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Visible>false</Visible>
+    </None>
+  </ItemGroup>
+
+  <ItemGroup Condition="Exists('$(_DotCLRuntimeAssets)contrib')">
+    <None Include="$(_DotCLRuntimeAssets)contrib/**/*">
+      <Link>contrib/%(RecursiveDir)%(Filename)%(Extension)</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Visible>false</Visible>
+    </None>
+  </ItemGroup>
+</Project>

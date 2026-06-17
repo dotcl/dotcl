@@ -18,25 +18,25 @@ public class SlotDefinition : LispObject
     /// <summary>Index of this slot in the instance layout (LispInstance.Slots),
     /// set during class finalization. -1 for :class-allocation slots and direct
     /// slot definitions (not in any instance layout). Returned by the AMOP
-    /// SLOT-DEFINITION-LOCATION accessor and used by STANDARD-INSTANCE-ACCESS (#264).</summary>
+    /// SLOT-DEFINITION-LOCATION accessor and used by STANDARD-INSTANCE-ACCESS.</summary>
     public int Location { get; set; } = -1;
 
     /// <summary>The CLOS class of this slot-definition metaobject when customized
     /// via direct-/effective-slot-definition-class (a subclass of standard-{direct,
     /// effective}-slot-definition). null = the standard class implied by IsEffective.
     /// CLASS-OF and TYPEP consult this so methods can dispatch on the slotd's class
-    /// (e.g. slot-value-using-class specialized on a custom effective-slot) (#264).</summary>
+    /// (e.g. slot-value-using-class specialized on a custom effective-slot).</summary>
     public LispClass? MetaClass { get; set; }
 
     /// <summary>Storage for the Lisp-level slots introduced by a custom slot-definition
     /// class (e.g. McCLIM's DYNAMIC-DIRECT-SLOT/DYNAMIC-EFFECTIVE-SLOT add a DYNAMIC
     /// slot). Keyed by slot name; null until the slotd gets a custom MetaClass. SLOT-VALUE
-    /// / (SETF SLOT-VALUE) / SLOT-BOUNDP route through this for SlotDefinition objects (#264).</summary>
+    /// / (SETF SLOT-VALUE) / SLOT-BOUNDP route through this for SlotDefinition objects.</summary>
     public Dictionary<string, LispObject?>? ExtraSlots { get; set; }
 
     /// <summary>The canonical slot-option plist (a Lisp list :key val ...) captured from the
     /// DEFCLASS slot specifier, used as the &rest initargs when DIRECT-SLOT-DEFINITION-CLASS
-    /// is consulted for a custom metaclass. Null for slots defined under STANDARD-CLASS (#264).</summary>
+    /// is consulted for a custom metaclass. Null for slots defined under STANDARD-CLASS.</summary>
     public LispObject? RawOptions { get; set; }
 
     public SlotDefinition(Symbol name, Symbol[]? initargs = null, LispFunction? initformThunk = null, bool isClassAllocation = false)
@@ -79,6 +79,11 @@ public class LispClass : LispObject
     public (Symbol Key, LispFunction Thunk)[] DefaultInitargs { get; set; } = Array.Empty<(Symbol, LispFunction)>();
     /// <summary>Storage for :allocation :class slots (shared across all instances).</summary>
     public Dictionary<string, LispObject?> ClassSlotValues { get; } = new();
+    /// <summary>Slot values this class holds as an instance of its (custom) metaclass —
+    /// i.e. slots the metaclass adds beyond STANDARD-CLASS. Null until populated.
+    /// Lets slot-value on a class metaobject read metaclass-defined slots,
+    /// mirroring SlotDefinition.ExtraSlots.</summary>
+    public Dictionary<string, LispObject?>? ExtraSlots { get; set; }
     /// <summary>Cached mapping from initarg name to slot index (only valid when each initarg maps to one slot).</summary>
     public Dictionary<string, int>? InitargToSlotIndex { get; set; }
     /// <summary>True if this class can use the fast make-instance path.</summary>
@@ -168,7 +173,7 @@ public class LispClass : LispObject
         {
             SlotIndex[EffectiveSlots[i].Name.Name] = i;
             // Instance-allocated slots get their layout index as location; :class
-            // allocation slots are not in the per-instance vector (#264).
+            // allocation slots are not in the per-instance vector.
             EffectiveSlots[i].Location = EffectiveSlots[i].IsClassAllocation ? -1 : i;
         }
         ComputeEffectiveDefaultInitargs();
@@ -280,7 +285,7 @@ public class LispClass : LispObject
     /// <summary>Hook for the COMPUTE-EFFECTIVE-SLOT-DEFINITION metaobject protocol.
     /// Set by Runtime CLOS init. When a class has a custom metaclass, FinalizeClass
     /// routes each slot's effective-definition construction through this delegate
-    /// (which calls the Lisp GF) instead of building it directly in C# (#264).</summary>
+    /// (which calls the Lisp GF) instead of building it directly in C#.</summary>
     public static Func<LispClass, Symbol, SlotDefinition[], SlotDefinition?>? ComputeEffectiveSlotHook;
 
     /// <summary>Build the standard effective slot definition by merging the per-name
@@ -339,7 +344,7 @@ public class LispClass : LispObject
 
         // For a custom metaclass, drive each slot through the COMPUTE-EFFECTIVE-SLOT-DEFINITION
         // protocol (AMOP). Standard classes (Metaclass == null) keep the direct C# path,
-        // which also avoids GF calls during bootstrap and for the common case (#264).
+        // which also avoids GF calls during bootstrap and for the common case.
         bool useProtocol = Metaclass != null && ComputeEffectiveSlotHook != null;
 
         var slots = new List<SlotDefinition>();
@@ -456,7 +461,7 @@ public class GenericFunction : LispFunction
 {
     public new Symbol Name { get; }
 
-    // Method list is copy-on-write for thread safety (#278): dispatch reads an
+    // Method list is copy-on-write for thread safety: dispatch reads an
     // immutable snapshot (the `Methods` property returns the current array, which
     // foreach/Count/[i] enumerate consistently even if a concurrent defmethod swaps
     // it), while mutations (ADD-METHOD / REMOVE-METHOD / defgeneric-inline clear)
@@ -479,7 +484,7 @@ public class GenericFunction : LispFunction
     /// <summary>Method combination arguments from defgeneric (:method-combination name arg1 arg2 ...)</summary>
     public LispObject[]? MethodCombinationArgs { get; set; }
     /// <summary>:argument-precedence-order as a permutation of required-parameter
-    /// indices (CLHS 7.6.6.1.2). null means natural left-to-right order (#268).</summary>
+    /// indices (CLHS 7.6.6.1.2). null means natural left-to-right order.</summary>
     public int[]? ArgumentPrecedenceOrder { get; set; }
     /// <summary>Method combination order: true = most-specific-first (default), false = most-specific-last</summary>
     public bool MostSpecificFirst { get; set; } = true;
@@ -507,7 +512,7 @@ public class GenericFunction : LispFunction
     /// Caches the last successful dispatch result for quick reuse. `volatile` so a
     /// concurrent InvalidateCache (defmethod) / cache-fill is visible across threads
     /// and reads never tear — worst case a reader uses a complete but slightly stale
-    /// CachedDispatch, never a corrupt one (#278).</summary>
+    /// CachedDispatch, never a corrupt one.</summary>
     internal volatile CachedDispatch? LastDispatch;
 
     /// <summary>Invalidate dispatch cache when methods are added/removed.</summary>

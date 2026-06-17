@@ -1,6 +1,6 @@
 // MOP (Meta-Object Protocol) wrappers — DOTCL-MOP package.
 //
-// Phase 1 of #144: expose dotcl's existing CLOS introspection so that
+// Expose dotcl's existing CLOS introspection so that
 // closer-mop's #+dotcl arm (and our fork's closer-dotcl.lisp) can
 // (:import-from :dotcl-mop ...) the AMOP API.
 //
@@ -147,13 +147,13 @@ public static class Mop
         RegisterMop("SLOT-DEFINITION-LOCATION", 1, args =>
         {
             // AMOP: a non-negative integer index into the instance layout for
-            // instance-allocated slots; NIL for :class allocation (#264).
+            // instance-allocated slots; NIL for :class allocation.
             if (args[0] is not SlotDefinition s) return Nil.Instance;
             return s.Location >= 0 ? (LispObject)Fixnum.Make(s.Location) : Nil.Instance;
         });
 
         // STANDARD-INSTANCE-ACCESS (instance location): read the slot at the given
-        // integer layout index directly, bypassing slot-value-using-class (#264).
+        // integer layout index directly, bypassing slot-value-using-class.
         RegisterMop("STANDARD-INSTANCE-ACCESS", 2, args =>
         {
             if (args[0] is not LispInstance inst)
@@ -234,7 +234,7 @@ public static class Mop
                 else break;
                 cur = c.Cdr;
             }
-            // Return in argument-precedence-order when declared, else declaration order (#268).
+            // Return in argument-precedence-order when declared, else declaration order.
             int[]? apo = gf.ArgumentPrecedenceOrder;
             if (apo != null)
             {
@@ -294,7 +294,7 @@ public static class Mop
         // These drive custom slot-definition classes (e.g. McCLIM's class-with-dynamic-slots).
         // Defaults specialize on CLASS so user metaclasses override via more-specific methods.
         // Only invoked for classes with a custom metaclass (see Runtime.MakeClassCore /
-        // LispClass.ComputeEffectiveSlots), so standard CLOS is untouched (#264).
+        // LispClass.ComputeEffectiveSlots), so standard CLOS is untouched.
         {
             var classCls = (LispClass)Runtime.FindClass(Startup.Sym("CLASS"));
             var tCls = (LispClass)Runtime.FindClass(Startup.Sym("T"));
@@ -383,7 +383,7 @@ public static class Mop
         });
 
         // Wire the COMPUTE-EFFECTIVE-SLOT-DEFINITION protocol into class finalization.
-        // The GF is resolved lazily so user methods (added later) participate (#264).
+        // The GF is resolved lazily so user methods (added later) participate.
         LispClass.ComputeEffectiveSlotHook = (cls, name, defs) =>
         {
             if (Startup.Sym("COMPUTE-EFFECTIVE-SLOT-DEFINITION").Function is not LispFunction gf)

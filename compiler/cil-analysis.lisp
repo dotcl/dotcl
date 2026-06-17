@@ -43,7 +43,7 @@
 (unless (fboundp '%stack-space-available-p)
   (defun %stack-space-available-p () t))
 
-;;; find-free-vars-expr: iterative version using explicit worklist (#18).
+;;; find-free-vars-expr: iterative version using explicit worklist.
 ;;; Each worklist entry is (expr bound . mdepth).
 ;;; Macrolet restore sentinels: (:restore-macro name . old-entry-or-nil).
 (defun find-free-vars-expr (expr bound free-ht)
@@ -407,7 +407,7 @@
       (find-mutated-vars-expr form result))
     (let ((keys '())) (maphash (lambda (k v) (declare (ignore v)) (push k keys)) result) keys)))
 
-;;; find-mutated-vars-expr: iterative version using explicit worklist (#18).
+;;; find-mutated-vars-expr: iterative version using explicit worklist.
 ;;; Each worklist entry is (expr . macro-depth) OR a restore sentinel
 ;;; (:restore-symbol-macros . old-*symbol-macros*).
 (defun find-mutated-vars-expr (expr result-ht)
@@ -572,7 +572,7 @@
     (let ((keys '())) (maphash (lambda (k v) (declare (ignore v)) (push k keys)) result) keys)))
 
 
-;;; find-captured-vars-expr: iterative version using explicit worklist (#18).
+;;; find-captured-vars-expr: iterative version using explicit worklist.
 ;;; Each worklist entry is (expr inside-lambda . macro-depth).
 (defun find-captured-vars-expr (expr var-names result-ht inside-lambda)
   (let ((worklist (list (cons expr (cons inside-lambda 0)))))
@@ -692,7 +692,7 @@
                         (push (cons sub (cons in-lambda mdepth)) worklist)))))))))))))
 
 ;;; ============================================================
-;;; Copy propagation: eliminate single-reference let locals (#198)
+;;; Copy propagation: eliminate single-reference let locals
 ;;; ============================================================
 
 (defun eliminate-single-ref-locals (instrs)
@@ -749,7 +749,7 @@
                        instrs))))))
 
 ;;; ============================================================
-;;; Slot sharing: merge LispObject locals with disjoint flat ranges (#199)
+;;; Slot sharing: merge LispObject locals with disjoint flat ranges
 ;;; ============================================================
 
 (defun peephole-optimize (instrs)
@@ -949,7 +949,7 @@
 (defun compile-toplevel-eval (expr)
   "Compile a top-level expression for EVAL.
    Like compile-toplevel but preserves MvReturn at the tail so EVAL's
-   caller can observe the form's multiple values (D638, issue #19)."
+   caller can observe the form's multiple values."
   (let ((*locals* '())
         (*var-counter* 0)
         (*label-counter* 0)

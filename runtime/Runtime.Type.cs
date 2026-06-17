@@ -63,7 +63,7 @@ public static partial class Runtime
             }
             // Slot-definition metaobjects dispatch by their (possibly customized)
             // CLOS class — walk its CPL so (typep slotd 'standard-effective-slot-
-            // definition) and dispatch on a custom slot-def class both work (#264).
+            // definition) and dispatch on a custom slot-def class both work.
             if (typeSpec is Symbol sdClsSym && obj is SlotDefinition)
             {
                 var resolvedCls = FindClassOrNil(sdClsSym) as LispClass;
@@ -72,6 +72,19 @@ public static partial class Runtime
                     foreach (var c in sdClass.ClassPrecedenceList)
                         if (ReferenceEquals(c, resolvedCls)) return T.Instance;
                     // No match against a known class — fall through (could be T/ATOM).
+                }
+            }
+            // A class metaobject's type is its metaclass: walk (class-of class)'s CPL so
+            // (typep (find-class 'foo) 'my-meta) and 'standard-class agree with CLASS-OF
+            // when FOO was defined with a custom metaclass.
+            if (typeSpec is Symbol clsObjSym && obj is LispClass)
+            {
+                var resolvedCls = FindClassOrNil(clsObjSym) as LispClass;
+                if (resolvedCls != null && ClassOf(obj) is LispClass objMeta)
+                {
+                    foreach (var c in objMeta.ClassPrecedenceList)
+                        if (ReferenceEquals(c, resolvedCls)) return T.Instance;
+                    // No match against a known class — fall through (could be T/ATOM/etc.).
                 }
             }
             if (CheckSimpleType(obj, name)) return T.Instance;

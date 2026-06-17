@@ -221,3 +221,84 @@
 (deftest d1110-gf-lambda-list-with-optional
   (generic-function-lambda-list #'mop-ll-opt)
   (x y &optional z))
+
+;;; --- custom metaclass identity: defclass and ensure-class (#287) ---
+;; ensure-class must honor :metaclass (it used to ignore it), and a class
+;; defined with a custom metaclass must satisfy TYPEP against that metaclass
+;; consistently with CLASS-OF.
+(defclass mop-meta (standard-class) ())
+(defmethod dotcl-mop:validate-superclass ((c mop-meta) (s standard-class)) t)
+
+(defclass mop-with-meta () () (:metaclass mop-meta))
+
+(deftest mop-defclass-metaclass-class-of
+  (eq (class-of (find-class 'mop-with-meta)) (find-class 'mop-meta))
+  t)
+
+(deftest mop-defclass-metaclass-typep
+  (notnot (typep (find-class 'mop-with-meta) 'mop-meta))
+  t)
+
+(dotcl-mop:ensure-class 'mop-ec-meta
+                        :metaclass 'mop-meta
+                        :direct-superclasses (list (find-class 'standard-object)))
+
+(deftest mop-ensure-class-honors-metaclass-class-of
+  (eq (class-of (find-class 'mop-ec-meta)) (find-class 'mop-meta))
+  t)
+
+(deftest mop-ensure-class-honors-metaclass-typep
+  (notnot (typep (find-class 'mop-ec-meta) 'mop-meta))
+  t)
+
+(deftest mop-ensure-class-superclass
+  (notnot (member (find-class 'standard-object)
+                  (dotcl-mop:class-precedence-list (find-class 'mop-ec-meta))))
+  t)
+
+;;; --- metaclass-added slots on the class metaobject (#291) ---
+;; A metaclass that subclasses standard-class AND adds a slot: the classes it
+;; creates must hold that slot on their class metaobject (slot-value works).
+(defclass mop-meta-mixin () ((tag :initarg :tag :initform :none)))
+(defclass mop-meta-slotted (mop-meta-mixin standard-class) ())
+(defmethod dotcl-mop:validate-superclass ((c mop-meta-slotted) (s standard-class)) t)
+(defclass mop-foo-slotted () () (:metaclass mop-meta-slotted))
+
+(deftest mop-metaclass-slot-initform
+  (slot-value (find-class 'mop-foo-slotted) 'tag)
+  :none)
+
+(deftest mop-metaclass-slot-setf-boundp
+  (let ((c (find-class 'mop-foo-slotted)))
+    (setf (slot-value c 'tag) :hi)
+    (list (slot-value c 'tag) (notnot (slot-boundp c 'tag))))
+  (:hi t))
+
+;;; #295: a class metaobject runs the metaclass's inherited initialize-instance
+;;; :after — a slot computed by :after (no initform/initarg) is bound on the class.
+(defclass mop-meta-mixin2 () ((computed :accessor mop-computed)))
+(defmethod initialize-instance :after ((o mop-meta-mixin2) &key)
+  (unless (slot-boundp o 'computed) (setf (slot-value o 'computed) :by-after)))
+(defclass mop-meta-after (mop-meta-mixin2 standard-class) ())
+(defmethod dotcl-mop:validate-superclass ((c mop-meta-after) (s standard-class)) t)
+(defclass mop-foo-after () () (:metaclass mop-meta-after))
+
+(deftest mop-metaclass-initialize-instance-after
+  (slot-value (find-class 'mop-foo-after) 'computed)
+  :by-after)
+
+;;; #296: re-ensure-class an existing class under a different metaclass switches the
+;;; metaclass and applies metaclass-slot initargs (McCLIM forward-ref -> real class).
+(defclass mop-meta-tn () ((type-name :initarg :type-name :accessor mop-type-name)))
+(defclass mop-meta-switch (mop-meta-tn standard-class) ())
+(defmethod dotcl-mop:validate-superclass ((c mop-meta-switch) (s standard-class)) t)
+(dotcl-mop:ensure-class 'mop-reensure :direct-superclasses (list (find-class 'standard-object)))
+(dotcl-mop:ensure-class 'mop-reensure :metaclass 'mop-meta-switch :type-name 'mop-reensure
+                        :direct-superclasses (list (find-class 'standard-object)))
+
+(deftest mop-reensure-metaclass-switch
+  (notnot (typep (find-class 'mop-reensure) 'mop-meta-switch))
+  t)
+(deftest mop-reensure-initarg-applied
+  (slot-value (find-class 'mop-reensure) 'type-name)
+  mop-reensure)

@@ -3,6 +3,58 @@
 User-facing release notes for dotcl. Each section corresponds to a tagged
 release on the public mirror (dotcl/dotcl).
 
+## v0.1.11 — 2026-06-17
+
+### Type-declared .NET calls compile to a direct call
+
+When the receiver and arguments of `dotnet:invoke` carry a static .NET type via
+`(the (dotnet "Type.FullName") x)`, the call now compiles to a direct `callvirt`
+to the resolved overload instead of a runtime member lookup — about 3.5x faster
+than the (already cached) dynamic path. Untyped calls are unchanged, so this is
+opt-in:
+
+```lisp
+(dotnet:invoke (the (dotnet "System.Text.StringBuilder") sb) "get_Length")
+```
+
+### uiop:run-program redirection and :directory
+
+`dotcl:launch-process` now takes per-stream redirection specs (`:stream`, a file
+pathname, `nil`, or inherit) and a working directory, so `uiop:run-program` /
+`uiop:launch-program` correctly handle file and null output/input redirection and
+the `:directory` argument.
+
+### Custom metaclasses
+
+`ensure-class` and `defclass`'s `(:metaclass ...)` option now honor a custom
+metaclass: the resulting class is an instance of that metaclass (so `class-of`
+and `typep` agree on the class metaobject), slots the metaclass adds beyond
+`standard-class` are stored on the class metaobject (readable/writable with
+`slot-value`), and the metaclass's inherited `initialize-instance` /
+`shared-initialize` methods run when the class is created — so `:after`-computed
+metaclass slots are initialized too.
+
+### dotnet:new with optional-only constructors
+
+`(dotnet:new "Type")` now works for a type whose only constructor has
+all-optional parameters (e.g. `FluentTheme(Uri? baseUri = null)`), supplying the
+defaults like C#'s `new T()`.
+
+### Windows desktop assemblies
+
+WinForms and WPF assemblies load by simple name —
+`(dotnet:load-assembly "PresentationFramework")` — with transitive
+shared-framework references resolved automatically. WinForms runs from the plain
+runtime; full WPF should be hosted in a WindowsDesktop (`UseWPF`) app. See
+`docs/windows.md` for the recipe, including the STA thread + message-pump setup.
+
+### Embedding (DotCL.Runtime)
+
+The `DotCL.Runtime` package now copies `dotcl.core` and the `contrib` tree to a
+referencing project's build output, so `DotclHost.FindCore()` and
+`(require :dotnet-class)` (i.e. `dotnet:define-class`) work from a plain
+`PackageReference` with no manual asset wiring.
+
 ## v0.1.10 — 2026-06-16
 
 ### Faster .NET interop calls

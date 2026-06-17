@@ -10,7 +10,7 @@ internal static class DotNetEvents
     // itself becomes unreachable. Lets AddEvent and RemoveEvent share the
     // same Delegate instance for a given (handler, delegateType) pair so
     // bare Lisp lambdas passed to remove-event correctly detach the handler
-    // that add-event installed (#160).
+    // that add-event installed.
     private static readonly ConditionalWeakTable<LispObject, Dictionary<Type, Delegate>>
         _delegateCache = new();
 

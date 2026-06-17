@@ -19,9 +19,9 @@ public class CilAssembler
     internal TypeBuilder? _faslTypeBuilder;
     private static int _faslClosureCount;
 
-    // Function registry is per-symbol (sym.Function / sym.SetfFunction) as of
-    // D683 / #113 Phase 3. The former flat `_functions` ConcurrentDictionary
-    // was removed — Startup.Sym(name).Function is now the sole source of truth.
+    // Function registry is per-symbol (sym.Function / sym.SetfFunction).
+    // The former flat `_functions` ConcurrentDictionary was removed —
+    // Startup.Sym(name).Function is now the sole source of truth.
 
     // Constant pool for non-inline literals. Stored as a raw object[] so
     // indexed reads are lock-free (one volatile load of the array reference
@@ -147,7 +147,7 @@ public class CilAssembler
     {
         // (SETF NAME) form: look up SetfFunction on the target symbol.
         // compile-named-call emits (:ldstr "(SETF NAME)") (:call "CilAssembler.GetFunction")
-        // for non-symbol names like (setf foo). After D683 removed _functions fallback,
+        // for non-symbol names like (setf foo). After removing the _functions fallback,
         // we must route to SetfFunction explicitly here.
         // Cross-package bridge: search all packages for a symbol with SetfFunction set,
         // since the defun may have been registered in a package other than CL or DOTCL-INTERNAL.
@@ -186,7 +186,7 @@ public class CilAssembler
     /// <summary>
     /// Symbol-based function lookup. sym.Function is primary. If empty,
     /// fall back to any same-named symbol in another package that has a
-    /// Function (D683 Phase 3) — replaces the old _functions flat
+    /// Function — replaces the old _functions flat
     /// table as a cross-package bridge. Caches the result on sym.Function
     /// to make subsequent lookups O(1).
     /// </summary>
@@ -298,7 +298,7 @@ public class CilAssembler
         }
         // Use bridge-free lookup: only CL + DOTCL-INTERNAL.
         // Prevents RegisterFunction from silently overwriting another package's
-        // Function slot via the cross-package bridge (#158/D918).
+        // Function slot via the cross-package bridge.
         var checkedSym = Startup.SymForRegistration(name);
         Runtime.CheckPackageLock(checkedSym, "DEFUN");  // may throw if locked
         checkedSym.Function = fn;
@@ -619,7 +619,7 @@ public class CilAssembler
                 // defmethod-direct registrations on the symbol's home
                 // package are picked up. Pre-resolving here would pin
                 // a Function-less placeholder in the constants pool
-                // before the defun has run (D683 Phase 3).
+                // before the defun has run.
                 var symName = GetString(Cadr(c));
                 _il.Emit(OpCodes.Ldstr, _faslMode ? Track(symName) : symName);
                 _il.Emit(OpCodes.Call, _methodCache["Startup.Sym"]);
@@ -752,7 +752,7 @@ public class CilAssembler
 
         // Register on the correct symbol for package-aware lookup.
         // If :pkg was specified, use that package (the defun name's home package).
-        // Otherwise fall back to *package* (D115 fix for flat namespace collision).
+        // Otherwise fall back to *package* (avoids flat namespace collision).
         // Check foreign CL BEFORE updating flat table to prevent overwriting host builtins.
         Symbol? pkgSym = null;
         bool isForeignCL2 = false;
@@ -784,7 +784,7 @@ public class CilAssembler
         }
         else if (name.StartsWith("(SETF ") && name.EndsWith(")"))
         {
-            // (SETF NAME): register fn on the target NAME symbol's SetfFunction slot (#58 Phase 1)
+            // (SETF NAME): register fn on the target NAME symbol's SetfFunction slot (Phase 1)
             var targetName = name.Substring(6, name.Length - 7);
             try
             {
@@ -823,7 +823,7 @@ public class CilAssembler
         }
         if (setfTargetSym != null)
         {
-            // Setf function runtime re-registration via sym.SetfFunction (#58 Phase 1)
+            // Setf function runtime re-registration via sym.SetfFunction (Phase 1)
             _il.Emit(OpCodes.Ldstr, setfTargetSym.Name);
             _il.Emit(OpCodes.Ldstr, setfTargetSym.HomePackage?.Name ?? defPkg ?? "");
             _il.Emit(OpCodes.Call, _methodCache["Startup.SymInPkg"]);
@@ -1154,7 +1154,7 @@ public class CilAssembler
                     defPkg = GetString(val);
                     break;
                 case "SELF":
-                    // D1144: this direct fn does a non-tail self-call; the body expects
+                    // this direct fn does a non-tail self-call; the body expects
                     // the self LispFunction as arg0 (params shifted to ldarg 1..n).
                     selfArg0 = val is not Nil;
                     break;
@@ -2261,7 +2261,7 @@ public class CilAssembler
                     // Multi-dimensional array: preserve rank/dimensions via the
                     // (LispObject[], int[], string) ctor. Without this, #2A(...)
                     // literals in compile-file output come back as flat 1D
-                    // vectors (D736 / issue #149).
+                    // vectors.
                     var dims = vec._dimensions;
                     _il.Emit(OpCodes.Ldc_I4, dims.Length);
                     _il.Emit(OpCodes.Newarr, typeof(int));
@@ -2281,7 +2281,7 @@ public class CilAssembler
                 {
                     // 1D vector with custom element-type (SINGLE-FLOAT, BIT, etc.):
                     // preserve via (LispObject[], string) ctor. Keeps _dimensions null
-                    // so the vector stays a proper 1D type (issue #150).
+                    // so the vector stays a proper 1D type.
                     _il.Emit(OpCodes.Ldstr, vec.ElementTypeName);
                     _il.Emit(OpCodes.Newobj,
                         typeof(LispVector).GetConstructor(

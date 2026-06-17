@@ -256,7 +256,7 @@ public class Package : LispObject
         _localNicknames.Select(kv => (kv.Key, kv.Value));
     // Return a snapshot under _pkgLock so iteration by another thread does
     // not race with Use / Unuse mutating the underlying List<Package>
-    // (#171 Step 2). Same pattern below for ShadowingSymbolNames and Nicknames.
+    // Same pattern below for ShadowingSymbolNames and Nicknames.
     public IReadOnlyList<Package> UseList
     {
         get { lock (_pkgLock) return _useList.ToList(); }
@@ -375,7 +375,7 @@ public class Package : LispObject
 
     // Package lock: when true, definers that would rebind symbols
     // whose home package is this package must signal a package-lock-violation.
-    // Step 1: plumbing only — no enforcement yet (see #93).
+    // Step 1: plumbing only — no enforcement yet.
     public bool IsLocked { get; set; }
 
     /// <summary>

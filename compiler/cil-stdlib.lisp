@@ -1294,3 +1294,44 @@ Also expands element types within compound type specifiers like (VECTOR etype si
                                         &allow-other-keys)
   (declare (ignore all-keys qualifiers lambda-list specializers function documentation)))
 
+
+;;; --- typed dotnet:invoke -> direct callvirt (compiler-macro surface) ---
+;; When the receiver (and every argument) carries a static .NET type via
+;; (the (dotnet "Type.FullName") expr), lower (dotnet:invoke ...) to the
+;; %dotnet-call-direct codegen target (resolved overload + direct callvirt, no
+;; InvokeMember). Otherwise decline so the normal dynamic interop path is used.
+;; Registered at boot under a (find-package "DOTNET") guard because the SBCL
+;; cross-compile host has no DOTNET package / DOTNET:INVOKE symbol.
+(defun %dotnet-the-type (x)
+  "If X is (the (dotnet \"T\") EXPR), return (cons \"T\" EXPR), else NIL."
+  (and (consp x) (consp (cdr x)) (consp (cddr x)) (null (cdddr x))
+       (symbolp (car x)) (string= (symbol-name (car x)) "THE")
+       (let ((spec (cadr x)))
+         (and (consp spec) (consp (cdr spec)) (null (cddr spec))
+              (symbolp (car spec)) (string= (symbol-name (car spec)) "DOTNET")
+              (stringp (cadr spec))
+              (cons (cadr spec) (caddr x))))))
+
+(defun %dotnet-invoke-direct-cm (form env)
+  "Compiler macro for DOTNET:INVOKE: rewrite a fully type-declared call to
+%DOTNET-CALL-DIRECT; decline (return FORM) otherwise."
+  (declare (ignore env))
+  (let ((recv (cadr form)) (method (caddr form)) (args (cdddr form)))
+    (let ((rt (and (stringp method) (%dotnet-the-type recv))))
+      (if (not rt)
+          form
+          (let ((param-types '()) (arg-exprs '()) (ok t))
+            (dolist (a args)
+              (let ((at (%dotnet-the-type a)))
+                (if at
+                    (progn (push (car at) param-types) (push (cdr at) arg-exprs))
+                    (setf ok nil))))
+            (if ok
+                `(%dotnet-call-direct ,(car rt) ,method ,(reverse param-types)
+                                      ,(cdr rt) ,@(reverse arg-exprs))
+                form))))))
+
+(let ((pkg (find-package "DOTNET")))
+  (when pkg
+    (let ((sym (find-symbol "INVOKE" pkg)))
+      (when sym (%register-compiler-macro-rt sym #'%dotnet-invoke-direct-cm)))))

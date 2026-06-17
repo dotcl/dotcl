@@ -111,7 +111,7 @@ public static class DotclHost
     /// resolved against the manifest's own directory if relative, used as-is
     /// if absolute.
     ///
-    /// Intended for project-core deployments (#166): the build target ships
+    /// Intended for project-core deployments: the build target ships
     /// a manifest plus the listed FASLs into the app's asset directory; the
     /// host extracts them and calls this once after <see cref="LoadCore"/>
     /// to bring in all required contribs in dependency order.

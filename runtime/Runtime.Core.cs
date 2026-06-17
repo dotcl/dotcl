@@ -411,7 +411,7 @@ public static partial class Runtime
 
     public static LispObject Fdefinition(LispObject name)
     {
-        // Handle (setf sym) names — sym.SetfFunction is authoritative (D683, #113).
+        // Handle (setf sym) names — sym.SetfFunction is authoritative.
         if (name is Cons c2 && c2.Car is Symbol setfKw && setfKw.Name == "SETF"
             && c2.Cdr is Cons rest2 && rest2.Car is Symbol setfTarget && rest2.Cdr is Nil)
         {
@@ -483,7 +483,7 @@ public static partial class Runtime
 
     public static LispObject Fmakunbound(LispObject name)
     {
-        // (setf sym) form: clear SetfFunction on the target symbol (D683, #113).
+        // (setf sym) form: clear SetfFunction on the target symbol.
         if (name is Cons fc && fc.Car is Symbol fsetfKw && fsetfKw.Name == "SETF"
             && fc.Cdr is Cons frest && frest.Car is Symbol ftarget && frest.Cdr is Nil)
         {
@@ -528,7 +528,7 @@ public static partial class Runtime
     }
 
     // Convert element-type specifier to an ElementTypeName string for LispVector.
-    // Expands user-defined types (deftype) before parsing (D601).
+    // Expands user-defined types (deftype) before parsing.
     internal static string ParseElementTypeName(LispObject typeSpec)
     {
         if (typeSpec is Nil) return "NIL";

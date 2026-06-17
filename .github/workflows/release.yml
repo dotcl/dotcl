@@ -96,7 +96,7 @@ jobs:
         run: make contrib-dotcl-cs
 
       # ── Stage runtime/contrib/ (mirrors the pack target, minus R2R) ──────
-      # R2R support is tracked in issue #131 and will be added as a follow-up.
+      # R2R (ReadyToRun) support is a planned follow-up.
       - name: Stage contrib for packing
         run: |
           rm -rf runtime/contrib
@@ -123,7 +123,7 @@ jobs:
             -o out/ \
             -p:Version=${{ steps.version.outputs.VERSION }}
 
-      # ── Per-RID tbz for Roswell (no R2R; R2R tracked in issue #131) ──────
+      # ── Per-RID tbz for Roswell (no R2R; R2R is a planned follow-up) ──────
       # dotnet publish -r <rid> --self-contained false cross-compiles on Linux
       # for all 6 RIDs.  contrib/ and dotcl.core are injected after publish.
       - name: Build per-RID tbz

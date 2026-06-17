@@ -585,7 +585,7 @@ public class LispHashTable : LispObject
     // For :weakness :value, _dict's value is a System.WeakReference<LispObject>;
     // for :weakness nil (default), it's the LispObject directly. Storing as
     // `object` keeps both shapes in one dictionary instance without doubling
-    // the field surface (#147).
+    // the field surface.
     private readonly Dictionary<LispObject, object> _dict;
     private readonly Func<LispObject, LispObject, bool> _test;
     private readonly string _testName;
@@ -942,7 +942,7 @@ public class LispHashTable : LispObject
         }
 
         // Normalize T.Instance/Nil.Instance to their symbol forms so EQ/EQL
-        // hash tables treat them as the same key (issue #22).
+        // hash tables treat them as the same key.
         private static LispObject Canonical(LispObject obj) =>
             obj is T ? (LispObject)(Startup.T_SYM ?? obj) :
             obj is Nil ? (Startup.NIL_SYM ?? (LispObject)obj) : obj;

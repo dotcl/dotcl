@@ -54,7 +54,7 @@ public class FaslAssembler
     // Typed delegate constructors for arities 0..8 (index 0 = Func<LispObject>, etc.)
     internal static readonly ConstructorInfo[] TypedFuncCtors = BuildTypedFuncCtors();
     // Native delegate constructors for arities 1..4. The leading LispFunction is the
-    // self argument threaded through native self-calls (D1143); index 0 =
+    // self argument threaded through native self-calls; index 0 =
     // Func<LispFunction,long,LispObject>, etc.
     internal static readonly ConstructorInfo[] NativeTypedFuncCtors = BuildNativeTypedFuncCtors();
 
@@ -145,8 +145,8 @@ public class FaslAssembler
         // outer level. If so, splitting at defmethod boundaries would orphan
         // labels from their branches, or orphan (:ldloc X)/(:stloc X) from
         // their (:declare-local X) — each helper has its own label and local
-        // table. Symptoms: "Label N has not been marked" (D719),
-        // "Undeclared local: X_N" (D721).
+        // table. Symptoms: "Label N has not been marked",
+        // "Undeclared local: X_N".
         bool hasDefmethod = false;
         bool hasBranch = false;
         bool hasOuterLocal = false;
@@ -191,7 +191,7 @@ public class FaslAssembler
             // Split into contiguous segments of non-defmethod / defmethod instructions,
             // flushing each segment in source order. This preserves execution order
             // so that e.g. (progn (fmakunbound 'x) (defun x ...)) clears then registers,
-            // not the other way around. (D674)
+            // not the other way around.
             LispObject? pendingHead = null;  // non-defmethod instructions accumulated so far, forward order
             LispObject? pendingTail = null;  // last Cons of pendingHead for O(1) append
             cur = instrList;
@@ -387,7 +387,7 @@ public class FaslAssembler
                     defPkg = CilAssembler.GetString(val);
                     break;
                 case "SELF":
-                    selfArg0 = val is not Nil;  // D1144: self threaded as arg0
+                    selfArg0 = val is not Nil;  // self threaded as arg0
                     break;
             }
             plist = CilAssembler.Cddr(pc);
@@ -413,7 +413,7 @@ public class FaslAssembler
             throw new Exception($"FASL DEFMETHOD-DIRECT: param-count {paramCount} > 8 not supported");
 
         // 1. Body method with direct typed params: static LispObject Name_body(LispObject p0, ...)
-        // When selfArg0 (D1144), arg0 is the self LispFunction (threaded so a non-tail
+        // When selfArg0, arg0 is the self LispFunction (threaded so a non-tail
         // self-call reaches its receiver from arg0 instead of re-resolving #'NAME each
         // recursive entry); the direct params then start at ldarg 1.
         var directParamTypes = new Type[selfArg0 ? paramCount + 1 : paramCount];
@@ -527,7 +527,7 @@ public class FaslAssembler
 
         // arg0 of every method below is the self LispFunction, threaded so a native
         // self-call reaches its receiver from arg0 instead of re-resolving #'NAME from
-        // its symbol each recursive entry (D1143). The direct/array wrappers are bound
+        // its symbol each recursive entry. The direct/array wrappers are bound
         // as delegates with `fn` as target (EmitRegistrationInto), so they receive self
         // implicitly; the native delegate is unbound and gets self from InvokeNativeN.
 
@@ -650,8 +650,8 @@ public class FaslAssembler
 
         // Install _funcN for direct-call fast path when we have a typed body method.
         // For native (selfBound) functions, directBodyMethod takes a leading LispFunction
-        // self param; bind it to fn so the open delegate signature still matches Func<...>
-        // (D1143). Non-native direct methods have no self param and bind to null.
+        // self param; bind it to fn so the open delegate signature still matches Func<...>.
+        // Non-native direct methods have no self param and bind to null.
         if (directBodyMethod != null && paramCount >= 0 && paramCount <= 8)
         {
             il.Emit(OpCodes.Ldloc, fnLocal);
@@ -661,7 +661,7 @@ public class FaslAssembler
             il.Emit(OpCodes.Callvirt, SetDirectDelegateMI);
         }
 
-        // Install _nativeFuncN for native long→long fast path (#130)
+        // Install _nativeFuncN for native long→long fast path
         if (nativeBodyMethod != null && paramCount >= 1 && paramCount <= 4)
         {
             il.Emit(OpCodes.Ldloc, fnLocal);
@@ -684,7 +684,7 @@ public class FaslAssembler
         }
         else if (defPkg != null)
         {
-            // Package-aware: guarded variant protects inherited CL symbols (D427).
+            // Package-aware: guarded variant protects inherited CL symbols.
             il.Emit(OpCodes.Ldstr, name);
             il.Emit(OpCodes.Ldstr, defPkg);
             il.Emit(OpCodes.Call, SymInPkgMI);

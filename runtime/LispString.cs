@@ -6,7 +6,7 @@ public class LispString : LispObject
     // - LispString(string) starts with _str set and _chars null (no ToCharArray copy).
     // - First mutating access (index set, ToUpperInPlace, RawChars) materializes _chars.
     // This is the dominant LispString allocation pattern (format/printer output) where
-    // the result is consumed read-only — making the ToCharArray copy pure waste pre-D663.
+    // the result is consumed read-only — making the ToCharArray copy pure waste.
     private string? _str;
     private char[]? _chars;
 
