@@ -1,6 +1,8 @@
 ## .NET
 runtime/bin/
 runtime/obj/
+runtime/build-tasks/bin/
+runtime/build-tasks/obj/
 output/
 
 ## Generated

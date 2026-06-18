@@ -1575,3 +1575,40 @@
     (dotnet:invoke sb "Append" "ok")
     (dotnet:invoke sb "ToString"))
   "ok")
+
+;;; #279(a) — Lisp-2: a local variable named like a global function must not shadow
+;;; the function in operator position, even when the local is setf-mutated (boxed).
+;;; Mirrors quicklisp's fetch: (url ...) calls the function URL while url is also a
+;;; mutated parameter.
+(defun %qls-url (thing) (if (stringp thing) (list :parsed thing) thing))
+(defun %qls-fetch (%qls-url)
+  (setf %qls-url (list :merged %qls-url))
+  (let* ((connect (or (%qls-url 99) %qls-url)))
+    (list connect %qls-url)))
+(deftest issue279-local-var-does-not-shadow-global-fn
+  (%qls-fetch :x)
+  (99 (:merged :x)))
+
+;;; compile-file must not leak compile-time *modules* mutations. A
+;;; (provide "x") (or (require "x")) evaluated at :compile-toplevel pushed "x"
+;;; into the global *modules* and survived compile-file, while the matching
+;;; compile-time defuns were stripped — so a later load-time (require "x")
+;;; saw "x" already in *modules*, skipped re-loading, and the module's
+;;; functions stayed unbound. Surfaced as quicklisp's compile-time
+;;; (require "dotcl-socket") leaving ql-dotcl:socket-connect undefined on the
+;;; first (cold-compile) install-dist run ("Not implemented").
+(defun %cf-modules-no-leak ()
+  (let* ((tmp (format nil "~a/dotcl-cfmod-~a"
+                      (or (dotcl:getenv "TEMP") "/tmp")
+                      (get-internal-real-time)))
+         (src (format nil "~a/src.lisp" tmp)))
+    (ensure-directories-exist (concatenate 'string tmp "/"))
+    (with-open-file (s src :direction :output :if-exists :supersede)
+      (format s "(eval-when (:compile-toplevel) (provide \"dotcl-cfmod-phantom\"))~%"))
+    (compile-file src)
+    ;; Provided only at compile time → must not survive into the image's *modules*.
+    (and (member "dotcl-cfmod-phantom" *modules* :test #'string=) t)))
+
+(deftest compile-file-does-not-leak-compile-time-modules
+  (%cf-modules-no-leak)
+  nil)

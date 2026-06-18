@@ -1465,3 +1465,43 @@
       (dotnet:invoke sb "Append" cv)
       (dotnet:invoke sb "ToString")))
   "Hello")
+
+;;; #305 — Nullable<T> marshalling. bool? mirrors plain bool (t->true, nil->false);
+;;; (dotnet:null) is an explicit .NET null distinct from Lisp NIL. Before the fix,
+;;; nil->bool? became null (so false was unreachable) and t->bool? errored.
+(deftest issue305-dotnet-null-distinct
+  (list (eq (dotnet:null) nil) (eq (dotnet:null) t))
+  (nil nil))
+
+(deftest issue305-bool-nullable-t
+  ;; t into a bool? property round-trips as t (errored before the fix).
+  (progn
+    (dotnet:%define-class "Probe305a.H" "System.Object"
+      nil nil nil nil '(("B" "System.Nullable`1[System.Boolean]")))
+    (let ((h (dotnet:new "Probe305a.H")))
+      (dotnet:invoke h "set_B" t)
+      (dotnet:invoke h "get_B")))
+  t)
+
+(deftest issue305-bool-nullable-nil-and-null-no-error
+  ;; nil (=> false) and (dotnet:null) (=> null) both marshal without error;
+  ;; both read back as NIL (false and null collapse on the .NET->Lisp side).
+  (progn
+    (dotnet:%define-class "Probe305b.H" "System.Object"
+      nil nil nil nil '(("B" "System.Nullable`1[System.Boolean]")))
+    (let ((h (dotnet:new "Probe305b.H")))
+      (dotnet:invoke h "set_B" nil)
+      (let ((a (dotnet:invoke h "get_B")))
+        (dotnet:invoke h "set_B" (dotnet:null))
+        (list a (dotnet:invoke h "get_B")))))
+  (nil nil))
+
+;;; int? accepts a value and (dotnet:null); the value round-trips.
+(deftest issue305-int-nullable-value
+  (progn
+    (dotnet:%define-class "Probe305c.H" "System.Object"
+      nil nil nil nil '(("N" "System.Nullable`1[System.Int32]")))
+    (let ((h (dotnet:new "Probe305c.H")))
+      (dotnet:invoke h "set_N" 42)
+      (dotnet:invoke h "get_N")))
+  42)

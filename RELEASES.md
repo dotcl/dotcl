@@ -3,6 +3,80 @@
 User-facing release notes for dotcl. Each section corresponds to a tagged
 release on the public mirror (dotcl/dotcl).
 
+## v0.1.12 — 2026-06-18
+
+### Precompile your Lisp from a plain PackageReference
+
+A project that references `DotCL.Runtime` can now precompile an ASDF system to a
+fasl at build time with a single property — no repo checkout and no global tool
+install. Point `DotclProjectAsd` at your `.asd`:
+
+```xml
+<PropertyGroup>
+  <DotclProjectAsd>$(MSBuildProjectDirectory)/MyApp.asd</DotclProjectAsd>
+</PropertyGroup>
+<ItemGroup>
+  <PackageReference Include="DotCL.Runtime" Version="0.1.12" />
+</ItemGroup>
+```
+
+The build walks the system's `:depends-on` graph, compiles each component, and
+writes a deployment manifest next to your output. At run time, load it in one
+call:
+
+```csharp
+DotclHost.Initialize();
+DotclHost.LoadFromManifest(
+    Path.Combine(AppContext.BaseDirectory, "dotcl-fasl", "dotcl-deps.txt"));
+```
+
+Compilation runs in-process inside MSBuild (no subprocess), reusing the runtime
+the package already ships, so the feature adds only a few KB to the package. It
+requires building with the .NET 10 SDK. A Lisp error during the build surfaces as
+an ordinary MSBuild error. The `.asd` file name must match the system name
+(`MyApp.asd` ↔ `(defsystem "MyApp" ...)`).
+
+GUI and heavy-dependency apps work too. The build does **not** need the .NET
+types your Lisp references to be loaded — a `dotnet:define-class` that inherits,
+say, `Avalonia.Application` compiles fine without Avalonia in the build process;
+the base type is resolved when the fasl is loaded. For that to succeed, force the
+relevant assemblies to load before `LoadFromManifest`:
+
+```csharp
+DotclHost.Initialize();
+_ = typeof(Avalonia.Application).Assembly;   // referencing one type pulls it in
+DotclHost.LoadFromManifest(manifest);
+```
+
+### Script arguments
+
+`dotcl file.lisp arg1 arg2` runs `file.lisp` as a script and passes the trailing
+arguments through to `uiop:command-line-arguments`. Arguments after the script
+file are treated as the program's argv (the Unix convention), so passing a data
+path — `dotcl viewer.lisp image.png` — no longer tries to load `image.png` as
+Lisp source.
+
+### `dotcl build` and a tidier CLI
+
+ASDF system compilation is now a subcommand:
+
+```
+dotcl build MyApp.asd --output obj/MyApp.fasl
+```
+
+`dotcl --help` lists only user-facing options; build-tooling flags are internal.
+New `--no-init` skips the user init file, and `--readline` / `--no-readline`
+force the line-editing REPL on or off (it is on by default for an interactive
+console, off when input is piped).
+
+### Gray Streams predicates
+
+`open-stream-p`, `force-output`, `finish-output`, and `clear-output` now accept
+Gray Streams instances (any object for which `streamp` returns true), matching
+the behavior of `input-stream-p` / `output-stream-p`. Output flush operations
+trampoline to the corresponding `stream-force-output` / `stream-finish-output` /
+`stream-clear-output` generic functions.
+
 ## v0.1.11 — 2026-06-17
 
 ### Type-declared .NET calls compile to a direct call

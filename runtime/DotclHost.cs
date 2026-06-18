@@ -253,4 +253,150 @@ public static class DotclHost
             return Runtime.DotNetToLisp(fn(clrArgs));
         });
     }
+
+    /// <summary>
+    /// Bind <c>*debugger-hook*</c> so an unhandled condition throws back to the
+    /// .NET caller instead of entering the interactive debugger. For
+    /// non-interactive hosts (MSBuild tasks, servers) with no console to drive
+    /// the debugger — otherwise a Lisp error stalls on "stdin closed". The thrown
+    /// <see cref="InvalidOperationException"/> carries the condition type + message.
+    /// </summary>
+    public static void SetThrowingDebuggerHook()
+    {
+        var hookSym = Startup.Sym("*DEBUGGER-HOOK*");
+        DynamicBindings.Set(hookSym, new LispFunction(a =>
+        {
+            var cond = a.Length > 0 ? a[0] : Nil.Instance;
+            var msg = cond is LispCondition lc ? lc.Message : cond.ToString();
+            var typeName = cond is LispCondition lc2 ? lc2.ConditionTypeName : "ERROR";
+            throw new InvalidOperationException($"{typeName}: {msg}");
+        }, "*NON-INTERACTIVE-DEBUGGER-HOOK*", 2));
+    }
+
+    // ── Project-core build (ASDF → fasl) ────────────────────────────────────
+    // Shared by the `dotcl build` CLI subcommand (runtime/Program.cs) and the
+    // MSBuild integration. Assumes Initialize() + LoadCore() have already run.
+    // These throw on error (FileNotFoundException for a missing .asd); callers
+    // map that to their own diagnostic (CLI: stderr+exit; MSBuild task: Log).
+
+    /// <summary>
+    /// Walk an ASDF system's <c>:depends-on</c> graph (dependency-first) and
+    /// emit one fasl path per line in load order, excluding the root system.
+    /// Output goes to <paramref name="manifestOut"/> (or stdout when null).
+    /// Dep systems without a pre-built <c>&lt;name&gt;.fasl</c> are compiled on
+    /// the fly via concatenate-source-op. When <paramref name="rootSourcesOut"/>
+    /// is non-null, also writes the root system's component source paths in
+    /// declared order (used by MSBuild as Inputs). <paramref name="targetRid"/>,
+    /// when given, prefers <c>&lt;name&gt;-r2r-&lt;rid&gt;.fasl</c> if present.
+    /// </summary>
+    public static void ResolveDeps(string asdPath, string? manifestOut, string? rootSourcesOut, string? targetRid = null)
+    {
+        var absAsd = System.IO.Path.GetFullPath(asdPath);
+        if (!System.IO.File.Exists(absAsd))
+            throw new System.IO.FileNotFoundException($"resolve-deps: file not found: {absAsd}", absAsd);
+
+        // Bring asdf in. (require "asdf") goes through module-provide-contrib
+        // and side-effects *central-registry* with shipped contrib subdirs.
+        Runtime.Eval(MultipleValues.Primary(
+            Runtime.ReadFromString(new LispObject[] { new LispString("(require \"asdf\")") })));
+
+        var asdLisp = absAsd.Replace("\\", "/");
+        var manifestForm = manifestOut == null
+            ? "*standard-output*"
+            : $"(open \"{manifestOut.Replace("\\", "/")}\" :direction :output :if-exists :supersede)";
+        var rootSourcesForm = rootSourcesOut == null
+            ? "nil"
+            : $"(open \"{rootSourcesOut.Replace("\\", "/")}\" :direction :output :if-exists :supersede)";
+        // For each dep system, if <dir>/<name>.fasl exists, use it. Otherwise
+        // concatenate-source-op + compile-file the dep's :components into
+        // <dir>/<name>.fasl on the fly. Empty :components (marker systems) are
+        // skipped silently.
+        var form = $@"
+(let* ((seen '()) (order '()))
+  (labels ((walk (sys)
+             (unless (member sys seen :test #'eq)
+               (push sys seen)
+               (dolist (d (asdf:system-depends-on sys))
+                 (let ((ds (ignore-errors (asdf:find-system d))))
+                   (when ds (walk ds))))
+               (push sys order)))
+           (ensure-fasl (sys)
+             (let* ((src  (asdf:component-pathname sys))
+                    (dir  (directory-namestring src))
+                    (name (asdf:component-name sys))
+                    (r2r-fasl {(targetRid == null
+                        ? "nil"
+                        : $"(concatenate 'string dir name \"-r2r-\" \"{targetRid}\" \".fasl\")")})
+                    (fasl (concatenate 'string dir name "".fasl"")))
+               (when (and r2r-fasl (probe-file r2r-fasl))
+                 (return-from ensure-fasl r2r-fasl))
+               (unless (probe-file fasl)
+                 (when (asdf:component-children sys)
+                   (format *error-output*
+                           ""[resolve-deps] compiling ~A...~%"" name)
+                   (asdf:operate 'asdf::concatenate-source-op sys)
+                   (let ((concat (first
+                                  (asdf:output-files
+                                   (asdf:make-operation 'asdf::concatenate-source-op)
+                                   sys))))
+                     (compile-file concat :output-file fasl))))
+               fasl)))
+    (asdf:load-asd ""{asdLisp}"")
+    (let* ((root (asdf:find-system
+                   (pathname-name (pathname ""{asdLisp}""))))
+           (deps (remove root (nreverse (progn (walk root) order)))))
+      (let ((stream {manifestForm}))
+        (unwind-protect
+          (dolist (sys deps)
+            (when (asdf:component-children sys)
+              (let ((fasl (ensure-fasl sys)))
+                (format stream ""~A~%"" fasl))))
+          (when {(manifestOut == null ? "nil" : "t")} (close stream))))
+      (let ((rstream {rootSourcesForm}))
+        (when rstream
+          (unwind-protect
+            (dolist (c (asdf:component-children root))
+              (let ((p (asdf:component-pathname c)))
+                (when p (format rstream ""~A~%"" (namestring p)))))
+            (close rstream)))))))";
+        Runtime.Eval(MultipleValues.Primary(
+            Runtime.ReadFromString(new LispObject[] { new LispString(form) })));
+    }
+
+    /// <summary>
+    /// Concatenate the root system's <c>:components</c> (declared order) via
+    /// <c>asdf::concatenate-files</c> and <c>compile-file</c> the result into
+    /// <paramref name="outputPath"/>. Only the root system is compiled;
+    /// dependencies stay as pre-built fasls resolved by <see cref="ResolveDeps"/>.
+    /// </summary>
+    public static void CompileProject(string asdPath, string outputPath)
+    {
+        var absAsd = System.IO.Path.GetFullPath(asdPath);
+        if (!System.IO.File.Exists(absAsd))
+            throw new System.IO.FileNotFoundException($"compile-project: file not found: {absAsd}", absAsd);
+        var absOut = System.IO.Path.GetFullPath(outputPath);
+        var outDir = System.IO.Path.GetDirectoryName(absOut);
+        if (!string.IsNullOrEmpty(outDir) && !System.IO.Directory.Exists(outDir))
+            System.IO.Directory.CreateDirectory(outDir);
+
+        Runtime.Eval(MultipleValues.Primary(
+            Runtime.ReadFromString(new LispObject[] { new LispString("(require \"asdf\")") })));
+
+        var asdLisp = absAsd.Replace("\\", "/");
+        var outLisp = absOut.Replace("\\", "/");
+        var concatLisp = (outDir == null ? "" : outDir.Replace("\\", "/") + "/")
+                       + System.IO.Path.GetFileNameWithoutExtension(outputPath)
+                       + ".concat.lisp";
+        var form = $@"
+(progn
+  (asdf:load-asd ""{asdLisp}"")
+  (let* ((root (asdf:find-system
+                 (pathname-name (pathname ""{asdLisp}""))))
+         (sources (mapcar #'asdf:component-pathname
+                          (asdf:component-children root))))
+    (asdf::concatenate-files sources ""{concatLisp}"")
+    (compile-file ""{concatLisp}"" :output-file ""{outLisp}"")))";
+        Runtime.Eval(MultipleValues.Primary(
+            Runtime.ReadFromString(new LispObject[] { new LispString(form) })));
+    }
 }

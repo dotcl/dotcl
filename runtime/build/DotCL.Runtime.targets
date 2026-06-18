@@ -25,4 +25,11 @@
       <Visible>false</Visible>
     </None>
   </ItemGroup>
+
+  <!-- Project-core build (#307): compile a consumer's <DotclProjectAsd> to a fasl
+       at build time via the in-process MSBuild tasks. Only active when the
+       consumer sets DotclProjectAsd; otherwise a no-op. Shipped alongside this
+       file in build/ and buildTransitive/. -->
+  <Import Project="$(MSBuildThisFileDirectory)DotCL.Runtime.ProjectCore.targets"
+          Condition="Exists('$(MSBuildThisFileDirectory)DotCL.Runtime.ProjectCore.targets')" />
 </Project>

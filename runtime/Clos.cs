@@ -99,6 +99,12 @@ public class LispClass : LispObject
     /// <summary>True if all slots are instance-allocated and no initargs use NIL as key.
     /// When false, the fast make-instance path must be skipped.</summary>
     private bool? _canUseFastPath;
+    /// <summary>Cached class prototype (AMOP class-prototype): a single per-class
+    /// instance reused across calls. Must be stable — define-presentation-method
+    /// (McCLIM) and other code dispatch via (eql class-prototype), which only
+    /// works if the same object is returned every time. Lazily created.</summary>
+    private LispInstance? _prototype;
+    public LispInstance Prototype => _prototype ??= new LispInstance(this);
     /// <summary>Cached result of HasCustomInitMethods check. Null = not yet computed.</summary>
     internal bool? CachedHasCustomInitMethods;
     /// <summary>Cached result of IsConditionClass check. Null = not yet computed.</summary>

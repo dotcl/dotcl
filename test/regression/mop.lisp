@@ -137,6 +137,29 @@
   (typep (dotcl-mop:class-prototype (find-class 'mop-dog)) 'mop-dog)
   t)
 
+;;; class-prototype must return the SAME instance every call (AMOP). McCLIM's
+;;; define-presentation-method dispatches via (eql (class-prototype <ptype-class>)),
+;;; which only works if the prototype identity is stable across method definition
+;;; and call. A fresh instance each call made every presentation method fall through
+;;; to its dumb default (e.g. presentation-subtypep on `command' with mixed
+;;; symbol/object :command-table params wrongly returned (nil nil)).
+(deftest mop-class-prototype-stable
+  (eq (dotcl-mop:class-prototype (find-class 'mop-dog))
+      (dotcl-mop:class-prototype (find-class 'mop-dog)))
+  t)
+
+;;; The behaviour McCLIM relies on: an (eql class-prototype) method actually
+;;; dispatches when called with that prototype.
+(defgeneric proto-dispatch (x))
+(defmethod proto-dispatch ((x t)) :default)
+(eval-when (:load-toplevel :execute)
+  (let ((proto (dotcl-mop:class-prototype (find-class 'mop-dog))))
+    (eval `(defmethod proto-dispatch ((x (eql ,proto))) :prototype))))
+
+(deftest mop-class-prototype-eql-dispatch
+  (proto-dispatch (dotcl-mop:class-prototype (find-class 'mop-dog)))
+  :prototype)
+
 ;;; --- eql-specializer ---
 
 (deftest mop-intern-eql-specializer
@@ -302,3 +325,22 @@
 (deftest mop-reensure-initarg-applied
   (slot-value (find-class 'mop-reensure) 'type-name)
   mop-reensure)
+
+;;; #297: on a class metaobject built via ensure-class, initialize-instance :after
+;;; runs AFTER the metaclass-slot initargs are applied (ordinary instance order), so an
+;;; :after that reads an initarg-filled slot sees it BOUND (used to be UNBOUND because
+;;; the :after fired during class creation before the initargs were applied).
+(defclass mop-meta-tn2 ()
+  ((type-name :initarg :type-name :accessor mop-type-name2)
+   (spec :accessor mop-spec2)))
+(defmethod initialize-instance :after ((o mop-meta-tn2) &key)
+  (unless (slot-boundp o 'spec)
+    (setf (slot-value o 'spec) (list :derived-from (slot-value o 'type-name)))))
+(defclass mop-meta-order (mop-meta-tn2 standard-class) ())
+(defmethod dotcl-mop:validate-superclass ((c mop-meta-order) (s standard-class)) t)
+(dotcl-mop:ensure-class 'mop-ec-order :metaclass 'mop-meta-order :type-name 'mop-ot
+                        :direct-superclasses (list (find-class 'standard-object)))
+
+(deftest mop-ec-after-sees-initarg
+  (slot-value (find-class 'mop-ec-order) 'spec)
+  (:derived-from mop-ot))

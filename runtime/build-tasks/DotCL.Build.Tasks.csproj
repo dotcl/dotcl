@@ -1,0 +1,52 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    In-process MSBuild tasks for the project-core build (#307). These load the
+    DotCL.Runtime library in the MSBuild process and drive DotclHost.ResolveDeps
+    / CompileProject directly — no `dotnet exec`/`dotnet run` subprocess and no
+    second copy of the runtime in the package (the task resolves the runtime
+    assembly that the package already ships under lib/).
+
+    net10.0 only: the FASL emitter (PersistedAssemblyBuilder, .NET 9+) is needed
+    to compile-file, and the net8.0 build of DotCL.Runtime #if's it out. So
+    project-core precompilation requires building under the .NET 10 SDK
+    (dotnet MSBuild), not legacy Framework msbuild.
+  -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <!-- This is build tooling, not a shipped library or its own package. -->
+    <IsPackable>false</IsPackable>
+    <CopyLocalLockFileAssemblies>false</CopyLocalLockFileAssemblies>
+    <!-- Don't drag the (huge, RID-bound) DotCL.Runtime.dll into this project's
+         own output; the packed task resolves it from the package's lib/ via the
+         Resolving handler in DotclBoot. The ProjectReference is compile-only. -->
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- MSBuild API referenced in-box from the running SDK ($(MSBuildToolsPath))
+         rather than via a PackageReference: the task always runs under the SDK
+         that built it, and this keeps the build offline-friendly (no restore of
+         Microsoft.Build.* from nuget.org). Never copied to output / packed. -->
+    <Reference Include="Microsoft.Build.Framework">
+      <HintPath>$(MSBuildToolsPath)\Microsoft.Build.Framework.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Microsoft.Build.Utilities.Core">
+      <HintPath>$(MSBuildToolsPath)\Microsoft.Build.Utilities.Core.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Compile-time reference to DotclHost / Runtime. At run time the task
+         loads DotCL.Runtime from the package lib/ (see DotclBoot.InstallResolver),
+         so we keep this from copying to output. -->
+    <ProjectReference Include="..\DotCL.Runtime.csproj">
+      <Private>false</Private>
+      <ReferenceOutputAssembly>true</ReferenceOutputAssembly>
+    </ProjectReference>
+  </ItemGroup>
+
+</Project>

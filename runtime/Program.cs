@@ -113,37 +113,37 @@ class Program
         {
             Console.WriteLine(@"dotcl [options] [script-file [arguments...]]
 
+Usage:
+  dotcl                        Start a REPL
+  dotcl file.lisp [args...]    Run file.lisp as a script, then exit
+  dotcl --load file.lisp       Load file.lisp and continue in the REPL
+  dotcl --eval ""(+ 1 2)""       Evaluate an expression, then exit
+
 Options:
   --help                       Display this message
   --version                    Display version information
   --core <file>                Use specified core file
-  --load <file>                Load a file
+  --load <file>                Load a file (REPL continues unless an action exits)
   --eval <expr>                Evaluate an expression
-  --script <file>              Run as script (skip init, no REPL)
-  --resolve-deps <asd>         Walk an ASDF system's :depends-on graph and
-                               emit one fasl path per line in load order
-  --manifest-out <path>        With --resolve-deps: write manifest to file
-                               instead of stdout
-  --root-sources-out <path>    With --resolve-deps: also write the root
-                               system's component source paths to <path>
-                               (used by MSBuild as Inputs)
-  --compile-project <asd>      Concatenate the asd's root system's components
-                               and compile-file to --output <path>
-  --output <path>              Output path for --compile-project
+  --no-init                    Skip loading the user init file (REPL/--eval/--load)
+  --readline / --no-readline   Force the line-editing REPL on / off
+                               (default: on for an interactive console)
   --completion <shell>         Emit a shell completion script for
                                pwsh / bash / zsh / fish
   --asd-search-path <dir>      Append <dir> to asdf:*central-registry*
                                after asdf loads (repeatable)
-  --target-rid <rid>           With --resolve-deps: prefer
-                               <dir>/<name>-r2r-<rid>.fasl over plain
-                               <name>.fasl when it exists
 
 Subcommands:
-  repl            Start REPL (even with --load/--eval)
+  repl                         Start REPL (even with --load/--eval)
+  build <asd> --output <fasl>  Compile an ASDF system to a fasl
 
 Example:
-  dotcl --script hello.lisp
-  dotcl --resolve-deps MyApp.asd --manifest-out obj/dotcl-deps.txt");
+  dotcl hello.lisp arg1 arg2
+  dotcl --eval ""(format t \""hi~%\"")""
+  dotcl build MyApp.asd --output obj/MyApp.fasl
+
+Build-tooling flags (--resolve-deps / --compile-project / etc.) are internal
+and invoked by the MSBuild integration; they are intentionally omitted here.");
             return;
         }
         if (!hasEmbeddedFasl && args.Any(a => a == "--version"))
@@ -227,71 +227,6 @@ Example:
                 break;
             }
         }
-        // Extract --script <file>
-        string? scriptFile = null;
-        for (int i = 0; i < rest.Count - 1; i++)
-        {
-            if (rest[i] == "--script")
-            {
-                scriptFile = rest[i + 1];
-                rest.RemoveRange(i, 2);
-                break;
-            }
-        }
-        bool scriptMode = scriptFile != null;
-
-        // Extract --resolve-deps <asd> [--manifest-out <path>] [--root-sources-out <path>]
-        // Used by build tooling: walk the .asd's :depends-on graph,
-        // emit one fasl path per line in load order. Optionally also writes
-        // the root system's component source files (one per line) to a
-        // separate file, used by MSBuild as Inputs for the root compile.
-        string? resolveDepsAsd = null;
-        string? resolveDepsManifestOut = null;
-        string? resolveDepsRootSourcesOut = null;
-        for (int i = 0; i < rest.Count - 1; i++)
-        {
-            if (rest[i] == "--resolve-deps")
-            {
-                resolveDepsAsd = rest[i + 1];
-                rest.RemoveRange(i, 2);
-                break;
-            }
-        }
-        for (int i = 0; i < rest.Count - 1; i++)
-        {
-            if (rest[i] == "--manifest-out")
-            {
-                resolveDepsManifestOut = rest[i + 1];
-                rest.RemoveRange(i, 2);
-                break;
-            }
-        }
-        for (int i = 0; i < rest.Count - 1; i++)
-        {
-            if (rest[i] == "--root-sources-out")
-            {
-                resolveDepsRootSourcesOut = rest[i + 1];
-                rest.RemoveRange(i, 2);
-                break;
-            }
-        }
-
-        // --target-rid <rid>: when set, --resolve-deps prefers
-        // <dir>/<name>-r2r-<rid>.fasl over plain <dir>/<name>.fasl. Used by
-        // release pack pipelines that pre-compile per-RID R2R fasls.
-        // Falls back to the IL-only fasl silently if the R2R variant is
-        // missing, so dev builds without R2R artifacts keep working.
-        string? targetRid = null;
-        for (int i = 0; i < rest.Count - 1; i++)
-        {
-            if (rest[i] == "--target-rid")
-            {
-                targetRid = rest[i + 1];
-                rest.RemoveRange(i, 2);
-                break;
-            }
-        }
-
         // Extract --asd-search-path <dir> (repeatable). These are appended to
         // asdf:*central-registry* after asdf loads, in addition to the
         // standard QL/CL source registry locations auto-detected at boot.
@@ -306,28 +241,39 @@ Example:
             i++;
         }
 
-        // Extract --compile-project <asd> --output <fasl-path>
-        // Concatenates the asd's root system's :components in order, then
-        // compile-files the result to <fasl-path>. MSBuild calls this with
-        // proper Inputs/Outputs to skip rebuilds when sources haven't moved.
-        string? compileProjectAsd = null;
-        string? compileProjectOutput = null;
-        for (int i = 0; i < rest.Count - 1; i++)
+        // `build` subcommand — the user-facing entry point for ASDF project
+        // builds. Invoked by the MSBuild integration (runtime/build/Dotcl.targets).
+        // Two modes off the same positional <asd>:
+        //   dotcl build <asd> --output <fasl>
+        //       Concatenate the root system's :components and compile-file to
+        //       <fasl>. (compile-project)
+        //   dotcl build <asd> --resolve-deps --manifest-out <p>
+        //                     [--root-sources-out <p>] [--target-rid <rid>]
+        //       Walk the :depends-on graph, emit one fasl path per line in load
+        //       order to <p> (or stdout). With --root-sources-out, also emit the
+        //       root system's component source paths (MSBuild Inputs).
+        //       --target-rid prefers <dir>/<name>-r2r-<rid>.fasl when present.
+        // The flags below are build-internal and intentionally absent from
+        // --help / completion (see D1212).
+        bool buildMode = rest.Count > 0 && rest[0] == "build";
+        string? buildAsd = null;
+        string? buildOutput = null;
+        bool buildResolveDeps = false;
+        string? buildManifestOut = null;
+        string? buildRootSourcesOut = null;
+        string? buildTargetRid = null;
+        if (buildMode)
         {
-            if (rest[i] == "--compile-project")
+            rest.RemoveAt(0);
+            for (int i = 0; i < rest.Count; i++)
             {
-                compileProjectAsd = rest[i + 1];
-                rest.RemoveRange(i, 2);
-                break;
-            }
-        }
-        for (int i = 0; i < rest.Count - 1; i++)
-        {
-            if (rest[i] == "--output")
-            {
-                compileProjectOutput = rest[i + 1];
-                rest.RemoveRange(i, 2);
-                break;
+                var a = rest[i];
+                if (a == "--output" && i + 1 < rest.Count) buildOutput = rest[++i];
+                else if (a == "--resolve-deps") buildResolveDeps = true;
+                else if (a == "--manifest-out" && i + 1 < rest.Count) buildManifestOut = rest[++i];
+                else if (a == "--root-sources-out" && i + 1 < rest.Count) buildRootSourcesOut = rest[++i];
+                else if (a == "--target-rid" && i + 1 < rest.Count) buildTargetRid = rest[++i];
+                else if (!a.StartsWith('-') && buildAsd == null) buildAsd = a;
             }
         }
 
@@ -343,8 +289,40 @@ Example:
             }
         }
 
-        // Collect ordered list of (kind, value): kind = "script" | "load" | "eval"
+        // Extract --no-init: skip loading %APPDATA%/dotcl/init.lisp in REPL /
+        // --eval / --load sessions. Script mode (dotcl file.lisp) already skips
+        // the init file regardless, so this only affects interactive/eval runs.
+        bool noInit = false;
+        for (int i = 0; i < rest.Count; i++)
+        {
+            if (rest[i] == "--no-init")
+            {
+                noInit = true;
+                rest.RemoveAt(i);
+                break;
+            }
+        }
+
+        // Extract --readline / --no-readline: control the line-editing REPL
+        // (dotcl-repl contrib: history, cursor movement). null = auto: enable
+        // when stdin is an interactive console, disable when redirected/piped.
+        // Only meaningful for the REPL path; ignored in script/eval runs.
+        bool? readlinePref = null;
+        for (int i = 0; i < rest.Count; i++)
+        {
+            if (rest[i] == "--readline") { readlinePref = true; rest.RemoveAt(i); break; }
+            if (rest[i] == "--no-readline") { readlinePref = false; rest.RemoveAt(i); break; }
+        }
+
+        // Collect ordered --load/--eval actions. The FIRST bare (non-flag) token
+        // is the positional script file; once seen, parsing stops and every
+        // remaining token (flag or not) becomes the script's argv — the Unix
+        // convention that args after the script belong to the program, not to
+        // dotcl. This also stops data args (e.g. an image path) from being
+        // mis-loaded as Lisp source (#246).
         var actions = new List<(string kind, string value)>();
+        string? positionalScript = null;
+        List<string> positionalArgv = new();
         for (int i = 0; i < rest.Count; i++)
         {
             if ((rest[i] == "--load" || rest[i] == "--eval") && i + 1 < rest.Count)
@@ -354,10 +332,13 @@ Example:
             }
             else if (!rest[i].StartsWith('-'))
             {
-                actions.Add(("script", rest[i]));
+                positionalScript = rest[i];
+                positionalArgv = rest.GetRange(i + 1, rest.Count - (i + 1));
+                break;
             }
         }
-        var scripts = actions; // renamed for clarity below
+        bool scriptMode = positionalScript != null;
+        var scripts = actions; // pre-script --load/--eval actions
 
         ProfileMark("arg-parse");
 
@@ -383,32 +364,28 @@ Example:
         if (TryRunEmbeddedUserFasl())
             return;
 
-        // --resolve-deps <asd> [--manifest-out <p>] [--root-sources-out <p>]:
-        // walk the .asd's :depends-on graph and emit one fasl path per line.
-        // With --root-sources-out, also write the root system's component
-        // source files. Project-core build tools invoke this.
-        if (resolveDepsAsd != null)
+        // `build` subcommand dispatch. --resolve-deps walks the :depends-on
+        // graph; otherwise --output compile-files the root system. Both need the
+        // core booted (they drive asdf). Used by runtime/build/Dotcl.targets.
+        if (buildMode)
         {
-            try { RunResolveDeps(resolveDepsAsd, resolveDepsManifestOut, resolveDepsRootSourcesOut, targetRid); }
-            catch (LispSourceException lse)
+            if (buildAsd == null)
             {
-                Console.Error.WriteLine(lse.FormatTrace());
-                Environment.Exit(1);
-            }
-            return;
-        }
-
-        // --compile-project <asd> --output <fasl-path>: concatenate the .asd's
-        // root system's :components in declared order, compile-file the
-        // result. Used by the MSBuild target with Inputs/Outputs.
-        if (compileProjectAsd != null)
-        {
-            if (compileProjectOutput == null)
-            {
-                Console.Error.WriteLine("--compile-project requires --output <path>");
+                Console.Error.WriteLine("build: missing <asd> path");
                 Environment.Exit(2);
             }
-            try { RunCompileProject(compileProjectAsd, compileProjectOutput); }
+            try
+            {
+                if (buildResolveDeps)
+                    RunResolveDeps(buildAsd, buildManifestOut, buildRootSourcesOut, buildTargetRid);
+                else if (buildOutput != null)
+                    RunCompileProject(buildAsd, buildOutput);
+                else
+                {
+                    Console.Error.WriteLine("build: requires --output <fasl> or --resolve-deps");
+                    Environment.Exit(2);
+                }
+            }
             catch (LispSourceException lse)
             {
                 Console.Error.WriteLine(lse.FormatTrace());
@@ -417,9 +394,15 @@ Example:
             return;
         }
 
-        // --script mode: register #! reader macro, execute script, exit
+        // Positional script mode: `dotcl file.lisp [args...]`. Any preceding
+        // --load/--eval run first, then the script, then exit (no REPL). The
+        // trailing args are exposed to uiop:command-line-arguments via
+        // Runtime.ScriptArgs. Non-interactive: errors print and exit non-zero.
         if (scriptMode)
         {
+            // Expose trailing args to (uiop:command-line-arguments).
+            Runtime.ScriptArgs = positionalArgv;
+
             // Set *debugger-hook* to print error and exit (no interactive debugger)
             var hookSym = Startup.Sym("*DEBUGGER-HOOK*");
             DynamicBindings.Set(hookSym, new LispFunction(hookArgs => {
@@ -439,7 +422,20 @@ Example:
                 if (shebangReader.TryRead(out var shebangForm))
                     Runtime.Eval(shebangForm);
 
-                Runtime.Load(new LispObject[] { new LispString(scriptFile!) });
+                // Run any --load/--eval that preceded the script file.
+                foreach (var (kind, value) in scripts)
+                {
+                    if (kind == "eval")
+                    {
+                        var reader = new Reader(new StringReader(value));
+                        while (reader.TryRead(out var form))
+                            Runtime.Eval(form);
+                    }
+                    else // "load"
+                        Runtime.Load(new LispObject[] { new LispString(value) });
+                }
+
+                Runtime.Load(new LispObject[] { new LispString(positionalScript!) });
             }
             catch (LispSourceException lse)
             {
@@ -455,10 +451,10 @@ Example:
             return;
         }
 
-        // Load user init file (unless --script mode)
+        // Load user init file (unless script mode or --no-init)
+        if (!noInit)
         {
-            var configDir = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
-            var initFile = Path.Combine(configDir, "dotcl", "init.lisp");
+            var initFile = Startup.UserInitFilePath();
             if (File.Exists(initFile))
             {
                 try
@@ -499,7 +495,38 @@ Example:
 
         // REPL if: explicit "repl" subcommand, or no actions.
         if (explicitRepl || scripts.Count == 0)
+        {
+            // Auto-enable the line-editing REPL (dotcl-repl) unless overridden.
+            // Default: on for an interactive console, off when stdin is piped /
+            // redirected (the custom reader uses Console.ReadKey, which has no
+            // meaning for non-interactive input). A user init file may already
+            // have enabled it — don't clobber that.
+            bool enableReadline = readlinePref ?? !Console.IsInputRedirected;
+            if (enableReadline && Startup.ReadlineHook == null)
+                TryEnableReadline();
             RunRepl();
+        }
+    }
+
+    /// <summary>
+    /// Load the dotcl-repl contrib and wire its line editor into the REPL read
+    /// loop. Best-effort: if the contrib is missing or fails to load, fall back
+    /// to the basic Console.ReadLine path with a one-line note on stderr.
+    /// </summary>
+    static void TryEnableReadline()
+    {
+        try
+        {
+            Runtime.Eval(MultipleValues.Primary(Runtime.ReadFromString(new LispObject[] {
+                new LispString(
+                    "(progn (require \"dotcl-repl\") (funcall (find-symbol \"ENABLE\" \"DOTCL-REPL\")))")
+            })));
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine(
+                $"; readline unavailable ({ex.Message}); using basic line input");
+        }
     }
 
     /// <summary>
@@ -573,104 +600,12 @@ Example:
     /// </summary>
     static void RunResolveDeps(string asdPath, string? manifestOut, string? rootSourcesOut, string? targetRid = null)
     {
-        var absAsd = System.IO.Path.GetFullPath(asdPath);
-        if (!System.IO.File.Exists(absAsd))
+        try { DotclHost.ResolveDeps(asdPath, manifestOut, rootSourcesOut, targetRid); }
+        catch (System.IO.FileNotFoundException ex)
         {
-            Console.Error.WriteLine($"--resolve-deps: file not found: {absAsd}");
+            Console.Error.WriteLine(ex.Message);
             Environment.Exit(2);
         }
-
-        // Bring asdf in. (require "asdf") goes through module-provide-contrib
-        // and side-effects *central-registry* with shipped contrib subdirs.
-        Runtime.Eval(MultipleValues.Primary(
-            Runtime.ReadFromString(new LispObject[] { new LispString("(require \"asdf\")") })));
-
-        // Run the dep walker as a small Lisp form. The form:
-        //   1. (asdf:load-asd <abs-asd>) so the user's system is registered.
-        //   2. Recursively walk asdf:system-depends-on, returning systems
-        //      in dependency-first order (deps before dependents).
-        //   3. For each system, format a "<name>\t<fasl-path>" line where
-        //      fasl-path is "<dir-of-asd>/<name>.fasl".
-        //   4. Write all lines to <manifestOut> (or stdout via *standard-output*).
-        var asdLisp = absAsd.Replace("\\", "/");
-        var manifestForm = manifestOut == null
-            ? "*standard-output*"
-            : $"(open \"{manifestOut.Replace("\\", "/")}\" :direction :output :if-exists :supersede)";
-        var rootSourcesForm = rootSourcesOut == null
-            ? "nil"
-            : $"(open \"{rootSourcesOut.Replace("\\", "/")}\" :direction :output :if-exists :supersede)";
-        // Manifest format: one absolute fasl path per line. Simple to parse
-        // (MSBuild ReadLinesFromFile + Copy directly), and the system name
-        // can be derived from the filename when needed for diagnostics.
-        //
-        // For each dep system, if <dir>/<name>.fasl exists, use it. Otherwise
-        // concatenate-source-op + compile-file the dep's :components into
-        // <dir>/<name>.fasl on the fly. This unlocks any QL library
-        // (alexandria, etc.) without dotcl needing to ship pre-built fasls
-        // for every package out there. Empty :components (marker systems)
-        // are skipped silently.
-        var form = $@"
-(let* ((seen '()) (order '()))
-  (labels ((walk (sys)
-             (unless (member sys seen :test #'eq)
-               (push sys seen)
-               (dolist (d (asdf:system-depends-on sys))
-                 (let ((ds (ignore-errors (asdf:find-system d))))
-                   (when ds (walk ds))))
-               (push sys order)))
-           (ensure-fasl (sys)
-             (let* ((src  (asdf:component-pathname sys))
-                    (dir  (directory-namestring src))
-                    (name (asdf:component-name sys))
-                    ;; If --target-rid is given, prefer the R2R variant
-                    ;; <dir>/<name>-r2r-<rid>.fasl when it exists. Falls
-                    ;; back to plain <dir>/<name>.fasl otherwise.
-                    (r2r-fasl {(targetRid == null
-                        ? "nil"
-                        : $"(concatenate 'string dir name \"-r2r-\" \"{targetRid}\" \".fasl\")")})
-                    (fasl (concatenate 'string dir name "".fasl"")))
-               (when (and r2r-fasl (probe-file r2r-fasl))
-                 (return-from ensure-fasl r2r-fasl))
-               (unless (probe-file fasl)
-                 (when (asdf:component-children sys)
-                   (format *error-output*
-                           ""[resolve-deps] compiling ~A...~%"" name)
-                   ;; Delegate ordering / nested-module traversal to ASDF
-                   ;; (alexandria has :module components with their own
-                   ;; :depends-on, so a flat (asdf:component-children sys)
-                   ;; walk would miss the right order).
-                   (asdf:operate 'asdf::concatenate-source-op sys)
-                   (let ((concat (first
-                                  (asdf:output-files
-                                   (asdf:make-operation 'asdf::concatenate-source-op)
-                                   sys))))
-                     (compile-file concat :output-file fasl))))
-               fasl)))
-    (asdf:load-asd ""{asdLisp}"")
-    (let* ((root (asdf:find-system
-                   (pathname-name (pathname ""{asdLisp}""))))
-           (deps (remove root (nreverse (progn (walk root) order)))))
-      ;; Emit deps' fasl paths to manifestOut/stdout, compiling on-the-fly
-      ;; if absent. Skip systems whose :components is empty (marker .asd).
-      (let ((stream {manifestForm}))
-        (unwind-protect
-          (dolist (sys deps)
-            (when (asdf:component-children sys)
-              (let ((fasl (ensure-fasl sys)))
-                (format stream ""~A~%"" fasl))))
-          (when {(manifestOut == null ? "nil" : "t")} (close stream))))
-      ;; If --root-sources-out is given, emit the root system's component
-      ;; source paths in declared order. (asdf:component-children root)
-      ;; preserves :components order.
-      (let ((rstream {rootSourcesForm}))
-        (when rstream
-          (unwind-protect
-            (dolist (c (asdf:component-children root))
-              (let ((p (asdf:component-pathname c)))
-                (when p (format rstream ""~A~%"" (namestring p)))))
-            (close rstream)))))))";
-        Runtime.Eval(MultipleValues.Primary(
-            Runtime.ReadFromString(new LispObject[] { new LispString(form) })));
     }
 
     /// <summary>
@@ -686,40 +621,12 @@ Example:
     /// </summary>
     static void RunCompileProject(string asdPath, string outputPath)
     {
-        var absAsd = System.IO.Path.GetFullPath(asdPath);
-        if (!System.IO.File.Exists(absAsd))
+        try { DotclHost.CompileProject(asdPath, outputPath); }
+        catch (System.IO.FileNotFoundException ex)
         {
-            Console.Error.WriteLine($"--compile-project: file not found: {absAsd}");
+            Console.Error.WriteLine(ex.Message);
             Environment.Exit(2);
         }
-        var absOut = System.IO.Path.GetFullPath(outputPath);
-        var outDir = System.IO.Path.GetDirectoryName(absOut);
-        if (!string.IsNullOrEmpty(outDir) && !System.IO.Directory.Exists(outDir))
-            System.IO.Directory.CreateDirectory(outDir);
-
-        Runtime.Eval(MultipleValues.Primary(
-            Runtime.ReadFromString(new LispObject[] { new LispString("(require \"asdf\")") })));
-
-        var asdLisp = absAsd.Replace("\\", "/");
-        var outLisp = absOut.Replace("\\", "/");
-        // Concatenate .lisp output sits next to the asd in build cache. We
-        // pin it to outDir so it's predictable / debuggable.
-        var concatLisp = (outDir == null ? "" : outDir.Replace("\\", "/") + "/")
-                       + System.IO.Path.GetFileNameWithoutExtension(outputPath)
-                       + ".concat.lisp";
-        // Wrap in progn so ReadFromString picks up the whole multi-form body
-        // as one expression (it reads a single top-level form per call).
-        var form = $@"
-(progn
-  (asdf:load-asd ""{asdLisp}"")
-  (let* ((root (asdf:find-system
-                 (pathname-name (pathname ""{asdLisp}""))))
-         (sources (mapcar #'asdf:component-pathname
-                          (asdf:component-children root))))
-    (asdf::concatenate-files sources ""{concatLisp}"")
-    (compile-file ""{concatLisp}"" :output-file ""{outLisp}"")))";
-        Runtime.Eval(MultipleValues.Primary(
-            Runtime.ReadFromString(new LispObject[] { new LispString(form) })));
     }
 
     /// <summary>
@@ -775,9 +682,42 @@ Example:
     }
 
 
+    /// <summary>
+    /// REPL input reader. On a Unix TTY this reads fd 0 directly via a plain
+    /// FileStream instead of Console.In, because .NET's UnixConsoleStream puts
+    /// the terminal into raw / non-canonical mode on every read. Raw mode makes
+    /// rlwrap think dotcl "asks for single keypresses" (forcing --always-readline)
+    /// and leaks raw arrow-key escapes (ESC[A) into the Lisp reader. Reading the
+    /// raw fd keeps the kernel's canonical line discipline. Falls back to
+    /// Console.In on Windows, for redirected input, or if opening fd 0 fails.
+    /// </summary>
+    private static System.IO.TextReader OpenReplStdin()
+    {
+        try
+        {
+            if (!OperatingSystem.IsWindows() && isatty(0) == 1)
+            {
+                var fs = new System.IO.FileStream(
+                    new Microsoft.Win32.SafeHandles.SafeFileHandle((IntPtr)0, ownsHandle: false),
+                    System.IO.FileAccess.Read);
+                return new System.IO.StreamReader(
+                    fs, new System.Text.UTF8Encoding(false),
+                    detectEncodingFromByteOrderMarks: false, bufferSize: 4096);
+            }
+        }
+        catch { /* fall back to Console.In below */ }
+        return Console.In;
+    }
+
     static void RunRepl()
     {
         _replMode = true;
+        // Read input through OpenReplStdin (raw fd 0 on a Unix TTY) rather than
+        // Console.In / Console.ReadLine, which would route through .NET's Unix
+        // console driver and switch the tty into raw mode — breaking rlwrap and
+        // leaking arrow-key escapes. Only do this for the default read path; a
+        // raw readline hook (dotcl-repl) does its own ReadKey-based editing.
+        var stdin = Startup.ReadlineHook == null ? OpenReplStdin() : Console.In;
         Console.WriteLine("dotcl REPL. Ctrl+D to exit.");
 
         var buffer = new System.Text.StringBuilder();
@@ -795,13 +735,28 @@ Example:
             string? line;
             if (Startup.ReadlineHook != null)
             {
-                var result = Startup.ReadlineHook.Invoke(new LispObject[] { new LispString(prompt) });
-                line = result is Nil ? null : (result as LispString)?.Value ?? result.ToString();
+                try
+                {
+                    var result = Startup.ReadlineHook.Invoke(new LispObject[] { new LispString(prompt) });
+                    line = result is Nil ? null : (result as LispString)?.Value ?? result.ToString();
+                }
+                catch (Exception ex)
+                {
+                    // The line editor failed (e.g. --readline forced on a
+                    // non-console where Console.ReadKey/CursorLeft are invalid).
+                    // Disable it and fall back to plain line input for the rest
+                    // of the session instead of crashing the REPL.
+                    Console.Error.WriteLine(
+                        $"; readline failed ({ex.Message}); falling back to basic line input");
+                    Startup.ReadlineHook = null;
+                    stdin = OpenReplStdin();
+                    continue;
+                }
             }
             else
             {
                 Console.Write(prompt);
-                line = Console.ReadLine();
+                line = stdin.ReadLine();
             }
 
             if (line == null)

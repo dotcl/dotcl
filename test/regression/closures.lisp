@@ -98,3 +98,76 @@
     (funcall (lambda () (setf (the fixnum x) 99)))
     x)
   99)
+
+;;; Lisp-2: a local variable that is mutated + captured (and therefore lives
+;;; in a boxed LispObject[1] cell) must NOT shadow a same-named global function
+;;; when that name appears in operator position. Regression for the
+;;; quicklisp http.lisp `(or (url *proxy-url*) url)` miscompile, where `url`
+;;; was both the http-fetch parameter (mutated, captured by with-connection's
+;;; lambda) and a global function: the call `(url ...)` wrongly funcalled the
+;;; boxed variable cell, yielding "cannot cast <value> to LispFunction".
+(defun l2box-fn (thing) (list :fn thing))
+
+(deftest lisp2-boxed-var-shadows-global-fn
+  (flet ((caller (l2box-fn)
+           (setf l2box-fn (list :merged l2box-fn))   ; mutate -> needs a cell
+           (flet ((capture () l2box-fn))              ; capture -> boxes the cell
+             (declare (ignorable #'capture))
+             (l2box-fn 99))))                          ; operator: must call global
+    (caller 42))
+  (:fn 99))
+
+(deftest lisp2-boxed-var-shadow-or-form
+  (flet ((caller (l2box-fn)
+           (setf l2box-fn (list :merged l2box-fn))
+           (let ((proxy (or (l2box-fn 7) l2box-fn)))   ; fn-call + value-ref same form
+             (flet ((capture () (list l2box-fn proxy)))
+               (funcall #'capture)))))
+    (caller 42))
+  ((:merged 42) (:fn 7)))
+
+;;; (setf (slot-value obj slot) VALUE) must pre-evaluate obj/slot into temps so
+;;; the evaluation stack is empty when VALUE is compiled. If VALUE contains a
+;;; try block (a handler-case, or a LOOP `being each hash-value` which expands
+;;; with one), pushing obj+slot inline first left the stack non-empty at the
+;;; try-block entry → InvalidProgramException. Regression for quicklisp
+;;; install-dist (slot-unbound for PROVIDED-SYSTEMS does exactly this).
+(defclass ssv-holder () ((s :accessor ssv-s :initform nil)))
+
+(deftest setf-slot-value-loop-hash-value
+  (let ((h (make-hash-table)) (o (make-instance 'ssv-holder)))
+    (setf (gethash :a h) 1 (gethash :b h) 2)
+    (setf (slot-value o 's)
+          (loop for v being each hash-value of h collect v))
+    (sort (copy-list (slot-value o 's)) #'<))
+  (1 2))
+
+(deftest setf-slot-value-handler-case-value
+  (let ((o (make-instance 'ssv-holder)))
+    (setf (slot-value o 's)
+          (handler-case (error "x") (error () :caught)))
+    (slot-value o 's))
+  :caught)
+
+;;; A cond clause whose TEST is a symbol that is BOTH a captured local variable
+;;; and a global function name (Lisp-2) must capture the variable. Free-var
+;;; analysis treated the clause (sap ...) as a function call (car = fn name) and
+;;; dropped `sap` as a free-var ref, so it wasn't captured → "Unbound variable"
+;;; at run time. Surfaced via cl-ppcre create-scanner-aux's `start-anchored-p`
+;;; (a defgeneric) reused as a closure-captured parameter in (cond (start-anchored-p ...)).
+(defun cap-anchored-p (x) (declare (ignore x)) :global-fn)
+
+(deftest cond-test-captures-var-shadowing-global-fn
+  (funcall (funcall (lambda (cap-anchored-p)
+                      (lambda (n)
+                        (declare (ignore n))
+                        (cond (cap-anchored-p :anchored) (t :unanchored))))
+                    t)
+           0)
+  :anchored)
+
+(deftest cond-test-captures-var-false-branch
+  (funcall (funcall (lambda (cap-anchored-p)
+                      (lambda () (cond (cap-anchored-p :y) (t :n))))
+                    nil))
+  :n)

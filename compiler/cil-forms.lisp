@@ -293,37 +293,22 @@
                 ,@(unless skip-reset '((:call "MultipleValues.Reset")))
                 (:ldloc ,args-tmp)
                 (:callvirt "LispFunction.Invoke"))))
-        ;; Check if it's a captured boxed local (e.g. labels functions captured in closure)
-        ;; Skip for (setf foo) list names — they are never local variables
-        (let ((local-entry (and (symbolp name) (local-bound-p name))))
-          (if (and local-entry (boxed-var-p name))
-              ;; It's a boxed var — load box[0], cast to LispFunction, invoke
-              (let ((key (lookup-local name)))
-                (if (<= n-args 8)
-                    (let* ((da (compile-direct-call-args args))
-                           (temps (car da))
-                           (eval-instrs (cdr da)))
-                      `(,@eval-instrs
-                        (:ldloc ,key) (:ldc-i4 0) (:ldelem-ref)
-                        (:castclass "LispFunction")
-                        ,@(unless skip-reset '((:call "MultipleValues.Reset")))
-                        ,@(loop for tmp in temps append `((:ldloc ,tmp)))
-                        (:callvirt ,(format nil "LispFunction.Invoke~D" n-args))))
-                    `((:declare-local ,args-tmp "LispObject[]")
-                      ,@(compile-args-array args) (:stloc ,args-tmp)
-                      (:ldloc ,key) (:ldc-i4 0) (:ldelem-ref)
-                      (:castclass "LispFunction")
-                      ,@(unless skip-reset '((:call "MultipleValues.Reset")))
-                      (:ldloc ,args-tmp)
-                      (:callvirt "LispFunction.Invoke"))))
-              ;; Global function — use symbol-based lookup (fixes flat namespace
-              ;; collision). A (setf SYM) name resolves via the TARGET symbol's
-              ;; SetfFunction (symbol identity), NOT via the "(SETF NAME)" string path:
-              ;; CilAssembler.GetFunction does a cross-package name search for (setf ...)
-              ;; names, so a same-named accessor in another package (e.g. clump's
-              ;; (setf parent) vs spatial-trees' (setf parent)) could be picked up by
-              ;; iteration order, dispatching to the wrong GF.
-              (let* ((setf-sym-p (and (consp name) (eq (car name) 'setf) (symbolp (cadr name))))
+        ;; Not a local function. In a Lisp-2 the operator position never names a
+        ;; lexical variable, so a symbol that is a boxed local *variable*
+        ;; (mutated + captured, hence living in a LispObject[1] cell) and happens
+        ;; to share a global function's name must still call the GLOBAL function
+        ;; here — it must NOT funcall the variable's cell. Boxed local *functions*
+        ;; (flet/labels, including ones captured into a closure and re-established
+        ;; in *local-functions*) are handled by the local-fn branch above. So
+        ;; always take the global-function path.
+        ;; Global function — use symbol-based lookup (fixes flat namespace
+        ;; collision). A (setf SYM) name resolves via the TARGET symbol's
+        ;; SetfFunction (symbol identity), NOT via the "(SETF NAME)" string path:
+        ;; CilAssembler.GetFunction does a cross-package name search for (setf ...)
+        ;; names, so a same-named accessor in another package (e.g. clump's
+        ;; (setf parent) vs spatial-trees' (setf parent)) could be picked up by
+        ;; iteration order, dispatching to the wrong GF.
+        (let* ((setf-sym-p (and (consp name) (eq (car name) 'setf) (symbolp (cadr name))))
                      (load-fn (cond (setf-sym-p
                                      `(,@(compile-sym-lookup (cadr name))
                                        (:castclass "Symbol")
@@ -356,7 +341,7 @@
                       ,@load-fn
                       ,@(unless skip-reset '((:call "MultipleValues.Reset")))
                       (:ldloc ,args-tmp)
-                      (:callvirt "LispFunction.Invoke"))))))))))
+                      (:callvirt "LispFunction.Invoke"))))))))
 
 
 ;;; ============================================================
@@ -4973,10 +4958,17 @@
   (setf (gethash 'slot-boundp h) (lambda (expr) (compile-binary-call (cdr expr) "Runtime.SlotBoundp")))
   (setf (gethash '%set-slot-value h)
         (lambda (expr)
-          `(,@(compile-expr (second expr))
-            ,@(compile-expr (third expr))
-            ,@(compile-expr (fourth expr))
-            (:call "Runtime.SetSlotValue"))))
+          ;; Pre-evaluate obj/slot/value into temps so the stack is empty while
+          ;; each is compiled. Pushing them inline would leave obj+slot on the
+          ;; stack during the value's evaluation, which is invalid CIL if the
+          ;; value contains a try block (e.g. (setf (slot-value o 's)
+          ;; (loop ... being each hash-value ...)) or a handler-case value).
+          (let* ((da (compile-direct-call-args (cdr expr)))
+                 (temps (car da))
+                 (eval-instrs (cdr da)))
+            `(,@eval-instrs
+              ,@(loop for tmp in temps append `((:ldloc ,tmp)))
+              (:call "Runtime.SetSlotValue")))))
   (setf (gethash '%allocate-instance h) (lambda (expr) (compile-unary-call (cdr expr) "Runtime.MakeInstanceRaw")))
   (setf (gethash '%slot-exists-p h) (lambda (expr) (compile-binary-call (cdr expr) "Runtime.SlotExists")))
   (setf (gethash '%change-class h) (lambda (expr) `(,@(compile-args-array (cdr expr)) (:call "Runtime.ChangeClass"))))

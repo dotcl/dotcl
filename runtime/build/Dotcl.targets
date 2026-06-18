@@ -83,7 +83,7 @@
           Inputs="$(DotclProjectAsd)"
           Outputs="$(IntermediateOutputPath)dotcl-fasl\dotcl-deps.source.txt;$(IntermediateOutputPath)dotcl-fasl\dotcl-root-sources.txt">
 
-    <Exec Command="$(_DotclCmdPrefix) --resolve-deps &quot;$(DotclProjectAsd)&quot; --manifest-out &quot;$(DotclSourceManifest)&quot; --root-sources-out &quot;$(DotclRootSourcesList)&quot;" />
+    <Exec Command="$(_DotclCmdPrefix) build &quot;$(DotclProjectAsd)&quot; --resolve-deps --manifest-out &quot;$(DotclSourceManifest)&quot; --root-sources-out &quot;$(DotclRootSourcesList)&quot;" />
   </Target>
 
   <!--
@@ -139,7 +139,7 @@
           Outputs="$(DotclRootFasl)">
 
     <Message Importance="high" Text="DotclCompileRoot: Inputs=@(_DotclRootSource);$(DotclProjectAsd) Outputs=$(DotclRootFasl)" />
-    <Exec Command="$(_DotclCmdPrefix) --compile-project &quot;$(DotclProjectAsd)&quot; --output &quot;$(DotclRootFasl)&quot;" />
+    <Exec Command="$(_DotclCmdPrefix) build &quot;$(DotclProjectAsd)&quot; --output &quot;$(DotclRootFasl)&quot;" />
   </Target>
 
   <!--

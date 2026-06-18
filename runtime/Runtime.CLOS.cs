@@ -295,7 +295,14 @@ public static partial class Runtime
     public static LispObject MakeClassFull(LispObject name, LispObject supersList, LispObject slotDefsList, LispObject metaclassObj)
         => MakeClassCore(name, supersList, slotDefsList, metaclassObj as LispClass);
 
-    private static LispObject MakeClassCore(LispObject name, LispObject supersList, LispObject slotDefsList, LispClass? metaclass)
+    // Variant carrying metaclass-slot initargs (e.g. :type-name) so the class object's
+    // single initialize-instance applies them before inherited :after methods run.
+    // Distinct name (not an overload) because builtins are reflected by method name and
+    // two methods named MakeClassFull would make that lookup ambiguous.
+    public static LispObject MakeClassFullWithInitargs(LispObject name, LispObject supersList, LispObject slotDefsList, LispObject metaclassObj, LispObject[] extraInitargs)
+        => MakeClassCore(name, supersList, slotDefsList, metaclassObj as LispClass, extraInitargs);
+
+    private static LispObject MakeClassCore(LispObject name, LispObject supersList, LispObject slotDefsList, LispClass? metaclass, LispObject[]? extraInitargs = null)
     {
         if (name is not Symbol sym)
             throw new LispErrorException(new LispTypeError("MAKE-CLASS: name must be a symbol", name));
@@ -356,7 +363,22 @@ public static partial class Runtime
             // methods fire — e.g. a slot computed by an :after method. The
             // shared-initialize primary handles a LispClass's ExtraSlots above.
             if (Startup.Sym("INITIALIZE-INSTANCE").Function is LispFunction iiFn)
-                iiFn.Invoke(new LispObject[] { cls });
+            {
+                // Pass the metaclass-slot initargs (e.g. :type-name from ensure-class) so
+                // shared-initialize applies them to the class object's ExtraSlots BEFORE any
+                // inherited initialize-instance :after runs — matching the ordinary instance
+                // init order. Otherwise an :after that reads an initarg-filled slot sees it
+                // UNBOUND.
+                LispObject[] iiArgs;
+                if (extraInitargs is { Length: > 0 })
+                {
+                    iiArgs = new LispObject[1 + extraInitargs.Length];
+                    iiArgs[0] = cls;
+                    Array.Copy(extraInitargs, 0, iiArgs, 1, extraInitargs.Length);
+                }
+                else iiArgs = new LispObject[] { cls };
+                iiFn.Invoke(iiArgs);
+            }
         }
         // Skip finalization if any superclass is forward-referenced
         bool hasForwardRef = false;
@@ -2020,10 +2042,13 @@ public static partial class Runtime
         if (methodObj is not LispMethod method)
             throw new LispErrorException(new LispTypeError("ADD-METHOD: not a method", methodObj));
 
-        // CLHS: If the method object is a method object of another generic function, signal error
-        if (method.Owner != null && method.Owner != gf)
+        // CLHS: If the method object is a method object of another generic function, signal error.
+        // Snapshot Owner once: a concurrent REMOVE-METHOD can null it between reads, and a
+        // non-atomic `Owner != null && Owner != gf ... Owner.Name` would then deref null (NRE).
+        var owner = method.Owner;
+        if (owner != null && owner != gf)
             throw new LispErrorException(new LispError(
-                $"ADD-METHOD: method already belongs to generic function {method.Owner.Name.Name}"));
+                $"ADD-METHOD: method already belongs to generic function {owner.Name.Name}"));
 
         // Check lambda list congruence (CLHS 7.6.4)
         CheckLambdaListCongruence(gf, method);
@@ -4376,7 +4401,7 @@ public static partial class Runtime
         Emitter.CilAssembler.RegisterFunction("CLASS-PROTOTYPE", new LispFunction(args => {
             if (args.Length != 1) throw new LispErrorException(new LispProgramError("CLASS-PROTOTYPE: wrong arg count"));
             if (args[0] is LispClass lc && !lc.IsBuiltIn)
-                return new LispInstance(lc);
+                return lc.Prototype; // memoized: stable identity for (eql class-prototype) dispatch
             throw new LispErrorException(new LispError("CLASS-PROTOTYPE: cannot create prototype for built-in class"));
         }, "CLASS-PROTOTYPE", 1));
 
@@ -4506,21 +4531,13 @@ public static partial class Runtime
                 }
                 for (int i = sds.Count - 1; i >= 0; i--) slotDefsList = new Cons(sds[i], slotDefsList);
             }
-            var clsObj = Runtime.MakeClassFull(nameSym, supersList, slotDefsList,
-                                               (LispObject?)metaclass ?? Nil.Instance);
+            // Pass metaclass-slot initargs (e.g. :type-name) into the class object's single
+            // init so shared-initialize applies them before inherited initialize-instance
+            // :after runs. RegisterClass copies ExtraSlots to the existing/forward-ref class,
+            // so re-ensure / forward-ref resolution carry the initialized slots too.
+            var clsObj = Runtime.MakeClassFullWithInitargs(nameSym, supersList, slotDefsList,
+                                               (LispObject?)metaclass ?? Nil.Instance, extra.ToArray());
             LispObject registered = clsObj is LispClass cls ? Runtime.RegisterClass(cls) : clsObj;
-            // Apply metaclass-slot initargs (e.g. :type-name) through the init protocol so
-            // they reach the class metaobject's metaclass-defined slots (and :after runs).
-            // RegisterClass's in-place path already switched the metaclass for an existing
-            // class, so this works for re-ensure / forward-ref resolution too.
-            if (metaclass != null && extra.Count > 0 && registered is LispClass rc
-                && Startup.Sym("INITIALIZE-INSTANCE").Function is LispFunction iiFn)
-            {
-                var iiArgs = new LispObject[1 + extra.Count];
-                iiArgs[0] = rc;
-                for (int i = 0; i < extra.Count; i++) iiArgs[i + 1] = extra[i];
-                iiFn.Invoke(iiArgs);
-            }
             return registered;
         }, "ENSURE-CLASS"));
     }

@@ -75,3 +75,81 @@
     (dotnet:invoke sb "Append" "world")
     (dotnet:invoke sb "ToString"))
   "world")
+
+;; #285 per-arg-local codegen: a multi-arg typed invoke marshals each argument
+;; from its own local (no LispObject[] array). String.IndexOf(string, int).
+(deftest direct-surface-multi-arg
+  (let ((s (dotnet:box "hello, hello" "System.String")))
+    (dotnet:invoke (the (dotnet "System.String") s) "IndexOf"
+                   (the (dotnet "System.String") "hello")
+                   (the (dotnet "System.Int32") 3)))
+  7)
+
+;; Two-arg typed call whose result feeds another: confirms locals don't clash
+;; across nested direct calls.
+(deftest direct-surface-multi-arg-nested
+  (let ((s (dotnet:box "abcabc" "System.String")))
+    (dotnet:invoke (the (dotnet "System.String") s) "Substring"
+                   (the (dotnet "System.Int32") 1)
+                   (the (dotnet "System.Int32") 3)))
+  "bca")
+
+;;; dotcl/dotcl#42 — DOTNET:BOX and DOTNET:NEW are static type sources too, so a
+;;; typed direct call needs no explicit THE when the receiver/args are already
+;;; written as box/new forms (their literal type is known at compile time).
+(deftest direct-surface-box-receiver-and-arg
+  (let ((sb (dotnet:new "System.Text.StringBuilder")))
+    (dotnet:invoke (dotnet:box sb "System.Text.StringBuilder") "Append"
+                   (dotnet:box "abcde" "System.String"))
+    (dotnet:invoke (dotnet:box sb "System.Text.StringBuilder") "get_Length"))
+  5)
+
+(deftest direct-surface-new-receiver
+  ;; A (dotnet:new "T" ...) receiver lowers directly (here the 0-arg get_Length).
+  (dotnet:invoke (dotnet:new "System.Text.StringBuilder"
+                             (dotnet:box "abcd" "System.String"))
+                 "get_Length")
+  4)
+
+(deftest direct-surface-box-mixed-with-the
+  ;; Receiver via THE, argument via BOX — both recognized.
+  (let ((sb (dotnet:new "System.Text.StringBuilder")))
+    (dotnet:invoke (the (dotnet "System.Text.StringBuilder") sb) "Append"
+                   (dotnet:box "xy" "System.String"))
+    (dotnet:invoke (the (dotnet "System.Text.StringBuilder") sb) "ToString"))
+  "xy")
+
+;; Partial typing (typed receiver, untyped arg) declines to the dynamic path
+;; and still returns the right value.
+(deftest direct-surface-box-partial-declines
+  (let ((sb (dotnet:new "System.Text.StringBuilder")))
+    (dotnet:invoke (dotnet:box sb "System.Text.StringBuilder") "Append" "zz")
+    (dotnet:invoke sb "ToString"))
+  "zz")
+
+;;; #285 value-type receivers: direct dispatch unboxes the receiver and uses
+;;; `call` for non-virtual methods / `constrained. callvirt` for virtual ones.
+(deftest direct-value-receiver-virtual-tostring
+  ;; Int32.ToString() is virtual -> constrained.callvirt.
+  (dotnet:invoke (the (dotnet "System.Int32") (dotnet:box 42 "System.Int32")) "ToString")
+  "42")
+
+(deftest direct-value-receiver-nonvirtual-getter
+  ;; DateTime.get_Year is non-virtual -> plain call on the unboxed pointer.
+  (dotnet:invoke (the (dotnet "System.DateTime")
+                      (dotnet:new "System.DateTime"
+                                  (the (dotnet "System.Int32") 2020)
+                                  (the (dotnet "System.Int32") 1)
+                                  (the (dotnet "System.Int32") 15)))
+                 "get_Year")
+  2020)
+
+(deftest direct-value-receiver-with-value-arg
+  ;; Int32.CompareTo(Int32): value receiver + value-type argument. 5 < 8 -> -1.
+  (dotnet:invoke (the (dotnet "System.Int32") (dotnet:box 5 "System.Int32"))
+                 "CompareTo" (the (dotnet "System.Int32") 8))
+  -1)
+
+(deftest direct-value-receiver-enum-tostring
+  (dotnet:invoke (dotnet:box "Read, Write" "System.IO.FileShare") "ToString")
+  "ReadWrite")

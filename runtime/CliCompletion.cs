@@ -2,21 +2,22 @@ namespace DotCL;
 
 public static class CliCompletion
 {
+    // User-facing flags only. Build-tooling flags (--resolve-deps,
+    // --compile-project, --manifest-out, --root-sources-out, --output,
+    // --target-rid) are internal MSBuild API and intentionally excluded
+    // from completion so the user surface stays clean (see --help).
     private static readonly string[] Flags = new[]
     {
-        "--help", "--version", "--core", "--load", "--eval", "--script",
-        "--resolve-deps", "--manifest-out", "--root-sources-out",
-        "--compile-project", "--output", "--completion", "--asd-search-path",
+        "--help", "--version", "--core", "--load", "--eval", "--no-init",
+        "--readline", "--no-readline", "--completion", "--asd-search-path",
     };
 
     private static readonly string[] FilePathFlags = new[]
     {
-        "--core", "--load", "--script", "--resolve-deps",
-        "--manifest-out", "--root-sources-out",
-        "--compile-project", "--output", "--asd-search-path",
+        "--core", "--load", "--asd-search-path",
     };
 
-    private static readonly string[] Subcommands = new[] { "repl" };
+    private static readonly string[] Subcommands = new[] { "repl", "build" };
 
     private static readonly string[] CompletionShells = new[]
     {

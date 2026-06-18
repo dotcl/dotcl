@@ -441,8 +441,8 @@ public class CilAssembler
             case "DOTNET-CALL-DIRECT":
                 EmitDotnetCallDirect(GetString(Cadr(c)), GetString(Caddr(c)));
                 break;
-            case "DOTNET-CALL-DIRECT-N":
-                EmitDotnetCallDirectN(c);
+            case "DOTNET-CALL-DIRECT-LOCALS":
+                EmitDotnetCallDirectLocals(c);
                 break;
             case "TAIL-PREFIX":
                 // CIL tail-call prefix. Must be immediately followed by a call/callvirt/calli
@@ -1822,76 +1822,155 @@ public class CilAssembler
         throw new Exception($"Unknown method for callvirt: {name}");
     }
 
+    // Resolve a type/method for the direct path, returning null (so the caller
+    // emits the dynamic fallback) for anything the direct codegen can't handle:
+    // an unresolvable type (e.g. a runtime dotnet:define-class not yet defined at
+    // assembly time) or no matching overload (e.g. a method reached only via
+    // optional-arg defaults). Value-type receivers ARE handled (see EmitDirectReceiver).
+    private MethodInfo? ResolveDirectTarget(string typeName, string methodName, Type[] paramTypes, out Type? type)
+    {
+        type = null;
+        Type t;
+        try { t = Runtime.ResolveDotNetType(typeName); }
+        catch { return null; }
+        var m = t.GetMethod(methodName, paramTypes);
+        if (m == null) return null;
+        type = t;
+        return m;
+    }
+
+    // Unwrap a receiver local to its static .NET type, leaving the `this` value on
+    // the stack: a typed object reference for reference types, or a managed pointer
+    // to the unboxed value for value types (via `unbox`). For value types the
+    // caller must prefix the call with `constrained. type` so both the value type's
+    // own methods and inherited virtuals (ToString, …) dispatch correctly.
+    private bool EmitDirectReceiver(LocalBuilder recv, Type type)
+    {
+        _il.Emit(OpCodes.Ldloc, recv);
+        _il.Emit(OpCodes.Castclass, typeof(LispDotNetObject));
+        _il.Emit(OpCodes.Callvirt, typeof(LispDotNetObject).GetMethod("get_Value")!);
+        if (type.IsValueType) { _il.Emit(OpCodes.Unbox, type); return true; }
+        _il.Emit(OpCodes.Castclass, type);
+        return false;
+    }
+
+    // Emit the instance call given the receiver kind. Reference receiver: plain
+    // callvirt. Value-type receiver (this = managed pointer from `unbox`): a
+    // virtual method (e.g. ToString) needs `constrained. type; callvirt`, while a
+    // non-virtual one (most struct methods / property getters like get_Year) needs
+    // a plain `call` — constrained.callvirt on a non-virtual method misdispatches.
+    private void EmitTypedInstanceCall(MethodInfo method, bool valueRecv, Type type)
+    {
+        if (!valueRecv)
+            _il.Emit(OpCodes.Callvirt, method);
+        else if (method.IsVirtual)
+        {
+            _il.Emit(OpCodes.Constrained, type);
+            _il.Emit(OpCodes.Callvirt, method);
+        }
+        else
+            _il.Emit(OpCodes.Call, method);
+    }
+
+    // Dynamic fallback: Runtime.DotNetInvoke(new LispObject[]{ recv, "method", args... }).
+    private void EmitDynamicInvokeFallback(LocalBuilder recv, string methodName, IReadOnlyList<LocalBuilder> args)
+    {
+        _il.Emit(OpCodes.Ldc_I4, 2 + args.Count);
+        _il.Emit(OpCodes.Newarr, typeof(LispObject));
+        _il.Emit(OpCodes.Dup); _il.Emit(OpCodes.Ldc_I4, 0);
+        _il.Emit(OpCodes.Ldloc, recv); _il.Emit(OpCodes.Stelem_Ref);
+        _il.Emit(OpCodes.Dup); _il.Emit(OpCodes.Ldc_I4, 1);
+        _il.Emit(OpCodes.Ldstr, methodName);
+        _il.Emit(OpCodes.Newobj, typeof(LispString).GetConstructor(new[] { typeof(string) })!);
+        _il.Emit(OpCodes.Stelem_Ref);
+        for (int i = 0; i < args.Count; i++)
+        {
+            _il.Emit(OpCodes.Dup); _il.Emit(OpCodes.Ldc_I4, 2 + i);
+            _il.Emit(OpCodes.Ldloc, args[i]); _il.Emit(OpCodes.Stelem_Ref);
+        }
+        _il.Emit(OpCodes.Call, typeof(Runtime).GetMethod("DotNetInvoke", new[] { typeof(LispObject[]) })!);
+    }
+
     private void EmitDotnetCallDirect(string typeName, string methodName)
     {
         // Stack on entry: [ receiver : LispObject ]. Direct dispatch for a
         // known-typed, zero-argument dotnet:invoke: unwrap the receiver to its
         // static .NET type and callvirt the resolved method — no runtime member
-        // lookup / InvokeMember. Reference-type receivers only for now (the codegen
-        // spine for type-declared invoke; args and value-type receivers come next).
-        var type = Runtime.ResolveDotNetType(typeName);
-        if (type.IsValueType)
-            throw new Exception($"dotnet-call-direct: value-type receiver not yet supported: {typeName}");
-        var method = type.GetMethod(methodName, Type.EmptyTypes)
-            ?? throw new Exception($"dotnet-call-direct: no zero-arg method {typeName}.{methodName}");
+        // lookup / InvokeMember. Falls back to the dynamic path when the target
+        // can't be resolved directly (see ResolveDirectTarget).
+        var recvTmp = _il.DeclareLocal(typeof(LispObject));
+        _il.Emit(OpCodes.Stloc, recvTmp);
 
-        // ((LispDotNetObject)receiver).Value, then cast to the static receiver type.
-        _il.Emit(OpCodes.Castclass, typeof(LispDotNetObject));
-        _il.Emit(OpCodes.Callvirt, typeof(LispDotNetObject).GetMethod("get_Value")!);
-        _il.Emit(OpCodes.Castclass, type);
-        // Callvirt works for both virtual and non-virtual instance methods on a
-        // reference type (and gives the desired null check).
-        _il.Emit(OpCodes.Callvirt, method);
+        var method = ResolveDirectTarget(typeName, methodName, Type.EmptyTypes, out var type);
+        if (method == null || type == null)
+        {
+            EmitDynamicInvokeFallback(recvTmp, methodName, System.Array.Empty<LocalBuilder>());
+            return;
+        }
+
+        bool valueRecv = EmitDirectReceiver(recvTmp, type);
+        EmitTypedInstanceCall(method, valueRecv, type);
         EmitDotnetResultMarshal(method);
     }
 
-    private void EmitDotnetCallDirectN(LispObject c)
+    private void EmitDotnetCallDirectLocals(LispObject c)
     {
-        // (:dotnet-call-direct-n "Type.FullName" "Method" "Param1.Type" ...)
-        // Entry stack: [ args : LispObject[], receiver : LispObject ]. Direct dispatch
-        // for a known-typed dotnet:invoke with arguments: resolve the exact overload by
-        // param types, marshal each LispObject arg to its parameter type, and callvirt
-        // directly (no InvokeMember). Reference-type receiver only for now.
+        // (:dotnet-call-direct-locals "Type" "Method" RECV-LOCAL (ARG-LOCAL...) (PARAM-TYPE...))
+        // Typed direct dispatch for a known-typed dotnet:invoke with arguments: the
+        // receiver and each argument are already in named locals (set by the
+        // compiler with an empty stack between them), so no LispObject[] is
+        // allocated. Resolve the exact overload by param types, marshal each arg
+        // local to its parameter type, and callvirt directly (no InvokeMember).
+        // Reference and value-type receivers (the latter via unbox + constrained.).
         string typeName = GetString(Cadr(c));
         string methodName = GetString(Caddr(c));
+        var rest = Cdr(Cdr(Cdr(c)));            // (RECV (ARGS) (PARAMS))
+        string recvLocal = GetSymbolName(Car(rest));
+        var argLocalNames = new System.Collections.Generic.List<string>();
+        for (var cur = Car(Cdr(rest)); cur is Cons cc; cur = cc.Cdr)
+            argLocalNames.Add(GetSymbolName(cc.Car));
         var paramTypeNames = new System.Collections.Generic.List<string>();
-        for (var cur = Cdr(Cdr(Cdr(c))); cur is Cons cc; cur = cc.Cdr)
+        for (var cur = Car(Cdr(Cdr(rest))); cur is Cons cc; cur = cc.Cdr)
             paramTypeNames.Add(GetString(cc.Car));
 
-        var type = Runtime.ResolveDotNetType(typeName);
-        if (type.IsValueType)
-            throw new Exception($"dotnet-call-direct-n: value-type receiver not yet supported: {typeName}");
+        var argLocals = new System.Collections.Generic.List<LocalBuilder>();
+        foreach (var n in argLocalNames) argLocals.Add(GetLocal(n));
+
+        // Resolve param types up front; an unresolvable one (e.g. runtime-defined)
+        // means we fall back to the dynamic path with the original args.
         var paramTypes = new Type[paramTypeNames.Count];
-        for (int i = 0; i < paramTypes.Length; i++) paramTypes[i] = Runtime.ResolveDotNetType(paramTypeNames[i]);
-        var method = type.GetMethod(methodName, paramTypes)
-            ?? throw new Exception($"dotnet-call-direct-n: no method {typeName}.{methodName}({string.Join(",", paramTypeNames)})");
+        bool paramsResolved = true;
+        for (int i = 0; i < paramTypes.Length; i++)
+        {
+            try { paramTypes[i] = Runtime.ResolveDotNetType(paramTypeNames[i]); }
+            catch { paramsResolved = false; break; }
+        }
+        Type? type = null;
+        MethodInfo? method = null;
+        if (paramsResolved && argLocalNames.Count == paramTypes.Length)
+            method = ResolveDirectTarget(typeName, methodName, paramTypes, out type);
+        if (method == null || type == null)
+        {
+            EmitDynamicInvokeFallback(GetLocal(recvLocal), methodName, argLocals);
+            return;
+        }
 
-        var recvLocal = _il.DeclareLocal(typeof(LispObject));
-        _il.Emit(OpCodes.Stloc, recvLocal);     // [ args ]
-        var argsLocal = _il.DeclareLocal(typeof(LispObject[]));
-        _il.Emit(OpCodes.Stloc, argsLocal);     // [ ]
+        // Typed receiver (reference: cast; value type: unbox + constrained. call).
+        bool valueRecv = EmitDirectReceiver(GetLocal(recvLocal), type);
 
-        // Typed receiver: ((T)((LispDotNetObject)recv).Value)
-        _il.Emit(OpCodes.Ldloc, recvLocal);
-        _il.Emit(OpCodes.Castclass, typeof(LispDotNetObject));
-        _il.Emit(OpCodes.Callvirt, typeof(LispDotNetObject).GetMethod("get_Value")!);
-        _il.Emit(OpCodes.Castclass, type);
-
-        // Each argument: Runtime.LispToDotNet(args[i], paramTypes[i]) then cast/unbox.
+        // Each argument straight from its local: Runtime.LispToDotNet(arg, paramTypes[i]).
         var lispToDotNet = typeof(Runtime).GetMethod("LispToDotNet", new[] { typeof(LispObject), typeof(Type) })!;
         var getTypeFromHandle = typeof(Type).GetMethod("GetTypeFromHandle", new[] { typeof(RuntimeTypeHandle) })!;
         for (int i = 0; i < paramTypes.Length; i++)
         {
-            _il.Emit(OpCodes.Ldloc, argsLocal);
-            _il.Emit(OpCodes.Ldc_I4, i);
-            _il.Emit(OpCodes.Ldelem_Ref);
+            _il.Emit(OpCodes.Ldloc, GetLocal(argLocalNames[i]));
             _il.Emit(OpCodes.Ldtoken, paramTypes[i]);
             _il.Emit(OpCodes.Call, getTypeFromHandle);
             _il.Emit(OpCodes.Call, lispToDotNet);
             if (paramTypes[i].IsValueType) _il.Emit(OpCodes.Unbox_Any, paramTypes[i]);
             else _il.Emit(OpCodes.Castclass, paramTypes[i]);
         }
-        _il.Emit(OpCodes.Callvirt, method);
+        EmitTypedInstanceCall(method, valueRecv, type);
         EmitDotnetResultMarshal(method);
     }
 

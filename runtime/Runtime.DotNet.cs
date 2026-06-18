@@ -34,8 +34,27 @@ public class LispDotNetBoxed : LispDotNetObject
         => $"#<DOTNET-BOXED {HintType.Name} {Value}>";
 }
 
+/// <summary>Singleton marker returned by (dotnet:null): marshals to an explicit
+/// .NET null, distinct from Lisp NIL (which means false for bool / bool?).</summary>
+public sealed class LispDotNetNull : LispObject
+{
+    public static readonly LispDotNetNull Instance = new();
+    private LispDotNetNull() { }
+    public override string ToString() => "#<DOTNET-NULL>";
+}
+
 public static partial class Runtime
 {
+    internal static readonly LispObject DotNetNullMarker = LispDotNetNull.Instance;
+
+    public static LispObject DotNetNull(LispObject[] args)
+    {
+        if (args.Length != 0)
+            throw new LispErrorException(new LispProgramError(
+                "DOTNET:NULL: takes no arguments"));
+        return DotNetNullMarker;
+    }
+
     // Tracks dynamically-defined class names (uppercase simple name → Type) for
     // case-insensitive resolution from Lisp symbols (e.g. symbol Animal → "ANIMAL").
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, Type>
@@ -62,6 +81,10 @@ public static partial class Runtime
     /// <summary>Convert a LispObject to a .NET type based on target parameter type.</summary>
     public static object? LispToDotNet(LispObject arg, Type targetType)
     {
+        // (dotnet:null) marker → an explicit .NET null, for any reference or
+        // Nullable<T> target (e.g. a null/indeterminate CheckBox.IsChecked).
+        if (ReferenceEquals(arg, DotNetNullMarker)) return null;
+
         // LispDotNetBoxed: use hint type
         if (arg is LispDotNetBoxed boxed)
         {
@@ -76,6 +99,18 @@ public static partial class Runtime
             if (targetType.IsAssignableFrom(dno.Type))
                 return dno.Value;
             return Convert.ChangeType(dno.Value, targetType);
+        }
+
+        // Nullable<T>: marshal to the underlying type so bool? mirrors plain bool
+        // (t→true, nil→false) and int?/etc. accept their value. nil maps to null
+        // for non-bool nullables (no false analog); (dotnet:null) is the explicit
+        // null for all. Without this, nil → Activator.CreateInstance(Nullable<T>)
+        // = null, so bool? could never receive false (#305).
+        var underlyingType = Nullable.GetUnderlyingType(targetType);
+        if (underlyingType != null)
+        {
+            if (arg is Nil && underlyingType != typeof(bool)) return null;
+            return LispToDotNet(arg, underlyingType);
         }
 
         // Nil → null or false
@@ -141,11 +176,91 @@ public static partial class Runtime
         if (arg is LispFunction fn && typeof(Delegate).IsAssignableFrom(targetType))
             return CreateLispDelegate(fn, targetType);
 
+        // Enum target: accept an integer (underlying value) or a name. Names come
+        // as a string/symbol/keyword and go through Enum.Parse (case-insensitive),
+        // which also accepts flag combinations like "Tunnel, Bubble". Lets callers
+        // pass RoutingStrategies / StringComparison etc. without first fetching the
+        // enum field object. An actual wrapped enum value is handled above.
+        if (targetType.IsEnum)
+        {
+            switch (arg)
+            {
+                case Fixnum efx: return Enum.ToObject(targetType, efx.Value);
+                case LispString els: return Enum.Parse(targetType, els.Value, ignoreCase: true);
+                case LispVector ecv when ecv.IsCharVector:
+                    return Enum.Parse(targetType, ecv.ToCharString(), ignoreCase: true);
+                case Symbol esym: return Enum.Parse(targetType, esym.Name, ignoreCase: true);
+            }
+        }
+
+        // Lisp sequence (list or vector) → typed array T[]. Lets a Lisp list or
+        // vector be passed where an array-typed parameter or property is expected
+        // (e.g. set_FileTypeFilter with FilePickerFileType[], Patterns with
+        // string[]). Each element is marshalled to the element type. An already
+        // wrapped .NET array is handled by the LispDotNetObject branch above.
+        if (targetType.IsArray && TryLispSequenceItems(arg, out var seqItems))
+        {
+            var elemType = targetType.GetElementType()!;
+            var arr = System.Array.CreateInstance(elemType, seqItems.Count);
+            for (int i = 0; i < seqItems.Count; i++)
+                arr.SetValue(LispToDotNet(seqItems[i], elemType), i);
+            return arr;
+        }
+
         // Fallback: pass as object
         if (targetType == typeof(object)) return arg;
 
         throw new LispErrorException(new LispTypeError(
             $"Cannot convert {arg.GetType().Name} to {targetType.Name}", arg));
+    }
+
+    /// <summary>Collect the elements of a Lisp proper list or vector (non-char)
+    /// into a flat list. Returns false for anything that isn't a sequence we
+    /// marshal to a .NET array (e.g. a string, which is a char vector).</summary>
+    private static bool TryLispSequenceItems(LispObject arg, out List<LispObject> items)
+    {
+        items = new List<LispObject>();
+        switch (arg)
+        {
+            case Nil:
+                return true;
+            case Cons:
+                var cur = arg;
+                while (cur is Cons c) { items.Add(c.Car); cur = c.Cdr; }
+                return cur is Nil; // proper list only
+            case LispVector v when !v.IsCharVector:
+                for (int i = 0; i < v.Length; i++) items.Add(v.GetElement(i));
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    /// <summary>Resolve a Lisp value naming a .NET type: a type-name string,
+    /// a symbol, or an already-wrapped System.Type.</summary>
+    internal static Type ResolveElementTypeArg(LispObject arg)
+    {
+        if (arg is LispDotNetObject dno && dno.Value is Type t) return t;
+        string typeName = arg switch { LispString ls => ls.Value, _ => arg.ToString() ?? "" };
+        return ResolveDotNetType(typeName);
+    }
+
+    /// <summary>(dotnet:new-array element-type &rest elements) => T[]
+    /// Create a typed .NET array of element-type, filled with the marshalled
+    /// elements. element-type is a type-name string/symbol or a resolved
+    /// System.Type. e.g. (dotnet:new-array "System.String" "a" "b" "c").
+    /// To build from a Lisp list: (apply #'dotnet:new-array "System.String" lst).</summary>
+    public static LispObject DotNetNewArray(LispObject[] args)
+    {
+        if (args.Length < 1)
+            throw new LispErrorException(new LispProgramError(
+                "DOTNET:NEW-ARRAY: requires at least 1 argument (element-type)"));
+        var elemType = ResolveElementTypeArg(args[0]);
+        int n = args.Length - 1;
+        var arr = System.Array.CreateInstance(elemType, n);
+        for (int i = 0; i < n; i++)
+            arr.SetValue(LispToDotNet(args[i + 1], elemType), i);
+        return new LispDotNetObject(arr);
     }
 
     public static LispObject DotNetLoadAssembly(LispObject[] args)
@@ -263,14 +378,42 @@ public static partial class Runtime
             catch { }
         }
 
-        // COM ProgID fallback. On non-Windows GetTypeFromProgID returns null
-        // (does not throw in modern .NET), so this is safe to call always.
-        try
+        // BCL / framework types whose assembly is not yet loaded and whose name
+        // doesn't match its containing assembly (so the namespace-prefix loop
+        // above misses it). The mscorlib / netstandard facades type-forward most
+        // of the BCL surface, so resolving through them triggers the real
+        // assembly load. e.g. "System.Collections.Queue" actually lives in
+        // System.Collections.NonGeneric — resolvable as "...Queue, mscorlib".
+        // Crucial: this must run BEFORE the COM ProgID fallback, because some
+        // legacy types (System.Collections.Queue, ArrayList, ...) are ALSO
+        // registered as .NET Framework COM components (mscoree.dll). Activating
+        // those via COM throws an uncatchable "Failed to load the runtime" and
+        // crashes the process (dotcl-internal #304).
+        foreach (var facade in new[] { "mscorlib", "netstandard" })
         {
-            var comType = Type.GetTypeFromProgID(typeName);
-            if (comType != null) return comType;
+            try
+            {
+                type = Type.GetType($"{bareTypeName}, {facade}");
+                if (type != null) return type;
+            }
+            catch { }
         }
-        catch { }
+
+        // COM ProgID fallback for genuine ProgIDs (e.g. "Excel.Application",
+        // "Schedule.Service" — D742). On non-Windows GetTypeFromProgID returns
+        // null (does not throw in modern .NET). Skip managed framework
+        // namespaces: they never name a wanted COM component, and "System.*"
+        // collides with legacy .NET Framework COM registrations that crash on
+        // activation (#304).
+        if (!bareTypeName.StartsWith("System.", StringComparison.Ordinal))
+        {
+            try
+            {
+                var comType = Type.GetTypeFromProgID(typeName);
+                if (comType != null) return comType;
+            }
+            catch { }
+        }
 
         // Fallback: case-insensitive lookup in dynamically-defined types (e.g. Lisp symbol
         // 'Animal uppercased to "ANIMAL" by reader, but dynamic type is named "Animal").
@@ -504,6 +647,60 @@ public static partial class Runtime
         }
     }
 
+    /// <summary>Fallback for dotnet:invoke / dotnet:static when InvokeMember's
+    /// default binder finds no overload, because it matches on the args' Lisp
+    /// runtime types and can't see conversions like Lisp-list → T[] or
+    /// Lisp-fn → delegate. Finds a same-name, same-arity, fixed (no ref/params)
+    /// method whose declared parameter types every supplied arg marshals to via
+    /// LispToDotNet, and invokes it. Purely additive: only runs after the binder
+    /// has already failed. Prefers candidates with an array parameter so the
+    /// list→T[] case is deterministic. Returns true and sets RESULT on success.</summary>
+    private static bool TryInvokeWithMarshalledArgs(
+        Type type, string name, object? target, LispObject[] lispArgs, bool isStatic, out object? result)
+    {
+        result = null;
+        var flags = System.Reflection.BindingFlags.Public
+            | (isStatic ? System.Reflection.BindingFlags.Static : System.Reflection.BindingFlags.Instance);
+        var candidates = new List<System.Reflection.MethodInfo>();
+        foreach (var m in type.GetMethods(flags))
+        {
+            if (m.Name != name || m.IsGenericMethodDefinition) continue;
+            var ps = m.GetParameters();
+            if (ps.Length != lispArgs.Length) continue;
+            bool ok = true;
+            foreach (var p in ps)
+                if (p.ParameterType.IsByRef
+                    || System.Attribute.IsDefined(p, typeof(ParamArrayAttribute)))
+                { ok = false; break; }
+            if (ok) candidates.Add(m);
+        }
+        // Prefer overloads with an array parameter (the case this enables).
+        candidates.Sort((a, b) =>
+            (b.GetParameters().Any(p => p.ParameterType.IsArray) ? 1 : 0)
+          - (a.GetParameters().Any(p => p.ParameterType.IsArray) ? 1 : 0));
+
+        foreach (var m in candidates)
+        {
+            var ps = m.GetParameters();
+            var converted = new object?[ps.Length];
+            bool converall = true;
+            for (int i = 0; i < ps.Length; i++)
+            {
+                try { converted[i] = LispToDotNet(lispArgs[i], ps[i].ParameterType); }
+                catch { converall = false; break; }
+            }
+            if (!converall) continue;
+            try { result = m.Invoke(target, converted); return true; }
+            catch (System.Reflection.TargetInvocationException tie)
+            {
+                throw new LispErrorException(new LispError(
+                    $"DOTNET:{(isStatic ? "STATIC" : "INVOKE")} {type.Name}.{name}: {tie.InnerException?.Message ?? tie.Message}"));
+            }
+            catch (ArgumentException) { /* wrong overload — try next */ }
+        }
+        return false;
+    }
+
     /// <summary>(dotnet:static "Type" "Member" &rest args)
     /// Read-side entry point for static methods, properties, and fields.
     /// Type.InvokeMember dispatches based on member kind + arg count.</summary>
@@ -530,6 +727,10 @@ public static partial class Runtime
             // No exact overload — retry allowing omitted C# optional parameters (#24).
             if (TryInvokeWithOptionalDefaults(type, memberName, null, args.Skip(2).ToArray(), true, out var r))
                 return DotNetToLisp(r);
+            // Or retry marshalling each arg to a candidate's declared param types
+            // (e.g. Lisp list → T[]), which the binder's runtime-type match misses.
+            if (TryInvokeWithMarshalledArgs(type, memberName, null, args.Skip(2).ToArray(), true, out var r2))
+                return DotNetToLisp(r2);
             throw;
         }
         catch (System.Reflection.TargetInvocationException tie)
@@ -613,6 +814,10 @@ public static partial class Runtime
             // No exact overload — retry allowing omitted C# optional parameters (#24).
             if (TryInvokeWithOptionalDefaults(type, memberName, target, args.Skip(2).ToArray(), false, out var r))
                 return DotNetToLisp(r);
+            // Or retry marshalling each arg to a candidate's declared param types
+            // (e.g. Lisp list → T[]), which the binder's runtime-type match misses.
+            if (TryInvokeWithMarshalledArgs(type, memberName, target, args.Skip(2).ToArray(), false, out var r2))
+                return DotNetToLisp(r2);
             throw;
         }
         catch (System.Reflection.TargetInvocationException tie)
@@ -701,6 +906,16 @@ public static partial class Runtime
                 if (lispArgs[i] is Fixnum) { if (pt == typeof(int) || pt == typeof(long)) score += 10; }
                 else if (lispArgs[i] is DoubleFloat || lispArgs[i] is SingleFloat) { if (pt == typeof(double)) score += 10; }
                 else if (lispArgs[i] is LispString) { if (pt == typeof(string)) score += 10; }
+                else if (lispArgs[i] is LispDotNetObject dno)
+                {
+                    // A wrapped .NET instance: prefer the overload whose parameter
+                    // type the instance is assignable to (exact match wins over a
+                    // base/interface match), e.g. Bitmap(Stream) for a MemoryStream
+                    // rather than Bitmap(string).
+                    var at = dno is LispDotNetBoxed bx ? bx.HintType : dno.Type;
+                    if (pt == at) score += 20;
+                    else if (pt.IsAssignableFrom(at)) score += 10;
+                }
             }
             return score;
         }).First();

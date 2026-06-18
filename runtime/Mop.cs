@@ -114,10 +114,12 @@ public static class Mop
         RegisterMop("CLASS-PROTOTYPE", 1, args =>
         {
             // AMOP: returns "an instance of class" without running initialize-instance.
-            // Best-effort: a freshly-allocated unbound LispInstance.
+            // Must return the SAME instance every call (memoized on the class) —
+            // EQL-method dispatch (e.g. McCLIM define-presentation-method) relies
+            // on (eql class-prototype) being stable across definition and call.
             if (args[0] is not LispClass c)
                 throw new LispErrorException(new LispTypeError("CLASS-PROTOTYPE: not a class", args[0]));
-            return new LispInstance(c);
+            return c.Prototype;
         });
 
         // -- Slot introspection -------------------------------------------

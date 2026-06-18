@@ -467,7 +467,6 @@ public static partial class Runtime
                     Load(new LispObject[] { new LispString(path) });
                     if (name == "asdf")
                     {
-                        RegisterStandardSourceRegistries();
                         RegisterUserAsdSearchPaths();
                         PatchUiopWindowsPath();
                         RegisterContribWithAsdf(searchDirs.ToArray());
@@ -486,41 +485,14 @@ public static partial class Runtime
     public static readonly List<string> UserAsdSearchPaths = new();
 
     /// <summary>
-    /// Push standard QL / Common Lisp source registry locations to
-    /// asdf:*central-registry*. Each library subdir under the QL software
-    /// dir is registered individually so asdf can resolve :depends-on
-    /// without manual CL_SOURCE_REGISTRY config.
+    /// Script user-arguments from a positional `dotcl file.lisp arg1 arg2`
+    /// invocation. Null when not running a positional script (REPL, --eval,
+    /// --load-only, save-application exe). Set by Program.cs before the script
+    /// runs; surfaced via dotcl:command-line-arguments so that
+    /// uiop:command-line-arguments returns these args. See COMMAND-LINE-ARGUMENTS
+    /// registration in Startup.cs for the `--`-delimited shape.
     /// </summary>
-    private static void RegisterStandardSourceRegistries()
-    {
-        var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        if (string.IsNullOrEmpty(home)) return;
-        string[] roots = new[]
-        {
-            Path.Combine(home, ".roswell", "lisp", "quicklisp", "dists", "quicklisp", "software"),
-            Path.Combine(home, "quicklisp", "dists", "quicklisp", "software"),
-            Path.Combine(home, ".local", "share", "common-lisp", "source"),
-        };
-        var dirs = new List<string>();
-        foreach (var root in roots)
-        {
-            if (!Directory.Exists(root)) continue;
-            foreach (var pkg in Directory.GetDirectories(root))
-            {
-                // Register the package dir itself if it has .asd files.
-                if (Directory.EnumerateFiles(pkg, "*.asd").Any())
-                    dirs.Add(pkg);
-                // Also register immediate subdirectories that contain .asd files
-                // (e.g. mgl-pax-20260101-git/autoload/, coalton/source-error/).
-                foreach (var sub in Directory.GetDirectories(pkg))
-                {
-                    if (Directory.EnumerateFiles(sub, "*.asd").Any())
-                        dirs.Add(sub);
-                }
-            }
-        }
-        PushDirsToCentralRegistry(dirs);
-    }
+    public static List<string>? ScriptArgs = null;
 
     /// <summary>
     /// On Windows hosts, wrap uiop:parse-unix-namestring so that strings
@@ -1396,6 +1368,18 @@ public static partial class Runtime
         var oldCompileFileMode = DynamicBindings.Get(compileFileModeSym);
         DynamicBindings.Set(compileFileModeSym, Startup.Sym("T"));
 
+        // Snapshot *modules*. A compile-time (require "x") (e.g. eval-when
+        // :compile-toplevel) loads a contrib whose defuns are reverted by the
+        // Function/SetfFunction strip in `finally` below — but the *modules*
+        // push is a dynamic-var mutation not covered by that strip, so without
+        // this it would persist, leaving the module marked-loaded yet undefined.
+        // A later load-time (require "x") would then see it in *modules* and
+        // skip re-loading, so the contrib's functions stay unbound. Reverting
+        // *modules* keeps it consistent with the stripped defuns: the compile-time
+        // require becomes fully transient and the load-time require re-loads for real.
+        var modulesSym2 = Startup.Sym("*MODULES*");
+        var oldModules = DynamicBindings.Get(modulesSym2);
+
         // :target-features — rebind *features* so reader conditionals (#+/#-) and
         // os-cond macro expansions see the target platform, not the host.
         // Used for cross-compiling asdf.fasl for Linux/Win/macOS from any host.
@@ -1576,6 +1560,10 @@ public static partial class Runtime
                     }
                 }
             }
+
+            // Restore *modules* so a compile-time (require ...) doesn't leak a
+            // marked-loaded-but-undefined module (its defuns were stripped above).
+            DynamicBindings.Set(modulesSym2, oldModules);
 
             // Restore *compile-file-mode* and dynamic bindings
             DynamicBindings.Set(compileFileModeSym, oldCompileFileMode);

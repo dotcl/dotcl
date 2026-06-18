@@ -627,16 +627,24 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
                      ;; zero-arg fast path: receiver only, no args array
                      `(,@(compile-for-single-value recv)
                        (:dotnet-call-direct ,type ,method))
-                     ;; n-arg: stash receiver in a local (so the args array can be
-                     ;; built with an empty stack — CIL try-block safety), build the
-                     ;; args array, reload receiver, then the typed direct call.
-                     (let ((recv-tmp (gen-local "DRCV")))
+                     ;; n-arg: evaluate the receiver and each argument into its own
+                     ;; local (each with an empty stack — CIL try-block safety), then
+                     ;; the typed direct call marshals straight from those locals. No
+                     ;; LispObject[] is allocated (per-arg-local codegen, #285).
+                     (let ((recv-tmp (gen-local "DRCV"))
+                           (arg-tmps (loop for a in args collect (gen-local "DARG"))))
                        `((:declare-local ,recv-tmp "LispObject")
                          ,@(compile-for-single-value recv)
                          (:stloc ,recv-tmp)
-                         ,@(compile-args-array args)
-                         (:ldloc ,recv-tmp)
-                         (:dotnet-call-direct-n ,type ,method ,@param-types))))))
+                         ,@(loop for arg in args
+                                 for tmp in arg-tmps
+                                 append `((:declare-local ,tmp "LispObject")
+                                          ,@(let ((*in-tail-position* nil)
+                                                  (*in-mv-context* nil))
+                                              (compile-expr arg))
+                                          (:stloc ,tmp)))
+                         (:dotnet-call-direct-locals ,type ,method ,recv-tmp
+                                                     ,arg-tmps ,param-types))))))
               ;; (setf name) function call: ((setf foo) args...) → named call
               ((and (consp op) (symbolp (car op)) (string= (symbol-name (car op)) "SETF"))
                (compile-named-call op (cdr expr)))

@@ -1,0 +1,146 @@
+<Project>
+  <!--
+    Project-core build for pure-PackageReference consumers (#307).
+
+    Activated only when the consumer sets <DotclProjectAsd>. It compiles an ASDF
+    system to a fasl (+ dependency fasls + a deployment manifest) entirely from
+    the packaged assets — no repo checkout, no `dotnet tool install`. The work is
+    done in-process by DotCL.Build.Tasks (tasks/DotCL.Build.Tasks.dll), which
+    loads the runtime the package already ships under lib/net10.0/ rather than a
+    second bundled copy.
+
+    Imported from DotCL.Runtime.targets. Plain embedders (no DotclProjectAsd) are
+    untouched — every target below is gated on it.
+
+    Requires the .NET 10 SDK's MSBuild: the FASL emitter is net10-only, so the
+    runtime assembly used here is lib/net10.0/DotCL.Runtime.dll regardless of the
+    consumer app's own target framework.
+  -->
+
+  <PropertyGroup Condition="'$(DotclProjectAsd)' != ''">
+    <!-- This file ships in build/ at the package root; assets sit alongside. -->
+    <_DotCLAssetsDir>$(MSBuildThisFileDirectory)..\dotclassets\</_DotCLAssetsDir>
+    <_DotCLTaskAssembly>$(MSBuildThisFileDirectory)..\tasks\DotCL.Build.Tasks.dll</_DotCLTaskAssembly>
+    <_DotCLRuntimeAssembly>$(MSBuildThisFileDirectory)..\lib\net10.0\DotCL.Runtime.dll</_DotCLRuntimeAssembly>
+    <_DotCLContribDir>$(_DotCLAssetsDir)contrib</_DotCLContribDir>
+    <!-- Base core: the packaged fasl unless the consumer points elsewhere. -->
+    <DotclBaseCore Condition="'$(DotclBaseCore)' == ''">$(_DotCLAssetsDir)dotcl.core</DotclBaseCore>
+
+    <DotclBundleDir>$(IntermediateOutputPath)dotcl-fasl\</DotclBundleDir>
+    <DotclSourceManifest>$(DotclBundleDir)dotcl-deps.source.txt</DotclSourceManifest>
+    <DotclRootSourcesList>$(DotclBundleDir)dotcl-root-sources.txt</DotclRootSourcesList>
+    <DotclDeployedManifest>$(DotclBundleDir)dotcl-deps.txt</DotclDeployedManifest>
+    <DotclRootFasl>$(DotclBundleDir)$(MSBuildProjectName).fasl</DotclRootFasl>
+  </PropertyGroup>
+
+  <UsingTask Condition="'$(DotclProjectAsd)' != '' and Exists('$(_DotCLTaskAssembly)')"
+             TaskName="DotCL.Build.Tasks.DotclResolveDeps" AssemblyFile="$(_DotCLTaskAssembly)" />
+  <UsingTask Condition="'$(DotclProjectAsd)' != '' and Exists('$(_DotCLTaskAssembly)')"
+             TaskName="DotCL.Build.Tasks.DotclCompileProject" AssemblyFile="$(_DotCLTaskAssembly)" />
+
+  <!-- The shared BeforeTargets hook list: run before output collection /
+       asset-pack / Android-assets / Maui / BeforeBuild. -->
+
+  <!-- Step 1: resolve the :depends-on graph → dep fasl manifest + root sources. -->
+  <Target Name="_DotCLResolveDeps"
+          BeforeTargets="GetCopyToOutputDirectoryItems;_CollectAssetPackFiles;_GenerateAndroidAssetsDir;_CollectMauiAssetsTargetFramework;BeforeBuild"
+          Condition="'$(DotclProjectAsd)' != ''"
+          Inputs="$(DotclProjectAsd)"
+          Outputs="$(DotclSourceManifest);$(DotclRootSourcesList)">
+    <MakeDir Directories="$(DotclBundleDir)" />
+    <DotclResolveDeps Asd="$(DotclProjectAsd)"
+                      BaseCore="$(DotclBaseCore)"
+                      ContribDir="$(_DotCLContribDir)"
+                      ManifestOut="$(DotclSourceManifest)"
+                      RootSourcesOut="$(DotclRootSourcesList)"
+                      RuntimeAssemblyPath="$(_DotCLRuntimeAssembly)" />
+  </Target>
+
+  <!-- Step 2: read both lists into items so later steps can use them. -->
+  <Target Name="_DotCLLoadItems"
+          DependsOnTargets="_DotCLResolveDeps"
+          BeforeTargets="GetCopyToOutputDirectoryItems;_CollectAssetPackFiles;_GenerateAndroidAssetsDir;_CollectMauiAssetsTargetFramework;BeforeBuild"
+          Condition="'$(DotclProjectAsd)' != '' and Exists('$(DotclSourceManifest)')">
+    <ReadLinesFromFile File="$(DotclSourceManifest)">
+      <Output TaskParameter="Lines" ItemName="_DotclDepFasl" />
+    </ReadLinesFromFile>
+    <ReadLinesFromFile File="$(DotclRootSourcesList)" Condition="Exists('$(DotclRootSourcesList)')">
+      <Output TaskParameter="Lines" ItemName="_DotclRootSource" />
+    </ReadLinesFromFile>
+  </Target>
+
+  <!-- Step 3: copy each dependency fasl into the bundle dir. -->
+  <Target Name="_DotCLBundleDeps"
+          DependsOnTargets="_DotCLLoadItems"
+          BeforeTargets="GetCopyToOutputDirectoryItems;_CollectAssetPackFiles;_GenerateAndroidAssetsDir;_CollectMauiAssetsTargetFramework;BeforeBuild"
+          Condition="'$(DotclProjectAsd)' != ''">
+    <Copy SourceFiles="@(_DotclDepFasl)"
+          DestinationFolder="$(DotclBundleDir)"
+          SkipUnchangedFiles="true" />
+  </Target>
+
+  <!-- Step 4: compile the root system's components into one fasl. Inputs are
+       the .lisp sources + the .asd, so MSBuild owns the incremental decision. -->
+  <Target Name="_DotCLCompileRoot"
+          DependsOnTargets="_DotCLLoadItems"
+          BeforeTargets="GetCopyToOutputDirectoryItems;_CollectAssetPackFiles;_GenerateAndroidAssetsDir;_CollectMauiAssetsTargetFramework;BeforeBuild"
+          Condition="'$(DotclProjectAsd)' != ''"
+          Inputs="@(_DotclRootSource);$(DotclProjectAsd)"
+          Outputs="$(DotclRootFasl)">
+    <DotclCompileProject Asd="$(DotclProjectAsd)"
+                         Output="$(DotclRootFasl)"
+                         BaseCore="$(DotclBaseCore)"
+                         ContribDir="$(_DotCLContribDir)"
+                         RuntimeAssemblyPath="$(_DotCLRuntimeAssembly)" />
+  </Target>
+
+  <!-- Step 5: write the deployment manifest (base core, deps, root fasl) using
+       basenames so LoadFromManifest resolves them relative to its own dir. -->
+  <Target Name="_DotCLWriteManifest"
+          DependsOnTargets="_DotCLBundleDeps;_DotCLCompileRoot"
+          BeforeTargets="GetCopyToOutputDirectoryItems;_CollectAssetPackFiles;_GenerateAndroidAssetsDir;_CollectMauiAssetsTargetFramework;BeforeBuild"
+          Condition="'$(DotclProjectAsd)' != ''">
+    <Copy Condition="'$(DotclBaseCore)' != '' and Exists('$(DotclBaseCore)')"
+          SourceFiles="$(DotclBaseCore)"
+          DestinationFolder="$(DotclBundleDir)"
+          SkipUnchangedFiles="true" />
+    <ItemGroup>
+      <_DotclManifestLine Include="dotcl.core" Condition="'$(DotclBaseCore)' != '' and Exists('$(DotclBaseCore)')" />
+      <_DotclManifestLine Include="%(_DotclDepFasl.Filename)%(_DotclDepFasl.Extension)" />
+      <_DotclManifestLine Include="$(MSBuildProjectName).fasl" />
+    </ItemGroup>
+    <WriteLinesToFile File="$(DotclDeployedManifest)"
+                      Lines="@(_DotclManifestLine)"
+                      Overwrite="true" />
+  </Target>
+
+  <!-- Step 6: inject the bundle (manifest + fasls + base core) as build items so
+       they reach bin/ (desktop) or the APK (Android/Maui). -->
+  <Target Name="_DotCLInjectAssets"
+          DependsOnTargets="_DotCLWriteManifest"
+          BeforeTargets="GetCopyToOutputDirectoryItems;_CollectAssetPackFiles;AssignTargetPaths;_GenerateAndroidAssetsDir;_CollectMauiAssetsTargetFramework"
+          Condition="'$(DotclProjectAsd)' != '' and Exists('$(DotclDeployedManifest)')">
+    <ItemGroup>
+      <_DotclBundled Include="$(DotclBundleDir)*.fasl" />
+      <_DotclBundled Include="$(DotclBundleDir)dotcl.core" Condition="Exists('$(DotclBundleDir)dotcl.core')" />
+      <_DotclBundled Include="$(DotclDeployedManifest)" />
+    </ItemGroup>
+
+    <ItemGroup Condition="'$(UseMaui)' == 'true' and $(TargetFramework.Contains('-android'))">
+      <MauiAsset Include="@(_DotclBundled)">
+        <LogicalName>dotcl-fasl/%(Filename)%(Extension)</LogicalName>
+      </MauiAsset>
+      <AndroidAsset Include="@(_DotclBundled)">
+        <Link>dotcl-fasl/%(Filename)%(Extension)</Link>
+      </AndroidAsset>
+    </ItemGroup>
+
+    <ItemGroup Condition="'$(UseMaui)' != 'true' or !$(TargetFramework.Contains('-android'))">
+      <None Include="@(_DotclBundled)">
+        <Link>dotcl-fasl/%(Filename)%(Extension)</Link>
+        <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      </None>
+    </ItemGroup>
+  </Target>
+
+</Project>

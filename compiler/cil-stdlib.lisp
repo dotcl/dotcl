@@ -1312,17 +1312,49 @@ Also expands element types within compound type specifiers like (VECTOR etype si
               (stringp (cadr spec))
               (cons (cadr spec) (caddr x))))))
 
+(defun %dotnet-in-pkg (sym name)
+  "True when symbol SYM is named NAME in the DOTNET package."
+  (and (symbolp sym) (string= (symbol-name sym) name)
+       (let ((p (symbol-package sym)))
+         (and p (string= (package-name p) "DOTNET")))))
+
+(defun %dotnet-static-type (x)
+  "If X statically denotes a typed .NET value, return (cons \"T\" EXPR) where
+EXPR evaluates to a .NET object of type \"T\". Recognizes:
+  (the (dotnet \"T\") E)   -> E is already a .NET object  (cons \"T\" E)
+  (dotnet:box E \"T\")      -> the box form yields a LispDotNetBoxed of T
+  (dotnet:new \"T\" ...)    -> the new form yields a LispDotNetObject of T
+For box/new the whole form is the EXPR (it produces the wrapped object), so the
+typed direct call works without an explicit THE (dotcl/dotcl#42)."
+  (or (%dotnet-the-type x)
+      (and (consp x)
+           (cond
+             ;; (dotnet:box E "T") — literal type in 3rd position
+             ((and (%dotnet-in-pkg (car x) "BOX")
+                   (consp (cdr x)) (consp (cddr x)) (null (cdddr x))
+                   (stringp (caddr x)))
+              (cons (caddr x) x))
+             ;; (dotnet:new "T" ...) — literal type in 2nd position
+             ((and (%dotnet-in-pkg (car x) "NEW")
+                   (consp (cdr x)) (stringp (cadr x)))
+              (cons (cadr x) x))
+             (t nil)))))
+
 (defun %dotnet-invoke-direct-cm (form env)
   "Compiler macro for DOTNET:INVOKE: rewrite a fully type-declared call to
-%DOTNET-CALL-DIRECT; decline (return FORM) otherwise."
+%DOTNET-CALL-DIRECT; decline (return FORM) otherwise. The receiver and each
+argument may carry their type via THE, DOTNET:BOX, or DOTNET:NEW. The lowering
+is optimistic: the assembler resolves the exact overload and silently falls back
+to the dynamic path when it can't (unresolvable / runtime-defined type, value-type
+receiver, or no matching overload), so this never changes behaviour, only speed."
   (declare (ignore env))
   (let ((recv (cadr form)) (method (caddr form)) (args (cdddr form)))
-    (let ((rt (and (stringp method) (%dotnet-the-type recv))))
+    (let ((rt (and (stringp method) (%dotnet-static-type recv))))
       (if (not rt)
           form
           (let ((param-types '()) (arg-exprs '()) (ok t))
             (dolist (a args)
-              (let ((at (%dotnet-the-type a)))
+              (let ((at (%dotnet-static-type a)))
                 (if at
                     (progn (push (car at) param-types) (push (cdr at) arg-exprs))
                     (setf ok nil))))

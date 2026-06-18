@@ -23,6 +23,7 @@
 (load "test/regression/native-int-arith.lisp")
 (load "test/regression/process.lisp")
 (load "test/regression/precompiled-only.lisp")
+(load "test/regression/gray-streams.lisp")
 
 (do-tests-summary)
 (if (= *fail-count* 0)

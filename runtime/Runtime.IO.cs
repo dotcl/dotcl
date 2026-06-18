@@ -1030,9 +1030,13 @@ public static partial class Runtime
 
     public static LispObject OpenStreamP(LispObject stream)
     {
-        if (stream is not LispStream ls)
-            throw new LispErrorException(new LispTypeError("OPEN-STREAM-P: not a stream", stream, Startup.Sym("STREAM")));
-        return ls.IsClosed ? Nil.Instance : T.Instance;
+        if (stream is LispStream ls)
+            return ls.IsClosed ? Nil.Instance : T.Instance;
+        // Gray Streams: streamp が T を返すインスタンスは open とみなす
+        // (dotcl は gray stream に closed フラグを持たないため常に open)
+        if (stream is LispInstance gi && (IsGrayOutputStream(gi) || IsGrayInputStream(gi)))
+            return T.Instance;
+        throw new LispErrorException(new LispTypeError("OPEN-STREAM-P: not a stream", stream, Startup.Sym("STREAM")));
     }
 
     public static LispObject ReadCharNoHang(LispObject streamObj, LispObject eofErrorP, LispObject eofValue)
@@ -3381,6 +3385,15 @@ public static partial class Runtime
                 new LispFunction(args => {
                     if (args.Length > 1)
                         throw new LispErrorException(new LispProgramError($"{fn}: wrong number of arguments: {args.Length} (expected 0 or 1)"));
+                    // Gray output stream: trampoline to the corresponding generic
+                    // (stream-force-output / stream-finish-output / stream-clear-output)
+                    // so streamp=T instances are accepted, consistent with D1211.
+                    if (args.Length > 0 && args[0] is LispInstance gi && IsGrayOutputStream(gi))
+                    {
+                        var gfn = GrayStreamLookup.GrayOrCl("STREAM-" + fn);
+                        gfn?.Invoke(new LispObject[] { gi });
+                        return Nil.Instance;
+                    }
                     if (args.Length > 0 && args[0] is not (LispStream or Nil or T))
                         throw new LispErrorException(new LispTypeError($"{fn}: not a stream designator", args[0], Startup.Sym("STREAM")));
                     var stream = args.Length > 0 && args[0] is not Nil

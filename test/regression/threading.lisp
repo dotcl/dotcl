@@ -380,3 +380,31 @@
         (dolist (th ths) (dotcl:thread-join th))))
     *%d1145-err*)
   nil)
+
+;;; #300: ALL threads concurrently REMOVE-METHOD + ADD-METHOD the same method (unlike
+;;; d1145's single churner). A TOCTOU on method.Owner in ADD-METHOD used to deref null
+;;; and crash with a .NET NullReferenceException. Clean Lisp errors from a transiently
+;;; empty method list are acceptable; a raw "Object reference" NRE is not.
+(defclass %i300-a () ())
+(defgeneric %i300-gf (x))
+(defmethod %i300-gf ((x %i300-a)) :a)
+(defparameter *%i300-ia* (make-instance '%i300-a))
+(defparameter *%i300-m* (find-method #'%i300-gf '() (list (find-class '%i300-a))))
+(defparameter *%i300-nre* nil)
+
+(deftest i300-concurrent-method-mutation-no-nre
+  (progn
+    (setf *%i300-nre* nil)
+    (flet ((worker ()
+             (dotimes (i 8000)
+               (handler-case
+                   (progn (remove-method #'%i300-gf *%i300-m*)
+                          (add-method #'%i300-gf *%i300-m*)
+                          (%i300-gf *%i300-ia*) nil)
+                 (error (e)
+                   (when (search "Object reference" (princ-to-string e))
+                     (setf *%i300-nre* (princ-to-string e))))))))
+      (let ((ths (loop repeat 4 collect (dotcl:make-thread #'worker :name "i300-w"))))
+        (dolist (th ths) (dotcl:thread-join th))))
+    *%i300-nre*)
+  nil)

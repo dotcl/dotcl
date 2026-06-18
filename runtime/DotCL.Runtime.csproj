@@ -47,11 +47,24 @@
           Condition="Exists('contrib')" Pack="true" PackagePath="dotclassets/contrib/" />
     <None Include="build/DotCL.Runtime.targets" Pack="true" PackagePath="build/" />
     <None Include="build/DotCL.Runtime.targets" Pack="true" PackagePath="buildTransitive/" />
+    <!-- Project-core build (#307): the targets that drive the in-process tasks,
+         and the task assembly itself under tools-like tasks/. The task is built
+         separately (it ProjectReferences this library) by `make pack` before
+         dotnet pack runs; Condition=Exists keeps a plain `dotnet pack` (without
+         the task built) from failing — it just omits the project-core feature. -->
+    <None Include="build/DotCL.Runtime.ProjectCore.targets" Pack="true" PackagePath="build/" />
+    <None Include="build/DotCL.Runtime.ProjectCore.targets" Pack="true" PackagePath="buildTransitive/" />
+    <None Include="build-tasks/bin/$(Configuration)/net10.0/DotCL.Build.Tasks.dll"
+          Condition="Exists('build-tasks/bin/$(Configuration)/net10.0/DotCL.Build.Tasks.dll')"
+          Pack="true" PackagePath="tasks/" />
   </ItemGroup>
 
   <!-- Exclude Program.cs — entry point lives in the dotcl tool project -->
   <ItemGroup>
     <Compile Remove="Program.cs" />
+    <!-- build-tasks/ is a separate MSBuild-task assembly (#307) that lives under
+         runtime/; keep its sources out of the runtime library's default glob. -->
+    <Compile Remove="build-tasks/**/*.cs" />
   </ItemGroup>
 
   <!-- contrib/ sources are separate assemblies (e.g. dotcl-jitdisasm needs Iced +

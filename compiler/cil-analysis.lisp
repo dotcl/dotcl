@@ -95,6 +95,20 @@
                   (cond
                     ((and (symbolp head) (eq head 'quote)) nil)
                     ((and (symbolp head) (eq head 'defun)) nil)
+                    ;; cond: each clause is (test . body) and EVERY element is an
+                    ;; evaluated expression. The generic walk below would treat a
+                    ;; clause whose test is a symbol — e.g. (cond (start-anchored-p ...)) —
+                    ;; as a function call (car = function name), dropping the test as a
+                    ;; free-variable reference. When that name is also a captured local
+                    ;; AND a global function (Lisp-2), the variable then isn't captured
+                    ;; into the closure env and reads "Unbound variable" at run time.
+                    ;; Scan all elements of each clause as expressions. (case/typecase
+                    ;; differ: their clause cars are unevaluated keys — handled generically.)
+                    ((and (symbolp head) (eq head 'cond))
+                     (do-list-safe (clause (cdr e))
+                       (when (consp clause)
+                         (do-list-safe (sub clause)
+                           (push (cons sub (cons bnd mdepth)) worklist)))))
                     ;; Lambda introduces new bindings
                     ((and (symbolp head) (eq head 'lambda))
                      (let* ((params (cadr e))

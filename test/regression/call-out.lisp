@@ -58,6 +58,98 @@
     (type-error () t))
   t)
 
+;;; #304 — BCL types whose assembly is not the corelib and whose name doesn't
+;;; match its assembly (System.Collections.Queue lives in
+;;; System.Collections.NonGeneric) must resolve via mscorlib/netstandard facade
+;;; forwarding, NOT fall through to the COM ProgID path. Queue is registered as a
+;;; legacy .NET Framework COM component, so the old code activated it via mscoree
+;;; and crashed the process uncatchably. A clean resolution proves the facade
+;;; path runs first and the System.* COM guard holds.
+(deftest issue304-resolve-noncorelib-bcl-type
+  (dotnet:invoke (dotnet:resolve-type "System.Collections.Queue") "get_FullName")
+  "System.Collections.Queue")
+
+(deftest issue304-new-noncorelib-bcl-type
+  (let ((q (dotnet:new "System.Collections.Queue")))
+    (dotnet:invoke q "Enqueue" 1)
+    (dotnet:invoke q "Enqueue" 2)
+    (dotnet:invoke q "get_Count"))
+  2)
+
+;;; #303 — typed array interop: dotnet:new-array builds a T[], and a Lisp
+;;; list/vector auto-marshals to an array-typed parameter/property.
+(deftest issue303-new-array-string
+  ;; new-array "System.String" -> string[]; passes into String.Join(string,string[]).
+  (dotnet:static "System.String" "Join" ","
+                 (dotnet:new-array "System.String" "a" "b" "c"))
+  "a,b,c")
+
+(deftest issue303-new-array-empty
+  (dotnet:static "System.String" "Join" ","
+                 (dotnet:new-array "System.String"))
+  "")
+
+(deftest issue303-new-array-int-length
+  (dotnet:invoke (dotnet:new-array "System.Int32" 10 20 30) "get_Length")
+  3)
+
+(deftest issue303-new-array-apply-from-list
+  (dotnet:static "System.String" "Join" ""
+                 (apply #'dotnet:new-array "System.String" (list "1" "2" "3")))
+  "123")
+
+;;; A Lisp list / vector marshals to a string[] method parameter (the binder's
+;;; runtime-type match misses this; the marshalling fallback recovers it).
+(deftest issue303-list-marshals-to-array-property
+  (progn
+    (dotnet:%define-class "Probe303.Holder" "System.Object"
+      nil nil nil nil '(("Tags" "System.String[]")))
+    (let ((h (dotnet:new "Probe303.Holder")))
+      (dotnet:invoke h "set_Tags" (list "alpha" "beta" "gamma"))
+      (let ((back (dotnet:invoke h "get_Tags")))
+        (list (dotnet:invoke back "get_Length")
+              (dotnet:invoke back "get_Item" 1)))))
+  (3 "beta"))
+
+(deftest issue303-vector-marshals-to-array-property
+  (progn
+    (dotnet:%define-class "Probe303.Holder2" "System.Object"
+      nil nil nil nil '(("Tags" "System.String[]")))
+    (let ((h (dotnet:new "Probe303.Holder2")))
+      (dotnet:invoke h "set_Tags" (vector "one" "two"))
+      (dotnet:invoke (dotnet:invoke h "get_Tags") "get_Length")))
+  2)
+
+;;; #302 — enum-typed parameters marshal from a Lisp integer, name string, or
+;;; symbol/keyword (Enum.Parse, case-insensitive, incl. flag combinations). Needed
+;;; so callers can pass RoutingStrategies / StringComparison without first fetching
+;;; the enum field object. String.Equals(string,string,StringComparison): 5 =
+;;; OrdinalIgnoreCase, so "a"/"A" compare equal.
+(deftest issue302-enum-from-int
+  (dotnet:static "System.String" "Equals" "a" "A" 5)
+  t)
+
+(deftest issue302-enum-from-name
+  (dotnet:static "System.String" "Equals" "a" "A" "OrdinalIgnoreCase")
+  t)
+
+(deftest issue302-enum-from-keyword
+  (dotnet:static "System.String" "Equals" "a" "A" :ordinalignorecase)
+  t)
+
+(deftest issue302-enum-case-sensitive-distinguished
+  ;; Ordinal (case-sensitive) → "a" and "A" differ.
+  (dotnet:static "System.String" "Equals" "a" "A" "Ordinal")
+  nil)
+
+(deftest issue302-enum-flag-combo-string
+  (dotnet:invoke (dotnet:box "Read, Write" "System.IO.FileShare") "ToString")
+  "ReadWrite")
+
+(deftest issue302-enum-flag-combo-int
+  (dotnet:invoke (dotnet:box 3 "System.IO.FileShare") "ToString")
+  "ReadWrite")
+
 ;;; D1120 (dotcl/dotcl#25) — DOTNET: built-ins carry function docstrings.
 (deftest d1120-dotnet-invoke-has-doc
   (and (stringp (documentation 'dotnet:invoke 'function)) t)
@@ -103,3 +195,12 @@
 (deftest d1123-static-optional-default
   (dotnet:static "DotCL.TestSupport.OptionalArgs" "StaticAdd" 1)
   6)
+
+;;; #294: dotnet:new overload scoring must consider assignability of a wrapped
+;;; .NET arg, so a MemoryStream picks StreamReader(Stream), not StreamReader(string)
+;;; (which would fail with "Object must implement IConvertible").
+(deftest issue294-ctor-assignable-wrapped-arg
+  (let* ((ms (dotnet:new "System.IO.MemoryStream"))
+         (sr (dotnet:new "System.IO.StreamReader" ms)))
+    (notnot (dotnet:invoke sr "get_BaseStream")))
+  t)

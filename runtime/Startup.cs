@@ -1369,6 +1369,19 @@ public static class Startup
         sym.Function = fn;
     }
 
+    /// <summary>Absolute path of the per-user init file dotcl loads at startup
+    /// (unless --script). Single source of truth shared by Program's startup
+    /// loader and the DOTCL:USER-INIT-FILE function, so tools that write to the
+    /// init file (e.g. quicklisp's add-to-init-file) target the real location.
+    /// Resolves to %APPDATA%\dotcl\init.lisp on Windows and
+    /// $XDG_CONFIG_HOME/dotcl/init.lisp (default ~/.config/dotcl/init.lisp) on
+    /// Unix — .NET maps SpecialFolder.ApplicationData to those per platform.</summary>
+    public static string UserInitFilePath()
+    {
+        var configDir = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+        return System.IO.Path.Combine(configDir, "dotcl", "init.lisp");
+    }
+
     private static void RegisterDotclFunctions()
     {
         // dotcl:*save-sil* — when true, defun stores SIL on symbol plist as %SIL
@@ -1376,6 +1389,13 @@ public static class Startup
         DotclPkg.Export(saveSilSym);
         saveSilSym.IsSpecial = true;
         saveSilSym.Value = Nil.Instance;
+
+        // dotcl:user-init-file — absolute pathname of the init file dotcl loads
+        // at startup. Returned absolute so callers (e.g. quicklisp's
+        // add-to-init-file, which merges against the home dir) target the real
+        // location on every platform.
+        RegisterDotcl("USER-INIT-FILE",
+            new LispFunction(args => LispPathname.FromString(UserInitFilePath())));
 
         // dotcl:function-sil — get SIL stored on a function (returns NIL if none)
         RegisterDotcl("FUNCTION-SIL", new LispFunction(args => {
@@ -1466,16 +1486,35 @@ public static class Startup
             return Nil.Instance; // unreachable
         }));
 
-        // dotcl:command-line-arguments — full process argv (matches sb-ext:*posix-argv*).
-        // uiop:raw-command-line-arguments delegates here on dotcl. Includes argv[0]
-        // (the host executable / dotnet host path); user code typically wants
-        // uiop:command-line-arguments which strips implementation flags.
+        // dotcl:command-line-arguments — argv as uiop:raw-command-line-arguments
+        // expects it on dotcl.
+        //
+        // When invoked as a positional script (`dotcl file.lisp a b c`), return
+        // a `--`-delimited list: (<script> "--" "a" "b" "c"). uiop's
+        // command-line-arguments (non-:executable path) does (rest (member "--" …)),
+        // so this yields the user args ("a" "b" "c"). This is dotcl's chosen
+        // convention — without the "--" delimiter uiop returns nil (the #246/paalam
+        // bug where positional data args were otherwise mis-loaded as Lisp source).
+        //
+        // Otherwise (REPL, --eval, --load-only, save-application exe) return the
+        // full host process argv, matching sb-ext:*posix-argv* (includes argv[0],
+        // the host executable / dotnet host path).
         RegisterDotcl("COMMAND-LINE-ARGUMENTS", new LispFunction(args => {
-            var argv = System.Environment.GetCommandLineArgs();
             LispObject result = Nil.Instance;
-            for (int i = argv.Length - 1; i >= 0; i--) {
-                result = new Cons(new LispString(argv[i]), result);
+            if (Runtime.ScriptArgs != null)
+            {
+                var sa = Runtime.ScriptArgs;
+                for (int i = sa.Count - 1; i >= 0; i--)
+                    result = new Cons(new LispString(sa[i]), result);
+                result = new Cons(new LispString("--"), result);
+                // Leading element stands in for argv[0]; uiop ignores anything
+                // before the "--" delimiter.
+                result = new Cons(new LispString("dotcl"), result);
+                return result;
             }
+            var argv = System.Environment.GetCommandLineArgs();
+            for (int i = argv.Length - 1; i >= 0; i--)
+                result = new Cons(new LispString(argv[i]), result);
             return result;
         }));
 
@@ -1777,6 +1816,10 @@ public static class Startup
             "(dotnet:call-base self \"Method\" &rest args) => value\nCall the base-class implementation of a virtual method non-virtually (like C#\nbase.Method(args)). SELF must be an instance of a dotcl-defined class; the base\ntype is self's BaseType.");
         RegisterDotNet(DotNetPkg, "NEW", new LispFunction(Runtime.DotNetNew, "DOTNET:NEW", -1),
             "(dotnet:new type-name &rest args) => instance\nConstruct a new instance of the named .NET type, selecting the constructor by\nargument count and types. ARGS are marshalled from Lisp values.");
+        RegisterDotNet(DotNetPkg, "NULL", new LispFunction(Runtime.DotNetNull, "DOTNET:NULL", 0),
+            "(dotnet:null) => marker\nReturn a marker that marshals to an explicit .NET null, for a reference or\nNullable<T> parameter. Distinct from Lisp NIL, which marshals to false for a\nbool / Nullable<bool> target.");
+        RegisterDotNet(DotNetPkg, "NEW-ARRAY", new LispFunction(Runtime.DotNetNewArray, "DOTNET:NEW-ARRAY", -1),
+            "(dotnet:new-array element-type &rest elements) => array\nCreate a typed .NET array (element-type[]) filled with the marshalled ELEMENTS.\nELEMENT-TYPE is a type-name string/symbol or a resolved System.Type. Build from\na Lisp list with (apply #'dotnet:new-array element-type list). A Lisp list or\nvector is also auto-marshalled to an array-typed parameter or property.");
         RegisterDotNet(DotNetPkg, "%DEFINE-CLASS", new LispFunction(Runtime.DotNetDefineClass, "DOTNET:%DEFINE-CLASS", -1));
         RegisterDotNet(DotNetPkg, "BOX", new LispFunction(Runtime.DotNetBox, "DOTNET:BOX", -1),
             "(dotnet:box value type-name) => boxed-value\nMarshal a Lisp VALUE to the named .NET type and keep it boxed at that static\ntype, so the right overload is chosen when it is passed to a subsequent call.");
