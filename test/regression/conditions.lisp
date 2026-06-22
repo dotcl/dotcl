@@ -1,4 +1,4 @@
-;;; Condition system regression tests (D34, D174 etc.)
+;;; Condition system regression tests
 
 ;;; handler-case catches error
 (deftest handler-case-basic
@@ -18,7 +18,7 @@
     (error () :bad))
   3)
 
-;;; handler-case catches .NET exceptions (D34)
+;;; handler-case catches .NET exceptions
 (deftest handler-case-dotnet-exception
   (handler-case
       (let ((v (make-array 3)))
@@ -61,7 +61,7 @@
     (my-restart (v) (* v 2)))
   198)
 
-;;; make-instance of condition subclass (D174)
+;;; make-instance of condition subclass
 (deftest condition-make-instance
   (let ((e (make-instance 'simple-error
                           :format-control "test ~a"
@@ -79,7 +79,7 @@
   t)
 
 ;;; restart-case: compute-restarts with condition arg returns non-abort restart
-;;; Reproduces DEFPACKAGE.24/25 failure pattern (D696)
+;;; Reproduces DEFPACKAGE.24/25 failure pattern
 (deftest restart-case-compute-restarts-with-condition
   (catch 'handled
     (handler-bind
@@ -94,7 +94,7 @@
         (continue () :report "Continue" nil))))
   success)
 
-;;; throw inside eval propagates to outer catch (D696)
+;;; throw inside eval propagates to outer catch
 ;;; The eval boundary must not intercept CatchThrowException for tags established outside
 (deftest throw-across-eval-boundary
   (catch 'my-tag

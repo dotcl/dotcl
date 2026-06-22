@@ -1,4 +1,4 @@
-;;; Regression tests for D891 — LispFunction → Delegate marshal (#188)
+;;; Regression tests for LispFunction → Delegate marshal
 ;;; dotnet:make-delegate + auto-marshal in dotnet:new
 
 ;;; make-delegate returns a non-nil .NET object

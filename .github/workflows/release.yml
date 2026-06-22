@@ -118,10 +118,29 @@ jobs:
             -p:Version=${{ steps.version.outputs.VERSION }} \
             -p:RuntimeIdentifiers=any \
             -p:PublishReadyToRun=false
+          # Build the in-process project-core MSBuild task FIRST so the library
+          # pack bundles tasks/DotCL.Build.Tasks.dll (#307). DotCL.Runtime.csproj
+          # includes it with Condition="Exists(...)", so if the task is not built
+          # the pack silently omits it and ships a broken project-core build
+          # (MSB4036 for <DotclProjectAsd> consumers — was the 0.1.12 regression).
+          dotnet build runtime/build-tasks/DotCL.Build.Tasks.csproj --configuration Release
           dotnet pack runtime/DotCL.Runtime.csproj \
             --configuration Release \
             -o out/ \
             -p:Version=${{ steps.version.outputs.VERSION }}
+
+      # ── Guard: fail the release if the project-core task didn't get bundled ──
+      - name: Verify project-core task is bundled
+        run: |
+          VER=${{ steps.version.outputs.VERSION }}
+          nupkg="out/DotCL.Runtime.$VER.nupkg"
+          if unzip -l "$nupkg" | grep -q 'tasks/DotCL.Build.Tasks.dll'; then
+            echo "OK: tasks/DotCL.Build.Tasks.dll present in $nupkg"
+          else
+            echo "ERROR: $nupkg is missing tasks/DotCL.Build.Tasks.dll"
+            echo "       project-core build (#307) would fail with MSB4036 for consumers."
+            exit 1
+          fi
 
       # ── Per-RID tbz for Roswell (no R2R; R2R is a planned follow-up) ──────
       # dotnet publish -r <rid> --self-contained false cross-compiles on Linux

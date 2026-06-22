@@ -110,12 +110,12 @@ public class LispVector : LispObject
             _elements = Array.Empty<LispObject>();
             // If initial element is 1, fill all bits
             if (initialElement is Fixnum f && f.Value == 1)
-                Array.Fill(_bitData, ulong.MaxValue);
+                Compat.Fill(_bitData, ulong.MaxValue);
         }
         else
         {
             _elements = new LispObject[size];
-            Array.Fill(_elements, initialElement);
+            Compat.Fill(_elements, initialElement);
         }
         _fillPointer = size;
         _declaredSize = size;
@@ -1044,7 +1044,7 @@ public class LispRandomState : LispObject
         for (int i = 0; i < byteCount; i++)
             bytes[i] = (byte)(Next() & 0xFF);
         bytes[byteCount - 1] = 0; // ensure positive
-        var result = new System.Numerics.BigInteger(bytes, isUnsigned: true);
+        var result = Compat.MakeBigInteger(bytes, isUnsigned: true);
         return result % limit;
     }
 

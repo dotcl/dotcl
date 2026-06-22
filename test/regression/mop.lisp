@@ -167,7 +167,7 @@
     (dotcl-mop:eql-specializer-object spec))
   42)
 
-;;; --- slot-value-using-class dispatch (issue #259, AMOP §5.4) ---
+;;; --- slot-value-using-class dispatch (AMOP §5.4) ---
 
 (defclass svuc-meta (standard-class) ())
 (defmethod validate-superclass ((c svuc-meta) (s standard-class)) t)
@@ -185,7 +185,7 @@
 
   ;; Clear the log AFTER make-instance: per AMOP, shared-initialize sets slots
   ;; from initargs via (setf slot-value-using-class), so construction itself
-  ;; dispatches a :write (required for #264 / McCLIM dynamic slots). These tests
+  ;; dispatches a :write (required for McCLIM dynamic slots). These tests
   ;; isolate the read / write dispatch of the operation under test.
   (deftest mop-svuc-read-dispatch
     (let ((o (make-instance 'svuc-obj :x 1)))
@@ -208,7 +208,7 @@
            (member :write svuc-log))
     (:write)))
 
-;;; --- setf GF cross-package bleed guard (issue #261, D1082) ---
+;;; --- setf GF cross-package bleed guard ---
 ;;; A (setf pkg:documentation) GF with a different arity must NOT mutate
 ;;; the existing (setf cl:documentation) GF lambda-list.
 (eval-when (:compile-toplevel :load-toplevel :execute)
@@ -224,7 +224,7 @@
     (length (generic-function-lambda-list #'(setf documentation))))
   3)
 
-;;; D1110/#270: standard GF stores its lambda-list; MOP readers return the
+;;; standard GF stores its lambda-list; MOP readers return the
 ;;; actual parameter names, not gensym placeholders (#:R0 ...).
 (defgeneric mop-llnames (alpha beta)
   (:argument-precedence-order beta alpha))
@@ -245,7 +245,7 @@
   (generic-function-lambda-list #'mop-ll-opt)
   (x y &optional z))
 
-;;; --- custom metaclass identity: defclass and ensure-class (#287) ---
+;;; --- custom metaclass identity: defclass and ensure-class ---
 ;; ensure-class must honor :metaclass (it used to ignore it), and a class
 ;; defined with a custom metaclass must satisfy TYPEP against that metaclass
 ;; consistently with CLASS-OF.
@@ -279,7 +279,7 @@
                   (dotcl-mop:class-precedence-list (find-class 'mop-ec-meta))))
   t)
 
-;;; --- metaclass-added slots on the class metaobject (#291) ---
+;;; --- metaclass-added slots on the class metaobject ---
 ;; A metaclass that subclasses standard-class AND adds a slot: the classes it
 ;; creates must hold that slot on their class metaobject (slot-value works).
 (defclass mop-meta-mixin () ((tag :initarg :tag :initform :none)))
@@ -297,7 +297,7 @@
     (list (slot-value c 'tag) (notnot (slot-boundp c 'tag))))
   (:hi t))
 
-;;; #295: a class metaobject runs the metaclass's inherited initialize-instance
+;;; A class metaobject runs the metaclass's inherited initialize-instance
 ;;; :after — a slot computed by :after (no initform/initarg) is bound on the class.
 (defclass mop-meta-mixin2 () ((computed :accessor mop-computed)))
 (defmethod initialize-instance :after ((o mop-meta-mixin2) &key)
@@ -310,7 +310,7 @@
   (slot-value (find-class 'mop-foo-after) 'computed)
   :by-after)
 
-;;; #296: re-ensure-class an existing class under a different metaclass switches the
+;;; re-ensure-class an existing class under a different metaclass switches the
 ;;; metaclass and applies metaclass-slot initargs (McCLIM forward-ref -> real class).
 (defclass mop-meta-tn () ((type-name :initarg :type-name :accessor mop-type-name)))
 (defclass mop-meta-switch (mop-meta-tn standard-class) ())
@@ -326,7 +326,7 @@
   (slot-value (find-class 'mop-reensure) 'type-name)
   mop-reensure)
 
-;;; #297: on a class metaobject built via ensure-class, initialize-instance :after
+;;; On a class metaobject built via ensure-class, initialize-instance :after
 ;;; runs AFTER the metaclass-slot initargs are applied (ordinary instance order), so an
 ;;; :after that reads an initarg-filled slot sees it BOUND (used to be UNBOUND because
 ;;; the :after fired during class creation before the initargs were applied).

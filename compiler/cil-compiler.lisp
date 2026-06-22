@@ -7,7 +7,8 @@
 (defpackage :dotcl.cil-compiler
   (:use :cl)
   (:export #:compile-toplevel #:compile-toplevel-eval
-           #:*cross-compiling* #:*compile-file-mode*))
+           #:*cross-compiling* #:*compile-file-mode* #:*concatenate-build*
+           #:compile-file-concatenated))
 
 ;; %INLINE-CS-SPLICED is the dispatch symbol for the dotcl-cs:inline-cs
 ;; macro. It needs to be reachable
@@ -33,6 +34,27 @@
 (defvar *compile-file-mode* nil
   "T when compiling via compile-file. Controls eval-when behavior per CLHS 3.2.3.1:
    :compile-toplevel → eval at compile time, :load-toplevel → emit CIL for load.")
+
+(defvar *concatenate-build* nil
+  "T only while compile-file'ing a project-core CONCATENATED build (the single
+   file produced by asdf::concatenate-files / concatenate-source-op from a
+   system's :components).  A normal multi-file ASDF load-op interleaves
+   compile+load per component, so a toplevel (require ...) / (use-package ...) in
+   an earlier component takes effect before later components compile.  The concat
+   build compiles everything as one unit and loses that, so here we evaluate such
+   toplevel module/package setup forms at compile time (see compile-form).  Not
+   set for ordinary user compile-file — those keep standard CL semantics.")
+
+(defun compile-file-concatenated (input output)
+  "compile-file INPUT to OUTPUT as a project-core CONCATENATED build:
+   binds *concatenate-build* so compile-form evaluates toplevel module/package
+   setup forms at compile time.  Must be defined here (cross-compiled) and called
+   by name from the C# build driver — binding *concatenate-build* from
+   reader-read code would bind a different Symbol instance than the one
+   compile-form reads (Startup.Sym vs Reader identity), so the dynamic binding
+   would not connect.  Function calls resolve by name, so calling this works."
+  (let ((*concatenate-build* t))
+    (compile-file input :output-file output)))
 
 (defvar *locals* '()
   "Alist of (symbol . local-key). local-key is a keyword like :v1.")
@@ -563,6 +585,33 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
            (let ((mf (macro-function sym)))
              (and mf (lambda (form) (funcall mf form nil)))))))
 
+(defvar *dotnet-typed-locals* '()
+  "Alist (var-name-string type-name-string . local-key) of lexical locals whose
+   value is statically known to be a .NET object of a specific type, inferred
+   from a let/let* init form (DOTNET:NEW / DOTNET:BOX / (THE (DOTNET \"T\") ...)).
+   Bound by COMPILE-LET around the body; only non-mutated, non-special bindings
+   qualify. The DOTNET:INVOKE compiler macro reads the filtered view (see
+   DOTNET-VALID-TYPED-LOCALS) to lower a call on such a variable to a typed direct
+   callvirt. The recorded LOCAL-KEY is verified against the current *LOCALS* so an
+   inner rebinding of the same name shadows it (no stale type → no miscompile).")
+
+(defun dotnet-valid-typed-locals ()
+  "Return *DOTNET-TYPED-LOCALS* as a plain (name-string . type-string) alist,
+   keeping only entries whose variable still resolves to the exact lexical local
+   it was typed for. An intervening binding (inner let, lambda param, dolist var,
+   …) maps the name to a different key, so the entry is dropped and the call falls
+   back to the dynamic path. Conservative: when in doubt, omit."
+  (let ((result '()))
+    (dolist (e *dotnet-typed-locals*)
+      (let* ((name (car e)) (type (cadr e)) (key (cddr e))
+             (cur (cdr (assoc name *locals*
+                              :key (lambda (k) (if (and (symbolp k) (symbol-package k))
+                                                   (symbol-name k) nil))
+                              :test #'string=))))
+        (when (eq cur key)
+          (push (cons name type) result))))
+    result))
+
 (defun maybe-expand-compiler-macro (op expr)
   "If OP names a compiler macro and isn't shadowed by a local function, apply it to
    the call form EXPR (CLHS 3.2.2.1). Return the expansion, or NIL when there is no
@@ -573,9 +622,16 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
              (not (assoc (symbol-name op) *local-functions* :test #'string=)))
     (let ((expander (compiler-macro-function op)))
       (when (functionp expander)
-        ;; Expander takes (whole-form environment). Returning the original form
-        ;; (eq) is the standard way to decline expansion.
-        (let ((expansion (funcall expander expr nil)))
+        ;; Expander takes (whole-form environment). dotcl passes the static .NET
+        ;; type environment (an alist of locals with a known .NET type) as the
+        ;; environment so DOTNET:INVOKE can lower a call on such a variable to a
+        ;; typed direct callvirt. NIL when no such locals are in scope — the
+        ;; common case, and what every user-defined compiler macro receives
+        ;; (define-compiler-macro ignores its environment argument). Returning the
+        ;; original form (eq) is the standard way to decline expansion.
+        (let ((expansion (funcall expander expr
+                                  (and *dotnet-typed-locals*
+                                       (dotnet-valid-typed-locals)))))
           (unless (eq expansion expr) expansion))))))
 
 (defun compile-form (expr)
@@ -594,6 +650,27 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
         (op (car expr))
         (*compile-was-toplevel* *at-toplevel*)
         (*at-toplevel* nil))
+    ;; in a project-core CONCATENATED build, a toplevel module/package
+    ;; setup form must take effect at COMPILE time so later components in the
+    ;; same concatenated unit see the macros / package use-list it establishes
+    ;; (normal multi-file load-op gets this from compile+load interleaving).
+    ;; Same SBCL-compat rationale as the defun ct-eval. try-eval compiles
+    ;; to Runtime.TryEval, which rebinds *compile-file-mode* to NIL during the
+    ;; eval — so the inner compile does not re-enter here (the gate needs both
+    ;; *compile-file-mode* and *concatenate-build*). Gated to concat builds only:
+    ;; ordinary user compile-file keeps standard CL semantics.
+    ;; Compare by symbol-name (string=), not eq on a quoted literal: symbols
+    ;; baked into this list at cross-compile time are not eq to the ones the
+    ;; runtime reader interns for user code (Startup.Sym vs Reader identity).
+    ;; Same idiom as compile-eval-when's defvar/defparameter list.
+    (when (and *compile-was-toplevel* *compile-file-mode* *concatenate-build*
+               (not *cross-compiling*)
+               (symbolp op)
+               (member (symbol-name op)
+                       '("REQUIRE" "LOAD" "USE-PACKAGE" "PROVIDE"
+                         "IMPORT" "SHADOW" "SHADOWING-IMPORT")
+                       :test #'string=))
+      (try-eval expr))
     ;; quote fast path
     (if (eq op 'quote)
         (compile-quoted (cadr expr))

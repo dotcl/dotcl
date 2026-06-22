@@ -28,7 +28,7 @@ public static partial class Runtime
             if (a1.Rank != 1)
             {
                 var items = new LispObject[size];
-                Array.Fill(items, Fixnum.Make(0));
+                Compat.Fill(items, Fixnum.Make(0));
                 result = new LispVector(items, a1.Dimensions, "BIT");
             }
             else
@@ -115,7 +115,7 @@ public static partial class Runtime
             if (a1.Rank != 1)
             {
                 var items = new LispObject[size];
-                Array.Fill(items, Fixnum.Make(0));
+                Compat.Fill(items, Fixnum.Make(0));
                 result = new LispVector(items, a1.Dimensions, "BIT");
             }
             else
@@ -343,10 +343,10 @@ public static partial class Runtime
     private static LispObject ElemTypeSpecifier(string elemTypeName)
     {
         if (elemTypeName.StartsWith("UNSIGNED-BYTE-", StringComparison.Ordinal) &&
-            long.TryParse(elemTypeName.AsSpan(14), out long ubits))
+            long.TryParse(elemTypeName.Substring(14), out long ubits))
             return new Cons(Startup.Sym("UNSIGNED-BYTE"), new Cons(Fixnum.Make(ubits), Nil.Instance));
         if (elemTypeName.StartsWith("SIGNED-BYTE-", StringComparison.Ordinal) &&
-            long.TryParse(elemTypeName.AsSpan(12), out long sbits))
+            long.TryParse(elemTypeName.Substring(12), out long sbits))
             return new Cons(Startup.Sym("SIGNED-BYTE"), new Cons(Fixnum.Make(sbits), Nil.Instance));
         return Startup.Sym(elemTypeName);
     }
@@ -938,7 +938,7 @@ public static partial class Runtime
         {
             int e = end >= 0 ? end : ls.Length;
             char ch = item is LispChar lc ? lc.Value : throw new LispErrorException(new LispTypeError("FILL: not a character", item));
-            Array.Fill(ls.RawChars, ch, start, e - start);
+            Compat.Fill(ls.RawChars, ch, start, e - start);
             return seq;
         }
         if (seq is LispVector v)
@@ -1702,6 +1702,11 @@ public static partial class Runtime
 
         // Hash-table accessors
         Startup.RegisterUnary("HASH-TABLE-P", Runtime.Hash_table_p);
+        // HASH-TABLE-PAIRS is a compiler intrinsic (inlined when compiled), but the
+        // LOOP hash-iteration expansion emits a literal (hash-table-pairs ht) call,
+        // which the tree-walk interpreter must be able to funcall. Register it so
+        // emit-free eval of LOOP ... being the hash-keys/values works.
+        Startup.RegisterUnary("HASH-TABLE-PAIRS", Runtime.HashTablePairs);
         Startup.RegisterUnary("HASH-TABLE-COUNT", obj =>
             obj is LispHashTable ht ? Fixnum.Make(ht.Count)
             : throw new LispErrorException(new LispTypeError("HASH-TABLE-COUNT: not a hash-table", obj)));

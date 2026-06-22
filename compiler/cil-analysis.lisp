@@ -354,6 +354,7 @@
                                                         %gf-methods %method-specializers
                                                         %method-qualifiers %method-function
                                                         call-next-method next-method-p
+                                                        %captured-call-next-method %captured-next-method-p
                                                         %change-class)))
                      (dolist (sub (cdr e))
                        (push (cons sub (cons bnd mdepth)) worklist)))
@@ -883,7 +884,18 @@
             ((or (eq op :stloc) (eq op :ldloc))
              (unless (gethash key first-pos)
                (setf (gethash key first-pos) pos))
-             (setf (gethash key last-pos) pos)))))
+             (setf (gethash key last-pos) pos))
+            ;; (:dotnet-call-direct-locals type method RECV (ARG...) (PARAM...))
+            ;; references RECV and each ARG local inside nested lists, not as
+            ;; top-level :ldloc. Count them as uses here so their live ranges
+            ;; extend to this op — otherwise the slot-share scan thinks they die
+            ;; at their :stloc and merges another local over them, orphaning the
+            ;; nested reference into an "Undeclared local" at assembly time.
+            ((eq op :dotnet-call-direct-locals)
+             (dolist (k (cons (nth 3 instr) (nth 4 instr)))
+               (unless (gethash k first-pos)
+                 (setf (gethash k first-pos) pos))
+               (setf (gethash k last-pos) pos))))))
       (incf pos))
     ;; Collect eligible candidates: LispObject type with at least one use
     (let ((candidates nil))
@@ -938,6 +950,17 @@
                                       (if canonical
                                           `(,op ,canonical)
                                           instr)))
+                                   ;; Rewrite the RECV and ARG locals carried in the
+                                   ;; nested lists so they track any slot-merge rename
+                                   ;; applied to their :declare-local/:stloc.
+                                   ((eq op :dotnet-call-direct-locals)
+                                    (let ((recv (nth 3 instr)))
+                                      `(:dotnet-call-direct-locals
+                                        ,(nth 1 instr) ,(nth 2 instr)
+                                        ,(or (gethash recv rename) recv)
+                                        ,(mapcar (lambda (a) (or (gethash a rename) a))
+                                                 (nth 4 instr))
+                                        ,(nth 5 instr))))
                                    (t instr))))))
                           instrs)))))))
 

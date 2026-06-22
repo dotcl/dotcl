@@ -254,7 +254,7 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
         //       root system's component source paths (MSBuild Inputs).
         //       --target-rid prefers <dir>/<name>-r2r-<rid>.fasl when present.
         // The flags below are build-internal and intentionally absent from
-        // --help / completion (see D1212).
+        // --help / completion.
         bool buildMode = rest.Count > 0 && rest[0] == "build";
         string? buildAsd = null;
         string? buildOutput = null;
@@ -262,6 +262,7 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
         string? buildManifestOut = null;
         string? buildRootSourcesOut = null;
         string? buildTargetRid = null;
+        var buildInit = new List<string>();
         if (buildMode)
         {
             rest.RemoveAt(0);
@@ -273,6 +274,7 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
                 else if (a == "--manifest-out" && i + 1 < rest.Count) buildManifestOut = rest[++i];
                 else if (a == "--root-sources-out" && i + 1 < rest.Count) buildRootSourcesOut = rest[++i];
                 else if (a == "--target-rid" && i + 1 < rest.Count) buildTargetRid = rest[++i];
+                else if (a == "--build-init" && i + 1 < rest.Count) buildInit.Add(rest[++i]);
                 else if (!a.StartsWith('-') && buildAsd == null) buildAsd = a;
             }
         }
@@ -376,10 +378,11 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
             }
             try
             {
+                var buildInitArr = buildInit.Count > 0 ? buildInit.ToArray() : null;
                 if (buildResolveDeps)
-                    RunResolveDeps(buildAsd, buildManifestOut, buildRootSourcesOut, buildTargetRid);
+                    RunResolveDeps(buildAsd, buildManifestOut, buildRootSourcesOut, buildTargetRid, buildInitArr);
                 else if (buildOutput != null)
-                    RunCompileProject(buildAsd, buildOutput);
+                    RunCompileProject(buildAsd, buildOutput, buildInitArr);
                 else
                 {
                     Console.Error.WriteLine("build: requires --output <fasl> or --resolve-deps");
@@ -598,9 +601,9 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
     /// to that file. The MSBuild target uses this list as Inputs to its root
     /// compile target so source-file mtimes drive incremental rebuilds.
     /// </summary>
-    static void RunResolveDeps(string asdPath, string? manifestOut, string? rootSourcesOut, string? targetRid = null)
+    static void RunResolveDeps(string asdPath, string? manifestOut, string? rootSourcesOut, string? targetRid = null, string[]? buildInit = null)
     {
-        try { DotclHost.ResolveDeps(asdPath, manifestOut, rootSourcesOut, targetRid); }
+        try { DotclHost.ResolveDeps(asdPath, manifestOut, rootSourcesOut, targetRid, buildInit); }
         catch (System.IO.FileNotFoundException ex)
         {
             Console.Error.WriteLine(ex.Message);
@@ -619,9 +622,9 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
     /// MSBuild owns the incremental decision via Inputs/Outputs on the
     /// component source files.
     /// </summary>
-    static void RunCompileProject(string asdPath, string outputPath)
+    static void RunCompileProject(string asdPath, string outputPath, string[]? buildInit = null)
     {
-        try { DotclHost.CompileProject(asdPath, outputPath); }
+        try { DotclHost.CompileProject(asdPath, outputPath, buildInit); }
         catch (System.IO.FileNotFoundException ex)
         {
             Console.Error.WriteLine(ex.Message);

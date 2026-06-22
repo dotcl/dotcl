@@ -759,6 +759,116 @@ public static partial class Runtime
         throw new LispErrorException(condition);
     }
 
+    /// <summary>
+    /// Establish a handler-bind cluster and run a thunk under it. Mirrors what
+    /// compile-handler-bind emits (PushCluster / try body / catch → rewrap /
+    /// finally PopCluster), but callable from Lisp so the emit-free tree-walk
+    /// interpreter (%mini-eval) can implement handler-bind / handler-case
+    /// without generating code. Uses no Reflection.Emit.
+    /// args: (handler-alist thunk) where handler-alist is a list of
+    /// (type-spec . handler-function) and thunk is a 0-arg function.
+    /// </summary>
+    public static LispObject CallWithHandlerCluster(LispObject[] args)
+    {
+        var alist = args[0];
+        var thunk = CoerceToFunction(args[1]);
+        var bindings = new System.Collections.Generic.List<HandlerBinding>();
+        for (var c = alist; c is Cons cc; c = cc.Cdr)
+        {
+            if (cc.Car is Cons pair)
+                bindings.Add(new HandlerBinding(pair.Car, CoerceToFunction(pair.Cdr)));
+        }
+        HandlerClusterStack.PushCluster(bindings.ToArray());
+        try
+        {
+            return thunk.Invoke();
+        }
+        catch (Exception e)
+        {
+            RewrapNonLispException(e); // always throws
+            throw; // unreachable
+        }
+        finally
+        {
+            HandlerClusterStack.PopCluster();
+        }
+    }
+
+    /// <summary>
+    /// restart-case for the tree-walk interpreter. args: (specs thunk) where specs
+    /// is a list of (name-symbol . handler-function). Establishes the restart
+    /// cluster, runs the body thunk; if an invoke-restart targets one of these
+    /// restarts (matched by tag via RestartInvocationException), pops the cluster
+    /// and runs that restart's handler with the invocation arguments — mirroring
+    /// compile-restart-case. Emit-free.
+    /// </summary>
+    public static LispObject CallWithRestartCluster(LispObject[] args)
+    {
+        var names = new System.Collections.Generic.List<Symbol>();
+        var handlers = new System.Collections.Generic.List<LispFunction>();
+        var tags = new System.Collections.Generic.List<object>();
+        for (var c = args[0]; c is Cons cc; c = cc.Cdr)
+        {
+            var pair = (Cons)cc.Car;
+            names.Add((Symbol)pair.Car);
+            handlers.Add(CoerceToFunction(pair.Cdr));
+            tags.Add(new object());
+        }
+        var thunk = CoerceToFunction(args[1]);
+        var restarts = new LispRestart[names.Count];
+        for (int i = 0; i < names.Count; i++)
+            restarts[i] = new LispRestart(names[i].Name, _ => Nil.Instance, null, tags[i], false)
+            { NameSymbol = names[i] };
+        RestartClusterStack.PushCluster(restarts);
+        bool popped = false;
+        try
+        {
+            return thunk.Invoke();
+        }
+        catch (RestartInvocationException rie)
+        {
+            int idx = -1;
+            for (int i = 0; i < tags.Count; i++)
+                if (ReferenceEquals(tags[i], rie.Tag)) { idx = i; break; }
+            if (idx < 0) throw; // not one of ours
+            RestartClusterStack.PopCluster();
+            popped = true;
+            return handlers[idx].Invoke(rie.Arguments); // handler runs outside the cluster
+        }
+        finally
+        {
+            if (!popped) RestartClusterStack.PopCluster();
+        }
+    }
+
+    /// <summary>
+    /// restart-bind for the tree-walk interpreter. args: (specs thunk) where specs
+    /// is a list of (name-symbol . handler-function). The handlers run in place
+    /// (IsBindRestart) when their restart is invoked. Emit-free.
+    /// </summary>
+    public static LispObject CallWithRestartBind(LispObject[] args)
+    {
+        var restarts = new System.Collections.Generic.List<LispRestart>();
+        for (var c = args[0]; c is Cons cc; c = cc.Cdr)
+        {
+            var pair = (Cons)cc.Car;
+            var name = (Symbol)pair.Car;
+            var hfn = CoerceToFunction(pair.Cdr);
+            restarts.Add(new LispRestart(name.Name, a => hfn.Invoke(a), null, new object(), true)
+            { NameSymbol = name });
+        }
+        var thunk = CoerceToFunction(args[1]);
+        RestartClusterStack.PushCluster(restarts.ToArray());
+        try
+        {
+            return thunk.Invoke();
+        }
+        finally
+        {
+            RestartClusterStack.PopCluster();
+        }
+    }
+
     internal static void RegisterCoreBuiltins()
     {
         // CAR, CDR
@@ -1138,7 +1248,7 @@ public static partial class Runtime
             if (rt.GetDispatchTable(dispChar) == null)
                 throw new LispErrorException(new LispError($"{dispChar} is not a dispatching macro character in the current readtable"));
             // Digit sub-chars return nil per CLHS
-            if (char.IsAsciiDigit(subChar)) return Nil.Instance;
+            if (Compat.IsAsciiDigit(subChar)) return Nil.Instance;
             var lispFn2 = rt.GetLispDispatchMacroFunction(dispChar, subChar);
             if (lispFn2 != null) return lispFn2;
             // Built-in C# dispatch functions: wrap on-the-fly so named-readtables can copy them

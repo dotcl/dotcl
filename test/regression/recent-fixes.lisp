@@ -1,6 +1,6 @@
-;;; Regression tests for recent D-file fixes
+;;; Regression tests for recent fixes
 
-;;; D577 — let/let* bindings take primary value only
+;;; let/let* bindings take primary value only
 (deftest d577-let-primary-value
   (let ((x (values 1 2 3)))
     x)
@@ -11,7 +11,7 @@
     x)
   10)
 
-;;; D579 — define-compiler-macro and compiler-macro-function
+;;; define-compiler-macro and compiler-macro-function
 (define-compiler-macro %reg-test-cm (x) (* 2 x))
 
 (deftest d579-compiler-macro-function-returns-fn
@@ -45,7 +45,7 @@
     (%cm-auto-fn 5))                                 ; flet wins -> 4 (not CM's 10)
   4)
 
-;;; D579 — (setf compiler-macro-function)
+;;; (setf compiler-macro-function)
 (deftest d579-setf-compiler-macro-function
   (progn
     (setf (compiler-macro-function '%cm-setf-test)
@@ -55,7 +55,7 @@
       expanded))
   (+ 5 100))
 
-;;; D579 — compile nil works
+;;; compile nil works
 (deftest d579-compile-nil-basic
   (funcall (compile nil '(lambda (x) (* x x))) 7)
   49)
@@ -67,13 +67,13 @@
     (funcall fn))
   10)
 
-;;; D576 — relative pathname merging (basic check)
+;;; relative pathname merging (basic check)
 (deftest d576-merge-pathnames-basic
   (let ((p (merge-pathnames "foo.lisp" (make-pathname :directory '(:absolute "tmp")))))
     (pathname-name p))
   "foo")
 
-;;; D573 — symbol-package type error on non-symbol
+;;; symbol-package type error on non-symbol
 (deftest d573-symbol-package-type-error
   (signals-error (symbol-package 42) type-error)
   t)
@@ -102,34 +102,34 @@
   (multiple-value-list (values-list '(x y z)))
   (x y z))
 
-;;; D606 — psetf with ldb should write to original variable (not a temp)
+;;; psetf with ldb should write to original variable (not a temp)
 (deftest d606-psetf-ldb
   (let ((x #b00000))
     (psetf (ldb (byte 5 1) x) #b10110)
     x)
   #b101100)
 
-;;; D606 — incf of (getf plist key default) should add key when missing
+;;; incf of (getf plist key default) should add key when missing
 (deftest d606-incf-getf-default
   (let ((p '(a 1 b 2)))
     (incf (getf p 'c 19))
     (getf p 'c))
   20)
 
-;;; D606 — setf of getf should update existing key
+;;; setf of getf should update existing key
 (deftest d606-setf-getf-existing
   (let ((p (list 'a 1 'b 2)))
     (incf (getf p 'a))
     (getf p 'a))
   2)
 
-;;; D606 — subtypep (cons (not x)) against (cons (satisfies y)) should be uncertain
+;;; subtypep (cons (not x)) against (cons (satisfies y)) should be uncertain
 (deftest d606-subtypep-cons-satisfies-uncertain
   (multiple-value-list
    (subtypep '(cons (not float)) '(cons (satisfies identity))))
   (nil nil))
 
-;;; D616 — reinitialize-instance validates initargs from method &key params (issue #30)
+;;; reinitialize-instance validates initargs from method &key params
 (defclass d616-test-class ()
   ((x :initarg :x :accessor d616-x)))
 
@@ -151,7 +151,7 @@
                  (error () t)))))
   t)
 
-;;; D615 — float printing and ~e format (issue #98)
+;;; float printing and ~e format
 (deftest d615-prin1-large-float-scientific
   ;; Values >= 1e7 must use scientific notation, not fixed
   (let ((*print-readably* nil)
@@ -185,9 +185,9 @@
       (string= s1 s2)))
   t)
 
-;;; D613 — float bit access functions exported from CL package (issue #104 / nibbles)
+;;; float bit access functions exported from CL package (nibbles)
 (deftest d613-single-float-bits-accessible
-  ;; cl:single-float-bits must be accessible (was in DOTCL-INTERNAL before)
+  ;; cl:single-float-bits must be accessible
   (not (null (find-symbol "SINGLE-FLOAT-BITS" "COMMON-LISP")))
   t)
 
@@ -203,7 +203,7 @@
   (make-double-float (double-float-bits 1.5d0))
   1.5d0)
 
-;;; D619 — subtypep circular deftype cycle detection (issue #16)
+;;; subtypep circular deftype cycle detection
 (deftype d619-circular-type (&optional low high) `(d619-circular-type ,low ,high))
 
 (deftest d619-subtypep-circular-deftype-no-hang
@@ -211,7 +211,7 @@
   (multiple-value-list (subtypep 'd619-circular-type 'integer))
   (nil nil))
 
-;;; D618 — &environment passed to macro expander (issue #79)
+;;; &environment passed to macro expander
 (defmacro d618-env-macro (&environment env form)
   ;; Return t if env is non-nil (the actual compile-time environment was passed)
   ;; At runtime (non-compile-file) env is typically nil; at compile-time it's the env object.
@@ -237,14 +237,14 @@
   (d618-macro-expanding-with-env d618-inner-macro)
   not-macro)
 
-;;; D623 — macrolet expander can call surrounding flet functions at expansion time (issue #76)
+;;; macrolet expander can call surrounding flet functions at expansion time
 (deftest d623-macrolet-calls-flet-at-expansion-time
   (flet ((double (x) (* x 2)))
     (macrolet ((m (x) (double x)))
       (m 5)))
   10)
 
-;;; D624 — gethash MV leakage through let binding (issue #19)
+;;; gethash MV leakage through let binding
 ;;; gethash returns (value, present-p); a let binding should strip to primary only.
 (deftest d624-gethash-mv-does-not-leak-through-let
   (let ((ht (make-hash-table)))
@@ -262,13 +262,14 @@
     (multiple-value-list (gethash 'a ht)))
   (99 t))
 
+;;; macrolet expander returns a quoted form built by a surrounding flet
 (deftest d623-macrolet-calls-flet-quoted-result
   (flet ((make-form (x) `(+ ,x 1)))
     (macrolet ((m (x) (make-form x)))
       (m 3)))
   4)
 
-;;; D651 — dotcl:gc-stats returns 5 fixnums, time preserves values
+;;; dotcl:gc-stats returns 5 fixnums, time preserves values
 (deftest d651-gc-stats-shape
   (let ((s (dotcl:gc-stats)))
     (and (listp s)
@@ -282,7 +283,7 @@
       (time (values 10 20 30))))
   (10 20 30))
 
-;;; D654 — subnormal double-float: rational / float / format correctness (issue #107)
+;;; subnormal double-float: rational / float / format correctness
 (deftest d654-subnormal-float-roundtrip
   (let ((x 9.63d-322))
     (= x (float (rational x) 1d0)))
@@ -304,7 +305,7 @@
   (format nil "~,2,,2e" 0.05)
   "50.0E-3")
 
-;;; D664 — self-TCO must not emit `br` that crosses a try/finally from a
+;;; self-TCO must not emit `br` that crosses a try/finally from a
 ;;; special LET. Regression for invalid-IL crash observed in cl-bench stak.
 (defvar %d664-a 0)
 (proclaim '(special %d664-a))
@@ -319,7 +320,7 @@
   (let ((%d664-a 15)) (%d664-f))
   9)
 
-;;; D667 — (the fixnum ...) emits native int64 arithmetic.
+;;; (the fixnum ...) emits native int64 arithmetic.
 ;;; Correctness tests: the fast path must match the slow path bit-for-bit.
 
 (deftest d667-fixnum-add
@@ -355,7 +356,7 @@
   (+ 1 2 3 4 5)
   15)
 
-;;; D668 — fixnum-typed comparisons (< > <= >= = /=) in fused if/cond/and/or
+;;; fixnum-typed comparisons (< > <= >= = /=) in fused if/cond/and/or
 ;;; positions emit native clt/cgt/ceq instead of Runtime.IsTrueXxx calls.
 
 (deftest d668-fixnum-cmp-lt
@@ -389,7 +390,7 @@
         (t :other))
   :equal)
 
-;;; D669 — (declare (fixnum x)) turns x itself into a fixnum-typed reference
+;;; (declare (fixnum x)) turns x itself into a fixnum-typed reference
 ;;; so arithmetic/comparisons on x hit the native int64 path without needing
 ;;; (the fixnum x) wrappers at every use.
 
@@ -422,7 +423,7 @@
     (+ x y))
   15)
 
-;;; D670 — dotimes with fixnum count injects (declare (fixnum var limit))
+;;; dotimes with fixnum count injects (declare (fixnum var limit))
 ;;; so the inner compare/increment hit native int64 paths. 1+/1- also get
 ;;; fixnum fast paths.
 
@@ -448,7 +449,7 @@
     (dotimes (i n s) (setq s (+ s i))))
   10)
 
-;;; D671 — (declaim (ftype (function (...) fixnum) name)) marks NAME's
+;;; (declaim (ftype (function (...) fixnum) name)) marks NAME's
 ;;; return as fixnum-typed-p, so callers in fixnum context emit native
 ;;; unbox + int64 arithmetic without needing (the fixnum (name ...)).
 
@@ -470,7 +471,7 @@
   (%d671-fact 5)
   120)
 
-;;; D672 — (declare (double-float x)) enables native r8 arithmetic on
+;;; (declare (double-float x)) enables native r8 arithmetic on
 ;;; +/-/*/div. Verify the fast path produces correct DoubleFloat results
 ;;; for each operator and for comparisons in fused branches.
 
@@ -511,7 +512,7 @@
   (%d672-type-form 2.5d0)
   6.25d0)
 
-;;; D678 — dotcl:save-application (#62 MVP, :executable nil)
+;;; dotcl:save-application (MVP, :executable nil)
 ;;; Writes a tiny source + build.lisp to a temp dir, calls save-application,
 ;;; and verifies the output is a valid PE/FASL (starts with "MZ").
 (defun %d678-save-application-smoke ()
@@ -536,7 +537,7 @@
   (%d678-save-application-smoke)
   t)
 
-;;; D682 — TCO now works for params that are captured+mutated (boxed).
+;;; TCO now works for params that are captured+mutated (boxed).
 ;;; Previously `use-tco` required (null needs-boxing), so this function
 ;;; would have blown the stack at 100k depth. The call-site handled
 ;;; stelem-ref into the box already; only the entry gate was blocking.
@@ -557,12 +558,12 @@
   (%d682-iter-sum 100000 0)
   5000050000)
 
-;;; D688 — REQUIRE returns newly-added module list (SBCL convention),
+;;; REQUIRE returns newly-added module list (SBCL convention),
 ;;; and idempotent re-require short-circuits even when the contrib's
 ;;; file forgot to call (provide ...).
 (deftest d688-require-first-returns-non-nil
-  ;; Use a contrib that (as of D687) doesn't call (provide ...) itself —
-  ;; dotcl-cs is such a module (intentionally, see D903). Require should
+  ;; Use a contrib that doesn't call (provide ...) itself —
+  ;; dotcl-cs is such a module (intentionally). Require should
   ;; auto-push its name so the set-difference is non-nil.
   (consp (require "dotcl-cs"))
   t)
@@ -577,7 +578,7 @@
          (not (null (member "dotcl-cs" *modules* :test #'equal))))
   t)
 
-;;; D698 — (defun (setf name) ...) use-direct path: self-fn-prelude must use
+;;; (defun (setf name) ...) use-direct path: self-fn-prelude must use
 ;;; GetSetfFunctionBySymbol not GetFunctionBySymbol for (SETF NAME) names.
 ;;; The bug caused LispUndefinedFunction to be thrown inside the setf fn body.
 
@@ -600,7 +601,7 @@
     (%d698-acc cell))
   99)
 
-;;; D709 — macroexpand-cache: plist-dependent macros (anaphora-style)
+;;; macroexpand-cache: plist-dependent macros (anaphora-style)
 ;;; Toy reproducer: macro that stores a gensym on a plist during expansion.
 ;;; A second macro reads the plist to produce a reference to that gensym.
 ;;; Without caching, analysis re-expands %d709-sif (clobbering the plist),
@@ -631,7 +632,7 @@
     r)
   15)
 
-;;; D712 — incf/decf of (car ...) / (cdr ...) / (nth ...) returns store value
+;;; incf/decf of (car ...) / (cdr ...) / (nth ...) returns store value
 ;;; Per CLHS, get-setf-expansion's storing form must return the values of
 ;;; the store variables. The car/cdr/nth cases in %get-setf-expansion
 ;;; previously used (rplaca ...) / (rplacd ...) / (rplaca (nthcdr ...) ...)
@@ -672,7 +673,7 @@
       (if it it (list :oops it))))
   1)
 
-;;; D713 — (defun (setf NAME) ...) in a user-defined package registered correctly
+;;; (defun (setf NAME) ...) in a user-defined package registered correctly
 ;;; through compile-file + load. defun-pkg-spec previously ignored (setf NAME)
 ;;; forms, so the FASL assembler fell back to CL-USER and attached the setf
 ;;; function to the wrong symbol. Broke asdf:load-system via the shipped
@@ -709,7 +710,7 @@
   (%d713-setf-fn-fasl)
   t)
 
-;;; D715 — character name table covers C0 control mnemonics (SBCL-compat)
+;;; character name table covers C0 control mnemonics (SBCL-compat)
 ;;; and a common Unicode name (No-break_space). Reader previously signaled
 ;;; "Unknown character name: Vt" for maxpc/mpc, "bell" for text-query,
 ;;; "No-break_space" for cl-inix.
@@ -737,7 +738,7 @@
   (char-code (read-from-string "#\\No-break_space"))
   160)
 
-;;; D719 — compile-file FASL split must not orphan labels across helper methods
+;;; compile-file FASL split must not orphan labels across helper methods
 ;;; Previously `(unless test (defun f ...))` (and similarly (if/when/unless ...))
 ;;; at top level caused "Label N has not been marked" during compile-file: the
 ;;; FaslAssembler split instruction stream at defmethod boundaries into
@@ -769,10 +770,10 @@
   (%d719-if-with-defun-fasl)
   t)
 
-;;; D736 — compile-file preserves multi-dimensional array literals (#2A ...)
+;;; compile-file preserves multi-dimensional array literals (#2A ...)
 ;;; Previously EmitLoadConstInline always used the 1-arg LispVector(LispObject[])
 ;;; ctor which dropped `_dimensions`, turning `#2A((1 2 3) (4 5 6))` into a flat
-;;; SIMPLE-VECTOR of 6 elements after load. Broke reversi (issue #149) via its
+;;; SIMPLE-VECTOR of 6 elements after load. Broke reversi via its
 ;;; `*static-edge-table*` literal which was used as `(aref table i j)`.
 (defun %d-2darray-literal-fasl ()
   (let* ((tmp (format nil "~a/dotcl-2darr-~a"
@@ -795,9 +796,9 @@
   (%d-2darray-literal-fasl)
   t)
 
-;;; D747 — compile-file preserves element-type for 1D specialized vectors and bit-vectors
+;;; compile-file preserves element-type for 1D specialized vectors and bit-vectors
 ;;; Previously EmitLoadConstInline used the 1-arg ctor for 1D vectors even when
-;;; element-type != T, dropping it (issue #150 / D736 sibling).
+;;; element-type != T, dropping it (sibling of the multi-dimensional array fix above).
 (defun %d747-1d-specialized-vector-fasl ()
   (let* ((tmp (format nil "~a/dotcl-1dvec-~a"
                       (or (dotcl:getenv "TEMP") "/tmp")
@@ -823,7 +824,7 @@
   (%d747-1d-specialized-vector-fasl)
   (single-float t 4 1 0 1 1))
 
-;;; D741 — dotnet:invoke / dotnet:static unified InvokeMember dispatch
+;;; dotnet:invoke / dotnet:static unified InvokeMember dispatch
 ;;; (method, property, field — both read and setf).
 (deftest d741-invoke-method-and-property-and-setf
   (let ((sb (dotnet:new "System.Text.StringBuilder")))
@@ -845,7 +846,7 @@
   (characterp (dotnet:static "System.IO.Path" "DirectorySeparatorChar"))
   t)
 
-;;; D755 — DOTCL-MOP package phase 1 (#144).
+;;; DOTCL-MOP package phase 1.
 ;;; Smoke-tests AMOP introspection wrappers see dotcl's CLOS state.
 (defclass d755-foo () ((x :initarg :x) (y :initarg :y)))
 (defclass d755-bar (d755-foo) ((z :initarg :z) (x :allocation :class)))
@@ -897,7 +898,7 @@
         (dotcl-mop:classp 42))
   (t t nil t nil))
 
-;;; D766 — compile-defmacro must not check package lock when macro already defined
+;;; compile-defmacro must not check package lock when macro already defined
 ;;; Regression for (unless (fboundp 'defmethod) (defmacro defmethod ...)) pattern.
 (deftest d766-defmacro-guard-pattern-no-error
   (progn
@@ -906,7 +907,7 @@
     t)
   t)
 
-;;; D767 — ((lambda ...) args) must store function to local before evaluating args
+;;; ((lambda ...) args) must store function to local before evaluating args
 ;;; so that the CIL stack is empty at try-block entry when args contain loop/return.
 (deftest d767-lambda-call-loop-arg
   ((lambda (p) p)
@@ -915,7 +916,7 @@
        :yes :no))
   :yes)
 
-;;; D768 — defmacro dotted lambda list (a b . rest) support
+;;; defmacro dotted lambda list (a b . rest) support
 ;;; Macros like (defmacro foo (x . body) ...) use dotted lists as &rest equivalent
 (defmacro d768-dotted-rest (x . body)
   `(list ,x ,@body))
@@ -924,7 +925,7 @@
   (d768-dotted-rest 1 2 3)
   (1 2 3))
 
-;;; D769 — initialize-instance :after keyword args are valid initargs (CLHS 7.1.2)
+;;; initialize-instance :after keyword args are valid initargs (CLHS 7.1.2)
 ;;; (spell library: (defmethod initialize-instance :after ((object word) &key spelling) ...))
 (defclass d769-base ()
   ((%val :initarg :val :reader d769-val)))
@@ -937,12 +938,12 @@
     (d769-val obj))
   42)
 
-;;; D769 — reader: ::keyword reads as :keyword (SBCL compat, e.g. english.txt has ::possessive-adjective)
+;;; reader: ::keyword reads as :keyword (SBCL compat, e.g. english.txt has ::possessive-adjective)
 (deftest d769-reader-double-colon-keyword
   (eq ::foo :foo)
   t)
 
-;;; D770 — gensym forward-ref: defclass with gensym name and forward superclass must resolve CPL
+;;; gensym forward-ref: defclass with gensym name and forward superclass must resolve CPL
 ;;; Bug: ToClassSymbol converted uninterned gensyms to interned CL symbols, breaking RefinalizeDependents
 (deftest d770-gensym-forward-ref-typep
   (let* ((g1 (gensym))
@@ -953,7 +954,7 @@
       (list (typep obj g1) (typep obj g2))))
   (t t))
 
-;;; D770 — import with no args must signal program-error (CLHS 11.2 import)
+;;; import with no args must signal program-error (CLHS 11.2 import)
 (deftest d770-import-no-args-errors
   (handler-case (eval '(import))
     (program-error () :ok)
@@ -961,7 +962,7 @@
     (:no-error (v) (declare (ignore v)) :no-error))
   :ok)
 
-;;; D770 — defclass unknown option must signal program-error (CLHS 7.7)
+;;; defclass unknown option must signal program-error (CLHS 7.7)
 (deftest d770-defclass-unknown-option-errors
   (handler-case (eval '(defclass d770-bad-opt () () (:unknown-opt)))
     (program-error () :ok)
@@ -970,7 +971,7 @@
   :ok)
 
 
-;;; D771 — (setf (accessor obj) val) must dispatch through :around methods
+;;; (setf (accessor obj) val) must dispatch through :around methods
 ;;; Bug: defclass registered a setf expander that called %set-slot-value directly,
 ;;; bypassing the (setf accessor) generic function and all its method qualifiers.
 (defvar *d771-around-called* nil)
@@ -988,7 +989,7 @@
   (99 t))
 
 
-;;; D803 — make-string-input-stream normalises CR (0x0D) / CRLF to LF (0x0A).
+;;; make-string-input-stream normalises CR (0x0D) / CRLF to LF (0x0A).
 ;;;         WinUI TextBox / MAUI Editor return CR-only line endings, so without
 ;;;         stream-level normalisation the reader's line-comment handler consumes
 ;;;         the following form (SBCL convention: reader expects LF, stream folds).
@@ -1013,8 +1014,8 @@
             (read s nil :eof))))
   (42 :eof))
 
-;;; D827 — UIOP parse-unix-namestring accepts Windows-style absolute paths
-;;; (drive letter and/or backslash). Issue #167.
+;;; UIOP parse-unix-namestring accepts Windows-style absolute paths
+;;; (drive letter and/or backslash).
 ;;; Symbols are looked up at runtime to keep the file readable before
 ;;; (require "asdf") brings the UIOP package into existence.
 (eval-when (:load-toplevel :execute) (require "asdf"))
@@ -1025,7 +1026,7 @@
 (defun %d827-absolute-p (p)
   (funcall (find-symbol "ABSOLUTE-PATHNAME-P" :uiop) p))
 
-;; D827 tests are Windows-specific: drive letter `C:\` style paths only
+;; These tests are Windows-specific: drive letter `C:\` style paths only
 ;; mean "absolute" on Windows. On Linux/macOS the same string is just a
 ;; relative-looking name, so the assertions don't hold. Gate with #+windows.
 #+windows
@@ -1053,7 +1054,7 @@
     (if (%d827-absolute-p (%d827-parse-unix s)) t nil))
   t)
 
-;;; D829 — macrolet comprehensive patterns (#76): eval errors now propagate instead of silent nil
+;;; macrolet comprehensive patterns: eval errors now propagate instead of silent nil
 (deftest d828-macrolet-simple-and
   (macrolet ((my-and (a b) `(if ,a ,b nil)))
     (my-and t t))
@@ -1086,8 +1087,8 @@
           nconc (%m (copy-seq x))))
   (a b c d e f g i))
 
-;;; D850 — Windows long path (>MAX_PATH=260) — regression check that .NET 10
-;;; handles these transparently (#138). Works even when LongPathsEnabled=0.
+;;; Windows long path (>MAX_PATH=260) — regression check that .NET 10
+;;; handles these transparently. Works even when LongPathsEnabled=0.
 #+windows
 (deftest d850-windows-long-path
   (let* ((tmp (dotnet:static "System.IO.Path" "GetTempPath"))
@@ -1108,21 +1109,21 @@
             (read-line s))))
   (t t "longpath-ok"))
 
-;;; D899 (#125) — TCO for labels self-recursion: should not stack overflow
+;;; TCO for labels self-recursion: should not stack overflow
 (deftest d899-labels-self-tco-basic
   (labels ((count-down (n)
              (if (= n 0) :done (count-down (- n 1)))))
     (count-down 200000))
   :done)
 
-;;; D899 (#125) — labels self-TCO with accumulator
+;;; labels self-TCO with accumulator
 (deftest d899-labels-self-tco-acc
   (labels ((sum (n acc)
              (if (= n 0) acc (sum (- n 1) (+ acc n)))))
     (sum 100000 0))
   5000050000)
 
-;;; D899 (#125) — defun with inner labels self-TCO
+;;; defun with inner labels self-TCO
 (defun d899-count-down-helper (n)
   (labels ((loop-fn (i)
              (if (= i 0) :done (loop-fn (- i 1)))))
@@ -1132,7 +1133,7 @@
   (d899-count-down-helper 200000)
   :done)
 
-;;; D900 (#126) — TCO inside handler-case: should not stack overflow
+;;; TCO inside handler-case: should not stack overflow
 (defun %d900-count-safe (n)
   (handler-case
       (if (= n 0) :done (%d900-count-safe (- n 1)))
@@ -1142,7 +1143,7 @@
   (%d900-count-safe 200000)
   :done)
 
-;;; D900 (#126) — handler-case TCO with accumulator
+;;; handler-case TCO with accumulator
 (defun %d900-sum-safe (n acc)
   (handler-case
       (if (= n 0) acc (%d900-sum-safe (- n 1) (+ acc n)))
@@ -1152,7 +1153,7 @@
   (%d900-sum-safe 100000 0)
   5000050000)
 
-;;; D902 (#129) — return type inference from body (fixnum declared vars + if branches)
+;;; return type inference from body (fixnum declared vars + if branches)
 (defun %d902-tak (x y z)
   (declare (fixnum x y z))
   (if (not (< y x))
@@ -1171,7 +1172,7 @@
   (%d902-double 21)
   42)
 
-;;; D903 (#130) — native fixnum self-call path (box/unbox elimination)
+;;; native fixnum self-call path (box/unbox elimination)
 ;;; tak with all fixnum params + fixnum return → native body compiled,
 ;;; inner recursive calls use InvokeNative3 instead of boxing round-trip
 (defun %d903-tak (x y z)
@@ -1205,7 +1206,7 @@
   (%d903-ack 3 4)
   125)
 
-;;; D914 — cond no-body arms share one CTMP slot (#114)
+;;; cond no-body arms share one CTMP slot
 ;;; Correctness: shared slot must not bleed across arms
 
 (deftest d914-cond-no-body-first-truthy
@@ -1226,7 +1227,7 @@
   (cond (nil) ((oddp 4) :even) ((+ 5 6)))
   11)
 
-;;; D917 — fixnum multiply bignum promotion (#154)
+;;; fixnum multiply bignum promotion
 (deftest d917-fixnum-mul-bignum-literal
   ;; Large literal * large literal must NOT silently wrap
   (= (* 10000000000 10000000000) 100000000000000000000)
@@ -1245,7 +1246,7 @@
     (= (* a b) 1000000))
   t)
 
-;;; D916 — MultipleValues.Reset elision for known-single-value calls (#128)
+;;; MultipleValues.Reset elision for known-single-value calls
 (declaim (ftype (function (fixnum fixnum) fixnum) d916-add2))
 (defun d916-add2 (a b) (+ a b))
 
@@ -1274,7 +1275,7 @@
     (multiple-value-list (values 10 20 30)))
   (10 20 30))
 
-;;; D919 — labels mutual TCO dispatch loop (#124)
+;;; labels mutual TCO dispatch loop
 (deftest d919-labels-mutual-tco-basic
   ;; even?/odd? via labels dispatch loop: no stack overflow at large N
   (labels ((even? (n) (if (= n 0) t (odd? (- n 1))))
@@ -1304,7 +1305,7 @@
     (list (double 3) (triple 2)))
   (6 6))
 
-;;; D976 — UCD char-name table (name-char / char-name)
+;;; UCD char-name table (name-char / char-name)
 (deftest d976-name-char-ucd-spaces
   ;; name-char accepts UCD names (space-separated)
   (char-code (name-char "LATIN SMALL LETTER A"))
@@ -1330,7 +1331,7 @@
   (char-name #\Space)
   "Space")
 
-;;; D1002 — code-char NIL for codes >= char-code-limit
+;;; code-char NIL for codes >= char-code-limit
 (deftest d1002-code-char-above-limit
   (code-char 65536)
   nil)
@@ -1339,7 +1340,7 @@
   (characterp (code-char 65535))
   t)
 
-;;; D1003 — closed stream raises stream-error
+;;; closed stream raises stream-error
 (deftest d1003-closed-stream-error
   (let ((s (make-string-input-stream "abc")))
     (close s)
@@ -1349,7 +1350,7 @@
       'stream-error))
   t)
 
-;;; D1004 — nth type-error for negative index
+;;; nth type-error for negative index
 (deftest d1004-nth-negative-index
   (typep
     (handler-case (nth -1 '(a b c))
@@ -1392,7 +1393,7 @@
     (eql (%mlf-box2-val (symbol-value (find-symbol "*MLF-TEST-VAL*"))) 99))
   t)
 
-;;; D1096/D1097: ASDF source-registry で dotcl-thread がロードできること
+;;; ASDF source-registry で dotcl-thread がロードできること
 (deftest asdf-load-dotcl-thread
   (progn
     (require "asdf")
@@ -1400,7 +1401,7 @@
     (not (null (find-package "DOTCL-THREAD"))))
   t)
 
-;;; D1108: dotcl:backtrace — named-function call stack, innermost first
+;;; dotcl:backtrace — named-function call stack, innermost first
 (defun %bt-c () (dotcl:backtrace))
 (defun %bt-b () (%bt-c))
 (defun %bt-a () (%bt-b))
@@ -1418,7 +1419,7 @@
   (dotcl:print-backtrace (make-string-output-stream))
   nil)
 
-;;; D1111: ash with non-negative constant shift must not overflow int64 / mask
+;;; ash with non-negative constant shift must not overflow int64 / mask
 ;;; count mod 64 (raw CIL shl bug). Constant base, nested, and overflow cases.
 (deftest d1111-ash-const-shift-64
   (ash 1 64)
@@ -1448,7 +1449,7 @@
   (ash 5 3)
   40)
 
-;;; D1112: fixnum fast-path +/- must promote to bignum on int64 overflow
+;;; fixnum fast-path +/- must promote to bignum on int64 overflow
 ;;; (compile-fixnum-binop emitted raw :add/:sub that silently wrapped). * already
 ;;; promoted via MultiplyFixnum; +/- now match via Add/SubtractFixnum.
 (defun %d1112-add (a b) (declare (fixnum a b)) (+ a b))
@@ -1470,12 +1471,12 @@
   (+ (the fixnum 1000000) (the fixnum 2000000))
   3000000)
 
-;;; D1117 (#271) — NESTED unboxed fixnum arithmetic must promote on int64 overflow.
+;;; NESTED unboxed fixnum arithmetic must promote on int64 overflow.
 ;;; The boxed fixnum fast path (compile-fixnum-binop / 1+ / 1-) now uses a static
 ;;; value-range proof (expr-int-range): the raw int64 path is taken only when every
 ;;; intermediate +/-/*/1+/1- result provably fits int64; otherwise it falls back to
 ;;; the promoting Runtime.Add/Subtract/Multiply so the result becomes a bignum.
-;;; (The #130 native-long self-call path keeps its opt-in unsafe contract; verified
+;;; (The native-long self-call path keeps its opt-in unsafe contract; verified
 ;;; intact by d903-native-tak above.)
 (defun %d1117-nest+ (a b c) (declare (fixnum a b c)) (+ (+ a b) c))
 (defun %d1117-nest* (a b) (declare (fixnum a b)) (* (+ a b) 1))
@@ -1512,7 +1513,7 @@
   (%d1117-nest+ 1 2 3)
   6)
 
-;;; D1118 (#251) — :bt / print-backtrace show call forms with arguments.
+;;; :bt / print-backtrace show call forms with arguments.
 ;;; Frames now carry args (alloc-free inline for <=4); dotcl:print-backtrace renders
 ;;; "(NAME arg1 arg2 ...)" while dotcl:backtrace keeps bare names (see d1108 above).
 (defun %d1118-bt-leaf (a b)
@@ -1534,7 +1535,30 @@
   (%bt-a)
   ("%BT-C" "%BT-B" "%BT-A"))
 
-;;; D1121 (#25 follow-up) — [LispDoc]/SetFunctionDoc docstrings now surface through
+;;; dotcl:backtrace-with-args exposes each frame as (NAME arg0 arg1 ...)
+;;; with the actual captured argument objects, innermost first.
+(defun %bta-leaf (n s) (declare (ignore s)) (dotcl:backtrace-with-args))
+(defun %bta-mid (a b) (%bta-leaf (+ a b) "x"))
+
+(deftest d269-backtrace-with-args-frames
+  (let ((bt (%bta-mid 3 4)))
+    (list (find "%BTA-LEAF" bt :key #'car :test #'string=)
+          (find "%BTA-MID" bt :key #'car :test #'string=)))
+  (("%BTA-LEAF" 7 "x") ("%BTA-MID" 3 4)))
+
+(deftest d269-backtrace-with-args-real-objects
+  ;; the args are real Lisp objects, not printed strings: usable directly.
+  (let* ((bt (%bta-mid 10 20))
+         (leaf (find "%BTA-LEAF" bt :key #'car :test #'string=)))
+    (1+ (cadr leaf)))             ; arg0 of %bta-leaf is the number 30
+  31)
+
+(deftest d269-backtrace-with-args-self-excluded
+  ;; registered without a Name, so it never appears in its own result.
+  (member "BACKTRACE-WITH-ARGS" (%bta-leaf 1 2) :key #'car :test #'string=)
+  nil)
+
+;;; [LispDoc]/SetFunctionDoc docstrings now surface through
 ;;; the DOCUMENTATION GF's function method (it falls back to _docs like the variable
 ;;; method does). dotcl:save-application carries a [LispDoc] docstring.
 (deftest d1121-builtin-lispdoc-function-doc
@@ -1549,7 +1573,7 @@
            (setf (documentation 'dotcl:save-application 'function) nil)))
   "user override")
 
-;;; D1146 (#19) — a leading ~ in a STRING file spec must expand to the user home
+;;; #19 — a leading ~ in a STRING file spec must expand to the user home
 ;;; on the LOAD/OPEN/PROBE-FILE path (ResolvePhysicalPath), not just for
 ;;; (pathname "~/..."). Previously (load "~/x") treated ~ as a relative segment
 ;;; → cwd/~/x. probe-file "~" exercises ResolvePhysicalPath; home always exists,
@@ -1561,7 +1585,7 @@
          t))
   t)
 
-;;; #292: dotnet:new with only a type name must work for a type that has no
+;;; dotnet:new with only a type name must work for a type that has no
 ;;; parameterless ctor but an all-optional one (mirrors C# `new T()`). JsonObject
 ;;; has only JsonObject(JsonNodeOptions? options = null).
 (deftest d1181-dotnet-new-all-optional-ctor
@@ -1576,7 +1600,7 @@
     (dotnet:invoke sb "ToString"))
   "ok")
 
-;;; #279(a) — Lisp-2: a local variable named like a global function must not shadow
+;;; Lisp-2: a local variable named like a global function must not shadow
 ;;; the function in operator position, even when the local is setf-mutated (boxed).
 ;;; Mirrors quicklisp's fetch: (url ...) calls the function URL while url is also a
 ;;; mutated parameter.
@@ -1612,3 +1636,102 @@
 (deftest compile-file-does-not-leak-compile-time-modules
   (%cf-modules-no-leak)
   nil)
+
+;;; #'aref via funcall/apply must support any rank. The Lisp variadic AREF
+;;; defun (used for the function-object path; direct (aref a i j ...) is compiled
+;;; rank-aware) capped at rank-2 and errored ">3 dimensions not supported via
+;;; funcall" for rank-3+. Now rank-0..3 route to the fast path and rank>=4 goes
+;;; through row-major-aref + array-row-major-index, so any rank works.
+(deftest i314-funcall-aref-rank3
+  (let ((a (make-array '(3 4 4) :initial-element 0)))
+    (setf (aref a 1 2 3) 'three-d)
+    (list (funcall #'aref a 1 2 3)
+          (apply #'aref a (list 1 2 3))
+          (funcall #'aref a 0 0 0)))
+  (three-d three-d 0))
+
+(deftest i314-funcall-aref-rank4
+  (let ((a (make-array '(2 2 2 2) :initial-element 0)))
+    (setf (aref a 1 1 1 1) 'four-d)
+    (list (funcall #'aref a 1 1 1 1)
+          (apply #'aref a (list 1 1 1 1))))
+  (four-d four-d))
+
+;;; compile-file :module-name pins a stable FASL assembly name (no
+;;; per-compile guid suffix) for build-time-linked / NativeAOT deployment.
+;;; This protects the :module-name path: compile with a fixed name, load, run.
+;;; (The stable name itself is verified out of band via Reflection.AssemblyName.)
+(defun %d1263-module-name-fasl ()
+  (let* ((tmp (format nil "~a/dotcl-d1263-~a"
+                      (or (dotcl:getenv "TEMP") "/tmp")
+                      (get-internal-real-time)))
+         (src (format nil "~a/src.lisp" tmp)))
+    (ensure-directories-exist (concatenate 'string tmp "/"))
+    (with-open-file (s src :direction :output :if-exists :supersede)
+      (format s "(defpackage #:d1263-pkg (:use :cl))~%")
+      (format s "(in-package #:d1263-pkg)~%")
+      (format s "(defun sq (n) (* n n))~%"))
+    (let ((fasl (concatenate 'string (subseq src 0 (- (length src) 5)) ".fasl")))
+      (compile-file src :output-file fasl :module-name "d1263-stable-mod")
+      (load fasl))
+    (funcall (read-from-string "d1263-pkg::sq") 6)))
+
+(deftest d1263-compile-file-module-name
+  (%d1263-module-name-fasl)
+  36)
+
+;;; get-setf-expansion returns N store-vars for a defsetf long form with
+;;; multiple store variables. Was always 1, breaking letf/with-cursor-off
+;;; on multi-value places (e.g. McCLIM's (cursor-position c)).
+(defvar *gsx-x* 0)
+(defvar *gsx-y* 0)
+(defun %gsx-gp (obj) (declare (ignore obj)) (values *gsx-x* *gsx-y*))
+(defun %gsx-set (nx ny) (setf *gsx-x* nx *gsx-y* ny) (values nx ny))
+(defsetf %gsx-gp (obj) (nx ny) (declare (ignore obj)) `(%gsx-set ,nx ,ny))
+
+(deftest d1274-get-setf-expansion-store-count
+  (multiple-value-bind (temps vals stores setter getter)
+      (get-setf-expansion '(%gsx-gp :o))
+    (declare (ignore temps vals setter getter))
+    (length stores))
+  2)
+
+;; The writer-form must use BOTH store variables (letf-style save/restore).
+(deftest d1274-get-setf-expansion-uses-both-stores
+  (progn
+    (%gsx-set 3 4)
+    (multiple-value-bind (temps vals stores setter getter)
+        (get-setf-expansion '(%gsx-gp :o))
+      (declare (ignore getter))
+      (eval `(let* (,@(mapcar #'list temps vals))
+               (multiple-value-bind ,stores (values 11 22) ,setter))))
+    (list *gsx-x* *gsx-y*))
+  (11 22))
+
+;;; UNC paths (\\server\share\...) must keep the server as the pathname host and
+;;; round-trip. Previously the leading // was dropped (RemoveEmptyEntries split),
+;;; giving (:absolute "server" "share" ...) with host NIL, which reconstructed to
+;;; a bogus local \server\share\... — directory returned nothing and probe-file
+;;; was NIL on a perfectly valid mapped UNC path. (Filesystem-independent here.)
+(deftest unc-pathname-host
+  (pathname-host (pathname "//srv/share/dir/file.txt"))
+  "srv")
+
+(deftest unc-pathname-directory
+  (pathname-directory (pathname "//srv/share/dir/file.txt"))
+  (:absolute "share" "dir"))
+
+(deftest unc-namestring-roundtrip
+  (namestring (pathname "//srv/share/dir/file.txt"))
+  "//srv/share/dir/file.txt")
+
+;; Backslash UNC form parses identically (separators are normalized).
+(deftest unc-backslash-roundtrip
+  (namestring (pathname "\\\\srv\\share\\f.txt"))
+  "//srv/share/f.txt")
+
+;; A plain absolute (non-UNC) path is unaffected: single leading slash, no host.
+(deftest unc-nonunc-absolute-unaffected
+  (list (pathname-host (pathname "/etc/hosts"))
+        (namestring (pathname "/etc/hosts")))
+  (nil "/etc/hosts"))

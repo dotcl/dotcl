@@ -105,7 +105,7 @@ public static partial class Runtime
         // (t→true, nil→false) and int?/etc. accept their value. nil maps to null
         // for non-bool nullables (no false analog); (dotnet:null) is the explicit
         // null for all. Without this, nil → Activator.CreateInstance(Nullable<T>)
-        // = null, so bool? could never receive false (#305).
+        // = null, so bool? could never receive false.
         var underlyingType = Nullable.GetUnderlyingType(targetType);
         if (underlyingType != null)
         {
@@ -205,6 +205,28 @@ public static partial class Runtime
             for (int i = 0; i < seqItems.Count; i++)
                 arr.SetValue(LispToDotNet(seqItems[i], elemType), i);
             return arr;
+        }
+
+        // Interface or base-class target (IComparable, IConvertible, IFormattable,
+        // ValueType, …) that a primitive value's natural .NET type satisfies: box at
+        // that natural type. Lets dotnet:box / a typed parameter accept e.g. an int
+        // where IComparable is wanted. Concrete primitive targets (int,
+        // double, string, …) are handled by the branches above.
+        {
+            object? natural = arg switch
+            {
+                Fixnum nfx      => nfx.Value,                // long
+                DoubleFloat ndf => ndf.Value,                // double
+                SingleFloat nsf => nsf.Value,                // float
+                LispString nls  => nls.Value,                // string
+                LispVector ncv when ncv.IsCharVector => ncv.ToCharString(),
+                _ => null
+            };
+            if (natural != null && targetType.IsAssignableFrom(natural.GetType()))
+                return natural;
+            // Integers also satisfy 32-bit-specific targets (e.g. IComparable<int>).
+            if (arg is Fixnum gfx && targetType.IsAssignableFrom(typeof(int)))
+                return (int)gfx.Value;
         }
 
         // Fallback: pass as object
@@ -388,7 +410,7 @@ public static partial class Runtime
         // legacy types (System.Collections.Queue, ArrayList, ...) are ALSO
         // registered as .NET Framework COM components (mscoree.dll). Activating
         // those via COM throws an uncatchable "Failed to load the runtime" and
-        // crashes the process (dotcl-internal #304).
+        // crashes the process.
         foreach (var facade in new[] { "mscorlib", "netstandard" })
         {
             try
@@ -400,7 +422,7 @@ public static partial class Runtime
         }
 
         // COM ProgID fallback for genuine ProgIDs (e.g. "Excel.Application",
-        // "Schedule.Service" — D742). On non-Windows GetTypeFromProgID returns
+        // "Schedule.Service"). On non-Windows GetTypeFromProgID returns
         // null (does not throw in modern .NET). Skip managed framework
         // namespaces: they never name a wanted COM component, and "System.*"
         // collides with legacy .NET Framework COM registrations that crash on
@@ -421,6 +443,77 @@ public static partial class Runtime
             return dynType;
 
         throw new LispErrorException(new LispError($"DOTNET: type not found: {typeName}"));
+    }
+
+    /// <summary>
+    /// Compile-time helper for typed-return inference. Given a
+    /// receiver type name, an instance method name, and a list of parameter-type
+    /// name strings, resolve the method's static return type and return its FullName
+    /// as a LispString — but ONLY when a value of that static type is guaranteed to
+    /// marshal back (DotNetToLisp) to a LispDotNetObject, so it can serve as the
+    /// receiver of a subsequent typed direct callvirt. Returns NIL for void, an
+    /// unresolvable type / overload, a natively-marshaled primitive or string, or
+    /// any slot type (object / ValueType / Enum / an interface) whose runtime value
+    /// could itself be a string or boxed primitive (which would NOT be a
+    /// LispDotNetObject). The compiler macro uses this to lower a method chain
+    /// (dotnet:invoke (dotnet:invoke r "Inner" ...) "Outer" ...) without an explicit
+    /// THE on the inner result. Args: (typeName methodName paramTypeList).
+    /// </summary>
+    public static LispObject DotNetMethodReturnType(LispObject[] args)
+    {
+        if (args.Length < 2) return Nil.Instance;
+        string? typeName = (args[0] as LispString)?.Value;
+        string? methodName = (args[1] as LispString)?.Value;
+        if (typeName == null || methodName == null) return Nil.Instance;
+
+        var paramTypeNames = new System.Collections.Generic.List<string>();
+        if (args.Length >= 3)
+            for (var cur = args[2]; cur is Cons cc; cur = cc.Cdr)
+            {
+                if (cc.Car is LispString ps) paramTypeNames.Add(ps.Value);
+                else return Nil.Instance;
+            }
+
+        Type t;
+        try { t = ResolveDotNetType(typeName); } catch { return Nil.Instance; }
+        var paramTypes = new Type[paramTypeNames.Count];
+        for (int i = 0; i < paramTypes.Length; i++)
+        {
+            try { paramTypes[i] = ResolveDotNetType(paramTypeNames[i]); }
+            catch { return Nil.Instance; }
+        }
+
+        System.Reflection.MethodInfo? m;
+        try { m = t.GetMethod(methodName, paramTypes); }
+        catch { return Nil.Instance; }          // ambiguous overload, etc.
+        if (m == null) return Nil.Instance;
+
+        var rt = m.ReturnType;
+        if (!IsDirectableReturnType(rt) || rt.FullName == null) return Nil.Instance;
+        return new LispString(rt.FullName);
+    }
+
+    /// <summary>
+    /// True when EVERY runtime value of static type RT marshals (DotNetToLisp) to a
+    /// LispDotNetObject — the precondition for using such a value as a typed direct
+    /// callvirt receiver. Value types are exact (sealed), so any non-primitive
+    /// struct / enum qualifies. Reference types are polymorphic: a slot typed as
+    /// object / ValueType / Enum / an interface could hold a string or boxed
+    /// primitive (which marshal to LispString / Fixnum / …), so those are excluded;
+    /// any other concrete or abstract class is safe because string and the boxed
+    /// primitives are not assignable to it.
+    /// </summary>
+    private static bool IsDirectableReturnType(Type rt)
+    {
+        if (rt == typeof(void)) return false;
+        if (rt.IsByRef || rt.IsPointer || rt.IsGenericParameter) return false;
+        if (rt.IsInterface) return false;
+        if (rt == typeof(object) || rt == typeof(ValueType) || rt == typeof(Enum))
+            return false;
+        if (rt == typeof(int) || rt == typeof(long) || rt == typeof(double)
+            || rt == typeof(float) || rt == typeof(string) || rt == typeof(char)
+            || rt == typeof(bool)) return false;
+        return true;
     }
 
     /// <summary>Best-fit conversion when target parameter type is unknown
@@ -715,6 +808,13 @@ public static partial class Runtime
         var type = ResolveDotNetType(typeName);
         var callArgs = LispArgsToDotNetGeneric(args.Skip(2).ToArray());
 
+        // See DotNetInvoke: marshal with declared param types first when an arg is
+        // nil, so value-type / Nullable<value> params get the natural default
+        // (bool/bool? → false) rather than null.
+        if (args.Skip(2).Any(a => a is Nil)
+            && TryInvokeWithMarshalledArgs(type, memberName, null, args.Skip(2).ToArray(), true, out var pre))
+            return DotNetToLisp(pre);
+
         try
         {
             if (TryCachedInvoke(type, memberName, null, callArgs, true, out var cached))
@@ -801,6 +901,19 @@ public static partial class Runtime
                 return DotNetToLisp(callArgs[callArgs.Length - 1]);
             }
         }
+
+        // Lisp NIL is ambiguous between .NET null and a value-type default (bool
+        // false, etc.). The generic binder path below treats it as null, which is
+        // wrong for value-type / Nullable<value> parameters — e.g.
+        // (dotnet:invoke cb "set_IsChecked" nil) keeps IsChecked null instead of
+        // false. When any arg is nil, first try parameter-type-aware marshalling
+        // (LispToDotNet with the declared param type) so nil maps to the param's
+        // natural default (bool/bool? → false, ref/string/int? → null).
+        // Reference/string params still resolve to null, so this only changes the
+        // previously-broken value-type case.
+        if (args.Skip(2).Any(a => a is Nil)
+            && TryInvokeWithMarshalledArgs(type, memberName, target, args.Skip(2).ToArray(), false, out var pre))
+            return DotNetToLisp(pre);
 
         try
         {
@@ -949,6 +1062,12 @@ public static partial class Runtime
     /// Returns the full name as a LispString on success.</summary>
     public static LispObject DotNetDefineClass(LispObject[] args)
     {
+#if !DOTCL_EMIT
+        // Defining a brand-new .NET type at runtime is inherently emit-based
+        // (AssemblyBuilder/TypeBuilder); unavailable on the emit-free runtime.
+        throw new LispErrorException(new LispProgramError(
+            "DOTNET:%DEFINE-CLASS: defining .NET classes requires the emitting runtime (not available on this build)"));
+#else
         if (args.Length < 1 || args.Length > 12)
             throw new LispErrorException(new LispProgramError(
                 "DOTNET:%DEFINE-CLASS: requires 1-12 arguments (full-name &optional base-type-name field-specs attr-specs method-specs ctor-body property-specs interface-specs event-specs ctor-param-types base-ctor-arg-indices ctor-specs-list)"));
@@ -1355,18 +1474,26 @@ public static partial class Runtime
             throw new LispErrorException(new LispError(
                 $"DOTNET:%DEFINE-CLASS: {ae.Message}"));
         }
+#endif
     }
 
+#if DOTCL_EMIT
     // Cache: (selfType, methodName, paramTypeSig) → DynamicMethod for non-virtual base call.
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<(Type, string, string), System.Reflection.Emit.DynamicMethod>
         _baseCallCache = new();
+#endif
 
     /// <summary>(dotnet:call-base self "Method" &rest args)
     /// Call the base class implementation of a virtual method non-virtually
     /// (equivalent to C# base.Method(args)). self must be a dotcl-defined class
-    /// instance; base type is self.GetType().BaseType.</summary>
+    /// instance; base type is self.GetType().BaseType. Requires the emitting runtime
+    /// (emits a non-virtual call thunk via DynamicMethod).</summary>
     public static LispObject DotNetCallBase(LispObject[] args)
     {
+#if !DOTCL_EMIT
+        throw new LispErrorException(new LispProgramError(
+            "DOTNET:CALL-BASE: requires the emitting runtime (not available on this build)"));
+#else
         if (args.Length < 2)
             throw new LispErrorException(new LispProgramError(
                 "DOTNET:CALL-BASE: requires at least 2 arguments (self method-name &rest args)"));
@@ -1419,6 +1546,7 @@ public static partial class Runtime
         var allArgs = new object?[] { target }.Concat(convertedArgs).ToArray();
         var result  = dm.Invoke(null, allArgs);
         return DotNetToLisp(result);
+#endif
     }
 
     public static LispObject DotNetBox(LispObject[] args)
@@ -1432,6 +1560,23 @@ public static partial class Runtime
         var converted = LispToDotNet(args[0], type);
         return new LispDotNetBoxed(converted!, type);
     }
+
+    /// <summary>
+    /// <lispdoc>(dotnet:hint-type obj) -- For a value produced by dotnet:box, return its hint type (the user-supplied static type used to choose overloads) as a System.Type. Returns NIL for any object that carries no hint (an ordinary .NET object, or a non-.NET value). Use dotnet:object-type for the actual runtime type. (#31)</lispdoc>
+    /// Return the static hint type of a LispDotNetBoxed value (the type given to
+    /// dotnet:box, used for overload resolution), or NIL when OBJ carries no hint.
+    /// </summary>
+    [LispDoc("DOTNET:HINT-TYPE")]
+    public static LispObject DotNetHintType(LispObject arg)
+        => arg is LispDotNetBoxed boxed ? new LispDotNetObject(boxed.HintType) : Nil.Instance;
+
+    /// <summary>
+    /// <lispdoc>(dotnet:object-type obj) -- Return the actual runtime type (value.GetType()) of a .NET object as a System.Type, or NIL if OBJ is not a .NET object. For a dotnet:box value this is the boxed value's real type, which may differ from dotnet:hint-type. (#31)</lispdoc>
+    /// Return the actual runtime Type of a wrapped .NET object, or NIL otherwise.
+    /// </summary>
+    [LispDoc("DOTNET:OBJECT-TYPE")]
+    public static LispObject DotNetObjectType(LispObject arg)
+        => arg is LispDotNetObject dno ? new LispDotNetObject(dno.Type) : Nil.Instance;
 
     public static LispObject DotNetToStream(LispObject[] args)
     {
@@ -1534,13 +1679,15 @@ public static partial class Runtime
                     System.Linq.Expressions.Expression.Convert(p, typeof(object))))
             .ToArray();
 
-        // fn.Invoke(new LispObject[] { ... })
+        // Runtime.InvokeForeignCallback(fn, new LispObject[] { ... }) — wraps
+        // fn.Invoke so a Lisp error inside the callback is handled at the boundary
+        // (dotcl:*foreign-callback-handler*) instead of crashing the .NET caller.
         var argsArray = System.Linq.Expressions.Expression.NewArrayInit(
             typeof(LispObject), lispArgs);
-        var invoke = typeof(LispFunction).GetMethod(nameof(LispFunction.Invoke))!;
+        var invokeForeign = typeof(Runtime).GetMethod(nameof(InvokeForeignCallback))!;
         var callFn = System.Linq.Expressions.Expression.Call(
-            System.Linq.Expressions.Expression.Constant(fn),
-            invoke,
+            invokeForeign,
+            System.Linq.Expressions.Expression.Constant(fn, typeof(LispObject)),
             argsArray);
 
         System.Linq.Expressions.Expression body;
@@ -1565,6 +1712,84 @@ public static partial class Runtime
 
         return System.Linq.Expressions.Expression.Lambda(delegateType, body, parameters)
             .Compile();
+    }
+
+    private static Symbol? _foreignCbHandlerSym;
+    private static Symbol ForeignCbHandlerSym =>
+        _foreignCbHandlerSym ??= Startup.SymInPkg("*FOREIGN-CALLBACK-HANDLER*", "DOTCL");
+
+    /// <summary>
+    /// Invoke a Lisp function at a C#→Lisp callback boundary (a delegate built by
+    /// CreateLispDelegate, an event handler, or a dotnet:%define-class method
+    /// override), keeping a Lisp error from tearing through the host. Such errors
+    /// otherwise escape as LispErrorException → TargetInvocationException and crash
+    /// the .NET caller (e.g. a MonoGame Game.Run loop calling an overridden Draw).
+    ///
+    /// On a LispErrorException the condition is handed to dotcl:*foreign-callback-
+    /// handler* — a function of one argument (the condition) whose return value
+    /// becomes the callback's result. When that variable is NIL (the default) the
+    /// condition is reported to *error-output* and NIL is returned, so the marshal
+    /// layer yields the return type's default and the host keeps running. Non-Lisp
+    /// .NET exceptions are NOT caught here; they propagate as before.
+    /// </summary>
+    public static LispObject InvokeForeignCallback(LispObject fn, LispObject[] args)
+    {
+        // Establish a handler-bind for ERROR around the callback (like handler-case)
+        // so the condition is intercepted at the SIGNAL point — before the error
+        // function would invoke the debugger. That matters because the host caller
+        // is typically a non-interactive loop (a 60fps Game.Run, an event handler);
+        // entering the debugger there would hang. The handler unwinds to the catch
+        // below carrying the ORIGINAL condition.
+        var tag = new object();
+        var handler = new LispFunction(
+            hargs => throw new HandlerCaseInvocationException(
+                tag, 0, hargs.Length > 0 ? hargs[0] : Nil.Instance),
+            "%FOREIGN-CALLBACK-BOUNDARY", -1);
+        HandlerClusterStack.PushCluster(new[] { new HandlerBinding(Startup.Sym("ERROR"), handler) });
+        try
+        {
+            return Funcall(fn, args);
+        }
+        catch (HandlerCaseInvocationException ex) when (ReferenceEquals(ex.Tag, tag))
+        {
+            return HandleForeignCallbackError(
+                ex.Condition as LispCondition ?? new LispError(ex.Condition.ToString() ?? "error"));
+        }
+        catch (LispErrorException ex)
+        {
+            // A LispErrorException that bypassed the handler-bind (e.g. signaled with
+            // no ERROR match, or thrown directly) is still handled at the boundary.
+            return HandleForeignCallbackError(ex.Condition);
+        }
+        finally
+        {
+            HandlerClusterStack.PopCluster();
+        }
+    }
+
+    private static LispObject HandleForeignCallbackError(LispCondition condition)
+    {
+        var handler = DynamicBindings.Get(ForeignCbHandlerSym);
+        if (handler is not Nil)
+        {
+            // A user handler decides the callback's result. If it is not actually
+            // funcallable or itself errors, fall through to the default report
+            // rather than re-crossing the boundary.
+            try { return Funcall(handler, condition); }
+            catch (LispErrorException) { }
+        }
+        // Default: report and continue with NIL so the host is not torn down.
+        try
+        {
+            var errOut = DynamicBindings.Get(Startup.SymInPkg("*ERROR-OUTPUT*", "COMMON-LISP"));
+            var writer = (errOut as LispOutputStream)?.Writer
+                         ?? (errOut as LispBidirectionalStream)?.Writer;
+            var msg = $";; Unhandled error in foreign callback: {condition}";
+            if (writer != null) writer.WriteLine(msg);
+            else Console.Error.WriteLine(msg);
+        }
+        catch { /* never let reporting itself escape the boundary */ }
+        return Nil.Instance;
     }
 
     /// <summary>

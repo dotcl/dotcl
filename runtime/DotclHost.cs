@@ -97,6 +97,62 @@ public static class DotclHost
     }
 
     /// <summary>
+    /// Run a build-time-linked compiled module's <c>CompiledModule.ModuleInit</c>
+    /// without loading any assembly at run time. This is the AOT/IL2CPP path:
+    /// the .fasl (core or app) is referenced as a normal assembly at build time
+    /// (so the AOT compiler bakes it in), and the host hands its ModuleInit
+    /// method group here, e.g.
+    /// <code>
+    ///   extern alias dotclcore;            // &lt;Reference ...&gt;&lt;Aliases&gt;dotclcore&lt;/Aliases&gt;
+    ///   DotclHost.RunLinkedModule(dotclcore::CompiledModule.ModuleInit);
+    /// </code>
+    /// Unlike <see cref="LoadCore"/>/<see cref="LoadLispFile"/>, this never calls
+    /// <c>Assembly.LoadFrom</c> (which throws PlatformNotSupportedException under
+    /// NativeAOT). The <c>*PACKAGE*</c> binding is saved/restored exactly as the
+    /// reflection-based loader does. Each compiled module exposes a public static
+    /// <c>CompiledModule.ModuleInit()</c>; collisions between the core's and the
+    /// app's same-named type are resolved by extern alias at the call site.
+    /// </summary>
+    public static LispObject? RunLinkedModule(Func<LispObject?> moduleInit)
+    {
+        if (moduleInit is null) throw new ArgumentNullException(nameof(moduleInit));
+        var packageSym = Startup.Sym("*PACKAGE*");
+        var oldPackage = DynamicBindings.Get(packageSym);
+        try { return moduleInit(); }
+        finally { DynamicBindings.Set(packageSym, oldPackage); }
+    }
+
+    /// <summary>
+    /// Build-time-link convenience over <see cref="RunLinkedModule"/>: resolve an
+    /// already-baked-in compiled module by its stable assembly NAME — the
+    /// <c>:module-name</c> passed to <c>compile-file</c> / <c>dotcl:sil-to-fasl</c>,
+    /// which must equal the referenced file's base name — and run its
+    /// <c>CompiledModule.ModuleInit</c>. Uses <see cref="Assembly.Load(AssemblyName)"/>
+    /// on an assembly that is already linked into the image; it never calls
+    /// <c>Assembly.LoadFrom</c> (PlatformNotSupported under NativeAOT), so it is the
+    /// AOT/IL2CPP boot path. The module's assembly must be kept whole via
+    /// <c>&lt;TrimmerRootAssembly&gt;</c> so the reflected type and method survive
+    /// trimming. This centralizes the reflection a host would otherwise hand-write,
+    /// letting the host boot a stable-named core/app fasl with a single call:
+    /// <code>
+    ///   DotclHost.RunLinkedModuleByName("dotclcore");   // the FASL core
+    ///   DotclHost.RunLinkedModuleByName("appfasl");     // the app image
+    /// </code>
+    /// </summary>
+    public static LispObject? RunLinkedModuleByName(string assemblyName)
+    {
+        if (assemblyName is null) throw new ArgumentNullException(nameof(assemblyName));
+        var asm = Assembly.Load(new AssemblyName(assemblyName));
+        var t = asm.GetType("CompiledModule")
+            ?? throw new InvalidOperationException(
+                $"RunLinkedModuleByName: {assemblyName}: CompiledModule type not found");
+        var mi = t.GetMethod("ModuleInit", BindingFlags.Public | BindingFlags.Static)
+            ?? throw new InvalidOperationException(
+                $"RunLinkedModuleByName: {assemblyName}: ModuleInit method not found");
+        return RunLinkedModule(() => (LispObject?)mi.Invoke(null, null));
+    }
+
+    /// <summary>
     /// Load and evaluate a Lisp source file. Same semantics as CL LOAD.
     /// </summary>
     public static void LoadLispFile(string path)
@@ -289,7 +345,31 @@ public static class DotclHost
     /// declared order (used by MSBuild as Inputs). <paramref name="targetRid"/>,
     /// when given, prefers <c>&lt;name&gt;-r2r-&lt;rid&gt;.fasl</c> if present.
     /// </summary>
-    public static void ResolveDeps(string asdPath, string? manifestOut, string? rootSourcesOut, string? targetRid = null)
+    /// <summary>
+    /// Load each user-supplied build-init script (the &lt;DotclBuildInit&gt; items)
+    /// before dependency resolution. dotcl does NOT auto-scan ~/quicklisp etc.; a
+    /// build that needs external systems makes them discoverable here — e.g. the
+    /// script does (pushnew #p"…/foo/" asdf:*central-registry*) or boots quicklisp.
+    /// Build-time only: the shipped runtime never runs these, so it can't end up
+    /// depending on the dev machine's paths. Called after (require "asdf").
+    /// </summary>
+    private static void LoadBuildInitScripts(string[]? scripts)
+    {
+        if (scripts == null) return;
+        foreach (var s in scripts)
+        {
+            if (string.IsNullOrWhiteSpace(s)) continue;
+            var abs = System.IO.Path.GetFullPath(s.Trim());
+            if (!System.IO.File.Exists(abs))
+                throw new System.IO.FileNotFoundException(
+                    $"DotclBuildInit script not found: {abs}", abs);
+            var lisp = abs.Replace("\\", "/");
+            Runtime.Eval(MultipleValues.Primary(
+                Runtime.ReadFromString(new LispObject[] { new LispString($"(load \"{lisp}\")") })));
+        }
+    }
+
+    public static void ResolveDeps(string asdPath, string? manifestOut, string? rootSourcesOut, string? targetRid = null, string[]? buildInit = null)
     {
         var absAsd = System.IO.Path.GetFullPath(asdPath);
         if (!System.IO.File.Exists(absAsd))
@@ -299,6 +379,9 @@ public static class DotclHost
         // and side-effects *central-registry* with shipped contrib subdirs.
         Runtime.Eval(MultipleValues.Primary(
             Runtime.ReadFromString(new LispObject[] { new LispString("(require \"asdf\")") })));
+
+        // User build-init scripts (e.g. register external system dirs / boot QL).
+        LoadBuildInitScripts(buildInit);
 
         var asdLisp = absAsd.Replace("\\", "/");
         var manifestForm = manifestOut == null
@@ -339,7 +422,9 @@ public static class DotclHost
                                   (asdf:output-files
                                    (asdf:make-operation 'asdf::concatenate-source-op)
                                    sys))))
-                     (compile-file concat :output-file fasl))))
+                     ;; same concat compile-time-eval as CompileProject,
+                     ;; for dependency systems built on the fly.
+                     (dotcl.cil-compiler:compile-file-concatenated concat fasl))))
                fasl)))
     (asdf:load-asd ""{asdLisp}"")
     (let* ((root (asdf:find-system
@@ -369,7 +454,7 @@ public static class DotclHost
     /// <paramref name="outputPath"/>. Only the root system is compiled;
     /// dependencies stay as pre-built fasls resolved by <see cref="ResolveDeps"/>.
     /// </summary>
-    public static void CompileProject(string asdPath, string outputPath)
+    public static void CompileProject(string asdPath, string outputPath, string[]? buildInit = null)
     {
         var absAsd = System.IO.Path.GetFullPath(asdPath);
         if (!System.IO.File.Exists(absAsd))
@@ -381,6 +466,9 @@ public static class DotclHost
 
         Runtime.Eval(MultipleValues.Primary(
             Runtime.ReadFromString(new LispObject[] { new LispString("(require \"asdf\")") })));
+
+        // User build-init scripts (e.g. register external system dirs / boot QL).
+        LoadBuildInitScripts(buildInit);
 
         var asdLisp = absAsd.Replace("\\", "/");
         var outLisp = absOut.Replace("\\", "/");
@@ -395,7 +483,12 @@ public static class DotclHost
          (sources (mapcar #'asdf:component-pathname
                           (asdf:component-children root))))
     (asdf::concatenate-files sources ""{concatLisp}"")
-    (compile-file ""{concatLisp}"" :output-file ""{outLisp}"")))";
+    ;; compile-file-concatenated binds *concatenate-build* (cross-compiled,
+    ;; so the binding shares symbol identity with the compiler's read) so the
+    ;; compiler evaluates toplevel require/use-package/load at compile time within
+    ;; the single concatenated unit — restoring the compile+load interleaving a
+    ;; normal multi-file load-op would have given the original :components.
+    (dotcl.cil-compiler:compile-file-concatenated ""{concatLisp}"" ""{outLisp}"")))";
         Runtime.Eval(MultipleValues.Primary(
             Runtime.ReadFromString(new LispObject[] { new LispString(form) })));
     }

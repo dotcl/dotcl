@@ -26,7 +26,7 @@ public static partial class Runtime
         // (error 'condition-type) or (error 'condition-type :initarg val ...) — create condition instance
         if (args[0] is Symbol sym)
         {
-            var initargs = args[1..];
+            var initargs = args.SubArray(1);
             var condObj = MakeConditionFromType(sym, initargs);
             if (condObj is LispInstanceCondition lic)
                 return ConditionSystem.Error(lic);
@@ -51,7 +51,7 @@ public static partial class Runtime
             var simpleErr = new LispError(msg);
             simpleErr.ConditionTypeName = "SIMPLE-ERROR";
             simpleErr.FormatControl = args[0];
-            simpleErr.FormatArguments = args.Length > 1 ? Runtime.List(args[1..]) : Nil.Instance;
+            simpleErr.FormatArguments = args.Length > 1 ? Runtime.List(args.SubArray(1)) : Nil.Instance;
             return ConditionSystem.Error(simpleErr);
         }
         if (args[0] is not LispString fmt)
@@ -62,7 +62,7 @@ public static partial class Runtime
         var err = new LispError(message);
         err.ConditionTypeName = "SIMPLE-ERROR";
         err.FormatControl = fmt;
-        err.FormatArguments = Runtime.List(args[1..]);
+        err.FormatArguments = Runtime.List(args.SubArray(1));
         return ConditionSystem.Error(err);
     }
 
@@ -195,7 +195,7 @@ public static partial class Runtime
             return ConditionSystem.Signal(new LispInstanceCondition(inst));
         if (args[0] is Symbol sym)
         {
-            var initargs = args.Length > 1 ? args[1..] : Array.Empty<LispObject>();
+            var initargs = args.Length > 1 ? args.SubArray(1) : Array.Empty<LispObject>();
             return ConditionSystem.Signal(MakeConditionFromType(sym, initargs));
         }
         // String message — preserve format control/arguments
@@ -204,7 +204,7 @@ public static partial class Runtime
         if (args[0] is LispString fmtStr)
         {
             sc.FormatControl = fmtStr;
-            sc.FormatArguments = Runtime.List(args[1..]);
+            sc.FormatArguments = Runtime.List(args.SubArray(1));
         }
         return ConditionSystem.Signal(sc);
     }
@@ -482,7 +482,7 @@ public static partial class Runtime
         }
         if (args[0] is Symbol sym)
         {
-            var initargs = args[1..];
+            var initargs = args.SubArray(1);
             var condObj = MakeConditionFromType(sym, initargs);
             // Check if it's a WARNING type
             if (!IsTruthy(Typep(condObj, Startup.Sym("WARNING"))))
@@ -497,7 +497,7 @@ public static partial class Runtime
         var warn = new LispWarning(message);
         warn.ConditionTypeName = "SIMPLE-WARNING";
         warn.FormatControl = fmt;
-        warn.FormatArguments = Runtime.List(args[1..]);
+        warn.FormatArguments = Runtime.List(args.SubArray(1));
         return ConditionSystem.Warn(warn);
     }
 
@@ -511,7 +511,7 @@ public static partial class Runtime
 
                 var continueFormatString = args[0];
                 var datum = args[1];
-                var restArgs = args.Length > 2 ? args[2..] : Array.Empty<LispObject>();
+                var restArgs = args.Length > 2 ? args.SubArray(2) : Array.Empty<LispObject>();
 
                 string continueDescription;
                 if (continueFormatString is LispString cfs)
@@ -651,7 +651,7 @@ public static partial class Runtime
             new LispFunction(args => {
                 if (args.Length == 0) throw new LispErrorException(new LispProgramError("MAKE-CONDITION: missing type argument"));
                 var type = args[0];
-                var initargs = args.Length > 1 ? args[1..] : Array.Empty<LispObject>();
+                var initargs = args.Length > 1 ? args.SubArray(1) : Array.Empty<LispObject>();
                 return Runtime.MakeConditionPublic(type, initargs);
             }));
 

@@ -758,7 +758,10 @@ public static class DynamicClassBuilder
         for (int i = 0; i < args.Length; i++)
             lispArgs[i + 1] = Runtime.DotNetToLisp(args[i]);
 
-        var result = Runtime.Funcall(lispFn, lispArgs);
+        // Cross the C#→Lisp boundary through InvokeForeignCallback so a Lisp error
+        // in the override body is handled (dotcl:*foreign-callback-handler*) rather
+        // than escaping as TargetInvocationException and crashing the .NET caller.
+        var result = Runtime.InvokeForeignCallback(lispFn, lispArgs);
 
         if (returnType == typeof(void)) return null;
         return Runtime.LispToDotNet(result, returnType);

@@ -45,11 +45,16 @@
   (declare (ignore env))
   (subtypep type1 type2))
 (defun aref (array &rest indices)
+  ;; #'aref via funcall/apply. Direct (aref a i j ...) is handled rank-aware by the
+  ;; compiler; here the rank-0..3 cases route back to that fast path, and rank >=4
+  ;; goes through row-major-aref + array-row-major-index (both arbitrary-rank C#
+  ;; primitives), so any rank works.
   (cond
     ((null indices) (aref array))
     ((null (cdr indices)) (aref array (car indices)))
     ((null (cddr indices)) (aref array (car indices) (cadr indices)))
-    (t (error "AREF: too many indices (>3 dimensions not supported via funcall)"))))
+    ((null (cdddr indices)) (aref array (car indices) (cadr indices) (caddr indices)))
+    (t (row-major-aref array (apply #'array-row-major-index array indices)))))
 (defun length (x) (length x))
 (defun keywordp (x) (keywordp x))
 (defun char (s i) (char s i))
@@ -1318,15 +1323,27 @@ Also expands element types within compound type specifiers like (VECTOR etype si
        (let ((p (symbol-package sym)))
          (and p (string= (package-name p) "DOTNET")))))
 
-(defun %dotnet-static-type (x)
+(defun %dotnet-static-type (x &optional env)
   "If X statically denotes a typed .NET value, return (cons \"T\" EXPR) where
 EXPR evaluates to a .NET object of type \"T\". Recognizes:
   (the (dotnet \"T\") E)   -> E is already a .NET object  (cons \"T\" E)
   (dotnet:box E \"T\")      -> the box form yields a LispDotNetBoxed of T
   (dotnet:new \"T\" ...)    -> the new form yields a LispDotNetObject of T
+  bare symbol VAR         -> when ENV maps VAR's name to a type (a let/let*-bound
+                             local whose init was one of the above); the symbol
+                             itself evaluates to the typed object  (cons \"T\" VAR)
+  (dotnet:invoke R \"M\" ...) -> when R is itself statically typed and M's return
+                             type is a directable .NET reference/value type, the
+                             whole call yields a LispDotNetObject of that type
+                             (method chaining)  (cons RETURN-TYPE FORM)
 For box/new the whole form is the EXPR (it produces the wrapped object), so the
-typed direct call works without an explicit THE (dotcl/dotcl#42)."
+typed direct call works without an explicit THE (dotcl/dotcl#42). ENV is the .NET
+type environment supplied by the compiler (compiler/cil-compiler.lisp:
+DOTNET-VALID-TYPED-LOCALS), an alist (name-string . type-string)."
   (or (%dotnet-the-type x)
+      (and (symbolp x) env
+           (let ((ty (cdr (assoc (symbol-name x) env :test #'string=))))
+             (and ty (cons ty x))))
       (and (consp x)
            (cond
              ;; (dotnet:box E "T") — literal type in 3rd position
@@ -1338,23 +1355,48 @@ typed direct call works without an explicit THE (dotcl/dotcl#42)."
              ((and (%dotnet-in-pkg (car x) "NEW")
                    (consp (cdr x)) (stringp (cadr x)))
               (cons (cadr x) x))
+             ;; (dotnet:invoke R "M" ...) — typed-return propagation
+             ((%dotnet-in-pkg (car x) "INVOKE")
+              (let ((rty (%dotnet-invoke-return-type x env)))
+                (and rty (cons rty x))))
              (t nil)))))
+
+(defun %dotnet-invoke-return-type (x env)
+  "If X is (dotnet:invoke R \"M\" ARG...) with a statically typed receiver R and
+fully statically typed arguments, and M's resolved return type is directable
+(marshals to a LispDotNetObject — see runtime %DOTNET-METHOD-RETURN-TYPE), return
+that return-type string; else NIL. Mutually recursive with %DOTNET-STATIC-TYPE so
+chains of any depth resolve. The inner call need not itself lower to a direct
+callvirt: both the direct and the dynamic path return a LispDotNetObject of the
+return type, so the OUTER direct dispatch is sound either way."
+  (let ((recv (cadr x)) (method (caddr x)) (args (cdddr x)))
+    (and (stringp method)
+         (let ((rt (%dotnet-static-type recv env)))
+           (and rt
+                (let ((param-types '()) (ok t))
+                  (dolist (a args)
+                    (let ((at (%dotnet-static-type a env)))
+                      (if at (push (car at) param-types) (setf ok nil))))
+                  (and ok
+                       (%dotnet-method-return-type
+                        (car rt) method (reverse param-types)))))))))
 
 (defun %dotnet-invoke-direct-cm (form env)
   "Compiler macro for DOTNET:INVOKE: rewrite a fully type-declared call to
 %DOTNET-CALL-DIRECT; decline (return FORM) otherwise. The receiver and each
-argument may carry their type via THE, DOTNET:BOX, or DOTNET:NEW. The lowering
-is optimistic: the assembler resolves the exact overload and silently falls back
-to the dynamic path when it can't (unresolvable / runtime-defined type, value-type
-receiver, or no matching overload), so this never changes behaviour, only speed."
-  (declare (ignore env))
+argument may carry their type via THE, DOTNET:BOX, or DOTNET:NEW, or be a bare
+local variable whose type is known from its let/let* init form (ENV, the compiler-
+supplied .NET type environment). The lowering is optimistic: the assembler resolves
+the exact overload and silently falls back to the dynamic path when it can't
+(unresolvable / runtime-defined type, value-type receiver, or no matching
+overload), so this never changes behaviour, only speed."
   (let ((recv (cadr form)) (method (caddr form)) (args (cdddr form)))
-    (let ((rt (and (stringp method) (%dotnet-static-type recv))))
+    (let ((rt (and (stringp method) (%dotnet-static-type recv env))))
       (if (not rt)
           form
           (let ((param-types '()) (arg-exprs '()) (ok t))
             (dolist (a args)
-              (let ((at (%dotnet-static-type a)))
+              (let ((at (%dotnet-static-type a env)))
                 (if at
                     (progn (push (car at) param-types) (push (cdr at) arg-exprs))
                     (setf ok nil))))

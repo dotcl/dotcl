@@ -113,6 +113,26 @@ public class LispFunction : LispObject
         return result;
     }
 
+    /// <summary>Backtrace frames as Lisp lists (NAME arg0 arg1 ...), innermost
+    /// first, where the args are the ACTUAL captured LispObjects (not printed
+    /// strings). Backs DOTCL:BACKTRACE-WITH-ARGS so callers can inspect frame
+    /// arguments programmatically (cf. sb-debug:list-backtrace).</summary>
+    internal static LispObject[] GetCallStackWithArgs()
+    {
+        if (s_callStack is not { Count: > 0 } s) return Array.Empty<LispObject>();
+        var frames = s.ToArray();
+        var result = new LispObject[frames.Length];
+        for (int i = 0; i < frames.Length; i++)
+        {
+            var f = frames[i];
+            LispObject args = Nil.Instance;
+            for (int j = f.Argc - 1; j >= 0; j--)
+                args = new Cons(f.Arg(j) ?? Nil.Instance, args);
+            result[i] = new Cons(new LispString(f.Name), args);
+        }
+        return result;
+    }
+
     private static string FormatFrame(Frame f)
     {
         if (f.Argc == 0) return "(" + f.Name + ")";
@@ -134,7 +154,7 @@ public class LispFunction : LispObject
     {
         if (++_stackCheckCounter % 256 == 0)
         {
-            if (!RuntimeHelpers.TryEnsureSufficientExecutionStack())
+            if (!Compat.TryEnsureSufficientExecutionStack())
                 throw new LispErrorException(new LispProgramError(
                     $"Stack overflow in function {Name ?? "anonymous"}"));
             ConditionSystem.CheckInterrupt();
@@ -150,7 +170,7 @@ public class LispFunction : LispObject
     {
         if (++_stackCheckCounter % 256 == 0)
         {
-            if (!RuntimeHelpers.TryEnsureSufficientExecutionStack())
+            if (!Compat.TryEnsureSufficientExecutionStack())
                 throw new LispErrorException(new LispProgramError(
                     $"Stack overflow in function {Name ?? "anonymous"}"));
             ConditionSystem.CheckInterrupt();

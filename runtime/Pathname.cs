@@ -66,6 +66,19 @@ public class LispPathname : LispObject
         LispObject? name = null;
         LispObject? type = null;
 
+        // UNC path: "\\server\share\..." becomes "//server/share/..." after the
+        // separator normalization above. Capture the server as the host so it
+        // round-trips; otherwise the leading "//" is dropped by the
+        // RemoveEmptyEntries split below and the path resolves to a bogus local
+        // "\server\share\..." (directory returns nothing, probe-file is NIL). The
+        // share remains the first absolute directory component.
+        if (path.StartsWith("//") && path.Length > 2 && path[2] != '/')
+        {
+            int s = path.IndexOf('/', 2);
+            if (s > 2) { host = new LispString(path[2..s]); path = path[s..]; }
+            else { host = new LispString(path[2..]); path = "/"; }
+        }
+
         // Extract drive letter on Windows (e.g., "C:")
         if (path.Length >= 2 && path[1] == ':')
         {
@@ -134,6 +147,12 @@ public class LispPathname : LispObject
     public virtual string ToNamestring()
     {
         var sb = new System.Text.StringBuilder();
+
+        // UNC host (set by FromString for \\server\share\... paths): emit the
+        // "//server" prefix so the absolute directory below yields
+        // "//server/share/..." (which Path.GetFullPath resolves back to UNC).
+        if (Host is LispString uncHost)
+            sb.Append("//").Append(uncHost.Value);
 
         var deviceStr = StringValue(Device);
         if (deviceStr != null)

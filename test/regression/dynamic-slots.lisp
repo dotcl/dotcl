@@ -1,4 +1,4 @@
-;;; Custom slot-definition metaobject protocol (#264).
+;;; Custom slot-definition metaobject protocol.
 ;;; A reduced version of McCLIM's class-with-dynamic-slots metaclass, exercising
 ;;; direct-/effective-slot-definition-class, compute-effective-slot-definition,
 ;;; the allocate-instance override, and slot-value-using-class dispatch on a
@@ -84,7 +84,7 @@
 (defclass dynslot-widget ()
   ((x :dynamic t :accessor dynslot-x)
    (y :initarg :y :initform 99 :accessor dynslot-y)
-   ;; A dynamic slot WITH an initform — the McCLIM stream-recording-p case (#264).
+   ;; A dynamic slot WITH an initform — the McCLIM stream-recording-p case.
    (z :dynamic t :initform 5 :accessor dynslot-z))
   (:metaclass dynslot-metaclass))
 
@@ -148,7 +148,7 @@
     (list (dynslot-x w1) (dynslot-x w2)))
   (100 -1))
 
-;;; --- dynamic slot WITH initform (#264 stream-recording-p case, #272) ---
+;;; --- dynamic slot WITH initform (stream-recording-p case) ---
 ;;; The initform must be applied through (setf slot-value-using-class) so it
 ;;; reaches the dynamic backing store, with boundness via slot-boundp-using-class.
 

@@ -77,6 +77,16 @@ public static partial class Runtime
                 os.Writer.Write(result2);
                 if (_pprintActive) PprintTrackWrite(result2);
             }
+            // *standard-output* may be a Gray output stream (a CLOS instance, not a
+            // LispOutputStream) or another LispStream — route it through GetTextWriter,
+            // the same trampoline the explicit-stream path uses, so
+            // (format t ...) reaches it instead of leaking to the console.
+            else if (resolvedStream is LispStream
+                     || (resolvedStream is LispInstance gi && IsGrayOutputStream(gi)))
+            {
+                GetTextWriter(resolvedStream).Write(result2);
+                if (_pprintActive) PprintTrackWrite(result2);
+            }
             else
                 Console.Write(result2);
         }
@@ -86,14 +96,14 @@ public static partial class Runtime
                 GetTextWriter(s).Write(result2);
             if (_pprintActive) PprintTrackWrite(result2);
         }
-        else if (dest is LispStream)
+        // A built-in stream, OR a Gray output stream (a CLOS instance, not a
+        // LispStream): GetTextWriter trampolines the latter through
+        // GrayStreamTextWriter -> stream-write-string / stream-write-char, the same
+        // path write-string uses, so (format gray-stream ...) works.
+        else if (dest is LispStream || (dest is LispInstance gdi && IsGrayOutputStream(gdi)))
         {
-            try
-            {
-                GetTextWriter(dest).Write(result2);
-                if (_pprintActive) PprintTrackWrite(result2);
-            }
-            catch { throw new LispErrorException(new LispTypeError("FORMAT: invalid destination", dest)); }
+            GetTextWriter(dest).Write(result2);
+            if (_pprintActive) PprintTrackWrite(result2);
         }
         else
         {
@@ -306,7 +316,7 @@ public static partial class Runtime
     {
         // Apply scale factor: the printed value is value * 10^k
         double scaled = value * Math.Pow(10.0, k);
-        bool negative = double.IsNegative(scaled); // handles -0.0
+        bool negative = Compat.IsNegative(scaled); // handles -0.0
         double absVal = Math.Abs(scaled);
 
         string result;
@@ -559,7 +569,7 @@ public static partial class Runtime
     private static string FormatExponentialFloat(double value, int? w, int? d, int? e, int k,
         char? overflowChar, char padChar, char? exponentChar, bool atSign, bool isSingle, bool isDouble)
     {
-        bool negative = double.IsNegative(value);
+        bool negative = Compat.IsNegative(value);
         double absVal = Math.Abs(value);
 
         // Determine exponent character (CLHS default: E per prin1 convention)
@@ -927,6 +937,15 @@ public static partial class Runtime
                 os.Writer.Write(result);
                 if (_pprintActive) PprintTrackWrite(result);
             }
+            // Gray output stream / other LispStream bound to *standard-output*: route
+            // through GetTextWriter like the explicit-stream path so
+            // (format t ...) reaches it instead of the console.
+            else if (resolvedStream is LispStream
+                     || (resolvedStream is LispInstance gi && IsGrayOutputStream(gi)))
+            {
+                GetTextWriter(resolvedStream).Write(result);
+                if (_pprintActive) PprintTrackWrite(result);
+            }
             else
                 Console.Write(result);
         }
@@ -936,14 +955,13 @@ public static partial class Runtime
                 GetTextWriter(s).Write(result);
             if (_pprintActive) PprintTrackWrite(result);
         }
-        else if (dest is LispStream)
+        // A built-in stream, OR a Gray output stream (a CLOS instance, not a
+        // LispStream): GetTextWriter trampolines the latter through
+        // GrayStreamTextWriter so (format gray-stream ...) works.
+        else if (dest is LispStream || (dest is LispInstance gdi && IsGrayOutputStream(gdi)))
         {
-            try
-            {
-                GetTextWriter(dest).Write(result);
-                if (_pprintActive) PprintTrackWrite(result);
-            }
-            catch { throw new LispErrorException(new LispTypeError("FORMAT: invalid destination", dest)); }
+            GetTextWriter(dest).Write(result);
+            if (_pprintActive) PprintTrackWrite(result);
         }
         else
             throw new LispErrorException(new LispTypeError("FORMAT: invalid destination", dest));
@@ -1005,7 +1023,7 @@ public static partial class Runtime
                         while (i < template.Length && char.IsDigit(template[i]))
                             i++;
                         if (long.TryParse(template[numStart..i], out long lv))
-                            prefixParams.Add((int)Math.Clamp(lv, int.MinValue, int.MaxValue));
+                            prefixParams.Add((int)Compat.Clamp(lv, int.MinValue, int.MaxValue));
                         else
                             prefixParams.Add(template[numStart] == '-' ? int.MinValue : int.MaxValue);
                     }
@@ -1036,7 +1054,7 @@ public static partial class Runtime
                         if (argIdx < args.Length)
                         {
                             var a = args[argIdx++];
-                            if (a is Fixnum fv) resolvedParams[pi] = (int)Math.Clamp(fv.Value, int.MinValue, int.MaxValue);
+                            if (a is Fixnum fv) resolvedParams[pi] = (int)Compat.Clamp(fv.Value, int.MinValue, int.MaxValue);
                             else if (a is Bignum) resolvedParams[pi] = a; // keep Bignum for ~^ comparison
                             else if (a is LispChar cv) resolvedParams[pi] = cv.Value;
                             else if (a is Nil) resolvedParams[pi] = null;
@@ -1641,7 +1659,7 @@ public static partial class Runtime
                             {
                                 int ci = args[argIdx] is Nil ? 0 : 1;
                                 if (ci < clauses.Count)
-                                    sb.Append(FormatString(clauses[ci], args[(argIdx + 1)..]));
+                                    sb.Append(FormatString(clauses[ci], args.SubArray((argIdx + 1))));
                                 argIdx++;
                             }
                         }
@@ -1672,9 +1690,9 @@ public static partial class Runtime
                             }
 
                             if (ci >= 0 && ci < clauses.Count)
-                                sb.Append(FormatString(clauses[ci], consumed ? args[(argIdx + 1)..] : args[argIdx..]));
+                                sb.Append(FormatString(clauses[ci], consumed ? args.SubArray((argIdx + 1)) : args.SubArray(argIdx)));
                             else if (hasDefault && clauses.Count > 0)
-                                sb.Append(FormatString(clauses[clauses.Count - 1], consumed ? args[(argIdx + 1)..] : args[argIdx..]));
+                                sb.Append(FormatString(clauses[clauses.Count - 1], consumed ? args.SubArray((argIdx + 1)) : args.SubArray(argIdx)));
 
                             if (consumed)
                                 argIdx++;
@@ -1725,7 +1743,7 @@ public static partial class Runtime
                         {
                             // ~@{~}: first arg = format string/function, remaining args used directly
                             var fmtArg = args[argIdx++];
-                            var remainArr = args[argIdx..];
+                            var remainArr = args.SubArray(argIdx);
                             int elemIdx = 0;
                             FormatIterateFlat(fmtArg, remainArr, ref elemIdx, maxIter, forceOnce, sb, ref iterCount);
                             argIdx += elemIdx;
@@ -1781,7 +1799,7 @@ public static partial class Runtime
                             // ~@{body~}: use remaining args directly, consuming multiple per iteration
                             while ((argIdx < args.Length || (forceOnce && iterCount == 0)) && (maxIter < 0 || iterCount < maxIter))
                             {
-                                var iterArgs = args[argIdx..];
+                                var iterArgs = args.SubArray(argIdx);
                                 int subIdx = 0;
                                 try
                                 {
@@ -1858,7 +1876,7 @@ public static partial class Runtime
                                 int elemIdx = 0;
                                 while ((elemIdx < elemArr.Length || (forceOnce && iterCount == 0)) && (maxIter < 0 || iterCount < maxIter))
                                 {
-                                    var iterArgs = elemArr[elemIdx..];
+                                    var iterArgs = elemArr.SubArray(elemIdx);
                                     int subIdx = 0;
                                     try
                                     {
@@ -2049,7 +2067,7 @@ public static partial class Runtime
                         int caseSubIdx = 0;
                         try
                         {
-                            inner = FormatString(body2, args[argIdx..], ref caseSubIdx);
+                            inner = FormatString(body2, args.SubArray(argIdx), ref caseSubIdx);
                         }
                         catch (FormatUpAndOutException ex)
                         {
@@ -2128,7 +2146,7 @@ public static partial class Runtime
                                     if (atMod)
                                     {
                                         // ~@<...~:>: use remaining format args directly
-                                        bodyArgs = args[argIdx..];
+                                        bodyArgs = args.SubArray(argIdx);
                                         argIdx = args.Length;
                                     }
                                     else
@@ -2327,7 +2345,7 @@ public static partial class Runtime
                             try
                             {
                                 int secArgIdx = 0;
-                                string formatted = FormatString(sec, args[localArgIdx..], ref secArgIdx);
+                                string formatted = FormatString(sec, args.SubArray(localArgIdx), ref secArgIdx);
                                 formattedSections.Add(formatted);
                                 localArgIdx += secArgIdx;
                             }
@@ -3204,7 +3222,7 @@ public static partial class Runtime
         {
             while ((elemIdx < elemArr.Length || (forceOnce && iterCount == 0)) && (maxIter < 0 || iterCount < maxIter))
             {
-                var iterArgs = elemArr[elemIdx..];
+                var iterArgs = elemArr.SubArray(elemIdx);
                 var callArgs = new LispObject[iterArgs.Length + 1];
                 var strStream = new System.IO.StringWriter();
                 callArgs[0] = new LispOutputStream(strStream);
@@ -3224,7 +3242,7 @@ public static partial class Runtime
             string indirectFmt = fmtArg is LispString ls ? ls.Value : FormatTop(fmtArg, false);
             while ((elemIdx < elemArr.Length || (forceOnce && iterCount == 0)) && (maxIter < 0 || iterCount < maxIter))
             {
-                var iterArgs = elemArr[elemIdx..];
+                var iterArgs = elemArr.SubArray(elemIdx);
                 int subIdx = 0;
                 try
                 {

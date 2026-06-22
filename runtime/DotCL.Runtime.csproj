@@ -6,9 +6,23 @@
          for broader reach incl. AOT (NativeAOT/IL2CPP) and Unity's CoreCLR backend;
          the FASL emitter (PersistedAssemblyBuilder, .NET 9+) is #if'd out there, so
          the net8.0 build runs precompiled .fasl but cannot compile-file. -->
-    <TargetFrameworks>net10.0;net8.0</TargetFrameworks>
+    <!-- netstandard2.0 = emit-free runtime (no System.Reflection.Emit): runs
+         precompiled .fasl and (eventually) interprets dynamic code, for the widest
+         reach incl. Unity/IL2CPP. The emit/JIT path (Emitter/*, compile-file, eval-
+         via-compile, runtime define-class) is gated behind the DOTCL_EMIT constant. -->
+    <TargetFrameworks>net10.0;net8.0;netstandard2.0</TargetFrameworks>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <!-- ns2.0 defaults to C# 7.3; force latest so only real BCL-API gaps surface. -->
+    <LangVersion>latest</LangVersion>
+  </PropertyGroup>
+
+  <!-- DOTCL_EMIT: the Reflection.Emit-based JIT/compiler is available. Defined for
+       every target EXCEPT netstandard2.0 (which has no System.Reflection.Emit). -->
+  <PropertyGroup Condition="'$(TargetFramework)' != 'netstandard2.0'">
+    <DefineConstants>$(DefineConstants);DOTCL_EMIT</DefineConstants>
+  </PropertyGroup>
+  <PropertyGroup>
 
     <PackageId>DotCL.Runtime</PackageId>
     <!-- <Version> comes from runtime/Directory.Build.props (single source of truth). -->
@@ -47,17 +61,38 @@
           Condition="Exists('contrib')" Pack="true" PackagePath="dotclassets/contrib/" />
     <None Include="build/DotCL.Runtime.targets" Pack="true" PackagePath="build/" />
     <None Include="build/DotCL.Runtime.targets" Pack="true" PackagePath="buildTransitive/" />
-    <!-- Project-core build (#307): the targets that drive the in-process tasks,
-         and the task assembly itself under tools-like tasks/. The task is built
-         separately (it ProjectReferences this library) by `make pack` before
-         dotnet pack runs; Condition=Exists keeps a plain `dotnet pack` (without
-         the task built) from failing — it just omits the project-core feature. -->
+    <!-- Project-core build: the targets that drive the in-process tasks. The task
+         assembly itself (tasks/DotCL.Build.Tasks.dll) is built and added to the
+         package by the _PackProjectCoreTask target below, which ERRORS if the build
+         didn't produce it — so the package can never silently ship without the task.
+         A previous release (0.1.12) shipped without it: the old item was guarded by
+         Condition=Exists, so when the task hadn't been built at pack time it was
+         dropped silently, and consumers using it as a build task hit MSB4036 (#44). -->
     <None Include="build/DotCL.Runtime.ProjectCore.targets" Pack="true" PackagePath="build/" />
     <None Include="build/DotCL.Runtime.ProjectCore.targets" Pack="true" PackagePath="buildTransitive/" />
+    <!-- The task assembly. Unconditional (no Condition=Exists): _PackProjectCoreTask
+         below builds it before pack copies files; if that build fails to produce it,
+         pack errors on the missing file instead of silently dropping it (#44). -->
     <None Include="build-tasks/bin/$(Configuration)/net10.0/DotCL.Build.Tasks.dll"
-          Condition="Exists('build-tasks/bin/$(Configuration)/net10.0/DotCL.Build.Tasks.dll')"
           Pack="true" PackagePath="tasks/" />
   </ItemGroup>
+
+  <!-- Build the in-process project-core MSBuild task and pack it under tasks/.
+       Runs before pack collects files. The task ProjectReferences this library, so
+       it can only be built after this project — hence a pack-time MSBuild call here
+       rather than a ProjectReference. Fails loudly if the DLL is missing instead of
+       silently shipping a package whose targets reference a non-existent task. -->
+  <Target Name="_PackProjectCoreTask" BeforeTargets="GenerateNuspec">
+    <MSBuild Projects="$(MSBuildThisFileDirectory)build-tasks/DotCL.Build.Tasks.csproj"
+             Properties="Configuration=$(Configuration)" Targets="Restore" />
+    <MSBuild Projects="$(MSBuildThisFileDirectory)build-tasks/DotCL.Build.Tasks.csproj"
+             Properties="Configuration=$(Configuration)" Targets="Build" />
+    <PropertyGroup>
+      <_DotclTaskDll>$(MSBuildThisFileDirectory)build-tasks/bin/$(Configuration)/net10.0/DotCL.Build.Tasks.dll</_DotclTaskDll>
+    </PropertyGroup>
+    <Error Condition="!Exists('$(_DotclTaskDll)')"
+           Text="Project-core MSBuild task not found at $(_DotclTaskDll) after building build-tasks. The package would ship without tasks/DotCL.Build.Tasks.dll and break for build-task consumers (#44)." />
+  </Target>
 
   <!-- Exclude Program.cs — entry point lives in the dotcl tool project -->
   <ItemGroup>
@@ -84,18 +119,56 @@
     <Compile Include="Generated/UnicodeCharNames.g.cs" />
   </ItemGroup>
 
-  <!-- Windows-only sources excluded for non-Windows RID builds -->
-  <PropertyGroup Condition="$(RuntimeIdentifier.StartsWith('android')) Or $(RuntimeIdentifier.StartsWith('linux')) Or $(RuntimeIdentifier.StartsWith('osx')) Or '$(OS)' != 'Windows_NT'">
+  <!-- Windows-only sources excluded for non-Windows RID builds and for ns2.0
+       (no System.Windows.Forms). -->
+  <PropertyGroup Condition="$(RuntimeIdentifier.StartsWith('android')) Or $(RuntimeIdentifier.StartsWith('linux')) Or $(RuntimeIdentifier.StartsWith('osx')) Or '$(OS)' != 'Windows_NT' Or '$(TargetFramework)' == 'netstandard2.0'">
     <DefineConstants>$(DefineConstants);DOTCL_NO_WINFORMS</DefineConstants>
   </PropertyGroup>
-  <ItemGroup Condition="$(RuntimeIdentifier.StartsWith('android')) Or $(RuntimeIdentifier.StartsWith('linux')) Or $(RuntimeIdentifier.StartsWith('osx')) Or '$(OS)' != 'Windows_NT'">
+  <ItemGroup Condition="$(RuntimeIdentifier.StartsWith('android')) Or $(RuntimeIdentifier.StartsWith('linux')) Or $(RuntimeIdentifier.StartsWith('osx')) Or '$(OS)' != 'Windows_NT' Or '$(TargetFramework)' == 'netstandard2.0'">
     <Compile Remove="Runtime.WinForms.cs" />
+  </ItemGroup>
+
+  <!-- Emit-free (netstandard2.0): exclude the purely Reflection.Emit-based sources.
+       FaslAssembler (compile-file), CompilerEnv (assembler env), IlDisasm (disasm)
+       have no non-emit callers. CilAssembler is split: CilAssembler.cs keeps the
+       function registry / constant pool / runtime-codegen guards (used everywhere,
+       emit-free) and stays; CilAssembler.Emit.cs holds the ILGenerator body and is
+       removed here. compile-file / save-application in Runtime.Misc.cs are gated by
+       #if DOTCL_EMIT. -->
+  <ItemGroup Condition="'$(TargetFramework)' == 'netstandard2.0'">
+    <Compile Remove="Emitter/FaslAssembler.cs" />
+    <Compile Remove="Emitter/CompilerEnv.cs" />
+    <Compile Remove="Emitter/IlDisasm.cs" />
+    <Compile Remove="Emitter/CilAssembler.Emit.cs" />
+    <!-- Runtime .NET class generation (AssemblyBuilder/TypeBuilder) — emit-only;
+         dotnet:define-class throws on this target (guarded in Runtime.DotNet.cs). -->
+    <Compile Remove="Emitter/DynamicClassBuilder.cs" />
+    <!-- Dynamic native FFI (DynamicMethod + calli) — emit-only. -->
+    <Compile Remove="Runtime.FFI.cs" />
   </ItemGroup>
 
   <ItemGroup>
     <ProjectReference Include="../runtime.docgen/runtime.docgen.csproj"
                       OutputItemType="Analyzer"
                       ReferenceOutputAssembly="false" />
+  </ItemGroup>
+
+  <!-- DotclNoJson: build a JSON-free runtime — drops dotnet:require (NuGet load)
+       and its only dependency, System.Text.Json. Used for targets whose BCL lacks
+       System.Text.Json and that can't load NuGet at run time anyway (Unity IL2CPP/
+       WebGL): build with -p:DotclNoJson=true. Off by default. -->
+  <PropertyGroup Condition="'$(DotclNoJson)' == 'true'">
+    <DefineConstants>$(DefineConstants);DOTCL_NO_JSON</DefineConstants>
+  </PropertyGroup>
+  <ItemGroup Condition="'$(DotclNoJson)' == 'true'">
+    <Compile Remove="Runtime.NuGet.cs" />
+  </ItemGroup>
+
+  <!-- System.Text.Json ships in-box on net5.0+, but ns2.0 needs the NuGet package
+       (used by Runtime.NuGet.cs for package-manifest parsing). Omitted for the
+       JSON-free build. -->
+  <ItemGroup Condition="'$(TargetFramework)' == 'netstandard2.0' And '$(DotclNoJson)' != 'true'">
+    <PackageReference Include="System.Text.Json" Version="8.0.5" />
   </ItemGroup>
 
   <!-- Auto-generate UnicodeCharNames.g.cs if missing.

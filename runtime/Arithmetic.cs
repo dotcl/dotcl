@@ -274,7 +274,7 @@ public static class Arithmetic
                 mantissa++;
                 if ((int)mantissa.GetBitLength() > 53) { mantissa >>= 1; shift++; }
             }
-            result = Math.ScaleB((double)(ulong)mantissa, shift);
+            result = Compat.ScaleB((double)(ulong)mantissa, shift);
         }
         return negative ? -result : result;
     }
@@ -352,7 +352,7 @@ public static class Arithmetic
         if (q.IsZero) return negative ? -0.0 : 0.0;
 
         // Value is q * 2^-shift. Math.ScaleB handles subnormal range.
-        double result = Math.ScaleB((double)(ulong)q, -shift);
+        double result = Compat.ScaleB((double)(ulong)q, -shift);
         if (double.IsInfinity(result))
             return negative ? double.NegativeInfinity : double.PositiveInfinity;
         return negative ? -result : result;

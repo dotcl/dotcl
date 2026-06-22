@@ -1,0 +1,10 @@
+<!-- Keep the emit-free runtime and the two build-time-linked Lisp images whole.
+     Their CompiledModule.ModuleInit (and the runtime's reflected members) are
+     reached only via reflection (DotclHost.RunLinkedModuleByName), so IL2CPP's
+     managed-code stripper must not remove them — the IL2CPP analogue of the
+     <TrimmerRootAssembly> entries in samples/PrecompiledLispDemoAot. -->
+<linker>
+  <assembly fullname="DotCL.Runtime" preserve="all" />
+  <assembly fullname="dotclcore" preserve="all" />
+  <assembly fullname="appfasl" preserve="all" />
+</linker>

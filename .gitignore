@@ -29,6 +29,9 @@ bench-state.json
 
 ## temp Scripts
 *.sh
+# …but committed tooling scripts are kept.
+!scripts/ilverify-check.sh
+!samples/**/*.sh
 
 ## qlot (dependency management)
 qlfile

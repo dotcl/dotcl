@@ -1,4 +1,4 @@
-;;; Regression tests for D894 — dotnet:call-out: ref/out parameter support (#190)
+;;; Regression tests for dotnet:call-out: ref/out parameter support
 
 ;;; Int32.TryParse(string, out int) — static, successful parse
 (deftest d894-try-parse-success
@@ -38,7 +38,7 @@
       (list (not found) val)))
   (t 0))
 
-;;; D1119 (dotcl/dotcl#17) — dotnet:resolve-type exposes ResolveDotNetType.
+;;; dotnet:resolve-type exposes ResolveDotNetType (dotcl/dotcl#17).
 (deftest d1119-resolve-type-fullname
   (dotnet:invoke (dotnet:resolve-type "System.String") "get_FullName")
   "System.String")
@@ -58,7 +58,7 @@
     (type-error () t))
   t)
 
-;;; #304 — BCL types whose assembly is not the corelib and whose name doesn't
+;;; BCL types whose assembly is not the corelib and whose name doesn't
 ;;; match its assembly (System.Collections.Queue lives in
 ;;; System.Collections.NonGeneric) must resolve via mscorlib/netstandard facade
 ;;; forwarding, NOT fall through to the COM ProgID path. Queue is registered as a
@@ -76,7 +76,7 @@
     (dotnet:invoke q "get_Count"))
   2)
 
-;;; #303 — typed array interop: dotnet:new-array builds a T[], and a Lisp
+;;; Typed array interop: dotnet:new-array builds a T[], and a Lisp
 ;;; list/vector auto-marshals to an array-typed parameter/property.
 (deftest issue303-new-array-string
   ;; new-array "System.String" -> string[]; passes into String.Join(string,string[]).
@@ -120,7 +120,7 @@
       (dotnet:invoke (dotnet:invoke h "get_Tags") "get_Length")))
   2)
 
-;;; #302 — enum-typed parameters marshal from a Lisp integer, name string, or
+;;; Enum-typed parameters marshal from a Lisp integer, name string, or
 ;;; symbol/keyword (Enum.Parse, case-insensitive, incl. flag combinations). Needed
 ;;; so callers can pass RoutingStrategies / StringComparison without first fetching
 ;;; the enum field object. String.Equals(string,string,StringComparison): 5 =
@@ -150,7 +150,7 @@
   (dotnet:invoke (dotnet:box 3 "System.IO.FileShare") "ToString")
   "ReadWrite")
 
-;;; D1120 (dotcl/dotcl#25) — DOTNET: built-ins carry function docstrings.
+;;; DOTNET: built-ins carry function docstrings (dotcl/dotcl#25).
 (deftest d1120-dotnet-invoke-has-doc
   (and (stringp (documentation 'dotnet:invoke 'function)) t)
   t)
@@ -170,7 +170,7 @@
            (setf (documentation 'dotnet:box 'function) nil)))
   "custom")
 
-;;; D1123 (dotcl/dotcl#24) — dotnet:invoke / dotnet:static may omit C# optional
+;;; dotnet:invoke / dotnet:static may omit C# optional (dotcl/dotcl#24)
 ;;; parameters; the missing trailing args are filled with their declared defaults.
 ;;; DotCL.TestSupport.OptionalArgs exists in DEBUG builds only (the test runner).
 (deftest d1123-invoke-all-defaults
@@ -196,7 +196,7 @@
   (dotnet:static "DotCL.TestSupport.OptionalArgs" "StaticAdd" 1)
   6)
 
-;;; #294: dotnet:new overload scoring must consider assignability of a wrapped
+;;; dotnet:new overload scoring must consider assignability of a wrapped
 ;;; .NET arg, so a MemoryStream picks StreamReader(Stream), not StreamReader(string)
 ;;; (which would fail with "Object must implement IConvertible").
 (deftest issue294-ctor-assignable-wrapped-arg

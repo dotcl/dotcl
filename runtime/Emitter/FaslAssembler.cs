@@ -707,8 +707,11 @@ public class FaslAssembler
         }
     }
 
-    /// <summary>Write the assembled .fasl to the given output path</summary>
-    public void Save(string outputPath)
+    /// <summary>Write the assembled .fasl to the given output path. When
+    /// <paramref name="retargetCorlib"/> is non-null, the saved image's corlib
+    /// reference is rewritten to that facade (only "netstandard" is supported) so
+    /// the fasl loads on BCLs without System.Private.CoreLib (Unity IL2CPP/WebGL).</summary>
+    public void Save(string outputPath, string? retargetCorlib = null)
     {
 #if !NET9_0_OR_GREATER
         throw new PlatformNotSupportedException(
@@ -730,6 +733,8 @@ public class FaslAssembler
             Console.Error.WriteLine($"[FaslAssembler] Unique string bytes tracked: {_structInternMap.UniqueStringBytes:N0}");
             throw;
         }
+        if (retargetCorlib != null)
+            FaslCorlibRetarget.RetargetCorlib(outputPath, retargetCorlib);
 #endif
     }
 

@@ -1,7 +1,7 @@
-;;; D656 Phase A — multi-thread safety regression tests.
+;;; Multi-thread safety regression tests.
 ;;; Verifies that concurrent INTERN, MAKE-INSTANCE, SETF DOCUMENTATION,
 ;;; and GENTEMP do not corrupt their shared dictionaries / counters.
-;;; Prior to D656 these would crash with Dictionary enumeration/modification
+;;; These used to crash with Dictionary enumeration/modification
 ;;; races. The test is deterministic: each helper runs 4 threads x 500-1000
 ;;; iterations and simply verifies completion without exception.
 
@@ -65,7 +65,7 @@
     t)
   t)
 
-;;; D657 Phase D — bordeaux-threads API additions: condition-var, semaphore,
+;;; bordeaux-threads API additions: condition-var, semaphore,
 ;;; recursive-lock, thread-yield.
 
 (deftest d657-recursive-lock-reentry
@@ -150,7 +150,7 @@
   (progn (dotcl-thread:thread-yield) :ok)
   :ok)
 
-;;; D658 Phase C — synchronized hash-tables.
+;;; Synchronized hash-tables.
 
 (deftest d658-synchronized-ht-basic
   (let ((ht (make-hash-table :synchronized t :test 'equal)))
@@ -173,8 +173,8 @@
     (hash-table-count ht))
   800)
 
-;;; D659 Phase B — per-thread dynamic binding isolation.
-;;; Before D659: (let ((*x* ...)) ...) wrote to Symbol.Value which was shared
+;;; Per-thread dynamic binding isolation.
+;;; Previously (let ((*x* ...)) ...) wrote to Symbol.Value which was shared
 ;;; across threads, so concurrent bindings of the same special corrupted each
 ;;; other (and Push/Pop of the linked-list stack could crash).
 
@@ -222,7 +222,7 @@
     (car errors))
   0)
 
-;;; D952 — thread identity and all-threads registry
+;;; Thread identity and all-threads registry
 
 (deftest d952-thread-join-returns-value
   ;; join-thread must return the thread function's return value
@@ -248,7 +248,7 @@
       found))
   t)
 
-;;; D660 soak — multi-pattern concurrent stress tests on dotcl-thread.
+;;; Multi-pattern concurrent stress tests on dotcl-thread.
 
 ;;; Dining philosophers: N=5, ordered-acquire avoids deadlock.
 (defun %d660-phil-body (ci n forks eat-counts rounds)
@@ -329,7 +329,7 @@
   ;;         = 19900      + 2019900 = 2039800
   2039800)
 
-;;; D1124 (dotcl/dotcl#26) — dotcl:thread-object exposes the underlying .NET Thread.
+;;; #26 — dotcl:thread-object exposes the underlying .NET Thread.
 (deftest d1124-thread-object-managed-id
   (let ((th (dotcl:make-thread (lambda () 42) :name "d1124")))
     (prog1 (integerp (dotnet:invoke (dotcl:thread-object th) "get_ManagedThreadId"))
@@ -347,7 +347,7 @@
     (error () t))
   t)
 
-;;; D1145 (#278) — concurrent GF dispatch must not tear the method set.
+;;; Concurrent GF dispatch must not tear the method set.
 ;;; GenericFunction.Methods was a plain List<T>; a dispatch enumerating it while
 ;;; another thread ADD/REMOVE-METHOD mutated it threw "Collection was modified"
 ;;; (surfacing in McCLIM as spurious CALL-NEXT-METHOD: no next method). Now the
@@ -381,8 +381,8 @@
     *%d1145-err*)
   nil)
 
-;;; #300: ALL threads concurrently REMOVE-METHOD + ADD-METHOD the same method (unlike
-;;; d1145's single churner). A TOCTOU on method.Owner in ADD-METHOD used to deref null
+;;; ALL threads concurrently REMOVE-METHOD + ADD-METHOD the same method (unlike
+;;; the single-churner test above). A TOCTOU on method.Owner in ADD-METHOD used to deref null
 ;;; and crash with a .NET NullReferenceException. Clean Lisp errors from a transiently
 ;;; empty method list are acceptable; a raw "Object reference" NRE is not.
 (defclass %i300-a () ())
@@ -407,4 +407,47 @@
       (let ((ths (loop repeat 4 collect (dotcl:make-thread #'worker :name "i300-w"))))
         (dolist (th ths) (dotcl:thread-join th))))
     *%i300-nre*)
+  nil)
+
+;;; residual race: NO method mutation, pure concurrent dispatch.
+;;; (call-next-method)/(next-method-p) used to be handed to a method body by mutating
+;;; the GLOBAL symbol-functions of CALL-NEXT-METHOD/NEXT-METHOD-P just before invoking
+;;; the method, which captured them via (symbol-function 'call-next-method). A second
+;;; thread dispatching concurrently clobbered that global mid-window, so the victim
+;;; captured the wrong closure — or the single-primary fast path's "no next method"
+;;; stub — and signalled a spurious CALL-NEXT-METHOD: no next method. The handoff is
+;;; now thread-local (%captured-call-next-method / Runtime.CapturedCnm).
+;;;   Thread A hammers a deep call-next-method chain; thread B hammers a single-primary
+;;; leaf GF (whose fast path installs the "no next method" default). A correct dispatch
+;;; NEVER errors and always returns (:c :b . :base).
+(defclass %i315-a () ())
+(defclass %i315-b (%i315-a) ())
+(defclass %i315-c (%i315-b) ())
+(defgeneric %i315-deep (x))
+(defmethod %i315-deep ((x %i315-a)) :base)
+(defmethod %i315-deep ((x %i315-b)) (cons :b (call-next-method)))
+(defmethod %i315-deep ((x %i315-c)) (cons :c (call-next-method)))
+(defgeneric %i315-leaf (x))
+(defmethod %i315-leaf ((x %i315-a)) :leaf)
+(defparameter *%i315-c* (make-instance '%i315-c))
+(defparameter *%i315-a* (make-instance '%i315-a))
+(defparameter *%i315-err* nil)
+
+(deftest i315-concurrent-cnm-no-global-clobber
+  (progn
+    (setf *%i315-err* nil)
+    (flet ((deep ()
+             (dotimes (i 100000)
+               (handler-case
+                   (let ((r (%i315-deep *%i315-c*)))
+                     (unless (equal r '(:c :b . :base))
+                       (setf *%i315-err* (list :bad r))))
+                 (error (e) (setf *%i315-err* (princ-to-string e))))))
+           (leaf ()
+             (dotimes (i 100000) (%i315-leaf *%i315-a*))))
+      (let ((ths (list (dotcl:make-thread #'deep :name "i315-deep")
+                       (dotcl:make-thread #'leaf :name "i315-leaf")
+                       (dotcl:make-thread #'deep :name "i315-deep2"))))
+        (dolist (th ths) (dotcl:thread-join th))))
+    *%i315-err*)
   nil)

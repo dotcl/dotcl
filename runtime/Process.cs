@@ -165,7 +165,7 @@ public sealed class LispProcess : LispObject
             RedirectStandardOutput = !IsInherit(output),
             RedirectStandardError = !IsInherit(error),
         };
-        foreach (var a in arguments) psi.ArgumentList.Add(a);
+        foreach (var a in arguments) Compat.AddArg(psi, a);
         if (!string.IsNullOrEmpty(directory)) psi.WorkingDirectory = directory;
 
         var proc = System.Diagnostics.Process.Start(psi)!;

@@ -3,6 +3,80 @@
 User-facing release notes for dotcl. Each section corresponds to a tagged
 release on the public mirror (dotcl/dotcl).
 
+## v0.1.13 — 2026-06-21
+
+### Run precompiled Lisp where runtime code generation is forbidden (NativeAOT / IL2CPP)
+
+dotcl now runs on platforms that ban `Reflection.Emit` entirely. The
+`netstandard2.0` runtime build contains no emitter; a tree-walk interpreter
+evaluates `eval` / `defun` / `defmacro` / CLOS at run time with no code
+generation, while precompiled `.fasl` images run as ordinary linked assemblies.
+The new `samples/PrecompiledLispDemoAot` ships precompiled Lisp inside a single
+**NativeAOT** native binary — `IsDynamicCodeSupported` is `False`, no JIT, no
+`Assembly.LoadFrom` — and still evaluates new `defun` / `defmacro` / CLOS at run
+time. The same path runs under Unity's **IL2CPP** backend, including WebGL in the
+browser — `samples/PrecompiledLispDemoWebGL` draws a curve whose every point is
+computed by precompiled Lisp each frame, and reshapes it live from Lisp typed
+into the page.
+
+### Build-task package fixed
+
+The `DotCL.Runtime` 0.1.12 package shipped without its in-process MSBuild task, so
+referencing it as a build task failed with `MSB4036`. 0.1.13 includes the task,
+and the package build now fails loudly if the task assembly is ever missing rather
+than shipping a broken package.
+
+### Declaring build-time dependencies
+
+A project-core build no longer scans your `~/quicklisp` (or Roswell) directories —
+a build, and a shipped binary, shouldn't silently depend on whatever happens to be
+installed on the build machine. To make external ASDF systems discoverable for a
+build, add a `<DotclBuildInit>` item pointing at a Lisp script the build loads
+before resolving dependencies:
+
+```xml
+<ItemGroup>
+  <DotclBuildInit Include="build-setup.lisp" />
+</ItemGroup>
+```
+
+The script can `(pushnew … asdf:*central-registry*)`, boot quicklisp, or do
+whatever your project needs — build-time only, so the shipped binary never reaches
+into your home directory. (Because `.asd` files are Lisp, you can equivalently put
+that setup at the top of your `.asd`.)
+
+### Quicklisp
+
+Fixed a compiler bug — incorrect shadowing across the function/value namespaces —
+that blocked loading quicklisp. The quicklisp-client portability patch is
+submitted upstream.
+
+### Gray streams
+
+`format`, `princ` / `prin1` / `print` / `write`, `open-stream-p`, and
+`interactive-stream-p` now funnel through the Gray stream protocol instead of
+leaking to the console or signaling "not a stream", and Gray stream detection is
+robust to a same-named class loaded from another package (for example after
+loading `trivial-gray-streams`).
+
+### .NET interop
+
+Typed `dotnet:invoke` infers the receiver type from `let`-bound variables and
+propagates it through method chains for direct, boxing-free calls; new
+`dotnet:hint-type` / `dotnet:object-type` accessors; `dotnet:box` marshals a
+primitive to an implemented interface type; and an unhandled condition crossing a
+C# → Lisp callback boundary is caught instead of crashing the host.
+
+### Other fixes
+
+`get-setf-expansion` returns multiple store variables for the `defsetf` long form;
+`#'aref` works through `funcall` / `apply` at any rank; a `call-next-method`
+concurrency race is fixed and explicit arguments are honored from `:around`
+methods; and `dotcl:backtrace-with-args` adds argument values to backtraces.
+Windows UNC paths (`\\server\share\…`) now work with `directory`, `probe-file`,
+and related operations — the server is kept as the pathname host instead of being
+mis-parsed as a local directory.
+
 ## v0.1.12 — 2026-06-18
 
 ### Precompile your Lisp from a plain PackageReference

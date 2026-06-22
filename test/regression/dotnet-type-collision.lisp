@@ -41,3 +41,60 @@
   (let ((sb (dotnet:new "System.Text.StringBuilder")))
     (string= (string (class-name (class-of sb))) "StringBuilder"))
   t)
+
+;;; (part2): expose the boxed hint type and the actual instance type.
+;;; dotnet:box keeps a user-supplied static hint type for overload resolution,
+;;; while the wrapped value's real type may differ. dotnet:hint-type returns the
+;;; hint (NIL if none); dotnet:object-type returns the actual runtime type.
+
+;; Boxed value: hint and actual differ and are both retrievable as System.Type.
+(deftest d286-boxed-hint-vs-object-type
+  (let ((b (dotnet:box "hi" "System.Object")))
+    (list (dotnet:invoke (dotnet:hint-type b) "get_FullName")
+          (dotnet:invoke (dotnet:object-type b) "get_FullName")))
+  ("System.Object" "System.String"))
+
+;; A plain .NET object carries no hint -> hint-type is NIL; object-type is actual.
+(deftest d286-plain-object-no-hint
+  (let ((sb (dotnet:new "System.Text.StringBuilder")))
+    (list (dotnet:hint-type sb)
+          (dotnet:invoke (dotnet:object-type sb) "get_FullName")))
+  (nil "System.Text.StringBuilder"))
+
+;; Non-.NET Lisp values: both accessors return NIL rather than erroring.
+(deftest d286-non-dotnet-values
+  (list (dotnet:hint-type 42) (dotnet:object-type "lisp-string"))
+  (nil nil))
+
+;; The hint type is a usable System.Type (its members are callable downstream).
+(deftest d286-hint-type-is-a-type
+  (let ((b (dotnet:box "hi" "System.Object")))
+    (list (dotnet:invoke (dotnet:hint-type b) "get_Name")
+          (dotnet:invoke (dotnet:hint-type b) "get_IsInterface")))
+  ("Object" nil))
+
+;;; dotnet:box of a primitive to an interface/base type it implements.
+;;; Previously "Cannot convert Fixnum to IComparable" — LispToDotNet only handled
+;;; concrete primitive targets. Now a primitive boxes at its natural .NET type when
+;;; the target is assignable from it.
+
+;; int -> IComparable (the original failing case): boxes, hint kept, actual is Int64.
+(deftest d313-box-int-to-interface
+  (let ((b (dotnet:box 7 "System.IComparable")))
+    (list (dotnet:invoke (dotnet:hint-type b) "get_Name")
+          (dotnet:invoke (dotnet:object-type b) "get_FullName")))
+  ("IComparable" "System.Int64"))
+
+;; double / string to a shared interface also marshal.
+(deftest d313-box-double-to-interface
+  (dotnet:invoke (dotnet:object-type (dotnet:box 3.5d0 "System.IComparable")) "get_FullName")
+  "System.Double")
+
+(deftest d313-box-string-to-interface
+  (dotnet:invoke (dotnet:object-type (dotnet:box "hi" "System.IConvertible")) "get_FullName")
+  "System.String")
+
+;; Concrete primitive targets are unaffected.
+(deftest d313-box-concrete-unaffected
+  (dotnet:invoke (dotnet:object-type (dotnet:box 9 "System.Int32")) "get_FullName")
+  "System.Int32")

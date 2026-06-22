@@ -1548,20 +1548,9 @@ public static partial class Runtime
         LispObject stdoutVal;
         if (!DynamicBindings.TryGet(Startup.Sym("*STANDARD-OUTPUT*"), out stdoutVal))
             stdoutVal = Startup.Sym("*STANDARD-OUTPUT*").Value!;
-        if (stdoutVal is LispOutputStream os) return os.Writer;
-        if (stdoutVal is LispBidirectionalStream bidi) return bidi.Writer;
-        if (stdoutVal is LispFileStream fs && fs.IsOutput) return fs.OutputWriter!;
-        if (stdoutVal is LispSynonymStream syn)
-        {
-            LispObject resolved;
-            if (!DynamicBindings.TryGet(syn.Symbol, out resolved))
-                resolved = syn.Symbol.Value!;
-            if (resolved is LispOutputStream so) return so.Writer;
-            if (resolved is LispBidirectionalStream sb) return sb.Writer;
-            if (resolved is LispFileStream sf && sf.IsOutput) return sf.OutputWriter!;
-            return Console.Out;
-        }
-        return Console.Out;
+        // Delegate to the general resolver so gray/broadcast/echo streams funnel
+        // through their CLOS output methods instead of leaking to Console.Out.
+        return Runtime.GetTextWriter(stdoutVal);
     }
 
     /// <summary>
@@ -1576,27 +1565,12 @@ public static partial class Runtime
             LispObject tio;
             if (!DynamicBindings.TryGet(Startup.Sym("*TERMINAL-IO*"), out tio))
                 tio = Startup.Sym("*TERMINAL-IO*").Value!;
-            if (tio is LispBidirectionalStream bidi) return bidi.Writer;
-            if (tio is LispTwoWayStream tws2) return GetOutputWriter(tws2.OutputStream);
-            if (tio is LispOutputStream os) return os.Writer;
-            return Console.Out;
+            return Runtime.GetTextWriter(tio);
         }
-        if (stream is LispOutputStream los) return los.Writer;
-        if (stream is LispBidirectionalStream bs) return bs.Writer;
-        if (stream is LispTwoWayStream tws) return GetOutputWriter(tws.OutputStream);
-        if (stream is LispFileStream fs && fs.IsOutput) return fs.OutputWriter!;
-        if (stream is LispSynonymStream syn)
-        {
-            LispObject resolved;
-            if (!DynamicBindings.TryGet(syn.Symbol, out resolved))
-                resolved = syn.Symbol.Value!;
-            if (resolved is LispOutputStream so) return so.Writer;
-            if (resolved is LispBidirectionalStream sb) return sb.Writer;
-            if (resolved is LispTwoWayStream stws) return GetOutputWriter(stws.OutputStream);
-            if (resolved is LispFileStream sf && sf.IsOutput) return sf.OutputWriter!;
-            return Console.Out;
-        }
-        return Console.Out;
+        // GetTextWriter handles output/file/two-way/echo/synonym/broadcast/gray
+        // streams uniformly; the printer must not reimplement a narrower subset
+        // (which previously dropped gray streams to Console.Out).
+        return Runtime.GetTextWriter(stream);
     }
 
     public static LispObject Print(LispObject obj)
@@ -2004,60 +1978,11 @@ public static partial class Runtime
                 else if (allowOtherKeys != true)
                     throw new LispErrorException(new LispProgramError($"WRITE: unknown keyword argument :{kw.Name}"));
             }
-            // Resolve output stream
-            TextWriter writer;
-            if (streamArg == null || streamArg is Nil) {
-                // Default: *standard-output*
-                LispObject stdoutVal;
-                if (!DynamicBindings.TryGet(Startup.Sym("*STANDARD-OUTPUT*"), out stdoutVal))
-                    stdoutVal = Startup.Sym("*STANDARD-OUTPUT*").Value!;
-                if (stdoutVal is LispOutputStream outs2) writer = outs2.Writer;
-                else if (stdoutVal is LispBidirectionalStream bidi2) writer = bidi2.Writer;
-                else if (stdoutVal is LispFileStream fs2 && fs2.IsOutput) writer = fs2.OutputWriter!;
-                else if (stdoutVal is LispSynonymStream syn) {
-                    LispObject resolved;
-                    if (!DynamicBindings.TryGet(syn.Symbol, out resolved))
-                        resolved = syn.Symbol.Value!;
-                    if (resolved is LispOutputStream so) writer = so.Writer;
-                    else if (resolved is LispBidirectionalStream sb) writer = sb.Writer;
-                    else if (resolved is LispFileStream sf && sf.IsOutput) writer = sf.OutputWriter!;
-                    else writer = Console.Out;
-                }
-                else writer = Console.Out;
-            } else if (streamArg is LispOutputStream outs) {
-                writer = outs.Writer;
-            } else if (streamArg is LispBidirectionalStream bidi) {
-                writer = bidi.Writer;
-            } else if (streamArg is LispFileStream fs && fs.IsOutput) {
-                writer = fs.OutputWriter!;
-            } else if (streamArg is LispSynonymStream syn) {
-                LispObject resolved;
-                if (!DynamicBindings.TryGet(syn.Symbol, out resolved))
-                    resolved = syn.Symbol.Value!;
-                if (resolved is LispOutputStream so) writer = so.Writer;
-                else if (resolved is LispBidirectionalStream sb) writer = sb.Writer;
-                else if (resolved is LispFileStream sf && sf.IsOutput) writer = sf.OutputWriter!;
-                else writer = Console.Out;
-            } else if (streamArg == T.Instance) {
-                // T means *terminal-io*
-                LispObject tio;
-                if (!DynamicBindings.TryGet(Startup.Sym("*TERMINAL-IO*"), out tio))
-                    tio = Startup.Sym("*TERMINAL-IO*").Value!;
-                if (tio is LispBidirectionalStream tbidi) writer = tbidi.Writer;
-                else if (tio is LispTwoWayStream ttw) {
-                    var outS = ttw.OutputStream;
-                    if (outS is LispOutputStream to2) writer = to2.Writer;
-                    else if (outS is LispStringOutputStream tso) writer = tso.Writer;
-                    else if (outS is LispBidirectionalStream tb2) writer = tb2.Writer;
-                    else if (outS is LispFileStream tf2 && tf2.IsOutput) writer = tf2.OutputWriter!;
-                    else writer = Console.Out;
-                }
-                else if (tio is LispOutputStream touts) writer = touts.Writer;
-                else if (tio is LispFileStream tfs && tfs.IsOutput) writer = tfs.OutputWriter!;
-                else writer = Console.Out;
-            } else {
-                writer = Console.Out;
-            }
+            // Resolve output stream. GetOutputWriter handles the NIL→*standard-output*
+            // and T→*terminal-io* designators plus output/file/two-way/echo/synonym/
+            // broadcast/gray streams uniformly; do not reimplement a narrower subset
+            // here (which previously dropped gray streams to Console.Out).
+            TextWriter writer = Runtime.GetOutputWriter(streamArg ?? Nil.Instance);
             // Push dynamic bindings
             foreach (var (sym, val) in bindings) DynamicBindings.Push(sym, val);
             try {

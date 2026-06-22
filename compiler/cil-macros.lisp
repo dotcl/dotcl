@@ -154,6 +154,13 @@
 (defvar *setf-expanders* (make-hash-table :test #'equal)
   "Table of custom setf expanders: accessor-name-string → (lambda (place value) expanded-form)")
 
+(defvar *setf-expander-store-counts* (make-hash-table :test #'equal)
+  "Number of store variables a defsetf-registered expander expects (keyed like
+   *setf-expanders*). Absent ⇒ 1. A defsetf long form may declare several store
+   variables (e.g. (defsetf gp (o) (nx ny) ...)); GET-SETF-EXPANSION must then
+   return that many store variables, so the count is recorded here at defsetf
+   time and consulted in %get-setf-expansion.")
+
 ;;; --- struct info table for :include support ---
 (defvar *struct-info* (make-hash-table :test #'eq)
   "Table of struct metadata: symbol → plist (:slots :parent :conc-prefix)")
@@ -875,6 +882,11 @@
                                                     (list (list* 'multiple-value-bind
                                                                  store-gensyms value
                                                                  (list body-form))))))))))
+                     ;; Record how many store variables this place has, so
+                     ;; GET-SETF-EXPANSION returns the right count (not always 1).
+                     (eval-when (:compile-toplevel :load-toplevel :execute)
+                       (setf (gethash ,(%setf-key accessor) *setf-expander-store-counts*)
+                             ,(length store-vars)))
                      ',accessor))))))))
 
 ;;; --- define-setf-expander ---
@@ -1007,13 +1019,23 @@
               (let ((exp-fn (and (symbolp (car place))
                                  (%lookup-setf-expander (car place) *setf-expanders*))))
                 (if exp-fn
-                    ;; Build proper 5-value expansion: evaluate each place arg exactly once
+                    ;; Build proper 5-value expansion: evaluate each place arg exactly once.
+                    ;; A defsetf long form may declare several store variables; report
+                    ;; that many (CLHS: one store var per stored value). The expander
+                    ;; takes a single VALUE form and binds it via multiple-value-bind,
+                    ;; so we feed it (values s1 ... sN) over our N store gensyms.
                     (let* ((args (cdr place))
                            (temps (mapcar (lambda (x) (declare (ignore x)) (gensym "TEMP")) args))
-                           (s (gensym "STORE"))
-                           (temp-place (cons (car place) temps)))
-                      (values temps args (list s)
-                              (funcall exp-fn temp-place s)
+                           (n-stores (or (%lookup-setf-expander (car place)
+                                                                *setf-expander-store-counts*)
+                                         1))
+                           (stores (loop repeat (max 1 n-stores) collect (gensym "STORE")))
+                           (temp-place (cons (car place) temps))
+                           (value-form (if (= (length stores) 1)
+                                           (car stores)
+                                           (cons 'values stores))))
+                      (values temps args stores
+                              (funcall exp-fn temp-place value-form)
                               temp-place))
                     ;; Try macroexpanding the place before falling back
                     (let ((expander (and (symbolp (car place))
@@ -2899,8 +2921,11 @@
                                        (nv (gensym "NMP-")))
                                   (if (some #'%has-cnm-p body)
                                       `(lambda ,plain-params
-                                         (let ((,cv (symbol-function 'call-next-method))
-                                               (,nv (symbol-function 'next-method-p)))
+                                         ;; Capture THIS invocation's cnm/nmp closures from
+                                         ;; thread-local storage (not the global symbol-function,
+                                         ;; which a concurrent dispatch would clobber).
+                                         (let ((,cv (%captured-call-next-method))
+                                               (,nv (%captured-next-method-p)))
                                            (block ,bn
                                              ,@(mapcar (lambda (b)
                                                          (%walk-replace-cnm b cv nv))

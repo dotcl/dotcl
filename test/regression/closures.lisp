@@ -81,7 +81,7 @@
     n)
   4)
 
-;;; (incf (the fixnum n)) in a closure must mutate captured var (D978)
+;;; (incf (the fixnum n)) in a closure must mutate captured var.
 ;;; Bug: mutation analysis didn't unwrap (the type var), so n wasn't boxed.
 (deftest incf-the-in-closure
   (let ((n 0))

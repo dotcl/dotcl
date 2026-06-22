@@ -8,7 +8,7 @@ INPUT ?= test/test1.lisp
 STDBUF ?=
 SETSID ?= $(shell which setsid 2>/dev/null)
 
-.PHONY: all build run clean repl test-a2 test-ansi test-ansi-all test-ansi-full test-ansi-extra test-regression test-mop update-ansi-state commit-ansi-state cross-compile loc publish pack install setup-ansi-test setup-asdf setup-cl-bench bench bench-state test-sbcl-host2 compile-asdf-fasl compile-asdf-fasls compile-core-fasl compile-contrib-fasls contrib-dotcl-cs contrib-dotcl-jitdisasm gen-char-names
+.PHONY: all build build-ns2 run clean repl test-a2 test-ansi test-ansi-all test-ansi-full test-ansi-extra test-regression test-mop ilverify update-ansi-state commit-ansi-state cross-compile loc publish pack install setup-ansi-test setup-asdf setup-cl-bench bench bench-state test-sbcl-host2 compile-asdf-fasl compile-asdf-fasls compile-core-fasl compile-contrib-fasls contrib-dotcl-cs contrib-dotcl-jitdisasm gen-char-names
 
 # Source files for cross-compile. Listed once; the recipe and dependency
 # tracking both reference this so adding a file is a single-edit change.
@@ -42,6 +42,27 @@ test-ansi-extra: build $(DOTCL_ROOT)compiler/cil-out.sil
 test-mop: build $(DOTCL_ROOT)compiler/cil-out.sil
 	@echo "=== Running AMOP protocol conformance tests ==="
 	$(SETSID) dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --asm $(DOTCL_ROOT)compiler/cil-out.sil $(DOTCL_ROOT)test/mop-protocol.lisp
+
+# Assert the emitter produces VERIFIABLE CIL (no covariant calls / stack-type
+# mismatches). Unverifiable IL runs on CoreCLR but is rejected by strict AOT C++
+# codegens (Unity IL2CPP / WebGL). Catches such codegen regressions in seconds
+# instead of via a 25-minute IL2CPP build. Needs dotnet-ilverify (the target
+# prints the install command if missing).
+ilverify: build $(DOTCL_ROOT)compiler/cil-out.sil
+	@echo "=== Verifying emitted CIL (ilverify) ==="
+	bash $(DOTCL_ROOT)scripts/ilverify-check.sh
+
+# Compile-only tripwire for the netstandard2.0 runtime — the build that AOT
+# (NativeAOT) and WebGL (Unity IL2CPP) link against. `make build` only compiles
+# the dev net10 runner, so an unguarded Reflection.Emit use (absent on ns2.0) or
+# a broken DOTCL_NO_JSON #if would otherwise surface only in a heavy AOT/IL2CPP
+# build. This catches it in seconds. Builds both shipped ns2.0 configs: plain
+# (with System.Text.Json) and emit-free/JSON-free (what the shippable samples use).
+build-ns2:
+	@echo "=== Building netstandard2.0 runtime (plain) ==="
+	dotnet build $(DOTCL_ROOT)runtime/DotCL.Runtime.csproj -c Release -f netstandard2.0
+	@echo "=== Building netstandard2.0 runtime (emit-free, JSON-free) ==="
+	dotnet build $(DOTCL_ROOT)runtime/DotCL.Runtime.csproj -c Release -f netstandard2.0 -p:DotclNoJson=true
 
 test-sbcl-host2: $(DOTCL_ROOT)compiler/cil-out.sil
 	DOTNET_GCConserveMemory=7 dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --asm $(DOTCL_ROOT)compiler/cil-out.sil $(DOTCL_ROOT)test-sbcl-host2.lisp

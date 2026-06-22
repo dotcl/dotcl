@@ -59,9 +59,9 @@ public static partial class Runtime
             "UNSIGNED_LONG_LONG" or "UINT64" =>
                 Fixnum.Make(Marshal.ReadInt64(ptr)),
             "FLOAT" =>
-                new DoubleFloat(BitConverter.ToSingle(BitConverter.GetBytes(Marshal.ReadInt32(ptr)))),
+                new DoubleFloat(Compat.Int32BitsToSingle(Marshal.ReadInt32(ptr))),
             "DOUBLE" =>
-                new DoubleFloat(BitConverter.ToDouble(BitConverter.GetBytes(Marshal.ReadInt64(ptr)))),
+                new DoubleFloat(BitConverter.Int64BitsToDouble(Marshal.ReadInt64(ptr))),
             "POINTER" or "PTR" =>
                 Fixnum.Make(Marshal.ReadIntPtr(ptr).ToInt64()),
             _ => throw new LispErrorException(new LispError($"dotnet:mem-read: unknown type {typeName}"))
@@ -95,13 +95,13 @@ public static partial class Runtime
                 var fv = value is DoubleFloat df2 ? (float)df2.Value :
                          value is SingleFloat sf2 ? sf2.Value :
                          (float)((Fixnum)value).Value;
-                Marshal.WriteInt32(ptr, BitConverter.ToInt32(BitConverter.GetBytes(fv)));
+                Marshal.WriteInt32(ptr, Compat.SingleToInt32Bits(fv));
                 break;
             case "DOUBLE":
                 var dv = value is DoubleFloat ddf ? ddf.Value :
                          value is SingleFloat sdf ? (double)sdf.Value :
                          (double)((Fixnum)value).Value;
-                Marshal.WriteInt64(ptr, BitConverter.ToInt64(BitConverter.GetBytes(dv)));
+                Marshal.WriteInt64(ptr, BitConverter.DoubleToInt64Bits(dv));
                 break;
             case "POINTER": case "PTR":
                 Marshal.WriteIntPtr(ptr, new IntPtr(((Fixnum)value).Value)); break;
@@ -242,7 +242,12 @@ public static partial class Runtime
         var argTypesList = args[1];
         var retType = args[2];
         var nativeArgs = args.Skip(3).ToArray();
+#if DOTCL_EMIT
         return NativeFFI.CallPtr(funcPtr, argTypesList, retType, nativeArgs);
+#else
+        throw new LispErrorException(new LispProgramError(
+            "dotnet:%ffi-call-ptr: native FFI requires the emitting runtime (not available on this build)"));
+#endif
     }
 
     static LispErrorException ArgError(string fn, int expected, int got) =>

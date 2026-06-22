@@ -340,7 +340,7 @@
   (cl-user::%ansi-cat-end "misc" %s))
 
 ;;; Patch do-entries: crash protection + *hang-tests* filter
-;;; Original block/handler-bind bug (D093) has been fixed; return-from restored.
+;;; Original block/handler-bind bug has been fixed; return-from restored.
 (in-package :regression-test)
 (defun do-entries (s)
   (format s "~&Doing ~A pending test~:P ~

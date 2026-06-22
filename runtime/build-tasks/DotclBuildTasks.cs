@@ -1,6 +1,9 @@
 using System;
 using System.IO;
+using System.Linq;
+using System.Runtime.ExceptionServices;
 using System.Runtime.Loader;
+using System.Threading;
 using Microsoft.Build.Framework;
 using Microsoft.Build.Utilities;
 using Task = Microsoft.Build.Utilities.Task;
@@ -89,6 +92,28 @@ internal static class DotclBoot
             }
         }
     }
+
+    /// <summary>
+    /// Run <paramref name="body"/> on a dedicated thread with a large stack.
+    /// The recursive-descent compiler can recurse deeply on large/deep Lisp
+    /// sources; the MSBuild worker thread's default (~1 MB) stack overflows
+    /// intermittently there. The CLI avoids this by running on a 256 MB
+    /// stack thread — mirror that here. Exceptions propagate to the caller with
+    /// their original stack trace.
+    /// </summary>
+    public static void RunOnLargeStack(Action body)
+    {
+        const int stackSize = 256 * 1024 * 1024;
+        ExceptionDispatchInfo? edi = null;
+        var t = new Thread(() =>
+        {
+            try { body(); }
+            catch (Exception ex) { edi = ExceptionDispatchInfo.Capture(ex); }
+        }, stackSize);
+        t.Start();
+        t.Join();
+        edi?.Throw();
+    }
 }
 
 /// <summary>
@@ -106,11 +131,15 @@ public sealed class DotclResolveDeps : Task
     public string? TargetRid { get; set; }
     /// <summary>Path to DotCL.Runtime.dll in the package lib/ (packaged layout).</summary>
     public string? RuntimeAssemblyPath { get; set; }
+    /// <summary>@(DotclBuildInit): Lisp scripts loaded before dependency
+    /// resolution so the project can make external systems discoverable
+    /// (e.g. (pushnew … asdf:*central-registry*) / boot quicklisp).</summary>
+    public ITaskItem[]? BuildInit { get; set; }
 
     public override bool Execute()
     {
         DotclBoot.InstallResolver(RuntimeAssemblyPath);
-        try { Run(); return true; }
+        try { DotclBoot.RunOnLargeStack(Run); return true; }
         catch (Exception ex)
         {
             Log.LogError($"dotcl resolve-deps failed for {Asd}: {ex.Message}");
@@ -122,7 +151,8 @@ public sealed class DotclResolveDeps : Task
     {
         DotclBoot.Boot(BaseCore, ContribDir);
         DotclHost.ResolveDeps(Asd, ManifestOut, RootSourcesOut,
-                              string.IsNullOrEmpty(TargetRid) ? null : TargetRid);
+                              string.IsNullOrEmpty(TargetRid) ? null : TargetRid,
+                              BuildInit?.Select(i => i.ItemSpec).ToArray());
     }
 }
 
@@ -137,11 +167,14 @@ public sealed class DotclCompileProject : Task
     [Required] public string BaseCore { get; set; } = "";
     public string? ContribDir { get; set; }
     public string? RuntimeAssemblyPath { get; set; }
+    /// <summary>@(DotclBuildInit): Lisp scripts loaded before compilation
+    /// (same as DotclResolveDeps; the root .asd may reference external systems).</summary>
+    public ITaskItem[]? BuildInit { get; set; }
 
     public override bool Execute()
     {
         DotclBoot.InstallResolver(RuntimeAssemblyPath);
-        try { Run(); return true; }
+        try { DotclBoot.RunOnLargeStack(Run); return true; }
         catch (Exception ex)
         {
             Log.LogError($"dotcl compile-project failed for {Asd}: {ex.Message}");
@@ -152,6 +185,6 @@ public sealed class DotclCompileProject : Task
     private void Run()
     {
         DotclBoot.Boot(BaseCore, ContribDir);
-        DotclHost.CompileProject(Asd, Output);
+        DotclHost.CompileProject(Asd, Output, BuildInit?.Select(i => i.ItemSpec).ToArray());
     }
 }

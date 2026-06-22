@@ -102,21 +102,25 @@ public static partial class Runtime
         }
     }
 
+    // detect Gray streams by class NAME walked over the precedence list,
+    // not by FindClassByName + reference compare. FindClassByName does a linear
+    // scan of the class registry and returns the FIRST class whose bare name
+    // matches — so when a second class of the same name exists (e.g. after
+    // (asdf:load-system :trivial-gray-streams), which defines its own
+    // FUNDAMENTAL-CHARACTER-OUTPUT-STREAM in another package), it can return a
+    // class that is NOT the one in this instance's CPL, making the reference
+    // compare wrongly false (order-dependent). Matching by name is robust to
+    // duplicate-named gray protocol classes across packages.
+
     /// <summary>Check if a LispInstance is a Gray output stream (subclass of fundamental-character-output-stream).</summary>
     internal static bool IsGrayOutputStream(LispInstance inst)
-    {
-        var cls = FindClassByName("FUNDAMENTAL-CHARACTER-OUTPUT-STREAM");
-        if (cls == null) return false;
-        return inst.Class.ClassPrecedenceList?.Any(c => c == cls) == true;
-    }
+        => inst.Class.ClassPrecedenceList?.Any(
+               c => c.Name?.Name == "FUNDAMENTAL-CHARACTER-OUTPUT-STREAM") == true;
 
     /// <summary>Check if a LispInstance is a Gray input stream (subclass of fundamental-character-input-stream).</summary>
     internal static bool IsGrayInputStream(LispInstance inst)
-    {
-        var cls = FindClassByName("FUNDAMENTAL-CHARACTER-INPUT-STREAM");
-        if (cls == null) return false;
-        return inst.Class.ClassPrecedenceList?.Any(c => c == cls) == true;
-    }
+        => inst.Class.ClassPrecedenceList?.Any(
+               c => c.Name?.Name == "FUNDAMENTAL-CHARACTER-INPUT-STREAM") == true;
 
     /// <summary>Resolve a stream designator to the outermost LispEchoStream, if any, following synonym streams.</summary>
     private static LispEchoStream? FindEchoStream(LispObject streamObj)
@@ -506,7 +510,7 @@ public static partial class Runtime
     /// </summary>
     private static void PatchUiopWindowsPath()
     {
-        if (!OperatingSystem.IsWindows()) return;
+        if (!Compat.IsWindows()) return;
         // ASDF coerces pathname designators through uiop:parse-unix-namestring, which
         // is UNIX-only and cannot represent a drive letter, so a native Windows path
         // (backslashes or a C: drive) fails ASDF's absolute-pathname check.
@@ -1022,7 +1026,7 @@ public static partial class Runtime
     private static LispFunction? _cachedCompileTopLevelEval;
     internal static LispObject CompileTopLevel(LispObject form)
     {
-        if (!RuntimeHelpers.TryEnsureSufficientExecutionStack())
+        if (!Compat.TryEnsureSufficientExecutionStack())
             throw new LispErrorException(new LispProgramError("Stack overflow in compilation"));
         _cachedCompileTopLevel ??= DotCL.Emitter.CilAssembler.GetFunction("COMPILE-TOPLEVEL");
         return _cachedCompileTopLevel.Invoke1(form);
@@ -1031,7 +1035,7 @@ public static partial class Runtime
     // Compile a top-level form for EVAL (preserves MvReturn in tail position).
     internal static LispObject CompileTopLevelEval(LispObject form)
     {
-        if (!RuntimeHelpers.TryEnsureSufficientExecutionStack())
+        if (!Compat.TryEnsureSufficientExecutionStack())
             throw new LispErrorException(new LispProgramError("Stack overflow in compilation"));
         _cachedCompileTopLevelEval ??= DotCL.Emitter.CilAssembler.GetFunction("COMPILE-TOPLEVEL-EVAL");
         return _cachedCompileTopLevelEval.Invoke1(form);
@@ -1228,6 +1232,7 @@ public static partial class Runtime
 
     public static LispObject CompileFile(LispObject[] args)
     {
+#if DOTCL_EMIT
         if (args.Length == 0)
             throw new LispErrorException(new LispProgramError("COMPILE-FILE: requires at least 1 argument"));
 
@@ -1239,6 +1244,8 @@ public static partial class Runtime
         LispObject? verboseArg = null;
         LispObject? printArg = null;
         LispObject? targetFeaturesArg = null;
+        LispObject? moduleNameArg = null;
+        LispObject? corlibNameArg = null;
         bool emitSil = false; // default: PE assembly (.fasl); :sil t → also write text SIL
         bool allowOtherKeys = false;
 
@@ -1273,6 +1280,17 @@ public static partial class Runtime
                     emitSil = args[i + 1] is not Nil;
                     break;
                 case "TARGET-FEATURES": targetFeaturesArg ??= args[i + 1]; break;
+                // :module-name — pin the FASL's .NET assembly/module name to a
+                // stable string instead of the default basename_<guid8>. Required
+                // for build-time-linked (NativeAOT/IL2CPP) deployment, where the
+                // assembly is referenced by a fixed name and the file name must
+                // match it. The caller owns uniqueness across co-loaded modules.
+                case "MODULE-NAME": moduleNameArg ??= args[i + 1]; break;
+                // :corlib-name — rewrite the emitted fasl's corlib reference to a
+                // portable facade (only "netstandard"). For build-time-linked
+                // deployment on BCLs without System.Private.CoreLib (Unity IL2CPP/
+                // WebGL). Default (null) keeps System.Private.CoreLib (CoreCLR/AOT).
+                case "CORLIB-NAME": corlibNameArg ??= args[i + 1]; break;
                 case "EXTERNAL-FORMAT": break; // accepted but ignored
                 case "ALLOW-OTHER-KEYS": break; // already handled
                 default:
@@ -1412,8 +1430,13 @@ public static partial class Runtime
         }
 
         // FASL module name must be computed before the module-ID binding (declared below).
-        var faslModuleName = Path.GetFileNameWithoutExtension(outputPath)
-            + "_" + Guid.NewGuid().ToString("N").Substring(0, 8);
+        // :module-name pins it to a stable string (build-time-link / AOT); otherwise
+        // a per-compile guid suffix keeps module names (and thus LTV slot-ID
+        // namespaces) unique across independently-compiled FASLs.
+        var faslModuleName = (moduleNameArg is LispString mns && mns.Value.Length > 0)
+            ? mns.Value
+            : Path.GetFileNameWithoutExtension(outputPath)
+                + "_" + Guid.NewGuid().ToString("N").Substring(0, 8);
 
         // Bind *current-module-id* to the FASL's unique module name.
         // The load-time-value compiler handler uses this to namespace LTV slot IDs per module,
@@ -1517,7 +1540,10 @@ public static partial class Runtime
                 // Emit any remaining init forms (cycle members, etc.)
                 faslAsm.FlushRemainingInitForms();
 
-                faslAsm.Save(outputPath);
+                var corlibName = (corlibNameArg is LispString cln && cln.Value.Length > 0)
+                    ? cln.Value
+                    : null;
+                faslAsm.Save(outputPath, corlibName);
                 }
                 finally { writer?.Dispose(); }
             }
@@ -1576,6 +1602,10 @@ public static partial class Runtime
             if (moduleIdSym != null)
                 DynamicBindings.Pop(moduleIdSym);
         }
+#else
+        throw new LispErrorException(new LispProgramError(
+            "COMPILE-FILE requires System.Reflection.Emit, which is unavailable in this runtime build"));
+#endif
     }
 
     // --- save-application (MVP) ---
@@ -1621,6 +1651,7 @@ public static partial class Runtime
     [LispDoc("SAVE-APPLICATION")]
     public static LispObject SaveApplication(LispObject[] args)
     {
+#if DOTCL_EMIT
         if (args.Length < 1)
             throw new LispErrorException(new LispProgramError(
                 "SAVE-APPLICATION: requires output-path"));
@@ -1728,8 +1759,13 @@ public static partial class Runtime
         }
 
         return LispPathname.FromString(Path.GetFullPath(outputPath));
+#else
+        throw new LispErrorException(new LispProgramError(
+            "SAVE-APPLICATION requires System.Reflection.Emit, which is unavailable in this runtime build"));
+#endif
     }
 
+#if DOTCL_EMIT
     /// <summary>
     /// Compile :load sources into the FASL at `faslPath`, append an entry call form
     /// if a toplevel designator was given, save. Shared between save-application's
@@ -1889,7 +1925,7 @@ public static partial class Runtime
 
             // Default AssemblyName for runtime.csproj is "runtime" — find it and
             // copy to the user's target path.
-            var exeName = OperatingSystem.IsWindows() ? "runtime.exe" : "runtime";
+            var exeName = Compat.IsWindows() ? "runtime.exe" : "runtime";
             var producedExe = Path.Combine(publishOut, exeName);
             if (!File.Exists(producedExe))
                 throw new LispErrorException(new LispError(
@@ -1934,6 +1970,7 @@ public static partial class Runtime
                 try { File.Delete(coreInRuntimeDir); } catch { }
         }
     }
+#endif
 
     private static string? FindRuntimeCsproj()
     {
@@ -2046,7 +2083,7 @@ public static partial class Runtime
         if (string.IsNullOrEmpty(s)) return "";
         var lines = s.TrimEnd().Split('\n');
         int start = Math.Max(0, lines.Length - n);
-        return string.Join('\n', lines.Skip(start));
+        return string.Join("\n", lines.Skip(start));
     }
 
     private static void CopyDirectory(string src, string dst)
@@ -2082,6 +2119,7 @@ public static partial class Runtime
         return sym;
     }
 
+#if DOTCL_EMIT
     /// <summary>
     /// Read a .lisp source and emit each top-level form into the given FASL assembler.
     /// Mirrors the core loop of CompileFile but without warnings tracking or SIL output
@@ -2120,6 +2158,7 @@ public static partial class Runtime
             }
         }
     }
+#endif
 
     // --- Eval ---
 
@@ -2139,7 +2178,7 @@ public static partial class Runtime
 
     public static LispObject Eval(LispObject form)
     {
-        if (!RuntimeHelpers.TryEnsureSufficientExecutionStack())
+        if (!Compat.TryEnsureSufficientExecutionStack())
             throw new LispErrorException(new LispProgramError("Stack overflow in eval"));
         // Fast path for self-evaluating forms: skip full compilation AND
         // skip the eval lock. These return paths touch no shared mutable
@@ -2162,6 +2201,11 @@ public static partial class Runtime
 
     private static LispObject EvalCompound(LispObject form)
     {
+#if DOTCL_EMIT
+        // :interpret mode routes compound forms through the emit-free tree-walk
+        // interpreter; :compile (default) uses the CIL compiler below.
+        if (UseInterpreter())
+            return MiniEval(form);
         // Use eval-specific compile path that preserves MvReturn at tail
         // so callers can observe multiple values from form.
         var instrList = CompileTopLevelEval(form);
@@ -2179,6 +2223,31 @@ public static partial class Runtime
             throw new LispErrorException(new LispControlError(
                 $"Attempt to THROW to tag {cte.Tag} but no catching CATCH form was found"));
         }
+#else
+        // No Reflection.Emit in this build: the tree-walk interpreter is the only
+        // way to evaluate a compound form.
+        return MiniEval(form);
+#endif
+    }
+
+    /// <summary>True when eval should use the tree-walk interpreter
+    /// (dotcl:*evaluator-mode* is :interpret). Only consulted on emit builds;
+    /// emit-free builds always interpret.</summary>
+    private static bool UseInterpreter()
+    {
+        var sym = Startup.SymInPkg("*EVALUATOR-MODE*", "DOTCL");
+        return DynamicBindings.Get(sym) is Symbol s && s.Name == "INTERPRET";
+    }
+
+    /// <summary>Invoke the Lisp tree-walk interpreter %mini-eval on FORM with an
+    /// empty lexical environment. %mini-eval is defined in the compiler sources
+    /// (package DOTCL.CIL-COMPILER) and is present in the loaded core.</summary>
+    private static LispObject MiniEval(LispObject form)
+    {
+        var fn = Startup.SymInPkg("%MINI-EVAL", "DOTCL.CIL-COMPILER").Function as LispFunction
+            ?? throw new LispErrorException(new LispProgramError(
+                "tree-walk interpreter (%mini-eval) is unavailable: the core is not loaded"));
+        return fn.Invoke(form, Nil.Instance);
     }
 
     /// <summary>
@@ -2645,7 +2714,7 @@ public static partial class Runtime
             throw new LispErrorException(new LispProgramError("ROOM: wrong number of arguments: " + args.Length + " (expected 0-1)"));
         var writer = GetStandardOutputWriter();
         long totalMem = GC.GetTotalMemory(false);
-        long allocated = GC.GetTotalAllocatedBytes(false);
+        long allocated = Compat.GetTotalAllocatedBytes(false);
         writer.WriteLine($"Total memory: {totalMem:N0} bytes");
         writer.WriteLine($"Total allocated: {allocated:N0} bytes");
         writer.WriteLine($"GC generation 0 collections: {GC.CollectionCount(0)}");
@@ -2665,7 +2734,7 @@ public static partial class Runtime
         long gen1 = GC.CollectionCount(1);
         long gen2 = GC.CollectionCount(2);
         long totalMem = GC.GetTotalMemory(false);
-        long allocated = GC.GetTotalAllocatedBytes(false);
+        long allocated = Compat.GetTotalAllocatedBytes(false);
         return new Cons(Fixnum.Make(gen0),
                new Cons(Fixnum.Make(gen1),
                new Cons(Fixnum.Make(gen2),
@@ -2786,6 +2855,23 @@ public static partial class Runtime
         LispObject result = Nil.Instance;
         for (int i = frames.Length - 1; i >= 0; i--)
             result = new Cons(new LispString(frames[i]), result);
+        return result;
+    }
+
+    /// <summary>
+    /// DOTCL:BACKTRACE-WITH-ARGS — like DOTCL:BACKTRACE, but each frame is a list
+    /// (NAME arg0 arg1 ...) whose args are the actual captured argument objects,
+    /// innermost (most recent) frame first. Lets a debugger / error handler inspect
+    /// the arguments a frame was called with, not just function names (cf.
+    /// sb-debug:list-backtrace). Same tracking caveats as DOTCL:BACKTRACE (only
+    /// named functions; anonymous lambdas and native-fixnum self-calls are absent).
+    /// </summary>
+    public static LispObject BacktraceWithArgs(LispObject[] args)
+    {
+        var frames = LispFunction.GetCallStackWithArgs();
+        LispObject result = Nil.Instance;
+        for (int i = frames.Length - 1; i >= 0; i--)
+            result = new Cons(frames[i], result);
         return result;
     }
 
@@ -3164,8 +3250,8 @@ public static partial class Runtime
         // FUNCALL
         Emitter.CilAssembler.RegisterFunction("FUNCALL",
             new LispFunction(args => {
-                if (args[0] is LispFunction f) return f.Invoke(args[1..]);
-                if (args[0] is Symbol s) return ((LispFunction)Runtime.Fdefinition(s)).Invoke(args[1..]);
+                if (args[0] is LispFunction f) return f.Invoke(args.SubArray(1));
+                if (args[0] is Symbol s) return ((LispFunction)Runtime.Fdefinition(s)).Invoke(args.SubArray(1));
                 throw new LispErrorException(new LispTypeError("FUNCALL: not a function designator", args[0]));
             }));
 
@@ -3316,7 +3402,7 @@ public static partial class Runtime
         Emitter.CilAssembler.RegisterFunction("MACROEXPAND-1",
             new LispFunction(args => {
                 if (args.Length < 1 || args.Length > 2) throw new LispErrorException(new LispProgramError($"MACROEXPAND-1: wrong number of arguments: {args.Length} (expected 1-2)"));
-                if (!RuntimeHelpers.TryEnsureSufficientExecutionStack())
+                if (!Compat.TryEnsureSufficientExecutionStack())
                     return MultipleValues.Values(args[0], Nil.Instance); // bail out: return unexpanded
                 var form = args[0];
                 var env = args.Length > 1 ? args[1] : Nil.Instance;
@@ -3381,11 +3467,21 @@ public static partial class Runtime
                 return MultipleValues.Values(form, Nil.Instance);
             }, "MACROEXPAND-1", -1));
 
+        // %CALL-WITH-HANDLER-CLUSTER — handler-bind primitive for the emit-free
+        // tree-walk interpreter (%mini-eval). (alist thunk) -> establishes the
+        // cluster, runs thunk under it. Mirrors compile-handler-bind.
+        Emitter.CilAssembler.RegisterFunction("%CALL-WITH-HANDLER-CLUSTER",
+            new LispFunction(Runtime.CallWithHandlerCluster, "%CALL-WITH-HANDLER-CLUSTER", 2));
+        Emitter.CilAssembler.RegisterFunction("%CALL-WITH-RESTART-CLUSTER",
+            new LispFunction(Runtime.CallWithRestartCluster, "%CALL-WITH-RESTART-CLUSTER", 2));
+        Emitter.CilAssembler.RegisterFunction("%CALL-WITH-RESTART-BIND",
+            new LispFunction(Runtime.CallWithRestartBind, "%CALL-WITH-RESTART-BIND", 2));
+
         // MACROEXPAND
         Emitter.CilAssembler.RegisterFunction("MACROEXPAND",
             new LispFunction(args => {
                 if (args.Length < 1 || args.Length > 2) throw new LispErrorException(new LispProgramError($"MACROEXPAND: wrong number of arguments: {args.Length} (expected 1-2)"));
-                if (!RuntimeHelpers.TryEnsureSufficientExecutionStack())
+                if (!Compat.TryEnsureSufficientExecutionStack())
                     return MultipleValues.Values(args[0], Nil.Instance); // bail out: return unexpanded
                 var form = args[0];
                 var env = args.Length > 1 ? args[1] : Nil.Instance;
@@ -3688,6 +3784,11 @@ public static partial class Runtime
             return fn;
         });
 
+        // %DOTNET-METHOD-RETURN-TYPE — compile-time return-type resolution for the
+        // typed-return inference of the DOTNET:INVOKE compiler macro.
+        Emitter.CilAssembler.RegisterFunction("%DOTNET-METHOD-RETURN-TYPE",
+            new LispFunction(Runtime.DotNetMethodReturnType, "%DOTNET-METHOD-RETURN-TYPE", -1));
+
         // %REGISTER-MACRO-FUNCTION-RT, %UNREGISTER-MACRO-FUNCTION-RT
         // First arg is a Symbol (package-aware macro registration)
         Startup.RegisterBinary("%REGISTER-MACRO-FUNCTION-RT", (nameObj, fn) => {
@@ -3837,7 +3938,7 @@ public static partial class Runtime
         }));
         Emitter.CilAssembler.RegisterFunction("GET-INTERNAL-REAL-TIME", new LispFunction(_ => {
             if (_.Length != 0) throw new LispErrorException(new LispProgramError("GET-INTERNAL-REAL-TIME: wrong number of arguments: " + _.Length + " (expected 0)"));
-            return Fixnum.Make(System.Environment.TickCount64);
+            return Fixnum.Make(Compat.TickCount64());
         }));
         Startup.RegisterUnary("SLEEP", obj => {
             double secs = Arithmetic.ToDouble(Runtime.AsNumber(obj));
@@ -3988,7 +4089,7 @@ public static partial class Runtime
         // Used by find-free-vars-expr to bail out before .NET StackOverflowException.
         Emitter.CilAssembler.RegisterFunction("%STACK-SPACE-AVAILABLE-P",
             new LispFunction(_ =>
-                RuntimeHelpers.TryEnsureSufficientExecutionStack()
+                Compat.TryEnsureSufficientExecutionStack()
                     ? (LispObject)T.Instance : Nil.Instance,
                 "%STACK-SPACE-AVAILABLE-P", 0));
     }

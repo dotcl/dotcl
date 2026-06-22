@@ -1,0 +1,61 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <!-- Host TFM is net10.0, but the binary is published with NativeAOT
+         (PublishAot), so the produced executable is fully ahead-of-time compiled:
+         IsDynamicCodeSupported is False and Reflection.Emit is unavailable. The
+         runtime asset linked in is the *netstandard2.0* build of DotCL.Runtime
+         (see the Reference below), where System.Reflection.Emit is PHYSICALLY
+         EXCLUDED. This proves the emit-free runtime survives a platform that
+         forbids codegen — the property the AOT/IL2CPP target actually requires. -->
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <PublishAot>true</PublishAot>
+    <TrimmerSingleWarn>false</TrimmerSingleWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- The emit-free netstandard2.0 runtime, referenced as a built asset.
+         ProjectReference + SetTargetFramework=netstandard2.0 fails here (NETSDK1207:
+         the AOT setting would propagate to the ns2.0 project); referencing the
+         already-built DLL by HintPath sidesteps that. BuildNs2Runtime (below)
+         produces it before reference resolution. -->
+    <Reference Include="DotCL.Runtime">
+      <HintPath>..\..\runtime\bin\Release\netstandard2.0\DotCL.Runtime.dll</HintPath>
+    </Reference>
+    <!-- The two stable-named build-time-linked Lisp images. File name == internal
+         assembly name (required: ILC resolves assemblies by simple name via the
+         file name). PrecompileLisp (below) generates these before this runs. -->
+    <Reference Include="dotclcore"><HintPath>dotclcore.dll</HintPath></Reference>
+    <Reference Include="appfasl"><HintPath>appfasl.dll</HintPath></Reference>
+    <!-- Keep the Lisp images and the runtime whole: their CompiledModule.ModuleInit
+         is reached only by reflection (RunLinkedModuleByName), so the trimmer must
+         not strip them. -->
+    <TrimmerRootAssembly Include="dotclcore" />
+    <TrimmerRootAssembly Include="appfasl" />
+    <TrimmerRootAssembly Include="DotCL.Runtime" />
+  </ItemGroup>
+
+  <!-- Step 1: build the emit-free netstandard2.0 runtime DLL the Reference needs.
+       Incremental (dotnet build is a no-op when up to date). Runs before reference
+       resolution so the HintPath above exists. -->
+  <Target Name="BuildNs2Runtime" BeforeTargets="PrecompileLisp;ResolveAssemblyReferences">
+    <Exec WorkingDirectory="$(MSBuildProjectDirectory)"
+          Command="dotnet build &quot;$(MSBuildProjectDirectory)\..\..\runtime\DotCL.Runtime.csproj&quot; -c Release -f netstandard2.0" />
+  </Target>
+
+  <!-- Step 2: precompile app.lisp -> appfasl.dll and the dev SIL core ->
+       dotclcore.dll, both with STABLE assembly names (file name == module name),
+       using the dev compiler (runtime.csproj, net10, which DOES have Reflection.Emit
+       — that is the dev/build side). Runs before reference resolution so the
+       dotclcore/appfasl HintPaths exist. -->
+  <Target Name="PrecompileLisp" BeforeTargets="ResolveAssemblyReferences"
+          Inputs="app.lisp;precompile.lisp;..\..\compiler\cil-out.sil"
+          Outputs="appfasl.dll;dotclcore.dll">
+    <Exec WorkingDirectory="$(MSBuildProjectDirectory)"
+          Command="dotnet run --project &quot;$(MSBuildProjectDirectory)\..\..\runtime\runtime.csproj&quot; -- --asm &quot;$(MSBuildProjectDirectory)\..\..\compiler\cil-out.sil&quot; precompile.lisp" />
+  </Target>
+
+</Project>

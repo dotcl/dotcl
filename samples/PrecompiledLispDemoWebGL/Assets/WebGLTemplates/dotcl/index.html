@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">
+  <title>{{{ PRODUCT_NAME }}}</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #0a0c12; color: #cdd6f4;
+           font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    header { padding: 10px 16px; border-bottom: 1px solid #1c2230; }
+    header b { color: #89b4fa; }
+    header span { color: #6c7086; }
+    #wrap { display: flex; gap: 12px; padding: 12px; align-items: flex-start;
+            flex-wrap: wrap; }
+    #unity-canvas { background: #0a0c12; width: 600px; height: 600px;
+                    border: 1px solid #1c2230; border-radius: 8px; }
+    #side { width: 520px; display: flex; flex-direction: column; gap: 8px; }
+    #dotcl-out { margin: 0; height: 470px; overflow: auto; padding: 10px;
+                 background: #11141d; border: 1px solid #1c2230; border-radius: 8px;
+                 color: #a6e3a1; white-space: pre-wrap; }
+    #row { display: flex; gap: 8px; align-items: stretch; }
+    #dotcl-in { flex: 1; padding: 8px; background: #11141d; color: #cdd6f4;
+                border: 1px solid #313244; border-radius: 6px; font: inherit;
+                resize: vertical; min-height: 56px; }
+    #dotcl-eval { padding: 8px 16px; background: #89b4fa; color: #11141d;
+                  border: 0; border-radius: 6px; font: inherit; font-weight: 700;
+                  cursor: pointer; }
+    #dotcl-eval:disabled { background: #45475a; color: #6c7086; cursor: default; }
+    .hint { color: #6c7086; }
+    .hint code { color: #f9e2af; cursor: pointer; }
+  </style>
+</head>
+<body>
+  <header>
+    <b>dotcl</b> — Common Lisp on .NET, running in your browser via
+    <b>Unity IL2CPP / WebGL</b>. <span>Precompiled Lisp draws the curve; type Lisp
+    below to change it live — emit-free, no server, no recompile.</span>
+  </header>
+  <div id="wrap">
+    <canvas id="unity-canvas" width="600" height="600" tabindex="-1"></canvas>
+    <div id="side">
+      <pre id="dotcl-out"></pre>
+      <div id="row">
+        <textarea id="dotcl-in" rows="2" placeholder="(setf *fx* 7)   — type any Lisp; Enter evaluates, Shift+Enter inserts a newline"
+                  autocomplete="off" spellcheck="false" disabled></textarea>
+        <button id="dotcl-eval" disabled>Eval</button>
+      </div>
+      <div class="hint">try:
+        <code data-x="(setf *fx* 7)">(setf *fx* 7)</code> ·
+        <code data-x="(setf *amp* 0.5)">(setf *amp* 0.5)</code> ·
+        <code data-x="(setf *spin* 4)">(setf *spin* 4)</code> ·
+        <code data-x="(defun px (i n tick) (* *amp* (cos (* *fx* (/ (* 2 pi i) n)))))">redefine px</code>
+      </div>
+    </div>
+  </div>
+
+  <script src="Build/{{{ LOADER_FILENAME }}}"></script>
+  <script>
+    var buildUrl = "Build";
+    var unityInstance = null;
+    var input = document.getElementById('dotcl-in');
+    var button = document.getElementById('dotcl-eval');
+
+    function evalLisp() {
+      var code = input.value.trim();
+      if (!code || !unityInstance) return;
+      unityInstance.SendMessage('Bootstrap', 'EvalFromJs', code);
+      input.value = '';
+    }
+    button.addEventListener('click', evalLisp);
+    // Enter evaluates; Shift+Enter inserts a newline (for multi-line forms).
+    input.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); evalLisp(); }
+    });
+    // Click a hint to drop it into the input.
+    Array.prototype.forEach.call(document.querySelectorAll('.hint code'), function (el) {
+      el.addEventListener('click', function () { input.value = el.getAttribute('data-x'); input.focus(); });
+    });
+
+    createUnityInstance(document.getElementById('unity-canvas'), {
+      dataUrl: buildUrl + "/{{{ DATA_FILENAME }}}",
+      frameworkUrl: buildUrl + "/{{{ FRAMEWORK_FILENAME }}}",
+      codeUrl: buildUrl + "/{{{ CODE_FILENAME }}}",
+      streamingAssetsUrl: "StreamingAssets",
+      companyName: "{{{ COMPANY_NAME }}}",
+      productName: "{{{ PRODUCT_NAME }}}",
+      productVersion: "{{{ PRODUCT_VERSION }}}",
+    }).then(function (instance) {
+      unityInstance = instance;
+      input.disabled = false;
+      button.disabled = false;
+      input.focus();
+    }).catch(function (err) {
+      var out = document.getElementById('dotcl-out');
+      out.textContent += 'Unity load error: ' + err + '\n';
+    });
+  </script>
+</body>
+</html>

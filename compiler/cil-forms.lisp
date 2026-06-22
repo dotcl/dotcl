@@ -634,7 +634,13 @@
   (let ((val-local (gen-local "DEFVAR-VAL"))
         (sym-local (gen-local "DEFVAR-SYM")))
     `((:declare-local ,val-local "LispObject")
-      (:declare-local ,sym-local "LispObject")
+      ;; Symbol (not LispObject): the symbol is castclass'd to Symbol below, and
+      ;; DynamicBindings.Set's first parameter is Symbol. Declaring the local as
+      ;; LispObject would widen it back, emitting an unverifiable covariant call
+      ;; (LispObject passed where Symbol is required) that CoreCLR/NativeAOT JIT
+      ;; tolerate but Unity IL2CPP's strict C++ codegen rejects. All other uses of
+      ;; this local pass it to LispObject parameters, where Symbol upcasts cleanly.
+      (:declare-local ,sym-local "Symbol")
       ,@(compile-sym-lookup name)
       (:castclass "Symbol")
       (:stloc ,sym-local)
@@ -1711,6 +1717,61 @@
               (push (cons (symbol-name var) r) result))))))
     result))
 
+(defun %dotnet-sym-p (x name)
+  "True when X is a symbol named NAME in the DOTNET package. Cross-compile safe:
+   on the SBCL host there is no DOTNET package, so this is simply always NIL and
+   no .NET type inference happens during cross-compile."
+  (and (symbolp x) (string= (symbol-name x) name)
+       (let ((p (symbol-package x)))
+         (and p (string= (package-name p) "DOTNET")))))
+
+(defun %dotnet-init-type (init)
+  "If the let/let* init form INIT statically denotes a typed .NET value, return
+   its .NET type-name string, else NIL. Mirrors the receiver/arg type sources the
+   DOTNET:INVOKE compiler macro already understands:
+     (the (dotnet \"T\") E)  -> \"T\"   (E is asserted to be a .NET object of T)
+     (dotnet:new \"T\" ...)   -> \"T\"
+     (dotnet:box E \"T\")     -> \"T\"
+   The variable bound to such an init holds a .NET object of T, so a later
+   (dotnet:invoke var ...) can be lowered to a typed direct callvirt."
+  (and (consp init)
+       (let ((head (car init)))
+         (cond
+           ((and (symbolp head) (string= (symbol-name head) "THE")
+                 (consp (cdr init)) (consp (cadr init)) (consp (cddr init)))
+            (let ((spec (cadr init)))
+              (and (symbolp (car spec)) (string= (symbol-name (car spec)) "DOTNET")
+                   (consp (cdr spec)) (stringp (cadr spec))
+                   (cadr spec))))
+           ((%dotnet-sym-p head "NEW")
+            (and (consp (cdr init)) (stringp (cadr init)) (cadr init)))
+           ((%dotnet-sym-p head "BOX")
+            (and (consp (cdr init)) (consp (cddr init)) (stringp (caddr init))
+                 (caddr init)))
+           (t nil)))))
+
+(defun infer-dotnet-typed-bindings (binding-info mutated outer)
+  "Compute the .NET-typed-locals environment for a let/let* body. Start from OUTER
+   (the enclosing environment), drop every name this let binds (so a rebinding
+   shadows an outer typed local even when the new init is untyped), then add an
+   entry for each non-special, non-mutated binding whose init denotes a typed .NET
+   value. Each new entry is (name-string type-string . local-key); the key lets
+   the consumer verify the binding is still the live one (see
+   DOTNET-VALID-TYPED-LOCALS). Mutated bindings are excluded because a setf could
+   replace the value with a different type, which would miscompile the direct
+   callvirt."
+  (let* ((bound-names (mapcar (lambda (b) (symbol-name (first b))) binding-info))
+         (result (remove-if (lambda (e) (member (car e) bound-names :test #'string=))
+                            outer)))
+    (dolist (b binding-info)
+      (let ((var (first b)) (init (second b)) (is-special (third b)) (key (fourth b)))
+        (unless (or is-special
+                    (member (symbol-name var) mutated :test #'string=))
+          (let ((type (%dotnet-init-type init)))
+            (when type
+              (push (list* (symbol-name var) type key) result))))))
+    result))
+
 (defun extract-double-float-locals (body)
   "Parallel to extract-fixnum-locals for double-float."
   (let ((result '()))
@@ -2003,7 +2064,10 @@
                                                   *double-float-locals*))
                                          (*single-float-locals*
                                           (append (extract-single-float-locals body)
-                                                  *single-float-locals*)))
+                                                  *single-float-locals*))
+                                         (*dotnet-typed-locals*
+                                          (infer-dotnet-typed-bindings
+                                           binding-info mutated *dotnet-typed-locals*)))
                                      (compile-progn real-body))))
                   (compile-let-with-specials
                    init-instrs bind-instrs body-instrs
@@ -2103,7 +2167,10 @@
                                                  *double-float-locals*))
                                         (*single-float-locals*
                                          (append (extract-single-float-locals body)
-                                                 *single-float-locals*)))
+                                                 *single-float-locals*))
+                                        (*dotnet-typed-locals*
+                                         (infer-dotnet-typed-bindings
+                                          binding-info mutated *dotnet-typed-locals*)))
                                     (compile-progn real-body))))
                 (compile-let-with-specials
                  '() bind-instrs body-instrs
@@ -2903,23 +2970,53 @@
 (defun puthash (key ht val) (puthash key ht val))
 
 (defun %mini-bind-params (params args env)
-  "Bind PARAMS to ARGS, extending ENV alist. Handles required, &optional, &rest."
-  (cond
-    ((null params) env)
-    ((eq (car params) '&rest)
-     (acons (cadr params) args env))
-    ((eq (car params) '&optional)
-     (let ((new-env env) (rest-args args))
-       (dolist (p (cdr params) new-env)
-         (cond
-           ((member p '(&rest &key &allow-other-keys &aux))
-            (return new-env))
-           (t
-            (let ((var (if (consp p) (car p) p)))
-              (setq new-env (acons var (when rest-args (pop rest-args)) new-env))))))))
-    ((member (car params) '(&key &allow-other-keys &aux)) env)
-    (t (acons (car params) (car args)
-              (%mini-bind-params (cdr params) (cdr args) env)))))
+  "Bind a lambda list PARAMS to ARGS, extending the ENV alist. Handles required,
+   &optional (with default forms and supplied-p), &rest, &key (with default
+   forms, supplied-p, and ((:keyword var) ...) form), and &aux. Default and aux
+   init forms are evaluated left-to-right in the partial environment."
+  (let ((state :required) (new-env env) (rest-args args))
+    (dolist (p params)
+      (cond
+        ((eq p '&optional) (setq state :optional))
+        ((eq p '&rest)     (setq state :rest))
+        ((eq p '&key)      (setq state :key))
+        ((eq p '&aux)      (setq state :aux))
+        ((eq p '&allow-other-keys) nil)
+        ((eq state :required)
+         (setq new-env (acons p (car rest-args) new-env)
+               rest-args (cdr rest-args)))
+        ((eq state :optional)
+         (let* ((var (if (consp p) (car p) p))
+                (default (when (consp p) (cadr p)))
+                (supp (when (consp p) (caddr p)))
+                (present rest-args)
+                (val (if present (pop rest-args)
+                         (when default (%mini-eval default new-env)))))
+           (setq new-env (acons var val new-env))
+           (when supp (setq new-env (acons supp (if present t nil) new-env)))))
+        ((eq state :rest)
+         (setq new-env (acons p rest-args new-env)))
+        ((eq state :key)
+         ;; p may be VAR, (VAR DEFAULT), (VAR DEFAULT SUPPLIED-P), or
+         ;; ((:KEYWORD VAR) DEFAULT [SUPPLIED-P]).
+         (let* ((head (if (consp p) (car p) p))
+                (var (if (consp head) (cadr head) head))
+                (kw (if (consp head) (car head)
+                        (intern (symbol-name var) :keyword)))
+                (default (when (consp p) (cadr p)))
+                (supp (when (consp p) (caddr p)))
+                (cell (do ((a rest-args (cddr a))) ((null a) nil)
+                        (when (eq (car a) kw) (return a))))
+                (val (if cell (cadr cell)
+                         (when default (%mini-eval default new-env)))))
+           (setq new-env (acons var val new-env))
+           (when supp (setq new-env (acons supp (if cell t nil) new-env)))))
+        ((eq state :aux)
+         (let* ((var (if (consp p) (car p) p))
+                (init (when (consp p) (cadr p)))
+                (val (when init (%mini-eval init new-env))))
+           (setq new-env (acons var val new-env))))))
+    new-env))
 
 (defun %mini-eval-progn (forms env)
   ;; Collect vars from (declare (special ...)) that are in env alist,
@@ -2934,14 +3031,15 @@
                 (when b
                   (push v dyn-vars)
                   (push (cdr b) dyn-vals))))))))
-    (if dyn-vars
-        (progv dyn-vars dyn-vals
-          (let (result)
-            (dolist (f forms result)
-              (setq result (%mini-eval f env)))))
-        (let (result)
-          (dolist (f forms result)
-            (setq result (%mini-eval f env)))))))
+    ;; Evaluate all-but-last for effect; return the LAST form's values via a
+    ;; tail %mini-eval so multiple values propagate (CL progn semantics).
+    (labels ((run (fs)
+               (cond ((null fs) nil)
+                     ((null (cdr fs)) (%mini-eval (car fs) env))
+                     (t (%mini-eval (car fs) env) (run (cdr fs))))))
+      (if dyn-vars
+          (progv dyn-vars dyn-vals (run forms))
+          (run forms)))))
 
 (defun %mini-make-closure (lambda-form env)
   "Return a Lisp function that interprets LAMBDA-FORM in captured ENV."
@@ -2949,6 +3047,36 @@
         (body   (cddr lambda-form)))
     (lambda (&rest call-args)
       (%mini-eval-progn body (%mini-bind-params params call-args env)))))
+
+(defun %mini-expand-handler-case (form)
+  "Rewrite (handler-case body (type (var) h...) ... [(:no-error ll forms...)])
+   into block + handler-bind (+ multiple-value-call for :no-error), reusing
+   primitives %mini-eval already supports. The condition clauses become
+   handler-bind handlers that non-locally exit the block with their result; a
+   :no-error clause receives the body's values when no condition is signalled."
+  (let* ((body (cadr form))
+         (all-clauses (cddr form))
+         (no-error (find :no-error all-clauses :key (lambda (c) (and (consp c) (car c)))))
+         (clauses (remove no-error all-clauses))
+         (blk (gensym "HC-BLK"))
+         (handler-bindings
+          (mapcar (lambda (clause)
+                    (let* ((type (car clause))
+                           (vars (cadr clause))
+                           (hbody (cddr clause))
+                           (cvar (if vars (car vars) (gensym "HC-C"))))
+                      (list type
+                            `(lambda (,cvar)
+                               ,@(unless vars `((declare (ignore ,cvar))))
+                               (return-from ,blk (progn ,@hbody))))))
+                  clauses)))
+    (if no-error
+        `(block ,blk
+           (multiple-value-call
+               (lambda ,(cadr no-error) ,@(cddr no-error))
+             (handler-bind ,handler-bindings ,body)))
+        `(block ,blk
+           (handler-bind ,handler-bindings ,body)))))
 
 (defvar *%mini-eval-depth* 0)
 
@@ -2971,7 +3099,15 @@
                  (%mini-eval (cadr v) env)
                  v))
            (let ((sm (lookup-symbol-macro form)))
-             (if sm (%mini-eval sm env) (symbol-value form))))))
+             (if sm
+                 (%mini-eval sm env)
+                 ;; Not lexically bound: a global symbol macro
+                 ;; (define-symbol-macro) expands via macroexpand-1; otherwise
+                 ;; treat as a dynamic/global variable reference.
+                 (multiple-value-bind (exp expandedp) (macroexpand-1 form)
+                   (if expandedp
+                       (%mini-eval exp env)
+                       (symbol-value form))))))))
     ((consp form)
      ;; First try macroexpand-1: handles destructuring-bind, when, cond, etc.
      (multiple-value-bind (expanded expandedp) (macroexpand-1 form)
@@ -2986,19 +3122,35 @@
                             (when (cdddr form) (%mini-eval (cadddr form) env))))
                (progn   (%mini-eval-progn (cdr form) env))
                (let
-                (let* ((pairs (mapcar (lambda (b)
-                                        (cons (if (consp b) (car b) b)
-                                              (when (consp b) (%mini-eval (cadr b) env))))
-                                      (cadr form)))
-                       (new-env (append pairs env)))
-                  (%mini-eval-progn (cddr form) new-env)))
-               (let*
-                (let ((new-env env))
+                ;; Special (dynamic) vars bind via progv; lexical vars via alist.
+                ;; All init forms are evaluated in the outer env (parallel).
+                (let ((spec-vars '()) (spec-vals '()) (lex '()))
                   (dolist (b (cadr form))
-                    (push (cons (if (consp b) (car b) b)
-                                (when (consp b) (%mini-eval (cadr b) new-env)))
-                          new-env))
-                  (%mini-eval-progn (cddr form) new-env)))
+                    (let ((var (if (consp b) (car b) b))
+                          (val (when (consp b) (%mini-eval (cadr b) env))))
+                      (if (%runtime-special-p var)
+                          (progn (push var spec-vars) (push val spec-vals))
+                          (push (cons var val) lex))))
+                  (let ((new-env (append lex env)))
+                    (if spec-vars
+                        (progv (nreverse spec-vars) (nreverse spec-vals)
+                          (%mini-eval-progn (cddr form) new-env))
+                        (%mini-eval-progn (cddr form) new-env)))))
+               (let*
+                ;; Sequential: lexical vars accumulate in new-env; special vars
+                ;; are progv'd around the body (their init forms still see prior
+                ;; lexical bindings).
+                (let ((new-env env) (spec-vars '()) (spec-vals '()))
+                  (dolist (b (cadr form))
+                    (let ((var (if (consp b) (car b) b))
+                          (val (when (consp b) (%mini-eval (cadr b) new-env))))
+                      (if (%runtime-special-p var)
+                          (progn (push var spec-vars) (push val spec-vals))
+                          (push (cons var val) new-env))))
+                  (if spec-vars
+                      (progv (nreverse spec-vars) (nreverse spec-vals)
+                        (%mini-eval-progn (cddr form) new-env))
+                      (%mini-eval-progn (cddr form) new-env))))
                (setq
                 (let (result)
                   (let ((pairs (cdr form)))
@@ -3022,10 +3174,13 @@
                (flet
                 (let ((new-env env))
                   (dolist (def (cadr form))
-                    (push (cons (car def)
-                                (%mini-make-closure
-                                 `(lambda ,(cadr def) ,@(cddr def)) env))
-                          new-env))
+                    ;; Named local functions get an implicit block named after the
+                    ;; function ((setf f) -> block f), so (return-from f ...) works.
+                    (let ((bname (if (consp (car def)) (cadr (car def)) (car def))))
+                      (push (cons (car def)
+                                  (%mini-make-closure
+                                   `(lambda ,(cadr def) (block ,bname ,@(cddr def))) env))
+                            new-env)))
                   (%mini-eval-progn (cddr form) new-env)))
                (labels
                 (let ((cells '()) (new-env env))
@@ -3036,10 +3191,11 @@
                       (push cell new-env)))
                   ;; Fill in closures (they capture new-env which already has all names)
                   (dolist (def (cadr form))
-                    (let ((cell (assoc (car def) cells)))
+                    (let ((cell (assoc (car def) cells))
+                          (bname (if (consp (car def)) (cadr (car def)) (car def))))
                       (setf (cdr cell)
                             (%mini-make-closure
-                             `(lambda ,(cadr def) ,@(cddr def)) new-env))))
+                             `(lambda ,(cadr def) (block ,bname ,@(cddr def))) new-env))))
                   (%mini-eval-progn (cddr form) new-env)))
                (block
                 ;; Use the block name as catch tag (correct for non-escaped returns)
@@ -3050,6 +3206,13 @@
                        (when (cddr form) (%mini-eval (caddr form) env))))
                (the    (%mini-eval (caddr form) env))
                (locally (%mini-eval-progn (cdr form) env))
+               (eval-when
+                ;; In an evaluator (not compile-file), eval the body iff :execute
+                ;; is among the situations (CLHS 3.2.3.1).
+                (let ((situations (cadr form)))
+                  (when (or (member :execute situations)
+                            (member 'cl:eval situations)) ; legacy EVAL keyword
+                    (%mini-eval-progn (cddr form) env))))
                (symbol-macrolet
                 ;; Extend env with symbol macro bindings
                 (let ((new-env env))
@@ -3123,6 +3286,128 @@
                       (throw (cadr (cdr b)) (caddr (cdr b)))
                       (error "%mini-eval: go tag ~S not found" tag))))
                (declare nil)
+               (catch
+                (catch (%mini-eval (cadr form) env)
+                  (%mini-eval-progn (cddr form) env)))
+               (throw
+                (throw (%mini-eval (cadr form) env)
+                       (%mini-eval (caddr form) env)))
+               (unwind-protect
+                (unwind-protect (%mini-eval (cadr form) env)
+                  (%mini-eval-progn (cddr form) env)))
+               (multiple-value-call
+                ;; (m-v-call fn form*) — splice all values of each form as args.
+                (apply (%mini-eval (cadr form) env)
+                       (mapcan (lambda (a)
+                                 (multiple-value-list (%mini-eval a env)))
+                               (cddr form))))
+               (multiple-value-prog1
+                (multiple-value-prog1 (%mini-eval (cadr form) env)
+                  (%mini-eval-progn (cddr form) env)))
+               (progv
+                (progv (%mini-eval (cadr form) env)
+                       (%mini-eval (caddr form) env)
+                  (%mini-eval-progn (cdddr form) env)))
+               (defun
+                ;; Interpreted defun: install an interpreted closure (with the
+                ;; implicit block) as the function. No compilation — works on
+                ;; emit-free targets. &key/&aux in the lambda list are not yet
+                ;; bound by %mini-bind-params (required/&optional/&rest only).
+                (let* ((name (cadr form))
+                       (params (caddr form))
+                       (fbody (cdddr form))
+                       (bname (if (consp name) (cadr name) name))
+                       (fn (%mini-make-closure
+                            `(lambda ,params (block ,bname ,@fbody))
+                            env)))
+                  (setf (fdefinition name) fn)
+                  name))
+               (defvar
+                (let ((name (cadr form)))
+                  (proclaim (list 'special name))
+                  (when (and (cddr form) (not (boundp name)))
+                    (set name (%mini-eval (caddr form) env)))
+                  name))
+               (defparameter
+                (let ((name (cadr form)))
+                  (proclaim (list 'special name))
+                  (set name (%mini-eval (caddr form) env))
+                  name))
+               (defconstant
+                (let ((name (cadr form)))
+                  (proclaim (list 'special name))
+                  (set name (%mini-eval (caddr form) env))
+                  name))
+               (define-symbol-macro
+                ;; Register into the global symbol-macro registry that
+                ;; macroexpand-1 (and the symbol-read branch above) consults.
+                (let ((name (cadr form)) (expansion (caddr form)))
+                  (%register-symbol-macro-rt name expansion)
+                  name))
+               (defmacro
+                ;; Interpreted defmacro: build a 2-arg (form env) interpreted
+                ;; expander and register it via (setf (macro-function name) ...),
+                ;; which feeds the runtime macro registry that macroexpand-1 reads.
+                ;; Handles &whole / &environment / dotted tail; &body via
+                ;; destructuring-bind. No compilation.
+                (let* ((name (cadr form))
+                       (ll0 (caddr form))
+                       (mbody (cdddr form))
+                       (whole-var (when (and (consp ll0) (eq (car ll0) '&whole))
+                                    (cadr ll0)))
+                       (rest-ll (if whole-var (cddr ll0) ll0))
+                       (env-var nil)
+                       (clean-ll
+                        (let ((res '()) (p rest-ll))
+                          (loop while (consp p) do
+                            (cond ((eq (car p) '&environment)
+                                   (setq env-var (cadr p) p (cddr p)))
+                                  (t (push (car p) res) (setq p (cdr p)))))
+                          (when p (push '&rest res) (push p res)) ; dotted tail
+                          (nreverse res)))
+                       (wv (or whole-var (gensym "MWHOLE")))
+                       (ev (or env-var (gensym "MENV")))
+                       (expander
+                        (%mini-make-closure
+                         `(lambda (,wv ,ev)
+                            (declare (ignorable ,wv ,ev))
+                            (destructuring-bind ,clean-ll (cdr ,wv)
+                              (block ,name ,@mbody)))
+                         env)))
+                  (setf (macro-function name) expander)
+                  name))
+               (handler-bind
+                ;; (handler-bind ((type handler-form) ...) body...)
+                ;; Establish a cluster via the runtime primitive, then run body
+                ;; as a 0-arg interpreted closure under it.
+                (%call-with-handler-cluster
+                 (mapcar (lambda (b)
+                           (cons (car b) (%mini-eval (cadr b) env)))
+                         (cadr form))
+                 (%mini-make-closure (list* 'lambda '() (cddr form)) env)))
+               (handler-case
+                (%mini-eval (%mini-expand-handler-case form) env))
+               (restart-case
+                ;; (restart-case body (name (params) [:report/:interactive/:test x]* h...) ...)
+                (%call-with-restart-cluster
+                 (mapcar (lambda (clause)
+                           (let ((name (car clause))
+                                 (params (cadr clause))
+                                 (rest (cddr clause)))
+                             (loop while (and rest (member (car rest)
+                                                           '(:report :interactive :test)))
+                                   do (setq rest (cddr rest)))
+                             (cons name
+                                   (%mini-make-closure `(lambda ,params ,@rest) env))))
+                         (cddr form))
+                 (%mini-make-closure (list 'lambda '() (cadr form)) env)))
+               (restart-bind
+                ;; (restart-bind ((name function [:report/:interactive/:test x]*) ...) body...)
+                (%call-with-restart-bind
+                 (mapcar (lambda (binding)
+                           (cons (car binding) (%mini-eval (cadr binding) env)))
+                         (cadr form))
+                 (%mini-make-closure (list* 'lambda '() (cddr form)) env)))
                (multiple-value-list
                 (multiple-value-list (%mini-eval (cadr form) env)))
                (%make-instance-with-initargs
@@ -3130,13 +3415,19 @@
                 (apply (symbol-function 'make-instance)
                        (mapcar (lambda (a) (%mini-eval a env)) (cdr form))))
                (t
-                ;; Function call: check local env first, then symbol-function
-                (let* ((fn (if (symbolp op)
-                               (let ((b (assoc op env)))
-                                 (if (and b (functionp (cdr b)))
-                                     (cdr b)
-                                     (symbol-function op)))
-                               (%mini-eval op env)))
+                ;; Function call: a local binding, a symbol's function, a
+                ;; (setf name) function designator in operator position (e.g.
+                ;; the ((setf foo) v place) form setf expands to), or a
+                ;; ((lambda ...) ...) / computed-function operator.
+                (let* ((fn (cond
+                             ((symbolp op)
+                              (let ((b (assoc op env)))
+                                (if (and b (functionp (cdr b)))
+                                    (cdr b)
+                                    (symbol-function op))))
+                             ((and (consp op) (eq (car op) 'setf))
+                              (fdefinition op))
+                             (t (%mini-eval op env))))
                        (args (mapcar (lambda (a) (%mini-eval a env)) (cdr form))))
                   (apply fn args))))))))
     (t form))
@@ -5005,6 +5296,12 @@
                                  (length (cdr expr))))
                 (:call "Runtime.ProgramError"))
               '((:call "Runtime.NextMethodP")))))
+  ;; defmethod-body capture intrinsics: return THIS invocation's cnm/nmp closures
+  ;; from thread-local storage. Used in place of (symbol-function 'call-next-method).
+  (setf (gethash '%captured-call-next-method h)
+        (lambda (expr) (declare (ignore expr)) '((:call "Runtime.CapturedCnm"))))
+  (setf (gethash '%captured-next-method-p h)
+        (lambda (expr) (declare (ignore expr)) '((:call "Runtime.CapturedNmp"))))
   (setf (gethash '%make-instance-with-initargs h)
         (lambda (expr)
           `(,@(compile-expr (second expr))

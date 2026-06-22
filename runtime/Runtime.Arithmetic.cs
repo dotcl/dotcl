@@ -69,7 +69,7 @@ public static partial class Runtime
     /// <summary>Checked fixnum multiply: returns Fixnum or Bignum.</summary>
     public static LispObject MultiplyFixnum(long a, long b)
     {
-        long hi = Math.BigMul(a, b, out long lo);
+        long hi = Compat.BigMul(a, b, out long lo);
         if (hi == (lo >> 63))
             return Fixnum.Make(lo);
         return Bignum.MakeInteger(new System.Numerics.BigInteger(a) * b);
@@ -107,7 +107,7 @@ public static partial class Runtime
         if (a is Fixnum fa && b is Fixnum fb)
         {
             long va = fa.Value, vb = fb.Value;
-            long hi = Math.BigMul(va, vb, out long result);
+            long hi = Compat.BigMul(va, vb, out long result);
             if (hi == (result >> 63))
                 return Fixnum.Make(result);
             return Bignum.MakeInteger(new System.Numerics.BigInteger(va) * vb);
@@ -1434,7 +1434,7 @@ public static partial class Runtime
         Startup.RegisterUnary("ASINH", obj => {
             var n = Runtime.AsNumber(obj);
             if (n is LispComplex lc) { var z = Arithmetic.ToSystemComplex(lc); return Arithmetic.FromSystemComplex(System.Numerics.Complex.Log(z + System.Numerics.Complex.Sqrt(z * z + 1)), n); }
-            return Startup.MakeFloat(System.Math.Asinh(Arithmetic.ToDouble(n)), obj);
+            return Startup.MakeFloat(Compat.Asinh(Arithmetic.ToDouble(n)), obj);
         });
         Startup.RegisterUnary("ACOSH", obj => {
             var n = Runtime.AsNumber(obj);
@@ -1445,7 +1445,7 @@ public static partial class Runtime
                 var z = new System.Numerics.Complex(d, 0);
                 return Arithmetic.FromSystemComplex(System.Numerics.Complex.Log(z + System.Numerics.Complex.Sqrt(z * z - 1)), n);
             }
-            return Startup.MakeFloat(System.Math.Acosh(d), obj);
+            return Startup.MakeFloat(Compat.Acosh(d), obj);
         });
         Startup.RegisterUnary("ATANH", obj => {
             var n = Runtime.AsNumber(obj);
@@ -1456,7 +1456,7 @@ public static partial class Runtime
                 var z = new System.Numerics.Complex(d, 0);
                 return Arithmetic.FromSystemComplex(0.5 * System.Numerics.Complex.Log((1 + z) / (1 - z)), n);
             }
-            return Startup.MakeFloat(System.Math.Atanh(d), obj);
+            return Startup.MakeFloat(Compat.Atanh(d), obj);
         });
 
         // CIS: (cis x) => (complex (cos x) (sin x)), only accepts real
@@ -1753,7 +1753,7 @@ public static partial class Runtime
                 if (d == 0.0) {
                     return MultipleValues.Values(new DoubleFloat(0.0), new Fixnum(0), new DoubleFloat(sign));
                 }
-                int exponent = (int)Math.Floor(Math.Log2(d)) + 1;
+                int exponent = (int)Math.Floor(Compat.Log2(d)) + 1;
                 double significand = d / Math.Pow(2.0, exponent);
                 return MultipleValues.Values(new DoubleFloat(significand), new Fixnum(exponent), new DoubleFloat(sign));
             }, "DECODE-FLOAT", 1));

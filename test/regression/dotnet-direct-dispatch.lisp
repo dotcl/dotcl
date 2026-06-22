@@ -53,7 +53,7 @@
     (dotnet:invoke sb "ToString"))
   "77")
 
-;;; --- typed surface: (dotnet:invoke (the (dotnet "T") r) "M" ...) lowering (#285) ---
+;;; --- typed surface: (dotnet:invoke (the (dotnet "T") r) "M" ...) lowering ---
 ;; A type-declared receiver lowers to %dotnet-call-direct via the compiler macro.
 (deftest direct-surface-length
   (let ((sb (dotnet:new "System.Text.StringBuilder")))
@@ -76,7 +76,7 @@
     (dotnet:invoke sb "ToString"))
   "world")
 
-;; #285 per-arg-local codegen: a multi-arg typed invoke marshals each argument
+;; Per-arg-local codegen: a multi-arg typed invoke marshals each argument
 ;; from its own local (no LispObject[] array). String.IndexOf(string, int).
 (deftest direct-surface-multi-arg
   (let ((s (dotnet:box "hello, hello" "System.String")))
@@ -94,7 +94,7 @@
                    (the (dotnet "System.Int32") 3)))
   "bca")
 
-;;; dotcl/dotcl#42 — DOTNET:BOX and DOTNET:NEW are static type sources too, so a
+;;; DOTNET:BOX and DOTNET:NEW are static type sources too, so a
 ;;; typed direct call needs no explicit THE when the receiver/args are already
 ;;; written as box/new forms (their literal type is known at compile time).
 (deftest direct-surface-box-receiver-and-arg
@@ -127,7 +127,7 @@
     (dotnet:invoke sb "ToString"))
   "zz")
 
-;;; #285 value-type receivers: direct dispatch unboxes the receiver and uses
+;;; Value-type receivers: direct dispatch unboxes the receiver and uses
 ;;; `call` for non-virtual methods / `constrained. callvirt` for virtual ones.
 (deftest direct-value-receiver-virtual-tostring
   ;; Int32.ToString() is virtual -> constrained.callvirt.

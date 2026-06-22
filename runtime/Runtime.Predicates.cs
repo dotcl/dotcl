@@ -209,7 +209,7 @@ public static partial class Runtime
             if (et.StartsWith("UNSIGNED-BYTE-") || et.StartsWith("SIGNED-BYTE-"))
             {
                 int dash = et.LastIndexOf('-');
-                if (int.TryParse(et.AsSpan(dash + 1), out int n))
+                if (int.TryParse(et.Substring(dash + 1), out int n))
                     return new Cons(Startup.Sym(et[..dash]), new Cons(Fixnum.Make(n), Nil.Instance));
             }
             return Startup.Sym(et);

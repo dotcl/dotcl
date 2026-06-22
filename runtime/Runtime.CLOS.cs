@@ -1599,7 +1599,7 @@ public static partial class Runtime
     public static LispObject MacroFunction(LispObject name)
     {
         // Guard against stack overflow from recursive macro expansion
-        if (!RuntimeHelpers.TryEnsureSufficientExecutionStack())
+        if (!Compat.TryEnsureSufficientExecutionStack())
             return Nil.Instance;
         var sym = GetSymbol(name, "MACRO-FUNCTION");
         if (_macroFunctions.TryGetValue(sym, out var fn))
@@ -2305,7 +2305,7 @@ public static partial class Runtime
                             var eqlPrimary = new List<LispMethod> { eqlMatch };
                             eqlPrimary.AddRange(cached.Primary);
                             return InvokeWithNextMethods(cached.Around, 0, args,
-                                () => InvokeStandardCombination(cached.Before, eqlPrimary, cached.After, args));
+                                a => InvokeStandardCombination(cached.Before, eqlPrimary, cached.After, a));
                         }
                         var primaryWithEql = new List<LispMethod> { eqlMatch };
                         primaryWithEql.AddRange(cached.Primary);
@@ -2318,7 +2318,7 @@ public static partial class Runtime
                     return DispatchBuiltinCombination(gf, cached.Applicable, args);
                 if (cached.Around.Count > 0)
                     return InvokeWithNextMethods(cached.Around, 0, args,
-                        () => InvokeStandardCombination(cached.Before, cached.Primary, cached.After, args));
+                        a => InvokeStandardCombination(cached.Before, cached.Primary, cached.After, a));
                 return InvokeStandardCombination(cached.Before, cached.Primary, cached.After, args);
             }
         }
@@ -2519,8 +2519,8 @@ public static partial class Runtime
         {
             // :around wraps everything
             return InvokeWithNextMethods(aroundMethods, 0, args,
-                () => {
-                    return InvokeStandardCombination(beforeMethods, primaryMethods, afterMethods, args);
+                a => {
+                    return InvokeStandardCombination(beforeMethods, primaryMethods, afterMethods, a);
                 });
         }
         else
@@ -2772,33 +2772,35 @@ public static partial class Runtime
             combinedMethods.Reverse();
         aroundMethods.Sort((a, b) => CompareMethodSpecificity(a, b, args));
 
-        Func<LispObject> invokeBody = () =>
+        // Takes nextArgs so an :around method's (call-next-method ...) with explicit
+        // arguments forwards them to the combined operator body (CLHS 7.6.6.1).
+        Func<LispObject[], LispObject> invokeBody = nextArgs =>
         {
             // :identity-with-one-argument - skip operator when single method
             if (identityWithOneArg && combinedMethods.Count == 1)
-                return combinedMethods[0].Function.Invoke(args);
+                return combinedMethods[0].Function.Invoke(nextArgs);
             switch (operatorName)
             {
                 case "+":
                 {
                     LispObject result = Fixnum.Make(0);
                     foreach (var m in combinedMethods)
-                        result = Arithmetic.Add(AsNumber(result), AsNumber(m.Function.Invoke(args)));
+                        result = Arithmetic.Add(AsNumber(result), AsNumber(m.Function.Invoke(nextArgs)));
                     return result;
                 }
                 case "*":
                 {
                     LispObject result = Fixnum.Make(1);
                     foreach (var m in combinedMethods)
-                        result = Arithmetic.Multiply(AsNumber(result), AsNumber(m.Function.Invoke(args)));
+                        result = Arithmetic.Multiply(AsNumber(result), AsNumber(m.Function.Invoke(nextArgs)));
                     return result;
                 }
                 case "MIN":
                 {
-                    LispObject result = combinedMethods[0].Function.Invoke(args);
+                    LispObject result = combinedMethods[0].Function.Invoke(nextArgs);
                     for (int i = 1; i < combinedMethods.Count; i++)
                     {
-                        var val = combinedMethods[i].Function.Invoke(args);
+                        var val = combinedMethods[i].Function.Invoke(nextArgs);
                         if (Arithmetic.Compare(AsNumber(val), AsNumber(result)) < 0)
                             result = val;
                     }
@@ -2806,10 +2808,10 @@ public static partial class Runtime
                 }
                 case "MAX":
                 {
-                    LispObject result = combinedMethods[0].Function.Invoke(args);
+                    LispObject result = combinedMethods[0].Function.Invoke(nextArgs);
                     for (int i = 1; i < combinedMethods.Count; i++)
                     {
-                        var val = combinedMethods[i].Function.Invoke(args);
+                        var val = combinedMethods[i].Function.Invoke(nextArgs);
                         if (Arithmetic.Compare(AsNumber(val), AsNumber(result)) > 0)
                             result = val;
                     }
@@ -2820,7 +2822,7 @@ public static partial class Runtime
                     LispObject result = T.Instance;
                     foreach (var m in combinedMethods)
                     {
-                        result = m.Function.Invoke(args);
+                        result = m.Function.Invoke(nextArgs);
                         if (result is Nil) return Nil.Instance;
                     }
                     return result;
@@ -2829,7 +2831,7 @@ public static partial class Runtime
                 {
                     foreach (var m in combinedMethods)
                     {
-                        var result = m.Function.Invoke(args);
+                        var result = m.Function.Invoke(nextArgs);
                         if (result is not Nil) return result;
                     }
                     return Nil.Instance;
@@ -2838,14 +2840,14 @@ public static partial class Runtime
                 {
                     LispObject result = Nil.Instance;
                     foreach (var m in combinedMethods)
-                        result = m.Function.Invoke(args);
+                        result = m.Function.Invoke(nextArgs);
                     return result;
                 }
                 case "LIST":
                 {
                     var results = new List<LispObject>();
                     foreach (var m in combinedMethods)
-                        results.Add(m.Function.Invoke(args));
+                        results.Add(m.Function.Invoke(nextArgs));
                     LispObject result = Nil.Instance;
                     for (int i = results.Count - 1; i >= 0; i--)
                         result = MakeCons(results[i], result);
@@ -2856,7 +2858,7 @@ public static partial class Runtime
                     LispObject result = Nil.Instance;
                     foreach (var m in combinedMethods)
                     {
-                        var val = m.Function.Invoke(args);
+                        var val = m.Function.Invoke(nextArgs);
                         result = NconcTwo(result, val);
                     }
                     return result;
@@ -2865,7 +2867,7 @@ public static partial class Runtime
                 {
                     var results = new List<LispObject>();
                     foreach (var m in combinedMethods)
-                        results.Add(m.Function.Invoke(args));
+                        results.Add(m.Function.Invoke(nextArgs));
                     if (results.Count == 0) return Nil.Instance;
                     LispObject result = results[results.Count - 1];
                     for (int i = results.Count - 2; i >= 0; i--)
@@ -2881,7 +2883,7 @@ public static partial class Runtime
         if (aroundMethods.Count > 0)
             return InvokeWithNextMethods(aroundMethods, 0, args, invokeBody);
         else
-            return invokeBody();
+            return invokeBody(args);
     }
 
     /// <summary>Destructively append b to the end of a (nconc for two lists).</summary>
@@ -2912,17 +2914,14 @@ public static partial class Runtime
             _nextMethodIndex = 1;
             _currentGFArgs = args;
             _nextMethodFallback = null;
-            // Also fix up nmpSym/cnmSym in case an outer around method left them
-            // pointing at stale closures (next-method-p.6/.7 and McCLIM-style code
-            // that calls #'next-method-p via funcall rather than inline).
-            var nmpSym = NmpSym;
-            var cnmSym = CnmSym;
-            var savedNmpFunc = nmpSym.Function;
-            var savedCnmFunc = cnmSym.Function;
-            nmpSym.Function = new LispFunction(_ => Nil.Instance, "NEXT-METHOD-P", 0);
-            cnmSym.Function = new LispFunction(
-                _ => throw new LispErrorException(new LispError("CALL-NEXT-METHOD: no next method")),
-                "CALL-NEXT-METHOD", -1);
+            // Single primary, no before/after → there is no next method. Publish the
+            // default closures thread-locally (the body capture sees "no next method").
+            // These were previously installed on the global symbol-functions, which a
+            // concurrent dispatch could read mid-window and mis-signal.
+            var savedCapturedNmp = _capturedNmp;
+            var savedCapturedCnm = _capturedCnm;
+            _capturedNmp = _defaultNmp;
+            _capturedCnm = _defaultCnm;
             try
             {
                 return primary[0].Function.Invoke(args);
@@ -2933,8 +2932,8 @@ public static partial class Runtime
                 _nextMethodIndex = savedIndex;
                 _currentGFArgs = savedArgs;
                 _nextMethodFallback = savedFallback;
-                nmpSym.Function = savedNmpFunc;
-                cnmSym.Function = savedCnmFunc;
+                _capturedNmp = savedCapturedNmp;
+                _capturedCnm = savedCapturedCnm;
             }
         }
 
@@ -2959,17 +2958,46 @@ public static partial class Runtime
     [ThreadStatic]
     private static LispObject[]? _currentGFArgs;
     [ThreadStatic]
-    private static Func<LispObject>? _nextMethodFallback;
+    // The fallback runs the "next method" when the next-method chain (e.g. the
+    // :around list) is exhausted — typically the before/primary/after combination.
+    // It takes the actual arguments so that (call-next-method ...) with EXPLICIT
+    // arguments propagates them to that combination (CLHS 7.6.6.1), rather than
+    // capturing the original generic-function arguments.
+    private static Func<LispObject[], LispObject>? _nextMethodFallback;
 
-    // Cached symbols for next-method infrastructure (avoid repeated Startup.Sym lookups)
-    private static Symbol? _nmpSymCached;
-    private static Symbol? _cnmSymCached;
-    private static Symbol NmpSym => _nmpSymCached ??= Startup.Sym("NEXT-METHOD-P");
-    private static Symbol CnmSym => _cnmSymCached ??= Startup.Sym("CALL-NEXT-METHOD");
+    // Per-invocation CALL-NEXT-METHOD / NEXT-METHOD-P closures, captured by a
+    // method body at entry via the %CAPTURED-CALL-NEXT-METHOD / %CAPTURED-NEXT-METHOD-P
+    // intrinsics (CapturedCnm/CapturedNmp below). These MUST be thread-local: they
+    // used to be published by mutating the GLOBAL symbol-functions of
+    // CALL-NEXT-METHOD / NEXT-METHOD-P, which a second thread dispatching
+    // concurrently would clobber — the victim method then captured the other
+    // thread's closure (or the fast-path "no next method" stub) and signalled a
+    // spurious "CALL-NEXT-METHOD: no next method" / wrong dispatch (the
+    // residual race after the method list became copy-on-write).
+    [ThreadStatic]
+    private static LispObject? _capturedCnm;
+    [ThreadStatic]
+    private static LispObject? _capturedNmp;
+
+    // Defaults used outside any method invocation (and for the single-primary fast
+    // path, where there is no next method). Stateless and immutable, so a single
+    // shared instance is safe across threads.
+    private static readonly LispFunction _defaultCnm = new LispFunction(
+        _ => throw new LispErrorException(new LispError("CALL-NEXT-METHOD: no next method")),
+        "CALL-NEXT-METHOD", -1);
+    private static readonly LispFunction _defaultNmp = new LispFunction(
+        _ => Nil.Instance, "NEXT-METHOD-P", 0);
+
+    /// <summary>Intrinsic: the current method's captured CALL-NEXT-METHOD closure
+    /// (thread-local). Emitted for the defmethod-body capture instead of
+    /// (symbol-function 'call-next-method), which read a process-global field.</summary>
+    public static LispObject CapturedCnm() => _capturedCnm ?? _defaultCnm;
+    /// <summary>Intrinsic: the current method's captured NEXT-METHOD-P closure (thread-local).</summary>
+    public static LispObject CapturedNmp() => _capturedNmp ?? _defaultNmp;
 
     private static LispObject InvokeWithNextMethods(
         List<LispMethod> methods, int startIdx, LispObject[] args,
-        Func<LispObject>? fallback)
+        Func<LispObject[], LispObject>? fallback)
     {
         var savedChain = _nextMethodChain;
         var savedIndex = _nextMethodIndex;
@@ -3010,14 +3038,14 @@ public static partial class Runtime
             },
             "CALL-NEXT-METHOD", -1);
 
-        // Bind closures to symbol functions and function table so
-        // both (call-next-method) and #'call-next-method work
-        var nmpSym = NmpSym;
-        var cnmSym = CnmSym;
-        var savedNmpFunc = nmpSym.Function;
-        var savedCnmFunc = cnmSym.Function;
-        nmpSym.Function = nmpClosure;
-        cnmSym.Function = cnmClosure;
+        // Publish the per-invocation closures thread-locally so the method body's
+        // entry capture (%CAPTURED-CALL-NEXT-METHOD / %CAPTURED-NEXT-METHOD-P) sees
+        // ITS OWN chain. Mutating the global symbol-functions here instead would let
+        // a concurrent dispatch on another thread clobber them mid-window.
+        var savedCapturedNmp = _capturedNmp;
+        var savedCapturedCnm = _capturedCnm;
+        _capturedNmp = nmpClosure;
+        _capturedCnm = cnmClosure;
 
         try
         {
@@ -3029,8 +3057,8 @@ public static partial class Runtime
             _nextMethodIndex = savedIndex;
             _currentGFArgs = savedArgs;
             _nextMethodFallback = savedFallback;
-            nmpSym.Function = savedNmpFunc;
-            cnmSym.Function = savedCnmFunc;
+            _capturedNmp = savedCapturedNmp;
+            _capturedCnm = savedCapturedCnm;
         }
     }
 
@@ -3038,12 +3066,12 @@ public static partial class Runtime
     /// Call next method using captured chain state (for indefinite extent closures).
     /// </summary>
     private static LispObject CallNextMethodWithChain(
-        List<LispMethod> chain, int idx, LispObject[] args, Func<LispObject>? fallback)
+        List<LispMethod> chain, int idx, LispObject[] args, Func<LispObject[], LispObject>? fallback)
     {
         if (idx < chain.Count)
             return InvokeWithNextMethods(chain, idx, args, fallback);
         if (fallback != null)
-            return fallback();
+            return fallback(args);
         throw new LispErrorException(new LispError("CALL-NEXT-METHOD: no next method"));
     }
 
@@ -3074,7 +3102,7 @@ public static partial class Runtime
         }
         else if (_nextMethodFallback != null)
         {
-            return _nextMethodFallback();
+            return _nextMethodFallback(actualArgs);
         }
         else
         {
@@ -3805,6 +3833,58 @@ public static partial class Runtime
         Emitter.CilAssembler.RegisterFunction("CALL-NEXT-METHOD",
             new LispFunction(Runtime.CallNextMethod, "CALL-NEXT-METHOD", -1));
 
+        // CLOS intrinsics callable as functions, for the emit-free tree-walk
+        // interpreter (%mini-eval). The compiler emits these as inline
+        // (:call "Runtime.X") via the special-form table; the compiled path is
+        // unaffected. defclass/defgeneric/defmethod macro-expand into calls to
+        // these (DOTCL-INTERNAL package), so the interpreter must be able to
+        // apply them. All map to existing Runtime methods — no new emit.
+        void RegClos(string name, System.Func<LispObject[], LispObject> fn, int arity = -1)
+            => Emitter.CilAssembler.RegisterFunction(name, new LispFunction(fn, name, arity));
+        RegClos("%MAKE-CLASS", a => Runtime.MakeClass(a[0], a[1], a[2]), 3);
+        RegClos("%REGISTER-CLASS", a => Runtime.RegisterClass(a[0]), 1);
+        RegClos("%MAKE-SLOT-DEF", a => Runtime.MakeSlotDef(a[0], a[1], a[2]), 3);
+        RegClos("%SLOT-DEF-RAW-OPTIONS", a => Runtime.SetSlotDefRawOptions(a[0], a[1]), 2);
+        RegClos("%SET-CLASS-DEFAULT-INITARGS", a => Runtime.SetClassDefaultInitargs(a[0], a[1]), 2);
+        RegClos("%FIND-CLASS-OR-NIL", a => Runtime.FindClassOrNil(a[0]), 1);
+        RegClos("%SET-SLOT-VALUE", a => Runtime.SetSlotValue(a[0], a[1], a[2]), 3);
+        RegClos("%ALLOCATE-INSTANCE", a => Runtime.MakeInstanceRaw(a[0]), 1);
+        RegClos("%SLOT-EXISTS-P", a => Runtime.SlotExists(a[0], a[1]), 2);
+        RegClos("%CHANGE-CLASS", Runtime.ChangeClass);
+        RegClos("%MAKE-GF", a => Runtime.MakeGF(a[0], a[1]), 2);
+        RegClos("%REGISTER-GF", a => Runtime.RegisterGF(a[0], a[1]), 2);
+        RegClos("%FIND-GF", a => Runtime.FindGF(a[0]), 1);
+        RegClos("%SET-GF-LAMBDA-LIST-INFO", Runtime.SetGFLambdaListInfo);
+        RegClos("%SET-METHOD-LAMBDA-LIST-INFO", Runtime.SetMethodLambdaListInfo);
+        RegClos("%MAKE-METHOD", a => Runtime.MakeMethod(a[0], a[1], a[2]), 3);
+        RegClos("%ADD-METHOD", a => Runtime.AddMethod(a[0], a[1]), 2);
+        RegClos("%GF-METHODS", a => Runtime.GetGFMethods(a[0]), 1);
+        RegClos("%METHOD-SPECIALIZERS", a => Runtime.MethodSpecializers(a[0]), 1);
+        RegClos("%METHOD-QUALIFIERS", a => Runtime.MethodQualifiers(a[0]), 1);
+        RegClos("%METHOD-FUNCTION", a => Runtime.MethodFunction(a[0]), 1);
+        RegClos("%CLEAR-DEFGENERIC-INLINE-METHODS", a => Runtime.ClearDefgenericInlineMethods(a[0]), 1);
+        RegClos("%MARK-DEFGENERIC-INLINE-METHOD", a => Runtime.MarkDefgenericInlineMethod(a[0], a[1]), 2);
+        RegClos("%SET-METHOD-COMBINATION", a => Runtime.SetMethodCombination(a[0], a[1]), 2);
+        RegClos("%SET-METHOD-COMBINATION-ORDER", a => Runtime.SetMethodCombinationOrder(a[0], a[1]), 2);
+        RegClos("%SET-METHOD-COMBINATION-ARGS", a => Runtime.SetMethodCombinationArgs(a[0], a[1]), 2);
+        RegClos("%CAPTURED-CALL-NEXT-METHOD", a => Runtime.CapturedCnm(), 0);
+        RegClos("%CAPTURED-NEXT-METHOD-P", a => Runtime.CapturedNmp(), 0);
+        // defstruct intrinsics (same rationale).
+        RegClos("%MAKE-STRUCT", a => Runtime.MakeStruct(a[0], a.SubArray(1)));
+        RegClos("%STRUCT-REF", a => Runtime.StructRef(a[0], a[1]), 2);
+        RegClos("%STRUCT-SET", a => Runtime.StructSet(a[0], a[1], a[2]), 3);
+        RegClos("%STRUCT-TYPEP", a => Runtime.StructTypep(a[0], a[1]), 2);
+        RegClos("%COPY-STRUCT", a => Runtime.CopyStruct(a[0]), 1);
+        // array/string element-set intrinsics (setf aref / setf char).
+        RegClos("%AREF-SET", a => a.Length switch
+        {
+            3 => Runtime.ArefSet(a[0], a[1], a[2]),
+            4 => Runtime.ArefSet2D(a[0], a[1], a[2], a[3]),
+            5 => Runtime.ArefSet3D(a[0], a[1], a[2], a[3], a[4]),
+            _ => Runtime.ArefSetMulti(a),
+        });
+        RegClos("%CHAR-SET", a => Runtime.CharSet(a[0], a[1], a[2]), 3);
+
         // MAKE-INSTANCE as a proper GF
         {
             var miSym = Startup.Sym("MAKE-INSTANCE");
@@ -3826,7 +3906,7 @@ public static partial class Runtime
                     if (args.Length == 0)
                         throw new LispErrorException(new LispProgramError("MAKE-INSTANCE: requires at least 1 argument"));
                     return Runtime.MakeInstanceWithInitargs(args[0],
-                        args.Length > 1 ? args[1..] : Array.Empty<LispObject>());
+                        args.Length > 1 ? args.SubArray(1) : Array.Empty<LispObject>());
                 }));
             ((LispMethod)miDefaultMethod).RequiredCount = 1;
             ((LispMethod)miDefaultMethod).HasRest = true;

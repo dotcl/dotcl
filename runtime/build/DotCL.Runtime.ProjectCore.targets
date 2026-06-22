@@ -45,7 +45,7 @@
   <Target Name="_DotCLResolveDeps"
           BeforeTargets="GetCopyToOutputDirectoryItems;_CollectAssetPackFiles;_GenerateAndroidAssetsDir;_CollectMauiAssetsTargetFramework;BeforeBuild"
           Condition="'$(DotclProjectAsd)' != ''"
-          Inputs="$(DotclProjectAsd)"
+          Inputs="$(DotclProjectAsd);@(DotclBuildInit)"
           Outputs="$(DotclSourceManifest);$(DotclRootSourcesList)">
     <MakeDir Directories="$(DotclBundleDir)" />
     <DotclResolveDeps Asd="$(DotclProjectAsd)"
@@ -53,6 +53,7 @@
                       ContribDir="$(_DotCLContribDir)"
                       ManifestOut="$(DotclSourceManifest)"
                       RootSourcesOut="$(DotclRootSourcesList)"
+                      BuildInit="@(DotclBuildInit)"
                       RuntimeAssemblyPath="$(_DotCLRuntimeAssembly)" />
   </Target>
 
@@ -85,12 +86,13 @@
           DependsOnTargets="_DotCLLoadItems"
           BeforeTargets="GetCopyToOutputDirectoryItems;_CollectAssetPackFiles;_GenerateAndroidAssetsDir;_CollectMauiAssetsTargetFramework;BeforeBuild"
           Condition="'$(DotclProjectAsd)' != ''"
-          Inputs="@(_DotclRootSource);$(DotclProjectAsd)"
+          Inputs="@(_DotclRootSource);$(DotclProjectAsd);@(DotclBuildInit)"
           Outputs="$(DotclRootFasl)">
     <DotclCompileProject Asd="$(DotclProjectAsd)"
                          Output="$(DotclRootFasl)"
                          BaseCore="$(DotclBaseCore)"
                          ContribDir="$(_DotCLContribDir)"
+                         BuildInit="@(DotclBuildInit)"
                          RuntimeAssemblyPath="$(_DotCLRuntimeAssembly)" />
   </Target>
 

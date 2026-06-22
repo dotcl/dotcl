@@ -44,7 +44,7 @@
 (defmethod clos-area ((s clos-child))
   (+ (call-next-method) 1))
 
-;;; Initarg validation — invalid initarg should error (D174)
+;;; Initarg validation — invalid initarg should error
 (deftest clos-invalid-initarg-error
   (signals-error (make-instance 'clos-point :z 99) error)
   t)
@@ -57,7 +57,7 @@
     (list (clos-person-name p) (clos-person-age p)))
   ("Alice" 30))
 
-;;; defstruct :read-only (D545) — accessor works
+;;; defstruct :read-only — accessor works
 (defstruct clos-ro-struct
   (value 0 :read-only t))
 
@@ -74,7 +74,7 @@
   (class-name (class-of (make-instance 'clos-point)))
   clos-point)
 
-;;; Issue #29: ValidateInitargs should apply to condition classes too
+;;; ValidateInitargs should apply to condition classes too
 (define-condition clos-test-condition (error)
   ((msg :initarg :message :reader condition-msg)))
 
@@ -89,8 +89,8 @@
   (signals-error (make-condition 'clos-test-condition :no-such-slot 42) error)
   t)
 
-;;; Issue #30: reinitialize-instance validates initargs when no custom methods exist
-;;; (Full &key-param collection from methods is deferred — see issue #30)
+;;; reinitialize-instance validates initargs when no custom methods exist
+;;; (Full &key-param collection from methods is deferred)
 (defclass clos-ri-obj ()
   ((val :initarg :val :accessor ri-val :initform 0)))
 
@@ -99,7 +99,7 @@
   (signals-error (reinitialize-instance (make-instance 'clos-ri-obj) :no-such-key 42) error)
   t)
 
-;;; Cross-package typep: pa:widget and pb:widget are distinct classes (#204)
+;;; Cross-package typep: pa:widget and pb:widget are distinct classes
 (defpackage :typep-test-pa (:use :cl) (:export :widget))
 (defpackage :typep-test-pb (:use :cl) (:export :widget))
 (defclass typep-test-pa:widget () ())
@@ -115,7 +115,7 @@
   (typep (make-instance 'typep-test-pa:widget) 'typep-test-pa:widget)
   t)
 
-;;; D1085: next-method-p fast path — funcall #'next-method-p must agree with
+;;; next-method-p fast path — funcall #'next-method-p must agree with
 ;;; compiled (next-method-p) even when an :around method for the same GF was
 ;;; dispatched previously (which set nmpSym.Function to a stale closure).
 
@@ -142,7 +142,7 @@
 
 ;; After dispatching via :around (sets nmpSym.Function stale), the fast path
 ;; must reset nmpSym.Function so (funcall #'next-method-p) still returns NIL.
-;; This was the D1085 regression.
+;; This was a regression in the fast path.
 (deftest nmp-fast-path-nil-after-around
   (progn
     (nmp-gf (make-instance 'nmp-derived))   ; pollutes nmpSym.Function
@@ -201,7 +201,7 @@
   (cnm-capture-gf2 (make-instance 'cnm-capture-derived2))
   :base2)
 
-;;; D1097: next-method-p with args must signal program-error
+;;; next-method-p with args must signal program-error
 (defgeneric nmp-arity-gf (x))
 (defmethod nmp-arity-gf ((x t)) nil)
 
@@ -213,7 +213,7 @@
     (program-error () :ok))
   :ok)
 
-;;; D1097: call-next-method with args that change applicable method set must error
+;;; call-next-method with args that change applicable method set must error
 (defgeneric cnm-applicability-gf (x))
 (defmethod cnm-applicability-gf ((x (eql 0))) (call-next-method 1))
 (defmethod cnm-applicability-gf ((x t)) :base)
@@ -224,7 +224,7 @@
     (error () :ok))
   :ok)
 
-;;; D1109/#268: method dispatch honours :argument-precedence-order (CLHS 7.6.6.1.2)
+;;; method dispatch honours :argument-precedence-order (CLHS 7.6.6.1.2)
 (defgeneric apo-foo (a b)
   (:argument-precedence-order b a))
 (defmethod apo-foo ((a t) (b null)) :a-null-b)
@@ -243,3 +243,61 @@
 (deftest d1109-natural-order-unchanged
   (apo-natural 5 nil)
   :b-integer-a)
+
+;;; call-next-method with EXPLICIT arguments must pass THOSE arguments to the next
+;;; method (CLHS 7.6.6.1), including when the next "method" is the before/primary/
+;;; after combination reached past the end of the :around chain. Regression for
+;;; the McCLIM editing-stream :around bug where the around prepended :peek-p nil but
+;;; the primary still saw the original :peek-p t (the fallback captured the original
+;;; generic-function args instead of the explicit ones).
+(defclass cnm-xargs () ())
+(defgeneric cnm-xargs-g (obj &key peek-p))
+(defmethod cnm-xargs-g ((obj cnm-xargs) &key peek-p &allow-other-keys) peek-p)
+(defmethod cnm-xargs-g :around ((obj cnm-xargs) &rest args &key peek-p &allow-other-keys)
+  (declare (ignore peek-p))
+  ;; prepend :peek-p nil to args, which already carries :peek-p t
+  (apply #'call-next-method obj :peek-p nil args))
+
+;; around supplies :peek-p nil; with the leftmost-wins keyword rule the primary
+;; must see NIL even though the original call (and trailing args) had :peek-p t.
+(deftest cnm-explicit-args-around-to-primary
+  (cnm-xargs-g (make-instance 'cnm-xargs) :peek-p t)
+  nil)
+
+;; Same shape but with the direct (call-next-method obj :peek-p nil) form.
+(defclass cnm-xargs2 () ())
+(defgeneric cnm-xargs-g2 (obj &key peek-p))
+(defmethod cnm-xargs-g2 ((obj cnm-xargs2) &key peek-p &allow-other-keys) peek-p)
+(defmethod cnm-xargs-g2 :around ((obj cnm-xargs2) &key peek-p &allow-other-keys)
+  (declare (ignore peek-p))
+  (call-next-method obj :peek-p nil))
+
+(deftest cnm-explicit-args-direct-form
+  (cnm-xargs-g2 (make-instance 'cnm-xargs2) :peek-p t)
+  nil)
+
+;; Without explicit args, call-next-method forwards the ORIGINAL args unchanged.
+(defclass cnm-noargs () ())
+(defgeneric cnm-noargs-g (obj &key peek-p))
+(defmethod cnm-noargs-g ((obj cnm-noargs) &key peek-p &allow-other-keys) peek-p)
+(defmethod cnm-noargs-g :around ((obj cnm-noargs) &key peek-p &allow-other-keys)
+  (declare (ignore peek-p))
+  (call-next-method))
+
+(deftest cnm-no-explicit-args-forwards-original
+  (cnm-noargs-g (make-instance 'cnm-noargs) :peek-p t)
+  t)
+
+;; Explicit args propagate down a chain of primary methods too (more-specific to
+;; less-specific via call-next-method).
+(defclass cnm-base () ())
+(defclass cnm-derived (cnm-base) ())
+(defgeneric cnm-chain-g (obj &key k))
+(defmethod cnm-chain-g ((obj cnm-base) &key k &allow-other-keys) k)
+(defmethod cnm-chain-g ((obj cnm-derived) &key k &allow-other-keys)
+  (declare (ignore k))
+  (call-next-method obj :k :from-derived))
+
+(deftest cnm-explicit-args-primary-chain
+  (cnm-chain-g (make-instance 'cnm-derived) :k :original)
+  :from-derived)

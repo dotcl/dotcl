@@ -81,7 +81,10 @@ internal static class DotNetEvents
         try
         {
             var lispArgs = rawArgs.Select(Runtime.DotNetToLisp).ToArray();
-            Runtime.Funcall(fn, lispArgs);
+            // Route Lisp errors through the unified callback-boundary handler
+            // (dotcl:*foreign-callback-handler*); the outer catch remains a safety
+            // net for non-Lisp .NET exceptions on the event thread.
+            Runtime.InvokeForeignCallback(fn, lispArgs);
         }
         catch (Exception ex)
         {

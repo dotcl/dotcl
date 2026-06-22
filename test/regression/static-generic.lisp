@@ -1,4 +1,4 @@
-;;; Regression tests for D895 — dotnet:static-generic: generic static methods (#191)
+;;; Regression tests for dotnet:static-generic: generic static methods
 
 ;;; Enumerable.Where<int> — filter list with lambda predicate
 (deftest d895-linq-where-basic
@@ -51,7 +51,7 @@
     error)
   t)
 
-;;; D1122 (dotcl/dotcl#23) — dotnet:invoke-generic: generic INSTANCE methods.
+;;; dotnet:invoke-generic: generic INSTANCE methods (dotcl/dotcl#23).
 ;;; List<int>.ConvertAll<string>(Converter<int,string>) via a Lisp delegate.
 (deftest d1122-invoke-generic-convertall
   (let ((lst (dotnet:new "System.Collections.Generic.List`1[System.Int32]")))

@@ -138,12 +138,16 @@ public static class Startup
         // with a version mismatch. Probing Microsoft.WindowsDesktop.App (and the other
         // shared frameworks) by name lets WPF/WinForms actually be used, not just
         // loaded. Fires only on resolution failure, so it's a safe fallback.
+#if !NETSTANDARD2_0
+        // System.Runtime.Loader (AssemblyLoadContext) is absent on netstandard2.0,
+        // where the host owns assembly resolution.
         System.Runtime.Loader.AssemblyLoadContext.Default.Resolving += (ctx, name) =>
         {
             if (name.Name == null) return null;
             var dll = Runtime.FindSharedFrameworkDll(name.Name);
             return dll != null ? ctx.LoadFromAssemblyPath(dll) : null;
         };
+#endif
 
         // Create packages
         CL = new Package("COMMON-LISP", "CL");
@@ -380,17 +384,17 @@ public static class Startup
         traceOut.Value = StandardOutput;
 
         // Platform-specific features (must be added before building *features* list)
-        if (OperatingSystem.IsWindows())
+        if (Compat.IsWindows())
         {
             _features.Add("WINDOWS");
             _features.Add("WIN32");   // SBCL/CMUCL compat alias used by many libraries
         }
-        if (OperatingSystem.IsLinux())
+        if (Compat.IsLinux())
         {
             _features.Add("LINUX");
             _features.Add("UNIX");
         }
-        if (OperatingSystem.IsMacOS())
+        if (Compat.IsMacOS())
         {
             _features.Add("MACOS");
             _features.Add("DARWIN"); // macOS kernel name, used by cffi/babel etc.
@@ -564,8 +568,8 @@ public static class Startup
         // Use BitIncrement to find the exact next float above the rounding midpoint.
         float singleEps = MathF.BitIncrement(MathF.ScaleB(1.0f, -24));     // next float after 2^-24
         float singleNegEps = MathF.BitIncrement(MathF.ScaleB(1.0f, -25));  // next float after 2^-25
-        double doubleEps = Math.BitIncrement(Math.ScaleB(1.0, -53));       // next float after 2^-53
-        double doubleNegEps = Math.BitIncrement(Math.ScaleB(1.0, -54));    // next float after 2^-54
+        double doubleEps = Compat.BitIncrement(Compat.ScaleB(1.0, -53));       // next float after 2^-53
+        double doubleNegEps = Compat.BitIncrement(Compat.ScaleB(1.0, -54));    // next float after 2^-54
         SetSingleFloatConst("SINGLE-FLOAT-EPSILON", singleEps);
         SetSingleFloatConst("SINGLE-FLOAT-NEGATIVE-EPSILON", singleNegEps);
         SetSingleFloatConst("SHORT-FLOAT-EPSILON", singleEps);
@@ -612,7 +616,7 @@ public static class Startup
         }
         RegisterUnary("SINGLE-FLOAT-BITS", a => {
             if (a is SingleFloat sf)
-                return Fixnum.Make(BitConverter.SingleToInt32Bits(sf.Value));
+                return Fixnum.Make(Compat.SingleToInt32Bits(sf.Value));
             throw new LispErrorException(new LispTypeError("SINGLE-FLOAT-BITS: not a single-float", a));
         });
         RegisterUnary("DOUBLE-FLOAT-BITS", a => {
@@ -632,7 +636,7 @@ public static class Startup
         });
         RegisterUnary("MAKE-SINGLE-FLOAT", a => {
             long bits = a is Fixnum f ? f.Value : throw new LispErrorException(new LispTypeError("MAKE-SINGLE-FLOAT: not an integer", a));
-            return new SingleFloat(BitConverter.Int32BitsToSingle((int)bits));
+            return new SingleFloat(Compat.Int32BitsToSingle((int)bits));
         });
         RegisterUnary("MAKE-DOUBLE-FLOAT", a => {
             long bits = a is Fixnum f ? f.Value : throw new LispErrorException(new LispTypeError("MAKE-DOUBLE-FLOAT: not an integer", a));
@@ -1255,9 +1259,9 @@ public static class Startup
         // DOTCL:GC — trigger .NET GC
         {
             var gcFn = new LispFunction(_ => {
-                GC.Collect(2, GCCollectionMode.Aggressive, true, true);
+                GC.Collect(2, Compat.AggressiveGCMode, true, true);
                 GC.WaitForPendingFinalizers();
-                GC.Collect(2, GCCollectionMode.Aggressive, true, true);
+                GC.Collect(2, Compat.AggressiveGCMode, true, true);
                 return Nil.Instance;
             }, "DOTCL:GC", -1);
             var gcSym = SymInPkg("GC", "DOTCL");
@@ -1305,6 +1309,9 @@ public static class Startup
             var btFn = new LispFunction(Runtime.Backtrace);
             RegisterDotcl("BACKTRACE", btFn);
             Emitter.CilAssembler.RegisterFunction("DOTCL:BACKTRACE", btFn);
+            var btaFn = new LispFunction(Runtime.BacktraceWithArgs);
+            RegisterDotcl("BACKTRACE-WITH-ARGS", btaFn);
+            Emitter.CilAssembler.RegisterFunction("DOTCL:BACKTRACE-WITH-ARGS", btaFn);
             var pbtFn = new LispFunction(Runtime.PrintBacktrace);
             RegisterDotcl("PRINT-BACKTRACE", pbtFn);
             Emitter.CilAssembler.RegisterFunction("DOTCL:PRINT-BACKTRACE", pbtFn);
@@ -1390,6 +1397,17 @@ public static class Startup
         saveSilSym.IsSpecial = true;
         saveSilSym.Value = Nil.Instance;
 
+        // dotcl:*evaluator-mode* — :compile (default) routes eval of compound
+        // forms through the CIL compiler; :interpret routes them through the
+        // emit-free tree-walk interpreter (%mini-eval). On a build without
+        // Reflection.Emit (netstandard2.0) the interpreter is always used
+        // regardless of this var. Lets the differential harness exercise the
+        // whole suite through the interpreter on a normal (net10) build.
+        var evalModeSym = SymInPkg("*EVALUATOR-MODE*", "DOTCL");
+        DotclPkg.Export(evalModeSym);
+        evalModeSym.IsSpecial = true;
+        evalModeSym.Value = Keyword("COMPILE");
+
         // dotcl:user-init-file — absolute pathname of the init file dotcl loads
         // at startup. Returned absolute so callers (e.g. quicklisp's
         // add-to-init-file, which merges against the home dir) target the real
@@ -1420,6 +1438,16 @@ public static class Startup
         DotclPkg.Export(debugStacktraceSym);
         debugStacktraceSym.IsSpecial = true;
         debugStacktraceSym.Value = Nil.Instance;
+
+        // dotcl:*foreign-callback-handler* — handler invoked when a Lisp error
+        // escapes a C#→Lisp callback (delegate / event / %define-class override).
+        // A function of one argument (the condition); its result becomes the
+        // callback's result. NIL (default) => report to *error-output* + return NIL
+        // so the host (e.g. a Game.Run loop) survives instead of crashing.
+        var foreignCbSym = SymInPkg("*FOREIGN-CALLBACK-HANDLER*", "DOTCL");
+        DotclPkg.Export(foreignCbSym);
+        foreignCbSym.IsSpecial = true;
+        foreignCbSym.Value = Nil.Instance;
 
         // dotcl:%ctype-stats — return CType routing statistics (temporary diagnostic)
         RegisterDotcl("%CTYPE-STATS", new LispFunction(args => {
@@ -1531,6 +1559,12 @@ public static class Startup
         // .fasl (PE assembly). Input .sil is one single top-level form whose
         // locals/labels may span the whole body (e.g. the cross-compiled
         // cil-out.sil). Emits it into ModuleInit via FaslAssembler.AddMonolithicForm.
+        // Emit-only: FaslAssembler is excluded from the netstandard2.0 build.
+#if DOTCL_EMIT
+        // (dotcl:sil-to-fasl input-path output-path &optional module-name)
+        // module-name pins a stable .NET assembly name (no per-run guid suffix) for
+        // build-time-linked / NativeAOT deployment of the core; omit it for the
+        // default guid-uniqued name. See compile-file :module-name.
         RegisterDotcl("SIL-TO-FASL", new LispFunction(args => {
             if (args.Length < 2)
                 throw new LispErrorException(new LispProgramError(
@@ -1542,13 +1576,19 @@ public static class Startup
             if (!reader.TryRead(out var instrList))
                 throw new LispErrorException(new LispProgramError(
                     $"SIL-TO-FASL: empty input: {inPath}"));
-            var moduleName = System.IO.Path.GetFileNameWithoutExtension(outPath)
-                + "_" + System.Guid.NewGuid().ToString("N").Substring(0, 8);
+            var moduleName = (args.Length >= 3 && args[2] is LispString mn && mn.Value.Length > 0)
+                ? mn.Value
+                : System.IO.Path.GetFileNameWithoutExtension(outPath)
+                    + "_" + System.Guid.NewGuid().ToString("N").Substring(0, 8);
+            var corlib = (args.Length >= 4 && args[3] is LispString cl && cl.Value.Length > 0)
+                ? cl.Value
+                : null;
             var fasl = new DotCL.Emitter.FaslAssembler(moduleName);
             fasl.AddMonolithicForm(instrList);
-            fasl.Save(outPath);
+            fasl.Save(outPath, corlib);
             return new LispString(outPath);
-        }, "SIL-TO-FASL", 2));
+        }, "SIL-TO-FASL", -1));
+#endif
 
         // dotcl:gc-stats — (gen0-count gen1-count gen2-count total-memory total-allocated-bytes)
         // Used by TIME to compute before/after deltas.
@@ -1603,7 +1643,7 @@ public static class Startup
                 UseShellExecute = false,
                 CreateNoWindow = true,
             };
-            foreach (var a in argStrings) psi.ArgumentList.Add(a);
+            foreach (var a in argStrings) Compat.AddArg(psi, a);
             try {
                 using var proc = System.Diagnostics.Process.Start(psi)!;
                 // Read stdout and stderr concurrently to avoid pipe buffer deadlock
@@ -1705,7 +1745,16 @@ public static class Startup
         RegisterDotcl("PROCESS-KILL", new LispFunction(args => {
             if (args[0] is not LispProcess p)
                 throw new LispErrorException(new LispTypeError("PROCESS-KILL: not a process", args[0]));
-            try { if (!p.Process.HasExited) p.Process.Kill(entireProcessTree: true); } catch { }
+            try
+            {
+                if (!p.Process.HasExited)
+#if NETSTANDARD2_0
+                    p.Process.Kill();
+#else
+                    p.Process.Kill(entireProcessTree: true);
+#endif
+            }
+            catch { }
             return Nil.Instance;
         }));
 
@@ -1794,8 +1843,14 @@ public static class Startup
             "(dotnet:invoke-generic object \"Method\" (type-arg ...) &rest args) => value\nInstance counterpart of dotnet:static-generic: invoke a generic instance method on\nOBJECT, instantiating it with the given type-argument name strings before the\ncall (e.g. (dotnet:invoke-generic cm \"Load\" '(\"Texture2D\") \"images/logo\")).");
         RegisterDotNet(DotNetPkg, "RESOLVE-TYPE", new LispFunction(Runtime.DotNetResolveType, "DOTNET:RESOLVE-TYPE", 1),
             "(dotnet:resolve-type type-name) => type\nResolve a .NET System.Type from a name string, searching loaded assemblies\n(loading by namespace prefix, and COM ProgIDs on Windows). The result can be\ninspected or passed anywhere a System.Type is expected. Errors if not found.");
+#if !DOTCL_NO_JSON
+        // DOTNET:REQUIRE pulls NuGet packages at run time (Assembly.LoadFrom +
+        // System.Text.Json manifest parsing) — inherently incompatible with AOT/
+        // IL2CPP/WebGL, and the only consumer of the System.Text.Json dependency.
+        // The DotclNoJson build drops both (see DotCL.Runtime.csproj).
         RegisterDotNet(DotNetPkg, "REQUIRE", new LispFunction(DotNetNuGet.Require, "DOTNET:REQUIRE", -1),
             "(dotnet:require package &optional version) => t\nDownload (if needed) and load a NuGet package and its dependencies, making the\nassemblies available for resolution and calls.");
+#endif
 #if !DOTCL_NO_WINFORMS
         RegisterDotNet(DotNetPkg, "UI-INVOKE", new LispFunction(DotNetWinForms.UiInvoke, "DOTNET:UI-INVOKE", -1),
             "(dotnet:ui-invoke fn) => value\nRun FN on the UI (message-loop) thread and wait for it, returning its value.\nUse for code that must touch UI controls from a background thread.");
@@ -1823,11 +1878,24 @@ public static class Startup
         RegisterDotNet(DotNetPkg, "%DEFINE-CLASS", new LispFunction(Runtime.DotNetDefineClass, "DOTNET:%DEFINE-CLASS", -1));
         RegisterDotNet(DotNetPkg, "BOX", new LispFunction(Runtime.DotNetBox, "DOTNET:BOX", -1),
             "(dotnet:box value type-name) => boxed-value\nMarshal a Lisp VALUE to the named .NET type and keep it boxed at that static\ntype, so the right overload is chosen when it is passed to a subsequent call.");
+        RegisterDotNet(DotNetPkg, "HINT-TYPE", new LispFunction(args => {
+            if (args.Length != 1) throw new LispErrorException(new LispProgramError($"DOTNET:HINT-TYPE: requires 1 argument, got {args.Length}"));
+            return Runtime.DotNetHintType(args[0]);
+        }, "DOTNET:HINT-TYPE", 1),
+            "(dotnet:hint-type obj) => type-or-nil\nFor a dotnet:box value, return its hint type (the user-supplied static type used\nto choose overloads) as a System.Type; NIL if OBJ carries no hint. See\ndotnet:object-type for the actual runtime type.");
+        RegisterDotNet(DotNetPkg, "OBJECT-TYPE", new LispFunction(args => {
+            if (args.Length != 1) throw new LispErrorException(new LispProgramError($"DOTNET:OBJECT-TYPE: requires 1 argument, got {args.Length}"));
+            return Runtime.DotNetObjectType(args[0]);
+        }, "DOTNET:OBJECT-TYPE", 1),
+            "(dotnet:object-type obj) => type-or-nil\nReturn the actual runtime type of a .NET object as a System.Type; NIL if OBJ is\nnot a .NET object. For a dotnet:box value this may differ from dotnet:hint-type.");
         RegisterDotNet(DotNetPkg, "TO-STREAM", new LispFunction(Runtime.DotNetToStream, "DOTNET:TO-STREAM", -1),
             "(dotnet:to-stream object) => stream\nAdapt OBJECT (a Lisp stream or an existing .NET stream object) to a\nSystem.IO.Stream usable by .NET APIs.");
+#if DOTCL_EMIT
+        // %FFI-CALL / FFI use DynamicMethod + calli (Runtime.FFI.cs) — emit-only.
         RegisterDotNet(DotNetPkg, "%FFI-CALL", new LispFunction(Runtime.FfiCall, "DOTNET:%FFI-CALL", -1));
         RegisterDotNet(DotNetPkg, "FFI", new LispFunction(Runtime.FfiCallKeyword, "DOTNET:FFI", -1),
             "(dotnet:ffi dll func :args '(type ...) :ret type &rest args) => value\nCall a native (P/Invoke) function FUNC in shared library DLL. :args gives the\nparameter types and :ret the return type; ARGS are marshalled accordingly.");
+#endif
         RegisterDotNet(DotNetPkg, "%FFI-CALL-PTR", new LispFunction(Runtime.FfiCallPtr, "DOTNET:%FFI-CALL-PTR", -1));
         RegisterDotNet(DotNetPkg, "ALLOC-MEM", new LispFunction(Runtime.AllocMem, "DOTNET:ALLOC-MEM", -1),
             "(dotnet:alloc-mem size) => pointer\nAllocate SIZE bytes of unmanaged memory and return a pointer. Free it with\ndotnet:free-mem.");

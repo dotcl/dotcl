@@ -18,7 +18,7 @@
   (coerce (map 'vector #'1+ '(1 2 3)) 'list)
   (2 3 4))
 
-;;; MAP with OR type — conflicting element types should signal type-error (D578)
+;;; MAP with OR type — conflicting element types should signal type-error
 (deftest seq-map-or-type-conflict
   (handler-case
       (map '(or (vector bit) (vector t)) #'identity '(1 0 1))

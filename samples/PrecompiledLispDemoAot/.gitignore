@@ -1,0 +1,5 @@
+# Build outputs of the PrecompileLisp target (stable-named Lisp IL assemblies,
+# generated from app.lisp / the dev SIL core). Not committed — produced by the
+# build.
+/appfasl.dll
+/dotclcore.dll

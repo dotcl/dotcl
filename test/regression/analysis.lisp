@@ -238,7 +238,7 @@
   10)
 
 ;;; ============================================================
-;;; Deep nesting stress test (iterative analysis, #18)
+;;; Deep nesting stress test (iterative analysis)
 ;;; ============================================================
 
 ;;; Generate deeply nested lets with a closure capture at the bottom.

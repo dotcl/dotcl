@@ -1212,7 +1212,7 @@ public static partial class Runtime
             }
             else
             {
-                var bigVal = new BigInteger(bytes, isUnsigned: true, isBigEndian: false);
+                var bigVal = Compat.MakeBigInteger(bytes, isUnsigned: true, isBigEndian: false);
                 return Bignum.MakeInteger(bigVal);
             }
         }
@@ -1471,7 +1471,7 @@ public static partial class Runtime
                         }
                         else
                         {
-                            var bigVal = new BigInteger(bytes, isUnsigned: true, isBigEndian: false);
+                            var bigVal = Compat.MakeBigInteger(bytes, isUnsigned: true, isBigEndian: false);
                             vec.SetElement(pos++, Bignum.MakeInteger(bigVal));
                         }
                     }
@@ -3075,6 +3075,7 @@ public static partial class Runtime
             throw new LispErrorException(new LispTypeError("OUTPUT-STREAM-P: not a stream", obj, Startup.Sym("STREAM")));
         });
         Startup.RegisterUnary("INTERACTIVE-STREAM-P", obj => {
+            if (obj is LispInstance) return Nil.Instance; // CLOS/gray stream: not interactive (cf. OUTPUT-STREAM-P)
             if (obj is not LispStream) throw new LispErrorException(new LispTypeError("INTERACTIVE-STREAM-P: not a stream", obj, Startup.Sym("STREAM")));
             if (obj is LispSynonymStream syn) obj = DynamicBindings.Get(syn.Symbol);
             if (obj is LispInputStream li && li.Reader == Console.In) return T.Instance;
@@ -3387,7 +3388,7 @@ public static partial class Runtime
                         throw new LispErrorException(new LispProgramError($"{fn}: wrong number of arguments: {args.Length} (expected 0 or 1)"));
                     // Gray output stream: trampoline to the corresponding generic
                     // (stream-force-output / stream-finish-output / stream-clear-output)
-                    // so streamp=T instances are accepted, consistent with D1211.
+                    // so streamp=T instances are accepted.
                     if (args.Length > 0 && args[0] is LispInstance gi && IsGrayOutputStream(gi))
                     {
                         var gfn = GrayStreamLookup.GrayOrCl("STREAM-" + fn);

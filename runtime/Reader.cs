@@ -909,7 +909,7 @@ public class Reader
         foreach (var d in dims) total *= d;
 
         var items = new LispObject[total];
-        Array.Fill(items, Nil.Instance);
+        Compat.Fill(items, Nil.Instance);
         FlattenArrayContents(contents, items, 0, rank);
 
         return rank == 1
@@ -941,7 +941,7 @@ public class Reader
 
         var slotNames = cls.StructSlotNames;
         var slots = new LispObject[slotNames.Length];
-        Array.Fill(slots, Nil.Instance);
+        Compat.Fill(slots, Nil.Instance);
 
         // Parse slot-value pairs from the rest of the list
         var rest = firstCons.Cdr;

@@ -1,16 +1,15 @@
-;;; Regression tests for D771-D776 — runtime emission of named .NET classes
-;;; via DOTNET:%DEFINE-CLASS. See project memory
-;;; `project_net_class_emission.md` for the multi-step roadmap.
+;;; Regression tests for runtime emission of named .NET classes
+;;; via DOTNET:%DEFINE-CLASS.
 
 ;;; Common helper: build a method-specs list containing a single Greet() that
-;;; returns the given string (closed-over value). Used by D771/D772/D773
-;;; tests that verify a round-trip through the Lisp-dispatch path.
+;;; returns the given string (closed-over value). Used by the tests that verify
+;;; a round-trip through the Lisp-dispatch path.
 (defun %greet-spec (retval)
   (list (list "Greet" "System.String" nil
               (lambda (self) (declare (ignore self)) retval))))
 
 ;;; -------------------------------------------------------------------------
-;;; D771 — Step 1: named class, default ctor, dynamic assembly visibility
+;;; Step 1: named class, default ctor, dynamic assembly visibility
 
 (deftest d771-define-class-returns-fullname
   (dotnet:%define-class "DotclTest.NetClassA")
@@ -48,7 +47,7 @@
   "DotclTest.NetClassD")
 
 ;;; -------------------------------------------------------------------------
-;;; D772 — Step 2: base type
+;;; Step 2: base type
 
 ;;; Without a base arg, the default is System.Object.
 (deftest d772-default-base-is-object
@@ -88,7 +87,7 @@
   t)
 
 ;;; -------------------------------------------------------------------------
-;;; D773 — Step 3: public instance fields
+;;; Step 3: public instance fields
 
 ;;; Single field (int) set/get roundtrip
 (deftest d773-int-field-roundtrip
@@ -142,7 +141,7 @@
   t)
 
 ;;; -------------------------------------------------------------------------
-;;; D774 — Step 4: type-level custom attributes
+;;; Step 4: type-level custom attributes
 
 ;;; Applying an attribute with no arguments
 (deftest d774-attribute-applied
@@ -198,7 +197,7 @@
   t)
 
 ;;; -------------------------------------------------------------------------
-;;; D776 — Step 5a: user-defined instance methods whose bodies dispatch to a
+;;; Step 5a: user-defined instance methods whose bodies dispatch to a
 ;;; Lisp lambda through DispatchLispMethod. self is passed as the first
 ;;; Lisp arg.
 
@@ -305,9 +304,9 @@
   t)
 
 ;;; -------------------------------------------------------------------------
-;;; D777 — Step 5b: dotnet:define-class macro (syntactic sugar over %define-class)
+;;; Step 5b: dotnet:define-class macro (syntactic sugar over %define-class)
 
-;;; The macro lives in contrib. Load it via require (D778).
+;;; The macro lives in contrib. Load it via require.
 (require :dotnet-class)
 
 ;;; Minimal form: name and superclass only. fields/attrs/methods omitted.
@@ -376,7 +375,7 @@
   2)
 
 ;;; -------------------------------------------------------------------------
-;;; D778 — Step 5c: type short-name resolution + require integration
+;;; Step 5c: type short-name resolution + require integration
 
 ;;; BCL type symbol short-names are valid (Int32 / String / Void / Object)
 (deftest d778-shortnames-primitive
@@ -444,7 +443,7 @@
   "DotclTest.UserAliasBase")
 
 ;;; -------------------------------------------------------------------------
-;;; D783 — Step 7a: ctor body (Lisp lambda invoked after base.ctor)
+;;; Step 7a: ctor body (Lisp lambda invoked after base.ctor)
 
 ;;; The ctor body is called and can initialize own fields via self
 (deftest d783-ctor-body-initializes-field
@@ -519,7 +518,7 @@
   123)
 
 ;;; -------------------------------------------------------------------------
-;;; D785 — Step 7b: auto-properties (private backing field + public get/set)
+;;; Step 7b: auto-properties (private backing field + public get/set)
 
 ;;; Int property set/get roundtrip (DOTNET:INVOKE finds get_X/set_X
 ;;; and calls them via InvokeMember)
@@ -576,7 +575,7 @@
   (5 "foo"))
 
 ;;; -------------------------------------------------------------------------
-;;; D786 — Step 7c: virtual method override via DefineMethodOverride
+;;; Step 7c: virtual method override via DefineMethodOverride
 
 ;;; Basic: overriding System.Object.ToString(). Virtual dispatch selects the override.
 (deftest d786-override-tostring
@@ -670,7 +669,7 @@
       (dotnet:invoke obj "ToString")))
   "macro-override")
 
-;;; No :override in macro means a normal method (confirms compatibility with existing d777)
+;;; No :override in macro means a normal method (confirms compatibility with plain methods)
 (deftest d786-macro-no-override-still-works
   (progn
     (dotnet:define-class "DotclTest.MacroNoOverride" (Object)
@@ -682,7 +681,7 @@
   "plain")
 
 ;;; -------------------------------------------------------------------------
-;;; D787 — Step 7d: interface implementations
+;;; Step 7d: interface implementations
 
 ;;; Implement IDisposable. The type is visible as an is-a IDisposable.
 (deftest d787-implement-idisposable
@@ -813,7 +812,7 @@
   ("vm" "vm" 2))
 
 ;;; -------------------------------------------------------------------------
-;;; D788 — Step 7e: events (delegate field + add_/remove_ accessors + EventBuilder)
+;;; Step 7e: events (delegate field + add_/remove_ accessors + EventBuilder)
 
 ;;; Basic: event is visible via reflection
 (deftest d788-event-visible-via-reflection
@@ -897,7 +896,7 @@
   (t t))
 
 ;;; dotnet:add-event / remove-event complete without crashing
-;;; (whether the handler is actually called cannot be verified until D789's raiser is implemented)
+;;; (whether the handler is actually called is verified later once the raiser exists)
 (deftest d788-add-remove-event-roundtrip
   (progn
     (dotnet:%define-class "DotclTest.EventC" nil nil nil nil nil nil nil
@@ -942,7 +941,7 @@
   (1 1 1))
 
 ;;; -------------------------------------------------------------------------
-;;; D789 — Step 7f: event raiser auto-generation (OnName)
+;;; Step 7f: event raiser auto-generation (OnName)
 
 ;;; OnName is emitted as a public method (sender-pattern)
 (deftest d789-raiser-method-exists
@@ -1006,7 +1005,7 @@
       t))
   t)
 
-;;; D794 (#160 fix): remove-event can actually detach the delegate even when
+;;; remove-event can actually detach the delegate even when
 ;;; a bare Lisp lambda is passed. Handler identity is resolved via cache.
 (deftest d794-remove-event-bare-lambda
   (progn
@@ -1105,7 +1104,7 @@
   ("new-title" "Title"))
 
 ;;; -------------------------------------------------------------------------
-;;; D790 — Step 7g: :notify t makes setter auto-call OnPropertyChanged
+;;; Step 7g: :notify t makes setter auto-call OnPropertyChanged
 
 ;;; With :notify t specified, PropertyChanged fires on property set
 (deftest d790-notify-fires-property-changed
@@ -1209,7 +1208,7 @@
   ("hello" 3 (("Title") ("Count"))))
 
 ;;; -------------------------------------------------------------------------
-;;; D785 integration (leading comment left as-is from the original)
+;;; Auto-property integration
 
 ;;; Integration of properties + ctor + methods — ViewModel equivalent pattern
 (deftest d785-integration-viewmodel
@@ -1234,7 +1233,7 @@
   ("initial" 3))
 
 ;;; -------------------------------------------------------------------------
-;;; D892 — dotnet:ref: indexer sugar
+;;; dotnet:ref: indexer sugar
 
 ;;; List<int> get via dotnet:ref
 (deftest d892-ref-list-get
@@ -1261,7 +1260,7 @@
   42)
 
 ;;; -------------------------------------------------------------------------
-;;; D893 — dotnet:using: IDisposable resource cleanup macro
+;;; dotnet:using: IDisposable resource cleanup macro
 
 ;;; Body value is returned
 (deftest d893-using-returns-body
@@ -1289,7 +1288,7 @@
   42)
 
 ;;; -------------------------------------------------------------------------
-;;; D1081 — parameterized constructors via (:ctor (params...) body...)
+;;; parameterized constructors via (:ctor (params...) body...)
 
 ;;; Single Int32 param: value passed to new is forwarded to ctor body
 (deftest d1081-ctor-single-int-param
@@ -1335,7 +1334,7 @@
   7)
 
 ;;; -------------------------------------------------------------------------
-;;; D1101 — CLOS dispatch on dotnet:define-class instances
+;;; CLOS dispatch on dotnet:define-class instances
 
 ;;; Top-level class definitions so macro expansion of subclasses sees the parent.
 (dotnet:define-class "DotclTest.ClsBase1" (Object))
@@ -1386,7 +1385,7 @@
   :animal)
 
 ;;; -------------------------------------------------------------------------
-;;; D1106 — method overloading and constructor overloading
+;;; method overloading and constructor overloading
 
 ;;; Same method name, different arity → each dispatches correctly
 (deftest d1106-method-overload-by-arity
@@ -1441,7 +1440,7 @@
           (dotnet:invoke (dotnet:new "DotclTest.OverloadCtorA" 42) "get_N")))
   (0 42))
 
-;;; D1125 — char-backed LispVector strings (BASE-STRING) marshal to System.String.
+;;; char-backed LispVector strings (BASE-STRING) marshal to System.String.
 ;;; CL strings have two runtime reprs (LispString and fill-pointered/adjustable
 ;;; char LispVector); both report type-of SIMPLE-BASE-STRING / BASE-STRING. Only
 ;;; LispString marshaled to System.String, so a char-vector string passed to a
@@ -1466,7 +1465,7 @@
       (dotnet:invoke sb "ToString")))
   "Hello")
 
-;;; #305 — Nullable<T> marshalling. bool? mirrors plain bool (t->true, nil->false);
+;;; Nullable<T> marshalling. bool? mirrors plain bool (t->true, nil->false);
 ;;; (dotnet:null) is an explicit .NET null distinct from Lisp NIL. Before the fix,
 ;;; nil->bool? became null (so false was unreachable) and t->bool? errored.
 (deftest issue305-dotnet-null-distinct
