@@ -204,3 +204,204 @@
          (sr (dotnet:new "System.IO.StreamReader" ms)))
     (notnot (dotnet:invoke sr "get_BaseStream")))
   t)
+
+;;; dotnet:new ctor selection must admit a ctor whose trailing params are all
+;;; optional (filling their defaults), so a wrapped value-type struct arg picks
+;;; ColorBox(ColorVal, double=1) over the fixed-arity ColorBox(uint) — which
+;;; would Convert.ChangeType(struct, uint) and fail "Object must implement
+;;; IConvertible". Models Avalonia.Media.SolidColorBrush(Color).
+(deftest issue357-ctor-optional-tail-prefers-struct-over-uint
+  (let* ((c (dotnet:static "DotCL.TestSupport.ColorVal" "Parse" "#808080"))
+         (b (dotnet:new "DotCL.TestSupport.ColorBox" c)))
+    (dotnet:invoke b "Tag"))
+  "color 128 op 1")
+
+;;; dotnet:call-out-generic — generic method + out/ref parameters combined
+;;; (dotcl/dotcl#45). dotnet:static-generic/invoke-generic handle generics but
+;;; not out/ref; dotnet:call-out handles out/ref but not open generic defs.
+;;; Enum.TryParse<TEnum>(string, out TEnum) exercises both at once.
+(deftest issue45-call-out-generic-enum-tryparse-ok
+  (multiple-value-bind (ok day)
+      (dotnet:call-out-generic "System.Enum" "TryParse" '("System.DayOfWeek") "Monday")
+    (list (notnot ok) (dotnet:invoke day "ToString")))
+  (t "Monday"))
+
+(deftest issue45-call-out-generic-enum-tryparse-fail
+  (multiple-value-bind (ok day)
+      (dotnet:call-out-generic "System.Enum" "TryParse" '("System.DayOfWeek") "Nonsense")
+    (declare (ignore day))
+    ok)
+  nil)
+
+;;; dotnet:make-array — sized typed .NET array creation, 1-D and multi-dim
+;;; (dotcl/dotcl#45). Distinct from dotnet:new-array (which fills from elements).
+(deftest issue45-make-array-1d
+  (let ((a (dotnet:make-array "System.Int32" 3)))
+    (dotnet:invoke a "set_Item" 0 42)
+    (dotnet:invoke a "set_Item" 2 7)
+    (list (dotnet:invoke a "get_Length")
+          (dotnet:invoke a "get_Item" 0)
+          (dotnet:invoke a "get_Item" 1)
+          (dotnet:invoke a "get_Item" 2)))
+  (3 42 0 7))
+
+(deftest issue45-make-array-2d
+  (let ((m (dotnet:make-array "System.Single" 2 3)))
+    (dotnet:invoke m "set_Item" 1 2 9.5)
+    (list (dotnet:invoke m "get_Length")
+          (dotnet:invoke m "get_Rank")
+          (dotnet:invoke m "get_Item" 1 2)))
+  (6 2 9.5d0))
+
+;;; dotnet:is-instance-of / dotnet:cast (dotcl/dotcl#45). is-instance-of replaces
+;;; manual Type.IsAssignableFrom; cast verifies + re-wraps with a hint type for
+;;; overload resolution (reference upcast).
+(deftest issue45-is-instance-of
+  (let ((sb (dotnet:new "System.Text.StringBuilder")))
+    (list (notnot (dotnet:is-instance-of sb "System.Object"))
+          (dotnet:is-instance-of sb "System.IConvertible")
+          (notnot (dotnet:is-instance-of "hi" "System.String"))
+          (dotnet:is-instance-of "hi" "System.Int32")))
+  (t nil t nil))
+
+(deftest issue45-cast-upcast-hint
+  (let* ((sb (dotnet:new "System.Text.StringBuilder"))
+         (o (dotnet:cast sb "System.Object")))
+    (dotnet:invoke (dotnet:hint-type o) "get_Name"))
+  "Object")
+
+(deftest issue45-cast-bad-errors
+  (handler-case (progn (dotnet:cast (dotnet:new "System.Text.StringBuilder") "System.Int32") :no-error)
+    (error () :errored))
+  :errored)
+
+;;; dotnet:enum-or — combine [Flags] enum members with bitwise OR (dotcl/dotcl#45).
+;;; Members may be name strings/symbols (case-insensitive), integers, or enum values.
+(deftest issue45-enum-or-names
+  (dotnet:invoke (dotnet:enum-or "System.IO.FileAccess" "Read" "Write") "ToString")
+  "ReadWrite")
+
+(deftest issue45-enum-or-mixed-int-and-symbol
+  (list (dotnet:invoke (dotnet:enum-or "System.IO.FileAccess" 1 "Write") "ToString")
+        (dotnet:invoke (dotnet:enum-or "System.IO.FileAccess" :read :write) "ToString"))
+  ("ReadWrite" "ReadWrite"))
+
+(deftest issue45-enum-or-bad-member-errors
+  (handler-case (progn (dotnet:enum-or "System.IO.FileAccess" "Nope") :ok)
+    (error () :errored))
+  :errored)
+
+(deftest issue45-enum-or-non-enum-errors
+  (handler-case (progn (dotnet:enum-or "System.Int32" 1) :ok)
+    (error () :errored))
+  :errored)
+
+;;; dotnet:make-generic-type — construct a closed generic System.Type from an
+;;; open definition + type-arg names; usable directly with dotnet:new (which now
+;;; accepts a resolved System.Type as its first arg). (dotcl/dotcl#45)
+(deftest issue45-make-generic-type-infer-arity
+  (let* ((dty (dotnet:make-generic-type "System.Collections.Generic.Dictionary"
+                                        '("System.String" "System.Int32")))
+         (d (dotnet:new dty)))
+    (dotnet:invoke d "set_Item" "x" 42)
+    (list (dotnet:invoke d "get_Count") (dotnet:invoke d "get_Item" "x")))
+  (1 42))
+
+(deftest issue45-make-generic-type-explicit-backtick
+  (dotnet:invoke (dotnet:make-generic-type "System.Collections.Generic.List`1" '("System.Int32"))
+                 "get_Name")
+  "List`1")
+
+(deftest issue45-make-generic-type-arity-mismatch-errors
+  (handler-case
+      (progn (dotnet:make-generic-type "System.Collections.Generic.Dictionary" '("System.String")) :ok)
+    (error () :errored))
+  :errored)
+
+;;; aref / (setf aref) transparency over wrapped .NET arrays (dotcl/dotcl#45).
+;;; Standard aref now indexes a System.Array (e.g. from dotnet:make-array) directly,
+;;; 1-D and multi-dimensional, marshalling values to the element type.
+(deftest issue364-aref-1d
+  (let ((a (dotnet:make-array "System.Int32" 3)))
+    (setf (aref a 0) 10 (aref a 2) 99)
+    (list (aref a 0) (aref a 1) (aref a 2)))
+  (10 0 99))
+
+(deftest issue364-aref-2d
+  (let ((m (dotnet:make-array "System.Double" 2 3)))
+    (setf (aref m 1 2) 4.5d0)
+    (setf (aref m 0 0) 1.0d0)
+    (list (aref m 0 0) (aref m 1 2) (aref m 0 1)))
+  (1.0d0 4.5d0 0.0d0))
+
+(deftest issue364-aref-string-elt
+  (let ((s (dotnet:make-array "System.String" 2)))
+    (setf (aref s 0) "hi")
+    (aref s 0))
+  "hi")
+
+;;; (dotcl/dotcl#45): raw .NET exceptions caught by handler-case preserve
+;;; their CLR type; dotnet:exception-type / dotnet:exception-typep expose it, and
+;;; dotnet:handler-bind dispatches on specific .NET exception types.
+;; A drive-less relative filename in an existing directory (the CWD) so the
+;; open fails with FileNotFoundException on every OS. A "C:/..." path is a
+;; *missing directory* on Unix → DirectoryNotFoundException, which made this
+;; test platform-dependent (green on Windows, red on macOS/Linux).
+(defun %i368-open-missing ()
+  (dotnet:invoke (dotnet:static "System.IO.File" "OpenRead" "dotcl-nonexistent-zzz-file.txt")
+                 "ReadByte"))
+
+(deftest i368-exception-type-and-typep
+  (handler-case (%i368-open-missing)
+    (error (c)
+      (list (dotnet:invoke (dotnet:exception-type c) "get_Name")  ; CLR type name
+            (notnot (dotnet:exception-typep c "System.IO.FileNotFoundException"))
+            (notnot (dotnet:exception-typep c "System.IO.IOException"))  ; base class
+            (dotnet:exception-typep c "System.ArgumentException"))))     ; unrelated
+  ("FileNotFoundException" t t nil))
+
+(deftest i368-plain-condition-has-no-clr-type
+  (handler-case (error "plain lisp error")
+    (error (c) (dotnet:exception-type c)))
+  nil)
+
+(deftest i368-handler-bind-dispatch-on-type
+  (block done
+    (dotnet:handler-bind (("System.IO.IOException" (c)
+                            (return-from done
+                              (list :caught (dotnet:invoke (dotnet:exception-type c) "get_Name")))))
+      (%i368-open-missing)))
+  (:caught "FileNotFoundException"))
+
+(deftest i368-handler-bind-non-match-propagates
+  (handler-case
+      (dotnet:handler-bind (("System.ArgumentException" (c) (declare (ignore c)) :wrong))
+        (%i368-open-missing))
+    (error () :propagated))
+  :propagated)
+
+;;; (dotcl/dotcl#45): extension-method resolution — dotnet:invoke falls back
+;;; to a static [Extension] method whose first param accepts the receiver. Covers
+;;; non-generic and single-type-param generic (inferred from IEnumerable<T>),
+;;; e.g. LINQ Enumerable.Count/Where/First on a List<int>.
+(defun %i369-int-list (&rest xs)
+  (let ((lst (dotnet:new (dotnet:make-generic-type "System.Collections.Generic.List"
+                                                   '("System.Int32")))))
+    (dolist (x xs lst) (dotnet:invoke lst "Add" x))))
+
+(deftest i369-linq-count
+  (dotnet:invoke (%i369-int-list 1 5 9) "Count")
+  3)
+
+(deftest i369-linq-where-and-first
+  (let* ((ft (dotnet:make-generic-type "System.Func" '("System.Int32" "System.Boolean")))
+         (pred (dotnet:make-delegate ft (lambda (x) (> x 3))))
+         (filtered (dotnet:invoke (%i369-int-list 1 5 9) "Where" pred)))
+    (list (dotnet:invoke filtered "Count") (dotnet:invoke filtered "First")))
+  (2 5))
+
+;; a genuinely missing method still errors (extension fallback doesn't mask it)
+(deftest i369-missing-method-still-errors
+  (handler-case (progn (dotnet:invoke (dotnet:new "System.Object") "NoSuchMethodXyz") :ok)
+    (error () :errored))
+  :errored)

@@ -97,7 +97,7 @@
   <!-- Exclude Program.cs — entry point lives in the dotcl tool project -->
   <ItemGroup>
     <Compile Remove="Program.cs" />
-    <!-- build-tasks/ is a separate MSBuild-task assembly (#307) that lives under
+    <!-- build-tasks/ is a separate MSBuild-task assembly that lives under
          runtime/; keep its sources out of the runtime library's default glob. -->
     <Compile Remove="build-tasks/**/*.cs" />
   </ItemGroup>

@@ -1034,7 +1034,8 @@ public static partial class Runtime
             return ls.IsClosed ? Nil.Instance : T.Instance;
         // Gray Streams: streamp が T を返すインスタンスは open とみなす
         // (dotcl は gray stream に closed フラグを持たないため常に open)
-        if (stream is LispInstance gi && (IsGrayOutputStream(gi) || IsGrayInputStream(gi)))
+        if (stream is LispInstance gi && (IsGrayOutputStream(gi) || IsGrayInputStream(gi)
+                                          || IsGrayBinaryOutputStream(gi) || IsGrayBinaryInputStream(gi)))
             return T.Instance;
         throw new LispErrorException(new LispTypeError("OPEN-STREAM-P: not a stream", stream, Startup.Sym("STREAM")));
     }
@@ -1130,6 +1131,17 @@ public static partial class Runtime
 
     public static LispObject WriteByte(LispObject byteObj, LispObject stream)
     {
+        // Gray binary output stream: dispatch to the stream-write-byte generic.
+        if (stream is LispInstance gbo && IsGrayBinaryOutputStream(gbo))
+        {
+            if (byteObj is not (Fixnum or Bignum))
+                throw new LispErrorException(new LispTypeError("WRITE-BYTE: not an integer", byteObj));
+            var fn = GrayStreamLookup.GrayOrCl("STREAM-WRITE-BYTE")
+                ?? throw new LispErrorException(new LispError("Gray stream: STREAM-WRITE-BYTE not defined"));
+            fn.Invoke(new LispObject[] { gbo, byteObj });
+            return byteObj;
+        }
+
         if (stream is not LispStream)
             throw new LispErrorException(new LispTypeError("WRITE-BYTE: not a stream", stream, Startup.Sym("STREAM")));
         if (!IsBinaryOutputStream(stream))
@@ -1166,13 +1178,28 @@ public static partial class Runtime
             throw new LispErrorException(new LispProgramError("READ-BYTE: requires at least 1 argument"));
         if (args.Length > 3) throw new LispErrorException(new LispProgramError($"READ-BYTE: wrong number of arguments: {args.Length} (expected 1-3)"));
         var stream = args[0];
+        bool eofErrorP = args.Length < 2 || IsTruthy(args[1]);
+        var eofValue = args.Length >= 3 ? args[2] : Nil.Instance;
+
+        // Gray binary input stream: dispatch to the stream-read-byte generic.
+        if (stream is LispInstance gbi && IsGrayBinaryInputStream(gbi))
+        {
+            var fn = GrayStreamLookup.GrayOrCl("STREAM-READ-BYTE")
+                ?? throw new LispErrorException(new LispError("Gray stream: STREAM-READ-BYTE not defined"));
+            var r = fn.Invoke(new LispObject[] { gbi });
+            if (r is Symbol es && es.Name == "EOF")
+            {
+                if (eofErrorP) throw new LispErrorException(MakeEndOfFileError(stream));
+                return eofValue;
+            }
+            return r;
+        }
+
         if (stream is not LispStream ls)
             throw new LispErrorException(new LispTypeError("READ-BYTE: not a stream", stream, Startup.Sym("STREAM")));
         if (!ls.IsInput)
             throw new LispErrorException(new LispTypeError(
                 $"READ-BYTE: {ls} is not an input stream", stream, Startup.Sym("STREAM")));
-        bool eofErrorP = args.Length < 2 || IsTruthy(args[1]);
-        var eofValue = args.Length >= 3 ? args[2] : Nil.Instance;
 
         int byteWidth = GetBinaryByteWidth(stream);
         if (byteWidth == 1)
@@ -1286,12 +1313,25 @@ public static partial class Runtime
             // Compound type like (UNSIGNED-BYTE 8) is binary
             return true;
         }
+        // Gray binary stream (CLOS instance): read/write-byte dispatch one byte
+        // at a time through the stream-read-byte/stream-write-byte generics.
+        if (stream is LispInstance gi && (IsGrayBinaryInputStream(gi) || IsGrayBinaryOutputStream(gi)))
+            return true;
         return false;
     }
 
     /// <summary>Read a byte from a stream's underlying byte stream. Returns -1 on EOF.</summary>
     private static int ReadStreamByte(LispObject stream)
     {
+        if (stream is LispInstance gi && IsGrayBinaryInputStream(gi))
+        {
+            var fn = GrayStreamLookup.GrayOrCl("STREAM-READ-BYTE")
+                ?? throw new LispErrorException(new LispError("Gray stream: STREAM-READ-BYTE not defined"));
+            var r = fn.Invoke(new LispObject[] { gi });
+            if (r is Symbol s && s.Name == "EOF") return -1;
+            if (r is Fixnum f) return (int)f.Value & 0xFF;
+            return -1;
+        }
         if (stream is LispBinaryStream bs)
             return bs.BaseStream.ReadByte();
         if (stream is LispFileStream fs && fs.InputReader is StreamReader sr)
@@ -1322,6 +1362,13 @@ public static partial class Runtime
     /// <summary>Write a byte to a stream's underlying byte stream.</summary>
     private static void WriteStreamByte(LispObject stream, int b)
     {
+        if (stream is LispInstance gi && IsGrayBinaryOutputStream(gi))
+        {
+            var fn = GrayStreamLookup.GrayOrCl("STREAM-WRITE-BYTE")
+                ?? throw new LispErrorException(new LispError("Gray stream: STREAM-WRITE-BYTE not defined"));
+            fn.Invoke(new LispObject[] { gi, Fixnum.Make(b & 0xFF) });
+            return;
+        }
         if (stream is LispBinaryStream bin)
         {
             bin.BaseStream.WriteByte((byte)b);
@@ -2571,6 +2618,18 @@ public static partial class Runtime
         return "";
     }
 
+    /// <summary>*default-pathname-defaults* as a LispPathname, or null if unset.</summary>
+    private static LispPathname? GetDefaultPathnameDefaultsPathname()
+    {
+        try { return DynamicBindings.Get(Startup.Sym("*DEFAULT-PATHNAME-DEFAULTS*")) as LispPathname; }
+        catch { return null; }
+    }
+
+    /// <summary>True when PN's directory is (:absolute ...) — a rooted directory that
+    /// needs no merge with *default-pathname-defaults*.</summary>
+    private static bool PathnameDirectoryIsAbsolute(LispPathname pn)
+        => pn.DirectoryComponent is Cons d && d.Car is Symbol s && s.Name == "ABSOLUTE";
+
     private static bool IsWildSymbol(LispObject? obj)
     {
         return obj is Symbol sym && (sym.Name == "WILD" || sym.Name == "WILD-INFERIORS");
@@ -2607,10 +2666,15 @@ public static partial class Runtime
         if (pathSpec is LispString s) raw = s.Value;
         else if (pathSpec is LispPathname p)
         {
-            raw = p.ToNamestring();
-            // Fall through to DPD merge logic below for relative paths
-            if (Path.IsPathRooted(raw)) return raw;
-            goto mergeDpd;
+            // CLHS: file ops resolve against *default-pathname-defaults*. Merge at the
+            // PATHNAME level (merge-pathnames) — keeps P's device, merges its directory
+            // with DPD's absolute directory. This is what resolves a :relative-directory
+            // pathname — whose Windows namestring is the drive-relative "C:scratch"
+            // (device set, but no separator, so NOT absolute) — against DPD instead of
+            // drive C:'s process-global current directory. Absolute dirs need no merge.
+            if (PathnameDirectoryIsAbsolute(p)) return p.ToNamestring();
+            var dpd = GetDefaultPathnameDefaultsPathname();
+            return (dpd != null ? p.MergeWith(dpd) : p).ToNamestring();
         }
         else if (pathSpec is LispFileStream fs) return fs.FilePath;
         else if (pathSpec is LispVector v && v.IsCharVector) raw = v.ToCharString();
@@ -2629,11 +2693,20 @@ public static partial class Runtime
         }
         // CL spec: file operations merge with *default-pathname-defaults*
         mergeDpd:
-        if (!string.IsNullOrEmpty(raw) && !Path.IsPathRooted(raw))
+        if (!string.IsNullOrEmpty(raw) && !Compat.IsPathFullyQualified(raw))
         {
             var defaults = GetDefaultPathnameDefaults();
             if (!string.IsNullOrEmpty(defaults))
-                return Path.Combine(defaults, raw);
+            {
+                // Strip a drive-relative prefix ("C:foo" -> "foo") so Combine actually
+                // merges with DPD; the drive comes from DPD. Win32 would otherwise
+                // resolve "C:foo" against drive C:'s process-global current directory,
+                // diverging from *default-pathname-defaults* (ENSURE-DIRECTORIES-EXIST.8).
+                var rel = raw;
+                if (rel.Length >= 2 && rel[1] == ':' && char.IsLetter(rel[0]))
+                    rel = rel.Substring(2);
+                return Path.Combine(defaults, rel);
+            }
         }
         return raw;
     }
@@ -2678,6 +2751,20 @@ public static partial class Runtime
         {
             File.Delete(filePath);
             return T.Instance;
+        }
+        // A directory pathname (no name/type) designates a directory. CLHS leaves
+        // delete-file on a directory implementation-defined; like SBCL, delete the
+        // directory (non-recursive — Directory.Delete throws if it is non-empty,
+        // which surfaces as the file-error below). Lets the ANSI suite delete a
+        // scratch subdirectory via delete-file (ENSURE-DIRECTORIES-EXIST.8).
+        if (Directory.Exists(filePath))
+        {
+            try
+            {
+                Directory.Delete(filePath, false);
+                return T.Instance;
+            }
+            catch (IOException) { /* non-empty or in use → fall through to file-error */ }
         }
         // CLHS says: If delete-file fails, an error of type file-error is signaled
         var err = new LispError($"DELETE-FILE: could not delete {filePath}");
@@ -2792,7 +2879,11 @@ public static partial class Runtime
                 targetFile = Path.Combine(defaults, targetFile);
         }
 
-        File.Move(oldFile, targetFile);
+        // Overwrite an existing target: CL rename-file replaces it (POSIX rename
+        // semantics, as SBCL/CCL do), and asdf's atomic-write idiom (write temp →
+        // rename onto the final path) depends on this — without overwrite the
+        // second build of any system throws "file already exists" from load-asd.
+        Compat.MoveFile(oldFile, targetFile, overwrite: true);
 
         // Return 3 values: defaulted-new-name, old-truename, new-truename
         var newTruename = LispPathname.FromString(Path.GetFullPath(targetFile));
@@ -3058,19 +3149,20 @@ public static partial class Runtime
         Startup.RegisterUnary("OPEN-STREAM-P", Runtime.OpenStreamP);
         Startup.RegisterUnary("STREAMP", obj => {
             if (obj is LispStream) return T.Instance;
-            if (obj is LispInstance gi && (Runtime.IsGrayOutputStream(gi) || Runtime.IsGrayInputStream(gi)))
+            if (obj is LispInstance gi && (Runtime.IsGrayOutputStream(gi) || Runtime.IsGrayInputStream(gi)
+                                           || Runtime.IsGrayBinaryOutputStream(gi) || Runtime.IsGrayBinaryInputStream(gi)))
                 return T.Instance;
             return Nil.Instance;
         });
         Startup.RegisterUnary("INPUT-STREAM-P", obj => {
             if (obj is LispStream s) return s.IsInput ? T.Instance : Nil.Instance;
-            if (obj is LispInstance gi && Runtime.IsGrayInputStream(gi)) return T.Instance;
+            if (obj is LispInstance gi && (Runtime.IsGrayInputStream(gi) || Runtime.IsGrayBinaryInputStream(gi))) return T.Instance;
             if (obj is LispInstance) return Nil.Instance; // CLOS stream but not input
             throw new LispErrorException(new LispTypeError("INPUT-STREAM-P: not a stream", obj, Startup.Sym("STREAM")));
         });
         Startup.RegisterUnary("OUTPUT-STREAM-P", obj => {
             if (obj is LispStream s) return s.IsOutput ? T.Instance : Nil.Instance;
-            if (obj is LispInstance gi && Runtime.IsGrayOutputStream(gi)) return T.Instance;
+            if (obj is LispInstance gi && (Runtime.IsGrayOutputStream(gi) || Runtime.IsGrayBinaryOutputStream(gi))) return T.Instance;
             if (obj is LispInstance) return Nil.Instance; // CLOS stream but not output
             throw new LispErrorException(new LispTypeError("OUTPUT-STREAM-P: not a stream", obj, Startup.Sym("STREAM")));
         });

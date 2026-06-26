@@ -15,7 +15,15 @@ $ bin/Debug/net10.0/AspNetLispDemo.exe
 
 $ curl http://localhost:5180/api/hello
 "hello from lisp"
+
+$ curl http://localhost:5180/api/async-hello
+hello from async lisp
 ```
+
+`/api/hello` は同期 MVC controller、`/api/async-hello` は Lisp の
+`(dotcl:async ...)` ハンドラ (Task 生成側) を Minimal API route に繋いだもの。
+後者はリクエストスレッドをブロックせず、ハンドラ内の `dotcl:await` が
+実 .NET Task (`Task.Delay`) をスレッドプール上で待つ。
 
 ## Lisp 側
 
@@ -80,9 +88,12 @@ app.Run("http://localhost:5180");
   新しい Controller を生やしても MVC の routing table は再構築されない。
   Hot-add / hot-redefine は別の仕組みが要る (e.g.,
   `IActionDescriptorChangeProvider`)
-- **Minimal API ではなく MVC**: MVC のほうが「Lisp で Controller」の絵に
-  なるが、Minimal API + Lambda trampoline ならランタイム endpoint 追加が
-  軽い。両方サポートはまだ未着手
+- **MVC と Minimal API の併用**: MVC controller (`/api/hello`) は「Lisp で
+  Controller」の絵に、Minimal API trampoline (`/api/async-hello`) は Lisp の
+  `dotcl:async` ハンドラ (Task 生成側) を繋ぐ軽い経路に使い分けている。
+  後者は `DotclHost.Call` で Lisp 関数を呼んで `Task<LispObject>` を受け取り、
+  C# 側で `await` する。MVC async action (`Task<IActionResult>` 戻り) への
+  直接バインドは型変換が要るため、現状は Minimal API 経由が素直。
 - **DI container**: 現在 Controller は parameterless ctor 想定。コンストラクタ
   注入は dotcl 側の ctor シグネチャ拡張が要る (`dotnet:define-class` の
   `:ctor` は現状 zero-arg のみ)

@@ -19,6 +19,10 @@ public class LispCondition : LispObject
     public LispObject? OperationRef { get; set; }
     /// <summary>Operands reference for ARITHMETIC-ERROR conditions.</summary>
     public LispObject? OperandsRef { get; set; }
+    /// <summary>For a condition wrapping a raw .NET exception: the original CLR
+    /// exception type, so dotnet:exception-type / dotnet:handler-bind can dispatch
+    /// on the specific .NET type. Null for ordinary Lisp conditions. (dotcl/dotcl#45)</summary>
+    public System.Type? ClrExceptionType { get; set; }
     public LispCondition(string message) => Message = message;
     public override string ToString() => $"#<{ConditionTypeName}: {Message}>";
 }
@@ -211,6 +215,33 @@ public static class HandlerClusterStack
             _clusters.RemoveAt(_clusters.Count - 1);
     }
 
+    /// <summary>Current cluster-stack depth.</summary>
+    public static int Depth => _clusters?.Count ?? 0;
+
+    /// <summary>Shallow copy of the live cluster stack (bottom→top), or null if
+    /// empty. Used to carry handler-bind clusters across an async await boundary,
+    /// where the continuation runs on a different (ThreadStatic) thread.</summary>
+    public static List<HandlerBinding[]>? Snapshot()
+        => (_clusters == null || _clusters.Count == 0)
+            ? null : new List<HandlerBinding[]>(_clusters);
+
+    /// <summary>Re-install a snapshot on top of the current stack.</summary>
+    public static void Restore(List<HandlerBinding[]>? snapshot)
+    {
+        if (snapshot == null || snapshot.Count == 0) return;
+        _clusters ??= new();
+        _clusters.AddRange(snapshot);
+    }
+
+    /// <summary>Pop clusters down to DEPTH (no-op if already at or below it).</summary>
+    public static void TruncateTo(int depth)
+    {
+        var c = _clusters;
+        if (c == null) return;
+        if (depth < 0) depth = 0;
+        while (c.Count > depth) c.RemoveAt(c.Count - 1);
+    }
+
     /// <summary>
     /// Signal a condition through the handler stack.
     /// Matching handlers are called without unwinding.
@@ -270,6 +301,34 @@ public static class RestartClusterStack
     {
         if (_clusters?.Count > 0)
             _clusters.RemoveAt(_clusters.Count - 1);
+    }
+
+    public static int Depth => _clusters?.Count ?? 0;
+
+    /// <summary>Shallow copy of the live restart-cluster stack (bottom→top), or
+    /// null if empty. Carries restart-case clusters across an async await
+    /// boundary so find-restart / compute-restarts / invoke-restart see them on
+    /// the continuation thread (which has fresh ThreadStatic stacks). Mirrors
+    /// HandlerClusterStack.Snapshot.</summary>
+    public static List<LispRestart[]>? Snapshot()
+        => (_clusters == null || _clusters.Count == 0)
+            ? null : new List<LispRestart[]>(_clusters);
+
+    /// <summary>Re-install a snapshot on top of the current stack.</summary>
+    public static void Restore(List<LispRestart[]>? snapshot)
+    {
+        if (snapshot == null || snapshot.Count == 0) return;
+        _clusters ??= new();
+        _clusters.AddRange(snapshot);
+    }
+
+    /// <summary>Pop clusters down to DEPTH (no-op if already at or below it).</summary>
+    public static void TruncateTo(int depth)
+    {
+        var c = _clusters;
+        if (c == null) return;
+        if (depth < 0) depth = 0;
+        while (c.Count > depth) c.RemoveAt(c.Count - 1);
     }
 
     [ThreadStatic]

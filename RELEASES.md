@@ -3,7 +3,121 @@
 User-facing release notes for dotcl. Each section corresponds to a tagged
 release on the public mirror (dotcl/dotcl).
 
-## v0.1.13 — 2026-06-21
+## v0.1.14 -- 2026-06-26
+
+### Async / await
+
+dotcl now speaks .NET's `Task` world. `dotnet:await` blocks for a `Task` /
+`ValueTask` result, while `dotcl:async` / `dotcl:await` give non-blocking,
+continuation-passing async that yields the thread instead of holding it. The
+control-flow operators you expect keep working across an `await` boundary:
+special-variable bindings, `handler-bind`, `handler-case` (including its
+`:no-error` clause), `unwind-protect`, and `restart-case` all survive a
+suspension and resume correctly. The `samples/AspNetLispDemo` sample wires a
+non-blocking Lisp endpoint into ASP.NET, producing its `Task` on the ASP.NET
+side.
+
+### .NET interop expansion
+
+Interop gained a lot of reach:
+
+- `dotnet:invoke` resolves **extension methods**, so LINQ (`Where`, `Select`,
+  `OrderBy`, ...) is callable directly on a receiver.
+- `dotnet:make-array` builds sized and multi-dimensional typed .NET arrays, and
+  `aref` / `(setf aref)` index a wrapped .NET array transparently -- no unwrap
+  step.
+- `dotnet:make-generic-type` constructs a closed generic type, and `dotnet:new`
+  accepts a `System.Type` (so you can instantiate the type you just built).
+- `dotnet:is-instance-of` and `dotnet:cast` for run-time type tests and
+  reference conversions; `dotnet:enum-or` combines `[Flags]` enum members;
+  `dotnet:call-out-generic` calls generic methods that have `out` / `ref`
+  parameters.
+- `dotnet:new` admits constructors with an optional tail, fixing a
+  struct->primitive overload selection case.
+- `handler-bind` / `handler-case` can catch a **specific** .NET exception type:
+  the wrapped condition answers `typep` against the CLR exception type, so you
+  can handle, say, only `System.IO.FileNotFoundException`.
+
+### CLOS
+
+The class-precedence list now follows the CLHS class linearization, including
+non-monotonic hierarchies. A batch of conformance fixes landed: `change-class`
+no longer overwrites a target's `:allocation :class` slot; `slot-boundp` and
+`slot-value` return a single value; generic-function keyword validation handles
+odd / non-symbol keyword plists and `:allow-other-keys` on both the cache-miss
+and cache-hit dispatch paths; an invalid method qualifier is signaled by the
+operator method-combination; class-redefinition identity no longer reuses a
+class whose proper name was cleared; `ensure-generic-function` applies a new
+lambda-list / argument-precedence-order in place; and a `make-load-form` creation
+form is evaluated at load time.
+
+### Places and `setf`
+
+`setf` of multiple values now distributes correctly --
+`(setf (values q r) (floor 17 5))` sets `q` to 3 and `r` to 2 -- and `psetf`
+evaluates its value forms before assigning. Assigning to a function-call place,
+`(setf (foo x) v)`, returns whatever the underlying `(setf foo)` call returns, as
+the standard requires.
+
+### Weak references, finalizers, and weak hash tables
+
+Real GC-backed weak pointers (over `System.WeakReference`),
+`dotcl:finalize` / `cancel-finalization` / `run-finalizers`, and hash tables that
+support every weakness mode -- including true key-weakness -- are now available.
+
+### Binary Gray streams
+
+`read-byte` / `write-byte` and `read-sequence` / `write-sequence` dispatch to
+Gray binary streams, so a custom byte stream behaves like a built-in one.
+`princ` / `~A` no longer prints a keyword's package prefix.
+
+### `require`, ASDF, and builds
+
+`cl:require` is wired to ASDF through the module-provider protocol, so
+`(require "system")` loads an ASDF system. `dotcl:chdir` backs
+`uiop:chdir` / `uiop:with-current-directory`. Project builds gained a
+`<DotclAsdSearchPath>` item to register external ASDF system directories
+declaratively, and a project-core build loads each `:depends-on` fasl before
+compiling the root system.
+
+### Pathnames and I/O
+
+A `:relative-directory` pathname merges against `*default-pathname-defaults*`;
+`compile-file-pathname` of a logical pathname stays logical; `delete-file` on a
+directory pathname removes the empty directory; `rename-file` overwrites an
+existing target (which unblocks ASDF's atomic write-then-rename idiom); and a
+literal pathname embedded in compiled code keeps its version component.
+
+### Library compatibility
+
+`remove` / `delete` (and the `-if` / `-if-not` forms) return the **original**
+list when nothing is removed, matching the de-facto convention that real
+libraries rely on -- for example Maxima's info-list bookkeeping, which mutates the
+list in place after a no-op `delete`. Special variables are handled through a
+dynamic-binding stack rather than boxing, `coerce` handles compound float type
+specifiers, and several previously bundled `trivial-*` shims (gray-streams,
+garbage, features, sockets, package-local-nicknames) now defer to
+upstream-tracked forks. `dotcl:package-locally-nicknamed-by-list` is provided for
+package-local-nickname introspection.
+
+### Platform
+
+dotcl runs on `net10.0-android` as a `PackageReference`-only embedding, and the
+emit-free `netstandard2.0` runtime build is fixed so the package packs cleanly
+for every target framework. A new `dotcl-cltl2` package provides minimal CLtL2
+environment access (`variable-information`, `function-information`,
+`declaration-information`, `augment-environment`).
+
+### Other fixes
+
+`.NET` stack traces attached to wrapped conditions are gated behind
+`dotcl:*debug-stacktrace*` (off by default); `maphash` tolerates mid-iteration
+modification; `function-lambda-expression` reports closure-p as its second value;
+`remove-if` returns a single value; and several compiler-correctness fixes for
+`eval-when` in compiled files, symbol-macro capture, multi-list `mapcar`, and
+tail-call handling in `and` / `or` / `cond`.
+
+## v0.1.13 -- 2026-06-21
 
 ### Run precompiled Lisp where runtime code generation is forbidden (NativeAOT / IL2CPP)
 
@@ -12,10 +126,10 @@ dotcl now runs on platforms that ban `Reflection.Emit` entirely. The
 evaluates `eval` / `defun` / `defmacro` / CLOS at run time with no code
 generation, while precompiled `.fasl` images run as ordinary linked assemblies.
 The new `samples/PrecompiledLispDemoAot` ships precompiled Lisp inside a single
-**NativeAOT** native binary — `IsDynamicCodeSupported` is `False`, no JIT, no
-`Assembly.LoadFrom` — and still evaluates new `defun` / `defmacro` / CLOS at run
+**NativeAOT** native binary -- `IsDynamicCodeSupported` is `False`, no JIT, no
+`Assembly.LoadFrom` -- and still evaluates new `defun` / `defmacro` / CLOS at run
 time. The same path runs under Unity's **IL2CPP** backend, including WebGL in the
-browser — `samples/PrecompiledLispDemoWebGL` draws a curve whose every point is
+browser -- `samples/PrecompiledLispDemoWebGL` draws a curve whose every point is
 computed by precompiled Lisp each frame, and reshapes it live from Lisp typed
 into the page.
 
@@ -28,7 +142,7 @@ than shipping a broken package.
 
 ### Declaring build-time dependencies
 
-A project-core build no longer scans your `~/quicklisp` (or Roswell) directories —
+A project-core build no longer scans your `~/quicklisp` (or Roswell) directories --
 a build, and a shipped binary, shouldn't silently depend on whatever happens to be
 installed on the build machine. To make external ASDF systems discoverable for a
 build, add a `<DotclBuildInit>` item pointing at a Lisp script the build loads
@@ -40,14 +154,14 @@ before resolving dependencies:
 </ItemGroup>
 ```
 
-The script can `(pushnew … asdf:*central-registry*)`, boot quicklisp, or do
-whatever your project needs — build-time only, so the shipped binary never reaches
+The script can `(pushnew ... asdf:*central-registry*)`, boot quicklisp, or do
+whatever your project needs -- build-time only, so the shipped binary never reaches
 into your home directory. (Because `.asd` files are Lisp, you can equivalently put
 that setup at the top of your `.asd`.)
 
 ### Quicklisp
 
-Fixed a compiler bug — incorrect shadowing across the function/value namespaces —
+Fixed a compiler bug -- incorrect shadowing across the function/value namespaces --
 that blocked loading quicklisp. The quicklisp-client portability patch is
 submitted upstream.
 
@@ -65,7 +179,7 @@ Typed `dotnet:invoke` infers the receiver type from `let`-bound variables and
 propagates it through method chains for direct, boxing-free calls; new
 `dotnet:hint-type` / `dotnet:object-type` accessors; `dotnet:box` marshals a
 primitive to an implemented interface type; and an unhandled condition crossing a
-C# → Lisp callback boundary is caught instead of crashing the host.
+C# -> Lisp callback boundary is caught instead of crashing the host.
 
 ### Other fixes
 
@@ -73,16 +187,16 @@ C# → Lisp callback boundary is caught instead of crashing the host.
 `#'aref` works through `funcall` / `apply` at any rank; a `call-next-method`
 concurrency race is fixed and explicit arguments are honored from `:around`
 methods; and `dotcl:backtrace-with-args` adds argument values to backtraces.
-Windows UNC paths (`\\server\share\…`) now work with `directory`, `probe-file`,
-and related operations — the server is kept as the pathname host instead of being
+Windows UNC paths (`\\server\share\...`) now work with `directory`, `probe-file`,
+and related operations -- the server is kept as the pathname host instead of being
 mis-parsed as a local directory.
 
-## v0.1.12 — 2026-06-18
+## v0.1.12 -- 2026-06-18
 
 ### Precompile your Lisp from a plain PackageReference
 
 A project that references `DotCL.Runtime` can now precompile an ASDF system to a
-fasl at build time with a single property — no repo checkout and no global tool
+fasl at build time with a single property -- no repo checkout and no global tool
 install. Point `DotclProjectAsd` at your `.asd`:
 
 ```xml
@@ -108,10 +222,10 @@ Compilation runs in-process inside MSBuild (no subprocess), reusing the runtime
 the package already ships, so the feature adds only a few KB to the package. It
 requires building with the .NET 10 SDK. A Lisp error during the build surfaces as
 an ordinary MSBuild error. The `.asd` file name must match the system name
-(`MyApp.asd` ↔ `(defsystem "MyApp" ...)`).
+(`MyApp.asd` <-> `(defsystem "MyApp" ...)`).
 
 GUI and heavy-dependency apps work too. The build does **not** need the .NET
-types your Lisp references to be loaded — a `dotnet:define-class` that inherits,
+types your Lisp references to be loaded -- a `dotnet:define-class` that inherits,
 say, `Avalonia.Application` compiles fine without Avalonia in the build process;
 the base type is resolved when the fasl is loaded. For that to succeed, force the
 relevant assemblies to load before `LoadFromManifest`:
@@ -127,7 +241,7 @@ DotclHost.LoadFromManifest(manifest);
 `dotcl file.lisp arg1 arg2` runs `file.lisp` as a script and passes the trailing
 arguments through to `uiop:command-line-arguments`. Arguments after the script
 file are treated as the program's argv (the Unix convention), so passing a data
-path — `dotcl viewer.lisp image.png` — no longer tries to load `image.png` as
+path -- `dotcl viewer.lisp image.png` -- no longer tries to load `image.png` as
 Lisp source.
 
 ### `dotcl build` and a tidier CLI
@@ -151,13 +265,13 @@ the behavior of `input-stream-p` / `output-stream-p`. Output flush operations
 trampoline to the corresponding `stream-force-output` / `stream-finish-output` /
 `stream-clear-output` generic functions.
 
-## v0.1.11 — 2026-06-17
+## v0.1.11 -- 2026-06-17
 
 ### Type-declared .NET calls compile to a direct call
 
 When the receiver and arguments of `dotnet:invoke` carry a static .NET type via
 `(the (dotnet "Type.FullName") x)`, the call now compiles to a direct `callvirt`
-to the resolved overload instead of a runtime member lookup — about 3.5x faster
+to the resolved overload instead of a runtime member lookup -- about 3.5x faster
 than the (already cached) dynamic path. Untyped calls are unchanged, so this is
 opt-in:
 
@@ -179,7 +293,7 @@ metaclass: the resulting class is an instance of that metaclass (so `class-of`
 and `typep` agree on the class metaobject), slots the metaclass adds beyond
 `standard-class` are stored on the class metaobject (readable/writable with
 `slot-value`), and the metaclass's inherited `initialize-instance` /
-`shared-initialize` methods run when the class is created — so `:after`-computed
+`shared-initialize` methods run when the class is created -- so `:after`-computed
 metaclass slots are initialized too.
 
 ### dotnet:new with optional-only constructors
@@ -190,8 +304,8 @@ defaults like C#'s `new T()`.
 
 ### Windows desktop assemblies
 
-WinForms and WPF assemblies load by simple name —
-`(dotnet:load-assembly "PresentationFramework")` — with transitive
+WinForms and WPF assemblies load by simple name --
+`(dotnet:load-assembly "PresentationFramework")` -- with transitive
 shared-framework references resolved automatically. WinForms runs from the plain
 runtime; full WPF should be hosted in a WindowsDesktop (`UseWPF`) app. See
 `docs/windows.md` for the recipe, including the STA thread + message-pump setup.
@@ -203,13 +317,13 @@ referencing project's build output, so `DotclHost.FindCore()` and
 `(require :dotnet-class)` (i.e. `dotnet:define-class`) work from a plain
 `PackageReference` with no manual asset wiring.
 
-## v0.1.10 — 2026-06-16
+## v0.1.10 -- 2026-06-16
 
 ### Faster .NET interop calls
 
 `dotnet:invoke` and `dotnet:static` now cache the resolved method per call shape
 (receiver type, member name, argument types), so a hot interop loop pays member
-lookup and overload resolution only once — roughly 4.6x faster on repeated calls.
+lookup and overload resolution only once -- roughly 4.6x faster on repeated calls.
 COM/IDispatch targets, `params` / by-ref methods, and calls with `nil` arguments
 keep the previous dynamic dispatch, so behavior is unchanged.
 
@@ -223,7 +337,7 @@ A new `dotcl:launch-process` primitive exposes a streaming child-process handle
 
 Compiler macros defined with `define-compiler-macro` (or via
 `(setf (compiler-macro-function ...) ...)`) are now expanded while compiling call
-forms, per CLHS 3.2.2.1 — previously they were registered but never consulted. A
+forms, per CLHS 3.2.2.1 -- previously they were registered but never consulted. A
 macro that declines (returns the original form) or a locally shadowed operator
 leaves the call untouched.
 
@@ -237,11 +351,11 @@ classes, so `class-of`, `typep`, and method dispatch no longer conflate them.
 
 The embeddable runtime library gains `DotclHost.ToClr` (convert a Lisp value to a
 .NET object), `DotclHost.Register` (expose a host function to Lisp), and a
-precompiled-only mode that forbids runtime code generation — for hosts where
+precompiled-only mode that forbids runtime code generation -- for hosts where
 dynamic code is unavailable (AOT / IL2CPP-style targets). `DotCL.Runtime` now
 multi-targets `net8.0` in addition to `net10.0`.
 
-## v0.1.9 — 2026-06-13
+## v0.1.9 -- 2026-06-13
 
 ### Performance: native int64 fixnum arithmetic
 
@@ -274,16 +388,16 @@ method list is now copy-on-write.
   (`generic-function-lambda-list`, etc.) return the real names.
 - `slot-definition` metaobjects are dispatchable; `slot-definition-class`,
   `standard-instance-access`, integer `slot-definition-location`, and
-  `slot-boundp`/`slot-makunbound-using-class` are wired up — enough MOP for
+  `slot-boundp`/`slot-makunbound-using-class` are wired up -- enough MOP for
   custom-metaclass dynamic slots.
 - `defmethod` specializers work on `dotnet:define-class` instances and on raw
   CLR types (dispatch on a .NET object's class).
 
 ### .NET interop
 
-- `dotnet:resolve-type` is now public — turn a type-name string into a
+- `dotnet:resolve-type` is now public -- turn a type-name string into a
   `System.Type` (#17).
-- `dotnet:invoke-generic` — call generic instance methods (#23).
+- `dotnet:invoke-generic` -- call generic instance methods (#23).
 - `dotnet:invoke` / `dotnet:static` may omit trailing parameters that have C#
   default values (#24).
 - `dotnet:define-class` supports method/constructor overloading.
@@ -298,9 +412,9 @@ method list is now copy-on-write.
 
 ### Debugging
 
-- `dotcl:backtrace` and `dotcl:print-backtrace` — Lisp-callable backtraces; the
+- `dotcl:backtrace` and `dotcl:print-backtrace` -- Lisp-callable backtraces; the
   printed form now includes call arguments.
-- `dotcl:jit-disassemble` (contrib) — view the JIT-generated native code of a
+- `dotcl:jit-disassemble` (contrib) -- view the JIT-generated native code of a
   compiled function.
 - REPL: readline is interruptible, and UP/DOWN history direction is fixed.
 
@@ -315,7 +429,7 @@ method list is now copy-on-write.
 - `(setf accessor)` calls resolve by symbol identity, fixing cross-package
   mis-dispatch of same-named accessors.
 
-## v0.1.8 — 2026-05-22
+## v0.1.8 -- 2026-05-22
 
 ### ANSI test suite: 21928/21929 pass (99.995%)
 
@@ -323,7 +437,7 @@ One additional conformance fix since 0.1.7: `FORMAT ~E` subnormal double
 rounding now passes consistently (was flaky). Known failure: `DEFGENERIC.ERROR.1`
 (SBCL-compatibility warn instead of error, intentional).
 
-### New: `dotnet:call-base` — invoke base class methods
+### New: `dotnet:call-base` -- invoke base class methods
 
 `(dotnet:call-base self "MethodName" arg1 arg2 ...)` calls the base class
 implementation of a virtual method non-virtually, equivalent to C# `base.Method(args)`.
@@ -337,7 +451,7 @@ Useful in `dotnet:define-class` method overrides for MonoGame, MAUI, etc.:
     ))
 ```
 
-### New: `dotnet:define-class` — base constructor arguments
+### New: `dotnet:define-class` -- base constructor arguments
 
 `:ctor` bodies may now start with `(:base arg1 arg2 ...)` to pass arguments
 to the base class constructor (C# `: base(...)`):
@@ -349,7 +463,7 @@ to the base class constructor (C# `: base(...)`):
     (initialize-renderer self device)))
 ```
 
-### New: `dotnet:define-class` — constructors with arguments supported
+### New: `dotnet:define-class` -- constructors with arguments supported
 
 `:ctor` can have arguments as per the previous example.
 The parameter list consists of `(<name> <type>)` pairs.
@@ -374,7 +488,7 @@ expanders are now interpreted via a lightweight evaluator, making
 `slot-value-using-class` generic function dispatch is now supported for
 custom metaclasses, enabling MOP-level slot access interception.
 
-### New: `dotcl:dotcl-homedir-pathname` — ASDF source-registry integration
+### New: `dotcl:dotcl-homedir-pathname` -- ASDF source-registry integration
 
 `dotcl:dotcl-homedir-pathname` returns the parent directory of dotcl's
 `contrib/` folder as a pathname, analogous to SBCL's `sbcl-homedir-pathname`.
@@ -397,11 +511,11 @@ bordeaux-threads) can be loaded without manual registry configuration.
 - **Compiler**: `(setf documentation)` on `cl:` symbols no longer mutates
   the wrong slot due to package-qualified setf key lookup.
 
-## v0.1.7 — 2026-05-16
+## v0.1.7 -- 2026-05-16
 
 ### ANSI test suite: 21927/21929 pass (99.99%)
 
-Updated to the latest ansi-test submodule (21791 → 21929 tests). Four
+Updated to the latest ansi-test submodule (21791 -> 21929 tests). Four
 conformance fixes were applied:
 
 - **`make-load-form-saving-slots`**: now returns CLHS 3.2.4.2-compliant
@@ -418,7 +532,7 @@ conformance fixes were applied:
 Known failures: `FORMAT.E.26` (subnormal double rounding, flaky) and
 `DEFGENERIC.ERROR.1` (SBCL-compatibility warn instead of error, intentional).
 
-### New: `dotcl-repl` — terminal readline contrib
+### New: `dotcl-repl` -- terminal readline contrib
 
 `contrib/dotcl-repl` provides a line-editing REPL with history and basic
 readline-style key bindings on all platforms. Load with `(require "dotcl-repl")`.
@@ -462,7 +576,7 @@ applications and testing.
 - **Runtime**: `make-load-form` protocol is now applied when serializing
   `LispInstance` objects to FASL.
 
-## v0.1.6 — 2026-05-07
+## v0.1.6 -- 2026-05-07
 
 ### New: `DotCL.Runtime` embeddable library NuGet package
 
@@ -485,7 +599,7 @@ workaround used by the sample projects is eliminated.
   `dotnet publish` (was silently ignored before).
 - Single-file compression is applied automatically for self-contained builds.
 
-### New: `save-application :executable` — ASDF/UIOP standalone exe
+### New: `save-application :executable` -- ASDF/UIOP standalone exe
 
 `save-application` with `:executable t` produces a standalone executable
 that invokes the Lisp image's top-level entry point. `--help` and
@@ -511,10 +625,10 @@ matching the behaviour of `uiop:getcwd`.
   redefinition demoted to a warning for ASDF compatibility.
 - Symbol reference in non-FASL mode changed to inline lookup.
 
-## v0.1.5 — 2026-05-06
+## v0.1.5 -- 2026-05-06
 
 CLHS conformance pass: completed a chapter-by-chapter audit of CLHS
-chapters 2–25 and fixed the spec violations found. ANSI test pass count
+chapters 2-25 and fixed the spec violations found. ANSI test pass count
 is 21789/21791 (99.99%; the 2 remaining failures are intentional
 SBCL-compatible deviations).
 
@@ -559,7 +673,7 @@ Type / error conformance:
 - `defstruct` rejects `setf` on `:read-only` slots.
 - `write-byte` signals `type-error` on non-binary-output streams.
 - `name-char` accepts string designators.
-- `code-char` returns NIL for codes ≥ `char-code-limit`.
+- `code-char` returns NIL for codes >= `char-code-limit`.
 - `nth` signals `type-error` on negative indices.
 - `apply` signals `type-error` when the last argument is not a proper
   list.
@@ -574,7 +688,7 @@ Type / error conformance:
 - `compare-and-swap` / `atomic-incf` / `atomic-decf` macros in the
   `DOTCL` package (lock-based).
 
-## v0.1.4 — 2026-05-04
+## v0.1.4 -- 2026-05-04
 
 CLOS / MOP and ecosystem compatibility release.
 
@@ -594,7 +708,7 @@ CLOS / MOP and ecosystem compatibility release.
 
 - MOP: `make-instance 'standard-generic-function` / `'standard-method`,
   `reinitialize-instance` on class objects, `validate-superclass` as a
-  GF, and custom slot options — unblocking `closer-mop` and libraries
+  GF, and custom slot options -- unblocking `closer-mop` and libraries
   built on it.
 - Reader: full Unicode character-name support (UCD-derived tables
   generated at build time), including non-BMP `#\Uxxxxxxxx`.
@@ -603,7 +717,7 @@ CLOS / MOP and ecosystem compatibility release.
 - `bordeaux-threads-2` lock timeout / `with-timeout`.
 - `trivial-gray-streams` lambda-list and `stream-element-type` GF fixes.
 
-## v0.1.3 — 2026-05-03
+## v0.1.3 -- 2026-05-03
 
 Ecosystem and demo support.
 
@@ -622,7 +736,7 @@ Ecosystem and demo support.
 - `crossgen2` path auto-detected from the host RID.
 - CI build no longer fails when `git describe` is unavailable.
 
-## v0.1.2 — 2026-05-03
+## v0.1.2 -- 2026-05-03
 
 Build, packaging, and toolchain release.
 
@@ -630,7 +744,7 @@ Build, packaging, and toolchain release.
 
 - `compile-file :target-features` for cross-compiling FASLs against a
   different feature set; per-OS asdf fasl loading.
-- `--version` reports a `git describe`–derived semver string.
+- `--version` reports a `git describe`-derived semver string.
 - `:package-local-nicknames` added to `*features*`.
 
 ### Fixed
@@ -643,7 +757,7 @@ Build, packaging, and toolchain release.
 - Copy-propagation peephole removes single-reference `let` / `let*`
   locals.
 
-## v0.1.1 — 2026-04-30
+## v0.1.1 -- 2026-04-30
 
 RID expansion release.
 
@@ -661,14 +775,14 @@ RID expansion release.
 - crossgen2 cross-compile is used; FASLs for non-host RIDs are produced
   on the win-arm64 dev machine.
 
-## v0.1.0 — 2026-04-29
+## v0.1.0 -- 2026-04-29
 
 Initial public release.
 
 ### Highlights
 
 - Common Lisp implementation on .NET 10. Lisp source is compiled to CIL
-  and runs on the .NET JIT — same Lisp image runs on Windows, macOS, and
+  and runs on the .NET JIT -- same Lisp image runs on Windows, macOS, and
   Linux across x86-64 and ARM64.
 - Broadly conforms to the ANSI Common Lisp standard (verified against
   the [ansi-test suite](https://gitlab.common-lisp.net/ansi-test/ansi-test)).

@@ -101,6 +101,26 @@
 (defvar *symbol-macros* '()
   "Alist of (symbol . expansion) for symbol-macrolet. Dynamically scoped.")
 
+(defvar *notinline-functions* '()
+  "List of function-name symbols currently declared NOTINLINE in the lexical
+   scope (via (declare (notinline f ...))). Per CLHS 3.2.2.1.1, a NOTINLINE
+   declaration of a function name suppresses its compiler macro for calls in the
+   declaration's scope. Bound (extended) by body-compiling forms that strip
+   declares. Dynamically scoped so nested bodies see enclosing declarations.")
+
+(defun extract-notinline (body)
+  "Collect function names from (declare (notinline f ...)) forms at the head of
+   BODY. Returns a list of symbols (possibly empty)."
+  (let ((result '())
+        (rest body))
+    (loop while (and rest (consp (car rest)) (eq (caar rest) 'declare))
+          do (dolist (decl (cdar rest))
+               (when (and (consp decl) (eq (car decl) 'notinline))
+                 (dolist (f (cdr decl))
+                   (when (symbolp f) (push f result)))))
+             (pop rest))
+    result))
+
 (defvar *global-symbol-macros* (make-hash-table :test #'eq)
   "Hash table of global symbol macros defined by DEFINE-SYMBOL-MACRO.")
 
@@ -206,6 +226,13 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
   (or (member sym *global-specials*)
       (member (symbol-name sym) *global-specials* :key #'symbol-name :test #'string=)
       (%runtime-special-p sym)))
+
+(defun global-special-name-p (name)
+  "Name-based (string) variant of GLOBAL-SPECIAL-P. Free-variable analysis
+   collects symbol-name strings, so closure capture uses this to skip globally
+   special vars — those are read dynamically (DynamicBindings.Get), not captured
+   into the closure env."
+  (member name *global-specials* :key #'symbol-name :test #'string=))
 
 (defun lookup-local (sym)
   "Look up a variable in *locals* by symbol identity first, then name fallback."
@@ -585,6 +612,55 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
            (let ((mf (macro-function sym)))
              (and mf (lambda (form) (funcall mf form nil)))))))
 
+(defun %macrolet-expander-form (params mbody)
+  "Build the (lambda (form) ...) expander body for a MACROLET-defined macro with
+   lambda list PARAMS and macro body MBODY, handling &whole and &environment per
+   CL macro lambda-list rules. Shared by every macrolet registration site —
+   compile-macrolet, the %mini-eval MACROLET case, and the three cil-analysis
+   walkers — so they never diverge. The analysis copies previously inlined
+   (destructuring-bind PARAMS (cdr form) ...), which omitted &whole handling and
+   bound a &whole var to (cdr form) instead of the whole form; because the
+   analysis pass caches its expansion in *macroexpand-cache* for compile to reuse,
+   that bug surfaced even though compile-macrolet itself was correct."
+  (let* ((whole-var (when (and (consp params) (eq (car params) '&whole)) (cadr params)))
+         (rest-params (if whole-var (cddr params) params))
+         (env-var nil)
+         (clean-params
+          (let ((result '()) (p rest-params))
+            (loop
+              (when (null p) (return))
+              (cond
+                ((eq (car p) '&environment) (setq env-var (cadr p)) (setq p (cddr p)))
+                (t (push (car p) result) (setq p (cdr p)))))
+            (nreverse result))))
+    (cond
+      ((and whole-var (consp whole-var))
+       ;; &whole (pattern) — destructure the whole form against the pattern
+       `(lambda (form)
+          ,(if env-var `(declare (ignore ,env-var)) '(progn))
+          (destructuring-bind ,whole-var form
+            (destructuring-bind ,clean-params (cdr form)
+              ,@mbody))))
+      (whole-var
+       ;; &whole var — bind var to the entire form
+       `(lambda (form)
+          (let ((,whole-var form))
+            (destructuring-bind ,clean-params (cdr form)
+              ,@mbody))))
+      (env-var
+       ;; &environment but no &whole. Build env as cons: (macros-ht . symbol-macros-alist)
+       `(lambda (form)
+          (let ((,env-var (cons *macros*
+                               (let ((ht (make-hash-table :test #'equal)))
+                                 (dolist (entry *symbol-macros* ht)
+                                   (setf (gethash (symbol-name (car entry)) ht) (cdr entry)))))))
+            (destructuring-bind ,clean-params (cdr form)
+              ,@mbody))))
+      (t
+       `(lambda (form)
+          (destructuring-bind ,clean-params (cdr form)
+            ,@mbody))))))
+
 (defvar *dotnet-typed-locals* '()
   "Alist (var-name-string type-name-string . local-key) of lexical locals whose
    value is statically known to be a .NET object of a specific type, inferred
@@ -619,7 +695,10 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
    Skipped during cross-compile so we never pick up the host (SBCL) compiler macros."
   (when (and (not *cross-compiling*)
              (symbolp op)
-             (not (assoc (symbol-name op) *local-functions* :test #'string=)))
+             (not (assoc (symbol-name op) *local-functions* :test #'string=))
+             ;; CLHS 3.2.2.1.1: a NOTINLINE declaration of OP in scope disables
+             ;; its compiler macro for calls in that scope.
+             (not (member op *notinline-functions*)))
     (let ((expander (compiler-macro-function op)))
       (when (functionp expander)
         ;; Expander takes (whole-form environment). dotcl passes the static .NET
@@ -707,7 +786,7 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
                      ;; n-arg: evaluate the receiver and each argument into its own
                      ;; local (each with an empty stack — CIL try-block safety), then
                      ;; the typed direct call marshals straight from those locals. No
-                     ;; LispObject[] is allocated (per-arg-local codegen, #285).
+                     ;; LispObject[] is allocated (per-arg-local codegen).
                      (let ((recv-tmp (gen-local "DRCV"))
                            (arg-tmps (loop for a in args collect (gen-local "DARG"))))
                        `((:declare-local ,recv-tmp "LispObject")
@@ -761,18 +840,15 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
               ;; String=-based dispatch for ops that may arrive from different packages.
               ;; These are rare (internal/cross-package ops) — not in the eq hash table.
               ((string= (symbol-name op) "TRY-EVAL") (compile-unary-call (cdr expr) "Runtime.TryEval"))
+              ;; Spill args to temps (compile-ternary-call): the value form may be
+              ;; a try-based NLX (block/return, loop) and CIL forbids entering a
+              ;; try region with a non-empty stack. Compiling the args inline left
+              ;; the array+index on the stack while the value's try was entered,
+              ;; producing unverifiable IL (e.g. (setf (svref s j) (block nil ...))).
               ((string= (symbol-name op) "%SET-CHAR")
-               (let ((args (cdr expr)))
-                 `(,@(compile-expr (first args))
-                   ,@(compile-expr (second args))
-                   ,@(compile-expr (third args))
-                   (:call "Runtime.SetChar"))))
+               (compile-ternary-call (cdr expr) "Runtime.SetChar"))
               ((string= (symbol-name op) "%SET-ELT")
-               (let ((args (cdr expr)))
-                 `(,@(compile-expr (first args))
-                   ,@(compile-expr (second args))
-                   ,@(compile-expr (third args))
-                   (:call "Runtime.SetElt"))))
+               (compile-ternary-call (cdr expr) "Runtime.SetElt"))
               ((string= (symbol-name op) "%SET-SUBSEQ")
                (compile-named-call '%set-subseq (cdr expr)))
               ((string= (symbol-name op) "%PUTF")

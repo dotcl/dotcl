@@ -608,6 +608,14 @@ public static partial class Runtime
                 }
                 return new LispComplex(real, imag);
             }
+            // Compound float types — e.g. (DOUBLE-FLOAT low high), which a deftype
+            // like Maxima's FLONUM expands to ((&optional low high) -> (double-float
+            // * *), since deftype optionals default to * not nil). Range bounds are
+            // irrelevant to the coercion target; coerce to the base float type
+            // (matches SBCL: (coerce 2/3 '(double-float 0d0 1d0)) => 0.666d0).
+            if (head is "DOUBLE-FLOAT" or "LONG-FLOAT" or "SINGLE-FLOAT"
+                     or "SHORT-FLOAT" or "FLOAT")
+                return Coerce(obj, headSym);
         }
 
         string typeName = resultType switch
@@ -1630,11 +1638,17 @@ public static partial class Runtime
         if (seq is not Nil && seq is not Cons && seq is not LispVector && seq is not LispString)
             throw new LispErrorException(new LispTypeError("REMOVE-IF: not a sequence", seq));
         var kw = ParseSeqKwArgs(args, 2, "REMOVE-IF");
-        return RemoveCore(seq, kw, (elem) =>
+        var result = RemoveCore(seq, kw, (elem) =>
         {
             var val = kw.Key != null ? kw.Key.Invoke1(elem) : elem;
             return IsTruthy(predFn.Invoke1(val));
         });
+        // The last predicate call may have left secondary values in the MV register
+        // (e.g. a predicate calling SUBTYPEP, which returns two values). REMOVE-IF
+        // yields exactly one value, so install the result as the primary, clearing
+        // the stale secondaries that would otherwise leak to our caller (ANSI NIL.1
+        // via check-predicate's remove-if).
+        return MultipleValues.Primary(result);
     }
 
     // Core remove logic shared by REMOVE and REMOVE-IF
@@ -1646,8 +1660,11 @@ public static partial class Runtime
         int? maxRemove = kw.Count;
         if (maxRemove.HasValue && maxRemove.Value <= 0)
         {
-            // count <= 0: remove nothing, return copy
-            return CopySeq(seq);
+            // count <= 0: nothing removed. Return the original sequence (eq), as
+            // SBCL/CCL and most impls do — many libraries (e.g. Maxima add2lnc)
+            // rely on (setq x (delete .. x)) preserving x's cons when no element
+            // matches, so a following (nconc x ..) still mutates the shared list.
+            return seq;
         }
 
         if (seq is LispVector vec)
@@ -1686,7 +1703,7 @@ public static partial class Runtime
                 var result = new System.Collections.Generic.List<LispObject>();
                 for (int i = 0; i < len; i++)
                     if (!removeSet.Contains(i)) result.Add(getElem(i));
-                return CoerceResult(result, origSeq);
+                return removeSet.Count == 0 ? origSeq : CoerceResult(result, origSeq);
             }
             else
             {
@@ -1701,7 +1718,7 @@ public static partial class Runtime
                     else
                         result.Add(elem);
                 }
-                return CoerceResult(result, origSeq);
+                return removed == 0 ? origSeq : CoerceResult(result, origSeq);
             }
         }
 
@@ -1727,7 +1744,7 @@ public static partial class Runtime
                 var result = new System.Collections.Generic.List<LispObject>();
                 for (int i = 0; i < len; i++)
                     if (!removeSet.Contains(i)) result.Add(allElems[i]);
-                return List(result.ToArray());
+                return removeSet.Count == 0 ? listSeq : List(result.ToArray());
             }
             else
             {
@@ -1741,7 +1758,7 @@ public static partial class Runtime
                     else
                         result.Add(allElems[i]);
                 }
-                return List(result.ToArray());
+                return removed == 0 ? listSeq : List(result.ToArray());
             }
         }
     }

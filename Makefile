@@ -348,10 +348,7 @@ compile-asdf-fasls: compile-asdf-fasl
 # CONTRIB_NAMES is auto-detected from contrib/*/ subdirs so that public
 # mirror builds (where externally-sourced contribs are excluded via
 # mirror-exclude) skip the missing dirs gracefully (dotcl/dotcl issue #2).
-# atomics is a patched copy of an upstream library and is mirror-excluded;
-# it also depends on dotcl-thread being loaded, which the per-contrib
-# isolated compile-file does not provide. Skip it here too.
-CONTRIB_NAMES := $(filter-out asdf atomics cil-from-cs,$(notdir $(patsubst %/,%,$(wildcard $(DOTCL_ROOT)contrib/*/))))
+CONTRIB_NAMES := $(filter-out asdf cil-from-cs,$(notdir $(patsubst %/,%,$(wildcard $(DOTCL_ROOT)contrib/*/))))
 
 CONTRIB_FASLS := $(foreach n,$(CONTRIB_NAMES),$(DOTCL_ROOT)contrib/$(n)/$(n).fasl)
 

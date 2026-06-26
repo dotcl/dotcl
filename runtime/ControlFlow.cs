@@ -148,6 +148,16 @@ public class LispSourceException : Exception
         sb.AppendLine($"{chain[0].file}:{chain[0].line}: {cur.Message}");
         for (int i = 1; i < chain.Count; i++)
             sb.AppendLine($"  from {chain[i].file}:{chain[i].line}");
+        // Under dotcl:*debug-stacktrace*, append the underlying .NET exception's
+        // type and stack trace. Without this a raw .NET exception (e.g.
+        // ArrayTypeMismatchException) that unwinds past all Lisp handlers loses
+        // its origin entirely — the Lisp backtrace is empty because the frames
+        // already unwound.
+        if (Startup.DebugStacktrace && cur != null && !string.IsNullOrEmpty(cur.StackTrace))
+        {
+            sb.AppendLine($"[.NET {cur.GetType().Name}]");
+            sb.Append(cur.StackTrace);
+        }
         return sb.ToString().TrimEnd();
     }
 }

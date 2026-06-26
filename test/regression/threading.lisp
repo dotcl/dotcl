@@ -451,3 +451,33 @@
         (dolist (th ths) (dotcl:thread-join th))))
     *%i315-err*)
   nil)
+
+;; dotcl-thread must export all-threads / lockp / recursive-lock-p so the
+;; pristine bordeaux-threads dotcl backend (which delegates to dotcl-thread:)
+;; loads. lockp/recursive-lock-p discriminate the lock objects make-lock /
+;; make-recursive-lock return.
+(deftest i336-lockp
+  (let ((l (dotcl-thread:make-lock "l"))
+        (r (dotcl-thread:make-recursive-lock "r")))
+    (list (dotcl-thread:lockp l)
+          (dotcl-thread:lockp r)
+          (dotcl-thread:lockp 5)
+          (dotcl-thread:recursive-lock-p l)
+          (dotcl-thread:recursive-lock-p r)))
+  (t t nil nil t))
+
+(deftest i336-all-threads-lists-spawned
+  (let* ((started (dotcl-thread:make-semaphore))
+         (done (dotcl-thread:make-semaphore))
+         (th (dotcl-thread:make-thread
+              (lambda ()
+                (dotcl-thread:signal-semaphore started)
+                (dotcl-thread:wait-on-semaphore done))
+              :name "i336-worker")))
+    (dotcl-thread:wait-on-semaphore started)   ; worker is now live
+    (let ((live (member "i336-worker" (dotcl-thread:all-threads)
+                        :key #'dotcl-thread:thread-name :test #'string=)))
+      (dotcl-thread:signal-semaphore done)
+      (dotcl-thread:thread-join th)
+      (and live t)))
+  t)

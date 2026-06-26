@@ -36,3 +36,18 @@
 
 (format *error-output* "[main.lisp] HelloController defined: ~S~%"
         (find-class 'demo.hello-controller nil))
+
+;;; --- Async endpoint (Task 生成側) -------------------------------
+;;; A Lisp async handler that returns a .NET Task<LispObject>. Program.cs maps it
+;;; to a Minimal API route and awaits the Task, writing its result to the response.
+;;; This exercises the Task-producing side of dotcl:async: an (async ...) block
+;;; awaits a real .NET Task (Task.Delay) then yields a value, all off the request
+;;; thread — no thread-per-request blocking.
+(defun async-hello ()
+  "Return a Task<LispObject> that completes (after a simulated async delay) with a
+   greeting string. The C# host awaits it as the request handler's result."
+  (dotcl:async
+    (dotcl:await (dotnet:static "System.Threading.Tasks.Task" "Delay" 20))
+    "hello from async lisp"))
+
+(format *error-output* "[main.lisp] async-hello defined~%")

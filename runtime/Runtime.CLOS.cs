@@ -102,8 +102,14 @@ public static partial class Runtime
         if (_classRegistry.TryGetValue(lc.Name, out var existing) && existing.IsBuiltIn)
             throw new LispErrorException(new LispError(
                 $"Cannot redefine built-in class {lc.Name.Name} with DEFCLASS"));
-        // CLHS 4.3.6: re-evaluating DEFCLASS should update existing class in-place
-        if (existing != null && !existing.IsBuiltIn && !existing.IsStructureClass)
+        // CLHS 4.3.6: re-evaluating DEFCLASS should update existing class in-place,
+        // BUT only if the name being defined is still the existing class's PROPER name.
+        // After (setf (class-name c) nil) the name is no longer c's proper name
+        // (CLHS ensure-class: redefine only when "the name given is the proper name of
+        // that class"), so a subsequent defclass under that name must create a fresh,
+        // distinct class rather than mutate the orphaned one. ANSI CLASS-0309/0310/0311.
+        if (existing != null && !existing.IsBuiltIn && !existing.IsStructureClass
+            && !existing.NameCleared && ReferenceEquals(existing.Name, lc.Name))
         {
             existing.DirectSlots = lc.DirectSlots;
             existing.DirectSuperclasses = lc.DirectSuperclasses;
@@ -810,7 +816,12 @@ public static partial class Runtime
             if (Startup.Sym("SLOT-MISSING").Function is LispFunction slotMissing)
             {
                 var result = Primary(slotMissing.Invoke(new LispObject[] { inst.Class, inst, slotName is Symbol ? slotName : Startup.Sym(name), Startup.Sym("SLOT-BOUNDP") }));
-                return result is Nil ? Nil.Instance : T.Instance;
+                // slot-boundp returns a SINGLE generalized boolean: explicitly install
+                // exactly one value so any secondary values slot-missing returned (it may
+                // legally return (values nil x)) do not leak to the caller. ANSI SLOT-MISSING.8.
+                LispObject b = IsTruthy(result) ? T.Instance : (LispObject)Nil.Instance;
+                MultipleValues.Set(b);
+                return b;
             }
             throw new LispErrorException(new LispError(
                 $"SLOT-BOUNDP: no slot named {name} in class {inst.Class.Name.Name}"));
@@ -1113,16 +1124,16 @@ public static partial class Runtime
                     {
                         if (cls.SlotIndex.TryGetValue(slot.Name.Name, out int idx))
                         {
-                            if (slot.IsClassAllocation)
+                            // CLHS: initargs always override the existing slot value, even
+                            // for :allocation :class slots already bound by a prior
+                            // make-instance. Only the first initarg for a given slot in
+                            // THIS call wins (slotsSetByInitarg guards duplicates).
+                            if (!slotsSetByInitarg.Contains(idx))
                             {
-                                var ownerClass = FindClassSlotOwner(cls, slot.Name.Name);
-                                if (!ownerClass.ClassSlotValues.ContainsKey(slot.Name.Name) || ownerClass.ClassSlotValues[slot.Name.Name] == null)
-                                    ownerClass.ClassSlotValues[slot.Name.Name] = args[i + 1];
-                            }
-                            else if (!slotsSetByInitarg.Contains(idx))
-                            {
-                                // First initarg wins among duplicate initarg names in this call
-                                StoreInstanceSlot(slot, idx, args[i + 1]);
+                                if (slot.IsClassAllocation)
+                                    FindClassSlotOwner(cls, slot.Name.Name).ClassSlotValues[slot.Name.Name] = args[i + 1];
+                                else
+                                    StoreInstanceSlot(slot, idx, args[i + 1]);
                                 slotsSetByInitarg.Add(idx);
                             }
                         }
@@ -1839,6 +1850,10 @@ public static partial class Runtime
             if (apoList.Count > 0) apo = apoList.ToArray();
         }
         gf.ArgumentPrecedenceOrder = apo;
+        // Lambda-list / precedence changes alter dispatch ordering, so a warm
+        // monomorphic cache would otherwise return stale results (ANSI
+        // ENSURE-GENERIC-FUNCTION.8: re-ensuring with :argument-precedence-order).
+        gf.InvalidateCache();
 
         // Store the full lambda-list as written so MOP readers return the actual
         // parameter names instead of gensym placeholders. Standard GFs
@@ -2231,6 +2246,62 @@ public static partial class Runtime
         _ => ClassOf(obj) as LispClass
     };
 
+    /// <summary>Validate keyword arguments against the union of keywords accepted by
+    /// the applicable methods plus GF-level keywords (CLHS 7.6.5). Signals program-error
+    /// for an unknown keyword unless :allow-other-keys t is passed or some applicable
+    /// method allows other keys. Must run on BOTH the cache-hit and cache-miss dispatch
+    /// paths — earlier it lived only on the cache-miss path, so a warm monomorphic cache
+    /// silently skipped the check (ANSI DEFMETHOD.ERROR.14/15).</summary>
+    private static void ValidateGenericKeywords(GenericFunction gf, IReadOnlyList<LispMethod> applicable, LispObject[] args)
+    {
+        if (!(gf.LambdaListInfoSet && gf.HasKey && !gf.HasAllowOtherKeys)) return;
+        int keyStart = gf.RequiredCount + gf.OptionalCount;
+        if (args.Length <= keyStart) return;
+
+        // CLHS 3.5.1.6: the keyword portion must be an even number of pairs whose
+        // keys are symbols. (sym 1 2) and (sym 1 :y) [no value] are program-errors.
+        int keyLen = args.Length - keyStart;
+        if ((keyLen & 1) != 0)
+            throw new LispErrorException(new LispProgramError(
+                $"{gf.Name.Name}: odd number of keyword arguments"));
+        for (int i = keyStart; i < args.Length; i += 2)
+        {
+            if (args[i] is not Symbol)
+                throw new LispErrorException(new LispProgramError(
+                    $"{gf.Name.Name}: keyword argument key is not a symbol: {args[i]}"));
+        }
+
+        // :allow-other-keys — only the FIRST occurrence's value is honored (CLHS 3.4.1.4.1).
+        for (int i = keyStart; i + 1 < args.Length; i += 2)
+        {
+            if (args[i] is Symbol ks && ks.Name == "ALLOW-OTHER-KEYS"
+                && ks.HomePackage?.Name == "KEYWORD")
+            {
+                if (args[i + 1] is not Nil) return; // suppress unknown-key check
+                break;                              // first wins; nil → validate
+            }
+        }
+
+        // Check if any applicable method has &allow-other-keys or &rest (without &key)
+        var allowedKeywords = new HashSet<string> { "ALLOW-OTHER-KEYS" }; // always valid per CLHS 3.4.1.4.1
+        foreach (var m in applicable)
+        {
+            if (m.HasAllowOtherKeys || (m.HasRest && !m.HasKey)) return;
+            foreach (var kw in m.KeywordNames)
+                allowedKeywords.Add(kw);
+        }
+        // Also add GF-level keywords
+        foreach (var kw in gf.KeywordNames)
+            allowedKeywords.Add(kw);
+
+        for (int i = keyStart; i + 1 < args.Length; i += 2)
+        {
+            if (args[i] is Symbol ks2 && !allowedKeywords.Contains(ks2.Name))
+                throw new LispErrorException(new LispProgramError(
+                    $"{gf.Name.Name}: invalid keyword argument :{ks2.Name}"));
+        }
+    }
+
     private static LispObject DispatchGF(GenericFunction gf, LispObject[] args)
     {
         // Arity check: signal program-error for too few/too many arguments
@@ -2263,6 +2334,27 @@ public static partial class Runtime
             }
             if (match)
             {
+                // Keyword validation must run on the cache-hit path too — a warm
+                // monomorphic cache otherwise skips the unknown-keyword check that the
+                // cache-miss path performs (ANSI DEFMETHOD.ERROR.14/15).
+                if (gf.LambdaListInfoSet && gf.HasKey && !gf.HasAllowOtherKeys)
+                {
+                    List<LispMethod> cachedApplicable;
+                    if (cached.Applicable != null)
+                        cachedApplicable = cached.Applicable;
+                    else
+                    {
+                        cachedApplicable = new List<LispMethod>();
+                        cachedApplicable.AddRange(cached.Around);
+                        cachedApplicable.AddRange(cached.Before);
+                        cachedApplicable.AddRange(cached.Primary);
+                        cachedApplicable.AddRange(cached.After);
+                        if (cached.EqlMethods != null)
+                            foreach (var em in cached.EqlMethods)
+                                if (IsMethodApplicable(em, args)) cachedApplicable.Add(em);
+                    }
+                    ValidateGenericKeywords(gf, cachedApplicable, args);
+                }
                 // For EQL specializers: check if any EQL method matches (takes priority)
                 if (cached.HasEqlSpecializers && cached.EqlMethods != null)
                 {
@@ -2347,57 +2439,7 @@ public static partial class Runtime
         }
 
         // Keyword argument validation (CLHS 7.6.5)
-        if (gf.LambdaListInfoSet && gf.HasKey && !gf.HasAllowOtherKeys)
-        {
-            int keyStart = gf.RequiredCount + gf.OptionalCount;
-            if (args.Length > keyStart)
-            {
-                // Check if :allow-other-keys t was passed
-                bool allowOtherKeysInArgs = false;
-                for (int i = keyStart; i + 1 < args.Length; i += 2)
-                {
-                    if (args[i] is Symbol ks && ks.Name == "ALLOW-OTHER-KEYS"
-                        && ks.HomePackage?.Name == "KEYWORD" && args[i + 1] is not Nil)
-                    {
-                        allowOtherKeysInArgs = true;
-                        break;
-                    }
-                }
-
-                if (!allowOtherKeysInArgs)
-                {
-                    // Check if any applicable method has &allow-other-keys or &rest (without &key)
-                    bool anyMethodAllows = false;
-                    var allowedKeywords = new HashSet<string> { "ALLOW-OTHER-KEYS" }; // always valid per CLHS 3.4.1.4.1
-                    foreach (var m in applicable)
-                    {
-                        if (m.HasAllowOtherKeys || (m.HasRest && !m.HasKey))
-                        {
-                            anyMethodAllows = true;
-                            break;
-                        }
-                        foreach (var kw in m.KeywordNames)
-                            allowedKeywords.Add(kw);
-                    }
-                    // Also add GF-level keywords
-                    foreach (var kw in gf.KeywordNames)
-                        allowedKeywords.Add(kw);
-
-                    if (!anyMethodAllows)
-                    {
-                        for (int i = keyStart; i + 1 < args.Length; i += 2)
-                        {
-                            if (args[i] is Symbol ks2)
-                            {
-                                if (!allowedKeywords.Contains(ks2.Name))
-                                    throw new LispErrorException(new LispProgramError(
-                                        $"{gf.Name.Name}: invalid keyword argument :{ks2.Name}"));
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        ValidateGenericKeywords(gf, applicable, args);
 
         // Built-in operator method combinations (+, NCONC, APPEND, AND, OR, PROGN, MIN, MAX, LIST)
         if (gf.MethodCombination != null)
@@ -2754,11 +2796,21 @@ public static partial class Runtime
 
         foreach (var m in applicable)
         {
-            if (m.Qualifiers.Length > 0 && m.Qualifiers[0].Name == "AROUND")
+            // CLHS 7.6.6.2 (short-form / operator method combination): every applicable
+            // method must be qualified by exactly the combination name or :around.
+            // An unqualified method or any other qualifier (e.g. a stray `nonsense`)
+            // is an invalid-method-error, not silently ignored. ANSI
+            // DEFGENERIC-METHOD-COMBINATION.APPEND.13.
+            bool isAround = m.Qualifiers.Length == 1 && m.Qualifiers[0].Name == "AROUND";
+            bool isOperator = m.Qualifiers.Length == 1 && m.Qualifiers[0].Name == mcName;
+            if (isAround)
                 aroundMethods.Add(m);
-            else if (m.Qualifiers.Length > 0 && m.Qualifiers[0].Name == mcName)
+            else if (isOperator)
                 combinedMethods.Add(m);
-            // Ignore unqualified or other qualifiers
+            else
+                throw new LispErrorException(new LispError(
+                    $"{gf.Name.Name}: method with invalid qualifiers {Runtime.List(m.Qualifiers.Cast<LispObject>().ToArray())} " +
+                    $"for the {mcName} method combination"));
         }
 
         if (combinedMethods.Count == 0)
@@ -3243,9 +3295,13 @@ public static partial class Runtime
         inst.Class = newClass;
         inst.Slots = new LispObject?[newClass.EffectiveSlots.Length];
 
-        // Copy slot values for slots with same name in both old and new class (CLHS 7.2)
+        // Copy slot values for slots with same name in both old and new class (CLHS 7.2).
+        // A slot that is :allocation :class in the NEW class is NOT affected by
+        // change-class — it keeps its existing shared value and must not be
+        // overwritten from the old instance (CLHS 7.2.1; ANSI CHANGE-CLASS.3.2).
         foreach (var newSlot in newClass.EffectiveSlots)
         {
+            if (newSlot.IsClassAllocation) continue;
             if (newClass.SlotIndex.TryGetValue(newSlot.Name.Name, out int newIdx))
             {
                 if (oldClass.SlotIndex.TryGetValue(newSlot.Name.Name, out int oldIdx))
@@ -3261,17 +3317,7 @@ public static partial class Runtime
                     {
                         val = oldSlots[oldIdx];
                     }
-                    // Write value to new class, handling class-allocated slots
-                    if (newSlot.IsClassAllocation)
-                    {
-                        var ownerClass = FindClassSlotOwner(newClass, newSlot.Name.Name);
-                        if (val != null)
-                            ownerClass.ClassSlotValues[newSlot.Name.Name] = val;
-                    }
-                    else
-                    {
-                        inst.Slots[newIdx] = val;
-                    }
+                    inst.Slots[newIdx] = val;
                 }
             }
         }

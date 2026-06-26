@@ -420,9 +420,18 @@ public partial class Runtime
         CurrentThread([]);  // Ensure main thread is registered
         LispObject result = Nil.Instance;
         foreach (var lt in _threadRegistry.Values)
-            result = new Cons(lt, result);
+            if (lt.Thread.IsAlive)   // a finished thread may linger until its finally prunes
+                result = new Cons(lt, result);
         return result;
     }
+
+    /// <summary>(dotcl:lockp x) → T if X is a lock (recursive or not).</summary>
+    public static LispObject Lockp(LispObject[] args)
+        => args.Length > 0 && args[0] is LispLock ? T.Instance : Nil.Instance;
+
+    /// <summary>(dotcl:recursive-lock-p x) → T if X is a recursive lock.</summary>
+    public static LispObject RecursiveLockP(LispObject[] args)
+        => args.Length > 0 && args[0] is LispLock { Recursive: true } ? T.Instance : Nil.Instance;
 
     internal static void RegisterThreadBuiltins()
     {
@@ -438,6 +447,12 @@ public partial class Runtime
             new LispFunction(Runtime.ThreadName, "%THREAD-NAME"));
         Emitter.CilAssembler.RegisterFunction("%THREADP",
             new LispFunction(Runtime.Threadp, "%THREADP"));
+        Emitter.CilAssembler.RegisterFunction("%ALL-THREADS",
+            new LispFunction(Runtime.AllThreads, "%ALL-THREADS"));
+        Emitter.CilAssembler.RegisterFunction("%LOCKP",
+            new LispFunction(Runtime.Lockp, "%LOCKP"));
+        Emitter.CilAssembler.RegisterFunction("%RECURSIVE-LOCK-P",
+            new LispFunction(Runtime.RecursiveLockP, "%RECURSIVE-LOCK-P"));
         Emitter.CilAssembler.RegisterFunction("%MAKE-LOCK",
             new LispFunction(Runtime.MakeLock, "%MAKE-LOCK"));
         Emitter.CilAssembler.RegisterFunction("%ACQUIRE-LOCK",

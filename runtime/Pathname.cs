@@ -144,6 +144,18 @@ public class LispPathname : LispObject
         return new LispPathname(host, device, directory, name, type, null);
     }
 
+    /// <summary>Reconstruct a pathname from its namestring but with an explicit
+    /// VERSION component. A namestring carries no version syntax, so a plain
+    /// FromString round-trip drops the version (e.g. :NEWEST → nil). The FASL
+    /// serializer uses this to preserve the version of a literal pathname embedded
+    /// via #. (ANSI COMPILE-FILE.16: *compile-file-pathname* has version :newest).</summary>
+    public static LispPathname FromStringWithVersion(string path, LispObject? version)
+    {
+        var p = FromString(path);
+        return new LispPathname(p.Host, p.Device, p.DirectoryComponent,
+                                p.NameComponent, p.TypeComponent, version);
+    }
+
     public virtual string ToNamestring()
     {
         var sb = new System.Text.StringBuilder();

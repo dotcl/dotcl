@@ -45,6 +45,17 @@
     (%cm-auto-fn 5))                                 ; flet wins -> 4 (not CM's 10)
   4)
 
+;;; A NOTINLINE declaration of the function name suppresses its compiler macro
+;;; for calls in that scope (CLHS 3.2.2.1.1) — previously dotcl ignored notinline
+;;; and the CM always fired (ANSI DEFINE-COMPILER-MACRO.7).
+(defun %cm-ni-fn (x) (* x 1000))                     ; real fn: *1000
+(define-compiler-macro %cm-ni-fn (x) `(* ,x 2))      ; CM: *2
+(deftest cm-notinline-suppresses
+  (list (%cm-ni-fn 5)                                ; no decl -> CM -> 10
+        (locally (declare (notinline %cm-ni-fn)) (%cm-ni-fn 5))  ; notinline -> real fn -> 5000
+        (funcall (lambda (x) (declare (notinline %cm-ni-fn)) (%cm-ni-fn x)) 5)) ; lambda body -> 5000
+  (10 5000 5000))
+
 ;;; (setf compiler-macro-function)
 (deftest d579-setf-compiler-macro-function
   (progn
@@ -1393,6 +1404,193 @@
     (eql (%mlf-box2-val (symbol-value (find-symbol "*MLF-TEST-VAL*"))) 99))
   t)
 
+;;; CLHS 3.2.4.2 — the make-load-form CREATION form must be EVALUATED at LOAD
+;;; time, not bypassed by returning the compile-time instance. The compile-time
+;;; intern pre-registration used to make InternViaEval cache-HIT the compile-time
+;;; object and skip the creation-form eval, so creation-form side effects never
+;;; ran at load (ANSI MAKE-LOAD-FORM.ORDER). Pin that a creation-form side
+;;; effect (a push onto a load-visible var) fires at load time.
+(defvar *mlf-creation-log* nil)
+(defclass %mlf-cls () ((name :initarg :name :reader %mlf-name)))
+(defmethod make-load-form ((x %mlf-cls) &optional env)
+  (declare (ignore env))
+  `(progn (push :created *mlf-creation-log*)
+          (make-instance '%mlf-cls :name ',(%mlf-name x))))
+
+(deftest make-load-form-creation-form-runs-at-load
+  (let* ((tmp (uiop:temporary-directory))
+         (src (merge-pathnames "mlf-creation-test.lisp" tmp))
+         (out (merge-pathnames "mlf-creation-test.fasl" tmp)))
+    (setf *mlf-creation-log* nil)
+    (with-open-file (f src :direction :output :if-exists :supersede)
+      (write-string "(defvar *mlf-c* '#.(make-instance '%mlf-cls :name 'foo))" f))
+    (compile-file src :output-file out)
+    (load out)
+    (list (and (member :created *mlf-creation-log*) t)
+          (%mlf-name (symbol-value (find-symbol "*MLF-C*")))))
+  (t foo))
+
+;;; FMAKUNBOUND must clear a macro definition too — including a macro defined on
+;;; a gensym. The *macros* table is keyed by symbol identity; FMAKUNBOUND cleared
+;;; it by a LispString of the name, leaving the symbol-keyed entry, so FBOUNDP /
+;;; MACRO-FUNCTION still found the macro afterward (ANSI FMAKUNBOUND.3).
+(deftest fmakunbound-clears-gensym-macro
+  (let ((g (gensym)))
+    (eval `(defmacro ,g () nil))
+    (list (and (fboundp g) t)
+          (progn (fmakunbound g) (fboundp g))
+          (macro-function g)))
+  (t nil nil))
+
+;;; REMOVE-IF yields exactly one value. A predicate whose last call returns
+;;; multiple values (e.g. SUBTYPEP) left secondaries in the MV register that
+;;; leaked through REMOVE-IF's scalar return (ANSI NIL.1 via check-predicate).
+(deftest remove-if-single-value-with-mv-predicate
+  (multiple-value-list
+   (remove-if (lambda (x) (not (subtypep (type-of x) nil))) '(1 2 3)))
+  (nil))
+
+;;; FUNCTION-LAMBDA-EXPRESSION's second value (closure indicator) must be true
+;;; for a function that closed over a non-null lexical environment; it was always
+;;; nil (ANSI FUNCTION-LAMBDA-EXPRESSION.2).
+(deftest function-lambda-expression-closure-p
+  (let ((x 1))
+    (flet ((%fle-f () x))
+      (let ((rv (multiple-value-list (function-lambda-expression #'%fle-f))))
+        (list (length rv) (and (second rv) t)))))
+  (3 t))
+
+;;; DEFPACKAGE :import-from / :shadowing-import-from accept a character as a
+;;; string designator for the package and symbol names (CLHS). Characters were
+;;; dropped, importing the wrong symbols (ANSI DEFPACKAGE.7/8).
+(deftest defpackage-import-from-char-designator
+  (progn
+    (ignore-errors (delete-package "RF-DPH"))
+    (ignore-errors (delete-package "Q"))
+    ;; source package "Q" so the char designator #\Q names it
+    (eval '(defpackage "Q" (:use) (:intern "A" "B")))
+    (eval `(defpackage "RF-DPH" (:use) (:import-from #\Q #\B "A")))
+    (let ((p (find-package "RF-DPH")))
+      (list (and (find-symbol "A" p) t)
+            (and (find-symbol "B" p) t)
+            (let ((n 0)) (do-symbols (s p) (declare (ignore s)) (incf n)) n))))
+  (t t 2))
+
+;;; (setf (f arg...) val) on a function-call place with no setf expander expands
+;;; to (funcall #'(setf f) val arg...) and yields THAT call's value(s), not a
+;;; re-returned copy of val (CLHS 5.1.2.5; ANSI FDEFINITION.5).
+(deftest setf-function-place-returns-funcall-value
+  (let* ((sym (gensym))
+         (fname (list 'setf sym)))
+    (setf (fdefinition fname) (fdefinition 'cons))
+    (eval `(setf (,sym 'a) 'b)))
+  (b . a))
+
+;;; set-pprint-dispatch keys on the full set of type specifiers (e.g. (MEMBER ..))
+;;; and accepts a symbol naming the dispatch function (ANSI PPRINT-DISPATCH.7-9).
+(deftest pprint-dispatch-member-spec-and-symbol-fn
+  (with-standard-io-syntax
+    (let ((*print-pprint-dispatch* (copy-pprint-dispatch nil))
+          (*print-readably* nil) (*print-escape* nil) (*print-pretty* t))
+      (defun %ppd-rf (s o) (declare (ignore o)) (write "HIT" :stream s))
+      (set-pprint-dispatch '(member x y) '%ppd-rf)
+      (list (write-to-string 'x) (write-to-string 'y) (write-to-string 'z))))
+  ("HIT" "HIT" "Z"))
+
+;;; pprint-pop / *print-length*: a dotted tail prints ". atom" even at the
+;;; length boundary; an empty/proper list still truncates with "..." (PPRINT-POP.6,
+;;; without regressing PPRINT-POP.1/9).
+(deftest pprint-pop-dotted-tail-at-length-boundary
+  (flet ((%f (len)
+           (with-standard-io-syntax
+             (let ((*print-pretty* t) (*print-escape* nil) (*print-right-margin* 100)
+                   (*print-readably* nil) (*print-length* len))
+               (with-output-to-string (os)
+                 (pprint-logical-block (os '(1 2 . 3) :prefix "{" :suffix "}")
+                   (pprint-exit-if-list-exhausted)
+                   (write (pprint-pop) :stream os)
+                   (loop (pprint-exit-if-list-exhausted)
+                         (write #\  :stream os)
+                         (write (pprint-pop) :stream os))))))))
+    (list (%f 0) (%f 1) (%f 2) (%f 3)))
+  ("{...}" "{1 ...}" "{1 2 . 3}" "{1 2 . 3}"))
+
+;;; (setf (values ...) form): place subforms evaluate left-to-right BEFORE the
+;;; value form (ANSI SETF-VALUES.5).
+(deftest setf-values-evaluation-order
+  (let ((a (vector nil nil)) (i 0) x y z)
+    (setf (values (aref a (progn (setf x (incf i)) 0))
+                  (aref a (progn (setf y (incf i)) 1)))
+          (progn (setf z (incf i)) (values 'foo 'bar)))
+    (list (coerce a 'list) i x y z))
+  ((foo bar) 3 1 2 3))
+
+;;; A nested (values ..) place consumes ONE value and sets its first sub-place,
+;;; NIL to the rest (ANSI VALUES.20).
+(deftest setf-values-nested-distributes-one-value
+  (let ((a t) (b t) (c t) (d t) (e t) (f t))
+    (setf (values a (values b c) (values d) (values e f)) (values 0 1 2 3 4 5 6))
+    (list a b c d e f))
+  (0 1 nil 2 3 nil))
+
+;;; psetf with multi-store (values ..) places binds all the value form's values
+;;; (ANSI PSETF.41), and a plain parallel swap still works.
+(deftest psetf-multistore-values-place
+  (let ((y 2) (z 3) u x a b c)
+    (psetf (values a b c) (values 1 2 3)
+           (values u x)   (values y z))
+    (list a b c u x))
+  (1 2 3 2 3))
+
+(deftest psetf-parallel-swap-still-works
+  (let ((a 1) (b 2)) (psetf a b b a) (list a b))
+  (2 1))
+
+;;; delete-file on a directory pathname deletes the (empty) directory, like SBCL
+;;; (ANSI ENSURE-DIRECTORIES-EXIST.8 deletes a scratch subdir this way).
+(deftest delete-file-on-directory-pathname
+  (let ((dir (make-pathname :directory '(:relative "rf-deldir-test")
+                            :defaults *default-pathname-defaults*)))
+    (ignore-errors (delete-file dir))
+    ;; ensure-directories-exist creates the directory component (but not a file)
+    (ensure-directories-exist
+     (make-pathname :name "x" :type "txt" :defaults dir))
+    (list (and (probe-file dir) t)
+          (and (delete-file dir) t)   ; delete-file on the empty directory
+          (and (probe-file dir) t)))
+  (t t nil))
+
+;;; A defstruct slot whose name is a SPECIAL variable must not shadow that
+;;; variable in later slots' default initforms — the keyword constructor binds
+;;; such a slot via a gensym, not the special symbol (ANSI STRUCTURE-60-1).
+(defvar *rf-st60* 100)
+(defstruct rf-struct-60
+  (a *rf-st60* :type integer)
+  (*rf-st60* 0 :type integer)
+  (b *rf-st60* :type integer))
+(deftest defstruct-special-slot-name-does-not-shadow
+  (let ((*rf-st60* 10))
+    (let ((s (make-rf-struct-60 :*rf-st60* 200)))
+      (list (rf-struct-60-a s) (rf-struct-60-*rf-st60* s) (rf-struct-60-b s))))
+  (10 200 10))
+
+;;; A literal pathname embedded in compiled code (#.) keeps its VERSION across the
+;;; FASL round-trip; a plain namestring round-trip dropped :newest to nil
+;;; (ANSI COMPILE-FILE.16 via *compile-file-pathname*).
+(deftest fasl-pathname-preserves-version
+  (let* ((tmp (uiop:temporary-directory))
+         (src (merge-pathnames "rf-pathver.lisp" tmp))
+         (out (merge-pathnames "rf-pathver.fasl" tmp)))
+    (with-open-file (f src :direction :output :if-exists :supersede)
+      (write-string
+       "(defparameter *rf-pathver* '#.(make-pathname :name \"x\" :type \"lsp\" :version :newest))"
+       f))
+    (compile-file src :output-file out)
+    (load out)
+    (pathname-version (symbol-value (find-symbol "*RF-PATHVER*"))))
+  :newest)
+
+
 ;;; ASDF source-registry で dotcl-thread がロードできること
 (deftest asdf-load-dotcl-thread
   (progn
@@ -1735,3 +1933,634 @@
   (list (pathname-host (pathname "/etc/hosts"))
         (namestring (pathname "/etc/hosts")))
   (nil "/etc/hosts"))
+
+;;; (or <non-tail self-call> <tail self-call>) in a self-recursive
+;;; function must not let the tail-side TCO loop discard the non-tail side's
+;;; truthy value. The non-tail arm of OR/AND is NOT in tail position; binding
+;;; *in-tail-position* nil there prevents the spurious TCO-rewrite that turned
+;;; a self-call into a value-discarding loop-back. Needs a deep spine so the
+;;; tail self-call actually loops past the matching element.
+(defun %refs-p-276 (tree key)
+  (cond ((atom tree) nil)
+        ((and (eq (car tree) :ldloc) (eq (cadr tree) key)) t)
+        (t (or (%refs-p-276 (car tree) key)     ; non-tail self-call
+               (%refs-p-276 (cdr tree) key))))) ; tail self-call (TCO target)
+
+(deftest issue276-or-nontail-self-truthy-deep
+  ;; ( :x :x ... (:ldloc 7) ) with a 60-deep spine — the match is in a deep
+  ;; car, reached only via the non-tail OR arm while the tail arm loops the cdr.
+  (%refs-p-276
+   (let ((lst '((:ldloc 7))))
+     (dotimes (i 60) (setq lst (cons :x lst)))
+     lst)
+   7)
+  t)
+
+(deftest issue276-or-nontail-self-trivial
+  (%refs-p-276 '(:ldloc 7) 7)
+  t)
+
+(deftest issue276-or-nontail-self-nested
+  (%refs-p-276 '(((((:ldloc 7))))) 7)
+  t)
+
+(deftest issue276-or-nontail-self-absent
+  (%refs-p-276
+   (let ((lst '((:ldloc 9))))
+     (dotimes (i 60) (setq lst (cons :x lst)))
+     lst)
+   7)
+  nil)
+
+;; NOTE: the symmetric AND case ((and <non-tail self> <tail self>)) is NOT fixed
+;; here. Applying the same *in-tail-position* nil binding to COMPILE-AND's
+;; intermediate args makes 4 eval-and-compile ANSI tests (EVAL-WHEN.1,
+;; DEFINE-COMPILER-MACRO.4/7, MACRO-FUNCTION.15) flip to FAIL. Investigation
+;; investigation found these are state-ordering-fragile, not a deterministic
+;; AND miscompile: one root cause — a bare {:execute} eval-when at top level of
+;; a compiled file leaked its body into the fasl — was fixed independently
+;; (see issue333-eval-when-execute-only-discarded-in-compiled-file below and
+;; the compile-eval-when change). That alone makes eval-and-compile 318/318
+;; standalone, but adding the AND fix still perturbs cross-test state. The AND
+;; codegen fix remains pending the residual interaction.
+
+;;; rename-file must replace an existing target (POSIX rename / SBCL semantics).
+;;; Previously it used File.Move without overwrite, so renaming onto an existing
+;;; file threw "Cannot create a file when that file already exists" — which broke
+;;; asdf's atomic-write idiom (write temp → rename onto final), making the second
+;;; build of any external system fail in load-asd.
+(deftest rename-file-overwrites-existing
+  (let ((src "dotcl-rf-src.tmp")
+        (dst "dotcl-rf-dst.tmp"))
+    (with-open-file (s src :direction :output :if-exists :supersede) (write-string "new" s))
+    (with-open-file (s dst :direction :output :if-exists :supersede) (write-string "old" s))
+    (rename-file src dst)
+    (prog1
+        (list (with-open-file (s dst) (read-line s))   ; dst now holds src's content
+              (and (probe-file src) t))                ; src is gone
+      (ignore-errors (delete-file dst))))
+  ("new" nil))
+
+;;; eval-when situation handling at top level of a COMPILE-FILE'd file
+;;; (CLHS 3.2.3.1, Figure 3-7). A bare {:execute} eval-when at top level of a
+;;; compiled file must be DISCARDED: its body is neither run at compile time nor
+;;; placed into the fasl's load code. Previously compile-eval-when emitted the
+;;; body whenever :execute was present (or lt-p ex-p), so loading the compiled
+;;; file wrongly ran the :execute-only body — an extra side effect.  Fixed to
+;;; emit-for-load iff :load-toplevel is present at top level.
+(defparameter *ew-discard-collector* nil)
+(deftest issue333-eval-when-execute-only-discarded-in-compiled-file
+  (let* ((src "dotcl-ew-discard-src.lisp")
+         (fasl (compile-file-pathname src)))
+    (with-open-file (o src :direction :output :if-exists :supersede)
+      (prin1 '(eval-when (:execute) (push :exec-only *ew-discard-collector*)) o)
+      (terpri o)
+      (prin1 '(eval-when (:load-toplevel) (push :load-only *ew-discard-collector*)) o)
+      (terpri o))
+    (compile-file src)
+    (prog1
+        (let ((*ew-discard-collector* nil))
+          (load fasl)
+          *ew-discard-collector*)              ; only the :load-toplevel body ran
+      (ignore-errors (delete-file src))
+      (ignore-errors (delete-file fasl))))
+  (:load-only))
+
+;; {:compile-toplevel :execute} (no :load-toplevel) at top level of a compiled
+;; file is evaluated at compile time and NOT placed in the fasl (CLHS Figure 3-7);
+;; :execute must not promote it into the load image. Previously the compile-file
+;; eval-when handler forced load-toplevel whenever :execute was present, leaking
+;; the body into the fasl. Here :ctex must NOT appear at load time.
+(deftest issue333-eval-when-ct-execute-not-in-fasl
+  (let* ((src "dotcl-ew-ctex-src.lisp")
+         (fasl (compile-file-pathname src)))
+    (with-open-file (o src :direction :output :if-exists :supersede)
+      (prin1 '(eval-when (:compile-toplevel :execute) (push :ctex *ew-discard-collector*)) o)
+      (terpri o)
+      (prin1 '(eval-when (:load-toplevel) (push :load *ew-discard-collector*)) o)
+      (terpri o))
+    (compile-file src)
+    (prog1
+        (let ((*ew-discard-collector* nil))
+          (load fasl)
+          *ew-discard-collector*)              ; only :load ran at load time
+      (ignore-errors (delete-file src))
+      (ignore-errors (delete-file fasl))))
+  (:load))
+
+;;; DEFUN of a (setf name) function returns the function name itself — the list
+;;; (SETF name) — not a symbol interned from the mangled string "(SETF name)".
+;;; compile-defun emitted the mangled symbol for non-symbol names, so
+;;; (eval `(defun (setf ,g) ...)) returned |(SETF G)| instead of (SETF G)
+;;; (ANSI DEFINE-COMPILER-MACRO.4).
+(deftest defun-setf-name-returns-name-list
+  (let ((g (gensym)))
+    (let ((ret (eval `(defun (setf ,g) (nv x) (setf (car x) nv)))))
+      (list (consp ret) (and (consp ret) (eq (car ret) 'setf) t) (eq (cadr ret) g))))
+  (t t t))
+
+;;; (setf (macro-function name environment) fn): the optional ENVIRONMENT place
+;;; subform must be evaluated for effect (CLHS 5.1.1.1), even though dotcl's macro
+;;; table doesn't key on it. The setf-expander previously used only (second place)
+;;; and silently dropped the environment subform, losing its side effects
+;;; (ANSI MACRO-FUNCTION.15).
+(deftest macro-function-setf-evaluates-environment-subform
+  (let ((sym (gensym)) (i 0) a b)
+    (setf (macro-function (progn (setf a (incf i)) sym)
+                          (progn (setf b (incf i)) nil))
+          (macro-function 'pop))
+    (list i a b))                              ; both progns ran: i=2, a=1, b=2
+  (2 1 2))
+
+;; dotcl-cltl2 minimal CLtL2 environment access. The crux is define-declaration
+;; being a MACRO (so the declaration name isn't evaluated as a variable) and all the
+;; introspection functions being TOTAL (never error at env=NIL, degrade to nil/safe).
+(deftest i338-define-declaration-is-macro
+  ;; was "Unbound variable: OPTIMIZER" when define-declaration was a plain call.
+  (eval '(dotcl-cltl2:define-declaration optimizer (spec env)
+          (declare (ignore spec env)) (values :declare nil)))
+  optimizer)
+
+(deftest i338-declaration-information-safe
+  (list (dotcl-cltl2:declaration-information 'optimizer nil)        ; custom -> nil
+        (and (dotcl-cltl2:declaration-information 'optimize nil) t))  ; optimize -> default
+  (nil t))
+
+(deftest i338-information-never-errors-at-nil-env
+  (list (multiple-value-list (dotcl-cltl2:variable-information 'x nil))
+        (multiple-value-list (dotcl-cltl2:function-information 'car nil))
+        (dotcl-cltl2:augment-environment nil :variable '(x)))
+  ((nil nil nil) (nil nil nil) nil))
+
+;;; compile-file-pathname of a LOGICAL pathname must stay logical (keep its host),
+;;; so the default output is translated through the host's translations. Returning
+;;; a physical pathname that reused the logical host mashed host+name into the
+;;; namestring ("//CLTEST..." → "\CLTEST..." on Windows), breaking compile-file of
+;;; a logical pathname (ANSI COMPILE-FILE.17).
+(deftest compile-file-pathname-logical-stays-logical
+  (progn
+    (setf (logical-pathname-translations "DOTCLT")
+          `(("**;*.*.*" ,(merge-pathnames
+                          "sandbox/"
+                          (make-pathname
+                           :directory (append (pathname-directory (truename (make-pathname)))
+                                               '(:wild-inferiors))
+                           :name :wild :type :wild)))))
+    (let ((out (compile-file-pathname (logical-pathname "DOTCLT:CFPLP.LSP"))))
+      (list (typep out 'logical-pathname)
+            (string-equal (pathname-type out) "fasl")
+            ;; physical translation must contain "sandbox", no mashed host token
+            (and (search "sandbox" (namestring (translate-logical-pathname out))) t)
+            (not (search "DOTCLT" (namestring (translate-logical-pathname out)))))))
+  (t t t t))
+
+;;; (The require->asdf fallback wiring is exercised implicitly by every test
+;;; that (require "<asdf-system>"); a dedicated test was removed: it added
+;;; no coverage beyond the wiring check and forced pinning a real library
+;;; (trivial-features) as an asdf-findable subject, which blocked removing that
+;;; library's contrib stub. Tests must earn their runtime cost.)
+
+;;; Multi-list MAPCAR whose list arg expands to code that opens a try-block
+;;; (e.g. LOOP ... COLLECT). The compiler pushed the function value, then
+;;; compiled the list args (building the array) with that value still on the
+;;; stack; a LOOP arg's try-block entry then violated CIL's empty-stack rule
+;;; → "CLR detected an invalid program" (inquisitor resolve-states).
+;;; Fixed by stashing function + arg-array in temps so the stack is empty
+;;; while each list arg compiles.
+(defun %mapcarn-loop-a (p) (mapcar (lambda (a i) (list a i)) p (loop for i below (length p) collect i)))
+(defun %mapcarn-loop-b (p) (mapcar (lambda (i a) (list i a)) (loop for i below 3 collect i) p))
+(deftest i340-multilist-mapcar-with-loop-arg
+  (list (%mapcarn-loop-a '(a b c))
+        (%mapcarn-loop-b '(x y z))
+        (mapcar (lambda (a b c) (list a b c)) '(1 2) '(p q) (loop for i below 2 collect i)))
+  (((a 0) (b 1) (c 2))
+   ((0 x) (1 y) (2 z))
+   ((1 p 0) (2 q 1))))
+
+;; dotcl:chdir (backs uiop:chdir / with-current-directory). Round-trip:
+;; change to a known-existing dir, confirm it changed, then restore.
+(deftest i343-chdir-roundtrip
+  (let ((orig (dotcl:getcwd)))
+    (unwind-protect
+        (progn
+          (dotcl:chdir (user-homedir-pathname))
+          (list (not (equal (namestring (dotcl:getcwd)) (namestring orig)))   ; changed
+                (progn (dotcl:chdir orig)
+                       (equal (namestring (dotcl:getcwd)) (namestring orig))))) ; restored
+      (dotcl:chdir orig)))
+  (t t))
+
+;; chdir to a nonexistent directory signals an error (caught, cwd unchanged)
+(deftest i343-chdir-bad-dir-errors
+  (let ((orig (namestring (dotcl:getcwd))))
+    (prog1 (handler-case (progn (dotcl:chdir "C:/dotcl-no-such-dir-i343/") :no-error)
+             (error () :error))
+      (dotcl:chdir orig)))
+  :error)
+
+;;; Weak pointers: dotcl:make-weak-pointer / weak-pointer-value /
+;;; weak-pointer-p backed by System.WeakReference. While the target is reachable,
+;;; weak-pointer-value returns it; type/predicate behave; print is readable.
+;;; (GC-collection behavior is timing-dependent and not asserted here.)
+(deftest i342-weak-pointer-basics
+  (let* ((obj (list 1 2 3))
+         (wp (dotcl:make-weak-pointer obj)))
+    (list (dotcl:weak-pointer-p wp)
+          (dotcl:weak-pointer-p obj)
+          (eq (dotcl:weak-pointer-value wp) obj)
+          (typep wp 'dotcl::weak-pointer)
+          (notnot (typep wp 'dotcl::weak-pointer))))
+  (t nil t t t))
+
+;;; (The trivial-garbage:* wrapper tests were removed: they only checked
+;;; that trivial-garbage forwards to the dotcl:* primitives, which the i342-*
+;;; tests here exercise directly. They pinned contrib/trivial-garbage, blocking
+;;; its move to the ../trivial-garbage fork. Tests must earn their cost.)
+
+;;; Weak hash tables: make-hash-table accepts all weakness modes;
+;;; hash-table-weakness reports them; entries with all weak sides live behave as
+;;; normal. (GC collection is timing-dependent, asserted separately/manually.)
+(deftest i342-weak-hash-table-modes
+  (mapcar (lambda (mode)
+            (let ((h (make-hash-table :test 'eq :weakness mode))
+                  (k (list 'k)) (v (list 'v)))
+              (setf (gethash k h) v)
+              (list (hash-table-weakness h)
+                    (eq (gethash k h) v)
+                    (hash-table-count h))))
+          '(:key :value :key-and-value :key-or-value))
+  ((:key t 1) (:value t 1) (:key-and-value t 1) (:key-or-value t 1)))
+
+;;; A non-weak table reports NIL weakness; an invalid mode errors.
+(deftest i342-hash-table-weakness-strong-and-invalid
+  (list (hash-table-weakness (make-hash-table))
+        (handler-case (progn (make-hash-table :weakness :bogus) :no-error)
+          (error () :error)))
+  (nil :error))
+
+;;; Finalizers: dotcl:finalize returns the object; cancel-finalization
+;;; returns T when a finalizer was registered, NIL otherwise; run-finalizers
+;;; returns a count. (Whether/when GC actually fires a finalizer is
+;;; timing-dependent and verified manually, not asserted here — same policy as
+;;; the weak-pointer/weak-hash-table tests above.)
+(deftest i342-finalize-api
+  (let ((obj (list 'x)))
+    (list (eq (dotcl:finalize obj (lambda () nil)) obj)   ; returns object
+          (notnot (dotcl:cancel-finalization obj))        ; T: had a finalizer
+          (dotcl:cancel-finalization obj)                 ; NIL: none now
+          (integerp (dotcl:run-finalizers))))             ; count
+  (t t nil t))
+
+;;; macrolet &whole binds the whole macro-call form, not (cdr form). The compiler
+;;; has several macrolet expander-registration sites (compile-macrolet, the
+;;; %mini-eval MACROLET case, and three cil-analysis walkers); the analysis copies
+;;; inlined (destructuring-bind PARAMS (cdr form) ...), omitting &whole handling,
+;;; and the analysis pass caches its expansion in *macroexpand-cache* for compile
+;;; to reuse — so &whole var bound to (cdr form) even though compile-macrolet was
+;;; correct. Now all sites share %macrolet-expander-form (MACROLET.4/12).
+(deftest i350-macrolet-whole
+  (list
+   ;; &whole var binds the entire call form
+   (let ((r nil)) (macrolet ((m (&whole w a) `(progn (setq r ',w) ,a))) (m 7) r))
+   ;; &whole alongside several args
+   (let ((r nil)) (macrolet ((m (&whole w a b) `(progn (setq r ',w) (+ ,a ,b)))) (m 3 4) r))
+   ;; plain macrolet (no &whole) still works
+   (macrolet ((m (a b) `(* ,a ,b))) (m 6 7))
+   ;; &whole destructuring pattern
+   (macrolet ((m (&whole (nm x) a) (declare (ignore nm a)) `',x)) (m 5)))
+  ((m 7) (m 3 4) 42 5))
+
+;;; get-setf-expansion of a function-call place yields the CLHS 5.1.2.5 store
+;;; form (funcall #'(setf f) store temps...), with the args bound to temps and
+;;; evaluated once — not a re-emitted (setf place store). gethash/get/char/
+;;; slot-value/symbol-value/cadr/cdar are modeled explicitly in %get-setf-expansion
+;;; (matching the SETF macro's setters) so they keep their real store forms and
+;;; the funcall fallback only applies to genuine (setf f) function places
+;;; (GET-SETF-EXPANSION.1).
+(deftest i349-get-setf-expansion-function-place
+  (let* ((e (multiple-value-list (get-setf-expansion '(fff a b))))
+         (setter (fourth e)))
+    (list (and (consp setter)
+               (eq (first setter) 'funcall)
+               (equal (second setter) '(function (setf fff)))
+               t)
+          (length (first e))    ; two arg temps
+          (second e)))          ; bound to a, b in order
+  (t 2 (a b)))
+
+(deftest i349-accessor-setters-intact
+  (list
+   (let ((h (make-hash-table))) (setf (gethash 'k h) 1) (incf (gethash 'k h)) (gethash 'k h))
+   (let ((s (gensym))) (setf (get s 'p) 3) (incf (get s 'p)) (get s 'p))
+   (let ((str (copy-seq "abc"))) (setf (char str 1) #\Z) str)
+   (let ((c (list 1 2 3))) (setf (cadr c) 5) (incf (cadr c)) c)
+   (let ((c (cons 1 (cons 2 3)))) (setf (cdar (list c)) 9) t))
+  (2 4 "aZc" (1 6 3) t))
+
+;;; make-load-form: creation and init forms interleave per object at load time
+;;; (CLHS 3.2.4.2 / SBCL): each object's init form runs right after its creation,
+;;; as data flow allows. The FASL emitter nested a referenced object's creation
+;;; inside the referencing creation form, so all creations ran before any init
+;;; (and in the wrong order). Now each creation is emitted as its own top-level
+;;; method, dependencies first, with eager init flush between (MLF.ORDER.6/10).
+(defclass i353-lfo ()
+  ((name :initarg :name :reader i353-name)
+   (md :initarg :md :accessor i353-md :initform nil)))
+(defvar *i353-order* nil)
+(defmethod make-load-form ((x i353-lfo) &optional env) (declare (ignore env))
+  (values
+   `(progn (push (list :creating ',(i353-name x)) *i353-order*)
+           (make-instance 'i353-lfo :name ',(i353-name x) :md ',(slot-value x 'md)))
+   `(progn (push (list :init ',(i353-name x)) *i353-order*) ',x)))
+(defun %i353-order (text)
+  (let* ((tmp (format nil "~a/dotcl-i353-~a" (or (dotcl:getenv "TEMP") "/tmp")
+                      (get-internal-real-time)))
+         (src (format nil "~a/src.lisp" tmp)))
+    (ensure-directories-exist (concatenate 'string tmp "/"))
+    (with-open-file (s src :direction :output :if-exists :supersede)
+      (write-string text s))
+    (setf *i353-order* nil)
+    (load (compile-file src :verbose nil :print nil))
+    (reverse *i353-order*)))
+
+(deftest i353-make-load-form-order
+  (list
+   (%i353-order "(eval-when (:compile-toplevel)
+       (defparameter *a* (make-instance 'i353-lfo :name 'a))
+       (defparameter *b* (make-instance 'i353-lfo :name 'b))
+       (setf (i353-md *b*) *a*))
+     (defparameter *bb* #.*b*) (defparameter *aa* #.*a*)")
+   (%i353-order "(eval-when (:compile-toplevel)
+       (defparameter *a* (make-instance 'i353-lfo :name 'a))
+       (defparameter *b* (make-instance 'i353-lfo :name 'b))
+       (defparameter *c* (make-instance 'i353-lfo :name 'c))
+       (setf (i353-md *b*) *a*) (setf (i353-md *c*) *b*))
+     (defparameter *cc* #.*c*) (defparameter *aa* #.*a*) (defparameter *bb* #.*b*)"))
+  (((:creating a) (:init a) (:creating b) (:init b))
+   ((:creating a) (:init a) (:creating b) (:init b) (:creating c) (:init c))))
+
+;;; ensure-directories-exist on a :relative-directory pathname creates the directory
+;;; under *default-pathname-defaults* and reports created=T. On Windows the merged
+;;; namestring is drive-relative ("C:scratch/..."): ResolvePhysicalPath must merge it
+;;; with DPD (CL :relative-directory semantics), not resolve it against drive C:'s
+;;; process-global cwd, or delete-file and ensure-directories-exist diverge and the
+;;; created flag comes back NIL (ENSURE-DIRECTORIES-EXIST.8 — Windows-only).
+(defun %i355-ede ()
+  (let* ((base (format nil "~a/dotcl-i355-~a/" (or (dotcl:getenv "TEMP") "/tmp")
+                       (get-internal-real-time)))
+         (*default-pathname-defaults* (pathname base))
+         (subdir (make-pathname :directory '(:relative "scratch")
+                                :defaults *default-pathname-defaults*))
+         (pn (make-pathname :name "foo" :type "txt" :defaults subdir)))
+    (ensure-directories-exist (pathname base))
+    (ignore-errors (delete-file pn) (delete-file subdir))
+    (multiple-value-bind (rpn created) (ensure-directories-exist pn)
+      (declare (ignore rpn))
+      (with-open-file (s pn :direction :output :if-exists :supersede :if-does-not-exist :create)
+        (write-string "x" s))
+      (list (and created t)                                  ; a directory was created
+            (and (probe-file pn) t)                          ; file exists
+            (and (search "i355" (namestring (truename pn))) t))))) ; under DPD, not cwd
+
+(deftest i355-ensure-directories-exist-relative-dir
+  (%i355-ede)
+  (t t t))
+
+;;; dotcl:package-locally-nicknamed-by-list — the packages that have a local
+;;; nickname for the given package. Completes dotcl's PLN API so the
+;;; ../trivial-package-local-nicknames fork can import all four operators from
+;;; the DOTCL package instead of dotcl shipping a contrib stub.
+(deftest i356-package-locally-nicknamed-by-list
+  (let ((host (make-package "I356-HOST" :use nil))
+        (targ (make-package "I356-TARG" :use nil)))
+    (unwind-protect
+        (progn
+          (dotcl:add-package-local-nickname "NK" targ host)
+          (list (mapcar #'package-name (dotcl:package-locally-nicknamed-by-list targ))
+                (dotcl:package-locally-nicknamed-by-list host)))  ; host: nicknamed by nobody
+      (ignore-errors (delete-package host))
+      (ignore-errors (delete-package targ))))
+  (("I356-HOST") nil))
+
+;;; princ / ~A must NOT print the package prefix of a symbol — including the
+;;; keyword colon and the #: of an uninterned symbol (CLHS 22.1.3.3: the prefix
+;;; is printed only when *print-escape* / *print-readably* is true). The keyword
+;;; case previously leaked the colon ((princ-to-string :foo) => ":FOO"), which
+;;; broke the upstream flexi-streams test suite (it builds fixture filenames with
+;;; (format nil "~(~A~)" external-format-keyword)).
+(deftest i360-princ-keyword-no-colon
+  (princ-to-string :utf8)
+  "UTF8")
+
+(deftest i360-format-a-keyword-no-colon
+  (format nil "~a" :foo)
+  "FOO")
+
+(deftest i360-format-downcase-keyword
+  (format nil "~(~a~)" :utf8)
+  "utf8")
+
+;; prin1 / ~S still prints the keyword colon (escape = t).
+(deftest i360-prin1-keyword-keeps-colon
+  (prin1-to-string :foo)
+  ":FOO")
+
+;; princ of an interned symbol from another package drops the package prefix.
+(deftest i360-princ-foreign-symbol-no-prefix
+  (let ((p (make-package "I360-PP" :use nil)))
+    (unwind-protect
+        (princ-to-string (intern "BAR" p))
+      (delete-package p)))
+  "BAR")
+
+;;; CIL codegen: (setf (svref/aref/schar/elt place idx) VALUE) where VALUE is a
+;;; try-based non-local exit (block/return, loop with finally/return) produced
+;;; unverifiable IL — the array-store path (%set-elt / %set-char) pushed array+
+;;; index onto the CIL stack, then entered the value's try region with a
+;;; non-empty stack ("enter try block with nonempty stack"). Now spilled to
+;;; temps like the function-call path. Found via the upstream flexi-streams
+;;; UTF-8 decoder (octets-to-string*).
+(deftest i362-setf-svref-block-return
+  (let ((s (make-array 2)))
+    (setf (svref s 0) (block nil (return 65)))
+    (setf (svref s 1) (block nil (return 66)))
+    (coerce s 'list))
+  (65 66))
+
+(deftest i362-setf-aref-loop-finally
+  (let ((s (make-array 3)))
+    (dotimes (k 3)
+      (setf (aref s k) (loop for x from 1 to (1+ k) sum x)))
+    (coerce s 'list))
+  (1 3 6))
+
+(deftest i362-setf-schar-block
+  (let ((s (make-string 2)))
+    (setf (schar s 0) (code-char (block nil (return 72))))
+    (setf (schar s 1) (code-char (block nil (return 73))))
+    s)
+  "HI")
+
+(deftest i362-setf-elt-loop
+  (let ((s (make-array 2 :initial-element 0)))
+    (setf (elt s 0) (loop repeat 3 sum 1))
+    (coerce s 'list))
+  (3 0))
+
+;;; Closure capture/mutation through a symbol-macro: a variable referenced and
+;;; mutated only via a SYMBOL-MACROLET expansion inside an FLET/lambda body must
+;;; still be boxed (shared between the closure and the enclosing scope). The
+;;; free-variable pass expanded symbol-macros, but find-mutated-vars and
+;;; find-captured-vars did not, so the var was seen as neither mutated nor
+;;; captured -> not boxed -> the closure got a private copy and the (incf)
+;;; was lost. Surfaced as the upstream flexi-streams CRLF decoder returning
+;;; "hh" for octets (104 105) (octet-getter symbol-macro doing (incf i) inside
+;;; an flet get-char-code).
+(defun %i363-smac-flet (v)
+  (let ((i 0))
+    (declare (fixnum i))
+    (symbol-macrolet ((og (prog1 (aref v i) (incf i))))
+      (flet ((g () og))
+        (list (g) (g) i)))))
+
+(deftest i363-symbol-macro-mutation-in-flet
+  (%i363-smac-flet #(10 20 30))
+  (10 20 2))
+
+;; lambda variant (not just flet)
+(defun %i363-smac-lambda (v)
+  (let ((i 0))
+    (declare (fixnum i))
+    (symbol-macrolet ((og (prog1 (aref v i) (incf i))))
+      (mapcar (lambda (ignored) (declare (ignore ignored)) og) '(a b c)))))
+
+(deftest i363-symbol-macro-mutation-in-lambda
+  (%i363-smac-lambda #(10 20 30))
+  (10 20 30))
+
+;;; A self-recursive call in cond TEST position must not be TCO'd into a
+;;; jump.  When the recursion returns NIL the clause is skipped (CLHS), so the
+;;; following clauses — including the t clause — must still be evaluated.
+(defun %i373-r (x)
+  (cond ((atom x) nil)        ; base: atom -> nil
+        ((%i373-r (car x)))   ; test-only self-recursive arm; (r 'z) -> nil
+        (t 'reached)))        ; must fire
+
+(deftest i373-cond-test-self-recursion-no-body
+  (%i373-r '(z))
+  reached)
+
+;; with-body variant of the same arm
+(defun %i373-r2 (x)
+  (cond ((atom x) nil)
+        ((%i373-r2 (car x)) 'got)
+        (t 'reached)))
+
+(deftest i373-cond-test-self-recursion-with-body
+  (%i373-r2 '(z))
+  reached)
+
+;;; Complex literals must survive compile-file -> load (the fasl writer
+;;; had no inline encoding for LispComplex and silently corrupted the constant
+;;; pool — a list element #C(0 1) came back as an unrelated string constant).
+(defun %i370-roundtrip ()
+  (let ((src (merge-pathnames "i370-cplx-tmp.lisp" *default-pathname-defaults*)))
+    (with-open-file (s src :direction :output :if-exists :supersede)
+      (write-string "(in-package :cl-user)
+(defparameter *i370-z* #C(3 4))
+(defparameter *i370-lst* (list 1 #C(0 1) 2))" s))
+    (let ((fasl (compile-file src)))
+      (load fasl)
+      (prog1 (list (symbol-value '*i370-z*) (symbol-value '*i370-lst*))
+        (ignore-errors (delete-file src))
+        (ignore-errors (delete-file fasl))))))
+
+(deftest i370-complex-literal-fasl-roundtrip
+  (%i370-roundtrip)
+  (#C(3 4) (1 #C(0 1) 2)))
+
+;;; A special variable that is ALSO closure-captured and mutated must be
+;;; bound on the dynamic stack, never in a lexical box. Previously the param was
+;;; boxed (LispObject[1]) for the capture, and the special-var bind pushed the
+;;; box itself instead of its value -> the box (an array, not a LispObject) was
+;;; stored into the binding stack's value array -> ArrayTypeMismatchException.
+;;; (Maxima taylor1's `tlist` is exactly this shape: defmvar special, captured
+;;; by a mapcan lambda, and setq'd in the body.)
+(defvar *i371-tl* nil)
+(defun %i371-g (e *i371-tl*)
+  (declare (special *i371-tl*))
+  (mapcar #'(lambda (q) (cons q *i371-tl*)) '(1 2))  ; closure captures the special
+  (setq *i371-tl* (cons 'z *i371-tl*))               ; mutate it
+  (list e *i371-tl*))
+
+(deftest i371-special-captured-mutated-param
+  (%i371-g 'x (cons 1 nil))
+  (x (z 1)))
+
+;; the closure must read the CURRENT dynamic value, not a stale capture
+(defvar *i371-d* 'global)
+(defun %i371-reader () *i371-d*)
+(defun %i371-h (*i371-d*)
+  (declare (special *i371-d*))
+  (funcall #'(lambda () (%i371-reader))))   ; reads special dynamically
+
+(deftest i371-closure-reads-dynamic-special
+  (%i371-h 'bound)
+  bound)
+
+;;; #374: coerce must handle a deftype whose expander COMPUTES the target type.
+;;; deftype &optional params default to * (not nil), so Maxima's FLONUM expands to
+;;; (DOUBLE-FLOAT * *); coerce's compound path handled VECTOR/ARRAY/COMPLEX but not
+;;; the float types, so it fell through to "cannot coerce to ". typep/subtypep were
+;;; fine. Broke all Maxima bigfloat log/gamma/expintegral (log-n: (coerce x 'flonum)).
+(deftype %i374-flonum (&optional low high)
+  (cond (high `(double-float ,low ,high))
+        (low  `(double-float ,low))
+        (t    'double-float)))
+
+(deftest i374-coerce-computed-deftype
+  (coerce 2/3 '%i374-flonum)
+  0.6666666666666666d0)
+
+(deftest i374-coerce-compound-double-float-with-bounds
+  (coerce 2/3 '(double-float 0d0 1d0))
+  0.6666666666666666d0)
+
+(deftest i374-coerce-compound-single-float
+  (coerce 3 '(single-float 0.0))
+  3.0)
+
+;; typep/subtypep already worked — guard they still do
+(deftest i374-typep-computed-deftype
+  (typep 1.0d0 '%i374-flonum)
+  t)
+
+;;; remove/delete must return the ORIGINAL list (eq) when nothing is removed,
+;;; not a fresh copy. CLHS permits a copy, but SBCL/CCL and most impls share the
+;;; original, and libraries (Maxima add2lnc) rely on it: (setq x (delete .. x))
+;;; followed by (nconc x ..) must mutate the same cons when no element matched.
+(deftest remove-absent-returns-eq-original
+  (let ((l (list 'a 'b 'c)))
+    (list (eq l (remove 'z l))
+          (eq l (delete 'z l))
+          (eq l (remove 'z l :count 1))
+          (eq l (delete 'z l :test #'equal))
+          (eq l (remove-if (lambda (x) (eq x 'z)) l))
+          (eq l (delete-if-not #'symbolp l :count 1))
+          (eq l (remove 'z l :from-end t :count 1))))
+  (t t t t t t t))
+
+;; When something IS removed, a new list is returned (original untouched).
+(deftest remove-present-returns-new-list
+  (let* ((l (list 'a 'b 'c)) (r (remove 'b l)))
+    (list (eq l r) r l))
+  (nil (a c) (a b c)))
+
+;; The add2lnc idiom: delete-absent keeps the cons shared so a later nconc lands.
+(deftest delete-then-nconc-shares-structure
+  (let* ((store (list 'a 'b))
+         (alias store))
+    (setf alias (delete 'z alias :count 1 :test #'equal))
+    (nconc alias (list 'c))
+    store)                       ; the nconc must be visible through store
+  (a b c))

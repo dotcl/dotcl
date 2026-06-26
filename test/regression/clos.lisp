@@ -301,3 +301,185 @@
 (deftest cnm-explicit-args-primary-chain
   (cnm-chain-g (make-instance 'cnm-derived) :k :original)
   :from-derived)
+
+;; gray-streams-shaped multiple inheritance must compute a CPL (a valid CLOS
+;; linearization exists; was a false "inconsistent precedence graph" on 0.1.8).
+;; Structural analog of trivial-gray-streams stacked on the impl gray classes.
+(defclass i335-g-fs () ())
+(defclass i335-g-fis (i335-g-fs) ())
+(defclass i335-g-fcs (i335-g-fs) ())
+(defclass i335-g-fcis (i335-g-fis i335-g-fcs) ())
+(defclass i335-t-fs (i335-g-fs) ())
+(defclass i335-t-fis (i335-t-fs i335-g-fis) ())
+(defclass i335-t-fcs (i335-t-fs i335-g-fcs) ())
+(defclass i335-t-fcis (i335-t-fis i335-t-fcs i335-g-fcis) ())
+
+(deftest i335-gray-streams-cpl
+  (mapcar #'class-name
+          (class-precedence-list (find-class 'i335-t-fcis)))
+  (i335-t-fcis i335-t-fis i335-t-fcs i335-t-fs
+   i335-g-fcis i335-g-fis i335-g-fcs i335-g-fs standard-object t))
+
+;; foothold: an :allocation :class slot with an :initarg must be overridden
+;; by a later make-instance's initarg, even when already bound by a prior instance
+;; (CLHS: initargs always override existing slot values in shared-initialize).
+;; Was: class-slot init guarded on "currently unbound", so the 2nd make-instance
+;; kept the 1st value. ANSI CLASS-0214.2.
+(defclass i333-ca () ((a :initarg :a1 :allocation :class)))
+(defclass i333-cb (i333-ca) (b))
+
+(deftest i333-class-alloc-initarg-override
+  (progn
+    (make-instance 'i333-ca :a1 'x)
+    (slot-value (make-instance 'i333-cb :a1 'y) 'a))
+  y)
+
+;; class redefinition identity (CLHS ensure-class — redefine in place only
+;; when the name is still the existing class's PROPER name). After clearing the
+;; old class's proper name (setf class-name nil / find-class nil / rename), a
+;; defclass under that name must produce a fresh, distinct class; an instance of
+;; the old class must NOT be (typep) the new one (CPL by object identity, not
+;; name). ANSI CLASS-0309.1 / 0310.1 / 0311.1.
+(deftest i333-class-redef-clear-name
+  (progn
+    (setf (find-class 'i333-r9 nil) nil)
+    (let* ((c1 (eval '(defclass i333-r9 () ((a)))))
+           (o1 (make-instance 'i333-r9)))
+      (setf (class-name c1) nil)
+      (let ((c2 (eval '(defclass i333-r9 () ((a))))))
+        (list (eq (class-of o1) c1) (eq c1 c2) (typep o1 c1) (typep o1 c2)))))
+  (t nil t nil))
+
+(deftest i333-class-redef-rename
+  (progn
+    (setf (find-class 'i333-r10a nil) nil (find-class 'i333-r10b nil) nil)
+    (let* ((c1 (eval '(defclass i333-r10a () ((a)))))
+           (o1 (make-instance 'i333-r10a)))
+      (setf (class-name c1) 'i333-r10b)
+      (let ((c2 (eval '(defclass i333-r10a () ((a))))))
+        (list (eq c1 c2) (typep o1 c1) (typep o1 c2)
+              (class-name c1) (class-name c2)))))
+  (nil t nil i333-r10b i333-r10a))
+
+;; a generic function with &key (no &allow-other-keys) must signal
+;; program-error for an unknown keyword on EVERY call, including when the
+;; monomorphic dispatch cache is warm. The cache-hit path used to skip keyword
+;; validation, so the 2nd+ call with a bad keyword silently succeeded.
+;; ANSI DEFMETHOD.ERROR.14/15.
+(defgeneric i333-kw-gf (x &key))
+(defmethod i333-kw-gf ((x t) &key) x)
+
+(deftest i333-gf-keyword-validation-warm-cache
+  (progn
+    (i333-kw-gf 1)                       ; warm the dispatch cache with a valid call
+    (list
+     (handler-case (progn (i333-kw-gf 1 :bogus t) :no-error)
+       (program-error () :prog-err))
+     (handler-case (progn (i333-kw-gf 1 :another t) :no-error)
+       (program-error () :prog-err))))
+  (:prog-err :prog-err))
+
+;; ensure-generic-function on an existing GF must apply :lambda-list and
+;; :argument-precedence-order in place and invalidate the dispatch cache, so a
+;; subsequent call dispatches by the new precedence order. ANSI
+;; ENSURE-GENERIC-FUNCTION.8.
+(deftest i333-ensure-gf-argument-precedence-order
+  (let ((f 'i333-egf))
+    (when (fboundp f) (fmakunbound f))
+    (let ((fn (eval `(defgeneric ,f (x y)
+                       (:method ((x t) (y symbol)) 1)
+                       (:method ((x symbol) (y t)) 2)))))
+      (let ((before (mapcar fn '(a a 3) '(b 4 b))))
+        (ensure-generic-function f :lambda-list '(x y)
+                                   :argument-precedence-order '(y x))
+        (list before (mapcar fn '(a a 3) '(b 4 b))))))
+  ((2 2 1) (1 2 1)))
+
+;; a &key generic function must also reject an odd / non-symbol keyword
+;; section and honor only the FIRST :allow-other-keys (CLHS 3.5.1.6 / 3.4.1.4.1).
+;; ANSI DEFMETHOD.ERROR.14/15 values 2 and 4.
+(defgeneric i333-kw-gf2 (x &key))
+(defmethod i333-kw-gf2 ((x t) &key) x)
+
+(deftest i333-gf-keyword-odd-and-aok-first
+  (list
+   (handler-case (progn (i333-kw-gf2 1 2) :no-error)            ; non-symbol / odd
+     (program-error () :prog-err))
+   (handler-case (progn (i333-kw-gf2 1 :allow-other-keys nil
+                                       :allow-other-keys t :bogus t) :no-error)
+     (program-error () :prog-err)))                              ; first aok nil → validate
+  (:prog-err :prog-err))
+
+;; slot-boundp on a missing slot must return a SINGLE generalized boolean
+;; even when the slot-missing method returns (values nil X). The secondary value
+;; leaked through into the caller's multiple values. ANSI SLOT-MISSING.8.
+(defclass i333-sm-class () (a))
+(defmethod slot-missing ((c t) (obj i333-sm-class)
+                         (slot-name (eql 'i333-nope)) (op (eql 'slot-boundp))
+                         &optional nv)
+  (declare (ignore nv))
+  (values nil :leaked-secondary))
+
+(deftest i333-slot-boundp-single-value
+  (multiple-value-list (slot-boundp (make-instance 'i333-sm-class) 'i333-nope))
+  (nil))
+
+;; change-class must NOT overwrite an :allocation :class slot of the target
+;; class from the old instance — a shared slot keeps its existing class value
+;; (CLHS 7.2.1). Here target slot a is class-allocated and was made unbound;
+;; after change-class the (instance-allocated) old a=1 must not rebind it.
+;; ANSI CHANGE-CLASS.3.2.
+(defclass i333-cc-a () ((a :initarg :a) (b :initarg :b)))
+(defclass i333-cc-b () ((a :allocation :class :initarg :a2)
+                        (b :allocation :class :initarg :b2)))
+
+(deftest i333-change-class-class-allocation
+  (let* ((obj (make-instance 'i333-cc-a :a 1))
+         (new (find-class 'i333-cc-b))
+         (obj2 (make-instance new)))
+    (slot-makunbound obj2 'a)
+    (setf (slot-value obj2 'b) 17)
+    (change-class obj new)
+    (list (slot-boundp obj 'a) (slot-boundp obj 'b) (slot-value obj 'b)))
+  (nil t 17))
+
+;; a short-form (operator) method combination must signal an error when an
+;; applicable method has an invalid qualifier (not the combination name or
+;; :around), rather than silently ignoring it (CLHS 7.6.6.2).
+;; ANSI DEFGENERIC-METHOD-COMBINATION.APPEND.13.
+(defclass i333-mc-a () ())
+(defclass i333-mc-b (i333-mc-a) ())
+
+(deftest i333-operator-combination-invalid-qualifier
+  (progn
+    (eval '(defgeneric i333-mcg (x)
+             (:method-combination append)
+             (:method append ((x i333-mc-a)) (list 'ok))
+             (:method nonsense ((x i333-mc-b)) (list 'bad))))
+    (list
+     (i333-mcg (make-instance 'i333-mc-a))
+     (handler-case (i333-mcg (make-instance 'i333-mc-b)) (error () :caught))))
+  ((ok) :caught))
+
+;; CLHS 4.3.5 CLOS class precedence list is non-monotonic. In this
+;; hierarchy class-c must precede class-b in h's CPL even though it follows it
+;; in the direct supers' CPLs, so h's slot A inherits c's initform 'y, not b's
+;; 'x. Mirrors ANSI CLASS-0306.1/2. (C3 linearization would give 'x.)
+(defclass i352-a () ((a :initform nil :reader i352-a-slot)))
+(defclass i352-b (i352-a) ((a :initform 'x)))
+(defclass i352-c (i352-a) ((a :initform 'y)))
+(defclass i352-d (i352-b) ())
+(defclass i352-e (i352-b) ())
+(defclass i352-f (i352-d i352-c) ())
+(defclass i352-g (i352-e) ())
+(defclass i352-h (i352-f i352-g) ())
+
+(deftest i352-nonmonotonic-cpl-slot
+  (loop for cls in '(i352-a i352-b i352-c i352-d i352-e i352-f i352-g i352-h)
+        collect (slot-value (make-instance cls) 'a))
+  (nil x y x x x x y))
+
+(deftest i352-nonmonotonic-cpl-order
+  (mapcar #'class-name
+          (dotcl::class-precedence-list (find-class 'i352-h)))
+  (i352-h i352-f i352-d i352-c i352-g i352-e i352-b i352-a standard-object t))

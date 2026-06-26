@@ -12,12 +12,15 @@
            #:destroy-thread
            #:thread-name
            #:threadp
+           #:all-threads
            #:thread-yield
            #:make-lock
            #:acquire-lock
            #:release-lock
            #:with-lock-held
+           #:lockp
            #:make-recursive-lock
+           #:recursive-lock-p
            #:with-recursive-lock-held
            #:thread-join
            #:make-condition-variable
@@ -55,6 +58,10 @@
   "Return T if OBJECT is a thread."
   (%threadp object))
 
+(defun all-threads ()
+  "Return a list of all live threads."
+  (%all-threads))
+
 (defun thread-yield ()
   "Hint to the scheduler to run other threads."
   (%thread-yield))
@@ -62,6 +69,10 @@
 (defun make-lock (&optional (name "anonymous"))
   "Create a new lock (mutex)."
   (%make-lock name))
+
+(defun lockp (object)
+  "Return T if OBJECT is a lock (recursive or not)."
+  (%lockp object))
 
 (defun acquire-lock (lock &optional (wait-p t))
   "Acquire LOCK. If WAIT-P is NIL, return immediately with NIL if unavailable."
@@ -83,6 +94,10 @@
 (defun make-recursive-lock (&optional (name "anonymous"))
   "Create a new re-entrant lock (same thread may acquire multiple times)."
   (%make-recursive-lock name))
+
+(defun recursive-lock-p (object)
+  "Return T if OBJECT is a recursive lock."
+  (%recursive-lock-p object))
 
 (defmacro with-recursive-lock-held ((lock) &body body)
   "Execute BODY with LOCK held, allowing re-entry from the same thread."

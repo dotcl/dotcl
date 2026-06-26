@@ -135,6 +135,10 @@ public sealed class DotclResolveDeps : Task
     /// resolution so the project can make external systems discoverable
     /// (e.g. (pushnew … asdf:*central-registry*) / boot quicklisp).</summary>
     public ITaskItem[]? BuildInit { get; set; }
+    /// <summary>@(DotclAsdSearchPath): external system directories pushed onto
+    /// asdf:*central-registry* before resolution — the declarative form of the
+    /// build-init pushnew.</summary>
+    public ITaskItem[]? AsdSearchPath { get; set; }
 
     public override bool Execute()
     {
@@ -152,7 +156,8 @@ public sealed class DotclResolveDeps : Task
         DotclBoot.Boot(BaseCore, ContribDir);
         DotclHost.ResolveDeps(Asd, ManifestOut, RootSourcesOut,
                               string.IsNullOrEmpty(TargetRid) ? null : TargetRid,
-                              BuildInit?.Select(i => i.ItemSpec).ToArray());
+                              BuildInit?.Select(i => i.GetMetadata("FullPath")).ToArray(),
+                              AsdSearchPath?.Select(i => i.GetMetadata("FullPath")).ToArray());
     }
 }
 
@@ -170,6 +175,9 @@ public sealed class DotclCompileProject : Task
     /// <summary>@(DotclBuildInit): Lisp scripts loaded before compilation
     /// (same as DotclResolveDeps; the root .asd may reference external systems).</summary>
     public ITaskItem[]? BuildInit { get; set; }
+    /// <summary>@(DotclAsdSearchPath): external system directories pushed onto
+    /// asdf:*central-registry* before compilation (same as DotclResolveDeps).</summary>
+    public ITaskItem[]? AsdSearchPath { get; set; }
 
     public override bool Execute()
     {
@@ -185,6 +193,7 @@ public sealed class DotclCompileProject : Task
     private void Run()
     {
         DotclBoot.Boot(BaseCore, ContribDir);
-        DotclHost.CompileProject(Asd, Output, BuildInit?.Select(i => i.ItemSpec).ToArray());
+        DotclHost.CompileProject(Asd, Output, BuildInit?.Select(i => i.GetMetadata("FullPath")).ToArray(),
+                                 AsdSearchPath?.Select(i => i.GetMetadata("FullPath")).ToArray());
     }
 }

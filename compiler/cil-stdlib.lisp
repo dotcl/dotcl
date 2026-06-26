@@ -1220,32 +1220,79 @@ Also expands element types within compound type specifiers like (VECTOR etype si
   (setf (documentation (car %dn-doc) 'function) (cdr %dn-doc)))
 
 ;;; --- ensure-generic-function ---
+(defun %ensure-gf-required-params (ll)
+  "The required parameter names of lambda-list LL (before any lambda-list keyword)."
+  (let ((result nil))
+    (dolist (x ll (nreverse result))
+      (when (member x '(&rest &optional &key &allow-other-keys &body &aux))
+        (return (nreverse result)))
+      (push x result))))
+
+(defun %ensure-gf-apply-lambda-list (gf lambda-list apo-params)
+  "Apply LAMBDA-LIST and ARGUMENT-PRECEDENCE-ORDER (APO-PARAMS, a list of param
+names or nil) to GF via %set-gf-lambda-list-info. Performs congruence checking
+against existing methods and invalidates the dispatch cache (CLHS 7.6.4)."
+  (let* ((required (%ensure-gf-required-params lambda-list))
+         (state :required)
+         (req 0) (opt 0) (rest-p nil) (key-p nil) (aok-p nil) (kw-names nil))
+    (dolist (p lambda-list)
+      (cond
+        ((eq p '&optional) (setf state :optional))
+        ((member p '(&rest &body)) (setf state :rest))
+        ((eq p '&key) (setf key-p t) (setf state :key))
+        ((eq p '&allow-other-keys) (setf aok-p t))
+        ((eq p '&aux) (setf state :aux))
+        (t (case state
+             (:required (incf req))
+             (:optional (incf opt))
+             (:rest (setf rest-p t))
+             (:key (push (if (consp p) (if (consp (car p)) (caar p) (car p)) p) kw-names))
+             (otherwise nil)))))
+    ;; :argument-precedence-order must be a permutation of the required params.
+    (let ((apo-indices nil))
+      (when apo-params
+        (dolist (p apo-params)
+          (unless (member p required) (error 'program-error)))
+        (dolist (p required)
+          (unless (member p apo-params) (error 'program-error)))
+        (setf apo-indices (mapcar (lambda (p) (position p required)) apo-params)))
+      (%set-gf-lambda-list-info gf req opt
+                                (if rest-p t nil) (if key-p t nil) (if aok-p t nil)
+                                (nreverse kw-names)
+                                apo-indices lambda-list))))
+
 (defun ensure-generic-function (name &rest args)
   ;; Odd number of keyword args → program-error
   (when (oddp (length args))
     (error 'program-error))
   (let ((lambda-list-p nil)
-        (lambda-list nil))
+        (lambda-list nil)
+        (apo-p nil)
+        (apo-params nil))
     ;; Manual keyword parsing
     (do ((rest args (cddr rest)))
         ((null rest))
-      (when (eq (car rest) :lambda-list)
-        (setf lambda-list (cadr rest))
-        (setf lambda-list-p t)))
-    ;; If already fbound
+      (cond
+        ((eq (car rest) :lambda-list)
+         (setf lambda-list (cadr rest) lambda-list-p t))
+        ((eq (car rest) :argument-precedence-order)
+         (setf apo-params (cadr rest) apo-p t))))
+    ;; If already fbound: must be a GF; apply lambda-list / precedence updates
+    ;; in place (CLHS — ensure-generic-function reinitializes the existing GF).
     (if (fboundp name)
         (let ((fn (fdefinition name)))
-          (if (typep fn 'generic-function)
-              fn
-              (error 'program-error)))
+          (unless (typep fn 'generic-function) (error 'program-error))
+          (when (or lambda-list-p apo-p)
+            (%ensure-gf-apply-lambda-list fn lambda-list apo-params))
+          fn)
         ;; Create new GF
         (let* ((ll (if lambda-list-p lambda-list '()))
-               (arity (length (remove-if (lambda (x)
-                                (member x '(&rest &optional &key &allow-other-keys &body &aux)))
-                              ll)))
+               (arity (length (%ensure-gf-required-params ll)))
                (gf (%make-gf name arity)))
           (%register-gf name gf)
           (setf (fdefinition name) gf)
+          (when (or lambda-list-p apo-p)
+            (%ensure-gf-apply-lambda-list gf ll apo-params))
           gf))))
 
 ;;; --- CLHS 3.2.4.2: make-load-form protocol ---
@@ -1409,3 +1456,36 @@ overload), so this never changes behaviour, only speed."
   (when pkg
     (let ((sym (find-symbol "INVOKE" pkg)))
       (when sym (%register-compiler-macro-rt sym #'%dotnet-invoke-direct-cm)))))
+
+;;; dotnet:handler-bind — handler-bind that dispatches on specific .NET exception
+;;; types (dotcl/dotcl#45). Each clause is ("Type.Name" (var) body...). When a
+;;; condition wraps a raw .NET exception whose CLR type is the named type or a
+;;; subtype (dotnet:exception-typep), the matching clause runs; the clause body is
+;;; expected to transfer control (return-from / invoke-restart) as in cl:handler-bind.
+;;; Non-matching / non-.NET conditions propagate.
+;;;
+;;; Registered at load time via find-package/intern (no literal dotnet: prefix) so
+;;; the SBCL cross-compile host — which has no DOTNET package and would otherwise
+;;; read-suppress a #+dotcl form right out of the core — compiles it fine; it runs
+;;; when the built core loads and DOTNET exists. The resolved exception-typep symbol
+;;; is spliced into the expansion, so the macro body needs no dotnet: literal either.
+(let ((pkg (find-package "DOTNET")))
+  (when pkg
+    (let ((hb  (intern "HANDLER-BIND" pkg))
+          (etp (find-symbol "EXCEPTION-TYPEP" pkg)))
+      (when etp
+        (export hb pkg)
+        (setf (gethash hb *macros*)
+              (lambda (form)
+                ;; form = (dotnet:handler-bind (clause ...) body ...)
+                (let ((clauses (cadr form))
+                      (body (cddr form))
+                      (cvar (gensym "DNHB-C")))
+                  `(handler-bind
+                       ((error (lambda (,cvar)
+                                 (cond
+                                   ,@(loop for cl in clauses
+                                           collect `((,etp ,cvar ,(car cl))
+                                                     (let ((,(caadr cl) ,cvar))
+                                                       ,@(cddr cl))))))))
+                     ,@body))))))))

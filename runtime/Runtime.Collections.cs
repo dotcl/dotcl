@@ -323,6 +323,7 @@ public static partial class Runtime
         LispVector v => VectorTypeOf(v),
         LispReadtable => Startup.Sym("READTABLE"),
         LispRandomState => Startup.Sym("RANDOM-STATE"),
+        LispWeakPointer => Startup.Sym("WEAK-POINTER"),
         LispPprintDispatchTable => Startup.Sym("PPRINT-DISPATCH-TABLE"),
         LispMethod => Startup.Sym("STANDARD-METHOD"),
         LispHashTable => Startup.Sym("HASH-TABLE"),
@@ -1716,12 +1717,27 @@ public static partial class Runtime
         Startup.RegisterUnary("HASH-TABLE-TEST", obj =>
             obj is LispHashTable ht3 ? Startup.Sym(ht3.TestName)
             : throw new LispErrorException(new LispTypeError("HASH-TABLE-TEST: not a hash-table", obj)));
-        // SBCL extension: hash-table-weakness returns :value (if value-weak),
-        // or NIL for strong tables. Other weakness modes are not yet supported.
-        Startup.RegisterUnary("HASH-TABLE-WEAKNESS", obj =>
+        // SBCL extension: hash-table-weakness returns the weakness keyword
+        // (:key, :value, :key-and-value, :key-or-value) or NIL for strong tables.
+        System.Func<LispObject, LispObject> htWeakness = obj =>
             obj is LispHashTable htw
-                ? (htw.Weakness == ":VALUE" ? (LispObject)Startup.Keyword("VALUE") : Nil.Instance)
-                : throw new LispErrorException(new LispTypeError("HASH-TABLE-WEAKNESS: not a hash-table", obj)));
+                ? (htw.Weakness == null ? Nil.Instance
+                   : (LispObject)Startup.Keyword(htw.Weakness.TrimStart(':')))
+                : throw new LispErrorException(new LispTypeError("HASH-TABLE-WEAKNESS: not a hash-table", obj));
+        Startup.RegisterUnary("HASH-TABLE-WEAKNESS", htWeakness);
+        // DOTCL-package alias so trivial-garbage's hash-table-weakness (which
+        // re-exports the same name from its own package) can delegate without
+        // shadowing/recursing on the bare operator.
+        {
+            var f = new LispFunction(a => a.Length == 1
+                ? htWeakness(a[0])
+                : throw new LispErrorException(new LispProgramError("HASH-TABLE-WEAKNESS: wrong number of arguments")),
+                "DOTCL:HASH-TABLE-WEAKNESS");
+            var (sym, _) = Startup.DotclPkg.Intern("HASH-TABLE-WEAKNESS");
+            Startup.DotclPkg.Export(sym);
+            sym.Function = f;
+            Emitter.CilAssembler.RegisterFunction("DOTCL:HASH-TABLE-WEAKNESS", f);
+        }
         Startup.RegisterUnary("HASH-TABLE-REHASH-SIZE", obj =>
             obj is LispHashTable ? new SingleFloat(1.5f)
             : throw new LispErrorException(new LispTypeError("HASH-TABLE-REHASH-SIZE: not a hash-table", obj)));

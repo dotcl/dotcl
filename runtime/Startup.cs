@@ -1256,17 +1256,42 @@ public static class Startup
             new LispFunction(Runtime.Describe, "DESCRIBE", -1));
         Emitter.CilAssembler.RegisterFunction("ROOM",
             new LispFunction(Runtime.Room, "ROOM", -1));
-        // DOTCL:GC — trigger .NET GC
+        // DOTCL:GC — trigger .NET GC, then drain any finalizer thunks the
+        // collection enqueued (on this normal thread, not the GC finalizer thread).
         {
             var gcFn = new LispFunction(_ => {
                 GC.Collect(2, Compat.AggressiveGCMode, true, true);
                 GC.WaitForPendingFinalizers();
                 GC.Collect(2, Compat.AggressiveGCMode, true, true);
+                Runtime.RunFinalizers();
                 return Nil.Instance;
             }, "DOTCL:GC", -1);
             var gcSym = SymInPkg("GC", "DOTCL");
             gcSym.Function = gcFn;
+            DotclPkg.Export(gcSym);
             Emitter.CilAssembler.RegisterFunction("DOTCL:GC", gcFn);
+        }
+        // Finalizers: dotcl:finalize / cancel-finalization / run-finalizers.
+        // The .NET finalizer enqueues thunks; these run them on a normal thread.
+        {
+            var finFn = new LispFunction(a => {
+                if (a.Length != 2)
+                    throw new LispErrorException(new LispProgramError("FINALIZE: requires 2 arguments (object function)"));
+                return Runtime.Finalize(a[0], a[1]);
+            }, "DOTCL:FINALIZE");
+            var cancelFn = new LispFunction(a => {
+                if (a.Length != 1)
+                    throw new LispErrorException(new LispProgramError("CANCEL-FINALIZATION: requires 1 argument"));
+                return Runtime.CancelFinalization(a[0]);
+            }, "DOTCL:CANCEL-FINALIZATION");
+            var runFn = new LispFunction(_ => Fixnum.Make(Runtime.RunFinalizers()), "DOTCL:RUN-FINALIZERS", -1);
+            foreach (var (nm, fn) in new[] { ("FINALIZE", finFn), ("CANCEL-FINALIZATION", cancelFn), ("RUN-FINALIZERS", runFn) })
+            {
+                var (sym, _) = DotclPkg.Intern(nm);
+                DotclPkg.Export(sym);
+                sym.Function = fn;
+                Emitter.CilAssembler.RegisterFunction("DOTCL:" + nm, fn);
+            }
         }
         // RUN-WITH-TIMEOUT: (run-with-timeout seconds thunk) — run THUNK with per-stem timeout
         // If THUNK does not complete within SECONDS, throws a Lisp error and moves on.
@@ -1316,6 +1341,28 @@ public static class Startup
             RegisterDotcl("PRINT-BACKTRACE", pbtFn);
             Emitter.CilAssembler.RegisterFunction("DOTCL:PRINT-BACKTRACE", pbtFn);
         }
+        {
+            // Weak pointers — real GC weakness via System.WeakReference.
+            // Exposed in the DOTCL package; trivial-garbage's make-weak-pointer /
+            // weak-pointer-value / weak-pointer-p delegate to these.
+            static LispObject Arg1(LispObject[] a, string who)
+            {
+                if (a.Length != 1)
+                    throw new LispErrorException(new LispProgramError($"{who}: wrong number of arguments: {a.Length} (expected 1)"));
+                return a[0];
+            }
+            void RegWp(string name, Func<LispObject[], LispObject> fn)
+            {
+                var f = new LispFunction(fn, "DOTCL:" + name);
+                RegisterDotcl(name, f);
+                Emitter.CilAssembler.RegisterFunction("DOTCL:" + name, f);
+            }
+            RegWp("MAKE-WEAK-POINTER", a => new LispWeakPointer(Arg1(a, "MAKE-WEAK-POINTER")));
+            RegWp("WEAK-POINTER-VALUE", a => Arg1(a, "WEAK-POINTER-VALUE") is LispWeakPointer wp
+                ? wp.Value
+                : throw new LispErrorException(new LispTypeError("WEAK-POINTER-VALUE: not a weak-pointer", a[0])));
+            RegWp("WEAK-POINTER-P", a => Arg1(a, "WEAK-POINTER-P") is LispWeakPointer ? T.Instance : (LispObject)Nil.Instance);
+        }
         Emitter.CilAssembler.RegisterFunction("%TRACE",
             new LispFunction(Runtime.Trace, "%TRACE", -1));
         Emitter.CilAssembler.RegisterFunction("%UNTRACE",
@@ -1348,6 +1395,7 @@ public static class Startup
         // otherwise find any existing DOTCL-MOP::GENERIC-FUNCTION-NAME with a
         // Function set and clobber it.
         Mop.Init();
+        Cltl2.Init();
         Runtime.RegisterConditionsBuiltins();
         Runtime.RegisterPrinterBuiltins();
         Runtime.RegisterThreadBuiltins();
@@ -1426,6 +1474,26 @@ public static class Startup
             return LispPathname.FromString(Directory.GetCurrentDirectory() + "/");
         }));
 
+        // dotcl:chdir — set the process current directory, POSIX chdir(2) semantics
+        // (backs uiop:chdir / uiop:with-current-directory). Returns the new cwd.
+        RegisterDotcl("CHDIR", new LispFunction(args => {
+            if (args.Length < 1)
+                throw new LispErrorException(new LispProgramError("CHDIR: requires 1 argument"));
+            string dir = args[0] switch
+            {
+                LispString s => s.Value,
+                LispPathname p => p.ToNamestring(),
+                _ => args[0].ToString() ?? ""
+            };
+            try { Directory.SetCurrentDirectory(dir); }
+            catch (Exception e)
+            {
+                throw new LispErrorException(new LispError(
+                    $"CHDIR: cannot change directory to {dir}: {e.Message}"));
+            }
+            return LispPathname.FromString(Directory.GetCurrentDirectory() + "/");
+        }));
+
         // dotcl:getenv — get environment variable (like sb-posix:getenv on SBCL)
         RegisterDotcl("GETENV", new LispFunction(args => {
             var name = args[0] is LispString s ? s.Value : args[0].ToString();
@@ -1477,6 +1545,8 @@ public static class Startup
         RegisterDotcl("PACKAGE-LOCAL-NICKNAMES",
             new LispFunction(args => Runtime.PackageLocalNicknames(
                 args.Length > 0 ? args[0] : DynamicBindings.Get(Sym("*PACKAGE*")))));
+        RegisterDotcl("PACKAGE-LOCALLY-NICKNAMED-BY-LIST",
+            new LispFunction(args => Runtime.PackageLocallyNicknamedByList(args[0])));
 
         // Compiler-callable package lock check, used by compile-defmacro before
         // it mutates the Lisp-side *macros* table (which bypasses RegisterMacroFunction).
@@ -1521,7 +1591,7 @@ public static class Startup
         // a `--`-delimited list: (<script> "--" "a" "b" "c"). uiop's
         // command-line-arguments (non-:executable path) does (rest (member "--" …)),
         // so this yields the user args ("a" "b" "c"). This is dotcl's chosen
-        // convention — without the "--" delimiter uiop returns nil (the #246/paalam
+        // convention — without the "--" delimiter uiop returns nil (the paalam
         // bug where positional data args were otherwise mis-loaded as Lisp source).
         //
         // Otherwise (REPL, --eval, --load-only, save-application exe) return the
@@ -1830,6 +1900,26 @@ public static class Startup
             return args[0];
         }, "DOTCL:%SET-REPL-READLINE-HOOK", 1));
 
+        // Non-blocking async/await primitives (step B). The (async ...) macro
+        // CPS-transforms its body into a chain of these. Internal (%-prefixed).
+        RegisterDotclInternal("%ASYNC-BIND",
+            new LispFunction(Runtime.AsyncBind, "DOTCL:%ASYNC-BIND", 2));
+        RegisterDotclInternal("%ASYNC-RETURN",
+            new LispFunction(Runtime.AsyncReturn, "DOTCL:%ASYNC-RETURN", 1));
+        // handler-bind inside (async ...): establish the cluster, run the CPS body
+        // thunk (whose first %async-bind snapshots the cluster so continuations keep
+        // it), pop. Reuses the tree-walk CallWithHandlerCluster (push/thunk/pop).
+        RegisterDotclInternal("%ASYNC-WITH-HANDLERS",
+            new LispFunction(Runtime.CallWithHandlerCluster, "DOTCL:%ASYNC-WITH-HANDLERS", 2));
+        RegisterDotclInternal("%ASYNC-UNWIND-PROTECT",
+            new LispFunction(Runtime.AsyncUnwindProtect, "DOTCL:%ASYNC-UNWIND-PROTECT", 2));
+        RegisterDotclInternal("%ASYNC-TRY",
+            new LispFunction(Runtime.AsyncTry, "DOTCL:%ASYNC-TRY", 2));
+        RegisterDotclInternal("%ASYNC-RESTART",
+            new LispFunction(Runtime.AsyncRestart, "DOTCL:%ASYNC-RESTART", 3));
+        RegisterDotclInternal("%ASYNC-DECLINE",
+            new LispFunction(Runtime.AsyncDecline, "DOTCL:%ASYNC-DECLINE", 0));
+
         // DOTNET package functions
         RegisterDotNet(DotNetPkg, "LOAD-ASSEMBLY", new LispFunction(Runtime.DotNetLoadAssembly, "DOTNET:LOAD-ASSEMBLY", -1),
             "(dotnet:load-assembly name-or-path) => assembly\nLoad a .NET assembly by simple name, file path, or partial name so its types\nbecome resolvable (cf. dotnet:resolve-type) and callable.");
@@ -1837,10 +1927,14 @@ public static class Startup
             "(dotnet:make-delegate delegate-type fn) => delegate\nWrap a Lisp function FN as a .NET delegate of DELEGATE-TYPE (a type name string).\nEach delegate call marshals the .NET args to Lisp, calls FN, and marshals the\nresult back to the delegate's return type.");
         RegisterDotNet(DotNetPkg, "CALL-OUT", new LispFunction(Runtime.DotNetCallOut, "DOTNET:CALL-OUT", -1),
             "(dotnet:call-out object \"Method\" &rest args) => value, out1, out2, ...\nInvoke an instance method that has out/ref parameters. Returns the method's\nreturn value (T for void) as the primary value, followed by each out/ref\nargument as additional values.");
+        RegisterDotNet(DotNetPkg, "CALL-OUT-GENERIC", new LispFunction(Runtime.DotNetCallOutGeneric, "DOTNET:CALL-OUT-GENERIC", -1),
+            "(dotnet:call-out-generic type-or-obj \"Method\" (type-arg ...) &rest in-args) => value, out1, ...\nGeneric counterpart of dotnet:call-out: instantiate an open generic method with\nthe given type-argument name strings (MakeGenericMethod), then invoke it handling\nout/ref parameters. type-or-obj is a type-name string (static) or a .NET object\n(instance). Returns the method's return value (T for void) followed by each\nout/ref argument. Example:\n(multiple-value-bind (ok day) (dotnet:call-out-generic \"System.Enum\" \"TryParse\" '(\"System.DayOfWeek\") \"Monday\") ...)");
         RegisterDotNet(DotNetPkg, "STATIC-GENERIC", new LispFunction(Runtime.DotNetStaticGeneric, "DOTNET:STATIC-GENERIC", -1),
             "(dotnet:static-generic \"Type\" \"Method\" (type-arg ...) &rest args) => value\nInvoke a generic static method, instantiating it with the given type arguments\n(MakeGenericMethod) before calling it.");
         RegisterDotNet(DotNetPkg, "INVOKE-GENERIC", new LispFunction(Runtime.DotNetInvokeGeneric, "DOTNET:INVOKE-GENERIC", -1),
             "(dotnet:invoke-generic object \"Method\" (type-arg ...) &rest args) => value\nInstance counterpart of dotnet:static-generic: invoke a generic instance method on\nOBJECT, instantiating it with the given type-argument name strings before the\ncall (e.g. (dotnet:invoke-generic cm \"Load\" '(\"Texture2D\") \"images/logo\")).");
+        RegisterDotNet(DotNetPkg, "AWAIT", new LispFunction(Runtime.DotNetAwait, "DOTNET:AWAIT", 1),
+            "(dotnet:await awaitable) => value\nBlock until a .NET Task / Task<T> / ValueTask / ValueTask<T> completes and return\nits result marshalled to Lisp (NIL for a void/non-generic awaitable). A faulted\nawaitable rethrows its inner exception so handler-case sees the real condition.\nHolds the calling thread, so run it on a worker thread (bordeaux-threads) when the\ncaller must stay responsive. Non-blocking (async ...) is tracked separately.");
         RegisterDotNet(DotNetPkg, "RESOLVE-TYPE", new LispFunction(Runtime.DotNetResolveType, "DOTNET:RESOLVE-TYPE", 1),
             "(dotnet:resolve-type type-name) => type\nResolve a .NET System.Type from a name string, searching loaded assemblies\n(loading by namespace prefix, and COM ProgIDs on Windows). The result can be\ninspected or passed anywhere a System.Type is expected. Errors if not found.");
 #if !DOTCL_NO_JSON
@@ -1873,6 +1967,20 @@ public static class Startup
             "(dotnet:new type-name &rest args) => instance\nConstruct a new instance of the named .NET type, selecting the constructor by\nargument count and types. ARGS are marshalled from Lisp values.");
         RegisterDotNet(DotNetPkg, "NULL", new LispFunction(Runtime.DotNetNull, "DOTNET:NULL", 0),
             "(dotnet:null) => marker\nReturn a marker that marshals to an explicit .NET null, for a reference or\nNullable<T> parameter. Distinct from Lisp NIL, which marshals to false for a\nbool / Nullable<bool> target.");
+        RegisterDotNet(DotNetPkg, "EXCEPTION-TYPE", new LispFunction(args => Runtime.DotNetExceptionType(args[0]), "DOTNET:EXCEPTION-TYPE", 1),
+            "(dotnet:exception-type condition) => type-or-nil\nFor a condition wrapping a raw .NET exception (e.g. caught in handler-case),\nreturn the original CLR exception System.Type; NIL for an ordinary Lisp condition.");
+        RegisterDotNet(DotNetPkg, "EXCEPTION-TYPEP", new LispFunction(args => Runtime.DotNetExceptionTypep(args[0], args[1]), "DOTNET:EXCEPTION-TYPEP", 2),
+            "(dotnet:exception-typep condition type) => boolean\nT if CONDITION wraps a raw .NET exception whose CLR type is TYPE or a subtype\n(Type.IsAssignableFrom). TYPE is a type-name string/symbol or System.Type. This is\nthe matcher dotnet:handler-bind uses.");
+        RegisterDotNet(DotNetPkg, "MAKE-GENERIC-TYPE", new LispFunction(Runtime.DotNetMakeGenericType, "DOTNET:MAKE-GENERIC-TYPE", 2),
+            "(dotnet:make-generic-type open-type type-args-list) => type\nConstruct a closed generic System.Type from an open generic type definition and a\nlist of type-argument names. OPEN-TYPE may carry the CLR backtick-arity suffix\n(\"...Dictionary`2\") or omit it (arity inferred from the list). The result is\nusable with dotnet:new and other type args. e.g.\n(dotnet:make-generic-type \"System.Collections.Generic.Dictionary\" '(\"System.String\" \"System.Int32\")).");
+        RegisterDotNet(DotNetPkg, "ENUM-OR", new LispFunction(Runtime.DotNetEnumOr, "DOTNET:ENUM-OR", -1),
+            "(dotnet:enum-or enum-type &rest members) => enum-value\nCombine [Flags] enum members with bitwise OR. ENUM-TYPE is a type-name\nstring/symbol or System.Type. Each member is a member-name string/symbol\n(case-insensitive), an integer, or an existing enum value of the type.\ne.g. (dotnet:enum-or \"System.IO.FileAccess\" \"Read\" \"Write\").");
+        RegisterDotNet(DotNetPkg, "IS-INSTANCE-OF", new LispFunction(Runtime.DotNetIsInstanceOf, "DOTNET:IS-INSTANCE-OF", 2),
+            "(dotnet:is-instance-of obj type) => boolean\nReturn T if OBJ is an instance of TYPE (a type-name string/symbol or System.Type),\nelse NIL. OBJ may be a wrapped .NET object or a plain Lisp value (marshalled to its\nnatural .NET type first). Replaces manual Type.IsAssignableFrom checks.");
+        RegisterDotNet(DotNetPkg, "CAST", new LispFunction(Runtime.DotNetCast, "DOTNET:CAST", 2),
+            "(dotnet:cast obj type) => object\nReference cast: verify OBJ is an instance of TYPE (error if not) and return it\nre-wrapped carrying TYPE as its static hint, so later dotnet:invoke/new overload\nresolution treats it as TYPE (upcast to a base class/interface). For value-type\nconversions use dotnet:box instead.");
+        RegisterDotNet(DotNetPkg, "MAKE-ARRAY", new LispFunction(Runtime.DotNetMakeArray, "DOTNET:MAKE-ARRAY", -1),
+            "(dotnet:make-array element-type &rest dimensions) => array\nCreate a typed .NET array of ELEMENT-TYPE sized by DIMENSIONS, filled with the\nelement type's default. One dimension => 1-D array; several => multi-dimensional.\nELEMENT-TYPE is a type-name string/symbol or a resolved System.Type.\ne.g. (dotnet:make-array \"System.Int32\" 100) or (dotnet:make-array \"System.Single\" 10 20).\nAccess elements via (dotnet:invoke arr \"get_Item\"/\"set_Item\" idx... [val]).");
         RegisterDotNet(DotNetPkg, "NEW-ARRAY", new LispFunction(Runtime.DotNetNewArray, "DOTNET:NEW-ARRAY", -1),
             "(dotnet:new-array element-type &rest elements) => array\nCreate a typed .NET array (element-type[]) filled with the marshalled ELEMENTS.\nELEMENT-TYPE is a type-name string/symbol or a resolved System.Type. Build from\na Lisp list with (apply #'dotnet:new-array element-type list). A Lisp list or\nvector is also auto-marshalled to an array-typed parameter or property.");
         RegisterDotNet(DotNetPkg, "%DEFINE-CLASS", new LispFunction(Runtime.DotNetDefineClass, "DOTNET:%DEFINE-CLASS", -1));

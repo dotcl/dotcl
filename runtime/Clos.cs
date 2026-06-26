@@ -225,64 +225,105 @@ public class LispClass : LispObject
 
     private LispClass[] ComputeCPL()
     {
-        // C3 linearization
-        var result = new List<LispClass>();
-        var toMerge = new List<List<LispClass>>();
+        // CLHS 4.3.5 CLOS class precedence list linearization (NOT C3).
+        //
+        // This is the standard ANSI algorithm, which is non-monotonic: a class
+        // can precede one of its direct superclasses' more-specific neighbours
+        // when a later branch demands it (see ANSI CLASS-0306). C3 would block
+        // that and produce a different order, so we implement 4.3.5 verbatim.
+        //
+        // Step 1: Sc = transitive set of superclasses (including this class).
+        // Step 2: Local precedence order R: for each class C with direct
+        //   superclasses (D1 D2 ... Dn), the pairs C<D1, D1<D2, ..., D(n-1)<Dn.
+        // Step 3: Topological sort of Sc respecting R. Tie-break among classes
+        //   with no remaining predecessor: pick the one that is a direct
+        //   superclass of the right-most (most recently placed) class in the
+        //   partial CPL that has such a candidate as a direct superclass.
 
-        // Add each superclass's CPL
-        foreach (var super in DirectSuperclasses)
+        // Step 1: collect all superclasses (this + transitive direct supers).
+        var sc = new List<LispClass>();
+        var scSet = new HashSet<LispClass>(ReferenceEqualityComparer.Instance);
+        void Collect(LispClass c)
         {
-            toMerge.Add(new List<LispClass>(super.ClassPrecedenceList));
+            if (!scSet.Add(c)) return;
+            sc.Add(c);
+            foreach (var s in c.DirectSuperclasses)
+                Collect(s);
         }
-        // Add direct superclasses list
-        if (DirectSuperclasses.Length > 0)
-            toMerge.Add(new List<LispClass>(DirectSuperclasses));
+        Collect(this);
 
-        // Start with this class
-        result.Add(this);
-
-        while (toMerge.Count > 0)
+        // Step 2: build local precedence pairs (predecessor -> set of successors)
+        // and a predecessor count per class restricted to Sc.
+        var successors = new Dictionary<LispClass, List<LispClass>>(ReferenceEqualityComparer.Instance);
+        var predCount = new Dictionary<LispClass, int>(ReferenceEqualityComparer.Instance);
+        foreach (var c in sc)
         {
-            // Remove empty lists
-            toMerge.RemoveAll(l => l.Count == 0);
-            if (toMerge.Count == 0) break;
-
-            // Find a candidate: head of some list that doesn't appear in the tail of any list
-            LispClass? candidate = null;
-            foreach (var list in toMerge)
+            successors[c] = new List<LispClass>();
+            predCount[c] = 0;
+        }
+        foreach (var c in sc)
+        {
+            // C < D1 (class precedes its first direct super) and Di < D(i+1).
+            LispClass prev = c;
+            foreach (var d in c.DirectSuperclasses)
             {
-                var head = list[0];
-                bool inTail = false;
-                foreach (var other in toMerge)
-                {
-                    for (int i = 1; i < other.Count; i++)
-                    {
-                        if (ReferenceEquals(other[i], head))
-                        {
-                            inTail = true;
-                            break;
-                        }
-                    }
-                    if (inTail) break;
-                }
-                if (!inTail)
-                {
-                    candidate = head;
-                    break;
-                }
+                successors[prev].Add(d);
+                predCount[d] = predCount[d] + 1;
+                prev = d;
             }
+        }
 
-            if (candidate == null)
+        // Step 3: topological sort with the "most-recently-placed direct super" tie-break.
+        var result = new List<LispClass>(sc.Count);
+        var placed = new HashSet<LispClass>(ReferenceEqualityComparer.Instance);
+        int remaining = sc.Count;
+        while (remaining > 0)
+        {
+            // Candidates: in Sc, not yet placed, with no remaining predecessors.
+            var candidates = new List<LispClass>();
+            foreach (var c in sc)
+                if (!placed.Contains(c) && predCount[c] == 0)
+                    candidates.Add(c);
+
+            if (candidates.Count == 0)
                 throw new LispErrorException(new LispError(
                     $"Cannot compute CPL for {Name.Name}: inconsistent precedence graph"));
 
-            result.Add(candidate);
-            // Remove candidate from all lists
-            foreach (var list in toMerge)
+            LispClass chosen;
+            if (candidates.Count == 1)
             {
-                if (list.Count > 0 && ReferenceEquals(list[0], candidate))
-                    list.RemoveAt(0);
+                chosen = candidates[0];
             }
+            else
+            {
+                // Tie-break: scan the partial CPL from most-recently-placed back to
+                // the front; pick the first candidate that is a direct superclass of
+                // some already-placed class encountered in that scan.
+                chosen = null!;
+                for (int i = result.Count - 1; i >= 0 && chosen == null; i--)
+                {
+                    var rp = result[i];
+                    foreach (var d in rp.DirectSuperclasses)
+                    {
+                        if (candidates.Contains(d))
+                        {
+                            chosen = d;
+                            break;
+                        }
+                    }
+                }
+                // No placed class has any candidate as a direct super (only happens
+                // for the very first pick, which is this class) — take the first.
+                if (chosen == null)
+                    chosen = candidates[0];
+            }
+
+            result.Add(chosen);
+            placed.Add(chosen);
+            remaining--;
+            // Removing `chosen` satisfies the predecessor edges out of it.
+            foreach (var succ in successors[chosen])
+                predCount[succ] = predCount[succ] - 1;
         }
 
         return result.ToArray();
@@ -390,8 +431,20 @@ public class LispInstance : LispObject
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, System.WeakReference<LispInstance>>
         _internCache = new();
 
+    // NOTE: deliberately does NOT populate _internCache. CLHS 3.2.4.2 requires the
+    // make-load-form creation form to be evaluated at LOAD time. Registering the
+    // compile-time instance here (the emitter calls this during compile-file, which
+    // shares a process with load under --asm / same-image ansi-test) made
+    // InternViaEval cache-HIT on the compile-time object and SKIP the load-time eval,
+    // so creation-form side effects (e.g. the :creating push in MAKE-LOAD-FORM.ORDER)
+    // never ran and the loaded object was the compile-time object, not a load-time
+    // reconstruction. EQ-ness across multiple references within one FASL is preserved
+    // by InternViaEval itself: the first reference evaluates+caches the load-time
+    // instance by key, later references (emitted with a Nil form) look it up.
     public static void PreRegisterIntern(string key, LispInstance inst)
-        => _internCache.TryAdd(key, new System.WeakReference<LispInstance>(inst));
+    {
+        // intentionally empty — see note above
+    }
 
     /// <summary>FASL load-time: evaluate make-load-form creation form once and cache by key.</summary>
     public static LispObject InternViaEval(string key, LispObject creationForm)

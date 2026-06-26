@@ -171,3 +171,31 @@
                       (lambda () (cond (cap-anchored-p :y) (t :n))))
                     nil))
   :n)
+
+;; a lambda parameter whose name also names a global generic function, when
+;; captured ONLY inside a nested closure built via a memoizing constructor and read
+;; under fixnum declarations, must resolve to the captured lexical (not the GF) and
+;; come out bound. cl-ppcre's create-scanner-aux / START-ANCHORED-P shape; was
+;; "Unbound variable: START-ANCHORED-P" at scan time on 0.1.8.
+(defgeneric i337-start-anchored-p (regex &optional in-seq-p))
+(defmethod i337-start-anchored-p ((r t) &optional in-seq-p)
+  (declare (ignore in-seq-p)) :gf)
+
+(defun i337-cache (fn)
+  (let ((tbl (make-hash-table :test #'equalp)))
+    (lambda (k) (or (gethash k tbl) (setf (gethash k tbl) (funcall fn k))))))
+
+(defun i337-make-scanner (i337-start-anchored-p)
+  (funcall (i337-cache
+            (lambda (key)
+              (declare (ignore key))
+              (lambda (start)
+                (declare (type fixnum start))
+                (cond (i337-start-anchored-p (list :anchored start))
+                      (t (list :free start))))))
+           :k))
+
+(deftest i337-param-shadows-gf-captured-in-nested-closure
+  (list (funcall (i337-make-scanner t) 0)
+        (funcall (i337-make-scanner nil) 5))
+  ((:anchored 0) (:free 5)))

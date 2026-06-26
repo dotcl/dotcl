@@ -189,6 +189,24 @@ public static class DynamicBindings
             Push(sym, val);
     }
 
+    /// <summary>Current binding-stack depth. Pair with <see cref="TruncateTo"/> to
+    /// install a snapshot temporarily (e.g. around an async continuation that runs
+    /// on a different thread) and unwind it afterwards.</summary>
+    public static int Depth => _top;
+
+    /// <summary>Pop bindings down to DEPTH (no-op if already at or below it).</summary>
+    public static void TruncateTo(int depth)
+    {
+        if (depth < 0) depth = 0;
+        var syms = _syms;
+        var vals = _vals;
+        while (_top > depth)
+        {
+            _top--;
+            if (syms != null) { syms[_top] = null; vals![_top] = null; }
+        }
+    }
+
     public static LispObject ProgvUnbind(LispObject symsObj)
     {
         var syms = Runtime.ToList(symsObj);

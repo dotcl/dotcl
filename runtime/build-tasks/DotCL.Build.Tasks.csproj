@@ -1,7 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <!--
-    In-process MSBuild tasks for the project-core build (#307). These load the
+    In-process MSBuild tasks for the project-core build. These load the
     DotCL.Runtime library in the MSBuild process and drive DotclHost.ResolveDeps
     / CompileProject directly — no `dotnet exec`/`dotnet run` subprocess and no
     second copy of the runtime in the package (the task resolves the runtime

@@ -463,7 +463,7 @@ public static partial class Runtime
         throw new LispErrorException(new LispTypeError($"{fn}: not a valid function name", name));
     }
 
-    internal static void RemoveCompilerMacro(string name)
+    internal static void RemoveCompilerMacro(Symbol sym)
     {
         foreach (var pkgName in new[] { "DOTCL-INTERNAL", "DOTCL.CIL-COMPILER" })
         {
@@ -474,7 +474,13 @@ public static partial class Runtime
                 if (macrosSym != null && status != SymbolStatus.None
                     && macrosSym.Value is LispHashTable macrosTable)
                 {
-                    macrosTable.Remove(new LispString(name));
+                    // *macros* is keyed by SYMBOL identity (eq test) — matching
+                    // %REGISTER-MACRO-FUNCTION-RT (macrosTable.Set(sym, ...)) and
+                    // Startup.LookupCompilerMacro (TryGet(sym)). Removing by a
+                    // LispString of the name left the symbol-keyed entry intact, so
+                    // FBOUNDP/MACRO-FUNCTION still saw the macro after FMAKUNBOUND on
+                    // a gensym macro (ANSI FMAKUNBOUND.3).
+                    macrosTable.Remove(sym);
                     break;
                 }
             }
@@ -495,8 +501,8 @@ public static partial class Runtime
         var sym = GetSymbol(name, "FMAKUNBOUND");
         sym.Function = null;
         UnregisterMacroFunction(sym);
-        // Also remove from compiler's *macros* hash table
-        RemoveCompilerMacro(sym.Name);
+        // Also remove from compiler's *macros* hash table (keyed by symbol identity)
+        RemoveCompilerMacro(sym);
         return sym;
     }
 
@@ -720,11 +726,27 @@ public static partial class Runtime
 
     /// <summary>
     /// Wrap a raw .NET exception message as a LispCondition for handler-case.
-    /// Called from compiled handler-case catch blocks for System.Exception.
+    /// Retained (alongside WrapDotNetExceptionObj) for ABI compatibility: FASLs
+    /// compiled before the type-preserving change still reference this overload.
     /// </summary>
     public static LispObject WrapDotNetException(string message)
     {
         return new LispProgramError(message);
+    }
+
+    /// <summary>
+    /// Wrap a raw .NET exception as a LispCondition for handler-case, preserving
+    /// the CLR exception type on the condition (ClrExceptionType) so
+    /// dotnet:exception-type / dotnet:handler-bind can dispatch on the specific
+    /// .NET type. Newly compiled handler-case catch blocks call this (passing the
+    /// Exception object); the message keeps the dotcl:*debug-stacktrace* formatting.
+    /// </summary>
+    public static LispObject WrapDotNetExceptionObj(Exception ex)
+    {
+        var message = Startup.DebugStacktrace && !string.IsNullOrEmpty(ex.StackTrace)
+            ? ex.Message + "\n[.NET " + ex.GetType().Name + "]\n" + ex.StackTrace
+            : ex.Message;
+        return new LispProgramError(message) { ClrExceptionType = ex.GetType() };
     }
 
     /// <summary>
@@ -754,8 +776,14 @@ public static partial class Runtime
             ex is GoException || ex is RestartInvocationException ||
             ex is LispErrorException || ex is HandlerCaseInvocationException)
             throw ex;
-        // Wrap unknown .NET exceptions and signal through handler-bind
-        var condition = new LispProgramError(ex.Message);
+        // Wrap unknown .NET exceptions and signal through handler-bind. The .NET
+        // type + StackTrace is appended only under dotcl:*debug-stacktrace*, so
+        // ordinary error reports stay clean and don't leak the .NET internal stack.
+        var condition = new LispProgramError(
+            Startup.DebugStacktrace && !string.IsNullOrEmpty(ex.StackTrace)
+                ? ex.Message + "\n[.NET " + ex.GetType().Name + "]\n" + ex.StackTrace
+                : ex.Message)
+        { ClrExceptionType = ex.GetType() };
         throw new LispErrorException(condition);
     }
 
@@ -937,8 +965,22 @@ public static partial class Runtime
         // %OBJECT-ID, FUNCTION-LAMBDA-EXPRESSION
         Startup.RegisterUnary("%OBJECT-ID", obj =>
             new Fixnum(System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(obj)));
+        // FUNCTION-LAMBDA-EXPRESSION: (values lambda-expression closure-p name).
+        // We don't retain source lambda expressions, so the first value is nil.
+        // The SECOND value must be true unless the function was DEFINITELY not
+        // produced by closing over a non-null lexical environment (CLHS). A
+        // LispFunction with a captured Environment is a closure → true; otherwise
+        // nil. Always returning nil mislabelled real closures (ANSI
+        // FUNCTION-LAMBDA-EXPRESSION.2). The third value (name) is returned when
+        // the function carries one.
         Startup.RegisterUnary("FUNCTION-LAMBDA-EXPRESSION", obj =>
-            MultipleValues.Values(Nil.Instance, Nil.Instance, Nil.Instance));
+        {
+            var closureP = (obj is LispFunction lf && lf.Environment != null)
+                ? T.Instance : (LispObject)Nil.Instance;
+            LispObject name = (obj is LispFunction nf && !string.IsNullOrEmpty(nf.Name))
+                ? Startup.Sym(nf.Name) : Nil.Instance;
+            return MultipleValues.Values(Nil.Instance, closureP, name);
+        });
 
         // BOUNDP
         Emitter.CilAssembler.RegisterFunction("BOUNDP", new LispFunction(args => {

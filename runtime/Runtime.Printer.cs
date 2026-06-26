@@ -128,10 +128,10 @@ public static partial class Runtime
 
         if (!effectiveEscape)
         {
-            if (sym.HomePackage == null) return name;
-            // Keyword colon prefix is part of the printed name, not an escape:
-            // it must appear even when *print-escape* is nil (CLHS 22.1.3.3.1).
-            if (sym.HomePackage.Name == "KEYWORD") return ":" + name;
+            // princ: print the symbol name only. The package prefix — including
+            // the keyword colon and the #: for uninterned symbols — is printed
+            // only when *print-escape* / *print-readably* is true (CLHS 22.1.3.3).
+            // SBCL: (princ-to-string :foo) => "FOO", not ":FOO".
             return name;
         }
 
@@ -531,6 +531,8 @@ public static partial class Runtime
                     return rs.ToReadableString();
                 return "#<RANDOM-STATE>";
             }
+            case LispWeakPointer:
+                return "#<WEAK-POINTER>";
             default:
                 if (obj is LispVector || obj is LispStruct || obj is LispInstance)
                 {
@@ -991,7 +993,13 @@ public static partial class Runtime
         {
             var sw = new System.IO.StringWriter();
             var stream = new LispOutputStream(sw);
-            if (best.Value.Function is LispFunction fn)
+            // The dispatch function may be a function designator: a function object
+            // OR a symbol naming one (set-pprint-dispatch accepts either). Coerce a
+            // symbol to its function so a symbol-named handler still runs (ANSI
+            // PPRINT-DISPATCH.9).
+            var fn = best.Value.Function as LispFunction
+                     ?? (best.Value.Function is Symbol fsym ? fsym.Function as LispFunction : null);
+            if (fn != null)
                 fn.Invoke(new LispObject[] { stream, obj });
             return sw.ToString();
         }
@@ -1010,6 +1018,14 @@ public static partial class Runtime
         if (typeSpec is Symbol typeSym)
         {
             return IsTruthy(Typep(obj, typeSym));
+        }
+        // Any other (compound) type specifier — (MEMBER ...), (AND ...), (OR ...),
+        // (SATISFIES ...), (NOT ...), etc. Delegate to TYPEP so set-pprint-dispatch
+        // can key on the full set of type specifiers (ANSI PPRINT-DISPATCH.7-9: a
+        // (MEMBER x y) entry must match both x and y).
+        if (typeSpec is Cons)
+        {
+            return IsTruthy(Typep(obj, typeSpec));
         }
         return false;
     }

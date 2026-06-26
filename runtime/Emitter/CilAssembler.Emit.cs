@@ -1875,7 +1875,7 @@ public partial class CilAssembler
             return key;
         }
 
-        private static void CollectInstanceRefs(LispObject form, List<LispInstance> result,
+        internal static void CollectInstanceRefs(LispObject form, List<LispInstance> result,
             HashSet<LispInstance> seen)
         {
             if (form is LispInstance li) { if (seen.Add(li)) result.Add(li); return; }
@@ -1887,6 +1887,13 @@ public partial class CilAssembler
         private readonly HashSet<LispInstance> _initialized = new(ReferenceEqualityComparer.Instance);
 
         public void MarkCreated(LispInstance li) => _created.Add(li);
+
+        public bool IsCreated(LispInstance li) => _created.Contains(li);
+
+        /// <summary>Counter for the per-instance creation/init top-level methods
+        /// (_mlf_N) emitted so make-load-form creation and init forms interleave
+        /// per object at load time (CLHS ordering, matching SBCL).</summary>
+        internal int TopLevelMethodCount;
 
         /// <summary>Pop all init forms whose external dependencies are now fully initialized.
         /// Repeats until no more unblocked forms. Call after each creation form is emitted.</summary>
@@ -2142,10 +2149,34 @@ public partial class CilAssembler
                 _il.Emit(OpCodes.Call, typeof(Ratio).GetMethod("Make")!);
                 _il.Emit(OpCodes.Castclass, typeof(LispObject));
                 break;
+            case LispComplex cx:
+                // Reconstruct from real/imag parts: new LispComplex(real, imag).
+                // The parts are themselves constants (fixnum/ratio/float/bignum),
+                // so emit them inline and cast each to Number for the ctor.
+                EmitLoadConstInline(cx.Real);
+                _il.Emit(OpCodes.Castclass, typeof(Number));
+                EmitLoadConstInline(cx.Imaginary);
+                _il.Emit(OpCodes.Castclass, typeof(Number));
+                _il.Emit(OpCodes.Newobj,
+                    typeof(LispComplex).GetConstructor(new[] { typeof(Number), typeof(Number) })!);
+                _il.Emit(OpCodes.Castclass, typeof(LispObject));
+                break;
             case LispPathname pn:
-                // Build via LispPathname.FromString(namestring)
+                // A namestring carries no version syntax, so FromString(namestring)
+                // drops the version (e.g. :NEWEST). When the literal pathname has a
+                // version, reconstruct it with FromStringWithVersion so #. round-trips
+                // preserve it (ANSI COMPILE-FILE.16). Otherwise the cheaper FromString.
                 _il.Emit(OpCodes.Ldstr, pn.ToNamestring());
-                _il.Emit(OpCodes.Call, typeof(LispPathname).GetMethod("FromString", new[] { typeof(string) })!);
+                if (pn.Version != null && pn.Version is not Nil)
+                {
+                    EmitLoadConstInline(pn.Version);
+                    _il.Emit(OpCodes.Call, typeof(LispPathname).GetMethod(
+                        "FromStringWithVersion", new[] { typeof(string), typeof(LispObject) })!);
+                }
+                else
+                {
+                    _il.Emit(OpCodes.Call, typeof(LispPathname).GetMethod("FromString", new[] { typeof(string) })!);
+                }
                 _il.Emit(OpCodes.Castclass, typeof(LispObject));
                 break;
             case LispStruct ls:
@@ -2301,10 +2332,18 @@ public partial class CilAssembler
                 break;
             }
             default:
-                // Fallback: use constant pool (won't work across processes, but
-                // allows compilation to proceed for unsupported constant types)
-                try { Console.Error.WriteLine($"[FASL WARNING] Unsupported constant type in fasl: {val.GetType().Name}"); }
-                catch { /* ignore ToString errors */ }
+                // Fallback: constant pool. This resolves correctly in-process
+                // (AssembleAndRun, and compile-file+load within the same process,
+                // e.g. make-load-form of a LispClass) but NOT across processes —
+                // the pool is per-process and not serialized into the fasl. Warn so
+                // the cross-process risk is visible. (Types that must round-trip
+                // cross-process need a dedicated inline case above, as LispComplex
+                // got.)
+                if (_faslMode)
+                {
+                    try { Console.Error.WriteLine($"[FASL WARNING] Unsupported constant type in fasl (constant-pool fallback, not cross-process safe): {val.GetType().Name}"); }
+                    catch { /* ignore ToString errors */ }
+                }
                 int idx = AddConstant(val);
                 _il.Emit(OpCodes.Ldc_I4, idx);
                 _il.Emit(OpCodes.Call, _getConstant);
@@ -2322,40 +2361,124 @@ public partial class CilAssembler
         if (_faslStructMap.TryGetInstanceKey(li, out var existingKey))
         {
             // Already registered: emit lookup (creation form already emitted or in progress)
-            _il.Emit(OpCodes.Ldstr, Track(existingKey));
-            _il.Emit(OpCodes.Ldsfld, typeof(Nil).GetField("Instance")!);
-            _il.Emit(OpCodes.Call, _internViaEvalInstance);
-            _il.Emit(OpCodes.Castclass, typeof(LispObject));
+            EmitInstanceLookup(existingKey);
             return;
         }
         var mlfSym = Startup.Sym("MAKE-LOAD-FORM");
         if (mlfSym?.Function != null)
         {
-            try
-            {
-                var raw = Runtime.Funcall(mlfSym.Function, li);
-                LispObject creationForm, initForm;
-                if (raw is MvReturn mv && mv.Values.Length >= 1)
-                {
-                    creationForm = mv.Values[0];
-                    initForm = mv.Values.Length >= 2 ? mv.Values[1] : Nil.Instance;
-                }
-                else { creationForm = raw; initForm = Nil.Instance; }
-
-                var key = _faslStructMap.RegisterInstance(li, initForm is Nil ? null : initForm);
-                _faslStructMap.MarkCreated(li);
-                _il.Emit(OpCodes.Ldstr, Track(key));
-                EmitLoadConstInline(creationForm);
-                _il.Emit(OpCodes.Call, _internViaEvalInstance);
-                _il.Emit(OpCodes.Castclass, typeof(LispObject));
-                return;
-            }
-            catch { /* fall through to fallback */ }
+            // Emit the creation form as its OWN top-level method (ahead of the
+            // referencing form in _initIl) so creation and init forms interleave
+            // per object at load time — (create a)(init a)(create b)(init b) —
+            // matching CLHS make-load-form ordering and SBCL. Dependencies are
+            // emitted first; the inline reference here becomes an intern lookup.
+            var key = EnsureInstanceCreatedTopLevel(li, mlfSym.Function);
+            if (key != null) { EmitInstanceLookup(key); return; }
+            // key == null: make-load-form errored, or a creation-form cycle — fall
+            // through to the direct-slot fallback below (old inline behavior).
         }
         // No make-load-form defined: fallback to direct slot serialization
         _faslStructMap.RegisterInstance(li, null);
         _faslStructMap.MarkCreated(li);
         EmitFaslInstanceFallback(li);
+    }
+
+    /// <summary>Emit an intern-by-key lookup of an already-created make-load-form
+    /// instance (InternViaEval with a NIL form designator = "look up existing").</summary>
+    private void EmitInstanceLookup(string key)
+    {
+        _il.Emit(OpCodes.Ldstr, Track(key));
+        _il.Emit(OpCodes.Ldsfld, typeof(Nil).GetField("Instance")!);
+        _il.Emit(OpCodes.Call, _internViaEvalInstance);
+        _il.Emit(OpCodes.Castclass, typeof(LispObject));
+    }
+
+    /// <summary>
+    /// Register an instance and emit its make-load-form creation form as a standalone
+    /// top-level method appended to _initIl, after first ensuring the creation form's
+    /// referenced instances are themselves created (so their forms precede this one).
+    /// After the creation, eagerly emits any init forms whose dependencies are now
+    /// satisfied — giving the per-object (create,init) interleave CLHS/SBCL require.
+    /// Returns the intern key, or null if make-load-form is unusable here (errored, or
+    /// an in-progress creation cycle) so the caller can fall back to inline emission.
+    /// </summary>
+    private string? EnsureInstanceCreatedTopLevel(LispInstance li, LispObject mlfFn)
+    {
+        if (_faslStructMap!.TryGetInstanceKey(li, out var existing))
+            // Registered but not yet created ⇒ we are inside its own dep recursion
+            // (a creation-form cycle, which is degenerate). Signal fallback.
+            return _faslStructMap.IsCreated(li) ? existing : null;
+
+        LispObject creationForm, initForm;
+        try
+        {
+            var raw = Runtime.Funcall(mlfFn, li);
+            if (raw is MvReturn mv && mv.Values.Length >= 1)
+            {
+                creationForm = mv.Values[0];
+                initForm = mv.Values.Length >= 2 ? mv.Values[1] : Nil.Instance;
+            }
+            else { creationForm = raw; initForm = Nil.Instance; }
+        }
+        catch { return null; }
+
+        var key = _faslStructMap.RegisterInstance(li, initForm is Nil ? null : initForm);
+
+        // Creation forms for instances referenced by THIS creation form must run first.
+        var deps = new List<LispInstance>();
+        FaslStructInternMap.CollectInstanceRefs(creationForm, deps,
+            new HashSet<LispInstance>(ReferenceEqualityComparer.Instance));
+        foreach (var dep in deps)
+        {
+            if (ReferenceEquals(dep, li)) continue;
+            if (_faslStructMap.IsCreated(dep)) continue;
+            if (_faslStructMap.TryGetInstanceKey(dep, out _)) continue; // in progress
+            var mlf = Startup.Sym("MAKE-LOAD-FORM");
+            if (mlf?.Function != null) EnsureInstanceCreatedTopLevel(dep, mlf.Function);
+        }
+
+        // Emit li's creation form (deps now resolve to lookups), then mark created
+        // and flush any init forms unblocked by it.
+        EmitMlfTopLevelMethod(creationForm, intern: true, key: key);
+        _faslStructMap.MarkCreated(li);
+        foreach (var (_, init) in _faslStructMap.PopEagerInitForms())
+            EmitMlfTopLevelMethod(init, intern: false, key: null);
+        return key;
+    }
+
+    /// <summary>Define a static _mlf_N method that, at load time, either interns the
+    /// creation form's value under KEY (intern=true) or evaluates an init form for
+    /// effect (intern=false), and append a call to it in the module-init sequence.</summary>
+    private void EmitMlfTopLevelMethod(LispObject form, bool intern, string? key)
+    {
+        var tb = _faslStructMap!.UninternedTypeBuilder!;
+        var initIl = _faslStructMap.UninternedInitIl!;
+        int id = _faslStructMap.TopLevelMethodCount++;
+        var m = tb.DefineMethod("_mlf_" + id,
+            MethodAttributes.Public | MethodAttributes.Static,
+            typeof(LispObject), Type.EmptyTypes);
+        var il = m.GetILGenerator();
+        var inner = new CilAssembler
+        {
+            _il = il, _faslMode = true,
+            _faslTypeBuilder = tb, _faslStructMap = _faslStructMap,
+        };
+        if (intern)
+        {
+            il.Emit(OpCodes.Ldstr, Track(key!));
+            inner.EmitLoadConstInline(form);
+            il.Emit(OpCodes.Call, _internViaEvalInstance);
+        }
+        else
+        {
+            inner.EmitLoadConstInline(form);
+            il.Emit(OpCodes.Call, _methodCache["Runtime.Eval"]);
+        }
+        il.Emit(OpCodes.Pop);
+        il.Emit(OpCodes.Ldsfld, typeof(Nil).GetField("Instance")!);
+        il.Emit(OpCodes.Ret);
+        initIl.Emit(OpCodes.Call, m);
+        initIl.Emit(OpCodes.Pop);
     }
 
     private void EmitFaslInstanceFallback(LispInstance li)
@@ -3176,6 +3299,8 @@ public partial class CilAssembler
             // Wrap .NET exceptions as Lisp conditions
             ["Runtime.WrapDotNetException"] =
                 typeof(Runtime).GetMethod("WrapDotNetException")!,
+            ["Runtime.WrapDotNetExceptionObj"] =
+                typeof(Runtime).GetMethod("WrapDotNetExceptionObj")!,
             ["Runtime.RewrapNonLispException"] =
                 typeof(Runtime).GetMethod("RewrapNonLispException")!,
             ["Runtime.IsLispControlFlowException"] =

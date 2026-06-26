@@ -284,7 +284,7 @@
 
 (deftest mop/slot-definition-location-non-negative-integer
   ;; AMOP: returns a non-negative integer (index into the instance layout)
-  ;; for instance-allocated slots (#264).
+  ;; for instance-allocated slots.
   (let ((slotd (find-if (lambda (s)
                           (eq (dotcl-mop:slot-definition-name s) 'x))
                         (dotcl-mop:class-slots (find-class 'mop/a)))))
@@ -293,7 +293,7 @@
   t)
 
 (deftest mop/standard-instance-access-roundtrip
-  ;; AMOP: standard-instance-access reads/writes the slot at an integer location (#264)
+  ;; AMOP: standard-instance-access reads/writes the slot at an integer location
   (let* ((obj (make-instance 'mop/a))
          (slotd (find-if (lambda (s) (eq (dotcl-mop:slot-definition-name s) 'x))
                          (dotcl-mop:class-slots (find-class 'mop/a))))
@@ -304,7 +304,7 @@
   (sentinel sentinel))
 
 (deftest mop/slot-definition-typep-consistent
-  ;; class-of and typep must agree on slot-definition metaobjects (#264)
+  ;; class-of and typep must agree on slot-definition metaobjects
   (let ((eslotd (first (dotcl-mop:class-slots (find-class 'mop/a))))
         (dslotd (first (dotcl-mop:class-direct-slots (find-class 'mop/a)))))
     (list (typep eslotd 'dotcl-mop:standard-effective-slot-definition)
@@ -314,7 +314,7 @@
   (t nil t t))
 
 (deftest mop/slot-definition-method-dispatch
-  ;; methods can dispatch on a slot-definition's class (#264)
+  ;; methods can dispatch on a slot-definition's class
   (progn
     (eval '(defgeneric mop/slotd-kind (s)))
     (eval '(defmethod mop/slotd-kind ((s dotcl-mop:standard-effective-slot-definition)) :effective))

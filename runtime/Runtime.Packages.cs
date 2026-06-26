@@ -340,6 +340,22 @@ public static partial class Runtime
         return result;
     }
 
+    /// <summary>CLHS-style package-locally-nicknamed-by-list: the packages that
+    /// have a local nickname for the given package.</summary>
+    public static LispObject PackageLocallyNicknamedByList(LispObject pkg)
+    {
+        var target = ResolvePackage(pkg, "PACKAGE-LOCALLY-NICKNAMED-BY-LIST");
+        LispObject result = Nil.Instance;
+        foreach (var p in Package.AllPackages)
+        {
+            foreach (var (_, actualPkg) in p.LocalNicknames)
+            {
+                if (ReferenceEquals(actualPkg, target)) { result = new Cons(p, result); break; }
+            }
+        }
+        return result;
+    }
+
     public static LispObject PackageName(LispObject pkg)
     {
         ValidatePackageDesignator(pkg, "PACKAGE-NAME");

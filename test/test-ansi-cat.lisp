@@ -206,13 +206,13 @@
       (null pending))))
 (in-package :cl-test)
 
-;;; Tests that hang (infinite loop on circular structures — *print-circle* not yet implemented)
-;;; These are skipped in do-entries below via *hang-tests*
+;;; Tests that hang or crash the test runner (skipped in do-entries via *hang-tests*).
+;;; Empty now: the former entries (pprint-fill.15 / pprint-pop.8 / print.cons.7 /
+;;; print.cons.random.2) only hung before *print-circle* existed. They pass and no
+;;; longer hang, so skipping them just mis-counted them as failures. Kept in sync with
+;;; the empty *hang-tests* in test-ansi.lisp (the full runner).
 (in-package :regression-test)
-(defvar *hang-tests* '(cl-test::pprint-fill.15
-                       cl-test::pprint-pop.8
-                       cl-test::print.cons.7
-                       cl-test::print.cons.random.2))
+(defvar *hang-tests* '())
 (in-package :cl-test)
 
 ;;; Category is loaded below (appended by Makefile)

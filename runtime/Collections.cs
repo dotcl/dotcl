@@ -582,11 +582,21 @@ public class LispVector : LispObject
 
 public class LispHashTable : LispObject
 {
-    // For :weakness :value, _dict's value is a System.WeakReference<LispObject>;
-    // for :weakness nil (default), it's the LispObject directly. Storing as
-    // `object` keeps both shapes in one dictionary instance without doubling
-    // the field surface.
-    private readonly Dictionary<LispObject, object> _dict;
+    // Storage. The dictionary KEY is:
+    //   - strong modes (Weakness null or :VALUE): the LispObject key directly.
+    //   - key-weak modes (:KEY, :KEY-AND-VALUE, :KEY-OR-VALUE): a WeakKeyBox that
+    //     holds a WeakReference to the key plus a frozen hash code, so the dict
+    //     does not strong-root the key (letting GC reclaim it).
+    // The dictionary VALUE is the LispObject value directly, or a
+    // WeakReference<LispObject> when the value side is weak (:VALUE,
+    // :KEY-AND-VALUE, :KEY-OR-VALUE). Storing as `object` keeps all shapes in one
+    // dictionary instance.
+    private readonly Dictionary<object, object> _dict;
+    private readonly bool _weakKey;    // key side is weak
+    private readonly bool _weakValue;  // value side is weak
+    // :KEY-OR-VALUE keeps an entry alive while EITHER side is live; all other
+    // weak modes require ALL weak sides to be live (the default "and" semantics).
+    private readonly bool _keyOrValue;
     private readonly Func<LispObject, LispObject, bool> _test;
     private readonly string _testName;
     // When Synchronized, all mutating/reading operations take _lock.
@@ -595,12 +605,10 @@ public class LispHashTable : LispObject
     private readonly object _lock = new();
     public bool Synchronized { get; }
     /// <summary>
-    /// Weakness mode (SBCL extension). Currently :value is the only supported
-    /// non-nil mode. Values are stored as WeakReference&lt;LispObject&gt; so that
-    /// when no strong reference outside the table holds the value, it becomes
-    /// eligible for GC and the entry surfaces as if absent. Required by
-    /// sheeple. Other modes (:key / :key-or-value / :key-and-value) are not
-    /// yet implemented and will throw at construction time.
+    /// Weakness mode (SBCL extension), one of NULL, ":VALUE", ":KEY",
+    /// ":KEY-AND-VALUE", ":KEY-OR-VALUE". A weak side is stored behind a
+    /// WeakReference (value) / WeakKeyBox (key) so the table does not keep the
+    /// object alive; the entry surfaces as absent once the required side(s) die.
     /// </summary>
     public string? Weakness { get; }
 
@@ -624,94 +632,165 @@ public class LispHashTable : LispObject
             "EQUALP" => Equalp,
             _ => throw new ArgumentException($"Unknown hash table test: {test}")
         };
-        _dict = new Dictionary<LispObject, object>(
-            new LispEqualityComparer(_test, _testName));
         Synchronized = synchronized;
         if (weakness != null)
         {
-            var w = weakness.ToUpperInvariant();
-            if (w != "VALUE")
-                throw new ArgumentException(
-                    $":weakness {weakness.ToLowerInvariant()} not yet supported (only :value)");
-            Weakness = ":VALUE";
+            switch (weakness.ToUpperInvariant())
+            {
+                case "VALUE":         Weakness = ":VALUE";         _weakValue = true; break;
+                case "KEY":           Weakness = ":KEY";           _weakKey = true;   break;
+                case "KEY-AND-VALUE": Weakness = ":KEY-AND-VALUE"; _weakKey = true; _weakValue = true; break;
+                case "KEY-OR-VALUE":  Weakness = ":KEY-OR-VALUE";  _weakKey = true; _weakValue = true; _keyOrValue = true; break;
+                default:
+                    throw new ArgumentException(
+                        $":weakness {weakness.ToLowerInvariant()} invalid " +
+                        "(expected :key, :value, :key-and-value, or :key-or-value)");
+            }
         }
+        // Key-weak tables box the key in a WeakKeyBox so the dict doesn't root it;
+        // the comparer resolves boxes (and bare live keys used for lookup) through
+        // the test. Strong/value-only tables key on the LispObject directly.
+        var inner = new LispEqualityComparer(_test, _testName);
+        _dict = new Dictionary<object, object>(
+            _weakKey ? new WeakKeyComparer(inner) : (IEqualityComparer<object>)new BoxedObjectComparer(inner));
         DotCL.Diagnostics.AllocCounter.Inc("LispHashTable");
     }
 
-    /// <summary>
-    /// Resolve a stored value to its live LispObject, or return null if the
-    /// slot is a dead WeakReference. Caller decides what "dead" means
-    /// (default value vs. absent).
-    /// </summary>
-    private LispObject? Resolve(object stored)
+    // --- weak storage helpers ---------------------------------------------
+
+    // A weak dictionary key: holds the key weakly + a frozen hash so the entry's
+    // bucket stays stable after the key is collected (until pruned).
+    private sealed class WeakKeyBox
     {
-        if (stored is WeakReference<LispObject> wr)
-            return wr.TryGetTarget(out var v) ? v : null;
-        return (LispObject)stored;
+        public readonly WeakReference<LispObject> Ref;
+        public readonly int Hash;
+        public WeakKeyBox(LispObject key, int hash) { Ref = new WeakReference<LispObject>(key); Hash = hash; }
+        public LispObject? Live => Ref.TryGetTarget(out var v) ? v : null;
     }
 
-    private object Wrap(LispObject value)
-        => Weakness == ":VALUE" ? new WeakReference<LispObject>(value) : value;
+    // Comparer for strong/value-only tables: dict key is a bare LispObject.
+    private sealed class BoxedObjectComparer : IEqualityComparer<object>
+    {
+        private readonly LispEqualityComparer _inner;
+        public BoxedObjectComparer(LispEqualityComparer inner) => _inner = inner;
+        public new bool Equals(object? x, object? y) => _inner.Equals((LispObject?)x, (LispObject?)y);
+        public int GetHashCode(object obj) => _inner.GetHashCode((LispObject)obj);
+    }
+
+    // Comparer for key-weak tables: stored keys are WeakKeyBox, lookup keys are
+    // bare LispObject. Resolves both sides to the live key and compares via test;
+    // hash comes from the box (frozen) or is computed for a bare lookup key.
+    private sealed class WeakKeyComparer : IEqualityComparer<object>
+    {
+        private readonly LispEqualityComparer _inner;
+        public WeakKeyComparer(LispEqualityComparer inner) => _inner = inner;
+        private LispObject? Resolve(object o) => o is WeakKeyBox b ? b.Live : (LispObject)o;
+        public new bool Equals(object? x, object? y)
+        {
+            var lx = x == null ? null : Resolve(x);
+            var ly = y == null ? null : Resolve(y);
+            // A dead box never equals anything (so pruning can find/remove it by ==).
+            if (lx == null || ly == null) return ReferenceEquals(x, y);
+            return _inner.Equals(lx, ly);
+        }
+        public int GetHashCode(object obj)
+        {
+            if (obj is WeakKeyBox b) return b.Hash;
+            return _inner.GetHashCode((LispObject)obj);
+        }
+        public int HashOf(LispObject key) => _inner.GetHashCode(key);
+    }
+
+    // Box a value for storage (weak when the value side is weak).
+    private object WrapValue(LispObject value)
+        => _weakValue ? new WeakReference<LispObject>(value) : value;
+
+    private LispObject? ResolveValue(object stored)
+        => stored is WeakReference<LispObject> wr ? (wr.TryGetTarget(out var v) ? v : null) : (LispObject)stored;
+
+    private LispObject? ResolveKey(object storedKey)
+        => storedKey is WeakKeyBox b ? b.Live : (LispObject)storedKey;
+
+    // Is the entry (storedKey -> storedVal) still live under this table's mode?
+    // Returns the (key,value) when live, else null. KEY-OR-VALUE survives while
+    // either weak side is live; all other modes need every weak side live.
+    private (LispObject k, LispObject v)? LiveEntry(object storedKey, object storedVal)
+    {
+        var k = ResolveKey(storedKey);
+        var v = ResolveValue(storedVal);
+        bool keyOk = !_weakKey || k != null;
+        bool valOk = !_weakValue || v != null;
+        bool alive = _keyOrValue ? (keyOk || valOk) : (keyOk && valOk);
+        if (!alive) return null;
+        // For OR-mode a side may be dead but the other alive; surface NIL? No —
+        // CL semantics keep the pair; if one side is collected the entry is
+        // logically gone for use. We require both resolvable to hand back a pair;
+        // a half-dead OR entry is treated as live-but-unusable → prune lazily.
+        if (k == null || v == null) return null;
+        return (k, v);
+    }
 
     public LispObject Get(LispObject key, LispObject defaultValue)
     {
-        if (Synchronized)
+        if (Synchronized) { lock (_lock) return GetImpl(key, defaultValue); }
+        return GetImpl(key, defaultValue);
+    }
+    private LispObject GetImpl(LispObject key, LispObject defaultValue)
+    {
+        if (_dict.TryGetValue(key, out var stored))
         {
-            lock (_lock)
-            {
-                if (_dict.TryGetValue(key, out var stored))
-                {
-                    var live = Resolve(stored);
-                    if (live != null) return live;
-                    _dict.Remove(key);
-                }
-                return defaultValue;
-            }
-        }
-        if (_dict.TryGetValue(key, out var s))
-        {
-            var live = Resolve(s);
+            var live = ResolveValue(stored);
+            // entry-level liveness also depends on key side for key-weak modes,
+            // but if we found it by live key, the key is necessarily alive.
             if (live != null) return live;
-            _dict.Remove(key);
+            RemoveByLookup(key);
         }
         return defaultValue;
     }
 
     public bool TryGet(LispObject key, out LispObject value)
     {
-        if (Synchronized)
-        {
-            lock (_lock)
-            {
-                if (_dict.TryGetValue(key, out var stored))
-                {
-                    var live = Resolve(stored);
-                    if (live != null) { value = live; return true; }
-                    _dict.Remove(key);
-                }
-                value = null!; return false;
-            }
-        }
+        if (Synchronized) { lock (_lock) return TryGetImpl(key, out value); }
+        return TryGetImpl(key, out value);
+    }
+    private bool TryGetImpl(LispObject key, out LispObject value)
+    {
         if (_dict.TryGetValue(key, out var s))
         {
-            var live = Resolve(s);
+            var live = ResolveValue(s);
             if (live != null) { value = live; return true; }
-            _dict.Remove(key);
+            RemoveByLookup(key);
         }
         value = null!; return false;
     }
 
     public void Set(LispObject key, LispObject value)
     {
-        if (Synchronized) lock (_lock) _dict[key] = Wrap(value);
-        else _dict[key] = Wrap(value);
+        if (Synchronized) { lock (_lock) SetImpl(key, value); }
+        else SetImpl(key, value);
+    }
+    private void SetImpl(LispObject key, LispObject value)
+    {
+        // For key-weak modes, an existing live entry must be updated in place
+        // (its box is the dict key). TryGetValue by the bare key finds it via the
+        // resolving comparer; if present we keep the existing box key.
+        if (_weakKey)
+        {
+            if (_dict.ContainsKey(key)) { _dict[key] = WrapValue(value); return; }
+            _dict[new WeakKeyBox(key, ((WeakKeyComparer)_dict.Comparer).HashOf(key))] = WrapValue(value);
+            return;
+        }
+        _dict[key] = WrapValue(value);
     }
 
     public bool Remove(LispObject key)
     {
-        if (Synchronized) lock (_lock) return _dict.Remove(key);
-        return _dict.Remove(key);
+        if (Synchronized) { lock (_lock) return RemoveByLookup(key); }
+        return RemoveByLookup(key);
     }
+    // Remove by live key. The resolving comparer matches the stored box, so a
+    // bare key removes the corresponding weak entry.
+    private bool RemoveByLookup(LispObject key) => _dict.Remove(key);
 
     public void Clear()
     {
@@ -723,8 +802,6 @@ public class LispHashTable : LispObject
     {
         get
         {
-            // For weak tables, Count must skip dead entries; we lazily prune
-            // them while counting so subsequent enumeration is consistent.
             if (Weakness == null)
             {
                 if (Synchronized) lock (_lock) return _dict.Count;
@@ -737,11 +814,11 @@ public class LispHashTable : LispObject
 
     private int CountAlivePruning()
     {
-        var dead = new List<LispObject>();
+        var dead = new List<object>();
         int alive = 0;
         foreach (var kv in _dict)
         {
-            if (Resolve(kv.Value) != null) alive++;
+            if (LiveEntry(kv.Key, kv.Value) != null) alive++;
             else dead.Add(kv.Key);
         }
         foreach (var k in dead) _dict.Remove(k);
@@ -773,15 +850,15 @@ public class LispHashTable : LispObject
             var arr = new KeyValuePair<LispObject, LispObject>[_dict.Count];
             int i = 0;
             foreach (var kv in _dict)
-                arr[i++] = new KeyValuePair<LispObject, LispObject>(kv.Key, (LispObject)kv.Value);
+                arr[i++] = new KeyValuePair<LispObject, LispObject>((LispObject)kv.Key, (LispObject)kv.Value);
             return arr;
         }
-        var dead = new List<LispObject>();
+        var dead = new List<object>();
         var alive = new List<KeyValuePair<LispObject, LispObject>>();
         foreach (var kv in _dict)
         {
-            var live = Resolve(kv.Value);
-            if (live != null) alive.Add(new KeyValuePair<LispObject, LispObject>(kv.Key, live));
+            var live = LiveEntry(kv.Key, kv.Value);
+            if (live != null) alive.Add(new KeyValuePair<LispObject, LispObject>(live.Value.k, live.Value.v));
             else dead.Add(kv.Key);
         }
         foreach (var k in dead) _dict.Remove(k);
@@ -808,8 +885,17 @@ public class LispHashTable : LispObject
                 action(pair.Key, pair.Value);
             return;
         }
-        foreach (var pair in _dict)
-            action(pair.Key, (LispObject)pair.Value);
+        // Snapshot before iterating so ACTION may add/remove entries during the
+        // walk. CLHS leaves mid-MAPHASH modification undefined, but SBCL/CCL/ECL
+        // tolerate it and real code relies on it (e.g. lem's
+        // add-lisp-color-aliases inserts aliases while mapping the color table).
+        // Iterating Dictionary live would throw InvalidOperationException
+        // ("Collection was modified"); snapshotting matches the other impls.
+        var snapshot2 = new KeyValuePair<object, object>[_dict.Count];
+        ((System.Collections.Generic.ICollection<KeyValuePair<object, object>>)_dict)
+            .CopyTo(snapshot2, 0);
+        foreach (var pair in snapshot2)
+            action((LispObject)pair.Key, (LispObject)pair.Value);
     }
 
     private static bool Eql(LispObject a, LispObject b)
@@ -1091,4 +1177,26 @@ public class LispPprintDispatchTable : LispObject
     }
 
     public override string ToString() => "#<PPRINT-DISPATCH-TABLE>";
+}
+
+/// <summary>
+/// A weak pointer to a single Lisp object, backed by System.WeakReference.
+/// weak-pointer-value returns the object while it is still reachable elsewhere,
+/// and NIL once the GC has reclaimed it. Used by trivial-garbage's
+/// make-weak-pointer / weak-pointer-value.
+/// </summary>
+public class LispWeakPointer : LispObject
+{
+    private readonly WeakReference<LispObject> _ref;
+
+    public LispWeakPointer(LispObject target)
+    {
+        // trackResurrection: false — value becomes unreachable once collected.
+        _ref = new WeakReference<LispObject>(target);
+    }
+
+    /// <summary>The referenced object, or NIL if it has been collected.</summary>
+    public LispObject Value => _ref.TryGetTarget(out var t) ? t : Nil.Instance;
+
+    public override string ToString() => "#<WEAK-POINTER>";
 }

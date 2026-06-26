@@ -339,6 +339,15 @@ public static partial class Runtime
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    /// <summary>True if OBJ wraps a System.Array (e.g. from dotnet:make-array),
+    /// so aref / (setf aref) can index it transparently. (dotcl/dotcl#45)</summary>
+    private static bool TryDotNetArray(LispObject obj, out System.Array arr)
+    {
+        if (obj is LispDotNetObject dno && dno.Value is System.Array a) { arr = a; return true; }
+        arr = null!;
+        return false;
+    }
+
     public static LispObject Aref(LispObject array, LispObject index)
     {
         // Tight fast path: plain 1D LispVector with Fixnum index.
@@ -358,6 +367,8 @@ public static partial class Runtime
         if (index is not Fixnum f)
             throw new LispErrorException(new LispTypeError("AREF: index must be integer", index));
         int idx = (int)f.Value;
+        if (TryDotNetArray(array, out var narr))
+            return DotNetToLisp(narr.GetValue(idx));
         if (array is LispVector v)
         {
             if (idx < 0 || idx >= v.Capacity)
@@ -396,6 +407,13 @@ public static partial class Runtime
         }
         if (array is LispString s && args.Length == 2)
             return Aref(array, args[1]);
+        if (TryDotNetArray(array, out var narr))
+        {
+            var indices = new int[args.Length - 1];
+            for (int k = 0; k < indices.Length; k++)
+                indices[k] = (int)((Fixnum)args[k + 1]).Value;
+            return DotNetToLisp(narr.GetValue(indices));
+        }
         throw new LispErrorException(new LispTypeError("AREF: not an array", array));
     }
 
@@ -431,6 +449,14 @@ public static partial class Runtime
             ls[i] = ch.Value;
             return value;
         }
+        if (TryDotNetArray(array, out var narr))
+        {
+            var indices = new int[args.Length - 2];
+            for (int k = 0; k < indices.Length; k++)
+                indices[k] = (int)((Fixnum)args[k + 1]).Value;
+            narr.SetValue(LispToDotNet(value, narr.GetType().GetElementType()!), indices);
+            return value;
+        }
         throw new LispErrorException(new LispTypeError("(SETF AREF): not a vector", array));
     }
 
@@ -456,6 +482,11 @@ public static partial class Runtime
         if (index is not Fixnum f)
             throw new LispErrorException(new LispTypeError("(SETF AREF): index must be integer", index));
         int idx = (int)f.Value;
+        if (TryDotNetArray(array, out var narr))
+        {
+            narr.SetValue(LispToDotNet(value, narr.GetType().GetElementType()!), idx);
+            return value;
+        }
         if (array is LispVector v)
         {
             if (idx < 0 || idx >= v.Capacity)
@@ -505,6 +536,8 @@ public static partial class Runtime
             int idx = i0 * dims[1] + i1;
             return v.GetElement(idx);
         }
+        if (TryDotNetArray(array, out var narr))
+            return DotNetToLisp(narr.GetValue((int)((Fixnum)idx0).Value, (int)((Fixnum)idx1).Value));
         throw new LispErrorException(new LispTypeError("AREF: not an array", array));
     }
 
@@ -545,6 +578,12 @@ public static partial class Runtime
                 return value;
             }
             v.SetElement(idx, value);
+            return value;
+        }
+        if (TryDotNetArray(array, out var narr))
+        {
+            narr.SetValue(LispToDotNet(value, narr.GetType().GetElementType()!),
+                          (int)((Fixnum)idx0).Value, (int)((Fixnum)idx1).Value);
             return value;
         }
         throw new LispErrorException(new LispTypeError("(SETF AREF): not an array", array));

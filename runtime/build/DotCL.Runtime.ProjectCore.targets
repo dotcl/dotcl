@@ -1,6 +1,6 @@
 <Project>
   <!--
-    Project-core build for pure-PackageReference consumers (#307).
+    Project-core build for pure-PackageReference consumers.
 
     Activated only when the consumer sets <DotclProjectAsd>. It compiles an ASDF
     system to a fasl (+ dependency fasls + a deployment manifest) entirely from
@@ -45,7 +45,7 @@
   <Target Name="_DotCLResolveDeps"
           BeforeTargets="GetCopyToOutputDirectoryItems;_CollectAssetPackFiles;_GenerateAndroidAssetsDir;_CollectMauiAssetsTargetFramework;BeforeBuild"
           Condition="'$(DotclProjectAsd)' != ''"
-          Inputs="$(DotclProjectAsd);@(DotclBuildInit)"
+          Inputs="$(DotclProjectAsd);@(DotclBuildInit);@(DotclAsdSearchPath)"
           Outputs="$(DotclSourceManifest);$(DotclRootSourcesList)">
     <MakeDir Directories="$(DotclBundleDir)" />
     <DotclResolveDeps Asd="$(DotclProjectAsd)"
@@ -54,6 +54,7 @@
                       ManifestOut="$(DotclSourceManifest)"
                       RootSourcesOut="$(DotclRootSourcesList)"
                       BuildInit="@(DotclBuildInit)"
+                      AsdSearchPath="@(DotclAsdSearchPath)"
                       RuntimeAssemblyPath="$(_DotCLRuntimeAssembly)" />
   </Target>
 
@@ -86,13 +87,14 @@
           DependsOnTargets="_DotCLLoadItems"
           BeforeTargets="GetCopyToOutputDirectoryItems;_CollectAssetPackFiles;_GenerateAndroidAssetsDir;_CollectMauiAssetsTargetFramework;BeforeBuild"
           Condition="'$(DotclProjectAsd)' != ''"
-          Inputs="@(_DotclRootSource);$(DotclProjectAsd);@(DotclBuildInit)"
+          Inputs="@(_DotclRootSource);$(DotclProjectAsd);@(DotclBuildInit);@(DotclAsdSearchPath)"
           Outputs="$(DotclRootFasl)">
     <DotclCompileProject Asd="$(DotclProjectAsd)"
                          Output="$(DotclRootFasl)"
                          BaseCore="$(DotclBaseCore)"
                          ContribDir="$(_DotCLContribDir)"
                          BuildInit="@(DotclBuildInit)"
+                         AsdSearchPath="@(DotclAsdSearchPath)"
                          RuntimeAssemblyPath="$(_DotCLRuntimeAssembly)" />
   </Target>
 

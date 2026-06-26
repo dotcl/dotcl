@@ -54,6 +54,7 @@ scratch.txt
 *.fasl
 *.ufsl
 *.tmp
+test/regression/.tmp-*/
 *.sil
 /*.lsp
 compile-file-*

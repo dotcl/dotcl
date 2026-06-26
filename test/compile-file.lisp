@@ -97,6 +97,28 @@
    'cf-test-const-t)
   t)
 
+(deftest compile-file.constant.complex-rational
+  (cf-roundtrip
+   "(in-package :cl-test)
+    (defun cf-test-const-cplx-rat () #C(3 4))"
+   'cf-test-const-cplx-rat)
+  #C(3 4))
+
+(deftest compile-file.constant.complex-float
+  (cf-roundtrip
+   "(in-package :cl-test)
+    (defun cf-test-const-cplx-flt () #C(1.5 2.5))"
+   'cf-test-const-cplx-flt)
+  #C(1.5 2.5))
+
+;; complex embedded in a list literal must not corrupt the constant pool
+(deftest compile-file.constant.complex-in-list
+  (cf-roundtrip
+   "(in-package :cl-test)
+    (defun cf-test-const-cplx-list () '(1 #C(0 1) 2))"
+   'cf-test-const-cplx-list)
+  (1 #C(0 1) 2))
+
 ;;; --- Closures ---
 
 (deftest compile-file.closure.1

@@ -69,5 +69,20 @@ builder.Services.AddControllers()
 var app = builder.Build();
 app.MapControllers();
 
+// Async endpoint (Task-producing side). The Lisp `async-hello` returns a
+// .NET Task<LispObject> built by (dotcl:async ...) — it awaits a real Task.Delay
+// off the request thread, then yields a value. We await that Task here and write
+// its (string) result, so the request completes without a thread blocked on the
+// delay. This is the Minimal-API trampoline the README flagged as the lighter
+// path for runtime endpoints (vs. an MVC async action's Task<IActionResult>).
+app.MapGet("/api/async-hello", async () =>
+{
+    // DotclHost.Call returns the Lisp value wrapping the Task<LispObject>.
+    var wrapped = (LispDotNetObject)DotclHost.Call("ASYNC-HELLO");
+    var task = (Task<LispObject>)wrapped.Value;   // the (dotcl:async ...) Task
+    var result = await task;                       // off-thread await, no blocking
+    return Results.Text(DotclHost.ToClr<string>(result));
+});
+
 Console.WriteLine("[aspnet] running on http://localhost:5180");
 app.Run("http://localhost:5180");

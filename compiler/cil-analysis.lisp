@@ -275,9 +275,7 @@
                                 (mparams (cadr def))
                                 (mbody (cddr def)))
                            (setf (gethash mname *macros*)
-                                 (eval `(lambda (form)
-                                          (destructuring-bind ,mparams (cdr form)
-                                            ,@mbody))))))
+                                 (eval (%macrolet-expander-form mparams mbody)))))
                        ;; Push body forms (LIFO: processed BEFORE restore sentinels)
                        (dolist (form mlbody)
                          (push (cons form (cons bnd mdepth)) worklist))))
@@ -446,6 +444,18 @@
              (if old-entry
                  (setf (gethash name *macros*) old-entry)
                  (remhash name *macros*))))
+          ;; Bare symbol that is a symbol-macro: expand and scan the expansion
+          ;; for mutations. A symbol-macro can hide a mutation (e.g. an
+          ;; octet-getter expanding to (prog1 (aref v i) (incf i))). Without
+          ;; this, a variable mutated only through a symbol-macro reference
+          ;; inside a closure isn't marked mutated, so it isn't boxed and the
+          ;; mutation is lost across closure calls (free-var analysis already
+          ;; expands symbol-macros — the two passes must agree).
+          ((and (symbolp e) e
+                (not (eq e :restore-symbol-macros)) (not (eq e :restore-macro))
+                (< mdepth *macro-expand-depth-limit*)
+                (assoc e *symbol-macros* :test #'eq))
+           (push (cons (cdr (assoc e *symbol-macros* :test #'eq)) (1+ mdepth)) worklist))
           (t
            (when (consp e)
              (let ((head (car e)))
@@ -549,9 +559,7 @@
                               (mparams (cadr def))
                               (mbody (cddr def)))
                          (setf (gethash mname *macros*)
-                               (eval `(lambda (form)
-                                        (destructuring-bind ,mparams (cdr form)
-                                          ,@mbody))))))
+                               (eval (%macrolet-expander-form mparams mbody)))))
                      ;; Push body forms (LIFO: processed BEFORE restore sentinels)
                      (dolist (form mlbody)
                        (push (cons form mdepth) worklist))))
@@ -611,6 +619,17 @@
              (if old-entry
                  (setf (gethash name *macros*) old-entry)
                  (remhash name *macros*))))
+          ;; Bare symbol that is a symbol-macro: expand and scan the expansion,
+          ;; so a variable referenced only through a symbol-macro inside a lambda
+          ;; (e.g. an octet-getter expanding to (... i ...)) is still detected as
+          ;; captured. Must agree with find-free-vars-expr, which expands too;
+          ;; otherwise the var is seen as mutated-but-not-captured and isn't boxed.
+          ((and (symbolp e) e
+                (not (eq e :restore-symbol-macros)) (not (eq e :restore-macro))
+                (< mdepth *macro-expand-depth-limit*)
+                (not (member (symbol-name e) var-names :test #'string=))
+                (assoc e *symbol-macros* :test #'eq))
+           (push (cons (cdr (assoc e *symbol-macros* :test #'eq)) (cons in-lambda (1+ mdepth))) worklist))
           ((and (symbolp e) in-lambda)
            (when (member (symbol-name e) var-names :test #'string=)
              (setf (gethash (symbol-name e) result-ht) t)))
@@ -672,9 +691,7 @@
                            (mparams (cadr def))
                            (mbody (cddr def)))
                       (setf (gethash mname *macros*)
-                            (eval `(lambda (form)
-                                     (destructuring-bind ,mparams (cdr form)
-                                       ,@mbody))))))
+                            (eval (%macrolet-expander-form mparams mbody)))))
                   ;; Push body forms (LIFO: processed BEFORE restore sentinels)
                   (dolist (form mlbody)
                     (push (cons form (cons in-lambda mdepth)) worklist))))

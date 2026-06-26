@@ -56,3 +56,43 @@
         (setq saved *sv-a*)))
     saved)
   55)
+
+;;; &aux + body (declare (special x)) — body x reads the dynamic value,
+;;; not the lexically-shadowed captured value. Mirrors ANSI DEFUN.5.
+(deftest aux-body-special-free
+  (let ((x 1)) (declare (special x))
+    (let ((x 2) (w 5))
+      (defun aux-bsf (&aux (q w)) (declare (special x)) (values q x))
+      (multiple-value-list (aux-bsf))))
+  (5 1))
+
+;;; &aux with a special PARAM declared in the body still binds dynamically.
+(deftest aux-body-special-param
+  (progn
+    (defun aux-bsp (x &aux (y 10)) (declare (special x)) (+ x y))
+    (aux-bsp 5))
+  15)
+
+;;; &aux without specials: chained aux defaults still see earlier aux vars.
+(deftest aux-chained-defaults
+  (progn
+    (defun aux-chain (n &aux (b (* n 2)) (c (+ b 1))) (list n b c))
+    (aux-chain 3))
+  (3 6 7))
+
+;;; ANSI DEFUN.5 exactly: &aux init reads the LEXICAL x (=2), body declare
+;;; (special x) makes the body x read the dynamic value (=1).
+(deftest aux-init-lexical-body-special
+  (let ((x 1)) (declare (special x))
+    (let ((x 2))
+      (defun aux-ilbs (&aux (y x)) (declare (special x)) (values y x))
+      (multiple-value-list (aux-ilbs))))
+  (2 1))
+
+;;; let* free special: init form reads lexical, body declare reads dynamic.
+(deftest letstar-free-special-init
+  (let ((x 1)) (declare (special x))
+    (let ((x 2))
+      (defun lfsi () (let* ((y x)) (declare (special x)) (values y x)))
+      (multiple-value-list (lfsi))))
+  (2 1))

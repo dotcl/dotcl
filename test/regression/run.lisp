@@ -22,6 +22,8 @@
 (load "test/regression/dotnet-direct-dispatch.lisp")
 (load "test/regression/dotnet-typed-inference.lisp")
 (load "test/regression/static-generic.lisp")
+(load "test/regression/dotnet-await.lisp")
+(load "test/regression/async.lisp")
 (load "test/regression/native-int-arith.lisp")
 (load "test/regression/process.lisp")
 (load "test/regression/project-core-concat.lisp")

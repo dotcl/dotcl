@@ -122,6 +122,18 @@ public static partial class Runtime
         => inst.Class.ClassPrecedenceList?.Any(
                c => c.Name?.Name == "FUNDAMENTAL-CHARACTER-INPUT-STREAM") == true;
 
+    /// <summary>Check if a LispInstance is a Gray binary input stream (subclass of fundamental-binary-input-stream).
+    /// read-byte/read-sequence dispatch to the stream-read-byte generic on these.</summary>
+    internal static bool IsGrayBinaryInputStream(LispInstance inst)
+        => inst.Class.ClassPrecedenceList?.Any(
+               c => c.Name?.Name == "FUNDAMENTAL-BINARY-INPUT-STREAM") == true;
+
+    /// <summary>Check if a LispInstance is a Gray binary output stream (subclass of fundamental-binary-output-stream).
+    /// write-byte/write-sequence dispatch to the stream-write-byte generic on these.</summary>
+    internal static bool IsGrayBinaryOutputStream(LispInstance inst)
+        => inst.Class.ClassPrecedenceList?.Any(
+               c => c.Name?.Name == "FUNDAMENTAL-BINARY-OUTPUT-STREAM") == true;
+
     /// <summary>Resolve a stream designator to the outermost LispEchoStream, if any, following synonym streams.</summary>
     private static LispEchoStream? FindEchoStream(LispObject streamObj)
     {
@@ -474,6 +486,7 @@ public static partial class Runtime
                         RegisterUserAsdSearchPaths();
                         PatchUiopWindowsPath();
                         RegisterContribWithAsdf(searchDirs.ToArray());
+                        InstallAsdfModuleProvider();
                     }
                     return T.Instance;
                 }
@@ -611,6 +624,32 @@ public static partial class Runtime
                 catch { /* ignore if ASDF symbols not yet available */ }
             }
         }
+    }
+
+    /// <summary>
+    /// After ASDF loads, push its module provider onto CL:*MODULE-PROVIDER-FUNCTIONS*
+    /// so that (require "some-asdf-system") falls back to ASDF — the way SBCL wires
+    /// asdf:module-provide-asdf into sb-ext:*module-provider-functions* (asdf's
+    /// footer.lisp does this only for known implementations; dotcl is not in that
+    /// feature list, and dotcl's hook lives in CL, not sb-ext, so the integration
+    /// never happened). asdf:module-provide-asdf returns T after loading the
+    /// matching system and NIL when no such system exists, exactly the
+    /// *module-provider-functions* contract REQUIRE expects.
+    /// </summary>
+    private static void InstallAsdfModuleProvider()
+    {
+        const string form = @"
+(let ((p (find-symbol ""MODULE-PROVIDE-ASDF"" ""ASDF""))
+      (v (find-symbol ""*MODULE-PROVIDER-FUNCTIONS*"" ""CL"")))
+  (when (and p (fboundp p) v (boundp v))
+    (set v (adjoin p (symbol-value v)))))";
+        try
+        {
+            var read = MultipleValues.Primary(
+                Runtime.ReadFromString(new LispObject[] { new LispString(form) }));
+            Runtime.Eval(read);
+        }
+        catch { /* ignore if ASDF symbols not yet available */ }
     }
 
     // --- Load ---
@@ -1085,27 +1124,27 @@ public static partial class Runtime
         if (c.Cdr is not Cons rest || rest.Car is not Cons situations)
             return false;
 
-        bool hasExec = false;
         for (var sit = situations; sit != null && sit is Cons sc; sit = sc.Cdr as Cons)
         {
             if (sc.Car is Symbol s)
             {
                 if (s.Name == "COMPILE-TOPLEVEL") hasCompileToplevel = true;
                 else if (s.Name == "LOAD-TOPLEVEL") hasLoadToplevel = true;
-                else if (s.Name == "EXECUTE") hasExec = true;
+                // :EXECUTE is irrelevant at top level in compile-file (Figure 3-7).
             }
         }
 
-        // Per CLHS 3.2.3.1, in compile-file context :execute is irrelevant;
-        // behavior is determined solely by :compile-toplevel and :load-toplevel.
-        // When :execute is also present, the body still needs compile-time
-        // evaluation (if :compile-toplevel) and FASL inclusion (if :load-toplevel).
+        // Per CLHS 3.2.3.1 (Figure 3-7), at top level in compile-file the
+        // behavior is determined solely by :compile-toplevel (eval now) and
+        // :load-toplevel (place in fasl). :execute is irrelevant here and does
+        // NOT promote the body into the fasl — e.g. {:compile-toplevel :execute}
+        // is evaluated at compile time and discarded, NOT written to the fasl
+        // (promoting it on :execute leaked the body into the load image).
+        // A bare {:execute} (no ct/lt) is handled by the Lisp compile-eval-when
+        // (returns here false) and discarded.
         if (hasCompileToplevel || hasLoadToplevel)
         {
             body = rest.Cdr ?? Nil.Instance;
-            // When :execute is present, also include in FASL (same as :load-toplevel)
-            if (hasExec && !hasLoadToplevel)
-                hasLoadToplevel = true;
             return true;
         }
         return false;
@@ -3186,6 +3225,77 @@ public static partial class Runtime
         else
             _documentationStore[key] = newValue;
         return newValue;
+    }
+
+    // --- Finalizers -------------------------------------------------
+    //
+    // CL/trivial-garbage finalizers: register a thunk to run "at some point after"
+    // an object is GC'd. Running arbitrary Lisp from the .NET finalizer thread is
+    // unsafe (Eval serializes on _evalLock and reads per-thread DynamicBindings),
+    // so the .NET finalizer only ENQUEUES the thunk; a normal thread drains the
+    // queue via RunFinalizers (called by dotcl:gc and dotcl:run-finalizers). CL
+    // does not specify when finalizers run, so deferred draining is conforming.
+
+    // Holds the finalizer thunk(s) for one object. When the object becomes
+    // unreachable this object does too (it is only reachable via the
+    // ConditionalWeakTable keyed on the object), so its .NET finalizer fires and
+    // enqueues the pending thunks. Cancellation clears the list so a fired
+    // finalizer enqueues nothing.
+    private sealed class Finalizable
+    {
+        public readonly List<LispObject> Thunks = new();
+        ~Finalizable()
+        {
+            lock (Thunks)
+            {
+                foreach (var fn in Thunks)
+                    _finalizerQueue.Enqueue(fn);
+            }
+        }
+    }
+
+    // object -> its Finalizable holder. CWT keeps the holder alive exactly as
+    // long as the key object is alive, and does NOT strong-root the key.
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<LispObject, Finalizable>
+        _finalizers = new();
+    private static readonly System.Collections.Concurrent.ConcurrentQueue<LispObject>
+        _finalizerQueue = new();
+
+    /// <summary>(finalize object function) — run FUNCTION (a thunk) some time
+    /// after OBJECT is garbage-collected. Returns OBJECT.</summary>
+    public static LispObject Finalize(LispObject obj, LispObject function)
+    {
+        var holder = _finalizers.GetOrCreateValue(obj);
+        lock (holder.Thunks) holder.Thunks.Add(function);
+        return obj;
+    }
+
+    /// <summary>(cancel-finalization object) — remove OBJECT's finalizers.
+    /// Returns T if any were registered.</summary>
+    public static LispObject CancelFinalization(LispObject obj)
+    {
+        if (_finalizers.TryGetValue(obj, out var holder))
+        {
+            lock (holder.Thunks) holder.Thunks.Clear();
+            _finalizers.Remove(obj);
+            return T.Instance;
+        }
+        return Nil.Instance;
+    }
+
+    /// <summary>Run all queued finalizer thunks on the current (normal) thread.
+    /// Returns the number run. Safe to call from Lisp; each thunk runs under the
+    /// usual Eval serialization. A thunk that errors is swallowed (a finalizer
+    /// must not abort the others, mirroring SBCL).</summary>
+    public static int RunFinalizers()
+    {
+        int n = 0;
+        while (_finalizerQueue.TryDequeue(out var fn))
+        {
+            try { Funcall(fn); } catch { /* finalizer errors are ignored */ }
+            n++;
+        }
+        return n;
     }
 
     internal static void RegisterMiscBuiltins()

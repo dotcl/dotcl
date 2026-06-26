@@ -38,6 +38,21 @@ public static class DotclHost
     /// </summary>
     public static string? FindCore()
     {
+#if NET5_0_OR_GREATER
+        // Android: the core ships as an APK AndroidAsset (assets/dotcl/dotcl.core,
+        // see build/DotCL.Runtime.targets). APK assets are not real filesystem
+        // paths, so AppContext.BaseDirectory/dotcl.core does not exist.
+        // Extract the asset tree to a writable dir and return the extracted path.
+        // (Guarded to NET5+: OperatingSystem.IsAndroid is absent on netstandard2.0,
+        // which is the emit-free desktop runtime and never runs on Android.)
+        if (OperatingSystem.IsAndroid())
+        {
+            var extracted = TryExtractAndroidCore();
+            if (extracted != null) return extracted;
+            // fall through to the file probes below (dev/unusual layouts)
+        }
+#endif
+
         var baseDir = AppContext.BaseDirectory;
         var candidates = new[]
         {
@@ -48,6 +63,74 @@ public static class DotclHost
         return candidates.Select(System.IO.Path.GetFullPath)
             .FirstOrDefault(System.IO.File.Exists);
     }
+
+#if NET5_0_OR_GREATER
+    /// <summary>
+    /// Extract the bundled dotcl asset tree (dotcl.core + contrib/**) from the
+    /// Android APK's asset manager into a writable cache dir, returning the path
+    /// to the extracted dotcl.core (or null if not on Android / asset missing).
+    ///
+    /// Uses reflection on Android.App.Application so this file compiles on the
+    /// plain net10.0 TFM (DotCL.Runtime does not target net10.0-android): the
+    /// Mono.Android assembly is present at runtime on Android, absent elsewhere.
+    /// The contrib tree is extracted alongside so (require :dotnet-class) etc.
+    /// resolve from the extracted dir (which the host should add as a contrib
+    /// search path, or which sits next to dotcl.core).
+    /// </summary>
+    private static string? TryExtractAndroidCore()
+    {
+        try
+        {
+            // Android.App.Application.Context  (static)
+            var appType = Type.GetType("Android.App.Application, Mono.Android");
+            var context = appType?.GetProperty("Context",
+                BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
+            if (context == null) return null;
+
+            // context.Assets  -> AssetManager
+            var assets = context.GetType().GetProperty("Assets")?.GetValue(context);
+            if (assets == null) return null;
+
+            // context.CacheDir.AbsolutePath  -> writable dir
+            var cacheDir = context.GetType().GetProperty("CacheDir")?.GetValue(context);
+            var destRoot = cacheDir?.GetType().GetProperty("AbsolutePath")?.GetValue(cacheDir) as string;
+            if (string.IsNullOrEmpty(destRoot)) return null;
+            destRoot = System.IO.Path.Combine(destRoot, "dotcl");
+
+            var open = assets.GetType().GetMethod("Open", new[] { typeof(string) });
+            var list = assets.GetType().GetMethod("List", new[] { typeof(string) });
+            if (open == null || list == null) return null;
+
+            // Recursively extract the "dotcl" asset subtree.
+            ExtractAssetTree(assets, open, list, "dotcl", destRoot);
+
+            var corePath = System.IO.Path.Combine(destRoot, "dotcl.core");
+            return System.IO.File.Exists(corePath) ? corePath : null;
+        }
+        catch { return null; }   // any reflection/IO failure → fall back to file probes
+    }
+
+    private static void ExtractAssetTree(object assets,
+        System.Reflection.MethodInfo open, System.Reflection.MethodInfo list,
+        string assetPath, string destDir)
+    {
+        var children = (string[]?)list.Invoke(assets, new object[] { assetPath });
+        if (children == null || children.Length == 0)
+        {
+            // Leaf (a file): copy it. (AssetManager.List returns empty for files.)
+            System.IO.Directory.CreateDirectory(System.IO.Path.GetDirectoryName(destDir)!);
+            using var src = (System.IO.Stream)open.Invoke(assets, new object[] { assetPath })!;
+            using var dst = System.IO.File.Create(destDir);
+            src.CopyTo(dst);
+            return;
+        }
+        // Directory: recurse into each child.
+        System.IO.Directory.CreateDirectory(destDir);
+        foreach (var child in children)
+            ExtractAssetTree(assets, open, list,
+                assetPath + "/" + child, System.IO.Path.Combine(destDir, child));
+    }
+#endif
 
     /// <summary>
     /// Load and execute a compiled core. Accepts a FASL PE assembly
@@ -369,7 +452,37 @@ public static class DotclHost
         }
     }
 
-    public static void ResolveDeps(string asdPath, string? manifestOut, string? rootSourcesOut, string? targetRid = null, string[]? buildInit = null)
+    /// <summary>
+    /// Register each user-declared external system directory (the
+    /// &lt;DotclAsdSearchPath&gt; items) onto <c>asdf:*central-registry*</c> so the
+    /// project's <c>:depends-on</c> resolves systems that live outside the shipped
+    /// contrib — without dotcl auto-scanning the dev machine. This is the
+    /// declarative common case; &lt;DotclBuildInit&gt; remains the escape hatch for
+    /// anything a plain dir list can't express (booting quicklisp, etc.). Like
+    /// build-init, this runs at build time only and never in the shipped runtime.
+    /// Called after (require "asdf"), before the build-init scripts.
+    /// </summary>
+    private static void RegisterAsdSearchPaths(string[]? dirs)
+    {
+        if (dirs == null) return;
+        foreach (var d in dirs)
+        {
+            if (string.IsNullOrWhiteSpace(d)) continue;
+            // A directory arg whose value ends in "\" gets a trailing quote
+            // glued on by Windows command-line escaping (\" → literal "), since
+            // the MSBuild Exec passes %(FullPath) of a dir (…\extlib\) quoted.
+            // Strip the surrounding-quote artifact before resolving.
+            var t = d.Trim().Trim('"');
+            if (t.Length == 0) continue;
+            var abs = System.IO.Path.GetFullPath(t).Replace("\\", "/");
+            if (!abs.EndsWith("/")) abs += "/";
+            Runtime.Eval(MultipleValues.Primary(
+                Runtime.ReadFromString(new LispObject[] { new LispString(
+                    $"(pushnew #p\"{abs}\" asdf:*central-registry* :test #'equal)") })));
+        }
+    }
+
+    public static void ResolveDeps(string asdPath, string? manifestOut, string? rootSourcesOut, string? targetRid = null, string[]? buildInit = null, string[]? searchPaths = null)
     {
         var absAsd = System.IO.Path.GetFullPath(asdPath);
         if (!System.IO.File.Exists(absAsd))
@@ -380,13 +493,23 @@ public static class DotclHost
         Runtime.Eval(MultipleValues.Primary(
             Runtime.ReadFromString(new LispObject[] { new LispString("(require \"asdf\")") })));
 
-        // User build-init scripts (e.g. register external system dirs / boot QL).
+        // Declarative external system dirs (<DotclAsdSearchPath>), then the
+        // build-init scripts (escape hatch, can override / do more).
+        RegisterAsdSearchPaths(searchPaths);
         LoadBuildInitScripts(buildInit);
 
         var asdLisp = absAsd.Replace("\\", "/");
         var manifestForm = manifestOut == null
             ? "*standard-output*"
             : $"(open \"{manifestOut.Replace("\\", "/")}\" :direction :output :if-exists :supersede)";
+        // Progress lines ("[resolve-deps] compiling X...") go to stdout in the
+        // MSBuild path (manifest written to a file, so stdout is free), where
+        // <Exec> shows them as ordinary build messages. PowerShell 5.1 wraps any
+        // native-process *stderr* as a red NativeCommandError, so emitting
+        // progress on stderr made a successful build look broken. When the
+        // manifest itself goes to stdout (manifestOut == null), keep progress on
+        // stderr to avoid corrupting the manifest stream.
+        var progressStream = manifestOut == null ? "*error-output*" : "*standard-output*";
         var rootSourcesForm = rootSourcesOut == null
             ? "nil"
             : $"(open \"{rootSourcesOut.Replace("\\", "/")}\" :direction :output :if-exists :supersede)";
@@ -415,7 +538,7 @@ public static class DotclHost
                  (return-from ensure-fasl r2r-fasl))
                (unless (probe-file fasl)
                  (when (asdf:component-children sys)
-                   (format *error-output*
+                   (format {progressStream}
                            ""[resolve-deps] compiling ~A...~%"" name)
                    (asdf:operate 'asdf::concatenate-source-op sys)
                    (let ((concat (first
@@ -454,7 +577,7 @@ public static class DotclHost
     /// <paramref name="outputPath"/>. Only the root system is compiled;
     /// dependencies stay as pre-built fasls resolved by <see cref="ResolveDeps"/>.
     /// </summary>
-    public static void CompileProject(string asdPath, string outputPath, string[]? buildInit = null)
+    public static void CompileProject(string asdPath, string outputPath, string[]? buildInit = null, string[]? searchPaths = null)
     {
         var absAsd = System.IO.Path.GetFullPath(asdPath);
         if (!System.IO.File.Exists(absAsd))
@@ -467,7 +590,9 @@ public static class DotclHost
         Runtime.Eval(MultipleValues.Primary(
             Runtime.ReadFromString(new LispObject[] { new LispString("(require \"asdf\")") })));
 
-        // User build-init scripts (e.g. register external system dirs / boot QL).
+        // Declarative external system dirs (<DotclAsdSearchPath>), then the
+        // build-init scripts (escape hatch, can override / do more).
+        RegisterAsdSearchPaths(searchPaths);
         LoadBuildInitScripts(buildInit);
 
         var asdLisp = absAsd.Replace("\\", "/");
@@ -482,6 +607,28 @@ public static class DotclHost
                  (pathname-name (pathname ""{asdLisp}""))))
          (sources (mapcar #'asdf:component-pathname
                           (asdf:component-children root))))
+    ;; Load the resolved :depends-on fasls into the image BEFORE compiling the
+    ;; root, so the deps' defpackage/macros are available at the root's compile
+    ;; time — same as a standard ASDF load-op-then-compile. Without this the
+    ;; root must itself (require :dep), because the concatenated unit holds only
+    ;; the root's own sources. The dep fasls are the
+    ;; ones resolve-deps built at <component-dir>/<name>.fasl, in topo order.
+    (let ((seen '()) (order '()))
+      (labels ((walk (sys)
+                 (unless (member sys seen :test #'eq)
+                   (push sys seen)
+                   (dolist (d (asdf:system-depends-on sys))
+                     (let ((ds (ignore-errors (asdf:find-system d))))
+                       (when ds (walk ds))))
+                   (push sys order))))
+        (walk root))
+      (dolist (sys (remove root (nreverse order)))
+        (when (asdf:component-children sys)
+          (let* ((src  (asdf:component-pathname sys))
+                 (dir  (directory-namestring src))
+                 (name (asdf:component-name sys))
+                 (fasl (concatenate 'string dir name "".fasl"")))
+            (when (probe-file fasl) (load fasl))))))
     (asdf::concatenate-files sources ""{concatLisp}"")
     ;; compile-file-concatenated binds *concatenate-build* (cross-compiled,
     ;; so the binding shares symbol identity with the compiler's read) so the

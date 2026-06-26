@@ -865,7 +865,13 @@
                    ,@uninterned-fixup
                    ,@(if (symbolp name)
                          (compile-sym-lookup name)
-                         `((:ldstr ,mangled) (:call "Startup.Sym")))))))
+                         ;; A non-symbol function name — e.g. (SETF foo) — is
+                         ;; returned by DEFUN as the name itself (the list
+                         ;; (SETF foo)), NOT a symbol interned from its mangled
+                         ;; string. Emitting the mangled symbol broke e.g.
+                         ;; (multiple-value-list (eval `(defun (setf ,g) ...)))
+                         ;; (ANSI DEFINE-COMPILER-MACRO.4).
+                         (compile-quoted name))))))
             ;; Standard defmethod
             (t
               `((:defmethod ,(mangle-name name)
@@ -875,7 +881,7 @@
                 ,@uninterned-fixup
                 ,@(if (symbolp name)
                       (compile-sym-lookup name)
-                      `((:ldstr ,(mangle-name name)) (:call "Startup.Sym")))))))))))
+                      (compile-quoted name))))))))))
 
 (defun compile-defmacro (name lambda-list body)
   "Compile (defmacro name lambda-list body...).
@@ -1040,38 +1046,55 @@
                                 :test #'string=))
                (try-eval form)))))))
     ;; Emit CIL for runtime/load.
-    ;; Per CLHS 3.2.3.1:
-    ;; - Cross-compiling or compile-file at top level: :load-toplevel/:execute → emit CIL
-    ;; - Load/eval (not cross-compiling, not compile-file): only :execute → emit CIL
-    ;; - Not at top level: only :execute → emit body as implicit progn
-    (if (if (or *cross-compiling* *compile-file-mode*)
-            (if *at-toplevel*
-                (or lt-p ex-p)
-                ex-p)
-            ex-p)
+    ;; Per CLHS 3.2.3.1 (Figure 3-7):
+    ;; - compile-file at top level: emit for load iff :load-toplevel is present.
+    ;;   A bare {:execute} eval-when at top level of a compiled file is DISCARDED
+    ;;   (its body is neither evaluated at compile time nor placed in the fasl),
+    ;;   so emitting on ex-p here was wrong (leaked :execute-only bodies into the
+    ;;   fasl load code — see EVAL-WHEN.1).
+    ;; - Cross-compiling (dotcl bootstrap convention): :load-toplevel OR :execute
+    ;;   at top level → emit CIL. The core build relies on this; keep it.
+    ;; - Load/eval (not cross-compiling, not compile-file): only :execute → emit CIL.
+    ;; - Not at top level: only :execute → emit body as implicit progn.
+    (if (cond
+          (*cross-compiling*
+           (if *at-toplevel* (or lt-p ex-p) ex-p))
+          (*compile-file-mode*
+           (if *at-toplevel* lt-p ex-p))
+          (t ex-p))
         (compile-progn body)
         (emit-nil))))
+
+(defun unwrap-body-wrappers (body)
+  "Peel nested single-form (block name ...) and (let* bindings ...) wrappers to
+   reach the leading declarations. &aux + a defun block produce
+   (block name (let* aux ...)), so both levels must be unwrapped."
+  (loop while (and (= (length body) 1)
+                   (consp (car body))
+                   (member (caar body) '(block let*)))
+        do (setf body (cddar body)))
+  body)
 
 (defun fn-body-special-params (body all-param-names)
   "Find function parameters declared special in the function body.
    Handles body possibly wrapped in (block name ...).
    ALL-PARAM-NAMES is a list of symbol-name strings."
-  ;; Unwrap optional (block name ...) or (let* bindings ...) wrapper to find leading declares
-  (let ((inner-forms
-          (cond ((and (= (length body) 1)
-                      (consp (car body))
-                      (eq (caar body) 'block))
-                 (cddar body))
-                ((and (= (length body) 1)
-                      (consp (car body))
-                      (eq (caar body) 'let*))
-                 (cddar body))  ;; skip let* and bindings: (cdr (cdr (car body)))
-                (t body))))
+  (let ((inner-forms (unwrap-body-wrappers body)))
     (multiple-value-bind (specials _rest) (extract-specials inner-forms)
       (declare (ignore _rest))
       (remove-if-not (lambda (s)
                        (member (symbol-name s) all-param-names :test #'string=))
                      specials))))
+
+(defun special-param-name-set (body all-params)
+  "Names (strings) of ALL-PARAMS that are special — either declared special in
+   BODY or globally proclaimed (defvar/defparameter/proclaim/defmvar).
+   Special variables are accessed through the dynamic-binding stack, never
+   through a lexical box, so they must be excluded from capture-driven boxing
+   (a boxed special would store the LispObject[] box where a value is expected)."
+  (mapcar #'symbol-name
+          (union (fn-body-special-params body (mapcar #'symbol-name all-params))
+                 (remove-if-not #'global-special-p all-params))))
 
 (defun compile-function-body (params body &optional (fn-name ""))
   "Compile a function body. Params are bound from args array (arg 0).
@@ -1138,10 +1161,14 @@
            (*block-tags* '())
            (*go-tags* '())
            (*local-functions* '())
+           ;; NOTINLINE in this body disables matching compiler macros (CLHS 3.2.2.1.1).
+           (*notinline-functions* (extract-notinline body))
            (local-keys (mapcar (lambda (p) (cons p (gen-local (symbol-name p)))) all-params))
            (mutated (find-mutated-vars body))
            (captured (find-captured-vars body (mapcar #'symbol-name all-params)))
-           (needs-boxing (intersection mutated captured :test #'string=))
+           (needs-boxing (set-difference
+                          (intersection mutated captured :test #'string=)
+                          (special-param-name-set body all-params) :test #'string=))
            ;; Pre-check native eligibility: all fixnum params, fixnum return, no captures
            ;; Full check (including no specials) happens after special-param-syms is computed,
            ;; but we need this early for param-instrs type selection.
@@ -1329,11 +1356,27 @@
                       (:ret))))
                self-arg0-p))))))))
 
+(defun wrap-aux-body (aux body)
+  "Wrap BODY in (let* AUX ...) for &aux parameters. If BODY is a single
+   (block name . forms), push the let* INSIDE the block so leading
+   (declare (special x)) stays directly in the let* body — otherwise it gets
+   buried under the block and compile-let* can't see it, so a body-level
+   special declaration for a captured free var is lost."
+  (if (null aux)
+      body
+      (if (and (= (length body) 1)
+               (consp (car body))
+               (eq (caar body) 'block))
+          (let ((block-name (cadar body))
+                (block-forms (cddar body)))
+            `((block ,block-name (let* ,aux ,@block-forms))))
+          `((let* ,aux ,@body)))))
+
 (defun compile-function-body-inner (params body args-arg-idx &optional (fn-name ""))
   "Compile function body, loading args from (:ldarg ARGS-ARG-IDX).
    For normal functions args-arg-idx=0, for closures args-arg-idx=1."
   (multiple-value-bind (required optional key rest-param aux allow-other-keys-p has-key-p) (parse-lambda-list params)
-    (let ((body (if aux `((let* ,aux ,@body)) body)))
+    (let ((body (wrap-aux-body aux body)))
     (let* ((key-supplied-p-vars (remove nil (mapcar #'fourth key)))
            (opt-supplied-p-vars (remove nil (mapcar #'third optional)))
            (all-params (append required
@@ -1347,6 +1390,9 @@
            (*block-tags* '())
            (*go-tags* '())
            (*local-functions* '())
+           ;; NOTINLINE in this body disables matching compiler macros for calls
+           ;; within it (CLHS 3.2.2.1.1). Fresh function scope → this body only.
+           (*notinline-functions* (extract-notinline body))
            ;; Reset TCO state: inner function bodies must not inherit outer TCO context
            (*tco-self-name* nil)
            (*tco-loop-label* nil)
@@ -1364,7 +1410,10 @@
            ;; Pre-scan for mutable captures
            (mutated (find-mutated-vars body))
            (captured (find-captured-vars body (mapcar #'symbol-name all-params)))
-           (needs-boxing (intersection mutated captured :test #'string=))
+           ;; Special params are bound on the dynamic stack, not in a box.
+           (needs-boxing (set-difference
+                          (intersection mutated captured :test #'string=)
+                          (special-param-name-set body all-params) :test #'string=))
            (n-required (length required))
            (key-start (+ n-required (length optional))))
       (let ((*locals* local-keys)
@@ -2302,13 +2351,16 @@
 
 (defun find-free-vars-with-defaults (params body)
   "Find free variables in body AND in &optional/&key default forms."
-  (multiple-value-bind (required optional key rest-param) (parse-lambda-list params)
+  (multiple-value-bind (required optional key rest-param aux) (parse-lambda-list params)
     (declare (ignore rest-param))
     (let* ((all-params (append required
                                (mapcar #'car optional)
                                (remove nil (mapcar #'third optional))
                                (mapcar #'second key)
-                               (remove nil (mapcar #'fourth key))))
+                               (remove nil (mapcar #'fourth key))
+                               ;; &aux vars are bound in the function body scope,
+                               ;; so body references to them are not free (D-fix).
+                               (mapcar (lambda (a) (if (consp a) (car a) a)) aux)))
            (bound-names (mapcar #'symbol-name all-params))
            (free-ht (make-hash-table :test #'equal)))
       ;; Scan body
@@ -2324,7 +2376,8 @@
   "Compile (lambda (params) body...). FN-NAME enables self-TCO when non-empty."
   (multiple-value-bind (required optional key rest-param) (parse-lambda-list params)
     (declare (ignore optional key))
-    (let ((free-vars (find-free-vars-with-defaults params body)))
+    (let ((free-vars (remove-if #'global-special-name-p
+                                (find-free-vars-with-defaults params body))))
       (if (null free-vars)
           ;; No captures — :make-function or :make-function-direct
           (if (simple-required-only-p params)
@@ -2414,7 +2467,7 @@
    OUTER-BOXED-FVS is a list of free var name strings that were boxed in the outer scope.
    Handles &rest/&optional/&key parameters."
   (multiple-value-bind (required optional key rest-param aux allow-other-keys-p has-key-p) (parse-lambda-list params)
-    (let ((body (if aux `((let* ,aux ,@body)) body)))
+    (let ((body (wrap-aux-body aux body)))
     (let* ((all-params (append required
                                (mapcar #'car optional)
                                (remove nil (mapcar #'third optional))
@@ -2432,6 +2485,8 @@
            (*block-tags* '())
            (*go-tags* '())
            (*local-functions* '())
+           ;; NOTINLINE in this body disables matching compiler macros (CLHS 3.2.2.1.1).
+           (*notinline-functions* (extract-notinline body))
            ;; Reset TCO state so inner closures don't inherit outer TCO context.
            ;; *self-fn-local* especially must be cleared — it refers to a local
            ;; declared in the OUTER method.
@@ -2754,6 +2809,10 @@
                  ;; These must be removed from *locals* so body references use
                  ;; DynamicBindings.Get instead of the closure-captured lexical value.
                  ;; Unwrap optional (block name ...) wrapper to find leading declares.
+                 ;; Do NOT unwrap let*: a special declared inside an &aux-introduced
+                 ;; (let* aux ...) only governs the let* BODY, not its init forms, and
+                 ;; compile-let* already handles that scoping. Removing it here
+                 ;; would wrongly make the aux init forms read the dynamic value.
                  (body-inner-forms
                    (if (and (= (length body) 1)
                             (consp (car body))
@@ -3232,11 +3291,7 @@
                                  (mbody (cddr def))
                                  (old (gethash name *macros*))
                                  (expander-fn
-                                  (%mini-eval
-                                   `(lambda (form)
-                                      (destructuring-bind ,params (cdr form)
-                                        ,@mbody))
-                                   env)))
+                                  (%mini-eval (%macrolet-expander-form params mbody) env)))
                             (push (cons name old) saved-macros)
                             (setf (gethash name *macros*) expander-fn)))
                         (%mini-eval-progn (cddr form) env))
@@ -3444,53 +3499,13 @@
              (mbody (cddr def))
              (old-entry (gethash name *macros*)))
         (push (cons name old-entry) saved)
-        ;; Build a macro expander lambda and eval it.
-        ;; If lambda list starts with &whole var, bind var to the whole form,
-        ;; then destructure the rest against (cdr form) per CL macro lambda list rules.
-        (let* ((whole-var (when (and (consp params) (eq (car params) '&whole))
-                            (cadr params)))
-               (rest-params (if whole-var (cddr params) params)))
-          ;; Strip &environment from rest-params (handle separately)
-          (let* ((env-var nil)
-                 (clean-params
-                  (let ((result '()) (p rest-params))
-                    (loop
-                      (when (null p) (return))
-                      (cond
-                        ((eq (car p) '&environment)
-                         (setq env-var (cadr p))
-                         (setq p (cddr p)))
-                        (t (push (car p) result) (setq p (cdr p)))))
-                    (nreverse result))))
-            (let* ((expander-form
-                    (cond
-                      ((and whole-var (consp whole-var))
-                       ;; &whole (pattern) — destructure whole form
-                       `(lambda (form)
-                          ,(if env-var `(declare (ignore ,env-var)) '(progn))
-                          (destructuring-bind ,whole-var form
-                            (destructuring-bind ,clean-params (cdr form)
-                              ,@mbody))))
-                      (whole-var
-                       ;; &whole var — bind var to entire form
-                       `(lambda (form)
-                          (let ((,whole-var form))
-                            (destructuring-bind ,clean-params (cdr form)
-                              ,@mbody))))
-                      (env-var
-                       ;; &environment but no &whole
-                       ;; Build env as cons: (macros-ht . symbol-macros-alist)
-                       `(lambda (form)
-                          (let ((,env-var (cons *macros*
-                                               (let ((ht (make-hash-table :test #'equal)))
-                                                 (dolist (entry *symbol-macros* ht)
-                                                   (setf (gethash (symbol-name (car entry)) ht) (cdr entry)))))))
-                            (destructuring-bind ,clean-params (cdr form)
-                              ,@mbody))))
-                      (t
-                       `(lambda (form)
-                          (destructuring-bind ,clean-params (cdr form)
-                            ,@mbody)))))
+        ;; Build a macro expander lambda and eval it. &whole / &environment are
+        ;; handled by the shared %macrolet-expander-form (same builder the
+        ;; %mini-eval MACROLET case uses) so the compiled and interpreted paths
+        ;; never diverge.
+        (progn
+          (progn
+            (let* ((expander-form (%macrolet-expander-form params mbody))
                    ;; Wrap with surrounding flet so macrolet body can call
                    ;; enclosing locally-defined functions at expansion time.
                    ;; Use %mini-eval instead of eval: no Reflection.Emit needed.
@@ -4325,8 +4340,8 @@
       ;; so they are not mistakenly caught as errors.
       (:ldloc ,dotnet-ex-key) (:call "Runtime.IsLispControlFlowException")
       (:brtrue ,dn-rethrow-label)  ;; brtrue within catch to rethrow path
-      (:ldloc ,dotnet-ex-key) (:callvirt "System.Exception.get_Message")
-      (:call "Runtime.WrapDotNetException")
+      (:ldloc ,dotnet-ex-key)
+      (:call "Runtime.WrapDotNetExceptionObj")
       (:stloc ,cond-key)
       ,@(loop for (type-name var handler-body) in parsed
               for label in clause-labels
@@ -4797,8 +4812,12 @@
          `((:declare-local ,result-key "LispObject")
            ,@(loop for (arg . rest) on args
                    if rest
-                     ;; Intermediate arg: normalize to primary value for IsTruthy check
-                     append `(,@(compile-expr arg)
+                     ;; Intermediate arg: NOT in tail position — its value is
+                     ;; consumed by the IsTruthy test, not returned. Binding
+                     ;; *in-tail-position* nil prevents a self-call here from
+                     ;; being TCO-rewritten into a value-discarding loop-back
+                     ;; (symmetric with compile-or).
+                     append `(,@(let ((*in-tail-position* nil)) (compile-expr arg))
                               (:call "MultipleValues.Primary")
                               (:stloc ,result-key)
                               (:ldloc ,result-key)
@@ -4821,15 +4840,22 @@
          `((:declare-local ,result-key "LispObject")
            ,@(loop for (arg . rest) on args
                    if rest
-                     ;; Intermediate arg: normalize to primary value for IsTruthy check
-                     append `(,@(compile-expr arg)
+                     ;; Intermediate arg: NOT in tail position — its value is
+                     ;; consumed by the IsTruthy test, not returned. Binding
+                     ;; *in-tail-position* nil prevents a self-call here from
+                     ;; being TCO-rewritten into a value-discarding loop-back,
+                     ;; which made e.g. (or (f (car x)) (f (cdr x))) return the
+                     ;; wrong value on deep inputs. The last arg
+                     ;; below keeps tail position so genuine tail self-calls
+                     ;; still TCO.
+                     append `(,@(let ((*in-tail-position* nil)) (compile-expr arg))
                               (:call "MultipleValues.Primary")
                               (:stloc ,result-key)
                               (:ldloc ,result-key)
                               (:call "Runtime.IsTruthy")
                               (:brtrue ,end-label))
                    else
-                     ;; Last arg: pass through all values
+                     ;; Last arg: pass through all values (tail position kept)
                      append `(,@(compile-expr arg)
                               (:stloc ,result-key)))
            (:label ,end-label)
@@ -4876,8 +4902,11 @@
                          ,@(compile-cond (cdr clauses) shared-tmp)
                          (:label ,end-label)))
                       (t
-                        ;; Default: normalize MV state, then IsTruthy
-                        `(,@(compile-expr test)
+                        ;; Default: normalize MV state, then IsTruthy.
+                        ;; The test is never in tail position (only the body is);
+                        ;; binding *in-tail-position* nil prevents a self-recursive
+                        ;; call in the test from being TCO'd into a jump.
+                        `(,@(let ((*in-tail-position* nil)) (compile-expr test))
                           (:call "MultipleValues.Primary")
                           (:call "Runtime.IsTruthy")
                           (:brfalse ,else-label)
@@ -4888,8 +4917,11 @@
                           (:label ,end-label))))
                     ;; No body: all no-body arms share one CTMP slot
                     (let ((tmp (or shared-tmp (gen-local "CTMP"))))
+                      ;; Test-only arm: the test value becomes the result, but the
+                      ;; test itself is not in tail position — a self-recursive call
+                      ;; here must compute a value, not TCO-jump.
                       `(,@(unless shared-tmp `((:declare-local ,tmp "LispObject")))
-                        ,@(compile-expr test)
+                        ,@(let ((*in-tail-position* nil)) (compile-expr test))
                         (:call "MultipleValues.Primary")
                         (:stloc ,tmp)
                         (:ldloc ,tmp)
@@ -5094,7 +5126,10 @@
   ;; locally: preserves top-level-ness (uses *compile-was-toplevel*)
   (setf (gethash 'locally h)
         (lambda (expr)
-          (let ((*at-toplevel* *compile-was-toplevel*))
+          (let ((*at-toplevel* *compile-was-toplevel*)
+                ;; (locally (declare (notinline f)) ...) extends the notinline set
+                ;; for the body (CLHS 3.2.2.1.1).
+                (*notinline-functions* (append (extract-notinline (cdr expr)) *notinline-functions*)))
             (multiple-value-bind (declared-specials real-body) (extract-specials (cdr expr))
               (if (null declared-specials)
                   (compile-progn real-body)
@@ -5690,7 +5725,28 @@
         (lambda (expr)
           (let ((args (cdr expr)))
             (if (cddr args)
-                `(,@(compile-expr (car args)) ,@(compile-args-array (cdr args)) (:call "Runtime.MapcarN"))
+                ;; Multi-list MAPCAR. Evaluate the function into a temp FIRST so the
+                ;; stack is empty before compile-args-array compiles the list args.
+                ;; Leaving the function value on the stack while a list arg expands
+                ;; to code that opens a try-block (e.g. a LOOP ... COLLECT) violated
+                ;; CIL's "stack must be empty at try-block entry" rule and produced
+                ;; invalid IL ("CLR detected an invalid program").
+                (let ((fn-tmp (gen-local "MAPFN"))
+                      (arr-tmp (gen-local "MAPARR")))
+                  `((:declare-local ,fn-tmp "LispObject")
+                    ,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
+                        (compile-expr (car args)))
+                    (:stloc ,fn-tmp)
+                    ;; Build the list-args array with an empty operand stack
+                    ;; (compile-args-array already pre-evaluates each arg to a temp),
+                    ;; then stash it so neither the function value nor a partial array
+                    ;; sits on the stack while a LOOP arg opens its try-block.
+                    (:declare-local ,arr-tmp "LispObject[]")
+                    ,@(compile-args-array (cdr args))
+                    (:stloc ,arr-tmp)
+                    (:ldloc ,fn-tmp)
+                    (:ldloc ,arr-tmp)
+                    (:call "Runtime.MapcarN")))
                 (compile-binary-call args "Runtime.Mapcar")))))
 
   ;; Property list

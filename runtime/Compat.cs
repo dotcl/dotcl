@@ -338,6 +338,46 @@ internal static class Compat
     }
 #endif
 
+    // --- Path.IsPathFullyQualified (net5.0+) / File.Move(overwrite) (net core 3.0+).
+    //     Routers used unconditionally at the call sites. ---
+
+    /// <summary>Path.IsPathFullyQualified(path): true when the path is fixed to a
+    /// specific drive/root and cannot be reinterpreted against the current directory.</summary>
+    public static bool IsPathFullyQualified(string path)
+    {
+#if NETSTANDARD2_0
+        if (path == null) throw new ArgumentNullException(nameof(path));
+        if (!IsWindows())
+            return path.Length > 0 && path[0] == '/'; // Unix: fully qualified == rooted
+        // Windows: mirror the BCL reference implementation.
+        if (path.Length < 2) return false;
+        if (IsDirSep(path[0]))
+            return IsDirSep(path[1]); // "\\server" / "\\?\" device → qualified; "\foo" → not
+        return path.Length >= 3
+            && path[1] == ':'
+            && IsDirSep(path[2])
+            && char.IsLetter(path[0]); // "C:\..." → qualified; "C:foo" → drive-relative
+#else
+        return System.IO.Path.IsPathFullyQualified(path);
+#endif
+    }
+
+#if NETSTANDARD2_0
+    private static bool IsDirSep(char c)
+        => c == System.IO.Path.DirectorySeparatorChar || c == System.IO.Path.AltDirectorySeparatorChar;
+#endif
+
+    /// <summary>File.Move(src, dest, overwrite): the overwrite overload is net core 3.0+.</summary>
+    public static void MoveFile(string sourceFileName, string destFileName, bool overwrite)
+    {
+#if NETSTANDARD2_0
+        if (overwrite && System.IO.File.Exists(destFileName)) System.IO.File.Delete(destFileName);
+        System.IO.File.Move(sourceFileName, destFileName);
+#else
+        System.IO.File.Move(sourceFileName, destFileName, overwrite);
+#endif
+    }
+
     /// <summary>BigInteger(byte[], isUnsigned, isBigEndian) ctor (net5.0+).</summary>
     public static BigInteger MakeBigInteger(byte[] value, bool isUnsigned = false, bool isBigEndian = false)
     {

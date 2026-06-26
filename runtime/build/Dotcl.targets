@@ -14,6 +14,27 @@
   `dotnet run` against that csproj. When unset, the global tool
   $(DotclTool) (default "dotcl") is used.
 
+  External ASDF systems: dotcl does NOT auto-scan ~/quicklisp, so a build
+  that depends on systems outside the shipped contrib makes them
+  discoverable itself. The declarative way is to list their directories:
+
+      <ItemGroup>
+        <DotclAsdSearchPath Include="../path/to/anaphora-20220220-git/" />
+      </ItemGroup>
+
+  Each dir is pushed onto asdf:*central-registry* (after asdf, before dep
+  resolution) so :depends-on resolves it; the system is compiled to a fasl
+  and bundled. For anything a plain dir list can't express (booting
+  quicklisp, computed paths, …), DotclBuildInit runs a Lisp script instead,
+  e.g. a setup.lisp that does (pushnew … asdf:*central-registry*):
+
+      <ItemGroup>
+        <DotclBuildInit Include="setup.lisp" />
+      </ItemGroup>
+
+  Both run at build time only, never in the shipped runtime, so the
+  deployed app never depends on the dev machine's paths.
+
   Pipeline (each step is an MSBuild target with proper Inputs/Outputs):
 
     1. DotclResolveDeps
@@ -70,6 +91,17 @@
       <_DotclCmdPrefix Condition="'$(DotclTool)' != ''">&quot;$(DotclTool)&quot;</_DotclCmdPrefix>
       <_DotclCmdPrefix Condition="'$(DotclTool)' == '' and '$(DotclRuntimeProject)' != ''">dotnet run --project &quot;$(DotclRuntimeProject)&quot; --</_DotclCmdPrefix>
     </PropertyGroup>
+    <!-- Forward-slash each search-path dir's full path. %(FullPath) of a dir ends
+         in a backslash, and a quoted arg ending in backslash+quote escapes the
+         closing quote at the CLI layer (the whole asd-search-path arg pair then
+         gets dropped). Slash-terminated paths sidestep that and dotcl accepts
+         them as-is. The property function expands %(FullPath) because it sits in
+         ItemGroup metadata (item batching), unlike inside an item-transform. -->
+    <ItemGroup>
+      <_DotclSearchPathArg Include="@(DotclAsdSearchPath)">
+        <Arg>$([MSBuild]::ValueOrDefault('%(FullPath)', '').Replace('\','/'))</Arg>
+      </_DotclSearchPathArg>
+    </ItemGroup>
     <MakeDir Directories="$(DotclBundleDir)" />
   </Target>
 
@@ -80,10 +112,10 @@
           DependsOnTargets="_DotclSetupCommand"
           BeforeTargets="GetCopyToOutputDirectoryItems;_CollectAssetPackFiles;_GenerateAndroidAssetsDir;_CollectMauiAssetsTargetFramework;BeforeBuild"
           Condition="'$(DotclProjectAsd)' != ''"
-          Inputs="$(DotclProjectAsd)"
+          Inputs="$(DotclProjectAsd);@(DotclBuildInit);@(DotclAsdSearchPath)"
           Outputs="$(IntermediateOutputPath)dotcl-fasl\dotcl-deps.source.txt;$(IntermediateOutputPath)dotcl-fasl\dotcl-root-sources.txt">
 
-    <Exec Command="$(_DotclCmdPrefix) build &quot;$(DotclProjectAsd)&quot; --resolve-deps --manifest-out &quot;$(DotclSourceManifest)&quot; --root-sources-out &quot;$(DotclRootSourcesList)&quot;" />
+    <Exec Command="$(_DotclCmdPrefix) build &quot;$(DotclProjectAsd)&quot; --resolve-deps --manifest-out &quot;$(DotclSourceManifest)&quot; --root-sources-out &quot;$(DotclRootSourcesList)&quot;@(_DotclSearchPathArg->' --asd-search-path &quot;%(Arg)&quot;', '')@(DotclBuildInit->' --build-init &quot;%(FullPath)&quot;', '')" />
   </Target>
 
   <!--
@@ -135,11 +167,11 @@
           DependsOnTargets="DotclLoadItems"
           BeforeTargets="GetCopyToOutputDirectoryItems;_CollectAssetPackFiles;_GenerateAndroidAssetsDir;_CollectMauiAssetsTargetFramework;BeforeBuild"
           Condition="'$(DotclProjectAsd)' != ''"
-          Inputs="@(_DotclRootSource);$(DotclProjectAsd)"
+          Inputs="@(_DotclRootSource);$(DotclProjectAsd);@(DotclBuildInit);@(DotclAsdSearchPath)"
           Outputs="$(DotclRootFasl)">
 
     <Message Importance="high" Text="DotclCompileRoot: Inputs=@(_DotclRootSource);$(DotclProjectAsd) Outputs=$(DotclRootFasl)" />
-    <Exec Command="$(_DotclCmdPrefix) build &quot;$(DotclProjectAsd)&quot; --output &quot;$(DotclRootFasl)&quot;" />
+    <Exec Command="$(_DotclCmdPrefix) build &quot;$(DotclProjectAsd)&quot; --output &quot;$(DotclRootFasl)&quot;@(_DotclSearchPathArg->' --asd-search-path &quot;%(Arg)&quot;', '')@(DotclBuildInit->' --build-init &quot;%(FullPath)&quot;', '')" />
   </Target>
 
   <!--

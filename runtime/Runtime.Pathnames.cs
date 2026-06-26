@@ -376,8 +376,16 @@ public static partial class Runtime
                 return Pathname(args[i + 1]);
             }
         }
-        // Default: always .fasl (content may be PE assembly or text SIL depending on :fasl flag)
-        return new LispPathname(p.Host, p.Device, p.DirectoryComponent, p.NameComponent, new LispString("fasl"), p.Version);
+        // Default: always .fasl (content may be PE assembly or text SIL depending on :fasl flag).
+        // Preserve logical-ness: when the input is a logical pathname, the result must
+        // remain a LispLogicalPathname so downstream ResolvePhysicalPath translates it
+        // through its host's translations. Returning a plain LispPathname here merged the
+        // logical host into the namestring (e.g. "//CLTESTCOMPILE-FILE-TEST-LP.fasl",
+        // which on Windows became "\CLTESTCOMPILE-FILE-TEST-LP.fasl") — ANSI COMPILE-FILE.17.
+        var fasl = new LispString("fasl");
+        return p is LispLogicalPathname
+            ? new LispLogicalPathname(p.Host, p.Device, p.DirectoryComponent, p.NameComponent, fasl, p.Version)
+            : new LispPathname(p.Host, p.Device, p.DirectoryComponent, p.NameComponent, fasl, p.Version);
     }
 
     public static LispObject Pathname(LispObject thing)

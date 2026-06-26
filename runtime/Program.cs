@@ -100,6 +100,29 @@ class Program
             Environment.GetEnvironmentVariable("DOTCL_NO_TTY_RESTORE") != "1")
         {
             AppDomain.CurrentDomain.ProcessExit += (_, _) => RestoreTerminal();
+
+            // ProcessExit does NOT fire when the process is killed by a signal
+            // (SIGTERM from `kill`, SIGHUP on terminal close, SIGQUIT) — the
+            // terminal is then left in application mode and needs `stty sane`
+            // (public dotcl/dotcl#37 symptom 2, signal path). Trap the catchable
+            // termination signals, restore the terminal, then let the default
+            // action run (Cancel stays false) so exit semantics are unchanged.
+            // SIGKILL is uncatchable by design and cannot be handled.
+            foreach (var sig in new[] { System.Runtime.InteropServices.PosixSignal.SIGTERM,
+                                        System.Runtime.InteropServices.PosixSignal.SIGHUP,
+                                        System.Runtime.InteropServices.PosixSignal.SIGQUIT })
+            {
+                try
+                {
+                    // Keep the registration alive: PosixSignalRegistration is
+                    // IDisposable and unregisters when GC'd, so the handle must
+                    // be rooted for the process lifetime.
+                    _signalRegistrations.Add(
+                        System.Runtime.InteropServices.PosixSignalRegistration.Create(
+                            sig, _ => RestoreTerminal()));
+                }
+                catch { /* signal not supported on this platform — best-effort */ }
+            }
         }
 
         // --help / --version: handled before core loading for fast response.
@@ -263,6 +286,7 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
         string? buildRootSourcesOut = null;
         string? buildTargetRid = null;
         var buildInit = new List<string>();
+        var buildSearchPaths = new List<string>();
         if (buildMode)
         {
             rest.RemoveAt(0);
@@ -275,6 +299,7 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
                 else if (a == "--root-sources-out" && i + 1 < rest.Count) buildRootSourcesOut = rest[++i];
                 else if (a == "--target-rid" && i + 1 < rest.Count) buildTargetRid = rest[++i];
                 else if (a == "--build-init" && i + 1 < rest.Count) buildInit.Add(rest[++i]);
+                else if (a == "--asd-search-path" && i + 1 < rest.Count) buildSearchPaths.Add(rest[++i]);
                 else if (!a.StartsWith('-') && buildAsd == null) buildAsd = a;
             }
         }
@@ -321,7 +346,7 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
         // remaining token (flag or not) becomes the script's argv — the Unix
         // convention that args after the script belong to the program, not to
         // dotcl. This also stops data args (e.g. an image path) from being
-        // mis-loaded as Lisp source (#246).
+        // mis-loaded as Lisp source.
         var actions = new List<(string kind, string value)>();
         string? positionalScript = null;
         List<string> positionalArgv = new();
@@ -379,10 +404,11 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
             try
             {
                 var buildInitArr = buildInit.Count > 0 ? buildInit.ToArray() : null;
+                var searchPathArr = buildSearchPaths.Count > 0 ? buildSearchPaths.ToArray() : null;
                 if (buildResolveDeps)
-                    RunResolveDeps(buildAsd, buildManifestOut, buildRootSourcesOut, buildTargetRid, buildInitArr);
+                    RunResolveDeps(buildAsd, buildManifestOut, buildRootSourcesOut, buildTargetRid, buildInitArr, searchPathArr);
                 else if (buildOutput != null)
-                    RunCompileProject(buildAsd, buildOutput, buildInitArr);
+                    RunCompileProject(buildAsd, buildOutput, buildInitArr, searchPathArr);
                 else
                 {
                     Console.Error.WriteLine("build: requires --output <fasl> or --resolve-deps");
@@ -601,9 +627,9 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
     /// to that file. The MSBuild target uses this list as Inputs to its root
     /// compile target so source-file mtimes drive incremental rebuilds.
     /// </summary>
-    static void RunResolveDeps(string asdPath, string? manifestOut, string? rootSourcesOut, string? targetRid = null, string[]? buildInit = null)
+    static void RunResolveDeps(string asdPath, string? manifestOut, string? rootSourcesOut, string? targetRid = null, string[]? buildInit = null, string[]? searchPaths = null)
     {
-        try { DotclHost.ResolveDeps(asdPath, manifestOut, rootSourcesOut, targetRid, buildInit); }
+        try { DotclHost.ResolveDeps(asdPath, manifestOut, rootSourcesOut, targetRid, buildInit, searchPaths); }
         catch (System.IO.FileNotFoundException ex)
         {
             Console.Error.WriteLine(ex.Message);
@@ -622,9 +648,9 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
     /// MSBuild owns the incremental decision via Inputs/Outputs on the
     /// component source files.
     /// </summary>
-    static void RunCompileProject(string asdPath, string outputPath, string[]? buildInit = null)
+    static void RunCompileProject(string asdPath, string outputPath, string[]? buildInit = null, string[]? searchPaths = null)
     {
-        try { DotclHost.CompileProject(asdPath, outputPath, buildInit); }
+        try { DotclHost.CompileProject(asdPath, outputPath, buildInit, searchPaths); }
         catch (System.IO.FileNotFoundException ex)
         {
             Console.Error.WriteLine(ex.Message);
@@ -869,6 +895,11 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
 
     // Track whether we already restored, so multiple exit paths don't double-write.
     private static int _terminalRestored;
+
+    // Roots the PosixSignalRegistration handles for the process lifetime; without
+    // a live reference they would be GC'd and the signal handlers unregistered.
+    private static readonly System.Collections.Generic.List<System.Runtime.InteropServices.PosixSignalRegistration>
+        _signalRegistrations = new();
 
     /// <summary>
     /// Emit the terminfo rmkx reset (DECCKM reset ESC[?1l + DECKPNM ESC>) so the

@@ -8,9 +8,16 @@
        inject explicit copy-to-output items here instead. -->
   <PropertyGroup>
     <_DotCLRuntimeAssets>$(MSBuildThisFileDirectory)../dotclassets/</_DotCLRuntimeAssets>
+    <!-- On Android, output-dir <None> items do NOT land in the APK; assets must be
+         <AndroidAsset> (APK assets/) and read at runtime via the asset manager,
+         since AppContext.BaseDirectory is not a real fs path holding the core.
+         Detect the android TargetPlatformIdentifier to switch packaging. -->
+    <_DotCLIsAndroid>false</_DotCLIsAndroid>
+    <_DotCLIsAndroid Condition="'$([MSBuild]::GetTargetPlatformIdentifier($(TargetFramework)))' == 'android'">true</_DotCLIsAndroid>
   </PropertyGroup>
 
-  <ItemGroup Condition="Exists('$(_DotCLRuntimeAssets)dotcl.core')">
+  <!-- Desktop / non-android: copy next to the app; FindCore() opens it by path. -->
+  <ItemGroup Condition="'$(_DotCLIsAndroid)' != 'true' And Exists('$(_DotCLRuntimeAssets)dotcl.core')">
     <None Include="$(_DotCLRuntimeAssets)dotcl.core">
       <Link>dotcl.core</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
@@ -18,7 +25,7 @@
     </None>
   </ItemGroup>
 
-  <ItemGroup Condition="Exists('$(_DotCLRuntimeAssets)contrib')">
+  <ItemGroup Condition="'$(_DotCLIsAndroid)' != 'true' And Exists('$(_DotCLRuntimeAssets)contrib')">
     <None Include="$(_DotCLRuntimeAssets)contrib/**/*">
       <Link>contrib/%(RecursiveDir)%(Filename)%(Extension)</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
@@ -26,7 +33,22 @@
     </None>
   </ItemGroup>
 
-  <!-- Project-core build (#307): compile a consumer's <DotclProjectAsd> to a fasl
+  <!-- Android: embed into the APK as AndroidAsset (assets/dotcl/...). At runtime
+       DotclHost.FindCore() extracts them from the asset manager to a writable dir
+       and opens by path. The "dotcl/" asset subdir keeps them namespaced. -->
+  <ItemGroup Condition="'$(_DotCLIsAndroid)' == 'true' And Exists('$(_DotCLRuntimeAssets)dotcl.core')">
+    <AndroidAsset Include="$(_DotCLRuntimeAssets)dotcl.core">
+      <Link>Assets/dotcl/dotcl.core</Link>
+    </AndroidAsset>
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(_DotCLIsAndroid)' == 'true' And Exists('$(_DotCLRuntimeAssets)contrib')">
+    <AndroidAsset Include="$(_DotCLRuntimeAssets)contrib/**/*">
+      <Link>Assets/dotcl/contrib/%(RecursiveDir)%(Filename)%(Extension)</Link>
+    </AndroidAsset>
+  </ItemGroup>
+
+  <!-- Project-core build: compile a consumer's <DotclProjectAsd> to a fasl
        at build time via the in-process MSBuild tasks. Only active when the
        consumer sets DotclProjectAsd; otherwise a no-op. Shipped alongside this
        file in build/ and buildTransitive/. -->

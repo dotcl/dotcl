@@ -101,8 +101,15 @@ public static partial class Runtime
         {
             if (obj is LispInstance inst)
             {
+                // The CPL (by object identity) is authoritative for a CLOS instance's
+                // class membership. Do NOT fall through to the name-based CheckSimpleType:
+                // two distinct class objects can share a name (e.g. after class
+                // redefinition once the old class's proper name was cleared), and an
+                // instance of the old class is NOT a member of the new one. ANSI
+                // CLASS-0309.1 / CLASS-0311.1.
                 foreach (var c in inst.Class.ClassPrecedenceList)
                     if (ReferenceEquals(c, lcSpec)) return T.Instance;
+                return Nil.Instance;
             }
             else if (obj is LispDotNetObject dn)
             {
@@ -521,6 +528,7 @@ public static partial class Runtime
         "PATHNAME" => obj is LispPathname,
         "LOGICAL-PATHNAME" => obj is LispLogicalPathname,
         "RANDOM-STATE" => obj is LispRandomState,
+        "WEAK-POINTER" => obj is LispWeakPointer,
         "PPRINT-DISPATCH-TABLE" => obj is LispPprintDispatchTable,
         "READTABLE" => obj is LispReadtable || (obj is LispInstance ri && ClassMatchesCPL(ri.Class, "READTABLE")),
         "INPUT-STREAM" => obj is LispStream s1 && s1.IsInput,

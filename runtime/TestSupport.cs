@@ -20,5 +20,28 @@ namespace DotCL.TestSupport
 
         public static int StaticAdd(int a, int b = 5) => a + b;
     }
+
+    // A value-type (struct) used to model Avalonia.Media.Color: ctor overload
+    // resolution must prefer ColorBox(ColorVal) over ColorBox(uint) for a wrapped
+    // ColorVal arg, never Convert.ChangeType(struct, typeof(uint)).
+    public struct ColorVal
+    {
+        public byte R, G, B;
+        public ColorVal(byte r, byte g, byte b) { R = r; G = g; B = b; }
+        public static ColorVal Parse(string _) => new ColorVal(128, 128, 128);
+    }
+
+    // Ctor set mirrors Avalonia.Media.SolidColorBrush exactly: (),
+    // (ColorVal, double opacity = 1), (uint). There is NO 1-arg (ColorVal) ctor —
+    // a single ColorVal must select the 2-param ctor with its opacity defaulted,
+    // not the fixed-arity (uint) ctor (which would Convert.ChangeType the struct →
+    // IConvertible). Exercises the optional-tail ctor path.
+    public class ColorBox
+    {
+        public string Tag = "";
+        public ColorBox() { Tag = "empty"; }
+        public ColorBox(ColorVal c, double opacity = 1.0) { Tag = $"color {c.R} op {opacity}"; }
+        public ColorBox(uint argb) { Tag = $"uint {argb}"; }
+    }
 }
 #endif

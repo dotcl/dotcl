@@ -362,14 +362,23 @@
         ;; protect CL macros from foreign package overwrite
         ;; if called via a non-CL shadow (e.g. SB-XC:MACRO-FUNCTION), skip dotcl *macros* update
         ;; to prevent infinite recursion when the stored lambda calls cl:macro-function
-        (let ((fn-sym (first place)))
+        (let ((fn-sym (first place))
+              ;; (macro-function name &optional environment) — the optional
+              ;; environment subform is a place subform and must be evaluated
+              ;; for effect (CLHS 5.1.1.1 left-to-right place-subform evaluation),
+              ;; even though dotcl's macro table does not key on it. Dropping it
+              ;; silently lost the side effects of e.g.
+              ;; (setf (macro-function n (progn (incf i) nil)) f) — see ANSI
+              ;; MACRO-FUNCTION.15.
+              (env-form (caddr place)))
           (if (and (symbolp fn-sym)
                    (let ((pkg (symbol-package fn-sym)))
                      (and pkg (not (string= (package-name pkg) "COMMON-LISP")))))
               ;; Non-CL variant (e.g. SB-XC:MACRO-FUNCTION): no-op for dotcl's macro table
-              `(progn ,value)
+              (if env-form `(progn ,env-form ,value) `(progn ,value))
               ;; Normal CL:MACRO-FUNCTION setf
-              `(let ((v ,value) (n ,(second place)))
+              `(let ((v ,value) (n ,(second place))
+                     ,@(when env-form `((,(gensym "ENV") ,env-form))))
                  (if v
                      (let ((mkey (macro-key-for-symbol n)))
                        ;; skip if CL macro already registered
@@ -673,16 +682,47 @@
                   ;; (setf (the type place) val) -> (setf place val)
                   ((and (consp place) (eq (car place) 'the))
                    `(setf ,(caddr place) ,value))
-                  ;; (setf (values p1 p2 ...) expr) — assign each value to each place
-                  ;; Per CL spec, each place receives one value from the RHS
+                  ;; (setf (values p1 p2 ...) expr) — assign each value to each place.
+                  ;; CLHS 5.1.2.3 / 5.1.1.1: the SUBFORMS of every place are evaluated
+                  ;; left-to-right FIRST, then the value form, then the stores happen.
+                  ;; (Binding each place's get-setf-expansion temps up front gives that
+                  ;; order; the old code ran the value form before touching the places,
+                  ;; so a place's index side effect happened after the value — ANSI
+                  ;; SETF-VALUES.5.)
                   ((and (consp place) (eq (car place) 'values))
                    (let* ((places (cdr place)))
                      (if (null places)
                          value
-                         (let* ((stores (mapcar (lambda (p) (declare (ignore p)) (gensym "STORE")) places)))
-                           `(multiple-value-bind ,stores ,value
-                              ,@(mapcar (lambda (p s) `(setf ,p ,s)) places stores)
-                              (values ,@stores))))))
+                         ;; CLHS 5.1.2.3: each TOP-LEVEL place consumes exactly one
+                         ;; value of the form. Evaluate every place's SUBFORMS
+                         ;; left-to-right FIRST (get-setf-expansion temps; ANSI
+                         ;; SETF-VALUES.5), then the value form, then store. A place
+                         ;; that is itself (values ..) has several store vars: bind the
+                         ;; FIRST of them to this place's single incoming value and the
+                         ;; rest to NIL, so a nested (values b c) sets b and leaves c
+                         ;; NIL (ANSI VALUES.20/21).
+                         (let* ((exps (mapcar (lambda (p)
+                                                (multiple-value-list (%get-setf-expansion p)))
+                                              places))
+                                (all-temp-binds
+                                  (loop for e in exps
+                                        append (mapcar #'list (first e) (second e))))
+                                ;; one incoming value var per top-level place
+                                (in-vars (mapcar (lambda (p) (declare (ignore p)) (gensym "VAL"))
+                                                 places)))
+                           `(let* ,all-temp-binds
+                              (multiple-value-bind ,in-vars ,value
+                                ,@(mapcar
+                                   (lambda (e in-var)
+                                     (let* ((stores (third e))   ; ≥1 store vars
+                                            (setter (fourth e)))
+                                       ;; first store = incoming value, rest = nil
+                                       `(let* ,(cons (list (car stores) in-var)
+                                                     (mapcar (lambda (s) (list s nil))
+                                                             (cdr stores)))
+                                          ,setter)))
+                                   exps in-vars)
+                                (values ,@in-vars)))))))
                   ;; (setf (apply #'fn arg1 ... rest-list) val)
                   ;; → (apply #'(setf fn) val arg1 ... rest-list)
                   ((and (consp place) (eq (car place) 'apply))
@@ -752,12 +792,15 @@
                         (find-macro-expander (car place)))
                    (let ((expander (find-macro-expander (car place))))
                      `(setf ,(funcall expander place) ,value)))
-                  ;; Fallback: try (setf accessor) function (CLOS generic setf)
+                  ;; Fallback: try (setf accessor) function (CLOS generic setf).
+                  ;; CLHS 5.1.2.5: (setf (f arg...) val) expands to
+                  ;; (funcall #'(setf f) val arg...), and the value of the SETF form
+                  ;; is the value(s) returned by that call — NOT a re-returned copy
+                  ;; of val. Returning val truncated a (setf f) whose function does
+                  ;; more than echo its first arg (ANSI FDEFINITION.5: #'(setf sym)
+                  ;; bound to CONS must yield (val . arg)).
                   ((and (consp place) (symbolp (car place)))
-                   (let ((val-var (gensym "SETF")))
-                     `(let ((,val-var ,value))
-                        ((setf ,(car place)) ,val-var ,@(cdr place))
-                        ,val-var)))
+                   `((setf ,(car place)) ,value ,@(cdr place)))
                   (t (error "SETF: unsupported place ~s" place))))
               ;; Multi-pair
               (let ((result '()))
@@ -1006,6 +1049,61 @@
           (values (list n lst) (list (cadr place) (caddr place)) (list s)
                   `(progn (rplaca (nthcdr ,n ,lst) ,s) ,s)
                   `(nth ,n ,lst))))
+       (cadr
+        (let ((obj (gensym "OBJ")) (s (gensym "STORE")))
+          (values (list obj) (list (cadr place)) (list s)
+                  `(progn (rplaca (cdr ,obj) ,s) ,s)
+                  `(cadr ,obj))))
+       (cdar
+        (let ((obj (gensym "OBJ")) (s (gensym "STORE")))
+          (values (list obj) (list (cadr place)) (list s)
+                  `(progn (rplacd (car ,obj) ,s) ,s)
+                  `(cdar ,obj))))
+       ;; gethash/get/char/slot-value/symbol-value have explicit setters (matching
+       ;; the SETF macro's cond cases). Without these they fell to the generic
+       ;; fallback, whose store form re-emitted (setf place store) — which the SETF
+       ;; macro re-expands correctly, but get-setf-expansion would then RETURN
+       ;; (setf (gethash..) s) rather than the proper accessor store form, and the
+       ;; fallback's funcall-ization (below) would mis-treat them as (setf gethash)
+       ;; function places. Modeling them here keeps incf/push/get-setf-expansion and
+       ;; the funcall fallback all correct.
+       (gethash
+        (let ((k (gensym "KEY")) (h (gensym "TABLE")) (s (gensym "STORE"))
+              (default (cadddr place)))
+          (if default
+              (let ((d (gensym "DEF")))
+                (values (list k h d) (list (cadr place) (caddr place) default) (list s)
+                        `(puthash ,k ,h ,s)
+                        `(gethash ,k ,h ,d)))
+              (values (list k h) (list (cadr place) (caddr place)) (list s)
+                      `(puthash ,k ,h ,s)
+                      `(gethash ,k ,h)))))
+       (get
+        (let ((sym (gensym "SYM")) (ind (gensym "IND")) (s (gensym "STORE"))
+              (default (cadddr place)))
+          (if default
+              (let ((d (gensym "DEF")))
+                (values (list sym ind d) (list (cadr place) (caddr place) default) (list s)
+                        `(put-prop ,sym ,ind ,s)
+                        `(get ,sym ,ind ,d)))
+              (values (list sym ind) (list (cadr place) (caddr place)) (list s)
+                      `(put-prop ,sym ,ind ,s)
+                      `(get ,sym ,ind)))))
+       (char
+        (let ((str (gensym "STR")) (idx (gensym "IDX")) (s (gensym "STORE")))
+          (values (list str idx) (list (cadr place) (caddr place)) (list s)
+                  `(%char-set ,str ,idx ,s)
+                  `(char ,str ,idx))))
+       (slot-value
+        (let ((obj (gensym "OBJ")) (name (gensym "NAME")) (s (gensym "STORE")))
+          (values (list obj name) (list (cadr place) (caddr place)) (list s)
+                  `(%set-slot-value ,obj ,name ,s)
+                  `(slot-value ,obj ,name))))
+       (symbol-value
+        (let ((sym (gensym "SYM")) (s (gensym "STORE")))
+          (values (list sym) (list (cadr place)) (list s)
+                  `(%set-symbol-value ,sym ,s)
+                  `(symbol-value ,sym))))
        (the
         ;; (the type place) — type is not a form; recurse on actual place
         (%get-setf-expansion (caddr place)))
@@ -1042,9 +1140,24 @@
                                          (find-macro-expander (car place)))))
                       (if expander
                           (%get-setf-expansion (funcall expander place))
-                          ;; Fallback: no temp binding, use setf/getter (may re-evaluate)
-                          (let ((s (gensym "STORE")))
-                            (values nil nil (list s) `(setf ,place ,s) place)))))))))))
+                          ;; Fallback. CLHS 5.1.2.5: a function-call place (f a1..aN)
+                          ;; has store form (funcall #'(setf f) store t1..tN) with the
+                          ;; args evaluated once via temps, and getter (f t1..tN).
+                          ;; (GET-SETF-EXPANSION.1 requires #'(setf f) here, not a
+                          ;; re-emitted (setf place store).) APPLY and any non-symbol
+                          ;; operator are modeled only by the SETF macro, not as
+                          ;; (setf op) functions, so for those we defer by re-emitting
+                          ;; (setf place store) for the macro to expand.
+                          (if (and (symbolp (car place)) (not (eq (car place) 'apply)))
+                              (let* ((args (cdr place))
+                                     (temps (mapcar (lambda (a) (declare (ignore a))
+                                                      (gensym "TEMP")) args))
+                                     (s (gensym "STORE")))
+                                (values temps args (list s)
+                                        `(funcall #'(setf ,(car place)) ,s ,@temps)
+                                        `(,(car place) ,@temps)))
+                              (let ((s (gensym "STORE")))
+                                (values nil nil (list s) `(setf ,place ,s) place))))))))))))
     (t (error "get-setf-expansion: unknown place: ~s" place))))
 
 ;;; --- %dmm-helper: runtime helper for define-modify-macro generated macros ---
@@ -1418,6 +1531,271 @@
                           for i from 0
                           collect `(,v (nth ,i ,mvl-var))))
              ,@body))))
+
+;;; --- dotcl:async / dotcl:await (step B) ---------------------------
+;;; (dotcl:async BODY...) CPS-transforms BODY into a chain of dotcl:%async-bind /
+;;; %async-return calls and evaluates to a .NET Task. (dotcl:await E) suspends
+;;; until E's Task completes and yields its value, WITHOUT blocking the thread
+;;; (the continuation runs via ContinueWith). Contrast dotnet:await, which BLOCKS.
+;;;
+;;; Symbols live in the DOTCL package (not COMMON-LISP), so the *macros* keys and
+;;; the predicates below resolve them via FIND-SYMBOL "…","DOTCL" — both because
+;;; non-CL symbols are package-specific (user code must reference dotcl:async to
+;;; hit the same symbol the macro is keyed on) and because host SBCL has no DOTCL
+;;; package during cross-compile (find-package returns nil → harmless fallback).
+;;;
+;;; First-cut grammar (await may appear in these positions only):
+;;;   - a statement in an implicit/explicit progn
+;;;   - the top-level init of a let* binding:  (let* ((v (dotcl:await E))) ...)
+;;; (await E) requires E itself synchronous (no nested await — use let*).
+;;; let with an await binding is rejected (use let*). Forms that contain await in
+;;; any other position (if/cond branches, function-argument position, lambda body)
+;;; are rejected with an error; restructure with let*. Out of scope for this cut:
+;;; special-variable bindings, handler-case/unwind-protect, and multiple values
+;;; spanning an await (the continuation runs on a thread-pool thread).
+
+(defun %async-bind-sym ()
+  (or (find-symbol "%ASYNC-BIND" "DOTCL") (intern "%ASYNC-BIND" "DOTCL")))
+(defun %async-return-sym ()
+  (or (find-symbol "%ASYNC-RETURN" "DOTCL") (intern "%ASYNC-RETURN" "DOTCL")))
+(defun %async-await-sym ()
+  (or (find-symbol "AWAIT" "DOTCL") (intern "AWAIT" "DOTCL")))
+(defun %async-async-sym ()
+  (or (find-symbol "ASYNC" "DOTCL") (intern "ASYNC" "DOTCL")))
+(defun %async-with-handlers-sym ()
+  (or (find-symbol "%ASYNC-WITH-HANDLERS" "DOTCL") (intern "%ASYNC-WITH-HANDLERS" "DOTCL")))
+(defun %async-unwind-protect-sym ()
+  (or (find-symbol "%ASYNC-UNWIND-PROTECT" "DOTCL") (intern "%ASYNC-UNWIND-PROTECT" "DOTCL")))
+(defun %async-try-sym ()
+  (or (find-symbol "%ASYNC-TRY" "DOTCL") (intern "%ASYNC-TRY" "DOTCL")))
+(defun %async-restart-sym ()
+  (or (find-symbol "%ASYNC-RESTART" "DOTCL") (intern "%ASYNC-RESTART" "DOTCL")))
+(defun %async-decline-sym ()
+  (or (find-symbol "%ASYNC-DECLINE" "DOTCL") (intern "%ASYNC-DECLINE" "DOTCL")))
+
+(defun %async-contains-await-p (form)
+  "True if FORM contains a (dotcl:await ...) outside a nested (dotcl:async ...)
+   or quote."
+  (cond ((atom form) nil)
+        ((eq (car form) 'quote) nil)
+        ((eq (car form) (%async-async-sym)) nil)
+        ((eq (car form) (%async-await-sym)) t)
+        (t (some #'%async-contains-await-p form))))
+
+(defun %async-await-form-p (form)
+  (and (consp form) (eq (car form) (%async-await-sym))))
+
+(defun %async-binding-parts (b)
+  "Normalize a let/let* binding to (values var init-form)."
+  (cond ((symbolp b) (values b nil))
+        ((null (cdr b)) (values (car b) nil))
+        (t (values (car b) (cadr b)))))
+
+(defun %async-cps (form k)
+  "Return a form that computes FORM and passes the result to continuation K
+   (a form denoting a 1-arg function), yielding a Task."
+  (cond
+    ;; Fully synchronous subexpression: hand its value straight to K.
+    ((not (%async-contains-await-p form)) `(funcall ,k ,form))
+    ;; (await E) — E must be synchronous.
+    ((%async-await-form-p form)
+     (let ((e (cadr form)))
+       (when (%async-contains-await-p e)
+         (error "ASYNC: nested await inside (await ...) is unsupported; use let*: ~S" form))
+       `(,(%async-bind-sym) ,e ,k)))
+    ((consp form)
+     (case (car form)
+       ((progn) (%async-cps-seq (cdr form) k))
+       ((let*) (%async-cps-let* (cadr form) (cddr form) k))
+       ((let) (%async-cps-let (cadr form) (cddr form) k))
+       ((handler-bind) (%async-cps-handler-bind (cadr form) (cddr form) k))
+       ((unwind-protect) (%async-cps-unwind-protect (cadr form) (cddr form) k))
+       ((handler-case) (%async-cps-handler-case (cadr form) (cddr form) k))
+       ((restart-case) (%async-cps-restart-case (cadr form) (cddr form) k))
+       (t
+        ;; Unknown operator: if it's a macro (e.g. with-simple-restart →
+        ;; restart-case, when/unless/cond → if/progn), expand once and re-CPS the
+        ;; result, so any macro that bottoms out in a CPS-handled special form works
+        ;; across await without enumerating every wrapper here.
+        (let ((expander (and (symbolp (car form)) (find-macro-expander (car form)))))
+          (if expander
+              (%async-cps (cached-macroexpand form expander) k)
+              (error "ASYNC: unsupported form containing await: ~S~%~
+                      Move the await into a let* binding or a progn statement." form))))))
+    (t (error "ASYNC: cannot transform ~S" form))))
+
+(defun %async-cps-handler-case (body clauses k)
+  "CPS a (handler-case BODY (type (var) h...) ... [(:no-error (v...) n...)]) containing
+   await. BODY runs to a Task via %async-try; on fault the macro-built dispatch
+   typecase's over the condition, running the matching clause (also CPS'd) or
+   declining to re-raise. A :no-error clause runs (also CPS'd) only on the success
+   path, bound to the body's value — never after a handled fault, matching CL
+   handler-case. Async is single-valued, so the :no-error lambda-list binds one value
+   (extra optionals default, &rest is nil)."
+  (let* ((no-error (assoc :no-error clauses))
+         (err-clauses (remove no-error clauses))
+         (c (gensym "HCC")) (v (gensym "HCV"))
+         ;; Success terminal continuation: when a :no-error clause is present,
+         ;; bind its first lambda-list param to the body value and run its body
+         ;; (CPS'd, may itself await) before %async-return; otherwise return the
+         ;; body value directly. A handled fault uses its own kont, so :no-error
+         ;; never runs after a handler — matching CL handler-case.
+         (ne-ll (and no-error (cadr no-error)))
+         (nev (gensym "NEV"))
+         ;; The :no-error body may itself await, so it must be CPS'd. Its
+         ;; lambda-list (e.g. (v), (&rest vals), (a &optional b)) is bound by a
+         ;; real lambda applied to the single body value — leaning on normal
+         ;; lambda-list processing rather than re-deriving binding semantics.
+         (success-kont
+           (if no-error
+               `(lambda (,v)
+                  (apply (lambda ,ne-ll
+                           ,(%async-cps-seq (cddr no-error)
+                                            `(lambda (,nev) (,(%async-return-sym) ,nev))))
+                         (list ,v)))
+               `(lambda (,v) (,(%async-return-sym) ,v)))))
+    `(,(%async-bind-sym)
+       (,(%async-try-sym)
+         ;; clause type-specifiers: a matching SIGNAL in the body unwinds as a fault
+         (list ,@(mapcar (lambda (clause) `(quote ,(car clause))) err-clauses))
+         (lambda () ,(%async-cps body success-kont))
+         (lambda (,c)
+           (typecase ,c
+             ,@(mapcar
+                (lambda (clause)
+                  (let* ((type (car clause))
+                         (ll (cadr clause))
+                         (var (and ll (car ll)))
+                         (hbody (cddr clause))
+                         (kont `(lambda (,v) (,(%async-return-sym) ,v))))
+                    `(,type ,(if var
+                                 `(let ((,var ,c)) ,(%async-cps-seq hbody kont))
+                                 (%async-cps-seq hbody kont)))))
+                err-clauses)
+             (t (,(%async-decline-sym))))))
+       ,k)))
+
+(defun %async-restart-clause-parts (clause)
+  "Parse one restart-case clause (name (params...) [:report/:interactive/:test x]* body...).
+   Returns (values name-string params body). Keyword options are skipped (they affect
+   only interactive reporting, irrelevant to async dispatch which targets by name)."
+  (let ((name (car clause))
+        (params (cadr clause))
+        (rest (cddr clause)))
+    (loop while (and rest (member (car rest) '(:report :interactive :test)))
+          do (setf rest (cddr rest)))
+    (values (symbol-name name) params rest)))
+
+(defun %async-cps-restart-case (body clauses k)
+  "CPS a (restart-case BODY (name (params...) [opts]* h...) ...) containing await.
+   BODY runs to a Task via %async-restart under a pushed restart cluster (visible to
+   find-restart / invoke-restart across awaits, since %async-bind snapshots the
+   restart stack). On normal completion BODY's value flows to K. When the body (or a
+   continuation) invoke-restarts one of these restarts, %async-restart catches the
+   tagged transfer and calls the dispatch fn (name args) → the matching clause's CPS'd
+   body, with its params bound to the invoke-restart arguments."
+  (let ((nm (gensym "RCNAME")) (as (gensym "RCARGS")) (v (gensym "RCV")))
+    `(,(%async-bind-sym)
+       (,(%async-restart-sym)
+         ;; restart name strings, declared order
+         (list ,@(mapcar (lambda (clause)
+                           (symbol-name (car clause)))
+                         clauses))
+         (lambda () ,(%async-cps body `(lambda (,v) (,(%async-return-sym) ,v))))
+         (lambda (,nm ,as)
+           (cond
+             ,@(mapcar
+                (lambda (clause)
+                  (multiple-value-bind (name params hbody)
+                      (%async-restart-clause-parts clause)
+                    `((string= ,nm ,name)
+                      ;; bind clause params to the invoke-restart args via a real
+                      ;; lambda applied to the arg list (handles (), (x), (&rest a)…).
+                      (apply (lambda ,params
+                               ,(%async-cps-seq hbody
+                                                `(lambda (,v) (,(%async-return-sym) ,v))))
+                             ,as))))
+                clauses)
+             (t (,(%async-return-sym) nil)))))
+       ,k)))
+
+(defun %async-cps-unwind-protect (protected cleanup k)
+  "CPS a (unwind-protect PROTECTED CLEANUP...) containing await. PROTECTED and the
+   CLEANUP progn each run to a Task; %async-unwind-protect runs cleanup after the
+   protected form settles (success or fault) and propagates the protected outcome."
+  (let ((bv (gensym "UPB")) (cv (gensym "UPC")))
+    `(,(%async-bind-sym)
+       (,(%async-unwind-protect-sym)
+         (lambda () ,(%async-cps protected `(lambda (,bv) (,(%async-return-sym) ,bv))))
+         (lambda () ,(%async-cps-seq cleanup `(lambda (,cv) (,(%async-return-sym) ,cv)))))
+       ,k)))
+
+(defun %async-cps-handler-bind (bindings body k)
+  "CPS a (handler-bind ((type fn)...) BODY) that contains await. The cluster is
+   established via %async-with-handlers and snapshotted by the body's %async-bind
+   calls, so the handlers stay active across awaits inside BODY. The body runs to a
+   Task (terminal %async-return); its value is then threaded to K."
+  (let ((v (gensym "HBV")))
+    `(,(%async-bind-sym)
+       (,(%async-with-handlers-sym)
+         (list ,@(mapcar (lambda (b) `(cons ',(car b) ,(cadr b))) bindings))
+         (lambda () ,(%async-cps-seq body `(lambda (,v) (,(%async-return-sym) ,v)))))
+       ,k)))
+
+(defun %async-cps-seq (forms k)
+  "CPS a sequence (implicit progn); the last form supplies the value."
+  (cond
+    ((null forms) `(funcall ,k nil))
+    ((null (cdr forms)) (%async-cps (car forms) k))
+    (t (let ((s (car forms)))
+         (if (%async-contains-await-p s)
+             ;; await statement: discard its value, then run the rest.
+             (let ((ig (gensym "IG")))
+               (%async-cps s `(lambda (,ig)
+                                (declare (ignore ,ig))
+                                ,(%async-cps-seq (cdr forms) k))))
+             ;; synchronous statement: run for effect, then the rest (a Task).
+             `(progn ,s ,(%async-cps-seq (cdr forms) k)))))))
+
+(defun %async-cps-let* (bindings body k)
+  (if (null bindings)
+      (%async-cps-seq body k)
+      (multiple-value-bind (var init) (%async-binding-parts (car bindings))
+        (if (%async-contains-await-p init)
+            ;; Async init (await / unwind-protect / handler-bind / nested let* …):
+            ;; compute it, bind VAR to its value, then continue with the rest.
+            (%async-cps init `(lambda (,var)
+                                ,(%async-cps-let* (cdr bindings) body k)))
+            ;; Synchronous binding.
+            `(let ((,var ,init))
+               ,(%async-cps-let* (cdr bindings) body k))))))
+
+(defun %async-cps-let (bindings body k)
+  ;; let binds in parallel; an await binding would imply ordering, so reject it.
+  (dolist (b bindings)
+    (multiple-value-bind (var init) (%async-binding-parts b)
+      (declare (ignore var))
+      (when (%async-contains-await-p init)
+        (error "ASYNC: await in a let binding is unsupported; use let*: ~S" b))))
+  `(let ,bindings ,(%async-cps-seq body k)))
+
+;;; Register under the DOTCL-package symbols so user code (dotcl:async /
+;;; dotcl:await) hits the same key. Under host SBCL (cross-compile) DOTCL is
+;;; absent, so fall back to compiler-local symbols — harmless because no
+;;; cross-compiled source uses async.
+(let ((async-key (if (find-package "DOTCL") (intern "ASYNC" "DOTCL") 'async))
+      (await-key (if (find-package "DOTCL") (intern "AWAIT" "DOTCL") 'await)))
+  (setf (gethash async-key *macros*)
+        (lambda (form)
+          (let ((v (gensym "AV")))
+            (%async-cps-seq (cdr form)
+                            `(lambda (,v) (,(%async-return-sym) ,v))))))
+  (setf (gethash await-key *macros*)
+        (lambda (form)
+          (error "DOTCL:AWAIT used outside (DOTCL:ASYNC ...) or in an unsupported position: ~S"
+                 form)))
+  (when (find-package "DOTCL")
+    (export (list async-key await-key) "DOTCL")))
 
 ;;; --- typecase ---
 (setf (gethash 'typecase *macros*)
@@ -1987,7 +2365,17 @@
                         ;; Build &key params and local var names, handling constant slot names (T, NIL, etc.)
                         (let* ((slot-vars (mapcar (lambda (s)
                                                     (let ((sname (car s)))
-                                                      (if (constantp sname)
+                                                      ;; Use a gensym for the &key var when the slot
+                                                      ;; name is constant OR a SPECIAL variable.
+                                                      ;; Binding a special slot name (e.g. a slot
+                                                      ;; literally named *st-60*) as the &key var
+                                                      ;; would create a special binding that shadows
+                                                      ;; that variable in LATER slots' default forms,
+                                                      ;; so a default referencing *st-60* read the
+                                                      ;; slot value instead of the dynamic value
+                                                      ;; (ANSI STRUCTURE-60-1).
+                                                      (if (or (constantp sname)
+                                                              (%runtime-special-p sname))
                                                           (gensym (symbol-name sname))
                                                           sname)))
                                                   all-slots))
@@ -2944,6 +3332,12 @@
 
 ;;; --- defpackage ---
 
+;; CLHS glossary: a string designator is a string, a symbol, or a character.
+;; defpackage's :import-from/:shadowing-import-from accept any of these for the
+;; package name and the symbol names.
+(defun string-designator-p (x)
+  (or (stringp x) (symbolp x) (characterp x)))
+
 (setf (gethash 'defpackage *macros*)
       (lambda (form)
         ;; (defpackage name &rest options)
@@ -3056,12 +3450,15 @@
                        ;; are stripped (metatilities-base pattern: #-(or sbcl ecl ...) (error ...)).
                        ;; In that case treat it as "no source package" and fall to DOTCL-MOP.
                        (let* ((pkg-name-raw (car args))
-                              (pkg-name-valid (or (symbolp pkg-name-raw) (stringp pkg-name-raw)))
+                              ;; CLHS: a string designator is a string, symbol, OR character.
+                              ;; A character package/symbol name (e.g. (:import-from #\G #\B))
+                              ;; was dropped, importing the wrong symbols (ANSI DEFPACKAGE.8).
+                              (pkg-name-valid (string-designator-p pkg-name-raw))
                               (from-pkg (when pkg-name-valid (string pkg-name-raw)))
                               ;; symbol names: (cdr args) when pkg-name is valid, else filter from args
                               (raw-syms (if pkg-name-valid (cdr args) args))
                               (sym-names (mapcar #'string
-                                                 (remove-if-not (lambda (x) (or (symbolp x) (stringp x)))
+                                                 (remove-if-not #'string-designator-p
                                                                 raw-syms))))
                          (let ((pkg-obj-var (gensym "FROMPKG")))
                            ;; Generate a single group-level form so that when the source
@@ -3121,11 +3518,12 @@
                                intern-forms)))
                       ((member key '(:shadowing-import-from) :test #'eq)
                        (let* ((pkg-name-raw (car args))
-                              (pkg-name-valid (or (symbolp pkg-name-raw) (stringp pkg-name-raw)))
+                              ;; CLHS: string designator = string, symbol, or character.
+                              (pkg-name-valid (string-designator-p pkg-name-raw))
                               (from-pkg (when pkg-name-valid (string pkg-name-raw)))
                               (raw-syms (if pkg-name-valid (cdr args) args))
                               (sym-names (mapcar #'string
-                                                 (remove-if-not (lambda (x) (or (symbolp x) (stringp x)))
+                                                 (remove-if-not #'string-designator-p
                                                                 raw-syms))))
                          (let ((pkg-obj-var (gensym "FROMPKG")))
                            (push
@@ -3870,31 +4268,46 @@
                       (mapcar (lambda (p)
                                 (multiple-value-list (%get-setf-expansion p)))
                               places))
-                     ;; Interleave: (place1-bindings val1-binding place2-bindings val2-binding ...)
-                     (val-tmps
-                      (mapcar (lambda (v) (declare (ignore v)) (gensym "PSETF-V")) vals))
-                     (interleaved-bindings
+                     ;; Per-pair value temps: ONE temp per STORE variable of that
+                     ;; place (a (values a b c) place has 3 stores → capture 3 values
+                     ;; of the value form). A single temp dropped the secondaries, so
+                     ;; (psetf (values a b c) (values 1 2 3) ...) only set a (ANSI
+                     ;; PSETF.41).
+                     (val-tmp-lists
+                      (mapcar (lambda (exp)
+                                (mapcar (lambda (s) (declare (ignore s)) (gensym "PSETF-V"))
+                                        (third exp)))
+                              expansions))
+                     ;; Interleave: (place1-subform-bindings value1-capture
+                     ;;              place2-subform-bindings value2-capture ...)
+                     ;; Each value-capture binds the pair's value-temps to the value
+                     ;; form's values via multiple-value-bind (left-to-right order).
+                     (interleaved
                       (apply #'append
-                             (mapcar (lambda (exp val val-tmp)
+                             (mapcar (lambda (exp val val-tmps)
                                        (append
                                         (mapcar #'list (first exp) (second exp))
-                                        (list (list val-tmp val))))
-                                     expansions vals val-tmps)))
+                                        (list (list :mvb val-tmps val))))
+                                     expansions vals val-tmp-lists)))
                      (assignments
-                      (mapcar (lambda (exp val-tmp)
+                      (mapcar (lambda (exp val-tmps)
                                 (let ((stores (third exp))
                                       (setter (fourth exp)))
-                                  (if (cdr stores)
-                                      ;; Multi-store (values place): use multiple-value-bind
-                                      `(multiple-value-bind ,stores ,val-tmp
-                                         ,setter)
-                                      ;; Single store
-                                      `(let ((,(car stores) ,val-tmp))
-                                         ,setter))))
-                              expansions val-tmps)))
-                `(let* (,@interleaved-bindings)
-                   ,@assignments
-                   nil))))))
+                                  `(let ,(mapcar #'list stores val-tmps)
+                                     ,setter)))
+                              expansions val-tmp-lists)))
+                ;; Build the let*-like body: subform temps via plain bindings, value
+                ;; captures via nested multiple-value-bind (can't sit in a let* binding
+                ;; list). Fold from the inside out.
+                (labels ((emit (binds)
+                           (if (null binds)
+                               `(progn ,@assignments nil)
+                               (let ((b (car binds)))
+                                 (if (and (consp b) (eq (car b) :mvb))
+                                     `(multiple-value-bind ,(second b) ,(third b)
+                                        ,(emit (cdr binds)))
+                                     `(let (,b) ,(emit (cdr binds))))))))
+                  (emit interleaved)))))))
 
 ;;; --- prog / prog* ---
 ;;; (prog (var-bindings) tag/form...) ≡ (block nil (let (var-bindings) (tagbody tag/form...)))
@@ -4021,8 +4434,16 @@
                                                        (list 'when (list 'null ',list-var) '(return)))
                                                      (pprint-pop ()
                                                        (list 'progn
+                                                             ;; *print-length*: write "..." at the length boundary
+                                                             ;; when a proper list (cons) or an exhausted list
+                                                             ;; (nil) remains. A non-nil DOTTED tail (improper,
+                                                             ;; non-cons cdr) is not a length-limited element — it
+                                                             ;; must still print as ". <atom>" even at the boundary
+                                                             ;; (ANSI PPRINT-POP.6). nil still yields "..." so an
+                                                             ;; empty list at length 0 truncates (PPRINT-POP.1/9).
                                                              (list 'when (list 'and '*print-length*
-                                                                           (list '>= ',count-var '*print-length*))
+                                                                           (list '>= ',count-var '*print-length*)
+                                                                           (list 'listp ',list-var))
                                                                    (list 'write-string "..." ',actual-stream)
                                                                    '(return))
                                                              (list 'setf ',count-var (list '+ ',count-var 1))
@@ -4136,3 +4557,20 @@
 (setf (gethash 'untrace *macros*)
       (lambda (form)
         `(%untrace ,@(mapcar (lambda (n) `',n) (cdr form)))))
+
+
+;;; --- dotcl-cltl2 macros --------------------------------------------
+;;; The dotcl-cltl2 PACKAGE and its functions live in cil-stdlib.lisp (compiled as
+;;; user code so they are runtime-callable). Only the macros belong in *macros*.
+;;; Ensure the package exists for the macro-key symbol (host SBCL during cross-
+;;; compile has no dotcl-cltl2 yet; at dotcl runtime cil-stdlib created it first).
+(let ((pkg (or (find-package "DOTCL-CLTL2")
+               (make-package "DOTCL-CLTL2" :use '("CL")))))
+  ;; define-declaration: make it a MACRO so the declaration NAME is not evaluated
+  ;; as a variable (the trivia "Unbound variable: OPTIMIZER" cause). dotcl ignores
+  ;; unknown declarations, so expanding to the quoted name is sufficient.
+  (setf (gethash (intern "DEFINE-DECLARATION" pkg) *macros*)
+        (lambda (form) (list 'quote (cadr form))))
+  ;; compiler-let (legacy): bind like LET.
+  (setf (gethash (intern "COMPILER-LET" pkg) *macros*)
+        (lambda (form) (append (list 'let (cadr form)) (cddr form)))))
