@@ -483,3 +483,64 @@
   (mapcar #'class-name
           (dotcl::class-precedence-list (find-class 'i352-h)))
   (i352-h i352-f i352-d i352-c i352-g i352-e i352-b i352-a standard-object t))
+
+;;; Cross-package same-named classes must stay distinct even when one is
+;;; forward-referenced by a subclass (FindOrForwardClass used to key the
+;;; placeholder by bare name → DOTCL-INTERNAL::SEQ, so a later same-named class
+;;; in another package shadowed the earlier one; cl-ppcre::seq vs fset::seq).
+(defpackage :i408-pa (:use :cl))
+(defpackage :i408-pb (:use :cl))
+;; child references the (not-yet-defined) parent → parent is forward-referenced
+(defclass i408-pa::child (i408-pa::node) ())
+(defclass i408-pa::node () ((aa :initarg :aa :accessor i408-pa::aa)))
+(defclass i408-pb::child (i408-pb::node) ())
+(defclass i408-pb::node () ((bb :initarg :bb :accessor i408-pb::bb)))
+
+(deftest i408-cross-package-classes-distinct
+  (eq (find-class 'i408-pa::node) (find-class 'i408-pb::node))
+  nil)
+
+(deftest i408-find-class-returns-queried-package
+  (list (eq (find-class 'i408-pa::node) (find-class 'i408-pa::node))
+        (eq (find-class 'i408-pb::node) (find-class 'i408-pb::node)))
+  (t t))
+
+;; each parent keeps its OWN slots; make-instance with the other package's slot
+;; was the reported failure ("Invalid initarg :ELEMENTS for class SEQ")
+(deftest i408-make-instance-pa-own-slot
+  (slot-value (make-instance 'i408-pa::node :aa 1) 'i408-pa::aa)
+  1)
+
+(deftest i408-make-instance-pb-own-slot
+  (slot-value (make-instance 'i408-pb::node :bb 2) 'i408-pb::bb)
+  2)
+
+;; the forward-referenced subclass resolves to its OWN package's parent
+(deftest i408-subclass-super-is-own-package
+  (list (class-name (first (dotcl-mop:class-direct-superclasses (find-class 'i408-pa::child))))
+        (class-name (first (dotcl-mop:class-direct-superclasses (find-class 'i408-pb::child)))))
+  (i408-pa::node i408-pb::node))
+
+;;; (setf find-class) must key by the ORIGINAL package-qualified symbol, not the
+;;; bare-name-normalized one. fset's post.lisp aliases each class into a FSET2
+;;; package via (setf (find-class fset2-sym) (find-class sym)); the normalized key
+;;; collapsed e.g. FSET2::SEQ onto DOTCL-INTERNAL::SEQ and shadowed cl-ppcre::seq.
+(defpackage :i408b-s1 (:use :cl))
+(defpackage :i408b-s2 (:use :cl))
+(defclass i408b-base1 () ((x :initarg :x)))
+(defclass i408b-base2 () ((y :initarg :y)))
+(setf (find-class (intern "WIDGET" :i408b-s1)) (find-class 'i408b-base1))
+(setf (find-class (intern "WIDGET" :i408b-s2)) (find-class 'i408b-base2))
+
+(deftest i408-setf-find-class-distinct-packages
+  (list (class-name (find-class (intern "WIDGET" :i408b-s1)))
+        (class-name (find-class (intern "WIDGET" :i408b-s2)))
+        (eq (find-class (intern "WIDGET" :i408b-s1))
+            (find-class (intern "WIDGET" :i408b-s2))))
+  (i408b-base1 i408b-base2 nil))
+
+;; the alias resolves to the aliased class (fset2 use-case), and make-instance with
+;; the aliased class's own initarg works
+(deftest i408-setf-find-class-alias-resolves
+  (slot-value (make-instance (find-class (intern "WIDGET" :i408b-s1)) :x 7) 'x)
+  7)

@@ -389,7 +389,7 @@ public static partial class Runtime
             return m != null ? $"{m.DeclaringType?.Name}.{m.Name}" : "?";
         });
         var stackHint = string.Join(" → ", topFrames);
-        throw new LispErrorException(new LispTypeError($"CAR: not a list (got {obj?.GetType().Name ?? "null"}: {objStr})\n  at: {stackHint}", obj));
+        throw new LispErrorException(new LispTypeError($"CAR: not a list (got {obj?.GetType().Name ?? "null"}: {objStr})\n  at: {stackHint}", obj, Startup.Sym("LIST")));
     }
 
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
@@ -397,7 +397,7 @@ public static partial class Runtime
     {
         if (obj is Cons c) return c.Cdr;
         if (obj is Nil) return Nil.Instance;
-        throw new LispErrorException(new LispTypeError("CDR: not a list", obj));
+        throw new LispErrorException(new LispTypeError("CDR: not a list", obj, Startup.Sym("LIST")));
     }
 
     public static LispObject MakeCons(LispObject car, LispObject cdr) => new Cons(car, cdr);

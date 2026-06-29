@@ -417,6 +417,18 @@
 (setq *hang-tests* '())
 (in-package :cl-user)
 
+;;; dotcl, like SBCL/CCL/ECL, purposefully does NOT signal FLOATING-POINT-UNDERFLOW
+;;; by default — expt/exp/* flush a float underflow to 0.0. The ansi-test suite tags
+;;; the 8 EXP.ERROR.8-11 / EXPT.ERROR.8-11 tests with :no-floating-point-underflow-by-default
+;;; (and :ansi-spec-problem, since 12.1.4.3 and the per-op "might signal" wording conflict);
+;;; SBCL et al. skip them via this note. Register it as disabled here (ansi-test/ is a
+;;; fresh clone, so we can't add a #+dotcl line to its notes.lsp). Done after all category
+;;; loads so nothing overwrites it before do-tests.
+(in-package :regression-test)
+(defnote :no-floating-point-underflow-by-default
+  "dotcl flushes FP underflow to 0.0 by default (SBCL/CCL/ECL behavior)." t)
+(in-package :cl-user)
+
 ;;; Run the tests — must be in CL-TEST package since tests use read-from-string
 ;;; and expect symbols to be interned in CL-TEST (where they were defined)
 (in-package :cl-test)

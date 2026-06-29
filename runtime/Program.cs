@@ -415,9 +415,25 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
                     Environment.Exit(2);
                 }
             }
+            // Build diagnostics in MSBuild canonical format so IDEs surface them in
+            // the Error List with click-to-navigate (dotcl/dotcl#48).
             catch (LispSourceException lse)
             {
-                Console.Error.WriteLine(lse.FormatTrace());
+                Console.Error.WriteLine(lse.FormatMsBuildDiagnostic());
+                Environment.Exit(1);
+            }
+            catch (LispErrorException lee)
+            {
+                // Error without a located form (e.g. during setup, dep load, or the
+                // module link/save phase). Use the asd as origin so it is still
+                // canonical (clickable to the project) rather than an unhandled stack.
+                Console.Error.WriteLine($"{buildAsd} : error DOTCL: {lee.Message}");
+                Environment.Exit(1);
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"{buildAsd} : error DOTCL: {ex.Message}");
+                if (Startup.DebugStacktrace) Console.Error.WriteLine(ex.StackTrace);
                 Environment.Exit(1);
             }
             return;

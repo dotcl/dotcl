@@ -128,6 +128,8 @@ public class FaslAssembler
     {
         Console.Error.WriteLine($"[FaslAssembler] Error in {where}: {ex.GetType().Name}: {ex.Message}");
         Console.Error.WriteLine($"[FaslAssembler] Unique string bytes tracked: {map.UniqueStringBytes:N0}");
+        if (Environment.GetEnvironmentVariable("DOTCL_FASL_DIAG") != null)
+            Console.Error.WriteLine($"[FaslAssembler] STACK:\n{ex.StackTrace}");
         Console.Error.Flush();
     }
 

@@ -592,19 +592,15 @@ public static partial class Runtime
                 Number real, imag;
                 if (num is LispComplex cx) { real = cx.Real; imag = cx.Imaginary; }
                 else { real = num; imag = Fixnum.Make(0); }
-                if (partType is Symbol pts)
+                // Coerce each part through Coerce(part, partType) rather than matching
+                // a literal float name, so a deftype part — e.g. (complex flonum), where
+                // flonum is a deftype expanding to double-float — is expanded and the
+                // parts converted. A wildcard/absent part type leaves the parts as-is.
+                if (partType is not null && partType is not Nil
+                    && !(partType is Symbol wsym && wsym.Name == "*"))
                 {
-                    string ptn = pts.Name;
-                    if (ptn is "SINGLE-FLOAT" or "SHORT-FLOAT")
-                    {
-                        real = new SingleFloat((float)Arithmetic.ToDouble(real));
-                        imag = new SingleFloat((float)Arithmetic.ToDouble(imag));
-                    }
-                    else if (ptn is "DOUBLE-FLOAT" or "LONG-FLOAT")
-                    {
-                        real = new DoubleFloat(Arithmetic.ToDouble(real));
-                        imag = new DoubleFloat(Arithmetic.ToDouble(imag));
-                    }
+                    real = AsNumber(Coerce(real, partType));
+                    imag = AsNumber(Coerce(imag, partType));
                 }
                 return new LispComplex(real, imag);
             }
@@ -1651,8 +1647,43 @@ public static partial class Runtime
         return MultipleValues.Primary(result);
     }
 
-    // Core remove logic shared by REMOVE and REMOVE-IF
-    private static LispObject RemoveCore(LispObject seq, SeqKwArgs kw, Func<LispObject, bool> matches)
+    // DELETE: like REMOVE but destructive on list arguments (in-place splice).
+    public static LispObject DeleteFull(LispObject[] args)
+    {
+        if (args.Length < 2)
+            throw new LispErrorException(new LispProgramError("DELETE: too few arguments"));
+        var item = args[0];
+        var seq = args[1];
+        if (seq is not Nil && seq is not Cons && seq is not LispVector && seq is not LispString)
+            throw new LispErrorException(new LispTypeError("DELETE: not a sequence", seq));
+        var kw = ParseSeqKwArgs(args, 2, "DELETE");
+        return RemoveCore(seq, kw, (elem) => SeqTestMatch(item, elem, kw), destructive: true);
+    }
+
+    // DELETE-IF: like REMOVE-IF but destructive on list arguments.
+    public static LispObject DeleteIf(LispObject[] args)
+    {
+        if (args.Length < 2)
+            throw new LispErrorException(new LispProgramError("DELETE-IF: too few arguments"));
+        var predFn = CoerceToFunction(args[0]);
+        var seq = args[1];
+        if (seq is not Nil && seq is not Cons && seq is not LispVector && seq is not LispString)
+            throw new LispErrorException(new LispTypeError("DELETE-IF: not a sequence", seq));
+        var kw = ParseSeqKwArgs(args, 2, "DELETE-IF");
+        var result = RemoveCore(seq, kw, (elem) =>
+        {
+            var val = kw.Key != null ? kw.Key.Invoke1(elem) : elem;
+            return IsTruthy(predFn.Invoke1(val));
+        }, destructive: true);
+        return MultipleValues.Primary(result);
+    }
+
+    // Core remove logic shared by REMOVE/REMOVE-IF (destructive=false) and
+    // DELETE/DELETE-IF (destructive=true). When destructive and the sequence is a
+    // list, matched conses are spliced out of the original chain in place (SBCL
+    // semantics) so code that discards the return value and relies on in-place
+    // mutation — e.g. Maxima rempropchk / mfunction-delete — works.
+    private static LispObject RemoveCore(LispObject seq, SeqKwArgs kw, Func<LispObject, bool> matches, bool destructive = false)
     {
         if (seq is Nil) return Nil.Instance;
 
@@ -1732,34 +1763,56 @@ public static partial class Runtime
             int len = allElems.Count;
             int end = endOpt ?? len;
 
+            // Determine which indices to drop. matches() (which may run user :key /
+            // :test code) is called in the same order/count as the legacy build path.
+            var removeSet = new System.Collections.Generic.HashSet<int>();
             if (fromEnd && maxRem.HasValue)
             {
-                // FROM-END with COUNT: find match positions in [start,end), remove rightmost maxRem
+                // FROM-END with COUNT: match positions in [start,end), drop rightmost maxRem
                 var matchPositions = new System.Collections.Generic.List<int>();
                 for (int i = start; i < end; i++)
                     if (matches(allElems[i])) matchPositions.Add(i);
-                var removeSet = new System.Collections.Generic.HashSet<int>();
                 for (int i = matchPositions.Count - 1; i >= 0 && removeSet.Count < maxRem.Value; i--)
                     removeSet.Add(matchPositions[i]);
-                var result = new System.Collections.Generic.List<LispObject>();
-                for (int i = 0; i < len; i++)
-                    if (!removeSet.Contains(i)) result.Add(allElems[i]);
-                return removeSet.Count == 0 ? listSeq : List(result.ToArray());
             }
             else
             {
-                // Forward scan
-                var result = new System.Collections.Generic.List<LispObject>();
+                // Forward scan: drop first maxRem matches in [start,end)
                 int removed = 0;
                 for (int i = 0; i < len; i++)
-                {
                     if (i >= start && i < end && (!maxRem.HasValue || removed < maxRem.Value) && matches(allElems[i]))
-                        removed++;
-                    else
-                        result.Add(allElems[i]);
-                }
-                return removed == 0 ? listSeq : List(result.ToArray());
+                        { removeSet.Add(i); removed++; }
             }
+
+            // Nothing removed: return the original list (eq), so a no-op delete still
+            // shares structure for a following nconc (Maxima add2lnc idiom).
+            if (removeSet.Count == 0) return listSeq;
+
+            if (destructive)
+            {
+                // Splice matched conses out of the original chain in place, relinking
+                // each survivor's cdr past the removed run. Returns the (possibly new) head.
+                LispObject newHead = listSeq;
+                Cons prev = null;
+                int idx = 0;
+                for (var cur = listSeq; cur is Cons c; idx++)
+                {
+                    var next = c.Cdr;
+                    if (removeSet.Contains(idx))
+                    {
+                        if (prev == null) newHead = next; else prev.Cdr = next;
+                    }
+                    else prev = c;
+                    cur = next;
+                }
+                return newHead;
+            }
+
+            // Non-destructive (remove): build a fresh list of the survivors.
+            var result = new System.Collections.Generic.List<LispObject>(len - removeSet.Count);
+            for (int i = 0; i < len; i++)
+                if (!removeSet.Contains(i)) result.Add(allElems[i]);
+            return List(result.ToArray());
         }
     }
 
@@ -2572,11 +2625,11 @@ public static partial class Runtime
                 newArgs[0] = new LispFunction(a => Runtime.IsTruthy(predFn.Invoke(a)) ? Nil.Instance : T.Instance);
                 return Runtime.RemoveIf(newArgs);
             }));
-        // DELETE, DELETE-IF, DELETE-IF-NOT
+        // DELETE, DELETE-IF, DELETE-IF-NOT — destructive on list args.
         Emitter.CilAssembler.RegisterFunction("DELETE",
-            new LispFunction(args => Runtime.RemoveFull(args)));
+            new LispFunction(args => Runtime.DeleteFull(args)));
         Emitter.CilAssembler.RegisterFunction("DELETE-IF",
-            new LispFunction(args => Runtime.RemoveIf(args)));
+            new LispFunction(args => Runtime.DeleteIf(args)));
         Emitter.CilAssembler.RegisterFunction("DELETE-IF-NOT",
             new LispFunction(args =>
             {
@@ -2584,7 +2637,7 @@ public static partial class Runtime
                 var newArgs = new LispObject[args.Length];
                 Array.Copy(args, newArgs, args.Length);
                 newArgs[0] = new LispFunction(a => Runtime.IsTruthy(predFn.Invoke(a)) ? Nil.Instance : T.Instance);
-                return Runtime.RemoveIf(newArgs);
+                return Runtime.DeleteIf(newArgs);
             }));
         // SUBSTITUTE, SUBSTITUTE-IF, SUBSTITUTE-IF-NOT
         Emitter.CilAssembler.RegisterFunction("SUBSTITUTE",

@@ -1,11 +1,11 @@
-# AspNetLispDemo — ASP.NET Core Controller を Lisp で書く
+# AspNetLispDemo — write an ASP.NET Core Controller in Lisp
 
-dotcl を ASP.NET Core プロセスのインプロセスランタイムとして埋め込み、
-**`Microsoft.AspNetCore.Mvc.ControllerBase` 派生型を Lisp 側で定義** して
-HTTP endpoint を serve する最小サンプル。MAUI demo と同じ
-「.NET framework type を Lisp で継承」パターンを web 側に展開した形。
+A minimal sample that embeds dotcl as an in-process runtime inside an ASP.NET
+Core process and **defines a `Microsoft.AspNetCore.Mvc.ControllerBase` subtype
+in Lisp** to serve HTTP endpoints. It applies the same "subclass a .NET
+framework type from Lisp" pattern as the MAUI demo, on the web side.
 
-## 動作
+## Behavior
 
 ```
 $ dotnet build
@@ -20,14 +20,14 @@ $ curl http://localhost:5180/api/async-hello
 hello from async lisp
 ```
 
-`/api/hello` は同期 MVC controller、`/api/async-hello` は Lisp の
-`(dotcl:async ...)` ハンドラ (Task 生成側) を Minimal API route に繋いだもの。
-後者はリクエストスレッドをブロックせず、ハンドラ内の `dotcl:await` が
-実 .NET Task (`Task.Delay`) をスレッドプール上で待つ。
+`/api/hello` is a synchronous MVC controller; `/api/async-hello` wires a Lisp
+`(dotcl:async ...)` handler (the Task producer side) to a Minimal API route. The
+latter does not block the request thread — the `dotcl:await` inside the handler
+waits on a real .NET Task (`Task.Delay`) on the thread pool.
 
-## Lisp 側
+## The Lisp side
 
-`main.lisp` 全体は ~10 行:
+The whole of `main.lisp` is ~10 lines:
 
 ```lisp
 (require :dotnet-class)
@@ -48,15 +48,14 @@ hello from async lisp
                   "hello from lisp"))))
 ```
 
-- `dotnet:define-class` の `:attributes` でクラスに `[Route]`、
-  メソッドに `[HttpGet]` を載せる
-- メソッドの戻り値は `IActionResult`、body で `OkObjectResult` を
-  返すと MVC がそのまま JSON / text として serialize
+- `dotnet:define-class`'s `:attributes` put `[Route]` on the class and
+  `[HttpGet]` on the method.
+- The method returns `IActionResult`; returning an `OkObjectResult` from the
+  body lets MVC serialize it as JSON / text.
 
-## C# 側 (`Program.cs`)
+## The C# side (`Program.cs`)
 
-dotcl boot → ASP.NET 起動 → 動的アセンブリを ApplicationPart として
-adopt:
+dotcl boot → start ASP.NET → adopt the dynamic assembly as an ApplicationPart:
 
 ```csharp
 DotclHost.Initialize();
@@ -66,39 +65,41 @@ DotclHost.LoadFromManifest(...);   // dotcl.core + dotnet-class.fasl
 builder.Services.AddControllers()
     .ConfigureApplicationPartManager(apm =>
     {
-        // AppDomain.CurrentDomain.GetAssemblies() を walk、ControllerBase
-        // 派生型を持つアセンブリを ApplicationPart として登録。
-        // dotcl が emit した DotclDynamic_N アセンブリもここに含まれる。
+        // Walk AppDomain.CurrentDomain.GetAssemblies() and register any
+        // assembly that holds a ControllerBase subtype as an ApplicationPart.
+        // The DotclDynamic_N assembly dotcl emitted is included here too.
     });
 
 app.MapControllers();
 app.Run("http://localhost:5180");
 ```
 
-## 組込みかた
+## How it's wired
 
-`AspNetLispDemo.csproj` は MauiLispDemo と同じ `<DotclProjectAsd>` +
-`<Import Project="...Dotcl.targets" />` パターン。`AspNetLispDemo.asd`
-で `:depends-on ("dotnet-class")` + `:components ((:file "main"))` を
-宣言、build target が manifest 経由で必要なものを bundle する。
+`AspNetLispDemo.csproj` uses the same `<DotclProjectAsd>` +
+`<Import Project="...Dotcl.targets" />` pattern as MauiLispDemo.
+`AspNetLispDemo.asd` declares `:depends-on ("dotnet-class")` +
+`:components ((:file "main"))`, and the build target bundles what's needed via
+the manifest.
 
-## 制約 / 後続課題
+## Limitations / follow-ups
 
-- **静的 Controller 定義のみ**: ランタイムで `(dotnet:define-class ...)` で
-  新しい Controller を生やしても MVC の routing table は再構築されない。
-  Hot-add / hot-redefine は別の仕組みが要る (e.g.,
-  `IActionDescriptorChangeProvider`)
-- **MVC と Minimal API の併用**: MVC controller (`/api/hello`) は「Lisp で
-  Controller」の絵に、Minimal API trampoline (`/api/async-hello`) は Lisp の
-  `dotcl:async` ハンドラ (Task 生成側) を繋ぐ軽い経路に使い分けている。
-  後者は `DotclHost.Call` で Lisp 関数を呼んで `Task<LispObject>` を受け取り、
-  C# 側で `await` する。MVC async action (`Task<IActionResult>` 戻り) への
-  直接バインドは型変換が要るため、現状は Minimal API 経由が素直。
-- **DI container**: 現在 Controller は parameterless ctor 想定。コンストラクタ
-  注入は dotcl 側の ctor シグネチャ拡張が要る (`dotnet:define-class` の
-  `:ctor` は現状 zero-arg のみ)
+- **Static controller definition only**: defining a new controller at runtime
+  with `(dotnet:define-class ...)` does not rebuild MVC's routing table.
+  Hot-add / hot-redefine needs a separate mechanism (e.g.
+  `IActionDescriptorChangeProvider`).
+- **MVC + Minimal API together**: the MVC controller (`/api/hello`) shows
+  "a controller in Lisp"; the Minimal API trampoline (`/api/async-hello`) is a
+  lightweight path that wires the Lisp `dotcl:async` handler (Task producer
+  side). The latter calls the Lisp function via `DotclHost.Call`, gets a
+  `Task<LispObject>`, and `await`s it on the C# side. Directly binding an MVC
+  async action (returning `Task<IActionResult>`) needs type conversion, so for
+  now going through Minimal API is the simplest.
+- **DI container**: controllers currently assume a parameterless ctor.
+  Constructor injection requires extending the ctor signature on the dotcl side
+  (`dotnet:define-class`'s `:ctor` is currently zero-arg only).
 
-## 関連
+## See also
 
-- MauiLispDemo: 同じ "Lisp で .NET type を継承" のパターンを desktop / mobile に適用
-- build pipeline は MauiLispDemo と同じ `<DotclProjectAsd>` パターンを流用
+- MauiLispDemo: the same "subclass a .NET type from Lisp" pattern on desktop / mobile.
+- The build pipeline reuses the same `<DotclProjectAsd>` pattern as MauiLispDemo.

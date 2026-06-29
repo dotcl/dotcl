@@ -12,4 +12,4 @@
             (dotnet:static "System.DateTime" "Now")))
   ;; SVSFlagsAsync = 1 — return immediately (process can exit before audio finishes
   ;; if 0 is passed and the process is killed), but we want to wait so use 0.
-  (dotnet:invoke voice "Speak" "おはようございます、dotclからのお知らせです" 0))
+  (dotnet:invoke voice "Speak" "Good morning. This is a notification from dotcl." 0))

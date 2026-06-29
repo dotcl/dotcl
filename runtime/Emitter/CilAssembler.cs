@@ -23,6 +23,101 @@ public partial class CilAssembler
     private static int _constantsSize;
     private static readonly object _constantsLock = new();
 
+    // --- Per-compilation-unit constant store for closure DynamicMethods ---
+    //
+    // Closure inner-lambda DynamicMethods used to go into the global _constants
+    // pool (via AddConstant) and were rooted forever, so the unmanaged JIT code
+    // behind each one never freed — the dominant RSS driver on large loads
+    // (Coalton / SBCL XC). The fix routes those DMs through a store keyed by the
+    // compilation unit (one AssembleAndRunSingle = one unit) so a later phase can
+    // make whole units collectible once the enclosing compiled function is
+    // unreachable.
+    //
+    // S3 is the scaffolding only: the unit store is a permanent global root
+    // (entries are never removed), so this is behavior-equivalent to the old
+    // global pool — a pure refactor whose acceptance test is zero regression and
+    // an unchanged dynamic-method count from dotcl:emit-pool-stats. S4 makes the
+    // store collectible.
+    //
+    // The map holds each unit's closure-DM list only *weakly* : the
+    // strong owners are the LispFunctions that can call MakeClosure into that
+    // unit (the enclosing defun/lambda and the closures it builds — they pin the
+    // holder via LispFunction.RetainUnit), plus AssembleAndRunSingle's own local
+    // for the duration of the unit's first run. Once all of those die, the holder
+    // (a List<object>) is collected, its DynamicMethods become unreferenced, and
+    // the unmanaged JIT code behind them frees — the RSS leak.
+    //
+    // Concurrency: a unit's list is appended only during that unit's assembly
+    // walk (single-threaded — Assemble emits IL, it does not run Lisp), and the
+    // unit's MakeClosure calls cannot execute until after that IL is created, so
+    // the list is frozen by the time any reader touches it. The map is a
+    // ConcurrentDictionary so a runtime thread building a closure can read while
+    // another thread compiles a *different* unit.
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<int, WeakReference<List<object>>> _unitStore = new();
+    private static int _nextUnitId;
+    private static int _unitRegistrations;
+
+    // The compilation unit being assembled on this thread. The holder collects
+    // the unit's closure body DMs; both are set only during the IL walk (which
+    // never runs Lisp) and restored after, so a re-entrant assembly triggered by
+    // the toplevel form's execution gets its own unit. Declared here (emit-free
+    // half) so AddConstant — which roots parent functions — can pin the holder
+    // onto them; the field is plain data and is harmless on netstandard2.0 where
+    // the emit half is compiled out.
+    [ThreadStatic] internal static int _currentUnitId;
+    [ThreadStatic] internal static List<object>? _currentUnitDms;
+
+    /// <summary>Append a closure body DynamicMethod to the unit being assembled
+    /// and return its index within that unit. The (unitId, index) pair is baked
+    /// into the MakeClosure call.</summary>
+    internal static int AddUnitConstant(object value)
+    {
+        var holder = _currentUnitDms!;
+        int idx = holder.Count;
+        holder.Add(value);
+        return idx;
+    }
+
+    /// <summary>Allocate a fresh compilation-unit id. Called once per
+    /// AssembleAndRunSingle; the id is baked into the unit's MakeClosure call
+    /// sites as a literal so closures resolve their body DM at runtime.</summary>
+    internal static int BeginUnit() => System.Threading.Interlocked.Increment(ref _nextUnitId);
+
+    /// <summary>Publish a unit's holder into the weak map so MakeClosure can
+    /// resolve it by id at runtime. Called once, after the unit is assembled,
+    /// only when it actually produced closure DMs. Opportunistically prunes map
+    /// entries whose holder has already been collected.</summary>
+    internal static void RegisterUnit(int unitId, List<object> holder)
+    {
+        _unitStore[unitId] = new WeakReference<List<object>>(holder);
+        if ((System.Threading.Interlocked.Increment(ref _unitRegistrations) & 1023) == 0)
+            PruneDeadUnits();
+    }
+
+    private static void PruneDeadUnits()
+    {
+        foreach (var kv in _unitStore)
+            if (!kv.Value.TryGetTarget(out _))
+                ((System.Collections.Generic.ICollection<System.Collections.Generic.KeyValuePair<int, WeakReference<List<object>>>>)_unitStore)
+                    .Remove(kv);
+    }
+
+    /// <summary>Resolve a unit's live holder, or null if it has been collected
+    /// (which only happens once no function can still call into it).</summary>
+    internal static List<object>? TryGetUnitHolder(int unitId) =>
+        _unitStore.TryGetValue(unitId, out var wr) && wr.TryGetTarget(out var holder) ? holder : null;
+
+    /// <summary>Load a unit-scoped constant (e.g. a MAKE-FUNCTION lambda object)
+    /// from emitted IL — the per-unit, collectible counterpart of GetConstant.
+    /// The holder is live whenever this runs: the loading code either runs once
+    /// under AssembleAndRunSingle's GC.KeepAlive, or is a rooted function that
+    /// pins the holder via RetainUnit.</summary>
+    public static object GetUnitConstant(int unitId, int index) =>
+        (TryGetUnitHolder(unitId)
+            ?? throw new LispErrorException(new LispProgramError(
+                "internal: compilation-unit constant was collected while still loadable")))
+        [index];
+
     /// <summary>Precompiled-only mode: when true, any attempt to generate code at
     /// runtime (eval/compile of compound forms, dotnet:define-class, native FFI
     /// thunks) throws instead of emitting. Lets a host run a precompiled-only
@@ -71,6 +166,7 @@ public partial class CilAssembler
             _constants = Array.Empty<object>();
             _constantsSize = 0;
         }
+        _unitStore.Clear();
     }
 
     public static LispFunction GetFunction(string name)
@@ -236,6 +332,17 @@ public partial class CilAssembler
 
     public static int AddConstant(object value)
     {
+        // A function rooted in the global pool (defun re-registration, anonymous
+        // lambda) whose body built closures must keep that unit's closure DMs
+        // alive as long as it can call MakeClosure into the unit — otherwise the
+        // weak unit map would let the holder collect and a later call would fault.
+        // This is the single chokepoint every rooted parent function passes
+        // through, so retention is set here rather than at each emit site. The
+        // closures themselves are pinned in MakeClosure.
+        if (value is LispFunction lf && lf.RetainUnit == null
+            && _currentUnitDms is { Count: > 0 } holder)
+            lf.RetainUnit = holder;
+
         lock (_constantsLock)
         {
             int idx = _constantsSize;
@@ -268,4 +375,36 @@ public partial class CilAssembler
         System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
     public static object GetConstant(int index) =>
         System.Threading.Volatile.Read(ref _constants)[index];
+
+    /// <summary>Diagnostic snapshot of the global constant pool. Returns
+    /// the live entry count, how many are retained DynamicMethods — each roots a
+    /// JIT-compiled body whose unmanaged code never frees because the static pool
+    /// is never reset — and the remaining data literals. The DynamicMethod count
+    /// is the proxy for the off-GC-heap JIT memory that drives RSS growth on large
+    /// loads (SBCL XC / Coalton). Used to size the per-compilation-unit pool work.</summary>
+    public static (int total, int dynamicMethods, int data) ConstantsPoolStats()
+    {
+        var arr = System.Threading.Volatile.Read(ref _constants);
+        int size = System.Threading.Volatile.Read(ref _constantsSize);
+        int dm = 0;
+        int unitTotal = 0, unitDm = 0;
+#if DOTCL_EMIT
+        for (int i = 0; i < size; i++)
+            if (arr[i] is System.Reflection.Emit.DynamicMethod) dm++;
+        // Closure body DMs live in the per-unit store, not the global
+        // pool. Count the live ones (a weak holder may already be collected) so
+        // the dynamic-method total reflects what is still rooted — the figure
+        // that should now *fall* when closure-producing functions are dropped.
+        foreach (var wr in _unitStore.Values)
+        {
+            if (!wr.TryGetTarget(out var list)) continue;
+            foreach (var v in list)
+            {
+                unitTotal++;
+                if (v is System.Reflection.Emit.DynamicMethod) unitDm++;
+            }
+        }
+#endif
+        return (size + unitTotal, dm + unitDm, (size - dm) + (unitTotal - unitDm));
+    }
 }

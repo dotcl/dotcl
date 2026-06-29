@@ -153,3 +153,19 @@
 (deftest direct-value-receiver-enum-tostring
   (dotnet:invoke (dotnet:box "Read, Write" "System.IO.FileShare") "ToString")
   "ReadWrite")
+
+;; /: the slot-share / single-ref passes must enumerate locals carried in
+;; :dotnet-call-direct-locals operand lists (RECV + ARGs), not just top-level
+;; :ldloc/:stloc. Here SB lives across three typed Append calls while the extra
+;; LispObject let* locals (A B C) give the slot-merge pass disjoint candidates to
+;; coalesce. If the nested DRCV/DARG references were invisible to the merge scan,
+;; a coalesced slot would clobber a still-live arg (assembly error / wrong
+;; output). Centralized enumeration keeps them live; result must be "x22z".
+(deftest direct-locals-slot-share-keeps-nested-args
+  (let* ((sb (dotnet:new "System.Text.StringBuilder"))
+         (a (progn (%dotnet-call-direct "System.Text.StringBuilder" "Append" ("System.String") sb "x") 1))
+         (b (progn (%dotnet-call-direct "System.Text.StringBuilder" "Append" ("System.Int32") sb 22) 2))
+         (c (progn (%dotnet-call-direct "System.Text.StringBuilder" "Append" ("System.String") sb "z") 3)))
+    (declare (ignore a b c))
+    (%dotnet-call-direct "System.Text.StringBuilder" "ToString" () sb))
+  "x22z")

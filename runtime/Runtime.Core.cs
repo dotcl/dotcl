@@ -503,6 +503,10 @@ public static partial class Runtime
         UnregisterMacroFunction(sym);
         // Also remove from compiler's *macros* hash table (keyed by symbol identity)
         RemoveCompilerMacro(sym);
+        // And drop any user define-compiler-macro: otherwise a stale compiler macro
+        // keeps rewriting calls (e.g. $foo -> $foo-impl) after the function is killed
+        // and redefined with a different signature, referencing a removed -IMPL.
+        RemoveUserCompilerMacro(sym);
         return sym;
     }
 
@@ -741,8 +745,26 @@ public static partial class Runtime
     /// .NET type. Newly compiled handler-case catch blocks call this (passing the
     /// Exception object); the message keeps the dotcl:*debug-stacktrace* formatting.
     /// </summary>
+    /// <summary>
+    /// Map a well-known CLR exception to its ANSI condition type so handler-case /
+    /// handler-bind can catch it specifically, instead of the generic PROGRAM-ERROR
+    /// wrapper. A raw .NET DivideByZeroException (integer 0-divide via ratio
+    /// construction, TRUNCATE/REM/MOD, etc.) must surface as DIVISION-BY-ZERO — a
+    /// subtype of ARITHMETIC-ERROR — not PROGRAM-ERROR. Returns null when there is
+    /// no specific mapping (caller falls back to PROGRAM-ERROR).
+    /// </summary>
+    private static LispError? MapWellKnownClrException(Exception ex)
+    {
+        if (ex is DivideByZeroException)
+            return new LispError(ex.Message)
+            { ConditionTypeName = "DIVISION-BY-ZERO", ClrExceptionType = ex.GetType() };
+        return null;
+    }
+
     public static LispObject WrapDotNetExceptionObj(Exception ex)
     {
+        var mapped = MapWellKnownClrException(ex);
+        if (mapped != null) return mapped;
         var message = Startup.DebugStacktrace && !string.IsNullOrEmpty(ex.StackTrace)
             ? ex.Message + "\n[.NET " + ex.GetType().Name + "]\n" + ex.StackTrace
             : ex.Message;
@@ -776,6 +798,10 @@ public static partial class Runtime
             ex is GoException || ex is RestartInvocationException ||
             ex is LispErrorException || ex is HandlerCaseInvocationException)
             throw ex;
+        // Well-known CLR exceptions (e.g. DivideByZeroException) map to their ANSI
+        // condition type so handler-bind can catch division-by-zero / arithmetic-error.
+        var mapped = MapWellKnownClrException(ex);
+        if (mapped != null) throw new LispErrorException(mapped);
         // Wrap unknown .NET exceptions and signal through handler-bind. The .NET
         // type + StackTrace is appended only under dotcl:*debug-stacktrace*, so
         // ordinary error reports stay clean and don't leak the .NET internal stack.
@@ -895,6 +921,52 @@ public static partial class Runtime
         {
             RestartClusterStack.PopCluster();
         }
+    }
+
+    /// <summary>Push a handler cluster from ((type-spec . handler-fn) ...). Paired with
+    /// %POP-HANDLER-CLUSTER (via unwind-protect) by the HANDLER-BIND macro expansion, so
+    /// the expansion keeps the body INLINE (progn) rather than in a lambda thunk — code
+    /// walkers can then walk into the body. Same cluster mechanism as the
+    /// HANDLER-BIND special form; HandlerClusterStack.Signal restores clusters in a
+    /// finally, so the pop stays balanced even on a non-local exit from a handler.</summary>
+    public static LispObject PushHandlerCluster(LispObject bindingsList)
+    {
+        var bindings = new System.Collections.Generic.List<HandlerBinding>();
+        for (var c = bindingsList; c is Cons cc; c = cc.Cdr)
+            if (cc.Car is Cons pair)
+                bindings.Add(new HandlerBinding(pair.Car, CoerceToFunction(pair.Cdr)));
+        HandlerClusterStack.PushCluster(bindings.ToArray());
+        return Nil.Instance;
+    }
+
+    public static LispObject PopHandlerCluster()
+    {
+        HandlerClusterStack.PopCluster();
+        return Nil.Instance;
+    }
+
+    /// <summary>Push a restart cluster from ((name . handler-fn) ...). Paired with
+    /// %POP-RESTART-CLUSTER by the RESTART-BIND macro expansion.</summary>
+    public static LispObject PushRestartCluster(LispObject bindingsList)
+    {
+        var restarts = new System.Collections.Generic.List<LispRestart>();
+        for (var c = bindingsList; c is Cons cc; c = cc.Cdr)
+        {
+            if (cc.Car is Cons pair && pair.Car is Symbol name)
+            {
+                var hfn = CoerceToFunction(pair.Cdr);
+                restarts.Add(new LispRestart(name.Name, a => hfn.Invoke(a), null, new object(), true)
+                { NameSymbol = name });
+            }
+        }
+        RestartClusterStack.PushCluster(restarts.ToArray());
+        return Nil.Instance;
+    }
+
+    public static LispObject PopRestartCluster()
+    {
+        RestartClusterStack.PopCluster();
+        return Nil.Instance;
     }
 
     internal static void RegisterCoreBuiltins()

@@ -1,31 +1,31 @@
 # McpServerDemo — dotcl as an MCP tool
 
-dotcl (Common Lisp on .NET) を **Model Context Protocol** サーバとして
-公開する最小サンプル。Claude Desktop / Cursor / その他 MCP client から
-`lisp_eval` を tool として呼ぶと、このプロセス内の dotcl image で
-Lisp form が評価され、結果文字列が LLM に返る。
+A minimal sample that exposes dotcl (Common Lisp on .NET) as a **Model Context
+Protocol** server. When Claude Desktop / Cursor / any MCP client calls
+`lisp_eval` as a tool, the Lisp form is evaluated in the dotcl image inside this
+process and the result string is returned to the LLM.
 
-dotcl の eval / define-class / interop がそのまま LLM の"思考の道具"
-になる絵作りが狙い。
+The goal is to make dotcl's eval / define-class / interop a "tool for the LLM to
+think with", directly.
 
-## 公開される tool
+## Exposed tool
 
-- **`lisp_eval(code)`** — Common Lisp ソースを受け取り、
-  `(prin1-to-string (progn <code>))` を返す。DEFUN / DEFVAR などの
-  副作用は session-persistent (サーバプロセスが生きている間は残る)。
+- **`lisp_eval(code)`** — takes Common Lisp source and returns
+  `(prin1-to-string (progn <code>))`. Side effects such as DEFUN / DEFVAR are
+  session-persistent (they live as long as the server process does).
 
-## ビルド
+## Build
 
 ```
 dotnet build samples/McpServerDemo/McpServerDemo.csproj -c Release
 ```
 
-生成物: `bin/Release/net10.0/McpServerDemo.exe` (and `dotcl.core`,
-`contrib/` 一式が出力ディレクトリに bundle される)。
+Output: `bin/Release/net10.0/McpServerDemo.exe` (with `dotcl.core` and the
+`contrib/` set bundled into the output directory).
 
-## Claude Desktop に登録
+## Register with Claude Desktop
 
-`%APPDATA%\Claude\claude_desktop_config.json` (Windows) に以下を追加:
+Add the following to `%APPDATA%\Claude\claude_desktop_config.json` (Windows):
 
 ```json
 {
@@ -37,39 +37,39 @@ dotnet build samples/McpServerDemo/McpServerDemo.csproj -c Release
 }
 ```
 
-Claude Desktop を再起動すると、ツール一覧に `dotcl` provider が現れ、
-`lisp_eval` が見える。
+Restart Claude Desktop and the `dotcl` provider appears in the tool list, with
+`lisp_eval` visible.
 
-## Cursor の場合
+## For Cursor
 
-Cursor の MCP 設定 (設定画面または `~/.cursor/mcp.json`) にも同じ
-形式で登録可能。
+Cursor's MCP settings (the settings UI or `~/.cursor/mcp.json`) accept the same
+format.
 
-## 動作確認
+## Try it
 
-Claude Desktop の会話で:
+In a Claude Desktop conversation:
 
-> dotcl で (+ 1 2 3 4 5) を評価して
+> Evaluate (+ 1 2 3 4 5) with dotcl
 
-→ Claude が `lisp_eval` を呼び、`"15"` が返る。
+→ Claude calls `lisp_eval` and `"15"` comes back.
 
-DEFUN なども:
+DEFUN works too:
 
-> (defun fact (n) (if (<= n 1) 1 (* n (fact (- n 1))))) を評価して、
-> そのあと (fact 10) を評価して
+> Evaluate (defun fact (n) (if (<= n 1) 1 (* n (fact (- n 1))))),
+> then evaluate (fact 10)
 
-→ 初回 call で defun、2 回目 call で `"3628800"`。
+→ the first call defines fact, the second returns `"3628800"`.
 
-## 実装ノート
+## Implementation notes
 
-- dotcl runtime は thread-safe でないので、`_evalLock` で eval を直列化
-- `DotclHost.LoadCore` は boot 1 回だけ (0.3s ほどかかる)
-- MCP プロトコルが stdout を占有するので、log は全部 stderr (`LogToStandardErrorThreshold=Trace`)
-- 複数 form を入力すると PROGN で包まれて **最後の値だけ** 返す
-- エラーは `ERROR (<ExceptionType>): <message>` 形式の文字列で返す
-  (crash させずに LLM が自然に recover できるように)
+- The dotcl runtime is not thread-safe, so eval is serialized with `_evalLock`.
+- `DotclHost.LoadCore` boots only once (it takes ~0.3s).
+- The MCP protocol owns stdout, so all logs go to stderr (`LogToStandardErrorThreshold=Trace`).
+- Multiple forms are wrapped in PROGN, so **only the last value** is returned.
+- Errors are returned as a string of the form `ERROR (<ExceptionType>): <message>`
+  (so the LLM can recover naturally instead of the server crashing).
 
-## 関連
+## See also
 
 - [ModelContextProtocol C# SDK](https://github.com/modelcontextprotocol/csharp-sdk) (1.2.0, stable)
 - [MCP spec](https://modelcontextprotocol.io/)

@@ -246,7 +246,7 @@
               ,(if (eq *self-fn-local* :arg0) '(:ldarg 0) `(:ldloc ,*self-fn-local*))
               ,@(unless skip-reset '((:call "MultipleValues.Reset")))
               ,@(loop for tmp in temps append `((:ldloc ,tmp)))
-              (:callvirt ,(format nil "LispFunction.Invoke~D" n-args)))))))
+              (:callvirt ,(invoke-name n-args)))))))
     ;; Inline struct accessor: (accessor-name obj) → StructRefI with raw int index
     ;; Only when not shadowed by a local function (flet/labels)
     (when (and (symbolp name)
@@ -283,7 +283,7 @@
                   (:castclass "LispFunction")
                   ,@(unless skip-reset '((:call "MultipleValues.Reset")))
                   ,@(loop for tmp in temps append `((:ldloc ,tmp)))
-                  (:callvirt ,(format nil "LispFunction.Invoke~D" n-args))))
+                  (:callvirt ,(invoke-name n-args))))
               `((:declare-local ,args-tmp "LispObject[]")
                 ,@(compile-args-array args) (:stloc ,args-tmp)
                 ,@(if boxed-p
@@ -327,7 +327,7 @@
                           ,@(unless skip-reset '((:call "MultipleValues.Reset")))
                           ,@(loop for arg in args
                                   append (let ((*in-tail-position* nil)) (compile-expr arg)))
-                          (:callvirt ,(format nil "LispFunction.Invoke~D" n-args)))
+                          (:callvirt ,(invoke-name n-args)))
                         (let* ((da (compile-direct-call-args args))
                                (temps (car da))
                                (eval-instrs (cdr da)))
@@ -335,7 +335,7 @@
                             ,@load-fn
                             ,@(unless skip-reset '((:call "MultipleValues.Reset")))
                             ,@(loop for tmp in temps append `((:ldloc ,tmp)))
-                            (:callvirt ,(format nil "LispFunction.Invoke~D" n-args)))))
+                            (:callvirt ,(invoke-name n-args)))))
                     `((:declare-local ,args-tmp "LispObject[]")
                       ,@(compile-args-array args) (:stloc ,args-tmp)
                       ,@load-fn
@@ -709,6 +709,9 @@
           (consp (cdr form))
           (eq (cadr form) name))
      nil)
+    ;; (quote X) is data, not code — never descend. X may be a circular literal
+    ;; (e.g. '#1=(1 2 3 . #1#)); walking it would loop forever.
+    ((eq (car form) 'quote) nil)
     ;; Recurse into subforms (handle dotted pairs safely)
     (t (do ((cur form (cdr cur)))
            ((atom cur) (when cur (form-has-return-from-p name cur)))
@@ -1128,9 +1131,15 @@
    loop drops the non-tail call's result on the long body spine."
   (labels ((walk (x)
              (when (consp x)
-               (if (and (eq (car x) :ldloc) (consp (cdr x)) (eq (cadr x) key))
-                   (return-from %sil-references-local-p t)
-                   (progn (walk (car x)) (walk (cdr x)))))))
+               (cond
+                 ((and (eq (car x) :ldloc) (consp (cdr x)) (eq (cadr x) key))
+                  (return-from %sil-references-local-p t))
+                 ;; (:load-const OBJ) embeds a quoted data literal that may be
+                 ;; circular (e.g. '#1=(1 2 3 . #1#)); it is data, never SIL,
+                 ;; so it can't contain (:ldloc KEY). Don't descend — walking a
+                 ;; cyclic constant loops forever.
+                 ((eq (car x) :load-const) nil)
+                 (t (walk (car x)) (walk (cdr x)))))))
     (walk tree)
     nil))
 
@@ -1142,6 +1151,9 @@
         ((and (eq (car tree) :ldloc) (consp (cdr tree))
               (eq (cadr tree) key) (null (cddr tree)))
          '(:ldarg 0))
+        ;; (:load-const OBJ) holds an opaque (possibly circular) data literal —
+        ;; never a self-call receiver. Leave it untouched, don't recurse.
+        ((eq (car tree) :load-const) tree)
         (t (let ((a (%sil-subst-self-arg0 (car tree) key))
                  (d (%sil-subst-self-arg0 (cdr tree) key)))
              (if (and (eq a (car tree)) (eq d (cdr tree))) tree (cons a d))))))
@@ -2310,9 +2322,10 @@
 
 (defun compile-setq (var val-expr)
   "Compile (setq var value). Returns the assigned value on stack (single value)."
-  ;; If var is a symbol-macro, delegate to SETF of the expansion
-  (let ((sm-exp (lookup-symbol-macro var)))
-    (when sm-exp
+  ;; If var is a symbol-macro, delegate to SETF of the expansion (branch on found-p,
+  ;; not the expansion's truth value, so a NIL-expanding symbol-macro still delegates )
+  (multiple-value-bind (sm-exp found) (lookup-symbol-macro var)
+    (when found
       (return-from compile-setq (compile-expr `(setf ,sm-exp ,val-expr)))))
   ;; Variable assignment binds a single value. Force *in-mv-context* nil
   ;; and *in-tail-position* nil when compiling val-expr so MvReturn is
@@ -2886,7 +2899,7 @@
                   ,@eval-instrs
                   (:ldloc ,fn-tmp)
                   ,@(loop for tmp in temps append `((:ldloc ,tmp)))
-                  (:callvirt ,(format nil "LispFunction.Invoke~D" n-call-args))))
+                  (:callvirt ,(invoke-name n-call-args))))
               `(,@(let ((*in-mv-context* nil) (*in-tail-position* nil))
                     (compile-expr fn-expr))
                 (:call "Runtime.CoerceToFunction")
@@ -2897,84 +2910,7 @@
 ;;; function special form + flet / labels
 ;;; ============================================================
 
-(defvar *builtin-varargs-methods*
-  '(("+" . "Runtime.AddN") ("-" . "Runtime.SubtractN")
-    ("*" . "Runtime.MultiplyN") ("/" . "Runtime.DivideN")
-    ("=" . "Runtime.NumEqualN") ("/=" . "Runtime.NumNotEqualN")
-    ("<" . "Runtime.LessThanN") (">" . "Runtime.GreaterThanN")
-    ("<=" . "Runtime.LessEqualN") (">=" . "Runtime.GreaterEqualN"))
-  "Builtins that accept params LispObject[] directly.")
-
-(defvar *builtin-unary-methods*
-  '(("CAR" . "Runtime.Car") ("CDR" . "Runtime.Cdr")
-    ("NOT" . "Runtime.Not") ("NULL" . "Runtime.Not")
-    ("ATOM" . "Runtime.Atom") ("CONSP" . "Runtime.Consp")
-    ("LISTP" . "Runtime.Listp") ("NUMBERP" . "Runtime.Numberp")
-    ("INTEGERP" . "Runtime.Integerp") ("SYMBOLP" . "Runtime.Symbolp")
-    ("STRINGP" . "Runtime.Stringp") ("CHARACTERP" . "Runtime.Characterp")
-    ("FUNCTIONP" . "Runtime.Functionp") ("LENGTH" . "Runtime.Length")
-    ("ABS" . "Runtime.Abs") ("NREVERSE" . "Runtime.Nreverse")
-    ("LAST" . "Runtime.Last") ("COPY-LIST" . "Runtime.CopyList")
-    ("CADR" . "Runtime.Cadr") ("CDDR" . "Runtime.Cddr")
-    ("CAAR" . "Runtime.Caar") ("CDAR" . "Runtime.Cdar")
-    ("CADDR" . "Runtime.Caddr") ("PRINT" . "Runtime.Print")
-    ("PRIN1" . "Runtime.Prin1") ("PRINC" . "Runtime.Princ")
-    ("SYMBOL-NAME" . "Runtime.SymbolName")
-    ;; STRING-UPCASE/DOWNCASE removed: they take &key start end, so not truly unary.
-    ;; Wrapping as unary drops the LispObject[] and passes a single LispObject,
-    ;; but Runtime.StringUpcase expects LispObject[].
-    ("CHAR-CODE" . "Runtime.CharCode") ("CODE-CHAR" . "Runtime.CodeChar")
-    ("TYPE-OF" . "Runtime.TypeOf")
-    ("RATIONALP" . "Runtime.Rationalp") ("FLOATP" . "Runtime.Floatp")
-    ("COMPLEXP" . "Runtime.Complexp"))
-  "Builtins that take exactly 1 arg.")
-
-(defvar *builtin-binary-methods*
-  '(("CONS" . "Runtime.MakeCons") ("EQ" . "Runtime.Eq")
-    ("EQL" . "Runtime.Eql") ("EQUAL" . "Runtime.Equal")
-    ("MOD" . "Runtime.Mod") ("REM" . "Runtime.Rem")
-    ("NTH" . "Runtime.Nth") ("NTHCDR" . "Runtime.Nthcdr")
-    ("MEMBER" . "Runtime.Member") ("ASSOC" . "Runtime.Assoc")
-    ("RPLACA" . "Runtime.Rplaca") ("RPLACD" . "Runtime.Rplacd")
-    ("APPLY" . "Runtime.Apply"))
-  "Builtins that take exactly 2 args.")
-
 ;;; (TCO defvars moved to top of file for proper SBCL special-var recognition)
-
-(defun compile-builtin-function-ref (name-str)
-  "Compile a reference to a built-in function. Returns instruction list or NIL."
-  (let ((varargs (assoc name-str *builtin-varargs-methods* :test #'string=))
-        (unary (assoc name-str *builtin-unary-methods* :test #'string=))
-        (binary (assoc name-str *builtin-binary-methods* :test #'string=)))
-    (cond
-      (varargs
-       ;; Varargs: (lambda args) → call Runtime.XxxN(args)
-       `((:make-function :param-count 0 :name ,name-str
-          :body ((:ldarg 0) (:call ,(cdr varargs)) (:ret)))))
-      (unary
-       ;; Unary: check arity, then call Runtime.Xxx(arg)
-       `((:make-function :param-count 0 :name ,name-str
-          :body ((:ldstr ,name-str) (:ldarg 0) (:call "Runtime.CheckUnaryArity")
-                 (:ldarg 0) (:ldc-i4 0) (:ldelem-ref)
-                 (:call ,(cdr unary)) (:ret)))))
-      (binary
-       ;; Binary: check arity, then call Runtime.Xxx(a, b)
-       `((:make-function :param-count 0 :name ,name-str
-          :body ((:ldstr ,name-str) (:ldarg 0) (:call "Runtime.CheckBinaryArity")
-                 (:ldarg 0) (:ldc-i4 0) (:ldelem-ref)
-                 (:ldarg 0) (:ldc-i4 1) (:ldelem-ref)
-                 (:call ,(cdr binary)) (:ret)))))
-      ;; list: special case — varargs using Runtime.List
-      ((string= name-str "LIST")
-       `((:make-function :param-count 0 :name ,name-str
-          :body ((:ldarg 0) (:call "Runtime.List") (:ret)))))
-      ((string= name-str "LIST*")
-       `((:make-function :param-count 0 :name ,name-str
-          :body ((:ldarg 0) (:call "Runtime.ListStar") (:ret)))))
-      ((string= name-str "VALUES")
-       `((:make-function :param-count 0 :name ,name-str
-          :body ((:ldarg 0) (:call "Runtime.Values") (:ret)))))
-      (t nil))))
 
 (defun compile-function-special (thing)
   "Compile (function name) or (function (lambda ...))."
@@ -3000,24 +2936,17 @@
              (if boxed-p
                  `((:ldloc ,key) (:ldc-i4 0) (:ldelem-ref))
                  `((:ldloc ,key))))
-           ;; Check builtin — only for COMMON-LISP package symbols (or uninterned).
-           ;; A symbol like CONCRETE-SYNTAX-TREE:CONSP shadows CL:CONSP; looking it
-           ;; up by name alone would wrongly return the CL built-in wrapper.
-           (let* ((home-pkg (symbol-package thing))
-                  (is-cl-pkg (or (null home-pkg)
-                                 (string= (package-name home-pkg) "COMMON-LISP")))
-                  (builtin-instrs (and is-cl-pkg
-                                       (compile-builtin-function-ref (symbol-name thing)))))
-             (if builtin-instrs
-                 builtin-instrs
-                 ;; Global user-defined function — use symbol-based lookup so that
-                 ;; package-qualified names (e.g. #'bt2:current-thread) resolve to
-                 ;; the correct package's symbol, not a same-named symbol in another
-                 ;; package (e.g. dotcl:current-thread). GetFunctionBySymbol checks
-                 ;; sym.Function first, then falls back to cross-package search.
-                 `(,@(compile-sym-lookup thing)
-                   (:castclass "Symbol")
-                   (:call "CilAssembler.GetFunctionBySymbol")))))))
+           ;; Global function (built-in or user-defined) — use symbol-based lookup
+           ;; so that #'sym returns the SAME stable object as (symbol-function sym),
+           ;; i.e. (eq #'car #'car) and (eq #'car (symbol-function 'car)) are T.
+           ;; A fresh arity-checking wrapper per #' would break eq-on-builtin code
+           ;; (memoization, function tables, cl-store's fdefinition round-trip).
+           ;; Package-qualified names (e.g. #'bt2:current-thread) resolve to the
+           ;; correct package's symbol via compile-sym-lookup. GetFunctionBySymbol
+           ;; returns sym.Function, falling back to a cross-package search.
+           `(,@(compile-sym-lookup thing)
+             (:castclass "Symbol")
+             (:call "CilAssembler.GetFunctionBySymbol")))))
     (t (error "FUNCTION: unsupported argument ~s" thing))))
 
 ;;;; Mini S-expression interpreter for compile-macrolet
@@ -3157,8 +3086,8 @@
              (if (and (consp v) (eq (car v) 'SYMBOL-MACRO))
                  (%mini-eval (cadr v) env)
                  v))
-           (let ((sm (lookup-symbol-macro form)))
-             (if sm
+           (multiple-value-bind (sm found) (lookup-symbol-macro form)
+             (if found
                  (%mini-eval sm env)
                  ;; Not lexically bound: a global symbol macro
                  ;; (define-symbol-macro) expands via macroexpand-1; otherwise
@@ -3526,7 +3455,12 @@
                                     *locals*)
                          *locals*)))
       (unwind-protect
-          (compile-progn real-body)
+          ;; Push this macrolet onto *macroexpand-scope* so a form shared (by a
+          ;; splicing macro) between this shadowing scope and an outer scope is
+          ;; cached separately per scope. MACRO-DEFS is the source
+          ;; cons the analysis walk pushes too, keeping the two passes in sync.
+          (let ((*macroexpand-scope* (cons macro-defs *macroexpand-scope*)))
+            (compile-progn real-body))
         (dolist (entry saved)
           (if (cdr entry)
               (setf (gethash (car entry) *macros*) (cdr entry))
@@ -4197,6 +4131,18 @@
 ;;; handler-case
 ;;; ============================================================
 
+(defun %handler-type-spec-load (type-spec)
+  "Instructions that push the handler clause's type specifier as a LispObject for
+   Runtime.Typep. A bare symbol / class metaobject loads its name symbol (Typep
+   matches CL condition types by name); a compound specifier — (or ...), (and ...),
+   (member ...), a deftype, etc. — is loaded as its literal list so Typep evaluates
+   it (was previously stringified into one bogus symbol, so (or ...) never matched)."
+  (cond
+    ((symbolp type-spec) `((:ldstr ,(symbol-name type-spec)) (:call "Startup.Sym")))
+    ((and (typep type-spec 'standard-object) (class-name type-spec))
+     `((:ldstr ,(symbol-name (class-name type-spec))) (:call "Startup.Sym")))
+    (t (compile-quoted type-spec))))
+
 (defun compile-handler-case (body-form clauses)
   "Compile (handler-case body (type1 (var) handler1...) (type2 () handler2...) ...).
    Uses HandlerClusterStack so handler-case takes priority over enclosing handler-bind
@@ -4217,17 +4163,12 @@
          ;; Parse clauses: each is (type-name var handler-body)
          (parsed (mapcar (lambda (clause)
                            (let* ((type-spec (car clause))
-                                  (type-name (cond ((symbolp type-spec) (symbol-name type-spec))
-                                                   ((and (typep type-spec 'standard-object)
-                                                         (class-name type-spec))
-                                                    (symbol-name (class-name type-spec)))
-                                                   (t (format nil "~A" type-spec))))
                                   (lambda-list (cadr clause))
                                   (var (if (and lambda-list (car lambda-list))
                                            (car lambda-list)
                                            nil))
                                   (handler-body (cddr clause)))
-                             (list type-name var handler-body)))
+                             (list type-spec var handler-body)))
                          clauses))
          (n (length parsed))
          ;; Generate unified clause body labels (shared across all catch dispatches)
@@ -4252,11 +4193,11 @@
       ;; Build HandlerBinding[] for our handler-case cluster
       (:ldc-i4 ,n)
       (:newarr "HandlerBinding")
-      ,@(loop for (type-name var handler-body) in parsed
+      ,@(loop for (type-spec var handler-body) in parsed
               for i from 0
               append `((:dup) (:ldc-i4 ,i)
-                        ;; Type specifier symbol
-                        (:ldstr ,type-name) (:call "Startup.Sym")
+                        ;; Type specifier (symbol/class name, or compound list literal)
+                        ,@(%handler-type-spec-load type-spec)
                         ;; Handler function: MakeHandlerCaseFunction(tag, clauseIndex)
                         (:ldloc ,hc-tag-key)
                         (:ldc-i4 ,i)
@@ -4321,11 +4262,11 @@
       (:stloc ,ex-key)
       (:ldloc ,ex-key) (:callvirt "LispErrorException.get_Condition")
       (:castclass "LispObject") (:stloc ,cond-key)
-      ,@(loop for (type-name var handler-body) in parsed
+      ,@(loop for (type-spec var handler-body) in parsed
               for label in clause-labels
               for skip in le-skip-labels
               append `((:ldloc ,cond-key)
-                       (:ldstr ,type-name) (:call "Startup.Sym")
+                       ,@(%handler-type-spec-load type-spec)
                        (:call "Runtime.Typep") (:call "Runtime.IsTruthy")
                        (:brfalse ,skip) ;; within catch: skip to next type check
                        (:leave ,label)  ;; exit catch to clause body after try-catch
@@ -4343,11 +4284,11 @@
       (:ldloc ,dotnet-ex-key)
       (:call "Runtime.WrapDotNetExceptionObj")
       (:stloc ,cond-key)
-      ,@(loop for (type-name var handler-body) in parsed
+      ,@(loop for (type-spec var handler-body) in parsed
               for label in clause-labels
               for skip in dn-skip-labels
               append `((:ldloc ,cond-key)
-                       (:ldstr ,type-name) (:call "Startup.Sym")
+                       ,@(%handler-type-spec-load type-spec)
                        (:call "Runtime.Typep") (:call "Runtime.IsTruthy")
                        (:brfalse ,skip) ;; within catch
                        (:leave ,label)  ;; exit catch to clause body
@@ -4362,7 +4303,7 @@
       (:br ,outer-end-label)
       ;; Clause bodies (AFTER try-catch, outside exception block)
       ;; PopCluster before executing handler body per CL spec.
-      ,@(loop for (type-name var handler-body) in parsed
+      ,@(loop for (type-spec var handler-body) in parsed
               for label in clause-labels
               append (multiple-value-bind (declared-specials real-body)
                          (extract-specials handler-body)

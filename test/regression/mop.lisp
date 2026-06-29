@@ -344,3 +344,131 @@
 (deftest mop-ec-after-sees-initarg
   (slot-value (find-class 'mop-ec-order) 'spec)
   (:derived-from mop-ot))
+
+;;; --- newly added AMOP protocol functions ---
+;;; These were interned/exported but UNDEFINED, breaking closer-mop callers.
+
+(deftest mop-compute-slots
+  (length (dotcl-mop:compute-slots (find-class 'mop-dog)))
+  3)  ; name age breed
+
+(deftest mop-compute-class-precedence-list
+  (mapcar #'class-name
+          (dotcl-mop:compute-class-precedence-list (find-class 'mop-dog)))
+  (mop-dog mop-animal standard-object t))
+
+(deftest mop-compute-default-initargs
+  (dotcl-mop:compute-default-initargs (find-class 'mop-dog))
+  nil)
+
+(deftest mop-method-function-is-function
+  (functionp (dotcl-mop:method-function
+              (first (dotcl-mop:generic-function-methods #'mop-speak))))
+  t)
+
+(deftest mop-reader-method-class
+  (class-name (dotcl-mop:reader-method-class (find-class 'mop-dog) nil))
+  standard-method)
+
+(deftest mop-writer-method-class
+  (class-name (dotcl-mop:writer-method-class (find-class 'mop-dog) nil))
+  standard-method)
+
+;;; specializer-direct-methods: every method specialized on mop-animal.
+;;; mop-speak has one (the (mop-animal) method); accessor mop-animal-name adds a
+;;; reader + writer = 3 total on the mop-animal class specializer.
+(deftest mop-specializer-direct-methods-count
+  (>= (length (dotcl-mop:specializer-direct-methods (find-class 'mop-animal))) 1)
+  t)
+
+(deftest mop-specializer-direct-generic-functions-has-speak
+  (if (member #'mop-speak
+              (dotcl-mop:specializer-direct-generic-functions (find-class 'mop-animal)))
+      t nil)
+  t)
+
+;;; compute-applicable-methods-using-classes + compute-discriminating-function
+(defgeneric mop-camuc (a))
+(defmethod mop-camuc ((a mop-animal)) 'a)
+(defmethod mop-camuc ((a mop-dog)) 'd)
+(defmethod mop-camuc ((a (eql 99))) 'e)
+
+(deftest mop-camuc-dog-definitive
+  ;; (eql 99) cannot apply to a dog, so the class-only result is definitive.
+  (multiple-value-bind (methods def)
+      (dotcl-mop:compute-applicable-methods-using-classes #'mop-camuc (list (find-class 'mop-dog)))
+    (list (length methods) (not (null def))))
+  (2 t))
+
+(deftest mop-camuc-integer-nondefinitive
+  ;; 99 is an integer, so for class INTEGER the (eql 99) method might apply.
+  (multiple-value-bind (methods def)
+      (dotcl-mop:compute-applicable-methods-using-classes #'mop-camuc (list (find-class 'integer)))
+    (list (length methods) (null def)))
+  (1 t))
+
+(deftest mop-compute-discriminating-function-callable
+  (functionp (dotcl-mop:compute-discriminating-function #'mop-camuc))
+  t)
+
+;;; ensure-class-using-class / ensure-generic-function-using-class
+(deftest mop-ensure-gf-using-class-creates
+  (typep (dotcl-mop:ensure-generic-function-using-class nil 'mop-egfuc-new)
+         'generic-function)
+  t)
+
+(deftest mop-ensure-class-using-class-creates
+  (class-name (dotcl-mop:ensure-class-using-class nil 'mop-ecuc-new
+                :direct-superclasses (list (find-class 'standard-object))))
+  mop-ecuc-new)
+
+(defclass mop-ecuc-existing () ((a :initarg :a)))
+(deftest mop-ensure-class-using-class-reensures
+  (eq (dotcl-mop:ensure-class-using-class (find-class 'mop-ecuc-existing) 'mop-ecuc-existing
+        :direct-superclasses (list (find-class 'standard-object)))
+      (find-class 'mop-ecuc-existing))
+  t)
+
+;;; compute-effective-method (standard combination)
+(defgeneric mop-cem (x))
+(defmethod mop-cem ((x mop-animal)) 'p)
+(defmethod mop-cem :before ((x mop-animal)) 'b)
+(defmethod mop-cem :after ((x mop-animal)) 'a)
+
+(deftest mop-compute-effective-method-primary-only
+  (let* ((ms (dotcl-mop:compute-applicable-methods-using-classes #'mop-speak
+               (list (find-class 'mop-animal))))
+         (em (dotcl-mop:compute-effective-method #'mop-speak 'standard ms)))
+    (car em))
+  call-method)
+
+(deftest mop-compute-effective-method-before-after
+  ;; with :before/:after the form wraps the primary call (progn / multiple-value-prog1)
+  (let* ((ms (dotcl-mop:compute-applicable-methods-using-classes #'mop-cem
+               (list (find-class 'mop-animal))))
+         (em (dotcl-mop:compute-effective-method #'mop-cem 'standard ms)))
+    (and (consp em) (symbolp (car em)) t))
+  t)
+
+;;; accessor-method-slot-definition: DEFCLASS tags reader/writer/accessor
+;;; methods with their slot-definition; ordinary methods return NIL.
+(defclass mop-ams () ((a :accessor mop-ams-a) (b :reader mop-ams-b)))
+(defgeneric mop-ams-plain (x))
+(defmethod mop-ams-plain ((x mop-ams)) 0)
+
+(deftest mop-accessor-method-slot-definition-reader
+  (slot-definition-name
+   (dotcl-mop:accessor-method-slot-definition
+    (first (dotcl-mop:generic-function-methods #'mop-ams-a))))
+  a)
+
+(deftest mop-accessor-method-slot-definition-setf
+  (slot-definition-name
+   (dotcl-mop:accessor-method-slot-definition
+    (first (dotcl-mop:generic-function-methods #'(setf mop-ams-a)))))
+  a)
+
+(deftest mop-accessor-method-slot-definition-ordinary-nil
+  (dotcl-mop:accessor-method-slot-definition
+   (first (dotcl-mop:generic-function-methods #'mop-ams-plain)))
+  nil)

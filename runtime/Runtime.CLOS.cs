@@ -52,7 +52,10 @@ public static partial class Runtime
             // Fast path: exact match (covers user-defined classes and CL built-ins).
             if (_classRegistry.ContainsKey(sym)) return sym;
             // Fallback by name: handles cross-package aliases (e.g. DOTCL-MOP:SLOT-DEFINITION
-            // vs DOTCL-INTERNAL:SLOT-DEFINITION registered by Startup).
+            // vs DOTCL-INTERNAL:SLOT-DEFINITION registered by Startup, and dotnet:define-class
+            // simple-name lookup). Only reached when there is no package-qualified entry, so
+            // distinct same-named user classes — which DO get their own exact entry, see
+            // FindOrForwardClass / RegisterClass — never fall through to here.
             // Do NOT apply for uninterned symbols (gensyms) — they have unique identity
             // and converting them to interned symbols breaks forward-ref resolution.
             if (sym.HomePackage != null)
@@ -87,10 +90,16 @@ public static partial class Runtime
         var sym = ToClassSymbol(name);
         if (_classRegistry.TryGetValue(sym, out var cls))
             return cls;
-        // Create forward-referenced placeholder
-        var fwd = new LispClass(sym, Array.Empty<SlotDefinition>(), Array.Empty<LispClass>());
+        // Create the forward-ref under the ORIGINAL package-qualified symbol, not the
+        // bare-name-normalized one. Otherwise CL-PPCRE::SEQ and FSET::SEQ would both
+        // forward-ref to one DOTCL-INTERNAL::SEQ placeholder and the later DEFCLASS
+        // would shadow the earlier class. The exact entry also means later
+        // same-package references hit ToClassSymbol's exact-match fast path instead of
+        // normalizing. Uninterned gensyms (HomePackage == null) keep ToClassSymbol's sym.
+        var key = (name is Symbol orig && orig.HomePackage != null) ? orig : sym;
+        var fwd = new LispClass(key, Array.Empty<SlotDefinition>(), Array.Empty<LispClass>());
         fwd.IsForwardReferenced = true;
-        _classRegistry[sym] = fwd;
+        _classRegistry[key] = fwd;
         return fwd;
     }
 
@@ -287,6 +296,11 @@ public static partial class Runtime
     /// <summary>Iterate all registered classes. Used by DOTCL-MOP:CLASS-DIRECT-SUBCLASSES
     /// (no back-link is maintained, so we scan).</summary>
     public static IEnumerable<LispClass> AllClasses() => _classRegistry.Values;
+
+    /// <summary>Iterate all registered generic functions. Used by
+    /// DOTCL-MOP:SPECIALIZER-DIRECT-METHODS / SPECIALIZER-DIRECT-GENERIC-FUNCTIONS
+    /// (no specializer→method back-link is maintained, so we scan).</summary>
+    public static IEnumerable<GenericFunction> AllGenericFunctions() => _gfRegistry.Values;
 
     public static void InternClassByName(string name, LispObject cls)
     {
@@ -543,6 +557,20 @@ public static partial class Runtime
             return inst.Class;
         if (obj is LispInstanceCondition lic)
             return lic.Instance.Class;
+        // Native (runtime-signaled) condition objects — e.g. the DIVISION-BY-ZERO
+        // from (/ 1 0), the TYPE-ERROR from (car 3) — carry their class name in
+        // ConditionTypeName, which type-of/typep already use. Resolve the same
+        // registered class here so class-of agrees, instead of falling through the
+        // switch to T. LispInstanceCondition (CLOS-backed user conditions)
+        // is handled above, so this only catches the native LispCondition family.
+        if (obj is LispCondition cond)
+        {
+            if (_classRegistry.TryGetValue(Startup.Sym(cond.ConditionTypeName), out var cc))
+                return cc;
+            if (_classRegistry.TryGetValue(Startup.Sym("CONDITION"), out var cbase))
+                return cbase;
+            return Nil.Instance;
+        }
         if (obj is LispDotNetObject dn)
             return EnsureDotNetTypeClass(dn.Type);
         // Slot-definition metaobject with a customized class (direct-/effective-
@@ -629,6 +657,24 @@ public static partial class Runtime
     {
         if (cls is not LispClass lc)
             throw new LispErrorException(new LispTypeError("ALLOCATE-INSTANCE: not a class", cls));
+        // A structure-class instance must be a LispStruct, not a CLOS LispInstance:
+        // equalp compares two LispStructs slot-by-slot and returns NIL if either side
+        // is a LispInstance, and make-load-form-saving-slots emits allocate-instance as
+        // a struct's creation form — so an allocate-instance'd struct that round-trips
+        // through a fasl would otherwise never be equalp to a normally-built one (broke
+        // Coalton's equalp-on-KIND type checking).
+        //
+        // Slots are left NIL (the dotcl stand-in for unbound): allocate-instance must
+        // NOT run slot initforms (that is initialize-instance's job). Running them broke
+        // the common required-slot idiom (id (required 'id) :read-only t), where the
+        // initform signals — so allocate-instance, and thus the make-load-form-saving-slots
+        // creation form, errored. The INIT form restores real slot values on the round-trip.
+        if (lc.IsStructureClass)
+        {
+            var slots = new LispObject[lc.EffectiveSlots.Length];
+            for (int i = 0; i < slots.Length; i++) slots[i] = Nil.Instance;
+            return new LispStruct(lc.Name, slots);
+        }
         return new LispInstance(lc);
     }
 
@@ -646,6 +692,72 @@ public static partial class Runtime
                 return li;
         }
         return new LispInstance(cls);
+    }
+
+    // Native (runtime-signaled) conditions — e.g. the DIVISION-BY-ZERO from (/ 1 0),
+    // the TYPE-ERROR from (car 3), the SIMPLE-ERROR from (error "x") — are LispCondition
+    // objects, not CLOS LispInstances. They still answer (typep c 'standard-object) => T
+    // and class-of correctly , so MOP slot access must work too. The standard
+    // condition slots are stored in C# fields rather than a Slots array; map them here so
+    // slot-value/slot-boundp/slot-makunbound/slot-exists-p agree with the class's slots.
+    // Returns true when NAME is a standard-condition slot applicable to COND; sets val to
+    // the bound value, or null when the slot is currently unbound.
+    internal static bool TryReadNativeConditionSlot(LispCondition cond, string name, out LispObject? val)
+    {
+        val = null;
+        switch (name)
+        {
+            case "FORMAT-CONTROL":
+                val = cond.FormatControl is Nil ? null : cond.FormatControl; return true;
+            case "FORMAT-ARGUMENTS":
+                val = cond.FormatArguments; return true;
+            case "OPERATION":
+                val = cond.OperationRef; return true;
+            case "OPERANDS":
+                val = cond.OperandsRef; return true;
+            case "PACKAGE":
+                val = cond.PackageRef; return true;
+            case "PATHNAME":
+                val = cond.FileErrorPathnameRef; return true;
+            case "STREAM":
+                val = cond.StreamErrorStreamRef; return true;
+            case "DATUM":
+                if (cond is LispTypeError te) { val = te.Datum; return true; }
+                return false;
+            case "EXPECTED-TYPE":
+                if (cond is LispTypeError te2) { val = te2.ExpectedType; return true; }
+                return false;
+            case "NAME":
+                if (cond is LispCellError ce) { val = ce.Name; return true; }
+                return false;
+        }
+        return false;
+    }
+
+    // Write side of TryReadNativeConditionSlot: store val (null = make unbound) into the
+    // native field backing standard-condition slot NAME. Returns true when handled.
+    internal static bool TryWriteNativeConditionSlot(LispCondition cond, string name, LispObject? val)
+    {
+        switch (name)
+        {
+            case "FORMAT-CONTROL":   cond.FormatControl = val ?? Nil.Instance; return true;
+            case "FORMAT-ARGUMENTS": cond.FormatArguments = val ?? Nil.Instance; return true;
+            case "OPERATION":        cond.OperationRef = val; return true;
+            case "OPERANDS":         cond.OperandsRef = val; return true;
+            case "PACKAGE":          cond.PackageRef = val; return true;
+            case "PATHNAME":         cond.FileErrorPathnameRef = val; return true;
+            case "STREAM":           cond.StreamErrorStreamRef = val; return true;
+            case "DATUM":
+                if (cond is LispTypeError te) { te.Datum = val ?? Nil.Instance; return true; }
+                return false;
+            case "EXPECTED-TYPE":
+                if (cond is LispTypeError te2) { te2.ExpectedType = val ?? Nil.Instance; return true; }
+                return false;
+            case "NAME":
+                if (cond is LispCellError ce) { ce.Name = val ?? Nil.Instance; return true; }
+                return false;
+        }
+        return false;
     }
 
     public static LispObject SlotValue(LispObject obj, LispObject slotName)
@@ -681,6 +793,25 @@ public static partial class Runtime
                 && Startup.Sym("SLOT-UNBOUND").Function is LispFunction csu)
                 return MultipleValues.Primary(csu.Invoke(new LispObject[] {
                     klass.Metaclass, klass, slotName is Symbol ? slotName : Startup.Sym(name) }));
+        }
+        if (obj is LispCondition cond)
+        {
+            var ccls = ClassOf(cond) as LispClass;
+            if (ccls != null && ccls.SlotIndex.ContainsKey(name))
+            {
+                TryReadNativeConditionSlot(cond, name, out var cval);
+                if (cval != null) return cval;
+                if (Startup.Sym("SLOT-UNBOUND").Function is LispFunction su)
+                    return MultipleValues.Primary(su.Invoke(new LispObject[] {
+                        ccls, cond, slotName is Symbol ? slotName : Startup.Sym(name) }));
+                throw new LispErrorException(new LispError(
+                    $"SLOT-UNBOUND: slot {name} is unbound in instance of {ccls.Name.Name}"));
+            }
+            if (Startup.Sym("SLOT-MISSING").Function is LispFunction csm)
+                return csm.Invoke(new LispObject[] { ccls ?? (LispObject)Nil.Instance, cond,
+                    slotName is Symbol ? slotName : Startup.Sym(name), Startup.Sym("SLOT-VALUE") });
+            throw new LispErrorException(new LispError(
+                $"SLOT-VALUE: no slot named {name} in condition {cond.ConditionTypeName}"));
         }
         if (obj is not LispInstance inst)
             throw new LispErrorException(new LispTypeError("SLOT-VALUE: not a CLOS instance", obj));
@@ -760,6 +891,20 @@ public static partial class Runtime
             (klass.ExtraSlots ??= new Dictionary<string, LispObject?>())[name] = value;
             return value;
         }
+        if (obj is LispCondition cond)
+        {
+            var ccls = ClassOf(cond) as LispClass;
+            if (ccls != null && ccls.SlotIndex.ContainsKey(name) && TryWriteNativeConditionSlot(cond, name, value))
+                return value;
+            if (Startup.Sym("SLOT-MISSING").Function is LispFunction csm)
+            {
+                csm.Invoke(new LispObject[] { ccls ?? (LispObject)Nil.Instance, cond,
+                    slotName is Symbol ? slotName : Startup.Sym(name), Startup.Sym("SETF"), value });
+                return value;
+            }
+            throw new LispErrorException(new LispError(
+                $"SET-SLOT-VALUE: no slot named {name} in condition {cond.ConditionTypeName}"));
+        }
         if (obj is not LispInstance inst)
             throw new LispErrorException(new LispTypeError("SET-SLOT-VALUE: not a CLOS instance", obj));
         if (!inst.Class.SlotIndex.TryGetValue(name, out int idx))
@@ -809,6 +954,27 @@ public static partial class Runtime
         if (obj is LispClass klass && klass.Metaclass != null)
             return klass.ExtraSlots != null && klass.ExtraSlots.TryGetValue(name, out var cbv) && cbv != null
                 ? T.Instance : Nil.Instance;
+        if (obj is LispCondition cond)
+        {
+            var ccls = ClassOf(cond) as LispClass;
+            if (ccls != null && ccls.SlotIndex.ContainsKey(name))
+            {
+                TryReadNativeConditionSlot(cond, name, out var cval);
+                LispObject cb = cval != null ? T.Instance : (LispObject)Nil.Instance;
+                MultipleValues.Set(cb);
+                return cb;
+            }
+            if (Startup.Sym("SLOT-MISSING").Function is LispFunction csm)
+            {
+                var r = Primary(csm.Invoke(new LispObject[] { ccls ?? (LispObject)Nil.Instance, cond,
+                    slotName is Symbol ? slotName : Startup.Sym(name), Startup.Sym("SLOT-BOUNDP") }));
+                LispObject cb = IsTruthy(r) ? T.Instance : (LispObject)Nil.Instance;
+                MultipleValues.Set(cb);
+                return cb;
+            }
+            throw new LispErrorException(new LispError(
+                $"SLOT-BOUNDP: no slot named {name} in condition {cond.ConditionTypeName}"));
+        }
         if (obj is not LispInstance inst)
             throw new LispErrorException(new LispTypeError("SLOT-BOUNDP: not a CLOS instance", obj));
         if (!inst.Class.SlotIndex.TryGetValue(name, out int idx))
@@ -2168,6 +2334,177 @@ public static partial class Runtime
         return result;
     }
 
+    /// <summary>AMOP COMPUTE-EFFECTIVE-METHOD for the STANDARD method combination.
+    /// METHODS are the applicable methods in most-specific-first order. Returns the
+    /// canonical effective-method form built from CALL-METHOD / MAKE-METHOD with the
+    /// actual LispMethod objects embedded (CLHS 7.6.6.2 standard combination).</summary>
+    public static LispObject ComputeEffectiveMethodStandard(LispObject methodList)
+    {
+        var around = new List<LispObject>();
+        var before = new List<LispObject>();
+        var after = new List<LispObject>();
+        var primary = new List<LispObject>();
+        for (var cur = methodList; cur is Cons c; cur = c.Cdr)
+        {
+            if (c.Car is not LispMethod m) continue;
+            if (m.Qualifiers.Length == 0) { primary.Add(m); continue; }
+            if (m.Qualifiers.Length == 1)
+            {
+                switch (m.Qualifiers[0].Name)
+                {
+                    case "AROUND": around.Add(m); continue;
+                    case "BEFORE": before.Add(m); continue;
+                    case "AFTER": after.Add(m); continue;
+                }
+            }
+            throw new LispErrorException(new LispError(
+                "COMPUTE-EFFECTIVE-METHOD: method with invalid qualifiers for standard combination"));
+        }
+        if (primary.Count == 0)
+            throw new LispErrorException(new LispError(
+                "COMPUTE-EFFECTIVE-METHOD: no applicable primary method"));
+
+        var callMethodSym = Startup.Sym("CALL-METHOD");
+        var makeMethodSym = Startup.Sym("MAKE-METHOD");
+        var prognSym = Startup.Sym("PROGN");
+        var mvp1Sym = Startup.Sym("MULTIPLE-VALUE-PROG1");
+
+        // (call-method M (next...))
+        LispObject CallMethod(LispObject m, IEnumerable<LispObject> nexts) =>
+            Runtime.List(callMethodSym, m, Runtime.List(nexts.ToArray()));
+
+        // primary: most-specific primary called with the rest as its next-methods.
+        var primaryCall = CallMethod(primary[0], primary.Skip(1));
+
+        // Wrap with before (for effect, before) and after (for effect, least-specific-first).
+        LispObject core = primaryCall;
+        if (after.Count > 0)
+        {
+            var parts = new List<LispObject> { mvp1Sym, primaryCall };
+            for (int i = after.Count - 1; i >= 0; i--)            // least-specific-first
+                parts.Add(CallMethod(after[i], Array.Empty<LispObject>()));
+            core = Runtime.List(parts.ToArray());
+        }
+        if (before.Count > 0)
+        {
+            var parts = new List<LispObject> { prognSym };
+            foreach (var b in before)                            // most-specific-first
+                parts.Add(CallMethod(b, Array.Empty<LispObject>()));
+            parts.Add(core);
+            core = Runtime.List(parts.ToArray());
+        }
+
+        if (around.Count == 0) return core;
+
+        // (call-method around0 (around1 ... aroundN (make-method core)))
+        var nexts = new List<LispObject>();
+        for (int i = 1; i < around.Count; i++) nexts.Add(around[i]);
+        nexts.Add(Runtime.List(makeMethodSym, core));
+        return CallMethod(around[0], nexts);
+    }
+
+    /// <summary>AMOP COMPUTE-APPLICABLE-METHODS-USING-CLASSES: like
+    /// COMPUTE-APPLICABLE-METHODS but the arguments are given as classes, so it
+    /// returns (values methods definitive-p). definitive-p is NIL when an applicable
+    /// method has an EQL specializer, since EQL applicability can't be decided from a
+    /// class alone — the caller must fall back to COMPUTE-APPLICABLE-METHODS.</summary>
+    public static LispObject ComputeApplicableMethodsUsingClasses(LispObject gfObj, LispObject classList)
+    {
+        if (gfObj is not GenericFunction gf)
+            throw new LispErrorException(new LispTypeError(
+                "COMPUTE-APPLICABLE-METHODS-USING-CLASSES: not a generic function", gfObj));
+        var classes = new List<LispClass?>();
+        for (var cur = classList; cur is Cons c; cur = c.Cdr)
+            classes.Add(c.Car as LispClass);
+
+        bool definitive = true;
+        var applicable = new List<LispMethod>();
+        foreach (var m in gf.Methods)
+        {
+            bool ok = true;
+            for (int i = 0; i < m.Specializers.Length; i++)
+            {
+                var spec = m.Specializers[i];
+                var argCls = i < classes.Count ? classes[i] : null;
+                if (spec is LispClass specCls)
+                {
+                    if (specCls.Name.Name == "T") continue;
+                    if (argCls == null || Array.IndexOf(argCls.ClassPrecedenceList, specCls) < 0)
+                    { ok = false; break; }
+                }
+                else if (spec is Cons eqlc && eqlc.Car is Symbol es && es.Name == "EQL"
+                         && eqlc.Cdr is Cons ev)
+                {
+                    // An (eql OBJ) method can only apply when an argument IS obj, which
+                    // is possible only if obj is an instance of argCls. If so the result
+                    // is non-definitive (a specific arg of this class might or might not
+                    // be obj); otherwise the method simply never applies for this class.
+                    var objCls = ClassOf(ev.Car) as LispClass;
+                    if (argCls != null && objCls != null
+                        && Array.IndexOf(objCls.ClassPrecedenceList, argCls) >= 0)
+                        definitive = false;
+                    else
+                    { ok = false; break; }
+                }
+            }
+            if (ok) applicable.Add(m);
+        }
+        applicable.Sort((a, b) => CompareMethodSpecificityByClasses(a, b, classes));
+        LispObject result = Nil.Instance;
+        for (int i = applicable.Count - 1; i >= 0; i--)
+            result = new Cons(applicable[i], result);
+        return MultipleValues.Values(result, definitive ? T.Instance : Nil.Instance);
+    }
+
+    /// <summary>CompareMethodSpecificity variant driven by an explicit class list
+    /// (for COMPUTE-APPLICABLE-METHODS-USING-CLASSES) instead of live argument values.</summary>
+    private static int CompareMethodSpecificityByClasses(LispMethod a, LispMethod b, List<LispClass?> classes)
+    {
+        int n = Math.Min(a.Specializers.Length, b.Specializers.Length);
+        int[]? apo = a.Owner?.ArgumentPrecedenceOrder;
+        for (int k = 0; k < n; k++)
+        {
+            int i = (apo != null && k < apo.Length && apo[k] < n) ? apo[k] : k;
+            if (ReferenceEquals(a.Specializers[i], b.Specializers[i])) continue;
+            bool aIsEql = a.Specializers[i] is Cons eqlA && eqlA.Car is Symbol symA && symA.Name == "EQL";
+            bool bIsEql = b.Specializers[i] is Cons eqlB && eqlB.Car is Symbol symB && symB.Name == "EQL";
+            if (aIsEql && !bIsEql) return -1;
+            if (!aIsEql && bIsEql) return 1;
+            if (aIsEql && bIsEql) continue;
+            if (a.Specializers[i] is LispClass clsA && b.Specializers[i] is LispClass clsB)
+            {
+                var argClass = i < classes.Count ? classes[i] : null;
+                if (argClass != null)
+                    foreach (var c in argClass.ClassPrecedenceList)
+                    {
+                        if (ReferenceEquals(c, clsA)) return -1;
+                        if (ReferenceEquals(c, clsB)) return 1;
+                    }
+                return string.Compare(clsA.Name.Name, clsB.Name.Name, StringComparison.Ordinal);
+            }
+        }
+        return 0;
+    }
+
+    /// <summary>DEFCLASS hook: tag the unqualified accessor method of GF that is
+    /// specialized on CLS with the effective slot-definition named SLOTNAME, so
+    /// DOTCL-MOP:ACCESSOR-METHOD-SLOT-DEFINITION can recover it. No-op if the pieces
+    /// can't be resolved (keeps DEFCLASS robust).</summary>
+    public static LispObject RegisterAccessorMethod(LispObject gfObj, LispObject clsObj, LispObject slotNameObj)
+    {
+        if (gfObj is GenericFunction gf && clsObj is LispClass cls && slotNameObj is Symbol slotName)
+        {
+            SlotDefinition? slotd = null;
+            foreach (var s in cls.EffectiveSlots)
+                if (s.Name.Name == slotName.Name) { slotd = s; break; }
+            if (slotd != null)
+                foreach (var m in gf.Methods)
+                    if (m.Qualifiers.Length == 0 && Array.IndexOf(m.Specializers, cls) >= 0)
+                    { m.AccessorSlot = slotd; break; }
+        }
+        return Nil.Instance;
+    }
+
     private static bool MethodSignatureMatches(LispMethod a, LispMethod b)
     {
         if (a.Specializers.Length != b.Specializers.Length) return false;
@@ -3370,6 +3707,11 @@ public static partial class Runtime
             return Nil.Instance;
         }
 
+        // Native (runtime-signaled) condition: consult its registered class's slots.
+        if (obj is LispCondition cond)
+            return ClassOf(cond) is LispClass ccls && ccls.SlotIndex.ContainsKey(name)
+                ? T.Instance : Nil.Instance;
+
         return Nil.Instance;
     }
 
@@ -3696,6 +4038,20 @@ public static partial class Runtime
                 klass.ExtraSlots?.Remove(name);
                 return klass;
             }
+            if (obj0 is LispCondition cond)
+            {
+                var ccls = Runtime.ClassOf(cond) as LispClass;
+                if (ccls != null && ccls.SlotIndex.ContainsKey(name) && Runtime.TryWriteNativeConditionSlot(cond, name, null))
+                    return args[0];
+                if (Startup.Sym("SLOT-MISSING").Function is LispFunction csm)
+                {
+                    csm.Invoke(new LispObject[] { ccls ?? (LispObject)Nil.Instance, cond,
+                        args[1] is Symbol ? args[1] : Startup.Sym(name), Startup.Sym("SLOT-MAKUNBOUND") });
+                    return args[0];
+                }
+                throw new LispErrorException(new LispError(
+                    $"SLOT-MAKUNBOUND: no slot named {name} in condition {cond.ConditionTypeName}"));
+            }
             if (obj0 is not LispInstance inst)
                 throw new LispErrorException(new LispTypeError("SLOT-MAKUNBOUND: not a CLOS instance", args[0]));
             if (!inst.Class.SlotIndex.TryGetValue(name, out int idx))
@@ -3897,6 +4253,7 @@ public static partial class Runtime
         RegClos("%ALLOCATE-INSTANCE", a => Runtime.MakeInstanceRaw(a[0]), 1);
         RegClos("%SLOT-EXISTS-P", a => Runtime.SlotExists(a[0], a[1]), 2);
         RegClos("%CHANGE-CLASS", Runtime.ChangeClass);
+        RegClos("%REGISTER-ACCESSOR-METHOD", a => Runtime.RegisterAccessorMethod(a[0], a[1], a[2]), 3);
         RegClos("%MAKE-GF", a => Runtime.MakeGF(a[0], a[1]), 2);
         RegClos("%REGISTER-GF", a => Runtime.RegisterGF(a[0], a[1]), 2);
         RegClos("%FIND-GF", a => Runtime.FindGF(a[0]), 1);
@@ -3974,7 +4331,11 @@ public static partial class Runtime
         Emitter.CilAssembler.RegisterFunction("(SETF FIND-CLASS)", new LispFunction(args => {
             if (args.Length < 2) throw new Exception("(SETF FIND-CLASS): too few arguments");
             var newVal = args[0];
-            var sym = ToClassSymbol(args[1]);
+            // Key by the ORIGINAL package-qualified symbol, never the bare-name-normalized
+            // one — otherwise (setf (find-class 'pa::seq) ...) and (setf (find-class 'pb::seq) ...)
+            // both land on DOTCL-INTERNAL::SEQ and the second clobbers the first. fset's
+            // post.lisp aliases its classes into the FSET2 package exactly this way.
+            var sym = (args[1] is Symbol orig && orig.HomePackage != null) ? orig : ToClassSymbol(args[1]);
             if (newVal is Nil) {
                 _classRegistry.TryRemove(sym, out _);
             } else if (newVal is LispClass lc) {

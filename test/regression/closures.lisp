@@ -199,3 +199,89 @@
   (list (funcall (i337-make-scanner t) 0)
         (funcall (i337-make-scanner nil) 5))
   ((:anchored 0) (:free 5)))
+
+;; Closure body methods are stored per compilation unit and resolved at runtime
+;; when MakeClosure runs. Each call to a closure-returning function must mint a
+;; fresh, independent closure (distinct captured env), and repeated invocation
+;; of the same closure body must keep resolving the same body method.
+(defun s3-adder (n) (lambda (x) (+ x n)))
+
+(deftest s3-distinct-closures-independent-env
+  (let ((a (s3-adder 10)) (b (s3-adder 100)))
+    (list (funcall a 5) (funcall b 5) (funcall a 1)))
+  (15 105 11))
+
+;; A counter closure mutating its captured binding across many calls — exercises
+;; the same body method resolved repeatedly from the unit store.
+(defun s3-counter ()
+  (let ((c 0)) (lambda () (incf c))))
+
+(deftest s3-counter-state-persists
+  (let ((k (s3-counter)))
+    (list (funcall k) (funcall k) (funcall k)))
+  (1 2 3))
+
+;; Nested closures: outer returns a closure that itself builds inner closures.
+;; Both body methods come from the same unit; each inner capture is independent.
+(defun s3-nested (a)
+  (lambda (b) (lambda (c) (+ a b c))))
+
+(deftest s3-nested-closures
+  (let* ((f (s3-nested 100))
+         (g (funcall f 20))
+         (h (funcall f 30)))
+    (list (funcall g 3) (funcall h 3)))
+  (123 133))
+
+;; S4: closure body DynamicMethods now live in a weakly-rooted per-unit
+;; store, reclaimed once no function can still call into the unit. Correctness
+;; requirement: any closure that is still reachable must stay callable across a
+;; full GC (the unit holder is pinned via the enclosing fn / the closure itself).
+(defun s4-make-adder (n) (lambda (x) (+ x n)))
+
+(deftest s4-defun-closure-survives-gc
+  (let ((a (s4-make-adder 10)) (b (s4-make-adder 100)))
+    (dotcl:gc)                          ; force full collect + finalizers
+    (list (funcall a 5) (funcall b 5)))
+  (15 105))
+
+;; Nested closures resolve a SIBLING body DM when the outer closure is called
+;; after a GC — the outer closure must keep its unit alive for the inner build.
+(defun s4-nested (a) (lambda (b) (lambda (c) (+ a b c))))
+
+(deftest s4-nested-closure-survives-gc
+  (let ((g (funcall (s4-nested 100) 20)))
+    (dotcl:gc)
+    (funcall g 3))
+  123)
+
+;; A closure produced by a transient EVAL unit, retained in a binding, must
+;; remain callable after GC (the closure pins its unit even though the toplevel
+;; code that built it is gone).
+(deftest s4-eval-transient-closure-survives-gc
+  (let ((f (eval '(let ((k 7)) (lambda (x) (* x k))))))
+    (dotcl:gc)
+    (funcall f 6))
+  42)
+
+;; S5: non-capturing lambdas (MAKE-FUNCTION / MAKE-FUNCTION-DIRECT) are now
+;; stored per compilation unit and reclaimed with it, instead of pinned in the
+;; global constant pool forever. Correctness: a non-capturing lambda returned by
+;; a rooted defun must stay callable across a full GC (the defun pins its unit).
+(defun s5-gen () (lambda (x) (* x x)))
+
+(deftest s5-rooted-noncapturing-lambda-survives-gc
+  (let ((g (s5-gen)))
+    (dotcl:gc)
+    (funcall g 7))
+  49)
+
+;; A non-capturing lambda whose body builds a further lambda must keep its unit
+;; alive so the inner one resolves when the outer is later called after a GC.
+(defun s5-outer () (lambda () (funcall (lambda (z) (+ z 1)) 41)))
+
+(deftest s5-nested-noncapturing-survives-gc
+  (let ((o (s5-outer)))
+    (dotcl:gc)
+    (funcall o))
+  42)

@@ -1,44 +1,46 @@
-# MauiLispDemo — dotcl を C# プロジェクトに組み込むレシピ (MAUI 版)
+# MauiLispDemo — a recipe for embedding dotcl in a C# project (MAUI edition)
 
-dotcl を **既存の .NET プロジェクトのインプロセスランタイムとして埋め込む**
-ための定型を、MAUI Windows / Android アプリで実演するサンプル。
-Common Lisp が分かる読者が、自分の C# プロジェクトに同じパターンを
-適用できることを目的にしている。
+A sample that demonstrates the boilerplate for **embedding dotcl as an
+in-process runtime in an existing .NET project**, using a MAUI Windows / Android
+app. It is meant to let a reader who knows Common Lisp apply the same pattern to
+their own C# project.
 
-要点:
+Key points:
 
-- C# 側は **boot とフレームワーク連結だけ**。UI / VM / ロジックは
-  すべて Lisp で書く
-- Lisp 側は `dotnet:define-class` で **MAUI の `Application` / `ContentPage`
-  / VM を emit** する。XamlC が要求する `x:Class` の partial class を
-  Lisp emit クラスが代行する
-- MAUI XAML compiler (XamlC) を回避するため、`MainPage.xaml` を素の
-  embedded resource にして runtime で `LoadFromXaml` する
+- The C# side is **just boot and framework wiring**. The UI / VM / logic are all
+  written in Lisp.
+- The Lisp side emits **MAUI's `Application` / `ContentPage` / VM** with
+  `dotnet:define-class`. The Lisp-emitted class stands in for the `x:Class`
+  partial class that XamlC expects.
+- To avoid the MAUI XAML compiler (XamlC), `MainPage.xaml` is a plain embedded
+  resource that is `LoadFromXaml`'d at runtime.
 
-## デモを起動すると
+## When you launch the demo
 
-タイトル下にスニペット一覧 (CollectionView) が並び、選ぶと下のエディタ
-(`Editor`) にそのスニペット本文が出る。下端のボタンは:
+Below the title, a list of snippets (a CollectionView) is shown; selecting one
+puts that snippet's body in the editor (`Editor`) below. The buttons at the
+bottom are:
 
-- **🌐** — スニペット表示言語の切替
-- **▶ Run my-click** — Lisp 側で `(defun my-click ...)` されている関数を
-  呼ぶ。エディタ内で `my-click` を再定義 → ▶ で即座に新挙動が走る
-  (live coding)
-- **Evaluate** — エディタの内容を `read` → `eval` し、結果を最下行に出す。
-  `defun` / `defparameter` 等の副作用は session 内で持続
+- **🌐** — switch the snippet display language.
+- **▶ Run my-click** — call the function `(defun my-click ...)` defined on the
+  Lisp side. Redefine `my-click` in the editor → press ▶ and the new behavior
+  runs immediately (live coding).
+- **Evaluate** — `read` → `eval` the editor's content and print the result on
+  the bottom line. Side effects such as `defun` / `defparameter` persist within
+  the session.
 
-スニペット側に `(setf (slot-value vm 'count) ...)` のような VM 操作を
-書けば、INotifyPropertyChanged 経由で UI が即時更新される。`▶` で
-Lisp 関数を上書きしてから押せば挙動が差し替わる、というのが
-"Lisp で組まれた MAUI アプリ" の体感。
+If a snippet performs a VM operation like `(setf (slot-value vm 'count) ...)`,
+the UI updates immediately via INotifyPropertyChanged. Overwriting a Lisp
+function and then pressing `▶` swaps the behavior — that is the feel of "a MAUI
+app built in Lisp".
 
-## 組み込みレシピ
+## Embedding recipe
 
-### 1. csproj 配線
+### 1. csproj wiring
 
 ```xml
 <ProjectReference Include="..\..\runtime\runtime.csproj">
-  <!-- Library として参照 (dotnet tool 兼用 Exe を抑止) -->
+  <!-- reference as a Library (suppress the dotnet-tool Exe) -->
   <AdditionalProperties>DotclAsLibrary=true;RuntimeIdentifier=</AdditionalProperties>
 </ProjectReference>
 
@@ -53,10 +55,10 @@ Lisp 関数を上書きしてから押せば挙動が差し替わる、という
 </None>
 ```
 
-Android では `<None>` の代わりに `<MauiAsset>` で APK に bundle、起動
-時に `FileSystem.AppDataDirectory` に extract する (詳細は `ANDROID-SETUP.md`)。
+On Android, use `<MauiAsset>` instead of `<None>` to bundle into the APK and
+extract to `FileSystem.AppDataDirectory` at launch (see `ANDROID-SETUP.md`).
 
-### 2. C# 側 boot
+### 2. C# boot
 
 ```csharp
 DotclHost.Initialize();
@@ -64,14 +66,14 @@ DotclHost.LoadCore(DotclHost.FindCore() ?? throw ...);
 DotclHost.LoadLispFile(Path.Combine(AppContext.BaseDirectory, "main.lisp"));
 ```
 
-`DotclHost` (`runtime/DotclHost.cs`) が組み込み用 façade。
-`Initialize → LoadCore → LoadLispFile` の順。MAUI では `MauiProgram.cs`
-の `CreateMauiApp` 冒頭で実行する。
+`DotclHost` (`runtime/DotclHost.cs`) is the embedding façade. The order is
+`Initialize → LoadCore → LoadLispFile`. In MAUI, run it at the top of
+`CreateMauiApp` in `MauiProgram.cs`.
 
-### 3. C# ↔ Lisp 結線
+### 3. C# ↔ Lisp wiring
 
-C# 側のフレームワーク fixed-point (MAUI なら `App.CreateWindow`) で
-Lisp 関数を呼び、戻り値を unwrap してフレームワークに渡す:
+At a framework fixed point on the C# side (for MAUI, `App.CreateWindow`), call a
+Lisp function, unwrap the result, and hand it to the framework:
 
 ```csharp
 // App.xaml.cs
@@ -84,10 +86,10 @@ protected override Window CreateWindow(IActivationState? state)
 }
 ```
 
-`LispDotNetObject` は dotcl が `dotnet:new` 等で返す .NET オブジェクト
-ラッパー。`Value` プロパティで生インスタンスを取り出す。
+`LispDotNetObject` is the .NET-object wrapper dotcl returns from `dotnet:new`
+etc. Its `Value` property gives the raw instance.
 
-## Lisp 側の prefab
+## Lisp-side prefabs
 
 ### `MauiLispDemo.MainVM` — VM (INotifyPropertyChanged + ICommand)
 
@@ -96,7 +98,7 @@ protected override Window CreateWindow(IActivationState? state)
   (:implements INotifyPropertyChanged)
   (:events ("PropertyChanged" PropertyChangedEventHandler))
   (:properties
-    ("Title" String :notify t)        ; setter で PropertyChanged 自動発火
+    ("Title" String :notify t)        ; setter auto-fires PropertyChanged
     ("Count" Int32 :notify t)
     ("IncrementCommand" ICommand))
   (:ctor () ...)
@@ -104,12 +106,12 @@ protected override Window CreateWindow(IActivationState? state)
     ("Increment" () :returns Void ...)))
 ```
 
-- `:notify t` が auto-property の setter 末尾に PropertyChanged 発火を
-  挿入
-- `ICommand` プロパティは `LispCommand` で wrap した
-  Lisp lambda を入れる (XAML 側は `Command="{Binding IncrementCommand}"`)
+- `:notify t` inserts a PropertyChanged firing at the end of the auto-property
+  setter.
+- The `ICommand` property holds a Lisp lambda wrapped in `LispCommand` (the XAML
+  side uses `Command="{Binding IncrementCommand}"`).
 
-### `MauiLispDemo.MainPage` — ContentPage 派生
+### `MauiLispDemo.MainPage` — a ContentPage subclass
 
 ```lisp
 (dotnet:define-class "MauiLispDemo.MainPage" (ContentPage)
@@ -120,19 +122,19 @@ protected override Window CreateWindow(IActivationState? state)
     (dotnet:%set-invoke self "BindingContext" (dotnet:new "MauiLispDemo.MainVM"))))
 ```
 
-ctor で:
+In the ctor:
 
-1. XAML をアセンブリの manifest resource から取り出し
-2. `Microsoft.Maui.Controls.Xaml.Extensions.LoadFromXaml(self, xaml)` で
-   自分自身に展開
-3. `MainVM` を BindingContext に挿す
+1. Pull the XAML from the assembly's manifest resources.
+2. Expand it into self via
+   `Microsoft.Maui.Controls.Xaml.Extensions.LoadFromXaml(self, xaml)`.
+3. Set a `MainVM` as the BindingContext.
 
-### XAML 側のお作法
+### XAML conventions
 
-`MainPage.xaml` は **MAUI の MauiXaml パイプラインから外して
-embedded resource として埋める**。XamlC は `x:Class` で指定された C#
-partial が compile time に存在することを期待するが、ここでは Lisp 側で
-runtime emit するので XamlC を通すと "type not found" になる。csproj:
+`MainPage.xaml` is **taken out of MAUI's MauiXaml pipeline and embedded as an
+embedded resource**. XamlC expects the C# partial named by `x:Class` to exist at
+compile time, but here it is emitted at runtime on the Lisp side, so running it
+through XamlC yields "type not found". csproj:
 
 ```xml
 <ItemGroup>
@@ -146,41 +148,41 @@ runtime emit するので XamlC を通すと "type not found" になる。csproj
 </ItemGroup>
 ```
 
-`App.xaml` は逆に **MAUI 標準の partial class 流儀** を維持している
-(空の `<Application x:Class="MauiLispDemo.App" />` + `App.xaml.cs`)。
-これは `MauiProgram.UseMauiApp<App>()` が compile-time に `App` 型の
-存在を要求し、かつ XamlC を回す方が C# 側の boot 配線が短く書けるため
-妥協した部分。Lisp emit に寄せる余地は残っている (TODO)。
+`App.xaml`, conversely, keeps **the standard MAUI partial-class style** (an empty
+`<Application x:Class="MauiLispDemo.App" />` + `App.xaml.cs`). This is a
+compromise: `MauiProgram.UseMauiApp<App>()` requires the `App` type to exist at
+compile time, and running XamlC keeps the C# boot wiring shorter. Moving it to a
+Lisp emit is still possible (TODO).
 
-## ビルド・実行
+## Build & run
 
 ```sh
 cd samples/MauiLispDemo
-dotnet workload restore       # Load necessary libraries
+dotnet workload restore       # load necessary libraries
 dotnet build                  # Debug
-dotnet run -c Release         # Release (warm boot ~1s, debug は 5-10s)
+dotnet run -c Release         # Release (warm boot ~1s; debug is 5-10s)
 ```
 
-GUI プロセスはコンソールを持たないので、boot trace と例外は
-`bin/.../dotcl-maui.log` に書く。`[App] BUILD-MAIN-PAGE returned
-MauiLispDemo.MainPage` が出れば結線成功。
+The GUI process has no console, so the boot trace and exceptions are written to
+`bin/.../dotcl-maui.log`. Seeing `[App] BUILD-MAIN-PAGE returned
+MauiLispDemo.MainPage` means the wiring succeeded.
 
-Android target は **`ANDROID-SETUP.md`** 参照 (workload、build flag、
-adb / scrcpy、トラブルシューティング)。
+For the Android target, see **`ANDROID-SETUP.md`** (workload, build flags,
+adb / scrcpy, troubleshooting).
 
-## ファイル案内
+## File guide
 
-| ファイル | 役割 |
+| File | Role |
 |---|---|
-| `MauiProgram.cs` | dotcl boot + `MauiAppBuilder` 配線 |
-| `App.xaml` / `App.xaml.cs` | `Application` 派生 (CreateWindow で BUILD-MAIN-PAGE 呼出) |
-| `MainPage.xaml` | UI markup。embedded resource として埋め込み |
-| `XamlHelper.cs` | `LoadFromXaml<T>` の非ジェネリックラッパー + manifest resource reader |
-| `main.lisp` | MainVM / MainPage / build-main-page を Lisp で定義 |
-| `Makefile` | `make build-windows` / `build-android` / `run-android` 等 |
-| `ANDROID-SETUP.md` | Android 実機セットアップ手順 |
+| `MauiProgram.cs` | dotcl boot + `MauiAppBuilder` wiring |
+| `App.xaml` / `App.xaml.cs` | `Application` subclass (calls BUILD-MAIN-PAGE in CreateWindow) |
+| `MainPage.xaml` | UI markup; embedded as an embedded resource |
+| `XamlHelper.cs` | non-generic wrapper around `LoadFromXaml<T>` + manifest resource reader |
+| `main.lisp` | defines MainVM / MainPage / build-main-page in Lisp |
+| `Makefile` | `make build-windows` / `build-android` / `run-android` etc. |
+| `ANDROID-SETUP.md` | Android device setup steps |
 
-## 関連
+## See also
 
-- `runtime/DotclHost.cs` — embedding API 一式
-- `contrib/dotnet-class/` — `dotnet:define-class` 等のマクロ
+- `runtime/DotclHost.cs` — the full embedding API.
+- `contrib/dotnet-class/` — macros such as `dotnet:define-class`.

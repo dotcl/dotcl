@@ -799,7 +799,7 @@ public static class Startup
             ("*PRINT-LEVEL*", Nil.Instance),
             ("*PRINT-LINES*", Nil.Instance),
             ("*PRINT-MISER-WIDTH*", Nil.Instance),
-            ("*PRINT-PRETTY*", Nil.Instance),
+            ("*PRINT-PRETTY*", T.Instance),
             ("*PRINT-RADIX*", Nil.Instance),
             ("*PRINT-READABLY*", Nil.Instance),
             ("*PRINT-RIGHT-MARGIN*", Nil.Instance),
@@ -1663,6 +1663,10 @@ public static class Startup
         // dotcl:gc-stats — (gen0-count gen1-count gen2-count total-memory total-allocated-bytes)
         // Used by TIME to compute before/after deltas.
         RegisterDotcl("GC-STATS", new LispFunction(Runtime.GcStats, "GC-STATS", 0));
+
+        // dotcl:emit-pool-stats — (total-entries dynamic-methods data-literals committed-bytes)
+        // Diagnostic for the CilAssembler constant-pool retention leak.
+        RegisterDotcl("EMIT-POOL-STATS", new LispFunction(Runtime.EmitPoolStats, "EMIT-POOL-STATS", 0));
 
         // dotcl:alloc-report — print per-type allocation counters. Only non-zero
         // when the runtime was started with DOTCL_ALLOC_PROF=1.

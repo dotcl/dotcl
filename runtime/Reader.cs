@@ -70,6 +70,12 @@ public class Reader
     private int _line = 1;
     private Dictionary<int, LispObject> _shareLabels = new();
     private Dictionary<int, SharePlaceholder> _sharePlaceholders = new();
+    // Nesting depth of the public top-level Read/TryRead. #n=/#n# label scope is one
+    // outermost read (CLHS 2.4.8.15/2.4.8.16), but a stream's Reader is cached and
+    // reused across reads — so the label tables must be cleared when a new top-level
+    // read begins (depth 0→1), not when a reader macro re-enters Read mid-form. Without
+    // this, a #1= in one form leaks into the next form's #1#.
+    private int _topLevelReadDepth;
     /// <summary>Thread-static backquote nesting level shared across all Readers.
     /// This allows Lisp-defined reader macros (which create new Reader instances
     /// via ReadFromStream) to correctly handle commas inside backquotes.</summary>
@@ -232,6 +238,7 @@ public class Reader
         var savedSuppress = _readSuppress;
         if (dynSuppress) _readSuppress = true;
         WhitespaceTerminated = false;
+        if (_topLevelReadDepth++ == 0) { _shareLabels.Clear(); _sharePlaceholders.Clear(); }
         try
         {
             while (true)
@@ -248,6 +255,7 @@ public class Reader
         finally
         {
             _readSuppress = savedSuppress;
+            _topLevelReadDepth--;
         }
     }
 
@@ -258,6 +266,7 @@ public class Reader
         bool dynSuppress = DynamicBindings.Get(suppressSym) is not Nil;
         var savedSuppress = _readSuppress;
         if (dynSuppress) _readSuppress = true;
+        if (_topLevelReadDepth++ == 0) { _shareLabels.Clear(); _sharePlaceholders.Clear(); }
         try
         {
             while (true)
@@ -279,6 +288,7 @@ public class Reader
         finally
         {
             _readSuppress = savedSuppress;
+            _topLevelReadDepth--;
         }
     }
 

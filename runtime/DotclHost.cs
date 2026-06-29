@@ -513,17 +513,41 @@ public static class DotclHost
         var rootSourcesForm = rootSourcesOut == null
             ? "nil"
             : $"(open \"{rootSourcesOut.Replace("\\", "/")}\" :direction :output :if-exists :supersede)";
-        // For each dep system, if <dir>/<name>.fasl exists, use it. Otherwise
-        // concatenate-source-op + compile-file the dep's :components into
-        // <dir>/<name>.fasl on the fly. Empty :components (marker systems) are
-        // skipped silently.
+        // Project-based dep fasl cache (dotcl/dotcl#47): when a manifest path is given
+        // (the MSBuild build), put on-the-fly-compiled dep fasls in a "deps/" subdir
+        // next to the manifest — i.e. under obj/.../dotcl-fasl/ — instead of polluting
+        // each dep's source dir. That makes them cleanable by `dotnet clean` (which wipes
+        // obj/), at the cost of recompiling deps per project (the .NET obj/ model). The
+        // CompileProject load step uses the same convention. A prebuilt -r2r-<rid> AOT
+        // fasl shipped next to the dep source is still preferred read-only. Direct CLI
+        // resolve-deps to stdout (manifestOut == null) keeps the old next-to-source cache.
+        string? depCacheDir = null;
+        if (manifestOut != null)
+        {
+            var manDir = System.IO.Path.GetDirectoryName(System.IO.Path.GetFullPath(manifestOut));
+            depCacheDir = System.IO.Path.Combine(manDir ?? ".", "deps");
+            System.IO.Directory.CreateDirectory(depCacheDir);
+        }
+        var depCacheLisp = depCacheDir == null ? null : depCacheDir.Replace("\\", "/").TrimEnd('/') + "/";
+        // FASL path for a dep's on-the-fly build: cache dir (if set) else next to source.
+        string DepFaslForm(string nameExpr) => depCacheLisp == null
+            ? $"(concatenate 'string dir {nameExpr} \".fasl\")"
+            : $"(concatenate 'string \"{depCacheLisp}\" {nameExpr} \".fasl\")";
+        // For each dep system, if its fasl exists, use it. Otherwise
+        // concatenate-source-op + compile-file the dep's :components into the dep
+        // fasl on the fly. Empty :components (marker systems) are skipped silently.
         var form = $@"
 (let* ((seen '()) (order '()))
   (labels ((walk (sys)
              (unless (member sys seen :test #'eq)
                (push sys seen)
                (dolist (d (asdf:system-depends-on sys))
-                 (let ((ds (ignore-errors (asdf:find-system d))))
+                 ;; resolve-dependency-spec normalizes ASDF dependency specifiers
+                 ;; ((:feature :dotcl ""x""), (:version ...), plain names) to a
+                 ;; system, returning nil when a :feature condition is unmet. Using
+                 ;; asdf:find-system directly returned nil for (:feature ...) forms,
+                 ;; dropping those deps from the manifest (e.g. micros' dotcl-thread).
+                 (let ((ds (ignore-errors (asdf/find-component:resolve-dependency-spec sys d))))
                    (when ds (walk ds))))
                (push sys order)))
            (ensure-fasl (sys)
@@ -533,7 +557,7 @@ public static class DotclHost
                     (r2r-fasl {(targetRid == null
                         ? "nil"
                         : $"(concatenate 'string dir name \"-r2r-\" \"{targetRid}\" \".fasl\")")})
-                    (fasl (concatenate 'string dir name "".fasl"")))
+                    (fasl {DepFaslForm("name")}))
                (when (and r2r-fasl (probe-file r2r-fasl))
                  (return-from ensure-fasl r2r-fasl))
                (unless (probe-file fasl)
@@ -587,6 +611,25 @@ public static class DotclHost
         if (!string.IsNullOrEmpty(outDir) && !System.IO.Directory.Exists(outDir))
             System.IO.Directory.CreateDirectory(outDir);
 
+        // Load dep fasls from the same project-based cache dir resolve-deps wrote them
+        // to (dotcl/dotcl#47): "deps/" next to the output fasl, i.e. under obj/. Must
+        // match ResolveDeps's DepFaslForm convention.
+        var depCacheDir = System.IO.Path.Combine(outDir ?? ".", "deps");
+        var depCacheLisp = depCacheDir.Replace("\\", "/").TrimEnd('/') + "/";
+
+        // Non-interactive build: a compile-time error must NOT drop into the
+        // interactive debugger (it loops on closed stdin and buries the message).
+        // Bind *debugger-hook* to re-raise the condition so it unwinds to the
+        // source-location wrap + MSBuild-canonical formatter (dotcl/dotcl#48).
+        var hookSym = Startup.Sym("*DEBUGGER-HOOK*");
+        var oldHook = DynamicBindings.Get(hookSym);
+        DynamicBindings.Set(hookSym, new LispFunction(hookArgs =>
+        {
+            var cond = hookArgs[0];
+            throw new LispErrorException(
+                cond is LispCondition lc ? lc : new LispError(cond.ToString()));
+        }, "*BUILD-DEBUGGER-HOOK*", 2));
+
         Runtime.Eval(MultipleValues.Primary(
             Runtime.ReadFromString(new LispObject[] { new LispString("(require \"asdf\")") })));
 
@@ -600,7 +643,11 @@ public static class DotclHost
         var concatLisp = (outDir == null ? "" : outDir.Replace("\\", "/") + "/")
                        + System.IO.Path.GetFileNameWithoutExtension(outputPath)
                        + ".concat.lisp";
-        var form = $@"
+        // Phase 1: load the asd, load the resolved :depends-on fasls, and
+        // concatenate the root's sources into the concat file. Return the ordered
+        // source namestrings so we can build a concat-line -> (file, line) map for
+        // diagnostics (dotcl/dotcl#48).
+        var setupForm = $@"
 (progn
   (asdf:load-asd ""{asdLisp}"")
   (let* ((root (asdf:find-system
@@ -612,31 +659,132 @@ public static class DotclHost
     ;; time — same as a standard ASDF load-op-then-compile. Without this the
     ;; root must itself (require :dep), because the concatenated unit holds only
     ;; the root's own sources. The dep fasls are the
-    ;; ones resolve-deps built at <component-dir>/<name>.fasl, in topo order.
+    ;; ones resolve-deps built at the project deps/ cache dir, in topo order.
     (let ((seen '()) (order '()))
       (labels ((walk (sys)
                  (unless (member sys seen :test #'eq)
                    (push sys seen)
                    (dolist (d (asdf:system-depends-on sys))
-                     (let ((ds (ignore-errors (asdf:find-system d))))
+                     ;; resolve-dependency-spec normalizes ASDF dependency specifiers
+                 ;; ((:feature :dotcl ""x""), (:version ...), plain names) to a
+                 ;; system, returning nil when a :feature condition is unmet. Using
+                 ;; asdf:find-system directly returned nil for (:feature ...) forms,
+                 ;; dropping those deps from the manifest (e.g. micros' dotcl-thread).
+                 (let ((ds (ignore-errors (asdf/find-component:resolve-dependency-spec sys d))))
                        (when ds (walk ds))))
                    (push sys order))))
         (walk root))
       (dolist (sys (remove root (nreverse order)))
         (when (asdf:component-children sys)
-          (let* ((src  (asdf:component-pathname sys))
-                 (dir  (directory-namestring src))
-                 (name (asdf:component-name sys))
-                 (fasl (concatenate 'string dir name "".fasl"")))
+          (let* ((name (asdf:component-name sys))
+                 (fasl (concatenate 'string ""{depCacheLisp}"" name "".fasl"")))
             (when (probe-file fasl) (load fasl))))))
     (asdf::concatenate-files sources ""{concatLisp}"")
-    ;; compile-file-concatenated binds *concatenate-build* (cross-compiled,
-    ;; so the binding shares symbol identity with the compiler's read) so the
-    ;; compiler evaluates toplevel require/use-package/load at compile time within
-    ;; the single concatenated unit — restoring the compile+load interleaving a
-    ;; normal multi-file load-op would have given the original :components.
-    (dotcl.cil-compiler:compile-file-concatenated ""{concatLisp}"" ""{outLisp}"")))";
-        Runtime.Eval(MultipleValues.Primary(
-            Runtime.ReadFromString(new LispObject[] { new LispString(form) })));
+    (mapcar #'namestring sources)))";
+        var sourcesResult = Runtime.Eval(MultipleValues.Primary(
+            Runtime.ReadFromString(new LispObject[] { new LispString(setupForm) })));
+        var sourcePaths = ListToStringArray(sourcesResult);
+        var lineMap = BuildConcatLineMap(sourcePaths);
+
+        // Progress trace (dotcl/dotcl#48 point 2): which files this build compiles,
+        // in order — so a failing build shows what was processed before the error.
+        System.Console.Error.WriteLine(
+            $"[build] {System.IO.Path.GetFileNameWithoutExtension(absAsd)}: compiling {sourcePaths.Length} source(s)");
+        foreach (var sp in sourcePaths)
+            System.Console.Error.WriteLine($"[build]   {sp}");
+
+        // Phase 2: compile the concatenated unit. compile-file-concatenated binds
+        // *concatenate-build* (cross-compiled, so the binding shares symbol identity
+        // with the compiler's read) so the compiler evaluates toplevel
+        // require/use-package/load at compile time within the single concatenated
+        // unit — restoring the compile+load interleaving a normal multi-file load-op
+        // would have given the original :components.
+        //
+        // EmitBuildSourceLocations makes COMPILE-FILE attach the concat file + form
+        // line to a compile error; we then remap that concat line back to the
+        // original source file:line via lineMap (dotcl/dotcl#48).
+        var compileForm =
+            $@"(dotcl.cil-compiler:compile-file-concatenated ""{concatLisp}"" ""{outLisp}"")";
+        var prevEmit = Runtime.EmitBuildSourceLocations;
+        Runtime.EmitBuildSourceLocations = true;
+        try
+        {
+            Runtime.Eval(MultipleValues.Primary(
+                Runtime.ReadFromString(new LispObject[] { new LispString(compileForm) })));
+        }
+        catch (LispSourceException lse)
+        {
+            throw RemapConcatException(lse, concatLisp, lineMap);
+        }
+        finally
+        {
+            Runtime.EmitBuildSourceLocations = prevEmit;
+            DynamicBindings.Set(hookSym, oldHook);
+        }
+    }
+
+    /// Walk a proper Lisp list of LispStrings into a C# string[].
+    private static string[] ListToStringArray(LispObject list)
+    {
+        var result = new System.Collections.Generic.List<string>();
+        var cur = list;
+        while (cur is Cons c)
+        {
+            if (c.Car is LispString s) result.Add(s.Value);
+            cur = c.Cdr;
+        }
+        return result.ToArray();
+    }
+
+    /// Build a concat-line -> source map. asdf::concatenate-files joins the raw
+    /// bytes of each source with no separators, so source file k begins at concat
+    /// line (1 + total newlines in files 0..k-1). Returns entries sorted by start
+    /// line so a concat line L maps to the last entry with startLine &lt;= L.
+    private static (int startLine, string path)[] BuildConcatLineMap(string[] sourcePaths)
+    {
+        var map = new (int, string)[sourcePaths.Length];
+        int start = 1;
+        for (int i = 0; i < sourcePaths.Length; i++)
+        {
+            map[i] = (start, sourcePaths[i]);
+            int newlines = 0;
+            try
+            {
+                foreach (var b in System.IO.File.ReadAllBytes(sourcePaths[i]))
+                    if (b == (byte)'\n') newlines++;
+            }
+            catch { /* unreadable source — leave start where it is */ }
+            start += newlines;
+        }
+        return map;
+    }
+
+    /// Remap a LispSourceException pointing into the concatenated unit back to the
+    /// original source file:line. Other (already-original) frames pass through.
+    private static LispSourceException RemapConcatException(
+        LispSourceException lse, string concatPath,
+        (int startLine, string path)[] lineMap)
+    {
+        string concatFull;
+        try { concatFull = System.IO.Path.GetFullPath(concatPath); }
+        catch { concatFull = concatPath; }
+
+        bool SameAsConcat(string f)
+        {
+            try { return string.Equals(System.IO.Path.GetFullPath(f), concatFull,
+                System.StringComparison.OrdinalIgnoreCase); }
+            catch { return false; }
+        }
+        if (!SameAsConcat(lse.FilePath) || lineMap.Length == 0)
+            return lse;
+
+        // Find the source file whose span contains the concat line.
+        int concatLine = lse.Line;
+        int idx = 0;
+        for (int i = 0; i < lineMap.Length; i++)
+            if (lineMap[i].startLine <= concatLine) idx = i; else break;
+        var origPath = lineMap[idx].path;
+        var origLine = concatLine - lineMap[idx].startLine + 1;
+        return new LispSourceException(origPath, origLine, lse.InnerException!);
     }
 }

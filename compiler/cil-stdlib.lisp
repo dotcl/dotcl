@@ -218,11 +218,24 @@
 (defun * (&rest args)
   (let ((result 1))
     (dolist (x args result) (setq result (* result x)))))
-(defun < (a b) (< a b))
-(defun > (a b) (> a b))
-(defun = (a b) (= a b))
-(defun <= (a b) (<= a b))
-(defun >= (a b) (>= a b))
+;; Comparison ops are variadic per CLHS (number &rest more-numbers). The body
+;; uses the 2-arg inline op (compiled to a direct Runtime call, NOT a self-call),
+;; so #'= etc. accept any arity and match (= 1 2 3) direct-call semantics. Direct
+;; multi-arg calls are still inlined by the compiler; these defuns back funcall/apply.
+(defun = (number &rest more)
+  (dolist (x more t) (unless (= number x) (return nil))))
+(defun < (number &rest more)
+  (let ((prev number))
+    (dolist (x more t) (if (< prev x) (setq prev x) (return nil)))))
+(defun > (number &rest more)
+  (let ((prev number))
+    (dolist (x more t) (if (> prev x) (setq prev x) (return nil)))))
+(defun <= (number &rest more)
+  (let ((prev number))
+    (dolist (x more t) (if (<= prev x) (setq prev x) (return nil)))))
+(defun >= (number &rest more)
+  (let ((prev number))
+    (dolist (x more t) (if (>= prev x) (setq prev x) (return nil)))))
 
 ;;; ============================================================
 ;;; Sequence functions (list-specialized)

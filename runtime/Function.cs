@@ -15,6 +15,15 @@ public class LispFunction : LispObject
     // Closure delegate: receives explicit env array
     private readonly Func<object[], LispObject[], LispObject>? _closureFunc;
 
+    // S4: strong reference to this function's compilation-unit closure-DM
+    // store (CilAssembler unit holder). Set on functions whose body builds
+    // closures (the enclosing defun/lambda) and on the closures themselves, so a
+    // unit's closure DynamicMethods stay alive exactly while some function that
+    // can still call MakeClosure(unit) is reachable. When the last such function
+    // dies, the holder dies and the off-GC-heap JIT code behind those DMs frees.
+    // The global CilAssembler unit map only holds the holder weakly.
+    internal object? RetainUnit;
+
     // Direct-param delegates for 0-8 arg fast path (set by assembler for simple functions)
     internal Func<LispObject>? _func0;
     internal Func<LispObject, LispObject>? _func1;

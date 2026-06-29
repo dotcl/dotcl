@@ -1591,7 +1591,7 @@
   :newest)
 
 
-;;; ASDF source-registry で dotcl-thread がロードできること
+;;; dotcl-thread must be loadable via the ASDF source-registry
 (deftest asdf-load-dotcl-thread
   (progn
     (require "asdf")
@@ -2508,7 +2508,7 @@
   (%i371-h 'bound)
   bound)
 
-;;; #374: coerce must handle a deftype whose expander COMPUTES the target type.
+;;; : coerce must handle a deftype whose expander COMPUTES the target type.
 ;;; deftype &optional params default to * (not nil), so Maxima's FLONUM expands to
 ;;; (DOUBLE-FLOAT * *); coerce's compound path handled VECTOR/ARRAY/COMPLEX but not
 ;;; the float types, so it fell through to "cannot coerce to ". typep/subtypep were
@@ -2564,3 +2564,1082 @@
     (nconc alias (list 'c))
     store)                       ; the nconc must be visible through store
   (a b c))
+
+;;; delete / delete-if / delete-if-not must be DESTRUCTIVE on a list: splice the
+;;; matched conses out of the original chain in place (SBCL semantics), so code
+;;; that discards the return value and relies on in-place mutation works — e.g.
+;;; Maxima rempropchk / mfunction-delete do (delete x list ...) without setq.
+;;; remove stays non-destructive.
+(deftest delete-splices-list-in-place
+  (let ((l (list 'hdr 'a 'b 'c)))
+    (delete 'b l :count 1 :test #'equal)   ; return discarded
+    l)                                      ; b spliced out of the original chain
+  (hdr a c))
+
+(deftest delete-if-splices-in-place
+  (let ((l (list 1 2 3 4 5)))
+    (delete-if #'evenp l)
+    l)
+  (1 3 5))
+
+(deftest delete-if-not-splices-in-place
+  (let ((l (list 1 2 3 4 5)))
+    (delete-if-not #'oddp l)
+    l)
+  (1 3 5))
+
+;; from-end + count deletes the rightmost matches, in place.
+(deftest delete-from-end-count-in-place
+  (let ((l (list 'a 'x 'b 'x 'c 'x)))
+    (delete 'x l :from-end t :count 2)
+    l)
+  (a x b c))
+
+;; remove must NOT mutate its list argument (stays non-destructive).
+(deftest remove-does-not-mutate-list
+  (let ((l (list 'a 'b 'c)))
+    (remove 'b l)
+    l)
+  (a b c))
+
+;; The mfunction-delete idiom: delete (assoc ...) from an alist in place.
+(deftest delete-assoc-in-place
+  (let ((al (list (list 'hdr) (list 'foo 1) (list 'bar 2))))
+    (delete (assoc 'foo al) al :count 1 :test #'equal)
+    al)
+  ((hdr) (bar 2)))
+
+;;; expt/exp must FLUSH a float underflow to 0.0 rather than signaling
+;;; FLOATING-POINT-UNDERFLOW. The IEEE underflow trap is masked by default
+;;; (as in SBCL/CCL/ECL), and dotcl's own * already flushes; expt/exp were the
+;;; inconsistent ones, breaking Maxima nfloat/special-function evaluation.
+(deftest expt-underflow-flushes-to-zero
+  (list (expt 10 -352.79868d0)
+        (expt 10d0 -352.79868d0)
+        (expt 2d0 -1100d0)
+        (expt 10.0 -400.0)
+        (exp -800d0))
+  (0.0d0 0.0d0 0.0d0 0.0 0.0d0))
+
+;; Overflow still signals (SBCL default traps overflow); only underflow changed.
+(deftest expt-overflow-still-signals
+  (list (handler-case (progn (expt 10d0 400d0) :no-error)
+          (floating-point-overflow () :overflow))
+        (handler-case (progn (exp 800d0) :no-error)
+          (floating-point-overflow () :overflow)))
+  (:overflow :overflow))
+
+;;; A local-function &optional/&key default init-form that references an outer
+;;; lexical variable must read the SHARED (boxed) cell at call time, not snapshot
+;;; the variable's value when the closure was created. Previously the capture
+;;; analysis scanned only the flet/labels body, not the lambda-list defaults, so a
+;;; var captured ONLY by a default went unboxed and the default saw a stale value.
+;;; (Maxima def-simplifier's give-up depends on this; e.g. simp-%hypergeometric
+;;; setqs its args before calling (give-up) whose default rebuilds the arg list.)
+(deftest flet-key-default-reads-current-outer-var
+  (flet ((run (x) (let ((a x)) (flet ((g (&key (r a)) r)) (setq a 99) (g)))))
+    (run 1))
+  99)
+
+(deftest flet-optional-default-reads-current-outer-var
+  (flet ((run (x) (let ((a x)) (flet ((g (&optional (r a)) r)) (setq a 99) (g)))))
+    (run 1))
+  99)
+
+(deftest labels-key-default-reads-current-outer-var
+  (flet ((run (x) (let ((a x)) (labels ((g (&key (r a)) r)) (setq a 99) (g)))))
+    (run 1))
+  99)
+
+;; An explicitly-supplied argument still wins over the (now correctly shared) default.
+(deftest flet-default-explicit-arg-overrides
+  (flet ((run (x) (let ((a x)) (flet ((g (&key (r a)) r)) (setq a 99) (g :r 7)))))
+    (run 1))
+  7)
+
+;; Guard: a body reference to a mutated outer var was already correct — keep it so.
+(deftest flet-body-reads-current-outer-var
+  (flet ((run (x) (let ((a x)) (flet ((g () a)) (setq a 99) (g)))))
+    (run 1))
+  99)
+
+;;; Comparing a non-finite float (inf/nan) with an integer/rational must not throw
+;;; "RATIONAL: infinity cannot be converted" — a non-finite float has no rational
+;;; value, so </>/=/min/max compare as doubles instead of rationalizing. (Maxima's
+;;; float-inf-p does (< x 0), which broke string/fortran output of any inf float.)
+(deftest float-infinity-vs-rational-compare
+  (let ((inf (* 1d300 1d300)))
+    (list (< inf 0) (> inf 5) (<= inf 0) (= inf 0) (< 0 inf) (< inf 1/2)
+          (min inf 0) (max inf 0)))
+  (nil t nil nil t nil 0 #.(* 1d300 1d300)))
+
+;; f-roundings of a non-finite float return the value itself (no rationalize/throw).
+;; Integer-result floor/truncate of infinity still signal (matching SBCL).
+(deftest float-infinity-frounding-and-integer-floor
+  (let ((inf (* 1d300 1d300)))
+    (list (ftruncate inf)
+          (ffloor inf)
+          (handler-case (floor inf) (arithmetic-error () :signaled))))
+  (#.(* 1d300 1d300) #.(* 1d300 1d300) :signaled))
+
+;;; Complex abs must use a scaled hypot, not naive sqrt(re^2+im^2), so extreme
+;;; magnitudes don't under/overflow the intermediate squares to 0 / +inf.
+(deftest complex-abs-scaled-hypot
+  (list (abs #C(1d-170 1d-170))
+        (abs #C(1d170 1d170))
+        (abs #C(3d0 4d0)))
+  (1.4142135623730951d-170 1.4142135623730952d170 5.0d0))
+
+;;; Complex division must be robust too (scaled denominator): (/ z (abs z)) for an
+;;; extreme-magnitude z is signum(z) and must give the unit phasor, not a
+;;; divide-by-zero (denom underflow) or NaN (denom overflow). Maxima signum depends
+;;; on this. Exact rational complex division and division-by-zero are unchanged.
+(deftest complex-divide-scaled-no-under-overflow
+  (list (let ((z #C(1d-170 1d-170))) (/ z (abs z)))
+        (let ((z #C(1d170 1d170)))  (/ z (abs z)))
+        (/ #C(1 2) #C(3 4)))                                  ; exact path
+  (#C(0.7071067811865475d0 0.7071067811865475d0)
+   #C(0.7071067811865475d0 0.7071067811865475d0)
+   #C(11/25 2/25)))
+
+(deftest complex-divide-by-zero-still-signals
+  (handler-case (/ #C(1d0 1d0) #C(0d0 0d0)) (division-by-zero () :signaled))
+  :signaled)
+
+;;; Ordering comparisons (< <= > >=) with a NaN operand must be false (IEEE
+;;; "unordered"), including when the other operand is an integer/rational. The
+;;; non-finite branch added for infinity used double.CompareTo, which ranks NaN
+;;; below everything and wrongly made (< nan 0) true. = stays false too.
+(deftest nan-ordering-is-unordered
+  (let ((nan (- (* 1d300 1d300) (* 1d300 1d300))))
+    (list (< nan 0) (<= nan 0) (> nan 0) (>= nan 0) (= nan 0)
+          (< 0 nan) (< nan 1/2) (minusp nan) (plusp nan)
+          (< 1 2 nan 3)))             ; n-ary with a NaN in the middle
+  (nil nil nil nil nil nil nil nil nil nil))
+
+;; Guard: infinity is still ORDERED (it is not NaN), and finite comparisons work.
+(deftest infinity-and-finite-still-ordered
+  (let ((inf (* 1d300 1d300)))
+    (list (< inf 5) (> inf 5) (< 1 2) (< 2 1) (< 1 2 3) (<= 2 2)))
+  (nil t t nil t t))
+
+;;; (coerce x '(complex <deftype>)) must expand the nested part deftype and convert
+;;; the real/imag parts, not just literal float part names. fixed top-level
+;;; deftype coerce; this is the nested-in-complex case. (Maxima float-zeta does
+;;; (coerce s '(complex flonum)) — flonum being a deftype — and broke without this.)
+(deftype %i384-simpf () 'double-float)
+(deftype %i384-compf (&optional lo) (if lo `(double-float ,lo) 'double-float))
+(deftest i384-coerce-complex-nested-deftype
+  (list (coerce #C(0 1) '(complex double-float))   ; literal (control)
+        (coerce #C(0 1) '(complex %i384-simpf))    ; literal-body deftype
+        (coerce #C(0 1) '(complex %i384-compf))    ; computed-body deftype
+        (coerce #C(0 1) '(complex single-float)))
+  (#C(0.0d0 1.0d0) #C(0.0d0 1.0d0) #C(0.0d0 1.0d0) #C(0.0 1.0)))
+
+;; A bare/absent or rational part type leaves the parts unchanged.
+(deftest i384-coerce-complex-part-unchanged
+  (list (coerce #C(1 2) 'complex)
+        (coerce #C(1 2) '(complex rational)))
+  (#C(1 2) #C(1 2)))
+
+;;; asin/acos of a real arg outside [-1,1] must promote to a complex on the CL
+;;; branch (not Math.Asin's NaN); acosh/atanh must use the CLHS factored formulas so
+;;; the branch (sign of the real/imag part) is right outside the real domain.
+;;; (Maxima asech / inverse_jacobi_dn depend on these.) Compare within 1e-13.
+(deftest i385-inverse-trig-hyp-out-of-domain
+  (flet ((close (z re im) (and (complexp z)
+                               (< (abs (- (realpart z) re)) 1d-13)
+                               (< (abs (- (imagpart z) im)) 1d-13))))
+    (list (close (acos 2d0)    0d0                 1.3169578969248166d0)
+          (close (acos -2d0)   pi                 -1.3169578969248166d0)
+          (close (asin 2d0)    1.5707963267948966d0 -1.3169578969248166d0)
+          (close (asin -2d0)  -1.5707963267948966d0  1.3169578969248166d0)
+          (close (acosh -2d0)  1.3169578969248166d0  pi)        ; real part > 0
+          (close (acosh 0.5d0) 0d0                 1.0471975511965976d0)
+          (close (atanh 2d0)   0.5493061443340549d0 1.5707963267948966d0)))  ; imag > 0
+  (t t t t t t t))
+
+;; In-domain results stay real and correct; this is purely a domain-boundary fix.
+(deftest i385-inverse-trig-in-domain-unchanged
+  (list (< (abs (- (acos 0.5d0) 1.0471975511965979d0)) 1d-13)
+        (< (abs (- (asin 0.5d0) 0.5235987755982989d0)) 1d-13)
+        (< (abs (- (atanh 0.5d0) 0.5493061443340549d0)) 1d-13)
+        (< (abs (- (acosh 2d0) 1.3169578969248166d0)) 1d-13))
+  (t t t t))
+
+;;; A user define-compiler-macro must be removed by (setf (compiler-macro-function
+;;; name) nil) and by fmakunbound — otherwise a stale compiler macro keeps rewriting
+;;; calls after the function is killed and redefined with a different signature
+;;; (Maxima defmfun's $foo -> $foo-impl rewrite; rtest_translator 180/197).
+(defun %i386a (&rest a) (declare (ignore a)) :real)
+(define-compiler-macro %i386a (&rest a) (declare (ignore a)) '':cm)
+(deftest i386-setf-compiler-macro-function-nil-removes
+  (progn (setf (compiler-macro-function '%i386a) nil)
+         (compiler-macro-function '%i386a))
+  nil)
+
+(defun %i386b () 0)
+(define-compiler-macro %i386b (&rest a) (declare (ignore a)) '':cm)
+(deftest i386-fmakunbound-removes-compiler-macro
+  (progn (fmakunbound '%i386b)
+         (compiler-macro-function '%i386b))
+  nil)
+
+;; Functional: after kill + redefine with a new signature (no new compiler macro),
+;; a freshly compiled caller must call the real function, not the stale macro.
+(defun %i386f () 0)
+(define-compiler-macro %i386f (&whole w &rest a) (declare (ignore a)) '':stale)
+(deftest i386-stale-compiler-macro-not-used-after-redefine
+  (progn (fmakunbound '%i386f)
+         (eval '(defun %i386f (&rest l) (cons :real l)))
+         (eval '(defun %i386caller () (%i386f 1 2 3)))
+         (%i386caller))
+  (:real 1 2 3))
+
+;;; (expt base huge-exponent) for base of magnitude 1 must stay an exact INTEGER for
+;;; an exponent past int.MaxValue (2^31), not fall through to the float path and
+;;; return 1.0/-1.0. The float coefficient corrupted Maxima's CRE coefficients in
+;;; (rat %e^N) for N >= 2^31, sending a ratio to gcd -> crash in floor/ceiling.
+(deftest i387-expt-unit-base-huge-exponent-stays-integer
+  (list (expt 1 2147483648)          ; 2^31, just past int.MaxValue
+        (expt 1 534625820200)
+        (expt 1 -534625820200)
+        (expt -1 2147483648)         ; even -> 1
+        (expt -1 2147483649)         ; odd  -> -1
+        (expt -1 534625820201)       ; odd  -> -1
+        (expt 1 2147483647)          ; boundary (was already ok)
+        (expt 2 10))                 ; ordinary case unaffected
+  (1 1 1 1 -1 -1 1 1024))
+
+;;; rational->double: when final rounding carries into a 54th mantissa bit, halving
+;;; the quotient must be compensated by shift-- (result = q*2^-shift), not shift++.
+;;; The wrong sign turned (2^N-1)/2^N (N>=54, ~1.0) into 0.25. (Maxima rtest16 108/109.)
+(deftest i389-ratio-to-double-rounding-carry
+  (list (float (/ (1- (expt 2 54)) (expt 2 54)) 1d0)
+        (float (/ (1- (expt 2 60)) (expt 2 60)) 1d0)
+        (float (/ (1- (expt 2 1000)) (expt 2 1000)) 1d0)
+        (- (float (/ (1- (expt 2 60)) (expt 2 60)) 1d0) 1)   ; Maxima form -> 0.0
+        ;; N<=53 region and ordinary ratios are unchanged
+        (float (/ (1- (expt 2 53)) (expt 2 53)) 1d0)
+        (float 2/3 1d0)
+        (float 1/2 1d0))
+  (1.0d0 1.0d0 1.0d0 0.0d0 0.9999999999999999d0 0.6666666666666666d0 0.5d0))
+
+;;; The project-core dependency walk must resolve ASDF feature-conditional
+;;; dependency specifiers — (:feature :dotcl "x") — not just plain names. asdf:find-system
+;;; returns NIL for such a spec, dropping the dependency from the build manifest (so the
+;;; fasl loads without its contrib and fails later). asdf/find-component:resolve-dependency-spec
+;;; normalizes the spec to the system. (asdf symbols via read-from-string so reading this
+;;; file doesn't require asdf to be loaded yet.)
+(defun %i390-feature-dep-resolution ()
+  (require "asdf")
+  ;; A feature we control, so the (:feature ...) condition is met here.
+  (pushnew :i390-feat *features*)
+  ;; Write real .asd files into a temp dir and register it, so asdf can load the
+  ;; system definitions normally (a synthetic in-memory system with a bogus pathname
+  ;; makes find-system try to reload from a non-existent .asd and error).
+  (let* ((dir (format nil "~a/dotcl-i390-~a/"
+                      (or (dotcl:getenv "TEMP") "/tmp") (get-internal-real-time)))
+         (dirp (substitute #\/ #\\ dir)))
+    (ensure-directories-exist dirp)
+    (with-open-file (s (concatenate 'string dirp "i390-dep.asd")
+                       :direction :output :if-exists :supersede)
+      (write-string "(defsystem \"i390-dep\" :components ())" s))
+    (with-open-file (s (concatenate 'string dirp "i390-root.asd")
+                       :direction :output :if-exists :supersede)
+      (write-string "(defsystem \"i390-root\" :depends-on ((:feature :i390-feat \"i390-dep\")))" s))
+    (eval (read-from-string
+           (format nil "(pushnew ~s asdf:*central-registry* :test #'equal)" dirp)))
+    (let* ((root (funcall (read-from-string "asdf:find-system") "i390-root"))
+           (dep  (car (funcall (read-from-string "asdf:system-depends-on") root)))
+           (via-find    (ignore-errors (funcall (read-from-string "asdf:find-system") dep)))
+           (via-resolve (funcall (read-from-string "asdf/find-component:resolve-dependency-spec")
+                                 root dep)))
+      (list (null via-find)            ; find-system can't handle (:feature ...) — the bug
+            (not (null via-resolve)))))) ; resolve-dependency-spec does — the fix
+
+(deftest i390-feature-dependency-spec-resolves
+  (%i390-feature-dep-resolution)
+  (t t))
+
+;;; allocate-instance on a structure-class must return a LispStruct (not a CLOS
+;;; LispInstance), so it round-trips through make-load-form-saving-slots (which emits
+;;; allocate-instance as a struct's creation form) and is equalp to a normally-built
+;;; one. A LispInstance there made equalp always NIL (broke Coalton). Slots are left
+;;; NIL (unbound stand-in): allocate-instance must NOT run slot initforms (that is
+;;; initialize-instance's job), or the required-slot idiom — (id (required 'id)
+;;; :read-only t), whose initform signals — would make allocate-instance error.
+(defstruct i391-foo (a 0))
+(defstruct i391-k)
+(defun %i391-required (name) (error "slot ~S required but not supplied" name))
+(defstruct i391-req (id (%i391-required 'id) :read-only t))
+(deftest i391-allocate-instance-on-structure-class
+  (list (typep (allocate-instance (find-class 'i391-foo)) 'i391-foo)         ; a LispStruct
+        (i391-foo-a (allocate-instance (find-class 'i391-foo)))              ; slot unbound -> nil
+        (equalp (allocate-instance (find-class 'i391-k)) (make-i391-k))      ; no-slot equalp
+        ;; required-slot: allocate-instance must NOT run the (error-signaling) initform
+        (handler-case (typep (allocate-instance (find-class 'i391-req)) 'i391-req)
+          (error () :errored)))
+  (t nil t t))
+
+;; make-load-form-saving-slots round-trip (fasl-style): the INIT form restores real
+;; slot values even for a required-slot struct whose initform would otherwise signal.
+(deftest i391-mlfss-struct-roundtrip
+  (list (equalp (eval (make-load-form-saving-slots (make-i391-k))) (make-i391-k))
+        (i391-foo-a (eval (make-load-form-saving-slots (make-i391-foo :a 3))))
+        (i391-req-id (eval (make-load-form-saving-slots (make-i391-req :id 5)))))
+  (t 3 5))
+
+;; Guard: allocate-instance on a standard-class still yields a CLOS instance.
+(defclass i391-cobj () ((s :initform 9)))
+(deftest i391-allocate-instance-standard-class-unchanged
+  (typep (allocate-instance (find-class 'i391-cobj)) 'i391-cobj)
+  t)
+
+;;; dotnet:to-stream (non-binary) must use BOM-less UTF-8: writing "HTTP" to a
+;;; MemoryStream-backed char stream produces exactly 4 bytes, not 7 (a leading
+;;; EF BB BF BOM would corrupt the head of an HTTP/WebSocket response).
+(deftest i392-to-stream-no-utf8-bom
+  (let* ((ms (dotnet:new "System.IO.MemoryStream"))
+         (s  (dotnet:to-stream ms)))
+    (write-string "HTTP" s)
+    (finish-output s)
+    (dotnet:invoke (dotnet:invoke ms "ToArray") "get_Length")) ; 4 with no BOM, 7 with BOM
+  4)
+
+;;; A bivalent stream (dotnet:to-stream :bivalent t) serves BOTH char I/O (read-char/
+;;; read-line/write-char) and byte I/O (read-byte/write-byte/read-sequence) over the
+;;; same stream, coordinated (no read-ahead loses bytes), as SBCL's socket streams do.
+;;; This lets byte-oriented protocol code (cl-rpc HTTP/WS) run on a non-binary socket
+;;; stream without :binary.
+;; Results are reduced to fixnum lists (char-code / length / coerce-to-list) so the
+;; deftest comparison is plain equal (it does not deep-compare general vectors).
+(deftest i394-bivalent-mixed-char-and-byte-read
+  (let ((ms (dotnet:new "System.IO.MemoryStream")))
+    (dolist (b '(71 69 84 10 65 66)) (dotnet:invoke ms "WriteByte" b)) ; "GET\nAB"
+    (dotnet:invoke ms "set_Position" 0)
+    (let ((s (dotnet:to-stream ms :bivalent t)))
+      (list (read-byte s nil nil)              ; 71 = G   (byte)
+            (char-code (read-char s nil nil))  ; 69 = E   (char, after a byte)
+            (read-byte s nil nil)              ; 84 = T   (byte, after a char)
+            (length (read-line s nil nil))     ; 0        (#\Newline terminator, empty line)
+            (read-byte s nil nil))))           ; 65 = A   (byte, after read-line)
+  (71 69 84 0 65))
+
+;; Byte write (write-byte/write-string/write-sequence) emits no BOM and reads back as
+;; bytes via read-sequence into a byte vector.
+(deftest i394-bivalent-byte-write-readback
+  (let* ((ms (dotnet:new "System.IO.MemoryStream"))
+         (s  (dotnet:to-stream ms :bivalent t)))
+    (write-byte 72 s)                                   ; 'H'
+    (write-string "TTP" s)                              ; chars
+    (write-sequence (make-array 2 :element-type '(unsigned-byte 8)
+                                  :initial-contents '(13 10)) s)
+    (finish-output s)
+    (dotnet:invoke ms "set_Position" 0)
+    (let* ((s2 (dotnet:to-stream ms :bivalent t))
+           (buf (make-array 6 :element-type '(unsigned-byte 8))))
+      (cons (read-sequence buf s2) (coerce buf 'list)))) ; (6 72 84 84 80 13 10) — first byte 72, no BOM
+  (6 72 84 84 80 13 10))
+
+;; eql compares floats by bits: (eql 0.0 -0.0)=NIL (= gives T); bit-identical NaNs are
+;; eql=T (= gives NIL). Regression guard for the old value-compare mismatch.
+(deftest i396-eql-signed-zero-distinct
+  (list (eql 0.0d0 -0.0d0) (= 0.0d0 -0.0d0)
+        (eql 0.0 -0.0)     (= 0.0 -0.0))
+  (nil t nil t))
+
+(deftest i396-eql-nan-bit-identical
+  ;; Distinct objects but bit-identical NaNs (exercises the non-ReferenceEquals path)
+  (let ((n1 (dotnet:static "System.Double" "NaN"))
+        (n2 (dotnet:static "System.Double" "NaN")))
+    (list (eql n1 n2) (= n1 n2)))   ; eql=T (bit-identical); = is NIL since NaN
+  (t nil))
+
+(deftest i396-eql-normal-float-unchanged
+  (list (eql 1.5d0 (+ 1.0d0 0.5d0))
+        (eql 1.5 (+ 1.0 0.5))
+        (eql 1.5d0 1.6d0))
+  (t t nil))
+
+;; Unary (- x) produces -0.0 via IEEE sign flip (Subtract(0,x) would collapse to +0.0).
+;; Regression guard for the conjugate signed-zero bug exposed by stricter eql (CONJUGATE.3-10).
+(deftest i396-unary-minus-zero-runtime
+  (let ((z 0.0d0))   ; runtime value (not constant-folded)
+    (list (eql (- z) -0.0d0)            ; t
+          (eql (- z) 0.0d0)             ; nil
+          (eql (conjugate #c(0.0d0 0.0d0)) #c(0.0d0 -0.0d0))   ; t
+          (eql (conjugate #c(1.0d0 0.0d0)) #c(1.0d0 -0.0d0)))) ; t
+  (t nil t t))
+
+;; (imagpart real-float) = (* 0 x): the imagpart of a negative float is -0.0 (IMAGPART.4 / MISC.598).
+(deftest i396-imagpart-real-signed-zero
+  (list (eql (imagpart -1.5d0) (* 0 -1.5d0))   ; t (both -0.0)
+        (eql (imagpart -1.5d0) -0.0d0)         ; t
+        (eql (imagpart 1.5d0)  0.0d0)          ; t (+0.0)
+        (eql (imagpart -1.5s0) -0.0s0))        ; t (single)
+  (t t t t))
+
+;; Integer divide-by-zero signals DIVISION-BY-ZERO (a subtype of ARITHMETIC-ERROR), catchable
+;; by handler-case / handler-bind. Previously the raw .NET DivideByZeroException turned into a
+;; PROGRAM-ERROR and was not caught by division-by-zero / arithmetic-error.
+(deftest i398-integer-zero-divide-is-division-by-zero
+  (macrolet ((dbz (form) `(handler-case ,form
+                            (division-by-zero () :dbz)
+                            (error (c) (type-of c)))))
+    (list (dbz (truncate 1 0)) (dbz (/ 1 0))   (dbz (rem 1 0))
+          (dbz (mod 1 0))      (dbz (floor 1 0)) (dbz (ceiling 1 0))
+          (dbz (round 7 0))))
+  (:dbz :dbz :dbz :dbz :dbz :dbz :dbz))
+
+;; Also catchable via the arithmetic-error supertype, and likewise through handler-bind.
+(deftest i398-zero-divide-arithmetic-error-and-handler-bind
+  (list (handler-case (/ 3 0) (arithmetic-error () :ae) (error () :other))
+        (block done
+          (handler-bind ((division-by-zero (lambda (c) (declare (ignore c))
+                                             (return-from done :hb))))
+            (truncate 9 0))))
+  (:ae :hb))
+
+;; integer-decode-float / decode-float signal FLOATING-POINT-INVALID-OPERATION (a subtype of
+;; ARITHMETIC-ERROR) for NaN / infinity. Previously they computed on the raw 0x7FF exponent and
+;; returned garbage, breaking cl-store's (error-dependent) non-finite float detection. Finite
+;; values are unchanged.
+(deftest i397-decode-float-nonfinite-signals
+  (let ((nan (cl::make-double-float #x7ff8000000000000))
+        (inf (cl::make-double-float #x7ff0000000000000)))
+    (flet ((fp (fn x) (handler-case (funcall fn x)
+                        (floating-point-invalid-operation () :fpio)
+                        (error (c) (type-of c)))))
+      (list (fp #'integer-decode-float nan) (fp #'integer-decode-float inf)
+            (fp #'decode-float nan)         (fp #'decode-float inf)
+            ;; finite values still decode as before
+            (multiple-value-list (integer-decode-float 1.5d0))
+            (multiple-value-list (decode-float 0.5d0)))))
+  (:fpio :fpio :fpio :fpio
+   (6755399441055744 -52 1)
+   (0.5d0 0 1.0d0)))
+
+;; equal/equalp hash-table key hashing is depth-limited (like sxhash). A circular structure
+;; used as a key no longer recurses forever and crashes the whole process with a stack
+;; overflow. Previously GetEqualHash/GetEqualpHash recursed unbounded into car/cdr and crashed.
+(deftest i399-equal-hash-circular-key-no-overflow
+  (let ((x (list 1 2 3)) (h (make-hash-table :test 'equal)))
+    (setf (cdr (last x)) x)               ; circular list
+    (setf (gethash x h) :v)
+    (list (hash-table-count h) (gethash x h)))
+  (1 :v))
+
+(deftest i399-equalp-hash-circular-key-no-overflow
+  (let ((x (list 1 2 3)) (h (make-hash-table :test 'equalp)))
+    (setf (cdr (last x)) x)
+    (setf (gethash x h) :w)
+    (list (hash-table-count h) (gethash x h)))
+  (1 :w))
+
+;; class-of a signaled native condition returns the correct class (matching type-of). Previously
+;; ClassOf had no LispCondition case and fell through to #<STANDARD-CLASS T>, which broke
+;; cl-store's condition save (class-of → class-slots) with a STORE-ERROR.
+(deftest i400-class-of-signaled-condition
+  (flet ((cn (c) (class-name (class-of c))))
+    (list (handler-case (/ 1 0)      (division-by-zero (c) (cn c)))
+          (handler-case (car 3)      (type-error (c) (cn c)))
+          (handler-case (error "x")  (error (c) (cn c)))
+          ;; type-of and class-of agree
+          (let ((c (handler-case (/ 1 0) (division-by-zero (e) e))))
+            (eq (type-of c) (class-name (class-of c))))))
+  (division-by-zero type-error simple-error t))
+
+;;; compile-file of a CIRCULAR or SHARED constant literal must not OOM and must
+;;; reconstruct the graph (cycles + EQ-shared substructure) exactly. The FASL
+;;; inline constant emitter used to walk a cons literal cell-by-cell, which
+;;; spun forever on a cycle (e.g. '#1=(1 2 3 . #1#)) and duplicated shared
+;;; tails. compile-file now detects this and emits a load-time read of the
+;;; *print-circle* representation. (Surfaced compiling cl-store's circ.* tests.)
+(defvar *cf-circ-dir* "test/regression/.tmp-cfcirc/")
+(defvar *cf-circ* :unset)
+
+(defun cf-circ-build-and-load ()
+  (ensure-directories-exist *cf-circ-dir*)
+  (let* ((src  (namestring (merge-pathnames "cfcirc.lisp" (truename *cf-circ-dir*))))
+         (fasl (namestring (merge-pathnames "cfcirc.fasl" (truename *cf-circ-dir*)))))
+    (setf *cf-circ* :unset)
+    (with-open-file (s src :direction :output
+                           :if-exists :supersede :if-does-not-exist :create)
+      ;; circular cdr-list, and a list with a tail shared (EQ) at two positions
+      (write-string
+       "(in-package :cl-user)
+        (defparameter cl-user::*cf-circ*
+          (list (let ((x '#1=(1 2 3 . #1#)))
+                  (and (eq x (cdddr x)) (eql (car x) 1)))
+                (let ((y '(1 2 (a b . #2=(c d e)) 3 4 . #2#)))
+                  (eq (cddr (third y)) (nthcdr 5 y)))))" s))
+    (compile-file src :output-file fasl)
+    (load fasl)
+    *cf-circ*))
+
+(deftest compile-file-circular-and-shared-constant
+  (cf-circ-build-and-load)
+  (t t))
+
+;;; A circular literal inside a DEFUN body (not just a top-level defparameter
+;;; init) used to Stack-overflow at compile-file time: the compiler's source-form
+;;; walkers (FORM-HAS-RETURN-FROM-P) and the SIL post-passes (%SIL-REFERENCES-LOCAL-P
+;;; / %SIL-SUBST-SELF-ARG0) descended into the (quote <cyclic>) / (:load-const
+;;; <cyclic>) data and looped forever. They now treat quoted data / :load-const as
+;;; opaque. Two defuns reuse the SAME #1= label: the reader must scope labels
+;;; per top-level read (CLHS 2.4.8.15), else the 2nd #1# leaks to the 1st structure.
+(defvar *cf-defun-dir* "test/regression/.tmp-cfdefun/")
+(defun cf-defun-build-and-load ()
+  (ensure-directories-exist *cf-defun-dir*)
+  (let* ((src  (namestring (merge-pathnames "cfdefun.lisp" (truename *cf-defun-dir*))))
+         (fasl (namestring (merge-pathnames "cfdefun.fasl" (truename *cf-defun-dir*)))))
+    (with-open-file (s src :direction :output
+                           :if-exists :supersede :if-does-not-exist :create)
+      (write-string
+       "(in-package :cl-user)
+        ;; nested labels in a defun body (the minimal repro)
+        (defun cf-nested () (let ((x '#1=(1 2 3 #2=(#2#) . #1#))) x))
+        ;; same #1= label reused in a second defun — must NOT leak across forms
+        (defun cf-a () '#1=(10 20 30 . #1#))
+        (defun cf-b () '#1=(40 50 60 . #1#))" s))
+    (compile-file src :output-file fasl)
+    (load fasl)
+    (let* ((x (funcall (intern "CF-NESTED" :cl-user)))
+           (e (cadddr x))                                  ; #2=(#2#)
+           (a (funcall (intern "CF-A" :cl-user)))
+           (b (funcall (intern "CF-B" :cl-user))))
+      (list (eq (car e) e)            ; nested inner self-cycle reconstructed
+            (eq (cdr (cdddr x)) x)    ; nested outer tail loops back to x
+            (eq (cdddr a) a)          ; cf-a's own cycle
+            (eq (cdddr b) b)          ; cf-b's own cycle (no label leak from cf-a)
+            (eql (car b) 40)))))      ; cf-b kept its own data, not cf-a's
+
+(deftest compile-file-circular-constant-in-defun
+  (cf-defun-build-and-load)
+  (t t t t t))
+
+;;; #n= label scope is one outermost READ: a #1= in one form must not leak into
+;;; the next form's #1# read from the same stream (cached Reader reuse).
+(deftest reader-share-label-scope-per-read
+  (with-input-from-string (s "#1=(1 2 3 . #1#) #1=(7 8 9 . #1#)")
+    (let ((a (read s)) (b (read s)))
+      (list (eq (cdddr a) a)    ; a self-cyclic
+            (eq (cdddr b) b)    ; b self-cyclic on its OWN structure
+            (eq (cdddr b) a)    ; b did NOT leak to a
+            (car b))))
+  (t t nil 7))
+
+;;; #'<builtin> must return the SAME stable object as symbol-function, so
+;;; (eq #'car #'car) is T (matches CLHS/SBCL). Previously the FUNCTION special
+;;; form built a fresh arity-checking wrapper per #', breaking eq-on-builtin code
+;;; (memoization, function tables, cl-store's fdefinition round-trip).
+(deftest function-builtin-eq-self
+  (eq #'car #'car)
+  t)
+
+(deftest function-builtin-eq-symbol-function
+  (eq #'car (symbol-function 'car))
+  t)
+
+(deftest function-builtin-eq-fdefinition
+  (eq #'cons (fdefinition 'cons))
+  t)
+
+(deftest function-varargs-builtin-eq
+  (eq #'+ #'+)
+  t)
+
+;;; Routing through sym.Function also exposes the full lambda list: #'member now
+;;; accepts &key, which the old binary-only wrapper dropped.
+(deftest function-builtin-member-keyword
+  (funcall #'member 2 '(1 2 3) :test #'eql)
+  (2 3))
+
+;;; Native (runtime-signaled) conditions must answer MOP slot access, since
+;;; (typep c 'standard-object) is T and class-of resolves correctly. Previously
+;;; slot-value/slot-boundp errored "not a CLOS instance" on signaled conditions
+;;; (only make-condition instances worked). cl-store saves conditions via
+;;; slot-boundp/slot-value over class-slots, so this broke condition serialization.
+(deftest native-condition-slot-boundp-bound
+  (handler-case (error "boom ~a" 7)
+    (error (c) (list (slot-boundp c 'format-control)
+                     (slot-value c 'format-control)
+                     (slot-value c 'format-arguments))))
+  (t "boom ~a" (7)))
+
+(deftest native-condition-type-error-slots
+  (handler-case (car 3)
+    (type-error (c) (list (slot-boundp c 'datum) (slot-value c 'datum))))
+  (t 3))
+
+(deftest native-condition-slot-boundp-unbound
+  ;; (/ 1 0) signals division-by-zero without capturing operands -> unbound slot,
+  ;; reported as NIL (not an error), so cl-store skips it cleanly.
+  (handler-case (/ 1 0)
+    (division-by-zero (c) (slot-boundp c 'operands)))
+  nil)
+
+(deftest native-condition-slot-exists-p
+  (handler-case (/ 1 0)
+    (division-by-zero (c) (list (slot-exists-p c 'operands)
+                                (slot-exists-p c 'nonexistent))))
+  (t nil))
+
+(deftest native-condition-setf-slot-value
+  (handler-case (error "x")
+    (error (c) (setf (slot-value c 'format-control) "changed")
+               (slot-value c 'format-control)))
+  "changed")
+
+(deftest native-condition-slot-makunbound
+  (handler-case (error "x")
+    (error (c) (slot-makunbound c 'format-control)
+               (slot-boundp c 'format-control)))
+  nil)
+
+(deftest native-condition-slot-value-missing
+  ;; A slot absent from the condition's class goes through slot-missing (error).
+  (handler-case
+      (handler-case (car 3) (type-error (c) (slot-value c 'no-such-slot)))
+    (error () :slot-missing))
+  :slot-missing)
+
+;;; CAR/CDR on a non-list signal a TYPE-ERROR whose expected-type is LIST
+;;; (previously NIL — Runtime.Car/Cdr omitted the expected type). cxr functions
+;;; compose CAR/CDR so they inherit it.
+(deftest car-type-error-expected-type
+  (handler-case (car 3) (type-error (c)
+    (list (type-error-datum c) (type-error-expected-type c))))
+  (3 list))
+
+(deftest cdr-type-error-expected-type
+  (handler-case (cdr 'x) (type-error (c)
+    (list (type-error-datum c) (type-error-expected-type c))))
+  (x list))
+
+;;; (compile name lambda) must install NAME's function definition and return NAME
+;;; (CLHS). Previously dotcl returned NAME without compiling/binding, so fiveam's
+;;; run-time (funcall (compile '%inner-test '(lambda ...))) hit Undefined function.
+(deftest compile-name-installs-fdefinition
+  (progn
+    (compile 'reg-compile-foo '(lambda () 42))
+    (list (and (fboundp 'reg-compile-foo) t) (funcall 'reg-compile-foo)))
+  (t 42))
+
+(deftest compile-name-returns-name
+  ;; CLHS: compile returns (values name warnings-p failures-p)
+  (compile 'reg-compile-bar '(lambda (x) (* x x)))
+  reg-compile-bar nil nil)
+
+(deftest compile-name-funcall-result
+  (funcall (compile 'reg-compile-inner '(lambda () (+ 1 2))))
+  3)
+
+(deftest compile-nil-returns-function
+  (funcall (compile nil '(lambda () :anon)))
+  :anon)
+
+(deftest compile-setf-name-installs
+  (progn
+    (compile '(setf reg-compile-place) '(lambda (v obj) (declare (ignore obj)) v))
+    (and (fboundp '(setf reg-compile-place)) t))
+  t)
+
+;;; symbol-macrolet whose expansion is NIL must still expand (not fall through to a
+;;; special-variable reference → UNBOUND-VARIABLE). lookup-symbol-macro now returns
+;;; found-p so a NIL expansion is distinguished from an unregistered symbol.
+;;; (Root cause of trivia CONSTANT-PATTERN / HASH-TABLE-ENTRY: (match nil (nil t)).)
+(deftest symbol-macrolet-nil-expansion
+  (symbol-macrolet ((reg-sm-foo nil)) reg-sm-foo)
+  nil)
+
+(deftest symbol-macrolet-nonnil-expansion
+  (symbol-macrolet ((reg-sm-foo 9)) reg-sm-foo)
+  9)
+
+(deftest symbol-macrolet-nil-expansion-in-form
+  (symbol-macrolet ((reg-sm-a nil) (reg-sm-b 2))
+    (list reg-sm-a reg-sm-b reg-sm-a))
+  (nil 2 nil))
+
+(deftest symbol-macrolet-nil-expansion-compiled
+  (funcall (compile nil '(lambda () (symbol-macrolet ((reg-sm-q nil)) reg-sm-q))))
+  nil)
+
+;;; decode-float must use the SIGN BIT, so -0.0 decodes with sign -1.0 (was +1.0:
+;;; -0.0 < 0 is false in IEEE). Significand/sign keep the argument's float format.
+;;; (ieee-floats / cl-conspack serialize -0.0 via this 3rd value, .)
+(deftest decode-float-negative-zero-double
+  (nth-value 2 (decode-float -0.0d0))
+  -1.0d0)
+
+(deftest decode-float-positive-zero-double
+  (nth-value 2 (decode-float 0.0d0))
+  1.0d0)
+
+(deftest decode-float-negative-zero-single
+  (multiple-value-list (decode-float -0.0f0))
+  (0.0f0 0 -1.0f0))
+
+(deftest decode-float-single-keeps-format
+  (typep (decode-float 3.5f0) 'single-float)
+  t)
+
+(deftest decode-float-sign-consistent-with-family
+  (list (float-sign -0.0d0)
+        (nth-value 2 (integer-decode-float -0.0d0))
+        (nth-value 2 (decode-float -0.0d0)))
+  (-1.0d0 -1 -1.0d0))
+
+;;; (setf (apply #'fn ...) value) must evaluate the place args left-to-right and
+;;; THEN value (CLHS 5.1.1.1). The naive expansion (apply #'(setf fn) value args...)
+;;; evaluated value first (broke iterate SETF.4).
+(deftest setf-apply-evaluation-order
+  (let ((v (vector 0 0 0 0)) (log nil))
+    (setf (apply #'aref v (list (progn (push :idx log) 1)))
+          (progn (push :val log) 9))
+    (list (reverse log) (coerce v 'list)))
+  ((:idx :val) (0 9 0 0)))
+
+(deftest setf-apply-stores-value
+  (let ((v (vector 10 20 30)))
+    (setf (apply #'aref v (list 1)) 99)
+    (coerce v 'list))
+  (10 99 30))
+
+;;; handler-bind/handler-case/restart-bind/restart-case had macro-function=T but
+;;; macroexpand-1 returned them unexpanded (expanded-p=NIL) — an inconsistency that
+;;; breaks code walkers. macroexpand-1 now yields a portable, eval-equivalent
+;;; expansion. The compiler is unaffected (it uses its compile-form handlers).
+(deftest handler-bind-macroexpands
+  (nth-value 1 (macroexpand-1 '(handler-bind ((error #'identity)) (foo))))
+  t)
+
+(deftest handler-case-macroexpands
+  (nth-value 1 (macroexpand-1 '(handler-case (foo) (error () :e))))
+  t)
+
+(deftest restart-bind-macroexpands
+  (nth-value 1 (macroexpand-1 '(restart-bind ((r #'identity)) (foo))))
+  t)
+
+(deftest restart-case-macroexpands
+  (nth-value 1 (macroexpand-1 '(restart-case (foo) (r () :ok))))
+  t)
+
+;; the expansion is eval-equivalent to the special form
+(deftest handler-case-expansion-eval-equivalent
+  (eval (macroexpand-1 '(handler-case (error "boom")
+                          (error (e) (list :caught (type-of e))))))
+  (:caught simple-error))
+
+(deftest handler-bind-expansion-eval-equivalent
+  (eval (macroexpand-1 '(block b
+                          (handler-bind ((error (lambda (c) (declare (ignore c))
+                                                  (return-from b :ran))))
+                            (error "x")))))
+  :ran)
+
+(deftest handler-case-no-error-clause-eval
+  (eval (macroexpand-1 '(handler-case (values 1 2)
+                          (error () :err)
+                          (:no-error (a b) (list :ok a b)))))
+  (:ok 1 2))
+
+(deftest restart-case-expansion-eval-equivalent
+  (eval (macroexpand-1 '(restart-case (invoke-restart 'r 5)
+                          (r (x) (* x 10)))))
+  50)
+
+;; normal (compiled) special-form behavior is unchanged
+(deftest handler-case-special-form-still-works
+  (handler-case (error "boom") (error () :caught))
+  :caught)
+
+;;; : handler-bind/restart-bind macroexpansion must keep the body INLINE (progn),
+;;; not in a (lambda () body) thunk, so a code walker that stops at function boundaries
+;;; can still reach the body. Verified with a lambda-skipping walker.
+(defun %reg-find-sym-no-lambda (s form)
+  (cond ((eq form s) t)
+        ((and (consp form) (eq (car form) 'lambda)) nil)   ; don't descend into lambdas
+        ((consp form) (or (%reg-find-sym-no-lambda s (car form))
+                          (%reg-find-sym-no-lambda s (cdr form))))
+        (t nil)))
+
+(deftest handler-bind-body-inline-not-thunked
+  (%reg-find-sym-no-lambda 'reg-hb-body-marker
+    (macroexpand-1 '(handler-bind ((error #'identity)) (reg-hb-body-marker))))
+  t)
+
+(deftest restart-bind-body-inline-not-thunked
+  (%reg-find-sym-no-lambda 'reg-rb-body-marker
+    (macroexpand-1 '(restart-bind ((r #'identity)) (reg-rb-body-marker))))
+  t)
+
+;; nested handler-binds keep the cluster push/pop balanced through a non-local exit
+(deftest handler-bind-inline-nested-balanced
+  (eval (macroexpand-1
+         '(block b
+            (handler-bind ((error (lambda (c) (declare (ignore c)) (return-from b :outer))))
+              (handler-bind ((warning (lambda (c) (declare (ignore c)) nil)))
+                (error "x"))))))
+  :outer)
+
+;;; define-condition :report must drive princ / ~A / princ-to-string (CLHS 9.1.3).
+;;; The printer's condition short-circuit ignored the generated print-object method,
+;;; so user conditions printed "#<TYPE>" under *print-escape*=nil (esrap).
+(define-condition reg-c413 (error) ((x :initarg :x :reader reg-c413-x))
+  (:report (lambda (c s) (format s "report: ~A" (reg-c413-x c)))))
+(define-condition reg-c413-str (error) () (:report "static msg"))
+(define-condition reg-c413-sub (reg-c413) ())
+
+(deftest condition-report-lambda-princ
+  (princ-to-string (make-condition 'reg-c413 :x 42))
+  "report: 42")
+
+(deftest condition-report-string-princ
+  (princ-to-string (make-condition 'reg-c413-str))
+  "static msg")
+
+(deftest condition-report-format-tilde-a
+  (format nil "~A" (make-condition 'reg-c413 :x 7))
+  "report: 7")
+
+;; ~S / *print-escape*=t keeps the #<TYPE> form
+(deftest condition-report-escape-still-type
+  (format nil "~S" (make-condition 'reg-c413 :x 7))
+  "#<REG-C413>")
+
+;; inherited report from a parent condition
+(deftest condition-report-inherited
+  (princ-to-string (make-condition 'reg-c413-sub :x 5))
+  "report: 5")
+
+;;; Default setf expansion for a (setf NAME) function (no defsetf/define-setf-expander)
+;;; must emit the funcall form (funcall #'(setf NAME) val args...), not the bare
+;;; ((setf NAME) val args) operator-list form, so code walkers handle it (iterate
+;;; minimize). Args evaluate left-to-right then value (CLHS 5.1.1.1).
+(defun reg-414-foo (x) x)
+(defun (setf reg-414-foo) (v x) (declare (ignore x)) v)
+
+(deftest setf-fn-fallback-is-funcall-form
+  (car (macroexpand-1 '(setf (reg-414-foo y) 5)))
+  let*)
+
+(deftest setf-fn-fallback-walkable-funcall
+  ;; the operator inside the expansion is FUNCALL (walker-friendly), not a (setf ..) list
+  (labels ((has-funcall (f)
+             (cond ((atom f) nil)
+                   ((eq (car f) 'funcall) t)
+                   (t (or (some #'has-funcall (and (listp f) f)) nil)))))
+    (has-funcall (macroexpand-1 '(setf (reg-414-foo y) 5))))
+  t)
+
+(deftest setf-fn-fallback-eval-order
+  (let ((log nil))
+    (setf (reg-414-foo (progn (push :idx log) 1)) (progn (push :val log) 9))
+    (reverse log))
+  (:idx :val))
+
+;; (setf f) function whose value is not an echo of val — the setf form yields it
+(defun (setf reg-414-cons) (v x) (cons v x))
+(deftest setf-fn-fallback-returns-setter-value
+  (setf (reg-414-cons 'a) 'b)
+  (b . a))
+
+;;; FORMAT: a ~:; that is the default-clause separator of a ~[...~] nested inside a
+;;; ~<...~:> must not be mistaken for the justification overflow ~:; (CLHS 22.3.6.1
+;;; applies only to a ~:; directly in ~<...~>). It also must not split the logical
+;;; block into prefix/suffix sections (esrap parse-error report).
+(deftest format-nested-conditional-in-justify
+  (format nil "~@<~[a~:;b~]~2@Tc~:>" 1)
+  "b  c")
+
+(deftest format-nested-conditional-clause-0
+  (format nil "~@<~[x~:;y~]~:>" 0)
+  "x")
+
+(deftest format-nested-conditional-clause-default
+  (format nil "~@<~[x~:;y~]~:>" 1)
+  "y")
+
+;;; princ / ~A / write :escape nil must bind the dynamic *PRINT-ESCAPE* to NIL so a
+;;; user print-object method reading it sees the right value (dotcl carried escape only
+;;; as a C# param, leaving the special var at its default T).
+(defclass reg-416-plain () ((y :initarg :y)))
+(defmethod print-object ((c reg-416-plain) s)
+  (format s "[e=~A y=~A]" *print-escape* (slot-value c 'y)))
+
+(deftest print-escape-bound-under-princ
+  (princ-to-string (make-instance 'reg-416-plain :y 9))
+  "[e=NIL y=9]")
+
+(deftest print-escape-bound-under-format-a
+  (format nil "~A" (make-instance 'reg-416-plain :y 9))
+  "[e=NIL y=9]")
+
+(deftest print-escape-bound-under-prin1
+  (prin1-to-string (make-instance 'reg-416-plain :y 9))
+  "[e=T y=9]")
+
+(defstruct (reg-416-st (:constructor mk-reg-416-st)) a)
+(defmethod print-object ((p reg-416-st) s)
+  (format s "<e=~A a=~A>" *print-escape* (reg-416-st-a p)))
+
+(deftest print-escape-bound-struct-princ
+  (princ-to-string (mk-reg-416-st :a 3))
+  "<e=NIL a=3>")
+
+(deftest print-escape-bound-struct-prin1
+  (prin1-to-string (mk-reg-416-st :a 3))
+  "<e=T a=3>")
+
+;;; follow-up: a real error inside a user condition's :report/print-object must
+;;; propagate, not be swallowed into "#<TYPE>" (the catch hid the true cause).
+(define-condition reg-416-bad (error) ((x :initarg :x :reader reg-416-bad-x))
+  (:report (lambda (c s) (declare (ignore s)) (funcall (reg-416-bad-x c)))))
+
+(deftest condition-report-error-propagates
+  (handler-case (princ-to-string (make-condition 'reg-416-bad :x 42))
+    (type-error () :propagated))
+  :propagated)
+
+;;; FORMAT ~[...~] processed its chosen clause on a SubArray copy starting past the
+;;; consumed selector, so a ~:* in the clause couldn't back up to the selector and the
+;;; args the clause consumed were not propagated — an enclosing ~{...~} then over-
+;;; iterated on the leftovers. Now the clause runs in place on the shared arg pointer
+;;; (esrap error-report). Tests use a function directive to make arg flow visible.
+(defun reg-417-pt (stream obj &optional c a) (declare (ignore c a)) (format stream "<~S>" obj))
+
+(deftest format-cond-backup-to-selector
+  (format nil "~[~*~:;~:*<~A>~]" 1)
+  "<1>")
+
+(deftest format-cond-clause-consumes-and-propagates
+  ;; ~{~{...~[~*~:;~:*<~A>~{...~}~]~}~}: the inner ~{~} destructures (:R 1 (:E));
+  ;; ~[ consumes the selector, ~:* backs up to read it, the nested ~{~} consumes the
+  ;; rest — so the inner ~{~} sees the list exhausted and the outer iterates only once
+  ;; (no leftover (:E) reused as a fresh round).
+  (format nil "~{~{=~A ~[~*~:;~:*<~A>~{~/reg-417-pt/~}~]~}~^|~}" '((:r 1 (:e))))
+  "=R <1><:E>")
+
+(deftest format-colon-cond-backup
+  (format nil "~:[no~;<~:*~A>~]" 5)
+  "<5>")
+
+(deftest format-colon-cond-in-iteration
+  (format nil "~{~:[N~;Y~:*~A~] ~}" '(1 nil 2))
+  "Y1 N Y2 ")
+
+;;; *print-pretty* defaults to T (matching SBCL), so logical-block mandatory newlines
+;;; (~:@_ / ~@:_ / (pprint-newline :mandatory)) fire by default. With the old NIL default
+;;; ~@<...~:> degraded to justify and the mandatory breaks were dropped (esrap report).
+(deftest print-pretty-default-is-t
+  *print-pretty*
+  t)
+
+(deftest format-logical-block-mandatory-newline
+  (format nil "~@<A~:@_~:@_B~:>")
+  #.(format nil "A~%~%B"))
+
+(deftest format-logical-block-mandatory-at-colon
+  (format nil "~@<A~@:_B~:>")
+  #.(format nil "A~%B"))
+
+(deftest pprint-logical-block-mandatory-newline
+  (with-output-to-string (s)
+    (pprint-logical-block (s nil)
+      (princ "A" s) (pprint-newline :mandatory s) (princ "B" s)))
+  #.(format nil "A~%B"))
+
+;; with *print-pretty* nil, ~<...~:> degrades to justification (CLHS) — no break
+(deftest format-logical-block-mandatory-disabled-when-not-pretty
+  (let ((*print-pretty* nil)) (format nil "~@<A~:@_B~:>"))
+  "AB")
+
+;;; equal must compare the CDR (dotted-pair tail) of a cons with EQUAL too, not eql, so a
+;;; string (or other content-equal value) in the tail position matches by content (
+;;; esrap AROUND). The comparison loops along the spine, so it stays O(1) stack and
+;;; terminates on a mismatched atom.
+(deftest equal-string-in-cdr
+  (list (equal (cons 1 "x") (cons 1 "x"))
+        (equal (list* 1 2 "x") (list* 1 2 "x"))
+        (equal (cons (list 1) "x") (cons (list 1) "x")))
+  (t t t))
+
+(deftest equal-string-cdr-distinct-nil
+  (equal (cons 1 "x") (cons 1 "y"))
+  nil)
+
+;; tail that is a non-equal atom must terminate with NIL (regression vs the broken
+;; self-recursing tail that stack-overflowed even compilation)
+(deftest equal-distinct-symbol-tail
+  (equal (cons 1 'a) (cons 1 'b))
+  nil)
+
+(deftest equal-non-string-vector-cdr-stays-nil
+  (let ((v1 (vector 2)) (v2 (vector 2)))
+    (equal (cons 1 v1) (cons 1 v2)))
+  nil)
+
+;; long list with a string tail — no stack overflow
+(deftest equal-long-list-string-tail
+  (let ((big (let ((acc nil)) (dotimes (i 3000) (push i acc)) acc)))
+    (equal (cons big "t") (cons big "t")))
+  t)
+
+;; pprint: with *print-pretty*=T, a ~/func/ call inside a logical block
+;; followed by a ~[...~] conditional containing ~@:_ was reordered (the
+;; conditional's output flushed ahead of the pre-conditional ~/func/ output).
+;; Verify "While" still precedes "Expected" in pretty mode.
+(defun rf420-pr (s o &optional c a) (declare (ignore c a)) (format s "<~S>" o))
+
+(deftest pprint-call-before-conditional-order
+  (let* ((out (let ((*print-pretty* t))
+                (format nil "~@<~{While ~/rf420-pr/. ~[Z~:;Expected:~@:_~@:_X~]~}~:>"
+                        (list :root 1))))
+         (wi (search "While" out))
+         (ei (search "Expected" out)))
+    (and wi ei (< wi ei) t))
+  t)
+
+;; preceding literal before an iteration with ~@:_ must also stay ordered
+(deftest pprint-literal-before-iteration-order
+  (let* ((out (let ((*print-pretty* t))
+                (format nil "~@<Pre ~{~/rf420-pr/~@:_~}~:>" (list :a))))
+         (pi (search "Pre" out))
+         (ai (search "<:A>" out)))
+    (and pi ai (< pi ai) t))
+  t)
+
+;; macroexpand-cache scope: the cache keyed expansions by form (cons) only,
+;; ignoring the macro environment. A form spliced (via ,@body) into both a real-
+;; macro context and a shadowing macrolet got ONE expansion reused for both —
+;; here the shadowed RF421-REAL leaked into the non-shadowed branch. (Root cause
+;; of esrap's parse-position off-by-one: it disabled the packrat with-cached-result
+;; in rules whose body was spliced this way.) The cache is now keyed by (form,scope).
+(defmacro rf421-real (x) `(list :real ,x))
+(defun rf421-pick (flag)
+  (macrolet ((variants (&body body)
+               `(if flag
+                    (progn ,@body)
+                    (macrolet ((rf421-real (x) `(list :noop ,x)))
+                      ,@body))))
+    (variants (rf421-real 42))))
+
+(deftest macrolet-shadow-not-leaked-to-shared-body
+  (list (rf421-pick t) (rf421-pick nil))
+  ((:real 42) (:noop 42)))
+
+;; compile-time keyword check: a direct call to a fixed-&key lambda with a literal unknown
+;; keyword must WARN at compile time (CLHS 3.5.1.4 static diagnosis). A known
+;; keyword must stay silent. (esrap CONDITION.INVALID-ARGUMENT-COMBINATIONS
+;; depends on this — its parse compiler-macro generates such a call for :raw t.)
+(deftest warn-unknown-keyword-in-lambda-call
+  (list
+   (handler-case (progn (compile nil '(lambda () ((lambda (&key a) a) :bad 1))) :no-warn)
+     (warning () :warned))
+   (handler-case (progn (compile nil '(lambda () ((lambda (&key a) a) :a 1))) :no-warn)
+     (warning () :warned)))
+  (:warned :no-warn))

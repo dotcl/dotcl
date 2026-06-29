@@ -32,9 +32,24 @@ public partial class CilAssembler
         var dm = new DynamicMethod("toplevel", typeof(LispObject),
             Type.EmptyTypes, typeof(CilAssembler).Module, true);
         asm._il = dm.GetILGenerator();
-        asm.Assemble(instrList);
+        int savedUnit = _currentUnitId;
+        var savedDms = _currentUnitDms;
+        int unitId = BeginUnit();
+        var holder = new List<object>();
+        _currentUnitId = unitId;
+        _currentUnitDms = holder;
+        try { asm.Assemble(instrList); }
+        finally { _currentUnitId = savedUnit; _currentUnitDms = savedDms; }
+        // Publish weakly only if the unit produced closures; closure-free units
+        // (the majority) leave no map entry at all.
+        if (holder.Count > 0) RegisterUnit(unitId, holder);
         var fn = (Func<LispObject>)dm.CreateDelegate(typeof(Func<LispObject>));
-        return fn();
+        var result = fn();
+        // Keep the holder alive across the unit's one-shot run so any closures it
+        // builds can resolve their body DMs; afterward only LispFunction.RetainUnit
+        // keeps it alive (transient units become collectible here).
+        GC.KeepAlive(holder);
+        return result;
     }
 
     /// <summary>
@@ -93,12 +108,42 @@ public partial class CilAssembler
         return segments;
     }
 
-    public static LispObject MakeClosure(object[] env, int dmIndex, int arity)
+    public static LispObject MakeClosure(object[] env, int unitId, int dmIndex, int arity)
     {
-        var dm = (DynamicMethod)System.Threading.Volatile.Read(ref _constants)[dmIndex];
+        var holder = TryGetUnitHolder(unitId)
+            ?? throw new LispErrorException(new LispProgramError(
+                "internal: closure compilation unit was collected while still callable"));
+        var dm = (DynamicMethod)holder[dmIndex];
         var closureDel = (Func<object[], LispObject[], LispObject>)dm.CreateDelegate(
             typeof(Func<object[], LispObject[], LispObject>));
-        return new LispFunction(closureDel, env, null, arity);
+        // Pin the unit so this closure can still resolve sibling DMs (e.g. a
+        // nested closure built when it is later called), and so the unit's JIT
+        // code outlives the enclosing function exactly as long as this closure does.
+        return new LispFunction(closureDel, env, null, arity) { RetainUnit = holder };
+    }
+
+    // Emit IL that loads a unit-scoped constant and casts it to LispObject —
+    // the collectible counterpart of (ldc.i4 idx; call GetConstant). Used for
+    // MAKE-FUNCTION lambda objects so a transient compile's lambda is reclaimed
+    // with its unit instead of pinned in the global pool forever .
+    private void EmitLoadUnitConstant(int idx)
+    {
+        _il.Emit(OpCodes.Ldc_I4, _currentUnitId);
+        _il.Emit(OpCodes.Ldc_I4, idx);
+        _il.Emit(OpCodes.Call, _getUnitConstant);
+        _il.Emit(OpCodes.Castclass, typeof(LispObject));
+    }
+
+    // Store a freshly built lambda in the current unit and emit IL to load it.
+    // If the lambda's body itself added unit constants (a nested MAKE-FUNCTION /
+    // MAKE-CLOSURE), the lambda must pin the holder so it can resolve them when
+    // later called — otherwise the weak unit map could drop the holder first.
+    private void PushUnitFunction(LispFunction fn, int beforeCount)
+    {
+        var holder = _currentUnitDms;
+        if (holder != null && holder.Count > beforeCount)
+            fn.RetainUnit = holder;
+        EmitLoadUnitConstant(AddUnitConstant(fn));
     }
 
     // --- Assembly ---
@@ -645,17 +690,16 @@ public partial class CilAssembler
                 new[] { typeof(LispObject[]) }, typeof(CilAssembler).Module, true);
             var innerAsm = new CilAssembler();
             innerAsm._il = dm.GetILGenerator();
+            int before = _currentUnitDms?.Count ?? 0;
             innerAsm.Assemble(bodyInstrs);
 
             var del = (Func<LispObject[], LispObject>)dm.CreateDelegate(
                 typeof(Func<LispObject[], LispObject>));
             var fn = new LispFunction(del, fnName, paramCount);
 
-            // Push the function onto the stack
-            int idx = AddConstant(fn);
-            _il.Emit(OpCodes.Ldc_I4, idx);
-            _il.Emit(OpCodes.Call, _getConstant);
-            _il.Emit(OpCodes.Castclass, typeof(LispObject));
+            // Push the function onto the stack (unit-scoped so a dropped compile
+            // result is collectible — S5).
+            PushUnitFunction(fn, before);
         }
     }
 
@@ -756,6 +800,7 @@ public partial class CilAssembler
             directParamTypes2, typeof(CilAssembler).Module, true);
         var innerAsm2 = new CilAssembler();
         innerAsm2._il = directDm.GetILGenerator();
+        int before = _currentUnitDms?.Count ?? 0;
         innerAsm2.Assemble(bodyInstrs);
 
         // Create array-based wrapper for backward compat (funcall, apply, etc.)
@@ -771,10 +816,7 @@ public partial class CilAssembler
                 arrayDel = args => { Runtime.CheckArityExact(n, args, 0); return d(); };
                 var fn = new LispFunction(arrayDel, fnName, paramCount);
                 fn._func0 = d;
-                int idx = AddConstant(fn);
-                _il.Emit(OpCodes.Ldc_I4, idx);
-                _il.Emit(OpCodes.Call, _getConstant);
-                _il.Emit(OpCodes.Castclass, typeof(LispObject));
+                PushUnitFunction(fn, before);
                 return;
             }
             case 1:
@@ -785,10 +827,7 @@ public partial class CilAssembler
                 arrayDel = args => { Runtime.CheckArityExact(n, args, 1); return d(args[0]); };
                 var fn = new LispFunction(arrayDel, fnName, paramCount);
                 fn._func1 = d;
-                int idx = AddConstant(fn);
-                _il.Emit(OpCodes.Ldc_I4, idx);
-                _il.Emit(OpCodes.Call, _getConstant);
-                _il.Emit(OpCodes.Castclass, typeof(LispObject));
+                PushUnitFunction(fn, before);
                 return;
             }
             case 2:
@@ -799,10 +838,7 @@ public partial class CilAssembler
                 arrayDel = args => { Runtime.CheckArityExact(n, args, 2); return d(args[0], args[1]); };
                 var fn = new LispFunction(arrayDel, fnName, paramCount);
                 fn._func2 = d;
-                int idx = AddConstant(fn);
-                _il.Emit(OpCodes.Ldc_I4, idx);
-                _il.Emit(OpCodes.Call, _getConstant);
-                _il.Emit(OpCodes.Castclass, typeof(LispObject));
+                PushUnitFunction(fn, before);
                 return;
             }
             case 3:
@@ -813,10 +849,7 @@ public partial class CilAssembler
                 arrayDel = args => { Runtime.CheckArityExact(n, args, 3); return d(args[0], args[1], args[2]); };
                 var fn = new LispFunction(arrayDel, fnName, paramCount);
                 fn._func3 = d;
-                int idx = AddConstant(fn);
-                _il.Emit(OpCodes.Ldc_I4, idx);
-                _il.Emit(OpCodes.Call, _getConstant);
-                _il.Emit(OpCodes.Castclass, typeof(LispObject));
+                PushUnitFunction(fn, before);
                 return;
             }
             case 4:
@@ -827,10 +860,7 @@ public partial class CilAssembler
                 arrayDel = args => { Runtime.CheckArityExact(n, args, 4); return d(args[0], args[1], args[2], args[3]); };
                 var fn = new LispFunction(arrayDel, fnName, paramCount);
                 fn._func4 = d;
-                int idx = AddConstant(fn);
-                _il.Emit(OpCodes.Ldc_I4, idx);
-                _il.Emit(OpCodes.Call, _getConstant);
-                _il.Emit(OpCodes.Castclass, typeof(LispObject));
+                PushUnitFunction(fn, before);
                 return;
             }
             default:
@@ -865,10 +895,7 @@ public partial class CilAssembler
                     case 7: fn._func7 = (Func<LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject>)d; break;
                     case 8: fn._func8 = (Func<LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject>)d; break;
                 }
-                int idx = AddConstant(fn);
-                _il.Emit(OpCodes.Ldc_I4, idx);
-                _il.Emit(OpCodes.Call, _getConstant);
-                _il.Emit(OpCodes.Castclass, typeof(LispObject));
+                PushUnitFunction(fn, before);
                 return;
             }
         }
@@ -1519,11 +1546,14 @@ public partial class CilAssembler
             innerAsm._boxedEnvSlots = boxedSlots;
             innerAsm.Assemble(bodyInstrs);
 
-            // Store DynamicMethod in constant pool
-            int dmIdx = AddConstant(dm);
+            // Store DynamicMethod in this compilation unit's holder rather
+            // than the global constant pool, so the closure body DM is reclaimed
+            // with the unit once no function can still call into it.
+            int dmIdx = AddUnitConstant(dm);
 
             // Stack: object[] env (from caller's instructions)
-            // Call MakeClosure(env, dmIdx, paramCount)
+            // Call MakeClosure(env, unitId, dmIdx, paramCount)
+            _il.Emit(OpCodes.Ldc_I4, _currentUnitId);
             _il.Emit(OpCodes.Ldc_I4, dmIdx);
             _il.Emit(OpCodes.Ldc_I4, paramCount);
             _il.Emit(OpCodes.Call, _makeClosure);
@@ -1984,6 +2014,29 @@ public partial class CilAssembler
         _inlineDepth++;
         try
         {
+        // A circular constant literal (e.g. '#1=(1 2 3 . #1#)) cannot be rebuilt by
+        // the naive cons-by-cons inline emitter — the cdr-flatten loop spins on the
+        // cycle and OOMs. Shared (acyclic but #N=-coalesced) structure rebuilds but
+        // loses EQ identity, since inline duplicates each occurrence. Both are fixed
+        // by emitting a load-time (read-from-string "<*print-circle* repr>"), which
+        // reconstructs the graph — sharing and cycles — exactly. (The non-FASL path
+        // stores the live object in the constant pool, so it never hit this.)
+        // cl-store circ.*/correct.list tests.
+        if (_inlineDepth == 1)
+        {
+            var kind = AnalyzeConstantGraph(val);
+            if (kind == ConstGraphKind.Cyclic)
+            {
+                if (!TryEmitConstantViaReader(val))
+                    throw new LispErrorException(new LispProgramError(
+                        "compile-file: cannot emit a circular constant that is not printably readable"));
+                return;
+            }
+            if (kind == ConstGraphKind.Shared && TryEmitConstantViaReader(val))
+                return;
+            // Shared-but-unprintable falls through to inline emission: it loses
+            // EQ identity across occurrences but reconstructs equal values.
+        }
         if (_inlineDepth > MaxInlineDepth)
         {
             // Too deep — fallback to constant pool (won't work across processes)
@@ -2352,6 +2405,72 @@ public partial class CilAssembler
         }
         }
         finally { _inlineDepth--; }
+    }
+
+    private enum ConstGraphKind { Simple, Shared, Cyclic }
+
+    /// <summary>Classify the constant graph reachable from <paramref name="root"/>:
+    /// Cyclic if a Cons/Vector reaches an ancestor on the DFS path (back-edge),
+    /// Shared if some Cons/Vector is reachable by more than one path (a #N=-coalesced
+    /// DAG), else Simple. Iterative so a long proper list does not overflow the C#
+    /// stack. Only Cons/Vector cells carry identity here; atoms are ignored.</summary>
+    private static ConstGraphKind AnalyzeConstantGraph(LispObject root)
+    {
+        if (root is not Cons && root is not LispVector) return ConstGraphKind.Simple;
+        var onPath = new HashSet<object>(ReferenceEqualityComparer.Instance);
+        var done = new HashSet<object>(ReferenceEqualityComparer.Instance);
+        bool shared = false;
+        // Stack of (node, phase): phase 0 = enter, phase 1 = exit (pop from path).
+        var st = new Stack<(LispObject node, int phase)>();
+        st.Push((root, 0));
+        while (st.Count > 0)
+        {
+            var (node, phase) = st.Pop();
+            if (node is not Cons && node is not LispVector) continue;
+            if (phase == 1) { onPath.Remove(node); continue; }
+            if (onPath.Contains(node)) return ConstGraphKind.Cyclic;  // back-edge → cycle
+            if (!done.Add(node)) { shared = true; continue; }         // reached again (acyclic) → shared
+            onPath.Add(node);
+            st.Push((node, 1));                                       // exit marker
+            if (node is Cons c) { st.Push((c.Cdr, 0)); st.Push((c.Car, 0)); }
+            else if (node is LispVector v)
+                for (int i = v.Length - 1; i >= 0; i--) st.Push((v.ElementAt(i), 0));
+        }
+        return shared ? ConstGraphKind.Shared : ConstGraphKind.Simple;
+    }
+
+    /// <summary>Emit IL that reconstructs a constant at load time by reading its
+    /// *print-circle* representation, instead of the naive inline cons-walk (which
+    /// loops forever on a cycle and duplicates shared structure). The representation
+    /// is computed now and re-read via read-from-string in the loading process.
+    /// Returns false (emitting nothing) if the value cannot be printed readably —
+    /// the caller then errors (cyclic) or falls back to inline (shared).</summary>
+    private bool TryEmitConstantViaReader(LispObject val)
+    {
+        string repr;
+        var pcSym = Startup.Sym("*PRINT-CIRCLE*");
+        var prSym = Startup.Sym("*PRINT-READABLY*");
+        var plSym = Startup.Sym("*PRINT-LEVEL*");
+        var pnSym = Startup.Sym("*PRINT-LENGTH*");
+        DynamicBindings.Push(pcSym, T.Instance);
+        DynamicBindings.Push(prSym, T.Instance);
+        DynamicBindings.Push(plSym, Nil.Instance);   // never truncate the repr
+        DynamicBindings.Push(pnSym, Nil.Instance);
+        try { repr = ((LispString)Runtime.WriteToString(val)).Value; }
+        catch { return false; }                      // unprintable (e.g. unreadable struct)
+        finally
+        {
+            DynamicBindings.Pop(pnSym); DynamicBindings.Pop(plSym);
+            DynamicBindings.Pop(prSym); DynamicBindings.Pop(pcSym);
+        }
+
+        // Runtime.ReadConstantFromString(repr) — reads one object, no multiple-values
+        // side effect (READ-FROM-STRING leaves a stray position value that can leak
+        // through the FASL module-init).
+        _il.Emit(OpCodes.Ldstr, Track(repr));
+        _il.Emit(OpCodes.Call, typeof(Runtime).GetMethod("ReadConstantFromString", new[] { typeof(string) })!);
+        _il.Emit(OpCodes.Castclass, typeof(LispObject));
+        return true;
     }
 
     private void EmitFaslInstanceInline(LispInstance li)
@@ -2776,6 +2895,7 @@ public partial class CilAssembler
     private static readonly Dictionary<string, ConstructorInfo> _ctorCache;
     private static readonly Dictionary<string, Type> _typeCache;
     private static readonly MethodInfo _getConstant;
+    private static readonly MethodInfo _getUnitConstant;
     private static readonly MethodInfo _makeFaslInstance;
     private static readonly MethodInfo _internViaEvalInstance;
     private static readonly MethodInfo _makeClosure;
@@ -2796,6 +2916,7 @@ public partial class CilAssembler
             // Runtime - arithmetic
             ["Runtime.Add"] = typeof(Runtime).GetMethod("Add")!,
             ["Runtime.Subtract"] = typeof(Runtime).GetMethod("Subtract")!,
+            ["Runtime.Negate"] = typeof(Runtime).GetMethod("Negate", new[] { typeof(LispObject) })!,
             ["Runtime.Increment"] = typeof(Runtime).GetMethod("Increment")!,
             ["Runtime.Decrement"] = typeof(Runtime).GetMethod("Decrement")!,
             ["Runtime.Multiply"] = typeof(Runtime).GetMethod("Multiply")!,
@@ -3410,6 +3531,7 @@ public partial class CilAssembler
         };
 
         _getConstant = typeof(CilAssembler).GetMethod("GetConstant")!;
+        _getUnitConstant = typeof(CilAssembler).GetMethod("GetUnitConstant")!;
         _makeFaslInstance = typeof(Runtime).GetMethod("MakeFaslInstance",
             new[] { typeof(string), typeof(string), typeof(LispObject[]) })!;
         _internViaEvalInstance = typeof(LispInstance).GetMethod("InternViaEval",

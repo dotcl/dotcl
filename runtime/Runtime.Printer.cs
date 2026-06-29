@@ -397,9 +397,33 @@ public static partial class Runtime
         var dispatchResult = TryPprintDispatch(obj);
         if (dispatchResult != null) return dispatchResult;
 
-        // For conditions when escape is false (princ/~a), print the condition report
+        // For conditions when escape is false (princ/~a), print the condition report.
         if (!escape && obj is LispCondition condReport)
+        {
+            // A user define-condition with :report generates a print-object method on the
+            // condition class; under *print-escape*=NIL it produces the report. The
+            // condition is a LispInstanceCondition wrapping the CLOS instance, so it never
+            // reaches the LispInstance print-object dispatch below — route it here, else the
+            // native FormatControl/Message fallback prints "#<TYPE>".
+            if (condReport is LispInstanceCondition lic && !_inInstancePrintObjectDispatch)
+            {
+                var poSym = Startup.Sym("PRINT-OBJECT");
+                if (poSym?.Function is GenericFunction gf
+                    && HasSpecializedPrintObjectMethodForInstance(gf, lic.Instance))
+                {
+                    // The generated print-object method branches on the dynamic *PRINT-ESCAPE*
+                    // (call-next-method when set, the report otherwise). We're on the
+                    // escape=false path; InvokePrintObjectBound binds it to NIL .
+                    // No catch: a real error inside the user's print-object (e.g. a TYPE-ERROR
+                    // in an esrap report) must propagate, not be swallowed into "#<TYPE>" — that
+                    // hid the true cause during debugging .
+                    _inInstancePrintObjectDispatch = true;
+                    try { return InvokePrintObjectBound(gf, lic.Instance, false); }
+                    finally { _inInstancePrintObjectDispatch = false; }
+                }
+            }
             return GetConditionReport(condReport);
+        }
 
         switch (obj)
         {
@@ -1250,6 +1274,25 @@ public static partial class Runtime
     [System.ThreadStatic] private static bool _inStructPrintObjectDispatch;
     [System.ThreadStatic] private static bool _inInstancePrintObjectDispatch;
 
+    /// <summary>Invoke a user PRINT-OBJECT method, binding the Lisp dynamic *PRINT-ESCAPE*
+    /// to the printer's current ESCAPE so the method sees the value princ/prin1/~A/~S
+    /// established. dotcl carries escape as a C# parameter and otherwise leaves the
+    /// special var at its default T, so under princ/~A a method reading *PRINT-ESCAPE*
+    /// wrongly took the escape branch (; was the condition-only special case).</summary>
+    private static string InvokePrintObjectBound(GenericFunction gf, LispObject obj, bool escape)
+    {
+        var peSym = Startup.Sym("*PRINT-ESCAPE*");
+        DynamicBindings.Push(peSym, escape ? (LispObject)T.Instance : Nil.Instance);
+        try
+        {
+            var sw = new System.IO.StringWriter();
+            var stream = new LispStringOutputStream(sw);
+            gf.Invoke(new LispObject[] { obj, stream });
+            return sw.ToString();
+        }
+        finally { DynamicBindings.Pop(peSym); }
+    }
+
     private static string FormatCompound(LispObject obj, bool escape)
     {
         if (_formatConsDepth >= MaxFormatConsDepth) return "#";
@@ -1269,13 +1312,7 @@ public static partial class Runtime
                     if (poSym?.Function is GenericFunction gf && HasSpecializedPrintObjectMethod(gf, st))
                     {
                         _inStructPrintObjectDispatch = true;
-                        try
-                        {
-                            var sw = new System.IO.StringWriter();
-                            var stream = new LispStringOutputStream(sw);
-                            gf.Invoke(new LispObject[] { st, stream });
-                            return sw.ToString();
-                        }
+                        try { return InvokePrintObjectBound(gf, st, escape); }
                         catch { }
                         finally { _inStructPrintObjectDispatch = false; }
                     }
@@ -1291,13 +1328,7 @@ public static partial class Runtime
                     if (poSym?.Function is GenericFunction gfInst && HasSpecializedPrintObjectMethodForInstance(gfInst, inst))
                     {
                         _inInstancePrintObjectDispatch = true;
-                        try
-                        {
-                            var sw = new System.IO.StringWriter();
-                            var stream = new LispStringOutputStream(sw);
-                            gfInst.Invoke(new LispObject[] { inst, stream });
-                            return sw.ToString();
-                        }
+                        try { return InvokePrintObjectBound(gfInst, inst, escape); }
                         catch { }
                         finally { _inInstancePrintObjectDispatch = false; }
                     }

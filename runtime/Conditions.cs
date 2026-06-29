@@ -35,8 +35,10 @@ public class LispError : LispCondition
 
 public class LispTypeError : LispError
 {
-    public LispObject Datum { get; }
-    public LispObject ExpectedType { get; }
+    // Settable so MOP slot-access (setf slot-value / slot-makunbound) can reach
+    // the DATUM / EXPECTED-TYPE slots of a native (runtime-signaled) type-error.
+    public LispObject Datum { get; set; }
+    public LispObject ExpectedType { get; set; }
 
     public LispTypeError(string message, LispObject? datum = null, LispObject? expectedType = null)
         : base(message)
@@ -57,7 +59,7 @@ public class LispProgramError : LispError
 
 public class LispCellError : LispError
 {
-    public LispObject Name { get; }
+    public LispObject Name { get; set; }
     public LispCellError(string message, LispObject name) : base(message) { Name = name; }
 }
 

@@ -973,6 +973,26 @@ public static partial class Runtime
         return argIdx;
     }
 
+    /// During a pretty logical block, FORMAT stages output in a per-recursion
+    /// StringBuilder and flushes it to _pprintStream at ~_ / ~I / block boundaries.
+    /// A nested structural directive (~[ clause, ~{ body, indirect ~{~}) recursively
+    /// formats into its OWN StringBuilder, and an inner ~_ there flushes straight to
+    /// _pprintStream — jumping ahead of the parent's still-staged content (e.g.
+    /// "While parsing X. " staged in the parent, while the clause's "Expected:~@:_"
+    /// flushes first → reordered output). Flushing the parent's staged content right
+    /// before recursing preserves source order. No-op outside a
+    /// pretty logical block (_pprintActive false), so non-pretty FORMAT is unaffected.
+    private static void PprintStageFlush(System.Text.StringBuilder sb)
+    {
+        if (_pprintActive && _pprintStream != null && sb.Length > 0)
+        {
+            var flushed = sb.ToString();
+            _pprintStream.Write(flushed);
+            PprintTrackWrite(flushed);
+            sb.Clear();
+        }
+    }
+
     private static string FormatString(string template, LispObject[] args, ref int argIdx, bool streamAtLineStart = true)
     {
         var sb = new System.Text.StringBuilder();
@@ -1643,6 +1663,7 @@ public static partial class Runtime
                             {
                                 // Arg is non-nil: don't consume it, process body with remaining args
                                 int condSubIdx = argIdx;
+                                PprintStageFlush(sb);
                                 sb.Append(FormatString(clauses[0], args, ref condSubIdx));
                                 argIdx = condSubIdx;
                             }
@@ -1654,13 +1675,20 @@ public static partial class Runtime
                         }
                         else if (colonMod)
                         {
-                            // ~:[false~;true~] — boolean
+                            // ~:[false~;true~] — boolean. Consume the test arg, then process
+                            // the clause in place on the shared arg pointer (same reasons as
+                            // the numeric ~[ below: ~:* backup + arg-consumption propagation).
                             if (argIdx < args.Length)
                             {
                                 int ci = args[argIdx] is Nil ? 0 : 1;
-                                if (ci < clauses.Count)
-                                    sb.Append(FormatString(clauses[ci], args.SubArray((argIdx + 1))));
                                 argIdx++;
+                                if (ci < clauses.Count)
+                                {
+                                    int condSubIdx = argIdx;
+                                    PprintStageFlush(sb);
+                                    sb.Append(FormatString(clauses[ci], args, ref condSubIdx));
+                                    argIdx = condSubIdx;
+                                }
                             }
                         }
                         else
@@ -1689,13 +1717,24 @@ public static partial class Runtime
                                 ci = -1; // no valid index
                             }
 
-                            if (ci >= 0 && ci < clauses.Count)
-                                sb.Append(FormatString(clauses[ci], consumed ? args.SubArray((argIdx + 1)) : args.SubArray(argIdx)));
-                            else if (hasDefault && clauses.Count > 0)
-                                sb.Append(FormatString(clauses[clauses.Count - 1], consumed ? args.SubArray((argIdx + 1)) : args.SubArray(argIdx)));
-
+                            // Consume the selector FIRST, then process the chosen clause
+                            // IN PLACE on the same args array with a shared arg pointer.
+                            // A SubArray copy starting past the selector would (a) prevent a
+                            // ~:* in the clause from backing up to/before the selector and
+                            // (b) drop the args the clause consumes, so an enclosing ~{...~}
+                            // would over-iterate on the leftovers.
                             if (consumed)
                                 argIdx++;
+                            int chosen = -1;
+                            if (ci >= 0 && ci < clauses.Count) chosen = ci;
+                            else if (hasDefault && clauses.Count > 0) chosen = clauses.Count - 1;
+                            if (chosen >= 0)
+                            {
+                                int condSubIdx = argIdx;
+                                PprintStageFlush(sb);
+                                sb.Append(FormatString(clauses[chosen], args, ref condSubIdx));
+                                argIdx = condSubIdx;
+                            }
                         }
                         break;
                     }
@@ -1785,7 +1824,7 @@ public static partial class Runtime
                                     _isLastSublist = argIdx >= args.Length;
                                     try
                                     {
-                                        sb.Append(FormatString(body, subArr, ref subIdx));
+                                        PprintStageFlush(sb); sb.Append(FormatString(body, subArr, ref subIdx));
                                     }
                                     catch (FormatUpAndOutException ex) { sb.Append(ex.PartialOutput); }
                                     finally { _isLastSublist = savedLastSublist; }
@@ -1803,7 +1842,7 @@ public static partial class Runtime
                                 int subIdx = 0;
                                 try
                                 {
-                                    sb.Append(FormatString(body, iterArgs, ref subIdx));
+                                    PprintStageFlush(sb); sb.Append(FormatString(body, iterArgs, ref subIdx));
                                 }
                                 catch (FormatUpAndOutException ex)
                                 {
@@ -1850,7 +1889,7 @@ public static partial class Runtime
                                         _isLastSublist = slIdx >= sublists.Count;
                                         try
                                         {
-                                            sb.Append(FormatString(body, subArr, ref subIdx));
+                                            PprintStageFlush(sb); sb.Append(FormatString(body, subArr, ref subIdx));
                                         }
                                         catch (FormatUpAndOutException ex) { sb.Append(ex.PartialOutput); }
                                         finally { _isLastSublist = savedLastSublist; }
@@ -1880,7 +1919,7 @@ public static partial class Runtime
                                     int subIdx = 0;
                                     try
                                     {
-                                        sb.Append(FormatString(body, iterArgs, ref subIdx));
+                                        PprintStageFlush(sb); sb.Append(FormatString(body, iterArgs, ref subIdx));
                                     }
                                     catch (FormatUpAndOutException ex)
                                     {
@@ -1915,7 +1954,7 @@ public static partial class Runtime
                                 // ~^ inside ~@? terminates the recursive processing only
                                 try
                                 {
-                                    sb.Append(FormatString(fmtStr.Value, args, ref argIdx));
+                                    PprintStageFlush(sb); sb.Append(FormatString(fmtStr.Value, args, ref argIdx));
                                 }
                                 catch (FormatUpAndOutException ex) { sb.Append(ex.PartialOutput); }
                             }
@@ -1932,7 +1971,7 @@ public static partial class Runtime
                                 }
                                 try
                                 {
-                                    sb.Append(FormatString(fmtStr.Value, subArgs.ToArray()));
+                                    PprintStageFlush(sb); sb.Append(FormatString(fmtStr.Value, subArgs.ToArray()));
                                 }
                                 catch (FormatUpAndOutException ex) { sb.Append(ex.PartialOutput); }
                             }
@@ -2807,6 +2846,10 @@ public static partial class Runtime
         closedWithAt = false;
         firstSepIsAt = false;
         int depth = 1;
+        // Nesting of ~[ ~] / ~{ ~} / ~( ~) inside this ~<...~>. Their own ~; / ~:;
+        // separators must NOT be treated as this justification block's section
+        // separators.
+        int condDepth = 0;
         bool isFirstSep = true;
         while (pos < template.Length && depth > 0)
         {
@@ -2876,9 +2919,20 @@ public static partial class Runtime
                     depth++;
                     current.Append(template[start..pos]);
                 }
-                else if (d == ';' && depth == 1)
+                else if ((d == '[' || d == '{' || d == '(') )
                 {
-                    // ~; or ~:; separator at top level
+                    condDepth++;
+                    current.Append(template[start..pos]);
+                }
+                else if ((d == ']' || d == '}' || d == ')'))
+                {
+                    condDepth = Math.Max(0, condDepth - 1);
+                    current.Append(template[start..pos]);
+                }
+                else if (d == ';' && depth == 1 && condDepth == 0)
+                {
+                    // ~; or ~:; separator at this justification block's top level
+                    // (not one belonging to a nested ~[...~] / ~{...~}).
                     if (isFirstSep)
                     {
                         firstSepIsColon = hasColon;
@@ -3041,6 +3095,10 @@ public static partial class Runtime
         bool hasPPDirective = false;
         bool hasLogicalBlock = false;
         int depth = 0; // nesting depth of ~< ~>
+        // Nesting depth of ~[ ~] / ~{ ~} / ~( ~), whose own ~:; / ~; separators must
+        // NOT be mistaken for a justification overflow ~:;. Only a ~:; sitting
+        // DIRECTLY inside a ~<...~> (these counters all 0) is the justify-overflow one.
+        int condDepth = 0;
         for (int ci = 0; ci < template.Length; ci++)
         {
             if (template[ci] != '~' || ci + 1 >= template.Length) continue;
@@ -3068,9 +3126,12 @@ public static partial class Runtime
                 // ~:> at depth 0 means a logical block was closed
                 if (hasColon) hasLogicalBlock = true;
             }
-            else if (dc == ';' && depth == 1 && hasColon)
+            else if (dc == '[' || dc == '{' || dc == '(') condDepth++;
+            else if (dc == ']' || dc == '}' || dc == ')') condDepth = Math.Max(0, condDepth - 1);
+            else if (dc == ';' && depth == 1 && condDepth == 0 && hasColon)
             {
-                // ~:; inside a top-level ~<...~> means justify with overflow
+                // ~:; sitting DIRECTLY in a top-level ~<...~> means justify with overflow.
+                // A ~:; inside a nested ~[...~] / ~{...~} is that block's own separator.
                 hasJustifyWithOverflow = true;
             }
             else if (depth == 0 && (dc == 'I' || dc == '_' || dc == 'W' || (dc == 'T' && hasColon)))
@@ -3246,7 +3307,7 @@ public static partial class Runtime
                 int subIdx = 0;
                 try
                 {
-                    sb.Append(FormatString(indirectFmt, iterArgs, ref subIdx));
+                    PprintStageFlush(sb); sb.Append(FormatString(indirectFmt, iterArgs, ref subIdx));
                 }
                 catch (FormatUpAndOutException ex)
                 {
@@ -3313,7 +3374,7 @@ public static partial class Runtime
                 _isLastSublist = slIdx >= sublists.Count;
                 try
                 {
-                    sb.Append(FormatString(indirectFmt, subArr, ref subIdx));
+                    PprintStageFlush(sb); sb.Append(FormatString(indirectFmt, subArr, ref subIdx));
                 }
                 catch (FormatUpAndOutException ex) { sb.Append(ex.PartialOutput); }
                 finally { _isLastSublist = savedLastSublist; }

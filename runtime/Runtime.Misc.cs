@@ -11,6 +11,17 @@ public static partial class Runtime
     private static readonly ConcurrentDictionary<Symbol, LispFunction> _compilerMacroFunctions = new();
     private static readonly ConcurrentDictionary<Symbol, LispFunction> _setfCompilerMacros = new();
 
+    /// <summary>Remove a symbol's user-defined compiler macro (define-compiler-macro),
+    /// for both the plain and (setf sym) namespaces. Called when the compiler macro is
+    /// cleared via (setf (compiler-macro-function name) nil) and when the function is
+    /// FMAKUNBOUND, so a stale compiler macro can't keep rewriting calls to a removed /
+    /// re-signatured -IMPL target after the function is killed and redefined.</summary>
+    internal static void RemoveUserCompilerMacro(Symbol sym)
+    {
+        _compilerMacroFunctions.TryRemove(sym, out _);
+        _setfCompilerMacros.TryRemove(sym, out _);
+    }
+
     // --- Read from stream ---
 
     /// <summary>
@@ -288,6 +299,21 @@ public static partial class Runtime
         if (eofErrorP is not Nil)
             throw new LispErrorException(new LispError("READ-FROM-STRING: end of string") { ConditionTypeName = "END-OF-FILE", StreamErrorStreamRef = stringStream });
         return MultipleValues.Values(eofValue, Fixnum.Make(end));
+    }
+
+    /// <summary>Read exactly one object from a string and return only it (no
+    /// multiple-values side effect, unlike READ-FROM-STRING). Used by FASL-emitted
+    /// IL to reconstruct a circular/shared constant literal from its *print-circle*
+    /// representation at load time. Supports #N= / #N# label syntax via the
+    /// standard reader.</summary>
+    public static LispObject ReadConstantFromString(string s)
+    {
+        var stringStream = new LispInputStream(new StringReader(s));
+        var reader = new Reader(stringStream.Reader) { LispStreamRef = stringStream };
+        if (reader.TryRead(out var result))
+            return result;
+        throw new LispErrorException(new LispProgramError(
+            "fasl: empty representation while reconstructing a constant literal"));
     }
 
     // --- Modules (provide/require) ---
@@ -1267,7 +1293,191 @@ public static partial class Runtime
             var thenForm = new Cons(PROGN, body);
             return new Cons(IF, new Cons(test, new Cons(thenForm, new Cons(restClauses, Nil.Instance))));
         }, "COND-MACRO-EXPANDER", 2));
+
+        // handler-bind / handler-case / restart-bind / restart-case are implemented as
+        // compile-form handlers (the compiler dispatches them directly, before macro
+        // expansion), but MACRO-FUNCTION reported them as macros while MACROEXPAND-1
+        // returned them unexpanded — an inconsistency that breaks code walkers.
+        // Register real expanders so MACROEXPAND-1 yields a portable, walkable, eval-able
+        // equivalent (CLHS: macro-function non-nil ⇒ macroexpand-1 expands). The compiler
+        // is unaffected: compile-form checks its handler table first, and the Lisp
+        // find-macro-expander only consults runtime macro-functions for DOTCL-package
+        // symbols, so these CL-package entries never divert compilation/analysis.
+        var QUOTE = Startup.Sym("QUOTE");
+        var LIST = Startup.Sym("LIST");
+        var CONS = Startup.Sym("CONS");
+        var LAMBDA = Startup.Sym("LAMBDA");
+        var BLOCK = Startup.Sym("BLOCK");
+        var TAGBODY = Startup.Sym("TAGBODY");
+        var GO = Startup.Sym("GO");
+        var SETQ = Startup.Sym("SETQ");
+        var LOCALLY = Startup.Sym("LOCALLY");
+        var MVCALL = Startup.Sym("MULTIPLE-VALUE-CALL");
+        var RETURN_FROM = Startup.Sym("RETURN-FROM");
+        var UNWIND_PROTECT = Startup.Sym("UNWIND-PROTECT");
+        var PUSH_HB = Startup.Sym("%PUSH-HANDLER-CLUSTER");
+        var POP_HB = Startup.Sym("%POP-HANDLER-CLUSTER");
+        var PUSH_RB = Startup.Sym("%PUSH-RESTART-CLUSTER");
+        var POP_RB = Startup.Sym("%POP-RESTART-CLUSTER");
+
+        // (handler-bind ((type fn)...) . body)
+        //   → (progn (%push-handler-cluster (list (cons 'type fn)...))
+        //            (unwind-protect (progn . body) (%pop-handler-cluster)))
+        // Body stays INLINE in a progn (not a lambda thunk), so code walkers can walk it
+        //. HandlerClusterStack.Signal restores clusters in a finally, so the
+        // unwind-protect pop stays balanced even on a non-local exit from a handler.
+        Runtime.RegisterMacroFunction(Startup.Sym("HANDLER-BIND"), new LispFunction(margs => {
+            if (margs[0] is not Cons form || form.Cdr is not Cons rest) return margs[0];
+            var pairs = new System.Collections.Generic.List<LispObject>();
+            for (var b = rest.Car; b is Cons bc; b = bc.Cdr)
+                if (bc.Car is Cons bd && bd.Cdr is Cons bf)
+                    pairs.Add(Runtime.List(CONS, Runtime.List(QUOTE, bd.Car), bf.Car));
+            var listForm = new Cons(LIST, Runtime.List(pairs.ToArray()));
+            var bodyProgn = new Cons(PROGN, rest.Cdr);
+            var uw = Runtime.List(UNWIND_PROTECT, bodyProgn, Runtime.List(POP_HB));
+            return Runtime.List(PROGN, Runtime.List(PUSH_HB, listForm), uw);
+        }, "HANDLER-BIND-MACRO-EXPANDER", 2));
+
+        // (restart-bind ((name fn . opts)...) . body)
+        //   → (progn (%push-restart-cluster (list (cons 'name fn)...))
+        //            (unwind-protect (progn . body) (%pop-restart-cluster)))
+        // Body inline. Restart options are kept by the compile-form handler used
+        // for actual compilation; this expansion is for macroexpand-1 / walkers.
+        Runtime.RegisterMacroFunction(Startup.Sym("RESTART-BIND"), new LispFunction(margs => {
+            if (margs[0] is not Cons form || form.Cdr is not Cons rest) return margs[0];
+            var pairs = new System.Collections.Generic.List<LispObject>();
+            for (var b = rest.Car; b is Cons bc; b = bc.Cdr)
+                if (bc.Car is Cons bd && bd.Cdr is Cons bf)
+                    pairs.Add(Runtime.List(CONS, Runtime.List(QUOTE, bd.Car), bf.Car));
+            var listForm = new Cons(LIST, Runtime.List(pairs.ToArray()));
+            var bodyProgn = new Cons(PROGN, rest.Cdr);
+            var uw = Runtime.List(UNWIND_PROTECT, bodyProgn, Runtime.List(POP_RB));
+            return Runtime.List(PROGN, Runtime.List(PUSH_RB, listForm), uw);
+        }, "RESTART-BIND-MACRO-EXPANDER", 2));
+
+        // (handler-case EXPR (type (var) . body)... [(:no-error ll . nbody)])
+        //   → (block #:b (let ((#:c nil)) (tagbody
+        //        (handler-bind ((type (lambda (#:g) (setq #:c #:g) (go #:t)))...)
+        //          (return-from #:b EXPR))   ; EXPR wrapped in mv-call of :no-error fn if present
+        //        #:t (return-from #:b (let ((var #:c)) . body)) ...)))
+        Runtime.RegisterMacroFunction(Startup.Sym("HANDLER-CASE"), new LispFunction(margs => {
+            if (margs[0] is not Cons form || form.Cdr is not Cons rest) return margs[0];
+            var expr = rest.Car;
+            var blk = (Symbol)Runtime.Gensym(new LispString("HC-BLOCK"));
+            var cvar = (Symbol)Runtime.Gensym(new LispString("HC-COND"));
+            LispObject noErrorClause = Nil.Instance;
+            var handlerClauses = new System.Collections.Generic.List<Cons>();
+            for (var c = rest.Cdr; c is Cons cc; c = cc.Cdr)
+            {
+                if (cc.Car is Cons clause)
+                {
+                    if (clause.Car is Symbol kw && kw.Name == "NO-ERROR") noErrorClause = clause;
+                    else handlerClauses.Add(clause);
+                }
+            }
+            var hbBindings = new System.Collections.Generic.List<LispObject>();
+            var tagForms = new System.Collections.Generic.List<LispObject>();
+            foreach (var clause in handlerClauses)
+            {
+                var type = clause.Car;
+                var ll = (clause.Cdr is Cons cd) ? cd.Car : Nil.Instance;
+                var cbody = (clause.Cdr is Cons cd2) ? cd2.Cdr : Nil.Instance;
+                var tag = Runtime.Gensym(new LispString("HC-TAG"));
+                var g = (Symbol)Runtime.Gensym(new LispString("HC-C"));
+                // (lambda (#:g) (setq #:c #:g) (go #:tag))
+                var hfn = Runtime.List(LAMBDA, Runtime.List(g),
+                    Runtime.List(SETQ, cvar, g), Runtime.List(GO, tag));
+                hbBindings.Add(Runtime.List(type, hfn));
+                // var binding: (var #:c) or nothing
+                LispObject clauseResult;
+                if (ll is Cons llc && llc.Car is Symbol v)
+                    clauseResult = new Cons(Startup.Sym("LET"),
+                        new Cons(Runtime.List(Runtime.List(v, cvar)), cbody));
+                else
+                    clauseResult = new Cons(LOCALLY, cbody);
+                tagForms.Add(tag);
+                tagForms.Add(Runtime.List(RETURN_FROM, blk, clauseResult));
+            }
+            // protected form, wrapping with :no-error mv-call when present
+            LispObject protectedReturn;
+            if (noErrorClause is Cons ne && ne.Cdr is Cons nec)
+            {
+                var nell = nec.Car; var nebody = nec.Cdr;
+                protectedReturn = Runtime.List(RETURN_FROM, blk,
+                    new Cons(MVCALL, new Cons(new Cons(LAMBDA, new Cons(nell, nebody)),
+                        new Cons(expr, Nil.Instance))));
+            }
+            else
+                protectedReturn = Runtime.List(RETURN_FROM, blk, expr);
+            var hb = new Cons(Startup.Sym("HANDLER-BIND"),
+                new Cons(Runtime.List(hbBindings.ToArray()),
+                    new Cons(protectedReturn, Nil.Instance)));
+            var tagbody = new Cons(TAGBODY, new Cons(hb, Runtime.List(tagForms.ToArray())));
+            var letc = Runtime.List(Startup.Sym("LET"),
+                Runtime.List(Runtime.List(cvar, Nil.Instance)), tagbody);
+            return Runtime.List(BLOCK, blk, letc);
+        }, "HANDLER-CASE-MACRO-EXPANDER", 2));
+
+        // (restart-case EXPR (name (args...) [:report r][:interactive i][:test t] . body)...)
+        //   → (block #:b (let ((#:av nil)) (tagbody
+        //        (return-from #:b
+        //          (restart-bind ((name (lambda (&rest #:a) (setq #:av #:a) (go #:tag))
+        //                          opts...)...) EXPR))
+        //        #:tag (return-from #:b (apply (lambda (args...) . body) #:av)) ...)))
+        Runtime.RegisterMacroFunction(Startup.Sym("RESTART-CASE"), new LispFunction(margs => {
+            if (margs[0] is not Cons form || form.Cdr is not Cons rest) return margs[0];
+            var expr = rest.Car;
+            var blk = (Symbol)Runtime.Gensym(new LispString("RC-BLOCK"));
+            var avar = (Symbol)Runtime.Gensym(new LispString("RC-ARGS"));
+            var REST = Startup.Sym("&REST");
+            var APPLY = Startup.Sym("APPLY");
+            var rbBindings = new System.Collections.Generic.List<LispObject>();
+            var tagForms = new System.Collections.Generic.List<LispObject>();
+            for (var c = rest.Cdr; c is Cons cc; c = cc.Cdr)
+            {
+                if (cc.Car is not Cons clause) continue;
+                var name = clause.Car;
+                var ll = (clause.Cdr is Cons cd) ? cd.Car : Nil.Instance;
+                var cbody = (clause.Cdr is Cons cd2) ? cd2.Cdr : Nil.Instance;
+                // Split leading :report/:interactive/:test keyword options off the body.
+                var opts = new System.Collections.Generic.List<LispObject>();
+                while (cbody is Cons bc && bc.Car is Symbol osym && osym.Name.Length > 0
+                       && (osym.Name == "REPORT" || osym.Name == "INTERACTIVE" || osym.Name == "TEST")
+                       && bc.Cdr is Cons bv)
+                {
+                    opts.Add(Startup.Keyword(osym.Name + "-FUNCTION"));
+                    // :report "str" stays a string; a symbol/lambda is a function designator.
+                    opts.Add(bv.Car);
+                    cbody = bv.Cdr;
+                }
+                var tag = Runtime.Gensym(new LispString("RC-TAG"));
+                var g = Runtime.Gensym(new LispString("RC-A"));
+                var rfn = Runtime.List(LAMBDA, Runtime.List(REST, g),
+                    Runtime.List(SETQ, avar, g), Runtime.List(GO, tag));
+                var bindItems = new System.Collections.Generic.List<LispObject> { name, rfn };
+                bindItems.AddRange(opts);
+                rbBindings.Add(Runtime.List(bindItems.ToArray()));
+                tagForms.Add(tag);
+                tagForms.Add(Runtime.List(RETURN_FROM, blk,
+                    Runtime.List(APPLY, new Cons(LAMBDA, new Cons(ll, cbody)), avar)));
+            }
+            var rb = new Cons(Startup.Sym("RESTART-BIND"),
+                new Cons(Runtime.List(rbBindings.ToArray()), new Cons(expr, Nil.Instance)));
+            var tagbody = new Cons(TAGBODY,
+                new Cons(Runtime.List(RETURN_FROM, blk, rb), Runtime.List(tagForms.ToArray())));
+            var letc = Runtime.List(Startup.Sym("LET"),
+                Runtime.List(Runtime.List(avar, Nil.Instance)), tagbody);
+            return Runtime.List(BLOCK, blk, letc);
+        }, "RESTART-CASE-MACRO-EXPANDER", 2));
     }
+
+    /// When true, COMPILE-FILE wraps a compile error on a top-level form in a
+    /// LispSourceException carrying the input file + the form's source line, so
+    /// the project build driver (CompileProject) can report file:line and remap
+    /// concat lines back to the original source (dotcl/dotcl#48). Thread-static and
+    /// gated: ordinary interactive/script COMPILE-FILE leaves it false so the raw
+    /// LispErrorException (a real condition) still propagates to handler-case.
+    [ThreadStatic] internal static bool EmitBuildSourceLocations;
 
     public static LispObject CompileFile(LispObject[] args)
     {
@@ -1539,6 +1749,11 @@ public static partial class Runtime
                 writer?.WriteLine(";; -*- dotcl-compiled -*-");
                 while (reader.TryRead(out var form))
                 {
+                    // Line where this top-level form began — used to attribute a
+                    // compile error to the source location under a project build.
+                    int formLine = reader.LastFormLine;
+                    try
+                    {
                     foreach (var subForm in FlattenTopLevel(form))
                     {
                         if (IsEvalWhenForCompileFile(subForm, out var ewBody,
@@ -1573,6 +1788,13 @@ public static partial class Runtime
                             w.WriteLine(FormatTop(subForm, true));
                             w.Flush();
                         }
+                    }
+                    }
+                    catch (LispSourceException) { throw; } // already located (nested load)
+                    catch (Exception ex) when (EmitBuildSourceLocations
+                                               && ex is not System.Threading.ThreadInterruptedException)
+                    {
+                        throw new LispSourceException(inputPath, formLine, ex);
                     }
                 }
 
@@ -2781,6 +3003,27 @@ public static partial class Runtime
                new Cons(Fixnum.Make(allocated), Nil.Instance)))));
     }
 
+    // dotcl:emit-pool-stats — (total-entries dynamic-methods data-literals committed-bytes)
+    // Diagnostic for the CilAssembler constant-pool retention leak: the
+    // global pool roots every compiled DynamicMethod forever, so DYNAMIC-METHODS
+    // tracks the JIT-backed code that never frees. COMMITTED-BYTES is the GC's
+    // committed heap (the off-heap JIT code is the gap between this and RSS).
+    public static LispObject EmitPoolStats(LispObject[] args)
+    {
+        if (args.Length != 0)
+            throw new LispErrorException(new LispProgramError("EMIT-POOL-STATS: takes no arguments"));
+        var (total, dm, data) = Emitter.CilAssembler.ConstantsPoolStats();
+#if DOTCL_EMIT
+        long committed = GC.GetGCMemoryInfo().TotalCommittedBytes;
+#else
+        long committed = 0; // GetGCMemoryInfo is unavailable on netstandard2.0
+#endif
+        return new Cons(Fixnum.Make(total),
+               new Cons(Fixnum.Make(dm),
+               new Cons(Fixnum.Make(data),
+               new Cons(Fixnum.Make(committed), Nil.Instance))));
+    }
+
     public static LispObject Disassemble(LispObject[] args)
     {
         if (args.Length != 1)
@@ -3586,6 +3829,14 @@ public static partial class Runtime
             new LispFunction(Runtime.CallWithRestartCluster, "%CALL-WITH-RESTART-CLUSTER", 2));
         Emitter.CilAssembler.RegisterFunction("%CALL-WITH-RESTART-BIND",
             new LispFunction(Runtime.CallWithRestartBind, "%CALL-WITH-RESTART-BIND", 2));
+        Emitter.CilAssembler.RegisterFunction("%PUSH-HANDLER-CLUSTER",
+            new LispFunction(a => Runtime.PushHandlerCluster(a[0]), "%PUSH-HANDLER-CLUSTER", 1));
+        Emitter.CilAssembler.RegisterFunction("%POP-HANDLER-CLUSTER",
+            new LispFunction(a => Runtime.PopHandlerCluster(), "%POP-HANDLER-CLUSTER", 0));
+        Emitter.CilAssembler.RegisterFunction("%PUSH-RESTART-CLUSTER",
+            new LispFunction(a => Runtime.PushRestartCluster(a[0]), "%PUSH-RESTART-CLUSTER", 1));
+        Emitter.CilAssembler.RegisterFunction("%POP-RESTART-CLUSTER",
+            new LispFunction(a => Runtime.PopRestartCluster(), "%POP-RESTART-CLUSTER", 0));
 
         // MACROEXPAND
         Emitter.CilAssembler.RegisterFunction("MACROEXPAND",
@@ -3695,13 +3946,35 @@ public static partial class Runtime
             new LispFunction(args => {
                 if (args.Length < 1 || args.Length > 2)
                     throw new LispErrorException(new LispProgramError($"COMPILE: wrong number of arguments: {args.Length} (expected 1-2)"));
-                if (args[0] is Nil && args.Length > 1)
+                // (compile name lambda-expression): compile the lambda, and when NAME is
+                // non-nil install the result as NAME's definition, returning NAME (CLHS
+                // — "compile replaces the function definition of name"). fiveam's run-time
+                // test compilation relies on this side effect.
+                if (args.Length > 1 && args[1] is not Nil)
                 {
-                    var lambda = args[1];
-                    var instrList = Runtime.CompileTopLevel(lambda);
+                    var instrList = Runtime.CompileTopLevel(args[1]);
                     var fn = Emitter.CilAssembler.AssembleAndRun(instrList);
-                    return MultipleValues.Values(fn, Nil.Instance, Nil.Instance);
+                    if (args[0] is Nil)
+                        return MultipleValues.Values(fn, Nil.Instance, Nil.Instance);
+                    if (fn is LispFunction lfn)
+                    {
+                        if (args[0] is Symbol nameSym)
+                        {
+                            Emitter.CilAssembler.RegisterFunctionOnSymbol(nameSym, lfn);
+                            return MultipleValues.Values(nameSym, Nil.Instance, Nil.Instance);
+                        }
+                        // (setf NAME) function-name
+                        if (args[0] is Cons fc && fc.Car is Symbol setfSym && setfSym.Name == "SETF"
+                            && fc.Cdr is Cons tc && tc.Car is Symbol target)
+                        {
+                            Emitter.CilAssembler.RegisterSetfFunctionOnSymbol(target, lfn);
+                            return MultipleValues.Values(args[0], Nil.Instance, Nil.Instance);
+                        }
+                    }
+                    return MultipleValues.Values(args[0], Nil.Instance, Nil.Instance);
                 }
+                // (compile name): NAME's existing definition is already compiled in dotcl;
+                // just return the designator.
                 if (args[0] is Symbol sym)
                 {
                     return MultipleValues.Values(sym, Nil.Instance, Nil.Instance);
@@ -3884,13 +4157,17 @@ public static partial class Runtime
             // (setf foo) form: a cons (setf . (foo . nil))
             if (nameObj is Cons setfCons && setfCons.Car is Symbol setfSym && setfSym.Name == "SETF") {
                 var innerSym = (setfCons.Cdr is Cons c2) ? c2.Car as Symbol : null;
-                if (innerSym != null && fn is LispFunction lf2)
-                    _setfCompilerMacros[innerSym] = lf2;
+                if (innerSym != null) {
+                    if (fn is LispFunction lf2) _setfCompilerMacros[innerSym] = lf2;
+                    else _setfCompilerMacros.TryRemove(innerSym, out _);   // (setf (compiler-macro-function '(setf foo)) nil)
+                }
                 return fn;
             }
             var sym = Runtime.GetSymbol(nameObj, "%REGISTER-COMPILER-MACRO-RT");
             if (fn is LispFunction lf)
                 _compilerMacroFunctions[sym] = lf;
+            else
+                _compilerMacroFunctions.TryRemove(sym, out _);   // (setf (compiler-macro-function 'foo) nil) removes it (CLHS)
             return fn;
         });
 

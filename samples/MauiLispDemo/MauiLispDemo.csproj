@@ -39,13 +39,13 @@
 		<DotclBaseCore>$(MSBuildProjectDirectory)/../../compiler/dotcl.core</DotclBaseCore>
 	</PropertyGroup>
 
-	<!-- Platform-version pinning (Windows vs Android は意味が違うので分ける) -->
+	<!-- Platform-version pinning (split because Windows vs Android differ) -->
 	<PropertyGroup Condition="$(TargetFramework.Contains('-windows'))">
 		<SupportedOSPlatformVersion>10.0.17763.0</SupportedOSPlatformVersion>
 		<TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
 	</PropertyGroup>
 	<PropertyGroup Condition="$(TargetFramework.Contains('-android'))">
-		<!-- Android 5.0 (API 21) minimum; 多くのデバイスをカバー -->
+		<!-- Android 5.0 (API 21) minimum; covers most devices -->
 		<SupportedOSPlatformVersion>21.0</SupportedOSPlatformVersion>
 		<!-- Embed .NET assemblies inside the APK. Default in Debug is
 		     false (Fast Deployment expects a separate adb push step that
@@ -75,11 +75,11 @@
 	</ItemGroup>
 
 	<!-- dotcl runtime.
-	     - DotclAsLibrary=true: OutputType=Library 化 (Exe 参照不可な MAUI Android
-	       self-contained 環境で NETSDK1150 を回避)
-	     - RuntimeIdentifier=: inner build で RID を空にリセット。runtime は
-	       pure managed なので per-RID build 不要、no-RID の runtime.dll を
-	       MAUI 側が全 RID で使い回す。 -->
+	     - DotclAsLibrary=true: make OutputType=Library (avoids NETSDK1150 in the
+	       MAUI Android self-contained environment where an Exe reference is not allowed)
+	     - RuntimeIdentifier=: reset the RID to empty in the inner build. The runtime is
+	       pure managed, so no per-RID build is needed; MAUI reuses the no-RID
+	       runtime.dll across all RIDs. -->
 	<ItemGroup>
 		<ProjectReference Include="..\..\runtime\DotCL.Runtime.csproj" />
 	</ItemGroup>

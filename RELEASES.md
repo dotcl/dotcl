@@ -3,6 +3,85 @@
 User-facing release notes for dotcl. Each section corresponds to a tagged
 release on the public mirror (dotcl/dotcl).
 
+## v0.1.15 -- 2026-06-29
+
+A conformance-and-robustness release. The bulk of this cycle was driven by
+bringing up real libraries (notably the Esrap parser generator) on dotcl, which
+surfaced a long tail of edge cases in numerics, the condition system, the
+printer, and the compiler. Most changes are invisible until you hit the case
+they fix -- but together they move dotcl meaningfully closer to behaving like an
+established Common Lisp.
+
+### Numerics
+
+- `decode-float` / `integer-decode-float` now signal on NaN and infinities and
+  preserve the sign of negative zero.
+- `eql` compares floats bit-for-bit, so `±0.0` and distinct NaNs behave per the
+  standard.
+- Integer division by zero signals `division-by-zero` (catchable by handlers)
+  instead of escaping as a host error.
+- Complex `abs` and division use scaled `hypot` / Smith's method, removing
+  spurious overflow and underflow. Comparisons and ordering involving floating
+  infinities, NaNs, and rationals were corrected.
+- `expt` / `exp` flush floating underflow to `0.0` rather than erroring;
+  `(expt ±1 huge-exponent)` stays an integer; `asin` / `acos` / `acosh` /
+  `atanh` branch into the complex plane exactly where CLHS requires.
+
+### CLOS and the metaobject protocol
+
+- A batch of AMOP introspection and protocol functions landed:
+  `compute-applicable-methods-using-classes`,
+  `compute-discriminating-function`, `compute-effective-method` (standard method
+  combination), `ensure-class-using-class`,
+  `ensure-generic-function-using-class`, accessor-method slot definitions, and
+  the surrounding introspection accessors.
+- `allocate-instance` works on `structure-class`, and `class-of` / MOP slot
+  access behave correctly on signalled host conditions.
+
+### Condition system
+
+- `handler-bind`, `handler-case`, `restart-bind`, and `restart-case` are fully
+  macroexpandable, so code walkers and `macroexpand-1` see through them.
+- Compound handler/condition types such as `(or ...)` and `(and ...)` match,
+  and a `define-condition` `:report` is honoured by `princ` and `~A`.
+
+### Printer and FORMAT
+
+- `*print-pretty*` now defaults to true, enabling mandatory newlines inside
+  logical blocks.
+- Pretty-printing places `~/function/` output in the correct order inside
+  conditionals and iteration, and resolves nested `~[...~]` inside `~<...~>`.
+- Assorted `~[...~]` / `~<...~>` directive fixes.
+
+### Reader and compiler
+
+- Circular and shared literal constants (`#n=` / `#n#`) work inside `defun` and
+  survive `compile-file`, fixing an out-of-memory failure on large
+  self-referential literals.
+- A literal unknown keyword argument passed to a fixed-`&key` lambda is now
+  reported at compile time.
+- `(compile name lambda)` installs the function definition, and symbol-macros
+  that expand to `NIL` expand correctly.
+
+### Interop and I/O
+
+- Bivalent socket streams carry both character and byte I/O on one stream.
+- `dotnet:to-stream` emits BOM-less UTF-8 for text streams.
+
+### Build tooling
+
+- A project build now keeps its compiled dependency FASLs under the project's
+  intermediate output directory, so `dotnet clean` removes them along with the
+  rest of the build (dotcl/dotcl#47).
+- Compile errors during a project build are reported with the original source
+  file and line in MSBuild's `file(line): error` form, so IDEs surface them in
+  the Error List with click-to-navigate (dotcl/dotcl#48).
+
+### Memory
+
+- Compiled closures and their dynamic methods are now collectible, reducing the
+  resident set of long-running compile sessions.
+
 ## v0.1.14 -- 2026-06-26
 
 ### Async / await

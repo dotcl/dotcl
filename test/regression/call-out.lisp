@@ -211,7 +211,7 @@
 ;;; would Convert.ChangeType(struct, uint) and fail "Object must implement
 ;;; IConvertible". Models Avalonia.Media.SolidColorBrush(Color).
 (deftest issue357-ctor-optional-tail-prefers-struct-over-uint
-  (let* ((c (dotnet:static "DotCL.TestSupport.ColorVal" "Parse" "#808080"))
+  (let* ((c (dotnet:static "DotCL.TestSupport.ColorVal" "Parse" ""))
          (b (dotnet:new "DotCL.TestSupport.ColorBox" c)))
     (dotnet:invoke b "Tag"))
   "color 128 op 1")

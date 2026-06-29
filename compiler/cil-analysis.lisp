@@ -46,6 +46,11 @@
 ;;; find-free-vars-expr: iterative version using explicit worklist.
 ;;; Each worklist entry is (expr bound . mdepth).
 ;;; Macrolet restore sentinels: (:restore-macro name . old-entry-or-nil).
+;;; A unique private object marks the "pop *macroexpand-scope*" sentinel; using an
+;;; uninterned cons (never EQ to any analyzed source form) avoids the keyword-vs-
+;;; source-form collision the other sentinels have to guard against.
+(defvar *mscope-restore-sentinel* (list '#:restore-macroexpand-scope))
+
 (defun find-free-vars-expr (expr bound free-ht)
   "Walk expr finding free variable references. Results accumulated in free-ht.
    Iterative worklist version — no recursion depth limit."
@@ -54,6 +59,10 @@
       (let* ((item (pop worklist))
              (e (car item)))
         (cond
+          ;; Restore-scope sentinel: pop *macroexpand-scope* after a macrolet body.
+          ;; The marker is a unique private object, so no source form collides.
+          ((eq e *mscope-restore-sentinel*)
+           (setf *macroexpand-scope* (cdr item)))
           ;; Restore-macro sentinel: restore *macros* entry after macrolet body.
           ;; Guard symbolp name so that a bare :restore-macro keyword from analyzed
           ;; source code (where cadr item is a bnd-list, not a symbol) is ignored.
@@ -269,6 +278,12 @@
                          (let* ((mname (car def))
                                 (old-entry (gethash mname *macros*)))
                            (push (cons :restore-macro (cons mname old-entry)) worklist)))
+                       ;; Pop-scope sentinel + push this macrolet's scope marker, so a
+                       ;; form shared between this shadowing scope and an outer scope is
+                       ;; cached per scope and the analysis walk agrees with code-gen.
+                       ;; Same source MACRO-DEFS cons as compile-macrolet.
+                       (push (cons *mscope-restore-sentinel* *macroexpand-scope*) worklist)
+                       (setf *macroexpand-scope* (cons macro-defs *macroexpand-scope*))
                        ;; Register macros immediately (same as compile-macrolet)
                        (dolist (def macro-defs)
                          (let* ((mname (car def))
@@ -430,6 +445,9 @@
              (e (car item))
              (mdepth (cdr item)))
         (cond
+          ;; Restore-scope sentinel: pop *macroexpand-scope* (unique private marker).
+          ((eq e *mscope-restore-sentinel*)
+           (setf *macroexpand-scope* mdepth))
           ;; Restore-symbol-macros sentinel: mdepth slot holds old *symbol-macros*.
           ;; Guard: real sentinels have mdepth = old-*symbol-macros* = nil or alist (not integer).
           ;; Collisions have mdepth = integer (the actual macro depth from analyzed code).
@@ -553,6 +571,11 @@
                        (let* ((mname (car def))
                               (old-entry (gethash mname *macros*)))
                          (push (cons :restore-macro (cons mname old-entry)) worklist)))
+                     ;; Pop-scope sentinel + push scope marker: cache
+                     ;; macro expansions inside this shadowing scope separately so the
+                     ;; mutation walk agrees with code-gen and doesn't poison (form,nil).
+                     (push (cons *mscope-restore-sentinel* *macroexpand-scope*) worklist)
+                     (setf *macroexpand-scope* (cons macro-defs *macroexpand-scope*))
                      ;; Register macros immediately
                      (dolist (def macro-defs)
                        (let* ((mname (car def))
@@ -605,6 +628,10 @@
              (in-lambda (cadr item))
              (mdepth (cddr item)))
         (cond
+          ;; Restore-scope sentinel: pop *macroexpand-scope* (unique private marker).
+          ;; The saved scope is in the in-lambda slot (cadr item).
+          ((eq e *mscope-restore-sentinel*)
+           (setf *macroexpand-scope* in-lambda))
           ;; Restore-symbol-macros sentinel: in-lambda slot holds old *symbol-macros*.
           ;; Guard: real sentinels have in-lambda = old-*symbol-macros* = list (not boolean t).
           ;; Collisions have in-lambda = t (inside lambda) which must be excluded.
@@ -653,6 +680,13 @@
                     (push (cons form (cons in-lambda mdepth)) worklist))))
                ((and (symbolp head) (or (eq head 'flet) (eq head 'labels)))
                 (dolist (fdef (cadr e))
+                  ;; Scan the lambda-list too, not just the body: an &optional/&key
+                  ;; default init-form references outer lexical vars from inside the
+                  ;; local function. If a var is captured ONLY by such a default it
+                  ;; must still be boxed; otherwise the default snapshots its
+                  ;; creation-time value instead of reading the shared cell at call
+                  ;; time. (The LAMBDA branch already scans its lambda-list via (cdr e).)
+                  (push (cons (cadr fdef) (cons t mdepth)) worklist)
                   (dolist (form (cddr fdef))
                     (push (cons form (cons t mdepth)) worklist)))
                 (dolist (form (cddr e))
@@ -685,6 +719,11 @@
                     (let* ((mname (car def))
                            (old-entry (gethash mname *macros*)))
                       (push (cons :restore-macro (cons (cons mname old-entry) mdepth)) worklist)))
+                  ;; Pop-scope sentinel (saved scope in the in-lambda slot) + push scope
+                  ;; marker: keep this walk's cache scope in sync with
+                  ;; code-gen so it doesn't poison the (form,nil) entry.
+                  (push (cons *mscope-restore-sentinel* (cons *macroexpand-scope* mdepth)) worklist)
+                  (setf *macroexpand-scope* (cons macro-defs *macroexpand-scope*))
                   ;; Register macros immediately
                   (dolist (def macro-defs)
                     (let* ((mname (car def))
@@ -724,6 +763,69 @@
                         (push (cons sub (cons in-lambda mdepth)) worklist)))))))))))))
 
 ;;; ============================================================
+;;; SIL local-reference enumeration (single source of truth)
+;;; ============================================================
+;;; Every analysis pass that ENUMERATES or REWRITES locals must go through these
+;;; helpers. A local-bearing SIL op is described in exactly one place here, so a
+;;; new op that carries local KEYs — whether as a direct operand or embedded in a
+;;; nested operand list — is taught to every pass by editing only this section.
+;;; Authoritative op set (CilAssembler.Emit.cs): :declare-local, :ldloc, :stloc,
+;;; :dotnet-call-direct-locals (RECV + ARG list). Background: a missed
+;;; nested-operand local once let slot-sharing orphan a merged local into an
+;;; "Undeclared local" at assembly time, because each pass scanned for top-level
+;;; :ldloc/:stloc independently and none knew the new op carried locals.
+;;;
+;;; (peephole-optimize is intentionally NOT a client: it pattern-matches fixed
+;;;  adjacent op sequences rather than enumerating locals, so an unknown op simply
+;;;  fails to match and passes through untouched — safe by construction.)
+
+(defun instr-local-reads (instr)
+  "Local KEYs INSTR reads, including locals carried in nested operand lists."
+  (when (consp instr)
+    (case (car instr)
+      (:ldloc (list (cadr instr)))
+      ;; (:dotnet-call-direct-locals TYPE METHOD RECV (ARG...) (PARAM...))
+      ;; RECV and each ARG are locals read by the call.
+      (:dotnet-call-direct-locals (cons (nth 3 instr) (nth 4 instr)))
+      (t nil))))
+
+(defun instr-local-writes (instr)
+  "Local KEYs INSTR writes."
+  (when (consp instr)
+    (case (car instr)
+      (:stloc (list (cadr instr)))
+      (t nil))))
+
+(defun instr-local-refs (instr)
+  "All local KEYs INSTR reads or writes (for liveness ranges / use counting)."
+  (nconc (instr-local-writes instr) (instr-local-reads instr)))
+
+(defun instr-declared-local (instr)
+  "If INSTR declares a local, return (KEY . TYPE-STRING); else NIL."
+  (when (and (consp instr) (eq (car instr) :declare-local))
+    (cons (cadr instr) (caddr instr))))
+
+(defun rewrite-instr-locals (instr rename)
+  "Return INSTR with every local KEY mapped through RENAME (a hash-table; a key
+   absent from RENAME is left unchanged). Covers :declare-local/:ldloc/:stloc and
+   the RECV + ARG locals of :dotnet-call-direct-locals. Other instrs are returned
+   unchanged."
+  (if (not (consp instr))
+      instr
+      (flet ((rn (k) (or (gethash k rename) k)))
+        (case (car instr)
+          (:declare-local `(:declare-local ,(rn (cadr instr)) ,(caddr instr)))
+          (:ldloc `(:ldloc ,(rn (cadr instr))))
+          (:stloc `(:stloc ,(rn (cadr instr))))
+          (:dotnet-call-direct-locals
+           `(:dotnet-call-direct-locals
+             ,(nth 1 instr) ,(nth 2 instr)
+             ,(rn (nth 3 instr))
+             ,(mapcar #'rn (nth 4 instr))
+             ,(nth 5 instr)))
+          (t instr)))))
+
+;;; ============================================================
 ;;; Copy propagation: eliminate single-reference let locals
 ;;; ============================================================
 
@@ -739,12 +841,13 @@
         (ldloc-count (make-hash-table :test #'equal))
         (local-type  (make-hash-table :test #'equal)))
     (dolist (instr instrs)
-      (when (consp instr)
-        (let ((op (car instr)) (key (cadr instr)))
-          (cond
-            ((eq op :declare-local) (setf (gethash key local-type) (caddr instr)))
-            ((eq op :stloc) (incf (gethash key stloc-count 0)))
-            ((eq op :ldloc) (incf (gethash key ldloc-count 0)))))))
+      (let ((decl (instr-declared-local instr)))
+        (when decl (setf (gethash (car decl) local-type) (cdr decl))))
+      ;; Count writes and reads via the central enumerator so locals embedded in
+      ;; nested operands (e.g. :dotnet-call-direct-locals) raise the read count and
+      ;; correctly disqualify a key from single-ref removal (issue).
+      (dolist (k (instr-local-writes instr)) (incf (gethash k stloc-count 0)))
+      (dolist (k (instr-local-reads instr))  (incf (gethash k ldloc-count 0))))
     ;; Eligible keys: single stloc, single ldloc, LispObject type
     (let ((single-ref (make-hash-table :test #'equal)))
       (maphash (lambda (key sc)
@@ -891,28 +994,18 @@
         (last-pos   (make-hash-table :test #'equal))
         (local-type (make-hash-table :test #'equal))
         (pos 0))
-    ;; Pass 1: collect types and compute [first-pos, last-pos] for each key
+    ;; Pass 1: collect types and compute [first-pos, last-pos] for each key.
+    ;; instr-local-refs returns every local a key reads/writes — including those
+    ;; embedded in nested operand lists (:dotnet-call-direct-locals) — so their
+    ;; live ranges extend to the using op and the slot-share scan won't merge
+    ;; another local over a still-live nested reference (issue).
     (dolist (instr instrs)
-      (when (consp instr)
-        (let ((op (car instr)) (key (cadr instr)))
-          (cond
-            ((eq op :declare-local)
-             (setf (gethash key local-type) (caddr instr)))
-            ((or (eq op :stloc) (eq op :ldloc))
-             (unless (gethash key first-pos)
-               (setf (gethash key first-pos) pos))
-             (setf (gethash key last-pos) pos))
-            ;; (:dotnet-call-direct-locals type method RECV (ARG...) (PARAM...))
-            ;; references RECV and each ARG local inside nested lists, not as
-            ;; top-level :ldloc. Count them as uses here so their live ranges
-            ;; extend to this op — otherwise the slot-share scan thinks they die
-            ;; at their :stloc and merges another local over them, orphaning the
-            ;; nested reference into an "Undeclared local" at assembly time.
-            ((eq op :dotnet-call-direct-locals)
-             (dolist (k (cons (nth 3 instr) (nth 4 instr)))
-               (unless (gethash k first-pos)
-                 (setf (gethash k first-pos) pos))
-               (setf (gethash k last-pos) pos))))))
+      (let ((decl (instr-declared-local instr)))
+        (when decl (setf (gethash (car decl) local-type) (cdr decl))))
+      (dolist (key (instr-local-refs instr))
+        (unless (gethash key first-pos)
+          (setf (gethash key first-pos) pos))
+        (setf (gethash key last-pos) pos))
       (incf pos))
     ;; Collect eligible candidates: LispObject type with at least one use
     (let ((candidates nil))
@@ -946,39 +1039,20 @@
                 (push (cons lp key) free-slots))))
         (when (zerop (hash-table-count rename))
           (return-from %merge-disjoint-locals instrs))
-        ;; Pass 2: rename stloc/ldloc for merged keys; deduplicate :declare-local
+        ;; Pass 2: apply RENAME to every local (central rewriter handles stloc/
+        ;; ldloc/declare-local and nested :dotnet-call-direct-locals locals), then
+        ;; drop duplicate :declare-local entries that collapsed onto a shared slot.
         (let ((seen-declare (make-hash-table :test #'equal)))
           (remove nil
                   (mapcar (lambda (instr)
-                            (cond
-                              ((not (consp instr)) instr)
-                              (t
-                               (let ((op (car instr)) (key (cadr instr)))
-                                 (cond
-                                   ((eq op :declare-local)
-                                    (let ((canonical (or (gethash key rename) key)))
-                                      (if (gethash canonical seen-declare)
-                                          nil
-                                          (progn
-                                            (setf (gethash canonical seen-declare) t)
-                                            `(:declare-local ,canonical ,(caddr instr))))))
-                                   ((or (eq op :stloc) (eq op :ldloc))
-                                    (let ((canonical (gethash key rename)))
-                                      (if canonical
-                                          `(,op ,canonical)
-                                          instr)))
-                                   ;; Rewrite the RECV and ARG locals carried in the
-                                   ;; nested lists so they track any slot-merge rename
-                                   ;; applied to their :declare-local/:stloc.
-                                   ((eq op :dotnet-call-direct-locals)
-                                    (let ((recv (nth 3 instr)))
-                                      `(:dotnet-call-direct-locals
-                                        ,(nth 1 instr) ,(nth 2 instr)
-                                        ,(or (gethash recv rename) recv)
-                                        ,(mapcar (lambda (a) (or (gethash a rename) a))
-                                                 (nth 4 instr))
-                                        ,(nth 5 instr))))
-                                   (t instr))))))
+                            (let* ((new (rewrite-instr-locals instr rename))
+                                   (decl (instr-declared-local new)))
+                              (if decl
+                                  (if (gethash (car decl) seen-declare)
+                                      nil
+                                      (progn (setf (gethash (car decl) seen-declare) t)
+                                             new))
+                                  new)))
                           instrs)))))))
 
 ;;; ============================================================
@@ -996,6 +1070,7 @@
         (*boxed-vars* '())
         (*local-functions* '())
         (*at-toplevel* t)
+        (*macroexpand-scope* '())
         (*macroexpand-cache* (make-hash-table :test #'eq)))
     `(,@(compile-expr expr)
       (:ret))))
@@ -1014,6 +1089,7 @@
         (*local-functions* '())
         (*at-toplevel* t)
         (*in-tail-position* t)
+        (*macroexpand-scope* '())
         (*macroexpand-cache* (make-hash-table :test #'eq)))
     `(,@(compile-expr expr)
       (:ret))))

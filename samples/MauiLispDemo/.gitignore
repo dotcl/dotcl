@@ -1,11 +1,11 @@
 # Per-machine task runner config (paths, scrcpy flags etc.)
 .env
 
-# MAUI / .NET build artifacts (root .gitignore も bin/ obj/ をカバーしているが
-# サンプルにも明示しておく)
+# MAUI / .NET build artifacts (the root .gitignore already covers bin/ obj/,
+# but list them here for the sample too)
 bin/
 obj/
 
 # Diagnostic log written by MauiProgram (output dir-relative on Windows,
-# AppDataDirectory on Android — ここで grep するのは Windows 出力)
+# AppDataDirectory on Android — grep here targets the Windows output)
 dotcl-maui.log

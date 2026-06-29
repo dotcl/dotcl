@@ -1,69 +1,70 @@
-# MonoGameLispDemo — dotcl を C# プロジェクトに組み込むレシピ (MonoGame 版)
+# MonoGameLispDemo — a recipe for embedding dotcl in a C# project (MonoGame edition)
 
-dotcl を **既存の .NET プロジェクトのインプロセスランタイムとして埋め込む**
-ための定型を、MonoGame DesktopGL アプリで実演するサンプル。Common Lisp が
-分かる読者が、自分の C# ゲームプロジェクトに同じパターンを適用できる
-ことを目的にしている。
+A sample that demonstrates the boilerplate for **embedding dotcl as an
+in-process runtime in an existing .NET project**, using a MonoGame DesktopGL
+app. It is meant to let a reader who knows Common Lisp apply the same pattern to
+their own C# game project.
 
-要点:
+Key points:
 
-- C# 側は **boot と `Game.Run()` だけ**。`Game` サブクラス (`Demo.LispGame`)
-  は Lisp 側で `dotnet:define-class` で emit する
-- ctor 内で `GraphicsDeviceManager(this)` を生成、`Draw` を override して
-  `GraphicsDevice.Clear(...)` で背景色を毎フレーム書き込む
-- 背景色は `(pulse-color seconds)` で時間経過に応じてグラデーション
+- The C# side is **just boot and `Game.Run()`**. The `Game` subclass
+  (`Demo.LispGame`) is emitted on the Lisp side with `dotnet:define-class`.
+- In its ctor it creates a `GraphicsDeviceManager(this)`, overrides `Draw`, and
+  writes the background color every frame with `GraphicsDevice.Clear(...)`.
+- The background color comes from `(pulse-color seconds)`, gradating over time.
 
-## デモを起動すると
+## When you launch the demo
 
-ウィンドウが開き、背景色が 6 秒周期で 赤 → 緑 → 青 → 赤 とグラデーション
-する。`Game.Update` / `Game.Draw` ループは MonoGame 側で回り、`Draw`
-override の中の Lisp コード (`pulse-color` を呼んで `Color` を作る)
-だけが毎フレーム評価される。
+A window opens and the background gradates red → green → blue → red on a 6-second
+cycle. The `Game.Update` / `Game.Draw` loop runs on the MonoGame side, and only
+the Lisp code inside the `Draw` override (calling `pulse-color` to build a
+`Color`) is evaluated each frame.
 
-## 構成
+## Layout
 
 ```
 MonoGameLispDemo/
 ├── MonoGameLispDemo.csproj   # net10.0-windows / win-x64 / DesktopGL
-├── MonoGameLispDemo.asd      # ASDF 定義: depends-on dotnet-class
-├── main.lisp                 # Demo.LispGame を define-class で emit
-├── Program.cs                # boot + Run() のみ
-└── CsharpSanityGame.cs       # 環境診断用 (--csharp-sanity フラグで起動)
+├── MonoGameLispDemo.asd      # ASDF definition: depends-on dotnet-class
+├── main.lisp                 # emits Demo.LispGame via define-class
+├── Program.cs                # boot + Run() only
+└── CsharpSanityGame.cs       # environment check (launch with --csharp-sanity)
 ```
 
-`MonoGameLispDemo.csproj` 内の `<Import Project=".../Dotcl.targets" />`
-が `main.lisp` をビルド時に compile-file → `bin/.../dotcl-fasl/` に
-配置する (project-core flow)。実行時は `DotclHost.LoadFromManifest`
-が manifest を読んでまとめて load する。
+The `<Import Project=".../Dotcl.targets" />` in `MonoGameLispDemo.csproj`
+compile-files `main.lisp` at build time and places it under
+`bin/.../dotcl-fasl/` (project-core flow). At run time
+`DotclHost.LoadFromManifest` reads the manifest and loads everything together.
 
-## なぜ DesktopGL / win-x64 か
+## Why DesktopGL / win-x64
 
-- **DesktopGL (SDL2 + OpenGL)** は ARM64 含めて移植性が高い。WindowsDX
-  (SharpDX) は Snapdragon Windows ARM64 で描画が出ないことを確認
-- **`<RuntimeIdentifier>win-x64</RuntimeIdentifier>`** は SDL2 の native
-  バイナリ (`MonoGame.Library.SDL`) が win-arm64 を ship していないため。
-  win-x64 に固定して Prism (x64 emulation) で走らせる。dev サンプルとして
-  は性能ペナルティ許容範囲
+- **DesktopGL (SDL2 + OpenGL)** is more portable, including ARM64. WindowsDX
+  (SharpDX) was confirmed to render nothing on Snapdragon Windows ARM64.
+- **`<RuntimeIdentifier>win-x64</RuntimeIdentifier>`** is used because SDL2's
+  native binary (`MonoGame.Library.SDL`) does not ship win-arm64. Pinning to
+  win-x64 runs it under Prism (x64 emulation). As a dev sample, the performance
+  penalty is acceptable.
 
-## 環境診断
+## Environment check
 
-レンダリングが真っ黒な場合、Lisp 連携か MonoGame 環境かの切り分けに
+If rendering is all black, use this to tell whether the Lisp integration or the
+MonoGame environment is at fault:
 
 ```
 MonoGameLispDemo.exe --csharp-sanity
 ```
 
-を使う。純 C# の `CsharpSanityGame` (赤一色 Clear) を立ち上げる。これも
-真っ黒なら MonoGame / GPU ドライバ側、これだけ動けば dotcl 連携側の
-バグを疑う。
+It launches the pure-C# `CsharpSanityGame` (a solid red Clear). If that is also
+black, suspect MonoGame / the GPU driver; if only that works, suspect the dotcl
+integration.
 
-## 実行
+## Run
 
 ```bash
 dotnet build MonoGameLispDemo.csproj -c Debug
 ./bin/Debug/net10.0-windows/win-x64/MonoGameLispDemo.exe
 ```
 
-`net10.0-windows` ターゲット + `win-x64` RID なので、x64 版の
-**.NET Desktop Runtime** が `C:\Program Files\dotnet\x64\` 以下に必要
-(ASP.NET Core Runtime ではない)。
+With the `net10.0-windows` target + `win-x64` RID, the x64 **.NET Desktop
+Runtime** must be present under `C:\Program Files\dotnet\x64\` (not the ASP.NET
+Core Runtime).

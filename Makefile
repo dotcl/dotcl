@@ -507,7 +507,7 @@ pack: compile-asdf-fasl compile-asdf-fasls compile-core-fasl compile-contrib-fas
 	rm -f $(DOTCL_ROOT)runtime/contrib/dotcl-cs/*.csproj $(DOTCL_ROOT)runtime/contrib/dotcl-cs/*.cs
 	cp $(DOTCL_ROOT)contrib/asdf/asdf.fasl $(DOTCL_ROOT)runtime/contrib/asdf/asdf.fasl
 	dotnet pack $(DOTCL_ROOT)runtime/runtime.csproj --configuration Release -o $(DOTCL_ROOT)out/
-	# Build the in-process project-core MSBuild task (#307) before packing the
+	# Build the in-process project-core MSBuild task before packing the
 	# library so DotCL.Runtime.csproj can bundle tasks/DotCL.Build.Tasks.dll.
 	dotnet build $(DOTCL_ROOT)runtime/build-tasks/DotCL.Build.Tasks.csproj --configuration Release
 	dotnet pack $(DOTCL_ROOT)runtime/DotCL.Runtime.csproj --configuration Release -o $(DOTCL_ROOT)out/

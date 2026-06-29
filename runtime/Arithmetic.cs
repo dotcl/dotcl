@@ -132,7 +132,29 @@ public static class Arithmetic
         {
             var ac = AsComplex(a);
             var bc = AsComplex(b);
-            // (a+bi)/(c+di) = ((ac+bd) + (bc-ad)i) / (c²+d²)
+            static bool IsFlt(Number n) => n is SingleFloat || n is DoubleFloat;
+            bool anyFloat = IsFlt(ac.Real) || IsFlt(ac.Imaginary) || IsFlt(bc.Real) || IsFlt(bc.Imaginary);
+            if (anyFloat)
+            {
+                // Float complex division via System.Numerics (Smith's algorithm): the
+                // denominator is scaled, so c²+d² no longer over/underflows for extreme
+                // magnitudes. The naive ((c²+d²)) form made (/ z (abs z)) for |z|~1e±170
+                // hit divide-by-zero (denom→0) or NaN (denom→inf). Maxima signum(complex)
+                // depends on this.
+                var bcx = ToSystemComplex(bc);
+                if (bcx.Real == 0.0 && bcx.Imaginary == 0.0)
+                    throw new DivideByZeroException("Division by zero");
+                var q = ToSystemComplex(ac) / bcx;
+                bool allSingle = !(ac.Real is DoubleFloat) && !(ac.Imaginary is DoubleFloat)
+                              && !(bc.Real is DoubleFloat) && !(bc.Imaginary is DoubleFloat)
+                              && (ac.Real is SingleFloat || ac.Imaginary is SingleFloat
+                                  || bc.Real is SingleFloat || bc.Imaginary is SingleFloat);
+                return allSingle
+                    ? MakeComplex(new SingleFloat((float)q.Real), new SingleFloat((float)q.Imaginary))
+                    : MakeComplex(new DoubleFloat(q.Real), new DoubleFloat(q.Imaginary));
+            }
+            // Exact (integer/rational) complex division: (a+bi)/(c+di) =
+            // ((ac+bd) + (bc-ad)i) / (c²+d²). BigInteger arithmetic — no overflow.
             var denom = Add(Multiply(bc.Real, bc.Real), Multiply(bc.Imaginary, bc.Imaginary));
             return MakeComplex(
                 Divide(Add(Multiply(ac.Real, bc.Real), Multiply(ac.Imaginary, bc.Imaginary)), denom),
@@ -183,11 +205,13 @@ public static class Arithmetic
             Ratio r => r.Numerator >= 0 ? a : (Number)Ratio.Make(-r.Numerator, r.Denominator),
             SingleFloat sf => new SingleFloat(System.Math.Abs(sf.Value)),
             DoubleFloat df => new DoubleFloat(System.Math.Abs(df.Value)),
+            // Magnitude via System.Numerics.Complex.Abs, which uses a scaled hypot
+            // (max*sqrt(1+(min/max)^2)) so it doesn't over/underflow when re^2/im^2
+            // would: e.g. (abs #C(1d170 1d170)) and (abs #C(1d-170 1d-170)) are exact
+            // rather than +inf / 0. The naive sqrt(re^2+im^2) squared the magnitude.
             LispComplex c => (c.Real is SingleFloat && c.Imaginary is SingleFloat)
-                ? (Number)new SingleFloat((float)System.Math.Sqrt(
-                    System.Math.Pow(ToDouble(c.Real), 2) + System.Math.Pow(ToDouble(c.Imaginary), 2)))
-                : new DoubleFloat(System.Math.Sqrt(
-                    System.Math.Pow(ToDouble(c.Real), 2) + System.Math.Pow(ToDouble(c.Imaginary), 2))),
+                ? (Number)new SingleFloat((float)System.Numerics.Complex.Abs(ToSystemComplex(c)))
+                : new DoubleFloat(System.Numerics.Complex.Abs(ToSystemComplex(c))),
             _ => throw new NotImplementedException()
         };
     }
@@ -344,8 +368,12 @@ public static class Arithmetic
             q++;
             if ((int)q.GetBitLength() > 53)
             {
+                // Rounding carried into a 54th bit. Halving q (q >>= 1) must be
+                // compensated by shift-- (the result is q * 2^-shift, so a smaller q
+                // needs a smaller shift to hold the value) — same convention as the
+                // guard-bit extraction above. shift++ here turned (2^N-1)/2^N into 0.25.
                 q >>= 1;
-                shift++;
+                shift--;
             }
         }
 
@@ -391,6 +419,10 @@ public static class Arithmetic
         // CL 12.1.4.1: when comparing float with rational, convert float to rational
         bool aFloat = a is SingleFloat || a is DoubleFloat;
         bool bFloat = b is SingleFloat || b is DoubleFloat;
+        // A non-finite float (inf/nan) has no rational value; compare as doubles
+        // instead of rationalizing (which would throw "cannot be converted").
+        if (IsNonFiniteFloat(a, aFloat) || IsNonFiniteFloat(b, bFloat))
+            return ToDouble(a) == ToDouble(b);
         if (aFloat && !bFloat) {
             // convert a (float) to rational, then compare as rationals
             var ar = FloatToRational(a);
@@ -423,6 +455,10 @@ public static class Arithmetic
         // CL 12.1.4.1: when comparing float with rational, convert float to rational
         bool aFloat = a is SingleFloat || a is DoubleFloat;
         bool bFloat = b is SingleFloat || b is DoubleFloat;
+        // A non-finite float (inf/nan) has no rational value; compare as doubles
+        // (matching the float/float path) instead of rationalizing (which throws).
+        if (IsNonFiniteFloat(a, aFloat) || IsNonFiniteFloat(b, bFloat))
+            return ToDouble(a).CompareTo(ToDouble(b));
         if (aFloat && !bFloat) {
             var ar = FloatToRational(a);
             var (an2, ad2) = AsRational(ar);
@@ -441,6 +477,25 @@ public static class Arithmetic
         var (an, ad) = AsRational(a);
         var (bn, bd) = AsRational(b);
         return (an * bd).CompareTo(bn * ad);
+    }
+
+    /// <summary>True if either operand is a NaN float. The ordering predicates
+    /// (&lt; &lt;= &gt; &gt;=) must return false when an operand is NaN — IEEE comparisons
+    /// with NaN are "unordered", but Compare() returns a total order (CompareTo
+    /// ranks NaN below everything), so callers must check this first.</summary>
+    public static bool EitherNaN(Number a, Number b)
+        => (a is DoubleFloat da && double.IsNaN(da.Value))
+        || (a is SingleFloat sa && float.IsNaN(sa.Value))
+        || (b is DoubleFloat db && double.IsNaN(db.Value))
+        || (b is SingleFloat sb && float.IsNaN(sb.Value));
+
+    /// <summary>True when N is a float operand whose value is infinite or NaN
+    /// (so it has no rational representation). ns2.0-safe (no double.IsFinite).</summary>
+    private static bool IsNonFiniteFloat(Number n, bool isFloat)
+    {
+        if (!isFloat) return false;
+        double d = ToDouble(n);
+        return double.IsInfinity(d) || double.IsNaN(d);
     }
 
     /// <summary>Convert a float Number to a rational Number via IEEE 754 decomposition.</summary>
@@ -572,26 +627,52 @@ public static class Arithmetic
     }
 
     // --- FFloor / FCeiling / FTruncate / FRound ---
+    // A non-finite float (inf/nan) can't be rounded to a rational. All four
+    // float-result roundings just return the (float) value itself — SBCL returns
+    // the infinity/NaN as the quotient — instead of going through Floor/Truncate
+    // which would rationalize and throw. (Integer-result floor/truncate still
+    // error on infinity, matching SBCL; only the f* float-result forms differ.)
+    private static bool TryFNonFinite(Number a, Number b, out (Number quotient, Number remainder) result)
+    {
+        if (IsNonFiniteFloat(a, a is SingleFloat || a is DoubleFloat) ||
+            IsNonFiniteFloat(b, b is SingleFloat || b is DoubleFloat))
+        {
+            double q = ToDouble(a) / ToDouble(b);                 // inf/1 = inf, inf/inf = NaN
+            double rem = ToDouble(a) - q * ToDouble(b);           // inf - inf = NaN
+            bool dbl = a is DoubleFloat || b is DoubleFloat;
+            Number quot = dbl ? new DoubleFloat(q) : (Number)new SingleFloat((float)q);
+            Number remN = dbl ? new DoubleFloat(rem) : (Number)new SingleFloat((float)rem);
+            result = (quot, remN);
+            return true;
+        }
+        result = default;
+        return false;
+    }
+
     public static (Number quotient, Number remainder) FFloor(Number a, Number b)
     {
+        if (TryFNonFinite(a, b, out var nf)) return nf;
         var (q, r) = Floor(a, b);
         return (QuotientToFloat(q, a, b), r);
     }
 
     public static (Number quotient, Number remainder) FTruncate(Number a, Number b)
     {
+        if (TryFNonFinite(a, b, out var nf)) return nf;
         var (q, r) = Truncate(a, b);
         return (QuotientToFloat(q, a, b), r);
     }
 
     public static (Number quotient, Number remainder) FCeiling(Number a, Number b)
     {
+        if (TryFNonFinite(a, b, out var nf)) return nf;
         var (q, r) = Ceiling(a, b);
         return (QuotientToFloat(q, a, b), r);
     }
 
     public static (Number quotient, Number remainder) FRound(Number a, Number b)
     {
+        if (TryFNonFinite(a, b, out var nf)) return nf;
         var (q, r) = Round(a, b);
         return (QuotientToFloat(q, a, b), r);
     }
@@ -672,6 +753,34 @@ public static class Arithmetic
         // Per CL spec: if imagpart is 0.0 for floats, still return complex (already float)
         return new LispComplex(real, imag);
     }
+
+    /// <summary>CLHS asin(z) = -i log(iz + sqrt(1-z)*sqrt(1+z)). Used to promote a
+    /// real |x|>1 to the CL-correct complex branch (.NET Complex.Asin picks the other
+    /// side of the real cut).</summary>
+    public static System.Numerics.Complex AsinComplex(System.Numerics.Complex z)
+    {
+        var i = System.Numerics.Complex.ImaginaryOne;
+        var s = System.Numerics.Complex.Sqrt(1 - z) * System.Numerics.Complex.Sqrt(1 + z);
+        return -i * System.Numerics.Complex.Log(i * z + s);
+    }
+
+    /// <summary>CLHS acos(z) = -i log(z + i*sqrt(1-z)*sqrt(1+z)).</summary>
+    public static System.Numerics.Complex AcosComplex(System.Numerics.Complex z)
+    {
+        var i = System.Numerics.Complex.ImaginaryOne;
+        var s = System.Numerics.Complex.Sqrt(1 - z) * System.Numerics.Complex.Sqrt(1 + z);
+        return -i * System.Numerics.Complex.Log(z + i * s);
+    }
+
+    /// <summary>CLHS acosh(z) = log(z + sqrt(z-1)*sqrt(z+1)). The factored sqrt
+    /// (not sqrt(z*z-1)) chooses the branch CL specifies on the real cut.</summary>
+    public static System.Numerics.Complex AcoshComplex(System.Numerics.Complex z)
+        => System.Numerics.Complex.Log(z + System.Numerics.Complex.Sqrt(z - 1) * System.Numerics.Complex.Sqrt(z + 1));
+
+    /// <summary>CLHS atanh(z) = (log(1+z) - log(1-z))/2. Separated logs (not
+    /// log((1+z)/(1-z))) keep the branch right on the real cut |x|>1.</summary>
+    public static System.Numerics.Complex AtanhComplex(System.Numerics.Complex z)
+        => 0.5 * (System.Numerics.Complex.Log(1 + z) - System.Numerics.Complex.Log(1 - z));
 
     /// <summary>Convert a LispComplex to System.Numerics.Complex.</summary>
     public static System.Numerics.Complex ToSystemComplex(LispComplex c)

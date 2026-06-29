@@ -10,13 +10,13 @@
 
 	<ItemGroup>
 		<!-- C# MCP SDK (modelcontextprotocol/csharp-sdk).
-		     ModelContextProtocol = Core + Hosting/DI (stdio) 一式。 -->
+		     ModelContextProtocol = Core + Hosting/DI (stdio), the full set. -->
 		<PackageReference Include="ModelContextProtocol" Version="1.2.0" />
 		<PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.0" />
 	</ItemGroup>
 
-	<!-- dotcl runtime (Library) を参照。CoreCLR で Reflection.Emit ベースの
-	     コンパイラ/ランタイムがそのまま動く。 -->
+	<!-- Reference the dotcl runtime (Library). The Reflection.Emit-based
+	     compiler/runtime runs as-is on CoreCLR. -->
 	<ItemGroup>
 		<ProjectReference Include="..\..\runtime\DotCL.Runtime.csproj" />
 	</ItemGroup>

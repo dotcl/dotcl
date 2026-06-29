@@ -903,8 +903,11 @@ public class LispHashTable : LispObject
         if (Runtime.IsEqRef(a, b)) return true;
         if (a is Fixnum fa && b is Fixnum fb) return fa.Value == fb.Value;
         if (a is LispChar ca && b is LispChar cb) return ca.Value == cb.Value;
-        if (a is SingleFloat sa && b is SingleFloat sb) return sa.Value == sb.Value;
-        if (a is DoubleFloat da && b is DoubleFloat db) return da.Value == db.Value;
+        // Floats compare by bits (eql semantics): 0.0/-0.0 distinct, bit-identical NaNs equal.
+        if (a is SingleFloat sa && b is SingleFloat sb)
+            return Compat.SingleToInt32Bits(sa.Value) == Compat.SingleToInt32Bits(sb.Value);
+        if (a is DoubleFloat da && b is DoubleFloat db)
+            return BitConverter.DoubleToInt64Bits(da.Value) == BitConverter.DoubleToInt64Bits(db.Value);
         return false;
     }
 
@@ -1052,16 +1055,28 @@ public class LispHashTable : LispObject
             };
         }
 
-        private static int GetEqualHash(LispObject obj) => obj switch
+        // Depth limit for structural key hashing. Like SXHASH (SxhashCompute),
+        // EQUAL/EQUALP hashing descends a bounded number of levels so a circular
+        // key (e.g. #1=(1 2 3 . #1#)) truncates instead of recursing until the
+        // native stack overflows and takes the whole process down.
+        private const int EqualHashMaxDepth = 8;
+
+        private static int GetEqualHash(LispObject obj) => GetEqualHash(obj, EqualHashMaxDepth);
+
+        private static int GetEqualHash(LispObject obj, int depth)
         {
-            LispString s => s.Value.GetHashCode(),
-            LispVector v when v.IsCharVector => v.ToCharString().GetHashCode(),
-            Cons c => HashCode.Combine(GetEqualHash(c.Car), GetEqualHash(c.Cdr)),
-            Fixnum f => f.Value.GetHashCode(),
-            LispChar ch => ch.Value.GetHashCode(),
-            LispVector bv when bv.IsBitVector => HashBitVector(bv),
-            _ => System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(obj)
-        };
+            if (depth == 0) return 0;
+            return obj switch
+            {
+                LispString s => s.Value.GetHashCode(),
+                LispVector v when v.IsCharVector => v.ToCharString().GetHashCode(),
+                Cons c => HashCode.Combine(GetEqualHash(c.Car, depth - 1), GetEqualHash(c.Cdr, depth - 1)),
+                Fixnum f => f.Value.GetHashCode(),
+                LispChar ch => ch.Value.GetHashCode(),
+                LispVector bv when bv.IsBitVector => HashBitVector(bv),
+                _ => System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(obj)
+            };
+        }
 
         private static int HashBitVector(LispVector bv)
         {
@@ -1071,16 +1086,22 @@ public class LispHashTable : LispObject
             return h.ToHashCode();
         }
 
-        private static int GetEqualpHash(LispObject obj) => obj switch
+        private static int GetEqualpHash(LispObject obj) => GetEqualpHash(obj, EqualHashMaxDepth);
+
+        private static int GetEqualpHash(LispObject obj, int depth)
         {
-            LispString s => s.Value.ToUpperInvariant().GetHashCode(),
-            LispVector v when v.IsCharVector => v.ToCharString().ToUpperInvariant().GetHashCode(),
-            LispChar c => char.ToUpperInvariant(c.Value).GetHashCode(),
-            Number n => Arithmetic.ToDouble(n).GetHashCode(),
-            Cons c => HashCode.Combine(GetEqualpHash(c.Car), GetEqualpHash(c.Cdr)),
-            LispVector v => v.Length == 0 ? 0 : GetEqualpHash(v.ElementAt(0)),
-            _ => System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(obj)
-        };
+            if (depth == 0) return 0;
+            return obj switch
+            {
+                LispString s => s.Value.ToUpperInvariant().GetHashCode(),
+                LispVector v when v.IsCharVector => v.ToCharString().ToUpperInvariant().GetHashCode(),
+                LispChar c => char.ToUpperInvariant(c.Value).GetHashCode(),
+                Number n => Arithmetic.ToDouble(n).GetHashCode(),
+                Cons c => HashCode.Combine(GetEqualpHash(c.Car, depth - 1), GetEqualpHash(c.Cdr, depth - 1)),
+                LispVector v => v.Length == 0 ? 0 : GetEqualpHash(v.ElementAt(0), depth - 1),
+                _ => System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(obj)
+            };
+        }
     }
 }
 

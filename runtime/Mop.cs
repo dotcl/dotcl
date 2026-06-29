@@ -274,6 +274,130 @@ public static class Mop
         RegisterMop("INTERN-EQL-SPECIALIZER", 1, args =>
             new Cons(Startup.Sym("EQL"), new Cons(args[0], Nil.Instance)));
 
+        // ACCESSOR-METHOD-SLOT-DEFINITION (method) → the slot-definition the accessor
+        // reads/writes. DEFCLASS tags reader/writer/accessor methods with their slot
+        // via %REGISTER-ACCESSOR-METHOD; ordinary methods return NIL.
+        RegisterMop("ACCESSOR-METHOD-SLOT-DEFINITION", 1, args =>
+            args[0] is LispMethod m && m.AccessorSlot is { } sd ? (LispObject)sd : Nil.Instance);
+
+        // METHOD-FUNCTION (method) → the method's function object. AMOP: the function
+        // called with (args next-methods); dotcl's method Function already follows the
+        // call-method calling convention used by the dispatcher.
+        RegisterMop("METHOD-FUNCTION", 1, args =>
+            args[0] is LispMethod m ? (LispObject)m.Function : Nil.Instance);
+
+        // READER-METHOD-CLASS / WRITER-METHOD-CLASS (class slotd &rest initargs) →
+        // the class of accessor methods. dotcl creates plain standard methods for
+        // accessors, so the metaobject class is STANDARD-METHOD.
+        RegisterMop("READER-METHOD-CLASS", -1, args =>
+            (LispObject?)Runtime.FindClassOrNil(Startup.Sym("STANDARD-METHOD")) ?? Nil.Instance);
+        RegisterMop("WRITER-METHOD-CLASS", -1, args =>
+            (LispObject?)Runtime.FindClassOrNil(Startup.Sym("STANDARD-METHOD")) ?? Nil.Instance);
+
+        // SPECIALIZER-DIRECT-METHODS (specializer) → every method that has SPECIALIZER
+        // in its specializer list. No back-link is kept, so scan all GFs' methods.
+        // Specializers are LispClass (eq) or (eql X) conses (structural compare).
+        RegisterMop("SPECIALIZER-DIRECT-METHODS", 1, args =>
+        {
+            var spec = args[0];
+            var found = new List<LispObject>();
+            foreach (var gf in Runtime.AllGenericFunctions())
+                foreach (var m in gf.Methods)
+                    if (SpecializerListContains(m.Specializers, spec))
+                        found.Add(m);
+            return Runtime.List(found.ToArray());
+        });
+
+        // SPECIALIZER-DIRECT-GENERIC-FUNCTIONS (specializer) → every GF that has a
+        // method specialized on SPECIALIZER (each GF at most once).
+        RegisterMop("SPECIALIZER-DIRECT-GENERIC-FUNCTIONS", 1, args =>
+        {
+            var spec = args[0];
+            var found = new List<LispObject>();
+            foreach (var gf in Runtime.AllGenericFunctions())
+                foreach (var m in gf.Methods)
+                    if (SpecializerListContains(m.Specializers, spec))
+                    {
+                        found.Add(gf);
+                        break;
+                    }
+            return Runtime.List(found.ToArray());
+        });
+
+        // COMPUTE-* introspection: dotcl finalizes classes eagerly, so the "computed"
+        // result is the already-stored effective value. Exposed as plain functions so
+        // closer-mop callers (which expect SBCL-style availability) resolve them.
+        RegisterMop("COMPUTE-SLOTS", 1, args =>
+            args[0] is LispClass c ? Runtime.List(c.EffectiveSlots.Cast<LispObject>().ToArray()) : Nil.Instance);
+        RegisterMop("COMPUTE-CLASS-PRECEDENCE-LIST", 1, args =>
+            args[0] is LispClass c ? Runtime.List(c.ClassPrecedenceList.Cast<LispObject>().ToArray()) : Nil.Instance);
+        RegisterMop("COMPUTE-DEFAULT-INITARGS", 1, args =>
+        {
+            if (args[0] is not LispClass c) return Nil.Instance;
+            var items = c.DefaultInitargs
+                .Select(p => Runtime.List(p.Key, Nil.Instance, p.Thunk))
+                .ToArray();
+            return Runtime.List(items);
+        });
+
+        // COMPUTE-APPLICABLE-METHODS-USING-CLASSES (gf classes) → (values methods
+        // definitive-p). definitive-p is NIL when applicability depends on an EQL
+        // specializer (undecidable from a class), so the caller falls back to
+        // COMPUTE-APPLICABLE-METHODS on the actual arguments.
+        RegisterMop("COMPUTE-APPLICABLE-METHODS-USING-CLASSES", 2, args =>
+            Runtime.ComputeApplicableMethodsUsingClasses(args[0], args[1]));
+
+        // COMPUTE-DISCRIMINATING-FUNCTION (gf) → a function that performs the GF's
+        // dispatch. dotcl's GenericFunction IS its own discriminating function (it is
+        // funcallable and runs the dispatcher), so return it directly.
+        RegisterMop("COMPUTE-DISCRIMINATING-FUNCTION", 1, args =>
+            args[0] is GenericFunction gf ? (LispObject)gf : Nil.Instance);
+
+        // COMPUTE-EFFECTIVE-METHOD (gf method-combination methods) → the effective
+        // method form for the STANDARD method combination (CLHS 7.6.6.2). METHODS is
+        // the applicable list most-specific-first. Non-standard combinations are not
+        // synthesized here (dotcl's own dispatcher handles them internally).
+        RegisterMop("COMPUTE-EFFECTIVE-METHOD", 3, args =>
+        {
+            var comb = args[1];
+            // Standard combination is named STANDARD or passed as NIL.
+            if (comb is Symbol cs && cs.Name != "STANDARD" && cs.Name != "NIL")
+                throw new LispErrorException(new LispError(
+                    $"COMPUTE-EFFECTIVE-METHOD: only the STANDARD method combination is supported, got {cs.Name}"));
+            return Runtime.ComputeEffectiveMethodStandard(args[2]);
+        });
+
+        // ENSURE-CLASS-USING-CLASS (class name &rest initargs): the functional core of
+        // DEFCLASS. dotcl's ENSURE-CLASS already creates-or-reinitializes by name
+        // (RegisterClass copies into an existing/forward-ref class), so the class arg
+        // (nil when not yet defined) is informational — delegate by name + initargs.
+        RegisterMop("ENSURE-CLASS-USING-CLASS", -1, args =>
+        {
+            if (args.Length < 2)
+                throw new LispErrorException(new LispProgramError(
+                    "ENSURE-CLASS-USING-CLASS: requires class and name"));
+            if (Startup.Sym("ENSURE-CLASS").Function is not LispFunction ec)
+                throw new LispErrorException(new LispProgramError("ENSURE-CLASS unavailable"));
+            var rest = new LispObject[args.Length - 1];      // name + initargs
+            Array.Copy(args, 1, rest, 0, args.Length - 1);
+            return ec.Invoke(rest);
+        });
+
+        // ENSURE-GENERIC-FUNCTION-USING-CLASS (gf name &rest initargs): functional core
+        // of DEFGENERIC. ENSURE-GENERIC-FUNCTION already reinitializes an existing GF
+        // (looked up by name via fboundp), so the gf arg is informational.
+        RegisterMop("ENSURE-GENERIC-FUNCTION-USING-CLASS", -1, args =>
+        {
+            if (args.Length < 2)
+                throw new LispErrorException(new LispProgramError(
+                    "ENSURE-GENERIC-FUNCTION-USING-CLASS: requires gf and name"));
+            if (Startup.Sym("ENSURE-GENERIC-FUNCTION").Function is not LispFunction egf)
+                throw new LispErrorException(new LispProgramError("ENSURE-GENERIC-FUNCTION unavailable"));
+            var rest = new LispObject[args.Length - 1];      // name + initargs
+            Array.Copy(args, 1, rest, 0, args.Length - 1);
+            return egf.Invoke(rest);
+        });
+
         // -- Protocol GFs (extensible via defmethod) ----------------------
         // VALIDATE-SUPERCLASS: default = standard-class/standard-class → T, else NIL
         {
@@ -428,6 +552,23 @@ public static class Mop
         var method = (LispMethod)Runtime.MakeMethod(specs, Nil.Instance, new LispFunction(impl));
         method.RequiredCount = specializers.Length;
         Runtime.AddMethod(gf, method);
+    }
+
+    // True if SPEC appears in SPECIALIZERS. A class specializer matches by identity;
+    // an (eql X) specializer matches another (eql Y) when X and Y are EQL.
+    private static bool SpecializerListContains(LispObject[] specializers, LispObject spec)
+    {
+        foreach (var s in specializers)
+        {
+            if (ReferenceEquals(s, spec)) return true;
+            if (s is Cons sc && spec is Cons pc
+                && sc.Car is Symbol ss && ss.Name == "EQL"
+                && pc.Car is Symbol ps && ps.Name == "EQL"
+                && sc.Cdr is Cons scd && pc.Cdr is Cons pcd
+                && Runtime.Eql(scd.Car, pcd.Car) is T)
+                return true;
+        }
+        return false;
     }
 
     private static void RegisterMop(string name, int arity, Func<LispObject[], LispObject> fn)

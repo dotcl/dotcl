@@ -1032,8 +1032,8 @@ public static partial class Runtime
     {
         if (stream is LispStream ls)
             return ls.IsClosed ? Nil.Instance : T.Instance;
-        // Gray Streams: streamp が T を返すインスタンスは open とみなす
-        // (dotcl は gray stream に closed フラグを持たないため常に open)
+        // Gray Streams: an instance for which streamp returns T is treated as open
+        // (dotcl keeps no closed flag on gray streams, so they are always open).
         if (stream is LispInstance gi && (IsGrayOutputStream(gi) || IsGrayInputStream(gi)
                                           || IsGrayBinaryOutputStream(gi) || IsGrayBinaryInputStream(gi)))
             return T.Instance;
@@ -1121,6 +1121,8 @@ public static partial class Runtime
 
     private static bool IsBinaryOutputStream(LispObject s) => s switch {
         LispBinaryStream => true,
+        // A bivalent stream (BivalentStreamWriter) accepts both write-char and write-byte.
+        LispBidirectionalStream bv => bv.Writer is BivalentStreamWriter,
         LispFileStream fs => fs.IsOutput && IsIntegerElementType(fs.ElementType),
         LispBroadcastStream bs => bs.Streams.Length > 0 && IsBinaryOutputStream(bs.Streams[^1]),
         LispTwoWayStream tw => IsBinaryOutputStream(tw.OutputStream),
@@ -1334,6 +1336,9 @@ public static partial class Runtime
         }
         if (stream is LispBinaryStream bs)
             return bs.BaseStream.ReadByte();
+        // Bivalent stream: read-byte draws from the same byte source as read-char.
+        if (stream is LispBidirectionalStream bvi && bvi.Reader is BivalentStreamReader bsr)
+            return bsr.ReadRawByte();
         if (stream is LispFileStream fs && fs.InputReader is StreamReader sr)
             return sr.BaseStream.ReadByte();
         if (stream is LispConcatenatedStream cs)
@@ -1372,6 +1377,12 @@ public static partial class Runtime
         if (stream is LispBinaryStream bin)
         {
             bin.BaseStream.WriteByte((byte)b);
+            return;
+        }
+        // Bivalent stream: write-byte goes to the same sink as write-char.
+        if (stream is LispBidirectionalStream bvo && bvo.Writer is BivalentStreamWriter bsw)
+        {
+            bsw.WriteRawByte(b);
             return;
         }
         if (stream is LispFileStream fs && fs.OutputWriter is StreamWriter sw)
@@ -1465,6 +1476,11 @@ public static partial class Runtime
         ValidateSequenceKeywords("READ-SEQUENCE", args, 2, ref start, ref end);
 
         bool binary = IsBinaryStream(stream);
+        // A bivalent stream serves byte vs char by the destination element-type: a
+        // numeric (byte) vector reads bytes; a string / char / T vector reads chars.
+        if (!binary && stream is LispBidirectionalStream rsbi && rsbi.Reader is BivalentStreamReader
+            && seq is LispVector rsv && !rsv.IsCharVector && !rsv.IsBitVector && rsv.ElementTypeName != "T")
+            binary = true;
         var echoStream = FindEchoStream(stream);
         TextWriter? echoWriter = echoStream != null ? GetTextWriter(echoStream.OutputStream) : null;
 

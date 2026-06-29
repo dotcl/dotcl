@@ -725,13 +725,21 @@
                                 (values ,@in-vars)))))))
                   ;; (setf (apply #'fn arg1 ... rest-list) val)
                   ;; → (apply #'(setf fn) val arg1 ... rest-list)
+                  ;; CLHS 5.1.1.1: evaluate the place subforms (args) left-to-right,
+                  ;; THEN value, before the store. Binding value first (the naive
+                  ;; `(apply ... ,value ,@args)) reversed that order, so stash
+                  ;; the args then value into temps.
                   ((and (consp place) (eq (car place) 'apply))
                    (let* ((fn-form (cadr place))
                           (args (cddr place))
                           (fn-name (if (and (consp fn-form) (eq (car fn-form) 'function))
                                        (cadr fn-form)
-                                       fn-form)))
-                     `(apply (function (setf ,fn-name)) ,value ,@args)))
+                                       fn-form))
+                          (arg-temps (mapcar (lambda (a) (declare (ignore a)) (gensym "APPLY-ARG")) args))
+                          (val-temp (gensym "APPLY-VAL")))
+                     `(let* (,@(mapcar #'list arg-temps args)
+                             (,val-temp ,value))
+                        (apply (function (setf ,fn-name)) ,val-temp ,@arg-temps))))
                   ;; (setf (slot-value obj 'name) val)
                   ((and (consp place) (eq (car place) 'slot-value))
                    `(%set-slot-value ,(cadr place) ,(caddr place) ,value))
@@ -799,8 +807,18 @@
                   ;; of val. Returning val truncated a (setf f) whose function does
                   ;; more than echo its first arg (ANSI FDEFINITION.5: #'(setf sym)
                   ;; bound to CONS must yield (val . arg)).
+                  ;; Emit the funcall form (not the bare ((setf f) val args) operator
+                  ;; form): the funcall form is the de-facto standard (SBCL/CCL/ECL/ABCL)
+                  ;; that code walkers handle, and the bare operator-list form trips
+                  ;; them up (iterate minimize). Bind the place args left-to-right
+                  ;; then value into temps so evaluation order is CLHS 5.1.1.1-correct.
                   ((and (consp place) (symbolp (car place)))
-                   `((setf ,(car place)) ,value ,@(cdr place)))
+                   (let ((arg-temps (mapcar (lambda (a) (declare (ignore a)) (gensym "SETF-ARG"))
+                                            (cdr place)))
+                         (val-temp (gensym "SETF-VAL")))
+                     `(let* (,@(mapcar #'list arg-temps (cdr place))
+                             (,val-temp ,value))
+                        (funcall (function (setf ,(car place))) ,val-temp ,@arg-temps))))
                   (t (error "SETF: unsupported place ~s" place))))
               ;; Multi-pair
               (let ((result '()))
@@ -2707,7 +2725,9 @@
                        ;; Accessor = reader + writer (use defmethod to work with defgeneric)
                        (dolist (accessor accessors)
                          (push `(defmethod ,accessor ((obj ,name)) (slot-value obj ',sname)) defs)
+                         (push `(%register-accessor-method #',accessor (find-class ',name) ',sname) defs)
                          (push `(defmethod (setf ,accessor) ((val t) (obj ,name)) (%set-slot-value obj ',sname val) val) defs)
+                         (push `(%register-accessor-method #'(setf ,accessor) (find-class ',name) ',sname) defs)
                          ;; Register setf expander — calls (setf accessor) GF so that
                          ;; :around and other qualifier methods are properly dispatched.
                          (let ((acc accessor))
@@ -2723,10 +2743,13 @@
                                         ,tmp))))))
                        ;; Readers (use defmethod)
                        (dolist (reader readers)
-                         (push `(defmethod ,reader ((obj ,name)) (slot-value obj ',sname)) defs))
-                       ;; Writers (use defmethod)
+                         (push `(defmethod ,reader ((obj ,name)) (slot-value obj ',sname)) defs)
+                         (push `(%register-accessor-method #',reader (find-class ',name) ',sname) defs))
+                       ;; Writers (use defmethod) — :writer names a GF taking
+                       ;; (new-value object); the accessor's (setf acc) is handled above.
                        (dolist (writer writers)
-                         (push `(defmethod ,writer ((val t) (obj ,name)) (%set-slot-value obj ',sname val)) defs))))))
+                         (push `(defmethod ,writer ((val t) (obj ,name)) (%set-slot-value obj ',sname val)) defs)
+                         (push `(%register-accessor-method #',writer (find-class ',name) ',sname) defs))))))
                ;; Build default-initargs setup form
                (default-initargs-form
                  (when default-initargs-forms

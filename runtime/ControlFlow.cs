@@ -160,4 +160,27 @@ public class LispSourceException : Exception
         }
         return sb.ToString().TrimEnd();
     }
+
+    /// MSBuild canonical diagnostic so IDEs (VS / Rider / VS Code) surface the
+    /// error in their Error List with click-to-navigate (dotcl/dotcl#48):
+    ///   file(line): error DOTCL: message
+    ///     from outer(line)
+    /// The innermost (deepest) frame — where compilation actually failed — is the
+    /// clickable canonical error; outer frames are informational `from` lines.
+    public string FormatMsBuildDiagnostic()
+    {
+        var chain = new System.Collections.Generic.List<(string file, int line)>();
+        Exception cur = this;
+        while (cur is LispSourceException lse)
+        {
+            chain.Add((lse.FilePath, lse.Line));
+            cur = lse.InnerException!;
+        }
+        chain.Reverse();
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine($"{chain[0].file}({chain[0].line}): error DOTCL: {cur.Message}");
+        for (int i = 1; i < chain.Count; i++)
+            sb.AppendLine($"  from {chain[i].file}({chain[i].line})");
+        return sb.ToString().TrimEnd();
+    }
 }

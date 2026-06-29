@@ -37,7 +37,7 @@
 (format *error-output* "[main.lisp] HelloController defined: ~S~%"
         (find-class 'demo.hello-controller nil))
 
-;;; --- Async endpoint (Task 生成側) -------------------------------
+;;; --- Async endpoint (Task producer side) -----------------------
 ;;; A Lisp async handler that returns a .NET Task<LispObject>. Program.cs maps it
 ;;; to a Minimal API route and awaits the Task, writing its result to the response.
 ;;; This exercises the Task-producing side of dotcl:async: an (async ...) block

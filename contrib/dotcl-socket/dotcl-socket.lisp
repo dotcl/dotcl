@@ -37,13 +37,15 @@
 
 (defun socket-accept (server-socket &key binary)
   "Accept a connection on SERVER-SOCKET.
-   Returns a bidirectional CL stream for the accepted connection.
-   When BINARY is true, returns a binary stream for byte-level I/O."
+   Returns a bidirectional CL stream for the accepted connection. The non-binary
+   stream is bivalent (char + byte I/O), as SBCL's socket streams are, so byte-oriented
+   protocol code (read-byte/write-byte) works on it without :binary.
+   When BINARY is true, returns a pure binary stream for byte-level I/O."
   (let* ((client (dotnet:invoke server-socket "AcceptTcpClient"))
          (net-stream (dotnet:invoke client "GetStream")))
     (if binary
         (dotnet:to-stream net-stream :binary t)
-        (dotnet:to-stream net-stream))))
+        (dotnet:to-stream net-stream :bivalent t))))
 
 (defun local-port (server-socket)
   "Return the local port number of SERVER-SOCKET."
@@ -67,11 +69,11 @@
          (net-stream (dotnet:invoke client "GetStream")))
     (if binary
         (dotnet:to-stream net-stream :binary t)
-        (dotnet:to-stream net-stream))))
+        (dotnet:to-stream net-stream :bivalent t))))
 
 (defun socket-stream (socket)
-  "Get a bidirectional CL stream from a raw socket object (TcpClient)."
+  "Get a bidirectional (bivalent: char + byte) CL stream from a raw socket (TcpClient)."
   (let ((net-stream (dotnet:invoke socket "GetStream")))
-    (dotnet:to-stream net-stream)))
+    (dotnet:to-stream net-stream :bivalent t)))
 
 (provide "dotcl-socket")

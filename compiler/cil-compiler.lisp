@@ -148,23 +148,44 @@
    Provides O(1) dispatch for ~250+ common operators in compile-form.")
 
 (defvar *macroexpand-cache* nil
-  "Hash table (form → expansion) for memoizing macro expansions within one
-   top-level compile.  Keyed by eq (cons-cell identity) so that the same
-   source form object is never expanded twice even when it appears in both
-   the analysis pass and the code-gen pass.  NIL outside a compile-toplevel
+  "Hash table (form → ((scope . expansion) ...)) for memoizing macro expansions
+   within one top-level compile.  Keyed by eq (cons-cell identity) on the form so
+   that the same source form object is never expanded twice even when it appears
+   in both the analysis pass and the code-gen pass.  NIL outside a compile-toplevel
    call, which disables caching (eval-time macro calls are not cached).")
 
+(defvar *macroexpand-scope* '()
+  "Stack of enclosing MACROLET scope markers (the source MACRO-DEFS cons of each
+   active macrolet) for the current lexical position.  A single source form
+   spliced — by a macro — into both a shadowing macrolet scope and an outer scope
+   must expand differently in each, but a plain form-keyed cache would reuse the
+   first expansion for both (with-cached-result shadowed in only
+   one of two ,@body splices).  Keying the cache by (form, scope) keeps them
+   apart.  Both the free-variable analysis walk and the code-gen walk push the
+   SAME source cons when entering a given macrolet, so the scope is identical
+   between the two passes — preserving their shared-expansion contract (one
+   expansion object reused across passes, important for gensym identity).")
+
+(defun %macroexpand-scope= (a b)
+  "Identity comparison of two macroexpand scopes (lists of eq markers)."
+  (loop (cond ((eq a b) (return t))
+              ((or (null a) (null b)) (return nil))
+              ((eq (car a) (car b)) (setf a (cdr a) b (cdr b)))
+              (t (return nil)))))
+
 (defun cached-macroexpand (form expander)
-  "Expand FORM using EXPANDER, memoizing the result in *macroexpand-cache*.
-   If the cache is NIL (outside a compile-toplevel) falls through to a plain
-   funcall so that eval / macrolet restore paths are unaffected."
+  "Expand FORM using EXPANDER, memoizing the result per (FORM, *macroexpand-scope*)
+   in *macroexpand-cache*.  If the cache is NIL (outside a compile-toplevel) falls
+   through to a plain funcall so that eval / macrolet restore paths are unaffected."
   (if *macroexpand-cache*
-      (let ((cached (gethash form *macroexpand-cache* :miss)))
-        (if (eq cached :miss)
+      (let* ((by-scope (gethash form *macroexpand-cache* '()))
+             (cell (assoc *macroexpand-scope* by-scope :test #'%macroexpand-scope=)))
+        (if cell
+            (cdr cell)
             (let ((result (funcall expander form)))
-              (setf (gethash form *macroexpand-cache*) result)
-              result)
-            cached))
+              (setf (gethash form *macroexpand-cache*)
+                    (cons (cons *macroexpand-scope* result) by-scope))
+              result)))
       (funcall expander form)))
 
 ;;; TCO (Tail Call Optimization) state — declared here so all compiler files see them as special.
@@ -187,6 +208,21 @@
 (defun gen-label (&optional (prefix "L"))
   "Generate a unique label symbol in the compiler package."
   (intern (format nil "~a_~d" prefix (incf *label-counter*)) "DOTCL.CIL-COMPILER"))
+
+;;; Precomputed "LispFunction.InvokeN" / "InvokeNativeN" method-name strings.
+;;; Every compiled function call emits one of these; building it with (format nil
+;;; "...~D" n) per call was a measurable per-form allocation. Index 0..8 covers
+;;; the direct-call fast path; n>8 (array-arg path) falls back to format.
+(defparameter +invoke-names+
+  (coerce (loop for n from 0 to 8 collect (format nil "LispFunction.Invoke~D" n)) 'vector))
+(defparameter +invoke-native-names+
+  (coerce (loop for n from 0 to 8 collect (format nil "LispFunction.InvokeNative~D" n)) 'vector))
+
+(defun invoke-name (n)
+  "The shared LispFunction.InvokeN method-name string (no per-call format consing)."
+  (if (<= 0 n 8) (svref +invoke-names+ n) (format nil "LispFunction.Invoke~D" n)))
+(defun invoke-native-name (n)
+  (if (<= 0 n 8) (svref +invoke-native-names+ n) (format nil "LispFunction.InvokeNative~D" n)))
 
 (defun compile-sym-lookup (sym)
   "Generate CIL instructions to load a Symbol object for SYM.
@@ -335,6 +371,33 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
              (push (list (symbol-name p) p nil nil nil) key)))
         ((eq state :rest) (setf rest-param p) (setf state :done))))
     (values (nreverse required) (nreverse optional) (nreverse key) rest-param (nreverse aux) allow-other-keys-p has-key-p)))
+
+(defun %check-lambda-call-keywords (op args)
+  "When OP is a (LAMBDA lambda-list ...) with &KEY and no &ALLOW-OTHER-KEYS, warn
+   at compile time about literal unknown keyword arguments in a direct call
+   ((lambda (&key a) a) :b 1) per CLHS 3.5.1.4 (static diagnosis).
+   Only literal keywords are checked; non-literal keyword forms are left to the
+   runtime keyword-validation. A literal :ALLOW-OTHER-KEYS with a non-NIL value in
+   the call suppresses the warning, per CLHS."
+  (when (and (consp op) (eq (car op) 'lambda) (consp (cdr op)) (listp (cadr op)))
+    (multiple-value-bind (required optional key rest-param aux aok-p has-key-p)
+        (parse-lambda-list (cadr op))
+      (declare (ignore aux rest-param))
+      (when (and has-key-p (not aok-p))
+        (let* ((nfixed (+ (length required) (length optional)))
+               (kw-args (when (> (length args) nfixed) (nthcdr nfixed args)))
+               (accepted (mapcar #'car key))) ; symbol-name strings
+          (flet ((aok-name-p (k)
+                   (and (keywordp k) (string= (symbol-name k) "ALLOW-OTHER-KEYS"))))
+            ;; A literal :allow-other-keys <non-nil> in the call permits other keys.
+            (unless (loop for (k v) on kw-args by #'cddr
+                          thereis (and (aok-name-p k) v (not (eq v 'nil))))
+              (loop for k in kw-args by #'cddr
+                    when (and (keywordp k) (not (aok-name-p k))
+                              (not (member (symbol-name k) accepted :test #'string=)))
+                      do (warn "unknown &KEY argument ~S in call to a ~
+                                LAMBDA with keys ~S"
+                               k (mapcar (lambda (n) (intern n :keyword)) accepted))))))))))
 
 (defun lambda-list-keyword-p (sym)
   "Check if symbol is a lambda list keyword."
@@ -495,16 +558,21 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
 ;;; ============================================================
 
 (defun lookup-symbol-macro (sym)
-  "Return the expansion form if SYM is a symbol-macro, else NIL."
-  (or (cdr (assoc sym *symbol-macros* :test #'eq))
-      (and (symbol-package sym)
-           (cdr (assoc (symbol-name sym) *symbol-macros*
-                       :key (lambda (k) (if (and (symbolp k) (symbol-package k))
-                                            (symbol-name k) nil))
-                       :test #'string=)))
-      ;; Check global symbol macros from DEFINE-SYMBOL-MACRO
-      (multiple-value-bind (val found) (gethash sym *global-symbol-macros*)
-        (if found val nil))))
+  "Return (values expansion found-p). FOUND-P distinguishes a symbol-macro whose
+   expansion happens to be NIL (e.g. (symbol-macrolet ((foo nil)) foo)) from an
+   unregistered symbol — both have a NIL expansion, so callers must branch on
+   FOUND-P, not on the expansion's truth value."
+  (let ((cell (or (assoc sym *symbol-macros* :test #'eq)
+                  (and (symbol-package sym)
+                       (assoc (symbol-name sym) *symbol-macros*
+                              :key (lambda (k) (if (and (symbolp k) (symbol-package k))
+                                                   (symbol-name k) nil))
+                              :test #'string=)))))
+    (if cell
+        (values (cdr cell) t)
+        ;; Check global symbol macros from DEFINE-SYMBOL-MACRO
+        (multiple-value-bind (val found) (gethash sym *global-symbol-macros*)
+          (if found (values val t) (values nil nil))))))
 
 (defun compile-var-ref (sym)
   "Compile a variable reference."
@@ -518,8 +586,8 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
                 `((:ldloc ,key) (:call "Fixnum.Make"))
                 `((:ldloc ,key))))
         ;; No local binding — check symbol-macro (let/let* shadow these too)
-        (let ((sm-exp (lookup-symbol-macro sym)))
-          (if sm-exp
+        (multiple-value-bind (sm-exp found) (lookup-symbol-macro sym)
+          (if found
               (compile-expr sm-exp)
               ;; No lexical binding — check special (includes locally declared specials)
               `(,@(compile-sym-lookup sym)
@@ -809,6 +877,7 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
               ;; empty during arg evaluation. CIL requires empty stack at try-block entry;
               ;; loop/return in args would fail if the function is on the stack.
               ((and (consp op) (eq (car op) 'lambda))
+               (%check-lambda-call-keywords op (cdr expr))
                (let ((fn-tmp (gen-local "FN")) (arr-tmp (gen-local "FNARR")))
                  `(,@(compile-expr op)
                    (:castclass "LispFunction")
@@ -1178,7 +1247,7 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
                      (let ((*in-tail-position* nil) (*in-mv-context* nil))
                        (compile-as-long arg)))
                    (cdr expr))
-         (:callvirt ,(format nil "LispFunction.InvokeNative~D" n-args))
+         (:callvirt ,(invoke-native-name n-args))
          (:unbox-fixnum))))
     ;; Declared-fixnum local: load slot (LispObject) then unbox.
     ((and (symbolp expr)
@@ -1516,7 +1585,9 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
           `(,@(compile-as-double (first args)) (:neg) (:newobj "DoubleFloat")))
          ((single-float-typed-p (first args))
           `(,@(compile-as-single (first args)) (:neg) (:conv-r4) (:newobj "SingleFloat")))
-         (t (compile-binary-call (list 0 (first args)) "Runtime.Subtract"))))
+         ;; Unary (- x): Subtract(0, x) would collapse -0.0 (0.0-0.0=+0.0), so use Negate
+         ;; (IEEE sign flip). Needed for signed-zero correctness of conjugate/eql.
+         (t (compile-unary-call (list (first args)) "Runtime.Negate" "-"))))
     (2
      (cond
        ((and (double-float-typed-p (first args)) (double-float-typed-p (second args)))

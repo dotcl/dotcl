@@ -2394,18 +2394,32 @@ public static partial class Runtime
             throw new LispErrorException(new LispTypeError(
                 "DOTNET:TO-STREAM: argument must be a .NET Stream", args[0]));
 
-        // Check for :binary keyword argument
-        bool binary = false;
+        // Check for :binary / :bivalent keyword arguments
+        bool binary = false, bivalent = false;
         for (int i = 1; i < args.Length - 1; i += 2)
         {
-            if (args[i] is Symbol kw && kw.Name == "BINARY" && args[i + 1] != Nil.Instance)
-                binary = true;
+            if (args[i] is Symbol kw && args[i + 1] != Nil.Instance)
+            {
+                if (kw.Name == "BINARY") binary = true;
+                else if (kw.Name == "BIVALENT") bivalent = true;
+            }
         }
 
         if (binary)
             return new LispBinaryStream(netStream);
 
-        var encoding = System.Text.Encoding.UTF8;
+        // Bivalent: a character stream that also serves read-byte/write-byte over the
+        // same NetworkStream (SBCL-style), so byte-oriented protocol code (cl-rpc HTTP/WS)
+        // works on a non-binary socket stream. No read-ahead, so char and byte reads
+        // stay coordinated; UTF-8 with no BOM.
+        if (bivalent)
+            return new LispBidirectionalStream(
+                new BivalentStreamReader(netStream), new BivalentStreamWriter(netStream));
+
+        // BOM-less UTF-8 (encoderShouldEmitUTF8Identifier: false). Encoding.UTF8 emits a
+        // BOM (EF BB BF) on the first write, which corrupts the head of a network/protocol
+        // response (e.g. an HTTP/WebSocket reply written through a non-binary to-stream).
+        var encoding = new System.Text.UTF8Encoding(false);
 
         var reader = new System.IO.StreamReader(netStream, encoding, false, 4096, leaveOpen: true);
         var writer = new System.IO.StreamWriter(netStream, encoding, 4096, leaveOpen: true)

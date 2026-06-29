@@ -54,8 +54,12 @@ public static partial class Runtime
             return T.Instance;
         if (a is Fixnum fa && b is Fixnum fb && fa.Value == fb.Value) return T.Instance;
         if (a is LispChar ca && b is LispChar cb && ca.Value == cb.Value) return T.Instance;
-        if (a is SingleFloat sa && b is SingleFloat sb && sa.Value == sb.Value) return T.Instance;
-        if (a is DoubleFloat da && b is DoubleFloat db && da.Value == db.Value) return T.Instance;
+        // eql compares floats by bit representation (CLHS): (eql 0.0 -0.0)=NIL, bit-identical
+        // NaNs are eql=T. Value compare (==) would give NaN!=NaN, 0.0==-0.0 — a mismatch.
+        if (a is SingleFloat sa && b is SingleFloat sb
+            && Compat.SingleToInt32Bits(sa.Value) == Compat.SingleToInt32Bits(sb.Value)) return T.Instance;
+        if (a is DoubleFloat da && b is DoubleFloat db
+            && BitConverter.DoubleToInt64Bits(da.Value) == BitConverter.DoubleToInt64Bits(db.Value)) return T.Instance;
         if (a is Bignum ba && b is Bignum bb && ba.Value == bb.Value) return T.Instance;
         if (a is Ratio ra && b is Ratio rb && ra.Numerator == rb.Numerator && ra.Denominator == rb.Denominator) return T.Instance;
         if (a is LispComplex xa && b is LispComplex xb)
@@ -67,45 +71,53 @@ public static partial class Runtime
     public static LispObject Equal(LispObject a, LispObject b)
     {
         a = Primary(a); b = Primary(b);
-        if (IsTrueEql(a, b)) return T.Instance;
-        // String comparison: LispString or char-vector — compare by content
-        bool aIsStr = a is LispString || (a is LispVector av && av.IsCharVector);
-        bool bIsStr = b is LispString || (b is LispVector bv && bv.IsCharVector);
-        if (aIsStr && bIsStr)
+        // Loop (not recurse) along the cons spine so a long list can't overflow, and so the
+        // dotted-pair tail re-runs the eql/string/... checks below — the tail of a cons must
+        // be compared with EQUAL too, not eql, e.g. (equal (cons 1 "x") (cons 1 "x")) must be
+        // T even though (eql "x" "x") is NIL. A plain mismatched atom falls through to
+        // the final "return NIL", so this terminates.
+        while (true)
         {
-            string sa = a is LispString las ? las.Value : ((LispVector)a).ToCharString();
-            string sb = b is LispString lbs ? lbs.Value : ((LispVector)b).ToCharString();
-            return sa == sb ? T.Instance : Nil.Instance;
+            if (IsTrueEql(a, b)) return T.Instance;
+            // String comparison: LispString or char-vector — compare by content
+            bool aIsStr = a is LispString || (a is LispVector av && av.IsCharVector);
+            bool bIsStr = b is LispString || (b is LispVector bv && bv.IsCharVector);
+            if (aIsStr && bIsStr)
+            {
+                string sa = a is LispString las ? las.Value : ((LispVector)a).ToCharString();
+                string sb = b is LispString lbs ? lbs.Value : ((LispVector)b).ToCharString();
+                return sa == sb ? T.Instance : Nil.Instance;
+            }
+            // Pathname: compare component-by-component per CLHS
+            if (a is LispPathname pa && b is LispPathname pb)
+            {
+                return IsTruthy(Equal(pa.Host ?? Nil.Instance, pb.Host ?? Nil.Instance))
+                    && IsTruthy(Equal(pa.Device ?? Nil.Instance, pb.Device ?? Nil.Instance))
+                    && IsTruthy(Equal(pa.DirectoryComponent ?? Nil.Instance, pb.DirectoryComponent ?? Nil.Instance))
+                    && IsTruthy(Equal(pa.NameComponent ?? Nil.Instance, pb.NameComponent ?? Nil.Instance))
+                    && IsTruthy(Equal(pa.TypeComponent ?? Nil.Instance, pb.TypeComponent ?? Nil.Instance))
+                    && IsTruthy(Equal(pa.Version ?? Nil.Instance, pb.Version ?? Nil.Instance))
+                    ? T.Instance : Nil.Instance;
+            }
+            // Bit-vector: compare element-by-element
+            if (a is LispVector bva && bva.IsBitVector && b is LispVector bvb && bvb.IsBitVector)
+            {
+                if (bva.Length != bvb.Length) return Nil.Instance;
+                for (int i = 0; i < bva.Length; i++)
+                    if (!IsTrueEql(bva.GetElement(i), bvb.GetElement(i))) return Nil.Instance;
+                return T.Instance;
+            }
+            // Cons: compare CAR recursively, then advance to the CDR and loop (the CDR is then
+            // compared with the same full EQUAL logic on the next iteration).
+            if (a is Cons ca && b is Cons cb)
+            {
+                if (!IsTruthy(Equal(ca.Car, cb.Car))) return Nil.Instance;
+                a = ca.Cdr; b = cb.Cdr;
+                continue;
+            }
+            // Mismatched (one cons / one not) or two non-equal atoms → not EQUAL.
+            return Nil.Instance;
         }
-        // Pathname: compare component-by-component per CLHS
-        if (a is LispPathname pa && b is LispPathname pb)
-        {
-            return IsTruthy(Equal(pa.Host ?? Nil.Instance, pb.Host ?? Nil.Instance))
-                && IsTruthy(Equal(pa.Device ?? Nil.Instance, pb.Device ?? Nil.Instance))
-                && IsTruthy(Equal(pa.DirectoryComponent ?? Nil.Instance, pb.DirectoryComponent ?? Nil.Instance))
-                && IsTruthy(Equal(pa.NameComponent ?? Nil.Instance, pb.NameComponent ?? Nil.Instance))
-                && IsTruthy(Equal(pa.TypeComponent ?? Nil.Instance, pb.TypeComponent ?? Nil.Instance))
-                && IsTruthy(Equal(pa.Version ?? Nil.Instance, pb.Version ?? Nil.Instance))
-                ? T.Instance : Nil.Instance;
-        }
-        // Bit-vector: compare element-by-element
-        if (a is LispVector bva && bva.IsBitVector && b is LispVector bvb && bvb.IsBitVector)
-        {
-            if (bva.Length != bvb.Length) return Nil.Instance;
-            for (int i = 0; i < bva.Length; i++)
-                if (!IsTrueEql(bva.GetElement(i), bvb.GetElement(i))) return Nil.Instance;
-            return T.Instance;
-        }
-        // Iteratively compare cons cells to avoid stack overflow for long lists
-        while (a is Cons ca && b is Cons cb)
-        {
-            if (!IsTruthy(Equal(ca.Car, cb.Car))) return Nil.Instance;
-            a = ca.Cdr;
-            b = cb.Cdr;
-        }
-        if (!(a is Cons) && !(b is Cons))
-            return IsTrueEql(a, b) ? T.Instance : Nil.Instance;
-        return Nil.Instance;
     }
 
     public static bool IsTrueEqual(LispObject a, LispObject b) => Equal(a, b) is not Nil;
@@ -154,11 +166,12 @@ public static partial class Runtime
         if (obj is not Number)
             throw new LispErrorException(new LispTypeError("IMAGPART: argument is not a number", obj, Startup.Sym("NUMBER")));
         if (obj is LispComplex c) return c.Imaginary;
-        // For real numbers: imaginary part is 0 of same float type
+        // For a real x, imagpart is (* 0 x): a signed float zero (negative float → -0.0).
+        // A fixed +0.0 would make (eql (imagpart -1.5) (* 0 -1.5)) mismatch (IMAGPART.4).
         return obj switch
         {
-            SingleFloat _ => new SingleFloat(0f),
-            DoubleFloat _ => new DoubleFloat(0.0),
+            SingleFloat sf => new SingleFloat(0f * sf.Value),
+            DoubleFloat df => new DoubleFloat(0.0 * df.Value),
             _ => Fixnum.Make(0)
         };
     }

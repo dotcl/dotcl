@@ -115,3 +115,42 @@
                   (error "test error from eval")
                 (continue () :report "Continue" nil)))))
   success)
+
+;;; handler-case / handler-bind clauses with COMPOUND type specifiers — (or ...),
+;;; (and ...) — used to be stringified into one bogus symbol and never matched
+;;; (only bare class names worked). Now loaded as a literal for Runtime.Typep.
+(deftest handler-case-or-compound-type
+  (handler-case (car 3)
+    ((or type-error simple-error) () :caught)
+    (error () :missed))
+  :caught)
+
+(deftest handler-case-or-compound-matches-simple-error
+  (handler-case (error "boom")
+    ((or type-error simple-error) () :caught)
+    (error () :missed))
+  :caught)
+
+(deftest handler-case-and-compound-type
+  (handler-case (car 3)
+    ((and error type-error) () :caught)
+    (error () :missed))
+  :caught)
+
+(deftest handler-case-compound-binds-var
+  (handler-case (car 3)
+    ((or type-error simple-error) (e) (type-of e)))
+  type-error)
+
+(deftest handler-bind-or-compound-type
+  (block done
+    (handler-bind (((or type-error simple-error)
+                    (lambda (c) (declare (ignore c)) (return-from done :caught))))
+      (car 3)
+      :missed))
+  :caught)
+
+;; bare class-name clauses must still work (no regression)
+(deftest handler-case-plain-class-clause
+  (handler-case (car 3) (type-error () :caught) (error () :missed))
+  :caught)

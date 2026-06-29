@@ -87,9 +87,9 @@ logcat:
 
 .PHONY: scrcpy
 scrcpy:
-	# scrcpy は winget で Windows PATH に居るが MSYS2 PATH には通って
-	# ない場合があるので、powershell 経由で起動する。MSYS2 側で scrcpy
-	# がコマンドとして見えるなら直接呼んでも OK。
+	# scrcpy (installed via winget) is on the Windows PATH but may not be on the
+	# MSYS2 PATH, so launch it through powershell. If scrcpy is visible as a command
+	# on the MSYS2 side, calling it directly is fine too.
 	powershell.exe -NoProfile -Command "scrcpy $(SCRCPY_FLAGS)"
 
 # --- Cleanup ---
