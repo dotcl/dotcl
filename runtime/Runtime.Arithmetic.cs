@@ -1790,7 +1790,7 @@ public static partial class Runtime
                 LispObject MakeF(double v) => single ? new SingleFloat((float)v) : (LispObject)new DoubleFloat(v);
                 // Use the sign BIT, not (d < 0): -0.0 < 0 is false in IEEE, which dropped
                 // the sign of -0.0. Matches float-sign / integer-decode-float.
-                double signVal = double.IsNegative(d) ? -1.0 : 1.0;
+                double signVal = Compat.IsNegative(d) ? -1.0 : 1.0;
                 d = Math.Abs(d);
                 if (d == 0.0) {
                     return MultipleValues.Values(MakeF(0.0), new Fixnum(0), MakeF(signVal));
