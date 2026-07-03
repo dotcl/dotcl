@@ -9,6 +9,19 @@ on:
       - 'docs/decisions/**'
   pull_request:
     branches: [master]
+  schedule:
+    # Nightly full ANSI+bench for the private repo (03:00 JST = 18:00 UTC). On
+    # push the private repo runs only the cheap gates (see RUN_FULL); the public
+    # mirror runs the full suite on every push (free runners) instead.
+    - cron: '0 18 * * *'
+
+# The D-commit cadence pushes in rapid succession; each push would otherwise
+# spawn a full ~15-min run. Cancel superseded in-flight runs per ref so only the
+# tip finishes — no coverage loss on the landed commit. (Public pushes arrive
+# batched via mirror, so this rarely fires there: full-every-push is preserved.)
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 defaults:
   run:
@@ -18,6 +31,11 @@ jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # Heavy tail (full ANSI + bench) runs on every push in the PUBLIC mirror
+    # (free runners) and nightly in the private repo. Private pushes evaluate to
+    # false and run only the cheap gates below.
+    env:
+      RUN_FULL: ${{ github.repository == 'dotcl/dotcl' || github.event_name == 'schedule' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -56,11 +74,20 @@ jobs:
       - name: Regression tests
         run: make test-regression
 
+      # Cheap tripwire (~25s): compile the emit-free netstandard2.0 runtime that
+      # AOT/WebGL link against. `make build` only builds the dev net10 runner, so
+      # an ns2.0-only break (unguarded Reflection.Emit / broken DOTCL_NO_JSON)
+      # would otherwise surface only in a heavy AOT/IL2CPP build. Both repos,
+      # every push.
+      - name: Build emit-free ns2.0 runtime (tripwire)
+        run: make build-ns2
+
       - name: ANSI tests
+        if: env.RUN_FULL == 'true'
         run: make test-ansi-all STDBUF="stdbuf -oL" 2>&1 | tee /tmp/ansi-summary.txt || true
 
       - name: Generate failure details
-        if: always()
+        if: ${{ always() && env.RUN_FULL == 'true' }}
         run: |
           for f in /tmp/ansi-*.txt; do
             [ -f "$f" ] || continue
@@ -68,7 +95,7 @@ jobs:
           done > /tmp/ansi-failures.txt || true
 
       - name: Upload test outputs
-        if: always()
+        if: ${{ always() && env.RUN_FULL == 'true' }}
         uses: actions/upload-artifact@v4
         with:
           name: ansi-test-outputs
@@ -78,9 +105,11 @@ jobs:
             /tmp/ansi-summary.txt
 
       - name: Update ansi-state.json
+        if: env.RUN_FULL == 'true'
         run: make update-ansi-state
 
       - name: Benchmarks
+        if: env.RUN_FULL == 'true'
         run: make bench-state || true
 
       - name: Disk usage (after)
@@ -88,7 +117,7 @@ jobs:
         run: df -h / && du -sh /tmp/ansi-*.txt 2>/dev/null || true
 
       - name: Show results
-        if: always()
+        if: ${{ always() && env.RUN_FULL == 'true' }}
         run: |
           {
             echo "## ANSI Test Results"

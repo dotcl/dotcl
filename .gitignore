@@ -67,6 +67,7 @@ sandbox/
 docs/*
 !docs/decisions/
 !docs/talks/
+!docs/images/
 out/
 runtime/contrib/
 contrib/asdf/

@@ -1333,9 +1333,11 @@
   #x03B1)
 
 (deftest d976-char-name-ucd
-  ;; char-name returns the UCD name (_charNames entries take priority: Space stays "Space")
+  ;; char-name returns the UCD name with underscores so #\<name> reads back as one
+  ;; token (_charNames entries take priority: Space stays "Space"). name-char still
+  ;; accepts the spaced form too (d976-name-char-ucd-spaces).
   (char-name (code-char 97))
-  "LATIN SMALL LETTER A")
+  "LATIN_SMALL_LETTER_A")
 
 (deftest d976-charnames-priority
   ;; _charNames entries take priority over UCD
@@ -3643,3 +3645,635 @@
    (handler-case (progn (compile nil '(lambda () ((lambda (&key a) a) :a 1))) :no-warn)
      (warning () :warned)))
   (:warned :no-warn))
+
+;; defstruct (:print-function fn) / (:print-object fn): the printer name was
+;; spliced UNQUOTED into the generated print-object method's funcall, so it was
+;; referenced as a variable (unbound) instead of a function — the printer never
+;; ran and output fell back to #S(...). Wrapping in (function ...) fixes both
+;; symbol and lambda forms. (fset's containers print via :print-function.)
+(defun rf423-pf (obj stream depth) (declare (ignore depth)) (format stream "<PF:~A>" (rf423a-n obj)))
+(defstruct (rf423a (:print-function rf423-pf)) (n 0))
+(defun rf423-po (obj stream) (format stream "<PO:~A>" (rf423b-n obj)))
+(defstruct (rf423b (:print-object rf423-po)) (n 0))
+(defstruct (rf423c (:print-object (lambda (o s) (format s "<L:~A>" (rf423c-n o))))) (n 0))
+(defstruct rf423d (n 0))
+
+(deftest defstruct-print-function-object-options
+  (list (prin1-to-string (make-rf423a :n 7))
+        (prin1-to-string (make-rf423b :n 9))
+        (prin1-to-string (make-rf423c :n 3))
+        (prin1-to-string (make-rf423d :n 5)))
+  ("<PF:7>" "<PO:9>" "<L:3>" "#S(RF423D :N 5)"))
+
+;; pprint-logical-block :prefix/:per-line-prefix/:suffix must print regardless of
+;; *print-pretty* (CLHS) — only dynamic newline/indent is gated on pretty. The
+;; macro wrongly wrapped the prefix/suffix write-string in (when *print-pretty* ...),
+;; so under *print-pretty*=NIL (e.g. with-standard-io-syntax) the delimiters
+;; vanished. (fset containers print their #{...} delimiters via this path.)
+(defun rf424 (pretty)
+  (let ((*print-pretty* pretty))
+    (with-output-to-string (s)
+      (pprint-logical-block (s nil :prefix "[" :suffix "]")
+        (write-string "x" s) (write-char #\Space s)
+        (pprint-newline :fill s) (write-string "y" s)))))
+
+(deftest pprint-logical-block-prefix-suffix-without-pretty
+  (list (rf424 t) (rf424 nil)
+        (let ((*print-pretty* nil))
+          (with-output-to-string (s)
+            (pprint-logical-block (s nil :per-line-prefix "; " :suffix "!")
+              (write-string "a" s)))))
+  ("[x y]" "[x y]" "; a!"))
+
+;; eql-specialized GF dispatch: the monomorphic dispatch cache keyed by arg CLASS
+;; ignored the eql VALUE, so two calls with same-class but different eql values
+;; (e.g. (cv :seq x) vs (cv :other x)) shared the cache slot; the class-keyed hit
+;; path then picked the first applicable eql method in definition order (a parent
+;; method) over the most-specific (child) one. Now eql GFs bypass the cache.
+;; (fset's convert uses (eql 'seq)/(eql 'list)/... first args + class 2nd args.)
+(defclass rf425-parent () ())
+(defclass rf425-child (rf425-parent) ())
+(defgeneric rf425-cv (kind obj))
+(defmethod rf425-cv ((kind (eql :seq))   (obj rf425-parent)) :parent)
+(defmethod rf425-cv ((kind (eql :seq))   (obj rf425-child))  :child)
+(defmethod rf425-cv ((kind (eql :other)) (obj rf425-child))  :other)
+
+(deftest eql-gf-dispatch-not-clobbered-by-other-eql-key
+  (let ((c (make-instance 'rf425-child)))
+    (list (rf425-cv :seq c)              ; child
+          (rf425-cv :other c)            ; other (different eql key, same class)
+          (rf425-cv :seq c)              ; must still be child (was :parent)
+          (rf425-cv :seq c)))            ; child even without :other in between
+  (:child :other :child :child))
+
+;; print-object recursion guard was per-CATEGORY (a struct/instance bool), so
+;; nesting a same-category object inside a print-object method (struct-in-struct
+;; or instance-in-instance) suppressed the inner method and fell back to
+;; #S(...)/#<...>. Now it's per-OBJECT (only the SAME object falls back, guarding
+;; self-recursion). (fset's complement-set / set-of-sets print nest this way.)
+(defstruct (rf426si) (v 0))
+(defmethod print-object ((o rf426si) s) (format s "<SI ~A>" (rf426si-v o)))
+(defstruct (rf426so) (x nil))
+(defmethod print-object ((o rf426so) s) (format s "S[") (write (rf426so-x o) :stream s) (format s "]"))
+(defclass rf426ci () ((y :initarg :y)))
+(defmethod print-object ((o rf426ci) s) (format s "C[") (write (slot-value o 'y) :stream s) (format s "]"))
+
+(deftest print-object-nested-same-category
+  (list (format nil "~A" (make-rf426so :x (make-rf426si :v 1)))                 ; struct in struct
+        (format nil "~A" (make-instance 'rf426ci :y (make-instance 'rf426ci :y 7))) ; inst in inst
+        (format nil "~A" (make-instance 'rf426ci :y (make-rf426si :v 2)))        ; struct in inst
+        (format nil "~A" (make-rf426so :x (make-instance 'rf426ci :y 3))))       ; inst in struct
+  ("S[<SI 1>]" "C[C[7]]" "C[<SI 2>]" "S[C[3]]"))
+
+;; dotcl atomic-long: single-cell Interlocked-backed compare-and-swap/incf/decf,
+;; the concurrency primitive bordeaux-threads' atomic-integer backs its counter
+;; with. Basic ops + lock-free correctness under thread contention.
+(deftest atomic-long-basic-ops
+  (let ((a (dotcl:make-atomic-long)))
+    (list (dotcl:atomic-long-value a)        ; 0
+          (dotcl:atomic-long-p a)            ; T
+          (dotcl:atomic-long-incf a 5)       ; 5
+          (dotcl:atomic-long-incf a)         ; 6
+          (dotcl:atomic-long-decf a 2)       ; 4
+          (dotcl:atomic-long-cas a 4 100)    ; T
+          (dotcl:atomic-long-value a)        ; 100
+          (dotcl:atomic-long-cas a 4 200)    ; NIL (4 != 100)
+          (dotcl:atomic-long-value a)        ; 100
+          (dotcl:set-atomic-long-value a 42) ; 42
+          (dotcl:atomic-long-value a)         ; 42
+          (dotcl:atomic-long-value (dotcl:make-atomic-long 7)))) ; 7
+  (0 t 5 6 4 t 100 nil 100 42 42 7))
+
+(deftest atomic-long-thread-safe-increment
+  (let ((a (dotcl:make-atomic-long)) (threads '()))
+    (dotimes (i 4)
+      (push (dotcl:make-thread (lambda () (dotimes (j 25000) (dotcl:atomic-long-incf a))))
+            threads))
+    (dolist (th threads) (dotcl:thread-join th))
+    (dotcl:atomic-long-value a))
+  100000)
+
+;; read (token accumulation) must cross make-concatenated-stream component
+;; boundaries — it stopped at the first component's EOF while read-char/peek-char
+;; crossed correctly. GetTextReader now returns a spanning reader for concatenated
+;; streams. (babel's #\ reader builds a concatenated stream and re-reads the token.)
+(defun rf427 (&rest parts)
+  (read (apply #'make-concatenated-stream (mapcar #'make-string-input-stream parts))))
+
+(deftest read-crosses-concatenated-stream-boundary
+  (list (rf427 "S" "UB") (rf427 "SU" "B") (rf427 "" "SUB") (rf427 "S" "U" "B")
+        ;; multiple objects across one boundary
+        (let ((s (make-concatenated-stream (make-string-input-stream "(a b")
+                                           (make-string-input-stream " c) 42"))))
+          (list (read s) (read s))))
+  (sub sub sub sub ((a b c) 42)))
+
+;; A custom #\ dispatch-macro-character (even one that just delegates to the
+;; built-in reader via get-dispatch-macro-character) over-consumed: after a #\x
+;; element the rest of the list was swallowed. Cause: get-dispatch-macro-character's
+;; wrapper ran the built-in reader on a FRESH throwaway Reader, so the longest-match
+;; look-ahead push-back in ReadCharacterLiteral was buffered there and discarded
+;; instead of re-read by the enclosing read. The handler now reuses the read's live
+;; reader. (babel's #\u<hex> reader delegates this way.)
+;; Build inputs with code-char to dodge #\ escaping. 35=# 92=\ 40=( 41=) 32=space.
+(deftest custom-sharp-backslash-delegation-no-overconsume
+  (flet ((s (codes) (map 'string #'code-char codes)))
+    (let* ((rt (copy-readtable))
+           (orig (get-dispatch-macro-character (code-char 35) (code-char 92) rt)))
+      (set-dispatch-macro-character (code-char 35) (code-char 92)
+                                    (lambda (st c n) (funcall orig st c n)) rt)
+      (let ((*readtable* rt))
+        (list (length (read-from-string (s '(40 35 92 97 32 35 92 98 41))))   ; (#\a #\b) -> 2
+              (read-from-string (s '(40 35 92 97 32 102 111 111 41)))          ; (#\a FOO)
+              (read-from-string (s '(40 49 32 35 92 97 41)))))))               ; (1 #\a)
+  (2 (#\a foo) (1 #\a)))
+
+;; A custom #\ reader that wraps the stream in make-concatenated-
+;; stream and delegates to the built-in reader (the pattern babel uses) still
+;; over-consumed: char-name reading scanned ahead over whitespace (for non-standard
+;; multi-word UCD names) and the push-back was lost across the throwaway concat
+;; reader, eating the rest of the list. Fix: #\ reads a SINGLE token (CLHS); UCD
+;; names print/round-trip with underscores (#\LATIN_SMALL_LETTER_A), so no
+;; over-scan. char-name / ~:C / ~@C / prin1 stay mutually consistent (underscores).
+(deftest sharp-backslash-concat-wrapped-no-overconsume
+  (flet ((cs (codes) (map 'string #'code-char codes)))
+    (let* ((rt (copy-readtable))
+           (orig (get-dispatch-macro-character (code-char 35) (code-char 92) rt)))
+      (set-dispatch-macro-character (code-char 35) (code-char 92)
+        (lambda (st c n)
+          (let ((c1 (read-char st)))
+            (funcall orig (make-concatenated-stream
+                           (make-string-input-stream (string c1)) st) c n)))
+        rt)
+      (let ((*readtable* rt))
+        (list (length (read-from-string (cs '(40 35 92 97 32 35 92 98 41))))   ; (#\a #\b) -> 2
+              (read-from-string (cs '(40 35 92 97 32 102 111 111 41)))          ; (#\a FOO)
+              (read-from-string (cs '(40 49 32 35 92 97 41)))))))               ; (1 #\a)
+  (2 (#\a foo) (1 #\a)))
+
+(deftest char-name-print-read-consistency
+  ;; UCD-named char round-trips and ~@c/~S/prin1/char-name agree (all underscores).
+  ;; (#\~:c == ~S is covered by ANSI FORMAT.S.8.)
+  (let ((c (code-char 173)))                        ; SOFT HYPHEN
+    (list (eql c (read-from-string (prin1-to-string c)))
+          (string= (format nil "~@c" c) (prin1-to-string c))
+          (string= (format nil "~@c" c) (format nil "~S" c))
+          (char-name c)))
+  (t t t "SOFT_HYPHEN"))
+
+(deftest sharp-backslash-concat-wrapped-read-suppress
+  ;; Under *read-suppress*, a custom #\ reader (babel pattern) delegating to the
+  ;; built-in over make-concatenated-stream must return NIL (not signal) for unknown
+  ;; char names, AND report the same end position a plain stream does. The fresh
+  ;; Reader created for the wrapped stream must inherit *read-suppress*, and the
+  ;; position must count chars consumed via the stream API across the concat wrap.
+  (flet ((cs (codes) (map 'string #'code-char codes)))
+    (let* ((rt (copy-readtable))
+           (orig (get-dispatch-macro-character (code-char 35) (code-char 92) rt)))
+      (set-dispatch-macro-character (code-char 35) (code-char 92)
+        (lambda (st c n)
+          (let ((c1 (read-char st)))
+            (funcall orig (make-concatenated-stream
+                           (make-string-input-stream (string c1)) st) c n)))
+        rt)
+      (let ((*readtable* rt) (*read-suppress* t))
+        (list (multiple-value-list (read-from-string (cs '(35 92 117 106 117 110 107))))  ; #\ujunk
+              (multiple-value-list (read-from-string (cs '(35 92 117 49 50 122 122))))     ; #\u12zz
+              ;; plain (non-wrapped) reference: same nil/7
+              (multiple-value-list
+               (let ((*readtable* (copy-readtable nil)))
+                 (read-from-string (cs '(35 92 117 106 117 110 107)))))))))
+  ((nil 7) (nil 7) (nil 7)))
+
+;; LOOP arithmetic stepping: the iteration variable is stepped THEN tested, so
+;; after termination it holds the first out-of-bound value (CLHS 6.1.2.1.1,
+;; matching SBCL). A prior "fix" terminated before the step, leaving the variable
+;; one short — which silently broke return-value counts in libraries (e.g. babel's
+;; unibyte encoder `finally (return (- di d-start))`).
+(deftest loop-finally-arith-var-overshoots
+  (list (loop for x from 1 to 5 finally (return x))                ; => 6
+        (loop for i from 0 below 3 finally (return i))             ; => 3
+        (loop for i from 0 upto 3 finally (return i))              ; => 4
+        ;; parallel `and` stepping clause overshoots too (babel's shape)
+        (loop for i fixnum from 0 below 3 and di fixnum from 0
+              do (progn) finally (return di))                      ; => 3
+        (loop for i fixnum from 1 to 5 and di fixnum from 0
+              do (progn) finally (return di))                      ; => 5
+        ;; downward stepping likewise overshoots past the bound
+        (loop for x from 5 downto 1 finally (return x))            ; => 0
+        ;; iteration count itself stays correct
+        (let ((n 0)) (loop for i from 0 below 3 do (incf n)) n))   ; => 3
+  (6 3 4 3 5 0 3))
+
+;; DotNetToLisp must unbox the small integer types (byte/sbyte/short/ushort/
+;; uint/ulong), not just int/long. C# type patterns don't widen, so byte used
+;; to fall through to a boxed LispDotNetObject — aref on a byte[] (UTF-8 codecs,
+;; binary protocols) returned #<DOTNET System.Byte N> instead of a CL integer.
+(deftest dotnet-byte-unboxed
+  (let* ((enc (dotnet:static "System.Text.Encoding" "get_UTF8"))
+         (nb  (dotnet:invoke enc "GetBytes" "ABC")))
+    (list (aref nb 0)                                  ; 65, a real integer
+          (+ (aref nb 0) 1)                            ; arithmetic works -> 66
+          (typep (aref nb 0) '(unsigned-byte 8))       ; T
+          (let ((a (dotnet:make-array "System.Byte" 1)))
+            (setf (aref a 0) 200) (aref a 0))          ; 200
+          (dotnet:static "System.Convert" "ToUInt16" 40000)))  ; ushort scalar -> 40000
+  (65 66 t 200 40000))
+
+;; Symmetric store side: LispToDotNet must convert a Fixnum to the small integer
+;; types (sbyte/short/ushort/uint/ulong), not just int/long/byte. Without these a
+;; (setf (aref a i) n) into a make-array of those types failed with
+;; "Cannot convert Fixnum to SByte". Completes the byte[] round-trip.
+(deftest dotnet-store-small-int-types
+  (flet ((rt (ty v) (let ((a (dotnet:make-array ty 1)))
+                      (setf (aref a 0) v) (aref a 0))))
+    (list (rt "System.SByte" 100)
+          (rt "System.SByte" -5)
+          (rt "System.Int16" 30000)
+          (rt "System.UInt16" 40000)
+          (rt "System.UInt32" 100)
+          (rt "System.UInt64" 100)
+          (dotnet:static "System.Convert" "ToSByte" 9)))   ; sbyte reflection param
+  (100 -5 30000 40000 100 100 9))
+
+;; Extended require phase 1: register-assembly-path / register-native-path populate
+;; the resolver tables the Default ALC's Resolving / ResolvingUnmanagedDll hooks
+;; consult. (Full managed+native resolution against a real NuGet package is verified
+;; manually — see D-file — since it needs a machine-local nupkg; here we assert the
+;; registration API contract: callable, accepts (name path), returns the path.)
+(deftest dotcl-register-resolver-paths-api
+  (list (dotcl:register-assembly-path "Dotcl.Test.Asm" "/tmp/dotcl-test/Asm.dll")
+        (dotcl:register-native-path "dotcl-test-native" "/tmp/dotcl-test/libnative.so"))
+  ("/tmp/dotcl-test/Asm.dll" "/tmp/dotcl-test/libnative.so"))
+
+;;; read-sequence into a LIST from a binary stream must read bytes, not chars.
+;;; The Cons destination branch previously always went through a TextReader,
+;;; so a list target read characters even from an (unsigned-byte 8) stream.
+(defun %read-sequence-binary-list ()
+  (let ((tmp (format nil "~a/dotcl-rsbin-~a.bin"
+                     (or (dotcl:getenv "TEMP") "/tmp")
+                     (get-internal-real-time))))
+    (with-open-file (out tmp :direction :output :element-type '(unsigned-byte 8)
+                             :if-exists :supersede)
+      (dolist (b '(208 151 208 176 209)) (write-byte b out)))
+    (prog1
+        (let ((lst (make-list 5)))
+          (with-open-file (in tmp :element-type '(unsigned-byte 8))
+            (read-sequence lst in))
+          lst)
+      (ignore-errors (delete-file tmp)))))
+
+(deftest read-sequence-binary-into-list
+  (%read-sequence-binary-list)
+  (208 151 208 176 209))
+
+;;; A character stream + list target still reads characters (no regression).
+(defun %read-sequence-char-list ()
+  (let ((tmp (format nil "~a/dotcl-rschar-~a.txt"
+                     (or (dotcl:getenv "TEMP") "/tmp")
+                     (get-internal-real-time))))
+    (with-open-file (out tmp :direction :output :if-exists :supersede)
+      (write-string "hello" out))
+    (prog1
+        (let ((lst (make-list 5)))
+          (with-open-file (in tmp)
+            (read-sequence lst in))
+          lst)
+      (ignore-errors (delete-file tmp)))))
+
+(deftest read-sequence-char-into-list
+  (%read-sequence-char-list)
+  (#\h #\e #\l #\l #\o))
+
+;; MV-propagating context must not leak into value-discarding / single-value
+;; positions. (block nil (setf (acc (gethash k h)) v)) compiled the gethash
+;; call without UnwrapMv — block bodies compile with MV propagation on for
+;; their value, and that flag leaked through the setf expansion into
+;; %struct-set's object argument, so STRUCT-SET received a raw multiple-values
+;; wrapper and errored "not a structure". dolist/do/loop expand to block, which
+;; is how SBCL's ucd second-pass (make-host-1) hit it.
+(defstruct %mvleak-foo a)
+(deftest mv-context-not-leaked-into-struct-set
+  (let ((h (make-hash-table)))
+    (setf (gethash 1 h) (make-%mvleak-foo :a 0))
+    (dolist (k '(1)) (setf (%mvleak-foo-a (gethash k h)) 9))
+    (block nil (setf (%mvleak-foo-a (gethash 1 h))
+                     (+ 1 (%mvleak-foo-a (gethash 1 h)))))
+    (%mvleak-foo-a (gethash 1 h)))
+  10)
+
+;; A Lisp reader-macro chain (custom "(" handler -> get-macro-character on #\#
+;; -> built-in dispatch -> Lisp #+ handler) used to create a throwaway Reader
+;; with a ReadSuppress=true baseline inside a #+/#- discard; the dispatch
+;; adapter then installed it as the stream's shared reader, permanently
+;; suppressing every later form on that stream (all read as NIL). This is
+;; SBCL's cold-build xc-readtable shape (read-list + read-targ-feature-expr):
+;; make-host-1 died on the first host fasl with nested #+ under a discard.
+(defun %rdr-suppress-feature-reader (stream sub-character infix-parameter)
+  (declare (ignore infix-parameter))
+  (let ((feature (let ((*package* (find-package "KEYWORD"))
+                       (*read-suppress* nil))
+                   (read stream t nil t))))
+    (if (and (eq feature :yes) (char= sub-character #\+))
+        (read stream t nil t)
+        (let ((*read-suppress* t))
+          (read stream t nil t)
+          (values)))))
+(defun %rdr-suppress-read-list (stream ignore)
+  (declare (ignore ignore))
+  (let* ((read-suppress *read-suppress*)
+         (list (list nil))
+         (tail list))
+    (loop
+      (when (eq (peek-char t stream t nil t) #\))
+        (read-char stream)
+        (return (cdr list)))
+      (let* ((char (read-char stream t nil t))
+             (function (get-macro-character char)))
+        (multiple-value-bind (object skipped)
+            (if function
+                (multiple-value-call (lambda (&rest args)
+                                       (if (null args)
+                                           (values nil t)
+                                           (values (first args) nil)))
+                  (funcall function stream char))
+                (progn (unread-char char stream)
+                       (read stream t nil t)))
+          (when (and (not skipped) (not read-suppress))
+            (setq tail (cdr (rplacd tail (list object))))))))))
+(deftest reader-suppress-not-stuck-after-nested-conditional
+  (let ((rt (copy-readtable)))
+    (set-dispatch-macro-character #\# #\+ #'%rdr-suppress-feature-reader rt)
+    (set-macro-character #\( #'%rdr-suppress-read-list nil rt)
+    (let ((*readtable* rt))
+      (with-input-from-string (s "#+nope (progn #+other (b) (c))
+(list :first 1)
+(list :second 2)")
+        (list (read s) (read s)))))
+  ((list :first 1) (list :second 2)))
+
+;; throw's result-form values must reach the catch as multiple values even
+;; when the throw sits in a non-last (value-discarding) position — after the
+;; MV-context tightening the values were unwrapped to one. (ANSI CATCH.7/8)
+(deftest throw-values-through-catch
+  (list (multiple-value-list (catch 'foo 'a (throw 'foo (values)) 'c))
+        (multiple-value-list (catch 'foo 'a (throw 'foo (values 1 2 3)) 'c)))
+  (nil (1 2 3)))
+
+;; A symbol-macro whose expansion rebinds its own name in a LET must not be
+;; re-expanded inside that let (CLHS 3.1.2.1.1). The mutated/captured-vars
+;; analysis walkers ignored let shadowing, so such an expansion (the shape of
+;; SBCL's POLICY macro qualities) re-expanded itself once per depth level with
+;; branching — an effectively infinite (2^50) analysis; make-host-1 hung on
+;; compiling knownfun.lisp. Also checks the shadowing semantics themselves.
+(deftest symbol-macro-let-shadow-no-blowup
+  (symbol-macrolet ((q (let ((q 1)) (if (= q 1) 10 q))))
+    (list q (let ((q 5)) q)))
+  (10 5))
+
+;; #n=/#n# across sibling elements must survive compile-file/load when a Lisp
+;; "(" reader macro assembles the form via per-element (read stream) calls
+;; (SBCL's cold-build read-list). CompileFile/Load used to leave their Reader
+;; unlinked from the stream, so ReadFromStream spun up a second Reader whose
+;; per-toplevel-form share-table clearing ran once per ELEMENT — a #1= defined
+;; in one element was cleared before the sibling #1# was read, leaking a raw
+;; placeholder into the fasl constant pool (make-host-1: extra-arg-refs blew
+;; up with "LENGTH: not a sequence").
+(deftest share-labels-survive-lisp-read-list-compile-file
+  (let ((rt (copy-readtable))
+        (src (format nil "~a/dotcl-sharelbl-~a.lisp"
+                     (or (dotcl:getenv "TEMP") "/tmp")
+                     (get-internal-real-time))))
+    (set-macro-character #\( #'%rdr-suppress-read-list nil rt)
+    (with-open-file (o src :direction :output :if-exists :supersede)
+      (write-string
+       "(defun %share-lbl-probe (name) (string= name #1=\"OPERAND-PARSE-TEMP\" :end1 (min (length name) (length #1#))))"
+       o))
+    (prog1
+        (progn
+          (let ((*readtable* rt))
+            (load (compile-file src)))
+          (list (%share-lbl-probe "OPERAND-PARSE-TEMP")
+                (%share-lbl-probe "XY")))
+      (ignore-errors (delete-file src))))
+  (t nil))
+
+;; INTERN / FIND-SYMBOL of "NIL" (and "T") in COMMON-LISP must return the
+;; canonical NIL/T objects, not the raw package-table Symbol entries. The raw
+;; entry was a "second NIL" that EQ/NULL accepted but proper-list checks
+;; rejected: (cons 'a (intern "NIL" "CL")) printed as (A . NIL) and MAPCAR
+;; signalled "not a proper list" (hit by SBCL's UNCROSS during make-host-1).
+(deftest intern-nil-is-canonical
+  (let ((x (intern "NIL" "COMMON-LISP"))
+        (y (find-symbol "T" "COMMON-LISP")))
+    (list (type-of x) (mapcar #'identity (cons 'a x)) (type-of y)
+          (multiple-value-list (find-symbol "NIL" "COMMON-LISP"))))
+  (null (a) boolean (nil :external)))
+
+;; A local function named NIL must be callable from a sibling labels function
+;; (ANSI LABELS.24). The labels-box capture path excluded head=NIL, so the
+;; sibling's closure never captured the __LABELFN_NIL box and the call fell
+;; back to an undefined global. Exposed when INTERN started returning the
+;; canonical NIL (the ansi-test symbol list is built via intern).
+(deftest labels-function-named-nil
+  (labels ((nil (x) (foo (1- x)))
+           (foo (y) (if (<= y 0) 'a (nil (1- y)))))
+    (nil 10))
+  a)
+
+;; A closure's &key parameter binding a special via ((:key *var*) default)
+;; emitted a 3-argument call to the 4-argument Runtime.FindKeyArgByName —
+;; the explicit key-package string was pushed only in the non-closure defun
+;; path — so the closure's IL underflowed the stack and the JIT rejected the
+;; whole method (InvalidProgramException at first call). SBCL's
+;; sb-xc:compile-file (a flet-captured defun with such keys) hit this at
+;; make-host-2 stem 1.
+(defvar *cks-var* nil)
+(deftest closure-key-special-binding
+  (let ((f (funcall (lambda (x)
+                      (lambda (&key ((:verbose *cks-var*) *cks-var*)
+                                    (plain 0 plain-p))
+                        (list x *cks-var* plain plain-p)))
+                    1)))
+    (list (funcall f :verbose 2 :plain 3)
+          (funcall f)
+          (let ((*cks-var* 9)) (funcall f))))
+  ((1 2 3 t) (1 nil 0 nil) (1 9 0 nil)))
+
+;; (setf (pkg:macro-function ...)) via a non-CL symbol named MACRO-FUNCTION
+;; (e.g. SB-XC:MACRO-FUNCTION) was expanded to a no-op that only evaluated
+;; the value form: the *setf-expanders* table is keyed by symbol NAME, and
+;; the non-CL branch protected dotcl's *macros* table by dropping the store
+;; entirely. SBCL's cross-compiler registers every sb-xc:defmacro
+;; through its own (defun (setf macro-function) ...), so no target macro
+;; ever reached the XC globaldb and make-host-2 died at stem 1 with
+;; "Ref to undefined variable */SHOW*". The store must delegate to the
+;; place's own #'(setf pkg:macro-function).
+(defpackage "SETF-MF-SHADOW-TEST" (:use))
+(defvar *smf-store* nil)
+(defun (setf setf-mf-shadow-test::macro-function) (new name &optional env)
+  (setq *smf-store* (list new name env))
+  new)
+(deftest setf-non-cl-macro-function-delegates
+  (let ((fn (lambda (form env) (declare (ignore env)) form)))
+    (setq *smf-store* nil)
+    (setf (setf-mf-shadow-test::macro-function 'smf-target) fn)
+    (list (eq (first *smf-store*) fn)
+          (second *smf-store*)
+          (third *smf-store*)
+          ;; dotcl's own macro table must stay untouched
+          (and (cl:macro-function 'smf-target) t)))
+  (t smf-target nil nil))
+
+;; CL scoping is by symbol identity, but dotcl's free-variable analysis and
+;; closure-capture machinery key locals by symbol-name STRING. An uninterned
+;; binding with the same name as an interned variable — SBCL's XC gensym is
+;; (make-symbol "CONSTRAINTS") with no counter, so its once-only temps all
+;; print as #:CONSTRAINTS — made the closure capture the gensym's value
+;; (a vector) where the user body referenced the interned hash-table:
+;; make-host-2 stem 6 died with "GETHASH: not a hash-table" inside
+;; JOIN-EQUALITY-CONSTRAINTS. Fixed by VAR-NAME: uninterned variable symbols
+;; get a unique stable effective name throughout analysis and capture.
+(defmacro uninterned-shadow-closure (&body body)
+  (let ((g (make-symbol "CONSTRAINTS")))
+    `(let ((,g (vector 1 2 3)))
+       (flet ((body () ,@body))
+         (when ,g (body))))))
+(deftest uninterned-binding-must-not-shadow-interned-var
+  (let ((constraints (make-hash-table :test #'equal)))
+    (setf (gethash 'k constraints) 'hit)
+    (uninterned-shadow-closure (values (gethash 'k constraints))))
+  hit)
+
+(defmacro uninterned-shadow-nested ()
+  (let ((g1 (make-symbol "C"))
+        (g2 (make-symbol "C")))
+    `(let ((,g1 :one))
+       (let ((,g2 :two))
+         (funcall (lambda () (list ,g1 ,g2 c)))))))
+(deftest same-named-gensyms-stay-distinct-in-closure
+  (let ((c :outer))
+    (uninterned-shadow-nested))
+  (:one :two :outer))
+
+;; labels mutual-TCO inlines each label body as a dispatch section whose
+;; params live in plain shared locals — but the section inherited the OUTER
+;; scope's *boxed-vars* / numeric type-locals. A label param named like a
+;; boxed outer variable (here TYPE, boxed because the labels closures
+;; capture it) compiled its references as box-derefs of a raw value:
+;; SBCL's simplify-vector-type returned garbage / threw
+;; ArrayTypeMismatchException at make-host-2 stem 6. The per-name context
+;; lists must be shadowed for the section params.
+(defun mtco-shadow-boxed-param (type)
+  (labels ((process (types)
+             (let (acc)
+               (dolist (type types)
+                 (multiple-value-bind (a) (simplify-mtco type)
+                   (push a acc)))
+               (values (nreverse acc) :compound)))
+           (simplify-mtco (type)
+             (cond ((consp type) (process type))
+                   (t (values type :atom)))))
+    (simplify-mtco type)))
+(deftest labels-mutual-tco-param-shadows-boxed-outer
+  (list (multiple-value-list (mtco-shadow-boxed-param 'x))
+        (multiple-value-list (mtco-shadow-boxed-param '(a (b) c))))
+  ((x :atom) ((a (b) c) :compound)))
+
+;; A :key function returning multiple values handed its raw MvReturn wrapper
+;; to :test / comparisons in the C# sequence functions (only the primary
+;; value may flow, CLHS 3.1.7). SBCL's XC %find-position calls POSITION with
+;; :key #'parse-optional-arg-spec (4 values) and :test #'string= — STRING=
+;; got the MvReturn and died at make-host-2 stem 8. Same class: REDUCE's
+;; function result fed back as the accumulator unwrapped.
+(defun mv-key (x) (values (car x) (cadr x)))
+(deftest seq-key-fn-multiple-values-primary-only
+  (list (position 'b '((a 1) (b 2) (c 3)) :key #'mv-key)
+        (find 'c '((a 1) (b 2) (c 3)) :key #'mv-key)
+        (count 'b '((a 1) (b 2) (b 3)) :key #'mv-key)
+        (remove 'b '((a 1) (b 2) (c 3)) :key #'mv-key)
+        (member 'b '((a 1) (b 2)) :key #'mv-key))
+  (1 (c 3) 2 ((a 1) (c 3)) ((b 2))))
+(deftest reduce-fn-multiple-values-primary-only
+  (reduce (lambda (a b) (values (+ a b) :junk)) '(1 2 3 4))
+  10)
+(deftest position-mv-key-with-string-test
+  (position "B" '((a 1) (b 2)) :key (lambda (x) (values (car x) x)) :test #'string=)
+  1)
+
+;; (setf (pkg:compiler-macro-function ...)) via a non-CL symbol named
+;; COMPILER-MACRO-FUNCTION (e.g. SB-XC:COMPILER-MACRO-FUNCTION) was hijacked
+;; into dotcl's own compiler-macro table (%register-compiler-macro-rt),
+;; never reaching the place's own #'(setf pkg:compiler-macro-function) —
+;; same shape as the MACRO-FUNCTION no-op fixed earlier.
+(defpackage "SETF-CMF-SHADOW-TEST" (:use))
+(defvar *scmf-store* nil)
+(defun (setf setf-cmf-shadow-test::compiler-macro-function) (new name &optional env)
+  (setq *scmf-store* (list new name env))
+  new)
+(deftest setf-non-cl-compiler-macro-function-delegates
+  (let ((fn (lambda (form env) (declare (ignore env)) form)))
+    (setq *scmf-store* nil)
+    (setf (setf-cmf-shadow-test::compiler-macro-function 'scmf-target) fn)
+    (list (eq (first *scmf-store*) fn)
+          (second *scmf-store*)
+          (third *scmf-store*)
+          ;; dotcl's own compiler-macro table must stay untouched
+          (and (cl:compiler-macro-function 'scmf-target) t)))
+  (t scmf-target nil nil))
+
+;; MAP's :vector result-type branch read the third element of ANY compound
+;; spec as a length constraint. For ARRAY/SIMPLE-ARRAY that position is a
+;; RANK (or dimension list) per CLHS: (simple-array (unsigned-byte 32) 1)
+;; means rank 1 / any length, but MAP signaled TYPE-ERROR unless the result
+;; had length 1. SBCL's perfectly-hashable maps key hashes into exactly that
+;; type — make-host-2 stem 22 (src/compiler/policy) died in the debugger.
+(deftest map-simple-array-rank-spec
+  (list (length (map '(simple-array (unsigned-byte 32) 1) #'identity '(1 2 3)))
+        (length (map '(simple-array (unsigned-byte 32) (3)) #'identity '(1 2 3)))
+        (handler-case (progn (map '(simple-array t (5)) #'identity '(1 2 3)) :no-error)
+          (type-error () :len-checked))
+        (handler-case (progn (map '(array t 2) #'identity '(1 2 3)) :no-error)
+          (type-error () :rank-checked))
+        (length (map '(vector t 3) #'identity '(1 2 3))))
+  (3 3 :len-checked :rank-checked 3))
+
+;; NSUBST / NSUBST-IF / NSUBST-IF-NOT were aliases of their non-destructive
+;; SUBST counterparts. Callers that mutate a tree in place and discard the
+;; return value — SBCL's propagate-lvar-annotations nsubsts annotation dep
+;; lists when lvars are substituted — silently kept the old tree: the deps
+;; pointed at dead lvars (derived type NIL) and every funarg call-type check
+;; in the XC warned "called with (NIL ...)", failing make-host-2 stem 26.
+(deftest nsubst-is-destructive
+  (let ((tree (list 'a (list 'b 'a) 'c)))
+    (nsubst 'z 'a tree)
+    tree)
+  (z (b z) c))
+(deftest nsubst-if-is-destructive
+  (let ((tree (list 1 (list 2 3) 4)))
+    (nsubst-if 'e (lambda (x) (eql x 3)) tree)
+    tree)
+  (1 (2 e) 4))
+(deftest nsubst-if-not-root-replacement
+  (nsubst-if-not 'z #'consp (list 1 2))
+  (z z . z))
+
+;; The deftype expander table was keyed by symbol NAME, so a non-CL deftype
+;; whose name matches a built-in type could never be resolved: registration
+;; deliberately SKIPPED the SB-XC package (it would have hijacked CL:COMPLEX
+;; for everyone), so (typep x 'sb-xc:complex) ignored SBCL's host-side
+;; (deftype complex () 'complexnum) and make-host-2 stem 64 failed to dump
+;; #C(0.0 0.0) flonums. Non-CL deftypes now register under "PKG::NAME" and
+;; shadow built-ins for their own symbol only.
+(defpackage "DTS-TEST" (:use))
+(defstruct dts-num (v 0))
+(deftype dts-test::complex () 'dts-num)
+(deftype dts-test::number () '(or cl:real dts-test::complex))
+(deftest non-cl-deftype-shadows-builtin-for-own-symbol
+  (let ((x (make-dts-num)))
+    (list (and (typep x 'dts-test::complex) t)
+          (and (typep x 'dts-test::number) t)
+          (typep x 'cl:complex)
+          (and (typep #C(1 2) 'cl:complex) t)
+          (typep #C(1 2) 'dts-test::complex)))
+  (t t nil t nil))

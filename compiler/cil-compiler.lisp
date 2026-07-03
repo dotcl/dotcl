@@ -205,6 +205,26 @@
   "Generate a unique local variable symbol in the compiler package."
   (intern (format nil "~a_~d" prefix (incf *var-counter*)) "DOTCL.CIL-COMPILER"))
 
+(defvar *uninterned-var-names* (make-hash-table :test #'eq)
+  "Uninterned variable symbol -> unique effective-name string.")
+(defvar *uninterned-var-counter* 0)
+
+(defun var-name (sym)
+  "Effective name string of a variable symbol for the string-keyed
+   locals/free-var/capture machinery. Interned symbols use SYMBOL-NAME
+   (cross-package name matching is intentional). Uninterned symbols get a
+   unique stable name, because CL scoping is by symbol identity: two
+   same-named gensyms — e.g. SBCL's (make-symbol \"CONSTRAINTS\") which
+   deliberately omits a counter — are distinct variables, and one must not
+   shadow the other (or an interned variable of the same name) in closure
+   capture."
+  (if (symbol-package sym)
+      (symbol-name sym)
+      (or (gethash sym *uninterned-var-names*)
+          (setf (gethash sym *uninterned-var-names*)
+                (format nil "~a#:~d" (symbol-name sym)
+                        (incf *uninterned-var-counter*))))))
+
 (defun gen-label (&optional (prefix "L"))
   "Generate a unique label symbol in the compiler package."
   (intern (format nil "~a_~d" prefix (incf *label-counter*)) "DOTCL.CIL-COMPILER"))
@@ -273,22 +293,21 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
 (defun lookup-local (sym)
   "Look up a variable in *locals* by symbol identity first, then name fallback."
   ;; Use eq for identity first.
-  ;; Fall back to string= for both interned (cross-package CL/CL-USER compat)
-  ;; and uninterned gensyms (closure env-locals use interned version of gensym name).
+  ;; Fall back to var-name string= for both interned (cross-package CL/CL-USER
+  ;; compat) and uninterned gensyms (closure env-locals use the interned version
+  ;; of the gensym's unique effective name).
   (or (cdr (assoc sym *locals* :test #'eq))
-      (let ((name (symbol-name sym)))
+      (let ((name (var-name sym)))
         (cdr (assoc name *locals*
-                    :key (lambda (k) (if (and (symbolp k) (symbol-package k))
-                                         (symbol-name k) nil))
+                    :key (lambda (k) (if (symbolp k) (var-name k) nil))
                     :test #'string=)))))
 
 (defun local-bound-p (sym)
   "Check if symbol is bound in *locals* or has a boxed entry in *local-functions*."
   (or (assoc sym *locals* :test #'eq)
-      (let ((name (symbol-name sym)))
+      (let ((name (var-name sym)))
         (assoc name *locals*
-               :key (lambda (k) (if (and (symbolp k) (symbol-package k))
-                                    (symbol-name k) nil))
+               :key (lambda (k) (if (symbolp k) (var-name k) nil))
                :test #'string=))
       ;; Also check *local-functions* for boxed labels functions
       ;; (supports closure capture of labels functions whose name clashes with a variable)
@@ -297,9 +316,9 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
               :key #'first :test #'string=))))
 
 (defun boxed-var-p (sym)
-  "Check if a variable needs boxing (by name, cross-package safe)."
-  (member (symbol-name sym) *boxed-vars*
-          :key (lambda (x) (if (symbolp x) (symbol-name x) x))
+  "Check if a variable needs boxing (by effective name, cross-package safe)."
+  (member (var-name sym) *boxed-vars*
+          :key (lambda (x) (if (symbolp x) (var-name x) x))
           :test #'string=))
 
 (defun mangle-name (symbol)
@@ -405,7 +424,8 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
        (member sym '(&rest &body &optional &key &allow-other-keys &aux &whole &environment))))
 
 (defun extract-param-names (params)
-  "Extract variable names (as strings) from a lambda list, handling &optional/&key specs."
+  "Extract variable names (as effective-name strings, see VAR-NAME) from a
+   lambda list, handling &optional/&key specs."
   (let ((names '()) (state :required))
     (dolist (p params)
       (cond
@@ -418,24 +438,24 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
            (t nil)))
         ((eq state :done) nil)
         ((eq state :required)
-         (push (symbol-name p) names))
+         (push (var-name p) names))
         ((eq state :rest)
-         (push (symbol-name p) names) (setf state :done))
+         (push (var-name p) names) (setf state :done))
         ((eq state :optional)
-         (push (symbol-name (if (consp p) (car p) p)) names)
+         (push (var-name (if (consp p) (car p) p)) names)
          ;; supplied-p variable (third element of optional spec)
          (when (and (consp p) (caddr p))
-           (push (symbol-name (caddr p)) names)))
+           (push (var-name (caddr p)) names)))
         ((eq state :key)
          (if (consp p)
              (let ((spec (car p)))
-               (push (symbol-name (if (consp spec) (cadr spec) spec)) names)
+               (push (var-name (if (consp spec) (cadr spec) spec)) names)
                ;; supplied-p variable (third element of key spec)
                (when (caddr p)
-                 (push (symbol-name (caddr p)) names)))
-             (push (symbol-name p) names)))
+                 (push (var-name (caddr p)) names)))
+             (push (var-name p) names)))
         ((eq state :aux)
-         (push (symbol-name (if (consp p) (car p) p)) names))))
+         (push (var-name (if (consp p) (car p) p)) names))))
     (nreverse names)))
 
 (defun scan-lambda-list-defaults (params bound free-ht)
@@ -454,7 +474,7 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
            (&aux (setf state :aux))
            (t nil)))
         ((eq state :required)
-         (push (symbol-name p) progressive-bound))
+         (push (var-name p) progressive-bound))
         ((member state '(:optional :key :aux))
          (when (consp p)
            (let ((default-form (cadr p)))
@@ -463,12 +483,12 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
          ;; After evaluating default, this param is now visible to subsequent defaults
          (let ((name (if (consp p) (car p) p)))
            (when (consp name) (setf name (cadr name))) ;; &key ((keyword var) default)
-           (push (symbol-name name) progressive-bound))
+           (push (var-name name) progressive-bound))
          ;; Also add supplied-p var if present
          (when (and (consp p) (caddr p))
-           (push (symbol-name (caddr p)) progressive-bound)))
+           (push (var-name (caddr p)) progressive-bound)))
         ((eq state :rest)
-         (push (symbol-name p) progressive-bound))))))
+         (push (var-name p) progressive-bound))))))
 
 ;;; ============================================================
 ;;; Instruction builders (thin wrappers for readability)
@@ -564,9 +584,9 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
    FOUND-P, not on the expansion's truth value."
   (let ((cell (or (assoc sym *symbol-macros* :test #'eq)
                   (and (symbol-package sym)
-                       (assoc (symbol-name sym) *symbol-macros*
+                       (assoc (var-name sym) *symbol-macros*
                               :key (lambda (k) (if (and (symbolp k) (symbol-package k))
-                                                   (symbol-name k) nil))
+                                                   (var-name k) nil))
                               :test #'string=)))))
     (if cell
         (values (cdr cell) t)
@@ -582,7 +602,7 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
         (if (boxed-var-p sym)
             `((:ldloc ,key) (:ldc-i4 0) (:ldelem-ref))
             (if (and (boundp '*long-locals*) *long-locals*
-                     (member (symbol-name sym) *long-locals* :test #'string=))
+                     (member (var-name sym) *long-locals* :test #'string=))
                 `((:ldloc ,key) (:call "Fixnum.Make"))
                 `((:ldloc ,key))))
         ;; No local binding — check symbol-macro (let/let* shadow these too)
@@ -941,7 +961,19 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
                `(,@(compile-args-array (cdr expr))
                  (:call "Runtime.InternSymbolV")))
               ;; defmacro: string= match to catch cross-package variants (e.g. SB-XC:DEFMACRO)
-              ((and (symbolp op) (string= (symbol-name op) "DEFMACRO"))
+              ;; — but only when the variant has no macro definition of its own.
+              ;; SBCL's host build defines SB-XC:DEFMACRO as a REAL host macro
+              ;; (src/code/defmacro.lisp) whose expansion registers the macro in
+              ;; the cross-compiler's own env; hijacking it here would instead
+              ;; register e.g. the XC's DEFUN into dotcl's macro table under
+              ;; CL:DEFUN, so host-compiling (defun ...) later in the same build
+              ;; runs the XC's defun-expander (%compiler-defun reads the unbound
+              ;; *IR1-NAMESPACE*). This DEFMACRO special-case remains only as the
+              ;; fallback for variants with no registered expander (whose bridge
+              ;; macro-function would loop forever returning the form unchanged).
+              ((and (symbolp op) (string= (symbol-name op) "DEFMACRO")
+                    (or (eq op 'defmacro)
+                        (not (find-macro-expander op))))
                ;; CLHS 3.4.11: extract docstring (first form if string AND more forms follow).
                ;; Skip during cross-compile (bootstrap concern, see compile-defun handler).
                (let* ((name (cadr expr))
@@ -1028,7 +1060,121 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
        (boundp '*small-int-locals*)
        (not (boxed-var-p expr))
        (lookup-local expr)
-       (cdr (assoc (symbol-name expr) *small-int-locals* :test #'string=))))
+       (cdr (assoc (var-name expr) *small-int-locals* :test #'string=))))
+
+;;; ------------------------------------------------------------
+;;; Numeric-backed array locals: let bindings whose init is a make-array
+;;; with a statically-known rank and a bounded-integer :element-type that
+;;; the runtime stores unboxed (byte[]/ushort[]/int[]/long[]). aref on such
+;;; a local can read/write the element as a raw int64 (Runtime.ArefNum*L),
+;;; and the element's storage range feeds expr-int-range so surrounding
+;;; arithmetic can prove int64-safety and stay native.
+;;; ------------------------------------------------------------
+
+(defun %numeric-storage-range (spec)
+  "Storage range (LO . HI) of the unboxed backing the runtime picks for
+   element-type SPEC, or NIL when SPEC gets no numeric backing. Must mirror
+   the runtime upgrade (ParseElementTypeName + NumKindForElementType):
+   [0,1] upgrades to bit-packed BIT (not numeric), [0,255]->u8,
+   [0,65535]->u16, int32->i32, int64->i64, wider (e.g. (unsigned-byte 64))
+   stays boxed."
+  (if (eq spec 'fixnum)
+      (cons +int64-min+ +int64-max+)
+      (let ((r (integer-type-range spec)))
+        (and r
+             (let ((lo (car r)) (hi (cdr r)))
+               (cond
+                 ((and (<= 0 lo) (<= hi 1)) nil)
+                 ((and (<= 0 lo) (<= hi 255)) (cons 0 255))
+                 ((and (<= 0 lo) (<= hi 65535)) (cons 0 65535))
+                 ((and (<= -2147483648 lo) (<= hi 2147483647))
+                  (cons -2147483648 2147483647))
+                 ((range-fits-int64-p r) (cons +int64-min+ +int64-max+))
+                 (t nil)))))))
+
+(defun %make-array-static-rank (dims)
+  "Statically-known rank of a make-array DIMS argument form, or NIL.
+   A bare fixnum-typed variable is rank 1 (an integer dimension), a (list ...)
+   or quoted literal list gives its length; anything else is unknown (the
+   variable could hold a dimension LIST at runtime)."
+  (cond ((integerp dims) 1)
+        ((and (symbolp dims) (fixnum-typed-p dims)) 1)
+        ((and (consp dims) (eq (car dims) 'list)) (length (cdr dims)))
+        ((and (consp dims) (eq (car dims) 'quote))
+         (let ((d (cadr dims)))
+           (cond ((integerp d) 1)
+                 ((and (consp d) (every #'integerp d)) (length d))
+                 (t nil))))
+        (t nil)))
+
+(defun %make-array-numeric-info (init)
+  "If INIT is a (make-array DIMS ...) call with static rank 1-3, a constant
+   quoted :element-type that upgrades to a numeric backing, and no
+   :displaced-to, return (RANK LO . HI); else NIL."
+  (and (consp init)
+       (eq (car init) 'make-array)
+       (not (assoc (mangle-name 'make-array) *local-functions* :test #'string=))
+       (consp (cdr init))
+       (let ((rank (%make-array-static-rank (cadr init)))
+             (spec nil)
+             (ok t))
+         (let ((tail (cddr init)))
+           (loop while (and ok tail)
+                 do (let ((k (car tail)))
+                      (cond
+                        ((not (and (symbolp k) (consp (cdr tail))))
+                         (setf ok nil))
+                        ((string= (symbol-name k) "DISPLACED-TO")
+                         (setf ok nil))
+                        ((string= (symbol-name k) "ELEMENT-TYPE")
+                         (let ((f (cadr tail)))
+                           (if (and (consp f) (eq (car f) 'quote))
+                               (setf spec (cadr f))
+                               (setf ok nil)))))
+                      (setf tail (cddr tail)))))
+         (and ok rank (<= 1 rank 3) spec
+              (let ((r (%numeric-storage-range spec)))
+                (and r (cons rank r)))))))
+
+(defun infer-numeric-array-bindings (binding-info mutated outer)
+  "Numeric-array environment for a let/let* body: start from OUTER, drop
+   every name this let binds (shadowing), then add (NAME KEY RANK LO . HI)
+   for each plain lexical, non-mutated binding whose init is a recognizable
+   numeric make-array. KEY pins the binding: a consumer only trusts the entry
+   while (lookup-local NAME) still resolves to it (a closure body re-keys its
+   captured vars, so stale entries self-invalidate). Mutated bindings are
+   excluded — a setq could install an array with different backing."
+  (let* ((bound-names (mapcar (lambda (b) (var-name (first b))) binding-info))
+         (result (remove-if (lambda (e) (member (car e) bound-names :test #'string=))
+                            outer)))
+    (dolist (b binding-info)
+      (let ((var (first b)) (init (second b)) (is-special (third b)) (key (fourth b)))
+        (when (and (not is-special)
+                   init
+                   (not (member (var-name var) mutated :test #'string=)))
+          (let ((info (%make-array-numeric-info init)))
+            (when info
+              (push (list* (var-name var) key info) result))))))
+    result))
+
+(defun numeric-array-aref-info (expr)
+  "If EXPR is (aref V IDX...) on a proven numeric-backed local with matching
+   rank and fixnum-typed indices, return (RANK LO . HI); else NIL."
+  (and (consp expr)
+       (eq (car expr) 'aref)
+       (not (assoc (mangle-name 'aref) *local-functions* :test #'string=))
+       (consp (cdr expr))
+       (symbolp (cadr expr))
+       (boundp '*numeric-array-locals*)
+       (let* ((v (cadr expr))
+              (idxs (cddr expr))
+              (entry (assoc (var-name v) *numeric-array-locals* :test #'string=)))
+         (and entry
+              (eq (lookup-local v) (second entry))
+              (not (boxed-var-p v))
+              (= (length idxs) (third entry))
+              (every #'fixnum-typed-p idxs)
+              (cddr entry)))))
 
 (defun integer-type-range (type)
   "Inclusive (LO . HI) for a bounded integer TYPE specifier, or NIL if TYPE is
@@ -1066,15 +1212,20 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
     ;; the full-range fixnum/long clauses so a tighter bound wins). This is what
     ;; lets e.g. (* rmdr 2) on a (signed-byte 56) prove int64-safety.
     ((small-int-local-range expr))
+    ;; aref on a numeric-backed array local → the element STORAGE range. Tight
+    ;; enough to prove e.g. (+ (aref a i j) (aref b i j)) of two u16 arrays
+    ;; stays in int64, keeping the whole store expression native.
+    ((let ((info (numeric-array-aref-info expr)))
+       (and info (cdr info))))
     ;; Raw int64 local (native body) or declared-fixnum local → full int64 range.
     ((and (symbolp expr)
           (boundp '*long-locals*) *long-locals*
-          (member (symbol-name expr) *long-locals* :test #'string=)
+          (member (var-name expr) *long-locals* :test #'string=)
           (lookup-local expr))
      (cons +int64-min+ +int64-max+))
     ((and (symbolp expr)
           (boundp '*fixnum-locals*)
-          (member (symbol-name expr) *fixnum-locals* :test #'string=)
+          (member (var-name expr) *fixnum-locals* :test #'string=)
           (not (boxed-var-p expr))
           (lookup-local expr))
      (cons +int64-min+ +int64-max+))
@@ -1088,6 +1239,13 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
          ((or (eq ty 'fixnum) (and (consp ty) (eq (car ty) 'integer)))
           (cons +int64-min+ +int64-max+))
          (t nil))))
+    ;; %dotimes-1+ asserts (from loop structure: counter < limit <= int64-max
+    ;; at the increment site) that the incremented result fits int64, so it is
+    ;; a leaf with the full int64 range — no +1 widening that would defeat the
+    ;; range proof for a plain (1+ counter) on a full-range fixnum counter.
+    ((and (consp expr) (= (length expr) 2) (eq (car expr) '%dotimes-1+)
+          (fixnum-typed-p (cadr expr)))
+     (cons +int64-min+ +int64-max+))
     ;; Bitwise results stay within int64 (conservatively the full range).
     ((and (consp expr) (= (length expr) 3)
           (member (car expr) '(logand logior logxor))
@@ -1150,13 +1308,13 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
     ((and (symbolp expr)
           (boundp '*long-locals*)
           *long-locals*
-          (member (symbol-name expr) *long-locals* :test #'string=)
+          (member (var-name expr) *long-locals* :test #'string=)
           (lookup-local expr))
      t)
     ;; Local var declared fixnum — must be a non-captured simple local
     ((and (symbolp expr)
           (boundp '*fixnum-locals*)
-          (member (symbol-name expr) *fixnum-locals* :test #'string=)
+          (member (var-name expr) *fixnum-locals* :test #'string=)
           ;; Boxed (captured) vars need indirection — stick with generic path
           (not (boxed-var-p expr))
           (lookup-local expr))
@@ -1164,6 +1322,9 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
     ;; Local with a proven bounded int64 range (signed-byte/unsigned-byte/bit
     ;; declaration or let-init inference). Slot holds a boxed Fixnum.
     ((small-int-local-range expr) t)
+    ;; aref on a proven numeric-backed array local: elements are integers
+    ;; within the storage range (stores are range-checked by the runtime).
+    ((numeric-array-aref-info expr) t)
     ((and (consp expr) (eq (car expr) 'the)
           (let ((ty (cadr expr)))
             (or (eq ty 'fixnum)
@@ -1182,6 +1343,12 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
      t)
     ((and (consp expr) (= (length expr) 2)
           (member (car expr) '(1+ 1-))
+          (fixnum-typed-p (cadr expr)))
+     t)
+    ;; %dotimes-1+ — dotimes-emitted increment whose result is asserted to fit
+    ;; int64 (counter < limit at the increment site), fixnum-typed like 1+.
+    ((and (consp expr) (= (length expr) 2)
+          (eq (car expr) '%dotimes-1+)
           (fixnum-typed-p (cadr expr)))
      t)
     ;; logand/logior/logxor with fixnum operands → fixnum result
@@ -1229,7 +1396,7 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
     ((and (symbolp expr)
           (boundp '*long-locals*)
           *long-locals*
-          (member (symbol-name expr) *long-locals* :test #'string=)
+          (member (var-name expr) *long-locals* :test #'string=)
           (lookup-local expr))
      `((:ldloc ,(lookup-local expr))))
     ;; Native self-call: long args avoid boxing; InvokeNativeN returns LispObject,
@@ -1252,7 +1419,7 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
     ;; Declared-fixnum local: load slot (LispObject) then unbox.
     ((and (symbolp expr)
           (boundp '*fixnum-locals*)
-          (member (symbol-name expr) *fixnum-locals* :test #'string=)
+          (member (var-name expr) *fixnum-locals* :test #'string=)
           (lookup-local expr))
      `((:ldloc ,(lookup-local expr))
        (:unbox-fixnum)))
@@ -1260,6 +1427,10 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
     ((small-int-local-range expr)
      `((:ldloc ,(lookup-local expr))
        (:unbox-fixnum)))
+    ;; aref on a numeric-backed array local — raw long element read, no box.
+    ((numeric-array-aref-info expr)
+     (compile-numeric-aref-as-long
+      (cadr expr) (cddr expr) (car (numeric-array-aref-info expr))))
     ((and (consp expr) (eq (car expr) 'the))
      ;; (the fixnum E): the declaration asserts E is a fixnum, so lower E
      ;; natively via compile-as-long — it handles +/-/*/1+/1-/locals as raw
@@ -1281,6 +1452,12 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
      `(,@(compile-as-long (cadr expr))
        (:ldc-i8 1)
        (:sub)))
+    ;; %dotimes-1+: raw add — the emitting macro asserts the result fits int64
+    ;; (the increment site is only reached while counter < limit <= int64-max).
+    ((and (consp expr) (= (length expr) 2) (eq (car expr) '%dotimes-1+))
+     `(,@(compile-as-long (cadr expr))
+       (:ldc-i8 1)
+       (:add)))
     ;; Bitwise ops — leaves int64 on stack (callers box if needed)
     ((and (consp expr) (= (length expr) 3) (member (car expr) '(logand logior logxor)))
      (let ((op (ecase (car expr) (logand :and) (logior :or) (logxor :xor))))
@@ -1313,6 +1490,19 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
      `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
            (compile-expr expr))
        (:unbox-fixnum)))))
+
+(defun compile-expr-to-long (expr)
+  "Compile EXPR leaving a raw int64 on the stack, without risking silent wrap:
+   the raw long path (compile-as-long) is taken only when a value-range proof
+   shows every intermediate fits int64. Otherwise the expression is evaluated
+   boxed on the generic promoting path and unboxed — a declaration-violating
+   bignum then signals (InvalidCast) instead of wrapping. Used to initialize
+   and assign Int64-slot locals."
+  (if (fixnum-arith-unboxed-safe-p expr)
+      (compile-as-long expr)
+      `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
+            (compile-expr expr))
+        (:unbox-fixnum))))
 
 (defun compile-fixnum-binop (args op)
   "Emit native int64 binop, boxing result back to LispObject. All of +/-/*
@@ -1393,7 +1583,7 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
     ((typep expr 'double-float) t)
     ((and (symbolp expr)
           (boundp '*double-float-locals*)
-          (member (symbol-name expr) *double-float-locals* :test #'string=)
+          (member (var-name expr) *double-float-locals* :test #'string=)
           (not (boxed-var-p expr))
           (lookup-local expr))
      t)
@@ -1419,7 +1609,7 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
   (cond
     ((and (symbolp expr)
           (boundp '*double-float-locals*)
-          (member (symbol-name expr) *double-float-locals* :test #'string=)
+          (member (var-name expr) *double-float-locals* :test #'string=)
           (lookup-local expr))
      `((:ldloc ,(lookup-local expr))
        (:unbox-double)))
@@ -1479,7 +1669,7 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
     ((typep expr 'single-float) t)
     ((and (symbolp expr)
           (boundp '*single-float-locals*)
-          (member (symbol-name expr) *single-float-locals* :test #'string=)
+          (member (var-name expr) *single-float-locals* :test #'string=)
           (not (boxed-var-p expr))
           (lookup-local expr))
      t)
@@ -1505,7 +1695,7 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
   (cond
     ((and (symbolp expr)
           (boundp '*single-float-locals*)
-          (member (symbol-name expr) *single-float-locals* :test #'string=)
+          (member (var-name expr) *single-float-locals* :test #'string=)
           (lookup-local expr))
      `((:ldloc ,(lookup-local expr))
        (:unbox-single)))
@@ -1551,7 +1741,7 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
 (defun compile-add (args)
   (case (length args)
     (0 (emit-fixnum 0))
-    (1 (let ((*in-tail-position* nil)) (compile-expr (first args))))
+    (1 (let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr (first args))))
     (2
      (cond
        ;; Fast path: both args known double-float → native r8 add
@@ -1607,7 +1797,7 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
 (defun compile-mul (args)
   (case (length args)
     (0 (emit-fixnum 1))
-    (1 (let ((*in-tail-position* nil)) (compile-expr (first args))))
+    (1 (let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr (first args))))
     (2
      (cond
        ((and (double-float-typed-p (first args)) (double-float-typed-p (second args)))
@@ -1797,6 +1987,104 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
            (setq acc (list 'append acc a)))
          (compile-form acc)))))
 
+(defun compile-aref-native-index-call (arr idx-exprs method &optional (val nil val-p))
+  "Compile an array read/write call whose index arguments are lowered to raw
+   int64 on the stack (no Fixnum boxing) — METHOD is one of the Runtime.*L
+   variants taking long indices. ARR (and VAL for setters) stay boxed
+   LispObject. Callers gate on every index being fixnum-typed-p. Mirrors the
+   compile-N-ary-call discipline: all-simple args push directly; otherwise
+   each arg is evaluated to a temp (Int64 temps for indices) so the stack is
+   empty whenever a non-simple subexpression is compiled."
+  (let ((all (append (list arr) idx-exprs (when val-p (list val)))))
+    (if (every #'simple-expr-p all)
+        `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
+              (compile-expr arr))
+          ,@(loop for idx in idx-exprs append (compile-expr-to-long idx))
+          ,@(when val-p
+              (let ((*in-tail-position* nil) (*in-mv-context* nil))
+                (compile-expr val)))
+          (:call ,method))
+        (let ((arr-tmp (gen-local "NAA"))
+              (idx-tmps (mapcar (lambda (i) (declare (ignore i)) (gen-local "NAI"))
+                                idx-exprs))
+              (val-tmp (when val-p (gen-local "NAV"))))
+          `((:declare-local ,arr-tmp "LispObject")
+            ,@(mapcar (lambda (tk) `(:declare-local ,tk "Int64")) idx-tmps)
+            ,@(when val-p `((:declare-local ,val-tmp "LispObject")))
+            ,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
+                (compile-expr arr))
+            (:stloc ,arr-tmp)
+            ,@(loop for idx in idx-exprs
+                    for tk in idx-tmps
+                    append `(,@(compile-expr-to-long idx) (:stloc ,tk)))
+            ,@(when val-p
+                `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
+                      (compile-expr val))
+                  (:stloc ,val-tmp)))
+            (:ldloc ,arr-tmp)
+            ,@(mapcar (lambda (tk) `(:ldloc ,tk)) idx-tmps)
+            ,@(when val-p `((:ldloc ,val-tmp)))
+            (:call ,method))))))
+
+(defun compile-numeric-aref-as-long (arr idxs rank)
+  "Emit (aref ARR IDX...) on a proven numeric-backed local as a raw int64 on
+   the stack (Runtime.ArefNum*L). ARR is a plain lexical local (guaranteed by
+   numeric-array-aref-info), so loading it is pure and can be reordered around
+   the index temps; non-simple indices are evaluated to Int64 temps first so
+   the stack is empty whenever a non-simple subexpression compiles."
+  (let ((method (ecase rank
+                  (1 "Runtime.ArefNumL")
+                  (2 "Runtime.ArefNum2DL")
+                  (3 "Runtime.ArefNum3DL"))))
+    (if (every #'simple-expr-p idxs)
+        `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
+              (compile-expr arr))
+          ,@(loop for idx in idxs append (compile-expr-to-long idx))
+          (:call ,method))
+        (let ((idx-tmps (mapcar (lambda (i) (declare (ignore i)) (gen-local "NAI"))
+                                idxs)))
+          `(,@(mapcar (lambda (tk) `(:declare-local ,tk "Int64")) idx-tmps)
+            ,@(loop for idx in idxs
+                    for tk in idx-tmps
+                    append `(,@(compile-expr-to-long idx) (:stloc ,tk)))
+            ,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
+                (compile-expr arr))
+            ,@(mapcar (lambda (tk) `(:ldloc ,tk)) idx-tmps)
+            (:call ,method))))))
+
+(defun compile-numeric-aref-set (arr idxs val rank)
+  "Emit (setf (aref ARR IDX...) VAL) on a numeric-backed local with the value
+   lowered to a raw int64 (Runtime.ArefSetNum*L — range-checked store, returns
+   the stored long). Leaves the value BOXED on the stack for the general setf
+   contract; in statement position the peephole (P5+P2 family) deletes the box."
+  (let ((method (ecase rank
+                  (1 "Runtime.ArefSetNumL")
+                  (2 "Runtime.ArefSetNum2DL")
+                  (3 "Runtime.ArefSetNum3DL"))))
+    (if (and (every #'simple-expr-p idxs) (simple-expr-p val))
+        `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
+              (compile-expr arr))
+          ,@(loop for idx in idxs append (compile-expr-to-long idx))
+          ,@(compile-expr-to-long val)
+          (:call ,method)
+          (:call "Fixnum.Make"))
+        (let ((idx-tmps (mapcar (lambda (i) (declare (ignore i)) (gen-local "NAI"))
+                                idxs))
+              (val-tmp (gen-local "NAV")))
+          `(,@(mapcar (lambda (tk) `(:declare-local ,tk "Int64")) idx-tmps)
+            (:declare-local ,val-tmp "Int64")
+            ,@(loop for idx in idxs
+                    for tk in idx-tmps
+                    append `(,@(compile-expr-to-long idx) (:stloc ,tk)))
+            ,@(compile-expr-to-long val)
+            (:stloc ,val-tmp)
+            ,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
+                (compile-expr arr))
+            ,@(mapcar (lambda (tk) `(:ldloc ,tk)) idx-tmps)
+            (:ldloc ,val-tmp)
+            (:call ,method)
+            (:call "Fixnum.Make"))))))
+
 (defun compile-list-call (args)
   (if (null args)
       (emit-nil)
@@ -1857,7 +2145,7 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
             (arr-tmp (gen-local "CATARR")))
         `((:declare-local ,rt-tmp "LispObject")
           (:declare-local ,arr-tmp "LispObject[]")
-          ,@(let ((*in-tail-position* nil)) (compile-expr (first args)))
+          ,@(let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr (first args)))
           (:stloc ,rt-tmp)
           ,@(compile-args-array (cdr args))
           (:stloc ,arr-tmp)

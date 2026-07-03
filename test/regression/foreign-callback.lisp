@@ -81,3 +81,14 @@
       (let ((obj (dotnet:new "DotclTest.CallbackErrB")))
         (dotnet:invoke obj "Greet"))))
   "recovered")
+
+;;; --- native FFI callback (dotnet:make-ffi-callback) ---
+;; Exposes a Lisp function as a native (C-callable) function pointer, e.g. for
+;; CFFI's defcallback. Creation must return a non-zero integer pointer (built via
+;; a per-signature Reflection.Emit delegate + a DynamicMethod thunk). The native
+;; round-trip (C code calling back into Lisp, e.g. qsort with a Lisp comparator)
+;; is OS-specific (needs a C runtime lib) and is exercised manually, not here.
+(deftest make-ffi-callback-returns-pointer
+  (let ((p (dotnet:make-ffi-callback (lambda (x) x) '(:int) :int)))
+    (and (integerp p) (/= p 0)))
+  t)

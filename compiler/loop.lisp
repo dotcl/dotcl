@@ -1907,18 +1907,16 @@ collected result will be returned as the value of the LOOP."
      (when testfn (setq test (hide-variable-reference t indexv `(,testfn ,indexv ,endform))))
      (when step-hack
        (setq step-hack `(,variable ,(hide-variable-reference indexv-user-specified-p indexv step-hack))))
-     ;; Build a pre-step endtest that checks whether the NEXT value
-     ;; (after stepping) would violate the bound.  This prevents the
-     ;; iteration variable from being stepped past the limit, so that
-     ;; it retains the correct value in FINALLY clauses.  (CLHS 6.1.2.1.1)
-     (let ((pre-step-endtest
-             (when testfn
-               (hide-variable-reference t indexv `(,testfn ,step ,endform))))
-           (first-test test) (remaining-tests test))
+     ;; CLHS 6.1.2.1.1: the iteration variable is stepped and THEN tested,
+     ;; so after termination it holds the first value that violates the bound
+     ;; (e.g. (loop for x from 1 to 5 finally (return x)) => 6, and
+     ;; (loop for i from 0 below 3 finally (return i)) => 3, matching SBCL).
+     ;; The endtest therefore runs after the step, never before it.
+     (let ((first-test test) (remaining-tests test))
        (when (and stepby-constantp start-constantp limit-constantp)
 	 (when (setq first-test (funcall (symbol-function testfn) start-value limit-value))
 	   (setq remaining-tests t)))
-       `(,pre-step-endtest (,indexv ,(hide-variable-reference t indexv step)) ,remaining-tests ,step-hack
+       `(() (,indexv ,(hide-variable-reference t indexv step)) ,remaining-tests ,step-hack
 	 () () ,first-test ,step-hack))))
 
 

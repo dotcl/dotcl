@@ -291,3 +291,160 @@ b")
     (write-sequence #(7 8 9) s)
     (reverse (%bin-out-acc s)))
   (7 8 9))
+
+;; Bivalent gray stream: a binary output stream that also defines stream-write-char.
+;; cl:write-char must dispatch to stream-write-char regardless of element-type
+;; (SBCL behavior). Previously write-char to a binary-only gray stream silently
+;; leaked to the console because GetTextWriter only recognized character gray streams.
+(defclass %gray-bivalent-out (dotcl-gray:fundamental-binary-output-stream)
+  ((acc :initform nil :accessor %biv-out-acc)))
+(defmethod dotcl-gray:stream-write-char ((s %gray-bivalent-out) ch)
+  (push ch (%biv-out-acc s))
+  ch)
+(defmethod dotcl-gray:stream-write-string ((s %gray-bivalent-out) str &optional (start 0) end)
+  (loop for i from start below (or end (length str))
+        do (push (char str i) (%biv-out-acc s)))
+  str)
+(defmethod dotcl-gray:stream-write-byte ((s %gray-bivalent-out) byte)
+  (push byte (%biv-out-acc s))
+  byte)
+
+(deftest i431-binary-gray-write-char
+  (let ((s (make-instance '%gray-bivalent-out)))
+    (list (write-char #\b s)                 ; returns the char
+          (reverse (%biv-out-acc s))))       ; and dispatched to stream-write-char
+  (#\b (#\b)))
+
+;; The whole character-output family routes through the gray protocol for a
+;; binary (bivalent) gray output stream, not just write-char.
+(deftest i431-binary-gray-write-string
+  (let ((s (make-instance '%gray-bivalent-out)))
+    (write-string "hi" s)
+    (reverse (%biv-out-acc s)))
+  (#\h #\i))
+
+(deftest i431-binary-gray-format
+  (let ((s (make-instance '%gray-bivalent-out)))
+    (format s "a~Ab" 7)
+    (reverse (%biv-out-acc s)))
+  (#\a #\7 #\b))
+
+(deftest i431-binary-gray-princ
+  (let ((s (make-instance '%gray-bivalent-out)))
+    (princ "xy" s)
+    (reverse (%biv-out-acc s)))
+  (#\x #\y))
+
+;; write-byte on the same bivalent stream still dispatches to stream-write-byte.
+(deftest i431-binary-gray-write-byte-still-works
+  (let ((s (make-instance '%gray-bivalent-out)))
+    (write-byte 66 s)
+    (reverse (%biv-out-acc s)))
+  (66))
+
+;;; ------------------------------------------------------------------
+;;; read-sequence / write-sequence dispatch to the Gray stream generics
+;;; (dotcl-gray:stream-read-sequence / stream-write-sequence). CL:READ-SEQUENCE
+;;; must honor a specialized method; an unspecialized stream falls back to the
+;;; per-element char/byte loop (matching the prior behavior).
+;;; ------------------------------------------------------------------
+
+(defclass %rs-str-in (dotcl-gray:fundamental-character-input-stream)
+  ((data :initarg :data) (pos :initform 0) (bulk :initform nil :accessor %rs-bulk)))
+(defmethod dotcl-gray:stream-read-char ((s %rs-str-in))
+  (with-slots (data pos) s
+    (if (< pos (length data)) (prog1 (char data pos) (incf pos)) :eof)))
+(defmethod dotcl-gray:stream-read-sequence ((s %rs-str-in) seq &optional (start 0) (end (length seq)))
+  (setf (%rs-bulk s) t)
+  (with-slots (data pos) s
+    (do ((i start (1+ i))) ((>= i end) i)
+      (if (< pos (length data)) (progn (setf (elt seq i) (char data pos)) (incf pos)) (return i)))))
+
+;; A specialized stream-read-sequence is invoked by CL:READ-SEQUENCE.
+(deftest gray-read-sequence-specialized-dispatch
+  (let* ((s (make-instance '%rs-str-in :data "hello")) (buf (make-string 5)))
+    (let ((n (read-sequence buf s))) (list n buf (%rs-bulk s))))
+  (5 "hello" t))
+
+(defclass %rs-str-in2 (dotcl-gray:fundamental-character-input-stream)
+  ((data :initarg :data) (pos :initform 0)))
+(defmethod dotcl-gray:stream-read-char ((s %rs-str-in2))
+  (with-slots (data pos) s
+    (if (< pos (length data)) (prog1 (char data pos) (incf pos)) :eof)))
+
+;; No specialization: default method reads char-by-char and stops at EOF.
+(deftest gray-read-sequence-default-eof
+  (let* ((s (make-instance '%rs-str-in2 :data "hi")) (buf (make-string 5)))
+    (let ((n (read-sequence buf s))) (list n (subseq buf 0 n))))
+  (2 "hi"))
+
+(defclass %rs-str-out (dotcl-gray:fundamental-character-output-stream)
+  ((acc :initform (make-array 0 :element-type 'character :adjustable t :fill-pointer 0)
+        :accessor %rs-out-acc)))
+(defmethod dotcl-gray:stream-write-char ((s %rs-str-out) c) (vector-push-extend c (%rs-out-acc s)) c)
+
+;; write-sequence to a Gray character output stream reaches stream-write-char.
+(deftest gray-write-sequence-char
+  (let ((s (make-instance '%rs-str-out)))
+    (write-sequence "world" s)
+    (coerce (%rs-out-acc s) 'string))
+  "world")
+
+(defclass %rs-byte-in (dotcl-gray:fundamental-binary-input-stream)
+  ((data :initarg :data) (pos :initform 0)))
+(defmethod dotcl-gray:stream-read-byte ((s %rs-byte-in))
+  (with-slots (data pos) s
+    (if (< pos (length data)) (prog1 (aref data pos) (incf pos)) :eof)))
+
+;; Binary Gray input stream: default read-sequence loops stream-read-byte.
+(deftest gray-read-sequence-binary-default
+  (let* ((s (make-instance '%rs-byte-in :data #(10 20 30))) (buf (make-array 5)))
+    (let ((n (read-sequence buf s))) (list n (coerce (subseq buf 0 n) 'list))))
+  (3 (10 20 30)))
+
+;;; ------------------------------------------------------------------
+;;; cl:read-char / cl:peek-char dispatch to the Gray character input generics.
+;;; Previously ResolveLispStream dropped a gray CLOS instance to *standard-input*
+;;; (default: branch), so read-char returned :EOF and peek-char stack-overflowed.
+;;; ------------------------------------------------------------------
+
+(defclass %rc-str-in (dotcl-gray:fundamental-character-input-stream)
+  ((data :initarg :data) (pos :initform 0)))
+(defmethod dotcl-gray:stream-read-char ((s %rc-str-in))
+  (with-slots (data pos) s
+    (if (< pos (length data)) (prog1 (char data pos) (incf pos)) :eof)))
+(defmethod dotcl-gray:stream-unread-char ((s %rc-str-in) ch)
+  (declare (ignore ch))
+  (with-slots (pos) s (when (> pos 0) (decf pos)) nil))
+
+(deftest gray-read-char-dispatch
+  (let ((s (make-instance '%rc-str-in :data "abc")))
+    (list (read-char s) (read-char s) (read-char s) (read-char s nil :eof)))
+  (#\a #\b #\c :eof))
+
+(deftest gray-peek-char-nil-no-consume
+  (let ((s (make-instance '%rc-str-in :data "xy")))
+    (list (peek-char nil s) (read-char s) (read-char s)))
+  (#\x #\x #\y))
+
+(deftest gray-peek-char-target
+  (let ((s (make-instance '%rc-str-in :data "aabca")))
+    (list (peek-char #\c s) (read-char s)))
+  (#\c #\c))
+
+(deftest gray-read-line-over-read-char
+  (let ((s (make-instance '%rc-str-in :data (format nil "hi~%yo"))))
+    (multiple-value-list (read-line s nil nil)))
+  ("hi" nil))
+
+;;; open-stream-p must dispatch to a user-defined method on a gray stream, not
+;;; short-circuit to the builtin gray default (which always returns T). This is
+;;; what flexi-streams relies on (its open-stream-p delegates to the underlying
+;;; stream); the direct Runtime.OpenStreamP compile-inline previously bypassed it.
+(defclass %osp-gray (dotcl-gray:fundamental-character-input-stream)
+  ((open :initarg :open :accessor %osp-open)))
+(defmethod open-stream-p ((s %osp-gray)) (%osp-open s))
+(deftest gray-open-stream-p-dispatches-user-method
+  (list (notnot (open-stream-p (make-instance '%osp-gray :open t)))
+        (open-stream-p (make-instance '%osp-gray :open nil)))
+  (t nil))

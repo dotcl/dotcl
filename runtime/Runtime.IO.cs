@@ -1450,6 +1450,20 @@ public static partial class Runtime
             throw new LispErrorException(new LispProgramError($"{funcName}: unrecognized keyword argument"));
     }
 
+    // Length of a sequence for resolving a defaulted :end when dispatching
+    // read-sequence / write-sequence to a Gray stream's bulk generic.
+    private static int GraySeqLength(LispObject seq)
+    {
+        switch (seq)
+        {
+            case LispString s: return s.Length;
+            case LispVector v: return v.Length;
+            case Nil: return 0;
+            case Cons: { int n = 0; LispObject t = seq; while (t is Cons c) { n++; t = c.Cdr; } return n; }
+            default: return 0;
+        }
+    }
+
     public static LispObject ReadSequence(LispObject[] args)
     {
         if (args.Length < 2)
@@ -1474,6 +1488,21 @@ public static partial class Runtime
         int end = -1;
         // Validate keyword args
         ValidateSequenceKeywords("READ-SEQUENCE", args, 2, ref start, ref end);
+
+        // Gray stream (Gray protocol): dispatch to the stream-read-sequence
+        // generic so a subclass can bulk-fill the sequence (e.g. flexi-streams
+        // decoding a whole octet buffer). The dotcl-gray default method loops
+        // stream-read-char / stream-read-byte, matching the per-element behavior
+        // used for streams that only implement the single-element generics.
+        if (stream is LispInstance grIn && (IsGrayInputStream(grIn) || IsGrayBinaryInputStream(grIn)))
+        {
+            var rsFn = GrayStreamLookup.GrayOrCl("STREAM-READ-SEQUENCE");
+            if (rsFn != null)
+            {
+                int gEnd = end < 0 ? GraySeqLength(seq) : end;
+                return rsFn.Invoke(new LispObject[] { grIn, seq, Fixnum.Make(start), Fixnum.Make(gEnd) });
+            }
+        }
 
         bool binary = IsBinaryStream(stream);
         // A bivalent stream serves byte vs char by the destination element-type: a
@@ -1565,14 +1594,60 @@ public static partial class Runtime
             var cell = seq;
             for (int i = 0; i < start && cell is Cons c; i++) cell = c.Cdr;
             int pos = start;
-            TextReader consReader = GetTextReader(stream);
-            while (pos < end && cell is Cons cc)
+            if (binary)
             {
-                int ch = consReader.Read();
-                if (ch == -1) break;
-                cc.Car = LispChar.Make((char)ch);
-                cell = cc.Cdr;
-                pos++;
+                // A binary stream reads bytes/integers into the list, same as the
+                // vector branch above (the list branch previously always read chars).
+                int byteWidth = GetBinaryByteWidth(stream);
+                while (pos < end && cell is Cons cc)
+                {
+                    if (byteWidth == 1)
+                    {
+                        int b = ReadStreamByte(stream);
+                        if (b == -1) break;
+                        cc.Car = Fixnum.Make(b);
+                    }
+                    else
+                    {
+                        byte[] bytes = new byte[byteWidth];
+                        int firstByte = ReadStreamByte(stream);
+                        if (firstByte == -1) break;
+                        bytes[0] = (byte)firstByte;
+                        for (int j = 1; j < byteWidth; j++)
+                        {
+                            int b = ReadStreamByte(stream);
+                            if (b == -1) break;
+                            bytes[j] = (byte)b;
+                        }
+                        if (byteWidth <= 8)
+                        {
+                            long val = 0;
+                            for (int j = byteWidth - 1; j >= 0; j--)
+                                val = (val << 8) | bytes[j];
+                            cc.Car = Fixnum.Make(val);
+                        }
+                        else
+                        {
+                            var bigVal = Compat.MakeBigInteger(bytes, isUnsigned: true, isBigEndian: false);
+                            cc.Car = Bignum.MakeInteger(bigVal);
+                        }
+                    }
+                    cell = cc.Cdr;
+                    pos++;
+                }
+            }
+            else
+            {
+                TextReader consReader = GetTextReader(stream);
+                while (pos < end && cell is Cons cc)
+                {
+                    int ch = consReader.Read();
+                    if (ch == -1) break;
+                    cc.Car = LispChar.Make((char)ch);
+                    echoWriter?.Write((char)ch);
+                    cell = cc.Cdr;
+                    pos++;
+                }
             }
             return Fixnum.Make(pos);
         }
@@ -1610,6 +1685,20 @@ public static partial class Runtime
             foreach (var s in bs.Streams) { args[1] = s; WriteSequence(args); }
             args[1] = origStream;
             return seq;
+        }
+
+        // Gray stream (Gray protocol): dispatch to the stream-write-sequence
+        // generic so a subclass can bulk-encode (e.g. flexi-streams). The
+        // dotcl-gray default method loops stream-write-char / stream-write-byte.
+        if (stream is LispInstance grOut && (IsGrayOutputStream(grOut) || IsGrayBinaryOutputStream(grOut)))
+        {
+            var wsFn = GrayStreamLookup.GrayOrCl("STREAM-WRITE-SEQUENCE");
+            if (wsFn != null)
+            {
+                int gEnd = end < 0 ? GraySeqLength(seq) : end;
+                wsFn.Invoke(new LispObject[] { grOut, seq, Fixnum.Make(start), Fixnum.Make(gEnd) });
+                return seq;
+            }
         }
 
         bool binary = IsBinaryStream(stream);
@@ -1857,6 +1946,20 @@ public static partial class Runtime
 
     public static LispObject ReadChar(LispObject streamObj, LispObject eofErrorP, LispObject eofValue)
     {
+        // Gray character input stream: dispatch to the stream-read-char generic.
+        // ResolveLispStream would otherwise drop the CLOS instance to
+        // *standard-input* (its default: branch), so read-char read stdin.
+        if (streamObj is LispInstance grIn && IsGrayInputStream(grIn))
+        {
+            var rcFn = GrayStreamLookup.GrayOrCl("STREAM-READ-CHAR");
+            if (rcFn != null)
+            {
+                var r = rcFn.Invoke(new LispObject[] { grIn });
+                if (r is LispChar lcg) return lcg;
+                if (IsTruthy(eofErrorP)) throw new LispErrorException(MakeEndOfFileError(streamObj));
+                return eofValue;
+            }
+        }
         // Check if this is an echo stream BEFORE resolving
         var echoStream = FindEchoStream(streamObj);
         var stream = ResolveLispStream(streamObj);
@@ -1907,8 +2010,59 @@ public static partial class Runtime
         return reader.Peek();
     }
 
+    // Peek at a gray character input stream via the stream-peek-char /
+    // stream-read-char generics, honoring the three peek-type modes. Kept
+    // separate so PeekChar's LispStream path (which relies on UnreadCharValue)
+    // is not entangled with gray dispatch.
+    private static LispObject PeekCharGray(LispObject peekType, LispInstance gs, LispObject eofErrorP, LispObject eofValue)
+    {
+        var peekFn = GrayStreamLookup.GrayOrCl("STREAM-PEEK-CHAR")
+            ?? throw new LispErrorException(new LispError("Gray stream: STREAM-PEEK-CHAR not defined"));
+        var readFn = GrayStreamLookup.GrayOrCl("STREAM-READ-CHAR")
+            ?? throw new LispErrorException(new LispError("Gray stream: STREAM-READ-CHAR not defined"));
+        static bool IsEof(LispObject r) => r is Symbol s && s.Name == "EOF";
+        var arg = new LispObject[] { gs };
+        LispObject Eof()
+        {
+            if (IsTruthy(eofErrorP)) throw new LispErrorException(MakeEndOfFileError(gs));
+            return eofValue;
+        }
+        if (peekType is LispChar targetChar)
+        {
+            while (true)
+            {
+                var p = peekFn.Invoke(arg);
+                if (IsEof(p)) return Eof();
+                if (p is LispChar pc && pc.Value == targetChar.Value) return pc;
+                readFn.Invoke(arg); // consume the non-matching char
+            }
+        }
+        if (peekType is T)
+        {
+            var rtObj = DynamicBindings.Get(Startup.Sym("*READTABLE*"));
+            var readtable = rtObj is LispReadtable lrt ? lrt : Startup.StandardReadtable;
+            while (true)
+            {
+                var p = peekFn.Invoke(arg);
+                if (IsEof(p)) return Eof();
+                if (p is LispChar pc && readtable.GetSyntaxType(pc.Value) != SyntaxType.Whitespace) return pc;
+                readFn.Invoke(arg); // consume the whitespace char
+            }
+        }
+        // NIL peek-type: peek at the next character.
+        var r = peekFn.Invoke(arg);
+        return IsEof(r) ? Eof() : r;
+    }
+
     public static LispObject PeekChar(LispObject peekType, LispObject streamObj, LispObject eofErrorP, LispObject eofValue)
     {
+        // Gray character input stream: dispatch to the stream-peek-char /
+        // stream-read-char generics (ResolveLispStream would drop the instance
+        // to *standard-input*, and the LispStream path below assumes a
+        // resolvable stream with an UnreadCharValue slot).
+        if (streamObj is LispInstance grIn && IsGrayInputStream(grIn))
+            return PeekCharGray(peekType, grIn, eofErrorP, eofValue);
+
         var echoStream = FindEchoStream(streamObj);
         var stream = ResolveLispStream(streamObj);
         TextWriter? echoWriter = echoStream != null ? GetTextWriter(echoStream.OutputStream) : null;

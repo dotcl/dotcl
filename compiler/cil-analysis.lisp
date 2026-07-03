@@ -87,17 +87,17 @@
                ;; walk the expansion instead of treating it as a variable reference.
                ((symbolp e)
                 (let ((sm (and e
-                               (not (member (symbol-name e) bnd :test #'string=))
+                               (not (member (var-name e) bnd :test #'string=))
                                (assoc e *symbol-macros* :test #'eq))))
                   (if sm
                       (push (cons (cdr sm) (cons bnd mdepth)) worklist)
                       (when (and e
                                  (or (not (eq e t)) (local-bound-p e))
                                  (or (not (keywordp e)) (local-bound-p e))
-                                 (not (member (symbol-name e) bnd :test #'string=))
-                                 (not (gethash (symbol-name e) free-ht))
+                                 (not (member (var-name e) bnd :test #'string=))
+                                 (not (gethash (var-name e) free-ht))
                                  (local-bound-p e))
-                        (setf (gethash (symbol-name e) free-ht) t)))))
+                        (setf (gethash (var-name e) free-ht) t)))))
                ;; Cons: dispatch on head
                ((consp e)
                 (let ((head (car e)))
@@ -137,17 +137,17 @@
                                 (&aux (setf state :aux))
                                 (t nil)))
                              ((eq state :required)
-                              (push (symbol-name p) progressive-bound))
+                              (push (var-name p) progressive-bound))
                              ((member state '(:optional :key :aux))
                               (when (and (consp p) (cadr p))
                                 (push (cons (cadr p) (cons progressive-bound mdepth)) worklist))
                               (let ((name (if (consp p) (car p) p)))
                                 (when (consp name) (setf name (cadr name)))
-                                (push (symbol-name name) progressive-bound))
+                                (push (var-name name) progressive-bound))
                               (when (and (consp p) (caddr p))
-                                (push (symbol-name (caddr p)) progressive-bound)))
+                                (push (var-name (caddr p)) progressive-bound)))
                              ((eq state :rest)
-                              (push (symbol-name p) progressive-bound)))))
+                              (push (var-name p) progressive-bound)))))
                        ;; Push body forms with all params bound
                        (dolist (form lbody)
                          (push (cons form (cons inner-bound mdepth)) worklist))))
@@ -159,7 +159,7 @@
                             (is-star (eq head 'let*)))
                        (dolist (b bindings)
                          (let ((init (if (consp b) (cadr b) nil))
-                               (vn (symbol-name (if (consp b) (car b) b))))
+                               (vn (var-name (if (consp b) (car b) b))))
                            (when init
                              (push (cons init (cons (if is-star inner-bound bnd) mdepth)) worklist))
                            (push vn inner-bound)))
@@ -236,7 +236,7 @@
                                          (car lambda-list) nil))
                                 (handler-body (cddr clause))
                                 (inner-bound (if var
-                                                 (cons (symbol-name var) bnd)
+                                                 (cons (var-name var) bnd)
                                                  bnd)))
                            (dolist (form handler-body)
                              (push (cons form (cons inner-bound mdepth)) worklist))))))
@@ -259,8 +259,8 @@
                                 (let ((names nil))
                                   (dolist (p params)
                                     (cond ((member p '(&optional &rest &key &aux &allow-other-keys)) nil)
-                                          ((consp p) (push (symbol-name (car p)) names))
-                                          ((symbolp p) (push (symbol-name p) names))))
+                                          ((consp p) (push (var-name (car p)) names))
+                                          ((symbolp p) (push (var-name p) names))))
                                   (nreverse names)))
                               (inner-bound (append param-names bnd)))
                          ;; Default value forms in optional/key params
@@ -296,8 +296,19 @@
                          (push (cons form (cons bnd mdepth)) worklist))))
                     ;; symbol-macrolet: extend *symbol-macros* during body walk
                     ((and (symbolp head) (eq head 'symbol-macrolet))
-                     (let ((sm-bindings (cadr e))
-                           (sm-body (cddr e)))
+                     (let* ((sm-bindings (cadr e))
+                            (sm-body (cddr e))
+                            ;; A symbol-macro shadows an enclosing lexical variable of
+                            ;; the same name in the body, so drop those names from the
+                            ;; bound set — a reference to them is the symbol-macro, not
+                            ;; a variable. Must match compile-symbol-macrolet, else the
+                            ;; free/mutation analysis and codegen disagree on boxing.
+                            (body-bnd (remove-if
+                                       (lambda (n)
+                                         (member n sm-bindings
+                                                 :key (lambda (b) (var-name (car b)))
+                                                 :test #'string=))
+                                       bnd)))
                        ;; Push restore sentinel FIRST (LIFO: processed LAST, after body)
                        (push (cons :restore-symbol-macros *symbol-macros*) worklist)
                        ;; Extend *symbol-macros* immediately so macro expansions inside
@@ -307,7 +318,7 @@
                                      *symbol-macros*))
                        ;; Push body forms (LIFO: processed BEFORE restore sentinel)
                        (dolist (form sm-body)
-                         (push (cons form (cons bnd mdepth)) worklist))))
+                         (push (cons form (cons body-bnd mdepth)) worklist))))
                     ;; flet/labels: function definitions + body
                     ((and (symbolp head) (member head '(flet labels)))
                      (let* ((fn-defs (cadr e))
@@ -337,17 +348,17 @@
                                       (&aux (setf state :aux))
                                       (t nil)))
                                    ((eq state :required)
-                                    (push (symbol-name p) progressive-bound))
+                                    (push (var-name p) progressive-bound))
                                    ((member state '(:optional :key :aux))
                                     (when (and (consp p) (cadr p))
                                       (push (cons (cadr p) (cons progressive-bound mdepth)) worklist))
                                     (let ((name (if (consp p) (car p) p)))
                                       (when (consp name) (setf name (cadr name)))
-                                      (push (symbol-name name) progressive-bound))
+                                      (push (var-name name) progressive-bound))
                                     (when (and (consp p) (caddr p))
-                                      (push (symbol-name (caddr p)) progressive-bound)))
+                                      (push (var-name (caddr p)) progressive-bound)))
                                    ((eq state :rest)
-                                    (push (symbol-name p) progressive-bound)))))
+                                    (push (var-name p) progressive-bound)))))
                              ;; Push fn body forms
                              (dolist (form fn-body)
                                (push (cons form (cons inner-bound mdepth)) worklist)))))
@@ -384,8 +395,12 @@
                        (if expanded
                            (push (cons expanded (cons bnd (1+ mdepth))) worklist)
                            (progn
-                             ;; Labels function mangled name capture
-                             (when (and (symbolp head) head)
+                             ;; Labels function mangled name capture.
+                             ;; head=NIL is admitted too: a local function may
+                             ;; be named NIL (ANSI LABELS.24) and its box must
+                             ;; be captured — the local-bound-p check below
+                             ;; gates this to scopes where such a fn exists.
+                             (when (symbolp head)
                                (let* ((name (symbol-name head))
                                       (mangled (concatenate 'string "__LABELFN_" name)))
                                  (when (and (local-bound-p (intern mangled :dotcl.cil-compiler))
@@ -483,10 +498,10 @@
                    (loop for (var val) on (cdr e) by #'cddr
                          do (cond
                               ((and var (symbolp var))
-                               (setf (gethash (symbol-name var) result-ht) t))
+                               (setf (gethash (var-name var) result-ht) t))
                               ;; (setf (the type var) ...) — unwrap the type annotation
                               ((and (consp var) (eq (car var) 'the) (symbolp (caddr var)))
-                               (setf (gethash (symbol-name (caddr var)) result-ht) t))
+                               (setf (gethash (var-name (caddr var)) result-ht) t))
                               ((consp var)
                                ;; Complex place (e.g. (getf p key)): macro-expand the
                                ;; setf form so the generated (setq p ...) is detected.
@@ -510,7 +525,7 @@
                      (when (listp vars)
                        (dolist (v vars)
                          (when (symbolp v)
-                           (setf (gethash (symbol-name v) result-ht) t)))))
+                           (setf (gethash (var-name v) result-ht) t)))))
                    (when (caddr e)
                      (push (cons (caddr e) mdepth) worklist)))
                   ((and (symbolp head) (member (symbol-name head) '("PUSH" "PUSHNEW") :test #'string=))
@@ -518,7 +533,7 @@
                      (let ((sym (if (symbolp place) place
                                     (and (consp place) (eq (car place) 'the) (caddr place)))))
                        (when (and sym (symbolp sym) (not (eq sym t)))
-                         (setf (gethash (symbol-name sym) result-ht) t))))
+                         (setf (gethash (var-name sym) result-ht) t))))
                    (do-list-safe (sub (cdr e))
                      (push (cons sub mdepth) worklist)))
                   ((and (symbolp head) (member (symbol-name head) '("POP" "INCF" "DECF") :test #'string=))
@@ -526,13 +541,13 @@
                      (let ((sym (if (symbolp place) place
                                     (and (consp place) (eq (car place) 'the) (caddr place)))))
                        (when (and sym (symbolp sym) (not (eq sym t)))
-                         (setf (gethash (symbol-name sym) result-ht) t))))
+                         (setf (gethash (var-name sym) result-ht) t))))
                    (do-list-safe (sub (cdr e))
                      (push (cons sub mdepth) worklist)))
                   ((and (symbolp head) (member (symbol-name head) '("ROTATEF" "SHIFTF") :test #'string=))
                    (dolist (arg (cdr e))
                      (when (and (symbolp arg) arg (not (eq arg t)))
-                       (setf (gethash (symbol-name arg) result-ht) t))
+                       (setf (gethash (var-name arg) result-ht) t))
                      (when (consp arg)
                        (push (cons arg mdepth) worklist))))
                   ((and (symbolp head) (eq head 'quote)) nil)
@@ -541,12 +556,36 @@
                      (push (cons form mdepth) worklist)))
                   ((and (symbolp head) (member head '(let let*)))
                    (let ((bindings (cadr e))
-                         (lbody (cddr e)))
+                         (lbody (cddr e))
+                         ;; let/let* bindings shadow same-named symbol-macros for the
+                         ;; body (CLHS 3.1.2.1.1). Without this, a symbol-macro whose
+                         ;; expansion rebinds its own name — e.g. SBCL's POLICY macro,
+                         ;; whose qualities expand to (LET ((X ...)) (IF (= X 1) .. X)) —
+                         ;; re-expands X inside its own expansion forever (exponential
+                         ;; in the depth limit; make-host-1 hung on knownfun.lisp).
+                         (shadowed nil))
+                     (when *symbol-macros*
+                       (do-list-safe (b bindings)
+                         (let ((name (if (consp b) (car b) b)))
+                           (when (and name (symbolp name)
+                                      (assoc name *symbol-macros* :test #'eq))
+                             (push name shadowed)))))
+                     ;; LIFO worklist: restore sentinel is processed LAST (after the
+                     ;; body), the narrow sentinel after the init forms but before the
+                     ;; body. Init forms are walked under the outer map, the body under
+                     ;; the narrowed map.
+                     (when shadowed
+                       (push (cons :restore-symbol-macros *symbol-macros*) worklist))
+                     (dolist (form lbody)
+                       (push (cons form mdepth) worklist))
+                     (when shadowed
+                       (push (cons :restore-symbol-macros
+                                   (remove-if (lambda (sm) (member (car sm) shadowed :test #'eq))
+                                              *symbol-macros*))
+                             worklist))
                      (dolist (b bindings)
                        (when (and (consp b) (cadr b))
-                         (push (cons (cadr b) mdepth) worklist)))
-                     (dolist (form lbody)
-                       (push (cons form mdepth) worklist))))
+                         (push (cons (cadr b) mdepth) worklist)))))
                   ((and (symbolp head) (eq head 'handler-case))
                    (when (cadr e) (push (cons (cadr e) mdepth) worklist))
                    (dolist (clause (cddr e))
@@ -654,12 +693,12 @@
           ((and (symbolp e) e
                 (not (eq e :restore-symbol-macros)) (not (eq e :restore-macro))
                 (< mdepth *macro-expand-depth-limit*)
-                (not (member (symbol-name e) var-names :test #'string=))
+                (not (member (var-name e) var-names :test #'string=))
                 (assoc e *symbol-macros* :test #'eq))
            (push (cons (cdr (assoc e *symbol-macros* :test #'eq)) (cons in-lambda (1+ mdepth))) worklist))
           ((and (symbolp e) in-lambda)
-           (when (member (symbol-name e) var-names :test #'string=)
-             (setf (gethash (symbol-name e) result-ht) t)))
+           (when (member (var-name e) var-names :test #'string=)
+             (setf (gethash (var-name e) result-ht) t)))
           ((consp e)
            (let ((head (car e)))
              (cond
@@ -672,12 +711,31 @@
                   (push (cons sub (cons t mdepth)) worklist)))
                ((and (symbolp head) (member head '(let let*)))
                 (let ((bindings (cadr e))
-                      (lbody (cddr e)))
+                      (lbody (cddr e))
+                      ;; Same symbol-macro shadowing as in find-mutated-vars-expr:
+                      ;; without it, self-rebinding expansions (SBCL's POLICY macro)
+                      ;; re-expand forever. Sentinel payload goes in the in-lambda slot.
+                      (shadowed nil))
+                  (when *symbol-macros*
+                    (do-list-safe (b bindings)
+                      (let ((name (if (consp b) (car b) b)))
+                        (when (and name (symbolp name)
+                                   (assoc name *symbol-macros* :test #'eq))
+                          (push name shadowed)))))
+                  (when shadowed
+                    (push (cons :restore-symbol-macros (cons *symbol-macros* mdepth)) worklist))
+                  (dolist (form lbody)
+                    (push (cons form (cons in-lambda mdepth)) worklist))
+                  (when shadowed
+                    (push (cons :restore-symbol-macros
+                                (cons (remove-if (lambda (sm)
+                                                   (member (car sm) shadowed :test #'eq))
+                                                 *symbol-macros*)
+                                      mdepth))
+                          worklist))
                   (dolist (b bindings)
                     (when (and (consp b) (cadr b))
-                      (push (cons (cadr b) (cons in-lambda mdepth)) worklist)))
-                  (dolist (form lbody)
-                    (push (cons form (cons in-lambda mdepth)) worklist))))
+                      (push (cons (cadr b) (cons in-lambda mdepth)) worklist)))))
                ((and (symbolp head) (or (eq head 'flet) (eq head 'labels)))
                 (dolist (fdef (cadr e))
                   ;; Scan the lambda-list too, not just the body: an &optional/&key
@@ -903,6 +961,11 @@
                                           ; statically-Nil value is identity with no
                                           ; side effect (Nil is not an MvReturn)
      P4  (:ldsfld \"Nil.Instance\") (:pop) -> {}        ; push-Nil-then-discard is dead
+     P5  (:call \"Fixnum.Make\") (:pop)   ->  (:pop)    ; boxing a value only to
+                                          ; discard it — Fixnum.Make is pure, so
+                                          ; pop the raw long instead. (Int64-slot
+                                          ; setq in statement position; composes
+                                          ; with P2 to a bare native store.)
    (P3+P4 compose across the fixpoint to delete the dead nil/unwrap/pop preamble
     that codegen emits at the top of every TCO loop body.)
 
@@ -946,6 +1009,13 @@
               ((and (consp i1) (eq (car i1) :ldsfld) (equal (cadr i1) "Nil.Instance")
                     (consp i2) (eq (car i2) :pop))
                (setf changed t)
+               (setf cur (cddr cur)))
+              ;; P5: box a raw long only to discard it. Fixnum.Make is pure —
+              ;; drop the call and pop the operand instead.
+              ((and (consp i1) (eq (car i1) :call) (equal (cadr i1) "Fixnum.Make")
+                    (consp i2) (eq (car i2) :pop))
+               (setf changed t)
+               (push i2 out)
                (setf cur (cddr cur)))
               (t
                (push i1 out)

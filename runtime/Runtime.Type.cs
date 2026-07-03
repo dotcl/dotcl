@@ -3,7 +3,22 @@ namespace DotCL;
 public static partial class Runtime
 {
     // --- Type expanders (registered by deftype) ---
+    // Keyed by plain name for COMMON-LISP-homed deftype names, and by
+    // "PKG::NAME" for other packages, so a non-CL deftype whose name matches
+    // a built-in type (e.g. SBCL's host-side SB-XC:COMPLEX -> COMPLEXNUM)
+    // shadows the built-in for ITS symbol only.
     public static Dictionary<string, LispObject> TypeExpanders = new();
+
+    public static string TypeExpanderKey(Symbol sym)
+        => sym.HomePackage is Package p && p.Name != "COMMON-LISP"
+           ? p.Name + "::" + sym.Name : sym.Name;
+
+    public static bool TryGetQualifiedTypeExpander(Symbol sym, out LispObject expander)
+    {
+        expander = Nil.Instance;
+        return sym.HomePackage is Package p && p.Name != "COMMON-LISP"
+            && TypeExpanders.TryGetValue(p.Name + "::" + sym.Name, out expander!);
+    }
 
     // --- Typep ---
 
@@ -87,6 +102,9 @@ public static partial class Runtime
                     // No match against a known class — fall through (could be T/ATOM/etc.).
                 }
             }
+            // A non-CL deftype shadows built-ins for its own symbol
+            if (typeSpec is Symbol qSym && TryGetQualifiedTypeExpander(qSym, out var qExp))
+                return Typep(obj, Funcall(qExp));
             if (CheckSimpleType(obj, name)) return T.Instance;
             // Try user-defined type expander
             if (TypeExpanders.TryGetValue(name, out var expSymExpander))
@@ -127,6 +145,11 @@ public static partial class Runtime
                 Symbol sym => sym.Name,
                 _ => ""
             };
+            if (head is Symbol qHead && TryGetQualifiedTypeExpander(qHead, out var qCompExp))
+            {
+                var qArgs = ToList(compound.Cdr).ToArray();
+                return Typep(obj, Funcall(qCompExp, qArgs));
+            }
             switch (headName)
             {
                 case "OR":

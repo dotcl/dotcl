@@ -3,6 +3,71 @@
 User-facing release notes for dotcl. Each section corresponds to a tagged
 release on the public mirror (dotcl/dotcl).
 
+## v0.1.16 -- 2026-07-03
+
+This cycle adds two pieces of interop tooling -- one-line NuGet resolution and
+live method advice -- alongside continued performance work and the usual long
+tail of conformance fixes from real-library bring-up.
+
+### NuGet from Lisp
+
+- New `nuget` contrib. `(require "nuget")` then `(nuget:require "SkiaSharp")`
+  resolves a NuGet package and its full transitive dependency graph -- version-
+  unified managed assemblies plus the RID-specific native libraries -- and
+  registers them with the runtime's assembly resolver, from one call. `:version`,
+  `:source`, `:prerelease`, `:rid` and `:tfm` are keyword arguments. This folds
+  the old manual "download + AssemblyResolve + path index" work into a single
+  form, so any NuGet library (Avalonia, SkiaSharp, ...) is reachable from a bare
+  `dotcl`.
+
+### Live method advice
+
+- New `harmony` contrib. Attach CLOS-style advice to *any* .NET method at run
+  time, with no restart: `(harmony:watch "Type" "Method" fn)` observes a call's
+  arguments and result, `harmony:patch` rewrites its return value in place, and
+  `harmony:trace` times each call. Built on HarmonyX. Handy for inspecting or
+  hot-fixing a running application, or scripting over managed code.
+
+### A GUI in five minutes
+
+- The README now walks through building a cross-platform Avalonia window from a
+  single Lisp file (`examples/hello-gui.lisp`), using the `nuget` contrib to
+  pull Avalonia at run time.
+
+### .NET interop
+
+- `dotnet:` marshalling round-trips the full set of small integer types
+  (byte / sbyte / short / ushort / uint / ulong) in both directions.
+- `dotnet:make-ffi-callback` exposes a Lisp function as a native function
+  pointer callable from C, for callback-based native APIs.
+- New atomic primitives (an `atomic-long` with compare-and-swap / increment /
+  decrement) built on .NET's `Interlocked`.
+
+### Performance
+
+- CLOS dispatch is substantially faster in common cases: a dispatch cache for
+  EQL-specialized generic functions, lazily-built `call-next-method` closures
+  (no per-dispatch allocation), and memoized built-in specializer classes.
+- Numeric arrays declared with a bounded integer or float element type now use
+  unboxed backing storage, and `aref` / `(setf aref)` take an unboxed integer
+  index -- removing per-access boxing in tight loops.
+
+### Gray streams and I/O
+
+- `read-char`, `peek-char`, `read-sequence` and `write-sequence` dispatch to
+  user-defined Gray stream methods, and bivalent (binary/character) streams
+  route correctly. This is enough to run the flexi-streams library unmodified.
+
+### Reader, printer, and conformance
+
+- Character (`#\`) reading, concatenated streams, and `#n=` / `#n#` shared
+  structure across `compile-file` were corrected in several edge cases.
+- The pretty printer, `print-object` nesting, and `defstruct` custom printers
+  moved closer to the standard.
+- A long tail of compiler fixes around multiple-value propagation, symbol-macro
+  shadowing, `setf` of `macro-function` in non-CL packages, and `labels` tail-
+  call scoping -- mostly invisible until you hit the case they fix.
+
 ## v0.1.15 -- 2026-06-29
 
 A conformance-and-robustness release. The bulk of this cycle was driven by

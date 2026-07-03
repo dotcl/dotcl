@@ -270,6 +270,126 @@ static class NativeFFI
         var result = dm.Invoke(null, invokeArgs);
         return ConvertReturn(result, retType);
     }
+
+    // --- Reverse callbacks: expose a Lisp function as a native function pointer. ---
+
+    sealed class CallbackEntry
+    {
+        public LispFunction Fn = null!;
+        public Type[] ArgTypes = null!;
+        public Type RetType = null!;
+    }
+
+    // Rooted so the GC never collects a delegate whose function pointer is live in
+    // native code. Indexed by id (baked into the emitted thunk as a constant).
+    static readonly List<CallbackEntry> _callbackEntries = new();
+    static readonly List<Delegate> _callbackRoots = new();
+
+    /// <summary>Invoked (via the emitted thunk) when native code calls the callback.
+    /// Marshals native args → Lisp, runs the Lisp function, marshals the result back.</summary>
+    public static object? CallbackTrampoline(int id, object?[] nativeArgs)
+    {
+        CallbackEntry e;
+        lock (_callbackEntries) e = _callbackEntries[id];
+        var lispArgs = new LispObject[nativeArgs.Length];
+        for (int i = 0; i < nativeArgs.Length; i++)
+            lispArgs[i] = ConvertReturn(nativeArgs[i], e.ArgTypes[i]);
+        var lispResult = e.Fn.Invoke(lispArgs);
+        if (IsVoidType(e.RetType)) return null;
+        return ConvertArg(lispResult, e.RetType);
+    }
+
+    static readonly MethodInfo _trampolineMI =
+        typeof(NativeFFI).GetMethod(nameof(CallbackTrampoline))!;
+
+    // Non-generic delegate types (Marshal.GetFunctionPointerForDelegate rejects Func<>/
+    // Action<>) built once per signature via Reflection.Emit.
+    static readonly Dictionary<string, Type> _delegateTypeCache = new();
+    static ModuleBuilder? _delegateModule;
+
+    static Type GetNativeDelegateType(Type[] argTypes, Type retType)
+    {
+        var key = string.Join(",", argTypes.Select(t => t.Name)) + "->" + retType.Name;
+        lock (_delegateTypeCache)
+        {
+            if (_delegateTypeCache.TryGetValue(key, out var cached)) return cached;
+            if (_delegateModule == null)
+            {
+                var ab = AssemblyBuilder.DefineDynamicAssembly(
+                    new AssemblyName("DotclFfiCallbacks"), AssemblyBuilderAccess.Run);
+                _delegateModule = ab.DefineDynamicModule("m");
+            }
+            var tb = _delegateModule.DefineType(
+                "cb_" + _delegateTypeCache.Count,
+                TypeAttributes.Public | TypeAttributes.Sealed | TypeAttributes.AutoClass,
+                typeof(MulticastDelegate));
+            // On x64/ARM64 the calling convention is unified; Cdecl matches C callbacks
+            // like qsort and is CFFI's default.
+            tb.SetCustomAttribute(new CustomAttributeBuilder(
+                typeof(UnmanagedFunctionPointerAttribute).GetConstructor(new[] { typeof(CallingConvention) })!,
+                new object[] { CallingConvention.Cdecl }));
+            var ctor = tb.DefineConstructor(
+                MethodAttributes.RTSpecialName | MethodAttributes.HideBySig | MethodAttributes.Public,
+                CallingConventions.Standard, new[] { typeof(object), typeof(IntPtr) });
+            ctor.SetImplementationFlags(MethodImplAttributes.Runtime | MethodImplAttributes.Managed);
+            var invoke = tb.DefineMethod("Invoke",
+                MethodAttributes.Public | MethodAttributes.HideBySig | MethodAttributes.NewSlot | MethodAttributes.Virtual,
+                retType, argTypes);
+            invoke.SetImplementationFlags(MethodImplAttributes.Runtime | MethodImplAttributes.Managed);
+            var dt = tb.CreateType()!;
+            _delegateTypeCache[key] = dt;
+            return dt;
+        }
+    }
+
+    /// <summary>Build a native function pointer that dispatches to LISPFN. ARGTYPES/RET are
+    /// dotcl FFI type keywords (as used by %ffi-call-ptr).</summary>
+    public static IntPtr MakeCallback(LispObject lispFn, LispObject argTypesList, LispObject retTypeKw)
+    {
+        Emitter.CilAssembler.EnsureEmitAllowed("native FFI callback");
+        if (lispFn is not LispFunction fn)
+            throw new LispErrorException(new LispError(
+                "dotnet:make-ffi-callback: first argument must be a function"));
+
+        var argTypes = new List<Type>();
+        for (var cur = argTypesList; cur is Cons c; cur = c.Cdr)
+            argTypes.Add(KeyToType(c.Car));
+        var retType = retTypeKw is Nil ? typeof(void) : KeyToType(retTypeKw);
+
+        int id;
+        var entry = new CallbackEntry { Fn = fn, ArgTypes = argTypes.ToArray(), RetType = retType };
+        lock (_callbackEntries) { id = _callbackEntries.Count; _callbackEntries.Add(entry); }
+
+        // Emit a thunk with the exact native signature that boxes its args into an
+        // object[] and calls CallbackTrampoline(id, args), then unboxes the result.
+        var actualRet = IsVoidType(retType) ? null : retType;
+        var dm = new DynamicMethod($"ffi_cb_{id}", actualRet, argTypes.ToArray(),
+                                   typeof(NativeFFI), skipVisibility: true);
+        var il = dm.GetILGenerator();
+        var arr = il.DeclareLocal(typeof(object[]));
+        il.Emit(OpCodes.Ldc_I4, argTypes.Count);
+        il.Emit(OpCodes.Newarr, typeof(object));
+        il.Emit(OpCodes.Stloc, arr);
+        for (int i = 0; i < argTypes.Count; i++)
+        {
+            il.Emit(OpCodes.Ldloc, arr);
+            il.Emit(OpCodes.Ldc_I4, i);
+            il.Emit(OpCodes.Ldarg, i);
+            il.Emit(OpCodes.Box, argTypes[i]);
+            il.Emit(OpCodes.Stelem_Ref);
+        }
+        il.Emit(OpCodes.Ldc_I4, id);
+        il.Emit(OpCodes.Ldloc, arr);
+        il.Emit(OpCodes.Call, _trampolineMI);
+        if (actualRet == null) il.Emit(OpCodes.Pop);
+        else il.Emit(OpCodes.Unbox_Any, retType);
+        il.Emit(OpCodes.Ret);
+
+        var delType = GetNativeDelegateType(argTypes.ToArray(), actualRet ?? typeof(void));
+        var del = dm.CreateDelegate(delType);
+        lock (_callbackRoots) _callbackRoots.Add(del);
+        return Marshal.GetFunctionPointerForDelegate(del);
+    }
 }
 
 public static partial class Runtime
@@ -341,5 +461,20 @@ public static partial class Runtime
         var nativeArgs = args.Skip(4).ToArray();
 
         return NativeFFI.Call(dll, func, argTypes, retType, nativeArgs);
+    }
+
+    /// <summary>
+    /// (dotnet:make-ffi-callback fn arg-types ret-type) => pointer
+    /// Expose the Lisp function FN as a native function pointer. ARG-TYPES is a list
+    /// of type keywords, RET-TYPE a keyword or NIL for void. The pointer stays valid
+    /// for the process lifetime (the delegate is rooted).
+    /// </summary>
+    public static LispObject MakeFfiCallback(LispObject[] args)
+    {
+        if (args.Length != 3)
+            throw new LispErrorException(new LispProgramError(
+                "dotnet:make-ffi-callback: requires (fn arg-types ret-type)"));
+        var ptr = NativeFFI.MakeCallback(args[0], args[1], args[2]);
+        return Fixnum.Make(ptr.ToInt64());
     }
 }

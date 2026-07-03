@@ -42,7 +42,10 @@
    #:stream-advance-to-column
    ;; Binary GFs
    #:stream-read-byte
-   #:stream-write-byte))
+   #:stream-write-byte
+   ;; Bulk sequence GFs
+   #:stream-read-sequence
+   #:stream-write-sequence))
 
 (in-package :dotcl-gray)
 
@@ -151,6 +154,23 @@
   (:documentation "Write BYTE (an integer) to STREAM."))
 
 ;;; ============================================================
+;;; Bulk sequence generic functions
+;;; ============================================================
+;;;
+;;; CL:READ-SEQUENCE / WRITE-SEQUENCE dispatch here (via the C# runtime) when
+;;; the stream is a Gray stream, so a subclass can provide an efficient bulk
+;;; implementation (e.g. flexi-streams decoding a whole octet buffer at once).
+;;; The default methods below fall back to the per-element char/byte generics,
+;;; matching the behavior of a stream that only implements stream-read-char etc.
+
+(defgeneric stream-read-sequence (stream seq &optional start end)
+  (:documentation "Fill SEQ from STREAM between START and END. Return the index
+of the first element not updated (i.e. START + number of elements read)."))
+
+(defgeneric stream-write-sequence (stream seq &optional start end)
+  (:documentation "Write SEQ to STREAM between START and END. Return SEQ."))
+
+;;; ============================================================
 ;;; Default methods
 ;;; ============================================================
 
@@ -193,7 +213,50 @@
 (defmethod stream-read-char-no-hang ((stream fundamental-input-stream))
   (stream-read-char stream))
 
+;;; Default stream-peek-char: read a character and put it back. Requires the
+;;; stream to implement stream-unread-char (as the Gray protocol expects for
+;;; peekable character input streams).
+(defmethod stream-peek-char ((stream fundamental-character-input-stream))
+  (let ((c (stream-read-char stream)))
+    (unless (eq c :eof)
+      (stream-unread-char stream c))
+    c))
+
 (defmethod stream-clear-input ((stream fundamental-input-stream))
   nil)
+
+;;; Default bulk methods: per-element loop over the char/byte generics.
+;;; A stream that specializes stream-read-sequence/stream-write-sequence (e.g.
+;;; flexi-streams) overrides these to decode/encode in bulk.
+
+(defmethod stream-read-sequence ((stream fundamental-character-input-stream) seq
+                                 &optional (start 0) (end (length seq)))
+  (do ((i start (1+ i)))
+      ((>= i end) i)
+    (let ((c (stream-read-char stream)))
+      (if (eq c :eof)
+          (return i)
+          (setf (elt seq i) c)))))
+
+(defmethod stream-read-sequence ((stream fundamental-binary-input-stream) seq
+                                 &optional (start 0) (end (length seq)))
+  (do ((i start (1+ i)))
+      ((>= i end) i)
+    (let ((b (stream-read-byte stream)))
+      (if (eq b :eof)
+          (return i)
+          (setf (elt seq i) b)))))
+
+(defmethod stream-write-sequence ((stream fundamental-character-output-stream) seq
+                                  &optional (start 0) (end (length seq)))
+  (do ((i start (1+ i)))
+      ((>= i end) seq)
+    (stream-write-char stream (elt seq i))))
+
+(defmethod stream-write-sequence ((stream fundamental-binary-output-stream) seq
+                                  &optional (start 0) (end (length seq)))
+  (do ((i start (1+ i)))
+      ((>= i end) seq)
+    (stream-write-byte stream (elt seq i))))
 
 (provide "dotcl-gray")

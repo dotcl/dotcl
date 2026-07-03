@@ -580,7 +580,25 @@ public static partial class Runtime
                 return $"{hname}-{nbF.Value}";
             if (hname == "UNSIGNED-BYTE" || hname == "SIGNED-BYTE") return hname;
             if (hname is "SINGLE-FLOAT" or "DOUBLE-FLOAT" or "SHORT-FLOAT" or "LONG-FLOAT" or "FLOAT") return hname;
-            if (hname == "INTEGER") return "INTEGER";
+            if (hname == "INTEGER")
+            {
+                // (integer LO HI) with constant bounds upgrades to the canonical
+                // fixed-width element type (CLHS upgraded-array-element-type):
+                // this is what routes e.g. (integer 0 2000) onto the unboxed
+                // ushort array backing instead of boxed general storage.
+                if (etCons.Cdr is Cons loC && loC.Car is Fixnum loF
+                    && loC.Cdr is Cons hiC && hiC.Car is Fixnum hiF
+                    && loF.Value <= hiF.Value)
+                {
+                    long lo = loF.Value, hi = hiF.Value;
+                    if (lo >= 0 && hi <= 1) return "BIT";
+                    if (lo >= 0 && hi <= byte.MaxValue) return "UNSIGNED-BYTE-8";
+                    if (lo >= 0 && hi <= ushort.MaxValue) return "UNSIGNED-BYTE-16";
+                    if (lo >= int.MinValue && hi <= int.MaxValue) return "SIGNED-BYTE-32";
+                    return "SIGNED-BYTE-64";
+                }
+                return "INTEGER";
+            }
             if (hname == "COMPLEX") return etCons.Cdr is Cons cc && cc.Car is Symbol cs ? $"COMPLEX-{cs.Name}" : "COMPLEX";
             // Try expanding compound user-defined types
             if (Runtime.TypeExpanders.TryGetValue(hname, out var compExpander))
@@ -1272,23 +1290,38 @@ public static partial class Runtime
             {
                 var csFn = fn;
                 lispFn = new LispFunction(fargs => {
-                    var textReader = Runtime.GetTextReader(fargs[0]);
-                    var reader = new Reader(textReader) { LispStreamRef = fargs[0] };
-                    // Propagate *read-suppress* from Lisp dynamic variable into the new Reader.
-                    // ReadList/ReadStep1 don't re-sync from the dynamic var, so a new Reader
-                    // created here would otherwise start with ReadSuppress=false even inside #+/#-.
-                    if (DynamicBindings.Get(Startup.Sym("*READ-SUPPRESS*")) is not Nil)
-                        reader.ReadSuppress = true;
-                    // Share #n=/#n# label tables with the stream so share references
-                    // work across Reader instances (e.g. when SBCL's Lisp reader calls
-                    // C# dispatch macros through GET-MACRO-CHARACTER)
-                    if (fargs[0] is LispStream ls5)
-                        reader.AdoptStreamShareTables(ls5);
-                    // Transfer unread char from stream to reader pushback
-                    if (fargs[0] is LispStream ls2 && ls2.UnreadCharValue != -1)
+                    // Reuse the stream's live CachedReader when present, same as the
+                    // GET-DISPATCH-MACRO-CHARACTER wrapper below: a fresh Reader here
+                    // both loses look-ahead push-back on return and — worse — can get
+                    // installed as the stream's CachedReader by the dispatch adapter
+                    // while carrying a ReadSuppress=true baseline (when created inside
+                    // a #+/#- discard), permanently suppressing all subsequent reads
+                    // on the stream (every later toplevel form reads as NIL).
+                    Reader reader;
+                    if (fargs[0] is LispStream lsCached0 && lsCached0.CachedReader != null)
                     {
-                        reader.UnreadChar(ls2.UnreadCharValue);
-                        ls2.UnreadCharValue = -1;
+                        reader = lsCached0.CachedReader;
+                    }
+                    else
+                    {
+                        var textReader = Runtime.GetTextReader(fargs[0]);
+                        reader = new Reader(textReader) { LispStreamRef = fargs[0] };
+                        // Propagate *read-suppress* from Lisp dynamic variable into the new Reader.
+                        // ReadList/ReadStep1 don't re-sync from the dynamic var, so a new Reader
+                        // created here would otherwise start with ReadSuppress=false even inside #+/#-.
+                        if (DynamicBindings.Get(Startup.Sym("*READ-SUPPRESS*")) is not Nil)
+                            reader.ReadSuppress = true;
+                        // Share #n=/#n# label tables with the stream so share references
+                        // work across Reader instances (e.g. when SBCL's Lisp reader calls
+                        // C# dispatch macros through GET-MACRO-CHARACTER)
+                        if (fargs[0] is LispStream ls5)
+                            reader.AdoptStreamShareTables(ls5);
+                        // Transfer unread char from stream to reader pushback
+                        if (fargs[0] is LispStream ls2 && ls2.UnreadCharValue != -1)
+                        {
+                            reader.UnreadChar(ls2.UnreadCharValue);
+                            ls2.UnreadCharValue = -1;
+                        }
                     }
                     char macroChar = ((LispChar)fargs[1]).Value;
                     var result = csFn(reader, macroChar);
@@ -1342,6 +1375,11 @@ public static partial class Runtime
                 : (LispReadtable)DynamicBindings.Get(Startup.Sym("*READTABLE*"));
             rt.SetDispatchMacroCharacter(dispChar, subChar, (reader, c, n) => {
                 LispObject stream = reader.LispStreamRef ?? new LispInputStream(reader.Input);
+                // Link this READ's live reader to the stream the handler receives, so that
+                // if the handler delegates to a built-in reader (via get-dispatch-macro-
+                // character) that reader reuses THIS reader and its look-ahead push-back
+                // re-reads on the enclosing read rather than being lost in a throwaway one.
+                if (stream is LispStream lsRef) lsRef.CachedReader = reader;
                 var result = Runtime.Funcall(lispFn, new LispObject[] {
                     stream, LispChar.Make(c),
                     n >= 0 ? (LispObject)Fixnum.Make(n) : Nil.Instance
@@ -1371,14 +1409,36 @@ public static partial class Runtime
             {
                 var capturedCsFn = csFn2;
                 return new LispFunction(fargs => {
-                    var textReader2 = Runtime.GetTextReader(fargs[0]);
-                    var reader2 = new Reader(textReader2) { LispStreamRef = fargs[0] };
-                    if (fargs[0] is LispStream ls6)
-                        reader2.AdoptStreamShareTables(ls6);
-                    if (fargs[0] is LispStream ls7 && ls7.UnreadCharValue != -1)
+                    // When invoked during a READ (the common case: a custom dispatch
+                    // handler delegating back to the built-in one), reuse the stream's
+                    // live CachedReader — the one the enclosing read is running on — so
+                    // any look-ahead the built-in handler pushes back (e.g. the
+                    // longest-match scan in ReadCharacterLiteral) lands in the SAME
+                    // reader and is re-read. A fresh Reader would buffer the pushed-back
+                    // chars and discard them on return, over-consuming to end of list.
+                    Reader reader2;
+                    if (fargs[0] is LispStream lsCached && lsCached.CachedReader != null)
                     {
-                        reader2.UnreadChar(ls7.UnreadCharValue);
-                        ls7.UnreadCharValue = -1;
+                        reader2 = lsCached.CachedReader;
+                    }
+                    else
+                    {
+                        var textReader2 = Runtime.GetTextReader(fargs[0]);
+                        reader2 = new Reader(textReader2) { LispStreamRef = fargs[0] };
+                        // Propagate *read-suppress* into the fresh Reader, same as the
+                        // GET-MACRO-CHARACTER path above. Without this a custom dispatch
+                        // handler delegating to the built-in #\ reader over a wrapped
+                        // stream loses suppress and signals on unknown char names, where
+                        // a plain stream (running on the live reader) returns nil.
+                        if (DynamicBindings.Get(Startup.Sym("*READ-SUPPRESS*")) is not Nil)
+                            reader2.ReadSuppress = true;
+                        if (fargs[0] is LispStream ls6)
+                            reader2.AdoptStreamShareTables(ls6);
+                        if (fargs[0] is LispStream ls7 && ls7.UnreadCharValue != -1)
+                        {
+                            reader2.UnreadChar(ls7.UnreadCharValue);
+                            ls7.UnreadCharValue = -1;
+                        }
                     }
                     char sc = ((LispChar)fargs[1]).Value;
                     int narg = fargs.Length > 2 && fargs[2] is Fixnum fi2 ? (int)fi2.Value : -1;

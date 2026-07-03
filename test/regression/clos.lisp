@@ -544,3 +544,106 @@
 (deftest i408-setf-find-class-alias-resolves
   (slot-value (make-instance (find-class (intern "WIDGET" :i408b-s1)) :x 7) 'x)
   7)
+
+;;; symbol-macrolet must shadow an enclosing lexical variable of the same name
+;;; (CLHS 5.1.2.1: the inner binding wins). Previously compile-var-ref found the
+;;; outer local first and never reached the symbol-macro on read.
+(deftest symbol-macrolet-shadows-outer-lexical
+  (let ((x 1)) (symbol-macrolet ((x 99)) x))
+  99)
+
+(deftest symbol-macrolet-shadows-outer-lexical-expansion
+  (let ((g 42) (x 'ignored)) (symbol-macrolet ((x (+ g 0))) x))
+  42)
+
+;;; with-accessors where an accessor variable name collides with the
+;;; instance-form variable must still expand to the accessor call, not resolve
+;;; to the instance. This is exactly flexi-streams' close method shape
+;;; ((stream flexi-stream-stream)) stream (close stream ...)), which otherwise
+;;; re-invoked itself on the instance and ran the control stack out.
+(defclass %wa-w () ((inner :initarg :inner :accessor %wa-inner)))
+(deftest with-accessors-name-collides-with-instance-var
+  (funcall (lambda (x) (with-accessors ((x %wa-inner)) x x))
+           (make-instance '%wa-w :inner 42))
+  42)
+
+;;; ---- EQL-specialized GF dispatch cache ----
+;;; Single-required-arg GFs whose EQL methods are all unqualified are cached
+;;; class-keyed; the hit path re-checks the EQL methods against the actual
+;;; value each call. These pin the reconstruction: EQL priority over class
+;;; primaries, call-next-method ordering, before-method participation,
+;;; no-applicable errors, and cache invalidation on defmethod.
+
+(defgeneric %eqlc-fib (x))
+(defmethod %eqlc-fib ((x (eql 0))) 10)
+(defmethod %eqlc-fib ((x (eql 1))) 11)
+(defmethod %eqlc-fib (x) (list :default x))
+
+;; Repeat so later iterations run on a warm cache, both EQL-hit and default.
+(deftest eql-cache-hot-loop
+  (let ((acc '()))
+    (dotimes (i 3)
+      (push (%eqlc-fib 0) acc)
+      (push (%eqlc-fib 1) acc)
+      (push (%eqlc-fib 5) acc))
+    (nreverse acc))
+  (10 11 (:default 5) 10 11 (:default 5) 10 11 (:default 5)))
+
+;; call-next-method from an EQL method reaches the class default (7.6.6 order),
+;; on a warm cache too.
+(defgeneric %eqlc-cnm (x))
+(defmethod %eqlc-cnm ((x (eql 1))) (cons :eql (call-next-method)))
+(defmethod %eqlc-cnm (x) (list :next x))
+(deftest eql-cache-call-next-method
+  (list (%eqlc-cnm 1) (%eqlc-cnm 1) (%eqlc-cnm 2))
+  ((:eql :next 1) (:eql :next 1) (:next 2)))
+
+;; EQL-only GF: next-method-p inside the body must be NIL (direct-invoke fast
+;; path publishes "no next method" to the captured closures).
+(defgeneric %eqlc-only (x))
+(defmethod %eqlc-only ((x (eql :a))) (next-method-p))
+(deftest eql-cache-only-nmp
+  (list (%eqlc-only :a) (%eqlc-only :a))
+  (nil nil))
+
+;; EQL-only GF called with a non-matching value of the SAME class after the
+;; cache is warm → no-applicable-method error (hit-path guard).
+(deftest eql-cache-no-applicable
+  (progn
+    (%eqlc-only :a)
+    (handler-case (progn (%eqlc-only :b) :no-error)
+      (error () :err)))
+  :err)
+
+;; Class :before methods still run when an EQL primary matches.
+(defclass %eqlc-rec () ())
+(defgeneric %eqlc-ba (x))
+(defvar *%eqlc-log* '())
+(defmethod %eqlc-ba :before ((x symbol)) (push :before *%eqlc-log*))
+(defmethod %eqlc-ba ((x (eql :k))) (push :eql *%eqlc-log*))
+(defmethod %eqlc-ba ((x symbol)) (push :sym *%eqlc-log*))
+(deftest eql-cache-before-runs
+  (progn
+    (setq *%eqlc-log* '())
+    (%eqlc-ba :k) (%eqlc-ba :k) (%eqlc-ba :other)
+    (nreverse *%eqlc-log*))
+  (:before :eql :before :eql :before :sym))
+
+;; defmethod after the cache is warm must invalidate it.
+(defgeneric %eqlc-inval (x))
+(defmethod %eqlc-inval (x) :old)
+(deftest eql-cache-invalidation
+  (list (%eqlc-inval 7)
+        (progn (eval '(defmethod %eqlc-inval ((x (eql 7))) :new))
+               (%eqlc-inval 7))
+        (%eqlc-inval 8))
+  (:old :new :old))
+
+;; Multi-required-arg EQL GFs stay uncached — CLHS ordering where a class
+;; method out-ranks an EQL method via the leftmost position must hold.
+(defgeneric %eqlc-two (x y))
+(defmethod %eqlc-two ((x integer) y) (list :int-first (when (next-method-p) (call-next-method))))
+(defmethod %eqlc-two ((x number) (y (eql 3))) (list :eql-y))
+(deftest eql-cache-multiarg-ordering
+  (list (%eqlc-two 5 3) (%eqlc-two 5 3))
+  ((:int-first (:eql-y)) (:int-first (:eql-y))))

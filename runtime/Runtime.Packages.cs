@@ -392,6 +392,7 @@ public static partial class Runtime
         else throw new LispErrorException(new LispTypeError("INTERN: invalid package designator", pkg));
 
         var (resultSym, isNew) = p.Intern(symName);
+        var canonical = CanonicalizeSymbol(resultSym);
         LispObject status;
         if (isNew)
         {
@@ -406,9 +407,20 @@ public static partial class Runtime
                 _                      => Startup.Keyword("INTERNAL"),
             };
         }
-        MultipleValues.Set(resultSym, status);
-        return resultSym;
+        MultipleValues.Set(canonical, status);
+        return canonical;
     }
+
+    /// <summary>Map the CL package's NIL/T table entries to their canonical runtime
+    /// objects. The reader yields Nil.Instance / T.Instance for the tokens NIL and T,
+    /// but the package table stores plain Symbol entries; INTERN / FIND-SYMBOL
+    /// returning the raw entries created a "second NIL" that EQ / NULL accept but
+    /// the printer and list walkers (proper-list checks are `is Nil`) reject —
+    /// e.g. SBCL's UNCROSS rebuilding a type spec via INTERN produced lists whose
+    /// tail printed as ". NIL" and made MAPCAR signal "not a proper list".</summary>
+    private static LispObject CanonicalizeSymbol(Symbol sym) =>
+        ReferenceEquals(sym, Startup.NIL_SYM) ? Nil.Instance :
+        ReferenceEquals(sym, Startup.T_SYM) ? (LispObject)T.Instance : sym;
 
     // --- Package operations for UIOP ---
 
@@ -690,8 +702,9 @@ public static partial class Runtime
             SymbolStatus.Inherited => Startup.Keyword("INHERITED"),
             _ => Nil.Instance
         };
-        MultipleValues.Set(status == SymbolStatus.None ? Nil.Instance : foundSym, statusSym);
-        return status == SymbolStatus.None ? Nil.Instance : foundSym;
+        var foundCanonical = status == SymbolStatus.None ? Nil.Instance : CanonicalizeSymbol(foundSym);
+        MultipleValues.Set(foundCanonical, statusSym);
+        return foundCanonical;
     }
 
     public static LispObject UninternSymbol(LispObject[] args)

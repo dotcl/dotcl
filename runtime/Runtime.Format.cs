@@ -82,7 +82,7 @@ public static partial class Runtime
             // the same trampoline the explicit-stream path uses, so
             // (format t ...) reaches it instead of leaking to the console.
             else if (resolvedStream is LispStream
-                     || (resolvedStream is LispInstance gi && IsGrayOutputStream(gi)))
+                     || (resolvedStream is LispInstance gi && (IsGrayOutputStream(gi) || IsGrayBinaryOutputStream(gi))))
             {
                 GetTextWriter(resolvedStream).Write(result2);
                 if (_pprintActive) PprintTrackWrite(result2);
@@ -100,7 +100,7 @@ public static partial class Runtime
         // LispStream): GetTextWriter trampolines the latter through
         // GrayStreamTextWriter -> stream-write-string / stream-write-char, the same
         // path write-string uses, so (format gray-stream ...) works.
-        else if (dest is LispStream || (dest is LispInstance gdi && IsGrayOutputStream(gdi)))
+        else if (dest is LispStream || (dest is LispInstance gdi && (IsGrayOutputStream(gdi) || IsGrayBinaryOutputStream(gdi))))
         {
             GetTextWriter(dest).Write(result2);
             if (_pprintActive) PprintTrackWrite(result2);
@@ -941,7 +941,7 @@ public static partial class Runtime
             // through GetTextWriter like the explicit-stream path so
             // (format t ...) reaches it instead of the console.
             else if (resolvedStream is LispStream
-                     || (resolvedStream is LispInstance gi && IsGrayOutputStream(gi)))
+                     || (resolvedStream is LispInstance gi && (IsGrayOutputStream(gi) || IsGrayBinaryOutputStream(gi))))
             {
                 GetTextWriter(resolvedStream).Write(result);
                 if (_pprintActive) PprintTrackWrite(result);
@@ -958,7 +958,7 @@ public static partial class Runtime
         // A built-in stream, OR a Gray output stream (a CLOS instance, not a
         // LispStream): GetTextWriter trampolines the latter through
         // GrayStreamTextWriter so (format gray-stream ...) works.
-        else if (dest is LispStream || (dest is LispInstance gdi && IsGrayOutputStream(gdi)))
+        else if (dest is LispStream || (dest is LispInstance gdi && (IsGrayOutputStream(gdi) || IsGrayBinaryOutputStream(gdi))))
         {
             GetTextWriter(dest).Write(result);
             if (_pprintActive) PprintTrackWrite(result);

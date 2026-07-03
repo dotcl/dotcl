@@ -68,6 +68,23 @@ public static partial class Runtime
         {
             int i => Fixnum.Make(i),
             long l => Fixnum.Make(l),
+            // C# type patterns do not implicitly widen, so the small integer types must
+            // be matched explicitly or they fall through to LispDotNetObject (boxed),
+            // breaking byte[] reads (UTF-8 codecs, binary protocols) and any reflection
+            // call returning a byte/short-family scalar. All fit in a 64-bit fixnum
+            // except ulong/nuint above long.MaxValue, which promote to a bignum.
+            byte b8 => Fixnum.Make(b8),
+            sbyte sb => Fixnum.Make(sb),
+            short s16 => Fixnum.Make(s16),
+            ushort u16 => Fixnum.Make(u16),
+            uint u32 => Fixnum.Make(u32),
+            ulong u64 => u64 <= long.MaxValue
+                ? Fixnum.Make((long)u64)
+                : (LispObject)Bignum.MakeInteger((System.Numerics.BigInteger)u64),
+            nint ni => Fixnum.Make((long)ni),
+            nuint nu => (ulong)nu <= long.MaxValue
+                ? Fixnum.Make((long)nu)
+                : (LispObject)Bignum.MakeInteger((System.Numerics.BigInteger)(ulong)nu),
             double d => new DoubleFloat(d),
             float f => new DoubleFloat(f),
             string s => new LispString(s),
@@ -636,6 +653,15 @@ public static partial class Runtime
             if (targetType == typeof(float)) return (float)fx.Value;
             if (targetType == typeof(short)) return (short)fx.Value;
             if (targetType == typeof(byte)) return (byte)fx.Value;
+            // The remaining small integer types, symmetric with DotNetToLisp's read
+            // side: without these a (setf (aref a i) n) into a sbyte[]/ushort[]/uint[]/…
+            // (dotnet:make-array store) fails with "Cannot convert Fixnum to SByte".
+            if (targetType == typeof(sbyte)) return (sbyte)fx.Value;
+            if (targetType == typeof(ushort)) return (ushort)fx.Value;
+            if (targetType == typeof(uint)) return (uint)fx.Value;
+            if (targetType == typeof(ulong)) return (ulong)fx.Value;
+            if (targetType == typeof(nint)) return (nint)fx.Value;
+            if (targetType == typeof(nuint)) return (nuint)fx.Value;
             if (targetType == typeof(decimal)) return (decimal)fx.Value;
             if (targetType == typeof(object)) return fx.Value;
         }
@@ -858,6 +884,27 @@ public static partial class Runtime
         var asm = System.Reflection.Assembly.LoadFrom(System.IO.Path.GetFullPath(path));
         return new LispString(asm.FullName ?? path);
     }
+
+    // Registerable resolver tables, populated from Lisp (e.g. the nuget contrib
+    // that reads project.assets.json after `dotnet restore`). The Default ALC's
+    // Resolving / ResolvingUnmanagedDll hooks (Startup.cs) consult these so a managed
+    // assembly resolves to the exact version-unified path and a native library resolves
+    // to its RID-specific path — without baking any NuGet logic into the runtime.
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, string>
+        _registeredAssemblyPaths = new(StringComparer.OrdinalIgnoreCase);
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, string>
+        _registeredNativePaths = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>Register managed assembly simple-name → absolute .dll path (dotcl:register-assembly-path).</summary>
+    internal static void RegisterAssemblyPath(string name, string path) => _registeredAssemblyPaths[name] = path;
+    /// <summary>Register native library name → absolute path (dotcl:register-native-path).</summary>
+    internal static void RegisterNativePath(string name, string path) => _registeredNativePaths[name] = path;
+    /// <summary>Look up a registered managed assembly path by simple name, or null.</summary>
+    internal static string? FindRegisteredAssembly(string name) =>
+        _registeredAssemblyPaths.TryGetValue(name, out var p) ? p : null;
+    /// <summary>Look up a registered native library path by name, or null.</summary>
+    internal static string? FindRegisteredNative(string name) =>
+        _registeredNativePaths.TryGetValue(name, out var p) ? p : null;
 
     internal static string? FindSharedFrameworkDll(string assemblyName)
     {

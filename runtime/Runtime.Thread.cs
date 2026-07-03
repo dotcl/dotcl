@@ -72,6 +72,32 @@ public class LispSemaphore : LispObject
         $"#<SEMAPHORE \"{SemName}\" count={Sem.CurrentCount}>";
 }
 
+/// <summary>
+/// A single 64-bit cell supporting lock-free atomic compare-and-swap, increment,
+/// and decrement via System.Threading.Interlocked. The atomic concurrency
+/// primitive layer (alongside LispLock); bordeaux-threads' atomic-integer is meant
+/// to back its counter cell with one of these. Values are treated as signed 64-bit,
+/// which covers all realistic counter use (full unsigned-64 would need bit
+/// reinterpretation on read).
+/// </summary>
+public sealed class LispAtomicLong : LispObject
+{
+    private long _value;
+    public LispAtomicLong(long value) => _value = value;
+
+    /// <summary>Atomic read.</summary>
+    public long Read() => System.Threading.Interlocked.Read(ref _value);
+    /// <summary>Atomic write, returns the new value.</summary>
+    public long Write(long v) { System.Threading.Interlocked.Exchange(ref _value, v); return v; }
+    /// <summary>CAS: if the current value == old, set to @new and return true.</summary>
+    public bool CompareAndSwap(long old, long @new)
+        => System.Threading.Interlocked.CompareExchange(ref _value, @new, old) == old;
+    /// <summary>Atomic add, returns the new value.</summary>
+    public long Add(long delta) => System.Threading.Interlocked.Add(ref _value, delta);
+
+    public override string ToString() => $"#<ATOMIC-LONG {Read()}>";
+}
+
 public partial class Runtime
 {
     [ThreadStatic]
@@ -79,6 +105,50 @@ public partial class Runtime
 
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<int, LispThread>
         _threadRegistry = new();
+
+    // --- atomic-long helpers (dotcl:make-atomic-long et al.) ---
+    private static LispAtomicLong AtomicLongArg(LispObject[] args, int i, string fn)
+        => (i < args.Length ? args[i] : Nil.Instance) as LispAtomicLong
+           ?? throw new LispErrorException(new LispTypeError(
+               $"{fn}: not an ATOMIC-LONG", i < args.Length ? args[i] : Nil.Instance,
+               Startup.Sym("T")));
+    private static long AtomicLongInt(LispObject o, string fn) => o switch
+    {
+        Fixnum f => f.Value,
+        Bignum b => (long)b.Value,
+        _ => throw new LispErrorException(new LispTypeError(
+            $"{fn}: integer expected", o, Startup.Sym("INTEGER")))
+    };
+    private static LispObject AtomicLongResult(long v)
+        => Bignum.MakeInteger((System.Numerics.BigInteger)v);
+
+    internal static LispObject MakeAtomicLong(LispObject[] args)
+        => new LispAtomicLong(args.Length > 0 && args[0] is not Nil
+               ? AtomicLongInt(args[0], "MAKE-ATOMIC-LONG") : 0L);
+    internal static LispObject AtomicLongValue(LispObject[] args)
+        => AtomicLongResult(AtomicLongArg(args, 0, "ATOMIC-LONG-VALUE").Read());
+    internal static LispObject SetAtomicLongValue(LispObject[] args)
+        // (set-atomic-long-value al newval) and the (setf atomic-long-value) order
+        // (newval al) are both accepted: pick the ATOMIC-LONG and the integer by type.
+    {
+        var al = (args[0] as LispAtomicLong) ?? (args.Length > 1 ? args[1] as LispAtomicLong : null)
+                 ?? throw new LispErrorException(new LispTypeError(
+                     "SET-ATOMIC-LONG-VALUE: no ATOMIC-LONG argument", args[0], Startup.Sym("T")));
+        var nv = ReferenceEquals(al, args[0]) ? args[1] : args[0];
+        al.Write(AtomicLongInt(nv, "SET-ATOMIC-LONG-VALUE"));
+        return nv;
+    }
+    internal static LispObject AtomicLongCas(LispObject[] args)
+        => AtomicLongArg(args, 0, "ATOMIC-LONG-CAS").CompareAndSwap(
+               AtomicLongInt(args[1], "ATOMIC-LONG-CAS"),
+               AtomicLongInt(args[2], "ATOMIC-LONG-CAS"))
+           ? T.Instance : (LispObject)Nil.Instance;
+    internal static LispObject AtomicLongIncf(LispObject[] args)
+        => AtomicLongResult(AtomicLongArg(args, 0, "ATOMIC-LONG-INCF").Add(
+               args.Length > 1 ? AtomicLongInt(args[1], "ATOMIC-LONG-INCF") : 1L));
+    internal static LispObject AtomicLongDecf(LispObject[] args)
+        => AtomicLongResult(AtomicLongArg(args, 0, "ATOMIC-LONG-DECF").Add(
+               -(args.Length > 1 ? AtomicLongInt(args[1], "ATOMIC-LONG-DECF") : 1L)));
 
     /// <summary>
     /// (bt:make-thread function &key name)

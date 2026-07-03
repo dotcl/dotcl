@@ -405,21 +405,21 @@ public static partial class Runtime
             // condition is a LispInstanceCondition wrapping the CLOS instance, so it never
             // reaches the LispInstance print-object dispatch below — route it here, else the
             // native FormatControl/Message fallback prints "#<TYPE>".
-            if (condReport is LispInstanceCondition lic && !_inInstancePrintObjectDispatch)
+            if (condReport is LispInstanceCondition lic)
             {
                 var poSym = Startup.Sym("PRINT-OBJECT");
                 if (poSym?.Function is GenericFunction gf
-                    && HasSpecializedPrintObjectMethodForInstance(gf, lic.Instance))
+                    && HasSpecializedPrintObjectMethodForInstance(gf, lic.Instance)
+                    && EnterPrintObject(lic.Instance))
                 {
                     // The generated print-object method branches on the dynamic *PRINT-ESCAPE*
                     // (call-next-method when set, the report otherwise). We're on the
-                    // escape=false path; InvokePrintObjectBound binds it to NIL .
+                    // escape=false path; InvokePrintObjectBound binds it to NIL.
                     // No catch: a real error inside the user's print-object (e.g. a TYPE-ERROR
-                    // in an esrap report) must propagate, not be swallowed into "#<TYPE>" — that
-                    // hid the true cause during debugging .
-                    _inInstancePrintObjectDispatch = true;
+                    // in a parser-library report) must propagate, not be swallowed into
+                    // "#<TYPE>" — that hid the true cause during debugging.
                     try { return InvokePrintObjectBound(gf, lic.Instance, false); }
-                    finally { _inInstancePrintObjectDispatch = false; }
+                    finally { ExitPrintObject(lic.Instance); }
                 }
             }
             return GetConditionReport(condReport);
@@ -1271,8 +1271,20 @@ public static partial class Runtime
         finally { _formatConsDepth--; }
     }
 
-    [System.ThreadStatic] private static bool _inStructPrintObjectDispatch;
-    [System.ThreadStatic] private static bool _inInstancePrintObjectDispatch;
+    // Objects currently inside their own print-object dispatch, tracked by reference
+    // identity. Re-entering the SAME object falls back to the default printer (guards
+    // against self-recursion), but a nested DIFFERENT object — even of the same
+    // category (struct-in-struct, instance-in-instance) — must dispatch its own
+    // print-object. A per-category boolean wrongly suppressed all same-category
+    // nesting, falling inner objects back to #S(...) / #<...>.
+    [System.ThreadStatic] private static HashSet<object>? _printObjectActive;
+
+    /// <summary>Begin print-object dispatch for OBJ. Returns false if OBJ is already
+    /// being printed (self-recursion) — caller must use the default printer then.</summary>
+    private static bool EnterPrintObject(object obj)
+        => (_printObjectActive ??= new HashSet<object>(
+                System.Collections.Generic.ReferenceEqualityComparer.Instance)).Add(obj);
+    private static void ExitPrintObject(object obj) => _printObjectActive?.Remove(obj);
 
     /// <summary>Invoke a user PRINT-OBJECT method, binding the Lisp dynamic *PRINT-ESCAPE*
     /// to the printer's current ESCAPE so the method sees the value princ/prin1/~A/~S
@@ -1306,32 +1318,26 @@ public static partial class Runtime
             // LispStruct: check for specialized print-object method first
             if (obj is LispStruct st)
             {
-                if (!_inStructPrintObjectDispatch)
+                var poSym = Startup.Sym("PRINT-OBJECT");
+                if (poSym?.Function is GenericFunction gf && HasSpecializedPrintObjectMethod(gf, st)
+                    && EnterPrintObject(st))
                 {
-                    var poSym = Startup.Sym("PRINT-OBJECT");
-                    if (poSym?.Function is GenericFunction gf && HasSpecializedPrintObjectMethod(gf, st))
-                    {
-                        _inStructPrintObjectDispatch = true;
-                        try { return InvokePrintObjectBound(gf, st, escape); }
-                        catch { }
-                        finally { _inStructPrintObjectDispatch = false; }
-                    }
+                    // No catch: a real error inside the user's print-object must propagate,
+                    // not be swallowed into the default #S(...) printer.
+                    try { return InvokePrintObjectBound(gf, st, escape); }
+                    finally { ExitPrintObject(st); }
                 }
                 return FormatStruct(st, escape);
             }
             // LispInstance (CLOS): dispatch to print-object GF if specialized method exists
             if (obj is LispInstance inst)
             {
-                if (!_inInstancePrintObjectDispatch)
+                var poSym = Startup.Sym("PRINT-OBJECT");
+                if (poSym?.Function is GenericFunction gfInst && HasSpecializedPrintObjectMethodForInstance(gfInst, inst)
+                    && EnterPrintObject(inst))
                 {
-                    var poSym = Startup.Sym("PRINT-OBJECT");
-                    if (poSym?.Function is GenericFunction gfInst && HasSpecializedPrintObjectMethodForInstance(gfInst, inst))
-                    {
-                        _inInstancePrintObjectDispatch = true;
-                        try { return InvokePrintObjectBound(gfInst, inst, escape); }
-                        catch { }
-                        finally { _inInstancePrintObjectDispatch = false; }
-                    }
+                    try { return InvokePrintObjectBound(gfInst, inst, escape); }
+                    finally { ExitPrintObject(inst); }
                 }
                 return inst.ToString();
             }

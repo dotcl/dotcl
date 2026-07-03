@@ -171,6 +171,15 @@
     <PackageReference Include="System.Text.Json" Version="8.0.5" />
   </ItemGroup>
 
+  <!-- ns2.0 lacks in-box Span<T> and ValueTask, which the runtime uses directly
+       (Stream.cs, Runtime.DotNet.cs). The plain ns2.0 build got them transitively
+       via System.Text.Json; the JSON-free build drops that, so reference them
+       explicitly for all ns2.0 builds. Both are pure-IL and IL2CPP/WebGL-safe. -->
+  <ItemGroup Condition="'$(TargetFramework)' == 'netstandard2.0'">
+    <PackageReference Include="System.Memory" Version="4.5.5" />
+    <PackageReference Include="System.Threading.Tasks.Extensions" Version="4.5.4" />
+  </ItemGroup>
+
   <!-- Auto-generate UnicodeCharNames.g.cs if missing.
        Runs only when the output file does not exist (Condition on the target).
        Downloads UnicodeData.txt on first use, then generates the C# source. -->

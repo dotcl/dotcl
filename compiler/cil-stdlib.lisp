@@ -543,7 +543,27 @@
       (s tree))))
 
 (defun nsubst (new old tree &key (test #'eql) test-not (key #'identity))
-  (subst new old tree :test test :test-not test-not :key key))
+  ;; Genuinely destructive: callers rely on the tree being mutated in place
+  ;; and may discard the return value. SBCL's PROPAGATE-LVAR-ANNOTATIONS does
+  ;; (nsubst new old (annotation-deps dep)) to redirect dependency lists when
+  ;; lvars are substituted; the previous subst-alias left the deps pointing at
+  ;; dead lvars (type NIL) and every funarg call-type check warned.
+  (let ((key (or key #'identity)))
+    (labels ((match-p (node)
+               (let ((k (funcall key node)))
+                 (if test-not
+                     (not (funcall test-not old k))
+                     (funcall test old k))))
+             (s (node)
+               (cond ((match-p node) new)
+                     ((consp node)
+                      (let ((a (s (car node)))
+                            (d (s (cdr node))))
+                        (unless (eq a (car node)) (rplaca node a))
+                        (unless (eq d (cdr node)) (rplacd node d)))
+                      node)
+                     (t node))))
+      (s tree))))
 
 (defun subst-if (new predicate tree &key (key #'identity))
   (let ((key (or key #'identity)))
@@ -561,7 +581,17 @@
       (s tree))))
 
 (defun nsubst-if (new predicate tree &key (key #'identity))
-  (subst-if new predicate tree :key key))
+  (let ((key (or key #'identity)))
+    (labels ((s (node)
+               (cond ((funcall predicate (funcall key node)) new)
+                     ((consp node)
+                      (let ((a (s (car node)))
+                            (d (s (cdr node))))
+                        (unless (eq a (car node)) (rplaca node a))
+                        (unless (eq d (cdr node)) (rplacd node d)))
+                      node)
+                     (t node))))
+      (s tree))))
 
 (defun subst-if-not (new predicate tree &key (key #'identity))
   (let ((key (or key #'identity)))
@@ -579,7 +609,17 @@
       (s tree))))
 
 (defun nsubst-if-not (new predicate tree &key (key #'identity))
-  (subst-if-not new predicate tree :key key))
+  (let ((key (or key #'identity)))
+    (labels ((s (node)
+               (cond ((not (funcall predicate (funcall key node))) new)
+                     ((consp node)
+                      (let ((a (s (car node)))
+                            (d (s (cdr node))))
+                        (unless (eq a (car node)) (rplaca node a))
+                        (unless (eq d (cdr node)) (rplacd node d)))
+                      node)
+                     (t node))))
+      (s tree))))
 
 (defun sublis (alist tree &key (test #'eql) test-not (key #'identity))
   (let ((key (or key #'identity)))
@@ -663,11 +703,27 @@
          (error 'type-error :datum result :expected-type result-type))
        (coerce result 'bit-vector))
       ((eq cat :vector)
-       ;; Check compound size constraint: (vector * n)
-       (when (and (consp result-type) (consp (cdr result-type)) (consp (cddr result-type))
-                  (integerp (caddr result-type))
-                  (/= (length result) (caddr result-type)))
-         (error 'type-error :datum result :expected-type result-type))
+       ;; Check the compound size constraint. The third element means
+       ;; different things per base type (CLHS): (vector elt N) — N is a
+       ;; LENGTH; (array elt N) / (simple-array elt N) — N is a RANK, and
+       ;; a length constraint is spelled (simple-array elt (N)). SBCL's
+       ;; perfectly-hashable maps into (simple-array (unsigned-byte 32) 1)
+       ;; — rank 1, any length.
+       (when (and (consp result-type) (consp (cdr result-type)) (consp (cddr result-type)))
+         (let* ((base-name (symbol-name (car result-type)))
+                (arrayp (member base-name '("ARRAY" "SIMPLE-ARRAY") :test #'string=))
+                (spec (caddr result-type))
+                (required-length
+                  (cond ((not arrayp) (and (integerp spec) spec))
+                        ;; (array elt (N)) — single-dimension length
+                        ((and (consp spec) (integerp (car spec)) (null (cdr spec)))
+                         (car spec))
+                        (t nil))))
+           ;; (array elt RANK) with rank /= 1 is not a sequence type
+           (when (and arrayp (integerp spec) (/= spec 1))
+             (error 'type-error :datum result :expected-type result-type))
+           (when (and required-length (/= (length result) required-length))
+             (error 'type-error :datum result :expected-type result-type))))
        (coerce result 'vector))
       ((eq cat :list) result)
       (t

@@ -516,8 +516,17 @@ internal class CachedDispatch
     public List<LispMethod>? Applicable; // for built-in method combination
     public bool HasEqlSpecializers;
     public bool IsBuiltinCombination;
-    /// <summary>EQL-specialized methods to check on cache hit (only when HasEqlSpecializers).</summary>
+    /// <summary>EQL-specialized methods to check on cache hit (only when HasEqlSpecializers).
+    /// Stored only for single-required-arg GFs whose EQL methods are all unqualified
+    /// (see the DispatchGF cache-store comment), so each entry's EQL specializer is
+    /// at argument position 0.</summary>
     public LispMethod[]? EqlMethods;
+    /// <summary>EqlMethods[i]'s EQL value (precomputed — the hit path compares the
+    /// argument against this directly instead of re-walking the specializer cons).</summary>
+    public LispObject[]? EqlValues;
+    /// <summary>Precomputed effective primary chain for EqlMethods[i]:
+    /// [EqlMethods[i], ..non-EQL primaries..] — avoids a per-hit list allocation.</summary>
+    public List<LispMethod>[]? EqlChains;
 }
 
 public class GenericFunction : LispFunction

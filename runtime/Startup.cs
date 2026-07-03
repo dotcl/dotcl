@@ -144,8 +144,21 @@ public static class Startup
         System.Runtime.Loader.AssemblyLoadContext.Default.Resolving += (ctx, name) =>
         {
             if (name.Name == null) return null;
+            // Registered (e.g. NuGet-resolved) paths first — they carry the exact,
+            // version-unified assembly from project.assets.json. Then shared framework.
+            var reg = Runtime.FindRegisteredAssembly(name.Name);
+            if (reg != null) return ctx.LoadFromAssemblyPath(reg);
             var dll = Runtime.FindSharedFrameworkDll(name.Name);
             return dll != null ? ctx.LoadFromAssemblyPath(dll) : null;
+        };
+        // Native (unmanaged) DLL resolution: a registered RID-specific native library
+        // path (libSkiaSharp / libHarfBuzzSharp / ANGLE, …) is loaded on demand.
+        System.Runtime.Loader.AssemblyLoadContext.Default.ResolvingUnmanagedDll += (asm, libName) =>
+        {
+            var p = Runtime.FindRegisteredNative(libName);
+            return p != null
+                ? System.Runtime.InteropServices.NativeLibrary.Load(p)
+                : System.IntPtr.Zero;
         };
 #endif
 
@@ -1894,6 +1907,47 @@ public static class Startup
         RegisterDotcl("WAIT-ON-SEMAPHORE",
             new LispFunction(Runtime.WaitOnSemaphore, "WAIT-ON-SEMAPHORE", -1));
 
+        // Atomic single-cell primitives (Interlocked-backed). Concurrency layer
+        // alongside MAKE-LOCK; bordeaux-threads' atomic-integer backs its counter
+        // with one of these for lock-free compare-and-swap / incf / decf.
+        RegisterDotcl("MAKE-ATOMIC-LONG",
+            new LispFunction(Runtime.MakeAtomicLong, "MAKE-ATOMIC-LONG", -1));
+        RegisterDotcl("ATOMIC-LONG-P",
+            new LispFunction(args => args.Length > 0 && args[0] is LispAtomicLong
+                ? (LispObject)T.Instance : Nil.Instance, "ATOMIC-LONG-P", 1));
+        RegisterDotcl("ATOMIC-LONG-VALUE",
+            new LispFunction(Runtime.AtomicLongValue, "ATOMIC-LONG-VALUE", 1));
+        RegisterDotcl("SET-ATOMIC-LONG-VALUE",
+            new LispFunction(Runtime.SetAtomicLongValue, "SET-ATOMIC-LONG-VALUE", 2));
+        RegisterDotcl("ATOMIC-LONG-CAS",
+            new LispFunction(Runtime.AtomicLongCas, "ATOMIC-LONG-CAS", 3));
+        RegisterDotcl("ATOMIC-LONG-INCF",
+            new LispFunction(Runtime.AtomicLongIncf, "ATOMIC-LONG-INCF", -1));
+        RegisterDotcl("ATOMIC-LONG-DECF",
+            new LispFunction(Runtime.AtomicLongDecf, "ATOMIC-LONG-DECF", -1));
+
+        // Assembly/native resolver registration. The Default ALC's Resolving /
+        // ResolvingUnmanagedDll hooks consult these tables, so a contrib (e.g.
+        // the nuget contrib, reading project.assets.json after `dotnet restore`) can teach
+        // the runtime exact version-unified managed paths and RID-specific native
+        // paths without baking NuGet logic into the runtime. (name path) -> path.
+        RegisterDotcl("REGISTER-ASSEMBLY-PATH", new LispFunction(args =>
+        {
+            if (args.Length != 2) throw new LispErrorException(new LispProgramError(
+                "REGISTER-ASSEMBLY-PATH: requires (name path)"));
+            var path = Runtime.AsStringDesignator(args[1], "REGISTER-ASSEMBLY-PATH");
+            Runtime.RegisterAssemblyPath(Runtime.AsStringDesignator(args[0], "REGISTER-ASSEMBLY-PATH"), path);
+            return new LispString(path);
+        }, "REGISTER-ASSEMBLY-PATH", 2));
+        RegisterDotcl("REGISTER-NATIVE-PATH", new LispFunction(args =>
+        {
+            if (args.Length != 2) throw new LispErrorException(new LispProgramError(
+                "REGISTER-NATIVE-PATH: requires (name path)"));
+            var path = Runtime.AsStringDesignator(args[1], "REGISTER-NATIVE-PATH");
+            Runtime.RegisterNativePath(Runtime.AsStringDesignator(args[0], "REGISTER-NATIVE-PATH"), path);
+            return new LispString(path);
+        }, "REGISTER-NATIVE-PATH", 2));
+
         // REPL readline hook — set by (dotcl-repl:enable)
         RegisterDotclInternal("%SET-REPL-READLINE-HOOK", new LispFunction(args =>
         {
@@ -2007,6 +2061,11 @@ public static class Startup
         RegisterDotNet(DotNetPkg, "%FFI-CALL", new LispFunction(Runtime.FfiCall, "DOTNET:%FFI-CALL", -1));
         RegisterDotNet(DotNetPkg, "FFI", new LispFunction(Runtime.FfiCallKeyword, "DOTNET:FFI", -1),
             "(dotnet:ffi dll func :args '(type ...) :ret type &rest args) => value\nCall a native (P/Invoke) function FUNC in shared library DLL. :args gives the\nparameter types and :ret the return type; ARGS are marshalled accordingly.");
+        // make-ffi-callback builds its native thunk with DynamicMethod
+        // (NativeFFI.MakeCallback in Runtime.FFI.cs, excluded from the emit-free
+        // build) — register it under the same gate.
+        RegisterDotNet(DotNetPkg, "MAKE-FFI-CALLBACK", new LispFunction(Runtime.MakeFfiCallback, "DOTNET:MAKE-FFI-CALLBACK", -1),
+            "(dotnet:make-ffi-callback fn arg-types ret-type) => pointer\nExpose the Lisp function FN as a native function pointer callable from C. ARG-TYPES\nis a list of type keywords, RET-TYPE a keyword or NIL for void.");
 #endif
         RegisterDotNet(DotNetPkg, "%FFI-CALL-PTR", new LispFunction(Runtime.FfiCallPtr, "DOTNET:%FFI-CALL-PTR", -1));
         RegisterDotNet(DotNetPkg, "ALLOC-MEM", new LispFunction(Runtime.AllocMem, "DOTNET:ALLOC-MEM", -1),

@@ -88,6 +88,13 @@ public class Reader
     /// <summary>Character position (number of chars consumed minus pushbacks). Useful for read-from-string.</summary>
     public int Position { get; private set; }
 
+    /// <summary>Chars pulled from the underlying input but currently held in lookahead
+    /// (pushback / prepend buffer) — i.e. read physically but not logically consumed.
+    /// Used by READ-FROM-STRING to derive position from the underlying reader's char
+    /// count even when reader-macros consume via the stream API (read-char/read over a
+    /// concatenated wrap), which bypasses this Reader's own Position counter.</summary>
+    public int PendingLookahead => (_hasPushback ? 1 : 0) + (_inputPrefix.Length - _inputPrefixPos);
+
     /// <summary>Line number where the most recently read form started.</summary>
     public int LastFormLine { get; private set; } = 1;
 
@@ -1274,51 +1281,21 @@ public class Reader
 
         if (_readSuppress) return Nil.Instance;
 
-        // Collect all space-separated words for longest-match.
-        // For each space we tentatively consume: if no word follows, push the space back.
-        var allWords = new List<string> { firstName };
-        while (Peek() == ' ')
-        {
-            ReadChar(); // consume space
-            var wordSb = new StringBuilder();
-            while (true)
-            {
-                int next = Peek();
-                if (next == -1 || IsTerminating(next)) break;
-                ReadChar();
-                wordSb.Append((char)next);
-            }
-            if (wordSb.Length == 0)
-            {
-                PrependToInput(" "); // push the space back — nothing followed it
-                break;
-            }
-            allWords.Add(wordSb.ToString());
-        }
-
-        // Try from longest to shortest; push back unconsumed words on a shorter match.
-        // Fallback: a single initial char that matches no named character is itself.
-        for (int len = allWords.Count; len >= 1; len--)
-        {
-            var candidate = string.Join(" ", allWords.Take(len));
-            var ch = Runtime.NameChar(candidate);
-            if (ch.HasValue)
-            {
-                if (len < allWords.Count)
-                    PrependToInput(" " + string.Join(" ", allWords.Skip(len)));
-                return LispChar.Make(ch.Value);
-            }
-            // Single-char fallback: the initial char with no name match is the char itself.
-            // Push back any speculatively consumed words.
-            if (len == 1 && candidate.Length == 1)
-            {
-                if (allWords.Count > 1)
-                    PrependToInput(" " + string.Join(" ", allWords.Skip(1)));
-                return LispChar.Make(candidate[0]);
-            }
-        }
-
-        throw MakeReaderError($"Unknown character name: {string.Join(" ", allWords)}");
+        // The character name is the single constituent token in firstName (read up to
+        // the first whitespace/terminator/EOF, which was only peeked — not consumed).
+        // Per CLHS, #\ reads ONE token; space-separated multi-word names are not #\
+        // syntax. Multi-glyph UCD names print with underscores (#\LATIN_SMALL_LETTER_A)
+        // and name-char accepts those, so they still round-trip. Resolving from one
+        // token — rather than scanning ahead over space-separated words and pushing the
+        // surplus back — avoids over-reading, which desynced custom dispatch and
+        // concatenated-stream readers (the look-ahead was consumed from the underlying
+        // stream but the push-back went to a buffer the enclosing read couldn't see).
+        if (firstName.Length == 1)
+            return LispChar.Make(firstName[0]);
+        var named = Runtime.NameChar(firstName);
+        if (named.HasValue)
+            return LispChar.Make(named.Value);
+        throw MakeReaderError($"Unknown character name: {firstName}");
     }
 
     internal LispObject ReadVector(int numArg = -1)

@@ -427,8 +427,8 @@ public static partial class Runtime
 
     private static int SortCompare(LispFunction fn, LispFunction? keyFn, LispObject a, LispObject b)
     {
-        var ka = keyFn != null ? keyFn.Invoke1(a) : a;
-        var kb = keyFn != null ? keyFn.Invoke1(b) : b;
+        var ka = ApplyKeyFn(keyFn, a);
+        var kb = ApplyKeyFn(keyFn, b);
         if (IsTruthy(fn.Invoke2(ka, kb))) return -1;
         if (IsTruthy(fn.Invoke2(kb, ka))) return 1;
         return 0;
@@ -845,9 +845,22 @@ public static partial class Runtime
         return kw;
     }
 
+    // :key / user-function results must flow as their PRIMARY value: a key fn
+    // returning (values a b ...) hands an MvReturn to :test otherwise (SBCL's
+    // %find-position with :key #'parse-optional-arg-spec hit STRING= with an
+    // MvReturn at make-host-2 stem 8).
+    private static LispObject ApplySeqKey(SeqKwArgs kw, LispObject elem)
+        => kw.Key != null ? UnwrapMv(kw.Key.Invoke1(elem)) : elem;
+
+    private static LispObject ApplyKeyFn(LispFunction? keyFn, LispObject elem)
+        => keyFn != null ? UnwrapMv(keyFn.Invoke1(elem)) : elem;
+
+    private static LispObject ApplySeqKey(ListKwArgs kw, LispObject elem)
+        => kw.Key != null ? UnwrapMv(kw.Key.Invoke1(elem)) : elem;
+
     private static bool SeqTestMatch(LispObject item, LispObject elem, SeqKwArgs kw)
     {
-        var val = kw.Key != null ? kw.Key.Invoke1(elem) : elem;
+        var val = ApplySeqKey(kw, elem);
         if (kw.TestNot != null)
             return !IsTruthy(kw.TestNot.Invoke2(item, val));
         if (kw.Test != null)
@@ -929,14 +942,14 @@ public static partial class Runtime
                 LispObject result = Nil.Instance;
                 for (int i = start; i < end; i++)
                 {
-                    var elem = kw.Key != null ? kw.Key.Invoke1(vec[i]) : vec[i];
+                    var elem = ApplySeqKey(kw, vec[i]);
                     if (IsTruthy(predFn.Invoke1(elem))) result = vec[i];
                 }
                 return result;
             }
             for (int i = start; i < end; i++)
             {
-                var elem = kw.Key != null ? kw.Key.Invoke1(vec[i]) : vec[i];
+                var elem = ApplySeqKey(kw, vec[i]);
                 if (IsTruthy(predFn.Invoke1(elem))) return vec[i];
             }
             return Nil.Instance;
@@ -949,7 +962,7 @@ public static partial class Runtime
                 for (int i = start; i < end; i++)
                 {
                     var ch = LispChar.Make(str[i]);
-                    var elem = kw.Key != null ? kw.Key.Invoke1(ch) : ch;
+                    var elem = ApplySeqKey(kw, ch);
                     if (IsTruthy(predFn.Invoke1(elem))) result = ch;
                 }
                 return result;
@@ -957,7 +970,7 @@ public static partial class Runtime
             for (int i = start; i < end; i++)
             {
                 var ch = LispChar.Make(str[i]);
-                var elem = kw.Key != null ? kw.Key.Invoke1(ch) : ch;
+                var elem = ApplySeqKey(kw, ch);
                 if (IsTruthy(predFn.Invoke1(elem))) return ch;
             }
             return Nil.Instance;
@@ -970,7 +983,7 @@ public static partial class Runtime
             LispObject result = Nil.Instance;
             for (int i = start; i < end && cur is Cons c; i++)
             {
-                var elem = kw.Key != null ? kw.Key.Invoke1(c.Car) : c.Car;
+                var elem = ApplySeqKey(kw, c.Car);
                 if (IsTruthy(predFn.Invoke1(elem))) result = c.Car;
                 cur = c.Cdr;
             }
@@ -978,7 +991,7 @@ public static partial class Runtime
         }
         for (int i = start; i < end && cur is Cons c2; i++)
         {
-            var elem = kw.Key != null ? kw.Key.Invoke1(c2.Car) : c2.Car;
+            var elem = ApplySeqKey(kw, c2.Car);
             if (IsTruthy(predFn.Invoke1(elem))) return c2.Car;
             cur = c2.Cdr;
         }
@@ -1050,14 +1063,14 @@ public static partial class Runtime
             {
                 for (int i = end - 1; i >= start; i--)
                 {
-                    var elem = kw.Key != null ? kw.Key.Invoke1(vec[i]) : vec[i];
+                    var elem = ApplySeqKey(kw, vec[i]);
                     if (IsTruthy(predFn.Invoke1(elem))) return Fixnum.Make(i);
                 }
                 return Nil.Instance;
             }
             for (int i = start; i < end; i++)
             {
-                var elem = kw.Key != null ? kw.Key.Invoke1(vec[i]) : vec[i];
+                var elem = ApplySeqKey(kw, vec[i]);
                 if (IsTruthy(predFn.Invoke1(elem))) return Fixnum.Make(i);
             }
             return Nil.Instance;
@@ -1069,7 +1082,7 @@ public static partial class Runtime
                 for (int i = end - 1; i >= start; i--)
                 {
                     var ch = LispChar.Make(str[i]);
-                    var elem = kw.Key != null ? kw.Key.Invoke1(ch) : ch;
+                    var elem = ApplySeqKey(kw, ch);
                     if (IsTruthy(predFn.Invoke1(elem))) return Fixnum.Make(i);
                 }
                 return Nil.Instance;
@@ -1077,7 +1090,7 @@ public static partial class Runtime
             for (int i = start; i < end; i++)
             {
                 var ch = LispChar.Make(str[i]);
-                var elem = kw.Key != null ? kw.Key.Invoke1(ch) : ch;
+                var elem = ApplySeqKey(kw, ch);
                 if (IsTruthy(predFn.Invoke1(elem))) return Fixnum.Make(i);
             }
             return Nil.Instance;
@@ -1089,7 +1102,7 @@ public static partial class Runtime
         {
             for (int i = start; i < end && cur is Cons c; i++)
             {
-                var elem = kw.Key != null ? kw.Key.Invoke1(c.Car) : c.Car;
+                var elem = ApplySeqKey(kw, c.Car);
                 if (IsTruthy(predFn.Invoke1(elem)))
                 {
                     // For lists with from-end, continue scanning
@@ -1097,7 +1110,7 @@ public static partial class Runtime
                     cur = c.Cdr;
                     for (int j = i + 1; j < end && cur is Cons c3; j++)
                     {
-                        var elem2 = kw.Key != null ? kw.Key.Invoke1(c3.Car) : c3.Car;
+                        var elem2 = ApplySeqKey(kw, c3.Car);
                         if (IsTruthy(predFn.Invoke1(elem2))) result = Fixnum.Make(j);
                         cur = c3.Cdr;
                     }
@@ -1109,7 +1122,7 @@ public static partial class Runtime
         }
         for (int i = start; i < end && cur is Cons c2; i++)
         {
-            var elem = kw.Key != null ? kw.Key.Invoke1(c2.Car) : c2.Car;
+            var elem = ApplySeqKey(kw, c2.Car);
             if (IsTruthy(predFn.Invoke1(elem))) return Fixnum.Make(i);
             cur = c2.Cdr;
         }
@@ -1177,17 +1190,17 @@ public static partial class Runtime
         if (seq is LispVector vec)
         {
             if (kw.FromEnd)
-                for (int i = end - 1; i >= start; i--) { var elem = kw.Key != null ? kw.Key.Invoke1(vec[i]) : vec[i]; if (IsTruthy(predFn.Invoke1(elem))) count++; }
+                for (int i = end - 1; i >= start; i--) { var elem = ApplySeqKey(kw, vec[i]); if (IsTruthy(predFn.Invoke1(elem))) count++; }
             else
-                for (int i = start; i < end; i++) { var elem = kw.Key != null ? kw.Key.Invoke1(vec[i]) : vec[i]; if (IsTruthy(predFn.Invoke1(elem))) count++; }
+                for (int i = start; i < end; i++) { var elem = ApplySeqKey(kw, vec[i]); if (IsTruthy(predFn.Invoke1(elem))) count++; }
             return Fixnum.Make(count);
         }
         if (seq is LispString str)
         {
             if (kw.FromEnd)
-                for (int i = end - 1; i >= start; i--) { var ch = LispChar.Make(str[i]); var elem = kw.Key != null ? kw.Key.Invoke1(ch) : ch; if (IsTruthy(predFn.Invoke1(elem))) count++; }
+                for (int i = end - 1; i >= start; i--) { var ch = LispChar.Make(str[i]); var elem = ApplySeqKey(kw, ch); if (IsTruthy(predFn.Invoke1(elem))) count++; }
             else
-                for (int i = start; i < end; i++) { var ch = LispChar.Make(str[i]); var elem = kw.Key != null ? kw.Key.Invoke1(ch) : ch; if (IsTruthy(predFn.Invoke1(elem))) count++; }
+                for (int i = start; i < end; i++) { var ch = LispChar.Make(str[i]); var elem = ApplySeqKey(kw, ch); if (IsTruthy(predFn.Invoke1(elem))) count++; }
             return Fixnum.Make(count);
         }
         // List - for from-end, collect elements then iterate in reverse
@@ -1197,13 +1210,13 @@ public static partial class Runtime
             var cur = seq;
             for (int i = 0; i < start && cur is Cons c1; i++) cur = c1.Cdr;
             for (int i = start; i < end && cur is Cons c2; i++) { elems.Add(c2.Car); cur = c2.Cdr; }
-            for (int i = elems.Count - 1; i >= 0; i--) { var elem = kw.Key != null ? kw.Key.Invoke1(elems[i]) : elems[i]; if (IsTruthy(predFn.Invoke1(elem))) count++; }
+            for (int i = elems.Count - 1; i >= 0; i--) { var elem = ApplySeqKey(kw, elems[i]); if (IsTruthy(predFn.Invoke1(elem))) count++; }
         }
         else
         {
             var cur = seq;
             for (int i = 0; i < start && cur is Cons c1; i++) cur = c1.Cdr;
-            for (int i = start; i < end && cur is Cons c2; i++) { var elem = kw.Key != null ? kw.Key.Invoke1(c2.Car) : c2.Car; if (IsTruthy(predFn.Invoke1(elem))) count++; cur = c2.Cdr; }
+            for (int i = start; i < end && cur is Cons c2; i++) { var elem = ApplySeqKey(kw, c2.Car); if (IsTruthy(predFn.Invoke1(elem))) count++; cur = c2.Cdr; }
         }
         return Fixnum.Make(count);
     }
@@ -1260,7 +1273,7 @@ public static partial class Runtime
 
     private static bool ListTestMatch(LispObject item, LispObject element, in ListKwArgs kw)
     {
-        var k = kw.Key != null ? kw.Key.Invoke1(element) : element;
+        var k = ApplySeqKey(kw, element);
         if (kw.TestNot != null)
             return !IsTruthy(kw.TestNot.Invoke2(item, k));
         if (kw.Test != null)
@@ -1385,7 +1398,7 @@ public static partial class Runtime
             for (; cur is Cons c; cur = c.Cdr)
             {
                 if (c.Car is not Cons pair) continue; // skip nil entries
-                var k = kw.Key != null ? kw.Key.Invoke1(pair.Car) : pair.Car;
+                var k = ApplySeqKey(kw, pair.Car);
                 if (kw.TestNot != null)
                 { if (!IsTruthy(kw.TestNot.Invoke2(item, k))) return pair; }
                 else if (kw.Test != null)
@@ -1414,7 +1427,7 @@ public static partial class Runtime
             if (c.Car is Nil) continue; // nil entries are allowed
             if (c.Car is not Cons pair)
                 throw new LispErrorException(new LispTypeError("ASSOC-IF: alist entry is not a cons or nil", c.Car));
-            var elem = kw.Key != null ? kw.Key.Invoke1(pair.Car) : pair.Car;
+            var elem = ApplySeqKey(kw, pair.Car);
             if (IsTruthy(predFn.Invoke1(elem))) return pair;
         }
         if (cur2 is not Nil) throw new LispErrorException(new LispTypeError("ASSOC-IF: not a proper list", cur2));
@@ -1446,7 +1459,7 @@ public static partial class Runtime
             for (; cur is Cons c; cur = c.Cdr)
             {
                 if (c.Car is not Cons pair) continue;
-                var k = kw.Key != null ? kw.Key.Invoke1(pair.Cdr) : pair.Cdr;
+                var k = ApplySeqKey(kw, pair.Cdr);
                 if (kw.TestNot != null)
                 { if (!IsTruthy(kw.TestNot.Invoke2(item, k))) return pair; }
                 else if (kw.Test != null)
@@ -1475,7 +1488,7 @@ public static partial class Runtime
             if (c.Car is Nil) continue;
             if (c.Car is not Cons pair)
                 throw new LispErrorException(new LispTypeError("RASSOC-IF: alist entry is not a cons or nil", c.Car));
-            var elem = kw.Key != null ? kw.Key.Invoke1(pair.Cdr) : pair.Cdr;
+            var elem = ApplySeqKey(kw, pair.Cdr);
             if (IsTruthy(predFn.Invoke1(elem))) return pair;
         }
         if (cur2 is not Nil) throw new LispErrorException(new LispTypeError("RASSOC-IF: not a proper list", cur2));
@@ -1535,7 +1548,7 @@ public static partial class Runtime
             int count = end - start;
             elems = new LispObject[count];
             for (int i = 0; i < count; i++)
-                elems[i] = keyFn != null ? keyFn.Invoke1(vec[start + i]) : vec[start + i];
+                elems[i] = ApplyKeyFn(keyFn, vec[start + i]);
         }
         else if (seq is LispString str)
         {
@@ -1547,7 +1560,7 @@ public static partial class Runtime
             for (int i = 0; i < count; i++)
             {
                 var ch = LispChar.Make(str[start + i]);
-                elems[i] = keyFn != null ? keyFn.Invoke1(ch) : ch;
+                elems[i] = ApplyKeyFn(keyFn, ch);
             }
         }
         else
@@ -1558,7 +1571,7 @@ public static partial class Runtime
             int start = startOpt ?? 0;
             for (var cur = seq; cur is Cons c; cur = c.Cdr, idx++)
             {
-                if (idx >= start) list.Add(keyFn != null ? keyFn.Invoke1(c.Car) : c.Car);
+                if (idx >= start) list.Add(ApplyKeyFn(keyFn, c.Car));
             }
             len = idx;
             int end = endOpt ?? len;
@@ -1570,7 +1583,7 @@ public static partial class Runtime
         if (elems.Length == 0)
         {
             if (hasIV) return iv;
-            return fn.Invoke(Array.Empty<LispObject>());
+            return UnwrapMv(fn.Invoke(Array.Empty<LispObject>()));
         }
 
         if (fromEnd)
@@ -1578,7 +1591,7 @@ public static partial class Runtime
             var result = hasIV ? iv : elems[elems.Length - 1];
             int startIdx = hasIV ? elems.Length - 1 : elems.Length - 2;
             for (int i = startIdx; i >= 0; i--)
-                result = fn.Invoke2(elems[i], result);
+                result = UnwrapMv(fn.Invoke2(elems[i], result));
             return result;
         }
         else
@@ -1586,7 +1599,7 @@ public static partial class Runtime
             var result = hasIV ? iv : elems[0];
             int startIdx = hasIV ? 0 : 1;
             for (int i = startIdx; i < elems.Length; i++)
-                result = fn.Invoke2(result, elems[i]);
+                result = UnwrapMv(fn.Invoke2(result, elems[i]));
             return result;
         }
     }
@@ -1636,7 +1649,7 @@ public static partial class Runtime
         var kw = ParseSeqKwArgs(args, 2, "REMOVE-IF");
         var result = RemoveCore(seq, kw, (elem) =>
         {
-            var val = kw.Key != null ? kw.Key.Invoke1(elem) : elem;
+            var val = ApplySeqKey(kw, elem);
             return IsTruthy(predFn.Invoke1(val));
         });
         // The last predicate call may have left secondary values in the MV register
@@ -1672,7 +1685,7 @@ public static partial class Runtime
         var kw = ParseSeqKwArgs(args, 2, "DELETE-IF");
         var result = RemoveCore(seq, kw, (elem) =>
         {
-            var val = kw.Key != null ? kw.Key.Invoke1(elem) : elem;
+            var val = ApplySeqKey(kw, elem);
             return IsTruthy(predFn.Invoke1(val));
         }, destructive: true);
         return MultipleValues.Primary(result);
@@ -1843,7 +1856,7 @@ public static partial class Runtime
         var kw = ParseSeqKwArgs(args, 3, "SUBSTITUTE-IF");
         return SubstituteCore(newitem, seq, kw, (elem) =>
         {
-            var val = kw.Key != null ? kw.Key.Invoke1(elem) : elem;
+            var val = ApplySeqKey(kw, elem);
             return IsTruthy(predFn.Invoke1(val));
         });
     }
@@ -1875,7 +1888,7 @@ public static partial class Runtime
         var kw = ParseSeqKwArgs(args, 3, "NSUBSTITUTE-IF");
         return NsubstituteCore(newitem, seq, kw, (elem) =>
         {
-            var val = kw.Key != null ? kw.Key.Invoke1(elem) : elem;
+            var val = ApplySeqKey(kw, elem);
             return IsTruthy(predFn.Invoke1(val));
         });
     }
@@ -2058,14 +2071,14 @@ public static partial class Runtime
         for (int i = start; i < end; i++)
         {
             if (isDup[i]) continue;
-            var ki = kw.Key != null ? kw.Key.Invoke1(allElems[i]) : allElems[i];
+            var ki = ApplySeqKey(kw, allElems[i]);
             if (kw.FromEnd)
             {
                 // from-end=t: keep first occurrence, mark later duplicates
                 for (int j = i + 1; j < end; j++)
                 {
                     if (isDup[j]) continue;
-                    var kj = kw.Key != null ? kw.Key.Invoke1(allElems[j]) : allElems[j];
+                    var kj = ApplySeqKey(kw, allElems[j]);
                     if (SeqTestMatch2(ki, kj, kw))
                         isDup[j] = true;
                 }
@@ -2076,7 +2089,7 @@ public static partial class Runtime
                 for (int j = i + 1; j < end; j++)
                 {
                     if (isDup[j]) continue;
-                    var kj = kw.Key != null ? kw.Key.Invoke1(allElems[j]) : allElems[j];
+                    var kj = ApplySeqKey(kw, allElems[j]);
                     if (SeqTestMatch2(ki, kj, kw))
                     {
                         isDup[i] = true;
@@ -2324,8 +2337,8 @@ public static partial class Runtime
             {
                 var x1 = elems1[e1 - i];
                 var x2 = elems2[e2 - i];
-                var k1 = keyFn != null ? keyFn.Invoke1(x1) : x1;
-                var k2 = keyFn != null ? keyFn.Invoke1(x2) : x2;
+                var k1 = ApplyKeyFn(keyFn, x1);
+                var k2 = ApplyKeyFn(keyFn, x2);
                 bool match = testNotFn != null ? !IsTruthy(testNotFn.Invoke2(k1, k2))
                            : testFn != null ? IsTruthy(testFn.Invoke2(k1, k2))
                            : IsTrueEql(k1, k2);
@@ -2340,8 +2353,8 @@ public static partial class Runtime
             {
                 var x1 = elems1[s1 + i];
                 var x2 = elems2[s2 + i];
-                var k1 = keyFn != null ? keyFn.Invoke1(x1) : x1;
-                var k2 = keyFn != null ? keyFn.Invoke1(x2) : x2;
+                var k1 = ApplyKeyFn(keyFn, x1);
+                var k2 = ApplyKeyFn(keyFn, x2);
                 bool match = testNotFn != null ? !IsTruthy(testNotFn.Invoke2(k1, k2))
                            : testFn != null ? IsTruthy(testFn.Invoke2(k1, k2))
                            : IsTrueEql(k1, k2);
@@ -2484,8 +2497,8 @@ public static partial class Runtime
                 bool match = true;
                 for (int j = 0; j < patLen && match; j++)
                 {
-                    var a = keyFn != null ? keyFn.Invoke1(ReplaceSeqGet(seq1, start1 + j)) : ReplaceSeqGet(seq1, start1 + j);
-                    var b = keyFn != null ? keyFn.Invoke1(ReplaceSeqGet(seq2, i + j)) : ReplaceSeqGet(seq2, i + j);
+                    var a = ApplyKeyFn(keyFn, ReplaceSeqGet(seq1, start1 + j));
+                    var b = ApplyKeyFn(keyFn, ReplaceSeqGet(seq2, i + j));
                     if (!elemTest(a, b)) match = false;
                 }
                 if (match) return Fixnum.Make(i);
@@ -2498,8 +2511,8 @@ public static partial class Runtime
                 bool match = true;
                 for (int j = 0; j < patLen && match; j++)
                 {
-                    var a = keyFn != null ? keyFn.Invoke1(ReplaceSeqGet(seq1, start1 + j)) : ReplaceSeqGet(seq1, start1 + j);
-                    var b = keyFn != null ? keyFn.Invoke1(ReplaceSeqGet(seq2, i + j)) : ReplaceSeqGet(seq2, i + j);
+                    var a = ApplyKeyFn(keyFn, ReplaceSeqGet(seq1, start1 + j));
+                    var b = ApplyKeyFn(keyFn, ReplaceSeqGet(seq2, i + j));
                     if (!elemTest(a, b)) match = false;
                 }
                 if (match) return Fixnum.Make(i);

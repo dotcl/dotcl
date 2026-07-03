@@ -463,6 +463,37 @@ $(foreach rid,$(R2R_RIDS),$(eval $(call R2R_RULES,$(rid))))
 compile-core-fasl-r2r-all: $(addprefix compile-core-fasl-r2r-,$(R2R_RIDS))
 compile-asdf-fasl-r2r-all: $(addprefix compile-asdf-fasl-r2r-,$(R2R_RIDS))
 
+# R2R-compile each contrib IL fasl per RID with the same crossgen2 pattern as
+# asdf. Produces contrib/<name>/<name>-r2r-<rid>.fasl next to the IL fasl so the
+# --target-rid dep resolver (DotclHost.ResolveDeps) probes and prefers it,
+# falling back to the IL fasl when no R2R copy is present. Contrib fasls are
+# compiled against runtime + core only (no cross-contrib assembly refs), so the
+# reference set matches the asdf rule: per-RID runtime.dll + dotcl.core.
+define R2R_CONTRIB_RULES
+compile-contrib-fasls-r2r-$(1): compile-contrib-fasls compile-core-fasl-r2r-$(1)
+	@test -n "$$(CROSSGEN2)" || (echo "error: crossgen2 not found" && exit 1)
+	@test -n "$$(call runtime_ref,$(1))" || (echo "error: runtime ref for $(1) not found" && exit 1)
+	cp $$(DOTCL_ROOT)compiler/dotcl.core $$(DOTCL_ROOT)compiler/dotcl.core.dll
+	@for n in $$(CONTRIB_NAMES); do \
+		fasl=$$(DOTCL_ROOT)contrib/$$$$n/$$$$n.fasl; \
+		if [ ! -f "$$$$fasl" ]; then continue; fi; \
+		echo "=== R2R contrib $$$$n ($(1)) ==="; \
+		cp "$$$$fasl" "$$$$fasl.dll"; \
+		"$$(CROSSGEN2)" "$$$$fasl.dll" \
+		  -r "$$(call runtime_ref,$(1))/*.dll" \
+		  -r "$$(DOTCL_ROOT)runtime/bin/Release/net10.0/$(1)/publish/runtime.dll" \
+		  -r "$$(DOTCL_ROOT)compiler/dotcl.core.dll" \
+		  --targetos $(TARGETOS_$(1)) --targetarch $(TARGETARCH_$(1)) -O \
+		  -o "$$(DOTCL_ROOT)contrib/$$$$n/$$$$n-r2r-$(1).fasl"; \
+		rm -f "$$$$fasl.dll"; \
+	done
+	rm -f $$(DOTCL_ROOT)compiler/dotcl.core.dll
+endef
+
+$(foreach rid,$(R2R_RIDS),$(eval $(call R2R_CONTRIB_RULES,$(rid))))
+
+compile-contrib-fasls-r2r-all: $(addprefix compile-contrib-fasls-r2r-,$(R2R_RIDS))
+
 # Publish contrib/dotcl-cs helper DLL + Roslyn deps into
 # contrib/dotcl-cs/lib/. Invoked during `make pack` so the tool NuGet
 # bundles them under tools/net10.0/any/contrib/dotcl-cs/lib/.
@@ -486,7 +517,7 @@ contrib-dotcl-jitdisasm:
 # Nuke runtime/contrib first so a contrib directory deleted from source
 # stops shipping in the nupkg (old dotcl-repl/ stayed in the
 # installed tool for at least one release after its source was removed).
-pack: compile-asdf-fasl compile-asdf-fasls compile-core-fasl compile-contrib-fasls contrib-dotcl-cs compile-core-fasl-r2r-all compile-asdf-fasl-r2r-all
+pack: compile-asdf-fasl compile-asdf-fasls compile-core-fasl compile-contrib-fasls contrib-dotcl-cs compile-core-fasl-r2r-all compile-asdf-fasl-r2r-all compile-contrib-fasls-r2r-all
 	rm -rf $(DOTCL_ROOT)runtime/contrib
 	cp $(DOTCL_ROOT)compiler/dotcl.core $(DOTCL_ROOT)runtime/dotcl.core
 	@for rid in $(R2R_RIDS); do \

@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Runtime.CompilerServices;
 
 namespace DotCL;
 
@@ -98,8 +99,103 @@ public class LispVector : LispObject
     // Packed bit storage: used when ElementTypeName == "BIT" and not displaced
     internal ulong[]? _bitData;
 
+    // Unboxed numeric storage: used when the element type is a bounded integer
+    // type that maps to a fixed-width backing (see NumKindForElementType) and
+    // the array is not displaced. Cuts memory traffic (2000x2000 (unsigned-byte
+    // 16) = 8MB of ushort vs 32MB of object references), removes the GC write
+    // barrier per store and the Fixnum object per element. _numKind selects the
+    // concrete array type of _numData.
+    internal Array? _numData;   // byte[] | ushort[] | int[] | long[] per _numKind
+    internal int _numLen;       // _numData.Length (Array.Length on the abstract
+                                // static type is a runtime call, not ldlen — hot
+                                // aref paths bounds-check against this instead)
+    internal byte _numKind;    // 0=none 1=u8 2=u16 3=i32 4=i64
+
     // Element type: "T" (general), "CHARACTER"/"BASE-CHAR"/"STANDARD-CHAR" (string-like), "NIL" (bit vector of nil), etc.
     public string ElementTypeName { get; private set; } = "T";
+
+    /// <summary>Storage kind for a bounded-integer element type name, or 0 for
+    /// none. Names arrive normalized from ParseElementTypeName ("UNSIGNED-BYTE-8",
+    /// "SIGNED-BYTE-32", "FIXNUM", ...). (unsigned-byte 64) does not fit a long
+    /// (and can legally hold dotcl bignums), so it stays on boxed storage.</summary>
+    internal static byte NumKindForElementType(string et)
+    {
+        if (et == "FIXNUM") return 4;
+        const string ub = "UNSIGNED-BYTE-";
+        const string sb = "SIGNED-BYTE-";
+        if (et.StartsWith(ub, StringComparison.Ordinal)
+            && int.TryParse(et.Substring(ub.Length), out int un) && un >= 1)
+            return un <= 8 ? (byte)1 : un <= 16 ? (byte)2 : un <= 31 ? (byte)3
+                 : un <= 63 ? (byte)4 : (byte)0;
+        if (et.StartsWith(sb, StringComparison.Ordinal)
+            && int.TryParse(et.Substring(sb.Length), out int sn) && sn >= 1)
+            return sn <= 32 ? (byte)3 : sn <= 64 ? (byte)4 : (byte)0;
+        return 0;
+    }
+
+    private Array AllocNum(int size)
+    {
+        _numLen = size;
+        return _numKind switch
+        {
+            1 => new byte[size],
+            2 => new ushort[size],
+            3 => new int[size],
+            _ => new long[size],
+        };
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal long NumGet(int i) => _numKind switch
+    {
+        1 => ((byte[])_numData!)[i],
+        2 => ((ushort[])_numData!)[i],
+        3 => ((int[])_numData!)[i],
+        _ => ((long[])_numData!)[i],
+    };
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal void NumSet(int i, long v)
+    {
+        // Range-checked store: silently wrapping a value that exceeds the
+        // storage width would corrupt data, so an element-type violation
+        // (undefined behavior per CLHS) signals loudly instead.
+        switch (_numKind)
+        {
+            case 1:
+                if ((ulong)v > byte.MaxValue) throw NumRangeError(v);
+                ((byte[])_numData!)[i] = (byte)v; return;
+            case 2:
+                if ((ulong)v > ushort.MaxValue) throw NumRangeError(v);
+                ((ushort[])_numData!)[i] = (ushort)v; return;
+            case 3:
+                if (v < int.MinValue || v > int.MaxValue) throw NumRangeError(v);
+                ((int[])_numData!)[i] = (int)v; return;
+            default:
+                ((long[])_numData!)[i] = v; return;
+        }
+    }
+
+    private Exception NumRangeError(long v) =>
+        new LispErrorException(new LispTypeError(
+            $"array of element-type {ElementTypeName}: value {v} does not fit", Fixnum.Make(v)));
+
+    // Pack a boxed element array into numeric storage (mirror of PackBits).
+    // C# null slots (uninitialized) become 0; any other non-fixnum is an
+    // element-type violation and signals.
+    private Array PackNum(LispObject[] elements)
+    {
+        _numData = AllocNum(elements.Length);
+        for (int i = 0; i < elements.Length; i++)
+        {
+            var e = elements[i];
+            if (e is Fixnum f) NumSet(i, f.Value);
+            else if (e is not null && e is not Nil)
+                throw new LispErrorException(new LispTypeError(
+                    $"array of element-type {ElementTypeName}: cannot store", e));
+        }
+        return _numData;
+    }
 
     public LispVector(int size, LispObject initialElement, string elementType)
     {
@@ -111,6 +207,19 @@ public class LispVector : LispObject
             // If initial element is 1, fill all bits
             if (initialElement is Fixnum f && f.Value == 1)
                 Compat.Fill(_bitData, ulong.MaxValue);
+        }
+        else if ((_numKind = NumKindForElementType(elementType)) != 0)
+        {
+            _numData = AllocNum(size);
+            _elements = Array.Empty<LispObject>();
+            if (initialElement is Fixnum nf)
+            {
+                if (nf.Value != 0)
+                    for (int i = 0; i < size; i++) NumSet(i, nf.Value);
+            }
+            else if (initialElement is not Nil)
+                throw new LispErrorException(new LispTypeError(
+                    $"array of element-type {elementType}: cannot store", initialElement));
         }
         else
         {
@@ -142,6 +251,11 @@ public class LispVector : LispObject
             _bitData = PackBits(elements);
             _elements = Array.Empty<LispObject>();
         }
+        else if ((_numKind = NumKindForElementType(elementType)) != 0)
+        {
+            PackNum(elements);
+            _elements = Array.Empty<LispObject>();
+        }
         else
         {
             _elements = elements;
@@ -159,6 +273,11 @@ public class LispVector : LispObject
         if (elementType == "BIT")
         {
             _bitData = PackBits(elements);
+            _elements = Array.Empty<LispObject>();
+        }
+        else if ((_numKind = NumKindForElementType(elementType)) != 0)
+        {
+            PackNum(elements);
             _elements = Array.Empty<LispObject>();
         }
         else
@@ -226,6 +345,8 @@ public class LispVector : LispObject
         if (_displacedTo != null) return _displacedTo.RawGet(_displacedOffset + index);
         if (_bitData != null)
             return Fixnum.Make((long)((_bitData[index >> 6] >> (index & 63)) & 1));
+        if (_numData != null)
+            return Fixnum.Make(NumGet(index));
         return _elements[index] ?? Nil.Instance;
     }
 
@@ -239,6 +360,14 @@ public class LispVector : LispObject
                 _bitData[index >> 6] |= 1UL << (index & 63);
             else
                 _bitData[index >> 6] &= ~(1UL << (index & 63));
+            return;
+        }
+        if (_numData != null)
+        {
+            if (val is not Fixnum nf)
+                throw new LispErrorException(new LispTypeError(
+                    $"array of element-type {ElementTypeName}: cannot store", val));
+            NumSet(index, nf.Value);
             return;
         }
         _elements[index] = val;
@@ -310,6 +439,7 @@ public class LispVector : LispObject
     public int[] Dimensions => _dimensions ?? new[] { _declaredSize };
     public int Capacity => _displacedTo != null ? _declaredSize
         : _bitData != null ? _declaredSize
+        : _numData != null ? _numLen
         : _elements.Length;
 
     public LispObject this[int index]
@@ -341,8 +471,26 @@ public class LispVector : LispObject
     {
         if (_displacedTo != null)
         {
-            // Converting from displaced to non-displaced
-            if (_bitData != null)
+            // Converting from displaced to non-displaced. A displaced array has
+            // no own storage (_numKind stays 0), so derive the numeric kind from
+            // the element type when acquiring storage here.
+            byte kind = NumKindForElementType(ElementTypeName);
+            if (ElementTypeName != "BIT" && kind != 0)
+            {
+                _numKind = kind;
+                _numData = AllocNum(newSize);
+                var oldSizeN = _declaredSize;
+                for (int i = 0; i < Math.Min(oldSizeN, newSize); i++)
+                {
+                    // Old storage is the displaced target: read through it.
+                    var e = _displacedTo.RawGet(_displacedOffset + i);
+                    if (e is Fixnum f) NumSet(i, f.Value);
+                }
+                if (initialElement is Fixnum fiN && fiN.Value != 0)
+                    for (int i = oldSizeN; i < newSize; i++) NumSet(i, fiN.Value);
+                _elements = Array.Empty<LispObject>();
+            }
+            else if (_bitData != null)
             {
                 var newBits = new ulong[(newSize + 63) / 64];
                 var oldSize = _declaredSize;
@@ -391,6 +539,18 @@ public class LispVector : LispObject
                 _bitData = newBits;
             }
         }
+        else if (_numData != null)
+        {
+            var oldSize = _numData.Length;
+            if (newSize != oldSize)
+            {
+                var oldNum = _numData;
+                _numData = AllocNum(newSize);
+                Array.Copy(oldNum, _numData, Math.Min(oldSize, newSize));
+                if (initialElement is Fixnum fiN && fiN.Value != 0)
+                    for (int i = oldSize; i < newSize; i++) NumSet(i, fiN.Value);
+            }
+        }
         else
         {
             var oldSize = _elements.Length;
@@ -424,6 +584,11 @@ public class LispVector : LispObject
             _bitData = PackBits(newContents);
             _elements = Array.Empty<LispObject>();
         }
+        else if ((_numKind = NumKindForElementType(ElementTypeName)) != 0)
+        {
+            PackNum(newContents);
+            _elements = Array.Empty<LispObject>();
+        }
         else
         {
             _elements = newContents;
@@ -440,6 +605,9 @@ public class LispVector : LispObject
     public void AdjustToDisplaced(int newSize, LispVector displacedTo, int offset, string elementType, int[]? newDimensions, int? newFillPointer)
     {
         _elements = Array.Empty<LispObject>();
+        _numData = null;
+        _numLen = 0;
+        _numKind = 0;
         _displacedTo = displacedTo;
         _displacedOffset = offset;
         _declaredSize = newSize;
@@ -490,6 +658,12 @@ public class LispVector : LispObject
                 Array.Copy(_bitData, newBits, copyWords);
                 _bitData = newBits;
             }
+            else if (_numData != null)
+            {
+                var oldNum = _numData;
+                _numData = AllocNum(newSize);
+                Array.Copy(oldNum, _numData, oldNum.Length);
+            }
             else
             {
                 var newElems = new LispObject[newSize];
@@ -498,8 +672,8 @@ public class LispVector : LispObject
             }
             _declaredSize = newSize;
         }
-        // Fast path: direct element write for non-displaced, non-bit arrays
-        if (_displacedTo == null && _bitData == null)
+        // Fast path: direct element write for non-displaced, non-bit, non-numeric arrays
+        if (_displacedTo == null && _bitData == null && _numData == null)
             _elements[fp] = element;
         else
             RawSet(fp, element);
@@ -511,6 +685,18 @@ public class LispVector : LispObject
     {
         if (_displacedTo != null)
             throw new InvalidOperationException("VectorPush not supported on displaced arrays");
+        if (_numData != null)
+        {
+            if (_fillPointer >= _numData.Length)
+            {
+                var oldNum = _numData;
+                _numData = AllocNum(Math.Max(1, oldNum.Length * 2));
+                Array.Copy(oldNum, _numData, oldNum.Length);
+            }
+            RawSet(_fillPointer++, element);
+            _hasFillPointer = true;
+            return;
+        }
         if (_fillPointer >= _elements.Length)
         {
             var newElements = new LispObject[_elements.Length * 2];

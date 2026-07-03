@@ -360,8 +360,13 @@
         ;; (setf (macro-function name) fn)
         ;; Update both C# _macroFunctions and *macros* Lisp table
         ;; protect CL macros from foreign package overwrite
-        ;; if called via a non-CL shadow (e.g. SB-XC:MACRO-FUNCTION), skip dotcl *macros* update
-        ;; to prevent infinite recursion when the stored lambda calls cl:macro-function
+        ;; A non-CL shadow (e.g. SB-XC:MACRO-FUNCTION) must not touch dotcl's
+        ;; *macros* table (the stored lambda may call cl:macro-function, which
+        ;; would then return itself — infinite recursion). But it is still a
+        ;; real store: delegate to the CLHS 5.1.2.5 default expansion
+        ;; (funcall #'(setf fn) value args...) so a user-defined
+        ;; (defun (setf pkg:macro-function) ...) — SBCL's XC writes its
+        ;; globaldb through exactly that — actually runs.
         (let ((fn-sym (first place))
               ;; (macro-function name &optional environment) — the optional
               ;; environment subform is a place subform and must be evaluated
@@ -374,8 +379,14 @@
           (if (and (symbolp fn-sym)
                    (let ((pkg (symbol-package fn-sym)))
                      (and pkg (not (string= (package-name pkg) "COMMON-LISP")))))
-              ;; Non-CL variant (e.g. SB-XC:MACRO-FUNCTION): no-op for dotcl's macro table
-              (if env-form `(progn ,env-form ,value) `(progn ,value))
+              ;; Non-CL variant (e.g. SB-XC:MACRO-FUNCTION): bypass dotcl's
+              ;; macro tables, call the place's own setf function instead.
+              (let ((arg-temps (mapcar (lambda (a) (declare (ignore a)) (gensym "SETF-ARG"))
+                                       (cdr place)))
+                    (val-temp (gensym "SETF-VAL")))
+                `(let* (,@(mapcar #'list arg-temps (cdr place))
+                        (,val-temp ,value))
+                   (funcall (function (setf ,fn-sym)) ,val-temp ,@arg-temps)))
               ;; Normal CL:MACRO-FUNCTION setf
               `(let ((v ,value) (n ,(second place))
                      ,@(when env-form `((,(gensym "ENV") ,env-form))))
@@ -411,9 +422,22 @@
              (%set-fdefinition ,sym-var ,val-var)))))
 
 ;; (setf (compiler-macro-function name) fn) — delegate to %register-compiler-macro-rt.
+;; A non-CL variant (e.g. SB-XC:COMPILER-MACRO-FUNCTION) must not touch dotcl's
+;; compiler-macro table: delegate to the place's own setf function instead,
+;; same as the MACRO-FUNCTION expander above.
 (setf (gethash "COMPILER-MACRO-FUNCTION" *setf-expanders*)
       (lambda (place value)
-        `(%register-compiler-macro-rt ,(second place) ,value)))
+        (let ((fn-sym (first place)))
+          (if (and (symbolp fn-sym)
+                   (let ((pkg (symbol-package fn-sym)))
+                     (and pkg (not (string= (package-name pkg) "COMMON-LISP")))))
+              (let ((arg-temps (mapcar (lambda (a) (declare (ignore a)) (gensym "SETF-ARG"))
+                                       (cdr place)))
+                    (val-temp (gensym "SETF-VAL")))
+                `(let* (,@(mapcar #'list arg-temps (cdr place))
+                        (,val-temp ,value))
+                   (funcall (function (setf ,fn-sym)) ,val-temp ,@arg-temps)))
+              `(%register-compiler-macro-rt ,(second place) ,value)))))
 
 ;;; (setf (the type place) value) → (setf place value)
 ;;; CLHS requires THE to be a valid setf place; strip the type annotation.
@@ -1533,7 +1557,11 @@
                   (if (>= ,var ,limit-var)
                       (return ,(or result-form nil)))
                   ,@real-body
-                  (setq ,var (1+ ,var))
+                  ;; Fixnum counter: %dotimes-1+ asserts the incremented value
+                  ;; fits int64 (this point is only reached while var < limit),
+                  ;; enabling a raw native add on an Int64-slot counter where a
+                  ;; plain (1+ var) could not prove the +1 stays in range.
+                  (setq ,var ,(if fx-count `(%dotimes-1+ ,var) `(1+ ,var)))
                   (go ,loop-tag))))))))
 
 ;;; --- multiple-value-bind ---
@@ -2513,11 +2541,11 @@
              ,@(when (and (null type-option)
                           print-fn-raw (not (eq print-fn-raw :bare)))
                  `((defmethod print-object ((obj ,name) stream)
-                     (funcall ,(cadr print-fn-raw) obj stream *print-level*))))
+                     (funcall (function ,(cadr print-fn-raw)) obj stream *print-level*))))
              ,@(when (and (null type-option)
                           print-obj-raw (not (eq print-obj-raw :bare)))
                  `((defmethod print-object ((obj ,name) stream)
-                     (funcall ,(cadr print-obj-raw) obj stream))))
+                     (funcall (function ,(cadr print-obj-raw)) obj stream))))
              ;; Documentation (CLHS 8.1)
              ,@(when struct-doc
                  (list `(funcall #'(setf documentation) ,struct-doc ',name 'structure)))
@@ -4444,9 +4472,11 @@
                                     (write-string "#" ,actual-stream)
                                     (let ((*%pprint-level* (1+ .plevel.)))
                                       (declare (special *%pprint-level*))
+                                      ;; CLHS: logical-block prefix/suffix print regardless of
+                                      ;; *print-pretty* — only the dynamic newline/indent
+                                      ;; (%pprint-start/end-block) is gated on pretty.
                                       ,@(when (or prefix per-line-prefix)
-                                          `((when *print-pretty*
-                                              (write-string ,(or prefix per-line-prefix) ,actual-stream))))
+                                          `((write-string ,(or prefix per-line-prefix) ,actual-stream)))
                                       (when *print-pretty*
                                         (%pprint-start-block ,actual-stream
                                           ,(if (or prefix per-line-prefix) `(length ,(or prefix per-line-prefix)) 0)
@@ -4494,8 +4524,7 @@
                                         (when *print-pretty*
                                           (%pprint-end-block)))
                                       ,@(when suffix
-                                          `((when *print-pretty*
-                                              (write-string ,suffix ,actual-stream)))))))))))
+                                          `((write-string ,suffix ,actual-stream))))))))))
                      (when .circle-started. (%pprint-circle-end))))
                  nil))))))
 

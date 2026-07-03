@@ -354,9 +354,17 @@ public static partial class Runtime
         if (array is LispVector v && index is Fixnum f
             && v._displacedTo == null && v._bitData == null)
         {
-            int idx = (int)f.Value;
-            if ((uint)idx < (uint)v._elements.Length)
-                return v._elements[idx] ?? Nil.Instance;
+            if (v._numData != null)
+            {
+                if ((ulong)f.Value < (ulong)v._numLen)
+                    return Fixnum.Make(v.NumGet((int)f.Value));
+            }
+            else
+            {
+                int idx = (int)f.Value;
+                if ((uint)idx < (uint)v._elements.Length)
+                    return v._elements[idx] ?? Nil.Instance;
+            }
         }
         return ArefSlow(array, index);
     }
@@ -466,11 +474,22 @@ public static partial class Runtime
         if (array is LispVector v && index is Fixnum f
             && v._displacedTo == null && v._bitData == null)
         {
-            int idx = (int)f.Value;
-            if ((uint)idx < (uint)v._elements.Length)
+            if (v._numData != null)
             {
-                v._elements[idx] = value;
-                return value;
+                if (value is Fixnum fv && (ulong)f.Value < (ulong)v._numLen)
+                {
+                    v.NumSet((int)f.Value, fv.Value);
+                    return value;
+                }
+            }
+            else
+            {
+                int idx = (int)f.Value;
+                if ((uint)idx < (uint)v._elements.Length)
+                {
+                    v._elements[idx] = value;
+                    return value;
+                }
             }
         }
         return ArefSetSlow(array, index, value);
@@ -519,7 +538,12 @@ public static partial class Runtime
             int i0 = (int)f0.Value;
             int i1 = (int)f1.Value;
             int idx = i0 * v._dimensions[1] + i1;
-            if ((uint)idx < (uint)v._elements.Length)
+            if (v._numData != null)
+            {
+                if ((uint)idx < (uint)v._numLen)
+                    return Fixnum.Make(v.NumGet(idx));
+            }
+            else if ((uint)idx < (uint)v._elements.Length)
                 return v._elements[idx] ?? Nil.Instance;
         }
         return Aref2DSlow(array, idx0, idx1);
@@ -553,7 +577,15 @@ public static partial class Runtime
             int i0 = (int)f0.Value;
             int i1 = (int)f1.Value;
             int idx = i0 * v._dimensions[1] + i1;
-            if ((uint)idx < (uint)v._elements.Length)
+            if (v._numData != null)
+            {
+                if (value is Fixnum fv && (uint)idx < (uint)v._numLen)
+                {
+                    v.NumSet(idx, fv.Value);
+                    return value;
+                }
+            }
+            else if ((uint)idx < (uint)v._elements.Length)
             {
                 v._elements[idx] = value;
                 return value;
@@ -571,8 +603,9 @@ public static partial class Runtime
             int i0 = (int)((Fixnum)idx0).Value;
             int i1 = (int)((Fixnum)idx1).Value;
             int idx = i0 * dims[1] + i1;
-            // Fast path: direct element access for non-displaced, non-bit arrays
-            if (v._displacedTo == null && v._bitData == null)
+            // Fast path: direct element access for non-displaced, non-bit,
+            // non-numeric-backed arrays
+            if (v._displacedTo == null && v._bitData == null && v._numData == null)
             {
                 v._elements[idx] = value;
                 return value;
@@ -602,7 +635,12 @@ public static partial class Runtime
             int i1 = (int)f1.Value;
             int i2 = (int)f2.Value;
             int idx = (i0 * v._dimensions[1] + i1) * v._dimensions[2] + i2;
-            if ((uint)idx < (uint)v._elements.Length)
+            if (v._numData != null)
+            {
+                if ((uint)idx < (uint)v._numLen)
+                    return Fixnum.Make(v.NumGet(idx));
+            }
+            else if ((uint)idx < (uint)v._elements.Length)
                 return v._elements[idx] ?? Nil.Instance;
         }
         return Aref3DSlow(array, idx0, idx1, idx2);
@@ -636,7 +674,15 @@ public static partial class Runtime
             int i1 = (int)f1.Value;
             int i2 = (int)f2.Value;
             int idx = (i0 * v._dimensions[1] + i1) * v._dimensions[2] + i2;
-            if ((uint)idx < (uint)v._elements.Length)
+            if (v._numData != null)
+            {
+                if (value is Fixnum fv && (uint)idx < (uint)v._numLen)
+                {
+                    v.NumSet(idx, fv.Value);
+                    return value;
+                }
+            }
+            else if ((uint)idx < (uint)v._elements.Length)
             {
                 v._elements[idx] = value;
                 return value;
@@ -655,7 +701,7 @@ public static partial class Runtime
             int i1 = (int)((Fixnum)idx1).Value;
             int i2 = (int)((Fixnum)idx2).Value;
             int idx = (i0 * dims[1] + i1) * dims[2] + i2;
-            if (v._displacedTo == null && v._bitData == null)
+            if (v._displacedTo == null && v._bitData == null && v._numData == null)
             {
                 v._elements[idx] = value;
                 return value;
@@ -664,6 +710,244 @@ public static partial class Runtime
             return value;
         }
         throw new LispErrorException(new LispTypeError("(SETF AREF): not an array", array));
+    }
+
+    // --- Native (raw long) index variants ---------------------------------
+    // Called by compiled code when the index expressions are statically known
+    // to be fixnums (e.g. Int64-slot loop counters): the index arrives as a
+    // raw long, skipping the Fixnum box on the caller side and the type-check/
+    // unbox here. Fast paths mirror the boxed variants; anything unusual
+    // (displaced, bit-vector, string, .NET array, out of range) re-boxes the
+    // indices and defers to the existing slow paths so behavior is identical.
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static LispObject ArefL(LispObject array, long index)
+    {
+        if (array is LispVector v && v._displacedTo == null)
+        {
+            if (v._bitData == null && v._numData == null
+                && (ulong)index < (ulong)v._elements.Length)
+                return v._elements[(int)index] ?? Nil.Instance;
+            // Unboxed numeric backing: read the raw value, box once (small
+            // values hit the Fixnum cache).
+            if (v._numData != null && (ulong)index < (ulong)v._numLen)
+                return Fixnum.Make(v.NumGet((int)index));
+        }
+        return ArefSlow(array, Fixnum.Make(index));
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static LispObject ArefSetL(LispObject array, long index, LispObject value)
+    {
+        if (array is LispVector v && v._displacedTo == null)
+        {
+            if (v._bitData == null && v._numData == null
+                && (ulong)index < (ulong)v._elements.Length)
+            {
+                v._elements[(int)index] = value;
+                return value;
+            }
+            if (v._numData != null && value is Fixnum fv
+                && (ulong)index < (ulong)v._numLen)
+            {
+                v.NumSet((int)index, fv.Value);
+                return value;
+            }
+        }
+        return ArefSetSlow(array, Fixnum.Make(index), value);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static LispObject Aref2DL(LispObject array, long i0, long i1)
+    {
+        if (array is LispVector v
+            && v._displacedTo == null && v._bitData == null
+            && v._dimensions != null && v._dimensions.Length == 2
+            && (ulong)i0 < (ulong)v._dimensions[0] && (ulong)i1 < (ulong)v._dimensions[1])
+        {
+            long idx = i0 * v._dimensions[1] + i1;
+            if (v._numData != null)
+            {
+                if ((ulong)idx < (ulong)v._numLen)
+                    return Fixnum.Make(v.NumGet((int)idx));
+            }
+            else if ((ulong)idx < (ulong)v._elements.Length)
+                return v._elements[(int)idx] ?? Nil.Instance;
+        }
+        return Aref2DSlow(array, Fixnum.Make(i0), Fixnum.Make(i1));
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static LispObject ArefSet2DL(LispObject array, long i0, long i1, LispObject value)
+    {
+        if (array is LispVector v
+            && v._displacedTo == null && v._bitData == null
+            && v._dimensions != null && v._dimensions.Length == 2
+            && (ulong)i0 < (ulong)v._dimensions[0] && (ulong)i1 < (ulong)v._dimensions[1])
+        {
+            long idx = i0 * v._dimensions[1] + i1;
+            if (v._numData != null)
+            {
+                if (value is Fixnum fv && (ulong)idx < (ulong)v._numLen)
+                {
+                    v.NumSet((int)idx, fv.Value);
+                    return value;
+                }
+            }
+            else if ((ulong)idx < (ulong)v._elements.Length)
+            {
+                v._elements[(int)idx] = value;
+                return value;
+            }
+        }
+        return ArefSet2DSlow(array, Fixnum.Make(i0), Fixnum.Make(i1), value);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static LispObject Aref3DL(LispObject array, long i0, long i1, long i2)
+    {
+        if (array is LispVector v
+            && v._displacedTo == null && v._bitData == null
+            && v._dimensions != null && v._dimensions.Length == 3
+            && (ulong)i0 < (ulong)v._dimensions[0] && (ulong)i1 < (ulong)v._dimensions[1]
+            && (ulong)i2 < (ulong)v._dimensions[2])
+        {
+            long idx = (i0 * v._dimensions[1] + i1) * v._dimensions[2] + i2;
+            if (v._numData != null)
+            {
+                if ((ulong)idx < (ulong)v._numLen)
+                    return Fixnum.Make(v.NumGet((int)idx));
+            }
+            else if ((ulong)idx < (ulong)v._elements.Length)
+                return v._elements[(int)idx] ?? Nil.Instance;
+        }
+        return Aref3DSlow(array, Fixnum.Make(i0), Fixnum.Make(i1), Fixnum.Make(i2));
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static LispObject ArefSet3DL(LispObject array, long i0, long i1, long i2, LispObject value)
+    {
+        if (array is LispVector v
+            && v._displacedTo == null && v._bitData == null
+            && v._dimensions != null && v._dimensions.Length == 3
+            && (ulong)i0 < (ulong)v._dimensions[0] && (ulong)i1 < (ulong)v._dimensions[1]
+            && (ulong)i2 < (ulong)v._dimensions[2])
+        {
+            long idx = (i0 * v._dimensions[1] + i1) * v._dimensions[2] + i2;
+            if (v._numData != null)
+            {
+                if (value is Fixnum fv && (ulong)idx < (ulong)v._numLen)
+                {
+                    v.NumSet((int)idx, fv.Value);
+                    return value;
+                }
+            }
+            else if ((ulong)idx < (ulong)v._elements.Length)
+            {
+                v._elements[(int)idx] = value;
+                return value;
+            }
+        }
+        return ArefSet3DSlow(array, Fixnum.Make(i0), Fixnum.Make(i1), Fixnum.Make(i2), value);
+    }
+
+    // --- Raw-long-value variants for numeric-backed arrays -----------------
+    // Called by compiled code when the compiler has PROVEN (from the let-init
+    // make-array form) that the array local is numeric-backed with a bounded
+    // integer element type: the element value crosses the boundary as a raw
+    // long, so a hot loop like (setf (aref a i j) (+ (aref b i j) (aref c i j)))
+    // runs without any Fixnum boxing at all. The fast path requires the
+    // numeric backing; anything else (adjusted to displaced, bit-packed after
+    // a [0,1] upgrade, plain boxed) takes the boxed entry and unboxes — the
+    // inferred element type guarantees the value is a fixnum, and a violation
+    // surfaces as a loud InvalidCast rather than a silent wrong value.
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static long ArefNumL(LispObject array, long index)
+    {
+        if (array is LispVector v && v._numData != null && v._displacedTo == null
+            && (ulong)index < (ulong)v._numLen)
+            return v.NumGet((int)index);
+        return ((Fixnum)Aref(array, Fixnum.Make(index))).Value;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static long ArefSetNumL(LispObject array, long index, long value)
+    {
+        if (array is LispVector v && v._numData != null && v._displacedTo == null
+            && (ulong)index < (ulong)v._numLen)
+        {
+            v.NumSet((int)index, value);
+            return value;
+        }
+        ArefSet(array, Fixnum.Make(index), Fixnum.Make(value));
+        return value;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static long ArefNum2DL(LispObject array, long i0, long i1)
+    {
+        if (array is LispVector v && v._numData != null && v._displacedTo == null
+            && v._dimensions != null && v._dimensions.Length == 2
+            && (ulong)i0 < (ulong)v._dimensions[0] && (ulong)i1 < (ulong)v._dimensions[1])
+        {
+            long idx = i0 * v._dimensions[1] + i1;
+            if ((ulong)idx < (ulong)v._numLen)
+                return v.NumGet((int)idx);
+        }
+        return ((Fixnum)Aref2D(array, Fixnum.Make(i0), Fixnum.Make(i1))).Value;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static long ArefSetNum2DL(LispObject array, long i0, long i1, long value)
+    {
+        if (array is LispVector v && v._numData != null && v._displacedTo == null
+            && v._dimensions != null && v._dimensions.Length == 2
+            && (ulong)i0 < (ulong)v._dimensions[0] && (ulong)i1 < (ulong)v._dimensions[1])
+        {
+            long idx = i0 * v._dimensions[1] + i1;
+            if ((ulong)idx < (ulong)v._numLen)
+            {
+                v.NumSet((int)idx, value);
+                return value;
+            }
+        }
+        ArefSet2D(array, Fixnum.Make(i0), Fixnum.Make(i1), Fixnum.Make(value));
+        return value;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static long ArefNum3DL(LispObject array, long i0, long i1, long i2)
+    {
+        if (array is LispVector v && v._numData != null && v._displacedTo == null
+            && v._dimensions != null && v._dimensions.Length == 3
+            && (ulong)i0 < (ulong)v._dimensions[0] && (ulong)i1 < (ulong)v._dimensions[1]
+            && (ulong)i2 < (ulong)v._dimensions[2])
+        {
+            long idx = (i0 * v._dimensions[1] + i1) * v._dimensions[2] + i2;
+            if ((ulong)idx < (ulong)v._numLen)
+                return v.NumGet((int)idx);
+        }
+        return ((Fixnum)Aref3D(array, Fixnum.Make(i0), Fixnum.Make(i1), Fixnum.Make(i2))).Value;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static long ArefSetNum3DL(LispObject array, long i0, long i1, long i2, long value)
+    {
+        if (array is LispVector v && v._numData != null && v._displacedTo == null
+            && v._dimensions != null && v._dimensions.Length == 3
+            && (ulong)i0 < (ulong)v._dimensions[0] && (ulong)i1 < (ulong)v._dimensions[1]
+            && (ulong)i2 < (ulong)v._dimensions[2])
+        {
+            long idx = (i0 * v._dimensions[1] + i1) * v._dimensions[2] + i2;
+            if ((ulong)idx < (ulong)v._numLen)
+            {
+                v.NumSet((int)idx, value);
+                return value;
+            }
+        }
+        ArefSet3D(array, Fixnum.Make(i0), Fixnum.Make(i1), Fixnum.Make(i2), Fixnum.Make(value));
+        return value;
     }
 
     // Binary vector-push-extend: avoids LispObject[] allocation for 2-arg case
@@ -759,7 +1043,7 @@ public static partial class Runtime
             inst.Slots[idx] = value;
             return value;
         }
-        throw new LispErrorException(new LispTypeError("STRUCT-SET: not a structure", obj));
+        throw new LispErrorException(new LispTypeError($"STRUCT-SET: not a structure (idx={idx}, type={obj?.GetType().AssemblyQualifiedName ?? "null"})", obj));
     }
 
     public static LispObject StructRef(LispObject obj, LispObject index)

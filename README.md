@@ -91,6 +91,71 @@ make install              # builds and installs the local nupkg as `dotcl`
 After the first cross-compile, dotcl can self-host: `DOTCL_LISP=dotcl
 make cross-compile` rebuilds the compiler using dotcl itself.
 
+## A GUI in five minutes
+
+A cross-platform desktop window from one plain Lisp file — no C# project,
+no csproj. `nuget` (bundled, dotcl 0.1.16+) resolves NuGet packages
+and their transitive dependencies at run time:
+
+```lisp
+;;;; hello-gui.lisp — run with:  dotcl --load hello-gui.lisp
+(require "dotnet-class")                         ; dotnet:define-class (ships with dotcl)
+(require "nuget")                          ; NuGet resolver (ships with dotcl)
+(nuget:require "Avalonia.Desktop" :version "12.0.4")
+(nuget:require "Avalonia.Themes.Fluent" :version "12.0.4")
+(dotnet:load-assembly "Avalonia.Desktop")
+(dotnet:load-assembly "Avalonia.Themes.Fluent")
+
+(dotnet:define-class "Hello.App" ("Avalonia.Application")
+  (:ctor ()
+    (dotnet:invoke (dotnet:invoke self "get_Styles") "Add"
+                   (dotnet:new "Avalonia.Themes.Fluent.FluentTheme")))
+  (:methods
+    ("OnFrameworkInitializationCompleted" () :returns Void :override t
+      (let ((win    (dotnet:new "Avalonia.Controls.Window"))
+            (button (dotnet:new "Avalonia.Controls.Button"))
+            (clicks 0))
+        (dotnet:invoke win "set_Title" "Hello from Common Lisp")
+        (dotnet:invoke win "set_Width" 420d0)
+        (dotnet:invoke win "set_Height" 240d0)
+        (dotnet:invoke button "set_Content" "Click me")
+        (dotnet:invoke button "set_HorizontalAlignment"
+                       (dotnet:static "Avalonia.Layout.HorizontalAlignment" "Center"))
+        (dotnet:invoke button "set_VerticalAlignment"
+                       (dotnet:static "Avalonia.Layout.VerticalAlignment" "Center"))
+        (dotnet:add-event button "Click"
+          (lambda (s e) (declare (ignore s e))
+            (dotnet:invoke button "set_Content"
+                           (format nil "~r click~:p from Lisp!" (incf clicks)))))
+        (dotnet:invoke win "set_Content" button)
+        (dotnet:invoke (dotnet:invoke self "get_ApplicationLifetime")
+                       "set_MainWindow" win)))))
+
+(let* ((builder (dotnet:static-generic "Avalonia.AppBuilder" "Configure" (list "Hello.App")))
+       (builder (dotnet:static "Avalonia.AppBuilderDesktopExtensions" "UsePlatformDetect" builder))
+       (args    (dotnet:static-generic "System.Array" "Empty" (list "System.String"))))
+  (dotnet:static "Avalonia.ClassicDesktopStyleApplicationLifetimeExtensions"
+                 "StartWithClassicDesktopLifetime" builder args))
+```
+
+![hello-gui window after three clicks](docs/images/hello-gui.png)
+
+The first run downloads Avalonia from NuGet (a minute or two); after that
+it starts in seconds. The same file is in
+[`examples/hello-gui.lisp`](examples/hello-gui.lisp). Note the Lisp side is
+ordinary object wiring — the same `dotnet:new` / `dotnet:invoke` /
+`dotnet:add-event` calls work against WinForms, WPF, or any other .NET UI
+toolkit you have on hand.
+
+## Showcase
+
+- **[paalam](https://github.com/dotcl/paalam)** — a NeeView-style
+  image / comic / PDF viewer (Avalonia). UI and application logic are
+  Common Lisp end to end: CLOS protocol for page sources
+  (folder / zip / rar / PDF), Lisp threads for prefetch, `dotnet:ffi`
+  for PDFium text extraction, installers for Windows / macOS / Linux.
+  Read it as the scaled-up version of the five-minute example above.
+
 ## Samples
 
 Working integrations in `samples/`:

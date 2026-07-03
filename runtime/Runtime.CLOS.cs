@@ -2576,9 +2576,27 @@ public static partial class Runtime
     /// Called when a GF is invoked.
     /// </summary>
     /// <summary>Get the CLOS class for a dispatch argument (for cache keying).</summary>
+    // Memoized dispatch classes for the hottest builtin argument types. ClassOf
+    // on a builtin resolves Startup.Sym("NAME") + a registry hash lookup on
+    // EVERY call, and ArgDispatchClass runs for every argument of every GF
+    // dispatch (cache compare + applicability checks) — e.g. (gf instance i)
+    // with a fixnum i paid the INTEGER lookup per call. Builtin classes are
+    // registered once at startup and CL forbids redefining them, so a one-shot
+    // memo is safe. Types with special ClassOf handling (conditions, .NET
+    // objects, class/GF/method metaobjects, vectors) fall through unchanged.
+    private static LispClass? _dcInteger, _dcNull, _dcSymbol, _dcCons,
+        _dcString, _dcCharacter, _dcDoubleFloat;
+
     private static LispClass? ArgDispatchClass(LispObject obj) => obj switch
     {
         LispInstance inst => inst.Class,
+        Fixnum or Bignum => _dcInteger ??= FindClassOrNil(Startup.Sym("INTEGER")) as LispClass,
+        Nil => _dcNull ??= FindClassOrNil(Startup.Sym("NULL")) as LispClass,
+        Symbol or T => _dcSymbol ??= FindClassOrNil(Startup.Sym("SYMBOL")) as LispClass,
+        Cons => _dcCons ??= FindClassOrNil(Startup.Sym("CONS")) as LispClass,
+        LispString => _dcString ??= FindClassOrNil(Startup.Sym("STRING")) as LispClass,
+        LispChar => _dcCharacter ??= FindClassOrNil(Startup.Sym("CHARACTER")) as LispClass,
+        DoubleFloat => _dcDoubleFloat ??= FindClassOrNil(Startup.Sym("DOUBLE-FLOAT")) as LispClass,
         LispStruct st => FindClassOrNil(st.TypeName) as LispClass,
         _ => ClassOf(obj) as LispClass
     };
@@ -2692,17 +2710,31 @@ public static partial class Runtime
                     }
                     ValidateGenericKeywords(gf, cachedApplicable, args);
                 }
-                // For EQL specializers: check if any EQL method matches (takes priority)
-                if (cached.HasEqlSpecializers && cached.EqlMethods != null)
+                // For EQL specializers: check if any EQL method matches (takes
+                // priority — the cache is only stored for single-required-arg GFs,
+                // where an applicable EQL method is always the most specific and at
+                // most one EQL value can match; see the cache-store comment).
+                if (cached.HasEqlSpecializers && cached.EqlValues != null)
                 {
-                    LispMethod? eqlMatch = null;
-                    foreach (var em in cached.EqlMethods)
+                    int eqlIdx = -1;
+                    var eqlValues = cached.EqlValues;
+                    var a0 = args[0];
+                    for (int i = 0; i < eqlValues.Length; i++)
                     {
-                        if (IsMethodApplicable(em, args))
-                        { eqlMatch = em; break; } // first = most specific
+                        // Fast eql: identity (symbols/keywords/interned values) or
+                        // fixnum value compare; a fixnum is never eql to a
+                        // non-fixnum, so only mixed non-fixnum pairs (floats,
+                        // chars, ...) take the generic IsTrueEql.
+                        var v = eqlValues[i];
+                        if (ReferenceEquals(a0, v)
+                            || (a0 is Fixnum fa
+                                ? v is Fixnum fv && fa.Value == fv.Value
+                                : v is not Fixnum && IsTrueEql(a0, v)))
+                        { eqlIdx = i; break; }
                     }
-                    if (eqlMatch != null)
+                    if (eqlIdx >= 0)
                     {
+                        var eqlMatch = cached.EqlMethods![eqlIdx];
                         // Fast path: no around/before/after and no non-EQL primaries
                         // → invoke EQL method directly with minimal overhead
                         if (cached.Around.Count == 0 && cached.Before.Count == 0
@@ -2712,10 +2744,17 @@ public static partial class Runtime
                             var savedIndex = _nextMethodIndex;
                             var savedArgs = _currentGFArgs;
                             var savedFallback = _nextMethodFallback;
+                            var savedNmp = _capturedNmp;
+                            var savedCnm = _capturedCnm;
                             _nextMethodChain = null;
                             _nextMethodIndex = 0;
                             _currentGFArgs = args;
                             _nextMethodFallback = null;
+                            // Reset the captured cnm/nmp slots too — otherwise a body
+                            // that captures CALL-NEXT-METHOD would see an enclosing
+                            // dispatch's closure instead of "no next method".
+                            _capturedNmp = null;
+                            _capturedCnm = null;
                             try
                             {
                                 return eqlMatch.Function.Invoke(args);
@@ -2726,21 +2765,36 @@ public static partial class Runtime
                                 _nextMethodIndex = savedIndex;
                                 _currentGFArgs = savedArgs;
                                 _nextMethodFallback = savedFallback;
+                                _capturedNmp = savedNmp;
+                                _capturedCnm = savedCnm;
                             }
                         }
-                        // General case: build combined primary list
+                        // General case: use the precomputed [eql-method, non-EQL
+                        // primaries...] chain — no per-hit list building.
+                        var eqlPrimary = cached.EqlChains![eqlIdx];
                         if (cached.Around.Count > 0)
-                        {
-                            var eqlPrimary = new List<LispMethod> { eqlMatch };
-                            eqlPrimary.AddRange(cached.Primary);
                             return InvokeWithNextMethods(cached.Around, 0, args,
                                 a => InvokeStandardCombination(cached.Before, eqlPrimary, cached.After, a));
-                        }
-                        var primaryWithEql = new List<LispMethod> { eqlMatch };
-                        primaryWithEql.AddRange(cached.Primary);
-                        return InvokeStandardCombination(cached.Before, primaryWithEql, cached.After, args);
+                        return InvokeStandardCombination(cached.Before, eqlPrimary, cached.After, args);
                     }
                     // No EQL match — fall through to cached non-EQL result
+                }
+                // EQL cache with no matching EQL method and no non-EQL primaries:
+                // mirror the miss path (no-applicable → fallback fn or error;
+                // applicable-but-no-primary → error). Non-EQL caches always have
+                // >= 1 primary (the miss path throws before storing otherwise).
+                if (cached.HasEqlSpecializers && cached.Primary.Count == 0)
+                {
+                    if (cached.Around.Count == 0 && cached.Before.Count == 0
+                        && cached.After.Count == 0)
+                    {
+                        if (gf.FallbackFunction != null)
+                            return gf.FallbackFunction.Invoke(args);
+                        throw new LispErrorException(new LispError(
+                            $"No applicable method for generic function {gf.Name.Name}"));
+                    }
+                    throw new LispErrorException(new LispError(
+                        $"No primary method for generic function {gf.Name.Name}"));
                 }
                 // Cache hit: reuse sorted method lists
                 if (cached.IsBuiltinCombination && cached.Applicable != null)
@@ -2838,36 +2892,85 @@ public static partial class Runtime
         afterMethods.Sort((a, b) => CompareMethodSpecificity(b, a, args)); // reverse for :after
         aroundMethods.Sort((a, b) => CompareMethodSpecificity(a, b, args));
 
-        // Update monomorphic cache for STANDARD combination
+        // Update monomorphic cache for STANDARD combination.
+        //
+        // EQL-specialized GFs need care: the cache key is the argument CLASSES
+        // only, so two calls with the same classes but different EQL values
+        // (e.g. (cv :seq x) vs (cv :other x)) share the single cache slot. A
+        // class-keyed hit therefore must re-check the EQL methods against the
+        // actual argument values — that is what the hit path's EqlMethods scan
+        // does. Storing such a cache is only correct when the hit path's
+        // reconstruction ("matching EQL method is the most specific primary,
+        // prepended to the cached non-EQL primaries") provably matches CLHS
+        // 7.6.6 ordering:
+        //   - exactly 1 required (dispatch) position: with a single position an
+        //     applicable EQL method always beats every class-specialized method,
+        //     and two distinct EQL methods can never both be applicable — so
+        //     "prepend the (unique) EQL match" IS the sorted order. With 2+
+        //     positions a class method can out-rank an EQL method (leftmost
+        //     comparison), so those GFs stay uncached.
+        //   - all EQL methods unqualified: the hit path files the EQL match as a
+        //     primary; an EQL :before/:after/:around would be misfiled.
+        // GFs outside this shape keep the old behavior (recompute per call).
+        if (!hasEqlSpec)
         {
             int n = Math.Max(1, requiredCount);
             var types = new LispClass?[n];
             for (int i = 0; i < n && i < args.Length; i++)
                 types[i] = ArgDispatchClass(args[i]);
-            if (hasEqlSpec)
+            gf.LastDispatch = new CachedDispatch
             {
-                // For EQL GFs: cache the non-EQL result + ALL EQL methods from the GF
-                // (not just applicable ones — different calls may match different EQL specializers)
-                var nonEqlPrimary = new List<LispMethod>();
+                ArgTypes = types,
+                Around = aroundMethods,
+                Before = beforeMethods,
+                Primary = primaryMethods,
+                After = afterMethods,
+                HasEqlSpecializers = false
+            };
+        }
+        else if (requiredCount == 1)
+        {
+            var eqlMethods = new List<LispMethod>();
+            bool cacheable = true;
+            foreach (var m in gf.Methods)
+            {
+                bool hasEql = false;
+                foreach (var spec in m.Specializers)
+                    if (spec is Cons) { hasEql = true; break; }
+                if (!hasEql) continue;
+                if (m.Qualifiers.Length != 0) { cacheable = false; break; }
+                eqlMethods.Add(m);
+            }
+            if (cacheable)
+            {
+                // Cached partitions hold only the non-EQL methods; the hit path
+                // re-checks EqlMethods per call and prepends the match. The
+                // current call's own invocation below still uses the full
+                // sorted primaryMethods (EQL included), so copy-on-filter.
+                var nonEqlPrimary = new List<LispMethod>(primaryMethods.Count);
                 foreach (var m in primaryMethods)
                 {
-                    bool isEql = false;
+                    bool hasEql = false;
                     foreach (var spec in m.Specializers)
-                        if (spec is Cons c && c.Car is Symbol s && s.Name == "EQL")
-                        { isEql = true; break; }
-                    if (!isEql) nonEqlPrimary.Add(m);
+                        if (spec is Cons) { hasEql = true; break; }
+                    if (!hasEql) nonEqlPrimary.Add(m);
                 }
-                // Collect ALL EQL-specialized primary methods from the GF (sorted by specificity)
-                var allEqlMethods = new List<LispMethod>();
-                foreach (var m in gf.Methods)
+                // Precompute per-EQL-method dispatch data: the EQL value (the
+                // single required arg means the EQL specializer is at position
+                // 0) and the effective primary chain [eql-method, non-EQL
+                // primaries...], so a warm hit allocates nothing.
+                var eqlArr = eqlMethods.ToArray();
+                var eqlValues = new LispObject[eqlArr.Length];
+                var eqlChains = new List<LispMethod>[eqlArr.Length];
+                for (int i = 0; i < eqlArr.Length; i++)
                 {
-                    if (m.Qualifiers.Length > 0) continue; // skip :before/:after/:around
-                    bool isEql = false;
-                    foreach (var spec in m.Specializers)
-                        if (spec is Cons c && c.Car is Symbol s && s.Name == "EQL")
-                        { isEql = true; break; }
-                    if (isEql) allEqlMethods.Add(m);
+                    eqlValues[i] = ((Cons)((Cons)eqlArr[i].Specializers[0]).Cdr).Car;
+                    var chain = new List<LispMethod>(1 + nonEqlPrimary.Count) { eqlArr[i] };
+                    chain.AddRange(nonEqlPrimary);
+                    eqlChains[i] = chain;
                 }
+                var types = new LispClass?[1];
+                if (args.Length > 0) types[0] = ArgDispatchClass(args[0]);
                 gf.LastDispatch = new CachedDispatch
                 {
                     ArgTypes = types,
@@ -2876,19 +2979,9 @@ public static partial class Runtime
                     Primary = nonEqlPrimary,
                     After = afterMethods,
                     HasEqlSpecializers = true,
-                    EqlMethods = allEqlMethods.ToArray()
-                };
-            }
-            else
-            {
-                gf.LastDispatch = new CachedDispatch
-                {
-                    ArgTypes = types,
-                    Around = aroundMethods,
-                    Before = beforeMethods,
-                    Primary = primaryMethods,
-                    After = afterMethods,
-                    HasEqlSpecializers = false
+                    EqlMethods = eqlArr,
+                    EqlValues = eqlValues,
+                    EqlChains = eqlChains
                 };
             }
         }
@@ -3379,10 +3472,64 @@ public static partial class Runtime
 
     /// <summary>Intrinsic: the current method's captured CALL-NEXT-METHOD closure
     /// (thread-local). Emitted for the defmethod-body capture instead of
-    /// (symbol-function 'call-next-method), which read a process-global field.</summary>
-    public static LispObject CapturedCnm() => _capturedCnm ?? _defaultCnm;
-    /// <summary>Intrinsic: the current method's captured NEXT-METHOD-P closure (thread-local).</summary>
-    public static LispObject CapturedNmp() => _capturedNmp ?? _defaultNmp;
+    /// (symbol-function 'call-next-method), which read a process-global field.
+    ///
+    /// The closure is built LAZILY from the thread-local chain state that
+    /// InvokeWithNextMethods installs before invoking the method body. The
+    /// defmethod compiler only emits this capture (in the body prologue, before
+    /// anything can disturb the thread state) when the body actually mentions
+    /// CALL-NEXT-METHOD / NEXT-METHOD-P — so methods that never use them pay no
+    /// per-dispatch closure allocation at all. The lazily built closure snapshots
+    /// the same values the previous eager version captured, keeping indefinite
+    /// extent (CLHS 7.6.6.1).</summary>
+    public static LispObject CapturedCnm()
+    {
+        var cached = _capturedCnm;
+        if (cached != null) return cached;
+        var chain = _nextMethodChain;
+        if (chain == null) return _defaultCnm;
+        var closureChain = chain;
+        var closureIdx = _nextMethodIndex;
+        var closureArgs = _currentGFArgs!;
+        var closureFallback = _nextMethodFallback;
+        var currentMethod = (closureIdx > 0 && closureIdx - 1 < closureChain.Count)
+            ? closureChain[closureIdx - 1] : null;
+        var cnm = new LispFunction(
+            cnmArgs => {
+                var actualArgs = cnmArgs.Length > 0 ? cnmArgs : closureArgs;
+                if (cnmArgs.Length > 0 && currentMethod != null
+                    && !IsMethodApplicable(currentMethod, actualArgs))
+                    throw new LispErrorException(new LispProgramError(
+                        "CALL-NEXT-METHOD: changed arguments are not applicable to the current method"));
+                return CallNextMethodWithChain(closureChain, closureIdx, actualArgs, closureFallback);
+            },
+            "CALL-NEXT-METHOD", -1);
+        _capturedCnm = cnm; // memoized until InvokeWithNextMethods restores the frame
+        return cnm;
+    }
+    /// <summary>Intrinsic: the current method's captured NEXT-METHOD-P closure
+    /// (thread-local). Lazily built like CapturedCnm.</summary>
+    public static LispObject CapturedNmp()
+    {
+        var cached = _capturedNmp;
+        if (cached != null) return cached;
+        var chain = _nextMethodChain;
+        if (chain == null) return _defaultNmp;
+        var closureChain = chain;
+        var closureIdx = _nextMethodIndex;
+        var closureFallback = _nextMethodFallback;
+        var nmp = new LispFunction(
+            nmpArgs => {
+                if (nmpArgs.Length != 0)
+                    throw new LispErrorException(new LispProgramError(
+                        $"NEXT-METHOD-P: wrong number of arguments: {nmpArgs.Length} (expected 0)"));
+                return (closureIdx < closureChain.Count || closureFallback != null)
+                    ? (LispObject)T.Instance : Nil.Instance;
+            },
+            "NEXT-METHOD-P", 0);
+        _capturedNmp = nmp;
+        return nmp;
+    }
 
     private static LispObject InvokeWithNextMethods(
         List<LispMethod> methods, int startIdx, LispObject[] args,
@@ -3398,43 +3545,17 @@ public static partial class Runtime
         _currentGFArgs = args;
         _nextMethodFallback = fallback;
 
-        // Create closure versions of next-method-p and call-next-method
-        // with indefinite extent (CLHS 7.6.6.1, 7.6.6.2).
-        // These capture the current method chain state so they remain valid
-        // even after the method returns.
-        var closureChain = methods;
-        var closureIdx = startIdx + 1;
-        var closureArgs = args;
-        var closureFallback = fallback;
-
-        var nmpClosure = new LispFunction(
-            nmpArgs => {
-                if (nmpArgs.Length != 0)
-                    throw new LispErrorException(new LispProgramError(
-                        $"NEXT-METHOD-P: wrong number of arguments: {nmpArgs.Length} (expected 0)"));
-                return (closureIdx < closureChain.Count || closureFallback != null)
-                    ? (LispObject)T.Instance : Nil.Instance;
-            },
-            "NEXT-METHOD-P", 0);
-        var currentMethod = methods[startIdx];
-        var cnmClosure = new LispFunction(
-            cnmArgs => {
-                var actualArgs = cnmArgs.Length > 0 ? cnmArgs : closureArgs;
-                if (cnmArgs.Length > 0 && !IsMethodApplicable(currentMethod, actualArgs))
-                    throw new LispErrorException(new LispProgramError(
-                        "CALL-NEXT-METHOD: changed arguments are not applicable to the current method"));
-                return CallNextMethodWithChain(closureChain, closureIdx, actualArgs, closureFallback);
-            },
-            "CALL-NEXT-METHOD", -1);
-
-        // Publish the per-invocation closures thread-locally so the method body's
-        // entry capture (%CAPTURED-CALL-NEXT-METHOD / %CAPTURED-NEXT-METHOD-P) sees
-        // ITS OWN chain. Mutating the global symbol-functions here instead would let
-        // a concurrent dispatch on another thread clobber them mid-window.
+        // Indefinite-extent NEXT-METHOD-P / CALL-NEXT-METHOD closures (CLHS
+        // 7.6.6.1, 7.6.6.2) are built LAZILY by CapturedNmp/CapturedCnm from the
+        // thread state installed above: clearing the captured slots here marks
+        // "this invocation has not built its closures yet". Method bodies that
+        // never mention CALL-NEXT-METHOD / NEXT-METHOD-P (the defmethod compiler
+        // emits the capture only when the body uses them) thus pay no closure
+        // allocation per dispatch.
         var savedCapturedNmp = _capturedNmp;
         var savedCapturedCnm = _capturedCnm;
-        _capturedNmp = nmpClosure;
-        _capturedCnm = cnmClosure;
+        _capturedNmp = null;
+        _capturedCnm = null;
 
         try
         {

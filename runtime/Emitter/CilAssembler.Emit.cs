@@ -2452,14 +2452,22 @@ public partial class CilAssembler
         var prSym = Startup.Sym("*PRINT-READABLY*");
         var plSym = Startup.Sym("*PRINT-LEVEL*");
         var pnSym = Startup.Sym("*PRINT-LENGTH*");
+        var pkgSym = Startup.Sym("*PACKAGE*");
         DynamicBindings.Push(pcSym, T.Instance);
         DynamicBindings.Push(prSym, T.Instance);
         DynamicBindings.Push(plSym, Nil.Instance);   // never truncate the repr
         DynamicBindings.Push(pnSym, Nil.Instance);
+        // Print with *package* = KEYWORD so every interned symbol carries a full
+        // package qualifier. The repr is re-read in the LOADING process (or later
+        // in this one) under an arbitrary *package*; an unqualified name would
+        // re-intern relative to that package (e.g. SBCL's cold-build load re-read
+        // NIL/FIXNUM into its XC packages, corrupting reconstructed constants).
+        DynamicBindings.Push(pkgSym, Startup.KeywordPkg);
         try { repr = ((LispString)Runtime.WriteToString(val)).Value; }
         catch { return false; }                      // unprintable (e.g. unreadable struct)
         finally
         {
+            DynamicBindings.Pop(pkgSym);
             DynamicBindings.Pop(pnSym); DynamicBindings.Pop(plSym);
             DynamicBindings.Pop(prSym); DynamicBindings.Pop(pcSym);
         }
@@ -3146,6 +3154,20 @@ public partial class CilAssembler
             ["Runtime.ArefSet2D"] = typeof(Runtime).GetMethod("ArefSet2D")!,
             ["Runtime.Aref3D"] = typeof(Runtime).GetMethod("Aref3D")!,
             ["Runtime.ArefSet3D"] = typeof(Runtime).GetMethod("ArefSet3D")!,
+            // Raw-long-index variants (no Fixnum box for statically-fixnum indices)
+            ["Runtime.ArefL"] = typeof(Runtime).GetMethod("ArefL")!,
+            ["Runtime.ArefSetL"] = typeof(Runtime).GetMethod("ArefSetL")!,
+            ["Runtime.Aref2DL"] = typeof(Runtime).GetMethod("Aref2DL")!,
+            ["Runtime.ArefSet2DL"] = typeof(Runtime).GetMethod("ArefSet2DL")!,
+            ["Runtime.Aref3DL"] = typeof(Runtime).GetMethod("Aref3DL")!,
+            ["Runtime.ArefSet3DL"] = typeof(Runtime).GetMethod("ArefSet3DL")!,
+            // Raw-long-value variants for inferred numeric-backed array locals
+            ["Runtime.ArefNumL"] = typeof(Runtime).GetMethod("ArefNumL")!,
+            ["Runtime.ArefSetNumL"] = typeof(Runtime).GetMethod("ArefSetNumL")!,
+            ["Runtime.ArefNum2DL"] = typeof(Runtime).GetMethod("ArefNum2DL")!,
+            ["Runtime.ArefSetNum2DL"] = typeof(Runtime).GetMethod("ArefSetNum2DL")!,
+            ["Runtime.ArefNum3DL"] = typeof(Runtime).GetMethod("ArefNum3DL")!,
+            ["Runtime.ArefSetNum3DL"] = typeof(Runtime).GetMethod("ArefSetNum3DL")!,
             ["Runtime.LispError"] = typeof(Runtime).GetMethod("LispError")!,
 
             // Runtime - vector push

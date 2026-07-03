@@ -209,6 +209,14 @@ public static class TypeParser
         if (_symbolCache.TryGetValue(sym, out var cached))
             return cached;
 
+        // A non-CL deftype shadows built-ins for its own symbol
+        if (Runtime.TryGetQualifiedTypeExpander(sym, out var qExpander))
+        {
+            var qResult = Parse(Runtime.Funcall(qExpander), expanding);
+            _symbolCache[sym] = qResult;
+            return qResult;
+        }
+
         // Built-in type names — return singleton NamedType
         if (Runtime.IsBuiltinTypeName(name) || name == "T" || name == "NIL" || name == "*")
         {
@@ -536,7 +544,8 @@ public static class TypeParser
 
     private static CType ParseCompoundDeftype(Symbol head, LispObject? args, HashSet<string>? expanding)
     {
-        if (!Runtime.TypeExpanders.TryGetValue(head.Name, out var expander))
+        if (!Runtime.TryGetQualifiedTypeExpander(head, out var expander)
+            && !Runtime.TypeExpanders.TryGetValue(head.Name, out expander!))
             return NamedType.Get(head.Name);
 
         expanding ??= new HashSet<string>();

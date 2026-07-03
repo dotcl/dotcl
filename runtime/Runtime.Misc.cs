@@ -33,6 +33,58 @@ public static partial class Runtime
     private static LispError MakeStreamError(LispObject stream, string op) =>
         new LispError($"{op}: stream is closed") { ConditionTypeName = "STREAM-ERROR", StreamErrorStreamRef = stream };
 
+    /// <summary>A TextReader that spans a concatenated-stream's component streams:
+    /// when the current component reaches EOF it advances to the next, so a single
+    /// reader (e.g. the token reader behind READ) reads continuously across the
+    /// whole concatenation instead of stopping at the first component's EOF.
+    /// Advances the shared CurrentIndex, consistent with read-char/peek-char.</summary>
+    private sealed class ConcatenatedTextReader : TextReader
+    {
+        private readonly LispConcatenatedStream _cs;
+        public ConcatenatedTextReader(LispConcatenatedStream cs) => _cs = cs;
+        private TextReader? Current()
+        {
+            while (_cs.CurrentIndex < _cs.Streams.Length)
+            {
+                var r = GetTextReader(_cs.Streams[_cs.CurrentIndex]);
+                if (r.Peek() != -1) return r;
+                _cs.CurrentIndex++;
+            }
+            return null;
+        }
+        public override int Peek() => Current()?.Peek() ?? -1;
+        public override int Read()
+        {
+            while (true)
+            {
+                var r = Current();
+                if (r == null) return -1;
+                int c = r.Read();
+                if (c != -1) return c;
+                _cs.CurrentIndex++; // component exhausted between Peek and Read — advance
+            }
+        }
+    }
+
+    /// <summary>Wraps a TextReader and counts characters physically read. READ-FROM-STRING
+    /// uses this to report position from the true consumption of the underlying string,
+    /// so reader macros that consume via the stream API (e.g. babel's #\ reader delegating
+    /// to the built-in over a make-concatenated-stream wrap) advance the reported position
+    /// even though they bypass the Reader's own Position counter. Peek does not consume.</summary>
+    private sealed class CountingTextReader : TextReader
+    {
+        private readonly TextReader _inner;
+        public int CharsRead { get; private set; }
+        public CountingTextReader(TextReader inner) => _inner = inner;
+        public override int Peek() => _inner.Peek();
+        public override int Read()
+        {
+            int c = _inner.Read();
+            if (c != -1) CharsRead++;
+            return c;
+        }
+    }
+
     public static TextReader GetTextReader(LispObject stream)
     {
         while (true)
@@ -58,16 +110,9 @@ public static partial class Runtime
                     stream = DynamicBindings.Get(syn.Symbol);
                     continue;
                 case LispConcatenatedStream concat:
-                {
-                    while (concat.CurrentIndex < concat.Streams.Length)
-                    {
-                        var componentReader = GetTextReader(concat.Streams[concat.CurrentIndex]);
-                        if (componentReader.Peek() != -1)
-                            return componentReader;
-                        concat.CurrentIndex++;
-                    }
-                    return new StringReader(""); // all exhausted
-                }
+                    // Span all components so the token reader (READ) crosses component
+                    // boundaries instead of stopping at the first component's EOF.
+                    return new ConcatenatedTextReader(concat);
                 case T:
                     stream = DynamicBindings.Get(Startup.Sym("*TERMINAL-IO*"));
                     continue;
@@ -106,7 +151,14 @@ public static partial class Runtime
                     var bcWriters = new TextWriter[bc.Streams.Length];
                     for (int i = 0; i < bc.Streams.Length; i++) bcWriters[i] = GetTextWriter(bc.Streams[i]);
                     return new BroadcastTextWriter(bcWriters);
-                case LispInstance gi when IsGrayOutputStream(gi):
+                // A character gray output stream, or a binary (bivalent) gray output
+                // stream that defines stream-write-char: route character output to the
+                // gray protocol. CLHS/SBCL dispatch write-char (and write-string/format)
+                // to stream-write-char regardless of element-type, so a binary gray
+                // stream with a stream-write-char method is writable as characters.
+                // (write-byte uses a separate path, so pure-binary streams are unaffected
+                // until a character is actually written, where erroring is correct.)
+                case LispInstance gi when IsGrayOutputStream(gi) || IsGrayBinaryOutputStream(gi):
                     return new GrayStreamTextWriter(gi);
                 default: return Console.Out;
             }
@@ -280,7 +332,13 @@ public static partial class Runtime
         }
 
         string substring = str.Substring(start, end - start);
-        var stringStream = new LispInputStream(new StringReader(substring));
+        // Count physical reads from the underlying string so the reported position
+        // tracks consumption done via the stream API by reader macros (read-char/read
+        // over a make-concatenated-stream wrap, as in babel's #\ reader), which bypass
+        // the Reader's own Position counter. Both the Reader and any stream-API access
+        // share this one counting reader, so position = consumed - still-buffered chars.
+        var counting = new CountingTextReader(new StringReader(substring));
+        var stringStream = new LispInputStream(counting);
         var reader = new Reader(stringStream.Reader) { LispStreamRef = stringStream };
         if (reader.TryRead(out var result))
         {
@@ -292,7 +350,8 @@ public static partial class Runtime
                 if (ch != -1 && char.IsWhiteSpace((char)ch))
                     reader.ReadChar();
             }
-            return MultipleValues.Values(result, Fixnum.Make(start + reader.Position));
+            int pending = reader.PendingLookahead + (stringStream.UnreadCharValue != -1 ? 1 : 0);
+            return MultipleValues.Values(result, Fixnum.Make(start + counting.CharsRead - pending));
         }
 
         // EOF
@@ -310,8 +369,19 @@ public static partial class Runtime
     {
         var stringStream = new LispInputStream(new StringReader(s));
         var reader = new Reader(stringStream.Reader) { LispStreamRef = stringStream };
-        if (reader.TryRead(out var result))
-            return result;
+        // The repr was printed with the standard syntax and fully qualified
+        // symbol names (see TryEmitConstantViaReader). Read it back under the
+        // standard readtable so a custom load-time *readtable* (e.g. SBCL's
+        // cold-build xc-readtable, which replaces "(", digits and #+) cannot
+        // distort the reconstruction.
+        var rtSym = Startup.Sym("*READTABLE*");
+        DynamicBindings.Push(rtSym, Startup.StandardReadtable);
+        try
+        {
+            if (reader.TryRead(out var result))
+                return result;
+        }
+        finally { DynamicBindings.Pop(rtSym); }
         throw new LispErrorException(new LispProgramError(
             "fasl: empty representation while reconstructing a constant literal"));
     }
@@ -834,7 +904,15 @@ public static partial class Runtime
         }
 
         var source = File.ReadAllText(filePath);
-        var reader2 = new Reader(new StringReader(source));
+        var loadStringReader = new StringReader(source);
+        var reader2 = new Reader(loadStringReader);
+        // Same live-reader/share-table link as CompileFile: a Lisp reader macro
+        // reading elements via (read stream) must reuse THIS reader so per-form
+        // share-table clearing doesn't run per element (see CompileFile).
+        var loadStream = new LispInputStream(loadStringReader);
+        reader2.LispStreamRef = loadStream;
+        loadStream.CachedReader = reader2;
+        reader2.AdoptStreamShareTables(loadStream);
 
         // Save and bind *load-pathname*, *load-truename*, *package*, and *readtable* per CLHS
         // CLHS: *load-pathname* = (merge-pathnames filespec *default-pathname-defaults*)
@@ -1706,7 +1784,17 @@ public static partial class Runtime
             var source = File.ReadAllText(inputPath);
             var trackingReader = new PositionTrackingReader(new StringReader(source));
             var reader = new Reader(trackingReader);
-            reader.LispStreamRef = new LispStringInputStream(trackingReader, 0);
+            var compileStream = new LispStringInputStream(trackingReader, 0);
+            reader.LispStreamRef = compileStream;
+            // Link this reader as the stream's live reader and share the #n=/#n#
+            // tables with the stream. A Lisp reader macro (e.g. SBCL's cold-build
+            // read-list on "(") reads elements via (read stream); without this link
+            // ReadFromStream spins up a second Reader whose per-form table clearing
+            // runs once per ELEMENT, so a #n= registered in one element is gone by
+            // the time the sibling #n# is read — the placeholder then leaks into
+            // the compiled fasl as an unresolved constant.
+            compileStream.CachedReader = reader;
+            reader.AdoptStreamShareTables(compileStream);
 
             var dir = Path.GetDirectoryName(outputPath);
             if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
@@ -2712,8 +2800,12 @@ public static partial class Runtime
             if (ch == c && name != "Linefeed" && name != "Delete" && name != "Nul"
                 && name != "Altmode") // only canonical names
                 return name;
+        // UCD names print with underscores (not spaces) so a #\<name> literal reads
+        // back as a single token (CLHS #\ reads one token; name-char accepts both
+        // underscores and spaces). This keeps char-name / ~:C / ~@C / prin1 mutually
+        // consistent and round-trippable without the reader over-scanning.
         if (Ucd.CharToName.TryGetValue(c, out string? ucdName))
-            return ucdName;
+            return ucdName.Replace(' ', '_');
         // Non-graphic characters get U+XXXX names
         if (char.IsControl(c) || char.GetUnicodeCategory(c) == System.Globalization.UnicodeCategory.Format
             || char.GetUnicodeCategory(c) == System.Globalization.UnicodeCategory.Surrogate
@@ -4461,14 +4553,22 @@ public static partial class Runtime
         // %REGISTER-TYPE-EXPANDER
         Emitter.CilAssembler.RegisterFunction("%REGISTER-TYPE-EXPANDER",
             new LispFunction(args => {
-                string n = args[0] is Symbol s ? s.Name : args[0].ToString()!;
-                // Don't let cross-compiler package (SB-XC) shadow CL built-in types.
-                // SB-XC:FLOAT, SB-XC:COMPLEX etc. are different symbols from CL:FLOAT, CL:COMPLEX
-                // but have the same name. Their deftypes are meant for the target, not the host.
-                if (args[0] is Symbol sym && sym.HomePackage is Package pkg
-                    && pkg.Name == "SB-XC")
-                    return args[0]; // skip registration
-                Runtime.TypeExpanders[n] = args[1];
+                // Package-aware key: a non-CL deftype (e.g. SBCL's host-side
+                // SB-XC:COMPLEX -> COMPLEXNUM) registers under "PKG::NAME" so it
+                // shadows a same-named built-in for its own symbol only, and
+                // never hijacks CL:COMPLEX for everyone.
+                if (args[0] is Symbol s)
+                {
+                    Runtime.TypeExpanders[Runtime.TypeExpanderKey(s)] = args[1];
+                    // Plain-name alias for cross-package references — but never
+                    // for a built-in type name (that would hijack e.g. CL:COMPLEX
+                    // for every package; such deftypes work via their own symbol).
+                    if (!Runtime.IsBuiltinTypeName(s.Name))
+                        Runtime.TypeExpanders[s.Name] = args[1];
+                    TypeParser.InvalidateCache(s.Name);
+                }
+                else
+                    Runtime.TypeExpanders[args[0].ToString()!] = args[1];
                 return args[0];
             }));
 

@@ -31,17 +31,15 @@ jobs:
           curl -L https://raw.githubusercontent.com/roswell/roswell/master/scripts/install-for-ci.sh | bash
           echo "$HOME/.roswell/bin" >> $GITHUB_PATH
 
+      # Build smoke only. Regression + ANSI already gated on every master push
+      # (ci.yml) and locally before tagging; re-running the full regression here
+      # is redundant. Tags are cut from validated local state, so this job just
+      # confirms the release artifacts still cross-compile + build on ubuntu.
       - name: Cross-compile
         run: make cross-compile
 
       - name: Build
         run: make build
-
-      - name: Compile asdf FASL (required by some regression tests)
-        run: make compile-asdf-fasl
-
-      - name: Regression tests
-        run: make test-regression
 
   # ── Job 2: build nupkg + tbz and create GitHub Release ──────────────────
   release:
@@ -95,8 +93,15 @@ jobs:
       - name: Build dotcl-cs contrib
         run: make contrib-dotcl-cs
 
-      # ── Stage runtime/contrib/ (mirrors the pack target, minus R2R) ──────
-      # R2R (ReadyToRun) support is a planned follow-up.
+      # ── R2R (ReadyToRun) FASL artifacts ──────────────────────────────────
+      # crossgen2 the core / asdf / contrib fasls per RID so the tbz distribution
+      # ships pre-native FASLs (cold RunCore ~3.37s → ~50ms, D704). crossgen2
+      # cross-compiles from the ubuntu host for every target RID. Runs before the
+      # contrib staging below so the <name>-r2r-<rid>.fasl land in runtime/contrib.
+      - name: Compile R2R FASLs (per RID)
+        run: make compile-core-fasl-r2r-all compile-asdf-fasl-r2r-all compile-contrib-fasls-r2r-all
+
+      # ── Stage runtime/contrib/ (mirrors the pack target) ─────────────────
       - name: Stage contrib for packing
         run: |
           rm -rf runtime/contrib
@@ -142,23 +147,27 @@ jobs:
             exit 1
           fi
 
-      # ── Per-RID tbz for Roswell (no R2R; R2R is a planned follow-up) ──────
+      # ── Per-RID tbz for Roswell (R2R) ────────────────────────────────────
       # dotnet publish -r <rid> --self-contained false cross-compiles on Linux
-      # for all 6 RIDs.  contrib/ and dotcl.core are injected after publish.
+      # for all 6 RIDs. PublishReadyToRun=true crossgens the runtime assembly to
+      # native; dotcl.core / asdf.fasl are injected as the per-RID R2R FASLs, and
+      # the contrib R2R fasls (<name>-r2r-<rid>.fasl) ride along in runtime/contrib
+      # for the resolve-deps probe.
       - name: Build per-RID tbz
         run: |
           VER=${{ steps.version.outputs.VERSION }}
           mkdir -p out
           for rid in win-x64 win-arm64 linux-x64 linux-arm64 osx-x64 osx-arm64; do
-            echo "=== publishing $rid ==="
+            echo "=== publishing $rid (R2R) ==="
             dotnet publish runtime/runtime.csproj \
               -c Release -r $rid --self-contained false \
               -p:Version=$VER \
-              -p:PublishReadyToRun=false \
+              -p:PublishReadyToRun=true \
               -o out/publish-$rid/
-            # inject contrib and dotcl.core
+            # inject contrib (IL + per-RID R2R contrib fasls) and R2R core/asdf
             cp -r runtime/contrib out/publish-$rid/contrib
-            cp compiler/dotcl.core out/publish-$rid/dotcl.core
+            cp compiler/dotcl-r2r-$rid.core out/publish-$rid/dotcl.core
+            cp contrib/asdf/asdf-r2r-$rid.fasl out/publish-$rid/contrib/asdf/asdf.fasl
             chmod +x out/publish-$rid/runtime 2>/dev/null || true
             tar -cjf out/dotcl-$rid-$VER.tar.bz2 -C out/publish-$rid .
             size=$(du -h out/dotcl-$rid-$VER.tar.bz2 | awk '{print $1}')
