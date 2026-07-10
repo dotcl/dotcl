@@ -36,6 +36,14 @@
     <ProjectReference Include="DotCL.Runtime.csproj" />
   </ItemGroup>
 
+  <!-- Exclude per-RID R2R fasls (*-r2r-<rid>.fasl) from the framework-dependent
+       (any-RID) tool package; they belong only in the per-RID tool packages
+       (dotcl.<rid>). Empty when a RID is set, so per-RID packs keep their R2R.
+       Without this the contrib/** glob bundled all 6 RIDs' R2R fasls (~35MB). -->
+  <PropertyGroup>
+    <FrameworkContribR2RExclude Condition="'$(RuntimeIdentifier)' == '' or '$(RuntimeIdentifier)' == 'any'">contrib/**/*-r2r-*.fasl</FrameworkContribR2RExclude>
+  </PropertyGroup>
+
   <ItemGroup>
     <None Include="..\README.md" Pack="true" PackagePath="\" />
     <None Include="dotcl.core" Condition="Exists('dotcl.core')">
@@ -46,11 +54,11 @@
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <CopyToPublishDirectory>Always</CopyToPublishDirectory>
     </Content>
-    <None Include="contrib/**" Condition="Exists('contrib')">
+    <None Include="contrib/**" Exclude="$(FrameworkContribR2RExclude)" Condition="Exists('contrib')">
       <Pack>true</Pack>
       <PackagePath>tools/net10.0/any/contrib/</PackagePath>
     </None>
-    <Content Include="contrib/**" Condition="Exists('contrib')">
+    <Content Include="contrib/**" Exclude="$(FrameworkContribR2RExclude)" Condition="Exists('contrib')">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <CopyToPublishDirectory>Always</CopyToPublishDirectory>
     </Content>

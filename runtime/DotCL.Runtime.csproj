@@ -57,7 +57,11 @@
     <None Include="dotcl.core" Condition="Exists('dotcl.core')" Pack="true" PackagePath="dotclassets/">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
-    <None Include="contrib/**/*" Exclude="contrib/**/*.cs;contrib/**/*.dll"
+    <!-- *-r2r-<rid>.fasl are per-RID native precompiled fasls; they belong only in
+         the per-RID tool packages (dotcl.<rid>), not in this framework-dependent
+         library package. Without this exclude the contrib/** glob bundled all 6 RIDs'
+         R2R fasls (~35MB), tripling the package. -->
+    <None Include="contrib/**/*" Exclude="contrib/**/*.cs;contrib/**/*.dll;contrib/**/*-r2r-*.fasl"
           Condition="Exists('contrib')" Pack="true" PackagePath="dotclassets/contrib/" />
     <None Include="build/DotCL.Runtime.targets" Pack="true" PackagePath="build/" />
     <None Include="build/DotCL.Runtime.targets" Pack="true" PackagePath="buildTransitive/" />
