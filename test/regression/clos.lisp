@@ -647,3 +647,70 @@
 (deftest eql-cache-multiarg-ordering
   (list (%eqlc-two 5 3) (%eqlc-two 5 3))
   ((:int-first (:eql-y)) (:int-first (:eql-y))))
+
+;;; Class-object specializer (a class metaobject, not a class-name symbol):
+;;; (defmethod m ((x #.(find-class 'cons))) ...). SBCL/CCL accept a class object
+;;; as a specializer and real libraries (serapeum threads.lisp) rely on it; dotcl
+;;; must register and dispatch on it rather than passing it to find-class.
+(defgeneric %clos-cospec (x))
+(defmethod %clos-cospec ((x #.(find-class 'cons))) :cons-class-object)
+(defmethod %clos-cospec ((x t)) :fallback)
+(deftest clos-class-object-specializer
+  (list (%clos-cospec (cons 1 2)) (%clos-cospec 99))
+  (:cons-class-object :fallback))
+
+;;; dotnet:class-for-type — public lookup of the CLOS class dotcl registers for a
+;;; .NET type, so user code never hand-spells a specializer symbol (dotcl/dotcl#50).
+;;; Returns a class object usable directly as a #. specializer.
+(deftest class-for-type-is-class
+  (typep (dotnet:class-for-type "System.Text.StringBuilder") 'class)
+  t)
+
+;;; Same class object as class-of an instance, and idempotent across calls / input forms.
+(deftest class-for-type-eq-class-of
+  (let ((c (dotnet:class-for-type "System.Text.StringBuilder")))
+    (list (eq c (class-of (dotnet:new "System.Text.StringBuilder")))
+          (eq c (dotnet:class-for-type "System.Text.StringBuilder"))
+          (eq c (dotnet:class-for-type (dotnet:resolve-type "System.Text.StringBuilder")))))
+  (t t t))
+
+;;; Closed generic — the motivating case: its auto-derived name is an ugly
+;;; assembly-qualified string, but class-for-type hands back the class directly.
+(deftest class-for-type-closed-generic
+  (typep (dotnet:class-for-type
+           (dotnet:make-generic-type "System.Collections.Generic.List" '("System.Int32")))
+         'class)
+  t)
+
+;;; The class object dispatches as a #. specializer.
+(defgeneric %cft-tag (x))
+(defmethod %cft-tag ((x #.(dotnet:class-for-type "System.Text.StringBuilder"))) :sb)
+(defmethod %cft-tag ((x t)) :other)
+(deftest class-for-type-specializer
+  (list (%cft-tag (dotnet:new "System.Text.StringBuilder")) (%cft-tag 42))
+  (:sb :other))
+
+;;; Closed generics get distinct, readable class names (List<Int32> vs List<String>)
+;;; instead of colliding on List`1 with a load-order-dependent winner (dotcl/dotcl#50).
+(deftest class-for-type-closed-generic-distinct-names
+  (let ((ci (dotnet:class-for-type
+              (dotnet:make-generic-type "System.Collections.Generic.List" '("System.Int32"))))
+        (cs (dotnet:class-for-type
+              (dotnet:make-generic-type "System.Collections.Generic.List" '("System.String")))))
+    (list (not (eq ci cs))
+          (string= (string (class-name ci)) "List<Int32>")
+          (string= (string (class-name cs)) "List<String>")))
+  (t t t))
+
+;;; A closed generic dispatches distinctly by its readable class (no collision with
+;;; another instantiation).
+(defgeneric %cft-gen (x))
+(defmethod %cft-gen ((x #.(dotnet:class-for-type
+                            (dotnet:make-generic-type "System.Collections.Generic.List"
+                                                      '("System.Int32"))))) :int-list)
+(defmethod %cft-gen ((x t)) :other)
+(deftest class-for-type-closed-generic-dispatch
+  (list (%cft-gen (dotnet:new (dotnet:make-generic-type "System.Collections.Generic.List"
+                                                        '("System.Int32"))))
+        (%cft-gen 42))
+  (:int-list :other))

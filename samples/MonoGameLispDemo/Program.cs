@@ -17,14 +17,9 @@ if (args.Length > 0 && args[0] == "--csharp-sanity")
 
 DotclHost.Initialize();
 
-// Force MonoGame's core types loaded so dotcl's ResolveDotNetType can see
-// Game / GraphicsDeviceManager / GameTime / Color / GraphicsDevice when the
-// Lisp side names them by short name.
-_ = typeof(Microsoft.Xna.Framework.Game).FullName;
-_ = typeof(Microsoft.Xna.Framework.GraphicsDeviceManager).FullName;
-_ = typeof(Microsoft.Xna.Framework.GameTime).FullName;
-_ = typeof(Microsoft.Xna.Framework.Color).FullName;
-_ = typeof(Microsoft.Xna.Framework.Graphics.GraphicsDevice).FullName;
+// No need to force-load MonoGame's assembly: when the Lisp side first names a
+// Microsoft.Xna.Framework.* type, resolve-type probes the app base directory
+// (where MonoGame.Framework.dll is copied) and loads it on demand.
 
 var manifestPath = Path.Combine(
     AppContext.BaseDirectory, "dotcl-fasl", "dotcl-deps.txt");

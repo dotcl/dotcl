@@ -48,3 +48,46 @@
   ;; function call would have signalled "Undefined function: PC325-MAC" on load.
   (pc325-build-and-load-concat)
   4242)
+
+;;; --- fasl serialization of class-object constants ---
+;;; A class object used as a compile-time literal (#.(find-class 'foo) /
+;;; #.(class-of x)) must be emitted as a FIND-CLASS load-form so the fasl is
+;;; cross-process safe, not a per-process constant-pool reference. We can't spawn
+;;; a second process here, but compiling to a fasl and loading it exercises the
+;;; LispClass emission path; the class must round-trip to the same registry object.
+(defun cc469-build-and-load ()
+  (ensure-directories-exist *pc325-tmp-dir*)
+  (let* ((src  (namestring (merge-pathnames "cc469-src.lisp" (truename *pc325-tmp-dir*))))
+         (fasl (namestring (merge-pathnames "cc469.fasl"     (truename *pc325-tmp-dir*)))))
+    (pc325-write-text src
+      "(in-package :cl-user)
+       (defclass cc469-myc () ())
+       (defun cc469-builtin () #.(find-class 'cons))
+       (defun cc469-user () #.(find-class 'cc469-myc))")
+    (compile-file src :output-file fasl)
+    (load fasl)
+    (list (eq (funcall (find-symbol "CC469-BUILTIN")) (find-class 'cons))
+          (eq (funcall (find-symbol "CC469-USER")) (find-class 'cc469-myc)))))
+
+(deftest fasl-class-constant-roundtrip
+  ;; Both a built-in class (CONS) and a user class resolve back to the live
+  ;; registry object after compile-file + load (find-class load-form, not pool).
+  (cc469-build-and-load)
+  (t t))
+
+;;; --- compile-file of a source whose basename has an AssemblyName-reserved
+;;; char --- e.g. serapeum's vector=.lisp. The fasl module name derived
+;;; from the basename ("vector=_<guid>") must be sanitized before new
+;;; AssemblyName, which otherwise throws "The given assembly name was invalid.".
+(defun cc471-build-and-load ()
+  (ensure-directories-exist *pc325-tmp-dir*)
+  (let* ((src  (namestring (merge-pathnames "cc471=eq.lisp" (truename *pc325-tmp-dir*))))
+         (fasl (namestring (merge-pathnames "cc471=eq.fasl" (truename *pc325-tmp-dir*)))))
+    (pc325-write-text src "(in-package :cl-user)(defun cc471-fn () 471)")
+    (compile-file src :output-file fasl)   ; must not signal "assembly name invalid"
+    (load fasl)
+    (funcall (find-symbol "CC471-FN"))))
+
+(deftest fasl-equals-in-filename
+  (cc471-build-and-load)
+  471)

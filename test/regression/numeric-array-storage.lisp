@@ -159,3 +159,91 @@
   (let ((v (make-array 3 :element-type '(unsigned-byte 8) :initial-contents '(1 2 3))))
     (format nil "~a" v))
   "#(1 2 3)")
+
+;;; ---- float element-type storage (single-float → float[], double-float →
+;;; double[]) ----
+
+(deftest nas-float-upgrade-single
+  (array-element-type (make-array 3 :element-type 'single-float))
+  single-float)
+
+(deftest nas-float-upgrade-double
+  (array-element-type (make-array 3 :element-type 'double-float))
+  double-float)
+
+(deftest nas-float-rw-single
+  (let ((v (make-array 3 :element-type 'single-float)))
+    (setf (aref v 0) 1.5 (aref v 1) 2.25 (aref v 2) -3.5)
+    (coerce v 'list))
+  (1.5 2.25 -3.5))
+
+(deftest nas-float-rw-double
+  (let ((v (make-array 3 :element-type 'double-float)))
+    (setf (aref v 0) 1.5d0 (aref v 1) 2.25d0 (aref v 2) -3.5d0)
+    (coerce v 'list))
+  (1.5d0 2.25d0 -3.5d0))
+
+;; single-float storage narrows on store (result reads back as single-float).
+(deftest nas-float-single-narrows
+  (let ((v (make-array 1 :element-type 'single-float)))
+    (setf (aref v 0) 0.5)
+    (typep (aref v 0) 'single-float))
+  t)
+
+;; default fill is a zero of the element type, not a fixnum.
+(deftest nas-float-default-zero
+  (let ((v (make-array 2 :element-type 'double-float)))
+    (list (aref v 0) (typep (aref v 0) 'double-float)))
+  (0.0d0 t))
+
+(deftest nas-float-initial-element
+  (coerce (make-array 3 :element-type 'single-float :initial-element 4.5) 'list)
+  (4.5 4.5 4.5))
+
+(deftest nas-float-initial-contents
+  (coerce (make-array 3 :element-type 'double-float
+                        :initial-contents '(1d0 2d0 3d0)) 'list)
+  (1.0d0 2.0d0 3.0d0))
+
+;; storing a non-real signals loudly (no silent corruption).
+(deftest nas-float-store-non-number
+  (let ((v (make-array 2 :element-type 'single-float :initial-element 0.0)))
+    (handler-case (progn (setf (aref v 0) "x") :no-error)
+      (type-error () :type-error)))
+  :type-error)
+
+;; native float arithmetic across aref boundaries (fft/mandelbrot inner shape).
+(deftest nas-float-arith
+  (let ((a (make-array 3 :element-type 'double-float :initial-contents '(1d0 2d0 3d0)))
+        (b (make-array 3 :element-type 'double-float :initial-contents '(10d0 20d0 30d0)))
+        (c (make-array 3 :element-type 'double-float)))
+    (dotimes (i 3) (setf (aref c i) (+ (aref a i) (aref b i))))
+    (coerce c 'list))
+  (11.0d0 22.0d0 33.0d0))
+
+(deftest nas-float-2d
+  (let ((a (make-array '(2 2) :element-type 'single-float :initial-element 0.0)))
+    (setf (aref a 0 0) 1.0 (aref a 0 1) 2.0 (aref a 1 0) 3.0 (aref a 1 1) 4.0)
+    (list (aref a 0 0) (aref a 0 1) (aref a 1 0) (aref a 1 1)))
+  (1.0 2.0 3.0 4.0))
+
+(deftest nas-float-adjust
+  (let* ((v (make-array 2 :element-type 'double-float
+                          :initial-contents '(1d0 2d0) :adjustable t))
+         (w (adjust-array v 4 :initial-element 9d0)))
+    (coerce w 'list))
+  (1.0d0 2.0d0 9.0d0 9.0d0))
+
+(deftest nas-float-vector-push-extend
+  (let ((v (make-array 2 :element-type 'single-float :fill-pointer 0 :adjustable t)))
+    (vector-push-extend 1.0 v)
+    (vector-push-extend 2.0 v)
+    (vector-push-extend 3.0 v)
+    (coerce v 'list))
+  (1.0 2.0 3.0))
+
+(deftest nas-float-typep
+  (let ((v (make-array 3 :element-type 'single-float)))
+    (list (typep v '(simple-array single-float (*)))
+          (typep v '(array single-float))))
+  (t t))

@@ -481,3 +481,38 @@
       (dotcl-thread:thread-join th)
       (and live t)))
   t)
+
+;; A worker thread must have a top-level ABORT restart (like the REPL's main
+;; thread), so a concurrency library can terminate a worker via
+;; (invoke-restart 'abort). compute-restarts used to return NIL in a worker,
+;; breaking lparallel's active-worker-replacement (invoke-abort-thread).
+(deftest i480-worker-has-abort-restart
+  (dotcl-thread:thread-join
+   (dotcl-thread:make-thread
+    (lambda () (and (find 'abort (mapcar #'restart-name (compute-restarts))) t))))
+  t)
+
+;; Invoking that ABORT restart unwinds the worker body (code after it must not run).
+(defvar *i480-ran-after* :untouched)
+(deftest i480-abort-unwinds-worker
+  (progn
+    (setf *i480-ran-after* :untouched)
+    (dotcl-thread:thread-join
+     (dotcl-thread:make-thread
+      (lambda ()
+        (invoke-restart (find-restart 'abort))
+        (setf *i480-ran-after* :ran))))   ; unreachable after abort
+    *i480-ran-after*)
+  :untouched)
+
+;; Runtime.Eval serializes compilation on the global _evalLock, but must NOT hold
+;; it while RUNNING the compiled form — a form that blocks waiting on worker
+;; threads which themselves need to compile (eval) deadlocks (main holds the lock,
+;; workers block acquiring it). Mirrors lparallel `each` over APL execute ⍎¨.
+;; If this regresses, the test HANGS.
+(deftest i490-eval-releases-lock-during-run
+  (eval '(let ((threads (loop for i below 4 collect
+                          (dotcl-thread:make-thread
+                           (let ((n i)) (lambda () (eval `(* ,n ,n))))))))
+           (mapcar #'dotcl-thread:thread-join threads)))
+  (0 1 4 9))

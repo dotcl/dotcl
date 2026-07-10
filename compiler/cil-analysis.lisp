@@ -30,13 +30,6 @@
 ;;; Free variable analysis (for lambda/closure)
 ;;; ============================================================
 
-(defun find-free-vars (body bound-names)
-  "Find free variable names (strings) referenced in body but not in bound-names set."
-  (let ((free-ht (make-hash-table :test #'equal)))
-    (dolist (form body)
-      (find-free-vars-expr form bound-names free-ht))
-    (let ((keys '())) (maphash (lambda (k v) (declare (ignore v)) (push k keys)) free-ht) keys)))
-
 (defvar *macro-expand-depth-limit* 50)
 
 ;; Stub for cross-compilation: always returns T (no stack limit during self-compile)
@@ -309,14 +302,20 @@
                                                  :key (lambda (b) (var-name (car b)))
                                                  :test #'string=))
                                        bnd)))
-                       ;; Push restore sentinel FIRST (LIFO: processed LAST, after body)
+                       ;; Push restore sentinels FIRST (LIFO: processed LAST, after body):
+                       ;; pop *macroexpand-scope* and restore *symbol-macros*.
+                       (push (cons *mscope-restore-sentinel* *macroexpand-scope*) worklist)
                        (push (cons :restore-symbol-macros *symbol-macros*) worklist)
+                       ;; Push a scope marker so cached macro expansions inside the body
+                       ;; are keyed per symbol-macrolet scope (mirrors compile-symbol-macrolet).
+                       ;; SM-BINDINGS is the same source cons compile pushes.
+                       (setf *macroexpand-scope* (cons sm-bindings *macroexpand-scope*))
                        ;; Extend *symbol-macros* immediately so macro expansions inside
                        ;; the body see the correct symbol-macro bindings
                        (setf *symbol-macros*
                              (append (mapcar (lambda (b) (cons (car b) (cadr b))) sm-bindings)
                                      *symbol-macros*))
-                       ;; Push body forms (LIFO: processed BEFORE restore sentinel)
+                       ;; Push body forms (LIFO: processed BEFORE restore sentinels)
                        (dolist (form sm-body)
                          (push (cons form (cons body-bnd mdepth)) worklist))))
                     ;; flet/labels: function definitions + body
@@ -443,223 +442,24 @@
 ;;; Mutated/captured variable analysis (for boxing)
 ;;; ============================================================
 
-(defun find-mutated-vars (body)
-  "Find variable names (strings) that are setq targets in body."
-  (let ((result (make-hash-table :test #'equal)))
-    (dolist (form body)
-      (find-mutated-vars-expr form result))
-    (let ((keys '())) (maphash (lambda (k v) (declare (ignore v)) (push k keys)) result) keys)))
-
-;;; find-mutated-vars-expr: iterative version using explicit worklist.
-;;; Each worklist entry is (expr . macro-depth) OR a restore sentinel
-;;; (:restore-symbol-macros . old-*symbol-macros*).
-(defun find-mutated-vars-expr (expr result-ht)
-  (let ((worklist (list (cons expr 0))))
-    (loop while worklist do
-      (let* ((item (pop worklist))
-             (e (car item))
-             (mdepth (cdr item)))
-        (cond
-          ;; Restore-scope sentinel: pop *macroexpand-scope* (unique private marker).
-          ((eq e *mscope-restore-sentinel*)
-           (setf *macroexpand-scope* mdepth))
-          ;; Restore-symbol-macros sentinel: mdepth slot holds old *symbol-macros*.
-          ;; Guard: real sentinels have mdepth = old-*symbol-macros* = nil or alist (not integer).
-          ;; Collisions have mdepth = integer (the actual macro depth from analyzed code).
-          ((and (eq e :restore-symbol-macros) (not (integerp mdepth)))
-           (setf *symbol-macros* mdepth))
-          ;; Restore-macro sentinel: mdepth slot holds (name . old-entry).
-          ;; Guard consp so that a bare :restore-macro keyword from analyzed source
-          ;; code (where mdepth is a number) does not trigger this branch.
-          ((and (eq e :restore-macro) (consp mdepth))
-           (let ((name (car mdepth))
-                 (old-entry (cdr mdepth)))
-             (if old-entry
-                 (setf (gethash name *macros*) old-entry)
-                 (remhash name *macros*))))
-          ;; Bare symbol that is a symbol-macro: expand and scan the expansion
-          ;; for mutations. A symbol-macro can hide a mutation (e.g. an
-          ;; octet-getter expanding to (prog1 (aref v i) (incf i))). Without
-          ;; this, a variable mutated only through a symbol-macro reference
-          ;; inside a closure isn't marked mutated, so it isn't boxed and the
-          ;; mutation is lost across closure calls (free-var analysis already
-          ;; expands symbol-macros — the two passes must agree).
-          ((and (symbolp e) e
-                (not (eq e :restore-symbol-macros)) (not (eq e :restore-macro))
-                (< mdepth *macro-expand-depth-limit*)
-                (assoc e *symbol-macros* :test #'eq))
-           (push (cons (cdr (assoc e *symbol-macros* :test #'eq)) (1+ mdepth)) worklist))
-          (t
-           (when (consp e)
-             (let ((head (car e)))
-               (cond
-                 ((and (symbolp head) (or (eq head 'setq) (eq head 'setf)
-                                           (eq head 'psetq) (eq head 'psetf)))
-                   (loop for (var val) on (cdr e) by #'cddr
-                         do (cond
-                              ((and var (symbolp var))
-                               (setf (gethash (var-name var) result-ht) t))
-                              ;; (setf (the type var) ...) — unwrap the type annotation
-                              ((and (consp var) (eq (car var) 'the) (symbolp (caddr var)))
-                               (setf (gethash (var-name (caddr var)) result-ht) t))
-                              ((consp var)
-                               ;; Complex place (e.g. (getf p key)): macro-expand the
-                               ;; setf form so the generated (setq p ...) is detected.
-                               ;; Without this, variables mutated via compound accessors
-                               ;; aren't recognized as mutated and skip boxing.
-                               (when (and (or (eq head 'setf) (eq head 'psetf))
-                                          (< mdepth *macro-expand-depth-limit*)
-                                          (%stack-space-available-p)
-                                          (find-macro-expander head))
-                                 (let* ((single-form `(,head ,var ,val))
-                                        (expander (find-macro-expander head))
-                                        (expanded (handler-case
-                                                      (cached-macroexpand single-form expander)
-                                                    (error () nil))))
-                                   (when expanded
-                                     (push (cons expanded (1+ mdepth)) worklist))))
-                               (push (cons var mdepth) worklist)))
-                            (when val (push (cons val mdepth) worklist))))
-                  ((and (symbolp head) (string= (symbol-name head) "MULTIPLE-VALUE-SETQ"))
-                   (let ((vars (cadr e)))
-                     (when (listp vars)
-                       (dolist (v vars)
-                         (when (symbolp v)
-                           (setf (gethash (var-name v) result-ht) t)))))
-                   (when (caddr e)
-                     (push (cons (caddr e) mdepth) worklist)))
-                  ((and (symbolp head) (member (symbol-name head) '("PUSH" "PUSHNEW") :test #'string=))
-                   (let ((place (caddr e)))
-                     (let ((sym (if (symbolp place) place
-                                    (and (consp place) (eq (car place) 'the) (caddr place)))))
-                       (when (and sym (symbolp sym) (not (eq sym t)))
-                         (setf (gethash (var-name sym) result-ht) t))))
-                   (do-list-safe (sub (cdr e))
-                     (push (cons sub mdepth) worklist)))
-                  ((and (symbolp head) (member (symbol-name head) '("POP" "INCF" "DECF") :test #'string=))
-                   (let ((place (cadr e)))
-                     (let ((sym (if (symbolp place) place
-                                    (and (consp place) (eq (car place) 'the) (caddr place)))))
-                       (when (and sym (symbolp sym) (not (eq sym t)))
-                         (setf (gethash (var-name sym) result-ht) t))))
-                   (do-list-safe (sub (cdr e))
-                     (push (cons sub mdepth) worklist)))
-                  ((and (symbolp head) (member (symbol-name head) '("ROTATEF" "SHIFTF") :test #'string=))
-                   (dolist (arg (cdr e))
-                     (when (and (symbolp arg) arg (not (eq arg t)))
-                       (setf (gethash (var-name arg) result-ht) t))
-                     (when (consp arg)
-                       (push (cons arg mdepth) worklist))))
-                  ((and (symbolp head) (eq head 'quote)) nil)
-                  ((and (symbolp head) (eq head 'defun))
-                   (dolist (form (cdddr e))
-                     (push (cons form mdepth) worklist)))
-                  ((and (symbolp head) (member head '(let let*)))
-                   (let ((bindings (cadr e))
-                         (lbody (cddr e))
-                         ;; let/let* bindings shadow same-named symbol-macros for the
-                         ;; body (CLHS 3.1.2.1.1). Without this, a symbol-macro whose
-                         ;; expansion rebinds its own name — e.g. SBCL's POLICY macro,
-                         ;; whose qualities expand to (LET ((X ...)) (IF (= X 1) .. X)) —
-                         ;; re-expands X inside its own expansion forever (exponential
-                         ;; in the depth limit; make-host-1 hung on knownfun.lisp).
-                         (shadowed nil))
-                     (when *symbol-macros*
-                       (do-list-safe (b bindings)
-                         (let ((name (if (consp b) (car b) b)))
-                           (when (and name (symbolp name)
-                                      (assoc name *symbol-macros* :test #'eq))
-                             (push name shadowed)))))
-                     ;; LIFO worklist: restore sentinel is processed LAST (after the
-                     ;; body), the narrow sentinel after the init forms but before the
-                     ;; body. Init forms are walked under the outer map, the body under
-                     ;; the narrowed map.
-                     (when shadowed
-                       (push (cons :restore-symbol-macros *symbol-macros*) worklist))
-                     (dolist (form lbody)
-                       (push (cons form mdepth) worklist))
-                     (when shadowed
-                       (push (cons :restore-symbol-macros
-                                   (remove-if (lambda (sm) (member (car sm) shadowed :test #'eq))
-                                              *symbol-macros*))
-                             worklist))
-                     (dolist (b bindings)
-                       (when (and (consp b) (cadr b))
-                         (push (cons (cadr b) mdepth) worklist)))))
-                  ((and (symbolp head) (eq head 'handler-case))
-                   (when (cadr e) (push (cons (cadr e) mdepth) worklist))
-                   (dolist (clause (cddr e))
-                     (dolist (form (cddr clause))
-                       (push (cons form mdepth) worklist))))
-                  ((and (symbolp head) (eq head 'handler-bind))
-                   (dolist (binding (cadr e))
-                     (when (cadr binding) (push (cons (cadr binding) mdepth) worklist)))
-                   (dolist (form (cddr e))
-                     (push (cons form mdepth) worklist)))
-                  ((and (symbolp head) (eq head 'restart-case))
-                   (when (cadr e) (push (cons (cadr e) mdepth) worklist))
-                   (dolist (clause (cddr e))
-                     (dolist (form (cddr clause))
-                       (push (cons form mdepth) worklist))))
-                  ;; macrolet: register local macros, push restore sentinels, push body
-                  ((and (symbolp head) (eq head 'macrolet))
-                   (let ((macro-defs (cadr e))
-                         (mlbody (cddr e)))
-                     ;; Push restore sentinels FIRST (LIFO: processed LAST, after body)
-                     (dolist (def macro-defs)
-                       (let* ((mname (car def))
-                              (old-entry (gethash mname *macros*)))
-                         (push (cons :restore-macro (cons mname old-entry)) worklist)))
-                     ;; Pop-scope sentinel + push scope marker: cache
-                     ;; macro expansions inside this shadowing scope separately so the
-                     ;; mutation walk agrees with code-gen and doesn't poison (form,nil).
-                     (push (cons *mscope-restore-sentinel* *macroexpand-scope*) worklist)
-                     (setf *macroexpand-scope* (cons macro-defs *macroexpand-scope*))
-                     ;; Register macros immediately
-                     (dolist (def macro-defs)
-                       (let* ((mname (car def))
-                              (mparams (cadr def))
-                              (mbody (cddr def)))
-                         (setf (gethash mname *macros*)
-                               (eval (%macrolet-expander-form mparams mbody)))))
-                     ;; Push body forms (LIFO: processed BEFORE restore sentinels)
-                     (dolist (form mlbody)
-                       (push (cons form mdepth) worklist))))
-                  ;; symbol-macrolet: extend *symbol-macros* during body walk
-                  ((and (symbolp head) (eq head 'symbol-macrolet))
-                   (let ((sm-bindings (cadr e))
-                         (sm-body (cddr e)))
-                     (push (cons :restore-symbol-macros *symbol-macros*) worklist)
-                     (setf *symbol-macros*
-                           (append (mapcar (lambda (b) (cons (car b) (cadr b))) sm-bindings)
-                                   *symbol-macros*))
-                     (dolist (form sm-body)
-                       (push (cons form mdepth) worklist))))
-                  (t
-                   (let ((expanded nil))
-                     (when (and (symbolp head) head
-                                (< mdepth *macro-expand-depth-limit*)
-                                (%stack-space-available-p)
-                                (find-macro-expander head))
-                       (let ((expander (find-macro-expander head)))
-                         (setf expanded (handler-case (cached-macroexpand e expander)
-                                          (error () nil)))))
-                     (if expanded
-                         (push (cons expanded (1+ mdepth)) worklist)
-                         (do-list-safe (sub e)
-                           (push (cons sub mdepth) worklist))))))))))))))
-
-(defun find-captured-vars (body var-names)
-  "Find variable names (strings) from var-names that are referenced inside lambda bodies."
-  (let ((result (make-hash-table :test #'equal)))
-    (dolist (form body)
-      (find-captured-vars-expr form var-names result nil))
-    (let ((keys '())) (maphash (lambda (k v) (declare (ignore v)) (push k keys)) result) keys)))
-
-
-;;; find-captured-vars-expr: iterative version using explicit worklist.
-;;; Each worklist entry is (expr inside-lambda . macro-depth).
-(defun find-captured-vars-expr (expr var-names result-ht inside-lambda)
+;;; find-mutated-and-captured-vars: single worklist walk that computes BOTH the
+;;; mutated-var set and the captured-var set in one pass over the expression
+;;; tree, avoiding two separate O(tree) walks per lambda/let.
+;;;
+;;; Merges find-mutated-vars-expr + find-captured-vars-expr. The two passes are
+;;; walk-compatible: identical mdepth-incrementing symbol-macro expansion,
+;;; identical macrolet/symbol-macrolet register-restore discipline, identical
+;;; let shadow-narrowing, and the same cached-macroexpand / *macroexpand-scope*
+;;; contract. Worklist entry shape is captured's `(expr inside-lambda . mdepth)`.
+;;;
+;;; MUTATED side records setq/setf/incf/... targets (independent of inside-lambda,
+;;; matching find-mutated-vars). CAPTURED side marks a var-names reference seen
+;;; while inside-lambda. Crucially, a mutation target symbol is BOTH recorded
+;;; (mutated) AND pushed onto the worklist (so it can be capture-marked) — the old
+;;; captured pass relied on its generic walk pushing the target; dropping that
+;;; push would lose the capture mark and silently skip boxing (the
+;;; mutation-loss class). Returns (values mutated-names captured-names).
+(defun find-mutated-and-captured-vars-expr (expr var-names mutated-ht captured-ht inside-lambda)
   (let ((worklist (list (cons expr (cons inside-lambda 0)))))
     (loop while worklist do
       (let* ((item (pop worklist))
@@ -667,41 +467,99 @@
              (in-lambda (cadr item))
              (mdepth (cddr item)))
         (cond
-          ;; Restore-scope sentinel: pop *macroexpand-scope* (unique private marker).
-          ;; The saved scope is in the in-lambda slot (cadr item).
           ((eq e *mscope-restore-sentinel*)
            (setf *macroexpand-scope* in-lambda))
-          ;; Restore-symbol-macros sentinel: in-lambda slot holds old *symbol-macros*.
-          ;; Guard: real sentinels have in-lambda = old-*symbol-macros* = list (not boolean t).
-          ;; Collisions have in-lambda = t (inside lambda) which must be excluded.
           ((and (eq e :restore-symbol-macros) (not (eq in-lambda t)))
            (setf *symbol-macros* in-lambda))
-          ;; Restore-macro sentinel: in-lambda slot holds (name . old-entry).
-          ;; Guard consp so that a bare :restore-macro keyword from analyzed source
-          ;; code does not trigger this branch.
           ((and (eq e :restore-macro) (consp in-lambda))
            (let ((name (car in-lambda))
                  (old-entry (cdr in-lambda)))
              (if old-entry
                  (setf (gethash name *macros*) old-entry)
                  (remhash name *macros*))))
-          ;; Bare symbol that is a symbol-macro: expand and scan the expansion,
-          ;; so a variable referenced only through a symbol-macro inside a lambda
-          ;; (e.g. an octet-getter expanding to (... i ...)) is still detected as
-          ;; captured. Must agree with find-free-vars-expr, which expands too;
-          ;; otherwise the var is seen as mutated-but-not-captured and isn't boxed.
+          ;; Bare symbol that is a symbol-macro: mark captured if applicable, and
+          ;; ALSO expand it so a mutation hidden in the expansion is still seen
+          ;; (fable pitfall #2 — do both actions, not either).
           ((and (symbolp e) e
                 (not (eq e :restore-symbol-macros)) (not (eq e :restore-macro))
                 (< mdepth *macro-expand-depth-limit*)
-                (not (member (var-name e) var-names :test #'string=))
                 (assoc e *symbol-macros* :test #'eq))
-           (push (cons (cdr (assoc e *symbol-macros* :test #'eq)) (cons in-lambda (1+ mdepth))) worklist))
+           ;; Capture side only expands when the symbol isn't a bound var-name.
+           ;; Mutation side always needs the expansion. So: if it IS a var-name,
+           ;; mark captured (when in-lambda) but still expand for the mutation walk;
+           ;; if it is NOT a var-name, just expand (matches both old passes).
+           (when (and in-lambda (member (var-name e) var-names :test #'string=))
+             (setf (gethash (var-name e) captured-ht) t))
+           (push (cons (cdr (assoc e *symbol-macros* :test #'eq))
+                       (cons in-lambda (1+ mdepth)))
+                 worklist))
           ((and (symbolp e) in-lambda)
            (when (member (var-name e) var-names :test #'string=)
-             (setf (gethash (var-name e) result-ht) t)))
+             (setf (gethash (var-name e) captured-ht) t)))
           ((consp e)
            (let ((head (car e)))
              (cond
+               ;; --- mutation-recording place forms (from find-mutated-vars-expr) ---
+               ;; Each records the target into mutated-ht AND pushes subforms/targets
+               ;; so the capture walk still sees them.
+               ((and (symbolp head) (or (eq head 'setq) (eq head 'setf)
+                                        (eq head 'psetq) (eq head 'psetf)))
+                (loop for (var val) on (cdr e) by #'cddr
+                      do (cond
+                           ((and var (symbolp var))
+                            (setf (gethash (var-name var) mutated-ht) t)
+                            ;; push the target symbol so capture side can mark it
+                            (push (cons var (cons in-lambda mdepth)) worklist))
+                           ((and (consp var) (eq (car var) 'the) (symbolp (caddr var)))
+                            (setf (gethash (var-name (caddr var)) mutated-ht) t)
+                            (push (cons var (cons in-lambda mdepth)) worklist))
+                           ((consp var)
+                            (when (and (or (eq head 'setf) (eq head 'psetf))
+                                       (< mdepth *macro-expand-depth-limit*)
+                                       (%stack-space-available-p)
+                                       (find-macro-expander head))
+                              (let* ((single-form `(,head ,var ,val))
+                                     (expander (find-macro-expander head))
+                                     (expanded (handler-case
+                                                   (cached-macroexpand single-form expander)
+                                                 (error () nil))))
+                                (when expanded
+                                  (push (cons expanded (cons in-lambda (1+ mdepth))) worklist))))
+                            (push (cons var (cons in-lambda mdepth)) worklist)))
+                         (when val (push (cons val (cons in-lambda mdepth)) worklist))))
+               ((and (symbolp head) (string= (symbol-name head) "MULTIPLE-VALUE-SETQ"))
+                (let ((vars (cadr e)))
+                  (when (listp vars)
+                    (dolist (v vars)
+                      (when (symbolp v)
+                        (setf (gethash (var-name v) mutated-ht) t)
+                        (push (cons v (cons in-lambda mdepth)) worklist)))))
+                (when (caddr e)
+                  (push (cons (caddr e) (cons in-lambda mdepth)) worklist)))
+               ((and (symbolp head) (member (symbol-name head) '("PUSH" "PUSHNEW") :test #'string=))
+                (let ((place (caddr e)))
+                  (let ((sym (if (symbolp place) place
+                                 (and (consp place) (eq (car place) 'the) (caddr place)))))
+                    (when (and sym (symbolp sym) (not (eq sym t)))
+                      (setf (gethash (var-name sym) mutated-ht) t))))
+                (do-list-safe (sub (cdr e))
+                  (push (cons sub (cons in-lambda mdepth)) worklist)))
+               ((and (symbolp head) (member (symbol-name head) '("POP" "INCF" "DECF") :test #'string=))
+                (let ((place (cadr e)))
+                  (let ((sym (if (symbolp place) place
+                                 (and (consp place) (eq (car place) 'the) (caddr place)))))
+                    (when (and sym (symbolp sym) (not (eq sym t)))
+                      (setf (gethash (var-name sym) mutated-ht) t))))
+                (do-list-safe (sub (cdr e))
+                  (push (cons sub (cons in-lambda mdepth)) worklist)))
+               ((and (symbolp head) (member (symbol-name head) '("ROTATEF" "SHIFTF") :test #'string=))
+                (dolist (arg (cdr e))
+                  (when (and (symbolp arg) arg (not (eq arg t)))
+                    (setf (gethash (var-name arg) mutated-ht) t)
+                    (push (cons arg (cons in-lambda mdepth)) worklist))
+                  (when (consp arg)
+                    (push (cons arg (cons in-lambda mdepth)) worklist))))
+               ;; --- structural forms (from find-captured-vars-expr) ---
                ((and (symbolp head) (eq head 'quote)) nil)
                ((and (symbolp head) (eq head 'defun))
                 (dolist (form (cdddr e))
@@ -712,9 +570,6 @@
                ((and (symbolp head) (member head '(let let*)))
                 (let ((bindings (cadr e))
                       (lbody (cddr e))
-                      ;; Same symbol-macro shadowing as in find-mutated-vars-expr:
-                      ;; without it, self-rebinding expansions (SBCL's POLICY macro)
-                      ;; re-expand forever. Sentinel payload goes in the in-lambda slot.
                       (shadowed nil))
                   (when *symbol-macros*
                     (do-list-safe (b bindings)
@@ -738,12 +593,6 @@
                       (push (cons (cadr b) (cons in-lambda mdepth)) worklist)))))
                ((and (symbolp head) (or (eq head 'flet) (eq head 'labels)))
                 (dolist (fdef (cadr e))
-                  ;; Scan the lambda-list too, not just the body: an &optional/&key
-                  ;; default init-form references outer lexical vars from inside the
-                  ;; local function. If a var is captured ONLY by such a default it
-                  ;; must still be boxed; otherwise the default snapshots its
-                  ;; creation-time value instead of reading the shared cell at call
-                  ;; time. (The LAMBDA branch already scans its lambda-list via (cdr e).)
                   (push (cons (cadr fdef) (cons t mdepth)) worklist)
                   (dolist (form (cddr fdef))
                     (push (cons form (cons t mdepth)) worklist)))
@@ -754,11 +603,11 @@
                   (push (cons (cadr e) (cons in-lambda mdepth)) worklist))
                 (dolist (clause (cddr e))
                   (dolist (form (cddr clause))
-                    (push (cons form (cons in-lambda mdepth)) worklist))))
+                    (push (cons form (cons t mdepth)) worklist))))
                ((and (symbolp head) (eq head 'handler-bind))
                 (dolist (binding (cadr e))
                   (when (cadr binding)
-                    (push (cons (cadr binding) (cons in-lambda mdepth)) worklist)))
+                    (push (cons (cadr binding) (cons t mdepth)) worklist)))
                 (dolist (form (cddr e))
                   (push (cons form (cons in-lambda mdepth)) worklist)))
                ((and (symbolp head) (eq head 'restart-case))
@@ -766,44 +615,31 @@
                   (push (cons (cadr e) (cons in-lambda mdepth)) worklist))
                 (dolist (clause (cddr e))
                   (dolist (form (cddr clause))
-                    (push (cons form (cons in-lambda mdepth)) worklist))))
-               ;; macrolet: register local macros, push restore sentinels, push body
-               ;; Sentinel reuses in-lambda slot for (name . old-entry)
+                    (push (cons form (cons t mdepth)) worklist))))
                ((and (symbolp head) (eq head 'macrolet))
                 (let ((macro-defs (cadr e))
                       (mlbody (cddr e)))
-                  ;; Push restore sentinels FIRST (LIFO: processed LAST, after body)
                   (dolist (def macro-defs)
                     (let* ((mname (car def))
                            (old-entry (gethash mname *macros*)))
                       (push (cons :restore-macro (cons (cons mname old-entry) mdepth)) worklist)))
-                  ;; Pop-scope sentinel (saved scope in the in-lambda slot) + push scope
-                  ;; marker: keep this walk's cache scope in sync with
-                  ;; code-gen so it doesn't poison the (form,nil) entry.
                   (push (cons *mscope-restore-sentinel* (cons *macroexpand-scope* mdepth)) worklist)
                   (setf *macroexpand-scope* (cons macro-defs *macroexpand-scope*))
-                  ;; Register macros immediately
                   (dolist (def macro-defs)
                     (let* ((mname (car def))
                            (mparams (cadr def))
                            (mbody (cddr def)))
                       (setf (gethash mname *macros*)
                             (eval (%macrolet-expander-form mparams mbody)))))
-                  ;; Push body forms (LIFO: processed BEFORE restore sentinels)
                   (dolist (form mlbody)
                     (push (cons form (cons in-lambda mdepth)) worklist))))
-               ;; symbol-macrolet: extend *symbol-macros* during body walk
-               ;; Sentinel reuses in-lambda slot for old-*symbol-macros*
                ((and (symbolp head) (eq head 'symbol-macrolet))
                 (let ((sm-bindings (cadr e))
                       (sm-body (cddr e)))
-                  ;; Push restore sentinel FIRST (in-lambda slot holds old value)
                   (push (cons :restore-symbol-macros (cons *symbol-macros* mdepth)) worklist)
-                  ;; Extend *symbol-macros* immediately
                   (setf *symbol-macros*
                         (append (mapcar (lambda (b) (cons (car b) (cadr b))) sm-bindings)
                                 *symbol-macros*))
-                  ;; Push body forms
                   (dolist (form sm-body)
                     (push (cons form (cons in-lambda mdepth)) worklist))))
                (t
@@ -819,6 +655,19 @@
                       (push (cons expanded (cons in-lambda (1+ mdepth))) worklist)
                       (do-list-safe (sub e)
                         (push (cons sub (cons in-lambda mdepth)) worklist)))))))))))))
+
+(defun find-mutated-and-captured-vars (body var-names)
+  "One walk computing both sets. Returns (values mutated-names captured-names),
+   each a list of variable-name strings. Replaces adjacent find-mutated-vars +
+   find-captured-vars calls on the same BODY (issue #395)."
+  (let ((mutated-ht (make-hash-table :test #'equal))
+        (captured-ht (make-hash-table :test #'equal)))
+    (dolist (form body)
+      (find-mutated-and-captured-vars-expr form var-names mutated-ht captured-ht nil))
+    (let ((mut '()) (cap '()))
+      (maphash (lambda (k v) (declare (ignore v)) (push k mut)) mutated-ht)
+      (maphash (lambda (k v) (declare (ignore v)) (push k cap)) captured-ht)
+      (values mut cap))))
 
 ;;; ============================================================
 ;;; SIL local-reference enumeration (single source of truth)
@@ -903,7 +752,7 @@
         (when decl (setf (gethash (car decl) local-type) (cdr decl))))
       ;; Count writes and reads via the central enumerator so locals embedded in
       ;; nested operands (e.g. :dotnet-call-direct-locals) raise the read count and
-      ;; correctly disqualify a key from single-ref removal (issue).
+      ;; correctly disqualify a key from single-ref removal.
       (dolist (k (instr-local-writes instr)) (incf (gethash k stloc-count 0)))
       (dolist (k (instr-local-reads instr))  (incf (gethash k ldloc-count 0))))
     ;; Eligible keys: single stloc, single ldloc, LispObject type
@@ -966,6 +815,13 @@
                                           ; pop the raw long instead. (Int64-slot
                                           ; setq in statement position; composes
                                           ; with P2 to a bare native store.)
+     P6  (:newobj \"DoubleFloat\") (:pop) ->  (:pop)    ; float sibling of P5: the
+     P6  (:newobj \"SingleFloat\") (:pop) ->  (:pop)    ; DoubleFloat/SingleFloat
+                                          ; ctor is pure (value + alloc counter),
+                                          ; so boxing a discarded native float
+                                          ; store result is dead — pop the raw r8
+                                          ; instead. (Float-array setf in
+                                          ; statement position; #448 phase 2.)
    (P3+P4 compose across the fixpoint to delete the dead nil/unwrap/pop preamble
     that codegen emits at the top of every TCO loop body.)
 
@@ -1016,6 +872,27 @@
                     (consp i2) (eq (car i2) :pop))
                (setf changed t)
                (push i2 out)
+               (setf cur (cddr cur)))
+              ;; P6: box a native float only to discard it. The DoubleFloat /
+              ;; SingleFloat ctor is pure (stores value, bumps the alloc counter),
+              ;; so drop the newobj and pop the raw r8/r4 operand instead.
+              ((and (consp i1) (eq (car i1) :newobj)
+                    (member (cadr i1) '("DoubleFloat" "SingleFloat") :test #'equal)
+                    (consp i2) (eq (car i2) :pop))
+               (setf changed t)
+               (push i2 out)
+               (setf cur (cddr cur)))
+              ;; P7: UnwrapMv of a freshly-boxed float is identity — a DoubleFloat
+              ;; / SingleFloat is never an MvReturn. Codegen wraps a setf result
+              ;; in UnwrapMv (twice, in a statement-position dotimes body); drop it
+              ;; so the newobj becomes adjacent to the pop and P6 can then delete
+              ;; the whole dead box. (Fixnum.Make's surviving box is invisible in
+              ;; alloc profiles thanks to the small-int cache; a float box is not.)
+              ((and (consp i1) (eq (car i1) :newobj)
+                    (member (cadr i1) '("DoubleFloat" "SingleFloat") :test #'equal)
+                    (consp i2) (eq (car i2) :call) (equal (cadr i2) "Runtime.UnwrapMv"))
+               (setf changed t)
+               (push i1 out)
                (setf cur (cddr cur)))
               (t
                (push i1 out)
@@ -1068,7 +945,7 @@
     ;; instr-local-refs returns every local a key reads/writes — including those
     ;; embedded in nested operand lists (:dotnet-call-direct-locals) — so their
     ;; live ranges extend to the using op and the slot-share scan won't merge
-    ;; another local over a still-live nested reference (issue).
+    ;; another local over a still-live nested reference.
     (dolist (instr instrs)
       (let ((decl (instr-declared-local instr)))
         (when decl (setf (gethash (car decl) local-type) (cdr decl))))

@@ -3,6 +3,89 @@
 User-facing release notes for dotcl. Each section corresponds to a tagged
 release on the public mirror (dotcl/dotcl).
 
+## v0.1.17 -- 2026-07-10
+
+A performance, interop, and concurrency release, with the usual long tail of
+conformance fixes surfaced by getting real libraries (an APL interpreter,
+cl-ppcre, serapeum, lparallel) to run on dotcl.
+
+### Performance
+
+- Function-call overhead is cut sharply. Named functions and common-arity
+  built-ins now dispatch through per-arity direct delegates instead of packing
+  and unpacking an argument array on every call -- the dominant cost in the
+  previous call convention.
+- Numeric float work stays unboxed. Type inference keeps `(array single-float)`
+  / `(array double-float)` in raw `float[]` / `double[]` storage and float
+  locals in unboxed slots, so tight numeric kernels no longer box each element or
+  each assignment.
+
+### .NET interop
+
+- `dotnet:resolve-type` now finds `PackageReference` types on its own. On a miss
+  it loads the managed assemblies sitting in the application base directory and
+  retries -- lazily, memoized, and auto-invalidated when a new assembly loads.
+  Deployed apps no longer need a manual `load-assembly` or a `typeof(...)`
+  force-load to make a referenced type resolvable.
+- New `dotnet:class-for-type` returns the CLOS class dotcl uses for a .NET type
+  (given a `System.Type` or a type-name string, registering it lazily on first
+  call), so you can specialize a method on a .NET type -- including a closed
+  generic -- without hand-spelling its long, assembly-qualified class symbol.
+- Closed generic types now get distinct, readable class names -- `List<Int32>`,
+  `Dictionary<String,Int32>` -- instead of every instantiation colliding on the
+  bare ``List`1``, where the friendly name went to whichever instantiation
+  happened to be reflected over first. Dispatching on a specific instantiation is now
+  predictable, and a one-time warning is emitted if two types still collide on a
+  name.
+- `defmethod` accepts a class object as a specializer via read-time `#.`, the
+  way SBCL and CCL do; libraries such as serapeum rely on it.
+
+### Concurrency
+
+- Opt-in parallel `eval` (`dotcl:set-parallel-eval`), with the internal macro
+  table made thread-safe.
+- Generic atomic compare-and-swap / increment / decrement over any Common Lisp
+  place, plus an `atomic-long` primitive built on `Interlocked`.
+- Worker threads now establish a top-level `abort` restart, so an error raised
+  in a spawned thread is recoverable rather than fatal to the process (lparallel
+  and friends depend on this).
+
+### New tooling
+
+- `decompiler` contrib -- decompile a loaded .NET assembly back to C#.
+- `clrmd` contrib -- walk a running process's heap and enumerate live instances.
+- The live-method-advice contrib is renamed from `harmony` to `advice`, to avoid
+  clashing with the unrelated Quicklisp `harmony` (a sound system). The API is
+  unchanged apart from the package name: `advice:watch` / `advice:patch` /
+  `advice:trace`, loaded with `(require "advice")`.
+
+### Reader, compiler, and conformance
+
+- Backquote expands `unquote` / `unquote-splicing` inside `#(...)` vector
+  literals.
+- `rationalize` returns the simplest fraction in the rounding interval;
+  `integer-decode-float` decodes single-floats at their true 24-bit precision.
+- A long tail of compiler corrections surfaced by that library work:
+  `make-instance` initarg values containing a `tagbody` (`loop` / `dolist`), a
+  `macrolet`-expanded `return-from` resolving a `defun`'s implicit block,
+  `symbol-macrolet` scope shared across both `if` arms, a `handler-case` clause
+  variable shadowing an enclosing boxed variable, `setf` of `car` / `cdr`
+  evaluating the place after the value, and `#'(setf name)` resolving a local
+  `flet` / `labels` `(setf name)`.
+- An oversized single form that exceeds the CIL per-method limit now raises a
+  clear, catchable error instead of crashing, and a non-top-level `defun`
+  registers at run time.
+
+### Distribution
+
+- Per-RID Ready-to-Run tool packages (`dotcl.<rid>`) are packed again in CI, and
+  an R2R cold-start regression was fixed.
+
+### Thanks
+
+- Douglas P. Fields, Jr. for the detailed write-up of generic-type dispatch on
+  .NET, which drove much of this cycle's interop work.
+
 ## v0.1.16 -- 2026-07-03
 
 This cycle adds two pieces of interop tooling -- one-line NuGet resolution and

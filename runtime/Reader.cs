@@ -703,8 +703,31 @@ public class Reader
     /// Expand a backquoted form into LIST/CONS/APPEND/QUOTE combinations.
     /// Called at read time so the result contains no QUASIQUOTE/UNQUOTE symbols.
     /// </summary>
+    // A `#(...) vector template: rank-1, general (element type T) vector. Its
+    // elements may contain ,/,@ and must be processed (CLHS 2.4.6); bit/char/
+    // numeric-specialized vectors cannot hold unquote forms and stay literal.
+    private static bool IsBackquoteVector(LispObject form) =>
+        form is LispVector v && v.ElementTypeName == "T" && v.Dimensions.Length == 1;
+
     private LispObject ExpandBackquote(LispObject form)
     {
+        // `#(v1 v2 ...) ≡ (apply #'vector `(v1 v2 ...)) — CLHS 2.4.6. Read as a
+        // LispVector, so build the element list, expand it as a backquoted list,
+        // then apply VECTOR to the result (freshly constructing the vector).
+        if (IsBackquoteVector(form))
+        {
+            var vec = (LispVector)form;
+            LispObject listTemplate = Nil.Instance;
+            for (int i = vec.Length - 1; i >= 0; i--)
+                listTemplate = new Cons(vec.ElementAt(i), listTemplate);
+            var listExpansion = listTemplate is Cons lc
+                ? ExpandBackquoteList(lc)
+                : (LispObject)Nil.Instance;  // `#() → (apply #'vector nil)
+            return MakeList(Startup.Sym("APPLY"),
+                            MakeList(Startup.Sym("FUNCTION"), Startup.Sym("VECTOR")),
+                            listExpansion);
+        }
+
         // Atom → (QUOTE atom)
         if (form is not Cons cons)
             return MakeList(Startup.QUOTE, form);
@@ -763,6 +786,13 @@ public class Reader
                 // Dot-position unquote: `(a . ,b) — but this shouldn't happen
                 // since ReadComma wraps in (UNQUOTE x)
                 segments.Add(MakeList(Startup.Sym("LIST"), element));
+            }
+            else if (IsBackquoteVector(element))
+            {
+                // A nested `#(...) element — expand it recursively (CLHS 2.4.6),
+                // e.g. `#(1 #(2 ,x) 3). Without this it fell to the atom branch and
+                // was quoted, leaving inner unquotes unprocessed.
+                segments.Add(MakeList(Startup.Sym("LIST"), ExpandBackquote(element)));
             }
             else
             {

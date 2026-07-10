@@ -663,14 +663,20 @@
                                `(let ((,tmp ,value)) ,tmp)))
                          `(setq ,place ,value))))
                   ((and (consp place) (eq (car place) 'car))
-                   (let ((tmp (gensym "V")))
-                     `(let ((,tmp ,value))
-                        (rplaca ,(cadr place) ,tmp)
+                   ;; CLHS 5.1.1.1: the place subform is evaluated (into a temp)
+                   ;; BEFORE the value form. Binding value first and re-evaluating
+                   ;; the subform in rplaca reversed that — (setf (car x) (setf x ..))
+                   ;; then stored into the NEW x, self-referencing.
+                   (let ((obj (gensym "OBJ")) (tmp (gensym "V")))
+                     `(let* ((,obj ,(cadr place))
+                             (,tmp ,value))
+                        (rplaca ,obj ,tmp)
                         ,tmp)))
                   ((and (consp place) (eq (car place) 'cdr))
-                   (let ((tmp (gensym "V")))
-                     `(let ((,tmp ,value))
-                        (rplacd ,(cadr place) ,tmp)
+                   (let ((obj (gensym "OBJ")) (tmp (gensym "V")))
+                     `(let* ((,obj ,(cadr place))
+                             (,tmp ,value))
+                        (rplacd ,obj ,tmp)
                         ,tmp)))
                   ((and (consp place) (eq (car place) 'nth))
                    (let ((n-var (gensym "N"))
@@ -694,14 +700,17 @@
                         (let ((,val-var ,value))
                           (puthash ,key-var ,table-var ,val-var)))))
                   ((and (consp place) (eq (car place) 'cadr))
-                   (let ((tmp (gensym "V")))
-                     `(let ((,tmp ,value))
-                        (rplaca (cdr ,(cadr place)) ,tmp)
+                   ;; Subform-before-value (see car/cdr above).
+                   (let ((obj (gensym "OBJ")) (tmp (gensym "V")))
+                     `(let* ((,obj ,(cadr place))
+                             (,tmp ,value))
+                        (rplaca (cdr ,obj) ,tmp)
                         ,tmp)))
                   ((and (consp place) (eq (car place) 'cdar))
-                   (let ((tmp (gensym "V")))
-                     `(let ((,tmp ,value))
-                        (rplacd (car ,(cadr place)) ,tmp)
+                   (let ((obj (gensym "OBJ")) (tmp (gensym "V")))
+                     `(let* ((,obj ,(cadr place))
+                             (,tmp ,value))
+                        (rplacd (car ,obj) ,tmp)
                         ,tmp)))
                   ;; (setf (the type place) val) -> (setf place val)
                   ((and (consp place) (eq (car place) 'the))
@@ -3284,9 +3293,18 @@
                                 (spec (cadr sp)))
                             (push param-name plain-params)
                             ;; Handle EQL specializers: (param (eql value))
-                            (if (and (consp spec) (eq (car spec) 'eql))
-                                (push `(list 'eql ,(cadr spec)) specializers)
-                                (push `(find-class ',spec) specializers)))
+                            (cond
+                              ((and (consp spec) (eq (car spec) 'eql))
+                               (push `(list 'eql ,(cadr spec)) specializers))
+                              ;; A specializer may be a class object, not just a
+                              ;; class-name symbol — e.g. (param #.(find-class 'foo)).
+                              ;; Use it directly; passing a class object to find-class
+                              ;; would fail. SBCL/CCL accept this and real libraries
+                              ;; (serapeum) rely on it.
+                              ((typep spec 'class)
+                               (push spec specializers))
+                              (t
+                               (push `(find-class ',spec) specializers))))
                           (progn
                             (push sp plain-params)
                             (push '(find-class 't) specializers)))

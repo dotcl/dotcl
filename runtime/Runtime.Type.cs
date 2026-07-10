@@ -347,12 +347,16 @@ public static partial class Runtime
                             }
                             else // SIGNED-BYTE
                             {
-                                if (bits < 63)
+                                // A dotcl Fixnum is a full 64-bit signed long (most-positive-fixnum
+                                // = 2^63-1). (signed-byte n) admits [-2^(n-1), 2^(n-1)-1]. For n < 64
+                                // that range is narrower than the long range, so large fixnums can
+                                // overflow it — e.g. 2^63-1 does NOT fit in (signed-byte 63).
+                                if (bits < 64)
                                 {
                                     long min = -(1L << (bits - 1)), max = (1L << (bits - 1)) - 1;
                                     if (objF.Value < min || objF.Value > max) return Nil.Instance;
                                 }
-                                // bits >= 63: all fixnums fit in signed-byte 63+
+                                // bits >= 64: (signed-byte 64) range == long range, all fixnums fit
                             }
                         }
                         else if (obj is Bignum objB)

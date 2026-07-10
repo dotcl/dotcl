@@ -25,6 +25,21 @@ public partial class CilAssembler
 
     // --- Emit-side assembly ---
 
+    // A DynamicMethod that emits too much IL (empirically a few MB) throws
+    // InvalidProgramException at JIT time (first invocation) with no hint of the
+    // cause. When that happens for a method whose IL is large, re-raise a clear,
+    // actionable "form too large" error instead of the opaque one. A SMALL method
+    // that InvalidPrograms is a genuine codegen bug, not a size limit, so it is
+    // re-thrown unchanged.
+    private const int LargeMethodIl = 500_000;
+
+    private static LispErrorException TooLargeError(int size) =>
+        new LispErrorException(new LispProgramError(
+            $"form too large to compile: it emits {size} bytes of CIL for a single method, " +
+            "exceeding the CLR's per-method size limit. Split it into smaller pieces — e.g. " +
+            "compile/eval statements individually or in chunks, or move sub-parts into their " +
+            "own functions."));
+
     private static LispObject AssembleAndRunSingle(LispObject instrList)
     {
         EnsureEmitAllowed("eval/compile of a compound form");
@@ -44,7 +59,26 @@ public partial class CilAssembler
         // (the majority) leave no map entry at all.
         if (holder.Count > 0) RegisterUnit(unitId, holder);
         var fn = (Func<LispObject>)dm.CreateDelegate(typeof(Func<LispObject>));
-        var result = fn();
+        // Runtime.Eval serializes COMPILATION on _evalLock (the compiler/assembler
+        // are not thread-safe), but the compiled form is now built — running it must
+        // NOT hold the lock: the form may block waiting on other threads (e.g. an
+        // lparallel `each` over APL execute `⍎`) that themselves need the lock to
+        // compile, which deadlocks. Release the lock across the run and re-acquire
+        // after, keeping the outer `lock` balanced. (Nested evals each release
+        // at their own AssembleAndRunSingle, so the count is 1 here.)
+        bool releasedEvalLock = Runtime.SerializeEval
+                                && System.Threading.Monitor.IsEntered(Runtime._evalLock);
+        if (releasedEvalLock) System.Threading.Monitor.Exit(Runtime._evalLock);
+        LispObject result;
+        try
+        {
+            try { result = fn(); }
+            catch (InvalidProgramException) when (asm._il.ILOffset > LargeMethodIl)
+            {
+                throw TooLargeError(asm._il.ILOffset);
+            }
+        }
+        finally { if (releasedEvalLock) System.Threading.Monitor.Enter(Runtime._evalLock); }
         // Keep the holder alive across the unit's one-shot run so any closures it
         // builds can resolve their body DMs; afterward only LispFunction.RetainUnit
         // keeps it alive (transient units become collectible here).
@@ -122,6 +156,35 @@ public partial class CilAssembler
         return new LispFunction(closureDel, env, null, arity) { RetainUnit = holder };
     }
 
+    // Direct-params variant of MakeClosure: the body DM was emitted with
+    // signature (object[] env, LispObject a0..aN-1), so bind the matching
+    // per-arity delegate and build the LispFunction via MakeDirectClosure
+    // (which installs _funcN for the direct path plus an args-array wrapper
+    // that runs the same Runtime.CheckArityExact the args-array body used to).
+    public static LispObject MakeClosureDirect(object[] env, int unitId, int dmIndex, int arity, string fnName)
+    {
+        var holder = TryGetUnitHolder(unitId)
+            ?? throw new LispErrorException(new LispProgramError(
+                "internal: closure compilation unit was collected while still callable"));
+        var dm = (DynamicMethod)holder[dmIndex];
+        Type delType = arity switch
+        {
+            0 => typeof(Func<object[], LispObject>),
+            1 => typeof(Func<object[], LispObject, LispObject>),
+            2 => typeof(Func<object[], LispObject, LispObject, LispObject>),
+            3 => typeof(Func<object[], LispObject, LispObject, LispObject, LispObject>),
+            4 => typeof(Func<object[], LispObject, LispObject, LispObject, LispObject, LispObject>),
+            5 => typeof(Func<object[], LispObject, LispObject, LispObject, LispObject, LispObject, LispObject>),
+            6 => typeof(Func<object[], LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject>),
+            _ => throw new LispErrorException(new LispProgramError(
+                $"internal: MakeClosureDirect unsupported arity {arity}"))
+        };
+        var fn = LispFunction.MakeDirectClosure(dm.CreateDelegate(delType), env, fnName);
+        // Pin the unit — same lifetime contract as MakeClosure.
+        fn.RetainUnit = holder;
+        return fn;
+    }
+
     // Emit IL that loads a unit-scoped constant and casts it to LispObject —
     // the collectible counterpart of (ldc.i4 idx; call GetConstant). Used for
     // MAKE-FUNCTION lambda objects so a transient compile's lambda is reclaimed
@@ -144,6 +207,44 @@ public partial class CilAssembler
         if (holder != null && holder.Count > beforeCount)
             fn.RetainUnit = holder;
         EmitLoadUnitConstant(AddUnitConstant(fn));
+    }
+
+    // Register the run-once function re-registration constant (defun / (setf NAME) /
+    // function definitions emit IL that re-registers fn after fmakunbound at runtime)
+    // in the collectible per-unit store when a unit is active, so redefining or
+    // fmakunbound-ing the name lets the old LispFunction — and the DynamicMethod JIT
+    // code behind it — collect instead of being pinned in the global _constants pool
+    // forever (the Coalton GB-working-set leak; the closure-DM fix moved only inner
+    // lambdas, leaving top-level definition constants here). Falls back to the global
+    // pool if no unit is active. If fn's body built closures into this unit, pin the
+    // holder onto fn (mirrors AddConstant) so they stay resolvable while fn is
+    // callable.
+    private (bool unit, int idx) AddReRegisterConstant(LispFunction fn)
+    {
+        if (_currentUnitDms is { } holder)
+        {
+            if (fn.RetainUnit == null && holder.Count > 0) fn.RetainUnit = holder;
+            return (true, AddUnitConstant(fn));
+        }
+        return (false, AddConstant(fn));
+    }
+
+    // Emit IL that loads the constant produced by AddReRegisterConstant and casts it
+    // to LispFunction, leaving it on the stack.
+    private void EmitLoadReRegisterConstant((bool unit, int idx) c)
+    {
+        if (c.unit)
+        {
+            _il.Emit(OpCodes.Ldc_I4, _currentUnitId);
+            _il.Emit(OpCodes.Ldc_I4, c.idx);
+            _il.Emit(OpCodes.Call, _getUnitConstant);
+        }
+        else
+        {
+            _il.Emit(OpCodes.Ldc_I4, c.idx);
+            _il.Emit(OpCodes.Call, _getConstant);
+        }
+        _il.Emit(OpCodes.Castclass, typeof(LispFunction));
     }
 
     // --- Assembly ---
@@ -388,6 +489,9 @@ public partial class CilAssembler
             case "CONV-R4":
                 _il.Emit(OpCodes.Conv_R4);
                 break;
+            case "CONV-R8":
+                _il.Emit(OpCodes.Conv_R8);
+                break;
             case "BEGIN-EXCEPTION-BLOCK":
                 _il.BeginExceptionBlock();
                 break;
@@ -447,10 +551,19 @@ public partial class CilAssembler
                 EmitLoadEnv(GetInt(Cadr(c)));
                 break;
             case "LOAD-ARG":
-                // Load args[i]: args is arg 1 (LispObject[]) for closures
-                _il.Emit(OpCodes.Ldarg_1);
-                _il.Emit(OpCodes.Ldc_I4, GetInt(Cadr(c)));
-                _il.Emit(OpCodes.Ldelem_Ref);
+                if (_directParams)
+                {
+                    // Direct-params closure body: param i is a real CLR arg at
+                    // slot i+1 (slot 0 is the object[] env).
+                    EmitLdarg(GetInt(Cadr(c)) + 1);
+                }
+                else
+                {
+                    // Load args[i]: args is arg 1 (LispObject[]) for closures
+                    _il.Emit(OpCodes.Ldarg_1);
+                    _il.Emit(OpCodes.Ldc_I4, GetInt(Cadr(c)));
+                    _il.Emit(OpCodes.Ldelem_Ref);
+                }
                 break;
 
             // Composite instructions
@@ -606,7 +719,7 @@ public partial class CilAssembler
         // fmakunbound precedes defun in the same progn — the assembly-time
         // registration above gets undone by fmakunbound at runtime, so we must
         // re-register after fmakunbound has executed.
-        int fnIdx = AddConstant(fn);
+        var fnc = AddReRegisterConstant(fn);
         if (pkgSym != null)
         {
             // Symbol-based runtime re-registration (package-aware).
@@ -615,9 +728,7 @@ public partial class CilAssembler
             _il.Emit(OpCodes.Ldstr, pkgSym.HomePackage?.Name ?? defPkg ?? "");
             _il.Emit(OpCodes.Call, _methodCache["Startup.SymInPkg"]);
             _il.Emit(OpCodes.Castclass, typeof(Symbol));
-            _il.Emit(OpCodes.Ldc_I4, fnIdx);
-            _il.Emit(OpCodes.Call, _getConstant);
-            _il.Emit(OpCodes.Castclass, typeof(LispFunction));
+            EmitLoadReRegisterConstant(fnc);
             _il.Emit(OpCodes.Call, _registerFunctionOnSymbol);
         }
         if (setfTargetSym != null)
@@ -627,20 +738,22 @@ public partial class CilAssembler
             _il.Emit(OpCodes.Ldstr, setfTargetSym.HomePackage?.Name ?? defPkg ?? "");
             _il.Emit(OpCodes.Call, _methodCache["Startup.SymInPkg"]);
             _il.Emit(OpCodes.Castclass, typeof(Symbol));
-            _il.Emit(OpCodes.Ldc_I4, fnIdx);
-            _il.Emit(OpCodes.Call, _getConstant);
-            _il.Emit(OpCodes.Castclass, typeof(LispFunction));
+            EmitLoadReRegisterConstant(fnc);
             _il.Emit(OpCodes.Call, _registerSetfFunctionOnSymbol);
         }
     }
 
     private void HandleMakeFunction(Cons instr)
     {
-        // (:make-function :param-count N :body (...) [:name "NAME"])
+        // (:make-function :param-count N :body (...) [:name "NAME"] [:ll-shape "o2k1r"])
+        // :ll-shape is a diagnostic lambda-list shape tag from the compiler,
+        // embedded in the DynamicMethod name ("lambda_o2k1r") so InvokeSlow
+        // statistics (AnonOriginTag) can break "<anon:lambda>" down by shape.
         var plist = instr.Cdr;
         int paramCount = 0;
         LispObject? bodyInstrs = null;
         string? fnName = null;
+        string llShape = "";
 
         while (plist is Cons pc)
         {
@@ -651,6 +764,7 @@ public partial class CilAssembler
                 case "PARAM-COUNT": paramCount = GetInt(val); break;
                 case "BODY": bodyInstrs = val; break;
                 case "NAME": fnName = val is LispString s ? s.Value : null; break;
+                case "LL-SHAPE": llShape = val is LispString ls ? ls.Value : ""; break;
             }
             plist = Cddr(pc);
         }
@@ -686,7 +800,8 @@ public partial class CilAssembler
         }
         else
         {
-            var dm = new DynamicMethod("lambda", typeof(LispObject),
+            var dm = new DynamicMethod(llShape.Length > 0 ? "lambda_" + llShape : "lambda",
+                typeof(LispObject),
                 new[] { typeof(LispObject[]) }, typeof(CilAssembler).Module, true);
             var innerAsm = new CilAssembler();
             innerAsm._il = dm.GetILGenerator();
@@ -1141,16 +1256,14 @@ public partial class CilAssembler
         }
 
         // Emit runtime re-registration
-        int fnIdx = AddConstant(fn);
+        var fnc = AddReRegisterConstant(fn);
         if (pkgSym != null)
         {
             _il.Emit(OpCodes.Ldstr, pkgSym.Name);
             _il.Emit(OpCodes.Ldstr, pkgSym.HomePackage?.Name ?? defPkg ?? "");
             _il.Emit(OpCodes.Call, _methodCache["Startup.SymInPkg"]);
             _il.Emit(OpCodes.Castclass, typeof(Symbol));
-            _il.Emit(OpCodes.Ldc_I4, fnIdx);
-            _il.Emit(OpCodes.Call, _getConstant);
-            _il.Emit(OpCodes.Castclass, typeof(LispFunction));
+            EmitLoadReRegisterConstant(fnc);
             _il.Emit(OpCodes.Call, _registerFunctionOnSymbol);
         }
         if (setfTargetSym != null)
@@ -1159,9 +1272,7 @@ public partial class CilAssembler
             _il.Emit(OpCodes.Ldstr, setfTargetSym.HomePackage?.Name ?? defPkg ?? "");
             _il.Emit(OpCodes.Call, _methodCache["Startup.SymInPkg"]);
             _il.Emit(OpCodes.Castclass, typeof(Symbol));
-            _il.Emit(OpCodes.Ldc_I4, fnIdx);
-            _il.Emit(OpCodes.Call, _getConstant);
-            _il.Emit(OpCodes.Castclass, typeof(LispFunction));
+            EmitLoadReRegisterConstant(fnc);
             _il.Emit(OpCodes.Call, _registerSetfFunctionOnSymbol);
         }
     }
@@ -1417,16 +1528,14 @@ public partial class CilAssembler
             catch { }
         }
 
-        int fnIdx = AddConstant(fn);
+        var fnc = AddReRegisterConstant(fn);
         if (pkgSym != null)
         {
             _il.Emit(OpCodes.Ldstr, pkgSym.Name);
             _il.Emit(OpCodes.Ldstr, pkgSym.HomePackage?.Name ?? defPkg ?? "");
             _il.Emit(OpCodes.Call, _methodCache["Startup.SymInPkg"]);
             _il.Emit(OpCodes.Castclass, typeof(Symbol));
-            _il.Emit(OpCodes.Ldc_I4, fnIdx);
-            _il.Emit(OpCodes.Call, _getConstant);
-            _il.Emit(OpCodes.Castclass, typeof(LispFunction));
+            EmitLoadReRegisterConstant(fnc);
             _il.Emit(OpCodes.Call, _registerFunctionOnSymbol);
         }
         if (setfTargetSym != null)
@@ -1435,9 +1544,7 @@ public partial class CilAssembler
             _il.Emit(OpCodes.Ldstr, setfTargetSym.HomePackage?.Name ?? defPkg ?? "");
             _il.Emit(OpCodes.Call, _methodCache["Startup.SymInPkg"]);
             _il.Emit(OpCodes.Castclass, typeof(Symbol));
-            _il.Emit(OpCodes.Ldc_I4, fnIdx);
-            _il.Emit(OpCodes.Call, _getConstant);
-            _il.Emit(OpCodes.Castclass, typeof(LispFunction));
+            EmitLoadReRegisterConstant(fnc);
             _il.Emit(OpCodes.Call, _registerSetfFunctionOnSymbol);
         }
     }
@@ -1445,12 +1552,18 @@ public partial class CilAssembler
     private void HandleMakeClosure(Cons instr)
     {
         // Stack already has: object[] env (built by preceding instructions)
-        // (:make-closure :param-count N :env-size M :env-map (...) :body (...))
+        // (:make-closure :param-count N :env-size M :env-map (...) :body (...)
+        //                [:direct t :fn-name "NAME"])
+        // :direct marks a required-only (≤6 params) closure whose body reads
+        // params exclusively via :load-arg and omits the arity-check prefix —
+        // eligible for the per-arity direct-delegate path.
         var plist = instr.Cdr;
         int paramCount = 0;
         int envSize = 0;
         LispObject? bodyInstrs = null;
         LispObject? envMap = null;
+        bool direct = false;
+        string fnName = "";
 
         while (plist is Cons pc)
         {
@@ -1462,6 +1575,8 @@ public partial class CilAssembler
                 case "ENV-SIZE": envSize = GetInt(val); break;
                 case "ENV-MAP": envMap = val; break;
                 case "BODY": bodyInstrs = val; break;
+                case "DIRECT": direct = val is not Nil; break;
+                case "FN-NAME": fnName = GetString(val); break;
             }
             plist = Cddr(pc);
         }
@@ -1507,6 +1622,10 @@ public partial class CilAssembler
             innerAsm._faslTypeBuilder = _faslTypeBuilder;
             innerAsm._faslStructMap = _faslStructMap;
             innerAsm._boxedEnvSlots = boxedSlots;
+            // FASL mode ignores :direct (args-array signature as before), but a
+            // :direct body omits the compiler's arity-check prefix — reconstitute
+            // it here so FASL-loaded closures keep the exact same argc error.
+            if (direct) EmitDirectFallbackArityCheck(innerAsm._il, fnName, paramCount);
             innerAsm.Assemble(bodyInstrs);
 
             // Stack has: object[] env
@@ -1534,6 +1653,34 @@ public partial class CilAssembler
                 typeof(object[]), typeof(string), typeof(int) })!;
             _il.Emit(OpCodes.Newobj, lispFuncClosureCtor);
         }
+        else if (direct && paramCount <= 6)
+        {
+            // Direct-params mode: body DM signature is (object[] env,
+            // LispObject a0..aN-1); :load-arg i maps to ldarg (i+1). The
+            // compiler only marks :direct on required-only bodies that read
+            // params exclusively via :load-arg (and omits the arity-check
+            // prefix — MakeDirectClosure's args-array wrapper performs it).
+            var paramTypes = new Type[paramCount + 1];
+            paramTypes[0] = typeof(object[]);
+            for (int i = 1; i < paramTypes.Length; i++) paramTypes[i] = typeof(LispObject);
+            var dm = new DynamicMethod("lambda_closure_direct", typeof(LispObject),
+                paramTypes, typeof(CilAssembler).Module, true);
+            var innerAsm = new CilAssembler();
+            innerAsm._il = dm.GetILGenerator();
+            innerAsm._boxedEnvSlots = boxedSlots;
+            innerAsm._directParams = true;
+            innerAsm.Assemble(bodyInstrs);
+
+            int dmIdx = AddUnitConstant(dm);
+
+            // Stack: object[] env (from caller's instructions)
+            // Call MakeClosureDirect(env, unitId, dmIdx, paramCount, fnName)
+            _il.Emit(OpCodes.Ldc_I4, _currentUnitId);
+            _il.Emit(OpCodes.Ldc_I4, dmIdx);
+            _il.Emit(OpCodes.Ldc_I4, paramCount);
+            _il.Emit(OpCodes.Ldstr, fnName);
+            _il.Emit(OpCodes.Call, _makeClosureDirect);
+        }
         else
         {
             // DynamicMethod mode (original path)
@@ -1544,6 +1691,10 @@ public partial class CilAssembler
             innerAsm._il = dm.GetILGenerator();
 
             innerAsm._boxedEnvSlots = boxedSlots;
+            // Defensive: a :direct body assembled on the args-array signature
+            // (can only happen if the arity gate above and the compiler's gate
+            // ever disagree) must get its omitted arity check back.
+            if (direct) EmitDirectFallbackArityCheck(innerAsm._il, fnName, paramCount);
             innerAsm.Assemble(bodyInstrs);
 
             // Store DynamicMethod in this compilation unit's holder rather
@@ -1560,8 +1711,26 @@ public partial class CilAssembler
         }
     }
 
+    // A :direct closure body omits the compiler's arity-check prefix (the
+    // direct-delegate wrapper performs it at call time). When such a body is
+    // nevertheless assembled on the args-array signature (FASL mode, or the
+    // defensive fallback above), emit the exact 4-instruction check the
+    // compiler would have emitted, so the argc-mismatch error is unchanged.
+    private static void EmitDirectFallbackArityCheck(ILGenerator il, string fnName, int paramCount)
+    {
+        il.Emit(OpCodes.Ldstr, fnName);
+        il.Emit(OpCodes.Ldarg_1);
+        il.Emit(OpCodes.Ldc_I4, paramCount);
+        il.Emit(OpCodes.Call, _checkArityExact);
+    }
+
     // For closure body: which env slots hold boxed (LispObject[]) values
     private HashSet<int>? _boxedEnvSlots;
+
+    // For direct-params closure bodies: :load-arg i maps to ldarg (i+1)
+    // (real CLR params) instead of args-array indexing. Set only while
+    // assembling a :direct :make-closure body.
+    private bool _directParams;
 
     private void EmitLoadEnv(int index)
     {
@@ -2370,6 +2539,20 @@ public partial class CilAssembler
                 }
                 break;
             }
+            case LispClass lc when lc.Name != null && !lc.NameCleared:
+            {
+                // A class object is identity-recoverable from its proper name via
+                // FIND-CLASS, so emit a load-form that re-resolves the class at load
+                // time instead of a per-process constant-pool reference. This makes
+                // a class literal (e.g. #.(find-class 'foo) / #.(class-of x)) survive
+                // a cross-process fasl (dotcl.core, distributed contrib fasls). Built-in
+                // and user classes both resolve by name; anonymous / name-cleared
+                // classes have no such handle and fall through to the pool fallback.
+                EmitLoadConstInline(lc.Name);   // pushes the class-name symbol
+                _il.Emit(OpCodes.Call, typeof(Runtime).GetMethod("FindClass", new[] { typeof(LispObject) })!);
+                _il.Emit(OpCodes.Castclass, typeof(LispObject));
+                break;
+            }
             case LispInstance li:
             {
                 if (_faslMode && _faslTypeBuilder != null)
@@ -2907,6 +3090,8 @@ public partial class CilAssembler
     private static readonly MethodInfo _makeFaslInstance;
     private static readonly MethodInfo _internViaEvalInstance;
     private static readonly MethodInfo _makeClosure;
+    private static readonly MethodInfo _makeClosureDirect;
+    private static readonly MethodInfo _checkArityExact;
     private static readonly MethodInfo _registerFunction;
     private static readonly MethodInfo _registerFunctionOnSymbol;
     private static readonly MethodInfo _registerSetfFunctionOnSymbol;
@@ -3002,6 +3187,7 @@ public partial class CilAssembler
             ["Runtime.Nthcdr"] = typeof(Runtime).GetMethod("Nthcdr")!,
             ["Runtime.Last"] = typeof(Runtime).GetMethod("Last")!,
             ["Runtime.Nconc2"] = typeof(Runtime).GetMethod("Nconc2")!,
+            ["Runtime.NconcDestructive2"] = typeof(Runtime).GetMethod("NconcDestructive2")!,
             ["Runtime.Butlast"] = typeof(Runtime).GetMethod("Butlast")!,
             ["Runtime.CopyList"] = typeof(Runtime).GetMethod("CopyList")!,
             ["Runtime.Member"] = typeof(Runtime).GetMethod("Member")!,
@@ -3168,6 +3354,13 @@ public partial class CilAssembler
             ["Runtime.ArefSetNum2DL"] = typeof(Runtime).GetMethod("ArefSetNum2DL")!,
             ["Runtime.ArefNum3DL"] = typeof(Runtime).GetMethod("ArefNum3DL")!,
             ["Runtime.ArefSetNum3DL"] = typeof(Runtime).GetMethod("ArefSetNum3DL")!,
+            // Raw-double-value variants for inferred float-backed array locals
+            ["Runtime.ArefNumD"] = typeof(Runtime).GetMethod("ArefNumD")!,
+            ["Runtime.ArefSetNumD"] = typeof(Runtime).GetMethod("ArefSetNumD")!,
+            ["Runtime.ArefNum2DD"] = typeof(Runtime).GetMethod("ArefNum2DD")!,
+            ["Runtime.ArefSetNum2DD"] = typeof(Runtime).GetMethod("ArefSetNum2DD")!,
+            ["Runtime.ArefNum3DD"] = typeof(Runtime).GetMethod("ArefNum3DD")!,
+            ["Runtime.ArefSetNum3DD"] = typeof(Runtime).GetMethod("ArefSetNum3DD")!,
             ["Runtime.LispError"] = typeof(Runtime).GetMethod("LispError")!,
 
             // Runtime - vector push
@@ -3559,6 +3752,9 @@ public partial class CilAssembler
         _internViaEvalInstance = typeof(LispInstance).GetMethod("InternViaEval",
             new[] { typeof(string), typeof(LispObject) })!;
         _makeClosure = typeof(CilAssembler).GetMethod("MakeClosure")!;
+        _makeClosureDirect = typeof(CilAssembler).GetMethod("MakeClosureDirect")!;
+        _checkArityExact = typeof(Runtime).GetMethod("CheckArityExact",
+            new[] { typeof(string), typeof(LispObject[]), typeof(int) })!;
         _registerFunction = typeof(CilAssembler).GetMethod("RegisterFunction")!;
         _registerFunctionOnSymbol = typeof(CilAssembler).GetMethod("RegisterFunctionOnSymbol")!;
         _registerSetfFunctionOnSymbol = typeof(CilAssembler).GetMethod("RegisterSetfFunctionOnSymbol")!;

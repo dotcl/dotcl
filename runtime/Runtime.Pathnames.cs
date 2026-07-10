@@ -576,10 +576,14 @@ public static partial class Runtime
             return Runtime.PathnameVersion(args[0]);
         }, "PATHNAME-VERSION", -1));
 
-        Emitter.CilAssembler.RegisterFunction("PATHNAME-DIRECTORY", new LispFunction(args => {
+        var pathnameDirFn = new LispFunction(args => {
             if (args.Length < 1) throw new LispErrorException(new LispProgramError("PATHNAME-DIRECTORY: expected at least 1 argument"));
             return Runtime.PathnameDirectory(args[0]);
-        }, "PATHNAME-DIRECTORY", -1));
+        }, "PATHNAME-DIRECTORY", -1);
+        // 1-arg direct delegate: same code path as the wrapper with one argument
+        // (the :case keyword was already ignored by the wrapper).
+        pathnameDirFn.SetDirectDelegate((Func<LispObject, LispObject>)(a => Runtime.PathnameDirectory(a)));
+        Emitter.CilAssembler.RegisterFunction("PATHNAME-DIRECTORY", pathnameDirFn);
 
         // LOAD-LOGICAL-PATHNAME-TRANSLATIONS
         Emitter.CilAssembler.RegisterFunction("LOAD-LOGICAL-PATHNAME-TRANSLATIONS", new LispFunction(args => {

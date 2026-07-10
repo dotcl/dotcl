@@ -441,6 +441,7 @@ compile-core-fasl-r2r-$(1): compile-core-fasl
 	"$$(CROSSGEN2)" $$(DOTCL_ROOT)compiler/dotcl.core.dll \
 	  -r "$$(call runtime_ref,$(1))/*.dll" \
 	  -r "$$(DOTCL_ROOT)runtime/bin/Release/net10.0/$(1)/publish/runtime.dll" \
+	  -r "$$(DOTCL_ROOT)runtime/bin/Release/net10.0/$(1)/publish/DotCL.Runtime.dll" \
 	  --targetos $(TARGETOS_$(1)) --targetarch $(TARGETARCH_$(1)) -O \
 	  -o $$(DOTCL_ROOT)compiler/dotcl-r2r-$(1).core
 	rm -f $$(DOTCL_ROOT)compiler/dotcl.core.dll
@@ -452,6 +453,7 @@ compile-asdf-fasl-r2r-$(1): compile-asdf-fasl compile-core-fasl-r2r-$(1)
 	"$$(CROSSGEN2)" $$(DOTCL_ROOT)contrib/asdf/asdf.fasl.dll \
 	  -r "$$(call runtime_ref,$(1))/*.dll" \
 	  -r "$$(DOTCL_ROOT)runtime/bin/Release/net10.0/$(1)/publish/runtime.dll" \
+	  -r "$$(DOTCL_ROOT)runtime/bin/Release/net10.0/$(1)/publish/DotCL.Runtime.dll" \
 	  -r "$$(DOTCL_ROOT)compiler/dotcl.core.dll" \
 	  --targetos $(TARGETOS_$(1)) --targetarch $(TARGETARCH_$(1)) -O \
 	  -o $$(DOTCL_ROOT)contrib/asdf/asdf-r2r-$(1).fasl
@@ -468,7 +470,9 @@ compile-asdf-fasl-r2r-all: $(addprefix compile-asdf-fasl-r2r-,$(R2R_RIDS))
 # --target-rid dep resolver (DotclHost.ResolveDeps) probes and prefers it,
 # falling back to the IL fasl when no R2R copy is present. Contrib fasls are
 # compiled against runtime + core only (no cross-contrib assembly refs), so the
-# reference set matches the asdf rule: per-RID runtime.dll + dotcl.core.
+# reference set matches the asdf rule: per-RID runtime.dll + DotCL.Runtime.dll +
+# dotcl.core (DotCL.Runtime holds the library body the fasls reference; without
+# it crossgen2 resolves nothing and silently strips every method to non-R2R).
 define R2R_CONTRIB_RULES
 compile-contrib-fasls-r2r-$(1): compile-contrib-fasls compile-core-fasl-r2r-$(1)
 	@test -n "$$(CROSSGEN2)" || (echo "error: crossgen2 not found" && exit 1)
@@ -482,6 +486,7 @@ compile-contrib-fasls-r2r-$(1): compile-contrib-fasls compile-core-fasl-r2r-$(1)
 		"$$(CROSSGEN2)" "$$$$fasl.dll" \
 		  -r "$$(call runtime_ref,$(1))/*.dll" \
 		  -r "$$(DOTCL_ROOT)runtime/bin/Release/net10.0/$(1)/publish/runtime.dll" \
+		  -r "$$(DOTCL_ROOT)runtime/bin/Release/net10.0/$(1)/publish/DotCL.Runtime.dll" \
 		  -r "$$(DOTCL_ROOT)compiler/dotcl.core.dll" \
 		  --targetos $(TARGETOS_$(1)) --targetarch $(TARGETARCH_$(1)) -O \
 		  -o "$$(DOTCL_ROOT)contrib/$$$$n/$$$$n-r2r-$(1).fasl"; \

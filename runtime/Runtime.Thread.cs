@@ -179,12 +179,28 @@ public partial class Runtime
             // Restore parent's bindings in the new thread
             DynamicBindings.Restore(snapshot);
             LispObject? result = null;
+            // Establish a top-level ABORT restart for this worker thread, like the
+            // REPL does for the main thread (Program.cs), so a concurrency library
+            // that terminates a worker via (invoke-restart 'abort) finds one —
+            // compute-restarts was empty in worker threads, breaking lparallel's
+            // active-worker-replacement (invoke-abort-thread). The stack is
+            // [ThreadStatic], so this cluster is private to this thread.
+            var abortTag = new object();
+            RestartClusterStack.PushCluster(new[] {
+                new LispRestart("ABORT", _ => Nil.Instance,
+                    description: "Abort this thread.", tag: abortTag) });
             try
             {
                 if (fn is LispFunction lfn)
                     result = lfn.Invoke();
                 else if (fn is Symbol sym && sym.Function is LispFunction sfn)
                     result = sfn.Invoke();
+            }
+            catch (RestartInvocationException rie) when (ReferenceEquals(rie.Tag, abortTag))
+            {
+                // (invoke-restart 'abort) in the worker → unwind the body and end
+                // the thread cleanly, returning NIL.
+                result = Nil.Instance;
             }
             catch (Exception ex)
             {
@@ -195,6 +211,7 @@ public partial class Runtime
             }
             finally
             {
+                RestartClusterStack.PopCluster();
                 if (lispThread != null)
                 {
                     lispThread.ReturnValue = result ?? Nil.Instance;
@@ -307,7 +324,16 @@ public partial class Runtime
     /// <summary>(bt:release-lock lock)</summary>
     public static LispObject ReleaseLock(LispObject[] args)
     {
-        if (args.Length < 1 || args[0] is not LispLock lk)
+        if (args.Length < 1)
+            throw new LispErrorException(new LispProgramError("RELEASE-LOCK: requires a lock"));
+        return ReleaseLock1(args[0]);
+    }
+
+    // 1-arg direct-delegate entry (same code path as ReleaseLock with one arg;
+    // the not-a-lock case raises the identical error).
+    public static LispObject ReleaseLock1(LispObject a)
+    {
+        if (a is not LispLock lk)
             throw new LispErrorException(new LispProgramError("RELEASE-LOCK: requires a lock"));
         System.Threading.Monitor.Exit(lk.Monitor);
         return T.Instance;

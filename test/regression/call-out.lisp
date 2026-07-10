@@ -58,6 +58,46 @@
     (type-error () t))
   t)
 
+;;; resolve-type memoization + explicit invalidation.
+;;; clear-type-cache returns T and the cache transparently rebuilds afterwards.
+(deftest resolve-type-clear-cache-returns-t
+  (dotnet:clear-type-cache)
+  t)
+
+(deftest resolve-type-survives-cache-clear
+  (progn
+    (dotnet:resolve-type "System.String")   ; populate
+    (dotnet:clear-type-cache)               ; drop
+    (dotnet:invoke (dotnet:resolve-type "System.String") "get_FullName")) ; rebuild
+  "System.String")
+
+;;; A failed resolution must NOT be cached: a real type resolved right after a
+;;; miss still succeeds (the miss did not poison the cache).
+(deftest resolve-type-miss-does-not-poison-cache
+  (progn
+    (handler-case (dotnet:resolve-type "No.Such.Type.ZZZ") (error () nil))
+    (dotnet:invoke (dotnet:resolve-type "System.Int32") "get_Name"))
+  "Int32")
+
+;;; Overload resolution must pick the typed offset overload, not the obsolete
+;;; (object, int, ...) catch-all: Marshal.WriteIntPtr(IntPtr,int,IntPtr) and
+;;; ReadIntPtr(IntPtr,int) over WriteIntPtr(object,int,IntPtr) / ReadIntPtr(object,int).
+;;; Picking the object overload boxes the pointer arg and reads/writes the box
+;;; instead of native memory — silently corrupting char** builds.
+(deftest static-marshal-offset-overload-round-trips
+  (let* ((m "System.Runtime.InteropServices.Marshal")
+         (p (dotnet:static m "StringToHGlobalAnsi" "hi"))
+         (arr (dotnet:static m "AllocHGlobal" 16)))
+    (unwind-protect
+        (progn
+          (dotnet:static m "WriteIntPtr" arr 0 p)              ; 3-arg (ptr,ofs,val)
+          (let ((slot0 (dotnet:static m "ReadIntPtr" arr 0)))  ; 2-arg (ptr,ofs)
+            (list (= slot0 p)
+                  (dotnet:static m "PtrToStringAnsi" slot0))))
+      (dotnet:static m "FreeHGlobal" p)
+      (dotnet:static m "FreeHGlobal" arr)))
+  (t "hi"))
+
 ;;; BCL types whose assembly is not the corelib and whose name doesn't
 ;;; match its assembly (System.Collections.Queue lives in
 ;;; System.Collections.NonGeneric) must resolve via mscorlib/netstandard facade

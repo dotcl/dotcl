@@ -21,6 +21,25 @@ public static partial class Runtime
         return c;
     }
 
+    /// <summary>
+    /// 2-arg NCONC, matching the stdlib Lisp implementation exactly:
+    /// (nconc a b) = a is nil → b; otherwise (rplacd (last a) b) then a —
+    /// DESTRUCTIVE and structure-sharing per CL. NOT to be confused with
+    /// Nconc2 above, which deliberately COPIES its first argument (a CLOS
+    /// method-combination helper only). LAST on a non-cons A returns A itself
+    /// (stdlib last semantics), so a non-list A falls through to Rplacd for
+    /// the identical RPLACD type error; a dotted A has its final cdr replaced.
+    /// Emitted directly by the compiler for 2-arg NCONC call sites.
+    /// </summary>
+    public static LispObject NconcDestructive2(LispObject a, LispObject b)
+    {
+        if (a is Nil) return b;
+        var last = a;
+        while (last is Cons c && c.Cdr is Cons) last = c.Cdr;
+        Rplacd(last, b);
+        return a;
+    }
+
     // --- List utilities ---
 
     public static LispObject Nreverse(LispObject list)
@@ -622,19 +641,13 @@ public static partial class Runtime
             if (sym.Function is LispFunction sfn) return sfn;
             // Cross-package bridge: closure defuns compiled inside a let may
             // register via RegisterFunction(string,fn) which lands on a
-            // DOTCL-INTERNAL symbol rather than the home-package symbol. Mirror
-            // the same fallback used by GetFunctionBySymbol so that (funcall sym)
-            // finds the function even when sym.Function is null.
-            foreach (var pkg in Package.AllPackages)
-            {
-                if (pkg == sym.HomePackage) continue;
-                var (other, status) = pkg.FindSymbol(sym.Name);
-                if (status != SymbolStatus.None && other.Function is LispFunction otherFn)
-                {
-                    sym.Function = otherFn;
-                    return otherFn;
-                }
-            }
+            // DOTCL-INTERNAL symbol rather than the home-package symbol. Same
+            // fallback as GetFunctionBySymbol (shared helper, incl. caching the
+            // hit on sym.Function) so that (funcall sym) finds the function
+            // even when sym.Function is null.
+            if (Emitter.CilAssembler.FindFunctionAcrossPackages(sym, cacheOnSym: true)
+                is LispFunction otherFn)
+                return otherFn;
             throw new LispErrorException(new LispUndefinedFunction(sym));
         }
         throw new LispErrorException(new LispTypeError("FUNCALL: not a function designator", designator));
@@ -1128,54 +1141,88 @@ public static partial class Runtime
         Startup.RegisterBinary("STRING-LEFT-TRIM", Runtime.StringLeftTrim);
         Startup.RegisterBinary("STRING-RIGHT-TRIM", Runtime.StringRightTrim);
 
-        // Character comparisons (variadic N-arg)
-        Emitter.CilAssembler.RegisterFunction("CHAR=", new LispFunction(args => {
-            if (args.Length == 0) throw new LispErrorException(new LispProgramError("CHAR=: requires at least 1 argument"));
-            for (int i = 1; i < args.Length; i++)
-                if (!Runtime.IsTruthy(Runtime.CharEqual(args[i-1], args[i]))) return Nil.Instance;
-            return T.Instance;
-        }));
-        Emitter.CilAssembler.RegisterFunction("CHAR<", new LispFunction(args => {
-            if (args.Length == 0) throw new LispErrorException(new LispProgramError("CHAR<: requires at least 1 argument"));
-            for (int i = 1; i < args.Length; i++)
-                if (!Runtime.IsTruthy(Runtime.CharLt(args[i-1], args[i]))) return Nil.Instance;
-            return T.Instance;
-        }));
-        Emitter.CilAssembler.RegisterFunction("CHAR>", new LispFunction(args => {
-            if (args.Length == 0) throw new LispErrorException(new LispProgramError("CHAR>: requires at least 1 argument"));
-            for (int i = 1; i < args.Length; i++)
-                if (!Runtime.IsTruthy(Runtime.CharGt(args[i-1], args[i]))) return Nil.Instance;
-            return T.Instance;
-        }));
-        Emitter.CilAssembler.RegisterFunction("CHAR<=", new LispFunction(args => {
-            if (args.Length == 0) throw new LispErrorException(new LispProgramError("CHAR<=: requires at least 1 argument"));
-            for (int i = 1; i < args.Length; i++)
-                if (!Runtime.IsTruthy(Runtime.CharLe(args[i-1], args[i]))) return Nil.Instance;
-            return T.Instance;
-        }));
-        Emitter.CilAssembler.RegisterFunction("CHAR>=", new LispFunction(args => {
-            if (args.Length == 0) throw new LispErrorException(new LispProgramError("CHAR>=: requires at least 1 argument"));
-            for (int i = 1; i < args.Length; i++)
-                if (!Runtime.IsTruthy(Runtime.CharGe(args[i-1], args[i]))) return Nil.Instance;
-            return T.Instance;
-        }));
-        Emitter.CilAssembler.RegisterFunction("CHAR/=", new LispFunction(args => {
+        // %ATTACH-NUMERIC-COMPARE-FAST-PATHS: called once by cil-stdlib right
+        // after its n-ary numeric comparison wrapper defuns (< > <= >= =).
+        // Attaches a 2-arg direct delegate to exactly those function INSTANCES
+        // (#'< handed to SORT as a comparator is a hot InvokeSlow source: the
+        // wrapper is a &rest defun, so every comparison went through the
+        // args-array path). The wrapper's 2-arg path reduces to the same
+        // Runtime.LessThan-family call and returns the same T/NIL, so the
+        // delegate result is identical incl. type errors (same C# comparator).
+        // A later user redefinition replaces sym.Function with a fresh object
+        // that simply lacks the delegate — clean fallback; a shadowing package
+        // defines a different symbol and is unaffected.
+        Emitter.CilAssembler.RegisterFunction("%ATTACH-NUMERIC-COMPARE-FAST-PATHS",
+            new LispFunction(_ => {
+                static void Attach(string name, Func<LispObject, LispObject, LispObject> cmp)
+                {
+                    var (sym, status) = Startup.CL.FindSymbol(name);
+                    if (status != SymbolStatus.None && sym.Function is LispFunction f
+                        && f is not GenericFunction)
+                        f.SetDirectDelegate(cmp);
+                }
+                Attach("<", Runtime.LessThan);
+                Attach(">", Runtime.GreaterThan);
+                Attach("<=", Runtime.LessEqual);
+                Attach(">=", Runtime.GreaterEqual);
+                Attach("=", Runtime.NumEqual);
+                return Nil.Instance;
+            }, "%ATTACH-NUMERIC-COMPARE-FAST-PATHS", 0));
+
+        // Character comparisons (variadic N-arg). Each chained comparison also
+        // gets 2-/3-arg direct entries — exact unrolls of the pairwise loop
+        // (same cmp order and errors), skipping the args-array InvokeSlow for
+        // the dominant call shapes, e.g. (char<= #\0 c #\9) in digit-char-p.
+        static LispFunction NaryCharChain(string opName,
+            Func<LispObject, LispObject, LispObject> cmp)
+        {
+            var fn = new LispFunction(args => {
+                if (args.Length == 0) throw new LispErrorException(new LispProgramError($"{opName}: requires at least 1 argument"));
+                for (int i = 1; i < args.Length; i++)
+                    if (!Runtime.IsTruthy(cmp(args[i-1], args[i]))) return Nil.Instance;
+                return T.Instance;
+            });
+            fn.SetDirectDelegate((Func<LispObject, LispObject, LispObject>)((a, b) =>
+                Runtime.IsTruthy(cmp(a, b)) ? T.Instance : (LispObject)Nil.Instance));
+            fn.SetDirectDelegate((Func<LispObject, LispObject, LispObject, LispObject>)((a, b, c) =>
+                Runtime.IsTruthy(cmp(a, b)) && Runtime.IsTruthy(cmp(b, c))
+                    ? T.Instance : (LispObject)Nil.Instance));
+            return fn;
+        }
+        Emitter.CilAssembler.RegisterFunction("CHAR=",  NaryCharChain("CHAR=",  Runtime.CharEqual));
+        Emitter.CilAssembler.RegisterFunction("CHAR<",  NaryCharChain("CHAR<",  Runtime.CharLt));
+        Emitter.CilAssembler.RegisterFunction("CHAR>",  NaryCharChain("CHAR>",  Runtime.CharGt));
+        Emitter.CilAssembler.RegisterFunction("CHAR<=", NaryCharChain("CHAR<=", Runtime.CharLe));
+        Emitter.CilAssembler.RegisterFunction("CHAR>=", NaryCharChain("CHAR>=", Runtime.CharGe));
+        var charNeFn = new LispFunction(args => {
             if (args.Length == 0) throw new LispErrorException(new LispProgramError("CHAR/=: requires at least 1 argument"));
             for (int i = 0; i < args.Length; i++)
                 for (int j = i + 1; j < args.Length; j++)
                     if (Runtime.IsTruthy(Runtime.CharEqual(args[i], args[j]))) return Nil.Instance;
             return T.Instance;
-        }));
+        });
+        // All-pairs inequality: (0,1) / (0,1),(0,2),(1,2) — same pair order.
+        charNeFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject>)((a, b) =>
+            Runtime.IsTruthy(Runtime.CharEqual(a, b)) ? Nil.Instance : (LispObject)T.Instance));
+        charNeFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject, LispObject>)((a, b, c) =>
+            Runtime.IsTruthy(Runtime.CharEqual(a, b)) || Runtime.IsTruthy(Runtime.CharEqual(a, c))
+            || Runtime.IsTruthy(Runtime.CharEqual(b, c)) ? Nil.Instance : (LispObject)T.Instance));
+        Emitter.CilAssembler.RegisterFunction("CHAR/=", charNeFn);
         // Case-insensitive character comparisons
         static char foldCI(LispObject o, string fn) => o is LispChar c ? Runtime.CharFoldCase(c)
             : throw new LispErrorException(new LispTypeError($"{fn}: not a character", o));
-        Emitter.CilAssembler.RegisterFunction("CHAR-EQUAL", new LispFunction(args => {
+        var charEqualFn = new LispFunction(args => {
             if (args.Length < 1) throw new LispErrorException(new LispProgramError("CHAR-EQUAL: requires at least 1 argument"));
             for (int i = 1; i < args.Length; i++)
                 if (foldCI(args[i-1], "CHAR-EQUAL") != foldCI(args[i], "CHAR-EQUAL")) return Nil.Instance;
             if (args.Length == 1) foldCI(args[0], "CHAR-EQUAL");
             return T.Instance;
-        }));
+        });
+        // 2-arg direct entry: exactly the args.Length==2 loop iteration
+        // (one pairwise fold-compare; the length-1 branch can't fire).
+        charEqualFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject>)((a, b) =>
+            foldCI(a, "CHAR-EQUAL") != foldCI(b, "CHAR-EQUAL") ? Nil.Instance : (LispObject)T.Instance));
+        Emitter.CilAssembler.RegisterFunction("CHAR-EQUAL", charEqualFn);
         Emitter.CilAssembler.RegisterFunction("CHAR-NOT-EQUAL", new LispFunction(args => {
             if (args.Length < 1) throw new LispErrorException(new LispProgramError("CHAR-NOT-EQUAL: requires at least 1 argument"));
             for (int i = 0; i < args.Length; i++)

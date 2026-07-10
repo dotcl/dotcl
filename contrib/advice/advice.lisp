@@ -1,14 +1,14 @@
-;;; harmony.lisp — interactive advice on live .NET methods, from Lisp.
+;;; advice.lisp — interactive advice on live .NET methods, from Lisp.
 ;;;
 ;;; Wraps Lib.Harmony (github.com/pardeike/Harmony) so you can attach CLOS-style
 ;;; :after advice to *any* .NET method at run time, no restart:
 ;;;
-;;;   (require "harmony")
-;;;   (harmony:watch "MyApp.OrderService" "Process"
+;;;   (require "advice")
+;;;   (advice:watch "MyApp.OrderService" "Process"
 ;;;     (lambda (instance args result)
 ;;;       (format t "~&Process~s => ~s~%" args result)))
 ;;;   ...
-;;;   (harmony:unwatch "MyApp.OrderService" "Process")
+;;;   (advice:unwatch "MyApp.OrderService" "Process")
 ;;;
 ;;; The Lisp closure runs after each call to the target and receives the
 ;;; instance (NIL for static methods), the argument list, and the return value.
@@ -28,14 +28,14 @@
 ;; one at a time, so this must precede the defun that references the package).
 (require "nuget")
 
-(defpackage :harmony
+(defpackage :advice
   (:use :cl)
   ;; trace / untrace shadow the CL debugging macros of the same name.
   (:shadow #:trace #:untrace)
   (:export #:watch #:unwatch #:patch #:unpatch #:trace #:untrace #:ensure
            #:*harmony-package* #:*harmony-version*))
 
-(in-package :harmony)
+(in-package :advice)
 
 (defvar *harmony-package* "HarmonyX"
   "NuGet package for the patching backend. HarmonyX (BepInEx) is a drop-in of
@@ -64,7 +64,7 @@ carries a <PackageReference Include=\"HarmonyX\"> (project-core build) or a prio
 nuget:require registered it — just load it, no `dotnet build`. Only when it is
 absent (e.g. the bare `dotcl` tool with no host project) fall back to resolving
 from NuGet at run time, which shells out to `dotnet build` (~seconds, needs the
-SDK + network). So an embedding app gets instant `(require \"harmony\")` by
+SDK + network). So an embedding app gets instant `(require \"advice\")` by
 declaring the dependency at build time; the contrib needs no change either way."
   (unless *harmony*
     (or (ignore-errors (dotnet:load-assembly "0Harmony"))
@@ -81,9 +81,9 @@ declaring the dependency at build time; the contrib needs no change either way."
 
 (defun %resolve-method (type-name method-name)
   (let ((ty (or (dotnet:resolve-type type-name)
-                (error "harmony: type not found: ~A" type-name))))
+                (error "advice: type not found: ~A" type-name))))
     (or (dotnet:invoke ty "GetMethod" method-name)
-        (error "harmony: method not found: ~A.~A" type-name method-name))))
+        (error "advice: method not found: ~A.~A" type-name method-name))))
 
 (defun watch (type-name method-name fn)
   "Run FN (instance args-list result) after each call to TYPE-NAME.METHOD-NAME.

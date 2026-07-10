@@ -1,8 +1,8 @@
-;;; Manual E2E for the harmony contrib. Run:
-;;;   dotnet run --project runtime/runtime.csproj -- --asm compiler/cil-out.sil test/harmony-watch.lisp
+;;; Manual E2E for the advice contrib. Run:
+;;;   dotnet run --project runtime/runtime.csproj -- --asm compiler/cil-out.sil test/advice-watch.lisp
 ;;; (needs network on first run to resolve Lib.Harmony from NuGet)
 
-(require "harmony")
+(require "advice")
 
 (defvar *log* nil)
 
@@ -11,7 +11,7 @@
 
 (format t "~&before watch: DemoAdd(3,4) = ~a~%" (call-add))
 
-(harmony:watch "DotCL.MethodAdviceBridge" "DemoAdd"
+(advice:watch "DotCL.MethodAdviceBridge" "DemoAdd"
   (lambda (instance args result)
     (declare (ignore instance))
     (push (list :args args :result result) *log*)
@@ -20,7 +20,7 @@
 (format t "~&after watch:  DemoAdd(3,4) = ~a~%" (call-add))
 (dotnet:static "DotCL.MethodAdviceBridge" "DemoAdd" 10 20)
 
-(harmony:unwatch "DotCL.MethodAdviceBridge" "DemoAdd")
+(advice:unwatch "DotCL.MethodAdviceBridge" "DemoAdd")
 (format t "~&after unwatch: DemoAdd(3,4) = ~a~%" (call-add))
 
 (format t "~&~%captured ~a call(s):~%" (length *log*))
@@ -32,7 +32,7 @@
 
 ;;; --- patch: rewrite the return value in place ---
 (format t "~%--- patch ---~%")
-(harmony:patch "DotCL.MethodAdviceBridge" "DemoAdd"
+(advice:patch "DotCL.MethodAdviceBridge" "DemoAdd"
   (lambda (instance args result)
     (declare (ignore instance))
     ;; "fix" the method: return the product instead of whatever it computed.
@@ -40,21 +40,21 @@
 
 (let ((patched (call-add)))                 ; DemoAdd(3,4): original 7, patched 12
   (format t "~&after patch:   DemoAdd(3,4) = ~a  (original 7)~%" patched)
-  (harmony:unpatch "DotCL.MethodAdviceBridge" "DemoAdd")
+  (advice:unpatch "DotCL.MethodAdviceBridge" "DemoAdd")
   (let ((restored (call-add)))
     (format t "~&after unpatch: DemoAdd(3,4) = ~a~%" restored)
 
     ;;; --- trace: time each call ---
     (format t "~%--- trace ---~%")
     (defvar *tlog* nil)
-    (harmony:trace "DotCL.MethodAdviceBridge" "DemoAdd"
+    (advice:trace "DotCL.MethodAdviceBridge" "DemoAdd"
       (lambda (instance args result seconds)
         (declare (ignore instance result))
         (push (cons args seconds) *tlog*)
         (format t "~&[trace] DemoAdd~s  ~,4Fms~%" args (* seconds 1000.0))))
     (call-add)
     (dotnet:static "DotCL.MethodAdviceBridge" "DemoAdd" 100 200)
-    (harmony:untrace "DotCL.MethodAdviceBridge" "DemoAdd")
+    (advice:untrace "DotCL.MethodAdviceBridge" "DemoAdd")
     (call-add)                                ; not traced
     (let ((trace-ok (and (= 2 (length *tlog*))
                          (every (lambda (e) (numberp (cdr e))) *tlog*))))

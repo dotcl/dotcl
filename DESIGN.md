@@ -172,9 +172,13 @@ contagion)、`runtime/Runtime.Predicates.cs` (`numberp` / `floatp`
 自動降格。
 
 **ANSI / SBCL との差分**: 数値塔は ANSI 準拠。SBCL のような unboxed
-fixnum 表現は持たず、すべての数値はヒープオブジェクト。型宣言を
-効かせて `Fixnum.Value` を直接演算する最適化は将来課題 (Step 7 の
-範疇)。
+fixnum 表現は既定では持たず、すべての数値はヒープオブジェクト。ただし
+型宣言に基づく unboxing は要所で導入済み: `(array single-float)` /
+`(array double-float)` は要素を raw な `float[]` / `double[]` で保持し
+(box なしの `aref` / `setf aref`)、型推論で float 配列と判定した local は
+native な `r8` slot で持ち回るので `setq` 毎の box が消える (daxpy 等の
+数値カーネルで大幅な box 削減)。スカラ fixnum の全面 unboxing は引き続き
+将来課題。
 
 ### 3.2 シンボルとパッケージ
 
@@ -310,8 +314,13 @@ cross-compile / load 双方で正しく走るように `cil-compile.lisp` 側で
 **ANSI / SBCL との差分**: 命令リストは VM bytecode ではなく **CIL を
 そのまま表現したデータ**。実行は CLR JIT に委ねる。SBCL のように
 独自の VOP / IR1 / IR2 段を持たず、最適化は基本的に「素直な CIL を
-出して JIT に任せる」スタンス。型推論ベースの最適化 (Step 7) は
-未実装。
+出して JIT に任せる」スタンス。ただし局所的な型推論ベースの最適化は
+導入が始まっており、float 数値配列 / 要素型宣言から unboxed な
+`float[]` / `double[]` ストレージと native float local を選ぶ経路が
+その第一歩 (3.1 参照)。呼出側では、名前付き関数や共通アリティの
+組込みに per-arity の direct delegate を装着して引数配列パック
+(InvokeSlow) を回避する最適化を進めている。全面的な型推論最適化は
+引き続き将来課題。
 
 ### 3.7 CIL アセンブラ
 
@@ -517,9 +526,16 @@ implementation limit は緩く取っている。
 `Restore()` (3.9 と連動)。`.NET Monitor` は再入可能なので、
 `make-lock` と `make-recursive-lock` の差はフラグだけの semantic 区分。
 `destroy-thread` は .NET 5+ で `Thread.Abort` が削除されているため
-`Thread.Interrupt()` で代替する softer な実装にしている。
+`Thread.Interrupt()` で代替する softer な実装にしている (実行中スレッドの
+非同期中断 = `interrupt-thread` は未実装)。
 グローバル状態のスレッドセーフ化は段階的に進めており、3.2 (Symbol
-の volatile 化) も同じ流れ。
+の volatile 化) も同じ流れ。ロックフリーな同期プリミティブとして
+`atomic-long` (compare-and-swap / incf / decf、`Interlocked` ラップ) と
+任意 CL place 用の汎用 atomic CAS を提供する。worker スレッドにも
+top-level の `abort` リスタートを張るので、子スレッド内のエラーは
+プロセスを巻き込まず個別に回収できる (lparallel 等が依存)。`eval` は
+`dotcl:set-parallel-eval` で opt-in の並列評価に切り替えられ、`*macros*`
+テーブルはそれに備えて synchronized。
 
 **ANSI / SBCL との差分**: CL は ANSI でスレッドを規定していないので、
 互換性の基準は bordeaux-threads。SBCL `sb-thread:thread` と異なり、
@@ -574,7 +590,17 @@ SBCL 内部に依存しないなら動く (alexandria / bordeaux-threads 等は
 して正しく emit するので、MAUI の binding や ASP.NET Core の routing、
 JSON シリアライザの自動 discover がそのまま効く。NuGet 統合は
 `~/.nuget/packages/` にダウンロードしてフレームワーク整合性のある
-DLL を `Assembly.LoadFrom` で取り込む方式。
+DLL を `Assembly.LoadFrom` で取り込む方式。`dotnet:resolve-type` は
+ミス時に `AppContext.BaseDirectory` (配置済みアプリの PackageReference
+アセンブリが並ぶ場所) の managed DLL を遅延ロードして再試行し、結果を
+memoize、新規アセンブリ load で世代 invalidate する。これにより
+PackageReference 型が手動 `load-assembly` なしで解決でき、生成コードから
+`typeof(...).FullName` の強制ロードを撤去できた (samples/MonoGameLispDemo)。
+CLOS dispatch では .NET 型ごとに `EnsureDotNetTypeClass` が built-in クラスを
+get-or-register し、`class-of` / `typep` / defmethod 特定化子が機能する。
+`dotnet:class-for-type` はこの登録クラスを型 (`System.Type` or 型名) から直接
+引く公開 API で、閉じたジェネリック型の長い assembly-qualified 名を綴らずに
+specializer を得られる。
 
 **ANSI / SBCL との差分**: ANSI 範囲外の dotcl 拡張。SBCL の CFFI が
 foreign function call に閉じているのに対し、dotcl の `dotnet:` は

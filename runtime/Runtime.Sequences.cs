@@ -78,6 +78,49 @@ public static partial class Runtime
         return cmp == 0 ? T.Instance : Nil.Instance;
     }
 
+    // Shared core for the 2-arg direct-delegate entries of the string comparison
+    // family (installed as _func2 at registration so Invoke2 skips InvokeSlow's
+    // args-array path). Semantically identical to the variadic entry with
+    // args.Length == 2: ParseStringCmpArgs then reduces to two ToStringDesignator
+    // coercions and a full-range compare — no keyword loop runs, no arity/
+    // odd-keyword error can fire. Each 2-arg entry keeps its own function's
+    // (pos, cmp) → result mapping unchanged.
+    private static (int pos, int cmp) CompareFull2(LispObject a, LispObject b,
+                                                   string fname, bool ignoreCase)
+    {
+        var s1 = ToStringDesignator(a, fname);
+        var s2 = ToStringDesignator(b, fname);
+        return CompareSubstrings(s1, 0, s1.Length, s2, 0, s2.Length, ignoreCase);
+    }
+
+    // Case-sensitive 2-arg entries
+    public static LispObject StringEq2(LispObject a, LispObject b)
+    { var (_, cmp) = CompareFull2(a, b, "STRING=", false); return cmp == 0 ? T.Instance : Nil.Instance; }
+    public static LispObject StringNotEq2(LispObject a, LispObject b)
+    { var (pos, cmp) = CompareFull2(a, b, "STRING/=", false); return cmp != 0 ? Fixnum.Make(pos) : Nil.Instance; }
+    public static LispObject StringLt2(LispObject a, LispObject b)
+    { var (pos, cmp) = CompareFull2(a, b, "STRING<", false); return cmp < 0 ? Fixnum.Make(pos) : Nil.Instance; }
+    public static LispObject StringGt2(LispObject a, LispObject b)
+    { var (pos, cmp) = CompareFull2(a, b, "STRING>", false); return cmp > 0 ? Fixnum.Make(pos) : Nil.Instance; }
+    public static LispObject StringLe2(LispObject a, LispObject b)
+    { var (pos, cmp) = CompareFull2(a, b, "STRING<=", false); return cmp <= 0 ? Fixnum.Make(pos) : Nil.Instance; }
+    public static LispObject StringGe2(LispObject a, LispObject b)
+    { var (pos, cmp) = CompareFull2(a, b, "STRING>=", false); return cmp >= 0 ? Fixnum.Make(pos) : Nil.Instance; }
+
+    // Case-insensitive 2-arg entries
+    public static LispObject StringEqual2(LispObject a, LispObject b)
+    { var (_, cmp) = CompareFull2(a, b, "STRING-EQUAL", true); return cmp == 0 ? T.Instance : Nil.Instance; }
+    public static LispObject StringNotEqual2(LispObject a, LispObject b)
+    { var (pos, cmp) = CompareFull2(a, b, "STRING-NOT-EQUAL", true); return cmp != 0 ? Fixnum.Make(pos) : Nil.Instance; }
+    public static LispObject StringLessp2(LispObject a, LispObject b)
+    { var (pos, cmp) = CompareFull2(a, b, "STRING-LESSP", true); return cmp < 0 ? Fixnum.Make(pos) : Nil.Instance; }
+    public static LispObject StringGreaterp2(LispObject a, LispObject b)
+    { var (pos, cmp) = CompareFull2(a, b, "STRING-GREATERP", true); return cmp > 0 ? Fixnum.Make(pos) : Nil.Instance; }
+    public static LispObject StringNotGreaterp2(LispObject a, LispObject b)
+    { var (pos, cmp) = CompareFull2(a, b, "STRING-NOT-GREATERP", true); return cmp <= 0 ? Fixnum.Make(pos) : Nil.Instance; }
+    public static LispObject StringNotLessp2(LispObject a, LispObject b)
+    { var (pos, cmp) = CompareFull2(a, b, "STRING-NOT-LESSP", true); return cmp >= 0 ? Fixnum.Make(pos) : Nil.Instance; }
+
     public static LispObject StringNotEq(LispObject[] args)
     {
         ParseStringCmpArgs(args, "STRING/=", out var s1, out var s2, out var st1, out var en1, out var st2, out var en2);
@@ -660,13 +703,26 @@ public static partial class Runtime
                 }
                 if (obj is LispVector vec)
                 {
-                    // char-vector already satisfies 'string — return as-is
-                    if (vec.IsCharVector) return obj;
-                    var sb = new System.Text.StringBuilder();
+                    // For a SIMPLE-STRING target the result must be a *simple* string
+                    // (CLHS): a fill-pointered / adjustable / displaced char-vector must
+                    // be copied to a fresh simple string, not returned as-is. Returning
+                    // the non-simple vector broke code that (coerce … 'simple-string)s
+                    // and then relies on simplicity — e.g. cl-ppcre's
+                    // maybe-coerce-to-simple-string on parser-built adjustable strings.
+                    bool wantSimple = typeName is "SIMPLE-STRING" or "SIMPLE-BASE-STRING";
+                    // A char-vector already satisfies (BASE-)STRING. For a SIMPLE
+                    // target return it as-is only if it is already simple (matches
+                    // CheckSimpleType's SIMPLE-STRING criterion: no fill pointer,
+                    // rank 1) — CLHS: coerce returns the object itself when it is
+                    // already of the type. Otherwise fall through and copy.
+                    if (vec.IsCharVector
+                        && (!wantSimple || (!vec.HasFillPointer && vec.Rank == 1)))
+                        return obj;
+                    var sb = new System.Text.StringBuilder(vec.Length);
                     for (int i = 0; i < vec.Length; i++)
                     {
-                        if (vec[i] is LispChar lch) sb.Append(lch.Value);
-                        else throw new LispErrorException(new LispTypeError("COERCE: vector element not a character", vec[i]));
+                        if (vec.ElementAt(i) is LispChar lch) sb.Append(lch.Value);
+                        else throw new LispErrorException(new LispTypeError("COERCE: vector element not a character", vec.ElementAt(i)));
                     }
                     return new LispString(sb.ToString());
                 }
@@ -1289,6 +1345,26 @@ public static partial class Runtime
         var item = args[0];
         var list = args[1];
         var kw = ParseListKwArgs(args, 2, "MEMBER");
+        return MemberCore(item, list, kw);
+    }
+
+    // No-keyword ListKwArgs — provably what ParseListKwArgs returns for zero
+    // keyword pairs (loops don't run; TestNot/Key null, Test null → IsEqlTest).
+    // Shared by the 2-arg direct entries of MEMBER/ASSOC.
+    private static readonly ListKwArgs s_eqlListKw = new ListKwArgs { IsEqlTest = true };
+
+    // 2-arg direct entry: (member item list) — no keyword pairs.
+    public static LispObject Member2(LispObject item, LispObject list) =>
+        MemberCore(item, list, s_eqlListKw);
+
+    // 4-arg direct entry: (member item list kw val). The keyword pair goes
+    // through the exact shared parser (over a 2-element array — half the
+    // allocation of the InvokeSlow path's 4-element args array).
+    public static LispObject Member4(LispObject item, LispObject list, LispObject k, LispObject v) =>
+        MemberCore(item, list, ParseListKwArgs(new[] { k, v }, 0, "MEMBER"));
+
+    private static LispObject MemberCore(LispObject item, LispObject list, in ListKwArgs kw)
+    {
         if (list is Nil) return Nil.Instance;
         if (list is not Cons)
             throw new LispErrorException(new LispTypeError("MEMBER: not a proper list", list));
@@ -1372,6 +1448,18 @@ public static partial class Runtime
         var item = args[0];
         var alist = args[1];
         var kw = ParseListKwArgs(args, 2, "ASSOC");
+        return AssocCore(item, alist, kw);
+    }
+
+    // 2-/4-arg direct entries — see Member2/Member4.
+    public static LispObject Assoc2(LispObject item, LispObject alist) =>
+        AssocCore(item, alist, s_eqlListKw);
+
+    public static LispObject Assoc4(LispObject item, LispObject alist, LispObject k, LispObject v) =>
+        AssocCore(item, alist, ParseListKwArgs(new[] { k, v }, 0, "ASSOC"));
+
+    private static LispObject AssocCore(LispObject item, LispObject alist, in ListKwArgs kw)
+    {
         if (alist is Nil) return Nil.Instance;
 
         // Fast path: eq test, no key
@@ -2120,36 +2208,35 @@ public static partial class Runtime
     {
         if (args.Length < 2)
             throw new LispErrorException(new LispProgramError("EVERY: too few arguments"));
-        var predFn = CoerceToFunction(args[0]);
-
-        if (args.Length == 2)
-        {
-            // Single sequence fast path
-            var seq = args[1];
-            if (seq is Cons || seq is Nil)
-            {
-                var cur = seq;
-                while (cur is Cons c) { if (!IsTruthy(predFn.Invoke1(c.Car))) return Nil.Instance; cur = c.Cdr; }
-                if (cur is not Nil) throw new LispErrorException(new LispTypeError("EVERY: not a proper list", cur));
-                return T.Instance;
-            }
-            if (seq is LispVector vec)
-            {
-                for (int i = 0; i < vec.Length; i++)
-                    if (!IsTruthy(predFn.Invoke1(vec[i]))) return Nil.Instance;
-                return T.Instance;
-            }
-            if (seq is LispString str)
-            {
-                for (int i = 0; i < str.Length; i++)
-                    if (!IsTruthy(predFn.Invoke1(LispChar.Make(str[i])))) return Nil.Instance;
-                return T.Instance;
-            }
-            throw new LispErrorException(new LispTypeError("EVERY: not a sequence", seq));
-        }
-
+        if (args.Length == 2) return Every2(args[0], args[1]);
         // Multiple sequences: parallel iteration
-        return EveryMulti(predFn, args);
+        return EveryMulti(CoerceToFunction(args[0]), args);
+    }
+
+    // 2-arg direct entry: single-sequence fast path, extracted verbatim.
+    public static LispObject Every2(LispObject pred, LispObject seq)
+    {
+        var predFn = CoerceToFunction(pred);
+        if (seq is Cons || seq is Nil)
+        {
+            var cur = seq;
+            while (cur is Cons c) { if (!IsTruthy(predFn.Invoke1(c.Car))) return Nil.Instance; cur = c.Cdr; }
+            if (cur is not Nil) throw new LispErrorException(new LispTypeError("EVERY: not a proper list", cur));
+            return T.Instance;
+        }
+        if (seq is LispVector vec)
+        {
+            for (int i = 0; i < vec.Length; i++)
+                if (!IsTruthy(predFn.Invoke1(vec[i]))) return Nil.Instance;
+            return T.Instance;
+        }
+        if (seq is LispString str)
+        {
+            for (int i = 0; i < str.Length; i++)
+                if (!IsTruthy(predFn.Invoke1(LispChar.Make(str[i])))) return Nil.Instance;
+            return T.Instance;
+        }
+        throw new LispErrorException(new LispTypeError("EVERY: not a sequence", seq));
     }
 
     private static LispObject EveryMulti(LispFunction predFn, LispObject[] args)
@@ -2198,42 +2285,41 @@ public static partial class Runtime
     {
         if (args.Length < 2)
             throw new LispErrorException(new LispProgramError("SOME: too few arguments"));
-        var predFn = CoerceToFunction(args[0]);
-
-        if (args.Length == 2)
-        {
-            // Single sequence fast path
-            var seq = args[1];
-            if (seq is Cons || seq is Nil)
-            {
-                var cur = seq;
-                while (cur is Cons c) { var result = predFn.Invoke1(c.Car); if (IsTruthy(result)) return result; cur = c.Cdr; }
-                if (cur is not Nil) throw new LispErrorException(new LispTypeError("SOME: not a proper list", cur));
-                return Nil.Instance;
-            }
-            if (seq is LispVector vec)
-            {
-                for (int i = 0; i < vec.Length; i++)
-                {
-                    var result = predFn.Invoke1(vec[i]);
-                    if (IsTruthy(result)) return result;
-                }
-                return Nil.Instance;
-            }
-            if (seq is LispString str)
-            {
-                for (int i = 0; i < str.Length; i++)
-                {
-                    var result = predFn.Invoke1(LispChar.Make(str[i]));
-                    if (IsTruthy(result)) return result;
-                }
-                return Nil.Instance;
-            }
-            throw new LispErrorException(new LispTypeError("SOME: not a sequence", seq));
-        }
-
+        if (args.Length == 2) return Some2(args[0], args[1]);
         // Multiple sequences
-        return SomeMulti(predFn, args);
+        return SomeMulti(CoerceToFunction(args[0]), args);
+    }
+
+    // 2-arg direct entry: single-sequence fast path, extracted verbatim.
+    public static LispObject Some2(LispObject pred, LispObject seq)
+    {
+        var predFn = CoerceToFunction(pred);
+        if (seq is Cons || seq is Nil)
+        {
+            var cur = seq;
+            while (cur is Cons c) { var result = predFn.Invoke1(c.Car); if (IsTruthy(result)) return result; cur = c.Cdr; }
+            if (cur is not Nil) throw new LispErrorException(new LispTypeError("SOME: not a proper list", cur));
+            return Nil.Instance;
+        }
+        if (seq is LispVector vec)
+        {
+            for (int i = 0; i < vec.Length; i++)
+            {
+                var result = predFn.Invoke1(vec[i]);
+                if (IsTruthy(result)) return result;
+            }
+            return Nil.Instance;
+        }
+        if (seq is LispString str)
+        {
+            for (int i = 0; i < str.Length; i++)
+            {
+                var result = predFn.Invoke1(LispChar.Make(str[i]));
+                if (IsTruthy(result)) return result;
+            }
+            return Nil.Instance;
+        }
+        throw new LispErrorException(new LispTypeError("SOME: not a sequence", seq));
     }
 
     private static LispObject SomeMulti(LispFunction predFn, LispObject[] args)
@@ -2583,8 +2669,14 @@ public static partial class Runtime
         Emitter.CilAssembler.RegisterFunction("REDUCE",
             new LispFunction(args => Runtime.Reduce(args)));
         // MEMBER, MEMBER-IF, MEMBER-IF-NOT
-        Emitter.CilAssembler.RegisterFunction("MEMBER",
-            new LispFunction(args => Runtime.MemberFull(args)));
+        // MEMBER/ASSOC: attach direct entries for the dominant call shapes
+        // ((item list) and (item list kw val) — e.g. :test #'string=). The
+        // 2-arg entry skips the args array entirely; the 4-arg entry runs the
+        // exact shared keyword parser over a 2-element array.
+        var memberFn = new LispFunction(args => Runtime.MemberFull(args));
+        memberFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject>)Runtime.Member2);
+        memberFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject, LispObject, LispObject>)Runtime.Member4);
+        Emitter.CilAssembler.RegisterFunction("MEMBER", memberFn);
         Emitter.CilAssembler.RegisterFunction("MEMBER-IF",
             new LispFunction(args => Runtime.MemberIf(args)));
         Emitter.CilAssembler.RegisterFunction("MEMBER-IF-NOT",
@@ -2597,8 +2689,10 @@ public static partial class Runtime
                 return Runtime.MemberIf(newArgs);
             }));
         // ASSOC, ASSOC-IF, ASSOC-IF-NOT
-        Emitter.CilAssembler.RegisterFunction("ASSOC",
-            new LispFunction(args => Runtime.AssocFull(args)));
+        var assocFn = new LispFunction(args => Runtime.AssocFull(args));
+        assocFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject>)Runtime.Assoc2);
+        assocFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject, LispObject, LispObject>)Runtime.Assoc4);
+        Emitter.CilAssembler.RegisterFunction("ASSOC", assocFn);
         Emitter.CilAssembler.RegisterFunction("ASSOC-IF",
             new LispFunction(args => Runtime.AssocIf(args)));
         Emitter.CilAssembler.RegisterFunction("ASSOC-IF-NOT",
@@ -2681,10 +2775,12 @@ public static partial class Runtime
                 return Runtime.NsubstituteIf(newArgs);
             }));
         // EVERY, SOME, NOTEVERY, NOTANY
-        Emitter.CilAssembler.RegisterFunction("EVERY",
-            new LispFunction(args => Runtime.Every(args)));
-        Emitter.CilAssembler.RegisterFunction("SOME",
-            new LispFunction(args => Runtime.Some(args)));
+        var everyFn = new LispFunction(args => Runtime.Every(args));
+        everyFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject>)Runtime.Every2);
+        Emitter.CilAssembler.RegisterFunction("EVERY", everyFn);
+        var someFn = new LispFunction(args => Runtime.Some(args));
+        someFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject>)Runtime.Some2);
+        Emitter.CilAssembler.RegisterFunction("SOME", someFn);
         Emitter.CilAssembler.RegisterFunction("NOTEVERY",
             new LispFunction(args => Runtime.IsTruthy(Runtime.Every(args)) ? Nil.Instance : T.Instance));
         Emitter.CilAssembler.RegisterFunction("NOTANY",
@@ -2735,19 +2831,29 @@ public static partial class Runtime
                 return Runtime.MakeString(size, initChar);
             }));
 
-        // String comparison functions
-        Emitter.CilAssembler.RegisterFunction("STRING=",   new LispFunction(Runtime.StringEq,          "STRING=",          -1));
-        Emitter.CilAssembler.RegisterFunction("STRING<",   new LispFunction(Runtime.StringLt,          "STRING<",          -1));
-        Emitter.CilAssembler.RegisterFunction("STRING>",   new LispFunction(Runtime.StringGt,          "STRING>",          -1));
-        Emitter.CilAssembler.RegisterFunction("STRING<=",  new LispFunction(Runtime.StringLe,          "STRING<=",         -1));
-        Emitter.CilAssembler.RegisterFunction("STRING>=",  new LispFunction(Runtime.StringGe,          "STRING>=",         -1));
-        Emitter.CilAssembler.RegisterFunction("STRING/=",  new LispFunction(Runtime.StringNotEq,       "STRING/=",         -1));
-        Emitter.CilAssembler.RegisterFunction("STRING-EQUAL",        new LispFunction(Runtime.StringEqualFn,       "STRING-EQUAL",        -1));
-        Emitter.CilAssembler.RegisterFunction("STRING-NOT-EQUAL",    new LispFunction(Runtime.StringNotEqualFn,    "STRING-NOT-EQUAL",    -1));
-        Emitter.CilAssembler.RegisterFunction("STRING-LESSP",        new LispFunction(Runtime.StringLessp,         "STRING-LESSP",        -1));
-        Emitter.CilAssembler.RegisterFunction("STRING-GREATERP",     new LispFunction(Runtime.StringGreaterp,      "STRING-GREATERP",     -1));
-        Emitter.CilAssembler.RegisterFunction("STRING-NOT-GREATERP", new LispFunction(Runtime.StringNotGreaterp,   "STRING-NOT-GREATERP", -1));
-        Emitter.CilAssembler.RegisterFunction("STRING-NOT-LESSP",    new LispFunction(Runtime.StringNotLessp,      "STRING-NOT-LESSP",    -1));
+        // String comparison functions. Each gets a 2-arg direct delegate
+        // (the dominant no-keyword call shape; bypasses the args-array
+        // InvokeSlow) alongside the full variadic keyword-parsing entry.
+        static void RegisterStringCmp(string name,
+            Func<LispObject[], LispObject> variadic,
+            Func<LispObject, LispObject, LispObject> twoArg)
+        {
+            var fn = new LispFunction(variadic, name, -1);
+            fn.SetDirectDelegate(twoArg);
+            Emitter.CilAssembler.RegisterFunction(name, fn);
+        }
+        RegisterStringCmp("STRING=",  Runtime.StringEq,    Runtime.StringEq2);
+        RegisterStringCmp("STRING<",  Runtime.StringLt,    Runtime.StringLt2);
+        RegisterStringCmp("STRING>",  Runtime.StringGt,    Runtime.StringGt2);
+        RegisterStringCmp("STRING<=", Runtime.StringLe,    Runtime.StringLe2);
+        RegisterStringCmp("STRING>=", Runtime.StringGe,    Runtime.StringGe2);
+        RegisterStringCmp("STRING/=", Runtime.StringNotEq, Runtime.StringNotEq2);
+        RegisterStringCmp("STRING-EQUAL",        Runtime.StringEqualFn,     Runtime.StringEqual2);
+        RegisterStringCmp("STRING-NOT-EQUAL",    Runtime.StringNotEqualFn,  Runtime.StringNotEqual2);
+        RegisterStringCmp("STRING-LESSP",        Runtime.StringLessp,       Runtime.StringLessp2);
+        RegisterStringCmp("STRING-GREATERP",     Runtime.StringGreaterp,    Runtime.StringGreaterp2);
+        RegisterStringCmp("STRING-NOT-GREATERP", Runtime.StringNotGreaterp, Runtime.StringNotGreaterp2);
+        RegisterStringCmp("STRING-NOT-LESSP",    Runtime.StringNotLessp,    Runtime.StringNotLessp2);
         // STRING-UPCASE/DOWNCASE/CAPITALIZE
         Emitter.CilAssembler.RegisterFunction("STRING-UPCASE",
             new LispFunction(Runtime.StringUpcase, "STRING-UPCASE", -1));

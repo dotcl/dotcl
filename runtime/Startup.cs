@@ -162,6 +162,12 @@ public static class Startup
         };
 #endif
 
+        // Invalidate the resolve-type memoization cache whenever a new assembly
+        // is loaded: a name that missed (or resolved elsewhere) before may now
+        // resolve, and a reloaded module must re-resolve rather than keep a
+        // stale Type. Guarded so the base-dir probe's own loads don't self-clear.
+        AppDomain.CurrentDomain.AssemblyLoad += (_, _) => Runtime.MarkTypeCacheDirty();
+
         // Create packages
         CL = new Package("COMMON-LISP", "CL");
         CLUser = new Package("COMMON-LISP-USER", "CL-USER");
@@ -802,7 +808,13 @@ public static class Startup
             ("*COMPILE-PRINT*", Nil.Instance),
             ("*COMPILE-VERBOSE*", Nil.Instance),
             ("*DEBUGGER-HOOK*", Nil.Instance),
-            ("*MACROEXPAND-HOOK*", Nil.Instance),
+            // CLHS 3.8.7: the initial value is a function designator equivalent to
+            // FUNCALL. Libraries that expand via (funcall *macroexpand-hook* fn form env)
+            // — e.g. introspect-environment:compiler-macroexpand-1 — need a non-NIL
+            // designator here. dotcl's own macroexpander (Runtime.TryMacroexpand1)
+            // calls macro functions directly and never reads this var, so the value
+            // only affects such library callers.
+            ("*MACROEXPAND-HOOK*", Sym("FUNCALL")),
             ("*PRINT-ARRAY*", T.Instance),
             ("*PRINT-BASE*", Fixnum.Make(10)),
             ("*PRINT-CASE*", Keyword("UPCASE")),
@@ -882,24 +894,31 @@ public static class Startup
 
     internal static void RegisterUnary(string name, Func<LispObject, LispObject> fn)
     {
-        Emitter.CilAssembler.RegisterFunction(name,
-            new LispFunction(args => {
-                if (args.Length != 1)
-                {
-                    throw new LispErrorException(new LispProgramError($"{name}: wrong number of arguments: {args.Length} (expected 1)"));
-                }
-                return fn(args[0]);
-            }, name));
+        var lispFn = new LispFunction(args => {
+            if (args.Length != 1)
+            {
+                throw new LispErrorException(new LispProgramError($"{name}: wrong number of arguments: {args.Length} (expected 1)"));
+            }
+            return fn(args[0]);
+        }, name);
+        // Direct-delegate fast path: an exactly-1-arg Invoke1 call runs fn
+        // without the args-array InvokeSlow detour. Any other argc still falls
+        // back to the args-array wrapper above, which raises the same
+        // wrong-number-of-arguments error as before.
+        lispFn.SetDirectDelegate(fn);
+        Emitter.CilAssembler.RegisterFunction(name, lispFn);
     }
 
     internal static void RegisterBinary(string name, Func<LispObject, LispObject, LispObject> fn)
     {
-        Emitter.CilAssembler.RegisterFunction(name,
-            new LispFunction(args => {
-                if (args.Length != 2)
-                    throw new LispErrorException(new LispProgramError($"{name}: wrong number of arguments: {args.Length} (expected 2)"));
-                return fn(args[0], args[1]);
-            }, name));
+        var lispFn = new LispFunction(args => {
+            if (args.Length != 2)
+                throw new LispErrorException(new LispProgramError($"{name}: wrong number of arguments: {args.Length} (expected 2)"));
+            return fn(args[0], args[1]);
+        }, name);
+        // Direct-delegate fast path (see RegisterUnary).
+        lispFn.SetDirectDelegate(fn);
+        Emitter.CilAssembler.RegisterFunction(name, lispFn);
     }
 
     /// <summary>
@@ -1681,6 +1700,43 @@ public static class Startup
         // Diagnostic for the CilAssembler constant-pool retention leak.
         RegisterDotcl("EMIT-POOL-STATS", new LispFunction(Runtime.EmitPoolStats, "EMIT-POOL-STATS", 0));
 
+        // dotcl:collect-invoke-stats — (flag) → previous flag value.
+        // Enables/disables the opt-in InvokeSlow call counters (see Function.cs).
+        RegisterDotcl("COLLECT-INVOKE-STATS", new LispFunction(args => {
+            if (args.Length != 1)
+                throw new LispErrorException(new LispProgramError(
+                    "COLLECT-INVOKE-STATS: takes exactly 1 argument (T or NIL)"));
+            var old = LispFunction.CollectInvokeStats;
+            LispFunction.CollectInvokeStats = args[0] is not Nil;
+            return old ? Sym("T") : (LispObject)Nil.Instance;
+        }, "COLLECT-INVOKE-STATS", 1));
+
+        // dotcl:invoke-slow-stats — alist (((name . argc) . count) ...) sorted by
+        // count descending. name is a string ("<anon>" for unnamed functions).
+        RegisterDotcl("INVOKE-SLOW-STATS", new LispFunction(args => {
+            if (args.Length != 0)
+                throw new LispErrorException(new LispProgramError(
+                    "INVOKE-SLOW-STATS: takes no arguments"));
+            var snapshot = LispFunction.InvokeSlowStatsSnapshot();
+            LispObject result = Nil.Instance;
+            for (int i = snapshot.Count - 1; i >= 0; i--)
+            {
+                var ((name, argc), count) = snapshot[i];
+                var key = new Cons(new LispString(name), Fixnum.Make(argc));
+                result = new Cons(new Cons(key, Fixnum.Make(count)), result);
+            }
+            return result;
+        }, "INVOKE-SLOW-STATS", 0));
+
+        // dotcl:reset-invoke-slow-stats — clear the InvokeSlow counters.
+        RegisterDotcl("RESET-INVOKE-SLOW-STATS", new LispFunction(args => {
+            if (args.Length != 0)
+                throw new LispErrorException(new LispProgramError(
+                    "RESET-INVOKE-SLOW-STATS: takes no arguments"));
+            LispFunction.ResetInvokeSlowStats();
+            return Nil.Instance;
+        }, "RESET-INVOKE-SLOW-STATS", 0));
+
         // dotcl:alloc-report — print per-type allocation counters. Only non-zero
         // when the runtime was started with DOTCL_ALLOC_PROF=1.
         RegisterDotcl("ALLOC-REPORT", new LispFunction(args => {
@@ -1879,8 +1935,9 @@ public static class Startup
             new LispFunction(Runtime.MakeLock, "MAKE-LOCK", -1));
         RegisterDotcl("ACQUIRE-LOCK",
             new LispFunction(Runtime.AcquireLock, "ACQUIRE-LOCK", -1));
-        RegisterDotcl("RELEASE-LOCK",
-            new LispFunction(Runtime.ReleaseLock, "RELEASE-LOCK", 1));
+        var releaseLockFn = new LispFunction(Runtime.ReleaseLock, "RELEASE-LOCK", 1);
+        releaseLockFn.SetDirectDelegate((Func<LispObject, LispObject>)Runtime.ReleaseLock1);
+        RegisterDotcl("RELEASE-LOCK", releaseLockFn);
         RegisterDotcl("LOCKP",
             new LispFunction(args => args.Length > 0 && args[0] is LispLock
                 ? (LispObject)T.Instance : Nil.Instance, "LOCKP", 1));
@@ -1906,6 +1963,18 @@ public static class Startup
             new LispFunction(Runtime.SignalSemaphore, "SIGNAL-SEMAPHORE", -1));
         RegisterDotcl("WAIT-ON-SEMAPHORE",
             new LispFunction(Runtime.WaitOnSemaphore, "WAIT-ON-SEMAPHORE", -1));
+
+        // Opt into concurrent eval (drop the process-wide _evalLock). Default is
+        // serialized/safe; hosts that call compiled functions from many threads
+        // (e.g. a probe/REPL on a multi-threaded service) can turn it off.
+        RegisterDotcl("SET-PARALLEL-EVAL",
+            new LispFunction(args => {
+                Runtime.SerializeEval = args.Length == 0 || args[0] is Nil;
+                return args.Length > 0 && args[0] is not Nil ? (LispObject)T.Instance : Nil.Instance;
+            }, "SET-PARALLEL-EVAL", -1));
+        RegisterDotcl("PARALLEL-EVAL-P",
+            new LispFunction(_ => Runtime.SerializeEval ? Nil.Instance : (LispObject)T.Instance,
+                "PARALLEL-EVAL-P", 0));
 
         // Atomic single-cell primitives (Interlocked-backed). Concurrency layer
         // alongside MAKE-LOCK; bordeaux-threads' atomic-integer backs its counter
@@ -1994,7 +2063,11 @@ public static class Startup
         RegisterDotNet(DotNetPkg, "AWAIT", new LispFunction(Runtime.DotNetAwait, "DOTNET:AWAIT", 1),
             "(dotnet:await awaitable) => value\nBlock until a .NET Task / Task<T> / ValueTask / ValueTask<T> completes and return\nits result marshalled to Lisp (NIL for a void/non-generic awaitable). A faulted\nawaitable rethrows its inner exception so handler-case sees the real condition.\nHolds the calling thread, so run it on a worker thread (bordeaux-threads) when the\ncaller must stay responsive. Non-blocking (async ...) is tracked separately.");
         RegisterDotNet(DotNetPkg, "RESOLVE-TYPE", new LispFunction(Runtime.DotNetResolveType, "DOTNET:RESOLVE-TYPE", 1),
-            "(dotnet:resolve-type type-name) => type\nResolve a .NET System.Type from a name string, searching loaded assemblies\n(loading by namespace prefix, and COM ProgIDs on Windows). The result can be\ninspected or passed anywhere a System.Type is expected. Errors if not found.");
+            "(dotnet:resolve-type type-name) => type\nResolve a .NET System.Type from a name string, searching loaded assemblies\n(loading by namespace prefix, probing the app base directory, and COM ProgIDs on\nWindows). Results are memoized until an assembly loads. Errors if not found.");
+        RegisterDotNet(DotNetPkg, "CLEAR-TYPE-CACHE", new LispFunction(Runtime.DotNetClearTypeCache, "DOTNET:CLEAR-TYPE-CACHE", 0),
+            "(dotnet:clear-type-cache) => t\nDrop all memoized resolve-type entries so the next resolution re-searches the\ncurrent set of loaded assemblies. Rarely needed — a new assembly load\ninvalidates the cache automatically.");
+        RegisterDotNet(DotNetPkg, "CLASS-FOR-TYPE", new LispFunction(Runtime.DotNetClassForType, "DOTNET:CLASS-FOR-TYPE", 1),
+            "(dotnet:class-for-type type) => class\nReturn the CLOS class dotcl uses for a .NET type, registering it lazily on first\ncall. TYPE is a System.Type (from dotnet:resolve-type / dotnet:make-generic-type) or\na type-name string/symbol. Use the returned class object directly as a defmethod\nspecializer (via read-time #.), so you never hand-spell a class symbol — handy for\nclosed generics whose auto-derived name is a long assembly-qualified string. e.g.\n(defmethod area ((s #.(dotnet:class-for-type \"MyLib.Shape\"))) ...).");
 #if !DOTCL_NO_JSON
         // DOTNET:REQUIRE pulls NuGet packages at run time (Assembly.LoadFrom +
         // System.Text.Json manifest parsing) — inherently incompatible with AOT/

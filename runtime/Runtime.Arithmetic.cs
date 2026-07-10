@@ -1754,6 +1754,29 @@ public static partial class Runtime
         // INTEGER-DECODE-FLOAT: (integer-decode-float f) => (values significand exponent sign)
         Emitter.CilAssembler.RegisterFunction("INTEGER-DECODE-FLOAT",
             new LispFunction(args => {
+                // A single-float must be decoded from its OWN 24-bit representation,
+                // not promoted to double (which yields a 53-bit mantissa and a tiny
+                // exponent). That broke anything relying on the true ulp — e.g.
+                // rationalize's rounding interval on single-floats.
+                if (args[0] is SingleFloat sfv)
+                {
+                    float f = sfv.Value;
+                    if (float.IsNaN(f) || float.IsInfinity(f))
+                        throw new LispErrorException(new LispError(
+                            "INTEGER-DECODE-FLOAT: argument is not a finite float (NaN or infinity)")
+                        { ConditionTypeName = "FLOATING-POINT-INVALID-OPERATION" });
+                    // BitConverter.SingleToInt32Bits is .NET Core 2.0+ (absent in
+                    // netstandard2.0, the emit-free runtime target). GetBytes+ToInt32
+                    // round-trips through the same endianness, so it is an equivalent
+                    // raw IEEE-754 bit reinterpret.
+                    int sbits = BitConverter.ToInt32(BitConverter.GetBytes(f), 0);
+                    int ssign = (sbits < 0) ? -1 : 1;
+                    int sexp = (sbits >> 23) & 0xFF;
+                    int smant = sbits & 0x7FFFFF;
+                    if (sexp == 0) { sexp = -149; }
+                    else { smant |= (1 << 23); sexp = sexp - 127 - 23; }
+                    return MultipleValues.Values(new Fixnum(smant), new Fixnum(sexp), new Fixnum(ssign));
+                }
                 double d = Runtime.ObjToDouble(args[0]);
                 // NaN/Inf have no (significand * radix^exponent * sign) decomposition;
                 // the 0x7FF exponent field would yield garbage. SBCL signals

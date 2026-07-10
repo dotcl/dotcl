@@ -4277,3 +4277,329 @@
           (and (typep #C(1 2) 'cl:complex) t)
           (typep #C(1 2) 'dts-test::complex)))
   (t t nil t nil))
+
+;; *macroexpand-hook* default must be a function designator (CLHS 3.8.7), not
+;; NIL. introspect-environment:compiler-macroexpand-1 (used by serapeum fbind
+;; when binding a function that has a compiler-macro, e.g. alexandria:curry)
+;; does (funcall *macroexpand-hook* cmf form env); a NIL default made that
+;; "FUNCALL: not a function designator" and broke serapeum's sequences.lisp.
+(defmacro mh-double (x) (list '* 2 x))
+(deftest macroexpand-hook-default-is-funcall-designator
+  (let ((hook *macroexpand-hook*))
+    (list (notnot hook)
+          ;; the library call pattern: expand a macro through the hook
+          (funcall hook (macro-function 'mh-double) '(mh-double 21) nil)))
+  (t (* 2 21)))
+
+;; A lambda-list parameter shadows an enclosing symbol-macro of the same name
+;; (CLHS 3.4.2), including inside nested lambdas. A self-referential symbol-macro
+;; whose name is a param — serapeum define-env-method's (self (slot-value self
+;; 'self)) — used to loop the compiler forever when the param was referenced
+;; inside a nested lambda (the nested lambda's free-var scan re-expanded the
+;; symbol-macro endlessly). If this regresses, compilation HANGS.
+(symbol-macrolet ((smpsh-self (slot-value smpsh-self 'smpsh-self)))
+  (defun smpsh-nested (smpsh-self) (funcall (lambda () smpsh-self))))
+(deftest symbol-macro-param-shadow-nested-lambda
+  ;; The param shadows the symbol-macro, so the nested lambda returns the arg.
+  (smpsh-nested 42)
+  42)
+
+;; A macro's &environment must carry lexically-enclosing symbol-macrolet
+;; bindings, so (macroexpand-1 'sym env) in the macro body expands them (CLHS
+;; macro &environment / macroexpand). dotcl's runtime macro registration wrapped
+;; the expander to pass a NIL env, so symbol-macros were invisible — serapeum's
+;; with-boolean uses symbol-macrolet as a compile-time channel and broke.
+(defmacro me473-probe (&environment env)
+  (multiple-value-bind (exp win) (macroexpand-1 'me473-foo env)
+    `(list ',exp ',win)))
+(deftest macro-environment-carries-symbol-macrolet
+  (symbol-macrolet ((me473-foo 42)) (me473-probe))
+  (42 t))
+
+;; Nested same-name symbol-macrolet: the reified &environment must expand to the
+;; INNERMOST binding (CLHS 5.1.2.1 shadowing), not the outermost. follow-up.
+(deftest macro-environment-nested-symbol-macrolet-innermost
+  (symbol-macrolet ((me473-foo :outer))
+    (symbol-macrolet ((me473-foo :inner))
+      (me473-probe)))
+  (:inner t))
+
+;; A recursive macro that nests symbol-macrolet and splices the SAME body cons
+;; into both if-arms (serapeum %with-boolean / string-join) must expand that body
+;; against each arm's symbol-macro scope, not reuse one arm's cached expansion for
+;; the other. symbol-macrolet did not push a *macroexpand-scope* marker (macrolet
+;; did), so the shared macro call collided in *macroexpand-cache* and the inner
+;; scope's binding was lost. follow-up.
+(defmacro me473r-pr (&environment env) `(list :tb ',(macroexpand-1 'me473r-tb env)))
+(defmacro me473r-wb (branches &body body &environment env)
+  (if branches
+      (let ((cur (macroexpand-1 'me473r-tb env)))
+        `(if ,(car branches)
+             (symbol-macrolet ((me473r-tb (,(car branches) . ,cur)))
+               (me473r-wb ,(cdr branches) ,@body))
+             (me473r-wb ,(cdr branches) ,@body)))
+      (if (= 1 (length body)) (car body) `(progn ,@body))))
+(defun me473r-run (x) (symbol-macrolet ((me473r-tb nil)) (me473r-wb (x) (me473r-pr))))
+(deftest macro-environment-symbol-macrolet-per-arm-scope
+  (me473r-run t)
+  (:tb (x)))
+
+;; A handler-case clause variable that shadows an enclosing BOXED variable of the
+;; same name (e.g. a captured LOOP variable) must bind the condition into a plain
+;; slot, not inherit the outer var's boxed representation. It used to compile the
+;; clause-body reference as a boxed slot[0] ldelem-ref on the condition object,
+;; throwing ArrayTypeMismatchException at runtime when the handler fired — which
+;; broke ANSI SET-SYNTAX-FROM-CHAR.MULTIPLE-ESCAPE.
+(defun hc468-shadow ()
+  (loop for c in '(1 2)
+        collect (handler-case (aref "x" 99) (error (c) (and c :caught)))))
+(deftest handler-case-var-shadows-boxed-loop-var
+  (hc468-shadow)
+  (:caught :caught))
+
+;; (setf (car/cdr/cadr/cdar PLACE) VALUE): the place subform is evaluated (into a
+;; temp) BEFORE the value form (CLHS 5.1.1.1). The car/cdr fast-paths bound the
+;; value first and re-evaluated the subform in rplaca/rplacd, so a VALUE that
+;; reassigns the subform variable stored into the NEW binding — self-reference.
+;; This broke serapeum with-collector's head/tail trick
+;; (setf (cdr tail) (setf tail (list x))), so collecting always returned empty.
+(defun sf474-collect (items)
+  (let* ((head (list nil)) (tail head))
+    (dolist (x items) (setf (cdr tail) (setf tail (list x))))
+    (cdr head)))
+(deftest setf-cdr-subform-before-value
+  (sf474-collect '(:a :b :c))
+  (:a :b :c))
+(deftest setf-car-subform-before-value
+  (let* ((head (list nil)) (tail head))
+    (setf (cdr tail) (setf tail (list 1)))
+    (cdr head))
+  (1))
+
+;; A lexical (flet/labels) (setf NAME) function shadows the global one: both
+;; (setf (NAME ...) v) and #'(setf NAME) must resolve it (CLHS 5.1.2.9 / the
+;; FUNCTION special form consults the lexical environment). compile-function-ref's
+;; (function (setf name)) case skipped *local-functions* and always took the
+;; global SetfFunction path, so the setf-function fallback expansion
+;; (funcall #'(setf name) …) failed with "Undefined function: (SETF NAME)" inside
+;; the flet that binds it — eclector's set-standard-syntax-types.
+(defun %setf475-eclector (readtable)
+  (let ((log '()))
+    (flet (((setf syntax) (syntax-type char)
+             (push (list readtable char syntax-type) log)
+             syntax-type))
+      (setf (syntax :space) :whitespace
+            (syntax :tab)   :whitespace))
+    (nreverse log)))
+(deftest flet-local-setf-fn-in-defun
+  (%setf475-eclector :rt)
+  ((:rt :space :whitespace) (:rt :tab :whitespace)))
+
+(defun %setf475-funcall (v c)
+  (flet (((setf syntax) (val ch) (list :got ch val)))
+    (funcall #'(setf syntax) v c)))
+(deftest sharp-quote-local-setf-fn
+  (%setf475-funcall :val :ch)
+  (:got :ch :val))
+
+(deftest labels-local-setf-fn-in-defun
+  (labels (((setf thing) (val key) (list :stored key val)))
+    (setf (thing :a) 1))
+  (:stored :a 1))
+
+;; A redefined top-level function's LispFunction — and the DynamicMethod JIT code
+;; behind it — must not be pinned in the global constant pool forever. The
+;; run-once re-registration constant now lives in the collectible per-unit store,
+;; so redefining a name many times (literal-free body, so the only per-definition
+;; constant is the re-registration fn) and running GC reclaims the dead
+;; definitions. Pre-fix the pool grew ~1 entry per redefinition and never fell
+;; (the Coalton GB-working-set leak). Generous threshold: pre-fix delta was
+;; ~300; post-fix ~0. Also asserts the still-bound function stays callable
+;; (no over-collection).
+(defun %pool476-data () (nth 2 (dotcl:emit-pool-stats)))
+(deftest defun-redefine-does-not-leak-constants
+  (let ((before (%pool476-data)))
+    (dotimes (i 300)
+      (eval `(defun cl-user::%leak476-target () (+ ,i 1))))
+    (dotcl:gc) (dotcl:gc) (dotcl:gc)
+    (list (< (- (%pool476-data) before) 100)
+          (integerp (funcall '%leak476-target))))
+  (t t))
+
+;; Backquote must process ,/,@ inside a #(...) vector template, not just lists
+;; (CLHS 2.4.6). `#(...) ≡ (apply #'vector `(...)). The reader used to quote the
+;; whole vector, leaving (UNQUOTE x) forms as literal elements — which broke SBCL's
+;; backquoted `+static-symbols+` vector (LENGTH: not a sequence).
+(defvar *bqv-x* 42)
+(defvar *bqv-l* (list 'p 'q))
+(deftest backquote-vector-unquote (equalp `#(a ,*bqv-x* c) #(a 42 c)) t)
+(deftest backquote-vector-splice  (equalp `#(,@*bqv-l* c) #(p q c)) t)
+(deftest backquote-vector-mixed   (equalp `#(0 ,@*bqv-l* ,*bqv-x*) #(0 p q 42)) t)
+(deftest backquote-vector-nested  (equalp `#(1 #(2 ,*bqv-x*) 3) #(1 #(2 42) 3)) t)
+(deftest backquote-vector-empty   (equalp `#() #()) t)
+(deftest backquote-vector-plain   (equalp `#(a b c) #(a b c)) t)
+(deftest backquote-vector-is-sequence
+  (let ((v `#(0 ,@*bqv-l* 9)))
+    (list (length v) (svref v 2) (typep v 'simple-vector)))
+  (4 q t))
+
+;; make-instance with an initarg value that contains a tagbody (loop/dolist —
+;; which emit :LEAVE and labels requiring an empty CIL stack) was compiled with
+;; the class still on the stack (the %make-instance-with-initargs emit pushed the
+;; class before pre-evaluating the initargs), producing a stack-unbalanced method
+;; = invalid CIL (InvalidProgramException at first call). Broke cl-ppcre back-
+;; references: (make-instance 'alternation :choices (loop … collect …)).
+(defclass mi482-holder () ((items :initarg :items :reader mi482-items)))
+(defun mi482-make (lst)
+  (make-instance 'mi482-holder :items (loop for x in lst collect (* x x))))
+(deftest make-instance-initarg-with-loop
+  (mi482-items (mi482-make '(1 2 3)))
+  (1 4 9))
+(defun mi482-make2 (lst)
+  (make-instance 'mi482-holder :items (progn (dolist (x lst) (identity x)) (length lst))))
+(deftest make-instance-initarg-with-dolist
+  (mi482-items (mi482-make2 '(:a :b :c :d)))
+  4)
+
+;; (coerce X 'simple-string) must yield a *simple* string (CLHS): a fill-pointered
+;; / adjustable / displaced char-vector must be copied to a fresh simple string,
+;; not returned as-is. Returning the non-simple vector broke cl-ppcre's
+;; maybe-coerce-to-simple-string on parser-built adjustable strings — a trailing
+;; empty group (?:) then dropped the preceding match.
+(deftest coerce-adjustable-to-simple-string
+  (let ((a (make-array 4 :element-type 'character :fill-pointer 2 :adjustable t
+                         :initial-element #\b)))
+    (list (simple-string-p (coerce a 'simple-string))
+          (simple-string-p (coerce a 'simple-base-string))
+          (string= (coerce a 'simple-string) "bb")))
+  (t t t))
+(deftest coerce-fillpointer-to-simple-string
+  (let ((a (make-array 2 :element-type 'character :fill-pointer 2 :initial-element #\x)))
+    (simple-string-p (coerce a 'simple-string)))
+  t)
+
+;; A non-top-level (defun) — nested inside a conditional — must register the
+;; function at RUNTIME (only when the branch executes), not at assembly time.
+;; It used to compile to :defmethod, which registers at assembly time even inside
+;; an untaken branch, so (unless (fboundp 'x) (defun x …)) / (if nil (defun x …))
+;; defined X unconditionally — breaking cross-file defdfun defaults (bordeaux-
+;; threads) on fresh compile.
+(deftest nested-defun-false-guard-does-not-define
+  (progn (eval '(unless t (defun %nd486-a () 1)))
+         (eval '(if nil (defun %nd486-b () 1)))
+         (eval '(when nil (defun %nd486-c () 1)))
+         (list (fboundp '%nd486-a) (fboundp '%nd486-b) (fboundp '%nd486-c)))
+  (nil nil nil))
+(deftest nested-defun-true-guard-defines
+  (progn (eval '(when t (defun %nd486-d () :yes)))
+         (funcall '%nd486-d))
+  :yes)
+;; guarded fboundp-default pattern (defdfun): impl already bound → default skipped
+(defun %nd486-impl () :impl)
+(deftest nested-defun-fboundp-guard-preserves-impl
+  (progn (eval '(unless (fboundp '%nd486-impl) (defun %nd486-impl () :default)))
+         (funcall '%nd486-impl))
+  :impl)
+;; (setf name) as a non-top-level defun registers on the correct (reader) symbol
+(deftest nested-setf-defun-registers
+  (progn (ignore-errors (defun (setf %nd486-acc) (v x) (setf (car x) v) v))
+         (list (fboundp '(setf %nd486-acc))
+               (typep #'(setf %nd486-acc) 'function)))
+  (t t))
+;; gensym-named non-top-level defun is callable via its actual symbol
+(deftest nested-gensym-defun-callable
+  (let* ((name (gensym "ND486G"))
+         (fn (eval `(prog2 nil (defun ,name (a b) (values a b 3)) nil))))
+    (list (multiple-value-list (funcall (symbol-function fn) 1 2))
+          (eq fn name)))
+  ((1 2 3) t))
+
+;; A big form inside a lexical scope used to compile into one oversized CIL
+;; method (a few MB) and fail with an opaque InvalidProgramException at JIT time.
+;; compile-progn now splits an oversized *non-toplevel* progn body into
+;; immediately-called closure chunks, so a form that just bundles many independent
+;; statements (a data-driven test suite, generated code) compiles and runs.
+(defvar %big488-acc 0)
+(defun %big488-heavy (i target)
+  ;; A statement that emits a lot of CIL. TARGET names the accumulator to mutate.
+  `(setf ,target (+ ,target
+                    (car (last (list (* ,i 2) (+ ,i 1) (- ,i 1))))
+                    (reduce #'+ (mapcar (lambda (x) (+ x ,i)) (list ,i ,i)))
+                    (length (format nil "~a-~a" ,i ,i)))))
+(defun %big488-chunkable (n)
+  ;; Mutates only the SPECIAL %big488-acc (DynamicBindings, not a lexical capture),
+  ;; so chunking is semantics-preserving -> compiles despite the size.
+  `(let ((k 1)) (declare (ignorable k))
+     (setf %big488-acc 0)
+     ,@(loop for i below n collect (%big488-heavy i '%big488-acc))
+     %big488-acc))
+(deftest huge-chunkable-form-compiles
+  (let ((r (eval (%big488-chunkable 4000))))
+    (and (integerp r) (> r 0)))
+  t)
+;; The clear-error fallback still holds: when the body mutates an *enclosing
+;; lexical* variable it can't be wrapped in a closure (the mutation would be lost),
+;; so compile-progn leaves it as one method and the catchable "form too large"
+;; PROGRAM-ERROR surfaces instead of an opaque InvalidProgramException.
+;; (Small methods that InvalidProgram are genuine codegen bugs and still surface
+;; unchanged.)
+(deftest huge-monolithic-form-signals-clear-error
+  (handler-case
+      (progn (eval `(let ((acc 0))
+                      ,@(loop for i below 4000 collect (%big488-heavy i 'acc))
+                      acc))
+             :no-error)
+    (program-error (e)
+      (if (search "too large" (princ-to-string e)) :clear-error :other-prog-error))
+    (error () :other-error))
+  :clear-error)
+
+;; A MACROLET-local macro that expands to (return-from <enclosing-defun> …) must
+;; resolve the defun's implicit block. The return-from is hidden in the macrolet's
+;; quasiquoted expander, so the use-direct fast path (which skips the block wrapper
+;; when no literal return-from is seen) dropped the implicit block → "no block
+;; named F". Now a body containing a macrolet keeps the block wrapper.
+(defun %rf487-simple (x)
+  (macrolet ((adv () `(return-from %rf487-simple :done)))
+    (adv)
+    x))
+(deftest macrolet-return-from-implicit-block
+  (%rf487-simple 42)
+  :done)
+;; life.lisp shape: return-from via macrolet through do/loop nesting
+(defun %rf487-nested (x)
+  (let ((i 0))
+    (macrolet ((advance (n c) `(progn (incf ,n) (unless ,c (return-from %rf487-nested :adv))))
+               (scan (g l) `(do () ((>= ,l ,g)) (advance ,l nil))))
+      (scan x i)
+      :fell-through)))
+(deftest macrolet-return-from-through-do-loop
+  (%rf487-nested 3)
+  :adv)
+;; a macrolet that does NOT return-from is unaffected
+(defun %rf487-norf (x) (macrolet ((m () '(* 2 3))) (+ x (m))))
+(deftest macrolet-no-return-from-still-works
+  (%rf487-norf 40)
+  46)
+
+;; rationalize returns the SIMPLEST rational within the float's rounding interval,
+;; not rational's exact fraction (was aliased to rational). Also integer-decode-float
+;; must decode a single-float from its own 24-bit form, not promote to double.
+(deftest rationalize-simplest-double
+  (list (rationalize 3.2d0) (rationalize 0.1d0) (rationalize 1.9d0)
+        (rationalize 0.333d0) (rationalize 2.5d0) (rationalize -3.2d0)
+        (rationalize (/ 1d0 3d0)))
+  (16/5 1/10 19/10 333/1000 5/2 -16/5 1/3))
+(deftest rationalize-simplest-single
+  (list (rationalize 3.2f0) (rationalize 0.1f0))
+  (16/5 1/10))
+(deftest rationalize-rational-passthrough
+  (list (rationalize 5) (rationalize 1/7) (rationalize 0))
+  (5 1/7 0))
+(deftest rationalize-round-trips
+  (every (lambda (x) (= (float (rationalize x) x) x))
+         '(3.2d0 0.1d0 1.23456789d0 123456.789d0 1d-10 1d10 3.2f0 0.1f0 1.5f8))
+  t)
+(deftest integer-decode-single-float
+  (multiple-value-list (integer-decode-float 3.2f0))
+  (13421773 -22 1))

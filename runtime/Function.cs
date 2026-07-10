@@ -66,6 +66,80 @@ public class LispFunction : LispObject
         DotCL.Diagnostics.AllocCounter.Inc("LispFunction+Closure");
     }
 
+    // Factory for direct-params closures (per-arity body delegates; built by
+    // CilAssembler.MakeClosureDirect). The closure body DynamicMethod takes
+    // (object[] env, LispObject a0..aN-1) instead of (object[] env,
+    // LispObject[] args), so an exactly-N-arg InvokeN call runs the body without
+    // the args-array InvokeSlow detour. The args-array _func wrapper keeps
+    // apply / spread-arg calls working: it performs the same
+    // Runtime.CheckArityExact the compiled args-array body used to perform
+    // (identical error type and message), then spreads the array. The direct
+    // _funcN path needs no check — the delegate signature structurally
+    // guarantees the argc (an InvokeM call with M != N finds _funcM null and
+    // falls back to the wrapper). fnName is captured only by the wrapper
+    // lambda; Name stays null like every closure, so PushFrame behavior and
+    // per-call cost are unchanged.
+    public static LispFunction MakeDirectClosure(Delegate del, object[] env, string fnName)
+    {
+        // The _funcN wrappers include PeriodicStackCheck: unlike assembler-built
+        // simple functions, a closure can recurse through itself via its own box
+        // (funcall of a captured self-reference) with no named-call site in
+        // between, and the InvokeN fast path skips InvokeSlow's check — without
+        // this, runaway closure recursion dies as an uncatchable .NET
+        // StackOverflowException instead of the catchable Lisp "Stack overflow"
+        // PROGRAM-ERROR that the args-array path has always produced.
+        LispFunction fn;
+        switch (del)
+        {
+            case Func<object[], LispObject> d0:
+            {
+                var f = fn = new LispFunction(args => { Runtime.CheckArityExact(fnName, args, 0); return d0(env); }, null, 0);
+                fn._func0 = () => { f.PeriodicStackCheck(); return d0(env); };
+                break;
+            }
+            case Func<object[], LispObject, LispObject> d1:
+            {
+                var f = fn = new LispFunction(args => { Runtime.CheckArityExact(fnName, args, 1); return d1(env, args[0]); }, null, 1);
+                fn._func1 = a => { f.PeriodicStackCheck(); return d1(env, a); };
+                break;
+            }
+            case Func<object[], LispObject, LispObject, LispObject> d2:
+            {
+                var f = fn = new LispFunction(args => { Runtime.CheckArityExact(fnName, args, 2); return d2(env, args[0], args[1]); }, null, 2);
+                fn._func2 = (a, b) => { f.PeriodicStackCheck(); return d2(env, a, b); };
+                break;
+            }
+            case Func<object[], LispObject, LispObject, LispObject, LispObject> d3:
+            {
+                var f = fn = new LispFunction(args => { Runtime.CheckArityExact(fnName, args, 3); return d3(env, args[0], args[1], args[2]); }, null, 3);
+                fn._func3 = (a, b, c) => { f.PeriodicStackCheck(); return d3(env, a, b, c); };
+                break;
+            }
+            case Func<object[], LispObject, LispObject, LispObject, LispObject, LispObject> d4:
+            {
+                var f = fn = new LispFunction(args => { Runtime.CheckArityExact(fnName, args, 4); return d4(env, args[0], args[1], args[2], args[3]); }, null, 4);
+                fn._func4 = (a, b, c, d) => { f.PeriodicStackCheck(); return d4(env, a, b, c, d); };
+                break;
+            }
+            case Func<object[], LispObject, LispObject, LispObject, LispObject, LispObject, LispObject> d5:
+            {
+                var f = fn = new LispFunction(args => { Runtime.CheckArityExact(fnName, args, 5); return d5(env, args[0], args[1], args[2], args[3], args[4]); }, null, 5);
+                fn._func5 = (a, b, c, d, e) => { f.PeriodicStackCheck(); return d5(env, a, b, c, d, e); };
+                break;
+            }
+            case Func<object[], LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject> d6:
+            {
+                var f = fn = new LispFunction(args => { Runtime.CheckArityExact(fnName, args, 6); return d6(env, args[0], args[1], args[2], args[3], args[4], args[5]); }, null, 6);
+                fn._func6 = (a, b, c, d, e, f2) => { f.PeriodicStackCheck(); return d6(env, a, b, c, d, e, f2); };
+                break;
+            }
+            default:
+                throw new ArgumentException($"MakeDirectClosure: unsupported delegate type {del.GetType().Name}");
+        }
+        fn.Environment = env;
+        return fn;
+    }
+
     // Lisp-level call stack for debugger backtrace. Each frame keeps the callee
     // name plus its arguments. To preserve the alloc-free push on the hot path,
     // Frame is a struct stored inline in Stack<Frame>'s backing array, with up to
@@ -333,13 +407,54 @@ public class LispFunction : LispObject
         }
     }
 
+    // --- InvokeSlow call statistics (opt-in diagnostic) ---
+    // Counts InvokeSlow entries per (callee name, argc) so the fast-path gap
+    // (functions still going through the args-array _func) can be measured.
+    // Off by default: the only cost on the hot path is a single branch.
+    // Lisp API: dotcl:collect-invoke-stats / dotcl:invoke-slow-stats /
+    // dotcl:reset-invoke-slow-stats (registered in Startup.cs).
+    internal static bool CollectInvokeStats;
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<(string Name, int Argc), long>
+        s_invokeSlowStats = new();
+
+    internal static void ResetInvokeSlowStats() => s_invokeSlowStats.Clear();
+
+    /// <summary>Snapshot of the InvokeSlow counters, sorted by count descending.</summary>
+    internal static List<KeyValuePair<(string Name, int Argc), long>> InvokeSlowStatsSnapshot()
+    {
+        var list = new List<KeyValuePair<(string Name, int Argc), long>>(s_invokeSlowStats.Count);
+        foreach (var kv in s_invokeSlowStats) list.Add(kv);
+        list.Sort((a, b) => b.Value.CompareTo(a.Value));
+        return list;
+    }
+
     private LispObject InvokeSlow(LispObject[] args)
     {
+        if (CollectInvokeStats)
+            s_invokeSlowStats.AddOrUpdate((Name ?? AnonOriginTag(), args.Length), 1,
+                                          static (_, c) => c + 1);
         PeriodicStackCheck();
         if (Name == null) return _func(args);
         (s_callStack ??= new Stack<Frame>()).Push(new Frame(Name, args));
         try { return _func(args); }
         finally { s_callStack.TryPop(out _); }
+    }
+
+    // Origin tag for anonymous functions in the InvokeSlow statistics. The
+    // backing method's name identifies the generation site: DynamicMethod
+    // names are chosen per emitter site ("lambda", "lambda_direct",
+    // "lambda_closure", "lambda_closure_direct", FASL "closure_N", ...), and
+    // C# lambdas carry a compiler-generated name embedding the enclosing
+    // method (e.g. "<MakeHandlerCaseFunction>b__1_0"). Digits are stripped so
+    // per-instance names (closure_42) collapse into one statistics key.
+    // Only called with CollectInvokeStats enabled — no cost otherwise.
+    private string AnonOriginTag()
+    {
+        var m = _closureFunc != null ? _closureFunc.Method : _func.Method;
+        var sb = new System.Text.StringBuilder("<anon:");
+        foreach (var ch in m.Name)
+            if (!char.IsDigit(ch)) sb.Append(ch);
+        return sb.Append('>').ToString();
     }
 
     public (Delegate Delegate, string Label) GetJitDelegate()

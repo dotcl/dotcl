@@ -209,14 +209,50 @@ public static partial class Runtime
 
     public static void SetClassByName(string name, LispClass cls) => _classRegistry[Startup.Sym(name)] = cls;
 
+    /// <summary>Readable display name for a .NET type, used as its CLOS class symbol.
+    /// Ordinary types keep their simple name; a generic instantiation gets a closed
+    /// form (List&lt;Int32&gt;, Dictionary&lt;String,Int32&gt;, nested recursively), and
+    /// an open definition yields List&lt;T&gt;. Bare Type.Name is identical for every
+    /// instantiation of a generic (List`1 for every List&lt;T&gt;), so distinct closed
+    /// names keep the class symbol from depending on which instantiation is reflected
+    /// over first. (dotcl/dotcl#50)</summary>
+    internal static string DotNetTypeDisplayName(Type t)
+    {
+        if (!t.IsGenericType) return t.Name;
+        var name = t.Name;
+        int tick = name.IndexOf('`');
+        if (tick >= 0) name = name.Substring(0, tick);
+        var args = string.Join(",", t.GetGenericArguments().Select(DotNetTypeDisplayName));
+        return name + "<" + args + ">";
+    }
+
+    private static readonly HashSet<string> _reportedTypeNameCollisions = new();
+
+    /// <summary>Warn once when a .NET type is registered under its (ugly) assembly-
+    /// qualified name because its display name is already claimed by another type, so
+    /// the load-order hazard is visible rather than silent. class-for-type sidesteps
+    /// the name entirely. (dotcl/dotcl#50)</summary>
+    private static void WarnDisplayNameCollision(Type type, string display)
+    {
+        var key = type.FullName ?? display;
+        lock (_reportedTypeNameCollisions)
+            if (!_reportedTypeNameCollisions.Add(key)) return;
+        Console.Error.WriteLine(
+            $"[DOTNET WARNING] .NET type {type.FullName} shares the class name \"{display}\" " +
+            "with an already-registered type; registering it under its assembly-qualified name " +
+            "instead. Use (dotnet:class-for-type ...) to obtain its class object directly.");
+    }
+
     /// <summary>Register a .NET Type as a CLOS built-in class so that class-of/type-of/find-class work.</summary>
     public static LispClass EnsureDotNetTypeClass(Type type)
     {
         if (_dotNetTypeRegistry.TryGetValue(type, out var existing)) return existing;
-        // Prefer the simple type name for the class symbol (friendly, and what
-        // unquoted Lisp symbols resolve to). But simple names are ambiguous across
-        // namespaces, so guard against collisions below.
-        var simpleSym = Startup.Sym(type.Name);
+        // Prefer a readable display name for the class symbol (friendly, and what
+        // unquoted Lisp symbols resolve to): the simple name for an ordinary type, a
+        // closed form (List<Int32>) for a generic instantiation. Names can still be
+        // ambiguous across namespaces, so guard against collisions below.
+        var display = DotNetTypeDisplayName(type);
+        var simpleSym = Startup.Sym(display);
         if (_classRegistry.TryGetValue(simpleSym, out var existingByName))
         {
             // The simple name is already taken. Adopt that class only if it is NOT
@@ -250,6 +286,8 @@ public static partial class Runtime
             ? simpleSym
             : Startup.Sym(type.FullName
                 ?? (type.Namespace is null ? type.Name : type.Namespace + "." + type.Name));
+        if (!simpleFree)
+            WarnDisplayNameCollision(type, display);
 
         var cls = new LispClass(classSym, Array.Empty<SlotDefinition>(), new[] { baseCls });
         var cpl = new List<LispClass> { cls };
@@ -263,7 +301,7 @@ public static partial class Runtime
             _classRegistry[simpleSym] = cls;
             // Also register under the uppercase name so unquoted Lisp symbols
             // (e.g. (ClsAnimal) read as CLSANIMAL) find the class correctly.
-            var upperSym = Startup.Sym(type.Name.ToUpperInvariant());
+            var upperSym = Startup.Sym(display.ToUpperInvariant());
             if (!ReferenceEquals(upperSym, simpleSym) && !_classRegistry.ContainsKey(upperSym))
                 _classRegistry[upperSym] = cls;
         }

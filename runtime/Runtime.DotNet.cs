@@ -906,6 +906,71 @@ public static partial class Runtime
     internal static string? FindRegisteredNative(string name) =>
         _registeredNativePaths.TryGetValue(name, out var p) ? p : null;
 
+    // ----- resolve-type memoization + base-directory probe -----------------
+    // resolve-type memoizes name -> Type so repeated lookups skip the
+    // GetAssemblies scan. The cache is invalidated wholesale whenever the set
+    // of loaded assemblies changes (AssemblyLoad fires MarkTypeCacheDirty), so
+    // a module reload re-resolves every name once on next use rather than
+    // returning a stale Type. Only successful resolutions of stable .NET
+    // assembly types are cached — failures and dynamically-defined Lisp types
+    // are never cached (a later load / redefinition must be able to change the
+    // answer). Cleared strong refs also let a collectible ALC actually unload.
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, Type>
+        _typeCache = new(StringComparer.Ordinal);
+    private static volatile bool _typeCacheDirty;
+    // Whether the base-dir probe has already run since the last invalidation.
+    // Bounds probing to once per assembly-set change: a name that stays
+    // unresolved does not re-scan the directory on every miss.
+    private static bool _probedSinceDirty;
+    // Reentrancy guard: the probe's own LoadFromAssemblyPath calls fire
+    // AssemblyLoad; without this the probe would mark its own cache dirty and
+    // thrash. Thread-static because the AssemblyLoad handler runs synchronously
+    // on the loading (== resolving) thread.
+    [ThreadStatic] private static bool _inTypeResolve;
+
+    /// <summary>Invalidate the resolve-type cache on the next resolution. Called
+    /// from the AssemblyLoad hook (Startup) — a new assembly may change what a
+    /// name resolves to. No-op while a resolution (incl. its probe) is in flight
+    /// so the probe does not invalidate itself.</summary>
+    internal static void MarkTypeCacheDirty()
+    {
+        if (!_inTypeResolve) _typeCacheDirty = true;
+    }
+
+    /// <summary>DOTNET:CLEAR-TYPE-CACHE — drop all memoized resolve-type entries.
+    /// The next resolve-type re-resolves against the current assembly set.</summary>
+    internal static void ClearTypeCache()
+    {
+        _typeCache.Clear();
+        _probedSinceDirty = false;
+    }
+
+    /// <summary>Eagerly load every managed assembly sitting in the app base
+    /// directory so resolve-type's GetAssemblies scan can see PackageReference
+    /// types whose assembly simple-name differs from the type's namespace (so
+    /// the namespace-prefix Assembly.Load never finds them). Best-effort; run at
+    /// most once per assembly-set change (see _probedSinceDirty).</summary>
+    private static void ProbeLoadBaseDir()
+    {
+        string dir;
+        try { dir = AppContext.BaseDirectory; }
+        catch { return; }
+        if (string.IsNullOrEmpty(dir) || !System.IO.Directory.Exists(dir)) return;
+        foreach (var dll in System.IO.Directory.EnumerateFiles(dir, "*.dll"))
+        {
+            try
+            {
+#if NETSTANDARD2_0
+                System.Reflection.Assembly.LoadFrom(System.IO.Path.GetFullPath(dll));
+#else
+                System.Runtime.Loader.AssemblyLoadContext.Default
+                    .LoadFromAssemblyPath(System.IO.Path.GetFullPath(dll));
+#endif
+            }
+            catch { /* not a managed assembly, or already loaded — ignore */ }
+        }
+    }
+
     internal static string? FindSharedFrameworkDll(string assemblyName)
     {
         // RuntimeEnvironment.GetRuntimeDirectory() returns e.g.
@@ -943,6 +1008,31 @@ public static partial class Runtime
         return new LispDotNetObject(ResolveDotNetType(name.Value));
     }
 
+    /// <summary>DOTNET:CLEAR-TYPE-CACHE — drop all memoized resolve-type entries so
+    /// the next resolution re-searches the current assembly set. Returns T.</summary>
+    public static LispObject DotNetClearTypeCache(LispObject[] args)
+    {
+        ClearTypeCache();
+        return T.Instance;
+    }
+
+    /// <summary>DOTNET:CLASS-FOR-TYPE — return the CLOS class DotCL uses (registering
+    /// it lazily on first call) for a .NET type, so user code can obtain a specializer
+    /// class object without hand-spelling a class symbol — which is especially awkward
+    /// for closed generics, whose auto-derived name is a long assembly-qualified string.
+    /// The argument is a System.Type (as from dotnet:resolve-type / dotnet:make-generic-type)
+    /// or a type-name string/symbol. The returned class object is usable directly as a
+    /// defmethod specializer via read-time #. (like SBCL/CCL accept a class object).
+    /// (dotcl/dotcl#50)</summary>
+    public static LispObject DotNetClassForType(LispObject[] args)
+    {
+        if (args.Length != 1)
+            throw new LispErrorException(new LispProgramError(
+                $"DOTNET:CLASS-FOR-TYPE: expected 1 argument, got {args.Length}"));
+        var type = ResolveElementTypeArg(args[0]);
+        return EnsureDotNetTypeClass(type);
+    }
+
     /// <summary>Resolve a .NET type by full name, searching loaded assemblies.
     /// Falls back to COM ProgID lookup (Windows only) for names like "Excel.Application".</summary>
     /// <summary>Non-throwing variant of ResolveDotNetType: returns null instead of
@@ -956,6 +1046,43 @@ public static partial class Runtime
 
     internal static Type ResolveDotNetType(string typeName)
     {
+        // Outermost call owns the dirty-flag check so the probe's own loads
+        // (which re-enter via AssemblyLoad, not via this method) don't clear the
+        // cache mid-resolution.
+        bool outer = !_inTypeResolve;
+        if (outer)
+        {
+            _inTypeResolve = true;
+            if (_typeCacheDirty) { ClearTypeCache(); _typeCacheDirty = false; }
+        }
+        try
+        {
+            if (_typeCache.TryGetValue(typeName, out var cached)) return cached;
+            var t = SearchDotNetType(typeName, out var cacheable);
+            if (t == null && !_probedSinceDirty)
+            {
+                // Miss: a PackageReference type whose assembly is present in the
+                // app base dir but not yet loaded. Probe once, then retry.
+                _probedSinceDirty = true;
+                ProbeLoadBaseDir();
+                t = SearchDotNetType(typeName, out cacheable);
+            }
+            if (t == null)
+                throw new LispErrorException(new LispError($"DOTNET: type not found: {typeName}"));
+            if (cacheable) _typeCache[typeName] = t;
+            return t;
+        }
+        finally { if (outer) _inTypeResolve = false; }
+    }
+
+    /// <summary>The actual type search: loaded assemblies, namespace-prefix load,
+    /// mscorlib/netstandard facades, COM ProgID, then dynamically-defined Lisp
+    /// types. Returns null (not throwing) on miss. CACHEABLE is false for a
+    /// dynamic Lisp type hit — those can be redefined, so they must not be
+    /// memoized.</summary>
+    private static Type? SearchDotNetType(string typeName, out bool cacheable)
+    {
+        cacheable = true;
         var type = Type.GetType(typeName);
         if (type != null) return type;
 
@@ -1026,9 +1153,12 @@ public static partial class Runtime
         // Fallback: case-insensitive lookup in dynamically-defined types (e.g. Lisp symbol
         // 'Animal uppercased to "ANIMAL" by reader, but dynamic type is named "Animal").
         if (_dotNetDynTypeByUpperName.TryGetValue(typeName, out var dynType))
+        {
+            cacheable = false;   // dynamic Lisp types can be redefined
             return dynType;
+        }
 
-        throw new LispErrorException(new LispError($"DOTNET: type not found: {typeName}"));
+        return null;
     }
 
     /// <summary>
@@ -1275,8 +1405,24 @@ public static partial class Runtime
 
         try
         {
-            return (System.Reflection.MethodInfo?)Type.DefaultBinder.SelectMethod(
+            var selected = (System.Reflection.MethodInfo?)Type.DefaultBinder.SelectMethod(
                 flags, candidates.ToArray(), argTypes, null);
+            // Don't cache a catch-all (object, ...) overload when a more-specific
+            // sibling of the same arity exists: the binder reached the object
+            // overload only by boxing an integer/pointer arg (e.g. it picks
+            // Marshal.ReadIntPtr(object,int) over (IntPtr,int) because Int64 boxes
+            // to object but has no implicit conversion to IntPtr). Defer so the
+            // specificity-aware path (TryInvokeMostSpecificOverload) selects the
+            // typed overload instead of reading/writing a boxed value.
+            if (selected != null)
+            {
+                int selObj = selected.GetParameters().Count(p => p.ParameterType == typeof(object));
+                if (selObj > 0 && candidates.Any(c =>
+                        !ReferenceEquals(c, selected) &&
+                        c.GetParameters().Count(p => p.ParameterType == typeof(object)) < selObj))
+                    return null;
+            }
+            return selected;
         }
         catch (System.Reflection.AmbiguousMatchException) { return null; }
     }
@@ -1325,6 +1471,69 @@ public static partial class Runtime
         }
     }
 
+    /// <summary>Pre-empt InvokeMember for the one case its default binder gets
+    /// wrong: when a same-arity catch-all <c>(object, ...)</c> overload coexists
+    /// with a fully-typed one, InvokeMember may box an integer/pointer arg to the
+    /// object overload — e.g. <c>Marshal.WriteIntPtr(object,int,IntPtr)</c> gets
+    /// picked over <c>(IntPtr,int,IntPtr)</c> and writes into a boxed value
+    /// instead of native memory (corrupting char** builds; dotcl/dotcl FFI
+    /// regression). Fires ONLY when an object-param overload is present AND a
+    /// 0-object-param overload exists that every arg marshals to; otherwise
+    /// returns false and the normal InvokeMember path runs unchanged. Runs after
+    /// the cache miss, so well-typed cacheable calls never reach it.</summary>
+    private static bool TryInvokeMostSpecificOverload(
+        Type type, string name, object? target, LispObject[] lispArgs, bool isStatic, out object? result)
+    {
+        result = null;
+        var flags = System.Reflection.BindingFlags.Public
+            | (isStatic ? System.Reflection.BindingFlags.Static : System.Reflection.BindingFlags.Instance);
+        List<System.Reflection.MethodInfo> cands = new();
+        bool sawObjectOverload = false;
+        foreach (var m in type.GetMethods(flags))
+        {
+            if (m.Name != name || m.IsGenericMethodDefinition) continue;
+            var ps = m.GetParameters();
+            if (ps.Length != lispArgs.Length) continue;
+            bool fixedArity = true;
+            bool hasObjectParam = false;
+            foreach (var p in ps)
+            {
+                if (p.ParameterType.IsByRef || System.Attribute.IsDefined(p, typeof(ParamArrayAttribute)))
+                { fixedArity = false; break; }
+                if (p.ParameterType == typeof(object)) hasObjectParam = true;
+            }
+            if (!fixedArity) continue;
+            if (hasObjectParam) sawObjectOverload = true;
+            cands.Add(m);
+        }
+        // Only intervene in the catch-all-ambiguity case; leave everything else to
+        // the binder so this stays a narrow, low-risk correction.
+        if (!sawObjectOverload || cands.Count < 2) return false;
+
+        foreach (var m in cands.OrderBy(mi => mi.GetParameters().Count(p => p.ParameterType == typeof(object))))
+        {
+            // Consider only fully-typed overloads; if none convert, defer to the
+            // normal path rather than forcing an object overload here.
+            if (m.GetParameters().Any(p => p.ParameterType == typeof(object))) break;
+            var ps = m.GetParameters();
+            var converted = new object?[ps.Length];
+            bool ok = true;
+            for (int i = 0; i < ps.Length; i++)
+            {
+                try { converted[i] = LispToDotNet(lispArgs[i], ps[i].ParameterType); }
+                catch { ok = false; break; }
+            }
+            if (!ok) continue;
+            try { result = m.Invoke(target, converted); return true; }
+            catch (System.Reflection.TargetInvocationException tie)
+            {
+                throw DotNetInvokeError($"DOTNET:{(isStatic ? "STATIC" : "INVOKE")} {type.Name}.{name}", tie);
+            }
+            catch (ArgumentException) { /* not this overload after all — try next typed one */ }
+        }
+        return false;
+    }
+
     /// <summary>Fallback for dotnet:invoke / dotnet:static when InvokeMember's
     /// default binder finds no overload, because it matches on the args' Lisp
     /// runtime types and can't see conversions like Lisp-list → T[] or
@@ -1352,10 +1561,25 @@ public static partial class Runtime
                 { ok = false; break; }
             if (ok) candidates.Add(m);
         }
-        // Prefer overloads with an array parameter (the case this enables).
+        // Order candidates by specificity so the fallback picks the intended
+        // overload, not a catch-all:
+        //   1. fewer System.Object parameters first — an obsolete (object, ...)
+        //      overload must lose to the typed one. e.g. Marshal.WriteIntPtr has
+        //      both (IntPtr,int,IntPtr) and (object,int,IntPtr); since a Lisp
+        //      integer marshals to object just as readily as to IntPtr, the object
+        //      overload would otherwise win by iteration order and write into a
+        //      boxed value instead of native memory (corrupting char** builds).
+        //   2. then prefer an array parameter (the list -> T[] case this enables).
+        int objParamCount(System.Reflection.MethodInfo m) =>
+            m.GetParameters().Count(p => p.ParameterType == typeof(object));
+        bool hasArrayParam(System.Reflection.MethodInfo m) =>
+            m.GetParameters().Any(p => p.ParameterType.IsArray);
         candidates.Sort((a, b) =>
-            (b.GetParameters().Any(p => p.ParameterType.IsArray) ? 1 : 0)
-          - (a.GetParameters().Any(p => p.ParameterType.IsArray) ? 1 : 0));
+        {
+            int byObj = objParamCount(a) - objParamCount(b);
+            if (byObj != 0) return byObj;
+            return (hasArrayParam(b) ? 1 : 0) - (hasArrayParam(a) ? 1 : 0);
+        });
 
         foreach (var m in candidates)
         {
@@ -1403,6 +1627,10 @@ public static partial class Runtime
         {
             if (TryCachedInvoke(type, memberName, null, callArgs, true, out var cached))
                 return DotNetToLisp(cached);
+            // Guard against InvokeMember binding an integer/pointer arg to a
+            // catch-all (object, ...) overload when a typed one exists.
+            if (TryInvokeMostSpecificOverload(type, memberName, null, args.Skip(2).ToArray(), true, out var spec))
+                return DotNetToLisp(spec);
             var result = type.InvokeMember(memberName, StaticReadFlags, null, null, callArgs);
             return DotNetToLisp(result);
         }

@@ -91,6 +91,27 @@ make install              # builds and installs the local nupkg as `dotcl`
 After the first cross-compile, dotcl can self-host: `DOTCL_LISP=dotcl
 make cross-compile` rebuilds the compiler using dotcl itself.
 
+#### Building on Windows
+
+You only need this if you are hacking on dotcl itself — to *use* dotcl,
+install the `dotcl` tool or grab a per-RID tarball above; no `make` or
+Roswell required.
+
+To build from source on Windows:
+
+- **`make`** — the build needs GNU Make. Git Bash (bundled with
+  [Git for Windows](https://gitforwindows.org/)) ships GNU Make and works;
+  run the commands above from a Git Bash prompt. WSL works too.
+- **Path translation** — run the build from Git Bash (`/c/...` paths) rather
+  than a shell that rewrites paths to Cygwin form (`/cygdrive/c/...`). The
+  Roswell/SBCL bootstrap reads the paths verbatim, so `/cygdrive/...` paths
+  it can't open surface as a `SB-INT:SIMPLE-FILE-ERROR` during
+  `make cross-compile`.
+- **`dotcl` not found after `make install`** — `make install` registers
+  `dotcl` as a .NET global tool under `~/.dotnet/tools`, which is on `PATH`
+  in PowerShell but often not in Git Bash. Add it there with
+  `export PATH="$HOME/.dotnet/tools:$PATH"` (or run `dotcl` from PowerShell).
+
 ## A GUI in five minutes
 
 A cross-platform desktop window from one plain Lisp file — no C# project,

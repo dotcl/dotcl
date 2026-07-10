@@ -237,6 +237,13 @@
   (let ((prev number))
     (dolist (x more t) (if (>= prev x) (setq prev x) (return nil)))))
 
+;; Attach 2-arg direct delegates to the comparison wrapper function objects
+;; just defined (#'< handed to SORT etc. — the funcall path). Compiled call
+;; sites already inline via compile-nary-comparison; this covers the
+;; function-object path with the same C# comparators the 2-arg wrapper
+;; bodies compile to (identical T/NIL results and type errors).
+(%attach-numeric-compare-fast-paths)
+
 ;;; ============================================================
 ;;; Sequence functions (list-specialized)
 ;;; ============================================================
@@ -1089,6 +1096,58 @@ Also expands element types within compound type specifiers like (VECTOR etype si
   (declare (ignore env))
   (%get-setf-expansion place))
 
+;;; ===== Generic atomic operations on arbitrary CL places =====
+;;;
+;;; dotcl:compare-and-swap / atomic-incf / atomic-decf. Lock-based (a single
+;;; global monitor) — correct among concurrent atomic operations, but NOT
+;;; lock-free. Because these expand through GET-SETF-EXPANSION, every place SETF
+;;; understands works uniformly: a special/lexical variable, CAR/CDR, SVREF/AREF,
+;;; GETHASH, SLOT-VALUE, a struct slot, etc. The place subforms are captured to
+;;; temporaries up front, so the read-compare-write runs under the lock on a
+;;; consistent snapshot. For a single 64-bit counter the lock-free
+;;; MAKE-ATOMIC-LONG primitive is the faster path.
+;;;
+;;; The DOTCL-package macro names are interned and registered at runtime rather
+;;; than written with dotcl:: reader syntax, because the SBCL cross-compile host
+;;; that reads this file has no DOTCL package — the same reason
+;;; without-package-locks is registered from C#. Helper functions and the lock
+;;; special variable stay unqualified (internal); only the user-facing macro
+;;; names need to live in DOTCL.
+(defvar *cas-lock* (%make-lock "dotcl-cas-global"))
+
+(defun %cas-expand (place old new)
+  (multiple-value-bind (temps vals stores setter getter) (get-setf-expansion place)
+    (let ((s (car stores)) (o (gensym "OLD")) (n (gensym "NEW")))
+      `(let* (,@(mapcar #'list temps vals) (,o ,old) (,n ,new))
+         (%acquire-lock *cas-lock* t)
+         (unwind-protect
+              (if (eq ,getter ,o) (let ((,s ,n)) ,setter t) nil)
+           (%release-lock *cas-lock*))))))
+
+(defun %atomic-delta-expand (place delta op)
+  (multiple-value-bind (temps vals stores setter getter) (get-setf-expansion place)
+    (let ((s (car stores)) (d (gensym "D")) (r (gensym "NEW")))
+      `(let* (,@(mapcar #'list temps vals) (,d ,delta))
+         (%acquire-lock *cas-lock* t)
+         (unwind-protect
+              (let* ((,r (,op ,getter ,d)) (,s ,r)) ,setter ,r)
+           (%release-lock *cas-lock*))))))
+
+(let ((cas  (intern "COMPARE-AND-SWAP" "DOTCL"))
+      (ainc (intern "ATOMIC-INCF" "DOTCL"))
+      (adec (intern "ATOMIC-DECF" "DOTCL"))
+      (pkg  (find-package "DOTCL")))
+  (%register-macro-function-rt cas
+    (lambda (form env) (declare (ignore env))
+      (%cas-expand (cadr form) (caddr form) (cadddr form))))
+  (%register-macro-function-rt ainc
+    (lambda (form env) (declare (ignore env))
+      (%atomic-delta-expand (cadr form) (if (cddr form) (caddr form) 1) '+)))
+  (%register-macro-function-rt adec
+    (lambda (form env) (declare (ignore env))
+      (%atomic-delta-expand (cadr form) (if (cddr form) (caddr form) 1) '-)))
+  (export (list cas ainc adec) pkg))
+
 ;;; --- Missing numeric functions ---
 
 (defun signum (n)
@@ -1114,7 +1173,45 @@ Also expands element types within compound type specifiers like (VECTOR etype si
 (defun scale-float (float integer)
   (* float (expt 2 integer)))
 
-(defun rationalize (x) (rational x))
+(defun %simplest-rational-between (lo hi)
+  "The smallest-denominator rational R with LO <= R <= HI, given 0 < LO <= HI.
+   Continued-fraction (Stern-Brocot) descent: the simplest rational in an interval
+   is either the smallest integer it contains, or FLOOR(LO) + 1/(simplest rational
+   in the reciprocal of the fractional interval)."
+  (labels ((simplest (lo hi)
+             (multiple-value-bind (fl rem) (floor lo)
+               (cond
+                 ((zerop rem) fl)                 ; LO is an integer — simplest possible
+                 ((< fl (floor hi)) (1+ fl))      ; integer FL+1 lies in (LO, HI]
+                 (t (+ fl (/ (simplest (/ (- hi fl)) (/ (- lo fl))))))))))
+    (simplest lo hi)))
+
+(defun rationalize (x)
+  "Return the SIMPLEST rational that rounds to X (CLHS): the smallest-denominator
+   rational within X's rounding interval — not RATIONAL's exact fraction. E.g.
+   (rationalize 3.2d0) => 16/5, (rationalize 0.1d0) => 1/10."
+  (cond
+    ((rationalp x) x)
+    ((floatp x)
+     (if (zerop x)
+         0
+         (multiple-value-bind (m e s) (integer-decode-float x)
+           ;; X's magnitude is M*2^E; the rounding interval is a half-ulp (2^(E-1))
+           ;; on each side. Find the simplest rational in it, then re-apply the sign.
+           (let* ((ulp (if (minusp e) (/ 1 (ash 1 (- e))) (ash 1 e)))
+                  (val (* m ulp))
+                  (half (/ ulp 2))
+                  ;; The float just below X has half the ulp when X sits on a
+                  ;; power-of-2 mantissa boundary (M minimal), so the lower rounding
+                  ;; boundary is half as far.
+                  (lower (if (= m (ash 1 (1- (float-precision x)))) (/ half 2) half))
+                  (cand (%simplest-rational-between (- val lower) (+ val half)))
+                  (r (if (minusp s) (- cand) cand)))
+             ;; The result must round back to X (CLHS). If a round-to-even boundary
+             ;; case let the interval's simplest rational land on a neighbor, fall
+             ;; back to the exact rational (which always rounds to X).
+             (if (= (float r x) x) r (rational x))))))
+    (t (rational x))))
 
 (defun conjugate (z)
   (if (complexp z)

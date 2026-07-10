@@ -56,19 +56,87 @@
   (let ((*concatenate-build* t))
     (compile-file input :output-file output)))
 
-(defvar *locals* '()
-  "Alist of (symbol . local-key). local-key is a keyword like :v1.")
+;;; ------------------------------------------------------------
+;;; define-compile-state — closure-boundary reset registry
+;;; ------------------------------------------------------------
+;;; compile-closure-body must rebind every per-compilation state variable to a
+;;; fresh value so an inner closure does not inherit the enclosing body's
+;;; compile context. Declaring such a variable with DEFINE-COMPILE-STATE
+;;; (instead of plain defvar) makes it participate in that reset
+;;; automatically. The registry is populated at LOAD time by the expansion's
+;;; %register-closure-fresh call (a runtime registration, not a compile-time
+;;; side effect): cross-compile's eval-when :compile-toplevel handling is
+;;; best-effort, but a load-time registry works identically in the
+;;; SBCL-hosted cross-compiler (source load populates it) and the self-hosted
+;;; compiler (the compiled registration call runs at load). Inherited state
+;;; (*specials*, *symbol-macros*, *global-specials*, ...) and config knobs
+;;; must stay plain defvar — they are intentionally NOT reset at closure
+;;; boundaries.
 
+(defvar *closure-fresh-state* '()
+  "Alist of (variable-symbol . fresh-init-value) rebound (via progv) around
+   every closure body compilation. Populated by define-compile-state.")
+
+(defun %register-closure-fresh (name fresh-value)
+  "Register NAME as closure-boundary-reset state with fresh value FRESH-VALUE.
+   Idempotent: re-registration replaces the existing entry (re-load safe)."
+  (let ((entry (assoc name *closure-fresh-state*)))
+    (if entry
+        (setf (cdr entry) fresh-value)
+        (push (cons name fresh-value) *closure-fresh-state*)))
+  name)
+
+(defmacro define-compile-state (name init &key (fresh-init nil fresh-init-p) doc)
+  "Declare a per-compilation special variable that automatically participates
+   in the closure-boundary reset: compile-closure-body rebinds it to
+   FRESH-INIT (default: INIT) for the dynamic extent of each closure body
+   compilation. DOC becomes the variable's documentation string."
+  `(progn
+     (defvar ,name ,init ,@(when doc (list doc)))
+     (%register-closure-fresh ',name ,(if fresh-init-p fresh-init init))))
+
+(defun call-with-fresh-closure-state (overrides thunk)
+  "Call THUNK with every variable in *closure-fresh-state* dynamically rebound
+   (progv) to its registered fresh value — the closure-boundary reset.
+   OVERRIDES is an alist ((variable . value) ...): an override wins over the
+   registered fresh value, and an override for a variable NOT in the registry
+   is bound as well (used for state whose fresh value is computed per call,
+   e.g. *notinline-functions*). Bindings have dynamic extent, exactly like
+   the special let* bindings this replaces; progv only runs on the compile
+   path, so the per-binding cost is irrelevant."
+  (let ((vars '())
+        (vals '()))
+    (dolist (entry *closure-fresh-state*)
+      (let ((ov (assoc (car entry) overrides)))
+        (push (car entry) vars)
+        (push (if ov (cdr ov) (cdr entry)) vals)))
+    (dolist (ov overrides)
+      (unless (assoc (car ov) *closure-fresh-state*)
+        (push (car ov) vars)
+        (push (cdr ov) vals)))
+    (progv vars vals
+      (funcall thunk))))
+
+(define-compile-state *locals* '()
+  :doc "Alist of (symbol . local-key). local-key is a keyword like :v1.")
+
+;; Counters for gen-local / gen-label. Under concurrent eval the plain incf can
+;; race (lost update), but this is benign: the generated names are only ever
+;; method-scoped locals/labels, and each concurrent compile emits an independent
+;; method, so a duplicated V_n / L_n in two different methods never collides.
+;; intern is idempotent and the package table is concurrency-safe, so no shared
+;; state is corrupted. Left as plain incf to avoid per-gensym atomic overhead on
+;; the hot compile path.
 (defvar *var-counter* 0)
 
 (defvar *label-counter* 0)
 
-(defvar *block-tags* '()
-  "Alist of (block-name . (tag-key . result-key)).
+(define-compile-state *block-tags* '()
+  :doc "Alist of (block-name . (tag-key . result-key)).
    tag-key is a keyword for the tag object, result-key for the result local.")
 
-(defvar *go-tags* '()
-  "Alist of (tag-symbol . (tagbody-id-key . integer-label)).")
+(define-compile-state *go-tags* '()
+  :doc "Alist of (tag-symbol . (tagbody-id-key . integer-label)).")
 
 (defvar *specials* '()
   "List of symbols known to be special (both global and locally declared).")
@@ -78,12 +146,14 @@
    Used to determine binding classification: only global specials force nested let bindings
    to be dynamic. Locally-declared specials (declare (special x)) only affect references.")
 
-(defvar *boxed-vars* '()
-  "Set of variable names (symbols) that need boxing (mutated + captured).")
+(define-compile-state *boxed-vars* '()
+  :doc "Set of variable names (symbols) that need boxing (mutated + captured).")
 
 
-(defvar *macros* (make-hash-table :test #'eq)
+(defvar *macros* (make-hash-table :test #'eq :synchronized t)
   "Global macro table: symbol → macro-expander-function.
+   :synchronized so concurrent eval (dotcl:set-parallel-eval) cannot corrupt the
+   table during a rehash-while-write; overhead is compile-time only.
    Keyed by symbol identity (not name string).
    Not reset by compile-toplevel (defmacro has global effect).")
 
@@ -93,8 +163,8 @@
    Used by fixnum-typed-p to recognize `(name args...)` as statically
    fixnum-typed, which then enables native int64 paths in arithmetic.")
 
-(defvar *local-functions* '()
-  "Alist of (name-string local-key boxed-p).
+(define-compile-state *local-functions* '()
+  :doc "Alist of (name-string local-key boxed-p).
    For flet: local-key is a keyword for a LispObject local holding the function.
    For labels: boxed-p is T, local-key is a keyword for a LispObject[] box.")
 
@@ -189,13 +259,135 @@
       (funcall expander form)))
 
 ;;; TCO (Tail Call Optimization) state — declared here so all compiler files see them as special.
-;;; (cil-forms.lisp re-declares them with documentation strings; that is fine in CL.)
-(defvar *tco-self-name* nil)
-(defvar *tco-loop-label* nil)
-(defvar *tco-param-entries* nil)
-(defvar *in-tail-position* nil)
-(defvar *in-finally-block* nil)
-(defvar *self-fn-local* nil)
+(define-compile-state *tco-self-name* nil
+  :doc "Mangled name of function currently being compiled for self-TCO. NIL = disabled.")
+(define-compile-state *tco-loop-label* nil
+  :doc "Label name to branch back to for TCO self-call.")
+(define-compile-state *tco-param-entries* nil
+  :doc "List of (key . boxed-p) in param order, for rewriting TCO self-call args.
+   key = gen-local string; boxed-p = T if the local is a LispObject[] box.")
+(define-compile-state *in-tail-position* nil
+  :fresh-init t
+  :doc "T when the currently-being-compiled expression is in tail position
+   within the TCO scope. Reset to NIL at function entry; compile-progn
+   and compile-if set it appropriately. Closure-boundary fresh value is T:
+   a closure body's last form is in tail position (MV propagation).")
+(define-compile-state *in-finally-block* nil
+  :doc "T while compiling unwind-protect cleanup forms. return-from / go
+   inside a finally region cannot use `leave` to a label outside it — they
+   take the exception (throw) path instead. Reset at closure boundaries: a
+   closure body is a separate CLR method, never inside the outer finally
+   region, so its own block/tagbody exits may use the local leave path.")
+(define-compile-state *self-fn-local* nil
+  :doc "When set, name of the local variable holding the current function's own
+   LispFunction object. compile-named-call uses this instead of doing a full
+   load-sym-pkg / GetFunctionBySymbol sequence for non-tail self-calls.
+   Must be cleared at closure boundaries — it refers to a local declared in
+   the OUTER method.")
+
+;;; --- Per-compilation dynamic state ---
+(define-compile-state *tco-self-symbol* nil
+  :doc "Original symbol of function currently being compiled for self-TCO.
+   NIL = fall back to mangled-name string comparison against *tco-self-name*.
+   Used by compile-named-call for symbol-identity self-call matching (avoids
+   cross-package false matches like uiop/os:getenv vs dotcl:getenv). Must be
+   reset at closure boundaries and rebound per labels function: a stale outer
+   defun's symbol makes a tail call to that OUTER defun inside an inner named
+   function match as a SELF call and branch to the inner TCO loop.")
+(define-compile-state *tco-local-fn-key* nil
+  :doc "Box key (gen-local string) of the labels function currently being compiled
+   for self-TCO, or NIL if compiling a defun. Allows compile-named-call to
+   permit self-TCO despite the function name appearing in *local-functions*.")
+(define-compile-state *tco-leave-instrs* nil
+  :doc "List of CIL instructions to emit BEFORE the TCO branch (br or leave).
+   Used when the TCO site is inside a try block that requires explicit cleanup
+   before branching back (e.g. handler-case must call HandlerClusterStack.PopCluster
+   before leaving the catch-protected region). NIL for ordinary TCO.")
+(define-compile-state *tco-in-try-catch* nil
+  :doc "T when the current TCO site is inside a handler-case try/catch body (not
+   a try/finally). In this case, TCO uses `leave` to exit the protected region
+   instead of `br`. Distinct from *in-try-block* which signals try/finally
+   (special-variable LET / unwind-protect) and always suppresses TCO.")
+
+(define-compile-state *labels-mutual-tco* nil
+  :doc "Dispatch table for labels mutual TCO. Each entry:
+   (name-str fn-index which-fn-key tcoloop-label shared-param-keys).
+   NIL outside a mutual-TCO labels group. Reset to NIL in every
+   compile-function-body-*/compile-closure-body so closures compiled
+   within the group never emit br-to-outer-TCOLOOP.")
+
+(define-compile-state *in-try-block* nil
+  :doc "Non-NIL when the currently-being-compiled expression is inside a try/
+   finally region whose finally must run on exit (e.g. special-variable
+   LET, UNWIND-PROTECT). TCO branches (`br` to the loop label) cannot
+   legally cross such a region — IL requires `leave`, which this compiler
+   does not yet emit for tail-recursion. Suppressing TCO via this flag
+   avoids invalid IL while keeping MV propagation intact. Reset at closure
+   boundaries: a closure body is a separate CLR method, never inside the
+   outer try region, so its own TCO branches need no suppression.")
+
+(defvar *fixnum-locals* '()
+  "List of symbol-name strings for lexical locals declared (fixnum X) /
+   (type fixnum X) / (type (integer LO HI) X) with bounded fixnum range.
+   compile-as-long treats references to these as int64 unbox sites, and
+   fixnum-typed-p reports them as fixnum. Values are boxed LispObject at
+   the slot; unboxing happens inline in compile-as-long (castclass Fixnum
+   + get_Value). Caller-side guarantee: the user's declaration contract.")
+
+(defvar *small-int-locals* '()
+  "Alist (name-string . (LO . HI)) for lexical locals whose value is statically
+   known to lie in the inclusive int64 range [LO,HI]. Two sources: bounded
+   integer type declarations ((signed-byte N) / (unsigned-byte N) / bit /
+   (integer c c)) and let-binding init range inference (compile-let). Like
+   *fixnum-locals* the slot holds a boxed LispObject (a Fixnum, since the range
+   fits int64), so compile-as-long unboxes inline. Unlike *fixnum-locals* the
+   tracked range is TIGHT, which is what lets expr-int-range prove a product
+   stays in int64 and emit native arithmetic; an overflowing product instead
+   falls back to the promoting path and yields a bignum (CL-compliant). Mutated
+   locals are excluded — a setf could move the value out of [LO,HI].")
+
+(defvar *double-float-locals* '()
+  "Like *fixnum-locals* but for double-float declarations. Enables native
+   r8 arithmetic on (declare (double-float x)) locals and references.")
+
+(defvar *single-float-locals* '()
+  "Like *double-float-locals* but for single-float declarations. Enables native
+   r4 arithmetic on (declare (single-float x)) locals and references.")
+
+(define-compile-state *long-locals* '()
+  :doc "List of symbol-name strings whose local slots hold Int64 directly (not boxed
+   LispObject). Set in native function bodies where params are long-typed.
+   compile-as-long skips :unbox-fixnum for these; fixnum-typed-p returns T.")
+
+(defvar *native-double-locals* '()
+  "List of symbol-name strings whose local slots hold a native r8 (double)
+   directly, not a boxed DoubleFloat — the float analog of *long-locals*. Set by
+   compile-let for double-float-declared, non-special, non-captured lexicals
+   with a double-typed init. compile-as-double loads the slot raw (no
+   unbox-double); compile-var-ref boxes on a generic read; compile-setq stores
+   the raw double. This removes the per-setq DoubleFloat box in numeric loops
+   (fft/mandelbrot's tr/ti/ur/ui accumulators). A name here is also in
+   *double-float-locals*, so double-float-typed-p still reports it double.")
+
+(defvar *native-single-locals* '()
+  "Like *native-double-locals* but for single-float locals (native r4 slot).")
+
+(define-compile-state *numeric-array-locals* '()
+  :doc "Alist (NAME-STRING KEY RANK LO . HI) of let locals proven to hold a
+   numeric-backed array (make-array init with bounded-integer element type).
+   aref on them reads/writes elements as raw int64 (Runtime.ArefNum*L) and
+   contributes the storage range to expr-int-range. KEY pins the binding —
+   consumers verify (lookup-local NAME) still resolves to it.")
+
+(define-compile-state *native-self-name* nil
+  :doc "Mangled name of the current function if it is native-eligible (all fixnum params
+   + fixnum return, no captures, no specials). Enables native self-call path
+   in compile-as-long and native TCO arg evaluation.")
+
+(defvar *compile-time-flet-defs* nil
+  "List of flet function source definitions active during compilation.
+   Each entry is (name lambda-list . body). Used by compile-defmacro
+   to make flet-local functions available during compile-time eval.")
 
 ;;; ============================================================
 ;;; Utilities
@@ -604,7 +796,12 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
             (if (and (boundp '*long-locals*) *long-locals*
                      (member (var-name sym) *long-locals* :test #'string=))
                 `((:ldloc ,key) (:call "Fixnum.Make"))
-                `((:ldloc ,key))))
+                ;; Native float slot: the raw r8/r4 needs boxing for a generic
+                ;; (LispObject) read; native float contexts use compile-as-*.
+                (case (float-native-local-kind sym)
+                  (:double `((:ldloc ,key) (:newobj "DoubleFloat")))
+                  (:single `((:ldloc ,key) (:newobj "SingleFloat")))
+                  (t `((:ldloc ,key))))))
         ;; No local binding — check symbol-macro (let/let* shadow these too)
         (multiple-value-bind (sm-exp found) (lookup-symbol-macro sym)
           (if found
@@ -680,6 +877,29 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
 
 (defvar *compile-depth* 0)
 
+
+(defun %reify-macro-environment ()
+  "Reify the compiler's current lexical macro / symbol-macro scope into the
+   (macros-ht . symbol-macros-ht) environment object that macroexpand-1 and
+   macroexpand read (see the MACROEXPAND-1 runtime). Macro expanders built by
+   defmacro/macrolet call this to supply &environment, so a macro can
+   macroexpand-1 a symbol-macro that is lexically in scope at the call site —
+   e.g. serapeum with-boolean's %all-branches% channel (#473). *macros* is
+   already a hash table; the symbol-macro side is keyed by symbol-name.
+   Returns NIL when no lexical symbol-macro is in scope (top-level / the common
+   case), so a macro's (if env ...) still reads a null environment there — only
+   a real symbol-macrolet scope produces a non-NIL reified env."
+  (when *symbol-macros*
+    (cons *macros*
+          (let ((ht (make-hash-table :test #'equal)))
+            ;; *symbol-macros* is innermost-first (compile-symbol-macrolet prepends
+            ;; new bindings), so on nested same-name symbol-macrolet the FIRST entry
+            ;; seen is the innermost — keep it and skip later (outer) shadows, matching
+            ;; the assoc-based lookup the compiler uses internally (nested case).
+            (dolist (entry *symbol-macros* ht)
+              (let ((k (symbol-name (car entry))))
+                (unless (nth-value 1 (gethash k ht))
+                  (setf (gethash k ht) (cdr entry)))))))))
 
 (defun find-macro-expander (sym)
   "Find macro expander for SYM by symbol identity.
@@ -1092,6 +1312,36 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
                  ((range-fits-int64-p r) (cons +int64-min+ +int64-max+))
                  (t nil)))))))
 
+(defun %float-storage-kind (spec)
+  "Float backing kind keyword for element-type SPEC, mirroring the runtime
+   NumKindForElementType (single/short-float→float[]=:single,
+   double/long-float→double[]=:double), or NIL when SPEC is not a float type."
+  (cond ((member spec '(single-float short-float)) :single)
+        ((member spec '(double-float long-float)) :double)
+        (t nil)))
+
+(defun %array-type-float-kind-and-rank (type)
+  "For an array type specifier (simple-array ELT DIMS) / (array ELT DIMS) /
+   (vector ELT ...) with a float ELT and statically-known rank 1-3, return
+   (KIND . RANK) where KIND is :single/:double; else NIL. DIMS must be a list
+   of integers/* (its length is the rank) — an unspecified rank (* or missing)
+   is rejected. This is what lets an aref on a float-array-typed PARAMETER,
+   e.g. (simple-array single-float (1025)), ride the native r8 path."
+  (and (consp type)
+       (let ((head (car type)))
+         (cond
+           ((member head '(simple-array array))
+            (let ((kind (%float-storage-kind (cadr type)))
+                  (dims (and (cddr type) (caddr type))))
+              (and kind (consp dims)
+                   (every (lambda (d) (or (eq d '*) (integerp d))) dims)
+                   (<= 1 (length dims) 3)
+                   (cons kind (length dims)))))
+           ((eq head 'vector)
+            (let ((kind (%float-storage-kind (cadr type))))
+              (and kind (cons kind 1))))
+           (t nil)))))
+
 (defun %make-array-static-rank (dims)
   "Statically-known rank of a make-array DIMS argument form, or NIL.
    A bare fixnum-typed variable is rank 1 (an integer dimension), a (list ...)
@@ -1133,17 +1383,27 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
                                (setf ok nil)))))
                       (setf tail (cddr tail)))))
          (and ok rank (<= 1 rank 3) spec
-              (let ((r (%numeric-storage-range spec)))
-                (and r (cons rank r)))))))
+              (let ((fk (%float-storage-kind spec)))
+                (if fk
+                    ;; Float backing: info tail is (RANK . :single/:double) — an
+                    ;; atom cdr distinguishes it from the integer (RANK LO . HI).
+                    (cons rank fk)
+                    (let ((r (%numeric-storage-range spec)))
+                      (and r (cons rank r)))))))))
 
 (defun infer-numeric-array-bindings (binding-info mutated outer)
   "Numeric-array environment for a let/let* body: start from OUTER, drop
    every name this let binds (shadowing), then add (NAME KEY RANK LO . HI)
-   for each plain lexical, non-mutated binding whose init is a recognizable
-   numeric make-array. KEY pins the binding: a consumer only trusts the entry
-   while (lookup-local NAME) still resolves to it (a closure body re-keys its
-   captured vars, so stale entries self-invalidate). Mutated bindings are
-   excluded — a setq could install an array with different backing."
+   (or (NAME KEY RANK . :single/:double) for float backing) for each plain
+   lexical, non-mutated binding whose init is a recognizable numeric make-array
+   — OR whose init is a bare reference to an array local already proven numeric
+   (copy propagation, e.g. the Gabriel fft's (prog ((ar areal)) ...) that
+   aliases a (simple-array single-float (1025)) parameter). KEY pins the
+   binding: a consumer only trusts the entry while (lookup-local NAME) still
+   resolves to it (a closure body re-keys its captured vars, so stale entries
+   self-invalidate). Mutated bindings are excluded — a setq could install an
+   array with different backing; a mutated SOURCE alias is likewise not
+   propagated."
   (let* ((bound-names (mapcar (lambda (b) (var-name (first b))) binding-info))
          (result (remove-if (lambda (e) (member (car e) bound-names :test #'string=))
                             outer)))
@@ -1152,14 +1412,22 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
         (when (and (not is-special)
                    init
                    (not (member (var-name var) mutated :test #'string=)))
-          (let ((info (%make-array-numeric-info init)))
+          (let ((info (or (%make-array-numeric-info init)
+                          ;; copy propagation: init is a plain var already known
+                          ;; numeric-backed and itself not mutated → same backing.
+                          (and (symbolp init)
+                               (not (member (var-name init) mutated :test #'string=))
+                               (let ((src (assoc (var-name init) result :test #'string=)))
+                                 (and src (cddr src)))))))
             (when info
               (push (list* (var-name var) key info) result))))))
     result))
 
-(defun numeric-array-aref-info (expr)
+(defun numeric-array-aref-entry (expr)
   "If EXPR is (aref V IDX...) on a proven numeric-backed local with matching
-   rank and fixnum-typed indices, return (RANK LO . HI); else NIL."
+   rank and fixnum-typed indices, return the info tail: (RANK LO . HI) for
+   integer backing, or (RANK . :single/:double) for float backing; else NIL.
+   numeric-array-aref-info / -float-kind split this by backing."
   (and (consp expr)
        (eq (car expr) 'aref)
        (not (assoc (mangle-name 'aref) *local-functions* :test #'string=))
@@ -1175,6 +1443,18 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
               (= (length idxs) (third entry))
               (every #'fixnum-typed-p idxs)
               (cddr entry)))))
+
+(defun numeric-array-aref-info (expr)
+  "Integer-backed aref only: (RANK LO . HI), else NIL. The (cdr info) is a
+   (LO . HI) cons for integer backing but a keyword for float backing, so
+   gating on a cons cdr excludes float arrays (which must not read raw longs)."
+  (let ((info (numeric-array-aref-entry expr)))
+    (and info (consp (cdr info)) info)))
+
+(defun numeric-array-aref-float-kind (expr)
+  "Float-backed aref only: :single / :double storage kind, else NIL."
+  (let ((info (numeric-array-aref-entry expr)))
+    (and info (keywordp (cdr info)) (cdr info))))
 
 (defun integer-type-range (type)
   "Inclusive (LO . HI) for a bounded integer TYPE specifier, or NIL if TYPE is
@@ -1581,6 +1861,9 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
   (cond
     ;; Literal double-float constant — unambiguous (the object is a double).
     ((typep expr 'double-float) t)
+    ;; aref on a proven double-float-backed array local — the element is a
+    ;; double, readable as a native r8 (Runtime.ArefNum*D).
+    ((eq (numeric-array-aref-float-kind expr) :double) t)
     ((and (symbolp expr)
           (boundp '*double-float-locals*)
           (member (var-name expr) *double-float-locals* :test #'string=)
@@ -1603,16 +1886,58 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
      t)
     (t nil)))
 
+(defun float-native-local-kind (sym)
+  "If SYM is a lexical local whose slot holds a native float (r8/r4) directly
+   rather than a boxed DoubleFloat/SingleFloat, return :double / :single; else
+   NIL. Gated (like *long-locals*) on a live lexical binding and non-boxed
+   (captured vars keep the boxed slot, since env capture stores an object)."
+  (and (symbolp sym)
+       (not (boxed-var-p sym))
+       (lookup-local sym)
+       (cond
+         ((and (boundp '*native-double-locals*)
+               (member (var-name sym) *native-double-locals* :test #'string=))
+          :double)
+         ((and (boundp '*native-single-locals*)
+               (member (var-name sym) *native-single-locals* :test #'string=))
+          :single)
+         (t nil))))
+
+(defun compile-float-native-value (expr kind)
+  "Compile EXPR leaving a native r8 (KIND :double) or r4 (KIND :single) on the
+   stack, for storing into a native float slot. A float-typed EXPR lowers via
+   compile-as-double/single (no box); anything else is compiled generically and
+   unboxed — the slot's declaration promises a float, so a non-float value
+   surfaces as a loud InvalidCast (matching the *long-locals* store contract)."
+  (ecase kind
+    (:double (if (double-float-typed-p expr)
+                 (compile-as-double expr)
+                 `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
+                       (compile-expr expr))
+                   (:unbox-double))))
+    (:single (if (single-float-typed-p expr)
+                 (compile-as-single expr)
+                 `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
+                       (compile-expr expr))
+                   (:unbox-single))))))
+
 (defun compile-as-double (expr)
   "Compile EXPR leaving a native r8 (double) on the stack.
    Caller must have verified double-float-typed-p."
   (cond
+    ;; Native r8 slot (double-rep local): the raw double is already in the slot.
+    ((eq (float-native-local-kind expr) :double)
+     `((:ldloc ,(lookup-local expr))))
     ((and (symbolp expr)
           (boundp '*double-float-locals*)
           (member (var-name expr) *double-float-locals* :test #'string=)
           (lookup-local expr))
      `((:ldloc ,(lookup-local expr))
        (:unbox-double)))
+    ;; aref on a double-float-backed array local → raw r8 read, no box.
+    ((eq (numeric-array-aref-float-kind expr) :double)
+     (compile-numeric-aref-float (cadr expr) (cddr expr)
+                                 (car (numeric-array-aref-entry expr))))
     ((and (consp expr) (eq (car expr) 'the))
      `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
            (compile-expr (caddr expr)))
@@ -1667,6 +1992,9 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
   (cond
     ;; Literal single-float constant — unambiguous (the object is a single).
     ((typep expr 'single-float) t)
+    ;; aref on a proven single-float-backed array local — element is a single,
+    ;; readable via Runtime.ArefNum*D (double) narrowed back with conv.r4.
+    ((eq (numeric-array-aref-float-kind expr) :single) t)
     ((and (symbolp expr)
           (boundp '*single-float-locals*)
           (member (var-name expr) *single-float-locals* :test #'string=)
@@ -1693,12 +2021,21 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
   "Compile EXPR leaving a native r4 (float) on the stack.
    Caller must have verified single-float-typed-p."
   (cond
+    ;; Native r4 slot (single-rep local): the raw float is already in the slot.
+    ((eq (float-native-local-kind expr) :single)
+     `((:ldloc ,(lookup-local expr))))
     ((and (symbolp expr)
           (boundp '*single-float-locals*)
           (member (var-name expr) *single-float-locals* :test #'string=)
           (lookup-local expr))
      `((:ldloc ,(lookup-local expr))
        (:unbox-single)))
+    ;; aref on a single-float-backed array local → raw r8 read (widened float),
+    ;; narrowed back to r4 with conv.r4 (exact for single-float values).
+    ((eq (numeric-array-aref-float-kind expr) :single)
+     `(,@(compile-numeric-aref-float (cadr expr) (cddr expr)
+                                     (car (numeric-array-aref-entry expr)))
+       (:conv-r4)))
     ((and (consp expr) (eq (car expr) 'the))
      `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
            (compile-expr (caddr expr)))
@@ -2084,6 +2421,71 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
             (:ldloc ,val-tmp)
             (:call ,method)
             (:call "Fixnum.Make"))))))
+
+(defun compile-numeric-aref-float (arr idxs rank)
+  "Emit (aref ARR IDX...) on a proven float-backed numeric local as a native
+   r8 (double) on the stack (Runtime.ArefNum*D). Mirrors
+   compile-numeric-aref-as-long but leaves a raw double and never boxes.
+   single-float backing widens to double here; callers narrow with conv.r4."
+  (let ((method (ecase rank
+                  (1 "Runtime.ArefNumD")
+                  (2 "Runtime.ArefNum2DD")
+                  (3 "Runtime.ArefNum3DD"))))
+    (if (every #'simple-expr-p idxs)
+        `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
+              (compile-expr arr))
+          ,@(loop for idx in idxs append (compile-expr-to-long idx))
+          (:call ,method))
+        (let ((idx-tmps (mapcar (lambda (i) (declare (ignore i)) (gen-local "NAI"))
+                                idxs)))
+          `(,@(mapcar (lambda (tk) `(:declare-local ,tk "Int64")) idx-tmps)
+            ,@(loop for idx in idxs
+                    for tk in idx-tmps
+                    append `(,@(compile-expr-to-long idx) (:stloc ,tk)))
+            ,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
+                (compile-expr arr))
+            ,@(mapcar (lambda (tk) `(:ldloc ,tk)) idx-tmps)
+            (:call ,method))))))
+
+(defun compile-numeric-aref-set-float (arr idxs val rank kind)
+  "Emit (setf (aref ARR IDX...) VAL) on a float-backed numeric local. VAL is
+   lowered to a native r8 (single-typed values widen with conv.r8) and stored
+   via Runtime.ArefSetNum*D (narrows to float for single backing). Leaves the
+   value BOXED for the setf contract; peephole removes it in statement position."
+  (let ((method (ecase rank
+                  (1 "Runtime.ArefSetNumD")
+                  (2 "Runtime.ArefSetNum2DD")
+                  (3 "Runtime.ArefSetNum3DD")))
+        (box (ecase kind
+               (:single '((:conv-r4) (:newobj "SingleFloat")))
+               (:double '((:newobj "DoubleFloat"))))))
+    (flet ((val-as-double ()
+             (if (eq kind :single)
+                 `(,@(compile-as-single val) (:conv-r8))
+                 (compile-as-double val))))
+      (if (and (every #'simple-expr-p idxs) (simple-expr-p val))
+          `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
+                (compile-expr arr))
+            ,@(loop for idx in idxs append (compile-expr-to-long idx))
+            ,@(val-as-double)
+            (:call ,method)
+            ,@box)
+          (let ((idx-tmps (mapcar (lambda (i) (declare (ignore i)) (gen-local "NAI"))
+                                  idxs))
+                (val-tmp (gen-local "NAV")))
+            `(,@(mapcar (lambda (tk) `(:declare-local ,tk "Int64")) idx-tmps)
+              (:declare-local ,val-tmp "Double")
+              ,@(loop for idx in idxs
+                      for tk in idx-tmps
+                      append `(,@(compile-expr-to-long idx) (:stloc ,tk)))
+              ,@(val-as-double)
+              (:stloc ,val-tmp)
+              ,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
+                  (compile-expr arr))
+              ,@(mapcar (lambda (tk) `(:ldloc ,tk)) idx-tmps)
+              (:ldloc ,val-tmp)
+              (:call ,method)
+              ,@box))))))
 
 (defun compile-list-call (args)
   (if (null args)

@@ -95,7 +95,7 @@ jobs:
 
       # ── R2R (ReadyToRun) FASL artifacts ──────────────────────────────────
       # crossgen2 the core / asdf / contrib fasls per RID so the tbz distribution
-      # ships pre-native FASLs (cold RunCore ~3.37s → ~50ms, D704). crossgen2
+      # ships pre-native FASLs (cold RunCore ~3.37s → ~50ms). crossgen2
       # cross-compiles from the ubuntu host for every target RID. Runs before the
       # contrib staging below so the <name>-r2r-<rid>.fasl land in runtime/contrib.
       - name: Compile R2R FASLs (per RID)
@@ -146,6 +146,36 @@ jobs:
             echo " project-core build would fail with MSB4036 for consumers."
             exit 1
           fi
+
+      # ── Per-RID R2R tool nupkg (dotcl.<rid>) ─────────────────────────────
+      # dotnet pack -r <rid> on the PackAsTool project emits a DotnetToolRidPackage
+      # named dotcl.<rid>; `dotnet tool install -g dotcl` then auto-selects the
+      # host's RID package. PublishReadyToRun=true + the staged per-RID R2R core /
+      # asdf (overlaid by the csproj's ReplaceFaslsWithR2R after publish) give the
+      # fast (~0.16s) cold start. The produced nupkgs ride the out/*.nupkg upload
+      # below and are pushed by nuget-publish.yml unchanged.
+      - name: Pack per-RID R2R tool nupkgs
+        run: |
+          VER=${{ steps.version.outputs.VERSION }}
+          mkdir -p out
+          # Each RID package carries only its own R2R asdf (injected via the
+          # top-level asdf-r2r-<rid>.fasl staged per RID below); strip the
+          # cross-RID copies the contrib/** glob would bundle into every package
+          # (~9 MB). tbz reads asdf from the source contrib/ tree, so this is
+          # harmless to the tbz step that follows.
+          rm -f runtime/contrib/asdf/asdf-r2r-*.fasl
+          for rid in win-x64 win-arm64 linux-x64 linux-arm64 osx-x64 osx-arm64; do
+            echo "=== pack dotcl.$rid (R2R) ==="
+            cp compiler/dotcl-r2r-$rid.core runtime/dotcl-r2r-$rid.core
+            cp contrib/asdf/asdf-r2r-$rid.fasl runtime/asdf-r2r-$rid.fasl
+            dotnet pack runtime/runtime.csproj \
+              --configuration Release \
+              -o out/ \
+              -p:Version=$VER \
+              -p:RuntimeIdentifier=$rid \
+              -p:PublishReadyToRun=true
+            rm -f runtime/dotcl-r2r-$rid.core runtime/asdf-r2r-$rid.fasl
+          done
 
       # ── Per-RID tbz for Roswell (R2R) ────────────────────────────────────
       # dotnet publish -r <rid> --self-contained false cross-compiles on Linux

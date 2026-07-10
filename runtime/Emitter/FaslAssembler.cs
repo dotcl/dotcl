@@ -95,6 +95,22 @@ public class FaslAssembler
         return result;
     }
 
+#if NET9_0_OR_GREATER
+    /// <summary>Map an arbitrary module name onto characters valid in an
+    /// AssemblyName simple-name. Anything outside [A-Za-z0-9_.-] (which includes
+    /// the '=' / ',' the AssemblyName parser reserves) becomes '_'. Uniqueness
+    /// is preserved by the caller's guid suffix, so collisions from the mapping
+    /// don't matter.</summary>
+    private static string SanitizeModuleName(string name)
+    {
+        if (string.IsNullOrEmpty(name)) return "M";
+        var sb = new System.Text.StringBuilder(name.Length);
+        foreach (var ch in name)
+            sb.Append(char.IsLetterOrDigit(ch) || ch == '_' || ch == '.' || ch == '-' ? ch : '_');
+        return sb.ToString();
+    }
+#endif
+
     public FaslAssembler(string moduleName)
     {
 #if !NET9_0_OR_GREATER
@@ -102,6 +118,14 @@ public class FaslAssembler
             "FASL emission (compile-file) requires .NET 9+ (PersistedAssemblyBuilder); " +
             "this runtime build runs precompiled .fasl only");
 #else
+        // An AssemblyName simple-name rejects characters the parser reads as
+        // attribute syntax (e.g. '=' and ',' from "name=value, ..."), so a source
+        // file whose basename contains one — e.g. serapeum's vector=.lisp, giving
+        // module name "vector=_<guid>" — made new AssemblyName throw "The given
+        // assembly name was invalid.". The module name is only an internal
+        // assembly / LTV-namespace identifier (a guid suffix keeps it unique), so
+        // replacing the offending characters is lossless in practice.
+        moduleName = SanitizeModuleName(moduleName);
         _ab = new PersistedAssemblyBuilder(
             new AssemblyName(moduleName), typeof(object).Assembly);
         _mb = _ab.DefineDynamicModule(moduleName);

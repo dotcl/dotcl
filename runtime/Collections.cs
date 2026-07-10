@@ -105,11 +105,11 @@ public class LispVector : LispObject
     // 16) = 8MB of ushort vs 32MB of object references), removes the GC write
     // barrier per store and the Fixnum object per element. _numKind selects the
     // concrete array type of _numData.
-    internal Array? _numData;   // byte[] | ushort[] | int[] | long[] per _numKind
+    internal Array? _numData;   // byte[] | ushort[] | int[] | long[] | float[] | double[] per _numKind
     internal int _numLen;       // _numData.Length (Array.Length on the abstract
                                 // static type is a runtime call, not ldlen — hot
                                 // aref paths bounds-check against this instead)
-    internal byte _numKind;    // 0=none 1=u8 2=u16 3=i32 4=i64
+    internal byte _numKind;    // 0=none 1=u8 2=u16 3=i32 4=i64 5=f4(float[]) 6=f8(double[])
 
     // Element type: "T" (general), "CHARACTER"/"BASE-CHAR"/"STANDARD-CHAR" (string-like), "NIL" (bit vector of nil), etc.
     public string ElementTypeName { get; private set; } = "T";
@@ -121,6 +121,8 @@ public class LispVector : LispObject
     internal static byte NumKindForElementType(string et)
     {
         if (et == "FIXNUM") return 4;
+        if (et == "SINGLE-FLOAT") return 5;
+        if (et == "DOUBLE-FLOAT") return 6;
         const string ub = "UNSIGNED-BYTE-";
         const string sb = "SIGNED-BYTE-";
         if (et.StartsWith(ub, StringComparison.Ordinal)
@@ -141,9 +143,16 @@ public class LispVector : LispObject
             1 => new byte[size],
             2 => new ushort[size],
             3 => new int[size],
-            _ => new long[size],
+            4 => new long[size],
+            5 => new float[size],
+            _ => new double[size],
         };
     }
+
+    // True when the numeric backing holds floats (kind 5=float[], 6=double[])
+    // rather than integers. Integer kinds cross the compiler boundary as a raw
+    // long (NumGet/NumSet); float kinds as a raw double (NumGetF/NumSetF).
+    internal bool IsFloatNumKind => _numKind >= 5;
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal long NumGet(int i) => _numKind switch
@@ -176,6 +185,48 @@ public class LispVector : LispObject
         }
     }
 
+    // Raw float element access (kind 5=float[] / 6=double[]). single-float
+    // storage narrows the double to float on store; NaN/inf are legal values
+    // so there is no range check (unlike the integer NumSet).
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal double NumGetF(int i) => _numKind == 5
+        ? ((float[])_numData!)[i]
+        : ((double[])_numData!)[i];
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal void NumSetF(int i, double v)
+    {
+        if (_numKind == 5) ((float[])_numData!)[i] = (float)v;
+        else ((double[])_numData!)[i] = v;
+    }
+
+    // Box the element at index i per the backing kind: Fixnum for integer
+    // kinds, SingleFloat/DoubleFloat for float kinds.
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal LispObject NumBox(int i) => _numKind >= 5
+        ? (_numKind == 5 ? new SingleFloat((float)NumGetF(i)) : (LispObject)new DoubleFloat(NumGetF(i)))
+        : Fixnum.Make(NumGet(i));
+
+    // Store a boxed value into numeric backing at (already bounds-checked)
+    // index i, dispatching on the backing kind. Returns false when val's type
+    // is incompatible with the backing so the caller can fall to the general
+    // (boxed) slow path. Integer range violations still throw loudly via NumSet.
+    internal bool TryNumStore(int i, LispObject val)
+    {
+        if (_numKind >= 5)
+        {
+            switch (val)
+            {
+                case DoubleFloat df: NumSetF(i, df.Value); return true;
+                case SingleFloat sf: NumSetF(i, sf.Value); return true;
+                case Fixnum fx: NumSetF(i, fx.Value); return true;
+                default: return false;
+            }
+        }
+        if (val is Fixnum nf) { NumSet(i, nf.Value); return true; }
+        return false;
+    }
+
     private Exception NumRangeError(long v) =>
         new LispErrorException(new LispTypeError(
             $"array of element-type {ElementTypeName}: value {v} does not fit", Fixnum.Make(v)));
@@ -189,8 +240,8 @@ public class LispVector : LispObject
         for (int i = 0; i < elements.Length; i++)
         {
             var e = elements[i];
-            if (e is Fixnum f) NumSet(i, f.Value);
-            else if (e is not null && e is not Nil)
+            if (e is null || e is Nil) continue; // uninitialized slot stays 0
+            if (!TryNumStore(i, e))
                 throw new LispErrorException(new LispTypeError(
                     $"array of element-type {ElementTypeName}: cannot store", e));
         }
@@ -212,7 +263,19 @@ public class LispVector : LispObject
         {
             _numData = AllocNum(size);
             _elements = Array.Empty<LispObject>();
-            if (initialElement is Fixnum nf)
+            if (_numKind >= 5)
+            {
+                if (size > 0 && initialElement is not Nil)
+                {
+                    if (!TryNumStore(0, initialElement))
+                        throw new LispErrorException(new LispTypeError(
+                            $"array of element-type {elementType}: cannot store", initialElement));
+                    double d = NumGetF(0);
+                    if (d != 0.0)
+                        for (int i = 1; i < size; i++) NumSetF(i, d);
+                }
+            }
+            else if (initialElement is Fixnum nf)
             {
                 if (nf.Value != 0)
                     for (int i = 0; i < size; i++) NumSet(i, nf.Value);
@@ -346,7 +409,7 @@ public class LispVector : LispObject
         if (_bitData != null)
             return Fixnum.Make((long)((_bitData[index >> 6] >> (index & 63)) & 1));
         if (_numData != null)
-            return Fixnum.Make(NumGet(index));
+            return NumBox(index);
         return _elements[index] ?? Nil.Instance;
     }
 
@@ -364,10 +427,9 @@ public class LispVector : LispObject
         }
         if (_numData != null)
         {
-            if (val is not Fixnum nf)
+            if (!TryNumStore(index, val))
                 throw new LispErrorException(new LispTypeError(
                     $"array of element-type {ElementTypeName}: cannot store", val));
-            NumSet(index, nf.Value);
             return;
         }
         _elements[index] = val;
@@ -484,10 +546,10 @@ public class LispVector : LispObject
                 {
                     // Old storage is the displaced target: read through it.
                     var e = _displacedTo.RawGet(_displacedOffset + i);
-                    if (e is Fixnum f) NumSet(i, f.Value);
+                    TryNumStore(i, e); // int and float kinds; incompatible leaves 0
                 }
-                if (initialElement is Fixnum fiN && fiN.Value != 0)
-                    for (int i = oldSizeN; i < newSize; i++) NumSet(i, fiN.Value);
+                if (initialElement is not null && initialElement is not Nil)
+                    for (int i = oldSizeN; i < newSize; i++) TryNumStore(i, initialElement);
                 _elements = Array.Empty<LispObject>();
             }
             else if (_bitData != null)
@@ -547,8 +609,8 @@ public class LispVector : LispObject
                 var oldNum = _numData;
                 _numData = AllocNum(newSize);
                 Array.Copy(oldNum, _numData, Math.Min(oldSize, newSize));
-                if (initialElement is Fixnum fiN && fiN.Value != 0)
-                    for (int i = oldSize; i < newSize; i++) NumSet(i, fiN.Value);
+                if (initialElement is not null && initialElement is not Nil)
+                    for (int i = oldSize; i < newSize; i++) TryNumStore(i, initialElement);
             }
         }
         else

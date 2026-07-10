@@ -4,7 +4,7 @@ using System.Reflection;
 namespace DotCL;
 
 /// <summary>
-/// Runtime scaffolding for the `harmony` contrib (interactive advice on live
+/// Runtime scaffolding for the `advice` contrib (interactive advice on live
 /// .NET methods). This class references NO Harmony types: it is only a registry
 /// of Lisp closures keyed by the target <see cref="MethodBase"/>, plus universal
 /// advice methods whose parameters use Harmony's name-based injection convention
@@ -13,7 +13,7 @@ namespace DotCL;
 /// Harmony the <see cref="MethodInfo"/> of <see cref="Postfix"/> as the patch;
 /// Harmony discovers and invokes it by reflection at runtime.
 ///
-/// PoC note: this bridge lives in the runtime for now so the harmony PoC needs
+/// PoC note: this bridge lives in the runtime for now so the advice PoC needs
 /// no C# build step in the contrib. The intended end state is to emit the same
 /// static method from Lisp via `dotnet:define-class` (:static), which does not
 /// exist yet; when it does, this file can be deleted and the contrib becomes
@@ -104,7 +104,7 @@ public static class MethodAdviceBridge
     /// Universal Harmony postfix that REPLACES the return value: funcalls the
     /// registered closure with <c>(instance args-list result)</c> and writes its
     /// value back through <c>ref __result</c>, converting to the method's actual
-    /// return type. This is how `harmony:patch` fixes a method's output in place
+    /// return type. This is how `advice:patch` fixes a method's output in place
     /// (Arthas "redefine"). Value-type results round-trip via boxing.
     /// </summary>
     public static void PostfixReplace(MethodBase __originalMethod, object? __instance,
@@ -181,7 +181,7 @@ public static class MethodAdviceBridge
     }
 
     /// <summary>
-    /// Demo target for the harmony PoC and its regression test: a plain, jitted
+    /// Demo target for the advice PoC and its regression test: a plain, jitted
     /// static method in a normal loaded assembly, which Harmony can reliably
     /// patch (Reflection.Emit dynamic-assembly methods are not always
     /// patchable on CoreCLR, so define-class targets are unsuitable for a

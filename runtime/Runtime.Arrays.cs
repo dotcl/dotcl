@@ -357,7 +357,7 @@ public static partial class Runtime
             if (v._numData != null)
             {
                 if ((ulong)f.Value < (ulong)v._numLen)
-                    return Fixnum.Make(v.NumGet((int)f.Value));
+                    return v.NumBox((int)f.Value);
             }
             else
             {
@@ -476,11 +476,8 @@ public static partial class Runtime
         {
             if (v._numData != null)
             {
-                if (value is Fixnum fv && (ulong)f.Value < (ulong)v._numLen)
-                {
-                    v.NumSet((int)f.Value, fv.Value);
+                if ((ulong)f.Value < (ulong)v._numLen && v.TryNumStore((int)f.Value, value))
                     return value;
-                }
             }
             else
             {
@@ -541,7 +538,7 @@ public static partial class Runtime
             if (v._numData != null)
             {
                 if ((uint)idx < (uint)v._numLen)
-                    return Fixnum.Make(v.NumGet(idx));
+                    return v.NumBox(idx);
             }
             else if ((uint)idx < (uint)v._elements.Length)
                 return v._elements[idx] ?? Nil.Instance;
@@ -579,11 +576,8 @@ public static partial class Runtime
             int idx = i0 * v._dimensions[1] + i1;
             if (v._numData != null)
             {
-                if (value is Fixnum fv && (uint)idx < (uint)v._numLen)
-                {
-                    v.NumSet(idx, fv.Value);
+                if ((uint)idx < (uint)v._numLen && v.TryNumStore(idx, value))
                     return value;
-                }
             }
             else if ((uint)idx < (uint)v._elements.Length)
             {
@@ -638,7 +632,7 @@ public static partial class Runtime
             if (v._numData != null)
             {
                 if ((uint)idx < (uint)v._numLen)
-                    return Fixnum.Make(v.NumGet(idx));
+                    return v.NumBox(idx);
             }
             else if ((uint)idx < (uint)v._elements.Length)
                 return v._elements[idx] ?? Nil.Instance;
@@ -676,11 +670,8 @@ public static partial class Runtime
             int idx = (i0 * v._dimensions[1] + i1) * v._dimensions[2] + i2;
             if (v._numData != null)
             {
-                if (value is Fixnum fv && (uint)idx < (uint)v._numLen)
-                {
-                    v.NumSet(idx, fv.Value);
+                if ((uint)idx < (uint)v._numLen && v.TryNumStore(idx, value))
                     return value;
-                }
             }
             else if ((uint)idx < (uint)v._elements.Length)
             {
@@ -729,9 +720,9 @@ public static partial class Runtime
                 && (ulong)index < (ulong)v._elements.Length)
                 return v._elements[(int)index] ?? Nil.Instance;
             // Unboxed numeric backing: read the raw value, box once (small
-            // values hit the Fixnum cache).
+            // integers hit the Fixnum cache; float kinds box to a float).
             if (v._numData != null && (ulong)index < (ulong)v._numLen)
-                return Fixnum.Make(v.NumGet((int)index));
+                return v.NumBox((int)index);
         }
         return ArefSlow(array, Fixnum.Make(index));
     }
@@ -747,12 +738,9 @@ public static partial class Runtime
                 v._elements[(int)index] = value;
                 return value;
             }
-            if (v._numData != null && value is Fixnum fv
-                && (ulong)index < (ulong)v._numLen)
-            {
-                v.NumSet((int)index, fv.Value);
+            if (v._numData != null && (ulong)index < (ulong)v._numLen
+                && v.TryNumStore((int)index, value))
                 return value;
-            }
         }
         return ArefSetSlow(array, Fixnum.Make(index), value);
     }
@@ -769,7 +757,7 @@ public static partial class Runtime
             if (v._numData != null)
             {
                 if ((ulong)idx < (ulong)v._numLen)
-                    return Fixnum.Make(v.NumGet((int)idx));
+                    return v.NumBox((int)idx);
             }
             else if ((ulong)idx < (ulong)v._elements.Length)
                 return v._elements[(int)idx] ?? Nil.Instance;
@@ -788,11 +776,8 @@ public static partial class Runtime
             long idx = i0 * v._dimensions[1] + i1;
             if (v._numData != null)
             {
-                if (value is Fixnum fv && (ulong)idx < (ulong)v._numLen)
-                {
-                    v.NumSet((int)idx, fv.Value);
+                if ((ulong)idx < (ulong)v._numLen && v.TryNumStore((int)idx, value))
                     return value;
-                }
             }
             else if ((ulong)idx < (ulong)v._elements.Length)
             {
@@ -816,7 +801,7 @@ public static partial class Runtime
             if (v._numData != null)
             {
                 if ((ulong)idx < (ulong)v._numLen)
-                    return Fixnum.Make(v.NumGet((int)idx));
+                    return v.NumBox((int)idx);
             }
             else if ((ulong)idx < (ulong)v._elements.Length)
                 return v._elements[(int)idx] ?? Nil.Instance;
@@ -836,11 +821,8 @@ public static partial class Runtime
             long idx = (i0 * v._dimensions[1] + i1) * v._dimensions[2] + i2;
             if (v._numData != null)
             {
-                if (value is Fixnum fv && (ulong)idx < (ulong)v._numLen)
-                {
-                    v.NumSet((int)idx, fv.Value);
+                if ((ulong)idx < (ulong)v._numLen && v.TryNumStore((int)idx, value))
                     return value;
-                }
             }
             else if ((ulong)idx < (ulong)v._elements.Length)
             {
@@ -947,6 +929,124 @@ public static partial class Runtime
             }
         }
         ArefSet3D(array, Fixnum.Make(i0), Fixnum.Make(i1), Fixnum.Make(i2), Fixnum.Make(value));
+        return value;
+    }
+
+    // --- Raw-double-value variants for float-backed array locals -----------
+    // Mirror the ArefNum*L (raw long) family for float element types: emitted
+    // when the compiler has PROVEN (from the make-array :element-type) that the
+    // array local is float-backed (float[] / double[]). The element crosses the
+    // boundary as a raw double, so a hot loop like
+    // (setf (aref c i) (+ (aref a i) (aref b i))) on double-float arrays runs
+    // with zero SingleFloat/DoubleFloat boxing. single-float backing widens to
+    // double on read and narrows on store (both exact). The fast path requires
+    // float numeric backing (_numKind >= 5); anything else (adjusted to
+    // displaced, boxed) takes the boxed entry and coerces — a violation of the
+    // inferred element type surfaces loudly rather than as a silent wrong value.
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static double ToDoubleElement(LispObject o) => o switch
+    {
+        DoubleFloat df => df.Value,
+        SingleFloat sf => sf.Value,
+        Fixnum fx => fx.Value,
+        _ => throw new LispErrorException(new LispTypeError("AREF: element is not a real", o)),
+    };
+
+    // Box a raw double back to the element box type of a float-backed array for
+    // the rare fallback store (e.g. displaced after adjust-array): single-float
+    // backing gets a SingleFloat, double gets a DoubleFloat.
+    private static LispObject BoxFloatElement(LispObject array, double value) =>
+        array is LispVector fv &&
+        (fv._numKind == 5 || fv.ElementTypeName is "SINGLE-FLOAT" or "SHORT-FLOAT")
+            ? new SingleFloat((float)value)
+            : new DoubleFloat(value);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static double ArefNumD(LispObject array, long index)
+    {
+        if (array is LispVector v && v._numData != null && v._numKind >= 5
+            && v._displacedTo == null && (ulong)index < (ulong)v._numLen)
+            return v.NumGetF((int)index);
+        return ToDoubleElement(Aref(array, Fixnum.Make(index)));
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static double ArefSetNumD(LispObject array, long index, double value)
+    {
+        if (array is LispVector v && v._numData != null && v._numKind >= 5
+            && v._displacedTo == null && (ulong)index < (ulong)v._numLen)
+        {
+            v.NumSetF((int)index, value);
+            return value;
+        }
+        ArefSet(array, Fixnum.Make(index), BoxFloatElement(array, value));
+        return value;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static double ArefNum2DD(LispObject array, long i0, long i1)
+    {
+        if (array is LispVector v && v._numData != null && v._numKind >= 5
+            && v._displacedTo == null && v._dimensions != null && v._dimensions.Length == 2
+            && (ulong)i0 < (ulong)v._dimensions[0] && (ulong)i1 < (ulong)v._dimensions[1])
+        {
+            long idx = i0 * v._dimensions[1] + i1;
+            if ((ulong)idx < (ulong)v._numLen)
+                return v.NumGetF((int)idx);
+        }
+        return ToDoubleElement(Aref2D(array, Fixnum.Make(i0), Fixnum.Make(i1)));
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static double ArefSetNum2DD(LispObject array, long i0, long i1, double value)
+    {
+        if (array is LispVector v && v._numData != null && v._numKind >= 5
+            && v._displacedTo == null && v._dimensions != null && v._dimensions.Length == 2
+            && (ulong)i0 < (ulong)v._dimensions[0] && (ulong)i1 < (ulong)v._dimensions[1])
+        {
+            long idx = i0 * v._dimensions[1] + i1;
+            if ((ulong)idx < (ulong)v._numLen)
+            {
+                v.NumSetF((int)idx, value);
+                return value;
+            }
+        }
+        ArefSet2D(array, Fixnum.Make(i0), Fixnum.Make(i1), BoxFloatElement(array, value));
+        return value;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static double ArefNum3DD(LispObject array, long i0, long i1, long i2)
+    {
+        if (array is LispVector v && v._numData != null && v._numKind >= 5
+            && v._displacedTo == null && v._dimensions != null && v._dimensions.Length == 3
+            && (ulong)i0 < (ulong)v._dimensions[0] && (ulong)i1 < (ulong)v._dimensions[1]
+            && (ulong)i2 < (ulong)v._dimensions[2])
+        {
+            long idx = (i0 * v._dimensions[1] + i1) * v._dimensions[2] + i2;
+            if ((ulong)idx < (ulong)v._numLen)
+                return v.NumGetF((int)idx);
+        }
+        return ToDoubleElement(Aref3D(array, Fixnum.Make(i0), Fixnum.Make(i1), Fixnum.Make(i2)));
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static double ArefSetNum3DD(LispObject array, long i0, long i1, long i2, double value)
+    {
+        if (array is LispVector v && v._numData != null && v._numKind >= 5
+            && v._displacedTo == null && v._dimensions != null && v._dimensions.Length == 3
+            && (ulong)i0 < (ulong)v._dimensions[0] && (ulong)i1 < (ulong)v._dimensions[1]
+            && (ulong)i2 < (ulong)v._dimensions[2])
+        {
+            long idx = (i0 * v._dimensions[1] + i1) * v._dimensions[2] + i2;
+            if ((ulong)idx < (ulong)v._numLen)
+            {
+                v.NumSetF((int)idx, value);
+                return value;
+            }
+        }
+        ArefSet3D(array, Fixnum.Make(i0), Fixnum.Make(i1), Fixnum.Make(i2), BoxFloatElement(array, value));
         return value;
     }
 

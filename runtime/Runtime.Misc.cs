@@ -2523,7 +2523,23 @@ public static partial class Runtime
     /// Removing this serialization is future work; the preparation to make
     /// individual operations race-free is already in place.
     /// </summary>
-    private static readonly object _evalLock = new();
+    internal static readonly object _evalLock = new();
+
+    /// <summary>
+    /// When true (default), Eval serializes the compound-form compile/run path on
+    /// <see cref="_evalLock"/>. Opt out (DOTCL_PARALLEL_EVAL=1, or
+    /// dotcl:set-parallel-eval) to run eval concurrently: the runtime state the
+    /// compile/run path touches is individually race-safe (Symbol/Package/Modules
+    /// concurrent-safe; CLOS method lists copy-on-write; constant pool + function
+    /// registry locked; *macros* a synchronized table), so many threads can
+    /// compile/call without the global lock. Proving full race-freedom is a
+    /// non-goal — user-level cons/array mutation stays the caller's responsibility,
+    /// as in any CL. Intended for hosts that call compiled functions from many
+    /// threads (e.g. a probe/REPL attached to a multi-threaded .NET service).
+    /// </summary>
+    internal static bool SerializeEval =
+        System.Environment.GetEnvironmentVariable("DOTCL_PARALLEL_EVAL")
+            is not ("1" or "true" or "TRUE" or "yes");
 
     public static LispObject Eval(LispObject form)
     {
@@ -2543,9 +2559,12 @@ public static partial class Runtime
         if (form is Symbol sym2 && DynamicBindings.TryGet(sym2, out var sym2val))
             return sym2val;
         // Compound forms hit the compiler + assembler, both of which mutate
-        // shared runtime state. Serialize from here.
-        lock (_evalLock)
-            return EvalCompound(form);
+        // shared runtime state. Serialize from here unless the host opted into
+        // parallel eval (see SerializeEval).
+        if (SerializeEval)
+            lock (_evalLock)
+                return EvalCompound(form);
+        return EvalCompound(form);
     }
 
     private static LispObject EvalCompound(LispObject form)
@@ -3093,6 +3112,47 @@ public static partial class Runtime
                new Cons(Fixnum.Make(gen2),
                new Cons(Fixnum.Make(totalMem),
                new Cons(Fixnum.Make(allocated), Nil.Instance)))));
+    }
+
+    // COMPILER-MACRO-FUNCTION body (shared by the args-array wrapper and the
+    // 1-arg direct delegate).
+    private static LispObject CompilerMacroFunctionImpl(LispObject nameArg)
+    {
+        // (setf foo) form: a cons (setf . (foo . nil))
+        if (nameArg is Cons setfCons && setfCons.Car is Symbol setfSym && setfSym.Name == "SETF") {
+            var innerSym = (setfCons.Cdr is Cons c2) ? c2.Car as Symbol : null;
+            if (innerSym != null && _setfCompilerMacros.TryGetValue(innerSym, out var sfn))
+                return sfn;
+            return Nil.Instance;
+        }
+        var sym = nameArg as Symbol;
+        if (sym == null) return Nil.Instance;
+        return _compilerMacroFunctions.TryGetValue(sym, out var fn)
+            ? (LispObject)fn : Nil.Instance;
+    }
+
+    // FBOUNDP body (shared by the args-array wrapper and the 1-arg direct delegate).
+    private static LispObject FboundpImpl(LispObject obj)
+    {
+        if (obj is Cons setfCons && setfCons.Car is Symbol setfKw && setfKw.Name == "SETF")
+        {
+            if (setfCons.Cdr is not Cons setfRest || setfRest.Cdr is not Nil)
+                throw new LispErrorException(new LispTypeError("FBOUNDP: invalid (setf ...) form", obj));
+            if (setfRest.Car is not Symbol setfName)
+                throw new LispErrorException(new LispTypeError("FBOUNDP: second element of (setf ...) must be a symbol", setfRest.Car));
+            // sym.SetfFunction is authoritative.
+            return setfName.SetfFunction != null ? T.Instance : Nil.Instance;
+        }
+        Symbol s;
+        if (obj is Symbol sym2) s = sym2;
+        else if (obj is Nil) s = Startup.NIL_SYM;
+        else if (obj is T) s = Startup.T_SYM;
+        else throw new LispErrorException(new LispTypeError("FBOUNDP: not a symbol", obj));
+        if (s.Function != null) return T.Instance;
+        if (Runtime.MacroFunction(s) != Nil.Instance) return T.Instance;
+        if (Startup.LookupCompilerMacro(s) != null) return T.Instance;
+        if (Runtime._specialOperators.Contains(s.Name)) return T.Instance;
+        return Nil.Instance;
     }
 
     // dotcl:emit-pool-stats — (total-entries dynamic-methods data-literals committed-bytes)
@@ -4008,30 +4068,15 @@ public static partial class Runtime
                 return MultipleValues.Values(form, anyExpanded ? (LispObject)T.Instance : Nil.Instance);
             }, "MACROEXPAND", -1));
 
-        // FBOUNDP
-        Emitter.CilAssembler.RegisterFunction("FBOUNDP", new LispFunction(args => {
+        // FBOUNDP. Body extracted to FboundpImpl so the 1-arg direct delegate and
+        // the args-array wrapper share the exact same code path; argc != 1 still
+        // falls back to the wrapper's wrong-number-of-arguments error.
+        var fboundpFn = new LispFunction(args => {
             if (args.Length != 1) throw new LispErrorException(new LispProgramError($"FBOUNDP: wrong number of arguments: {args.Length} (expected 1)"));
-            var obj = args[0];
-            if (obj is Cons setfCons && setfCons.Car is Symbol setfKw && setfKw.Name == "SETF")
-            {
-                if (setfCons.Cdr is not Cons setfRest || setfRest.Cdr is not Nil)
-                    throw new LispErrorException(new LispTypeError("FBOUNDP: invalid (setf ...) form", obj));
-                if (setfRest.Car is not Symbol setfName)
-                    throw new LispErrorException(new LispTypeError("FBOUNDP: second element of (setf ...) must be a symbol", setfRest.Car));
-                // sym.SetfFunction is authoritative.
-                return setfName.SetfFunction != null ? T.Instance : Nil.Instance;
-            }
-            Symbol s;
-            if (obj is Symbol sym2) s = sym2;
-            else if (obj is Nil) s = Startup.NIL_SYM;
-            else if (obj is T) s = Startup.T_SYM;
-            else throw new LispErrorException(new LispTypeError("FBOUNDP: not a symbol", obj));
-            if (s.Function != null) return T.Instance;
-            if (Runtime.MacroFunction(s) != Nil.Instance) return T.Instance;
-            if (Startup.LookupCompilerMacro(s) != null) return T.Instance;
-            if (Runtime._specialOperators.Contains(s.Name)) return T.Instance;
-            return Nil.Instance;
-        }, "FBOUNDP", -1));
+            return FboundpImpl(args[0]);
+        }, "FBOUNDP", -1);
+        fboundpFn.SetDirectDelegate((Func<LispObject, LispObject>)FboundpImpl);
+        Emitter.CilAssembler.RegisterFunction("FBOUNDP", fboundpFn);
 
         // COMPILE
         Emitter.CilAssembler.RegisterFunction("COMPILE",
@@ -4227,22 +4272,15 @@ public static partial class Runtime
             }, "MAKE-LOAD-FORM-SAVING-SLOTS", -1));
 
         // COMPILER-MACRO-FUNCTION — look up runtime-registered compiler macros.
-        Emitter.CilAssembler.RegisterFunction("COMPILER-MACRO-FUNCTION",
-            new LispFunction(args => {
-                if (args.Length < 1) return Nil.Instance;
-                var nameArg = args[0];
-                // (setf foo) form: a cons (setf . (foo . nil))
-                if (nameArg is Cons setfCons && setfCons.Car is Symbol setfSym && setfSym.Name == "SETF") {
-                    var innerSym = (setfCons.Cdr is Cons c2) ? c2.Car as Symbol : null;
-                    if (innerSym != null && _setfCompilerMacros.TryGetValue(innerSym, out var sfn))
-                        return sfn;
-                    return Nil.Instance;
-                }
-                var sym = nameArg as Symbol;
-                if (sym == null) return Nil.Instance;
-                return _compilerMacroFunctions.TryGetValue(sym, out var fn)
-                    ? (LispObject)fn : Nil.Instance;
-            }, "COMPILER-MACRO-FUNCTION", -1));
+        // Body extracted to CompilerMacroFunctionImpl so the 1-arg direct delegate
+        // and the args-array wrapper share the same code path (the optional env
+        // argument was already ignored by the wrapper).
+        var cmfFn = new LispFunction(args => {
+            if (args.Length < 1) return Nil.Instance;
+            return CompilerMacroFunctionImpl(args[0]);
+        }, "COMPILER-MACRO-FUNCTION", -1);
+        cmfFn.SetDirectDelegate((Func<LispObject, LispObject>)CompilerMacroFunctionImpl);
+        Emitter.CilAssembler.RegisterFunction("COMPILER-MACRO-FUNCTION", cmfFn);
 
         // %REGISTER-COMPILER-MACRO-RT — store a compiler macro function at runtime.
         Startup.RegisterBinary("%REGISTER-COMPILER-MACRO-RT", (nameObj, fn) => {
@@ -4574,11 +4612,17 @@ public static partial class Runtime
 
         // Stack space check: returns T if sufficient execution stack remains, NIL otherwise.
         // Used by find-free-vars-expr to bail out before .NET StackOverflowException.
-        Emitter.CilAssembler.RegisterFunction("%STACK-SPACE-AVAILABLE-P",
-            new LispFunction(_ =>
-                Compat.TryEnsureSufficientExecutionStack()
-                    ? (LispObject)T.Instance : Nil.Instance,
-                "%STACK-SPACE-AVAILABLE-P", 0));
+        // The args-array wrapper ignores its arguments entirely, so the 0-arg
+        // direct delegate is the identical code path (extra-arg calls still fall
+        // back to the wrapper, which also ignores them — unchanged).
+        var stackSpaceFn = new LispFunction(_ =>
+            Compat.TryEnsureSufficientExecutionStack()
+                ? (LispObject)T.Instance : Nil.Instance,
+            "%STACK-SPACE-AVAILABLE-P", 0);
+        stackSpaceFn.SetDirectDelegate((Func<LispObject>)(() =>
+            Compat.TryEnsureSufficientExecutionStack()
+                ? (LispObject)T.Instance : Nil.Instance));
+        Emitter.CilAssembler.RegisterFunction("%STACK-SPACE-AVAILABLE-P", stackSpaceFn);
     }
 
     /// <summary>Helper: check if a Lisp list contains a symbol (by name)</summary>
