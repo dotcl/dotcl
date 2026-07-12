@@ -38,6 +38,7 @@
 (load "test/regression/process.lisp")
 (load "test/regression/project-core-concat.lisp")
 (load "test/regression/gray-streams.lisp")
+(load "test/regression/string-streams.lisp")
 (load "test/regression/compile-state-registry.lisp")
 (load "test/regression/tco-self-symbol.lisp")
 (load "test/regression/direct-closure-stack.lisp")
