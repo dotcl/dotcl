@@ -1784,7 +1784,7 @@ public static partial class Runtime
             var source = File.ReadAllText(inputPath);
             var trackingReader = new PositionTrackingReader(new StringReader(source));
             var reader = new Reader(trackingReader);
-            var compileStream = new LispStringInputStream(trackingReader, 0);
+            var compileStream = new LispStringInputStream(trackingReader, 0, source, source.Length);
             reader.LispStreamRef = compileStream;
             // Link this reader as the stream's live reader and share the #n=/#n#
             // tables with the stream. A Lisp reader macro (e.g. SBCL's cold-build

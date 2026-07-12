@@ -448,3 +448,39 @@ b")
   (list (notnot (open-stream-p (make-instance '%osp-gray :open t)))
         (open-stream-p (make-instance '%osp-gray :open nil)))
   (t nil))
+
+;;; ------------------------------------------------------------------
+;;; file-position must dispatch to stream-file-position /
+;;; (setf stream-file-position) generics for Gray streams.
+;;; Previously both getter and setter fell through to return NIL.
+;;; ------------------------------------------------------------------
+
+;; A Gray character input stream tracking a position slot.
+(defclass %fp-gray-in (dotcl-gray:fundamental-character-input-stream)
+  ((data :initarg :data) (pos :initform 0)))
+(defmethod dotcl-gray:stream-read-char ((s %fp-gray-in))
+  (with-slots (data pos) s
+    (if (< pos (length data)) (prog1 (char data pos) (incf pos)) :eof)))
+(defmethod dotcl-gray:stream-file-position ((s %fp-gray-in))
+  (slot-value s 'pos))
+(defmethod (setf dotcl-gray:stream-file-position) (newval (s %fp-gray-in))
+  (setf (slot-value s 'pos) newval))
+
+(deftest gray-file-position-getter
+  (let ((s (make-instance '%fp-gray-in :data "hello")))
+    (read-char s)
+    (file-position s))
+  1)
+
+(deftest gray-file-position-setf
+  (let ((s (make-instance '%fp-gray-in :data "hello")))
+    (read-char s)
+    (read-char s)
+    (file-position s 0)
+    (read-char s))
+  #\h)
+
+(deftest gray-file-position-setf-returns-position
+  (let ((s (make-instance '%fp-gray-in :data "hello")))
+    (file-position s 3))
+  3)
