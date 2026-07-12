@@ -56,7 +56,7 @@ public abstract class LispStream : LispObject
 
 public class LispInputStream : LispStream
 {
-    public TextReader Reader { get; }
+    public TextReader Reader { get; protected set; }
     public override bool IsInput => true;
     public override bool IsOutput => false;
 
@@ -211,25 +211,49 @@ public class LispStringInputStream : LispInputStream
     /// <summary>The starting offset from the original string (for :start parameter).</summary>
     public int StartOffset { get; set; }
     /// <summary>The position-tracking wrapper for this stream's reader.</summary>
-    public PositionTrackingReader? TrackingReader { get; }
+    public PositionTrackingReader? TrackingReader { get; private set; }
+    /// <summary>The full original string (before any slicing). Used for repositioning.</summary>
+    private readonly string? _fullString;
+    /// <summary>The exclusive end offset in the full string.</summary>
+    private readonly int _endOffset;
 
     public LispStringInputStream(StringReader reader) : base(new PositionTrackingReader(reader))
     {
         TrackingReader = (PositionTrackingReader)Reader;
     }
-    public LispStringInputStream(StringReader reader, int startOffset) : base(new PositionTrackingReader(reader))
+    public LispStringInputStream(StringReader reader, int startOffset, string? fullString = null, int endOffset = 0)
+        : base(new PositionTrackingReader(reader))
     {
         StartOffset = startOffset;
         TrackingReader = (PositionTrackingReader)Reader;
+        _fullString = fullString;
+        _endOffset = endOffset;
     }
-    public LispStringInputStream(PositionTrackingReader trackingReader, int startOffset = 0) : base(trackingReader)
+    public LispStringInputStream(PositionTrackingReader trackingReader, int startOffset = 0, string? fullString = null, int endOffset = 0)
+        : base(trackingReader)
     {
         StartOffset = startOffset;
         TrackingReader = trackingReader;
+        _fullString = fullString;
+        _endOffset = endOffset;
     }
 
     /// <summary>Current position in the original string.</summary>
     public int Position => StartOffset + (TrackingReader?.Position ?? 0);
+
+    /// <summary>Reposition the stream to an absolute position in the original string.
+    /// Recreates the underlying StringReader at the target offset.</summary>
+    public bool SeekToPosition(int absolutePosition)
+    {
+        if (_fullString == null) return false;
+        if (absolutePosition < 0 || absolutePosition >= _endOffset) return false;
+        var sub = _fullString.Substring(absolutePosition, _endOffset - absolutePosition);
+        var newReader = new PositionTrackingReader(new StringReader(sub));
+        Reader = newReader;
+        TrackingReader = newReader;
+        StartOffset = absolutePosition;
+        return true;
+    }
 
     public override string? StreamTypeName => "STRING-STREAM";
     public override string ToString() => "#<STRING-INPUT-STREAM>";

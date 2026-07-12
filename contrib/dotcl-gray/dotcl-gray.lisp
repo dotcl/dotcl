@@ -43,9 +43,10 @@
    ;; Binary GFs
    #:stream-read-byte
    #:stream-write-byte
-   ;; Bulk sequence GFs
    #:stream-read-sequence
-   #:stream-write-sequence))
+   #:stream-write-sequence
+   ;; File position GF
+   #:stream-file-position))
 
 (in-package :dotcl-gray)
 
@@ -170,6 +171,9 @@ of the first element not updated (i.e. START + number of elements read)."))
 (defgeneric stream-write-sequence (stream seq &optional start end)
   (:documentation "Write SEQ to STREAM between START and END. Return SEQ."))
 
+(defgeneric stream-file-position (stream)
+  (:documentation "Return the current file position of STREAM, or NIL if unknown."))
+
 ;;; ============================================================
 ;;; Default methods
 ;;; ============================================================
@@ -221,6 +225,10 @@ of the first element not updated (i.e. START + number of elements read)."))
     (unless (eq c :eof)
       (stream-unread-char stream c))
     c))
+
+;;; Default stream-file-position: return NIL (position unknown).
+(defmethod stream-file-position ((stream fundamental-stream))
+  nil)
 
 (defmethod stream-clear-input ((stream fundamental-input-stream))
   nil)

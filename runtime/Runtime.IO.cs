@@ -2164,13 +2164,59 @@ public static partial class Runtime
         {
             if (args.Length == 1)
                 return Fixnum.Make(sis.Position);
-            return Nil.Instance; // Can't set position on string streams
+            // Setf position: reposition the underlying StringReader
+            if (args[1] is Fixnum pos)
+            {
+                if (sis.SeekToPosition((int)pos.Value))
+                    return Fixnum.Make(pos.Value);
+            }
+            return Nil.Instance;
         }
         // String output streams track position
         if (args[0] is LispStringOutputStream sos)
         {
             if (args.Length == 1)
                 return Fixnum.Make(sos.GetString().Length);
+            return Nil.Instance;
+        }
+        // Gray stream: dispatch to stream-file-position / (setf stream-file-position)
+        if (args[0] is LispInstance gi && (IsGrayInputStream(gi) || IsGrayOutputStream(gi)
+                                        || IsGrayBinaryInputStream(gi) || IsGrayBinaryOutputStream(gi)))
+        {
+            Symbol? fpSym = null;
+            // Prefer trivial-gray-streams (where portable code defines methods)
+            var tgsPkg = Package.FindPackage("TRIVIAL-GRAY-STREAMS");
+            if (tgsPkg != null)
+            {
+                var (sym, status) = tgsPkg.FindSymbol("STREAM-FILE-POSITION");
+                if (status != SymbolStatus.None) fpSym = sym;
+            }
+            // Fall back to dotcl-gray
+            if (fpSym == null)
+            {
+                var grayPkg = Package.FindPackage("DOTCL-GRAY");
+                if (grayPkg != null)
+                {
+                    var (sym, status) = grayPkg.FindSymbol("STREAM-FILE-POSITION");
+                    if (status != SymbolStatus.None) fpSym = sym;
+                }
+            }
+            if (fpSym != null)
+            {
+                if (args.Length == 1)
+                {
+                    // Getter: (stream-file-position stream)
+                    var fn = fpSym.Function as LispFunction;
+                    if (fn != null) return fn.Invoke(new LispObject[] { gi });
+                }
+                else
+                {
+                    // Setter: ((setf stream-file-position) pos stream)
+                    var setfFn = fpSym.SetfFunction as LispFunction;
+                    if (setfFn != null)
+                        return setfFn.Invoke(new LispObject[] { args[1], gi });
+                }
+            }
             return Nil.Instance;
         }
         if (args[0] is not LispFileStream fs)
@@ -3240,7 +3286,7 @@ public static partial class Runtime
         }
         var sliced = val.Substring(start, end - start);
         var sr = new StringReader(sliced);
-        return new LispStringInputStream(sr, start);
+        return new LispStringInputStream(sr, start, val, end);
     }
 
 
