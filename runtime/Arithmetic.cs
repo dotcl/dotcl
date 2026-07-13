@@ -190,6 +190,7 @@ public static class Arithmetic
             Ratio => Subtract(Fixnum.Make(0), a),
             SingleFloat sf => new SingleFloat(-sf.Value),
             DoubleFloat df => new DoubleFloat(-df.Value),
+            LispDecimal d => Negate(d.ToRational()),   // standard op → standard (rational) result
             LispComplex c => MakeComplex(Negate(c.Real), Negate(c.Imaginary)),
             _ => throw new NotImplementedException()
         };
@@ -205,6 +206,7 @@ public static class Arithmetic
             Ratio r => r.Numerator >= 0 ? a : (Number)Ratio.Make(-r.Numerator, r.Denominator),
             SingleFloat sf => new SingleFloat(System.Math.Abs(sf.Value)),
             DoubleFloat df => new DoubleFloat(System.Math.Abs(df.Value)),
+            LispDecimal d => Abs(d.ToRational()),   // standard op → standard (rational) result
             // Magnitude via System.Numerics.Complex.Abs, which uses a scaled hypot
             // (max*sqrt(1+(min/max)^2)) so it doesn't over/underflow when re^2/im^2
             // would: e.g. (abs #C(1d170 1d170)) and (abs #C(1d-170 1d-170)) are exact
@@ -702,6 +704,7 @@ public static class Arithmetic
         Bignum b => (float)b.Value,
         Ratio r => (float)r.Numerator / (float)r.Denominator,
         DoubleFloat df => (float)df.Value,
+        LispDecimal d => (float)d.Value,
         _ => throw new NotImplementedException($"ToSingle not implemented for {n.GetType().Name}")
     };
 
@@ -712,6 +715,7 @@ public static class Arithmetic
         Ratio r => RatioToDouble(r),
         SingleFloat sf => sf.Value,
         DoubleFloat df => df.Value,
+        LispDecimal d => (double)d.Value,
         _ => throw new NotImplementedException($"ToDouble not implemented for {n.GetType().Name}")
     };
 
@@ -720,6 +724,9 @@ public static class Arithmetic
         Fixnum f => (f.Value, BigInteger.One),
         Bignum b => (b.Value, BigInteger.One),
         Ratio r => (r.Numerator, r.Denominator),
+        // A decimal contributes its exact rational value; standard exact arithmetic then
+        // yields a standard rational/integer (never a decimal — conservative extension).
+        LispDecimal d => d.AsRatio(),
         _ => throw new ArgumentException($"Not a rational number: {n}")
     };
 

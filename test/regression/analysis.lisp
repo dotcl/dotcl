@@ -202,6 +202,119 @@
   6)
 
 ;;; ============================================================
+;;; Memoized intrinsic free-vars : nested lambdas whose
+;;; free-var sets are computed once and re-scoped by BND subtraction.
+;;; Exercises correctness of the per-form %lambda-intrinsic-free cache.
+;;; ============================================================
+
+;;; Same-named variable rebound at each nesting level: the innermost
+;;; reference must resolve to the NEAREST binding, so no spurious capture
+;;; of an outer same-named var. If BND re-scoping were wrong the value
+;;; would differ.
+(deftest analysis-memo-shadow-rescope
+  (let ((x 100))
+    (funcall
+     (lambda ()
+       (let ((x 200))
+         (funcall
+          (lambda ()
+            (let ((x 300))
+              (funcall (lambda () x))))))))
+    )
+  300)
+
+;;; Five-level nested lambdas each capturing a distinct outer var — the
+;;; intrinsic set of each inner lambda must propagate every still-free
+;;; name up through all enclosing levels.
+(deftest analysis-memo-deep-multi-capture
+  (let ((a 1))
+    (funcall
+     (lambda ()
+       (let ((b 2))
+         (funcall
+          (lambda ()
+            (let ((c 4))
+              (funcall
+               (lambda ()
+                 (let ((d 8))
+                   (funcall
+                    (lambda () (+ a b c d)))))))))))))
+  15)
+
+;;; A lambda appearing in an &optional default form must have its own
+;;; captures analyzed (the defaults branch of %compute-lambda-intrinsic-free).
+(deftest analysis-memo-optional-default-lambda
+  (let ((base 40))
+    (funcall
+     (lambda (&optional (f (lambda () base)))
+       (funcall f))))
+  40)
+
+;;; Two sibling lambdas sharing an identical body shape but distinct conses:
+;;; each is cached under its own key, so both capture correctly.
+(deftest analysis-memo-sibling-lambdas
+  (let ((p 3) (q 7))
+    (let ((f (lambda () p))
+          (g (lambda () q)))
+      (+ (funcall f) (funcall g))))
+  10)
+
+;;; ============================================================
+;;; Deferred free-var candidate memo : special capture
+;;; names (block tag / go tag / labels fn / #'fn) must survive the
+;;; *locals*-independent candidate collection + per-merge local-bound-p.
+;;; ============================================================
+
+;;; block tag captured through TWO nested lambdas (candidate must carry the
+;;; %BTAG- name up and be re-filtered by local-bound-p at each level).
+(deftest analysis-memo-block-deep
+  (block outer
+    (funcall
+     (lambda ()
+       (funcall
+        (lambda ()
+          (return-from outer 77)))))
+    99)
+  77)
+
+;;; labels fn captured through TWO nested lambdas via direct call
+;;; (__LABELFN_ mangled candidate).
+(deftest analysis-memo-labels-deep
+  (let ((base 100))
+    (labels ((bump (n) (+ n base)))
+      (funcall
+       (lambda ()
+         (funcall
+          (lambda () (bump 11)))))))
+  111)
+
+;;; labels fn captured via #'fn (function-case candidate) across a lambda.
+(deftest analysis-memo-sharpquote-labels
+  (labels ((squ (x) (* x x)))
+    (funcall (lambda () (mapcar #'squ '(1 2 3)))))
+  (1 4 9))
+
+;;; go tag captured across a lambda (tagbody var candidate).
+(deftest analysis-memo-go-capture
+  (let ((acc nil))
+    (tagbody
+       (funcall (lambda () (go skip)))
+       (push 'reached acc)
+     skip)
+    acc)
+  nil)
+
+;;; Lisp-2: same name as both a lexical variable and a labels function,
+;;; the variable captured across a lambda while #'name is used elsewhere.
+;;; Exercises the function-case both-names candidate branch.
+(deftest analysis-memo-lisp2-samename
+  (let ((f 5))
+    (labels ((f (x) (* x 10)))
+      (+ (funcall (lambda () f))        ; captures the VARIABLE f = 5
+         (funcall (lambda () (f 3))))))  ; calls the FUNCTION f
+  35)
+
+;;; ============================================================
 ;;; handler-bind with closure
 ;;; ============================================================
 

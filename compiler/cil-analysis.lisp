@@ -44,6 +44,15 @@
 ;;; source-form collision the other sentinels have to guard against.
 (defvar *mscope-restore-sentinel* (list '#:restore-macroexpand-scope))
 
+;; Per-top-level-form EQ memo: lambda form -> list of free-variable CANDIDATE
+;; names (structurally free w.r.t. the lambda's own params, collected under
+;; *ffv-assume-bound* so the set is *locals*-independent = a pure function of the
+;; form). find-free-vars-expr descends into every nested lambda and compile-lambda
+;; re-runs find-free-vars per lambda, so without this an inner body is walked once
+;; per enclosing lambda = O(depth^2) on nested closures. The real
+;; local-bound-p filter is applied at each enclosing merge, not baked into the memo.
+(defvar *ffv-free-cache* nil)
+
 (defun find-free-vars-expr (expr bound free-ht)
   "Walk expr finding free variable references. Results accumulated in free-ht.
    Iterative worklist version — no recursion depth limit."
@@ -111,39 +120,58 @@
                        (when (consp clause)
                          (do-list-safe (sub clause)
                            (push (cons sub (cons bnd mdepth)) worklist)))))
-                    ;; Lambda introduces new bindings
+                    ;; Lambda.
                     ((and (symbolp head) (eq head 'lambda))
-                     (let* ((params (cadr e))
-                            (lbody (cddr e))
-                            (inner-bound (append (extract-param-names params) bnd)))
-                       ;; Inline scan-lambda-list-defaults: push default forms
-                       ;; with progressive scoping directly onto worklist
-                       (let ((state :required)
-                             (progressive-bound bnd))
-                         (dolist (p params)
-                           (cond
-                             ((lambda-list-keyword-p p)
-                              (case p
-                                ((&rest &body) (setf state :rest))
-                                (&optional (setf state :optional))
-                                (&key (setf state :key))
-                                (&aux (setf state :aux))
-                                (t nil)))
-                             ((eq state :required)
-                              (push (var-name p) progressive-bound))
-                             ((member state '(:optional :key :aux))
-                              (when (and (consp p) (cadr p))
-                                (push (cons (cadr p) (cons progressive-bound mdepth)) worklist))
-                              (let ((name (if (consp p) (car p) p)))
-                                (when (consp name) (setf name (cadr name)))
-                                (push (var-name name) progressive-bound))
-                              (when (and (consp p) (caddr p))
-                                (push (var-name (caddr p)) progressive-bound)))
-                             ((eq state :rest)
-                              (push (var-name p) progressive-bound)))))
-                       ;; Push body forms with all params bound
-                       (dolist (form lbody)
-                         (push (cons form (cons inner-bound mdepth)) worklist))))
+                     (if *symbol-macros*
+                         ;; Under an active symbol-macrolet, an enclosing binding
+                         ;; (e.g. a lambda parameter) may shadow a symbol-macro of
+                         ;; the same name (CLHS 3.4.2). The candidate memo drops the
+                         ;; enclosing BND, so it would lose that shadow and re-expand
+                         ;; the symbol-macro — infinitely if it is self-referential
+                         ;; (regression: symbol-macro-param-shadow-nested-lambda).
+                         ;; Fall back to the exact inline descent, which carries the
+                         ;; full enclosing BND. Rare, so the O(depth^2) is acceptable.
+                         (let* ((params (cadr e))
+                                (lbody (cddr e))
+                                (inner-bound (append (extract-param-names params) bnd)))
+                           (let ((state :required)
+                                 (progressive-bound bnd))
+                             (dolist (p params)
+                               (cond
+                                 ((lambda-list-keyword-p p)
+                                  (case p
+                                    ((&rest &body) (setf state :rest))
+                                    (&optional (setf state :optional))
+                                    (&key (setf state :key))
+                                    (&aux (setf state :aux))
+                                    (t nil)))
+                                 ((eq state :required)
+                                  (push (var-name p) progressive-bound))
+                                 ((member state '(:optional :key :aux))
+                                  (when (and (consp p) (cadr p))
+                                    (push (cons (cadr p) (cons progressive-bound mdepth)) worklist))
+                                  (let ((name (if (consp p) (car p) p)))
+                                    (when (consp name) (setf name (cadr name)))
+                                    (push (var-name name) progressive-bound))
+                                  (when (and (consp p) (caddr p))
+                                    (push (var-name (caddr p)) progressive-bound)))
+                                 ((eq state :rest)
+                                  (push (var-name p) progressive-bound)))))
+                           (dolist (form lbody)
+                             (push (cons form (cons inner-bound mdepth)) worklist)))
+                         ;; No active symbol-macro: merge the memoized free-var
+                         ;; CANDIDATES (names free w.r.t. E's own params,
+                         ;; *locals*-independent) re-scoped by the enclosing BND,
+                         ;; applying the real local-bound-p here. O(1) per enclosing
+                         ;; level instead of re-walking the inner body each time
+                         ;; level. Under *ffv-assume-bound* (we are collecting
+                         ;; candidates for an outer lambda) local-bound-p is T, so
+                         ;; this collects; otherwise it filters.
+                         (dolist (name (%lambda-free-candidates e))
+                           (when (and (not (member name bnd :test #'string=))
+                                      (not (gethash name free-ht))
+                                      (or *ffv-assume-bound* (local-bound-name-p name)))
+                             (setf (gethash name free-ht) t)))))
                     ;; Let/Let* introduces bindings
                     ((and (symbolp head) (member head '(let let*)))
                      (let* ((bindings (cadr e))
@@ -206,18 +234,34 @@
                          ((and (consp arg) (eq (car arg) 'lambda))
                           (push (cons arg (cons bnd mdepth)) worklist))
                          ((symbolp arg)
-                          (when (and arg (or (not (eq arg t)) (local-bound-p arg))
-                                     (not (special-var-p arg))
-                                     (local-bound-p arg))
-                            (let* ((plain-name (symbol-name arg))
-                                   (mangled-name (concatenate 'string "__LABELFN_" plain-name))
-                                   (capture-name (cond
-                                                   ((local-bound-p (intern mangled-name :dotcl.cil-compiler))
-                                                    mangled-name)
-                                                   (t plain-name))))
-                              (when (and (not (member capture-name bnd :test #'string=))
-                                         (not (gethash capture-name free-ht)))
-                                (setf (gethash capture-name free-ht) t))))))))
+                          (if *ffv-assume-bound*
+                              ;; Candidate collection: local-bound-p is T for all,
+                              ;; so the mangled-vs-plain choice below can't be made
+                              ;; yet. Emit BOTH names as candidates; the enclosing
+                              ;; merge's real local-bound-p keeps the labels-fn
+                              ;; (mangled) and/or the variable (plain) that is
+                              ;; actually bound. Over-collecting is harmless — merge
+                              ;; drops names that are not local-bound.
+                              (when (and arg (not (special-var-p arg)))
+                                (let ((plain-name (symbol-name arg))
+                                      (mangled-name (concatenate 'string "__LABELFN_"
+                                                                 (symbol-name arg))))
+                                  (dolist (nm (list mangled-name plain-name))
+                                    (when (and (not (member nm bnd :test #'string=))
+                                               (not (gethash nm free-ht)))
+                                      (setf (gethash nm free-ht) t)))))
+                              (when (and arg (or (not (eq arg t)) (local-bound-p arg))
+                                         (not (special-var-p arg))
+                                         (local-bound-p arg))
+                                (let* ((plain-name (symbol-name arg))
+                                       (mangled-name (concatenate 'string "__LABELFN_" plain-name))
+                                       (capture-name (cond
+                                                       ((local-bound-p (intern mangled-name :dotcl.cil-compiler))
+                                                        mangled-name)
+                                                       (t plain-name))))
+                                  (when (and (not (member capture-name bnd :test #'string=))
+                                             (not (gethash capture-name free-ht)))
+                                    (setf (gethash capture-name free-ht) t)))))))))
                     ;; handler-case: body + clauses with optional var binding
                     ((and (symbolp head) (eq head 'handler-case))
                      (let ((body-form (cadr e))
@@ -438,6 +482,62 @@
                                   (do-list-safe (sub e)
                                     (push (cons sub (cons bnd mdepth)) worklist))))))))))))))))))))
 
+(defun %compute-free-candidates (e)
+  "Free-variable CANDIDATE names of lambda form E, relative to E's OWN params.
+   Runs the same walk as the inline lambda case but under *ffv-assume-bound* (so
+   local-bound-p is T and every structurally-free name is collected) and with an
+   empty enclosing scope; the caller re-scopes by subtracting its BND and applies
+   the real local-bound-p. Because *locals* is not consulted, the result is a pure
+   function of E and can be memoized."
+  (let* ((params (cadr e))
+         (lbody (cddr e))
+         (inner-bound (extract-param-names params))
+         (free-ht (make-hash-table :test #'equal))
+         (*ffv-assume-bound* t))
+    ;; &optional/&key/&aux default forms with progressive left-to-right scoping,
+    ;; starting from the empty scope (a default referencing an enclosing-bound var
+    ;; is reported here and removed by the caller's BND subtraction).
+    (let ((state :required) (progressive-bound '()))
+      (dolist (p params)
+        (cond
+          ((lambda-list-keyword-p p)
+           (case p
+             ((&rest &body) (setf state :rest))
+             (&optional (setf state :optional))
+             (&key (setf state :key))
+             (&aux (setf state :aux))
+             (t nil)))
+          ((eq state :required)
+           (push (var-name p) progressive-bound))
+          ((member state '(:optional :key :aux))
+           (when (and (consp p) (cadr p))
+             (find-free-vars-expr (cadr p) progressive-bound free-ht))
+           (let ((name (if (consp p) (car p) p)))
+             (when (consp name) (setf name (cadr name)))
+             (push (var-name name) progressive-bound))
+           (when (and (consp p) (caddr p))
+             (push (var-name (caddr p)) progressive-bound)))
+          ((eq state :rest)
+           (push (var-name p) progressive-bound)))))
+    (dolist (form lbody)
+      (find-free-vars-expr form inner-bound free-ht))
+    (let ((keys '()))
+      (maphash (lambda (k v) (declare (ignore v)) (push k keys)) free-ht)
+      keys)))
+
+(defun %lambda-free-candidates (e)
+  "Memoized wrapper over %compute-free-candidates, keyed by EQ(E) in
+   *ffv-free-cache*. Within one top-level form EQ identity of E implies an
+   identical lexical macro/symbol-macro scope, and the candidate set is
+   *locals*-independent, so caching is a behaviour-preserving performance
+   transform."
+  (if *ffv-free-cache*
+      (multiple-value-bind (cached present) (gethash e *ffv-free-cache*)
+        (if present
+            cached
+            (setf (gethash e *ffv-free-cache*) (%compute-free-candidates e))))
+      (%compute-free-candidates e)))
+
 ;;; ============================================================
 ;;; Mutated/captured variable analysis (for boxing)
 ;;; ============================================================
@@ -459,6 +559,18 @@
 ;;; captured pass relied on its generic walk pushing the target; dropping that
 ;;; push would lose the capture mark and silently skip boxing (the
 ;;; mutation-loss class). Returns (values mutated-names captured-names).
+;;;
+;;; VAR-NAMES may be the sentinel :ALL, meaning "every referenced symbol is a
+;;; capture candidate" — used by %boundary-mut-ref to collect the full mutated
+;;; and referenced sets of a nested lambda once, so the enclosing walks reuse
+;;; them instead of re-descending (O(depth^2) -> O(depth) on nested
+;;; closures). Sound to memoize because this walk never consults *locals*:
+;;; captures key off explicit references and mutations off setq/place targets,
+;;; both pure functions of the form within a top-level compile (unlike the
+;;; free-var walk, whose local-bound-p filter is *locals*-dependent).
+(defvar *bmr-cache* nil
+  "Per-top-level-form EQ memo: lambda form -> (mutated-names . ref-names).")
+
 (defun find-mutated-and-captured-vars-expr (expr var-names mutated-ht captured-ht inside-lambda)
   (let ((worklist (list (cons expr (cons inside-lambda 0)))))
     (loop while worklist do
@@ -488,13 +600,15 @@
            ;; Mutation side always needs the expansion. So: if it IS a var-name,
            ;; mark captured (when in-lambda) but still expand for the mutation walk;
            ;; if it is NOT a var-name, just expand (matches both old passes).
-           (when (and in-lambda (member (var-name e) var-names :test #'string=))
+           (when (and in-lambda (or (eq var-names :all)
+                                    (member (var-name e) var-names :test #'string=)))
              (setf (gethash (var-name e) captured-ht) t))
            (push (cons (cdr (assoc e *symbol-macros* :test #'eq))
                        (cons in-lambda (1+ mdepth)))
                  worklist))
           ((and (symbolp e) in-lambda)
-           (when (member (var-name e) var-names :test #'string=)
+           (when (or (eq var-names :all)
+                     (member (var-name e) var-names :test #'string=))
              (setf (gethash (var-name e) captured-ht) t)))
           ((consp e)
            (let ((head (car e)))
@@ -564,9 +678,17 @@
                ((and (symbolp head) (eq head 'defun))
                 (dolist (form (cdddr e))
                   (push (cons form (cons t mdepth)) worklist)))
+               ;; Nested lambda: its whole content is inside-lambda, so every
+               ;; mutation is a mutation and every reference is a capture
+               ;; candidate. Compute both sets once (memoized) and merge, instead
+               ;; of re-walking the body once per enclosing lambda.
                ((and (symbolp head) (eq head 'lambda))
-                (dolist (sub (cdr e))
-                  (push (cons sub (cons t mdepth)) worklist)))
+                (multiple-value-bind (mut ref) (%boundary-mut-ref e)
+                  (dolist (n mut) (setf (gethash n mutated-ht) t))
+                  (dolist (n ref)
+                    (when (or (eq var-names :all)
+                              (member n var-names :test #'string=))
+                      (setf (gethash n captured-ht) t)))))
                ((and (symbolp head) (member head '(let let*)))
                 (let ((bindings (cadr e))
                       (lbody (cddr e))
@@ -656,10 +778,33 @@
                       (do-list-safe (sub e)
                         (push (cons sub (cons in-lambda mdepth)) worklist)))))))))))))
 
+(defun %boundary-mut-ref (lam)
+  "Return (values MUT-NAMES REF-NAMES) for lambda form LAM: every symbol name
+   mutated anywhere in LAM, and every symbol name referenced anywhere in LAM
+   (all inside-lambda, hence all capture candidates). Both are independent of the
+   caller's var-names, so this is computed once and memoized by EQ(LAM) in
+   *bmr-cache*; the caller intersects REF with its own var-names. Walks (CDR LAM)
+   rather than LAM so a nested lambda re-enters through the memoized lambda case
+   instead of recursing on itself. NIL cache => uncached (identical result)."
+  (flet ((compute ()
+           (let ((mut (make-hash-table :test #'equal))
+                 (ref (make-hash-table :test #'equal)))
+             (dolist (sub (cdr lam))
+               (find-mutated-and-captured-vars-expr sub :all mut ref t))
+             (let ((ml '()) (rl '()))
+               (maphash (lambda (k v) (declare (ignore v)) (push k ml)) mut)
+               (maphash (lambda (k v) (declare (ignore v)) (push k rl)) ref)
+               (cons ml rl)))))
+    (let ((cell (if *bmr-cache*
+                    (multiple-value-bind (c present) (gethash lam *bmr-cache*)
+                      (if present c (setf (gethash lam *bmr-cache*) (compute))))
+                    (compute))))
+      (values (car cell) (cdr cell)))))
+
 (defun find-mutated-and-captured-vars (body var-names)
   "One walk computing both sets. Returns (values mutated-names captured-names),
    each a list of variable-name strings. Replaces adjacent find-mutated-vars +
-   find-captured-vars calls on the same BODY (issue #395)."
+   find-captured-vars calls on the same BODY."
   (let ((mutated-ht (make-hash-table :test #'equal))
         (captured-ht (make-hash-table :test #'equal)))
     (dolist (form body)
@@ -821,7 +966,7 @@
                                           ; so boxing a discarded native float
                                           ; store result is dead — pop the raw r8
                                           ; instead. (Float-array setf in
-                                          ; statement position; #448 phase 2.)
+                                          ; statement position.)
    (P3+P4 compose across the fixpoint to delete the dead nil/unwrap/pop preamble
     that codegen emits at the top of every TCO loop body.)
 
@@ -1018,7 +1163,9 @@
         (*local-functions* '())
         (*at-toplevel* t)
         (*macroexpand-scope* '())
-        (*macroexpand-cache* (make-hash-table :test #'eq)))
+        (*macroexpand-cache* (make-hash-table :test #'eq))
+        (*bmr-cache* (make-hash-table :test #'eq))
+        (*ffv-free-cache* (make-hash-table :test #'eq)))
     `(,@(compile-expr expr)
       (:ret))))
 
@@ -1037,6 +1184,8 @@
         (*at-toplevel* t)
         (*in-tail-position* t)
         (*macroexpand-scope* '())
-        (*macroexpand-cache* (make-hash-table :test #'eq)))
+        (*macroexpand-cache* (make-hash-table :test #'eq))
+        (*bmr-cache* (make-hash-table :test #'eq))
+        (*ffv-free-cache* (make-hash-table :test #'eq)))
     `(,@(compile-expr expr)
       (:ret))))

@@ -41,23 +41,6 @@ dotcl --eval "(format t \"hello, ~a~%\" (lisp-implementation-type))"
 dotcl --load my-program.lisp
 ```
 
-The framework-dependent `dotcl` package is portable across OS / arch but
-JIT-compiles the core on first launch (~3 s cold start). For faster
-startup, install the RID-specific package — it bundles ahead-of-time
-(R2R) FASLs:
-
-```bash
-# Pick the one matching your host:
-dotnet tool install --global dotcl.win-x64
-dotnet tool install --global dotcl.win-arm64
-dotnet tool install --global dotcl.linux-x64
-dotnet tool install --global dotcl.linux-arm64
-dotnet tool install --global dotcl.osx-x64
-dotnet tool install --global dotcl.osx-arm64
-```
-
-The two variants share the `dotcl` command name, so install only one.
-
 For Roswell users, per-RID tarballs are also published on each
 [release page](https://github.com/dotcl/dotcl/releases).
 

@@ -3,6 +3,65 @@
 User-facing release notes for dotcl. Each section corresponds to a tagged
 release on the public mirror (dotcl/dotcl).
 
+## v0.1.18 -- 2026-07-13
+
+Adds a first-class .NET `decimal` type, tightens a couple of interop and
+concurrency contracts, and fixes `dotnet tool install` so it pulls the fast
+native build.
+
+### System.Decimal as a first-class number
+
+- `System.Decimal` values are now a first-class CL number instead of an opaque
+  object. A decimal is a distinct exactness category -- `numberp` and `realp` are
+  true, `rationalp` and `floatp` are false -- so its base-10 scale (the trailing
+  zeros in `1.50`) survives, which a CL ratio would normalize away.
+- Read and print decimals with `#m`: `#m1.50` and `#m"1.50"` read a decimal
+  preserving scale, and it prints back the same way.
+- `dotcl:decimalp` tests for one and `(typep x 'dotcl:decimal)` works. `(rational
+  d)` gives the exact ratio and `(float d)` a float; `=` / `<` / `>` compare by
+  value (`(= #m1.0 1)` is true) while `eql` is representation-sensitive.
+- .NET APIs that take or return `decimal` marshal naturally: a returned decimal
+  keeps its scale, and a CL integer or exactly-representable ratio passed to a
+  decimal parameter converts exactly (a non-representable ratio like 1/3 signals
+  an error rather than rounding silently).
+- Standard arithmetic stays conservative -- `(+ #m1.5 1)` yields a rational,
+  never a decimal, so code that never mentions decimals never meets one. Inside a
+  `(declare (type dotcl:decimal x y))` scope, `+ - * /` instead compile to native
+  `System.Decimal` operations and preserve scale (`1.50m + 2.25m` stays `3.75m`).
+  Mixing a declared decimal with a float in one operation is rejected -- coerce
+  explicitly -- since .NET itself forbids implicit decimal/double conversion.
+
+### Generic-function dispatch
+
+- Polymorphic call sites are much faster. The dispatch cache is now N-way, so a
+  generic function called on several classes in rotation stays warm instead of
+  recomputing the applicable methods every call. Standard slot accessors read and
+  write the slot directly, and a reader accessor called at a monomorphic site is
+  inlined to a direct slot read.
+
+### Concurrency
+
+- `dotcl:compare-and-swap` returns the prior value of the place (matching SBCL,
+  CCL, and `Interlocked.CompareExchange`) instead of a boolean. Success is `(eq
+  old result)`; a failed swap hands back the current value to reuse as the next
+  `old` in a retry loop, with no separate racy re-read.
+
+### Fixes
+
+- `(setf (readtable-case rt) mode)` on a non-CL `readtable-case` -- a package that
+  shadows the CL symbol with its own CLOS protocol, such as Eclector's -- reaches
+  the user's own writer instead of being hijacked by the built-in.
+- `dotnet tool install -g dotcl` installs the host's Ready-to-Run build again.
+  The tool's package pointer had listed only the framework-dependent `any` build,
+  so installs fell back to the slower non-R2R runtime; it now enumerates every
+  per-RID package.
+
+### Thanks
+
+- Bohong Huang -- for the FILE-POSITION string-stream / Gray-stream fix (a pull
+  request) and for reporting the `return-from`-in-an-external-macro block-resolution
+  bug, both fixed this release.
+
 ## v0.1.17 -- 2026-07-10
 
 A performance, interop, and concurrency release, with the usual long tail of

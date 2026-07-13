@@ -1541,6 +1541,31 @@ public class Reader
         }
     }
 
+    /// <summary>#m1.50 or #m"1.50" — read a first-class CLR decimal, scale preserved.
+    /// The token form is base-independent (unlike a `1.50m` suffix, whose `m` would be a
+    /// digit at *read-base* >= 23); the string form is handy for programmatic scales.</summary>
+    internal LispObject ReadDecimal()
+    {
+        string tok;
+        if (Peek() == '"')
+        {
+            var s = Read();
+            if (_readSuppress) return Nil.Instance;
+            if (s is not LispString ls)
+                throw MakeReaderError("#m: expected a decimal string");
+            tok = ls.Value;
+        }
+        else
+        {
+            tok = ReadTokenString();
+            if (_readSuppress) return Nil.Instance;
+        }
+        if (!decimal.TryParse(tok, System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture, out var d))
+            throw MakeReaderError($"#m: invalid decimal literal: {tok}");
+        return new LispDecimal(d);
+    }
+
     private static BigInteger ParseIntegerRadix(string token, int radix)
     {
         bool negative = false;
@@ -2058,6 +2083,8 @@ public class Reader
         rt.SetDispatchMacroCharacter('#', 'P', (r, c, n) => r.ReadPathnameShorthand());
         rt.SetDispatchMacroCharacter('#', 'R', (r, c, n) => r.ReadRadixNumber(n));
         rt.SetDispatchMacroCharacter('#', 'S', (r, c, n) => r.ReadStructureLiteral());
+        // #m<token> / #m"<string>" — a first-class CLR decimal, scale preserved (dotcl).
+        rt.SetDispatchMacroCharacter('#', 'M', (r, c, n) => r.ReadDecimal());
         rt.SetDispatchMacroCharacter('#', 'X', (r, c, n) => r.ReadRadixNumber(16));
         // CLHS: #) and #< signal error
         rt.SetDispatchMacroCharacter('#', ')', (r, c, n) =>

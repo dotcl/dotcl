@@ -4603,3 +4603,58 @@
 (deftest integer-decode-single-float
   (multiple-value-list (integer-decode-float 3.2f0))
   (13421773 -22 1))
+
+;; dotcl/dotcl issue 51: a macro that expands to (return-from <defun-name> …) must
+;; resolve the implicit defun block even when the macro call is nested inside a
+;; special form. The block-elision (use-direct) scan only expanded TOP-LEVEL macro
+;; calls, so a macro under (progn …)/(when …)/(let …) was missed and compiling the
+;; expanded return-from signalled "no block named …".
+(defmacro i51-ret () `(return-from i51-progn 5))
+(defun i51-progn () (progn (i51-ret)) 99)
+(deftest issue51-return-from-macro-in-progn (i51-progn) 5)
+
+(defmacro i51-ret2 () `(return-from i51-when 7))
+(defun i51-when () (when t (i51-ret2)) 99)
+(deftest issue51-return-from-macro-in-when (i51-when) 7)
+
+(defmacro i51-ret3 () `(return-from i51-let 11))
+(defun i51-let () (let ((z 0)) (declare (ignore z)) (i51-ret3)) 99)
+(deftest issue51-return-from-macro-in-let (i51-let) 11)
+
+;; Value-returning and the plain direct-call form (control) must still work.
+(defmacro i51-ret4 () `(return-from i51-direct 13))
+(defun i51-direct () (i51-ret4) 99)
+(deftest issue51-return-from-macro-direct (i51-direct) 13)
+
+;; a known-function intrinsic in tail position whose argument is a self
+;; tail-call must still execute — the intrinsic entries compiled args without
+;; binding *in-tail-position* nil, so the self-call fired TCO and the intrinsic
+;; call became unreachable dead code (side effect silently lost).
+(defun i502-tsc (n) (if (zerop n) 0 (princ (i502-tsc (- n 1)))))
+(deftest issue502-tail-intrinsic-arg-self-call
+  ;; princ runs once per level (3 times), each writing the base value "0".
+  ;; Bug = 0 chars (princ dead-coded); fixed = "000".
+  (length (with-output-to-string (*standard-output*) (i502-tsc 3)))
+  3)
+;; multiple-value-list keeps MV context for its arg but must still block tail:
+;; a self-tail-call arg otherwise TCOs and dead-codes the wrapping call, so the
+;; result would be the raw values (primary = a number) instead of a list.
+(defun i502-mvl (n) (if (zerop n) (values 10 20) (multiple-value-list (i502-mvl (1- n)))))
+(deftest issue502-multiple-value-list-tail (listp (i502-mvl 1)) t)
+
+;; (setf (pkg:readtable-case obj) mode) via a non-CL symbol named READTABLE-CASE
+;; (e.g. eclector.readtable:readtable-case, which :shadows cl:readtable-case with its
+;; own CLOS protocol) was hijacked into the built-in %set-readtable-case expander and
+;; fataled with "not a readtable" — the (setf compiler-macro-function)/(setf
+;; macro-function) hijack, 3rd instance. It must reach the place's own
+;; #'(setf pkg:readtable-case). Blocks eclector/mallet bring-up.
+(defpackage "SETF-RTC-SHADOW-TEST" (:use))
+(defclass srtc-obj () ((rc :initform :upcase)))
+(defmethod setf-rtc-shadow-test::readtable-case ((r srtc-obj)) (slot-value r 'rc))
+(defmethod (setf setf-rtc-shadow-test::readtable-case) (mode (r srtc-obj))
+  (setf (slot-value r 'rc) mode))
+(deftest setf-non-cl-readtable-case-delegates
+  (let ((o (make-instance 'srtc-obj)))
+    (setf (setf-rtc-shadow-test::readtable-case o) :preserve)
+    (setf-rtc-shadow-test::readtable-case o))
+  :preserve)

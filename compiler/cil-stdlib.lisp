@@ -1116,12 +1116,17 @@ Also expands element types within compound type specifiers like (VECTOR etype si
 (defvar *cas-lock* (%make-lock "dotcl-cas-global"))
 
 (defun %cas-expand (place old new)
+  ;; Returns the PRIOR value of PLACE (sb-ext / CCL / Interlocked.CompareExchange
+  ;; convention), not a T/NIL success flag: success is (eq old ret), and a failed CAS
+  ;; hands back the current value for the next retry with no separate (racy) re-read.
   (multiple-value-bind (temps vals stores setter getter) (get-setf-expansion place)
-    (let ((s (car stores)) (o (gensym "OLD")) (n (gensym "NEW")))
+    (let ((s (car stores)) (o (gensym "OLD")) (n (gensym "NEW")) (cur (gensym "CUR")))
       `(let* (,@(mapcar #'list temps vals) (,o ,old) (,n ,new))
          (%acquire-lock *cas-lock* t)
          (unwind-protect
-              (if (eq ,getter ,o) (let ((,s ,n)) ,setter t) nil)
+              (let ((,cur ,getter))
+                (when (eq ,cur ,o) (let ((,s ,n)) ,setter))
+                ,cur)
            (%release-lock *cas-lock*))))))
 
 (defun %atomic-delta-expand (place delta op)

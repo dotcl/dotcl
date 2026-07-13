@@ -181,6 +181,13 @@
   "Maps accessor symbol to slot index (integer) for compile-time inlining.
    Only populated for standard (non-typed) structs.")
 
+(defvar *clos-accessor-readers* (make-hash-table :test #'eq)
+  "Set of symbols named by DEFCLASS :reader/:accessor — a compile-time HINT that a
+   1-arg call is likely a simple slot reader, so compile-named-call emits the
+   Runtime.ReaderFast fast path. Only a hint: ReaderFast re-checks the
+   GF's SimpleReaderSlot flag at runtime, so a stale/over-broad entry only costs a
+   wrapper call, never correctness.")
+
 (defvar *setf-expansion-fns* (make-hash-table :test #'equal)
   "DEFINE-SETF-EXPANDER entries: accessor-name-string → (lambda (place) → 5 values)")
 
@@ -239,9 +246,24 @@
       (lambda (place value)
         `(%set-fill-pointer ,(second place) ,value)))
 
+;; (setf (readtable-case rt) mode) — delegate to %set-readtable-case for CL's
+;; READTABLE-CASE, but a non-CL variant (e.g. eclector.readtable:readtable-case,
+;; :shadow-ing cl:readtable-case with its own CLOS protocol) must not be hijacked by
+;; the built-in expander: fall back to the place's own (setf ...) function (CLHS
+;; 5.1.2.5). Same shape as COMPILER-MACRO-FUNCTION/MACRO-FUNCTION.
 (setf (gethash "READTABLE-CASE" *setf-expanders*)
       (lambda (place value)
-        `(%set-readtable-case ,(second place) ,value)))
+        (let ((fn-sym (first place)))
+          (if (and (symbolp fn-sym)
+                   (let ((pkg (symbol-package fn-sym)))
+                     (and pkg (not (string= (package-name pkg) "COMMON-LISP")))))
+              (let ((arg-temps (mapcar (lambda (a) (declare (ignore a)) (gensym "SETF-ARG"))
+                                       (cdr place)))
+                    (val-temp (gensym "SETF-VAL")))
+                `(let* (,@(mapcar #'list arg-temps (cdr place))
+                        (,val-temp ,value))
+                   (funcall (function (setf ,fn-sym)) ,val-temp ,@arg-temps)))
+              `(%set-readtable-case ,(second place) ,value)))))
 
 (setf (gethash "LOGICAL-PATHNAME-TRANSLATIONS" *setf-expanders*)
       (lambda (place value)
@@ -2690,6 +2712,13 @@
                                  (list sname initargs initform-present initform accessors readers writers allocation
                                        (nreverse custom-opts)))))
                          (or slot-specs '())))
+               ;; register :reader/:accessor names as slot-reader hints
+               ;; (side effect at macro-expansion time, mirroring *struct-accessors*).
+               (%reader-reg (progn
+                              (dolist (ps parsed-slots)
+                                (dolist (r (append (fifth ps) (sixth ps))) ; accessors + readers
+                                  (setf (gethash r *clos-accessor-readers*) t)))
+                              nil))
                ;; Parse class options for :default-initargs
                (default-initargs-forms
                  (let ((result nil))

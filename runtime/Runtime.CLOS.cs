@@ -975,6 +975,41 @@ public static partial class Runtime
         return value;
     }
 
+    /// <summary>Item3b: compile-time-inlined fast path for a call to a simple
+    /// slot-reader accessor GF, backed by a per-call-site monomorphic inline cache
+    /// (<paramref name="cell"/>, baked once by the assembler). On a hit — same class as
+    /// last time and the method-system epoch unchanged — the slot is read straight from
+    /// the instance vector, with no GF resolution, no dispatch, and no name→index lookup.
+    /// A miss re-resolves the accessor and refills the cell; anything that isn't a plain
+    /// instance-allocated simple reader (redefined/extended accessor, custom metaclass,
+    /// class-allocated or unbound slot) falls through to a normal 1-arg invocation, so
+    /// semantics are identical to calling the GF directly.</summary>
+    public static LispObject ReaderIC(LispObject obj, ReaderCache cell)
+    {
+        if (obj is LispInstance inst)
+        {
+            var e = cell.E;
+            if (e != null && e.Epoch == GenericFunction.MethodEpoch
+                && ReferenceEquals(inst.Class, e.Cls))
+            {
+                var v = inst.Slots[e.Idx];
+                if (v != null) return v;   // bound slot (bound NIL is non-null) — hot path
+                // unbound slot: fall to full path for the SLOT-UNBOUND protocol
+            }
+            else if (Emitter.CilAssembler.GetFunctionBySymbol(cell.Sym) is GenericFunction gf
+                     && gf.SimpleReaderSlot is { } s && inst.Class.Metaclass == null
+                     && inst.Class.SlotIndex.TryGetValue(s.Name, out int idx))
+            {
+                // Only instance-allocated slots are cacheable as a direct Slots[idx] read;
+                // :class-allocation lives on the owner class, so serve it without caching.
+                if (!inst.Class.EffectiveSlots[idx].IsClassAllocation)
+                    cell.E = new ReaderCache.Entry(inst.Class, idx, GenericFunction.MethodEpoch);
+                return SlotValueDirect(inst, idx, s, s.Name);
+            }
+        }
+        return Emitter.CilAssembler.GetFunctionBySymbol(cell.Sym).Invoke(new LispObject[] { obj });
+    }
+
     public static LispObject SlotBoundp(LispObject obj, LispObject slotName)
     {
         if (obj is LispInstanceCondition lic) obj = lic.Instance;
@@ -2288,6 +2323,7 @@ public static partial class Runtime
                     method.Owner = gf;
                     gf.ReplaceMethods(replaced);
                     gf.InvalidateCache();
+                    gf.RecomputeAccessorFlags();
                     return gf;
                 }
             }
@@ -2297,6 +2333,7 @@ public static partial class Runtime
             method.Owner = gf;
             gf.ReplaceMethods(appended);
             gf.InvalidateCache();
+            gf.RecomputeAccessorFlags();
         }
         return gf;
     }
@@ -2334,6 +2371,7 @@ public static partial class Runtime
                 method.Owner = null;
                 gf.ReplaceMethods(arr);
                 gf.InvalidateCache();
+                gf.RecomputeAccessorFlags();
             }
         }
         return gf;
@@ -2539,6 +2577,9 @@ public static partial class Runtime
                 foreach (var m in gf.Methods)
                     if (m.Qualifiers.Length == 0 && Array.IndexOf(m.Specializers, cls) >= 0)
                     { m.AccessorSlot = slotd; break; }
+            // The AccessorSlot tag is what RecomputeAccessorFlags keys on; the method
+            // was already added (with AccessorSlot null then), so recompute now.
+            gf.RecomputeAccessorFlags();
         }
         return Nil.Instance;
     }
@@ -2695,6 +2736,37 @@ public static partial class Runtime
         }
     }
 
+    /// <summary>add ENTRY to GF's N-way dispatch cache. Rebuilds an immutable
+    /// array with ENTRY at the front (most-recent), dropping any existing entry that
+    /// has the same argument classes (ENTRY replaces it) and capping at
+    /// DispatchCacheWidth, then publishes it with one volatile write — a concurrent
+    /// reader sees the whole old or whole new array, never a partial one. Racing fills
+    /// may lose an entry (a future miss re-fills it); a race with InvalidateCache can
+    /// leave a briefly-stale entry, exactly as the previous single-entry cache did.</summary>
+    private static void AddDispatchCache(GenericFunction gf, CachedDispatch entry)
+    {
+        var old = gf.DispatchCache;
+        var list = new List<CachedDispatch>(GenericFunction.DispatchCacheWidth) { entry };
+        if (old != null)
+        {
+            foreach (var e in old)
+            {
+                if (list.Count >= GenericFunction.DispatchCacheWidth) break;
+                if (SameArgTypes(e.ArgTypes, entry.ArgTypes)) continue; // replaced by ENTRY
+                list.Add(e);
+            }
+        }
+        gf.DispatchCache = list.ToArray();
+    }
+
+    private static bool SameArgTypes(LispClass?[] a, LispClass?[] b)
+    {
+        if (a.Length != b.Length) return false;
+        for (int i = 0; i < a.Length; i++)
+            if (!ReferenceEquals(a[i], b[i])) return false;
+        return true;
+    }
+
     private static LispObject DispatchGF(GenericFunction gf, LispObject[] args)
     {
         // Arity check: signal program-error for too few/too many arguments
@@ -2711,22 +2783,44 @@ public static partial class Runtime
                     $"{gf.Name.Name}: too many arguments ({args.Length}), expected at most {maxArgs}"));
         }
 
-        // Cache check: try monomorphic inline cache
-        var cached = gf.LastDispatch;
-        if (cached != null)
+        // Cache check: N-way polymorphic inline cache. Scan the recent
+        // dispatches for one whose argument classes match this call, then fall into
+        // the (unchanged) hit logic below. The old single-entry cache missed on every
+        // alternation between 2+ classes at a call site (3.5-4.6x on poly sites).
+        CachedDispatch? cached = null;
         {
-            var cachedTypes = cached.ArgTypes;
-            bool match = cachedTypes.Length <= args.Length;
-            if (match)
+            var dcache = gf.DispatchCache;
+            if (dcache != null)
             {
-                for (int i = 0; i < cachedTypes.Length; i++)
+                foreach (var entry in dcache)
                 {
-                    if (!ReferenceEquals(ArgDispatchClass(args[i]), cachedTypes[i]))
-                    { match = false; break; }
+                    var cachedTypes = entry.ArgTypes;
+                    if (cachedTypes.Length > args.Length) continue;
+                    bool match = true;
+                    for (int i = 0; i < cachedTypes.Length; i++)
+                    {
+                        if (!ReferenceEquals(ArgDispatchClass(args[i]), cachedTypes[i]))
+                        { match = false; break; }
+                    }
+                    if (match) { cached = entry; break; }
                 }
             }
-            if (match)
-            {
+        }
+        if (cached != null)
+        {
+                // Item2: specialized standard slot reader — read the slot directly,
+                // skipping keyword/eql checks and effective-method construction. The cache
+                // entry was only stored for this shape (1 dispatch arg, single accessor
+                // primary, no aux methods, standard metaclass, instance-allocated slot), so
+                // args[0] is a LispInstance of ArgTypes[0] and ReaderSlotIndex is its slot.
+                if (cached.ReaderSlotIndex >= 0 && args[0] is LispInstance readerInst)
+                    return SlotValueDirect(readerInst, cached.ReaderSlotIndex,
+                                           cached.ReaderSlotName!, cached.ReaderSlotName!.Name);
+                // Item2b: specialized standard slot writer — write the slot directly.
+                // (setf accessor) is arity 2: object = args[1], new value = args[0].
+                if (cached.WriterSlotIndex >= 0 && args.Length >= 2 && args[1] is LispInstance writerInst)
+                    return SetSlotValueDirect(writerInst, cached.WriterSlotIndex,
+                                              cached.WriterSlotName!.Name, args[0]);
                 // Keyword validation must run on the cache-hit path too — a warm
                 // monomorphic cache otherwise skips the unknown-keyword check that the
                 // cache-miss path performs (ANSI DEFMETHOD.ERROR.14/15).
@@ -2841,7 +2935,6 @@ public static partial class Runtime
                     return InvokeWithNextMethods(cached.Around, 0, args,
                         a => InvokeStandardCombination(cached.Before, cached.Primary, cached.After, a));
                 return InvokeStandardCombination(cached.Before, cached.Primary, cached.After, args);
-            }
         }
 
         // Find applicable methods
@@ -2887,7 +2980,7 @@ public static partial class Runtime
                 var types = new LispClass?[n];
                 for (int i = 0; i < n && i < args.Length; i++)
                     types[i] = ArgDispatchClass(args[i]);
-                gf.LastDispatch = new CachedDispatch
+                AddDispatchCache(gf, new CachedDispatch
                 {
                     ArgTypes = types,
                     Applicable = applicable,
@@ -2897,7 +2990,7 @@ public static partial class Runtime
                     Before = new List<LispMethod>(),
                     Primary = new List<LispMethod>(),
                     After = new List<LispMethod>()
-                };
+                });
             }
             return DispatchBuiltinCombination(gf, applicable, args);
         }
@@ -2956,15 +3049,50 @@ public static partial class Runtime
             var types = new LispClass?[n];
             for (int i = 0; i < n && i < args.Length; i++)
                 types[i] = ArgDispatchClass(args[i]);
-            gf.LastDispatch = new CachedDispatch
+            // Item2: specialize a standard slot READER — one dispatch arg, a single
+            // accessor primary with no before/after/around, a standard-metaclass instance
+            // and an instance-allocated slot. The hit path then reads the slot directly
+            // (SlotValueDirect), which is exactly what the reader method's body does, minus
+            // effective-method construction and the lambda call. requiredCount==1 excludes
+            // (setf accessor) writers (arity 2). InvalidateCache on any method add clears it.
+            int readerIdx = -1, writerIdx = -1;
+            Symbol? readerName = null, writerName = null;
+            if (primaryMethods.Count == 1
+                && aroundMethods.Count == 0 && beforeMethods.Count == 0 && afterMethods.Count == 0
+                && primaryMethods[0].AccessorSlot is { } asd)
+            {
+                if (requiredCount == 1
+                    && args.Length >= 1 && args[0] is LispInstance rinst && rinst.Class.Metaclass == null
+                    && rinst.Class.SlotIndex.TryGetValue(asd.Name.Name, out int sidx)
+                    && !rinst.Class.EffectiveSlots[sidx].IsClassAllocation)
+                {
+                    readerIdx = sidx;
+                    readerName = asd.Name;
+                }
+                // Item2b: (setf accessor) writer — object is the last required arg
+                // (args[requiredCount-1]), new value is args[0]. Write the slot directly.
+                else if (requiredCount == 2
+                    && args.Length >= 2 && args[1] is LispInstance winst && winst.Class.Metaclass == null
+                    && winst.Class.SlotIndex.TryGetValue(asd.Name.Name, out int widx)
+                    && !winst.Class.EffectiveSlots[widx].IsClassAllocation)
+                {
+                    writerIdx = widx;
+                    writerName = asd.Name;
+                }
+            }
+            AddDispatchCache(gf, new CachedDispatch
             {
                 ArgTypes = types,
                 Around = aroundMethods,
                 Before = beforeMethods,
                 Primary = primaryMethods,
                 After = afterMethods,
-                HasEqlSpecializers = false
-            };
+                HasEqlSpecializers = false,
+                ReaderSlotIndex = readerIdx,
+                ReaderSlotName = readerName,
+                WriterSlotIndex = writerIdx,
+                WriterSlotName = writerName
+            });
         }
         else if (requiredCount == 1)
         {
@@ -3009,7 +3137,7 @@ public static partial class Runtime
                 }
                 var types = new LispClass?[1];
                 if (args.Length > 0) types[0] = ArgDispatchClass(args[0]);
-                gf.LastDispatch = new CachedDispatch
+                AddDispatchCache(gf, new CachedDispatch
                 {
                     ArgTypes = types,
                     Around = aroundMethods,
@@ -3020,7 +3148,7 @@ public static partial class Runtime
                     EqlMethods = eqlArr,
                     EqlValues = eqlValues,
                     EqlChains = eqlChains
-                };
+                });
             }
         }
 

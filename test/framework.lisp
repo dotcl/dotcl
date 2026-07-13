@@ -1,7 +1,8 @@
-;;; framework.lisp — Lightweight deftest framework for ANSI test porting
+;;; framework.lisp — Lightweight deftest framework
 ;;;
-;;; Load before test files:
-;;;   ros cil-compile.ros test/framework.lisp test/ansi/cons.lisp output.sil
+;;; Loaded by the dotcl-specific test harnesses before their test bodies:
+;;;   test/regression/run.lisp   (make test-regression)
+;;;   test/mop-protocol.lisp     (make test-mop)
 
 (defvar *test-count* 0)
 (defvar *pass-count* 0)

@@ -162,6 +162,10 @@
 
 (defvar dotcl::%atomics-lock nil)
 
+;; Returns the PRIOR value of PLACE (sb-ext / CCL convention), not a T/NIL flag:
+;; success is (eq old ret), and a failed CAS hands back the current value for the
+;; next retry with no separate (racy) re-read. Kept in sync with the
+;; base fallback in cil-stdlib.lisp (%cas-expand).
 (defmacro dotcl::compare-and-swap (place old new)
   (let ((o (gensym "OLD")) (n (gensym "NEW")) (c (gensym "CUR")))
     (multiple-value-bind (temps vals stores writer reader)
@@ -170,11 +174,9 @@
          (dotcl:acquire-lock dotcl::%atomics-lock)
          (unwind-protect
            (let ((,c ,reader))
-             (if (eq ,c ,o)
-               (let ((,(car stores) ,n))
-                 ,writer
-                 t)
-               nil))
+             (when (eq ,c ,o)
+               (let ((,(car stores) ,n)) ,writer))
+             ,c)
            (dotcl:release-lock dotcl::%atomics-lock))))))
 
 (defmacro dotcl::atomic-incf (place &optional (delta 1))

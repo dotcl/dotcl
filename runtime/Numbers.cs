@@ -95,6 +95,63 @@ public class Ratio : Number
     public override int GetHashCode() => HashCode.Combine(Numerator, Denominator);
 }
 
+/// <summary>A first-class CLR <see cref="decimal"/> (System.Decimal) value: a base-10,
+/// scale-preserving number (96-bit mantissa × 10^-scale). Distinct third exactness
+/// category — <c>numberp</c>/<c>realp</c>=T but <c>rationalp</c>=<c>floatp</c>=NIL — so
+/// that trailing-zero / scale information (1.00m ≠ representation of 1) survives, which a
+/// CL ratio would normalize away. It arises only from explicit construction (#m literal),
+/// coercion, or .NET interop; standard arithmetic treats it by its exact rational value and
+/// yields standard tower types (conservative extension — existing code never meets it).</summary>
+public class LispDecimal : Number
+{
+    public decimal Value { get; }
+
+    public LispDecimal(decimal value)
+    {
+        Value = value;
+        DotCL.Diagnostics.AllocCounter.Inc("LispDecimal");
+    }
+
+    /// <summary>Exact rational value (num/den, un-normalized denominator = 10^scale).
+    /// Always exact: a decimal is mantissa/10^scale by construction.</summary>
+    public (BigInteger Num, BigInteger Den) AsRatio()
+    {
+        int[] bits = decimal.GetBits(Value);
+        BigInteger mantissa = ((BigInteger)(uint)bits[2] << 64)
+            | ((BigInteger)(uint)bits[1] << 32) | (uint)bits[0];
+        int flags = bits[3];
+        int scale = (flags >> 16) & 0xFF;              // 0..28
+        bool negative = (flags & unchecked((int)0x80000000)) != 0;
+        var num = negative ? -mantissa : mantissa;
+        var den = BigInteger.Pow(10, scale);
+        return (num, den);
+    }
+
+    /// <summary>The decimal's value as a normalized CL rational (Fixnum/Bignum/Ratio).</summary>
+    public Number ToRational()
+    {
+        var (num, den) = AsRatio();
+        return (Number)Ratio.Make(num, den);
+    }
+
+    // "#m1.50" — round-trippable, scale preserved (InvariantCulture "." decimal point).
+    public override string ToString() =>
+        "#m" + Value.ToString(System.Globalization.CultureInfo.InvariantCulture);
+
+    // EQL is representation-sensitive (scale included): 1.0m and 1.00m are NOT eql,
+    // though = compares them equal (via the exact rational value in the tower). GetBits
+    // captures mantissa+scale+sign, so its sequence equality distinguishes scales.
+    public override bool Equals(object? obj)
+    {
+        if (obj is not LispDecimal other) return false;
+        var a = decimal.GetBits(Value);
+        var b = decimal.GetBits(other.Value);
+        return a[0] == b[0] && a[1] == b[1] && a[2] == b[2] && a[3] == b[3];
+    }
+
+    public override int GetHashCode() => Value.GetHashCode();
+}
+
 public class SingleFloat : Number
 {
     public float Value { get; }

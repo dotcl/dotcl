@@ -161,6 +161,24 @@
                   (compile-expr (car args)))
               (:ldc-i4 ,slot-idx)
               (:call "Runtime.StructRefI"))))))
+    ;; Inline CLOS simple-reader accessor: (reader obj) → Runtime.ReaderIC(obj, cell),
+    ;; a per-call-site monomorphic inline cache. On a warm hit it reads the slot straight
+    ;; from the instance vector (no GF resolution, no dispatch, no name→index lookup); any
+    ;; miss re-resolves and anything that isn't a plain instance-slot simple reader falls
+    ;; back to full dispatch. The DEFCLASS-populated registry is only a
+    ;; compile-time hint that NAME is likely a reader; ReaderIC re-validates at run time
+    ;; (SimpleReaderSlot flag + epoch), so a redefined/extended accessor stays correct.
+    (when (and (symbolp name)
+               (symbol-package name)
+               (not *cross-compiling*)
+               (= (length args) 1)
+               (not (assoc (mangle-name name) *local-functions* :test #'string=))
+               (gethash name *clos-accessor-readers*))
+      (return-from compile-named-call
+        `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
+              (compile-expr (car args)))
+          (:reader-ic ,(symbol-name name)
+                      ,(package-name (symbol-package name))))))
     ;; --- original compile-named-call body (unchanged) ---
     ;; Compile args first (into temp), then load function and invoke.
     ;; This ensures the stack is empty during arg evaluation, which is
@@ -706,13 +724,49 @@
          (when (form-has-return-from-p name (car cur))
            (return t))))))
 
+(defun form-macroexpands-to-return-from-p (name form &optional (depth 0))
+  "Like FORM-HAS-RETURN-FROM-P, but also expands global macro calls (up to
+   *macro-expand-depth-limit*) so a (return-from NAME) produced by a macro is
+   found even when the macro call is nested inside a special form such as PROGN
+   (dotcl/dotcl issue 51: the top-level-only scan missed `(progn (some-macro))`).
+   Scans BOTH the expansion and the original subforms, so it never misses a
+   return-from and only ever over-keeps the implicit block (safe). Conservative:
+   answers T if a macro expander errors. Uses cached-macroexpand, so the pre-pass
+   expansion is shared with code-gen (identical gensyms)."
+  (cond
+    ((atom form) nil)
+    ((and (eq (car form) 'return-from) (consp (cdr form)) (eq (cadr form) name)) t)
+    ;; nested block/defun shadowing NAME — its own return-from is not ours
+    ((and (eq (car form) 'block) (consp (cdr form)) (eq (cadr form) name)) nil)
+    ((and (eq (car form) 'defun) (consp (cdr form)) (eq (cadr form) name)) nil)
+    ((eq (car form) 'quote) nil)
+    (t
+     (or
+      ;; A global macro call may expand to a return-from (possibly after more
+      ;; expansions). Local macrolet macros are handled separately by
+      ;; form-has-macrolet-p (they are not in the global *macros* table).
+      (and (symbolp (car form))
+           (< depth *macro-expand-depth-limit*)
+           (gethash (car form) *macros*)
+           (handler-case
+               (let ((expanded (cached-macroexpand form (gethash (car form) *macros*))))
+                 (and (not (equal expanded form))
+                      (form-macroexpands-to-return-from-p name expanded (1+ depth))))
+             (error () t)))
+      ;; Structural recursion into the original subforms (macro arguments may
+      ;; themselves contain a return-from).
+      (do ((cur form (cdr cur)))
+          ((atom cur) (when cur (form-macroexpands-to-return-from-p name cur depth)))
+        (when (form-macroexpands-to-return-from-p name (car cur) depth)
+          (return t)))))))
+
 (defun form-has-macrolet-p (form)
   "T if FORM contains a MACROLET / SYMBOL-MACROLET anywhere in the tree. Such a
    local macro can expand to (return-from <enclosing-defun> …) — which
    form-has-return-from-p cannot see, because the expander body is a quasiquoted
    template, not a literal return-from. When present we conservatively keep the
    defun's implicit block wrapper (disable the use-direct fast path) so the
-   generated return-from resolves. #487."
+   generated return-from resolves."
   (cond
     ((atom form) nil)
     ((eq (car form) 'quote) nil)
@@ -735,10 +789,10 @@
 
 (defvar *sil-dump-pattern* :unread
   "Cached upcased DOTCL_DUMP_SIL_FOR value (or NIL if unset); :UNREAD before the
-   first compiled defun reads the env var. See %maybe-dump-defun-sil (#477).")
+   first compiled defun reads the env var. See %maybe-dump-defun-sil.")
 
 (defun %maybe-dump-defun-sil (name result)
-  "Diagnostic (#477): if the env var DOTCL_DUMP_SIL_FOR is set to a substring that
+  "Diagnostic: if the env var DOTCL_DUMP_SIL_FOR is set to a substring that
    NAME contains (case-insensitive), print RESULT — the emitted instruction list,
    which carries the :body SIL — to *error-output*, bracketed by ;;DUMP-SIL /
    ;;END-DUMP-SIL markers. Lets a state-dependent miscompile be inspected as
@@ -812,27 +866,22 @@
                                                  *double-float-locals*))
                   (*single-float-locals* (append (extract-single-float-locals body)
                                                  *single-float-locals*))
+                  (*decimal-locals* (append (extract-decimal-locals body)
+                                            *decimal-locals*))
                   (*locals* (append (mapcar (lambda (p) (cons p (var-name p)))
                                             all-param-vars)
                                     *locals*)))
               (cons
-               (or (some (lambda (f) (form-has-return-from-p block-name f)) body)
-                   ;; A MACROLET local macro can expand to (return-from block-name …)
-                   ;; via its quasiquoted template — invisible to the scans below.
-                   ;; Keep the implicit block wrapper conservatively when present.
-                   (some #'form-has-macrolet-p body)
-                   ;; Also check macro-expanded forms: a local macro call like (def 10)
-                   ;; might expand to contain (return-from block-name ...).
-                   (some (lambda (f)
-                           (and (consp f)
-                                (symbolp (car f))
-                                (gethash (car f) *macros*)
-                                (handler-case
-                                    (let ((expanded (cached-macroexpand f (gethash (car f) *macros*))))
-                                      (and (not (equal expanded f))
-                                           (form-has-return-from-p block-name expanded)))
-                                  (error () t))))  ; on expansion error, be conservative
-                         body))
+               (or ;; Detect (return-from block-name …) anywhere in the body,
+                   ;; expanding global macro calls at any depth (a macro nested in
+                   ;; a progn/let/etc. can expand to one — dotcl/dotcl issue 51).
+                   (some (lambda (f) (form-macroexpands-to-return-from-p block-name f)) body)
+                   ;; A MACROLET / SYMBOL-MACROLET local macro can also expand to
+                   ;; (return-from block-name …) via its quasiquoted template, and
+                   ;; its expander is lexical (not in the global *macros* table), so
+                   ;; the scan above cannot expand it. Keep the implicit block
+                   ;; wrapper conservatively when present.
+                   (some #'form-has-macrolet-p body))
                (find-free-vars-with-defaults params body))))
            (has-literal-return-from (car analysis-context-vals))
            ;; Check for free variables from original body (block wrapper doesn't add free vars)
@@ -1271,7 +1320,7 @@
 
 (defun params-needs-boxing (body all-params)
   "Names of params that must be boxed: mutated AND captured in BODY (single
-   walk, issue #395), minus special params — those are bound on the dynamic
+   walk), minus special params — those are bound on the dynamic
    stack, not in a box."
   (let* ((mc (multiple-value-list
               (find-mutated-and-captured-vars body (mapcar #'var-name all-params))))
@@ -1287,7 +1336,7 @@
    including inside nested lambdas. Without this a self-referential
    symbol-macro whose name is a param — e.g. serapeum define-env-method's
    (self (slot-value self 'self)) — is still live when a NESTED lambda's
-   free-var scan reaches the name, expanding it forever (compile hang, #472)."
+   free-var scan reaches the name, expanding it forever (compile hang)."
   (let ((param-names (mapcar #'var-name all-params)))
     (remove-if (lambda (entry)
                  (let ((k (car entry)))
@@ -1548,7 +1597,19 @@
            (*boxed-vars* '())
            (*block-tags* '())
            (*go-tags* '())
-           (*local-functions* '())
+           ;; Normally empty (a defun body sees no lexical local functions). During
+           ;; speculative labels-self-TCO compilation, inject THIS function's own box
+           ;; as a local-function: a self-reference that becomes a TCO branch never
+           ;; consults it, but one that does NOT (non-tail, arity mismatch, inside a
+           ;; try region, #'g, an optimizer gate) falls to the local-fn path and emits
+           ;; a (:ldloc box-key) the acceptance scan detects — forcing the safe
+           ;; closure-path fallback. Keyed off fn-name so nested inner lambdas
+           ;; (fn-name "") never pick it up.
+           (*local-functions*
+             (let ((spec *labels-direct-speculation*))
+               (if (and spec (string= fn-name (car spec)))
+                   (list (list (car spec) (cdr spec) t))
+                   '())))
            ;; NOTINLINE in this body disables matching compiler macros (CLHS 3.2.2.1.1).
            (*notinline-functions* (extract-notinline body))
            (local-keys (gen-param-local-keys all-params))
@@ -1678,6 +1739,10 @@
                                                   *double-float-locals*))
                    (*single-float-locals* (append (extract-single-float-locals body)
                                                   *single-float-locals*))
+                   ;; Decimal type declarations on params: native
+                   ;; System.Decimal arithmetic in the body, scale preserved.
+                   (*decimal-locals* (append (extract-decimal-locals body)
+                                             *decimal-locals*))
                    ;; Float-array type declarations on params/locals (e.g.
                    ;; (simple-array double-float (*))) → aref rides native r8.
                    (*numeric-array-locals* (append (extract-float-array-locals body)
@@ -2018,6 +2083,38 @@
              (dolist (v (cdr decl))
                (when (symbolp v) (pushnew (var-name v) result :test #'string=))))
             ((and (eq (car decl) 'type) (eq (cadr decl) 'double-float))
+             (dolist (v (cddr decl))
+               (when (symbolp v) (pushnew (var-name v) result :test #'string=))))))))
+    result))
+
+(defun decimal-type-name-p (sym)
+  "T iff SYM is specifically DOTCL:DECIMAL, keyed on symbol-NAME *and* home
+   PACKAGE-NAME. Both are cross-compile-safe strings (dotcl:decimal need not exist on
+   the SBCL host, so EQ is unusable), yet the package check keeps a bare or foreign
+   DECIMAL (CL-USER::DECIMAL, my-lib::DECIMAL) from being mistaken for the CLR decimal
+   type and mis-triggering native decimal codegen. Under (use-package :dotcl) an
+   unqualified DECIMAL resolves to dotcl:decimal and still matches."
+  (and (symbolp sym)
+       (string= (symbol-name sym) "DECIMAL")
+       (let ((p (symbol-package sym)))
+         (and p (string= (package-name p) "DOTCL")))))
+
+(defun extract-decimal-locals (body)
+  "Parallel to extract-double-float-locals for decimal. Only the
+   (type decimal ...) / (decimal ...) forms — decimal is non-standard, so there is
+   no bare shorthand class name to also accept beyond these."
+  (let ((result '()))
+    (dolist (form body)
+      (unless (and (consp form) (eq (car form) 'declare))
+        (return))
+      (dolist (decl (cdr form))
+        (when (consp decl)
+          (cond
+            ((decimal-type-name-p (car decl))
+             (dolist (v (cdr decl))
+               (when (symbolp v) (pushnew (var-name v) result :test #'string=))))
+            ((and (symbolp (car decl)) (string= (symbol-name (car decl)) "TYPE")
+                  (decimal-type-name-p (cadr decl)))
              (dolist (v (cddr decl))
                (when (symbolp v) (pushnew (var-name v) result :test #'string=))))))))
     result))
@@ -2417,6 +2514,9 @@
                                          (*single-float-locals*
                                           (append (extract-single-float-locals body)
                                                   *single-float-locals*))
+                                         (*decimal-locals*
+                                          (append (extract-decimal-locals body)
+                                                  *decimal-locals*))
                                          (*dotnet-typed-locals*
                                           (infer-dotnet-typed-bindings
                                            binding-info mutated *dotnet-typed-locals*)))
@@ -2560,6 +2660,9 @@
                                         (*single-float-locals*
                                          (append (extract-single-float-locals body)
                                                  *single-float-locals*))
+                                        (*decimal-locals*
+                                         (append (extract-decimal-locals body)
+                                                 *decimal-locals*))
                                         (*dotnet-typed-locals*
                                          (infer-dotnet-typed-bindings
                                           binding-info mutated *dotnet-typed-locals*)))
@@ -2580,7 +2683,13 @@
           ,@body-instrs
           (:stloc ,result-key)
           (:begin-finally-block)
-          ,@(loop for sym in special-syms
+          ;; Pop in REVERSE of push order (LIFO). All call sites pass SPECIAL-SYMS
+          ;; in push (source) order, so the naive in-order loop emitted FIFO Pops
+          ;; for a multi-special frame. The current by-symbol DynamicBindings.Pop
+          ;; tolerates any order, so this is behavior-neutral today — but it lets a
+          ;; shallow-binding Pop take its O(1) top-of-stack fast path instead of the
+          ;; out-of-order search fallback.
+          ,@(loop for sym in (reverse special-syms)
                   append `(,@(compile-sym-lookup sym)
                            (:castclass "Symbol") (:call "DynamicBindings.Pop")))
           (:end-exception-block)
@@ -2768,10 +2877,23 @@
    (e.g. &rest stdlib defuns in chunked progn compiles)."
   (multiple-value-bind (required optional key rest-param) (parse-lambda-list params)
     (declare (ignore optional key))
-    (let ((free-vars (remove-if #'global-special-name-p
-                                (find-free-vars-with-defaults params body))))
-      (if (null free-vars)
-          ;; No captures — :make-function or :make-function-direct
+    (let* ((free-vars (remove-if #'global-special-name-p
+                                 (find-free-vars-with-defaults params body)))
+           ;; Speculative labels-self-TCO: when this named, required-only fn's
+           ;; ONLY free var is its own labels box, compile it through the
+           ;; direct+TCO path instead of a closure. compile-labels-boxed scans the
+           ;; result and falls back to the closure path unless it is provably
+           ;; self-contained (no box-key reference, no orphan post-TCO code), so a
+           ;; wrong guess only forgoes the optimization — it never miscompiles.
+           (spec *labels-direct-speculation*)
+           (speculate-direct
+             (and spec
+                  (string= fn-name (car spec))
+                  (simple-required-only-p params)
+                  (equal free-vars
+                         (list (concatenate 'string "__LABELFN_" (car spec)))))))
+      (if (or (null free-vars) speculate-direct)
+          ;; No captures (or speculating self-TCO) — :make-function or :make-function-direct
           (if (simple-required-only-p params)
               `((:make-function-direct
                  :param-count ,(length required)
@@ -3826,6 +3948,81 @@
   (not (some (lambda (p) (member p '(&optional &key &rest &aux &allow-other-keys)))
              params)))
 
+;;; --- Speculative labels-self-TCO acceptance scan ---
+;;; compile-labels-boxed speculatively compiles a single self-recursive labels
+;;; function through the direct+TCO path (see *labels-direct-speculation*). The
+;;; generated instruction tree is accepted ONLY when both scans pass, so the
+;;; failure mode is always "fall back to the closure path", never a miscompile.
+
+(defun %instr-tree-contains-symbol-p (tree sym)
+  "T if the interned symbol SYM (a labels box-key from gen-local) appears
+   anywhere in the instruction TREE. Any occurrence means the box was actually
+   referenced (as a value / non-tail call / #'g), so the direct compile is not
+   self-contained — scan (a)."
+  (cond ((eq tree sym) t)
+        ((consp tree)
+         (or (%instr-tree-contains-symbol-p (car tree) sym)
+             (%instr-tree-contains-symbol-p (cdr tree) sym)))
+        (t nil)))
+
+(defun %tco-loop-target (instr)
+  "If INSTR is a (:br L) / (:leave L) to a TCO loop label (TCOLOOP* or LMTCO*),
+   return L, else NIL."
+  (and (consp instr)
+       (member (car instr) '(:br :leave))
+       (let ((tgt (cadr instr)))
+         (and (stringp tgt)
+              (or (and (>= (length tgt) 7) (string= tgt "TCOLOOP" :end1 7))
+                  (and (>= (length tgt) 5) (string= tgt "LMTCO" :end1 5)))
+              tgt))))
+
+(defun %instr-list-tco-orphan-free-p (instrs)
+  "Scan ONE instruction list: after a TCO-loop branch, until the next
+   (:label ...), only :br / :leave / :ret may appear. Anything else is dead code
+   stranded by a TCO rewrite (e.g. an intrinsic call whose result was discarded
+   because its argument tail-recursed) — reject. Scan (b)."
+  (let ((in-dead nil))
+    (dolist (instr instrs t)
+      (cond
+        ((and (consp instr) (eq (car instr) :label))
+         (setq in-dead nil))
+        (in-dead
+         (unless (and (consp instr) (member (car instr) '(:br :leave :ret)))
+           (return nil)))
+        ((%tco-loop-target instr)
+         (setq in-dead t))))))
+
+(defun %instr-nested-body (instr)
+  "The nested :body instruction list of a make-function/-direct/closure op, or
+   NIL. Restricted to those ops so GETF never touches a non-plist instruction
+   like (:ldc-i4 0)."
+  (when (and (consp instr)
+             (member (car instr)
+                     '(:make-function :make-function-direct :make-closure)))
+    (getf (cdr instr) :body)))
+
+(defun %instr-tree-tco-orphan-free-p (instrs)
+  "Apply %instr-list-tco-orphan-free-p to INSTRS and recursively to every nested
+   :body instruction list (each nested make-function/-direct/closure is its own
+   method)."
+  (and (%instr-list-tco-orphan-free-p instrs)
+       (every (lambda (instr)
+                (let ((body (%instr-nested-body instr)))
+                  (or (not (consp body))
+                      (%instr-tree-tco-orphan-free-p body))))
+              instrs)))
+
+(defun labels-direct-speculation-acceptable-p (instrs box-key)
+  "T iff INSTRS is a single :make-function-direct whose body is provably safe for
+   labels self-TCO: it took the direct path, references BOX-KEY nowhere (scan a),
+   and strands no orphan code after a TCO branch (scan b)."
+  (and (consp instrs)
+       (null (cdr instrs))
+       (consp (car instrs))
+       (eq (caar instrs) :make-function-direct)
+       (not (%instr-tree-contains-symbol-p instrs box-key))
+       (%instr-tree-tco-orphan-free-p instrs)))
+
 (defun compile-labels (fn-defs body)
   "Compile (labels ((name (params) body...) ...) body...).
    When all functions have the same required-only arity (>= 2 fns), uses a dispatch
@@ -3883,12 +4080,29 @@
                  ;; the self-call identity check must match g, not a stale
                  ;; enclosing defun (whose symbol would make a tail call to
                  ;; that outer defun falsely TCO-branch to g's loop).
-                 (lambda-instrs (let ((*tco-local-fn-key* key)
-                                      (*tco-self-symbol* (if (symbolp name) name nil)))
-                                  (if (and (symbolp name)
-                                           (some (lambda (f) (form-has-return-from-p name f)) fn-body))
-                                      (compile-lambda params `((block ,name ,@fn-body)) name-str)
-                                      (compile-lambda params fn-body name-str)))))
+                 (compile-thunk
+                   (lambda ()
+                     (let ((*tco-local-fn-key* key)
+                           (*tco-self-symbol* (if (symbolp name) name nil)))
+                       (if (and (symbolp name)
+                                (some (lambda (f) (form-has-return-from-p name f)) fn-body))
+                           (compile-lambda params `((block ,name ,@fn-body)) name-str)
+                           (compile-lambda params fn-body name-str)))))
+                 ;; Speculative direct+TCO: try compiling this labels fn
+                 ;; through the direct path so a single self-tail-recursion is
+                 ;; TCO'd instead of overflowing. Accept only when the generated
+                 ;; body is provably self-contained; otherwise recompile via the
+                 ;; unchanged closure path. Symbol-named fns only (the box key is
+                 ;; matched by name in compile-lambda / -function-body-direct).
+                 (lambda-instrs
+                   (if (symbolp name)
+                       (let ((spec-instrs
+                               (let ((*labels-direct-speculation* (cons name-str key)))
+                                 (funcall compile-thunk))))
+                         (if (labels-direct-speculation-acceptable-p spec-instrs key)
+                             spec-instrs
+                             (funcall compile-thunk)))
+                       (funcall compile-thunk))))
             (setf store-instrs
                   (append store-instrs
                           `((:ldloc ,key) (:ldc-i4 0)
@@ -4031,6 +4245,7 @@
                                           (*small-int-locals* (remove-if shadowed-key-p *small-int-locals*))
                                           (*double-float-locals* (remove-if shadowed-key-p *double-float-locals*))
                                           (*single-float-locals* (remove-if shadowed-key-p *single-float-locals*))
+                                          (*decimal-locals* (remove-if shadowed-key-p *decimal-locals*))
                                           (*long-locals* (remove-if shadowed-key-p *long-locals*))
                                           (*numeric-array-locals* (remove-if shadowed-key-p *numeric-array-locals*))
                                           ;; Reset outer self-TCO: dispatch bodies have their own context
@@ -5197,6 +5412,19 @@
 ;;; and cil-forms.lisp).  Populates *compile-form-handlers* for O(1) dispatch.
 ;;; ============================================================
 
+(defun compile-value-arg (arg)
+  "Compile ARG as a known-function intrinsic argument: never in tail position (the
+   consuming intrinsic call is), never in MV context (a single value is taken).
+   Without this, a self-tail-call in an intrinsic argument inherits the tail
+   context, fires TCO (a br/leave to the TCO loop), and the intrinsic call that
+   follows becomes unreachable dead code — its side effect silently lost
+   (e.g. (defun f (n) (if (zerop n) 0 (print (f (1- n))))) never printing). Mirrors
+   compile-unary-call / compile-args-array, which already bind both. NOT for
+   tail/MV-transparent intrinsics (the/when/unless/min/max/values/…): those use a
+   bare (compile-expr …) as their whole result and must keep the caller's context."
+  (let ((*in-tail-position* nil) (*in-mv-context* nil))
+    (compile-expr arg)))
+
 (let ((h *compile-form-handlers*))
 
   ;; Arithmetic
@@ -5506,7 +5734,7 @@
   (setf (gethash 'restart-bind h) (lambda (expr) (compile-restart-bind (cadr expr) (cddr expr))))
   (setf (gethash 'invoke-restart h)
         (lambda (expr)
-          `(,@(compile-expr (cadr expr))
+          `(,@(compile-value-arg (cadr expr))
             ,@(compile-args-array (cddr expr))
             (:call "Runtime.InvokeRestart"))))
   (setf (gethash 'find-restart h)
@@ -5535,7 +5763,7 @@
   ;; Struct primitives
   (setf (gethash '%make-struct h)
         (lambda (expr)
-          `(,@(compile-expr (cadr expr))
+          `(,@(compile-value-arg (cadr expr))
             ,@(compile-args-array (cddr expr))
             (:call "Runtime.MakeStruct"))))
   (setf (gethash '%struct-ref h)
@@ -5557,9 +5785,9 @@
                       (compile-expr val))
                   (:call "Runtime.StructSetI"))
                 `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
-                      `(,@(compile-expr obj)
-                        ,@(compile-expr idx)
-                        ,@(compile-expr val)))
+                      `(,@(compile-value-arg obj)
+                        ,@(compile-value-arg idx)
+                        ,@(compile-value-arg val)))
                   (:call "Runtime.StructSet"))))))
   (setf (gethash '%struct-typep h) (lambda (expr) (compile-binary-call (cdr expr) "Runtime.StructTypep")))
   (setf (gethash '%copy-struct h) (lambda (expr) (compile-unary-call (cdr expr) "Runtime.CopyStruct")))
@@ -5567,43 +5795,43 @@
   ;; CLOS primitives
   (setf (gethash '%make-class h)
         (lambda (expr)
-          `(,@(compile-expr (second expr))
-            ,@(compile-expr (third expr))
-            ,@(compile-expr (fourth expr))
+          `(,@(compile-value-arg (second expr))
+            ,@(compile-value-arg (third expr))
+            ,@(compile-value-arg (fourth expr))
             (:call "Runtime.MakeClass"))))
   (setf (gethash '%make-class-full h)
         (lambda (expr)
-          `(,@(compile-expr (second expr))
-            ,@(compile-expr (third expr))
-            ,@(compile-expr (fourth expr))
-            ,@(compile-expr (fifth expr))
+          `(,@(compile-value-arg (second expr))
+            ,@(compile-value-arg (third expr))
+            ,@(compile-value-arg (fourth expr))
+            ,@(compile-value-arg (fifth expr))
             (:call "Runtime.MakeClassFull"))))
   (setf (gethash '%make-slot-def h)
         (lambda (expr)
-          `(,@(compile-expr (second expr))
-            ,@(compile-expr (third expr))
-            ,@(compile-expr (fourth expr))
+          `(,@(compile-value-arg (second expr))
+            ,@(compile-value-arg (third expr))
+            ,@(compile-value-arg (fourth expr))
             (:call "Runtime.MakeSlotDef"))))
   (setf (gethash '%make-slot-def-with-allocation h)
         (lambda (expr)
-          `(,@(compile-expr (second expr))
-            ,@(compile-expr (third expr))
-            ,@(compile-expr (fourth expr))
-            ,@(compile-expr (fifth expr))
+          `(,@(compile-value-arg (second expr))
+            ,@(compile-value-arg (third expr))
+            ,@(compile-value-arg (fourth expr))
+            ,@(compile-value-arg (fifth expr))
             (:call "Runtime.MakeSlotDefWithAllocation"))))
   ;; (%slot-def-raw-options slotd options-plist) → slotd
   ;; Attaches the canonical slot-option plist for DIRECT-SLOT-DEFINITION-CLASS dispatch
   ;; under a custom metaclass; returns the slotd so it wraps %make-slot-def transparently.
   (setf (gethash '%slot-def-raw-options h)
         (lambda (expr)
-          `(,@(compile-expr (second expr))
-            ,@(compile-expr (third expr))
+          `(,@(compile-value-arg (second expr))
+            ,@(compile-value-arg (third expr))
             (:call "Runtime.SetSlotDefRawOptions"))))
   (setf (gethash '%register-class h) (lambda (expr) (compile-unary-call (cdr expr) "Runtime.RegisterClass")))
   (setf (gethash '%set-class-default-initargs h)
         (lambda (expr)
-          `(,@(compile-expr (second expr))
-            ,@(compile-expr (third expr))
+          `(,@(compile-value-arg (second expr))
+            ,@(compile-value-arg (third expr))
             (:call "Runtime.SetClassDefaultInitargs"))))
   (setf (gethash 'find-class h)
         (lambda (expr)
@@ -5648,9 +5876,9 @@
   (setf (gethash '%mark-defgeneric-inline-method h) (lambda (expr) (compile-binary-call (cdr expr) "Runtime.MarkDefgenericInlineMethod")))
   (setf (gethash '%make-method h)
         (lambda (expr)
-          `(,@(compile-expr (second expr))
-            ,@(compile-expr (third expr))
-            ,@(compile-expr (fourth expr))
+          `(,@(compile-value-arg (second expr))
+            ,@(compile-value-arg (third expr))
+            ,@(compile-value-arg (fourth expr))
             (:call "Runtime.MakeMethod"))))
   (setf (gethash '%add-method h) (lambda (expr) (compile-binary-call (cdr expr) "Runtime.AddMethod")))
   (setf (gethash '%gf-methods h) (lambda (expr) (compile-unary-call (cdr expr) "Runtime.GetGFMethods")))
@@ -5686,7 +5914,7 @@
           (let ((class-tmp (gen-local "MI-CLASS"))
                 (args-tmp (gen-local "MI-ARGS")))
             `((:declare-local ,class-tmp "LispObject")
-              ,@(compile-expr (second expr))
+              ,@(compile-value-arg (second expr))
               (:stloc ,class-tmp)
               (:declare-local ,args-tmp "LispObject[]")
               ,@(compile-args-array (cddr expr))
@@ -5699,17 +5927,17 @@
   (setf (gethash 'zerop h)
         (lambda (expr)
           (if (= (length (cdr expr)) 1)
-              `(,@(compile-expr (cadr expr)) ,@(emit-fixnum 0) (:call "Runtime.NumEqual"))
+              `(,@(compile-value-arg (cadr expr)) ,@(emit-fixnum 0) (:call "Runtime.NumEqual"))
               (compile-named-call 'zerop (cdr expr)))))
   (setf (gethash 'plusp h)
         (lambda (expr)
           (if (= (length (cdr expr)) 1)
-              `(,@(compile-expr (cadr expr)) ,@(emit-fixnum 0) (:call "Runtime.GreaterThan"))
+              `(,@(compile-value-arg (cadr expr)) ,@(emit-fixnum 0) (:call "Runtime.GreaterThan"))
               (compile-named-call 'plusp (cdr expr)))))
   (setf (gethash 'minusp h)
         (lambda (expr)
           (if (= (length (cdr expr)) 1)
-              `(,@(compile-expr (cadr expr)) ,@(emit-fixnum 0) (:call "Runtime.LessThan"))
+              `(,@(compile-value-arg (cadr expr)) ,@(emit-fixnum 0) (:call "Runtime.LessThan"))
               (compile-named-call 'minusp (cdr expr)))))
   (setf (gethash 'evenp h)
         (lambda (expr)
@@ -5819,20 +6047,20 @@
   (setf (gethash 'print h)
         (lambda (expr)
           (let ((nargs (length (cdr expr))))
-            (cond ((= nargs 1) `(,@(compile-expr (cadr expr)) (:call "Runtime.Print")))
-                  ((= nargs 2) `(,@(compile-expr (cadr expr)) ,@(compile-expr (caddr expr)) (:call "Runtime.Print2")))
+            (cond ((= nargs 1) `(,@(compile-value-arg (cadr expr)) (:call "Runtime.Print")))
+                  ((= nargs 2) `(,@(compile-value-arg (cadr expr)) ,@(compile-value-arg (caddr expr)) (:call "Runtime.Print2")))
                   (t (compile-static-program-error (format nil "PRINT: wrong number of arguments: ~a (expected 1-2)" nargs)))))))
   (setf (gethash 'prin1 h)
         (lambda (expr)
           (let ((nargs (length (cdr expr))))
-            (cond ((= nargs 1) `(,@(compile-expr (cadr expr)) (:call "Runtime.Prin1")))
-                  ((= nargs 2) `(,@(compile-expr (cadr expr)) ,@(compile-expr (caddr expr)) (:call "Runtime.Prin12")))
+            (cond ((= nargs 1) `(,@(compile-value-arg (cadr expr)) (:call "Runtime.Prin1")))
+                  ((= nargs 2) `(,@(compile-value-arg (cadr expr)) ,@(compile-value-arg (caddr expr)) (:call "Runtime.Prin12")))
                   (t (compile-static-program-error (format nil "PRIN1: wrong number of arguments: ~a (expected 1-2)" nargs)))))))
   (setf (gethash 'princ h)
         (lambda (expr)
           (let ((nargs (length (cdr expr))))
-            (cond ((= nargs 1) `(,@(compile-expr (cadr expr)) (:call "Runtime.Princ")))
-                  ((= nargs 2) `(,@(compile-expr (cadr expr)) ,@(compile-expr (caddr expr)) (:call "Runtime.Princ2")))
+            (cond ((= nargs 1) `(,@(compile-value-arg (cadr expr)) (:call "Runtime.Princ")))
+                  ((= nargs 2) `(,@(compile-value-arg (cadr expr)) ,@(compile-value-arg (caddr expr)) (:call "Runtime.Princ2")))
                   (t (compile-static-program-error (format nil "PRINC: wrong number of arguments: ~a (expected 1-2)" nargs)))))))
   (setf (gethash 'terpri h)
         (lambda (expr)
@@ -5849,7 +6077,7 @@
           (let ((stream-tmp (gen-local "FMTDST")) (args-tmp (gen-local "FMTARGS")))
             `((:declare-local ,stream-tmp "LispObject")
               (:declare-local ,args-tmp "LispObject[]")
-              ,@(compile-expr (cadr expr)) (:stloc ,stream-tmp)
+              ,@(compile-value-arg (cadr expr)) (:stloc ,stream-tmp)
               ,@(compile-args-array (cddr expr)) (:stloc ,args-tmp)
               (:ldloc ,stream-tmp) (:ldloc ,args-tmp)
               (:call "Runtime.Format")))))
@@ -5860,7 +6088,7 @@
               (let ((path-tmp (gen-local "OPNDST")) (args-tmp (gen-local "OPNARGS")))
                 `((:declare-local ,path-tmp "LispObject")
                   (:declare-local ,args-tmp "LispObject[]")
-                  ,@(compile-expr (cadr expr)) (:stloc ,path-tmp)
+                  ,@(compile-value-arg (cadr expr)) (:stloc ,path-tmp)
                   ,@(compile-args-array (cddr expr)) (:stloc ,args-tmp)
                   (:ldloc ,path-tmp) (:ldloc ,args-tmp)
                   (:call "Runtime.OpenFile"))))))
@@ -5876,40 +6104,40 @@
           (let ((nargs (length (cdr expr))))
             (cond
               ((= nargs 4) (compile-named-call 'read-line (cdr expr)))
-              ((= nargs 0) `(,@(compile-expr '*standard-input*) ,@(emit-t) ,@(emit-nil) (:call "Runtime.ReadLine")))
-              ((= nargs 1) `(,@(compile-expr (cadr expr)) ,@(emit-t) ,@(emit-nil) (:call "Runtime.ReadLine")))
-              ((= nargs 2) `(,@(compile-expr (cadr expr)) ,@(compile-expr (caddr expr)) ,@(emit-nil) (:call "Runtime.ReadLine")))
-              ((= nargs 3) `(,@(compile-expr (cadr expr)) ,@(compile-expr (caddr expr)) ,@(compile-expr (cadddr expr)) (:call "Runtime.ReadLine")))
+              ((= nargs 0) `(,@(compile-value-arg '*standard-input*) ,@(emit-t) ,@(emit-nil) (:call "Runtime.ReadLine")))
+              ((= nargs 1) `(,@(compile-value-arg (cadr expr)) ,@(emit-t) ,@(emit-nil) (:call "Runtime.ReadLine")))
+              ((= nargs 2) `(,@(compile-value-arg (cadr expr)) ,@(compile-value-arg (caddr expr)) ,@(emit-nil) (:call "Runtime.ReadLine")))
+              ((= nargs 3) `(,@(compile-value-arg (cadr expr)) ,@(compile-value-arg (caddr expr)) ,@(compile-value-arg (cadddr expr)) (:call "Runtime.ReadLine")))
               (t (compile-static-program-error (format nil "READ-LINE: wrong number of arguments: ~a (expected 0-4)" nargs)))))))
   (setf (gethash 'read-char h)
         (lambda (expr)
           (let ((nargs (length (cdr expr))))
             (cond
               ((= nargs 4) (compile-named-call 'read-char (cdr expr)))
-              ((= nargs 0) `(,@(compile-expr '*standard-input*) ,@(emit-t) ,@(emit-nil) (:call "Runtime.ReadChar")))
-              ((= nargs 1) `(,@(compile-expr (cadr expr)) ,@(emit-t) ,@(emit-nil) (:call "Runtime.ReadChar")))
-              ((= nargs 2) `(,@(compile-expr (cadr expr)) ,@(compile-expr (caddr expr)) ,@(emit-nil) (:call "Runtime.ReadChar")))
-              ((= nargs 3) `(,@(compile-expr (cadr expr)) ,@(compile-expr (caddr expr)) ,@(compile-expr (cadddr expr)) (:call "Runtime.ReadChar")))
+              ((= nargs 0) `(,@(compile-value-arg '*standard-input*) ,@(emit-t) ,@(emit-nil) (:call "Runtime.ReadChar")))
+              ((= nargs 1) `(,@(compile-value-arg (cadr expr)) ,@(emit-t) ,@(emit-nil) (:call "Runtime.ReadChar")))
+              ((= nargs 2) `(,@(compile-value-arg (cadr expr)) ,@(compile-value-arg (caddr expr)) ,@(emit-nil) (:call "Runtime.ReadChar")))
+              ((= nargs 3) `(,@(compile-value-arg (cadr expr)) ,@(compile-value-arg (caddr expr)) ,@(compile-value-arg (cadddr expr)) (:call "Runtime.ReadChar")))
               (t (compile-static-program-error (format nil "READ-CHAR: wrong number of arguments: ~a (expected 0-4)" nargs)))))))
   (setf (gethash 'read-char-no-hang h)
         (lambda (expr)
           (let ((nargs (length (cdr expr))))
             (cond
               ((= nargs 4) (compile-named-call 'read-char-no-hang (cdr expr)))
-              ((= nargs 0) `(,@(compile-expr '*standard-input*) ,@(emit-t) ,@(emit-nil) (:call "Runtime.ReadCharNoHang")))
-              ((= nargs 1) `(,@(compile-expr (cadr expr)) ,@(emit-t) ,@(emit-nil) (:call "Runtime.ReadCharNoHang")))
-              ((= nargs 2) `(,@(compile-expr (cadr expr)) ,@(compile-expr (caddr expr)) ,@(emit-nil) (:call "Runtime.ReadCharNoHang")))
-              ((= nargs 3) `(,@(compile-expr (cadr expr)) ,@(compile-expr (caddr expr)) ,@(compile-expr (cadddr expr)) (:call "Runtime.ReadCharNoHang")))
+              ((= nargs 0) `(,@(compile-value-arg '*standard-input*) ,@(emit-t) ,@(emit-nil) (:call "Runtime.ReadCharNoHang")))
+              ((= nargs 1) `(,@(compile-value-arg (cadr expr)) ,@(emit-t) ,@(emit-nil) (:call "Runtime.ReadCharNoHang")))
+              ((= nargs 2) `(,@(compile-value-arg (cadr expr)) ,@(compile-value-arg (caddr expr)) ,@(emit-nil) (:call "Runtime.ReadCharNoHang")))
+              ((= nargs 3) `(,@(compile-value-arg (cadr expr)) ,@(compile-value-arg (caddr expr)) ,@(compile-value-arg (cadddr expr)) (:call "Runtime.ReadCharNoHang")))
               (t (compile-static-program-error (format nil "READ-CHAR-NO-HANG: wrong number of arguments: ~a (expected 0-4)" nargs)))))))
   (setf (gethash 'listen h)
         (lambda (expr)
           (if (null (cdr expr))
-              `(,@(compile-expr '*standard-input*) (:call "Runtime.Listen"))
+              `(,@(compile-value-arg '*standard-input*) (:call "Runtime.Listen"))
               (compile-unary-call (cdr expr) "Runtime.Listen"))))
   (setf (gethash 'clear-input h)
         (lambda (expr)
           (if (null (cdr expr))
-              `(,@(compile-expr '*standard-input*) (:call "Runtime.ClearInput"))
+              `(,@(compile-value-arg '*standard-input*) (:call "Runtime.ClearInput"))
               (compile-unary-call (cdr expr) "Runtime.ClearInput"))))
   (setf (gethash 'write-byte h) (lambda (expr) (compile-binary-call (cdr expr) "Runtime.WriteByte")))
   (setf (gethash 'peek-char h)
@@ -5917,21 +6145,21 @@
           (let ((nargs (length (cdr expr))))
             (cond
               ((= nargs 5) (compile-named-call 'peek-char (cdr expr)))
-              ((= nargs 0) `(,@(emit-nil) ,@(compile-expr '*standard-input*) ,@(emit-t) ,@(emit-nil) (:call "Runtime.PeekChar")))
-              ((= nargs 1) `(,@(compile-expr (cadr expr)) ,@(compile-expr '*standard-input*) ,@(emit-t) ,@(emit-nil) (:call "Runtime.PeekChar")))
-              ((= nargs 2) `(,@(compile-expr (cadr expr)) ,@(compile-expr (caddr expr)) ,@(emit-t) ,@(emit-nil) (:call "Runtime.PeekChar")))
-              ((= nargs 3) `(,@(compile-expr (cadr expr)) ,@(compile-expr (caddr expr)) ,@(compile-expr (cadddr expr)) ,@(emit-nil) (:call "Runtime.PeekChar")))
-              ((= nargs 4) `(,@(compile-expr (cadr expr)) ,@(compile-expr (caddr expr)) ,@(compile-expr (cadddr expr)) ,@(compile-expr (car (cddddr expr))) (:call "Runtime.PeekChar")))
+              ((= nargs 0) `(,@(emit-nil) ,@(compile-value-arg '*standard-input*) ,@(emit-t) ,@(emit-nil) (:call "Runtime.PeekChar")))
+              ((= nargs 1) `(,@(compile-value-arg (cadr expr)) ,@(compile-value-arg '*standard-input*) ,@(emit-t) ,@(emit-nil) (:call "Runtime.PeekChar")))
+              ((= nargs 2) `(,@(compile-value-arg (cadr expr)) ,@(compile-value-arg (caddr expr)) ,@(emit-t) ,@(emit-nil) (:call "Runtime.PeekChar")))
+              ((= nargs 3) `(,@(compile-value-arg (cadr expr)) ,@(compile-value-arg (caddr expr)) ,@(compile-value-arg (cadddr expr)) ,@(emit-nil) (:call "Runtime.PeekChar")))
+              ((= nargs 4) `(,@(compile-value-arg (cadr expr)) ,@(compile-value-arg (caddr expr)) ,@(compile-value-arg (cadddr expr)) ,@(compile-value-arg (car (cddddr expr))) (:call "Runtime.PeekChar")))
               (t (compile-static-program-error (format nil "PEEK-CHAR: wrong number of arguments: ~a (expected 0-5)" nargs)))))))
   (setf (gethash 'unread-char h)
         (lambda (expr)
           (if (= (length (cdr expr)) 1)
-              `(,@(compile-expr (cadr expr)) ,@(compile-expr '*standard-input*) (:call "Runtime.UnreadChar"))
+              `(,@(compile-value-arg (cadr expr)) ,@(compile-value-arg '*standard-input*) (:call "Runtime.UnreadChar"))
               (compile-binary-call (cdr expr) "Runtime.UnreadChar"))))
   (setf (gethash 'write-char h)
         (lambda (expr)
           (if (= (length (cdr expr)) 1)
-              `(,@(compile-expr (cadr expr)) ,@(compile-expr '*standard-output*) (:call "Runtime.WriteChar"))
+              `(,@(compile-value-arg (cadr expr)) ,@(compile-value-arg '*standard-output*) (:call "Runtime.WriteChar"))
               (compile-binary-call (cdr expr) "Runtime.WriteChar"))))
   (setf (gethash 'write-string h) (lambda (expr) `(,@(compile-args-array (cdr expr)) (:call "Runtime.WriteString"))))
   (setf (gethash 'write-line h) (lambda (expr) `(,@(compile-args-array (cdr expr)) (:call "Runtime.WriteLine"))))
@@ -5964,10 +6192,10 @@
               ((> nargs 4) (compile-static-program-error (format nil "READ: too many arguments: ~D (expected at most 4)" nargs)))
               ;; With recursive-p: fall through to generic dispatch (registered LispFunction handles it)
               ((= nargs 4) (compile-named-call 'read (cdr expr)))
-              ((= nargs 0) `(,@(compile-expr '*standard-input*) ,@(emit-t) ,@(emit-nil) (:call "Runtime.ReadFromStream")))
-              ((= nargs 1) `(,@(compile-expr (cadr expr)) ,@(emit-t) ,@(emit-nil) (:call "Runtime.ReadFromStream")))
-              ((= nargs 3) `(,@(compile-expr (cadr expr)) ,@(compile-expr (caddr expr)) ,@(compile-expr (cadddr expr)) (:call "Runtime.ReadFromStream")))
-              (t `(,@(compile-expr (cadr expr)) ,@(compile-expr (caddr expr)) ,@(emit-nil) (:call "Runtime.ReadFromStream")))))))
+              ((= nargs 0) `(,@(compile-value-arg '*standard-input*) ,@(emit-t) ,@(emit-nil) (:call "Runtime.ReadFromStream")))
+              ((= nargs 1) `(,@(compile-value-arg (cadr expr)) ,@(emit-t) ,@(emit-nil) (:call "Runtime.ReadFromStream")))
+              ((= nargs 3) `(,@(compile-value-arg (cadr expr)) ,@(compile-value-arg (caddr expr)) ,@(compile-value-arg (cadddr expr)) (:call "Runtime.ReadFromStream")))
+              (t `(,@(compile-value-arg (cadr expr)) ,@(compile-value-arg (caddr expr)) ,@(emit-nil) (:call "Runtime.ReadFromStream")))))))
   (setf (gethash 'read-from-string h) (lambda (expr) `(,@(compile-args-array (cdr expr)) (:call "Runtime.ReadFromString"))))
   (setf (gethash 'read-preserving-whitespace h)
         (lambda (expr)
@@ -5976,10 +6204,10 @@
               ((> nargs 4) (compile-static-program-error (format nil "READ-PRESERVING-WHITESPACE: too many arguments: ~D (expected at most 4)" nargs)))
               ;; With recursive-p: fall through to generic dispatch
               ((= nargs 4) (compile-named-call 'read-preserving-whitespace (cdr expr)))
-              ((= nargs 0) `(,@(compile-expr '*standard-input*) ,@(emit-t) ,@(emit-nil) (:call "Runtime.ReadPreservingWhitespace")))
-              ((= nargs 1) `(,@(compile-expr (cadr expr)) ,@(emit-t) ,@(emit-nil) (:call "Runtime.ReadPreservingWhitespace")))
-              ((= nargs 3) `(,@(compile-expr (cadr expr)) ,@(compile-expr (caddr expr)) ,@(compile-expr (cadddr expr)) (:call "Runtime.ReadPreservingWhitespace")))
-              (t `(,@(compile-expr (cadr expr)) ,@(compile-expr (caddr expr)) ,@(emit-nil) (:call "Runtime.ReadPreservingWhitespace")))))))
+              ((= nargs 0) `(,@(compile-value-arg '*standard-input*) ,@(emit-t) ,@(emit-nil) (:call "Runtime.ReadPreservingWhitespace")))
+              ((= nargs 1) `(,@(compile-value-arg (cadr expr)) ,@(emit-t) ,@(emit-nil) (:call "Runtime.ReadPreservingWhitespace")))
+              ((= nargs 3) `(,@(compile-value-arg (cadr expr)) ,@(compile-value-arg (caddr expr)) ,@(compile-value-arg (cadddr expr)) (:call "Runtime.ReadPreservingWhitespace")))
+              (t `(,@(compile-value-arg (cadr expr)) ,@(compile-value-arg (caddr expr)) ,@(emit-nil) (:call "Runtime.ReadPreservingWhitespace")))))))
 
   ;; Eval / gensym / misc
   (setf (gethash 'eval h) (lambda (expr) (compile-unary-call (cdr expr) "Runtime.Eval")))
@@ -5991,7 +6219,7 @@
   (setf (gethash 'streamp h)
         (lambda (expr)
           (if (and (cdr expr) (null (cddr expr)))
-              `(,@(compile-expr (cadr expr)) ,@(compile-quoted 'stream) (:call "Runtime.Typep"))
+              `(,@(compile-value-arg (cadr expr)) ,@(compile-quoted 'stream) (:call "Runtime.Typep"))
               (compile-named-call 'streamp (cdr expr)))))
   (setf (gethash 'lisp-implementation-type h)
         (lambda (expr)
@@ -6018,7 +6246,7 @@
             (cond
               ((= nargs 0) (compile-static-program-error "DIGIT-CHAR-P: too few arguments: 0 (expected 1-2)"))
               ((> nargs 2) (compile-static-program-error (format nil "DIGIT-CHAR-P: too many arguments: ~D (expected 1-2)" nargs)))
-              ((= nargs 1) `(,@(compile-expr (car args)) (:ldc-i4 10) (:call "Fixnum.Make") (:call "Runtime.DigitCharP")))
+              ((= nargs 1) `(,@(compile-value-arg (car args)) (:ldc-i4 10) (:call "Fixnum.Make") (:call "Runtime.DigitCharP")))
               (t (compile-binary-call args "Runtime.DigitCharP"))))))
   (setf (gethash 'string h) (lambda (expr) (compile-unary-call (cdr expr) "Runtime.String")))
   (setf (gethash 'char h)
@@ -6114,15 +6342,15 @@
             (cond
               ((< nargs 2) (compile-static-program-error (format nil "GET: too few arguments: ~D (expected at least 2)" nargs)))
               ((> nargs 3) (compile-static-program-error (format nil "GET: too many arguments: ~D (expected at most 3)" nargs)))
-              (t `(,@(compile-expr (first args))
-                   ,@(compile-expr (second args))
-                   ,@(if (third args) (compile-expr (third args)) (emit-nil))
+              (t `(,@(compile-value-arg (first args))
+                   ,@(compile-value-arg (second args))
+                   ,@(if (third args) (compile-value-arg (third args)) (emit-nil))
                    (:call "Runtime.GetProp")))))))
   (setf (gethash 'put-prop h)
         (lambda (expr)
-          `(,@(compile-expr (cadr expr))
-            ,@(compile-expr (caddr expr))
-            ,@(compile-expr (cadddr expr))
+          `(,@(compile-value-arg (cadr expr))
+            ,@(compile-value-arg (caddr expr))
+            ,@(compile-value-arg (cadddr expr))
             (:call "Runtime.PutProp"))))
   (setf (gethash 'remprop h) (lambda (expr) (compile-binary-call (cdr expr) "Runtime.Remprop")))
   (setf (gethash 'copy-symbol h)
@@ -6156,7 +6384,7 @@
                         (t nil))))
                  (if literal-name
                      `((:ldstr ,literal-name) (:call "Startup.Keyword") (:call "Runtime.MakeHashTable"))
-                     `(,@(compile-expr test-expr) (:call "Runtime.MakeHashTable")))))
+                     `(,@(compile-value-arg test-expr) (:call "Runtime.MakeHashTable")))))
               (t '((:call "Runtime.MakeHashTable0")))))))
   (setf (gethash 'gethash h) (lambda (expr) (compile-gethash (cdr expr))))
   (setf (gethash 'puthash h) (lambda (expr) (compile-puthash (cdr expr))))
@@ -6167,7 +6395,10 @@
   (setf (gethash 'multiple-value-list h)
         (lambda (expr)
           `((:call "MultipleValues.Reset")
-            ,@(let ((*in-mv-context* t))
+            ;; Keep MV context (multiple-value-list needs its arg's values) but
+            ;; block tail: a self-tail-call arg would otherwise fire TCO and
+            ;; dead-code the MultipleValuesList1 call.
+            ,@(let ((*in-tail-position* nil) (*in-mv-context* t))
                 (compile-expr (cadr expr)))
             (:call "Runtime.MultipleValuesList1"))))
 

@@ -81,56 +81,54 @@ public class LispFunction : LispObject
     // per-call cost are unchanged.
     public static LispFunction MakeDirectClosure(Delegate del, object[] env, string fnName)
     {
-        // The _funcN wrappers include PeriodicStackCheck: unlike assembler-built
-        // simple functions, a closure can recurse through itself via its own box
-        // (funcall of a captured self-reference) with no named-call site in
-        // between, and the InvokeN fast path skips InvokeSlow's check — without
-        // this, runaway closure recursion dies as an uncatchable .NET
-        // StackOverflowException instead of the catchable Lisp "Stack overflow"
-        // PROGRAM-ERROR that the args-array path has always produced.
+        // The _funcN direct wrappers bind the closure environment; the periodic
+        // stack-overflow check now lives at the single InvokeN choke point (see
+        // Invoke0..Invoke8), so a closure recursing through its own box still hits
+        // a checked entry and raises the catchable Lisp "Stack overflow"
+        // PROGRAM-ERROR rather than an uncatchable .NET StackOverflowException.
         LispFunction fn;
         switch (del)
         {
             case Func<object[], LispObject> d0:
             {
-                var f = fn = new LispFunction(args => { Runtime.CheckArityExact(fnName, args, 0); return d0(env); }, null, 0);
-                fn._func0 = () => { f.PeriodicStackCheck(); return d0(env); };
+                fn = new LispFunction(args => { Runtime.CheckArityExact(fnName, args, 0); return d0(env); }, null, 0);
+                fn._func0 = () => d0(env);
                 break;
             }
             case Func<object[], LispObject, LispObject> d1:
             {
-                var f = fn = new LispFunction(args => { Runtime.CheckArityExact(fnName, args, 1); return d1(env, args[0]); }, null, 1);
-                fn._func1 = a => { f.PeriodicStackCheck(); return d1(env, a); };
+                fn = new LispFunction(args => { Runtime.CheckArityExact(fnName, args, 1); return d1(env, args[0]); }, null, 1);
+                fn._func1 = a => d1(env, a);
                 break;
             }
             case Func<object[], LispObject, LispObject, LispObject> d2:
             {
-                var f = fn = new LispFunction(args => { Runtime.CheckArityExact(fnName, args, 2); return d2(env, args[0], args[1]); }, null, 2);
-                fn._func2 = (a, b) => { f.PeriodicStackCheck(); return d2(env, a, b); };
+                fn = new LispFunction(args => { Runtime.CheckArityExact(fnName, args, 2); return d2(env, args[0], args[1]); }, null, 2);
+                fn._func2 = (a, b) => d2(env, a, b);
                 break;
             }
             case Func<object[], LispObject, LispObject, LispObject, LispObject> d3:
             {
-                var f = fn = new LispFunction(args => { Runtime.CheckArityExact(fnName, args, 3); return d3(env, args[0], args[1], args[2]); }, null, 3);
-                fn._func3 = (a, b, c) => { f.PeriodicStackCheck(); return d3(env, a, b, c); };
+                fn = new LispFunction(args => { Runtime.CheckArityExact(fnName, args, 3); return d3(env, args[0], args[1], args[2]); }, null, 3);
+                fn._func3 = (a, b, c) => d3(env, a, b, c);
                 break;
             }
             case Func<object[], LispObject, LispObject, LispObject, LispObject, LispObject> d4:
             {
-                var f = fn = new LispFunction(args => { Runtime.CheckArityExact(fnName, args, 4); return d4(env, args[0], args[1], args[2], args[3]); }, null, 4);
-                fn._func4 = (a, b, c, d) => { f.PeriodicStackCheck(); return d4(env, a, b, c, d); };
+                fn = new LispFunction(args => { Runtime.CheckArityExact(fnName, args, 4); return d4(env, args[0], args[1], args[2], args[3]); }, null, 4);
+                fn._func4 = (a, b, c, d) => d4(env, a, b, c, d);
                 break;
             }
             case Func<object[], LispObject, LispObject, LispObject, LispObject, LispObject, LispObject> d5:
             {
-                var f = fn = new LispFunction(args => { Runtime.CheckArityExact(fnName, args, 5); return d5(env, args[0], args[1], args[2], args[3], args[4]); }, null, 5);
-                fn._func5 = (a, b, c, d, e) => { f.PeriodicStackCheck(); return d5(env, a, b, c, d, e); };
+                fn = new LispFunction(args => { Runtime.CheckArityExact(fnName, args, 5); return d5(env, args[0], args[1], args[2], args[3], args[4]); }, null, 5);
+                fn._func5 = (a, b, c, d, e) => d5(env, a, b, c, d, e);
                 break;
             }
             case Func<object[], LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject> d6:
             {
-                var f = fn = new LispFunction(args => { Runtime.CheckArityExact(fnName, args, 6); return d6(env, args[0], args[1], args[2], args[3], args[4], args[5]); }, null, 6);
-                fn._func6 = (a, b, c, d, e, f2) => { f.PeriodicStackCheck(); return d6(env, a, b, c, d, e, f2); };
+                fn = new LispFunction(args => { Runtime.CheckArityExact(fnName, args, 6); return d6(env, args[0], args[1], args[2], args[3], args[4], args[5]); }, null, 6);
+                fn._func6 = (a, b, c, d, e, f2) => d6(env, a, b, c, d, e, f2);
                 break;
             }
             default:
@@ -313,57 +311,66 @@ public class LispFunction : LispObject
         public void Dispose() { if (_pushed) s_callStack!.TryPop(out _); }
     }
 
+    // Each InvokeN fast path calls PeriodicStackCheck before dispatching to
+    // _funcN: this is the single choke point for every direct-delegate call
+    // (assembler-installed simple functions, FASL closures, C# builtins, and
+    // MakeDirectClosure closures — grep confirms nothing calls _funcN directly).
+    // Without it, deep non-TCO recursion through the fast path never reaches
+    // InvokeSlow's check and dies as an uncatchable .NET StackOverflowException
+    // instead of a catchable Lisp "Stack overflow" PROGRAM-ERROR. The check is
+    // AggressiveInlining and only a thread-static counter increment on the
+    // common path (the real stack probe runs every 256th call).
     public LispObject Invoke0()
     {
-        if (_func0 != null) { using (PushFrame()) return _func0(); }
+        if (_func0 != null) { PeriodicStackCheck(); using (PushFrame()) return _func0(); }
         return InvokeSlow(Array.Empty<LispObject>());
     }
 
     public LispObject Invoke1(LispObject a)
     {
-        if (_func1 != null) { using (PushFrame(a)) return _func1(a); }
+        if (_func1 != null) { PeriodicStackCheck(); using (PushFrame(a)) return _func1(a); }
         return InvokeSlow(new[] { a });
     }
 
     public LispObject Invoke2(LispObject a, LispObject b)
     {
-        if (_func2 != null) { using (PushFrame(a, b)) return _func2(a, b); }
+        if (_func2 != null) { PeriodicStackCheck(); using (PushFrame(a, b)) return _func2(a, b); }
         return InvokeSlow(new[] { a, b });
     }
 
     public LispObject Invoke3(LispObject a, LispObject b, LispObject c)
     {
-        if (_func3 != null) { using (PushFrame(a, b, c)) return _func3(a, b, c); }
+        if (_func3 != null) { PeriodicStackCheck(); using (PushFrame(a, b, c)) return _func3(a, b, c); }
         return InvokeSlow(new[] { a, b, c });
     }
 
     public LispObject Invoke4(LispObject a, LispObject b, LispObject c, LispObject d)
     {
-        if (_func4 != null) { using (PushFrame(a, b, c, d)) return _func4(a, b, c, d); }
+        if (_func4 != null) { PeriodicStackCheck(); using (PushFrame(a, b, c, d)) return _func4(a, b, c, d); }
         return InvokeSlow(new[] { a, b, c, d });
     }
 
     public LispObject Invoke5(LispObject a, LispObject b, LispObject c, LispObject d, LispObject e)
     {
-        if (_func5 != null) { var args = new[] { a, b, c, d, e }; using (PushFrame(args)) return _func5(a, b, c, d, e); }
+        if (_func5 != null) { PeriodicStackCheck(); var args = new[] { a, b, c, d, e }; using (PushFrame(args)) return _func5(a, b, c, d, e); }
         return InvokeSlow(new[] { a, b, c, d, e });
     }
 
     public LispObject Invoke6(LispObject a, LispObject b, LispObject c, LispObject d, LispObject e, LispObject f)
     {
-        if (_func6 != null) { var args = new[] { a, b, c, d, e, f }; using (PushFrame(args)) return _func6(a, b, c, d, e, f); }
+        if (_func6 != null) { PeriodicStackCheck(); var args = new[] { a, b, c, d, e, f }; using (PushFrame(args)) return _func6(a, b, c, d, e, f); }
         return InvokeSlow(new[] { a, b, c, d, e, f });
     }
 
     public LispObject Invoke7(LispObject a, LispObject b, LispObject c, LispObject d, LispObject e, LispObject f, LispObject g)
     {
-        if (_func7 != null) { var args = new[] { a, b, c, d, e, f, g }; using (PushFrame(args)) return _func7(a, b, c, d, e, f, g); }
+        if (_func7 != null) { PeriodicStackCheck(); var args = new[] { a, b, c, d, e, f, g }; using (PushFrame(args)) return _func7(a, b, c, d, e, f, g); }
         return InvokeSlow(new[] { a, b, c, d, e, f, g });
     }
 
     public LispObject Invoke8(LispObject a, LispObject b, LispObject c, LispObject d, LispObject e, LispObject f, LispObject g, LispObject h)
     {
-        if (_func8 != null) { var args = new[] { a, b, c, d, e, f, g, h }; using (PushFrame(args)) return _func8(a, b, c, d, e, f, g, h); }
+        if (_func8 != null) { PeriodicStackCheck(); var args = new[] { a, b, c, d, e, f, g, h }; using (PushFrame(args)) return _func8(a, b, c, d, e, f, g, h); }
         return InvokeSlow(new[] { a, b, c, d, e, f, g, h });
     }
 

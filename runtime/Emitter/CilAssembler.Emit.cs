@@ -423,6 +423,26 @@ public partial class CilAssembler
                 _il.Emit(OpCodes.Castclass, typeof(SingleFloat));
                 _il.Emit(OpCodes.Call, _methodCache["SingleFloat.get_Value"]);
                 break;
+            // LispDecimal → raw System.Decimal, and native decimal ops.
+            case "UNBOX-DECIMAL":
+                _il.Emit(OpCodes.Castclass, typeof(LispDecimal));
+                _il.Emit(OpCodes.Call, _methodCache["LispDecimal.get_Value"]);
+                break;
+            case "DECIMAL-ADD":
+                _il.Emit(OpCodes.Call, _methodCache["Decimal.op_Addition"]);
+                break;
+            case "DECIMAL-SUB":
+                _il.Emit(OpCodes.Call, _methodCache["Decimal.op_Subtraction"]);
+                break;
+            case "DECIMAL-MUL":
+                _il.Emit(OpCodes.Call, _methodCache["Decimal.op_Multiply"]);
+                break;
+            case "DECIMAL-DIV":
+                _il.Emit(OpCodes.Call, _methodCache["Decimal.op_Division"]);
+                break;
+            case "DECIMAL-NEG":
+                _il.Emit(OpCodes.Call, _methodCache["Decimal.op_UnaryNegation"]);
+                break;
             case "LDC-R8":
                 _il.Emit(OpCodes.Ldc_R8, GetDouble(Cadr(c)));
                 break;
@@ -545,6 +565,38 @@ public partial class CilAssembler
                 _il.Emit(OpCodes.Ldstr, _faslMode ? Track(spPkg) : spPkg);
                 _il.Emit(OpCodes.Call, _methodCache["Startup.SymInPkg"]);
                 _il.Emit(OpCodes.Castclass, typeof(LispObject));
+                break;
+            }
+            case "READER-IC":
+            {
+                // (reader obj) inline-cached simple slot read. OBJ is
+                // already on the stack (LispObject). Call Runtime.ReaderIC(obj, cell),
+                // where `cell` is a per-call-site monomorphic inline cache.
+                var ricName = GetString(Cadr(c));
+                var ricPkg = GetString(Caddr(c));
+                var ricMethod = _methodCache["Runtime.ReaderIC"];
+                if (_faslMode)
+                {
+                    // The global constant pool is not serialized into a .fasl, so bake
+                    // a fresh cell per call (correct — it just always misses and
+                    // re-resolves the accessor, i.e. no worse than a normal GF call).
+                    _il.Emit(OpCodes.Ldstr, Track(ricName));
+                    _il.Emit(OpCodes.Ldstr, Track(ricPkg));
+                    _il.Emit(OpCodes.Call, _methodCache["Startup.SymInPkg"]);
+                    _il.Emit(OpCodes.Newobj, typeof(ReaderCache).GetConstructor(new[] { typeof(Symbol) })!);
+                    _il.Emit(OpCodes.Call, ricMethod);
+                }
+                else
+                {
+                    // JIT mode: one rooted cell in the constant pool per call site, so
+                    // the monomorphic (class → slot-index) fill persists across calls.
+                    var cell = new ReaderCache(Startup.SymInPkg(ricName, ricPkg));
+                    int idx = AddConstant(cell);
+                    _il.Emit(OpCodes.Ldc_I4, idx);
+                    _il.Emit(OpCodes.Call, _getConstant);
+                    _il.Emit(OpCodes.Castclass, typeof(ReaderCache));
+                    _il.Emit(OpCodes.Call, ricMethod);
+                }
                 break;
             }
             case "LOAD-ENV":
@@ -3487,6 +3539,7 @@ public partial class CilAssembler
             ["Runtime.MakeInstanceRaw"] = typeof(Runtime).GetMethod("MakeInstanceRaw")!,
             ["Runtime.SlotValue"] = typeof(Runtime).GetMethod("SlotValue")!,
             ["Runtime.SetSlotValue"] = typeof(Runtime).GetMethod("SetSlotValue")!,
+            ["Runtime.ReaderIC"] = typeof(Runtime).GetMethod("ReaderIC")!,
             ["Runtime.Boundp"] = typeof(Runtime).GetMethod("Boundp")!,
             ["Runtime.SymbolValue"] = typeof(Runtime).GetMethod("SymbolValue")!,
             ["Runtime.Fdefinition"] = typeof(Runtime).GetMethod("Fdefinition")!,
@@ -3652,6 +3705,20 @@ public partial class CilAssembler
                 typeof(DoubleFloat).GetProperty("Value")!.GetGetMethod()!,
             ["SingleFloat.get_Value"] =
                 typeof(SingleFloat).GetProperty("Value")!.GetGetMethod()!,
+            // Native System.Decimal arithmetic for (declare (type decimal x))
+            // scopes — scale-preserving decimal ops, unlike the undeclared rational path.
+            ["LispDecimal.get_Value"] =
+                typeof(LispDecimal).GetProperty("Value")!.GetGetMethod()!,
+            ["Decimal.op_Addition"] =
+                typeof(decimal).GetMethod("op_Addition", new[] { typeof(decimal), typeof(decimal) })!,
+            ["Decimal.op_Subtraction"] =
+                typeof(decimal).GetMethod("op_Subtraction", new[] { typeof(decimal), typeof(decimal) })!,
+            ["Decimal.op_Multiply"] =
+                typeof(decimal).GetMethod("op_Multiply", new[] { typeof(decimal), typeof(decimal) })!,
+            ["Decimal.op_Division"] =
+                typeof(decimal).GetMethod("op_Division", new[] { typeof(decimal), typeof(decimal) })!,
+            ["Decimal.op_UnaryNegation"] =
+                typeof(decimal).GetMethod("op_UnaryNegation", new[] { typeof(decimal) })!,
 
             // BlockReturnException properties
             ["BlockReturnException.get_Tag"] =
@@ -3693,6 +3760,7 @@ public partial class CilAssembler
             ["LispString"] = typeof(LispString).GetConstructor(new[] { typeof(string) })!,
             ["DoubleFloat"] = typeof(DoubleFloat).GetConstructor(new[] { typeof(double) })!,
             ["SingleFloat"] = typeof(SingleFloat).GetConstructor(new[] { typeof(float) })!,
+            ["LispDecimal"] = typeof(LispDecimal).GetConstructor(new[] { typeof(decimal) })!,
             ["LispProgramError"] = typeof(LispProgramError).GetConstructor(new[] { typeof(string) })!,
             ["LispErrorException"] = typeof(LispErrorException)
                 .GetConstructor(new[] { typeof(LispCondition) })!,

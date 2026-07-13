@@ -113,16 +113,42 @@ jobs:
           rm -f runtime/contrib/dotcl-cs/*.csproj runtime/contrib/dotcl-cs/*.cs
           cp contrib/asdf/asdf.fasl runtime/contrib/asdf/asdf.fasl
 
-      # ── dotnet pack (any RID, no R2R) ────────────────────────────────────
+      # ── dotnet pack: base pointer + per-RID R2R tool packages in one pass ──
+      # Mirror `make pack`: stage all 6 desktop R2R cores at runtime/ top level and run
+      # ONE `dotnet pack` over the desktop RID list + `any`. That single pack emits the
+      # base pointer (tools/net10.0/any/DotnetToolSettings.xml) enumerating EVERY listed
+      # RID PLUS a dotcl.<rid> R2R package each, so `dotnet tool install -g dotcl` selects
+      # the host's fast (~0.16s) R2R build. The old `-p:RuntimeIdentifiers=any` override
+      # listed only `any` in the pointer, so installs fell back to the slow (~1.8s) non-R2R
+      # `any` build and the per-RID R2R packages were orphaned. PublishReadyToRun
+      # defaults to true in the csproj (R2R applies per-RID; `any` stays IL). android RIDs
+      # are intentionally excluded here (release deferral).
       - name: Pack NuGet packages
         run: |
           mkdir -p out
+          for rid in win-x64 win-arm64 linux-x64 linux-arm64 osx-x64 osx-arm64; do
+            cp compiler/dotcl-r2r-$rid.core runtime/dotcl-r2r-$rid.core
+            cp contrib/asdf/asdf-r2r-$rid.fasl runtime/asdf-r2r-$rid.fasl
+          done
+          # Each RID nupkg ships only its own R2R asdf (overlaid via the top-level
+          # asdf-r2r-<rid>.fasl by the csproj's ReplaceFaslsWithR2R); drop the cross-RID
+          # copies the contrib/** glob would otherwise bundle into every package (~9 MB).
+          rm -f runtime/contrib/asdf/asdf-r2r-*.fasl
+          # Exclude android via the csproj's DotclToolNoAndroid hook — it rewrites
+          # <RuntimeIdentifiers> to the 6 desktop RIDs + `any` inside the project. A
+          # ;-list cannot be passed as a command-line -p:RuntimeIdentifiers (bare ; ->
+          # MSB1006; %3B -> NETSDK1083 single-RID), so the flag carries the intent and
+          # the literal list lives in XML.
           dotnet pack runtime/runtime.csproj \
             --configuration Release \
             -o out/ \
             -p:Version=${{ steps.version.outputs.VERSION }} \
-            -p:RuntimeIdentifiers=any \
-            -p:PublishReadyToRun=false
+            -p:DotclToolNoAndroid=true
+          # Drop the staged per-RID cores; the tbz publish below stages its own (from
+          # compiler/), so runtime/ should be clean of them first.
+          for rid in win-x64 win-arm64 linux-x64 linux-arm64 osx-x64 osx-arm64; do
+            rm -f runtime/dotcl-r2r-$rid.core runtime/asdf-r2r-$rid.fasl
+          done
           # Build the in-process project-core MSBuild task FIRST so the library
           # pack bundles tasks/DotCL.Build.Tasks.dll. DotCL.Runtime.csproj
           # includes it with Condition="Exists(...)", so if the task is not built
@@ -147,35 +173,30 @@ jobs:
             exit 1
           fi
 
-      # ── Per-RID R2R tool nupkg (dotcl.<rid>) ─────────────────────────────
-      # dotnet pack -r <rid> on the PackAsTool project emits a DotnetToolRidPackage
-      # named dotcl.<rid>; `dotnet tool install -g dotcl` then auto-selects the
-      # host's RID package. PublishReadyToRun=true + the staged per-RID R2R core /
-      # asdf (overlaid by the csproj's ReplaceFaslsWithR2R after publish) give the
-      # fast (~0.16s) cold start. The produced nupkgs ride the out/*.nupkg upload
-      # below and are pushed by nuget-publish.yml unchanged.
-      - name: Pack per-RID R2R tool nupkgs
+      # ── Guard: the base tool pointer must enumerate every per-RID package ──
+      # If it lists only `any`, `dotnet tool install -g dotcl` picks the slow non-R2R
+      # build and the per-RID R2R packages are orphaned. Fail the release loudly.
+      - name: Verify tool pointer enumerates all RIDs
         run: |
           VER=${{ steps.version.outputs.VERSION }}
-          mkdir -p out
-          # Each RID package carries only its own R2R asdf (injected via the
-          # top-level asdf-r2r-<rid>.fasl staged per RID below); strip the
-          # cross-RID copies the contrib/** glob would bundle into every package
-          # (~9 MB). tbz reads asdf from the source contrib/ tree, so this is
-          # harmless to the tbz step that follows.
-          rm -f runtime/contrib/asdf/asdf-r2r-*.fasl
+          nupkg="out/dotcl.$VER.nupkg"
+          xml=$(unzip -p "$nupkg" 'tools/net10.0/any/DotnetToolSettings.xml')
+          missing=""
           for rid in win-x64 win-arm64 linux-x64 linux-arm64 osx-x64 osx-arm64; do
-            echo "=== pack dotcl.$rid (R2R) ==="
-            cp compiler/dotcl-r2r-$rid.core runtime/dotcl-r2r-$rid.core
-            cp contrib/asdf/asdf-r2r-$rid.fasl runtime/asdf-r2r-$rid.fasl
-            dotnet pack runtime/runtime.csproj \
-              --configuration Release \
-              -o out/ \
-              -p:Version=$VER \
-              -p:RuntimeIdentifier=$rid \
-              -p:PublishReadyToRun=true
-            rm -f runtime/dotcl-r2r-$rid.core runtime/asdf-r2r-$rid.fasl
+            echo "$xml" | grep -q "RuntimeIdentifier=\"$rid\"" || missing="$missing $rid"
           done
+          if [ -n "$missing" ]; then
+            echo "ERROR: $nupkg tool pointer is missing RIDs:$missing"
+            echo "  dotnet tool install -g dotcl would fall back to the slow non-R2R any build."
+            echo "$xml"
+            exit 1
+          fi
+          echo "OK: pointer enumerates all desktop RIDs — R2R install works"
+
+      # (The per-RID R2R tool nupkgs — dotcl.<rid> — are now produced by the single
+      #  multi-RID `dotnet pack` in "Pack NuGet packages" above, together with a base
+      #  pointer that enumerates every RID. A separate per-RID `-p:RuntimeIdentifier=$rid`
+      #  loop is no longer needed and would only duplicate those packages.)
 
       # ── Per-RID tbz for Roswell (R2R) ────────────────────────────────────
       # dotnet publish -r <rid> --self-contained false cross-compiles on Linux

@@ -62,6 +62,9 @@ public static partial class Runtime
             && BitConverter.DoubleToInt64Bits(da.Value) == BitConverter.DoubleToInt64Bits(db.Value)) return T.Instance;
         if (a is Bignum ba && b is Bignum bb && ba.Value == bb.Value) return T.Instance;
         if (a is Ratio ra && b is Ratio rb && ra.Numerator == rb.Numerator && ra.Denominator == rb.Denominator) return T.Instance;
+        // Decimals are eql when representation-identical (value AND scale): (eql #m1.0 #m1.0)=T
+        // but (eql #m1.0 #m1.00)=NIL, while = compares them equal via the rational value.
+        if (a is LispDecimal lda && b is LispDecimal ldb && lda.Equals(ldb)) return T.Instance;
         if (a is LispComplex xa && b is LispComplex xb)
             return IsTrueEql(xa.Real, xb.Real) && IsTrueEql(xa.Imaginary, xb.Imaginary)
                 ? T.Instance : Nil.Instance;
@@ -293,6 +296,28 @@ public static partial class Runtime
         Startup.RegisterBinary("COERCE", Runtime.Coerce);
         Startup.RegisterUnary("TYPE-OF", Runtime.TypeOf);
         Startup.RegisterUnary("RATIONALP", Runtime.Rationalp);
+
+        // dotcl:decimalp — non-standard predicate for the first-class CLR decimal
+        // (LispDecimal). Exported from DOTCL but NOT imported into CL-USER: like the
+        // dotnet:/dotcl: interop surface, a non-standard extension stays qualified rather
+        // than contaminating CL-USER. Callers write dotcl:decimalp (or (use-package :dotcl)).
+        {
+            var decimalpSym = Startup.SymInPkg("DECIMALP", "DOTCL");
+            Func<LispObject, LispObject> decimalp =
+                o => Runtime.Primary(o) is LispDecimal ? T.Instance : Nil.Instance;
+            var fn = new LispFunction(a => {
+                if (a.Length != 1)
+                    throw new LispErrorException(new LispProgramError("DECIMALP: wrong number of arguments"));
+                return decimalp(a[0]);
+            }, "DECIMALP");
+            fn.SetDirectDelegate(decimalp);
+            decimalpSym.Function = fn;
+            Startup.DotclPkg.Export(decimalpSym);
+            // Export the DOTCL:DECIMAL type name too. typep matches by name so
+            // (typep x 'decimal) still answers for any DECIMAL-named spec, but the
+            // compiler's native-decimal path keys strictly on dotcl:decimal.
+            Startup.DotclPkg.Export(Startup.SymInPkg("DECIMAL", "DOTCL"));
+        }
 
         // Equality: EQ, EQL, EQUAL, EQUALP
         Startup.RegisterBinary("EQ", Runtime.Eq);

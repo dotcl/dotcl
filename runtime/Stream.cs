@@ -246,7 +246,10 @@ public class LispStringInputStream : LispInputStream
     public bool SeekToPosition(int absolutePosition)
     {
         if (_fullString == null) return false;
-        if (absolutePosition < 0 || absolutePosition >= _endOffset) return false;
+        // Allow seeking to the end (== _endOffset), the valid EOF position:
+        // (file-position s (length s)) leaves the stream at end-of-input. A
+        // position past the end is still rejected.
+        if (absolutePosition < 0 || absolutePosition > _endOffset) return false;
         var sub = _fullString.Substring(absolutePosition, _endOffset - absolutePosition);
         var newReader = new PositionTrackingReader(new StringReader(sub));
         Reader = newReader;

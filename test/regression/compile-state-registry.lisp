@@ -74,12 +74,12 @@
   (let ((dcs (%csr-sym "DEFINE-COMPILE-STATE"))
         (cwf (symbol-function (%csr-sym "CALL-WITH-FRESH-CLOSURE-STATE")))
         (dummy (intern "*CSR-DUMMY-STATE*" "CL-USER")))
-    ;; Expand via the macro's own expander, then eval the expansion. Direct
-    ;; (eval (list dcs ...)) hits a pre-existing eval/macro symbol-identity
-    ;; quirk for cross-package macro heads (compile path misses the *macros*
-    ;; entry that macro-function's name bridge finds) — unrelated to the
-    ;; registry mechanism under test.
-    (eval (funcall (macro-function dcs) (list dcs dummy :fresh-a) nil))
+    ;; Direct (eval (list dcs ...)) with a cross-package macro head: the compile
+    ;; path resolves the macro through MACRO-FUNCTION's name bridge even when the
+    ;; *macros* eq-lookup misses (the head symbol found by name may differ from
+    ;; the one the macro was registered under). Previously this compiled the head
+    ;; as a function call and errored; it now expands correctly.
+    (eval (list dcs dummy :fresh-a))
     (let* ((registry (symbol-value (%csr-sym "*CLOSURE-FRESH-STATE*")))
            (dv (car (assoc "*CSR-DUMMY-STATE*" registry
                            :key #'symbol-name :test #'string=))))
@@ -94,7 +94,7 @@
   (let ((dcs (%csr-sym "DEFINE-COMPILE-STATE"))
         (cwf (symbol-function (%csr-sym "CALL-WITH-FRESH-CLOSURE-STATE")))
         (dummy2 (intern "*CSR-DUMMY-STATE-2*" "CL-USER")))
-    (eval (funcall (macro-function dcs) (list dcs dummy2 nil :fresh-init t) nil))
+    (eval (list dcs dummy2 nil :fresh-init t))
     (let* ((registry (symbol-value (%csr-sym "*CLOSURE-FRESH-STATE*")))
            (dv (car (assoc "*CSR-DUMMY-STATE-2*" registry
                            :key #'symbol-name :test #'string=))))

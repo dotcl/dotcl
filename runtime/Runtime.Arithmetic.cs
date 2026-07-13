@@ -1260,6 +1260,7 @@ public static partial class Runtime
                     Fixnum f => (LispObject)new SingleFloat((float)f.Value),
                     Bignum b => (LispObject)new SingleFloat((float)(double)b.Value),
                     Ratio r => (LispObject)new SingleFloat((float)Arithmetic.RatioToDouble(r)),
+                    LispDecimal d => (LispObject)new SingleFloat((float)d.Value),
                     _ => throw new LispErrorException(new LispTypeError("FLOAT: not a number", num, Startup.Sym("REAL")))
                 };
             }
@@ -1274,6 +1275,8 @@ public static partial class Runtime
                                       : new SingleFloat((float)Arithmetic.RatioToDouble(r)),
                 SingleFloat sf => wantDouble ? (LispObject)new DoubleFloat((double)sf.Value) : sf,
                 DoubleFloat df => wantDouble ? df : (LispObject)new SingleFloat((float)df.Value),
+                LispDecimal d => wantDouble ? (LispObject)new DoubleFloat((double)d.Value)
+                                            : new SingleFloat((float)d.Value),
                 _ => throw new LispErrorException(new LispTypeError("FLOAT: not a number", num, Startup.Sym("REAL")))
             };
         }, "FLOAT"));
@@ -1311,6 +1314,7 @@ public static partial class Runtime
             Ratio r => r,
             SingleFloat sf => Runtime.DoubleToRational((double)sf.Value),
             DoubleFloat df => Runtime.DoubleToRational(df.Value),
+            LispDecimal d => d.ToRational(),   // exact — a decimal is always rational
             _ => throw new LispErrorException(new LispTypeError("RATIONAL: not real", obj))
         });
 

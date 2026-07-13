@@ -87,12 +87,48 @@ public static partial class Runtime
                 : (LispObject)Bignum.MakeInteger((System.Numerics.BigInteger)(ulong)nu),
             double d => new DoubleFloat(d),
             float f => new DoubleFloat(f),
+            // Preserve decimal as a first-class scale-keeping value (not a normalized
+            // rational, which would drop trailing zeros / the .NET-specific scale).
+            decimal m => new LispDecimal(m),
             string s => new LispString(s),
             char c => LispChar.Make(c),
             bool b => b ? (LispObject)T.Instance : Nil.Instance,
             LispObject lo => lo,
             _ => new LispDotNetObject(value)
         };
+    }
+
+    private static readonly System.Numerics.BigInteger DecimalMaxInt = new(decimal.MaxValue);
+    private static readonly System.Numerics.BigInteger DecimalMinInt = new(decimal.MinValue);
+
+    /// <summary>Convert an exact rational (num/den, normalized) to System.Decimal, or signal
+    /// a Lisp error when it is not exactly representable: the denominator has a prime factor
+    /// other than 2 or 5 (e.g. 1/3), or the value needs scale &gt; 28 / a mantissa wider than
+    /// 96 bits. Used when marshalling a CL ratio into a decimal-typed .NET parameter.</summary>
+    private static decimal RationalToDecimalExact(System.Numerics.BigInteger num, System.Numerics.BigInteger den, LispObject arg)
+    {
+        var d = den;
+        int twos = 0, fives = 0;
+        while (d % 2 == 0) { d /= 2; twos++; }
+        while (d % 5 == 0) { d /= 5; fives++; }
+        if (d != System.Numerics.BigInteger.One)
+            throw new LispErrorException(new LispError(
+                $"{arg} is not exactly representable as System.Decimal (denominator has a prime factor other than 2 or 5)"));
+        int scale = System.Math.Max(twos, fives);
+        if (scale > 28)
+            throw new LispErrorException(new LispError(
+                $"{arg} needs more than 28 decimal places (System.Decimal scale limit)"));
+        // Exact: den = 2^twos * 5^fives divides 10^scale.
+        var mantissa = num * System.Numerics.BigInteger.Pow(10, scale) / den;
+        bool neg = mantissa.Sign < 0;
+        var mag = System.Numerics.BigInteger.Abs(mantissa);
+        if (mag > (System.Numerics.BigInteger.One << 96) - 1)
+            throw new LispErrorException(new LispError(
+                $"{arg} exceeds the System.Decimal 96-bit mantissa range"));
+        uint lo = (uint)(mag & 0xFFFFFFFF);
+        uint mid = (uint)((mag >> 32) & 0xFFFFFFFF);
+        uint hi = (uint)((mag >> 64) & 0xFFFFFFFF);
+        return new decimal((int)lo, (int)mid, (int)hi, neg, (byte)scale);
     }
 
     /// <summary>Normalize a Lisp-wrapped awaitable (Task / Task&lt;T&gt; / ValueTask /
@@ -683,6 +719,27 @@ public static partial class Runtime
             if (targetType == typeof(decimal)) return (decimal)sf.Value;
             if (targetType == typeof(object)) return sf.Value;
         }
+
+        // LispDecimal → decimal (exact) / float / double
+        if (arg is LispDecimal ld)
+        {
+            if (targetType == typeof(decimal)) return ld.Value;
+            if (targetType == typeof(double)) return (double)ld.Value;
+            if (targetType == typeof(float)) return (float)ld.Value;
+            if (targetType == typeof(object)) return ld.Value;
+        }
+
+        // Bignum / Ratio → decimal: exact-or-throw, so a computed CL real can be passed to
+        // a decimal-typed .NET parameter without silent precision loss.
+        if (arg is Bignum bnD && targetType == typeof(decimal))
+        {
+            if (bnD.Value < DecimalMinInt || bnD.Value > DecimalMaxInt)
+                throw new LispErrorException(new LispTypeError(
+                    "value out of System.Decimal range", arg, Startup.Sym("NUMBER")));
+            return (decimal)bnD.Value;
+        }
+        if (arg is Ratio rtD && targetType == typeof(decimal))
+            return RationalToDecimalExact(rtD.Numerator, rtD.Denominator, arg);
 
         // LispString → string
         if (arg is LispString ls)

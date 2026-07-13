@@ -316,6 +316,17 @@
    compile-function-body-*/compile-closure-body so closures compiled
    within the group never emit br-to-outer-TCOLOOP.")
 
+(define-compile-state *labels-direct-speculation* nil
+  :doc "During speculative direct+TCO compilation of a single self-recursive
+   labels function (compile-labels-boxed), holds (name-str . box-key).
+   compile-lambda routes the fn — whose SOLE free var is its own labels box —
+   through the direct :make-function-direct path (which carries self-TCO)
+   instead of a closure; compile-function-body-direct injects the box as a
+   local-function so any self-reference NOT lowered to a TCO branch emits a
+   detectable (:ldloc box-key) load. The caller then scans the generated body
+   and only accepts it when provably self-contained, otherwise recompiles via
+   the closure path. NIL outside speculation. Reset at closure boundaries.")
+
 (define-compile-state *in-try-block* nil
   :doc "Non-NIL when the currently-being-compiled expression is inside a try/
    finally region whose finally must run on exit (e.g. special-variable
@@ -353,6 +364,12 @@
 (defvar *single-float-locals* '()
   "Like *double-float-locals* but for single-float declarations. Enables native
    r4 arithmetic on (declare (single-float x)) locals and references.")
+
+(defvar *decimal-locals* '()
+  "Like *double-float-locals* but for decimal declarations. Enables
+   native System.Decimal arithmetic on (declare (type decimal x)) locals: in such a
+   scope (+ x y) compiles to decimal.op_Addition and PRESERVES SCALE (1.50m+2.25m=
+   3.75m), where the undeclared path degrades a decimal to its rational value.")
 
 (define-compile-state *long-locals* '()
   :doc "List of symbol-name strings whose local slots hold Int64 directly (not boxed
@@ -494,9 +511,17 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
                     :key (lambda (k) (if (symbolp k) (var-name k) nil))
                     :test #'string=)))))
 
+;; When true, LOCAL-BOUND-P answers T for every symbol. Bound only during
+;; free-var CANDIDATE collection (%compute-free-candidates, cil-analysis.lisp):
+;; candidates are the structurally-free names of a lambda,
+;; independent of *locals*, so they can be memoized per form. The real
+;; *locals*-dependent filter is re-applied at each enclosing merge point.
+(defvar *ffv-assume-bound* nil)
+
 (defun local-bound-p (sym)
   "Check if symbol is bound in *locals* or has a boxed entry in *local-functions*."
-  (or (assoc sym *locals* :test #'eq)
+  (or *ffv-assume-bound*
+      (assoc sym *locals* :test #'eq)
       (let ((name (var-name sym)))
         (assoc name *locals*
                :key (lambda (k) (if (symbolp k) (var-name k) nil))
@@ -506,6 +531,18 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
       (let ((name (symbol-name sym)))
         (find name *local-functions*
               :key #'first :test #'string=))))
+
+(defun local-bound-name-p (name)
+  "Like LOCAL-BOUND-P but keyed by an effective-name STRING, so callers holding
+   only a var-name (e.g. the free-var candidate merge) need not intern
+   a symbol just to test binding. Equivalent to LOCAL-BOUND-P of any symbol whose
+   VAR-NAME is NAME: the symbol-identity (EQ) branch of LOCAL-BOUND-P can only
+   match an entry that this by-name branch also matches. Avoids the package
+   mutation an INTERN would cause (harmful under concurrent compile)."
+  (or (assoc name *locals*
+             :key (lambda (k) (if (symbolp k) (var-name k) nil))
+             :test #'string=)
+      (find name *local-functions* :key #'first :test #'string=)))
 
 (defun boxed-var-p (sym)
   "Check if a variable needs boxing (by effective name, cross-package safe)."
@@ -884,7 +921,7 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
    macroexpand read (see the MACROEXPAND-1 runtime). Macro expanders built by
    defmacro/macrolet call this to supply &environment, so a macro can
    macroexpand-1 a symbol-macro that is lexically in scope at the call site —
-   e.g. serapeum with-boolean's %all-branches% channel (#473). *macros* is
+   e.g. serapeum with-boolean's %all-branches% channel. *macros* is
    already a hash table; the symbol-macro side is keyed by symbol-name.
    Returns NIL when no lexical symbol-macro is in scope (top-level / the common
    case), so a macro's (if env ...) still reads a null environment there — only
@@ -902,21 +939,41 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
                   (setf (gethash k ht) (cdr entry)))))))))
 
 (defun find-macro-expander (sym)
-  "Find macro expander for SYM by symbol identity.
+  "Find macro expander for SYM by symbol identity, with a runtime name bridge.
    Checks *macros* first, then (at runtime only) the runtime macro table
-   (MACRO-FUNCTION) for C#-registered macros such as DOTCL:WITHOUT-PACKAGE-LOCKS.
+   (MACRO-FUNCTION) for macros that reached the C# _macroFunctions table but not
+   the Lisp *macros* table.
    Runtime-table entries take (form env); we wrap them to the 1-arg convention.
-   Skipped during cross-compile to avoid picking up host (SBCL) macro definitions."
+   Skipped during cross-compile to avoid picking up host (SBCL) macro definitions.
+
+   The MACRO-FUNCTION fallback used to be limited to the DOTCL package (only
+   C#-registered macros like DOTCL:WITHOUT-PACKAGE-LOCKS). That left a hole:
+   a macro registered at cross-compile under one symbol object can be referenced
+   at runtime through a same-named symbol in a different package — e.g. a form
+   whose head is DOTCL-INTERNAL::DEFINE-COMPILE-STATE built programmatically and
+   EVALd. The registration only lands in _macroFunctions (keyed by that symbol),
+   so the eq-keyed *macros* misses and the head would wrongly compile as a
+   function call (UNDEFINED-FUNCTION / silent misbehavior). MACRO-FUNCTION finds
+   it by symbol identity, so consulting it closes the gap and matches the
+   cross-package bridge the function-resolution path already has
+   (FindFunctionAcrossPackages).
+
+   COMMON-LISP is excluded from the fallback: standard CL operators (FORMATTER,
+   DEFUN, LOOP, CASE, DESTRUCTURING-BIND, ...) carry a no-op MACRO-FUNCTION
+   bridge that returns the form UNCHANGED when no compiler macro exists
+   (Runtime.Misc.cs standardMacros; the bridge exists so runtime MACROEXPAND-1
+   works for code walkers). The compiler lowers those via its own handlers /
+   named-call, so consulting the bridge for a CL symbol would loop forever
+   (form unchanged → re-compile → same head) or mis-expand — this is exactly the
+   trap the DEFMACRO special-case above documents. Every genuine macro missing
+   from *macros* lives in another package and has a real expander. Special
+   operators (WHEN/AND/OR/COND/...) never reach here anyway — they are handled by
+   *compile-form-handlers* before macro expansion."
   (or (gethash sym *macros*)
-      ;; Runtime fallback: pick up macros registered from C# (e.g.
-      ;; DOTCL:WITHOUT-PACKAGE-LOCKS) that the Lisp-side *macros* table doesn't
-      ;; know about. Limit to symbols in the DOTCL package to avoid the cost of
-      ;; a per-form macro-function lookup for every operator. Skipped during
-      ;; cross-compile so we never pick up host (SBCL) macro definitions.
       (and (not *cross-compiling*)
            (symbolp sym)
            (let ((pkg (symbol-package sym)))
-             (and pkg (string= (package-name pkg) "DOTCL")))
+             (and pkg (not (string= (package-name pkg) "COMMON-LISP"))))
            (let ((mf (macro-function sym)))
              (and mf (lambda (form) (funcall mf form nil)))))))
 
@@ -1977,6 +2034,135 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
       ,@body)))
 
 ;;; ============================================================
+;;; Decimal native arithmetic
+;;; Parallel to the double-float path, but emits native System.Decimal ops
+;;; (decimal.op_Addition etc.) and boxes with newobj LispDecimal. The point is
+;;; SEMANTIC as well as speed: System.Decimal arithmetic preserves scale, so in a
+;;; (declare (type decimal ...)) scope 1.50m+2.25m stays 3.75m — the undeclared
+;;; tower path instead treats the decimal by its rational value (scale lost).
+;;; ============================================================
+
+;; Whether the running host knows the DECIMAL type. Evaluated at load time in the
+;; TARGET (dotcl → T) — not baked by a #+dotcl read-conditional, which would freeze
+;; the cross-compile host's answer (SBCL → NIL) into the shipped compiler. ignore-errors
+;; makes the probe safe on the XC host, where DECIMAL is an unknown type specifier.
+(defvar *decimal-type-available*
+  (ignore-errors (progn (typep nil 'decimal) t)))
+
+(defun decimal-literal-p (expr)
+  "T if EXPR is a first-class decimal object (a #m literal). NIL (never a type error)
+   on a host without the DECIMAL type, e.g. the SBCL cross-compile host."
+  (and *decimal-type-available* (typep expr 'decimal)))
+
+(defun decimal-typed-p (expr)
+  "T if EXPR is statically known to produce a decimal (LispDecimal) value:
+   a #m literal, a decimal-declared local (via *decimal-locals*), (the decimal E),
+   or recursive binary +,-,*,/ / unary - whose operands are all decimal-typed."
+  (cond
+    ((decimal-literal-p expr) t)
+    ((and (symbolp expr)
+          (boundp '*decimal-locals*)
+          (member (var-name expr) *decimal-locals* :test #'string=)
+          (not (boxed-var-p expr))
+          (lookup-local expr))
+     t)
+    ((and (consp expr) (eq (car expr) 'the)
+          (let ((ty (cadr expr)))
+            (or (decimal-type-name-p ty)
+                (and (consp ty) (decimal-type-name-p (car ty))))))
+     t)
+    ((and (consp expr) (= (length expr) 3)
+          (member (car expr) '(+ - * /))
+          (decimal-typed-p (cadr expr))
+          (decimal-typed-p (caddr expr)))
+     t)
+    ((and (consp expr) (= (length expr) 2) (eq (car expr) '-)
+          (decimal-typed-p (cadr expr)))
+     t)
+    (t nil)))
+
+(defun decimal-strong-typed-p (expr)
+  "Like DECIMAL-TYPED-P, but a bare #m literal does NOT count on its own. A native
+   decimal op fires only when a declared decimal or (the decimal E) is involved, so
+   undeclared literal arithmetic — (+ #m1.5 #m1.5) — stays on the standard tower and
+   degrades to a rational (conservative-extension invariant #1: standard ops/literals
+   do not spontaneously yield extended-type values). Literals are still valid OPERANDS
+   of a strong decimal expression; compile-as-decimal loads them fine."
+  (cond
+    ((and (symbolp expr)
+          (boundp '*decimal-locals*)
+          (member (var-name expr) *decimal-locals* :test #'string=)
+          (not (boxed-var-p expr))
+          (lookup-local expr))
+     t)
+    ((and (consp expr) (eq (car expr) 'the)
+          (let ((ty (cadr expr)))
+            (or (decimal-type-name-p ty)
+                (and (consp ty) (decimal-type-name-p (car ty))))))
+     t)
+    ((and (consp expr) (= (length expr) 3)
+          (member (car expr) '(+ - * /))
+          (decimal-typed-p (cadr expr))
+          (decimal-typed-p (caddr expr))
+          (or (decimal-strong-typed-p (cadr expr))
+              (decimal-strong-typed-p (caddr expr))))
+     t)
+    ((and (consp expr) (= (length expr) 2) (eq (car expr) '-)
+          (decimal-strong-typed-p (cadr expr)))
+     t)
+    (t nil)))
+
+(defun decimal-float-mix-p (args)
+  "T if the two ARGS are a declared/`the` decimal on one side and a statically
+   float-typed value on the other. Such a mix has no lossless meaning (decimal is
+   base-10 exact, float is binary approximate — .NET itself forbids implicit
+   decimal<->double), so a declared scope rejects it and requires an explicit coerce
+   ((float d) / (rational d)) rather than silently widening to double."
+  (and (= (length args) 2)
+       (let ((a (first args)) (b (second args)))
+         (flet ((floatp* (e) (or (double-float-typed-p e) (single-float-typed-p e))))
+           (or (and (decimal-strong-typed-p a) (floatp* b))
+               (and (decimal-strong-typed-p b) (floatp* a)))))))
+
+(defparameter *decimal-float-mix-error*
+  "cannot mix a decimal with a float in one arithmetic op — .NET forbids implicit
+ decimal<->double; coerce explicitly, e.g. (+ (rational d) x) or (float d)")
+
+(defun compile-as-decimal (expr)
+  "Compile EXPR leaving a native System.Decimal (valuetype) on the stack.
+   Caller must have verified decimal-typed-p."
+  (cond
+    ((and (symbolp expr)
+          (boundp '*decimal-locals*)
+          (member (var-name expr) *decimal-locals* :test #'string=)
+          (lookup-local expr))
+     `((:ldloc ,(lookup-local expr))
+       (:unbox-decimal)))
+    ((and (consp expr) (eq (car expr) 'the))
+     `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
+           (compile-expr (caddr expr)))
+       (:unbox-decimal)))
+    ((and (consp expr) (= (length expr) 3) (member (car expr) '(+ - * /)))
+     (let ((op (ecase (car expr) (+ :decimal-add) (- :decimal-sub)
+                                 (* :decimal-mul) (/ :decimal-div))))
+       `(,@(compile-as-decimal (cadr expr))
+         ,@(compile-as-decimal (caddr expr))
+         (,op))))
+    ((and (consp expr) (= (length expr) 2) (eq (car expr) '-))
+     `(,@(compile-as-decimal (cadr expr)) (:decimal-neg)))
+    (t
+     `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
+           (compile-expr expr))
+       (:unbox-decimal)))))
+
+(defun compile-decimal-binop (args op)
+  "Emit: compile-as-decimal a, compile-as-decimal b, <decimal op>, newobj LispDecimal."
+  `(,@(compile-as-decimal (first args))
+    ,@(compile-as-decimal (second args))
+    (,op)
+    (:newobj "LispDecimal")))
+
+;;; ============================================================
 ;;; Single-float native arithmetic
 ;;; Parallel to the double-float path above, but emits native r4 (IEEE 754
 ;;; single) arithmetic with a final conv.r4 + newobj SingleFloat to box.
@@ -2081,6 +2267,12 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
     (1 (let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr (first args))))
     (2
      (cond
+       ;; Both args known decimal → native System.Decimal add (scale preserved).
+       ((and (decimal-typed-p (first args)) (decimal-typed-p (second args))
+             (or (decimal-strong-typed-p (first args)) (decimal-strong-typed-p (second args))))
+        (compile-decimal-binop args :decimal-add))
+       ((decimal-float-mix-p args)
+        (compile-static-program-error *decimal-float-mix-error*))
        ;; Fast path: both args known double-float → native r8 add
        ((and (double-float-typed-p (first args)) (double-float-typed-p (second args)))
         (compile-double-binop args :add))
@@ -2107,6 +2299,11 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
   (case (length args)
     (0 (compile-static-program-error "-: too few arguments: 0 (expected at least 1)"))
     (1 (cond
+         ;; Native unary negate for a strongly-decimal operand (scale preserved). A bare
+         ;; #m literal is NOT strong, so (- #m1.5) degrades to a rational like other
+         ;; undeclared literal arithmetic.
+         ((decimal-strong-typed-p (first args))
+          `(,@(compile-as-decimal (first args)) (:decimal-neg) (:newobj "LispDecimal")))
          ;; Native unary negate for float-typed operand.
          ((double-float-typed-p (first args))
           `(,@(compile-as-double (first args)) (:neg) (:newobj "DoubleFloat")))
@@ -2117,6 +2314,11 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
          (t (compile-unary-call (list (first args)) "Runtime.Negate" "-"))))
     (2
      (cond
+       ((and (decimal-typed-p (first args)) (decimal-typed-p (second args))
+             (or (decimal-strong-typed-p (first args)) (decimal-strong-typed-p (second args))))
+        (compile-decimal-binop args :decimal-sub))
+       ((decimal-float-mix-p args)
+        (compile-static-program-error *decimal-float-mix-error*))
        ((and (double-float-typed-p (first args)) (double-float-typed-p (second args)))
         (compile-double-binop args :sub))
        ((and (single-float-typed-p (first args)) (single-float-typed-p (second args)))
@@ -2137,6 +2339,11 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
     (1 (let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr (first args))))
     (2
      (cond
+       ((and (decimal-typed-p (first args)) (decimal-typed-p (second args))
+             (or (decimal-strong-typed-p (first args)) (decimal-strong-typed-p (second args))))
+        (compile-decimal-binop args :decimal-mul))
+       ((decimal-float-mix-p args)
+        (compile-static-program-error *decimal-float-mix-error*))
        ((and (double-float-typed-p (first args)) (double-float-typed-p (second args)))
         (compile-double-binop args :mul))
        ((and (single-float-typed-p (first args)) (single-float-typed-p (second args)))
@@ -2155,6 +2362,13 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
     (1 (compile-binary-call (list 1 (first args)) "Runtime.Divide"))
     (2
      (cond
+       ;; Both decimal → native decimal divide (System.Decimal semantics: rounds
+       ;; to 28 significant digits, unlike CL's exact rational division).
+       ((and (decimal-typed-p (first args)) (decimal-typed-p (second args))
+             (or (decimal-strong-typed-p (first args)) (decimal-strong-typed-p (second args))))
+        (compile-decimal-binop args :decimal-div))
+       ((decimal-float-mix-p args)
+        (compile-static-program-error *decimal-float-mix-error*))
        ((and (double-float-typed-p (first args)) (double-float-typed-p (second args)))
         (compile-double-binop args :div))
        ((and (single-float-typed-p (first args)) (single-float-typed-p (second args)))

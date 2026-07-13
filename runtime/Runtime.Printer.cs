@@ -512,6 +512,9 @@ public static partial class Runtime
                 return FormatSingleFloat(sf.Value);
             case DoubleFloat df:
                 return FormatDoubleFloat(df.Value);
+            case LispDecimal dec:
+                // #m<value> — round-trippable, scale preserved (InvariantCulture).
+                return "#m" + dec.Value.ToString(System.Globalization.CultureInfo.InvariantCulture);
             case LispPathname pn:
             {
                 var ns = pn.ToNamestring();

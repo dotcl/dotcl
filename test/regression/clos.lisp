@@ -714,3 +714,236 @@
                                                         '("System.Int32"))))
         (%cft-gen 42))
   (:int-list :other))
+
+;;; ============================================================
+;;; N-way polymorphic dispatch cache — correctness across
+;;; alternating argument classes (the old monomorphic cache only
+;;; ever held one class key; the poly cache must still dispatch to
+;;; the right method for each, and invalidate on defmethod).
+;;; ============================================================
+
+(defclass %pd-a () ()) (defclass %pd-b () ()) (defclass %pd-c () ())
+(defclass %pd-d () ()) (defclass %pd-e () ())
+(defgeneric %pd (x))
+(defmethod %pd ((x %pd-a)) :a)
+(defmethod %pd ((x %pd-b)) :b)
+(defmethod %pd ((x %pd-c)) :c)
+(defmethod %pd ((x %pd-d)) :d)
+(defmethod %pd ((x %pd-e)) :e)
+
+;; Alternate 2 classes many times: each call must return its own method.
+(deftest pd-alternate-2
+  (let ((a (make-instance '%pd-a)) (b (make-instance '%pd-b)) (acc '()))
+    (dotimes (i 5) (push (%pd a) acc) (push (%pd b) acc))
+    (remove-duplicates (nreverse acc)))
+  (:a :b))
+
+;; Cycle 5 classes > cache width (4): all still correct (misses re-fill).
+(deftest pd-cycle-over-width
+  (let ((xs (list (make-instance '%pd-a) (make-instance '%pd-b) (make-instance '%pd-c)
+                  (make-instance '%pd-d) (make-instance '%pd-e))))
+    (loop repeat 4 nconc (mapcar #'%pd xs)))
+  (:a :b :c :d :e :a :b :c :d :e :a :b :c :d :e :a :b :c :d :e))
+
+;; defmethod after warming the cache must be seen (invalidation).
+(defclass %pd-inv () ())
+(defgeneric %pdi (x))
+(defmethod %pdi ((x %pd-inv)) :old)
+(deftest pd-invalidate-on-defmethod
+  (let ((o (make-instance '%pd-inv)))
+    (dotimes (i 3) (%pdi o))                 ; warm cache with :old
+    (eval '(defmethod %pdi ((x %pd-inv)) :new))
+    (%pdi o))
+  :new)
+
+;; EQL + class specializers alternating (the eql cache path, 1 required arg).
+(defgeneric %pde (x))
+(defmethod %pde ((x (eql :k1))) :eql1)
+(defmethod %pde ((x (eql :k2))) :eql2)
+(defmethod %pde ((x symbol)) :sym)
+(deftest pd-eql-alternate
+  (let ((acc '()))
+    (dotimes (i 3)
+      (push (%pde :k1) acc) (push (%pde :k2) acc) (push (%pde :other) acc))
+    (remove-duplicates (nreverse acc)))
+  (:eql1 :eql2 :sym))
+
+;; :before/:after (standard combination) poly across classes.
+(defvar *pd-log* '())
+(defgeneric %pdc (x))
+(defmethod %pdc ((x %pd-a)) :a)
+(defmethod %pdc ((x %pd-b)) :b)
+(defmethod %pdc :before ((x %pd-a)) (push :ba *pd-log*))
+(defmethod %pdc :before ((x %pd-b)) (push :bb *pd-log*))
+(deftest pd-combination-alternate
+  (let ((a (make-instance '%pd-a)) (b (make-instance '%pd-b)))
+    (setf *pd-log* '())
+    (list (%pdc a) (%pdc b) (%pdc a) (nreverse *pd-log*)))
+  (:a :b :a (:ba :bb :ba)))
+
+;;; ============================================================
+;;; Item2: specialized standard slot reader (direct slot read).
+;;; Must preserve unbound-slot, inheritance (slot at a different index
+;;; in a subclass), and NOT specialize when a :before/around method or a
+;;; user-redefined accessor body is present.
+;;; ============================================================
+
+(defclass %ra-base () ((v :initarg :v :accessor ra-v)))
+(deftest ra-reader-basic
+  (let ((o (make-instance '%ra-base :v 42)))
+    (dotimes (i 3) (ra-v o))              ; warm the specialized-reader cache
+    (ra-v o))
+  42)
+
+;; Unbound slot through the specialized reader must still signal.
+(deftest ra-reader-unbound
+  (let ((o (make-instance '%ra-base)))
+    (dotimes (i 3) (ignore-errors (ra-v o)))
+    (handler-case (progn (ra-v o) :no-error)
+      (unbound-slot () :unbound)))
+  :unbound)
+
+;; Subclass places an extra slot first, so the inherited slot's index differs;
+;; the specialized reader must use the subclass's own index.
+(defclass %ra-sub (%ra-base) ((extra :initform 0)))
+(deftest ra-reader-inheritance
+  (let ((base (make-instance '%ra-base :v 1)) (sub (make-instance '%ra-sub :v 2)))
+    (dotimes (i 3) (ra-v base) (ra-v sub))   ; both class keys warm
+    (list (ra-v base) (ra-v sub)))
+  (1 2))
+
+;; A :before method disables the direct-read specialization (side effect must run).
+(defvar *ra-log* nil)
+(defclass %ra-b () ((w :initarg :w :accessor ra-w)))
+(defmethod ra-w :before ((o %ra-b)) (push :before *ra-log*))
+(deftest ra-reader-before-not-specialized
+  (let ((o (make-instance '%ra-b :w 7)))
+    (setf *ra-log* nil)
+    (dotimes (i 3) (ra-w o))
+    (list (ra-w o) (length *ra-log*)))     ; :before ran each call (4 total)
+  (7 4))
+
+;; A user-redefined accessor body (no longer a plain slot reader) must be honored.
+(defclass %ra-c () ((z :initarg :z :accessor ra-z)))
+(deftest ra-reader-custom-body
+  (let ((o (make-instance '%ra-c :z 5)))
+    (dotimes (i 3) (ra-z o))               ; warm specialized reader
+    (eval '(defmethod ra-z ((o %ra-c)) :custom))  ; redefine -> invalidates
+    (ra-z o))
+  :custom)
+
+;;; ============================================================
+;;; Item2b: specialized standard slot writer ((setf accessor)).
+;;; ============================================================
+
+(defclass %wa () ((v :initarg :v :accessor wa-v)))
+(deftest wa-writer-basic
+  (let ((o (make-instance '%wa :v 0)))
+    (dotimes (i 3) (setf (wa-v o) i))    ; warm the specialized-writer cache
+    (setf (wa-v o) 99)
+    (wa-v o))
+  99)
+
+(deftest wa-writer-returns-newval
+  (let ((o (make-instance '%wa :v 0)))
+    (dotimes (i 3) (setf (wa-v o) 1))
+    (setf (wa-v o) 42))                  ; setf returns the stored value
+  42)
+
+;; Subclass: inherited slot at a different index; the specialized writer must
+;; use the subclass's own index.
+(defclass %wa-sub (%wa) ((extra :initform 0)))
+(deftest wa-writer-inheritance
+  (let ((b (make-instance '%wa :v 0)) (s (make-instance '%wa-sub :v 0)))
+    (dotimes (i 3) (setf (wa-v b) 1) (setf (wa-v s) 2))
+    (setf (wa-v b) 10) (setf (wa-v s) 20)
+    (list (wa-v b) (wa-v s)))
+  (10 20))
+
+;; :before on the writer disables specialization (side effect must run).
+(defvar *wa-log* nil)
+(defclass %wa-b () ((w :initarg :w :accessor wa-w)))
+(defmethod (setf wa-w) :before (nv (o %wa-b)) (push nv *wa-log*))
+(deftest wa-writer-before-not-specialized
+  (let ((o (make-instance '%wa-b :w 0)))
+    (setf *wa-log* nil)
+    (dotimes (i 3) (setf (wa-w o) i))
+    (list (wa-w o) (reverse *wa-log*)))
+  (2 (0 1 2)))
+
+;; A newval-specialized user writer method takes over for that value type; the
+;; default (specializable) writer still handles other value types.
+(defclass %wa-n () ((z :initarg :z :accessor wa-z)))
+(defmethod (setf wa-z) ((nv string) (o %wa-n)) (setf (slot-value o 'z) :was-string))
+(deftest wa-writer-newval-specialized-mix
+  (let ((o (make-instance '%wa-n :z 0)))
+    (dotimes (i 3) (setf (wa-z o) 1))    ; integer newval -> default writer (specialized)
+    (setf (wa-z o) "hi")                 ; string newval -> user method
+    (list (wa-z o) (progn (setf (wa-z o) 7) (wa-z o))))
+  (:was-string 7))
+
+;; ---- Item3b: reader inline-cache (ReaderIC) soundness ----
+;; A warm monomorphic call site must stay correct across accessor/class
+;; redefinition, subclassing, unbound slots, and a bound NIL value.
+
+(defclass %ric1 () ((x :initarg :x :accessor ric1x)))
+(deftest ric-basic-warm
+  (let ((o (make-instance '%ric1 :x 42)))
+    (dotimes (i 5) (ric1x o))            ; warm the inline cache
+    (ric1x o))
+  42)
+
+;; Adding a specialized primary method must deopt the cached slot read.
+(defclass %ric2 () ((x :initarg :x :accessor ric2x)))
+(deftest ric-deopt-after-defmethod
+  (let ((o (make-instance '%ric2 :x 10)))
+    (dotimes (i 5) (ric2x o))
+    (defmethod ric2x ((o %ric2)) 999)
+    (ric2x o))
+  999)
+
+;; An :around must likewise disable the direct slot read.
+(defclass %ric3 () ((x :initarg :x :accessor ric3x)))
+(deftest ric-deopt-around
+  (let ((o (make-instance '%ric3 :x 7)))
+    (dotimes (i 5) (ric3x o))
+    (defmethod ric3x :around ((o %ric3)) (1+ (call-next-method)))
+    (ric3x o))
+  8)
+
+;; One call site warmed on the base class, then hit with a subclass whose slot
+;; sits at a different index — must miss and refill, not read the stale index.
+(defclass %ricb () ((a :initarg :a :accessor ricg)))
+(defclass %rics (%ricb) ((z :initarg :z) (a :initarg :a :accessor ricg)))
+(defun %ric-read (o) (ricg o))
+(deftest ric-subclass-refill
+  (let ((b (make-instance '%ricb :a 1)) (s (make-instance '%rics :a 2 :z 9)))
+    (dotimes (i 5) (%ric-read b))
+    (list (%ric-read b) (%ric-read s) (%ric-read b)))
+  (1 2 1))
+
+;; Redefining the class to reorder slots must invalidate the warm cache.
+(defclass %ric5 () ((x :initarg :x :accessor ric5x)))
+(deftest ric-class-redef
+  (let ((o (make-instance '%ric5 :x 3)))
+    (dotimes (i 5) (ric5x o))
+    (defclass %ric5 () ((y :initarg :y) (x :initarg :x :accessor ric5x)))
+    (ric5x (make-instance '%ric5 :x 55 :y 1)))
+  55)
+
+;; Unbound slot goes through the SLOT-UNBOUND protocol even on the fast path.
+(defclass %ric6 () ((x :accessor ric6x)))
+(deftest ric-unbound
+  (let ((o (make-instance '%ric6)))
+    (list (handler-case (progn (ric6x o) :no-error)
+            (unbound-slot () :unbound))
+          (progn (setf (slot-value o 'x) 88) (ric6x o))))
+  (:unbound 88))
+
+;; A bound NIL must not be mistaken for an unbound slot.
+(defclass %ric7 () ((x :initarg :x :accessor ric7x)))
+(deftest ric-bound-nil
+  (let ((o (make-instance '%ric7 :x nil)))
+    (dotimes (i 5) (ric7x o))
+    (ric7x o))
+  nil)

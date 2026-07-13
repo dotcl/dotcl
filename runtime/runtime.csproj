@@ -26,6 +26,39 @@
     <PublishReadyToRun>true</PublishReadyToRun>
   </PropertyGroup>
 
+  <!-- dotcl-app packaging hook: pack this apphost as another app's tool nupkg (e.g.
+       roswell) via a few -p:Dotcl* properties, without leaking global properties into
+       DotCL.Runtime.csproj (a bare -p:PackageId does, causing "Ambiguous project name").
+       Default (all unset) = the plain `dotcl` tool pack, unchanged.
+         DotclToolPackageId / DotclToolCommandName — rename the produced tool.
+         DotclToolNoAndroid=true — drop the android RIDs. A ;-list RID override cannot be
+           passed on the command line (bare ; -> MSB1006; %3B -> NETSDK1083 single-RID),
+           so the desktop+any list is written here as a literal, gated by a boolean flag.
+           dotcl's own release.yml uses this to keep android deferred. -->
+  <PropertyGroup>
+    <PackageId Condition="'$(DotclToolPackageId)' != ''">$(DotclToolPackageId)</PackageId>
+    <ToolCommandName Condition="'$(DotclToolCommandName)' != ''">$(DotclToolCommandName)</ToolCommandName>
+    <RuntimeIdentifiers Condition="'$(DotclToolNoAndroid)' == 'true'">win-x64;win-arm64;linux-x64;linux-arm64;osx-x64;osx-arm64;any</RuntimeIdentifiers>
+    <!-- Empty unless DotclAppBundle is set. The item globs below reference THIS, never
+         "$(DotclAppBundle)/**" directly: with the bundle unset the latter evaluates to
+         the drive-root glob "/**" which MSBuild rejects at load with MSB5029 even under a
+         false ItemGroup Condition. Empty here => Include="" => no items, no glob. -->
+    <_DotclAppBundleGlob Condition="'$(DotclAppBundle)' != ''">$(DotclAppBundle)/**</_DotclAppBundleGlob>
+  </PropertyGroup>
+
+  <!-- dotcl-app bundle: extra files shipped alongside the tool (e.g. roswell's
+       quicklisp-client + SharpCompress.dll). Packed into the any/ fallback and copied
+       into every per-RID publish with subdirectory structure preserved — replacing the
+       old post-pack nupkg unzip/inject surgery. Inert unless DotclAppBundle is set. -->
+  <ItemGroup Condition="'$(_DotclAppBundleGlob)' != ''">
+    <None Include="$(_DotclAppBundleGlob)" Pack="true" PackagePath="tools/net10.0/any/" />
+    <Content Include="$(_DotclAppBundleGlob)">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>Always</CopyToPublishDirectory>
+      <Link>%(RecursiveDir)%(Filename)%(Extension)</Link>
+    </Content>
+  </ItemGroup>
+
   <!-- Only Program.cs — all runtime sources live in DotCL.Runtime.csproj -->
   <ItemGroup>
     <Compile Remove="**/*.cs" />

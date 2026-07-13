@@ -4,11 +4,10 @@ DOTCL_ROOT := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 # ABCL, flips the default and breaks cross-compile, dotcl/dotcl #35). Still
 # overridable, e.g. `DOTCL_LISP=dotcl make cross-compile` to self-host.
 DOTCL_LISP ?= ros -L sbcl-bin run
-INPUT ?= test/test1.lisp
 STDBUF ?=
 SETSID ?= $(shell which setsid 2>/dev/null)
 
-.PHONY: all build build-ns2 run clean repl test-a2 test-ansi test-ansi-all test-ansi-full test-ansi-extra test-regression test-mop ilverify update-ansi-state commit-ansi-state cross-compile loc publish pack install setup-ansi-test setup-asdf setup-cl-bench bench bench-state test-sbcl-host2 compile-asdf-fasl compile-asdf-fasls compile-core-fasl compile-contrib-fasls contrib-dotcl-cs contrib-dotcl-jitdisasm gen-char-names
+.PHONY: all build build-ns2 run clean repl test-ansi-all test-ansi-full test-ansi-extra test-regression test-mop ilverify update-ansi-state commit-ansi-state cross-compile loc publish pack install setup-ansi-test setup-asdf setup-cl-bench bench bench-state test-sbcl-host2 compile-asdf-fasl compile-asdf-fasls compile-core-fasl compile-contrib-fasls contrib-dotcl-cs contrib-dotcl-jitdisasm gen-char-names
 
 # Source files for cross-compile. Listed once; the recipe and dependency
 # tracking both reference this so adding a file is a single-edit change.
@@ -66,31 +65,6 @@ build-ns2:
 
 test-sbcl-host2: $(DOTCL_ROOT)compiler/cil-out.sil
 	DOTNET_GCConserveMemory=7 dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --asm $(DOTCL_ROOT)compiler/cil-out.sil $(DOTCL_ROOT)test-sbcl-host2.lisp
-
-test-a2: build $(DOTCL_ROOT)compiler/cil-out.sil
-	@echo "=== Running A2 (Lisp CIL compiler) tests ==="
-	@for f in $(DOTCL_ROOT)test/test[0-9].lisp $(DOTCL_ROOT)test/test[12][0-9].lisp; do \
-		[ -f "$$f" ] || continue; \
-		echo -n "$$(basename $$f): "; \
-		DOTCL_INPUTS="$$f" DOTCL_OUTPUT="/tmp/dotcl_instrs.sil" $(DOTCL_LISP) --load $(DOTCL_ROOT)compiler/cil-compile.lisp 2>/dev/null && \
-		dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --asm /tmp/dotcl_instrs.sil 2>/dev/null \
-			&& echo " OK" || echo " FAIL"; \
-	done
-
-test-ansi: build
-	@echo "=== Running ANSI extracted tests ==="
-	@if [ -d $(DOTCL_ROOT)test/ansi ]; then \
-		for f in $(DOTCL_ROOT)test/ansi/*.lisp; do \
-			echo -n "$$(basename $$f): "; \
-			DOTCL_INPUTS="$(DOTCL_ROOT)test/framework.lisp $(DOTCL_ROOT)compiler/cil-stdlib.lisp $$f" \
-				DOTCL_OUTPUT="/tmp/dotcl_instrs.sil" \
-				$(DOTCL_LISP) --load $(DOTCL_ROOT)compiler/cil-compile.lisp 2>/dev/null && \
-			dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --asm /tmp/dotcl_instrs.sil 2>/dev/null \
-				&& echo " OK" || echo " FAIL"; \
-		done; \
-	else \
-		echo "No ansi test directory yet"; \
-	fi
 
 test-ansi-full: build setup-ansi-test
 	$(SETSID) dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --asm $(DOTCL_ROOT)compiler/cil-out.sil $(DOTCL_ROOT)test/test-ansi.lisp

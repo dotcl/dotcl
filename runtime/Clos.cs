@@ -64,7 +64,14 @@ public class LispClass : LispObject
     public LispClass[] DirectSuperclasses { get; set; }
     public LispClass[] ClassPrecedenceList { get; set; }
     public SlotDefinition[] EffectiveSlots { get; set; }
-    public Dictionary<string, int> SlotIndex { get; }
+    public Dictionary<string, int> SlotIndex { get; private set; }
+
+    /// <summary>Serializes (re)definition of THIS class. FinalizeClass mutates the
+    /// class's non-concurrent caches (SlotIndex, InitargToSlotIndex, EffectiveSlots,
+    /// CPL); under set-parallel-eval two threads re-defining the same class name
+    /// concurrently otherwise corrupt those Dictionaries. Cold path — taken
+    /// only during defclass/ensure-class, never during dispatch or make-instance.</summary>
+    internal readonly object DefLock = new();
     /// <summary>True for built-in classes (BUILT-IN-CLASS metaclass). False for user-defined (STANDARD-CLASS).</summary>
     public bool IsBuiltIn { get; set; }
     /// <summary>True for structure classes (STRUCTURE-CLASS metaclass).</summary>
@@ -131,24 +138,35 @@ public class LispClass : LispObject
     }
     private void BuildInitargCache()
     {
-        _initargSlotMap = new Dictionary<string, int>();
-        _canUseFastPath = true;
+        // Build into locals, then publish the fully-populated map LAST. Under
+        // set-parallel-eval, two threads' first make-instance on this class can
+        // race here: the old code assigned the empty Dictionary to the shared
+        // field first and populated it afterwards, so a concurrent reader (or a
+        // second builder) mutated/read a half-built non-concurrent Dictionary and
+        // tripped ".NET: concurrent update corrupted its state" — the flaky
+        // parallel-eval/mop crash. With publish-when-complete a reader sees
+        // either null (and harmlessly rebuilds an identical map) or a complete,
+        // thereafter-immutable map. Matches the CachedValidInitargKeys builder.
+        var map = new Dictionary<string, int>();
+        var canFast = true;
         for (int i = 0; i < EffectiveSlots.Length; i++)
         {
             var slot = EffectiveSlots[i];
             if (slot.IsClassAllocation && slot.Initargs.Length > 0)
             {
                 // Class-allocated slots with initargs can't use fast path
-                _canUseFastPath = false;
+                canFast = false;
             }
             if (!slot.IsClassAllocation)
             {
                 foreach (var ia in slot.Initargs)
                 {
-                    _initargSlotMap.TryAdd(ia.Name, i);
+                    map.TryAdd(ia.Name, i);
                 }
             }
         }
+        _canUseFastPath = canFast;
+        _initargSlotMap = map;
     }
 
     public LispClass(Symbol name, SlotDefinition[] directSlots, LispClass[] directSuperclasses)
@@ -167,42 +185,57 @@ public class LispClass : LispObject
     /// </summary>
     public void FinalizeClass()
     {
-        ClassPrecedenceList = ComputeCPL();
-        EffectiveSlots = ComputeEffectiveSlots();
-        _initargSlotMap = null; // invalidate cached initarg→slot mapping
-        _canUseFastPath = null;
-        CachedHasCustomInitMethods = null;
-        CachedIsConditionClass = null;
-        CachedValidInitargKeys = null;
-        SlotIndex.Clear();
-        for (int i = 0; i < EffectiveSlots.Length; i++)
+        // Serialize concurrent (re)finalization of THIS class: two threads
+        // re-defining the same class name under set-parallel-eval would otherwise
+        // both run this body and corrupt the non-concurrent caches below. Cold
+        // path (defclass/ensure-class only). SlotIndex and InitargToSlotIndex are
+        // rebuilt into locals and published by a single reference swap, so a
+        // concurrent reader on the make-instance/slot-value hot path (which does
+        // NOT take DefLock) always sees a complete map, never one mid-rebuild.
+        lock (DefLock)
         {
-            SlotIndex[EffectiveSlots[i].Name.Name] = i;
-            // Instance-allocated slots get their layout index as location; :class
-            // allocation slots are not in the per-instance vector.
-            EffectiveSlots[i].Location = EffectiveSlots[i].IsClassAllocation ? -1 : i;
-        }
-        ComputeEffectiveDefaultInitargs();
-
-        // Build initarg-to-slot cache for fast make-instance path
-        InitargToSlotIndex = new Dictionary<string, int>();
-        bool hasSharedInitarg = false;
-        for (int i = 0; i < EffectiveSlots.Length; i++)
-        {
-            foreach (var ia in EffectiveSlots[i].Initargs)
+            ClassPrecedenceList = ComputeCPL();
+            EffectiveSlots = ComputeEffectiveSlots();
+            _initargSlotMap = null; // invalidate cached initarg→slot mapping
+            _canUseFastPath = null;
+            CachedHasCustomInitMethods = null;
+            CachedIsConditionClass = null;
+            CachedValidInitargKeys = null;
+            var slotIndex = new Dictionary<string, int>();
+            for (int i = 0; i < EffectiveSlots.Length; i++)
             {
-                if (InitargToSlotIndex.ContainsKey(ia.Name))
-                    hasSharedInitarg = true;
-                else
-                    InitargToSlotIndex[ia.Name] = i;
+                slotIndex[EffectiveSlots[i].Name.Name] = i;
+                // Instance-allocated slots get their layout index as location; :class
+                // allocation slots are not in the per-instance vector.
+                EffectiveSlots[i].Location = EffectiveSlots[i].IsClassAllocation ? -1 : i;
             }
-        }
+            SlotIndex = slotIndex;
+            ComputeEffectiveDefaultInitargs();
 
-        // Fast path: no default initargs, no shared initargs, no :class allocation slots
-        HasSimpleInitialization = DefaultInitargs.Length == 0
-            && !hasSharedInitarg
-            && !Array.Exists(EffectiveSlots, s => s.IsClassAllocation);
-        SimpleInitChecked = false;
+            // Build initarg-to-slot cache for fast make-instance path
+            var initargMap = new Dictionary<string, int>();
+            bool hasSharedInitarg = false;
+            for (int i = 0; i < EffectiveSlots.Length; i++)
+            {
+                foreach (var ia in EffectiveSlots[i].Initargs)
+                {
+                    if (initargMap.ContainsKey(ia.Name))
+                        hasSharedInitarg = true;
+                    else
+                        initargMap[ia.Name] = i;
+                }
+            }
+            InitargToSlotIndex = initargMap;
+
+            // Fast path: no default initargs, no shared initargs, no :class allocation slots
+            HasSimpleInitialization = DefaultInitargs.Length == 0
+                && !hasSharedInitarg
+                && !Array.Exists(EffectiveSlots, s => s.IsClassAllocation);
+            SimpleInitChecked = false;
+        }
+        // Slot layout may have changed — invalidate any call-site reader inline caches
+        // that snapshotted this class's old (class, index) pair.
+        GenericFunction.BumpMethodEpoch();
     }
 
     /// <summary>
@@ -527,6 +560,50 @@ internal class CachedDispatch
     /// <summary>Precomputed effective primary chain for EqlMethods[i]:
     /// [EqlMethods[i], ..non-EQL primaries..] — avoids a per-hit list allocation.</summary>
     public List<LispMethod>[]? EqlChains;
+
+    /// <summary>Specialized standard slot READER. When >= 0, the single
+    /// applicable method is an accessor reader for the instance-allocated slot at this
+    /// index in ArgTypes[0]'s layout — no before/after/around/eql, standard metaclass.
+    /// The hit path reads the slot directly (SlotValueDirect), skipping effective-method
+    /// construction and the reader lambda call. -1 = not a specialized reader.</summary>
+    public int ReaderSlotIndex = -1;
+    /// <summary>Slot-name symbol for ReaderSlotIndex's SlotValueDirect (unbound/missing
+    /// reporting). Only meaningful when ReaderSlotIndex >= 0.</summary>
+    public Symbol? ReaderSlotName;
+
+    /// <summary>Specialized standard slot WRITER ((setf accessor)). When
+    /// >= 0, the single applicable method is an accessor writer for the instance-
+    /// allocated slot at this index in the OBJECT's layout — object is the last required
+    /// arg (args[1] for a 2-arg setf writer), new value is args[0], no aux/eql, standard
+    /// metaclass. The hit path writes the slot directly (SetSlotValueDirect). -1 = not
+    /// a specialized writer.</summary>
+    public int WriterSlotIndex = -1;
+    /// <summary>Slot-name symbol for WriterSlotIndex. Only meaningful when >= 0.</summary>
+    public Symbol? WriterSlotName;
+}
+
+/// <summary>A per-call-site monomorphic inline cache for a simple slot
+/// reader accessor. One instance is baked (as a unit constant) per <c>(reader obj)</c>
+/// call site by the assembler; <see cref="Runtime.ReaderIC"/> reads and fills it.
+/// The resolved (class, slot-index) is published atomically as an immutable
+/// <see cref="Entry"/> via the volatile <see cref="E"/> field, so a concurrent fill can
+/// never expose a torn (class, index) pair. Soundness against redefinition rides on the
+/// snapshotted <see cref="GenericFunction.MethodEpoch"/>: any defmethod on the accessor or
+/// any class re-layout bumps the epoch and forces a miss + re-resolve.</summary>
+public sealed class ReaderCache
+{
+    /// <summary>The accessor name — used to (re)resolve the GF on a miss.</summary>
+    internal readonly Symbol Sym;
+    internal volatile Entry? E;
+    public ReaderCache(Symbol sym) { Sym = sym; }
+
+    internal sealed class Entry
+    {
+        internal readonly LispClass Cls;
+        internal readonly int Idx;
+        internal readonly int Epoch;
+        internal Entry(LispClass cls, int idx, int epoch) { Cls = cls; Idx = idx; Epoch = epoch; }
+    }
 }
 
 public class GenericFunction : LispFunction
@@ -580,15 +657,64 @@ public class GenericFunction : LispFunction
     /// without losing the original C# implementation for non-Gray streams.</summary>
     public LispFunction? FallbackFunction { get; set; }
 
-    /// <summary>Single-entry dispatch cache (monomorphic inline cache).
-    /// Caches the last successful dispatch result for quick reuse. `volatile` so a
-    /// concurrent InvalidateCache (defmethod) / cache-fill is visible across threads
-    /// and reads never tear — worst case a reader uses a complete but slightly stale
-    /// CachedDispatch, never a corrupt one.</summary>
-    internal volatile CachedDispatch? LastDispatch;
+    /// <summary>N-way polymorphic dispatch cache. An immutable array of recent
+    /// successful dispatches (most-recent first), swapped atomically via this `volatile`
+    /// field so a concurrent InvalidateCache (defmethod) / cache-fill publishes a
+    /// complete snapshot — a reader never sees a torn array, worst case a complete but
+    /// slightly stale one. Bounded to <see cref="DispatchCacheWidth"/> entries: a call
+    /// site that cycles through up to that many argument-class combinations stays warm,
+    /// where the old single-entry monomorphic cache missed on every alternation.</summary>
+    internal volatile CachedDispatch[]? DispatchCache;
+
+    /// <summary>Max entries in the polymorphic dispatch cache.</summary>
+    internal const int DispatchCacheWidth = 4;
 
     /// <summary>Invalidate dispatch cache when methods are added/removed.</summary>
-    internal void InvalidateCache() => LastDispatch = null;
+    internal void InvalidateCache() { DispatchCache = null; BumpMethodEpoch(); }
+
+    /// <summary>Global method-system epoch. Bumped on any method add/remove (via
+    /// <see cref="InvalidateCache"/>) and on any class finalization (slot-layout change).
+    /// Call-site reader inline caches (<see cref="ReaderCache"/>) snapshot this and miss
+    /// wholesale when it moves, so a redefined accessor GF or a re-laid-out class can never
+    /// serve a stale cached slot index. A plain int compare on the hot path.</summary>
+    internal static volatile int MethodEpoch;
+    internal static void BumpMethodEpoch() => System.Threading.Interlocked.Increment(ref MethodEpoch);
+
+    /// <summary>Non-null iff this GF is a PURE simple slot reader — every
+    /// method is an unqualified defclass-generated accessor reader for a slot of this
+    /// (common) name, no user/aux methods. Then a call site can read the slot directly
+    /// via Runtime.ReaderFast, skipping the whole dispatch. Cleared (null) the moment any
+    /// non-accessor / qualified / differing-slot method is present, so a redefined or
+    /// extended accessor safely falls back to full dispatch. Maintained by
+    /// RecomputeAccessorFlags on every method add/remove and accessor tagging.</summary>
+    public Symbol? SimpleReaderSlot;
+    /// <summary>As SimpleReaderSlot, for a pure (setf accessor) writer.</summary>
+    public Symbol? SimpleWriterSlot;
+
+    /// <summary>Recompute SimpleReaderSlot / SimpleWriterSlot from the current methods.
+    /// Both null unless every method is an unqualified accessor (AccessorSlot set) of one
+    /// common slot name and one common arity: arity 1 -> reader, arity 2 -> writer.</summary>
+    internal void RecomputeAccessorFlags()
+    {
+        SimpleReaderSlot = null;
+        SimpleWriterSlot = null;
+        var methods = Methods;
+        if (methods.Count == 0) return;
+        Symbol? slot = null;
+        int arity = -1;
+        foreach (var m in methods)
+        {
+            if (m.Qualifiers.Length != 0) return;              // :before/:after/:around
+            if (m.AccessorSlot is not { } sd) return;          // user / non-accessor method
+            if (slot == null) slot = sd.Name;
+            else if (slot.Name != sd.Name.Name) return;        // differing slot name
+            if (arity == -1) arity = m.Specializers.Length;
+            else if (arity != m.Specializers.Length) return;   // mixed reader/writer
+        }
+        if (slot == null) return;
+        if (arity == 1) SimpleReaderSlot = slot;
+        else if (arity == 2) SimpleWriterSlot = slot;
+    }
 
     public GenericFunction(Symbol name, int arity, Func<LispObject[], LispObject> dispatchFn)
         : base(dispatchFn, name.Name, arity)

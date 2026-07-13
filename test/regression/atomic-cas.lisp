@@ -2,30 +2,32 @@
 ;;; dotcl:compare-and-swap / atomic-incf / atomic-decf expand through
 ;;; get-setf-expansion, so every SETF-able place works; a single global monitor
 ;;; makes them correct under concurrency (lock-based, not lock-free).
+;;; compare-and-swap returns the PRIOR value (sb-ext/CCL convention): success is
+;;; (eq old ret), and a failed CAS returns the current value for the next retry.
 
 (require "dotcl-thread")
 
 ;; --- compare-and-swap on each place kind ---
 
 (defvar *cas-special* 10)
-(deftest cas-special-var-success
+(deftest cas-special-var-success        ; matches: stores 20, returns the prior value 10
   (list (dotcl:compare-and-swap *cas-special* 10 20) *cas-special*)
-  (t 20))
+  (10 20))
 
-(deftest cas-special-var-failure
+(deftest cas-special-var-failure        ; no match: returns the current value 5, unchanged
   (let ((*cas-special* 5))
     (list (dotcl:compare-and-swap *cas-special* 99 7) *cas-special*))
-  (nil 5))
+  (5 5))
 
 (deftest cas-car
   (let ((c (cons :a :b)))
     (list (dotcl:compare-and-swap (car c) :a :x) (car c)))
-  (t :x))
+  (:a :x))
 
 (deftest cas-cdr-failure
   (let ((c (cons :a :b)))
     (list (dotcl:compare-and-swap (cdr c) :z :y) (cdr c)))
-  (nil :b))
+  (:b :b))
 
 (deftest cas-svref
   (let ((v (vector 1 2 3)))
@@ -53,6 +55,15 @@
     (dotcl:compare-and-swap (%cas-box-val b) 1 2)
     (%cas-box-val b))
   2)
+
+;; The failing return IS the current cell value, usable directly as the next OLD in a
+;; retry — no separate (racy) re-read (rationale: old-value beats a boolean flag).
+(deftest cas-failure-returns-current-for-retry
+  (let ((cell (list 100)))
+    (let* ((prev (dotcl:compare-and-swap (car cell) 999 -1))   ; mismatch → returns 100
+           (ok   (dotcl:compare-and-swap (car cell) prev 200))) ; retry with prev succeeds
+      (list prev ok (car cell))))
+  (100 100 200))
 
 ;; --- atomic-incf / atomic-decf return the NEW value ---
 
@@ -82,8 +93,10 @@
 ;; CAS retry loop implementing a lock-free concurrent push; every push must land.
 (defvar *cas-stack* nil)
 (defun %cas-push (x)
+  ;; Old-value CAS: success is (eq ret old). The failing return is the fresh value,
+  ;; but this loop re-reads *cas-stack* each turn anyway, so it just retries.
   (loop for old = *cas-stack*
-        until (dotcl:compare-and-swap *cas-stack* old (cons x old))))
+        until (eq (dotcl:compare-and-swap *cas-stack* old (cons x old)) old)))
 (deftest compare-and-swap-lock-free-push
   (progn
     (setf *cas-stack* nil)
