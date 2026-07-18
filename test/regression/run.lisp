@@ -48,6 +48,7 @@
 (load "test/regression/closure-key-check.lisp")
 (load "test/regression/nconc2-inline.lisp")
 (load "test/regression/precompiled-only.lisp")
+(load "test/regression/lexical.lisp")
 
 (do-tests-summary)
 (if (= *fail-count* 0)
