@@ -2184,22 +2184,11 @@ public static partial class Runtime
                                         || IsGrayBinaryInputStream(gi) || IsGrayBinaryOutputStream(gi)))
         {
             Symbol? fpSym = null;
-            // Prefer trivial-gray-streams (where portable code defines methods)
-            var tgsPkg = Package.FindPackage("TRIVIAL-GRAY-STREAMS");
-            if (tgsPkg != null)
+            var grayPkg = Package.FindPackage("DOTCL-GRAY");
+            if (grayPkg != null)
             {
-                var (sym, status) = tgsPkg.FindSymbol("STREAM-FILE-POSITION");
+                var (sym, status) = grayPkg.FindSymbol("STREAM-FILE-POSITION");
                 if (status != SymbolStatus.None) fpSym = sym;
-            }
-            // Fall back to dotcl-gray
-            if (fpSym == null)
-            {
-                var grayPkg = Package.FindPackage("DOTCL-GRAY");
-                if (grayPkg != null)
-                {
-                    var (sym, status) = grayPkg.FindSymbol("STREAM-FILE-POSITION");
-                    if (status != SymbolStatus.None) fpSym = sym;
-                }
             }
             if (fpSym != null)
             {
