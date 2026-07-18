@@ -499,16 +499,44 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
    into the closure env."
   (member name *global-specials* :key #'symbol-name :test #'string=))
 
-(defun lookup-local (sym)
-  "Look up a variable in *locals* by symbol identity first, then name fallback."
-  ;; Use eq for identity first.
-  ;; Fall back to var-name string= for both interned (cross-package CL/CL-USER
-  ;; compat) and uninterned gensyms (closure env-locals use the interned version
-  ;; of the gensym's unique effective name).
-  (or (cdr (assoc sym *locals* :test #'eq))
+(defun same-var-package-p (k sym-pkg)
+  "Return (var-name k) if K's package is compatible with SYM-PKG for
+  lookup-local matching: same package, DOTCL.CIL-COMPILER (closure
+  env-locals), or uninterned (gensyms). nil otherwise."
+  (let ((k-pkg (symbol-package k)))
+    (if (or (null k-pkg)
+            (null sym-pkg)
+            (eq k-pkg sym-pkg)
+            (string= (package-name k-pkg) "DOTCL.CIL-COMPILER"))
+        (var-name k)
+        nil)))
+
+(defun bnd-member-p (sym bnd)
+  "Check if SYM is bound by BND (the free-var bound-names list).
+  BND entries are normally var-name strings, but the let/let* handler in
+  find-free-vars-expr stores the binding SYMBOL instead, so EQ can
+  distinguish same-name vars from different packages.
+  String entries match by STRING=; symbol entries by EQ."
+  (or (member sym bnd :test #'eq)
       (let ((name (var-name sym)))
+        (member name bnd
+                :test (lambda (n entry)
+                        (and (stringp entry) (string= n entry)))))))
+
+(defun lookup-local (sym)
+  "Look up a variable in *locals* by symbol identity first, then name fallback.
+  The var-name fallback is package-aware: it only matches entries from the
+  same package, from DOTCL.CIL-COMPILER (closure env-locals), or uninterned
+  (gensyms). This prevents cross-package collisions where two different
+  packages have a symbol with the same printed name."
+  (or (cdr (assoc sym *locals* :test #'eq))
+      (let ((name (var-name sym))
+            (sym-pkg (symbol-package sym)))
         (cdr (assoc name *locals*
-                    :key (lambda (k) (if (symbolp k) (var-name k) nil))
+                    :key (lambda (k)
+                           (if (symbolp k)
+                               (same-var-package-p k sym-pkg)
+                               nil))
                     :test #'string=)))))
 
 ;; When true, LOCAL-BOUND-P answers T for every symbol. Bound only during
@@ -519,12 +547,21 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
 (defvar *ffv-assume-bound* nil)
 
 (defun local-bound-p (sym)
-  "Check if symbol is bound in *locals* or has a boxed entry in *local-functions*."
+  "Check if symbol is bound in *locals* or has a boxed entry in *local-functions*.
+  Package-aware: the var-name fallback only matches entries from the same
+  package, DOTCL.CIL-COMPILER (closure env-locals), or uninterned (gensyms).
+  This prevents a reference from matching a same-named binding in a
+  different package, which would suppress free-var capture and cause
+  the closure to read the wrong variable at runtime."
   (or *ffv-assume-bound*
       (assoc sym *locals* :test #'eq)
-      (let ((name (var-name sym)))
+      (let ((name (var-name sym))
+            (sym-pkg (symbol-package sym)))
         (assoc name *locals*
-               :key (lambda (k) (if (symbolp k) (var-name k) nil))
+               :key (lambda (k)
+                      (if (symbolp k)
+                          (same-var-package-p k sym-pkg)
+                          nil))
                :test #'string=))
       ;; Also check *local-functions* for boxed labels functions
       ;; (supports closure capture of labels functions whose name clashes with a variable)
@@ -543,6 +580,7 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
              :key (lambda (k) (if (symbolp k) (var-name k) nil))
              :test #'string=)
       (find name *local-functions* :key #'first :test #'string=)))
+
 
 (defun boxed-var-p (sym)
   "Check if a variable needs boxing (by effective name, cross-package safe)."
@@ -853,8 +891,7 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
 
 (defvar *in-mv-context* nil
   "T when compiling an expression whose multiple values should propagate
-   (e.g. the form inside multiple-value-list). Default nil = unwrap MvReturn.")
-
+  (e.g. the form inside multiple-value-list). Default nil = unwrap MvReturn.")
 (defun compile-expr-raw (expr)
   "Compile expression without MvReturn unwrapping."
   ;; SBCL cross-compile: expand SB-INT:QUASIQUOTE at compile time
@@ -889,6 +926,7 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
      (compile-quoted expr))
     ;; Other self-evaluating objects (pathnames, etc.) → load as constant
     (t `((:load-const ,expr)))))
+
 
 (defun compile-expr (expr)
   "Compile expression. Unwraps MvReturn unless in MV-propagating position.

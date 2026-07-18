@@ -89,17 +89,17 @@
                ;; walk the expansion instead of treating it as a variable reference.
                ((symbolp e)
                 (let ((sm (and e
-                               (not (member (var-name e) bnd :test #'string=))
+                               (not (bnd-member-p e bnd))
                                (assoc e *symbol-macros* :test #'eq))))
                   (if sm
                       (push (cons (cdr sm) (cons bnd mdepth)) worklist)
                       (when (and e
                                  (or (not (eq e t)) (local-bound-p e))
                                  (or (not (keywordp e)) (local-bound-p e))
-                                 (not (member (var-name e) bnd :test #'string=))
+                                 (not (bnd-member-p e bnd))
                                  (not (gethash (var-name e) free-ht))
                                  (local-bound-p e))
-                        (setf (gethash (var-name e) free-ht) t)))))
+                        (setf (gethash (var-name e) free-ht) e)))))
                ;; Cons: dispatch on head
                ((consp e)
                 (let ((head (car e)))
@@ -167,11 +167,11 @@
                          ;; level. Under *ffv-assume-bound* (we are collecting
                          ;; candidates for an outer lambda) local-bound-p is T, so
                          ;; this collects; otherwise it filters.
-                         (dolist (name (%lambda-free-candidates e))
-                           (when (and (not (member name bnd :test #'string=))
-                                      (not (gethash name free-ht))
-                                      (or *ffv-assume-bound* (local-bound-name-p name)))
-                             (setf (gethash name free-ht) t)))))
+                        (dolist (sym (%lambda-free-candidates e))
+                          (when (and (not (bnd-member-p sym bnd))
+                                     (not (gethash (var-name sym) free-ht))
+                                     (or *ffv-assume-bound* (local-bound-p sym)))
+                            (setf (gethash (var-name sym) free-ht) sym)))))
                     ;; Let/Let* introduces bindings
                     ((and (symbolp head) (member head '(let let*)))
                      (let* ((bindings (cadr e))
@@ -180,10 +180,10 @@
                             (is-star (eq head 'let*)))
                        (dolist (b bindings)
                          (let ((init (if (consp b) (cadr b) nil))
-                               (vn (var-name (if (consp b) (car b) b))))
+                               (bind-sym (if (consp b) (car b) b)))
                            (when init
                              (push (cons init (cons (if is-star inner-bound bnd) mdepth)) worklist))
-                           (push vn inner-bound)))
+                           (push bind-sym inner-bound)))
                        (dolist (form lbody)
                          (push (cons form (cons inner-bound mdepth)) worklist))))
                     ;; setq: analyze all target/value pairs
@@ -200,7 +200,7 @@
                            (when (and (not (member tb-var-name bnd :test #'string=))
                                       (not (gethash tb-var-name free-ht))
                                       (local-bound-p (intern tb-var-name :dotcl.cil-compiler)))
-                             (setf (gethash tb-var-name free-ht) t))))))
+                             (setf (gethash tb-var-name free-ht) (intern tb-var-name :dotcl.cil-compiler)))))))
                     ;; Block introduces a synthetic block-tag variable
                     ((and (symbolp head) (eq head 'block))
                      (let* ((bname (cadr e))
@@ -215,7 +215,7 @@
                        (when (and (not (member tag-var bnd :test #'string=))
                                   (not (gethash tag-var free-ht))
                                   (local-bound-p (intern tag-var :dotcl.cil-compiler)))
-                         (setf (gethash tag-var free-ht) t)))
+                        (setf (gethash tag-var free-ht) (intern tag-var :dotcl.cil-compiler))))
                      (when (caddr e)
                        (push (cons (caddr e) (cons bnd mdepth)) worklist)))
                     ;; return: (return expr) = (return-from nil expr)
@@ -224,7 +224,7 @@
                        (when (and (not (member tag-var bnd :test #'string=))
                                   (not (gethash tag-var free-ht))
                                   (local-bound-p (intern tag-var :dotcl.cil-compiler)))
-                         (setf (gethash tag-var free-ht) t)))
+                        (setf (gethash tag-var free-ht) (intern tag-var :dotcl.cil-compiler))))
                      (when (cadr e)
                        (push (cons (cadr e) (cons bnd mdepth)) worklist)))
                     ;; (function sym) or (function (lambda ...))
@@ -249,7 +249,7 @@
                                   (dolist (nm (list mangled-name plain-name))
                                     (when (and (not (member nm bnd :test #'string=))
                                                (not (gethash nm free-ht)))
-                                      (setf (gethash nm free-ht) t)))))
+                                      (setf (gethash nm free-ht) (intern nm :dotcl.cil-compiler))))))
                               (when (and arg (or (not (eq arg t)) (local-bound-p arg))
                                          (not (special-var-p arg))
                                          (local-bound-p arg))
@@ -261,7 +261,7 @@
                                                        (t plain-name))))
                                   (when (and (not (member capture-name bnd :test #'string=))
                                              (not (gethash capture-name free-ht)))
-                                    (setf (gethash capture-name free-ht) t)))))))))
+                                    (setf (gethash capture-name free-ht) (intern capture-name :dotcl.cil-compiler))))))))))
                     ;; handler-case: body + clauses with optional var binding
                     ((and (symbolp head) (eq head 'handler-case))
                      (let ((body-form (cadr e))
@@ -449,7 +449,7 @@
                                  (when (and (local-bound-p (intern mangled :dotcl.cil-compiler))
                                             (not (member mangled bnd :test #'string=))
                                             (not (gethash mangled free-ht)))
-                                   (setf (gethash mangled free-ht) t))))
+                                   (setf (gethash mangled free-ht) (intern mangled :dotcl.cil-compiler)))))
                              ;; Generic walk. The car is in function position only when
                              ;; it is a SYMBOL (function name) or a (setf sym) / (lambda ...)
                              ;; compound form. Symbols in function position must NOT be pushed
@@ -522,7 +522,7 @@
     (dolist (form lbody)
       (find-free-vars-expr form inner-bound free-ht))
     (let ((keys '()))
-      (maphash (lambda (k v) (declare (ignore v)) (push k keys)) free-ht)
+      (maphash (lambda (k v) (declare (ignore k)) (push v keys)) free-ht)
       keys)))
 
 (defun %lambda-free-candidates (e)
