@@ -63,29 +63,6 @@ public static class Mop
             MopPkg.Export(s);
         }
 
-        // Mirror DOTCL-INTERNAL flat-name registrations onto the DOTCL-MOP
-        // symbols. RegisterCLOSBuiltins (Runtime.CLOS.cs) registers many MOP
-        // protocol functions via CilAssembler.RegisterFunction BEFORE Mop.Init
-        // runs, so the mirror in RegisterFunction could not fire (MopPkg was
-        // null). Now that the names are interned here, copy any fbound
-        // DOTCL-INTERNAL::name.Function onto dotcl-mop::name so package-qualified
-        // dotcl-mop:<name> calls resolve (GetFunctionBySymbol is authoritative).
-        foreach (var name in new[] {
-            "CLASS-DIRECT-SUPERCLASSES", "CLASS-DIRECT-SUBCLASSES",
-            "CLASS-PRECEDENCE-LIST", "CLASS-FINALIZED-P", "CLASS-PROTOTYPE",
-            "GENERIC-FUNCTION-METHODS", "GENERIC-FUNCTION-NAME",
-            "METHOD-SPECIALIZERS", "METHOD-GENERIC-FUNCTION",
-            "METHOD-LAMBDA-LIST", "MAKE-METHOD-LAMBDA", "ENSURE-CLASS",
-        })
-        {
-            var (mopSym, mopSt) = MopPkg.FindSymbol(name);
-            if (mopSt != SymbolStatus.None && mopSym.Function == null)
-            {
-                var (internalSym, internalSt) = Startup.Internal.FindSymbol(name);
-                if (internalSt != SymbolStatus.None && internalSym.Function is LispFunction fn)
-                    mopSym.Function = fn;
-            }
-        }
 
         // -- Class introspection ------------------------------------------
         RegisterMop("CLASS-DIRECT-SUPERCLASSES", 1, args =>
@@ -542,6 +519,27 @@ public static class Mop
             var result = MultipleValues.Primary(gf.Invoke(new LispObject[] { cls, name, defsList }));
             return result as SlotDefinition;
         };
+        // Gap-fill: every DOTCL-MOP symbol still unbound after the RegisterMop/
+        // RegisterMopGF calls above was flat-registered via
+        // CilAssembler.RegisterFunction BEFORE Mop.Init ran — so the
+        // RegisterFunction mirror couldn't fire (MopPkg was null). Adopt the
+        // Function from the same-named fbound symbol in CL or DOTCL-INTERNAL
+        // (matching Startup.SymForRegistration's lookup precedence) so
+        // package-qualified dotcl-mop:<name> calls resolve (GetFunctionBySymbol
+        // is authoritative).
+        foreach (var sym in MopPkg.ExternalSymbols)
+        {
+            if (sym.Function != null) continue;
+            var (clSym, clSt) = Startup.CL.FindSymbol(sym.Name);
+            if (clSt != SymbolStatus.None && clSym.Function is LispFunction clFn)
+            {
+                sym.Function = clFn;
+                continue;
+            }
+            var (internalSym, internalSt) = Startup.Internal.FindSymbol(sym.Name);
+            if (internalSt != SymbolStatus.None && internalSym.Function is LispFunction fn)
+                sym.Function = fn;
+        }
     }
 
     // --- helpers -------------------------------------------------------------

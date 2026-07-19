@@ -361,26 +361,6 @@ public partial class CilAssembler
         var checkedSym = Startup.SymForRegistration(name);
         Runtime.CheckPackageLock(checkedSym, "DEFUN");  // may throw if locked
         checkedSym.Function = fn;
-        // Mirror onto DOTCL-MOP when the name is interned there: many MOP
-        // protocol functions (CLASS-PRECEDENCE-LIST, METHOD-SPECIALIZERS, ...)
-        // are registered here by flat name (DOTCL-INTERNAL) but exported from
-        // DOTCL-MOP. Without this mirror, a package-qualified call
-        // dotcl-mop:<name> sees an unbound symbol (DOTCL-MOP:<name>.Function
-        // null) and — now that GetFunctionBySymbol is authoritative — signals
-        // UNDEFINED-FUNCTION instead of aliasing to the DOTCL-INTERNAL symbol
-        // via the (removed) cross-package bridge. Mirroring keeps the
-        // DOTCL-MOP export fbound so dotcl-mop:<name> resolves directly.
-        // Mop.MopPkg may be null during early startup (RegisterCLOSBuiltins
-        // runs before Mop.Init); Mop.Init re-mirrors after interning the names.
-        if (Mop.MopPkg != null)
-        {
-            var (_, mopStatus) = Mop.MopPkg.FindSymbol(name);
-            if (mopStatus != SymbolStatus.None)
-            {
-                var (mopSym, _) = Mop.MopPkg.Intern(name);
-                mopSym.Function = fn;
-            }
-        }
     }
 
     public static int AddConstant(object value)
