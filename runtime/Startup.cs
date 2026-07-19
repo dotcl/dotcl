@@ -937,16 +937,20 @@ public static class Startup
         if (_symCache.TryGetValue(name, out var cached)) return cached;
         var (sym, status) = CL.FindSymbol(name);
         if (status != SymbolStatus.None) { _symCache[name] = sym; return sym; }
-        // Symbols not in CL go to DOTCL-INTERNAL.
-        // Avoids polluting CL or CL-USER. Will be resolved by self-hosting.
-        var (sym2, status2) = Internal.FindSymbol(name);
-        if (status2 != SymbolStatus.None) { _symCache[name] = sym2; return sym2; }
         // Cross-package bridge (replaces the old flat _functions table):
         // cross-compiled code emits LOAD-SYM with the bare function name even when the
         // defun's home package is e.g. DOTCL.CIL-COMPILER. Check if any package has a
         // symbol by that name with a Function bound, and adopt it. Without this bridge
         // functions defined in non-CL packages are unreachable through flat-name
         // lookup (GetFunctionBySymbol would see newSym with null Function).
+        //
+        // The bridge runs BEFORE the DOTCL-INTERN check: a prior Sym() call may have
+        // interned a placeholder in DOTCL-INTERNAL (Function null) for this name.
+        // Returning that placeholder would shadow an fbound same-named symbol in
+        // another package (e.g. a defmethod reader registered after the placeholder
+        // was interned), breaking unqualified calls. The bridge finds the fbound
+        // symbol wherever it lives; only if none is fbound do we fall back to the
+        // DOTCL-INTERNAL symbol (if present) or intern a fresh placeholder.
         foreach (var pkg in Package.AllPackages)
         {
             var (existingSym, existingStatus) = pkg.FindSymbol(name);
@@ -956,11 +960,15 @@ public static class Startup
                 return existingSym;
             }
         }
-        // Intern a fresh placeholder in DOTCL-INTERNAL, but DO NOT cache — a
-        // later defun/defmethod-direct in another package may register the
-        // function on a different symbol, and a subsequent Sym() call needs
-        // to re-search the packages to find it. Caching here would pin a
+        // Symbols not in CL go to DOTCL-INTERNAL.
+        // Avoids polluting CL or CL-USER. Will be resolved by self-hosting.
+        // A placeholder interned here (Function null) is NOT cached: a later
+        // defun/defmethod in another package may register the function on a
+        // different symbol, and a subsequent Sym() call needs to re-search the
+        // packages (via the bridge above) to find it. Caching here would pin a
         // Function-less bogus symbol forever (cache-pollution fix).
+        var (sym2, status2) = Internal.FindSymbol(name);
+        if (status2 != SymbolStatus.None) return sym2;
         var (newSym, _) = Internal.Intern(name);
         return newSym;
     }

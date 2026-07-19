@@ -63,6 +63,30 @@ public static class Mop
             MopPkg.Export(s);
         }
 
+        // Mirror DOTCL-INTERNAL flat-name registrations onto the DOTCL-MOP
+        // symbols. RegisterCLOSBuiltins (Runtime.CLOS.cs) registers many MOP
+        // protocol functions via CilAssembler.RegisterFunction BEFORE Mop.Init
+        // runs, so the mirror in RegisterFunction could not fire (MopPkg was
+        // null). Now that the names are interned here, copy any fbound
+        // DOTCL-INTERNAL::name.Function onto dotcl-mop::name so package-qualified
+        // dotcl-mop:<name> calls resolve (GetFunctionBySymbol is authoritative).
+        foreach (var name in new[] {
+            "CLASS-DIRECT-SUPERCLASSES", "CLASS-DIRECT-SUBCLASSES",
+            "CLASS-PRECEDENCE-LIST", "CLASS-FINALIZED-P", "CLASS-PROTOTYPE",
+            "GENERIC-FUNCTION-METHODS", "GENERIC-FUNCTION-NAME",
+            "METHOD-SPECIALIZERS", "METHOD-GENERIC-FUNCTION",
+            "METHOD-LAMBDA-LIST", "MAKE-METHOD-LAMBDA", "ENSURE-CLASS",
+        })
+        {
+            var (mopSym, mopSt) = MopPkg.FindSymbol(name);
+            if (mopSt != SymbolStatus.None && mopSym.Function == null)
+            {
+                var (internalSym, internalSt) = Startup.Internal.FindSymbol(name);
+                if (internalSt != SymbolStatus.None && internalSym.Function is LispFunction fn)
+                    mopSym.Function = fn;
+            }
+        }
+
         // -- Class introspection ------------------------------------------
         RegisterMop("CLASS-DIRECT-SUPERCLASSES", 1, args =>
             args[0] is LispClass c ? Runtime.List(c.DirectSuperclasses.Cast<LispObject>().ToArray()) : Nil.Instance);

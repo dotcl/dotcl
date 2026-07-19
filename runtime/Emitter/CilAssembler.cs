@@ -256,17 +256,17 @@ public partial class CilAssembler
     }
 
     /// <summary>
-    /// Symbol-based function lookup. sym.Function is primary. If empty,
-    /// fall back to any same-named symbol in another package that has a
-    /// Function — replaces the old _functions flat
-    /// table as a cross-package bridge. Caches the result on sym.Function
-    /// to make subsequent lookups O(1).
+    /// Symbol-based function lookup — authoritative for package-qualified
+    /// compiled calls. Returns sym.Function or signals UNDEFINED-FUNCTION.
+    /// Unqualified compiled calls resolve via Startup.Sym's bare-name bridge
+    /// at symbol-resolution time (emit :load-sym), so sym.Function is already
+    /// the registered function when reached here. The cross-package bridge
+    /// (FindFunctionAcrossPackages) is NOT applied here — a package-qualified
+    /// call to an unbound symbol is undefined (matches SBCL semantics).
     /// </summary>
     public static LispFunction GetFunctionBySymbol(Symbol sym)
     {
         if (sym.Function is LispFunction symFn) return symFn;
-        if (FindFunctionAcrossPackages(sym, cacheOnSym: true) is LispFunction otherFn)
-            return otherFn;
         throw new LispErrorException(new LispUndefinedFunction(sym));
     }
 
@@ -361,6 +361,26 @@ public partial class CilAssembler
         var checkedSym = Startup.SymForRegistration(name);
         Runtime.CheckPackageLock(checkedSym, "DEFUN");  // may throw if locked
         checkedSym.Function = fn;
+        // Mirror onto DOTCL-MOP when the name is interned there: many MOP
+        // protocol functions (CLASS-PRECEDENCE-LIST, METHOD-SPECIALIZERS, ...)
+        // are registered here by flat name (DOTCL-INTERNAL) but exported from
+        // DOTCL-MOP. Without this mirror, a package-qualified call
+        // dotcl-mop:<name> sees an unbound symbol (DOTCL-MOP:<name>.Function
+        // null) and — now that GetFunctionBySymbol is authoritative — signals
+        // UNDEFINED-FUNCTION instead of aliasing to the DOTCL-INTERNAL symbol
+        // via the (removed) cross-package bridge. Mirroring keeps the
+        // DOTCL-MOP export fbound so dotcl-mop:<name> resolves directly.
+        // Mop.MopPkg may be null during early startup (RegisterCLOSBuiltins
+        // runs before Mop.Init); Mop.Init re-mirrors after interning the names.
+        if (Mop.MopPkg != null)
+        {
+            var (_, mopStatus) = Mop.MopPkg.FindSymbol(name);
+            if (mopStatus != SymbolStatus.None)
+            {
+                var (mopSym, _) = Mop.MopPkg.Intern(name);
+                mopSym.Function = fn;
+            }
+        }
     }
 
     public static int AddConstant(object value)

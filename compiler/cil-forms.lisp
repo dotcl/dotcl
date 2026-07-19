@@ -235,7 +235,7 @@
                                        (:castclass "Symbol")
                                        (:call "CilAssembler.GetSetfFunctionBySymbol")))
                                     ((symbolp name)
-                                     `(,@(compile-sym-lookup name)
+                                     `(,@(compile-fn-sym-lookup name)
                                        (:castclass "Symbol")
                                        (:call "CilAssembler.GetFunctionBySymbol")))
                                     (t
@@ -3313,9 +3313,10 @@
            ;; A fresh arity-checking wrapper per #' would break eq-on-builtin code
            ;; (memoization, function tables, cl-store's fdefinition round-trip).
            ;; Package-qualified names (e.g. #'bt2:current-thread) resolve to the
-           ;; correct package's symbol via compile-sym-lookup. GetFunctionBySymbol
-           ;; returns sym.Function, falling back to a cross-package search.
-           `(,@(compile-sym-lookup thing)
+           ;; correct package's symbol via compile-fn-sym-lookup. GetFunctionBySymbol
+           ;; is authoritative (no cross-package fallback): unqualified #'sym resolves
+           ;; via Startup.Sym's bare-name bridge at symbol-resolution time.
+           `(,@(compile-fn-sym-lookup thing)
              (:castclass "Symbol")
              (:call "CilAssembler.GetFunctionBySymbol")))))
     (t (error "FUNCTION: unsupported argument ~s" thing))))

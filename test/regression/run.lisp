@@ -19,6 +19,7 @@
 (load "test/regression/delegate-marshal.lisp")
 (load "test/regression/foreign-callback.lisp")
 (load "test/regression/call-out.lisp")
+(load "test/regression/cross-package-fn-aliasing.lisp")
 (load "test/regression/dotnet-invoke-cache.lisp")
 (load "test/regression/dotnet-type-collision.lisp")
 (load "test/regression/dotnet-direct-dispatch.lisp")
