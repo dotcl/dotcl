@@ -138,9 +138,14 @@
          (base-arg-indices (mapcar (lambda (n)
                                      (or (position n ctor-param-names :test #'eq)
                                          (error "dotnet:define-class: (:base ~S) — ~S is not a ctor param" n n)))
-                                   base-arg-names)))
-    `(list (lambda (self ,@ctor-param-names)
-             (declare (ignorable self))
+                                   base-arg-names))
+         ;; SELF must be interned in the CALLER's package -- the package the
+         ;; method body's bare `self' is read in -- not this file's compile-time
+         ;; package. *package* here is the caller's, since this runs at the
+         ;; caller's macroexpansion time (robust even from a prebuilt fasl).
+         (self-sym (intern "SELF" *package*)))
+    `(list (lambda (,self-sym ,@ctor-param-names)
+             (declare (ignorable ,self-sym))
              ,@ctor-body)
            (list ,@ctor-param-types)
            (list ,@base-arg-indices))))
@@ -157,7 +162,9 @@
                                             options)))
          (properties-opt (cdr (assoc :properties options)))
          (implements-opt (cdr (assoc :implements options)))
-         (events-opt (cdr (assoc :events options))))
+         (events-opt (cdr (assoc :events options)))
+         ;; SELF interned in the caller's package (see %process-ctor-form).
+         (self-sym (intern "SELF" *package*)))
     `(dotnet:%define-class
       ,full-name
       ,base-type
@@ -197,8 +204,8 @@
                                                  params)))
                         `(list ,name ,(dotnet::%resolve-type return-type)
                                (list ,@param-types)
-                               (lambda (self ,@param-names)
-                                 (declare (ignorable self))
+                               (lambda (,self-sym ,@param-names)
+                                 (declare (ignorable ,self-sym))
                                  ,@body)
                                ,override
                                ,(if method-attrs

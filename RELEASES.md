@@ -43,6 +43,11 @@ compiler variable-scoping bug across packages.
   reference to one could resolve to the other's binding, reading the wrong
   variable at runtime. Variable lookup is now package-aware. Thanks to Bohong
   Huang for the report and fix.
+- `dotnet:define-class` now binds the method receiver `self` as a symbol in the
+  caller's package, so a bare `self` in a method body resolves regardless of
+  which package the class is defined in (previously it could fail with an unbound
+  `self`, including when loaded from a prebuilt FASL). Thanks to Douglas P.
+  Fields, Jr. for the detailed report.
 
 ### Performance
 

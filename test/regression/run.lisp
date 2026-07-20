@@ -17,6 +17,7 @@
 (load "test/regression/frame-source-location.lisp")
 (load "test/regression/dynamic-slots.lisp")
 (load "test/regression/net-class.lisp")
+(load "test/regression/define-class-self.lisp")
 (load "test/regression/delegate-marshal.lisp")
 (load "test/regression/foreign-callback.lisp")
 (load "test/regression/call-out.lisp")
