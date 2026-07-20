@@ -934,6 +934,33 @@ public static class Startup
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, Symbol> _symFnCache = new();
 
     /// <summary>
+    /// Evict any _symCache entry whose value is the given symbol (identity match).
+    /// Called by compile-file's finally strip after nulling a symbol's Function,
+    /// so a subsequent Sym() re-runs the bridge instead of returning the stale
+    /// stripped symbol.
+    /// </summary>
+    internal static void InvalidateSymCache(Symbol sym)
+    {
+        // _symCache is keyed by bare name; there is at most one entry per name.
+        // Remove by name only if the cached value IS sym (avoid evicting a
+        // re-bound entry that a concurrent intern already replaced).
+        if (_symCache.TryGetValue(sym.Name, out var cached) && ReferenceEquals(cached, sym))
+            _symCache.TryRemove(sym.Name, out _);
+    }
+
+    /// <summary>
+    /// Evict any _symFnCache entry whose value is the given symbol. _symFnCache
+    /// is keyed by name+"\0"+package (possibly multiple entries per bare name
+    /// across packages), so scan keys whose value is sym.
+    /// </summary>
+    internal static void InvalidateSymFnCache(Symbol sym)
+    {
+        foreach (var kv in _symFnCache)
+            if (ReferenceEquals(kv.Value, sym))
+                _symFnCache.TryRemove(kv.Key, out _);
+    }
+
+    /// <summary>
     /// Deterministic data-symbol resolver for :load-sym (data positions: slot
     /// names, member-type constituents, etc.). Resolution order is fixed:
     /// CL → DOTCL-INTERNAL (cache the hit) → cross-package bridge → intern
