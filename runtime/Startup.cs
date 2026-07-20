@@ -973,17 +973,43 @@ public static class Startup
     /// class-precedence-list registered in DOTCL-MOP) is adopted on the next call.
     /// This is the fe63591 Sym behavior, preserved for the function-call case only.
     /// </summary>
-    public static Symbol SymFn(string name)
+    public static Symbol SymFn(string name) => SymFn(name, null);
+
+    /// <summary>
+    /// Function-call symbol resolver for :load-sym-fn. Like Sym but bridges to
+    /// find the registered fbound symbol. When packageName is supplied (the
+    /// symbol's home package at compile time), checks that package first so
+    /// unqualified calls resolve to the correct package instead of the first
+    /// fbound hit from Package.AllPackages (which caused find-system in
+    /// ql-dist to resolve to asdf/footer::find-system, creating infinite
+    /// recursion through asdf's search-for-system-definition).
+    /// </summary>
+    public static Symbol SymFn(string name, string? packageName)
     {
-        if (_symFnCache.TryGetValue(name, out var cached)) return cached;
+        var cacheKey = packageName is null ? name : name + "\0" + packageName;
+        if (_symFnCache.TryGetValue(cacheKey, out var cached)) return cached;
         var (sym, status) = CL.FindSymbol(name);
-        if (status != SymbolStatus.None) { _symFnCache[name] = sym; return sym; }
+        if (status != SymbolStatus.None) { _symFnCache[cacheKey] = sym; return sym; }
+        // Check the home package first so unqualified calls resolve correctly.
+        if (packageName is not null)
+        {
+            var homePkg = Package.FindPackage(packageName);
+            if (homePkg is not null)
+            {
+                var (homeSym, homeStatus) = homePkg.FindSymbol(name);
+                if (homeStatus != SymbolStatus.None && homeSym.Function != null)
+                {
+                    _symFnCache[cacheKey] = homeSym;
+                    return homeSym;
+                }
+            }
+        }
         foreach (var pkg in Package.AllPackages)
         {
             var (existingSym, existingStatus) = pkg.FindSymbol(name);
             if (existingStatus != SymbolStatus.None && existingSym.Function != null)
             {
-                _symFnCache[name] = existingSym;
+                _symFnCache[cacheKey] = existingSym;
                 return existingSym;
             }
         }

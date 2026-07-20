@@ -1705,7 +1705,7 @@
                            `((:declare-local ,*self-fn-local* "LispFunction")
                              ,@(if fn-pkg
                                    `((:load-sym-pkg ,setf-target-name ,fn-pkg))
-                                   `((:load-sym-fn ,setf-target-name)))
+                                   `((:load-sym-fn ,setf-target-name ,(package-name *package*))))
                              (:castclass "Symbol")
                              (:call "CilAssembler.GetSetfFunctionBySymbol")
                              (:stloc ,*self-fn-local*))
@@ -1713,7 +1713,7 @@
                            `((:declare-local ,*self-fn-local* "LispFunction")
                              ,@(if fn-pkg
                                    `((:load-sym-pkg ,fn-name ,fn-pkg))
-                                   `((:load-sym-fn ,fn-name)))
+                                   `((:load-sym-fn ,fn-name ,(package-name *package*))))
                              (:castclass "Symbol")
                              (:call "CilAssembler.GetFunctionBySymbol")
                              (:stloc ,*self-fn-local*)))))
