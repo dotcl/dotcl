@@ -472,7 +472,7 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
 package-qualified from unqualified calls so GetFunctionBySymbol can be
 authoritative (no cross-package bridge). Package-qualified (symbol-package
 neq *package*) -> :load-sym-pkg (authoritative). Unqualified
-(symbol-package eq *package*) -> :load-sym (bare Startup.Sym, which bridges
+(symbol-package eq *package*) -> :load-sym-fn (bare Startup.SymFn, which bridges
 at symbol-resolution to find the registered fbound symbol). Keywords and
 uninterned gensyms fall through to compile-sym-lookup."
   (cond ((keywordp sym)
@@ -482,10 +482,10 @@ uninterned gensyms fall through to compile-sym-lookup."
         ((and (not *cross-compiling*)
               (not (string= (package-name (symbol-package sym)) "COMMON-LISP"))
               (eq (symbol-package sym) *package*))
-         ;; Unqualified non-CL call: bare Startup.Sym bridges to the
+         ;; Unqualified non-CL call: Startup.SymFn bridges to the
          ;; registered fbound symbol (e.g. class-precedence-list in CL-USER
          ;; -> dotcl-mop:class-precedence-list).
-         `((:load-sym ,(symbol-name sym))))
+         `((:load-sym-fn ,(symbol-name sym))))
         (t (compile-sym-lookup sym))))
 
 (defun %runtime-special-p (sym)

@@ -549,6 +549,14 @@ public partial class CilAssembler
                 _il.Emit(OpCodes.Castclass, typeof(LispObject));
                 break;
             }
+            case "LOAD-SYM-FN":
+            {
+                var symName = GetString(Cadr(c));
+                _il.Emit(OpCodes.Ldstr, _faslMode ? Track(symName) : symName);
+                _il.Emit(OpCodes.Call, _methodCache["Startup.SymFn"]);
+                _il.Emit(OpCodes.Castclass, typeof(LispObject));
+                break;
+            }
             case "LOAD-SYM-KEYWORD":
             {
                 var kwName = GetString(Cadr(c));
@@ -3436,6 +3444,7 @@ public partial class CilAssembler
             // Startup
             ["Startup.Sym"] = typeof(Startup).GetMethod("Sym")!,
             ["Startup.SymInPkg"] = typeof(Startup).GetMethod("SymInPkg")!,
+            ["Startup.SymFn"] = typeof(Startup).GetMethod("SymFn")!,
             ["Startup.Keyword"] = typeof(Startup).GetMethod("Keyword")!,
 
             // DynamicBindings

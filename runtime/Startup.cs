@@ -931,26 +931,27 @@ public static class Startup
                 tag, clauseIndex, args.Length > 0 ? args[0] : Nil.Instance));
 
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, Symbol> _symCache = new();
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, Symbol> _symFnCache = new();
 
+    /// <summary>
+    /// Deterministic data-symbol resolver for :load-sym (data positions: slot
+    /// names, member-type constituents, etc.). Resolution order is fixed:
+    /// CL → DOTCL-INTERNAL (cache the hit) → cross-package bridge → intern
+    /// placeholder (NOT cached). The cache and the CL→DOTCL-INTERNAL→bridge
+    /// ordering make symbol identity stable for the session: a bare data
+    /// symbol always resolves to the same Symbol instance regardless of
+    /// later fbound-foreign registrations. Function-call sites use SymFn
+    /// (via :load-sym-fn) for the bridging behavior.
+    /// </summary>
     public static Symbol Sym(string name)
     {
         if (_symCache.TryGetValue(name, out var cached)) return cached;
         var (sym, status) = CL.FindSymbol(name);
         if (status != SymbolStatus.None) { _symCache[name] = sym; return sym; }
-        // Cross-package bridge (replaces the old flat _functions table):
-        // cross-compiled code emits LOAD-SYM with the bare function name even when the
-        // defun's home package is e.g. DOTCL.CIL-COMPILER. Check if any package has a
-        // symbol by that name with a Function bound, and adopt it. Without this bridge
-        // functions defined in non-CL packages are unreachable through flat-name
-        // lookup (GetFunctionBySymbol would see newSym with null Function).
-        //
-        // The bridge runs BEFORE the DOTCL-INTERN check: a prior Sym() call may have
-        // interned a placeholder in DOTCL-INTERNAL (Function null) for this name.
-        // Returning that placeholder would shadow an fbound same-named symbol in
-        // another package (e.g. a defmethod reader registered after the placeholder
-        // was interned), breaking unqualified calls. The bridge finds the fbound
-        // symbol wherever it lives; only if none is fbound do we fall back to the
-        // DOTCL-INTERNAL symbol (if present) or intern a fresh placeholder.
+        // Symbols not in CL go to DOTCL-INTERNAL.
+        var (sym2, status2) = Internal.FindSymbol(name);
+        if (status2 != SymbolStatus.None) { _symCache[name] = sym2; return sym2; }
+        // Cross-package bridge (replaces the old flat _functions table, D683 / #113):
         foreach (var pkg in Package.AllPackages)
         {
             var (existingSym, existingStatus) = pkg.FindSymbol(name);
@@ -960,13 +961,32 @@ public static class Startup
                 return existingSym;
             }
         }
-        // Symbols not in CL go to DOTCL-INTERNAL.
-        // Avoids polluting CL or CL-USER. Will be resolved by self-hosting.
-        // A placeholder interned here (Function null) is NOT cached: a later
-        // defun/defmethod in another package may register the function on a
-        // different symbol, and a subsequent Sym() call needs to re-search the
-        // packages (via the bridge above) to find it. Caching here would pin a
-        // Function-less bogus symbol forever (cache-pollution fix).
+        // Intern a fresh placeholder in DOTCL-INTERNAL, but DO NOT cache.
+        var (newSym, _) = Internal.Intern(name);
+        return newSym;
+    }
+
+    /// <summary>
+    /// Bridging symbol lookup for unqualified function-call sites (emit :load-sym-fn).
+    /// Runs the cross-package bridge BEFORE the DOTCL-INTERNAL check and does NOT cache
+    /// the DOTCL-INTERNAL placeholder, so a later-fbound foreign symbol (e.g.
+    /// class-precedence-list registered in DOTCL-MOP) is adopted on the next call.
+    /// This is the fe63591 Sym behavior, preserved for the function-call case only.
+    /// </summary>
+    public static Symbol SymFn(string name)
+    {
+        if (_symFnCache.TryGetValue(name, out var cached)) return cached;
+        var (sym, status) = CL.FindSymbol(name);
+        if (status != SymbolStatus.None) { _symFnCache[name] = sym; return sym; }
+        foreach (var pkg in Package.AllPackages)
+        {
+            var (existingSym, existingStatus) = pkg.FindSymbol(name);
+            if (existingStatus != SymbolStatus.None && existingSym.Function != null)
+            {
+                _symFnCache[name] = existingSym;
+                return existingSym;
+            }
+        }
         var (sym2, status2) = Internal.FindSymbol(name);
         if (status2 != SymbolStatus.None) return sym2;
         var (newSym, _) = Internal.Intern(name);

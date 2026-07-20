@@ -66,3 +66,30 @@
     (let ((fn (compile nil '(lambda () (xpa-b:bar)))))
       (signals-error (funcall fn) undefined-function)))
   t)
+
+;;; fe63591 data-symbol identity split: a defclass :accessor named hash-value in a
+;;; non-CL package makes that package's HASH-VALUE fbound. loop.lisp's
+;;; (check-type which (member hash-key hash-value)) must keep resolving its
+;;; hash-value to the stable DOTCL-INTERNAL symbol (data position), NOT bridge to
+;;; the foreign fbound accessor. Pre-fix: TYPE-ERROR (datum
+;;; DOTCL-INTERNAL::HASH-VALUE, expected (MEMBER DOTCL-INTERNAL::HASH-KEY
+;;; QL-CDB::HASH-VALUE)). Post-fix: loop iterates normally.
+(defpackage #:xpa-ht (:use #:cl) (:export #:hash-value #:bridge-target #:record-pointer))
+(deftest cross-package-fn-aliasing.data-symbol-not-stolen-by-fbound-accessor
+  (progn
+    (fmakunbound 'xpa-ht:hash-value)
+    (defclass xpa-ht:record-pointer ()
+      ((hash-value :initarg :hash-value :accessor xpa-ht:hash-value)))
+    (let ((ht (make-hash-table)))
+      (setf (gethash 'a ht) 1)
+      (setf (gethash 'b ht) 2)
+      (sort (loop for v being the hash-values of ht collect v) #'<)))
+  (1 2))
+
+(deftest cross-package-fn-aliasing.unqualified-call-still-bridges
+  (progn
+    (fmakunbound 'xpa-ht:bridge-target)
+    (defun xpa-ht:bridge-target () :bridged)
+    (let ((*package* (find-package :cl-user)))
+      (funcall (compile nil '(lambda () (bridge-target))))))
+  :bridged)
