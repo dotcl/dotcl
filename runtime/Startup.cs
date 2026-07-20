@@ -1013,6 +1013,17 @@ public static class Startup
                 return existingSym;
             }
         }
+        // Bridge found no fbound symbol. If the home package has the symbol
+        // (even unbound — e.g. reader-interned but never defun'd), return it so
+        // an undefined-function condition carries the symbol the user actually
+        // named (cell-error-name returns CL-TEST::MY-UNDEFINED-FUNCTION, not a
+        // DOTCL-INTERNAL placeholder). Falls back to DOTCL-INTERNAL only if the
+        // home package doesn't have the symbol at all.
+        if (packageName is not null && Package.FindPackage(packageName) is { } homePkg2)
+        {
+            var (homeSym2, homeStatus2) = homePkg2.FindSymbol(name);
+            if (homeStatus2 != SymbolStatus.None) return homeSym2;
+        }
         var (sym2, status2) = Internal.FindSymbol(name);
         if (status2 != SymbolStatus.None) return sym2;
         var (newSym, _) = Internal.Intern(name);
