@@ -7,12 +7,11 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
 
-    <!-- project-core: walk AspNetLispDemo.asd's :depends-on, compile
-         main.lisp into AspNetLispDemo.fasl, write a manifest. The runtime
-         only needs DotclHost.Initialize + LoadFromManifest. -->
+    <!-- project-core: the DotCL.Runtime package's ProjectCore targets walk
+         AspNetLispDemo.asd's :depends-on, compile main.lisp into
+         AspNetLispDemo.fasl, and write a manifest. The runtime only needs
+         DotclHost.Initialize + LoadFromManifest. -->
     <DotclProjectAsd>$(MSBuildProjectDirectory)/AspNetLispDemo.asd</DotclProjectAsd>
-    <DotclRuntimeProject>$(MSBuildProjectDirectory)/../../runtime/runtime.csproj</DotclRuntimeProject>
-    <DotclBaseCore>$(MSBuildProjectDirectory)/../../compiler/dotcl.core</DotclBaseCore>
   </PropertyGroup>
 
   <ItemGroup>
@@ -21,9 +20,10 @@
   </ItemGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\..\runtime\DotCL.Runtime.csproj" />
+    <!-- A published version, deliberately not bumped every release: this sample
+         demonstrates the shipping flow (PackageReference + project-core), not
+         the latest runtime. It builds against whatever it pins here. -->
+    <PackageReference Include="DotCL.Runtime" Version="0.1.18" />
   </ItemGroup>
-
-  <Import Project="..\..\runtime\build\Dotcl.targets" />
 
 </Project>

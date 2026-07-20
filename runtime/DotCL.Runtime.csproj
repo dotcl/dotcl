@@ -101,6 +101,10 @@
   <!-- Exclude Program.cs — entry point lives in the dotcl tool project -->
   <ItemGroup>
     <Compile Remove="Program.cs" />
+    <!-- PackRestamp.cs is `dotcl pack` tooling (rewrites nupkgs on the packaging
+         host). It belongs to the tool project alongside Program.cs, not in the
+         runtime that ships to Unity/IL2CPP/WebGL. -->
+    <Compile Remove="PackRestamp.cs" />
     <!-- build-tasks/ is a separate MSBuild-task assembly that lives under
          runtime/; keep its sources out of the runtime library's default glob. -->
     <Compile Remove="build-tasks/**/*.cs" />

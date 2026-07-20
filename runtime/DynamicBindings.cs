@@ -161,7 +161,10 @@ public static class DynamicBindings
     }
 
     /// <summary>
-    /// Snapshot the current thread's dynamic bindings for child-thread inheritance.
+    /// Snapshot the current thread's dynamic bindings so they can be re-installed on
+    /// another thread (used when a .NET callback / async continuation must run with
+    /// the specials that were in effect where it was registered — see Runtime.DotNet).
+    /// NOT used for MAKE-THREAD: new Lisp threads deliberately do not inherit bindings.
     /// Scans from top; first occurrence of each symbol is the effective binding.
     /// </summary>
     public static Dictionary<Symbol, LispObject>? Snapshot()

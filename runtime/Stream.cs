@@ -291,13 +291,14 @@ public class LispBroadcastStream : LispStream
 /// <summary>Concatenated stream: reads from component streams in sequence.</summary>
 public class LispConcatenatedStream : LispStream
 {
-    public LispStream[] Streams { get; }
+    // LispObject[] components — see LispTwoWayStream (Gray stream support).
+    public LispObject[] Streams { get; }
     public int CurrentIndex { get; set; } = 0;
     public override bool IsInput => true;
     public override bool IsOutput => false;
     public override string? StreamTypeName => "CONCATENATED-STREAM";
 
-    public LispConcatenatedStream(LispStream[] streams) => Streams = streams;
+    public LispConcatenatedStream(LispObject[] streams) => Streams = streams;
 
     public override string ToString() => "#<CONCATENATED-STREAM>";
 }
@@ -305,13 +306,17 @@ public class LispConcatenatedStream : LispStream
 /// <summary>Echo stream: reads from input, echoes to output.</summary>
 public class LispEchoStream : LispStream
 {
-    public LispStream InputStream { get; }
-    public LispStream OutputStream { get; }
+    // LispObject components — see LispTwoWayStream for why (Gray stream support +
+    // accessor identity).
+    public LispObject InputStream { get; }
+    public LispObject OutputStream { get; }
+    // See LispTwoWayStream.ResolvedInputCache.
+    internal LispStream? ResolvedInputCache;
     public override bool IsInput => true;
     public override bool IsOutput => true;
     public override string? StreamTypeName => "ECHO-STREAM";
 
-    public LispEchoStream(LispStream input, LispStream output)
+    public LispEchoStream(LispObject input, LispObject output)
     {
         InputStream = input;
         OutputStream = output;
@@ -350,13 +355,22 @@ public class LispSynonymStream : LispStream
 /// <summary>Two-way stream: separate input and output streams.</summary>
 public class LispTwoWayStream : LispStream
 {
-    public LispStream InputStream { get; }
-    public LispStream OutputStream { get; }
+    // LispObject (not LispStream) so a Gray CLOS stream (a LispInstance, not a
+    // LispStream subclass) can be a component. GetTextReader/GetTextWriter and the
+    // byte helpers already resolve composite components and dispatch Gray at the
+    // leaf, so holding the original object also preserves accessor identity
+    // (two-way-stream-input-stream returns the exact object given).
+    public LispObject InputStream { get; }
+    public LispObject OutputStream { get; }
+    // Native adapter cached when InputStream is a Gray stream, so the char-level
+    // read path (which needs a LispStream with a persistent unread-char slot)
+    // reads through the Gray protocol. Null when InputStream is already a LispStream.
+    internal LispStream? ResolvedInputCache;
     public override bool IsInput => true;
     public override bool IsOutput => true;
     public override string? StreamTypeName => "TWO-WAY-STREAM";
 
-    public LispTwoWayStream(LispStream input, LispStream output)
+    public LispTwoWayStream(LispObject input, LispObject output)
     {
         InputStream = input;
         OutputStream = output;

@@ -10,15 +10,12 @@ on:
   pull_request:
     branches: [master]
   schedule:
-    # Nightly full ANSI+bench for the private repo (03:00 JST = 18:00 UTC). On
-    # push the private repo runs only the cheap gates (see RUN_FULL); the public
-    # mirror runs the full suite on every push (free runners) instead.
+    # Nightly full ANSI + bench (03:00 JST = 18:00 UTC).
     - cron: '0 18 * * *'
 
-# The D-commit cadence pushes in rapid succession; each push would otherwise
-# spawn a full ~15-min run. Cancel superseded in-flight runs per ref so only the
-# tip finishes — no coverage loss on the landed commit. (Public pushes arrive
-# batched via mirror, so this rarely fires there: full-every-push is preserved.)
+# Cancel superseded in-flight runs per ref so a burst of pushes doesn't each
+# spawn a full ~15-min run; only the tip finishes (no coverage loss on the
+# landed commit).
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
@@ -31,9 +28,8 @@ jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    # Heavy tail (full ANSI + bench) runs on every push in the PUBLIC mirror
-    # (free runners) and nightly in the private repo. Private pushes evaluate to
-    # false and run only the cheap gates below.
+    # Full ANSI + bench runs on every push to dotcl/dotcl and on the nightly
+    # schedule; other pushes run only the cheap gates below.
     env:
       RUN_FULL: ${{ github.repository == 'dotcl/dotcl' || github.event_name == 'schedule' }}
     steps:

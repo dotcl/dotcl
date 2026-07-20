@@ -947,3 +947,28 @@
     (dotimes (i 5) (ric7x o))
     (ric7x o))
   nil)
+
+;; A defmethod added to INITIALIZE-INSTANCE / SHARED-INITIALIZE AFTER a class has
+;; already been instantiated must take effect on subsequent make-instance. The
+;; per-class make-instance fast-path caches (SimpleInitChecked / HasCustomInit)
+;; were not invalidated on add-method (the invalidation helper had lost its
+;; callers in a merge), so a class instantiated before the method was added
+;; silently skipped it.
+(defclass %sic-init () ((x :initform 1)))
+(deftest simple-init-cache-invalidated-on-add-method
+  (progn
+    (make-instance '%sic-init)   ; caches "no custom init methods" for this class
+    (eval '(defmethod initialize-instance :after ((f %sic-init) &key)
+             (setf (slot-value f 'x) 42)))
+    (slot-value (make-instance '%sic-init) 'x))
+  42)
+
+(defclass %sic-shared () ((y :initform 1)))
+(deftest simple-init-cache-invalidated-on-shared-initialize
+  (progn
+    (make-instance '%sic-shared)
+    (eval '(defmethod shared-initialize :after ((f %sic-shared) slot-names &key)
+             (declare (ignore slot-names))
+             (setf (slot-value f 'y) 7)))
+    (slot-value (make-instance '%sic-shared) 'y))
+  7)

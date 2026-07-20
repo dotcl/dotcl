@@ -516,3 +516,21 @@
                            (let ((n i)) (lambda () (eval `(* ,n ,n))))))))
            (mapcar #'dotcl-thread:thread-join threads)))
   (0 1 4 9))
+
+;; A newly spawned thread must see the GLOBAL value of a special variable, not
+;; the spawning thread's dynamic binding of it (SBCL / bordeaux-threads
+;; semantics). Previously MAKE-THREAD snapshotted and re-installed the parent's
+;; dynamic bindings in the child, which broke libraries (e.g. swank/micros) that
+;; rely on a worker starting from global values.
+(defvar %thread-inherit-probe :global)
+
+(deftest thread-no-dynamic-binding-inheritance
+  (let ((child-saw nil))
+    (let ((%thread-inherit-probe :parent-binding))
+      (dotcl-thread:thread-join
+       (dotcl-thread:make-thread
+        (lambda () (setf child-saw %thread-inherit-probe)))))
+    ;; child sees :global (not the parent's :parent-binding); parent binding
+    ;; is unaffected and restored on scope exit.
+    (list child-saw %thread-inherit-probe))
+  (:global :global))

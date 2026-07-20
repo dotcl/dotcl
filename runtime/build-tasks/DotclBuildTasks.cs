@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Runtime.ExceptionServices;
@@ -71,7 +72,8 @@ internal static class DotclBoot
     /// tree, and load the base core once. Idempotent across task invocations in
     /// the same MSBuild process. Touches DotCL.* — only call after InstallResolver.
     /// </summary>
-    public static void Boot(string baseCore, string? contribDir)
+    public static void Boot(string baseCore, string? contribDir,
+                            IEnumerable<string>? referenceDirs = null)
     {
         lock (_gate)
         {
@@ -82,6 +84,16 @@ internal static class DotclBoot
                 if (Directory.Exists(dir) && !Runtime.ContribExtraSearchPaths.Contains(dir))
                     Runtime.ContribExtraSearchPaths.Add(dir);
             }
+            // Consumer reference assemblies live in the project's output, not the
+            // MSBuild/SDK base dir, so resolve-type cannot see them without this.
+            if (referenceDirs != null)
+                foreach (var d in referenceDirs)
+                {
+                    if (string.IsNullOrEmpty(d)) continue;
+                    var dir = Path.GetFullPath(d);
+                    if (Directory.Exists(dir) && !Runtime.AssemblyProbeSearchPaths.Contains(dir))
+                        Runtime.AssemblyProbeSearchPaths.Add(dir);
+                }
             if (!_coreLoaded)
             {
                 DotclHost.LoadCore(baseCore);
@@ -101,6 +113,20 @@ internal static class DotclBoot
     /// stack thread — mirror that here. Exceptions propagate to the caller with
     /// their original stack trace.
     /// </summary>
+    /// <summary>Distinct directories holding the given reference assembly files
+    /// (@(ReferenceCopyLocalPaths) items), for AssemblyProbeSearchPaths. Kept
+    /// here (not touching DotCL.* types) so callers can compute it before Boot.</summary>
+    public static IEnumerable<string> ReferenceDirs(ITaskItem[]? referencePaths)
+    {
+        if (referencePaths == null) return System.Array.Empty<string>();
+        return referencePaths
+            .Select(i => i.GetMetadata("FullPath"))
+            .Where(p => !string.IsNullOrEmpty(p))
+            .Select(p => Path.GetDirectoryName(p) ?? "")
+            .Where(d => d.Length > 0)
+            .Distinct();
+    }
+
     public static void RunOnLargeStack(Action body)
     {
         const int stackSize = 256 * 1024 * 1024;
@@ -139,6 +165,11 @@ public sealed class DotclResolveDeps : Task
     /// asdf:*central-registry* before resolution — the declarative form of the
     /// build-init pushnew.</summary>
     public ITaskItem[]? AsdSearchPath { get; set; }
+    /// <summary>@(ReferenceCopyLocalPaths): the consumer's referenced .NET
+    /// assemblies. Their directories are registered as assembly probe paths so
+    /// compile-time (dotnet:resolve-type ...) can see PackageReference /
+    /// ProjectReference types.</summary>
+    public ITaskItem[]? ReferencePath { get; set; }
 
     public override bool Execute()
     {
@@ -153,7 +184,7 @@ public sealed class DotclResolveDeps : Task
 
     private void Run()
     {
-        DotclBoot.Boot(BaseCore, ContribDir);
+        DotclBoot.Boot(BaseCore, ContribDir, DotclBoot.ReferenceDirs(ReferencePath));
         DotclHost.ResolveDeps(Asd, ManifestOut, RootSourcesOut,
                               string.IsNullOrEmpty(TargetRid) ? null : TargetRid,
                               BuildInit?.Select(i => i.GetMetadata("FullPath")).ToArray(),
@@ -178,6 +209,10 @@ public sealed class DotclCompileProject : Task
     /// <summary>@(DotclAsdSearchPath): external system directories pushed onto
     /// asdf:*central-registry* before compilation (same as DotclResolveDeps).</summary>
     public ITaskItem[]? AsdSearchPath { get; set; }
+    /// <summary>@(ReferenceCopyLocalPaths): the consumer's referenced .NET
+    /// assemblies, so compile-time (dotnet:resolve-type ...) can see
+    /// PackageReference / ProjectReference types (same as DotclResolveDeps).</summary>
+    public ITaskItem[]? ReferencePath { get; set; }
 
     public override bool Execute()
     {
@@ -192,7 +227,7 @@ public sealed class DotclCompileProject : Task
 
     private void Run()
     {
-        DotclBoot.Boot(BaseCore, ContribDir);
+        DotclBoot.Boot(BaseCore, ContribDir, DotclBoot.ReferenceDirs(ReferencePath));
         DotclHost.CompileProject(Asd, Output, BuildInit?.Select(i => i.GetMetadata("FullPath")).ToArray(),
                                  AsdSearchPath?.Select(i => i.GetMetadata("FullPath")).ToArray());
     }

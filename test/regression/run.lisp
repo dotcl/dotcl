@@ -14,6 +14,7 @@
 (load "test/regression/atomic-cas.lisp")
 (load "test/regression/parallel-eval.lisp")
 (load "test/regression/mop.lisp")
+(load "test/regression/frame-source-location.lisp")
 (load "test/regression/dynamic-slots.lisp")
 (load "test/regression/net-class.lisp")
 (load "test/regression/delegate-marshal.lisp")

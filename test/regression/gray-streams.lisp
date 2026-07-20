@@ -484,3 +484,88 @@ b")
   (let ((s (make-instance '%fp-gray-in :data "hello")))
     (file-position s 3))
   3)
+
+;;; make-two-way-stream / make-echo-stream must accept Gray streams. Previously
+;;; they type-checked the C# LispStream class and rejected a Gray input/output
+;;; stream even though streamp / input-stream-p / output-stream-p answer T for it
+;;; (self-contradiction). Reads/writes through the composite reach the Gray
+;;; components, and the component accessors return the original object (identity).
+(defclass %gray-src (dotcl-gray:fundamental-character-input-stream)
+  ((chars :initarg :chars :accessor %gray-src-chars)))
+(defmethod dotcl-gray:stream-read-char ((s %gray-src))
+  (if (%gray-src-chars s) (pop (%gray-src-chars s)) :eof))
+
+(deftest gray-two-way-accepts
+  (let ((in (make-instance '%gray-src :chars '(#\a)))
+        (out (make-instance '%gray-acc)))
+    (streamp (make-two-way-stream in out)))
+  t)
+
+(deftest gray-two-way-read-write-through
+  (let* ((in (make-instance '%gray-src :chars (coerce "hi" 'list)))
+         (out (make-instance '%gray-acc))
+         (tw (make-two-way-stream in out)))
+    (write-char #\X tw)
+    (list (read-char tw) (read-char tw)
+          (get-output-stream-string (%gray-acc-buf out))))
+  (#\h #\i "X"))
+
+(deftest gray-two-way-input-identity
+  (let* ((in (make-instance '%gray-src :chars nil))
+         (out (make-instance '%gray-acc))
+         (tw (make-two-way-stream in out)))
+    (eq (two-way-stream-input-stream tw) in))
+  t)
+
+(deftest gray-two-way-output-identity
+  (let* ((in (make-instance '%gray-src :chars nil))
+         (out (make-instance '%gray-acc))
+         (tw (make-two-way-stream in out)))
+    (eq (two-way-stream-output-stream tw) out))
+  t)
+
+(deftest gray-echo-accepts
+  (let ((in (make-instance '%gray-src :chars '(#\z)))
+        (out (make-instance '%gray-acc)))
+    (streamp (make-echo-stream in out)))
+  t)
+
+(deftest gray-concatenated-accepts
+  (let ((in (make-instance '%gray-src :chars '(#\q))))
+    (streamp (make-concatenated-stream in)))
+  t)
+
+;;; clear-input / stream-element-type / stream-external-format must accept Gray
+;;; streams (streamp / input-stream-p already answer T for them). Previously they
+;;; used a bare "is not LispStream" check and rejected a Gray input as "not a
+;;; stream", which broke the swank/micros REPL (listener-eval calls clear-input).
+(deftest gray-clear-input-accepts
+  (let ((in (make-instance '%gray-in)))
+    (clear-input in))
+  nil)
+
+(deftest gray-stream-element-type-character
+  (let ((in (make-instance '%gray-in)))
+    (stream-element-type in))
+  character)
+
+(deftest gray-stream-element-type-output
+  (let ((out (make-instance '%gray-out)))
+    (stream-element-type out))
+  character)
+
+(deftest gray-stream-external-format-accepts
+  (let ((in (make-instance '%gray-in)))
+    (stream-external-format in))
+  :default)
+
+;; Non-stream objects still error on these (the check moved, not removed).
+(deftest gray-clear-input-non-stream-errors
+  (handler-case (progn (clear-input 42) :no-error)
+    (error () :errored))
+  :errored)
+
+(deftest gray-stream-element-type-non-stream-errors
+  (handler-case (progn (stream-element-type 42) :no-error)
+    (error () :errored))
+  :errored)

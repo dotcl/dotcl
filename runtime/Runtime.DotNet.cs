@@ -1002,29 +1002,42 @@ public static partial class Runtime
         _probedSinceDirty = false;
     }
 
+    /// <summary>Extra directories, besides AppContext.BaseDirectory, that
+    /// ProbeLoadBaseDir scans for managed assemblies. A host whose referenced
+    /// assemblies sit somewhere other than the app base registers them here —
+    /// notably the in-process MSBuild compile task, where BaseDirectory is the
+    /// .NET SDK's own dir, not the consumer project's output, so its
+    /// PackageReference / ProjectReference types would otherwise be invisible to
+    /// resolve-type at compile time.</summary>
+    public static readonly List<string> AssemblyProbeSearchPaths = new();
+
     /// <summary>Eagerly load every managed assembly sitting in the app base
-    /// directory so resolve-type's GetAssemblies scan can see PackageReference
-    /// types whose assembly simple-name differs from the type's namespace (so
-    /// the namespace-prefix Assembly.Load never finds them). Best-effort; run at
-    /// most once per assembly-set change (see _probedSinceDirty).</summary>
+    /// directory (and any AssemblyProbeSearchPaths) so resolve-type's
+    /// GetAssemblies scan can see PackageReference types whose assembly
+    /// simple-name differs from the type's namespace (so the namespace-prefix
+    /// Assembly.Load never finds them). Best-effort; run at most once per
+    /// assembly-set change (see _probedSinceDirty).</summary>
     private static void ProbeLoadBaseDir()
     {
-        string dir;
-        try { dir = AppContext.BaseDirectory; }
-        catch { return; }
-        if (string.IsNullOrEmpty(dir) || !System.IO.Directory.Exists(dir)) return;
-        foreach (var dll in System.IO.Directory.EnumerateFiles(dir, "*.dll"))
+        var dirs = new List<string>();
+        try { dirs.Add(AppContext.BaseDirectory); } catch { /* no base dir */ }
+        dirs.AddRange(AssemblyProbeSearchPaths);
+        foreach (var dir in dirs)
         {
-            try
+            if (string.IsNullOrEmpty(dir) || !System.IO.Directory.Exists(dir)) continue;
+            foreach (var dll in System.IO.Directory.EnumerateFiles(dir, "*.dll"))
             {
+                try
+                {
 #if NETSTANDARD2_0
-                System.Reflection.Assembly.LoadFrom(System.IO.Path.GetFullPath(dll));
+                    System.Reflection.Assembly.LoadFrom(System.IO.Path.GetFullPath(dll));
 #else
-                System.Runtime.Loader.AssemblyLoadContext.Default
-                    .LoadFromAssemblyPath(System.IO.Path.GetFullPath(dll));
+                    System.Runtime.Loader.AssemblyLoadContext.Default
+                        .LoadFromAssemblyPath(System.IO.Path.GetFullPath(dll));
 #endif
+                }
+                catch { /* not a managed assembly, or already loaded — ignore */ }
             }
-            catch { /* not a managed assembly, or already loaded — ignore */ }
         }
     }
 

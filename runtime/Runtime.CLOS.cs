@@ -304,6 +304,19 @@ public static partial class Runtime
             var upperSym = Startup.Sym(display.ToUpperInvariant());
             if (!ReferenceEquals(upperSym, simpleSym) && !_classRegistry.ContainsKey(upperSym))
                 _classRegistry[upperSym] = cls;
+            // Always alias the class under its FullName too, so the FullName is a
+            // deterministic, load-order-independent specializer for EVERY type —
+            // not just the loser of a same-simple-name collision (whose FullName is
+            // registered in the else branch below). A code generator can then emit
+            // the FullName specializer for any type and have it resolve, without
+            // depending on which same-named type won the simple-name slot.
+            // (dotcl/dotcl#50). The simple name stays first-wins as an ambiguous
+            // interactive convenience.
+            var fullName = type.FullName
+                ?? (type.Namespace is null ? type.Name : type.Namespace + "." + type.Name);
+            var fullSym = Startup.Sym(fullName);
+            if (!ReferenceEquals(fullSym, simpleSym) && !_classRegistry.ContainsKey(fullSym))
+                _classRegistry[fullSym] = cls;
         }
         else if (!_classRegistry.ContainsKey(classSym))
         {
@@ -1857,6 +1870,24 @@ public static partial class Runtime
         return Nil.Instance;
     }
 
+    // 1-arg direct entry for MACRO-FUNCTION — (macro-function name). Replicates
+    // the args-array registration's single-argument branch exactly, so the
+    // compiler's per-form macro check ((macro-function sym), very hot) skips the
+    // args array and the InvokeSlow detour. The 2-arg (&optional environment)
+    // form stays on the variadic registration wrapper.
+    public static LispObject MacroFunction1(LispObject name)
+    {
+        var result = MacroFunction(name);
+        if (result != Nil.Instance) return result;
+        var sym = GetSymbol(name, "MACRO-FUNCTION");
+        var compilerFn = Startup.LookupCompilerMacro(sym);
+        if (compilerFn != null)
+            return new LispFunction(wrapArgs =>
+                compilerFn.Invoke(new LispObject[] { wrapArgs[0] }),
+                $"MACRO-EXPANDER-{sym.Name}", 2);
+        return Nil.Instance;
+    }
+
 
     // --- Global symbol-macro registry (DEFINE-SYMBOL-MACRO) ---
 
@@ -2313,6 +2344,7 @@ public static partial class Runtime
         lock (gf.MethodsLock)
         {
             var cur = gf.Methods;  // snapshot (current array)
+            bool done = false;
             for (int i = 0; i < cur.Count; i++)
             {
                 if (MethodSignatureMatches(cur[i], method))
@@ -2322,22 +2354,32 @@ public static partial class Runtime
                     replaced[i] = method;
                     method.Owner = gf;
                     gf.ReplaceMethods(replaced);
-                    gf.InvalidateCache();
-                    gf.RecomputeAccessorFlags();
-                    return gf;
+                    done = true;
+                    break;
                 }
             }
-            var appended = new LispMethod[cur.Count + 1];
-            for (int i = 0; i < cur.Count; i++) appended[i] = cur[i];
-            appended[cur.Count] = method;
-            method.Owner = gf;
-            gf.ReplaceMethods(appended);
+            if (!done)
+            {
+                var appended = new LispMethod[cur.Count + 1];
+                for (int i = 0; i < cur.Count; i++) appended[i] = cur[i];
+                appended[cur.Count] = method;
+                method.Owner = gf;
+                gf.ReplaceMethods(appended);
+            }
             gf.InvalidateCache();
             gf.RecomputeAccessorFlags();
         }
+        // A new INITIALIZE-INSTANCE / SHARED-INITIALIZE method invalidates the
+        // per-class make-instance fast-path caches (else already-instantiated
+        // classes silently skip it).
+        InvalidateSimpleInitCaches(gf);
         return gf;
     }
 
+    // Called after ADD-METHOD / REMOVE-METHOD on INITIALIZE-INSTANCE or
+    // SHARED-INITIALIZE. Those per-class caches decide whether make-instance can
+    // take its custom-method-free fast path; a method added after instances were
+    // already made must invalidate them, or the new method is silently skipped.
     private static void InvalidateSimpleInitCaches(GenericFunction gf)
     {
         if (gf.Name.Name == "INITIALIZE-INSTANCE" || gf.Name.Name == "SHARED-INITIALIZE")
@@ -2346,6 +2388,7 @@ public static partial class Runtime
             {
                 c.SimpleInitChecked = false;
                 c.CachedValidInitargKeys = null; // method keys affect valid initargs (CLHS 7.1.2)
+                c.CachedHasCustomInitMethods = null; // the fast-path gate itself
             }
         }
     }
@@ -2374,6 +2417,9 @@ public static partial class Runtime
                 gf.RecomputeAccessorFlags();
             }
         }
+        // Removing an INITIALIZE-INSTANCE / SHARED-INITIALIZE method also changes
+        // the make-instance fast-path eligibility — invalidate the per-class caches.
+        InvalidateSimpleInitCaches(gf);
         return gf;
     }
 

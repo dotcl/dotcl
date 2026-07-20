@@ -3,6 +3,62 @@
 User-facing release notes for dotcl. Each section corresponds to a tagged
 release on the public mirror (dotcl/dotcl).
 
+## v0.1.19 -- 2026-07-20
+
+Adds `dotcl pack` for shipping a Lisp system as a .NET tool, broadens Gray
+stream interop, lays the groundwork for source-aware debugging, and fixes a
+compiler variable-scoping bug across packages.
+
+### `dotcl pack` -- ship a Lisp system as a .NET tool
+
+- `dotcl pack` turns an ASDF system (`.asd`) into a `dotnet tool` NuGet package:
+  the system is compiled to a FASL, bundled with the runtime, and stamped into a
+  self-contained CLI tool that `dotnet tool install -g` can pull. An executable
+  carrying a user FASL runs that program directly instead of dropping into
+  dotcl's own REPL. See `docs/dotcl-pack.md` for usage.
+
+### Gray stream interop
+
+- `make-two-way-stream`, `make-echo-stream`, and `make-concatenated-stream` now
+  accept Gray streams, and `clear-input`, `stream-element-type`, and
+  `stream-external-format` dispatch to Gray stream methods. Portable code layered
+  on trivial-gray-streams composes with the built-in stream constructors.
+
+### Threads
+
+- `make-thread` no longer inherits the parent thread's dynamic bindings, matching
+  bordeaux-threads' contract (a fresh thread starts from the global values).
+
+### Source-aware debugging (foundation)
+
+- Loading or compiling a file now records where each top-level definition was
+  written, and `dotcl:function-source-location` reports it. This backs a debugger
+  backend's "jump to definition" / "jump to the erroring frame" so a SLIME-style
+  debugger can open the source at the right place.
+
+### Compiler correctness
+
+- Fixed a multi-package lexical variable collision: when two packages interned a
+  symbol with the same printed name and both were used as lexical variables, a
+  reference to one could resolve to the other's binding, reading the wrong
+  variable at runtime. Variable lookup is now package-aware. Thanks to Bohong
+  Huang for the report and fix.
+
+### Performance
+
+- Many sequence and list operations -- `find`, `find-if`, `remove`, `remove-if`,
+  `remove-if-not`, `delete`, `member`, `assoc`, `macro-function` -- take a faster
+  direct call path that avoids per-call argument-array allocation.
+
+### CLOS and interop
+
+- Generic-function dispatch and class metadata are hardened against concurrent
+  evaluation, removing intermittent failures under parallel compilation.
+- Method specializers on .NET types no longer depend on class load order -- a
+  specializer registered before its argument type is first seen still dispatches.
+- In-process project compilation resolves the consuming project's referenced
+  assemblies at compile time.
+
 ## v0.1.18 -- 2026-07-13
 
 Adds a first-class .NET `decimal` type, tightens a couple of interop and

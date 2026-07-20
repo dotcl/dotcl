@@ -948,6 +948,7 @@ public static partial class Runtime
                 while (reader2.TryRead(out var form))
                 {
                     int formLine = reader2.LastFormLine;
+                    if (!isCompiled) RecordDefinitionSources(form, filePath, formLine);
                     try
                     {
                         if (isCompiled)
@@ -1120,6 +1121,91 @@ public static partial class Runtime
             }
         }
         yield return form;
+    }
+
+    // --- Definition source tracking (rich backtrace, "medium" tier follow-up) ---
+    // Maps a top-level definition name to where it was defined, so swank/micros
+    // sldb can implement frame-source-location / find-definitions (M-. / jump to
+    // the erroring function). Populated by LOAD and COMPILE-FILE as each top-level
+    // form is read, BEFORE macroexpansion (defun etc. are macros, so the form must
+    // be inspected raw). Line granularity is the top-level form, matching what a
+    // debugger needs to jump to the definition.
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<Symbol, (string File, int Line)>
+        s_defSources = new();
+
+    // Top-level operators whose second element names a thing worth locating.
+    private static bool IsDefinerName(string name) => name switch
+    {
+        "DEFUN" or "DEFMACRO" or "DEFGENERIC" or "DEFMETHOD" or "DEFINE-COMPILER-MACRO"
+        or "DEFVAR" or "DEFPARAMETER" or "DEFCONSTANT"
+        or "DEFCLASS" or "DEFSTRUCT" or "DEFINE-CONDITION"
+        or "DEFTYPE" or "DEFSETF" or "DEFINE-SETF-EXPANDER" or "DEFINE-SYMBOL-MACRO"
+        or "DEFINE-MODIFY-MACRO" => true,
+        _ => false
+    };
+
+    /// <summary>Walk a raw (unexpanded) top-level form, descending PROGN/EVAL-WHEN
+    /// like <see cref="FlattenTopLevel"/> but without macroexpanding, and record the
+    /// source location of each definition it names. Best-effort: names that only
+    /// appear after macroexpansion are not tracked (v1 = top-level form granularity).</summary>
+    internal static void RecordDefinitionSources(LispObject form, string file, int line)
+    {
+        if (form is not Cons c || c.Car is not Symbol head) return;
+        switch (head.Name)
+        {
+            case "PROGN":
+                for (var b = c.Cdr; b is Cons bc; b = bc.Cdr)
+                    RecordDefinitionSources(bc.Car, file, line);
+                return;
+            case "EVAL-WHEN":
+                if (c.Cdr is Cons ew)
+                    for (var b = ew.Cdr; b is Cons bc; b = bc.Cdr)
+                        RecordDefinitionSources(bc.Car, file, line);
+                return;
+        }
+        if (!IsDefinerName(head.Name) || c.Cdr is not Cons nameCell) return;
+        // Name is a bare symbol, or (name options...) for defstruct/(setf name) etc.
+        var nameSym = nameCell.Car switch
+        {
+            Symbol s => s,
+            Cons nc when nc.Car is Symbol s2 => s2, // (defstruct (name ...) ...)
+            _ => null
+        };
+        if (nameSym != null)
+            s_defSources[nameSym] = (file, line);
+    }
+
+    /// <summary>
+    /// DOTCL:FUNCTION-SOURCE-LOCATION (name) — where NAME (a symbol) was most
+    /// recently defined by a top-level definer (defun/defmethod/defclass/...) under
+    /// LOAD or COMPILE-FILE, as the plist (:FILE "path" :LINE n), or NIL if unknown.
+    /// Backs the swank/micros sldb frame-source-location and find-definitions so
+    /// M-. and "jump to erroring frame" work (issue: rich backtrace, source tier).
+    /// </summary>
+    public static LispObject FunctionSourceLocation(LispObject[] args)
+    {
+        if (args.Length < 1 || args[0] is not Symbol name) return Nil.Instance;
+        if (!s_defSources.TryGetValue(name, out var loc)) return Nil.Instance;
+        return new Cons(Startup.Keyword("FILE"),
+               new Cons(new LispString(loc.File),
+               new Cons(Startup.Keyword("LINE"),
+               new Cons(Fixnum.Make(loc.Line), Nil.Instance))));
+    }
+
+    /// <summary>
+    /// DOTCL:RECORD-DEFINITION-SOURCES (form file line) — run the same definition
+    /// walker LOAD/COMPILE-FILE use on FORM, attributing any definitions to
+    /// FILE:LINE. Lets a tool that compiles a single form outside LOAD/COMPILE-FILE
+    /// (e.g. swank-compile-string on C-c C-c, which receives the buffer filename and
+    /// line) populate DOTCL:FUNCTION-SOURCE-LOCATION. Returns FORM unchanged.
+    /// </summary>
+    public static LispObject RecordDefinitionSourcesForm(LispObject[] args)
+    {
+        if (args.Length < 3) return args.Length >= 1 ? args[0] : Nil.Instance;
+        var form = args[0];
+        if (args[1] is LispString file && args[2] is Fixnum line)
+            RecordDefinitionSources(form, file.Value, (int)line.Value);
+        return form;
     }
 
     /// <summary>Try to macroexpand-1 a form. Returns expanded form or null if not a macro/expansion fails.</summary>
@@ -1838,8 +1924,10 @@ public static partial class Runtime
                 while (reader.TryRead(out var form))
                 {
                     // Line where this top-level form began — used to attribute a
-                    // compile error to the source location under a project build.
+                    // compile error to the source location under a project build,
+                    // and to record definition locations for frame-source-location.
                     int formLine = reader.LastFormLine;
+                    RecordDefinitionSources(form, inputPath, formLine);
                     try
                     {
                     foreach (var subForm in FlattenTopLevel(form))
@@ -3843,8 +3931,9 @@ public static partial class Runtime
                 return Nil.Instance;
             }));
 
-        // MACRO-FUNCTION
-        Emitter.CilAssembler.RegisterFunction("MACRO-FUNCTION", new LispFunction(args => {
+        // MACRO-FUNCTION. The 1-arg form is compiler-hot (per-form macro check),
+        // so it also carries a direct 1-arg delegate (Runtime.MacroFunction1).
+        var macroFunctionFn = new LispFunction(args => {
             if (args.Length < 1 || args.Length > 2) throw new LispErrorException(new LispProgramError($"MACRO-FUNCTION: wrong number of arguments: {args.Length}"));
             var result = Runtime.MacroFunction(args[0]);
             if (result != Nil.Instance) return result;
@@ -3857,7 +3946,9 @@ public static partial class Runtime
                 }, $"MACRO-EXPANDER-{sym.Name}", 2);
             }
             return Nil.Instance;
-        }, "MACRO-FUNCTION", -1));
+        }, "MACRO-FUNCTION", -1);
+        macroFunctionFn.SetDirectDelegate((Func<LispObject, LispObject>)Runtime.MacroFunction1);
+        Emitter.CilAssembler.RegisterFunction("MACRO-FUNCTION", macroFunctionFn);
 
         // Standard macro function registration
         var standardMacros = new[] {

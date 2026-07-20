@@ -7,7 +7,12 @@ public static partial class Runtime
     // "PKG::NAME" for other packages, so a non-CL deftype whose name matches
     // a built-in type (e.g. SBCL's host-side SB-XC:COMPLEX -> COMPLEXNUM)
     // shadows the built-in for ITS symbol only.
-    public static Dictionary<string, LispObject> TypeExpanders = new();
+    // ConcurrentDictionary: runtime DEFTYPE writes this (TypeExpanders[key]=…) while
+    // typep/subtypep/etc. read it (TryGetValue/ContainsKey). A concurrent DEFTYPE on
+    // one thread and a type test on another otherwise corrupts a plain Dictionary.
+    // All uses are TryGetValue / indexer-set / ContainsKey, which ConcurrentDictionary
+    // supports with identical signatures.
+    public static readonly System.Collections.Concurrent.ConcurrentDictionary<string, LispObject> TypeExpanders = new();
 
     public static string TypeExpanderKey(Symbol sym)
         => sym.HomePackage is Package p && p.Name != "COMMON-LISP"

@@ -743,6 +743,24 @@ public static partial class Runtime
         return 1;
     }
 
+    // Stream-argument predicates for composite-stream constructors. Accept both
+    // native LispStream instances and Gray CLOS streams (LispInstance), matching
+    // the INPUT-STREAM-P / OUTPUT-STREAM-P generic — so MAKE-TWO-WAY-STREAM etc.
+    // agree with the stream protocol instead of testing the C# LispStream type.
+    internal static bool IsInputStreamArg(LispObject o)
+        => (o is LispStream s && s.IsInput)
+           || (o is LispInstance gi && (IsGrayInputStream(gi) || IsGrayBinaryInputStream(gi)));
+
+    internal static bool IsOutputStreamArg(LispObject o)
+        => (o is LispStream s && s.IsOutput)
+           || (o is LispInstance gi && (IsGrayOutputStream(gi) || IsGrayBinaryOutputStream(gi)));
+
+    // STREAMP: any native or Gray stream (used only to shape the type-error report).
+    internal static bool IsStreamArg(LispObject o)
+        => o is LispStream
+           || (o is LispInstance gi && (IsGrayInputStream(gi) || IsGrayOutputStream(gi)
+                                        || IsGrayBinaryInputStream(gi) || IsGrayBinaryOutputStream(gi)));
+
     public static LispObject OpenFile(LispObject path, LispObject[] options)
     {
         string filePath = ResolvePhysicalPath(path);
@@ -1100,6 +1118,14 @@ public static partial class Runtime
 
     public static LispObject ClearInput(LispObject stream)
     {
+        // Gray input stream: trampoline to the stream-clear-input generic (which
+        // has a default method), so a streamp=T instance is accepted rather than
+        // rejected as "not a stream" (input-stream-p already answers T for it).
+        if (stream is LispInstance gi && IsGrayInputStream(gi))
+        {
+            GrayStreamLookup.GrayOrCl("STREAM-CLEAR-INPUT")?.Invoke(new LispObject[] { gi });
+            return Nil.Instance;
+        }
         // Validate: must be a stream designator (stream, nil, or t)
         if (stream is not (LispStream or Nil or T))
             throw new LispErrorException(new LispTypeError("CLEAR-INPUT: not a stream designator", stream, Startup.Sym("STREAM")));
@@ -1919,9 +1945,12 @@ public static partial class Runtime
                     streamObj = DynamicBindings.Get(syn.Symbol);
                     continue;
                 case LispTwoWayStream tw:
-                    return tw.InputStream;
+                    if (tw.InputStream is LispStream) { streamObj = tw.InputStream; continue; }
+                    // Gray input component: read through a cached native adapter.
+                    return tw.ResolvedInputCache ??= new LispInputStream(new GrayStreamTextReader((LispInstance)tw.InputStream));
                 case LispEchoStream es:
-                    return es.InputStream;
+                    if (es.InputStream is LispStream) { streamObj = es.InputStream; continue; }
+                    return es.ResolvedInputCache ??= new LispInputStream(new GrayStreamTextReader((LispInstance)es.InputStream));
                 case LispStream ls:
                     return ls;
                 case T:
@@ -3392,11 +3421,21 @@ public static partial class Runtime
             return Nil.Instance;
         });
         Startup.RegisterUnary("STREAM-ELEMENT-TYPE", obj => {
-            if (obj is not LispStream ls) throw new LispErrorException(new LispTypeError("STREAM-ELEMENT-TYPE: not a stream", obj, Startup.Sym("STREAM")));
-            return ls.ElementType ?? Startup.Sym("CHARACTER");
+            if (obj is LispStream ls) return ls.ElementType ?? Startup.Sym("CHARACTER");
+            // Gray streams: no stream-element-type generic, so report the protocol
+            // default — CHARACTER for character streams, (unsigned-byte 8) for binary.
+            if (obj is LispInstance gc && (Runtime.IsGrayInputStream(gc) || Runtime.IsGrayOutputStream(gc)))
+                return Startup.Sym("CHARACTER");
+            if (obj is LispInstance gb && (Runtime.IsGrayBinaryInputStream(gb) || Runtime.IsGrayBinaryOutputStream(gb)))
+                return Runtime.List(Startup.Sym("UNSIGNED-BYTE"), Fixnum.Make(8));
+            throw new LispErrorException(new LispTypeError("STREAM-ELEMENT-TYPE: not a stream", obj, Startup.Sym("STREAM")));
         });
         Startup.RegisterUnary("STREAM-EXTERNAL-FORMAT", obj => {
-            if (obj is not LispStream) throw new LispErrorException(new LispTypeError("STREAM-EXTERNAL-FORMAT: not a stream", obj, Startup.Sym("STREAM")));
+            // Accept Gray streams (streamp=T); dotcl reports :default for every
+            // stream, so a Gray stream is no exception (better than "not a stream").
+            if (obj is not LispStream && !(obj is LispInstance ei && (Runtime.IsGrayInputStream(ei) || Runtime.IsGrayOutputStream(ei)
+                                                                      || Runtime.IsGrayBinaryInputStream(ei) || Runtime.IsGrayBinaryOutputStream(ei))))
+                throw new LispErrorException(new LispTypeError("STREAM-EXTERNAL-FORMAT: not a stream", obj, Startup.Sym("STREAM")));
             return Startup.Keyword("DEFAULT");
         });
         Startup.RegisterUnary("BROADCAST-STREAM-STREAMS", obj => {
@@ -3645,20 +3684,20 @@ public static partial class Runtime
             new LispFunction(args => {
                 for (int i = 0; i < args.Length; i++)
                 {
-                    if (args[i] is not LispStream s || !s.IsInput)
+                    if (!Runtime.IsInputStreamArg(args[i]))
                         throw new LispErrorException(new LispTypeError("MAKE-CONCATENATED-STREAM: argument is not an input stream", args[i], Startup.Sym("STREAM")));
                 }
-                var streams = args.OfType<LispStream>().ToArray();
+                var streams = (LispObject[])args.Clone();
                 return new LispConcatenatedStream(streams);
             }, "MAKE-CONCATENATED-STREAM", -1));
         Emitter.CilAssembler.RegisterFunction("MAKE-ECHO-STREAM",
             new LispFunction(args => {
                 if (args.Length != 2) throw new LispErrorException(new LispProgramError($"MAKE-ECHO-STREAM: requires exactly 2 arguments, got {args.Length}"));
-                if (args[0] is not LispStream input || !input.IsInput)
+                if (!Runtime.IsInputStreamArg(args[0]))
                     throw new LispErrorException(new LispTypeError("MAKE-ECHO-STREAM: first argument is not an input stream", args[0], Startup.Sym("STREAM")));
-                if (args[1] is not LispStream output || !output.IsOutput)
+                if (!Runtime.IsOutputStreamArg(args[1]))
                     throw new LispErrorException(new LispTypeError("MAKE-ECHO-STREAM: second argument is not an output stream", args[1], Startup.Sym("STREAM")));
-                return new LispEchoStream(input, output);
+                return new LispEchoStream(args[0], args[1]);
             }, "MAKE-ECHO-STREAM", 2));
         Emitter.CilAssembler.RegisterFunction("MAKE-SYNONYM-STREAM",
             new LispFunction(args => {
@@ -3669,21 +3708,21 @@ public static partial class Runtime
         Emitter.CilAssembler.RegisterFunction("MAKE-TWO-WAY-STREAM",
             new LispFunction(args => {
                 if (args.Length != 2) throw new LispErrorException(new LispProgramError($"MAKE-TWO-WAY-STREAM: requires exactly 2 arguments, got {args.Length}"));
-                if (args[0] is not LispStream input || !input.IsInput)
+                if (!Runtime.IsInputStreamArg(args[0]))
                 {
-                    var expectedType = args[0] is LispStream
+                    var expectedType = Runtime.IsStreamArg(args[0])
                         ? (LispObject)Runtime.List(Startup.Sym("AND"), Startup.Sym("STREAM"), Runtime.List(Startup.Sym("SATISFIES"), Startup.Sym("INPUT-STREAM-P")))
                         : Startup.Sym("STREAM");
                     throw new LispErrorException(new LispTypeError("MAKE-TWO-WAY-STREAM: first argument is not an input stream", args[0], expectedType));
                 }
-                if (args[1] is not LispStream output || !output.IsOutput)
+                if (!Runtime.IsOutputStreamArg(args[1]))
                 {
-                    var expectedType = args[1] is LispStream
+                    var expectedType = Runtime.IsStreamArg(args[1])
                         ? (LispObject)Runtime.List(Startup.Sym("AND"), Startup.Sym("STREAM"), Runtime.List(Startup.Sym("SATISFIES"), Startup.Sym("OUTPUT-STREAM-P")))
                         : Startup.Sym("STREAM");
                     throw new LispErrorException(new LispTypeError("MAKE-TWO-WAY-STREAM: second argument is not an output stream", args[1], expectedType));
                 }
-                return new LispTwoWayStream(input, output);
+                return new LispTwoWayStream(args[0], args[1]);
             }, "MAKE-TWO-WAY-STREAM", 2));
 
         // --- finish-output, force-output, clear-output ---

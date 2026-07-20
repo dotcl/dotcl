@@ -492,6 +492,30 @@ contrib-dotcl-jitdisasm:
 	rm -f $(DOTCL_ROOT)contrib/dotcl-jitdisasm/lib/*.pdb $(DOTCL_ROOT)contrib/dotcl-jitdisasm/lib/*.deps.json
 	rm -rf $(DOTCL_ROOT)contrib/dotcl-jitdisasm/bin $(DOTCL_ROOT)contrib/dotcl-jitdisasm/obj
 
+# Extra args for the tool `dotnet pack` only. Release CI packs the full RID matrix
+# and needs none of these. Locally, crossgen2 can only emit R2R for the host RID,
+# and a RID it cannot compile suppresses the base pointer package for the whole
+# pack — so a local package set has to be limited to the host:
+#
+#   make pack R2R_RIDS=win-arm64 PACK_ARGS=-p:RuntimeIdentifiers=win-arm64 \
+#             PACK_VERSION=0.1.x-dev
+#
+# Keep R2R_RIDS and the RuntimeIdentifiers override in step: the recipe stages one
+# dotcl-r2r-<rid>.core per R2R_RIDS entry. A ;-list cannot be passed here (see the
+# note in runtime/runtime.csproj), so this only expresses a single RID. Such a set
+# is what `dotcl pack --from` consumes.
+PACK_ARGS ?=
+
+# Version for the pack, applied to BOTH projects. Never pass -p:Version in
+# PACK_ARGS: that reaches the tool pack only, and the library pack below runs
+# afterwards and rewrites the shared bin/Release/net10.0/ output at the
+# un-overridden version — leaving a runtime.dll that demands one DotCL.Runtime
+# version next to a DotCL.Runtime.dll that claims another, which cannot start.
+# The per-RID publish dirs (and so the nupkgs) stay consistent either way, so the
+# breakage only shows up when running the plain build output.
+PACK_VERSION ?=
+_PACK_VERSION_ARG := $(if $(PACK_VERSION),-p:Version=$(PACK_VERSION),)
+
 # Build NuGet package (requires cross-compile to have been run first).
 # Nuke runtime/contrib first so a contrib directory deleted from source
 # stops shipping in the nupkg (old dotcl-repl/ stayed in the
@@ -516,11 +540,11 @@ pack: compile-asdf-fasl compile-asdf-fasls compile-core-fasl compile-contrib-fas
 	rm -rf $(DOTCL_ROOT)runtime/contrib/dotcl-cs/bin $(DOTCL_ROOT)runtime/contrib/dotcl-cs/obj
 	rm -f $(DOTCL_ROOT)runtime/contrib/dotcl-cs/*.csproj $(DOTCL_ROOT)runtime/contrib/dotcl-cs/*.cs
 	cp $(DOTCL_ROOT)contrib/asdf/asdf.fasl $(DOTCL_ROOT)runtime/contrib/asdf/asdf.fasl
-	dotnet pack $(DOTCL_ROOT)runtime/runtime.csproj --configuration Release -o $(DOTCL_ROOT)out/
+	dotnet pack $(DOTCL_ROOT)runtime/runtime.csproj --configuration Release -o $(DOTCL_ROOT)out/ $(PACK_ARGS) $(_PACK_VERSION_ARG)
 	# Build the in-process project-core MSBuild task before packing the
 	# library so DotCL.Runtime.csproj can bundle tasks/DotCL.Build.Tasks.dll.
 	dotnet build $(DOTCL_ROOT)runtime/build-tasks/DotCL.Build.Tasks.csproj --configuration Release
-	dotnet pack $(DOTCL_ROOT)runtime/DotCL.Runtime.csproj --configuration Release -o $(DOTCL_ROOT)out/
+	dotnet pack $(DOTCL_ROOT)runtime/DotCL.Runtime.csproj --configuration Release -o $(DOTCL_ROOT)out/ $(_PACK_VERSION_ARG)
 	rm -f $(DOTCL_ROOT)runtime/dotcl.core
 	@for rid in $(R2R_RIDS); do \
 		rm -f $(DOTCL_ROOT)runtime/dotcl-r2r-$$rid.core $(DOTCL_ROOT)runtime/asdf-r2r-$$rid.fasl; \

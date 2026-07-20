@@ -352,13 +352,27 @@ public class LispFunction : LispObject
 
     public LispObject Invoke5(LispObject a, LispObject b, LispObject c, LispObject d, LispObject e)
     {
-        if (_func5 != null) { PeriodicStackCheck(); var args = new[] { a, b, c, d, e }; using (PushFrame(args)) return _func5(a, b, c, d, e); }
+        if (_func5 != null)
+        {
+            PeriodicStackCheck();
+            // Anonymous callee: skip the frame array (PushFrame is a no-op when
+            // Name == null, so allocating it just to discard it is pure waste).
+            if (Name == null) return _func5(a, b, c, d, e);
+            var args = new[] { a, b, c, d, e };
+            using (PushFrame(args)) return _func5(a, b, c, d, e);
+        }
         return InvokeSlow(new[] { a, b, c, d, e });
     }
 
     public LispObject Invoke6(LispObject a, LispObject b, LispObject c, LispObject d, LispObject e, LispObject f)
     {
-        if (_func6 != null) { PeriodicStackCheck(); var args = new[] { a, b, c, d, e, f }; using (PushFrame(args)) return _func6(a, b, c, d, e, f); }
+        if (_func6 != null)
+        {
+            PeriodicStackCheck();
+            if (Name == null) return _func6(a, b, c, d, e, f);
+            var args = new[] { a, b, c, d, e, f };
+            using (PushFrame(args)) return _func6(a, b, c, d, e, f);
+        }
         return InvokeSlow(new[] { a, b, c, d, e, f });
     }
 

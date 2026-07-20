@@ -151,3 +151,36 @@
 (deftest dec-plus-int-no-error
   (%dec-plus-int #m1.5)
   5/2)
+
+;; --- coerce INTO decimal ---
+(deftest dec-coerce-integer               ; integer -> exact decimal
+  (let ((d (coerce 1 'dotcl:decimal)))
+    (list (dotcl:decimalp d) (princ-to-string d)))
+  (t "#m1"))
+
+(deftest dec-coerce-bignum-in-range
+  (princ-to-string (coerce 1000000000000000000000000000 'dotcl:decimal))
+  "#m1000000000000000000000000000")
+
+(deftest dec-coerce-ratio-exact           ; 2/5-smooth denominators -> exact, minimal scale
+  (mapcar (lambda (r) (princ-to-string (coerce r 'dotcl:decimal)))
+          '(1/2 3/4 1/8 1/5))
+  ("#m0.5" "#m0.75" "#m0.125" "#m0.2"))
+
+(deftest dec-coerce-float-escape          ; float is the explicit escape out of the mix ban
+  (list (princ-to-string (coerce 1.5d0 'dotcl:decimal))
+        (princ-to-string (coerce 1.5f0 'dotcl:decimal)))
+  ("#m1.5" "#m1.5"))
+
+(deftest dec-coerce-decimal-idempotent    ; already a decimal -> returned as-is, scale kept
+  (princ-to-string (coerce #m2.50 'dotcl:decimal))
+  "#m2.50")
+
+(deftest dec-coerce-nonrepresentable-signals  ; 1/3 denominator has factor 3 -> error, no rounding
+  (handler-case (progn (coerce 1/3 'dotcl:decimal) :no-error)
+    (error () :signalled))
+  :signalled)
+
+(deftest dec-coerce-result-typep          ; unqualified 'decimal resolves too
+  (typep (coerce 7 'decimal) 'dotcl:decimal)
+  t)

@@ -482,6 +482,30 @@ public static class DotclHost
         }
     }
 
+    /// <summary>
+    /// Route ASDF's compile output under <paramref name="cacheDir"/> (a dir
+    /// inside the project's obj/) instead of the default user cache
+    /// (~/.cache/common-lisp/…). ASDF caches each system's component fasls keyed
+    /// by source path; that cache lives outside the project and survives
+    /// `dotnet clean`, so a regenerated source can be shadowed by a stale cached
+    /// fasl (dotcl/dotcl#53). Sending it under obj/ makes `dotnet clean` (which
+    /// wipes obj/) clear it too — one project-local cache, no external trap. The
+    /// source tree is mirrored under the dir so distinct sources never collide.
+    /// Called after (require "asdf"), before any load/compile. MSBuild path only
+    /// (the CLI keeps ASDF's default shared cache).
+    /// </summary>
+    private static void RedirectAsdfOutput(string? cacheDir)
+    {
+        if (string.IsNullOrEmpty(cacheDir)) return;
+        var dir = System.IO.Path.GetFullPath(cacheDir).Replace("\\", "/").TrimEnd('/') + "/";
+        var form = $"(asdf:initialize-output-translations "
+                 + $"(list :output-translations "
+                 + $"(list t (list #p\"{dir}\" :**/ :*.*.*)) "
+                 + $":ignore-inherited-configuration))";
+        Runtime.Eval(MultipleValues.Primary(
+            Runtime.ReadFromString(new LispObject[] { new LispString(form) })));
+    }
+
     public static void ResolveDeps(string asdPath, string? manifestOut, string? rootSourcesOut, string? targetRid = null, string[]? buildInit = null, string[]? searchPaths = null)
     {
         var absAsd = System.IO.Path.GetFullPath(asdPath);
@@ -492,6 +516,15 @@ public static class DotclHost
         // and side-effects *central-registry* with shipped contrib subdirs.
         Runtime.Eval(MultipleValues.Primary(
             Runtime.ReadFromString(new LispObject[] { new LispString("(require \"asdf\")") })));
+
+        // MSBuild path (manifest to a file): route ASDF's compile cache under
+        // obj/ so `dotnet clean` clears it (dotcl/dotcl#53). CLI resolve-deps to
+        // stdout keeps ASDF's default shared cache.
+        if (manifestOut != null)
+        {
+            var mDir = System.IO.Path.GetDirectoryName(System.IO.Path.GetFullPath(manifestOut));
+            RedirectAsdfOutput(System.IO.Path.Combine(mDir ?? ".", "asdf-cache"));
+        }
 
         // Declarative external system dirs (<DotclAsdSearchPath>), then the
         // build-init scripts (escape hatch, can override / do more).
@@ -633,6 +666,10 @@ public static class DotclHost
         Runtime.Eval(MultipleValues.Primary(
             Runtime.ReadFromString(new LispObject[] { new LispString("(require \"asdf\")") })));
 
+        // Route ASDF's compile cache under obj/ so `dotnet clean` clears it and a
+        // stale user-cache fasl can't shadow a regenerated source (dotcl/dotcl#53).
+        RedirectAsdfOutput(System.IO.Path.Combine(outDir ?? ".", "asdf-cache"));
+
         // Declarative external system dirs (<DotclAsdSearchPath>), then the
         // build-init scripts (escape hatch, can override / do more).
         RegisterAsdSearchPaths(searchPaths);
@@ -715,6 +752,84 @@ public static class DotclHost
         catch (LispSourceException lse)
         {
             throw RemapConcatException(lse, concatLisp, lineMap);
+        }
+        finally
+        {
+            Runtime.EmitBuildSourceLocations = prevEmit;
+            DynamicBindings.Set(hookSym, oldHook);
+        }
+    }
+
+    /// <summary>
+    /// Build a single self-contained FASL for <c>dotcl pack</c>: monolithic-
+    /// concatenate the named ASDF system — its root sources AND all dependency
+    /// sources — via <c>asdf:monolithic-concatenate-source-op</c>, then
+    /// <c>compile-file-concatenated</c> the result into
+    /// <paramref name="outputFasl"/>. Unlike <see cref="CompileProject"/> (root
+    /// only, deps stay as separate fasls) the produced FASL loads standalone, so
+    /// the pack restamp can drop it into the tool package as a single
+    /// dotcl.user.fasl with no dep fasls to bundle.
+    ///
+    /// When <paramref name="toplevel"/> is non-null a call <c>(toplevel)</c> is
+    /// appended so the tool runs that entry point on launch. A system that
+    /// already invokes its entry at load time (e.g. a roswell <c>&lt;name&gt;/exe</c>
+    /// launcher) needs none.
+    /// </summary>
+    public static void PackFasl(string system, string outputFasl, string? toplevel = null,
+                                string[]? buildInit = null, string[]? searchPaths = null)
+    {
+        var absOut = System.IO.Path.GetFullPath(outputFasl);
+        var outDir = System.IO.Path.GetDirectoryName(absOut);
+        if (!string.IsNullOrEmpty(outDir) && !System.IO.Directory.Exists(outDir))
+            System.IO.Directory.CreateDirectory(outDir);
+
+        // Non-interactive: a compile-time error must unwind, not drop into the
+        // debugger on closed stdin (same rationale as CompileProject).
+        var hookSym = Startup.Sym("*DEBUGGER-HOOK*");
+        var oldHook = DynamicBindings.Get(hookSym);
+        DynamicBindings.Set(hookSym, new LispFunction(hookArgs =>
+        {
+            var cond = hookArgs[0];
+            throw new LispErrorException(
+                cond is LispCondition lc ? lc : new LispError(cond.ToString()));
+        }, "*PACK-DEBUGGER-HOOK*", 2));
+
+        Runtime.Eval(MultipleValues.Primary(
+            Runtime.ReadFromString(new LispObject[] { new LispString("(require \"asdf\")") })));
+        RegisterAsdSearchPaths(searchPaths);
+        LoadBuildInitScripts(buildInit);
+
+        var outLisp = absOut.Replace("\\", "/");
+        var sysEsc = system.Replace("\\", "\\\\").Replace("\"", "\\\"");
+        var workConcat = (outDir == null ? "" : outDir.Replace("\\", "/") + "/")
+                       + System.IO.Path.GetFileNameWithoutExtension(outputFasl) + ".pack.concat.lisp";
+        // Launcher appended only when --toplevel was given.
+        var appendForm = toplevel == null ? "" :
+            $@"(with-open-file (o work :direction :output :if-exists :append :if-does-not-exist :error)
+                 (terpri o) (write-line ""({toplevel})"" o))";
+
+        // monolithic-concatenate-source-op writes the concat into asdf's shared
+        // cache; copy it to a writable work file next to the output (keep the
+        // cached one pristine), append the optional launcher, then compile.
+        var form = $@"
+(let* ((sys (asdf:find-system ""{sysEsc}""))
+       (op 'asdf:monolithic-concatenate-source-op))
+  (asdf:operate op sys)
+  (let ((concat (namestring (first (asdf:output-files op sys))))
+        (work ""{workConcat}""))
+    (with-open-file (o work :direction :output :if-exists :supersede :if-does-not-exist :create)
+      (with-open-file (i concat)
+        (loop for line = (read-line i nil :eof) until (eq line :eof)
+              do (write-line line o))))
+    {appendForm}
+    (dotcl.cil-compiler:compile-file-concatenated work ""{outLisp}"")))";
+
+        var prevEmit = Runtime.EmitBuildSourceLocations;
+        Runtime.EmitBuildSourceLocations = true;
+        try
+        {
+            Runtime.Eval(MultipleValues.Primary(
+                Runtime.ReadFromString(new LispObject[] { new LispString(form) })));
         }
         finally
         {

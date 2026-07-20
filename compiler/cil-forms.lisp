@@ -724,7 +724,7 @@
          (when (form-has-return-from-p name (car cur))
            (return t))))))
 
-(defun form-macroexpands-to-return-from-p (name form &optional (depth 0))
+(defun form-macroexpands-to-return-from-p (name form depth)
   "Like FORM-HAS-RETURN-FROM-P, but also expands global macro calls (up to
    *macro-expand-depth-limit*) so a (return-from NAME) produced by a macro is
    found even when the macro call is nested inside a special form such as PROGN
@@ -732,7 +732,11 @@
    Scans BOTH the expansion and the original subforms, so it never misses a
    return-from and only ever over-keeps the implicit block (safe). Conservative:
    answers T if a macro expander errors. Uses cached-macroexpand, so the pre-pass
-   expansion is shared with code-gen (identical gensyms)."
+   expansion is shared with code-gen (identical gensyms).
+   DEPTH is the current macro-expansion depth; entry callers pass 0. It is a
+   required parameter (not &optional) so the compiler gives this hot recursive
+   tree-walker a required-only lambda list, which enables the direct-delegate
+   fast path instead of the args-array entry."
   (cond
     ((atom form) nil)
     ((and (eq (car form) 'return-from) (consp (cdr form)) (eq (cadr form) name)) t)
@@ -875,7 +879,7 @@
                (or ;; Detect (return-from block-name …) anywhere in the body,
                    ;; expanding global macro calls at any depth (a macro nested in
                    ;; a progn/let/etc. can expand to one — dotcl/dotcl issue 51).
-                   (some (lambda (f) (form-macroexpands-to-return-from-p block-name f)) body)
+                   (some (lambda (f) (form-macroexpands-to-return-from-p block-name f 0)) body)
                    ;; A MACROLET / SYMBOL-MACROLET local macro can also expand to
                    ;; (return-from block-name …) via its quasiquoted template, and
                    ;; its expander is lexical (not in the global *macros* table), so

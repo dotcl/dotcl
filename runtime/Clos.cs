@@ -84,8 +84,11 @@ public class LispClass : LispObject
     public (Symbol Key, LispFunction Thunk)[] DirectDefaultInitargs { get; set; } = Array.Empty<(Symbol, LispFunction)>();
     /// <summary>Effective default initargs (merged from CPL, most specific first).</summary>
     public (Symbol Key, LispFunction Thunk)[] DefaultInitargs { get; set; } = Array.Empty<(Symbol, LispFunction)>();
-    /// <summary>Storage for :allocation :class slots (shared across all instances).</summary>
-    public Dictionary<string, LispObject?> ClassSlotValues { get; } = new();
+    /// <summary>Storage for :allocation :class slots (shared across all instances).
+    /// ConcurrentDictionary: a :class slot's initform can fire on the make-instance
+    /// hot path, so parallel make-instance / setf slot-value on the same class write
+    /// concurrently. Usage is TryGetValue/indexer only (no lock; hot path).</summary>
+    public System.Collections.Concurrent.ConcurrentDictionary<string, LispObject?> ClassSlotValues { get; } = new();
     /// <summary>Slot values this class holds as an instance of its (custom) metaclass —
     /// i.e. slots the metaclass adds beyond STANDARD-CLASS. Null until populated.
     /// Lets slot-value on a class metaobject read metaclass-defined slots,
@@ -111,7 +114,12 @@ public class LispClass : LispObject
     /// (McCLIM) and other code dispatch via (eql class-prototype), which only
     /// works if the same object is returned every time. Lazily created.</summary>
     private LispInstance? _prototype;
-    public LispInstance Prototype => _prototype ??= new LispInstance(this);
+    // Atomic lazy init: a plain ??= lets two threads publish different instances,
+    // which silently breaks (eql class-prototype) dispatch. CompareExchange keeps
+    // the first winner as the single stable prototype (a losing extra instance is
+    // discarded, not published).
+    public LispInstance Prototype
+        => _prototype ?? System.Threading.Interlocked.CompareExchange(ref _prototype, new LispInstance(this), null) ?? _prototype;
     /// <summary>Cached result of HasCustomInitMethods check. Null = not yet computed.</summary>
     internal bool? CachedHasCustomInitMethods;
     /// <summary>Cached result of IsConditionClass check. Null = not yet computed.</summary>

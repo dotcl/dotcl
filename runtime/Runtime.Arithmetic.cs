@@ -938,14 +938,18 @@ public static partial class Runtime
     }
 
     // CL documentation storage: (symbol, doc-type-string) → LispObject
-    private static readonly Dictionary<(string sym, string docType), LispObject> _docs = new();
+    // ConcurrentDictionary: (setf documentation) on separate threads writes this
+    // while documentation reads it — a plain Dictionary corrupts under concurrent write.
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<(string sym, string docType), LispObject> _docs = new();
 
     // Called by GeneratedDocs.Register() (source-generated from [LispDoc] attributes).
     internal static void SetFunctionDoc(string lispName, string docstring) =>
         _docs[(lispName, "FUNCTION")] = new LispString(docstring);
 
     // Logical pathname translations: host name (uppercase) -> list of (from to) translation rules
-    internal static readonly Dictionary<string, LispObject> _logicalPathnameTranslations = new(StringComparer.OrdinalIgnoreCase);
+    // ConcurrentDictionary: (setf logical-pathname-translations) writes this while
+    // pathname translation reads it; concurrent write corrupts a plain Dictionary.
+    internal static readonly System.Collections.Concurrent.ConcurrentDictionary<string, LispObject> _logicalPathnameTranslations = new(StringComparer.OrdinalIgnoreCase);
 
     public static LispObject LogicalPathnameTranslations(LispObject host)
     {

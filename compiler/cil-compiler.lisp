@@ -410,8 +410,11 @@
 ;;; Utilities
 ;;; ============================================================
 
-(defun gen-local (&optional (prefix "V"))
-  "Generate a unique local variable symbol in the compiler package."
+(defun gen-local (prefix)
+  "Generate a unique local variable symbol in the compiler package.
+   PREFIX is required (every call site passes one) so the lambda list stays
+   required-only and the compiler routes calls through the direct-delegate
+   fast path instead of the args-array entry."
   (intern (format nil "~a_~d" prefix (incf *var-counter*)) "DOTCL.CIL-COMPILER"))
 
 (defvar *uninterned-var-names* (make-hash-table :test #'eq)
@@ -434,8 +437,10 @@
                 (format nil "~a#:~d" (symbol-name sym)
                         (incf *uninterned-var-counter*))))))
 
-(defun gen-label (&optional (prefix "L"))
-  "Generate a unique label symbol in the compiler package."
+(defun gen-label (prefix)
+  "Generate a unique label symbol in the compiler package.
+   PREFIX is required (every call site passes one) so the lambda list stays
+   required-only and calls take the direct-delegate fast path (see GEN-LOCAL)."
   (intern (format nil "~a_~d" prefix (incf *label-counter*)) "DOTCL.CIL-COMPILER"))
 
 ;;; Precomputed "LispFunction.InvokeN" / "InvokeNativeN" method-name strings.

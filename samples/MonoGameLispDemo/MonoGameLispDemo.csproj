@@ -30,11 +30,10 @@
 
   <PropertyGroup>
 
-    <!-- project-core flow: Dotcl.targets walks .asd, compiles main.lisp,
-         writes manifest. Runtime side just calls Initialize + LoadFromManifest. -->
+    <!-- project-core flow: the DotCL.Runtime package's ProjectCore targets walk
+         the .asd, compile main.lisp, and write the manifest. The runtime side
+         just calls Initialize + LoadFromManifest. -->
     <DotclProjectAsd>$(MSBuildProjectDirectory)/MonoGameLispDemo.asd</DotclProjectAsd>
-    <DotclRuntimeProject>$(MSBuildProjectDirectory)/../../runtime/runtime.csproj</DotclRuntimeProject>
-    <DotclBaseCore>$(MSBuildProjectDirectory)/../../compiler/dotcl.core</DotclBaseCore>
   </PropertyGroup>
 
   <ItemGroup>
@@ -50,9 +49,10 @@
   </ItemGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\..\runtime\DotCL.Runtime.csproj" />
+    <!-- A published version, deliberately not bumped every release: this sample
+         demonstrates the shipping flow (PackageReference + project-core), not
+         the latest runtime. It builds against whatever it pins here. -->
+    <PackageReference Include="DotCL.Runtime" Version="0.1.18" />
   </ItemGroup>
-
-  <Import Project="..\..\runtime\build\Dotcl.targets" />
 
 </Project>

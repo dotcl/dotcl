@@ -63,11 +63,9 @@ load-test-file*
 modules[0-9]*
 sandbox/
 
-## Internal notes
-docs/*
-!docs/decisions/
-!docs/talks/
-!docs/images/
+# Non-source artifacts under docs/ (talk media, editor backups)
+docs/**/*.mp4
+docs/**/*~
 out/
 runtime/contrib/
 contrib/asdf/

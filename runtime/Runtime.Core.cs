@@ -314,8 +314,10 @@ public static partial class Runtime
     //      _ltvSlotsPerModule[moduleId][slotId].  Each FASL has a unique moduleId so
     //      cross-run LTV slot ID collisions are impossible.
     //   2. Legacy (global): FASLs compiled without module context (old FASLs, eval, compile).
-    private static readonly Dictionary<int, LispObject> _ltvSlots = new();
-    private static readonly Dictionary<string, Dictionary<int, LispObject>> _ltvSlotsPerModule = new();
+    // ConcurrentDictionary: parallel load of load-time-value-bearing FASLs writes
+    // these slot tables concurrently; a plain Dictionary corrupts under that.
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<int, LispObject> _ltvSlots = new();
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, System.Collections.Concurrent.ConcurrentDictionary<int, LispObject>> _ltvSlotsPerModule = new();
     private static int _ltvNextId;
 
     public static int AllocateLtvSlot() => Interlocked.Increment(ref _ltvNextId);
@@ -351,8 +353,8 @@ public static partial class Runtime
 
     public static void SetLtvSlotIn(string moduleId, int id, LispObject value)
     {
-        if (!_ltvSlotsPerModule.TryGetValue(moduleId, out var slots))
-            _ltvSlotsPerModule[moduleId] = slots = new Dictionary<int, LispObject>();
+        var slots = _ltvSlotsPerModule.GetOrAdd(moduleId,
+            static _ => new System.Collections.Concurrent.ConcurrentDictionary<int, LispObject>());
         slots[id] = value;
     }
 

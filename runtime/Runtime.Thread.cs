@@ -153,7 +153,11 @@ public partial class Runtime
     /// <summary>
     /// (bt:make-thread function &key name)
     /// Creates and starts a new thread running FUNCTION.
-    /// Inherits the parent thread's current dynamic binding values.
+    /// The new thread does NOT inherit the parent thread's dynamic bindings; it
+    /// sees the global (top-level) values of special variables, matching SBCL and
+    /// bordeaux-threads. (bt exposes *default-special-bindings* for opting specific
+    /// specials in; a worker that needs the parent's stream bindings must establish
+    /// them itself, as micros does via its own with-io-redirection.)
     /// </summary>
     public static LispObject MakeThread(LispObject[] args)
     {
@@ -168,16 +172,13 @@ public partial class Runtime
                 name = args[i + 1] is LispString ls ? ls.Value : args[i + 1].ToString();
         }
 
-        // Snapshot parent thread's dynamic bindings
-        var snapshot = DynamicBindings.Snapshot();
-
         LispThread? lispThread = null;
         var thread = new Thread(() =>
         {
             // Publish stable LispThread identity for (current-thread) inside this thread
             _currentLispThread = lispThread;
-            // Restore parent's bindings in the new thread
-            DynamicBindings.Restore(snapshot);
+            // The dynamic-binding stack is [ThreadStatic] and starts empty here, so
+            // special-variable reads see their global values (no parent inheritance).
             LispObject? result = null;
             // Establish a top-level ABORT restart for this worker thread, like the
             // REPL does for the main thread (Program.cs), so a concurrency library

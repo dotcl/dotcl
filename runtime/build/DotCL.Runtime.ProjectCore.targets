@@ -41,8 +41,13 @@
   <!-- The shared BeforeTargets hook list: run before output collection /
        asset-pack / Android-assets / Maui / BeforeBuild. -->
 
-  <!-- Step 1: resolve the :depends-on graph → dep fasl manifest + root sources. -->
+  <!-- Step 1: resolve the :depends-on graph → dep fasl manifest + root sources.
+       DependsOnTargets=ResolveReferences populates @(ReferenceCopyLocalPaths)
+       (and builds ProjectReferences) so their assemblies' dirs can be handed to
+       the task as assembly probe paths — that's what lets compile-time
+       (dotnet:resolve-type ...) see PackageReference / ProjectReference types. -->
   <Target Name="_DotCLResolveDeps"
+          DependsOnTargets="ResolveReferences"
           BeforeTargets="GetCopyToOutputDirectoryItems;_CollectAssetPackFiles;_GenerateAndroidAssetsDir;_CollectMauiAssetsTargetFramework;BeforeBuild"
           Condition="'$(DotclProjectAsd)' != ''"
           Inputs="$(DotclProjectAsd);@(DotclBuildInit);@(DotclAsdSearchPath)"
@@ -55,6 +60,7 @@
                       RootSourcesOut="$(DotclRootSourcesList)"
                       BuildInit="@(DotclBuildInit)"
                       AsdSearchPath="@(DotclAsdSearchPath)"
+                      ReferencePath="@(ReferenceCopyLocalPaths)"
                       RuntimeAssemblyPath="$(_DotCLRuntimeAssembly)" />
   </Target>
 
@@ -84,7 +90,7 @@
   <!-- Step 4: compile the root system's components into one fasl. Inputs are
        the .lisp sources + the .asd, so MSBuild owns the incremental decision. -->
   <Target Name="_DotCLCompileRoot"
-          DependsOnTargets="_DotCLLoadItems"
+          DependsOnTargets="_DotCLLoadItems;ResolveReferences"
           BeforeTargets="GetCopyToOutputDirectoryItems;_CollectAssetPackFiles;_GenerateAndroidAssetsDir;_CollectMauiAssetsTargetFramework;BeforeBuild"
           Condition="'$(DotclProjectAsd)' != ''"
           Inputs="@(_DotclRootSource);$(DotclProjectAsd);@(DotclBuildInit);@(DotclAsdSearchPath)"
@@ -95,6 +101,7 @@
                          ContribDir="$(_DotCLContribDir)"
                          BuildInit="@(DotclBuildInit)"
                          AsdSearchPath="@(DotclAsdSearchPath)"
+                         ReferencePath="@(ReferenceCopyLocalPaths)"
                          RuntimeAssemblyPath="$(_DotCLRuntimeAssembly)" />
   </Target>
 

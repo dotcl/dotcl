@@ -550,8 +550,8 @@ top-level の `abort` リスタートを張るので、子スレッド内のエ�
 
 **主要なファイル**: `runtime/Runtime.Misc.cs` 内の
 `ModuleProvideContrib`、配布バンドル `runtime/contrib/asdf/asdf.fasl`、
-ASDF 本体は別 fork (`github.com/dotcl/asdf`) の master ブランチを
-`make setup-asdf` で取り込む。
+ASDF 本体は別 fork (`github.com/dotcl/asdf`) の `dotcl-0.1.11` ブランチ
+(互換世代 pin ブランチ) を `make setup-asdf` で取り込む。
 
 **実装上の論点**: `.fasl` は cross-platform .NET IL なので Windows /
 Linux / macOS の x86-64 / ARM64 で同じバイナリが動く。`.fasl` 0.73s
@@ -560,6 +560,20 @@ Linux / macOS の x86-64 / ARM64 で同じバイナリが動く。`.fasl` 0.73s
 `_modulesLock` で防ぐ。`asdf/` 以下のソースを修正したら
 `make setup-asdf` → `make compile-asdf-fasl` → `make pack` で
 `.fasl` が再生成される。
+
+**ビルド時の依存解決 (project-core)**: `<PackageReference DotCL.Runtime>`
++ `<DotclProjectAsd>` を持つ MSBuild プロジェクトでは、in-process の
+ビルドタスク (`DotclHost.ResolveDeps` / `CompileProject`) が `.asd` の
+`:depends-on` を辿り、依存システムを fasl 化して同梱、root を単一 fasl に
+コンパイルしてマニフェストを書く。contrib 外の外部システムは
+`<DotclAsdSearchPath>` (ディレクトリを `asdf:*central-registry*` に push)
+または `<DotclBuildInit>` (resolve 前に走る Lisp スクリプト。`pushnew` や
+quicklisp の boot 用の escape hatch) で明示的に discoverable にする。dotcl は
+`~/quicklisp` 等を auto-scan せず `CL_SOURCE_REGISTRY` も読まない — ビルドを
+再現可能に保つため依存の指定は宣言的 (env で成果物が揺れない)。ASDF が
+コンパイルする fasl の出力先はプロジェクトの `obj/` 配下に向けており
+(既定の共有ユーザキャッシュではなく)、`dotnet clean` で消える。これにより
+再生成したソースを古いキャッシュ fasl が shadow する事故を防ぐ。
 
 **ANSI / SBCL との差分**: ASDF / Quicklisp 生態系のかなりの部分が
 SBCL 内部に依存しないなら動く (alexandria / bordeaux-threads 等は
@@ -598,9 +612,12 @@ PackageReference 型が手動 `load-assembly` なしで解決でき、生成コ�
 `typeof(...).FullName` の強制ロードを撤去できた (samples/MonoGameLispDemo)。
 CLOS dispatch では .NET 型ごとに `EnsureDotNetTypeClass` が built-in クラスを
 get-or-register し、`class-of` / `typep` / defmethod 特定化子が機能する。
-`dotnet:class-for-type` はこの登録クラスを型 (`System.Type` or 型名) から直接
-引く公開 API で、閉じたジェネリック型の長い assembly-qualified 名を綴らずに
-specializer を得られる。
+simple name (`Timer` 等) は最初に登録した型が取る早い者勝ちの対話用エイリアス
+だが、FullName (`System.Threading.Timer`) は全型で必ず登録されるので、同名の
+別型が居ても load 順に依存しない決定的な specializer になる。生成コードは
+FullName specializer を焼けば常に正しく解決する。`dotnet:class-for-type` は
+この登録クラスを型 (`System.Type` or 型名) から直接引く公開 API で、閉じた
+ジェネリック型の長い assembly-qualified 名を綴らずに specializer を得られる。
 
 **ANSI / SBCL との差分**: ANSI 範囲外の dotcl 拡張。SBCL の CFFI が
 foreign function call に閉じているのに対し、dotcl の `dotnet:` は

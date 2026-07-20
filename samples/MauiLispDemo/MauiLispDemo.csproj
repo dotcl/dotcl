@@ -29,14 +29,12 @@
 
 		<WindowsPackageType>None</WindowsPackageType>
 
-		<!-- project-core build: Dotcl.targets walks MauiLispDemo.asd's
-		     :depends-on, copies dependency fasls + dotcl.core into a bundle
-		     dir, compiles main.lisp into MauiLispDemo.fasl, writes a manifest,
-		     and injects the lot as <None>/<MauiAsset> items so they land in
-		     the published output / APK. -->
+		<!-- project-core build: the DotCL.Runtime package's ProjectCore targets
+		     walk MauiLispDemo.asd's :depends-on, copy dependency fasls +
+		     dotcl.core into a bundle dir, compile main.lisp into
+		     MauiLispDemo.fasl, write a manifest, and inject the lot as
+		     <None>/<MauiAsset> items so they land in the published output / APK. -->
 		<DotclProjectAsd>$(MSBuildProjectDirectory)/MauiLispDemo.asd</DotclProjectAsd>
-		<DotclRuntimeProject>$(MSBuildProjectDirectory)/../../runtime/runtime.csproj</DotclRuntimeProject>
-		<DotclBaseCore>$(MSBuildProjectDirectory)/../../compiler/dotcl.core</DotclBaseCore>
 	</PropertyGroup>
 
 	<!-- Platform-version pinning (split because Windows vs Android differ) -->
@@ -74,14 +72,15 @@
 		<None Remove="MauiLispDemo.asd" />
 	</ItemGroup>
 
-	<!-- dotcl runtime.
-	     - DotclAsLibrary=true: make OutputType=Library (avoids NETSDK1150 in the
-	       MAUI Android self-contained environment where an Exe reference is not allowed)
-	     - RuntimeIdentifier=: reset the RID to empty in the inner build. The runtime is
-	       pure managed, so no per-RID build is needed; MAUI reuses the no-RID
-	       runtime.dll across all RIDs. -->
+	<!-- dotcl runtime as a published package. Unlike a ProjectReference to the
+	     runtime, a PackageReference ships pre-built managed assemblies, so the
+	     old inner-build tweaks are unneeded: no NETSDK1150 (no Exe project ref in
+	     the self-contained Android build) and no per-RID reset (the package's
+	     no-RID runtime.dll is reused across RIDs). Pinned to a published version,
+	     deliberately not bumped every release — this sample shows the shipping
+	     flow, not the latest runtime. -->
 	<ItemGroup>
-		<ProjectReference Include="..\..\runtime\DotCL.Runtime.csproj" />
+		<PackageReference Include="DotCL.Runtime" Version="0.1.18" />
 	</ItemGroup>
 
 	<!-- MainPage.xaml embedded as an assembly manifest resource.
@@ -98,7 +97,5 @@
 			<LogicalName>MauiLispDemo.MainPage.xaml</LogicalName>
 		</EmbeddedResource>
 	</ItemGroup>
-
-	<Import Project="..\..\runtime\build\Dotcl.targets" />
 
 </Project>

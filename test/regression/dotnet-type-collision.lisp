@@ -42,6 +42,42 @@
     (string= (string (class-name (class-of sb))) "StringBuilder"))
   t)
 
+;;; (dotcl/dotcl#50): the FullName must be a deterministic, load-order-independent
+;;; specializer for BOTH same-simple-name types. Before the fix, only the SECOND
+;;; (losing) type got a FullName registry entry; the first (winning) type was
+;;; findable only by its simple name, so a generated FullName specializer symbol
+;;; resolved for the loser but errored/missed for the winner. Specializer symbols
+;;; for unknown names live in DOTCL-INTERNAL (what the code generator emits).
+
+;; Both types resolve by their own FullName symbol, and not by the other's.
+(deftest d492-fullname-specializer-both-types
+  (progn
+    (dotnet:%define-class "Collide.AlphaNs.Widget492")
+    (dotnet:%define-class "Collide.BetaNs.Widget492")
+    (let ((a  (dotnet:new "Collide.AlphaNs.Widget492"))
+          (b  (dotnet:new "Collide.BetaNs.Widget492"))
+          (ca (find-class (intern "Collide.AlphaNs.Widget492" :dotcl-internal) nil))
+          (cb (find-class (intern "Collide.BetaNs.Widget492" :dotcl-internal) nil)))
+      (list (and ca (typep a ca) t)
+            (and cb (typep b cb) t)
+            (and ca (typep b ca))
+            (and cb (typep a cb)))))
+  (t t nil nil))
+
+;; Registering in the reverse order gives the same result (the winner flips, but
+;; both FullName specializers still resolve correctly — that is the whole point).
+(deftest d492-fullname-specializer-reverse-order
+  (progn
+    (dotnet:%define-class "Collide.BetaNs.Cog492")
+    (dotnet:%define-class "Collide.AlphaNs.Cog492")
+    (let ((a  (dotnet:new "Collide.AlphaNs.Cog492"))
+          (b  (dotnet:new "Collide.BetaNs.Cog492"))
+          (ca (find-class (intern "Collide.AlphaNs.Cog492" :dotcl-internal) nil))
+          (cb (find-class (intern "Collide.BetaNs.Cog492" :dotcl-internal) nil)))
+      (list (and ca (typep a ca) t)
+            (and cb (typep b cb) t))))
+  (t t))
+
 ;;; (part2): expose the boxed hint type and the actual instance type.
 ;;; dotnet:box keeps a user-supplied static hint type for overload resolution,
 ;;; while the wrapped value's real type may differ. dotnet:hint-type returns the

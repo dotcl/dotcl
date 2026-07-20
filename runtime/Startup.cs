@@ -1372,6 +1372,12 @@ public static class Startup
             var pbtFn = new LispFunction(Runtime.PrintBacktrace);
             RegisterDotcl("PRINT-BACKTRACE", pbtFn);
             Emitter.CilAssembler.RegisterFunction("DOTCL:PRINT-BACKTRACE", pbtFn);
+            var fslFn = new LispFunction(Runtime.FunctionSourceLocation, "DOTCL:FUNCTION-SOURCE-LOCATION", -1);
+            RegisterDotcl("FUNCTION-SOURCE-LOCATION", fslFn);
+            Emitter.CilAssembler.RegisterFunction("DOTCL:FUNCTION-SOURCE-LOCATION", fslFn);
+            var rdsFn = new LispFunction(Runtime.RecordDefinitionSourcesForm, "DOTCL:RECORD-DEFINITION-SOURCES", -1);
+            RegisterDotcl("RECORD-DEFINITION-SOURCES", rdsFn);
+            Emitter.CilAssembler.RegisterFunction("DOTCL:RECORD-DEFINITION-SOURCES", rdsFn);
         }
         {
             // Weak pointers — real GC weakness via System.WeakReference.

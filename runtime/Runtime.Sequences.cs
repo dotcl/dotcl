@@ -752,6 +752,35 @@ public static partial class Runtime
                 if (obj is Number nd) return new DoubleFloat(Arithmetic.ToDouble(nd));
                 throw new LispErrorException(new LispTypeError("COERCE: cannot coerce to double-float", obj));
 
+            case "DECIMAL":
+                // dotcl:decimal — a distinct exactness category. Exact reals (integer,
+                // ratio) convert exactly or signal (a denominator with a prime factor
+                // other than 2/5, e.g. 1/3, is not representable — no silent rounding).
+                // A float is the explicit escape hatch out of the decimal/float mixing
+                // ban, so coercing one imports its value via the .NET decimal cast (lossy
+                // by nature of the source, ~15 significant digits).
+                if (obj is LispDecimal) return obj;
+                if (obj is Fixnum dfx) return new LispDecimal((decimal)dfx.Value);
+                if (obj is Bignum dbn)
+                {
+                    if (dbn.Value < DecimalMinInt || dbn.Value > DecimalMaxInt)
+                        throw new LispErrorException(new LispTypeError("COERCE: value out of System.Decimal range", obj));
+                    return new LispDecimal((decimal)dbn.Value);
+                }
+                if (obj is Ratio drt)
+                    return new LispDecimal(RationalToDecimalExact(drt.Numerator, drt.Denominator, obj));
+                if (obj is SingleFloat dsf)
+                {
+                    try { return new LispDecimal((decimal)dsf.Value); }
+                    catch (OverflowException) { throw new LispErrorException(new LispTypeError("COERCE: value not representable as System.Decimal", obj)); }
+                }
+                if (obj is DoubleFloat ddf)
+                {
+                    try { return new LispDecimal((decimal)ddf.Value); }
+                    catch (OverflowException) { throw new LispErrorException(new LispTypeError("COERCE: value not representable as System.Decimal", obj)); }
+                }
+                throw new LispErrorException(new LispTypeError("COERCE: cannot coerce to decimal", obj));
+
             case "VECTOR":
                 // Any LispVector or LispString satisfies VECTOR — return as-is
                 if (obj is LispVector || obj is LispString) return obj;
@@ -928,9 +957,19 @@ public static partial class Runtime
     {
         if (args.Length < 2)
             throw new LispErrorException(new LispProgramError("FIND: too few arguments"));
-        var item = args[0];
-        var seq = args[1];
-        var kw = ParseSeqKwArgs(args, 2, "FIND");
+        return FindCore(args[0], args[1], ParseSeqKwArgs(args, 2, "FIND"));
+    }
+
+    // 6-arg direct entry: (find item seq k1 v1 k2 v2) — two keyword pairs, e.g.
+    // (find name l :key #'symbol-name :test #'string=), which the compiler runs
+    // per special/local-function lookup. Shared parser over a 4-element array;
+    // the InvokeSlow path's 6-element args array is skipped. See Member6.
+    public static LispObject Find6(LispObject item, LispObject seq,
+                                   LispObject k1, LispObject v1, LispObject k2, LispObject v2) =>
+        FindCore(item, seq, ParseSeqKwArgs(new[] { k1, v1, k2, v2 }, 0, "FIND"));
+
+    private static LispObject FindCore(LispObject item, LispObject seq, in SeqKwArgs kw)
+    {
         int len = seq is LispVector v ? v.Length : seq is LispString ls ? ls.Length : (int)((Fixnum)Length(seq)).Value;
         int start = kw.Start;
         int end = kw.End ?? len;
@@ -985,8 +1024,17 @@ public static partial class Runtime
         if (args.Length < 2)
             throw new LispErrorException(new LispProgramError("FIND-IF: too few arguments"));
         var predFn = CoerceToFunction(args[0]);
-        var seq = args[1];
-        var kw = ParseSeqKwArgs(args, 2, "FIND-IF");
+        return FindIfCore(predFn, args[1], ParseSeqKwArgs(args, 2, "FIND-IF"));
+    }
+
+    // 2-arg direct entry: (find-if pred seq) — no keywords. Skips the args array
+    // and the ParseSeqKwArgs scan (a default SeqKwArgs is exactly its zero-keyword
+    // result). See RemoveIf2.
+    public static LispObject FindIf2(LispObject pred, LispObject seq) =>
+        FindIfCore(CoerceToFunction(pred), seq, new SeqKwArgs());
+
+    private static LispObject FindIfCore(LispFunction predFn, LispObject seq, in SeqKwArgs kw)
+    {
         int len = seq is LispVector v ? v.Length : seq is LispString ls ? ls.Length : (int)((Fixnum)Length(seq)).Value;
         int start = kw.Start;
         int end = kw.End ?? len;
@@ -1363,6 +1411,14 @@ public static partial class Runtime
     public static LispObject Member4(LispObject item, LispObject list, LispObject k, LispObject v) =>
         MemberCore(item, list, ParseListKwArgs(new[] { k, v }, 0, "MEMBER"));
 
+    // 6-arg direct entry: (member item list k1 v1 k2 v2) — two keyword pairs,
+    // e.g. (member x l :key #'symbol-name :test #'string=), which the compiler's
+    // special-variable lookup performs per variable reference. Same shared parser
+    // over a 4-element array; the InvokeSlow path's 6-element args array is skipped.
+    public static LispObject Member6(LispObject item, LispObject list,
+                                     LispObject k1, LispObject v1, LispObject k2, LispObject v2) =>
+        MemberCore(item, list, ParseListKwArgs(new[] { k1, v1, k2, v2 }, 0, "MEMBER"));
+
     private static LispObject MemberCore(LispObject item, LispObject list, in ListKwArgs kw)
     {
         if (list is Nil) return Nil.Instance;
@@ -1457,6 +1513,12 @@ public static partial class Runtime
 
     public static LispObject Assoc4(LispObject item, LispObject alist, LispObject k, LispObject v) =>
         AssocCore(item, alist, ParseListKwArgs(new[] { k, v }, 0, "ASSOC"));
+
+    // 6-arg direct entry: (assoc item alist k1 v1 k2 v2) — two keyword pairs.
+    // See Member6.
+    public static LispObject Assoc6(LispObject item, LispObject alist,
+                                    LispObject k1, LispObject v1, LispObject k2, LispObject v2) =>
+        AssocCore(item, alist, ParseListKwArgs(new[] { k1, v1, k2, v2 }, 0, "ASSOC"));
 
     private static LispObject AssocCore(LispObject item, LispObject alist, in ListKwArgs kw)
     {
@@ -1725,6 +1787,17 @@ public static partial class Runtime
         return RemoveCore(seq, kw, (elem) => SeqTestMatch(item, elem, kw));
     }
 
+    // 2-arg direct entry: (remove item seq) — no keywords, default EQL test.
+    // Skips the args array and the ParseSeqKwArgs scan (a default SeqKwArgs is
+    // exactly its zero-keyword result). See RemoveIf2.
+    public static LispObject Remove2(LispObject item, LispObject seq)
+    {
+        if (seq is not Nil && seq is not Cons && seq is not LispVector && seq is not LispString)
+            throw new LispErrorException(new LispTypeError("REMOVE: not a sequence", seq));
+        var kw = new SeqKwArgs();
+        return RemoveCore(seq, kw, (elem) => SeqTestMatch(item, elem, kw));
+    }
+
     // REMOVE-IF: (remove-if predicate sequence &key key count from-end start end)
     public static LispObject RemoveIf(LispObject[] args)
     {
@@ -1734,11 +1807,40 @@ public static partial class Runtime
         var seq = args[1];
         if (seq is not Nil && seq is not Cons && seq is not LispVector && seq is not LispString)
             throw new LispErrorException(new LispTypeError("REMOVE-IF: not a sequence", seq));
-        var kw = ParseSeqKwArgs(args, 2, "REMOVE-IF");
+        return RemoveIfCore(predFn, seq, ParseSeqKwArgs(args, 2, "REMOVE-IF"));
+    }
+
+    // 2-arg direct entry: (remove-if pred seq) — no keywords. The compiler calls
+    // this shape frequently (bound-name filtering). Skips the args array and the
+    // ParseSeqKwArgs scan; a default SeqKwArgs is exactly ParseSeqKwArgs's zero-
+    // keyword result (all fields default).
+    public static LispObject RemoveIf2(LispObject pred, LispObject seq)
+    {
+        var predFn = CoerceToFunction(pred);
+        if (seq is not Nil && seq is not Cons && seq is not LispVector && seq is not LispString)
+            throw new LispErrorException(new LispTypeError("REMOVE-IF: not a sequence", seq));
+        return RemoveIfCore(predFn, seq, new SeqKwArgs());
+    }
+
+    // 2-arg direct entry: (remove-if-not pred seq) — no keywords. Inverts the
+    // predicate inline (negate: true) rather than allocating a negating wrapper
+    // LispFunction the way the args-array registration does, so both the args
+    // array and the per-element wrapper InvokeSlow are avoided. See RemoveIf2.
+    public static LispObject RemoveIfNot2(LispObject pred, LispObject seq)
+    {
+        var predFn = CoerceToFunction(pred);
+        if (seq is not Nil && seq is not Cons && seq is not LispVector && seq is not LispString)
+            throw new LispErrorException(new LispTypeError("REMOVE-IF-NOT: not a sequence", seq));
+        return RemoveIfCore(predFn, seq, new SeqKwArgs(), negate: true);
+    }
+
+    private static LispObject RemoveIfCore(LispFunction predFn, LispObject seq, SeqKwArgs kw, bool negate = false)
+    {
         var result = RemoveCore(seq, kw, (elem) =>
         {
             var val = ApplySeqKey(kw, elem);
-            return IsTruthy(predFn.Invoke1(val));
+            var t = IsTruthy(predFn.Invoke1(val));
+            return negate ? !t : t;
         });
         // The last predicate call may have left secondary values in the MV register
         // (e.g. a predicate calling SUBTYPEP, which returns two values). REMOVE-IF
@@ -1758,6 +1860,17 @@ public static partial class Runtime
         if (seq is not Nil && seq is not Cons && seq is not LispVector && seq is not LispString)
             throw new LispErrorException(new LispTypeError("DELETE: not a sequence", seq));
         var kw = ParseSeqKwArgs(args, 2, "DELETE");
+        return RemoveCore(seq, kw, (elem) => SeqTestMatch(item, elem, kw), destructive: true);
+    }
+
+    // 4-arg direct entry: (delete item seq kw val) — one keyword pair (e.g.
+    // :test #'eq). Pure addition (DeleteFull unchanged); shared parser over a
+    // 2-element array. See Remove2 / Member4.
+    public static LispObject Delete4(LispObject item, LispObject seq, LispObject k, LispObject v)
+    {
+        if (seq is not Nil && seq is not Cons && seq is not LispVector && seq is not LispString)
+            throw new LispErrorException(new LispTypeError("DELETE: not a sequence", seq));
+        var kw = ParseSeqKwArgs(new[] { k, v }, 0, "DELETE");
         return RemoveCore(seq, kw, (elem) => SeqTestMatch(item, elem, kw), destructive: true);
     }
 
@@ -2638,10 +2751,12 @@ public static partial class Runtime
         Emitter.CilAssembler.RegisterFunction("FILL",
             new LispFunction(args => Runtime.Fill(args)));
         // FIND, FIND-IF, FIND-IF-NOT
-        Emitter.CilAssembler.RegisterFunction("FIND",
-            new LispFunction(args => Runtime.Find(args)));
-        Emitter.CilAssembler.RegisterFunction("FIND-IF",
-            new LispFunction(args => Runtime.FindIf(args)));
+        var findFn = new LispFunction(args => Runtime.Find(args));
+        findFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject>)Runtime.Find6);
+        Emitter.CilAssembler.RegisterFunction("FIND", findFn);
+        var findIfFn = new LispFunction(args => Runtime.FindIf(args));
+        findIfFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject>)Runtime.FindIf2);
+        Emitter.CilAssembler.RegisterFunction("FIND-IF", findIfFn);
         Emitter.CilAssembler.RegisterFunction("FIND-IF-NOT",
             new LispFunction(args =>
             {
@@ -2676,6 +2791,7 @@ public static partial class Runtime
         var memberFn = new LispFunction(args => Runtime.MemberFull(args));
         memberFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject>)Runtime.Member2);
         memberFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject, LispObject, LispObject>)Runtime.Member4);
+        memberFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject>)Runtime.Member6);
         Emitter.CilAssembler.RegisterFunction("MEMBER", memberFn);
         Emitter.CilAssembler.RegisterFunction("MEMBER-IF",
             new LispFunction(args => Runtime.MemberIf(args)));
@@ -2692,6 +2808,7 @@ public static partial class Runtime
         var assocFn = new LispFunction(args => Runtime.AssocFull(args));
         assocFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject>)Runtime.Assoc2);
         assocFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject, LispObject, LispObject>)Runtime.Assoc4);
+        assocFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject>)Runtime.Assoc6);
         Emitter.CilAssembler.RegisterFunction("ASSOC", assocFn);
         Emitter.CilAssembler.RegisterFunction("ASSOC-IF",
             new LispFunction(args => Runtime.AssocIf(args)));
@@ -2719,22 +2836,26 @@ public static partial class Runtime
                 return Runtime.RassocIf(newArgs);
             }));
         // REMOVE, REMOVE-IF, REMOVE-IF-NOT
-        Emitter.CilAssembler.RegisterFunction("REMOVE",
-            new LispFunction(args => Runtime.RemoveFull(args)));
-        Emitter.CilAssembler.RegisterFunction("REMOVE-IF",
-            new LispFunction(args => Runtime.RemoveIf(args)));
-        Emitter.CilAssembler.RegisterFunction("REMOVE-IF-NOT",
-            new LispFunction(args =>
+        var removeFn = new LispFunction(args => Runtime.RemoveFull(args));
+        removeFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject>)Runtime.Remove2);
+        Emitter.CilAssembler.RegisterFunction("REMOVE", removeFn);
+        var removeIfFn = new LispFunction(args => Runtime.RemoveIf(args));
+        removeIfFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject>)Runtime.RemoveIf2);
+        Emitter.CilAssembler.RegisterFunction("REMOVE-IF", removeIfFn);
+        var removeIfNotFn = new LispFunction(args =>
             {
                 var predFn = Runtime.CoerceToFunction(args[0]);
                 var newArgs = new LispObject[args.Length];
                 Array.Copy(args, newArgs, args.Length);
                 newArgs[0] = new LispFunction(a => Runtime.IsTruthy(predFn.Invoke(a)) ? Nil.Instance : T.Instance);
                 return Runtime.RemoveIf(newArgs);
-            }));
+            });
+        removeIfNotFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject>)Runtime.RemoveIfNot2);
+        Emitter.CilAssembler.RegisterFunction("REMOVE-IF-NOT", removeIfNotFn);
         // DELETE, DELETE-IF, DELETE-IF-NOT — destructive on list args.
-        Emitter.CilAssembler.RegisterFunction("DELETE",
-            new LispFunction(args => Runtime.DeleteFull(args)));
+        var deleteFn = new LispFunction(args => Runtime.DeleteFull(args));
+        deleteFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject, LispObject, LispObject>)Runtime.Delete4);
+        Emitter.CilAssembler.RegisterFunction("DELETE", deleteFn);
         Emitter.CilAssembler.RegisterFunction("DELETE-IF",
             new LispFunction(args => Runtime.DeleteIf(args)));
         Emitter.CilAssembler.RegisterFunction("DELETE-IF-NOT",

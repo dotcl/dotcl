@@ -59,10 +59,11 @@
     </Content>
   </ItemGroup>
 
-  <!-- Only Program.cs — all runtime sources live in DotCL.Runtime.csproj -->
+  <!-- Only the CLI sources — all runtime sources live in DotCL.Runtime.csproj -->
   <ItemGroup>
     <Compile Remove="**/*.cs" />
     <Compile Include="Program.cs" />
+    <Compile Include="PackRestamp.cs" />
   </ItemGroup>
 
   <ItemGroup>

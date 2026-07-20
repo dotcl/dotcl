@@ -126,13 +126,11 @@ class Program
         }
 
         // --help / --version: handled before core loading for fast response.
-        // Skip for save-application :executable t outputs — those embed a
-        // "dotcl.user.fasl" manifest resource and handle their own --help.
-        bool hasEmbeddedFasl =
-            typeof(Program).Assembly
-                .GetManifestResourceStream("dotcl.user.fasl") != null;
+        // Skipped when a user FASL is present — then this executable IS an
+        // application and every argument belongs to it (see HasUserFasl).
+        bool hasUserFasl = HasUserFasl();
 
-        if (!hasEmbeddedFasl && args.Any(a => a == "--help"))
+        if (!hasUserFasl && args.Any(a => a == "--help"))
         {
             Console.WriteLine(@"dotcl [options] [script-file [arguments...]]
 
@@ -159,17 +157,31 @@ Options:
 Subcommands:
   repl                         Start REPL (even with --load/--eval)
   build <asd> --output <fasl>  Compile an ASDF system to a fasl
+  pack --system <name> ...     Package an ASDF system as a dotnet tool nupkg,
+                               built by restamping the published dotcl tool
+                               packages in --from
+                               (--id <pkgid> --command <cmd> --version <ver>
+                               -o <dir> --from <dir> [--dotcl-version <ver>]
+                               [--toplevel <fn>] [--bundle <dir>]
+                               [--rids <csv>] [--dry-run])
 
 Example:
   dotcl hello.lisp arg1 arg2
   dotcl --eval ""(format t \""hi~%\"")""
   dotcl build MyApp.asd --output obj/MyApp.fasl
+  dotcl pack --system myapp/exe --id myapp --command myapp \
+             --version 0.1.0 -o out/ --from ~/dotcl-nupkgs/
 
 Build-tooling flags (--resolve-deps / --compile-project / etc.) are internal
 and invoked by the MSBuild integration; they are intentionally omitted here.");
             return;
         }
-        if (!hasEmbeddedFasl && args.Any(a => a == "--version"))
+        // `pack` takes --version as the produced package's version, so don't let
+        // the global "print dotcl's version" handler swallow it in that subcommand.
+        // (Guard on presence, not args[0]: leading globals like --core can precede
+        // the subcommand token.)
+        if (!hasUserFasl && args.Any(a => a == "--version")
+            && !args.Contains("pack"))
         {
             var version = typeof(Program).Assembly
                 .GetCustomAttribute<System.Reflection.AssemblyInformationalVersionAttribute>()
@@ -179,20 +191,24 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
         }
 
         // --completion <shell>: emit shell completion script and exit. Handled
-        // before core loading so it stays fast (no Lisp init).
-        for (int ci = 0; ci < args.Length; ci++)
+        // before core loading so it stays fast (no Lisp init). Completions
+        // describe dotcl's own CLI, so an app built on it must not answer them.
+        if (!hasUserFasl)
         {
-            if (args[ci] == "--completion")
+            for (int ci = 0; ci < args.Length; ci++)
             {
-                var shell = ci + 1 < args.Length ? args[ci + 1] : "pwsh";
-                Environment.Exit(CliCompletion.Emit(shell));
-                return;
+                if (args[ci] == "--completion")
+                {
+                    var shell = ci + 1 < args.Length ? args[ci + 1] : "pwsh";
+                    Environment.Exit(CliCompletion.Emit(shell));
+                    return;
+                }
             }
         }
 
         // --asm: legacy behavior (run .sil directly, load additional scripts, exit)
         // Used by test-a2 and Makefile targets. No REPL, no core auto-discovery.
-        if (args.Length >= 2 && args[0] == "--asm")
+        if (!hasUserFasl && args.Length >= 2 && args[0] == "--asm")
         {
             try
             {
@@ -278,7 +294,7 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
         //       --target-rid prefers <dir>/<name>-r2r-<rid>.fasl when present.
         // The flags below are build-internal and intentionally absent from
         // --help / completion.
-        bool buildMode = rest.Count > 0 && rest[0] == "build";
+        bool buildMode = !hasUserFasl && rest.Count > 0 && rest[0] == "build";
         string? buildAsd = null;
         string? buildOutput = null;
         bool buildResolveDeps = false;
@@ -304,15 +320,51 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
             }
         }
 
+        // `pack` subcommand — package an ASDF system as a dotnet-tool nupkg
+        //   dotcl pack --system <name> --id <pkgid> --command <cmd>
+        //              --version <ver> -o <dir> --from <dotcl-nupkg-dir>
+        //              [--dotcl-version <ver>] [--toplevel <fn>]
+        //              [--bundle <dir>] [--rids <csv>] [--no-android] [--dry-run]
+        // Concatenate+compile the system to a single fasl (as `build`), then
+        // restamp the published dotcl tool packages in --from into the app's
+        // own base pointer + per-RID packages with that fasl injected.
+        bool packMode = !hasUserFasl && rest.Count > 0 && rest[0] == "pack";
+        var pack = new PackOptions();
+        if (packMode)
+        {
+            rest.RemoveAt(0);
+            for (int i = 0; i < rest.Count; i++)
+            {
+                var a = rest[i];
+                if (a == "--system" && i + 1 < rest.Count) pack.System = rest[++i];
+                else if (a == "--id" && i + 1 < rest.Count) pack.Id = rest[++i];
+                else if (a == "--command" && i + 1 < rest.Count) pack.Command = rest[++i];
+                else if (a == "--version" && i + 1 < rest.Count) pack.Version = rest[++i];
+                else if ((a == "-o" || a == "--output") && i + 1 < rest.Count) pack.Output = rest[++i];
+                else if (a == "--toplevel" && i + 1 < rest.Count) pack.Toplevel = rest[++i];
+                else if (a == "--bundle" && i + 1 < rest.Count) pack.Bundle = rest[++i];
+                else if (a == "--rids" && i + 1 < rest.Count) pack.Rids = rest[++i];
+                else if (a == "--from" && i + 1 < rest.Count) pack.From = rest[++i];
+                else if (a == "--dotcl-version" && i + 1 < rest.Count) pack.DotclVersion = rest[++i];
+                else if (a == "--no-android") pack.NoAndroid = true;
+                else if (a == "--dry-run") pack.DryRun = true;
+                else if (a == "--asd-search-path" && i + 1 < rest.Count) pack.SearchPaths.Add(rest[++i]);
+                else if (!a.StartsWith('-') && pack.Asd == null) pack.Asd = a;
+            }
+        }
+
         // Extract "repl" subcommand
         bool explicitRepl = false;
-        for (int i = 0; i < rest.Count; i++)
+        if (!hasUserFasl)
         {
-            if (rest[i] == "repl")
+            for (int i = 0; i < rest.Count; i++)
             {
-                explicitRepl = true;
-                rest.RemoveAt(i);
-                break;
+                if (rest[i] == "repl")
+                {
+                    explicitRepl = true;
+                    rest.RemoveAt(i);
+                    break;
+                }
             }
         }
 
@@ -437,6 +489,12 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
                 Environment.Exit(1);
             }
             return;
+        }
+
+        // `pack` subcommand dispatch: build the user fasl, then restamp.
+        if (packMode)
+        {
+            Environment.Exit(RunPack(pack));
         }
 
         // Positional script mode: `dotcl file.lisp [args...]`. Any preceding
@@ -674,34 +732,196 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
         }
     }
 
+    /// <summary>Options for the `pack` subcommand (dotcl pack ...).</summary>
+    sealed class PackOptions
+    {
+        public string? System;    // ASDF system name (e.g. "myapp/exe")
+        public string? Id;        // nupkg / tool package id
+        public string? Command;   // tool command name (installed executable)
+        public string? Version;   // produced package version
+        public string? Output;    // output directory (-o / --output)
+        public string? Toplevel;  // optional entry fn to synthesize a launcher
+        public string? Bundle;    // optional extra-files bundle dir (DotclAppBundle)
+        public string? Rids;      // optional RID list override (comma/semicolon)
+        public string? Asd;       // optional explicit .asd path (else from System)
+        public string? From;      // dir holding the published dotcl.* nupkgs to restamp
+        public string? DotclVersion; // which dotcl version in --from (else inferred)
+        public bool NoAndroid = true;   // desktop RIDs only (release default)
+        public bool DryRun;
+        public readonly List<string> SearchPaths = new();
+    }
+
     /// <summary>
-    /// Check for an embedded "dotcl.user.fasl" manifest resource — present only
-    /// in exes produced by dotcl:save-application with :executable t. When found,
-    /// loads the embedded PE/FASL via Assembly.Load and invokes its ModuleInit.
-    /// Returns true if a resource was present and run; false otherwise.
+    /// `pack` subcommand: turn an ASDF system into a set of dotnet-tool nupkgs.
+    /// Step 1 concatenates the system and its dependencies into a single fasl;
+    /// step 2 restamps the published dotcl tool packages found in --from into
+    /// the app's own id / version / command with that fasl injected (see
+    /// PackRestamp). Returns a process exit code (0 ok, 1 failure, 2 usage).
     /// </summary>
+    static int RunPack(PackOptions o)
+    {
+        var missing = new List<string>();
+        if (string.IsNullOrEmpty(o.System)) missing.Add("--system");
+        if (string.IsNullOrEmpty(o.Id)) missing.Add("--id");
+        if (string.IsNullOrEmpty(o.Command)) missing.Add("--command");
+        if (string.IsNullOrEmpty(o.Version)) missing.Add("--version");
+        if (string.IsNullOrEmpty(o.Output)) missing.Add("-o/--output");
+        if (string.IsNullOrEmpty(o.From)) missing.Add("--from");
+        if (missing.Count > 0)
+        {
+            Console.Error.WriteLine($"pack: missing required option(s): {string.Join(", ", missing)}");
+            Console.Error.WriteLine("usage: dotcl pack --system <name> --id <pkgid> --command <cmd> --version <ver> -o <dir> --from <dotcl-nupkg-dir>");
+            return 2;
+        }
+
+        // Default RID set: 6 desktop RIDs + `any` fallback (android excluded).
+        var rids = (!string.IsNullOrEmpty(o.Rids)
+                ? o.Rids!.Replace(';', ',')
+                : "win-x64,win-arm64,linux-x64,linux-arm64,osx-x64,osx-arm64,any")
+            .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .ToList();
+
+        string faslPath = System.IO.Path.Combine(o.Output!, "obj",
+            o.System!.Replace('/', '_').Replace('\\', '_') + ".fasl");
+
+        if (o.DryRun)
+        {
+            try
+            {
+                var planned = PackRestamp.Run(o.From!, o.DotclVersion, o.Id!, o.Command!,
+                                              o.Version!, faslPath, o.Bundle, rids,
+                                              o.Output!, dryRun: true);
+                Console.WriteLine($"pack: would build user fasl  {faslPath}");
+                foreach (var p in planned) Console.WriteLine($"pack: would write  {p}");
+                return 0;
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"pack: {ex.Message}");
+                return 1;
+            }
+        }
+
+        // Step 1: build the self-contained user FASL from the ASDF system. The
+        // asd is located via the source registry + any --asd-search-path dirs
+        // (extracted globally before subcommand parsing, so read them here).
+        var searchPaths = Runtime.UserAsdSearchPaths.Count > 0
+            ? Runtime.UserAsdSearchPaths.ToArray() : null;
+        try
+        {
+            Console.Error.WriteLine($"[pack] system '{o.System}' -> {faslPath}");
+            DotclHost.PackFasl(o.System!, faslPath, o.Toplevel, null, searchPaths);
+        }
+        catch (LispSourceException lse)
+        {
+            Console.Error.WriteLine(lse.FormatMsBuildDiagnostic());
+            return 1;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"pack: fasl build failed: {ex.Message}");
+            if (Startup.DebugStacktrace) Console.Error.WriteLine(ex.StackTrace);
+            return 1;
+        }
+        Console.WriteLine($"pack: built user fasl  {faslPath}");
+
+        // Step 2: restamp the published dotcl tool packages into this app's.
+        List<string> produced;
+        try
+        {
+            produced = PackRestamp.Run(o.From!, o.DotclVersion, o.Id!, o.Command!, o.Version!,
+                                       faslPath, o.Bundle, rids, o.Output!, dryRun: false);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"pack: restamp failed: {ex.Message}");
+            if (Startup.DebugStacktrace) Console.Error.WriteLine(ex.StackTrace);
+            return 1;
+        }
+
+        foreach (var p in produced) Console.WriteLine($"pack: wrote  {p}");
+        Console.WriteLine($"pack: id={o.Id} command={o.Command} version={o.Version} "
+                          + $"rids={string.Join(",", rids)}");
+        return 0;
+    }
+
+    /// <summary>
+    /// Run a user FASL if one is present, then signal the caller to exit. Two
+    /// sources, in order:
+    ///   1. An embedded "dotcl.user.fasl" manifest resource — exes produced by
+    ///      dotcl:save-application with :executable t.
+    ///   2. A loose "dotcl.user.fasl" file next to the executable — the
+    ///      `dotcl pack` restamp path drops the fasl into the tool package's
+    ///      tools/net10.0/&lt;rid&gt;/ dir (alongside runtime.exe) rather than
+    ///      embedding it in the assembly, since a published nupkg is restamped,
+    ///      not rebuilt. Either way the FASL is a PE assembly whose
+    ///      CompiledModule.ModuleInit is invoked. Returns true if one was found
+    ///      and run; false otherwise.
+    /// </summary>
+    /// <summary>
+    /// True when this executable carries a user FASL, in either shape that
+    /// TryRunEmbeddedUserFasl accepts: an embedded "dotcl.user.fasl" manifest
+    /// resource (save-application :executable t) or a loose file next to the
+    /// executable (`dotcl pack`). Such an executable IS the application, not
+    /// the dotcl CLI, so every argument belongs to the app: dotcl's own flags
+    /// (--help / --version / --completion / --asm) and subcommands (build /
+    /// pack / repl) must all stand down. Otherwise an app that legitimately
+    /// defines those names — roswell has its own `ros build` and `ros --version`
+    /// — would have them silently answered by dotcl instead.
+    ///
+    /// Must agree with TryRunEmbeddedUserFasl about what counts as present: if
+    /// this says no and that says yes, dotcl eats the app's arguments.
+    /// </summary>
+    static bool HasUserFasl()
+    {
+        using (var stream = typeof(Program).Assembly
+                   .GetManifestResourceStream("dotcl.user.fasl"))
+        {
+            if (stream != null) return true;
+        }
+        return System.IO.File.Exists(
+            System.IO.Path.Combine(AppContext.BaseDirectory, "dotcl.user.fasl"));
+    }
+
     static bool TryRunEmbeddedUserFasl()
     {
         var selfAsm = typeof(Program).Assembly;
-        using var stream = selfAsm.GetManifestResourceStream("dotcl.user.fasl");
-        if (stream == null) return false;
+        using (var stream = selfAsm.GetManifestResourceStream("dotcl.user.fasl"))
+        {
+            if (stream != null)
+            {
+                using var ms = new MemoryStream();
+                stream.CopyTo(ms);
+                RunUserFaslBytes(ms.ToArray(), "embedded dotcl.user.fasl");
+                return true;
+            }
+        }
 
-        using var ms = new MemoryStream();
-        stream.CopyTo(ms);
-        var userAsm = System.Reflection.Assembly.Load(ms.ToArray());
+        var loosePath = System.IO.Path.Combine(AppContext.BaseDirectory, "dotcl.user.fasl");
+        if (System.IO.File.Exists(loosePath))
+        {
+            RunUserFaslBytes(System.IO.File.ReadAllBytes(loosePath), loosePath);
+            return true;
+        }
+        return false;
+    }
+
+    /// <summary>Load a user FASL (PE assembly bytes) and invoke its
+    /// CompiledModule.ModuleInit, preserving *package* across the run.
+    /// <paramref name="what"/> names the source for diagnostics.</summary>
+    static void RunUserFaslBytes(byte[] bytes, string what)
+    {
+        var userAsm = System.Reflection.Assembly.Load(bytes);
         var t = userAsm.GetType("CompiledModule")
-            ?? throw new InvalidOperationException(
-                "embedded dotcl.user.fasl: CompiledModule type not found");
+            ?? throw new InvalidOperationException($"{what}: CompiledModule type not found");
         var mi = t.GetMethod("ModuleInit",
             System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static)
-            ?? throw new InvalidOperationException(
-                "embedded dotcl.user.fasl: ModuleInit method not found");
+            ?? throw new InvalidOperationException($"{what}: ModuleInit method not found");
 
         var packageSym = Startup.Sym("*PACKAGE*");
         var oldPackage = DynamicBindings.Get(packageSym);
         try { mi.Invoke(null, null); }
         finally { DynamicBindings.Set(packageSym, oldPackage); }
-        return true;
     }
 
     /// <summary>Load a pre-compiled FASL core (PE assembly) and invoke its ModuleInit.</summary>
