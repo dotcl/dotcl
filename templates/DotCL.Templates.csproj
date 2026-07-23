@@ -1,0 +1,34 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Packs the dotnet-new templates under this directory into a template
+       package. Install with `dotnet new install DotCL.Templates`, then create a
+       project with `dotnet new dotcl-app`. Version tracks the runtime release
+       (set -p:Version=<ver> in the release build). -->
+  <PropertyGroup>
+    <PackageType>Template</PackageType>
+    <PackageId>DotCL.Templates</PackageId>
+    <Title>dotcl project templates</Title>
+    <Authors>SANO Masatoshi</Authors>
+    <Description>dotnet new templates for Common Lisp on .NET (dotcl): a console app you can build, run, and F5-debug in Visual Studio.</Description>
+    <PackageProjectUrl>https://github.com/dotcl/dotcl</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/dotcl/dotcl.git</RepositoryUrl>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageTags>dotnet-new;templates;common-lisp;lisp;dotcl</PackageTags>
+
+    <TargetFramework>netstandard2.0</TargetFramework>
+    <IncludeContentInPack>true</IncludeContentInPack>
+    <IncludeBuildOutput>false</IncludeBuildOutput>
+    <ContentTargetFolders>content</ContentTargetFolders>
+    <!-- Templates carry no assembly; NU5128 warns about the missing lib/ folder. -->
+    <NoWarn>$(NoWarn);NU5128</NoWarn>
+    <!-- Keep .template.config (a dot-prefixed dir) in the pack. -->
+    <NoDefaultExcludes>true</NoDefaultExcludes>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Content Include="dotcl-app\**\*" Exclude="**\bin\**;**\obj\**" />
+    <Compile Remove="**\*" />
+  </ItemGroup>
+
+</Project>

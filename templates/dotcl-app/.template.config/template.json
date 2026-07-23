@@ -1,0 +1,21 @@
+{
+  "$schema": "http://json.schemastore.org/template",
+  "author": "dotcl",
+  "classifications": [ "Console", "Windows", "Linux", "macOS" ],
+  "identity": "DotCL.ConsoleApp",
+  "name": "Common Lisp Console App",
+  "description": "A Common Lisp console app on .NET (dotcl).",
+  "shortName": "dotcl-app",
+  "sourceName": "DotclApp",
+  "tags": { "language": "Common Lisp", "type": "project" },
+  "symbols": {
+    "DotclRuntimeVersion": {
+      "type": "parameter",
+      "datatype": "string",
+      "defaultValue": "0.1.20",
+      "replaces": "DOTCL_RUNTIME_VERSION",
+      "description": "Version of the DotCL.Runtime NuGet package to reference."
+    }
+  },
+  "preferNameDirectory": true
+}

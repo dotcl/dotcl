@@ -3,6 +3,10 @@ runtime/bin/
 runtime/obj/
 runtime/build-tasks/bin/
 runtime/build-tasks/obj/
+runtime/sdk/bin/
+runtime/sdk/obj/
+test/debug-pdb/pdbcheck/bin/
+test/debug-pdb/pdbcheck/obj/
 output/
 
 ## Generated
@@ -32,6 +36,7 @@ bench-state.json
 # …but committed tooling scripts are kept.
 !scripts/ilverify-check.sh
 !samples/**/*.sh
+!test/debug-pdb/check.sh
 
 ## qlot (dependency management)
 qlfile
@@ -89,3 +94,7 @@ scripts/gen-utils-out/
 scripts/GenUtils/bin/
 scripts/GenUtils/obj/
 runtime/Generated/
+
+# dotnet new template packaging build artifacts
+templates/bin/
+templates/obj/

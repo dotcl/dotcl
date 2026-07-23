@@ -1033,7 +1033,26 @@ public static partial class Runtime
 
         try
         {
-            var asm = System.Reflection.Assembly.Load(File.ReadAllBytes(Path.GetFullPath(filePath)));
+            // Load the fasl bytes into the default context. When a matching .pdb
+            // sits next to the fasl, hand it to the symbol-store overload so a
+            // debugger has symbols for this in-memory module directly: an
+            // assembly loaded from bytes carries no file Location, so the
+            // debugger cannot otherwise discover a co-located pdb. This is what
+            // makes a deployed dotcl app — whose fasl LoadFromManifest loads from
+            // bin/dotcl-fasl/ — break/step in its .lisp under a Debug build.
+            var faslFull = Path.GetFullPath(filePath);
+            var faslBytes = File.ReadAllBytes(faslFull);
+            var pdbPath = Path.ChangeExtension(faslFull, ".pdb");
+            System.Reflection.Assembly asm;
+            if (File.Exists(pdbPath))
+            {
+                try { asm = System.Reflection.Assembly.Load(faslBytes, File.ReadAllBytes(pdbPath)); }
+                catch { asm = System.Reflection.Assembly.Load(faslBytes); } // mismatched/locked pdb
+            }
+            else
+            {
+                asm = System.Reflection.Assembly.Load(faslBytes);
+            }
             var moduleType = asm.GetType("CompiledModule")
                 ?? throw new Exception($"LOAD: .fasl has no CompiledModule type: {filePath}");
             var initMethod = moduleType.GetMethod("ModuleInit")
@@ -1190,6 +1209,40 @@ public static partial class Runtime
                new Cons(new LispString(loc.File),
                new Cons(Startup.Keyword("LINE"),
                new Cons(Fixnum.Make(loc.Line), Nil.Instance))));
+    }
+
+    /// <summary>
+    /// Identity-keyed map from a read form (a cons) to the source line where its
+    /// opening paren appeared. Populated by the Reader only while non-null, which
+    /// COMPILE-FILE arranges under DOTCL_EMIT_PDB so the compiler can attach
+    /// per-expression sequence points. Off (null) → the Reader does no work.
+    /// Thread-static: compile is single-threaded per file and this avoids sharing.
+    /// </summary>
+    [ThreadStatic] internal static Dictionary<object, (int sl, int sc, int el, int ec)>? SourceLineTable;
+
+    /// <summary>Record FORM's source span (start line/col .. end line/col) if line
+    /// tracking is active. Called by the Reader for each list it builds.</summary>
+    internal static void StampSourceLine(LispObject form, int sl, int sc, int el, int ec)
+    {
+        var t = SourceLineTable;
+        if (t != null) t[form] = (sl, sc, el, ec);
+    }
+
+    /// <summary>The function COMPILE-FILE installs in the compiler's
+    /// *EMIT-SOURCE-LINES* under DOTCL_EMIT_PDB: (fn form) → the form's source span
+    /// as a list (start-line start-col end-line end-col), or NIL. The compiler
+    /// funcalls it per form; NIL means "no source position" (e.g. a
+    /// macroexpansion-produced form), which correctly yields no sequence point.</summary>
+    public static LispObject FormLineLookup(LispObject[] args)
+    {
+        if (args.Length < 1) return Nil.Instance;
+        var t = SourceLineTable;
+        if (t != null && t.TryGetValue(args[0], out var span))
+            return new Cons(Fixnum.Make(span.sl),
+                   new Cons(Fixnum.Make(span.sc),
+                   new Cons(Fixnum.Make(span.el),
+                   new Cons(Fixnum.Make(span.ec), Nil.Instance))));
+        return Nil.Instance;
     }
 
     /// <summary>
@@ -1643,6 +1696,30 @@ public static partial class Runtime
     /// LispErrorException (a real condition) still propagates to handler-case.
     [ThreadStatic] internal static bool EmitBuildSourceLocations;
 
+    /// <summary>
+    /// When true, COMPILE-FILE emits a Portable PDB even without the
+    /// DOTCL_EMIT_PDB env var — set by CompileProject on a Debug build so a
+    /// dotcl project is source-debuggable without the caller exporting the var.
+    /// </summary>
+    [ThreadStatic] internal static bool BuildEmitPdb;
+
+    /// <summary>
+    /// PDB document override for a Debug project build. CompileProject compiles a
+    /// concatenated unit (&lt;out&gt;.concat.lisp); pointing the document at the
+    /// real source makes a single-source project break/step in its own .lisp
+    /// rather than the generated concat file. Null falls back to the input path.
+    /// Multi-source projects keep the concat unit until per-document mapping lands.
+    /// </summary>
+    [ThreadStatic] internal static string? BuildDebugSourceOverride;
+
+    /// <summary>
+    /// Per-source-file line map for a Debug project build over a concatenated unit
+    /// (one (startLine, path) per component). Non-null makes COMPILE-FILE emit a
+    /// multi-document PDB so each .lisp in a multi-file project is independently
+    /// debuggable. Null keeps the single-document path. Set by CompileProject.
+    /// </summary>
+    [ThreadStatic] internal static (int startLine, string path)[]? BuildDebugLineMap;
+
     public static LispObject CompileFile(LispObject[] args)
     {
 #if DOTCL_EMIT
@@ -1906,6 +1983,34 @@ public static partial class Runtime
 
             // FASL assembler (always — .fasl is the default output)
             var faslAsm = new DotCL.Emitter.FaslAssembler(faslModuleName);
+            // Opt-in Portable PDB emission: DOTCL_EMIT_PDB writes a sidecar
+            // .pdb mapping compiled forms to their source lines, so a debugger can
+            // break/step in the .lisp. Off by default; the normal emit path is
+            // unchanged. Turns on the Reader's source-line tracking and installs the
+            // line-lookup fn in the compiler's *EMIT-SOURCE-LINES* so COMPILE-EXPR
+            // emits (:line N) markers.
+            bool emitPdb = Environment.GetEnvironmentVariable("DOTCL_EMIT_PDB") != null
+                           || BuildEmitPdb;
+            Symbol? emitLinesSym = null;
+            LispObject? savedEmitLines = null;
+            if (emitPdb)
+            {
+                if (BuildDebugLineMap != null)
+                    faslAsm.EnableDebugInfoMap(BuildDebugLineMap);
+                else
+                    faslAsm.EnableDebugInfo(BuildDebugSourceOverride ?? Path.GetFullPath(inputPath));
+                SourceLineTable = new Dictionary<object, (int, int, int, int)>(ReferenceEqualityComparer.Instance);
+                // The compiled compiler reads *EMIT-SOURCE-LINES* via a bare-name
+                // (:LOAD-SYM ...) = Startup.Sym, so set the SAME symbol instance —
+                // SymInPkg("...","DOTCL.CIL-COMPILER") would be a different symbol
+                // (symbol-identity gotcha) and the compiler would never see it.
+                emitLinesSym = Startup.Sym("*EMIT-SOURCE-LINES*");
+                if (emitLinesSym != null)
+                {
+                    savedEmitLines = emitLinesSym.IsBound ? emitLinesSym.Value : null;
+                    emitLinesSym.Value = new LispFunction(FormLineLookup, "%FORM-LINE-LOOKUP", 1);
+                }
+            }
 
             try
             {
@@ -1944,7 +2049,7 @@ public static partial class Runtime
                             if (hasLT)
                             {
                                 writer?.WriteLine(bodyInstrList.ToString());
-                                faslAsm.AddTopLevelForm(bodyInstrList);
+                                faslAsm.AddTopLevelForm(bodyInstrList, formLine);
                                 faslAsm.FlushInitForms();
                             }
                         }
@@ -1954,7 +2059,7 @@ public static partial class Runtime
                             if (ShouldExecuteAtCompileTime(subForm))
                                 DotCL.Emitter.CilAssembler.AssembleAndRun(instrList);
                             writer?.WriteLine(instrList.ToString());
-                            faslAsm.AddTopLevelForm(instrList);
+                            faslAsm.AddTopLevelForm(instrList, formLine);
                             faslAsm.FlushInitForms();
                         }
 
@@ -1987,6 +2092,11 @@ public static partial class Runtime
             finally
             {
                 HandlerClusterStack.PopCluster();
+                if (emitPdb)
+                {
+                    SourceLineTable = null;
+                    if (emitLinesSym != null) emitLinesSym.Value = savedEmitLines ?? Nil.Instance;
+                }
             }
 
             // Return (values output-truename warnings-p failure-p)

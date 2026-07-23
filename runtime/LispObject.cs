@@ -1,8 +1,28 @@
 namespace DotCL;
 
+// DebuggerDisplay makes every Lisp value read as its printed form in the VS
+// Locals/Watch/hover windows (e.g. (1 2 3), 42, "foo") instead of the boxed
+// .NET type. ToString() on each subclass yields that form and is side-effect
+// free and depth-guarded (see Cons). The debugger applies a base type's
+// DebuggerDisplay to derived instances lacking their own.
+[System.Diagnostics.DebuggerDisplay("{ToString(),nq}")]
 public abstract class LispObject
 {
     public abstract override string ToString();
+}
+
+// Debug-only representation of a boxed lexical variable (one that is both
+// mutated and captured by a closure). In normal builds such a variable lives in
+// a LispObject[1] heap cell; under DOTCL_EMIT_PDB the compiler emits this named
+// class instead, so the VS Locals window shows the variable's value directly
+// (via DebuggerDisplay) rather than a one-element array. It is purely a
+// display/representation choice and is never mixed with LispObject[] boxes
+// within a single (debug) compilation. Not a LispObject — it holds one.
+[System.Diagnostics.DebuggerDisplay("{Value}")]
+public sealed class LispBox
+{
+    public LispObject Value;
+    public LispBox(LispObject value) { Value = value; }
 }
 
 public class Cons : LispObject

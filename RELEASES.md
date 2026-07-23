@@ -3,6 +3,44 @@
 User-facing release notes for dotcl. Each section corresponds to a tagged
 release on the public mirror (dotcl/dotcl).
 
+## v0.1.20 -- 2026-07-24
+
+Makes Common Lisp a first-class Visual Studio project: scaffold with
+`dotnet new dotcl-app`, build through an MSBuild SDK, and F5-debug the `.lisp`
+source. Also hardens cross-package symbol resolution and guards `dotcl pack`
+against a silent misconfiguration.
+
+### Visual Studio debugging
+
+- `dotnet new dotcl-app` scaffolds a Common Lisp console app as an ordinary
+  MSBuild project. Building it with `<Project Sdk="DotCL.Sdk">` produces a normal
+  .NET assembly you can run and, in Visual Studio, debug with F5.
+- A Debug build emits Portable PDBs beside the compiled Lisp, so you can set
+  breakpoints in `.lisp`, step through it expression by expression, and inspect
+  variables in the Locals window -- parameters, `let` / `let*` bindings, and
+  variables a lambda closes over, each shown by name with its printed value.
+  Several `.lisp` files in one project each debug against their own source.
+
+### Cross-package symbol resolution
+
+- An unqualified call to a function whose printed name is also interned in another
+  package (for example COMMON-LISP's backquote markers) no longer resolves to the
+  wrong symbol: a package's own `fbound` function wins over a same-named symbol
+  that merely exists elsewhere. This unblocks loading libraries such as ironclad.
+  Thanks to Bohong Huang for the reports and fixes.
+
+### `dotcl pack`
+
+- `dotcl pack --from <dir>` now fails loudly when the payload runtime is too old
+  to load a loose user FASL, instead of silently building a tool that drops into a
+  REPL rather than running your program.
+
+### Build
+
+- Release builds pick the crossgen2 and runtime-reference packages by highest
+  installed version rather than lexicographic order, so a machine with several
+  .NET bands installed always uses the newest.
+
 ## v0.1.19 -- 2026-07-20
 
 Adds `dotcl pack` for shipping a Lisp system as a .NET tool, broadens Gray

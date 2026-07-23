@@ -160,6 +160,14 @@ toolkit you have on hand.
   for PDFium text extraction, installers for Windows / macOS / Linux.
   Read it as the scaled-up version of the five-minute example above.
 
+- **[playa](https://github.com/dotcl/playa)** — an Emacs-style split-tiling
+  video / music player (Avalonia + LibVLCSharp). Split the window into panes
+  and play a different video in each, every pane with its own playlist,
+  volume and position. UI and application logic are Common Lisp end to end —
+  even the `Avalonia.Application` subclass is emitted from Lisp via
+  `dotnet:define-class` — with C# only for boot and the native input shims.
+  Lisp is ahead-of-time compiled at build time via project-core.
+
 ## Samples
 
 Working integrations in `samples/`:

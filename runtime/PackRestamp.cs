@@ -26,15 +26,38 @@ namespace DotCL;
 static class PackRestamp
 {
     /// <summary>
+    /// Optional nuspec metadata overrides for a pack. Each null field leaves
+    /// the source dotcl package's value in place; a non-null one replaces it in
+    /// every produced package. Without these a tool packed under a different id
+    /// keeps dotcl's description, project URL, repository, embedded README and
+    /// tags, so its nuget.org page misrepresents what it actually is.
+    /// </summary>
+    public sealed class Meta
+    {
+        public string? Description;
+        public string? ProjectUrl;
+        public string? RepositoryUrl;
+        public string? RepositoryCommit;
+        public string? ReadmePath;   // file whose bytes replace the packaged README
+        public string? Tags;         // free-form; normalized to space-separated
+        public string? Authors;
+        public string? Copyright;
+    }
+
+    /// <summary>
     /// Restamp the dotcl packages in <paramref name="sourceDir"/> into
     /// <paramref name="outputDir"/>. Returns the produced nupkg paths.
     /// </summary>
     public static List<string> Run(
         string sourceDir, string? dotclVersion, string newId, string command,
         string version, string faslPath, string? bundleDir,
-        IReadOnlyList<string> rids, string outputDir, bool dryRun)
+        IReadOnlyList<string> rids, string outputDir, Meta? meta, bool dryRun)
     {
         dotclVersion ??= InferDotclVersion(sourceDir);
+
+        // A payload runtime older than the loose-fasl loader would restamp into a
+        // tool that starts a REPL instead of running the app — fail loudly first.
+        EnsureLoaderCapablePayload(dotclVersion);
 
         // Resolve every input up front so a missing RID package is reported as
         // one list rather than discovered halfway through writing the output.
@@ -63,11 +86,33 @@ static class PackRestamp
         // The pointer package gets the rewritten RID map but no fasl: it holds
         // no runtime, so nothing there ever executes.
         produced.Add(RestampOne(basePkg, "dotcl", newId, version, command,
-                                ridMap: rids, faslPath: null, bundleDir: null, outputDir));
+                                ridMap: rids, faslPath: null, bundleDir: null, meta, outputDir));
         foreach (var (rid, path) in ridPkgs)
             produced.Add(RestampOne(path, $"dotcl.{rid}", $"{newId}.{rid}", version, command,
-                                    ridMap: null, faslPath: faslPath, bundleDir: bundleDir, outputDir));
+                                    ridMap: null, faslPath: faslPath, bundleDir: bundleDir, meta, outputDir));
         return produced;
+    }
+
+    // The first released dotcl whose payload runtime loads a loose dotcl.user.fasl
+    // at startup. A --from payload older than this restamps into an installable
+    // tool that silently drops to a REPL instead of running the app (it never
+    // loads the user fasl), so refuse to build one from it.
+    static readonly Version LoaderFloor = new Version(0, 1, 19);
+
+    internal static void EnsureLoaderCapablePayload(string dotclVersion)
+    {
+        // Compare the leading numeric X.Y.Z, ignoring any -prerelease / +build
+        // suffix a local dev payload may carry. Only block versions we can prove
+        // are too old; let an unparseable version through.
+        var numeric = dotclVersion;
+        int cut = numeric.IndexOfAny(new[] { '-', '+' });
+        if (cut >= 0) numeric = numeric.Substring(0, cut);
+        if (Version.TryParse(numeric, out var v) && v < LoaderFloor)
+            throw new InvalidOperationException(
+                $"--from payload dotcl {dotclVersion} is older than {LoaderFloor}, the "
+                + "first version whose runtime loads a loose user fasl. A tool "
+                + "restamped from an older payload would silently start a REPL instead "
+                + $"of running your app; use a dotcl {LoaderFloor} or newer payload.");
     }
 
     /// <summary>
@@ -76,7 +121,7 @@ static class PackRestamp
     /// have a RID between the id and the version, so a digit after "dotcl."
     /// identifies the base.
     /// </summary>
-    static string InferDotclVersion(string dir)
+    internal static string InferDotclVersion(string dir)
     {
         if (!Directory.Exists(dir))
             throw new InvalidOperationException($"source package directory not found: {dir}");
@@ -100,7 +145,8 @@ static class PackRestamp
 
     static string RestampOne(
         string srcPath, string oldId, string newId, string version, string command,
-        IReadOnlyList<string>? ridMap, string? faslPath, string? bundleDir, string outputDir)
+        IReadOnlyList<string>? ridMap, string? faslPath, string? bundleDir,
+        Meta? meta, string outputDir)
     {
         Directory.CreateDirectory(outputDir);
         var dest = Path.Combine(outputDir, $"{newId}.{version}.nupkg");
@@ -109,6 +155,22 @@ static class PackRestamp
         using var src = ZipFile.OpenRead(srcPath);
         using var outFs = new FileStream(dest, FileMode.CreateNew);
         using var outZip = new ZipArchive(outFs, ZipArchiveMode.Create);
+
+        // A --readme override replaces the file the nuspec's <readme> points at.
+        // Read that filename from the nuspec before the copy loop, since the
+        // README entry can precede the nuspec in the archive.
+        string? readmeName = null;
+        byte[]? readmeBytes = null;
+        if (meta?.ReadmePath != null)
+        {
+            var nuspecEntry = src.Entries.FirstOrDefault(e =>
+                e.FullName.Equals($"{oldId}.nuspec", StringComparison.OrdinalIgnoreCase));
+            if (nuspecEntry != null)
+                readmeName = LoadXml(ReadAll(nuspecEntry))
+                    .Descendants().FirstOrDefault(e => e.Name.LocalName == "readme")
+                    ?.Value?.Trim();
+            if (readmeName != null) readmeBytes = File.ReadAllBytes(meta.ReadmePath);
+        }
 
         // Set when the package turns out to carry a runtime: the directory
         // holding the apphost is where the fasl has to land to be found.
@@ -129,8 +191,13 @@ static class PackRestamp
 
             if (name.Equals($"{oldId}.nuspec", StringComparison.OrdinalIgnoreCase))
             {
-                bytes = RewriteNuspec(bytes, newId, version);
+                bytes = RewriteNuspec(bytes, newId, version, meta);
                 outName = $"{newId}.nuspec";
+            }
+            else if (readmeName != null
+                     && name.Equals(readmeName, StringComparison.OrdinalIgnoreCase))
+            {
+                bytes = readmeBytes!;
             }
             else if (name.Equals("_rels/.rels", StringComparison.OrdinalIgnoreCase))
             {
@@ -176,13 +243,23 @@ static class PackRestamp
         return dest;
     }
 
-    static byte[] RewriteNuspec(byte[] bytes, string newId, string version)
+    static byte[] RewriteNuspec(byte[] bytes, string newId, string version, Meta? meta)
     {
         var doc = LoadXml(bytes);
         var md = doc.Root?.Elements().FirstOrDefault(e => e.Name.LocalName == "metadata")
             ?? throw new InvalidOperationException("nuspec has no <metadata>");
         SetChildValue(md, "id", newId);
         SetChildValue(md, "version", version);
+        if (meta != null)
+        {
+            if (meta.Description != null) SetOrCreateChild(md, "description", meta.Description);
+            if (meta.ProjectUrl != null) SetOrCreateChild(md, "projectUrl", meta.ProjectUrl);
+            if (meta.Authors != null) SetOrCreateChild(md, "authors", meta.Authors);
+            if (meta.Copyright != null) SetOrCreateChild(md, "copyright", meta.Copyright);
+            if (meta.Tags != null) SetOrCreateChild(md, "tags", NormalizeTags(meta.Tags));
+            if (meta.RepositoryUrl != null)
+                SetRepository(md, meta.RepositoryUrl, meta.RepositoryCommit);
+        }
         return SaveXml(doc);
     }
 
@@ -191,6 +268,41 @@ static class PackRestamp
         var e = parent.Elements().FirstOrDefault(x => x.Name.LocalName == localName)
             ?? throw new InvalidOperationException($"nuspec metadata has no <{localName}>");
         e.Value = value;
+    }
+
+    /// <summary>Set an existing metadata child, or append one if absent.</summary>
+    static void SetOrCreateChild(XElement parent, string localName, string value)
+    {
+        var e = parent.Elements().FirstOrDefault(x => x.Name.LocalName == localName);
+        if (e != null) e.Value = value;
+        else parent.Add(new XElement(parent.Name.Namespace + localName, value));
+    }
+
+    /// <summary>
+    /// Point &lt;repository&gt; at the app's own repo. When the override omits a
+    /// commit, drop the stale one carried over from dotcl rather than keep it.
+    /// </summary>
+    static void SetRepository(XElement md, string url, string? commit)
+    {
+        var repo = md.Elements().FirstOrDefault(x => x.Name.LocalName == "repository");
+        if (repo == null)
+        {
+            repo = new XElement(md.Name.Namespace + "repository", new XAttribute("type", "git"));
+            md.Add(repo);
+        }
+        repo.SetAttributeValue("url", url);
+        repo.SetAttributeValue("commit", commit); // null removes the attribute
+    }
+
+    /// <summary>
+    /// nuspec stores tags space-separated; accept comma / semicolon / whitespace
+    /// input so `--tags "a,b"` and `--tags "a b"` both work.
+    /// </summary>
+    static string NormalizeTags(string raw)
+    {
+        var parts = raw.Split(new[] { ',', ';', ' ', '\t', '\n', '\r' },
+            StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        return string.Join(' ', parts);
     }
 
     static byte[] RewriteRels(byte[] bytes, string oldId, string newId)

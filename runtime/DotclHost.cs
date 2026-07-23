@@ -634,7 +634,7 @@ public static class DotclHost
     /// <paramref name="outputPath"/>. Only the root system is compiled;
     /// dependencies stay as pre-built fasls resolved by <see cref="ResolveDeps"/>.
     /// </summary>
-    public static void CompileProject(string asdPath, string outputPath, string[]? buildInit = null, string[]? searchPaths = null)
+    public static void CompileProject(string asdPath, string outputPath, string[]? buildInit = null, string[]? searchPaths = null, bool debugInfo = false)
     {
         var absAsd = System.IO.Path.GetFullPath(asdPath);
         if (!System.IO.File.Exists(absAsd))
@@ -744,6 +744,22 @@ public static class DotclHost
             $@"(dotcl.cil-compiler:compile-file-concatenated ""{concatLisp}"" ""{outLisp}"")";
         var prevEmit = Runtime.EmitBuildSourceLocations;
         Runtime.EmitBuildSourceLocations = true;
+        // Debug build: emit a Portable PDB from the project compile. For a
+        // single-source project point the PDB document at the real .lisp (so F5
+        // breaks in the user's source, not the generated concat unit); a
+        // multi-source project keeps the concat until per-document mapping lands.
+        var prevEmitPdb = Runtime.BuildEmitPdb;
+        var prevDebugSrc = Runtime.BuildDebugSourceOverride;
+        var prevLineMap = Runtime.BuildDebugLineMap;
+        Runtime.BuildEmitPdb = debugInfo;
+        // Single source: point the one document at the real .lisp. Multiple
+        // sources: hand COMPILE-FILE the concat line map so it emits one document
+        // per file and each .lisp gets its own breakpoints (lineMap already built
+        // above for error remapping).
+        Runtime.BuildDebugSourceOverride =
+            debugInfo && sourcePaths.Length == 1 ? sourcePaths[0] : null;
+        Runtime.BuildDebugLineMap =
+            debugInfo && sourcePaths.Length > 1 ? lineMap : null;
         try
         {
             Runtime.Eval(MultipleValues.Primary(
@@ -756,6 +772,9 @@ public static class DotclHost
         finally
         {
             Runtime.EmitBuildSourceLocations = prevEmit;
+            Runtime.BuildEmitPdb = prevEmitPdb;
+            Runtime.BuildDebugSourceOverride = prevDebugSrc;
+            Runtime.BuildDebugLineMap = prevLineMap;
             DynamicBindings.Set(hookSym, oldHook);
         }
     }

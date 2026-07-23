@@ -8,6 +8,7 @@
   (:use :cl)
   (:export #:compile-toplevel #:compile-toplevel-eval
            #:*cross-compiling* #:*compile-file-mode* #:*concatenate-build*
+           #:*emit-source-lines*
            #:compile-file-concatenated))
 
 ;; %INLINE-CS-SPLICED is the dispatch symbol for the dotcl-cs:inline-cs
@@ -30,6 +31,14 @@
 
 (defvar *cross-compiling* nil
   "T when running in SBCL as cross-compiler; NIL in self-hosted mode.")
+
+(defvar *emit-source-lines* nil
+  "When non-NIL, a function (fn form) -> source-line-or-NIL. COMPILE-EXPR calls it
+   per compiled cons form and, on a non-NIL line, prepends a (:line N) marker so the
+   assembler can emit a debug sequence point. NIL (default, incl. cross-compile)
+   disables it entirely — output is unchanged. Set by COMPILE-FILE under
+   DOTCL_EMIT_PDB. Forms produced by macroexpansion aren't in the source map, so
+   funcall returns NIL for them and they get no marker (they read as #line hidden).")
 
 (defvar *compile-file-mode* nil
   "T when compiling via compile-file. Controls eval-when behavior per CLHS 3.2.3.1:
@@ -614,6 +623,16 @@ through to compile-sym-lookup."
           :key (lambda (x) (if (symbolp x) (var-name x) x))
           :test #'string=))
 
+(defun labels-cell-var-p (name-or-sym)
+  "True if NAME-OR-SYM names a labels function cell — a boxed LispObject[1]
+   holding a LispFunction, tracked in *locals* under a __LABELFN_ prefix. Such
+   cells keep the array representation even under debug info emission (only
+   genuine data variables use the debug-only LispBox cell), so their box
+   reads/writes and env captures must stay ldelem / LispObject[]."
+  (let ((name (if (stringp name-or-sym) name-or-sym (var-name name-or-sym))))
+    (and (>= (length name) 10)
+         (string= name "__LABELFN_" :end1 10))))
+
 (defun mangle-name (symbol)
   "Convert a Lisp symbol/name to a display string (for defmethod names).
    Handles (setf foo), (cas foo), string names, and (\"c-name\" lisp-name) pairs.
@@ -893,7 +912,11 @@ through to compile-sym-lookup."
   (let ((key (lookup-local sym)))
     (if key
         (if (boxed-var-p sym)
-            `((:ldloc ,key) (:ldc-i4 0) (:ldelem-ref))
+            ;; Boxed read: LispObject[1] cell (normal, and labels function cells
+            ;; even under debug) or LispBox.Value (debug data variable).
+            (if (and *emit-source-lines* (not (labels-cell-var-p sym)))
+                `((:ldloc ,key) (:ldfld "LispBox.Value"))
+                `((:ldloc ,key) (:ldc-i4 0) (:ldelem-ref)))
             (if (and (boundp '*long-locals*) *long-locals*
                      (member (var-name sym) *long-locals* :test #'string=))
                 `((:ldloc ,key) (:call "Fixnum.Make"))
@@ -960,9 +983,17 @@ through to compile-sym-lookup."
    MV-context positions (*in-mv-context* t, e.g. inside multiple-value-list)
    also propagate. Single-value forms never produce MvReturn so no unwrap."
   (let ((code (compile-expr-raw expr)))
-    (if (or *in-mv-context* *in-tail-position* (single-value-form-p expr))
-        code
-        `(,@code (:call "Runtime.UnwrapMv")))))
+    (let ((c2 (if (or *in-mv-context* *in-tail-position* (single-value-form-p expr))
+                  code
+                  `(,@code (:call "Runtime.UnwrapMv")))))
+      ;; Debug info: prepend a source-span marker for literally-written cons forms
+      ;; (only when line emission is on). A no-op instruction for the assembler
+      ;; unless it is collecting sequence points. SPAN is (start-line start-col
+      ;; end-line end-col) from *emit-source-lines*, or NIL (macroexpansion output).
+      (if (and *emit-source-lines* (consp expr))
+          (let ((span (funcall *emit-source-lines* expr)))
+            (if span (cons (cons :line span) c2) c2))
+          c2))))
 
 (defun compile-for-single-value (expr)
   "Compile expr and ensure result is a single value (unwrap MvReturn).

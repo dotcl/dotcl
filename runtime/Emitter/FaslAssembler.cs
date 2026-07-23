@@ -1,5 +1,10 @@
 using System.Reflection;
 using System.Reflection.Emit;
+#if NET9_0_OR_GREATER
+using System.Reflection.Metadata;
+using System.Reflection.Metadata.Ecma335;
+using System.Reflection.PortableExecutable;
+#endif
 
 namespace DotCL.Emitter;
 
@@ -17,6 +22,60 @@ public class FaslAssembler
     private readonly ILGenerator _initIl;
     private int _methodCount;
     private readonly CilAssembler.FaslStructInternMap _structInternMap;
+
+    // --- Debug info (opt-in) ---
+    // When enabled, Save() emits a Portable PDB alongside the .fasl with one
+    // sequence point per compiled function body at the source line of its
+    // top-level form, so a debugger can bind a breakpoint on a defun and show
+    // source-mapped stack frames. Off by default; the emit path is unchanged
+    // (still _ab.Save) so the hot compile path stays byte-for-byte identical.
+    private bool _emitDebug;
+    private string? _debugSourcePath;
+    // Project build over a concatenated unit: (startLine, path) per source file,
+    // where startLine is the file's first line within the concat. Non-null selects
+    // multi-document PDB — each method is attributed to the file its body came from
+    // and its concat lines are remapped to that file's own line numbers. Null keeps
+    // the single-document path (plain compile-file of one .lisp).
+    private (int startLine, string path)[]? _debugLineMap;
+    private int _currentFormLine;
+    // Recorded body methods (top-level functions AND nested closures/lambdas) are
+    // collected into the shared _structInternMap.DebugSink so both kinds reach the
+    // PDB uniformly; see RecordBodyMethod (top-level) and CilAssembler.AssembleFaslBody
+    // (closures).
+
+    /// <summary>Enable Portable PDB emission for this fasl, mapping bodies to
+    /// <paramref name="sourcePath"/>. No-op on runtimes without the emitter.</summary>
+    public void EnableDebugInfo(string sourcePath)
+    {
+        _emitDebug = true;
+        _debugSourcePath = sourcePath;
+        _structInternMap.DebugSink = new();
+    }
+
+    /// <summary>Enable Portable PDB emission for a concatenated project build,
+    /// mapping each method back to its originating source file via
+    /// <paramref name="lineMap"/> (one document per file). No-op without the emitter.</summary>
+    public void EnableDebugInfoMap((int startLine, string path)[] lineMap)
+    {
+        _emitDebug = true;
+        _debugLineMap = lineMap;
+        _structInternMap.DebugSink = new();
+    }
+
+    // Record a just-assembled body method with its collected debug info (read off
+    // the inner assembler). Passed as onBodyMethod to the static emitters only when
+    // debug is on. If the body produced no sequence points (e.g. no literal cons
+    // forms), fall back to a single point at the top-level form's line so the
+    // function is still breakable.
+    private void RecordBodyMethod(MethodBuilder m, CilAssembler asm)
+    {
+        var points = asm._seqPoints ?? new List<(int, int, int, int, int)>();
+        if (points.Count == 0) points.Add((0, _currentFormLine, 1, _currentFormLine, 1));
+        var localVars = asm._localVars ?? new List<(int, string)>();
+        var scopes = asm._completedScopes ?? new List<(int, int, List<(int, string)>)>();
+        _structInternMap.DebugSink?.Add(
+            new CilAssembler.DebugMethodInfo(m, points, localVars, scopes, asm._il.ILOffset));
+    }
 
     // --- Cached reflection refs (static readonly, shared across instances) ---
 
@@ -36,6 +95,8 @@ public class FaslAssembler
         typeof(CilAssembler).GetMethod("RegisterSetfFunctionOnSymbol")!;
     internal static readonly MethodInfo SymInPkgMI =
         typeof(Startup).GetMethod("SymInPkg")!;
+    internal static readonly MethodInfo PreinternSymbolMI =
+        typeof(Startup).GetMethod("PreinternSymbol")!;
     internal static readonly MethodInfo GetFunctionBySymbolMI =
         typeof(CilAssembler).GetMethod("GetFunctionBySymbol")!;
     internal static readonly MethodInfo GetSetfFunctionBySymbolMI =
@@ -164,6 +225,15 @@ public class FaslAssembler
         catch (Exception ex) { ThrowWithStringDiag(ex, _structInternMap, "AddTopLevelForm"); throw; }
     }
 
+    /// <summary>As <see cref="AddTopLevelForm(LispObject)"/>, tagging any function
+    /// bodies emitted for this form with <paramref name="sourceLine"/> for PDB
+    /// (only used when debug info is enabled).</summary>
+    public void AddTopLevelForm(LispObject instrList, int sourceLine)
+    {
+        _currentFormLine = sourceLine;
+        AddTopLevelForm(instrList);
+    }
+
     private void AddTopLevelFormImpl(LispObject instrList)
     {
         // Check if this form contains DEFMETHOD/DEFMETHOD-DIRECT and whether
@@ -235,15 +305,16 @@ public class FaslAssembler
                     }
                     var (name, paramNames, bodyInstrs, defPkg, selfArg0) = ParseDefmethodForm(inner);
                     int id = _methodCount++;
+                    var onBody = _emitDebug ? RecordBodyMethod : (Action<MethodBuilder, CilAssembler>?)null;
                     if (sym.Name == "DEFMETHOD-DIRECT")
                         EmitDefmethodDirectInto(_tb, _initIl, _structInternMap,
-                            name, paramNames.Count, bodyInstrs, defPkg, id, selfArg0);
+                            name, paramNames.Count, bodyInstrs, defPkg, id, selfArg0, onBody);
                     else if (sym.Name == "DEFMETHOD-NATIVE")
                         EmitDefmethodNativeInto(_tb, _initIl, _structInternMap,
-                            name, paramNames.Count, bodyInstrs, defPkg, id);
+                            name, paramNames.Count, bodyInstrs, defPkg, id, onBody);
                     else
                         EmitDefmethodInto(_tb, _initIl, _structInternMap,
-                            name, paramNames.Count, bodyInstrs, defPkg, id);
+                            name, paramNames.Count, bodyInstrs, defPkg, id, onBody);
                 }
                 else
                 {
@@ -306,6 +377,12 @@ public class FaslAssembler
         var method = _tb.DefineMethod(methodName,
             MethodAttributes.Public | MethodAttributes.Static,
             typeof(LispObject), Type.EmptyTypes);
+        // Intentionally not source-mapped: _toplevel helpers carry compiler glue
+        // (e.g. a defun's return-name tail, or registration side effects that run
+        // at module-load time). Mapping them would make a breakpoint on a defun's
+        // line spuriously hit at load. Only real function bodies get sequence
+        // points (function granularity). Top-level side-effect forms are a
+        // later step.
 
         var innerAsm = new CilAssembler();
         innerAsm._il = method.GetILGenerator();
@@ -433,7 +510,7 @@ public class FaslAssembler
     internal static void EmitDefmethodDirectInto(
         TypeBuilder tb, ILGenerator initIl, CilAssembler.FaslStructInternMap structMap,
         string name, int paramCount, LispObject bodyInstrs, string? defPkg, int id,
-        bool selfArg0 = false)
+        bool selfArg0 = false, Action<MethodBuilder, CilAssembler>? onBodyMethod = null)
     {
         if (paramCount > 8)
             throw new Exception($"FASL DEFMETHOD-DIRECT: param-count {paramCount} > 8 not supported");
@@ -463,7 +540,9 @@ public class FaslAssembler
         innerAsm._faslMode = true;
         innerAsm._faslTypeBuilder = tb;
         innerAsm._faslStructMap = structMap;
+        if (onBodyMethod != null) { innerAsm._seqPoints = new(); innerAsm._localVars = new(); innerAsm._completedScopes = new(); }
         innerAsm.Assemble(bodyInstrs);
+        if (onBodyMethod != null) onBodyMethod(bodyMethod, innerAsm);
 
         // 2. Array-arg wrapper: static LispObject Name(LispObject[] args)
         string wrapperName = SanitizeName(name) + "_" + id;
@@ -521,19 +600,25 @@ public class FaslAssembler
     /// </summary>
     internal static void EmitDefmethodInto(
         TypeBuilder tb, ILGenerator initIl, CilAssembler.FaslStructInternMap structMap,
-        string name, int paramCount, LispObject bodyInstrs, string? defPkg, int id)
+        string name, int paramCount, LispObject bodyInstrs, string? defPkg, int id,
+        Action<MethodBuilder, CilAssembler>? onBodyMethod = null)
     {
         string methodName = SanitizeName(name) + "_" + id;
         var method = tb.DefineMethod(methodName,
             MethodAttributes.Public | MethodAttributes.Static,
             typeof(LispObject), new[] { typeof(LispObject[]) });
+        // Name the raw args array so the debugger's Locals shows "args" rather
+        // than an unnamed "value" alongside the source-named parameters.
+        method.DefineParameter(1, System.Reflection.ParameterAttributes.None, "args");
 
         var innerAsm = new CilAssembler();
         innerAsm._il = method.GetILGenerator();
         innerAsm._faslMode = true;
         innerAsm._faslTypeBuilder = tb;
         innerAsm._faslStructMap = structMap;
+        if (onBodyMethod != null) { innerAsm._seqPoints = new(); innerAsm._localVars = new(); innerAsm._completedScopes = new(); }
         innerAsm.Assemble(bodyInstrs);
+        if (onBodyMethod != null) onBodyMethod(method, innerAsm);
 
         // No _funcN for plain DEFMETHOD — body signature is LispObject[] -> LispObject.
         EmitRegistrationInto(initIl, name, method, paramCount, defPkg, directBodyMethod: null);
@@ -546,7 +631,8 @@ public class FaslAssembler
     /// </summary>
     internal static void EmitDefmethodNativeInto(
         TypeBuilder tb, ILGenerator initIl, CilAssembler.FaslStructInternMap structMap,
-        string name, int paramCount, LispObject bodyInstrs, string? defPkg, int id)
+        string name, int paramCount, LispObject bodyInstrs, string? defPkg, int id,
+        Action<MethodBuilder, CilAssembler>? onBodyMethod = null)
     {
         if (paramCount < 1 || paramCount > 4)
             throw new Exception($"FASL DEFMETHOD-NATIVE: param-count {paramCount} not supported (1-4)");
@@ -573,7 +659,9 @@ public class FaslAssembler
         nativeAsm._faslMode = true;
         nativeAsm._faslTypeBuilder = tb;
         nativeAsm._faslStructMap = structMap;
+        if (onBodyMethod != null) { nativeAsm._seqPoints = new(); nativeAsm._localVars = new(); nativeAsm._completedScopes = new(); }
         nativeAsm.Assemble(bodyInstrs);
+        if (onBodyMethod != null) onBodyMethod(nativeMethod, nativeAsm);
 
         // 2. Direct LispObject wrapper: static LispObject Name_direct_N(LispFunction self, LispObject p0, ...)
         var directParamTypes = new Type[paramCount + 1];
@@ -733,6 +821,46 @@ public class FaslAssembler
         }
     }
 
+#if NET9_0_OR_GREATER
+    /// <summary>
+    /// Emit load-time pre-interning for every symbol this fasl names (see
+    /// Startup.PreinternSymbol). Called at the END of ModuleInit so the file's own
+    /// defpackage forms have already run — a symbol whose package this fasl
+    /// defines is then interned in the right place, and one whose package is
+    /// missing is skipped by the guard in PreinternSymbol.
+    ///
+    /// The calls go into chunked helper methods rather than straight into
+    /// ModuleInit: a large source file names thousands of symbols, and ~11 IL
+    /// bytes each would push ModuleInit (which also carries the top-level forms)
+    /// toward the method-size limit.
+    /// </summary>
+    private void EmitPreinternSymbols()
+    {
+        const int chunkSize = 256;
+        var syms = _structInternMap.PreinternSymbols;
+        if (syms.Count == 0) return;
+        int index = 0, chunk = 0;
+        ILGenerator? chunkIl = null;
+        foreach (var (name, pkg) in syms)
+        {
+            if (index % chunkSize == 0)
+            {
+                if (chunkIl != null) chunkIl.Emit(OpCodes.Ret);
+                var m = _tb.DefineMethod($"PreinternSymbols_{chunk++}",
+                    MethodAttributes.Public | MethodAttributes.Static,
+                    typeof(void), Type.EmptyTypes);
+                chunkIl = m.GetILGenerator();
+                _initIl.Emit(OpCodes.Call, m);
+            }
+            chunkIl!.Emit(OpCodes.Ldstr, name);
+            chunkIl.Emit(OpCodes.Ldstr, pkg);
+            chunkIl.Emit(OpCodes.Call, PreinternSymbolMI);
+            index++;
+        }
+        chunkIl!.Emit(OpCodes.Ret);
+    }
+#endif
+
     /// <summary>Write the assembled .fasl to the given output path. When
     /// <paramref name="retargetCorlib"/> is non-null, the saved image's corlib
     /// reference is rewritten to that facade (only "netstandard" is supported) so
@@ -743,6 +871,8 @@ public class FaslAssembler
         throw new PlatformNotSupportedException(
             "FASL emission (compile-file) requires .NET 9+; this runtime build runs precompiled .fasl only");
 #else
+        EmitPreinternSymbols();
+
         // return Nil.Instance
         _initIl.Emit(OpCodes.Ldsfld,
             typeof(Nil).GetField("Instance")!);
@@ -751,7 +881,10 @@ public class FaslAssembler
         _tb.CreateType();
         try
         {
-            _ab.Save(outputPath);
+            if (_emitDebug)
+                SaveWithDebugInfo(outputPath);
+            else
+                _ab.Save(outputPath);
         }
         catch (Exception ex) when (ex.Message.Contains("UserString"))
         {
@@ -763,6 +896,267 @@ public class FaslAssembler
             FaslCorlibRetarget.RetargetCorlib(outputPath, retargetCorlib);
 #endif
     }
+
+#if NET9_0_OR_GREATER
+    /// <summary>
+    /// Save the .fasl (a PE image) together with a sidecar Portable PDB.
+    /// Instead of PersistedAssemblyBuilder.Save (which builds the PE for us), we
+    /// generate the metadata + IL stream ourselves so we can attach a debug
+    /// directory pointing at a PDB. The PDB carries one document (the source
+    /// file) and one sequence point per recorded body method, at the source line
+    /// of its top-level form — enough to bind a breakpoint on a defun and show
+    /// source-mapped frames. Finer, per-expression stepping is a later step.
+    /// </summary>
+    private void SaveWithDebugInfo(string outputPath)
+    {
+        // Mark the assembly debuggable with the JIT optimizer disabled. Without
+        // this the JIT optimizes the fasl's methods and a debugger shows "optimized
+        // code" — locals get elided and stepping is unreliable even with a valid
+        // PDB. Must be set before GenerateMetadata so it lands in the metadata.
+        try
+        {
+            var dbgCtor = typeof(System.Diagnostics.DebuggableAttribute)
+                .GetConstructor(new[] { typeof(System.Diagnostics.DebuggableAttribute.DebuggingModes) });
+            if (dbgCtor != null)
+                _ab.SetCustomAttribute(new CustomAttributeBuilder(dbgCtor, new object[]
+                {
+                    System.Diagnostics.DebuggableAttribute.DebuggingModes.Default
+                    | System.Diagnostics.DebuggableAttribute.DebuggingModes.DisableOptimizations
+                }));
+        }
+        catch { /* best-effort: a valid PDB still helps even if this fails */ }
+
+        var asmMetadata = _ab.GenerateMetadata(out BlobBuilder ilStream, out BlobBuilder fieldData);
+        int methodDefCount = asmMetadata.GetRowCounts()[(int)TableIndex.MethodDef];
+
+        var pdb = new MetadataBuilder();
+
+        // Build the source document(s). A plain compile-file maps to one document;
+        // a concatenated project build (with a line map) makes one document per
+        // source file. AddSourceDocument attaches the SHA-256 checksum so a
+        // debugger can verify the on-disk source and won't refuse to bind.
+        DocumentHandle singleDoc = default;
+        Dictionary<string, DocumentHandle>? docByPath = null;
+        if (_debugLineMap != null)
+        {
+            docByPath = new(StringComparer.OrdinalIgnoreCase);
+            foreach (var (_, path) in _debugLineMap)
+                if (!docByPath.ContainsKey(path))
+                    docByPath[path] = AddSourceDocument(pdb, path);
+        }
+        else
+        {
+            singleDoc = AddSourceDocument(pdb, _debugSourcePath ?? outputPath);
+        }
+
+        // Map MethodDef row id -> collected debug info. MetadataToken is only
+        // assigned after GenerateMetadata.
+        var infoByRow = new Dictionary<int, (List<(int offset, int sl, int sc, int el, int ec)> points,
+            List<(int index, string name)> localVars,
+            List<(int start, int length, List<(int index, string name)> vars)> scopes,
+            int ilLength)>();
+        foreach (var dm in _structInternMap.DebugSink ?? new())
+        {
+            int row = MetadataTokens.GetRowNumber(
+                MetadataTokens.MethodDefinitionHandle(dm.Method.MetadataToken));
+            if (row > 0) infoByRow[row] = (dm.Points, dm.Locals, dm.Scopes, dm.IlLength);
+        }
+
+        // MethodDebugInformation is parallel to MethodDef: one row per method in
+        // order, nil for methods we didn't map. LocalScope/LocalVariable rows are
+        // added in the same ascending-row loop so the LocalScope table stays sorted
+        // by method (a Portable-PDB validity requirement), and each scope's
+        // LocalVariable rows are contiguous.
+        for (int row = 1; row <= methodDefCount; row++)
+        {
+            if (infoByRow.TryGetValue(row, out var info) && info.points.Count > 0)
+            {
+                // Pick this method's document and, for a project build, remap its
+                // concat line numbers to the originating file's own lines. A defun
+                // body (and its nested closures) comes from one file, so a single
+                // document per method suffices — no in-method document switching.
+                DocumentHandle methodDoc;
+                List<(int offset, int sl, int sc, int el, int ec)> pts;
+                if (_debugLineMap != null)
+                {
+                    // Remap concat line numbers (start and end) to the originating
+                    // file's own lines; the document comes from the method's first point.
+                    methodDoc = MapConcatLine(_debugLineMap, docByPath!, info.points[0].sl).doc;
+                    pts = new List<(int, int, int, int, int)>(info.points.Count);
+                    foreach (var (off, sl, sc, el, ec) in info.points)
+                        pts.Add((off,
+                                 MapConcatLine(_debugLineMap, docByPath!, sl).line, sc,
+                                 MapConcatLine(_debugLineMap, docByPath!, el).line, ec));
+                }
+                else { methodDoc = singleDoc; pts = info.points; }
+
+                pdb.AddMethodDebugInformation(methodDoc,
+                    pdb.GetOrAddBlob(EncodeSequencePoints(pts)));
+
+                // Build the scope list: the method-wide scope [0, ilLength) holding
+                // parameters, plus each nested let/let* scope. LocalScope rows must
+                // be sorted by (StartOffset asc, Length desc) within a method — an
+                // enclosing scope precedes those it contains. Skip empty scopes.
+                var scopes = new List<(int start, int length, List<(int index, string name)> vars)>();
+                if (info.localVars.Count > 0)
+                    scopes.Add((0, info.ilLength > 0 ? info.ilLength : 1, info.localVars));
+                foreach (var sc in info.scopes)
+                    if (sc.vars.Count > 0)
+                        scopes.Add((sc.start, sc.length > 0 ? sc.length : 1, sc.vars));
+                scopes.Sort((a, b) =>
+                    a.start != b.start ? a.start.CompareTo(b.start) : b.length.CompareTo(a.length));
+
+                foreach (var sc in scopes)
+                {
+                    LocalVariableHandle firstVar = default;
+                    bool first = true;
+                    foreach (var (index, name) in sc.vars)
+                    {
+                        var h = pdb.AddLocalVariable(LocalVariableAttributes.None, index, pdb.GetOrAddString(name));
+                        if (first) { firstVar = h; first = false; }
+                    }
+                    pdb.AddLocalScope(
+                        method: MetadataTokens.MethodDefinitionHandle(row),
+                        importScope: default,
+                        variableList: firstVar,
+                        // No local constants — point one past the (empty) table.
+                        constantList: MetadataTokens.LocalConstantHandle(1),
+                        startOffset: sc.start,
+                        length: sc.length);
+                }
+            }
+            else
+                pdb.AddMethodDebugInformation(default, default);
+        }
+
+        var pdbBuilder = new PortablePdbBuilder(pdb, asmMetadata.GetRowCounts(), entryPoint: default);
+        var pdbBlob = new BlobBuilder();
+        BlobContentId pdbId = pdbBuilder.Serialize(pdbBlob);
+        string pdbPath = Path.ChangeExtension(outputPath, ".pdb");
+        using (var pdbStream = new FileStream(pdbPath, FileMode.Create, FileAccess.Write))
+            pdbBlob.WriteContentTo(pdbStream);
+
+        var dbgDir = new DebugDirectoryBuilder();
+        dbgDir.AddCodeViewEntry(pdbPath, pdbId, pdbBuilder.FormatVersion);
+
+        var peBuilder = new ManagedPEBuilder(
+            header: new PEHeaderBuilder(
+                imageCharacteristics: Characteristics.ExecutableImage | Characteristics.Dll),
+            metadataRootBuilder: new MetadataRootBuilder(asmMetadata),
+            ilStream: ilStream,
+            mappedFieldData: fieldData,
+            debugDirectoryBuilder: dbgDir);
+        var peBlob = new BlobBuilder();
+        peBuilder.Serialize(peBlob);
+        using (var peStream = new FileStream(outputPath, FileMode.Create, FileAccess.Write))
+            peBlob.WriteContentTo(peStream);
+    }
+
+    /// <summary>Add a source-file document to the PDB with its SHA-256 checksum.
+    /// The hash lets a debugger verify the on-disk source matches; best-effort —
+    /// an unreadable file yields a document with no hash.</summary>
+    private static DocumentHandle AddSourceDocument(MetadataBuilder pdb, string path)
+    {
+        GuidHandle hashAlg = default;
+        BlobHandle hashBlob = default;
+        try
+        {
+            if (File.Exists(path))
+            {
+                byte[] sha = System.Security.Cryptography.SHA256.HashData(File.ReadAllBytes(path));
+                // ECMA/Portable-PDB SHA-256 document-hash algorithm GUID.
+                hashAlg = pdb.GetOrAddGuid(new Guid("8829d00f-11b8-4213-878b-770e8597ac16"));
+                hashBlob = pdb.GetOrAddBlob(sha);
+            }
+        }
+        catch { hashAlg = default; hashBlob = default; }
+        // No standard Common Lisp language GUID exists; leave unset. A debugger
+        // binds by document path + sequence points regardless.
+        return pdb.AddDocument(pdb.GetOrAddDocumentName(path), hashAlg, hashBlob, language: default);
+    }
+
+    /// <summary>Map a line in the concatenated build unit back to its source file's
+    /// document and own line number. The file is the last one whose start line does
+    /// not exceed <paramref name="concatLine"/>.</summary>
+    private static (DocumentHandle doc, int line) MapConcatLine(
+        (int startLine, string path)[] map, Dictionary<string, DocumentHandle> docByPath, int concatLine)
+    {
+        int idx = 0;
+        for (int i = 0; i < map.Length; i++)
+            if (map[i].startLine <= concatLine) idx = i; else break;
+        var (start, path) = map[idx];
+        int src = concatLine - start + 1;
+        return (docByPath[path], src < 1 ? 1 : src);
+    }
+
+    /// <summary>Encode a Portable-PDB sequence-points blob for a method. Each point
+    /// spans (line,1)..(line,2) at its IL offset. Header carries local-signature
+    /// row id 0 (we emit no local scopes yet). Points must be ordered by IL offset
+    /// (they are: collected in emission order) with strictly non-decreasing offset.</summary>
+    private static BlobBuilder EncodeSequencePoints(List<(int offset, int sl, int sc, int el, int ec)> points)
+    {
+        var b = new BlobBuilder();
+        b.WriteCompressedInteger(0);       // LocalSignature row id (none)
+
+        int prevOffset = 0, prevSl = 0, prevSc = 0;
+        bool first = true;
+        foreach (var (offset, slRaw, scRaw, elRaw, ecRaw) in points)
+        {
+            // Clamp to a well-formed span: 1-based, End >= Start (a degenerate or
+            // reversed span from a reader edge case would make an invalid PDB).
+            int sl = slRaw < 1 ? 1 : slRaw;
+            int sc = scRaw < 1 ? 1 : scRaw;
+            int el = elRaw < sl ? sl : elRaw;
+            int ec = ecRaw;
+            // Collapse a multi-line span to its start line. A point that spans
+            // several lines makes VS bind a breakpoint set on ANY of them to this
+            // point, so an outer multi-line form (defun/let/flet) would swallow
+            // breakpoints meant for its inner body; the inner forms have their own
+            // single-line points, and binding must resolve to the innermost one.
+            // Same-line column precision (the point of per-column points) is kept.
+            if (el > sl) { el = sl; ec = sc + 1; }
+            if (el == sl && ec <= sc) ec = sc + 1;   // DeltaColumns must be > 0
+            if (ec < 1) ec = sc + 1;
+
+            // ILOffset: absolute for the first record, delta thereafter. A delta of
+            // 0 is illegal for non-first points, so skip a duplicate offset.
+            if (first)
+                b.WriteCompressedInteger(offset);
+            else
+            {
+                int dOffset = offset - prevOffset;
+                if (dOffset <= 0) continue;
+                b.WriteCompressedInteger(dOffset);
+            }
+
+            int dLines = el - sl;
+            b.WriteCompressedInteger(dLines);                          // DeltaLines
+            // DeltaColumns = EndColumn - StartColumn: unsigned (and > 0) when the
+            // span is on one line, signed when it crosses lines.
+            if (dLines == 0)
+                b.WriteCompressedInteger(ec - sc);
+            else
+                b.WriteCompressedSignedInteger(ec - sc);
+
+            if (first)
+            {
+                b.WriteCompressedInteger(sl);                         // StartLine
+                b.WriteCompressedInteger(sc);                         // StartColumn
+            }
+            else
+            {
+                b.WriteCompressedSignedInteger(sl - prevSl);          // ΔStartLine
+                b.WriteCompressedSignedInteger(sc - prevSc);          // ΔStartColumn
+            }
+
+            prevOffset = offset;
+            prevSl = sl;
+            prevSc = sc;
+            first = false;
+        }
+        return b;
+    }
+#endif
 
     internal static string SanitizeName(string name)
     {

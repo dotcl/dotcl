@@ -23,6 +23,58 @@ public partial class CilAssembler
     internal TypeBuilder? _faslTypeBuilder;
     private static int _faslClosureCount;
 
+    // Debug info: when non-null, a (:line SL SC EL EC) instruction records
+    // (ILOffset, startLine, startCol, endLine, endCol) here so FaslAssembler can
+    // emit sequence points spanning the exact source form. Deduped by (startLine,
+    // startCol) within a method. Null (the default) → (:line ...) is a no-op.
+    internal List<(int offset, int sl, int sc, int el, int ec)>? _seqPoints;
+    private (int sl, int sc) _lastSeqPos = (-1, -1);
+
+    // Debug info: when non-null, a (:local-var LOCALNAME SOURCENAME) instruction
+    // records (localSlotIndex, SOURCENAME) here so FaslAssembler can emit a PDB
+    // LocalVariable row and the debugger's Locals window shows the source name.
+    // Null → the marker is a no-op. Only user lexicals are marked (the compiler
+    // emits these only for non-temp, non-boxed, non-special bindings).
+    internal List<(int index, string name)>? _localVars;
+
+    // Nested LocalScope tracking. (:scope-begin) opens a scope at the current IL
+    // offset; (:local-var ...) names go to the innermost open scope (or _localVars
+    // = the method-wide scope if none is open, e.g. parameters); (:scope-end)
+    // closes it, recording [start, length). Nested lets nest their scopes, so the
+    // PDB can disambiguate shadowed names. Collected only in debug.
+    private readonly Stack<(int start, List<(int index, string name)> vars)> _scopeStack = new();
+    internal List<(int start, int length, List<(int index, string name)> vars)>? _completedScopes;
+
+    // One recorded body method's debug info (top-level function or nested
+    // closure/lambda). Collected into FaslStructInternMap.DebugSink so both kinds
+    // of body reach the PDB uniformly.
+    internal readonly record struct DebugMethodInfo(
+        System.Reflection.Emit.MethodBuilder Method,
+        List<(int offset, int sl, int sc, int el, int ec)> Points,
+        List<(int index, string name)> Locals,
+        List<(int start, int length, List<(int index, string name)> vars)> Scopes,
+        int IlLength);
+
+    /// <summary>Assemble a FASL body method into <paramref name="innerAsm"/>,
+    /// collecting its debug info (sequence points / named locals / scopes) into the
+    /// shared DebugSink when debug is on. Used by the closure/lambda emitters so
+    /// their bodies get PDB entries just like top-level function bodies.</summary>
+    private void AssembleFaslBody(System.Reflection.Emit.MethodBuilder method,
+                                  CilAssembler innerAsm, LispObject bodyInstrs)
+    {
+        var sink = _faslStructMap?.DebugSink;
+        if (sink != null)
+        {
+            innerAsm._seqPoints = new();
+            innerAsm._localVars = new();
+            innerAsm._completedScopes = new();
+        }
+        innerAsm.Assemble(bodyInstrs);
+        if (sink != null)
+            sink.Add(new DebugMethodInfo(method, innerAsm._seqPoints!, innerAsm._localVars!,
+                                         innerAsm._completedScopes!, innerAsm._il.ILOffset));
+    }
+
     // --- Emit-side assembly ---
 
     // A DynamicMethod that emits too much IL (empirically a few MB) throws
@@ -308,6 +360,42 @@ public partial class CilAssembler
 
         switch (op)
         {
+            case "LINE":
+                // Debug marker: record a sequence point spanning the source form at
+                // the current IL offset. No-op unless collecting (debug build), and
+                // deduped so repeated forms at one source position make one point.
+                if (_seqPoints != null)
+                {
+                    var sp = ListToArray(c);
+                    int sl = GetInt(sp[1]), sc = GetInt(sp[2]),
+                        el = GetInt(sp[3]), ec = GetInt(sp[4]);
+                    if ((sl, sc) != _lastSeqPos)
+                    {
+                        _seqPoints.Add((_il.ILOffset, sl, sc, el, ec));
+                        _lastSeqPos = (sl, sc);
+                    }
+                }
+                break;
+            case "LOCAL-VAR":
+                // Debug marker: name a user lexical local for the PDB. Look up the
+                // slot the compiler declared and record (index, source-name) in the
+                // innermost open scope (method-wide _localVars if none open).
+                if (_localVars != null
+                    && _locals.TryGetValue(GetSymbolName(Cadr(c)), out var lvBuilder))
+                    (_scopeStack.Count > 0 ? _scopeStack.Peek().vars : _localVars)
+                        .Add((lvBuilder.LocalIndex, GetString(Caddr(c))));
+                break;
+            case "SCOPE-BEGIN":
+                if (_localVars != null)
+                    _scopeStack.Push((_il.ILOffset, new List<(int, string)>()));
+                break;
+            case "SCOPE-END":
+                if (_localVars != null && _scopeStack.Count > 0)
+                {
+                    var (scStart, scVars) = _scopeStack.Pop();
+                    _completedScopes!.Add((scStart, _il.ILOffset - scStart, scVars));
+                }
+                break;
             case "LDC-I4":
                 _il.Emit(OpCodes.Ldc_I4, GetInt(Cadr(c)));
                 break;
@@ -319,6 +407,12 @@ public partial class CilAssembler
                 break;
             case "LDSFLD":
                 EmitLdsfld(GetString(Cadr(c)));
+                break;
+            case "LDFLD":
+                _il.Emit(OpCodes.Ldfld, ResolveInstanceField(GetString(Cadr(c))));
+                break;
+            case "STFLD":
+                _il.Emit(OpCodes.Stfld, ResolveInstanceField(GetString(Cadr(c))));
                 break;
             case "LDNULL":
                 _il.Emit(OpCodes.Ldnull);
@@ -583,6 +677,7 @@ public partial class CilAssembler
                 var spPkg = GetString(Caddr(c));
                 _il.Emit(OpCodes.Ldstr, _faslMode ? Track(spName) : spName);
                 _il.Emit(OpCodes.Ldstr, _faslMode ? Track(spPkg) : spPkg);
+                if (_faslMode) _faslStructMap?.RecordSymbolReference(spName, spPkg);
                 _il.Emit(OpCodes.Call, _methodCache["Startup.SymInPkg"]);
                 _il.Emit(OpCodes.Castclass, typeof(LispObject));
                 break;
@@ -855,7 +950,7 @@ public partial class CilAssembler
             innerAsm._faslMode = true;
             innerAsm._faslTypeBuilder = _faslTypeBuilder;
             innerAsm._faslStructMap = _faslStructMap;
-            innerAsm.Assemble(bodyInstrs);
+            AssembleFaslBody(method, innerAsm, bodyInstrs);
 
             // Push new LispFunction(delegate, name, arity)
             _il.Emit(OpCodes.Ldnull);
@@ -931,7 +1026,7 @@ public partial class CilAssembler
             innerAsm._faslMode = true;
             innerAsm._faslTypeBuilder = _faslTypeBuilder;
             innerAsm._faslStructMap = _faslStructMap;
-            innerAsm.Assemble(bodyInstrs);
+            AssembleFaslBody(bodyMethod, innerAsm, bodyInstrs);
 
             // Create wrapper: (LispObject[] args) -> LispObject
             string wrapperName = $"fnd_{fnId}";
@@ -1655,14 +1750,18 @@ public partial class CilAssembler
 
         if (bodyInstrs == null) throw new Exception("MAKE-CLOSURE: missing :body");
 
-        // Determine which env slots are boxed from env-map
+        // Determine which env slots are boxed from env-map. "boxed" cells are
+        // LispObject[1] (the normal representation, and labels function cells);
+        // "lispbox" cells are the debug-only LispBox class (data variables under
+        // DOTCL_EMIT_PDB — see LispBox). They cast differently on load.
         var boxedSlots = new HashSet<int>();
+        var lispboxSlots = new HashSet<int>();
         if (envMap != null)
         {
             var cur = envMap;
             while (cur is Cons mc)
             {
-                // Each entry is (name index "boxed"|"value")
+                // Each entry is (name index "boxed"|"lispbox"|"value")
                 if (mc.Car is Cons entry)
                 {
                     var entryList = ListToArray(entry);
@@ -1672,6 +1771,8 @@ public partial class CilAssembler
                         string kind = GetString(entryList[2]);
                         if (kind == "boxed")
                             boxedSlots.Add(slotIdx);
+                        else if (kind == "lispbox")
+                            lispboxSlots.Add(slotIdx);
                     }
                 }
                 cur = mc.Cdr;
@@ -1687,6 +1788,10 @@ public partial class CilAssembler
                 MethodAttributes.Public | MethodAttributes.Static,
                 typeof(LispObject),
                 new[] { typeof(object[]), typeof(LispObject[]) });
+            // Name the plumbing parameters so the debugger's Locals shows "env" /
+            // "args" instead of two entries called "value" (unnamed SRE params).
+            closureMethod.DefineParameter(1, ParameterAttributes.None, "env");
+            closureMethod.DefineParameter(2, ParameterAttributes.None, "args");
 
             var innerAsm = new CilAssembler();
             innerAsm._il = closureMethod.GetILGenerator();
@@ -1694,11 +1799,12 @@ public partial class CilAssembler
             innerAsm._faslTypeBuilder = _faslTypeBuilder;
             innerAsm._faslStructMap = _faslStructMap;
             innerAsm._boxedEnvSlots = boxedSlots;
+            innerAsm._lispboxEnvSlots = lispboxSlots;
             // FASL mode ignores :direct (args-array signature as before), but a
             // :direct body omits the compiler's arity-check prefix — reconstitute
             // it here so FASL-loaded closures keep the exact same argc error.
             if (direct) EmitDirectFallbackArityCheck(innerAsm._il, fnName, paramCount);
-            innerAsm.Assemble(bodyInstrs);
+            AssembleFaslBody(closureMethod, innerAsm, bodyInstrs);
 
             // Stack has: object[] env
             // Emit: new LispFunction(closureDel, env, null, paramCount)
@@ -1740,6 +1846,7 @@ public partial class CilAssembler
             var innerAsm = new CilAssembler();
             innerAsm._il = dm.GetILGenerator();
             innerAsm._boxedEnvSlots = boxedSlots;
+            innerAsm._lispboxEnvSlots = lispboxSlots;
             innerAsm._directParams = true;
             innerAsm.Assemble(bodyInstrs);
 
@@ -1763,6 +1870,7 @@ public partial class CilAssembler
             innerAsm._il = dm.GetILGenerator();
 
             innerAsm._boxedEnvSlots = boxedSlots;
+            innerAsm._lispboxEnvSlots = lispboxSlots;
             // Defensive: a :direct body assembled on the args-array signature
             // (can only happen if the arity gate above and the compiler's gate
             // ever disagree) must get its omitted arity check back.
@@ -1799,6 +1907,10 @@ public partial class CilAssembler
     // For closure body: which env slots hold boxed (LispObject[]) values
     private HashSet<int>? _boxedEnvSlots;
 
+    // For closure body: which env slots hold debug-only LispBox cells (data
+    // variables under DOTCL_EMIT_PDB — see LispBox). Disjoint from _boxedEnvSlots.
+    private HashSet<int>? _lispboxEnvSlots;
+
     // For direct-params closure bodies: :load-arg i maps to ldarg (i+1)
     // (real CLR params) instead of args-array indexing. Set only while
     // assembling a :direct :make-closure body.
@@ -1809,7 +1921,9 @@ public partial class CilAssembler
         _il.Emit(OpCodes.Ldarg_0); // object[] env
         _il.Emit(OpCodes.Ldc_I4, index);
         _il.Emit(OpCodes.Ldelem_Ref);
-        if (_boxedEnvSlots != null && _boxedEnvSlots.Contains(index))
+        if (_lispboxEnvSlots != null && _lispboxEnvSlots.Contains(index))
+            _il.Emit(OpCodes.Castclass, typeof(LispBox));
+        else if (_boxedEnvSlots != null && _boxedEnvSlots.Contains(index))
             _il.Emit(OpCodes.Castclass, typeof(LispObject[]));
         else
             _il.Emit(OpCodes.Castclass, typeof(LispObject));
@@ -1824,6 +1938,12 @@ public partial class CilAssembler
             _il.Emit(OpCodes.Ldsfld, fi);
             return;
         }
+        throw new Exception($"Unknown field: {name}");
+    }
+
+    private static FieldInfo ResolveInstanceField(string name)
+    {
+        if (_fieldCache.TryGetValue(name, out var fi)) return fi;
         throw new Exception($"Unknown field: {name}");
     }
 
@@ -2094,6 +2214,12 @@ public partial class CilAssembler
         private readonly HashSet<string> _uniqueStrings = new();
         public long UniqueStringBytes { get; private set; }
 
+        // Debug info collection (opt-in, shared across every body assembler for
+        // this fasl). When non-null, top-level function bodies and nested
+        // closures/lambdas append their DebugMethodInfo here; FaslAssembler creates
+        // it under DOTCL_EMIT_PDB and reads it at Save. Null → no debug info.
+        internal List<DebugMethodInfo>? DebugSink;
+
         // Per-FASL uninterned symbol deduplication: same Symbol object → same static field.
         // Set by FaslAssembler after construction.
         internal System.Reflection.Emit.TypeBuilder? UninternedTypeBuilder;
@@ -2237,6 +2363,23 @@ public partial class CilAssembler
             return field;
         }
 
+        // Symbols this compilation unit names in a package other than CL/KEYWORD.
+        // FaslAssembler emits pre-interning calls for them at the end of ModuleInit
+        // so that a symbol reachable only from a constant that has not run yet
+        // (e.g. one appearing solely inside a macro's backquote template) still
+        // exists in its package right after the fasl is loaded — SBCL interns the
+        // whole constant pool at load time, and defpackage :import-from in a later
+        // file relies on that.
+        private readonly HashSet<(string Name, string Package)> _preinternSymbols = new();
+        public IReadOnlyCollection<(string Name, string Package)> PreinternSymbols => _preinternSymbols;
+
+        /// <summary>Record a symbol reference for load-time pre-interning (FASL mode only).</summary>
+        public void RecordSymbolReference(string name, string pkgName)
+        {
+            if (pkgName == "COMMON-LISP" || pkgName == "KEYWORD") return;
+            _preinternSymbols.Add((name, pkgName));
+        }
+
         /// <summary>Track a string being emitted via Ldstr. Returns the string.</summary>
         public string TrackString(string s)
         {
@@ -2315,6 +2458,10 @@ public partial class CilAssembler
                     _il.Emit(OpCodes.Ldstr, Track(sym.Name));
                     _il.Emit(OpCodes.Ldstr, Track(sym.HomePackage.Name));
                     _il.Emit(OpCodes.Call, _methodCache["Startup.SymInPkg"]);
+                    // This SymInPkg call only interns when the constant is actually
+                    // built (a macro template does that at expansion time, not at
+                    // load); record it so the fasl also interns it at load time.
+                    if (_faslMode) _faslStructMap?.RecordSymbolReference(sym.Name, sym.HomePackage.Name);
                 }
                 else if (_faslMode && _faslStructMap?.UninternedTypeBuilder != null)
                 {
@@ -3775,6 +3922,9 @@ public partial class CilAssembler
         {
             ["Nil.Instance"] = typeof(Nil).GetField("Instance")!,
             ["T.Instance"] = typeof(T).GetField("Instance")!,
+            // Debug-only boxed-variable cell (see LispBox); read/written via
+            // ldfld/stfld in the debug codegen path.
+            ["LispBox.Value"] = typeof(LispBox).GetField("Value")!,
         };
 
         _ctorCache = new Dictionary<string, ConstructorInfo>
@@ -3787,6 +3937,7 @@ public partial class CilAssembler
             ["LispErrorException"] = typeof(LispErrorException)
                 .GetConstructor(new[] { typeof(LispCondition) })!,
             ["LispVector"] = typeof(LispVector).GetConstructor(new[] { typeof(LispObject[]) })!,
+            ["LispBox"] = typeof(LispBox).GetConstructor(new[] { typeof(LispObject) })!,
             ["Object"] = typeof(object).GetConstructor(Type.EmptyTypes)!,
             ["BlockReturnException"] = typeof(BlockReturnException)
                 .GetConstructor(new[] { typeof(object), typeof(LispObject) })!,
@@ -3805,6 +3956,7 @@ public partial class CilAssembler
         {
             ["LispObject"] = typeof(LispObject),
             ["LispObject[]"] = typeof(LispObject[]),
+            ["LispBox"] = typeof(LispBox),
             ["LispFunction"] = typeof(LispFunction),
             ["Symbol"] = typeof(Symbol),
             ["Object"] = typeof(object),

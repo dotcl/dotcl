@@ -7,6 +7,47 @@
 ;;; declared in cil-compiler.lisp — see the
 ;;; "--- Per-compilation dynamic state ---" section there.
 
+(defun %local-var-marker (key var)
+  "Under debug info emission, return ((:local-var KEY sourcename)) naming the
+   slot KEY after the source variable VAR for the PDB; otherwise NIL. Skipped
+   for uninterned symbols (gensyms introduced by macroexpansion, e.g. dotimes's
+   limit) so only user-written variables reach the debugger's Locals window."
+  (when (and *emit-source-lines*
+             (symbolp var)
+             (symbol-package var))
+    `((:local-var ,key ,(var-name var)))))
+
+(defun emit-box-create (key value-instrs var)
+  "Emit IL creating a boxed-variable cell in local slot KEY, initialized to the
+   value pushed by VALUE-INSTRS, and naming it for the PDB. Boxed vars (mutated
+   AND captured) live in a heap cell so a closure and its enclosing frame share
+   the mutation. Normally the cell is a LispObject[1]; under debug info emission
+   it is a LispBox class instead, whose Value field the VS Locals window shows
+   directly (a LispObject[1] would display as a one-element array). Paired with
+   compile-var-ref's box read and compile-setq's box write, which branch on the
+   same *emit-source-lines* flag."
+  (if *emit-source-lines*
+      `((:declare-local ,key "LispBox")
+        ,@value-instrs
+        (:newobj "LispBox") (:stloc ,key)
+        ,@(%local-var-marker key var))
+      `((:declare-local ,key "LispObject[]")
+        (:ldc-i4 1) (:newarr "LispObject") (:dup)
+        (:ldc-i4 0) ,@value-instrs
+        (:stelem-ref) (:stloc ,key)
+        ,@(%local-var-marker key var))))
+
+(defun %synthetic-capture-name-p (name)
+  "True if NAME is a compiler-synthesized captured slot — a labels/flet function
+   cell (__LABELFN_), a block tag (%BTAG-), or a tagbody id (%TBID-) — rather
+   than a user variable. Such slots are excluded from the debugger's Locals; only
+   real captured variables are named there."
+  (flet ((pfx (p) (let ((n (length p)))
+                    (and (>= (length name) n) (string= name p :end1 n)))))
+    (or (labels-cell-var-p name)
+        (pfx "%BTAG-")
+        (pfx "%TBID-"))))
+
 (defun maybe-tail-callvirt (instrs)
   "Post-pass for compile-function-body-direct: if INSTRS ends with (:callvirt ...),
   insert (:tail-prefix) immediately before it. Only called when there is no
@@ -95,7 +136,9 @@
                      (loop for tmp in temps
                            for (key . boxed-p) in *tco-param-entries*
                            if boxed-p
-                             append `((:ldloc ,key) (:ldc-i4 0) (:ldloc ,tmp) (:stelem-ref))
+                             append (if *emit-source-lines*
+                                        `((:ldloc ,key) (:ldloc ,tmp) (:stfld "LispBox.Value"))
+                                        `((:ldloc ,key) (:ldc-i4 0) (:ldloc ,tmp) (:stelem-ref)))
                            else
                              append `((:ldloc ,tmp) (:stloc ,key))))))
           (return-from compile-named-call
@@ -1378,14 +1421,12 @@
          for key = (cdr (assoc p locals-alist))
          for i from 0
          if (boxed-var-p p)
-           append `((:declare-local ,key "LispObject[]")
-                    (:ldc-i4 1) (:newarr "LispObject") (:dup)
-                    (:ldc-i4 0) ,@(funcall arg-elem-fn i)
-                    (:stelem-ref) (:stloc ,key))
+           append (emit-box-create key (funcall arg-elem-fn i) p)
          else
            append `((:declare-local ,key "LispObject")
                     ,@(funcall arg-elem-fn i)
-                    (:stloc ,key)))
+                    (:stloc ,key)
+                    ,@(%local-var-marker key p)))
    ;; Optional params: check args.Length (with boxing & supplied-p support)
    (let ((opt-instrs nil)
          (remaining-opt-names (mapcar #'car optional)))
@@ -1413,10 +1454,7 @@
                                             (emit-nil))
                                       (:label ,done-label)
                                       (:stloc ,tmp)
-                                      (:declare-local ,key "LispObject[]")
-                                      (:ldc-i4 1) (:newarr "LispObject") (:dup)
-                                      (:ldc-i4 0) (:ldloc ,tmp) (:stelem-ref)
-                                      (:stloc ,key)))
+                                      ,@(emit-box-create key (list (list :ldloc tmp)) opt-name)))
                                   `((:declare-local ,key "LispObject")
                                     ,@args-array-instrs (:ldlen) (:conv-i4)
                                     (:ldc-i4 ,(1+ i))
@@ -1428,7 +1466,8 @@
                                           (compile-expr opt-default)
                                           (emit-nil))
                                     (:label ,done-label)
-                                    (:stloc ,key)))))
+                                    (:stloc ,key)
+                                    ,@(%local-var-marker key opt-name)))))
               ;; After initializing, this param is now visible to subsequent defaults
               (pop remaining-opt-names)
               ;; supplied-p variable right after its optional param
@@ -1488,10 +1527,7 @@
                                  (:label ,found-label)
                                  (:label ,done-label)
                                  (:stloc ,tmp)
-                                 (:declare-local ,key "LispObject[]")
-                                 (:ldc-i4 1) (:newarr "LispObject") (:dup)
-                                 (:ldc-i4 0) (:ldloc ,tmp) (:stelem-ref)
-                                 (:stloc ,key)))
+                                 ,@(emit-box-create key (list (list :ldloc tmp)) var-name)))
                              `((:declare-local ,key "LispObject")
                                ,@args-array-instrs (:ldc-i4 ,key-start)
                                (:ldstr ,key-name)
@@ -1503,7 +1539,8 @@
                                (:br ,done-label)
                                (:label ,found-label)
                                (:label ,done-label)
-                               (:stloc ,key))))))
+                               (:stloc ,key)
+                               ,@(%local-var-marker key var-name))))))
          ;; supplied-p variable right after its key param
          (when sp-var
            (let ((sp-key (cdr (assoc sp-var locals-alist)))
@@ -1531,13 +1568,14 @@
      (let ((key (cdr (assoc rest-param locals-alist)))
            (n key-start))
        (if (boxed-var-p rest-param)
-           `((:declare-local ,key "LispObject[]")
-             (:ldc-i4 1) (:newarr "LispObject") (:dup)
-             (:ldc-i4 0) ,@args-array-instrs (:ldc-i4 ,n) (:call "Runtime.CollectRestArgs")
-             (:stelem-ref) (:stloc ,key))
+           (emit-box-create key (append args-array-instrs
+                                        (list (list :ldc-i4 n)
+                                              (list :call "Runtime.CollectRestArgs")))
+                            rest-param)
            `((:declare-local ,key "LispObject")
              ,@args-array-instrs (:ldc-i4 ,n) (:call "Runtime.CollectRestArgs")
-             (:stloc ,key)))))))
+             (:stloc ,key)
+             ,@(%local-var-marker key rest-param)))))))
 
 (defun compile-args-arity-instrs (fn-name optional key-specs rest-param has-key-p
                                   n-required args-array-instrs)
@@ -1642,19 +1680,18 @@
                           for key = (cdr (assoc p local-keys))
                           for i from 1
                           append `((:declare-local ,key "Int64")
-                                   (:ldarg ,i) (:stloc ,key)))
+                                   (:ldarg ,i) (:stloc ,key)
+                                   ,@(%local-var-marker key p)))
                     ;; Normal body: params as LispObject (with boxed-var support)
                     (loop for p in required
                           for key = (cdr (assoc p local-keys))
                           for i from 0
                           if (boxed-var-p p)
-                            append `((:declare-local ,key "LispObject[]")
-                                     (:ldc-i4 1) (:newarr "LispObject") (:dup)
-                                     (:ldc-i4 0) (:ldarg ,i)
-                                     (:stelem-ref) (:stloc ,key))
+                            append (emit-box-create key (list (list :ldarg i)) p)
                           else
                             append `((:declare-local ,key "LispObject")
-                                     (:ldarg ,i) (:stloc ,key))))))
+                                     (:ldarg ,i) (:stloc ,key)
+                                     ,@(%local-var-marker key p))))))
           (let* ((special-param-syms
                    (union (fn-body-special-params body (mapcar #'var-name all-params))
                           (remove-if-not #'global-special-p all-params)))
@@ -1786,13 +1823,11 @@
                                for key = (cdr (assoc p local-keys))
                                for i from 1
                                if (boxed-var-p p)
-                                 append `((:declare-local ,key "LispObject[]")
-                                          (:ldc-i4 1) (:newarr "LispObject") (:dup)
-                                          (:ldc-i4 0) (:ldarg ,i)
-                                          (:stelem-ref) (:stloc ,key))
+                                 append (emit-box-create key (list (list :ldarg i)) p)
                                else
                                  append `((:declare-local ,key "LispObject")
-                                          (:ldarg ,i) (:stloc ,key)))
+                                          (:ldarg ,i) (:stloc ,key)
+                                          ,@(%local-var-marker key p)))
                          param-instrs))
                    (eff-self-fn-prelude (if self-arg0-p '() self-fn-prelude))
                    (eff-body-instrs (if self-arg0-p
@@ -2256,6 +2291,16 @@
           ty)))))
 
 (defun compile-let (bindings body sequential-p)
+  "Compile (let/let* ...), wrapping the result in a debug scope so its lexical
+   locals are named only within this binding form. Nested lets nest their scopes,
+   giving the debugger correct shadowing (a method-wide scope can't disambiguate
+   two same-named vars). No-op wrapper when debug info is off."
+  (let ((result (%compile-let bindings body sequential-p)))
+    (if *emit-source-lines*
+        `((:scope-begin) ,@result (:scope-end))
+        result)))
+
+(defun %compile-let (bindings body sequential-p)
   "Compile (let bindings body...) or (let* bindings body...)."
   (multiple-value-bind (declared-specials real-body) (extract-specials body)
     (let* ((all-specials (append declared-specials *specials*))
@@ -2376,7 +2421,8 @@
                                    (append init-instrs
                                            `((:declare-local ,key "Int64")
                                              ,@(compile-expr-to-long init-form)
-                                             (:stloc ,key)))))
+                                             (:stloc ,key)
+                                             ,@(%local-var-marker key (first b))))))
                            (nfk
                              ;; Native float rep: raw r8/r4 slot, init lowered
                              ;; to a native float (still in the OLD scope).
@@ -2384,7 +2430,8 @@
                                    (append init-instrs
                                            `((:declare-local ,key ,(ecase nfk (:double "Double") (:single "Single")))
                                              ,@(compile-float-native-value init-form nfk)
-                                             (:stloc ,key)))))
+                                             (:stloc ,key)
+                                             ,@(%local-var-marker key (first b))))))
                            (t
                              (let ((init-code
                                      (let ((*in-tail-position* nil)
@@ -2404,11 +2451,13 @@
                                    ;; stloc directly. The new scope's *locals*
                                    ;; entry already points at this key, so no
                                    ;; further bind-instr is needed for this var.
+                                   ;; Under debug, name this user lexical for the PDB.
                                    (setf init-instrs
                                          (append init-instrs
                                                  `((:declare-local ,key "LispObject")
                                                    ,@init-code
-                                                   (:stloc ,key))))))))))
+                                                   (:stloc ,key)
+                                                   ,@(%local-var-marker key (first b)))))))))))
               ;; Now bind in new scope
               ;; Filter *boxed-vars* to remove names being rebound as non-boxed
               (let* ((non-boxed-names (set-difference
@@ -2482,11 +2531,7 @@
                              ((member (var-name var) needs-boxing :test #'string=)
                               (setf bind-instrs
                                     (append bind-instrs
-                                            `((:declare-local ,key "LispObject[]")
-                                              (:ldc-i4 1) (:newarr "LispObject")
-                                              (:dup) (:ldc-i4 0)
-                                              (:ldloc ,tk) (:stelem-ref)
-                                              (:stloc ,key)))))
+                                            (emit-box-create key (list (list :ldloc tk)) var))))
                              (t
                               ;; Plain lexical: already initialized in
                               ;; init-instrs via direct stloc to key.
@@ -2611,11 +2656,7 @@
                                  (if (member (var-name var) needs-boxing :test #'string=)
                                      (setf bind-instrs
                                            (append bind-instrs
-                                                   `((:declare-local ,key "LispObject[]")
-                                                     (:ldc-i4 1) (:newarr "LispObject")
-                                                     (:dup) (:ldc-i4 0)
-                                                     ,@init-code
-                                                     (:stelem-ref) (:stloc ,key))))
+                                                   (emit-box-create key init-code var)))
                                      (progn
                                        ;; Remove from *boxed-vars* to shadow outer boxed binding (e.g. labels)
                                        (when (boxed-var-p var)
@@ -2631,7 +2672,8 @@
                                                                ((eq nfk :single) "Single")
                                                                (t "LispObject")))
                                                        ,@init-code
-                                                       (:stloc ,key))))))))))
+                                                       (:stloc ,key)
+                                                       ,@(%local-var-marker key var))))))))))
               ;; Remove declared-specials from *locals* so body references use dynamic binding
               (let* ((ds-names (mapcar #'var-name declared-specials))
                      ;; Body inherits outer *in-tail-position*; TCO branches
@@ -2812,7 +2854,9 @@
                 `((:declare-local ,tmp "LispObject")
                   ,@val-instrs
                   (:stloc ,tmp)
-                  (:ldloc ,key) (:ldc-i4 0) (:ldloc ,tmp) (:stelem-ref)
+                  ,@(if (and *emit-source-lines* (not (labels-cell-var-p var)))
+                        `((:ldloc ,key) (:ldloc ,tmp) (:stfld "LispBox.Value"))
+                        `((:ldloc ,key) (:ldc-i4 0) (:ldloc ,tmp) (:stelem-ref)))
                   (:ldloc ,tmp)))
               ;; Simple local: store and return value
               `(,@val-instrs
@@ -2946,9 +2990,22 @@
                                                   :key #'first :test #'string=)))
                                     (and lf (third lf))))))
                           free-vars))
+         ;; Under debug, the subset of boxed captures that are DATA variables
+         ;; (a boxed lexical in *locals*, not a captured labels function cell)
+         ;; use the LispBox representation and so must be loaded/declared as
+         ;; LispBox in the body. Labels function cells stay LispObject[1].
+         (outer-lispbox-fvs
+           (when *emit-source-lines*
+             (remove-if-not (lambda (fv)
+                              (let ((entry (assoc fv *locals*
+                                                  :key (lambda (k) (var-name k))
+                                                  :test #'string=)))
+                                (and entry (boxed-var-p (car entry))
+                                     (not (labels-cell-var-p (car entry))))))
+                            free-vars)))
          ;; Compile inner body with env slots
          (inner-body (compile-closure-body params body free-vars outer-boxed-fvs
-                                           "" direct-p)))
+                                           "" direct-p outer-lispbox-fvs)))
     `(,@env-build-instrs
       (:make-closure
        :param-count ,(length required)
@@ -2963,12 +3020,20 @@
                                                    :test #'string=)))
                                  (if entry
                                      (if (boxed-var-p (car entry))
-                                         (list fv i "boxed")
+                                         ;; Data var: LispBox under debug (so the
+                                         ;; body loads env[i] as LispBox), else
+                                         ;; LispObject[1]. Labels function cells
+                                         ;; stay LispObject[1] even under debug.
+                                         (list fv i
+                                               (if (and *emit-source-lines*
+                                                        (not (labels-cell-var-p (car entry))))
+                                                   "lispbox" "boxed"))
                                          (list fv i "value"))
                                      ;; Only check *local-functions* when not in *locals*
                                      (let ((lf (find fv *local-functions*
                                                      :key #'first :test #'string=)))
                                        (if (and lf (third lf))
+                                           ;; Labels function cell: always LispObject[1].
                                            (list fv i "boxed")
                                            (list fv i "value"))))))
        :body ,inner-body)))))
@@ -2998,7 +3063,7 @@
               `((:dup) (:ldc-i4 ,idx) (:ldsfld "Nil.Instance") (:stelem-ref)))))))
 
 (defun compile-closure-body (params body free-vars &optional outer-boxed-fvs (fn-name "")
-                                                             direct-p)
+                                                             direct-p outer-lispbox-fvs)
   "Compile function body for closure. Free vars access env (arg 0), params from args (arg 1).
    OUTER-BOXED-FVS is a list of free var name strings that were boxed in the outer scope.
    Handles &rest/&optional/&key parameters.
@@ -3054,17 +3119,36 @@
       (loop for fv in free-vars
             for i from 0
             do (let* ((key (gen-local fv))
-                      (is-outer-boxed (member fv outer-boxed-fvs :test #'string=)))
-                 (push (cons (intern fv :dotcl.cil-compiler) key) env-locals)
+                      (fv-sym (intern fv :dotcl.cil-compiler))
+                      (is-lispbox (member fv outer-lispbox-fvs :test #'string=))
+                      (is-outer-boxed (member fv outer-boxed-fvs :test #'string=))
+                      ;; Name the captured slot in the closure body's Locals, but
+                      ;; only for real user variables (not labels cells / block /
+                      ;; tagbody machinery) — so a variable closed over shows by
+                      ;; name when stopped inside the lambda.
+                      (marker (unless (%synthetic-capture-name-p fv)
+                                (%local-var-marker key fv-sym))))
+                 (push (cons fv-sym key) env-locals)
                  (setf env-instrs
                        (append env-instrs
-                               (if is-outer-boxed
-                                   `((:declare-local ,key "LispObject[]")
-                                     (:load-env ,i)
-                                     (:stloc ,key))
-                                   `((:declare-local ,key "LispObject")
-                                     (:load-env ,i)
-                                     (:stloc ,key)))))))
+                               (cond
+                                 ;; Debug data-var box: LispBox cell from env.
+                                 (is-lispbox
+                                  `((:declare-local ,key "LispBox")
+                                    (:load-env ,i)
+                                    (:stloc ,key)
+                                    ,@marker))
+                                 ;; LispObject[1] box (labels cell, or non-debug).
+                                 (is-outer-boxed
+                                  `((:declare-local ,key "LispObject[]")
+                                    (:load-env ,i)
+                                    (:stloc ,key)
+                                    ,@marker))
+                                 (t
+                                  `((:declare-local ,key "LispObject")
+                                    (:load-env ,i)
+                                    (:stloc ,key)
+                                    ,@marker)))))))
       ;; Set up params
       (let* ((param-locals
                (loop for p in all-params

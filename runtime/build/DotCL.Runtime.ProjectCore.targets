@@ -31,6 +31,13 @@
     <DotclRootSourcesList>$(DotclBundleDir)dotcl-root-sources.txt</DotclRootSourcesList>
     <DotclDeployedManifest>$(DotclBundleDir)dotcl-deps.txt</DotclDeployedManifest>
     <DotclRootFasl>$(DotclBundleDir)$(MSBuildProjectName).fasl</DotclRootFasl>
+
+    <!-- Emit a Portable PDB (source-debuggable .lisp) on a Debug build. Defaults
+         from $(Configuration); a consumer can force it either way by setting
+         <DotclDebugInfo> explicitly. The .pdb ships next to the fasl (see
+         _DotCLInjectAssets) so a debugger binds breakpoints in the source. -->
+    <DotclDebugInfo Condition="'$(DotclDebugInfo)' == '' and '$(Configuration)' == 'Debug'">true</DotclDebugInfo>
+    <DotclDebugInfo Condition="'$(DotclDebugInfo)' == ''">false</DotclDebugInfo>
   </PropertyGroup>
 
   <UsingTask Condition="'$(DotclProjectAsd)' != '' and Exists('$(_DotCLTaskAssembly)')"
@@ -102,7 +109,8 @@
                          BuildInit="@(DotclBuildInit)"
                          AsdSearchPath="@(DotclAsdSearchPath)"
                          ReferencePath="@(ReferenceCopyLocalPaths)"
-                         RuntimeAssemblyPath="$(_DotCLRuntimeAssembly)" />
+                         RuntimeAssemblyPath="$(_DotCLRuntimeAssembly)"
+                         DebugInfo="$(DotclDebugInfo)" />
   </Target>
 
   <!-- Step 5: write the deployment manifest (base core, deps, root fasl) using
@@ -133,6 +141,9 @@
           Condition="'$(DotclProjectAsd)' != '' and Exists('$(DotclDeployedManifest)')">
     <ItemGroup>
       <_DotclBundled Include="$(DotclBundleDir)*.fasl" />
+      <!-- Debug build: ship the .pdb next to its fasl so the debugger finds the
+           symbols and binds breakpoints in the .lisp. Empty on a Release build. -->
+      <_DotclBundled Include="$(DotclBundleDir)*.pdb" />
       <_DotclBundled Include="$(DotclBundleDir)dotcl.core" Condition="Exists('$(DotclBundleDir)dotcl.core')" />
       <_DotclBundled Include="$(DotclDeployedManifest)" />
     </ItemGroup>

@@ -68,6 +68,11 @@ public class Reader
     private bool _readSuppress;
     public bool ReadSuppress { get => _readSuppress; set => _readSuppress = value; }
     private int _line = 1;
+    // Absolute Position of the current line's first char, so a 1-based column is
+    // Position - _lineStartPos + 1. Position is maintained through pushback/unread,
+    // so this stays correct without per-char column bookkeeping.
+    private int _lineStartPos = 0;
+    private int CurCol => Position - _lineStartPos + 1;
     private Dictionary<int, LispObject> _shareLabels = new();
     private Dictionary<int, SharePlaceholder> _sharePlaceholders = new();
     // Nesting depth of the public top-level Read/TryRead. #n=/#n# label scope is one
@@ -164,20 +169,20 @@ public class Reader
         if (_inputPrefixPos < _inputPrefix.Length)
         {
             var ch2 = _inputPrefix[_inputPrefixPos++];
-            if (ch2 == '\n') _line++;
             Position++;
+            if (ch2 == '\n') { _line++; _lineStartPos = Position; }
             return ch2;
         }
         if (_hasPushback)
         {
             _hasPushback = false;
-            if (_pushedBack == '\n') _line++;
             Position++;
+            if (_pushedBack == '\n') { _line++; _lineStartPos = Position; }
             return _pushedBack;
         }
         var ch = _input.Read();
-        if (ch == '\n') _line++;
         if (ch != -1) Position++;
+        if (ch == '\n') { _line++; _lineStartPos = Position; }
         return ch;
     }
 
@@ -620,6 +625,11 @@ public class Reader
     /// <summary>Reader macro function for '(' — read a list (CLHS 2.4.1).</summary>
     internal LispObject ReadList(char _triggerChar)
     {
+        // Line of the opening paren — used to source-map the resulting form for
+        // debug info (only when line tracking is active; see Runtime.SourceLineTable).
+        int startLine = _line;
+        // Column of the opening paren (already consumed, so it sits at Position-1).
+        int startCol = Position - _lineStartPos;
         var items = new List<LispObject>();
         LispObject? dotCdr = null;
 
@@ -678,6 +688,11 @@ public class Reader
         LispObject result = dotCdr ?? Nil.Instance;
         for (int i = items.Count - 1; i >= 0; i--)
             result = new Cons(items[i], result);
+
+        // Source-map the outer cons to the form's span, opening paren through the
+        // char past the closing paren (no-op unless a debug build has tracking on).
+        if (Runtime.SourceLineTable != null && result is Cons)
+            Runtime.StampSourceLine(result, startLine, startCol < 1 ? 1 : startCol, _line, CurCol);
 
         return result;
     }

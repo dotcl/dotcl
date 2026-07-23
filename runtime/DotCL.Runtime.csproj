@@ -108,6 +108,9 @@
     <!-- build-tasks/ is a separate MSBuild-task assembly that lives under
          runtime/; keep its sources out of the runtime library's default glob. -->
     <Compile Remove="build-tasks/**/*.cs" />
+    <!-- sdk/ is the DotCL.Sdk MSBuild-SDK packaging project (props/targets only,
+         no runtime sources). Keep its obj/ generated .cs out of the default glob. -->
+    <Compile Remove="sdk/**/*.cs" />
   </ItemGroup>
 
   <!-- contrib/ sources are separate assemblies (e.g. dotcl-jitdisasm needs Iced +

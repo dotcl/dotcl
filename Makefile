@@ -34,6 +34,10 @@ test-regression: build $(DOTCL_ROOT)compiler/cil-out.sil
 	@echo "=== Running dotcl regression tests ==="
 	$(SETSID) dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --asm $(DOTCL_ROOT)compiler/cil-out.sil $(DOTCL_ROOT)test/regression/run.lisp
 
+test-debug-pdb: build $(DOTCL_ROOT)compiler/cil-out.sil
+	@echo "=== Running debug-path (DOTCL_EMIT_PDB) checks ==="
+	sh $(DOTCL_ROOT)test/debug-pdb/check.sh $(DOTCL_ROOT)
+
 test-ansi-extra: build $(DOTCL_ROOT)compiler/cil-out.sil
 	@echo "=== Running CLHS audit extra tests ==="
 	$(SETSID) dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --asm $(DOTCL_ROOT)compiler/cil-out.sil $(DOTCL_ROOT)test/test-ansi-extra.lisp
@@ -400,14 +404,35 @@ $(DOTCL_ROOT)runtime/Generated/UnicodeCharNames.g.cs: $(DOTCL_ROOT)scripts/Unico
 	$(GEN_UTILS_EXE) char-names $< $@
 
 gen-char-names: $(DOTCL_ROOT)runtime/Generated/UnicodeCharNames.g.cs
-CROSSGEN2 = $(firstword $(wildcard $(HOME)/.nuget/packages/microsoft.netcore.app.crossgen2.$(HOST_RID)/*/tools/$(CROSSGEN2_EXE)))
+# Pick the HIGHEST installed version, not $(firstword $(wildcard ...)): wildcard
+# returns lexicographic order, so a cache holding both 10.0.x and a future 11.0.x
+# would keep selecting the stale 10.0.x ("10" < "11" as strings). $(wildcard)
+# still does the globbing (it handles the native $(HOME) path); we only sort its
+# result by version. (Both build hosts — Linux CI and MSYS2 — ship GNU sort.)
+CROSSGEN2 = $(shell echo "$(wildcard $(HOME)/.nuget/packages/microsoft.netcore.app.crossgen2.$(HOST_RID)/*/tools/$(CROSSGEN2_EXE))" | tr ' ' '\n' | sort -V | tail -1)
+
+# Cross-OS R2R needs the HOST crossgen2 pack, but a target-rid publish restores
+# it only unreliably: the pack arrives as a side effect of PublishReadyToRun,
+# which is non-deterministic when the host OS differs from the target OS (a
+# cross-OS release CI would then die on "crossgen2 not found"). A HOST-rid
+# publish is same-OS and restores the host crossgen2 pack deterministically, so
+# prime it once before any per-RID R2R rule. Each R2R rule depends on this, so
+# it runs first even under parallel make. Fails loudly if even the host publish
+# cannot restore crossgen2 (a real environment problem, not a silent R2R skip).
+.PHONY: prime-crossgen2
+prime-crossgen2:
+	@echo "=== prime host crossgen2 (HOST_RID=$(HOST_RID)) ==="
+	dotnet publish $(DOTCL_ROOT)runtime/runtime.csproj -c Release -r $(HOST_RID) --self-contained false -p:PublishReadyToRun=true >/dev/null
+	@test -n "$(CROSSGEN2)" || (echo "error: host crossgen2 pack still missing after host publish (HOST_RID=$(HOST_RID))" && exit 1)
+	@echo "crossgen2: $(CROSSGEN2)"
 
 # Per-RID runtime ref dir (NuGet cache; populated by `dotnet publish -r <rid>`).
-runtime_ref = $(firstword $(wildcard $(HOME)/.nuget/packages/microsoft.netcore.app.runtime.$(1)/*/runtimes/$(1)/lib/net10.0))
+# Highest version, not lexicographic firstword — see CROSSGEN2 above.
+runtime_ref = $(shell echo "$(wildcard $(HOME)/.nuget/packages/microsoft.netcore.app.runtime.$(1)/*/runtimes/$(1)/lib/net10.0)" | tr ' ' '\n' | sort -V | tail -1)
 
 # Generate compile-{core,asdf}-fasl-r2r-<rid> targets for each RID.
 define R2R_RULES
-compile-core-fasl-r2r-$(1): compile-core-fasl
+compile-core-fasl-r2r-$(1): compile-core-fasl prime-crossgen2
 	dotnet publish $$(DOTCL_ROOT)runtime/runtime.csproj -c Release -r $(1) --self-contained false -p:PublishReadyToRun=true >/dev/null
 	@test -n "$$(CROSSGEN2)" || (echo "error: crossgen2 not found (HOST_RID=$(HOST_RID)). Is 'dotnet --info' showing the correct RID?" && exit 1)
 	@test -n "$$(call runtime_ref,$(1))" || (echo "error: runtime ref for $(1) not found" && exit 1)

@@ -1052,7 +1052,14 @@
    :declare-local entries, which can bring an (:ldloc X)(:stloc X) pair
    (separated by a declare in the raw stream) into adjacency where the
    peephole can collapse it."
-  (peephole-optimize (%merge-disjoint-locals instrs)))
+  ;; Under debug info emission, skip slot sharing so each source variable keeps
+  ;; its own physical slot (a coalesced slot would host several source vars over
+  ;; its lifetime, which a method-wide PDB LocalVariable name can't represent).
+  ;; The classic "debug builds don't reuse slots" tradeoff. Peephole still runs.
+  (peephole-optimize
+   (if *emit-source-lines*
+       instrs
+       (%merge-disjoint-locals instrs))))
 
 (defun %merge-disjoint-locals (instrs)
   "Linear-scan slot sharing: merge LispObject locals whose flat live ranges

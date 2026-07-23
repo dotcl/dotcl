@@ -951,7 +951,7 @@ public static class Startup
         // Symbols not in CL go to DOTCL-INTERNAL.
         var (sym2, status2) = Internal.FindSymbol(name);
         if (status2 != SymbolStatus.None) { _symCache[name] = sym2; return sym2; }
-        // Cross-package bridge (replaces the old flat _functions table, D683 / #113):
+        // Cross-package bridge (replaces the old flat _functions table):
         foreach (var pkg in Package.AllPackages)
         {
             var (existingSym, existingStatus) = pkg.FindSymbol(name);
@@ -989,7 +989,13 @@ public static class Startup
         var cacheKey = packageName is null ? name : name + "\0" + packageName;
         if (_symFnCache.TryGetValue(cacheKey, out var cached)) return cached;
         var (sym, status) = CL.FindSymbol(name);
-        if (status != SymbolStatus.None) { _symFnCache[cacheKey] = sym; return sym; }
+        // A CL symbol wins only when it actually names something callable. The CL
+        // package also holds non-standard implementation symbols (the backquote
+        // markers UNQUOTE / QUASIQUOTE / UNQUOTE-SPLICING, reader internals, …);
+        // those are never fbound, and must not hijack a same-named user function
+        // in the caller's package (ironclad's crypto::unquote).
+        if (status != SymbolStatus.None && (sym.Function != null || sym.SetfFunction != null))
+        { _symFnCache[cacheKey] = sym; return sym; }
         // Check the home package first so unqualified calls resolve correctly.
         if (packageName is not null)
         {
@@ -1024,6 +1030,9 @@ public static class Startup
             var (homeSym2, homeStatus2) = homePkg2.FindSymbol(name);
             if (homeStatus2 != SymbolStatus.None) return homeSym2;
         }
+        // An unbound CL symbol still names the call better than a fresh
+        // DOTCL-INTERNAL placeholder (not cached: it may become fbound later).
+        if (status != SymbolStatus.None) return sym;
         var (sym2, status2) = Internal.FindSymbol(name);
         if (status2 != SymbolStatus.None) return sym2;
         var (newSym, _) = Internal.Intern(name);
@@ -1043,6 +1052,22 @@ public static class Startup
         if (status2 != SymbolStatus.None) return sym2;
         var (newSym, _) = Internal.Intern(name);
         return newSym;
+    }
+
+    /// <summary>
+    /// Load-time symbol pre-interning for .fasl files: intern NAME in PKGNAME if
+    /// that package exists, otherwise do nothing. Called from ModuleInit for every
+    /// symbol the fasl names, so a symbol reachable only from a not-yet-built
+    /// constant (e.g. one appearing solely inside a macro's backquote template)
+    /// still exists right after the fasl loads — a later file's defpackage
+    /// :import-from must be able to find it. The package guard keeps a fasl that
+    /// references a package it does not itself define from interning a placeholder
+    /// somewhere wrong.
+    /// </summary>
+    public static void PreinternSymbol(string name, string pkgName)
+    {
+        if (Package.FindPackage(pkgName) is null) return;
+        SymInPkg(name, pkgName);
     }
 
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<(string, string), Symbol> _symInPkgCache = new();
