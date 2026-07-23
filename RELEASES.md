@@ -13,8 +13,10 @@ against a silent misconfiguration.
 ### Visual Studio debugging
 
 - `dotnet new dotcl-app` scaffolds a Common Lisp console app as an ordinary
-  MSBuild project. Building it with `<Project Sdk="DotCL.Sdk">` produces a normal
-  .NET assembly you can run and, in Visual Studio, debug with F5.
+  MSBuild project that references the `DotCL.Runtime` package and compiles the
+  Lisp into the build output. You can run it and, in Visual Studio, debug it with
+  F5. A `DotCL.Sdk` MSBuild SDK is also published as a more concise way to write
+  the same project (`<Project Sdk="DotCL.Sdk">`).
 - A Debug build emits Portable PDBs beside the compiled Lisp, so you can set
   breakpoints in `.lisp`, step through it expression by expression, and inspect
   variables in the Locals window -- parameters, `let` / `let*` bindings, and
