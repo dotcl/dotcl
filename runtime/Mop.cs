@@ -63,6 +63,7 @@ public static class Mop
             MopPkg.Export(s);
         }
 
+
         // -- Class introspection ------------------------------------------
         RegisterMop("CLASS-DIRECT-SUPERCLASSES", 1, args =>
             args[0] is LispClass c ? Runtime.List(c.DirectSuperclasses.Cast<LispObject>().ToArray()) : Nil.Instance);
@@ -518,6 +519,27 @@ public static class Mop
             var result = MultipleValues.Primary(gf.Invoke(new LispObject[] { cls, name, defsList }));
             return result as SlotDefinition;
         };
+        // Gap-fill: every DOTCL-MOP symbol still unbound after the RegisterMop/
+        // RegisterMopGF calls above was flat-registered via
+        // CilAssembler.RegisterFunction BEFORE Mop.Init ran — so the
+        // RegisterFunction mirror couldn't fire (MopPkg was null). Adopt the
+        // Function from the same-named fbound symbol in CL or DOTCL-INTERNAL
+        // (matching Startup.SymForRegistration's lookup precedence) so
+        // package-qualified dotcl-mop:<name> calls resolve (GetFunctionBySymbol
+        // is authoritative).
+        foreach (var sym in MopPkg.ExternalSymbols)
+        {
+            if (sym.Function != null) continue;
+            var (clSym, clSt) = Startup.CL.FindSymbol(sym.Name);
+            if (clSt != SymbolStatus.None && clSym.Function is LispFunction clFn)
+            {
+                sym.Function = clFn;
+                continue;
+            }
+            var (internalSym, internalSt) = Startup.Internal.FindSymbol(sym.Name);
+            if (internalSt != SymbolStatus.None && internalSym.Function is LispFunction fn)
+                sym.Function = fn;
+        }
     }
 
     // --- helpers -------------------------------------------------------------

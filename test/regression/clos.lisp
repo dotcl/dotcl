@@ -481,7 +481,7 @@
 
 (deftest i352-nonmonotonic-cpl-order
   (mapcar #'class-name
-          (dotcl::class-precedence-list (find-class 'i352-h)))
+          (dotcl-mop:class-precedence-list (find-class 'i352-h)))
   (i352-h i352-f i352-d i352-c i352-g i352-e i352-b i352-a standard-object t))
 
 ;;; Cross-package same-named classes must stay distinct even when one is

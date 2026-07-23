@@ -931,22 +931,27 @@ public static class Startup
                 tag, clauseIndex, args.Length > 0 ? args[0] : Nil.Instance));
 
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, Symbol> _symCache = new();
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, Symbol> _symFnCache = new();
 
+    /// <summary>
+    /// Deterministic data-symbol resolver for :load-sym (data positions: slot
+    /// names, member-type constituents, etc.). Resolution order is fixed:
+    /// CL → DOTCL-INTERNAL (cache the hit) → cross-package bridge → intern
+    /// placeholder (NOT cached). The cache and the CL→DOTCL-INTERNAL→bridge
+    /// ordering make symbol identity stable for the session: a bare data
+    /// symbol always resolves to the same Symbol instance regardless of
+    /// later fbound-foreign registrations. Function-call sites use SymFn
+    /// (via :load-sym-fn) for the bridging behavior.
+    /// </summary>
     public static Symbol Sym(string name)
     {
         if (_symCache.TryGetValue(name, out var cached)) return cached;
         var (sym, status) = CL.FindSymbol(name);
         if (status != SymbolStatus.None) { _symCache[name] = sym; return sym; }
         // Symbols not in CL go to DOTCL-INTERNAL.
-        // Avoids polluting CL or CL-USER. Will be resolved by self-hosting.
         var (sym2, status2) = Internal.FindSymbol(name);
         if (status2 != SymbolStatus.None) { _symCache[name] = sym2; return sym2; }
-        // Cross-package bridge (replaces the old flat _functions table):
-        // cross-compiled code emits LOAD-SYM with the bare function name even when the
-        // defun's home package is e.g. DOTCL.CIL-COMPILER. Check if any package has a
-        // symbol by that name with a Function bound, and adopt it. Without this bridge
-        // functions defined in non-CL packages are unreachable through flat-name
-        // lookup (GetFunctionBySymbol would see newSym with null Function).
+        // Cross-package bridge (replaces the old flat _functions table, D683 / #113):
         foreach (var pkg in Package.AllPackages)
         {
             var (existingSym, existingStatus) = pkg.FindSymbol(name);
@@ -956,11 +961,71 @@ public static class Startup
                 return existingSym;
             }
         }
-        // Intern a fresh placeholder in DOTCL-INTERNAL, but DO NOT cache — a
-        // later defun/defmethod-direct in another package may register the
-        // function on a different symbol, and a subsequent Sym() call needs
-        // to re-search the packages to find it. Caching here would pin a
-        // Function-less bogus symbol forever (cache-pollution fix).
+        // Intern a fresh placeholder in DOTCL-INTERNAL, but DO NOT cache.
+        var (newSym, _) = Internal.Intern(name);
+        return newSym;
+    }
+
+    /// <summary>
+    /// Bridging symbol lookup for unqualified function-call sites (emit :load-sym-fn).
+    /// Runs the cross-package bridge BEFORE the DOTCL-INTERNAL check and does NOT cache
+    /// the DOTCL-INTERNAL placeholder, so a later-fbound foreign symbol (e.g.
+    /// class-precedence-list registered in DOTCL-MOP) is adopted on the next call.
+    /// This is the fe63591 Sym behavior, preserved for the function-call case only.
+    /// </summary>
+    public static Symbol SymFn(string name) => SymFn(name, null);
+
+    /// <summary>
+    /// Function-call symbol resolver for :load-sym-fn. Like Sym but bridges to
+    /// find the registered fbound symbol. When packageName is supplied (the
+    /// symbol's home package at compile time), checks that package first so
+    /// unqualified calls resolve to the correct package instead of the first
+    /// fbound hit from Package.AllPackages (which caused find-system in
+    /// ql-dist to resolve to asdf/footer::find-system, creating infinite
+    /// recursion through asdf's search-for-system-definition).
+    /// </summary>
+    public static Symbol SymFn(string name, string? packageName)
+    {
+        var cacheKey = packageName is null ? name : name + "\0" + packageName;
+        if (_symFnCache.TryGetValue(cacheKey, out var cached)) return cached;
+        var (sym, status) = CL.FindSymbol(name);
+        if (status != SymbolStatus.None) { _symFnCache[cacheKey] = sym; return sym; }
+        // Check the home package first so unqualified calls resolve correctly.
+        if (packageName is not null)
+        {
+            var homePkg = Package.FindPackage(packageName);
+            if (homePkg is not null)
+            {
+                var (homeSym, homeStatus) = homePkg.FindSymbol(name);
+                if (homeStatus != SymbolStatus.None && homeSym.Function != null)
+                {
+                    _symFnCache[cacheKey] = homeSym;
+                    return homeSym;
+                }
+            }
+        }
+        foreach (var pkg in Package.AllPackages)
+        {
+            var (existingSym, existingStatus) = pkg.FindSymbol(name);
+            if (existingStatus != SymbolStatus.None && existingSym.Function != null)
+            {
+                _symFnCache[cacheKey] = existingSym;
+                return existingSym;
+            }
+        }
+        // Bridge found no fbound symbol. If the home package has the symbol
+        // (even unbound — e.g. reader-interned but never defun'd), return it so
+        // an undefined-function condition carries the symbol the user actually
+        // named (cell-error-name returns CL-TEST::MY-UNDEFINED-FUNCTION, not a
+        // DOTCL-INTERNAL placeholder). Falls back to DOTCL-INTERNAL only if the
+        // home package doesn't have the symbol at all.
+        if (packageName is not null && Package.FindPackage(packageName) is { } homePkg2)
+        {
+            var (homeSym2, homeStatus2) = homePkg2.FindSymbol(name);
+            if (homeStatus2 != SymbolStatus.None) return homeSym2;
+        }
+        var (sym2, status2) = Internal.FindSymbol(name);
+        if (status2 != SymbolStatus.None) return sym2;
         var (newSym, _) = Internal.Intern(name);
         return newSym;
     }

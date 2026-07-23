@@ -472,6 +472,27 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
          `((:load-sym-pkg ,(symbol-name sym) ,(package-name (symbol-package sym)))))
         (t `((:load-sym ,(symbol-name sym))))))
 
+(defun compile-fn-sym-lookup (sym)
+  "Like compile-sym-lookup but for function-call sites: distinguishes
+package-qualified from unqualified calls so GetFunctionBySymbol can be
+authoritative (no cross-package bridge). Package-qualified (symbol-package
+(symbol-package eq *package*) -> :load-sym-fn (Startup.SymFn bridges
+at symbol-resolution to find the registered fbound symbol, checking the
+symbol's home package first). Keywords and uninterned gensyms fall
+through to compile-sym-lookup."
+  (cond ((keywordp sym)
+         `((:load-sym-keyword ,(symbol-name sym))))
+        ((null (symbol-package sym))
+         `((:load-const ,sym)))
+        ((and (not *cross-compiling*)
+              (not (string= (package-name (symbol-package sym)) "COMMON-LISP"))
+              (eq (symbol-package sym) *package*))
+         ;; Unqualified non-CL call: Startup.SymFn bridges to the
+         ;; registered fbound symbol (e.g. class-precedence-list in CL-USER
+         ;; -> dotcl-mop:class-precedence-list).
+         `((:load-sym-fn ,(symbol-name sym) ,(package-name (symbol-package sym)))))
+        (t (compile-sym-lookup sym))))
+
 (defun %runtime-special-p (sym)
   "Check if the runtime marks SYM as special (via IsSpecial flag).
    Returns NIL during cross-compilation or if %SYMBOL-SPECIAL-P is unavailable."

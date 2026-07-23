@@ -256,17 +256,17 @@ public partial class CilAssembler
     }
 
     /// <summary>
-    /// Symbol-based function lookup. sym.Function is primary. If empty,
-    /// fall back to any same-named symbol in another package that has a
-    /// Function — replaces the old _functions flat
-    /// table as a cross-package bridge. Caches the result on sym.Function
-    /// to make subsequent lookups O(1).
+    /// Symbol-based function lookup — authoritative for package-qualified
+    /// compiled calls. Returns sym.Function or signals UNDEFINED-FUNCTION.
+    /// Unqualified compiled calls resolve via Startup.Sym's bare-name bridge
+    /// at symbol-resolution time (emit :load-sym), so sym.Function is already
+    /// the registered function when reached here. The cross-package bridge
+    /// (FindFunctionAcrossPackages) is NOT applied here — a package-qualified
+    /// call to an unbound symbol is undefined (matches SBCL semantics).
     /// </summary>
     public static LispFunction GetFunctionBySymbol(Symbol sym)
     {
         if (sym.Function is LispFunction symFn) return symFn;
-        if (FindFunctionAcrossPackages(sym, cacheOnSym: true) is LispFunction otherFn)
-            return otherFn;
         throw new LispErrorException(new LispUndefinedFunction(sym));
     }
 

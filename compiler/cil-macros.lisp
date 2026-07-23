@@ -2353,13 +2353,20 @@
                (include-accessor-names
                  (when include-slots
                    (mapcar (lambda (s)
-                             (intern (concatenate 'string conc-prefix
-                                                  (symbol-name (car s)))))
+                             ;; CLHS: when :conc-name is nil/empty the accessor
+                             ;; name IS the slot name (same symbol, same package).
+                             ;; Otherwise intern the prefixed name in *package*.
+                             (if (string= conc-prefix "")
+                                 (car s)
+                                 (intern (concatenate 'string conc-prefix
+                                                      (symbol-name (car s))))))
                            include-slots)))
                ;; Accessor names for own slots use this struct's conc-prefix
                (own-accessor-names (mapcar (lambda (s)
-                                             (intern (concatenate 'string conc-prefix
-                                                                  (symbol-name (car s)))))
+                                             (if (string= conc-prefix "")
+                                                 (car s)
+                                                 (intern (concatenate 'string conc-prefix
+                                                                      (symbol-name (car s))))))
                                            slots))
                ;; All accessor names in order (inherited first, then own)
                (accessor-names (append (or include-accessor-names nil) own-accessor-names)))
