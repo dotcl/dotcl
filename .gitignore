@@ -37,6 +37,8 @@ bench-state.json
 !scripts/ilverify-check.sh
 !samples/**/*.sh
 !test/debug-pdb/check.sh
+!test/pack-nuspec/check.sh
+!test/save-class-lib/check.sh
 
 ## qlot (dependency management)
 qlfile

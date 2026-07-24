@@ -166,7 +166,7 @@
    Keyed by symbol identity (not name string).
    Not reset by compile-toplevel (defmacro has global effect).")
 
-(defvar *function-return-types* (make-hash-table :test #'eq)
+(defvar *function-return-types* (make-hash-table :test #'eq :synchronized t)
   "symbol → return-type (currently only 'fixnum is honored).
    Populated by (declaim (ftype (function (...) ret) name...)).
    Used by fixnum-typed-p to recognize `(name args...)` as statically
@@ -200,7 +200,7 @@
              (pop rest))
     result))
 
-(defvar *global-symbol-macros* (make-hash-table :test #'eq)
+(defvar *global-symbol-macros* (make-hash-table :test #'eq :synchronized t)
   "Hash table of global symbol macros defined by DEFINE-SYMBOL-MACRO.")
 
 (defvar *ltv-counter* 0
@@ -426,9 +426,27 @@
    fast path instead of the args-array entry."
   (intern (format nil "~a_~d" prefix (incf *var-counter*)) "DOTCL.CIL-COMPILER"))
 
-(defvar *uninterned-var-names* (make-hash-table :test #'eq)
+(defvar *uninterned-var-names* (make-hash-table :test #'eq :synchronized t)
   "Uninterned variable symbol -> unique effective-name string.")
-(defvar *uninterned-var-counter* 0)
+(defvar *uninterned-var-counter*
+  ;; ATOMIC-LONG on dotcl so (set-parallel-eval t) workers can bump it lock-free:
+  ;; a plain (incf) on a special var is a non-atomic read-modify-write and two
+  ;; workers can lost-update to the same value, minting colliding names for
+  ;; distinct gensyms. MAKE-ATOMIC-LONG is a runtime primitive absent on the SBCL
+  ;; cross-compile host (which never runs VAR-NAME), so resolve it at load time by
+  ;; name — DOTCL:: reader syntax would break reading on the host, which has no
+  ;; DOTCL package. The host keeps a plain integer purely to stay loadable.
+  (if (find-package "DOTCL")
+      (funcall (find-symbol "MAKE-ATOMIC-LONG" "DOTCL") 0)
+      0))
+
+(defun uninterned-var-counter-next ()
+  "Atomically bump the uninterned-var uniqueness counter and return the new
+   value. Lock-free on dotcl (ATOMIC-LONG-INCF); a plain increment on the SBCL
+   host, where VAR-NAME never runs concurrently."
+  (if (integerp *uninterned-var-counter*)
+      (incf *uninterned-var-counter*)
+      (funcall (find-symbol "ATOMIC-LONG-INCF" "DOTCL") *uninterned-var-counter*)))
 
 (defun var-name (sym)
   "Effective name string of a variable symbol for the string-keyed
@@ -444,7 +462,7 @@
       (or (gethash sym *uninterned-var-names*)
           (setf (gethash sym *uninterned-var-names*)
                 (format nil "~a#:~d" (symbol-name sym)
-                        (incf *uninterned-var-counter*))))))
+                        (uninterned-var-counter-next))))))
 
 (defun gen-label (prefix)
   "Generate a unique label symbol in the compiler package.

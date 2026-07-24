@@ -1537,37 +1537,37 @@ collected result will be returned as the value of the LOOP."
   (cond ((loop-tequal (car *loop-source-code*) :then)
 	 ;;Then we are the same as "FOR x FIRST y THEN z".
 	 (loop-pop-source)
-	 `(() (,var ,(loop-get-form)) () ()
-	   () (,var ,val) () ()))
+	 (let ((then-form (loop-get-form)))
+	   ;; The FIRST form runs exactly once. Put its assignment in the loop
+	   ;; prologue at THIS clause's source position instead of in
+	   ;; *loop-before-loop* (which loop-body emits before the whole prologue
+	   ;; — see "(append (nreverse rbefore) prologue)"). Otherwise the first
+	   ;; assignment runs ahead of a textually-earlier :initially clause,
+	   ;; violating ANSI CL 6.1.7.2 (prologue clauses run in source order) and
+	   ;; disagreeing with SBCL. Unlike the no-then case, first-form and
+	   ;; then-form differ, so the loop-body merge that keeps the no-then
+	   ;; assignment in sync cannot apply here. The then-form remains the
+	   ;; per-iteration step (STEPS). loop-make-desetq handles a destructuring
+	   ;; var like the PRE-LOOP-STEPS psetq did.
+	   (push (loop-make-desetq (list var val)) *loop-prologue*)
+	   `(() (,var ,then-form) () ()
+	     () () () ())))
 	(t ;;We are the same as "FOR x = y".
-	 ;; Let me document here what this is returning.  Look at
-	 ;; loop-hack-iteration for more info.  But anyway, we return a list of
-	 ;; 8 items, in this order: PRE-STEP-TESTS, STEPS, POST-STEP-TESTS,
-	 ;; PSEUDO-STEPS, PRE-LOOP-PRE-STEP-TESTS, PRE-LOOP-STEPS,
-	 ;; PRE-LOOP-POST-STEP-TESTS, PRE-LOOP-PSEUDO-STEPS.  (We should add
-	 ;; something to make it easier to figure out what these args are!)
+	 ;; loop-hack-iteration consumes an 8-item list: PRE-STEP-TESTS, STEPS,
+	 ;; POST-STEP-TESTS, PSEUDO-STEPS, PRE-LOOP-PRE-STEP-TESTS, PRE-LOOP-STEPS,
+	 ;; PRE-LOOP-POST-STEP-TESTS, PRE-LOOP-PSEUDO-STEPS.
 	 ;;
-	 ;; For a "FOR x = y" clause without the THEN, we want the STEPS item to
-	 ;; step the variable VAR with the value VAL.  This gets placed in the
-	 ;; body of the loop.  The original code just did that.  It seems that
-	 ;; the STEPS form is placed in *loop-before-loop* and in
-	 ;; *loop-after-loop*.  Loop optimization would then see the same form
-	 ;; in both, and move them into the beginning of body.  This is ok,
-	 ;; except that if there are :initially forms that were placed into the
-	 ;; loop prologue, the :initially forms might refer to incorrectly
-	 ;; initialized variables, because the optimizer moved STEPS from from
-	 ;; *loop-before-loop* into the body.
-	 ;;
-	 ;; To solve this, we add a PRE-LOOP-PSEUDO-STEP form that is identical
-	 ;; to the STEPS form.  This gets placed in *loop-before-loop*.  But
-	 ;; this won't match any *loop-after-loop* form, so it won't get moved,
-	 ;; and we maintain the proper sequencing such that the
-	 ;; PRE-LOOP-PSEUDO-STEP form is in *loop-before-loop*, before any
-	 ;; :initially clauses that might refer to this.  So all is well. Whew.
-	 ;;
-	 ;; I hope this doesn't break anything else.
+	 ;; STEPS = PRE-LOOP-STEPS = (var val); both go through loop-make-psetq so
+	 ;; the *loop-before-loop* form matches the step form and loop-body merges
+	 ;; the first assignment into the start of the body — i.e. AFTER the loop
+	 ;; prologue, so an earlier :initially clause runs first, per ANSI CL
+	 ;; 6.1.7.2 (prologue clauses execute in source order). This matches SBCL.
+	 ;; A PRE-LOOP-PSEUDO-STEP (loop-make-desetq) here would not match the psetq
+	 ;; step form, would fail to merge, and would strand the assignment in the
+	 ;; prologue ahead of :initially (a real ordering bug, seen loading
+	 ;; named-readtables).
 	 `(() (,var ,val) () ()
-	   () () () (,var ,val))
+	   () (,var ,val) () ())
 	 )))
 
 

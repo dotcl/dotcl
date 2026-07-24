@@ -31,8 +31,18 @@ public class SlotDefinition : LispObject
     /// <summary>Storage for the Lisp-level slots introduced by a custom slot-definition
     /// class (e.g. McCLIM's DYNAMIC-DIRECT-SLOT/DYNAMIC-EFFECTIVE-SLOT add a DYNAMIC
     /// slot). Keyed by slot name; null until the slotd gets a custom MetaClass. SLOT-VALUE
-    /// / (SETF SLOT-VALUE) / SLOT-BOUNDP route through this for SlotDefinition objects.</summary>
-    public Dictionary<string, LispObject?>? ExtraSlots { get; set; }
+    /// / (SETF SLOT-VALUE) / SLOT-BOUNDP route through this for SlotDefinition objects.
+    /// ConcurrentDictionary + atomic lazy init (see EnsureExtraSlots): under
+    /// (set-parallel-eval t), parallel make-instance / defclass of a custom metaclass
+    /// otherwise tore a plain Dictionary.</summary>
+    public System.Collections.Concurrent.ConcurrentDictionary<string, LispObject?>? ExtraSlots;
+
+    /// <summary>Atomically obtain the ExtraSlots table, creating it on first use.
+    /// A plain (ExtraSlots ??= new()) lets two threads publish different dictionaries
+    /// and lose an update; CompareExchange keeps a single winner.</summary>
+    public System.Collections.Concurrent.ConcurrentDictionary<string, LispObject?> EnsureExtraSlots()
+        => ExtraSlots ?? System.Threading.Interlocked.CompareExchange(
+               ref ExtraSlots, new(), null) ?? ExtraSlots;
 
     /// <summary>The canonical slot-option plist (a Lisp list :key val ...) captured from the
     /// DEFCLASS slot specifier, used as the &rest initargs when DIRECT-SLOT-DEFINITION-CLASS
@@ -92,8 +102,16 @@ public class LispClass : LispObject
     /// <summary>Slot values this class holds as an instance of its (custom) metaclass —
     /// i.e. slots the metaclass adds beyond STANDARD-CLASS. Null until populated.
     /// Lets slot-value on a class metaobject read metaclass-defined slots,
-    /// mirroring SlotDefinition.ExtraSlots.</summary>
-    public Dictionary<string, LispObject?>? ExtraSlots { get; set; }
+    /// mirroring SlotDefinition.ExtraSlots.
+    /// ConcurrentDictionary + atomic lazy init (see EnsureExtraSlots) so parallel
+    /// eval cannot tear a plain Dictionary.</summary>
+    public System.Collections.Concurrent.ConcurrentDictionary<string, LispObject?>? ExtraSlots;
+
+    /// <summary>Atomically obtain the ExtraSlots table, creating it on first use.
+    /// CompareExchange keeps a single winner if two threads race the first write.</summary>
+    public System.Collections.Concurrent.ConcurrentDictionary<string, LispObject?> EnsureExtraSlots()
+        => ExtraSlots ?? System.Threading.Interlocked.CompareExchange(
+               ref ExtraSlots, new(), null) ?? ExtraSlots;
     /// <summary>Cached mapping from initarg name to slot index (only valid when each initarg maps to one slot).</summary>
     public Dictionary<string, int>? InitargToSlotIndex { get; set; }
     /// <summary>True if this class can use the fast make-instance path.</summary>

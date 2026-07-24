@@ -867,6 +867,51 @@
         (finish-output *error-output*))))
   result)
 
+(defun %constant-default-form-p (form)
+  "T if FORM is a compile-time constant an &optional default can be filled from
+   without evaluating earlier params: a self-evaluating literal or (quote X)."
+  (or (null form) (eq form t) (keywordp form)
+      (numberp form) (stringp form) (characterp form)
+      (and (consp form) (eq (car form) 'quote))))
+
+(defun %optional-direct-eligible-p (required optional has-key-p rest-param aux)
+  "T if a required+&optional function can carry typed direct delegates for its
+   concrete arities in addition to the array XEP. Requires: at least one optional,
+   no &key/&rest/&aux, every optional has a constant default and no supplied-p var,
+   and total params <= 8 (the direct-delegate arity ceiling)."
+  (and optional (not has-key-p) (null rest-param) (null aux)
+       (<= (+ (length required) (length optional)) 8)
+       (every (lambda (o) (and (null (third o))          ; no supplied-p var
+                               (%constant-default-form-p (second o))))
+              optional)))
+
+(defun %build-optional-direct-specs (required optional wrapped-body fn-name fn-pkg fn-symbol)
+  "Build ((ARITY DIRECT-BODY) ...) for each concrete arity N in
+   [len(required) .. len(required)+len(optional)]. For arity N the first
+   (N - len(required)) optionals are real direct params; the rest are bound to
+   their constant defaults by a wrapping LET, so the shared body runs identically
+   to the array XEP with those optionals defaulted."
+  (let ((rn (length required))
+        (specs '()))
+    (loop for present from 0 to (length optional)
+          for n = (+ rn present)
+          for present-opts = (subseq optional 0 present)
+          for absent-opts = (subseq optional present)
+          for direct-params = (append required (mapcar #'car present-opts))
+          for direct-body = (if absent-opts
+                                `((let ,(mapcar (lambda (o) (list (car o) (second o))) absent-opts)
+                                    ,@wrapped-body))
+                                wrapped-body)
+          do (multiple-value-bind (body-instrs self-p)
+                 (compile-function-body-direct direct-params direct-body fn-name fn-pkg fn-symbol)
+               ;; A non-tail self-call makes compile-function-body-direct thread
+               ;; the function itself as arg0 (params shift to ldarg 1+); the
+               ;; install path then builds a method with a leading LispFunction
+               ;; self param and binds the fn into the _funcN delegate. SELF-P
+               ;; per arity tells HandleDefmethod which signature to emit.
+               (push (list n (if self-p t nil) body-instrs) specs)))
+    (nreverse specs)))
+
 (defun compile-defun (name params body)
   "Compile (defun name (params) body...) → :defmethod directive + return symbol."
   ;; Pre-pass: infer return type before body compilation so self-calls inside the
@@ -875,7 +920,9 @@
     (let ((inferred (infer-body-return-type body (mangle-name name))))
       (when inferred
         (setf (gethash name *function-return-types*) inferred))))
-  (multiple-value-bind (required optional key rest-param) (parse-lambda-list params)
+  (multiple-value-bind (required optional key rest-param aux allow-other-keys-p has-key-p)
+      (parse-lambda-list params)
+    (declare (ignore allow-other-keys-p))
     (let* ((param-names (mapcar #'var-name required))
            ;; Every variable the lambda list binds in the body. The analysis
            ;; context below must report ALL of them as bound — not just the
@@ -933,13 +980,17 @@
            (has-literal-return-from (car analysis-context-vals))
            ;; Check for free variables from original body (block wrapper doesn't add free vars)
            (free-vars (cdr analysis-context-vals))
-           ;; Use direct params for simple required-only functions with no return-from
+           ;; Use direct params for simple required-only functions. A literal
+           ;; return-from (or a macrolet that may expand to one) no longer forces
+           ;; the array path: the direct body is wrapped in the implicit block
+           ;; below, so an early (return-from name ...) still resolves while the
+           ;; function keeps its typed direct delegate (was: every early-return
+           ;; function fell back to InvokeSlow on every call).
            (use-direct (and (null free-vars)
-                            (simple-required-only-p params)
-                            (not has-literal-return-from)))
-           ;; For use-direct path: skip block wrapper (preserves TCO, literal body has no return-from).
-           ;; For standard path: always wrap to handle return-from inside macro expansions.
-           (wrapped-body (if use-direct
+                            (simple-required-only-p params)))
+           ;; use-direct with no return-from: literal body, no block (preserves TCO).
+           ;; Otherwise wrap in the implicit block so return-from resolves.
+           (wrapped-body (if (and use-direct (not has-literal-return-from))
                              body
                              `((block ,block-name ,@body))))
            (pkg-spec (defun-pkg-spec name)))
@@ -1057,16 +1108,28 @@
                          ;; (multiple-value-list (eval `(defun (setf ,g) ...)))
                          ;; (ANSI DEFINE-COMPILER-MACRO.4).
                          (compile-quoted name))))))
-            ;; Standard defmethod
+            ;; Standard defmethod (array XEP). A required+&optional function with
+            ;; constant optional defaults additionally carries typed direct
+            ;; delegates for each concrete arity, so calls at a fixed arity skip
+            ;; the args-array InvokeSlow detour (the array XEP still backs apply /
+            ;; other arities). Only the non-fasl (--asm) load path installs these;
+            ;; the fasl path ignores :direct-delegates and stays array-only.
             (t
-              `((:defmethod ,(mangle-name name)
-                 ,@pkg-spec
-                 :params ,param-names
-                 :body ,(compile-function-body params wrapped-body (mangle-name name)))
-                ,@uninterned-fixup
-                ,@(if (symbolp name)
-                      (compile-sym-lookup name)
-                      (compile-quoted name)))))))))))
+              (let ((direct-specs
+                      (when (and (symbolp name)
+                                 (%optional-direct-eligible-p required optional has-key-p rest-param aux))
+                        (%build-optional-direct-specs
+                         required optional wrapped-body
+                         (mangle-name name) (cadr pkg-spec) name))))
+                `((:defmethod ,(mangle-name name)
+                   ,@pkg-spec
+                   :params ,param-names
+                   ,@(when direct-specs `(:direct-delegates ,direct-specs))
+                   :body ,(compile-function-body params wrapped-body (mangle-name name)))
+                  ,@uninterned-fixup
+                  ,@(if (symbolp name)
+                        (compile-sym-lookup name)
+                        (compile-quoted name))))))))))))
 
 (defun compile-defmacro (name lambda-list body)
   "Compile (defmacro name lambda-list body...).
@@ -1295,7 +1358,7 @@
    through a lexical box, so they must be excluded from capture-driven boxing
    (a boxed special would store the LispObject[] box where a value is expected)."
   (mapcar #'var-name
-          (union (fn-body-special-params body (mapcar #'var-name all-params))
+          (%union-eq (fn-body-special-params body (mapcar #'var-name all-params))
                  (remove-if-not #'global-special-p all-params))))
 
 (defun compile-function-body (params body &optional (fn-name ""))
@@ -1365,6 +1428,37 @@
   "Fresh gen-local key per param: alist (param . key)."
   (mapcar (lambda (p) (cons p (gen-local (var-name p)))) all-params))
 
+(defun %string-member-p (x list)
+  "T if string X is STRING= to some element of LIST. Required-only (typed direct
+   delegate) and internally uses only STRING= (which has a 2-arg direct delegate),
+   so it never re-enters the variadic MEMBER XEP."
+  (dolist (y list nil) (when (string= x y) (return t))))
+
+(defun %eq-member-p (x list)
+  "T if X is EQ to some element of LIST (EQL membership for symbols)."
+  (dolist (y list nil) (when (eq x y) (return t))))
+
+(defun %union-eq (a b)
+  "UNION of two symbol lists by EQ (= EQL for symbols): B plus every element of A
+   not already present. Required-only helper — a typed direct delegate that skips
+   the variadic UNION :test XEP (InvokeSlow) on the special-param analysis hot
+   path. Callers use the result as a set, so order/dup match UNION well enough."
+  (let ((r b))
+    (dolist (x a r) (unless (%eq-member-p x r) (push x r)))))
+
+(defun %strings-in-both (a b)
+  "Elements of string list A that are STRING= to some element of B (INTERSECTION
+   by STRING=, keeping A's elements/order). A boxing-analysis hot path per compile
+   — a required-only helper skips the variadic INTERSECTION :test XEP (InvokeSlow)."
+  (let ((r '()))
+    (dolist (x a (nreverse r)) (when (%string-member-p x b) (push x r)))))
+
+(defun %strings-minus (a b)
+  "Elements of string list A not STRING= to any element of B (SET-DIFFERENCE by
+   STRING=). Companion to %strings-in-both, same rationale."
+  (let ((r '()))
+    (dolist (x a (nreverse r)) (unless (%string-member-p x b) (push x r)))))
+
 (defun params-needs-boxing (body all-params)
   "Names of params that must be boxed: mutated AND captured in BODY (single
    walk), minus special params — those are bound on the dynamic
@@ -1373,9 +1467,9 @@
               (find-mutated-and-captured-vars body (mapcar #'var-name all-params))))
          (mutated (first mc))
          (captured (second mc)))
-    (set-difference
-     (intersection mutated captured :test #'string=)
-     (special-param-name-set body all-params) :test #'string=)))
+    (%strings-minus
+     (%strings-in-both mutated captured)
+     (special-param-name-set body all-params))))
 
 (defun params-shadowed-symbol-macros (all-params)
   "Value for rebinding *symbol-macros* in a function body: lambda-list
@@ -1661,7 +1755,7 @@
            ;; but we need this early for param-instrs type selection.
            (pre-special-syms
              (when (and fn-symbol (null needs-boxing) (all-params-fixnum-p params body))
-               (union (fn-body-special-params body (mapcar #'var-name all-params))
+               (%union-eq (fn-body-special-params body (mapcar #'var-name all-params))
                       (remove-if-not #'global-special-p all-params))))
            (pre-native-eligible
              (and fn-symbol
@@ -1693,7 +1787,7 @@
                                      (:ldarg ,i) (:stloc ,key)
                                      ,@(%local-var-marker key p))))))
           (let* ((special-param-syms
-                   (union (fn-body-special-params body (mapcar #'var-name all-params))
+                   (%union-eq (fn-body-special-params body (mapcar #'var-name all-params))
                           (remove-if-not #'global-special-p all-params)))
                  (sp-names (mapcar #'var-name special-param-syms))
                  (special-push-instrs
@@ -1928,7 +2022,7 @@
            ;; Handle special params: both (declare (special param)) and
            ;; globally special params (defvar/*name* convention) bind dynamically
            (let* ((special-param-syms
-                    (union (fn-body-special-params body (mapcar #'var-name all-params))
+                    (%union-eq (fn-body-special-params body (mapcar #'var-name all-params))
                            (remove-if-not #'global-special-p all-params)))
                   (sp-names (mapcar #'var-name special-param-syms))
                   (special-push-instrs
@@ -2331,7 +2425,7 @@
                 (find-mutated-and-captured-vars scan-forms (mapcar #'var-name var-names))))
            (mutated (first mc))
            (captured (second mc))
-           (needs-boxing (intersection mutated captured :test #'string=))
+           (needs-boxing (%strings-in-both mutated captured))
            ;; Separate
            (special-bindings (remove-if-not #'third binding-info))
            (lexical-bindings (remove-if #'third binding-info))
@@ -3111,7 +3205,7 @@
                 (find-mutated-and-captured-vars body all-var-names)))
            (mutated (first mc))
            (captured-inner (second mc))
-           (needs-boxing (intersection mutated captured-inner :test #'string=))
+           (needs-boxing (%strings-in-both mutated captured-inner))
            ;; Env slot locals
            (env-instrs '())
            (env-locals '()))
@@ -3254,7 +3348,7 @@
                                                 key-start '((:ldarg 1)))))
           ;; Handle special params in closure body (declare + globally special)
           (let* ((special-param-syms
-                   (union (fn-body-special-params body (mapcar #'var-name all-params))
+                   (%union-eq (fn-body-special-params body (mapcar #'var-name all-params))
                           (remove-if-not #'global-special-p all-params)))
                  (sp-names (mapcar #'var-name special-param-syms))
                  (special-push-instrs

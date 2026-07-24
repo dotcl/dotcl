@@ -24,6 +24,16 @@
 
     <RuntimeIdentifiers>win-x64;win-arm64;linux-x64;linux-arm64;osx-x64;osx-arm64;android-arm64;android-x64;any</RuntimeIdentifiers>
     <PublishReadyToRun>true</PublishReadyToRun>
+
+    <!-- No C# debug symbols in Release. The runtime never reads its own pdb at
+         run time — dotcl's Lisp-level backtraces and frame source come from the
+         .fasl's own PDB, not runtime.pdb / DotCL.Runtime.pdb — so shipping them
+         in the distributed tool is ~0.6 MB of dead weight. Scoped to Release so
+         Debug builds keep full pdbs and local C# debugging is unaffected; only
+         the pack (which builds Release) drops them. DotCL.Runtime.csproj carries
+         the matching setting so the referenced library's pdb is dropped too. -->
+    <DebugType Condition="'$(Configuration)' == 'Release'">none</DebugType>
+    <DebugSymbols Condition="'$(Configuration)' == 'Release'">false</DebugSymbols>
   </PropertyGroup>
 
   <!-- dotcl-app packaging hook: pack this apphost as another app's tool nupkg (e.g.
@@ -84,7 +94,15 @@
       <Pack>true</Pack>
       <PackagePath>tools/net10.0/any/</PackagePath>
     </None>
-    <Content Include="dotcl.core" Condition="Exists('dotcl.core')">
+    <!-- Pack=false: these Content items exist to copy core+contrib into the
+         build/publish output (so the per-RID tool payload under
+         tools/net10.0/<rid>/ carries them, and the dev runner finds them next
+         to runtime.dll). They must NOT also be packed as content/ and
+         contentFiles/: this is a DotnetTool package (consumed via tools/), the
+         SDK/PackageReference payload lives in the separate DotCL.Runtime
+         package's dotclassets/, so a content/contentFiles copy here is a third
+         redundant portable payload nothing reads (~14 MB each). -->
+    <Content Include="dotcl.core" Condition="Exists('dotcl.core')" Pack="false">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <CopyToPublishDirectory>Always</CopyToPublishDirectory>
     </Content>
@@ -92,7 +110,7 @@
       <Pack>true</Pack>
       <PackagePath>tools/net10.0/any/contrib/</PackagePath>
     </None>
-    <Content Include="contrib/**" Exclude="$(FrameworkContribR2RExclude)" Condition="Exists('contrib')">
+    <Content Include="contrib/**" Exclude="$(FrameworkContribR2RExclude)" Condition="Exists('contrib')" Pack="false">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <CopyToPublishDirectory>Always</CopyToPublishDirectory>
     </Content>

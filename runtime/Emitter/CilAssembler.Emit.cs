@@ -770,6 +770,7 @@ public partial class CilAssembler
         var paramNames = new List<string>();
         LispObject? bodyInstrs = null;
         string? defPkg = null;
+        LispObject? directDelegates = null;  // ((arity body) ...) for &optional direct delegates
 
         while (plist is Cons pc)
         {
@@ -790,6 +791,9 @@ public partial class CilAssembler
                     break;
                 case "PKG":
                     defPkg = GetString(val);
+                    break;
+                case "DIRECT-DELEGATES":
+                    directDelegates = val;
                     break;
             }
             plist = Cddr(pc);
@@ -820,6 +824,41 @@ public partial class CilAssembler
             typeof(Func<LispObject[], LispObject>));
 
         var fn = new LispFunction(del, name, paramNames.Count);
+
+        // Attach typed direct delegates for an &optional function's concrete
+        // arities (non-fasl path only). The array XEP `del` above still backs
+        // apply and any arity without a direct delegate; these just let a fixed-
+        // arity call skip the args-array InvokeSlow detour.
+        if (directDelegates is Cons)
+        {
+            for (var dd = directDelegates; dd is Cons ddc; dd = ddc.Cdr)
+            {
+                if (ddc.Car is not Cons spec) continue;
+                int arity = (int)((Fixnum)Car(spec)).Value;
+                bool selfP = Cadr(spec) is not Nil;
+                var ddBody = Caddr(spec);
+                // A self-recursive body reads its params from ldarg 1.. with the
+                // function itself threaded in as arg0 (BuildSelfDirectFunction does
+                // the same); the _funcN delegate then binds `fn` as that leading
+                // arg via CreateDelegate(type, fn). Non-self bodies read from ldarg
+                // 0.. and need no bound target.
+                int nParams = selfP ? arity + 1 : arity;
+                var directParamTypes = new Type[nParams];
+                int off = selfP ? 1 : 0;
+                if (selfP) directParamTypes[0] = typeof(LispFunction);
+                for (int i = 0; i < arity; i++) directParamTypes[off + i] = typeof(LispObject);
+                var ddm = new DynamicMethod(name + "_opt" + arity, typeof(LispObject),
+                    directParamTypes, typeof(CilAssembler).Module, true);
+                var ddAsm = new CilAssembler { _il = ddm.GetILGenerator() };
+                ddAsm.Assemble(ddBody);
+                var ddFuncArgs = new Type[arity + 1];
+                for (int i = 0; i <= arity; i++) ddFuncArgs[i] = typeof(LispObject);
+                var ddType = System.Linq.Expressions.Expression.GetFuncType(ddFuncArgs);
+                fn.SetDirectDelegate(selfP ? ddm.CreateDelegate(ddType, fn)
+                                           : ddm.CreateDelegate(ddType));
+            }
+        }
+
         // Store SIL on function when dotcl:*save-sil* is true
         try
         {
@@ -2423,7 +2462,16 @@ public partial class CilAssembler
         }
         if (_inlineDepth > MaxInlineDepth)
         {
-            // Too deep — fallback to constant pool (won't work across processes)
+            if (_faslMode && _faslTypeBuilder != null)
+            {
+                // FASL: continue in a helper method instead. The constant pool is
+                // process-local, so a fasl that reaches into it picks up whatever
+                // unrelated object sits at that index in the loading process (or
+                // indexes past the pool) — silent corruption of the literal.
+                EmitFaslDeepConstant(val);
+                return;
+            }
+            // Too deep — fallback to constant pool (same process only)
             int idx2 = AddConstant(val);
             _il.Emit(OpCodes.Ldc_I4, idx2);
             _il.Emit(OpCodes.Call, _getConstant);
@@ -2501,6 +2549,11 @@ public partial class CilAssembler
                 var cars = new List<LispObject>();
                 LispObject tail = cons;
                 while (tail is Cons c) { cars.Add(c.Car); tail = c.Cdr; }
+                if (_faslMode && _faslTypeBuilder != null && cars.Count > MaxInlineListChunk)
+                {
+                    EmitFaslChunkedList(cars, tail);
+                    break;
+                }
                 var consCtor = typeof(Cons).GetConstructor(new[] { typeof(LispObject), typeof(LispObject) })!;
                 // Emit tail (nil for proper list, or dotted cdr)
                 EmitLoadConstInline(tail);
@@ -2530,12 +2583,21 @@ public partial class CilAssembler
                 int vecLen = vec.Length;
                 _il.Emit(OpCodes.Ldc_I4, vecLen);
                 _il.Emit(OpCodes.Newarr, typeof(LispObject));
-                for (int i = 0; i < vecLen; i++)
+                if (_faslMode && _faslTypeBuilder != null && vecLen > MaxInlineListChunk)
                 {
-                    _il.Emit(OpCodes.Dup);
-                    _il.Emit(OpCodes.Ldc_I4, i);
-                    EmitLoadConstInline(vec.ElementAt(i));
-                    _il.Emit(OpCodes.Stelem_Ref);
+                    // Same JIT-working-set concern as long lists: fill the backing
+                    // array through chunk methods instead of one giant body.
+                    EmitFaslChunkedVectorFill(vec, vecLen);
+                }
+                else
+                {
+                    for (int i = 0; i < vecLen; i++)
+                    {
+                        _il.Emit(OpCodes.Dup);
+                        _il.Emit(OpCodes.Ldc_I4, i);
+                        EmitLoadConstInline(vec.ElementAt(i));
+                        _il.Emit(OpCodes.Stelem_Ref);
+                    }
                 }
                 if (vec._dimensions != null)
                 {
@@ -3028,6 +3090,125 @@ public partial class CilAssembler
             _il.Emit(OpCodes.Stelem_Ref);
         }
         _il.Emit(OpCodes.Call, _makeFaslInstance);
+        _il.Emit(OpCodes.Castclass, typeof(LispObject));
+    }
+
+    // Elements per helper method when a list literal is emitted in chunks. ~500
+    // conses is ~15KB of IL, comfortably inside the JIT's cheap range.
+    private const int MaxInlineListChunk = 500;
+
+    /// <summary>
+    /// FASL mode: build a long list literal through a chain of static helper methods,
+    /// each prepending one chunk of elements onto the list built so far.
+    /// Emitting the whole literal as one method is what makes a fasl expensive to
+    /// LOAD: for the same 100k-cons data, load-time peak RSS was +13MB when the
+    /// conses were spread over 200 methods but +680MB when they sat in 4, because
+    /// the JIT's working set grows faster than the method body it compiles. The
+    /// compiling process never sees this — it builds the literal directly.
+    /// </summary>
+    private void EmitFaslChunkedList(List<LispObject> cars, LispObject tail)
+    {
+        int id = Interlocked.Increment(ref _faslClosureCount);
+        var consCtor = typeof(Cons).GetConstructor(new[] { typeof(LispObject), typeof(LispObject) })!;
+        // Tail first (nil for a proper list, or the dotted cdr); each chunk method
+        // then takes the list built so far and prepends its own slice, so the
+        // chunks are called back-to-front.
+        EmitLoadConstInline(tail);
+        int chunkId = 0;
+        for (int end = cars.Count; end > 0; end -= MaxInlineListChunk, chunkId++)
+        {
+            int start = Math.Max(0, end - MaxInlineListChunk);
+            var m = _faslTypeBuilder!.DefineMethod(
+                $"_lst_{id}_{chunkId}",
+                MethodAttributes.Private | MethodAttributes.Static,
+                typeof(LispObject), new[] { typeof(LispObject) });
+            var il = m.GetILGenerator();
+            var inner = new CilAssembler
+            {
+                _il = il, _faslMode = true,
+                _faslTypeBuilder = _faslTypeBuilder, _faslStructMap = _faslStructMap,
+                _skipStructIntern = _skipStructIntern,
+            };
+            var acc = il.DeclareLocal(typeof(LispObject));
+            il.Emit(OpCodes.Ldarg_0);
+            il.Emit(OpCodes.Stloc, acc);
+            for (int i = end - 1; i >= start; i--)
+            {
+                inner.EmitLoadConstInline(cars[i]);   // car
+                il.Emit(OpCodes.Ldloc, acc);          // cdr
+                il.Emit(OpCodes.Newobj, consCtor);
+                il.Emit(OpCodes.Stloc, acc);
+            }
+            il.Emit(OpCodes.Ldloc, acc);
+            il.Emit(OpCodes.Ret);
+            _il.Emit(OpCodes.Call, m);
+        }
+        _il.Emit(OpCodes.Castclass, typeof(LispObject));
+    }
+
+    /// <summary>
+    /// FASL mode: fill a long vector literal's backing array through a chain of
+    /// static helper methods, each populating one slice. The array is on the IL
+    /// stack (from Newarr); this leaves it there afterwards for the ctor call.
+    /// A single huge fill body blows up the JIT's load-time working set.
+    /// </summary>
+    private void EmitFaslChunkedVectorFill(LispVector vec, int vecLen)
+    {
+        int id = Interlocked.Increment(ref _faslClosureCount);
+        var arrLocal = _il.DeclareLocal(typeof(LispObject[]));
+        _il.Emit(OpCodes.Stloc, arrLocal);
+        int chunkId = 0;
+        for (int start = 0; start < vecLen; start += MaxInlineListChunk, chunkId++)
+        {
+            int end = Math.Min(start + MaxInlineListChunk, vecLen);
+            var m = _faslTypeBuilder!.DefineMethod(
+                $"_vec_{id}_{chunkId}",
+                MethodAttributes.Private | MethodAttributes.Static,
+                typeof(void), new[] { typeof(LispObject[]) });
+            var il = m.GetILGenerator();
+            var inner = new CilAssembler
+            {
+                _il = il, _faslMode = true,
+                _faslTypeBuilder = _faslTypeBuilder, _faslStructMap = _faslStructMap,
+                _skipStructIntern = _skipStructIntern,
+            };
+            for (int i = start; i < end; i++)
+            {
+                il.Emit(OpCodes.Ldarg_0);
+                il.Emit(OpCodes.Ldc_I4, i);
+                inner.EmitLoadConstInline(vec.ElementAt(i));
+                il.Emit(OpCodes.Stelem_Ref);
+            }
+            il.Emit(OpCodes.Ret);
+            _il.Emit(OpCodes.Ldloc, arrLocal);
+            _il.Emit(OpCodes.Call, m);
+        }
+        _il.Emit(OpCodes.Ldloc, arrLocal);
+    }
+
+    /// <summary>
+    /// FASL mode: continue a constant that exceeded the inline depth cap in a fresh
+    /// static helper method, and call it. The call resets both the emitter's nesting
+    /// depth and the IL evaluation stack (the helper returns a single value), which is
+    /// what the cap exists to bound — while keeping the FASL self-contained.
+    /// </summary>
+    private void EmitFaslDeepConstant(LispObject val)
+    {
+        int id = Interlocked.Increment(ref _faslClosureCount);
+        var m = _faslTypeBuilder!.DefineMethod(
+            $"_const_{id}",
+            MethodAttributes.Private | MethodAttributes.Static,
+            typeof(LispObject), Type.EmptyTypes);
+        var il = m.GetILGenerator();
+        var inner = new CilAssembler
+        {
+            _il = il, _faslMode = true,
+            _faslTypeBuilder = _faslTypeBuilder, _faslStructMap = _faslStructMap,
+            _skipStructIntern = _skipStructIntern,
+        };
+        inner.EmitLoadConstInline(val);
+        il.Emit(OpCodes.Ret);
+        _il.Emit(OpCodes.Call, m);
         _il.Emit(OpCodes.Castclass, typeof(LispObject));
     }
 

@@ -7,7 +7,7 @@ DOTCL_LISP ?= ros -L sbcl-bin run
 STDBUF ?=
 SETSID ?= $(shell which setsid 2>/dev/null)
 
-.PHONY: all build build-ns2 run clean repl test-ansi-all test-ansi-full test-ansi-extra test-regression test-mop ilverify update-ansi-state commit-ansi-state cross-compile loc publish pack install setup-ansi-test setup-asdf setup-cl-bench bench bench-state test-sbcl-host2 compile-asdf-fasl compile-asdf-fasls compile-core-fasl compile-contrib-fasls contrib-dotcl-cs contrib-dotcl-jitdisasm gen-char-names
+.PHONY: all build build-ns2 run clean repl test-ansi-all test-ansi-full test-ansi-extra test-regression test-pack-nuspec test-save-class-lib test-mop ilverify update-ansi-state commit-ansi-state cross-compile loc publish pack install setup-ansi-test setup-asdf setup-cl-bench bench bench-state test-sbcl-host2 compile-asdf-fasl compile-asdf-fasls compile-core-fasl compile-contrib-fasls contrib-dotcl-cs contrib-dotcl-jitdisasm gen-char-names
 
 # Source files for cross-compile. Listed once; the recipe and dependency
 # tracking both reference this so adding a file is a single-edit change.
@@ -37,6 +37,18 @@ test-regression: build $(DOTCL_ROOT)compiler/cil-out.sil
 test-debug-pdb: build $(DOTCL_ROOT)compiler/cil-out.sil
 	@echo "=== Running debug-path (DOTCL_EMIT_PDB) checks ==="
 	sh $(DOTCL_ROOT)test/debug-pdb/check.sh $(DOTCL_ROOT)
+
+# Asserts a packed tool's nuspec describes the app, not dotcl. Needs published
+# dotcl packages (`make pack`); skips cleanly when they are absent.
+test-pack-nuspec: build
+	@echo "=== Running pack nuspec checks ==="
+	sh $(DOTCL_ROOT)test/pack-nuspec/check.sh $(DOTCL_ROOT)
+
+# Asserts dotcl can emit a .NET DLL that a separate C# app references at compile
+# time (save-class-library stage 1). Round-trips via dotnet build; needs .NET 9+.
+test-save-class-lib: build
+	@echo "=== Running save-class-library checks ==="
+	sh $(DOTCL_ROOT)test/save-class-lib/check.sh $(DOTCL_ROOT)
 
 test-ansi-extra: build $(DOTCL_ROOT)compiler/cil-out.sil
 	@echo "=== Running CLHS audit extra tests ==="
@@ -210,14 +222,17 @@ setup-ansi-test:
 	fi
 
 setup-asdf:
-	@# dotcl-0.1.11 is the compat-generation bundle branch: it pairs with the
-	@# launch-process keyword API and the run-time os-cond / single-FASL
-	@# work. Updated in place going forward; a new dotcl-X.Y.Z branch is cut
-	@# only on the next hard #+dotcl incompatibility. The old `dotcl` branch stays
-	@# frozen so pre-0.1.11 source builds keep cloning a matching asdf.
+	@# dotcl-0.1.21 is the compat-generation bundle branch: it pairs with the
+	@# launch-process keyword API, the run-time os-cond / single-FASL work, and
+	@# the uiop #+dotcl backends (env writes, chdir, hostname,
+	@# delete-empty-directory, run-program :error-output :output, combine-fasls)
+	@# that need runtime primitives shipped in 0.1.21. A new dotcl-X.Y.Z branch is
+	@# cut on a hard #+dotcl incompatibility (the previous dotcl-0.1.11 stays frozen
+	@# for the 0.1.11-era runtime). The old `dotcl` branch stays frozen so
+	@# pre-0.1.11 source builds keep cloning a matching asdf.
 	@if [ ! -d $(DOTCL_ROOT)asdf ]; then \
 		echo "Cloning asdf..."; \
-		git clone --branch dotcl-0.1.11 https://github.com/dotcl/asdf.git $(DOTCL_ROOT)asdf; \
+		git clone --branch dotcl-0.1.21 https://github.com/dotcl/asdf.git $(DOTCL_ROOT)asdf; \
 	else \
 		echo "asdf/ already exists"; \
 	fi

@@ -1231,7 +1231,7 @@ Also expands element types within compound type specifiers like (VECTOR etype si
 (defvar *compilation-unit-depth* 0)
 (defvar *deferred-compilation-warnings* nil)
 
-(defvar *documentation-table* (make-hash-table :test #'equal))
+(defvar *documentation-table* (make-hash-table :test #'equal :synchronized t))
 
 ;; Helper to make a key for the documentation table
 (defun %doc-key (obj doc-type)

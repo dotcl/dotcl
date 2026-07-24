@@ -1629,6 +1629,38 @@ public static class Startup
             return val != null ? (LispObject)new LispString(val) : Nil.Instance;
         }));
 
+        // dotcl:setenv — set an environment variable (backs (setf uiop:getenv)).
+        // Returns the value set.
+        RegisterDotcl("SETENV", new LispFunction(args => {
+            if (args.Length < 2)
+                throw new LispErrorException(new LispProgramError("SETENV: requires 2 arguments"));
+            var name = args[0] is LispString ns ? ns.Value : args[0].ToString();
+            var value = args[1] is LispString vs ? vs.Value : args[1].ToString();
+            System.Environment.SetEnvironmentVariable(name, value);
+            return args[1];
+        }));
+
+        // dotcl:unsetenv — remove an environment variable (backs uiop:unsetenv).
+        // Passing null to SetEnvironmentVariable deletes the entry. Returns NIL.
+        RegisterDotcl("UNSETENV", new LispFunction(args => {
+            if (args.Length < 1)
+                throw new LispErrorException(new LispProgramError("UNSETENV: requires 1 argument"));
+            var name = args[0] is LispString s ? s.Value : args[0].ToString();
+            System.Environment.SetEnvironmentVariable(name, null);
+            return Nil.Instance;
+        }));
+
+        // dotcl:combine-fasls — back uiop:combine-fasls (monolithic FASL bundle).
+        // Not yet implemented: a dotcl FASL is a .NET PE assembly and cannot be
+        // concatenated the way most implementations combine object FASLs. The uiop
+        // #+dotcl branch calls here so the wiring is in place once a real merge
+        // (e.g. re-emitting the inputs' sources into one assembly) is built.
+        RegisterDotcl("COMBINE-FASLS", new LispFunction(args => {
+            throw new LispErrorException(new LispError(
+                "COMBINE-FASLS: monolithic FASL bundles are not yet supported on dotcl "
+                + "(a FASL is a .NET assembly and cannot be concatenated)."));
+        }));
+
         // dotcl:*debug-stacktrace* — when true, .NET stack traces are printed on unhandled errors
         var debugStacktraceSym = SymInPkg("*DEBUG-STACKTRACE*", "DOTCL");
         DotclPkg.Export(debugStacktraceSym);
@@ -2086,10 +2118,14 @@ public static class Startup
             new LispFunction(Runtime.SetAtomicLongValue, "SET-ATOMIC-LONG-VALUE", 2));
         RegisterDotcl("ATOMIC-LONG-CAS",
             new LispFunction(Runtime.AtomicLongCas, "ATOMIC-LONG-CAS", 3));
-        RegisterDotcl("ATOMIC-LONG-INCF",
-            new LispFunction(Runtime.AtomicLongIncf, "ATOMIC-LONG-INCF", -1));
-        RegisterDotcl("ATOMIC-LONG-DECF",
-            new LispFunction(Runtime.AtomicLongDecf, "ATOMIC-LONG-DECF", -1));
+        var atomicIncfFn = new LispFunction(Runtime.AtomicLongIncf, "ATOMIC-LONG-INCF", -1);
+        atomicIncfFn.SetDirectDelegate((Func<LispObject, LispObject>)Runtime.AtomicLongIncf1);
+        atomicIncfFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject>)Runtime.AtomicLongIncf2);
+        RegisterDotcl("ATOMIC-LONG-INCF", atomicIncfFn);
+        var atomicDecfFn = new LispFunction(Runtime.AtomicLongDecf, "ATOMIC-LONG-DECF", -1);
+        atomicDecfFn.SetDirectDelegate((Func<LispObject, LispObject>)Runtime.AtomicLongDecf1);
+        atomicDecfFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject>)Runtime.AtomicLongDecf2);
+        RegisterDotcl("ATOMIC-LONG-DECF", atomicDecfFn);
 
         // Assembly/native resolver registration. The Default ALC's Resolving /
         // ResolvingUnmanagedDll hooks consult these tables, so a contrib (e.g.
@@ -2211,6 +2247,7 @@ public static class Startup
         RegisterDotNet(DotNetPkg, "NEW-ARRAY", new LispFunction(Runtime.DotNetNewArray, "DOTNET:NEW-ARRAY", -1),
             "(dotnet:new-array element-type &rest elements) => array\nCreate a typed .NET array (element-type[]) filled with the marshalled ELEMENTS.\nELEMENT-TYPE is a type-name string/symbol or a resolved System.Type. Build from\na Lisp list with (apply #'dotnet:new-array element-type list). A Lisp list or\nvector is also auto-marshalled to an array-typed parameter or property.");
         RegisterDotNet(DotNetPkg, "%DEFINE-CLASS", new LispFunction(Runtime.DotNetDefineClass, "DOTNET:%DEFINE-CLASS", -1));
+        RegisterDotNet(DotNetPkg, "%SAVE-LIBRARY", new LispFunction(Runtime.DotNetSaveLibrary, "DOTNET:%SAVE-LIBRARY", -1));
         RegisterDotNet(DotNetPkg, "BOX", new LispFunction(Runtime.DotNetBox, "DOTNET:BOX", -1),
             "(dotnet:box value type-name) => boxed-value\nMarshal a Lisp VALUE to the named .NET type and keep it boxed at that static\ntype, so the right overload is chosen when it is passed to a subsequent call.");
         RegisterDotNet(DotNetPkg, "HINT-TYPE", new LispFunction(args => {

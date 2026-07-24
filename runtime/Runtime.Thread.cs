@@ -150,6 +150,22 @@ public partial class Runtime
         => AtomicLongResult(AtomicLongArg(args, 0, "ATOMIC-LONG-DECF").Add(
                -(args.Length > 1 ? AtomicLongInt(args[1], "ATOMIC-LONG-DECF") : 1L)));
 
+    // Typed direct delegates for the hot 1-arg / 2-arg calls (e.g. the compiler's
+    // uninterned-var counter increments once per fresh gensym during a compile).
+    // A LispAtomicLong argument reuses the array validator by wrapping the single
+    // arg; the delta-less form is the common one.
+    private static LispAtomicLong AtomicLong1(LispObject o, string fn)
+        => o as LispAtomicLong ?? throw new LispErrorException(new LispTypeError(
+               $"{fn}: not an ATOMIC-LONG", o, Startup.Sym("T")));
+    internal static LispObject AtomicLongIncf1(LispObject a)
+        => AtomicLongResult(AtomicLong1(a, "ATOMIC-LONG-INCF").Add(1L));
+    internal static LispObject AtomicLongIncf2(LispObject a, LispObject b)
+        => AtomicLongResult(AtomicLong1(a, "ATOMIC-LONG-INCF").Add(AtomicLongInt(b, "ATOMIC-LONG-INCF")));
+    internal static LispObject AtomicLongDecf1(LispObject a)
+        => AtomicLongResult(AtomicLong1(a, "ATOMIC-LONG-DECF").Add(-1L));
+    internal static LispObject AtomicLongDecf2(LispObject a, LispObject b)
+        => AtomicLongResult(AtomicLong1(a, "ATOMIC-LONG-DECF").Add(-AtomicLongInt(b, "ATOMIC-LONG-DECF")));
+
     /// <summary>
     /// (bt:make-thread function &key name)
     /// Creates and starts a new thread running FUNCTION.
@@ -208,6 +224,8 @@ public partial class Runtime
                 // Don't let thread exceptions crash the process
                 var w = Console.Error;
                 w.WriteLine($"Thread \"{name}\" error: {ex.Message}");
+                if (Startup.DebugStacktrace && !string.IsNullOrEmpty(ex.StackTrace))
+                    w.WriteLine(ex.StackTrace);
                 w.Flush();
             }
             finally

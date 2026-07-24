@@ -857,6 +857,80 @@ public static class DotclHost
         }
     }
 
+    /// <summary>
+    /// Metadata read off an ASDF system definition, used to fill in nuspec
+    /// fields for `dotcl pack`. Every field is null when the .asd omits it.
+    /// </summary>
+    public sealed class SystemMeta
+    {
+        public string? Description;
+        public string? Homepage;
+        public string? SourceControlUrl;
+        public string? Author;
+        public string? License;
+        public string? AsdDirectory;   // where to look for a sibling README
+    }
+
+    /// <summary>
+    /// Read the standard metadata slots off an ASDF system. `dotcl pack` uses
+    /// these as nuspec defaults so a packed tool describes itself rather than
+    /// inheriting the description and URLs of the dotcl packages it was
+    /// restamped from. Returns a SystemMeta whose fields are null where the .asd
+    /// is silent; returns null if the system cannot be found at all (packing
+    /// proceeds — the fasl build reports a missing system with a better error).
+    /// </summary>
+    public static SystemMeta? ReadSystemMeta(string system, string[]? searchPaths = null)
+    {
+        try
+        {
+            Runtime.Eval(MultipleValues.Primary(
+                Runtime.ReadFromString(new LispObject[] { new LispString("(require \"asdf\")") })));
+            RegisterAsdSearchPaths(searchPaths);
+
+            var sysEsc = system.Replace("\\", "\\\\").Replace("\"", "\\\"");
+            // :source-control is (:git "url") / (:github "url") / a bare string.
+            // Normalize to the url alone here so the C# side stays shapeless.
+            var form = $@"
+(let* ((sys (asdf:find-system ""{sysEsc}""))
+       (sc (asdf:system-source-control sys))
+       (asd (asdf:system-source-file sys)))
+  (list (asdf:system-description sys)
+        (asdf:system-homepage sys)
+        (cond ((stringp sc) sc)
+              ((and (consp sc) (stringp (second sc))) (second sc))
+              ((and (consp sc) (stringp (cdr sc))) (cdr sc)))
+        (asdf:system-author sys)
+        (asdf:system-license sys)
+        (and asd (namestring (make-pathname :name nil :type nil :defaults asd)))))";
+            var result = MultipleValues.Primary(Runtime.Eval(MultipleValues.Primary(
+                Runtime.ReadFromString(new LispObject[] { new LispString(form) }))));
+
+            var items = new List<string?>();
+            var cur = result;
+            while (cur is Cons c)
+            {
+                items.Add(c.Car is LispString s && s.Value.Length > 0 ? s.Value : null);
+                cur = c.Cdr;
+            }
+            while (items.Count < 6) items.Add(null);
+            return new SystemMeta
+            {
+                Description = items[0],
+                Homepage = items[1],
+                SourceControlUrl = items[2],
+                Author = items[3],
+                License = items[4],
+                AsdDirectory = items[5],
+            };
+        }
+        catch
+        {
+            // Metadata is best-effort: never fail a pack because a .asd omits
+            // slots or uses a shape we do not recognize.
+            return null;
+        }
+    }
+
     /// Walk a proper Lisp list of LispStrings into a C# string[].
     private static string[] ListToStringArray(LispObject list)
     {

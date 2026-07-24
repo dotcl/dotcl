@@ -832,17 +832,43 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
             else repoUrl = o.Repository;
         }
 
+        // The .asd already describes the system; read it so a pack does not have
+        // to restate on the command line what the system definition says. CLI
+        // flags win, .asd fills the gaps, and anything still unset is dropped
+        // rather than inherited from dotcl (see PackRestamp.Meta).
+        var asdSearch = Runtime.UserAsdSearchPaths.Count > 0
+            ? Runtime.UserAsdSearchPaths.ToArray() : null;
+        var asd = DotclHost.ReadSystemMeta(o.System!, asdSearch);
+
+        // A README sitting next to the .asd is the package README by default —
+        // the same convention every other packaging tool uses.
+        string? readmePath = o.Readme;
+        if (readmePath == null && asd?.AsdDirectory != null)
+        {
+            foreach (var candidate in new[] { "README.md", "readme.md", "README.MD" })
+            {
+                var p = System.IO.Path.Combine(asd.AsdDirectory, candidate);
+                if (File.Exists(p)) { readmePath = p; break; }
+            }
+        }
+
         var meta = new PackRestamp.Meta
         {
-            Description = o.Description,
-            ProjectUrl = o.ProjectUrl,
-            RepositoryUrl = repoUrl,
+            Description = o.Description ?? asd?.Description,
+            ProjectUrl = o.ProjectUrl ?? asd?.Homepage,
+            RepositoryUrl = repoUrl ?? asd?.SourceControlUrl,
             RepositoryCommit = repoCommit,
-            ReadmePath = o.Readme,
+            ReadmePath = readmePath,
             Tags = o.Tags,
-            Authors = o.Authors,
+            Authors = o.Authors ?? asd?.Author,
             Copyright = o.Copyright,
+            License = asd?.License,
         };
+
+        // Fail before building the fasl, not after producing a package NuGet
+        // would reject or that would misdescribe itself.
+        try { PackRestamp.EnsureRequiredMetadata(o.Id!, meta); }
+        catch (Exception ex) { Console.Error.WriteLine($"pack: {ex.Message}"); return 1; }
 
         if (o.DryRun)
         {

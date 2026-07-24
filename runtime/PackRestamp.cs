@@ -42,6 +42,45 @@ static class PackRestamp
         public string? Tags;         // free-form; normalized to space-separated
         public string? Authors;
         public string? Copyright;
+        public string? License;
+    }
+
+    /// <summary>
+    /// Provenance fields whose donor value describes dotcl, not the app being
+    /// packed. Once the package id is no longer the donor's, keeping them is
+    /// worse than dropping them: a repository url and commit belonging to
+    /// another project is not stale metadata, it is wrong attribution. Any of
+    /// these that the caller did not supply is removed from the nuspec.
+    /// </summary>
+    static readonly string[] DonorProvenanceFields =
+        { "description", "projectUrl", "repository", "readme", "tags", "authors", "copyright",
+          "license", "licenseUrl", "icon", "iconUrl" };
+
+    /// <summary>The package id the payloads are restamped from.</summary>
+    const string DonorId = "dotcl";
+
+    /// <summary>True once the package is no longer dotcl itself.</summary>
+    static bool IsRebrand(string newId) =>
+        !newId.Equals(DonorId, StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// NuGet requires &lt;description&gt; and &lt;authors&gt;. When the package
+    /// is rebranded away from dotcl we will not inherit dotcl's values for them,
+    /// so they have to come from the .asd or the command line. Checked before
+    /// any work happens rather than surfacing as a misdescribed package.
+    /// </summary>
+    public static void EnsureRequiredMetadata(string newId, Meta? meta)
+    {
+        if (!IsRebrand(newId)) return;
+        var missing = new List<string>();
+        if (string.IsNullOrWhiteSpace(meta?.Description))
+            missing.Add("a description (--description, or :description in the .asd)");
+        if (string.IsNullOrWhiteSpace(meta?.Authors))
+            missing.Add("an author (--authors, or :author in the .asd)");
+        if (missing.Count > 0)
+            throw new InvalidOperationException(
+                $"packing as '{newId}' needs {string.Join(" and ", missing)}. NuGet requires "
+                + "these fields, and dotcl's own values would misdescribe your package.");
     }
 
     /// <summary>
@@ -156,12 +195,15 @@ static class PackRestamp
         using var outFs = new FileStream(dest, FileMode.CreateNew);
         using var outZip = new ZipArchive(outFs, ZipArchiveMode.Create);
 
-        // A --readme override replaces the file the nuspec's <readme> points at.
-        // Read that filename from the nuspec before the copy loop, since the
-        // README entry can precede the nuspec in the archive.
+        // The nuspec's <readme> names a file packaged alongside it. Read that
+        // name before the copy loop, since the README entry can precede the
+        // nuspec in the archive. A --readme override replaces its bytes; with no
+        // override on a rebranded package the file is dropped entirely, because
+        // shipping dotcl's README as the app's own is what nuget.org would show.
         string? readmeName = null;
         byte[]? readmeBytes = null;
-        if (meta?.ReadmePath != null)
+        bool dropReadme = false;
+        if (meta?.ReadmePath != null || IsRebrand(newId))
         {
             var nuspecEntry = src.Entries.FirstOrDefault(e =>
                 e.FullName.Equals($"{oldId}.nuspec", StringComparison.OrdinalIgnoreCase));
@@ -169,7 +211,11 @@ static class PackRestamp
                 readmeName = LoadXml(ReadAll(nuspecEntry))
                     .Descendants().FirstOrDefault(e => e.Name.LocalName == "readme")
                     ?.Value?.Trim();
-            if (readmeName != null) readmeBytes = File.ReadAllBytes(meta.ReadmePath);
+            if (readmeName != null)
+            {
+                if (meta?.ReadmePath != null) readmeBytes = File.ReadAllBytes(meta.ReadmePath);
+                else dropReadme = true;
+            }
         }
 
         // Set when the package turns out to carry a runtime: the directory
@@ -184,6 +230,17 @@ static class PackRestamp
             // An author signature covers the package hash, so it cannot survive
             // a rewrite — packages pulled from nuget.org carry one.
             if (name.Equals(".signature.p7s", StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            // Dropped <readme> target: leave the donor's README out of the zip.
+            if (dropReadme && readmeName != null
+                && name.Equals(readmeName, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            // Debug symbols: a distributed tool never loads its own .pdb at run
+            // time, so the donor packages' runtime.pdb / DotCL.Runtime.pdb are
+            // pure weight in every restamped package. Drop them.
+            if (name.EndsWith(".pdb", StringComparison.OrdinalIgnoreCase))
                 continue;
 
             var bytes = ReadAll(entry);
@@ -257,10 +314,55 @@ static class PackRestamp
             if (meta.Authors != null) SetOrCreateChild(md, "authors", meta.Authors);
             if (meta.Copyright != null) SetOrCreateChild(md, "copyright", meta.Copyright);
             if (meta.Tags != null) SetOrCreateChild(md, "tags", NormalizeTags(meta.Tags));
+            if (meta.License != null) SetLicenseExpression(md, meta.License);
             if (meta.RepositoryUrl != null)
                 SetRepository(md, meta.RepositoryUrl, meta.RepositoryCommit);
         }
+        // Anything the caller did not supply still holds dotcl's value. Under a
+        // different id that is wrong attribution, not merely stale, so drop it.
+        if (IsRebrand(newId)) DropUnsuppliedDonorFields(md, meta);
         return SaveXml(doc);
+    }
+
+    /// <summary>
+    /// Remove the donor's provenance fields that neither the .asd nor the
+    /// command line replaced. Emitting nothing is strictly better than pointing
+    /// at another project's repository, README or copyright holder.
+    /// </summary>
+    static void DropUnsuppliedDonorFields(XElement md, Meta? meta)
+    {
+        var supplied = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (meta?.Description != null) supplied.Add("description");
+        if (meta?.ProjectUrl != null) supplied.Add("projectUrl");
+        if (meta?.RepositoryUrl != null) supplied.Add("repository");
+        if (meta?.ReadmePath != null) supplied.Add("readme");
+        if (meta?.Tags != null) supplied.Add("tags");
+        if (meta?.Authors != null) supplied.Add("authors");
+        if (meta?.Copyright != null) supplied.Add("copyright");
+        if (meta?.License != null) { supplied.Add("license"); supplied.Add("licenseUrl"); }
+
+        foreach (var field in DonorProvenanceFields)
+        {
+            if (supplied.Contains(field)) continue;
+            md.Elements().Where(e => e.Name.LocalName == field).Remove();
+        }
+    }
+
+    /// <summary>
+    /// Write &lt;license type="expression"&gt;. A donor licenseUrl (deprecated by
+    /// NuGet, and pointing at dotcl's) is removed so the two cannot disagree.
+    /// </summary>
+    static void SetLicenseExpression(XElement md, string expression)
+    {
+        md.Elements().Where(e => e.Name.LocalName == "licenseUrl").Remove();
+        var lic = md.Elements().FirstOrDefault(e => e.Name.LocalName == "license");
+        if (lic == null)
+        {
+            lic = new XElement(md.Name.Namespace + "license");
+            md.Add(lic);
+        }
+        lic.SetAttributeValue("type", "expression");
+        lic.Value = expression;
     }
 
     static void SetChildValue(XElement parent, string localName, string value)

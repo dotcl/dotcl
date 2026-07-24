@@ -95,7 +95,16 @@
                       (push (cons (cdr sm) (cons bnd mdepth)) worklist)
                       (when (and e
                                  (or (not (eq e t)) (local-bound-p e))
-                                 (or (not (keywordp e)) (local-bound-p e))
+                                 ;; A keyword is a self-evaluating constant, never a
+                                 ;; lexical variable, so it is never a free-var
+                                 ;; candidate. Excluding it unconditionally matters
+                                 ;; under *ffv-assume-bound* (candidate collection),
+                                 ;; where LOCAL-BOUND-P is forced T: otherwise e.g.
+                                 ;; the :input keyword in (apply f :input input ...)
+                                 ;; would grab the "INPUT" var-name slot in FREE-HT
+                                 ;; (string-keyed) and shadow the real INPUT variable,
+                                 ;; losing its closure capture.
+                                 (not (keywordp e))
                                  (not (bnd-member-p e bnd))
                                  (not (gethash (var-name e) free-ht))
                                  (local-bound-p e))

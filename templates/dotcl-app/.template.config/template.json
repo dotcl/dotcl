@@ -12,7 +12,7 @@
     "DotclRuntimeVersion": {
       "type": "parameter",
       "datatype": "string",
-      "defaultValue": "0.1.20",
+      "defaultValue": "0.1.21",
       "replaces": "DOTCL_RUNTIME_VERSION",
       "description": "Version of the DotCL.Runtime NuGet package to reference."
     }

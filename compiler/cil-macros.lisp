@@ -151,10 +151,10 @@
 ;;; Old hand-written implementation removed.
 
 ;;; --- setf expander table ---
-(defvar *setf-expanders* (make-hash-table :test #'equal)
+(defvar *setf-expanders* (make-hash-table :test #'equal :synchronized t)
   "Table of custom setf expanders: accessor-name-string → (lambda (place value) expanded-form)")
 
-(defvar *setf-expander-store-counts* (make-hash-table :test #'equal)
+(defvar *setf-expander-store-counts* (make-hash-table :test #'equal :synchronized t)
   "Number of store variables a defsetf-registered expander expects (keyed like
    *setf-expanders*). Absent ⇒ 1. A defsetf long form may declare several store
    variables (e.g. (defsetf gp (o) (nx ny) ...)); GET-SETF-EXPANSION must then
@@ -162,7 +162,7 @@
    time and consulted in %get-setf-expansion.")
 
 ;;; --- struct info table for :include support ---
-(defvar *struct-info* (make-hash-table :test #'eq)
+(defvar *struct-info* (make-hash-table :test #'eq :synchronized t)
   "Table of struct metadata: symbol → plist (:slots :parent :conc-prefix)")
 
 (defun %register-struct-info (name parent conc-prefix base-offset slots)
@@ -177,18 +177,18 @@
               :base-offset base-offset
               :ctor-layout nil)))
 
-(defvar *struct-accessors* (make-hash-table :test #'eq)
+(defvar *struct-accessors* (make-hash-table :test #'eq :synchronized t)
   "Maps accessor symbol to slot index (integer) for compile-time inlining.
    Only populated for standard (non-typed) structs.")
 
-(defvar *clos-accessor-readers* (make-hash-table :test #'eq)
+(defvar *clos-accessor-readers* (make-hash-table :test #'eq :synchronized t)
   "Set of symbols named by DEFCLASS :reader/:accessor — a compile-time HINT that a
    1-arg call is likely a simple slot reader, so compile-named-call emits the
    Runtime.ReaderFast fast path. Only a hint: ReaderFast re-checks the
    GF's SimpleReaderSlot flag at runtime, so a stale/over-broad entry only costs a
    wrapper call, never correctness.")
 
-(defvar *setf-expansion-fns* (make-hash-table :test #'equal)
+(defvar *setf-expansion-fns* (make-hash-table :test #'equal :synchronized t)
   "DEFINE-SETF-EXPANDER entries: accessor-name-string → (lambda (place) → 5 values)")
 
 ;;; --- Setf-expander table key computation ---

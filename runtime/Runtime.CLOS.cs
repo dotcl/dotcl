@@ -566,7 +566,7 @@ public static partial class Runtime
                 found = true;
             }
             if (found)
-                (slotd.ExtraSlots ??= new Dictionary<string, LispObject?>())[es.Name.Name] = value;
+                (slotd.EnsureExtraSlots())[es.Name.Name] = value;
         }
     }
 
@@ -933,13 +933,13 @@ public static partial class Runtime
         }
         if (obj is SlotDefinition slotd)
         {
-            (slotd.ExtraSlots ??= new Dictionary<string, LispObject?>())[name] = value;
+            (slotd.EnsureExtraSlots())[name] = value;
             return value;
         }
         // Metaclass-added slot on a class metaobject.
         if (obj is LispClass klass && klass.Metaclass != null && klass.Metaclass.SlotIndex.ContainsKey(name))
         {
-            (klass.ExtraSlots ??= new Dictionary<string, LispObject?>())[name] = value;
+            (klass.EnsureExtraSlots())[name] = value;
             return value;
         }
         if (obj is LispCondition cond)
@@ -1313,13 +1313,13 @@ public static partial class Runtime
                 bool fromInitarg = false;
                 for (int i = 2; i + 1 < args.Length; i += 2)
                     if (args[i] is Symbol k && Array.Exists(es.Initargs, ia => ia.Name == k.Name))
-                    { (klass.ExtraSlots ??= new Dictionary<string, LispObject?>())[sn] = args[i + 1]; fromInitarg = true; break; }
+                    { (klass.EnsureExtraSlots())[sn] = args[i + 1]; fromInitarg = true; break; }
                 if (fromInitarg) continue;
                 bool inNames = args[1] is T;
                 if (!inNames) for (var c = args[1]; c is Cons cc; c = cc.Cdr) if (cc.Car is Symbol s2 && s2.Name == sn) { inNames = true; break; }
                 bool bound = klass.ExtraSlots != null && klass.ExtraSlots.TryGetValue(sn, out var ev) && ev != null;
                 if (inNames && !bound && es.InitformThunk is { } thunk)
-                    (klass.ExtraSlots ??= new Dictionary<string, LispObject?>())[sn] = MultipleValues.Primary(thunk.Invoke(Array.Empty<LispObject>()));
+                    (klass.EnsureExtraSlots())[sn] = MultipleValues.Primary(thunk.Invoke(Array.Empty<LispObject>()));
             }
             return klass;
         }
@@ -4368,7 +4368,7 @@ public static partial class Runtime
             // Metaclass-added slot on a class metaobject.
             if (obj0 is LispClass klass && klass.Metaclass != null)
             {
-                klass.ExtraSlots?.Remove(name);
+                klass.ExtraSlots?.TryRemove(name, out _);
                 return klass;
             }
             if (obj0 is LispCondition cond)

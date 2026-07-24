@@ -15,6 +15,13 @@
     <Nullable>enable</Nullable>
     <!-- ns2.0 defaults to C# 7.3; force latest so only real BCL-API gaps surface. -->
     <LangVersion>latest</LangVersion>
+    <!-- No debug symbols in Release: this library ships inside the dotcl tool
+         packages (via the runtime exe's publish) and the DotCL.Runtime NuGet,
+         neither of which needs its C# pdb (dotcl reads the .fasl PDB, not this).
+         Scoped to Release so Debug keeps pdbs for local C# debugging. Matches
+         runtime.csproj so the referenced pdb is not regenerated during the pack. -->
+    <DebugType Condition="'$(Configuration)' == 'Release'">none</DebugType>
+    <DebugSymbols Condition="'$(Configuration)' == 'Release'">false</DebugSymbols>
   </PropertyGroup>
 
   <!-- DOTCL_EMIT: the Reflection.Emit-based JIT/compiler is available. Defined for

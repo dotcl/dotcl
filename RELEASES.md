@@ -3,6 +3,51 @@
 User-facing release notes for dotcl. Each section corresponds to a tagged
 release on the public mirror (dotcl/dotcl).
 
+## v0.1.21 -- 2026-07-25
+
+Compile Common Lisp definitions into a .NET assembly that C# can reference at
+compile time (experimental), and run more of UIOP/ASDF unmodified: environment
+writes, working-directory changes, hostname, and merged process output. Also
+cuts the memory needed to load very large compiled files.
+
+### Compiling Lisp into a C#-referenceable library (experimental)
+
+- A new emit path turns dotcl definitions into a .NET DLL that a C# project can
+  reference at compile time. Enums, structs, constants, delegates, interfaces,
+  and exception types are exported as their C# equivalents; `defun`s become
+  public static methods; several types can be collected into a single assembly;
+  and docstrings are carried through as XML doc comments. This is experimental --
+  the surface and conventions may still change.
+
+### UIOP / ASDF portability
+
+- Environment variables can now be written: `(setf (uiop:getenv "X") "...")`,
+  and removed by setting the value to `nil`.
+- `uiop:chdir` / `uiop:with-current-directory`, `uiop:hostname`, and
+  `uiop:delete-empty-directory` are implemented.
+- `run-program` accepts `:error-output :output`, sending a child's stderr to the
+  same destination as its stdout.
+
+### Loading large compiled files
+
+- Long list and vector literals, and deeply nested literals, are split across
+  several methods, so very large compiled files load with far less memory --
+  files that previously needed multiple gigabytes now load in a fraction of that.
+
+### Packaging
+
+- `dotcl pack` copies `.asd` metadata (author, license, description) into the
+  generated NuGet nuspec.
+- Distributed packages no longer ship `.pdb` files, and stop packing the same
+  content more than once.
+
+### Correctness
+
+- `loop` runs `:initially` clauses before `for x = form` variable
+  initialization, matching SBCL's order.
+- Fixed a compiler internal-table corruption that could occur when compiling in
+  parallel.
+
 ## v0.1.20 -- 2026-07-24
 
 Makes Common Lisp a first-class Visual Studio project: scaffold with
