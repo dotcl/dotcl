@@ -28,6 +28,7 @@
 
   <ItemGroup>
     <Content Include="dotcl-app\**\*" Exclude="**\bin\**;**\obj\**" />
+    <Content Include="dotcl-classlib\**\*" Exclude="**\bin\**;**\obj\**" />
     <Compile Remove="**\*" />
   </ItemGroup>
 

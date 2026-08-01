@@ -188,6 +188,12 @@
    GF's SimpleReaderSlot flag at runtime, so a stale/over-broad entry only costs a
    wrapper call, never correctness.")
 
+(defvar *clos-accessor-writers* (make-hash-table :test #'eq :synchronized t)
+  "Set of symbols named by DEFCLASS :writer/:accessor — the writer twin of
+   *clos-accessor-readers*. A compile-time HINT that ((setf NAME) newval obj) is likely a
+   simple slot write, so compile-named-call emits the Runtime.WriterIC inline cache.
+   Only a hint: WriterIC re-checks the GF's SimpleWriterSlot flag at run time.")
+
 (defvar *setf-expansion-fns* (make-hash-table :test #'equal :synchronized t)
   "DEFINE-SETF-EXPANDER entries: accessor-name-string → (lambda (place) → 5 values)")
 
@@ -493,6 +499,21 @@
       (lambda (place value)
         `(,(intern "%SET-STATIC" (find-package "DOTNET"))
           ,@(rest place) ,value)))
+;; (setf (dotnet:-> obj step... "Prop") v) — the chain's last step is the place;
+;; everything before it just navigates. (setf (dotnet:-> o ("Item" 3)) v) sets an
+;; indexed property, matching the dotnet:invoke expander above.
+(setf (gethash "DOTNET:->" *setf-expanders*)
+      (lambda (place value)
+        (let* ((steps (cddr place))
+               (last-step (car (last steps)))
+               (prefix (butlast steps))
+               (chain (intern "->" (find-package "DOTNET")))
+               (set-invoke (intern "%SET-INVOKE" (find-package "DOTNET"))))
+          (if (consp last-step)
+              `(,set-invoke (,chain ,(second place) ,@prefix)
+                            ,(%dotnet-member-name (car last-step)) ,@(cdr last-step) ,value)
+              `(,set-invoke (,chain ,(second place) ,@prefix)
+                            ,(%dotnet-member-name last-step) ,value)))))
 ;; cXXr: (setf (caar x) v) → (progn (rplaca (car x) v) v)
 (dolist (spec '(("CAAR" car car) ("CADR" car cdr) ("CDAR" cdr car) ("CDDR" cdr cdr)
                ("CAAAR" car car car) ("CAADR" car car cdr) ("CADAR" car cdr car)
@@ -822,7 +843,7 @@
                   ;; Local (setf sym) function in scope — direct call per CLHS 5.1.2.9
                   ;; Returns what the setter function returns (not necessarily value)
                   ((and (consp place) (symbolp (car place))
-                        (assoc (mangle-name (list 'setf (car place))) *local-functions* :test #'string=))
+                        (local-function-entry (list 'setf (car place))))
                    `((setf ,(car place)) ,value ,@(cdr place)))
                   ;; DEFINE-SETF-EXPANDER entries — use 5-value protocol.
                   ;; Package-aware lookup: qualified key first (e.g.
@@ -1635,6 +1656,16 @@
   (or (find-symbol "%ASYNC-BIND" "DOTCL") (intern "%ASYNC-BIND" "DOTCL")))
 (defun %async-return-sym ()
   (or (find-symbol "%ASYNC-RETURN" "DOTCL") (intern "%ASYNC-RETURN" "DOTCL")))
+(defun %async-return-mv-sym ()
+  (or (find-symbol "%ASYNC-RETURN-MV" "DOTCL") (intern "%ASYNC-RETURN-MV" "DOTCL")))
+
+(defun %async-terminal-k ()
+  "The continuation that ends an (async ...) block: it takes however many values
+   the block produced and parks them in the Task. &REST rather than one parameter
+   because the value is delivered with MULTIPLE-VALUE-CALL — (values 1 2 3) as the
+   block's last form must not decay to 1 on the way out."
+  (let ((vs (gensym "AVS")))
+    `(lambda (&rest ,vs) (,(%async-return-mv-sym) ,vs))))
 (defun %async-await-sym ()
   (or (find-symbol "AWAIT" "DOTCL") (intern "AWAIT" "DOTCL")))
 (defun %async-async-sym ()
@@ -1672,8 +1703,12 @@
   "Return a form that computes FORM and passes the result to continuation K
    (a form denoting a 1-arg function), yielding a Task."
   (cond
-    ;; Fully synchronous subexpression: hand its value straight to K.
-    ((not (%async-contains-await-p form)) `(funcall ,k ,form))
+    ;; Fully synchronous subexpression: hand its value(s) straight to K.
+    ;; MULTIPLE-VALUE-CALL, not FUNCALL: when this form is the block's last one,
+    ;; K is the terminal continuation and all its values must survive. Binder
+    ;; continuations take a primary parameter plus &rest, so extra values are
+    ;; dropped there exactly as (let ((x (floor 7 2)))) drops them.
+    ((not (%async-contains-await-p form)) `(multiple-value-call ,k ,form))
     ;; (await E) — E must be synchronous.
     ((%async-await-form-p form)
      (let ((e (cadr form)))
@@ -1721,16 +1756,17 @@
          (nev (gensym "NEV"))
          ;; The :no-error body may itself await, so it must be CPS'd. Its
          ;; lambda-list (e.g. (v), (&rest vals), (a &optional b)) is bound by a
-         ;; real lambda applied to the single body value — leaning on normal
+         ;; real lambda applied to the body's values — leaning on normal
          ;; lambda-list processing rather than re-deriving binding semantics.
+         ;; All values are passed, as CL's handler-case :no-error receives them.
          (success-kont
            (if no-error
-               `(lambda (,v)
+               `(lambda (&rest ,v)
                   (apply (lambda ,ne-ll
                            ,(%async-cps-seq (cddr no-error)
-                                            `(lambda (,nev) (,(%async-return-sym) ,nev))))
-                         (list ,v)))
-               `(lambda (,v) (,(%async-return-sym) ,v)))))
+                                            (%async-terminal-k)))
+                         ,v))
+               (%async-terminal-k))))
     `(,(%async-bind-sym)
        (,(%async-try-sym)
          ;; clause type-specifiers: a matching SIGNAL in the body unwinds as a fault
@@ -1744,7 +1780,7 @@
                          (ll (cadr clause))
                          (var (and ll (car ll)))
                          (hbody (cddr clause))
-                         (kont `(lambda (,v) (,(%async-return-sym) ,v))))
+                         (kont (%async-terminal-k)))
                     `(,type ,(if var
                                  `(let ((,var ,c)) ,(%async-cps-seq hbody kont))
                                  (%async-cps-seq hbody kont)))))
@@ -1778,7 +1814,7 @@
          (list ,@(mapcar (lambda (clause)
                            (symbol-name (car clause)))
                          clauses))
-         (lambda () ,(%async-cps body `(lambda (,v) (,(%async-return-sym) ,v))))
+         (lambda () ,(%async-cps body (%async-terminal-k)))
          (lambda (,nm ,as)
            (cond
              ,@(mapcar
@@ -1790,7 +1826,7 @@
                       ;; lambda applied to the arg list (handles (), (x), (&rest a)…).
                       (apply (lambda ,params
                                ,(%async-cps-seq hbody
-                                                `(lambda (,v) (,(%async-return-sym) ,v))))
+                                                (%async-terminal-k)))
                              ,as))))
                 clauses)
              (t (,(%async-return-sym) nil)))))
@@ -1803,8 +1839,8 @@
   (let ((bv (gensym "UPB")) (cv (gensym "UPC")))
     `(,(%async-bind-sym)
        (,(%async-unwind-protect-sym)
-         (lambda () ,(%async-cps protected `(lambda (,bv) (,(%async-return-sym) ,bv))))
-         (lambda () ,(%async-cps-seq cleanup `(lambda (,cv) (,(%async-return-sym) ,cv)))))
+         (lambda () ,(%async-cps protected (%async-terminal-k)))
+         (lambda () ,(%async-cps-seq cleanup (%async-terminal-k))))
        ,k)))
 
 (defun %async-cps-handler-bind (bindings body k)
@@ -1816,7 +1852,7 @@
     `(,(%async-bind-sym)
        (,(%async-with-handlers-sym)
          (list ,@(mapcar (lambda (b) `(cons ',(car b) ,(cadr b))) bindings))
-         (lambda () ,(%async-cps-seq body `(lambda (,v) (,(%async-return-sym) ,v)))))
+         (lambda () ,(%async-cps-seq body (%async-terminal-k))))
        ,k)))
 
 (defun %async-cps-seq (forms k)
@@ -1826,10 +1862,10 @@
     ((null (cdr forms)) (%async-cps (car forms) k))
     (t (let ((s (car forms)))
          (if (%async-contains-await-p s)
-             ;; await statement: discard its value, then run the rest.
-             (let ((ig (gensym "IG")))
-               (%async-cps s `(lambda (,ig)
-                                (declare (ignore ,ig))
+             ;; await statement: discard its value(s), then run the rest.
+             (let ((ig (gensym "IG")) (igr (gensym "IGR")))
+               (%async-cps s `(lambda (,ig &rest ,igr)
+                                (declare (ignore ,ig ,igr))
                                 ,(%async-cps-seq (cdr forms) k))))
              ;; synchronous statement: run for effect, then the rest (a Task).
              `(progn ,s ,(%async-cps-seq (cdr forms) k)))))))
@@ -1840,9 +1876,12 @@
       (multiple-value-bind (var init) (%async-binding-parts (car bindings))
         (if (%async-contains-await-p init)
             ;; Async init (await / unwind-protect / handler-bind / nested let* …):
-            ;; compute it, bind VAR to its value, then continue with the rest.
-            (%async-cps init `(lambda (,var)
-                                ,(%async-cps-let* (cdr bindings) body k)))
+            ;; compute it, bind VAR to its primary value (&rest absorbs any extra,
+            ;; like an ordinary LET binding does), then continue with the rest.
+            (let ((mvr (gensym "MVR")))
+              (%async-cps init `(lambda (,var &rest ,mvr)
+                                  (declare (ignore ,mvr))
+                                  ,(%async-cps-let* (cdr bindings) body k))))
             ;; Synchronous binding.
             `(let ((,var ,init))
                ,(%async-cps-let* (cdr bindings) body k))))))
@@ -1866,7 +1905,7 @@
         (lambda (form)
           (let ((v (gensym "AV")))
             (%async-cps-seq (cdr form)
-                            `(lambda (,v) (,(%async-return-sym) ,v))))))
+                            (%async-terminal-k)))))
   (setf (gethash await-key *macros*)
         (lambda (form)
           (error "DOTCL:AWAIT used outside (DOTCL:ASYNC ...) or in an unsupported position: ~S"
@@ -2301,6 +2340,14 @@
                                          ((stringp v) v)
                                          ((characterp v) (string v))
                                          (t (symbol-name v)))))))
+               ;; CLHS: with no :conc-name argument (or NIL) the accessor IS the
+               ;; slot symbol — same package. An explicitly supplied prefix is
+               ;; concatenated and INTERNed in *PACKAGE*, and that stays true for
+               ;; the empty string: (:conc-name "") on a slot named
+               ;; other-pkg::a36 defines the accessor A36 in the reading package,
+               ;; not other-pkg::a36 (ansi-test structures-02 spells this out).
+               (conc-same-symbol-p (or (eq conc-raw :bare)
+                                       (and (consp conc-raw) (null (cadr conc-raw)))))
                ;; Constructor processing: generate list of constructor forms
                ;; Each entry is either:
                ;;   (:keyword name) - standard &key constructor
@@ -2353,17 +2400,14 @@
                (include-accessor-names
                  (when include-slots
                    (mapcar (lambda (s)
-                             ;; CLHS: when :conc-name is nil/empty the accessor
-                             ;; name IS the slot name (same symbol, same package).
-                             ;; Otherwise intern the prefixed name in *package*.
-                             (if (string= conc-prefix "")
+                             (if conc-same-symbol-p
                                  (car s)
                                  (intern (concatenate 'string conc-prefix
                                                       (symbol-name (car s))))))
                            include-slots)))
                ;; Accessor names for own slots use this struct's conc-prefix
                (own-accessor-names (mapcar (lambda (s)
-                                             (if (string= conc-prefix "")
+                                             (if conc-same-symbol-p
                                                  (car s)
                                                  (intern (concatenate 'string conc-prefix
                                                                       (symbol-name (car s))))))
@@ -2724,7 +2768,10 @@
                (%reader-reg (progn
                               (dolist (ps parsed-slots)
                                 (dolist (r (append (fifth ps) (sixth ps))) ; accessors + readers
-                                  (setf (gethash r *clos-accessor-readers*) t)))
+                                  (setf (gethash r *clos-accessor-readers*) t))
+                                ;; accessors + writers → (setf NAME) call-site hint
+                                (dolist (w (append (fifth ps) (seventh ps)))
+                                  (setf (gethash w *clos-accessor-writers*) t)))
                               nil))
                ;; Parse class options for :default-initargs
                (default-initargs-forms
@@ -3339,8 +3386,21 @@
                               ;; (serapeum) rely on it.
                               ((typep spec 'class)
                                (push spec specializers))
+                              ;; A .NET type designator: a type-name string, or a form
+                              ;; that evaluates to a System.Type / class — e.g.
+                              ;; ((x "System.Text.StringBuilder")) or
+                              ;; ((x (dotnet:make-generic-type "...List" '("System.Int32")))).
+                              ;; %specializer-class registers the CLOS class on the spot,
+                              ;; so no instance of the type need exist first, and a
+                              ;; FullName disambiguates same-simple-name types.
+                              ((or (stringp spec) (consp spec))
+                               (push `(%specializer-class ,spec) specializers))
                               (t
-                               (push `(find-class ',spec) specializers))))
+                               ;; Symbol: the known class wins; a symbol naming only a
+                               ;; .NET type resolves to that type's class instead of
+                               ;; failing (FIND-CLASS's error is still what surfaces
+                               ;; when it is neither).
+                               (push `(%specializer-class ',spec) specializers))))
                           (progn
                             (push sp plain-params)
                             (push '(find-class 't) specializers)))

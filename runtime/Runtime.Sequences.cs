@@ -51,6 +51,36 @@ public static partial class Runtime
         }
         if (hasUnknown && allowOtherKeys != true)
             throw new LispErrorException(new LispProgramError($"{fname}: unknown keyword argument"));
+        CheckBoundingIndices(start1, end1, s1.Length, fname);
+        CheckBoundingIndices(start2, end2, s2.Length, fname);
+    }
+
+    /// <summary>Compare two strings under ONE bounds keyword pair without building an
+    /// args array — the (string= name prefix :end1 n) shape, which prefix checks make the
+    /// most common keyworded string comparison by a wide margin. Returns false when the
+    /// pair is anything else (:allow-other-keys, a non-integer bound, an unknown keyword),
+    /// leaving the caller to fall back to the shared variadic parser so behaviour and
+    /// error messages stay in one place.</summary>
+    private static bool TryStringCmp4(LispObject a, LispObject b, LispObject k, LispObject v,
+                                      string fname, bool caseInsensitive, out (int pos, int cmp) result)
+    {
+        result = default;
+        if (k is not Symbol kw || v is not Fixnum fv) return false;
+        var s1 = ToStringDesignator(a, fname);
+        var s2 = ToStringDesignator(b, fname);
+        int start1 = 0, end1 = s1.Length, start2 = 0, end2 = s2.Length;
+        switch (kw.Name)
+        {
+            case "START1": start1 = (int)fv.Value; break;
+            case "END1": end1 = (int)fv.Value; break;
+            case "START2": start2 = (int)fv.Value; break;
+            case "END2": end2 = (int)fv.Value; break;
+            default: return false;
+        }
+        if (start1 < 0 || end1 > s1.Length || start1 > end1 ||
+            start2 < 0 || end2 > s2.Length || start2 > end2) return false;   // let the general path report
+        result = CompareSubstrings(s1, start1, end1, s2, start2, end2, caseInsensitive);
+        return true;
     }
 
     // Compare substrings; returns (mismatchPos, cmpSign) where:
@@ -92,6 +122,58 @@ public static partial class Runtime
         var s2 = ToStringDesignator(b, fname);
         return CompareSubstrings(s1, 0, s1.Length, s2, 0, s2.Length, ignoreCase);
     }
+
+    // 4-arg entries: one bounds keyword pair, handled without an args array; anything
+    // else falls back to the variadic entry so there is a single parser and a single
+    // set of error messages.
+    public static LispObject StringEq4(LispObject a, LispObject b, LispObject k, LispObject v)
+        => TryStringCmp4(a, b, k, v, "STRING=", false, out var r)
+            ? (r.cmp == 0 ? T.Instance : (LispObject)Nil.Instance)
+            : StringEq(new[] { a, b, k, v });
+    public static LispObject StringNotEq4(LispObject a, LispObject b, LispObject k, LispObject v)
+        => TryStringCmp4(a, b, k, v, "STRING/=", false, out var r)
+            ? (r.cmp != 0 ? Fixnum.Make(r.pos) : (LispObject)Nil.Instance)
+            : StringNotEq(new[] { a, b, k, v });
+    public static LispObject StringLt4(LispObject a, LispObject b, LispObject k, LispObject v)
+        => TryStringCmp4(a, b, k, v, "STRING<", false, out var r)
+            ? (r.cmp < 0 ? Fixnum.Make(r.pos) : (LispObject)Nil.Instance)
+            : StringLt(new[] { a, b, k, v });
+    public static LispObject StringGt4(LispObject a, LispObject b, LispObject k, LispObject v)
+        => TryStringCmp4(a, b, k, v, "STRING>", false, out var r)
+            ? (r.cmp > 0 ? Fixnum.Make(r.pos) : (LispObject)Nil.Instance)
+            : StringGt(new[] { a, b, k, v });
+    public static LispObject StringLe4(LispObject a, LispObject b, LispObject k, LispObject v)
+        => TryStringCmp4(a, b, k, v, "STRING<=", false, out var r)
+            ? (r.cmp <= 0 ? Fixnum.Make(r.pos) : (LispObject)Nil.Instance)
+            : StringLe(new[] { a, b, k, v });
+    public static LispObject StringGe4(LispObject a, LispObject b, LispObject k, LispObject v)
+        => TryStringCmp4(a, b, k, v, "STRING>=", false, out var r)
+            ? (r.cmp >= 0 ? Fixnum.Make(r.pos) : (LispObject)Nil.Instance)
+            : StringGe(new[] { a, b, k, v });
+    public static LispObject StringEqual4(LispObject a, LispObject b, LispObject k, LispObject v)
+        => TryStringCmp4(a, b, k, v, "STRING-EQUAL", true, out var r)
+            ? (r.cmp == 0 ? T.Instance : (LispObject)Nil.Instance)
+            : StringEqualFn(new[] { a, b, k, v });
+    public static LispObject StringNotEqual4(LispObject a, LispObject b, LispObject k, LispObject v)
+        => TryStringCmp4(a, b, k, v, "STRING-NOT-EQUAL", true, out var r)
+            ? (r.cmp != 0 ? Fixnum.Make(r.pos) : (LispObject)Nil.Instance)
+            : StringNotEqualFn(new[] { a, b, k, v });
+    public static LispObject StringLessp4(LispObject a, LispObject b, LispObject k, LispObject v)
+        => TryStringCmp4(a, b, k, v, "STRING-LESSP", true, out var r)
+            ? (r.cmp < 0 ? Fixnum.Make(r.pos) : (LispObject)Nil.Instance)
+            : StringLessp(new[] { a, b, k, v });
+    public static LispObject StringGreaterp4(LispObject a, LispObject b, LispObject k, LispObject v)
+        => TryStringCmp4(a, b, k, v, "STRING-GREATERP", true, out var r)
+            ? (r.cmp > 0 ? Fixnum.Make(r.pos) : (LispObject)Nil.Instance)
+            : StringGreaterp(new[] { a, b, k, v });
+    public static LispObject StringNotGreaterp4(LispObject a, LispObject b, LispObject k, LispObject v)
+        => TryStringCmp4(a, b, k, v, "STRING-NOT-GREATERP", true, out var r)
+            ? (r.cmp <= 0 ? Fixnum.Make(r.pos) : (LispObject)Nil.Instance)
+            : StringNotGreaterp(new[] { a, b, k, v });
+    public static LispObject StringNotLessp4(LispObject a, LispObject b, LispObject k, LispObject v)
+        => TryStringCmp4(a, b, k, v, "STRING-NOT-LESSP", true, out var r)
+            ? (r.cmp >= 0 ? Fixnum.Make(r.pos) : (LispObject)Nil.Instance)
+            : StringNotLessp(new[] { a, b, k, v });
 
     // Case-sensitive 2-arg entries
     public static LispObject StringEq2(LispObject a, LispObject b)
@@ -235,6 +317,20 @@ public static partial class Runtime
         throw new LispErrorException(new LispTypeError("ELT: not a sequence", seq));
     }
 
+    /// <summary>Check that START and END really are bounding indices of a sequence of
+    /// LENGTH elements (CLHS: 0 &lt;= start &lt;= end &lt;= length), signalling a type error if
+    /// not. Without this a too-large END silently produced a wrong answer rather than an
+    /// error — (subseq '(1 2 3) 0 99) returned the list padded with 96 NILs.</summary>
+    private static void CheckBoundingIndices(int start, int end, int length, string fname)
+    {
+        if (start < 0 || start > length)
+            throw new LispErrorException(new LispTypeError(
+                $"{fname}: start index {start} is not in [0, {length}]", Fixnum.Make(start)));
+        if (end < start || end > length)
+            throw new LispErrorException(new LispTypeError(
+                $"{fname}: end index {end} is not in [{start}, {length}]", Fixnum.Make(end)));
+    }
+
     public static LispObject Subseq(LispObject seq, LispObject start, LispObject end)
     {
         int s = (start is Fixnum fs) ? (int)fs.Value : throw new LispErrorException(new LispTypeError("SUBSEQ: start must be integer", start));
@@ -243,11 +339,13 @@ public static partial class Runtime
         if (seq is LispString str)
         {
             int endIdx = e ?? str.Length;
+            CheckBoundingIndices(s, endIdx, str.Length, "SUBSEQ");
             return new LispString(str.Value.Substring(s, endIdx - s));
         }
         if (seq is LispVector vec)
         {
             int endIdx = e ?? vec.Length;
+            CheckBoundingIndices(s, endIdx, vec.Length, "SUBSEQ");
             var items = new LispObject[endIdx - s];
             for (int i = s; i < endIdx; i++) items[i - s] = vec.GetElement(i);
             return new LispVector(items, vec.ElementTypeName);
@@ -255,13 +353,15 @@ public static partial class Runtime
         if (seq is Cons || seq is Nil)
         {
             // List subseq
+            int listLen = ListLength(seq);
+            CheckBoundingIndices(s, e ?? listLen, listLen, "SUBSEQ");
             LispObject cur = seq;
             for (int i = 0; i < s; i++)
             {
                 if (cur is Cons c) cur = c.Cdr;
                 else break;
             }
-            int count = (e ?? ListLength(seq)) - s;
+            int count = (e ?? listLen) - s;
             var items = new LispObject[count];
             for (int i = 0; i < count; i++)
             {
@@ -430,19 +530,57 @@ public static partial class Runtime
         return SortImpl(seq, predicate, null);
     }
 
-    public static LispObject SortFull(LispObject[] args)
+    public static LispObject StableSort(LispObject seq, LispObject predicate)
+    {
+        return SortImpl(seq, predicate, null, stable: true);
+    }
+
+    // 4-arg direct entry: (sort seq pred k v) — the only keyword SORT takes is
+    // :key, so the single pair is decoded here instead of running the general
+    // scan over an args array. Anything else (an unknown keyword, or
+    // :allow-other-keys paired with one) falls back to SortFull so there is a
+    // single error path. Companion 2-arg entry is Sort.
+    public static LispObject Sort4(LispObject seq, LispObject predicate, LispObject k, LispObject v) =>
+        Sort4Core(seq, predicate, k, v, stable: false);
+
+    public static LispObject StableSort4(LispObject seq, LispObject predicate, LispObject k, LispObject v) =>
+        Sort4Core(seq, predicate, k, v, stable: true);
+
+    private static LispObject Sort4Core(LispObject seq, LispObject predicate, LispObject k, LispObject v, bool stable)
+    {
+        if (k is Symbol ks)
+        {
+            switch (ks.Name)
+            {
+                case "KEY":
+                    var karg = v;
+                    if (karg is Symbol ksym && ksym.Function is LispFunction ksf) karg = ksf;
+                    return SortImpl(seq, predicate, karg as LispFunction, stable);
+                case "ALLOW-OTHER-KEYS":
+                    return SortImpl(seq, predicate, null, stable);
+            }
+        }
+        return SortFullCore(new[] { seq, predicate, k, v }, stable);
+    }
+
+    public static LispObject SortFull(LispObject[] args) => SortFullCore(args, stable: false);
+
+    public static LispObject StableSortFull(LispObject[] args) => SortFullCore(args, stable: true);
+
+    private static LispObject SortFullCore(LispObject[] args, bool stable)
     {
         // (sort seq predicate &key key)
+        var name = stable ? "STABLE-SORT" : "SORT";
         var seq = args[0];
         var predicate = args[1];
         int keyArgCount = args.Length - 2;
         if (keyArgCount % 2 != 0)
-            throw new LispErrorException(new LispProgramError("SORT: odd number of keyword arguments"));
+            throw new LispErrorException(new LispProgramError($"{name}: odd number of keyword arguments"));
         bool allowOtherKeys = false;
         for (int i = 2; i < args.Length - 1; i += 2)
         {
             if (args[i] is not Symbol sk)
-                throw new LispErrorException(new LispProgramError($"SORT: keyword must be a symbol, got {args[i]}"));
+                throw new LispErrorException(new LispProgramError($"{name}: keyword must be a symbol, got {args[i]}"));
             if (sk.Name == "ALLOW-OTHER-KEYS" && args[i + 1] != Nil.Instance)
                 allowOtherKeys = true;
         }
@@ -450,7 +588,7 @@ public static partial class Runtime
         for (int i = 2; i < args.Length - 1; i += 2)
         {
             if (args[i] is not Symbol ks)
-                throw new LispErrorException(new LispProgramError($"SORT: keyword must be a symbol, got {args[i]}"));
+                throw new LispErrorException(new LispProgramError($"{name}: keyword must be a symbol, got {args[i]}"));
             switch (ks.Name)
             {
                 case "KEY":
@@ -461,11 +599,11 @@ public static partial class Runtime
                 case "ALLOW-OTHER-KEYS": break;
                 default:
                     if (!allowOtherKeys)
-                        throw new LispErrorException(new LispProgramError($"SORT: unknown keyword :{ks.Name}"));
+                        throw new LispErrorException(new LispProgramError($"{name}: unknown keyword :{ks.Name}"));
                     break;
             }
         }
-        return SortImpl(seq, predicate, keyFn);
+        return SortImpl(seq, predicate, keyFn, stable);
     }
 
     private static int SortCompare(LispFunction fn, LispFunction? keyFn, LispObject a, LispObject b)
@@ -488,7 +626,37 @@ public static partial class Runtime
         // Otherwise it's a genuine sort inconsistency (e.g. inconsistent comparator) - ignore
     }
 
-    private static LispObject SortImpl(LispObject seq, LispObject predicate, LispFunction? keyFn)
+    // Sort ITEMS in place. Array.Sort is introsort — fine for SORT, which ANSI
+    // leaves unstable, but STABLE-SORT must keep the original order of elements
+    // the predicate considers equal. Stability is obtained by sorting a
+    // permutation of indices and breaking ties on the index, so both modes share
+    // one comparator and one exception-unwrapping path.
+    private static void SortObjects(LispObject[] items, LispFunction fn, LispFunction? keyFn, bool stable)
+    {
+        // .NET wraps comparator exceptions in InvalidOperationException or ArgumentException.
+        // Unwrap and rethrow Lisp errors/control exceptions.
+        try
+        {
+            if (!stable)
+            {
+                Array.Sort(items, (a, b) => SortCompare(fn, keyFn, a, b));
+                return;
+            }
+            var src = (LispObject[])items.Clone();
+            var order = new int[items.Length];
+            for (int i = 0; i < order.Length; i++) order[i] = i;
+            Array.Sort(order, (i, j) =>
+            {
+                int c = SortCompare(fn, keyFn, src[i], src[j]);
+                return c != 0 ? c : i.CompareTo(j);
+            });
+            for (int i = 0; i < items.Length; i++) items[i] = src[order[i]];
+        }
+        catch (InvalidOperationException ioe) { UnwrapSortException(ioe); }
+        catch (ArgumentException ae) { UnwrapSortException(ae); }
+    }
+
+    private static LispObject SortImpl(LispObject seq, LispObject predicate, LispFunction? keyFn, bool stable = false)
     {
         // Accept symbol as function designator (ANSI CL: function designator can be symbol or function)
         if (predicate is Symbol psym && psym.Function is LispFunction pf)
@@ -501,21 +669,16 @@ public static partial class Runtime
             var items = new List<LispObject>();
             var cur = seq;
             while (cur is Cons c) { items.Add(c.Car); cur = c.Cdr; }
-            // .NET wraps comparator exceptions in InvalidOperationException or ArgumentException.
-            // Unwrap and rethrow Lisp errors/control exceptions.
-            try { items.Sort((a, b) => SortCompare(fn, keyFn, a, b)); }
-            catch (InvalidOperationException ioe) { UnwrapSortException(ioe); }
-            catch (ArgumentException ae) { UnwrapSortException(ae); }
-            return List(items.ToArray());
+            var arr = items.ToArray();
+            SortObjects(arr, fn, keyFn, stable);
+            return List(arr);
         }
         if (seq is LispString str)
         {
             var chars = str.Value.ToCharArray();
             var charObjs = new LispObject[chars.Length];
             for (int i = 0; i < chars.Length; i++) charObjs[i] = LispChar.Make(chars[i]);
-            try { Array.Sort(charObjs, (a, b) => SortCompare(fn, keyFn, a, b)); }
-            catch (InvalidOperationException ioe) { UnwrapSortException(ioe); }
-            catch (ArgumentException ae) { UnwrapSortException(ae); }
+            SortObjects(charObjs, fn, keyFn, stable);
             var sb = new System.Text.StringBuilder(charObjs.Length);
             foreach (var o in charObjs) if (o is LispChar lc) sb.Append(lc.Value);
             for (int i = 0; i < sb.Length; i++) str[i] = sb[i];
@@ -525,9 +688,7 @@ public static partial class Runtime
         {
             var items = new LispObject[vec.Length];
             for (int i = 0; i < vec.Length; i++) items[i] = vec.ElementAt(i);
-            try { Array.Sort(items, (a, b) => SortCompare(fn, keyFn, a, b)); }
-            catch (InvalidOperationException ioe) { UnwrapSortException(ioe); }
-            catch (ArgumentException ae) { UnwrapSortException(ae); }
+            SortObjects(items, fn, keyFn, stable);
             for (int i = 0; i < items.Length; i++) vec.SetElement(i, items[i]);
             return vec;
         }
@@ -973,6 +1134,7 @@ public static partial class Runtime
         int len = seq is LispVector v ? v.Length : seq is LispString ls ? ls.Length : (int)((Fixnum)Length(seq)).Value;
         int start = kw.Start;
         int end = kw.End ?? len;
+        CheckBoundingIndices(start, end, len, "FIND");
 
         if (seq is LispVector vec)
         {
@@ -1038,6 +1200,7 @@ public static partial class Runtime
         int len = seq is LispVector v ? v.Length : seq is LispString ls ? ls.Length : (int)((Fixnum)Length(seq)).Value;
         int start = kw.Start;
         int end = kw.End ?? len;
+        CheckBoundingIndices(start, end, len, "FIND-IF");
 
         if (seq is LispVector vec)
         {
@@ -1112,6 +1275,7 @@ public static partial class Runtime
         int len = seq is LispVector v ? v.Length : seq is LispString ls ? ls.Length : (int)((Fixnum)Length(seq)).Value;
         int start = kw.Start;
         int end = kw.End ?? len;
+        CheckBoundingIndices(start, end, len, "POSITION");
 
         if (seq is LispVector vec)
         {
@@ -1160,6 +1324,7 @@ public static partial class Runtime
         int len = seq is LispVector v ? v.Length : seq is LispString ls ? ls.Length : (int)((Fixnum)Length(seq)).Value;
         int start = kw.Start;
         int end = kw.End ?? len;
+        CheckBoundingIndices(start, end, len, "POSITION-IF");
 
         if (seq is LispVector vec)
         {
@@ -1243,6 +1408,7 @@ public static partial class Runtime
         int len = seq is LispVector v ? v.Length : seq is LispString ls ? ls.Length : (int)((Fixnum)Length(seq)).Value;
         int start = kw.Start;
         int end = kw.End ?? len;
+        CheckBoundingIndices(start, end, len, "COUNT");
         int count = 0;
 
         if (seq is LispVector vec)
@@ -1289,6 +1455,7 @@ public static partial class Runtime
         int len = seq is LispVector v ? v.Length : seq is LispString ls ? ls.Length : (int)((Fixnum)Length(seq)).Value;
         int start = kw.Start;
         int end = kw.End ?? len;
+        CheckBoundingIndices(start, end, len, "COUNT-IF");
         int count = 0;
 
         if (seq is LispVector vec)
@@ -1496,6 +1663,40 @@ public static partial class Runtime
         return Nil.Instance;
     }
 
+    // ADJOIN: (adjoin item list &key key test test-not) —
+    // (if (member (funcall key item) list :key key :test test) list (cons item list)).
+    // The key is applied to ITEM for the comparison, but the element consed on is
+    // the original ITEM. PUSHNEW expands into this, so the keyworded shapes are
+    // common in ordinary code; the direct entries below mirror MEMBER's.
+    public static LispObject AdjoinFull(LispObject[] args)
+    {
+        if (args.Length < 2)
+            throw new LispErrorException(new LispProgramError("ADJOIN: too few arguments"));
+        return AdjoinCore(args[0], args[1], ParseListKwArgs(args, 2, "ADJOIN"));
+    }
+
+    public static LispObject Adjoin2(LispObject item, LispObject list) =>
+        AdjoinCore(item, list, s_eqlListKw);
+
+    public static LispObject Adjoin4(LispObject item, LispObject list, LispObject k, LispObject v) =>
+        AdjoinCore(item, list, ParseListKwArgs(new[] { k, v }, 0, "ADJOIN"));
+
+    public static LispObject Adjoin6(LispObject item, LispObject list,
+                                     LispObject k1, LispObject v1, LispObject k2, LispObject v2) =>
+        AdjoinCore(item, list, ParseListKwArgs(new[] { k1, v1, k2, v2 }, 0, "ADJOIN"));
+
+    private static LispObject AdjoinCore(LispObject item, LispObject list, in ListKwArgs kw)
+    {
+        if (list is not Nil && list is not Cons)
+            throw new LispErrorException(new LispTypeError("ADJOIN: not a proper list", list));
+        var itemKey = ApplySeqKey(kw, item);
+        var cur = list;
+        for (; cur is Cons c; cur = c.Cdr)
+            if (ListTestMatch(itemKey, c.Car, kw)) return list;
+        if (cur is not Nil) throw new LispErrorException(new LispTypeError("ADJOIN: not a proper list", cur));
+        return new Cons(item, list);
+    }
+
     // ASSOC: (assoc item alist &key test test-not key)
     public static LispObject AssocFull(LispObject[] args)
     {
@@ -1695,6 +1896,7 @@ public static partial class Runtime
             len = vec.Length;
             int start = startOpt ?? 0;
             int end = endOpt ?? len;
+            CheckBoundingIndices(start, end, len, "REDUCE");
             int count = end - start;
             elems = new LispObject[count];
             for (int i = 0; i < count; i++)
@@ -1705,6 +1907,7 @@ public static partial class Runtime
             len = str.Length;
             int start = startOpt ?? 0;
             int end = endOpt ?? len;
+            CheckBoundingIndices(start, end, len, "REDUCE");
             int count = end - start;
             elems = new LispObject[count];
             for (int i = 0; i < count; i++)
@@ -1725,6 +1928,9 @@ public static partial class Runtime
             }
             len = idx;
             int end = endOpt ?? len;
+            // The walk above already skipped to START, so the range is validated here,
+            // once the list's length is known.
+            CheckBoundingIndices(start, end, len, "REDUCE");
             int count = end - start;
             if (count < list.Count) elems = list.GetRange(0, count).ToArray();
             else elems = list.ToArray();
@@ -1795,6 +2001,30 @@ public static partial class Runtime
         if (seq is not Nil && seq is not Cons && seq is not LispVector && seq is not LispString)
             throw new LispErrorException(new LispTypeError("REMOVE: not a sequence", seq));
         var kw = new SeqKwArgs();
+        return RemoveCore(seq, kw, (elem) => SeqTestMatch(item, elem, kw));
+    }
+
+    // 4-arg direct entry: (remove item seq k v) — one keyword pair, e.g.
+    // (remove x list :test #'string=) or (remove x list :key #'car). This is by
+    // far the most common REMOVE shape in the compiler itself. The shared keyword
+    // parser runs over a 2-element array, so only the args array of the InvokeSlow
+    // path is saved — same trade-off as Member4/Assoc4.
+    public static LispObject Remove4(LispObject item, LispObject seq, LispObject k, LispObject v)
+    {
+        if (seq is not Nil && seq is not Cons && seq is not LispVector && seq is not LispString)
+            throw new LispErrorException(new LispTypeError("REMOVE: not a sequence", seq));
+        var kw = ParseSeqKwArgs(new[] { k, v }, 0, "REMOVE");
+        return RemoveCore(seq, kw, (elem) => SeqTestMatch(item, elem, kw));
+    }
+
+    // 6-arg direct entry: (remove item seq k1 v1 k2 v2) — two keyword pairs,
+    // e.g. (remove x l :key #'car :test #'string=).
+    public static LispObject Remove6(LispObject item, LispObject seq,
+                                     LispObject k1, LispObject v1, LispObject k2, LispObject v2)
+    {
+        if (seq is not Nil && seq is not Cons && seq is not LispVector && seq is not LispString)
+            throw new LispErrorException(new LispTypeError("REMOVE: not a sequence", seq));
+        var kw = ParseSeqKwArgs(new[] { k1, v1, k2, v2 }, 0, "REMOVE");
         return RemoveCore(seq, kw, (elem) => SeqTestMatch(item, elem, kw));
     }
 
@@ -1917,6 +2147,7 @@ public static partial class Runtime
             int len = vec.Length;
             int start = kw.Start;
             int end = kw.End ?? len;
+            CheckBoundingIndices(start, end, len, "REMOVE");
             return RemoveCoreIndexed(len, start, end, kw.FromEnd, maxRemove,
                 i => vec[i], seq);
         }
@@ -1925,10 +2156,16 @@ public static partial class Runtime
             int len = str.Length;
             int start = kw.Start;
             int end = kw.End ?? len;
+            CheckBoundingIndices(start, end, len, "REMOVE");
             return RemoveCoreIndexed(len, start, end, kw.FromEnd, maxRemove,
                 i => LispChar.Make(str[i]), seq);
         }
-        // List
+        // List. Its length is only needed to validate the range — the walk itself
+        // does not need it — so it is computed here rather than inside the walk.
+        {
+            int listLen = (int)((Fixnum)Length(seq)).Value;
+            CheckBoundingIndices(kw.Start, kw.End ?? listLen, listLen, "REMOVE");
+        }
         return RemoveCoreList(seq, kw.Start, kw.End, kw.FromEnd, maxRemove);
 
         // Local function for indexed sequences (vector/string)
@@ -2124,6 +2361,7 @@ public static partial class Runtime
 
         int start = kw.Start;
         int end = kw.End ?? len;
+        CheckBoundingIndices(start, end, len, "SUBSTITUTE");
 
         if (kw.FromEnd)
         {
@@ -2173,6 +2411,7 @@ public static partial class Runtime
             int len = vec.Length;
             int start = kw.Start;
             int end = kw.End ?? len;
+            CheckBoundingIndices(start, end, len, "NSUBSTITUTE");
 
             if (kw.FromEnd)
             {
@@ -2266,6 +2505,7 @@ public static partial class Runtime
 
         int start = kw.Start;
         int end = kw.End ?? len;
+        CheckBoundingIndices(start, end, len, "REMOVE-DUPLICATES");
 
         // Determine which elements are duplicates
         var isDup = new bool[len];
@@ -2648,6 +2888,8 @@ public static partial class Runtime
 
         int len1 = ReplaceSeqLength(seq1), len2 = ReplaceSeqLength(seq2);
         int e1 = end1 ?? len1, e2 = end2 ?? len2;
+        CheckBoundingIndices(start1, e1, len1, "SEARCH");
+        CheckBoundingIndices(start2, e2, len2, "SEARCH");
         int patLen = e1 - start1;
         int searchLen = e2 - start2;
 
@@ -2724,9 +2966,10 @@ public static partial class Runtime
     {
         if (obj is LispString) return obj;
         if (obj is LispVector v && v.IsCharVector && v.Rank == 1) return obj; // rank-1 char-vector is a string
-        if (obj is Symbol sym) return new LispString(sym.Name);
-        if (obj is Nil) return new LispString("NIL");
-        if (obj is T) return new LispString("T");
+        // CLHS: STRING of a symbol is its name — the same string SYMBOL-NAME
+        // answers with, so share it (SBCL does too).
+        if (obj is Symbol sym) return sym.NameString;
+        if (obj is Nil || obj is T) return SymbolName(obj);
         if (obj is LispChar ch) return new LispString(ch.Value.ToString());
         throw new LispErrorException(new LispTypeError("STRING: cannot convert to string", obj));
     }
@@ -2793,6 +3036,12 @@ public static partial class Runtime
         memberFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject, LispObject, LispObject>)Runtime.Member4);
         memberFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject>)Runtime.Member6);
         Emitter.CilAssembler.RegisterFunction("MEMBER", memberFn);
+        // ADJOIN: same shapes as MEMBER (PUSHNEW expands into (adjoin item place kw val)).
+        var adjoinFn = new LispFunction(args => Runtime.AdjoinFull(args));
+        adjoinFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject>)Runtime.Adjoin2);
+        adjoinFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject, LispObject, LispObject>)Runtime.Adjoin4);
+        adjoinFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject>)Runtime.Adjoin6);
+        Emitter.CilAssembler.RegisterFunction("ADJOIN", adjoinFn);
         Emitter.CilAssembler.RegisterFunction("MEMBER-IF",
             new LispFunction(args => Runtime.MemberIf(args)));
         Emitter.CilAssembler.RegisterFunction("MEMBER-IF-NOT",
@@ -2838,6 +3087,8 @@ public static partial class Runtime
         // REMOVE, REMOVE-IF, REMOVE-IF-NOT
         var removeFn = new LispFunction(args => Runtime.RemoveFull(args));
         removeFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject>)Runtime.Remove2);
+        removeFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject, LispObject, LispObject>)Runtime.Remove4);
+        removeFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject>)Runtime.Remove6);
         Emitter.CilAssembler.RegisterFunction("REMOVE", removeFn);
         var removeIfFn = new LispFunction(args => Runtime.RemoveIf(args));
         removeIfFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject>)Runtime.RemoveIf2);
@@ -2957,24 +3208,34 @@ public static partial class Runtime
         // InvokeSlow) alongside the full variadic keyword-parsing entry.
         static void RegisterStringCmp(string name,
             Func<LispObject[], LispObject> variadic,
-            Func<LispObject, LispObject, LispObject> twoArg)
+            Func<LispObject, LispObject, LispObject> twoArg,
+            Func<LispObject, LispObject, LispObject, LispObject, LispObject> fourArg)
         {
             var fn = new LispFunction(variadic, name, -1);
             fn.SetDirectDelegate(twoArg);
+            // 4 args = one keyword pair, e.g. the (string= name prefix :end1 n) that
+            // prefix checks are written with — the dominant keyworded shape.
+            fn.SetDirectDelegate(fourArg);
             Emitter.CilAssembler.RegisterFunction(name, fn);
         }
-        RegisterStringCmp("STRING=",  Runtime.StringEq,    Runtime.StringEq2);
-        RegisterStringCmp("STRING<",  Runtime.StringLt,    Runtime.StringLt2);
-        RegisterStringCmp("STRING>",  Runtime.StringGt,    Runtime.StringGt2);
-        RegisterStringCmp("STRING<=", Runtime.StringLe,    Runtime.StringLe2);
-        RegisterStringCmp("STRING>=", Runtime.StringGe,    Runtime.StringGe2);
-        RegisterStringCmp("STRING/=", Runtime.StringNotEq, Runtime.StringNotEq2);
-        RegisterStringCmp("STRING-EQUAL",        Runtime.StringEqualFn,     Runtime.StringEqual2);
-        RegisterStringCmp("STRING-NOT-EQUAL",    Runtime.StringNotEqualFn,  Runtime.StringNotEqual2);
-        RegisterStringCmp("STRING-LESSP",        Runtime.StringLessp,       Runtime.StringLessp2);
-        RegisterStringCmp("STRING-GREATERP",     Runtime.StringGreaterp,    Runtime.StringGreaterp2);
-        RegisterStringCmp("STRING-NOT-GREATERP", Runtime.StringNotGreaterp, Runtime.StringNotGreaterp2);
-        RegisterStringCmp("STRING-NOT-LESSP",    Runtime.StringNotLessp,    Runtime.StringNotLessp2);
+        RegisterStringCmp("STRING=",  Runtime.StringEq,    Runtime.StringEq2,    Runtime.StringEq4);
+        RegisterStringCmp("STRING<",  Runtime.StringLt,    Runtime.StringLt2,    Runtime.StringLt4);
+        RegisterStringCmp("STRING>",  Runtime.StringGt,    Runtime.StringGt2,    Runtime.StringGt4);
+        RegisterStringCmp("STRING<=", Runtime.StringLe,    Runtime.StringLe2,    Runtime.StringLe4);
+        RegisterStringCmp("STRING>=", Runtime.StringGe,    Runtime.StringGe2,    Runtime.StringGe4);
+        RegisterStringCmp("STRING/=", Runtime.StringNotEq, Runtime.StringNotEq2, Runtime.StringNotEq4);
+        RegisterStringCmp("STRING-EQUAL",        Runtime.StringEqualFn,     Runtime.StringEqual2,
+                          Runtime.StringEqual4);
+        RegisterStringCmp("STRING-NOT-EQUAL",    Runtime.StringNotEqualFn,  Runtime.StringNotEqual2,
+                          Runtime.StringNotEqual4);
+        RegisterStringCmp("STRING-LESSP",        Runtime.StringLessp,       Runtime.StringLessp2,
+                          Runtime.StringLessp4);
+        RegisterStringCmp("STRING-GREATERP",     Runtime.StringGreaterp,    Runtime.StringGreaterp2,
+                          Runtime.StringGreaterp4);
+        RegisterStringCmp("STRING-NOT-GREATERP", Runtime.StringNotGreaterp, Runtime.StringNotGreaterp2,
+                          Runtime.StringNotGreaterp4);
+        RegisterStringCmp("STRING-NOT-LESSP",    Runtime.StringNotLessp,    Runtime.StringNotLessp2,
+                          Runtime.StringNotLessp4);
         // STRING-UPCASE/DOWNCASE/CAPITALIZE
         Emitter.CilAssembler.RegisterFunction("STRING-UPCASE",
             new LispFunction(Runtime.StringUpcase, "STRING-UPCASE", -1));
@@ -3005,10 +3266,14 @@ public static partial class Runtime
             }, "SUBSEQ", -1));
 
         // SORT, STABLE-SORT
-        Emitter.CilAssembler.RegisterFunction("SORT",
-            new LispFunction(args => Runtime.SortFull(args)));
-        Emitter.CilAssembler.RegisterFunction("STABLE-SORT",
-            new LispFunction(args => Runtime.SortFull(args)));
+        var sortFn = new LispFunction(args => Runtime.SortFull(args));
+        sortFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject>)Runtime.Sort);
+        sortFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject, LispObject, LispObject>)Runtime.Sort4);
+        Emitter.CilAssembler.RegisterFunction("SORT", sortFn);
+        var stableSortFn = new LispFunction(args => Runtime.StableSortFull(args));
+        stableSortFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject>)Runtime.StableSort);
+        stableSortFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject, LispObject, LispObject>)Runtime.StableSort4);
+        Emitter.CilAssembler.RegisterFunction("STABLE-SORT", stableSortFn);
         // SEARCH
         Emitter.CilAssembler.RegisterFunction("SEARCH",
             new LispFunction(args => Runtime.SearchFull(args)));

@@ -362,7 +362,7 @@ public static partial class Runtime
         if (pkg is Package pp && pp.IsDeleted) return Nil.Instance;
         var p = ResolvePackage(pkg, "PACKAGE-NAME");
         if (p.IsDeleted) return Nil.Instance;
-        return new LispString(p.Name);
+        return p.NameString;
     }
 
     public static LispObject InternSymbolV(LispObject[] args)

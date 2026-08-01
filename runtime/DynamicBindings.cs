@@ -197,6 +197,30 @@ public static class DynamicBindings
     /// on a different thread) and unwind it afterwards.</summary>
     public static int Depth => _top;
 
+    /// <summary>
+    /// The bindings currently on this thread's stack, innermost first, as
+    /// (symbol, value, depth) — for the debugger, which shows what specials are
+    /// in effect and (via DEPTH) which of them a given frame established.
+    ///
+    /// Every binding is listed, not just the effective one per symbol: a shadowed
+    /// outer binding is exactly what a reader of a nested LET wants to see, and
+    /// collapsing them would hide it. An unbound binding (PROGV with no value)
+    /// reports the Unbound sentinel rather than being skipped.
+    /// </summary>
+    public static List<(Symbol Symbol, LispObject Value, int Depth)> CurrentBindings()
+    {
+        var result = new List<(Symbol, LispObject, int)>();
+        var syms = _syms;
+        if (syms == null) return result;
+        var vals = _vals!;
+        for (int i = _top - 1; i >= 0; i--)
+        {
+            var sym = syms[i];
+            if (sym != null) result.Add((sym, vals[i] ?? Unbound, i));
+        }
+        return result;
+    }
+
     /// <summary>Pop bindings down to DEPTH (no-op if already at or below it).</summary>
     public static void TruncateTo(int depth)
     {

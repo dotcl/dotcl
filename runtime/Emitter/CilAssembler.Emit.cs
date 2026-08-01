@@ -142,7 +142,7 @@ public partial class CilAssembler
     /// Split instruction list at :toplevel-boundary markers.
     /// Returns null if no boundaries found.
     /// </summary>
-    private static List<LispObject>? SplitAtBoundaries(LispObject instrList)
+    internal static List<LispObject>? SplitAtBoundaries(LispObject instrList)
     {
         bool hasBoundary = false;
         var cur = instrList;
@@ -384,6 +384,29 @@ public partial class CilAssembler
                     && _locals.TryGetValue(GetSymbolName(Cadr(c)), out var lvBuilder))
                     (_scopeStack.Count > 0 ? _scopeStack.Peek().vars : _localVars)
                         .Add((lvBuilder.LocalIndex, GetString(Caddr(c))));
+                break;
+            case "FRAME-ENTER":
+                EmitFrameEnter(Cadr(c) is Nil ? null : GetString(Cadr(c)));
+                break;
+            case "FRAME-SET":
+                EmitFrameSet(GetString(Cadr(c)), GetSymbolName(Caddr(c)), "DebugFrame.Set");
+                break;
+            case "FRAME-SET-BOX":
+                EmitFrameSet(GetString(Cadr(c)), GetSymbolName(Caddr(c)), "DebugFrame.SetBox");
+                break;
+            case "FRAME-SET-LONG":
+                EmitFrameSetNative(GetString(Cadr(c)), GetSymbolName(Caddr(c)), "Fixnum.Make", false);
+                break;
+            case "FRAME-SET-DOUBLE":
+                EmitFrameSetNative(GetString(Cadr(c)), GetSymbolName(Caddr(c)), "DoubleFloat", true);
+                break;
+            case "FRAME-SET-SINGLE":
+                EmitFrameSetNative(GetString(Cadr(c)), GetSymbolName(Caddr(c)), "SingleFloat", true);
+                break;
+            case "FRAME-SET-DECIMAL":
+                // Raw System.Decimal slot: box into a LispDecimal on the way into
+                // the frame, the same as the native float slots.
+                EmitFrameSetNative(GetString(Cadr(c)), GetSymbolName(Caddr(c)), "LispDecimal", true);
                 break;
             case "SCOPE-BEGIN":
                 if (_localVars != null)
@@ -646,19 +669,41 @@ public partial class CilAssembler
             case "LOAD-SYM-FN":
             {
                 var symName = GetString(Cadr(c));
-                _il.Emit(OpCodes.Ldstr, _faslMode ? Track(symName) : symName);
                 // Optional package name (Caddr c) for home-package-first resolution.
                 var rest = Cddr(c);
-                if (rest is Cons r && r.Car is not Nil)
+                var symPkg = rest is Cons r && r.Car is not Nil ? GetString(r.Car) : null;
+                if (_faslMode)
                 {
-                    var pkgName = GetString(r.Car);
-                    _il.Emit(OpCodes.Ldstr, _faslMode ? Track(pkgName) : pkgName);
-                    _il.Emit(OpCodes.Call, _methodCache["Startup.SymFn(string, string)"]);
+                    // The constant pool is not serialized into a .fasl, so the cell
+                    // lives in a static field of the generated type instead, filled
+                    // by its type initializer.
+                    if (_faslStructMap?.SymFnSiteInitIl != null
+                        && _faslStructMap.UninternedTypeBuilder != null)
+                    {
+                        _il.Emit(OpCodes.Ldsfld,
+                                 _faslStructMap.GetOrCreateSymFnSiteField(symName, symPkg));
+                        _il.Emit(OpCodes.Call, _symFnSiteResolve);
+                    }
+                    else
+                    {
+                        // No type to hang a field on (split/inner assemblers):
+                        // go through SymFn's own memo table as before.
+                        _il.Emit(OpCodes.Ldstr, Track(symName));
+                        if (symPkg is null) _il.Emit(OpCodes.Ldnull);
+                        else _il.Emit(OpCodes.Ldstr, Track(symPkg));
+                        _il.Emit(OpCodes.Call, _methodCache["Startup.SymFn(string, string)"]);
+                    }
                 }
                 else
                 {
-                    _il.Emit(OpCodes.Ldnull);
-                    _il.Emit(OpCodes.Call, _methodCache["Startup.SymFn(string, string)"]);
+                    // JIT mode: one rooted cache cell per call site, filled on first
+                    // execution. Same pattern as READER-IC / WRITER-IC. Takes the
+                    // string-keyed memo lookup out of every function call.
+                    int idx = AddConstant(new Startup.SymFnSite(symName, symPkg));
+                    _il.Emit(OpCodes.Ldc_I4, idx);
+                    _il.Emit(OpCodes.Call, _getConstant);
+                    _il.Emit(OpCodes.Castclass, typeof(Startup.SymFnSite));
+                    _il.Emit(OpCodes.Call, _symFnSiteResolve);
                 }
                 _il.Emit(OpCodes.Castclass, typeof(LispObject));
                 break;
@@ -711,6 +756,35 @@ public partial class CilAssembler
                     _il.Emit(OpCodes.Call, _getConstant);
                     _il.Emit(OpCodes.Castclass, typeof(ReaderCache));
                     _il.Emit(OpCodes.Call, ricMethod);
+                }
+                break;
+            }
+            case "WRITER-IC":
+            {
+                // (setf (accessor obj) newval) inline-cached simple slot write. NEWVAL and
+                // OBJ are already on the stack in that order (the (SETF name) GF's own
+                // argument order). Call Runtime.WriterIC(newval, obj, cell). Cell handling
+                // matches READER-IC: a rooted constant-pool cell in JIT mode, a fresh
+                // always-missing cell per call in FASL mode.
+                var wicName = GetString(Cadr(c));
+                var wicPkg = GetString(Caddr(c));
+                var wicMethod = _methodCache["Runtime.WriterIC"];
+                if (_faslMode)
+                {
+                    _il.Emit(OpCodes.Ldstr, Track(wicName));
+                    _il.Emit(OpCodes.Ldstr, Track(wicPkg));
+                    _il.Emit(OpCodes.Call, _methodCache["Startup.SymInPkg"]);
+                    _il.Emit(OpCodes.Newobj, typeof(WriterCache).GetConstructor(new[] { typeof(Symbol) })!);
+                    _il.Emit(OpCodes.Call, wicMethod);
+                }
+                else
+                {
+                    var cell = new WriterCache(Startup.SymInPkg(wicName, wicPkg));
+                    int idx = AddConstant(cell);
+                    _il.Emit(OpCodes.Ldc_I4, idx);
+                    _il.Emit(OpCodes.Call, _getConstant);
+                    _il.Emit(OpCodes.Castclass, typeof(WriterCache));
+                    _il.Emit(OpCodes.Call, wicMethod);
                 }
                 break;
             }
@@ -2381,6 +2455,41 @@ public partial class CilAssembler
             return result;
         }
 
+        // Per-FASL SymFnSite deduplication: one static cell per (name, package)
+        // named in a call position, shared by every call site that names it.
+        // Initialized from the type initializer (below), not ModuleInit, so the
+        // CLR guarantees the cells exist before any body can read one.
+        internal System.Reflection.Emit.ILGenerator? SymFnSiteInitIl;
+        private readonly Dictionary<string, System.Reflection.Emit.FieldBuilder> _symFnSiteFields = new();
+        private static readonly System.Reflection.ConstructorInfo _symFnSiteCtor =
+            typeof(Startup.SymFnSite).GetConstructor(new[] { typeof(string), typeof(string) })!;
+        private int _symFnSiteCounter;
+
+        /// <summary>
+        /// Static field holding the call-site symbol cache for NAME (optionally
+        /// qualified by its home PKG at compile time). Without it, FASL code
+        /// resolves the callee through Startup.SymFn on every call — a string
+        /// concatenation and a dictionary probe per call, which measured as
+        /// ~57 ns more per call than the JIT path's constant-pool cell.
+        /// </summary>
+        public System.Reflection.Emit.FieldBuilder GetOrCreateSymFnSiteField(string name, string? pkg)
+        {
+            var key = pkg is null ? name : name + "\0" + pkg;
+            if (_symFnSiteFields.TryGetValue(key, out var existing)) return existing;
+            var tb = UninternedTypeBuilder!;
+            var il = SymFnSiteInitIl!;
+            var field = tb.DefineField($"_symfn_{_symFnSiteCounter++}",
+                typeof(Startup.SymFnSite),
+                System.Reflection.FieldAttributes.Public | System.Reflection.FieldAttributes.Static);
+            il.Emit(System.Reflection.Emit.OpCodes.Ldstr, TrackString(name));
+            if (pkg is null) il.Emit(System.Reflection.Emit.OpCodes.Ldnull);
+            else il.Emit(System.Reflection.Emit.OpCodes.Ldstr, TrackString(pkg));
+            il.Emit(System.Reflection.Emit.OpCodes.Newobj, _symFnSiteCtor);
+            il.Emit(System.Reflection.Emit.OpCodes.Stsfld, field);
+            _symFnSiteFields[key] = field;
+            return field;
+        }
+
         /// <summary>
         /// Get or create a static field for an uninterned symbol so that all uses within
         /// this FASL resolve to the SAME Symbol object (preserves EQ-ness across make-load-form).
@@ -3384,6 +3493,49 @@ public partial class CilAssembler
         return label;
     }
 
+    // Frame-locals mode: the DebugFrame this body opened at entry. One
+    // CilAssembler instance emits one method (every body path constructs a fresh
+    // one), so this slot belongs to that method. Null when the compiler emitted no
+    // (:frame-enter) — frame-locals off, or a context with no body prologue such
+    // as a top-level form — in which case (:frame-set ...) is a no-op rather than
+    // IL referring to a slot that does not exist.
+    private LocalBuilder? _dbgFrame;
+
+    // OWNNAME is the body's own runtime function name, or null for a lambda /
+    // closure body. DebugFrames.Enter compares it with the innermost call-stack
+    // frame to tell whether this body has a frame of its own.
+    private void EmitFrameEnter(string? ownName)
+    {
+        if (_dbgFrame != null) return;
+        _dbgFrame = _il.DeclareLocal(typeof(DebugFrame));
+        if (ownName == null) _il.Emit(OpCodes.Ldnull);
+        else _il.Emit(OpCodes.Ldstr, Track(ownName));
+        EmitCall("DebugFrames.Enter");
+        _il.Emit(OpCodes.Stloc, _dbgFrame);
+    }
+
+    private void EmitFrameSet(string sourceName, string localName, string method)
+    {
+        if (_dbgFrame == null || !_locals.TryGetValue(localName, out var slot)) return;
+        _il.Emit(OpCodes.Ldloc, _dbgFrame);
+        _il.Emit(OpCodes.Ldstr, Track(sourceName));
+        _il.Emit(OpCodes.Ldloc, slot);
+        EmitCall(method);
+    }
+
+    /// A native-rep slot (Int64 / Double / Single) holds a raw value, so it is boxed
+    /// into the matching Lisp object on the way into the debug frame — the frame
+    /// hands out LispObjects. Debug-only cost (one box per store).
+    private void EmitFrameSetNative(string sourceName, string localName, string conv, bool newobj)
+    {
+        if (_dbgFrame == null || !_locals.TryGetValue(localName, out var slot)) return;
+        _il.Emit(OpCodes.Ldloc, _dbgFrame);
+        _il.Emit(OpCodes.Ldstr, Track(sourceName));
+        _il.Emit(OpCodes.Ldloc, slot);
+        if (newobj) EmitNewobj(conv); else EmitCall(conv);
+        EmitCall("DebugFrame.Set");
+    }
+
     private LocalBuilder GetLocal(string name)
     {
         if (_locals.TryGetValue(name, out var local)) return local;
@@ -3486,6 +3638,7 @@ public partial class CilAssembler
     private static readonly Dictionary<string, ConstructorInfo> _ctorCache;
     private static readonly Dictionary<string, Type> _typeCache;
     private static readonly MethodInfo _getConstant;
+    private static readonly MethodInfo _symFnSiteResolve;
     private static readonly MethodInfo _getUnitConstant;
     private static readonly MethodInfo _makeFaslInstance;
     private static readonly MethodInfo _internViaEvalInstance;
@@ -3698,6 +3851,7 @@ public partial class CilAssembler
             ["Runtime.Subseq"] = typeof(Runtime).GetMethod("Subseq")!,
             ["Runtime.Concatenate"] = typeof(Runtime).GetMethod("Concatenate")!,
             ["Runtime.Sort"] = typeof(Runtime).GetMethod("Sort")!,
+            ["Runtime.StableSort"] = typeof(Runtime).GetMethod("StableSort")!,
             ["Runtime.Reverse"] = typeof(Runtime).GetMethod("Reverse")!,
             ["Runtime.Coerce"] = typeof(Runtime).GetMethod("Coerce")!,
             ["Runtime.Search"] = typeof(Runtime).GetMethod("Search")!,
@@ -3722,6 +3876,11 @@ public partial class CilAssembler
             ["Runtime.MultipleValuesList"] = typeof(Runtime).GetMethod("MultipleValuesList")!,
             ["Runtime.MultipleValuesList1"] = typeof(Runtime).GetMethod("MultipleValuesList1")!,
             ["Runtime.UnwrapMv"] = typeof(Runtime).GetMethod("UnwrapMv")!,
+
+            // DebugFrames — frame-locals mode only (see DebugFrames.cs)
+            ["DebugFrames.Enter"] = typeof(DebugFrames).GetMethod("Enter")!,
+            ["DebugFrame.Set"] = typeof(DebugFrame).GetMethod("Set")!,
+            ["DebugFrame.SetBox"] = typeof(DebugFrame).GetMethod("SetBox")!,
 
             // MultipleValues
             ["MultipleValues.Reset"] = typeof(MultipleValues).GetMethod("Reset")!,
@@ -3890,6 +4049,7 @@ public partial class CilAssembler
             ["Runtime.SlotValue"] = typeof(Runtime).GetMethod("SlotValue")!,
             ["Runtime.SetSlotValue"] = typeof(Runtime).GetMethod("SetSlotValue")!,
             ["Runtime.ReaderIC"] = typeof(Runtime).GetMethod("ReaderIC")!,
+            ["Runtime.WriterIC"] = typeof(Runtime).GetMethod("WriterIC")!,
             ["Runtime.Boundp"] = typeof(Runtime).GetMethod("Boundp")!,
             ["Runtime.SymbolValue"] = typeof(Runtime).GetMethod("SymbolValue")!,
             ["Runtime.Fdefinition"] = typeof(Runtime).GetMethod("Fdefinition")!,
@@ -4146,6 +4306,10 @@ public partial class CilAssembler
             ["Int64"] = typeof(long),
             ["Double"] = typeof(double),
             ["Single"] = typeof(float),
+            // A local slot holding a raw System.Decimal, for the declared-decimal
+            // native path: the boxed LispDecimal only reappears when the value
+            // crosses back into generic code.
+            ["Decimal"] = typeof(decimal),
             ["Boolean"] = typeof(bool),
             ["String"] = typeof(string),
             ["BlockReturnException"] = typeof(BlockReturnException),
@@ -4169,6 +4333,7 @@ public partial class CilAssembler
         };
 
         _getConstant = typeof(CilAssembler).GetMethod("GetConstant")!;
+        _symFnSiteResolve = typeof(Startup.SymFnSite).GetMethod("Resolve")!;
         _getUnitConstant = typeof(CilAssembler).GetMethod("GetUnitConstant")!;
         _makeFaslInstance = typeof(Runtime).GetMethod("MakeFaslInstance",
             new[] { typeof(string), typeof(string), typeof(LispObject[]) })!;

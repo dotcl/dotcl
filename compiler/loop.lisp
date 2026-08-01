@@ -682,11 +682,17 @@ a LET-like macro, and a SETQ-like macro, which perform LOOP-style destructuring.
 	   (pify (l) (if (null (cdr l)) (car l) `(progn ,@l)))
 	   (makebody ()
 	     (let ((form `(tagbody
-			     ;; ANSI CL 6.1.7.2 says that initially clauses are
-			     ;; evaluated in the loop prologue, which precedes
-			     ;; all loop code except for the initial settings
-			     ;; provided by with, for, or as.
-			     ,@(psimp (append (nreverse rbefore) prologue))
+			     ;; ANSI CL 6.1.7.2 puts initially clauses in the loop
+			     ;; prologue, which precedes all loop iteration. The
+			     ;; initial settings of WITH / FOR / AS that precede it
+			     ;; are the LET bindings, which are outside this form
+			     ;; either way; what lands in BEFORE-LOOP is stepping
+			     ;; and termination code, and that runs after. Emitting
+			     ;; BEFORE-LOOP first ran a FOR clause's first
+			     ;; assignment, and a first termination test, ahead of
+			     ;; a textually-earlier :initially. SBCL emits the
+			     ;; prologue first (GEN-LOOP-BODY).
+			     ,@(psimp (append prologue (nreverse rbefore)))
 			 next-loop
 			    ,@(psimp (append main-body (nreconc rafter `((go next-loop)))))
 			 end-loop
@@ -1538,20 +1544,22 @@ collected result will be returned as the value of the LOOP."
 	 ;;Then we are the same as "FOR x FIRST y THEN z".
 	 (loop-pop-source)
 	 (let ((then-form (loop-get-form)))
-	   ;; The FIRST form runs exactly once. Put its assignment in the loop
-	   ;; prologue at THIS clause's source position instead of in
-	   ;; *loop-before-loop* (which loop-body emits before the whole prologue
-	   ;; — see "(append (nreverse rbefore) prologue)"). Otherwise the first
-	   ;; assignment runs ahead of a textually-earlier :initially clause,
-	   ;; violating ANSI CL 6.1.7.2 (prologue clauses run in source order) and
-	   ;; disagreeing with SBCL. Unlike the no-then case, first-form and
-	   ;; then-form differ, so the loop-body merge that keeps the no-then
-	   ;; assignment in sync cannot apply here. The then-form remains the
-	   ;; per-iteration step (STEPS). loop-make-desetq handles a destructuring
-	   ;; var like the PRE-LOOP-STEPS psetq did.
-	   (push (loop-make-desetq (list var val)) *loop-prologue*)
+	   ;; The FIRST form is PRE-LOOP-STEPS and the THEN form is STEPS, so both
+	   ;; assignments sit in the same per-clause lists as every other FOR. That
+	   ;; is what keeps successive FOR clauses sequential: ANSI CL 6.1.2.1 binds
+	   ;; them like LET*, and only AND makes them parallel, so a later clause's
+	   ;; init form has to see the value this clause just established.
+	   ;;
+	   ;; Pushing the first assignment onto *loop-prologue* instead placed it
+	   ;; after everything in *loop-before-loop*, since loop-body emits
+	   ;; "(append (nreverse rbefore) prologue)". A following FOR then read the
+	   ;; variable before it had been assigned and got NIL. That was done to stop
+	   ;; the first assignment from running ahead of a textually-earlier
+	   ;; :initially clause, but it is not needed: loop-body already moves these
+	   ;; forms into the body under a not-first-time flag, which puts them after
+	   ;; the prologue on its own. Both orderings match SBCL now.
 	   `(() (,var ,then-form) () ()
-	     () () () ())))
+	     () (,var ,val) () ())))
 	(t ;;We are the same as "FOR x = y".
 	 ;; loop-hack-iteration consumes an 8-item list: PRE-STEP-TESTS, STEPS,
 	 ;; POST-STEP-TESTS, PSEUDO-STEPS, PRE-LOOP-PRE-STEP-TESTS, PRE-LOOP-STEPS,
@@ -2423,8 +2431,12 @@ collected result will be returned as the value of the LOOP."
                  (nreverse ans)))
              (pify (l) (if (null (cdr l)) (car l) `(progn ,@l)))
              (makebody ()
+               ;; Prologue first — see the LOOP-BODY macro above, which this
+               ;; mirrors. Emitting BEFORE-LOOP first ran a FOR clause's first
+               ;; assignment, and a first termination test, ahead of a
+               ;; textually-earlier :initially.
                (let ((result `(tagbody
-                                ,@(psimp (append (nreverse rbefore) prologue))
+                                ,@(psimp (append prologue (nreverse rbefore)))
                               next-loop
                                 ,@(psimp (append main-body (nreconc rafter `((go next-loop)))))
                               end-loop

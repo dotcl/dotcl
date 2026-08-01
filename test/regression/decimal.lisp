@@ -184,3 +184,65 @@
 (deftest dec-coerce-result-typep          ; unqualified 'decimal resolves too
   (typep (coerce 7 'decimal) 'dotcl:decimal)
   t)
+
+;;; --- native decimal slots (scope ④) ---
+;;; A declared-decimal, non-captured lexical with a decimal-typed init gets a slot
+;;; holding a raw System.Decimal. Arithmetic then runs without the get_Value/newobj
+;;; pair per operation, and the box only reappears when the value crosses back into
+;;; generic code. Values and scale must be exactly what the boxed path produced.
+
+(defun %dec-native-sum (n)
+  (declare (fixnum n))
+  (let ((acc #m0.00))
+    (declare (type dotcl:decimal acc))
+    (dotimes (i n acc)
+      (setq acc (+ acc #m1.25)))))
+
+(deftest dec-native-slot-accumulates
+  (princ-to-string (%dec-native-sum 4))
+  "#m5.00")
+
+;; The slot's value read generically is a first-class decimal again.
+(deftest dec-native-slot-boxes-on-generic-read
+  (let ((r (%dec-native-sum 2)))
+    (list (dotcl:decimalp r) (princ-to-string r)))
+  (t "#m2.50"))
+
+;; let* bindings get the same treatment when their inits are decimals themselves.
+(deftest dec-native-slot-let*
+  (let* ((a #m1.50)
+         (b #m0.25))
+    (declare (type dotcl:decimal a b))
+    (princ-to-string (+ a b)))
+  "#m1.75")
+
+;; Known gap, fixed here so it cannot change silently: a LET* sibling init does
+;; not see this form's declarations, so (+ a #m0.25) is undeclared arithmetic and
+;; degrades to a rational on the standard tower. The slot therefore must NOT be
+;; declared native — a Decimal slot holding a rational would be a hard cast error.
+(deftest dec-native-slot-let*-sibling-init-degrades
+  (let* ((a #m1.50)
+         (b (+ a #m0.25)))
+    (declare (type dotcl:decimal a b))
+    b)
+  7/4)
+
+;; A captured variable keeps the boxed slot (env capture stores an object), so the
+;; closure and the body still agree on the value.
+(deftest dec-native-slot-captured-stays-boxed
+  (let ((x #m2.50))
+    (declare (type dotcl:decimal x))
+    (let ((peek (lambda () x)))
+      (list (princ-to-string x) (princ-to-string (funcall peek)))))
+  ("#m2.50" "#m2.50"))
+
+;; Mixing with a float in a declared scope is still a compile-time error — the
+;; native slot does not open a back door around the guard.
+(deftest dec-native-slot-mix-still-errors
+  (handler-case
+      (progn (eval '(let ((d #m1.5))
+                      (declare (type dotcl:decimal d))
+                      (+ d 2.0d0)))
+             :no-error)
+    (program-error () :mix-error))
+  :mix-error)

@@ -285,21 +285,48 @@ CLOS は ASCII 圏で完結するため当面問題なし)。
 キーワードシンボルのタプル列)。コンパイラは純粋関数で、副作用なし。
 
 **主要なファイル**:
-- `compiler/cil-compile.lisp` (145 行) — クロスコンパイル時のドライバ。
+- `compiler/cil-compile.lisp` (184 行) — クロスコンパイル時のドライバ。
   ファイル読み込み、`eval-when` の `:compile-toplevel` 処理、SIL 出力
-- `compiler/cil-compiler.lisp` (1286 行) — `compile-toplevel` /
-  `compile-toplevel-eval` のエントリポイント、`*locals*` /
-  `*specials*` / `*boxed-vars*` などのコンテキスト変数管理
-- `compiler/cil-forms.lisp` (4698 行) — 250 ほどの special form ハンドラ
+- `compiler/cil-compiler.lisp` (3450 行) — `compile-toplevel` /
+  `compile-toplevel-eval` のエントリポイント、コンパイル状態
+  (`*CSTATE*` パック、下記) と大域環境 (`*macros*` / `*specials*` 等)
+  の管理、inline 展開・compiler macro のフック
+- `compiler/cil-forms.lisp` (7388 行) — 250 ほどの special form ハンドラ
   を `*compile-form-handlers*` ハッシュ (O(1) ディスパッチ) に登録。
   `quote` / `if` / `let` / `lambda` / `block` / `tagbody` /
   `handler-case` / `unwind-protect` 等
-- `compiler/cil-analysis.lisp` (665 行) — 自由変数解析
+- `compiler/cil-analysis.lisp` (1216 行) — 自由変数解析
   (`find-free-vars-expr`)、変異解析 (どの変数を closure cell に
   ボックス化するか)
-- `compiler/cil-stdlib.lisp` (1235 行) — `cons` / `car` / `mapcar`
+- `compiler/cil-stdlib.lisp` (1705 行) — `cons` / `car` / `mapcar`
   などの標準関数を Lisp で実装。C# 側の `Runtime.cs` と対になっており、
   `#'eql` のように関数オブジェクトで取りたい場合に Lisp 実装が必要
+
+**コンパイル状態の持ち方**: per-compilation の文脈 (スコープ表
+`*locals*` 相当・native 表現スロット表・TCO 文脈など 23 種) は単一の
+special `*CSTATE*` が持つ simple-vector のスロットに集約されている。
+更新は常に functional (コピーして `*CSTATE*` を let 再束縛 / setq)。
+リセット規則はこれで 1 箇所に落ちる: クロージャ境界は空パックへの
+束縛 (レジストリ経由・実 4 エントリ)、非クロージャ関数本体は
+`cstate-fresh-function-body` (呼び出し元が渡す self-TCO の受け渡し
+2 スロットだけ保存)。スロットを足せば全境界のリセットに自動参加する
+ので、「リセット列挙への追加漏れ → 内側 body が外側文脈を引きずる
+silent miscompile」というバグクラスが構造的に消える。式ごとに高頻度で
+再束縛される 2 フラグ (`*in-tail-position*` / `*in-mv-context*`) だけは
+dynamic binding のまま (プロファイル上 special アクセスは無視できる
+コストで、頻繁な再束縛には dynamic binding が正しい道具)。変数の
+参照・シャドウ判定はシンボル identity で行い、native 表現スロット表は
+変数名でなくスロット key でキーする — 同名別 package や内側の再束縛が
+別スロットに解決されることで、シャドウ処理そのものが不要になる。
+
+**inline 展開**: `(declaim (inline f))` された全必須引数の関数は、
+呼び出し地点で `(let ((p a)...) decls (block f body))` に展開して
+その場でコンパイルする (即時適用 lambda は β簡約されないので使わない)。
+局所関数によるシャドウ・NOTINLINE・再帰・サイズ超過・名前捕獲の
+恐れがあるときは普通の呼び出しに落とすだけなので、拒否側に間違いは
+ない。展開体は呼び出し元の tail/TCO 文脈を継承する — これは意図した
+動作で、tail 位置で inline された body 内から包含関数への tail call は
+包含関数の TCO ループに乗る (深い相互再帰が inline 越しに回る)。
 
 **実装上の論点**: 自由変数解析はワークリストで反復し、深くネストした
 フォームでの再帰 stack 溢れを避ける。変異解析が「let で束縛されて
@@ -362,7 +389,13 @@ intern してメソッド間で共有し、IL サイズを抑える。
 
 中間フォーマットとして `.sil` (S 式テキストの IL) があり、ディスク上
 で人間が読める形で命令リストを保存できる。`compiler/cil-out.sil` が
-クロスコンパイル成果物。
+クロスコンパイル成果物。コアの命令列は 1 本の巨大メソッドではなく、
+ファイルを跨がない **32 トップレベルフォーム単位のセグメント**を
+`(:toplevel-boundary)` で連結した形で emit する。ローダは境界で分割して
+1 セグメント = 1 メソッドとして実行するので、組み立て・JIT のピークが
+セグメント単位になり、core ロード時の peak working set が約 4 割下がった
+(セグメント数に対しピークは U 字で、per-form まで細かくすると逆に
+固定費で太る。粒度は `DOTCL_SEG_FORMS` で上書き可)。
 
 **主要なファイル**: `runtime/Emitter/FaslAssembler.cs` (492 行、
 `PersistedAssemblyBuilder` を駆動して `.fasl` を生成)、
@@ -519,15 +552,19 @@ implementation limit は緩く取っている。
 `LispSemaphore` は `SemaphoreSlim` をラップする。bordeaux-threads
 互換の API を提供する。
 
-**主要なファイル**: `runtime/Runtime.Thread.cs` (414 行、
+**主要なファイル**: `runtime/Runtime.Thread.cs` (717 行、
 `bt:make-thread` / `acquire-lock` / `condition-wait` 等の組み込み)。
 
 **実装上の論点**: 親スレッドの動的束縛を `Snapshot()` して子で
 `Restore()` (3.9 と連動)。`.NET Monitor` は再入可能なので、
 `make-lock` と `make-recursive-lock` の差はフラグだけの semantic 区分。
 `destroy-thread` は .NET 5+ で `Thread.Abort` が削除されているため
-`Thread.Interrupt()` で代替する softer な実装にしている (実行中スレッドの
-非同期中断 = `interrupt-thread` は未実装)。
+`Thread.Interrupt()` で代替する softer な実装にしている (destroy された
+スレッドは restart 探索に落ちず黙って終了する)。`interrupt-thread` は
+第 1 段として「.NET の待ち (lock / sleep / join / condition-wait) を
+`Thread.Interrupt()` で叩き起こして割り込み thunk を配送する」実装が
+入っている — 割り込みを飲み込むのは queue に配送物があるときだけ。
+純計算ループ中の preemption は未対応で追跡継続。
 グローバル状態のスレッドセーフ化は段階的に進めており、3.2 (Symbol
 の volatile 化) も同じ流れ。ロックフリーな同期プリミティブとして
 `atomic-long` (compare-and-swap / incf / decf、`Interlocked` ラップ) と

@@ -622,17 +622,19 @@ public static class Startup
         SetDoubleFloatConst("LEAST-POSITIVE-NORMALIZED-LONG-FLOAT", 2.2250738585072014e-308);
         SetDoubleFloatConst("LEAST-NEGATIVE-NORMALIZED-LONG-FLOAT", -2.2250738585072014e-308);
 
-        // Float bit-level access (needed by SBCL cross-compilation and nibbles library).
-        // Intern in CL (so find-symbol "..." "COMMON-LISP" works) but do NOT export
-        // (they are non-standard, exporting would fail NO-EXTRA-SYMBOLS ANSI test).
-        // Import into CL-USER so unqualified access works.
-        foreach (var floatBitSym in new[] {
-            "SINGLE-FLOAT-BITS", "DOUBLE-FLOAT-BITS", "DOUBLE-FLOAT-HIGH-BITS",
-            "DOUBLE-FLOAT-LOW-BITS", "MAKE-SINGLE-FLOAT", "MAKE-DOUBLE-FLOAT" })
-        {
-            var (fbSym, _) = CL.Intern(floatBitSym);
-            CLUser.Import(fbSym);
-        }
+        // Float bit-level access. Non-standard, so these land in DOTCL-INTERNAL —
+        // SymForRegistration's fallback — and are reached from other packages through
+        // the bridge in Startup.SymFn, which is consulted only AFTER the caller's own
+        // package. An earlier revision interned them in CL instead, on the premise that
+        // nibbles calls them as CL symbols; it does not. Its #-(or abcl allegro ccl
+        // clasp clisp cmu ecl lispworks mezzano sbcl) branch calls them unqualified,
+        // resolving to the portable NIBBLES:: definitions in the library's own float.lisp.
+        //
+        // Keeping them in CL was actively harmful: CL is probed before the caller's
+        // package, so a same-named function in any other package was shadowed. SBCL's
+        // cross-compiler defines its target floats as (defstruct (single-float ...))
+        // whose inherited-slot accessor is SB-KERNEL:SINGLE-FLOAT-BITS; the CL entry
+        // hijacked every call to it and broke make-host-1 at src/code/cross-float.
         RegisterUnary("SINGLE-FLOAT-BITS", a => {
             if (a is SingleFloat sf)
                 return Fixnum.Make(Compat.SingleToInt32Bits(sf.Value));
@@ -661,6 +663,17 @@ public static class Startup
             long bits = a is Fixnum f ? f.Value : throw new LispErrorException(new LispTypeError("MAKE-DOUBLE-FLOAT: not an integer", a));
             return new DoubleFloat(BitConverter.Int64BitsToDouble(bits));
         });
+        // Unqualified access from CL-USER, as before — the compiler resolves a name
+        // read there against CL-USER itself, so without this the call does not compile.
+        // Importing into CL-USER is safe in a way interning into CL is not: CL-USER is
+        // not a Package.IsBridgeSource, so it is consulted only for code actually read
+        // in CL-USER and can never shadow a same-named function in another package.
+        foreach (var floatBitSym in new[] {
+            "SINGLE-FLOAT-BITS", "DOUBLE-FLOAT-BITS", "DOUBLE-FLOAT-HIGH-BITS",
+            "DOUBLE-FLOAT-LOW-BITS", "MAKE-SINGLE-FLOAT", "MAKE-DOUBLE-FLOAT" })
+        {
+            CLUser.Import(SymForRegistration(floatBitSym));
+        }
 
         // REPL variables: *, **, ***, +, ++, +++, /, //, ///
         foreach (var name in new[] { "*", "**", "***", "+", "++", "+++", "/", "//", "///" })
@@ -930,6 +943,16 @@ public static class Startup
             throw new HandlerCaseInvocationException(
                 tag, clauseIndex, args.Length > 0 ? args[0] : Nil.Instance));
 
+    /// <summary>
+    /// DOTCL_TRACE_BRIDGE=1 logs every cross-package name-bridge hit (which name,
+    /// which package answered). The bridges are the mechanism behind the
+    /// "undefined function silently resolved to a same-named foreign function"
+    /// class of bug, and the only way to see who still relies on them is to watch
+    /// a real workload.
+    /// </summary>
+    internal static readonly bool TraceBridge =
+        Environment.GetEnvironmentVariable("DOTCL_TRACE_BRIDGE") == "1";
+
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, Symbol> _symCache = new();
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, Symbol> _symFnCache = new();
 
@@ -951,12 +974,16 @@ public static class Startup
         // Symbols not in CL go to DOTCL-INTERNAL.
         var (sym2, status2) = Internal.FindSymbol(name);
         if (status2 != SymbolStatus.None) { _symCache[name] = sym2; return sym2; }
-        // Cross-package bridge (replaces the old flat _functions table):
+        // Cross-package bridge (replaces the old flat _functions table), limited
+        // to dotcl's own namespace — see Package.IsBridgeSource.
         foreach (var pkg in Package.AllPackages)
         {
+            if (!pkg.IsBridgeSource) continue;
             var (existingSym, existingStatus) = pkg.FindSymbol(name);
             if (existingStatus != SymbolStatus.None && existingSym.Function != null)
             {
+                if (TraceBridge)
+                    Console.Error.WriteLine($"[Sym bridge] {name} -> {existingSym.HomePackage?.Name ?? pkg.Name}::{name}");
                 _symCache[name] = existingSym;
                 return existingSym;
             }
@@ -974,6 +1001,41 @@ public static class Startup
     /// This is the fe63591 Sym behavior, preserved for the function-call case only.
     /// </summary>
     public static Symbol SymFn(string name) => SymFn(name, null);
+
+    /// <summary>
+    /// Per-call-site cache for :load-sym-fn. One of these is created per emitted
+    /// call site and rooted in the constant pool, so the (name, package) → Symbol
+    /// resolution happens once instead of on every call. SymFn itself is already
+    /// memoized, but its key is name + "\0" + package — a fresh string allocated
+    /// and hashed on every single function call. That was ~47 ns per call, which
+    /// is a third of dotcl's per-call fixed cost.
+    ///
+    /// Resolution still happens at RUNTIME (on first execution), not at assembly
+    /// time: pre-resolving would pin whatever the symbol looked like before the
+    /// callee's defun ran.
+    /// </summary>
+    public sealed class SymFnSite
+    {
+        private readonly string _name;
+        private readonly string? _pkg;
+        private Symbol? _sym;
+
+        public SymFnSite(string name, string? pkg) { _name = name; _pkg = pkg; }
+
+        public Symbol Resolve() => _sym ?? SlowResolve();
+
+        private Symbol SlowResolve()
+        {
+            var s = SymFn(_name, _pkg);
+            // Pin only a resolution that actually names something callable —
+            // exactly the condition SymFn's own cache uses. An unbound symbol may
+            // become fbound later, and the cross-package bridge may then find a
+            // different package's definition; caching the miss would freeze the
+            // call site on a symbol that never acquires a function.
+            if (s.Function != null || s.SetfFunction != null) _sym = s;
+            return s;
+        }
+    }
 
     /// <summary>
     /// Function-call symbol resolver for :load-sym-fn. Like Sym but bridges to
@@ -1012,9 +1074,12 @@ public static class Startup
         }
         foreach (var pkg in Package.AllPackages)
         {
+            if (!pkg.IsBridgeSource) continue;
             var (existingSym, existingStatus) = pkg.FindSymbol(name);
             if (existingStatus != SymbolStatus.None && existingSym.Function != null)
             {
+                if (TraceBridge)
+                    Console.Error.WriteLine($"[SymFn bridge] {packageName ?? "-"}::{name} -> {existingSym.HomePackage?.Name ?? pkg.Name}::{name}");
                 _symFnCache[cacheKey] = existingSym;
                 return existingSym;
             }
@@ -1082,24 +1147,14 @@ public static class Startup
             var (sym, status) = pkg.FindSymbol(name);
             if (status != SymbolStatus.None) { _symInPkgCache[key] = sym; return sym; }
             var (newSym, _) = pkg.Intern(name);
-            // Cross-package Function bridge (replaces the old _functions flat
-            // table) Phase 3: when newly interning into a user
-            // package (e.g., DOTCL-THREAD), inherit the Function slot from any
-            // existing same-named symbol that has one (e.g. DOTCL-INTERNAL's
-            // runtime-registered helper). Copy-on-intern only.
-            if (newSym.Function == null)
-            {
-                foreach (var otherPkg in Package.AllPackages)
-                {
-                    if (otherPkg == pkg) continue;
-                    var (existingSym, existingStatus) = otherPkg.FindSymbol(name);
-                    if (existingStatus != SymbolStatus.None && existingSym.Function != null)
-                    {
-                        newSym.Function = existingSym.Function;
-                        break;
-                    }
-                }
-            }
+            // No cross-package Function copy here: interning PKG::NAME must not
+            // give the fresh symbol another package's function. Unqualified
+            // function-call sites bridge at the call site instead (SymFn, via
+            // :load-sym-fn), and (funcall 'sym) bridges in CoerceToFunction, so
+            // the DOTCL-THREAD -> DOTCL-INTERNAL helper case still resolves.
+            // Copying grafted e.g. ASDF/FOOTER::EMPTYP onto a user package's
+            // freshly interned EMPTYP, making DEFGENERIC see a bogus ordinary
+            // function (and any funcall of that symbol reach the wrong one).
             _symInPkgCache[key] = newSym;
             return newSym;
         }
@@ -1459,6 +1514,27 @@ public static class Startup
             var btaFn = new LispFunction(Runtime.BacktraceWithArgs);
             RegisterDotcl("BACKTRACE-WITH-ARGS", btaFn);
             Emitter.CilAssembler.RegisterFunction("DOTCL:BACKTRACE-WITH-ARGS", btaFn);
+            // Nameless for the same reason as BACKTRACE: a frame of its own would
+            // shift every index the caller asks about by one.
+            var flFn = new LispFunction(Runtime.FrameLocals);
+            RegisterDotcl("FRAME-LOCALS", flFn);
+            Emitter.CilAssembler.RegisterFunction("DOTCL:FRAME-LOCALS", flFn);
+            var fsFn = new LispFunction(Runtime.FrameSpecials);
+            RegisterDotcl("FRAME-SPECIALS", fsFn);
+            Emitter.CilAssembler.RegisterFunction("DOTCL:FRAME-SPECIALS", fsFn);
+            var pflFn = new LispFunction(Runtime.PrintFrameLocals);
+            RegisterDotcl("PRINT-FRAME-LOCALS", pflFn);
+            Emitter.CilAssembler.RegisterFunction("DOTCL:PRINT-FRAME-LOCALS", pflFn);
+            // Frame-locals mode flag. The compiled compiler reads it through a
+            // bare-name (:load-sym), which Startup.Sym resolves in DOTCL-INTERNAL;
+            // import THAT symbol into DOTCL and export it so user code setting or
+            // LET-binding DOTCL:*EMIT-FRAME-LOCALS* means the same variable the
+            // compiler reads (the symbol-identity gotcha: interning the name
+            // separately in DOTCL would give a different symbol the compiler never
+            // sees).
+            var eflSym = Startup.Sym("*EMIT-FRAME-LOCALS*");
+            DotclPkg.Import(eflSym);
+            DotclPkg.Export(eflSym);
             var pbtFn = new LispFunction(Runtime.PrintBacktrace);
             RegisterDotcl("PRINT-BACKTRACE", pbtFn);
             Emitter.CilAssembler.RegisterFunction("DOTCL:PRINT-BACKTRACE", pbtFn);
@@ -1677,6 +1753,17 @@ public static class Startup
         foreignCbSym.IsSpecial = true;
         foreignCbSym.Value = Nil.Instance;
 
+        // dotcl:*foreign-callback-propagate* — when true, a Lisp error inside a
+        // callback is re-signalled to the caller instead of being contained. Off by
+        // default (containment is what keeps a .NET-driven loop alive), but a callback
+        // called from Lisp — say a lambda handed to LINQ — is far easier to debug when
+        // the error reaches the surrounding handler-case instead of printing a line and
+        // yielding the return type's default.
+        var foreignCbPropagateSym = SymInPkg("*FOREIGN-CALLBACK-PROPAGATE*", "DOTCL");
+        DotclPkg.Export(foreignCbPropagateSym);
+        foreignCbPropagateSym.IsSpecial = true;
+        foreignCbPropagateSym.Value = Nil.Instance;
+
         // dotcl:%ctype-stats — return CType routing statistics (temporary diagnostic)
         RegisterDotcl("%CTYPE-STATS", new LispFunction(args => {
             return new LispString(Runtime.CTypeStats());
@@ -1814,7 +1901,18 @@ public static class Startup
                 ? cl.Value
                 : null;
             var fasl = new DotCL.Emitter.FaslAssembler(moduleName);
-            fasl.AddMonolithicForm(instrList);
+            // A cross-compiled .sil carries one segment per source file, joined by
+            // (:TOPLEVEL-BOUNDARY). Each segment is a top-level form of its own —
+            // emitting them through AddTopLevelForm keeps each file's code in its
+            // own method (and its own label/local table) instead of concatenating
+            // everything into ModuleInit, where the first segment's :RET would
+            // strand the rest. Older boundary-free .sil files still go the
+            // monolithic route.
+            var segments = DotCL.Emitter.CilAssembler.SplitAtBoundaries(instrList);
+            if (segments != null)
+                foreach (var seg in segments) fasl.AddTopLevelForm(seg);
+            else
+                fasl.AddMonolithicForm(instrList);
             fasl.Save(outPath, corlib);
             return new LispString(outPath);
         }, "SIL-TO-FASL", -1));
@@ -1895,6 +1993,47 @@ public static class Startup
             Diagnostics.AllocCounter.Reset();
             return Nil.Instance;
         }, "ALLOC-RESET", 0));
+
+        // dotcl:phase-report — where COMPILE-FILE's time went, slowest first.
+        RegisterDotcl("PHASE-REPORT", new LispFunction(args => {
+            var w = Runtime.GetStandardOutputWriter();
+            if (!Diagnostics.PhaseTimer.Enabled)
+            {
+                w.WriteLine(";; DOTCL_PHASE_PROF=1 not set at startup; phase timers are off");
+                w.Flush();
+                return Nil.Instance;
+            }
+            var snap = Diagnostics.PhaseTimer.Snapshot();
+            double total = 0;
+            foreach (var (_, s, _) in snap) total += s;
+            w.WriteLine("| phase     |    seconds |  % |      calls |");
+            w.WriteLine("|-----------|------------|----|------------|");
+            foreach (var (p, s, c) in snap)
+            {
+                var pct = total > 0 ? (s * 100.0 / total) : 0.0;
+                w.WriteLine($"| {p,-9} | {s,10:F3} | {pct,3:F0} | {c,10:N0} |");
+            }
+            w.WriteLine($"| {"TOTAL",-9} | {total,10:F3} |    |            |");
+            w.Flush();
+            return Nil.Instance;
+        }, "PHASE-REPORT", 0));
+
+        RegisterDotcl("PHASE-RESET", new LispFunction(args => {
+            Diagnostics.PhaseTimer.Reset();
+            return Nil.Instance;
+        }, "PHASE-RESET", 0));
+
+        // dotcl:%phase-time — charge a thunk's elapsed time to a named phase.
+        // Lets the Lisp compiler mark its own phase boundaries; a no-op beyond
+        // calling the thunk unless DOTCL_PHASE_PROF=1.
+        RegisterDotclInternal("%PHASE-TIME", new LispFunction(args => {
+            if (args.Length != 2 || args[1] is not LispFunction thunk)
+                throw new LispErrorException(new LispProgramError(
+                    "DOTCL:%PHASE-TIME: requires (name thunk)"));
+            if (!Diagnostics.PhaseTimer.Enabled) return thunk.Invoke0();
+            var name = args[0] is LispString ls ? ls.Value : args[0].ToString()!;
+            return Diagnostics.PhaseTimer.Time(name, () => thunk.Invoke0());
+        }, "DOTCL:%PHASE-TIME", 2));
 
         // dotcl:run-process — run external process, return (list exit-code stdout-string stderr-string).
         // Public API used by uiop:run-program in dotcl/asdf. Takes (exe args-list)
@@ -2057,12 +2196,33 @@ public static class Startup
             new LispFunction(Runtime.ThreadYield, "THREAD-YIELD", 0));
         RegisterDotcl("DESTROY-THREAD",
             new LispFunction(Runtime.DestroyThread, "DESTROY-THREAD", 1));
+        RegisterDotcl("INTERRUPT-THREAD",
+            new LispFunction(Runtime.InterruptThread, "INTERRUPT-THREAD", 2));
+        RegisterDotcl("KNOWN-TYPE-NAME-P",
+            new LispFunction(Runtime.KnownTypeNameP, "KNOWN-TYPE-NAME-P", 1));
+        // Two predicates the compiler asks about a symbol's proclamations. They
+        // live in DOTCL beside KNOWN-TYPE-NAME-P because the compiler reaches
+        // them the same way — a load-time FIND-SYMBOL probe, so the source also
+        // compiles on the SBCL cross-compile host, which has no DOTCL package.
+        RegisterDotcl("DECLARATION-NAME-P",
+            new LispFunction(args =>
+                args[0] is Symbol s && s.IsDeclarationName ? (LispObject)T.Instance : Nil.Instance,
+                "DECLARATION-NAME-P", 1));
+        RegisterDotcl("GLOBAL-NOTINLINE-P",
+            new LispFunction(args =>
+                args[0] is Symbol s && s.IsNotinlineProclaimed ? (LispObject)T.Instance : Nil.Instance,
+                "GLOBAL-NOTINLINE-P", 1));
+        RegisterDotcl("GLOBAL-INLINE-P",
+            new LispFunction(args =>
+                args[0] is Symbol s && s.IsInlineProclaimed ? (LispObject)T.Instance : Nil.Instance,
+                "GLOBAL-INLINE-P", 1));
         RegisterDotcl("ALL-THREADS",
             new LispFunction(Runtime.AllThreads, "ALL-THREADS", 0));
         RegisterDotcl("MAKE-LOCK",
             new LispFunction(Runtime.MakeLock, "MAKE-LOCK", -1));
-        RegisterDotcl("ACQUIRE-LOCK",
-            new LispFunction(Runtime.AcquireLock, "ACQUIRE-LOCK", -1));
+        var acquireLockFn = new LispFunction(Runtime.AcquireLock, "ACQUIRE-LOCK", -1);
+        acquireLockFn.SetDirectDelegate((Func<LispObject, LispObject>)Runtime.AcquireLock1);
+        RegisterDotcl("ACQUIRE-LOCK", acquireLockFn);
         var releaseLockFn = new LispFunction(Runtime.ReleaseLock, "RELEASE-LOCK", 1);
         releaseLockFn.SetDirectDelegate((Func<LispObject, LispObject>)Runtime.ReleaseLock1);
         RegisterDotcl("RELEASE-LOCK", releaseLockFn);
@@ -2087,6 +2247,9 @@ public static class Startup
             new LispFunction(Runtime.ConditionBroadcast, "CONDITION-BROADCAST", 1));
         RegisterDotcl("MAKE-SEMAPHORE",
             new LispFunction(Runtime.MakeSemaphore, "MAKE-SEMAPHORE", -1));
+        RegisterDotcl("SEMAPHORE-P",
+            new LispFunction(args => args.Length > 0 && args[0] is LispSemaphore
+                ? (LispObject)T.Instance : Nil.Instance, "SEMAPHORE-P", 1));
         RegisterDotcl("SIGNAL-SEMAPHORE",
             new LispFunction(Runtime.SignalSemaphore, "SIGNAL-SEMAPHORE", -1));
         RegisterDotcl("WAIT-ON-SEMAPHORE",
@@ -2159,12 +2322,21 @@ public static class Startup
             return args[0];
         }, "DOTCL:%SET-REPL-READLINE-HOOK", 1));
 
+        // HTTP(S) GET to a file. Transport only: the caller resolves any
+        // credentials and passes them as headers, so nothing here knows about a
+        // particular host. Wrapped in Lisp by the bundled quicklisp's https
+        // fetcher; kept internal until a second consumer justifies a public name.
+        RegisterDotclInternal("%HTTP-FETCH",
+            new LispFunction(DotclHttp.Fetch, "DOTCL:%HTTP-FETCH", 4));
+
         // Non-blocking async/await primitives (step B). The (async ...) macro
         // CPS-transforms its body into a chain of these. Internal (%-prefixed).
         RegisterDotclInternal("%ASYNC-BIND",
             new LispFunction(Runtime.AsyncBind, "DOTCL:%ASYNC-BIND", 2));
         RegisterDotclInternal("%ASYNC-RETURN",
             new LispFunction(Runtime.AsyncReturn, "DOTCL:%ASYNC-RETURN", 1));
+        RegisterDotclInternal("%ASYNC-RETURN-MV",
+            new LispFunction(Runtime.AsyncReturnMv, "DOTCL:%ASYNC-RETURN-MV", 1));
         // handler-bind inside (async ...): establish the cluster, run the CPS body
         // thunk (whose first %async-bind snapshots the cluster so continuations keep
         // it), pop. Reuses the tree-walk CallWithHandlerCluster (push/thunk/pop).

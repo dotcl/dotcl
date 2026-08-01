@@ -30,6 +30,10 @@
     <DotclSourceManifest>$(DotclBundleDir)dotcl-deps.source.txt</DotclSourceManifest>
     <DotclRootSourcesList>$(DotclBundleDir)dotcl-root-sources.txt</DotclRootSourcesList>
     <DotclDeployedManifest>$(DotclBundleDir)dotcl-deps.txt</DotclDeployedManifest>
+    <!-- Per-project copy of the manifest, so a referenced Lisp library can load
+         its own even though the app's dotcl-deps.txt owns that name in the
+         shared output directory. -->
+    <DotclProjectManifest>$(DotclBundleDir)$(MSBuildProjectName).deps.txt</DotclProjectManifest>
     <DotclRootFasl>$(DotclBundleDir)$(MSBuildProjectName).fasl</DotclRootFasl>
 
     <!-- Emit a Portable PDB (source-debuggable .lisp) on a Debug build. Defaults
@@ -131,6 +135,14 @@
     <WriteLinesToFile File="$(DotclDeployedManifest)"
                       Lines="@(_DotclManifestLine)"
                       Overwrite="true" />
+    <!-- Same list under a per-project name. dotcl-deps.txt is the app's
+         manifest and only one of them can occupy the output directory, so a
+         referenced Lisp library needs a manifest it can name for itself; its
+         facade loads that one. LoadFromManifest skips entries already loaded,
+         so the overlap (core, shared deps) is paid for once. -->
+    <WriteLinesToFile File="$(DotclProjectManifest)"
+                      Lines="@(_DotclManifestLine)"
+                      Overwrite="true" />
   </Target>
 
   <!-- Step 6: inject the bundle (manifest + fasls + base core) as build items so
@@ -146,6 +158,7 @@
       <_DotclBundled Include="$(DotclBundleDir)*.pdb" />
       <_DotclBundled Include="$(DotclBundleDir)dotcl.core" Condition="Exists('$(DotclBundleDir)dotcl.core')" />
       <_DotclBundled Include="$(DotclDeployedManifest)" />
+      <_DotclBundled Include="$(DotclProjectManifest)" Condition="Exists('$(DotclProjectManifest)')" />
     </ItemGroup>
 
     <ItemGroup Condition="'$(UseMaui)' == 'true' and $(TargetFramework.Contains('-android'))">

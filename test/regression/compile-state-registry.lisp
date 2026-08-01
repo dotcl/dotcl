@@ -16,8 +16,9 @@
         b a)))
 
 (deftest compile-state.registry-populated
-  ;; All 17 originally-converted variables plus any later additions.
-  (<= 17 (length (symbol-value (%csr-sym "*CLOSURE-FRESH-STATE*"))))
+  ;; The per-expression flags and the *CSTATE* pack (which consolidated the
+  ;; scope tables, the key-verified tables, and the TCO state into one entry).
+  (<= 4 (length (symbol-value (%csr-sym "*CLOSURE-FRESH-STATE*"))))
   t)
 
 (deftest compile-state.fresh-values-inside

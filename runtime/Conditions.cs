@@ -2,7 +2,34 @@ namespace DotCL;
 
 public class LispCondition : LispObject
 {
-    public string Message { get; }
+    private string? _message;
+    private System.Func<string>? _messageThunk;
+
+    /// <summary>
+    /// The condition's message. May be supplied as a thunk, in which case it is
+    /// rendered on first access rather than at construction. WARN and friends build
+    /// this by running the caller's format control over the caller's arguments, and
+    /// those arguments are arbitrary objects: rendering them when the condition is
+    /// created runs the printer under whatever printer variables happened to be in
+    /// effect at the signalling site, not the ones in effect where the condition is
+    /// finally reported. SBCL's compiler relies on the difference — it binds
+    /// *PRINT-CIRCLE* to T around reporting, and the type objects it reports on hold
+    /// each other, so rendering early printed a cycle with no circle detection and
+    /// never came back.
+    /// </summary>
+    public string Message
+    {
+        get
+        {
+            if (_message == null)
+            {
+                var thunk = _messageThunk;
+                _messageThunk = null;   // render once
+                _message = thunk != null ? thunk() : "";
+            }
+            return _message;
+        }
+    }
     /// <summary>CL condition type name (used for TYPE-OF). Defaults to "CONDITION".</summary>
     public string ConditionTypeName { get; set; } = "CONDITION";
     /// <summary>Original format control string (for simple-condition-format-control).</summary>
@@ -23,7 +50,8 @@ public class LispCondition : LispObject
     /// exception type, so dotnet:exception-type / dotnet:handler-bind can dispatch
     /// on the specific .NET type. Null for ordinary Lisp conditions. (dotcl/dotcl#45)</summary>
     public System.Type? ClrExceptionType { get; set; }
-    public LispCondition(string message) => Message = message;
+    public LispCondition(string message) => _message = message;
+    public LispCondition(System.Func<string> messageThunk) => _messageThunk = messageThunk;
     public override string ToString() => $"#<{ConditionTypeName}: {Message}>";
 }
 
@@ -86,6 +114,7 @@ public class LispControlError : LispError
 public class LispWarning : LispCondition
 {
     public LispWarning(string message) : base(message) { ConditionTypeName = "WARNING"; }
+    public LispWarning(System.Func<string> messageThunk) : base(messageThunk) { ConditionTypeName = "WARNING"; }
     public override string ToString() => $"#<WARNING: {Message}>";
 }
 
@@ -572,10 +601,21 @@ public static class ConditionSystem
         CheckBreakOnSignals(condition);
         // CLHS: warn establishes a MUFFLE-WARNING restart, then signals.
         // If a handler calls muffle-warning, the warning is suppressed.
+        //
+        // The restart must transfer control, not merely record that it ran: CLHS says
+        // WARN's restart causes WARN to return immediately, which unwinds the handler
+        // that invoked it. Marking it isBindRestart made MUFFLE-WARNING call this
+        // handler in place and return, so the invoking handler kept running and
+        // HANDLER-BIND went on to the next applicable clause. Code that muffles a
+        // STYLE-WARNING under a handler-bind listing both STYLE-WARNING and WARNING
+        // therefore ran the WARNING clause as well — SBCL's compiler does exactly that
+        // (COMPILER-STYLE-WARNING-HANDLER muffles, COMPILER-WARNING-HANDLER sets
+        // *FAILURE-P*), so every cross-compiled file printed its diagnostics twice and
+        // any file with a style warning failed with "FAILURE-P was set".
+        // The catch below is what ends the warning now.
         var muffled = false;
         var restart = new LispRestart("MUFFLE-WARNING",
-            _ => { muffled = true; return Nil.Instance; },
-            isBindRestart: true);
+            _ => Nil.Instance);
         RestartClusterStack.PushCluster(new[] { restart });
         try
         {

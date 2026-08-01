@@ -19,6 +19,7 @@ namespace DotCL;
 public static class DotclHost
 {
     private static bool _initialized;
+    private static bool _coreLoaded;
 
     /// <summary>
     /// Bootstraps the Lisp runtime (packages, readtable, core functions).
@@ -139,6 +140,7 @@ public static class DotclHost
     /// </summary>
     public static void LoadCore(string filePath)
     {
+        _coreLoaded = true;
         byte[] header = new byte[2];
         using (var fs = System.IO.File.OpenRead(filePath))
         {
@@ -236,6 +238,30 @@ public static class DotclHost
     }
 
     /// <summary>
+    /// True once a core has been loaded through <see cref="LoadCore"/> or
+    /// <see cref="LoadFromManifest"/> in this process.
+    /// </summary>
+    public static bool CoreLoaded => _coreLoaded;
+
+    /// <summary>
+    /// Load the bundled core unless one is already loaded. Idempotent, so a
+    /// component that must run on a booted image — a library facade, a plugin —
+    /// can call it without knowing whether the host booted dotcl first. Loading
+    /// a core twice is not benign: the second pass redefines CL functions and
+    /// signals "package COMMON-LISP is locked".
+    /// </summary>
+    public static void EnsureCore()
+    {
+        if (_coreLoaded) return;
+        var core = FindCore()
+            ?? throw new InvalidOperationException(
+                "DotclHost.EnsureCore: no dotcl.core found next to the application. "
+                + "A project referencing DotCL.Runtime gets one copied to its output; "
+                + "otherwise pass an explicit path to LoadCore.");
+        LoadCore(core);
+    }
+
+    /// <summary>
     /// Load and evaluate a Lisp source file. Same semantics as CL LOAD.
     /// </summary>
     public static void LoadLispFile(string path)
@@ -255,7 +281,15 @@ public static class DotclHost
     /// host extracts them and calls this once after <see cref="LoadCore"/>
     /// to bring in all required contribs in dependency order.
     ///
-    /// Returns the number of FASLs loaded.
+    /// Loading is idempotent per entry: the core is loaded at most once per
+    /// process, and a FASL whose module is already in <c>*MODULES*</c> is
+    /// skipped. Several manifests can therefore be loaded in one process — an
+    /// app's own plus one per referenced Lisp library — with the overlap (the
+    /// core, shared contribs) paid for once. Re-loading the core is not benign:
+    /// it redefines CL functions and signals "package COMMON-LISP is locked".
+    ///
+    /// Returns the number of FASLs loaded, not counting entries skipped as
+    /// already loaded.
     /// </summary>
     public static int LoadFromManifest(string manifestPath)
     {
@@ -277,28 +311,43 @@ public static class DotclHost
             var resolved = System.IO.Path.IsPathRooted(fileName)
                 ? fileName
                 : System.IO.Path.Combine(dir, fileName);
+
+            // Module name is the filename without extension, lowercased —
+            // matching the keyword/string normalization REQUIRE applies. The
+            // base image is "dotcl" and is tracked by _coreLoaded rather than
+            // *MODULES*: it is a core, not a library.
+            var moduleName = System.IO.Path.GetFileNameWithoutExtension(fileName).ToLowerInvariant();
+            var isCore = moduleName == "dotcl";
+
+            if (isCore ? _coreLoaded : ModuleProvided(modulesSym, moduleName))
+                continue;
+
             Runtime.Load(new LispObject[] { new LispString(resolved) });
 
             // Treat each loaded fasl as a "provided" module so a later
             // (require :foo) from user code doesn't trigger module-provide-
             // contrib's filesystem search (which would fail in deployment
-            // where the contrib/ tree isn't shipped). Module name is the
-            // filename without extension, lowercased — matching the keyword/
-            // string normalization REQUIRE applies. dotcl.core is excluded
-            // since it's a base image, not a library.
-            var moduleName = System.IO.Path.GetFileNameWithoutExtension(fileName).ToLowerInvariant();
-            if (moduleName.Length > 0 && moduleName != "dotcl")
-            {
-                bool present = false;
-                for (LispObject c = DynamicBindings.Get(modulesSym); c is Cons cc; c = cc.Cdr)
-                    if (cc.Car is LispString s && s.Value == moduleName) { present = true; break; }
-                if (!present)
-                    DynamicBindings.Set(modulesSym,
-                        new Cons(new LispString(moduleName), DynamicBindings.Get(modulesSym)));
-            }
+            // where the contrib/ tree isn't shipped).
+            if (isCore)
+                _coreLoaded = true;
+            else if (moduleName.Length > 0)
+                DynamicBindings.Set(modulesSym,
+                    new Cons(new LispString(moduleName), DynamicBindings.Get(modulesSym)));
             count++;
         }
         return count;
+    }
+
+    /// <summary>
+    /// True if MODULENAME is already on <c>*MODULES*</c> — i.e. a manifest load
+    /// or a REQUIRE has brought it in.
+    /// </summary>
+    private static bool ModuleProvided(Symbol modulesSym, string moduleName)
+    {
+        if (moduleName.Length == 0) return false;
+        for (LispObject c = DynamicBindings.Get(modulesSym); c is Cons cc; c = cc.Cdr)
+            if (cc.Car is LispString s && s.Value == moduleName) return true;
+        return false;
     }
 
     /// <summary>
@@ -314,14 +363,68 @@ public static class DotclHost
     }
 
     /// <summary>
-    /// Call a Lisp function by name (interned in CL-USER) with .NET object
-    /// arguments. Each arg is converted via <see cref="Runtime.DotNetToLisp"/>;
-    /// the return is a <see cref="LispObject"/>. Use
-    /// <see cref="LispString.Value"/> etc. to extract typed results.
+    /// Resolve a function name a host passed in, for <see cref="Call"/>.
+    ///
+    /// "PKG:NAME" / "PKG::NAME" names a package explicitly and always wins.
+    /// An unqualified name goes through the normal resolver first (CL and
+    /// dotcl's own packages), and then — only if that found nothing callable —
+    /// through every package that has an fbound symbol of that name. The last
+    /// step is what makes a host call into a Lisp library work: the library's
+    /// entry points live in the library's own package, which the internal
+    /// name-based bridge deliberately does not search. Ambiguity is an error
+    /// rather than a coin flip: the caller is told to qualify the name.
+    /// </summary>
+    private static Symbol ResolveCallable(string functionName)
+    {
+        var colon = functionName.IndexOf(':');
+        if (colon > 0)
+        {
+            var pkgName = functionName[..colon];
+            var symName = functionName[colon..].TrimStart(':');
+            var pkg = Package.FindPackage(pkgName)
+                ?? throw new InvalidOperationException(
+                    $"DotclHost.Call: no package named {pkgName} (in \"{functionName}\")");
+            var (qualified, qualifiedStatus) = pkg.FindSymbol(symName);
+            if (qualifiedStatus == SymbolStatus.None)
+                throw new InvalidOperationException(
+                    $"DotclHost.Call: package {pkgName} has no symbol {symName}");
+            return qualified;
+        }
+
+        var sym = Startup.SymFn(functionName);
+        if (sym.Function != null) return sym;
+
+        Symbol? found = null;
+        List<string>? ambiguous = null;
+        foreach (var pkg in Package.AllPackages)
+        {
+            var (candidate, status) = pkg.FindSymbol(functionName);
+            // Inherited hits are the same symbol seen through a use-list; only
+            // the home-ish statuses are considered so a symbol counts once.
+            if (status != SymbolStatus.External && status != SymbolStatus.Internal) continue;
+            if (candidate.Function == null) continue;
+            if (found == null || ReferenceEquals(found, candidate)) { found = candidate; continue; }
+            ambiguous ??= new List<string> { $"{found.HomePackage?.Name}::{functionName}" };
+            ambiguous.Add($"{candidate.HomePackage?.Name}::{functionName}");
+        }
+        if (ambiguous != null)
+            throw new InvalidOperationException(
+                $"DotclHost.Call: {functionName} is ambiguous ({string.Join(", ", ambiguous)}); "
+                + "name the package explicitly, e.g. \"PKG:NAME\"");
+        return found ?? sym;
+    }
+
+    /// <summary>
+    /// Call a Lisp function by name with .NET object arguments. The name may be
+    /// package-qualified ("MYLIB:ENTRY"); an unqualified name resolves as
+    /// described on <see cref="ResolveCallable"/>. Each arg is converted via
+    /// <see cref="Runtime.DotNetToLisp"/>; the return is a
+    /// <see cref="LispObject"/>. Use <see cref="LispString.Value"/> etc. to
+    /// extract typed results.
     /// </summary>
     public static LispObject Call(string functionName, params object?[] args)
     {
-        var sym = Startup.Sym(functionName);
+        var sym = ResolveCallable(functionName);
         if (sym.Function is not LispFunction fn)
             throw new InvalidOperationException(
                 $"DotclHost.Call: symbol {functionName} has no function binding");
@@ -341,6 +444,68 @@ public static class DotclHost
     /// <see cref="Runtime.DotNetToLisp"/> conversion used on the way in.
     /// </summary>
     public static object? ToClr(LispObject value) => Runtime.LispToDotNetGeneric(value);
+
+    /// <summary>
+    /// Build a Lisp LIST from a .NET sequence, converting each element with the
+    /// same marshalling <see cref="Call"/> applies to arguments.
+    ///
+    /// Passing a .NET array or collection straight to <see cref="Call"/> hands
+    /// the Lisp side a foreign object, not a sequence — deliberately, so a
+    /// byte[] stays the same buffer. This is the explicit way to say "as a Lisp
+    /// list", for calling a function that takes one sequence argument.
+    /// </summary>
+    public static LispObject ToLispList(System.Collections.IEnumerable items)
+    {
+        if (items is null) throw new ArgumentNullException(nameof(items));
+        var elements = new List<LispObject>();
+        foreach (var item in items) elements.Add(Runtime.DotNetToLisp(item));
+        LispObject result = Nil.Instance;
+        for (int i = elements.Count - 1; i >= 0; i--) result = new Cons(elements[i], result);
+        return result;
+    }
+
+    /// <summary>
+    /// Build a Lisp simple VECTOR from a .NET sequence. The vector counterpart
+    /// of <see cref="ToLispList"/>.
+    /// </summary>
+    public static LispObject ToLispVector(System.Collections.IEnumerable items)
+    {
+        if (items is null) throw new ArgumentNullException(nameof(items));
+        var elements = new List<LispObject>();
+        foreach (var item in items) elements.Add(Runtime.DotNetToLisp(item));
+        return new LispVector(elements.ToArray());
+    }
+
+    /// <summary>
+    /// Convert a Lisp sequence — a list or a vector — to a .NET array, each
+    /// element converted to <typeparamref name="T"/> as <see cref="ToClr{T}"/>
+    /// does. NIL is the empty sequence, so it yields an empty array.
+    /// </summary>
+    public static T[] ToClrArray<T>(LispObject sequence) => ToClrList<T>(sequence).ToArray();
+
+    /// <summary>
+    /// List form of <see cref="ToClrArray{T}"/>.
+    /// </summary>
+    public static List<T> ToClrList<T>(LispObject sequence)
+    {
+        var result = new List<T>();
+        switch (sequence)
+        {
+            case null:
+            case Nil:
+                return result;
+            case LispVector v:
+                for (int i = 0; i < v.Length; i++) result.Add(ToClr<T>(v.ElementAt(i)));
+                return result;
+            case Cons:
+                for (LispObject c = sequence; c is Cons cc; c = cc.Cdr) result.Add(ToClr<T>(cc.Car));
+                return result;
+            default:
+                throw new InvalidCastException(
+                    $"DotclHost.ToClrList<{typeof(T).Name}>: not a Lisp list or vector: "
+                    + sequence.GetType().Name);
+        }
+    }
 
     /// <summary>
     /// Convert a Lisp result to the requested .NET type <typeparamref name="T"/>,

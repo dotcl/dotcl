@@ -158,6 +158,12 @@ public static partial class Runtime
             if (resultProp != null)
             {
                 var res = resultProp.GetValue(task);
+                // An (async ...) block whose value is multiple values carries an
+                // MvReturn as its payload. Re-publish it through MultipleValues on
+                // THIS thread: the values were produced on a continuation thread,
+                // and the thread-static side of the MV protocol did not come along.
+                if (res is MvReturn mv)
+                    return MultipleValues.Values(mv.Values);
                 // Task<VoidTaskResult> is the internal shape of a non-generic async
                 // Task; its Result is a private placeholder struct → NIL.
                 if (res != null && res.GetType().FullName == "System.Threading.Tasks.VoidTaskResult")
@@ -203,6 +209,25 @@ public static partial class Runtime
             throw new LispErrorException(new LispProgramError(
                 "DOTCL:%ASYNC-RETURN: requires exactly 1 argument"));
         return new LispDotNetObject(System.Threading.Tasks.Task.FromResult(args[0]));
+    }
+
+    /// <summary>
+    /// (dotcl:%async-return-mv value-list) => task
+    /// Terminal continuation of an (async ...) block that keeps multiple values.
+    /// The macro hands the block's values as a list (collected with
+    /// MULTIPLE-VALUE-CALL, so nothing is dropped at the call boundary); this lifts
+    /// them back into the MV protocol and parks the result in a completed Task.
+    /// One value stays a bare value — the common case allocates nothing extra.
+    /// </summary>
+    public static LispObject AsyncReturnMv(LispObject[] args)
+    {
+        if (args.Length != 1)
+            throw new LispErrorException(new LispProgramError(
+                "DOTCL:%ASYNC-RETURN-MV: requires exactly 1 argument (a list of values)"));
+        var vals = new System.Collections.Generic.List<LispObject>();
+        for (LispObject c = args[0]; c is Cons cc; c = cc.Cdr) vals.Add(cc.Car);
+        return new LispDotNetObject(
+            System.Threading.Tasks.Task.FromResult(MultipleValues.Values(vals.ToArray())));
     }
 
     /// <summary>Run a Lisp 0-arg thunk with a captured dynamic environment installed
@@ -268,6 +293,16 @@ public static partial class Runtime
     private static LispErrorException DotNetInvokeError(string context, System.Reflection.TargetInvocationException tie)
     {
         var inner = tie.InnerException;
+        // A Lisp non-local exit or condition that started inside a callback (a lambda
+        // handed to LINQ, an event handler) is passing THROUGH this reflection call on
+        // its way to its own target — it is not a failure of the .NET method. Let it
+        // continue unchanged; wrapping it turned (return-from b ...) across a callback
+        // into an error reading "DOTNET:INVOKE Func`2.Invoke: block return", and lost
+        // the original condition of a Lisp error.
+        if (inner is BlockReturnException || inner is CatchThrowException || inner is GoException
+            || inner is HandlerCaseInvocationException || inner is RestartInvocationException
+            || inner is LispErrorException)
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(inner).Throw();
         return new LispErrorException(new LispError($"{context}: {inner?.Message ?? tie.Message}")
         {
             ClrExceptionType = inner?.GetType()
@@ -606,8 +641,20 @@ public static partial class Runtime
                 DynamicBindings.Restore(dynSnapshot);    // install captured specials
                 HandlerClusterStack.Restore(handlerSnapshot);  // and handler clusters
                 RestartClusterStack.Restore(restartSnapshot);  // and restart clusters
+                // Multiple values reach the continuation as multiple ARGUMENTS,
+                // which is what makes both kinds of continuation behave: a let*
+                // binder is (lambda (x &rest ignored)) and keeps the primary, as
+                // (let ((x (floor 7 2)))) does, while the terminal continuation is
+                // (lambda (&rest vs)) and keeps them all. Unwrapping to the primary
+                // here instead would silently drop the values of a sub-construct
+                // (handler-case's :no-error clause, say) on their way out.
                 var v = TaskResultToLisp(t);
-                next = cont.Invoke1(v);   // continuation returns the next Task
+                next = v is MvReturn mvr
+                    ? (mvr.Values.Length == 0
+                        // No values: a binder still binds NIL (CL semantics).
+                        ? cont.Invoke1(Nil.Instance)
+                        : cont.Invoke(mvr.Values))
+                    : cont.Invoke1(v);   // continuation returns the next Task
             }
             catch (Exception e) { tcs.SetException(e); return; }
             finally
@@ -816,6 +863,12 @@ public static partial class Runtime
 
         // Fallback: pass as object
         if (targetType == typeof(object)) return arg;
+
+        // A parameter typed in terms of the Lisp object model itself (LispObject,
+        // Cons, LispVector, …) takes the value unchanged — no marshalling was
+        // ever wanted. This is how Lisp code calls a host API that speaks
+        // LispObject, e.g. DotclHost.ToClrArray.
+        if (targetType.IsInstanceOfType(arg)) return arg;
 
         throw new LispErrorException(new LispTypeError(
             $"Cannot convert {arg.GetType().Name} to {targetType.Name}", arg));
@@ -1072,10 +1125,13 @@ public static partial class Runtime
         if (args.Length != 1)
             throw new LispErrorException(new LispProgramError(
                 $"DOTNET:RESOLVE-TYPE: expected 1 argument, got {args.Length}"));
-        if (args[0] is not LispString name)
+        // A name string, a symbol, or an already-resolved System.Type (idempotent, so a
+        // composed generic type can be passed back through without special-casing).
+        if (args[0] is not LispString && args[0] is not Symbol
+            && !(args[0] is LispDotNetObject dno && dno.Value is Type))
             throw new LispErrorException(new LispTypeError(
-                "DOTNET:RESOLVE-TYPE: type name must be a string", args[0]));
-        return new LispDotNetObject(ResolveDotNetType(name.Value));
+                "DOTNET:RESOLVE-TYPE: type must be a name string, a symbol, or a System.Type", args[0]));
+        return new LispDotNetObject(ResolveElementTypeArg(args[0]));
     }
 
     /// <summary>DOTNET:CLEAR-TYPE-CACHE — drop all memoized resolve-type entries so
@@ -1325,6 +1381,29 @@ public static partial class Runtime
             _ => arg
         };
     }
+
+    /// <summary>The receiver a Lisp value stands for in an instance call, or null when it
+    /// does not stand for one. A .NET object is itself; a Lisp scalar that .NET hands back
+    /// unwrapped — string, character, number — becomes its CLR counterpart, so a value that
+    /// came OUT of a .NET call can be called back into:
+    /// <c>(dotnet:invoke (dotnet:invoke x "get_Name") "ToUpper")</c>.
+    /// NIL and T are deliberately excluded: NIL is ambiguous between null, false and the
+    /// empty list, and a symbol receiver almost always means a type name was meant.</summary>
+    private static object? InvocationReceiver(LispObject arg)
+        => arg switch
+        {
+            LispDotNetBoxed b => b.Value,
+            LispDotNetObject d => d.Value,
+            LispString ls => ls.Value,
+            LispVector cv when cv.IsCharVector => cv.ToCharString(),
+            LispChar lc => lc.Value,
+            Fixnum fx => (fx.Value >= int.MinValue && fx.Value <= int.MaxValue)
+                            ? (object)(int)fx.Value : fx.Value,
+            Bignum bn => bn.Value,
+            DoubleFloat df => df.Value,
+            SingleFloat sf => sf.Value,
+            _ => null
+        };
 
     private static object?[] LispArgsToDotNetGeneric(LispObject[] lispArgs)
     {
@@ -1756,11 +1835,12 @@ public static partial class Runtime
             throw new LispErrorException(new LispProgramError(
                 "DOTNET:INVOKE: requires at least 2 arguments (object member-name &rest args)"));
 
-        if (args[0] is not LispDotNetObject dno)
+        var target = InvocationReceiver(args[0]);
+        if (target == null)
             throw new LispErrorException(new LispTypeError(
-                "DOTNET:INVOKE: first argument must be a .NET object", args[0]));
+                "DOTNET:INVOKE: first argument must be a .NET object, string, character or number",
+                args[0]));
 
-        var target = dno.Value;
         string memberName = args[1] switch { LispString ls => ls.Value, _ => args[1].ToString() ?? "" };
         var type = target.GetType();
         var callArgs = LispArgsToDotNetGeneric(args.Skip(2).ToArray());
@@ -1879,6 +1959,62 @@ public static partial class Runtime
     /// whose type argument can be inferred from the receiver's IEnumerable&lt;T&gt;
     /// (covers Enumerable.Where etc.). Binding mismatches are skipped; an exception
     /// thrown by the resolved method propagates as TargetInvocationException.</summary>
+    /// <summary>Type arguments for a generic extension method called on RECVTYPE, or null
+    /// when it cannot be called at all. The type parameter the receiver parameter exposes
+    /// (the TSource of <c>IEnumerable&lt;TSource&gt;</c>, or T itself for <c>this T x</c>) is
+    /// inferred from the receiver; every other type parameter defaults to System.Object.
+    /// A Lisp closure carries no return type, so TResult of Select&lt;TSource,TResult&gt; is not
+    /// inferable — object keeps such methods callable, and values come back to Lisp
+    /// unwrapped anyway. Callers who need a specific instantiation use
+    /// dotnet:static-generic.</summary>
+    /// <summary>True for a type parameter declared by a METHOD (the T of
+    /// <c>Select&lt;T,R&gt;</c>), as opposed to one declared by a type. Spelled out rather
+    /// than using Type.IsGenericMethodParameter, which netstandard2.0 — the target the
+    /// emit-free runtime builds against — does not have.</summary>
+    private static bool IsMethodTypeParameter(Type t)
+        => t.IsGenericParameter && t.DeclaringMethod != null;
+
+    private static Type[]? InferExtensionTypeArgs(System.Reflection.MethodInfo m, Type recvType)
+    {
+        var gps = m.GetGenericArguments();
+        var typeArgs = new Type[gps.Length];
+        for (int i = 0; i < typeArgs.Length; i++) typeArgs[i] = typeof(object);
+        var recvParam = m.GetParameters()[0].ParameterType;
+        if (IsMethodTypeParameter(recvParam))
+        {
+            typeArgs[recvParam.GenericParameterPosition] = recvType;
+            return typeArgs;
+        }
+        if (recvParam.IsGenericType)
+        {
+            var ra = recvParam.GetGenericArguments();
+            if (ra.Length == 1 && IsMethodTypeParameter(ra[0]))
+            {
+                var elem = EnumerableElementType(recvType);
+                if (elem == null) return null;
+                typeArgs[ra[0].GenericParameterPosition] = elem;
+                return typeArgs;
+            }
+        }
+        return null;
+    }
+
+    /// <summary>True when every Lisp function passed for a delegate parameter has an arity
+    /// the delegate can call. Unknown arity (-1, e.g. a closure with &amp;rest) matches
+    /// anything; non-delegate parameters are not considered.</summary>
+    private static bool DelegateArgArityFits(System.Reflection.ParameterInfo[] ps, LispObject[] lispArgs)
+    {
+        for (int i = 0; i < lispArgs.Length; i++)
+        {
+            if (lispArgs[i] is not LispFunction fn || fn.Arity < 0) continue;
+            var pt = ps[i + 1].ParameterType;
+            if (!typeof(Delegate).IsAssignableFrom(pt)) continue;
+            var invoke = pt.GetMethod("Invoke");
+            if (invoke != null && invoke.GetParameters().Length != fn.Arity) return false;
+        }
+        return true;
+    }
+
     private static bool TryInvokeExtensionMethod(Type recvType, string methodName, object? target,
         LispObject[] lispArgs, out object? result)
     {
@@ -1890,14 +2026,19 @@ public static partial class Runtime
             var concrete = m;
             if (m.IsGenericMethodDefinition)
             {
-                if (m.GetGenericArguments().Length != 1) continue; // only 1-type-param inference
-                var elem = EnumerableElementType(recvType);
-                if (elem == null) continue;
-                try { concrete = m.MakeGenericMethod(elem); }
-                catch { continue; }
+                var typeArgs = InferExtensionTypeArgs(m, recvType);
+                if (typeArgs == null) continue;
+                try { concrete = m.MakeGenericMethod(typeArgs); }
+                catch { continue; }   // constraints (e.g. where T : struct) rule this one out
                 ps = concrete.GetParameters();
             }
             if (!ps[0].ParameterType.IsAssignableFrom(recvType)) continue;
+            // With a Lisp function for a delegate parameter, pick the overload whose
+            // delegate arity matches. Enumerable.Select/Where each have a plain and an
+            // indexed overload with identical arity, so without this the first one
+            // reflection happens to return wins and a 1-argument Lisp lambda ends up
+            // behind a Func<T,int,R>.
+            if (!DelegateArgArityFits(ps, lispArgs)) continue;
             var callArgs = new object?[ps.Length];
             callArgs[0] = target;
             bool ok = true;
@@ -2925,37 +3066,50 @@ public static partial class Runtime
             throw new LispErrorException(new LispProgramError(
                 "DOTNET:MAKE-GENERIC-TYPE: requires open-type and type-args-list"));
 
-        string openName = args[0] switch { LispString ls => ls.Value, Symbol sym => sym.Name, _ => args[0].ToString() ?? "" };
-
-        // Parse the type-args list (a Lisp list of type-name strings/symbols).
-        var typeArgNames = new System.Collections.Generic.List<string>();
+        // Parse the type-args list. Each element is a type-name string/symbol OR an
+        // already-resolved System.Type — the latter is what makes nesting composable:
+        // (make-generic-type "System.Action" (list (make-generic-type "...Task" ...)))
+        // instead of spelling the whole assembly-qualified name by hand.
+        var typeArgForms = new System.Collections.Generic.List<LispObject>();
         var cursor = args[1];
         while (cursor is Cons c)
         {
-            typeArgNames.Add(c.Car switch { LispString ls => ls.Value, Symbol sym => sym.Name, _ => c.Car.ToString() ?? "" });
+            typeArgForms.Add(c.Car);
             cursor = c.Cdr;
         }
-        if (typeArgNames.Count == 0)
+        if (typeArgForms.Count == 0)
             throw new LispErrorException(new LispProgramError(
                 "DOTNET:MAKE-GENERIC-TYPE: type-args-list must be a non-empty list of type names"));
 
-        // Resolve the open generic definition. Accept the name with an explicit
-        // backtick-arity (Dictionary`2) or without (infer arity from the args).
-        Type? openType = TryResolveDotNetType(openName);
-        if ((openType == null || !openType.IsGenericTypeDefinition) && !openName.Contains('`'))
-            openType = TryResolveDotNetType($"{openName}`{typeArgNames.Count}");
+        // Resolve the open generic definition. It may already be a System.Type (an open
+        // generic definition); otherwise accept the name with an explicit backtick-arity
+        // (Dictionary`2) or without (infer arity from the args).
+        Type? openType;
+        string openName;
+        if (args[0] is LispDotNetObject odno && odno.Value is Type ot)
+        {
+            openType = ot;
+            openName = ot.FullName ?? ot.Name;
+        }
+        else
+        {
+            openName = args[0] switch { LispString ls => ls.Value, Symbol sym => sym.Name, _ => args[0].ToString() ?? "" };
+            openType = TryResolveDotNetType(openName);
+            if ((openType == null || !openType.IsGenericTypeDefinition) && !openName.Contains('`'))
+                openType = TryResolveDotNetType($"{openName}`{typeArgForms.Count}");
+        }
         if (openType == null)
             throw new LispErrorException(new LispError(
                 $"DOTNET:MAKE-GENERIC-TYPE: cannot resolve open generic type {openName}"));
         if (!openType.IsGenericTypeDefinition)
             throw new LispErrorException(new LispError(
                 $"DOTNET:MAKE-GENERIC-TYPE: {openType.FullName} is not an open generic type definition"));
-        if (openType.GetGenericArguments().Length != typeArgNames.Count)
+        if (openType.GetGenericArguments().Length != typeArgForms.Count)
             throw new LispErrorException(new LispError(
                 $"DOTNET:MAKE-GENERIC-TYPE: {openType.FullName} expects " +
-                $"{openType.GetGenericArguments().Length} type arg(s), got {typeArgNames.Count}"));
+                $"{openType.GetGenericArguments().Length} type arg(s), got {typeArgForms.Count}"));
 
-        var typeArgs = typeArgNames.Select(ResolveDotNetType).ToArray();
+        var typeArgs = typeArgForms.Select(ResolveElementTypeArg).ToArray();
         try
         {
             return new LispDotNetObject(openType.MakeGenericType(typeArgs));
@@ -3211,6 +3365,15 @@ public static partial class Runtime
     private static Symbol ForeignCbHandlerSym =>
         _foreignCbHandlerSym ??= Startup.SymInPkg("*FOREIGN-CALLBACK-HANDLER*", "DOTCL");
 
+    private static Symbol? _foreignCbPropagateSym;
+    private static Symbol ForeignCbPropagateSym =>
+        _foreignCbPropagateSym ??= Startup.SymInPkg("*FOREIGN-CALLBACK-PROPAGATE*", "DOTCL");
+
+    /// <summary>True when dotcl:*foreign-callback-propagate* asks for a callback's Lisp
+    /// error to reach the caller instead of being contained at the boundary.</summary>
+    private static bool ForeignCallbackPropagates()
+        => IsTruthy(DynamicBindings.Get(ForeignCbPropagateSym));
+
     /// <summary>
     /// Invoke a Lisp function at a C#→Lisp callback boundary (a delegate built by
     /// CreateLispDelegate, an event handler, or a dotnet:%define-class method
@@ -3239,25 +3402,33 @@ public static partial class Runtime
                 tag, 0, hargs.Length > 0 ? hargs[0] : Nil.Instance),
             "%FOREIGN-CALLBACK-BOUNDARY", -1);
         HandlerClusterStack.PushCluster(new[] { new HandlerBinding(Startup.Sym("ERROR"), handler) });
+        // Set when dotcl:*foreign-callback-propagate* asks for the caller to see the
+        // error. It is re-signalled AFTER the try, because signalling inside the catch
+        // would hit this boundary's own ERROR handler — still on the cluster stack until
+        // the finally runs — and bounce straight back here.
+        LispCondition? propagate = null;
         try
         {
             return Funcall(fn, args);
         }
         catch (HandlerCaseInvocationException ex) when (ReferenceEquals(ex.Tag, tag))
         {
-            return HandleForeignCallbackError(
-                ex.Condition as LispCondition ?? new LispError(ex.Condition.ToString() ?? "error"));
+            var cond = ex.Condition as LispCondition ?? new LispError(ex.Condition.ToString() ?? "error");
+            if (!ForeignCallbackPropagates()) return HandleForeignCallbackError(cond);
+            propagate = cond;
         }
         catch (LispErrorException ex)
         {
             // A LispErrorException that bypassed the handler-bind (e.g. signaled with
             // no ERROR match, or thrown directly) is still handled at the boundary.
-            return HandleForeignCallbackError(ex.Condition);
+            if (!ForeignCallbackPropagates()) return HandleForeignCallbackError(ex.Condition);
+            propagate = ex.Condition;
         }
         finally
         {
             HandlerClusterStack.PopCluster();
         }
+        throw new LispErrorException(propagate);
     }
 
     private static LispObject HandleForeignCallbackError(LispCondition condition)
@@ -3497,33 +3668,36 @@ public static partial class Runtime
             throw new LispErrorException(new LispProgramError(
                 "DOTNET:STATIC-GENERIC: requires type-name method-name type-args-list &rest args"));
 
-        string typeName   = args[0] switch { LispString ls => ls.Value, _ => args[0].ToString() ?? "" };
+        // The declaring type and each type arg may be a name string/symbol or an
+        // already-resolved System.Type (e.g. from dotnet:make-generic-type).
         string memberName = args[1] switch { LispString ls => ls.Value, _ => args[1].ToString() ?? "" };
-        var    type       = ResolveDotNetType(typeName);
+        var    type       = ResolveElementTypeArg(args[0]);
+        string typeName   = type.FullName ?? type.Name;
         var    lispArgs   = args.Skip(3).ToArray();
 
         // Parse type-args list
-        var typeArgNames = new System.Collections.Generic.List<string>();
+        var typeArgForms = new System.Collections.Generic.List<LispObject>();
         var cursor = args[2];
         while (cursor is Cons c)
         {
-            typeArgNames.Add(c.Car switch { LispString ls => ls.Value, _ => c.Car.ToString() ?? "" });
+            typeArgForms.Add(c.Car);
             cursor = c.Cdr;
         }
+        int typeArgCount = typeArgForms.Count;
 
         // Find the generic method definition matching name + arity
         var methodDef = type.GetMethods(
                 System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static)
             .Where(m => m.Name == memberName
                      && m.IsGenericMethodDefinition
-                     && m.GetGenericArguments().Length == typeArgNames.Count
+                     && m.GetGenericArguments().Length == typeArgCount
                      && m.GetParameters().Length == lispArgs.Length)
             .FirstOrDefault()
             ?? throw new LispErrorException(new LispError(
                 $"DOTNET:STATIC-GENERIC: no generic static method {typeName}.{memberName} " +
-                $"with {typeArgNames.Count} type arg(s) and {lispArgs.Length} parameter(s)"));
+                $"with {typeArgCount} type arg(s) and {lispArgs.Length} parameter(s)"));
 
-        var concreteTypes  = typeArgNames.Select(ResolveDotNetType).ToArray();
+        var concreteTypes  = typeArgForms.Select(ResolveElementTypeArg).ToArray();
         var concreteMethod = methodDef.MakeGenericMethod(concreteTypes);
         var paramInfos     = concreteMethod.GetParameters();
 
@@ -3551,11 +3725,12 @@ public static partial class Runtime
         if (args.Length < 3)
             throw new LispErrorException(new LispProgramError(
                 "DOTNET:INVOKE-GENERIC: requires object method-name type-args-list &rest args"));
-        if (args[0] is not LispDotNetObject dno)
+        var    target     = InvocationReceiver(args[0]);
+        if (target == null)
             throw new LispErrorException(new LispTypeError(
-                "DOTNET:INVOKE-GENERIC: first argument must be a .NET object", args[0]));
+                "DOTNET:INVOKE-GENERIC: first argument must be a .NET object, string, character or number",
+                args[0]));
 
-        var    target     = dno.Value;
         var    type       = target.GetType();
         string memberName = args[1] switch { LispString ls => ls.Value, _ => args[1].ToString() ?? "" };
         var    lispArgs   = args.Skip(3).ToArray();

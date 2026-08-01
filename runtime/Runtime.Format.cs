@@ -566,6 +566,36 @@ public static partial class Runtime
         return false;
     }
 
+    /// <summary>Significant decimal digits of ABSVAL from which rounding to N digits gives
+    /// the same answer as rounding the value itself.
+    ///
+    /// Asking for N+3 digits is not the same as asking for the value: .NET rounds exactly
+    /// at whatever precision is requested, so rounding that result again at N is a double
+    /// rounding, and the two disagree when the discarded part sits right at the tie. (With
+    /// G17 — enough to round-trip a double, not enough to round it — ~E printed
+    /// 1.051215004350025d24 to 15 digits as ...435002 where the exact value gives ...435003:
+    /// G17's last digit 5 looks like an exact tie, while the real remainder is above it.)
+    ///
+    /// So: probe at N+3, which decides every case except digits[N] == '5' followed by
+    /// zeros — precisely the shape a tie, a hair above it, and a hair below it all collapse
+    /// to. Only then take the full expansion, which terminates for every double (at most
+    /// 767 significant digits) and leaves the caller's tie rule to act on a real tie.</summary>
+    private static void SignificantDigitsForRounding(double absVal, int n,
+                                                     out string allDigits, out int msdExp)
+    {
+        int probe = Math.Max(17, n + 3);
+        ExtractScientificDigits(
+            absVal.ToString("G" + probe, System.Globalization.CultureInfo.InvariantCulture),
+            out allDigits, out msdExp);
+        if (n >= 0 && n < allDigits.Length
+            && allDigits[n] == '5' && !HasNonZeroAfter(allDigits, n + 1))
+        {
+            ExtractScientificDigits(
+                absVal.ToString("G767", System.Globalization.CultureInfo.InvariantCulture),
+                out allDigits, out msdExp);
+        }
+    }
+
     private static string FormatExponentialFloat(double value, int? w, int? d, int? e, int k,
         char? overflowChar, char padChar, char? exponentChar, bool atSign, bool isSingle, bool isDouble)
     {
@@ -776,10 +806,8 @@ public static partial class Runtime
         }
         if (totalDigitsToEmit < 1) totalDigitsToEmit = 1; // need at least one digit
 
-        // Request extra digits so we can round correctly.
-        int gPrecision = Math.Max(17, totalDigitsToEmit + 2);
-        string gStr = absVal.ToString($"G{gPrecision}", System.Globalization.CultureInfo.InvariantCulture);
-        ExtractScientificDigits(gStr, out string allDigits, out int msdExp);
+        // Digits to round from — enough that rounding them equals rounding the value.
+        SignificantDigitsForRounding(absVal, totalDigitsToEmit, out string allDigits, out int msdExp);
 
         // Round allDigits to totalDigitsToEmit significant digits (round-half-up, then normalize).
         bool carry = false;
@@ -1123,9 +1151,15 @@ public static partial class Runtime
                     case 'A': // aesthetic (princ-like)
                         if (argIdx < args.Length)
                         {
+                            // FormatTop, not FormatObject: ~A and ~S print an arbitrary
+                            // object, so they are exactly where *print-circle* has to be
+                            // established. Going straight to FormatObject skipped the scan
+                            // pass, so a shared or circular argument printed untangled —
+                            // for a graph that loops, forever. FormatTop costs nothing when
+                            // *print-circle* is nil or a scan is already in progress.
                             string s = (colonMod && args[argIdx] is Nil)
                                 ? "()"
-                                : FormatObject(args[argIdx], false);
+                                : FormatTop(args[argIdx], false);
                             // ~mincol,colinc,minpad,padcharA
                             int aMincol = GetIntParam(0, 0)!.Value;
                             int aColinc = GetIntParam(1, 1)!.Value;
@@ -1159,7 +1193,7 @@ public static partial class Runtime
                         {
                             string s = (colonMod && args[argIdx] is Nil)
                                 ? "()"
-                                : FormatObject(args[argIdx], true);
+                                : FormatTop(args[argIdx], true);
                             // ~mincol,colinc,minpad,padcharS
                             int sMincol = GetIntParam(0, 0)!.Value;
                             int sColinc = GetIntParam(1, 1)!.Value;

@@ -20,6 +20,9 @@ public class FaslAssembler
     private readonly ModuleBuilder _mb;
     private readonly TypeBuilder _tb;
     private readonly ILGenerator _initIl;
+    // Type initializer: fills the per-call-site symbol caches (see
+    // FaslStructInternMap.GetOrCreateSymFnSiteField). Closed in Save.
+    private readonly ILGenerator _cctorIl;
     private int _methodCount;
     private readonly CilAssembler.FaslStructInternMap _structInternMap;
 
@@ -202,6 +205,13 @@ public class FaslAssembler
         // Wire TypeBuilder + init ILGenerator so CilAssembler can deduplicate uninterned symbols.
         _structInternMap.UninternedTypeBuilder = _tb;
         _structInternMap.UninternedInitIl = _initIl;
+        // Call-site symbol caches go in the TYPE INITIALIZER, not ModuleInit: the
+        // fields are read by compiled bodies, and a body can be reached from
+        // anywhere in ModuleInit, so "initialized earlier in ModuleInit" is not a
+        // guarantee we can make. Defining a .cctor also clears beforefieldinit, so
+        // the CLR runs it before the first static access to this type.
+        _cctorIl = _tb.DefineTypeInitializer().GetILGenerator();
+        _structInternMap.SymFnSiteInitIl = _cctorIl;
 #endif
     }
 
@@ -350,10 +360,13 @@ public class FaslAssembler
     /// <summary>
     /// Emit a monolithic top-level form into _initIl, without splitting.
     /// Unlike AddTopLevelForm (which segments at defmethod boundaries), this
-    /// assembles the whole form into the init method. Required for forms where
-    /// locals/labels span the entire body (e.g. cil-out.sil — the cross-compiled
-    /// core). Relies on CilAssembler's _faslMode branches in
-    /// HandleDefmethod/HandleDefmethodDirect to emit persisted body methods.
+    /// assembles the whole form into the init method. For forms whose
+    /// locals/labels span the entire body — a .sil produced before the
+    /// cross-compiler segmented its output at (:TOPLEVEL-BOUNDARY); current
+    /// ones go through AddTopLevelForm per segment. Only one such form can be
+    /// added: its :RET ends the init method. Relies on CilAssembler's _faslMode
+    /// branches in HandleDefmethod/HandleDefmethodDirect to emit persisted body
+    /// methods.
     /// </summary>
     public void AddMonolithicForm(LispObject instrList)
     {
@@ -877,6 +890,9 @@ public class FaslAssembler
         _initIl.Emit(OpCodes.Ldsfld,
             typeof(Nil).GetField("Instance")!);
         _initIl.Emit(OpCodes.Ret);
+
+        // Close the type initializer (empty when the module named no functions).
+        _cctorIl.Emit(OpCodes.Ret);
 
         _tb.CreateType();
         try

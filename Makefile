@@ -7,7 +7,7 @@ DOTCL_LISP ?= ros -L sbcl-bin run
 STDBUF ?=
 SETSID ?= $(shell which setsid 2>/dev/null)
 
-.PHONY: all build build-ns2 run clean repl test-ansi-all test-ansi-full test-ansi-extra test-regression test-pack-nuspec test-save-class-lib test-mop ilverify update-ansi-state commit-ansi-state cross-compile loc publish pack install setup-ansi-test setup-asdf setup-cl-bench bench bench-state test-sbcl-host2 compile-asdf-fasl compile-asdf-fasls compile-core-fasl compile-contrib-fasls contrib-dotcl-cs contrib-dotcl-jitdisasm gen-char-names
+.PHONY: all build build-ns2 run clean repl test-coverage test-ansi-all test-ansi-full test-ansi-extra test-regression test-pack-nuspec test-save-class-lib test-project-compose test-mop ilverify update-ansi-state commit-ansi-state cross-compile loc publish pack install setup-ansi-test setup-asdf setup-quicklisp setup-cl-bench bench bench-state test-sbcl-host2 compile-asdf-fasl compile-asdf-fasls compile-quicklisp-fasl compile-core-fasl compile-contrib-fasls contrib-dotcl-cs contrib-dotcl-jitdisasm gen-char-names
 
 # Source files for cross-compile. Listed once; the recipe and dependency
 # tracking both reference this so adding a file is a single-edit change.
@@ -38,6 +38,13 @@ test-debug-pdb: build $(DOTCL_ROOT)compiler/cil-out.sil
 	@echo "=== Running debug-path (DOTCL_EMIT_PDB) checks ==="
 	sh $(DOTCL_ROOT)test/debug-pdb/check.sh $(DOTCL_ROOT)
 
+# Line coverage for .lisp via an off-the-shelf .NET coverage collector: the PDB
+# names the .lisp, so no coverage-specific code of ours is involved. Skips
+# cleanly when the dotnet-coverage tool is absent.
+test-coverage: build $(DOTCL_ROOT)compiler/cil-out.sil
+	@echo "=== Running .lisp line-coverage checks ==="
+	sh $(DOTCL_ROOT)test/coverage/check.sh $(DOTCL_ROOT)
+
 # Asserts a packed tool's nuspec describes the app, not dotcl. Needs published
 # dotcl packages (`make pack`); skips cleanly when they are absent.
 test-pack-nuspec: build
@@ -49,6 +56,10 @@ test-pack-nuspec: build
 test-save-class-lib: build
 	@echo "=== Running save-class-library checks ==="
 	sh $(DOTCL_ROOT)test/save-class-lib/check.sh $(DOTCL_ROOT)
+
+test-project-compose: build
+	@echo "=== Running project-core composition checks ==="
+	sh $(DOTCL_ROOT)test/project-compose/check.sh $(DOTCL_ROOT)
 
 test-ansi-extra: build $(DOTCL_ROOT)compiler/cil-out.sil
 	@echo "=== Running CLHS audit extra tests ==="
@@ -246,6 +257,23 @@ setup-asdf:
 	@cmp -s $(DOTCL_ROOT)asdf/build/asdf.lisp $(DOTCL_ROOT)contrib/asdf/asdf.lisp 2>/dev/null \
 	  || cp $(DOTCL_ROOT)asdf/build/asdf.lisp $(DOTCL_ROOT)contrib/asdf/asdf.lisp
 
+setup-quicklisp:
+	@# dotcl-support is both the branch submitted upstream (quicklisp-client PR
+	@# "Add dotcl (Common Lisp on .NET) support") and the shipping branch. Unlike
+	@# asdf there is no per-generation branch: the dotcl surface is 3 definterface
+	@# implementations (socket / init-file-name / directory-entries) and does not
+	@# grow with OS or runtime features, so one branch stays accurate. If a commit
+	@# ever has to ship that cannot go into the PR, split the two and add a CI
+	@# check that the shipping branch contains the PR branch.
+	@if [ ! -d $(DOTCL_ROOT)quicklisp-client ]; then \
+		echo "Cloning quicklisp-client..."; \
+		git clone --branch dotcl-support https://github.com/dotcl/quicklisp-client.git $(DOTCL_ROOT)quicklisp-client; \
+	else \
+		echo "quicklisp-client/ already exists"; \
+	fi
+	@mkdir -p $(DOTCL_ROOT)contrib/quicklisp
+	@sh $(DOTCL_ROOT)scripts/build-quicklisp.sh $(DOTCL_ROOT)quicklisp-client $(DOTCL_ROOT)contrib/quicklisp/quicklisp.lisp
+
 # Benchmarks: make bench / make bench SUITE=gabriel / make bench BENCH=tak
 SUITE ?=
 BENCH ?=
@@ -334,6 +362,18 @@ compile-asdf-fasl: setup-asdf $(DOTCL_ROOT)contrib/asdf/asdf.fasl
 # (os-cond is runtime for dotcl), so target-features-per-OS baking is unnecessary.
 compile-asdf-fasls: compile-asdf-fasl
 
+# Compile contrib/quicklisp/quicklisp.lisp → quicklisp.fasl, same shape as asdf
+# above: the .lisp is generated (concatenated client components) and the .fasl is
+# the shipped artifact. Both are gitignored.
+#
+# asdf has to be loaded first: the client reads asdf: symbols at read time
+# (client.lisp, dist.lisp, misc.lisp, setup.lisp), exactly as upstream's
+# bootstrap loads asdf.lisp before the client files.
+$(DOTCL_ROOT)contrib/quicklisp/quicklisp.fasl: $(DOTCL_ROOT)compiler/cil-out.sil $(DOTCL_ROOT)contrib/quicklisp/quicklisp.lisp $(DOTCL_ROOT)contrib/asdf/asdf.fasl
+	dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --asm $(DOTCL_ROOT)compiler/cil-out.sil --eval '(progn (require "asdf") (compile-file "$(DOTCL_ROOT)contrib/quicklisp/quicklisp.lisp"))'
+
+compile-quicklisp-fasl: setup-quicklisp compile-asdf-fasl $(DOTCL_ROOT)contrib/quicklisp/quicklisp.fasl
+
 # Pre-build IL fasls for every contrib that ships a .asd. Project-core
 # builds consume these as ready artifacts instead of recompiling
 # contrib source per project. Pattern rule matches contrib/<name>/<name>.lisp
@@ -341,9 +381,13 @@ compile-asdf-fasls: compile-asdf-fasl
 # CONTRIB_NAMES is auto-detected from contrib/*/ subdirs so that public
 # mirror builds (where externally-sourced contribs are excluded via
 # mirror-exclude) skip the missing dirs gracefully (dotcl/dotcl issue #2).
-CONTRIB_NAMES := $(filter-out asdf cil-from-cs,$(notdir $(patsubst %/,%,$(wildcard $(DOTCL_ROOT)contrib/*/))))
+CONTRIB_NAMES := $(filter-out asdf quicklisp cil-from-cs,$(notdir $(patsubst %/,%,$(wildcard $(DOTCL_ROOT)contrib/*/))))
 
 CONTRIB_FASLS := $(foreach n,$(CONTRIB_NAMES),$(DOTCL_ROOT)contrib/$(n)/$(n).fasl)
+
+# quicklisp is built by its own rule (it needs asdf loaded first) but is R2R'd
+# like any other contrib: that step only crossgen2's an existing IL fasl.
+CONTRIB_R2R_NAMES := $(CONTRIB_NAMES) quicklisp
 
 $(DOTCL_ROOT)contrib/%.fasl: $(DOTCL_ROOT)contrib/%.lisp $(DOTCL_ROOT)compiler/cil-out.sil
 	dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --asm $(DOTCL_ROOT)compiler/cil-out.sil --eval '(compile-file "$<")'
@@ -488,11 +532,11 @@ compile-asdf-fasl-r2r-all: $(addprefix compile-asdf-fasl-r2r-,$(R2R_RIDS))
 # dotcl.core (DotCL.Runtime holds the library body the fasls reference; without
 # it crossgen2 resolves nothing and silently strips every method to non-R2R).
 define R2R_CONTRIB_RULES
-compile-contrib-fasls-r2r-$(1): compile-contrib-fasls compile-core-fasl-r2r-$(1)
+compile-contrib-fasls-r2r-$(1): compile-contrib-fasls compile-quicklisp-fasl compile-core-fasl-r2r-$(1)
 	@test -n "$$(CROSSGEN2)" || (echo "error: crossgen2 not found" && exit 1)
 	@test -n "$$(call runtime_ref,$(1))" || (echo "error: runtime ref for $(1) not found" && exit 1)
 	cp $$(DOTCL_ROOT)compiler/dotcl.core $$(DOTCL_ROOT)compiler/dotcl.core.dll
-	@for n in $$(CONTRIB_NAMES); do \
+	@for n in $$(CONTRIB_R2R_NAMES); do \
 		fasl=$$(DOTCL_ROOT)contrib/$$$$n/$$$$n.fasl; \
 		if [ ! -f "$$$$fasl" ]; then continue; fi; \
 		echo "=== R2R contrib $$$$n ($(1)) ==="; \
@@ -560,7 +604,7 @@ _PACK_VERSION_ARG := $(if $(PACK_VERSION),-p:Version=$(PACK_VERSION),)
 # Nuke runtime/contrib first so a contrib directory deleted from source
 # stops shipping in the nupkg (old dotcl-repl/ stayed in the
 # installed tool for at least one release after its source was removed).
-pack: compile-asdf-fasl compile-asdf-fasls compile-core-fasl compile-contrib-fasls contrib-dotcl-cs compile-core-fasl-r2r-all compile-asdf-fasl-r2r-all compile-contrib-fasls-r2r-all
+pack: compile-asdf-fasl compile-asdf-fasls compile-quicklisp-fasl compile-core-fasl compile-contrib-fasls contrib-dotcl-cs compile-core-fasl-r2r-all compile-asdf-fasl-r2r-all compile-contrib-fasls-r2r-all
 	rm -rf $(DOTCL_ROOT)runtime/contrib
 	cp $(DOTCL_ROOT)compiler/dotcl.core $(DOTCL_ROOT)runtime/dotcl.core
 	@for rid in $(R2R_RIDS); do \
@@ -570,6 +614,10 @@ pack: compile-asdf-fasl compile-asdf-fasls compile-core-fasl compile-contrib-fas
 	mkdir -p $(DOTCL_ROOT)runtime/contrib/asdf
 	cp -r $(DOTCL_ROOT)contrib/*/ $(DOTCL_ROOT)runtime/contrib/
 	rm -f $(DOTCL_ROOT)runtime/contrib/asdf/asdf.lisp $(DOTCL_ROOT)runtime/contrib/asdf/asdf.sil
+	# Same for quicklisp: the concatenated client source is a build input, not a
+	# shipped artifact, and it is 230 KB the module provider would never read
+	# (it finds quicklisp.fasl first).
+	rm -f $(DOTCL_ROOT)runtime/contrib/quicklisp/quicklisp.lisp
 	# Strip cross-RID R2R fasls from contrib/asdf/ so each RID nupkg only ships
 	# its own R2R copy (overlaid by ReplaceFaslsWithR2R via runtime/asdf-r2r-<rid>.fasl
 	# which is at runtime/ top-level, separate from contrib/). Without this the

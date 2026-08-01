@@ -78,16 +78,23 @@
     (nreverse l))
   (:init :first :then :then))
 
-;; initially textually AFTER `for = first then next` : the FIRST init runs first.
+;; initially textually AFTER `for = first then next` : initially still runs first.
+;; Every initially clause goes to the prologue, and the prologue precedes the
+;; stepping code a FOR clause contributes, whatever their source order. Checked
+;; against SBCL 2.6.1, which gives (:INIT :FIRST :THEN :THEN). This test read
+;; (:first :init ...) while dotcl special-cased this clause into the prologue;
+;; that special case is gone.
 (deftest loop-prologue-initially-after-for-equals-then
   (let ((l '()))
     (loop for y = (progn (push :first l) 1) then (progn (push :then l) (1+ y))
           initially (push :init l)
           for x in '(a b) do (identity x))
     (nreverse l))
-  (:first :init :then :then))
+  (:init :first :then :then))
 
 ;; `for = first then next` sits in source order between two initially clauses.
+;; Both initially clauses still run before the FIRST form — same reason. SBCL
+;; 2.6.1 gives (:I1 :I2 :FIRST).
 (deftest loop-prologue-for-equals-then-between-initially
   (let ((l '()))
     (loop initially (push :i1 l)
@@ -95,9 +102,46 @@
           initially (push :i2 l)
           for x in '(a) do (identity x))
     (nreverse l))
-  (:i1 :first :i2))
+  (:i1 :i2 :first))
 
 ;; The then-form steps the value each iteration.
 (deftest loop-for-equals-then-steps
   (loop for y = 1 then (1+ y) for x in '(a b c) collect y)
   (1 2 3))
+
+;; Successive FOR clauses bind like LET* (ANSI CL 6.1.2.1); only AND makes them
+;; parallel. A later clause's init form has to see the value the earlier clause
+;; established on this same iteration. SBCL's fasl writer depends on it —
+;; WRITE-VAR-INTEGER reads its own stepped variable from the next FOR clause, and
+;; with the variable still NIL it emitted a varint without its continuation bit,
+;; which made GENESIS reject the layout it decoded.
+(deftest loop-successive-for-clauses-are-sequential
+  (loop for a = 10 then (1- a)
+        for b = (* a 2)
+        for i from 0 below 3
+        collect (list a b))
+  ((10 20) (9 18) (8 16)))
+
+(deftest loop-successive-for-clauses-see-with
+  (loop with base = 100
+        for a = base then (1+ a)
+        for b = (* a 2)
+        for i from 0 below 2
+        collect (list a b))
+  ((100 200) (101 202)))
+
+;; AND keeps them parallel: b's init must not see the new a.
+(deftest loop-and-keeps-for-clauses-parallel
+  (loop for a = 10 then (1- a)
+        and b = 99
+        for i from 0 below 2
+        collect (list a b))
+  ((10 99) (9 99)))
+
+;; The prologue runs before the first termination test, so initially happens even
+;; when the sequence is empty.
+(deftest loop-initially-runs-for-empty-sequence
+  (let ((l '()))
+    (loop initially (push :init l) for x in '() do (push x l))
+    (nreverse l))
+  (:init))

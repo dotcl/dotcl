@@ -972,3 +972,118 @@
              (setf (slot-value f 'y) 7)))
     (slot-value (make-instance '%sic-shared) 'y))
   7)
+
+;; ---- Item3c: writer inline-cache (WriterIC) soundness ----
+;; The (setf accessor) twin of the ric-* tests above: a warm monomorphic write
+;; site must stay correct across accessor/class redefinition, subclassing,
+;; newval-specialized methods, :around/:before, and :class allocation.
+
+(defclass %wic1 () ((x :initarg :x :accessor wic1x)))
+(deftest wic-basic-warm
+  (let ((o (make-instance '%wic1 :x 0)))
+    (dotimes (i 5) (setf (wic1x o) i))   ; warm the inline cache
+    (setf (wic1x o) 42)
+    (wic1x o))
+  42)
+
+;; SETF returns the new value, not the slot read-back.
+(deftest wic-returns-newval
+  (let ((o (make-instance '%wic1 :x 0)))
+    (dotimes (i 5) (setf (wic1x o) i))
+    (setf (wic1x o) :v))
+  :v)
+
+;; Adding a specialized primary writer must deopt the cached slot write.
+(defclass %wic2 () ((x :initarg :x :accessor wic2x)))
+(deftest wic-deopt-after-defmethod
+  (let ((o (make-instance '%wic2 :x 0)))
+    (dotimes (i 5) (setf (wic2x o) i))
+    (defmethod (setf wic2x) (nv (o %wic2)) (setf (slot-value o 'x) (list :via-method nv)))
+    (setf (wic2x o) 9)
+    (wic2x o))
+  (:via-method 9))
+
+;; An :around on the writer must likewise disable the direct slot write.
+(defclass %wic3 () ((x :initarg :x :accessor wic3x)))
+(deftest wic-deopt-around
+  (let ((o (make-instance '%wic3 :x 0)))
+    (dotimes (i 5) (setf (wic3x o) i))
+    (defmethod (setf wic3x) :around (nv (o %wic3)) (call-next-method (* 10 nv) o))
+    (setf (wic3x o) 4)
+    (wic3x o))
+  40)
+
+;; A :before must still run once the site is warm (side effect, not just value).
+(defvar *wic-log* nil)
+(defclass %wic4 () ((x :initarg :x :accessor wic4x)))
+(defmethod (setf wic4x) :before (nv (o %wic4)) (push nv *wic-log*))
+(deftest wic-before-runs
+  (let ((o (make-instance '%wic4 :x 0)))
+    (setf *wic-log* nil)
+    (dotimes (i 3) (setf (wic4x o) i))
+    (list (wic4x o) (reverse *wic-log*)))
+  (2 (0 1 2)))
+
+;; One write site warmed on the base class, then hit with a subclass whose slot
+;; sits at a different index — must miss and refill, not write the stale index.
+(defclass %wicb () ((a :initarg :a :accessor wicg)))
+(defclass %wics (%wicb) ((z :initarg :z :initform 0) (a :initarg :a :accessor wicg)))
+(defun %wic-write (o v) (setf (wicg o) v))
+(deftest wic-subclass-refill
+  (let ((b (make-instance '%wicb :a 0)) (s (make-instance '%wics :a 0)))
+    (dotimes (i 5) (%wic-write b i))
+    (%wic-write b 1) (%wic-write s 2)
+    (list (wicg b) (wicg s) (slot-value s 'z)))
+  (1 2 0))
+
+;; Redefining the class to reorder slots must invalidate the warm cache.
+(defclass %wic5 () ((x :initarg :x :accessor wic5x)))
+(deftest wic-class-redef
+  (let ((o (make-instance '%wic5 :x 0)))
+    (dotimes (i 5) (setf (wic5x o) i))
+    (defclass %wic5 () ((y :initarg :y :initform 1) (x :initarg :x :accessor wic5x)))
+    (let ((n (make-instance '%wic5 :x 0)))
+      (setf (wic5x n) 55)
+      (list (wic5x n) (slot-value n 'y))))
+  (55 1))
+
+;; A newval-specialized user method must win even after the site is warm on the
+;; default writer (the epoch bump from its defmethod deopts the cache).
+(defclass %wic6 () ((z :initarg :z :accessor wic6z)))
+(defmethod (setf wic6z) ((nv string) (o %wic6)) (setf (slot-value o 'z) :was-string))
+(deftest wic-newval-specialized-mix
+  (let ((o (make-instance '%wic6 :z 0)))
+    (dotimes (i 3) (setf (wic6z o) 1))
+    (setf (wic6z o) "hi")
+    (list (wic6z o) (progn (setf (wic6z o) 7) (wic6z o))))
+  (:was-string 7))
+
+;; :allocation :class must write the shared class slot (visible from a second
+;; instance), never a per-instance vector cell.
+(defclass %wic7 () ((c :initform 0 :accessor wic7c :allocation :class)))
+(deftest wic-class-allocation
+  (let ((a (make-instance '%wic7)) (b (make-instance '%wic7)))
+    (dotimes (i 3) (setf (wic7c a) i))
+    (setf (wic7c a) 77)
+    (list (wic7c a) (wic7c b)))
+  (77 77))
+
+;; The object form is evaluated for effect exactly once per write.
+(defvar *wic-obj-evals* 0)
+(defclass %wic8 () ((x :initarg :x :accessor wic8x)))
+(defun %wic-obj (o) (incf *wic-obj-evals*) o)
+(deftest wic-object-form-evaluated-once
+  (let ((o (make-instance '%wic8 :x 0)))
+    (dotimes (i 3) (setf (wic8x (%wic-obj o)) i))
+    (setf *wic-obj-evals* 0)
+    (setf (wic8x (%wic-obj o)) 5)
+    (list (wic8x o) *wic-obj-evals*))
+  (5 1))
+
+;; A non-instance object (no applicable method) must still signal, not write.
+(deftest wic-non-instance-errors
+  (let ((o (make-instance '%wic8 :x 0)))
+    (dotimes (i 3) (setf (wic8x o) i))
+    (handler-case (progn (setf (wic8x 5) 1) :no-error)
+      (error () :error)))
+  :error)

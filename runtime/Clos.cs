@@ -84,6 +84,16 @@ public class LispClass : LispObject
     internal readonly object DefLock = new();
     /// <summary>True for built-in classes (BUILT-IN-CLASS metaclass). False for user-defined (STANDARD-CLASS).</summary>
     public bool IsBuiltIn { get; set; }
+    /// <summary>True when this class stands for a .NET interface. Interfaces are
+    /// superclasses for dispatch, but rank below every concrete class in a class
+    /// precedence list, so EnsureDotNetTypeClass keeps them separable.</summary>
+    public bool IsDotNetInterface { get; set; }
+    /// <summary>The .NET type this class stands for, or null for an ordinary Lisp
+    /// class. Dispatch consults it for the assignabilities a class precedence list
+    /// cannot enumerate — a variant generic (List&lt;String&gt; is an
+    /// IEnumerable&lt;Object&gt;) would need every instantiation of every supertype
+    /// of every type argument spelled out.</summary>
+    public System.Type? DotNetType { get; set; }
     /// <summary>True for structure classes (STRUCTURE-CLASS metaclass).</summary>
     public bool IsStructureClass { get; set; }
     /// <summary>True for forward-referenced classes (superclass not yet defined).</summary>
@@ -622,6 +632,28 @@ public sealed class ReaderCache
     internal readonly Symbol Sym;
     internal volatile Entry? E;
     public ReaderCache(Symbol sym) { Sym = sym; }
+
+    internal sealed class Entry
+    {
+        internal readonly LispClass Cls;
+        internal readonly int Idx;
+        internal readonly int Epoch;
+        internal Entry(LispClass cls, int idx, int epoch) { Cls = cls; Idx = idx; Epoch = epoch; }
+    }
+}
+
+/// <summary>The writer twin of <see cref="ReaderCache"/>: a per-call-site monomorphic
+/// inline cache for a simple slot writer, baked once per <c>(setf (accessor obj) v)</c>
+/// call site and read/filled by <see cref="Runtime.WriterIC"/>. Same publication and
+/// soundness rules — an immutable <see cref="Entry"/> published through the volatile
+/// <see cref="E"/> field, invalidated wholesale by a <see cref="GenericFunction.MethodEpoch"/>
+/// bump (defmethod on the writer, class re-layout).</summary>
+public sealed class WriterCache
+{
+    /// <summary>The accessor name — the (SETF name) function is re-resolved from it on a miss.</summary>
+    internal readonly Symbol Sym;
+    internal volatile Entry? E;
+    public WriterCache(Symbol sym) { Sym = sym; }
 
     internal sealed class Entry
     {
