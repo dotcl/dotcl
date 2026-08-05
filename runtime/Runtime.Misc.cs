@@ -2168,12 +2168,52 @@ public static partial class Runtime
                     {
                         s.Function = null;
                         Runtime.RemoveGfRegistryEntry(s);
+                        Startup.InvalidateSymCache(s);
+                        Startup.InvalidateSymFnCache(s);
                     }
                     if (s.SetfFunction != null && !preSetf.Contains(s))
                     {
                         s.SetfFunction = null;
                         Runtime.RemoveGfRegistryEntry(s, isSetf: true);
                     }
+                }
+            }
+
+            // For each module added to *modules* during compile (via a compile-time
+            // require that went through asdf:module-provide-asdf), clear the ASDF
+            // registry entry so a load-time re-require actually re-loads. module-provide-asdf
+            // registers the system in *registered-systems* and sets the load-op stamp
+            // (component-loaded-p → T); without clear-system, the load-time require's
+            // module-provide-asdf → find-system returns the stale registered system,
+            // component-loaded-p is T, load-system no-ops, and the fasl is never loaded.
+            // clear-system (asdf.lisp:9128) does (remhash name *registered-systems*) +
+            // (unset-asdf-cache-entry '(find-system name)), making the old stamped system
+            // unreachable so a fresh find-system rebuilds an unstamped one.
+            // module-provide-asdf (asdf.lisp:11161) looks up systems by (string-downcase name),
+            // so clear-system must be called with the downcased name to match.
+            var addedModules = new System.Collections.Generic.List<string>();
+            var beforeSet = new System.Collections.Generic.HashSet<string>();
+            for (LispObject c = oldModules; c is Cons cc; c = cc.Cdr)
+                if (cc.Car is LispString s) beforeSet.Add(s.Value);
+            for (LispObject c = DynamicBindings.Get(modulesSym2); c is Cons cc; c = cc.Cdr)
+                if (cc.Car is LispString s && !beforeSet.Contains(s.Value))
+                    addedModules.Add(s.Value);
+            if (addedModules.Count > 0)
+            {
+                foreach (var mod in addedModules)
+                {
+                    var downcased = mod.ToLowerInvariant();
+                    var clearForm = $@"
+(let ((cs (find-symbol ""CLEAR-SYSTEM"" ""ASDF"")))
+  (when (and cs (fboundp cs))
+    (funcall cs ""{downcased}"")))";
+                    try
+                    {
+                        var read = MultipleValues.Primary(
+                            Runtime.ReadFromString(new LispObject[] { new LispString(clearForm) }));
+                        Runtime.Eval(read);
+                    }
+                    catch { /* asdf not loaded or clear-system unavailable — skip */ }
                 }
             }
 

@@ -26,6 +26,7 @@
 (load "test/regression/foreign-callback.lisp")
 (load "test/regression/call-out.lisp")
 (load "test/regression/cross-package-fn-aliasing.lisp")
+(load "test/regression/asdf-registry-invalidation.lisp")
 (load "test/regression/defstruct-conc-name.lisp")
 (load "test/regression/unquote-user-function.lisp")
 (load "test/regression/illegal-function-call.lisp")
