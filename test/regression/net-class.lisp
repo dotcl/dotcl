@@ -1504,3 +1504,234 @@
       (dotnet:invoke h "set_N" 42)
       (dotnet:invoke h "get_N")))
   42)
+
+;;; -------------------------------------------------------------------------
+;;; Step 6: save-library — aggregate MANY types into one C#-referenceable .dll.
+;;; The saved DLL is a facade (persisted, unloadable in this process), so these
+;;; tests assert emission succeeds, the primitive returns the save-path, and a
+;;; non-empty .dll lands on disk. C#-consumability is covered end-to-end by
+;;; test/save-class-lib/check.sh (make test-save-class-lib).
+
+(defun %savelib-temp-path (name)
+  "A unique temp .dll path for a save-library test (overwritten each run)."
+  (concatenate 'string
+               (dotnet:static "System.IO.Path" "GetTempPath")
+               name ".dll"))
+
+(defun %file-nonempty-p (path)
+  (and (probe-file path)
+       (with-open-file (s path :element-type '(unsigned-byte 8))
+         (> (file-length s) 0))))
+
+;;; dotnet:%save-library primitive: tagged member-spec-list — two :class instance
+;;; types + a static function (7th method-spec element = static-flag). One DLL.
+(deftest savelib-primitive-multi-type
+  (let ((path (%savelib-temp-path "dotcl-savelib-prim")))
+    (list
+     (string= path
+              (dotnet:%save-library
+               path "SaveLibPrim" "1.0.0.0"
+               (list
+                ;; tagged member = (:class DOC . 12-slots); DOC nil here.
+                (list :class nil "SaveLibPrim.Calc" nil nil nil
+                      (list (list "Add" "System.Int32"
+                                  (list "System.Int32" "System.Int32")
+                                  (lambda (self a b) (declare (ignore self)) (+ a b)))))
+                (list :class nil "SaveLibPrim.Greeter" nil nil nil
+                      (list (list "Hi" "System.String" (list "System.String")
+                                  (lambda (self who) (declare (ignore self))
+                                    (concatenate 'string "Hi " who)))))
+                ;; static function: 7th method-spec element non-nil, lambda w/o self
+                (list :class nil "SaveLibPrim.MathOps" nil nil nil
+                      (list (list "Square" "System.Int32" (list "System.Int32")
+                                  (lambda (x) (* x x))
+                                  nil nil t))))))
+     (%file-nonempty-p path)))
+  (t t))
+
+;;; %save-library requires exactly 4 args.
+(deftest savelib-arity-error
+  (handler-case
+      (progn (dotnet:%save-library "x.dll" "X") nil)
+    (error () :signaled))
+  :signaled)
+
+;;; An empty member-spec-list is an error (nothing to aggregate).
+(deftest savelib-empty-list-error
+  (handler-case
+      (progn (dotnet:%save-library
+              (%savelib-temp-path "dotcl-savelib-empty") "Empty" nil nil)
+             nil)
+    (error () :signaled))
+  :signaled)
+
+;;; An unknown member kind is an error.
+(deftest savelib-unknown-kind-error
+  (handler-case
+      (progn (dotnet:%save-library
+              (%savelib-temp-path "dotcl-savelib-badkind") "Bad" nil
+              (list (list :bogus "Bad.T")))
+             nil)
+    (error () :signaled))
+  :signaled)
+
+;;; dotnet:library macro: :class instance types + :module static-function holder,
+;;; emitted from the same surface a user writes. Assert a non-empty DLL lands.
+(deftest library-macro-emits-dll
+  (let ((path (%savelib-temp-path "dotcl-library-macro")))
+    (dotnet:library ("LibMacro" :version "2.1.0.0" :path path)
+      (:class "LibMacro.Calculator" ()
+        (:methods ("Add" ((a Int32) (b Int32)) :returns Int32 (+ a b))))
+      (:class "LibMacro.Greeter" ()
+        (:methods ("Hello" ((who String)) :returns String
+          (concatenate 'string "Hi " who))))
+      (:module "LibMacro.MathOps"
+        (:functions ("Square" ((x Int32)) :returns Int32 (* x x)))))
+    (%file-nonempty-p path))
+  t)
+
+;;; %save-library tagged :enum members: an enum-only library (no classes) is
+;;; valid — enums are standalone metadata. Underlying nil defaults to Int32.
+(deftest savelib-enum-only
+  (let ((path (%savelib-temp-path "dotcl-savelib-enum")))
+    (list
+     (string= path
+              (dotnet:%save-library
+               path "SaveLibEnum" nil
+               (list
+                (list :enum nil "SaveLibEnum.Color" "System.Int32"
+                      (list "Red" 0) (list "Green" 1) (list "Blue" 2))
+                (list :enum nil "SaveLibEnum.Priority" nil
+                      (list "Low" 10) (list "High" 20)))))
+     (%file-nonempty-p path)))
+  (t t))
+
+;;; dotnet:library :enum forms: auto-increment ("Blue" => 2) and explicit values
+;;; mixed with a class in one DLL. Assert a non-empty DLL lands.
+(deftest library-macro-enum
+  (let ((path (%savelib-temp-path "dotcl-library-enum")))
+    (dotnet:library ("LibEnum" :version "1.0.0.0" :path path)
+      (:class "LibEnum.Calc" ()
+        (:methods ("Add" ((a Int32) (b Int32)) :returns Int32 (+ a b))))
+      (:enum "LibEnum.Color" "Red" "Green" "Blue")
+      (:enum "LibEnum.Flags" :underlying Int32 ("A" 1) ("B" 2) ("C" 4) "D"))
+    (%file-nonempty-p path))
+  t)
+
+;;; %save-library tagged :constants member: a const-holder of int/string/double
+;;; literals. Like enums, standalone metadata; a const-only library is valid.
+(deftest savelib-constants-only
+  (let ((path (%savelib-temp-path "dotcl-savelib-const")))
+    (list
+     (string= path
+              (dotnet:%save-library
+               path "SaveLibConst" nil
+               (list
+                (list :constants nil "SaveLibConst.Config"
+                      (list "MaxRetries" "System.Int32" 5)
+                      (list "ApiUrl" "System.String" "https://example.com")
+                      (list "Pi" "System.Double" 3.14159d0)))))
+     (%file-nonempty-p path)))
+  (t t))
+
+;;; dotnet:library :constants form mixed with a class + enum in one DLL.
+(deftest library-macro-constants
+  (let ((path (%savelib-temp-path "dotcl-library-const")))
+    (dotnet:library ("LibConst" :version "1.0.0.0" :path path)
+      (:class "LibConst.Calc" ()
+        (:methods ("Add" ((a Int32) (b Int32)) :returns Int32 (+ a b))))
+      (:enum "LibConst.Color" "Red" "Green" "Blue")
+      (:constants "LibConst.Config"
+        ("MaxRetries" Int32 5)
+        ("ApiUrl" String "https://example.com")
+        ("Pi" Double 3.14159d0)))
+    (%file-nonempty-p path))
+  t)
+
+;;; Exception type: a class deriving System.Exception whose ctor forwards its
+;;; message to base with NO body. Such a base-forwarding-only ctor emits no Lisp
+;;; dispatch, so the type is standalone (a C# consumer throws/catches it with no
+;;; DotCL.Runtime — asserted end-to-end in test/save-class-lib/check.sh).
+(deftest library-macro-exception-type
+  (let ((path (%savelib-temp-path "dotcl-library-exc")))
+    (dotnet:library ("LibExc" :version "1.0.0.0" :path path)
+      (:class "LibExc.MyError" ("System.Exception")
+        (:ctor ((msg String)) (:base msg))))
+    (%file-nonempty-p path))
+  t)
+
+;;; In-process: a base-forwarding-only ctor (no body) still constructs correctly
+;;; via dotnet:new — the null-body ctor calls base and returns.
+(deftest define-class-base-forwarding-ctor
+  (progn
+    (dotnet:define-class "DcExcTest.AppError" ("System.Exception")
+      (:ctor ((msg String)) (:base msg)))
+    (let ((e (dotnet:new "DcExcTest.AppError" "kaboom")))
+      (dotnet:invoke e "get_Message")))
+  "kaboom")
+
+;;; %save-library tagged :struct member: a value type with public fields.
+;;; Standalone data (no dispatch); a struct-only library is valid.
+(deftest savelib-struct-only
+  (let ((path (%savelib-temp-path "dotcl-savelib-struct")))
+    (list
+     (string= path
+              (dotnet:%save-library
+               path "SaveLibStruct" nil
+               (list
+                (list :struct nil "SaveLibStruct.Point"
+                      (list "X" "System.Int32")
+                      (list "Y" "System.Int32")))))
+     (%file-nonempty-p path)))
+  (t t))
+
+;;; dotnet:library :struct form mixed with a class + enum + const in one DLL.
+(deftest library-macro-struct
+  (let ((path (%savelib-temp-path "dotcl-library-struct")))
+    (dotnet:library ("LibStruct" :version "1.0.0.0" :path path)
+      (:class "LibStruct.Calc" ()
+        (:methods ("Add" ((a Int32) (b Int32)) :returns Int32 (+ a b))))
+      (:enum "LibStruct.Color" "Red" "Green" "Blue")
+      (:constants "LibStruct.Config" ("Max" Int32 9))
+      (:struct "LibStruct.Point" ("X" Int32) ("Y" Int32)))
+    (%file-nonempty-p path))
+  t)
+
+;;; dotnet:library :interface — a standalone abstract-method contract. Assert a
+;;; non-empty DLL; C#-implementability is asserted end-to-end in check.sh.
+(deftest library-macro-interface
+  (let ((path (%savelib-temp-path "dotcl-library-iface")))
+    (dotnet:library ("LibIface" :version "1.0.0.0" :path path)
+      (:interface "LibIface.IShape"
+        ("Area" () :returns Double)
+        ("Scale" ((factor Double)) :returns Void)))
+    (%file-nonempty-p path))
+  t)
+
+;;; dotnet:library :delegate — a standalone callback type. Assert a non-empty
+;;; DLL; C#-usability is asserted end-to-end in check.sh.
+(deftest library-macro-delegate
+  (let ((path (%savelib-temp-path "dotcl-library-del")))
+    (dotnet:library ("LibDel" :version "1.0.0.0" :path path)
+      (:delegate "LibDel.BinaryOp" ((a Int32) (b Int32)) :returns Int32))
+    (%file-nonempty-p path))
+  t)
+
+;;; :doc on a member writes a sidecar <name>.xml with a <member name="T:Full">
+;;; <summary>. A C# consumer's IntelliSense reads it. Assert the .xml lands with
+;;; the member id + summary text.
+(deftest library-macro-xmldoc
+  (let* ((path (%savelib-temp-path "dotcl-library-xmldoc"))
+         (xml (concatenate 'string (subseq path 0 (- (length path) 4)) ".xml")))
+    (dotnet:library ("LibDoc" :version "1.0.0.0" :path path)
+      (:enum "LibDoc.Color" :doc "A set of colors." "Red" "Green")
+      (:struct "LibDoc.Point" :doc "A 2D point." ("X" Int32) ("Y" Int32)))
+    (and (not (null (probe-file xml)))
+         (with-open-file (s xml)
+           (let ((content (make-string (file-length s))))
+             (read-sequence content s)
+             (and (not (null (search "T:LibDoc.Color" content)))
+                  (not (null (search "A set of colors." content)))
+                  (not (null (search "T:LibDoc.Point" content)))
+                  t)))))
+  t)

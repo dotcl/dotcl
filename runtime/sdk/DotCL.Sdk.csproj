@@ -1,0 +1,45 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Packs the DotCL.Sdk MSBuild SDK. This project ships NO
+    assembly — only Sdk/Sdk.props + Sdk/Sdk.targets, which MSBuild auto-imports
+    for any consumer that writes <Project Sdk="DotCL.Sdk">.
+
+    Version is inherited from runtime/Directory.Build.props, so DotCL.Sdk and
+    DotCL.Runtime always share a version number (they release in lockstep).
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>netstandard2.0</TargetFramework>
+    <!-- No compiled output goes into the package: it's a pure MSBuild SDK. -->
+    <IncludeBuildOutput>false</IncludeBuildOutput>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <!-- No AssemblyInfo / TFM attribute source to compile; this project ships no
+         assembly. Silences NU5128 (no lib/ref for the TFM). -->
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <NoWarn>$(NoWarn);NU5128</NoWarn>
+
+    <PackageId>DotCL.Sdk</PackageId>
+    <PackageType>MSBuildSdk</PackageType>
+    <!-- An SDK package has no library dependencies of its own. -->
+    <SuppressDependenciesWhenPacking>true</SuppressDependenciesWhenPacking>
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
+
+    <Description>MSBuild SDK for Common Lisp on .NET — build/pack/F5 a dotcl app as a first-class MSBuild project.</Description>
+    <Authors>SANO Masatoshi</Authors>
+    <Copyright>Copyright © 2026 SANO Masatoshi</Copyright>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/dotcl/dotcl</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/dotcl/dotcl.git</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageTags>lisp;common-lisp;dotnet;msbuild-sdk;sdk</PackageTags>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- The two files that make this an SDK package. MSBuild's SDK resolver
+         looks for Sdk/Sdk.props and Sdk/Sdk.targets at the package root. -->
+    <None Include="Sdk.props" Pack="true" PackagePath="Sdk/" />
+    <None Include="Sdk.targets" Pack="true" PackagePath="Sdk/" />
+  </ItemGroup>
+
+</Project>

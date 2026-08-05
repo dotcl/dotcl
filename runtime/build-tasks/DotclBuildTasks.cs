@@ -213,6 +213,9 @@ public sealed class DotclCompileProject : Task
     /// assemblies, so compile-time (dotnet:resolve-type ...) can see
     /// PackageReference / ProjectReference types (same as DotclResolveDeps).</summary>
     public ITaskItem[]? ReferencePath { get; set; }
+    /// <summary>Emit a Portable PDB alongside the fasl (Debug build) so the
+    /// project is source-debuggable in a .NET debugger.</summary>
+    public bool DebugInfo { get; set; }
 
     public override bool Execute()
     {
@@ -229,6 +232,7 @@ public sealed class DotclCompileProject : Task
     {
         DotclBoot.Boot(BaseCore, ContribDir, DotclBoot.ReferenceDirs(ReferencePath));
         DotclHost.CompileProject(Asd, Output, BuildInit?.Select(i => i.GetMetadata("FullPath")).ToArray(),
-                                 AsdSearchPath?.Select(i => i.GetMetadata("FullPath")).ToArray());
+                                 AsdSearchPath?.Select(i => i.GetMetadata("FullPath")).ToArray(),
+                                 DebugInfo);
     }
 }

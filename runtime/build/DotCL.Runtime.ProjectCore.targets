@@ -30,7 +30,18 @@
     <DotclSourceManifest>$(DotclBundleDir)dotcl-deps.source.txt</DotclSourceManifest>
     <DotclRootSourcesList>$(DotclBundleDir)dotcl-root-sources.txt</DotclRootSourcesList>
     <DotclDeployedManifest>$(DotclBundleDir)dotcl-deps.txt</DotclDeployedManifest>
+    <!-- Per-project copy of the manifest, so a referenced Lisp library can load
+         its own even though the app's dotcl-deps.txt owns that name in the
+         shared output directory. -->
+    <DotclProjectManifest>$(DotclBundleDir)$(MSBuildProjectName).deps.txt</DotclProjectManifest>
     <DotclRootFasl>$(DotclBundleDir)$(MSBuildProjectName).fasl</DotclRootFasl>
+
+    <!-- Emit a Portable PDB (source-debuggable .lisp) on a Debug build. Defaults
+         from $(Configuration); a consumer can force it either way by setting
+         <DotclDebugInfo> explicitly. The .pdb ships next to the fasl (see
+         _DotCLInjectAssets) so a debugger binds breakpoints in the source. -->
+    <DotclDebugInfo Condition="'$(DotclDebugInfo)' == '' and '$(Configuration)' == 'Debug'">true</DotclDebugInfo>
+    <DotclDebugInfo Condition="'$(DotclDebugInfo)' == ''">false</DotclDebugInfo>
   </PropertyGroup>
 
   <UsingTask Condition="'$(DotclProjectAsd)' != '' and Exists('$(_DotCLTaskAssembly)')"
@@ -102,7 +113,8 @@
                          BuildInit="@(DotclBuildInit)"
                          AsdSearchPath="@(DotclAsdSearchPath)"
                          ReferencePath="@(ReferenceCopyLocalPaths)"
-                         RuntimeAssemblyPath="$(_DotCLRuntimeAssembly)" />
+                         RuntimeAssemblyPath="$(_DotCLRuntimeAssembly)"
+                         DebugInfo="$(DotclDebugInfo)" />
   </Target>
 
   <!-- Step 5: write the deployment manifest (base core, deps, root fasl) using
@@ -123,6 +135,14 @@
     <WriteLinesToFile File="$(DotclDeployedManifest)"
                       Lines="@(_DotclManifestLine)"
                       Overwrite="true" />
+    <!-- Same list under a per-project name. dotcl-deps.txt is the app's
+         manifest and only one of them can occupy the output directory, so a
+         referenced Lisp library needs a manifest it can name for itself; its
+         facade loads that one. LoadFromManifest skips entries already loaded,
+         so the overlap (core, shared deps) is paid for once. -->
+    <WriteLinesToFile File="$(DotclProjectManifest)"
+                      Lines="@(_DotclManifestLine)"
+                      Overwrite="true" />
   </Target>
 
   <!-- Step 6: inject the bundle (manifest + fasls + base core) as build items so
@@ -133,8 +153,12 @@
           Condition="'$(DotclProjectAsd)' != '' and Exists('$(DotclDeployedManifest)')">
     <ItemGroup>
       <_DotclBundled Include="$(DotclBundleDir)*.fasl" />
+      <!-- Debug build: ship the .pdb next to its fasl so the debugger finds the
+           symbols and binds breakpoints in the .lisp. Empty on a Release build. -->
+      <_DotclBundled Include="$(DotclBundleDir)*.pdb" />
       <_DotclBundled Include="$(DotclBundleDir)dotcl.core" Condition="Exists('$(DotclBundleDir)dotcl.core')" />
       <_DotclBundled Include="$(DotclDeployedManifest)" />
+      <_DotclBundled Include="$(DotclProjectManifest)" Condition="Exists('$(DotclProjectManifest)')" />
     </ItemGroup>
 
     <ItemGroup Condition="'$(UseMaui)' == 'true' and $(TargetFramework.Contains('-android'))">

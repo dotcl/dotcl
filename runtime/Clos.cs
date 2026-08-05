@@ -31,8 +31,18 @@ public class SlotDefinition : LispObject
     /// <summary>Storage for the Lisp-level slots introduced by a custom slot-definition
     /// class (e.g. McCLIM's DYNAMIC-DIRECT-SLOT/DYNAMIC-EFFECTIVE-SLOT add a DYNAMIC
     /// slot). Keyed by slot name; null until the slotd gets a custom MetaClass. SLOT-VALUE
-    /// / (SETF SLOT-VALUE) / SLOT-BOUNDP route through this for SlotDefinition objects.</summary>
-    public Dictionary<string, LispObject?>? ExtraSlots { get; set; }
+    /// / (SETF SLOT-VALUE) / SLOT-BOUNDP route through this for SlotDefinition objects.
+    /// ConcurrentDictionary + atomic lazy init (see EnsureExtraSlots): under
+    /// (set-parallel-eval t), parallel make-instance / defclass of a custom metaclass
+    /// otherwise tore a plain Dictionary.</summary>
+    public System.Collections.Concurrent.ConcurrentDictionary<string, LispObject?>? ExtraSlots;
+
+    /// <summary>Atomically obtain the ExtraSlots table, creating it on first use.
+    /// A plain (ExtraSlots ??= new()) lets two threads publish different dictionaries
+    /// and lose an update; CompareExchange keeps a single winner.</summary>
+    public System.Collections.Concurrent.ConcurrentDictionary<string, LispObject?> EnsureExtraSlots()
+        => ExtraSlots ?? System.Threading.Interlocked.CompareExchange(
+               ref ExtraSlots, new(), null) ?? ExtraSlots;
 
     /// <summary>The canonical slot-option plist (a Lisp list :key val ...) captured from the
     /// DEFCLASS slot specifier, used as the &rest initargs when DIRECT-SLOT-DEFINITION-CLASS
@@ -74,6 +84,16 @@ public class LispClass : LispObject
     internal readonly object DefLock = new();
     /// <summary>True for built-in classes (BUILT-IN-CLASS metaclass). False for user-defined (STANDARD-CLASS).</summary>
     public bool IsBuiltIn { get; set; }
+    /// <summary>True when this class stands for a .NET interface. Interfaces are
+    /// superclasses for dispatch, but rank below every concrete class in a class
+    /// precedence list, so EnsureDotNetTypeClass keeps them separable.</summary>
+    public bool IsDotNetInterface { get; set; }
+    /// <summary>The .NET type this class stands for, or null for an ordinary Lisp
+    /// class. Dispatch consults it for the assignabilities a class precedence list
+    /// cannot enumerate — a variant generic (List&lt;String&gt; is an
+    /// IEnumerable&lt;Object&gt;) would need every instantiation of every supertype
+    /// of every type argument spelled out.</summary>
+    public System.Type? DotNetType { get; set; }
     /// <summary>True for structure classes (STRUCTURE-CLASS metaclass).</summary>
     public bool IsStructureClass { get; set; }
     /// <summary>True for forward-referenced classes (superclass not yet defined).</summary>
@@ -92,8 +112,16 @@ public class LispClass : LispObject
     /// <summary>Slot values this class holds as an instance of its (custom) metaclass —
     /// i.e. slots the metaclass adds beyond STANDARD-CLASS. Null until populated.
     /// Lets slot-value on a class metaobject read metaclass-defined slots,
-    /// mirroring SlotDefinition.ExtraSlots.</summary>
-    public Dictionary<string, LispObject?>? ExtraSlots { get; set; }
+    /// mirroring SlotDefinition.ExtraSlots.
+    /// ConcurrentDictionary + atomic lazy init (see EnsureExtraSlots) so parallel
+    /// eval cannot tear a plain Dictionary.</summary>
+    public System.Collections.Concurrent.ConcurrentDictionary<string, LispObject?>? ExtraSlots;
+
+    /// <summary>Atomically obtain the ExtraSlots table, creating it on first use.
+    /// CompareExchange keeps a single winner if two threads race the first write.</summary>
+    public System.Collections.Concurrent.ConcurrentDictionary<string, LispObject?> EnsureExtraSlots()
+        => ExtraSlots ?? System.Threading.Interlocked.CompareExchange(
+               ref ExtraSlots, new(), null) ?? ExtraSlots;
     /// <summary>Cached mapping from initarg name to slot index (only valid when each initarg maps to one slot).</summary>
     public Dictionary<string, int>? InitargToSlotIndex { get; set; }
     /// <summary>True if this class can use the fast make-instance path.</summary>
@@ -604,6 +632,28 @@ public sealed class ReaderCache
     internal readonly Symbol Sym;
     internal volatile Entry? E;
     public ReaderCache(Symbol sym) { Sym = sym; }
+
+    internal sealed class Entry
+    {
+        internal readonly LispClass Cls;
+        internal readonly int Idx;
+        internal readonly int Epoch;
+        internal Entry(LispClass cls, int idx, int epoch) { Cls = cls; Idx = idx; Epoch = epoch; }
+    }
+}
+
+/// <summary>The writer twin of <see cref="ReaderCache"/>: a per-call-site monomorphic
+/// inline cache for a simple slot writer, baked once per <c>(setf (accessor obj) v)</c>
+/// call site and read/filled by <see cref="Runtime.WriterIC"/>. Same publication and
+/// soundness rules — an immutable <see cref="Entry"/> published through the volatile
+/// <see cref="E"/> field, invalidated wholesale by a <see cref="GenericFunction.MethodEpoch"/>
+/// bump (defmethod on the writer, class re-layout).</summary>
+public sealed class WriterCache
+{
+    /// <summary>The accessor name — the (SETF name) function is re-resolved from it on a miss.</summary>
+    internal readonly Symbol Sym;
+    internal volatile Entry? E;
+    public WriterCache(Symbol sym) { Sym = sym; }
 
     internal sealed class Entry
     {

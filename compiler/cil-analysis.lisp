@@ -95,11 +95,20 @@
                       (push (cons (cdr sm) (cons bnd mdepth)) worklist)
                       (when (and e
                                  (or (not (eq e t)) (local-bound-p e))
-                                 (or (not (keywordp e)) (local-bound-p e))
+                                 ;; A keyword is a self-evaluating constant, never a
+                                 ;; lexical variable, so it is never a free-var
+                                 ;; candidate. Excluding it unconditionally matters
+                                 ;; under *ffv-assume-bound* (candidate collection),
+                                 ;; where LOCAL-BOUND-P is forced T: otherwise e.g.
+                                 ;; the :input keyword in (apply f :input input ...)
+                                 ;; would grab the "INPUT" var-name slot in FREE-HT
+                                 ;; (string-keyed) and shadow the real INPUT variable,
+                                 ;; losing its closure capture.
+                                 (not (keywordp e))
                                  (not (bnd-member-p e bnd))
-                                 (not (gethash (var-name e) free-ht))
+                                 (not (gethash e free-ht))
                                  (local-bound-p e))
-                        (setf (gethash (var-name e) free-ht) e)))))
+                        (setf (gethash e free-ht) e)))))
                ;; Cons: dispatch on head
                ((consp e)
                 (let ((head (car e)))
@@ -169,9 +178,9 @@
                          ;; this collects; otherwise it filters.
                         (dolist (sym (%lambda-free-candidates e))
                           (when (and (not (bnd-member-p sym bnd))
-                                     (not (gethash (var-name sym) free-ht))
+                                     (not (gethash sym free-ht))
                                      (or *ffv-assume-bound* (local-bound-p sym)))
-                            (setf (gethash (var-name sym) free-ht) sym)))))
+                            (setf (gethash sym free-ht) sym)))))
                     ;; Let/Let* introduces bindings
                     ((and (symbolp head) (member head '(let let*)))
                      (let* ((bindings (cadr e))
@@ -194,13 +203,14 @@
                     ;; go: check if tagbody ID needs capture
                     ((and (symbolp head) (eq head 'go))
                      (let* ((tag (cadr e))
-                            (entry (assoc tag *go-tags*)))
+                            (entry (assoc tag (cstate-go-tags))))
                        (when entry
-                         (let ((tb-var-name (second entry)))
+                         (let* ((tb-var-name (second entry))
+                                (tb-sym (intern tb-var-name :dotcl.cil-compiler)))
                            (when (and (not (member tb-var-name bnd :test #'string=))
-                                      (not (gethash tb-var-name free-ht))
-                                      (local-bound-p (intern tb-var-name :dotcl.cil-compiler)))
-                             (setf (gethash tb-var-name free-ht) (intern tb-var-name :dotcl.cil-compiler)))))))
+                                      (not (gethash tb-sym free-ht))
+                                      (local-bound-p tb-sym))
+                             (setf (gethash tb-sym free-ht) tb-sym))))))
                     ;; Block introduces a synthetic block-tag variable
                     ((and (symbolp head) (eq head 'block))
                      (let* ((bname (cadr e))
@@ -211,20 +221,22 @@
                     ;; return-from: check block tag capture + scan value
                     ((and (symbolp head) (eq head 'return-from))
                      (let* ((bname (cadr e))
-                            (tag-var (block-tag-var-name bname)))
+                            (tag-var (block-tag-var-name bname))
+                            (tag-sym (intern tag-var :dotcl.cil-compiler)))
                        (when (and (not (member tag-var bnd :test #'string=))
-                                  (not (gethash tag-var free-ht))
-                                  (local-bound-p (intern tag-var :dotcl.cil-compiler)))
-                        (setf (gethash tag-var free-ht) (intern tag-var :dotcl.cil-compiler))))
+                                  (not (gethash tag-sym free-ht))
+                                  (local-bound-p tag-sym))
+                        (setf (gethash tag-sym free-ht) tag-sym)))
                      (when (caddr e)
                        (push (cons (caddr e) (cons bnd mdepth)) worklist)))
                     ;; return: (return expr) = (return-from nil expr)
                     ((and (symbolp head) (eq head 'return))
-                     (let ((tag-var (block-tag-var-name nil)))
+                     (let* ((tag-var (block-tag-var-name nil))
+                            (tag-sym (intern tag-var :dotcl.cil-compiler)))
                        (when (and (not (member tag-var bnd :test #'string=))
-                                  (not (gethash tag-var free-ht))
-                                  (local-bound-p (intern tag-var :dotcl.cil-compiler)))
-                        (setf (gethash tag-var free-ht) (intern tag-var :dotcl.cil-compiler))))
+                                  (not (gethash tag-sym free-ht))
+                                  (local-bound-p tag-sym))
+                        (setf (gethash tag-sym free-ht) tag-sym)))
                      (when (cadr e)
                        (push (cons (cadr e) (cons bnd mdepth)) worklist)))
                     ;; (function sym) or (function (lambda ...))
@@ -247,9 +259,10 @@
                                       (mangled-name (concatenate 'string "__LABELFN_"
                                                                  (symbol-name arg))))
                                   (dolist (nm (list mangled-name plain-name))
-                                    (when (and (not (member nm bnd :test #'string=))
-                                               (not (gethash nm free-ht)))
-                                      (setf (gethash nm free-ht) (intern nm :dotcl.cil-compiler))))))
+                                    (let ((nm-sym (intern nm :dotcl.cil-compiler)))
+                                      (when (and (not (member nm bnd :test #'string=))
+                                                 (not (gethash nm-sym free-ht)))
+                                        (setf (gethash nm-sym free-ht) nm-sym))))))
                               (when (and arg (or (not (eq arg t)) (local-bound-p arg))
                                          (not (special-var-p arg))
                                          (local-bound-p arg))
@@ -259,9 +272,10 @@
                                                        ((local-bound-p (intern mangled-name :dotcl.cil-compiler))
                                                         mangled-name)
                                                        (t plain-name))))
-                                  (when (and (not (member capture-name bnd :test #'string=))
-                                             (not (gethash capture-name free-ht)))
-                                    (setf (gethash capture-name free-ht) (intern capture-name :dotcl.cil-compiler))))))))))
+                                  (let ((capture-sym (intern capture-name :dotcl.cil-compiler)))
+                                    (when (and (not (member capture-name bnd :test #'string=))
+                                               (not (gethash capture-sym free-ht)))
+                                      (setf (gethash capture-sym free-ht) capture-sym))))))))))
                     ;; handler-case: body + clauses with optional var binding
                     ((and (symbolp head) (eq head 'handler-case))
                      (let ((body-form (cadr e))
@@ -445,11 +459,12 @@
                              ;; gates this to scopes where such a fn exists.
                              (when (symbolp head)
                                (let* ((name (symbol-name head))
-                                      (mangled (concatenate 'string "__LABELFN_" name)))
-                                 (when (and (local-bound-p (intern mangled :dotcl.cil-compiler))
+                                      (mangled (concatenate 'string "__LABELFN_" name))
+                                      (mangled-sym (intern mangled :dotcl.cil-compiler)))
+                                 (when (and (local-bound-p mangled-sym)
                                             (not (member mangled bnd :test #'string=))
-                                            (not (gethash mangled free-ht)))
-                                   (setf (gethash mangled free-ht) (intern mangled :dotcl.cil-compiler)))))
+                                            (not (gethash mangled-sym free-ht)))
+                                   (setf (gethash mangled-sym free-ht) mangled-sym))))
                              ;; Generic walk. The car is in function position only when
                              ;; it is a SYMBOL (function name) or a (setf sym) / (lambda ...)
                              ;; compound form. Symbols in function position must NOT be pushed
@@ -492,7 +507,7 @@
   (let* ((params (cadr e))
          (lbody (cddr e))
          (inner-bound (extract-param-names params))
-         (free-ht (make-hash-table :test #'equal))
+         (free-ht (make-hash-table :test #'eq))
          (*ffv-assume-bound* t))
     ;; &optional/&key/&aux default forms with progressive left-to-right scoping,
     ;; starting from the empty scope (a default referencing an enclosing-bound var
@@ -836,6 +851,10 @@
   (when (consp instr)
     (case (car instr)
       (:ldloc (list (cadr instr)))
+      ;; The debug frame stores (:frame-set NAME KEY) and its box / native-rep
+      ;; variants all read KEY.
+      ((:frame-set :frame-set-box :frame-set-long :frame-set-double :frame-set-single)
+       (list (caddr instr)))
       ;; (:dotnet-call-direct-locals TYPE METHOD RECV (ARG...) (PARAM...))
       ;; RECV and each ARG are locals read by the call.
       (:dotnet-call-direct-locals (cons (nth 3 instr) (nth 4 instr)))
@@ -859,9 +878,9 @@
 
 (defun rewrite-instr-locals (instr rename)
   "Return INSTR with every local KEY mapped through RENAME (a hash-table; a key
-   absent from RENAME is left unchanged). Covers :declare-local/:ldloc/:stloc and
-   the RECV + ARG locals of :dotnet-call-direct-locals. Other instrs are returned
-   unchanged."
+   absent from RENAME is left unchanged). Covers :declare-local/:ldloc/:stloc,
+   the debug (:frame-set[-box] NAME KEY) stores, and the RECV + ARG locals of
+   :dotnet-call-direct-locals. Other instrs are returned unchanged."
   (if (not (consp instr))
       instr
       (flet ((rn (k) (or (gethash k rename) k)))
@@ -869,6 +888,8 @@
           (:declare-local `(:declare-local ,(rn (cadr instr)) ,(caddr instr)))
           (:ldloc `(:ldloc ,(rn (cadr instr))))
           (:stloc `(:stloc ,(rn (cadr instr))))
+          ((:frame-set :frame-set-box :frame-set-long :frame-set-double :frame-set-single)
+           `(,(car instr) ,(cadr instr) ,(rn (caddr instr))))
           (:dotnet-call-direct-locals
            `(:dotnet-call-direct-locals
              ,(nth 1 instr) ,(nth 2 instr)
@@ -962,6 +983,7 @@
                                           ; with P2 to a bare native store.)
      P6  (:newobj \"DoubleFloat\") (:pop) ->  (:pop)    ; float sibling of P5: the
      P6  (:newobj \"SingleFloat\") (:pop) ->  (:pop)    ; DoubleFloat/SingleFloat
+     P6  (:newobj \"LispDecimal\") (:pop) ->  (:pop)   ; and the decimal slot's box
                                           ; ctor is pure (value + alloc counter),
                                           ; so boxing a discarded native float
                                           ; store result is dead — pop the raw r8
@@ -1022,7 +1044,7 @@
               ;; SingleFloat ctor is pure (stores value, bumps the alloc counter),
               ;; so drop the newobj and pop the raw r8/r4 operand instead.
               ((and (consp i1) (eq (car i1) :newobj)
-                    (member (cadr i1) '("DoubleFloat" "SingleFloat") :test #'equal)
+                    (member (cadr i1) '("DoubleFloat" "SingleFloat" "LispDecimal") :test #'equal)
                     (consp i2) (eq (car i2) :pop))
                (setf changed t)
                (push i2 out)
@@ -1034,7 +1056,7 @@
               ;; the whole dead box. (Fixnum.Make's surviving box is invisible in
               ;; alloc profiles thanks to the small-int cache; a float box is not.)
               ((and (consp i1) (eq (car i1) :newobj)
-                    (member (cadr i1) '("DoubleFloat" "SingleFloat") :test #'equal)
+                    (member (cadr i1) '("DoubleFloat" "SingleFloat" "LispDecimal") :test #'equal)
                     (consp i2) (eq (car i2) :call) (equal (cadr i2) "Runtime.UnwrapMv"))
                (setf changed t)
                (push i1 out)
@@ -1052,7 +1074,14 @@
    :declare-local entries, which can bring an (:ldloc X)(:stloc X) pair
    (separated by a declare in the raw stream) into adjacency where the
    peephole can collapse it."
-  (peephole-optimize (%merge-disjoint-locals instrs)))
+  ;; Under debug info emission, skip slot sharing so each source variable keeps
+  ;; its own physical slot (a coalesced slot would host several source vars over
+  ;; its lifetime, which a method-wide PDB LocalVariable name can't represent).
+  ;; The classic "debug builds don't reuse slots" tradeoff. Peephole still runs.
+  (peephole-optimize
+   (if *emit-source-lines*
+       instrs
+       (%merge-disjoint-locals instrs))))
 
 (defun %merge-disjoint-locals (instrs)
   "Linear-scan slot sharing: merge LispObject locals whose flat live ranges
@@ -1153,14 +1182,12 @@
 
 (defun compile-toplevel (expr)
   "Compile a top-level expression. Returns instruction list."
-  (let ((*locals* '())
+  (let ((*cstate* (cstate-with *cstate*
+                               +cs-locals+ '() +cs-block-tags+ '() +cs-go-tags+ '()
+                               +cs-boxed-vars+ '() +cs-local-functions+ '()))
         (*var-counter* 0)
         (*label-counter* 0)
-        (*block-tags* '())
-        (*go-tags* '())
         (*specials* '())
-        (*boxed-vars* '())
-        (*local-functions* '())
         (*at-toplevel* t)
         (*macroexpand-scope* '())
         (*macroexpand-cache* (make-hash-table :test #'eq))
@@ -1173,14 +1200,12 @@
   "Compile a top-level expression for EVAL.
    Like compile-toplevel but preserves MvReturn at the tail so EVAL's
    caller can observe the form's multiple values."
-  (let ((*locals* '())
+  (let ((*cstate* (cstate-with *cstate*
+                               +cs-locals+ '() +cs-block-tags+ '() +cs-go-tags+ '()
+                               +cs-boxed-vars+ '() +cs-local-functions+ '()))
         (*var-counter* 0)
         (*label-counter* 0)
-        (*block-tags* '())
-        (*go-tags* '())
         (*specials* '())
-        (*boxed-vars* '())
-        (*local-functions* '())
         (*at-toplevel* t)
         (*in-tail-position* t)
         (*macroexpand-scope* '())

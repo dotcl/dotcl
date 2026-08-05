@@ -433,17 +433,10 @@
 ;;; Set operations
 ;;; ============================================================
 
-(defun adjoin (item list &key (test #'eql) test-not (key #'identity))
-  (let ((key (or key #'identity)))
-    (let ((item-key (funcall key item)))
-      (if (dolist (x list nil)
-            (let ((k (funcall key x)))
-              (when (if test-not
-                        (not (funcall test-not item-key k))
-                        (funcall test item-key k))
-                (return t))))
-          list
-          (cons item list)))))
+;;; ADJOIN lives in C# (Runtime.AdjoinFull and its 2/4/6-arg direct entries).
+;;; A &key Lisp defun gets no typed direct delegate, so every (adjoin item list
+;;; :test ...) — which is what PUSHNEW expands into — went through the variadic
+;;; XEP and an args array.
 
 ;;; Helper: test if item (already key-applied) is in list using test/test-not/key
 ;;; Calls (test item (key x)) — item is first arg
@@ -1231,7 +1224,7 @@ Also expands element types within compound type specifiers like (VECTOR etype si
 (defvar *compilation-unit-depth* 0)
 (defvar *deferred-compilation-warnings* nil)
 
-(defvar *documentation-table* (make-hash-table :test #'equal))
+(defvar *documentation-table* (make-hash-table :test #'equal :synchronized t))
 
 ;; Helper to make a key for the documentation table
 (defun %doc-key (obj doc-type)
@@ -1660,3 +1653,53 @@ overload), so this never changes behaviour, only speed."
                                                      (let ((,(caadr cl) ,cvar))
                                                        ,@(cddr cl))))))))
                      ,@body))))))))
+
+;;; dotnet:-> — a left-to-right member chain, so nested interop reads in call order:
+;;;   (dotnet:-> uri "Host" ("Substring" 0 7) "ToUpper")
+;;; instead of the inside-out
+;;;   (dotnet:invoke (dotnet:invoke (dotnet:invoke uri "Host") "Substring" 0 7) "ToUpper")
+;;; A step is a member name, or (member-name arg...) to pass arguments. Property and
+;;; field reads need no getter prefix — dotnet:invoke resolves those too — and the
+;;; whole chain is a place: (setf (dotnet:-> sb "Capacity") 64).
+;;;
+;;; dotnet:doto — apply several members to ONE object and return it:
+;;;   (dotnet:doto sb ("Append" "a") ("Append" "b"))
+;;;
+;;; Member names are strings because the Lisp reader upcases bare symbols while .NET
+;;; member names are case-sensitive; a symbol is accepted and contributes its name
+;;; verbatim, so |Host| works and HOST (from bare host) correctly does not.
+;;;
+;;; Registered at load time via find-package/intern, like dotnet:handler-bind above:
+;;; the SBCL cross-compile host has no DOTNET package.
+(defun %dotnet-member-name (x)
+  "Member designator in a dotnet chain step: a string verbatim, a symbol's name."
+  (cond ((stringp x) x)
+        ((symbolp x) (symbol-name x))
+        (t x)))
+
+(defun %dotnet-chain-step (invoke-sym target step)
+  "One chain step applied to TARGET: (INVOKE target \"Name\" arg...)."
+  (if (consp step)
+      (list* invoke-sym target (%dotnet-member-name (car step)) (cdr step))
+      (list invoke-sym target (%dotnet-member-name step))))
+
+(let ((pkg (find-package "DOTNET")))
+  (when pkg
+    (let ((chain (intern "->" pkg))
+          (doto (intern "DOTO" pkg))
+          (inv (find-symbol "INVOKE" pkg)))
+      (when inv
+        (export chain pkg)
+        (export doto pkg)
+        (setf (gethash chain *macros*)
+              (lambda (form)
+                (let ((expr (cadr form)))
+                  (dolist (step (cddr form) expr)
+                    (setf expr (%dotnet-chain-step inv expr step))))))
+        (setf (gethash doto *macros*)
+              (lambda (form)
+                (let ((obj (gensym "DOTO")))
+                  `(let ((,obj ,(cadr form)))
+                     ,@(mapcar (lambda (step) (%dotnet-chain-step inv obj step))
+                               (cddr form))
+                     ,obj))))))))

@@ -319,12 +319,16 @@
 ;;; with-simple-restart (macro → restart-case) works across await via the
 ;;; macroexpand fallback in %async-cps; invoking the restart yields (values nil t)
 ;;; but in single-value position the primary value nil is seen.
+;; WITH-SIMPLE-RESTART returns two values when its restart is invoked (NIL and T),
+;; and the async path now carries both — the same as the synchronous form. It used
+;; to deliver only NIL, which is what this test expected before multiple values
+;; survived an (async ...) block.
 (deftest i339-restart-with-simple-restart-invoke
   (dotnet:await (dotcl:async
                   (with-simple-restart (skip "skip it")
                     (dotcl:await (%a-fr 0))
                     (invoke-restart 'skip))))
-  nil)
+  nil t)
 
 (deftest i339-restart-with-simple-restart-normal
   (dotnet:await (dotcl:async
@@ -339,3 +343,45 @@
                   (let* ((x (dotcl:await (%a-fr 11))))
                     (when (> x 5) x))))
   11)
+
+;;; --- multiple values out of an (async ...) block ---
+;;; The block's value is delivered with MULTIPLE-VALUE-CALL to a &rest terminal
+;;; continuation and parked in the Task through the MV protocol, so a block whose
+;;; last form returns several values no longer decays to the primary one.
+
+(deftest async-mv-plain
+  (multiple-value-list (dotnet:await (dotcl:async (values 1 2 3))))
+  (1 2 3))
+
+(deftest async-mv-after-await
+  (multiple-value-list
+   (dotnet:await (dotcl:async (let* ((x (dotcl:await (%a-fr 5))))
+                                (values x (* x 10))))))
+  (5 50))
+
+(deftest async-mv-none
+  (multiple-value-list (dotnet:await (dotcl:async (values))))
+  ())
+
+;;; A single value stays a single value (no MvReturn wrapper leaks out).
+(deftest async-mv-single-unchanged
+  (multiple-value-list (dotnet:await (dotcl:async (let* ((x (dotcl:await (%a-fr 20)))) (+ x 1)))))
+  (21))
+
+;;; An awaited form binds ONE value, like an ordinary LET binding: the extra
+;;; values of the awaited block are dropped at the binder, not carried along.
+(deftest async-mv-binder-takes-primary
+  (dotnet:await (dotcl:async (let* ((x (dotcl:await (dotcl:async (values 7 8)))))
+                               (+ x 1))))
+  8)
+
+;;; Multiple values through handler-case's :no-error clause, which CL gives all
+;;; of the body's values.
+(deftest async-mv-no-error-clause
+  (multiple-value-list
+   (dotnet:await (dotcl:async
+                   (handler-case (let* ((x (dotcl:await (%a-fr 3))))
+                                   (values x (* x 2)))
+                     (error () :handled)
+                     (:no-error (a b) (values b a))))))
+  (6 3))

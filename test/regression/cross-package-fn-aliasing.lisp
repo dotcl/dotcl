@@ -86,10 +86,81 @@
       (sort (loop for v being the hash-values of ht collect v) #'<)))
   (1 2))
 
-(deftest cross-package-fn-aliasing.unqualified-call-still-bridges
+;;; Interning PKG::NAME must never graft another package's function onto the
+;;; fresh symbol. Startup.SymInPkg used to copy the Function slot from any
+;;; same-named symbol on first intern ("copy-on-intern" bridge), so loading a
+;;; .fasl whose package names a symbol that happens to exist elsewhere (e.g.
+;;; asdf/footer::emptyp) made the fresh symbol fbound to the foreign function:
+;;; DEFGENERIC then warned "being redefined as a generic function, but it was
+;;; previously defined as an ordinary function", and any funcall of that symbol
+;;; before its own definition ran would have reached the foreign one.
+(defun %xpa-fasl-collide-case ()
+  (let* ((tmp (format nil "~a/dotcl-xpafasl-~a"
+                      (or (dotcl:getenv "TEMP") "/tmp")
+                      (get-internal-real-time)))
+         (src (format nil "~a/src.lisp" tmp))
+         (warned nil))
+    (ensure-directories-exist (concatenate 'string tmp "/"))
+    (with-open-file (s src :direction :output :if-exists :supersede)
+      (format s "(defpackage #:xpafasl-pkg (:use :cl))~%")
+      (format s "(in-package #:xpafasl-pkg)~%")
+      (format s "(defclass xpafasl-box () ((n :initarg :n :accessor xpafasl-n)))~%")
+      (format s "(defgeneric xpafasl-collide (b)~%")
+      (format s "  (:method ((b xpafasl-box)) (zerop (xpafasl-n b))))~%")
+      ;; A call site is what dragged the symbol through SymInPkg first.
+      (format s "(defun xpafasl-user (b) (unless (xpafasl-collide b) :go))~%"))
+    (compile-file src)
+    ;; compile-file interned the names in XPAFASL-PKG; drop the package so the
+    ;; load re-interns them fresh, as it would in a separate session.
+    (delete-package (find-package "XPAFASL-PKG"))
+    ;; Same-named ordinary function in an unrelated package, bound BEFORE the load.
+    (eval (read-from-string "(defpackage #:xpafasl-other (:use :cl))"))
+    (eval (read-from-string "(defun xpafasl-other::xpafasl-collide (x) (declare (ignore x)) :other)"))
+    (handler-bind ((warning (lambda (c) (setf warned t) (muffle-warning c))))
+      (load (concatenate 'string (subseq src 0 (- (length src) 5)) ".fasl")))
+    (let ((own (find-symbol "XPAFASL-COLLIDE" "XPAFASL-PKG"))
+          (other (find-symbol "XPAFASL-COLLIDE" "XPAFASL-OTHER")))
+      (list warned
+            (typep (fdefinition own) 'generic-function)
+            ;; the foreign definition is untouched and still its own function
+            (funcall other nil)
+            (funcall own (make-instance (find-symbol "XPAFASL-BOX" "XPAFASL-PKG") :n 0))))))
+
+(deftest cross-package-fn-aliasing.fasl-intern-does-not-graft-foreign-function
+  (%xpa-fasl-collide-case)
+  (nil t :other t))
+
+;;; The unqualified-call bridge exists for one reason: the C# runtime registers
+;;; its helpers on CL / DOTCL-INTERNAL symbols, so Lisp code that reads such a
+;;; name in another package produces a different symbol object that still has to
+;;; reach the registered function. It bridges only from dotcl's own packages —
+;;; an arbitrary library's package answering would turn an undefined function
+;;; into a silent call of an unrelated same-named one.
+(deftest cross-package-fn-aliasing.unqualified-call-bridges-to-dotcl-packages
+  (let ((*package* (find-package :cl-user)))
+    ;; CLASS-PRECEDENCE-LIST is registered in DOTCL-INTERNAL, not CL.
+    (let ((cpl (funcall (compile nil '(lambda ()
+                                        (class-precedence-list (find-class 'symbol)))))))
+      (and (consp cpl) (member (find-class 't) cpl) t)))
+  t)
+
+;;; Same rule on the (funcall 'sym) path, and the hit is never cached on the
+;;; caller's symbol — a failed funcall must not leave the symbol FBOUNDP.
+(deftest cross-package-fn-aliasing.funcall-does-not-bridge-to-user-packages
+  (progn
+    (fmakunbound 'xpa-a:bar)
+    (fmakunbound 'xpa-b:bar)
+    (defun xpa-a:bar () :a)
+    (list (signals-error (funcall 'xpa-b:bar) undefined-function)
+          (fboundp 'xpa-b:bar)))
+  (t nil))
+
+(deftest cross-package-fn-aliasing.unqualified-call-does-not-bridge-to-user-packages
   (progn
     (fmakunbound 'xpa-ht:bridge-target)
     (defun xpa-ht:bridge-target () :bridged)
     (let ((*package* (find-package :cl-user)))
-      (funcall (compile nil '(lambda () (bridge-target))))))
-  :bridged)
+      (let ((fn (compile nil '(lambda () (bridge-target)))))
+        (list (funcall 'xpa-ht:bridge-target)
+              (signals-error (funcall fn) undefined-function)))))
+  (:bridged t))

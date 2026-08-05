@@ -1,0 +1,42 @@
+<Project>
+  <!--
+    DotCL.Sdk targets. Imported at the very bottom of the
+    consuming project. See Sdk.props for the overview.
+  -->
+
+  <!-- Inject the DotCL.Runtime PackageReference so the consumer never writes it.
+       This pulls ProjectCore.targets in transitively (buildTransitive/), which
+       drive the <DotclProjectAsd> compile. Added before the inner SDK's targets
+       so restore and the inner package-resolution logic both see it.
+
+       Skippable with <DisableImplicitDotCLRuntimeReference>true</...> for a
+       consumer that wants to pin the runtime itself (mirrors the framework's
+       DisableImplicitFrameworkReferences pattern). Without that flag, a consumer
+       must NOT also add <PackageReference DotCL.Runtime> — the SDK owns it. -->
+  <ItemGroup Condition="'$(DisableImplicitDotCLRuntimeReference)' != 'true'">
+    <PackageReference Include="DotCL.Runtime" Version="$(DotCLRuntimeVersion)" />
+  </ItemGroup>
+
+  <Import Project="Sdk.targets" Sdk="Microsoft.NET.Sdk" />
+
+  <!--
+    Public extension seam.
+
+    The ProjectCore pipeline hangs off internal _DotCL* targets (leading
+    underscore = private, no stability contract). DotclBuild is the public anchor
+    a consumer may hook without depending on those private names:
+
+        <Target Name="MyPostStep" AfterTargets="DotclBuild"> ... </Target>
+        <Target Name="MyPreStep"  BeforeTargets="DotclBuild"> ... </Target>
+
+    Contract: DotclBuild runs once per build, after the .asd has been compiled to
+    a fasl and the deployment manifest written (i.e. after _DotCLInjectAssets),
+    and only when <DotclProjectAsd> is set. It is intentionally empty — it exists
+    solely as a stable name to schedule around. The public *input* contract is
+    the non-underscore properties/items: DotclProjectAsd, DotclBaseCore, and the
+    DotclAsdSearchPath / DotclBuildInit item groups.
+  -->
+  <Target Name="DotclBuild"
+          AfterTargets="_DotCLInjectAssets"
+          Condition="'$(DotclProjectAsd)' != ''" />
+</Project>

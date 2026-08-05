@@ -160,6 +160,23 @@ jobs:
             -o out/ \
             -p:Version=${{ steps.version.outputs.VERSION }}
 
+      # ── Pack DotCL.Sdk (MSBuild SDK) + dotcl-app templates ───────────────
+      # The flagship developer experience: `dotnet new dotcl-app` (template) and
+      # `<Project Sdk="DotCL.Sdk">` (build/F5-debug). Both reference the runtime
+      # version stamped into Sdk.props / template.json by `make set-version`, kept
+      # in lockstep with this package version. They land in out/, so the Release
+      # upload and the nuget-publish push (both out/*.nupkg globs) pick them up.
+      - name: Pack DotCL.Sdk and dotcl-app templates
+        run: |
+          dotnet pack runtime/sdk/DotCL.Sdk.csproj \
+            --configuration Release \
+            -o out/ \
+            -p:Version=${{ steps.version.outputs.VERSION }}
+          dotnet pack templates/DotCL.Templates.csproj \
+            --configuration Release \
+            -o out/ \
+            -p:Version=${{ steps.version.outputs.VERSION }}
+
       # ── Guard: fail the release if the project-core task didn't get bundled ──
       - name: Verify project-core task is bundled
         run: |

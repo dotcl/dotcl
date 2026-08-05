@@ -576,6 +576,18 @@ public static partial class Runtime
                 var path = Path.GetFullPath(Path.Combine(dir, name, name + ext));
                 if (File.Exists(path))
                 {
+                    // The quicklisp client reads asdf: symbols (client.lisp,
+                    // dist.lisp, misc.lisp, setup.lisp). Loading its fasl with
+                    // asdf absent does not fail here — the references are
+                    // resolved lazily and the ASDF package is never even
+                    // created — so the breakage would surface much later as a
+                    // missing-package error inside quickload. Pull asdf in
+                    // first, the way upstream's bootstrap loads asdf.lisp ahead
+                    // of the client. The nested Require re-enters _modulesLock
+                    // on the same thread, which is fine (lock is reentrant).
+                    if (name == "quicklisp")
+                        Require(new LispObject[] { new LispString("asdf") });
+
                     Load(new LispObject[] { new LispString(path) });
                     if (name == "asdf")
                     {
@@ -1033,7 +1045,46 @@ public static partial class Runtime
 
         try
         {
-            var asm = System.Reflection.Assembly.Load(File.ReadAllBytes(Path.GetFullPath(filePath)));
+            // Load the fasl bytes into the default context. When a matching .pdb
+            // sits next to the fasl, hand it to the symbol-store overload so a
+            // debugger has symbols for this in-memory module directly: an
+            // assembly loaded from bytes carries no file Location, so the
+            // debugger cannot otherwise discover a co-located pdb. This is what
+            // makes a deployed dotcl app — whose fasl LoadFromManifest loads from
+            // bin/dotcl-fasl/ — break/step in its .lisp under a Debug build.
+            var faslFull = Path.GetFullPath(filePath);
+            var pdbPath = Path.ChangeExtension(faslFull, ".pdb");
+            System.Reflection.Assembly asm;
+            if (Environment.GetEnvironmentVariable("DOTCL_FASL_LOADFROM") == "1")
+            {
+                // Load by path so the module is file-backed. A coverage profiler
+                // picks its targets per loaded module and skips anything without a
+                // Location, so an assembly loaded from bytes is invisible to it —
+                // which is the whole reason this switch exists: with it set, an
+                // off-the-shelf .NET coverage collector reports line coverage
+                // against the .lisp itself, out of the PDB's document table.
+                //
+                // Not the default, because loading by path holds the file open and
+                // caches the assembly against that path: recompiling a fasl and
+                // LOADing it again in the same session would fail to write on
+                // Windows, and elsewhere would return the assembly already loaded.
+                // A coverage run does not do that — it is one process that compiles,
+                // loads, runs and exits — so the switch costs it nothing.
+                asm = System.Reflection.Assembly.LoadFrom(faslFull);
+            }
+            else
+            {
+                var faslBytes = File.ReadAllBytes(faslFull);
+                if (File.Exists(pdbPath))
+                {
+                    try { asm = System.Reflection.Assembly.Load(faslBytes, File.ReadAllBytes(pdbPath)); }
+                    catch { asm = System.Reflection.Assembly.Load(faslBytes); } // mismatched/locked pdb
+                }
+                else
+                {
+                    asm = System.Reflection.Assembly.Load(faslBytes);
+                }
+            }
             var moduleType = asm.GetType("CompiledModule")
                 ?? throw new Exception($"LOAD: .fasl has no CompiledModule type: {filePath}");
             var initMethod = moduleType.GetMethod("ModuleInit")
@@ -1190,6 +1241,40 @@ public static partial class Runtime
                new Cons(new LispString(loc.File),
                new Cons(Startup.Keyword("LINE"),
                new Cons(Fixnum.Make(loc.Line), Nil.Instance))));
+    }
+
+    /// <summary>
+    /// Identity-keyed map from a read form (a cons) to the source line where its
+    /// opening paren appeared. Populated by the Reader only while non-null, which
+    /// COMPILE-FILE arranges under DOTCL_EMIT_PDB so the compiler can attach
+    /// per-expression sequence points. Off (null) → the Reader does no work.
+    /// Thread-static: compile is single-threaded per file and this avoids sharing.
+    /// </summary>
+    [ThreadStatic] internal static Dictionary<object, (int sl, int sc, int el, int ec)>? SourceLineTable;
+
+    /// <summary>Record FORM's source span (start line/col .. end line/col) if line
+    /// tracking is active. Called by the Reader for each list it builds.</summary>
+    internal static void StampSourceLine(LispObject form, int sl, int sc, int el, int ec)
+    {
+        var t = SourceLineTable;
+        if (t != null) t[form] = (sl, sc, el, ec);
+    }
+
+    /// <summary>The function COMPILE-FILE installs in the compiler's
+    /// *EMIT-SOURCE-LINES* under DOTCL_EMIT_PDB: (fn form) → the form's source span
+    /// as a list (start-line start-col end-line end-col), or NIL. The compiler
+    /// funcalls it per form; NIL means "no source position" (e.g. a
+    /// macroexpansion-produced form), which correctly yields no sequence point.</summary>
+    public static LispObject FormLineLookup(LispObject[] args)
+    {
+        if (args.Length < 1) return Nil.Instance;
+        var t = SourceLineTable;
+        if (t != null && t.TryGetValue(args[0], out var span))
+            return new Cons(Fixnum.Make(span.sl),
+                   new Cons(Fixnum.Make(span.sc),
+                   new Cons(Fixnum.Make(span.el),
+                   new Cons(Fixnum.Make(span.ec), Nil.Instance))));
+        return Nil.Instance;
     }
 
     /// <summary>
@@ -1643,6 +1728,30 @@ public static partial class Runtime
     /// LispErrorException (a real condition) still propagates to handler-case.
     [ThreadStatic] internal static bool EmitBuildSourceLocations;
 
+    /// <summary>
+    /// When true, COMPILE-FILE emits a Portable PDB even without the
+    /// DOTCL_EMIT_PDB env var — set by CompileProject on a Debug build so a
+    /// dotcl project is source-debuggable without the caller exporting the var.
+    /// </summary>
+    [ThreadStatic] internal static bool BuildEmitPdb;
+
+    /// <summary>
+    /// PDB document override for a Debug project build. CompileProject compiles a
+    /// concatenated unit (&lt;out&gt;.concat.lisp); pointing the document at the
+    /// real source makes a single-source project break/step in its own .lisp
+    /// rather than the generated concat file. Null falls back to the input path.
+    /// Multi-source projects keep the concat unit until per-document mapping lands.
+    /// </summary>
+    [ThreadStatic] internal static string? BuildDebugSourceOverride;
+
+    /// <summary>
+    /// Per-source-file line map for a Debug project build over a concatenated unit
+    /// (one (startLine, path) per component). Non-null makes COMPILE-FILE emit a
+    /// multi-document PDB so each .lisp in a multi-file project is independently
+    /// debuggable. Null keeps the single-document path. Set by CompileProject.
+    /// </summary>
+    [ThreadStatic] internal static (int startLine, string path)[]? BuildDebugLineMap;
+
     public static LispObject CompileFile(LispObject[] args)
     {
 #if DOTCL_EMIT
@@ -1906,6 +2015,34 @@ public static partial class Runtime
 
             // FASL assembler (always — .fasl is the default output)
             var faslAsm = new DotCL.Emitter.FaslAssembler(faslModuleName);
+            // Opt-in Portable PDB emission: DOTCL_EMIT_PDB writes a sidecar
+            // .pdb mapping compiled forms to their source lines, so a debugger can
+            // break/step in the .lisp. Off by default; the normal emit path is
+            // unchanged. Turns on the Reader's source-line tracking and installs the
+            // line-lookup fn in the compiler's *EMIT-SOURCE-LINES* so COMPILE-EXPR
+            // emits (:line N) markers.
+            bool emitPdb = Environment.GetEnvironmentVariable("DOTCL_EMIT_PDB") != null
+                           || BuildEmitPdb;
+            Symbol? emitLinesSym = null;
+            LispObject? savedEmitLines = null;
+            if (emitPdb)
+            {
+                if (BuildDebugLineMap != null)
+                    faslAsm.EnableDebugInfoMap(BuildDebugLineMap);
+                else
+                    faslAsm.EnableDebugInfo(BuildDebugSourceOverride ?? Path.GetFullPath(inputPath));
+                SourceLineTable = new Dictionary<object, (int, int, int, int)>(ReferenceEqualityComparer.Instance);
+                // The compiled compiler reads *EMIT-SOURCE-LINES* via a bare-name
+                // (:LOAD-SYM ...) = Startup.Sym, so set the SAME symbol instance —
+                // SymInPkg("...","DOTCL.CIL-COMPILER") would be a different symbol
+                // (symbol-identity gotcha) and the compiler would never see it.
+                emitLinesSym = Startup.Sym("*EMIT-SOURCE-LINES*");
+                if (emitLinesSym != null)
+                {
+                    savedEmitLines = emitLinesSym.IsBound ? emitLinesSym.Value : null;
+                    emitLinesSym.Value = new LispFunction(FormLineLookup, "%FORM-LINE-LOOKUP", 1);
+                }
+            }
 
             try
             {
@@ -1921,7 +2058,7 @@ public static partial class Runtime
                 try
                 {
                 writer?.WriteLine(";; -*- dotcl-compiled -*-");
-                while (reader.TryRead(out var form))
+                while (DotCL.Diagnostics.PhaseTimer.Time("read", () => reader.TryRead(out var f) ? f : null) is { } form)
                 {
                     // Line where this top-level form began — used to attribute a
                     // compile error to the source location under a project build,
@@ -1936,25 +2073,35 @@ public static partial class Runtime
                             out bool hasCT, out bool hasLT))
                         {
                             var prognForm = MakeProgn(ewBody);
-                            var bodyInstrList = CompileTopLevel(prognForm);
+                            var bodyInstrList = DotCL.Diagnostics.PhaseTimer.Time(
+                                "compile", () => CompileTopLevel(prognForm));
 
                             if (hasCT)
-                                DotCL.Emitter.CilAssembler.AssembleAndRun(bodyInstrList);
+                                DotCL.Diagnostics.PhaseTimer.Time("eval-ct",
+                                    () => DotCL.Emitter.CilAssembler.AssembleAndRun(bodyInstrList));
 
                             if (hasLT)
                             {
                                 writer?.WriteLine(bodyInstrList.ToString());
-                                faslAsm.AddTopLevelForm(bodyInstrList);
+                                DotCL.Diagnostics.PhaseTimer.Time("fasl-add",
+                                    () => faslAsm.AddTopLevelForm(bodyInstrList, formLine));
                                 faslAsm.FlushInitForms();
                             }
                         }
                         else
                         {
-                            var instrList = CompileTopLevel(subForm);
+                            // Phase boundaries for DOTCL_PHASE_PROF (see PhaseTimer):
+                            // "compile" is the Lisp compiler, "eval-ct" is running a
+                            // form at compile time, "fasl-add" is the backend turning
+                            // the instruction list into IL.
+                            var instrList = DotCL.Diagnostics.PhaseTimer.Time(
+                                "compile", () => CompileTopLevel(subForm));
                             if (ShouldExecuteAtCompileTime(subForm))
-                                DotCL.Emitter.CilAssembler.AssembleAndRun(instrList);
+                                DotCL.Diagnostics.PhaseTimer.Time("eval-ct",
+                                    () => DotCL.Emitter.CilAssembler.AssembleAndRun(instrList));
                             writer?.WriteLine(instrList.ToString());
-                            faslAsm.AddTopLevelForm(instrList);
+                            DotCL.Diagnostics.PhaseTimer.Time("fasl-add",
+                                () => faslAsm.AddTopLevelForm(instrList, formLine));
                             faslAsm.FlushInitForms();
                         }
 
@@ -1980,13 +2127,19 @@ public static partial class Runtime
                 var corlibName = (corlibNameArg is LispString cln && cln.Value.Length > 0)
                     ? cln.Value
                     : null;
-                faslAsm.Save(outputPath, corlibName);
+                DotCL.Diagnostics.PhaseTimer.Time("fasl-save",
+                    () => faslAsm.Save(outputPath, corlibName));
                 }
                 finally { writer?.Dispose(); }
             }
             finally
             {
                 HandlerClusterStack.PopCluster();
+                if (emitPdb)
+                {
+                    SourceLineTable = null;
+                    if (emitLinesSym != null) emitLinesSym.Value = savedEmitLines ?? Nil.Instance;
+                }
             }
 
             // Return (values output-truename warnings-p failure-p)
@@ -3438,6 +3591,82 @@ public static partial class Runtime
     }
 
     /// <summary>
+    /// DOTCL:FRAME-LOCALS (&amp;optional (n 0)) — the lexical variables of backtrace
+    /// frame N (0 = innermost, same numbering as DOTCL:BACKTRACE) as an alist
+    /// (("NAME" . value) ...) in binding order. NIL when the frame recorded none:
+    /// its function was compiled with frame-locals mode off (the default), is
+    /// implemented in C#, or binds no user variables. To record locals, compile the
+    /// code with DOTCL:*EMIT-FRAME-LOCALS* true.
+    /// </summary>
+    public static LispObject FrameLocals(LispObject[] args)
+    {
+        int idx = 0;
+        if (args.Length >= 1 && args[0] is not Nil)
+        {
+            if (args[0] is not Fixnum f)
+                throw new LispErrorException(new LispTypeError(
+                    "FRAME-LOCALS: frame index must be a fixnum",
+                    args[0], Startup.Sym("FIXNUM")));
+            idx = (int)f.Value;
+        }
+        return DebugFrames.Locals(idx);
+    }
+
+    /// <summary>
+    /// DOTCL:FRAME-SPECIALS (&amp;optional (n 0)) — the dynamic (special-variable)
+    /// bindings in effect, innermost first, as ((SYMBOL value . own-p) ...).
+    /// OWN-P is true for the ones backtrace frame N or its callees established.
+    ///
+    /// Every binding is listed, including ones shadowed by an inner rebinding of
+    /// the same symbol — that is what a reader of nested LETs wants to see.
+    /// Unlike FRAME-LOCALS this needs no frame-locals mode: the binding stack is
+    /// always there, and N only decides where the OWN-P line falls.
+    /// </summary>
+    public static LispObject FrameSpecials(LispObject[] args)
+    {
+        int idx = 0;
+        if (args.Length >= 1 && args[0] is not Nil)
+        {
+            if (args[0] is not Fixnum f)
+                throw new LispErrorException(new LispTypeError(
+                    "FRAME-SPECIALS: frame index must be a fixnum",
+                    args[0], Startup.Sym("FIXNUM")));
+            idx = (int)f.Value;
+        }
+        return DebugFrames.Specials(idx);
+    }
+
+    /// <summary>
+    /// DOTCL:PRINT-FRAME-LOCALS (&amp;optional (n 0) stream) — print backtrace frame
+    /// N's lexical variables, one "NAME = value" line each, indented. Defaults to
+    /// *ERROR-OUTPUT*. Same rendering the debugger's :locals command uses.
+    /// </summary>
+    public static LispObject PrintFrameLocals(LispObject[] args)
+    {
+        int idx = 0;
+        if (args.Length >= 1 && args[0] is not Nil)
+        {
+            if (args[0] is not Fixnum f)
+                throw new LispErrorException(new LispTypeError(
+                    "PRINT-FRAME-LOCALS: frame index must be a fixnum",
+                    args[0], Startup.Sym("FIXNUM")));
+            idx = (int)f.Value;
+        }
+        LispObject streamArg = args.Length >= 2 ? args[1] : Nil.Instance;
+        if (streamArg is Nil)
+            streamArg = DynamicBindings.Get(Startup.Sym("*ERROR-OUTPUT*"));
+        var writer = GetTextWriter(streamArg);
+        var lines = DebugFrames.FormatLocals(idx);
+        if (lines.Length == 0)
+            writer.Write("  (no locals recorded for this frame)\n");
+        else
+            foreach (var line in lines)
+                writer.Write($"  {line}\n");
+        writer.Flush();
+        return Nil.Instance;
+    }
+
+    /// <summary>
     /// DOTCL:PRINT-BACKTRACE (&amp;optional stream) — print the current call stack
     /// as numbered frames. Defaults to *ERROR-OUTPUT* (cf. sb-debug:print-backtrace).
     /// </summary>
@@ -3965,6 +4194,42 @@ public static partial class Runtime
                     {
                         if (c.Car is Symbol sym)
                             sym.IsSpecial = true;
+                        rest = c.Cdr;
+                    }
+                }
+                else if (declKind.Name == "NOTINLINE" || declKind.Name == "INLINE")
+                {
+                    // CLHS 3.2.2.1.1: NOTINLINE in scope suppresses the
+                    // compiler macro, and a proclamation is in scope
+                    // everywhere. INLINE is the way back off.
+                    var notinline = declKind.Name == "NOTINLINE";
+                    var rest = declCons.Cdr;
+                    while (rest is Cons c)
+                    {
+                        if (c.Car is Symbol sym)
+                        {
+                            sym.IsNotinlineProclaimed = notinline;
+                            sym.IsInlineProclaimed = !notinline;
+                        }
+                        rest = c.Cdr;
+                    }
+                }
+                else if (declKind.Name == "DECLARATION")
+                {
+                    // CLHS TYPE: a symbol cannot name both a type and a
+                    // declaration. This is the "or vice versa" direction — the
+                    // type definers check the flag set here.
+                    var rest = declCons.Cdr;
+                    while (rest is Cons c)
+                    {
+                        if (c.Car is Symbol sym)
+                        {
+                            if (Runtime.NamesAType(sym))
+                                throw new LispErrorException(new LispProgramError(
+                                    $"PROCLAIM: {sym.Name} already names a type, "
+                                    + "so it cannot also name a declaration"));
+                            sym.IsDeclarationName = true;
+                        }
                         rest = c.Cdr;
                     }
                 }
@@ -4591,7 +4856,18 @@ public static partial class Runtime
         Startup.RegisterUnary("SLEEP", obj => {
             double secs = Arithmetic.ToDouble(Runtime.AsNumber(obj));
             if (secs < 0) throw new LispErrorException(new LispTypeError("SLEEP: negative argument", obj));
-            System.Threading.Thread.Sleep((int)(secs * 1000));
+            try
+            {
+                System.Threading.Thread.Sleep((int)(secs * 1000));
+            }
+            catch (System.Threading.ThreadInterruptedException)
+            {
+                // INTERRUPT-THREAD reached us. Run what it queued (which usually
+                // exits non-locally, e.g. a timeout) and cut the sleep short.
+                // Nothing queued means this was DESTROY-THREAD (or a stray
+                // interrupt): let it propagate and end the thread, as before.
+                if (!Runtime.RunPendingInterrupts()) throw;
+            }
             return Nil.Instance;
         });
         Emitter.CilAssembler.RegisterFunction("DECODE-UNIVERSAL-TIME", new LispFunction(args => {
@@ -4728,6 +5004,7 @@ public static partial class Runtime
                 // never hijacks CL:COMPLEX for everyone.
                 if (args[0] is Symbol s)
                 {
+                    Runtime.CheckTypeNameAvailable(s, "DEFTYPE");
                     Runtime.TypeExpanders[Runtime.TypeExpanderKey(s)] = args[1];
                     // Plain-name alias for cross-package references — but never
                     // for a built-in type name (that would hijack e.g. CL:COMPLEX

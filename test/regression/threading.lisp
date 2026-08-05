@@ -466,6 +466,23 @@
           (dotcl-thread:recursive-lock-p r)))
   (t t nil nil t))
 
+;; A bordeaux-threads backend types its SEMAPHORE and CONDITION-VARIABLE from
+;; these predicates, so each has to accept only its own object kind. Without
+;; SEMAPHORE-P the backend had to type semaphores as T, which made
+;; BT:SEMAPHORE-P answer true for locks and condition variables alike.
+(deftest i558-semaphore-p
+  (let ((s (dotcl:make-semaphore))
+        (l (dotcl:make-lock "l"))
+        (c (dotcl:make-condition-variable)))
+    (list (dotcl:semaphore-p s)
+          (dotcl:semaphore-p l)
+          (dotcl:semaphore-p c)
+          (dotcl:semaphore-p 5)
+          (dotcl:condition-variable-p c)
+          (dotcl:condition-variable-p s)
+          (dotcl:lockp s)))
+  (t nil nil nil t nil nil))
+
 (deftest i336-all-threads-lists-spawned
   (let* ((started (dotcl-thread:make-semaphore))
          (done (dotcl-thread:make-semaphore))

@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <!-- project-core: the build compiles the .asd's sources (app.lisp) into a
+         fasl and, in a Debug build, a matching PDB so you can F5-debug the Lisp. -->
+    <DotclProjectAsd>$(MSBuildProjectDirectory)/DotclApp.asd</DotclProjectAsd>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="DotCL.Runtime" Version="DOTCL_RUNTIME_VERSION" />
+  </ItemGroup>
+
+  <!-- app.lisp and the .asd are shown in Solution Explorer (the SDK's default
+       None glob includes them); they are not removed. -->
+
+</Project>

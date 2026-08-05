@@ -14,28 +14,43 @@ public sealed class ProcessStreamReader : System.IO.TextReader
     private bool _eof;
     private readonly object _lock = new();
 
+    private int _pending;
+
     public ProcessStreamReader(System.IO.TextReader inner, System.Diagnostics.Process proc)
+        : this(proc, inner) { }
+
+    /// <summary>Drain one or more child readers into a single shared buffer. Passing
+    /// both stdout and stderr merges them into one stream (uiop's
+    /// :error-output :output — send stderr to the same place as stdout). True EOF is
+    /// reported only once every producer has drained to end.</summary>
+    public ProcessStreamReader(System.Diagnostics.Process proc, params System.IO.TextReader[] inners)
     {
-        var drain = new System.Threading.Thread(() =>
+        _pending = inners.Length;
+        int i = 0;
+        foreach (var inner in inners)
         {
-            try
+            var src = inner;
+            var drain = new System.Threading.Thread(() =>
             {
-                var chunk = new char[4096];
-                int n;
-                while ((n = inner.Read(chunk, 0, chunk.Length)) > 0)
+                try
                 {
-                    lock (_lock) { _buf.Append(chunk, 0, n); System.Threading.Monitor.PulseAll(_lock); }
+                    var chunk = new char[4096];
+                    int n;
+                    while ((n = src.Read(chunk, 0, chunk.Length)) > 0)
+                    {
+                        lock (_lock) { _buf.Append(chunk, 0, n); System.Threading.Monitor.PulseAll(_lock); }
+                    }
                 }
-            }
-            catch { /* pipe closed/broken — treat as EOF */ }
-            finally
-            {
-                lock (_lock) { _eof = true; System.Threading.Monitor.PulseAll(_lock); }
-                try { inner.Dispose(); } catch { }
-            }
-        })
-        { IsBackground = true, Name = "dotcl-process-drain" };
-        drain.Start();
+                catch { /* pipe closed/broken — treat as EOF */ }
+                finally
+                {
+                    lock (_lock) { if (--_pending <= 0) _eof = true; System.Threading.Monitor.PulseAll(_lock); }
+                    try { src.Dispose(); } catch { }
+                }
+            })
+            { IsBackground = true, Name = "dotcl-process-drain-" + (i++) };
+            drain.Start();
+        }
     }
 
     public override int Read()
@@ -153,17 +168,22 @@ public sealed class LispProcess : LispObject
         LispObject input, LispObject output, LispObject error,
         LispObject ifInputDoesNotExist, LispObject ifOutputExists, LispObject ifErrorOutputExists)
     {
+        // uiop normalizes :error-output :output to the :output keyword: send the
+        // child's stderr to the same destination as its stdout (like shell 2>&1).
+        bool mergeErr = IsKw(error, "OUTPUT");
+        bool outInherit = IsInherit(output);
+
         if (FilePath(input) is string inPath0) EnsureInputExists(inPath0, ifInputDoesNotExist);
         if (FilePath(output) is string outPath0) CheckOutputExists(outPath0, ifOutputExists);
-        if (FilePath(error) is string errPath0) CheckOutputExists(errPath0, ifErrorOutputExists);
+        if (!mergeErr && FilePath(error) is string errPath0) CheckOutputExists(errPath0, ifErrorOutputExists);
 
         var psi = new System.Diagnostics.ProcessStartInfo(program)
         {
             UseShellExecute = false,
             CreateNoWindow = true,
             RedirectStandardInput = !IsInherit(input),
-            RedirectStandardOutput = !IsInherit(output),
-            RedirectStandardError = !IsInherit(error),
+            RedirectStandardOutput = !outInherit,
+            RedirectStandardError = mergeErr ? !outInherit : !IsInherit(error),
         };
         foreach (var a in arguments) Compat.AddArg(psi, a);
         if (!string.IsNullOrEmpty(directory)) psi.WorkingDirectory = directory;
@@ -183,12 +203,23 @@ public sealed class LispProcess : LispObject
         else if (!IsInherit(input))
             try { proc.StandardInput.Close(); } catch { }   // nil: child sees EOF
 
-        // --- stdout ---
-        outStream = WireOutput(output, ifOutputExists, "dotcl-drain-stdout",
-                               () => proc.StandardOutput, proc, helpers);
-        // --- stderr ---
-        errStream = WireOutput(error, ifErrorOutputExists, "dotcl-drain-stderr",
-                               () => proc.StandardError, proc, helpers);
+        if (mergeErr)
+        {
+            // stderr shares stdout's destination. When stdout is inherited, stderr is
+            // inherited too (neither redirected), so there is nothing to wire.
+            if (!outInherit)
+                outStream = WireMergedOutput(output, ifOutputExists, proc, helpers,
+                                             () => proc.StandardOutput, () => proc.StandardError);
+        }
+        else
+        {
+            // --- stdout ---
+            outStream = WireOutput(output, ifOutputExists, "dotcl-drain-stdout",
+                                   () => proc.StandardOutput, proc, helpers);
+            // --- stderr ---
+            errStream = WireOutput(error, ifErrorOutputExists, "dotcl-drain-stderr",
+                                   () => proc.StandardError, proc, helpers);
+        }
 
         return new LispProcess(proc, inStream, outStream, errStream, helpers);
     }
@@ -208,6 +239,45 @@ public sealed class LispProcess : LispObject
         else if (!IsInherit(spec))   // nil: drain & discard so a full pipe can't block the child
             helpers.Add(Spawn(threadName, () => Copy(source(), System.IO.TextWriter.Null)));
         return Nil.Instance;
+    }
+
+    /// <summary>Wire stdout AND stderr into a single destination (uiop's
+    /// :error-output :output). :stream yields one merged live stream; a file gets both
+    /// pipes appended under a lock; nil drains both to null. Caller guarantees the
+    /// destination (stdout spec) is redirected (not inherited).</summary>
+    private static LispObject WireMergedOutput(
+        LispObject spec, LispObject ifExists, System.Diagnostics.Process proc,
+        System.Collections.Generic.List<System.Threading.Thread> helpers,
+        System.Func<System.IO.TextReader> stdoutSrc, System.Func<System.IO.TextReader> stderrSrc)
+    {
+        if (IsKw(spec, "STREAM"))
+            return new LispInputStream(new ProcessStreamReader(proc, stdoutSrc(), stderrSrc()));
+        if (FilePath(spec) is string path)
+        {
+            var w = new System.IO.StreamWriter(path, append: IsKw(ifExists, "APPEND"));
+            var wlock = new object();
+            int pending = 2;
+            void addDrain(System.Func<System.IO.TextReader> src, string nm) =>
+                helpers.Add(Spawn(nm, () => {
+                    try { CopyLocked(src(), w, wlock); }
+                    finally { lock (wlock) { if (--pending == 0) { try { w.Dispose(); } catch { } } } }
+                }));
+            addDrain(stdoutSrc, "dotcl-drain-stdout");
+            addDrain(stderrSrc, "dotcl-drain-stderr-merged");
+            return Nil.Instance;
+        }
+        // nil: drain both & discard so a full pipe can't block the child
+        helpers.Add(Spawn("dotcl-drain-stdout", () => Copy(stdoutSrc(), System.IO.TextWriter.Null)));
+        helpers.Add(Spawn("dotcl-drain-stderr-merged", () => Copy(stderrSrc(), System.IO.TextWriter.Null)));
+        return Nil.Instance;
+    }
+
+    private static void CopyLocked(System.IO.TextReader r, System.IO.TextWriter w, object wlock)
+    {
+        var buf = new char[4096];
+        int n;
+        while ((n = r.Read(buf, 0, buf.Length)) > 0)
+            lock (wlock) { w.Write(buf, 0, n); w.Flush(); }
     }
 
     private static void EnsureInputExists(string path, LispObject ifDoesNotExist)

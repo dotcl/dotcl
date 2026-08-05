@@ -212,6 +212,15 @@ public static partial class Runtime
     public static LispObject MakeConditionPublic(LispObject typeSpec, LispObject[] initargs)
     {
         Symbol sym;
+        // A condition coerces to itself. Callers that funnel an already-built condition
+        // back through MAKE-CONDITION are common (SBCL's compiler does it while reporting
+        // an error it just caught). Rejecting it replaced the real condition — an
+        // UNDEFINED-FUNCTION naming the function that was actually missing — with an
+        // unrelated TYPE-ERROR about MAKE-CONDITION's own argument, so the diagnosis was
+        // destroyed at the point it mattered most. CLHS leaves a non-type-specifier
+        // argument undefined, which makes returning it permitted and strictly more useful.
+        // Any INITARGS are dropped: the condition already has its slots filled.
+        if (typeSpec is LispCondition existing) return existing;
         if (typeSpec is Symbol s) sym = s;
         else if (typeSpec is LispClass lc) sym = lc.Name;
         else if (typeSpec is Cons cl)
@@ -219,7 +228,10 @@ public static partial class Runtime
             // Handle compound type specifiers: (OR type1 type2 ...) or (AND type1 type2 ...)
             sym = ResolveCompoundConditionType(cl);
         }
-        else throw new LispErrorException(new LispTypeError("MAKE-CONDITION: type must be a symbol", typeSpec));
+        // Name what was actually passed. The old message said only "must be a symbol",
+        // which gave the reader nothing to go on when the argument was a live object.
+        else throw new LispErrorException(new LispTypeError(
+            $"MAKE-CONDITION: {typeSpec} is not a condition type specifier", typeSpec));
         return MakeConditionFromType(sym, initargs);
     }
 
@@ -491,10 +503,14 @@ public static partial class Runtime
         }
         if (args[0] is not LispString fmt)
             return ConditionSystem.Warn(new LispWarning(args[0].ToString() ?? ""));
-        string message;
-        try { message = ((LispString)Format(Nil.Instance, args)).Value; }
-        catch { message = fmt.Value; }
-        var warn = new LispWarning(message);
+        // Render on demand, not here: the arguments are the caller's objects and
+        // running the printer over them now would use the printer variables of the
+        // signalling site. A reporter that binds *PRINT-CIRCLE* (SBCL's compiler does)
+        // must be the one whose bindings apply, or a cyclic argument prints forever.
+        var warn = new LispWarning(() => {
+            try { return ((LispString)Format(Nil.Instance, args)).Value; }
+            catch { return fmt.Value; }
+        });
         warn.ConditionTypeName = "SIMPLE-WARNING";
         warn.FormatControl = fmt;
         warn.FormatArguments = Runtime.List(args.SubArray(1));

@@ -682,11 +682,17 @@ a LET-like macro, and a SETQ-like macro, which perform LOOP-style destructuring.
 	   (pify (l) (if (null (cdr l)) (car l) `(progn ,@l)))
 	   (makebody ()
 	     (let ((form `(tagbody
-			     ;; ANSI CL 6.1.7.2 says that initially clauses are
-			     ;; evaluated in the loop prologue, which precedes
-			     ;; all loop code except for the initial settings
-			     ;; provided by with, for, or as.
-			     ,@(psimp (append (nreverse rbefore) prologue))
+			     ;; ANSI CL 6.1.7.2 puts initially clauses in the loop
+			     ;; prologue, which precedes all loop iteration. The
+			     ;; initial settings of WITH / FOR / AS that precede it
+			     ;; are the LET bindings, which are outside this form
+			     ;; either way; what lands in BEFORE-LOOP is stepping
+			     ;; and termination code, and that runs after. Emitting
+			     ;; BEFORE-LOOP first ran a FOR clause's first
+			     ;; assignment, and a first termination test, ahead of
+			     ;; a textually-earlier :initially. SBCL emits the
+			     ;; prologue first (GEN-LOOP-BODY).
+			     ,@(psimp (append prologue (nreverse rbefore)))
 			 next-loop
 			    ,@(psimp (append main-body (nreconc rafter `((go next-loop)))))
 			 end-loop
@@ -1537,37 +1543,39 @@ collected result will be returned as the value of the LOOP."
   (cond ((loop-tequal (car *loop-source-code*) :then)
 	 ;;Then we are the same as "FOR x FIRST y THEN z".
 	 (loop-pop-source)
-	 `(() (,var ,(loop-get-form)) () ()
-	   () (,var ,val) () ()))
+	 (let ((then-form (loop-get-form)))
+	   ;; The FIRST form is PRE-LOOP-STEPS and the THEN form is STEPS, so both
+	   ;; assignments sit in the same per-clause lists as every other FOR. That
+	   ;; is what keeps successive FOR clauses sequential: ANSI CL 6.1.2.1 binds
+	   ;; them like LET*, and only AND makes them parallel, so a later clause's
+	   ;; init form has to see the value this clause just established.
+	   ;;
+	   ;; Pushing the first assignment onto *loop-prologue* instead placed it
+	   ;; after everything in *loop-before-loop*, since loop-body emits
+	   ;; "(append (nreverse rbefore) prologue)". A following FOR then read the
+	   ;; variable before it had been assigned and got NIL. That was done to stop
+	   ;; the first assignment from running ahead of a textually-earlier
+	   ;; :initially clause, but it is not needed: loop-body already moves these
+	   ;; forms into the body under a not-first-time flag, which puts them after
+	   ;; the prologue on its own. Both orderings match SBCL now.
+	   `(() (,var ,then-form) () ()
+	     () (,var ,val) () ())))
 	(t ;;We are the same as "FOR x = y".
-	 ;; Let me document here what this is returning.  Look at
-	 ;; loop-hack-iteration for more info.  But anyway, we return a list of
-	 ;; 8 items, in this order: PRE-STEP-TESTS, STEPS, POST-STEP-TESTS,
-	 ;; PSEUDO-STEPS, PRE-LOOP-PRE-STEP-TESTS, PRE-LOOP-STEPS,
-	 ;; PRE-LOOP-POST-STEP-TESTS, PRE-LOOP-PSEUDO-STEPS.  (We should add
-	 ;; something to make it easier to figure out what these args are!)
+	 ;; loop-hack-iteration consumes an 8-item list: PRE-STEP-TESTS, STEPS,
+	 ;; POST-STEP-TESTS, PSEUDO-STEPS, PRE-LOOP-PRE-STEP-TESTS, PRE-LOOP-STEPS,
+	 ;; PRE-LOOP-POST-STEP-TESTS, PRE-LOOP-PSEUDO-STEPS.
 	 ;;
-	 ;; For a "FOR x = y" clause without the THEN, we want the STEPS item to
-	 ;; step the variable VAR with the value VAL.  This gets placed in the
-	 ;; body of the loop.  The original code just did that.  It seems that
-	 ;; the STEPS form is placed in *loop-before-loop* and in
-	 ;; *loop-after-loop*.  Loop optimization would then see the same form
-	 ;; in both, and move them into the beginning of body.  This is ok,
-	 ;; except that if there are :initially forms that were placed into the
-	 ;; loop prologue, the :initially forms might refer to incorrectly
-	 ;; initialized variables, because the optimizer moved STEPS from from
-	 ;; *loop-before-loop* into the body.
-	 ;;
-	 ;; To solve this, we add a PRE-LOOP-PSEUDO-STEP form that is identical
-	 ;; to the STEPS form.  This gets placed in *loop-before-loop*.  But
-	 ;; this won't match any *loop-after-loop* form, so it won't get moved,
-	 ;; and we maintain the proper sequencing such that the
-	 ;; PRE-LOOP-PSEUDO-STEP form is in *loop-before-loop*, before any
-	 ;; :initially clauses that might refer to this.  So all is well. Whew.
-	 ;;
-	 ;; I hope this doesn't break anything else.
+	 ;; STEPS = PRE-LOOP-STEPS = (var val); both go through loop-make-psetq so
+	 ;; the *loop-before-loop* form matches the step form and loop-body merges
+	 ;; the first assignment into the start of the body — i.e. AFTER the loop
+	 ;; prologue, so an earlier :initially clause runs first, per ANSI CL
+	 ;; 6.1.7.2 (prologue clauses execute in source order). This matches SBCL.
+	 ;; A PRE-LOOP-PSEUDO-STEP (loop-make-desetq) here would not match the psetq
+	 ;; step form, would fail to merge, and would strand the assignment in the
+	 ;; prologue ahead of :initially (a real ordering bug, seen loading
+	 ;; named-readtables).
 	 `(() (,var ,val) () ()
-	   () () () (,var ,val))
+	   () (,var ,val) () ())
 	 )))
 
 
@@ -2423,8 +2431,12 @@ collected result will be returned as the value of the LOOP."
                  (nreverse ans)))
              (pify (l) (if (null (cdr l)) (car l) `(progn ,@l)))
              (makebody ()
+               ;; Prologue first — see the LOOP-BODY macro above, which this
+               ;; mirrors. Emitting BEFORE-LOOP first ran a FOR clause's first
+               ;; assignment, and a first termination test, ahead of a
+               ;; textually-earlier :initially.
                (let ((result `(tagbody
-                                ,@(psimp (append (nreverse rbefore) prologue))
+                                ,@(psimp (append prologue (nreverse rbefore)))
                               next-loop
                                 ,@(psimp (append main-body (nreconc rafter `((go next-loop)))))
                               end-loop

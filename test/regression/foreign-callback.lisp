@@ -92,3 +92,59 @@
   (let ((p (dotnet:make-ffi-callback (lambda (x) x) '(:int) :int)))
     (and (integerp p) (/= p 0)))
   t)
+
+;;; --- dotcl:*foreign-callback-propagate* (opt-in) ---
+;;; Containment keeps a .NET-driven loop alive, but a callback that Lisp itself
+;;; triggered (a lambda handed to a .NET API) is far easier to debug when the error
+;;; reaches the surrounding handler-case. Binding the variable to T asks for that.
+
+(deftest fcb-propagate-reaches-caller
+  (let ((dotcl:*foreign-callback-propagate* t))
+    (handler-case
+        (dotnet:invoke (dotnet:make-delegate "System.Func`2[System.Int32,System.Int32]"
+                                             (lambda (x) (declare (ignore x)) (error "boom")))
+                       "Invoke" 5)
+      (error (e) (princ-to-string e))))
+  "boom")
+
+;;; ...including through several .NET frames (LINQ drives the callback here).
+(deftest fcb-propagate-through-linq
+  (let ((dotcl:*foreign-callback-propagate* t)
+        (l (dotnet:new (dotnet:make-generic-type "System.Collections.Generic.List"
+                                                 (list "System.Int32")))))
+    (dotnet:invoke l "Add" 1)
+    (handler-case
+        (dotnet:invoke (dotnet:invoke l "Select" (lambda (x) (error "boom ~a" x))) "ToList")
+      (error (e) (princ-to-string e))))
+  "boom 1")
+
+;;; The switch is dynamic: outside the binding, containment is back.
+(deftest fcb-propagate-is-dynamic
+  (let ((fn (dotnet:make-delegate "System.Func`2[System.Int32,System.Int32]"
+                                  (lambda (x) (declare (ignore x)) (error "boom")))))
+    (list (let ((dotcl:*foreign-callback-propagate* t))
+            (handler-case (dotnet:invoke fn "Invoke" 5) (error () :propagated)))
+          (dotnet:invoke fn "Invoke" 5)))
+  (:propagated 0))
+
+;;; Successful callbacks are unaffected by the switch.
+(deftest fcb-propagate-success-unaffected
+  (let ((dotcl:*foreign-callback-propagate* t))
+    (dotnet:invoke (dotnet:make-delegate "System.Func`2[System.Int32,System.Int32]"
+                                         (lambda (x) (* x 2)))
+                   "Invoke" 21))
+  42)
+
+;;; Propagation wins over *foreign-callback-handler*: the error reaches the caller
+;;; instead of the handler deciding a result.
+(deftest fcb-propagate-beats-handler
+  (let ((called nil))
+    (let ((dotcl:*foreign-callback-propagate* t)
+          (dotcl:*foreign-callback-handler* (lambda (c) (declare (ignore c)) (setf called t) 99)))
+      (list (handler-case
+                (dotnet:invoke (dotnet:make-delegate "System.Func`2[System.Int32,System.Int32]"
+                                                     (lambda (x) (declare (ignore x)) (error "boom")))
+                               "Invoke" 5)
+              (error () :propagated))
+            called)))
+  (:propagated nil))

@@ -530,6 +530,10 @@ public static partial class Runtime
     {
         if (a is Nil) return b;
         if (a is not Cons ca) throw new LispErrorException(new LispTypeError("APPEND: not a list", a));
+        // Counted separately under DOTCL_ALLOC_PROF: APPEND copies its first
+        // argument, so "how much of the cons traffic is copying" is the question
+        // that tells a quadratic list build from an inherent one.
+        Diagnostics.AllocCounter.Inc("Cons/append-copy");
         return new Cons(ca.Car, Append(ca.Cdr, b));
     }
 
@@ -559,12 +563,17 @@ public static partial class Runtime
 
     // --- Symbol operations ---
 
+    // NIL and T are not Symbols in this object model, so they need their own
+    // shared name strings (see Symbol.NameString for why sharing is correct).
+    private static readonly LispString NilNameString = new LispString("NIL");
+    private static readonly LispString TNameString = new LispString("T");
+
     public static LispObject SymbolName(LispObject obj)
     {
         obj = Primary(obj);
-        if (obj is Symbol sym) return new LispString(sym.Name);
-        if (obj is Nil) return new LispString("NIL");
-        if (obj is T) return new LispString("T");
+        if (obj is Symbol sym) return sym.NameString;
+        if (obj is Nil) return NilNameString;
+        if (obj is T) return TNameString;
         throw new LispErrorException(new LispTypeError(
             $"SYMBOL-NAME: {obj} is not of type SYMBOL", obj, Startup.Sym("SYMBOL")));
     }
@@ -938,6 +947,7 @@ public static partial class Runtime
         if (seq is LispString ls)
         {
             int e = end >= 0 ? end : ls.Length;
+            CheckBoundingIndices(start, e, ls.Length, "FILL");
             char ch = item is LispChar lc ? lc.Value : throw new LispErrorException(new LispTypeError("FILL: not a character", item));
             Compat.Fill(ls.RawChars, ch, start, e - start);
             return seq;
@@ -945,12 +955,15 @@ public static partial class Runtime
         if (seq is LispVector v)
         {
             int e = end >= 0 ? end : v.Length;
+            CheckBoundingIndices(start, e, v.Length, "FILL");
             for (int i = start; i < e; i++) v[i] = item;
             return seq;
         }
         if (seq is Cons || seq is Nil)
         {
-            int e = end >= 0 ? end : Length(seq) is Fixnum fl ? (int)fl.Value : 0;
+            int listLen = Length(seq) is Fixnum fll ? (int)fll.Value : 0;
+            int e = end >= 0 ? end : listLen;
+            CheckBoundingIndices(start, e, listLen, "FILL");
             LispObject cur = seq;
             for (int i = 0; i < start && cur is Cons c1; i++) cur = c1.Cdr;
             for (int i = start; i < e && cur is Cons c2; i++) { c2.Car = item; cur = c2.Cdr; }
@@ -1002,6 +1015,8 @@ public static partial class Runtime
         int len2 = ReplaceSeqLength(source);
         int e1 = end1 >= 0 ? end1 : len1;
         int e2 = end2 >= 0 ? end2 : len2;
+        CheckBoundingIndices(start1, e1, len1, "REPLACE");
+        CheckBoundingIndices(start2, e2, len2, "REPLACE");
         int copyLen = Math.Min(e1 - start1, e2 - start2);
         if (copyLen <= 0) return target;
         // Fast path: string-to-string copy using direct char access

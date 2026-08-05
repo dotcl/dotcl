@@ -82,6 +82,35 @@ public static partial class Runtime
         return Nil.Instance;
     }
 
+    /// <summary>A DEFMETHOD parameter specializer designator → the class to specialize on.
+    /// Accepts everything FIND-CLASS does, plus .NET type designators: a type-name string,
+    /// an already-resolved System.Type (e.g. from dotnet:resolve-type or
+    /// dotnet:make-generic-type), and a symbol that names a .NET type with no CLOS class
+    /// registered yet. In those cases the class is registered on the spot
+    /// (EnsureDotNetTypeClass), so specializing on a .NET type no longer requires that an
+    /// instance of it has been seen first, and a FullName disambiguates same-simple-name
+    /// types. A name that is neither a known class nor a resolvable .NET type still fails
+    /// with FIND-CLASS's error.</summary>
+    public static LispObject SpecializerClass(LispObject spec)
+    {
+        switch (spec)
+        {
+            case LispClass c:
+                return c;
+            case LispDotNetObject dno when dno.Value is Type t:
+                return EnsureDotNetTypeClass(t);
+            case LispString s:
+                return TryResolveDotNetType(s.Value) is Type st
+                    ? EnsureDotNetTypeClass(st)
+                    : throw new LispErrorException(new LispError(
+                        $"DEFMETHOD: specializer \"{s.Value}\" names neither a class nor a resolvable .NET type"));
+        }
+        if (FindClassOrNil(spec) is LispClass known) return known;
+        if (spec is Symbol sym && TryResolveDotNetType(sym.Name) is Type nt)
+            return EnsureDotNetTypeClass(nt);
+        return FindClass(spec);   // signals the standard "no class named X"
+    }
+
     /// <summary>
     /// Find class or create a forward-referenced placeholder for DEFCLASS superclasses.
     /// </summary>
@@ -107,6 +136,10 @@ public static partial class Runtime
     {
         if (cls is not LispClass lc)
             throw new LispErrorException(new LispTypeError("REGISTER-CLASS: not a class", cls));
+        // CLHS TYPE: the class name must not already name a declaration. Every
+        // class-defining operator lands here — defclass, defstruct and
+        // define-condition all register a class.
+        CheckTypeNameAvailable(lc.Name, "DEFCLASS");
         // Prevent redefining built-in classes (CLHS 4.3.7)
         if (_classRegistry.TryGetValue(lc.Name, out var existing) && existing.IsBuiltIn)
             throw new LispErrorException(new LispError(
@@ -244,8 +277,57 @@ public static partial class Runtime
     }
 
     /// <summary>Register a .NET Type as a CLOS built-in class so that class-of/type-of/find-class work.</summary>
+    /// <summary>Order interfaces so that a derived interface precedes the ones it
+    /// extends (IList`1 before ICollection`1 before IEnumerable`1). Sorting by how many
+    /// interfaces each one itself implements gives that order, and is stable for
+    /// unrelated interfaces so the declaration order survives.</summary>
+    private static Type[] OrderInterfacesMostDerivedFirst(Type[] interfaces)
+    {
+        var ordered = (Type[])interfaces.Clone();
+        // OrderByDescending is a stable sort in LINQ, unlike Array.Sort.
+        return ordered.OrderByDescending(i => i.GetInterfaces().Length).ToArray();
+    }
+
+    /// <summary>Class precedence list for a .NET type's class: the type itself, then the
+    /// concrete chain, then interfaces (this type's first, then any the base chain
+    /// contributes), then the tail the base chain ended with (T). Keeping interfaces
+    /// behind every concrete class is what makes a method on a concrete .NET class win
+    /// over one on an interface it implements.</summary>
+    private static LispClass[] BuildDotNetCpl(LispClass cls, LispClass baseCls,
+                                              List<LispClass> ifaceClasses, LispClass? openCls)
+    {
+        var tCls = _classRegistry.TryGetValue(Startup.Sym("T"), out var t) ? t : null;
+        var concrete = new List<LispClass>();
+        var baseIfaces = new List<LispClass>();
+        var tail = new List<LispClass>();
+        foreach (var c in baseCls.ClassPrecedenceList)
+        {
+            if (tail.Count > 0 || ReferenceEquals(c, tCls)) tail.Add(c);
+            else if (c.IsDotNetInterface) baseIfaces.Add(c);
+            else concrete.Add(c);
+        }
+        var cpl = new List<LispClass> { cls };
+        // The open generic definition (List<T>) sits immediately behind its own closed
+        // instantiation, so a wildcard method on List<T> loses to one on List<Int32> but
+        // still beats anything inherited. Each level of a generic base chain keeps that
+        // pairing, because the base's own CPL already carries its open form.
+        if (openCls != null && !cpl.Contains(openCls)) cpl.Add(openCls);
+        foreach (var c in concrete) if (!cpl.Contains(c)) cpl.Add(c);
+        foreach (var c in ifaceClasses) if (!cpl.Contains(c)) cpl.Add(c);
+        foreach (var c in baseIfaces) if (!cpl.Contains(c)) cpl.Add(c);
+        foreach (var c in tail) if (!cpl.Contains(c)) cpl.Add(c);
+        return cpl.ToArray();
+    }
+
     public static LispClass EnsureDotNetTypeClass(Type type)
     {
+        // An open-constructed type (List<T>.GetInterfaces() yields IList<T> with the
+        // declaring type's own parameter) has no FullName and is not a type any object
+        // can be an instance of. Collapse it to its generic definition, which is the
+        // wildcard class users specialize on — otherwise it would register a second,
+        // nameless class under the same display name and warn about the collision.
+        if (type.IsConstructedGenericType && type.ContainsGenericParameters)
+            type = type.GetGenericTypeDefinition();
         if (_dotNetTypeRegistry.TryGetValue(type, out var existing)) return existing;
         // Prefer a readable display name for the class symbol (friendly, and what
         // unquoted Lisp symbols resolve to): the simple name for an ordinary type, a
@@ -289,10 +371,42 @@ public static partial class Runtime
         if (!simpleFree)
             WarnDisplayNameCollision(type, display);
 
-        var cls = new LispClass(classSym, Array.Empty<SlotDefinition>(), new[] { baseCls });
-        var cpl = new List<LispClass> { cls };
-        cpl.AddRange(baseCls.ClassPrecedenceList);
-        cls.ClassPrecedenceList = cpl.ToArray();
+        // Interfaces are superclasses too, so a method specialized on IEnumerable
+        // applies to every implementor. They rank below the whole concrete chain:
+        // the precedence list is concrete classes, then interfaces (most derived
+        // first), then the T tail — dotcl's T standing for the object/lisp tail.
+        var ifaceClasses = new List<LispClass>();
+        foreach (var itf in OrderInterfacesMostDerivedFirst(type.GetInterfaces()))
+        {
+            ifaceClasses.Add(EnsureDotNetTypeClass(itf));
+            // A closed generic interface is followed by its open definition, so
+            // (defmethod f ((x (dotnet:resolve-type "...IEnumerable`1")))) applies to
+            // every instantiation while a method on IEnumerable<Int32> still wins.
+            if (itf.IsConstructedGenericType)
+                ifaceClasses.Add(EnsureDotNetTypeClass(itf.GetGenericTypeDefinition()));
+        }
+
+        // Same for the type itself: List<Int32> gets List<T> as a wildcard superclass.
+        LispClass? openCls = type.IsConstructedGenericType
+            ? EnsureDotNetTypeClass(type.GetGenericTypeDefinition())
+            : null;
+
+        // Direct superclasses: the base class plus the interfaces this type introduces
+        // itself (the ones its base class does not already implement).
+        var inheritedIfaces = type.BaseType?.GetInterfaces() ?? Type.EmptyTypes;
+        var directSupers = new List<LispClass> { baseCls };
+        if (openCls != null) directSupers.Add(openCls);
+        foreach (var itf in OrderInterfacesMostDerivedFirst(type.GetInterfaces()))
+            if (Array.IndexOf(inheritedIfaces, itf) < 0)
+            {
+                var ic = EnsureDotNetTypeClass(itf);
+                if (!directSupers.Contains(ic)) directSupers.Add(ic);
+            }
+
+        var cls = new LispClass(classSym, Array.Empty<SlotDefinition>(), directSupers.ToArray());
+        cls.IsDotNetInterface = type.IsInterface;
+        cls.DotNetType = type;
+        cls.ClassPrecedenceList = BuildDotNetCpl(cls, baseCls, ifaceClasses, openCls);
         cls.EffectiveSlots = Array.Empty<SlotDefinition>();
         cls.IsBuiltIn = true;
         _dotNetTypeRegistry[type] = cls;
@@ -566,7 +680,7 @@ public static partial class Runtime
                 found = true;
             }
             if (found)
-                (slotd.ExtraSlots ??= new Dictionary<string, LispObject?>())[es.Name.Name] = value;
+                (slotd.EnsureExtraSlots())[es.Name.Name] = value;
         }
     }
 
@@ -933,13 +1047,13 @@ public static partial class Runtime
         }
         if (obj is SlotDefinition slotd)
         {
-            (slotd.ExtraSlots ??= new Dictionary<string, LispObject?>())[name] = value;
+            (slotd.EnsureExtraSlots())[name] = value;
             return value;
         }
         // Metaclass-added slot on a class metaobject.
         if (obj is LispClass klass && klass.Metaclass != null && klass.Metaclass.SlotIndex.ContainsKey(name))
         {
-            (klass.ExtraSlots ??= new Dictionary<string, LispObject?>())[name] = value;
+            (klass.EnsureExtraSlots())[name] = value;
             return value;
         }
         if (obj is LispCondition cond)
@@ -1021,6 +1135,41 @@ public static partial class Runtime
             }
         }
         return Emitter.CilAssembler.GetFunctionBySymbol(cell.Sym).Invoke(new LispObject[] { obj });
+    }
+
+    /// <summary>Item3c: the writer twin of <see cref="ReaderIC"/> — the compile-time-inlined
+    /// fast path for <c>(setf (accessor obj) newval)</c>, backed by a per-call-site
+    /// monomorphic inline cache. Arguments keep the (SETF name) generic function's own
+    /// order (new value first, object second) so the call site evaluates its argument forms
+    /// in exactly the order the normal call would. On a hit the slot is written straight
+    /// into the instance vector; a miss re-resolves the writer, and anything that is not a
+    /// plain instance-allocated simple writer (extended accessor, custom metaclass,
+    /// class-allocated slot, newval-specialized method) falls through to a normal 2-arg
+    /// invocation, so semantics are identical to calling the GF.</summary>
+    public static LispObject WriterIC(LispObject newval, LispObject obj, WriterCache cell)
+    {
+        if (obj is LispInstance inst)
+        {
+            var e = cell.E;
+            if (e != null && e.Epoch == GenericFunction.MethodEpoch
+                && ReferenceEquals(inst.Class, e.Cls))
+            {
+                inst.Slots[e.Idx] = newval;   // instance-allocated by construction of the entry
+                return newval;
+            }
+            if (Emitter.CilAssembler.GetSetfFunctionBySymbol(cell.Sym) is GenericFunction gf
+                && gf.SimpleWriterSlot is { } s && inst.Class.Metaclass == null
+                && inst.Class.SlotIndex.TryGetValue(s.Name, out int idx))
+            {
+                // Only instance-allocated slots are cacheable as a direct Slots[idx] write;
+                // :class-allocation lives on the owner class, so serve it without caching.
+                if (!inst.Class.EffectiveSlots[idx].IsClassAllocation)
+                    cell.E = new WriterCache.Entry(inst.Class, idx, GenericFunction.MethodEpoch);
+                return SetSlotValueDirect(inst, idx, s.Name, newval);
+            }
+        }
+        return Emitter.CilAssembler.GetSetfFunctionBySymbol(cell.Sym)
+                                   .Invoke(new LispObject[] { newval, obj });
     }
 
     public static LispObject SlotBoundp(LispObject obj, LispObject slotName)
@@ -1313,13 +1462,13 @@ public static partial class Runtime
                 bool fromInitarg = false;
                 for (int i = 2; i + 1 < args.Length; i += 2)
                     if (args[i] is Symbol k && Array.Exists(es.Initargs, ia => ia.Name == k.Name))
-                    { (klass.ExtraSlots ??= new Dictionary<string, LispObject?>())[sn] = args[i + 1]; fromInitarg = true; break; }
+                    { (klass.EnsureExtraSlots())[sn] = args[i + 1]; fromInitarg = true; break; }
                 if (fromInitarg) continue;
                 bool inNames = args[1] is T;
                 if (!inNames) for (var c = args[1]; c is Cons cc; c = cc.Cdr) if (cc.Car is Symbol s2 && s2.Name == sn) { inNames = true; break; }
                 bool bound = klass.ExtraSlots != null && klass.ExtraSlots.TryGetValue(sn, out var ev) && ev != null;
                 if (inNames && !bound && es.InitformThunk is { } thunk)
-                    (klass.ExtraSlots ??= new Dictionary<string, LispObject?>())[sn] = MultipleValues.Primary(thunk.Invoke(Array.Empty<LispObject>()));
+                    (klass.EnsureExtraSlots())[sn] = MultipleValues.Primary(thunk.Invoke(Array.Empty<LispObject>()));
             }
             return klass;
         }
@@ -2551,7 +2700,8 @@ public static partial class Runtime
                 if (spec is LispClass specCls)
                 {
                     if (specCls.Name.Name == "T") continue;
-                    if (argCls == null || Array.IndexOf(argCls.ClassPrecedenceList, specCls) < 0)
+                    if (argCls == null || (Array.IndexOf(argCls.ClassPrecedenceList, specCls) < 0
+                                           && !DotNetVarianceApplicable(specCls, argCls)))
                     { ok = false; break; }
                 }
                 else if (spec is Cons eqlc && eqlc.Car is Symbol es && es.Name == "EQL"
@@ -2597,11 +2747,16 @@ public static partial class Runtime
             {
                 var argClass = i < classes.Count ? classes[i] : null;
                 if (argClass != null)
-                    foreach (var c in argClass.ClassPrecedenceList)
+                {
+                    int ra = SpecializerRank(clsA, argClass);
+                    int rb = SpecializerRank(clsB, argClass);
+                    if (ra != rb) return ra < rb ? -1 : 1;
+                    if (ra != int.MaxValue)
                     {
-                        if (ReferenceEquals(c, clsA)) return -1;
-                        if (ReferenceEquals(c, clsB)) return 1;
+                        int v = CompareByDotNetAssignability(clsA, clsB);
+                        if (v != 0) return v;
                     }
+                }
                 return string.Compare(clsA.Name.Name, clsB.Name.Name, StringComparison.Ordinal);
             }
         }
@@ -3841,6 +3996,63 @@ public static partial class Runtime
         return Nil.Instance;
     }
 
+    /// <summary>Is SPECCLS applicable to an argument of ARGCLS through an assignability
+    /// the class precedence list does not carry? .NET generic variance is the case that
+    /// matters: List&lt;String&gt; implements IEnumerable&lt;String&gt;, and the covariant
+    /// IEnumerable&lt;out T&gt; makes that assignable to IEnumerable&lt;Object&gt; — but
+    /// enumerating it in the CPL would mean spelling out every instantiation over every
+    /// supertype of every type argument. Asking the CLR the question only for the
+    /// specializers a generic function actually has keeps it bounded.
+    ///
+    /// Only reached after the CPL check has already failed, and only when both sides are
+    /// .NET classes, so ordinary CLOS dispatch is untouched.</summary>
+    private static bool DotNetVarianceApplicable(LispClass specCls, LispClass? argCls)
+    {
+        var specType = specCls.DotNetType;
+        var argType = argCls?.DotNetType;
+        if (specType == null || argType == null) return false;
+        // An open generic definition (List<T>) is a wildcard, not a real type: its
+        // assignability is meaningless and the CPL already pairs it with each closed
+        // instantiation.
+        if (specType.ContainsGenericParameters || argType.ContainsGenericParameters) return false;
+        return specType.IsAssignableFrom(argType);
+    }
+
+    /// <summary>Position of SPEC in ARGCLS's class precedence list, doubled so a
+    /// variance-only match can be ranked between two CPL entries. A specializer the CPL
+    /// does not mention but .NET says the argument is assignable to ranks immediately
+    /// ahead of T: it is a genuine supertype, so it must beat the catch-all method, and
+    /// it loses to everything the CPL actually spells out. Unrelated specializers rank
+    /// last (int.MaxValue) and are left to the caller's name ordering.</summary>
+    private static int SpecializerRank(LispClass spec, LispClass argCls)
+    {
+        var cpl = argCls.ClassPrecedenceList;
+        int idx = Array.IndexOf(cpl, spec);
+        if (idx >= 0) return idx * 2;
+        if (!DotNetVarianceApplicable(spec, argCls)) return int.MaxValue;
+        int tIdx = cpl.Length;
+        for (int i = 0; i < cpl.Length; i++)
+            if (cpl[i].Name.Name == "T") { tIdx = i; break; }
+        return tIdx * 2 - 1;
+    }
+
+    /// <summary>Rank two .NET specializers neither of which the argument's CPL mentions
+    /// (both reached the method through variance): the one assignable to the other is
+    /// the more specific, e.g. IEnumerable&lt;String&gt; beats IEnumerable&lt;Object&gt;
+    /// for a List&lt;String&gt; argument. 0 when they are unrelated or not .NET classes,
+    /// leaving the caller's deterministic name ordering in charge.</summary>
+    private static int CompareByDotNetAssignability(LispClass clsA, LispClass clsB)
+    {
+        var a = clsA.DotNetType;
+        var b = clsB.DotNetType;
+        if (a == null || b == null || a == b) return 0;
+        bool aFromB = a.IsAssignableFrom(b);
+        bool bFromA = b.IsAssignableFrom(a);
+        if (aFromB && !bFromA) return 1;   // b is the narrower type
+        if (bFromA && !aFromB) return -1;  // a is the narrower type
+        return 0;
+    }
+
     private static bool IsMethodApplicable(LispMethod method, LispObject[] args)
     {
         for (int i = 0; i < method.Specializers.Length; i++)
@@ -3860,7 +4072,7 @@ public static partial class Runtime
                     bool found = false;
                     foreach (var c in argClass.ClassPrecedenceList)
                         if (ReferenceEquals(c, cls)) { found = true; break; }
-                    if (!found) return false;
+                    if (!found && !DotNetVarianceApplicable(cls, argClass)) return false;
                 }
                 else if (!IsTruthy(Typep(args[i], cls.Name)))
                     return false;
@@ -3906,10 +4118,15 @@ public static partial class Runtime
                 }
                 if (argClass != null)
                 {
-                    foreach (var c in argClass.ClassPrecedenceList)
+                    int ra = SpecializerRank(clsA, argClass);
+                    int rb = SpecializerRank(clsB, argClass);
+                    if (ra != rb) return ra < rb ? -1 : 1;
+                    // Same rank: both got here through .NET variance, which the CPL
+                    // cannot order.
+                    if (ra != int.MaxValue)
                     {
-                        if (ReferenceEquals(c, clsA)) return -1; // a is more specific
-                        if (ReferenceEquals(c, clsB)) return 1;  // b is more specific
+                        int v = CompareByDotNetAssignability(clsA, clsB);
+                        if (v != 0) return v;
                     }
                 }
                 // Fallback: compare by name (arbitrary but deterministic)
@@ -4368,7 +4585,7 @@ public static partial class Runtime
             // Metaclass-added slot on a class metaobject.
             if (obj0 is LispClass klass && klass.Metaclass != null)
             {
-                klass.ExtraSlots?.Remove(name);
+                klass.ExtraSlots?.TryRemove(name, out _);
                 return klass;
             }
             if (obj0 is LispCondition cond)
@@ -4574,14 +4791,32 @@ public static partial class Runtime
         // unaffected. defclass/defgeneric/defmethod macro-expand into calls to
         // these (DOTCL-INTERNAL package), so the interpreter must be able to
         // apply them. All map to existing Runtime methods — no new emit.
+        // A fixed-arity builtin also gets a typed direct delegate, so a call site of
+        // that arity reaches it through Invoke0..3 instead of InvokeSlow (which pushes
+        // a call-stack frame and re-checks the argument count). The wrapper still packs
+        // the small array the shared body expects; what is saved is the slow-path
+        // bookkeeping, and these run once per defclass / defmethod / slot access during
+        // compilation. RegisterUnary/RegisterBinary in Startup have done this all along;
+        // the CLOS builtins were the set that missed out.
         void RegClos(string name, System.Func<LispObject[], LispObject> fn, int arity = -1)
-            => Emitter.CilAssembler.RegisterFunction(name, new LispFunction(fn, name, arity));
+        {
+            var lispFn = new LispFunction(fn, name, arity);
+            switch (arity)
+            {
+                case 0: lispFn.SetDirectDelegate((Func<LispObject>)(() => fn(System.Array.Empty<LispObject>()))); break;
+                case 1: lispFn.SetDirectDelegate((Func<LispObject, LispObject>)(a => fn(new[] { a }))); break;
+                case 2: lispFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject>)((a, b) => fn(new[] { a, b }))); break;
+                case 3: lispFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject, LispObject>)((a, b, c) => fn(new[] { a, b, c }))); break;
+            }
+            Emitter.CilAssembler.RegisterFunction(name, lispFn);
+        }
         RegClos("%MAKE-CLASS", a => Runtime.MakeClass(a[0], a[1], a[2]), 3);
         RegClos("%REGISTER-CLASS", a => Runtime.RegisterClass(a[0]), 1);
         RegClos("%MAKE-SLOT-DEF", a => Runtime.MakeSlotDef(a[0], a[1], a[2]), 3);
         RegClos("%SLOT-DEF-RAW-OPTIONS", a => Runtime.SetSlotDefRawOptions(a[0], a[1]), 2);
         RegClos("%SET-CLASS-DEFAULT-INITARGS", a => Runtime.SetClassDefaultInitargs(a[0], a[1]), 2);
         RegClos("%FIND-CLASS-OR-NIL", a => Runtime.FindClassOrNil(a[0]), 1);
+        RegClos("%SPECIALIZER-CLASS", a => Runtime.SpecializerClass(a[0]), 1);
         RegClos("%SET-SLOT-VALUE", a => Runtime.SetSlotValue(a[0], a[1], a[2]), 3);
         RegClos("%ALLOCATE-INSTANCE", a => Runtime.MakeInstanceRaw(a[0]), 1);
         RegClos("%SLOT-EXISTS-P", a => Runtime.SlotExists(a[0], a[1]), 2);
@@ -4658,9 +4893,11 @@ public static partial class Runtime
             bool errorp = args.Length < 2 || Runtime.IsTruthy(args[1]);
             return errorp ? Runtime.FindClass(args[0]) : Runtime.FindClassOrNil(args[0]);
         }, "FIND-CLASS"));
-        Emitter.CilAssembler.RegisterFunction("%FIND-OR-FORWARD-CLASS",
-            new LispFunction(args => Runtime.FindOrForwardClass(args[0]),
-                "%FIND-OR-FORWARD-CLASS", 1));
+        var findOrForward = new LispFunction(args => Runtime.FindOrForwardClass(args[0]),
+                                             "%FIND-OR-FORWARD-CLASS", 1);
+        // Typed 1-arg entry: DEFCLASS resolves every superclass through this.
+        findOrForward.SetDirectDelegate((Func<LispObject, LispObject>)Runtime.FindOrForwardClass);
+        Emitter.CilAssembler.RegisterFunction("%FIND-OR-FORWARD-CLASS", findOrForward);
         Emitter.CilAssembler.RegisterFunction("(SETF FIND-CLASS)", new LispFunction(args => {
             if (args.Length < 2) throw new Exception("(SETF FIND-CLASS): too few arguments");
             var newVal = args[0];

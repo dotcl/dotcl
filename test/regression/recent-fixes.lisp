@@ -196,23 +196,79 @@
       (string= s1 s2)))
   t)
 
-;;; float bit access functions exported from CL package (nibbles)
-(deftest d613-single-float-bits-accessible
-  ;; cl:single-float-bits must be accessible
-  (not (null (find-symbol "SINGLE-FLOAT-BITS" "COMMON-LISP")))
+;;; float bit access functions live OUTSIDE the CL package.
+;;; They are non-standard, and CL is probed before the caller's own package, so a
+;;; CL entry shadows any same-named function elsewhere (it hijacked SBCL's
+;;; SB-KERNEL:SINGLE-FLOAT-BITS and broke make-host-1). They were put in CL on the
+;;; premise that nibbles calls them as CL symbols; it calls them unqualified and
+;;; gets its own portable NIBBLES:: definitions. Reachability is what matters, and
+;;; the DOTCL-INTERNAL bridge provides it — the round-trip tests below cover that.
+(deftest d613-single-float-bits-not-in-cl
+  (null (find-symbol "SINGLE-FLOAT-BITS" "COMMON-LISP"))
   t)
 
 (deftest d613-make-single-float-roundtrip
   (make-single-float (single-float-bits 1.5))
   1.5)
 
-(deftest d613-double-float-bits-accessible
-  (not (null (find-symbol "DOUBLE-FLOAT-BITS" "COMMON-LISP")))
+(deftest d613-double-float-bits-not-in-cl
+  (null (find-symbol "DOUBLE-FLOAT-BITS" "COMMON-LISP"))
   t)
 
 (deftest d613-make-double-float-roundtrip
   (make-double-float (double-float-bits 1.5d0))
   1.5d0)
+
+;;; MAKE-CONDITION given a condition returns it, rather than signalling about its own
+;;; argument. Code that reports an error it just caught hands the live condition back
+;;; through MAKE-CONDITION; rejecting it swapped the real condition for an unrelated
+;;; TYPE-ERROR and lost the diagnosis.
+(deftest d1825-make-condition-of-condition-is-identity
+  (let ((c (make-condition 'simple-error :format-control "boom")))
+    (eq (make-condition c) c))
+  t)
+
+(deftest d1825-make-condition-of-condition-keeps-type
+  (let ((c (make-condition 'undefined-function :name 'no-such-fn)))
+    (list (typep (make-condition c) 'undefined-function)
+          (cell-error-name (make-condition c))))
+  (t no-such-fn))
+
+;;; A genuinely bad type specifier still errors, and the message names what was passed.
+(deftest d1825-make-condition-of-non-type-still-errors
+  (handler-case (progn (make-condition 42) :no-error)
+    (error () :errored))
+  :errored)
+
+;;; An IN-PACKAGE earlier in a toplevel PROGN has to take effect before the REST of
+;;; that progn is COMPILED, because a later DEFSTRUCT builds its accessor names at
+;;; macroexpansion time and interns them in *PACKAGE*. A file gets this from the
+;;; loader, which splits a toplevel progn and compiles+runs each piece in turn; that
+;;; split does not reach inside MACROLET, and EVAL of a whole progn never gets it —
+;;; so both shapes interned the accessors in the wrong package. (SBCL puts them in
+;;; those two packages for both.) *PACKAGE* is rebound so the test cannot leak.
+(defpackage "CT-ORDER-PKG-A" (:use "CL"))
+(defpackage "CT-ORDER-PKG-B" (:use "CL"))
+
+(deftest d1827-eval-progn-in-package-orders-accessor-interning
+  (let ((*package* *package*))
+    (eval '(progn
+             (in-package "CT-ORDER-PKG-B")
+             (defstruct (ctord2 (:conc-name "CTORD2-")) fld)))
+    (let ((s (find-symbol "CTORD2-FLD" "CT-ORDER-PKG-B")))
+      (and s (package-name (symbol-package s)))))
+  "CT-ORDER-PKG-B")
+
+(deftest d1827-macrolet-progn-in-package-orders-accessor-interning
+  (let ((*package* *package*))
+    (eval '(macrolet ((d1827m ()
+                        `(progn
+                           (in-package "CT-ORDER-PKG-A")
+                           (defstruct (ctord1 (:conc-name "CTORD1-")) fld))))
+             (d1827m)))
+    (let ((s (find-symbol "CTORD1-FLD" "CT-ORDER-PKG-A")))
+      (and s (package-name (symbol-package s)))))
+  "CT-ORDER-PKG-A")
 
 ;;; subtypep circular deftype cycle detection
 (deftype d619-circular-type (&optional low high) `(d619-circular-type ,low ,high))
@@ -3008,8 +3064,8 @@
 ;; returned garbage, breaking cl-store's (error-dependent) non-finite float detection. Finite
 ;; values are unchanged.
 (deftest i397-decode-float-nonfinite-signals
-  (let ((nan (cl::make-double-float #x7ff8000000000000))
-        (inf (cl::make-double-float #x7ff0000000000000)))
+  (let ((nan (make-double-float #x7ff8000000000000))
+        (inf (make-double-float #x7ff0000000000000)))
     (flet ((fp (fn x) (handler-case (funcall fn x)
                         (floating-point-invalid-operation () :fpio)
                         (error (c) (type-of c)))))
@@ -4658,3 +4714,74 @@
     (setf (setf-rtc-shadow-test::readtable-case o) :preserve)
     (setf-rtc-shadow-test::readtable-case o))
   :preserve)
+
+;; WARN's MUFFLE-WARNING restart has to transfer control: CLHS says invoking it
+;; makes WARN return immediately, which unwinds the handler that invoked it.
+;; dotcl built that restart as a restart-bind style restart, so MUFFLE-WARNING
+;; called its function in place and returned; the invoking handler ran on, and
+;; HANDLER-BIND went to the next applicable clause. A handler-bind naming both
+;; STYLE-WARNING and WARNING — which is how SBCL's compiler separates "note it"
+;; from "this file failed" — therefore ran both, so every cross-compiled file
+;; printed its diagnostics twice and any file with a mere style warning was
+;; reported as a failure.
+(define-condition muffle-probe-style (style-warning) ()
+  (:report (lambda (c s) (declare (ignore c)) (write-string "probe" s))))
+;; *print-circle* has to see structure slots. The scan pass that marks shared and
+;; circular objects walked conses, uninterned symbols and vectors, but not the slots
+;; of structures or instances — though the printing pass already looked structures up
+;; in the same table. A cycle closing through a slot was therefore never marked, and
+;; the printer emitted the object afresh at every turn: unbounded output at full CPU
+;; instead of a #1= label. SBCL's compiler binds *print-circle* to T and PRINC-TO-STRINGs
+;; the condition when reporting, and its type objects hold each other, so cross-compiling
+;; wedged there.
+(defstruct pc-node kid)
+(deftest print-circle-follows-structure-slots
+  (let ((s (make-pc-node)))
+    (setf (pc-node-kid s) (list 1 s))
+    (let ((*print-circle* t)) (princ-to-string s)))
+  "#1=#S(PC-NODE :KID (1 #1#))")
+(deftest print-circle-labels-shared-structures
+  (let ((s (make-pc-node :kid (list 7))))
+    (let ((*print-circle* t)) (princ-to-string (list s s))))
+  "(#1=#S(PC-NODE :KID (7)) #1#)")
+
+;; ~A and ~S print an arbitrary object, so they are where *print-circle* has to be
+;; established. They went straight to the formatter's inner entry point, skipping the
+;; scan pass that marks shared objects, so a circular argument printed forever. This is
+;; how a condition report reaches the printer: SBCL's compiler reports its warnings with
+;; (format stream "... ~S ..." <type object>) under *print-circle* bound to T.
+(deftest format-tilde-s-honors-print-circle
+  (let ((s (make-pc-node)))
+    (setf (pc-node-kid s) (list 1 s))
+    (let ((*print-circle* t)) (format nil "~S" s)))
+  "#1=#S(PC-NODE :KID (1 #1#))")
+(deftest format-tilde-a-honors-print-circle
+  (let ((s (make-pc-node)))
+    (setf (pc-node-kid s) (list 1 s))
+    (let ((*print-circle* t)) (format nil "~A" s)))
+  "#1=#S(PC-NODE :KID (1 #1#))")
+
+;; A condition's report has to be rendered where it is asked for, not where the
+;; condition was signalled. WARN ran its format control over the caller's arguments
+;; immediately, so the printer saw the printer variables of the signalling site. The
+;; reporter is the one that knows how it wants the objects printed — SBCL's compiler
+;; binds *PRINT-CIRCLE* to T and PRINC-TO-STRINGs the condition, and rendering early
+;; meant a cyclic argument was printed with no circle detection at all.
+(deftest warn-report-renders-at-report-time
+  (block probe
+    (handler-bind ((warning (lambda (c)
+                              (let ((*print-circle* t))
+                                (return-from probe (princ-to-string c))))))
+      (let ((s (make-pc-node)))
+        (setf (pc-node-kid s) (list 1 s))
+        (warn "cyclic: ~S" s))
+      :no-handler))
+  "cyclic: #1=#S(PC-NODE :KID (1 #1#))")
+
+(deftest muffle-warning-unwinds-the-handler
+  (let ((log nil))
+    (handler-bind ((style-warning (lambda (c) (push :style log) (muffle-warning c)))
+                   (warning (lambda (c) (declare (ignore c)) (push :warning log))))
+      (warn 'muffle-probe-style))
+    (reverse log))
+  (:style))

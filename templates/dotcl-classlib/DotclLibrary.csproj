@@ -1,0 +1,42 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <!-- project-core: the build compiles the .asd's sources (library.lisp) into
+         DotclLibrary.fasl and, in a Debug build, a matching PDB, so a consuming
+         app can F5-debug into the Lisp. The fasl and its manifest are copied to
+         the output directory, and from there to the output of any project that
+         references this one. -->
+    <DotclProjectAsd>$(MSBuildProjectDirectory)/DotclLibrary.asd</DotclProjectAsd>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="DotCL.Runtime" Version="DOTCL_RUNTIME_VERSION" />
+  </ItemGroup>
+
+  <!-- `dotnet pack` on this project ships the compiled Lisp alongside the
+       assembly, so a consumer can reference it as a NuGet package and not only
+       as a project. build/DotclLibrary.targets (imported automatically by
+       NuGet) copies those files into the consumer's output. Delete this section
+       if the library is only ever consumed by ProjectReference. -->
+  <PropertyGroup>
+    <TargetsForTfmSpecificContentInPackage>$(TargetsForTfmSpecificContentInPackage);DotclPackFasl</TargetsForTfmSpecificContentInPackage>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="build\DotclLibrary.targets" Pack="true" PackagePath="build\" />
+  </ItemGroup>
+
+  <Target Name="DotclPackFasl">
+    <ItemGroup>
+      <!-- The fasls and this project's manifest; dotcl.core is not matched (and
+           not wanted — it comes from DotCL.Runtime). -->
+      <TfmSpecificPackageFile Include="$(IntermediateOutputPath)dotcl-fasl\*.fasl;$(IntermediateOutputPath)dotcl-fasl\$(MSBuildProjectName).deps.txt">
+        <PackagePath>build/dotcl-fasl/</PackagePath>
+      </TfmSpecificPackageFile>
+    </ItemGroup>
+  </Target>
+
+</Project>

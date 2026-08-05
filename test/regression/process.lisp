@@ -56,3 +56,15 @@
                (dotcl:process-wait p)))))
     (loop repeat 5 always (equal (sort3) '("apple" "banana" "cherry"))))
   t)
+
+;;; error :output (uiop's :error-output :output — merge stderr into stdout).
+;;; Portable check: stdout is still delivered through the single merged stream.
+;;; (Full stderr-into-stdout merge verified manually with a dual-output child;
+;;; a portable dual-output child is fragile across Windows/Linux CI.)
+(deftest error-output-merge-preserves-stdout
+  (let* ((p (dotcl:launch-process "dotnet" '("--version")
+                                  :output :stream :error :output))
+         (line (read-line (dotcl:process-output p) nil ""))
+         (code (dotcl:process-wait p)))
+    (list (eql code 0) (> (length line) 0)))
+  (t t))

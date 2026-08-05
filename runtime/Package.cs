@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Concurrent;
 using System.Linq;
 
@@ -14,6 +15,16 @@ public enum SymbolStatus
 public class Package : LispObject
 {
     public string Name { get; private set; }
+
+    /// <summary>
+    /// The LISP string PACKAGE-NAME answers with. Shared per package for the
+    /// same reason as Symbol.NameString: the compiler asks on every local
+    /// lookup (SAME-VAR-PACKAGE-P compares package names), so a fresh string
+    /// per call is millions of allocations in one COMPILE-FILE. Cleared by
+    /// Rename, the only thing that changes a package name.
+    /// </summary>
+    private LispString? _nameString;
+    public LispString NameString => _nameString ??= new LispString(Name);
     // ConcurrentDictionary prevents enumeration-during-mutation crashes when
     // multiple threads intern/export/unintern concurrently. Multi-step
     // operations (e.g. Intern, Export) wrap with `lock (this)` for atomicity.
@@ -44,6 +55,26 @@ public class Package : LispObject
     }
 
     public static IEnumerable<Package> AllPackages => _allPackages.Values.Distinct();
+
+    /// <summary>
+    /// May a same-named symbol in this package be adopted by one of the
+    /// name-based cross-package bridges (Startup.Sym / Startup.SymFn /
+    /// CilAssembler.FindFunctionAcrossPackages)?
+    ///
+    /// The bridges exist for one reason: the C# runtime registers its helpers on
+    /// CL or DOTCL-INTERNAL symbols, so Lisp code reading those names in one of
+    /// dotcl's own packages produces a DIFFERENT symbol object that must still
+    /// reach the registered function (dotcl-thread's %make-thread is the case
+    /// this was built for). They
+    /// are not a general "same name means same function" rule — letting an
+    /// arbitrary library's package answer turns an undefined function into a
+    /// silent call of an unrelated one (uiop:emptyp for a user's EMPTYP).
+    /// So only dotcl's own namespace may serve as a bridge source.
+    /// </summary>
+    public bool IsBridgeSource =>
+        Name == "COMMON-LISP" || Name == "DOTCL" || Name == "DOTNET"
+        || Name.StartsWith("DOTCL-", StringComparison.Ordinal)
+        || Name.StartsWith("DOTCL.", StringComparison.Ordinal);
 
     public (Symbol symbol, SymbolStatus status) FindSymbol(string name)
     {
@@ -356,6 +387,7 @@ public class Package : LispObject
                 _allPackages.TryRemove(n, out _);
             _nicknames.Clear();
             Name = newName;
+            _nameString = null;   // PACKAGE-NAME must answer with the new name
             _allPackages[newName] = this;
             if (newNicknames != null)
                 foreach (var n in newNicknames)

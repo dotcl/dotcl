@@ -3,6 +3,162 @@
 User-facing release notes for dotcl. Each section corresponds to a tagged
 release on the public mirror (dotcl/dotcl).
 
+## v0.1.22 -- 2026-08-01
+
+Quicklisp works out of the box, .NET interop reads the way you would write it
+by hand, the debugger shows locals in every frame, and the function-call path
+got roughly twice as fast. Also: CPU profiles and line coverage of Lisp code
+now come from the standard .NET tools, unmodified.
+
+### Quicklisp out of the box
+
+- `(require "quicklisp")` loads a bundled client; `(ql:setup)` fetches over
+  HTTPS and installs the dotcl overlay dist automatically, so
+  `(ql:quickload :alexandria)` works on a fresh install with no manual
+  bootstrap.
+
+### Calling .NET (and .NET calling back)
+
+- New call-chain syntax: `(dotcl:-> obj (Method a) Property ...)` reads in
+  call order, and `doto` threads an object through several member calls.
+  Lisp scalars work directly as receivers. The full surface is documented in
+  `docs/dotnet-package.md`.
+- CLOS now dispatches over .NET types: `defmethod` accepts .NET type
+  specializers, interfaces participate in dispatch with a consistent
+  precedence order, and generic variance is honored. Generic .NET types can
+  be composed from Lisp.
+- Callbacks passed to .NET propagate Lisp non-local exits correctly, and
+  callback errors can be re-raised on the calling side.
+- Class libraries: `dotnet new dotcl-classlib` scaffolds a Lisp library that
+  a C# project can reference; a host API accepts .NET collections where Lisp
+  sequences are expected.
+
+### Debugging: locals in every frame
+
+- The built-in debugger walks frames and shows their locals — including
+  variables in boxed cells, natively-stored (unboxed) locals, and dynamic
+  (special) variables. The same view is wired into SLIME's debugger, with
+  eval-in-frame.
+
+### Faster calls, smaller loads
+
+- Function calls resolve their callee through a per-call-site cache
+  (compiled and loaded code alike), and `(declaim (inline f))` now actually
+  inline-expands small functions at call sites. The fixed cost of a simple
+  call dropped from ~171ns to ~57ns; call-heavy benchmarks run up to 2x
+  faster.
+- Declared `decimal` locals and integer locals with statically proven ranges
+  use raw native slots, extending the unboxed-arithmetic paths.
+- The precompiled core loads in file-sized segments: peak memory while
+  loading dropped by about 40%, and warm startup improved measurably.
+
+### Profiling and coverage with stock .NET tools
+
+- dotcl compiles Lisp functions to real .NET methods under their Lisp names,
+  so `dotnet-trace` CPU profiles show your functions directly — no dotcl-side
+  setup. See `docs/profiling.md`.
+- Line coverage of `.lisp` sources works with the standard .NET coverage
+  tools via the emitted PDBs. See `docs/coverage.md`.
+
+### Correctness
+
+- Sequence and string functions validate `:start`/`:end` bounding indexes.
+- `stable-sort` is now actually stable; `format ~E` no longer double-rounds.
+- Compiled files no longer resolve a call to an undefined global against a
+  same-named function in another package.
+- Native-representation locals shadowed by a same-named inner binding no
+  longer corrupt the outer slot.
+- `bordeaux-threads:interrupt-thread` gained a first tier: threads blocked in
+  waits (locks, sleeps, joins) can be interrupted; `destroy-thread` ends the
+  thread quietly.
+- `file-position` now works through Gray stream bridges — thanks to
+  Bohong Huang for the fix.
+
+## v0.1.21 -- 2026-07-25
+
+Compile Common Lisp definitions into a .NET assembly that C# can reference at
+compile time (experimental), and run more of UIOP/ASDF unmodified: environment
+writes, working-directory changes, hostname, and merged process output. Also
+cuts the memory needed to load very large compiled files.
+
+### Compiling Lisp into a C#-referenceable library (experimental)
+
+- A new emit path turns dotcl definitions into a .NET DLL that a C# project can
+  reference at compile time. Enums, structs, constants, delegates, interfaces,
+  and exception types are exported as their C# equivalents; `defun`s become
+  public static methods; several types can be collected into a single assembly;
+  and docstrings are carried through as XML doc comments. This is experimental --
+  the surface and conventions may still change.
+
+### UIOP / ASDF portability
+
+- Environment variables can now be written: `(setf (uiop:getenv "X") "...")`,
+  and removed by setting the value to `nil`.
+- `uiop:chdir` / `uiop:with-current-directory`, `uiop:hostname`, and
+  `uiop:delete-empty-directory` are implemented.
+- `run-program` accepts `:error-output :output`, sending a child's stderr to the
+  same destination as its stdout.
+
+### Loading large compiled files
+
+- Long list and vector literals, and deeply nested literals, are split across
+  several methods, so very large compiled files load with far less memory --
+  files that previously needed multiple gigabytes now load in a fraction of that.
+
+### Packaging
+
+- `dotcl pack` copies `.asd` metadata (author, license, description) into the
+  generated NuGet nuspec.
+- Distributed packages no longer ship `.pdb` files, and stop packing the same
+  content more than once.
+
+### Correctness
+
+- `loop` runs `:initially` clauses before `for x = form` variable
+  initialization, matching SBCL's order.
+- Fixed a compiler internal-table corruption that could occur when compiling in
+  parallel.
+
+## v0.1.20 -- 2026-07-24
+
+Makes Common Lisp a first-class Visual Studio project: scaffold with
+`dotnet new dotcl-app`, build through an MSBuild SDK, and F5-debug the `.lisp`
+source. Also hardens cross-package symbol resolution and guards `dotcl pack`
+against a silent misconfiguration.
+
+### Visual Studio debugging
+
+- `dotnet new dotcl-app` scaffolds a Common Lisp console app as an ordinary
+  MSBuild project that references the `DotCL.Runtime` package and compiles the
+  Lisp into the build output. You can run it and, in Visual Studio, debug it with
+  F5. A `DotCL.Sdk` MSBuild SDK is also published as a more concise way to write
+  the same project (`<Project Sdk="DotCL.Sdk">`).
+- A Debug build emits Portable PDBs beside the compiled Lisp, so you can set
+  breakpoints in `.lisp`, step through it expression by expression, and inspect
+  variables in the Locals window -- parameters, `let` / `let*` bindings, and
+  variables a lambda closes over, each shown by name with its printed value.
+  Several `.lisp` files in one project each debug against their own source.
+
+### Cross-package symbol resolution
+
+- An unqualified call to a function whose printed name is also interned in another
+  package (for example COMMON-LISP's backquote markers) no longer resolves to the
+  wrong symbol: a package's own `fbound` function wins over a same-named symbol
+  that merely exists elsewhere. This unblocks loading libraries such as ironclad.
+  Thanks to Bohong Huang for the reports and fixes.
+
+### `dotcl pack`
+
+- `dotcl pack --from <dir>` now fails loudly when the payload runtime is too old
+  to load a loose user FASL, instead of silently building a tool that drops into a
+  REPL rather than running your program.
+
+### Build
+
+- Release builds pick the crossgen2 and runtime-reference packages by highest
+  installed version rather than lexicographic order, so a machine with several
+  .NET bands installed always uses the newest.
+
 ## v0.1.19 -- 2026-07-20
 
 Adds `dotcl pack` for shipping a Lisp system as a .NET tool, broadens Gray

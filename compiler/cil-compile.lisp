@@ -96,6 +96,24 @@
                (setf start (1+ i))))
     (nreverse result)))
 
+(defparameter *default-segment-forms* 32
+  "Number of top-level forms per emitted segment (one loader method each).
+   Empirical plateau: with the six core sources, peak working set while loading
+   dotcl.core is 68 MB at one segment per file, 59 MB at 8-64 forms per segment,
+   and 68 MB again at one form per segment (per-segment overhead takes over).
+   Override with DOTCL_SEG_FORMS to re-run that sweep; 0 means one per file.")
+
+(defun chunk-list (list n)
+  "Split LIST into consecutive chunks of at most N elements."
+  (let ((out '()) (cur '()) (k 0))
+    (dolist (x list)
+      (push x cur)
+      (when (>= (incf k) n)
+        (push (nreverse cur) out)
+        (setf cur '() k 0)))
+    (when cur (push (nreverse cur) out))
+    (nreverse out)))
+
 (defun portable-getenv (name)
   #+dotcl (dotcl:getenv name)
   #-dotcl (uiop:getenv name))
@@ -116,25 +134,46 @@
     (portable-quit 1))
   (let* ((input-files (split-spaces inputs-env))
          (output-file output-env)
-         (forms '()))
-    (dolist (input-file input-files)
-      (setf forms (append forms (read-all-forms input-file))))
-    (setf forms (mapcar #'preprocess-sbcl-quasiquotes forms))
+         ;; One entry per input file, in order. Every file is READ before any is
+         ;; compiled, exactly as when the whole core was one form: reading evals
+         ;; defpackage / in-package / eval-when, and moving those evals after an
+         ;; earlier file's compilation would change what they see.
+         (groups (mapcar (lambda (f)
+                           (mapcar #'preprocess-sbcl-quasiquotes (read-all-forms f)))
+                         input-files)))
     ;; If we're building a SIL that includes cil-stdlib.lisp (i.e. the canonical
     ;; cross-compile of the dotcl core), append a runtime form that locks the
     ;; CL package after stdlib load completes. The form is built
     ;; with intern/find-package so it doesn't reference the DOTCL package at
     ;; read time on the SBCL host.
     (when (some (lambda (p) (search "cil-stdlib" (namestring p))) input-files)
-      (setf forms (append forms
-                          '((funcall (symbol-function
-                                       (intern "LOCK-PACKAGE" (find-package "DOTCL")))
-                                     "COMMON-LISP")))))
+      (setf groups (append groups
+                           '(((funcall (symbol-function
+                                         (intern "LOCK-PACKAGE" (find-package "DOTCL")))
+                                       "COMMON-LISP"))))))
     (setf *cross-compiling* t)
-    (let* ((expr (if (= (length forms) 1)
-                     (first forms)
-                     `(progn ,@forms)))
-           (instrs (compile-toplevel expr)))
+    ;; Compile the core in bounded units and join the instruction lists with
+    ;; (:TOPLEVEL-BOUNDARY). Loaders split there and run each segment as its own
+    ;; method, so the core's top-level code is many small methods instead of one
+    ;; method for the whole core: each segment's forms are top-level forms (not
+    ;; forms nested in one giant PROGN), locals/labels stay segment-scoped, and
+    ;; the peak cost of assembling or JITting the toplevel is per segment.
+    ;; Segments never span files, so file order and per-file scoping hold.
+    ;; Loading order is unchanged — the segments run in sequence.
+    (let* ((chunk (let ((s (portable-getenv "DOTCL_SEG_FORMS")))
+                    (if (and s (> (length s) 0))
+                        (parse-integer s)
+                        *default-segment-forms*)))
+           (instrs (let ((out '()) (first t))
+                     (dolist (forms groups (apply #'append (nreverse out)))
+                       (dolist (part (if (plusp chunk) (chunk-list forms chunk) (list forms)))
+                         (when part
+                           (let ((seg (compile-toplevel
+                                       (if (= (length part) 1)
+                                           (first part)
+                                           `(progn ,@part)))))
+                             (push (if first seg (cons '(:toplevel-boundary) seg)) out)
+                             (setf first nil))))))))
       (if (string= output-file "/dev/stdout")
           (write-instrs instrs *standard-output*)
           (with-open-file (out output-file

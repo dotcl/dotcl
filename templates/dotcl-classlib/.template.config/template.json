@@ -1,0 +1,21 @@
+{
+  "$schema": "http://json.schemastore.org/template",
+  "author": "dotcl",
+  "classifications": [ "Library", "Windows", "Linux", "macOS" ],
+  "identity": "DotCL.ClassLibrary",
+  "name": "Common Lisp Class Library",
+  "description": "A Common Lisp class library on .NET (dotcl): Lisp sources compiled to a fasl, plus a C# facade so other .NET projects can call in.",
+  "shortName": "dotcl-classlib",
+  "sourceName": "DotclLibrary",
+  "tags": { "language": "Common Lisp", "type": "project" },
+  "symbols": {
+    "DotclRuntimeVersion": {
+      "type": "parameter",
+      "datatype": "string",
+      "defaultValue": "0.1.22",
+      "replaces": "DOTCL_RUNTIME_VERSION",
+      "description": "Version of the DotCL.Runtime NuGet package to reference."
+    }
+  },
+  "preferNameDirectory": true
+}

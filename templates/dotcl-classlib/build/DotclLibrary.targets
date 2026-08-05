@@ -1,0 +1,22 @@
+<Project>
+
+  <!--
+    Shipped inside this library's NuGet package as build/<PackageId>.targets, so
+    NuGet imports it into every consuming project. It copies the compiled Lisp
+    (this library's fasl, its dependency fasls, and the manifest listing them)
+    into the consumer's output directory, next to the assembly — which is where
+    the facade looks for them at run time.
+
+    The base image (dotcl.core) is deliberately not packed here: the consumer
+    gets one from DotCL.Runtime, which this package depends on, and the facade
+    calls DotclHost.EnsureCore() to load it if the host has not already.
+  -->
+  <ItemGroup>
+    <None Include="$(MSBuildThisFileDirectory)dotcl-fasl\**\*">
+      <Link>dotcl-fasl\%(Filename)%(Extension)</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Visible>false</Visible>
+    </None>
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,59 @@
+<Project>
+  <!--
+    DotCL.Sdk — MSBuild SDK for Common-Lisp-on-.NET projects.
+
+    Lets a Common Lisp .NET app be as small as:
+
+        <Project Sdk="DotCL.Sdk">
+          <PropertyGroup>
+            <DotclProjectAsd>app.asd</DotclProjectAsd>
+          </PropertyGroup>
+        </Project>
+
+    It wraps Microsoft.NET.Sdk and injects the DotCL.Runtime PackageReference,
+    which brings the project-core build (ProjectCore.targets) in
+    transitively. That pipeline walks the .asd's :depends-on, compiles the
+    system to a fasl, and writes a deployment manifest into the app output — the
+    same flow a hand-written <PackageReference DotCL.Runtime> + <DotclProjectAsd>
+    project uses today, minus the boilerplate.
+
+    Structure decision: the SDK loads ON TOP of ProjectCore's in-process
+    tasks. It does not add a third build implementation — it is sugar over the
+    existing one.
+
+    Import order: this Sdk.props is imported at the very top of the consuming
+    project (before its PropertyGroups); Sdk.targets at the very bottom.
+  -->
+
+  <!-- Defaults set BEFORE importing Microsoft.NET.Sdk so its own
+       Condition="'$(X)' == ''" fallbacks pick these up (its Sdk.props defaults
+       OutputType to Library, TFM to empty). The consumer's own PropertyGroups
+       run AFTER this whole file, so any of these remains overridable. -->
+  <PropertyGroup>
+    <!-- A CL app is an executable by default (a Lisp entry point hosted by a
+         thin C# Main). Set <OutputType>Library</OutputType> for a library. -->
+    <OutputType Condition="'$(OutputType)' == ''">Exe</OutputType>
+
+    <!-- The FASL emitter that ProjectCore runs at build time is net10-only, so
+         default the TFM there. The produced app can target another framework;
+         only the build-time compile needs net10's MSBuild. -->
+    <TargetFramework Condition="'$(TargetFramework)' == '' And '$(TargetFrameworks)' == ''">net10.0</TargetFramework>
+
+    <!-- Modern C# host ergonomics by default (the C# Main is usually a few lines
+         of DotclHost boilerplate). Overridable. -->
+    <ImplicitUsings Condition="'$(ImplicitUsings)' == ''">enable</ImplicitUsings>
+    <Nullable Condition="'$(Nullable)' == ''">enable</Nullable>
+  </PropertyGroup>
+
+  <Import Project="Sdk.props" Sdk="Microsoft.NET.Sdk" />
+
+  <PropertyGroup>
+    <!-- Version of the DotCL.Runtime package this SDK injects. Defaults to the
+         runtime the SDK shipped with (SDK and Runtime release in lockstep — both
+         inherit the same <Version> from runtime/Directory.Build.props). Override
+         <DotCLRuntimeVersion> to pin a different runtime.
+         NOTE: kept in sync with the SDK package version at pack time; the literal
+         below is the fallback for a locally built SDK. -->
+    <DotCLRuntimeVersion Condition="'$(DotCLRuntimeVersion)' == ''">0.1.22</DotCLRuntimeVersion>
+  </PropertyGroup>
+</Project>

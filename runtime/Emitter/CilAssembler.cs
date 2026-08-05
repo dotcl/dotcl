@@ -191,23 +191,27 @@ public partial class CilAssembler
         new Cons(Startup.Sym("SETF"), new Cons(targetSym, Nil.Instance));
 
     /// <summary>
-    /// Cross-package bridge for plain function lookup: search all packages for a
-    /// same-named symbol whose Function slot is set — replaces the old _functions
-    /// flat table. The symbol's home package is skipped (its own Function slot was
-    /// already checked by the caller). When cacheOnSym is true the hit is cached
-    /// on sym.Function to make subsequent lookups O(1) (GetFunctionBySymbol and
-    /// Runtime.CoerceToFunction — GetFunction must not cache, so string-based
-    /// lookups stay uncached). Returns null if no package has the function.
+    /// Cross-package bridge for plain function lookup: search dotcl's own packages
+    /// (Package.IsBridgeSource) for a same-named symbol whose Function slot is set
+    /// — replaces the old _functions flat table. A library's package is never
+    /// asked, so an undefined function stays undefined instead of silently
+    /// resolving to an unrelated same-named one. The symbol's home package is
+    /// skipped (its own Function slot was already checked by the caller). The hit
+    /// is never written back to sym.Function: caching it there would make the
+    /// caller's symbol permanently FBOUNDP to a function it does not name, which
+    /// is how a later DEFGENERIC on that symbol came to warn about "redefining an
+    /// ordinary function". Returns null if no package has the function.
     /// </summary>
-    internal static LispFunction? FindFunctionAcrossPackages(Symbol sym, bool cacheOnSym)
+    internal static LispFunction? FindFunctionAcrossPackages(Symbol sym)
     {
         foreach (var pkg in Package.AllPackages)
         {
-            if (pkg == sym.HomePackage) continue;
+            if (pkg == sym.HomePackage || !pkg.IsBridgeSource) continue;
             var (other, status) = pkg.FindSymbol(sym.Name);
             if (status != SymbolStatus.None && other.Function is LispFunction otherFn)
             {
-                if (cacheOnSym) sym.Function = otherFn;   // cache for future lookups
+                if (Startup.TraceBridge)
+                    Console.Error.WriteLine($"[FnAcross bridge] {sym.HomePackage?.Name}::{sym.Name} -> {pkg.Name}::{sym.Name}");
                 return otherFn;
             }
         }
@@ -215,19 +219,41 @@ public partial class CilAssembler
     }
 
     /// <summary>
-    /// Cross-package bridge for (SETF name) lookup: search all packages for a
-    /// symbol by this name with SetfFunction set, since the defun may have been
-    /// registered in a package other than CL or DOTCL-INTERNAL. Unlike the plain
-    /// bridge, no package is skipped and the hit is never cached (preserves the
-    /// historical behavior of the setf paths). Returns null if not found.
+    /// The symbol NAME names in the package the current form is being defined in.
+    /// The :defmethod path registers a function on NAME interned in *PACKAGE*
+    /// (see HandleDefmethod), which for a mangled uninterned name — the
+    /// "(SETF G123)" that DEFUN of (setf #:g) produces — is neither CL nor
+    /// DOTCL-INTERNAL, the only packages Startup.Sym consults. The string-based
+    /// lookups below have to mirror the registration or the uninterned-fixup
+    /// round trip cannot find what it just registered. Returns null if *PACKAGE*
+    /// is unavailable or has no such symbol.
+    /// </summary>
+    private static Symbol? FindInDefiningPackage(string name)
+    {
+        if (DynamicBindings.Get(Startup.Sym("*PACKAGE*")) is not Package cur) return null;
+        var (sym, status) = cur.FindSymbol(name);
+        return status == SymbolStatus.None ? null : sym;
+    }
+
+    /// <summary>
+    /// Cross-package bridge for (SETF name) lookup: search dotcl's own packages
+    /// (Package.IsBridgeSource) for a symbol by this name with SetfFunction set,
+    /// since the defun may have been registered in a package other than CL or
+    /// DOTCL-INTERNAL. Unlike the plain bridge, the symbol's own package is not
+    /// skipped. The hit is never cached. Returns null if not found.
     /// </summary>
     private static LispFunction? FindSetfFunctionAcrossPackages(string targetName)
     {
         foreach (var pkg in Package.AllPackages)
         {
+            if (!pkg.IsBridgeSource) continue;
             var (other, status) = pkg.FindSymbol(targetName);
             if (status != SymbolStatus.None && other.SetfFunction is LispFunction setfFn)
+            {
+                if (Startup.TraceBridge)
+                    Console.Error.WriteLine($"[SetfAcross bridge] (SETF {targetName}) -> {pkg.Name}");
                 return setfFn;
+            }
         }
         return null;
     }
@@ -240,17 +266,21 @@ public partial class CilAssembler
             // Try current-package symbol first
             var targetSym = Startup.Sym(targetName);
             if (targetSym.SetfFunction is LispFunction setfFn0) return setfFn0;
+            if (FindInDefiningPackage(targetName) is Symbol defSym
+                && defSym.SetfFunction is LispFunction setfFnPkg) return setfFnPkg;
             if (FindSetfFunctionAcrossPackages(targetName) is LispFunction setfFn) return setfFn;
             throw new LispErrorException(new LispUndefinedFunction(SetfNameCons(targetSym)));
         }
         var sym = Startup.Sym(name);
         if (sym.Function is LispFunction symFn) return symFn;
+        if (FindInDefiningPackage(name) is Symbol pkgSym
+            && pkgSym.Function is LispFunction pkgFn) return pkgFn;
         // Cross-package bridge: uninterned-fixup calls this during FASL loading when
         // *PACKAGE* may differ from the package where the function was registered
-        // (e.g. LEXICAL-CONTEXTS vs DOTCL-INTERNAL). Search all packages (same as
-        // GetFunctionBySymbol / CoerceToFunction). Note: sym.Name == name here
+        // (e.g. LEXICAL-CONTEXTS vs DOTCL-INTERNAL). Searches dotcl's own packages
+        // only, same as CoerceToFunction. Note: sym.Name == name here
         // (Startup.Sym resolves by exact name, no transformation).
-        if (FindFunctionAcrossPackages(sym, cacheOnSym: false) is LispFunction otherFn)
+        if (FindFunctionAcrossPackages(sym) is LispFunction otherFn)
             return otherFn;
         throw new LispErrorException(new LispUndefinedFunction(sym));
     }
@@ -346,6 +376,10 @@ public partial class CilAssembler
 
     public static void RegisterFunction(string name, LispFunction fn)
     {
+        // Anonymous C# builtins have no Name (that field also drives the InvokeSlow
+        // frame push); remember the registered name for the InvokeSlow statistics so
+        // they are attributed per symbol rather than per registration method.
+        fn.StatsName ??= name;
         // Handle (SETF NAME) functions: register on the target symbol's SetfFunction
         // slot so that #'(setf name) / GetSetfFunctionBySymbol can find them.
         if (name.StartsWith("(SETF ", StringComparison.Ordinal) && name.EndsWith(")"))

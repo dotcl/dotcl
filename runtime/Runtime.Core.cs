@@ -641,13 +641,11 @@ public static partial class Runtime
         if (designator is Symbol sym)
         {
             if (sym.Function is LispFunction sfn) return sfn;
-            // Cross-package bridge: closure defuns compiled inside a let may
-            // register via RegisterFunction(string,fn) which lands on a
-            // DOTCL-INTERNAL symbol rather than the home-package symbol. Same
-            // fallback as GetFunctionBySymbol (shared helper, incl. caching the
-            // hit on sym.Function) so that (funcall sym) finds the function
-            // even when sym.Function is null.
-            if (Emitter.CilAssembler.FindFunctionAcrossPackages(sym, cacheOnSym: true)
+            // Cross-package bridge: a helper the C# runtime registered on a
+            // CL / DOTCL-INTERNAL symbol is reachable through (funcall 'name)
+            // read in another package. Only dotcl's own packages may answer, and
+            // the hit is not written back to sym (see FindFunctionAcrossPackages).
+            if (Emitter.CilAssembler.FindFunctionAcrossPackages(sym)
                 is LispFunction otherFn)
                 return otherFn;
             throw new LispErrorException(new LispUndefinedFunction(sym));

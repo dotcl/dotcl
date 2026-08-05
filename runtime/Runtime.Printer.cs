@@ -1096,6 +1096,33 @@ public static partial class Runtime
             for (int i = 0; i < total; i++)
                 ScanCircle(vec.ElementAt(i), table);
         }
+        else if (obj is LispStruct st)
+        {
+            // Structure slots are part of the graph. Leaving them out meant a cycle
+            // closing through a slot was never detected, and FormatStruct printed the
+            // object again at every turn — unbounded output at full CPU rather than
+            // #1=#S(...  #1#). The format side already looks structures up here; only
+            // this pass was missing them.
+            if (table.TryGetValue(st, out int state))
+            {
+                if (state == 1) table[st] = 0;
+                return;
+            }
+            table[st] = 1;
+            foreach (var slot in st.Slots)
+                ScanCircle(slot, table);
+        }
+        else if (obj is LispInstance inst)
+        {
+            if (table.TryGetValue(inst, out int state))
+            {
+                if (state == 1) table[inst] = 0;
+                return;
+            }
+            table[inst] = 1;
+            foreach (var slot in inst.Slots)
+                if (slot != null) ScanCircle(slot, table);  // null = unbound slot
+        }
     }
 
     /// <summary>

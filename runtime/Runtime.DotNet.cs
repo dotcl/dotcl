@@ -158,6 +158,12 @@ public static partial class Runtime
             if (resultProp != null)
             {
                 var res = resultProp.GetValue(task);
+                // An (async ...) block whose value is multiple values carries an
+                // MvReturn as its payload. Re-publish it through MultipleValues on
+                // THIS thread: the values were produced on a continuation thread,
+                // and the thread-static side of the MV protocol did not come along.
+                if (res is MvReturn mv)
+                    return MultipleValues.Values(mv.Values);
                 // Task<VoidTaskResult> is the internal shape of a non-generic async
                 // Task; its Result is a private placeholder struct → NIL.
                 if (res != null && res.GetType().FullName == "System.Threading.Tasks.VoidTaskResult")
@@ -203,6 +209,25 @@ public static partial class Runtime
             throw new LispErrorException(new LispProgramError(
                 "DOTCL:%ASYNC-RETURN: requires exactly 1 argument"));
         return new LispDotNetObject(System.Threading.Tasks.Task.FromResult(args[0]));
+    }
+
+    /// <summary>
+    /// (dotcl:%async-return-mv value-list) => task
+    /// Terminal continuation of an (async ...) block that keeps multiple values.
+    /// The macro hands the block's values as a list (collected with
+    /// MULTIPLE-VALUE-CALL, so nothing is dropped at the call boundary); this lifts
+    /// them back into the MV protocol and parks the result in a completed Task.
+    /// One value stays a bare value — the common case allocates nothing extra.
+    /// </summary>
+    public static LispObject AsyncReturnMv(LispObject[] args)
+    {
+        if (args.Length != 1)
+            throw new LispErrorException(new LispProgramError(
+                "DOTCL:%ASYNC-RETURN-MV: requires exactly 1 argument (a list of values)"));
+        var vals = new System.Collections.Generic.List<LispObject>();
+        for (LispObject c = args[0]; c is Cons cc; c = cc.Cdr) vals.Add(cc.Car);
+        return new LispDotNetObject(
+            System.Threading.Tasks.Task.FromResult(MultipleValues.Values(vals.ToArray())));
     }
 
     /// <summary>Run a Lisp 0-arg thunk with a captured dynamic environment installed
@@ -268,6 +293,16 @@ public static partial class Runtime
     private static LispErrorException DotNetInvokeError(string context, System.Reflection.TargetInvocationException tie)
     {
         var inner = tie.InnerException;
+        // A Lisp non-local exit or condition that started inside a callback (a lambda
+        // handed to LINQ, an event handler) is passing THROUGH this reflection call on
+        // its way to its own target — it is not a failure of the .NET method. Let it
+        // continue unchanged; wrapping it turned (return-from b ...) across a callback
+        // into an error reading "DOTNET:INVOKE Func`2.Invoke: block return", and lost
+        // the original condition of a Lisp error.
+        if (inner is BlockReturnException || inner is CatchThrowException || inner is GoException
+            || inner is HandlerCaseInvocationException || inner is RestartInvocationException
+            || inner is LispErrorException)
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(inner).Throw();
         return new LispErrorException(new LispError($"{context}: {inner?.Message ?? tie.Message}")
         {
             ClrExceptionType = inner?.GetType()
@@ -606,8 +641,20 @@ public static partial class Runtime
                 DynamicBindings.Restore(dynSnapshot);    // install captured specials
                 HandlerClusterStack.Restore(handlerSnapshot);  // and handler clusters
                 RestartClusterStack.Restore(restartSnapshot);  // and restart clusters
+                // Multiple values reach the continuation as multiple ARGUMENTS,
+                // which is what makes both kinds of continuation behave: a let*
+                // binder is (lambda (x &rest ignored)) and keeps the primary, as
+                // (let ((x (floor 7 2)))) does, while the terminal continuation is
+                // (lambda (&rest vs)) and keeps them all. Unwrapping to the primary
+                // here instead would silently drop the values of a sub-construct
+                // (handler-case's :no-error clause, say) on their way out.
                 var v = TaskResultToLisp(t);
-                next = cont.Invoke1(v);   // continuation returns the next Task
+                next = v is MvReturn mvr
+                    ? (mvr.Values.Length == 0
+                        // No values: a binder still binds NIL (CL semantics).
+                        ? cont.Invoke1(Nil.Instance)
+                        : cont.Invoke(mvr.Values))
+                    : cont.Invoke1(v);   // continuation returns the next Task
             }
             catch (Exception e) { tcs.SetException(e); return; }
             finally
@@ -816,6 +863,12 @@ public static partial class Runtime
 
         // Fallback: pass as object
         if (targetType == typeof(object)) return arg;
+
+        // A parameter typed in terms of the Lisp object model itself (LispObject,
+        // Cons, LispVector, …) takes the value unchanged — no marshalling was
+        // ever wanted. This is how Lisp code calls a host API that speaks
+        // LispObject, e.g. DotclHost.ToClrArray.
+        if (targetType.IsInstanceOfType(arg)) return arg;
 
         throw new LispErrorException(new LispTypeError(
             $"Cannot convert {arg.GetType().Name} to {targetType.Name}", arg));
@@ -1072,10 +1125,13 @@ public static partial class Runtime
         if (args.Length != 1)
             throw new LispErrorException(new LispProgramError(
                 $"DOTNET:RESOLVE-TYPE: expected 1 argument, got {args.Length}"));
-        if (args[0] is not LispString name)
+        // A name string, a symbol, or an already-resolved System.Type (idempotent, so a
+        // composed generic type can be passed back through without special-casing).
+        if (args[0] is not LispString && args[0] is not Symbol
+            && !(args[0] is LispDotNetObject dno && dno.Value is Type))
             throw new LispErrorException(new LispTypeError(
-                "DOTNET:RESOLVE-TYPE: type name must be a string", args[0]));
-        return new LispDotNetObject(ResolveDotNetType(name.Value));
+                "DOTNET:RESOLVE-TYPE: type must be a name string, a symbol, or a System.Type", args[0]));
+        return new LispDotNetObject(ResolveElementTypeArg(args[0]));
     }
 
     /// <summary>DOTNET:CLEAR-TYPE-CACHE — drop all memoized resolve-type entries so
@@ -1325,6 +1381,29 @@ public static partial class Runtime
             _ => arg
         };
     }
+
+    /// <summary>The receiver a Lisp value stands for in an instance call, or null when it
+    /// does not stand for one. A .NET object is itself; a Lisp scalar that .NET hands back
+    /// unwrapped — string, character, number — becomes its CLR counterpart, so a value that
+    /// came OUT of a .NET call can be called back into:
+    /// <c>(dotnet:invoke (dotnet:invoke x "get_Name") "ToUpper")</c>.
+    /// NIL and T are deliberately excluded: NIL is ambiguous between null, false and the
+    /// empty list, and a symbol receiver almost always means a type name was meant.</summary>
+    private static object? InvocationReceiver(LispObject arg)
+        => arg switch
+        {
+            LispDotNetBoxed b => b.Value,
+            LispDotNetObject d => d.Value,
+            LispString ls => ls.Value,
+            LispVector cv when cv.IsCharVector => cv.ToCharString(),
+            LispChar lc => lc.Value,
+            Fixnum fx => (fx.Value >= int.MinValue && fx.Value <= int.MaxValue)
+                            ? (object)(int)fx.Value : fx.Value,
+            Bignum bn => bn.Value,
+            DoubleFloat df => df.Value,
+            SingleFloat sf => sf.Value,
+            _ => null
+        };
 
     private static object?[] LispArgsToDotNetGeneric(LispObject[] lispArgs)
     {
@@ -1756,11 +1835,12 @@ public static partial class Runtime
             throw new LispErrorException(new LispProgramError(
                 "DOTNET:INVOKE: requires at least 2 arguments (object member-name &rest args)"));
 
-        if (args[0] is not LispDotNetObject dno)
+        var target = InvocationReceiver(args[0]);
+        if (target == null)
             throw new LispErrorException(new LispTypeError(
-                "DOTNET:INVOKE: first argument must be a .NET object", args[0]));
+                "DOTNET:INVOKE: first argument must be a .NET object, string, character or number",
+                args[0]));
 
-        var target = dno.Value;
         string memberName = args[1] switch { LispString ls => ls.Value, _ => args[1].ToString() ?? "" };
         var type = target.GetType();
         var callArgs = LispArgsToDotNetGeneric(args.Skip(2).ToArray());
@@ -1879,6 +1959,62 @@ public static partial class Runtime
     /// whose type argument can be inferred from the receiver's IEnumerable&lt;T&gt;
     /// (covers Enumerable.Where etc.). Binding mismatches are skipped; an exception
     /// thrown by the resolved method propagates as TargetInvocationException.</summary>
+    /// <summary>Type arguments for a generic extension method called on RECVTYPE, or null
+    /// when it cannot be called at all. The type parameter the receiver parameter exposes
+    /// (the TSource of <c>IEnumerable&lt;TSource&gt;</c>, or T itself for <c>this T x</c>) is
+    /// inferred from the receiver; every other type parameter defaults to System.Object.
+    /// A Lisp closure carries no return type, so TResult of Select&lt;TSource,TResult&gt; is not
+    /// inferable — object keeps such methods callable, and values come back to Lisp
+    /// unwrapped anyway. Callers who need a specific instantiation use
+    /// dotnet:static-generic.</summary>
+    /// <summary>True for a type parameter declared by a METHOD (the T of
+    /// <c>Select&lt;T,R&gt;</c>), as opposed to one declared by a type. Spelled out rather
+    /// than using Type.IsGenericMethodParameter, which netstandard2.0 — the target the
+    /// emit-free runtime builds against — does not have.</summary>
+    private static bool IsMethodTypeParameter(Type t)
+        => t.IsGenericParameter && t.DeclaringMethod != null;
+
+    private static Type[]? InferExtensionTypeArgs(System.Reflection.MethodInfo m, Type recvType)
+    {
+        var gps = m.GetGenericArguments();
+        var typeArgs = new Type[gps.Length];
+        for (int i = 0; i < typeArgs.Length; i++) typeArgs[i] = typeof(object);
+        var recvParam = m.GetParameters()[0].ParameterType;
+        if (IsMethodTypeParameter(recvParam))
+        {
+            typeArgs[recvParam.GenericParameterPosition] = recvType;
+            return typeArgs;
+        }
+        if (recvParam.IsGenericType)
+        {
+            var ra = recvParam.GetGenericArguments();
+            if (ra.Length == 1 && IsMethodTypeParameter(ra[0]))
+            {
+                var elem = EnumerableElementType(recvType);
+                if (elem == null) return null;
+                typeArgs[ra[0].GenericParameterPosition] = elem;
+                return typeArgs;
+            }
+        }
+        return null;
+    }
+
+    /// <summary>True when every Lisp function passed for a delegate parameter has an arity
+    /// the delegate can call. Unknown arity (-1, e.g. a closure with &amp;rest) matches
+    /// anything; non-delegate parameters are not considered.</summary>
+    private static bool DelegateArgArityFits(System.Reflection.ParameterInfo[] ps, LispObject[] lispArgs)
+    {
+        for (int i = 0; i < lispArgs.Length; i++)
+        {
+            if (lispArgs[i] is not LispFunction fn || fn.Arity < 0) continue;
+            var pt = ps[i + 1].ParameterType;
+            if (!typeof(Delegate).IsAssignableFrom(pt)) continue;
+            var invoke = pt.GetMethod("Invoke");
+            if (invoke != null && invoke.GetParameters().Length != fn.Arity) return false;
+        }
+        return true;
+    }
+
     private static bool TryInvokeExtensionMethod(Type recvType, string methodName, object? target,
         LispObject[] lispArgs, out object? result)
     {
@@ -1890,14 +2026,19 @@ public static partial class Runtime
             var concrete = m;
             if (m.IsGenericMethodDefinition)
             {
-                if (m.GetGenericArguments().Length != 1) continue; // only 1-type-param inference
-                var elem = EnumerableElementType(recvType);
-                if (elem == null) continue;
-                try { concrete = m.MakeGenericMethod(elem); }
-                catch { continue; }
+                var typeArgs = InferExtensionTypeArgs(m, recvType);
+                if (typeArgs == null) continue;
+                try { concrete = m.MakeGenericMethod(typeArgs); }
+                catch { continue; }   // constraints (e.g. where T : struct) rule this one out
                 ps = concrete.GetParameters();
             }
             if (!ps[0].ParameterType.IsAssignableFrom(recvType)) continue;
+            // With a Lisp function for a delegate parameter, pick the overload whose
+            // delegate arity matches. Enumerable.Select/Where each have a plain and an
+            // indexed overload with identical arity, so without this the first one
+            // reflection happens to return wins and a 1-argument Lisp lambda ends up
+            // behind a Func<T,int,R>.
+            if (!DelegateArgArityFits(ps, lispArgs)) continue;
             var callArgs = new object?[ps.Length];
             callArgs[0] = target;
             bool ok = true;
@@ -2040,59 +2181,58 @@ public static partial class Runtime
         return new LispDotNetObject(instance);
     }
 
-    /// <summary>(dotnet:%define-class "Full.Name" &optional "Base.Type" field-specs attr-specs method-specs ctor-body property-specs interface-specs event-specs)
-    /// Emit a named public class. Shapes: (fields) (attrs),
-    /// (methods) (ctor-body: 1-arg Lisp fn called after base.ctor),
-    /// (property-specs: list of ("Name" "TypeName") for auto-properties).
-    /// method-spec accepts optional 5th element override-flag; when truthy,
-    /// the method is emitted as an override of a matching base virtual method.
-    /// 8th arg interface-specs is a list of fully qualified interface
-    /// type names; each declared, and any method in method-specs whose
-    /// name+signature matches an interface method is emitted as the implicit
-    /// implementation of that slot.
-    /// 9th arg event-specs is a list of ("Name" "DelegateTypeName"); each
-    /// emits a private delegate field + public add_/remove_ accessors +
-    /// EventBuilder. If a declared interface carries a matching add_/remove_
-    /// slot, the accessors are wired up as implicit implementations.
-    /// property-specs accepts optional 3rd element (notify-flag); when
-    /// truthy, the setter additionally calls OnPropertyChanged with a
-    /// PropertyChangedEventArgs carrying the property name. Requires a
-    /// matching PropertyChanged event to be declared via event-specs.
-    /// Returns the full name as a LispString on success.</summary>
-    public static LispObject DotNetDefineClass(LispObject[] args)
-    {
-#if !DOTCL_EMIT
-        // Defining a brand-new .NET type at runtime is inherently emit-based
-        // (AssemblyBuilder/TypeBuilder); unavailable on the emit-free runtime.
-        throw new LispErrorException(new LispProgramError(
-            "DOTNET:%DEFINE-CLASS: defining .NET classes requires the emitting runtime (not available on this build)"));
-#else
-        if (args.Length < 1 || args.Length > 12)
-            throw new LispErrorException(new LispProgramError(
-                "DOTNET:%DEFINE-CLASS: requires 1-12 arguments (full-name &optional base-type-name field-specs attr-specs method-specs ctor-body property-specs interface-specs event-specs ctor-param-types base-ctor-arg-indices ctor-specs-list)"));
+#if DOTCL_EMIT
+    /// <summary>
+    /// The parsed C# form of one class-spec: the positional dotnet:%define-class
+    /// args 0-11 (full-name .. ctor-specs, minus save-to-path) converted from
+    /// their Lisp shapes into the object model DynamicClassBuilder consumes.
+    /// Shared by %define-class (single type) and %save-library (one entry per
+    /// type in an aggregated library) so both parse identically.
+    /// </summary>
+    private readonly record struct ParsedClassSpec(
+        string FullName,
+        Type? BaseType,
+        List<(string, Type)>? Fields,
+        List<System.Reflection.Emit.CustomAttributeBuilder>? Attributes,
+        List<Emitter.DynamicClassBuilder.MethodSpec>? Methods,
+        LispObject? CtorBody,
+        List<(string, Type, bool)>? Properties,
+        List<Type>? Interfaces,
+        List<(string, Type)>? Events,
+        List<Type>? CtorParamTypes,
+        List<int>? BaseCtorArgIndices,
+        List<Emitter.DynamicClassBuilder.CtorSpec>? CtorSpecs);
 
-        string fullName = args[0] switch
+    /// <summary>
+    /// Parse dotnet:%define-class positional args 0-11 (any trailing save-to-path
+    /// at index 12 is ignored here — the caller handles it) into a
+    /// <see cref="ParsedClassSpec"/>. Behavior-preserving extraction of the old
+    /// inline parsing so %save-library can reuse it per class.
+    /// </summary>
+    private static ParsedClassSpec ParseClassSpec(LispObject[] a)
+    {
+        string fullName = a[0] switch
         {
             LispString ls => ls.Value,
-            _ => args[0].ToString() ?? ""
+            _ => a[0].ToString() ?? ""
         };
 
         Type? baseType = null;
-        if (args.Length >= 2 && args[1] != Nil.Instance)
+        if (a.Length >= 2 && a[1] != Nil.Instance)
         {
-            string baseName = args[1] switch
+            string baseName = a[1] switch
             {
                 LispString ls => ls.Value,
-                _ => args[1].ToString() ?? ""
+                _ => a[1].ToString() ?? ""
             };
             baseType = ResolveDotNetType(baseName);
         }
 
         List<(string, Type)>? fields = null;
-        if (args.Length >= 3 && args[2] != Nil.Instance)
+        if (a.Length >= 3 && a[2] != Nil.Instance)
         {
             fields = new List<(string, Type)>();
-            var cur = args[2];
+            var cur = a[2];
             while (cur is Cons c)
             {
                 if (c.Car is not Cons spec)
@@ -2118,10 +2258,10 @@ public static partial class Runtime
         }
 
         List<System.Reflection.Emit.CustomAttributeBuilder>? attrs = null;
-        if (args.Length >= 4 && args[3] != Nil.Instance)
+        if (a.Length >= 4 && a[3] != Nil.Instance)
         {
             attrs = new List<System.Reflection.Emit.CustomAttributeBuilder>();
-            var cur = args[3];
+            var cur = a[3];
             while (cur is Cons c)
             {
                 if (c.Car is not Cons spec)
@@ -2159,17 +2299,18 @@ public static partial class Runtime
         }
 
         List<Emitter.DynamicClassBuilder.MethodSpec>? methods = null;
-        if (args.Length >= 5 && args[4] != Nil.Instance)
+        if (a.Length >= 5 && a[4] != Nil.Instance)
         {
             methods = new List<Emitter.DynamicClassBuilder.MethodSpec>();
-            var cur = args[4];
+            var cur = a[4];
             while (cur is Cons c)
             {
                 if (c.Car is not Cons spec)
                     throw new LispErrorException(new LispTypeError(
                         "DOTNET:%DEFINE-CLASS: each method spec must be a (name return-type (param-types) lambda) list",
                         c.Car));
-                // Spec shape: (name return-type (param-types) lambda)
+                // Spec shape: (name return-type (param-types) lambda
+                //              [override-flag [attr-specs [static-flag]]])
                 var nameObj = spec.Car;
                 var rest = spec.Cdr;
                 if (rest is not Cons r1)
@@ -2221,13 +2362,21 @@ public static partial class Runtime
                 // Optional 5th element: override flag. Nil/absent = false.
                 bool isOverride = false;
                 LispObject? attrSpecsObj = null;
+                // Optional 7th element: static flag. When truthy the method is
+                // emitted as `public static` (no self) — a defun exported into a
+                // library type. Mutually exclusive with override.
+                bool isStatic = false;
                 if (r3.Cdr is Cons r4)
                 {
                     isOverride = r4.Car != Nil.Instance;
                     // Optional 6th element: list of (type-name ctor-args...)
                     // attribute specs, same shape as the class-level attrs list.
                     if (r4.Cdr is Cons r5)
+                    {
                         attrSpecsObj = r5.Car;
+                        if (r5.Cdr is Cons r6)
+                            isStatic = r6.Car != Nil.Instance;
+                    }
                 }
 
                 List<System.Reflection.Emit.CustomAttributeBuilder>? methodAttrs = null;
@@ -2270,26 +2419,26 @@ public static partial class Runtime
                 }
 
                 methods.Add(new Emitter.DynamicClassBuilder.MethodSpec(
-                    mname, rtype, paramTypes, lambdaObj, isOverride, methodAttrs));
+                    mname, rtype, paramTypes, lambdaObj, isOverride, methodAttrs, isStatic));
                 cur = c.Cdr;
             }
         }
 
         LispObject? ctorBody = null;
-        if (args.Length >= 6 && args[5] != Nil.Instance)
+        if (a.Length >= 6 && a[5] != Nil.Instance)
         {
-            if (args[5] is not LispFunction)
+            if (a[5] is not LispFunction)
                 throw new LispErrorException(new LispTypeError(
                     "DOTNET:%DEFINE-CLASS: ctor-body must be a function",
-                    args[5]));
-            ctorBody = args[5];
+                    a[5]));
+            ctorBody = a[5];
         }
 
         List<(string, Type, bool)>? propertySpecs = null;
-        if (args.Length >= 7 && args[6] != Nil.Instance)
+        if (a.Length >= 7 && a[6] != Nil.Instance)
         {
             propertySpecs = new List<(string, Type, bool)>();
-            var cur = args[6];
+            var cur = a[6];
             while (cur is Cons c)
             {
                 if (c.Car is not Cons spec)
@@ -2319,10 +2468,10 @@ public static partial class Runtime
         }
 
         List<Type>? interfaceSpecs = null;
-        if (args.Length >= 8 && args[7] != Nil.Instance)
+        if (a.Length >= 8 && a[7] != Nil.Instance)
         {
             interfaceSpecs = new List<Type>();
-            var cur = args[7];
+            var cur = a[7];
             while (cur is Cons c)
             {
                 var entry = c.Car;
@@ -2337,10 +2486,10 @@ public static partial class Runtime
         }
 
         List<(string, Type)>? eventSpecs = null;
-        if (args.Length >= 9 && args[8] != Nil.Instance)
+        if (a.Length >= 9 && a[8] != Nil.Instance)
         {
             eventSpecs = new List<(string, Type)>();
-            var cur = args[8];
+            var cur = a[8];
             while (cur is Cons c)
             {
                 if (c.Car is not Cons spec)
@@ -2366,10 +2515,10 @@ public static partial class Runtime
         }
 
         List<Type>? userCtorParamTypes = null;
-        if (args.Length >= 10 && args[9] != Nil.Instance)
+        if (a.Length >= 10 && a[9] != Nil.Instance)
         {
             userCtorParamTypes = new List<Type>();
-            var cur = args[9];
+            var cur = a[9];
             while (cur is Cons c)
             {
                 string tname = c.Car switch
@@ -2383,10 +2532,10 @@ public static partial class Runtime
         }
 
         List<int>? baseCtorArgIndices = null;
-        if (args.Length >= 11 && args[10] != Nil.Instance)
+        if (a.Length >= 11 && a[10] != Nil.Instance)
         {
             baseCtorArgIndices = new List<int>();
-            var cur = args[10];
+            var cur = a[10];
             while (cur is Cons c)
             {
                 if (c.Car is not Fixnum fi)
@@ -2401,10 +2550,10 @@ public static partial class Runtime
         // arg 11: ctor-specs-list: list of (lambda param-types base-arg-indices) triples.
         // When non-nil, overrides the single-ctor path (args 5/9/10).
         List<Emitter.DynamicClassBuilder.CtorSpec>? ctorSpecs = null;
-        if (args.Length >= 12 && args[11] != Nil.Instance)
+        if (a.Length >= 12 && a[11] != Nil.Instance)
         {
             ctorSpecs = new List<Emitter.DynamicClassBuilder.CtorSpec>();
-            var cur = args[11];
+            var cur = a[11];
             while (cur is Cons c)
             {
                 if (c.Car is not Cons spec)
@@ -2454,12 +2603,70 @@ public static partial class Runtime
             }
         }
 
+        return new ParsedClassSpec(fullName, baseType, fields, attrs, methods,
+            ctorBody, propertySpecs, interfaceSpecs, eventSpecs, userCtorParamTypes,
+            baseCtorArgIndices, ctorSpecs);
+    }
+#endif
+
+    /// <summary>(dotnet:%define-class "Full.Name" &optional "Base.Type" field-specs attr-specs method-specs ctor-body property-specs interface-specs event-specs)
+    /// Emit a named public class. Shapes: (fields) (attrs),
+    /// (methods) (ctor-body: 1-arg Lisp fn called after base.ctor),
+    /// (property-specs: list of ("Name" "TypeName") for auto-properties).
+    /// method-spec accepts optional 5th element override-flag; when truthy,
+    /// the method is emitted as an override of a matching base virtual method.
+    /// 8th arg interface-specs is a list of fully qualified interface
+    /// type names; each declared, and any method in method-specs whose
+    /// name+signature matches an interface method is emitted as the implicit
+    /// implementation of that slot.
+    /// 9th arg event-specs is a list of ("Name" "DelegateTypeName"); each
+    /// emits a private delegate field + public add_/remove_ accessors +
+    /// EventBuilder. If a declared interface carries a matching add_/remove_
+    /// slot, the accessors are wired up as implicit implementations.
+    /// property-specs accepts optional 3rd element (notify-flag); when
+    /// truthy, the setter additionally calls OnPropertyChanged with a
+    /// PropertyChangedEventArgs carrying the property name. Requires a
+    /// matching PropertyChanged event to be declared via event-specs.
+    /// Returns the full name as a LispString on success.</summary>
+    public static LispObject DotNetDefineClass(LispObject[] args)
+    {
+#if !DOTCL_EMIT
+        // Defining a brand-new .NET type at runtime is inherently emit-based
+        // (AssemblyBuilder/TypeBuilder); unavailable on the emit-free runtime.
+        throw new LispErrorException(new LispProgramError(
+            "DOTNET:%DEFINE-CLASS: defining .NET classes requires the emitting runtime (not available on this build)"));
+#else
+        if (args.Length < 1 || args.Length > 13)
+            throw new LispErrorException(new LispProgramError(
+                "DOTNET:%DEFINE-CLASS: requires 1-13 arguments (full-name &optional base-type-name field-specs attr-specs method-specs ctor-body property-specs interface-specs event-specs ctor-param-types base-ctor-arg-indices ctor-specs-list save-to-path)"));
+
+        var s = ParseClassSpec(args);
+        string fullName = s.FullName;
+
+        // arg 12: save-to-path. Non-nil emits a saved, C#-referenceable facade
+        // .dll (the dotcl→C# library path) instead of an in-process Run type.
+        string? saveToPath = null;
+        if (args.Length >= 13 && args[12] != Nil.Instance)
+        {
+            saveToPath = args[12] switch
+            {
+                LispString ls => ls.Value,
+                _ => args[12].ToString() ?? ""
+            };
+        }
+
         try
         {
             var type = Emitter.DynamicClassBuilder.DefineMinimalClass(
-                fullName, baseType, fields, attrs, methods, ctorBody, propertySpecs,
-                interfaceSpecs, eventSpecs, userCtorParamTypes, baseCtorArgIndices,
-                ctorSpecs);
+                fullName, s.BaseType, s.Fields, s.Attributes, s.Methods, s.CtorBody,
+                s.Properties, s.Interfaces, s.Events, s.CtorParamTypes,
+                s.BaseCtorArgIndices, s.CtorSpecs, saveToPath);
+            if (saveToPath != null)
+                // Saved facade type: it lives in a persisted (unloadable) assembly
+                // and is never instantiated in this process, so skip the CLOS/name
+                // registration (which would map a Lisp name to an unusable type).
+                // Return the full name as written into the .dll.
+                return new LispString(type.FullName ?? fullName);
             // Register as CLOS class so class-of/type-of/find-class work for instances.
             EnsureDotNetTypeClass(type);
             // Register by uppercase name for resolution from Lisp symbols (e.g. Animal → ANIMAL).
@@ -2472,6 +2679,264 @@ public static partial class Runtime
         {
             throw new LispErrorException(new LispError(
                 $"DOTNET:%DEFINE-CLASS: {ae.Message}"));
+        }
+#endif
+    }
+
+    /// <summary>(dotnet:%save-library save-path assembly-name version member-spec-list)
+    /// Emit a saved, C#-referenceable library .dll aggregating MANY types into
+    /// one assembly (the aggregation unit a single %define-class cannot express).
+    /// SAVE-PATH is where the .dll is written; ASSEMBLY-NAME is the library's
+    /// simple name (what a C# consumer references); VERSION is a version string
+    /// ("1.2.3.0") or nil. MEMBER-SPEC-LIST is a list of tagged specs, each
+    /// (KIND DOC . rest) where KIND is a keyword and DOC is a type-level
+    /// &lt;summary&gt; string (or nil) written to a sidecar &lt;name&gt;.xml. KIND is one of:
+    ///   (:class full-name base fields attrs methods ctor-body properties
+    ///           interfaces events ctor-param-types base-ctor-arg-indices ctor-specs)
+    ///     — the positional slots dotnet:%define-class takes (save-to-path omitted).
+    ///       A method-spec may carry a 7th static-flag element (defun → static).
+    ///   (:enum full-name underlying-type-name (member-name value)...) — a public
+    ///       enum; underlying defaults to System.Int32 when nil.
+    ///   (:constants full-name (member-name type-name value)...) — a static holder
+    ///       of public const fields.
+    ///   (:struct full-name (field-name type-name)...) — a public value type of
+    ///       public fields.
+    ///   (:interface full-name (method-name return-type-name (param-type-name...))...)
+    ///       — a public interface of abstract method signatures.
+    ///   (:delegate full-name return-type-name (param-type-name...)) — a public
+    ///       delegate (callback) type of the given signature.
+    /// Unlike class facades, enums / const holders / structs / interfaces /
+    /// delegates are pure metadata: standalone, needing no runtime/Lisp. Returns
+    /// the save-path on success. The saved CLASS types are facades dispatching to
+    /// Lisp bodies, so consuming their methods at runtime needs DotCL.Runtime +
+    /// the Lisp loaded.</summary>
+    public static LispObject DotNetSaveLibrary(LispObject[] args)
+    {
+#if !DOTCL_EMIT || !NET9_0_OR_GREATER
+        // Saving a persisted, C#-referenceable assembly uses PersistedAssemblyBuilder,
+        // which is .NET 9+ only; net8.0 / netstandard2.0 have no emit path here.
+        throw new LispErrorException(new LispProgramError(
+            "DOTNET:%SAVE-LIBRARY: emitting a .NET library requires the emitting runtime on .NET 9+ (not available on this build)"));
+#else
+        if (args.Length != 4)
+            throw new LispErrorException(new LispProgramError(
+                "DOTNET:%SAVE-LIBRARY: requires 4 arguments (save-path assembly-name version member-spec-list)"));
+
+        static string Str(LispObject o) => o switch
+        {
+            LispString ls => ls.Value,
+            Symbol sy => sy.Name,
+            _ => o.ToString() ?? ""
+        };
+
+        string savePath = Str(args[0]);
+        string asmName = Str(args[1]);
+        Version? version = null;
+        if (args[2] != Nil.Instance)
+        {
+            string vstr = Str(args[2]);
+            if (!Version.TryParse(vstr, out version))
+                throw new LispErrorException(new LispError(
+                    $"DOTNET:%SAVE-LIBRARY: invalid version string {vstr}"));
+        }
+
+        // Parse EVERY member BEFORE opening the library so a malformed spec fails
+        // without leaving a half-written .dll on disk. Each member is (KIND . rest)
+        // dispatched on the keyword tag.
+        var classes = new List<ParsedClassSpec>();
+        var enums = new List<(string FullName, Type Underlying, List<(string, object)> Members)>();
+        var constHolders = new List<(string FullName, List<(string, Type, object)> Members)>();
+        var structs = new List<(string FullName, List<(string, Type)> Fields)>();
+        var interfaces = new List<(string FullName, List<(string, Type, List<Type>)> Methods)>();
+        var delegates = new List<(string FullName, Type ReturnType, List<Type> ParamTypes)>();
+        // (docCommentId, summary) for the sidecar XML doc. Each tagged member is
+        // (KIND DOC . rest): DOC is a type-level <summary> string, or nil.
+        var docs = new List<(string Id, string Summary)>();
+
+        var cur = args[3];
+        while (cur is Cons c)
+        {
+            if (c.Car is not Cons spec || spec.Car is not Symbol tagSym)
+                throw new LispErrorException(new LispTypeError(
+                    "DOTNET:%SAVE-LIBRARY: each member-spec must be a (KIND DOC . rest) list with a keyword KIND",
+                    c.Car));
+            // Element after the tag is the type-level doc summary (string or nil);
+            // the kind-specific data follows.
+            string? doc = (spec.Cdr is Cons dc && dc.Car is LispString ds) ? ds.Value : null;
+            var rest = spec.Cdr is Cons rc ? rc.Cdr : Nil.Instance;
+            string? memberFull = null;
+            switch (tagSym.Name)
+            {
+                case "CLASS":
+                {
+                    var slots = new List<LispObject>();
+                    var scur = rest;
+                    while (scur is Cons sc) { slots.Add(sc.Car); scur = sc.Cdr; }
+                    if (slots.Count < 1)
+                        throw new LispErrorException(new LispProgramError(
+                            "DOTNET:%SAVE-LIBRARY: a :class member needs at least a full-name"));
+                    var parsed = ParseClassSpec(slots.ToArray());
+                    classes.Add(parsed);
+                    memberFull = parsed.FullName;
+                    break;
+                }
+                case "ENUM":
+                {
+                    string efull = Str(rest is Cons er0 ? er0.Car : Nil.Instance);
+                    var underlyingObj = (rest is Cons er0b && er0b.Cdr is Cons er1) ? er1.Car : Nil.Instance;
+                    Type underlying = underlyingObj == Nil.Instance
+                        ? typeof(int) : ResolveDotNetType(Str(underlyingObj));
+                    var members = new List<(string, object)>();
+                    var mcur = (rest is Cons er0c && er0c.Cdr is Cons er1b) ? er1b.Cdr : Nil.Instance;
+                    while (mcur is Cons mc)
+                    {
+                        if (mc.Car is not Cons mspec)
+                            throw new LispErrorException(new LispTypeError(
+                                "DOTNET:%SAVE-LIBRARY: each enum member must be a (name value) list", mc.Car));
+                        string mname = Str(mspec.Car);
+                        var mvalObj = mspec.Cdr is Cons mc2 ? mc2.Car : Nil.Instance;
+                        var mval = LispToDotNet(mvalObj, underlying)
+                            ?? throw new LispErrorException(new LispError(
+                                $"DOTNET:%SAVE-LIBRARY: enum member {efull}.{mname} has no value"));
+                        members.Add((mname, mval));
+                        mcur = mc.Cdr;
+                    }
+                    enums.Add((efull, underlying, members));
+                    memberFull = efull;
+                    break;
+                }
+                case "CONSTANTS":
+                {
+                    string cfull = Str(rest is Cons cr0 ? cr0.Car : Nil.Instance);
+                    var members = new List<(string, Type, object)>();
+                    var mcur = rest is Cons cr0b ? cr0b.Cdr : Nil.Instance;
+                    while (mcur is Cons mc)
+                    {
+                        if (mc.Car is not Cons mspec)
+                            throw new LispErrorException(new LispTypeError(
+                                "DOTNET:%SAVE-LIBRARY: each constant must be a (name type value) list", mc.Car));
+                        string mname = Str(mspec.Car);
+                        var mrest = mspec.Cdr;
+                        var mtypeObj = mrest is Cons mr1 ? mr1.Car : Nil.Instance;
+                        var mvalObj = (mrest is Cons mr1b && mr1b.Cdr is Cons mr2) ? mr2.Car : Nil.Instance;
+                        Type mtype = ResolveDotNetType(Str(mtypeObj));
+                        var mval = LispToDotNet(mvalObj, mtype)
+                            ?? throw new LispErrorException(new LispError(
+                                $"DOTNET:%SAVE-LIBRARY: constant {cfull}.{mname} has no value"));
+                        members.Add((mname, mtype, mval));
+                        mcur = mc.Cdr;
+                    }
+                    constHolders.Add((cfull, members));
+                    memberFull = cfull;
+                    break;
+                }
+                case "STRUCT":
+                {
+                    string sfull = Str(rest is Cons sr0 ? sr0.Car : Nil.Instance);
+                    var sfields = new List<(string, Type)>();
+                    var fcur = rest is Cons sr0b ? sr0b.Cdr : Nil.Instance;
+                    while (fcur is Cons fc)
+                    {
+                        if (fc.Car is not Cons fspec)
+                            throw new LispErrorException(new LispTypeError(
+                                "DOTNET:%SAVE-LIBRARY: each struct field must be a (name type) list", fc.Car));
+                        string fname = Str(fspec.Car);
+                        var ftypeObj = fspec.Cdr is Cons fc2 ? fc2.Car : Nil.Instance;
+                        sfields.Add((fname, ResolveDotNetType(Str(ftypeObj))));
+                        fcur = fc.Cdr;
+                    }
+                    structs.Add((sfull, sfields));
+                    memberFull = sfull;
+                    break;
+                }
+                case "INTERFACE":
+                {
+                    string ifull = Str(rest is Cons ir0 ? ir0.Car : Nil.Instance);
+                    var methods = new List<(string, Type, List<Type>)>();
+                    var mcur = rest is Cons ir0b ? ir0b.Cdr : Nil.Instance;
+                    while (mcur is Cons mc)
+                    {
+                        if (mc.Car is not Cons mspec)
+                            throw new LispErrorException(new LispTypeError(
+                                "DOTNET:%SAVE-LIBRARY: each interface method must be a (name return-type (param-types)) list", mc.Car));
+                        string mname = Str(mspec.Car);
+                        var mrest = mspec.Cdr;
+                        var retObj = mrest is Cons ir1 ? ir1.Car : Nil.Instance;
+                        string rname = Str(retObj);
+                        Type rtype = rname == "System.Void" ? typeof(void) : ResolveDotNetType(rname);
+                        var paramListObj = (mrest is Cons ir1b && ir1b.Cdr is Cons ir2) ? ir2.Car : Nil.Instance;
+                        var ptypes = new List<Type>();
+                        var pcur = paramListObj;
+                        while (pcur is Cons pc) { ptypes.Add(ResolveDotNetType(Str(pc.Car))); pcur = pc.Cdr; }
+                        methods.Add((mname, rtype, ptypes));
+                        mcur = mc.Cdr;
+                    }
+                    interfaces.Add((ifull, methods));
+                    memberFull = ifull;
+                    break;
+                }
+                case "DELEGATE":
+                {
+                    string dfull = Str(rest is Cons dr0 ? dr0.Car : Nil.Instance);
+                    var retObj = (rest is Cons dr0b && dr0b.Cdr is Cons dr1) ? dr1.Car : Nil.Instance;
+                    string drname = Str(retObj);
+                    Type drtype = drname == "System.Void" ? typeof(void) : ResolveDotNetType(drname);
+                    var paramListObj = (rest is Cons dr0c && dr0c.Cdr is Cons dr1b && dr1b.Cdr is Cons dr2)
+                        ? dr2.Car : Nil.Instance;
+                    var dptypes = new List<Type>();
+                    var pcur = paramListObj;
+                    while (pcur is Cons pc) { dptypes.Add(ResolveDotNetType(Str(pc.Car))); pcur = pc.Cdr; }
+                    delegates.Add((dfull, drtype, dptypes));
+                    memberFull = dfull;
+                    break;
+                }
+                default:
+                    throw new LispErrorException(new LispError(
+                        $"DOTNET:%SAVE-LIBRARY: unknown member kind :{tagSym.Name} (expected :class/:enum/:constants/:struct/:interface/:delegate)"));
+            }
+            if (doc != null && memberFull != null)
+                docs.Add(("T:" + memberFull, doc));
+            cur = c.Cdr;
+        }
+
+        if (classes.Count == 0 && enums.Count == 0 && constHolders.Count == 0
+            && structs.Count == 0 && interfaces.Count == 0 && delegates.Count == 0)
+            throw new LispErrorException(new LispProgramError(
+                "DOTNET:%SAVE-LIBRARY: nothing to emit (member-spec-list is empty)"));
+
+        try
+        {
+            var lib = Emitter.DynamicClassBuilder.BeginLibrary(savePath, asmName, version);
+            // Interfaces first so a :class implementing one can resolve it in-module.
+            foreach (var it in interfaces)
+                lib.AddInterface(it.FullName, it.Methods.Select(m =>
+                    (m.Item1, m.Item2, (IReadOnlyList<Type>)m.Item3)).ToList());
+            foreach (var dg in delegates)
+                lib.AddDelegate(dg.FullName, dg.ReturnType, dg.ParamTypes);
+            foreach (var s in classes)
+                lib.AddClass(s.FullName, s.BaseType, s.Fields, s.Attributes, s.Methods,
+                    s.CtorBody, s.Properties, s.Interfaces, s.Events, s.CtorParamTypes,
+                    s.BaseCtorArgIndices, s.CtorSpecs);
+            foreach (var e in enums)
+                lib.AddEnum(e.FullName, e.Underlying, e.Members);
+            foreach (var ch in constHolders)
+                lib.AddConstants(ch.FullName, ch.Members);
+            foreach (var st in structs)
+                lib.AddStruct(st.FullName, st.Fields);
+            foreach (var d in docs)
+                lib.AddDoc(d.Id, d.Summary);
+            lib.Save();
+            return new LispString(savePath);
+        }
+        catch (ArgumentException ae)
+        {
+            throw new LispErrorException(new LispError(
+                $"DOTNET:%SAVE-LIBRARY: {ae.Message}"));
+        }
+        catch (PlatformNotSupportedException pnse)
+        {
+            throw new LispErrorException(new LispError(
+                $"DOTNET:%SAVE-LIBRARY: {pnse.Message}"));
         }
 #endif
     }
@@ -2601,37 +3066,50 @@ public static partial class Runtime
             throw new LispErrorException(new LispProgramError(
                 "DOTNET:MAKE-GENERIC-TYPE: requires open-type and type-args-list"));
 
-        string openName = args[0] switch { LispString ls => ls.Value, Symbol sym => sym.Name, _ => args[0].ToString() ?? "" };
-
-        // Parse the type-args list (a Lisp list of type-name strings/symbols).
-        var typeArgNames = new System.Collections.Generic.List<string>();
+        // Parse the type-args list. Each element is a type-name string/symbol OR an
+        // already-resolved System.Type — the latter is what makes nesting composable:
+        // (make-generic-type "System.Action" (list (make-generic-type "...Task" ...)))
+        // instead of spelling the whole assembly-qualified name by hand.
+        var typeArgForms = new System.Collections.Generic.List<LispObject>();
         var cursor = args[1];
         while (cursor is Cons c)
         {
-            typeArgNames.Add(c.Car switch { LispString ls => ls.Value, Symbol sym => sym.Name, _ => c.Car.ToString() ?? "" });
+            typeArgForms.Add(c.Car);
             cursor = c.Cdr;
         }
-        if (typeArgNames.Count == 0)
+        if (typeArgForms.Count == 0)
             throw new LispErrorException(new LispProgramError(
                 "DOTNET:MAKE-GENERIC-TYPE: type-args-list must be a non-empty list of type names"));
 
-        // Resolve the open generic definition. Accept the name with an explicit
-        // backtick-arity (Dictionary`2) or without (infer arity from the args).
-        Type? openType = TryResolveDotNetType(openName);
-        if ((openType == null || !openType.IsGenericTypeDefinition) && !openName.Contains('`'))
-            openType = TryResolveDotNetType($"{openName}`{typeArgNames.Count}");
+        // Resolve the open generic definition. It may already be a System.Type (an open
+        // generic definition); otherwise accept the name with an explicit backtick-arity
+        // (Dictionary`2) or without (infer arity from the args).
+        Type? openType;
+        string openName;
+        if (args[0] is LispDotNetObject odno && odno.Value is Type ot)
+        {
+            openType = ot;
+            openName = ot.FullName ?? ot.Name;
+        }
+        else
+        {
+            openName = args[0] switch { LispString ls => ls.Value, Symbol sym => sym.Name, _ => args[0].ToString() ?? "" };
+            openType = TryResolveDotNetType(openName);
+            if ((openType == null || !openType.IsGenericTypeDefinition) && !openName.Contains('`'))
+                openType = TryResolveDotNetType($"{openName}`{typeArgForms.Count}");
+        }
         if (openType == null)
             throw new LispErrorException(new LispError(
                 $"DOTNET:MAKE-GENERIC-TYPE: cannot resolve open generic type {openName}"));
         if (!openType.IsGenericTypeDefinition)
             throw new LispErrorException(new LispError(
                 $"DOTNET:MAKE-GENERIC-TYPE: {openType.FullName} is not an open generic type definition"));
-        if (openType.GetGenericArguments().Length != typeArgNames.Count)
+        if (openType.GetGenericArguments().Length != typeArgForms.Count)
             throw new LispErrorException(new LispError(
                 $"DOTNET:MAKE-GENERIC-TYPE: {openType.FullName} expects " +
-                $"{openType.GetGenericArguments().Length} type arg(s), got {typeArgNames.Count}"));
+                $"{openType.GetGenericArguments().Length} type arg(s), got {typeArgForms.Count}"));
 
-        var typeArgs = typeArgNames.Select(ResolveDotNetType).ToArray();
+        var typeArgs = typeArgForms.Select(ResolveElementTypeArg).ToArray();
         try
         {
             return new LispDotNetObject(openType.MakeGenericType(typeArgs));
@@ -2887,6 +3365,15 @@ public static partial class Runtime
     private static Symbol ForeignCbHandlerSym =>
         _foreignCbHandlerSym ??= Startup.SymInPkg("*FOREIGN-CALLBACK-HANDLER*", "DOTCL");
 
+    private static Symbol? _foreignCbPropagateSym;
+    private static Symbol ForeignCbPropagateSym =>
+        _foreignCbPropagateSym ??= Startup.SymInPkg("*FOREIGN-CALLBACK-PROPAGATE*", "DOTCL");
+
+    /// <summary>True when dotcl:*foreign-callback-propagate* asks for a callback's Lisp
+    /// error to reach the caller instead of being contained at the boundary.</summary>
+    private static bool ForeignCallbackPropagates()
+        => IsTruthy(DynamicBindings.Get(ForeignCbPropagateSym));
+
     /// <summary>
     /// Invoke a Lisp function at a C#→Lisp callback boundary (a delegate built by
     /// CreateLispDelegate, an event handler, or a dotnet:%define-class method
@@ -2915,25 +3402,33 @@ public static partial class Runtime
                 tag, 0, hargs.Length > 0 ? hargs[0] : Nil.Instance),
             "%FOREIGN-CALLBACK-BOUNDARY", -1);
         HandlerClusterStack.PushCluster(new[] { new HandlerBinding(Startup.Sym("ERROR"), handler) });
+        // Set when dotcl:*foreign-callback-propagate* asks for the caller to see the
+        // error. It is re-signalled AFTER the try, because signalling inside the catch
+        // would hit this boundary's own ERROR handler — still on the cluster stack until
+        // the finally runs — and bounce straight back here.
+        LispCondition? propagate = null;
         try
         {
             return Funcall(fn, args);
         }
         catch (HandlerCaseInvocationException ex) when (ReferenceEquals(ex.Tag, tag))
         {
-            return HandleForeignCallbackError(
-                ex.Condition as LispCondition ?? new LispError(ex.Condition.ToString() ?? "error"));
+            var cond = ex.Condition as LispCondition ?? new LispError(ex.Condition.ToString() ?? "error");
+            if (!ForeignCallbackPropagates()) return HandleForeignCallbackError(cond);
+            propagate = cond;
         }
         catch (LispErrorException ex)
         {
             // A LispErrorException that bypassed the handler-bind (e.g. signaled with
             // no ERROR match, or thrown directly) is still handled at the boundary.
-            return HandleForeignCallbackError(ex.Condition);
+            if (!ForeignCallbackPropagates()) return HandleForeignCallbackError(ex.Condition);
+            propagate = ex.Condition;
         }
         finally
         {
             HandlerClusterStack.PopCluster();
         }
+        throw new LispErrorException(propagate);
     }
 
     private static LispObject HandleForeignCallbackError(LispCondition condition)
@@ -3173,33 +3668,36 @@ public static partial class Runtime
             throw new LispErrorException(new LispProgramError(
                 "DOTNET:STATIC-GENERIC: requires type-name method-name type-args-list &rest args"));
 
-        string typeName   = args[0] switch { LispString ls => ls.Value, _ => args[0].ToString() ?? "" };
+        // The declaring type and each type arg may be a name string/symbol or an
+        // already-resolved System.Type (e.g. from dotnet:make-generic-type).
         string memberName = args[1] switch { LispString ls => ls.Value, _ => args[1].ToString() ?? "" };
-        var    type       = ResolveDotNetType(typeName);
+        var    type       = ResolveElementTypeArg(args[0]);
+        string typeName   = type.FullName ?? type.Name;
         var    lispArgs   = args.Skip(3).ToArray();
 
         // Parse type-args list
-        var typeArgNames = new System.Collections.Generic.List<string>();
+        var typeArgForms = new System.Collections.Generic.List<LispObject>();
         var cursor = args[2];
         while (cursor is Cons c)
         {
-            typeArgNames.Add(c.Car switch { LispString ls => ls.Value, _ => c.Car.ToString() ?? "" });
+            typeArgForms.Add(c.Car);
             cursor = c.Cdr;
         }
+        int typeArgCount = typeArgForms.Count;
 
         // Find the generic method definition matching name + arity
         var methodDef = type.GetMethods(
                 System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static)
             .Where(m => m.Name == memberName
                      && m.IsGenericMethodDefinition
-                     && m.GetGenericArguments().Length == typeArgNames.Count
+                     && m.GetGenericArguments().Length == typeArgCount
                      && m.GetParameters().Length == lispArgs.Length)
             .FirstOrDefault()
             ?? throw new LispErrorException(new LispError(
                 $"DOTNET:STATIC-GENERIC: no generic static method {typeName}.{memberName} " +
-                $"with {typeArgNames.Count} type arg(s) and {lispArgs.Length} parameter(s)"));
+                $"with {typeArgCount} type arg(s) and {lispArgs.Length} parameter(s)"));
 
-        var concreteTypes  = typeArgNames.Select(ResolveDotNetType).ToArray();
+        var concreteTypes  = typeArgForms.Select(ResolveElementTypeArg).ToArray();
         var concreteMethod = methodDef.MakeGenericMethod(concreteTypes);
         var paramInfos     = concreteMethod.GetParameters();
 
@@ -3227,11 +3725,12 @@ public static partial class Runtime
         if (args.Length < 3)
             throw new LispErrorException(new LispProgramError(
                 "DOTNET:INVOKE-GENERIC: requires object method-name type-args-list &rest args"));
-        if (args[0] is not LispDotNetObject dno)
+        var    target     = InvocationReceiver(args[0]);
+        if (target == null)
             throw new LispErrorException(new LispTypeError(
-                "DOTNET:INVOKE-GENERIC: first argument must be a .NET object", args[0]));
+                "DOTNET:INVOKE-GENERIC: first argument must be a .NET object, string, character or number",
+                args[0]));
 
-        var    target     = dno.Value;
         var    type       = target.GetType();
         string memberName = args[1] switch { LispString ls => ls.Value, _ => args[1].ToString() ?? "" };
         var    lispArgs   = args.Skip(3).ToArray();

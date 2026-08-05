@@ -87,6 +87,10 @@
       <DotclSourceManifest>$(DotclBundleDir)dotcl-deps.source.txt</DotclSourceManifest>
       <DotclRootSourcesList>$(DotclBundleDir)dotcl-root-sources.txt</DotclRootSourcesList>
       <DotclDeployedManifest>$(DotclBundleDir)dotcl-deps.txt</DotclDeployedManifest>
+      <!-- Per-project copy of the manifest: the app's dotcl-deps.txt owns that
+           name in the shared output directory, so a referenced Lisp library
+           needs one it can name for itself. -->
+      <DotclProjectManifest>$(DotclBundleDir)$(MSBuildProjectName).deps.txt</DotclProjectManifest>
       <DotclRootFasl>$(DotclBundleDir)$(MSBuildProjectName).fasl</DotclRootFasl>
       <_DotclCmdPrefix Condition="'$(DotclTool)' != ''">&quot;$(DotclTool)&quot;</_DotclCmdPrefix>
       <_DotclCmdPrefix Condition="'$(DotclTool)' == '' and '$(DotclRuntimeProject)' != ''">dotnet run --project &quot;$(DotclRuntimeProject)&quot; --</_DotclCmdPrefix>
@@ -133,6 +137,10 @@
       <DotclSourceManifest>$(DotclBundleDir)dotcl-deps.source.txt</DotclSourceManifest>
       <DotclRootSourcesList>$(DotclBundleDir)dotcl-root-sources.txt</DotclRootSourcesList>
       <DotclDeployedManifest>$(DotclBundleDir)dotcl-deps.txt</DotclDeployedManifest>
+      <!-- Per-project copy of the manifest: the app's dotcl-deps.txt owns that
+           name in the shared output directory, so a referenced Lisp library
+           needs one it can name for itself. -->
+      <DotclProjectManifest>$(DotclBundleDir)$(MSBuildProjectName).deps.txt</DotclProjectManifest>
       <DotclRootFasl>$(DotclBundleDir)$(MSBuildProjectName).fasl</DotclRootFasl>
     </PropertyGroup>
 
@@ -200,6 +208,13 @@
     <WriteLinesToFile File="$(DotclDeployedManifest)"
                       Lines="@(_DotclManifestLine)"
                       Overwrite="true" />
+    <!-- Same list under a per-project name, for a Lisp library that is consumed
+         by another project: its facade loads this one rather than the app's
+         dotcl-deps.txt. LoadFromManifest skips entries already loaded, so the
+         overlap (core, shared deps) is paid for once. -->
+    <WriteLinesToFile File="$(DotclProjectManifest)"
+                      Lines="@(_DotclManifestLine)"
+                      Overwrite="true" />
   </Target>
 
   <!--
@@ -214,12 +229,14 @@
     <PropertyGroup>
       <DotclBundleDir>$(IntermediateOutputPath)dotcl-fasl\</DotclBundleDir>
       <DotclDeployedManifest>$(DotclBundleDir)dotcl-deps.txt</DotclDeployedManifest>
+      <DotclProjectManifest>$(DotclBundleDir)$(MSBuildProjectName).deps.txt</DotclProjectManifest>
     </PropertyGroup>
 
     <ItemGroup>
       <_DotclBundled Include="$(DotclBundleDir)*.fasl" />
       <_DotclBundled Include="$(DotclBundleDir)dotcl.core" Condition="Exists('$(DotclBundleDir)dotcl.core')" />
       <_DotclBundled Include="$(DotclDeployedManifest)" />
+      <_DotclBundled Include="$(DotclProjectManifest)" Condition="Exists('$(DotclProjectManifest)')" />
     </ItemGroup>
 
     <!-- MAUI Android: emit MauiAsset for the SingleProject pipeline AND

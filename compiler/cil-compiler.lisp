@@ -8,6 +8,7 @@
   (:use :cl)
   (:export #:compile-toplevel #:compile-toplevel-eval
            #:*cross-compiling* #:*compile-file-mode* #:*concatenate-build*
+           #:*emit-source-lines* #:*emit-frame-locals*
            #:compile-file-concatenated))
 
 ;; %INLINE-CS-SPLICED is the dispatch symbol for the dotcl-cs:inline-cs
@@ -30,6 +31,24 @@
 
 (defvar *cross-compiling* nil
   "T when running in SBCL as cross-compiler; NIL in self-hosted mode.")
+
+(defvar *emit-source-lines* nil
+  "When non-NIL, a function (fn form) -> source-line-or-NIL. COMPILE-EXPR calls it
+   per compiled cons form and, on a non-NIL line, prepends a (:line N) marker so the
+   assembler can emit a debug sequence point. NIL (default, incl. cross-compile)
+   disables it entirely — output is unchanged. Set by COMPILE-FILE under
+   DOTCL_EMIT_PDB. Forms produced by macroexpansion aren't in the source map, so
+   funcall returns NIL for them and they get no marker (they read as #line hidden).")
+
+(defvar *emit-frame-locals* nil
+  "When true, every compiled function body opens a runtime DebugFrame at entry and
+   each user lexical binding stores itself there, so the in-process debugger
+   (sldb's frame locals, the :bt/:locals commands) can read a running frame's
+   variables by name via DOTCL:FRAME-LOCALS. NIL by default (incl. cross-compile):
+   no (:frame-enter)/(:frame-set) instructions are emitted and the output is
+   unchanged. Independent of *EMIT-SOURCE-LINES*, which drives the Portable PDB
+   for out-of-process debuggers; this one is for the CL-native debugger.
+   User-visible as DOTCL:*EMIT-FRAME-LOCALS* (the same symbol — Startup imports it).")
 
 (defvar *compile-file-mode* nil
   "T when compiling via compile-file. Controls eval-when behavior per CLHS 3.2.3.1:
@@ -72,6 +91,25 @@
 ;;; (*specials*, *symbol-macros*, *global-specials*, ...) and config knobs
 ;;; must stay plain defvar — they are intentionally NOT reset at closure
 ;;; boundaries.
+;;;
+;;; Which scoped table belongs in the registry follows from how its entries are
+;;; keyed:
+;;;
+;;; - KEY-VERIFIED tables — entries pinned to a slot key handed out by *LOCALS*
+;;;   (long / small-int / numeric-array / native-double / native-single /
+;;;   native-decimal / dotnet-typed). These travel together in the *CSTATE*
+;;;   pack (see its section below), which is registered as ONE entry. A closure
+;;;   body compiles with a fresh *LOCALS*, so an outer key can never be
+;;;   re-derived there and every inherited entry is already dead — resetting
+;;;   the whole pack preserves behavior and keeps one rule for the family.
+;;;
+;;; - NAME-KEYED declaration tables — the user's type declarations
+;;;   (*fixnum-locals*, *double-float-locals*, *single-float-locals*,
+;;;   *decimal-locals*). These stay plain defvar and are NOT reset: a declared
+;;;   variable captured by the closure keeps its declared type inside the body,
+;;;   which is what lets the body use the native path on it. An inner binding of
+;;;   the same name is handled where that binding is compiled (the shadowed
+;;;   entries are dropped there), not at the closure boundary.
 
 (defvar *closure-fresh-state* '()
   "Alist of (variable-symbol . fresh-init-value) rebound (via progv) around
@@ -117,8 +155,9 @@
     (progv vars vals
       (funcall thunk))))
 
-(define-compile-state *locals* '()
-  :doc "Alist of (symbol . local-key). local-key is a keyword like :v1.")
+;; The *LOCALS* alist and the other scope tables live in the *CSTATE* pack —
+;; see its section below (readers CSTATE-LOCALS / CSTATE-BLOCK-TAGS /
+;; CSTATE-GO-TAGS / CSTATE-BOXED-VARS / CSTATE-LOCAL-FUNCTIONS).
 
 ;; Counters for gen-local / gen-label. Under concurrent eval the plain incf can
 ;; race (lost update), but this is benign: the generated names are only ever
@@ -131,12 +170,6 @@
 
 (defvar *label-counter* 0)
 
-(define-compile-state *block-tags* '()
-  :doc "Alist of (block-name . (tag-key . result-key)).
-   tag-key is a keyword for the tag object, result-key for the result local.")
-
-(define-compile-state *go-tags* '()
-  :doc "Alist of (tag-symbol . (tagbody-id-key . integer-label)).")
 
 (defvar *specials* '()
   "List of symbols known to be special (both global and locally declared).")
@@ -146,10 +179,6 @@
    Used to determine binding classification: only global specials force nested let bindings
    to be dynamic. Locally-declared specials (declare (special x)) only affect references.")
 
-(define-compile-state *boxed-vars* '()
-  :doc "Set of variable names (symbols) that need boxing (mutated + captured).")
-
-
 (defvar *macros* (make-hash-table :test #'eq :synchronized t)
   "Global macro table: symbol → macro-expander-function.
    :synchronized so concurrent eval (dotcl:set-parallel-eval) cannot corrupt the
@@ -157,16 +186,11 @@
    Keyed by symbol identity (not name string).
    Not reset by compile-toplevel (defmacro has global effect).")
 
-(defvar *function-return-types* (make-hash-table :test #'eq)
+(defvar *function-return-types* (make-hash-table :test #'eq :synchronized t)
   "symbol → return-type (currently only 'fixnum is honored).
    Populated by (declaim (ftype (function (...) ret) name...)).
    Used by fixnum-typed-p to recognize `(name args...)` as statically
    fixnum-typed, which then enables native int64 paths in arithmetic.")
-
-(define-compile-state *local-functions* '()
-  :doc "Alist of (name-string local-key boxed-p).
-   For flet: local-key is a keyword for a LispObject local holding the function.
-   For labels: boxed-p is T, local-key is a keyword for a LispObject[] box.")
 
 (defvar *symbol-macros* '()
   "Alist of (symbol . expansion) for symbol-macrolet. Dynamically scoped.")
@@ -191,7 +215,28 @@
              (pop rest))
     result))
 
-(defvar *global-symbol-macros* (make-hash-table :test #'eq)
+(defvar *inline-defs* (make-hash-table :test #'eq :synchronized t)
+  "Function-name symbol -> (LAMBDA-LIST . BODY) for functions whose DEFUN was
+   compiled while the name was proclaimed INLINE. Filled by COMPILE-DEFUN,
+   consumed by MAYBE-EXPAND-INLINE at call sites.
+
+   CLHS 3.2.2.1.3 puts the proclamation BEFORE the defun for exactly this
+   reason: the compiler has to be told to keep the definition around before it
+   sees it. A later (declaim (inline f)) does not reach back and make an
+   already-compiled f inlinable, which matches every other implementation.")
+
+(defvar *inlining-stack* '()
+  "Function names whose bodies are currently being substituted, innermost first.
+   Stops a recursive function from inlining into its own expansion forever, and
+   stops a mutually recursive pair from doing the same. Dynamically scoped.")
+
+(defvar *inline-body-size-limit* 80
+  "Maximum cons count of a recorded body that will be substituted at a call
+   site. INLINE is a request, not an order (CLHS 3.2.2.1.3), and expanding a
+   large body at every call site trades a call for a large multiple of the code.
+   Deliberately generous: the functions people declaim inline are small.")
+
+(defvar *global-symbol-macros* (make-hash-table :test #'eq :synchronized t)
   "Hash table of global symbol macros defined by DEFINE-SYMBOL-MACRO.")
 
 (defvar *ltv-counter* 0
@@ -243,6 +288,20 @@
               ((eq (car a) (car b)) (setf a (cdr a) b (cdr b)))
               (t (return nil)))))
 
+;; Phase profiler hook. Resolved at load time in the TARGET (the SBCL
+;; cross-compile host has no DOTCL package), same shape as
+;; *known-type-name-p-fn*. NIL =&gt; WITH-PHASE is a plain PROGN.
+(defvar *phase-time-fn*
+  (ignore-errors
+   (let ((sym (find-symbol "%PHASE-TIME" "DOTCL")))
+     (and sym (fboundp sym) (symbol-function sym)))))
+
+(defmacro with-phase (name &body body)
+  "Charge BODY's elapsed time to phase NAME when DOTCL_PHASE_PROF=1 is on."
+  `(if *phase-time-fn*
+       (funcall *phase-time-fn* ,name (lambda () ,@body))
+       (progn ,@body)))
+
 (defun cached-macroexpand (form expander)
   "Expand FORM using EXPANDER, memoizing the result per (FORM, *macroexpand-scope*)
    in *macroexpand-cache*.  If the cache is NIL (outside a compile-toplevel) falls
@@ -252,20 +311,15 @@
              (cell (assoc *macroexpand-scope* by-scope :test #'%macroexpand-scope=)))
         (if cell
             (cdr cell)
-            (let ((result (funcall expander form)))
+            (let ((result (with-phase "macroexpand" (funcall expander form))))
               (setf (gethash form *macroexpand-cache*)
                     (cons (cons *macroexpand-scope* result) by-scope))
               result)))
       (funcall expander form)))
 
-;;; TCO (Tail Call Optimization) state — declared here so all compiler files see them as special.
-(define-compile-state *tco-self-name* nil
-  :doc "Mangled name of function currently being compiled for self-TCO. NIL = disabled.")
-(define-compile-state *tco-loop-label* nil
-  :doc "Label name to branch back to for TCO self-call.")
-(define-compile-state *tco-param-entries* nil
-  :doc "List of (key . boxed-p) in param order, for rewriting TCO self-call args.
-   key = gen-local string; boxed-p = T if the local is a LispObject[] box.")
+;;; TCO (Tail Call Optimization) state. The TCO-scope values live in the
+;;; *CSTATE* pack (readers below its section); the two flags that are rebound
+;;; per expression stay dynamic specials here.
 (define-compile-state *in-tail-position* nil
   :fresh-init t
   :doc "T when the currently-being-compiled expression is in tail position
@@ -278,55 +332,6 @@
    take the exception (throw) path instead. Reset at closure boundaries: a
    closure body is a separate CLR method, never inside the outer finally
    region, so its own block/tagbody exits may use the local leave path.")
-(define-compile-state *self-fn-local* nil
-  :doc "When set, name of the local variable holding the current function's own
-   LispFunction object. compile-named-call uses this instead of doing a full
-   load-sym-pkg / GetFunctionBySymbol sequence for non-tail self-calls.
-   Must be cleared at closure boundaries — it refers to a local declared in
-   the OUTER method.")
-
-;;; --- Per-compilation dynamic state ---
-(define-compile-state *tco-self-symbol* nil
-  :doc "Original symbol of function currently being compiled for self-TCO.
-   NIL = fall back to mangled-name string comparison against *tco-self-name*.
-   Used by compile-named-call for symbol-identity self-call matching (avoids
-   cross-package false matches like uiop/os:getenv vs dotcl:getenv). Must be
-   reset at closure boundaries and rebound per labels function: a stale outer
-   defun's symbol makes a tail call to that OUTER defun inside an inner named
-   function match as a SELF call and branch to the inner TCO loop.")
-(define-compile-state *tco-local-fn-key* nil
-  :doc "Box key (gen-local string) of the labels function currently being compiled
-   for self-TCO, or NIL if compiling a defun. Allows compile-named-call to
-   permit self-TCO despite the function name appearing in *local-functions*.")
-(define-compile-state *tco-leave-instrs* nil
-  :doc "List of CIL instructions to emit BEFORE the TCO branch (br or leave).
-   Used when the TCO site is inside a try block that requires explicit cleanup
-   before branching back (e.g. handler-case must call HandlerClusterStack.PopCluster
-   before leaving the catch-protected region). NIL for ordinary TCO.")
-(define-compile-state *tco-in-try-catch* nil
-  :doc "T when the current TCO site is inside a handler-case try/catch body (not
-   a try/finally). In this case, TCO uses `leave` to exit the protected region
-   instead of `br`. Distinct from *in-try-block* which signals try/finally
-   (special-variable LET / unwind-protect) and always suppresses TCO.")
-
-(define-compile-state *labels-mutual-tco* nil
-  :doc "Dispatch table for labels mutual TCO. Each entry:
-   (name-str fn-index which-fn-key tcoloop-label shared-param-keys).
-   NIL outside a mutual-TCO labels group. Reset to NIL in every
-   compile-function-body-*/compile-closure-body so closures compiled
-   within the group never emit br-to-outer-TCOLOOP.")
-
-(define-compile-state *labels-direct-speculation* nil
-  :doc "During speculative direct+TCO compilation of a single self-recursive
-   labels function (compile-labels-boxed), holds (name-str . box-key).
-   compile-lambda routes the fn — whose SOLE free var is its own labels box —
-   through the direct :make-function-direct path (which carries self-TCO)
-   instead of a closure; compile-function-body-direct injects the box as a
-   local-function so any self-reference NOT lowered to a TCO branch emits a
-   detectable (:ldloc box-key) load. The caller then scans the generated body
-   and only accepts it when provably self-contained, otherwise recompiles via
-   the closure path. NIL outside speculation. Reset at closure boundaries.")
-
 (define-compile-state *in-try-block* nil
   :doc "Non-NIL when the currently-being-compiled expression is inside a try/
    finally region whose finally must run on exit (e.g. special-variable
@@ -345,8 +350,172 @@
    the slot; unboxing happens inline in compile-as-long (castclass Fixnum
    + get_Value). Caller-side guarantee: the user's declaration contract.")
 
-(defvar *small-int-locals* '()
-  "Alist (name-string . (LO . HI)) for lexical locals whose value is statically
+;;; --- *CSTATE*: the key-verified table pack (one special, seven tables) ----
+;;; The per-compilation tables whose entries are pinned to slot keys handed
+;;; out by *LOCALS* travel together as one simple-vector held by the special
+;;; *CSTATE*. Updates are functional — CSTATE-WITH copies the vector — and
+;;; are installed either by rebinding *CSTATE* in a LET/LET* (scoped
+;;; extension, exactly like the per-table specials this replaces) or by SETF
+;;; of *CSTATE* inside such a frame (the sequential-LET* idiom). The empty
+;;; pack is shared and never mutated, so a reset is a binding to
+;;; +CSTATE-EMPTY+, and the closure-boundary reset is ONE registry entry no
+;;; matter how many tables the pack grows.
+
+(defparameter +cs-long-locals+ 0)
+(defparameter +cs-small-int-locals+ 1)
+(defparameter +cs-numeric-array-locals+ 2)
+(defparameter +cs-native-double-locals+ 3)
+(defparameter +cs-native-single-locals+ 4)
+(defparameter +cs-native-decimal-locals+ 5)
+(defparameter +cs-dotnet-typed-locals+ 6)
+(defparameter +cs-tco-self-name+ 7)
+(defparameter +cs-tco-loop-label+ 8)
+(defparameter +cs-tco-param-entries+ 9)
+(defparameter +cs-self-fn-local+ 10)
+(defparameter +cs-tco-self-symbol+ 11)
+(defparameter +cs-tco-local-fn-key+ 12)
+(defparameter +cs-tco-leave-instrs+ 13)
+(defparameter +cs-tco-in-try-catch+ 14)
+(defparameter +cs-labels-mutual-tco+ 15)
+(defparameter +cs-labels-direct-speculation+ 16)
+(defparameter +cs-native-self-name+ 17)
+(defparameter +cs-locals+ 18)
+(defparameter +cs-block-tags+ 19)
+(defparameter +cs-go-tags+ 20)
+(defparameter +cs-boxed-vars+ 21)
+(defparameter +cs-local-functions+ 22)
+(defparameter +cstate-empty+
+  (vector '() '() '() '() '() '() '() nil nil nil nil nil nil nil nil nil nil nil
+          '() '() '() '() '()))
+
+(defvar *cstate* +cstate-empty+
+  "The key-verified table pack; see the section comment above. Participates
+   in the closure-boundary reset as a single registry entry.")
+(%register-closure-fresh '*cstate* +cstate-empty+)
+
+(defun cstate-with (cstate &rest index-value-pairs)
+  "A copy of CSTATE with each +CS-...+ INDEX set to the following VALUE."
+  (let ((v (copy-seq cstate)))
+    (do ((p index-value-pairs (cddr p)))
+        ((null p) v)
+      (setf (svref v (first p)) (second p)))))
+
+(defun cstate-fresh-function-body ()
+  "The pack a non-closure function body compiles under: everything fresh —
+   the body is a separate CLR method, so it must not inherit the enclosing
+   body's compile context — EXCEPT the tco-self-symbol / tco-local-fn-key
+   slots, which are parameters the CALLER hands in through its *CSTATE*
+   binding (compile-defun passes the defun symbol, the labels path passes
+   the self-TCO key) and the self-call fast path in the body reads.
+   The closure boundary differs on exactly this point: it resets to the
+   plain +CSTATE-EMPTY+, clearing the handoff (a closure is never the
+   self-call target of its enclosing function)."
+  (cstate-with +cstate-empty+
+               +cs-tco-self-symbol+ (cstate-tco-self-symbol)
+               +cs-tco-local-fn-key+ (cstate-tco-local-fn-key)))
+
+(defun cstate-locals ()
+  "Alist of (symbol . local-key). local-key is a keyword like :v1."
+  (svref *cstate* +cs-locals+))
+
+(defun cstate-block-tags ()
+  "Alist of (block-name . (tag-key . result-key)).
+   tag-key is a keyword for the tag object, result-key for the result local."
+  (svref *cstate* +cs-block-tags+))
+
+(defun cstate-go-tags ()
+  "Alist of (tag-symbol . (tagbody-id-key . integer-label))."
+  (svref *cstate* +cs-go-tags+))
+
+(defun cstate-boxed-vars ()
+  "Set of variable names (symbols) that need boxing (mutated + captured)."
+  (svref *cstate* +cs-boxed-vars+))
+
+(defun cstate-local-functions ()
+  "Alist of (name-string local-key boxed-p).
+   For flet: local-key is a keyword for a LispObject local holding the function.
+   For labels: boxed-p is T, local-key is a keyword for a LispObject[] box."
+  (svref *cstate* +cs-local-functions+))
+
+(defun cstate-tco-self-name ()
+  "Mangled name of function currently being compiled for self-TCO. NIL = disabled."
+  (svref *cstate* +cs-tco-self-name+))
+
+(defun cstate-tco-loop-label ()
+  "Label name to branch back to for TCO self-call."
+  (svref *cstate* +cs-tco-loop-label+))
+
+(defun cstate-tco-param-entries ()
+  "List of (key . boxed-p) in param order, for rewriting TCO self-call args.
+   key = gen-local string; boxed-p = T if the local is a LispObject[] box."
+  (svref *cstate* +cs-tco-param-entries+))
+
+(defun cstate-self-fn-local ()
+  "When set, name of the local variable holding the current function's own
+   LispFunction object. compile-named-call uses this instead of doing a full
+   load-sym-pkg / GetFunctionBySymbol sequence for non-tail self-calls.
+   Must be cleared at closure boundaries — it refers to a local declared in
+   the OUTER method."
+  (svref *cstate* +cs-self-fn-local+))
+
+(defun cstate-tco-self-symbol ()
+  "Original symbol of function currently being compiled for self-TCO.
+   NIL = fall back to mangled-name string comparison against the tco-self-name
+   slot. Used by compile-named-call for symbol-identity self-call matching
+   (avoids cross-package false matches like uiop/os:getenv vs dotcl:getenv).
+   Must be reset at closure boundaries and rebound per labels function: a stale
+   outer defun's symbol makes a tail call to that OUTER defun inside an inner
+   named function match as a SELF call and branch to the inner TCO loop."
+  (svref *cstate* +cs-tco-self-symbol+))
+
+(defun cstate-tco-local-fn-key ()
+  "Box key (gen-local string) of the labels function currently being compiled
+   for self-TCO, or NIL if compiling a defun. Allows compile-named-call to
+   permit self-TCO despite the function name appearing in *local-functions*."
+  (svref *cstate* +cs-tco-local-fn-key+))
+
+(defun cstate-tco-leave-instrs ()
+  "List of CIL instructions to emit BEFORE the TCO branch (br or leave).
+   Used when the TCO site is inside a try block that requires explicit cleanup
+   before branching back (e.g. handler-case must call HandlerClusterStack.PopCluster
+   before leaving the catch-protected region). NIL for ordinary TCO."
+  (svref *cstate* +cs-tco-leave-instrs+))
+
+(defun cstate-tco-in-try-catch ()
+  "T when the current TCO site is inside a handler-case try/catch body (not
+   a try/finally). In this case, TCO uses `leave` to exit the protected region
+   instead of `br`. Distinct from *in-try-block* which signals try/finally
+   (special-variable LET / unwind-protect) and always suppresses TCO."
+  (svref *cstate* +cs-tco-in-try-catch+))
+
+(defun cstate-labels-mutual-tco ()
+  "Dispatch table for labels mutual TCO. Each entry:
+   (name-str fn-index which-fn-key tcoloop-label shared-param-keys).
+   NIL outside a mutual-TCO labels group. Reset in every
+   compile-function-body-*/compile-closure-body so closures compiled
+   within the group never emit br-to-outer-TCOLOOP."
+  (svref *cstate* +cs-labels-mutual-tco+))
+
+(defun cstate-labels-direct-speculation ()
+  "During speculative direct+TCO compilation of a single self-recursive
+   labels function (compile-labels-boxed), holds (name-str . box-key).
+   compile-lambda routes the fn — whose SOLE free var is its own labels box —
+   through the direct :make-function-direct path (which carries self-TCO)
+   instead of a closure; compile-function-body-direct injects the box as a
+   local-function so any self-reference NOT lowered to a TCO branch emits a
+   detectable (:ldloc box-key) load. The caller then scans the generated body
+   and only accepts it when provably self-contained, otherwise recompiles via
+   the closure path. NIL outside speculation. Reset at closure boundaries."
+  (svref *cstate* +cs-labels-direct-speculation+))
+
+(defun cstate-native-self-name ()
+  "Mangled name of the current function if it is native-eligible (all fixnum params
+   + fixnum return, no captures, no specials). Enables native self-call path
+   in compile-as-long and native TCO arg evaluation."
+  (svref *cstate* +cs-native-self-name+))
+
+(defun cstate-small-int-locals ()
+  "Alist (SLOT-KEY . (LO . HI)) for lexical locals whose value is statically
    known to lie in the inclusive int64 range [LO,HI]. Two sources: bounded
    integer type declarations ((signed-byte N) / (unsigned-byte N) / bit /
    (integer c c)) and let-binding init range inference (compile-let). Like
@@ -355,7 +524,8 @@
    tracked range is TIGHT, which is what lets expr-int-range prove a product
    stays in int64 and emit native arithmetic; an overflowing product instead
    falls back to the promoting path and yields a bignum (CL-compliant). Mutated
-   locals are excluded — a setf could move the value out of [LO,HI].")
+   locals are excluded — a setf could move the value out of [LO,HI]."
+  (svref *cstate* +cs-small-int-locals+))
 
 (defvar *double-float-locals* '()
   "Like *fixnum-locals* but for double-float declarations. Enables native
@@ -371,35 +541,100 @@
    scope (+ x y) compiles to decimal.op_Addition and PRESERVES SCALE (1.50m+2.25m=
    3.75m), where the undeclared path degrades a decimal to its rational value.")
 
-(define-compile-state *long-locals* '()
-  :doc "List of symbol-name strings whose local slots hold Int64 directly (not boxed
+(defun native-slot-p (sym slot-keys)
+  "The slot key SYM's binding occupies when that slot is one of SLOT-KEYS (a
+   native-representation table: *LONG-LOCALS* / *NATIVE-DOUBLE-LOCALS* /
+   *NATIVE-SINGLE-LOCALS*), or NIL.
+
+   Resolving SYM first and then asking about the resulting SLOT is what makes
+   shadowing a non-issue: an inner binding of the same name gets its own key and
+   simply is not in the table, while an outer native slot stays valid for as long
+   as SYM still resolves to it. Captured variables are excluded — env capture
+   stores an object, so their slot holds the box, not a raw value."
+  (and (symbolp sym)
+       slot-keys
+       (not (boxed-var-p sym))
+       (let ((key (lookup-local sym)))
+         (and key (member key slot-keys) key))))
+
+(defun shadows-var-p (sym k)
+  "True when a binding of SYM hides an existing *LOCALS* entry keyed by K.
+   Same rule as LOCAL-ENTRY resolves references with — identity, or a
+   package-compatible name — so a same-named symbol from ANOTHER package does
+   not hide it (CL scoping is by symbol identity)."
+  (and (symbolp k)
+       (or (eq k sym)
+           (and (same-var-package-p k (symbol-package sym))
+                (string= (var-name k) (var-name sym))))))
+
+(defun remove-locals-shadowed-by (syms locals)
+  "LOCALS minus every entry that a binding of some symbol in SYMS hides."
+  (remove-if (lambda (entry)
+               (some (lambda (s) (shadows-var-p s (car entry))) syms))
+             locals))
+
+(defun drop-shadowed-type-locals (bound-names entries)
+  "ENTRIES (a name list, or an alist keyed by name) minus every entry whose
+   variable name is in BOUND-NAMES — the names a new binding form introduces.
+
+   A type declaration covers the binding it was written for and nothing else. An
+   inner binding of the same name is a DIFFERENT variable, so carrying the outer
+   entry into that scope miscompiles: (let ((n 1)) (declare (fixnum n))
+   (let ((n 2.5d0)) (* n 2))) would unbox the inner DoubleFloat slot as a Fixnum.
+   Every form that binds variables must filter the inherited type-locals through
+   this before adding its own declarations."
+  (remove-if (lambda (e)
+               (member (if (consp e) (car e) e) bound-names :test #'string=))
+             entries))
+
+(defun cstate-long-locals ()
+  "List of SLOT KEYS whose local slots hold Int64 directly (not boxed
    LispObject). Set in native function bodies where params are long-typed.
-   compile-as-long skips :unbox-fixnum for these; fixnum-typed-p returns T.")
+   compile-as-long skips :unbox-fixnum for these; fixnum-typed-p returns T.
 
-(defvar *native-double-locals* '()
-  "List of symbol-name strings whose local slots hold a native r8 (double)
-   directly, not a boxed DoubleFloat — the float analog of *long-locals*. Set by
-   compile-let for double-float-declared, non-special, non-captured lexicals
-   with a double-typed init. compile-as-double loads the slot raw (no
-   unbox-double); compile-var-ref boxes on a generic read; compile-setq stores
-   the raw double. This removes the per-setq DoubleFloat box in numeric loops
-   (fft/mandelbrot's tr/ti/ur/ui accumulators). A name here is also in
-   *double-float-locals*, so double-float-typed-p still reports it double.")
+   Keyed by slot, not by variable name: the fact recorded is about the SLOT, and
+   a slot is never reused by another binding. A name-keyed list cannot express
+   this — an inner binding of the same name (even from another package, which is
+   a different variable entirely) had to be handled by dropping the outer entry,
+   which silently un-declared a slot that was still live and still Int64, and the
+   next read of it emitted a boxed load against an Int64 slot. With slot keys the
+   question 'is THIS binding's slot native?' is answered by NATIVE-SLOT-P and
+   shadowing needs no handling at all."
+  (svref *cstate* +cs-long-locals+))
 
-(defvar *native-single-locals* '()
-  "Like *native-double-locals* but for single-float locals (native r4 slot).")
+(defun cstate-native-double-locals ()
+  "List of SLOT KEYS whose local slots hold a native r8 (double)
+   directly, not a boxed DoubleFloat — the float analog of the long-locals
+   table. Set by compile-let for double-float-declared, non-special,
+   non-captured lexicals with a double-typed init. compile-as-double loads the
+   slot raw (no unbox-double); compile-var-ref boxes on a generic read;
+   compile-setq stores the raw double. This removes the per-setq DoubleFloat
+   box in numeric loops (fft/mandelbrot's tr/ti/ur/ui accumulators). The
+   variable is also in *double-float-locals*, so double-float-typed-p still
+   reports it double."
+  (svref *cstate* +cs-native-double-locals+))
 
-(define-compile-state *numeric-array-locals* '()
-  :doc "Alist (NAME-STRING KEY RANK LO . HI) of let locals proven to hold a
+(defun cstate-native-single-locals ()
+  "Like the native-double table but for single-float locals (native r4 slot)."
+  (svref *cstate* +cs-native-single-locals+))
+
+(defun cstate-native-decimal-locals ()
+  "Like the native-double table but for decimal locals: the slot holds a raw
+   System.Decimal instead of a boxed LispDecimal. Set by compile-let for
+   decimal-declared, non-special, non-captured lexicals with a decimal-typed
+   init. compile-as-decimal loads the slot raw (no unbox-decimal), compile-setq
+   stores it raw, and compile-var-ref boxes only when the value crosses back into
+   generic code — which is what takes the get_Value/newobj pair out of every
+   operation in a declared-decimal computation."
+  (svref *cstate* +cs-native-decimal-locals+))
+
+(defun cstate-numeric-array-locals ()
+  "Alist (NAME-STRING KEY RANK LO . HI) of let locals proven to hold a
    numeric-backed array (make-array init with bounded-integer element type).
    aref on them reads/writes elements as raw int64 (Runtime.ArefNum*L) and
    contributes the storage range to expr-int-range. KEY pins the binding —
-   consumers verify (lookup-local NAME) still resolves to it.")
-
-(define-compile-state *native-self-name* nil
-  :doc "Mangled name of the current function if it is native-eligible (all fixnum params
-   + fixnum return, no captures, no specials). Enables native self-call path
-   in compile-as-long and native TCO arg evaluation.")
+   consumers verify (lookup-local NAME) still resolves to it."
+  (svref *cstate* +cs-numeric-array-locals+))
 
 (defvar *compile-time-flet-defs* nil
   "List of flet function source definitions active during compilation.
@@ -417,9 +652,27 @@
    fast path instead of the args-array entry."
   (intern (format nil "~a_~d" prefix (incf *var-counter*)) "DOTCL.CIL-COMPILER"))
 
-(defvar *uninterned-var-names* (make-hash-table :test #'eq)
+(defvar *uninterned-var-names* (make-hash-table :test #'eq :synchronized t)
   "Uninterned variable symbol -> unique effective-name string.")
-(defvar *uninterned-var-counter* 0)
+(defvar *uninterned-var-counter*
+  ;; ATOMIC-LONG on dotcl so (set-parallel-eval t) workers can bump it lock-free:
+  ;; a plain (incf) on a special var is a non-atomic read-modify-write and two
+  ;; workers can lost-update to the same value, minting colliding names for
+  ;; distinct gensyms. MAKE-ATOMIC-LONG is a runtime primitive absent on the SBCL
+  ;; cross-compile host (which never runs VAR-NAME), so resolve it at load time by
+  ;; name — DOTCL:: reader syntax would break reading on the host, which has no
+  ;; DOTCL package. The host keeps a plain integer purely to stay loadable.
+  (if (find-package "DOTCL")
+      (funcall (find-symbol "MAKE-ATOMIC-LONG" "DOTCL") 0)
+      0))
+
+(defun uninterned-var-counter-next ()
+  "Atomically bump the uninterned-var uniqueness counter and return the new
+   value. Lock-free on dotcl (ATOMIC-LONG-INCF); a plain increment on the SBCL
+   host, where VAR-NAME never runs concurrently."
+  (if (integerp *uninterned-var-counter*)
+      (incf *uninterned-var-counter*)
+      (funcall (find-symbol "ATOMIC-LONG-INCF" "DOTCL") *uninterned-var-counter*)))
 
 (defun var-name (sym)
   "Effective name string of a variable symbol for the string-keyed
@@ -435,7 +688,21 @@
       (or (gethash sym *uninterned-var-names*)
           (setf (gethash sym *uninterned-var-names*)
                 (format nil "~a#:~d" (symbol-name sym)
-                        (incf *uninterned-var-counter*))))))
+                        (uninterned-var-counter-next))))))
+
+(defun local-function-entry (name)
+  "The *LOCAL-FUNCTIONS* entry (NAME-STRING KEY BOXED-P) NAME resolves to, or NIL
+   — i.e. \"is this operator shadowed by an FLET/LABELS binding in scope?\", which
+   guards every inlining, TCO and open-coding decision keyed on an operator name.
+   The one place that walks *LOCAL-FUNCTIONS*, so that guard has one definition.
+
+   NAME is a function name — a symbol, an (SETF f) list, or an ALREADY-MANGLED
+   name string. Strings pass through untouched: entries are stored under
+   MANGLE-NAME, which preserves symbol-name case, while MANGLE-NAME of a *string*
+   upcases it — re-mangling would break a name that legitimately holds lowercase
+   (a multiply-escaped symbol like |#{-reader|)."
+  (assoc (if (stringp name) name (mangle-name name))
+         (cstate-local-functions) :test #'string=))
 
 (defun gen-label (prefix)
   "Generate a unique label symbol in the compiler package.
@@ -549,21 +816,45 @@ through to compile-sym-lookup."
                 :test (lambda (n entry)
                         (and (stringp entry) (string= n entry)))))))
 
-(defun lookup-local (sym)
-  "Look up a variable in *locals* by symbol identity first, then name fallback.
-  The var-name fallback is package-aware: it only matches entries from the
-  same package, from DOTCL.CIL-COMPILER (closure env-locals), or uninterned
-  (gensyms). This prevents cross-package collisions where two different
-  packages have a symbol with the same printed name."
-  (or (cdr (assoc sym *locals* :test #'eq))
+(defun local-entry (sym)
+  "The *LOCALS* entry (BINDING-SYMBOL . SLOT-KEY) SYM resolves to, or NIL.
+  Symbol identity first, then a name fallback. The var-name fallback is
+  package-aware: it only matches entries from the same package, from
+  DOTCL.CIL-COMPILER (closure env-locals), or uninterned (gensyms). This
+  prevents cross-package collisions where two different packages have a symbol
+  with the same printed name.
+
+  This and LOCAL-ENTRY-BY-NAME are the only two places that walk *LOCALS*:
+  callers that need the slot, the binding symbol, or just a yes/no go through
+  them rather than re-inlining ASSOC + VAR-NAME, so the matching rule has one
+  definition (the string-keyed design is the root of the shadow-bug class)."
+  (or (assoc sym (cstate-locals) :test #'eq)
       (let ((name (var-name sym))
             (sym-pkg (symbol-package sym)))
-        (cdr (assoc name *locals*
-                    :key (lambda (k)
-                           (if (symbolp k)
-                               (same-var-package-p k sym-pkg)
-                               nil))
-                    :test #'string=)))))
+        (assoc name (cstate-locals)
+               :key (lambda (k)
+                      (if (symbolp k)
+                          (same-var-package-p k sym-pkg)
+                          nil))
+               :test #'string=))))
+
+(defun local-entry-by-name (name locals)
+  "The entry in LOCALS (an alist shaped like *LOCALS*) whose variable's effective
+  name is NAME, or NIL. The name-keyed counterpart of LOCAL-ENTRY, for callers
+  that hold only a VAR-NAME string — free-var capture, closure env-locals, the
+  typed-local check. LOCALS is required rather than defaulting to *LOCALS* so the
+  lambda list stays required-only (direct-delegate calls; see GEN-LOCAL).
+
+  No package filter is possible here: a name string has lost the symbol's
+  package. Callers that still hold the symbol should use LOCAL-ENTRY."
+  (assoc name locals
+         :key (lambda (k) (if (symbolp k) (var-name k) nil))
+         :test #'string=))
+
+(defun lookup-local (sym)
+  "The slot key SYM's binding lives in, or NIL. See LOCAL-ENTRY for the
+  matching rule."
+  (cdr (local-entry sym)))
 
 ;; When true, LOCAL-BOUND-P answers T for every symbol. Bound only during
 ;; free-var CANDIDATE collection (%compute-free-candidates, cil-analysis.lisp):
@@ -580,20 +871,10 @@ through to compile-sym-lookup."
   different package, which would suppress free-var capture and cause
   the closure to read the wrong variable at runtime."
   (or *ffv-assume-bound*
-      (assoc sym *locals* :test #'eq)
-      (let ((name (var-name sym))
-            (sym-pkg (symbol-package sym)))
-        (assoc name *locals*
-               :key (lambda (k)
-                      (if (symbolp k)
-                          (same-var-package-p k sym-pkg)
-                          nil))
-               :test #'string=))
+      (local-entry sym)
       ;; Also check *local-functions* for boxed labels functions
       ;; (supports closure capture of labels functions whose name clashes with a variable)
-      (let ((name (symbol-name sym)))
-        (find name *local-functions*
-              :key #'first :test #'string=))))
+      (local-function-entry sym)))
 
 (defun local-bound-name-p (name)
   "Like LOCAL-BOUND-P but keyed by an effective-name STRING, so callers holding
@@ -602,17 +883,25 @@ through to compile-sym-lookup."
    VAR-NAME is NAME: the symbol-identity (EQ) branch of LOCAL-BOUND-P can only
    match an entry that this by-name branch also matches. Avoids the package
    mutation an INTERN would cause (harmful under concurrent compile)."
-  (or (assoc name *locals*
-             :key (lambda (k) (if (symbolp k) (var-name k) nil))
-             :test #'string=)
-      (find name *local-functions* :key #'first :test #'string=)))
+  (or (local-entry-by-name name (cstate-locals))
+      (local-function-entry name)))
 
 
 (defun boxed-var-p (sym)
   "Check if a variable needs boxing (by effective name, cross-package safe)."
-  (member (var-name sym) *boxed-vars*
+  (member (var-name sym) (cstate-boxed-vars)
           :key (lambda (x) (if (symbolp x) (var-name x) x))
           :test #'string=))
+
+(defun labels-cell-var-p (name-or-sym)
+  "True if NAME-OR-SYM names a labels function cell — a boxed LispObject[1]
+   holding a LispFunction, tracked in *locals* under a __LABELFN_ prefix. Such
+   cells keep the array representation even under debug info emission (only
+   genuine data variables use the debug-only LispBox cell), so their box
+   reads/writes and env captures must stay ldelem / LispObject[]."
+  (let ((name (if (stringp name-or-sym) name-or-sym (var-name name-or-sym))))
+    (and (>= (length name) 10)
+         (string= name "__LABELFN_" :end1 10))))
 
 (defun mangle-name (symbol)
   "Convert a Lisp symbol/name to a display string (for defmethod names).
@@ -893,15 +1182,24 @@ through to compile-sym-lookup."
   (let ((key (lookup-local sym)))
     (if key
         (if (boxed-var-p sym)
-            `((:ldloc ,key) (:ldc-i4 0) (:ldelem-ref))
-            (if (and (boundp '*long-locals*) *long-locals*
-                     (member (var-name sym) *long-locals* :test #'string=))
+            ;; Boxed read: LispObject[1] cell (normal, and labels function cells
+            ;; even under debug) or LispBox.Value (debug data variable).
+            (if (and *emit-source-lines* (not (labels-cell-var-p sym)))
+                `((:ldloc ,key) (:ldfld "LispBox.Value"))
+                `((:ldloc ,key) (:ldc-i4 0) (:ldelem-ref)))
+            (if (and (boundp '*cstate*)
+                     (native-slot-p sym (cstate-long-locals)))
                 `((:ldloc ,key) (:call "Fixnum.Make"))
                 ;; Native float slot: the raw r8/r4 needs boxing for a generic
                 ;; (LispObject) read; native float contexts use compile-as-*.
-                (case (float-native-local-kind sym)
-                  (:double `((:ldloc ,key) (:newobj "DoubleFloat")))
-                  (:single `((:ldloc ,key) (:newobj "SingleFloat")))
+                (cond
+                  ((eq (float-native-local-kind sym) :double)
+                   `((:ldloc ,key) (:newobj "DoubleFloat")))
+                  ((eq (float-native-local-kind sym) :single)
+                   `((:ldloc ,key) (:newobj "SingleFloat")))
+                  ;; Native decimal slot boxes the same way on a generic read.
+                  ((decimal-native-local-p sym)
+                   `((:ldloc ,key) (:newobj "LispDecimal")))
                   (t `((:ldloc ,key))))))
         ;; No local binding — check symbol-macro (let/let* shadow these too)
         (multiple-value-bind (sm-exp found) (lookup-symbol-macro sym)
@@ -960,9 +1258,17 @@ through to compile-sym-lookup."
    MV-context positions (*in-mv-context* t, e.g. inside multiple-value-list)
    also propagate. Single-value forms never produce MvReturn so no unwrap."
   (let ((code (compile-expr-raw expr)))
-    (if (or *in-mv-context* *in-tail-position* (single-value-form-p expr))
-        code
-        `(,@code (:call "Runtime.UnwrapMv")))))
+    (let ((c2 (if (or *in-mv-context* *in-tail-position* (single-value-form-p expr))
+                  code
+                  `(,@code (:call "Runtime.UnwrapMv")))))
+      ;; Debug info: prepend a source-span marker for literally-written cons forms
+      ;; (only when line emission is on). A no-op instruction for the assembler
+      ;; unless it is collecting sequence points. SPAN is (start-line start-col
+      ;; end-line end-col) from *emit-source-lines*, or NIL (macroexpansion output).
+      (if (and *emit-source-lines* (consp expr))
+          (let ((span (funcall *emit-source-lines* expr)))
+            (if span (cons (cons :line span) c2) c2))
+          c2))))
 
 (defun compile-for-single-value (expr)
   "Compile expr and ensure result is a single value (unwrap MvReturn).
@@ -1090,7 +1396,7 @@ through to compile-sym-lookup."
           (destructuring-bind ,clean-params (cdr form)
             ,@mbody))))))
 
-(defvar *dotnet-typed-locals* '()
+(defun cstate-dotnet-typed-locals ()
   "Alist (var-name-string type-name-string . local-key) of lexical locals whose
    value is statically known to be a .NET object of a specific type, inferred
    from a let/let* init form (DOTNET:NEW / DOTNET:BOX / (THE (DOTNET \"T\") ...)).
@@ -1098,7 +1404,8 @@ through to compile-sym-lookup."
    qualify. The DOTNET:INVOKE compiler macro reads the filtered view (see
    DOTNET-VALID-TYPED-LOCALS) to lower a call on such a variable to a typed direct
    callvirt. The recorded LOCAL-KEY is verified against the current *LOCALS* so an
-   inner rebinding of the same name shadows it (no stale type → no miscompile).")
+   inner rebinding of the same name shadows it (no stale type → no miscompile)."
+  (svref *cstate* +cs-dotnet-typed-locals+))
 
 (defun dotnet-valid-typed-locals ()
   "Return *DOTNET-TYPED-LOCALS* as a plain (name-string . type-string) alist,
@@ -1107,15 +1414,145 @@ through to compile-sym-lookup."
    …) maps the name to a different key, so the entry is dropped and the call falls
    back to the dynamic path. Conservative: when in doubt, omit."
   (let ((result '()))
-    (dolist (e *dotnet-typed-locals*)
+    (dolist (e (cstate-dotnet-typed-locals))
+      ;; NAME is a VAR-NAME (INFER-DOTNET-TYPED-BINDINGS stores one), so resolve
+      ;; it with the same rule — a gensym-bound typed local is a real binding,
+      ;; and the (EQ CUR KEY) check below is what makes the entry safe to keep.
       (let* ((name (car e)) (type (cadr e)) (key (cddr e))
-             (cur (cdr (assoc name *locals*
-                              :key (lambda (k) (if (and (symbolp k) (symbol-package k))
-                                                   (symbol-name k) nil))
-                              :test #'string=))))
+             (cur (cdr (local-entry-by-name name (cstate-locals)))))
         (when (eq cur key)
           (push (cons name type) result))))
     result))
+
+;; Probed by name at load time, like *KNOWN-TYPE-NAME-P-FN*: the proclamation
+;; lives on the runtime's symbol and the SBCL cross-compile host has neither the
+;; DOTCL package nor the flag. Defined here rather than beside its sibling
+;; probes because the cross-compile compiles the core in segments, and a use
+;; that precedes its definition is reported as undefined at segment end.
+(defvar *global-notinline-p-fn*
+  (ignore-errors
+   (let ((sym (find-symbol "GLOBAL-NOTINLINE-P" "DOTCL")))
+     (and sym (fboundp sym) (symbol-function sym)))))
+
+(defun %global-notinline-p (sym)
+  "Was SYM proclaimed NOTINLINE globally? NIL on the cross-compile host, which
+   carries no proclamations of its own."
+  (and *global-notinline-p-fn* (funcall *global-notinline-p-fn* sym)))
+
+(defvar *global-inline-p-fn*
+  (ignore-errors
+   (let ((sym (find-symbol "GLOBAL-INLINE-P" "DOTCL")))
+     (and sym (fboundp sym) (symbol-function sym)))))
+
+(defun %global-inline-p (sym)
+  "Was SYM proclaimed INLINE globally? NIL on the cross-compile host, so the
+   core is never built with inline substitution — the host has no
+   proclamations, and keeping cross-compile output identical to the runtime
+   compiler's is worth more here than the speed."
+  (and *global-inline-p-fn* (funcall *global-inline-p-fn* sym)))
+
+(defun %form-size (form &optional (limit 1000000))
+  "Cons count of FORM, stopping once LIMIT is exceeded (returns LIMIT then).
+   Bounded so a circular constant inside a body cannot hang the size check."
+  (let ((n 0))
+    (labels ((walk (x)
+               (when (and (consp x) (< n limit))
+                 (incf n)
+                 (walk (car x))
+                 (walk (cdr x)))))
+      (walk form))
+    n))
+
+(defun %inline-body-capturable-p (body params)
+  "True when substituting BODY at the current call site could bind one of its
+   free names to something the definition never meant.
+
+   The body was written at top level, so its free function names mean the GLOBAL
+   ones. Dropped verbatim inside a caller's FLET/LABELS of the same name, they
+   would silently mean the caller's local function instead — the classic
+   inline-hygiene bug, and a wrong ANSWER, not just wrong speed. MACROLET can do
+   the same to any name at all, and its bindings live in the global macro table
+   while the scope is active, so there is nothing per-name to consult: an active
+   macrolet scope refuses the substitution outright.
+
+   PARAMS are excluded because the expansion's own lambda binds them."
+  (or *macroexpand-scope*
+      (and (cstate-local-functions)
+           (let ((hit nil))
+             (labels ((walk (x)
+                        (cond (hit nil)
+                              ((symbolp x)
+                               (when (and x (not (member x params))
+                                          (local-function-entry x))
+                                 (setf hit t)))
+                              ((consp x)
+                               (unless (eq (car x) 'quote)
+                                 (walk (car x))
+                                 (walk (cdr x)))))))
+               (walk body))
+             hit))))
+
+(defun maybe-expand-inline (op expr)
+  "If OP names a function proclaimed INLINE whose definition was recorded, return
+   the call EXPR rewritten as an immediately-applied lambda; else NIL.
+
+   (let ((p1 arg1) (p2 arg2) ...) decls... (block op body...)) is the expansion.
+   For an all-required lambda list this is exactly what applying the function
+   means: the inits are evaluated left to right in the caller's scope, then the
+   parameters are bound. Everything else — capture, RETURN-FROM, declarations
+   (including a SPECIAL one, which makes the LET binding dynamic just as it
+   would a parameter) — is then the existing LET machinery's problem.
+
+   NOT ((lambda (params) ...) args): dotcl does not beta-reduce an immediately
+   applied lambda, it builds a function object and calls it, so that shape
+   replaces the call with a call plus an allocation.
+
+   The leading declarations have to stay OUTSIDE the block — they belong to the
+   binding form's body, and (block name (declare ...)) is not a declaration
+   position at all. Getting this wrong drops every parameter type declaration,
+   which is exactly what the functions people declaim inline are carrying.
+
+   Refused when:
+   - a local flet/labels/macrolet binds OP — that is a different function
+   - NOTINLINE is in scope for OP, lexically or globally (CLHS 3.2.2.1.1)
+   - OP is already being inlined (recursion would not terminate)
+   - the argument count does not match the required parameters, or the lambda
+     list has any non-required parameter (an &optional/&key/&rest expansion has
+     to replicate defaulting rules; left to the normal call for now)
+   - the body is larger than *INLINE-BODY-SIZE-LIMIT*
+   - a local function binding or an active MACROLET at the call site could
+     capture one of the body's free names (see %INLINE-BODY-CAPTURABLE-P)
+
+   Every refusal simply leaves a normal function call, so none of them can be
+   wrong — only slower."
+  (when (and (not *cross-compiling*)
+             (symbolp op)
+             (not (local-function-entry op))
+             (not (member op *notinline-functions*))
+             (not (member op *inlining-stack*))
+             (not (%global-notinline-p op)))
+    (let ((def (gethash op *inline-defs*)))
+      (when def
+        (let ((params (car def))
+              (body (cdr def))
+              (args (cdr expr)))
+          (when (and (every #'symbolp params)
+                     (notany (lambda (p) (member p lambda-list-keywords)) params)
+                     (= (length args) (length params))
+                     (< (%form-size body (1+ *inline-body-size-limit*))
+                        (1+ *inline-body-size-limit*))
+                     (not (%inline-body-capturable-p body params))
+                     ;; The global proclamation is asked about last: it crosses
+                     ;; into the runtime, and everything above is cheap.
+                     (%global-inline-p op))
+            (let ((decls '())
+                  (rest body))
+              (loop while (and (consp rest) (consp (car rest))
+                               (eq (caar rest) 'declare))
+                    do (push (pop rest) decls))
+              `(let ,(mapcar #'list params args)
+                 ,@(nreverse decls)
+                 (block ,op ,@rest)))))))))
 
 (defun maybe-expand-compiler-macro (op expr)
   "If OP names a compiler macro and isn't shadowed by a local function, apply it to
@@ -1124,12 +1561,16 @@ through to compile-sym-lookup."
    Skipped during cross-compile so we never pick up the host (SBCL) compiler macros."
   (when (and (not *cross-compiling*)
              (symbolp op)
-             (not (assoc (symbol-name op) *local-functions* :test #'string=))
+             (not (local-function-entry op))
              ;; CLHS 3.2.2.1.1: a NOTINLINE declaration of OP in scope disables
              ;; its compiler macro for calls in that scope.
              (not (member op *notinline-functions*)))
     (let ((expander (compiler-macro-function op)))
-      (when (functionp expander)
+      ;; The global proclamation is asked about only once a compiler macro is
+      ;; known to exist: the lexical list above is checked for every call form,
+      ;; but this crosses into the runtime, and a call with no compiler macro
+      ;; has nothing to suppress anyway.
+      (when (and (functionp expander) (not (%global-notinline-p op)))
         ;; Expander takes (whole-form environment). dotcl passes the static .NET
         ;; type environment (an alist of locals with a known .NET type) as the
         ;; environment so DOTNET:INVOKE can lower a call on such a variable to a
@@ -1138,7 +1579,7 @@ through to compile-sym-lookup."
         ;; (define-compiler-macro ignores its environment argument). Returning the
         ;; original form (eq) is the standard way to decline expansion.
         (let ((expansion (funcall expander expr
-                                  (and *dotnet-typed-locals*
+                                  (and (cstate-dotnet-typed-locals)
                                        (dotnet-valid-typed-locals)))))
           (unless (eq expansion expr) expansion))))))
 
@@ -1190,7 +1631,7 @@ through to compile-sym-lookup."
                                  tagbody go unwind-protect catch throw flet labels macrolet
                                  symbol-macrolet the locally load-time-value eval-when
                                  multiple-value-call multiple-value-prog1 progv)))
-               (assoc (mangle-name op) *local-functions* :test #'string=))
+               (local-function-entry op))
           (compile-named-call op (cdr expr))
         ;; Hash table dispatch — O(1) for all registered ops (~250 cases).
         ;; *compile-was-toplevel* is already bound above; handlers use it directly.
@@ -1267,6 +1708,17 @@ through to compile-sym-lookup."
                    (:ldloc ,fn-tmp) (:ldloc ,arr-tmp)
                    (:callvirt "LispFunction.Invoke"))))
 
+              ;; Operator is neither a symbol nor a cons, e.g. (0 1 2). This shows
+              ;; up when a macro definition was not loaded and one of its unquoted
+              ;; literal arguments is read as a call form. Defer the diagnosis to
+              ;; run time (like SBCL, so the rest of the file still compiles)
+              ;; instead of letting the SYMBOL-NAME dispatch below signal an
+              ;; opaque "0 is not of type SYMBOL" type error at compile time.
+              ((not (symbolp op))
+               (compile-static-program-error
+                (let ((*print-length* 6) (*print-level* 3))
+                  (format nil "Illegal function call: ~S" expr))))
+
               ;; String=-based dispatch for ops that may arrive from different packages.
               ;; These are rare (internal/cross-package ops) — not in the eq hash table.
               ((string= (symbol-name op) "TRY-EVAL") (compile-unary-call (cdr expr) "Runtime.TryEval"))
@@ -1337,7 +1789,7 @@ through to compile-sym-lookup."
               ;; Preserves top-level-ness per CLHS 3.2.3.1.
               ((and (symbolp op)
                     (find-macro-expander op)
-                    (not (assoc (symbol-name op) *local-functions* :test #'string=)))
+                    (not (local-function-entry op)))
                (let* ((expander (find-macro-expander op))
                       (expanded (cached-macroexpand expr expander))
                       (*at-toplevel* *compile-was-toplevel*))
@@ -1351,7 +1803,15 @@ through to compile-sym-lookup."
                  (if cm-expansion
                      (let ((*at-toplevel* *compile-was-toplevel*))
                        (compile-expr cm-expansion))
-                     (compile-named-call op (cdr expr)))))
+                     ;; No compiler macro: an INLINE proclamation may substitute
+                     ;; the definition instead. A user compiler macro wins — it
+                     ;; is the more specific instruction about this call.
+                     (let ((inl (maybe-expand-inline op expr)))
+                       (if inl
+                           (let ((*inlining-stack* (cons op *inlining-stack*))
+                                 (*at-toplevel* nil))
+                             (compile-expr inl))
+                           (compile-named-call op (cdr expr)))))))
 
               (t (error "Cannot compile form: ~s" expr)))))))))
 
@@ -1394,14 +1854,20 @@ through to compile-sym-lookup."
   (and r (<= +int64-min+ (car r)) (<= (cdr r) +int64-max+)))
 
 (defun small-int-local-range (expr)
-  "If EXPR is a reference to a small-int local (see *small-int-locals*) that is a
+  "If EXPR is a reference to a small-int local (see CSTATE-SMALL-INT-LOCALS) that is a
    plain non-captured slot, return its proven (LO . HI) range; else NIL. These
    slots hold a boxed Fixnum, so compile-as-long can unbox them inline."
   (and (symbolp expr)
-       (boundp '*small-int-locals*)
+       (boundp '*cstate*)
        (not (boxed-var-p expr))
-       (lookup-local expr)
-       (cdr (assoc (var-name expr) *small-int-locals* :test #'string=))))
+       (let ((key (lookup-local expr)))
+         (and key
+              ;; Slot-keyed, like the native tables: the proven range belongs to
+              ;; the binding, so an inner binding of the same name resolves to a
+              ;; different slot and never inherits it. (It used to be name-keyed,
+              ;; and an inner (let ((f 3))) handed its integer range to an outer
+              ;; F holding a native double — native multiply on an r8 slot.)
+              (cdr (assoc key (cstate-small-int-locals) :test #'equal))))))
 
 ;;; ------------------------------------------------------------
 ;;; Numeric-backed array locals: let bindings whose init is a make-array
@@ -1484,7 +1950,7 @@ through to compile-sym-lookup."
    :displaced-to, return (RANK LO . HI); else NIL."
   (and (consp init)
        (eq (car init) 'make-array)
-       (not (assoc (mangle-name 'make-array) *local-functions* :test #'string=))
+       (not (local-function-entry 'make-array))
        (consp (cdr init))
        (let ((rank (%make-array-static-rank (cadr init)))
              (spec nil)
@@ -1551,13 +2017,13 @@ through to compile-sym-lookup."
    numeric-array-aref-info / -float-kind split this by backing."
   (and (consp expr)
        (eq (car expr) 'aref)
-       (not (assoc (mangle-name 'aref) *local-functions* :test #'string=))
+       (not (local-function-entry 'aref))
        (consp (cdr expr))
        (symbolp (cadr expr))
-       (boundp '*numeric-array-locals*)
+       (boundp '*cstate*)
        (let* ((v (cadr expr))
               (idxs (cddr expr))
-              (entry (assoc (var-name v) *numeric-array-locals* :test #'string=)))
+              (entry (assoc (var-name v) (cstate-numeric-array-locals) :test #'string=)))
          (and entry
               (eq (lookup-local v) (second entry))
               (not (boxed-var-p v))
@@ -1620,9 +2086,8 @@ through to compile-sym-lookup."
        (and info (cdr info))))
     ;; Raw int64 local (native body) or declared-fixnum local → full int64 range.
     ((and (symbolp expr)
-          (boundp '*long-locals*) *long-locals*
-          (member (var-name expr) *long-locals* :test #'string=)
-          (lookup-local expr))
+          (boundp '*cstate*)
+          (native-slot-p expr (cstate-long-locals)))
      (cons +int64-min+ +int64-max+))
     ((and (symbolp expr)
           (boundp '*fixnum-locals*)
@@ -1664,7 +2129,7 @@ through to compile-sym-lookup."
     ((and (consp expr) (symbolp (car expr))
           (boundp '*function-return-types*)
           (eq (gethash (car expr) *function-return-types*) 'fixnum)
-          (not (assoc (mangle-name (car expr)) *local-functions* :test #'string=)))
+          (not (local-function-entry (car expr))))
      (cons +int64-min+ +int64-max+))
     (t nil)))
 
@@ -1707,10 +2172,8 @@ through to compile-sym-lookup."
     ((integerp expr) (and (<= -4611686018427387904 expr 4611686018427387903)))
     ;; Direct Int64 local in native function body — already long, no unbox needed
     ((and (symbolp expr)
-          (boundp '*long-locals*)
-          *long-locals*
-          (member (var-name expr) *long-locals* :test #'string=)
-          (lookup-local expr))
+          (boundp '*cstate*)
+          (native-slot-p expr (cstate-long-locals)))
      t)
     ;; Local var declared fixnum — must be a non-captured simple local
     ((and (symbolp expr)
@@ -1783,7 +2246,7 @@ through to compile-sym-lookup."
           (boundp '*function-return-types*)
           (eq (gethash (car expr) *function-return-types*) 'fixnum)
           ;; Must not be shadowed by a local flet/labels function.
-          (not (assoc (mangle-name (car expr)) *local-functions* :test #'string=)))
+          (not (local-function-entry (car expr))))
      t)
     (t nil)))
 
@@ -1795,22 +2258,21 @@ through to compile-sym-lookup."
      `((:ldc-i8 ,expr)))
     ;; Direct Int64 local in native body — already long, no unbox
     ((and (symbolp expr)
-          (boundp '*long-locals*)
-          *long-locals*
-          (member (var-name expr) *long-locals* :test #'string=)
-          (lookup-local expr))
+          (boundp '*cstate*)
+          (native-slot-p expr (cstate-long-locals)))
      `((:ldloc ,(lookup-local expr))))
     ;; Native self-call: long args avoid boxing; InvokeNativeN returns LispObject,
     ;; so unbox-fixnum extracts the long back for the caller.
     ((and (consp expr) (symbolp (car expr))
-          (boundp '*native-self-name*) *native-self-name*
-          (boundp '*self-fn-local*) *self-fn-local*
-          (string= (mangle-name (car expr)) *native-self-name*)
-          (not (assoc (mangle-name (car expr)) *local-functions* :test #'string=))
+          (boundp '*cstate*) (cstate-native-self-name)
+          (cstate-self-fn-local)
+          (string= (mangle-name (car expr)) (cstate-native-self-name))
+          (not (local-function-entry (car expr)))
           (let ((n (length (cdr expr)))) (and (>= n 1) (<= n 4)))
           (every #'fixnum-typed-p (cdr expr)))
      (let ((n-args (length (cdr expr))))
-       `(,(if (eq *self-fn-local* :arg0) '(:ldarg 0) `(:ldloc ,*self-fn-local*))
+       `(,(if (eq (cstate-self-fn-local) :arg0) '(:ldarg 0)
+              `(:ldloc ,(cstate-self-fn-local)))
          ,@(mapcan (lambda (arg)
                      (let ((*in-tail-position* nil) (*in-mv-context* nil))
                        (compile-as-long arg)))
@@ -2010,26 +2472,23 @@ through to compile-sym-lookup."
 (defun float-native-local-kind (sym)
   "If SYM is a lexical local whose slot holds a native float (r8/r4) directly
    rather than a boxed DoubleFloat/SingleFloat, return :double / :single; else
-   NIL. Gated (like *long-locals*) on a live lexical binding and non-boxed
+   NIL. Gated (like the long-locals table) on a live lexical binding and non-boxed
    (captured vars keep the boxed slot, since env capture stores an object)."
-  (and (symbolp sym)
-       (not (boxed-var-p sym))
-       (lookup-local sym)
-       (cond
-         ((and (boundp '*native-double-locals*)
-               (member (var-name sym) *native-double-locals* :test #'string=))
-          :double)
-         ((and (boundp '*native-single-locals*)
-               (member (var-name sym) *native-single-locals* :test #'string=))
-          :single)
-         (t nil))))
+  (cond
+    ((and (boundp '*cstate*)
+          (native-slot-p sym (cstate-native-double-locals)))
+     :double)
+    ((and (boundp '*cstate*)
+          (native-slot-p sym (cstate-native-single-locals)))
+     :single)
+    (t nil)))
 
 (defun compile-float-native-value (expr kind)
   "Compile EXPR leaving a native r8 (KIND :double) or r4 (KIND :single) on the
    stack, for storing into a native float slot. A float-typed EXPR lowers via
    compile-as-double/single (no box); anything else is compiled generically and
    unboxed — the slot's declaration promises a float, so a non-float value
-   surfaces as a loud InvalidCast (matching the *long-locals* store contract)."
+   surfaces as a loud InvalidCast (matching the long-locals store contract)."
   (ecase kind
     (:double (if (double-float-typed-p expr)
                  (compile-as-double expr)
@@ -2118,6 +2577,120 @@ through to compile-sym-lookup."
    on a host without the DECIMAL type, e.g. the SBCL cross-compile host."
   (and *decimal-type-available* (typep expr 'decimal)))
 
+;; Same load-time probe shape as *decimal-type-available*: the predicate lives in
+;; the DOTCL package, which the SBCL cross-compile host does not have, so it is
+;; looked up by name at load time rather than read as a package-qualified symbol.
+(defvar *known-type-name-p-fn*
+  (ignore-errors
+   (let ((sym (find-symbol "KNOWN-TYPE-NAME-P" "DOTCL")))
+     (and sym (fboundp sym) (symbol-function sym)))))
+
+;; Same shape, same reason: proclamations live on the runtime's symbols, and the
+;; host has neither the package nor the flags.
+(defvar *declaration-name-p-fn*
+  (ignore-errors
+   (let ((sym (find-symbol "DECLARATION-NAME-P" "DOTCL")))
+     (and sym (fboundp sym) (symbol-function sym)))))
+
+(defvar *warned-unknown-types* (make-hash-table :test #'equal :synchronized t)
+  "Names already reported by WARN-UNKNOWN-DECLARED-TYPES, so a type that is
+   declared in many places is mentioned once rather than once per binding form.")
+
+(defun %declared-type-known-p (spec)
+  "How SPEC is known as a type (:DEFTYPE / :BUILTIN / :NAME / :CLASS), or NIL.
+   Only bare symbols are judged: a compound specifier's head is a separate
+   question, and NIL/T reach here as their own objects rather than symbols."
+  (cond ((null *known-type-name-p-fn*) :builtin)   ; cross-compile host: never warn
+        ((not (symbolp spec)) :builtin)
+        (t (funcall *known-type-name-p-fn* spec))))
+
+(defun warn-unknown-declared-types (body)
+  "Style-warn for each type named in BODY's leading declarations that nothing
+   defines as a type. Such a declaration is silently dropped — the compiler has
+   nothing to attach it to — so a typo, or DECIMAL where DOTCL:DECIMAL was meant,
+   costs the declaration (and any optimization or check it implied) without a
+   word. Reported once per name per session."
+  (when *known-type-name-p-fn*
+    (dolist (form body)
+      (unless (and (consp form) (eq (car form) 'declare))
+        (return))
+      (dolist (decl (cdr form))
+        (when (consp decl)
+          (let ((head (car decl)))
+            (cond
+              ;; (type SPEC var...)
+              ((and (symbolp head) (string= (var-name head) "TYPE"))
+               (%warn-if-unknown-type (cadr decl) nil))
+              ;; (SPEC var...) shorthand, and the variable-less (SPEC) that is
+              ;; the shape of a user-proclaimed DECLARATION identifier. Both are
+              ;; reported: neither names anything the compiler can attach, and a
+              ;; proclaimed declaration name is excluded by the warner itself.
+              ((and (symbolp head)
+                    (every #'symbolp (cdr decl))
+                    (not (member (var-name head)
+                                 '("IGNORE" "IGNORABLE" "OPTIMIZE" "SPECIAL"
+                                   "DYNAMIC-EXTENT" "INLINE" "NOTINLINE"
+                                   "DECLARATION" "FTYPE" "VALUES")
+                                 :test #'string=)))
+               (%warn-if-unknown-type head (null (cdr decl)))))))))))
+
+(defun %warn-if-unknown-type (spec lone-p)
+  "Warn when a declared type name resolves to nothing. LONE-P is true for a
+   variable-less (declare (spec)), where the likely intent is a declaration
+   identifier rather than a type, so the message names the way to say that.
+   Three ways to get here and they look identical in source:
+
+   1. nothing defines it — a typo
+   2. it is a dotcl extension type named through the WRONG symbol, e.g. a bare
+      DECIMAL where DOTCL:DECIMAL was meant. Those are gated on symbol identity
+      (KNOWN-TYPE-NAME-P answers NIL for a foreign DECIMAL), because the
+      declaration-driven native paths key on the DOTCL symbol — so the
+      declaration buys nothing and the arithmetic quietly degrades
+   3. it is meant to be a declaration identifier that was never proclaimed
+      (LONE-P). CLHS leaves an unproclaimed one undefined, and every other
+      implementation warns
+
+   Either way the compiler drops the declaration, so say so. Once per name."
+  (when (and (symbolp spec)
+             (null (%declared-type-known-p spec))
+             ;; A symbol proclaimed (declaration foo) names no type by
+             ;; definition — CLHS forbids it from naming both — so it is not an
+             ;; unknown type, it is a declaration the user told us about.
+             (null (and *declaration-name-p-fn*
+                        (funcall *declaration-name-p-fn* spec))))
+    (let ((pkg (let ((p (symbol-package spec)))
+                 (if p (package-name p) "#")))
+          (suggestion (%known-type-in-other-package spec)))
+      (let ((key (format nil "~a::~a" pkg (symbol-name spec))))
+        (unless (gethash key *warned-unknown-types*)
+          (setf (gethash key *warned-unknown-types*) t)
+          (if lone-p
+              (warn "~a::~a is neither a known type nor a proclaimed declaration; ~
+                     the declaration is ignored~@[ (did you mean ~a?)~] ~
+                     — proclaim it with (declaim (declaration ~a))"
+                    pkg (symbol-name spec) suggestion (symbol-name spec))
+              (warn "declared type ~a::~a names no known type; the declaration is ignored~@[ (did you mean ~a?)~]"
+                    pkg (symbol-name spec) suggestion)))))))
+
+(defun %known-type-in-other-package (spec)
+  "A same-named symbol from another package that IS known as a type, rendered
+   as PKG:NAME. The DOTCL one wins when several exist — that is the case worth
+   pointing at (a bare DECIMAL meaning DOTCL:DECIMAL)."
+  (when *known-type-name-p-fn*
+    (let ((hits '()))
+      (dolist (p (list-all-packages))
+        (multiple-value-bind (sym status) (find-symbol (symbol-name spec) p)
+          (when (and status (not (eq sym spec)) (symbol-package sym)
+                     (funcall *known-type-name-p-fn* sym))
+            (pushnew sym hits :test #'eq))))
+      (let ((best (or (find-if (lambda (s)
+                                 (string= (package-name (symbol-package s)) "DOTCL"))
+                               hits)
+                      (and (= (length hits) 1) (first hits)))))
+        (when best
+          (format nil "~a:~a" (package-name (symbol-package best))
+                  (symbol-name best)))))))
+
 (defun decimal-typed-p (expr)
   "T if EXPR is statically known to produce a decimal (LispDecimal) value:
    a #m literal, a decimal-declared local (via *decimal-locals*), (the decimal E),
@@ -2192,10 +2765,20 @@ through to compile-sym-lookup."
   "cannot mix a decimal with a float in one arithmetic op — .NET forbids implicit
  decimal<->double; coerce explicitly, e.g. (+ (rational d) x) or (float d)")
 
+(defun decimal-native-local-p (sym)
+  "T if SYM's slot holds a raw System.Decimal rather than a boxed LispDecimal.
+   Gated on a live lexical binding and non-boxed, like the float slots: a
+   captured variable keeps the boxed slot because env capture stores an object."
+  (and (boundp '*cstate*)
+       (native-slot-p sym (cstate-native-decimal-locals))))
+
 (defun compile-as-decimal (expr)
   "Compile EXPR leaving a native System.Decimal (valuetype) on the stack.
    Caller must have verified decimal-typed-p."
   (cond
+    ;; Native decimal slot: the raw value is already there.
+    ((decimal-native-local-p expr)
+     `((:ldloc ,(lookup-local expr))))
     ((and (symbolp expr)
           (boundp '*decimal-locals*)
           (member (var-name expr) *decimal-locals* :test #'string=)
@@ -2218,6 +2801,18 @@ through to compile-sym-lookup."
      `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
            (compile-expr expr))
        (:unbox-decimal)))))
+
+(defun compile-decimal-native-value (expr)
+  "Compile EXPR leaving a raw System.Decimal on the stack, for storing into a
+   native decimal slot. A decimal-typed EXPR lowers through compile-as-decimal
+   (no box); anything else is compiled generically and unboxed — the slot's
+   declaration promises a decimal, so a non-decimal value surfaces as a loud
+   InvalidCast, matching the native float slots' store contract."
+  (if (decimal-typed-p expr)
+      (compile-as-decimal expr)
+      `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
+            (compile-expr expr))
+        (:unbox-decimal))))
 
 (defun compile-decimal-binop (args op)
   "Emit: compile-as-decimal a, compile-as-decimal b, <decimal op>, newobj LispDecimal."

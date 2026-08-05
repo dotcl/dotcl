@@ -9,6 +9,14 @@ public class LispThread : LispObject
     public string ThreadName { get; }
     public LispObject? ReturnValue { get; set; }
 
+    /// <summary>
+    /// Functions queued by INTERRUPT-THREAD, to run ON this thread the next time
+    /// it notices — which, on .NET, means when a blocking wait it is sitting in
+    /// throws ThreadInterruptedException. See Runtime.InterruptThread.
+    /// </summary>
+    public System.Collections.Concurrent.ConcurrentQueue<LispObject> PendingInterrupts { get; }
+        = new System.Collections.Concurrent.ConcurrentQueue<LispObject>();
+
     public LispThread(Thread thread, string name)
     {
         Thread = thread;
@@ -150,6 +158,22 @@ public partial class Runtime
         => AtomicLongResult(AtomicLongArg(args, 0, "ATOMIC-LONG-DECF").Add(
                -(args.Length > 1 ? AtomicLongInt(args[1], "ATOMIC-LONG-DECF") : 1L)));
 
+    // Typed direct delegates for the hot 1-arg / 2-arg calls (e.g. the compiler's
+    // uninterned-var counter increments once per fresh gensym during a compile).
+    // A LispAtomicLong argument reuses the array validator by wrapping the single
+    // arg; the delta-less form is the common one.
+    private static LispAtomicLong AtomicLong1(LispObject o, string fn)
+        => o as LispAtomicLong ?? throw new LispErrorException(new LispTypeError(
+               $"{fn}: not an ATOMIC-LONG", o, Startup.Sym("T")));
+    internal static LispObject AtomicLongIncf1(LispObject a)
+        => AtomicLongResult(AtomicLong1(a, "ATOMIC-LONG-INCF").Add(1L));
+    internal static LispObject AtomicLongIncf2(LispObject a, LispObject b)
+        => AtomicLongResult(AtomicLong1(a, "ATOMIC-LONG-INCF").Add(AtomicLongInt(b, "ATOMIC-LONG-INCF")));
+    internal static LispObject AtomicLongDecf1(LispObject a)
+        => AtomicLongResult(AtomicLong1(a, "ATOMIC-LONG-DECF").Add(-1L));
+    internal static LispObject AtomicLongDecf2(LispObject a, LispObject b)
+        => AtomicLongResult(AtomicLong1(a, "ATOMIC-LONG-DECF").Add(-AtomicLongInt(b, "ATOMIC-LONG-DECF")));
+
     /// <summary>
     /// (bt:make-thread function &key name)
     /// Creates and starts a new thread running FUNCTION.
@@ -203,11 +227,21 @@ public partial class Runtime
                 // the thread cleanly, returning NIL.
                 result = Nil.Instance;
             }
+            catch (System.Threading.ThreadInterruptedException)
+            {
+                // DESTROY-THREAD. Asking a thread to die is not an error to
+                // report — and the caller doing it routinely (bordeaux-threads'
+                // WITH-TIMEOUT retires its watchdog this way on every successful
+                // body) would otherwise print on every normal completion.
+                result = Nil.Instance;
+            }
             catch (Exception ex)
             {
                 // Don't let thread exceptions crash the process
                 var w = Console.Error;
                 w.WriteLine($"Thread \"{name}\" error: {ex.Message}");
+                if (Startup.DebugStacktrace && !string.IsNullOrEmpty(ex.StackTrace))
+                    w.WriteLine(ex.StackTrace);
                 w.Flush();
             }
             finally
@@ -258,6 +292,69 @@ public partial class Runtime
         if (args.Length < 1 || args[0] is not LispThread lt)
             throw new LispErrorException(new LispProgramError("THREAD-OBJECT: requires a thread"));
         return new LispDotNetObject(lt.Thread);
+    }
+
+    /// <summary>
+    /// (dotcl:interrupt-thread thread function) — queue FUNCTION to run on
+    /// THREAD and poke the thread so it notices.
+    ///
+    /// Delivery is what .NET can offer without VM support: Thread.Interrupt
+    /// unblocks a thread sitting in a wait (SLEEP, JOIN, lock/condition-variable/
+    /// semaphore) and nothing else. A thread busy in a computation is NOT
+    /// interrupted — the function stays queued until that thread next blocks.
+    /// This covers the timeout cases that matter in practice (I/O, locks,
+    /// condition variables); killing a compute loop needs cooperative safepoints
+    /// in generated code, which is a separate, much larger change.
+    ///
+    /// The function runs on the target thread at the point where the wait was
+    /// interrupted, so a non-local exit from it (SIGNAL, THROW, an ABORT
+    /// restart) unwinds that thread — which is how a timeout is delivered.
+    /// If it returns normally, the interrupted wait gives up and returns.
+    /// </summary>
+    public static LispObject InterruptThread(LispObject[] args)
+    {
+        if (args.Length < 2 || args[0] is not LispThread lt)
+            throw new LispErrorException(new LispProgramError(
+                "INTERRUPT-THREAD: requires a thread and a function"));
+        var fn = args[1];
+        if (fn is not LispFunction && !(fn is Symbol s && s.Function is LispFunction))
+            throw new LispErrorException(new LispProgramError(
+                "INTERRUPT-THREAD: second argument must be a function"));
+        if (!lt.Thread.IsAlive) return Nil.Instance;
+        lt.PendingInterrupts.Enqueue(fn);
+        lt.Thread.Interrupt();
+        return T.Instance;
+    }
+
+    /// <summary>
+    /// Run every function INTERRUPT-THREAD queued for the current thread, in
+    /// order; return whether there was anything to run. Called from the blocking
+    /// primitives when their wait is cut short by Thread.Interrupt. A queued
+    /// function that exits non-locally takes the rest of the queue with it —
+    /// same as any handler that unwinds.
+    ///
+    /// A false return means the interrupt was not one of ours: DESTROY-THREAD
+    /// also pokes the thread (that is all .NET offers), and its contract is that
+    /// the thread dies. Callers rethrow in that case, which is what the
+    /// blocking primitives did before INTERRUPT-THREAD existed.
+    /// </summary>
+    public static bool RunPendingInterrupts()
+    {
+        // The main thread has no LispThread until someone asks for one, and
+        // INTERRUPT-THREAD can only have been handed one that exists — so look
+        // it up rather than creating a fresh (empty) one here.
+        var self = _currentLispThread
+                   ?? (_threadRegistry.TryGetValue(Thread.CurrentThread.ManagedThreadId, out var reg)
+                       ? reg : null);
+        if (self == null) return false;
+        bool ran = false;
+        while (self.PendingInterrupts.TryDequeue(out var fn))
+        {
+            ran = true;
+            if (fn is LispFunction lfn) lfn.Invoke();
+            else if (fn is Symbol sym && sym.Function is LispFunction sfn) sfn.Invoke();
+        }
+        return ran;
     }
 
     /// <summary>(bt:destroy-thread thread)</summary>
@@ -330,6 +427,19 @@ public partial class Runtime
         return ReleaseLock1(args[0]);
     }
 
+    // 1-arg direct-delegate entry: (acquire-lock lock) with both optionals
+    // defaulted, which is what WITH-LOCK-HELD expands to and therefore the shape
+    // nearly every acquire takes. Same path AcquireLock runs for one argument
+    // (wait defaults true, no timeout), same error for a non-lock. Calls that do
+    // pass the optionals still go through the args-array wrapper.
+    public static LispObject AcquireLock1(LispObject a)
+    {
+        if (a is not LispLock lk)
+            throw new LispErrorException(new LispProgramError("ACQUIRE-LOCK: requires a lock"));
+        System.Threading.Monitor.Enter(lk.Monitor);
+        return T.Instance;
+    }
+
     // 1-arg direct-delegate entry (same code path as ReleaseLock with one arg;
     // the not-a-lock case raises the identical error).
     public static LispObject ReleaseLock1(LispObject a)
@@ -345,7 +455,8 @@ public partial class Runtime
     {
         if (args.Length < 1 || args[0] is not LispThread lt)
             throw new LispErrorException(new LispProgramError("THREAD-JOIN: requires a thread"));
-        lt.Thread.Join();
+        try { lt.Thread.Join(); }
+        catch (System.Threading.ThreadInterruptedException) { if (!RunPendingInterrupts()) throw; }
         return lt.ReturnValue ?? Nil.Instance;
     }
 
@@ -409,6 +520,7 @@ public partial class Runtime
         // cannot slip through between Exit(lock) and Wait(cv.SyncObj).
         System.Threading.Monitor.Enter(cv.SyncObj);
         bool signaled = true;
+        bool interrupted = false;
         try
         {
             System.Threading.Monitor.Exit(lk.Monitor);
@@ -418,10 +530,23 @@ public partial class Runtime
             else
                 System.Threading.Monitor.Wait(cv.SyncObj);
         }
+        catch (System.Threading.ThreadInterruptedException)
+        {
+            // INTERRUPT-THREAD cut the wait short. The finally below still
+            // restores the documented lock state before the queued function
+            // runs, so it sees CONDITION-WAIT's normal postcondition.
+            interrupted = true;
+        }
         finally
         {
             System.Threading.Monitor.Exit(cv.SyncObj);
             System.Threading.Monitor.Enter(lk.Monitor);
+        }
+        if (interrupted)
+        {
+            if (!RunPendingInterrupts())
+                throw new System.Threading.ThreadInterruptedException();
+            return Nil.Instance;   // woke without a notification
         }
         return signaled ? T.Instance : Nil.Instance;
     }
@@ -502,12 +627,20 @@ public partial class Runtime
                 };
             }
         }
-        if (timeoutSec.HasValue)
+        try
         {
-            bool got = sem.Sem.Wait(TimeSpan.FromSeconds(timeoutSec.Value));
-            return got ? T.Instance : Nil.Instance;
+            if (timeoutSec.HasValue)
+            {
+                bool got = sem.Sem.Wait(TimeSpan.FromSeconds(timeoutSec.Value));
+                return got ? T.Instance : Nil.Instance;
+            }
+            sem.Sem.Wait();
         }
-        sem.Sem.Wait();
+        catch (System.Threading.ThreadInterruptedException)
+        {
+            if (!RunPendingInterrupts()) throw;
+            return Nil.Instance;   // woke without acquiring
+        }
         return T.Instance;
     }
 
@@ -552,10 +685,14 @@ public partial class Runtime
             new LispFunction(Runtime.RecursiveLockP, "%RECURSIVE-LOCK-P"));
         Emitter.CilAssembler.RegisterFunction("%MAKE-LOCK",
             new LispFunction(Runtime.MakeLock, "%MAKE-LOCK"));
-        Emitter.CilAssembler.RegisterFunction("%ACQUIRE-LOCK",
-            new LispFunction(Runtime.AcquireLock, "%ACQUIRE-LOCK"));
-        Emitter.CilAssembler.RegisterFunction("%RELEASE-LOCK",
-            new LispFunction(Runtime.ReleaseLock, "%RELEASE-LOCK"));
+        // The % variants are what compiled code calls; give them the same 1-arg
+        // direct delegates as the DOTCL-package registrations in Startup.
+        var pctAcquire = new LispFunction(Runtime.AcquireLock, "%ACQUIRE-LOCK");
+        pctAcquire.SetDirectDelegate((Func<LispObject, LispObject>)Runtime.AcquireLock1);
+        Emitter.CilAssembler.RegisterFunction("%ACQUIRE-LOCK", pctAcquire);
+        var pctRelease = new LispFunction(Runtime.ReleaseLock, "%RELEASE-LOCK");
+        pctRelease.SetDirectDelegate((Func<LispObject, LispObject>)Runtime.ReleaseLock1);
+        Emitter.CilAssembler.RegisterFunction("%RELEASE-LOCK", pctRelease);
         Emitter.CilAssembler.RegisterFunction("%THREAD-JOIN",
             new LispFunction(Runtime.ThreadJoin, "%THREAD-JOIN"));
         Emitter.CilAssembler.RegisterFunction("%THREAD-YIELD",

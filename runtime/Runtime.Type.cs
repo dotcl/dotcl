@@ -25,6 +25,56 @@ public static partial class Runtime
             && TypeExpanders.TryGetValue(p.Name + "::" + sym.Name, out expander!);
     }
 
+    /// <summary>
+    /// Type names dotcl adds beyond CL, which the compiler gates on symbol
+    /// identity (see the DOTCL package check in KnownTypeNameP).
+    /// </summary>
+    private static readonly HashSet<string> DotclExtensionTypeNames =
+        new HashSet<string> { "DECIMAL", "WEAK-POINTER" };
+
+    /// <summary>
+    /// (dotcl:known-type-name-p symbol) — NIL if SYMBOL names no type, else a
+    /// keyword saying HOW it is known:
+    ///   :DEFTYPE  a DEFTYPE expander registered for this exact symbol
+    ///   :BUILTIN  a built-in type name — matched by NAME, so a same-named
+    ///             symbol from any package answers here
+    ///   :NAME     a DEFTYPE expander registered under this name in another package
+    ///   :CLASS    a class
+    ///
+    /// Mirrors the order CType.ParseSymbol resolves a symbol specifier in, so a
+    /// NIL answer means exactly "ParseSymbol falls back to an opaque NamedType"
+    /// — a declaration the compiler then drops on the floor without a word.
+    ///
+    /// The distinction between :DEFTYPE/:CLASS (identity) and :BUILTIN/:NAME
+    /// (name) is what lets a caller notice that e.g. CL-USER::DECIMAL satisfies
+    /// TYPEP by name while the compiler's declaration-driven decimal
+    /// arithmetic — which is keyed on the DOTCL symbol — will not fire.
+    /// </summary>
+    public static LispObject KnownTypeNameP(LispObject[] args)
+    {
+        if (args.Length < 1) return Nil.Instance;
+        // T and NIL are type specifiers but are not Symbols in this object model.
+        if (args[0] is T || args[0] is Nil) return Startup.Keyword("BUILTIN");
+        if (args[0] is not Symbol sym) return Nil.Instance;
+        var name = sym.Name;
+        if (TryGetQualifiedTypeExpander(sym, out _)) return Startup.Keyword("DEFTYPE");
+        // dotcl's own extension types are identity-gated. TYPEP matches built-in
+        // names by name, so CL-USER::DECIMAL passes (typep x 'decimal) — but the
+        // compiler's declaration-driven native paths key on the DOTCL symbol, so
+        // a declaration written with any other same-named symbol buys nothing.
+        // Answering NIL here is what lets a caller say so instead of the
+        // declaration disappearing without a word.
+        if (DotclExtensionTypeNames.Contains(name))
+            return sym.HomePackage is Package hp && hp.Name == "DOTCL"
+                ? Startup.Keyword("BUILTIN") : Nil.Instance;
+        if (IsBuiltinTypeName(name) || name == "T" || name == "NIL" || name == "*")
+            return Startup.Keyword("BUILTIN");
+        if (TypeExpanders.ContainsKey(name)) return Startup.Keyword("NAME");
+        if (FindClassOrNil(sym) is LispClass || FindClassByName(name) != null)
+            return Startup.Keyword("CLASS");
+        return Nil.Instance;
+    }
+
     // --- Typep ---
 
     public static bool IsTrueTypep(LispObject obj, LispObject typeSpec) => Typep(obj, typeSpec) is not Nil;
@@ -107,6 +157,27 @@ public static partial class Runtime
                     // No match against a known class — fall through (could be T/ATOM/etc.).
                 }
             }
+            // A symbol naming a class, tested against a .NET object: the .NET type's
+            // class precedence list decides, by identity — the same rule dispatch and
+            // (typep obj <class-object>) use. Without this the two disagreed:
+            // (typep sb 'stringbuilder) was NIL while passing the class object, or
+            // asking (subtypep 'stringbuilder ...), said otherwise.
+            if (typeSpec is Symbol dnSym && obj is LispDotNetObject dnObj)
+            {
+                // Register the object's type (and its supers) first: the class the
+                // symbol names may not exist yet, since .NET classes are created
+                // lazily. Otherwise the first (typep x 'stringbuilder) of a session
+                // answered NIL and a later one answered T.
+                var dnCls = EnsureDotNetTypeClass(dnObj.Type);
+                if (FindClassOrNil(dnSym) is LispClass dnSpecCls)
+                {
+                    foreach (var c in dnCls.ClassPrecedenceList)
+                        if (ReferenceEquals(c, dnSpecCls)) return T.Instance;
+                    // Same variance rule dispatch uses: a covariant/contravariant
+                    // generic is a supertype the CPL cannot enumerate.
+                    if (DotNetVarianceApplicable(dnSpecCls, dnCls)) return T.Instance;
+                }
+            }
             // A non-CL deftype shadows built-ins for its own symbol
             if (typeSpec is Symbol qSym && TryGetQualifiedTypeExpander(qSym, out var qExp))
                 return Typep(obj, Funcall(qExp));
@@ -139,6 +210,7 @@ public static partial class Runtime
                 var dnCls = EnsureDotNetTypeClass(dn.Type);
                 foreach (var c in dnCls.ClassPrecedenceList)
                     if (ReferenceEquals(c, lcSpec)) return T.Instance;
+                if (DotNetVarianceApplicable(lcSpec, dnCls)) return T.Instance;
             }
             return CheckSimpleType(obj, lcSpec.Name.Name) ? T.Instance : Nil.Instance;
         }
@@ -1911,6 +1983,33 @@ public static partial class Runtime
     /// <summary>Check if a type name is a built-in type known to the hierarchy table.</summary>
     public static bool IsBuiltinTypeName(string name) => _typeAncestors.ContainsKey(name);
 
+    /// <summary>
+    /// Does SYM already name a type — a deftype expander, a class (defclass,
+    /// defstruct, define-condition all register one), or a built-in type name?
+    /// </summary>
+    public static bool NamesAType(Symbol sym) =>
+        TypeExpanders.ContainsKey(TypeExpanderKey(sym))
+        || TypeExpanders.ContainsKey(sym.Name)
+        || IsBuiltinTypeName(sym.Name)
+        || FindClassOrNil(sym) != Nil.Instance;
+
+    /// <summary>
+    /// CLHS TYPE: "A symbol cannot be both the name of a type and the name of a
+    /// declaration. Defining a symbol as the name of a class, structure,
+    /// condition, or type, when the symbol has been declared as a declaration
+    /// name, or vice versa, signals an error."
+    ///
+    /// Called from both directions: the type definers check the declaration
+    /// flag, PROCLAIM checks NamesAType.
+    /// </summary>
+    public static void CheckTypeNameAvailable(Symbol sym, string definer)
+    {
+        if (sym.IsDeclarationName)
+            throw new LispErrorException(new LispProgramError(
+                $"{definer}: {sym.Name} is already the name of a declaration, "
+                + "so it cannot also name a type"));
+    }
+
     private static Dictionary<string, HashSet<string>> BuildTypeHierarchy()
     {
         var parents = new Dictionary<string, string[]>
@@ -1934,6 +2033,14 @@ public static partial class Runtime
             ["UNSIGNED-BYTE"] = new[] { "SIGNED-BYTE", "INTEGER", "RATIONAL", "REAL", "NUMBER", "T" },
             ["SIGNED-BYTE"] = new[] { "INTEGER", "RATIONAL", "REAL", "NUMBER", "T" },
             ["RATIO"] = new[] { "RATIONAL", "REAL", "NUMBER", "T" },
+            // dotcl extensions. DECIMAL sits under REAL but deliberately not
+            // under RATIONAL or FLOAT: it is a third exactness category
+            // (numberp/realp = T, rationalp/floatp = NIL). Listing them here is
+            // what makes them answer as types — TYPEP knows them from
+            // CheckSimpleType, but the hierarchy is what SUBTYPEP and
+            // KnownTypeNameP consult.
+            ["DECIMAL"] = new[] { "REAL", "NUMBER", "T" },
+            ["WEAK-POINTER"] = new[] { "T" },
             ["FLOAT"] = new[] { "REAL", "NUMBER", "T" },
             // SHORT-FLOAT=SINGLE-FLOAT and DOUBLE-FLOAT=LONG-FLOAT in our .NET impl
             ["SINGLE-FLOAT"] = new[] { "SHORT-FLOAT", "FLOAT", "REAL", "NUMBER", "T" },

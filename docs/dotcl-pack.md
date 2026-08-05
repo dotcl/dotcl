@@ -77,6 +77,20 @@ On Windows the installed command is a `.cmd` shim named after `--command`.
   Note: dry-run does not compile, so it will not catch a build error such as an
   unexported entry point -- do a real run to validate the build.
 
+### Package metadata for publishing
+
+Restamping reuses the dotcl runtime packages, so without these flags your tool
+inherits dotcl's nuspec metadata -- its description, project URL, repository,
+embedded README and tags. When you publish under your own id, override them:
+
+- **`--description <text>`**, **`--project-url <url>`**, **`--tags <csv>`**
+  (comma / semicolon / space separated), **`--authors <text>`**,
+  **`--copyright <text>`**.
+- **`--repository <url[#commit]>`** -- e.g.
+  `https://github.com/you/app.git#<sha>`. Omit `#commit` to leave it out.
+- **`--readme <file>`** -- the file whose contents become the package's embedded
+  README shown on nuget.org.
+
 ## How it works
 
 Two steps. `dotcl pack` first compiles your system to a self-contained FASL, then

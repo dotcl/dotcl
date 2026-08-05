@@ -163,7 +163,11 @@ Subcommands:
                                (--id <pkgid> --command <cmd> --version <ver>
                                -o <dir> --from <dir> [--dotcl-version <ver>]
                                [--toplevel <fn>] [--bundle <dir>]
-                               [--rids <csv>] [--dry-run])
+                               [--rids <csv>] [--dry-run]
+                               [--description <text>] [--project-url <url>]
+                               [--repository <url[#commit]>] [--readme <file>]
+                               [--tags <csv>] [--authors <text>]
+                               [--copyright <text>])
 
 Example:
   dotcl hello.lisp arg1 arg2
@@ -298,6 +302,7 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
         string? buildAsd = null;
         string? buildOutput = null;
         bool buildResolveDeps = false;
+        bool buildDebugInfo = false;
         string? buildManifestOut = null;
         string? buildRootSourcesOut = null;
         string? buildTargetRid = null;
@@ -311,6 +316,7 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
                 var a = rest[i];
                 if (a == "--output" && i + 1 < rest.Count) buildOutput = rest[++i];
                 else if (a == "--resolve-deps") buildResolveDeps = true;
+                else if (a == "--debug-info") buildDebugInfo = true;
                 else if (a == "--manifest-out" && i + 1 < rest.Count) buildManifestOut = rest[++i];
                 else if (a == "--root-sources-out" && i + 1 < rest.Count) buildRootSourcesOut = rest[++i];
                 else if (a == "--target-rid" && i + 1 < rest.Count) buildTargetRid = rest[++i];
@@ -325,6 +331,9 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
         //              --version <ver> -o <dir> --from <dotcl-nupkg-dir>
         //              [--dotcl-version <ver>] [--toplevel <fn>]
         //              [--bundle <dir>] [--rids <csv>] [--no-android] [--dry-run]
+        //              [--description <text>] [--project-url <url>]
+        //              [--repository <url[#commit]>] [--readme <file>]
+        //              [--tags <csv>] [--authors <text>] [--copyright <text>]
         // Concatenate+compile the system to a single fasl (as `build`), then
         // restamp the published dotcl tool packages in --from into the app's
         // own base pointer + per-RID packages with that fasl injected.
@@ -349,6 +358,13 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
                 else if (a == "--no-android") pack.NoAndroid = true;
                 else if (a == "--dry-run") pack.DryRun = true;
                 else if (a == "--asd-search-path" && i + 1 < rest.Count) pack.SearchPaths.Add(rest[++i]);
+                else if (a == "--description" && i + 1 < rest.Count) pack.Description = rest[++i];
+                else if (a == "--project-url" && i + 1 < rest.Count) pack.ProjectUrl = rest[++i];
+                else if (a == "--repository" && i + 1 < rest.Count) pack.Repository = rest[++i];
+                else if (a == "--readme" && i + 1 < rest.Count) pack.Readme = rest[++i];
+                else if (a == "--tags" && i + 1 < rest.Count) pack.Tags = rest[++i];
+                else if (a == "--authors" && i + 1 < rest.Count) pack.Authors = rest[++i];
+                else if (a == "--copyright" && i + 1 < rest.Count) pack.Copyright = rest[++i];
                 else if (!a.StartsWith('-') && pack.Asd == null) pack.Asd = a;
             }
         }
@@ -460,7 +476,7 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
                 if (buildResolveDeps)
                     RunResolveDeps(buildAsd, buildManifestOut, buildRootSourcesOut, buildTargetRid, buildInitArr, searchPathArr);
                 else if (buildOutput != null)
-                    RunCompileProject(buildAsd, buildOutput, buildInitArr, searchPathArr);
+                    RunCompileProject(buildAsd, buildOutput, buildInitArr, searchPathArr, buildDebugInfo);
                 else
                 {
                     Console.Error.WriteLine("build: requires --output <fasl> or --resolve-deps");
@@ -722,9 +738,9 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
     /// MSBuild owns the incremental decision via Inputs/Outputs on the
     /// component source files.
     /// </summary>
-    static void RunCompileProject(string asdPath, string outputPath, string[]? buildInit = null, string[]? searchPaths = null)
+    static void RunCompileProject(string asdPath, string outputPath, string[]? buildInit = null, string[]? searchPaths = null, bool debugInfo = false)
     {
-        try { DotclHost.CompileProject(asdPath, outputPath, buildInit, searchPaths); }
+        try { DotclHost.CompileProject(asdPath, outputPath, buildInit, searchPaths, debugInfo); }
         catch (System.IO.FileNotFoundException ex)
         {
             Console.Error.WriteLine(ex.Message);
@@ -749,6 +765,14 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
         public bool NoAndroid = true;   // desktop RIDs only (release default)
         public bool DryRun;
         public readonly List<string> SearchPaths = new();
+        // nuspec metadata overrides (else inherited from the dotcl packages).
+        public string? Description;
+        public string? ProjectUrl;
+        public string? Repository; // url[#commit]
+        public string? Readme;     // path to a README file to embed
+        public string? Tags;       // comma/semicolon/space separated
+        public string? Authors;
+        public string? Copyright;
     }
 
     /// <summary>
@@ -774,6 +798,11 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
             return 2;
         }
 
+        // Fail fast, before building the fasl, if the --from payload predates the
+        // loose-fasl loader — a tool restamped from it would silently run a REPL.
+        try { PackRestamp.EnsureLoaderCapablePayload(o.DotclVersion ?? PackRestamp.InferDotclVersion(o.From!)); }
+        catch (Exception ex) { Console.Error.WriteLine($"pack: {ex.Message}"); return 1; }
+
         // Default RID set: 6 desktop RIDs + `any` fallback (android excluded).
         var rids = (!string.IsNullOrEmpty(o.Rids)
                 ? o.Rids!.Replace(';', ',')
@@ -784,13 +813,70 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
         string faslPath = System.IO.Path.Combine(o.Output!, "obj",
             o.System!.Replace('/', '_').Replace('\\', '_') + ".fasl");
 
+        if (!string.IsNullOrEmpty(o.Readme) && !File.Exists(o.Readme))
+        {
+            Console.Error.WriteLine($"pack: --readme file not found: {o.Readme}");
+            return 1;
+        }
+
+        // Split --repository <url[#commit]> into its parts.
+        string? repoUrl = null, repoCommit = null;
+        if (!string.IsNullOrEmpty(o.Repository))
+        {
+            var hash = o.Repository!.IndexOf('#');
+            if (hash >= 0)
+            {
+                repoUrl = o.Repository[..hash];
+                repoCommit = o.Repository[(hash + 1)..];
+            }
+            else repoUrl = o.Repository;
+        }
+
+        // The .asd already describes the system; read it so a pack does not have
+        // to restate on the command line what the system definition says. CLI
+        // flags win, .asd fills the gaps, and anything still unset is dropped
+        // rather than inherited from dotcl (see PackRestamp.Meta).
+        var asdSearch = Runtime.UserAsdSearchPaths.Count > 0
+            ? Runtime.UserAsdSearchPaths.ToArray() : null;
+        var asd = DotclHost.ReadSystemMeta(o.System!, asdSearch);
+
+        // A README sitting next to the .asd is the package README by default —
+        // the same convention every other packaging tool uses.
+        string? readmePath = o.Readme;
+        if (readmePath == null && asd?.AsdDirectory != null)
+        {
+            foreach (var candidate in new[] { "README.md", "readme.md", "README.MD" })
+            {
+                var p = System.IO.Path.Combine(asd.AsdDirectory, candidate);
+                if (File.Exists(p)) { readmePath = p; break; }
+            }
+        }
+
+        var meta = new PackRestamp.Meta
+        {
+            Description = o.Description ?? asd?.Description,
+            ProjectUrl = o.ProjectUrl ?? asd?.Homepage,
+            RepositoryUrl = repoUrl ?? asd?.SourceControlUrl,
+            RepositoryCommit = repoCommit,
+            ReadmePath = readmePath,
+            Tags = o.Tags,
+            Authors = o.Authors ?? asd?.Author,
+            Copyright = o.Copyright,
+            License = asd?.License,
+        };
+
+        // Fail before building the fasl, not after producing a package NuGet
+        // would reject or that would misdescribe itself.
+        try { PackRestamp.EnsureRequiredMetadata(o.Id!, meta); }
+        catch (Exception ex) { Console.Error.WriteLine($"pack: {ex.Message}"); return 1; }
+
         if (o.DryRun)
         {
             try
             {
                 var planned = PackRestamp.Run(o.From!, o.DotclVersion, o.Id!, o.Command!,
                                               o.Version!, faslPath, o.Bundle, rids,
-                                              o.Output!, dryRun: true);
+                                              o.Output!, meta, dryRun: true);
                 Console.WriteLine($"pack: would build user fasl  {faslPath}");
                 foreach (var p in planned) Console.WriteLine($"pack: would write  {p}");
                 return 0;
@@ -830,7 +916,7 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
         try
         {
             produced = PackRestamp.Run(o.From!, o.DotclVersion, o.Id!, o.Command!, o.Version!,
-                                       faslPath, o.Bundle, rids, o.Output!, dryRun: false);
+                                       faslPath, o.Bundle, rids, o.Output!, meta, dryRun: false);
         }
         catch (Exception ex)
         {

@@ -33,9 +33,13 @@ namespace DotCL.Emitter;
 ///            after stfld, so `(dotnet:%set-invoke vm "Title" v)` alone
 ///            fires the INotifyPropertyChanged notification.
 ///
-/// Each call creates a fresh dynamic assembly holding one type. That assembly
-/// becomes visible to Type.GetType lookup through AppDomain.CurrentDomain
-/// .GetAssemblies(), which is the path ResolveDotNetType already uses.
+/// DefineMinimalClass (the in-process path) creates a fresh dynamic assembly
+/// holding one type; that assembly becomes visible to Type.GetType lookup
+/// through AppDomain.CurrentDomain.GetAssemblies(), which is the path
+/// ResolveDotNetType already uses. For saved, C#-referenceable libraries,
+/// BeginLibrary/LibraryBuilder accumulate MANY types into one persisted
+/// assembly (the aggregation unit — a real library is more than one type);
+/// PopulateType is the shared per-type emitter both paths call.
 /// </summary>
 public static class DynamicClassBuilder
 {
@@ -49,9 +53,14 @@ public static class DynamicClassBuilder
     private static readonly Dictionary<(string, string), LispObject> _methodHandlers
         = new();
 
+    // IsStatic maps a Lisp defun to a `public static` method (no `self`) — the
+    // shape a function library exports (System.Math-style). A static method
+    // cannot be an override or interface impl, so IsStatic and IsOverride are
+    // mutually exclusive.
     public record MethodSpec(string Name, Type ReturnType, IReadOnlyList<Type> ParamTypes,
                              LispObject LispBody, bool IsOverride = false,
-                             IReadOnlyList<CustomAttributeBuilder>? Attributes = null);
+                             IReadOnlyList<CustomAttributeBuilder>? Attributes = null,
+                             bool IsStatic = false);
 
     // multi-ctor support: one spec per constructor overload.
     public record CtorSpec(
@@ -85,9 +94,79 @@ public static class DynamicClassBuilder
         IReadOnlyList<(string Name, Type DelegateType)>? events = null,
         IReadOnlyList<Type>? ctorParamTypes = null,
         IReadOnlyList<int>? baseCtorArgIndices = null,
-        IReadOnlyList<CtorSpec>? ctorSpecs = null)
+        IReadOnlyList<CtorSpec>? ctorSpecs = null,
+        string? saveToPath = null)
     {
         CilAssembler.EnsureEmitAllowed("dotnet:define-class");
+        if (string.IsNullOrEmpty(fullName))
+            throw new ArgumentException("fullName must be non-empty", nameof(fullName));
+
+        // saveToPath != null → the type goes into a saved, C#-referenceable
+        // facade assembly (stage 1). A single-type save is just a one-class library,
+        // so we route through the aggregation layer (BeginLibrary/AddClass/Save)
+        // to keep one code path for "populate a module + retarget corlib".
+        if (saveToPath != null)
+        {
+#if NET9_0_OR_GREATER
+            // Assembly simple-name = the type's namespace if any, else its name;
+            // this is what a C# consumer sees as the reference.
+            var dot = fullName.LastIndexOf('.');
+            var asmSimple = dot > 0 ? fullName.Substring(0, dot) : fullName;
+            var lib = BeginLibrary(saveToPath, asmSimple);
+            var t = lib.AddClass(fullName, baseType, fields, attributes, methods, ctorBody,
+                properties, interfaces, events, ctorParamTypes, baseCtorArgIndices, ctorSpecs);
+            lib.Save();
+            return t;
+#else
+            throw new PlatformNotSupportedException(
+                "saving a class library requires .NET 9+ (PersistedAssemblyBuilder)");
+#endif
+        }
+
+        // Run assembly: usable in-process (make-instance, method dispatch). One
+        // fresh dynamic assembly per call, historical behavior.
+        int id = System.Threading.Interlocked.Increment(ref _assemblyCounter);
+        var asmName = new AssemblyName("DotclDynamic_" + id);
+        var ab = AssemblyBuilder.DefineDynamicAssembly(asmName, AssemblyBuilderAccess.Run);
+        var mb = ab.DefineDynamicModule(asmName.Name!);
+
+        var (createdType, handlers) = PopulateType(mb, fullName, baseType, fields, attributes,
+            methods, ctorBody, properties, interfaces, events, ctorParamTypes,
+            baseCtorArgIndices, ctorSpecs);
+
+        // Register method/ctor handlers AFTER CreateType so the first call to a
+        // method (e.g. from a test's DOTNET:INVOKE) finds its Lisp body. A
+        // re-define of the same full name overwrites (matches "fresh assembly
+        // per call").
+        foreach (var (key, body) in handlers)
+            _methodHandlers[(fullName, key)] = body;
+
+        return createdType;
+    }
+
+    /// <summary>
+    /// Populate one public type on the given <paramref name="mb"/> from the
+    /// member specs, emit all members, call CreateType, and return the built
+    /// Type plus the (dispatchKey, LispBody) handler pairs to register. The
+    /// caller decides whether to register them: the in-process Run path does
+    /// (so method dispatch works); the saved-facade path does not (the type is
+    /// never invoked in the emitting process). Shared by DefineMinimalClass and
+    /// LibraryBuilder.AddClass so both single-type and multi-type-per-assembly
+    /// paths emit identical member IL.
+    /// </summary>
+    private static (Type Type, List<(string Key, LispObject Body)> Handlers) PopulateType(
+        ModuleBuilder mb, string fullName, Type? baseType,
+        IReadOnlyList<(string Name, Type Type)>? fields,
+        IReadOnlyList<CustomAttributeBuilder>? attributes,
+        IReadOnlyList<MethodSpec>? methods,
+        LispObject? ctorBody,
+        IReadOnlyList<(string Name, Type Type, bool Notify)>? properties,
+        IReadOnlyList<Type>? interfaces,
+        IReadOnlyList<(string Name, Type DelegateType)>? events,
+        IReadOnlyList<Type>? ctorParamTypes,
+        IReadOnlyList<int>? baseCtorArgIndices,
+        IReadOnlyList<CtorSpec>? ctorSpecs)
+    {
         if (string.IsNullOrEmpty(fullName))
             throw new ArgumentException("fullName must be non-empty", nameof(fullName));
 
@@ -99,6 +178,10 @@ public static class DynamicClassBuilder
         if (baseType.IsInterface)
             throw new ArgumentException(
                 $"Base type must be a class, not interface: {baseType.FullName}", nameof(baseType));
+
+        // Handlers collected here and returned; the caller registers them into
+        // _methodHandlers only for the in-process Run path.
+        var handlers = new List<(string Key, LispObject Body)>();
 
         // Single-ctor path resolves baseCtor eagerly; multi-ctor path resolves per spec.
         ConstructorInfo? baseCtor = null;
@@ -126,11 +209,6 @@ public static class DynamicClassBuilder
                         nameof(baseType));
             }
         }
-
-        int id = System.Threading.Interlocked.Increment(ref _assemblyCounter);
-        var asmName = new AssemblyName("DotclDynamic_" + id);
-        var ab = AssemblyBuilder.DefineDynamicAssembly(asmName, AssemblyBuilderAccess.Run);
-        var mb = ab.DefineDynamicModule(asmName.Name!);
 
         var tb = mb.DefineType(fullName,
             TypeAttributes.Public | TypeAttributes.Class | TypeAttributes.AutoClass
@@ -299,8 +377,7 @@ public static class DynamicClassBuilder
                 }
                 ctorIl.Emit(OpCodes.Ret);
             }
-            foreach (var (key, body) in pendingCtorHandlers)
-                _methodHandlers[(fullName, key)] = body;
+            handlers.AddRange(pendingCtorHandlers);
         }
         else
         {
@@ -343,13 +420,12 @@ public static class DynamicClassBuilder
             cil.Emit(OpCodes.Ret);
 
             if (ctorBody != null)
-                _methodHandlers[(fullName, CtorKey)] = ctorBody;
+                handlers.Add((CtorKey, ctorBody));
         }
 
         // User-defined instance methods. Each body dispatches to the
         // corresponding Lisp lambda through DispatchLispMethod.
         // dispatch key = method name for no-param; name#Type1|Type2 for parameterized.
-        var pendingMethods = new List<(string DispatchKey, LispObject Lambda)>();
         if (methods != null)
         {
             var seenMethods = new HashSet<string>(StringComparer.Ordinal);
@@ -366,19 +442,293 @@ public static class DynamicClassBuilder
                         $"method name {m.Name} collides with an auto-generated event accessor",
                         nameof(methods));
                 EmitLispDispatchMethod(tb, fullName, baseType, interfaces, m, dispatchKey);
-                pendingMethods.Add((dispatchKey, m.LispBody));
+                handlers.Add((dispatchKey, m.LispBody));
             }
         }
 
         var createdType = tb.CreateType()!;
+        return (createdType, handlers);
+    }
 
-        // Register method handlers AFTER CreateType so first call to the method
-        // (e.g. from a test's DOTNET:INVOKE) finds its Lisp body. A re-define of
-        // the same full name overwrites (matches Step 1 "fresh assembly per call").
-        foreach (var (dispatchKey, lambda) in pendingMethods)
-            _methodHandlers[(fullName, dispatchKey)] = lambda;
+#if NET9_0_OR_GREATER
+    /// <summary>
+    /// Begin a saved class library: a single persisted assembly that many types
+    /// are added to (via <see cref="LibraryBuilder.AddClass"/>) before one
+    /// <see cref="LibraryBuilder.Save"/>. This is the aggregation unit — the
+    /// original "1 define-class → 1 assembly" cannot express a real library.
+    /// The saved DLL is a C#-referenceable facade (stage 1 semantics extended to N
+    /// types): its method bodies dispatch through <see cref="DispatchLispMethod"/>,
+    /// so consuming it at runtime needs DotCL.Runtime + the Lisp loaded (stage 2
+    /// bakes bodies into IL). Requires .NET 9+ (PersistedAssemblyBuilder).
+    /// </summary>
+    /// <param name="savePath">Path the .dll is written to on Save().</param>
+    /// <param name="assemblyName">
+    /// Library assembly simple-name — what a C# consumer references. Sanitized
+    /// to a legal AssemblyName.
+    /// </param>
+    /// <param name="version">Optional assembly version stamped into metadata.</param>
+    /// <param name="corlibProfile">
+    /// Reference corlib the saved DLL is retargeted to (default "netstandard"),
+    /// so a C# consumer referencing System.Runtime facades does not hit CS0012.
+    /// </param>
+    public static LibraryBuilder BeginLibrary(string savePath, string assemblyName,
+        Version? version = null, string corlibProfile = "netstandard")
+    {
+        CilAssembler.EnsureEmitAllowed("dotcl:library");
+        if (string.IsNullOrEmpty(savePath))
+            throw new ArgumentException("savePath must be non-empty", nameof(savePath));
+        var simple = SanitizeAssemblyName(assemblyName);
+        var an = new AssemblyName(simple);
+        if (version != null) an.Version = version;
+        var pab = new PersistedAssemblyBuilder(an, typeof(object).Assembly);
+        var mb = pab.DefineDynamicModule(simple);
+        return new LibraryBuilder(pab, mb, savePath, corlibProfile, simple);
+    }
 
-        return createdType;
+    /// <summary>
+    /// Accumulates multiple public types into one persisted (saved) assembly.
+    /// Obtained from <see cref="BeginLibrary"/>. Add each type with
+    /// <see cref="AddClass"/>, then call <see cref="Save"/> once to write the
+    /// .dll and retarget its corlib reference. Not thread-safe; drive from one
+    /// thread. Saved types are facades and are never invoked in the emitting
+    /// process, so AddClass does not register method handlers.
+    /// </summary>
+    public sealed class LibraryBuilder
+    {
+        private readonly PersistedAssemblyBuilder _pab;
+        private readonly ModuleBuilder _mb;
+        private readonly string _savePath;
+        private readonly string _corlibProfile;
+        private readonly string _assemblyName;
+        // (docCommentId, summaryText) pairs for the sidecar XML doc file.
+        private readonly List<(string Id, string Summary)> _docs = new();
+        private bool _saved;
+
+        internal LibraryBuilder(PersistedAssemblyBuilder pab, ModuleBuilder mb,
+            string savePath, string corlibProfile, string assemblyName)
+        {
+            _pab = pab;
+            _mb = mb;
+            _savePath = savePath;
+            _corlibProfile = corlibProfile;
+            _assemblyName = assemblyName;
+        }
+
+        /// <summary>
+        /// Record one XML doc-comment entry. <paramref name="id"/> is a doc
+        /// member id (e.g. "T:MyLib.Calculator"); <paramref name="summary"/> is
+        /// the &lt;summary&gt; text. Written to a sidecar &lt;name&gt;.xml on Save
+        /// so a C# consumer's IntelliSense shows the summary.
+        /// </summary>
+        public void AddDoc(string id, string summary) => _docs.Add((id, summary));
+
+        /// <summary>
+        /// Add one public class to the library. Parameters mirror
+        /// <see cref="DefineMinimalClass"/> (minus saveToPath). Returns the
+        /// built Type. The handler pairs PopulateType produces are discarded:
+        /// a saved facade type is never invoked in this process.
+        /// </summary>
+        public Type AddClass(string fullName, Type? baseType = null,
+            IReadOnlyList<(string Name, Type Type)>? fields = null,
+            IReadOnlyList<CustomAttributeBuilder>? attributes = null,
+            IReadOnlyList<MethodSpec>? methods = null,
+            LispObject? ctorBody = null,
+            IReadOnlyList<(string Name, Type Type, bool Notify)>? properties = null,
+            IReadOnlyList<Type>? interfaces = null,
+            IReadOnlyList<(string Name, Type DelegateType)>? events = null,
+            IReadOnlyList<Type>? ctorParamTypes = null,
+            IReadOnlyList<int>? baseCtorArgIndices = null,
+            IReadOnlyList<CtorSpec>? ctorSpecs = null)
+        {
+            if (_saved)
+                throw new InvalidOperationException("cannot AddClass after Save()");
+            CilAssembler.EnsureEmitAllowed("dotcl:library");
+            var (type, _) = PopulateType(_mb, fullName, baseType, fields, attributes,
+                methods, ctorBody, properties, interfaces, events, ctorParamTypes,
+                baseCtorArgIndices, ctorSpecs);
+            return type;
+        }
+
+        /// <summary>
+        /// Add one public enum type. Unlike a class facade, an enum is pure
+        /// metadata (named constants over an integral underlying type), so the
+        /// emitted type is genuinely standalone — a C# consumer uses it with no
+        /// DotCL.Runtime dependency and no Lisp loaded. <paramref name="members"/>
+        /// pairs each literal name with its value (already the underlying type).
+        /// </summary>
+        public Type AddEnum(string fullName, Type underlyingType,
+            IReadOnlyList<(string Name, object Value)> members)
+        {
+            if (_saved)
+                throw new InvalidOperationException("cannot AddEnum after Save()");
+            CilAssembler.EnsureEmitAllowed("dotcl:library");
+            var eb = _mb.DefineEnum(fullName, TypeAttributes.Public, underlyingType);
+            foreach (var (name, value) in members)
+                eb.DefineLiteral(name, value);
+            return eb.CreateTypeInfo()!;
+        }
+
+        /// <summary>
+        /// Add a public interface type with abstract method signatures. Pure
+        /// signature metadata (no bodies), so the emitted type is standalone: a
+        /// C# consumer references and implements it with no DotCL.Runtime. Each
+        /// method is emitted Public|Abstract|Virtual|NewSlot|HideBySig.
+        /// </summary>
+        public Type AddInterface(string fullName,
+            IReadOnlyList<(string Name, Type ReturnType, IReadOnlyList<Type> ParamTypes)> methods)
+        {
+            if (_saved)
+                throw new InvalidOperationException("cannot AddInterface after Save()");
+            CilAssembler.EnsureEmitAllowed("dotcl:library");
+            var tb = _mb.DefineType(fullName,
+                TypeAttributes.Public | TypeAttributes.Interface | TypeAttributes.Abstract);
+            foreach (var m in methods)
+                tb.DefineMethod(m.Name,
+                    MethodAttributes.Public | MethodAttributes.Abstract | MethodAttributes.Virtual
+                    | MethodAttributes.NewSlot | MethodAttributes.HideBySig,
+                    m.ReturnType, m.ParamTypes.ToArray());
+            return tb.CreateType();
+        }
+
+        /// <summary>
+        /// Add a public delegate type of the given signature. A delegate is a
+        /// sealed type over System.MulticastDelegate with a runtime-provided
+        /// (object,IntPtr) ctor and Invoke method — pure metadata, so the emitted
+        /// type is standalone (a C# consumer references it as a callback type with
+        /// no DotCL.Runtime). Both members are MethodImplAttributes.Runtime, i.e.
+        /// the CLR supplies their bodies; this is the canonical reflection-emit
+        /// delegate shape.
+        /// </summary>
+        public Type AddDelegate(string fullName, Type returnType,
+            IReadOnlyList<Type> paramTypes)
+        {
+            if (_saved)
+                throw new InvalidOperationException("cannot AddDelegate after Save()");
+            CilAssembler.EnsureEmitAllowed("dotcl:library");
+            var tb = _mb.DefineType(fullName,
+                TypeAttributes.Public | TypeAttributes.Sealed
+                | TypeAttributes.AnsiClass | TypeAttributes.AutoClass,
+                typeof(MulticastDelegate));
+            var ctor = tb.DefineConstructor(
+                MethodAttributes.Public | MethodAttributes.HideBySig
+                | MethodAttributes.RTSpecialName | MethodAttributes.SpecialName,
+                CallingConventions.Standard, new[] { typeof(object), typeof(IntPtr) });
+            ctor.SetImplementationFlags(MethodImplAttributes.Runtime | MethodImplAttributes.Managed);
+            var invoke = tb.DefineMethod("Invoke",
+                MethodAttributes.Public | MethodAttributes.HideBySig
+                | MethodAttributes.NewSlot | MethodAttributes.Virtual,
+                returnType, paramTypes.ToArray());
+            invoke.SetImplementationFlags(MethodImplAttributes.Runtime | MethodImplAttributes.Managed);
+            return tb.CreateType();
+        }
+
+        /// <summary>
+        /// Add a public value type (C# <c>struct</c>) with public instance
+        /// fields. Like enums/consts a fields-only struct is pure data — no Lisp
+        /// dispatch — so the emitted type is standalone (a C# consumer reads/
+        /// writes its fields with no DotCL.Runtime). Emitted sequential-layout
+        /// sealed over System.ValueType; the implicit default ctor zero-inits.
+        /// </summary>
+        public Type AddStruct(string fullName,
+            IReadOnlyList<(string Name, Type Type)> fields)
+        {
+            if (_saved)
+                throw new InvalidOperationException("cannot AddStruct after Save()");
+            CilAssembler.EnsureEmitAllowed("dotcl:library");
+            var tb = _mb.DefineType(fullName,
+                TypeAttributes.Public | TypeAttributes.SequentialLayout
+                | TypeAttributes.Sealed | TypeAttributes.BeforeFieldInit,
+                typeof(ValueType));
+            foreach (var (name, type) in fields)
+                tb.DefineField(name, type, FieldAttributes.Public);
+            return tb.CreateType();
+        }
+
+        /// <summary>
+        /// Add a static holder type of <c>public const</c> fields. Each constant
+        /// is a compile-time literal (SetConstant) — like an enum it is pure
+        /// metadata, so the type is standalone (no DotCL.Runtime, no Lisp) and
+        /// the value is inlined into a C# consumer. Only literal-capable field
+        /// types are valid (the integral/floating primitives, bool, char, string,
+        /// or an enum); a non-literal type throws at DefineField/SetConstant time.
+        /// The holder is emitted abstract+sealed (a C# <c>static class</c>).
+        /// </summary>
+        public Type AddConstants(string fullName,
+            IReadOnlyList<(string Name, Type Type, object Value)> constants)
+        {
+            if (_saved)
+                throw new InvalidOperationException("cannot AddConstants after Save()");
+            CilAssembler.EnsureEmitAllowed("dotcl:library");
+            var tb = _mb.DefineType(fullName,
+                TypeAttributes.Public | TypeAttributes.Abstract | TypeAttributes.Sealed);
+            foreach (var (name, type, value) in constants)
+            {
+                var fb = tb.DefineField(name, type,
+                    FieldAttributes.Public | FieldAttributes.Static
+                    | FieldAttributes.Literal | FieldAttributes.HasDefault);
+                fb.SetConstant(value);
+            }
+            return tb.CreateType();
+        }
+
+        /// <summary>
+        /// Write the assembly to disk and retarget its corlib reference so the
+        /// DLL is C#-referenceable. Idempotent guard: throws if called twice.
+        /// </summary>
+        public void Save()
+        {
+            if (_saved) throw new InvalidOperationException("library already saved");
+            _saved = true;
+            var dir = System.IO.Path.GetDirectoryName(System.IO.Path.GetFullPath(_savePath));
+            if (!string.IsNullOrEmpty(dir)) System.IO.Directory.CreateDirectory(dir);
+            _pab.Save(_savePath);
+            // PersistedAssemblyBuilder references System.Private.CoreLib (the
+            // implementation corlib) for Object etc. A C# consumer references
+            // System.Runtime / netstandard facades, so without retargeting it
+            // gets CS0012 ("Object is defined in an assembly that is not
+            // referenced"). Retarget to the netstandard facade, same as
+            // FaslAssembler does for its fasls.
+            FaslCorlibRetarget.RetargetCorlib(_savePath, _corlibProfile);
+            WriteXmlDoc();
+        }
+
+        // Write the sidecar <name>.xml doc file next to the .dll (the standard
+        // location the C# compiler auto-loads for IntelliSense). No-op if no docs
+        // were recorded.
+        private void WriteXmlDoc()
+        {
+            if (_docs.Count == 0) return;
+            var xmlPath = System.IO.Path.ChangeExtension(_savePath, ".xml");
+            var sb = new System.Text.StringBuilder();
+            sb.Append("<?xml version=\"1.0\"?>\n<doc>\n    <assembly>\n        <name>");
+            sb.Append(System.Security.SecurityElement.Escape(_assemblyName));
+            sb.Append("</name>\n    </assembly>\n    <members>\n");
+            foreach (var (id, summary) in _docs)
+            {
+                sb.Append("        <member name=\"");
+                sb.Append(System.Security.SecurityElement.Escape(id));
+                sb.Append("\">\n            <summary>");
+                sb.Append(System.Security.SecurityElement.Escape(summary));
+                sb.Append("</summary>\n        </member>\n");
+            }
+            sb.Append("    </members>\n</doc>\n");
+            System.IO.File.WriteAllText(xmlPath, sb.ToString());
+        }
+    }
+#endif
+
+    /// <summary>
+    /// Sanitize a dotted type namespace into a legal assembly simple-name: an
+    /// AssemblyName rejects the characters the parser reads as attribute syntax
+    /// ('=', ',', etc.). Mirrors FaslAssembler.SanitizeModuleName's intent.
+    /// </summary>
+    private static string SanitizeAssemblyName(string name)
+    {
+        var sb = new System.Text.StringBuilder(name.Length);
+        foreach (var c in name)
+            sb.Append(char.IsLetterOrDigit(c) || c == '.' || c == '_' || c == '-' ? c : '_');
+        var s = sb.ToString();
+        return string.IsNullOrEmpty(s) ? "DotclLibrary" : s;
     }
 
     /// <summary>
@@ -440,21 +790,32 @@ public static class DynamicClassBuilder
     }
 
     /// <summary>
-    /// Emit the body of a user-defined instance method. The body boxes args
-    /// into an <c>object[]</c>, calls <see cref="DispatchLispMethod"/>, then
+    /// Emit the body of a user-defined method. The body boxes args into an
+    /// <c>object[]</c>, dispatches to the registered Lisp lambda, then
     /// unboxes/casts the result to the declared return type.
-    /// If <c>m.IsOverride</c> is true, the method is emitted as Virtual and
-    /// explicitly tied to a matching base virtual method via
-    /// <see cref="TypeBuilder.DefineMethodOverride"/>.
-    /// Otherwise, if the type declares any interfaces and the method matches
-    /// an interface method by name+signature, it is emitted as an implicit
-    /// interface implementation: Virtual|NewSlot|Final|HideBySig plus
-    /// DefineMethodOverride for each matched interface method.
+    /// If <c>m.IsStatic</c> is true, a <c>public static</c> method is emitted
+    /// (no <c>self</c>; dispatch through <see cref="DispatchLispStatic"/>) —
+    /// the shape a function library exports.
+    /// Otherwise an instance method through <see cref="DispatchLispMethod"/>:
+    /// if <c>m.IsOverride</c> is true it is Virtual and tied to a matching base
+    /// virtual method via <see cref="TypeBuilder.DefineMethodOverride"/>; else
+    /// if the type declares interfaces and the method matches one by
+    /// name+signature it is emitted as the implicit interface implementation
+    /// (Virtual|NewSlot|Final|HideBySig + DefineMethodOverride per slot).
     /// </summary>
     private static void EmitLispDispatchMethod(TypeBuilder tb, string fullName,
         Type baseType, IReadOnlyList<Type>? interfaces, MethodSpec m, string dispatchKey)
     {
         var paramArr = m.ParamTypes.ToArray();
+
+        if (m.IsStatic)
+        {
+            if (m.IsOverride)
+                throw new ArgumentException(
+                    $"static method {m.Name} cannot be an override", nameof(m));
+            EmitLispStaticMethod(tb, fullName, m, dispatchKey, paramArr);
+            return;
+        }
 
         MethodInfo? baseMethod = null;
         List<MethodInfo>? ifaceTargets = null;
@@ -511,22 +872,7 @@ public static class DynamicClassBuilder
 
         il.Emit(OpCodes.Call, DispatchMI);
 
-        // Convert return value
-        if (m.ReturnType == typeof(void))
-        {
-            il.Emit(OpCodes.Pop);
-        }
-        else if (m.ReturnType.IsValueType)
-        {
-            il.Emit(OpCodes.Unbox_Any, m.ReturnType);
-        }
-        else if (m.ReturnType != typeof(object))
-        {
-            il.Emit(OpCodes.Castclass, m.ReturnType);
-        }
-        // else: result is already object; leave on stack
-
-        il.Emit(OpCodes.Ret);
+        EmitReturnConversion(il, m.ReturnType);
 
         if (baseMethod != null)
             tb.DefineMethodOverride(method, baseMethod);
@@ -534,6 +880,66 @@ public static class DynamicClassBuilder
         if (ifaceTargets != null)
             foreach (var target in ifaceTargets)
                 tb.DefineMethodOverride(method, target);
+    }
+
+    /// <summary>
+    /// Emit a <c>public static</c> method whose body boxes its args into an
+    /// <c>object[]</c> and dispatches to the registered Lisp function via
+    /// <see cref="DispatchLispStatic"/> (no <c>self</c>). This is how a Lisp
+    /// <c>defun</c> becomes a callable static member of a library type.
+    /// </summary>
+    private static void EmitLispStaticMethod(TypeBuilder tb, string fullName,
+        MethodSpec m, string dispatchKey, Type[] paramArr)
+    {
+        var method = tb.DefineMethod(m.Name,
+            MethodAttributes.Public | MethodAttributes.Static | MethodAttributes.HideBySig,
+            m.ReturnType, paramArr);
+
+        if (m.Attributes != null)
+            foreach (var ab2 in m.Attributes)
+                method.SetCustomAttribute(ab2);
+
+        var il = method.GetILGenerator();
+
+        // DispatchLispStatic(typeName, dispatchKey, returnType, object[] args)
+        il.Emit(OpCodes.Ldstr, fullName);
+        il.Emit(OpCodes.Ldstr, dispatchKey);
+        il.Emit(OpCodes.Ldtoken, m.ReturnType);
+        il.Emit(OpCodes.Call, GetTypeFromHandleMI);
+
+        il.Emit(OpCodes.Ldc_I4, paramArr.Length);
+        il.Emit(OpCodes.Newarr, typeof(object));
+        for (int i = 0; i < paramArr.Length; i++)
+        {
+            il.Emit(OpCodes.Dup);
+            il.Emit(OpCodes.Ldc_I4, i);
+            il.Emit(OpCodes.Ldarg, i); // static: arg 0 is the first parameter
+            if (paramArr[i].IsValueType)
+                il.Emit(OpCodes.Box, paramArr[i]);
+            il.Emit(OpCodes.Stelem_Ref);
+        }
+
+        il.Emit(OpCodes.Call, DispatchStaticMI);
+
+        EmitReturnConversion(il, m.ReturnType);
+    }
+
+    /// <summary>
+    /// Emit the return-value conversion + Ret shared by instance and static
+    /// dispatch bodies: pop for void, unbox for value types, castclass for
+    /// non-object reference types, leave-as-is for object.
+    /// </summary>
+    private static void EmitReturnConversion(ILGenerator il, Type returnType)
+    {
+        if (returnType == typeof(void))
+            il.Emit(OpCodes.Pop);
+        else if (returnType.IsValueType)
+            il.Emit(OpCodes.Unbox_Any, returnType);
+        else if (returnType != typeof(object))
+            il.Emit(OpCodes.Castclass, returnType);
+        // else: result is already object; leave on stack
+
+        il.Emit(OpCodes.Ret);
     }
 
     /// <summary>
@@ -739,6 +1145,10 @@ public static class DynamicClassBuilder
         typeof(DynamicClassBuilder).GetMethod(nameof(DispatchLispMethod),
             BindingFlags.Public | BindingFlags.Static)!;
 
+    private static readonly MethodInfo DispatchStaticMI =
+        typeof(DynamicClassBuilder).GetMethod(nameof(DispatchLispStatic),
+            BindingFlags.Public | BindingFlags.Static)!;
+
     /// <summary>
     /// Runtime entry point called by the emitted method body. Looks up the
     /// Lisp lambda registered for (typeFullName, methodName), marshals self
@@ -761,6 +1171,31 @@ public static class DynamicClassBuilder
         // Cross the C#→Lisp boundary through InvokeForeignCallback so a Lisp error
         // in the override body is handled (dotcl:*foreign-callback-handler*) rather
         // than escaping as TargetInvocationException and crashing the .NET caller.
+        var result = Runtime.InvokeForeignCallback(lispFn, lispArgs);
+
+        if (returnType == typeof(void)) return null;
+        return Runtime.LispToDotNet(result, returnType);
+    }
+
+    /// <summary>
+    /// Runtime entry point for an emitted <c>public static</c> method body.
+    /// Like <see cref="DispatchLispMethod"/> but with no <c>self</c>: looks up
+    /// the Lisp function registered for (typeFullName, methodName), marshals the
+    /// args, funcalls it through InvokeForeignCallback (so a Lisp error is
+    /// handled rather than crashing the .NET caller), and marshals the result
+    /// back for the declared <paramref name="returnType"/>.
+    /// </summary>
+    public static object? DispatchLispStatic(
+        string typeFullName, string methodName, Type returnType, object?[] args)
+    {
+        if (!_methodHandlers.TryGetValue((typeFullName, methodName), out var lispFn))
+            throw new InvalidOperationException(
+                $"DispatchLispStatic: no Lisp handler registered for {typeFullName}.{methodName}");
+
+        var lispArgs = new LispObject[args.Length];
+        for (int i = 0; i < args.Length; i++)
+            lispArgs[i] = Runtime.DotNetToLisp(args[i]);
+
         var result = Runtime.InvokeForeignCallback(lispFn, lispArgs);
 
         if (returnType == typeof(void)) return null;

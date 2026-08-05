@@ -12,6 +12,15 @@ public class LispFunction : LispObject
     // Debug: SIL body stored when dotcl:*save-sil* is true at defun time
     public LispObject? Sil { get; internal set; }
 
+    // Name this function was registered under, for the InvokeSlow statistics only.
+    // C# builtins are constructed as anonymous lambdas and keep Name == null on
+    // purpose (a non-null Name makes InvokeSlow push a call-stack frame), so the
+    // statistics used to collapse every lambda of one registration method into a
+    // single <anon:<RegisterSequenceBuiltins>b___> bucket. RegisterFunction fills
+    // this in so the counters name the symbol instead. Read only while
+    // CollectInvokeStats is on — no hot-path cost.
+    internal string? StatsName;
+
     // Closure delegate: receives explicit env array
     private readonly Func<object[], LispObject[], LispObject>? _closureFunc;
 
@@ -170,6 +179,16 @@ public class LispFunction : LispObject
     }
 
     [ThreadStatic] private static Stack<Frame>? s_callStack;
+
+    /// <summary>Number of Lisp frames on this thread's call stack. A body's own
+    /// frame is already pushed while it runs, so this is that body's depth —
+    /// DebugFrames uses it to tie a frame's locals to its backtrace position.</summary>
+    internal static int CallStackDepth => s_callStack?.Count ?? 0;
+
+    /// <summary>Name of the innermost Lisp frame, or null when there is none
+    /// (anonymous callee, or a body reached without going through Invoke).</summary>
+    internal static string? CurrentFrameName =>
+        s_callStack is { Count: > 0 } s ? s.Peek().Name : null;
 
     /// <summary>Backtrace as callee-name strings, innermost first. Used by the
     /// programmatic DOTCL:BACKTRACE.</summary>
@@ -452,7 +471,7 @@ public class LispFunction : LispObject
     private LispObject InvokeSlow(LispObject[] args)
     {
         if (CollectInvokeStats)
-            s_invokeSlowStats.AddOrUpdate((Name ?? AnonOriginTag(), args.Length), 1,
+            s_invokeSlowStats.AddOrUpdate((Name ?? StatsName ?? AnonOriginTag(), args.Length), 1,
                                           static (_, c) => c + 1);
         PeriodicStackCheck();
         if (Name == null) return _func(args);
