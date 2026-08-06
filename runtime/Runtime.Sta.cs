@@ -3,11 +3,18 @@ using System.Runtime.ExceptionServices;
 namespace DotCL;
 
 /// <summary>
-/// STA UI thread support for Windows Forms.
+/// A single-threaded-apartment thread with a message loop, and the bridge onto it.
 /// dotnet:ui-invoke runs a Lisp lambda on the STA thread and returns the result.
 /// dotnet:ui-post   runs a Lisp lambda on the STA thread without waiting.
+///
+/// A window belongs to the thread that created it and only that thread may pump its
+/// messages, so UI work cannot run on the REPL's thread — hence the dedicated STA
+/// thread and the marshalling. Apartments are a COM concept, which is why this is
+/// Windows-only: the dependency is Thread.SetApartmentState, not any UI framework.
+/// System.Windows.Forms is never referenced here; the caller loads it (or WPF, or
+/// anything else needing an apartment) and it is looked up reflectively.
 /// </summary>
-internal static class DotNetWinForms
+internal static class DotNetSta
 {
     private static Thread? _uiThread;
     private static SynchronizationContext? _uiContext;

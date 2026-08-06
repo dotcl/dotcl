@@ -1703,3 +1703,270 @@ overload), so this never changes behaviour, only speed."
                      ,@(mapcar (lambda (step) (%dotnet-chain-step inv obj step))
                                (cddr form))
                      ,obj))))))))
+
+;;; ============================================================
+;;; MACROEXPAND-ALL (exported as dotcl-cltl2:macroexpand-all)
+;;; ============================================================
+;;; A code walker that expands every macro form in FORM, including macros and
+;;; symbol macros introduced by local MACROLET / SYMBOL-MACROLET. MACROEXPAND-1
+;;; already reads a reified environment shaped (macros-ht . symbol-macros-ht)
+;;; keyed by symbol NAME, which is what the compiler hands to &environment, so
+;;; the walker carries tables of that shape and shadows them per scope.
+;;;
+;;; Scope tracking is what a structural walker cannot do: a lexical variable
+;;; shadows a symbol macro of the same name, and FLET/LABELS shadow a global
+;;; macro, so both must remove the binding on the way down.
+
+(defun %mea-copy (ht)
+  (let ((new (make-hash-table :test 'equal)))
+    (when ht (maphash (lambda (k v) (setf (gethash k new) v)) ht))
+    new))
+
+(defun %mea-shadow (ht names)
+  ;; Lexical bindings hide a symbol macro / macro of the same name.
+  (if (null names)
+      ht
+      (let ((new (%mea-copy ht)))
+        (dolist (n names new)
+          (when (symbolp n) (remhash (symbol-name n) new))))))
+
+(defun %mea-ll-vars (ll)
+  ;; Variables a lambda list binds, so they can shadow symbol macros.
+  (let ((vars '()))
+    (dolist (x ll (nreverse vars))
+      (cond ((member x '(&optional &rest &key &aux &allow-other-keys &body
+                         &whole &environment)))
+            ((symbolp x) (push x vars))
+            ((consp x)
+             (let ((head (car x)))
+               (cond ((symbolp head) (push head vars))
+                     ;; ((:key var) default svar)
+                     ((and (consp head) (symbolp (cadr head))) (push (cadr head) vars))))
+             (when (and (cddr x) (symbolp (caddr x))) (push (caddr x) vars)))))))
+
+(defun %mea-strip-env (ll)
+  ;; Drop &environment VAR from a macrolet lambda list; the walker has no
+  ;; compiler environment object to pass, and CLHS lets it be absent.
+  (let ((out '()) (rest ll))
+    (loop while rest do
+      (if (eq (car rest) '&environment)
+          (setq rest (cddr rest))
+          (progn (push (car rest) out) (setq rest (cdr rest)))))
+    (nreverse out)))
+
+(defun %mea-macrolet-expander (name ll body)
+  ;; Build the expander MACROEXPAND-1 will call: it receives the whole form.
+  (let ((whole (gensym "WHOLE"))
+        (clean (%mea-strip-env ll)))
+    (declare (ignorable name))
+    (if (eq (car clean) '&whole)
+        (let ((wvar (cadr clean)))
+          (eval (list 'lambda (list whole)
+                      (list 'let (list (list wvar whole))
+                            (list* 'destructuring-bind (cddr clean)
+                                   (list 'cdr whole) body)))))
+        (eval (list 'lambda (list whole)
+                    (list* 'destructuring-bind clean (list 'cdr whole) body))))))
+
+(defun %mea-body (body macros symbol-macros fns)
+  ;; Walk a body, leaving (declare ...) forms untouched.
+  (mapcar (lambda (f)
+            (if (and (consp f) (eq (car f) 'declare))
+                f
+                (%mea f macros symbol-macros fns)))
+          body))
+
+(defun %mea-list (forms macros symbol-macros fns)
+  (mapcar (lambda (f) (%mea f macros symbol-macros fns)) forms))
+
+(defun %mea-lambda-tail (rest macros symbol-macros fns)
+  ;; (lambda-list . body) shared by LAMBDA, FLET/LABELS definitions.
+  (let* ((ll (car rest))
+         (vars (%mea-ll-vars ll))
+         (sm (%mea-shadow symbol-macros vars)))
+    (cons ll (%mea-body (cdr rest) macros sm fns))))
+
+(defun %mea (form macros symbol-macros fns)
+  (cond
+    ;; A symbol may be a symbol macro, unless lexically shadowed (handled by
+    ;; the callers that bind variables).
+    ((symbolp form)
+     (if (and form (not (eq form t)) (not (keywordp form)))
+         (multiple-value-bind (exp expanded)
+             (macroexpand-1 form (cons macros symbol-macros))
+           (if expanded (%mea exp macros symbol-macros fns) form))
+         form))
+    ((atom form) form)
+    (t
+     (let ((head (car form)))
+       ;; Expand macro calls first, but never a name shadowed by a local
+       ;; function binding (FLET/LABELS beat a global macro of the same name).
+       (when (and (symbolp head) (not (member head fns)))
+         (multiple-value-bind (exp expanded)
+             (macroexpand-1 form (cons macros symbol-macros))
+           (when expanded
+             (return-from %mea (%mea exp macros symbol-macros fns)))))
+       (case head
+         ((quote go declare) form)
+         ((function)
+          (if (and (consp (cadr form)) (eq (car (cadr form)) 'lambda))
+              (list 'function (cons 'lambda (%mea-lambda-tail (cdr (cadr form))
+                                                              macros symbol-macros fns)))
+              form))
+         ((lambda) (cons 'lambda (%mea-lambda-tail (cdr form) macros symbol-macros fns)))
+         ((let let*)
+          (let* ((binds (cadr form))
+                 (walked (mapcar (lambda (b)
+                                   (if (consp b)
+                                       (list (car b) (%mea (cadr b) macros symbol-macros fns))
+                                       b))
+                                 binds))
+                 (vars (mapcar (lambda (b) (if (consp b) (car b) b)) binds))
+                 (sm (%mea-shadow symbol-macros vars)))
+            (list* head walked (%mea-body (cddr form) macros sm fns))))
+         ((flet labels)
+          (let* ((defs (cadr form))
+                 (names (mapcar (lambda (d) (car d)) defs))
+                 ;; LABELS definitions see each other; FLET's do not.
+                 (inner-fns (if (eq head 'labels) (append names fns) fns))
+                 (walked (mapcar (lambda (d)
+                                   (cons (car d)
+                                         (%mea-lambda-tail (cdr d) macros symbol-macros
+                                                           inner-fns)))
+                                 defs))
+                 (body-macros (%mea-shadow macros names)))
+            (list* head walked
+                   (%mea-body (cddr form) body-macros symbol-macros
+                              (append names fns)))))
+         ((macrolet)
+          (let ((new (%mea-copy macros)))
+            (dolist (d (cadr form))
+              (setf (gethash (symbol-name (car d)) new)
+                    (%mea-macrolet-expander (car d) (cadr d) (cddr d))))
+            ;; The macrolet itself disappears: its body is walked with the
+            ;; definitions in scope, which is the point of the whole exercise.
+            (let ((walked (%mea-body (cddr form) new symbol-macros fns)))
+              (if (= (length walked) 1) (car walked) (cons 'progn walked)))))
+         ((symbol-macrolet)
+          (let ((new (%mea-copy symbol-macros)))
+            (dolist (d (cadr form))
+              (setf (gethash (symbol-name (car d)) new) (cadr d)))
+            (let ((walked (%mea-body (cddr form) macros new fns)))
+              (if (= (length walked) 1) (car walked) (cons 'progn walked)))))
+         ((setq)
+          ;; A symbol macro in the place turns SETQ into SETF (CLHS 5.1.2.4).
+          (let ((out '()) (rest (cdr form)))
+            (loop while rest do
+              (let* ((place (car rest))
+                     (value (%mea (cadr rest) macros symbol-macros fns))
+                     (sm (and (symbolp place)
+                              (gethash (symbol-name place) symbol-macros))))
+                (if sm
+                    (push (%mea (list 'setf sm value) macros symbol-macros fns) out)
+                    (progn (push place out) (push value out))))
+              (setq rest (cddr rest)))
+            (let ((parts (nreverse out)))
+              (if (and parts (consp (car parts)))
+                  (if (= (length parts) 1) (car parts) (cons 'progn parts))
+                  (cons 'setq parts)))))
+         ((block catch throw return-from the multiple-value-call
+           multiple-value-prog1 unwind-protect progn locally eval-when if)
+          ;; Forms whose first subform is a name/keyword rather than a form.
+          (case head
+            ((block return-from)
+             (list* head (cadr form) (%mea-list (cddr form) macros symbol-macros fns)))
+            ((the) (list 'the (cadr form) (%mea (caddr form) macros symbol-macros fns)))
+            ((eval-when)
+             (list* 'eval-when (cadr form) (%mea-body (cddr form) macros symbol-macros fns)))
+            ((locally) (list* 'locally (%mea-body (cdr form) macros symbol-macros fns)))
+            (t (cons head (%mea-list (cdr form) macros symbol-macros fns)))))
+         ((tagbody)
+          (cons 'tagbody
+                (mapcar (lambda (f)
+                          (if (or (symbolp f) (integerp f))
+                              f
+                              (%mea f macros symbol-macros fns)))
+                        (cdr form))))
+         ((progv)
+          (list* 'progv (%mea-list (cdr form) macros symbol-macros fns)))
+         ((load-time-value)
+          (list* 'load-time-value (%mea (cadr form) macros symbol-macros fns) (cddr form)))
+         (t
+          ;; Ordinary call. ((lambda ...) args) keeps its operator walked too.
+          (if (consp head)
+              (cons (%mea head macros symbol-macros fns)
+                    (%mea-list (cdr form) macros symbol-macros fns))
+              (cons head (%mea-list (cdr form) macros symbol-macros fns)))))))))
+
+(defun %macroexpand-all (form &optional env)
+  "Expand every macro in FORM, including ones from local MACROLET /
+SYMBOL-MACROLET. ENV is an environment as handed to &environment; its macro
+and symbol-macro scope is used as the starting point."
+  (let ((macros (cond ((consp env) (car env))
+                      ((hash-table-p env) env)
+                      (t nil)))
+        (symbol-macros (and (consp env) (cdr env))))
+    (%mea form
+          (%mea-copy (and (hash-table-p macros) macros))
+          (%mea-copy (and (hash-table-p symbol-macros) symbol-macros))
+          '())))
+
+;;; --- xref (who-calls) runtime tables ---
+;;;
+;;; The compiler records CALLER→CALLEE edges while compiling each named
+;;; function and plants a load-time (dotcl:%xref-note caller callees) call in
+;;; the compiled output. The tables live here; registration replaces the
+;;; caller's whole edge set, so redefinition / fasl reload drops stale edges
+;;; naturally. Keys are function names: symbols or (setf sym) lists — hence
+;;; EQUAL tables (equal on interned symbols is identity).
+;;; DOTCL-package names are interned at load time, not written with dotcl:
+;;; reader syntax, because the SBCL cross-compile host has no DOTCL package.
+
+(defvar *xref-callee-table* (make-hash-table :test 'equal)
+  "caller name → list of callee names (compile-order).")
+
+(defvar *xref-caller-table* (make-hash-table :test 'equal)
+  "callee name → list of caller names.")
+
+(defvar *xref-lock* (%make-lock "dotcl-xref"))
+
+(defun %xref-note (caller callees)
+  "Replace CALLER's recorded callee set with CALLEES and update the reverse
+   index. Called from compiled code at load time; also usable directly."
+  (%acquire-lock *xref-lock* t)
+  (unwind-protect
+       (progn
+         ;; drop the old edges of this caller from the reverse index
+         (dolist (old (gethash caller *xref-callee-table*))
+           (setf (gethash old *xref-caller-table*)
+                 (remove caller (gethash old *xref-caller-table*) :test #'equal)))
+         (setf (gethash caller *xref-callee-table*) callees)
+         (dolist (callee callees)
+           (pushnew caller (gethash callee *xref-caller-table*) :test #'equal))
+         caller)
+    (%release-lock *xref-lock*)))
+
+(defun %xref-who-calls (name)
+  "List of function names whose definitions call (or take #' of) NAME."
+  (%acquire-lock *xref-lock* t)
+  (unwind-protect
+       (copy-list (gethash name *xref-caller-table*))
+    (%release-lock *xref-lock*)))
+
+(defun %xref-who-is-called-by (name)
+  "List of function names that NAME's definition calls (or takes #' of)."
+  (%acquire-lock *xref-lock* t)
+  (unwind-protect
+       (copy-list (gethash name *xref-callee-table*))
+    (%release-lock *xref-lock*)))
+
+(let ((pkg (find-package "DOTCL")))
+  (when pkg
+    (let ((note (intern "%XREF-NOTE" pkg))
+          (who  (intern "WHO-CALLS" pkg))
+          (by   (intern "WHO-IS-CALLED-BY" pkg)))
+      (setf (symbol-function note) #'%xref-note)
+      (setf (symbol-function who) #'%xref-who-calls)
+      (setf (symbol-function by) #'%xref-who-is-called-by)
+      (export who pkg)
+      (export by pkg))))

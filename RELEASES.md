@@ -3,6 +3,109 @@
 User-facing release notes for dotcl. Each section corresponds to a tagged
 release on the public mirror (dotcl/dotcl).
 
+## v0.1.23 -- 2026-08-06
+
+SBCL's `make-host-2` cross-build stage now runs on dotcl without the workaround
+harness it used to need.
+Threads can be interrupted while they are computing, not only while they wait.
+`save-application` follows a real dependency graph. And .NET's wider numeric
+types -- `BigInteger`, `Int128`, `UInt128`, `Half` -- arrive as ordinary Lisp
+numbers.
+
+### SBCL's cross-build, unmodified
+
+- dotcl runs SBCL's stock `make-host-2.sh` (which chains `make-genesis-2.sh`)
+  with no patches to SBCL's sources and no Lisp-level workarounds on our side.
+  What remains on ours is two environment lines in the cross-compilation host
+  wrapper; the harness that used to stand in for missing pieces is gone. SBCL's
+  own two-pass consistency check passes: "header files match between first and
+  second GENESIS".
+- The earlier `make-host-1` stage still runs with scaffolding. That is the next
+  piece of work, not something this release finishes.
+- Getting this far drove most of the correctness fixes below. Compiling a
+  large, demanding body of portable Common Lisp remains the most productive way
+  we have found to surface real bugs.
+
+### Interrupting threads that are working
+
+- `interrupt-thread` and `destroy-thread` now reach a thread that is busy
+  computing, not just one blocked in a lock, sleep, or join: compiled loops
+  carry an interrupt safepoint at the back edge.
+- On Unix, Ctrl+C at the REPL interrupts the running form instead of killing
+  the process.
+- Running out of stack or heap signals a `storage-condition` you can handle,
+  rather than taking the process down. Deep `apply` chains no longer die
+  during the signalling itself.
+
+### save-application
+
+- The image is built by compiling as it loads, so definitions that a later
+  file's macro needs are present when it expands.
+- Component collection walks the dependency graph itself. ASDF's
+  `required-components` is not transitively closed, which could silently drop
+  whole systems from a saved image.
+- New `:prelude` accepts source that must run before the closure is computed --
+  the escape hatch for systems whose load-time forms need a build environment.
+
+### .NET numeric types
+
+- `System.Numerics.BigInteger`, `Int128`, `UInt128`, and `System.Half` now
+  marshal in both directions as ordinary Lisp numbers. A `BigInteger` or
+  `Int128` result is a CL integer; a `Half` is a `single-float`, which holds
+  every `Half` value exactly. No new Lisp types were introduced.
+- Passing a CL integer to a fixed-width .NET parameter is now checked: a value
+  that does not fit the target's width signals a `type-error` instead of
+  silently wrapping. **This can turn code that appeared to work into an error**
+  -- an unchecked `(byte)300` used to store 44. Bit patterns still work:
+  a signed target accepts the unsigned N-bit form, so `#xFF800000` reaches an
+  `int` parameter and reinterprets as expected.
+- These types can also appear in signatures dotcl emits, via
+  `dotnet:define-class`.
+- New `dotcl-float` contrib: IEEE float bit/value primitives, which is what
+  Shinmera's float-features needs from an implementation.
+
+### Interop and I/O
+
+- Constructor exceptions from `dotnet:new` are unwrapped with the inner
+  exception preserved, and `dotnet:exception-object` reaches the exception
+  instance itself.
+- `dotnet:call-out` treats `ref` parameters as in-out.
+- `launch-process` accepts `:environment`; `open` accepts `:external-format`.
+- Stream I/O failures signal `stream-error`, `file-position` on a closed stream
+  signals rather than returning nonsense, and a `nil` pathname designator is a
+  `type-error` instead of a confusing downstream failure.
+- Gray streams: `force-output`/`clear-input` work on binary streams,
+  `unread-char` dispatches to `stream-unread-char`, and `format ~T` asks the
+  stream for its column.
+
+### Tooling
+
+- `dotcl:who-calls` reports callers of a function.
+- New `dotcl-cltl2:macroexpand-all`, a real code walker that handles local
+  `macrolet`. Tools that expand a whole form -- and the portability shims that
+  look for an implementation's spelling of it -- now have one to find.
+- Compiled `.fasl` files carry the generation of the compiler that produced
+  them and warn on load when it does not match the running core -- the usual
+  cause of "I fixed it but nothing changed".
+- The `clrmd` contrib can aggregate a heap: type histogram, symbols per
+  package, list structure.
+- `samples/HotReloadDemo` shows a running C# host swapping in a changed
+  `.lisp` file.
+
+### Browser (WASM) groundwork
+
+Not a supported target yet, but the pieces are in place: the build produces a
+`browser-wasm` runtime, the core can be loaded from a byte array rather than a
+file, and it survives IL trimming. Measurements of what actually works in a
+browser -- filesystem, speed, JS interop -- are in the docs.
+
+### Thanks
+
+- Bohong Huang -- for the `dotcl-float` contrib and for finding that a
+  compile-time `(require ...)` left the module registered but its definitions
+  stripped, so the load-time `require` did nothing. The contrib also turned up
+  an over-strict range check in our integer marshalling.
+
 ## v0.1.22 -- 2026-08-01
 
 Quicklisp works out of the box, .NET interop reads the way you would write it

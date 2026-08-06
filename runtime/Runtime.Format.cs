@@ -67,7 +67,8 @@ public static partial class Runtime
         while (resolved is LispSynonymStream syn2) resolved = DynamicBindings.Get(syn2.Symbol);
         bool atLineStart = resolved is LispStream ls2 ? ls2.AtLineStart : true;
 
-        var result2 = FormatString(formatString, formatArgs2, atLineStart);
+        var result2 = FormatString(formatString, formatArgs2, atLineStart,
+                                   StreamInitialColumn(resolved));
 
         // Write result and update AtLineStart
         if (dest is T)
@@ -931,12 +932,38 @@ public static partial class Runtime
         return full;
     }
 
-    private static string FormatString(string template, LispObject[] args, bool streamAtLineStart = true)
+    private static string FormatString(string template, LispObject[] args, bool streamAtLineStart = true,
+                                       int initialColumn = 0)
     {
         // CLHS 22.3.6.1: ~I, ~_, ~W, ~:T cannot coexist with ~<...~:;...~> in same format string
         ValidateJustifyPrettyPrintConflict(template);
         int argIdx = 0;
-        return FormatString(template, args, ref argIdx, streamAtLineStart);
+        return FormatString(template, args, ref argIdx, streamAtLineStart, initialColumn);
+    }
+
+    /// <summary>
+    /// Column the destination stream is currently at, for ~T tabulation.
+    /// A gray output stream answers via the stream-line-column generic
+    /// (NIL / no method / non-integer all mean "unknown" = 0). Built-in
+    /// streams don't track columns, so they report 0 (CLHS 22.3.6.1 allows
+    /// assuming column 0 when it cannot be determined).
+    /// </summary>
+    private static int StreamInitialColumn(LispObject resolved)
+    {
+        if (resolved is LispInstance gi && IsGrayOutputStream(gi))
+        {
+            try
+            {
+                var fn = GrayStreamLookup.GrayOrCl("STREAM-LINE-COLUMN");
+                if (fn != null && fn.Invoke(new LispObject[] { gi }) is Fixnum col && col.Value >= 0)
+                    return (int)col.Value;
+            }
+            catch (LispErrorException)
+            {
+                // no applicable method — column unknown
+            }
+        }
+        return 0;
     }
 
     /// <summary>
@@ -956,7 +983,8 @@ public static partial class Runtime
         bool atLineStart = resolved is LispStream ls2 ? ls2.AtLineStart : true;
 
         int argIdx = 0;
-        var result = FormatString(template, args, ref argIdx, atLineStart);
+        var result = FormatString(template, args, ref argIdx, atLineStart,
+                                  StreamInitialColumn(resolved));
 
         if (dest is T)
         {
@@ -1021,7 +1049,8 @@ public static partial class Runtime
         }
     }
 
-    private static string FormatString(string template, LispObject[] args, ref int argIdx, bool streamAtLineStart = true)
+    private static string FormatString(string template, LispObject[] args, ref int argIdx, bool streamAtLineStart = true,
+                                       int initialColumn = 0)
     {
         var sb = new System.Text.StringBuilder();
         int i = 0;
@@ -2083,9 +2112,11 @@ public static partial class Runtime
                             }
                             break;
                         }
-                        // Find current column (approximate: count from last newline)
+                        // Find current column (approximate: count from last newline;
+                        // before any newline in this format run, everything is offset
+                        // by the column the destination stream was already at)
                         int lastNl = sb.ToString().LastIndexOf('\n');
-                        int col = lastNl < 0 ? sb.Length : sb.Length - lastNl - 1;
+                        int col = lastNl < 0 ? initialColumn + sb.Length : sb.Length - lastNl - 1;
                         if (atMod)
                         {
                             // ~colnum,colinc@T: relative tabulation

@@ -322,8 +322,61 @@ public partial class Runtime
                 "INTERRUPT-THREAD: second argument must be a function"));
         if (!lt.Thread.IsAlive) return Nil.Instance;
         lt.PendingInterrupts.Enqueue(fn);
+        // Tier 2: computing threads see the enqueue at their next safepoint
+        // (loop back-edge poll / periodic call check). The counter is the
+        // cheap process-wide gate those hot paths read before touching any
+        // per-thread state.
+        Interlocked.Increment(ref SafepointInterruptsPending);
         lt.Thread.Interrupt();
         return T.Instance;
+    }
+
+    /// <summary>Process-wide count of INTERRUPT-THREAD functions enqueued but
+    /// not yet run. Safepoints (ConditionSystem.PollInterrupt / CheckInterrupt)
+    /// read this with Volatile.Read as their fast-path gate: zero means no
+    /// thread anywhere has a pending interrupt, so the common case costs one
+    /// static read.</summary>
+    internal static int SafepointInterruptsPending;
+
+    /// <summary>
+    /// Deliver INTERRUPT-THREAD functions to the CURRENT thread at a compiled
+    /// -code safepoint. This is what makes INTERRUPT-THREAD reach a thread
+    /// that is computing rather than waiting (Tier 2): the blocking
+    /// primitives deliver via RunPendingInterrupts when their wait is cut
+    /// short, but a compute loop never waits.
+    ///
+    /// The Thread.Interrupt() poke that accompanied the enqueue has NOT fired
+    /// here (this thread was computing), so after draining we absorb it —
+    /// otherwise the thread's next legitimate wait dies with a spurious
+    /// interrupt that RunPendingInterrupts cannot claim (the DESTROY-THREAD
+    /// contract makes the blocking primitives rethrow "not ours"). The absorb
+    /// races with a concurrent fresh enqueue's poke; if anything is queued
+    /// again afterwards, self-interrupt to restore the pending poke so a wait
+    /// entered before the next safepoint still wakes (Tier 1 preserved).
+    /// </summary>
+    internal static void RunPendingInterruptsAtSafepoint()
+    {
+        var self = _currentLispThread
+                   ?? (_threadRegistry.TryGetValue(Thread.CurrentThread.ManagedThreadId, out var reg)
+                       ? reg : null);
+        if (self == null || self.PendingInterrupts.IsEmpty) return;
+        try
+        {
+            while (self.PendingInterrupts.TryDequeue(out var fn))
+            {
+                Interlocked.Decrement(ref SafepointInterruptsPending);
+                if (ReferenceEquals(fn, s_destroyRequest))
+                    throw new ThreadInterruptedException("destroy-thread");
+                if (fn is LispFunction lfn) lfn.Invoke();
+                else if (fn is Symbol sym && sym.Function is LispFunction sfn) sfn.Invoke();
+            }
+        }
+        finally
+        {
+            try { Thread.Sleep(0); }
+            catch (ThreadInterruptedException) { }
+            if (!self.PendingInterrupts.IsEmpty) Thread.CurrentThread.Interrupt();
+        }
     }
 
     /// <summary>
@@ -351,18 +404,37 @@ public partial class Runtime
         while (self.PendingInterrupts.TryDequeue(out var fn))
         {
             ran = true;
+            Interlocked.Decrement(ref SafepointInterruptsPending);
+            if (ReferenceEquals(fn, s_destroyRequest))
+                throw new ThreadInterruptedException("destroy-thread");
             if (fn is LispFunction lfn) lfn.Invoke();
             else if (fn is Symbol sym && sym.Function is LispFunction sfn) sfn.Invoke();
         }
         return ran;
     }
 
-    /// <summary>(bt:destroy-thread thread)</summary>
+    /// <summary>Sentinel queued by DESTROY-THREAD. When either drain dequeues
+    /// it, the target thread throws ThreadInterruptedException on itself —
+    /// the same control-flow exception a destroy delivers to a waiting
+    /// thread — so unwind-protect cleanups run and the thread dies.</summary>
+    private static readonly Symbol s_destroyRequest = new Symbol("%DESTROY-THREAD-REQUEST%");
+
+    /// <summary>(bt:destroy-thread thread)
+    ///
+    /// Thread.Interrupt alone only reaches a thread that is (or next goes)
+    /// waiting — a compute-bound thread (lparallel's kill-tasks target shape)
+    /// would never die. So also queue a destroy sentinel: the safepoint drain
+    /// picks it up at the next loop back-edge / periodic check and the thread
+    /// terminates itself from compiled code, running its cleanups on the way
+    /// out (that is what fulfills lparallel's :abort push of
+    /// task-killed-error to the task's waiters).</summary>
     public static LispObject DestroyThread(LispObject[] args)
     {
         if (args.Length < 1 || args[0] is not LispThread lt)
             throw new LispErrorException(new LispProgramError("DESTROY-THREAD: requires a thread"));
-        // .NET doesn't support Thread.Abort in modern .NET; use interrupt
+        if (!lt.Thread.IsAlive) return T.Instance;
+        lt.PendingInterrupts.Enqueue(s_destroyRequest);
+        Interlocked.Increment(ref SafepointInterruptsPending);
         lt.Thread.Interrupt();
         return T.Instance;
     }

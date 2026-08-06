@@ -405,6 +405,37 @@
     (error (c) (dotnet:exception-type c)))
   nil)
 
+;;; dotnet:exception-object exposes the exception INSTANCE (not just its type),
+;;; so a handler can read type-specific properties and walk InnerException —
+;;; e.g. the SocketException (with its error code) inside the IOException a
+;;; stream read timeout raises. Message text is localized; codes are not.
+(deftest exception-object-exposes-instance
+  (handler-case (%i368-open-missing)
+    (error (c)
+      (notnot (search "dotcl-nonexistent"
+                      (dotnet:invoke (dotnet:exception-object c) "get_FileName")))))
+  t)
+
+(deftest exception-object-inner-chain
+  (handler-case (progn (dotnet:static "DotCL.TestSupport.Throwers" "ThrowWrapped") :no-error)
+    (error (c)
+      (let* ((ex (dotnet:exception-object c))
+             (inner (dotnet:invoke ex "get_InnerException"))
+             ;; SocketException(10060) is WSAETIMEDOUT on Windows; on Linux/.NET the
+             ;; native ErrorCode is translated to 110 (ETIMEDOUT). Normalize so the
+             ;; test asserts "the inner socket error and its code are reachable"
+             ;; without hardcoding a platform-specific errno.
+             (code (dotnet:invoke inner "get_ErrorCode")))
+        (list (dotnet:invoke (dotnet:invoke ex "GetType") "get_Name")
+              (dotnet:invoke (dotnet:invoke inner "GetType") "get_Name")
+              (if (member code '(10060 110)) :timed-out code)))))
+  ("IOException" "SocketException" :timed-out))
+
+(deftest exception-object-nil-for-lisp-condition
+  (handler-case (error "plain lisp error")
+    (error (c) (dotnet:exception-object c)))
+  nil)
+
 (deftest i368-handler-bind-dispatch-on-type
   (block done
     (dotnet:handler-bind (("System.IO.IOException" (c)
@@ -419,6 +450,68 @@
         (%i368-open-missing))
     (error () :propagated))
   :propagated)
+
+;;; dotnet:call-out with a plain `ref` parameter: ref is in-out, so the caller
+;;; supplies the initial value and receives the updated one as an extra return
+;;; value. Previously ref was classified like `out` (no in-arg consumed), which
+;;; shifted the remaining args into the wrong parameter slots — for a method
+;;; like Socket.ReceiveFrom(byte[], ref EndPoint) the EndPoint landed in a
+;;; SocketFlags slot and died with "Object must implement IConvertible".
+(deftest call-out-ref-consumes-initial-value
+  (let ((sb (dotnet:new "System.Text.StringBuilder" "hi")))
+    (multiple-value-bind (len sb2)
+        (dotnet:call-out "DotCL.TestSupport.RefParams" "AppendBang" sb)
+      (list len (dotnet:invoke sb2 "ToString"))))
+  (3 "hi!"))
+
+(deftest call-out-ref-replacement-returned
+  (multiple-value-bind (ok s2)
+      (dotnet:call-out "DotCL.TestSupport.RefParams" "Replace" "abc")
+    (list (notnot ok) s2))
+  (t "abc-replaced"))
+
+;;; Overload selection counts ref params as in-params.
+(deftest call-out-ref-overload-by-in-count
+  (let ((sb (dotnet:new "System.Text.StringBuilder" "z")))
+    (list (values (dotnet:call-out "DotCL.TestSupport.RefParams" "Describe" sb))
+          (values (dotnet:call-out "DotCL.TestSupport.RefParams" "Describe" sb 5))))
+  ("one:z" "two:z5"))
+
+;;; BCL end-to-end: Array.Resize<T>(ref T[], int) — a ref reference-type param
+;;; on a generic method (dotnet:call-out-generic shares the classification).
+(deftest call-out-generic-ref-array-resize
+  (let ((a (dotnet:make-array "System.Int32" 2)))
+    (dotnet:invoke a "set_Item" 0 7)
+    (multiple-value-bind (ret a2)
+        (dotnet:call-out-generic "System.Array" "Resize" '("System.Int32") a 4)
+      (declare (ignore ret))
+      (list (dotnet:invoke a2 "get_Length")
+            (dotnet:invoke a2 "get_Item" 0))))
+  (4 7))
+
+;;; dotnet:new on a throwing ctor must surface the inner CLR exception (type
+;;; visible to dotnet:exception-typep, message preserved), not the reflection
+;;; wrapper's "Exception has been thrown by the target of an invocation."
+;;; ThrowingCtor() exercises the Activator.CreateInstance path, ThrowingCtor(int)
+;;; the scored ConstructorInfo.Invoke path, Guid(string) a BCL value type.
+(deftest new-throwing-ctor-parameterless-unwrapped
+  (handler-case (progn (dotnet:new "DotCL.TestSupport.ThrowingCtor") :no-error)
+    (error (c)
+      (list (notnot (dotnet:exception-typep c "System.InvalidOperationException"))
+            (notnot (search "ctor boom" (format nil "~A" c))))))
+  (t t))
+
+(deftest new-throwing-ctor-args-unwrapped
+  (handler-case (progn (dotnet:new "DotCL.TestSupport.ThrowingCtor" 7) :no-error)
+    (error (c)
+      (list (notnot (dotnet:exception-typep c "System.ArgumentOutOfRangeException"))
+            (notnot (search "ctor boom 7" (format nil "~A" c))))))
+  (t t))
+
+(deftest new-throwing-ctor-bcl-guid-unwrapped
+  (handler-case (progn (dotnet:new "System.Guid" "not-a-guid") :no-error)
+    (error (c) (notnot (dotnet:exception-typep c "System.FormatException"))))
+  t)
 
 ;;; (dotcl/dotcl#45): extension-method resolution — dotnet:invoke falls back
 ;;; to a static [Extension] method whose first param accepts the receiver. Covers

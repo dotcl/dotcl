@@ -1,0 +1,25 @@
+<Project>
+  <!--
+    Imported into PackageReference consumers before their own project body, which
+    is the whole reason this is a .props and not part of the .targets next to it:
+    NuGet injects .props at the top and .targets at the bottom, and a property
+    that only exists at the bottom cannot be used by an ItemGroup the consumer
+    writes. (Measured, not assumed: read from a PropertyGroup in the body it came
+    back empty from the .targets, and correct from here.)
+
+    DotclAssetsDir is where the packaged dotcl.core and contrib tree live. Most
+    consumers never need it — DotCL.Runtime.targets copies both into their build
+    output and DotclHost.FindCore() picks the core up from there. It is public
+    for the hosts where that does not work: a browser page has no filesystem for
+    FindCore() to look in, so the core has to be embedded in the assembly or
+    fetched over HTTP, and either way the build has to name the file. Without a
+    property to name it, such a project vendors its own copy of a file the
+    package already ships.
+
+    Settable from outside, so a consumer can point the copy items and its own
+    embedding at a core of its own.
+  -->
+  <PropertyGroup>
+    <DotclAssetsDir Condition="'$(DotclAssetsDir)' == ''">$(MSBuildThisFileDirectory)../dotclassets/</DotclAssetsDir>
+  </PropertyGroup>
+</Project>

@@ -50,6 +50,12 @@ public class LispCondition : LispObject
     /// exception type, so dotnet:exception-type / dotnet:handler-bind can dispatch
     /// on the specific .NET type. Null for ordinary Lisp conditions. (dotcl/dotcl#45)</summary>
     public System.Type? ClrExceptionType { get; set; }
+    /// <summary>For a condition wrapping a raw .NET exception: the exception
+    /// instance itself, exposed via dotnet:exception-object so handlers can read
+    /// type-specific detail the message loses — SocketException.SocketErrorCode,
+    /// the InnerException chain (an IOException around a socket timeout), etc.
+    /// Null for ordinary Lisp conditions.</summary>
+    public System.Exception? ClrException { get; set; }
     public LispCondition(string message) => _message = message;
     public LispCondition(System.Func<string> messageThunk) => _messageThunk = messageThunk;
     public override string ToString() => $"#<{ConditionTypeName}: {Message}>";
@@ -83,6 +89,19 @@ public class LispProgramError : LispError
         ConditionTypeName = "PROGRAM-ERROR";
     }
     public override string ToString() => $"#<PROGRAM-ERROR: {Message}>";
+}
+
+/// <summary>STORAGE-CONDITION (stack or heap exhaustion). Deliberately NOT a
+/// LispError: the spec places it under SERIOUS-CONDITION but outside ERROR, so
+/// handler-case (error ...) must not catch it — matching SBCL, whose
+/// control-stack-exhausted / heap-exhausted-error are pure storage-conditions.</summary>
+public class LispStorageCondition : LispCondition
+{
+    public LispStorageCondition(string message) : base(message)
+    {
+        ConditionTypeName = "STORAGE-CONDITION";
+    }
+    public override string ToString() => $"#<STORAGE-CONDITION: {Message}>";
 }
 
 public class LispCellError : LispError
@@ -548,6 +567,32 @@ public static class ConditionSystem
     /// </summary>
     internal static void CheckInterrupt()
     {
+        if (System.Threading.Volatile.Read(ref Runtime.SafepointInterruptsPending) != 0)
+            Runtime.RunPendingInterruptsAtSafepoint();
+        if (!_interruptRequested) return;
+        _interruptRequested = false;
+        Error(new LispInteractiveInterrupt());
+    }
+
+    /// <summary>Diagnostic counter for PollInterrupt: how many loop back-edge
+    /// safepoints have executed. Read from Lisp via dotnet:static; regression
+    /// tests use the delta to prove a loop is (or is not) emitting polls.</summary>
+    public static long PollCount;
+
+    /// <summary>
+    /// Loop back-edge safepoint. The compiler emits a call to this on the
+    /// back-edge of compiled loops (tagbody dispatch, TCO self/mutual loops) so
+    /// a loop whose body contains no Lisp calls — and therefore never reaches
+    /// the periodic check in LispFunction.Invoke — can still be stopped by
+    /// Ctrl-C. Bodies declared (optimize (safety 0)) opt out at compile time.
+    /// </summary>
+    public static void PollInterrupt()
+    {
+        PollCount++;
+        // Tier 2: INTERRUPT-THREAD functions queued for this thread run here.
+        // The counter gate keeps the common case to one volatile static read.
+        if (System.Threading.Volatile.Read(ref Runtime.SafepointInterruptsPending) != 0)
+            Runtime.RunPendingInterruptsAtSafepoint();
         if (!_interruptRequested) return;
         _interruptRequested = false;
         Error(new LispInteractiveInterrupt());

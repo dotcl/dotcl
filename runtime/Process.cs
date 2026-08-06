@@ -166,7 +166,8 @@ public sealed class LispProcess : LispObject
     public static LispProcess Launch(
         string program, System.Collections.Generic.List<string> arguments, string? directory,
         LispObject input, LispObject output, LispObject error,
-        LispObject ifInputDoesNotExist, LispObject ifOutputExists, LispObject ifErrorOutputExists)
+        LispObject ifInputDoesNotExist, LispObject ifOutputExists, LispObject ifErrorOutputExists,
+        System.Collections.Generic.List<string>? environment = null)
     {
         // uiop normalizes :error-output :output to the :output keyword: send the
         // child's stderr to the same destination as its stdout (like shell 2>&1).
@@ -187,6 +188,19 @@ public sealed class LispProcess : LispObject
         };
         foreach (var a in arguments) Compat.AddArg(psi, a);
         if (!string.IsNullOrEmpty(directory)) psi.WorkingDirectory = directory;
+        if (environment != null)
+        {
+            // sb-ext:run-program :environment semantics: the "VAR=value" list
+            // REPLACES the child's entire environment (psi.Environment starts as a
+            // copy of the parent's, so clear it first). A null list means the key
+            // was omitted — inherit the parent environment unchanged.
+            psi.Environment.Clear();
+            foreach (var kv in environment)
+            {
+                int eq = kv.IndexOf('=');
+                if (eq > 0) psi.Environment[kv.Substring(0, eq)] = kv.Substring(eq + 1);
+            }
+        }
 
         var proc = System.Diagnostics.Process.Start(psi)!;
         var helpers = new System.Collections.Generic.List<System.Threading.Thread>();

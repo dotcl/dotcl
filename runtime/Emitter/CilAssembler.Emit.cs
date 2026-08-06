@@ -949,7 +949,7 @@ public partial class CilAssembler
         Symbol? pkgSym = null;
         bool isForeignCL2 = false;
         Symbol? setfTargetSym = null;  // for (SETF NAME) functions: the target NAME symbol
-        if (!name.StartsWith("("))  // regular function names
+        if (!IsCompoundFunctionName(name))  // regular function names (incl. symbols whose name starts with '(')
         {
             try
             {
@@ -1483,7 +1483,7 @@ public partial class CilAssembler
         Symbol? pkgSym = null;
         bool isForeignCL = false;
         Symbol? setfTargetSym = null;  // for (SETF NAME) functions: the target NAME symbol
-        if (!name.StartsWith("("))
+        if (!IsCompoundFunctionName(name))
         {
             try
             {
@@ -1774,7 +1774,7 @@ public partial class CilAssembler
         // Symbol registration (same as HandleDefmethodDirect)
         Symbol? pkgSym = null;
         Symbol? setfTargetSym = null;
-        if (!name.StartsWith("("))
+        if (!IsCompoundFunctionName(name))
         {
             try
             {
@@ -3882,6 +3882,9 @@ public partial class CilAssembler
             ["DebugFrame.Set"] = typeof(DebugFrame).GetMethod("Set")!,
             ["DebugFrame.SetBox"] = typeof(DebugFrame).GetMethod("SetBox")!,
 
+            // ConditionSystem — loop back-edge interrupt safepoint
+            ["ConditionSystem.PollInterrupt"] = typeof(ConditionSystem).GetMethod("PollInterrupt")!,
+
             // MultipleValues
             ["MultipleValues.Reset"] = typeof(MultipleValues).GetMethod("Reset")!,
             ["MultipleValues.Primary"] = typeof(MultipleValues).GetMethod("Primary")!,
@@ -4135,7 +4138,7 @@ public partial class CilAssembler
             ["Runtime.WriteChar"] = typeof(Runtime).GetMethod("WriteChar")!,
             ["Runtime.WriteString"] = typeof(Runtime).GetMethod("WriteString", new[] { typeof(LispObject[]) })!,
             ["Runtime.WriteLine"] = typeof(Runtime).GetMethod("WriteLine", new[] { typeof(LispObject[]) })!,
-            ["Runtime.Directory"] = typeof(Runtime).GetMethod("LispDirectory")!,
+            ["Runtime.Directory"] = typeof(Runtime).GetMethod("DirectoryFunc")!,
             ["Runtime.ProbeFile"] = typeof(Runtime).GetMethod("ProbeFile")!,
             ["Runtime.Truename"] = typeof(Runtime).GetMethod("Truename")!,
 

@@ -644,9 +644,11 @@ public static partial class Runtime
             || (obj is LispInstanceCondition lici && ClassMatchesCPL(lici.Instance.Class, "CONDITION")),
         "SIMPLE-CONDITION" => (obj is LispCondition scc && (scc.ConditionTypeName == "SIMPLE-CONDITION" || scc.ConditionTypeName == "SIMPLE-ERROR" || scc.ConditionTypeName == "SIMPLE-WARNING"))
             || (obj is LispInstanceCondition scci && ClassMatchesCPL(scci.Instance.Class, "SIMPLE-CONDITION")),
-        "SERIOUS-CONDITION" => obj is LispError
+        "SERIOUS-CONDITION" => obj is LispError || obj is LispStorageCondition
             || (obj is LispInstance sci && ClassMatchesCPL(sci.Class, "SERIOUS-CONDITION"))
             || (obj is LispInstanceCondition sci2 && ClassMatchesCPL(sci2.Instance.Class, "SERIOUS-CONDITION")),
+        "STORAGE-CONDITION" => obj is LispStorageCondition
+            || (obj is LispInstanceCondition stc && ClassMatchesCPL(stc.Instance.Class, "STORAGE-CONDITION")),
         "ERROR" => obj is LispError
             || (obj is LispInstance ei && ClassMatchesCPL(ei.Class, "ERROR"))
             || (obj is LispInstanceCondition ei2 && ClassMatchesCPL(ei2.Instance.Class, "ERROR")),

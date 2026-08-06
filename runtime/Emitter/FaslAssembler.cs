@@ -895,6 +895,7 @@ public class FaslAssembler
         _cctorIl.Emit(OpCodes.Ret);
 
         _tb.CreateType();
+        StampCoreGeneration();
         try
         {
             if (_emitDebug)
@@ -914,6 +915,28 @@ public class FaslAssembler
     }
 
 #if NET9_0_OR_GREATER
+    /// <summary>Record which compiler generation produced this fasl, as an
+    /// assembly-level [AssemblyMetadata("dotcl-core-generation", ...)]. The loader
+    /// compares it with the running one and warns on a mismatch: a fasl carries the
+    /// code generation of the compiler that built it, so one built before a codegen
+    /// fix keeps the old behaviour and the fix looks inert. No stamp is written when
+    /// the generation cannot be determined (a core loaded from memory) — an absent
+    /// stamp is treated as "unknown", never as a mismatch.</summary>
+    private void StampCoreGeneration()
+    {
+        try
+        {
+            var gen = Startup.CoreGeneration();
+            if (gen == null) return;
+            var ctor = typeof(System.Reflection.AssemblyMetadataAttribute)
+                .GetConstructor(new[] { typeof(string), typeof(string) });
+            if (ctor != null)
+                _ab.SetCustomAttribute(new CustomAttributeBuilder(
+                    ctor, new object[] { Startup.CoreGenerationKey, gen }));
+        }
+        catch { /* best-effort: the fasl is still valid without the stamp */ }
+    }
+
     /// <summary>
     /// Save the .fasl (a PE image) together with a sidecar Portable PDB.
     /// Instead of PersistedAssemblyBuilder.Save (which builds the PE for us), we

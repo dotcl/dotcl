@@ -7,7 +7,7 @@ DOTCL_LISP ?= ros -L sbcl-bin run
 STDBUF ?=
 SETSID ?= $(shell which setsid 2>/dev/null)
 
-.PHONY: all build build-ns2 run clean repl test-coverage test-ansi-all test-ansi-full test-ansi-extra test-regression test-pack-nuspec test-save-class-lib test-project-compose test-mop ilverify update-ansi-state commit-ansi-state cross-compile loc publish pack install setup-ansi-test setup-asdf setup-quicklisp setup-cl-bench bench bench-state test-sbcl-host2 compile-asdf-fasl compile-asdf-fasls compile-quicklisp-fasl compile-core-fasl compile-contrib-fasls contrib-dotcl-cs contrib-dotcl-jitdisasm gen-char-names
+.PHONY: all build build-ns2 check-contrib-freshness run clean repl test-core-bytes test-coverage test-ansi-all test-ansi-full test-ansi-extra test-regression test-pack-nuspec test-save-class-lib test-project-compose test-mop ilverify update-ansi-state commit-ansi-state cross-compile loc publish pack install setup-ansi-test setup-asdf setup-quicklisp setup-cl-bench bench bench-state compile-asdf-fasl compile-asdf-fasls compile-quicklisp-fasl compile-core-fasl compile-contrib-fasls contrib-dotcl-cs contrib-dotcl-jitdisasm gen-char-names
 
 # Source files for cross-compile. Listed once; the recipe and dependency
 # tracking both reference this so adding a file is a single-edit change.
@@ -23,6 +23,41 @@ all: cross-compile build
 
 build: $(DOTCL_ROOT)runtime/Generated/UnicodeCharNames.g.cs
 	dotnet build $(DOTCL_ROOT)runtime/runtime.csproj
+
+# Diagnostic for "I fixed the compiler but the fix does not take effect".
+#
+# A prebuilt contrib fasl carries the code generation of the compiler that built
+# it, so one produced before a codegen change keeps the OLD behaviour even
+# though cil-out.sil has the fix. Run this when a change seems inert; it reports
+# two independent problems.
+#
+# Deliberately NOT wired into `build`: contrib fasls are older than cil-out.sil
+# after every compiler edit, so warning there would fire constantly and be
+# tuned out. The shadow report below is the rare, always-actionable one.
+#
+# Regenerate with: make compile-asdf-fasl compile-contrib-fasls
+check-contrib-freshness:
+	@sil=$(DOTCL_ROOT)compiler/cil-out.sil; \
+	if [ -f "$$sil" ]; then \
+	  stale=""; \
+	  for f in $(DOTCL_ROOT)contrib/*/*.fasl; do \
+	    case "$$f" in *-r2r-*) continue;; esac; \
+	    [ -f "$$f" ] || continue; \
+	    [ "$$f" -ot "$$sil" ] && stale="$$stale $$f"; \
+	  done; \
+	  if [ -n "$$stale" ]; then \
+	    echo "older than compiler/cil-out.sil (built by an older compiler):"; \
+	    for f in $$stale; do echo "  $$f"; done; \
+	  else \
+	    echo "contrib fasls are newer than cil-out.sil"; \
+	  fi; \
+	fi
+	@echo ""
+	@# Which file each (require "<name>") actually reaches, and what it hides.
+	@# Comparing timestamps against cil-out.sil (above) says "old" about
+	@# everything after any compiler edit; this says which single candidate wins,
+	@# which is the part that explains an edit not taking effect.
+	@bash $(DOTCL_ROOT)scripts/contrib-resolve.sh $(DOTCL_ROOT)
 
 run:
 	dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj
@@ -61,6 +96,13 @@ test-project-compose: build
 	@echo "=== Running project-core composition checks ==="
 	sh $(DOTCL_ROOT)test/project-compose/check.sh $(DOTCL_ROOT)
 
+# Booting from a core held in memory (DotclHost.LoadCore(byte[])) — the only way
+# in for a host with no filesystem, and for the emit-free runtime the only way in
+# at all. Covers both the normal and the emit-free build.
+test-core-bytes: build $(DOTCL_ROOT)compiler/dotcl.core
+	@echo "=== Running in-memory core checks ==="
+	sh $(DOTCL_ROOT)test/core-bytes/check.sh $(DOTCL_ROOT)
+
 test-ansi-extra: build $(DOTCL_ROOT)compiler/cil-out.sil
 	@echo "=== Running CLHS audit extra tests ==="
 	$(SETSID) dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --asm $(DOTCL_ROOT)compiler/cil-out.sil $(DOTCL_ROOT)test/test-ansi-extra.lisp
@@ -89,9 +131,6 @@ build-ns2:
 	dotnet build $(DOTCL_ROOT)runtime/DotCL.Runtime.csproj -c Release -f netstandard2.0
 	@echo "=== Building netstandard2.0 runtime (emit-free, JSON-free) ==="
 	dotnet build $(DOTCL_ROOT)runtime/DotCL.Runtime.csproj -c Release -f netstandard2.0 -p:DotclNoJson=true
-
-test-sbcl-host2: $(DOTCL_ROOT)compiler/cil-out.sil
-	DOTNET_GCConserveMemory=7 dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --asm $(DOTCL_ROOT)compiler/cil-out.sil $(DOTCL_ROOT)test-sbcl-host2.lisp
 
 test-ansi-full: build setup-ansi-test
 	$(SETSID) dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --asm $(DOTCL_ROOT)compiler/cil-out.sil $(DOTCL_ROOT)test/test-ansi.lisp
@@ -232,6 +271,14 @@ setup-ansi-test:
 		echo "ansi-test/ already exists"; \
 	fi
 
+# asdf/ and quicklisp-client/ are gitignored working copies, so a checkout left
+# on the wrong branch is invisible to git status and survives git reset --hard.
+# Which branch a tree ends up on is decided by when it was first cloned, so two
+# worktrees of the same repository can disagree. Name the expected branch here
+# and check it; override on the command line to build against another one.
+ASDF_BRANCH ?= dotcl-0.1.21
+QUICKLISP_CLIENT_BRANCH ?= dotcl-support
+
 setup-asdf:
 	@# dotcl-0.1.21 is the compat-generation bundle branch: it pairs with the
 	@# launch-process keyword API, the run-time os-cond / single-FASL work, and
@@ -243,14 +290,25 @@ setup-asdf:
 	@# pre-0.1.11 source builds keep cloning a matching asdf.
 	@if [ ! -d $(DOTCL_ROOT)asdf ]; then \
 		echo "Cloning asdf..."; \
-		git clone --branch dotcl-0.1.21 https://github.com/dotcl/asdf.git $(DOTCL_ROOT)asdf; \
+		git clone --branch $(ASDF_BRANCH) https://github.com/dotcl/asdf.git $(DOTCL_ROOT)asdf; \
 	else \
-		echo "asdf/ already exists"; \
+		cur=$$(git -C $(DOTCL_ROOT)asdf rev-parse --abbrev-ref HEAD 2>/dev/null); \
+		if [ -z "$$cur" ]; then \
+			echo "asdf/: not a git checkout, cannot verify it is $(ASDF_BRANCH)"; \
+		elif [ "$$cur" != "$(ASDF_BRANCH)" ]; then \
+			echo "asdf/ is on '$$cur', but this tree builds against '$(ASDF_BRANCH)'."; \
+			echo "  git -C $(DOTCL_ROOT)asdf fetch origin"; \
+			echo "  git -C $(DOTCL_ROOT)asdf switch $(ASDF_BRANCH)"; \
+			echo "If '$$cur' is deliberate, re-run with ASDF_BRANCH=$$cur."; \
+			exit 1; \
+		fi; \
 	fi
-	@if [ ! -f $(DOTCL_ROOT)asdf/build/asdf.lisp ]; then \
-		echo "Building asdf..."; \
-		cd $(DOTCL_ROOT)asdf && sh make-asdf.sh; \
-	fi
+	@# Unconditionally, not only when build/asdf.lisp is missing: make-asdf.sh
+	@# concatenates to a .tmp and cmp-and-moves, so unchanged source leaves the
+	@# file (and its mtime) alone. Guarding on existence instead made a branch
+	@# switch invisible — the concatenation from the old branch stayed behind and
+	@# kept being copied on to contrib/, so the rebuilt fasl was still the old one.
+	@cd $(DOTCL_ROOT)asdf && sh make-asdf.sh
 	@mkdir -p $(DOTCL_ROOT)contrib/asdf
 	@# cmp-then-cp so unchanged source doesn't bump dest mtime (which would
 	@# cascade-rebuild asdf.fasl unnecessarily on every compile-asdf-fasl call).
@@ -267,9 +325,18 @@ setup-quicklisp:
 	@# check that the shipping branch contains the PR branch.
 	@if [ ! -d $(DOTCL_ROOT)quicklisp-client ]; then \
 		echo "Cloning quicklisp-client..."; \
-		git clone --branch dotcl-support https://github.com/dotcl/quicklisp-client.git $(DOTCL_ROOT)quicklisp-client; \
+		git clone --branch $(QUICKLISP_CLIENT_BRANCH) https://github.com/dotcl/quicklisp-client.git $(DOTCL_ROOT)quicklisp-client; \
 	else \
-		echo "quicklisp-client/ already exists"; \
+		cur=$$(git -C $(DOTCL_ROOT)quicklisp-client rev-parse --abbrev-ref HEAD 2>/dev/null); \
+		if [ -z "$$cur" ]; then \
+			echo "quicklisp-client/: not a git checkout, cannot verify it is $(QUICKLISP_CLIENT_BRANCH)"; \
+		elif [ "$$cur" != "$(QUICKLISP_CLIENT_BRANCH)" ]; then \
+			echo "quicklisp-client/ is on '$$cur', but this tree builds against '$(QUICKLISP_CLIENT_BRANCH)'."; \
+			echo "  git -C $(DOTCL_ROOT)quicklisp-client fetch origin"; \
+			echo "  git -C $(DOTCL_ROOT)quicklisp-client switch $(QUICKLISP_CLIENT_BRANCH)"; \
+			echo "If '$$cur' is deliberate, re-run with QUICKLISP_CLIENT_BRANCH=$$cur."; \
+			exit 1; \
+		fi; \
 	fi
 	@mkdir -p $(DOTCL_ROOT)contrib/quicklisp
 	@sh $(DOTCL_ROOT)scripts/build-quicklisp.sh $(DOTCL_ROOT)quicklisp-client $(DOTCL_ROOT)contrib/quicklisp/quicklisp.lisp
@@ -278,6 +345,21 @@ setup-quicklisp:
 SUITE ?=
 BENCH ?=
 BENCH_TIMEOUT ?= 600
+
+# bench/ is internal-only (mirror-exclude), so in the public tree these targets
+# have no inputs. Say so and stop, instead of failing partway through on a
+# missing file. The check is a parse-time $(wildcard) rather than a `test -d`
+# guard in the recipe, because each recipe line is its own shell — an `exit 0`
+# on the first line would not stop the remaining ones. Relative path: this make
+# always runs in the repo root, and a native make would not resolve the POSIX
+# form of $(DOTCL_ROOT).
+ifeq ($(wildcard bench/run.lisp),)
+
+bench bench-state:
+	@echo "$@: bench/ is internal-only and is not part of the public tree."
+
+else
+
 bench: setup-cl-bench
 	@EVAL_ARGS=""; \
 	if [ -n "$(SUITE)" ]; then EVAL_ARGS="--eval '(setq *bench-suite* :$(SUITE))'"; fi; \
@@ -302,6 +384,8 @@ bench-state: setup-cl-bench
 	@$(DOTCL_ROOT)bench/make-state.sh /tmp/bench-dotcl.txt /tmp/bench-sbcl.txt $(DOTCL_ROOT)bench-state.json > /tmp/bench-state-new.json && mv /tmp/bench-state-new.json $(DOTCL_ROOT)bench-state.json
 	@echo "Updated bench-state.json"
 	@cat $(DOTCL_ROOT)bench-state.json
+
+endif
 
 # Survey mode: run each bench N times, record median/min/max/stddev/cv.
 #   make bench-survey [SUITE=...] [BENCH=...] [RUNS=5] [WARMUP=1]

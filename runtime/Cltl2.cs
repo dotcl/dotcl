@@ -30,7 +30,7 @@ public static class Cltl2
         foreach (var n in new[] {
             "COMPILER-LET", "VARIABLE-INFORMATION", "FUNCTION-INFORMATION",
             "DECLARATION-INFORMATION", "AUGMENT-ENVIRONMENT", "DEFINE-DECLARATION",
-            "PARSE-MACRO", "ENCLOSE" })
+            "PARSE-MACRO", "ENCLOSE", "MACROEXPAND-ALL" })
         {
             var (s, _) = Cltl2Pkg.Intern(n);
             Cltl2Pkg.Export(s);
@@ -42,6 +42,23 @@ public static class Cltl2
         Reg("AUGMENT-ENVIRONMENT", -1, AugmentEnvironment);
         Reg("PARSE-MACRO", -1, ParseMacro);
         Reg("ENCLOSE", -1, Enclose);
+        Reg("MACROEXPAND-ALL", -1, MacroexpandAll);
+    }
+
+    /// <summary>(macroexpand-all form &amp;optional env). The walker itself is
+    /// %MACROEXPAND-ALL in cil-stdlib.lisp — a code walker is far easier to get
+    /// right in Lisp, and the SIL round-trip problem that keeps the other
+    /// functions here only affects a defun whose NAME lives in this package.
+    /// Resolved lazily because the core is loaded after Init runs.</summary>
+    private static LispObject MacroexpandAll(LispObject[] args)
+    {
+        if (args.Length < 1 || args.Length > 2)
+            throw new LispErrorException(new LispProgramError(
+                $"MACROEXPAND-ALL: wrong number of arguments: {args.Length} (expected 1-2)"));
+        var fn = Emitter.CilAssembler.TryGetFunction("%MACROEXPAND-ALL")
+                 ?? throw new LispErrorException(new LispError(
+                     "MACROEXPAND-ALL: the code walker is not loaded"));
+        return fn.Invoke(new[] { args[0], args.Length > 1 ? args[1] : Nil.Instance });
     }
 
     private static void Reg(string name, int arity, Func<LispObject[], LispObject> fn)

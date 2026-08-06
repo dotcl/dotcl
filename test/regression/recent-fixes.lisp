@@ -4785,3 +4785,90 @@
       (warn 'muffle-probe-style))
     (reverse log))
   (:style))
+
+;;; NIL is not a pathname designator (CLHS: pathname / string / file stream).
+;;; The file-op entry point used to fall through to ToString and silently
+;;; create a file literally named "NIL" in the cwd — the classic
+;;; (with-open-file (s (uiop:getenv "UNSET_VAR") ...)) bug, succeeding with a
+;;; side effect instead of signalling.
+(deftest open-nil-signals-type-error
+  (handler-case (progn (open nil :direction :output) :no-error)
+    (type-error () :type-error))
+  :type-error)
+
+(deftest probe-file-nil-signals-type-error
+  (handler-case (progn (probe-file nil) :no-error)
+    (type-error () :type-error))
+  :type-error)
+
+(deftest open-nil-creates-no-file
+  (progn (handler-case (with-open-file (s nil :direction :output)
+                         (write-line "x" s))
+           (error () nil))
+         (probe-file "NIL"))
+  nil)
+
+(deftest pathname-nil-signals-type-error
+  (handler-case (progn (pathname nil) :no-error)
+    (type-error () :type-error))
+  :type-error)
+
+;;; :external-format was accepted and silently ignored, so every character
+;;; stream was written as UTF-8. (with-open-file ... :external-format :latin-1)
+;;; wrote 384 bytes for codes 0-255 instead of 256, which breaks the
+;;; faithful-octet-I/O idiom (open latin-1, one char == one byte) that
+;;; rfc2388 and friends use to round-trip binary uploads.
+(defmacro %ef-bytes (path &rest open-args)
+  `(progn
+     (with-open-file (s ,path :direction :output :if-exists :supersede ,@open-args)
+       (dotimes (i 256) (write-char (code-char i) s)))
+     (prog1 (with-open-file (s ,path :element-type '(unsigned-byte 8)) (file-length s))
+       (delete-file ,path))))
+
+(deftest external-format-latin1-is-one-byte-per-char
+  (%ef-bytes "ef-t1.tmp" :external-format :latin-1)
+  256)
+
+(deftest external-format-iso8859-1-alias
+  (%ef-bytes "ef-t2.tmp" :external-format :iso-8859-1)
+  256)
+
+(deftest external-format-default-stays-utf8
+  (%ef-bytes "ef-t3.tmp")
+  384)
+
+(deftest external-format-explicit-utf8
+  (%ef-bytes "ef-t4.tmp" :external-format :utf-8)
+  384)
+
+;;; latin-1 round trip: every code 0-255 comes back unchanged.
+(deftest external-format-latin1-round-trips
+  (progn
+    (with-open-file (s "ef-t5.tmp" :direction :output :if-exists :supersede
+                                   :external-format :latin-1)
+      (dotimes (i 256) (write-char (code-char i) s)))
+    (prog1 (with-open-file (s "ef-t5.tmp" :external-format :latin-1)
+             (let ((ok t))
+               (dotimes (i 256) (unless (eql (char-code (read-char s)) i) (setf ok nil)))
+               (if ok :same :differs)))
+      (delete-file "ef-t5.tmp")))
+  :same)
+
+;;; stream-external-format reports what the stream was opened with.
+(deftest external-format-reported-by-stream
+  (progn
+    (with-open-file (s "ef-t6.tmp" :direction :output :if-exists :supersede
+                                   :external-format :latin-1)
+      (write-char #\a s))
+    (prog1 (list (with-open-file (s "ef-t6.tmp" :external-format :latin-1)
+                   (stream-external-format s))
+                 (with-open-file (s "ef-t6.tmp") (stream-external-format s)))
+      (delete-file "ef-t6.tmp")))
+  (:latin-1 :default))
+
+;;; An unrecognised format must signal rather than silently encode as UTF-8 —
+;;; a misspelled name looked like it took effect before.
+(deftest external-format-unknown-signals
+  (handler-case (progn (%ef-bytes "ef-t7.tmp" :external-format :no-such-format) :no-error)
+    (error () :errored))
+  :errored)

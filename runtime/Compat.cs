@@ -242,6 +242,15 @@ internal static class Compat
         => OperatingSystem.IsMacOS();
 #endif
 
+    /// <summary>Running inside a browser page (browser-wasm). None of the three
+    /// above are true there.</summary>
+    public static bool IsBrowser()
+#if NETSTANDARD2_0
+        => RuntimeInformation.IsOSPlatform(OSPlatform.Create("BROWSER"));
+#else
+        => OperatingSystem.IsBrowser();
+#endif
+
     public static long TickCount64()
 #if NETSTANDARD2_0
         => Environment.TickCount & 0xFFFFFFFFL;
@@ -261,6 +270,36 @@ internal static class Compat
         => true; // ns2.0 lacks the probe; best-effort no-op
 #else
         => RuntimeHelpers.TryEnsureSufficientExecutionStack();
+#endif
+
+    // The runtime's fixed probe only guarantees ~64KB of headroom — enough to
+    // THROW, but signalling the resulting STORAGE-CONDITION runs the whole
+    // condition system on top of the exhausted stack (HandlerClusterStack.Signal
+    // → Typep handler matching → possibly a handler-bind handler body), and fat
+    // per-call frames (Runtime.Apply, interop delegate marshalling) advance the
+    // stack further between periodic checks. Passing here means at least
+    // PadFrames×PadBytes + the fixed probe of headroom remain, so the signal
+    // path has room to run. Each level verifies the fixed probe BEFORE its
+    // stackalloc, so the padding itself can never trip a fatal overflow.
+    private const int PadFrames = 16;   // 16 × 16KB = 256KB extra headroom
+    private const int PadBytes = 16 * 1024;
+
+    public static bool TryEnsureSufficientExecutionStackWithMargin()
+#if NETSTANDARD2_0
+        => true;
+#else
+        => ProbePadded(PadFrames);
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static bool ProbePadded(int depth)
+    {
+        if (!RuntimeHelpers.TryEnsureSufficientExecutionStack()) return false;
+        if (depth <= 0) return true;
+        Span<byte> pad = stackalloc byte[PadBytes];
+        pad[0] = 1;
+        pad[PadBytes - 1] = 1;
+        return ProbePadded(depth - 1);
+    }
 #endif
 
     /// <summary>GCCollectionMode.Aggressive is net5.0+; fall back to Forced on ns2.0.</summary>
@@ -392,6 +431,20 @@ internal static class Compat
         return new BigInteger(bytes);
 #else
         return new BigInteger(value, isUnsigned, isBigEndian);
+#endif
+    }
+
+    /// <summary>Convert.ToHexString(byte[], int, int) (net5.0+). Uppercase, no
+    /// separators, exactly as the BCL produces it.</summary>
+    public static string ToHexString(byte[] value, int start, int length)
+    {
+#if NETSTANDARD2_0
+        var sb = new System.Text.StringBuilder(length * 2);
+        for (int i = start; i < start + length; i++)
+            sb.Append(value[i].ToString("X2", System.Globalization.CultureInfo.InvariantCulture));
+        return sb.ToString();
+#else
+        return Convert.ToHexString(value, start, length);
 #endif
     }
 }

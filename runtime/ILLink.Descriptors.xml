@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Keep the runtime whole when the consuming app is trimmed (WebAssembly publishes
+  with the trimmer on by default; so do Blazor and self-contained trimmed apps).
+
+  A core or a FASL is IL that is loaded at run time, and the code in it calls
+  straight into this assembly. The trimmer cannot see those calls, so it removes
+  anything the *host application* does not reach statically, and the load then
+  fails with MissingMethodException naming a method that plainly exists in the
+  sources. Enumerating the reachable surface is not an option: the compiler emits
+  calls across most of the runtime, and the set changes whenever it does.
+
+  Trimming the framework is unaffected — this preserves only DotCL.Runtime.
+  An application that never loads a core or a FASL can drop this with
+  -p:DotclPreserveForTrimming=false.
+-->
+<linker>
+  <assembly fullname="DotCL.Runtime" preserve="all" />
+</linker>

@@ -761,6 +761,76 @@ public static partial class Runtime
            || (o is LispInstance gi && (IsGrayInputStream(gi) || IsGrayOutputStream(gi)
                                         || IsGrayBinaryInputStream(gi) || IsGrayBinaryOutputStream(gi)));
 
+    /// <summary>Run a stream I/O operation, converting a CLR I/O failure into a
+    /// STREAM-ERROR carrying the stream (CLHS: an I/O failure on a stream is a
+    /// stream-error, and the portable peer-disconnect idiom is
+    /// (handler-case (read-char s) (stream-error ...))). Without this the raw
+    /// IOException surfaced as PROGRAM-ERROR — wrong type, no stream slot. The
+    /// original exception rides along for dotnet:exception-object (a stream
+    /// timeout is an IOException whose InnerException holds the SocketException
+    /// with the error code).</summary>
+    internal static LispObject GuardStreamIO(LispObject stream, System.Func<LispObject> io)
+    {
+        try { return io(); }
+        catch (System.IO.IOException ex) { throw StreamIOError(stream, ex); }
+        catch (System.ObjectDisposedException ex) { throw StreamIOError(stream, ex); }
+        catch (System.Net.Sockets.SocketException ex) { throw StreamIOError(stream, ex); }
+    }
+
+    private static LispErrorException StreamIOError(LispObject stream, Exception ex) =>
+        new LispErrorException(new LispError(ex.Message)
+        {
+            ConditionTypeName = "STREAM-ERROR",
+            StreamErrorStreamRef = stream,
+            ClrExceptionType = ex.GetType(),
+            ClrException = ex
+        });
+
+    /// <summary>Map a CL external-format designator to a .NET Encoding. Returns null
+    /// for :default, so the stream keeps the implementation default (UTF-8) and its
+    /// existing BOM handling. An unrecognised name is an error: silently encoding as
+    /// UTF-8 made (with-open-file ... :external-format :latin-1) look like it took
+    /// effect while writing 1.5x the bytes, which breaks the faithful-octet-I/O idiom
+    /// that libraries like rfc2388 rely on.
+    /// Encodings are fetched by code page rather than the Encoding.Latin1 property so
+    /// the netstandard2.0 target builds too.</summary>
+    private static System.Text.Encoding? ParseExternalFormat(LispObject spec)
+    {
+        // A list designator carries options after the name, e.g. (:utf-8 :replacement #\?).
+        if (spec is Cons c) spec = c.Car;
+        string name = spec switch
+        {
+            Symbol s => s.Name,
+            LispString ls => ls.Value.ToUpperInvariant(),
+            _ => spec.ToString()?.ToUpperInvariant() ?? ""
+        };
+        switch (name)
+        {
+            case "DEFAULT": return null;
+            case "UTF-8": case "UTF8": return new System.Text.UTF8Encoding(false);
+            case "LATIN-1": case "LATIN1": case "ISO-8859-1": case "ISO8859-1":
+                return System.Text.Encoding.GetEncoding(28591);
+            case "ASCII": case "US-ASCII": return System.Text.Encoding.ASCII;
+            case "UTF-16": case "UTF16": case "UCS-2": case "UCS2":
+                return System.Text.Encoding.Unicode;
+            case "UTF-16BE": case "UTF16BE": return System.Text.Encoding.BigEndianUnicode;
+            case "UTF-32": case "UTF32": case "UCS-4": case "UCS4":
+                return System.Text.Encoding.UTF32;
+            default:
+                throw new LispErrorException(new LispError(
+                    $"OPEN: unsupported external format: {name}"));
+        }
+    }
+
+    private static StreamReader MakeReader(System.IO.Stream s, System.Text.Encoding? enc)
+        // With an explicit encoding, BOM sniffing must be off: a latin-1 file whose
+        // first bytes happen to look like a BOM would otherwise be decoded as UTF-8.
+        => enc == null ? new StreamReader(s)
+                       : new StreamReader(s, enc, detectEncodingFromByteOrderMarks: false);
+
+    private static StreamWriter MakeWriter(System.IO.Stream s, System.Text.Encoding? enc)
+        => enc == null ? new StreamWriter(s) : new StreamWriter(s, enc);
+
     public static LispObject OpenFile(LispObject path, LispObject[] options)
     {
         string filePath = ResolvePhysicalPath(path);
@@ -782,6 +852,8 @@ public static partial class Runtime
         string ifExists = "DEFAULT";
         string ifDoesNotExist = "DEFAULT";
         LispObject? elementType = null; // null means CHARACTER
+        LispObject? externalFormat = null; // null means :default
+        System.Text.Encoding? encoding = null;
 
         for (int j = 0; j < options.Length - 1; j += 2)
         {
@@ -800,6 +872,13 @@ public static partial class Runtime
                     elementType = etVal;
                 continue;
             }
+            if (key == "EXTERNAL-FORMAT")
+            {
+                var efVal = options[j + 1];
+                encoding = ParseExternalFormat(efVal);
+                externalFormat = encoding == null ? null : efVal;
+                continue;
+            }
             string val = options[j + 1] switch
             {
                 Symbol s => s.Name,
@@ -811,7 +890,6 @@ public static partial class Runtime
                 case "DIRECTION": direction = val; break;
                 case "IF-EXISTS": ifExists = val; break;
                 case "IF-DOES-NOT-EXIST": ifDoesNotExist = val; break;
-                case "EXTERNAL-FORMAT": break; // accepted but ignored (implementation uses UTF-8)
                 default:
                     throw new LispErrorException(new LispProgramError($"OPEN: unknown keyword argument :{key}"));
             }
@@ -855,9 +933,10 @@ public static partial class Runtime
                     throw new LispErrorException(err);
                 }
                 var netFsIn = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-                var reader = new StreamReader(netFsIn);
+                var reader = MakeReader(netFsIn, encoding);
                 var fs = new LispFileStream(reader, filePath);
                 fs.ElementType = elementType;
+                fs.ExternalFormat = externalFormat;
                 fs.OriginalPathname = originalPathname;
                 return fs;
             }
@@ -875,9 +954,10 @@ public static partial class Runtime
                         case "OVERWRITE":
                         {
                             var netFs = new FileStream(filePath, FileMode.Open, FileAccess.Write, FileShare.ReadWrite);
-                            var writer = new StreamWriter(netFs);
+                            var writer = MakeWriter(netFs, encoding);
                             var ofs = new LispFileStream(writer, filePath);
                             ofs.ElementType = elementType;
+                            ofs.ExternalFormat = externalFormat;
                             ofs.OriginalPathname = originalPathname;
                             return ofs;
                         }
@@ -885,9 +965,10 @@ public static partial class Runtime
                         {
                             var netFsApp = new FileStream(filePath, FileMode.Open, FileAccess.Write, FileShare.ReadWrite);
                             netFsApp.Seek(0, SeekOrigin.End);
-                            var writer = new StreamWriter(netFsApp);
+                            var writer = MakeWriter(netFsApp, encoding);
                             var ofs = new LispFileStream(writer, filePath);
                             ofs.ElementType = elementType;
+                            ofs.ExternalFormat = externalFormat;
                             ofs.OriginalPathname = originalPathname;
                             return ofs;
                         }
@@ -916,9 +997,10 @@ public static partial class Runtime
                 }
                 {
                     var netFsOut = new FileStream(filePath, FileMode.Create, FileAccess.Write, FileShare.ReadWrite);
-                    var writer = new StreamWriter(netFsOut);
+                    var writer = MakeWriter(netFsOut, encoding);
                     var fs = new LispFileStream(writer, filePath);
                     fs.ElementType = elementType;
+                    fs.ExternalFormat = externalFormat;
                     fs.OriginalPathname = originalPathname;
                     return fs;
                 }
@@ -945,10 +1027,11 @@ public static partial class Runtime
                         {
                             // Truncate instead of delete+recreate to avoid file lock issues on Windows
                             var netFsTrunc = new FileStream(filePath, FileMode.Truncate, FileAccess.ReadWrite, FileShare.ReadWrite);
-                            var readerTrunc = new StreamReader(netFsTrunc);
-                            var writerTrunc = new StreamWriter(netFsTrunc) { AutoFlush = true };
+                            var readerTrunc = MakeReader(netFsTrunc, encoding);
+                            var writerTrunc = MakeWriter(netFsTrunc, encoding); writerTrunc.AutoFlush = true;
                             var fsTrunc = new LispFileStream(readerTrunc, writerTrunc, filePath);
                             fsTrunc.ElementType = elementType;
+                            fsTrunc.ExternalFormat = externalFormat;
                             fsTrunc.OriginalPathname = originalPathname;
                             return fsTrunc;
                         }
@@ -959,10 +1042,11 @@ public static partial class Runtime
                             // Open for append + read
                             var netFs = new FileStream(filePath, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite);
                             netFs.Seek(0, SeekOrigin.End); // Position at end for append
-                            var reader = new StreamReader(netFs);
-                            var writer = new StreamWriter(netFs) { AutoFlush = true };
+                            var reader = MakeReader(netFs, encoding);
+                            var writer = MakeWriter(netFs, encoding); writer.AutoFlush = true;
                             var afs = new LispFileStream(reader, writer, filePath);
                             afs.ElementType = elementType;
+                            afs.ExternalFormat = externalFormat;
                             afs.OriginalPathname = originalPathname;
                             return afs;
                         }
@@ -986,10 +1070,11 @@ public static partial class Runtime
                 }
                 {
                     var netFs = new FileStream(filePath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.ReadWrite);
-                    var reader = new StreamReader(netFs);
-                    var writer = new StreamWriter(netFs) { AutoFlush = true };
+                    var reader = MakeReader(netFs, encoding);
+                    var writer = MakeWriter(netFs, encoding); writer.AutoFlush = true;
                     var fs = new LispFileStream(reader, writer, filePath);
                     fs.ElementType = elementType;
+                    fs.ExternalFormat = externalFormat;
                     fs.OriginalPathname = originalPathname;
                     return fs;
                 }
@@ -1059,6 +1144,9 @@ public static partial class Runtime
     }
 
     public static LispObject ReadCharNoHang(LispObject streamObj, LispObject eofErrorP, LispObject eofValue)
+        => GuardStreamIO(streamObj, () => ReadCharNoHangUnguarded(streamObj, eofErrorP, eofValue));
+
+    private static LispObject ReadCharNoHangUnguarded(LispObject streamObj, LispObject eofErrorP, LispObject eofValue)
     {
         var lispStream = ResolveLispStream(streamObj);
         if (lispStream.UnreadCharValue != -1)
@@ -1088,6 +1176,9 @@ public static partial class Runtime
     }
 
     public static LispObject Listen(LispObject stream)
+        => GuardStreamIO(stream, () => ListenUnguarded(stream));
+
+    private static LispObject ListenUnguarded(LispObject stream)
     {
         // Resolve stream designators
         var resolved = stream;
@@ -1121,7 +1212,8 @@ public static partial class Runtime
         // Gray input stream: trampoline to the stream-clear-input generic (which
         // has a default method), so a streamp=T instance is accepted rather than
         // rejected as "not a stream" (input-stream-p already answers T for it).
-        if (stream is LispInstance gi && IsGrayInputStream(gi))
+        // Binary gray streams included, for the same reason as force-output.
+        if (stream is LispInstance gi && (IsGrayInputStream(gi) || IsGrayBinaryInputStream(gi)))
         {
             GrayStreamLookup.GrayOrCl("STREAM-CLEAR-INPUT")?.Invoke(new LispObject[] { gi });
             return Nil.Instance;
@@ -1158,6 +1250,9 @@ public static partial class Runtime
     };
 
     public static LispObject WriteByte(LispObject byteObj, LispObject stream)
+        => GuardStreamIO(stream, () => WriteByteUnguarded(byteObj, stream));
+
+    private static LispObject WriteByteUnguarded(LispObject byteObj, LispObject stream)
     {
         // Gray binary output stream: dispatch to the stream-write-byte generic.
         if (stream is LispInstance gbo && IsGrayBinaryOutputStream(gbo))
@@ -1832,6 +1927,9 @@ public static partial class Runtime
     }
 
     public static LispObject ReadPreservingWhitespace(LispObject stream, LispObject eofErrorP, LispObject eofValue)
+        => GuardStreamIO(stream, () => ReadPreservingWhitespaceUnguarded(stream, eofErrorP, eofValue));
+
+    private static LispObject ReadPreservingWhitespaceUnguarded(LispObject stream, LispObject eofErrorP, LispObject eofValue)
     {
         Reader lispReader;
         if (stream is LispStream ls2 && ls2.CachedReader != null)
@@ -1877,6 +1975,9 @@ public static partial class Runtime
     }
 
     public static LispObject ReadLine(LispObject stream, LispObject eofErrorP, LispObject eofValue)
+        => GuardStreamIO(stream, () => ReadLineUnguarded(stream, eofErrorP, eofValue));
+
+    private static LispObject ReadLineUnguarded(LispObject stream, LispObject eofErrorP, LispObject eofValue)
     {
         var echoStream = FindEchoStream(stream);
         TextWriter? echoWriter = echoStream != null ? GetTextWriter(echoStream.OutputStream) : null;
@@ -1973,7 +2074,13 @@ public static partial class Runtime
         return err;
     }
 
+    // The compiler emits direct (:call "Runtime.ReadChar") etc. for the common
+    // stream builtins, bypassing the registered LispFunction wrappers — so the
+    // stream-error guard must live on the methods themselves.
     public static LispObject ReadChar(LispObject streamObj, LispObject eofErrorP, LispObject eofValue)
+        => GuardStreamIO(streamObj, () => ReadCharUnguarded(streamObj, eofErrorP, eofValue));
+
+    private static LispObject ReadCharUnguarded(LispObject streamObj, LispObject eofErrorP, LispObject eofValue)
     {
         // Gray character input stream: dispatch to the stream-read-char generic.
         // ResolveLispStream would otherwise drop the CLOS instance to
@@ -2084,6 +2191,9 @@ public static partial class Runtime
     }
 
     public static LispObject PeekChar(LispObject peekType, LispObject streamObj, LispObject eofErrorP, LispObject eofValue)
+        => GuardStreamIO(streamObj, () => PeekCharUnguarded(peekType, streamObj, eofErrorP, eofValue));
+
+    private static LispObject PeekCharUnguarded(LispObject peekType, LispObject streamObj, LispObject eofErrorP, LispObject eofValue)
     {
         // Gray character input stream: dispatch to the stream-peek-char /
         // stream-read-char generics (ResolveLispStream would drop the instance
@@ -2170,6 +2280,19 @@ public static partial class Runtime
     {
         if (ch is not LispChar lc)
             throw new LispErrorException(new LispTypeError("UNREAD-CHAR: not a character", ch));
+        // Gray character input stream: dispatch to the stream-unread-char
+        // generic. ResolveLispStream would otherwise drop the CLOS instance to
+        // *standard-input* (its default: branch), silently unreading onto stdin
+        // while the gray stream lost the character.
+        if (streamObj is LispInstance grIn && IsGrayInputStream(grIn))
+        {
+            var fn = GrayStreamLookup.GrayOrCl("STREAM-UNREAD-CHAR");
+            if (fn != null)
+            {
+                fn.Invoke(new LispObject[] { grIn, lc });
+                return Nil.Instance;
+            }
+        }
         var stream = ResolveLispStream(streamObj);
         stream.UnreadCharValue = lc.Value;
         return Nil.Instance;
@@ -2180,6 +2303,11 @@ public static partial class Runtime
         if (args.Length < 1)
             throw new LispErrorException(new LispProgramError("FILE-POSITION: wrong number of arguments"));
         if (args.Length > 2) throw new LispErrorException(new LispProgramError($"FILE-POSITION: wrong number of arguments: {args.Length} (expected 1-2)"));
+        // A closed stream is a stream-error here, as it already is for read/write.
+        // FILE-LENGTH deliberately does not check: SBCL answers it on a closed
+        // stream too, and matching that keeps portable code working.
+        if (args[0] is LispStream closed && closed.IsClosed)
+            throw new LispErrorException(MakeStreamError(args[0], "FILE-POSITION"));
         // Broadcast stream: return file-position of last component, or 0 if empty
         if (args[0] is LispBroadcastStream bs)
         {
@@ -2368,6 +2496,9 @@ public static partial class Runtime
     }
 
     public static LispObject WriteChar(LispObject ch, LispObject stream)
+        => GuardStreamIO(stream, () => WriteCharUnguarded(ch, stream));
+
+    private static LispObject WriteCharUnguarded(LispObject ch, LispObject stream)
     {
         if (ch is not LispChar lc)
             throw new LispErrorException(new LispTypeError("WRITE-CHAR: not a character", ch));
@@ -2383,6 +2514,10 @@ public static partial class Runtime
     }
 
     public static LispObject WriteString(LispObject[] args)
+        => GuardStreamIO(args.Length > 1 ? args[1] : Nil.Instance,
+                         () => WriteStringUnguarded(args));
+
+    private static LispObject WriteStringUnguarded(LispObject[] args)
     {
         if (args.Length < 1)
             throw new LispErrorException(new LispProgramError("WRITE-STRING: wrong number of arguments"));
@@ -2449,6 +2584,10 @@ public static partial class Runtime
     }
 
     public static LispObject WriteLine(LispObject[] args)
+        => GuardStreamIO(args.Length > 1 ? args[1] : Nil.Instance,
+                         () => WriteLineUnguarded(args));
+
+    private static LispObject WriteLineUnguarded(LispObject[] args)
     {
         if (args.Length < 1)
             throw new LispErrorException(new LispProgramError("WRITE-LINE: wrong number of arguments"));
@@ -2543,96 +2682,6 @@ public static partial class Runtime
                 }
                 cur = cc.Cdr;
             }
-        }
-    }
-
-    public static LispObject LispDirectory(LispObject[] args)
-    {
-        if (args.Length == 0)
-            throw new LispErrorException(new LispProgramError("DIRECTORY requires at least one argument"));
-
-        ValidateDirectoryComponent(args[0]);
-
-        var pathspec = args[0];
-        string filePath = ResolvePhysicalPath(pathspec);
-
-        // Check if path contains wildcards (in filename or directory parts)
-        bool hasWild = filePath.Contains('*') || filePath.Contains('?');
-
-        if (!hasWild)
-        {
-            // No wildcards - check if specific file exists
-            var fullPath = Path.GetFullPath(filePath);
-            if (File.Exists(fullPath))
-            {
-                return new Cons(LispPathname.FromString(fullPath), Nil.Instance);
-            }
-            return Nil.Instance;
-        }
-
-        // Detect directory-only search: pathspec has no name/type component,
-        // or filePath ends with a directory separator (e.g. "path/*/").
-        bool wantsDirs = false;
-        if (pathspec is LispPathname pnCheck2)
-            wantsDirs = (pnCheck2.NameComponent is Nil || pnCheck2.NameComponent == null)
-                     && (pnCheck2.TypeComponent is Nil || pnCheck2.TypeComponent == null);
-        else
-            wantsDirs = filePath.EndsWith("/") || filePath.EndsWith("\\");
-
-        // Has wildcards - handle wildcards in both directory and filename parts
-        // e.g. "dists/*/distinfo.txt" should match "dists/quicklisp/distinfo.txt"
-        try
-        {
-            if (wantsDirs)
-            {
-                // Strip trailing slash to get wildcard dir path, e.g. "C:/foo/*/" → "C:/foo/*"
-                string dirWildPath = filePath.TrimEnd('/', '\\');
-                var expandedDirs = ExpandWildDirectories(dirWildPath);
-                if (expandedDirs.Length == 0) return Nil.Instance;
-                LispObject result = Nil.Instance;
-                for (int i = expandedDirs.Length - 1; i >= 0; i--)
-                {
-                    string fullDir = Path.GetFullPath(expandedDirs[i]);
-                    result = new Cons(LispPathname.FromString(fullDir + Path.DirectorySeparatorChar), result);
-                }
-                return result;
-            }
-
-            var dir = Path.GetDirectoryName(filePath) ?? ".";
-            var filePattern = Path.GetFileName(filePath) ?? "*";
-            if (string.IsNullOrEmpty(dir)) dir = System.IO.Directory.GetCurrentDirectory();
-            if (string.IsNullOrEmpty(filePattern)) filePattern = "*";
-
-            bool dirHasWild = dir.Contains('*') || dir.Contains('?');
-
-            string[] files;
-            if (!dirHasWild)
-            {
-                // Simple case: wildcards only in filename
-                if (!System.IO.Directory.Exists(dir))
-                    return Nil.Instance;
-                files = System.IO.Directory.GetFiles(dir, filePattern);
-            }
-            else
-            {
-                // Directory path contains wildcards - expand recursively
-                files = ExpandWildDirectory(dir, filePattern);
-            }
-
-            if (files.Length == 0)
-                return Nil.Instance;
-
-            // Build list from results
-            LispObject fileResult = Nil.Instance;
-            for (int i = files.Length - 1; i >= 0; i--)
-            {
-                fileResult = new Cons(LispPathname.FromString(Path.GetFullPath(files[i])), fileResult);
-            }
-            return fileResult;
-        }
-        catch
-        {
-            return Nil.Instance;
         }
     }
 
@@ -2912,7 +2961,14 @@ public static partial class Runtime
         }
         else if (pathSpec is LispFileStream fs) return fs.FilePath;
         else if (pathSpec is LispVector v && v.IsCharVector) raw = v.ToCharString();
-        else return pathSpec.ToString();
+        else
+            // CLHS: a pathname designator is a pathname, string, or file stream.
+            // Falling through to ToString() turned (open nil ...) into a file
+            // literally named "NIL" — the classic unset-config-variable bug,
+            // silently succeeding with a side effect instead of signalling.
+            throw new LispErrorException(new LispTypeError(
+                "Not a pathname designator (expected pathname, string, or file stream)",
+                pathSpec));
 
         // Expand a leading ~ for STRING/char-vector specs (LispPathname args were
         // already expanded by FromString). Without this, LOAD/OPEN/PROBE-FILE on
@@ -3156,6 +3212,32 @@ public static partial class Runtime
         return Fixnum.Make(seconds);
     }
 
+    /// <summary>A filesystem entry as DIRECTORY should report it: a subdirectory
+    /// becomes a directory pathname (trailing separator, NAME and TYPE both NIL),
+    /// not a file pathname that happens to name a directory.
+    ///
+    /// Callers rely on telling the two apart — uiop:directory-files enumerates
+    /// with a wild pattern and then drops the results for which
+    /// UIOP:DIRECTORY-PATHNAME-P holds. Reporting a subdirectory as #P".../assets"
+    /// rather than #P".../assets/" defeats that filter, and the caller goes on to
+    /// read it as a file.</summary>
+    private static LispObject EntryPathname(string entry)
+    {
+        string full = Path.GetFullPath(entry);
+        if (Directory.Exists(full) && full.Length > 0
+            && full[full.Length - 1] != Path.DirectorySeparatorChar
+            && full[full.Length - 1] != Path.AltDirectorySeparatorChar)
+            full += Path.DirectorySeparatorChar;
+        return LispPathname.FromString(full);
+    }
+
+    /// <summary>Kept only so FASLs compiled before the two DIRECTORY
+    /// implementations were merged keep loading: a FASL is real IL and names the
+    /// method it called, so deleting this one breaks every previously compiled
+    /// caller of DIRECTORY — including the contrib quicklisp and asdf FASLs that
+    /// ship with the release. It forwards; there is no second implementation.</summary>
+    public static LispObject LispDirectory(LispObject[] args) => DirectoryFunc(args);
+
     public static LispObject DirectoryFunc(LispObject[] args)
     {
         if (args.Length == 0)
@@ -3184,10 +3266,7 @@ public static partial class Runtime
             // Non-wild: check if file/directory exists
             string fullPath = Path.GetFullPath(namestring);
             if (File.Exists(fullPath) || Directory.Exists(fullPath))
-            {
-                var result = LispPathname.FromString(fullPath);
-                return new Cons(result, Nil.Instance);
-            }
+                return new Cons(EntryPathname(fullPath), Nil.Instance);
             return Nil.Instance;
         }
 
@@ -3208,6 +3287,17 @@ public static partial class Runtime
                 if (string.IsNullOrEmpty(dirWild)) dirWild = "*";
                 if (string.IsNullOrEmpty(searchDir)) searchDir = ".";
 
+                // A wildcard may sit in the directory part rather than the last
+                // segment — "dists/*/" — so expand the whole path, not just the
+                // final component.
+                if (searchDir.Contains('*') || searchDir.Contains('?'))
+                {
+                    foreach (var dir in ExpandWildDirectories(dirWildPath))
+                        entries.Add(LispPathname.FromString(
+                            Path.GetFullPath(dir) + Path.DirectorySeparatorChar));
+                    return Runtime.List(entries.ToArray());
+                }
+
                 if (!Directory.Exists(searchDir)) return Nil.Instance;
                 foreach (var dir in Directory.EnumerateDirectories(searchDir, dirWild))
                 {
@@ -3222,20 +3312,32 @@ public static partial class Runtime
             string pattern = Path.GetFileName(namestring) ?? "*";
             if (string.IsNullOrEmpty(dirPath)) dirPath = ".";
 
+            // The wildcard is not always in the last segment: quicklisp finds its
+            // dists with "dists/*/distinfo.txt". Expanding the directory part is
+            // what the second DIRECTORY implementation did and this one did not,
+            // which is why compiled callers and #'DIRECTORY callers each worked
+            // for their own cases and neither noticed the other's gap.
+            if (dirPath.Contains('*') || dirPath.Contains('?'))
+            {
+                foreach (var file in ExpandWildDirectory(dirPath, pattern))
+                    entries.Add(EntryPathname(file));
+                return Runtime.List(entries.ToArray());
+            }
+
             // Check for ** (recursive) pattern
             if (namestring.Contains("**"))
             {
                 foreach (var file in Directory.EnumerateFileSystemEntries(
                     dirPath, pattern, SearchOption.AllDirectories))
                 {
-                    entries.Add(LispPathname.FromString(Path.GetFullPath(file)));
+                    entries.Add(EntryPathname(file));
                 }
             }
             else
             {
                 foreach (var file in Directory.EnumerateFileSystemEntries(dirPath, pattern))
                 {
-                    entries.Add(LispPathname.FromString(Path.GetFullPath(file)));
+                    entries.Add(EntryPathname(file));
                 }
             }
 
@@ -3326,9 +3428,15 @@ public static partial class Runtime
 
         // --- READ-SEQUENCE, WRITE-SEQUENCE ---
         Emitter.CilAssembler.RegisterFunction("READ-SEQUENCE",
-            new LispFunction(args => Runtime.ReadSequence(args)));
+            new LispFunction(args => {
+                var stream = args.Length > 1 ? args[1] : (LispObject)Nil.Instance;
+                return Runtime.GuardStreamIO(stream, () => Runtime.ReadSequence(args));
+            }));
         Emitter.CilAssembler.RegisterFunction("WRITE-SEQUENCE",
-            new LispFunction(args => Runtime.WriteSequence(args)));
+            new LispFunction(args => {
+                var stream = args.Length > 1 ? args[1] : (LispObject)Nil.Instance;
+                return Runtime.GuardStreamIO(stream, () => Runtime.WriteSequence(args));
+            }));
 
         // --- READ-FROM-STRING ---
         Emitter.CilAssembler.RegisterFunction("READ-FROM-STRING", new LispFunction(Runtime.ReadFromString, "READ-FROM-STRING", -1));
@@ -3420,11 +3528,12 @@ public static partial class Runtime
             throw new LispErrorException(new LispTypeError("STREAM-ELEMENT-TYPE: not a stream", obj, Startup.Sym("STREAM")));
         });
         Startup.RegisterUnary("STREAM-EXTERNAL-FORMAT", obj => {
-            // Accept Gray streams (streamp=T); dotcl reports :default for every
-            // stream, so a Gray stream is no exception (better than "not a stream").
+            // Accept Gray streams (streamp=T); they carry no format, so :default.
             if (obj is not LispStream && !(obj is LispInstance ei && (Runtime.IsGrayInputStream(ei) || Runtime.IsGrayOutputStream(ei)
                                                                       || Runtime.IsGrayBinaryInputStream(ei) || Runtime.IsGrayBinaryOutputStream(ei))))
                 throw new LispErrorException(new LispTypeError("STREAM-EXTERNAL-FORMAT: not a stream", obj, Startup.Sym("STREAM")));
+            // Report what the stream was opened with; :default when unspecified.
+            if (obj is LispStream fsx && fsx.ExternalFormat is LispObject ef) return ef;
             return Startup.Keyword("DEFAULT");
         });
         Startup.RegisterUnary("BROADCAST-STREAM-STREAMS", obj => {
@@ -3495,20 +3604,28 @@ public static partial class Runtime
         }));
 
         // --- LISTEN, CLEAR-INPUT ---
-        Startup.RegisterUnary("LISTEN", Runtime.Listen);
+        Startup.RegisterUnary("LISTEN",
+            s => Runtime.GuardStreamIO(s, () => Runtime.Listen(s)));
         Startup.RegisterUnary("CLEAR-INPUT", Runtime.ClearInput);
 
         // --- WRITE-BYTE, WRITE-STRING, WRITE-LINE, WRITE-CHAR ---
-        Startup.RegisterBinary("WRITE-BYTE", Runtime.WriteByte);
+        Startup.RegisterBinary("WRITE-BYTE",
+            (b, s) => Runtime.GuardStreamIO(s, () => Runtime.WriteByte(b, s)));
         Emitter.CilAssembler.RegisterFunction("WRITE-STRING",
-            new LispFunction(args => Runtime.WriteString(args)));
+            new LispFunction(args => {
+                var stream = args.Length > 1 ? args[1] : (LispObject)Nil.Instance;
+                return Runtime.GuardStreamIO(stream, () => Runtime.WriteString(args));
+            }));
         Emitter.CilAssembler.RegisterFunction("WRITE-LINE",
-            new LispFunction(args => Runtime.WriteLine(args)));
+            new LispFunction(args => {
+                var stream = args.Length > 1 ? args[1] : (LispObject)Nil.Instance;
+                return Runtime.GuardStreamIO(stream, () => Runtime.WriteLine(args));
+            }));
         Emitter.CilAssembler.RegisterFunction("WRITE-CHAR",
             new LispFunction(args => {
                 var ch = args[0];
                 var stream = args.Length > 1 ? args[1] : DynamicBindings.Get(Startup.Sym("*STANDARD-OUTPUT*"));
-                return Runtime.WriteChar(ch, stream);
+                return Runtime.GuardStreamIO(stream, () => Runtime.WriteChar(ch, stream));
             }));
 
         // --- MAKE-STRING-INPUT-STREAM, MAKE-STRING-OUTPUT-STREAM, MAKE-STRING-OUTPUT-STREAM-TO-STRING ---
@@ -3555,7 +3672,10 @@ public static partial class Runtime
 
         // --- READ-BYTE ---
         Emitter.CilAssembler.RegisterFunction("READ-BYTE",
-            new LispFunction(args => Runtime.ReadByte(args)));
+            new LispFunction(args => {
+                var stream = args.Length > 0 ? args[0] : (LispObject)Nil.Instance;
+                return Runtime.GuardStreamIO(stream, () => Runtime.ReadByte(args));
+            }));
 
         // --- READ-CHAR-NO-HANG, READ-CHAR, PEEK-CHAR, UNREAD-CHAR ---
         Emitter.CilAssembler.RegisterFunction("READ-CHAR-NO-HANG",
@@ -3566,7 +3686,7 @@ public static partial class Runtime
                 var eofValue = args.Length > 2 ? args[2] : Nil.Instance;
                 var recursiveP = args.Length > 3 ? args[3] : Nil.Instance;
                 if (recursiveP is not Nil) eofErrorP = T.Instance;
-                return Runtime.ReadCharNoHang(stream, eofErrorP, eofValue);
+                return Runtime.GuardStreamIO(stream, () => Runtime.ReadCharNoHang(stream, eofErrorP, eofValue));
             }));
         Emitter.CilAssembler.RegisterFunction("READ-CHAR",
             new LispFunction(args => {
@@ -3575,7 +3695,7 @@ public static partial class Runtime
                 var eofErrorP = args.Length > 1 ? args[1] : T.Instance;
                 var eofValue = args.Length > 2 ? args[2] : Nil.Instance;
                 // recursive-p (args[3]) does NOT override eof-error-p (CLHS)
-                return Runtime.ReadChar(stream, eofErrorP, eofValue);
+                return Runtime.GuardStreamIO(stream, () => Runtime.ReadChar(stream, eofErrorP, eofValue));
             }));
         Emitter.CilAssembler.RegisterFunction("PEEK-CHAR",
             new LispFunction(args => {
@@ -3585,7 +3705,7 @@ public static partial class Runtime
                 var eofErrorP = args.Length > 2 ? args[2] : T.Instance;
                 var eofValue = args.Length > 3 ? args[3] : Nil.Instance;
                 // recursive-p (args[4]) does NOT override eof-error-p (CLHS)
-                return Runtime.PeekChar(peekType, stream, eofErrorP, eofValue);
+                return Runtime.GuardStreamIO(stream, () => Runtime.PeekChar(peekType, stream, eofErrorP, eofValue));
             }));
         Emitter.CilAssembler.RegisterFunction("UNREAD-CHAR",
             new LispFunction(args => {
@@ -3608,7 +3728,7 @@ public static partial class Runtime
                 var eofValue = args.Length > 2 ? args[2] : Nil.Instance;
                 var recursiveP = args.Length > 3 ? args[3] : Nil.Instance;
                 if (recursiveP is not Nil) eofErrorP = T.Instance;
-                return Runtime.ReadPreservingWhitespace(stream, eofErrorP, eofValue);
+                return Runtime.GuardStreamIO(stream, () => Runtime.ReadPreservingWhitespace(stream, eofErrorP, eofValue));
             }));
 
         // --- OPEN, CLOSE, PROBE-FILE, TRUENAME, FILE-WRITE-DATE, GET-OUTPUT-STREAM-STRING ---
@@ -3640,7 +3760,7 @@ public static partial class Runtime
                 var eofValue = args.Length > 2 ? args[2] : Nil.Instance;
                 var recursiveP = args.Length > 3 ? args[3] : Nil.Instance;
                 if (recursiveP is not Nil) eofErrorP = T.Instance;
-                return Runtime.ReadFromStream(stream, eofErrorP, eofValue);
+                return Runtime.GuardStreamIO(stream, () => Runtime.ReadFromStream(stream, eofErrorP, eofValue));
             }, "READ", -1));
         Emitter.CilAssembler.RegisterFunction("READ-LINE",
             new LispFunction(args => {
@@ -3649,7 +3769,7 @@ public static partial class Runtime
                 var eofValue = args.Length > 2 ? args[2] : Nil.Instance;
                 var recursiveP = args.Length > 3 ? args[3] : Nil.Instance;
                 if (recursiveP is not Nil) eofErrorP = T.Instance;
-                return Runtime.ReadLine(stream, eofErrorP, eofValue);
+                return Runtime.GuardStreamIO(stream, () => Runtime.ReadLine(stream, eofErrorP, eofValue));
             }, "READ-LINE", -1));
 
         // --- Stream factory functions for composite stream types ---
@@ -3724,8 +3844,12 @@ public static partial class Runtime
                         throw new LispErrorException(new LispProgramError($"{fn}: wrong number of arguments: {args.Length} (expected 0 or 1)"));
                     // Gray output stream: trampoline to the corresponding generic
                     // (stream-force-output / stream-finish-output / stream-clear-output)
-                    // so streamp=T instances are accepted.
-                    if (args.Length > 0 && args[0] is LispInstance gi && IsGrayOutputStream(gi))
+                    // so streamp=T instances are accepted. Binary gray streams count
+                    // too — flexi-streams' classes are binary output streams, and
+                    // testing only the character predicate rejected the very objects
+                    // write-char and streamp had already accepted.
+                    if (args.Length > 0 && args[0] is LispInstance gi
+                        && (IsGrayOutputStream(gi) || IsGrayBinaryOutputStream(gi)))
                     {
                         var gfn = GrayStreamLookup.GrayOrCl("STREAM-" + fn);
                         gfn?.Invoke(new LispObject[] { gi });
@@ -3736,8 +3860,7 @@ public static partial class Runtime
                     var stream = args.Length > 0 && args[0] is not Nil
                         ? args[0]
                         : DynamicBindings.Get(Startup.Sym("*STANDARD-OUTPUT*"));
-                    FlushStream(stream);
-                    return Nil.Instance;
+                    return Runtime.GuardStreamIO(stream, () => { FlushStream(stream); return Nil.Instance; });
                 }));
         }
     }

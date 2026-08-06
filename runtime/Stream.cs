@@ -44,6 +44,10 @@ public abstract class LispStream : LispObject
     public int UnreadCharValue { get; set; } = -1;
     /// <summary>Element type of the stream. Default is CHARACTER (null means CHARACTER).</summary>
     public LispObject? ElementType { get; set; }
+    /// <summary>External format the stream was opened with, as the designator the
+    /// caller supplied; null means the implementation default (UTF-8). Reported by
+    /// STREAM-EXTERNAL-FORMAT.</summary>
+    public LispObject? ExternalFormat { get; set; }
     /// <summary>True if the last character written was a newline (or nothing written yet).</summary>
     public bool AtLineStart { get; set; } = true;
     /// <summary>Cached Reader instance for ReadFromStream, so pushback state is preserved across calls.</summary>

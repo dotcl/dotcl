@@ -7,7 +7,12 @@
        contentFiles/copyToOutput is unreliable on plain `dotnet build`, so we
        inject explicit copy-to-output items here instead. -->
   <PropertyGroup>
-    <_DotCLRuntimeAssets>$(MSBuildThisFileDirectory)../dotclassets/</_DotCLRuntimeAssets>
+    <!-- DotclAssetsDir comes from DotCL.Runtime.props, which NuGet imports ahead
+         of the consumer's project body so an ItemGroup there can use it. The
+         fallback is for anyone importing this file directly, without the props
+         beside it. -->
+    <DotclAssetsDir Condition="'$(DotclAssetsDir)' == ''">$(MSBuildThisFileDirectory)../dotclassets/</DotclAssetsDir>
+    <_DotCLRuntimeAssets>$(DotclAssetsDir)</_DotCLRuntimeAssets>
     <!-- On Android, output-dir <None> items do NOT land in the APK; assets must be
          <AndroidAsset> (APK assets/) and read at runtime via the asset manager,
          since AppContext.BaseDirectory is not a real fs path holding the core.

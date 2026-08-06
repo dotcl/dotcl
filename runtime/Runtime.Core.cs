@@ -784,11 +784,19 @@ public static partial class Runtime
     /// subtype of ARITHMETIC-ERROR — not PROGRAM-ERROR. Returns null when there is
     /// no specific mapping (caller falls back to PROGRAM-ERROR).
     /// </summary>
-    private static LispError? MapWellKnownClrException(Exception ex)
+    private static LispCondition? MapWellKnownClrException(Exception ex)
     {
         if (ex is DivideByZeroException)
             return new LispError(ex.Message)
-            { ConditionTypeName = "DIVISION-BY-ZERO", ClrExceptionType = ex.GetType() };
+            { ConditionTypeName = "DIVISION-BY-ZERO", ClrExceptionType = ex.GetType(), ClrException = ex };
+        // Heap exhaustion must surface as STORAGE-CONDITION, not PROGRAM-ERROR:
+        // a raw OutOfMemoryException is catchable in .NET, and the CL spelling
+        // for "allocation failed" is storage-condition (like SBCL's
+        // heap-exhausted-error). Storage-conditions are not ERRORs, so
+        // handler-case (error ...) deliberately does not catch this.
+        if (ex is OutOfMemoryException)
+            return new LispStorageCondition(ex.Message)
+            { ClrExceptionType = ex.GetType(), ClrException = ex };
         return null;
     }
 
@@ -799,18 +807,29 @@ public static partial class Runtime
         var message = Startup.DebugStacktrace && !string.IsNullOrEmpty(ex.StackTrace)
             ? ex.Message + "\n[.NET " + ex.GetType().Name + "]\n" + ex.StackTrace
             : ex.Message;
-        return new LispProgramError(message) { ClrExceptionType = ex.GetType() };
+        return new LispProgramError(message) { ClrExceptionType = ex.GetType(), ClrException = ex };
     }
 
     /// <summary>
     /// For handler-bind catch(System.Exception): rethrow Lisp control exceptions
     /// (BlockReturn, CatchThrow, Go, Restart, LispError), wrap others as LispError.
     /// Takes the exception object from the stack.
+    ///
+    /// ThreadInterruptedException counts as control flow too: it is how
+    /// DESTROY-THREAD ends a thread (and how a not-ours interrupt propagates
+    /// out of a blocking primitive). Wrapping it as a PROGRAM-ERROR let any
+    /// (handler-case ... (error ...)) swallow a DESTROY-THREAD — the thread
+    /// refused to die — and defeated MakeThread's silent-termination catch,
+    /// which reports "Thread ... error" for what is a routine retirement
+    /// (bordeaux-threads' WITH-TIMEOUT destroys its watchdog on every
+    /// successful body). SBCL behaves the same way: thread termination is a
+    /// control transfer, not a condition handlers can intercept.
     /// </summary>
     public static bool IsLispControlFlowException(Exception ex)
         => ex is BlockReturnException || ex is CatchThrowException ||
            ex is GoException || ex is RestartInvocationException ||
-           ex is HandlerCaseInvocationException;
+           ex is HandlerCaseInvocationException ||
+           ex is System.Threading.ThreadInterruptedException;
 
     /// <summary>
     /// Signal CONTROL-ERROR for unmatched THROW (no active CATCH for the tag).
@@ -824,10 +843,12 @@ public static partial class Runtime
 
     public static void RewrapNonLispException(Exception ex)
     {
-        // Rethrow Lisp control flow exceptions as-is
+        // Rethrow Lisp control flow exceptions as-is. ThreadInterruptedException
+        // is control flow too (thread termination) — see IsLispControlFlowException.
         if (ex is BlockReturnException || ex is CatchThrowException ||
             ex is GoException || ex is RestartInvocationException ||
-            ex is LispErrorException || ex is HandlerCaseInvocationException)
+            ex is LispErrorException || ex is HandlerCaseInvocationException ||
+            ex is System.Threading.ThreadInterruptedException)
             throw ex;
         // Well-known CLR exceptions (e.g. DivideByZeroException) map to their ANSI
         // condition type so handler-bind can catch division-by-zero / arithmetic-error.
@@ -840,7 +861,7 @@ public static partial class Runtime
             Startup.DebugStacktrace && !string.IsNullOrEmpty(ex.StackTrace)
                 ? ex.Message + "\n[.NET " + ex.GetType().Name + "]\n" + ex.StackTrace
                 : ex.Message)
-        { ClrExceptionType = ex.GetType() };
+        { ClrExceptionType = ex.GetType(), ClrException = ex };
         throw new LispErrorException(condition);
     }
 

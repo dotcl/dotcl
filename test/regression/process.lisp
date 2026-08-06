@@ -57,6 +57,35 @@
     (loop repeat 5 always (equal (sort3) '("apple" "banana" "cherry"))))
   t)
 
+;;; :environment follows sb-ext:run-program: a list of "VAR=value" strings that
+;;; REPLACES the child's entire environment; omitting the key inherits the
+;;; parent's. The child echoes the variable back through the platform shell.
+(defun %env-echo (&rest launch-keys)
+  (let* ((p (apply #'dotcl:launch-process
+                   #+windows "cmd" #-windows "sh"
+                   #+windows '("/c" "echo" "%DOTCL_ENV_TEST%")
+                   #-windows '("-c" "echo ${DOTCL_ENV_TEST:-unset}")
+                   launch-keys))
+         (line (read-line (dotcl:process-output p) nil "")))
+    (dotcl:process-wait p)
+    (string-right-trim '(#\return #\space) line)))
+
+(deftest launch-process-environment-passes-var
+  (string= (%env-echo :environment '("DOTCL_ENV_TEST=hello")) "hello")
+  t)
+
+(deftest launch-process-environment-replaces-not-merges
+  (progn
+    (dotnet:static "System.Environment" "SetEnvironmentVariable" "DOTCL_ENV_TEST" "leaky")
+    (prog1 (list
+            ;; omitted key → child inherits the parent's environment
+            (string= (%env-echo) "leaky")
+            ;; explicit list without the var → whole environment replaced, no leak
+            (not (string= (%env-echo :environment '("DOTCL_OTHER=x")) "leaky")))
+      (dotnet:static "System.Environment" "SetEnvironmentVariable"
+                     "DOTCL_ENV_TEST" (dotnet:null))))
+  (t t))
+
 ;;; error :output (uiop's :error-output :output — merge stderr into stdout).
 ;;; Portable check: stdout is still delivered through the single merged stream.
 ;;; (Full stderr-into-stdout merge verified manually with a dual-output child;

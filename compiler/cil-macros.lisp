@@ -177,6 +177,50 @@
               :base-offset base-offset
               :ctor-layout nil)))
 
+;;; --- Cross-compile (make-host-2) SBCL classoid registration -------------
+;;; When dotcl is used as the cross-compile host to build SBCL, SBCL's own
+;;; bootstrap structs (TYPE-CLASS, META-INFO, VOP-PARSE, ...) must be
+;;; registered in SBCL's classoid table via SB-KERNEL::%DEFSTRUCT — that is the
+;;; table genesis reads to obtain each structure classoid's layout.  dotcl
+;;; compiles DEFSTRUCT natively and never calls %DEFSTRUCT, so those classoids
+;;; end up layout-less (the make-host-2 harness worked around it by hand-building
+;;; DDs).  The DEFSTRUCT expander below additionally emits — ONLY when
+;;; SB-XC:DEFSTRUCT is loaded (i.e. we are cross-compiling SBCL) — a load-time
+;;; call to %XC-DEFSTRUCT-REGISTER on the original source form, so the SBCL
+;;; classoid gets registered alongside the native struct.  In ordinary dotcl
+;;; use SB-XC:DEFSTRUCT is absent, so nothing is emitted and this is dead code.
+(defvar *xc-pending-defstructs* nil
+  "Source forms of DEFSTRUCTs seen before SB-KERNEL::%DEFSTRUCT became fbound,
+   deferred until it is (early-bootstrap structs load before defstruct.lisp).")
+
+(defun %xc-eval-defstruct (ds source-form)
+  "Expand (SB-XC:DEFSTRUCT . SOURCE-FORM) and evaluate its :host expansion,
+   which calls %DEFSTRUCT / %COMPILER-DEFSTRUCT to register the SBCL classoid."
+  (handler-case
+      (eval (funcall (macro-function ds) (cons ds source-form) nil))
+    (error (e)
+      (format *error-output* ";; %xc-defstruct-register ~S: ~A~%"
+              (if (consp (car source-form)) (caar source-form) (car source-form)) e))))
+
+(defun %xc-flush-pending-defstructs (ds)
+  (when *xc-pending-defstructs*
+    (let ((pending (nreverse *xc-pending-defstructs*)))
+      (setf *xc-pending-defstructs* nil)
+      (dolist (f pending) (%xc-eval-defstruct ds f)))))
+
+(defun %xc-defstruct-register (source-form)
+  "Register an SBCL classoid for SOURCE-FORM (= (name-and-options . slots)).
+   Deferred until SB-KERNEL::%DEFSTRUCT is fbound; deferred entries flush on the
+   next call once it is.  No-op unless SB-XC:DEFSTRUCT is loaded."
+  (let ((ds (and (find-package "SB-XC") (find-symbol "DEFSTRUCT" "SB-XC"))))
+    (when (and ds (macro-function ds))
+      (let ((pd (and (find-package "SB-KERNEL") (find-symbol "%DEFSTRUCT" "SB-KERNEL"))))
+        (if (and pd (fboundp pd))
+            (progn
+              (%xc-flush-pending-defstructs ds)
+              (%xc-eval-defstruct ds source-form))
+            (push source-form *xc-pending-defstructs*))))))
+
 (defvar *struct-accessors* (make-hash-table :test #'eq :synchronized t)
   "Maps accessor symbol to slot index (integer) for compile-time inlining.
    Only populated for standard (non-typed) structs.")
@@ -2471,6 +2515,21 @@
                       :ctor-layout (when ctor-layout
                                      (mapcar #'identity ctor-layout))))
           `(progn
+             ;; Cross-compile host mode: also register the SBCL classoid via
+             ;; %DEFSTRUCT (genesis reads its layout).  Only emitted when
+             ;; SB-XC:DEFSTRUCT is loaded — a no-op in ordinary dotcl.
+             ;; :compile-toplevel ONLY: the registration must run in the HOST
+             ;; while dotcl compiles this target file (that is when genesis, which
+             ;; runs later in the same host, reads the classoid table), and it
+             ;; must NOT be emitted into the target fasl — genesis cold-loads that
+             ;; fasl into the SBCL core, where the dotcl symbol below does not
+             ;; exist.  %DEFSTRUCT is already fbound at XC-compile time (Phase 1
+             ;; loaded defstruct.lisp before the compile pass).
+             ,@(let ((ds (and (find-package "SB-XC")
+                              (find-symbol "DEFSTRUCT" "SB-XC"))))
+                 (when (and ds (macro-function ds))
+                   `((eval-when (:compile-toplevel)
+                       (dotcl.cil-compiler::%xc-defstruct-register ',(cdr form))))))
              ;; Register struct type in CLOS class registry (only for non-typed structs).
              ;; eval-when :compile-toplevel ensures struct inheritance is visible during
              ;; compile-file macro expansions (e.g. coalton's (assert (subtypep type 'node))).

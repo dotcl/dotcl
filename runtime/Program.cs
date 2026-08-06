@@ -29,7 +29,8 @@ class Program
     }
 
     // True when the REPL is active — CancelKeyPress delivers interrupt instead of killing process.
-    static bool _replMode = false;
+    // volatile: read from the SIGINT signal handler, which runs on another thread.
+    static volatile bool _replMode = false;
 
     // Startup profiling: enabled with DOTCL_STARTUP_PROFILE=1. Prints
     // wall-clock elapsed at key phase boundaries to stderr. Cost when
@@ -85,6 +86,33 @@ class Program
             }
             // else: default behavior — process exits with SIGINT
         };
+
+        // On Unix, Console.CancelKeyPress never fires: the REPL reads raw fd 0 and
+        // deliberately avoids .NET's Unix console driver (which is where CancelKeyPress
+        // is wired), so Ctrl-C would otherwise terminate the process outright. Deliver
+        // the interrupt through a PosixSignalRegistration for SIGINT instead — the same
+        // driver-independent mechanism used for SIGTERM/SIGHUP/SIGQUIT below. Windows
+        // keeps using CancelKeyPress above; this path is Unix-only to avoid double
+        // handling. In non-REPL (script) mode, leave Cancel=false so the default action
+        // still terminates the process — unchanged from before.
+        if (!OperatingSystem.IsWindows())
+        {
+            try
+            {
+                _signalRegistrations.Add(
+                    System.Runtime.InteropServices.PosixSignalRegistration.Create(
+                        System.Runtime.InteropServices.PosixSignal.SIGINT,
+                        ctx =>
+                        {
+                            if (_replMode)
+                            {
+                                ctx.Cancel = true;   // don't terminate — interrupt instead
+                                ConditionSystem.RequestInterrupt();
+                            }
+                        }));
+            }
+            catch { /* SIGINT not registerable here — best-effort */ }
+        }
 
         // Restore the terminal on exit (Unix). .NET's Console driver switches
         // the terminal into "application" keypad / cursor-key mode (terminfo
@@ -671,6 +699,11 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
     /// <summary>Load and execute a compiled core (.sil text or .fasl PE assembly).</summary>
     static void RunCore(string filePath)
     {
+        // Remember which core this image was built from, so a .fasl written now
+        // can be stamped with it and a .fasl written by a different compiler can
+        // be recognised on load. Only the path is kept here; hashing it is
+        // deferred to the first fasl save/check so startup pays nothing.
+        Startup.CorePath = filePath;
         // Detect PE signature ("MZ") at byte 0 — PersistedAssemblyBuilder output.
         // Any other bytes → treat as SIL text and fall through to Reader.
         byte[] header = new byte[2];

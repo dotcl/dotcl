@@ -195,6 +195,41 @@
 (defvar *symbol-macros* '()
   "Alist of (symbol . expansion) for symbol-macrolet. Dynamically scoped.")
 
+;;; ------------------------------------------------------------
+;;; xref (who-calls) collection
+;;;
+;;; While a named function's body compiles, every named call site and #'name
+;;; reference is recorded as CALLER→CALLEE. compile-defun binds the two specials,
+;;; collects the edges, and appends a load-time (dotcl:%xref-note ...) call to
+;;; the compiled output, so the table rebuilds on fasl load — no fasl format
+;;; change. Plain specials, NOT *CSTATE* slots: a nested lambda's compile resets
+;;; *CSTATE* at the closure boundary, but its call sites must still attribute to
+;;; the enclosing defun, which is exactly what dynamic binding gives for free.
+;;; Cross-compile is excluded: stdlib edges would bloat cil-out.sil and startup.
+
+(defvar *xref-caller* nil
+  "Function name (symbol or (setf sym)) whose body is being compiled, for
+   who-calls edge attribution. NIL = not inside a named function (no recording).")
+
+(defvar *xref-edges* nil
+  "Callee names recorded for the current *XREF-CALLER* (reverse order, deduped).")
+
+(defun xref-record-call (name)
+  "Record *XREF-CALLER* → NAME if xref collection is active and NAME is a
+   global function name (interned symbol or (setf sym)). Local flet/labels
+   calls are skipped — they would alias a same-named global."
+  (when (and *xref-caller* (not *cross-compiling*))
+    (when (if (symbolp name)
+              (and (symbol-package name)
+                   (not (local-function-entry name)))
+              (and (consp name) (eq (car name) 'setf) (symbolp (cadr name))
+                   (not (local-function-entry name))))
+      (pushnew name *xref-edges* :test #'equal))))
+
+;;; xref-note-instrs (the load-time registration emitter) is defined after the
+;;; *in-mv-context* defvar below — it rebinds that special, so it must compile
+;;; after the defvar is seen or the host would bind it lexically.
+
 (defvar *notinline-functions* '()
   "List of function-name symbols currently declared NOTINLINE in the lexical
    scope (via (declare (notinline f ...))). Per CLHS 3.2.2.1.1, a NOTINLINE
@@ -384,9 +419,10 @@
 (defparameter +cs-go-tags+ 20)
 (defparameter +cs-boxed-vars+ 21)
 (defparameter +cs-local-functions+ 22)
+(defparameter +cs-no-safepoint+ 23)
 (defparameter +cstate-empty+
   (vector '() '() '() '() '() '() '() nil nil nil nil nil nil nil nil nil nil nil
-          '() '() '() '() '()))
+          '() '() '() '() '() nil))
 
 (defvar *cstate* +cstate-empty+
   "The key-verified table pack; see the section comment above. Participates
@@ -480,6 +516,27 @@
    before branching back (e.g. handler-case must call HandlerClusterStack.PopCluster
    before leaving the catch-protected region). NIL for ordinary TCO."
   (svref *cstate* +cs-tco-leave-instrs+))
+
+(defun cstate-no-safepoint ()
+  "T while compiling a body declared (optimize (safety 0)): loop back-edge
+   interrupt polls (ConditionSystem.PollInterrupt) are omitted, so tight
+   call-free loops pay nothing per iteration — at the cost of that loop being
+   unstoppable by Ctrl-C."
+  (svref *cstate* +cs-no-safepoint+))
+
+(defun body-declares-safety-0-p (body)
+  "T when BODY's leading declarations include (optimize ... (safety 0) ...).
+   The opt-out for loop back-edge interrupt polls; docstrings may precede or
+   interleave with the declarations."
+  (loop for form in body
+        while (or (stringp form)
+                  (and (consp form) (eq (car form) 'declare)))
+        thereis (and (consp form) (eq (car form) 'declare)
+                     (loop for d in (cdr form)
+                           thereis (and (consp d)
+                                        (eq (car d) 'optimize)
+                                        (member '(safety 0) (cdr d)
+                                                :test #'equal))))))
 
 (defun cstate-tco-in-try-catch ()
   "T when the current TCO site is inside a handler-case try/catch body (not
@@ -795,7 +852,22 @@ through to compile-sym-lookup."
 (defun same-var-package-p (k sym-pkg)
   "Return (var-name k) if K's package is compatible with SYM-PKG for
   lookup-local matching: same package, DOTCL.CIL-COMPILER (closure
-  env-locals), or uninterned (gensyms). nil otherwise."
+  env-locals), or uninterned (gensyms). nil otherwise.
+
+  The DOTCL.CIL-COMPILER clause looks obsolete and is not. It was introduced to
+  compensate for compile-closure-body registering env slots under a symbol
+  re-interned from the free variable's name; that intern is long gone (the
+  captured symbol itself is the slot key now), which makes the clause read like
+  leftover scaffolding. Removing it has been tried: the SIL oracle corpus stays
+  byte-identical and test-regression stays green, but the ANSI suite fails
+  RESTART-CASE.21, which is
+
+      (flet ((%f (s2) (format s2 \"A report\")))
+        (restart-case ... (foo () :report %f)))
+
+  — a local function reached by name through a restart's report slot, which
+  still routes through a compiler-package entry. Keep the clause until that
+  path changes, and note that the corpus alone will not catch its removal."
   (let ((k-pkg (symbol-package k)))
     (if (or (null k-pkg)
             (null sym-pkg)
@@ -1216,6 +1288,24 @@ through to compile-sym-lookup."
 (defvar *in-mv-context* nil
   "T when compiling an expression whose multiple values should propagate
   (e.g. the form inside multiple-value-list). Default nil = unwrap MvReturn.")
+
+(defun xref-note-instrs ()
+  "CIL instructions calling dotcl:%xref-note with the edges collected for the
+   current caller — run at load time, they register the edges in the runtime
+   xref table. NIL when nothing was collected (or during cross-compile)."
+  (when (and *xref-edges* (not *cross-compiling*))
+    (let* ((pkg (find-package "DOTCL"))
+           (note (and pkg (intern "%XREF-NOTE" pkg))))
+      (when note
+        ;; *xref-caller* nil: the %xref-note call itself must not be recorded
+        ;; as an edge of the function being registered.
+        (let ((caller *xref-caller*)
+              (edges (reverse *xref-edges*))
+              (*xref-caller* nil)
+              (*in-tail-position* nil)
+              (*in-mv-context* nil))
+          `(,@(compile-expr `(,note (quote ,caller) (quote ,edges)))
+            (:pop)))))))
 (defun compile-expr-raw (expr)
   "Compile expression without MvReturn unwrapping."
   ;; SBCL cross-compile: expand SB-INT:QUASIQUOTE at compile time
@@ -2280,9 +2370,14 @@ through to compile-sym-lookup."
          (:callvirt ,(invoke-native-name n-args))
          (:unbox-fixnum))))
     ;; Declared-fixnum local: load slot (LispObject) then unbox.
+    ;; A captured+mutated (boxed) local's slot holds the LispObject[1] cell,
+    ;; not the Fixnum — unboxing it directly would castclass the cell array.
+    ;; Boxed vars fall through to the fallback, whose compile-expr dereferences
+    ;; the cell before the unbox.
     ((and (symbolp expr)
           (boundp '*fixnum-locals*)
           (member (var-name expr) *fixnum-locals* :test #'string=)
+          (not (boxed-var-p expr))
           (lookup-local expr))
      `((:ldloc ,(lookup-local expr))
        (:unbox-fixnum)))

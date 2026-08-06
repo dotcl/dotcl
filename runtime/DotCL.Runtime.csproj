@@ -24,9 +24,30 @@
     <DebugSymbols Condition="'$(Configuration)' == 'Release'">false</DebugSymbols>
   </PropertyGroup>
 
-  <!-- DOTCL_EMIT: the Reflection.Emit-based JIT/compiler is available. Defined for
-       every target EXCEPT netstandard2.0 (which has no System.Reflection.Emit). -->
-  <PropertyGroup Condition="'$(TargetFramework)' != 'netstandard2.0'">
+  <!-- DotclEmit: is the Reflection.Emit-based JIT/compiler available? Decided once
+       here; both the DOTCL_EMIT constant below and the emit-only source exclusions
+       further down read it, so the two can never disagree.
+
+       Off where the platform forbids generating code at run time:
+         - netstandard2.0 — System.Reflection.Emit is not in the API surface
+         - browser-wasm   — the API is present but the runtime rejects it
+       Keyed off the RID (and a browser TFM) rather than the framework alone,
+       because a wasm build is net10.0, not netstandard2.0: gating on the framework
+       would have defined DOTCL_EMIT for it and produced a build whose compiler
+       cannot run.
+
+       DotclNoEmit=true forces it off for any target. That is how the emit-free
+       runtime gets built — and therefore run and tested — on an ordinary desktop
+       framework, instead of only as a netstandard2.0 library that also drags in an
+       older BCL. It isolates "no emit" from everything else that differs. -->
+  <PropertyGroup>
+    <DotclEmit>true</DotclEmit>
+    <DotclEmit Condition="'$(TargetFramework)' == 'netstandard2.0'
+                          Or $(RuntimeIdentifier.StartsWith('browser'))
+                          Or $(TargetFramework.Contains('browser'))
+                          Or '$(DotclNoEmit)' == 'true'">false</DotclEmit>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(DotclEmit)' == 'true'">
     <DefineConstants>$(DefineConstants);DOTCL_EMIT</DefineConstants>
   </PropertyGroup>
   <PropertyGroup>
@@ -45,6 +66,12 @@
     <PackageReadmeFile>README.md</PackageReadmeFile>
 
     <RuntimeIdentifiers>win-x64;win-arm64;linux-x64;linux-arm64;osx-x64;osx-arm64;android-arm64;android-x64;any</RuntimeIdentifiers>
+    <!-- Building for the browser narrows this to browser-wasm alone. With the wasm
+         workload present the SDK resolves a Mono runtime pack for every declared
+         RID, and Microsoft.NETCore.App.Runtime.Mono.win-x64 (and the other desktop
+         ones) does not exist — restore fails before anything is compiled. The list
+         above is what the desktop packages ship; a wasm build needs none of it. -->
+    <RuntimeIdentifiers Condition="$(RuntimeIdentifier.StartsWith('browser'))">browser-wasm</RuntimeIdentifiers>
   </PropertyGroup>
 
   <ItemGroup>
@@ -72,6 +99,11 @@
           Condition="Exists('contrib')" Pack="true" PackagePath="dotclassets/contrib/" />
     <None Include="build/DotCL.Runtime.targets" Pack="true" PackagePath="build/" />
     <None Include="build/DotCL.Runtime.targets" Pack="true" PackagePath="buildTransitive/" />
+    <!-- .props, not .targets, because NuGet imports it before the consumer's own
+         project body: DotclAssetsDir is there to be used by an ItemGroup they
+         write, and a property that only exists at the bottom cannot be. -->
+    <None Include="build/DotCL.Runtime.props" Pack="true" PackagePath="build/" />
+    <None Include="build/DotCL.Runtime.props" Pack="true" PackagePath="buildTransitive/" />
     <!-- Project-core build: the targets that drive the in-process tasks. The task
          assembly itself (tasks/DotCL.Build.Tasks.dll) is built and added to the
          package by the _PackProjectCoreTask target below, which ERRORS if the build
@@ -137,13 +169,50 @@
     <Compile Include="Generated/UnicodeCharNames.g.cs" />
   </ItemGroup>
 
-  <!-- Windows-only sources excluded for non-Windows RID builds and for ns2.0
-       (no System.Windows.Forms). -->
-  <PropertyGroup Condition="$(RuntimeIdentifier.StartsWith('android')) Or $(RuntimeIdentifier.StartsWith('linux')) Or $(RuntimeIdentifier.StartsWith('osx')) Or '$(OS)' != 'Windows_NT' Or '$(TargetFramework)' == 'netstandard2.0'">
-    <DefineConstants>$(DefineConstants);DOTCL_NO_WINFORMS</DefineConstants>
+  <!-- DotclSta: can a single-threaded apartment be created? Decided once, like
+       DotclEmit above, so the constant and the source exclusion cannot drift apart.
+       Gates Runtime.Sta.cs — the STA thread and message loop behind
+       dotnet:ui-invoke / ui-post — and, through DOTCL_NO_STA, the registration of
+       those two functions in Startup.cs, which would otherwise name a type that is
+       no longer compiled.
+
+       Apartments are a COM concept, so this is Windows-only; the dependency is
+       Thread.SetApartmentState, not any UI framework. System.Windows.Forms is never
+       referenced here — the caller loads it and it is looked up reflectively.
+
+       Off for any non-Windows RID, for a host that is not Windows, and for ns2.0.
+       browser is listed explicitly: a wasm build is net10.0 and its RID is neither
+       android/linux/osx, so on a Windows host none of the other clauses caught it
+       and the STA support was being compiled into a browser build, which has
+       neither apartments nor a message loop. -->
+  <PropertyGroup>
+    <DotclSta>true</DotclSta>
+    <DotclSta Condition="$(RuntimeIdentifier.StartsWith('android'))
+                              Or $(RuntimeIdentifier.StartsWith('linux'))
+                              Or $(RuntimeIdentifier.StartsWith('osx'))
+                              Or $(RuntimeIdentifier.StartsWith('browser'))
+                              Or $(TargetFramework.Contains('browser'))
+                              Or '$(OS)' != 'Windows_NT'
+                              Or '$(TargetFramework)' == 'netstandard2.0'
+                              Or '$(DotclNoSta)' == 'true'">false</DotclSta>
   </PropertyGroup>
-  <ItemGroup Condition="$(RuntimeIdentifier.StartsWith('android')) Or $(RuntimeIdentifier.StartsWith('linux')) Or $(RuntimeIdentifier.StartsWith('osx')) Or '$(OS)' != 'Windows_NT' Or '$(TargetFramework)' == 'netstandard2.0'">
-    <Compile Remove="Runtime.WinForms.cs" />
+  <PropertyGroup Condition="'$(DotclSta)' != 'true'">
+    <DefineConstants>$(DefineConstants);DOTCL_NO_STA</DefineConstants>
+  </PropertyGroup>
+  <ItemGroup Condition="'$(DotclSta)' != 'true'">
+    <Compile Remove="Runtime.Sta.cs" />
+  </ItemGroup>
+
+  <!-- Survive a trimmed consumer. A core / FASL is IL loaded at run time, so the
+       trimmer cannot see that it calls into this assembly and removes whatever the
+       host does not reach statically. See ILLink.Descriptors.xml. -->
+  <PropertyGroup>
+    <DotclPreserveForTrimming Condition="'$(DotclPreserveForTrimming)' == ''">true</DotclPreserveForTrimming>
+  </PropertyGroup>
+  <ItemGroup Condition="'$(DotclPreserveForTrimming)' == 'true'">
+    <EmbeddedResource Include="ILLink.Descriptors.xml">
+      <LogicalName>ILLink.Descriptors.xml</LogicalName>
+    </EmbeddedResource>
   </ItemGroup>
 
   <!-- Emit-free (netstandard2.0): exclude the purely Reflection.Emit-based sources.
@@ -153,7 +222,7 @@
        emit-free) and stays; CilAssembler.Emit.cs holds the ILGenerator body and is
        removed here. compile-file / save-application in Runtime.Misc.cs are gated by
        #if DOTCL_EMIT. -->
-  <ItemGroup Condition="'$(TargetFramework)' == 'netstandard2.0'">
+  <ItemGroup Condition="'$(DotclEmit)' != 'true'">
     <Compile Remove="Emitter/FaslAssembler.cs" />
     <Compile Remove="Emitter/CompilerEnv.cs" />
     <Compile Remove="Emitter/IlDisasm.cs" />

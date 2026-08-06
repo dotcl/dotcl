@@ -104,8 +104,15 @@ jobs:
         if: env.RUN_FULL == 'true'
         run: make update-ansi-state
 
+      # bench/ is mirror-excluded, so on the public repo this step has no inputs.
+      # RUN_FULL alone is true there, so it used to run on every public push and
+      # fail every time, kept green by the `|| true` — a step that could never
+      # succeed, wearing a passing face. Gate on the file instead, so it runs
+      # exactly where it can work and is honestly reported as skipped elsewhere.
+      # The `|| true` stays on purpose: benchmarks are data collection, not a
+      # gate, and a slow or missing SBCL must not fail the build.
       - name: Benchmarks
-        if: env.RUN_FULL == 'true'
+        if: env.RUN_FULL == 'true' && hashFiles('bench/run.lisp') != ''
         run: make bench-state || true
 
       - name: Disk usage (after)

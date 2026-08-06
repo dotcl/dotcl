@@ -151,6 +151,11 @@
                          (:stloc ,tmp))))))
 
 (defun compile-named-call (name args)
+  ;; xref: single choke point for every named call — all the fast-path
+  ;; return-froms below (self-call, CLOS reader/writer IC, struct accessor,
+  ;; local flet/labels) are branches INSIDE this function, so recording at
+  ;; entry catches them all.
+  (xref-record-call name)
   (block compile-named-call
     ;; Self-TCO: if in tail position and calling current function, emit loop
     ;; Use symbol identity (eq) not just name string to avoid cross-package false matches
@@ -205,6 +210,10 @@
             `(,@eval-instrs
               ,@store-instrs
               ,@(cstate-tco-leave-instrs)
+              ;; Back-edge safepoint: a TCO'd self-call never passes a checked
+              ;; Invoke entry, so poll here or the loop is unstoppable.
+              ,@(unless (cstate-no-safepoint)
+                  '((:call "ConditionSystem.PollInterrupt")))
               ;; handler-case try/catch: use `leave` to exit cleanly.
               ;; try/finally (special-var LET) already suppressed above via *in-try-block*.
               ,(if (cstate-tco-in-try-catch)
@@ -232,6 +241,8 @@
                       (:ldc-i4 ,fn-index)
                       (:stloc ,which-fn-key)
                       ,@(cstate-tco-leave-instrs)
+                      ,@(unless (cstate-no-safepoint)
+                          '((:call "ConditionSystem.PollInterrupt")))
                       ,(if (cstate-tco-in-try-catch)
                            `(:leave ,tcoloop-label)
                            `(:br ,tcoloop-label))))))))))
@@ -869,6 +880,23 @@
          (when (form-has-return-from-p name (car cur))
            (return t))))))
 
+(defun %lambda-list-init-forms (lambda-list)
+  "The default-value initializer forms in an ordinary LAMBDA-LIST — the only code
+   positions it contains. Parameter names (required, &rest, and supplied-p names)
+   are binding occurrences, not code, so they are excluded. Returns NIL for a
+   non-list. Used by the return-from scanners so they never macroexpand a
+   parameter name, which would fire a same-named macro's compile-time side
+   effects (e.g. a required param named INST under SBCL's assembler)."
+  (when (listp lambda-list)
+    (let ((state :required) (forms '()))
+      (dolist (p lambda-list (nreverse forms))
+        (cond
+          ((member p '(&optional &rest &body &key &aux &allow-other-keys
+                       &whole &environment))
+           (setf state p))
+          ((and (consp p) (member state '(&optional &key &aux)) (cadr p))
+           (push (cadr p) forms)))))))
+
 (defun form-macroexpands-to-return-from-p (name form depth)
   "Like FORM-HAS-RETURN-FROM-P, but also expands global macro calls (up to
    *macro-expand-depth-limit*) so a (return-from NAME) produced by a macro is
@@ -889,6 +917,35 @@
     ((and (eq (car form) 'block) (consp (cdr form)) (eq (cadr form) name)) nil)
     ((and (eq (car form) 'defun) (consp (cdr form)) (eq (cadr form) name)) nil)
     ((eq (car form) 'quote) nil)
+    ;; Binding special forms: recurse only into their code positions (default
+    ;; initializer forms + bodies), never into lambda-list parameter names or
+    ;; LET variable names. Blindly recursing into a lambda list macroexpands a
+    ;; form like (INST) — a required param named after a macro — firing that
+    ;; macro's compile-time side effects. A binding name can never hold a
+    ;; RETURN-FROM, so skipping it loses no detection.
+    ((member (car form) '(lambda named-lambda))
+     (let ((namedp (eq (car form) 'named-lambda)))
+       (or (some (lambda (f) (form-macroexpands-to-return-from-p name f depth))
+                 (%lambda-list-init-forms (if namedp (caddr form) (cadr form))))
+           (some (lambda (f) (form-macroexpands-to-return-from-p name f depth))
+                 (if namedp (cdddr form) (cddr form))))))
+    ((member (car form) '(flet labels))
+     (or (some (lambda (fdef)
+                 (and (consp fdef)
+                      (or (some (lambda (f) (form-macroexpands-to-return-from-p name f depth))
+                                (%lambda-list-init-forms (cadr fdef)))
+                          (some (lambda (f) (form-macroexpands-to-return-from-p name f depth))
+                                (cddr fdef)))))
+               (cadr form))
+         (some (lambda (f) (form-macroexpands-to-return-from-p name f depth))
+               (cddr form))))
+    ((member (car form) '(let let*))
+     (or (some (lambda (b)
+                 (and (consp b) (cadr b)
+                      (form-macroexpands-to-return-from-p name (cadr b) depth)))
+               (cadr form))
+         (some (lambda (f) (form-macroexpands-to-return-from-p name f depth))
+               (cddr form))))
     (t
      (or
       ;; A global macro call may expand to a return-from (possibly after more
@@ -1107,6 +1164,18 @@
 
 (defun compile-defun (name params body)
   "Compile (defun name (params) body...) → :defmethod directive + return symbol."
+  ;; xref: collect CALLER→CALLEE edges while this body (and any nested lambda)
+  ;; compiles, and prepend a load-time %xref-note registration. The caller must
+  ;; be a nameable global — an uninterned gensym defun records nothing.
+  (let ((*xref-caller* (and (not *cross-compiling*)
+                            (or (and (symbolp name) (symbol-package name) name)
+                                (and (consp name) (eq (car name) 'setf) name))))
+        (*xref-edges* '()))
+    (let ((instrs (%compile-defun-1 name params body)))
+      (let ((note (xref-note-instrs)))
+        (if note (append note instrs) instrs)))))
+
+(defun %compile-defun-1 (name params body)
   ;; Pre-pass: infer return type before body compilation so self-calls inside the
   ;; body benefit from the single-value elision path.
   (when (and (symbolp name) (not (gethash name *function-return-types*)))
@@ -2086,7 +2155,8 @@
                   (eq 'fixnum (gethash fn-symbol *function-return-types*)))))
       (let ((*cstate* (cstate-with *cstate*
                         +cs-locals+ local-keys
-                        +cs-boxed-vars+ (params-boxed-vars all-params needs-boxing)))
+                        +cs-boxed-vars+ (params-boxed-vars all-params needs-boxing)
+                        +cs-no-safepoint+ (body-declares-safety-0-p body)))
             (*symbol-macros* (params-shadowed-symbol-macros all-params)))
         (let ((param-instrs
                 ;; Native body: arg0 is the self LispFunction (threaded for
@@ -2312,7 +2382,8 @@
            (key-start (+ n-required (length optional))))
       (let ((*cstate* (cstate-with *cstate*
                         +cs-locals+ local-keys
-                        +cs-boxed-vars+ (params-boxed-vars all-params needs-boxing)))
+                        +cs-boxed-vars+ (params-boxed-vars all-params needs-boxing)
+                        +cs-no-safepoint+ (body-declares-safety-0-p body)))
             (*symbol-macros* (params-shadowed-symbol-macros all-params)))
         ;; Generate parameter binding instructions via the shared args-array
         ;; machinery (compile-args-param-instrs); the args array lives at
@@ -3843,10 +3914,12 @@
                       for label-idx = (fourth gt-entry)
                       for env-entry = (local-entry-by-name tb-var-name env-locals)
                       when env-entry
-                      ;; 5th/6th nil (closure go → throw path); 7th preserves the
-                      ;; outer tagbody's needs-catch cell so the throw flags it.
+                      ;; 5th/6th nil (closure go → throw path); 7th/8th preserve
+                      ;; the outer tagbody's needs-catch / has-go cells so the
+                      ;; throw flags them (has-go: a go that exists only inside
+                      ;; the closure still makes the outer tagbody a loop).
                       collect (list tag-name tb-var-name (cdr env-entry) label-idx
-                                    nil nil (seventh gt-entry)))))
+                                    nil nil (seventh gt-entry) (eighth gt-entry)))))
              (param-instrs
                ;; Shared args-array machinery (compile-args-param-instrs):
                ;; args elements load via :load-arg (mapped per closure mode by
@@ -4019,9 +4092,12 @@
              (if boxed-p
                  `((:ldloc ,key) (:ldc-i4 0) (:ldelem-ref))
                  `((:ldloc ,key))))
-           `(,@(compile-sym-lookup (cadr thing))
-             (:castclass "Symbol")
-             (:call "CilAssembler.GetSetfFunctionBySymbol")))))
+           (progn
+             ;; xref: #'(setf f) is an indirect-call reference, same edge as a call
+             (xref-record-call thing)
+             `(,@(compile-sym-lookup (cadr thing))
+               (:castclass "Symbol")
+               (:call "CilAssembler.GetSetfFunctionBySymbol"))))))
     ((symbolp thing)
      ;; Check local functions first
      (let ((local-fn (local-function-entry thing)))
@@ -4040,9 +4116,13 @@
            ;; correct package's symbol via compile-fn-sym-lookup. GetFunctionBySymbol
            ;; is authoritative (no cross-package fallback): unqualified #'sym resolves
            ;; via Startup.Sym's bare-name bridge at symbol-resolution time.
-           `(,@(compile-fn-sym-lookup thing)
-             (:castclass "Symbol")
-             (:call "CilAssembler.GetFunctionBySymbol")))))
+           (progn
+             ;; xref: #'f is an indirect-call reference (funcall/mapcar target),
+             ;; recorded as the same caller→callee edge as a direct call.
+             (xref-record-call thing)
+             `(,@(compile-fn-sym-lookup thing)
+               (:castclass "Symbol")
+               (:call "CilAssembler.GetFunctionBySymbol"))))))
     (t (error "FUNCTION: unsupported argument ~s" thing))))
 
 ;;;; Mini S-expression interpreter for compile-macrolet
@@ -4495,6 +4575,18 @@
                 (apply (symbol-function 'make-instance)
                        (mapcar (lambda (a) (%mini-eval a env)) (cdr form))))
                (t
+                ;; %DOTIMES-1+ is a compiler intrinsic emitted by dotcl's DOTIMES
+                ;; for a fixnum counter (an increment asserted to fit int64).
+                ;; compile-expr lowers it to a raw add, but the interpreter never
+                ;; sees a handler for it — so a macro body that uses DOTIMES and is
+                ;; expanded through %MINI-EVAL (e.g. the DO-FPRS assembler macro)
+                ;; would call %DOTIMES-1+ as an undefined function. The interpreter
+                ;; has no int64 assertion, so it is simply 1+. Match by name: the
+                ;; symbol may be DOTCL-INTERNAL:: or DOTCL.CIL-COMPILER:: depending
+                ;; on how it was interned at emit time.
+                (if (and (symbolp op) (string= (symbol-name op) "%DOTIMES-1+"))
+                    (return-from %mini-eval (1+ (%mini-eval (cadr form) env)))
+                    nil)
                 ;; Function call: a local binding, a symbol's function, a
                 ;; (setf name) function designator in operator position (e.g.
                 ;; the ((setf foo) v place) form setf expands to), or a
@@ -5255,13 +5347,19 @@
          ;; (mirrors compile-block). Eliding the per-iteration try is a large
          ;; win for hot loops (dotimes/do/loop → tagbody).
          (needs-catch (list nil))
+         ;; has-go: shared cell flagged by compile-go when ANY go targets this
+         ;; tagbody. Every go re-enters through the dispatch label below, so a
+         ;; flagged tagbody is a (potential) loop and gets an interrupt
+         ;; safepoint there; a straight-line tagbody (no go at all) does not.
+         (has-go (list nil))
          ;; Extended format: (tag-name tb-var-name tb-id-key label-idx index-key
-         ;;                    leave-label needs-catch). 5th/6th enable local go;
-         ;; 7th lets a captured non-local go flag this tagbody's needs-catch.
+         ;;                    leave-label needs-catch has-go). 5th/6th enable
+         ;; local go; 7th lets a captured non-local go flag this tagbody's
+         ;; needs-catch; 8th records that a go exists at all.
          (*cstate* (cstate-with *cstate* +cs-go-tags+
                      (append
                       (mapcar (lambda (ti) (list (car ti) tb-var-name tb-id-key (cdr ti)
-                                                 index-key loop-label needs-catch))
+                                                 index-key loop-label needs-catch has-go))
                               tag-indices)
                       (cstate-go-tags))))
          ;; Compile segments NOW so compile-go runs (and may flag needs-catch)
@@ -5271,7 +5369,13 @@
                              for label in seg-labels
                              append `((:label ,label)
                                       ,@(loop for form in (cdr seg)
-                                              append (compile-and-pop form)))))))
+                                              append (compile-and-pop form))))))
+         ;; Interrupt safepoint on the dispatch label = the shared back-edge of
+         ;; every loop this tagbody expresses. Only when a go exists (otherwise
+         ;; the tagbody runs straight through once) and the body is not
+         ;; declared (optimize (safety 0)).
+         (poll-instrs (when (and (car has-go) (not (cstate-no-safepoint)))
+                        '((:call "ConditionSystem.PollInterrupt")))))
     (if (or (car needs-catch)
             ;; tb-id-key referenced in the body ⇒ a non-local go's throw or a
             ;; closure capturing the tagbody id ⇒ the catch is required. This
@@ -5286,6 +5390,7 @@
           (:declare-local ,done-key "Boolean")
           (:ldc-i4 0) (:stloc ,done-key)
           (:label ,loop-label)
+          ,@poll-instrs
           (:ldloc ,done-key) (:brtrue ,end-label)
           (:begin-exception-block)
           (:ldloc ,index-key)
@@ -5318,6 +5423,7 @@
           (:declare-local ,done-key "Boolean")
           (:ldc-i4 0) (:stloc ,done-key)
           (:label ,loop-label)
+          ,@poll-instrs
           (:ldloc ,done-key) (:brtrue ,end-label)
           (:ldloc ,index-key)
           (:switch ,seg-labels)
@@ -5341,7 +5447,11 @@
           (label-idx (fourth entry))
           (local-index-key (fifth entry))
           (local-loop-label (sixth entry))
-          (needs-catch (seventh entry)))
+          (needs-catch (seventh entry))
+          (has-go (eighth entry)))
+      ;; Any go makes the target tagbody a potential loop → it places an
+      ;; interrupt safepoint on its dispatch label (see compile-tagbody).
+      (when has-go (setf (car has-go) t))
       (if (and local-index-key (not *in-finally-block*))
           ;; Local go: set index and leave try block — no exception
           `((:ldc-i4 ,label-idx)
@@ -5478,28 +5588,24 @@
       ;; Result local
       (:declare-local ,result-key "LispObject")
       ,@(emit-nil) (:stloc ,result-key)
-      ;; try-catch: body + exception dispatch
-      ;; PopCluster is done explicitly before handler body or on normal exit,
-      ;; NOT in a finally block. This ensures handler bodies run with the
-      ;; handler-case cluster already removed (per CL spec: handlers are
-      ;; executed after unwinding, outside the handler's dynamic scope).
+      ;; try-catch-FINALLY: body + exception dispatch. PopCluster lives in the finally
+      ;; so it runs on EVERY exit from the try (normal, matched-clause :leave, rethrow,
+      ;; and non-local :leave out of the body). Handler bodies still run with the
+      ;; cluster removed (per CL spec) because the :leave to a clause label runs the
+      ;; finally before the clause body executes.
       (:begin-exception-block)
       ;; Body in MV-propagating position: handler-case returns body's values (CL spec).
       ;; Self-TCO inside handler-case: use `leave` to exit the try block and prepend
       ;; PopCluster so each iteration has a clean handler stack.
       ,@(let ((*in-try-block* t)         ; protect: :ret invalid in try/catch region
               (*in-mv-context* t)
-              ;; When TCO is active, mark the try/catch context and prepend
-              ;; PopCluster to the leave-instrs so the self-call emits PopCluster
-              ;; before `leave TCOLOOP`.
+              ;; When TCO is active, mark the try/catch context so the self-call uses
+              ;; `leave TCOLOOP` instead of `ret`. The cluster PopCluster on that leave
+              ;; is now handled by the finally block (see below), so we no longer
+              ;; prepend it to the leave-instrs (doing so would double-pop).
               (*cstate* (cstate-with *cstate*
                           +cs-tco-in-try-catch+
-                          (if (cstate-tco-self-name) t (cstate-tco-in-try-catch))
-                          +cs-tco-leave-instrs+
-                          (if (cstate-tco-self-name)
-                              (cons '(:call "HandlerClusterStack.PopCluster")
-                                    (cstate-tco-leave-instrs))
-                              (cstate-tco-leave-instrs)))))
+                          (if (cstate-tco-self-name) t (cstate-tco-in-try-catch)))))
           (compile-expr body-form))
       (:stloc ,result-key)
       (:leave ,inner-end-label)
@@ -5527,8 +5633,7 @@
                        (:label ,ci-skip))) ;; within catch
       ;; Out-of-range clauseIndex falls through to nomatch
       (:label ,nomatch-hcex-label) ;; reached by: tag mismatch OR out-of-range index
-      (:call "HandlerClusterStack.PopCluster")
-      (:rethrow)
+      (:rethrow)  ;; finally pops the cluster
       ;; Catch 2: LispErrorException (fallback when Signal didn't find our cluster,
       ;;          or for LispErrors whose type doesn't match any clause)
       (:begin-catch-block "LispErrorException")
@@ -5545,8 +5650,7 @@
                        (:brfalse ,skip) ;; within catch: skip to next type check
                        (:leave ,label)  ;; exit catch to clause body after try-catch
                        (:label ,skip))) ;; within catch
-      (:call "HandlerClusterStack.PopCluster")
-      (:rethrow)
+      (:rethrow)  ;; finally pops the cluster
       ;; Catch 3: System.Exception (raw .NET exceptions not yet wrapped)
       (:begin-catch-block "System.Exception")
       (:declare-local ,dotnet-ex-key "System.Exception")
@@ -5568,15 +5672,23 @@
                        (:leave ,label)  ;; exit catch to clause body
                        (:label ,skip))) ;; within catch
       (:label ,dn-rethrow-label)
+      (:rethrow)  ;; finally pops the cluster
+      ;; Finally: pop the cluster on EVERY exit from the try — normal completion, a
+      ;; matched-clause :leave, a no-match rethrow, AND a non-local :leave
+      ;; (return-from / go) out of the body. The old code popped only on the catch
+      ;; and normal-exit paths, so a :leave *through the body* leaked the handler
+      ;; cluster; a later signal then fired the stale handler and threw
+      ;; HandlerCaseInvocationException past this frame (the make-host-2 irrat crash).
+      ;; Clauses still run outside the cluster: the :leave to a clause label runs the
+      ;; finally (pop) before the clause body executes.
+      (:begin-finally-block)
       (:call "HandlerClusterStack.PopCluster")
-      (:rethrow)
-      (:end-exception-block) ;; end try-catch
-      ;; Normal exit: PopCluster and jump to end
+      (:end-exception-block) ;; end try-catch-finally
+      ;; Normal exit: finally already popped; jump to end
       (:label ,inner-end-label)
-      (:call "HandlerClusterStack.PopCluster")
       (:br ,outer-end-label)
-      ;; Clause bodies (AFTER try-catch, outside exception block)
-      ;; PopCluster before executing handler body per CL spec.
+      ;; Clause bodies (AFTER try-catch, outside exception block). The cluster was
+      ;; already popped by the finally when the catch did :leave to the clause label.
       ,@(loop for (type-spec var handler-body) in parsed
               for label in clause-labels
               append (multiple-value-bind (declared-specials real-body)
@@ -5606,7 +5718,8 @@
                          (let ((var-key (if (and var (not var-is-special))
                                             (lookup-local var) nil)))
                            `((:label ,label)
-                             (:call "HandlerClusterStack.PopCluster")
+                             ;; cluster already popped by the finally on the catch's
+                             ;; :leave to this clause label (was a manual pop here)
                              ,@(cond
                                  (var-is-special
                                   ;; Bind as special (dynamic) variable with try/finally.
@@ -5782,13 +5895,19 @@
                          (:brfalse ,skip)  ;; skip if not matching (within catch)
                          (:leave ,label)   ;; exit catch to clause body
                          (:label ,skip)))) ;; within catch
-      ;; No match → PopCluster + rethrow
-      (:call "RestartClusterStack.PopCluster")
+      ;; No match → rethrow; the finally pops the cluster.
       (:rethrow)
-      (:end-exception-block)
-      ;; Normal exit: PopCluster and jump to done
-      (:label ,try-end-label)
+      ;; Finally: pop the cluster on EVERY exit from the try — normal completion,
+      ;; a matched-restart :leave to a clause, a no-match rethrow, AND a non-local
+      ;; transfer (return-from / throw / go) out of the body. The old code popped
+      ;; only on the normal-exit and rethrow paths, so a non-local exit *through the
+      ;; body* leaked the restart cluster. SBCL's compile-file body does exactly
+      ;; that, leaking one RECOMPILE cluster per stem in the make-host-2 XC build.
+      (:begin-finally-block)
       (:call "RestartClusterStack.PopCluster")
+      (:end-exception-block)
+      ;; Normal exit: finally already popped; jump to done (skip clause bodies).
+      (:label ,try-end-label)
       (:br ,done-label)
       ;; Clause bodies (AFTER try-catch, with PopCluster before handler body)
       ,@(loop for (name params handler-body report interactive name-sym test-fn) in parsed
@@ -5888,14 +6007,15 @@
                                              (:stloc ,var-key))
                                            param-bindings)))))
                              `((:label ,label)
-                               (:call "RestartClusterStack.PopCluster")
+                               ;; cluster already popped by the finally on the
+                               ;; catch's :leave to this clause label
                                ,@(apply #'append (nreverse param-bindings))
                                ,@(compile-progn effective-body)
                                (:stloc ,result-key)
                                (:br ,done-label))))
                          ;; No parameter
                          `((:label ,label)
-                           (:call "RestartClusterStack.PopCluster")
+                           ;; cluster already popped by the finally (see above)
                            ,@(compile-progn handler-body)
                            (:stloc ,result-key)
                            (:br ,done-label))))

@@ -37,10 +37,9 @@ bench-state.json
 # …but committed tooling scripts are kept.
 !scripts/ilverify-check.sh
 !scripts/build-quicklisp.sh
+!scripts/contrib-resolve.sh
 !samples/**/*.sh
-!test/debug-pdb/check.sh
-!test/pack-nuspec/check.sh
-!test/save-class-lib/check.sh
+!test/*/check.sh
 
 ## qlot (dependency management)
 qlfile

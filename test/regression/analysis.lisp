@@ -368,3 +368,45 @@
                    form)))
       (make-deep-nest 150)))
   42)
+
+;;; ============================================================
+;;; Binding-name positions must not be macroexpanded
+;;; ============================================================
+;;; A lambda-list parameter (or LET variable) whose name happens to name a
+;;; macro is a binding occurrence, not a call. The compiler's return-from
+;;; scanner and mutation/capture walk must not macroexpand it: doing so fires
+;;; the macro's compile-time side effects. SBCL's assembler INST macro is one
+;;; real case — modarith.lisp has (labels ((commutativep (inst) ...)) ...), and
+;;; INST WARNs on an undefined mnemonic, which set compile-file failure-p.
+
+(defvar *bindpos-expand-count* 0)
+
+(defmacro bindpos-marker (&rest args)
+  (declare (ignore args))
+  (incf *bindpos-expand-count*)
+  ''expanded)
+
+;; labels param named after the macro — a binding, never called.
+(defun bindpos-labels (x)
+  (labels ((pick (bindpos-marker) (list bindpos-marker)))
+    (pick x)))
+
+;; flet param named after the macro.
+(defun bindpos-flet (x)
+  (flet ((pick (bindpos-marker) (list bindpos-marker)))
+    (pick x)))
+
+;; let variable named after the macro.
+(defun bindpos-let (x)
+  (let ((bindpos-marker x)) (list bindpos-marker)))
+
+;; The three functions above were compiled at file-load time. The macro must
+;; not have expanded during any of those compiles.
+(deftest bindpos-no-spurious-expansion
+  *bindpos-expand-count*
+  0)
+
+;; And they behave correctly — the name is an ordinary binding.
+(deftest bindpos-labels-result (bindpos-labels 'a) (a))
+(deftest bindpos-flet-result (bindpos-flet 'b) (b))
+(deftest bindpos-let-result (bindpos-let 'c) (c))

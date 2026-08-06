@@ -4,6 +4,6 @@
        library (DotCL.Runtime.csproj) — inherit this <Version> via MSBuild's automatic
        Directory.Build.props import. Bump the release version HERE only. -->
   <PropertyGroup>
-    <Version>0.1.22</Version>
+    <Version>0.1.23</Version>
   </PropertyGroup>
 </Project>

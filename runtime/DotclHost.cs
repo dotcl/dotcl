@@ -152,32 +152,70 @@ public static class DotclHost
             }
         }
 
-        var source = System.IO.File.ReadAllText(filePath);
-        var reader = new Reader(new System.IO.StringReader(source));
+        RunCoreSil(System.IO.File.ReadAllText(filePath), filePath);
+    }
 
-        if (!reader.TryRead(out var instrList))
-            throw new InvalidOperationException($"Empty core file: {filePath}");
+    /// <summary>
+    /// Load and execute a compiled core already in memory. Same two formats as
+    /// <see cref="LoadCore(string)"/> — a FASL PE assembly (the "MZ" header) or SIL
+    /// text — for a host with no filesystem to read from. A browser fetches the core
+    /// over HTTP and hands the bytes straight here; there is no path to open.
+    ///
+    /// The PE form goes through Assembly.Load(byte[]), so the module has no file
+    /// Location. That is the only option without a filesystem, and it is why this is
+    /// an overload rather than a replacement: the path version keeps LoadFrom, whose
+    /// file-backed module is what tools selecting per loaded module can see.
+    ///
+    /// The SIL text form still needs Reflection.Emit to assemble, so on an emit-free
+    /// build the core has to be the FASL form.
+    /// </summary>
+    public static void LoadCore(byte[] coreImage)
+    {
+        if (coreImage == null || coreImage.Length == 0)
+            throw new ArgumentException("LoadCore: the core image is empty", nameof(coreImage));
+        _coreLoaded = true;
 
-        var packageSym = Startup.Sym("*PACKAGE*");
-        var oldPackage = DynamicBindings.Get(packageSym);
-        try { Emitter.CilAssembler.AssembleAndRun(instrList); }
-        finally { DynamicBindings.Set(packageSym, oldPackage); }
+        if (coreImage.Length >= 2 && coreImage[0] == 0x4D && coreImage[1] == 0x5A)
+        {
+            RunCoreModuleInit(System.Reflection.Assembly.Load(coreImage), "FASL core (in memory)");
+            return;
+        }
+
+        var source = System.Text.Encoding.UTF8.GetString(coreImage);
+        RunCoreSil(source, "core (in memory)");
     }
 
     private static void LoadCoreFasl(string filePath)
+        => RunCoreModuleInit(System.Reflection.Assembly.LoadFrom(filePath), $"FASL core {filePath}");
+
+    /// <summary>Call a loaded core assembly's CompiledModule.ModuleInit, restoring
+    /// *PACKAGE* afterwards. WHAT names the core in errors.</summary>
+    private static void RunCoreModuleInit(System.Reflection.Assembly asm, string what)
     {
-        var asm = System.Reflection.Assembly.LoadFrom(filePath);
         var t = asm.GetType("CompiledModule")
             ?? throw new InvalidOperationException(
-                $"FASL core {filePath}: CompiledModule type not found");
+                $"{what}: CompiledModule type not found");
         var mi = t.GetMethod("ModuleInit",
                 BindingFlags.Public | BindingFlags.Static)
             ?? throw new InvalidOperationException(
-                $"FASL core {filePath}: ModuleInit method not found");
+                $"{what}: ModuleInit method not found");
 
         var packageSym = Startup.Sym("*PACKAGE*");
         var oldPackage = DynamicBindings.Get(packageSym);
         try { mi.Invoke(null, null); }
+        finally { DynamicBindings.Set(packageSym, oldPackage); }
+    }
+
+    /// <summary>Assemble and run SIL core text, restoring *PACKAGE* afterwards.</summary>
+    private static void RunCoreSil(string source, string what)
+    {
+        var reader = new Reader(new System.IO.StringReader(source));
+        if (!reader.TryRead(out var instrList))
+            throw new InvalidOperationException($"Empty core file: {what}");
+
+        var packageSym = Startup.Sym("*PACKAGE*");
+        var oldPackage = DynamicBindings.Get(packageSym);
+        try { Emitter.CilAssembler.AssembleAndRun(instrList); }
         finally { DynamicBindings.Set(packageSym, oldPackage); }
     }
 

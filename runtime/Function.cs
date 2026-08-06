@@ -254,8 +254,8 @@ public class LispFunction : LispObject
     {
         if (++_stackCheckCounter % 256 == 0)
         {
-            if (!Compat.TryEnsureSufficientExecutionStack())
-                throw new LispErrorException(new LispProgramError(
+            if (!Compat.TryEnsureSufficientExecutionStackWithMargin())
+                throw new LispErrorException(new LispStorageCondition(
                     $"Stack overflow in function {Name ?? "anonymous"}"));
             ConditionSystem.CheckInterrupt();
         }
@@ -270,8 +270,8 @@ public class LispFunction : LispObject
     {
         if (++_stackCheckCounter % 256 == 0)
         {
-            if (!Compat.TryEnsureSufficientExecutionStack())
-                throw new LispErrorException(new LispProgramError(
+            if (!Compat.TryEnsureSufficientExecutionStackWithMargin())
+                throw new LispErrorException(new LispStorageCondition(
                     $"Stack overflow in function {Name ?? "anonymous"}"));
             ConditionSystem.CheckInterrupt();
         }

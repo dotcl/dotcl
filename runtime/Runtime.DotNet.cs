@@ -85,8 +85,28 @@ public static partial class Runtime
             nuint nu => (ulong)nu <= long.MaxValue
                 ? Fixnum.Make((long)nu)
                 : (LispObject)Bignum.MakeInteger((System.Numerics.BigInteger)(ulong)nu),
+            // BigInteger is the CLR's arbitrary-precision integer and CL's integer
+            // type is unbounded, so it maps onto the standard tower exactly — no
+            // extension value escapes. Without this a BigInteger result is an opaque
+            // wrapper that numberp/arithmetic reject.
+            System.Numerics.BigInteger bi => Bignum.MakeInteger(bi),
+#if NET7_0_OR_GREATER
+            // Int128/UInt128 are fixed-width VIEWS of values the CL tower already
+            // holds exactly, so they read as ordinary integers — no extension value
+            // escapes. What is distinct about them (width, overflow, unboxed
+            // storage) lives on the .NET side of the boundary, not in the value.
+            Int128 i128 => Bignum.MakeInteger((System.Numerics.BigInteger)i128),
+            UInt128 u128 => Bignum.MakeInteger((System.Numerics.BigInteger)u128),
+#endif
             double d => new DoubleFloat(d),
             float f => new DoubleFloat(f),
+#if NET5_0_OR_GREATER
+            // Half is a 16-bit IEEE float; single-float is the narrowest CL format
+            // that holds every one of its values exactly, so the widening loses
+            // nothing. Like Int128, what is distinct about Half (storage width,
+            // interop layout) stays on the .NET side — no new Lisp float format.
+            Half h => new SingleFloat((float)h),
+#endif
             // Preserve decimal as a first-class scale-keeping value (not a normalized
             // rational, which would drop trailing zeros / the .NET-specific scale).
             decimal m => new LispDecimal(m),
@@ -305,7 +325,8 @@ public static partial class Runtime
             System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(inner).Throw();
         return new LispErrorException(new LispError($"{context}: {inner?.Message ?? tie.Message}")
         {
-            ClrExceptionType = inner?.GetType()
+            ClrExceptionType = inner?.GetType(),
+            ClrException = inner
         });
     }
 
@@ -321,7 +342,7 @@ public static partial class Runtime
             Startup.DebugStacktrace && !string.IsNullOrEmpty(ex.StackTrace)
                 ? ex.Message + "\n[.NET " + ex.GetType().Name + "]\n" + ex.StackTrace
                 : ex.Message)
-        { ClrExceptionType = ex.GetType() };
+        { ClrExceptionType = ex.GetType(), ClrException = ex };
     }
 
     private static LispObject InvokeWithEnv1(LispFunction fn, LispObject arg,
@@ -680,6 +701,116 @@ public static partial class Runtime
         return new LispDotNetObject(tcs.Task);
     }
 
+    // Platform-width bounds for nint/nuint, as the widest signed 64-bit value that
+    // can still be represented — a long never exceeds nuint's real maximum on a
+    // 64-bit process, so clamping the check at long.MaxValue there is exact.
+    private static readonly long NIntMin = IntPtr.Size == 8 ? long.MinValue : int.MinValue;
+    private static readonly long NIntMax = IntPtr.Size == 8 ? long.MaxValue : int.MaxValue;
+    private static readonly long NUIntMax = IntPtr.Size == 8 ? long.MaxValue : uint.MaxValue;
+
+    private static long IntegerFits(long v, long min, long max, Type targetType, LispObject arg)
+    {
+        if (v < min || v > max)
+            throw new LispErrorException(new LispTypeError(
+                $"integer out of System.{targetType.Name} range", arg, Startup.Sym("INTEGER")));
+        return v;
+    }
+
+    /// <summary>Marshal a CL integer into a fixed-width CLR integer parameter, signalling a
+    /// Lisp type-error when it does not fit instead of wrapping silently (an unchecked
+    /// (byte)300 is 44 — a store that looks like it worked). Returns null when targetType is
+    /// not a fixed-width integer, so the caller goes on to try float/decimal/object.
+    ///
+    /// A SIGNED target also accepts the value written as an unsigned N-bit pattern and
+    /// reinterprets it: CL has no way to write a negative bit pattern, so (ldb (byte 32 0) x)
+    /// — the idiomatic name for 32 bits — is always non-negative, and that is exactly what
+    /// callers hand to BitConverter.Int32BitsToSingle and friends. Unsigned targets stay
+    /// strict, because (ldb ...) already produces non-negative values there and a negative
+    /// argument is far likelier to be a mistake than a request for all-ones. A value that
+    /// fits the width in NEITHER form is still an error, so (byte)300 stays rejected.</summary>
+    private static object? IntegerToFixedWidth(long v, Type targetType, LispObject arg)
+    {
+        if (targetType == typeof(int)) return unchecked((int)IntegerFits(v, int.MinValue, uint.MaxValue, targetType, arg));
+        if (targetType == typeof(long)) return v;
+        if (targetType == typeof(uint)) return (uint)IntegerFits(v, uint.MinValue, uint.MaxValue, targetType, arg);
+        if (targetType == typeof(ulong)) return (ulong)IntegerFits(v, 0, long.MaxValue, targetType, arg);
+        if (targetType == typeof(short)) return unchecked((short)IntegerFits(v, short.MinValue, ushort.MaxValue, targetType, arg));
+        if (targetType == typeof(ushort)) return (ushort)IntegerFits(v, ushort.MinValue, ushort.MaxValue, targetType, arg);
+        if (targetType == typeof(byte)) return (byte)IntegerFits(v, byte.MinValue, byte.MaxValue, targetType, arg);
+        if (targetType == typeof(sbyte)) return unchecked((sbyte)IntegerFits(v, sbyte.MinValue, byte.MaxValue, targetType, arg));
+        if (targetType == typeof(nint)) return unchecked((nint)IntegerFits(v, NIntMin, NIntMax, targetType, arg));
+        if (targetType == typeof(nuint)) return (nuint)IntegerFits(v, 0, NUIntMax, targetType, arg);
+#if NET7_0_OR_GREATER
+        if (targetType == typeof(Int128)) return (Int128)v;
+        if (targetType == typeof(UInt128)) return (UInt128)IntegerFits(v, 0, long.MaxValue, targetType, arg);
+#endif
+        return null;
+    }
+
+    /// <summary>Same, for an integer too wide for a fixnum. Only the unsigned 64-bit
+    /// targets can hold one; every other fixed-width target is out of range by
+    /// construction and says so rather than silently truncating.</summary>
+    private static object? IntegerToFixedWidth(System.Numerics.BigInteger v, Type targetType, LispObject arg)
+    {
+        if (v >= long.MinValue && v <= long.MaxValue)
+            return IntegerToFixedWidth((long)v, targetType, arg);
+        bool unsigned64 = targetType == typeof(ulong)
+                          || (targetType == typeof(nuint) && IntPtr.Size == 8);
+        if (unsigned64 && v.Sign > 0 && v <= UInt64MaxInt)
+            return targetType == typeof(ulong) ? (object)(ulong)v : (nuint)(ulong)v;
+        // Signed 64-bit targets take the unsigned 64-bit pattern too — the same
+        // reinterpretation the long overload does for the narrower widths, which is
+        // how (ldb (byte 64 0) x) reaches BitConverter.Int64BitsToDouble.
+        bool signed64 = targetType == typeof(long)
+                        || (targetType == typeof(nint) && IntPtr.Size == 8);
+        if (signed64 && v.Sign > 0 && v <= UInt64MaxInt)
+        {
+            long reinterpreted = unchecked((long)(ulong)v);
+            return targetType == typeof(long) ? (object)reinterpreted : (nint)reinterpreted;
+        }
+#if NET7_0_OR_GREATER
+        if (targetType == typeof(Int128))
+        {
+            var fitted = BigIntegerFits(v, Int128MinInt, UInt128MaxInt, targetType, arg);
+            // Above Int128.MaxValue the caller wrote the unsigned 128-bit pattern.
+            return fitted > Int128MaxInt ? unchecked((Int128)(UInt128)fitted) : (Int128)fitted;
+        }
+        if (targetType == typeof(UInt128))
+            return (UInt128)BigIntegerFits(v, 0, UInt128MaxInt, targetType, arg);
+#endif
+        // Signal only for targets this method owns; anything else falls through so
+        // the caller can keep trying (BigInteger, decimal, object, …).
+        if (IntegerToFixedWidthOwns(targetType))
+            throw new LispErrorException(new LispTypeError(
+                $"integer out of System.{targetType.Name} range", arg, Startup.Sym("INTEGER")));
+        return null;
+    }
+
+    private static readonly System.Numerics.BigInteger UInt64MaxInt = ulong.MaxValue;
+#if NET7_0_OR_GREATER
+    private static readonly System.Numerics.BigInteger Int128MinInt = (System.Numerics.BigInteger)Int128.MinValue;
+    private static readonly System.Numerics.BigInteger Int128MaxInt = (System.Numerics.BigInteger)Int128.MaxValue;
+    private static readonly System.Numerics.BigInteger UInt128MaxInt = (System.Numerics.BigInteger)UInt128.MaxValue;
+#endif
+
+    private static System.Numerics.BigInteger BigIntegerFits(
+        System.Numerics.BigInteger v, System.Numerics.BigInteger min, System.Numerics.BigInteger max,
+        Type targetType, LispObject arg)
+    {
+        if (v < min || v > max)
+            throw new LispErrorException(new LispTypeError(
+                $"integer out of System.{targetType.Name} range", arg, Startup.Sym("INTEGER")));
+        return v;
+    }
+
+    private static bool IntegerToFixedWidthOwns(Type t) =>
+        t == typeof(int) || t == typeof(long) || t == typeof(uint) || t == typeof(ulong)
+        || t == typeof(short) || t == typeof(ushort) || t == typeof(byte) || t == typeof(sbyte)
+#if NET7_0_OR_GREATER
+        || t == typeof(Int128) || t == typeof(UInt128)
+#endif
+        || t == typeof(nint) || t == typeof(nuint);
+
     /// <summary>Convert a LispObject to a .NET type based on target parameter type.</summary>
     public static object? LispToDotNet(LispObject arg, Type targetType)
     {
@@ -730,39 +861,43 @@ public static partial class Runtime
         // Fixnum → numeric types
         if (arg is Fixnum fx)
         {
-            if (targetType == typeof(int)) return (int)fx.Value;
-            if (targetType == typeof(long)) return fx.Value;
+            // The small integer types are symmetric with DotNetToLisp's read side:
+            // without them a (setf (aref a i) n) into a sbyte[]/ushort[]/uint[]/…
+            // (dotnet:make-array store) fails with "Cannot convert Fixnum to SByte".
+            var narrowed = IntegerToFixedWidth(fx.Value, targetType, arg);
+            if (narrowed != null) return narrowed;
             if (targetType == typeof(double)) return (double)fx.Value;
             if (targetType == typeof(float)) return (float)fx.Value;
-            if (targetType == typeof(short)) return (short)fx.Value;
-            if (targetType == typeof(byte)) return (byte)fx.Value;
-            // The remaining small integer types, symmetric with DotNetToLisp's read
-            // side: without these a (setf (aref a i) n) into a sbyte[]/ushort[]/uint[]/…
-            // (dotnet:make-array store) fails with "Cannot convert Fixnum to SByte".
-            if (targetType == typeof(sbyte)) return (sbyte)fx.Value;
-            if (targetType == typeof(ushort)) return (ushort)fx.Value;
-            if (targetType == typeof(uint)) return (uint)fx.Value;
-            if (targetType == typeof(ulong)) return (ulong)fx.Value;
-            if (targetType == typeof(nint)) return (nint)fx.Value;
-            if (targetType == typeof(nuint)) return (nuint)fx.Value;
+#if NET5_0_OR_GREATER
+            if (targetType == typeof(Half)) return (Half)(float)fx.Value;
+#endif
             if (targetType == typeof(decimal)) return (decimal)fx.Value;
+            if (targetType == typeof(System.Numerics.BigInteger))
+                return new System.Numerics.BigInteger(fx.Value);
             if (targetType == typeof(object)) return fx.Value;
         }
 
-        // DoubleFloat → double/float
+        // DoubleFloat → double/float/Half. Narrowing to float/Half rounds to nearest
+        // and overflows to an infinity, exactly as the corresponding C# cast does.
         if (arg is DoubleFloat df)
         {
             if (targetType == typeof(double)) return df.Value;
             if (targetType == typeof(float)) return (float)df.Value;
+#if NET5_0_OR_GREATER
+            if (targetType == typeof(Half)) return (Half)df.Value;
+#endif
             if (targetType == typeof(decimal)) return (decimal)df.Value;
             if (targetType == typeof(object)) return df.Value;
         }
 
-        // SingleFloat → float/double
+        // SingleFloat → float/double/Half
         if (arg is SingleFloat sf)
         {
             if (targetType == typeof(float)) return sf.Value;
             if (targetType == typeof(double)) return (double)sf.Value;
+#if NET5_0_OR_GREATER
+            if (targetType == typeof(Half)) return (Half)sf.Value;
+#endif
             if (targetType == typeof(decimal)) return (decimal)sf.Value;
             if (targetType == typeof(object)) return sf.Value;
         }
@@ -774,6 +909,18 @@ public static partial class Runtime
             if (targetType == typeof(double)) return (double)ld.Value;
             if (targetType == typeof(float)) return (float)ld.Value;
             if (targetType == typeof(object)) return ld.Value;
+        }
+
+        // Bignum → BigInteger: the exact counterpart of the read side, so an integer
+        // too wide for a fixnum can be passed into a BigInteger-typed parameter.
+        if (arg is Bignum bnB)
+        {
+            if (targetType == typeof(System.Numerics.BigInteger)) return bnB.Value;
+            // …and into a fixed-width one it still fits. A ulong/nuint above
+            // long.MaxValue comes back OUT of .NET as a bignum, so without this a
+            // value an API just returned cannot be passed back IN.
+            var wide = IntegerToFixedWidth(bnB.Value, targetType, arg);
+            if (wide != null) return wide;
         }
 
         // Bignum / Ratio → decimal: exact-or-throw, so a computed CL real can be passed to
@@ -1829,8 +1976,31 @@ public static partial class Runtime
     /// Read-side entry point for instance methods, properties, fields, and
     /// COM IDispatch members. Type.InvokeMember on the runtime type routes
     /// transparently for both managed and __ComObject targets.</summary>
+    // Interop frames (marshalling + reflection / delegate dispatch) are far
+    // fatter than plain Lisp calls, so a delegate-callback recursion can burn
+    // through the whole 256-call periodic-check window and die as a fatal
+    // StackOverflowException. Worse, the DEEP margin matters here: after the
+    // condition is thrown, every interop level catches and rethrows
+    // (TargetInvocationException unwrap), and .NET's managed exception
+    // dispatch (EH.DispatchEx) runs on the remaining stack — with only the
+    // fixed probe's headroom the DISPATCH itself overflows. So every 16th
+    // interop call runs the margined probe (~256KB headroom, room for signal
+    // + EH dispatch); the other 15 run the cheap fixed probe as a backstop.
+    // 16 levels of interop frames stay well under the margin.
+    [ThreadStatic] private static int s_interopStackCheckCounter;
+
+    private static void InteropStackCheck()
+    {
+        if ((++s_interopStackCheckCounter & 15) == 0
+                ? !Compat.TryEnsureSufficientExecutionStackWithMargin()
+                : !Compat.TryEnsureSufficientExecutionStack())
+            throw new LispErrorException(new LispStorageCondition(
+                "Stack overflow in dotnet:invoke"));
+    }
+
     public static LispObject DotNetInvoke(LispObject[] args)
     {
+        InteropStackCheck();
         if (args.Length < 2)
             throw new LispErrorException(new LispProgramError(
                 "DOTNET:INVOKE: requires at least 2 arguments (object member-name &rest args)"));
@@ -2100,11 +2270,24 @@ public static partial class Runtime
             type = ResolveDotNetType(typeName);
         }
 
+        // A ctor body's throw reaches us as TargetInvocationException (from
+        // ConstructorInfo.Invoke and Activator.CreateInstance alike); unwrap it
+        // like dotnet:invoke does so the condition carries the inner exception's
+        // CLR type and message instead of the reflection wrapper's.
+        object Construct(Func<object?> invoke)
+        {
+            try { return invoke()!; }
+            catch (System.Reflection.TargetInvocationException tie)
+            {
+                throw DotNetInvokeError($"DOTNET:NEW {type.Name}", tie);
+            }
+        }
+
         if (args.Length == 1)
         {
             // A true parameterless ctor (value types always have one).
             if (type.IsValueType || type.GetConstructor(Type.EmptyTypes) != null)
-                return new LispDotNetObject(Activator.CreateInstance(type)!);
+                return new LispDotNetObject(Construct(() => Activator.CreateInstance(type)));
             // Otherwise fall back to an all-optional ctor, supplying its defaults —
             // C#'s `new T()` does the same (e.g. FluentTheme(Uri? baseUri = null)).
             var optCtor = type.GetConstructors()
@@ -2117,10 +2300,10 @@ public static partial class Runtime
                 var defaults = new object?[ps.Length];
                 for (int i = 0; i < ps.Length; i++)
                     defaults[i] = ps[i].HasDefaultValue ? ps[i].DefaultValue : Type.Missing;
-                return new LispDotNetObject(optCtor.Invoke(defaults)!);
+                return new LispDotNetObject(Construct(() => optCtor.Invoke(defaults)));
             }
             // No usable ctor — let Activator throw its descriptive error.
-            return new LispDotNetObject(Activator.CreateInstance(type)!);
+            return new LispDotNetObject(Construct(() => Activator.CreateInstance(type)));
         }
 
         var lispArgs = args.Skip(1).ToArray();
@@ -2177,7 +2360,7 @@ public static partial class Runtime
         for (int i = lispArgs.Length; i < paramTypes.Length; i++)
             convertedArgs[i] = paramTypes[i].HasDefaultValue ? paramTypes[i].DefaultValue : Type.Missing;
 
-        var instance = ctor.Invoke(convertedArgs);
+        var instance = Construct(() => ctor.Invoke(convertedArgs));
         return new LispDotNetObject(instance);
     }
 
@@ -3043,6 +3226,14 @@ public static partial class Runtime
             ? new LispDotNetObject(ct) : Nil.Instance;
 
     /// <summary>
+    /// <lispdoc>(dotnet:exception-object condition) -- For a condition that wraps a raw .NET exception, return the exception instance itself as a .NET object, so a handler can read detail the message loses: type-specific properties (e.g. SocketException.SocketErrorCode) or the InnerException chain (e.g. the SocketException inside the IOException a stream read timeout raises). Returns NIL for an ordinary Lisp condition.</lispdoc>
+    /// </summary>
+    [LispDoc("DOTNET:EXCEPTION-OBJECT")]
+    public static LispObject DotNetExceptionObject(LispObject arg)
+        => arg is LispCondition lc && lc.ClrException is Exception ex
+            ? new LispDotNetObject(ex) : Nil.Instance;
+
+    /// <summary>
     /// <lispdoc>(dotnet:exception-typep condition type) -- Return T if CONDITION wraps a raw .NET exception whose CLR type is TYPE or a subtype of it (Type.IsAssignableFrom), else NIL. TYPE is a type-name string/symbol or System.Type. This is the matcher dotnet:handler-bind uses. (dotcl/dotcl#45)</lispdoc>
     /// </summary>
     [LispDoc("DOTNET:EXCEPTION-TYPEP")]
@@ -3457,9 +3648,10 @@ public static partial class Runtime
     }
 
     /// <summary>
-    /// <lispdoc>(dotnet:call-out type-or-obj "Method" &amp;rest in-args) -- Call a .NET method that has out/ref parameters. type-or-obj is a type-name string for static calls, or a .NET object for instance calls. in-args supplies only the non-out parameters. Returns multiple values: the method's return value (T for void), followed by each out/ref parameter value in declaration order. Example: (multiple-value-bind (ok n) (dotnet:call-out "System.Int32" "TryParse" "42") ...)</lispdoc>
+    /// <lispdoc>(dotnet:call-out type-or-obj "Method" &amp;rest in-args) -- Call a .NET method that has out/ref parameters. type-or-obj is a type-name string for static calls, or a .NET object for instance calls. in-args supplies every parameter except the out ones; a ref parameter is in-out, so pass its initial value (e.g. the EndPoint for Socket.ReceiveFrom). Returns multiple values: the method's return value (T for void), followed by each out/ref parameter value in declaration order. Example: (multiple-value-bind (ok n) (dotnet:call-out "System.Int32" "TryParse" "42") ...)</lispdoc>
     /// Invoke a .NET static or instance method that has <c>out</c>/<c>ref</c> parameters.
-    /// Supply only the in (non-out) arguments from Lisp; out positions are filled automatically.
+    /// Supply every argument except <c>out</c> positions from Lisp (a <c>ref</c>
+    /// parameter is in-out: pass its initial value); out positions are filled automatically.
     /// Returns multiple values: return-value (T for void) followed by each out/ref value.
     /// </summary>
     [LispDoc("DOTNET:CALL-OUT")]
@@ -3506,7 +3698,11 @@ public static partial class Runtime
         for (int i = 0; i < paramInfos.Length; i++)
         {
             var p = paramInfos[i];
-            if (p.IsOut || (p.ParameterType.IsByRef && !p.IsIn))
+            // Only a true `out` param is caller-invisible. A plain `ref` param is
+            // in-out: the caller must supply its initial value (Socket.ReceiveFrom's
+            // ref EndPoint). Treating ref as out shifted the remaining in-args into
+            // the wrong parameter slots → "Object must implement IConvertible".
+            if (p.IsOut)
             {
                 callArgs[i] = null; // placeholder; filled by .NET on return
             }
@@ -3544,13 +3740,15 @@ public static partial class Runtime
             .Where(m => m.Name == name)
             .FirstOrDefault(m => {
                 var ps = m.GetParameters();
-                var inCount = ps.Count(p => !p.IsOut && !(p.ParameterType.IsByRef && !p.IsIn));
+                // ref params count as in (their initial value is supplied); only
+                // true out params are excluded.
+                var inCount = ps.Count(p => !p.IsOut);
                 return inCount == inArgCount;
             });
     }
 
     /// <summary>
-    /// <lispdoc>(dotnet:call-out-generic type-or-obj "Method" type-args-list &amp;rest in-args) -- Call a generic .NET method that has out/ref parameters. Combines generic type-argument instantiation (MakeGenericMethod) with out/ref handling: type-or-obj is a type-name string for static calls or a .NET object for instance calls; type-args-list is a Lisp list of type-name strings; in-args supplies only the non-out parameters. Returns multiple values: the method's return value (T for void) followed by each out/ref parameter value in declaration order. Example: (multiple-value-bind (ok day) (dotnet:call-out-generic "System.Enum" "TryParse" '("System.DayOfWeek") "Monday") ...)</lispdoc>
+    /// <lispdoc>(dotnet:call-out-generic type-or-obj "Method" type-args-list &amp;rest in-args) -- Call a generic .NET method that has out/ref parameters. Combines generic type-argument instantiation (MakeGenericMethod) with out/ref handling: type-or-obj is a type-name string for static calls or a .NET object for instance calls; type-args-list is a Lisp list of type-name strings; in-args supplies every parameter except the out ones (a ref parameter is in-out: pass its initial value). Returns multiple values: the method's return value (T for void) followed by each out/ref parameter value in declaration order. Example: (multiple-value-bind (ok day) (dotnet:call-out-generic "System.Enum" "TryParse" '("System.DayOfWeek") "Monday") ...)</lispdoc>
     /// Generic counterpart of dotnet:call-out: resolve an open generic method
     /// definition with explicit type arguments (MakeGenericMethod), then invoke it
     /// handling out/ref parameters like call-out. This is the combined
@@ -3594,15 +3792,16 @@ public static partial class Runtime
         }
 
         // Find the open generic method definition: name + generic arity + in-param count.
-        // in-param count excludes out and by-ref-out parameters (same rule as call-out),
-        // and is computed on the OPEN definition (IsByRef/IsOut are visible there).
+        // in-param count excludes only true out parameters (same rule as call-out:
+        // a ref parameter is in-out and consumes an in-arg), and is computed on
+        // the OPEN definition (IsByRef/IsOut are visible there).
         var methodDef = type.GetMethods(flags)
             .Where(m => m.Name == memberName
                      && m.IsGenericMethodDefinition
                      && m.GetGenericArguments().Length == typeArgNames.Count)
             .FirstOrDefault(m => {
                 var ps = m.GetParameters();
-                var inCount = ps.Count(p => !p.IsOut && !(p.ParameterType.IsByRef && !p.IsIn));
+                var inCount = ps.Count(p => !p.IsOut);
                 return inCount == lispInArgs.Length;
             })
             ?? throw new LispErrorException(new LispError(
@@ -3624,7 +3823,9 @@ public static partial class Runtime
         for (int i = 0; i < paramInfos.Length; i++)
         {
             var p = paramInfos[i];
-            if (p.IsOut || (p.ParameterType.IsByRef && !p.IsIn))
+            // Same rule as call-out: only true out params are placeholders; a
+            // plain ref param is in-out and takes the supplied initial value.
+            if (p.IsOut)
                 callArgs[i] = null; // placeholder; filled by .NET on return
             else
             {

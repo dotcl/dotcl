@@ -569,3 +569,101 @@ b")
   (handler-case (progn (stream-element-type 42) :no-error)
     (error () :errored))
   :errored)
+
+;;; Binary gray streams must be accepted wherever character ones are. The
+;;; force-output / finish-output / clear-output trampoline (and clear-input)
+;;; tested only the character predicate, so a binary gray stream was rejected
+;;; as "not a stream designator" — even though streamp and write-byte had
+;;; already accepted the same object. flexi-streams builds binary gray streams,
+;;; so drakma and anything layering on it tripped over this.
+(defclass %gray-bin-out (dotcl-gray:fundamental-binary-output-stream) ())
+(defclass %gray-bin-in  (dotcl-gray:fundamental-binary-input-stream) ())
+
+(deftest gray-binary-out-streamp
+  (streamp (make-instance '%gray-bin-out))
+  t)
+
+(deftest gray-binary-force-output-accepts
+  (progn (force-output (make-instance '%gray-bin-out)) :ok)
+  :ok)
+
+(deftest gray-binary-finish-output-accepts
+  (progn (finish-output (make-instance '%gray-bin-out)) :ok)
+  :ok)
+
+(deftest gray-binary-clear-output-accepts
+  (progn (clear-output (make-instance '%gray-bin-out)) :ok)
+  :ok)
+
+(deftest gray-binary-clear-input-accepts
+  (progn (clear-input (make-instance '%gray-bin-in)) :ok)
+  :ok)
+
+;; The type check moved, not removed: a non-stream still errors.
+(deftest gray-force-output-non-stream-errors
+  (handler-case (progn (force-output 42) :no-error)
+    (error () :errored))
+  :errored)
+
+;;; unread-char on a gray stream must dispatch to STREAM-UNREAD-CHAR.
+;;; Previously ResolveLispStream dropped the CLOS instance to
+;;; *standard-input* — the unread char was pushed onto stdin and lost
+;;; from the gray stream (flexi-streams peek/unread silently misread).
+(defclass %gray-in-unread (dotcl-gray:fundamental-character-input-stream)
+  ((chars :initarg :chars :accessor %giu-chars)))
+
+(defmethod dotcl-gray:stream-read-char ((s %gray-in-unread))
+  (if (%giu-chars s)
+      (pop (%giu-chars s))
+      :eof))
+
+(defmethod dotcl-gray:stream-unread-char ((s %gray-in-unread) char)
+  (push char (%giu-chars s))
+  nil)
+
+(deftest gray-unread-char-dispatch
+  (let ((s (make-instance '%gray-in-unread :chars (list #\a #\b #\c))))
+    (let ((first (read-char s)))
+      (unread-char first s)
+      (coerce (list (read-char s) (read-char s) (read-char s)) 'string)))
+  "abc")
+
+(deftest gray-unread-char-peek
+  (let ((s (make-instance '%gray-in-unread :chars (list #\x #\y))))
+    (list (peek-char nil s) (read-char s) (read-char s)))
+  (#\x #\x #\y))
+
+;;; format ~T on a gray stream must start from the stream's current column
+;;; (stream-line-column), not from 0. Previously (write-string "hello" s)
+;;; followed by (format s "~12Tworld") padded 12 spaces instead of 7
+;;; (flexi-streams column-tests tripped this).
+(defclass %gray-out-col (dotcl-gray:fundamental-character-output-stream)
+  ((buf :initform (make-array 0 :element-type 'character
+                              :adjustable t :fill-pointer t)
+        :accessor %goc-buf)))
+
+(defmethod dotcl-gray:stream-write-char ((s %gray-out-col) ch)
+  (vector-push-extend ch (%goc-buf s))
+  ch)
+
+(defmethod dotcl-gray:stream-line-column ((s %gray-out-col))
+  (let* ((buf (%goc-buf s))
+         (nl (position #\Newline buf :from-end t)))
+    (if nl (- (fill-pointer buf) nl 1) (fill-pointer buf))))
+
+(deftest gray-format-tab-uses-line-column
+  (let ((s (make-instance '%gray-out-col)))
+    (write-string "hello" s)
+    (format s "~12Tworld")
+    (coerce (%goc-buf s) 'string))
+  "hello       world")
+
+;;; After a newline inside the same format run, the column restarts at 0
+;;; (the stream's initial column no longer applies).
+(deftest gray-format-tab-after-newline
+  (let ((s (make-instance '%gray-out-col)))
+    (write-string "xy" s)
+    (format s "ab~%~4Tz")
+    (coerce (%goc-buf s) 'string))
+  "xyab
+    z")

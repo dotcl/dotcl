@@ -186,6 +186,18 @@ public partial class CilAssembler
         return false;
     }
 
+    /// <summary>
+    /// True when a mangled function-name string denotes a compound name —
+    /// "(SETF X)", "(CAS X)", etc. — which registers on a target symbol's slot
+    /// rather than as an ordinary symbol-function. Such names both start with
+    /// '(' and end with ')'. A plain symbol whose print-name merely starts with
+    /// '(' (e.g. SB-FORMAT::|(-COMPILER|, the ~( format directive handler) is NOT
+    /// compound and must register on its own symbol like any other DEFUN; using
+    /// StartsWith("(") alone silently dropped its registration.
+    /// </summary>
+    internal static bool IsCompoundFunctionName(string name) =>
+        name.Length >= 2 && name[0] == '(' && name[name.Length - 1] == ')';
+
     /// <summary>Build the (SETF name) function-name list for LispUndefinedFunction.</summary>
     private static Cons SetfNameCons(Symbol targetSym) =>
         new Cons(Startup.Sym("SETF"), new Cons(targetSym, Nil.Instance));

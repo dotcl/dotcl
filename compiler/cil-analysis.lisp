@@ -730,7 +730,16 @@
                       (push (cons (cadr b) (cons in-lambda mdepth)) worklist)))))
                ((and (symbolp head) (or (eq head 'flet) (eq head 'labels)))
                 (dolist (fdef (cadr e))
-                  (push (cons (cadr fdef) (cons t mdepth)) worklist)
+                  ;; Walk only the initializer forms of the lambda list (the
+                  ;; default-value / supplied-p expressions of &optional/&key/&aux),
+                  ;; not the raw lambda list. Pushing the lambda list itself as a
+                  ;; form macroexpands a param whose name happens to be a macro
+                  ;; (e.g. a required param named INST, which is a macro under
+                  ;; SBCL's assembler), firing that macro's compile-time side
+                  ;; effects. Param names are binding occurrences, not code.
+                  (dolist (p (cadr fdef))
+                    (when (and (consp p) (cadr p))
+                      (push (cons (cadr p) (cons t mdepth)) worklist)))
                   (dolist (form (cddr fdef))
                     (push (cons form (cons t mdepth)) worklist)))
                 (dolist (form (cddr e))
