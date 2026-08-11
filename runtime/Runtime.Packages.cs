@@ -824,6 +824,27 @@ public static partial class Runtime
         Startup.RegisterUnary("%PACKAGE-ALL-SYMBOLS", Runtime.PackageAllSymbolsList);
         Startup.RegisterUnary("%PACKAGE-EXTERNAL-SYMBOLS", Runtime.PackageExternalSymbolsList);
         Startup.RegisterBinary("%COLLECT-PACKAGE-ITERATOR-ENTRIES", Runtime.CollectPackageIteratorEntries);
+        // The lowering targets DEFPACKAGE / EXPORT / IMPORT / SHADOW / ... expand
+        // into. compile-expr recognises them by SYMBOL-NAME and emits the direct
+        // call, so a compiled caller never reaches these bindings — but the
+        // tree-walk interpreter (the only evaluator on emit-free builds) resolves
+        // an operator through SYMBOL-FUNCTION, and without a binding every
+        // interpreted DEFPACKAGE died on "Undefined function: %MAKE-PACKAGE".
+        // Registering them makes the compiler's name test a pure optimisation
+        // rather than the only definition. DOTCL-INTERNAL (RegisterFunction's
+        // fallback package) is deliberate: it is the package the macro expanders
+        // intern these names in, and the cross-package bridge consults it only
+        // after the caller's own package, so a foreign %MAKE-PACKAGE (SBCL's
+        // package-structure constructor, say) still wins for its own callers.
+        Startup.RegisterUnary("%MAKE-PACKAGE", Runtime.MakePackage);
+        Startup.RegisterBinary("%PACKAGE-USE", Runtime.PackageUse);
+        Startup.RegisterBinary("%PACKAGE-EXPORT", Runtime.PackageExport);
+        Startup.RegisterBinary("%PACKAGE-IMPORT", Runtime.PackageImport);
+        Startup.RegisterBinary("%PACKAGE-SHADOW", Runtime.PackageShadow);
+        Startup.RegisterBinary("%PACKAGE-NICKNAME", Runtime.PackageNickname);
+        Startup.RegisterBinary("%UNEXPORT", Runtime.UnexportSymbol);
+        Startup.RegisterBinary("%UNUSE-PACKAGE", Runtime.UnusePackage);
+        Startup.RegisterBinary("%SHADOWING-IMPORT", Runtime.ShadowingImport);
     }
 
 }

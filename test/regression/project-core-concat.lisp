@@ -43,7 +43,7 @@
     (load fasl)
     *pc325-result*))
 
-(deftest project-core-concat-toplevel-load-macro
+(deftest-compiled-only project-core-concat-toplevel-load-macro
   ;; 4242 proves pc325-mac expanded (macro available at compile time); a plain
   ;; function call would have signalled "Undefined function: PC325-MAC" on load.
   (pc325-build-and-load-concat)
@@ -69,7 +69,7 @@
     (list (eq (funcall (find-symbol "CC469-BUILTIN")) (find-class 'cons))
           (eq (funcall (find-symbol "CC469-USER")) (find-class 'cc469-myc)))))
 
-(deftest fasl-class-constant-roundtrip
+(deftest-compiled-only fasl-class-constant-roundtrip
   ;; Both a built-in class (CONS) and a user class resolve back to the live
   ;; registry object after compile-file + load (find-class load-form, not pool).
   (cc469-build-and-load)
@@ -88,6 +88,6 @@
     (load fasl)
     (funcall (find-symbol "CC471-FN"))))
 
-(deftest fasl-equals-in-filename
+(deftest-compiled-only fasl-equals-in-filename
   (cc471-build-and-load)
   471)

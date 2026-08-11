@@ -195,12 +195,21 @@
 
 (defun %xc-eval-defstruct (ds source-form)
   "Expand (SB-XC:DEFSTRUCT . SOURCE-FORM) and evaluate its :host expansion,
-   which calls %DEFSTRUCT / %COMPILER-DEFSTRUCT to register the SBCL classoid."
-  (handler-case
-      (eval (funcall (macro-function ds) (cons ds source-form) nil))
-    (error (e)
-      (format *error-output* ";; %xc-defstruct-register ~S: ~A~%"
-              (if (consp (car source-form)) (caar source-form) (car source-form)) e))))
+   which calls %DEFSTRUCT / %COMPILER-DEFSTRUCT to register the SBCL classoid.
+   Any WARNING signalled by the registration is muffled.  Registration is a
+   side channel that exists only for genesis, but it runs inside whatever file
+   happens to be compiling when the deferred queue flushes — so a stray
+   WARNING would set that unrelated file's COMPILE-FILE FAILURE-P.  A
+   redefinition warning here is also inert: %DEFSTRUCT signals it and then
+   errors out, so the pre-existing classoid is kept either way."
+  (handler-bind ((warning (lambda (c)
+                            (let ((r (find-restart 'muffle-warning c)))
+                              (when r (invoke-restart r))))))
+    (handler-case
+        (eval (funcall (macro-function ds) (cons ds source-form) nil))
+      (error (e)
+        (format *error-output* ";; %xc-defstruct-register ~S: ~A~%"
+                (if (consp (car source-form)) (caar source-form) (car source-form)) e)))))
 
 (defun %xc-flush-pending-defstructs (ds)
   (when *xc-pending-defstructs*
@@ -3650,12 +3659,21 @@
                   (nickname-forms nil) (intern-forms nil)
                   (shadowing-import-forms nil)
                   (nickname-check-forms nil)
-                  (local-nickname-forms nil))
+                  (local-nickname-forms nil)
+                  (doc-forms nil))
               (dolist (option options)
                 (when (consp option)
                   (let ((key (car option))
                         (args (cdr option)))
                     (cond
+                      ((member key '(:documentation) :test #'eq)
+                       ;; CLHS 11.2.13: the string becomes the package's
+                       ;; documentation. SBCL's genesis copies each target
+                       ;; package's docstring from the host package of the same
+                       ;; name, so dropping it here loses it in the built image.
+                       (when (stringp (car args))
+                         (push `(setf (documentation ,pkg-var t) ,(car args))
+                               doc-forms)))
                       ((member key '(:use) :test #'eq)
                        ;; Pass the name string directly so that the runtime
                        ;; (Runtime.PackageUse → ResolvePackage) reports the
@@ -3818,6 +3836,7 @@
                               ,@(nreverse intern-forms)
                               ,@(nreverse export-forms)
                               ,@(nreverse local-nickname-forms)
+                              ,@(nreverse doc-forms)
                               ,pkg-var)))
                 ;; In compile-file mode, wrap with eval-when so macrolet-expanded
                 ;; defpackage forms are evaluated at compile time (CLHS 3.2.3.1).

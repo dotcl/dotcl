@@ -9,6 +9,11 @@ without per-platform porting work.
 against the
 [ansi-test suite](https://gitlab.common-lisp.net/ansi-test/ansi-test).
 
+**Try it without installing anything** — the
+[playground](https://dotcl.github.io/playground/) is dotcl compiled to
+WebAssembly, running in the browser tab you open it in. Nothing is sent
+anywhere; the Lisp runs on your machine.
+
 ## What dotcl is good for
 
 - **Embedding Common Lisp in .NET applications.** `dotcl.runtime` is a

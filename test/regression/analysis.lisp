@@ -410,3 +410,29 @@
 (deftest bindpos-labels-result (bindpos-labels 'a) (a))
 (deftest bindpos-flet-result (bindpos-flet 'b) (b))
 (deftest bindpos-let-result (bindpos-let 'c) (c))
+
+;; A form can LOOK like a binding special form without being one: a DOLIST
+;; spec whose variable is named LET reads as (LET <list-form>), i.e. car LET
+;; and a symbol where a binding list would be. The scanners walk unevaluated
+;; subforms too, so they must tolerate that shape instead of assuming the
+;; binding-list and body positions hold proper lists.
+(defmacro bindpos-drop (form)
+  (declare (ignore form))
+  nil)
+
+(defun bindpos-shape-let (x)
+  (block b (bindpos-drop (let lets)) x))
+
+(defun bindpos-shape-labels (x)
+  (block b (bindpos-drop (labels labels)) x))
+
+(defun bindpos-shape-flet (x)
+  (block b (bindpos-drop (flet flets)) x))
+
+(defun bindpos-shape-lambda (x)
+  (block b (bindpos-drop (lambda args)) x))
+
+(deftest bindpos-shape-let-result (bindpos-shape-let 'a) a)
+(deftest bindpos-shape-labels-result (bindpos-shape-labels 'b) b)
+(deftest bindpos-shape-flet-result (bindpos-shape-flet 'c) c)
+(deftest bindpos-shape-lambda-result (bindpos-shape-lambda 'd) d)

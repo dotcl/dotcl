@@ -914,6 +914,16 @@ public class FaslAssembler
 #endif
     }
 
+    /// <summary>When set, the generation this assembly IS rather than the one that
+    /// built it. A core stamps its own identity (derived from the .sil it embodies);
+    /// every ordinary .fasl stamps the running core's.
+    ///
+    /// Declared OUTSIDE the NET9_0_OR_GREATER block below on purpose: sil-to-fasl in
+    /// Startup sets it on every target framework, while only the stamping itself is
+    /// version-specific. Inside the block it compiled on net10.0 and vanished on
+    /// net8.0, which nothing local builds — the break surfaced at pack time.</summary>
+    internal string? SelfGeneration;
+
 #if NET9_0_OR_GREATER
     /// <summary>Record which compiler generation produced this fasl, as an
     /// assembly-level [AssemblyMetadata("dotcl-core-generation", ...)]. The loader
@@ -926,7 +936,7 @@ public class FaslAssembler
     {
         try
         {
-            var gen = Startup.CoreGeneration();
+            var gen = SelfGeneration ?? Startup.CoreGeneration();
             if (gen == null) return;
             var ctor = typeof(System.Reflection.AssemblyMetadataAttribute)
                 .GetConstructor(new[] { typeof(string), typeof(string) });

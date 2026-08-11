@@ -64,7 +64,10 @@
 (defun fs-run ()
   (let ((*fs-outer* :by-toplevel)) (fs-deep)))
 
-(deftest frame-specials-own-vs-caller
+;;; See frame-locals.lisp: the per-frame recording is emitted IL, so the case that
+;;; asks which frame a binding belongs to is compiled-only.
+
+(deftest-compiled-only frame-specials-own-vs-caller
   (progn
     (destructuring-bind (frame0 frame1) (fs-run)
       (list (third (find "*FS-INNER*" frame0 :key (lambda (e) (symbol-name (car e))) :test #'string=))

@@ -422,7 +422,7 @@ public static partial class Runtime
 
     public static LispObject SubtractN(params LispObject[] args)
     {
-        if (args.Length == 0) throw new ArgumentException("- requires at least one argument");
+        Runtime.CheckArityMin("-", args, 1);
         if (args.Length == 1) return Arithmetic.Negate(AsNumber(args[0]));
         LispObject result = args[0];
         for (int i = 1; i < args.Length; i++)
@@ -432,7 +432,7 @@ public static partial class Runtime
 
     public static LispObject DivideN(params LispObject[] args)
     {
-        if (args.Length == 0) throw new ArgumentException("/ requires at least one argument");
+        Runtime.CheckArityMin("/", args, 1);
         if (args.Length == 1)
         {
             try { return Arithmetic.Divide(Fixnum.Make(1), AsNumber(args[0])); }
@@ -1642,7 +1642,8 @@ public static partial class Runtime
 
         // RANDOM as callable function (for funcall/apply)
         Emitter.CilAssembler.RegisterFunction("RANDOM", new LispFunction(args => {
-            if (args.Length == 0) throw new LispErrorException(new LispError("RANDOM: too few args"));
+            Runtime.CheckArityMin("RANDOM", args, 1);
+            Runtime.CheckArityMax("RANDOM", args, 2);
             return args.Length >= 2 ? Runtime.Random2(args[0], args[1]) : Runtime.Random(args[0]);
         }));
 

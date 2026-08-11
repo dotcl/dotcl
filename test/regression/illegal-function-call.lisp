@@ -21,15 +21,15 @@
   (handler-case (progn (funcall (compile nil `(lambda () ,form))) "")
     (error (e) (princ-to-string e))))
 
-(deftest illegal-function-call.number-operator
+(deftest-compiled-only illegal-function-call.number-operator
   (ifc-error-of '(0 1 2))
   program-error)
 
-(deftest illegal-function-call.string-operator
+(deftest-compiled-only illegal-function-call.string-operator
   (ifc-error-of '("nope" 1))
   program-error)
 
-(deftest illegal-function-call.message-names-the-form
+(deftest-compiled-only illegal-function-call.message-names-the-form
   (let ((msg (ifc-message-of '(0 1 2))))
     (and (search "Illegal function call" msg)
          (search "(0 1 2)" msg)
@@ -38,11 +38,11 @@
 
 ;;; The error is deferred to run time: compiling the form must not signal, and
 ;;; forms after it in the same compilation unit still compile.
-(deftest illegal-function-call.compiles-without-signaling
+(deftest-compiled-only illegal-function-call.compiles-without-signaling
   (progn (compile nil '(lambda () (0 1 2))) :compiled)
   :compiled)
 
-(deftest illegal-function-call.unreached-branch-is-harmless
+(deftest-compiled-only illegal-function-call.unreached-branch-is-harmless
   (funcall (compile nil '(lambda (flag) (if flag (0 1 2) :fine))) nil)
   :fine)
 
@@ -51,6 +51,6 @@
   ((lambda (x) (* x 2)) 21)
   42)
 
-(deftest illegal-function-call.quoted-designator-still-works
+(deftest-compiled-only illegal-function-call.quoted-designator-still-works
   (funcall (compile nil '(lambda () ((quote list) 1 2))))
   (1 2))

@@ -3834,8 +3834,16 @@ public static partial class Runtime
     private static readonly LispFunction _defaultCnm = new LispFunction(
         _ => throw new LispErrorException(new LispError("CALL-NEXT-METHOD: no next method")),
         "CALL-NEXT-METHOD", -1);
+    // Arity is checked here too: this is what CapturedNmp hands back when the
+    // invocation has no next-method chain, so without it (next-method-p nil)
+    // would still be silently accepted on that path (CLHS: exactly 0 arguments).
     private static readonly LispFunction _defaultNmp = new LispFunction(
-        _ => Nil.Instance, "NEXT-METHOD-P", 0);
+        a => {
+            if (a.Length != 0)
+                throw new LispErrorException(new LispProgramError(
+                    $"NEXT-METHOD-P: wrong number of arguments: {a.Length} (expected 0)"));
+            return Nil.Instance;
+        }, "NEXT-METHOD-P", 0);
 
     /// <summary>Intrinsic: the current method's captured CALL-NEXT-METHOD closure
     /// (thread-local). Emitted for the defmethod-body capture instead of
@@ -4779,9 +4787,21 @@ public static partial class Runtime
             ((LispMethod)camDefaultMethod).RequiredCount = 2;
             Runtime.AddMethod(camGF, camDefaultMethod);
         }
-        // NEXT-METHOD-P and CALL-NEXT-METHOD
+        // NEXT-METHOD-P and CALL-NEXT-METHOD.
+        // NEXT-METHOD-P accepts exactly 0 arguments (CLHS): passing one is a
+        // PROGRAM-ERROR. The compiler rejects it statically (the next-method-p
+        // special-form handler) and the per-invocation captured closure checks it
+        // at call time, but this globally registered function silently ignored
+        // whatever it was handed — so an interpreted method body, where the
+        // operator resolves through this binding, returned NIL/T instead of
+        // signalling. Same check as CapturedNmp, so all three paths agree.
         Emitter.CilAssembler.RegisterFunction("NEXT-METHOD-P",
-            new LispFunction(args => Runtime.NextMethodP(), "NEXT-METHOD-P", 0));
+            new LispFunction(args => {
+                if (args.Length != 0)
+                    throw new LispErrorException(new LispProgramError(
+                        $"NEXT-METHOD-P: wrong number of arguments: {args.Length} (expected 0)"));
+                return Runtime.NextMethodP();
+            }, "NEXT-METHOD-P", 0));
         Emitter.CilAssembler.RegisterFunction("CALL-NEXT-METHOD",
             new LispFunction(Runtime.CallNextMethod, "CALL-NEXT-METHOD", -1));
 
@@ -4813,6 +4833,15 @@ public static partial class Runtime
         RegClos("%MAKE-CLASS", a => Runtime.MakeClass(a[0], a[1], a[2]), 3);
         RegClos("%REGISTER-CLASS", a => Runtime.RegisterClass(a[0]), 1);
         RegClos("%MAKE-SLOT-DEF", a => Runtime.MakeSlotDef(a[0], a[1], a[2]), 3);
+        // The :ALLOCATION :CLASS variant of the slot-def lowering target. It was the
+        // one member of this family with no function binding, so the DEFCLASS
+        // expansion — which the tree-walk evaluator runs as real code — died with
+        // "Undefined function: %MAKE-SLOT-DEF-WITH-ALLOCATION" as soon as a slot
+        // carried :allocation (ansi-test CLASS-REDEFINITION.1/2/3). Compiled code
+        // never noticed: the compiler emits Runtime.MakeSlotDefWithAllocation
+        // inline from its own table and never looks the name up.
+        RegClos("%MAKE-SLOT-DEF-WITH-ALLOCATION",
+            a => Runtime.MakeSlotDefWithAllocation(a[0], a[1], a[2], a[3]), 4);
         RegClos("%SLOT-DEF-RAW-OPTIONS", a => Runtime.SetSlotDefRawOptions(a[0], a[1]), 2);
         RegClos("%SET-CLASS-DEFAULT-INITARGS", a => Runtime.SetClassDefaultInitargs(a[0], a[1]), 2);
         RegClos("%FIND-CLASS-OR-NIL", a => Runtime.FindClassOrNil(a[0]), 1);

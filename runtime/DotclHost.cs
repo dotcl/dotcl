@@ -192,6 +192,10 @@ public static class DotclHost
     /// *PACKAGE* afterwards. WHAT names the core in errors.</summary>
     private static void RunCoreModuleInit(System.Reflection.Assembly asm, string what)
     {
+        // Same reason as Program.RunCoreFasl: the generation stamp is read off the
+        // core assembly, so an embedding host must record it too — including the
+        // in-memory path, which has no file to fall back to.
+        Startup.CoreAssembly = asm;
         var t = asm.GetType("CompiledModule")
             ?? throw new InvalidOperationException(
                 $"{what}: CompiledModule type not found");

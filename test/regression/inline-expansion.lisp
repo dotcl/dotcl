@@ -38,7 +38,16 @@
 (defun %inl-plain2 (a b) (+ a b))
 (defun %inl-use-plain2 (x) (%inl-plain2 x 10))
 
-(deftest inl-no-proclamation-not-substituted
+;;; The substitution tests below are DEFTEST-COMPILED-ONLY: they ask whether the
+;;; compiler DID or DID NOT substitute an inline body at a call site. Without a
+;;; compiler nothing is ever substituted, so every one of them would report
+;;; "not substituted" and pass or fail for a reason unrelated to what it tests.
+;;;
+;;; The capture tests are NOT compiled-only. They assert ordinary CL scoping —
+;;; that a local FLET / LABELS / MACROLET does not reach into a separately
+;;; defined function — which must hold under either evaluator.
+
+(deftest-compiled-only inl-no-proclamation-not-substituted
   (%inl-calls-p #'%inl-use-plain2 "%INL-PLAIN2")
   t)
 
@@ -169,7 +178,7 @@
   (declare (notinline %inl-notinlinable))
   (%inl-notinlinable x))
 
-(deftest inl-local-notinline-not-substituted
+(deftest-compiled-only inl-local-notinline-not-substituted
   (%inl-calls-p #'%inl-local-notinline "%INL-NOTINLINABLE")
   t)
 
@@ -210,7 +219,7 @@
 (defun %inl-opt (a &optional (b 3)) (list a b))
 (defun %inl-use-opt () (list (%inl-opt 1) (%inl-opt 1 2)))
 
-(deftest inl-optional-not-substituted
+(deftest-compiled-only inl-optional-not-substituted
   (%inl-calls-p #'%inl-use-opt "%INL-OPT")
   t)
 
@@ -244,7 +253,7 @@
         a a a a a a a a a a a a a a a a a a a a))
 (defun %inl-use-big () (length (%inl-big 1)))
 
-(deftest inl-oversize-not-substituted
+(deftest-compiled-only inl-oversize-not-substituted
   (%inl-calls-p #'%inl-use-big "%INL-BIG")
   t)
 
@@ -277,7 +286,7 @@
 (defun %inl-versioned () :v3)
 (defun %inl-site-v3 () (%inl-versioned))
 
-(deftest inl-notinline-proclaim-drops-body
+(deftest-compiled-only inl-notinline-proclaim-drops-body
   (%inl-calls-p #'%inl-site-v3 "%INL-VERSIONED")
   t)
 

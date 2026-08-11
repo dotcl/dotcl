@@ -28,7 +28,11 @@
 
 ;; The whole inner loop must be on the raw-long entries: no boxed Aref2D,
 ;; no generic Runtime.Add.
-(deftest nai2-bench-2d-sil
+;;; DEFTEST-COMPILED-ONLY below: the fast array paths are a compiler inference —
+;;; element types are deduced and unboxed access is emitted. There is nothing to
+;;; infer without a compiler, so an emit-free build takes the generic path.
+
+(deftest-compiled-only nai2-bench-2d-sil
   (let ((sil (princ-to-string (dotcl:function-sil #'%nai2-bench-2d))))
     (list (notnot (search "ArefNum2DL" sil))
           (notnot (search "ArefSetNum2DL" sil))
@@ -134,7 +138,7 @@
 ;; ArefNum*D on both sides and NO generic Runtime.Add (the inner-loop add runs
 ;; on the native r8 path). A newobj DoubleFloat may still appear for the boxed
 ;; RETURN value (aref c 0) and the literal — only the arithmetic must be raw.
-(deftest naf-daxpy-local-sil
+(deftest-compiled-only naf-daxpy-local-sil
   (let ((sil (princ-to-string (dotcl:function-sil #'%naf-daxpy-local))))
     (list (notnot (search "ArefNumD" sil))
           (notnot (search "ArefSetNumD" sil))
@@ -156,7 +160,7 @@
       (setf (aref c i) (+ (aref a i) (* 3d0 (aref a i)))))
     n))
 
-(deftest naf-boxfree-sil
+(deftest-compiled-only naf-boxfree-sil
   (let ((sil (princ-to-string (dotcl:function-sil #'%naf-boxfree))))
     (list (notnot (search "ArefSetNumD" sil))
           ;; no surviving DoubleFloat box anywhere in the body
@@ -176,7 +180,7 @@
       (setf (aref c i) (+ (aref a i) (aref a i))))
     (aref c 0)))
 
-(deftest naf-single-sil
+(deftest-compiled-only naf-single-sil
   (let ((sil (princ-to-string (dotcl:function-sil #'%naf-single))))
     (list (notnot (search "ArefNumD" sil))
           (notnot (search "ArefSetNumD" sil))))
@@ -196,7 +200,7 @@
         (setf (aref b i j) (* (aref a i j) (aref a i j)))))
     (aref b 1 1)))
 
-(deftest naf-2d-sil
+(deftest-compiled-only naf-2d-sil
   (let ((sil (princ-to-string (dotcl:function-sil #'%naf-2d))))
     (list (notnot (search "ArefNum2DD" sil))
           (notnot (search "ArefSetNum2DD" sil))
@@ -235,7 +239,7 @@
   (dotimes (i n)
     (setf (aref c i) (+ (aref a i) (aref b i)))))
 
-(deftest naf-param-daxpy-sil
+(deftest-compiled-only naf-param-daxpy-sil
   (let ((sil (princ-to-string (dotcl:function-sil #'%naf-param-daxpy))))
     (list (notnot (search "ArefNumD" sil))
           (notnot (search "ArefSetNumD" sil))
@@ -258,7 +262,7 @@
   (dotimes (i n)
     (setf (aref a i) (* 2.0 (aref a i)))))
 
-(deftest naf-param-single-sil
+(deftest-compiled-only naf-param-single-sil
   (let ((sil (princ-to-string (dotcl:function-sil #'%naf-param-single))))
     (list (notnot (search "ArefNumD" sil))
           (notnot (search "ArefSetNumD" sil))))
@@ -282,7 +286,7 @@
         (go loop))
     (return (aref ar 0))))
 
-(deftest naf-alias-sil
+(deftest-compiled-only naf-alias-sil
   (let ((sil (princ-to-string (dotcl:function-sil #'%naf-alias))))
     (list (notnot (search "ArefNumD" sil))
           (notnot (search "ArefSetNumD" sil))))

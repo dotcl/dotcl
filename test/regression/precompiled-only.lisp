@@ -7,7 +7,11 @@
 
 (defun ship-sq (x) (* x x))   ; precompiled while emit is still allowed
 
-(deftest precompiled-only-blocks-eval-not-funcall
+;; Compiled-only: the flag blocks CODE GENERATION, and the tree-walk interpreter
+;; generates none — under :interpret this EVAL is correctly allowed through, so
+;; there is nothing here to assert. (On an emit-free build the same is true by
+;; construction: there is no JIT to forbid.)
+(deftest-compiled-only precompiled-only-blocks-eval-not-funcall
   ;; With precompiled-only mode on: calling already-compiled code still works,
   ;; but eval of a compound form (which would JIT) is blocked. unwind-protect
   ;; guarantees the global flag is cleared even though the eval errors.

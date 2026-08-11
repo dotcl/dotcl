@@ -17,7 +17,7 @@
 (defun itp-f1 (x acc) (itp-g1 x acc))
 
 (deftest itp-inline-tail-correct (itp-f1 100 0) 5050)
-(deftest itp-inline-tail-deep    (itp-f1 200000 0) 20000100000)
+(deftest-compiled-only itp-inline-tail-deep    (itp-f1 200000 0) 20000100000)
 
 ;; Multiple values through an inlined call in tail position...
 (declaim (inline itp-g2))
@@ -43,4 +43,4 @@
 (defun itp-g5 (x acc) (if (<= x 0) acc (itp-f5 (- x 1) (+ acc 1))))
 (defun itp-f5 (x acc) (handler-case (itp-g5 x acc) (error () :err)))
 (deftest itp-inline-handler-correct (itp-f5 100 0) 100)
-(deftest itp-inline-handler-deep    (itp-f5 200000 0) 200000)
+(deftest-compiled-only itp-inline-handler-deep    (itp-f5 200000 0) 200000)

@@ -68,6 +68,6 @@
     (list (fboundp 'cfri-mod:fn)
           (when (fboundp 'cfri-mod:fn) (funcall (symbol-function 'cfri-mod:fn))))))
 
-(deftest compile-file-clears-asdf-registry-for-compile-time-require
+(deftest-compiled-only compile-file-clears-asdf-registry-for-compile-time-require
   (%cfri-asdf-stale-registry)
   (t :loaded))

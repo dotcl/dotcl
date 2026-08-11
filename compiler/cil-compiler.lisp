@@ -1447,7 +1447,8 @@ through to compile-sym-lookup."
    bound a &whole var to (cdr form) instead of the whole form; because the
    analysis pass caches its expansion in *macroexpand-cache* for compile to reuse,
    that bug surfaced even though compile-macrolet itself was correct."
-  (let* ((whole-var (when (and (consp params) (eq (car params) '&whole)) (cadr params)))
+  (let* ((env-arg (gensym "MLENV"))
+         (whole-var (when (and (consp params) (eq (car params) '&whole)) (cadr params)))
          (rest-params (if whole-var (cddr params) params))
          (env-var nil)
          (clean-params
@@ -1461,28 +1462,42 @@ through to compile-sym-lookup."
     (cond
       ((and whole-var (consp whole-var))
        ;; &whole (pattern) — destructure the whole form against the pattern
-       `(lambda (form)
+       `(lambda (form &optional ,env-arg)
+          (declare (ignore ,env-arg))
           ,(if env-var `(declare (ignore ,env-var)) '(progn))
           (destructuring-bind ,whole-var form
             (destructuring-bind ,clean-params (cdr form)
               ,@mbody))))
       (whole-var
        ;; &whole var — bind var to the entire form
-       `(lambda (form)
+       `(lambda (form &optional ,env-arg)
+          (declare (ignore ,env-arg))
           (let ((,whole-var form))
             (destructuring-bind ,clean-params (cdr form)
               ,@mbody))))
       (env-var
-       ;; &environment but no &whole. Build env as cons: (macros-ht . symbol-macros-alist)
-       `(lambda (form)
-          (let ((,env-var (cons *macros*
-                               (let ((ht (make-hash-table :test #'equal)))
-                                 (dolist (entry *symbol-macros* ht)
-                                   (setf (gethash (symbol-name (car entry)) ht) (cdr entry)))))))
+       ;; &environment but no &whole.
+       ;;
+       ;; The caller may supply the environment. The tree-walk evaluator does:
+       ;; its MACROLET bindings are lexical (an entry in ENV), so they are not in
+       ;; *MACROS* and an environment built from the globals here would not show
+       ;; them to (MACROEXPAND x env) inside the expander. The compiler does not —
+       ;; COMPILE-MACROLET registers its expanders in *MACROS* for the extent of
+       ;; the body, so the globals are the right source there.
+       ;;
+       ;; Shape either way: (macro-table . symbol-macro-table), which is what
+       ;; MACROEXPAND-1 destructures.
+       `(lambda (form &optional ,env-arg)
+          (let ((,env-var (or ,env-arg
+                              (cons *macros*
+                                    (let ((ht (make-hash-table :test #'equal)))
+                                      (dolist (entry *symbol-macros* ht)
+                                        (setf (gethash (symbol-name (car entry)) ht) (cdr entry))))))))
             (destructuring-bind ,clean-params (cdr form)
               ,@mbody))))
       (t
-       `(lambda (form)
+       `(lambda (form &optional ,env-arg)
+          (declare (ignore ,env-arg))
           (destructuring-bind ,clean-params (cdr form)
             ,@mbody))))))
 

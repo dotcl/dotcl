@@ -209,10 +209,15 @@
 (defun + (&rest args)
   (let ((result 0))
     (dolist (x args result) (setq result (+ result x)))))
+;; CLHS: (- number &rest more) — zero arguments is a program-error. The unary case
+;; is a sign flip, not "subtract from 0": (- 0.0) is -0.0, and compile-sub uses
+;; Runtime.Negate for the same reason. The (- x) / (- result x) below lower to the
+;; inline two-argument op, so this is not self-recursive.
 (defun - (&rest args)
-  (if (null args) 0
+  (if (null args)
+      (error 'program-error)
       (if (null (cdr args))
-          (- 0 (car args))
+          (- (car args))
           (let ((result (car args)))
             (dolist (x (cdr args) result) (setq result (- result x)))))))
 (defun * (&rest args)

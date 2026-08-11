@@ -1819,6 +1819,13 @@ public static partial class Runtime
         Startup.RegisterBinary("CHAR", Runtime.CharAccess);
         Startup.RegisterBinary("SCHAR", Runtime.CharAccess);
 
+        // %SET-CHAR / %SET-ELT — the lowering (setf char) / (setf elt) expand to.
+        // compile-expr recognises both by SYMBOL-NAME and emits the direct call;
+        // these bindings exist so the tree-walk interpreter, which resolves an
+        // operator through SYMBOL-FUNCTION, can evaluate the same expansion.
+        Startup.RegisterTernary("%SET-CHAR", Runtime.SetChar);
+        Startup.RegisterTernary("%SET-ELT", Runtime.SetElt);
+
         // %SET-SUBSEQ (setf subseq)
         Emitter.CilAssembler.RegisterFunction("%SET-SUBSEQ",
             new LispFunction(args => {
@@ -1867,7 +1874,7 @@ public static partial class Runtime
 
         // MAKE-ARRAY, ADJUST-ARRAY
         Emitter.CilAssembler.RegisterFunction("MAKE-ARRAY",
-            new LispFunction(args => Runtime.MakeArray(args)));
+            new LispFunction(args => { Runtime.CheckArityMin("MAKE-ARRAY", args, 1); return Runtime.MakeArray(args); }));
         Emitter.CilAssembler.RegisterFunction("ADJUST-ARRAY",
             new LispFunction(args => Runtime.AdjustArray(args)));
     }

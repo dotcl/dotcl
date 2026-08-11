@@ -30,23 +30,17 @@
   (ldb (byte 64 0)
        (dotnet:static "System.BitConverter" "DoubleToInt64Bits" float)))
 
+;; Both take a SIGNED .NET integer, and (ldb (byte N 0) ...) is always
+;; non-negative. Marshalling reinterprets an unsigned N-bit pattern for a signed
+;; target, so the pattern goes straight in; and a .NET float arrives as a
+;; single-float, so nothing needs coercing on the way out.
 (defun bits-single-float (bits)
-  ;; BitConverter.Int32BitsToSingle takes a signed int. ldb alone yields an
-  ;; unsigned 32-bit pattern that is a fixnum whose (int) cast in C# reinterprets
-  ;; the high bit as a sign, giving the correct bit pattern. coerce is needed
-  ;; because Runtime.DotNetToLisp widens every float return to DoubleFloat.
-  (coerce (dotnet:static "System.BitConverter" "Int32BitsToSingle"
-                         (ldb (byte 32 0) bits))
-          'single-float))
+  (dotnet:static "System.BitConverter" "Int32BitsToSingle"
+                 (ldb (byte 32 0) bits)))
 
 (defun bits-double-float (bits)
-  ;; BitConverter.Int64BitsToDouble takes a signed long. ldb alone yields an
-  ;; unsigned 64-bit pattern that is a bignum when bit 63 is set; dotnet:static
-  ;; cannot marshal bignum to Int64. Convert to the signed fixnum in
-  ;; [-2^63, 2^63) so it marshals to long with the same bit pattern.
-  (let ((u (ldb (byte 64 0) bits)))
-    (dotnet:static "System.BitConverter" "Int64BitsToDouble"
-                   (if (logbitp 63 u) (- u (expt 2 64)) u))))
+  (dotnet:static "System.BitConverter" "Int64BitsToDouble"
+                 (ldb (byte 64 0) bits)))
 
 (defconstant +single-float-positive-infinity+ (bits-single-float #x7F800000))
 (defconstant +single-float-negative-infinity+ (bits-single-float #xFF800000))

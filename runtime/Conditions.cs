@@ -636,7 +636,12 @@ public static class ConditionSystem
         var invokeDebugger = Startup.Sym("INVOKE-DEBUGGER");
         if (invokeDebugger.Function is LispFunction invDbgFn)
         {
-            invDbgFn.Invoke(condition);
+            // No debugger frame: this is ERROR handing control over, not a call
+            // the user made. Recording it would put INVOKE-DEBUGGER between
+            // *DEBUGGER-HOOK* and the frame that signalled, shifting every index
+            // the hook reads (a user (invoke-debugger c) still gets a frame — it
+            // goes through the ordinary compiled call path).
+            invDbgFn.InvokeNoFrame(condition);
         }
         throw new LispErrorException(condition);
     }

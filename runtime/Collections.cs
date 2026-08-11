@@ -1146,18 +1146,11 @@ public class LispHashTable : LispObject
             action((LispObject)pair.Key, (LispObject)pair.Value);
     }
 
-    private static bool Eql(LispObject a, LispObject b)
-    {
-        if (Runtime.IsEqRef(a, b)) return true;
-        if (a is Fixnum fa && b is Fixnum fb) return fa.Value == fb.Value;
-        if (a is LispChar ca && b is LispChar cb) return ca.Value == cb.Value;
-        // Floats compare by bits (eql semantics): 0.0/-0.0 distinct, bit-identical NaNs equal.
-        if (a is SingleFloat sa && b is SingleFloat sb)
-            return Compat.SingleToInt32Bits(sa.Value) == Compat.SingleToInt32Bits(sb.Value);
-        if (a is DoubleFloat da && b is DoubleFloat db)
-            return BitConverter.DoubleToInt64Bits(da.Value) == BitConverter.DoubleToInt64Bits(db.Value);
-        return false;
-    }
+    // The one EQL. This used to be a partial copy that knew only fixnums,
+    // characters and floats, so a hash table could not find a bignum, ratio or
+    // complex key even though CL:EQL reported the two keys EQL. Delegating
+    // keeps the table's notion of key identity from drifting from the language's.
+    private static bool Eql(LispObject a, LispObject b) => Runtime.IsTrueEql(a, b);
 
     private static bool LispEqual(LispObject a, LispObject b)
     {
@@ -1289,19 +1282,34 @@ public class LispHashTable : LispObject
             return _testName switch
             {
                 "EQ" => System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(Canonical(obj)),
-                "EQL" => obj switch
-                {
-                    Fixnum f => f.Value.GetHashCode(),
-                    LispChar c => c.Value.GetHashCode(),
-                    SingleFloat sf => sf.Value.GetHashCode(),
-                    DoubleFloat df => df.Value.GetHashCode(),
-                    _ => System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(Canonical(obj))
-                },
+                "EQL" => NumericOrCharHash(obj)
+                         ?? System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(Canonical(obj)),
                 "EQUAL" => GetEqualHash(obj),
                 "EQUALP" => GetEqualpHash(obj),
                 _ => obj.GetHashCode()
             };
         }
+
+        // EQL compares numbers by type and value, so every number must hash by
+        // value. Falling through to the identity hash (as bignums, ratios and
+        // complexes used to) puts two EQL keys in different buckets, and the
+        // table can never find them again — EQUAL inherits this through its
+        // number case, which is how a float-keyed EQUAL table silently
+        // accumulated one entry per lookup. Returns null for non-numbers.
+        // Collisions across types are fine (1 vs 1.0d0 hash alike); the test
+        // function still separates them.
+        private static int? NumericOrCharHash(LispObject obj) => obj switch
+        {
+            Fixnum f => f.Value.GetHashCode(),
+            LispChar c => c.Value.GetHashCode(),
+            SingleFloat sf => sf.Value.GetHashCode(),
+            DoubleFloat df => df.Value.GetHashCode(),
+            Bignum b => b.Value.GetHashCode(),
+            Ratio r => HashCode.Combine(r.Numerator.GetHashCode(), r.Denominator.GetHashCode()),
+            LispComplex lc => HashCode.Combine(NumericOrCharHash(lc.Real) ?? 0,
+                                               NumericOrCharHash(lc.Imaginary) ?? 0),
+            _ => null
+        };
 
         // Depth limit for structural key hashing. Like SXHASH (SxhashCompute),
         // EQUAL/EQUALP hashing descends a bounded number of levels so a circular
@@ -1319,10 +1327,12 @@ public class LispHashTable : LispObject
                 LispString s => s.Value.GetHashCode(),
                 LispVector v when v.IsCharVector => v.ToCharString().GetHashCode(),
                 Cons c => HashCode.Combine(GetEqualHash(c.Car, depth - 1), GetEqualHash(c.Cdr, depth - 1)),
-                Fixnum f => f.Value.GetHashCode(),
-                LispChar ch => ch.Value.GetHashCode(),
                 LispVector bv when bv.IsBitVector => HashBitVector(bv),
-                _ => System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(obj)
+                // EQUAL falls back to EQL for numbers and characters, so they
+                // must hash by value here too — including inside a cons, which
+                // is how SBCL's inline-constant table keys its float constants.
+                _ => NumericOrCharHash(obj)
+                     ?? System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(obj)
             };
         }
 
@@ -1416,8 +1426,17 @@ public class LispRandomState : LispObject
     public override string ToString() => "#<RANDOM-STATE>";
 
     /// <summary>Readable form that can be read back via #. eval.</summary>
+    /// The constructor is a dotcl extension living in DOTCL-INTERNAL, so that is the
+    /// package it must be printed in. It used to be spelled COMMON-LISP::, which is
+    /// a symbol that has no function: the compiled path still worked because the
+    /// compiler resolves a call by NAME through CilAssembler (which bridges bare
+    /// names across dotcl's own packages), but the tree-walk evaluator resolves the
+    /// operator through SYMBOL-FUNCTION on that exact symbol and got
+    /// "Undefined function: MAKE-RANDOM-STATE-FROM-SEEDS" (ansi-test
+    /// PRINT.RANDOM-STATE.1). Reading the old spelling also interned a
+    /// non-standard name into COMMON-LISP as a side effect.
     public string ToReadableString() =>
-        $"#.(COMMON-LISP::MAKE-RANDOM-STATE-FROM-SEEDS {(System.Numerics.BigInteger)_s0} {(System.Numerics.BigInteger)_s1})";
+        $"#.(DOTCL-INTERNAL::MAKE-RANDOM-STATE-FROM-SEEDS {(System.Numerics.BigInteger)_s0} {(System.Numerics.BigInteger)_s1})";
 
     /// <summary>Restore a random state from its two seed values.</summary>
     public static LispRandomState FromSeeds(ulong s0, ulong s1)

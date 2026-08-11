@@ -5,7 +5,39 @@ namespace DotCL;
 public class LispFunction : LispObject
 {
     private readonly Func<LispObject[], LispObject> _func;
-    public string? Name { get; }
+    private string? _name;
+    public string? Name
+    {
+        get => _name;
+        // Settable so the tree-walk evaluator can name the closure it builds for
+        // an interpreted DEFUN. Compiled code names its functions at emit time;
+        // the interpreter has no emit step, so it names them right after
+        // construction through %SET-FUNCTION-NAME. Nothing else mutates this.
+        internal set { _name = value; _frameName = FrameNameOf(value); }
+    }
+
+    // Name to record on the debugger call stack, or null when this function must
+    // not appear in a backtrace. It differs from Name only for the machinery the
+    // tree-walk evaluator runs a form through, which is ordinary named Lisp and
+    // would otherwise show up as if the user had called it:
+    //
+    //   %MINI-*       the evaluator's own helpers. Every interpreted call pushed a
+    //                 dozen of these, burying the user's frames and leaking the
+    //                 evaluator's environment through BACKTRACE-WITH-ARGS.
+    //   %CALL-WITH-*  the primitives that stand in for a special form the
+    //                 evaluator cannot emit code for (%CALL-WITH-HANDLER-CLUSTER
+    //                 for HANDLER-BIND). Compiled code emits the equivalent inline
+    //                 and shows no frame, so a frame here is a divergence.
+    //
+    // Derived once at naming time so PushFrame stays a single null test on the
+    // call hot path.
+    private string? _frameName;
+
+    private static string? FrameNameOf(string? name) =>
+        name != null && (name.StartsWith("%MINI-", StringComparison.Ordinal) ||
+                         name.StartsWith("%CALL-WITH-", StringComparison.Ordinal))
+            ? null : name;
+
     public int Arity { get; }
     public Func<LispObject[], LispObject> RawFunction => _func;
     public object[]? Environment { get; internal set; }
@@ -259,6 +291,27 @@ public class LispFunction : LispObject
                     $"Stack overflow in function {Name ?? "anonymous"}"));
             ConditionSystem.CheckInterrupt();
         }
+        // Push a debugger frame, exactly as InvokeSlow does for the same
+        // args-array shape. This is the entry every non-emitted caller uses —
+        // APPLY, and the tree-walk evaluator's own call site — so without it a
+        // named callee reached that way was missing from BACKTRACE while the
+        // identical call from compiled code (which goes through InvokeN) was
+        // listed.
+        var n = _frameName;
+        if (n == null) return _func(args);
+        (s_callStack ??= new Stack<Frame>()).Push(new Frame(n, args));
+        try { return _func(args); }
+        finally { s_callStack.TryPop(out _); }
+    }
+
+    /// <summary>Invoke without recording a debugger frame. Used where the callee
+    /// is scaffolding the debugger user is not asking about: the runtime's call to
+    /// *DEBUGGER-HOOK* runs at the depth of the frame that signalled, so the hook
+    /// appearing as frame 0 would shift every index the user reads and hide the
+    /// signalling frame's variables behind its own.</summary>
+    public LispObject InvokeNoFrame(params LispObject[] args)
+    {
+        PeriodicStackCheck();
         return _func(args);
     }
 
@@ -279,47 +332,54 @@ public class LispFunction : LispObject
 
     // Push the current function name onto the debugger call stack and return a
     // scope whose Dispose pops it. Struct + `using` keeps this alloc-free (no
-    // closure, no boxing); anonymous functions (Name == null) skip the stack.
+    // closure, no boxing); functions with no frame name skip the stack — that is
+    // anonymous functions, plus the tree-walk evaluator's own helpers.
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private FrameScope PushFrame()
     {
-        if (Name == null) return default;
-        (s_callStack ??= new Stack<Frame>()).Push(new Frame(Name));
+        var n = _frameName;
+        if (n == null) return default;
+        (s_callStack ??= new Stack<Frame>()).Push(new Frame(n));
         return new FrameScope(true);
     }
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private FrameScope PushFrame(LispObject a)
     {
-        if (Name == null) return default;
-        (s_callStack ??= new Stack<Frame>()).Push(new Frame(Name, a));
+        var n = _frameName;
+        if (n == null) return default;
+        (s_callStack ??= new Stack<Frame>()).Push(new Frame(n, a));
         return new FrameScope(true);
     }
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private FrameScope PushFrame(LispObject a, LispObject b)
     {
-        if (Name == null) return default;
-        (s_callStack ??= new Stack<Frame>()).Push(new Frame(Name, a, b));
+        var n = _frameName;
+        if (n == null) return default;
+        (s_callStack ??= new Stack<Frame>()).Push(new Frame(n, a, b));
         return new FrameScope(true);
     }
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private FrameScope PushFrame(LispObject a, LispObject b, LispObject c)
     {
-        if (Name == null) return default;
-        (s_callStack ??= new Stack<Frame>()).Push(new Frame(Name, a, b, c));
+        var n = _frameName;
+        if (n == null) return default;
+        (s_callStack ??= new Stack<Frame>()).Push(new Frame(n, a, b, c));
         return new FrameScope(true);
     }
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private FrameScope PushFrame(LispObject a, LispObject b, LispObject c, LispObject d)
     {
-        if (Name == null) return default;
-        (s_callStack ??= new Stack<Frame>()).Push(new Frame(Name, a, b, c, d));
+        var n = _frameName;
+        if (n == null) return default;
+        (s_callStack ??= new Stack<Frame>()).Push(new Frame(n, a, b, c, d));
         return new FrameScope(true);
     }
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private FrameScope PushFrame(LispObject[] args)
     {
-        if (Name == null) return default;
-        (s_callStack ??= new Stack<Frame>()).Push(new Frame(Name, args));
+        var n = _frameName;
+        if (n == null) return default;
+        (s_callStack ??= new Stack<Frame>()).Push(new Frame(n, args));
         return new FrameScope(true);
     }
 
@@ -376,7 +436,7 @@ public class LispFunction : LispObject
             PeriodicStackCheck();
             // Anonymous callee: skip the frame array (PushFrame is a no-op when
             // Name == null, so allocating it just to discard it is pure waste).
-            if (Name == null) return _func5(a, b, c, d, e);
+            if (_frameName == null) return _func5(a, b, c, d, e);
             var args = new[] { a, b, c, d, e };
             using (PushFrame(args)) return _func5(a, b, c, d, e);
         }
@@ -388,7 +448,7 @@ public class LispFunction : LispObject
         if (_func6 != null)
         {
             PeriodicStackCheck();
-            if (Name == null) return _func6(a, b, c, d, e, f);
+            if (_frameName == null) return _func6(a, b, c, d, e, f);
             var args = new[] { a, b, c, d, e, f };
             using (PushFrame(args)) return _func6(a, b, c, d, e, f);
         }
@@ -474,8 +534,9 @@ public class LispFunction : LispObject
             s_invokeSlowStats.AddOrUpdate((Name ?? StatsName ?? AnonOriginTag(), args.Length), 1,
                                           static (_, c) => c + 1);
         PeriodicStackCheck();
-        if (Name == null) return _func(args);
-        (s_callStack ??= new Stack<Frame>()).Push(new Frame(Name, args));
+        var frameName = _frameName;
+        if (frameName == null) return _func(args);
+        (s_callStack ??= new Stack<Frame>()).Push(new Frame(frameName, args));
         try { return _func(args); }
         finally { s_callStack.TryPop(out _); }
     }

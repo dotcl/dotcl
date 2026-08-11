@@ -3416,13 +3416,13 @@ public static partial class Runtime
         Emitter.CilAssembler.RegisterFunction("DIRECTORY",
             new LispFunction(args => Runtime.DirectoryFunc(args), "DIRECTORY", -1));
         Emitter.CilAssembler.RegisterFunction("FILE-AUTHOR",
-            new LispFunction(args => Runtime.FileAuthor(args[0])));
+            new LispFunction(args => { Runtime.CheckArityMin("FILE-AUTHOR", args, 1); Runtime.CheckArityMax("FILE-AUTHOR", args, 1); return Runtime.FileAuthor(args[0]); }));
         Emitter.CilAssembler.RegisterFunction("DELETE-FILE",
-            new LispFunction(args => Runtime.DeleteFile(args[0])));
+            new LispFunction(args => { Runtime.CheckArityMin("DELETE-FILE", args, 1); Runtime.CheckArityMax("DELETE-FILE", args, 1); return Runtime.DeleteFile(args[0]); }));
         Emitter.CilAssembler.RegisterFunction("DOTCL-DELETE-DIRECTORY",
             new LispFunction(args => Runtime.DeleteDirectory(args[0])));
         Emitter.CilAssembler.RegisterFunction("RENAME-FILE",
-            new LispFunction(args => Runtime.RenameFile(args[0], args[1])));
+            new LispFunction(args => { Runtime.CheckArityMin("RENAME-FILE", args, 2); return Runtime.RenameFile(args[0], args[1]); }));
         Emitter.CilAssembler.RegisterFunction("ENSURE-DIRECTORIES-EXIST",
             new LispFunction(args => Runtime.EnsureDirectoriesExist(args), "ENSURE-DIRECTORIES-EXIST", -1));
 
@@ -3604,9 +3604,25 @@ public static partial class Runtime
         }));
 
         // --- LISTEN, CLEAR-INPUT ---
-        Startup.RegisterUnary("LISTEN",
-            s => Runtime.GuardStreamIO(s, () => Runtime.Listen(s)));
-        Startup.RegisterUnary("CLEAR-INPUT", Runtime.ClearInput);
+        // CLHS gives both &OPTIONAL INPUT-STREAM, defaulting to *STANDARD-INPUT*.
+        // RegisterUnary made the argument mandatory, which never showed on the
+        // compiled path because the compiler supplies the default at the call site
+        // — so (listen) reached the function with zero arguments only under EVAL
+        // (ansi-test LISTEN.3/.4, CLEAR-INPUT.2).
+        Emitter.CilAssembler.RegisterFunction("LISTEN",
+            new LispFunction(args => {
+                Runtime.CheckArityMax("LISTEN", args, 1);
+                var s = args.Length > 0 ? args[0]
+                    : DynamicBindings.Get(Startup.Sym("*STANDARD-INPUT*"));
+                return Runtime.GuardStreamIO(s, () => Runtime.Listen(s));
+            }, "LISTEN", -1));
+        Emitter.CilAssembler.RegisterFunction("CLEAR-INPUT",
+            new LispFunction(args => {
+                Runtime.CheckArityMax("CLEAR-INPUT", args, 1);
+                var s = args.Length > 0 ? args[0]
+                    : DynamicBindings.Get(Startup.Sym("*STANDARD-INPUT*"));
+                return Runtime.ClearInput(s);
+            }, "CLEAR-INPUT", -1));
 
         // --- WRITE-BYTE, WRITE-STRING, WRITE-LINE, WRITE-CHAR ---
         Startup.RegisterBinary("WRITE-BYTE",
@@ -3623,6 +3639,8 @@ public static partial class Runtime
             }));
         Emitter.CilAssembler.RegisterFunction("WRITE-CHAR",
             new LispFunction(args => {
+                Runtime.CheckArityMin("WRITE-CHAR", args, 1);
+                Runtime.CheckArityMax("WRITE-CHAR", args, 2);
                 var ch = args[0];
                 var stream = args.Length > 1 ? args[1] : DynamicBindings.Get(Startup.Sym("*STANDARD-OUTPUT*"));
                 return Runtime.GuardStreamIO(stream, () => Runtime.WriteChar(ch, stream));
@@ -3709,6 +3727,8 @@ public static partial class Runtime
             }));
         Emitter.CilAssembler.RegisterFunction("UNREAD-CHAR",
             new LispFunction(args => {
+                Runtime.CheckArityMin("UNREAD-CHAR", args, 1);
+                Runtime.CheckArityMax("UNREAD-CHAR", args, 2);
                 var ch = args[0];
                 var stream = args.Length > 1 ? args[1] : DynamicBindings.Get(Startup.Sym("*STANDARD-INPUT*"));
                 return Runtime.UnreadChar(ch, stream);
@@ -3764,6 +3784,7 @@ public static partial class Runtime
             }, "READ", -1));
         Emitter.CilAssembler.RegisterFunction("READ-LINE",
             new LispFunction(args => {
+                Runtime.CheckArityMax("READ-LINE", args, 4);
                 var stream = args.Length > 0 ? args[0] : DynamicBindings.Get(Startup.Sym("*STANDARD-INPUT*"));
                 var eofErrorP = args.Length > 1 ? args[1] : T.Instance;
                 var eofValue = args.Length > 2 ? args[2] : Nil.Instance;

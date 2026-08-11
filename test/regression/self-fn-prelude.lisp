@@ -45,7 +45,7 @@
   5050)
 
 ;; Deep enough that a lost TCO would blow the stack.
-(deftest sfp-tail-deep
+(deftest-compiled-only sfp-tail-deep
   (%sfp-tail 200000 0)
   20000100000)
 

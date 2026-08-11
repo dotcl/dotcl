@@ -3,6 +3,60 @@
 User-facing release notes for dotcl. Each section corresponds to a tagged
 release on the public mirror (dotcl/dotcl).
 
+## v0.1.24 -- 2026-08-11
+
+Where dotcl cannot generate code at run time -- in the browser, under NativeAOT,
+under Unity's IL2CPP -- `eval` goes through a tree-walk interpreter instead of the
+compiler. This release closes a long list of differences between the two, and
+the regression suite now runs through the interpreter on every push, so they
+cannot drift apart unnoticed again.
+
+### Upgrading
+
+- A .NET `Single` now arrives as a `single-float` rather than a `double-float`.
+  The value is unchanged -- binary32 widened to binary64 exactly -- but the Lisp
+  type is now the right one, so **later arithmetic runs in single precision where
+  it used to run in double**. Results can differ. Where you want the wider type,
+  say so: `(* x 2.0d0)`.
+- The `was compiled by a different dotcl core` warning that 0.1.23 printed on
+  every start was wrong. Nothing was stale; it is gone.
+
+### Running without run-time code generation
+
+These builds evaluate through the interpreter. What was broken and now works:
+
+- `load` on a `.lisp` file — previously it could not read source at all.
+- Backtraces show your frames instead of the interpreter's internals.
+- `handler-case` and `handler-bind` catch exceptions thrown by .NET, not only
+  conditions signalled from Lisp.
+- An uncaught `throw` signals a condition instead of terminating the process.
+- `eval` from more than one thread no longer deadlocks.
+- Lambda lists are checked: wrong argument counts signal a `program-error`
+  instead of being accepted or crashing.
+
+Beyond that, a long tail of semantic differences from the compiler is corrected —
+`block` scope was dynamic, `macrolet` leaked into the global macro table, the
+function and variable namespaces were shared, `symbol-macrolet` did not reach
+`&environment`, `restart-case` did not associate its restarts with the condition,
+`handler-case`'s `:no-error` clause ran inside its own handler.
+
+New `:dotcl-emit` feature so code can ask which kind of build it is on.
+
+### Bundled applications answer for themselves
+
+Libraries commonly read their own version at load time with
+`(asdf:component-version (asdf:find-system :self))`. A bundle has no `.asd`
+files, so that form used to signal and the whole image refused to load —
+dexador and cl-str both do this. `save-application` now records the systems it
+bundled, with the versions read at build time, so those forms answer correctly
+in the deployed image.
+
+### Numbers across the .NET boundary
+
+The rules — which .NET numeric types arrive as which Lisp types, when an integer
+argument is rejected, and how `System.Decimal` works — are now written down in
+`docs/numbers.md`, with every example run against dotcl.
+
 ## v0.1.23 -- 2026-08-06
 
 SBCL's `make-host-2` cross-build stage now runs on dotcl without the workaround

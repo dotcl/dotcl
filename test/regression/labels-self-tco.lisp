@@ -10,12 +10,12 @@
 ;;; never trade correctness for the optimization.
 
 ;; Core: single self-tail-recursion at depth 3M must TCO (not overflow).
-(deftest labels-self-tco.deep-single
+(deftest-compiled-only labels-self-tco.deep-single
   (labels ((g (n acc) (if (zerop n) acc (g (1- n) (1+ acc))))) (g 3000000 0))
   3000000)
 
 ;; Multiple tail sites via cond, deep.
-(deftest labels-self-tco.deep-cond
+(deftest-compiled-only labels-self-tco.deep-cond
   (labels ((g (n acc)
              (cond ((zerop n) acc)
                    ((evenp n) (g (1- n) (+ acc 2)))
@@ -42,7 +42,7 @@
 
 ;; A sibling calls g; g self-tail-recurses at depth 3M. Mixed arity (h/1, g/2)
 ;; forces the boxed (non-mutual) path, and g must still TCO.
-(deftest labels-self-tco.mixed-arity-sibling
+(deftest-compiled-only labels-self-tco.mixed-arity-sibling
   (labels ((g (n a) (if (zerop n) a (g (1- n) (1+ a))))
            (h (x) (g x 0)))
     (h 3000000))
@@ -72,7 +72,7 @@
   50)
 
 ;; Tail self-call inside handler-case (leave, not br): deep, must TCO+catch-clean.
-(deftest labels-self-tco.handler-case-tail
+(deftest-compiled-only labels-self-tco.handler-case-tail
   (labels ((g (n acc)
              (handler-case
                  (if (zerop n) acc (g (1- n) (1+ acc)))

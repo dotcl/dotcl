@@ -34,13 +34,17 @@
         new-rmdr
         (logxor new-rmdr poly))))
 
-(deftest nis-crc-step-native-slot
+;;; DEFTEST-COMPILED-ONLY below: a native (unboxed Int64) slot representation is
+;;; chosen by the compiler from the declared slot type. An emit-free build stores
+;;; the ordinary boxed value, so these ask a question that build cannot answer.
+
+(deftest-compiled-only nis-crc-step-native-slot
   (%nis-int64-slot-p #'%nis-crc-step)
   t)
 
 ;; The store into the slot no longer boxes: the only Fixnum.Make left is the one
 ;; that hands the result back to the caller.
-(deftest nis-crc-step-one-box
+(deftest-compiled-only nis-crc-step-one-box
   (let ((sil (princ-to-string (dotcl:function-sil #'%nis-crc-step)))
         (n 0)
         (start 0))
@@ -79,7 +83,7 @@
   (let ((v (* a 2)))
     (if (zerop (logand v 1)) (* v v) (- (* v v)))))
 
-(deftest nis-tight-native-slot
+(deftest-compiled-only nis-tight-native-slot
   (%nis-int64-slot-p #'%nis-tight)
   t)
 
@@ -222,7 +226,7 @@
   (let ((v (logior 1 (* a 2))))
     (if (zerop (logand v 1)) nil (format nil "~a" v))))
 
-(deftest nis-generic-read-native-slot
+(deftest-compiled-only nis-generic-read-native-slot
   (%nis-int64-slot-p #'%nis-generic-read)
   t)
 

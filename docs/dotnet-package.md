@@ -4,6 +4,10 @@ Everything in this guide is in the `dotnet:` package, which is available without
 loading anything. Every form below was run against dotcl and shows its real
 result.
 
+Numbers have rules of their own — which .NET numeric types arrive as which Lisp
+types, when an integer argument is rejected, and how `System.Decimal` works.
+See [Numbers across the .NET boundary](numbers.md).
+
 ## Objects, methods, properties
 
 ```lisp

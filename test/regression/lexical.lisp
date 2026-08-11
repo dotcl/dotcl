@@ -18,7 +18,7 @@
 ;; (same printed name, different package). The nested lambda references the
 ;; &aux var — it must capture the &aux value, not the let value. Before the
 ;; fix, lookup-local matched cross-package and returned the wrong binding.
-(deftest multipackage-lexical.closure-captures-aux-not-let
+(deftest-compiled-only multipackage-lexical.closure-captures-aux-not-let
   (let ((arg (gensym "ARG"))
         (dummy (gensym "DUMMY")))
     (let ((form
@@ -36,7 +36,7 @@
 ;; Same structure, but the reference is read directly (not via subseq) — the
 ;; closure must return the &aux value (the array), not the let value (the
 ;; length, a fixnum).
-(deftest multipackage-lexical.closure-returns-aux-value
+(deftest-compiled-only multipackage-lexical.closure-returns-aux-value
   (let ((arg (gensym "ARG"))
         (dummy (gensym "DUMMY")))
     (let ((form
@@ -53,7 +53,7 @@
 
 ;; Without a nested closure: a direct reference to the &aux var inside the
 ;; let body must still read the &aux binding (same package, eq match).
-(deftest multipackage-lexical.direct-ref-reads-aux
+(deftest-compiled-only multipackage-lexical.direct-ref-reads-aux
   (let ((arg (gensym "ARG")))
     (let ((form
             `(lambda (,arg &aux (,*lexical-fix-sym-a* ,arg))
@@ -65,7 +65,7 @@
 
 ;; The let-bound same-name var in a different package must still be readable
 ;; by its own symbol within the let body.
-(deftest multipackage-lexical.let-binding-readable-by-own-symbol
+(deftest-compiled-only multipackage-lexical.let-binding-readable-by-own-symbol
   (let ((arg (gensym "ARG")))
     (let ((form
             `(lambda (,arg &aux (,*lexical-fix-sym-a* ,arg))

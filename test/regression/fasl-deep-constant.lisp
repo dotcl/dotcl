@@ -55,7 +55,7 @@
           ;; The fasl must rebuild the literal on its own: no process-local pool.
           (%fasl-deep-file-contains-p fasl "GetConstant"))))
 
-(deftest fasl-deep-constant.self-contained
+(deftest-compiled-only fasl-deep-constant.self-contained
   (%fasl-deep-constant-case)
   (1500 nil))
 
@@ -91,7 +91,7 @@
             (nth 2996 v) (nth 2499 v)
             (cdr (last v))))))
 
-(deftest fasl-chunked-list.roundtrip
+(deftest-compiled-only fasl-chunked-list.roundtrip
   (%fasl-chunked-list-case)
   (3000 (sub 0 0) 1 499 500 2999 (sub 2996 -2996) (sub 2499 -2499) end))
 
@@ -121,6 +121,6 @@
       (list (vectorp v) (length v)
             (aref v 0) (aref v 499) (aref v 500) (aref v 2996) (aref v 2999)))))
 
-(deftest fasl-chunked-vector.roundtrip
+(deftest-compiled-only fasl-chunked-vector.roundtrip
   (%fasl-chunked-vector-case)
   (t 3000 (sub 0) 499 500 (sub 2996) 2999))

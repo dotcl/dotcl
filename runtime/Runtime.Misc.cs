@@ -1009,8 +1009,19 @@ public static partial class Runtime
                             // .lisp file: compile each top-level form
                             foreach (var subForm in FlattenTopLevel(form))
                             {
+#if DOTCL_EMIT
                                 var instrList = CompileTopLevel(subForm);
                                 result = DotCL.Emitter.CilAssembler.AssembleAndRun(instrList);
+#else
+                                // No Reflection.Emit in this build: the tree-walk
+                                // interpreter is the only evaluator, so a source file
+                                // is loaded by evaluating its top-level forms. Without
+                                // this branch an emit-free runtime could boot its FASL
+                                // core and answer --eval, but LOAD of any .lisp died on
+                                // the CilAssembler guard — which is why the suite had
+                                // never been run on such a build.
+                                result = Eval(subForm);
+#endif
                             }
                         }
                     }
@@ -1620,6 +1631,7 @@ public static partial class Runtime
         var QUOTE = Startup.Sym("QUOTE");
         var LIST = Startup.Sym("LIST");
         var CONS = Startup.Sym("CONS");
+        var FUNCTION = Startup.Sym("FUNCTION");
         var LAMBDA = Startup.Sym("LAMBDA");
         var BLOCK = Startup.Sym("BLOCK");
         var TAGBODY = Startup.Sym("TAGBODY");
@@ -1653,16 +1665,56 @@ public static partial class Runtime
         }, "HANDLER-BIND-MACRO-EXPANDER", 2));
 
         // (restart-bind ((name fn . opts)...) . body)
-        //   → (progn (%push-restart-cluster (list (cons 'name fn)...))
+        //   → (progn (%push-restart-cluster
+        //              (list (list 'name fn desc report test interactive)...))
         //            (unwind-protect (progn . body) (%pop-restart-cluster)))
-        // Body inline. Restart options are kept by the compile-form handler used
-        // for actual compilation; this expansion is for macroexpand-1 / walkers.
+        // Body inline.
+        //
+        // The options used to be DROPPED here, on the premise (recorded in the old
+        // comment) that "restart options are kept by the compile-form handler; this
+        // expansion is for macroexpand-1 / walkers". That premise is false for the
+        // tree-walk interpreter: RESTART-CASE macroexpands into RESTART-BIND, which
+        // macroexpands through HERE, so this is the real evaluation path whenever a
+        // restart is established by EVAL — and the only one on emit-free builds.
+        // Dropping the options meant an interpreted restart could not report itself
+        // (printing gave "#<RESTART FOO>") and its :TEST never ran, so FIND-RESTART
+        // returned a restart the test excludes (ansi-test RESTART-CASE.19/20/21).
+        //
+        // Option forms are spliced UNEVALUATED so they are evaluated in the
+        // establishing environment, exactly like the function itself — :report may
+        // be a closure over the surrounding scope. A string :report-function is the
+        // description rather than a function (CLHS restart-case :report).
         Runtime.RegisterMacroFunction(Startup.Sym("RESTART-BIND"), new LispFunction(margs => {
             if (margs[0] is not Cons form || form.Cdr is not Cons rest) return margs[0];
             var pairs = new System.Collections.Generic.List<LispObject>();
             for (var b = rest.Car; b is Cons bc; b = bc.Cdr)
                 if (bc.Car is Cons bd && bd.Cdr is Cons bf)
-                    pairs.Add(Runtime.List(CONS, Runtime.List(QUOTE, bd.Car), bf.Car));
+                {
+                    LispObject desc = Nil.Instance, report = Nil.Instance,
+                               test = Nil.Instance, inter = Nil.Instance;
+                    for (var o = bf.Cdr; o is Cons oc && oc.Cdr is Cons ov; o = ov.Cdr)
+                    {
+                        var key = (oc.Car as Symbol)?.Name;
+                        var val = ov.Car;
+                        // A bare symbol names the FUNCTION, not a variable (CLHS:
+                        // the option takes a function designator). Splicing it raw
+                        // made the interpreter read it as a variable — which only
+                        // appeared to work while FLET bindings shared the variable
+                        // alist. compile-restart-case does the same (function x)
+                        // wrapping, so both paths agree.
+                        LispObject AsFn(LispObject v) =>
+                            v is Symbol sy && sy != Startup.NIL_SYM
+                                ? Runtime.List(FUNCTION, v) : v;
+                        if (key == "REPORT-FUNCTION" || key == "REPORT")
+                        {
+                            if (val is LispString) desc = val; else report = AsFn(val);
+                        }
+                        else if (key == "TEST-FUNCTION" || key == "TEST") test = AsFn(val);
+                        else if (key == "INTERACTIVE-FUNCTION" || key == "INTERACTIVE") inter = AsFn(val);
+                    }
+                    pairs.Add(Runtime.List(LIST, Runtime.List(QUOTE, bd.Car), bf.Car,
+                                           desc, report, test, inter));
+                }
             var listForm = new Cons(LIST, Runtime.List(pairs.ToArray()));
             var bodyProgn = new Cons(PROGN, rest.Cdr);
             var uw = Runtime.List(UNWIND_PROTECT, bodyProgn, Runtime.List(POP_RB));
@@ -1713,22 +1765,54 @@ public static partial class Runtime
                 tagForms.Add(Runtime.List(RETURN_FROM, blk, clauseResult));
             }
             // protected form, wrapping with :no-error mv-call when present
+            // CLHS HANDLER-CASE: the :NO-ERROR clause's body runs only after the
+            // handlers are no longer active, so an error it signals must reach the
+            // NEXT outer handler — not this form's own clauses. Wrapping EXPR in
+            // MULTIPLE-VALUE-CALL of the :no-error function, as this expansion used
+            // to, ran that body INSIDE the HANDLER-BIND, so
+            //   (handler-case (handler-case (values)
+            //                   (error () 'bad)
+            //                   (:no-error () (error "foo")))
+            //     (error () 'good))
+            // answered BAD (ansi-test HANDLER-CASE.25). COMPILE-HANDLER-CASE gets
+            // this right, so it showed only under EVAL.
+            //
+            // Instead stash EXPR's values, leave the HANDLER-BIND by GO, and apply
+            // the :no-error function from a tagbody segment — the same place the
+            // error clauses run, which is by construction outside the handlers.
             LispObject protectedReturn;
+            Symbol? vvar = null;
             if (noErrorClause is Cons ne && ne.Cdr is Cons nec)
             {
                 var nell = nec.Car; var nebody = nec.Cdr;
-                protectedReturn = Runtime.List(RETURN_FROM, blk,
-                    new Cons(MVCALL, new Cons(new Cons(LAMBDA, new Cons(nell, nebody)),
-                        new Cons(expr, Nil.Instance))));
+                vvar = (Symbol)Runtime.Gensym(new LispString("HC-VALS"));
+                var neTag = Runtime.Gensym(new LispString("HC-NO-ERROR"));
+                protectedReturn = Runtime.List(SETQ, vvar,
+                    Runtime.List(Startup.Sym("MULTIPLE-VALUE-LIST"), expr));
+                tagForms.Add(neTag);
+                tagForms.Add(Runtime.List(RETURN_FROM, blk,
+                    Runtime.List(Startup.Sym("APPLY"),
+                        new Cons(LAMBDA, new Cons(nell, nebody)), vvar)));
+                // The GO must sit AFTER the handler-bind, not inside it.
+                protectedReturn = Runtime.List(PROGN,
+                    new Cons(Startup.Sym("HANDLER-BIND"),
+                        new Cons(Runtime.List(hbBindings.ToArray()),
+                            new Cons(protectedReturn, Nil.Instance))),
+                    Runtime.List(GO, neTag));
             }
             else
-                protectedReturn = Runtime.List(RETURN_FROM, blk, expr);
-            var hb = new Cons(Startup.Sym("HANDLER-BIND"),
-                new Cons(Runtime.List(hbBindings.ToArray()),
-                    new Cons(protectedReturn, Nil.Instance)));
-            var tagbody = new Cons(TAGBODY, new Cons(hb, Runtime.List(tagForms.ToArray())));
-            var letc = Runtime.List(Startup.Sym("LET"),
-                Runtime.List(Runtime.List(cvar, Nil.Instance)), tagbody);
+            {
+                protectedReturn = new Cons(Startup.Sym("HANDLER-BIND"),
+                    new Cons(Runtime.List(hbBindings.ToArray()),
+                        new Cons(Runtime.List(RETURN_FROM, blk, expr), Nil.Instance)));
+            }
+            var tagbody = new Cons(TAGBODY,
+                new Cons(protectedReturn, Runtime.List(tagForms.ToArray())));
+            var letBindings = vvar == null
+                ? Runtime.List(Runtime.List(cvar, Nil.Instance))
+                : Runtime.List(Runtime.List(cvar, Nil.Instance),
+                               Runtime.List(vvar, Nil.Instance));
+            var letc = Runtime.List(Startup.Sym("LET"), letBindings, tagbody);
             return Runtime.List(BLOCK, blk, letc);
         }, "HANDLER-CASE-MACRO-EXPANDER", 2));
 
@@ -1738,9 +1822,14 @@ public static partial class Runtime
         //          (restart-bind ((name (lambda (&rest #:a) (setq #:av #:a) (go #:tag))
         //                          opts...)...) EXPR))
         //        #:tag (return-from #:b (apply (lambda (args...) . body) #:av)) ...)))
+        //
+        // When EXPR is a signaling form, it is additionally wrapped so the restarts
+        // this form establishes are associated with the condition it signals — see
+        // WrapSignalingRestartCaseBody below.
         Runtime.RegisterMacroFunction(Startup.Sym("RESTART-CASE"), new LispFunction(margs => {
             if (margs[0] is not Cons form || form.Cdr is not Cons rest) return margs[0];
             var expr = rest.Car;
+            var mEnv = margs.Length > 1 ? margs[1] : Nil.Instance;
             var blk = (Symbol)Runtime.Gensym(new LispString("RC-BLOCK"));
             var avar = (Symbol)Runtime.Gensym(new LispString("RC-ARGS"));
             var REST = Startup.Sym("&REST");
@@ -1776,13 +1865,71 @@ public static partial class Runtime
                     Runtime.List(APPLY, new Cons(LAMBDA, new Cons(ll, cbody)), avar)));
             }
             var rb = new Cons(Startup.Sym("RESTART-BIND"),
-                new Cons(Runtime.List(rbBindings.ToArray()), new Cons(expr, Nil.Instance)));
+                new Cons(Runtime.List(rbBindings.ToArray()),
+                         new Cons(WrapSignalingRestartCaseBody(expr, mEnv), Nil.Instance)));
             var tagbody = new Cons(TAGBODY,
                 new Cons(Runtime.List(RETURN_FROM, blk, rb), Runtime.List(tagForms.ToArray())));
             var letc = Runtime.List(Startup.Sym("LET"),
                 Runtime.List(Runtime.List(avar, Nil.Instance)), tagbody);
             return Runtime.List(BLOCK, blk, letc);
         }, "RESTART-CASE-MACRO-EXPANDER", 2));
+    }
+
+    /// CLHS RESTART-CASE: when the protected form is a call to SIGNAL, ERROR,
+    /// CERROR or WARN — "or a macro form which macroexpands into such a list" —
+    /// WITH-CONDITION-RESTARTS is used implicitly, so the restarts this
+    /// RESTART-CASE establishes belong to the condition that form signals and are
+    /// invisible to any other condition. compile-restart-case (cil-forms.lisp)
+    /// already does this for compiled code; the macro expansion did not, so an
+    /// interpreted (restart-case (error ...) (foo () ...)) left its FOO
+    /// unassociated. A handler that resignals then saw the *inner* FOO through
+    /// (find-restart 'foo c) and ran the wrong clause (ansi-test RESTART-CASE.25-31),
+    /// and COMPUTE-RESTARTS on an unrelated condition wrongly listed it
+    /// (COMPUTE-RESTARTS.9). Same shape as the rest of this family: the work that
+    /// supports EVAL existed only on the compile path.
+    ///
+    /// (restart-bind (...) EXPR) becomes
+    ///   (restart-bind (...)
+    ///     (let ((#:rs (%top-cluster-restarts)))            ; the cluster just pushed
+    ///       (handler-bind ((condition (lambda (#:c)
+    ///                                   (%associate-condition-restarts #:c #:rs))))
+    ///         EXPR)))
+    /// The association happens at signal time rather than at establishment time
+    /// because the condition object does not exist yet when the cluster is pushed.
+    private static LispObject WrapSignalingRestartCaseBody(LispObject expr, LispObject env)
+    {
+        if (!IsSignalingForm(expr, env)) return expr;
+        var rs = (Symbol)Runtime.Gensym(new LispString("RC-RESTARTS"));
+        var cv = (Symbol)Runtime.Gensym(new LispString("RC-COND"));
+        var handler = Runtime.List(Startup.Sym("LAMBDA"), Runtime.List(cv),
+            Runtime.List(Startup.Sym("%ASSOCIATE-CONDITION-RESTARTS"), cv, rs));
+        var hb = Runtime.List(Startup.Sym("HANDLER-BIND"),
+            Runtime.List(Runtime.List(Startup.Sym("CONDITION"), handler)), expr);
+        return Runtime.List(Startup.Sym("LET"),
+            Runtime.List(Runtime.List(rs, Runtime.List(Startup.Sym("%TOP-CLUSTER-RESTARTS")))),
+            hb);
+    }
+
+    /// True when FORM is, or macroexpands in ENV into, a call to SIGNAL / ERROR /
+    /// CERROR / WARN. ENV matters: ansi-test RESTART-CASE.29/30/31 reach the
+    /// signaling form only through MACROLET / SYMBOL-MACROLET bindings, which are
+    /// invisible to an environment-less MACROEXPAND-1.
+    private static bool IsSignalingForm(LispObject form, LispObject env)
+    {
+        var expander = Emitter.CilAssembler.TryGetFunction("MACROEXPAND-1");
+        for (var i = 0; i < 64; i++)
+        {
+            if (form is Cons c && c.Car is Symbol s
+                && (s.Name == "ERROR" || s.Name == "SIGNAL"
+                    || s.Name == "CERROR" || s.Name == "WARN"))
+                return true;
+            if (expander == null) return false;
+            var next = MultipleValues.Primary(expander.Invoke(new[] { form, env }));
+            // MACROEXPAND-1 returns the very same object when nothing expanded.
+            if (ReferenceEquals(next, form)) return false;
+            form = next;
+        }
+        return false;
     }
 
     /// When true, COMPILE-FILE wraps a compile error on a top-level form in a
@@ -1792,6 +1939,23 @@ public static partial class Runtime
     /// gated: ordinary interactive/script COMPILE-FILE leaves it false so the raw
     /// LispErrorException (a real condition) still propagates to handler-case.
     [ThreadStatic] internal static bool EmitBuildSourceLocations;
+
+    /// True while a non-default *MACROEXPAND-HOOK* is running, so MACROEXPAND-1
+    /// calls the expander directly instead of going through the hook again.
+    ///
+    /// An INTERPRETED hook re-enters without this. The tree-walk evaluator
+    /// macroexpands the hook's own body on every call, so a hook whose body
+    /// contains any macro — (incf count) is enough — expands it, which calls
+    /// MACROEXPAND-1, which calls the hook, forever. The process dies on a .NET
+    /// stack overflow, which cannot be caught. A COMPILED hook never showed this:
+    /// its body was expanded once at compile time, so nothing expands while it
+    /// runs and this guard never fires.
+    ///
+    /// The effect is that a hook does not observe expansions performed by its own
+    /// body. That is the only terminating reading for an evaluator that expands at
+    /// eval time, and it leaves what the hook is for — seeing the expansions of
+    /// the code being walked — intact.
+    [ThreadStatic] private static bool _inMacroexpandHook;
 
     /// <summary>
     /// When true, COMPILE-FILE emits a Portable PDB even without the
@@ -2392,8 +2556,9 @@ public static partial class Runtime
         // Collect ASDF system sources (transitive, topologically ordered) if :system given.
         // This requires ASDF to be loaded in the current session.
         var asdfsources = new List<string>();
+        var asdfSystems = new List<(string Name, string Version)>();
         if (systemArg != null)
-            asdfsources = CollectAsdfSystemSources(systemArg);
+            asdfsources = CollectAsdfSystemSources(systemArg, out asdfSystems);
 
         var preludeSources = NormalizeSourceList(preludeArg);
         var userSources = NormalizeSourceList(loadArg);
@@ -2441,7 +2606,7 @@ public static partial class Runtime
 
         try
         {
-            BuildFaslFromSources(faslPath, sources, toplevelDesignator);
+            BuildFaslFromSources(faslPath, sources, toplevelDesignator, asdfSystems);
             if (isExecutable)
                 BuildExecutableFromFasl(faslPath, outputPath, targetRid, runtimeCsprojOverride, isR2r, noSelfContained);
         }
@@ -2465,7 +2630,8 @@ public static partial class Runtime
     /// :executable nil and :executable t paths.
     /// </summary>
     private static void BuildFaslFromSources(
-        string faslPath, List<string> sources, LispObject? toplevelDesignator)
+        string faslPath, List<string> sources, LispObject? toplevelDesignator,
+        List<(string Name, string Version)>? asdfSystems = null)
     {
         var moduleName = Path.GetFileNameWithoutExtension(faslPath)
             + "_" + Guid.NewGuid().ToString("N").Substring(0, 8);
@@ -2487,6 +2653,37 @@ public static partial class Runtime
                 var requireForm = new Cons(Startup.Sym("REQUIRE"),
                     new Cons(new LispString("asdf"), Nil.Instance));
                 faslAsm.AddTopLevelForm(CompileTopLevel(requireForm));
+            }
+
+            // Tell ASDF which systems this image already contains, before any of
+            // their own files run. Libraries routinely bind their version from
+            // (asdf:component-version (asdf:find-system :self)) at load time —
+            // dexador and cl-str both do — and a bundle has no .asd files, so
+            // those forms would signal and stop the load.
+            //
+            // register-preloaded-system is ASDF's own answer for "in the image,
+            // no filesystem backing"; it registers the system directly rather
+            // than through the search functions, so a real .asd on the target
+            // still wins if there is one. The stronger register-immutable-system
+            // (which makes the in-image copy unconditionally win) is a
+            // deployment policy, so it stays the caller's to add via :prelude.
+            //
+            // Versions are literals read at collection time: :version t means
+            // "keep the version of the already-loaded system", which is true in
+            // the building image and false in the deployed one.
+            // Count, not null: with no :system there is no closure and ASDF may
+            // not even be loaded, so resolving the symbol would signal.
+            if (asdfSystems != null && asdfSystems.Count > 0)
+            {
+                var registerSym = ResolveSymbolName("ASDF:REGISTER-PRELOADED-SYSTEM");
+                foreach (var (name, version) in asdfSystems)
+                {
+                    LispObject args = new Cons(new LispString(name), Nil.Instance);
+                    if (!string.IsNullOrEmpty(version))
+                        ((Cons)args).Cdr = new Cons(Startup.SymInPkg("VERSION", "KEYWORD"),
+                            new Cons(new LispString(version), Nil.Instance));
+                    faslAsm.AddTopLevelForm(CompileTopLevel(new Cons(registerSym, args)));
+                }
             }
 
             // Say where we are. A closure of several hundred sources takes long
@@ -2741,7 +2938,13 @@ public static partial class Runtime
     /// Closes over system-depends-on here and asks asdf only for one system's
     /// own files at a time; see the comment on the query for why.
     /// </summary>
-    private static List<string> CollectAsdfSystemSources(LispObject systemDesignator)
+    /// <summary>Source files of a system's transitive closure, dependencies first.
+    /// SYSTEMS receives the (name, version) of every system walked — read here while
+    /// the building image still has a real ASDF registry, so the deployed image can
+    /// answer for itself. See the register-preloaded-system emission in
+    /// BuildFaslFromSources.</summary>
+    private static List<string> CollectAsdfSystemSources(
+        LispObject systemDesignator, out List<(string Name, string Version)> systems)
     {
         // Convert designator to a lowercase string for ASDF
         string sysName = systemDesignator switch
@@ -2792,8 +2995,9 @@ public static partial class Runtime
                                         (push sys order)))))))
                              (visit ""{sysName}""))
                            (let ((files '())
-                                 (emitted (make-hash-table :test 'equal)))
-                             (dolist (sys (nreverse order))
+                                 (emitted (make-hash-table :test 'equal))
+                                 (ordered (nreverse order)))
+                             (dolist (sys ordered)
                                (dolist (c (or (ignore-errors
                                                 (asdf:required-components sys :other-systems nil))
                                               '()))
@@ -2802,7 +3006,17 @@ public static partial class Runtime
                                      (unless (gethash p emitted)
                                        (setf (gethash p emitted) t)
                                        (push p files))))))
-                             (nreverse files)))";
+                             ;; Second value: (name version) for each system in the
+                             ;; closure, read here while the build image still has a
+                             ;; real registry. The deployed image has no .asd files,
+                             ;; so this is the only chance to learn the versions.
+                             (list (nreverse files)
+                                   (mapcar (lambda (sys)
+                                             (list (asdf:component-name sys)
+                                                   (let ((v (ignore-errors
+                                                              (asdf:component-version sys))))
+                                                     (if (stringp v) v """"))))
+                                           ordered))))";
 
         LispObject result;
         try
@@ -2820,7 +3034,8 @@ public static partial class Runtime
         }
 
         var files = new List<string>();
-        var cur = result;
+        systems = new List<(string Name, string Version)>();
+        var cur = result is Cons top ? top.Car : result;
         while (cur is Cons c)
         {
             if (c.Car is LispString ls)
@@ -2828,6 +3043,15 @@ public static partial class Runtime
             else if (c.Car is LispPathname pn)
                 files.Add(pn.ToNamestring());
             cur = c.Cdr;
+        }
+        var sysList = result is Cons top2 && top2.Cdr is Cons second ? second.Car : Nil.Instance;
+        while (sysList is Cons sc)
+        {
+            if (sc.Car is Cons pair
+                && pair.Car is LispString nameStr
+                && pair.Cdr is Cons vcell && vcell.Car is LispString verStr)
+                systems.Add((nameStr.Value, verStr.Value));
+            sysList = sc.Cdr;
         }
         return files;
     }
@@ -3057,17 +3281,28 @@ public static partial class Runtime
 
     private static LispObject EvalCompound(LispObject form)
     {
-#if DOTCL_EMIT
-        // :interpret mode routes compound forms through the emit-free tree-walk
-        // interpreter; :compile (default) uses the CIL compiler below.
-        if (UseInterpreter())
-            return MiniEval(form);
-        // Use eval-specific compile path that preserves MvReturn at tail
-        // so callers can observe multiple values from form.
-        var instrList = CompileTopLevelEval(form);
+        // An unmatched THROW must leave EVAL as a CONTROL-ERROR (ansi-test
+        // THROW-ERROR: (signals-error (throw (gensym) nil) control-error)), and
+        // that conversion has to happen on BOTH evaluator paths. It used to wrap
+        // the compiled branch only, so under the interpreter the raw .NET
+        // CatchThrowException escaped all the way to Program.Main and killed the
+        // process — the ansi-test run died there rather than reporting a failure.
         try
         {
+#if DOTCL_EMIT
+            // :interpret mode routes compound forms through the emit-free tree-walk
+            // interpreter; :compile (default) uses the CIL compiler below.
+            if (UseInterpreter())
+                return MiniEval(form);
+            // Use eval-specific compile path that preserves MvReturn at tail
+            // so callers can observe multiple values from form.
+            var instrList = CompileTopLevelEval(form);
             return DotCL.Emitter.CilAssembler.AssembleAndRun(instrList);
+#else
+            // No Reflection.Emit in this build: the tree-walk interpreter is the
+            // only way to evaluate a compound form.
+            return MiniEval(form);
+#endif
         }
         catch (CatchThrowException cte)
         {
@@ -3079,11 +3314,6 @@ public static partial class Runtime
             throw new LispErrorException(new LispControlError(
                 $"Attempt to THROW to tag {cte.Tag} but no catching CATCH form was found"));
         }
-#else
-        // No Reflection.Emit in this build: the tree-walk interpreter is the only
-        // way to evaluate a compound form.
-        return MiniEval(form);
-#endif
     }
 
     /// <summary>True when eval should use the tree-walk interpreter
@@ -3103,7 +3333,20 @@ public static partial class Runtime
         var fn = Startup.SymInPkg("%MINI-EVAL", "DOTCL.CIL-COMPILER").Function as LispFunction
             ?? throw new LispErrorException(new LispProgramError(
                 "tree-walk interpreter (%mini-eval) is unavailable: the core is not loaded"));
-        return fn.Invoke(form, Nil.Instance);
+        // _evalLock serializes COMPILATION, and must not be held while a form
+        // RUNS: a form that blocks waiting on other threads which themselves need
+        // to compile deadlocks. The compiled path releases it around the
+        // run inside AssembleAndRunSingle — but the interpreter never goes there,
+        // so on this path the lock stayed held for the whole evaluation and that
+        // same deadlock came back whenever eval interprets. Interpreting IS
+        // running (no compiler or assembler is involved), so release for the whole
+        // call, same shape as AssembleAndRunSingle and keeping the outer `lock`
+        // balanced.
+        bool releasedEvalLock = SerializeEval
+                                && System.Threading.Monitor.IsEntered(_evalLock);
+        if (releasedEvalLock) System.Threading.Monitor.Exit(_evalLock);
+        try { return fn.Invoke(form, Nil.Instance); }
+        finally { if (releasedEvalLock) System.Threading.Monitor.Enter(_evalLock); }
     }
 
     /// <summary>
@@ -4275,7 +4518,7 @@ public static partial class Runtime
 
         // EVAL, FORMAT, FORMATTER
         Emitter.CilAssembler.RegisterFunction("EVAL",
-            new LispFunction(args => Runtime.Eval(args[0])));
+            new LispFunction(args => { Runtime.CheckArityMin("EVAL", args, 1); Runtime.CheckArityMax("EVAL", args, 1); return Runtime.Eval(args[0]); }));
         Emitter.CilAssembler.RegisterFunction("FORMAT",
             new LispFunction(args => {
                 var dest = args[0];
@@ -4319,10 +4562,51 @@ public static partial class Runtime
         // FUNCALL
         Emitter.CilAssembler.RegisterFunction("FUNCALL",
             new LispFunction(args => {
+                Runtime.CheckArityMin("FUNCALL", args, 1);
                 if (args[0] is LispFunction f) return f.Invoke(args.SubArray(1));
-                if (args[0] is Symbol s) return ((LispFunction)Runtime.Fdefinition(s)).Invoke(args.SubArray(1));
-                throw new LispErrorException(new LispTypeError("FUNCALL: not a function designator", args[0]));
+                // A symbol designator is resolved by CoerceToFunction — the same
+                // coercion the compiled general FUNCALL path emits. It used to go
+                // through Fdefinition, which is deliberately more permissive: it
+                // answers for macros and hands back a stub for special operators,
+                // both of which are FBOUNDP but have no function to call. So
+                // (funcall 'progn 1) reported "Cannot call special operator PROGN"
+                // as a plain ERROR and (funcall 'defconstant ...) reported the
+                // MACRO's arity mismatch, where the compiled path reports
+                // UNDEFINED-FUNCTION naming the symbol (ansi FUNCALL.ERROR.1/2/3).
+                // CoerceToFunction also keeps the cross-package bridge that
+                // Fdefinition lacks.
+                return Runtime.CoerceToFunction(args[0]).Invoke(args.SubArray(1));
             }));
+
+        // The same coercion, callable from Lisp: %MINI-EVAL uses it to resolve a
+        // symbol in OPERATOR position. It used to call SYMBOL-FUNCTION directly,
+        // which has no cross-package bare-name bridge — so a function registered
+        // on a DOTCL-MOP / DOTCL-INTERNAL symbol was callable from compiled code
+        // (CilAssembler.GetFunctionBySymbol bridges) and through FUNCALL, but not
+        // as a plain (name args...) form under the interpreter:
+        //   (class-precedence-list c)          => Undefined function   (interpreted)
+        //   (funcall 'class-precedence-list c) => works
+        //   compiled (class-precedence-list c) => works
+        // Routing operator position through the same coercion removes that whole
+        // class of divergence rather than giving each name its own binding.
+        Emitter.CilAssembler.RegisterFunction("%COERCE-TO-FUNCTION",
+            new LispFunction(args => {
+                Runtime.CheckArityExact("%COERCE-TO-FUNCTION", args, 1);
+                return Runtime.CoerceToFunction(args[0]);
+            }, "%COERCE-TO-FUNCTION", 1));
+
+        // %SET-FUNCTION-NAME fn name-string -> fn
+        // Names a function after the fact. The tree-walk evaluator needs it: a
+        // compiled DEFUN gets its name at emit time, but the interpreter builds
+        // an ordinary anonymous closure, and an anonymous callee pushes no
+        // debugger frame — so BACKTRACE saw nothing of the user's own calls on
+        // an emit-free build. Naming the closure makes the two evaluators agree.
+        Emitter.CilAssembler.RegisterFunction("%SET-FUNCTION-NAME",
+            new LispFunction(args => {
+                Runtime.CheckArityExact("%SET-FUNCTION-NAME", args, 2);
+                if (args[0] is LispFunction fn && args[1] is LispString s) fn.Name = s.Value;
+                return args[0];
+            }, "%SET-FUNCTION-NAME", 2));
 
         // SYMBOL-FUNCTION, FDEFINITION, %SET-FDEFINITION, FMAKUNBOUND, MAKUNBOUND
         // SYMBOL-FUNCTION only accepts symbols (unlike FDEFINITION which also takes (setf sym))
@@ -4522,7 +4806,7 @@ public static partial class Runtime
         }
         static LispObject CallExpander(LispFunction expander, bool is2arg, LispObject form, LispObject env)
         {
-            var hook = NonDefaultMacroexpandHook();
+            var hook = _inMacroexpandHook ? null : NonDefaultMacroexpandHook();
             if (hook == null)
                 return MultipleValues.Primary(is2arg
                     ? expander.Invoke(new LispObject[] { form, env })
@@ -4530,7 +4814,13 @@ public static partial class Runtime
             var hookee = is2arg
                 ? expander
                 : new LispFunction(a => expander.Invoke(new[] { a[0] }), expander.Name, 2);
-            return MultipleValues.Primary(hook.Invoke(new LispObject[] { hookee, form, env }));
+            var savedInHook = _inMacroexpandHook;
+            _inMacroexpandHook = true;
+            try
+            {
+                return MultipleValues.Primary(hook.Invoke(new LispObject[] { hookee, form, env }));
+            }
+            finally { _inMacroexpandHook = savedInHook; }
         }
 
         // MACROEXPAND-1

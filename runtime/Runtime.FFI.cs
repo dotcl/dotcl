@@ -155,7 +155,7 @@ static class NativeFFI
             ushort us => Fixnum.Make(us),
             sbyte sb => Fixnum.Make(sb),
             byte b => Fixnum.Make(b),
-            float f => new DoubleFloat(f),
+            float f => new SingleFloat(f),   // binary32 — see DotNetToLisp
             double d => new DoubleFloat(d),
             bool bv => bv ? T.Instance : Nil.Instance,
             _ => Runtime.DotNetToLisp(result)

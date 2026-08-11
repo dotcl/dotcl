@@ -515,7 +515,7 @@ public static partial class Runtime
         Emitter.CilAssembler.RegisterFunction("LOGICAL-PATHNAME-TRANSLATIONS",
             new LispFunction(args => Runtime.LogicalPathnameTranslations(args[0])));
         Emitter.CilAssembler.RegisterFunction("TRANSLATE-LOGICAL-PATHNAME",
-            new LispFunction(args => Runtime.TranslateLogicalPathname(args[0])));
+            new LispFunction(args => { Runtime.CheckArityMin("TRANSLATE-LOGICAL-PATHNAME", args, 1); return Runtime.TranslateLogicalPathname(args[0]); }));
 
         // MAKE-PATHNAME as callable function (also compiled inline by cil-compiler)
         Emitter.CilAssembler.RegisterFunction("MAKE-PATHNAME", new LispFunction(Runtime.MakePathname));
@@ -595,8 +595,8 @@ public static partial class Runtime
         }));
 
         // PATHNAME and NAMESTRING as callable functions
-        Emitter.CilAssembler.RegisterFunction("PATHNAME", new LispFunction(args => Runtime.Pathname(args[0])));
-        Emitter.CilAssembler.RegisterFunction("NAMESTRING", new LispFunction(args => Runtime.Namestring(args[0])));
+        Emitter.CilAssembler.RegisterFunction("PATHNAME", new LispFunction(args => { Runtime.CheckArityMin("PATHNAME", args, 1); Runtime.CheckArityMax("PATHNAME", args, 1); return Runtime.Pathname(args[0]); }));
+        Emitter.CilAssembler.RegisterFunction("NAMESTRING", new LispFunction(args => { Runtime.CheckArityMin("NAMESTRING", args, 1); Runtime.CheckArityMax("NAMESTRING", args, 1); return Runtime.Namestring(args[0]); }));
 
         // FILE-NAMESTRING: return name.type portion of namestring
         Emitter.CilAssembler.RegisterFunction("FILE-NAMESTRING", new LispFunction(args => {
@@ -736,7 +736,7 @@ public static partial class Runtime
         // PARSE-NAMESTRING
         Emitter.CilAssembler.RegisterFunction("PARSE-NAMESTRING",
             new LispFunction(args => {
-                if (args.Length == 0) throw new Exception("PARSE-NAMESTRING: requires at least 1 argument");
+                Runtime.CheckArityMin("PARSE-NAMESTRING", args, 1);
                 var thing = args[0];
 
                 if (thing is LispPathname pn)

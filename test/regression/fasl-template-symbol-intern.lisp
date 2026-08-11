@@ -35,6 +35,6 @@
           ;; The macro still expands and runs.
           (eval (read-from-string "(tmplsym-pkg::mac)")))))
 
-(deftest fasl-template-symbol-intern.load-time
+(deftest-compiled-only fasl-template-symbol-intern.load-time
   (%fasl-template-sym-case)
   (t t 42))

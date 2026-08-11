@@ -81,29 +81,41 @@
 (defun %dec-neg (x) (declare (type dotcl:decimal x)) (- x))
 (defun %dec-chain (x y z) (declare (type dotcl:decimal x y z)) (+ (* x y) z))
 
-(deftest dec-decl-add-preserves-scale
+;;; Two groups below are DEFTEST-COMPILED-ONLY.
+;;;
+;;; The declared-scope tests assert that a DECLARE / THE of type DOTCL:DECIMAL
+;;; makes arithmetic stay in the native decimal representation. Choosing that
+;;; representation is a compile-time decision driven by the declaration; with no
+;;; compiler the values degrade to the standard rational tower, which is the
+;;; documented behaviour of an undeclared expression rather than a wrong answer.
+;;;
+;;; The mixing guards assert a PROGRAM-ERROR the COMPILER emits when a declared
+;;; decimal meets a statically float-typed value. A tree-walk evaluator has no
+;;; compile phase to diagnose from.
+
+(deftest-compiled-only dec-decl-add-preserves-scale
   (let ((r (%dec-sum #m1.50 #m2.25)))
     (list (dotcl:decimalp r) (princ-to-string r)))
   (t "#m3.75"))
 
-(deftest dec-decl-sub
+(deftest-compiled-only dec-decl-sub
   (princ-to-string (%dec-diff #m5.00 #m1.25))
   "#m3.75")
 
-(deftest dec-decl-mul
+(deftest-compiled-only dec-decl-mul
   (princ-to-string (%dec-mul #m1.5 #m2))
   "#m3.0")
 
-(deftest dec-decl-neg
+(deftest-compiled-only dec-decl-neg
   (princ-to-string (%dec-neg #m3.14))
   "#m-3.14")
 
-(deftest dec-decl-chain               ; (+ (* x y) z), all native decimal
+(deftest-compiled-only dec-decl-chain               ; (+ (* x y) z), all native decimal
   (princ-to-string (%dec-chain #m1.5 #m2.0 #m0.25))
   "#m3.25")
 
 ;; let-bound decimal locals get the same native path
-(deftest dec-decl-let
+(deftest-compiled-only dec-decl-let
   (let ((r (let ((a #m1.50) (b #m2.25))
              (declare (type dotcl:decimal a b))
              (+ a b))))
@@ -113,7 +125,7 @@
 ;; (the dotcl:decimal E) is a "strong" trigger: native decimal arithmetic even without a
 ;; declared local. Bare-literal arithmetic (dec-arith-degrades-to-rational) stays on
 ;; the standard tower — only a declared decimal / (the decimal) opts into native ops.
-(deftest dec-the-triggers-native
+(deftest-compiled-only dec-the-triggers-native
   (princ-to-string (+ (the dotcl:decimal #m1.50) (the dotcl:decimal #m2.25)))
   "#m3.75")
 
@@ -128,13 +140,13 @@
 ;; coerce ((rational d) / (float d)) dissolves it.
 
 (defun %dec-mix (x y) (declare (type dotcl:decimal x) (type double-float y)) (+ x y))
-(deftest dec-mix-float-errors
+(deftest-compiled-only dec-mix-float-errors
   (handler-case (progn (%dec-mix #m1.5 2.0d0) :no-error)
     (program-error () :mix-error))
   :mix-error)
 
 (defun %dec-mix-single (x y) (declare (type dotcl:decimal x) (type single-float y)) (* x y))
-(deftest dec-mix-single-errors
+(deftest-compiled-only dec-mix-single-errors
   (handler-case (progn (%dec-mix-single #m2.0 3.0) :no-error)
     (program-error () :mix-error))
   :mix-error)
@@ -198,18 +210,18 @@
     (dotimes (i n acc)
       (setq acc (+ acc #m1.25)))))
 
-(deftest dec-native-slot-accumulates
+(deftest-compiled-only dec-native-slot-accumulates
   (princ-to-string (%dec-native-sum 4))
   "#m5.00")
 
 ;; The slot's value read generically is a first-class decimal again.
-(deftest dec-native-slot-boxes-on-generic-read
+(deftest-compiled-only dec-native-slot-boxes-on-generic-read
   (let ((r (%dec-native-sum 2)))
     (list (dotcl:decimalp r) (princ-to-string r)))
   (t "#m2.50"))
 
 ;; let* bindings get the same treatment when their inits are decimals themselves.
-(deftest dec-native-slot-let*
+(deftest-compiled-only dec-native-slot-let*
   (let* ((a #m1.50)
          (b #m0.25))
     (declare (type dotcl:decimal a b))
@@ -237,8 +249,9 @@
   ("#m2.50" "#m2.50"))
 
 ;; Mixing with a float in a declared scope is still a compile-time error — the
-;; native slot does not open a back door around the guard.
-(deftest dec-native-slot-mix-still-errors
+;; native slot does not open a back door around the guard. Compiled-only: the
+;; guard lives in the compiler, so the interpreter reaches the generic + instead.
+(deftest-compiled-only dec-native-slot-mix-still-errors
   (handler-case
       (progn (eval '(let ((d #m1.5))
                       (declare (type dotcl:decimal d))

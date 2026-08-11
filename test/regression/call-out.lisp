@@ -291,7 +291,9 @@
     (list (dotnet:invoke m "get_Length")
           (dotnet:invoke m "get_Rank")
           (dotnet:invoke m "get_Item" 1 2)))
-  (6 2 9.5d0))
+  ;; A System.Single element reads back as a single-float, not a double-float:
+  ;; .NET float is binary32, which is what CL calls single-float.
+  (6 2 9.5))
 
 ;;; dotnet:is-instance-of / dotnet:cast (dotcl/dotcl#45). is-instance-of replaces
 ;;; manual Type.IsAssignableFrom; cast verifies + re-wraps with a hint type for

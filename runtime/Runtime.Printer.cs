@@ -1961,7 +1961,7 @@ public static partial class Runtime
     {
         // WRITE-TO-STRING: variadic with printer keyword args
         Emitter.CilAssembler.RegisterFunction("WRITE-TO-STRING", new LispFunction(args => {
-            if (args.Length < 1) throw new Exception("WRITE-TO-STRING: requires at least 1 argument");
+            Runtime.CheckArityMin("WRITE-TO-STRING", args, 1);
             var obj = args[0];
             if ((args.Length - 1) % 2 != 0)
                 throw new LispErrorException(new LispProgramError("WRITE-TO-STRING: odd number of keyword arguments"));
@@ -2012,7 +2012,7 @@ public static partial class Runtime
         }, "WRITE-TO-STRING", -1));
         // WRITE: variadic with :stream and printer keyword args
         Emitter.CilAssembler.RegisterFunction("WRITE", new LispFunction(args => {
-            if (args.Length < 1) throw new Exception("WRITE: requires at least 1 argument");
+            Runtime.CheckArityMin("WRITE", args, 1);
             var obj = args[0];
             if ((args.Length - 1) % 2 != 0)
                 throw new LispErrorException(new LispProgramError("WRITE: odd number of keyword arguments"));

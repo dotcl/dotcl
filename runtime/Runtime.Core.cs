@@ -1004,11 +1004,48 @@ public static partial class Runtime
         var restarts = new System.Collections.Generic.List<LispRestart>();
         for (var c = bindingsList; c is Cons cc; c = cc.Cdr)
         {
-            if (cc.Car is Cons pair && pair.Car is Symbol name)
+            // An ANONYMOUS restart — (nil () :report ... ) in RESTART-CASE, or
+            // WITH-SIMPLE-RESTART with a NIL name — is legal (CLHS): it cannot be
+            // found by name, but it is still established and still shows up in
+            // COMPUTE-RESTARTS. NIL is its own class here rather than a Symbol, so
+            // the `pair.Car is Symbol` test silently DROPPED it and the restart was
+            // never established at all (ansi-test RESTART-CASE.35,
+            // WITH-SIMPLE-RESTART.8). COMPILE-RESTART-CASE emits the name as the
+            // string "NIL" with no NameSymbol, which is what is mirrored here.
+            if (cc.Car is Cons pair && (pair.Car is Symbol || pair.Car is Nil))
             {
-                var hfn = CoerceToFunction(pair.Cdr);
-                restarts.Add(new LispRestart(name.Name, a => hfn.Invoke(a), null, new object(), true)
-                { NameSymbol = name });
+                var name = pair.Car as Symbol;
+                // Two spec shapes. (name . handler) is the original; the RESTART-BIND
+                // expansion now emits (name handler desc report test interactive) so
+                // the options survive into the interpreted path (they used to be
+                // dropped by the macro). Telling them apart is unambiguous: in the
+                // old shape the cdr IS the handler, in the new one it is a list.
+                LispObject rest = pair.Cdr;
+                LispFunction hfn;
+                LispObject? desc = null, report = null, test = null, inter = null;
+                if (rest is Cons opts)
+                {
+                    hfn = CoerceToFunction(opts.Car);
+                    var tail = opts.Cdr;
+                    LispObject Pop()
+                    {
+                        if (tail is not Cons t) return Nil.Instance;
+                        tail = t.Cdr;
+                        return t.Car;
+                    }
+                    var d = Pop(); var r = Pop(); var te = Pop(); var i = Pop();
+                    if (d is not Nil) desc = d;
+                    if (r is not Nil) report = r;
+                    if (te is not Nil) test = te;
+                    if (i is not Nil) inter = i;
+                }
+                else hfn = CoerceToFunction(rest);
+                var restart = new LispRestart(name?.Name ?? "NIL", a => hfn.Invoke(a),
+                    (desc as LispString)?.Value, new object(), true) { NameSymbol = name };
+                if (report != null) restart.ReportFunction = report;
+                if (test != null) restart.TestFunction = test;
+                if (inter != null) restart.InteractiveFunction = inter;
+                restarts.Add(restart);
             }
         }
         RestartClusterStack.PushCluster(restarts.ToArray());

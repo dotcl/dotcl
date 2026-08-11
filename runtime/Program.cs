@@ -1047,6 +1047,9 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
     static void RunCoreFasl(string filePath)
     {
         var asm = System.Reflection.Assembly.LoadFrom(filePath);
+        // The core's generation stamp is read off this assembly, not off the file:
+        // see Startup.CoreGeneration.
+        Startup.CoreAssembly = asm;
         var t = asm.GetType("CompiledModule")
             ?? throw new InvalidOperationException($"FASL core {filePath}: CompiledModule type not found");
         var mi = t.GetMethod("ModuleInit",

@@ -47,6 +47,6 @@
                  (g (1- y) (1+ acc)))))
     (g n 0)))
 
-(deftest tco-self-symbol.labels-self-tco-depth
+(deftest-compiled-only tco-self-symbol.labels-self-tco-depth
   (tss-deep 200000)
   200000)

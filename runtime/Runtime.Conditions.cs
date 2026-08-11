@@ -619,7 +619,7 @@ public static partial class Runtime
                         try
                         {
                             if (hookVal is LispFunction hookFn)
-                                hookFn.Invoke(condition, hookVal);
+                                hookFn.InvokeNoFrame(condition, hookVal);
                             else
                                 Runtime.Funcall(hookVal, new[] { condition, hookVal });
                         }
@@ -777,7 +777,7 @@ public static partial class Runtime
                 try
                 {
                     if (hookVal is LispFunction fn)
-                        fn.Invoke(condition, hookVal);
+                        fn.InvokeNoFrame(condition, hookVal);
                     else
                         Runtime.Funcall(hookVal, new[] { condition, hookVal });
                 }

@@ -71,7 +71,7 @@
 ;;; tail-optimized: the enclosing method's try context is not this method's, so
 ;;; it must not suppress the TCO branch. Without the reset this recurses for
 ;;; real and exhausts the stack.
-(deftest fbr-tco-inside-try-region (fbr-inner-hc 200000) :done)
+(deftest-compiled-only fbr-tco-inside-try-region (fbr-inner-hc 200000) :done)
 
 ;;; --- drift tripwire ------------------------------------------------------
 ;;; The closure boundary picks up new state automatically; the two function-body

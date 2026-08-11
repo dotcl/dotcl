@@ -364,6 +364,8 @@ public static partial class Runtime
         Startup.RegisterUnary("BOTH-CASE-P", Runtime.BothCaseP);
         Emitter.CilAssembler.RegisterFunction("DIGIT-CHAR-P",
             new LispFunction(args => {
+                Runtime.CheckArityMin("DIGIT-CHAR-P", args, 1);
+                Runtime.CheckArityMax("DIGIT-CHAR-P", args, 2);
                 var radix = args.Length > 1 ? args[1] : Fixnum.Make(10);
                 return Runtime.DigitCharP(args[0], radix);
             }));

@@ -99,7 +99,12 @@ public static partial class Runtime
             UInt128 u128 => Bignum.MakeInteger((System.Numerics.BigInteger)u128),
 #endif
             double d => new DoubleFloat(d),
-            float f => new DoubleFloat(f),
+            // .NET float is IEEE binary32, which is exactly what CL calls a
+            // single-float. Widening it to double-float kept the value but lost
+            // the type: typep 'single-float went false, printing showed digits
+            // the value does not have, and the caller's subsequent CL arithmetic
+            // silently ran in double precision.
+            float f => new SingleFloat(f),
 #if NET5_0_OR_GREATER
             // Half is a 16-bit IEEE float; single-float is the narrowest CL format
             // that holds every one of its values exactly, so the widening loses

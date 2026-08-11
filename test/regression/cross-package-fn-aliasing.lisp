@@ -28,7 +28,7 @@
 ;;; xpa-usr:foo is bound and its body calls xpa-lib:foo (unbound). A
 ;;; compiled thunk calling xpa-usr:foo must signal UNDEFINED-FUNCTION
 ;;; for xpa-lib:foo, not stack-overflow.
-(deftest cross-package-fn-aliasing.unbound-qualified-call-signals-undefined
+(deftest-compiled-only cross-package-fn-aliasing.unbound-qualified-call-signals-undefined
   (progn
     (fmakunbound 'xpa-lib:foo)
     (fmakunbound 'xpa-usr:foo)
@@ -41,7 +41,7 @@
 
 ;;; When the target symbol is bound, the package-qualified call resolves
 ;;; to it directly — no aliasing, no undefined-function.
-(deftest cross-package-fn-aliasing.bound-qualified-call-resolves
+(deftest-compiled-only cross-package-fn-aliasing.bound-qualified-call-resolves
   (progn
     (fmakunbound 'xpa-lib:foo)
     (fmakunbound 'xpa-usr:foo)
@@ -56,7 +56,7 @@
 ;;; bound function anywhere) must signal UNDEFINED-FUNCTION, not be
 ;;; aliased to some unrelated same-named function in another package.
 ;;; This is the core "no cross-package alias" guarantee.
-(deftest cross-package-fn-aliasing.no-cross-package-alias
+(deftest-compiled-only cross-package-fn-aliasing.no-cross-package-alias
   (progn
     ;; xpa-a:bar is bound; xpa-b:bar is NOT bound. A call to xpa-b:bar
     ;; must NOT resolve to xpa-a:bar via the bridge.
@@ -75,7 +75,7 @@
 ;;; DOTCL-INTERNAL::HASH-VALUE, expected (MEMBER DOTCL-INTERNAL::HASH-KEY
 ;;; QL-CDB::HASH-VALUE)). Post-fix: loop iterates normally.
 (defpackage #:xpa-ht (:use #:cl) (:export #:hash-value #:bridge-target #:record-pointer))
-(deftest cross-package-fn-aliasing.data-symbol-not-stolen-by-fbound-accessor
+(deftest-compiled-only cross-package-fn-aliasing.data-symbol-not-stolen-by-fbound-accessor
   (progn
     (fmakunbound 'xpa-ht:hash-value)
     (defclass xpa-ht:record-pointer ()
@@ -126,7 +126,7 @@
             (funcall other nil)
             (funcall own (make-instance (find-symbol "XPAFASL-BOX" "XPAFASL-PKG") :n 0))))))
 
-(deftest cross-package-fn-aliasing.fasl-intern-does-not-graft-foreign-function
+(deftest-compiled-only cross-package-fn-aliasing.fasl-intern-does-not-graft-foreign-function
   (%xpa-fasl-collide-case)
   (nil t :other t))
 
@@ -136,7 +136,7 @@
 ;;; reach the registered function. It bridges only from dotcl's own packages —
 ;;; an arbitrary library's package answering would turn an undefined function
 ;;; into a silent call of an unrelated same-named one.
-(deftest cross-package-fn-aliasing.unqualified-call-bridges-to-dotcl-packages
+(deftest-compiled-only cross-package-fn-aliasing.unqualified-call-bridges-to-dotcl-packages
   (let ((*package* (find-package :cl-user)))
     ;; CLASS-PRECEDENCE-LIST is registered in DOTCL-INTERNAL, not CL.
     (let ((cpl (funcall (compile nil '(lambda ()
@@ -155,7 +155,7 @@
           (fboundp 'xpa-b:bar)))
   (t nil))
 
-(deftest cross-package-fn-aliasing.unqualified-call-does-not-bridge-to-user-packages
+(deftest-compiled-only cross-package-fn-aliasing.unqualified-call-does-not-bridge-to-user-packages
   (progn
     (fmakunbound 'xpa-ht:bridge-target)
     (defun xpa-ht:bridge-target () :bridged)

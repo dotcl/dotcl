@@ -1721,16 +1721,35 @@ public static partial class Runtime
                                     LispObject k1, LispObject v1, LispObject k2, LispObject v2) =>
         AssocCore(item, alist, ParseListKwArgs(new[] { k1, v1, k2, v2 }, 0, "ASSOC"));
 
+    /// NIL is a legal (skipped) alist element; any other non-cons is a type error.
+    private static void CheckAssocEntry(LispObject entry)
+    {
+        if (entry is not Nil)
+            throw new LispErrorException(new LispTypeError(
+                "ASSOC: alist entry is not a cons", entry, Startup.Sym("CONS")));
+    }
+
     private static LispObject AssocCore(LispObject item, LispObject alist, in ListKwArgs kw)
     {
         if (alist is Nil) return Nil.Instance;
 
+        // A NIL element is allowed and skipped (CLHS assoc); anything else that is
+        // not a cons is a type error. Runtime.Assoc — what the compiler emits inline
+        // for the 2-argument call — already signalled it, so (assoc 'z '((a . b) :bad))
+        // errored when written literally but returned NIL through #'ASSOC, on BOTH
+        // evaluator paths (ansi-test ASSOC.ERROR.11) — the same divergence unary #'-
+        // had, where the inlined form is right and the function object is not.
+        // The extra test only runs for entries that are not conses, so the eq/eql
+        // fast paths keep their cost.
         // Fast path: eq test, no key
         if (kw.IsEqTest)
         {
             var cur = alist;
             for (; cur is Cons c; cur = c.Cdr)
-                if (c.Car is Cons pair && IsEqRef(item, pair.Car)) return pair;
+            {
+                if (c.Car is Cons pair) { if (IsEqRef(item, pair.Car)) return pair; }
+                else CheckAssocEntry(c.Car);
+            }
             if (cur is not Nil) throw new LispErrorException(new LispTypeError("ASSOC: not a proper list", cur));
             return Nil.Instance;
         }
@@ -1739,7 +1758,10 @@ public static partial class Runtime
         {
             var cur = alist;
             for (; cur is Cons c; cur = c.Cdr)
-                if (c.Car is Cons pair && IsTrueEql(item, pair.Car)) return pair;
+            {
+                if (c.Car is Cons pair) { if (IsTrueEql(item, pair.Car)) return pair; }
+                else CheckAssocEntry(c.Car);
+            }
             if (cur is not Nil) throw new LispErrorException(new LispTypeError("ASSOC: not a proper list", cur));
             return Nil.Instance;
         }
@@ -1748,7 +1770,7 @@ public static partial class Runtime
             var cur = alist;
             for (; cur is Cons c; cur = c.Cdr)
             {
-                if (c.Car is not Cons pair) continue; // skip nil entries
+                if (c.Car is not Cons pair) { CheckAssocEntry(c.Car); continue; }
                 var k = ApplySeqKey(kw, pair.Car);
                 if (kw.TestNot != null)
                 { if (!IsTruthy(kw.TestNot.Invoke2(item, k))) return pair; }
@@ -2984,6 +3006,7 @@ public static partial class Runtime
         Emitter.CilAssembler.RegisterFunction("COUNT-IF-NOT",
             new LispFunction(args =>
             {
+                Runtime.CheckArityMin("COUNT-IF-NOT", args, 2);
                 var predFn = Runtime.CoerceToFunction(args[0]);
                 var newArgs = new LispObject[args.Length];
                 Array.Copy(args, newArgs, args.Length);
@@ -3003,6 +3026,7 @@ public static partial class Runtime
         Emitter.CilAssembler.RegisterFunction("FIND-IF-NOT",
             new LispFunction(args =>
             {
+                Runtime.CheckArityMin("FIND-IF-NOT", args, 2);
                 var predFn = Runtime.CoerceToFunction(args[0]);
                 var newArgs = new LispObject[args.Length];
                 Array.Copy(args, newArgs, args.Length);
@@ -3017,6 +3041,7 @@ public static partial class Runtime
         Emitter.CilAssembler.RegisterFunction("POSITION-IF-NOT",
             new LispFunction(args =>
             {
+                Runtime.CheckArityMin("POSITION-IF-NOT", args, 2);
                 var predFn = Runtime.CoerceToFunction(args[0]);
                 var newArgs = new LispObject[args.Length];
                 Array.Copy(args, newArgs, args.Length);
@@ -3047,6 +3072,7 @@ public static partial class Runtime
         Emitter.CilAssembler.RegisterFunction("MEMBER-IF-NOT",
             new LispFunction(args =>
             {
+                Runtime.CheckArityMin("MEMBER-IF-NOT", args, 2);
                 var predFn = Runtime.CoerceToFunction(args[0]);
                 var newArgs = new LispObject[args.Length];
                 Array.Copy(args, newArgs, args.Length);
@@ -3064,6 +3090,7 @@ public static partial class Runtime
         Emitter.CilAssembler.RegisterFunction("ASSOC-IF-NOT",
             new LispFunction(args =>
             {
+                Runtime.CheckArityMin("ASSOC-IF-NOT", args, 2);
                 var predFn = Runtime.CoerceToFunction(args[0]);
                 var newArgs = new LispObject[args.Length];
                 Array.Copy(args, newArgs, args.Length);
@@ -3078,6 +3105,7 @@ public static partial class Runtime
         Emitter.CilAssembler.RegisterFunction("RASSOC-IF-NOT",
             new LispFunction(args =>
             {
+                Runtime.CheckArityMin("RASSOC-IF-NOT", args, 2);
                 var predFn = Runtime.CoerceToFunction(args[0]);
                 var newArgs = new LispObject[args.Length];
                 Array.Copy(args, newArgs, args.Length);
@@ -3126,6 +3154,7 @@ public static partial class Runtime
         Emitter.CilAssembler.RegisterFunction("SUBSTITUTE-IF-NOT",
             new LispFunction(args =>
             {
+                Runtime.CheckArityMin("SUBSTITUTE-IF-NOT", args, 3);
                 var predFn = Runtime.CoerceToFunction(args[1]);
                 var newArgs = new LispObject[args.Length];
                 Array.Copy(args, newArgs, args.Length);
@@ -3140,6 +3169,7 @@ public static partial class Runtime
         Emitter.CilAssembler.RegisterFunction("NSUBSTITUTE-IF-NOT",
             new LispFunction(args =>
             {
+                Runtime.CheckArityMin("NSUBSTITUTE-IF-NOT", args, 3);
                 var predFn = Runtime.CoerceToFunction(args[1]);
                 var newArgs = new LispObject[args.Length];
                 Array.Copy(args, newArgs, args.Length);
@@ -3165,7 +3195,7 @@ public static partial class Runtime
         Emitter.CilAssembler.RegisterFunction("DELETE-DUPLICATES",
             new LispFunction(args => Runtime.RemoveDuplicatesFull(args)));
         Emitter.CilAssembler.RegisterFunction("REPLACE",
-            new LispFunction(args => Runtime.Replace(args)));
+            new LispFunction(args => { Runtime.CheckArityMin("REPLACE", args, 2); return Runtime.Replace(args); }));
         // MAKE-STRING
         Emitter.CilAssembler.RegisterFunction("MAKE-STRING",
             new LispFunction(args =>
@@ -3266,11 +3296,11 @@ public static partial class Runtime
             }, "SUBSEQ", -1));
 
         // SORT, STABLE-SORT
-        var sortFn = new LispFunction(args => Runtime.SortFull(args));
+        var sortFn = new LispFunction(args => { Runtime.CheckArityMin("SORT", args, 2); return Runtime.SortFull(args); });
         sortFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject>)Runtime.Sort);
         sortFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject, LispObject, LispObject>)Runtime.Sort4);
         Emitter.CilAssembler.RegisterFunction("SORT", sortFn);
-        var stableSortFn = new LispFunction(args => Runtime.StableSortFull(args));
+        var stableSortFn = new LispFunction(args => { Runtime.CheckArityMin("STABLE-SORT", args, 2); return Runtime.StableSortFull(args); });
         stableSortFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject>)Runtime.StableSort);
         stableSortFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject, LispObject, LispObject>)Runtime.StableSort4);
         Emitter.CilAssembler.RegisterFunction("STABLE-SORT", stableSortFn);
@@ -3283,6 +3313,7 @@ public static partial class Runtime
         // CONCATENATE
         Emitter.CilAssembler.RegisterFunction("CONCATENATE",
             new LispFunction(args => {
+                Runtime.CheckArityMin("CONCATENATE", args, 1);
                 var seqs = new LispObject[args.Length - 1];
                 Array.Copy(args, 1, seqs, 0, seqs.Length);
                 return Runtime.Concatenate(args[0], seqs);

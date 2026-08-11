@@ -7,7 +7,7 @@ DOTCL_LISP ?= ros -L sbcl-bin run
 STDBUF ?=
 SETSID ?= $(shell which setsid 2>/dev/null)
 
-.PHONY: all build build-ns2 check-contrib-freshness run clean repl test-core-bytes test-coverage test-ansi-all test-ansi-full test-ansi-extra test-regression test-pack-nuspec test-save-class-lib test-project-compose test-mop ilverify update-ansi-state commit-ansi-state cross-compile loc publish pack install setup-ansi-test setup-asdf setup-quicklisp setup-cl-bench bench bench-state compile-asdf-fasl compile-asdf-fasls compile-quicklisp-fasl compile-core-fasl compile-contrib-fasls contrib-dotcl-cs contrib-dotcl-jitdisasm gen-char-names
+.PHONY: all build build-ns2 check-contrib-freshness run clean repl test-core-bytes test-coverage test-ansi-all test-ansi-full test-ansi-extra test-regression test-regression-interp test-regression-emitfree test-pack-nuspec test-save-class-lib test-project-compose test-mop ilverify update-ansi-state commit-ansi-state cross-compile loc publish pack install setup-ansi-test setup-asdf setup-quicklisp setup-cl-bench bench bench-state compile-asdf-fasl compile-asdf-fasls compile-quicklisp-fasl compile-core-fasl compile-contrib-fasls contrib-dotcl-cs contrib-dotcl-jitdisasm gen-char-names
 
 # Source files for cross-compile. Listed once; the recipe and dependency
 # tracking both reference this so adding a file is a single-edit change.
@@ -68,6 +68,40 @@ repl:
 test-regression: build $(DOTCL_ROOT)compiler/cil-out.sil
 	@echo "=== Running dotcl regression tests ==="
 	$(SETSID) dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --asm $(DOTCL_ROOT)compiler/cil-out.sil $(DOTCL_ROOT)test/regression/run.lisp
+
+# The same suite with EVAL routed through the emit-free tree-walk interpreter.
+# That interpreter is the ONLY evaluator on netstandard2.0 (AOT/WebGL) builds,
+# and `build-ns2` merely compiles that runtime — it runs no tests, so until this
+# target existed the evaluator those builds depend on had never been executed by
+# CI at all. Tests asserting a compile-time diagnostic (a warning, the IL size
+# limit, refusal to generate code) opt out via DEFTEST-COMPILED-ONLY.
+#
+# Scope, so this is not read as more than it is: *evaluator-mode* redirects EVAL
+# only — LOAD still compiles top-level forms. This exercises the interpreter
+# wherever a test reaches it through EVAL, which is far better than nothing but
+# is not the same as running the suite ON an emit-free build.
+test-regression-interp: build $(DOTCL_ROOT)compiler/cil-out.sil
+	@echo "=== Running dotcl regression tests (tree-walk interpreter) ==="
+	$(SETSID) dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --asm $(DOTCL_ROOT)compiler/cil-out.sil --eval '(setq dotcl:*evaluator-mode* :interpret)' $(DOTCL_ROOT)test/regression/run.lisp
+
+# The same suite ON an emit-free build — no System.Reflection.Emit anywhere, so
+# the tree-walk interpreter is the only evaluator and even LOAD of a .lisp goes
+# through it. This is what `test-regression-interp` above is only a proxy for:
+# there, LOAD still compiles each top-level form, so an interpreted DEFUN never
+# exists. The interpreted-DEFUN declaration bug was found here and cannot be
+# found there.
+#
+# NOT wired into CI yet: it currently stops at test/regression/macroexpand-hook.lisp
+# with a stack overflow — an interpreted *MACROEXPAND-HOOK* re-enters, because the
+# interpreter macroexpands the hook's own body on every call. Tracked separately.
+#
+# -p:DotclNoEmit=true flips the DOTCL_EMIT constant off for an ordinary desktop
+# framework (see runtime/DotCL.Runtime.csproj), so this differs from a normal run
+# in exactly one axis. It needs the FASL core: --asm of a .sil would itself want
+# the assembler.
+test-regression-emitfree: $(DOTCL_ROOT)compiler/dotcl.core
+	@echo "=== Running dotcl regression tests (emit-free build) ==="
+	$(SETSID) dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -p:DotclNoEmit=true -- --core $(DOTCL_ROOT)compiler/dotcl.core $(DOTCL_ROOT)test/regression/run.lisp
 
 test-debug-pdb: build $(DOTCL_ROOT)compiler/cil-out.sil
 	@echo "=== Running debug-path (DOTCL_EMIT_PDB) checks ==="
@@ -355,7 +389,7 @@ BENCH_TIMEOUT ?= 600
 # form of $(DOTCL_ROOT).
 ifeq ($(wildcard bench/run.lisp),)
 
-bench bench-state:
+bench bench-state bench-survey:
 	@echo "$@: bench/ is internal-only and is not part of the public tree."
 
 else
@@ -385,7 +419,6 @@ bench-state: setup-cl-bench
 	@echo "Updated bench-state.json"
 	@cat $(DOTCL_ROOT)bench-state.json
 
-endif
 
 # Survey mode: run each bench N times, record median/min/max/stddev/cv.
 #   make bench-survey [SUITE=...] [BENCH=...] [RUNS=5] [WARMUP=1]
@@ -413,6 +446,8 @@ bench-survey: setup-cl-bench
 	rc=$$?; if [ $$rc -eq 124 ]; then echo ";; SBCL TIMEOUT after $(BENCH_TIMEOUT)s"; fi
 	@$(PYTHON) $(DOTCL_ROOT)bench/make-survey-state.py /tmp/bench-survey-dotcl.txt /tmp/bench-survey-sbcl.txt $(DOTCL_ROOT)bench-state.json > /tmp/bench-state-new.json && mv /tmp/bench-state-new.json $(DOTCL_ROOT)bench-state.json
 	@echo "Updated bench-state.json"
+
+endif
 
 setup-cl-bench:
 	@if [ ! -d $(DOTCL_ROOT)cl-bench ]; then \
@@ -547,12 +582,23 @@ $(DOTCL_ROOT)runtime/Generated/UnicodeCharNames.g.cs: $(DOTCL_ROOT)scripts/Unico
 	$(GEN_UTILS_EXE) char-names $< $@
 
 gen-char-names: $(DOTCL_ROOT)runtime/Generated/UnicodeCharNames.g.cs
-# Pick the HIGHEST installed version, not $(firstword $(wildcard ...)): wildcard
-# returns lexicographic order, so a cache holding both 10.0.x and a future 11.0.x
-# would keep selecting the stale 10.0.x ("10" < "11" as strings). $(wildcard)
-# still does the globbing (it handles the native $(HOME) path); we only sort its
-# result by version. (Both build hosts — Linux CI and MSYS2 — ship GNU sort.)
-CROSSGEN2 = $(shell echo "$(wildcard $(HOME)/.nuget/packages/microsoft.netcore.app.crossgen2.$(HOST_RID)/*/tools/$(CROSSGEN2_EXE))" | tr ' ' '\n' | sort -V | tail -1)
+# NuGet package root, with forward slashes. On MSYS2 $(HOME) is a native Windows
+# path (C:\Users\...) and a shell glob would eat the backslashes, so normalize
+# here once; forward slashes are valid for both the shell and Windows itself.
+# This is what lets the lookups below glob in the shell instead of $(wildcard).
+NUGET_PKG_DIR := $(subst \,/,$(HOME))/.nuget/packages
+
+# Pick the HIGHEST installed version, not the first match: a glob returns
+# lexicographic order, so a cache holding both 10.0.x and a future 11.0.x would
+# keep selecting the stale 10.0.x ("10" < "11" as strings) — hence sort -V.
+# (Both build hosts — Linux CI and MSYS2 — ship GNU sort.)
+#
+# Glob with `ls`, NOT $(wildcard): make caches the directory listings it reads
+# for a wildcard for the life of the process, so once a lookup finds no pack,
+# every later $(wildcard) in the same make run keeps reporting none even after a
+# publish restored it. That silently broke the per-RID R2R rules downstream of
+# prime-crossgen2.
+CROSSGEN2 = $(shell ls -d $(NUGET_PKG_DIR)/microsoft.netcore.app.crossgen2.$(HOST_RID)/*/tools/$(CROSSGEN2_EXE) 2>/dev/null | sort -V | tail -1)
 
 # Cross-OS R2R needs the HOST crossgen2 pack, but a target-rid publish restores
 # it only unreliably: the pack arrives as a side effect of PublishReadyToRun,
@@ -565,13 +611,28 @@ CROSSGEN2 = $(shell echo "$(wildcard $(HOME)/.nuget/packages/microsoft.netcore.a
 .PHONY: prime-crossgen2
 prime-crossgen2:
 	@echo "=== prime host crossgen2 (HOST_RID=$(HOST_RID)) ==="
-	dotnet publish $(DOTCL_ROOT)runtime/runtime.csproj -c Release -r $(HOST_RID) --self-contained false -p:PublishReadyToRun=true >/dev/null
-	@test -n "$(CROSSGEN2)" || (echo "error: host crossgen2 pack still missing after host publish (HOST_RID=$(HOST_RID))" && exit 1)
-	@echo "crossgen2: $(CROSSGEN2)"
+	dotnet publish $(DOTCL_ROOT)runtime/runtime.csproj -c Release -r $(HOST_RID) --self-contained false -p:PublishReadyToRun=true
+	@# Locate the pack in the SHELL, not via $(CROSSGEN2). make expands EVERY line
+	@# of a recipe before it runs the first one, so a make-level lookup here would
+	@# report the state from before the publish above — this check could only ever
+	@# pass when the pack happened to be cached already, and failed outright on a
+	@# runner whose cache started empty. The publish output is left visible for the
+	@# same reason: when the restore is the thing that went wrong, that log is the
+	@# only evidence.
+	@cg=$$(ls -d $(NUGET_PKG_DIR)/microsoft.netcore.app.crossgen2.$(HOST_RID)/*/tools/$(CROSSGEN2_EXE) 2>/dev/null | sort -V | tail -1); \
+	if [ -z "$$cg" ]; then \
+	  echo "error: host crossgen2 pack still missing after host publish (HOST_RID=$(HOST_RID))"; \
+	  echo "crossgen2 packs under $(NUGET_PKG_DIR):"; \
+	  ls -d $(NUGET_PKG_DIR)/microsoft.netcore.app.crossgen2.* 2>/dev/null || echo "  (none)"; \
+	  exit 1; \
+	fi; \
+	echo "crossgen2: $$cg"
 
 # Per-RID runtime ref dir (NuGet cache; populated by `dotnet publish -r <rid>`).
-# Highest version, not lexicographic firstword — see CROSSGEN2 above.
-runtime_ref = $(shell echo "$(wildcard $(HOME)/.nuget/packages/microsoft.netcore.app.runtime.$(1)/*/runtimes/$(1)/lib/net10.0)" | tr ' ' '\n' | sort -V | tail -1)
+# Highest version, and shell glob rather than $(wildcard) — see CROSSGEN2 above
+# for both. This one is restored by the publish inside the very rule that reads
+# it, so the wildcard directory cache would bite here too.
+runtime_ref = $(shell ls -d $(NUGET_PKG_DIR)/microsoft.netcore.app.runtime.$(1)/*/runtimes/$(1)/lib/net10.0 2>/dev/null | sort -V | tail -1)
 
 # Generate compile-{core,asdf}-fasl-r2r-<rid> targets for each RID.
 define R2R_RULES

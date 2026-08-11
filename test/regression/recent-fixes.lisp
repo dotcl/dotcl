@@ -28,7 +28,7 @@
 ;;; they were registered but never consulted). Foundation for type-hinted dispatch.
 (defun %cm-auto-fn (x) (* x 1000))                  ; real function multiplies by 1000
 (define-compiler-macro %cm-auto-fn (x) `(* ,x 2))   ; compiler macro multiplies by 2
-(deftest cm-auto-applied-in-compiled-call
+(deftest-compiled-only cm-auto-applied-in-compiled-call
   (%cm-auto-fn 5)                                    ; compiled call uses the CM -> 10
   10)
 
@@ -50,7 +50,7 @@
 ;;; and the CM always fired (ANSI DEFINE-COMPILER-MACRO.7).
 (defun %cm-ni-fn (x) (* x 1000))                     ; real fn: *1000
 (define-compiler-macro %cm-ni-fn (x) `(* ,x 2))      ; CM: *2
-(deftest cm-notinline-suppresses
+(deftest-compiled-only cm-notinline-suppresses
   (list (%cm-ni-fn 5)                                ; no decl -> CM -> 10
         (locally (declare (notinline %cm-ni-fn)) (%cm-ni-fn 5))  ; notinline -> real fn -> 5000
         (funcall (lambda (x) (declare (notinline %cm-ni-fn)) (%cm-ni-fn x)) 5)) ; lambda body -> 5000
@@ -67,11 +67,11 @@
   (+ 5 100))
 
 ;;; compile nil works
-(deftest d579-compile-nil-basic
+(deftest-compiled-only d579-compile-nil-basic
   (funcall (compile nil '(lambda (x) (* x x))) 7)
   49)
 
-(deftest d579-compile-nil-with-cm
+(deftest-compiled-only d579-compile-nil-with-cm
   (let* ((cm (compiler-macro-function '%reg-test-cm))
          (expanded (funcall cm '(%reg-test-cm 5) nil))
          (fn (compile nil `(lambda () ,expanded))))
@@ -89,13 +89,19 @@
   (signals-error (symbol-package 42) type-error)
   t)
 
-;;; TCO — tail-recursive function shouldn't stack overflow
+;;; TCO — tail-recursive function shouldn't stack overflow.
+;;;
+;;; Compiled-only because the tree-walk interpreter does NOT eliminate tail
+;;; calls: each iteration is a real .NET frame, so this blows the stack on an
+;;; emit-free build (where every call is interpreted). That is a genuine
+;;; limitation of that build, not a property of this test — it is tracked on its
+;;; own issue rather than hidden by the skip.
 (defun tco-count-down (n)
   (if (= n 0)
       :done
       (tco-count-down (- n 1))))
 
-(deftest tco-basic
+(deftest-compiled-only tco-basic
   (tco-count-down 100000)
   :done)
 
@@ -600,7 +606,7 @@
                        (list (read-byte in) (read-byte in)))))
       (and ok (equal first-two '(#x4d #x5a))))))
 
-(deftest d678-save-application-smoke
+(deftest-compiled-only d678-save-application-smoke
   (%d678-save-application-smoke)
   t)
 
@@ -620,7 +626,7 @@
   (%d682-iter-sum 100 0)
   5050)
 
-(deftest d682-tco-boxed-params-deep
+(deftest-compiled-only d682-tco-boxed-params-deep
   ;; Stack is ~256MB; without TCO this would SO well before 100k.
   (%d682-iter-sum 100000 0)
   5000050000)
@@ -733,7 +739,7 @@
     (car x))
   8)
 
-(deftest d712-asif-like
+(deftest-compiled-only d712-asif-like
   ;; Minimal anaphora ASIF.1 reproducer without the library.
   (let ((x (list 0)))
     (let ((it (incf (car x))))
@@ -773,7 +779,7 @@
            (eql (funcall (fdefinition setf-place) 42) 42)
            (eql (funcall place-sym) 42)))))
 
-(deftest d713-setf-fn-user-package-fasl
+(deftest-compiled-only d713-setf-fn-user-package-fasl
   (%d713-setf-fn-fasl)
   t)
 
@@ -801,7 +807,7 @@
   (char-code (read-from-string "#\\Esc"))
   27)
 
-(deftest d715-char-name-nbsp
+(deftest-compiled-only d715-char-name-nbsp
   (char-code (read-from-string "#\\No-break_space"))
   160)
 
@@ -833,7 +839,7 @@
          (eql (funcall (read-from-string "d719-pkg::f-719") 5) 10)
          (eql (funcall (read-from-string "d719-pkg::g-719") 7) 8))))
 
-(deftest d719-if-with-defun-fasl
+(deftest-compiled-only d719-if-with-defun-fasl
   (%d719-if-with-defun-fasl)
   t)
 
@@ -859,7 +865,7 @@
            (eql (aref a 0 0) 1)
            (eql (aref a 1 2) 6)))))
 
-(deftest d-2darray-literal-fasl
+(deftest-compiled-only d-2darray-literal-fasl
   (%d-2darray-literal-fasl)
   t)
 
@@ -887,7 +893,7 @@
             (length bv)
             (bit bv 0) (bit bv 1) (bit bv 2) (bit bv 3)))))
 
-(deftest d747-1d-specialized-vector-fasl
+(deftest-compiled-only d747-1d-specialized-vector-fasl
   (%d747-1d-specialized-vector-fasl)
   (single-float t 4 1 0 1 1))
 
@@ -1177,14 +1183,14 @@
   (t t "longpath-ok"))
 
 ;;; TCO for labels self-recursion: should not stack overflow
-(deftest d899-labels-self-tco-basic
+(deftest-compiled-only d899-labels-self-tco-basic
   (labels ((count-down (n)
              (if (= n 0) :done (count-down (- n 1)))))
     (count-down 200000))
   :done)
 
 ;;; labels self-TCO with accumulator
-(deftest d899-labels-self-tco-acc
+(deftest-compiled-only d899-labels-self-tco-acc
   (labels ((sum (n acc)
              (if (= n 0) acc (sum (- n 1) (+ acc n)))))
     (sum 100000 0))
@@ -1196,7 +1202,7 @@
              (if (= i 0) :done (loop-fn (- i 1)))))
     (loop-fn n)))
 
-(deftest d899-labels-in-defun
+(deftest-compiled-only d899-labels-in-defun
   (d899-count-down-helper 200000)
   :done)
 
@@ -1206,7 +1212,7 @@
       (if (= n 0) :done (%d900-count-safe (- n 1)))
     (error (e) (list :error e))))
 
-(deftest d900-handler-case-self-tco
+(deftest-compiled-only d900-handler-case-self-tco
   (%d900-count-safe 200000)
   :done)
 
@@ -1216,7 +1222,7 @@
       (if (= n 0) acc (%d900-sum-safe (- n 1) (+ acc n)))
     (error (e) (list :error e))))
 
-(deftest d900-handler-case-tco-acc
+(deftest-compiled-only d900-handler-case-tco-acc
   (%d900-sum-safe 100000 0)
   5000050000)
 
@@ -1343,7 +1349,7 @@
   (10 20 30))
 
 ;;; labels mutual TCO dispatch loop
-(deftest d919-labels-mutual-tco-basic
+(deftest-compiled-only d919-labels-mutual-tco-basic
   ;; even?/odd? via labels dispatch loop: no stack overflow at large N
   (labels ((even? (n) (if (= n 0) t (odd? (- n 1))))
            (odd?  (n) (if (= n 0) nil (even? (- n 1)))))
@@ -1448,7 +1454,7 @@
          (eql (%mlf-box-val newobj) 42)))
   t)
 
-(deftest make-load-form-fasl-roundtrip
+(deftest-compiled-only make-load-form-fasl-roundtrip
   (let* ((tmp (uiop:temporary-directory))
          (src (merge-pathnames "mlf-fasl-test.lisp" tmp))
          (out (merge-pathnames "mlf-fasl-test.fasl" tmp)))
@@ -1475,7 +1481,7 @@
   `(progn (push :created *mlf-creation-log*)
           (make-instance '%mlf-cls :name ',(%mlf-name x))))
 
-(deftest make-load-form-creation-form-runs-at-load
+(deftest-compiled-only make-load-form-creation-form-runs-at-load
   (let* ((tmp (uiop:temporary-directory))
          (src (merge-pathnames "mlf-creation-test.lisp" tmp))
          (out (merge-pathnames "mlf-creation-test.fasl" tmp)))
@@ -1635,7 +1641,7 @@
 ;;; A literal pathname embedded in compiled code (#.) keeps its VERSION across the
 ;;; FASL round-trip; a plain namestring round-trip dropped :newest to nil
 ;;; (ANSI COMPILE-FILE.16 via *compile-file-pathname*).
-(deftest fasl-pathname-preserves-version
+(deftest-compiled-only fasl-pathname-preserves-version
   (let* ((tmp (uiop:temporary-directory))
          (src (merge-pathnames "rf-pathver.lisp" tmp))
          (out (merge-pathnames "rf-pathver.fasl" tmp)))
@@ -1865,7 +1871,7 @@
   (setf %qls-url (list :merged %qls-url))
   (let* ((connect (or (%qls-url 99) %qls-url)))
     (list connect %qls-url)))
-(deftest issue279-local-var-does-not-shadow-global-fn
+(deftest-compiled-only issue279-local-var-does-not-shadow-global-fn
   (%qls-fetch :x)
   (99 (:merged :x)))
 
@@ -1889,7 +1895,7 @@
     ;; Provided only at compile time → must not survive into the image's *modules*.
     (and (member "dotcl-cfmod-phantom" *modules* :test #'string=) t)))
 
-(deftest compile-file-does-not-leak-compile-time-modules
+(deftest-compiled-only compile-file-does-not-leak-compile-time-modules
   (%cf-modules-no-leak)
   nil)
 
@@ -1906,7 +1912,7 @@
           (funcall #'aref a 0 0 0)))
   (three-d three-d 0))
 
-(deftest i314-funcall-aref-rank4
+(deftest-compiled-only i314-funcall-aref-rank4
   (let ((a (make-array '(2 2 2 2) :initial-element 0)))
     (setf (aref a 1 1 1 1) 'four-d)
     (list (funcall #'aref a 1 1 1 1)
@@ -1932,7 +1938,7 @@
       (load fasl))
     (funcall (read-from-string "d1263-pkg::sq") 6)))
 
-(deftest d1263-compile-file-module-name
+(deftest-compiled-only d1263-compile-file-module-name
   (%d1263-module-name-fasl)
   36)
 
@@ -2067,7 +2073,7 @@
 ;;; file wrongly ran the :execute-only body — an extra side effect.  Fixed to
 ;;; emit-for-load iff :load-toplevel is present at top level.
 (defparameter *ew-discard-collector* nil)
-(deftest issue333-eval-when-execute-only-discarded-in-compiled-file
+(deftest-compiled-only issue333-eval-when-execute-only-discarded-in-compiled-file
   (let* ((src "dotcl-ew-discard-src.lisp")
          (fasl (compile-file-pathname src)))
     (with-open-file (o src :direction :output :if-exists :supersede)
@@ -2089,7 +2095,7 @@
 ;; :execute must not promote it into the load image. Previously the compile-file
 ;; eval-when handler forced load-toplevel whenever :execute was present, leaking
 ;; the body into the fasl. Here :ctex must NOT appear at load time.
-(deftest issue333-eval-when-ct-execute-not-in-fasl
+(deftest-compiled-only issue333-eval-when-ct-execute-not-in-fasl
   (let* ((src "dotcl-ew-ctex-src.lisp")
          (fasl (compile-file-pathname src)))
     (with-open-file (o src :direction :output :if-exists :supersede)
@@ -2306,7 +2312,7 @@
           (second e)))          ; bound to a, b in order
   (t 2 (a b)))
 
-(deftest i349-accessor-setters-intact
+(deftest-compiled-only i349-accessor-setters-intact
   (list
    (let ((h (make-hash-table))) (setf (gethash 'k h) 1) (incf (gethash 'k h)) (gethash 'k h))
    (let ((s (gensym))) (setf (get s 'p) 3) (incf (get s 'p)) (get s 'p))
@@ -2341,7 +2347,7 @@
     (load (compile-file src :verbose nil :print nil))
     (reverse *i353-order*)))
 
-(deftest i353-make-load-form-order
+(deftest-compiled-only i353-make-load-form-order
   (list
    (%i353-order "(eval-when (:compile-toplevel)
        (defparameter *a* (make-instance 'i353-lfo :name 'a))
@@ -2514,7 +2520,7 @@
         ((%i373-r2 (car x)) 'got)
         (t 'reached)))
 
-(deftest i373-cond-test-self-recursion-with-body
+(deftest-compiled-only i373-cond-test-self-recursion-with-body
   (%i373-r2 '(z))
   reached)
 
@@ -3098,7 +3104,7 @@
 ;; class-of a signaled native condition returns the correct class (matching type-of). Previously
 ;; ClassOf had no LispCondition case and fell through to #<STANDARD-CLASS T>, which broke
 ;; cl-store's condition save (class-of → class-slots) with a STORE-ERROR.
-(deftest i400-class-of-signaled-condition
+(deftest-compiled-only i400-class-of-signaled-condition
   (flet ((cn (c) (class-name (class-of c))))
     (list (handler-case (/ 1 0)      (division-by-zero (c) (cn c)))
           (handler-case (car 3)      (type-error (c) (cn c)))
@@ -3136,7 +3142,7 @@
     (load fasl)
     *cf-circ*))
 
-(deftest compile-file-circular-and-shared-constant
+(deftest-compiled-only compile-file-circular-and-shared-constant
   (cf-circ-build-and-load)
   (t t))
 
@@ -3173,7 +3179,7 @@
             (eq (cdddr b) b)          ; cf-b's own cycle (no label leak from cf-a)
             (eql (car b) 40)))))      ; cf-b kept its own data, not cf-a's
 
-(deftest compile-file-circular-constant-in-defun
+(deftest-compiled-only compile-file-circular-constant-in-defun
   (cf-defun-build-and-load)
   (t t t t t))
 
@@ -3279,26 +3285,26 @@
 ;;; (compile name lambda) must install NAME's function definition and return NAME
 ;;; (CLHS). Previously dotcl returned NAME without compiling/binding, so fiveam's
 ;;; run-time (funcall (compile '%inner-test '(lambda ...))) hit Undefined function.
-(deftest compile-name-installs-fdefinition
+(deftest-compiled-only compile-name-installs-fdefinition
   (progn
     (compile 'reg-compile-foo '(lambda () 42))
     (list (and (fboundp 'reg-compile-foo) t) (funcall 'reg-compile-foo)))
   (t 42))
 
-(deftest compile-name-returns-name
+(deftest-compiled-only compile-name-returns-name
   ;; CLHS: compile returns (values name warnings-p failures-p)
   (compile 'reg-compile-bar '(lambda (x) (* x x)))
   reg-compile-bar nil nil)
 
-(deftest compile-name-funcall-result
+(deftest-compiled-only compile-name-funcall-result
   (funcall (compile 'reg-compile-inner '(lambda () (+ 1 2))))
   3)
 
-(deftest compile-nil-returns-function
+(deftest-compiled-only compile-nil-returns-function
   (funcall (compile nil '(lambda () :anon)))
   :anon)
 
-(deftest compile-setf-name-installs
+(deftest-compiled-only compile-setf-name-installs
   (progn
     (compile '(setf reg-compile-place) '(lambda (v obj) (declare (ignore obj)) v))
     (and (fboundp '(setf reg-compile-place)) t))
@@ -3321,7 +3327,7 @@
     (list reg-sm-a reg-sm-b reg-sm-a))
   (nil 2 nil))
 
-(deftest symbol-macrolet-nil-expansion-compiled
+(deftest-compiled-only symbol-macrolet-nil-expansion-compiled
   (funcall (compile nil '(lambda () (symbol-macrolet ((reg-sm-q nil)) reg-sm-q))))
   nil)
 
@@ -3694,7 +3700,7 @@
 ;; keyword must WARN at compile time (CLHS 3.5.1.4 static diagnosis). A known
 ;; keyword must stay silent. (esrap CONDITION.INVALID-ARGUMENT-COMBINATIONS
 ;; depends on this — its parse compiler-macro generates such a call for :raw t.)
-(deftest warn-unknown-keyword-in-lambda-call
+(deftest-compiled-only warn-unknown-keyword-in-lambda-call
   (list
    (handler-case (progn (compile nil '(lambda () ((lambda (&key a) a) :bad 1))) :no-warn)
      (warning () :warned))
@@ -4095,7 +4101,7 @@
 ;; in one element was cleared before the sibling #1# was read, leaking a raw
 ;; placeholder into the fasl constant pool (make-host-1: extra-arg-refs blew
 ;; up with "LENGTH: not a sequence").
-(deftest share-labels-survive-lisp-read-list-compile-file
+(deftest-compiled-only share-labels-survive-lisp-read-list-compile-file
   (let ((rt (copy-readtable))
         (src (format nil "~a/dotcl-sharelbl-~a.lisp"
                      (or (dotcl:getenv "TEMP") "/tmp")
@@ -4599,7 +4605,9 @@
 ;; PROGRAM-ERROR surfaces instead of an opaque InvalidProgramException.
 ;; (Small methods that InvalidProgram are genuine codegen bugs and still surface
 ;; unchanged.)
-(deftest huge-monolithic-form-signals-clear-error
+;; Compiled-only: "form too large" is a limit of the IL a method can hold. The
+;; interpreter has no such ceiling, so evaluating this is simply not an error.
+(deftest-compiled-only huge-monolithic-form-signals-clear-error
   (handler-case
       (progn (eval `(let ((acc 0))
                       ,@(loop for i below 4000 collect (%big488-heavy i 'acc))

@@ -34,7 +34,7 @@
     (dotimes (i 100000) (setq s (+ s 1)))
     s))
 
-(deftest interrupt-poll.safety0-opts-out
+(deftest-compiled-only interrupt-poll.safety0-opts-out
   (let ((before (dotnet:static "DotCL.ConditionSystem" "PollCount")))
     (%s575-nopoll-spin)
     (< (- (dotnet:static "DotCL.ConditionSystem" "PollCount") before) 1000))

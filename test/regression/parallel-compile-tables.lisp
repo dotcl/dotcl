@@ -53,7 +53,7 @@
       (dotcl:set-parallel-eval nil))
     (if errs (cons :errors errs) :ok)))
 
-(deftest parallel-compile-tables-no-corruption
+(deftest-compiled-only parallel-compile-tables-no-corruption
   (%parallel-compile-tables-case)
   :ok)
 

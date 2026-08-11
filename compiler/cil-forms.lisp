@@ -887,15 +887,28 @@
    non-list. Used by the return-from scanners so they never macroexpand a
    parameter name, which would fire a same-named macro's compile-time side
    effects (e.g. a required param named INST under SBCL's assembler)."
-  (when (listp lambda-list)
-    (let ((state :required) (forms '()))
-      (dolist (p lambda-list (nreverse forms))
+  (let ((state :required) (forms '()))
+    (do ((cur lambda-list (cdr cur)))
+        ((not (consp cur)) (nreverse forms))
+      (let ((p (car cur)))
         (cond
           ((member p '(&optional &rest &body &key &aux &allow-other-keys
                        &whole &environment))
            (setf state p))
           ((and (consp p) (member state '(&optional &key &aux)) (cadr p))
            (push (cadr p) forms)))))))
+
+(defun %scan-code-forms (fn forms)
+  "Apply FN to each element of FORMS, returning the first true result. Unlike
+   SOME, tolerates an improper or non-list FORMS: the scanners walk unevaluated
+   subforms too, so a binding special form's binding-list or body position is
+   not guaranteed to hold a proper list. A DOLIST spec whose variable is named
+   LET or LABELS, for instance, reads as (LET <list-form>) — indistinguishable
+   by shape from a LET whose binding list is a symbol."
+  (do ((cur forms (cdr cur)))
+      ((not (consp cur)) nil)
+    (let ((r (funcall fn (car cur))))
+      (when r (return r)))))
 
 (defun form-macroexpands-to-return-from-p (name form depth)
   "Like FORM-HAS-RETURN-FROM-P, but also expands global macro calls (up to
@@ -925,27 +938,29 @@
     ;; RETURN-FROM, so skipping it loses no detection.
     ((member (car form) '(lambda named-lambda))
      (let ((namedp (eq (car form) 'named-lambda)))
-       (or (some (lambda (f) (form-macroexpands-to-return-from-p name f depth))
-                 (%lambda-list-init-forms (if namedp (caddr form) (cadr form))))
-           (some (lambda (f) (form-macroexpands-to-return-from-p name f depth))
-                 (if namedp (cdddr form) (cddr form))))))
+       (or (%scan-code-forms (lambda (f) (form-macroexpands-to-return-from-p name f depth))
+                             (%lambda-list-init-forms (if namedp (caddr form) (cadr form))))
+           (%scan-code-forms (lambda (f) (form-macroexpands-to-return-from-p name f depth))
+                             (if namedp (cdddr form) (cddr form))))))
     ((member (car form) '(flet labels))
-     (or (some (lambda (fdef)
-                 (and (consp fdef)
-                      (or (some (lambda (f) (form-macroexpands-to-return-from-p name f depth))
-                                (%lambda-list-init-forms (cadr fdef)))
-                          (some (lambda (f) (form-macroexpands-to-return-from-p name f depth))
-                                (cddr fdef)))))
-               (cadr form))
-         (some (lambda (f) (form-macroexpands-to-return-from-p name f depth))
-               (cddr form))))
+     (or (%scan-code-forms
+          (lambda (fdef)
+            (and (consp fdef)
+                 (or (%scan-code-forms (lambda (f) (form-macroexpands-to-return-from-p name f depth))
+                                       (%lambda-list-init-forms (cadr fdef)))
+                     (%scan-code-forms (lambda (f) (form-macroexpands-to-return-from-p name f depth))
+                                       (cddr fdef)))))
+          (cadr form))
+         (%scan-code-forms (lambda (f) (form-macroexpands-to-return-from-p name f depth))
+                           (cddr form))))
     ((member (car form) '(let let*))
-     (or (some (lambda (b)
-                 (and (consp b) (cadr b)
-                      (form-macroexpands-to-return-from-p name (cadr b) depth)))
-               (cadr form))
-         (some (lambda (f) (form-macroexpands-to-return-from-p name f depth))
-               (cddr form))))
+     (or (%scan-code-forms
+          (lambda (b)
+            (and (consp b) (cadr b)
+                 (form-macroexpands-to-return-from-p name (cadr b) depth)))
+          (cadr form))
+         (%scan-code-forms (lambda (f) (form-macroexpands-to-return-from-p name f depth))
+                           (cddr form))))
     (t
      (or
       ;; A global macro call may expand to a return-from (possibly after more
@@ -4133,68 +4148,347 @@
 ;; symbol-function. The body compiles to (:call "Runtime.Puthash") directly.
 (defun puthash (key ht val) (puthash key ht val))
 
-(defun %mini-bind-params (params args env)
-  "Bind a lambda list PARAMS to ARGS, extending the ENV alist. Handles required,
-   &optional (with default forms and supplied-p), &rest, &key (with default
-   forms, supplied-p, and ((:keyword var) ...) form), and &aux. Default and aux
-   init forms are evaluated left-to-right in the partial environment."
-  (let ((state :required) (new-env env) (rest-args args))
+;; Same rationale as PUTHASH: these are the lowering targets SETF of SYMBOL-VALUE
+;; and of GET expand into (cil-macros.lisp), emitted inline by the compiler
+;; through the special-form table and therefore never given a function binding.
+;; The tree-walk evaluator resolves an operator through SYMBOL-FUNCTION, so an
+;; interpreted (setf (symbol-value s) v) died with "Undefined function:
+;; %SET-SYMBOL-VALUE" and (setf (get s k) v) with "PUT-PROP". Each body compiles
+;; to the corresponding (:call "Runtime.X"), so the compiled path is unchanged —
+;; the name test in the emit table still wins there.
+(defun %set-symbol-value (sym val) (%set-symbol-value sym val))
+(defun put-prop (sym ind val) (put-prop sym ind val))
+
+(defun %mini-lambda-list-shape (params)
+  "Describe PARAMS for argument checking:
+   (values nreq nopt restp keyp allow-other-keys-p keywords checkablep).
+   CHECKABLEP is NIL when the list contains a lambda-list keyword this does not
+   model — the caller then skips checking rather than risk rejecting a valid
+   call."
+  (let ((state :required) (nreq 0) (nopt 0) (restp nil) (keyp nil)
+        (aok nil) (kws '()) (checkable t))
     (dolist (p params)
       (cond
         ((eq p '&optional) (setq state :optional))
-        ((eq p '&rest)     (setq state :rest))
-        ((eq p '&key)      (setq state :key))
-        ((eq p '&aux)      (setq state :aux))
-        ((eq p '&allow-other-keys) nil)
-        ((eq state :required)
-         (setq new-env (acons p (car rest-args) new-env)
-               rest-args (cdr rest-args)))
-        ((eq state :optional)
-         (let* ((var (if (consp p) (car p) p))
-                (default (when (consp p) (cadr p)))
-                (supp (when (consp p) (caddr p)))
-                (present rest-args)
-                (val (if present (pop rest-args)
-                         (when default (%mini-eval default new-env)))))
-           (setq new-env (acons var val new-env))
-           (when supp (setq new-env (acons supp (if present t nil) new-env)))))
-        ((eq state :rest)
-         (setq new-env (acons p rest-args new-env)))
+        ;; &body is &rest with a different name (it reaches here only from a
+        ;; lambda list that was not routed through DESTRUCTURING-BIND).
+        ((or (eq p '&rest) (eq p '&body)) (setq state :rest restp t))
+        ((eq p '&key) (setq state :key keyp t))
+        ((eq p '&aux) (setq state :aux))
+        ((eq p '&allow-other-keys) (setq aok t))
+        ;; Anything else spelled like a lambda-list keyword (&whole, &environment,
+        ;; an implementation's own) is not modelled here: stop claiming to know
+        ;; the shape instead of counting it as a required parameter, which would
+        ;; reject calls that are perfectly legal.
+        ((and (symbolp p) p (char= (char (symbol-name p) 0) #\&))
+         (setq checkable nil))
+        ((eq state :required) (incf nreq))
+        ((eq state :optional) (incf nopt))
         ((eq state :key)
-         ;; p may be VAR, (VAR DEFAULT), (VAR DEFAULT SUPPLIED-P), or
-         ;; ((:KEYWORD VAR) DEFAULT [SUPPLIED-P]).
          (let* ((head (if (consp p) (car p) p))
                 (var (if (consp head) (cadr head) head))
                 (kw (if (consp head) (car head)
-                        (intern (symbol-name var) :keyword)))
-                (default (when (consp p) (cadr p)))
-                (supp (when (consp p) (caddr p)))
-                (cell (do ((a rest-args (cddr a))) ((null a) nil)
-                        (when (eq (car a) kw) (return a))))
-                (val (if cell (cadr cell)
-                         (when default (%mini-eval default new-env)))))
-           (setq new-env (acons var val new-env))
-           (when supp (setq new-env (acons supp (if cell t nil) new-env)))))
-        ((eq state :aux)
-         (let* ((var (if (consp p) (car p) p))
-                (init (when (consp p) (cadr p)))
-                (val (when init (%mini-eval init new-env))))
-           (setq new-env (acons var val new-env))))))
-    new-env))
+                        (intern (symbol-name var) :keyword))))
+           (push kw kws)))
+        (t nil)))                       ; :rest / :aux consume no arguments
+    (values nreq nopt restp keyp aok (nreverse kws) checkable)))
 
-(defun %mini-eval-progn (forms env)
-  ;; Collect vars from (declare (special ...)) that are in env alist,
-  ;; then bind them dynamically so closures can see their values.
-  (let ((dyn-vars '()) (dyn-vals '()))
+(defun %mini-check-args (params args)
+  "Signal PROGRAM-ERROR if ARGS does not match the lambda list PARAMS.
+   Interpreted closures previously accepted any argument count, so a missing
+   required argument silently bound NIL and an unknown :KEY was ignored. That is
+   the largest single source of ansi-test failures under the interpreter — every
+   structure whose DEFSTRUCT was created through EVAL gets its accessors as
+   interpreted closures, so (FOO-P) with no argument answered NIL instead of
+   signalling (CLHS 3.5.1.2 / 3.5.1.4 / 3.5.1.6)."
+  (multiple-value-bind (nreq nopt restp keyp aok kws checkable)
+      (%mini-lambda-list-shape params)
+    (when checkable
+      (let ((n (length args)))
+        (when (< n nreq)
+          (error 'program-error))
+        (when (and (not restp) (not keyp) (> n (+ nreq nopt)))
+          (error 'program-error))
+        (when keyp
+          (let ((tail (nthcdr (+ nreq nopt) args)))
+            ;; The keyword portion must be an even-length list of keyword/value
+            ;; pairs, and every keyword must be accepted unless other keys are
+            ;; allowed — by &allow-other-keys or by :ALLOW-OTHER-KEYS non-NIL in
+            ;; the call itself (CLHS 3.5.1.4).
+            (when (oddp (length tail))
+              (error 'program-error))
+            ;; CLHS 3.4.1.4.1: when :ALLOW-OTHER-KEYS appears more than once, the
+            ;; value of the FIRST pair is the one that counts. Scanning for "any
+            ;; pair with a true value" made
+            ;;   (:allow-other-keys nil :allow-other-keys t :foo t)
+            ;; accept :FOO, where the leftmost NIL should have rejected it
+            ;; (ansi-test COMPLEMENT.ERROR.6). Stop at the first pair, whatever
+            ;; its value.
+            (let ((caller-aok (do ((a tail (cddr a))) ((null a) nil)
+                                (when (eq (car a) :allow-other-keys)
+                                  (return (and (cadr a) t))))))
+              (unless (or aok caller-aok)
+                (do ((a tail (cddr a))) ((null a) nil)
+                  (unless (or (member (car a) kws)
+                              (eq (car a) :allow-other-keys))
+                    (error 'program-error)))))))))))
+
+(defun %mini-body-special-decls (body)
+  "The names BODY's (DECLARE (SPECIAL ...)) forms mention. Scans every form, the
+   same way %MINI-EVAL-PROGN does, so the two agree on what counts as declared."
+  (let ((r '()))
+    (dolist (f body r)
+      (when (and (consp f) (eq (car f) 'declare))
+        (dolist (d (cdr f))
+          (when (and (consp d) (eq (car d) 'special))
+            (dolist (v (cdr d)) (push v r))))))))
+
+(defun %mini-bind-supp (supp supp-val ps state env rest-args specials k)
+  "Bind a supplied-p variable, then continue the lambda-list walk. Split out of
+   %MINI-BIND-WALK (rather than being a LABELS inside it) so neither function
+   closes over anything: both are on the per-call path of every interpreted
+   call."
+  (if (member supp specials)
+      (progv (list supp) (list supp-val)
+        (%mini-bind-walk ps state env rest-args specials k))
+      (%mini-bind-walk ps state (acons supp supp-val env) rest-args specials k)))
+
+(defun %mini-bind-walk (ps state env rest-args specials k)
+  "Walk the remaining lambda list PS, extending ENV, and finally call K with it.
+   See %MINI-BIND-PARAMS-CALL for what SPECIALS and K are for.
+
+   The walk is ITERATIVE and recurses only where it must — at a special binding,
+   whose PROGV has to wrap the remainder."
+  (loop
+    (when (null ps) (return-from %mini-bind-walk (funcall k env)))
+    (let ((p (car ps)))
+      (cond
+        ((eq p '&optional) (setq state :optional ps (cdr ps)))
+        ((or (eq p '&rest) (eq p '&body)) (setq state :rest ps (cdr ps)))
+        ((eq p '&key) (setq state :key ps (cdr ps)))
+        ((eq p '&aux) (setq state :aux ps (cdr ps)))
+        ((eq p '&allow-other-keys) (setq ps (cdr ps)))
+        (t
+         (let ((var nil) (val nil) (supp nil) (supp-val nil) (next rest-args))
+           (cond
+             ((eq state :required)
+              (setq var p val (car rest-args) next (cdr rest-args)))
+             ((eq state :optional)
+              (let* ((v (if (consp p) (car p) p))
+                     (default (when (consp p) (cadr p)))
+                     (sp (when (consp p) (caddr p)))
+                     (present rest-args))
+                (setq var v
+                      val (if present (car rest-args)
+                              (when default (%mini-eval default env)))
+                      supp sp
+                      supp-val (if present t nil)
+                      next (if present (cdr rest-args) rest-args))))
+             ((eq state :rest)
+              (setq var p val rest-args))
+             ((eq state :key)
+              ;; p may be VAR, (VAR DEFAULT), (VAR DEFAULT SUPPLIED-P), or
+              ;; ((:KEYWORD VAR) DEFAULT [SUPPLIED-P]).
+              (let* ((head (if (consp p) (car p) p))
+                     (v (if (consp head) (cadr head) head))
+                     (kw (if (consp head) (car head)
+                             (intern (symbol-name v) :keyword)))
+                     (default (when (consp p) (cadr p)))
+                     (sp (when (consp p) (caddr p)))
+                     (cell (do ((a rest-args (cddr a))) ((null a) nil)
+                             (when (eq (car a) kw) (return a)))))
+                (setq var v
+                      val (if cell (cadr cell)
+                              (when default (%mini-eval default env)))
+                      supp sp
+                      supp-val (if cell t nil))))
+             ((eq state :aux)
+              (let* ((v (if (consp p) (car p) p))
+                     (init (when (consp p) (cadr p))))
+                (setq var v val (when init (%mini-eval init env))))))
+           (setq ps (cdr ps))
+           (cond
+             ((member var specials)
+              (return-from %mini-bind-walk
+                (progv (list var) (list val)
+                  (if supp
+                      (%mini-bind-supp supp supp-val ps state env next specials k)
+                      (%mini-bind-walk ps state env next specials k)))))
+             (supp
+              (setq env (acons var val env))
+              (return-from %mini-bind-walk
+                (%mini-bind-supp supp supp-val ps state env next specials k)))
+             (t (setq env (acons var val env)
+                      rest-args next)))))))))
+
+(defun %mini-bind-params-call (params args env specials k)
+  "Bind lambda list PARAMS to ARGS extending ENV, then call K with the result.
+   Handles required, &optional (default + supplied-p), &rest, &key (default,
+   supplied-p, ((:keyword var) ...)) and &aux. Init forms are evaluated
+   left-to-right in the partial environment.
+
+   A parameter named in SPECIALS is bound DYNAMICALLY (PROGV) instead of being
+   put in the alist, and that binding is in effect for every LATER init form as
+   well as for K. **That is why this takes a continuation instead of returning
+   the env**: a PROGV scope cannot be handed back as a value.
+
+   The previous shape built the whole env first and left the dynamic binding to
+   %MINI-EVAL-PROGN, so an &AUX init ran BEFORE the parameter it reads was bound:
+
+     (let ((x :bad)) (declare (special x))
+       (flet ((%f () x))
+         ((lambda (x &aux (y (%f))) (declare (special x)) y) :good)))   ; => :BAD
+
+   (ansi-test LAMBDA.64.) Leaving the special parameter OUT of the alist is also
+   what makes %MINI-EVAL-PROGN do the right thing afterwards: it only re-binds a
+   declared name it can still find in ENV, so it now sees nothing to do and body
+   references fall through to the dynamic value.
+
+   This is the hottest path in the evaluator, so nothing here allocates for the
+   common case (SPECIALS NIL): the walk is a plain loop in two top-level
+   functions that close over nothing, and K is built once per closure rather than
+   once per call (see %MINI-MAKE-CLOSURE). Written as a straightforward CPS walk
+   with LABELS it cost ~10% on every interpreted call."
+  (%mini-check-args params args)
+  (%mini-bind-walk params :required env args specials k))
+
+(defun %mini-bind-params (params args env)
+  "Bind PARAMS to ARGS and RETURN the extended ENV. No parameter is treated as
+   special — callers that need that use %MINI-BIND-PARAMS-CALL, which can keep a
+   PROGV scope open across the rest of the binding and the body."
+  (%mini-bind-params-call params args env '() #'identity))
+
+(defvar *%mini-symbol-macro-marker* (make-symbol "SYMBOL-MACRO")
+  "Head cons marker for a SYMBOL-MACROLET binding in %MINI-EVAL's ENV alist.
+
+   It must be UNINTERNED. It used to be the interned symbol
+   DOTCL-INTERNAL::SYMBOL-MACRO, which the SIL loader materialises lazily — the
+   first interpreted SYMBOL-MACROLET brings it into the package, and from then on
+   DO-SYMBOLS / DO-ALL-SYMBOLS hand the interpreter's own sentinel back to user
+   code. Any interpreted variable then holding a list that starts with it (the
+   DOLIST variable walking a package's symbol list is the obvious one) was read as
+   a symbol-macro binding, and its SECOND element was evaluated as a variable:
+
+     (do-symbols (sym (find-package \"DOTCL-INTERNAL\")) (symbol-name sym))
+     => #<UNBOUND-VARIABLE: %THREADP>   ; the symbol after the marker
+
+   That is ansi-test DO-ALL-SYMBOLS.1-13 / FIND-ALL-SYMBOLS.1 / PRINT.SYMBOL.RANDOM.3-4.
+   The lazy interning is what made it look state-dependent: the same form passes
+   until something interprets a SYMBOL-MACROLET, and the reported variable name
+   changes with the package's symbol order. MAKE-SYMBOL puts the marker out of
+   every package, so no iteration can ever produce it.")
+
+(defun %mini-macroexpand-env (&optional lex-macros)
+  "&ENVIRONMENT object to hand MACROEXPAND-1 from %MINI-EVAL: the MACROLET and
+   SYMBOL-MACROLET bindings currently in scope, and nothing else. NIL when there
+   are none. LEX-MACROS is the enclosing %MINI-MACROS alist (name . expander).
+
+   %MINI-EVAL used to call (MACROEXPAND-1 FORM) with no environment at all, so an
+   expander's &ENVIRONMENT was always empty. SYMBOL-MACROLET bindings live only in
+   *SYMBOL-MACROS*, which the runtime MACROEXPAND-1 does not read — so
+   (MACROEXPAND x env) inside an expander could not see them (ansi-test
+   RESTART-CASE.30, where RESTART-CASE must decide whether its body is a signaling
+   form and the body is a symbol macro).
+
+   MACROLET used to reach an expander by a different route: the MACROLET case
+   registered its expanders GLOBALLY in *MACROS* for the dynamic extent of the
+   body. That made them visible with an empty environment — and visible to every
+   other form interpreted during that extent, including the body of a separately
+   defined function the body happened to call. Putting the bindings here instead
+   is what makes them lexical: MACROEXPAND-1 consults an environment's macro table
+   before the runtime one, which is the shadowing CL asks for, and nothing outside
+   this scope is handed the table.
+
+   The CAR still must not be *MACROS* itself — that would reorder macro lookup for
+   every interpreted form. Only the lexically established bindings go in."
+  (when (or *symbol-macros* lex-macros)
+    (cons (when lex-macros
+            (let ((ht (make-hash-table :test #'equal)))
+              (dolist (entry lex-macros ht)
+                ;; innermost first: the alist is already in that order, so an
+                ;; outer binding must not overwrite an inner one
+                (let ((key (if (null (car entry)) "NIL" (symbol-name (car entry)))))
+                  (unless (nth-value 1 (gethash key ht))
+                    (setf (gethash key ht) (cdr entry)))))))
+          (when *symbol-macros*
+            (let ((ht (make-hash-table :test #'equal)))
+              (dolist (entry *symbol-macros* ht)
+                (setf (gethash (symbol-name (car entry)) ht) (cdr entry))))))))
+
+(defun %mini-macro-fn (name env)
+  "The lexical MACROLET binding of NAME in ENV, or NIL.
+
+   Macros get their own key in ENV for the reasons FLET bindings (%MINI-FDEFN)
+   and GO tags (%MINI-GO-TAGS) do: they are looked up before MACROEXPAND-1, which
+   cannot see ENV and therefore always answered with the GLOBAL macro of the same
+   name. ASSOC's EQL test is right here — a macro name is always a symbol (and
+   NIL / T reach this too, which is the point: they are not SYMBOL instances, so
+   nothing else in this evaluator recognises them in operator position)."
+  (%mini-macro-fn-in name (cdr (assoc '%mini-macros env))))
+
+(defun %mini-macro-fn-in (name lex-macros)
+  "%MINI-MACRO-FN against an already-extracted %MINI-MACROS alist. The operator
+   dispatch needs that alist twice per compound form — once to look the operator
+   up, once to build the &ENVIRONMENT it hands MACROEXPAND-1 — and this runs on
+   every interpreted form, so it is extracted once and passed in."
+  (and (or (symbolp name) (null name))
+       (cdr (assoc name lex-macros))))
+
+(defun symbol-macrolet-violation-p (bindings body)
+  "True when (symbol-macrolet BINDINGS . BODY) is a program error.
+   CLHS SYMBOL-MACROLET: the consequences are undefined (and it is required to
+   signal PROGRAM-ERROR) if a name is a constant or names a globally special
+   variable, or if the body declares one of the names SPECIAL.
+   Shared by COMPILE-SYMBOL-MACROLET and the %MINI-EVAL case so the two
+   evaluators cannot drift — the interpreter used to accept all three."
+  (dolist (b bindings)
+    (let ((name (car b)))
+      (when (or (constantp name) (global-special-p name))
+        (return-from symbol-macrolet-violation-p t))))
+  (let ((binding-names (mapcar #'car bindings)))
+    (dolist (form body)
+      (when (and (consp form) (eq (car form) 'declare))
+        (dolist (decl (cdr form))
+          (when (and (consp decl) (eq (car decl) 'special))
+            (dolist (sname (cdr decl))
+              (when (member sname binding-names)
+                (return-from symbol-macrolet-violation-p t))))))))
+  nil)
+
+(defun %mini-eval-progn (forms env &optional bound-vars)
+  ;; (declare (special V)) in a body makes references to V within that body
+  ;; DYNAMIC (CLHS 3.3.4). Which binding that refers to depends on whether the
+  ;; enclosing form bound V, so BOUND-VARS names what it just bound:
+  ;;
+  ;;   V is in BOUND-VARS — the enclosing form's own binding becomes dynamic.
+  ;;     PROGV it with the value that form computed.
+  ;;       (let ((x 5)) (declare (special x)) ...)      ; x is dynamically 5
+  ;;
+  ;;   V is free here — the declaration only says "read V dynamically". Do NOT
+  ;;     rebind: the reference must reach the value an OUTER special binding
+  ;;     established.
+  ;;       (let ((x :good)) (declare (special x))
+  ;;         (let ((x :bad)) (locally (declare (special x)) x)))   ; => :GOOD
+  ;;
+  ;; Either way the lexical entry must be dropped for the body, or reads keep
+  ;; hitting the alist and never consult the dynamic value at all. Taking the
+  ;; value out of ENV unconditionally — what this did before — got the free case
+  ;; exactly backwards: it re-bound V to the *shadowing lexical* value, so the
+  ;; example above answered :BAD (ansi-test DO.14/17/19 and the LOCALLY tests).
+  (let ((dyn-vars '()) (dyn-vals '()) (shadow '()))
     (dolist (f forms)
       (when (and (consp f) (eq (car f) 'declare))
         (dolist (d (cdr f))
           (when (and (consp d) (eq (car d) 'special))
             (dolist (v (cdr d))
-              (let ((b (assoc v env)))
-                (when b
-                  (push v dyn-vars)
-                  (push (cdr b) dyn-vals))))))))
+              (push v shadow)
+              (when (member v bound-vars)
+                (let ((b (assoc v env)))
+                  (when b
+                    (push v dyn-vars)
+                    (push (cdr b) dyn-vals)))))))))
+    (when shadow
+      (setq env (remove-if (lambda (e) (member (car e) shadow)) env)))
     ;; Evaluate all-but-last for effect; return the LAST form's values via a
     ;; tail %mini-eval so multiple values propagate (CL progn semantics).
     (labels ((run (fs)
@@ -4205,12 +4499,67 @@
           (progv dyn-vars dyn-vals (run forms))
           (run forms)))))
 
-(defun %mini-make-closure (lambda-form env)
-  "Return a Lisp function that interprets LAMBDA-FORM in captured ENV."
-  (let ((params (cadr lambda-form))
-        (body   (cddr lambda-form)))
-    (lambda (&rest call-args)
-      (%mini-eval-progn body (%mini-bind-params params call-args env)))))
+(defun %mini-lambda-list-var-names (params)
+  "The variable names PARAMS binds, ignoring lambda-list keywords, default forms
+   and supplied-p vars' spelling. Used to tell a (declare (special p)) that
+   rebinds a parameter from one that merely reads an outer special."
+  (let ((names '()))
+    (dolist (p params)
+      (cond ((and (symbolp p) p (char= (char (symbol-name p) 0) #\&)) nil)
+            ((symbolp p) (push p names))
+            ((consp p)
+             (let ((head (car p)))
+               (push (if (consp head) (cadr head) head) names))
+             (when (caddr p) (push (caddr p) names)))))
+    (nreverse names)))
+
+(defun %mini-fdefn (name env)
+  "The lexical FLET / LABELS binding of NAME in ENV, or NIL.
+
+   Function names get their own key, for the same two reasons go tags did
+   (%MINI-GO-TAGS): they are a separate namespace from variables (CLHS 3.1.1),
+   and — unlike tags — a name can be the CONS (SETF F), which ASSOC's default
+   EQL test can never match. Storing them in the variable alist therefore made
+   every (setf f) local function invisible no matter how it was referenced, and
+   made a VARIABLE whose value happened to be a function answer in operator
+   position: (let ((list #'car)) (list 1 2)) called CAR."
+  (cdr (assoc name (cdr (assoc '%mini-functions env)) :test #'equal)))
+
+(defun %mini-fn-lambda (params bname body)
+  "(LAMBDA PARAMS decls... (BLOCK BNAME body...)) for a named local function.
+   The declarations must stay OUTSIDE the BLOCK: %MINI-MAKE-CLOSURE is the only
+   caller that knows which names the lambda list bound, and %MINI-EVAL-PROGN only
+   scans the forms handed to it. Burying them in the BLOCK made a parameter's
+   (declare (special p)) look like a FREE declaration, so the parameter was never
+   bound dynamically."
+  (let ((decls '()) (rest body))
+    (when (and (stringp (car rest)) (cdr rest)) (push (pop rest) decls))
+    (loop while (and (consp (car rest)) (eq (caar rest) 'declare))
+          do (push (pop rest) decls))
+    `(lambda ,params ,@(nreverse decls) (block ,bname ,@rest))))
+
+(defun %mini-make-closure (lambda-form env &optional name)
+  "Return a Lisp function that interprets LAMBDA-FORM in captured ENV.
+
+   NAME, when given, is the string the function reports on the debugger call
+   stack. Only a globally named definition passes one: a compiled backtrace lists
+   DEFUN and DEFMETHOD frames and nothing else — FLET, LABELS and plain LAMBDA
+   stay anonymous there — so the interpreted path names exactly the same set."
+  (let* ((params (cadr lambda-form))
+         (body   (cddr lambda-form))
+         (names  (%mini-lambda-list-var-names params))
+         ;; The parameters are what THIS form binds, so a (declare (special p))
+         ;; in the body rebinds the parameter rather than reading an outer one.
+         ;; Those are bound during the lambda-list walk, not after it, so a later
+         ;; &OPTIONAL / &KEY default or &AUX init sees the dynamic binding.
+         (specials (intersection (%mini-body-special-decls body) names))
+         ;; Built once per closure, not once per call: it depends only on the
+         ;; lambda form, and this runs on every interpreted call.
+         (k (lambda (new-env) (%mini-eval-progn body new-env names)))
+         (fn (lambda (&rest call-args)
+               (%mini-bind-params-call params call-args env specials k))))
+    (when name (%set-function-name fn name))
+    fn))
 
 (defun %mini-expand-handler-case (form)
   "Rewrite (handler-case body (type (var) h...) ... [(:no-error ll forms...)])
@@ -4242,6 +4591,17 @@
         `(block ,blk
            (handler-bind ,handler-bindings ,body)))))
 
+(defun %mini-eval-handler-bind (form env)
+  "Interpret (handler-bind ((type handler-form)...) body...).
+   Establishes the cluster through the runtime primitive, which runs the body
+   under a .NET try/catch: a raw .NET exception is converted to a condition and
+   signalled through the cluster, so an interpreted handler sees the same
+   conditions a compiled one does."
+  (%call-with-handler-cluster
+   (mapcar (lambda (b) (cons (car b) (%mini-eval (cadr b) env)))
+           (cadr form))
+   (%mini-make-closure (list* 'lambda '() (cddr form)) env)))
+
 (defvar *%mini-eval-depth* 0)
 
 (defun %mini-eval (form env)
@@ -4259,7 +4619,7 @@
        (if b
            ;; Could be (SYMBOL-MACRO expansion) from symbol-macrolet
            (let ((v (cdr b)))
-             (if (and (consp v) (eq (car v) 'SYMBOL-MACRO))
+             (if (and (consp v) (eq (car v) *%mini-symbol-macro-marker*))
                  (%mini-eval (cadr v) env)
                  v))
            (multiple-value-bind (sm found) (lookup-symbol-macro form)
@@ -4273,8 +4633,54 @@
                        (%mini-eval exp env)
                        (symbol-value form))))))))
     ((consp form)
+     ;; A lexical FLET/LABELS binding shadows a GLOBAL MACRO of the same name
+     ;; (CLHS 3.1.2.1.2.4). MACROEXPAND-1 cannot see ENV, so expanding first
+     ;; turned (flet ((f () :good)) (f)) into the global macro's expansion.
+     (if (%mini-fdefn (car form) env)
+         (apply (%mini-fdefn (car form) env)
+                (mapcar (lambda (a) (%mini-eval a env)) (cdr form)))
+     ;; A MACROLET binding shadows a global macro for the same reason, and needs
+     ;; its own lookup for the same reason: MACROEXPAND-1 consults the runtime
+     ;; macro table before it ever reaches the *MACROS* entry the MACROLET case
+     ;; writes, so (macrolet ((m () :good)) (m)) took the GLOBAL M's expansion
+     ;; whenever one existed (ansi-test MACROLET.50, and the entries of
+     ;; MACROLET.16 that name a CL macro).
+     ;;
+     ;; It also settles the operator NIL and T. Those are not SYMBOL instances
+     ;; here, so MACROEXPAND-1 does not treat them as macro calls and the
+     ;; fall-through called (SYMBOL-FUNCTION NIL), which type-errors —
+     ;; (macrolet ((nil () ''a)) (nil)) died there (ansi-test MACROLET.15).
+     ;; Looking the operator up in ENV first never reaches that path.
+     (let* ((lex-macros (cdr (assoc '%mini-macros env)))
+            (lex-macro (%mini-macro-fn-in (car form) lex-macros)))
+     (if lex-macro
+         ;; The expander is handed the same environment MACROEXPAND-1 would get,
+         ;; so an &ENVIRONMENT parameter can expand the MACROLET bindings in scope
+         ;; (they are lexical here, so an environment built from the globals would
+         ;; not show them).
+         (%mini-eval (funcall lex-macro form (%mini-macroexpand-env lex-macros)) env)
+     (if (eq (car form) 'handler-bind)
+         ;; HANDLER-BIND is implemented here rather than through its macro, the
+         ;; way COMPILE-FORM consults its handler table before macroexpanding.
+         ;; The macro exists so a code walker can see the body inline, and its
+         ;; expansion (%PUSH-HANDLER-CLUSTER + UNWIND-PROTECT) establishes the
+         ;; cluster without wrapping the body in a .NET try/catch — which is
+         ;; correct for a walker and wrong for an evaluator, because a raw .NET
+         ;; throw does not go through SIGNAL and so flew straight past the
+         ;; handlers. %CALL-WITH-HANDLER-CLUSTER runs the body under a catch that
+         ;; converts and signals. HANDLER-CASE expands into HANDLER-BIND, so it
+         ;; arrives here too.
+         (%mini-eval-handler-bind form env)
      ;; First try macroexpand-1: handles destructuring-bind, when, cond, etc.
-     (multiple-value-bind (expanded expandedp) (macroexpand-1 form)
+     ;; The environment carries the enclosing SYMBOL-MACROLET bindings (and only
+     ;; those) so an expander's (MACROEXPAND x env) can see them. The *SYMBOL-MACROS*
+     ;; test is inline rather than inside %MINI-MACROEXPAND-ENV: this runs for every
+     ;; interpreted compound form, and the overwhelmingly common case is "no symbol
+     ;; macros in scope", which must not cost a call.
+     (multiple-value-bind (expanded expandedp)
+         (if (or *symbol-macros* lex-macros)
+             (macroexpand-1 form (%mini-macroexpand-env lex-macros))
+             (macroexpand-1 form))
        (if expandedp
            (%mini-eval expanded env)
            ;; Dispatch on special form operators
@@ -4295,79 +4701,150 @@
                       (if (%runtime-special-p var)
                           (progn (push var spec-vars) (push val spec-vals))
                           (push (cons var val) lex))))
-                  (let ((new-env (append lex env)))
+                  (let ((new-env (append lex env))
+                        (bound (mapcar (lambda (b) (if (consp b) (car b) b))
+                                       (cadr form))))
                     (if spec-vars
                         (progv (nreverse spec-vars) (nreverse spec-vals)
-                          (%mini-eval-progn (cddr form) new-env))
-                        (%mini-eval-progn (cddr form) new-env)))))
+                          (%mini-eval-progn (cddr form) new-env bound))
+                        (%mini-eval-progn (cddr form) new-env bound)))))
                (let*
-                ;; Sequential: lexical vars accumulate in new-env; special vars
-                ;; are progv'd around the body (their init forms still see prior
-                ;; lexical bindings).
-                (let ((new-env env) (spec-vars '()) (spec-vals '()))
-                  (dolist (b (cadr form))
-                    (let ((var (if (consp b) (car b) b))
-                          (val (when (consp b) (%mini-eval (cadr b) new-env))))
-                      (if (%runtime-special-p var)
-                          (progn (push var spec-vars) (push val spec-vals))
-                          (push (cons var val) new-env))))
-                  (if spec-vars
-                      (progv (nreverse spec-vars) (nreverse spec-vals)
-                        (%mini-eval-progn (cddr form) new-env))
-                      (%mini-eval-progn (cddr form) new-env))))
+                ;; Sequential (CLHS 3.1.2.1.1.2): each binding is in effect while
+                ;; the REMAINING init forms are evaluated. Collecting the specials
+                ;; and PROGV-ing them all at the end got that backwards: a later
+                ;; init form ran with the special still at its outer value, and
+                ;; then PROGV installed the saved value over whatever that form
+                ;; had done to it. So
+                ;;   (let* ((*ctr* 0) (s (make-s2))) ... *ctr* ...)
+                ;; where the struct's slot default is (incf *ctr*) saw *ctr* = 0
+                ;; in the body although the counter had been incremented — the
+                ;; increment was applied to the outer binding and then masked.
+                ;; (ansi-test structures: 370 of that category's failures.)
+                ;; Bind one at a time instead, so each PROGV is established before
+                ;; the next init form is evaluated and the body runs inside all of
+                ;; them. Lexicals keep accumulating in ENV as before.
+                (labels ((bind-seq (bindings benv)
+                           (if (null bindings)
+                               (%mini-eval-progn
+                                (cddr form) benv
+                                (mapcar (lambda (b) (if (consp b) (car b) b))
+                                        (cadr form)))
+                               (let* ((b (car bindings))
+                                      (var (if (consp b) (car b) b))
+                                      (val (when (consp b)
+                                             (%mini-eval (cadr b) benv))))
+                                 (if (%runtime-special-p var)
+                                     (progv (list var) (list val)
+                                       (bind-seq (cdr bindings) benv))
+                                     (bind-seq (cdr bindings)
+                                               (cons (cons var val) benv)))))))
+                  (bind-seq (cadr form) env)))
                (setq
+                ;; CLHS 5.1.2.4 / setq: assigning a name that is a symbol macro
+                ;; is SETF of its expansion, not a variable assignment. The env
+                ;; alist holds a symbol-macrolet binding as
+                ;; (name SYMBOL-MACRO expansion) — the same shape the variable
+                ;; read branch above already unwraps — so writing to (cdr b)
+                ;; here did not just assign the wrong place, it OVERWROTE the
+                ;; binding with the value and destroyed the symbol macro for the
+                ;; rest of the body. (ansi-test SETF-SYMBOL-MACRO.1-3, and
+                ;; PSETQ/PSETF/ROTATEF, which macroexpand into SETQ.)
                 (let (result)
                   (let ((pairs (cdr form)))
                     (loop while pairs do
                       (let* ((var (car pairs))
-                             (val (%mini-eval (cadr pairs) env))
+                             (vform (cadr pairs))
                              (b   (assoc var env)))
-                        (if b (setf (cdr b) val) (set var val))
-                        (setq result val)
+                        (if (and b (consp (cdr b)) (eq (cadr b) *%mini-symbol-macro-marker*))
+                            ;; Hand the whole assignment back to the evaluator as
+                            ;; a SETF of the expansion, so the value form is
+                            ;; evaluated exactly once and any place form works.
+                            (setq result
+                                  (%mini-eval (list 'setf (caddr b) vform) env))
+                            (let ((val (%mini-eval vform env)))
+                              (if b (setf (cdr b) val) (set var val))
+                              (setq result val)))
                         (setq pairs (cddr pairs)))))
                   result))
                (function
+                ;; A lexical FLET/LABELS binding shadows the global definition, so
+                ;; the function namespace is consulted first (ansi-test BLOCK.5 /
+                ;; BLOCK.10, where #'%f is handed to MAPCAR). This used to look in
+                ;; the variable alist for an entry whose value happened to be a
+                ;; function, because that was where FLET put its bindings; with a
+                ;; real namespace the guess is unnecessary, and a (SETF F) name —
+                ;; a CONS, which ASSOC/EQL never matched — now resolves too.
+                ;; %COERCE-TO-FUNCTION for the same reason the operator branch
+                ;; uses it: SYMBOL-FUNCTION has no cross-package bare-name bridge,
+                ;; so #'class-precedence-list failed under the interpreter while
+                ;; the compiled #' and (funcall 'name ...) both worked.
                 (let ((fn (cadr form)))
-                  (if (symbolp fn)
-                      (symbol-function fn)
-                      (if (and (consp fn) (eq (car fn) 'setf))
-                          (fdefinition fn)
-                          (%mini-make-closure fn env)))))
+                  (cond ((%mini-fdefn fn env))
+                        ((symbolp fn) (%coerce-to-function fn))
+                        ((and (consp fn) (eq (car fn) 'setf)) (fdefinition fn))
+                        (t (%mini-make-closure fn env)))))
                (lambda
                 (%mini-make-closure form env))
                (flet
-                (let ((new-env env))
+                ;; Named local functions get an implicit block named after the
+                ;; function ((setf f) -> block f), so (return-from f ...) works.
+                ;; Bindings go in the FUNCTION namespace (see %MINI-FDEFN).
+                (let ((fns '()) (outer (cdr (assoc '%mini-functions env))))
                   (dolist (def (cadr form))
-                    ;; Named local functions get an implicit block named after the
-                    ;; function ((setf f) -> block f), so (return-from f ...) works.
                     (let ((bname (if (consp (car def)) (cadr (car def)) (car def))))
                       (push (cons (car def)
                                   (%mini-make-closure
-                                   `(lambda ,(cadr def) (block ,bname ,@(cddr def))) env))
-                            new-env)))
-                  (%mini-eval-progn (cddr form) new-env)))
+                                   (%mini-fn-lambda (cadr def) bname (cddr def)) env))
+                            fns)))
+                  (%mini-eval-progn
+                   (cddr form)
+                   (cons (cons '%mini-functions (append (nreverse fns) outer)) env))))
                (labels
-                (let ((cells '()) (new-env env))
-                  ;; Pre-allocate cells so closures can mutually reference each other
+                ;; Pre-allocate cells so closures can mutually reference each other,
+                ;; then fill them in against an env that already has every name.
+                (let* ((cells (mapcar (lambda (def) (cons (car def) nil)) (cadr form)))
+                       (outer (cdr (assoc '%mini-functions env)))
+                       (new-env (cons (cons '%mini-functions (append cells outer)) env)))
                   (dolist (def (cadr form))
-                    (let ((cell (cons (car def) nil)))
-                      (push cell cells)
-                      (push cell new-env)))
-                  ;; Fill in closures (they capture new-env which already has all names)
-                  (dolist (def (cadr form))
-                    (let ((cell (assoc (car def) cells))
+                    (let ((cell (assoc (car def) cells :test #'equal))
                           (bname (if (consp (car def)) (cadr (car def)) (car def))))
                       (setf (cdr cell)
                             (%mini-make-closure
-                             `(lambda ,(cadr def) (block ,bname ,@(cddr def))) new-env))))
+                             (%mini-fn-lambda (cadr def) bname (cddr def)) new-env))))
                   (%mini-eval-progn (cddr form) new-env)))
                (block
-                ;; Use the block name as catch tag (correct for non-escaped returns)
-                (catch (cadr form)
-                  (%mini-eval-progn (cddr form) env)))
+                ;; BLOCK names are LEXICAL (CLHS 3.1.2.1.2.4), so each entry gets a
+                ;; fresh tag object recorded in its own namespace in ENV — the same
+                ;; shape %MINI-GO-TAGS uses, and for the same reason.
+                ;;
+                ;; The block NAME itself used to be the CATCH tag, which made the
+                ;; scope DYNAMIC: a same-named inner block hid the outer one for
+                ;; everything running inside it, including a closure whose text is
+                ;; lexically outside. In
+                ;;   (block done
+                ;;     (flet ((%f (x) (return-from done x)))
+                ;;       (block done (mapcar #'%f '(good bad bad))))
+                ;;     'bad)
+                ;; %f's RETURN-FROM refers to the OUTER DONE, but the throw landed
+                ;; on the inner one, so MAPCAR simply took its next element and the
+                ;; form returned BAD (ansi-test BLOCK.10). A closure carries the ENV
+                ;; it was made in, so looking the tag up there is exactly the
+                ;; lexical rule.
+                (let* ((name (cadr form))
+                       (tag (list '%mini-block name))
+                       (new-env (cons (cons '%mini-blocks
+                                            (cons (cons name tag)
+                                                  (cdr (assoc '%mini-blocks env))))
+                                      env)))
+                  (catch tag (%mini-eval-progn (cddr form) new-env))))
                (return-from
-                (throw (cadr form)
-                       (when (cddr form) (%mini-eval (caddr form) env))))
+                ;; No lexically visible block of that name: fall back to throwing on
+                ;; the name, which is what every established block used as its tag
+                ;; before. Keeps a RETURN-FROM that crosses an evaluator boundary
+                ;; behaving as it did rather than turning into a new failure mode.
+                (let ((b (assoc (cadr form) (cdr (assoc '%mini-blocks env)))))
+                  (throw (if b (cdr b) (cadr form))
+                         (when (cddr form) (%mini-eval (caddr form) env)))))
                (the    (%mini-eval (caddr form) env))
                (locally (%mini-eval-progn (cdr form) env))
                (eval-when
@@ -4378,32 +4855,65 @@
                             (member 'cl:eval situations)) ; legacy EVAL keyword
                     (%mini-eval-progn (cddr form) env))))
                (symbol-macrolet
-                ;; Extend env with symbol macro bindings
-                (let ((new-env env))
+                ;; Extend env with symbol macro bindings, AND bind *SYMBOL-MACROS*.
+                ;; That dynamically-scoped alist is what %MACROLET-EXPANDER-FORM
+                ;; turns into the &ENVIRONMENT object it hands a macrolet expander:
+                ;;   (cons *macros* <hash of *symbol-macros*>)
+                ;; so an expander's (macroexpand x env) can only see an enclosing
+                ;; SYMBOL-MACROLET if that special was bound. The interpreter pushed
+                ;; onto its own alist only, leaving *SYMBOL-MACROS* empty, so the
+                ;; expander was handed an environment with no symbol macros in it
+                ;; and MACROEXPAND returned the symbol unchanged (ansi-test
+                ;; MACROLET.13/14/15). COMPILE-SYMBOL-MACROLET binds the same
+                ;; special, which is exactly why the compiled path was right — the
+                ;; expander builder is deliberately shared between the two paths,
+                ;; so the divergence was in who populates what it reads.
+                ;;
+                ;; The same split applied to the CLHS program-error cases (a
+                ;; constant / globally special name, or a body that declares one
+                ;; of the names special): COMPILE-SYMBOL-MACROLET rejected them
+                ;; and the interpreter silently accepted, so a symbol-macro could
+                ;; shadow a special variable under EVAL only (ansi-test
+                ;; SYMBOL-MACROLET.ERROR.1/2/3). The predicate is shared.
+                (when (symbol-macrolet-violation-p (cadr form) (cddr form))
+                  (error 'program-error))
+                (let ((new-env env) (new-sm *symbol-macros*))
                   (dolist (binding (cadr form))
-                    (push (cons (car binding) (list 'SYMBOL-MACRO (cadr binding))) new-env))
-                  (%mini-eval-progn (cddr form) new-env)))
+                    (push (cons (car binding)
+                                (list *%mini-symbol-macro-marker* (cadr binding)))
+                          new-env)
+                    (push (cons (car binding) (cadr binding)) new-sm))
+                  (let ((*symbol-macros* new-sm))
+                    (%mini-eval-progn (cddr form) new-env))))
                (macrolet
-                ;; Temporarily extend *macros* with local macros, then eval body.
-                ;; Handles the case where a macro (e.g. collect) expands into macrolet
-                ;; inside a %mini-eval closure (e.g. in a compile-macrolet expander).
-                (let ((saved-macros '()))
-                  (unwind-protect
-                      (progn
-                        (dolist (def (cadr form))
-                          (let* ((name (car def))
-                                 (params (cadr def))
-                                 (mbody (cddr def))
-                                 (old (gethash name *macros*))
-                                 (expander-fn
-                                  (%mini-eval (%macrolet-expander-form params mbody) env)))
-                            (push (cons name old) saved-macros)
-                            (setf (gethash name *macros*) expander-fn)))
-                        (%mini-eval-progn (cddr form) env))
-                    (dolist (entry saved-macros)
-                      (if (cdr entry)
-                          (setf (gethash (car entry) *macros*) (cdr entry))
-                          (remhash (car entry) *macros*))))))
+                ;; The bindings go into a lexical %MINI-MACROS namespace in ENV. The
+                ;; operator dispatch consults it (%MINI-MACRO-FN), and it is what the
+                ;; &ENVIRONMENT handed to MACROEXPAND-1 is built from
+                ;; (%MINI-MACROEXPAND-ENV) — an environment's macro table is consulted
+                ;; before the runtime one, so a MACROLET over a name that already had
+                ;; a global macro shadows it, which is what CL asks for.
+                ;;
+                ;; The expanders used to ALSO be registered in the global *MACROS*
+                ;; table for the dynamic extent of the body. That is how they used to
+                ;; become visible to MACROEXPAND-1, which cannot see ENV — and it made
+                ;; them visible far too widely: any form interpreted during that
+                ;; extent saw them, including the body of a separately defined
+                ;; function that the body called, so
+                ;;   (defun h () :global) (defun c () (h))
+                ;;   (macrolet ((h () :macro)) (list (h) (c)))
+                ;; answered (:MACRO :MACRO) interpreted and (:MACRO :GLOBAL) compiled.
+                (let ((lex-macros '()))
+                  (dolist (def (cadr form))
+                    (push (cons (car def)
+                                (%mini-eval (%macrolet-expander-form (cadr def) (cddr def))
+                                            env))
+                          lex-macros))
+                  (%mini-eval-progn
+                   (cddr form)
+                   (cons (cons '%mini-macros
+                               (append (nreverse lex-macros)
+                                       (cdr (assoc '%mini-macros env))))
+                         env))))
                (tagbody
                 (let* ((tb-id (list 'tagbody))
                        ;; Parse body into segments: list of (tag . forms)
@@ -4417,14 +4927,27 @@
                                 (push item cur-forms)))
                           (push (cons cur-tag (nreverse cur-forms)) result)
                           (nreverse result)))
-                       ;; Extend env with (tag . (GO-TARGET tb-id idx)) for each tag
+                       ;; Go tags live in their OWN namespace (CLHS 3.1.1), so they
+                       ;; are collected under one private key instead of being
+                       ;; pushed onto ENV under the tag symbol itself. Sharing the
+                       ;; symbol key with variables was actively destructive: in
+                       ;;   (let ((even nil)) (dotimes (i 8) ... (go even) ...
+                       ;;                       even (push i even) ...))
+                       ;; the tag EVEN and the variable EVEN landed on the same
+                       ;; alist entry, so (push i even) — a SETQ — overwrote the
+                       ;; GO-TARGET with a list and the NEXT (go even) reported
+                       ;; "tag not found" (ansi-test DOTIMES.12 and the DO / DO* /
+                       ;; DOLIST / TAGBODY tests of the same shape). Inner tagbodies
+                       ;; shadow outer ones by consing in front.
+                       (outer-tags (cdr (assoc '%mini-go-tags env)))
                        (tagged-env
-                        (let ((e env) (idx 0))
+                        (let ((tl '()) (idx 0))
                           (dolist (seg segs)
                             (when (car seg)
-                              (push (cons (car seg) (list 'GO-TARGET tb-id idx)) e))
+                              (push (cons (car seg) (cons tb-id idx)) tl))
                             (incf idx))
-                          e))
+                          (cons (cons '%mini-go-tags (append (nreverse tl) outer-tags))
+                                env)))
                        (done-marker (list 'done))
                        (start-idx 0))
                   (loop
@@ -4440,10 +4963,13 @@
                           (return nil)
                           (setq start-idx result))))))
                (go
+                ;; Tags are looked up in the tag namespace only (see TAGBODY), so a
+                ;; variable of the same name can neither hide a tag nor be clobbered
+                ;; by one. Entry is (tag tb-id . index).
                 (let* ((tag (cadr form))
-                       (b (assoc tag env)))
-                  (if (and b (consp (cdr b)) (eq (car (cdr b)) 'GO-TARGET))
-                      (throw (cadr (cdr b)) (caddr (cdr b)))
+                       (b (assoc tag (cdr (assoc '%mini-go-tags env)))))
+                  (if b
+                      (throw (cadr b) (cddr b))
                       (error "%mini-eval: go tag ~S not found" tag))))
                (declare nil)
                (catch
@@ -4471,32 +4997,72 @@
                (defun
                 ;; Interpreted defun: install an interpreted closure (with the
                 ;; implicit block) as the function. No compilation — works on
-                ;; emit-free targets. &key/&aux in the lambda list are not yet
-                ;; bound by %mini-bind-params (required/&optional/&rest only).
+                ;; emit-free targets.
+                ;;
+                ;; %MINI-FN-LAMBDA, not a hand-built (lambda params (block ...)):
+                ;; the declarations have to stay OUTSIDE the block. Buried inside
+                ;; it, a parameter's (declare (special p)) looks like a FREE
+                ;; declaration to %MINI-EVAL-PROGN — which then drops P's lexical
+                ;; entry without establishing a dynamic binding, so the body reads
+                ;; an unbound variable:
+                ;;   (defun f (x &aux (y 10)) (declare (special x)) (+ x y))
+                ;;   (f 5)   =>  Unbound variable: X
+                ;; FLET / LABELS already went through %MINI-FN-LAMBDA for exactly
+                ;; this reason; DEFUN was the one that did not. It only shows when
+                ;; the DEFUN ITSELF is interpreted — LOAD compiles top-level forms
+                ;; on an emit build, so it took running the suite on an emit-free
+                ;; build to surface it.
+                ;; The docstring is registered the same way COMPILE-DEFUN does
+                ;; it, with (setf documentation). %MINI-FN-LAMBDA hoists it out of
+                ;; the implicit block, but hoisting only moves it — as a form in
+                ;; the lambda body it is evaluated and discarded, so an
+                ;; interpreted DEFUN recorded nothing and (documentation 'f
+                ;; 'function) answered NIL. Same shape as the DEFVAR family.
+                ;; A docstring needs a body after it; "foo" alone IS the body.
                 (let* ((name (cadr form))
                        (params (caddr form))
                        (fbody (cdddr form))
                        (bname (if (consp name) (cadr name) name))
+                       (doc (when (and (stringp (car fbody)) (cdr fbody))
+                              (car fbody)))
                        (fn (%mini-make-closure
-                            `(lambda ,params (block ,bname ,@fbody))
-                            env)))
+                            (%mini-fn-lambda params bname fbody)
+                            env (mangle-name name))))
                   (setf (fdefinition name) fn)
+                  (when doc (funcall #'(setf documentation) doc name 'function))
                   name))
+               ;; The docstring is the 4th element and is stored INDEPENDENTLY of the
+               ;; value: DEFVAR skips the init form when the variable is already
+               ;; bound, but its documentation is still updated (CLHS defvar —
+               ;; ansi-test DEFVAR.5 turns exactly on that). COMPILE-DEFVAR emitted
+               ;; the SetVariableDocumentation call; these cases dropped the string
+               ;; on the floor, so (documentation name 'variable) was NIL under EVAL
+               ;; (DEFVAR.4/5, DEFPARAMETER.4/5).
                (defvar
-                (let ((name (cadr form)))
+                (let ((name (cadr form)) (doc (cadddr form)))
                   (proclaim (list 'special name))
                   (when (and (cddr form) (not (boundp name)))
                     (set name (%mini-eval (caddr form) env)))
+                  (when (stringp doc) (setf (documentation name 'variable) doc))
                   name))
                (defparameter
-                (let ((name (cadr form)))
+                (let ((name (cadr form)) (doc (cadddr form)))
                   (proclaim (list 'special name))
                   (set name (%mini-eval (caddr form) env))
+                  (when (stringp doc) (setf (documentation name 'variable) doc))
                   name))
                (defconstant
-                (let ((name (cadr form)))
+                ;; SET-SYMBOL-CONSTANT is what makes CONSTANTP answer T; without it
+                ;; a constant defined through EVAL was an ordinary special. That
+                ;; matters beyond introspection: SYMBOL-MACROLET's program-error
+                ;; check consults CONSTANTP, and nothing could refuse to rebind
+                ;; such a name. COMPILE-DEFVAR emitted the call for defconstant;
+                ;; this case only did the SET and the PROCLAIM.
+                (let ((name (cadr form)) (doc (cadddr form)))
                   (proclaim (list 'special name))
                   (set name (%mini-eval (caddr form) env))
+                  (set-symbol-constant name)
+                  (when (stringp doc) (setf (documentation name 'variable) doc))
                   name))
                (define-symbol-macro
                 ;; Register into the global symbol-macro registry that
@@ -4536,15 +5102,6 @@
                          env)))
                   (setf (macro-function name) expander)
                   name))
-               (handler-bind
-                ;; (handler-bind ((type handler-form) ...) body...)
-                ;; Establish a cluster via the runtime primitive, then run body
-                ;; as a 0-arg interpreted closure under it.
-                (%call-with-handler-cluster
-                 (mapcar (lambda (b)
-                           (cons (car b) (%mini-eval (cadr b) env)))
-                         (cadr form))
-                 (%mini-make-closure (list* 'lambda '() (cddr form)) env)))
                (handler-case
                 (%mini-eval (%mini-expand-handler-case form) env))
                (restart-case
@@ -4587,21 +5144,47 @@
                 (if (and (symbolp op) (string= (symbol-name op) "%DOTIMES-1+"))
                     (return-from %mini-eval (1+ (%mini-eval (cadr form) env)))
                     nil)
+                ;; %DOTNET-CALL-DIRECT is the one compiler intrinsic on this path
+                ;; that cannot be given a function binding: its third argument is
+                ;; a literal list of parameter type names, which ordinary argument
+                ;; evaluation would try to call. It is a special form, so the
+                ;; interpreter needs its own case.
+                ;;   (%dotnet-call-direct "Type" "Method" (param-types...) recv arg...)
+                ;; The type and parameter-type strings only select an overload for
+                ;; the direct callvirt; dropping them and going through the dynamic
+                ;; DOTNET:INVOKE path is the same call, which is exactly what the
+                ;; assembler itself falls back to when it cannot resolve the
+                ;; overload. Matched by name for the same reason as %DOTIMES-1+.
+                (if (and (symbolp op) (string= (symbol-name op) "%DOTNET-CALL-DIRECT"))
+                    (return-from %mini-eval
+                      (apply (symbol-function (find-symbol "INVOKE" "DOTNET"))
+                             (%mini-eval (nth 4 form) env)
+                             (caddr form)
+                             (mapcar (lambda (a) (%mini-eval a env)) (nthcdr 5 form))))
+                    nil)
                 ;; Function call: a local binding, a symbol's function, a
                 ;; (setf name) function designator in operator position (e.g.
                 ;; the ((setf foo) v place) form setf expands to), or a
                 ;; ((lambda ...) ...) / computed-function operator.
                 (let* ((fn (cond
-                             ((symbolp op)
-                              (let ((b (assoc op env)))
-                                (if (and b (functionp (cdr b)))
-                                    (cdr b)
-                                    (symbol-function op))))
+                             ;; Function namespace first: a lexical FLET/LABELS
+                             ;; binding shadows the global function AND a global
+                             ;; macro of the same name (CLHS 3.1.2.1.2.4).
+                             ((%mini-fdefn op env))
+                             ;; %COERCE-TO-FUNCTION, not SYMBOL-FUNCTION: the
+                             ;; compiled named-call path resolves through
+                             ;; CilAssembler, which bridges a bare name across
+                             ;; dotcl's own packages. SYMBOL-FUNCTION does not, so
+                             ;; (class-precedence-list c) — registered on a
+                             ;; DOTCL-MOP symbol — worked compiled and through
+                             ;; FUNCALL but not as a plain form under the
+                             ;; interpreter.
+                             ((symbolp op) (%coerce-to-function op))
                              ((and (consp op) (eq (car op) 'setf))
                               (fdefinition op))
                              (t (%mini-eval op env))))
                        (args (mapcar (lambda (a) (%mini-eval a env)) (cdr form))))
-                  (apply fn args))))))))
+                  (apply fn args))))))))))))
     (t form))
   (decf *%mini-eval-depth*)))
 
@@ -4658,24 +5241,12 @@
 (defun compile-symbol-macrolet (bindings body)
   "Compile (symbol-macrolet ((sym expansion)...) body...).
    Temporarily extends *symbol-macros* with new bindings."
-  ;; Validate: symbol-macro names must not be constants or special variables
-  (dolist (b bindings)
-    (let ((name (car b)))
-      (when (or (constantp name)
-                (global-special-p name))
-        (compile-expr `(error 'program-error))
-        (return-from compile-symbol-macrolet
-          (compile-expr `(error 'program-error))))))
-  ;; Check for (declare (special ...)) in body that conflicts with symbol-macro names
-  (let ((binding-names (mapcar #'car bindings)))
-    (dolist (form body)
-      (when (and (consp form) (eq (car form) 'declare))
-        (dolist (decl (cdr form))
-          (when (and (consp decl) (eq (car decl) 'special))
-            (dolist (sname (cdr decl))
-              (when (member sname binding-names)
-                (return-from compile-symbol-macrolet
-                  (compile-expr `(error 'program-error))))))))))
+  ;; Validate (constant / globally special name, or a body (declare (special n))
+  ;; naming one of them). The predicate is shared with the %MINI-EVAL case so the
+  ;; two evaluators cannot drift apart on what is a program error.
+  (when (symbol-macrolet-violation-p bindings body)
+    (return-from compile-symbol-macrolet
+      (compile-expr `(error 'program-error))))
   (let* ((*symbol-macros* (append (mapcar (lambda (b) (cons (car b) (cadr b)))
                                           bindings)
                                   *symbol-macros*))

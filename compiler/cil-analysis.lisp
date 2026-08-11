@@ -130,7 +130,7 @@
                          (do-list-safe (sub clause)
                            (push (cons sub (cons bnd mdepth)) worklist)))))
                     ;; Lambda.
-                    ((and (symbolp head) (eq head 'lambda))
+                    ((and (symbolp head) (eq head 'lambda) (listp (cadr e)))
                      (if *symbol-macros*
                          ;; Under an active symbol-macrolet, an enclosing binding
                          ;; (e.g. a lambda parameter) may shadow a symbol-macro of
@@ -182,7 +182,7 @@
                                      (or *ffv-assume-bound* (local-bound-p sym)))
                             (setf (gethash sym free-ht) sym)))))
                     ;; Let/Let* introduces bindings
-                    ((and (symbolp head) (member head '(let let*)))
+                    ((and (symbolp head) (member head '(let let*)) (listp (cadr e)))
                      (let* ((bindings (cadr e))
                             (lbody (cddr e))
                             (inner-bound (copy-list bnd))
@@ -377,7 +377,7 @@
                        (dolist (form sm-body)
                          (push (cons form (cons body-bnd mdepth)) worklist))))
                     ;; flet/labels: function definitions + body
-                    ((and (symbolp head) (member head '(flet labels)))
+                    ((and (symbolp head) (member head '(flet labels)) (listp (cadr e)))
                      (let* ((fn-defs (cadr e))
                             (lbody (cddr e))
                             (fn-names (loop for fd in fn-defs
@@ -697,14 +697,14 @@
                ;; mutation is a mutation and every reference is a capture
                ;; candidate. Compute both sets once (memoized) and merge, instead
                ;; of re-walking the body once per enclosing lambda.
-               ((and (symbolp head) (eq head 'lambda))
+               ((and (symbolp head) (eq head 'lambda) (listp (cadr e)))
                 (multiple-value-bind (mut ref) (%boundary-mut-ref e)
                   (dolist (n mut) (setf (gethash n mutated-ht) t))
                   (dolist (n ref)
                     (when (or (eq var-names :all)
                               (member n var-names :test #'string=))
                       (setf (gethash n captured-ht) t)))))
-               ((and (symbolp head) (member head '(let let*)))
+               ((and (symbolp head) (member head '(let let*)) (listp (cadr e)))
                 (let ((bindings (cadr e))
                       (lbody (cddr e))
                       (shadowed nil))
@@ -728,7 +728,7 @@
                   (dolist (b bindings)
                     (when (and (consp b) (cadr b))
                       (push (cons (cadr b) (cons in-lambda mdepth)) worklist)))))
-               ((and (symbolp head) (or (eq head 'flet) (eq head 'labels)))
+               ((and (symbolp head) (or (eq head 'flet) (eq head 'labels)) (listp (cadr e)))
                 (dolist (fdef (cadr e))
                   ;; Walk only the initializer forms of the lambda list (the
                   ;; default-value / supplied-p expressions of &optional/&key/&aux),
@@ -737,9 +737,14 @@
                   ;; (e.g. a required param named INST, which is a macro under
                   ;; SBCL's assembler), firing that macro's compile-time side
                   ;; effects. Param names are binding occurrences, not code.
-                  (dolist (p (cadr fdef))
-                    (when (and (consp p) (cadr p))
-                      (push (cons (cadr p) (cons t mdepth)) worklist)))
+                  ;; Walked with a CONSP loop, not DOLIST: the walker also visits
+                  ;; unevaluated subforms, so the lambda-list position is not
+                  ;; guaranteed to hold a proper list.
+                  (do ((pl (cadr fdef) (cdr pl)))
+                      ((not (consp pl)))
+                    (let ((p (car pl)))
+                      (when (and (consp p) (cadr p))
+                        (push (cons (cadr p) (cons t mdepth)) worklist))))
                   (dolist (form (cddr fdef))
                     (push (cons form (cons t mdepth)) worklist)))
                 (dolist (form (cddr e))

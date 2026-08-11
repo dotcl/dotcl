@@ -45,7 +45,7 @@
 ;; %FSCS-LATE does not exist when this unit is compiled, and the call runs (and
 ;; fails) before it is defined. If the failure were cached in the site's cell,
 ;; the later definition would never be seen.
-(deftest fscs-forward-reference
+(deftest-compiled-only fscs-forward-reference
   (progn
     (%fscs-compile-and-load
      '((in-package :cl-user)
@@ -59,7 +59,7 @@
 
 ;;; ---- redefinition is observed through a compiled call site ----
 
-(deftest fscs-redefinition
+(deftest-compiled-only fscs-redefinition
   (progn
     (%fscs-compile-and-load
      '((in-package :cl-user)
@@ -72,7 +72,7 @@
   (:v1 :v2))
 
 ;; fmakunbound goes back to undefined and a later definition is picked up again.
-(deftest fscs-fmakunbound-round-trip
+(deftest-compiled-only fscs-fmakunbound-round-trip
   (progn
     (%fscs-compile-and-load
      '((in-package :cl-user)
@@ -89,7 +89,7 @@
 
 ;;; ---- same name in two packages keeps its own resolution ----
 
-(deftest fscs-per-package
+(deftest-compiled-only fscs-per-package
   (progn
     (%fscs-compile-and-load
      '((defpackage :fscs-a (:use :cl) (:export #:who #:ask))
@@ -106,7 +106,7 @@
 
 ;;; ---- (setf name), closures and mutual recursion round-trip ----
 
-(deftest fscs-setf-and-closure
+(deftest-compiled-only fscs-setf-and-closure
   (progn
     (%fscs-compile-and-load
      '((in-package :cl-user)
@@ -121,7 +121,7 @@
           (funcall (intern "%FSCS-CLOSURE-SITE") 4)))
   (9 12))
 
-(deftest fscs-mutual-recursion
+(deftest-compiled-only fscs-mutual-recursion
   (progn
     (%fscs-compile-and-load
      '((in-package :cl-user)
@@ -134,7 +134,7 @@
 
 ;; Two fasls compiled separately: the callee lives in the first, the call site in
 ;; the second, so the site's cell has to resolve across compilation units.
-(deftest fscs-cross-unit
+(deftest-compiled-only fscs-cross-unit
   (progn
     (%fscs-compile-and-load
      '((in-package :cl-user)

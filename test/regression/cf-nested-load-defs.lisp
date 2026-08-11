@@ -6,7 +6,7 @@
 ;;; later fasl-load's require was a no-op and e.g. micros' backend was left
 ;;; calling an undefined make-lock.
 
-(deftest compile-file-keeps-nested-load-defs
+(deftest-compiled-only compile-file-keeps-nested-load-defs
   (let ((lib "cfk-lib-tmp.lisp")
         (src "cfk-src-tmp.lisp"))
     (unwind-protect

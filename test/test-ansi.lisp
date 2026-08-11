@@ -429,6 +429,25 @@
   "dotcl flushes FP underflow to 0.0 by default (SBCL/CCL/ECL behavior)." t)
 (in-package :cl-user)
 
+;;; LOOP.1.40-43 ask what an arithmetic loop's iteration variable holds once the
+;;; FINALLY clause runs. ansi-test expects the last in-body value (5 / 4 / 0 / 1);
+;;; dotcl returns the value after the final step (6 / 5 / -1 / 0). Measured, the
+;;; other implementations do the same thing:
+;;;
+;;;   (loop for x from 1 to 5 do (progn) finally (return x))
+;;;     dotcl 0.1.23  => 6      SBCL 2.6.6 => 6      ABCL 1.9.3 => 6
+;;;   from 1 below 5  => 5 / 5 / 5      from 10 downto 0 => -1 / -1 / -1
+;;;   from 10 above 0 => 0 / 0 / 0
+;;;
+;;; ansi-test tags all four :ansi-spec-problem itself — 6.1.2.1.1 leaves what the
+;;; variable holds in FINALLY unsettled. Disable the narrow note rather than
+;;; :ansi-spec-problem, which would also skip unrelated tests. Same reason as
+;;; above for registering it here: ansi-test/ is a fresh clone.
+(in-package :regression-test)
+(defnote :loop-iteration-values-in-finally
+  "Arithmetic LOOP leaves the stepped value visible in FINALLY (SBCL/ABCL behavior)." t)
+(in-package :cl-user)
+
 ;;; Run the tests — must be in CL-TEST package since tests use read-from-string
 ;;; and expect symbols to be interned in CL-TEST (where they were defined)
 (in-package :cl-test)

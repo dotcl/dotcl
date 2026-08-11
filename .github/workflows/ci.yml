@@ -70,6 +70,16 @@ jobs:
       - name: Regression tests
         run: make test-regression
 
+      # The same suite with EVAL routed through the emit-free tree-walk
+      # interpreter. That interpreter is the ONLY evaluator on the netstandard2.0
+      # build below, which CI merely COMPILES — so until this step it had never
+      # been executed here at all, and it was broken: interpreted DEFPACKAGE
+      # signalled "Undefined function: %MAKE-PACKAGE", multi-threaded EVAL
+      # deadlocked, and an unmatched THROW killed the process outright.
+      # Compile-time-diagnostic tests opt out via DEFTEST-COMPILED-ONLY.
+      - name: Regression tests (tree-walk interpreter)
+        run: make test-regression-interp
+
       # Cheap tripwire (~25s): compile the emit-free netstandard2.0 runtime that
       # AOT/WebGL link against. `make build` only builds the dev net10 runner, so
       # an ns2.0-only break (unguarded Reflection.Emit / broken DOTCL_NO_JSON)
