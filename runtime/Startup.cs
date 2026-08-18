@@ -5,27 +5,65 @@ namespace DotCL;
 
 public static class Startup
 {
+    // *macros* ends up in DOTCL-INTERNAL (via Startup.Sym during cross-compile)
+    private static readonly string[] _macroTablePackages = { "DOTCL-INTERNAL", "DOTCL.CIL-COMPILER" };
+
+    // The *MACROS* symbols themselves, once every package holding one exists.
+    // Symbol identity is stable, so only the lookup is cached; the table is read
+    // from Value on each call and a rebound *MACROS* is picked up as before.
+    private static Symbol[]? _macroTableSyms;
+
     /// <summary>Look up a macro expander in the compiler's *macros* hash table by symbol.
     /// Returns the LispFunction expander if found, null otherwise.</summary>
     internal static LispFunction? LookupCompilerMacro(Symbol sym)
     {
-        // *macros* ends up in DOTCL-INTERNAL (via Startup.Sym during cross-compile)
-        foreach (var pkgName in new[] { "DOTCL-INTERNAL", "DOTCL.CIL-COMPILER" })
+        var syms = _macroTableSyms;
+        if (syms != null)
         {
-            var pkg = Package.FindPackage(pkgName);
-            if (pkg != null)
+            bool sawTable = false;
+            foreach (var macrosSym in syms)
             {
-                var (macrosSym, status) = pkg.FindSymbol("*MACROS*");
-                if (macrosSym != null && status != SymbolStatus.None
-                    && macrosSym.Value is LispHashTable macrosTable)
+                // *macros* uses symbol keys (eq test) — look up directly by symbol identity
+                if (macrosSym.Value is LispHashTable macrosTable)
                 {
-                    // *macros* uses symbol keys (eq test) — look up directly by symbol identity
+                    sawTable = true;
                     if (macrosTable.TryGet(sym, out var expander) && expander is LispFunction fn)
                         return fn;
                 }
             }
+            // A cache built before any *MACROS* was bound could be missing the package
+            // the table later appears in. As long as no table is bound anywhere, keep
+            // resolving; once one is, the set of packages holding it no longer changes.
+            if (sawTable) return null;
+            _macroTableSyms = null;
         }
-        return null;
+        return LookupCompilerMacroResolving(sym);
+    }
+
+    /// <summary>LookupCompilerMacro's slow path: find the *MACROS* symbols by package
+    /// name, cache them once one of them actually holds a table, and answer from them.</summary>
+    private static LispFunction? LookupCompilerMacroResolving(Symbol sym)
+    {
+        List<Symbol>? found = null;
+        LispFunction? result = null;
+        bool sawTable = false;
+        foreach (var pkgName in _macroTablePackages)
+        {
+            var pkg = Package.FindPackage(pkgName);
+            if (pkg == null) continue;
+            var (macrosSym, status) = pkg.FindSymbol("*MACROS*");
+            if (macrosSym == null || status == SymbolStatus.None) continue;
+            (found ??= new List<Symbol>()).Add(macrosSym);
+            if (macrosSym.Value is LispHashTable macrosTable)
+            {
+                sawTable = true;
+                if (result == null && macrosTable.TryGet(sym, out var expander)
+                    && expander is LispFunction fn)
+                    result = fn;
+            }
+        }
+        if (sawTable && found != null) _macroTableSyms = found.ToArray();
+        return result;
     }
 
     /// <summary>Look up a macro expander by name string (convenience overload).
@@ -664,6 +702,27 @@ public static class Startup
         contribProviderSym.Function = (LispFunction)Emitter.CilAssembler.GetFunction("MODULE-PROVIDE-CONTRIB");
         mpfSym.Value = new Cons(contribProviderSym, Nil.Instance);
 
+        // Infinities and NaN, as named constants in DOTCL. The printer emits
+        // #.DOTCL:DOUBLE-FLOAT-POSITIVE-INFINITY for such a value, so the name has
+        // to exist and be readable from any package — printing a #. form naming a
+        // symbol nobody defined made every infinity unreadable. (SBCL has the same
+        // constants in SB-EXT.)
+        foreach (var (cname, cval) in new (string, LispObject)[]
+        {
+            ("SINGLE-FLOAT-POSITIVE-INFINITY", new SingleFloat(float.PositiveInfinity)),
+            ("SINGLE-FLOAT-NEGATIVE-INFINITY", new SingleFloat(float.NegativeInfinity)),
+            ("SINGLE-FLOAT-NAN", new SingleFloat(float.NaN)),
+            ("DOUBLE-FLOAT-POSITIVE-INFINITY", new DoubleFloat(double.PositiveInfinity)),
+            ("DOUBLE-FLOAT-NEGATIVE-INFINITY", new DoubleFloat(double.NegativeInfinity)),
+            ("DOUBLE-FLOAT-NAN", new DoubleFloat(double.NaN)),
+        })
+        {
+            var csym = SymInPkg(cname, "DOTCL");
+            DotclPkg.Export(csym);
+            csym.Value = cval;
+            csym.IsConstant = true;
+        }
+
         // CL constants
         var mpf = InternExport("MOST-POSITIVE-FIXNUM");
         mpf.Value = Fixnum.Make(long.MaxValue);
@@ -1003,9 +1062,11 @@ public static class Startup
         // Runtime.Core.cs: RegisterCoreBuiltins()
         // Runtime.Packages.cs: RegisterPackageBuiltins()
 
-        // INTERNAL-TIME-UNITS-PER-SECOND is a constant (matches TickCount64 = milliseconds)
+        // INTERNAL-TIME-UNITS-PER-SECOND is a constant. Microseconds: both
+        // GET-INTERNAL-REAL-TIME (high-resolution counter) and
+        // GET-INTERNAL-RUN-TIME (process CPU time) report in this unit.
         var ituSym = InternExport("INTERNAL-TIME-UNITS-PER-SECOND");
-        ituSym.Value = Fixnum.Make(1000);
+        ituSym.Value = Fixnum.Make(1000000);
         ituSym.IsConstant = true;
     }
 
@@ -1199,6 +1260,28 @@ public static class Startup
     {
         var cacheKey = packageName is null ? name : name + "\0" + packageName;
         if (_symFnCache.TryGetValue(cacheKey, out var cached)) return cached;
+        // The call site's own package decides first: FindSymbol there reproduces
+        // what the reader saw, including a SHADOWed name. A package that merely
+        // uses CL finds the inherited CL symbol here, so this is only a change of
+        // outcome when the caller's package really does own (or shadow) the name —
+        // and then the caller's symbol is the only correct answer. Checking CL
+        // ahead of this made every call in such a package hit the CL function
+        // instead (concrete-syntax-tree shadows FIRST/REST/NTH/CONSP/…, so
+        // (cst:nth 1 cst) called CL:NTH on a CST object and quietly returned NIL).
+        if (packageName is not null)
+        {
+            var homePkg = Package.FindPackage(packageName);
+            if (homePkg is not null)
+            {
+                var (homeSym, homeStatus) = homePkg.FindSymbol(name);
+                if (homeStatus != SymbolStatus.None
+                    && (homeSym.Function != null || homeSym.SetfFunction != null))
+                {
+                    _symFnCache[cacheKey] = homeSym;
+                    return homeSym;
+                }
+            }
+        }
         var (sym, status) = CL.FindSymbol(name);
         // A CL symbol wins only when it actually names something callable. The CL
         // package also holds non-standard implementation symbols (the backquote
@@ -1207,20 +1290,6 @@ public static class Startup
         // in the caller's package (ironclad's crypto::unquote).
         if (status != SymbolStatus.None && (sym.Function != null || sym.SetfFunction != null))
         { _symFnCache[cacheKey] = sym; return sym; }
-        // Check the home package first so unqualified calls resolve correctly.
-        if (packageName is not null)
-        {
-            var homePkg = Package.FindPackage(packageName);
-            if (homePkg is not null)
-            {
-                var (homeSym, homeStatus) = homePkg.FindSymbol(name);
-                if (homeStatus != SymbolStatus.None && homeSym.Function != null)
-                {
-                    _symFnCache[cacheKey] = homeSym;
-                    return homeSym;
-                }
-            }
-        }
         foreach (var pkg in Package.AllPackages)
         {
             if (!pkg.IsBridgeSource) continue;
@@ -1556,32 +1625,11 @@ public static class Startup
         funcallableStdClass.IsBuiltIn = false;
 
         // ===== Environment functions =====
-        Emitter.CilAssembler.RegisterFunction("LISP-IMPLEMENTATION-TYPE",
-            new LispFunction(Runtime.LispImplementationType, "LISP-IMPLEMENTATION-TYPE", 0));
-        Emitter.CilAssembler.RegisterFunction("LISP-IMPLEMENTATION-VERSION",
-            new LispFunction(Runtime.LispImplementationVersion, "LISP-IMPLEMENTATION-VERSION", 0));
-        Emitter.CilAssembler.RegisterFunction("SOFTWARE-TYPE",
-            new LispFunction(Runtime.SoftwareType, "SOFTWARE-TYPE", 0));
-        Emitter.CilAssembler.RegisterFunction("SOFTWARE-VERSION",
-            new LispFunction(Runtime.SoftwareVersion, "SOFTWARE-VERSION", 0));
-        Emitter.CilAssembler.RegisterFunction("MACHINE-TYPE",
-            new LispFunction(Runtime.MachineType, "MACHINE-TYPE", 0));
-        Emitter.CilAssembler.RegisterFunction("MACHINE-VERSION",
-            new LispFunction(Runtime.MachineVersion, "MACHINE-VERSION", 0));
-        Emitter.CilAssembler.RegisterFunction("MACHINE-INSTANCE",
-            new LispFunction(Runtime.MachineInstance, "MACHINE-INSTANCE", 0));
-        Emitter.CilAssembler.RegisterFunction("SHORT-SITE-NAME",
-            new LispFunction(Runtime.ShortSiteName, "SHORT-SITE-NAME", 0));
-        Emitter.CilAssembler.RegisterFunction("LONG-SITE-NAME",
-            new LispFunction(Runtime.LongSiteName, "LONG-SITE-NAME", 0));
-        Emitter.CilAssembler.RegisterFunction("APROPOS",
-            new LispFunction(Runtime.Apropos, "APROPOS", -1));
-        Emitter.CilAssembler.RegisterFunction("APROPOS-LIST",
-            new LispFunction(Runtime.AproposList, "APROPOS-LIST", -1));
-        Emitter.CilAssembler.RegisterFunction("DESCRIBE",
-            new LispFunction(Runtime.Describe, "DESCRIBE", -1));
-        Emitter.CilAssembler.RegisterFunction("ROOM",
-            new LispFunction(Runtime.Room, "ROOM", -1));
+        // LISP-IMPLEMENTATION-*, SOFTWARE-*, MACHINE-*, *-SITE-NAME, APROPOS,
+        // APROPOS-LIST, DESCRIBE and ROOM are registered by
+        // Runtime.RegisterMiscBuiltins, which runs later in this method and
+        // therefore owns them. They used to be registered here as well, where
+        // editing them had no effect.
         // DOTCL:GC — trigger .NET GC, then drain any finalizer thunks the
         // collection enqueued (on this normal thread, not the GC finalizer thread).
         {
@@ -1647,8 +1695,7 @@ public static class Startup
             Startup.Sym("RUN-WITH-TIMEOUT")!.Function = rwtFn;
             Emitter.CilAssembler.RegisterFunction("RUN-WITH-TIMEOUT", rwtFn);
         }
-        Emitter.CilAssembler.RegisterFunction("DISASSEMBLE",
-            new LispFunction(Runtime.Disassemble, "DISASSEMBLE", -1));
+        // DISASSEMBLE is registered by Runtime.RegisterMiscBuiltins (see above).
         {
             var jitDasmFn = new LispFunction(Runtime.JitDisassemble, "DOTCL:JIT-DISASSEMBLE", -1);
             RegisterDotcl("JIT-DISASSEMBLE", jitDasmFn);
@@ -1716,16 +1763,8 @@ public static class Startup
                 : throw new LispErrorException(new LispTypeError("WEAK-POINTER-VALUE: not a weak-pointer", a[0])));
             RegWp("WEAK-POINTER-P", a => Arg1(a, "WEAK-POINTER-P") is LispWeakPointer ? T.Instance : (LispObject)Nil.Instance);
         }
-        Emitter.CilAssembler.RegisterFunction("%TRACE",
-            new LispFunction(Runtime.Trace, "%TRACE", -1));
-        Emitter.CilAssembler.RegisterFunction("%UNTRACE",
-            new LispFunction(Runtime.Untrace, "%UNTRACE", -1));
-        Emitter.CilAssembler.RegisterFunction("ED",
-            new LispFunction(Runtime.Ed, "ED", -1));
-        Emitter.CilAssembler.RegisterFunction("DRIBBLE",
-            new LispFunction(Runtime.Dribble, "DRIBBLE", -1));
-        Emitter.CilAssembler.RegisterFunction("INSPECT",
-            new LispFunction(Runtime.Inspect, "INSPECT", -1));
+        // %TRACE, %UNTRACE, ED, DRIBBLE and INSPECT are registered by
+        // Runtime.RegisterMiscBuiltins (see above).
         // DOCUMENTATION and (SETF DOCUMENTATION) are defined as generic functions
         // in cil-stdlib.lisp. Don't register as plain functions here to avoid
         // defgeneric validation errors.
@@ -1913,8 +1952,12 @@ public static class Startup
         foreignCbPropagateSym.IsSpecial = true;
         foreignCbPropagateSym.Value = Nil.Instance;
 
-        // dotcl:%ctype-stats — return CType routing statistics (temporary diagnostic)
+        // dotcl:%ctype-stats — CType routing statistics. With an argument, turn
+        // collection on (non-NIL) or off, resetting the counters either way; with
+        // none, report. Collection is off by default so SUBTYPEP does not carry
+        // the counting cost in a shipped runtime.
         RegisterDotcl("%CTYPE-STATS", new LispFunction(args => {
+            if (args.Length > 0) Runtime.SetCTypeStats(args[0] is not Nil);
             return new LispString(Runtime.CTypeStats());
         }));
 
@@ -1926,6 +1969,19 @@ public static class Startup
                 Fixnum.Make(HandlerClusterStack.Depth),
                 Fixnum.Make(RestartClusterStack.Depth));
         }));
+
+        // dotcl:%throw-raw-clr-exception — throw a .NET exception that never went
+        // through SIGNAL, on purpose. The interpreter has to catch and convert
+        // those (a raw throw crossing an interpreted HANDLER-CASE), and the test
+        // for it needs a source that really is raw. Every such source in the
+        // runtime is a bug being fixed one by one, so a test written against one
+        // of them breaks — silently passing while testing nothing — the day that
+        // bug is fixed. This exists so the test can depend on something stable.
+        // Not exported: nothing outside the test suite should call it.
+        RegisterDotcl("%THROW-RAW-CLR-EXCEPTION", new LispFunction(args => {
+            throw new ArgumentException(args.Length > 0 && args[0] is LispString s
+                ? s.Value : "raw CLR exception from %throw-raw-clr-exception");
+        }, "DOTCL:%THROW-RAW-CLR-EXCEPTION", -1));
 
         // Package lock API. *PACKAGE-LOCKS-DISABLED*: when bound to T,
         // CheckPackageLock becomes a no-op (used by WITHOUT-PACKAGE-LOCKS).
@@ -2150,6 +2206,36 @@ public static class Startup
             w.Flush();
             return Nil.Instance;
         }, "ALLOC-REPORT", 0));
+
+        // dotcl:alloc-stacks — print the sampled allocation stacks collected for
+        // the type named by DOTCL_ALLOC_STACK, most frequent first. Optional
+        // argument limits how many stacks are printed (default 20).
+        RegisterDotcl("ALLOC-STACKS", new LispFunction(args => {
+            var w = Runtime.GetStandardOutputWriter();
+            if (!Diagnostics.AllocCounter.Enabled ||
+                Diagnostics.AllocCounter.StackType == null)
+            {
+                w.WriteLine(";; DOTCL_ALLOC_PROF=1 DOTCL_ALLOC_STACK=<type> not set at startup");
+                w.Flush();
+                return Nil.Instance;
+            }
+            var limit = args.Length > 0 && args[0] is Fixnum lim ? (int)lim.Value : 20;
+            var snap = Diagnostics.AllocCounter.StackSnapshot();
+            long total = 0;
+            foreach (var (_, c) in snap) total += c;
+            w.WriteLine($";; {Diagnostics.AllocCounter.StackType}: {total:N0} samples " +
+                        $"(1 per {Diagnostics.AllocCounter.StackEvery:N0} allocations), " +
+                        $"{snap.Count:N0} distinct stacks");
+            int shown = 0;
+            foreach (var (s, c) in snap)
+            {
+                if (shown++ >= limit) break;
+                var pct = total > 0 ? (c * 100.0 / total) : 0.0;
+                w.WriteLine($"{c,8:N0} {pct,5:F1}%  {s}");
+            }
+            w.Flush();
+            return Nil.Instance;
+        }, "ALLOC-STACKS", -1));
 
         // dotcl:alloc-reset — zero all per-type counters.
         RegisterDotcl("ALLOC-RESET", new LispFunction(args => {

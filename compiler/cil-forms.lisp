@@ -473,6 +473,16 @@
          (list :unary (cdr (assoc op '((zerop . "Runtime.IsTrueZerop")
                                        (minusp . "Runtime.IsTrueMinusp")
                                        (plusp . "Runtime.IsTruePlusp")))) args))
+        ;; (eq x 'sym) / (eql x 'sym) against a symbol literal → inline
+        ;; reference comparison instead of a call. CASE expands to a linear
+        ;; COND of these, so a dispatch pays one call per clause it walks past
+        ;; (measured ~25 ns each; %MINI-EVAL's 32-key dispatch pays ~0.77 us
+        ;; before it reaches the function-call default).
+        ((and (= nargs 2)
+              (member op '(eq eql))
+              (or (literal-symbol-operand (first args))
+                  (literal-symbol-operand (second args))))
+         (list :sym-eq nil args))
         ;; Binary equality: eq, eql, equal
         ((and (= nargs 2)
               (member op '(eq eql equal)))
@@ -528,6 +538,7 @@
                (:binary (compile-binary-call (third fused) (second fused)))
                (:unary (compile-unary-call (third fused) (second fused)))
                (:fixnum-cmp (compile-fixnum-cmp (third fused) (second fused)))
+               (:sym-eq (compile-sym-eq (third fused)))
                (:double-cmp (compile-double-cmp (third fused) (second fused)))))
          (,(if branch-on-true :brtrue :brfalse) ,label)))
       ;; (not x) / (null x): negate direction and recurse
@@ -582,6 +593,7 @@
                (:binary (compile-binary-call (third fused-method) (second fused-method)))
                (:unary (compile-unary-call (third fused-method) (second fused-method)))
                (:fixnum-cmp (compile-fixnum-cmp (third fused-method) (second fused-method)))
+               (:sym-eq (compile-sym-eq (third fused-method)))
                (:double-cmp (compile-double-cmp (third fused-method) (second fused-method)))))
          (:brfalse ,else-label)
          ,@(compile-expr (second args))
@@ -631,6 +643,7 @@
                      (:binary (compile-binary-call (third inner-fused) (second inner-fused)))
                      (:unary (compile-unary-call (third inner-fused) (second inner-fused)))
                      (:fixnum-cmp (compile-fixnum-cmp (third inner-fused) (second inner-fused)))
+                     (:sym-eq (compile-sym-eq (third inner-fused)))
                      (:double-cmp (compile-double-cmp (third inner-fused) (second inner-fused)))))
                (:brtrue ,else-label)  ;; Negate: branch to else when TRUE
                ,@(compile-expr (second args))
@@ -740,6 +753,48 @@
              (null (intersection
                     (nth-value 0 (find-mutated-and-captured-vars forms value-captured))
                     value-captured :test #'string=))))))
+
+;;; A LET body gets its chunking decision earlier than a bare progn does, and
+;;; that timing is the whole point. By the time COMPILE-PROGN runs on a LET body,
+;;; the LET has already decided which of its own variables are boxed — so a body
+;;; that assigns to one of them is stuck: the variable is a plain slot, a closure
+;;; would capture a stale copy, and %PROGN-CHUNK-SAFE-P correctly refuses. That
+;;; refusal is what left coalton's (let ((env ..)) (setf ..) x1575) as a single
+;;; 17 MB method.
+;;;
+;;; Rewriting the body into closure chunks BEFORE %COMPILE-LET runs its
+;;; capture/mutation scan removes the obstacle instead of overriding it: the scan
+;;; then sees the lambdas, finds the variable both captured and mutated, and
+;;; boxes it through the existing machinery. No new sharing rules — the chunks
+;;; get the same boxed cell any other closure would.
+;;;
+;;; The enclosing scope still has to pass %PROGN-CHUNK-SAFE-P: variables bound
+;;; further out already have their boxing fixed, so a chunk that mutates one of
+;;; those would still capture a stale copy. At this point CSTATE-LOCALS holds
+;;; exactly those outer variables — this LET's own are not registered yet — so
+;;; the existing predicate asks precisely the right question here.
+
+(defun %let-own-native-locals-p (body)
+  "T if BODY's declarations give this LET a raw native slot (Int64, native
+   float, decimal, numeric array). Those are invisible to CSTATE-LOCALS at
+   %COMPILE-LET time because the LET has not established them yet, and a closure
+   capturing a raw slot loads a value where an object is required (invalid IL)."
+  (or (extract-fixnum-locals body)
+      (extract-small-int-locals body)
+      (extract-double-float-locals body)
+      (extract-single-float-locals body)
+      (extract-decimal-locals body)
+      (extract-float-array-locals body)))
+
+(defun %maybe-chunk-let-body (real-body body)
+  "Rewrite an oversized LET body into leading closure chunks, ahead of the
+   capture/mutation analysis. REAL-BODY is BODY minus its declarations."
+  (if (and (not *at-toplevel*)
+           (%list-longer-than-p real-body *progn-chunk-threshold*)
+           (%progn-chunk-safe-p real-body)
+           (not (%let-own-native-locals-p body)))
+      (%chunk-progn-forms real-body)
+      real-body))
 
 (defun compile-progn (forms)
   (cond
@@ -1092,7 +1147,12 @@
    anything else (mangled-string fallback)."
   (if (symbolp name)
       (if (symbol-package name)
+          ;; compile-sym-lookup leaves the symbol widened to LispObject, and
+          ;; RegisterFunctionOnSymbol takes a Symbol: without the narrowing
+          ;; castclass the call is covariant, which the JIT tolerates but
+          ;; verifiable IL (and AOT codegens like IL2CPP) does not.
           `(,@(compile-sym-lookup name)
+            (:castclass "Symbol")
             ,@(compile-lambda params wrapped-body "" (mangle-name name))
             (:castclass "LispFunction")
             (:call "CilAssembler.RegisterFunctionOnSymbol")
@@ -2893,6 +2953,9 @@
   "Compile (let bindings body...) or (let* bindings body...)."
   (warn-unknown-declared-types body)
   (multiple-value-bind (declared-specials real-body) (extract-specials body)
+    ;; Before the capture/mutation scan below, so that a variable the chunks
+    ;; assign to is boxed like any other captured-and-mutated variable.
+    (setf real-body (%maybe-chunk-let-body real-body body))
     (let* ((all-specials (append declared-specials *specials*))
            ;; Parse bindings
            (parsed (mapcar (lambda (b)
@@ -4193,6 +4256,21 @@
         (t nil)))                       ; :rest / :aux consume no arguments
     (values nreq nopt restp keyp aok (nreverse kws) checkable)))
 
+(defvar *mini-shape-cache* (make-hash-table :test 'eq :weakness :key)
+  "PARAMS list -> #(nreq nopt restp keyp aok kws checkable).
+   A lambda list does not change, but describing it returns seven values, and
+   returning seven values conses a list — on every interpreted call. Keyed by
+   the params list itself, which an interpreted function holds for its lifetime;
+   weak so a lambda list built by EVAL and dropped does not pin the entry.")
+
+(defun %mini-shape (params)
+  "The cached shape vector for PARAMS (see *MINI-SHAPE-CACHE*)."
+  (or (gethash params *mini-shape-cache*)
+      (setf (gethash params *mini-shape-cache*)
+            (multiple-value-bind (nreq nopt restp keyp aok kws checkable)
+                (%mini-lambda-list-shape params)
+              (vector nreq nopt restp keyp aok kws checkable)))))
+
 (defun %mini-check-args (params args)
   "Signal PROGRAM-ERROR if ARGS does not match the lambda list PARAMS.
    Interpreted closures previously accepted any argument count, so a missing
@@ -4201,8 +4279,14 @@
    structure whose DEFSTRUCT was created through EVAL gets its accessors as
    interpreted closures, so (FOO-P) with no argument answered NIL instead of
    signalling (CLHS 3.5.1.2 / 3.5.1.4 / 3.5.1.6)."
-  (multiple-value-bind (nreq nopt restp keyp aok kws checkable)
-      (%mini-lambda-list-shape params)
+  (let* ((shape (%mini-shape params))
+         (nreq (svref shape 0))
+         (nopt (svref shape 1))
+         (restp (svref shape 2))
+         (keyp (svref shape 3))
+         (aok (svref shape 4))
+         (kws (svref shape 5))
+         (checkable (svref shape 6)))
     (when checkable
       (let ((n (length args)))
         (when (< n nreq)
@@ -4413,7 +4497,14 @@
           (when *symbol-macros*
             (let ((ht (make-hash-table :test #'equal)))
               (dolist (entry *symbol-macros* ht)
-                (setf (gethash (symbol-name (car entry)) ht) (cdr entry))))))))
+                ;; innermost first, exactly as above: *SYMBOL-MACROS* is pushed
+                ;; onto by SYMBOL-MACROLET, so an outer binding sits behind an
+                ;; inner one of the same name and must not overwrite it. Letting
+                ;; it win made the reified &ENVIRONMENT expand a shadowed name to
+                ;; the OUTERMOST expansion (CLHS 5.1.2.1 asks for the innermost).
+                (let ((key (symbol-name (car entry))))
+                  (unless (nth-value 1 (gethash key ht))
+                    (setf (gethash key ht) (cdr entry))))))))))
 
 (defun %mini-macro-fn (name env)
   "The lexical MACROLET binding of NAME in ENV, or NIL.
@@ -4455,7 +4546,56 @@
                 (return-from symbol-macrolet-violation-p t))))))))
   nil)
 
-(defun %mini-eval-progn (forms env &optional bound-vars)
+;;; Tail calls in the tree-walk evaluator.
+;;;
+;;; A call in tail position is not made; it is RETURNED, as
+;;; (marker fn . args), to the trampoline that %MINI-MAKE-CLOSURE wraps around
+;;; every interpreted function body. The trampoline runs the callee's body in its
+;;; own loop when the callee is itself interpreted, so an interpreted tail
+;;; recursion costs constant stack instead of one .NET frame per iteration —
+;;; without which a tail-recursive loop, the ordinary CL idiom, could not be
+;;; written at all on a build with no compiler (netstandard2.0 / WASM / AOT).
+;;;
+;;; The marker is a fresh cons held in a variable, so nothing a user program can
+;;; construct is EQ to it. Only positions that are genuinely tail pass TAILP on:
+;;; the last form of a body, both arms of IF, a BLOCK's body. A body running
+;;; inside PROGV (a special binding, including a special parameter), UNWIND-PROTECT
+;;; or a handler cluster is NOT tail — the binding has to outlive the call — and
+;;; those simply never pass the flag.
+(defvar *%mini-tail-marker* (list '%mini-tail-call))
+
+(defun %mini-tail-p (x)
+  (and (consp x) (eq (car x) *%mini-tail-marker*)))
+
+;; %MACROEXPAND-1-OR-SELF is a runtime builtin, but COMPILE-MACROLET runs
+;; %MINI-EVAL on the cross-compile host as well, where there is no such function.
+;; The host version is MACROEXPAND-1 with its second value folded into the
+;; identity of the result, which is exactly what the builtin returns.
+#-dotcl
+(defun %macroexpand-1-or-self (form &optional (env nil env-p))
+  (multiple-value-bind (exp expandedp)
+      (if env-p (macroexpand-1 form env) (macroexpand-1 form))
+    (if expandedp exp form)))
+
+(defun %mini-eval-args (forms env)
+  "Evaluate FORMS left to right in ENV and return the list of their values.
+   A loop, not (MAPCAR (LAMBDA (A) (%MINI-EVAL A ENV)) FORMS): that lambda
+   captures ENV, and creating a capturing closure costs a flat ~512 B whatever
+   it captures. Every interpreted function call evaluates its arguments here."
+  (let ((head nil) (tail nil))
+    (dolist (f forms head)
+      (let ((cell (cons (%mini-eval f env) nil)))
+        (if tail (setf (cdr tail) cell) (setq head cell))
+        (setq tail cell)))))
+
+(defvar *%mini-go-marker* (list '%mini-go)
+  "Head cons of the value (GO tag) returns instead of throwing, when the caller
+   asked for it. See %MINI-EVAL's GOP parameter.")
+
+(defun %mini-go-p (x)
+  (and (consp x) (eq (car x) *%mini-go-marker*)))
+
+(defun %mini-eval-progn (forms env &optional bound-vars tailp gop)
   ;; (declare (special V)) in a body makes references to V within that body
   ;; DYNAMIC (CLHS 3.3.4). Which binding that refers to depends on whether the
   ;; enclosing form bound V, so BOUND-VARS names what it just bound:
@@ -4491,13 +4631,26 @@
       (setq env (remove-if (lambda (e) (member (car e) shadow)) env)))
     ;; Evaluate all-but-last for effect; return the LAST form's values via a
     ;; tail %mini-eval so multiple values propagate (CL progn semantics).
-    (labels ((run (fs)
+    ;; ENV travels as an argument rather than being closed over. A local
+    ;; function that captures anything costs a flat ~512 B to create, paid on
+    ;; every entry here — and this runs for the body of every PROGN, LET,
+    ;; LAMBDA and DEFUN the interpreter evaluates. Taking it as a parameter
+    ;; leaves RUN capturing nothing, which allocates nothing.
+    ;; GOP is passed straight through to every form: this body's value goes to a
+    ;; caller that checks for the marker, and a non-last form's value is dropped
+    ;; here, so a GO in either position can travel as a return value. If a
+    ;; non-last form produces one, the rest of the body must not run.
+    (labels ((run (fs e tail g)
                (cond ((null fs) nil)
-                     ((null (cdr fs)) (%mini-eval (car fs) env))
-                     (t (%mini-eval (car fs) env) (run (cdr fs))))))
+                     ((null (cdr fs)) (%mini-eval (car fs) e tail g))
+                     (t (let ((v (%mini-eval (car fs) e nil g)))
+                          (if (and g (%mini-go-p v))
+                              v
+                              (run (cdr fs) e tail g)))))))
       (if dyn-vars
-          (progv dyn-vars dyn-vals (run forms))
-          (run forms)))))
+          ;; The PROGV must outlive the body, so its last form is not tail.
+          (progv dyn-vars dyn-vals (run forms env nil gop))
+          (run forms env tailp gop)))))
 
 (defun %mini-lambda-list-var-names (params)
   "The variable names PARAMS binds, ignoring lambda-list keywords, default forms
@@ -4522,8 +4675,16 @@
    EQL test can never match. Storing them in the variable alist therefore made
    every (setf f) local function invisible no matter how it was referenced, and
    made a VARIABLE whose value happened to be a function answer in operator
-   position: (let ((list #'car)) (list 1 2)) called CAR."
-  (cdr (assoc name (cdr (assoc '%mini-functions env)) :test #'equal)))
+   position: (let ((list #'car)) (list 1 2)) called CAR.
+
+   EQUAL is only needed for the (SETF F) names; a symbol name is settled by
+   ASSOC's default EQL, which never matches one of those conses. Taking that
+   branch keeps the keyword argument (and the args vector it allocates) out of
+   a lookup every interpreted compound form makes."
+  (let ((fns (cdr (assoc '%mini-functions env))))
+    (if (symbolp name)
+        (cdr (assoc name fns))
+        (cdr (assoc name fns :test #'equal)))))
 
 (defun %mini-fn-lambda (params bname body)
   "(LAMBDA PARAMS decls... (BLOCK BNAME body...)) for a named local function.
@@ -4555,11 +4716,124 @@
          (specials (intersection (%mini-body-special-decls body) names))
          ;; Built once per closure, not once per call: it depends only on the
          ;; lambda form, and this runs on every interpreted call.
-         (k (lambda (new-env) (%mini-eval-progn body new-env names)))
+         ;; A special parameter binds through PROGV around the body, which must
+         ;; outlive any call the body ends in — so such a body is not tail.
+         (body-tailp (null specials))
+         ;; Everything %MINI-BIND-PARAMS-CALL needs to run this body again, so the
+         ;; trampoline can re-enter it without calling the closure. Its identity
+         ;; also stands in for this closure's: it is a fresh list per closure, so
+         ;; EQ on it answers "is this callee me?" — which the closure cannot ask
+         ;; about itself, having no name inside its own LET* init form. The
+         ;; continuation is filled in below, once it exists.
+         (info (list params env specials nil))
+         ;; INFO under its own key in ENV is how a call in tail position tells
+         ;; "this is me again" from "this is some other function" — the same
+         ;; namespace trick %MINI-BLOCKS and %MINI-FUNCTIONS use.
+         (k (lambda (new-env)
+              (%mini-eval-progn body
+                                (if body-tailp
+                                    (cons (cons '%mini-self-info info) new-env)
+                                    new-env)
+                                names body-tailp)))
+         ;; MULTIPLE-VALUE-CALL, not (let ((r ...))): binding the body's result
+         ;; would truncate it to one value, and an interpreted function that ends
+         ;; in (values a b) must still return both. A tail request is always
+         ;; exactly one value, so only that shape is intercepted; everything else
+         ;; is passed straight back out, including no values at all.
+         ;; Built once per closure, like K. It closes over INFO, and a closure
+         ;; that captures anything costs a flat ~450 B to create — written inline
+         ;; as MULTIPLE-VALUE-CALL's function it was built again on every call,
+         ;; which was most of what entering an interpreted function allocated.
+         (tail-filter
+          (lambda (&optional (v1 nil v1p) &rest more)
+            (cond ((and v1p (null more) (%mini-tail-p v1)) (%mini-trampoline v1 info))
+                  (v1p (apply #'values v1 more))
+                  (t (values)))))
          (fn (lambda (&rest call-args)
-               (%mini-bind-params-call params call-args env specials k))))
+               (multiple-value-call tail-filter
+                 (%mini-bind-params-call params call-args env specials k)))))
+    (setf (fourth info) k)
     (when name (%set-function-name fn name))
+    ;; Every interpreted closure is variadic, so it would otherwise report zero
+    ;; required parameters whatever the user wrote. Anything that reads a
+    ;; function's arity then sees the evaluator's shape instead of the user's —
+    ;; selecting the .NET overload for a delegate parameter, for one, which is why
+    ;; a Lisp lambda handed to Enumerable.Select matched no overload at all.
+    ;; Compiled code records the same count when it emits the function.
+    ;; FBOUNDP because the cross-compiling host runs this while loading the
+    ;; compiler, and %SET-FUNCTION-ARITY is a dotcl runtime primitive.
+    (when (fboundp '%set-function-arity)
+      (%set-function-arity fn (%mini-required-param-count params)))
+    ;; What the trampoline needs to continue a tail call INTO this function
+    ;; without calling it: everything %MINI-BIND-PARAMS-CALL takes.
+    (when (fboundp '%set-fn-interp-info)
+      (%set-fn-interp-info fn info))
     fn))
+
+(defun %mini-call (fn args tailp env)
+  "Call FN on ARGS, or — for a tail call back into the function being interpreted
+   — hand it to that function's trampoline.
+
+   Only a SELF call is handed over, and the restriction is what makes the
+   handover safe as well as compiler-faithful. Returning the request unwinds
+   everything between here and the trampoline, including any BLOCK whose CATCH
+   the body established. For a self call that is right: re-entering the body
+   builds a fresh block, exactly as the compiler's self-TCO jump does. For a call
+   to some OTHER function it is not: a closure that function receives may
+   RETURN-FROM one of those blocks, which would then no longer exist —
+   (block lvl (let ((esc (lambda () (return-from lvl ...)))) (funcall esc)))
+   throws to a dead tag. It would also drop a frame DOTCL:BACKTRACE still lists
+   on the compiled path, which optimizes self calls only."
+  (if (and tailp
+           (fboundp '%fn-interp-info)
+           (let ((self (cdr (assoc '%mini-self-info env))))
+             (and self (eq (%fn-interp-info fn) self))))
+      (list* *%mini-tail-marker* fn args)
+      (apply fn args)))
+
+(defun %mini-trampoline (r self-info)
+  "Run out the tail calls R stands for, re-entering the body in THIS frame so a
+   self-recursive tail loop costs constant stack instead of a .NET frame per
+   iteration.
+
+   Only a tail call back into the SAME function is looped. That is deliberate:
+   it is exactly what the compiler optimizes (self-TCO), so the two evaluators
+   keep agreeing — including on what DOTCL:BACKTRACE shows, since eliding a call
+   to a DIFFERENT function would drop a frame the compiled path still lists.
+   Every other tail call is an ordinary call made here, in tail position of this
+   loop, so its values reach the caller intact."
+  (loop
+    (let* ((fn (cadr r))
+           (args (cddr r))
+           (info (and (fboundp '%fn-interp-info) (%fn-interp-info fn))))
+      (unless (eq info self-info)
+        ;; End of the chain: an ordinary call, in tail position of this loop so
+        ;; its values reach the caller intact.
+        (return (apply fn args)))
+      (let ((next (multiple-value-call
+                   (lambda (&optional (v1 nil v1p) &rest more)
+                     (if (and v1p (null more) (%mini-tail-p v1))
+                         v1
+                         (list* *%mini-tail-values* (if v1p (cons v1 more) '()))))
+                   (%mini-bind-params-call (first info) args (second info)
+                                           (third info) (fourth info)))))
+        (if (%mini-tail-p next)
+            (setq r next)
+            (return (values-list (cdr next))))))))
+
+;;; Marks "the chain ended with these values" inside the trampoline. Distinct
+;;; from the tail marker so the loop can tell a further tail call from a result
+;;; that merely happens to be a list.
+(defvar *%mini-tail-values* (list '%mini-tail-values))
+
+(defun %mini-required-param-count (params)
+  "Number of parameters before the first lambda-list keyword — what a compiled
+   function records as its arity."
+  (let ((n 0))
+    (dolist (p params n)
+      (if (and (symbolp p) p (char= (char (symbol-name p) 0) #\&))
+          (return n)
+          (incf n)))))
 
 (defun %mini-expand-handler-case (form)
   "Rewrite (handler-case body (type (var) h...) ... [(:no-error ll forms...)])
@@ -4602,12 +4876,27 @@
            (cadr form))
    (%mini-make-closure (list* 'lambda '() (cddr form)) env)))
 
-(defvar *%mini-eval-depth* 0)
+(defun %mini-eval (form env &optional tailp gop)
+  "Interpret FORM in ENV (alist of (sym . val)). No Reflection.Emit needed.
 
-(defun %mini-eval (form env)
-  "Interpret FORM in ENV (alist of (sym . val)). No Reflection.Emit needed."
-  (incf *%mini-eval-depth*)
-  (unwind-protect
+   TAILP says FORM's value is returned straight to the enclosing function body,
+   so a call it ends in may be handed to the trampoline instead of made here
+   (see *%MINI-TAIL-MARKER*). Callers that do anything with the value — bind it,
+   test it, unwind past it — leave it NIL, which is the default.
+
+   GOP says the caller inspects this form's value for a GO marker and will act
+   on it, so a (GO tag) reached from here may return one instead of throwing.
+   THROW out of the interpreter is expensive far beyond the throw itself: the
+   .NET unwind walks every interpreter frame between the GO and its TAGBODY, and
+   the interpreter stacks a dozen frames per level of Lisp nesting. The same
+   throw costs about 1.0 us from compiled code and 4.8 us from here, which made
+   one GO 3.1 us — 45% of an interpreted DOTIMES iteration.
+
+   Only positions whose caller actually checks pass GOP on: the forms of a
+   TAGBODY body, the forms of a PROGN/LET/LAMBDA body under one, and the arms of
+   an IF. Everywhere else it stays NIL and GO throws exactly as before, so a GO
+   from a place the marker could not travel through — an argument, an init form,
+   a test — is unaffected."
   (cond
     ;; Self-evaluating
     ((null form) nil)
@@ -4636,9 +4925,11 @@
      ;; A lexical FLET/LABELS binding shadows a GLOBAL MACRO of the same name
      ;; (CLHS 3.1.2.1.2.4). MACROEXPAND-1 cannot see ENV, so expanding first
      ;; turned (flet ((f () :good)) (f)) into the global macro's expansion.
-     (if (%mini-fdefn (car form) env)
-         (apply (%mini-fdefn (car form) env)
-                (mapcar (lambda (a) (%mini-eval a env)) (cdr form)))
+     (let ((lex-fn (%mini-fdefn (car form) env)))
+     (if lex-fn
+         (%mini-call lex-fn
+                     (%mini-eval-args (cdr form) env)
+                     tailp env)
      ;; A MACROLET binding shadows a global macro for the same reason, and needs
      ;; its own lookup for the same reason: MACROEXPAND-1 consults the runtime
      ;; macro table before it ever reaches the *MACROS* entry the MACROLET case
@@ -4658,7 +4949,7 @@
          ;; so an &ENVIRONMENT parameter can expand the MACROLET bindings in scope
          ;; (they are lexical here, so an environment built from the globals would
          ;; not show them).
-         (%mini-eval (funcall lex-macro form (%mini-macroexpand-env lex-macros)) env)
+         (%mini-eval (funcall lex-macro form (%mini-macroexpand-env lex-macros)) env tailp gop)
      (if (eq (car form) 'handler-bind)
          ;; HANDLER-BIND is implemented here rather than through its macro, the
          ;; way COMPILE-FORM consults its handler table before macroexpanding.
@@ -4677,20 +4968,26 @@
      ;; test is inline rather than inside %MINI-MACROEXPAND-ENV: this runs for every
      ;; interpreted compound form, and the overwhelmingly common case is "no symbol
      ;; macros in scope", which must not cost a call.
-     (multiple-value-bind (expanded expandedp)
-         (if (or *symbol-macros* lex-macros)
-             (macroexpand-1 form (%mini-macroexpand-env lex-macros))
-             (macroexpand-1 form))
-       (if expandedp
-           (%mini-eval expanded env)
+     ;; %MACROEXPAND-1-OR-SELF, not MACROEXPAND-1: the two-value version decides
+     ;; "expanded" by comparing the result against the input anyway, so the same
+     ;; test here loses nothing — and returning two values allocates ~96 B on
+     ;; every compound form the evaluator looks at, expanding or not.
+     (let ((expanded
+            (if (or *symbol-macros* lex-macros)
+                (%macroexpand-1-or-self form (%mini-macroexpand-env lex-macros))
+                (%macroexpand-1-or-self form))))
+       (if (not (eq expanded form))
+           (%mini-eval expanded env tailp gop)
            ;; Dispatch on special form operators
            (let ((op (car form)))
              (case op
                (quote   (cadr form))
+               ;; The test's value is used here, so it never carries a marker;
+               ;; the arms' values are this form's value, so they can.
                (if      (if (%mini-eval (cadr form) env)
-                            (%mini-eval (caddr form) env)
-                            (when (cdddr form) (%mini-eval (cadddr form) env))))
-               (progn   (%mini-eval-progn (cdr form) env))
+                            (%mini-eval (caddr form) env tailp gop)
+                            (when (cdddr form) (%mini-eval (cadddr form) env tailp gop))))
+               (progn   (%mini-eval-progn (cdr form) env nil tailp gop))
                (let
                 ;; Special (dynamic) vars bind via progv; lexical vars via alist.
                 ;; All init forms are evaluated in the outer env (parallel).
@@ -4705,9 +5002,12 @@
                         (bound (mapcar (lambda (b) (if (consp b) (car b) b))
                                        (cadr form))))
                     (if spec-vars
+                        ;; PROGV must outlive the body: not a tail position.
+                        ;; A GO marker still travels — returning it unwinds the
+                        ;; PROGV, which is what leaving the LET has to do.
                         (progv (nreverse spec-vars) (nreverse spec-vals)
-                          (%mini-eval-progn (cddr form) new-env bound))
-                        (%mini-eval-progn (cddr form) new-env bound)))))
+                          (%mini-eval-progn (cddr form) new-env bound nil gop))
+                        (%mini-eval-progn (cddr form) new-env bound tailp gop)))))
                (let*
                 ;; Sequential (CLHS 3.1.2.1.1.2): each binding is in effect while
                 ;; the REMAINING init forms are evaluated. Collecting the specials
@@ -4723,22 +5023,25 @@
                 ;; Bind one at a time instead, so each PROGV is established before
                 ;; the next init form is evaluated and the body runs inside all of
                 ;; them. Lexicals keep accumulating in ENV as before.
-                (labels ((bind-seq (bindings benv)
+                (labels ((bind-seq (bindings benv tail)
                            (if (null bindings)
                                (%mini-eval-progn
                                 (cddr form) benv
                                 (mapcar (lambda (b) (if (consp b) (car b) b))
-                                        (cadr form)))
+                                        (cadr form))
+                                tail gop)
                                (let* ((b (car bindings))
                                       (var (if (consp b) (car b) b))
                                       (val (when (consp b)
                                              (%mini-eval (cadr b) benv))))
                                  (if (%runtime-special-p var)
+                                     ;; PROGV must outlive the body: from here in,
+                                     ;; nothing under it is a tail position.
                                      (progv (list var) (list val)
-                                       (bind-seq (cdr bindings) benv))
+                                       (bind-seq (cdr bindings) benv nil))
                                      (bind-seq (cdr bindings)
-                                               (cons (cons var val) benv)))))))
-                  (bind-seq (cadr form) env)))
+                                               (cons (cons var val) benv) tail))))))
+                  (bind-seq (cadr form) env tailp)))
                (setq
                 ;; CLHS 5.1.2.4 / setq: assigning a name that is a symbol macro
                 ;; is SETF of its expansion, not a variable assignment. The env
@@ -4836,7 +5139,7 @@
                                             (cons (cons name tag)
                                                   (cdr (assoc '%mini-blocks env))))
                                       env)))
-                  (catch tag (%mini-eval-progn (cddr form) new-env))))
+                  (catch tag (%mini-eval-progn (cddr form) new-env nil tailp))))
                (return-from
                 ;; No lexically visible block of that name: fall back to throwing on
                 ;; the name, which is what every established block used as its tag
@@ -4846,7 +5149,7 @@
                   (throw (if b (cdr b) (cadr form))
                          (when (cddr form) (%mini-eval (caddr form) env)))))
                (the    (%mini-eval (caddr form) env))
-               (locally (%mini-eval-progn (cdr form) env))
+               (locally (%mini-eval-progn (cdr form) env nil tailp))
                (eval-when
                 ;; In an evaluator (not compile-file), eval the body iff :execute
                 ;; is among the situations (CLHS 3.2.3.1).
@@ -4950,15 +5253,31 @@
                                 env)))
                        (done-marker (list 'done))
                        (start-idx 0))
+                  ;; Body forms are evaluated with GOP on, so a GO that can reach
+                  ;; here as a return value does that instead of throwing. The
+                  ;; CATCH stays for the ones that cannot — a GO inside an
+                  ;; argument, an init form, a handler, an interpreted function
+                  ;; called from here — which still throw.
                   (loop
-                    (let ((result (catch tb-id
-                                    (let ((idx 0))
-                                      (dolist (seg segs)
-                                        (when (>= idx start-idx)
-                                          (dolist (f (cdr seg))
-                                            (%mini-eval f tagged-env)))
-                                        (incf idx)))
-                                    done-marker)))
+                    (let ((result
+                           (catch tb-id
+                             (let ((idx 0) (jump nil))
+                               (dolist (seg segs)
+                                 (when (and (null jump) (>= idx start-idx))
+                                   (dolist (f (cdr seg))
+                                     (let ((v (%mini-eval f tagged-env nil t)))
+                                       (when (%mini-go-p v)
+                                         (setq jump v)
+                                         (return)))))
+                                 (incf idx))
+                               (cond ((null jump) done-marker)
+                                     ;; Ours: loop again from the tag's segment.
+                                     ((eq (cadr jump) tb-id) (cddr jump))
+                                     ;; An enclosing TAGBODY's tag. Pass it on as
+                                     ;; a marker if our own caller checks, else
+                                     ;; put it back on the throw path.
+                                     (gop (return-from %mini-eval jump))
+                                     (t (throw (cadr jump) (cddr jump))))))))
                       (if (eq result done-marker)
                           (return nil)
                           (setq start-idx result))))))
@@ -4968,9 +5287,11 @@
                 ;; by one. Entry is (tag tb-id . index).
                 (let* ((tag (cadr form))
                        (b (assoc tag (cdr (assoc '%mini-go-tags env)))))
-                  (if b
-                      (throw (cadr b) (cddr b))
-                      (error "%mini-eval: go tag ~S not found" tag))))
+                  (cond ((null b) (error "%mini-eval: go tag ~S not found" tag))
+                        ;; (cdr b) is (tb-id . index), which is what the marker
+                        ;; carries and what the CATCH would have thrown.
+                        (gop (cons *%mini-go-marker* (cdr b)))
+                        (t (throw (cadr b) (cddr b))))))
                (declare nil)
                (catch
                 (catch (%mini-eval (cadr form) env)
@@ -5130,7 +5451,7 @@
                (%make-instance-with-initargs
                 ;; Compiler intrinsic for (make-instance 'class ...): delegate to GF.
                 (apply (symbol-function 'make-instance)
-                       (mapcar (lambda (a) (%mini-eval a env)) (cdr form))))
+                       (%mini-eval-args (cdr form) env)))
                (t
                 ;; %DOTIMES-1+ is a compiler intrinsic emitted by dotcl's DOTIMES
                 ;; for a fixnum counter (an increment asserted to fit int64).
@@ -5160,17 +5481,19 @@
                       (apply (symbol-function (find-symbol "INVOKE" "DOTNET"))
                              (%mini-eval (nth 4 form) env)
                              (caddr form)
-                             (mapcar (lambda (a) (%mini-eval a env)) (nthcdr 5 form))))
+                             (%mini-eval-args (nthcdr 5 form) env)))
                     nil)
                 ;; Function call: a local binding, a symbol's function, a
                 ;; (setf name) function designator in operator position (e.g.
                 ;; the ((setf foo) v place) form setf expands to), or a
                 ;; ((lambda ...) ...) / computed-function operator.
                 (let* ((fn (cond
-                             ;; Function namespace first: a lexical FLET/LABELS
-                             ;; binding shadows the global function AND a global
-                             ;; macro of the same name (CLHS 3.1.2.1.2.4).
-                             ((%mini-fdefn op env))
+                             ;; A lexical FLET/LABELS binding of OP was already
+                             ;; taken at the top of this branch (LEX-FN), where it
+                             ;; has to be looked up before macroexpansion to shadow
+                             ;; a global macro of the same name (CLHS 3.1.2.1.2.4).
+                             ;; Reaching here means there is none.
+                             ;;
                              ;; %COERCE-TO-FUNCTION, not SYMBOL-FUNCTION: the
                              ;; compiled named-call path resolves through
                              ;; CilAssembler, which bridges a bare name across
@@ -5183,10 +5506,9 @@
                              ((and (consp op) (eq (car op) 'setf))
                               (fdefinition op))
                              (t (%mini-eval op env))))
-                       (args (mapcar (lambda (a) (%mini-eval a env)) (cdr form))))
-                  (apply fn args))))))))))))
-    (t form))
-  (decf *%mini-eval-depth*)))
+                       (args (%mini-eval-args (cdr form) env)))
+                  (%mini-call fn args tailp env)))))))))))))
+    (t form)))
 
 (defun compile-macrolet (macro-defs body)
   "Compile (macrolet ((name (params) body...) ...) body...).
@@ -5231,7 +5553,12 @@
           ;; splicing macro) between this shadowing scope and an outer scope is
           ;; cached separately per scope. MACRO-DEFS is the source
           ;; cons the analysis walk pushes too, keeping the two passes in sync.
-          (let ((*macroexpand-scope* (cons macro-defs *macroexpand-scope*)))
+          ;; *macrolet-shadowed* carries the same names to COMPILE-FORM's
+          ;; dispatcher, which would otherwise reach the built-in handler for a
+          ;; name like WHEN before ever looking for this binding.
+          (let ((*macroexpand-scope* (cons macro-defs *macroexpand-scope*))
+                (*macrolet-shadowed* (append (mapcar #'car macro-defs)
+                                             *macrolet-shadowed*)))
             (compile-progn real-body))
         (dolist (entry saved)
           (if (cdr entry)
@@ -5707,7 +6034,6 @@
          (tag-var-sym (intern (block-tag-var-name name) :dotcl.cil-compiler))
          (result-key (gen-local "BRES"))
          (end-label (gen-label "BEND"))
-         (match-label (gen-label "BMATCH"))
          (ex-key (gen-local "BEX"))
          (needs-catch (list nil))
          ;; Entry format: (tag-key result-key end-label local-result-key local-end-label needs-catch)
@@ -5729,14 +6055,17 @@
           ,@body-instrs
           (:stloc ,result-key)
           (:leave ,end-label)
-          (:begin-catch-block "BlockReturnException")
+          ;; Filter: exception on the stack, answer 1 (mine) / 0 (keep unwinding).
+          ;; A catch that rethrew what it did not own left a live handler funclet at
+          ;; every block a non-local return crossed, so crossing N of them cost N
+          ;; stacked dispatches (see compile-catch).
+          (:begin-filter-block)
+          (:ldloc ,tag-key)
+          (:call "ControlFlowFilters.BlockTagMatches")
+          (:begin-filter-handler)
+          (:castclass "BlockReturnException")
           (:declare-local ,ex-key "BlockReturnException")
           (:stloc ,ex-key)
-          (:ldloc ,ex-key) (:callvirt "BlockReturnException.get_Tag")
-          (:ldloc ,tag-key)
-          (:beq ,match-label)
-          (:rethrow)
-          (:label ,match-label)
           (:ldloc ,ex-key) (:callvirt "BlockReturnException.get_Value")
           (:stloc ,result-key)
           (:leave ,end-label)
@@ -5789,13 +6118,21 @@
 
 (defun compile-catch (tag-expr body)
   "Compile (catch tag body...).
-   Uses try/catch/finally for CatchThrowException with EQ tag matching.
+   Uses try/filter/finally for CatchThrowException with EQ tag matching.
    Pushes tag to CatchTagStack so (throw ...) inside (eval ...) can propagate
-   correctly to an outer (catch ...) even across the eval boundary."
+   correctly to an outer (catch ...) even across the eval boundary.
+
+   The tag test is a CIL exception FILTER, not a catch that rethrows what it does
+   not own. A rethrow restarts dispatch from inside the handler funclet, and that
+   funclet stays live for the rest of the throw's journey, so N nested catches
+   cost N stacked dispatches' worth of stack. The tree-walk evaluator wraps every
+   interpreted call in a BLOCK, which is one CATCH per call, so a THROW out of
+   deep interpreted recursion needed stack proportional to the depth it crossed
+   and blew the .NET stack fatally. A filter answers \"not mine\" without touching
+   the frame."
   (let ((tag-key (gen-local "CTAG"))
         (result-key (gen-local "CRES"))
         (end-label (gen-label "CEND"))
-        (match-label (gen-label "CMATCH"))
         (ex-key (gen-local "CEX")))
     `((:declare-local ,tag-key "LispObject")
       ,@(compile-expr tag-expr)
@@ -5809,15 +6146,14 @@
       ,@(let ((*in-tail-position* nil) (*in-mv-context* t)) (compile-progn body))
       (:stloc ,result-key)
       (:leave ,end-label)
-      (:begin-catch-block "CatchThrowException")
+      ;; Filter: exception on the stack, answer 1 (mine) / 0 (keep unwinding).
+      (:begin-filter-block)
+      (:ldloc ,tag-key)
+      (:call "ControlFlowFilters.CatchTagMatches")
+      (:begin-filter-handler)
+      (:castclass "CatchThrowException")
       (:declare-local ,ex-key "CatchThrowException")
       (:stloc ,ex-key)
-      ;; Check tag identity (EQ)
-      (:ldloc ,ex-key) (:callvirt "CatchThrowException.get_Tag")
-      (:ldloc ,tag-key)
-      (:beq ,match-label)
-      (:rethrow)
-      (:label ,match-label)
       (:ldloc ,ex-key) (:callvirt "CatchThrowException.get_Value")
       (:stloc ,result-key)
       (:leave ,end-label)
@@ -5893,7 +6229,6 @@
          (end-label (gen-label "TBEND"))
          (loop-label (gen-label "TBLOOP"))
          (leave-label (gen-label "TBLEAVE"))
-         (match-label (gen-label "TBMATCH"))
          (ex-key (gen-local "TBEX"))
          ;; Build tag→index map (tags start from index 0)
          (tag-counter 0)
@@ -5971,14 +6306,17 @@
           (:label ,leave-label)
           (:ldc-i4 1) (:stloc ,done-key)
           (:leave ,loop-label)
-          (:begin-catch-block "GoException")
+          ;; Filter: exception on the stack, answer 1 (mine) / 0 (keep unwinding).
+          ;; A catch that rethrew another tagbody's GO left a live handler funclet at
+          ;; every level it crossed: a GO out of 20000 nested tagbodies took 4.1s and
+          ;; 50000 killed the process (see compile-catch).
+          (:begin-filter-block)
+          (:ldloc ,tb-id-key)
+          (:call "ControlFlowFilters.GoTagbodyMatches")
+          (:begin-filter-handler)
+          (:castclass "GoException")
           (:declare-local ,ex-key "GoException")
           (:stloc ,ex-key)
-          (:ldloc ,ex-key) (:callvirt "GoException.get_TagbodyId")
-          (:ldloc ,tb-id-key)
-          (:beq ,match-label)
-          (:rethrow)
-          (:label ,match-label)
           (:ldloc ,ex-key) (:callvirt "GoException.get_TargetLabel")
           (:stloc ,index-key)
           (:leave ,loop-label)
@@ -6106,11 +6444,9 @@
          (inner-end-label (gen-label "HCINNEREND"))
          (hc-tag-key (gen-local "HCTAG"))
          (cond-key (gen-local "HCCOND"))
-         (hcex-key (gen-local "HCINVEX"))
-         (ex-key (gen-local "HCEX"))
-         (dotnet-ex-key (gen-local "HCDOTNETEX"))
+         (exobj-key (gen-local "HCEXOBJ"))
+         (specs-key (gen-local "HCSPECS"))
          (ci-key (gen-local "HCCIKEY"))
-         (nomatch-hcex-label (gen-label "HCNOMATCHHCEX"))
          ;; Parse clauses: each is (type-name var handler-body)
          (parsed (mapcar (lambda (clause)
                            (let* ((type-spec (car clause))
@@ -6125,22 +6461,32 @@
          ;; Generate unified clause body labels (shared across all catch dispatches)
          (clause-labels (loop for i from 0 below n
                               collect (gen-label (format nil "HCCLAUSE~d" i))))
-         ;; Skip labels for ceq+brfalse dispatch (must stay WITHIN each catch block)
+         ;; Skip labels for the ceq+brfalse dispatch, which must stay WITHIN the
+         ;; filter's handler block (a brfalse cannot leave a funclet).
          (ci-skip-labels (loop for i from 0 below n
-                               collect (gen-label (format nil "HCCISKIP~d" i))))
-         (le-skip-labels (loop for i from 0 below n
-                               collect (gen-label (format nil "HCLESKIP~d" i))))
-         (dn-skip-labels (loop for i from 0 below n
-                               collect (gen-label (format nil "HCDNSKIP~d" i))))
-         (dn-rethrow-label (gen-label "HCDNRETHROW")))
+                               collect (gen-label (format nil "HCCISKIP~d" i)))))
     `(;; Create unique tag for this handler-case instance
       (:declare-local ,hc-tag-key "Object")
       (:newobj "Object") (:stloc ,hc-tag-key)
       ;; Shared condition local (set before dispatching to clause body)
       (:declare-local ,cond-key "LispObject")
       ,@(emit-nil) (:stloc ,cond-key)
-      ;; clauseIndex local for HandlerCaseInvocationException dispatch
+      ;; Matched clause index, written by the filter and read by its handler.
       (:declare-local ,ci-key "Int32")
+      ;; The in-flight exception, kept by the filter for the handler.
+      (:declare-local ,exobj-key "Object")
+      ;; Clause type specifiers in clause order, for the filter's type match. Built
+      ;; once here rather than re-emitted per handler: they are literals, and the
+      ;; filter must stay a straight predicate.
+      (:declare-local ,specs-key "LispObject[]")
+      (:ldc-i4 ,n)
+      (:newarr "LispObject")
+      ,@(loop for (type-spec var handler-body) in parsed
+              for i from 0
+              append `((:dup) (:ldc-i4 ,i)
+                       ,@(%handler-type-spec-load type-spec)
+                       (:stelem-ref)))
+      (:stloc ,specs-key)
       ;; Build HandlerBinding[] for our handler-case cluster
       (:ldc-i4 ,n)
       (:newarr "HandlerBinding")
@@ -6180,70 +6526,37 @@
           (compile-expr body-form))
       (:stloc ,result-key)
       (:leave ,inner-end-label)
-      ;; Catch 1: HandlerCaseInvocationException (main path via HandlerClusterStack.Signal)
-      ;; NOTE: brfalse/brtrue inside a catch block can only branch WITHIN the catch block.
-      ;; Use 'leave' to exit the catch block to labels after the try-catch.
-      (:begin-catch-block "HandlerCaseInvocationException")
-      (:declare-local ,hcex-key "HandlerCaseInvocationException")
-      (:stloc ,hcex-key)
-      ;; Check tag — brfalse to nomatch-hcex-label (within this catch block)
-      (:ldloc ,hcex-key) (:callvirt "HandlerCaseInvocationException.get_Tag")
-      (:ldloc ,hc-tag-key) (:ceq)
-      (:brfalse ,nomatch-hcex-label) ;; within catch
-      ;; Tag matches: extract condition and dispatch by clauseIndex
-      (:ldloc ,hcex-key) (:callvirt "HandlerCaseInvocationException.get_Condition")
-      (:stloc ,cond-key)
-      (:ldloc ,hcex-key) (:callvirt "HandlerCaseInvocationException.get_ClauseIndex")
+      ;; One filter for every exception shape this handler-case can take: its own
+      ;; HandlerCaseInvocationException (the main path, thrown by the handler
+      ;; function HandlerClusterStack.Signal calls), a LispErrorException whose
+      ;; condition matches a clause type, and a raw .NET exception wrapped into a
+      ;; condition that does. The filter answers "which clause" (or -1) without
+      ;; entering the frame, so a signal that crosses N nested handler-cases costs
+      ;; one dispatch instead of N stacked ones. Catching everything and rethrowing
+      ;; what did not match — the shape this replaces — left a live handler funclet
+      ;; at every level, and deep recursion with a handler-case per level died as an
+      ;; uncatchable .NET StackOverflowException.
+      (:begin-filter-block)
+      (:dup) (:stloc ,exobj-key)
+      (:ldloc ,hc-tag-key)
+      (:ldloc ,specs-key)
+      (:call "ControlFlowFilters.HandlerCaseClause")
       (:stloc ,ci-key)
-      ;; For each clause: check ci == i, if so leave to clause body (after try-catch)
+      (:ldloc ,ci-key) (:ldc-i4 -1) (:cgt)
+      (:begin-filter-handler)
+      (:pop)
+      ;; The clause variable binds the condition the filter matched on.
+      (:ldloc ,exobj-key)
+      (:call "ControlFlowFilters.HandlerCaseCondition")
+      (:stloc ,cond-key)
       ,@(loop for label in clause-labels
               for ci-skip in ci-skip-labels
               for i from 0
-              append `((:ldloc ,ci-key) (:ldc-i4 ,i) (:ceq) (:brfalse ,ci-skip) ;; within catch
-                       (:leave ,label) ;; exit catch to clause body after try-catch
-                       (:label ,ci-skip))) ;; within catch
-      ;; Out-of-range clauseIndex falls through to nomatch
-      (:label ,nomatch-hcex-label) ;; reached by: tag mismatch OR out-of-range index
-      (:rethrow)  ;; finally pops the cluster
-      ;; Catch 2: LispErrorException (fallback when Signal didn't find our cluster,
-      ;;          or for LispErrors whose type doesn't match any clause)
-      (:begin-catch-block "LispErrorException")
-      (:declare-local ,ex-key "LispErrorException")
-      (:stloc ,ex-key)
-      (:ldloc ,ex-key) (:callvirt "LispErrorException.get_Condition")
-      (:castclass "LispObject") (:stloc ,cond-key)
-      ,@(loop for (type-spec var handler-body) in parsed
-              for label in clause-labels
-              for skip in le-skip-labels
-              append `((:ldloc ,cond-key)
-                       ,@(%handler-type-spec-load type-spec)
-                       (:call "Runtime.Typep") (:call "Runtime.IsTruthy")
-                       (:brfalse ,skip) ;; within catch: skip to next type check
-                       (:leave ,label)  ;; exit catch to clause body after try-catch
-                       (:label ,skip))) ;; within catch
-      (:rethrow)  ;; finally pops the cluster
-      ;; Catch 3: System.Exception (raw .NET exceptions not yet wrapped)
-      (:begin-catch-block "System.Exception")
-      (:declare-local ,dotnet-ex-key "System.Exception")
-      (:stloc ,dotnet-ex-key)
-      ;; Re-throw Lisp control-flow exceptions (RETURN-FROM, THROW, GO, etc.)
-      ;; so they are not mistakenly caught as errors.
-      (:ldloc ,dotnet-ex-key) (:call "Runtime.IsLispControlFlowException")
-      (:brtrue ,dn-rethrow-label)  ;; brtrue within catch to rethrow path
-      (:ldloc ,dotnet-ex-key)
-      (:call "Runtime.WrapDotNetExceptionObj")
-      (:stloc ,cond-key)
-      ,@(loop for (type-spec var handler-body) in parsed
-              for label in clause-labels
-              for skip in dn-skip-labels
-              append `((:ldloc ,cond-key)
-                       ,@(%handler-type-spec-load type-spec)
-                       (:call "Runtime.Typep") (:call "Runtime.IsTruthy")
-                       (:brfalse ,skip) ;; within catch
-                       (:leave ,label)  ;; exit catch to clause body
-                       (:label ,skip))) ;; within catch
-      (:label ,dn-rethrow-label)
-      (:rethrow)  ;; finally pops the cluster
+              append `((:ldloc ,ci-key) (:ldc-i4 ,i) (:ceq) (:brfalse ,ci-skip) ;; within handler
+                       (:leave ,label) ;; exit handler to clause body after the block
+                       (:label ,ci-skip)))
+      ;; Unreachable: the filter only answered 1 for an index in range.
+      (:leave ,inner-end-label)
       ;; Finally: pop the cluster on EVERY exit from the try — normal completion, a
       ;; matched-clause :leave, a no-match rethrow, AND a non-local :leave
       ;; (return-from / go) out of the body. The old code popped only on the catch
@@ -6344,8 +6657,14 @@
          (result-key (gen-local "RCRES"))
          (try-end-label (gen-label "RCTRYEND"))
          (done-label (gen-label "RCDONE"))
-         (ex-key (gen-local "RCEX"))
+         ;; The in-flight exception, kept by the filter for its handler.
+         (exobj-key (gen-local "RCEXOBJ"))
+         ;; Matched clause index, written by the filter and read by its handler.
+         (ri-key (gen-local "RCIDX"))
          (args-key (gen-local "RCARGS"))
+         ;; One unique tag object per clause, in clause order. The LispRestart
+         ;; entries and the filter both read them from here.
+         (tags-key (gen-local "RCTAGS"))
          ;; Parse clauses: ((name params body...) ...)
          ;; Extract :report, :interactive, :test keyword options before body
          (parsed (mapcar (lambda (clause)
@@ -6369,24 +6688,29 @@
                                             (t (return))))
                              (list name params rest report interactive (car clause) test-fn)))
                          clauses))
-         ;; Generate a unique tag object for each restart
-         (tag-keys (loop for i from 0 below (length parsed)
-                         collect (gen-local (format nil "RCTAG~d" i))))
          ;; Generate labels for each clause
          (clause-labels (loop for i from 0 below (length parsed)
-                              collect (gen-label (format nil "RC~d" i)))))
+                              collect (gen-label (format nil "RC~d" i))))
+         ;; Skip labels for the ceq+brfalse dispatch, which must stay WITHIN the
+         ;; filter's handler block (a brfalse cannot leave a funclet).
+         (skip-labels (loop for i from 0 below (length parsed)
+                            collect (gen-label (format nil "RCSKIP~d" i)))))
     `((:declare-local ,result-key "LispObject")
       ,@(emit-nil) (:stloc ,result-key)
       (:declare-local ,args-key "LispObject[]")
-      ;; Create tag objects for each restart
-      ,@(loop for tk in tag-keys
-              append `((:declare-local ,tk "Object")
-                       (:newobj "Object") (:stloc ,tk)))
+      (:declare-local ,exobj-key "Object")
+      (:declare-local ,ri-key "Int32")
+      ;; Create a tag object for each restart
+      (:declare-local ,tags-key "Object[]")
+      (:ldc-i4 ,(length parsed))
+      (:newarr "Object")
+      ,@(loop for i from 0 below (length parsed)
+              append `((:dup) (:ldc-i4 ,i) (:newobj "Object") (:stelem-ref)))
+      (:stloc ,tags-key)
       ;; Build LispRestart[] array and push cluster
       (:ldc-i4 ,(length parsed))
       (:newarr "LispRestart")
       ,@(loop for (name params handler-body report interactive name-sym test-fn) in parsed
-              for tk in tag-keys
               for i from 0
               append `((:dup) (:ldc-i4 ,i)
                        (:ldstr ,name)   ;; restart name
@@ -6394,7 +6718,7 @@
                        ,@(if (stringp report)
                              `((:ldstr ,report))
                              `((:ldnull)))  ;; description
-                       (:ldloc ,tk)     ;; tag
+                       (:ldloc ,tags-key) (:ldc-i4 ,i) (:ldelem-ref)  ;; tag
                        (:ldc-i4 0)      ;; isBindRestart = false
                        (:newobj "LispRestart")
                        ;; Set NameSymbol to original symbol
@@ -6443,35 +6767,41 @@
                              body-form)))
       (:stloc ,result-key)
       (:leave ,try-end-label)
-      ;; Catch RestartInvocationException
-      (:begin-catch-block "RestartInvocationException")
-      (:declare-local ,ex-key "RestartInvocationException")
-      (:stloc ,ex-key)
+      ;; A CIL exception FILTER answers "which of MY clauses does this invocation
+      ;; target" (or -1) without entering the frame. The shape this replaces caught
+      ;; every RestartInvocationException and rethrew the ones it did not own, and a
+      ;; rethrow restarts dispatch from inside the handler funclet, which then stays
+      ;; live for the rest of the exception's journey. Invoking a restart established
+      ;; N levels out therefore stacked N dispatches: quadratic time, and past ~20000
+      ;; levels an uncatchable .NET StackOverflowException, at a depth the same
+      ;; recursion descends ten times over.
+      (:begin-filter-block)
+      (:dup) (:stloc ,exobj-key)
+      (:ldloc ,tags-key)
+      (:call "ControlFlowFilters.RestartCaseTag")
+      (:stloc ,ri-key)
+      (:ldloc ,ri-key) (:ldc-i4 -1) (:cgt)
+      (:begin-filter-handler)
+      (:pop)
       ;; Save arguments array
-      (:ldloc ,ex-key)
+      (:ldloc ,exobj-key)
+      (:castclass "RestartInvocationException")
       (:callvirt "RestartInvocationException.get_Arguments")
       (:stloc ,args-key)
-      ;; Match tag to find which restart was invoked
-      ;; ceq+brfalse to skip, leave to exit catch to clause-label
-      ,@(let ((skip-labels (loop for i from 0 below (length parsed)
-                                 collect (gen-label (format nil "RCSKIP~d" i)))))
-          (loop for (name params handler-body report interactive name-sym test-fn) in parsed
-                for tk in tag-keys
-                for label in clause-labels
-                for skip in skip-labels
-                append `((:ldloc ,ex-key)
-                         (:callvirt "RestartInvocationException.get_Tag")
-                         (:ldloc ,tk)
-                         (:ceq)
-                         (:brfalse ,skip)  ;; skip if not matching (within catch)
-                         (:leave ,label)   ;; exit catch to clause body
-                         (:label ,skip)))) ;; within catch
-      ;; No match → rethrow; the finally pops the cluster.
-      (:rethrow)
+      ;; Dispatch on the clause index the filter picked
+      ,@(loop for label in clause-labels
+              for skip in skip-labels
+              for i from 0
+              append `((:ldloc ,ri-key) (:ldc-i4 ,i) (:ceq)
+                       (:brfalse ,skip)  ;; skip if not this clause (within handler)
+                       (:leave ,label)   ;; exit handler to clause body
+                       (:label ,skip)))  ;; within handler
+      ;; Unreachable: the filter only answered 1 for an index in range.
+      (:leave ,try-end-label)
       ;; Finally: pop the cluster on EVERY exit from the try — normal completion,
-      ;; a matched-restart :leave to a clause, a no-match rethrow, AND a non-local
-      ;; transfer (return-from / throw / go) out of the body. The old code popped
-      ;; only on the normal-exit and rethrow paths, so a non-local exit *through the
+      ;; a matched-restart :leave to a clause, an invocation the filter declined,
+      ;; AND a non-local transfer (return-from / throw / go) out of the body. The
+      ;; old code popped only on the normal-exit and rethrow paths, so a non-local exit *through the
       ;; body* leaked the restart cluster. SBCL's compile-file body does exactly
       ;; that, leaking one RECOMPILE cluster per stem in the make-host-2 XC build.
       (:begin-finally-block)
@@ -6811,6 +7141,7 @@
                                 (:binary (compile-binary-call (third fused) (second fused)))
                                 (:unary (compile-unary-call (third fused) (second fused)))
                                 (:fixnum-cmp (compile-fixnum-cmp (third fused) (second fused)))
+                                (:sym-eq (compile-sym-eq (third fused)))
                (:double-cmp (compile-double-cmp (third fused) (second fused)))))
                           (:brfalse ,else-label)
                           ,@(compile-progn body)
@@ -7315,6 +7646,17 @@
           `(,@(compile-value-arg (second expr))
             ,@(compile-value-arg (third expr))
             (:call "Runtime.SetSlotDefRawOptions"))))
+  ;; (%slot-def-attrs slotd readers writers type) → slotd
+  ;; Carries the introspectable slot attributes DEFCLASS parses (reader/writer
+  ;; names, declared type) onto the slot definition.
+  (setf (gethash '%slot-def-attrs h)
+        (lambda (expr)
+          `(,@(compile-value-arg (second expr))
+            ,@(compile-value-arg (third expr))
+            ,@(compile-value-arg (fourth expr))
+            ,@(compile-value-arg (fifth expr))
+            ,@(compile-value-arg (sixth expr))
+            (:call "Runtime.SetSlotDefAttrs"))))
   (setf (gethash '%register-class h) (lambda (expr) (compile-unary-call (cdr expr) "Runtime.RegisterClass")))
   (setf (gethash '%set-class-default-initargs h)
         (lambda (expr)
@@ -7734,7 +8076,9 @@
             (cond
               ((= nargs 0) (compile-static-program-error "DIGIT-CHAR-P: too few arguments: 0 (expected 1-2)"))
               ((> nargs 2) (compile-static-program-error (format nil "DIGIT-CHAR-P: too many arguments: ~D (expected 1-2)" nargs)))
-              ((= nargs 1) `(,@(compile-value-arg (car args)) (:ldc-i4 10) (:call "Fixnum.Make") (:call "Runtime.DigitCharP")))
+              ;; The default radix has to be pushed as an i8: Fixnum.Make takes a
+              ;; long, and an i4 there is an unverifiable stack-type mismatch.
+              ((= nargs 1) `(,@(compile-value-arg (car args)) ,@(emit-fixnum 10) (:call "Runtime.DigitCharP")))
               (t (compile-binary-call args "Runtime.DigitCharP"))))))
   (setf (gethash 'string h) (lambda (expr) (compile-unary-call (cdr expr) "Runtime.String")))
   (setf (gethash 'char h)

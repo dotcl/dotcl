@@ -118,10 +118,23 @@ public static partial class Runtime
         return dest is Nil ? new LispString(result2) : Nil.Instance;
     }
 
+    /// <summary>A print base / radix must be an integer in [2, 36]. This used to
+    /// throw ArgumentException, which the CLR-exception mapping reports as a
+    /// PROGRAM-ERROR — but passing 40 for :base is a bad argument, not a broken
+    /// program, and a handler could not see which value was rejected.</summary>
+    private static void CheckRadix(int radix)
+    {
+        if (radix >= 2 && radix <= 36) return;
+        throw new LispErrorException(new LispTypeError(
+            $"invalid radix {radix} (must be between 2 and 36)",
+            Fixnum.Make(radix),
+            List(Startup.Sym("INTEGER"), Fixnum.Make(2), Fixnum.Make(36))));
+    }
+
     private static string ToRadixString(long value, int radix)
     {
         const string digits = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
-        if (radix < 2 || radix > 36) throw new ArgumentException($"Invalid radix: {radix}");
+        CheckRadix(radix);
         if (value == 0) return "0";
         bool neg = value < 0;
         ulong v = neg ? (ulong)(-value) : (ulong)value;
@@ -135,7 +148,7 @@ public static partial class Runtime
     private static string BigIntToRadixString(System.Numerics.BigInteger value, int radix)
     {
         const string digits = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
-        if (radix < 2 || radix > 36) throw new ArgumentException($"Invalid radix: {radix}");
+        CheckRadix(radix);
         if (value == 0) return "0";
         bool neg = value < 0;
         var v = neg ? -value : value;

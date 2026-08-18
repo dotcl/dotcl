@@ -95,7 +95,11 @@ internal static class DotNetSta
             appType.GetMethod("Run", Type.EmptyTypes)!.Invoke(null, null);
         });
 
-        _uiThread.SetApartmentState(ApartmentState.STA);
+        // WinForms exists on Windows only (the type lookup above already failed
+        // elsewhere), but the platform analyzer needs the guard spelled out.
+        if (System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(
+                System.Runtime.InteropServices.OSPlatform.Windows))
+            _uiThread.SetApartmentState(ApartmentState.STA);
         _uiThread.IsBackground = true;
         _uiThread.Name = "dotcl-ui";
         _uiThread.Start();

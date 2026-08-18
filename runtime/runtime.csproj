@@ -80,12 +80,16 @@
     <ProjectReference Include="DotCL.Runtime.csproj" />
   </ItemGroup>
 
-  <!-- Exclude per-RID R2R fasls (*-r2r-<rid>.fasl) from the framework-dependent
-       (any-RID) tool package; they belong only in the per-RID tool packages
-       (dotcl.<rid>). Empty when a RID is set, so per-RID packs keep their R2R.
-       Without this the contrib/** glob bundled all 6 RIDs' R2R fasls (~35MB). -->
+  <!-- Keep every per-RID R2R fasl (*-r2r-<rid>.fasl) out of the contrib/** glob,
+       then add back only the one RID being built (see the item group below). The
+       staging directory holds all six RIDs' copies because a single pack pass
+       emits every package from it, but a given package must carry exactly one:
+       the framework-dependent (any-RID) tool package carries none, and each
+       per-RID package (dotcl.<rid>) carries its own. Without the add-back this
+       glob shipped all six R2R sets in all six packages (~22 MB of waste each). -->
   <PropertyGroup>
-    <FrameworkContribR2RExclude Condition="'$(RuntimeIdentifier)' == '' or '$(RuntimeIdentifier)' == 'any'">contrib/**/*-r2r-*.fasl</FrameworkContribR2RExclude>
+    <ContribR2RExclude>contrib/**/*-r2r-*.fasl</ContribR2RExclude>
+    <ContribOwnR2R Condition="'$(RuntimeIdentifier)' != '' and '$(RuntimeIdentifier)' != 'any'">contrib/**/*-r2r-$(RuntimeIdentifier).fasl</ContribOwnR2R>
   </PropertyGroup>
 
   <ItemGroup>
@@ -106,11 +110,22 @@
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <CopyToPublishDirectory>Always</CopyToPublishDirectory>
     </Content>
-    <None Include="contrib/**" Exclude="$(FrameworkContribR2RExclude)" Condition="Exists('contrib')">
+    <None Include="contrib/**" Exclude="$(ContribR2RExclude)" Condition="Exists('contrib')">
       <Pack>true</Pack>
       <PackagePath>tools/net10.0/any/contrib/</PackagePath>
     </None>
-    <Content Include="contrib/**" Exclude="$(FrameworkContribR2RExclude)" Condition="Exists('contrib')" Pack="false">
+    <Content Include="contrib/**" Exclude="$(ContribR2RExclude)" Condition="Exists('contrib')" Pack="false">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>Always</CopyToPublishDirectory>
+    </Content>
+    <!-- Add back this RID's own R2R contrib fasls (empty glob for the any-RID
+         package). ResolveDeps probes contrib/<n>/<n>-r2r-<rid>.fasl and falls
+         back to the IL fasl, so this is what makes contrib load pre-native. -->
+    <None Include="$(ContribOwnR2R)" Condition="Exists('contrib') and '$(ContribOwnR2R)' != ''">
+      <Pack>true</Pack>
+      <PackagePath>tools/net10.0/any/contrib/</PackagePath>
+    </None>
+    <Content Include="$(ContribOwnR2R)" Condition="Exists('contrib') and '$(ContribOwnR2R)' != ''" Pack="false">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <CopyToPublishDirectory>Always</CopyToPublishDirectory>
     </Content>

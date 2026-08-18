@@ -17,6 +17,12 @@ public partial class CilAssembler
     private readonly Dictionary<string, LocalBuilder> _locals = new();
     private readonly Dictionary<string, Label> _labels = new();
 
+    /// <summary>The exact type the instruction just emitted left on the stack, when
+    /// it is known. Set by the symbol loaders (whose runtime method returns Symbol)
+    /// and read by the next instruction only — a one-instruction lookback, not a
+    /// stack model. Lets a redundant castclass be dropped instead of emitted.</summary>
+    private Type? _lastPushedType;
+
     // FASL mode: emit constants inline in IL instead of using constant pool
     internal bool _faslMode;
     // TypeBuilder for FASL mode — used to define closure body methods
@@ -194,14 +200,42 @@ public partial class CilAssembler
         return segments;
     }
 
+    // Delegates bound to closure-body DynamicMethods, one per closure SITE.
+    // The delegate does not depend on the closure's environment: env is passed as
+    // the body's first argument at call time, not bound into the delegate. So the
+    // same delegate serves every closure the site ever creates, and CreateDelegate
+    // -- which cost about 380 ns and the bulk of 512 B on EVERY closure creation --
+    // runs once.
+    // Keyed by the unit holder rather than by unitId so the cache is collected with
+    // the unit; a static id-keyed table would pin the delegates and ids are reused.
+    // A dictionary rather than an array indexed by dmIndex: a unit's constant
+    // holder grows as more code is assembled into it, so any size fixed when the
+    // cache was first built could be outrun by a later site.
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<
+        List<object>, System.Collections.Concurrent.ConcurrentDictionary<int, Delegate>>
+        _closureDelegates = new();
+
+    private static Delegate GetClosureDelegate(List<object> holder, int dmIndex, Type delType)
+    {
+        var cache = _closureDelegates.GetValue(
+            holder, static _ => new System.Collections.Concurrent.ConcurrentDictionary<int, Delegate>());
+        // The type check is defensive: a site's signature is fixed by the emitter,
+        // so a mismatch cannot normally happen, and returning a wrong-typed
+        // delegate would be far worse than rebuilding one.
+        if (cache.TryGetValue(dmIndex, out var cached) && cached.GetType() == delType) return cached;
+        var made = ((DynamicMethod)holder[dmIndex]).CreateDelegate(delType);
+        // Racing threads just build two equivalent delegates; either is correct.
+        cache[dmIndex] = made;
+        return made;
+    }
+
     public static LispObject MakeClosure(object[] env, int unitId, int dmIndex, int arity)
     {
         var holder = TryGetUnitHolder(unitId)
             ?? throw new LispErrorException(new LispProgramError(
                 "internal: closure compilation unit was collected while still callable"));
-        var dm = (DynamicMethod)holder[dmIndex];
-        var closureDel = (Func<object[], LispObject[], LispObject>)dm.CreateDelegate(
-            typeof(Func<object[], LispObject[], LispObject>));
+        var closureDel = (Func<object[], LispObject[], LispObject>)GetClosureDelegate(
+            holder, dmIndex, typeof(Func<object[], LispObject[], LispObject>));
         // Pin the unit so this closure can still resolve sibling DMs (e.g. a
         // nested closure built when it is later called), and so the unit's JIT
         // code outlives the enclosing function exactly as long as this closure does.
@@ -218,7 +252,6 @@ public partial class CilAssembler
         var holder = TryGetUnitHolder(unitId)
             ?? throw new LispErrorException(new LispProgramError(
                 "internal: closure compilation unit was collected while still callable"));
-        var dm = (DynamicMethod)holder[dmIndex];
         Type delType = arity switch
         {
             0 => typeof(Func<object[], LispObject>),
@@ -231,7 +264,8 @@ public partial class CilAssembler
             _ => throw new LispErrorException(new LispProgramError(
                 $"internal: MakeClosureDirect unsupported arity {arity}"))
         };
-        var fn = LispFunction.MakeDirectClosure(dm.CreateDelegate(delType), env, fnName);
+        var fn = LispFunction.MakeDirectClosure(
+            GetClosureDelegate(holder, dmIndex, delType), env, fnName);
         // Pin the unit — same lifetime contract as MakeClosure.
         fn.RetainUnit = holder;
         return fn;
@@ -315,6 +349,7 @@ public partial class CilAssembler
                 {
                     var dn = ds.Name;
                     if (dn == "LABEL" || dn == "BEGIN-CATCH-BLOCK"
+                        || dn == "BEGIN-FILTER-BLOCK" || dn == "BEGIN-FILTER-HANDLER"
                         || dn == "BEGIN-FINALLY-BLOCK" || dn == "END-EXCEPTION-BLOCK"
                         || dn == "BEGIN-EXCEPTION-BLOCK")
                     {
@@ -339,6 +374,18 @@ public partial class CilAssembler
                     continue;
                 }
             }
+            // A string literal reaches the assembler as (:LDSTR s) (:NEWOBJ
+            // "LispString") — a .sil file is text, so it cannot carry the live
+            // object the way an in-process compile does. Taken literally that
+            // builds a fresh LispString every time the expression is EVALUATED.
+            // The literal is a constant (CLHS 3.7.1), so hoist it: one object per
+            // distinct value, built once. This is the whole cost of a string
+            // literal in the core, which the interpreter's dispatch runs per call.
+            if (c.Cdr is Cons nextCell && TryEmitStringLiteral(instr, nextCell.Car))
+            {
+                cur = nextCell.Cdr;
+                continue;
+            }
             AssembleOne(instr);
             // Check if this instruction makes subsequent code unreachable
             if (instr is Cons tc && tc.Car is Symbol ts)
@@ -351,12 +398,47 @@ public partial class CilAssembler
         }
     }
 
+    /// <summary>
+    /// Emit (:LDSTR s) (:NEWOBJ "LispString") as a load of one shared object, or
+    /// return false if the pair is not that. LDSTR is the only SIL op that leaves
+    /// a raw System.String on the stack, so an adjacent NEWOBJ "LispString" can
+    /// only be consuming this one.
+    /// </summary>
+    private bool TryEmitStringLiteral(LispObject instr, LispObject next)
+    {
+        if (instr is not Cons c || c.Car is not Symbol op || op.Name != "LDSTR") return false;
+        if (next is not Cons n || n.Car is not Symbol nop || nop.Name != "NEWOBJ") return false;
+        if (GetString(Cadr(n)) != "LispString") return false;
+        var value = GetString(Cadr(c));
+        if (_faslMode)
+        {
+            // A FASL cannot reach the process-local constant pool, so the shared
+            // object is a static field filled by the type initializer.
+            if (_faslStructMap?.UninternedTypeBuilder == null
+                || _faslStructMap.SymFnSiteInitIl == null) return false;
+            _il.Emit(OpCodes.Ldsfld, _faslStructMap.GetOrCreateStringField(value));
+            return true;
+        }
+        int idx = AddConstant(new LispString(value));
+        _il.Emit(OpCodes.Ldc_I4, idx);
+        _il.Emit(OpCodes.Call, _getConstant);
+        _il.Emit(OpCodes.Castclass, typeof(LispString));
+        return true;
+    }
+
     private void AssembleOne(LispObject instr)
     {
         if (instr is not Cons c) return;
         var opSym = c.Car as Symbol;
         if (opSym == null) return;
         var op = opSym.Name;
+
+        // What the PREVIOUS instruction left on the stack, when we know it exactly.
+        // Only the symbol loaders set it (they call a method whose return type is
+        // Symbol), and it survives exactly one instruction — long enough for the
+        // CASTCLASS that almost always follows to notice it has nothing to do.
+        var prevPushed = _lastPushedType;
+        _lastPushedType = null;
 
         switch (op)
         {
@@ -472,7 +554,7 @@ public partial class CilAssembler
                 EmitNewobj(GetString(Cadr(c)));
                 break;
             case "CASTCLASS":
-                EmitCastclass(GetString(Cadr(c)));
+                EmitCastclass(GetString(Cadr(c)), prevPushed);
                 break;
             case "DECLARE-LOCAL":
                 DeclareLocal(GetSymbolName(Cadr(c)), GetString(Caddr(c)));
@@ -635,6 +717,17 @@ public partial class CilAssembler
             case "BEGIN-CATCH-BLOCK":
                 _il.BeginCatchBlock(ResolveType(GetString(Cadr(c))));
                 break;
+            // Filter-based handler: the filter block runs with the exception on the
+            // stack and must leave 1 (handle) or 0 (keep unwinding); the handler
+            // block that follows starts with the exception on the stack, as a catch
+            // block does. Lets a tag-matching construct decline without catching and
+            // rethrowing — see ControlFlowFilters.
+            case "BEGIN-FILTER-BLOCK":
+                _il.BeginExceptFilterBlock();
+                break;
+            case "BEGIN-FILTER-HANDLER":
+                _il.BeginCatchBlock(null);
+                break;
             case "BEGIN-FINALLY-BLOCK":
                 _il.BeginFinallyBlock();
                 break;
@@ -663,7 +756,11 @@ public partial class CilAssembler
                 var symName = GetString(Cadr(c));
                 _il.Emit(OpCodes.Ldstr, _faslMode ? Track(symName) : symName);
                 _il.Emit(OpCodes.Call, _methodCache["Startup.Sym"]);
-                _il.Emit(OpCodes.Castclass, typeof(LispObject));
+                // Startup.Sym returns Symbol, and a Symbol is usable wherever a
+                // LispObject is wanted, so the widening cast was never needed —
+                // and it forced the narrowing one that usually follows to be a
+                // second cast rather than a no-op.
+                _lastPushedType = typeof(Symbol);
                 break;
             }
             case "LOAD-SYM-FN":
@@ -705,7 +802,10 @@ public partial class CilAssembler
                     _il.Emit(OpCodes.Castclass, typeof(Startup.SymFnSite));
                     _il.Emit(OpCodes.Call, _symFnSiteResolve);
                 }
-                _il.Emit(OpCodes.Castclass, typeof(LispObject));
+                // Both arms leave a Symbol (SymFnSite.Resolve and Startup.SymFn
+                // both return one), so the widening cast was dead — and this is
+                // the call-site path, so it was dead on every named call.
+                _lastPushedType = typeof(Symbol);
                 break;
             }
             case "LOAD-SYM-KEYWORD":
@@ -713,7 +813,7 @@ public partial class CilAssembler
                 var kwName = GetString(Cadr(c));
                 _il.Emit(OpCodes.Ldstr, _faslMode ? Track(kwName) : kwName);
                 _il.Emit(OpCodes.Call, _methodCache["Startup.Keyword"]);
-                _il.Emit(OpCodes.Castclass, typeof(LispObject));
+                _lastPushedType = typeof(Symbol);
                 break;
             }
             case "LOAD-SYM-PKG":
@@ -724,7 +824,7 @@ public partial class CilAssembler
                 _il.Emit(OpCodes.Ldstr, _faslMode ? Track(spPkg) : spPkg);
                 if (_faslMode) _faslStructMap?.RecordSymbolReference(spName, spPkg);
                 _il.Emit(OpCodes.Call, _methodCache["Startup.SymInPkg"]);
-                _il.Emit(OpCodes.Castclass, typeof(LispObject));
+                _lastPushedType = typeof(Symbol);
                 break;
             }
             case "READER-IC":
@@ -1007,7 +1107,7 @@ public partial class CilAssembler
             _il.Emit(OpCodes.Ldstr, pkgSym.Name);
             _il.Emit(OpCodes.Ldstr, pkgSym.HomePackage?.Name ?? defPkg ?? "");
             _il.Emit(OpCodes.Call, _methodCache["Startup.SymInPkg"]);
-            _il.Emit(OpCodes.Castclass, typeof(Symbol));
+            // SymInPkg returns Symbol; the cast that used to be here was a no-op.
             EmitLoadReRegisterConstant(fnc);
             _il.Emit(OpCodes.Call, _registerFunctionOnSymbol);
         }
@@ -1017,7 +1117,7 @@ public partial class CilAssembler
             _il.Emit(OpCodes.Ldstr, setfTargetSym.Name);
             _il.Emit(OpCodes.Ldstr, setfTargetSym.HomePackage?.Name ?? defPkg ?? "");
             _il.Emit(OpCodes.Call, _methodCache["Startup.SymInPkg"]);
-            _il.Emit(OpCodes.Castclass, typeof(Symbol));
+            // SymInPkg returns Symbol; the cast that used to be here was a no-op.
             EmitLoadReRegisterConstant(fnc);
             _il.Emit(OpCodes.Call, _registerSetfFunctionOnSymbol);
         }
@@ -1542,7 +1642,7 @@ public partial class CilAssembler
             _il.Emit(OpCodes.Ldstr, pkgSym.Name);
             _il.Emit(OpCodes.Ldstr, pkgSym.HomePackage?.Name ?? defPkg ?? "");
             _il.Emit(OpCodes.Call, _methodCache["Startup.SymInPkg"]);
-            _il.Emit(OpCodes.Castclass, typeof(Symbol));
+            // SymInPkg returns Symbol; the cast that used to be here was a no-op.
             EmitLoadReRegisterConstant(fnc);
             _il.Emit(OpCodes.Call, _registerFunctionOnSymbol);
         }
@@ -1551,7 +1651,7 @@ public partial class CilAssembler
             _il.Emit(OpCodes.Ldstr, setfTargetSym.Name);
             _il.Emit(OpCodes.Ldstr, setfTargetSym.HomePackage?.Name ?? defPkg ?? "");
             _il.Emit(OpCodes.Call, _methodCache["Startup.SymInPkg"]);
-            _il.Emit(OpCodes.Castclass, typeof(Symbol));
+            // SymInPkg returns Symbol; the cast that used to be here was a no-op.
             EmitLoadReRegisterConstant(fnc);
             _il.Emit(OpCodes.Call, _registerSetfFunctionOnSymbol);
         }
@@ -1814,7 +1914,7 @@ public partial class CilAssembler
             _il.Emit(OpCodes.Ldstr, pkgSym.Name);
             _il.Emit(OpCodes.Ldstr, pkgSym.HomePackage?.Name ?? defPkg ?? "");
             _il.Emit(OpCodes.Call, _methodCache["Startup.SymInPkg"]);
-            _il.Emit(OpCodes.Castclass, typeof(Symbol));
+            // SymInPkg returns Symbol; the cast that used to be here was a no-op.
             EmitLoadReRegisterConstant(fnc);
             _il.Emit(OpCodes.Call, _registerFunctionOnSymbol);
         }
@@ -1823,7 +1923,7 @@ public partial class CilAssembler
             _il.Emit(OpCodes.Ldstr, setfTargetSym.Name);
             _il.Emit(OpCodes.Ldstr, setfTargetSym.HomePackage?.Name ?? defPkg ?? "");
             _il.Emit(OpCodes.Call, _methodCache["Startup.SymInPkg"]);
-            _il.Emit(OpCodes.Castclass, typeof(Symbol));
+            // SymInPkg returns Symbol; the cast that used to be here was a no-op.
             EmitLoadReRegisterConstant(fnc);
             _il.Emit(OpCodes.Call, _registerSetfFunctionOnSymbol);
         }
@@ -2256,9 +2356,14 @@ public partial class CilAssembler
         throw new Exception($"Unknown constructor: {name}");
     }
 
-    private void EmitCastclass(string name)
+    /// <summary>A castclass to a type the value provably already has is dead work:
+    /// the JIT still calls the cast helper unless it can prove otherwise, and this
+    /// pattern is everywhere — every (:load-sym "X") (:castclass "Symbol") pair.
+    /// PREVPUSHED is the exact type the previous instruction left, when known.</summary>
+    private void EmitCastclass(string name, Type? prevPushed = null)
     {
         var t = ResolveType(name);
+        if (prevPushed != null && t.IsAssignableFrom(prevPushed)) return;
         _il.Emit(OpCodes.Castclass, t);
     }
 
@@ -2308,6 +2413,15 @@ public partial class CilAssembler
 
     private int _inlineDepth;
     private const int MaxInlineDepth = 500;
+    // Constant graph nodes emitted into the method this assembler is building.
+    // One oversized literal is already bounded (MaxInlineDepth for deep ones,
+    // MaxInlineListChunk for long lists and vectors), but a method holding MANY
+    // medium-sized literals had no bound at all: each one passed every existing
+    // check and they simply accumulated. That is how a top level form with ~130
+    // moderate literals reached megabytes of IL in a single method, which is
+    // what the JIT has to chew through at load time.
+    private int _constNodes;
+    private const int MaxConstNodesPerMethod = 2000;
     private HashSet<LispStruct>? _inlineVisited;
     private bool _skipStructIntern; // skip intern key for structs inside hash table values
     // Shared across all CilAssemblers in one FASL to deduplicate struct intern keys
@@ -2333,10 +2447,66 @@ public partial class CilAssembler
         // it under DOTCL_EMIT_PDB and reads it at Save. Null → no debug info.
         internal List<DebugMethodInfo>? DebugSink;
 
+        // These are written by FaslAssembler, whose implementation needs .NET 9+.
+        // On an older target framework it compiles out, so the fields stay null and
+        // the code that reads them checks for that; CS0649 is reporting the shape,
+        // not a bug.
+#pragma warning disable CS0649
         // Per-FASL uninterned symbol deduplication: same Symbol object → same static field.
         // Set by FaslAssembler after construction.
         internal System.Reflection.Emit.TypeBuilder? UninternedTypeBuilder;
         internal System.Reflection.Emit.ILGenerator? UninternedInitIl;
+#pragma warning restore CS0649
+
+        // --- Literal-holding static fields ---------------------------------
+        // Uninterned symbols, call-site caches and string literals all take one
+        // static field each, and they all used to land on CompiledModule. .NET
+        // caps a type at 64K fields: past that the type cannot be loaded at all,
+        // and the CLR says only "Internal limitation: too many fields", which
+        // names neither the file nor the cause. The type initializer that fills
+        // them is one method too, so its IL grows with every field and the JIT
+        // pays for all of it at load. coalton's library/format bakes 114,451
+        // uninterned symbols into its literals — 1.8x the field cap.
+        //
+        // Roll the fields over onto fresh holder types before either limit
+        // bites. Each holder fills its own fields from its own type
+        // initializer, which the CLR runs before the first access to that
+        // holder — the same guarantee the single .cctor gave, now per holder
+        // and lazily, so a file only pays for the literals it reaches.
+        private const int MaxFieldsPerHolder = 4096;
+#pragma warning disable CS0649
+        internal System.Reflection.Emit.ModuleBuilder? ModuleBuilder;
+#pragma warning restore CS0649
+        internal readonly List<(System.Reflection.Emit.TypeBuilder Type,
+                               System.Reflection.Emit.ILGenerator Cctor)> OverflowHolders = new();
+        private System.Reflection.Emit.TypeBuilder? _holderType;
+        private System.Reflection.Emit.ILGenerator? _holderCctor;
+        private int _holderFields;
+        private int _holderCount;
+
+        /// <summary>The type a new literal field goes on, with the initializer
+        /// that fills it. Rolls over to a fresh holder type once the current one
+        /// has taken MaxFieldsPerHolder fields.</summary>
+        private (System.Reflection.Emit.TypeBuilder Type,
+                 System.Reflection.Emit.ILGenerator Cctor) FieldHolder()
+        {
+            if (_holderType == null)
+            {
+                _holderType = UninternedTypeBuilder!;
+                _holderCctor = SymFnSiteInitIl!;
+            }
+            else if (_holderFields >= MaxFieldsPerHolder && ModuleBuilder != null)
+            {
+                var tb = ModuleBuilder.DefineType($"CompiledModuleLiterals{_holderCount++}",
+                    System.Reflection.TypeAttributes.Public | System.Reflection.TypeAttributes.Class);
+                _holderType = tb;
+                _holderCctor = tb.DefineTypeInitializer().GetILGenerator();
+                OverflowHolders.Add((tb, _holderCctor));
+                _holderFields = 0;
+            }
+            _holderFields++;
+            return (_holderType!, _holderCctor!);
+        }
         private readonly Dictionary<Symbol, System.Reflection.Emit.FieldBuilder> _uninternedFields =
             new(ReferenceEqualityComparer.Instance);
         private static readonly System.Reflection.ConstructorInfo _symbolCtor2 =
@@ -2459,7 +2629,9 @@ public partial class CilAssembler
         // named in a call position, shared by every call site that names it.
         // Initialized from the type initializer (below), not ModuleInit, so the
         // CLR guarantees the cells exist before any body can read one.
+#pragma warning disable CS0649
         internal System.Reflection.Emit.ILGenerator? SymFnSiteInitIl;
+#pragma warning restore CS0649
         private readonly Dictionary<string, System.Reflection.Emit.FieldBuilder> _symFnSiteFields = new();
         private static readonly System.Reflection.ConstructorInfo _symFnSiteCtor =
             typeof(Startup.SymFnSite).GetConstructor(new[] { typeof(string), typeof(string) })!;
@@ -2476,8 +2648,7 @@ public partial class CilAssembler
         {
             var key = pkg is null ? name : name + "\0" + pkg;
             if (_symFnSiteFields.TryGetValue(key, out var existing)) return existing;
-            var tb = UninternedTypeBuilder!;
-            var il = SymFnSiteInitIl!;
+            var (tb, il) = FieldHolder();
             var field = tb.DefineField($"_symfn_{_symFnSiteCounter++}",
                 typeof(Startup.SymFnSite),
                 System.Reflection.FieldAttributes.Public | System.Reflection.FieldAttributes.Static);
@@ -2490,6 +2661,35 @@ public partial class CilAssembler
             return field;
         }
 
+        private readonly Dictionary<string, System.Reflection.Emit.FieldBuilder> _stringFields =
+            new(StringComparer.Ordinal);
+        private static readonly System.Reflection.ConstructorInfo _lispStringCtor =
+            typeof(LispString).GetConstructor(new[] { typeof(string) })!;
+        private int _stringCounter;
+
+        /// <summary>
+        /// Static field holding the LispString for a string literal, built once by
+        /// the type initializer. Emitting the literal inline instead constructs a
+        /// fresh LispString every time the expression is EVALUATED, not once per
+        /// site: an interpreted call through the core paid four of them, and any
+        /// string literal in a loop pays one per iteration. Literal objects are
+        /// constants (CLHS 3.7.1), so one object per distinct value per assembly
+        /// is the same coalescing a file compiler is allowed to do.
+        /// </summary>
+        public System.Reflection.Emit.FieldBuilder GetOrCreateStringField(string value)
+        {
+            if (_stringFields.TryGetValue(value, out var existing)) return existing;
+            var (tb, il) = FieldHolder();
+            var field = tb.DefineField($"_str_{_stringCounter++}",
+                typeof(LispString),
+                System.Reflection.FieldAttributes.Public | System.Reflection.FieldAttributes.Static);
+            il.Emit(System.Reflection.Emit.OpCodes.Ldstr, TrackString(value));
+            il.Emit(System.Reflection.Emit.OpCodes.Newobj, _lispStringCtor);
+            il.Emit(System.Reflection.Emit.OpCodes.Stsfld, field);
+            _stringFields[value] = field;
+            return field;
+        }
+
         /// <summary>
         /// Get or create a static field for an uninterned symbol so that all uses within
         /// this FASL resolve to the SAME Symbol object (preserves EQ-ness across make-load-form).
@@ -2498,8 +2698,12 @@ public partial class CilAssembler
         {
             if (_uninternedFields.TryGetValue(sym, out var field))
                 return field;
-            var tb = UninternedTypeBuilder!;
-            var il = UninternedInitIl!;
+            // Filled from the holder's type initializer rather than ModuleInit.
+            // Same reasoning as the call-site caches: a compiled body reads these
+            // fields and can be reached from anywhere in ModuleInit, so "we store
+            // it earlier in ModuleInit" is not a guarantee. It also keeps the
+            // 114k-symbol case out of one 1.8 MB ModuleInit.
+            var (tb, il) = FieldHolder();
             field = tb.DefineField($"_gsym_{_uninternedCounter++}",
                 typeof(Symbol), System.Reflection.FieldAttributes.Public | System.Reflection.FieldAttributes.Static);
             // Emit init: new Symbol(name, null); stsfld field
@@ -2546,6 +2750,18 @@ public partial class CilAssembler
         _inlineDepth++;
         try
         {
+        // Budget exhausted for this method: continue this literal in its own
+        // helper method (which starts with a fresh budget). Only aggregates are
+        // worth a method — spilling an atom would cost more IL than it saves.
+        // No recursion risk: the helper's own budget starts at zero, so the very
+        // value that triggered the spill is emitted inline there.
+        if (_faslMode && _faslTypeBuilder != null
+            && _constNodes > MaxConstNodesPerMethod && IsSpillWorthy(val))
+        {
+            EmitFaslDeepConstant(val);
+            return;
+        }
+        _constNodes++;
         // A circular constant literal (e.g. '#1=(1 2 3 . #1#)) cannot be rebuilt by
         // the naive cons-by-cons inline emitter — the cdr-flatten loop spins on the
         // cycle and OOMs. Shared (acyclic but #N=-coalesced) structure rebuilds but
@@ -2600,8 +2816,19 @@ public partial class CilAssembler
                 _il.Emit(OpCodes.Call, _methodCache["Fixnum.Make"]);
                 break;
             case LispString s:
-                _il.Emit(OpCodes.Ldstr, Track(s.Value));
-                _il.Emit(OpCodes.Newobj, _ctorCache["LispString"]);
+                // In a FASL the literal lives in a static field built once by the
+                // type initializer; inline construction would run on every
+                // evaluation of the expression, not once per site.
+                if (_faslMode && _faslStructMap?.UninternedTypeBuilder != null
+                    && _faslStructMap.SymFnSiteInitIl != null)
+                {
+                    _il.Emit(OpCodes.Ldsfld, _faslStructMap.GetOrCreateStringField(s.Value));
+                }
+                else
+                {
+                    _il.Emit(OpCodes.Ldstr, Track(s.Value));
+                    _il.Emit(OpCodes.Newobj, _ctorCache["LispString"]);
+                }
                 _il.Emit(OpCodes.Castclass, typeof(LispObject));
                 break;
             case Symbol sym:
@@ -3301,6 +3528,11 @@ public partial class CilAssembler
     /// depth and the IL evaluation stack (the helper returns a single value), which is
     /// what the cap exists to bound — while keeping the FASL self-contained.
     /// </summary>
+    /// <summary>Aggregates whose materialization can be large enough to deserve
+    /// its own method. Atoms emit a handful of bytes, less than the call site.</summary>
+    private static bool IsSpillWorthy(LispObject val) =>
+        val is Cons or LispVector or LispStruct or LispHashTable or LispInstance;
+
     private void EmitFaslDeepConstant(LispObject val)
     {
         int id = Interlocked.Increment(ref _faslClosureCount);
@@ -3314,6 +3546,10 @@ public partial class CilAssembler
             _il = il, _faslMode = true,
             _faslTypeBuilder = _faslTypeBuilder, _faslStructMap = _faslStructMap,
             _skipStructIntern = _skipStructIntern,
+            // The set of structs currently being emitted is what breaks cycles.
+            // It has to cross into the helper, or a cyclic struct graph would
+            // spill back and forth between methods forever.
+            _inlineVisited = _inlineVisited,
         };
         inner.EmitLoadConstInline(val);
         il.Emit(OpCodes.Ret);
@@ -3698,6 +3934,10 @@ public partial class CilAssembler
             ["Runtime.IsTrueZerop"] = typeof(Runtime).GetMethod("IsTrueZerop")!,
             ["Runtime.IsTrueMinusp"] = typeof(Runtime).GetMethod("IsTrueMinusp")!,
             ["Runtime.IsTruePlusp"] = typeof(Runtime).GetMethod("IsTruePlusp")!,
+            // Used by the inline symbol comparison the compiler emits in place of
+            // an IsTrueEq/IsTrueEql call: the value still has to be normalized
+            // before the reference compare.
+            ["Runtime.Primary"] = typeof(Runtime).GetMethod("Primary")!,
             ["Runtime.IsTrueEq"] = typeof(Runtime).GetMethod("IsTrueEq")!,
             ["Runtime.IsTrueEql"] = typeof(Runtime).GetMethod("IsTrueEql")!,
             ["Runtime.IsTrueEqual"] = typeof(Runtime).GetMethod("IsTrueEqual")!,
@@ -4045,6 +4285,7 @@ public partial class CilAssembler
             ["Runtime.MakeSlotDef"] = typeof(Runtime).GetMethod("MakeSlotDef")!,
             ["Runtime.MakeSlotDefWithAllocation"] = typeof(Runtime).GetMethod("MakeSlotDefWithAllocation")!,
             ["Runtime.SetSlotDefRawOptions"] = typeof(Runtime).GetMethod("SetSlotDefRawOptions")!,
+            ["Runtime.SetSlotDefAttrs"] = typeof(Runtime).GetMethod("SetSlotDefAttrs")!,
             ["Runtime.SetClassDefaultInitargs"] = typeof(Runtime).GetMethod("SetClassDefaultInitargs")!,
             ["Runtime.ClassOf"] = typeof(Runtime).GetMethod("ClassOf")!,
             ["Runtime.ClassName"] = typeof(Runtime).GetMethod("ClassName")!,
@@ -4246,6 +4487,20 @@ public partial class CilAssembler
                 typeof(CatchThrowException).GetProperty("Value")!.GetGetMethod()!,
             ["CatchThrowException.Get"] =
                 typeof(CatchThrowException).GetMethod("Get")!,
+
+            // Exception-filter predicates
+            ["ControlFlowFilters.CatchTagMatches"] =
+                typeof(ControlFlowFilters).GetMethod("CatchTagMatches")!,
+            ["ControlFlowFilters.HandlerCaseClause"] =
+                typeof(ControlFlowFilters).GetMethod("HandlerCaseClause")!,
+            ["ControlFlowFilters.HandlerCaseCondition"] =
+                typeof(ControlFlowFilters).GetMethod("HandlerCaseCondition")!,
+            ["ControlFlowFilters.RestartCaseTag"] =
+                typeof(ControlFlowFilters).GetMethod("RestartCaseTag")!,
+            ["ControlFlowFilters.BlockTagMatches"] =
+                typeof(ControlFlowFilters).GetMethod("BlockTagMatches")!,
+            ["ControlFlowFilters.GoTagbodyMatches"] =
+                typeof(ControlFlowFilters).GetMethod("GoTagbodyMatches")!,
 
             // CatchTagStack methods
             ["CatchTagStack.Push"] =

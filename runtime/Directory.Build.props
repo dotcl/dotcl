@@ -4,6 +4,42 @@
        library (DotCL.Runtime.csproj) — inherit this <Version> via MSBuild's automatic
        Directory.Build.props import. Bump the release version HERE only. -->
   <PropertyGroup>
-    <Version>0.1.24</Version>
+    <Version>0.1.25</Version>
+  </PropertyGroup>
+
+  <!-- The build has no compiler warnings, and stays that way: a warning stops it.
+       The point is the noise floor rather than any single warning — a build whose
+       output is all actionable is one people read, and this repo shipped a net8.0
+       compile error precisely because nobody read a wall of 44 warnings.
+
+       Compiler (CS/CA) warnings only. MSBuild and NuGet warnings stay warnings:
+       they report on the environment (a package resolving to a different target
+       framework, say) rather than on this source, and a restore that behaves
+       differently on someone's machine should not be a build failure. -->
+  <PropertyGroup>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <MSBuildTreatWarningsAsErrors>false</MSBuildTreatWarningsAsErrors>
+    <!-- NuGet reads TreatWarningsAsErrors too, so NU* codes are promoted as well
+         — MSBuildTreatWarningsAsErrors does not cover them (setting it either way
+         leaves NU5128 an error; measured). That is mostly what we want: a new
+         packaging warning should stop a release rather than scroll past. These
+         two are the ones this repository has decided are correct as they stand,
+         so they are demoted back to warnings — still printed, not silenced, so a
+         change that makes them mean something again is still visible:
+           NU5128 — the tool package (PackAsTool) has no lib/, while referencing
+                    the multi-targeted DotCL.Runtime puts a dependency group per
+                    target framework in the nuspec. Nothing consumes those groups:
+                    installing a tool does not resolve dependencies, and the
+                    produced nuspec carries none of them either (verified).
+           NU5100 — DotCL.Build.Tasks.dll ships under tasks/ because it is an
+                    MSBuild task the .targets loads by path, not a reference. -->
+    <WarningsNotAsErrors>$(WarningsNotAsErrors);NU5128;NU5100</WarningsNotAsErrors>
+    <!-- CS0649 (field never assigned) is off wherever the emit half is left out:
+         fields only the emitter writes (CilAssembler._currentUnitId,
+         Runtime.SourceLineTable, …) are genuinely unassigned there and the warning
+         is saying nothing about them. That is netstandard2.0, and equally
+         -p:DotclNoEmit=true on any framework, which is how `make
+         test-regression-emitfree` builds. -->
+    <NoWarn Condition="'$(TargetFramework)' == 'netstandard2.0' Or '$(DotclNoEmit)' == 'true'">$(NoWarn);CS0649</NoWarn>
   </PropertyGroup>
 </Project>

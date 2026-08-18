@@ -51,7 +51,9 @@ jobs:
 
       - name: Setup Roswell
         run: |
-          curl -L https://raw.githubusercontent.com/roswell/roswell/master/scripts/install-for-ci.sh | bash
+          if ! command -v ros >/dev/null && [ ! -x "$HOME/.roswell/bin/ros" ]; then
+            curl -L https://raw.githubusercontent.com/roswell/roswell/master/scripts/install-for-ci.sh | bash
+          fi
           echo "$HOME/.roswell/bin" >> $GITHUB_PATH
 
       - name: Cross-compile
@@ -59,6 +61,9 @@ jobs:
 
       - name: Build
         run: make build
+
+      - name: Self-host fixpoint
+        run: make selfhost-check
 
       - name: Compile asdf FASL (required by some regression tests)
         run: make compile-asdf-fasl
@@ -87,6 +92,19 @@ jobs:
       # every push.
       - name: Build emit-free ns2.0 runtime (tripwire)
         run: make build-ns2
+
+      # Assert the emitted CIL is VERIFIABLE, not merely JIT-acceptable: CoreCLR
+      # tolerates a covariant call or an i4 where an i8 is wanted, IL2CPP/WebGL
+      # do not, and a 25-minute AOT build is a terrible place to find out. The
+      # target exists since the emitter was written but nothing ran it, so two
+      # such defects sat in every fasl (a covariant Symbol call in non-top-level
+      # DEFUN, an i4 default radix in DIGIT-CHAR-P) until a real library was put
+      # through it. It now verifies the core, the stress fixture, and asdf.
+      - name: Verify emitted CIL (ilverify)
+        run: |
+          dotnet tool install --global dotnet-ilverify >/dev/null 2>&1 || true
+          export PATH="$PATH:$HOME/.dotnet/tools"
+          make ilverify
 
       - name: ANSI tests
         if: env.RUN_FULL == 'true'

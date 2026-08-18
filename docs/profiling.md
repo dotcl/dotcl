@@ -116,3 +116,24 @@ and in the program, around the region of interest:
 ```
 
 The counters are compiled out unless `DOTCL_ALLOC_PROF=1` is set at startup.
+
+A count says what is being allocated, not who allocates it. To get the callers,
+name one type to sample stacks for:
+
+```
+DOTCL_ALLOC_PROF=1 DOTCL_ALLOC_STACK=LispFunction dotcl run app.lisp
+```
+
+and print them with `(dotcl:alloc-stacks)` (optionally with how many stacks to
+show; default 20):
+
+```
+;; LispFunction: 277 samples (1 per 64 allocations), 6 distinct stacks
+     236  85.2%  LispFunction..ctor < LispFunction.MakeDirectClosure < ... < MY-FUNCTION
+```
+
+Since compiled Lisp functions are .NET methods named after the Lisp function,
+the frames read as Lisp names. Capturing a stack is expensive, so only one type
+is sampled and only every 64th allocation of it; `DOTCL_ALLOC_STACK_EVERY` and
+`DOTCL_ALLOC_STACK_DEPTH` change the interval and how many frames make up a
+stack.

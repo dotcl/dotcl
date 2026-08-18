@@ -13,11 +13,16 @@ namespace DotCL;
 /// Harmony the <see cref="MethodInfo"/> of <see cref="Postfix"/> as the patch;
 /// Harmony discovers and invokes it by reflection at runtime.
 ///
-/// PoC note: this bridge lives in the runtime for now so the advice PoC needs
-/// no C# build step in the contrib. The intended end state is to emit the same
-/// static method from Lisp via `dotnet:define-class` (:static), which does not
-/// exist yet; when it does, this file can be deleted and the contrib becomes
-/// pure Lisp.
+/// PoC note: this bridge lives in the runtime so the advice PoC needs no C#
+/// build step in the contrib. The intended end state is to emit the same static
+/// methods from Lisp via `dotnet:define-class` (:static) and delete this file,
+/// leaving the contrib pure Lisp.
+///
+/// That `:static` now exists, so the condition this note was waiting for has
+/// been met; what remains is the port itself, which has to answer whether a
+/// Lisp-emitted static method can carry a `ref` parameter and keep its
+/// parameter NAMES in metadata — Harmony injects by name. Tracked as an issue
+/// rather than in this comment, so it is on a list someone reads.
 /// </summary>
 public static class MethodAdviceBridge
 {

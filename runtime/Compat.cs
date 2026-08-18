@@ -66,6 +66,7 @@ internal static class Compat
     // --- IDictionary.TryAdd (net5.0+) ---
 
     public static bool TryAdd<TKey, TValue>(this Dictionary<TKey, TValue> dict, TKey key, TValue value)
+        where TKey : notnull
     {
         if (dict.ContainsKey(key)) return false;
         dict.Add(key, value);
@@ -258,6 +259,23 @@ internal static class Compat
         => Environment.TickCount64;
 #endif
 
+    /// <summary>
+    /// Monotonic microseconds since an arbitrary epoch, for GET-INTERNAL-REAL-TIME.
+    /// TickCount64 reports milliseconds but advances at the platform timer
+    /// granularity, which is 15.6 ms on Windows by default -- coarse enough that
+    /// anything under a few milliseconds cannot be timed at all. Stopwatch reads
+    /// the high-resolution counter instead.
+    /// The division is split so the multiply cannot overflow: the remainder is
+    /// below Frequency, so remainder * 1e6 stays well inside Int64 for every
+    /// platform frequency.
+    /// </summary>
+    public static long MonotonicMicroseconds()
+    {
+        long ts = System.Diagnostics.Stopwatch.GetTimestamp();
+        long freq = System.Diagnostics.Stopwatch.Frequency;
+        return (ts / freq) * 1000000L + ((ts % freq) * 1000000L) / freq;
+    }
+
     public static long GetTotalAllocatedBytes(bool precise = false)
 #if NETSTANDARD2_0
         => GC.GetTotalMemory(false);
@@ -267,7 +285,16 @@ internal static class Compat
 
     public static bool TryEnsureSufficientExecutionStack()
 #if NETSTANDARD2_0
-        => true; // ns2.0 lacks the probe; best-effort no-op
+    {
+        // netstandard2.0 has only the throwing form of the probe — the Try*
+        // variant arrived in netstandard2.1 — so the exception IS the false
+        // return. Same check underneath, and the path that runs per call (the
+        // success path) costs the same as the Try form. Returning a constant
+        // true here instead would leave every deep-recursion defence built on
+        // this probe inert in the ns2.0 (embedding) build.
+        try { RuntimeHelpers.EnsureSufficientExecutionStack(); return true; }
+        catch (InsufficientExecutionStackException) { return false; }
+    }
 #else
         => RuntimeHelpers.TryEnsureSufficientExecutionStack();
 #endif
@@ -285,22 +312,18 @@ internal static class Compat
     private const int PadBytes = 16 * 1024;
 
     public static bool TryEnsureSufficientExecutionStackWithMargin()
-#if NETSTANDARD2_0
-        => true;
-#else
         => ProbePadded(PadFrames);
 
     [MethodImpl(MethodImplOptions.NoInlining)]
     private static bool ProbePadded(int depth)
     {
-        if (!RuntimeHelpers.TryEnsureSufficientExecutionStack()) return false;
+        if (!TryEnsureSufficientExecutionStack()) return false;
         if (depth <= 0) return true;
         Span<byte> pad = stackalloc byte[PadBytes];
         pad[0] = 1;
         pad[PadBytes - 1] = 1;
         return ProbePadded(depth - 1);
     }
-#endif
 
     /// <summary>GCCollectionMode.Aggressive is net5.0+; fall back to Forced on ns2.0.</summary>
     public static readonly GCCollectionMode AggressiveGCMode =

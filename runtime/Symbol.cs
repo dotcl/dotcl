@@ -64,12 +64,6 @@ public class Symbol : LispObject
     /// </summary>
     public bool IsInlineProclaimed { get; set; }
 
-    /// <summary>
-    /// Stack of saved dynamic binding values.
-    /// Used by DynamicBindings.Push/Pop for save/restore of Symbol.Value.
-    /// </summary>
-    internal DynamicBindingNode? DynamicSaved;
-
     public Symbol(string name, Package? homePackage = null)
     {
         Name = name;
@@ -90,17 +84,3 @@ public class Symbol : LispObject
     }
 }
 
-/// <summary>
-/// Linked list node for per-symbol dynamic binding save stack.
-/// </summary>
-internal class DynamicBindingNode
-{
-    public LispObject? SavedValue;
-    public DynamicBindingNode? Next;
-
-    public DynamicBindingNode(LispObject? savedValue, DynamicBindingNode? next)
-    {
-        SavedValue = savedValue;
-        Next = next;
-    }
-}

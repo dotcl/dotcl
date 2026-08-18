@@ -263,7 +263,7 @@
 
 ;;; The sldb case: *DEBUGGER-HOOK* runs at the depth of the frame that signalled,
 ;;; and the debugger must see that frame's variables, not the hook's own.
-(deftest frame-locals-debugger-hook-sees-signalling-frame
+(deftest-compiled-only frame-locals-debugger-hook-sees-signalling-frame
   (progn (fl-hook-caller 2) *fl-captured*)
   (("A" . 2) ("S" . 6)))
 

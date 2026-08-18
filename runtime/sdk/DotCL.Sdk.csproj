@@ -17,7 +17,10 @@
     <!-- No AssemblyInfo / TFM attribute source to compile; this project ships no
          assembly. Silences NU5128 (no lib/ref for the TFM). -->
     <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
-    <NoWarn>$(NoWarn);NU5128</NoWarn>
+    <!-- CS2008 for the same reason: with no compile items, csc is invoked with
+         nothing to compile. Directory.Build.props makes compiler warnings errors,
+         and this one is a property of the project being content-only. -->
+    <NoWarn>$(NoWarn);NU5128;CS2008</NoWarn>
 
     <PackageId>DotCL.Sdk</PackageId>
     <PackageType>MSBuildSdk</PackageType>

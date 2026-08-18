@@ -153,7 +153,8 @@ public static class DynamicBindings
         for (int i = 0; i < syms.Count; i++)
         {
             if (syms[i] is not Symbol sym)
-                throw new LispErrorException(new LispError($"PROGV: not a symbol: {syms[i]}"));
+                throw new LispErrorException(new LispTypeError(
+                    $"PROGV: not a symbol: {syms[i]}", syms[i], Startup.Sym("SYMBOL")));
             var val = i < vals.Count ? vals[i] : Unbound;
             Push(sym, val);
         }

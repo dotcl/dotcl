@@ -259,7 +259,7 @@ public static partial class Runtime
         }
         else
         {
-            TextReader reader = GetTextReader(stream);
+            TextReader reader = GetReaderTextReader(stream);
             lispReader = new Reader(reader) { LispStreamRef = stream };
             if (stream is LispStream ls3)
             {
@@ -274,27 +274,20 @@ public static partial class Runtime
             lispReader.UnreadChar(ls.UnreadCharValue);
             ls.UnreadCharValue = -1;
         }
-        try
+        if (lispReader.TryRead(out var result))
         {
-            if (lispReader.TryRead(out var result))
-            {
-                // CLHS: read (not read-preserving-whitespace) consumes
-                // one trailing whitespace character after a token
-                if (lispReader.WhitespaceTerminated)
-                    lispReader.ConsumeOneWhitespace();
-                return result;
-            }
-            // EOF
-            if (eofErrorP is not Nil)
-                { var eof = new LispError("READ: end of file"); eof.ConditionTypeName = "END-OF-FILE"; eof.StreamErrorStreamRef = stream; throw new LispErrorException(eof); }
-            return eofValue;
+            // CLHS: read (not read-preserving-whitespace) consumes
+            // one trailing whitespace character after a token
+            if (lispReader.WhitespaceTerminated)
+                lispReader.ConsumeOneWhitespace();
+            return result;
         }
-        catch (EndOfStreamException)
-        {
-            if (eofErrorP is not Nil)
-                throw;
-            return eofValue;
-        }
+        // EOF before any form began: this is the one eof-error-p governs. An end
+        // of file in the middle of an object signals END-OF-FILE from the reader
+        // itself and passes through here regardless (CLHS READ).
+        if (eofErrorP is not Nil)
+            { var eof = new LispError("READ: end of file"); eof.ConditionTypeName = "END-OF-FILE"; eof.StreamErrorStreamRef = stream; throw new LispErrorException(eof); }
+        return eofValue;
     }
 
     public static LispObject ReadFromString(LispObject[] args)
@@ -611,6 +604,15 @@ public static partial class Runtime
                 var path = Path.GetFullPath(Path.Combine(dir, name, name + ext));
                 if (File.Exists(path))
                 {
+                    // Another implementation's fasl sitting where ours would be:
+                    // warn and fall through to the .sil / .lisp candidate instead of
+                    // failing the whole (require ...) on a file we cannot read.
+                    if (IsForeignFasl(path))
+                    {
+                        Console.Error.WriteLine(
+                            $";; warning: ignoring {path}: not a dotcl fasl (foreign Lisp fasl?)");
+                        continue;
+                    }
                     // The quicklisp client reads asdf: symbols (client.lisp,
                     // dist.lisp, misc.lisp, setup.lisp). Loading its fasl with
                     // asdf absent does not fail here — the references are
@@ -630,6 +632,7 @@ public static partial class Runtime
                         PatchUiopWindowsPath();
                         RegisterContribWithAsdf(searchDirs.ToArray());
                         InstallAsdfModuleProvider();
+                        UseAsdfSourceLoadingWithoutCompiler();
                     }
                     return T.Instance;
                 }
@@ -795,6 +798,38 @@ public static partial class Runtime
         catch { /* ignore if ASDF symbols not yet available */ }
     }
 
+    /// <summary>
+    /// On a build with no compiler (netstandard2.0 / wasm / -p:DotclNoEmit=true),
+    /// make ASDF's LOAD-SYSTEM run LOAD-SOURCE-OP instead of LOAD-OP. LOAD-OP
+    /// COMPILE-FILEs every component, so (require "some-system") and every
+    /// asdf:load-system died on "COMPILE-FILE requires System.Reflection.Emit":
+    /// the whole ASDF world was unreachable on those builds, not merely slower.
+    /// LOAD-SOURCE-OP is ASDF's own operation for loading a system as source and
+    /// needs nothing but LOAD. ASDF hardcodes 'LOAD-OP inside LOAD-SYSTEM (this
+    /// generation has no *LOAD-SYSTEM-OPERATION* to set), so the redirection has
+    /// to replace the function. Builds that have a compiler are untouched.
+    /// </summary>
+    private static void UseAsdfSourceLoadingWithoutCompiler()
+    {
+        const string form = @"
+(unless (find :dotcl-emit *features*)
+  (let ((ls (find-symbol ""LOAD-SYSTEM"" ""ASDF""))
+        (op (find-symbol ""OPERATE"" ""ASDF""))
+        (src (find-symbol ""LOAD-SOURCE-OP"" ""ASDF"")))
+    (when (and ls op src (fboundp op))
+      (setf (fdefinition ls)
+            (lambda (system &rest keys)
+              (apply (fdefinition op) src system keys)
+              t)))))";
+        try
+        {
+            var read = MultipleValues.Primary(
+                Runtime.ReadFromString(new LispObject[] { new LispString(form) }));
+            Runtime.Eval(read);
+        }
+        catch { /* ignore if ASDF symbols not yet available */ }
+    }
+
     // --- Load ---
 
     /// <summary>
@@ -951,13 +986,24 @@ public static partial class Runtime
             finally { WhitelistLoadedDefinitionsForCompileFile(); }
         }
 
+        if (IsForeignFasl(filePath))
+            throw FaslFileError(
+                $"LOAD: not a dotcl fasl (foreign Lisp fasl?): {filePath}", filespec);
+
         var source = File.ReadAllText(filePath);
         var loadStringReader = new StringReader(source);
-        var reader2 = new Reader(loadStringReader);
+        // Position-tracking, like CompileFile below. Without it FILE-POSITION on
+        // the stream LOAD hands to a reader macro answers NIL, and a reader macro
+        // that records source locations (eclector, and so coalton, whose reader
+        // macro runs its whole front end) does arithmetic on that NIL. Reading the
+        // very same file with COMPILE-FILE or WITH-OPEN-FILE reports a position,
+        // so the failure looked like it belonged to the library.
+        var loadTrackingReader = new PositionTrackingReader(loadStringReader);
+        var reader2 = new Reader(loadTrackingReader);
         // Same live-reader/share-table link as CompileFile: a Lisp reader macro
         // reading elements via (read stream) must reuse THIS reader so per-form
         // share-table clearing doesn't run per element (see CompileFile).
-        var loadStream = new LispInputStream(loadStringReader);
+        var loadStream = new LispStringInputStream(loadTrackingReader, 0, source, source.Length);
         reader2.LispStreamRef = loadStream;
         loadStream.CachedReader = reader2;
         reader2.AdoptStreamShareTables(loadStream);
@@ -1067,6 +1113,24 @@ public static partial class Runtime
         catch { return false; }
     }
 
+    /// <summary>A .fasl that is not a PE image belongs to some other Lisp: the
+    /// extension is shared across implementations and their files turn up in
+    /// quicklisp dists and bundle directories. dotcl fasls are always .NET
+    /// assemblies, so treat this as "foreign fasl" rather than reading the
+    /// binary as source text (which reports a reader error about whatever byte
+    /// came first).</summary>
+    private static bool IsForeignFasl(string filePath) =>
+        string.Equals(Path.GetExtension(filePath), ".fasl", StringComparison.OrdinalIgnoreCase)
+        && !IsPeAssembly(filePath);
+
+    private static LispErrorException FaslFileError(string message, LispObject filespec)
+    {
+        var err = new LispError(message);
+        err.ConditionTypeName = "FILE-ERROR";
+        err.FileErrorPathnameRef = filespec;
+        return new LispErrorException(err);
+    }
+
     /// <summary>Load a .fasl (persisted .NET assembly) file.</summary>
     private static LispObject LoadFasl(string filePath, LispObject filespec,
         bool isVerbose, bool isPrint)
@@ -1103,41 +1167,58 @@ public static partial class Runtime
             var faslFull = Path.GetFullPath(filePath);
             var pdbPath = Path.ChangeExtension(faslFull, ".pdb");
             System.Reflection.Assembly asm;
-            if (Environment.GetEnvironmentVariable("DOTCL_FASL_LOADFROM") == "1")
+            try
             {
-                // Load by path so the module is file-backed. A coverage profiler
-                // picks its targets per loaded module and skips anything without a
-                // Location, so an assembly loaded from bytes is invisible to it —
-                // which is the whole reason this switch exists: with it set, an
-                // off-the-shelf .NET coverage collector reports line coverage
-                // against the .lisp itself, out of the PDB's document table.
-                //
-                // Not the default, because loading by path holds the file open and
-                // caches the assembly against that path: recompiling a fasl and
-                // LOADing it again in the same session would fail to write on
-                // Windows, and elsewhere would return the assembly already loaded.
-                // A coverage run does not do that — it is one process that compiles,
-                // loads, runs and exits — so the switch costs it nothing.
-                asm = System.Reflection.Assembly.LoadFrom(faslFull);
-            }
-            else
-            {
-                var faslBytes = File.ReadAllBytes(faslFull);
-                if (File.Exists(pdbPath))
+                if (Environment.GetEnvironmentVariable("DOTCL_FASL_LOADFROM") == "1")
                 {
-                    try { asm = System.Reflection.Assembly.Load(faslBytes, File.ReadAllBytes(pdbPath)); }
-                    catch { asm = System.Reflection.Assembly.Load(faslBytes); } // mismatched/locked pdb
+                    // Load by path so the module is file-backed. A coverage profiler
+                    // picks its targets per loaded module and skips anything without a
+                    // Location, so an assembly loaded from bytes is invisible to it —
+                    // which is the whole reason this switch exists: with it set, an
+                    // off-the-shelf .NET coverage collector reports line coverage
+                    // against the .lisp itself, out of the PDB's document table.
+                    //
+                    // Not the default, because loading by path holds the file open and
+                    // caches the assembly against that path: recompiling a fasl and
+                    // LOADing it again in the same session would fail to write on
+                    // Windows, and elsewhere would return the assembly already loaded.
+                    // A coverage run does not do that — it is one process that compiles,
+                    // loads, runs and exits — so the switch costs it nothing.
+                    asm = System.Reflection.Assembly.LoadFrom(faslFull);
                 }
                 else
                 {
-                    asm = System.Reflection.Assembly.Load(faslBytes);
+                    var faslBytes = File.ReadAllBytes(faslFull);
+                    if (File.Exists(pdbPath))
+                    {
+                        try { asm = System.Reflection.Assembly.Load(faslBytes, File.ReadAllBytes(pdbPath)); }
+                        catch { asm = System.Reflection.Assembly.Load(faslBytes); } // mismatched/locked pdb
+                    }
+                    else
+                    {
+                        asm = System.Reflection.Assembly.Load(faslBytes);
+                    }
                 }
             }
+            catch (BadImageFormatException)
+            {
+                // PE header but not managed IL (a native DLL, or a corrupt file).
+                // Left alone this reaches the user as a bare "Bad IL format."
+                throw FaslFileError(
+                    $"LOAD: not a dotcl fasl (not a .NET assembly): {filePath}", filespec);
+            }
             WarnOnStaleFaslGeneration(asm, faslFull);
+            // A PE file that is not a dotcl fasl: a plain .NET library, or another
+            // implementation's fasl that happens to be an assembly. Report it as a
+            // FILE-ERROR carrying the pathname, not as the raw reflection failure.
             var moduleType = asm.GetType("CompiledModule")
-                ?? throw new Exception($"LOAD: .fasl has no CompiledModule type: {filePath}");
+                ?? throw FaslFileError(
+                    $"LOAD: not a dotcl fasl (.NET assembly without a CompiledModule type): {filePath}",
+                    filespec);
             var initMethod = moduleType.GetMethod("ModuleInit")
-                ?? throw new Exception($"LOAD: .fasl has no ModuleInit method: {filePath}");
+                ?? throw FaslFileError(
+                    $"LOAD: not a dotcl fasl (CompiledModule has no ModuleInit method): {filePath}",
+                    filespec);
             try
             {
                 var result = (LispObject?)initMethod.Invoke(null, null) ?? Nil.Instance;
@@ -1204,6 +1285,44 @@ public static partial class Runtime
                     body = bodyCell.Cdr;
                 }
                 yield break;
+            }
+            // Per CLHS 3.2.3.1, the body of a top level LOCALLY is likewise
+            // processed as top level forms, with the declarations still in
+            // effect — so each body form is re-wrapped in its own LOCALLY.
+            // The Lisp side already agrees (compile-locally keeps
+            // *at-toplevel*); only this flattener did not, so a file whose
+            // definitions sit inside one top level LOCALLY compiled its whole
+            // body into a single _toplevel_N method. A library that emits a few
+            // hundred definitions that way reached multi-MB of IL in one method,
+            // and JITting it at load cost gigabytes of RSS.
+            if (sym.Name == "LOCALLY" && c.Cdr is Cons lrest)
+            {
+                var decls = new List<LispObject>();
+                LispObject lbody = lrest;
+                while (lbody is Cons rc && rc.Car is Cons dc
+                       && dc.Car is Symbol dsym && dsym.Name == "DECLARE")
+                {
+                    decls.Add(rc.Car);
+                    lbody = rc.Cdr;
+                }
+                int bodyCount = 0;
+                for (var t = lbody; t is Cons tc; t = tc.Cdr) bodyCount++;
+                // One body form is already one method; splitting it would only
+                // add a wrapper. Zero means the LOCALLY is declarations only.
+                if (bodyCount > 1)
+                {
+                    for (var t = lbody; t is Cons tc; t = tc.Cdr)
+                    {
+                        foreach (var sub in FlattenTopLevel(tc.Car))
+                        {
+                            LispObject wrapped = new Cons(sub, Nil.Instance);
+                            for (int i = decls.Count - 1; i >= 0; i--)
+                                wrapped = new Cons(decls[i], wrapped);
+                            yield return new Cons(sym, wrapped);
+                        }
+                    }
+                    yield break;
+                }
             }
             // Per CLHS 3.2.3.1: "If a top level form is a macro form,
             // the macro form is expanded and the result is processed as a top level form."
@@ -3440,7 +3559,7 @@ public static partial class Runtime
         if (DynamicBindings.TryGet(_gensymCounterSym, out var dv))
             v = dv;
         else if (_gensymCounterSym != null && _gensymCounterSym.IsBound)
-            v = _gensymCounterSym.Value;
+            v = _gensymCounterSym.Value!;   // IsBound is exactly Value != null
         else
             return; // unbound = OK, GetGensymCounter returns 0
         bool valid = (v is Fixnum fx && fx.Value >= 0) || (v is Bignum bx && bx.Value >= 0);
@@ -4608,6 +4727,32 @@ public static partial class Runtime
                 return args[0];
             }, "%SET-FUNCTION-NAME", 2));
 
+        // %SET-FN-INTERP-INFO fn info -> fn / %FN-INTERP-INFO fn -> info or NIL
+        // The tree-walk evaluator's trampoline: see LispFunction.InterpInfo.
+        Emitter.CilAssembler.RegisterFunction("%SET-FN-INTERP-INFO",
+            new LispFunction(args => {
+                Runtime.CheckArityExact("%SET-FN-INTERP-INFO", args, 2);
+                if (args[0] is LispFunction fn) fn.InterpInfo = args[1];
+                return args[0];
+            }, "%SET-FN-INTERP-INFO", 2));
+        Emitter.CilAssembler.RegisterFunction("%FN-INTERP-INFO",
+            new LispFunction(args => {
+                Runtime.CheckArityExact("%FN-INTERP-INFO", args, 1);
+                return args[0] is LispFunction fn ? fn.InterpInfo ?? Nil.Instance : Nil.Instance;
+            }, "%FN-INTERP-INFO", 1));
+
+        // %SET-FUNCTION-ARITY fn n -> fn
+        // Records how many required parameters the user's lambda list has, which
+        // the interpreter's uniformly variadic closures otherwise lose. Compiled
+        // code passes the same count (:param-count = number of required
+        // parameters) when it emits the function, so the two evaluators agree.
+        Emitter.CilAssembler.RegisterFunction("%SET-FUNCTION-ARITY",
+            new LispFunction(args => {
+                Runtime.CheckArityExact("%SET-FUNCTION-ARITY", args, 2);
+                if (args[0] is LispFunction fn && args[1] is Fixnum n) fn.Arity = (int)n.Value;
+                return args[0];
+            }, "%SET-FUNCTION-ARITY", 2));
+
         // SYMBOL-FUNCTION, FDEFINITION, %SET-FDEFINITION, FMAKUNBOUND, MAKUNBOUND
         // SYMBOL-FUNCTION only accepts symbols (unlike FDEFINITION which also takes (setf sym))
         Startup.RegisterUnary("SYMBOL-FUNCTION", Runtime.SymbolFunction);
@@ -4827,10 +4972,35 @@ public static partial class Runtime
         Emitter.CilAssembler.RegisterFunction("MACROEXPAND-1",
             new LispFunction(args => {
                 if (args.Length < 1 || args.Length > 2) throw new LispErrorException(new LispProgramError($"MACROEXPAND-1: wrong number of arguments: {args.Length} (expected 1-2)"));
+                var form0 = args[0];
+                var expanded0 = MacroexpandOnceOrSelf(form0, args.Length > 1 ? args[1] : Nil.Instance);
+                return ReferenceEquals(expanded0, form0)
+                    ? MultipleValues.Values(form0, Nil.Instance)
+                    : MultipleValues.Values(expanded0, T.Instance);
+            }, "MACROEXPAND-1", -1));
+
+        // Single-value MACROEXPAND-1: the expansion, or FORM itself when it does
+        // not expand. Equivalent because the two-value version already decides
+        // "expanded" by ReferenceEquals against the input -- a macro returning its
+        // own form counts as unexpanded there too.
+        //
+        // The tree-walk evaluator calls this on every compound form it sees, and
+        // returning two values allocates about 96 B each time, which was 46% of what
+        // evaluating (QUOTE A) allocated. Nothing else about the expansion differs.
+        Emitter.CilAssembler.RegisterFunction("%MACROEXPAND-1-OR-SELF",
+            new LispFunction(args => {
+                if (args.Length < 1 || args.Length > 2) throw new LispErrorException(new LispProgramError($"%MACROEXPAND-1-OR-SELF: wrong number of arguments: {args.Length} (expected 1-2)"));
+                return MacroexpandOnceOrSelf(args[0], args.Length > 1 ? args[1] : Nil.Instance);
+            }, "%MACROEXPAND-1-OR-SELF", -1));
+
+        // One macro / symbol-macro expansion step. Returns the expansion, or FORM
+        // itself when there is nothing to expand. Shared by MACROEXPAND-1 (which
+        // derives its second value from the identity test) and
+        // %MACROEXPAND-1-OR-SELF.
+        static LispObject MacroexpandOnceOrSelf(LispObject form, LispObject env)
+        {
                 if (!Compat.TryEnsureSufficientExecutionStack())
-                    return MultipleValues.Values(args[0], Nil.Instance); // bail out: return unexpanded
-                var form = args[0];
-                var env = args.Length > 1 ? args[1] : Nil.Instance;
+                    return form; // bail out: return unexpanded
                 // Extract macro table and symbol-macro table from env
                 // env can be: LispHashTable (macros only), Cons (macros-ht . symbol-macros-ht), or Nil
                 LispHashTable? macroHt = null;
@@ -4848,11 +5018,11 @@ public static partial class Runtime
                     {
                         var key = new LispString(symForm.Name);
                         if (symMacroHt.TryGet(key, out var expansion))
-                            return MultipleValues.Values(expansion, T.Instance);
+                            return expansion;
                     }
                     // Check global symbol macros (DEFINE-SYMBOL-MACRO)
                     if (Runtime.TryGetGlobalSymbolMacro(symForm, out var gsmExpansion))
-                        return MultipleValues.Values(gsmExpansion, T.Instance);
+                        return gsmExpansion;
                 }
                 // Macro expansion: form is a cons
                 if (form is Cons cons && cons.Car is Symbol sym)
@@ -4864,8 +5034,8 @@ public static partial class Runtime
                         {
                             var expanded = CallExpander(fn, false, form, env);
                             if (ReferenceEquals(expanded, form))
-                                return MultipleValues.Values(form, Nil.Instance);
-                            return MultipleValues.Values(expanded, T.Instance);
+                                return form;
+                            return expanded;
                         }
                     }
                     var runtimeMacroFn = Runtime.MacroFunction(sym);
@@ -4877,20 +5047,20 @@ public static partial class Runtime
                         // Returning T for expanded-p would cause infinite recursion in
                         // estimate-code-size-1 (loop.lisp). Treat as unexpanded.
                         if (ReferenceEquals(expanded, form))
-                            return MultipleValues.Values(form, Nil.Instance);
-                        return MultipleValues.Values(expanded, T.Instance);
+                            return form;
+                        return expanded;
                     }
                     var compilerFn = Startup.LookupCompilerMacro(sym);
                     if (compilerFn != null)
                     {
                         var expanded = CallExpander(compilerFn, false, form, env);
                         if (ReferenceEquals(expanded, form))
-                            return MultipleValues.Values(form, Nil.Instance);
-                        return MultipleValues.Values(expanded, T.Instance);
+                            return form;
+                        return expanded;
                     }
                 }
-                return MultipleValues.Values(form, Nil.Instance);
-            }, "MACROEXPAND-1", -1));
+                return form;
+        }
 
         // %CALL-WITH-HANDLER-CLUSTER — handler-bind primitive for the emit-free
         // tree-walk interpreter (%mini-eval). (alist thunk) -> establishes the
@@ -5044,8 +5214,10 @@ public static partial class Runtime
             new LispFunction(args => Runtime.Load(args)));
 
         // Stubs: BREAK, Y-OR-N-P, YES-OR-NO-P
-        Emitter.CilAssembler.RegisterFunction("BREAK",
-            new LispFunction(args => Nil.Instance, "BREAK", -1));
+        // BREAK lives in Runtime.RegisterConditionsBuiltins, which runs later and
+        // owns it. The stub that used to sit here (args => NIL) was dead code:
+        // had the call order ever changed, BREAK would have quietly stopped
+        // entering the debugger.
         Emitter.CilAssembler.RegisterFunction("Y-OR-N-P",
             new LispFunction(args => T.Instance, "Y-OR-N-P", -1));
         Emitter.CilAssembler.RegisterFunction("YES-OR-NO-P",
@@ -5069,7 +5241,6 @@ public static partial class Runtime
                 var obj = args[0];
                 bool slotNamesSupplied = false;
                 LispObject slotNamesList = Nil.Instance;
-                bool allowOtherKeysFound = false;
                 bool allowOtherKeys = false;
                 for (int i = 1; i < args.Length; i += 2)
                 {
@@ -5090,7 +5261,6 @@ public static partial class Runtime
                         }
                         else if (keySym.Name == "ALLOW-OTHER-KEYS")
                         {
-                            allowOtherKeysFound = true;
                             if (i + 1 < args.Length)
                                 allowOtherKeys = args[i + 1] != Nil.Instance;
                         }
@@ -5369,11 +5539,12 @@ public static partial class Runtime
         }));
         Emitter.CilAssembler.RegisterFunction("GET-INTERNAL-RUN-TIME", new LispFunction(_ => {
             if (_.Length != 0) throw new LispErrorException(new LispProgramError("GET-INTERNAL-RUN-TIME: wrong number of arguments: " + _.Length + " (expected 0)"));
-            return Fixnum.Make(System.Diagnostics.Process.GetCurrentProcess().TotalProcessorTime.Ticks);
+            // TimeSpan ticks are 100 ns; internal time units are microseconds.
+            return Fixnum.Make(System.Diagnostics.Process.GetCurrentProcess().TotalProcessorTime.Ticks / 10L);
         }));
         Emitter.CilAssembler.RegisterFunction("GET-INTERNAL-REAL-TIME", new LispFunction(_ => {
             if (_.Length != 0) throw new LispErrorException(new LispProgramError("GET-INTERNAL-REAL-TIME: wrong number of arguments: " + _.Length + " (expected 0)"));
-            return Fixnum.Make(Compat.TickCount64());
+            return Fixnum.Make(Compat.MonotonicMicroseconds());
         }));
         Startup.RegisterUnary("SLEEP", obj => {
             double secs = Arithmetic.ToDouble(Runtime.AsNumber(obj));

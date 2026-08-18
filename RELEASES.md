@@ -3,6 +3,106 @@
 User-facing release notes for dotcl. Each section corresponds to a tagged
 release on the public mirror (dotcl/dotcl).
 
+## v0.1.25 -- 2026-08-18
+
+Where 0.1.24 made the interpreter *correct*, this release makes it usable: deep
+recursion no longer takes the process down, `eval` on a build without a code
+generator is roughly twice as fast and does proper tail calls, and ASDF works
+there. Alongside that, a long list of operations that used to fail with a raw
+.NET exception now signal the Common Lisp condition the standard asks for.
+
+### Deep recursion no longer kills the process
+
+Several shapes of deep recursion terminated the whole process instead of
+signalling. All of them now unwind and signal a `storage-condition` you can
+handle:
+
+- `invoke-restart` crossing deeply nested `restart-case`,
+- `go` / `return-from` crossing deeply nested `tagbody` / `block`,
+- `throw` leaving a deep interpreted recursion,
+- a `handler-case` at every level of a deep recursion,
+- a deep recursion with a .NET interop callback in the middle,
+- `append` on a long list, which recursed per element.
+
+The `netstandard2.0` runtime also got a real stack-space probe; it previously
+answered "yes, there is room" unconditionally.
+
+### Errors say what they are
+
+Operations that used to surface a raw .NET exception, or a bare `simple-error`,
+now signal the condition the standard specifies — so `handler-case` clauses for
+`type-error`, `end-of-file` and friends actually fire:
+
+- array index and dimension arguments, `(setf (aref ...))` bounds, `char`,
+  `row-major-aref`, `(setf fill-pointer)`,
+- `make-hash-table` with an invalid `:test` or `:weakness`,
+- a print base outside 2-36,
+- the real-only arithmetic functions and the readtable API,
+- `compile-file` on a build with no code generator,
+- loading a foreign `.fasl` (an SBCL fasl, say),
+- end of file in the middle of a form, which now signals `end-of-file`,
+- `logical-pathname` and `logical-pathname-translations` on an undefined host.
+
+### Printing and reading round-trip
+
+- Infinity and NaN print in a form the reader accepts.
+- `nil` and `t` print with their package prefix where the current package does
+  not inherit them.
+- `read-delimited-list` reads recursively, so reader macros inside the list work.
+- `read` and `read-preserving-whitespace` echo to an echo stream.
+
+### Running without run-time code generation
+
+The tree-walk interpreter, which is the only evaluator on AOT / IL2CPP / WebGL
+builds:
+
+- **Self tail calls are now proper tail calls.** A tail-recursive interpreted
+  function runs in constant stack.
+- **About twice as fast.** An empty `dotimes` iteration went from 11.4 us to
+  5.2 us; `tak` from 1118 ms to 871 ms, and its allocation from 415 MB to 189 MB.
+  `go` no longer throws a .NET exception per jump.
+- **ASDF loads there.** Previously `require`-ing it on a build without a compiler
+  failed outright.
+- An interpreted closure keeps its required-argument count, so .NET generics that
+  inspect it — LINQ's `Select`, for instance — resolve.
+- `(defclass ... (:metaclass ...))` no longer calls an undefined function.
+
+### Quicklisp on a fresh machine
+
+`(ql:quickload ...)` on a Quicklisp home with no dist installs one first, instead
+of reporting the system as not found. `(require "quicklisp")` still touches no
+network; the fetch happens when you ask for a library. `(ql:setup)` still works if
+you would rather do it up front.
+
+### CLOS and the MOP answer truthfully
+
+A group of MOP accessors returned a plausible-looking constant rather than the
+real value. `class-direct-subclasses` (always `nil`), the `slot-definition`
+readers / writers / type, `method-generic-function` and `method-lambda-list` now
+report what the metaobject actually holds, which is what an inspector or a
+portable MOP library reads.
+
+`defclass` also validates its slot options instead of accepting a malformed one
+silently.
+
+### Also
+
+- `get-internal-real-time` resolves microseconds. The clock underneath it ticked
+  in 15.6 ms steps, so nothing shorter than that was measurable;
+  `internal-time-units-per-second` is 1,000,000 now rather than 1,000, which is
+  why the standard has you read the unit from the constant.
+- A function that shadows a Common Lisp name is now callable unqualified from
+  inside its own package.
+- Generic extension methods resolve through an explicit delegate and through
+  `dotnet:static`.
+- `print-object` on a `(:include ...)` struct uses the parent's method.
+- Macros compile to less code. A backquote template used to build its result one
+  element at a time and glue the pieces with `append`; a run of elements is now a
+  single `list` (or `list*` before a dotted tail), and a template with no unquotes
+  is a literal — which is what it should have been, and what it is elsewhere.
+  A string literal in a `.fasl` is likewise built once rather than on every
+  evaluation.
+
 ## v0.1.24 -- 2026-08-11
 
 Where dotcl cannot generate code at run time -- in the browser, under NativeAOT,

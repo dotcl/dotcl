@@ -119,7 +119,6 @@ public static class Debugger
                         Console.WriteLine(Runtime.FormatTop(result, true));
                     }
                 }
-                catch (EndOfStreamException) { }
                 catch (Exception ex)
                 {
                     Console.Error.WriteLine($"; Error: {ex.Message}");

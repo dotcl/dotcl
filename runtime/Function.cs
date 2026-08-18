@@ -38,7 +38,24 @@ public class LispFunction : LispObject
                          name.StartsWith("%CALL-WITH-", StringComparison.Ordinal))
             ? null : name;
 
-    public int Arity { get; }
+    // Number of REQUIRED parameters, or -1 when unknown. Settable for the same
+    // reason Name is: compiled code fixes it at emit time, but the tree-walk
+    // evaluator builds every closure as one variadic (&rest args) lambda, so
+    // without a way to record the user's own lambda list every interpreted
+    // function claimed zero required parameters. Overload selection for a .NET
+    // delegate parameter reads this, and a Lisp lambda passed to Enumerable.Select
+    // matched neither overload. Set through %SET-FUNCTION-ARITY right after
+    // construction; nothing else mutates it.
+    public int Arity { get; internal set; }
+    // What the tree-walk evaluator needs to run this function's BODY without
+    // calling the function: its lambda list, captured environment, special
+    // parameters and body continuation. Only interpreted closures carry it, and
+    // only their trampoline reads it — a tail call whose callee has this can be
+    // continued in the caller's own loop instead of on a new .NET frame, which is
+    // what makes interpreted tail recursion run in constant stack. Null for
+    // everything else, so the trampoline falls back to an ordinary call.
+    public LispObject? InterpInfo { get; internal set; }
+
     public Func<LispObject[], LispObject> RawFunction => _func;
     public object[]? Environment { get; internal set; }
     // Debug: SIL body stored when dotcl:*save-sil* is true at defun time

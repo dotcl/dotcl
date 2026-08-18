@@ -462,6 +462,148 @@ public static partial class Runtime
     /// (no back-link is maintained, so we scan).</summary>
     public static IEnumerable<LispClass> AllClasses() => _classRegistry.Values;
 
+    /// <summary>The classes that name C as a direct superclass, as a list.
+    /// Not maintained as a back-link; scanning the registry is cheap enough for
+    /// occasional MOP introspection. Shared by CL:CLASS-DIRECT-SUBCLASSES and
+    /// DOTCL-MOP:CLASS-DIRECT-SUBCLASSES so the two cannot drift apart — the
+    /// argument check lives here for the same reason: with it at the call sites,
+    /// one returned NIL for a non-class and the other signalled, and which one
+    /// answered depended on the platform's registration order.</summary>
+    /// <summary>The class argument of a MOP class accessor. AMOP (and SBCL) make a
+    /// non-class here a type error; the DOTCL-MOP registrations used to return NIL
+    /// instead, so the answer depended on which of the two same-named functions the
+    /// caller reached.</summary>
+    private static LispClass RequireClass(string who, LispObject arg)
+        => arg as LispClass ?? throw new LispErrorException(new LispTypeError(
+            $"{who}: not a class", arg, Startup.Sym("CLASS")));
+
+    private static LispObject ToLispList(LispObject[]? items)
+    {
+        LispObject result = Nil.Instance;
+        if (items != null)
+            for (int i = items.Length - 1; i >= 0; i--)
+                result = new Cons(items[i], result);
+        return result;
+    }
+
+    public static LispObject ClassDirectSlots(LispObject arg)
+        => ToLispList(RequireClass("CLASS-DIRECT-SLOTS", arg).DirectSlots);
+
+    public static LispObject ClassSlots(LispObject arg)
+        => ToLispList(RequireClass("CLASS-SLOTS", arg).EffectiveSlots);
+
+    public static LispObject ClassDirectSuperclasses(LispObject arg)
+        => ToLispList(RequireClass("CLASS-DIRECT-SUPERCLASSES", arg).DirectSuperclasses);
+
+    /// <summary>The CPL, falling back to (C) for a class whose list has not been
+    /// computed — without that, DOTCL-MOP's version dereferenced a null array.</summary>
+    public static LispObject ClassPrecedenceListOf(LispObject arg)
+    {
+        var c = RequireClass("CLASS-PRECEDENCE-LIST", arg);
+        var cpl = c.ClassPrecedenceList;
+        if (cpl == null || cpl.Length == 0) return new Cons(c, Nil.Instance);
+        return ToLispList(cpl);
+    }
+
+    /// <summary>dotcl finalizes eagerly during DEFCLASS, so every class that exists
+    /// is finalized — except a forward-referenced one, which by definition is not.
+    /// The CL-side registration answered T even for those.</summary>
+    public static LispObject ClassFinalizedP(LispObject arg)
+        => RequireClass("CLASS-FINALIZED-P", arg).IsForwardReferenced ? Nil.Instance : T.Instance;
+
+    /// <summary>The memoized prototype instance (stable identity, which EQL-method
+    /// dispatch on a prototype depends on). Built-in classes have no instance to
+    /// hand out.</summary>
+    public static LispObject ClassPrototypeOf(LispObject arg)
+    {
+        var c = RequireClass("CLASS-PROTOTYPE", arg);
+        if (c.IsBuiltIn)
+            throw new LispErrorException(new LispError(
+                "CLASS-PROTOTYPE: cannot create prototype for built-in class"));
+        return c.Prototype;
+    }
+
+    private static GenericFunction RequireGf(string who, LispObject arg)
+        => arg as GenericFunction ?? throw new LispErrorException(new LispTypeError(
+            $"{who}: not a generic function", arg, Startup.Sym("GENERIC-FUNCTION")));
+
+    public static LispObject GenericFunctionMethods(LispObject arg)
+        => ToLispList(RequireGf("GENERIC-FUNCTION-METHODS", arg).Methods.ToArray());
+
+    public static LispObject GenericFunctionName(LispObject arg)
+        => RequireGf("GENERIC-FUNCTION-NAME", arg).Name;
+
+    private static SlotDefinition RequireSlotDef(string who, LispObject arg)
+        => arg as SlotDefinition ?? throw new LispErrorException(new LispTypeError(
+            $"{who}: not a slot definition", arg, Startup.Sym("SLOT-DEFINITION")));
+
+    public static LispObject SlotDefinitionName(LispObject arg)
+        => RequireSlotDef("SLOT-DEFINITION-NAME", arg).Name;
+
+    public static LispObject SlotDefinitionInitargs(LispObject arg)
+        => ToLispList(RequireSlotDef("SLOT-DEFINITION-INITARGS", arg).Initargs);
+
+    public static LispObject SlotDefinitionInitfunction(LispObject arg)
+    {
+        var sd = RequireSlotDef("SLOT-DEFINITION-INITFUNCTION", arg);
+        return sd.InitformThunk is { } f ? f : Nil.Instance;
+    }
+
+    public static LispObject SlotDefinitionAllocation(LispObject arg)
+        => Startup.Keyword(RequireSlotDef("SLOT-DEFINITION-ALLOCATION", arg).IsClassAllocation
+            ? "CLASS" : "INSTANCE");
+
+    /// <summary>The declared :type, T when the slot did not name one.</summary>
+    public static LispObject SlotDefinitionType(LispObject arg)
+        => RequireSlotDef("SLOT-DEFINITION-TYPE", arg).SlotType;
+
+    /// <summary>The :initform as source, NIL when the slot has none.</summary>
+    public static LispObject SlotDefinitionInitform(LispObject arg)
+        => RequireSlotDef("SLOT-DEFINITION-INITFORM", arg).Initform;
+
+    /// <summary>AMOP puts readers/writers on DIRECT slot definitions; an effective
+    /// slot definition has none, which is what the empty array gives.</summary>
+    public static LispObject SlotDefinitionReaders(LispObject arg)
+        => ToLispList(RequireSlotDef("SLOT-DEFINITION-READERS", arg).Readers);
+
+    public static LispObject SlotDefinitionWriters(LispObject arg)
+        => ToLispList(RequireSlotDef("SLOT-DEFINITION-WRITERS", arg).Writers);
+
+    /// <summary>The generic function a method is attached to, NIL while it is
+    /// unattached. Shared by CL:METHOD-GENERIC-FUNCTION and the DOTCL-MOP one.</summary>
+    public static LispObject MethodGenericFunction(LispObject arg)
+    {
+        if (arg is not LispMethod m)
+            throw new LispErrorException(new LispTypeError(
+                "METHOD-GENERIC-FUNCTION: not a method", arg, Startup.Sym("METHOD")));
+        return m.Owner is { } gf ? gf : Nil.Instance;
+    }
+
+    /// <summary>A method's lambda list. dotcl does not keep the source list, so
+    /// this rebuilds one of the right shape from the recorded arity. Shared by
+    /// CL:METHOD-LAMBDA-LIST and the DOTCL-MOP one.</summary>
+    public static LispObject MethodLambdaList(LispObject arg)
+    {
+        if (arg is not LispMethod m)
+            throw new LispErrorException(new LispTypeError(
+                "METHOD-LAMBDA-LIST: not a method", arg, Startup.Sym("METHOD")));
+        if (m.StoredLambdaList is { } given) return given;
+        return Mop.BuildLambdaListPlaceholder(m.RequiredCount, m.OptionalCount,
+            m.HasRest, m.HasKey, m.KeywordNames, m.HasAllowOtherKeys);
+    }
+
+    public static LispObject ClassDirectSubclasses(LispObject arg)
+    {
+        if (arg is not LispClass c)
+            throw new LispErrorException(new LispTypeError(
+                "CLASS-DIRECT-SUBCLASSES: not a class", arg, Startup.Sym("CLASS")));
+        var subs = new List<LispObject>();
+        foreach (var cls in AllClasses())
+            if (Array.IndexOf(cls.DirectSuperclasses, c) >= 0)
+                subs.Add(cls);
+        return List(subs.ToArray());
+    }
+
     /// <summary>Iterate all registered generic functions. Used by
     /// DOTCL-MOP:SPECIALIZER-DIRECT-METHODS / SPECIALIZER-DIRECT-GENERIC-FUNCTIONS
     /// (no specializer→method back-link is maintained, so we scan).</summary>
@@ -620,6 +762,32 @@ public static partial class Runtime
         if (slotdObj is SlotDefinition sd)
             sd.RawOptions = options;
         return slotdObj;
+    }
+
+    /// <summary>Attach the introspectable slot attributes DEFCLASS parses but did not
+    /// used to pass on: the :reader/:accessor names, the :writer/(setf accessor) names,
+    /// and the declared :type. Returns the slotd so the DEFCLASS expansion can wrap
+    /// %make-slot-def transparently, like %SLOT-DEF-RAW-OPTIONS.</summary>
+    public static LispObject SetSlotDefAttrs(LispObject slotdObj, LispObject readers,
+                                             LispObject writers, LispObject slotType,
+                                             LispObject initform)
+    {
+        if (slotdObj is SlotDefinition sd)
+        {
+            sd.Readers = ListToArray(readers);
+            sd.Writers = ListToArray(writers);
+            sd.SlotType = slotType is Nil ? T.Instance : slotType;
+            sd.Initform = initform;
+        }
+        return slotdObj;
+    }
+
+    private static LispObject[] ListToArray(LispObject list)
+    {
+        var items = new List<LispObject>();
+        for (var cur = list; cur is Cons c; cur = c.Cdr)
+            items.Add(c.Car);
+        return items.Count > 0 ? items.ToArray() : Array.Empty<LispObject>();
     }
 
     /// <summary>AMOP DIRECT-SLOT-DEFINITION-CLASS protocol: for each direct slot of a class
@@ -4842,7 +5010,15 @@ public static partial class Runtime
         // inline from its own table and never looks the name up.
         RegClos("%MAKE-SLOT-DEF-WITH-ALLOCATION",
             a => Runtime.MakeSlotDefWithAllocation(a[0], a[1], a[2], a[3]), 4);
+        // The custom-:METACLASS variant of the class lowering target, missing for the
+        // same reason %MAKE-SLOT-DEF-WITH-ALLOCATION was: DEFCLASS emits it only when
+        // the class names a metaclass, and compiled code never looks the name up
+        // (the compiler emits Runtime.MakeClassFull inline). The tree-walk evaluator
+        // runs the expansion as real code, so every (defclass ... (:metaclass ...))
+        // died with "Undefined function: %MAKE-CLASS-FULL".
+        RegClos("%MAKE-CLASS-FULL", a => Runtime.MakeClassFull(a[0], a[1], a[2], a[3]), 4);
         RegClos("%SLOT-DEF-RAW-OPTIONS", a => Runtime.SetSlotDefRawOptions(a[0], a[1]), 2);
+        RegClos("%SLOT-DEF-ATTRS", a => Runtime.SetSlotDefAttrs(a[0], a[1], a[2], a[3], a[4]), 5);
         RegClos("%SET-CLASS-DEFAULT-INITARGS", a => Runtime.SetClassDefaultInitargs(a[0], a[1]), 2);
         RegClos("%FIND-CLASS-OR-NIL", a => Runtime.FindClassOrNil(a[0]), 1);
         RegClos("%SPECIALIZER-CLASS", a => Runtime.SpecializerClass(a[0]), 1);
@@ -5153,6 +5329,11 @@ public static partial class Runtime
                                     break;
                                 case "LAMBDA-LIST":
                                     ParseLambdaListIntoMethod(m, args[i + 1]);
+                                    // Keep the list itself, not just the arity it
+                                    // implies: METHOD-LAMBDA-LIST has to hand back
+                                    // what was passed, and a rebuilt placeholder
+                                    // (#:R0 ...) is not that.
+                                    m.StoredLambdaList = args[i + 1];
                                     break;
                             }
                         }
@@ -5360,154 +5541,105 @@ public static partial class Runtime
         // SLOT-DEFINITION-NAME
         Emitter.CilAssembler.RegisterFunction("SLOT-DEFINITION-NAME", new LispFunction(args => {
             if (args.Length != 1) throw new LispErrorException(new LispProgramError("SLOT-DEFINITION-NAME: wrong arg count"));
-            if (args[0] is SlotDefinition sd) return sd.Name;
-            throw new LispErrorException(new LispTypeError("SLOT-DEFINITION-NAME: not a slot definition", args[0]));
+            return SlotDefinitionName(args[0]);
         }, "SLOT-DEFINITION-NAME", 1));
 
         // SLOT-DEFINITION-TYPE
         Emitter.CilAssembler.RegisterFunction("SLOT-DEFINITION-TYPE", new LispFunction(args => {
             if (args.Length != 1) throw new LispErrorException(new LispProgramError("SLOT-DEFINITION-TYPE: wrong arg count"));
-            if (args[0] is SlotDefinition) return T.Instance;  // T = no type restriction
-            throw new LispErrorException(new LispTypeError("SLOT-DEFINITION-TYPE: not a slot definition", args[0]));
+            return SlotDefinitionType(args[0]);
         }, "SLOT-DEFINITION-TYPE", 1));
 
         // SLOT-DEFINITION-INITARGS
         Emitter.CilAssembler.RegisterFunction("SLOT-DEFINITION-INITARGS", new LispFunction(args => {
             if (args.Length != 1) throw new LispErrorException(new LispProgramError("SLOT-DEFINITION-INITARGS: wrong arg count"));
-            if (args[0] is SlotDefinition sd) {
-                LispObject result = Nil.Instance;
-                for (int i = sd.Initargs.Length - 1; i >= 0; i--)
-                    result = new Cons(sd.Initargs[i], result);
-                return result;
-            }
-            throw new LispErrorException(new LispTypeError("SLOT-DEFINITION-INITARGS: not a slot definition", args[0]));
+            return SlotDefinitionInitargs(args[0]);
         }, "SLOT-DEFINITION-INITARGS", 1));
 
         // SLOT-DEFINITION-INITFORM / SLOT-DEFINITION-INITFUNCTION
         Emitter.CilAssembler.RegisterFunction("SLOT-DEFINITION-INITFORM", new LispFunction(args => {
             if (args.Length != 1) throw new LispErrorException(new LispProgramError("SLOT-DEFINITION-INITFORM: wrong arg count"));
-            // CL spec: returns the initform if one was specified, or signals slot-value-not-available if none.
-            // Simplified: we don't store the raw initform, only the compiled thunk. Return NIL if no initform.
-            if (args[0] is SlotDefinition) return Nil.Instance;
-            throw new LispErrorException(new LispTypeError("SLOT-DEFINITION-INITFORM: not a slot definition", args[0]));
+            return SlotDefinitionInitform(args[0]);
         }, "SLOT-DEFINITION-INITFORM", 1));
 
         Emitter.CilAssembler.RegisterFunction("SLOT-DEFINITION-INITFUNCTION", new LispFunction(args => {
             if (args.Length != 1) throw new LispErrorException(new LispProgramError("SLOT-DEFINITION-INITFUNCTION: wrong arg count"));
-            if (args[0] is SlotDefinition sd)
-                return sd.InitformThunk != null ? (LispObject)sd.InitformThunk : Nil.Instance;
-            throw new LispErrorException(new LispTypeError("SLOT-DEFINITION-INITFUNCTION: not a slot definition", args[0]));
+            return SlotDefinitionInitfunction(args[0]);
         }, "SLOT-DEFINITION-INITFUNCTION", 1));
 
         // SLOT-DEFINITION-ALLOCATION → :instance or :class
         Emitter.CilAssembler.RegisterFunction("SLOT-DEFINITION-ALLOCATION", new LispFunction(args => {
             if (args.Length != 1) throw new LispErrorException(new LispProgramError("SLOT-DEFINITION-ALLOCATION: wrong arg count"));
-            if (args[0] is SlotDefinition sd2)
-                return sd2.IsClassAllocation ? (LispObject)Startup.Keyword("CLASS") : Startup.Keyword("INSTANCE");
-            throw new LispErrorException(new LispTypeError("SLOT-DEFINITION-ALLOCATION: not a slot definition", args[0]));
+            return SlotDefinitionAllocation(args[0]);
         }, "SLOT-DEFINITION-ALLOCATION", 1));
 
-        // SLOT-DEFINITION-READERS / SLOT-DEFINITION-WRITERS → NIL stub
+        // SLOT-DEFINITION-READERS / SLOT-DEFINITION-WRITERS: the :reader/:accessor
+        // and :writer/(setf accessor) names DEFCLASS parsed. Both used to be NIL.
         Emitter.CilAssembler.RegisterFunction("SLOT-DEFINITION-READERS", new LispFunction(args => {
             if (args.Length != 1) throw new LispErrorException(new LispProgramError("SLOT-DEFINITION-READERS: wrong arg count"));
-            return Nil.Instance;
+            return SlotDefinitionReaders(args[0]);
         }, "SLOT-DEFINITION-READERS", 1));
         Emitter.CilAssembler.RegisterFunction("SLOT-DEFINITION-WRITERS", new LispFunction(args => {
             if (args.Length != 1) throw new LispErrorException(new LispProgramError("SLOT-DEFINITION-WRITERS: wrong arg count"));
-            return Nil.Instance;
+            return SlotDefinitionWriters(args[0]);
         }, "SLOT-DEFINITION-WRITERS", 1));
 
         // CLASS-DIRECT-SLOTS: list of SlotDefinition objects for the class's own slots
         Emitter.CilAssembler.RegisterFunction("CLASS-DIRECT-SLOTS", new LispFunction(args => {
             if (args.Length != 1) throw new LispErrorException(new LispProgramError("CLASS-DIRECT-SLOTS: wrong arg count"));
-            if (args[0] is LispClass lc) {
-                LispObject result = Nil.Instance;
-                for (int i = lc.DirectSlots.Length - 1; i >= 0; i--)
-                    result = new Cons(lc.DirectSlots[i], result);
-                return result;
-            }
-            throw new LispErrorException(new LispTypeError("CLASS-DIRECT-SLOTS: not a class", args[0]));
+            return ClassDirectSlots(args[0]);
         }, "CLASS-DIRECT-SLOTS", 1));
 
         // CLASS-SLOTS: list of effective SlotDefinition objects (all inherited slots)
         Emitter.CilAssembler.RegisterFunction("CLASS-SLOTS", new LispFunction(args => {
             if (args.Length != 1) throw new LispErrorException(new LispProgramError("CLASS-SLOTS: wrong arg count"));
-            if (args[0] is LispClass lc) {
-                LispObject result = Nil.Instance;
-                if (lc.EffectiveSlots != null)
-                    for (int i = lc.EffectiveSlots.Length - 1; i >= 0; i--)
-                        result = new Cons(lc.EffectiveSlots[i], result);
-                return result;
-            }
-            throw new LispErrorException(new LispTypeError("CLASS-SLOTS: not a class", args[0]));
+            return ClassSlots(args[0]);
         }, "CLASS-SLOTS", 1));
 
         // CLASS-DIRECT-SUPERCLASSES
         Emitter.CilAssembler.RegisterFunction("CLASS-DIRECT-SUPERCLASSES", new LispFunction(args => {
             if (args.Length != 1) throw new LispErrorException(new LispProgramError("CLASS-DIRECT-SUPERCLASSES: wrong arg count"));
-            if (args[0] is LispClass lc) {
-                LispObject result = Nil.Instance;
-                for (int i = lc.DirectSuperclasses.Length - 1; i >= 0; i--)
-                    result = new Cons(lc.DirectSuperclasses[i], result);
-                return result;
-            }
-            throw new LispErrorException(new LispTypeError("CLASS-DIRECT-SUPERCLASSES: not a class", args[0]));
+            return ClassDirectSuperclasses(args[0]);
         }, "CLASS-DIRECT-SUPERCLASSES", 1));
 
-        // CLASS-DIRECT-SUBCLASSES — tracked at registration time would be ideal, but
-        // for now return NIL (stub). Real implementation requires tracking all registered subclasses.
+        // CLASS-DIRECT-SUBCLASSES — the same implementation DOTCL-MOP exposes.
+        // This used to be a stub returning NIL for every class, so the answer
+        // depended on which symbol the caller reached: dotcl-mop:… was right and
+        // the CL one silently wrong. GENERIC-FUNCTION-LAMBDA-LIST had the same
+        // split and returned NIL only on Linux (see below).
         Emitter.CilAssembler.RegisterFunction("CLASS-DIRECT-SUBCLASSES", new LispFunction(args => {
             if (args.Length != 1) throw new LispErrorException(new LispProgramError("CLASS-DIRECT-SUBCLASSES: wrong arg count"));
-            if (args[0] is LispClass) return Nil.Instance;
-            throw new LispErrorException(new LispTypeError("CLASS-DIRECT-SUBCLASSES: not a class", args[0]));
+            return ClassDirectSubclasses(args[0]);
         }, "CLASS-DIRECT-SUBCLASSES", 1));
 
         // CLASS-PRECEDENCE-LIST
         Emitter.CilAssembler.RegisterFunction("CLASS-PRECEDENCE-LIST", new LispFunction(args => {
             if (args.Length != 1) throw new LispErrorException(new LispProgramError("CLASS-PRECEDENCE-LIST: wrong arg count"));
-            if (args[0] is LispClass lc) {
-                if (lc.ClassPrecedenceList == null || lc.ClassPrecedenceList.Length == 0)
-                    return new Cons(lc, Nil.Instance);
-                LispObject result = Nil.Instance;
-                for (int i = lc.ClassPrecedenceList.Length - 1; i >= 0; i--)
-                    result = new Cons(lc.ClassPrecedenceList[i], result);
-                return result;
-            }
-            throw new LispErrorException(new LispTypeError("CLASS-PRECEDENCE-LIST: not a class", args[0]));
+            return ClassPrecedenceListOf(args[0]);
         }, "CLASS-PRECEDENCE-LIST", 1));
 
         // CLASS-FINALIZED-P — all dotcl classes are considered finalized
         Emitter.CilAssembler.RegisterFunction("CLASS-FINALIZED-P", new LispFunction(args => {
             if (args.Length != 1) throw new LispErrorException(new LispProgramError("CLASS-FINALIZED-P: wrong arg count"));
-            if (args[0] is LispClass) return T.Instance;
-            throw new LispErrorException(new LispTypeError("CLASS-FINALIZED-P: not a class", args[0]));
+            return ClassFinalizedP(args[0]);
         }, "CLASS-FINALIZED-P", 1));
 
         // CLASS-PROTOTYPE — make a prototype instance of a class
         Emitter.CilAssembler.RegisterFunction("CLASS-PROTOTYPE", new LispFunction(args => {
             if (args.Length != 1) throw new LispErrorException(new LispProgramError("CLASS-PROTOTYPE: wrong arg count"));
-            if (args[0] is LispClass lc && !lc.IsBuiltIn)
-                return lc.Prototype; // memoized: stable identity for (eql class-prototype) dispatch
-            throw new LispErrorException(new LispError("CLASS-PROTOTYPE: cannot create prototype for built-in class"));
+            return ClassPrototypeOf(args[0]);
         }, "CLASS-PROTOTYPE", 1));
 
         // GENERIC-FUNCTION-METHODS
         Emitter.CilAssembler.RegisterFunction("GENERIC-FUNCTION-METHODS", new LispFunction(args => {
             if (args.Length != 1) throw new LispErrorException(new LispProgramError("GENERIC-FUNCTION-METHODS: wrong arg count"));
-            if (args[0] is GenericFunction gf) {
-                LispObject result = Nil.Instance;
-                for (int i = gf.Methods.Count - 1; i >= 0; i--)
-                    result = new Cons(gf.Methods[i], result);
-                return result;
-            }
-            throw new LispErrorException(new LispTypeError("GENERIC-FUNCTION-METHODS: not a generic function", args[0]));
+            return GenericFunctionMethods(args[0]);
         }, "GENERIC-FUNCTION-METHODS", 1));
 
         // GENERIC-FUNCTION-NAME
         Emitter.CilAssembler.RegisterFunction("GENERIC-FUNCTION-NAME", new LispFunction(args => {
             if (args.Length != 1) throw new LispErrorException(new LispProgramError("GENERIC-FUNCTION-NAME: wrong arg count"));
-            if (args[0] is GenericFunction gf) return gf.Name;
-            throw new LispErrorException(new LispTypeError("GENERIC-FUNCTION-NAME: not a generic function", args[0]));
+            return GenericFunctionName(args[0]);
         }, "GENERIC-FUNCTION-NAME", 1));
 
         // GENERIC-FUNCTION-LAMBDA-LIST is registered by Mop.cs (returns the stored
@@ -5531,18 +5663,22 @@ public static partial class Runtime
             throw new LispErrorException(new LispTypeError("METHOD-SPECIALIZERS: not a method", args[0]));
         }, "METHOD-SPECIALIZERS", 1));
 
-        // METHOD-GENERIC-FUNCTION — stub returning NIL (not tracked in dotcl)
+        // METHOD-GENERIC-FUNCTION — the generic function this method is attached
+        // to, or NIL while it is unattached. The comment here used to say "not
+        // tracked in dotcl" and the body returned NIL for every method, but
+        // LispMethod.Owner has tracked it all along (ADD-METHOD sets it,
+        // REMOVE-METHOD clears it), and DOTCL-MOP returned it correctly.
         Emitter.CilAssembler.RegisterFunction("METHOD-GENERIC-FUNCTION", new LispFunction(args => {
             if (args.Length != 1) throw new LispErrorException(new LispProgramError("METHOD-GENERIC-FUNCTION: wrong arg count"));
-            if (args[0] is LispMethod) return Nil.Instance;
-            throw new LispErrorException(new LispTypeError("METHOD-GENERIC-FUNCTION: not a method", args[0]));
+            return MethodGenericFunction(args[0]);
         }, "METHOD-GENERIC-FUNCTION", 1));
 
-        // METHOD-LAMBDA-LIST — stub returning NIL
+        // METHOD-LAMBDA-LIST — rebuilt from the recorded arity (dotcl does not
+        // keep the source lambda list). Used to return NIL for every method here
+        // while DOTCL-MOP returned the real shape.
         Emitter.CilAssembler.RegisterFunction("METHOD-LAMBDA-LIST", new LispFunction(args => {
             if (args.Length != 1) throw new LispErrorException(new LispProgramError("METHOD-LAMBDA-LIST: wrong arg count"));
-            if (args[0] is LispMethod) return Nil.Instance;
-            throw new LispErrorException(new LispTypeError("METHOD-LAMBDA-LIST: not a method", args[0]));
+            return MethodLambdaList(args[0]);
         }, "METHOD-LAMBDA-LIST", 1));
 
         // MAKE-METHOD-LAMBDA — stub (needed by some MOP code)

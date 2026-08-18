@@ -14,6 +14,13 @@ namespace DotCL.Emitter;
 /// </summary>
 public class FaslAssembler
 {
+    // Writing a .fasl needs PersistedAssemblyBuilder, which is .NET 9+. On an
+    // older target framework the whole implementation below compiles out and
+    // these fields are left declared but never written — which is exactly what
+    // CS0649 / CS0169 report. Keeping the declarations (rather than guarding
+    // them too) keeps the class shape identical across target frameworks, so
+    // only the assignments move.
+#pragma warning disable CS0649, CS0169
 #if NET9_0_OR_GREATER
     private readonly PersistedAssemblyBuilder _ab;
 #endif
@@ -25,6 +32,7 @@ public class FaslAssembler
     private readonly ILGenerator _cctorIl;
     private int _methodCount;
     private readonly CilAssembler.FaslStructInternMap _structInternMap;
+#pragma warning restore CS0649, CS0169
 
     // --- Debug info (opt-in) ---
     // When enabled, Save() emits a Portable PDB alongside the .fasl with one
@@ -178,9 +186,13 @@ public class FaslAssembler
     public FaslAssembler(string moduleName)
     {
 #if !NET9_0_OR_GREATER
-        throw new PlatformNotSupportedException(
+        // A Lisp condition, not a raw CLR exception: the caller is Lisp code that
+        // called COMPILE-FILE, and it should be able to handle this like any other
+        // error. Same class the emit-free CilAssembler path uses for "this build
+        // cannot generate code".
+        throw new LispErrorException(new LispProgramError(
             "FASL emission (compile-file) requires .NET 9+ (PersistedAssemblyBuilder); " +
-            "this runtime build runs precompiled .fasl only");
+            "this runtime build runs precompiled .fasl only"));
 #else
         // An AssemblyName simple-name rejects characters the parser reads as
         // attribute syntax (e.g. '=' and ',' from "name=value, ..."), so a source
@@ -205,6 +217,9 @@ public class FaslAssembler
         // Wire TypeBuilder + init ILGenerator so CilAssembler can deduplicate uninterned symbols.
         _structInternMap.UninternedTypeBuilder = _tb;
         _structInternMap.UninternedInitIl = _initIl;
+        // Lets the map roll literal fields over onto fresh holder types once
+        // CompiledModule has taken its share (see MaxFieldsPerHolder).
+        _structInternMap.ModuleBuilder = _mb;
         // Call-site symbol caches go in the TYPE INITIALIZER, not ModuleInit: the
         // fields are read by compiled bodies, and a body can be reached from
         // anywhere in ModuleInit, so "initialized earlier in ModuleInit" is not a
@@ -881,8 +896,8 @@ public class FaslAssembler
     public void Save(string outputPath, string? retargetCorlib = null)
     {
 #if !NET9_0_OR_GREATER
-        throw new PlatformNotSupportedException(
-            "FASL emission (compile-file) requires .NET 9+; this runtime build runs precompiled .fasl only");
+        throw new LispErrorException(new LispProgramError(
+            "FASL emission (compile-file) requires .NET 9+; this runtime build runs precompiled .fasl only"));
 #else
         EmitPreinternSymbols();
 
@@ -893,6 +908,14 @@ public class FaslAssembler
 
         // Close the type initializer (empty when the module named no functions).
         _cctorIl.Emit(OpCodes.Ret);
+
+        // Literal holders spilled off CompiledModule, each with its own
+        // initializer. Created before CompiledModule, which references them.
+        foreach (var (holder, cctor) in _structInternMap.OverflowHolders)
+        {
+            cctor.Emit(OpCodes.Ret);
+            holder.CreateType();
+        }
 
         _tb.CreateType();
         StampCoreGeneration();
@@ -909,6 +932,10 @@ public class FaslAssembler
             Console.Error.WriteLine($"[FaslAssembler] Unique string bytes tracked: {_structInternMap.UniqueStringBytes:N0}");
             throw;
         }
+        // PersistedAssemblyBuilder writes exception clauses in an order the CLR
+        // rejects when one exception block is nested inside another's handler
+        // (an unwind-protect whose cleanup contains handler-case / catch / …).
+        FaslEhOrder.Fix(outputPath);
         if (retargetCorlib != null)
             FaslCorlibRetarget.RetargetCorlib(outputPath, retargetCorlib);
 #endif

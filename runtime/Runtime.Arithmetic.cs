@@ -149,7 +149,9 @@ public static partial class Runtime
 
     // --- Comparison (backward compat) ---
 
-    public static bool IsTruthy(LispObject obj) => Primary(obj) is not Nil;
+    /// <summary>Everything but NIL is true. NIL is a singleton, so this is an
+    /// identity test; `is not Nil` would go through CastHelpers.IsInstanceOfClass.</summary>
+    public static bool IsTruthy(LispObject obj) => !ReferenceEquals(Primary(obj), Nil.Instance);
 
     public static LispObject GreaterThan(LispObject a, LispObject b)
     {
@@ -298,8 +300,9 @@ public static partial class Runtime
     {
         a = Primary(a); b = Primary(b);
         if (ReferenceEquals(a, b)) return true;
-        if ((a is T && ReferenceEquals(b, Startup.T_SYM)) ||
-            (b is T && ReferenceEquals(a, Startup.T_SYM)))
+        // T is a singleton, so this is identity rather than a type test.
+        if ((ReferenceEquals(a, T.Instance) && ReferenceEquals(b, Startup.T_SYM)) ||
+            (ReferenceEquals(b, T.Instance) && ReferenceEquals(a, Startup.T_SYM)))
             return true;
         if ((a is Nil && ReferenceEquals(b, Startup.NIL_SYM)) ||
             (b is Nil && ReferenceEquals(a, Startup.NIL_SYM)))
@@ -311,8 +314,9 @@ public static partial class Runtime
     {
         a = Primary(a); b = Primary(b);
         if (ReferenceEquals(a, b)) return true;
-        if ((a is T && ReferenceEquals(b, Startup.T_SYM)) ||
-            (b is T && ReferenceEquals(a, Startup.T_SYM)))
+        // T is a singleton, so this is identity rather than a type test.
+        if ((ReferenceEquals(a, T.Instance) && ReferenceEquals(b, Startup.T_SYM)) ||
+            (ReferenceEquals(b, T.Instance) && ReferenceEquals(a, Startup.T_SYM)))
             return true;
         if ((a is Nil && ReferenceEquals(b, Startup.NIL_SYM)) ||
             (b is Nil && ReferenceEquals(a, Startup.NIL_SYM)))
@@ -955,7 +959,14 @@ public static partial class Runtime
     {
         var hostName = host is LispString s ? s.Value : host is LispVector v && v.IsCharVector ? v.ToCharString() : host.ToString();
         hostName = hostName.ToUpperInvariant();
-        return _logicalPathnameTranslations.TryGetValue(hostName, out var val) ? val : Nil.Instance;
+        // CLHS: host must name a logical host that has already been defined.
+        // Libraries probe for a host by catching this error, so returning NIL
+        // here silently skips their initialization.
+        if (!_logicalPathnameTranslations.TryGetValue(hostName, out var val))
+            throw new LispErrorException(new LispTypeError(
+                $"LOGICAL-PATHNAME-TRANSLATIONS: logical host not yet defined: {hostName}",
+                host, Startup.Sym("LOGICAL-HOST")));
+        return val;
     }
 
     public static LispObject SetLogicalPathnameTranslations(LispObject host, LispObject translations)
@@ -980,27 +991,36 @@ public static partial class Runtime
         return _logicalPathnameTranslations.ContainsKey(host.ToUpperInvariant());
     }
 
+    /// <summary>
+    /// CLHS 19.3.1: a logical pathname namestring must carry a host, and that host
+    /// must already be defined as a logical host. Without the second half a
+    /// "HOST:NAME" string for an unknown host silently becomes a file name.
+    /// </summary>
+    private static void CheckLogicalPathnameNamestring(string str, LispObject thing)
+    {
+        int colonPos = str.IndexOf(':');
+        if (colonPos <= 0)
+            throw new LispErrorException(new LispTypeError(
+                "LOGICAL-PATHNAME: not a valid logical pathname namestring", thing,
+                Startup.Sym("LOGICAL-PATHNAME")));
+        if (!_logicalPathnameTranslations.ContainsKey(str[..colonPos]))
+            throw new LispErrorException(new LispTypeError(
+                $"LOGICAL-PATHNAME: logical host not yet defined: {str[..colonPos].ToUpperInvariant()}",
+                thing, Startup.Sym("LOGICAL-PATHNAME")));
+    }
+
     public static LispObject LogicalPathname(LispObject thing)
     {
         if (thing is LispLogicalPathname) return thing;
         if (thing is LispString s)
         {
-            // CLHS: string must be a valid logical pathname namestring (must have a host)
-            int colonPos = s.Value.IndexOf(':');
-            if (colonPos <= 0)
-                throw new LispErrorException(new LispTypeError(
-                    "LOGICAL-PATHNAME: not a valid logical pathname namestring", thing,
-                    Startup.Sym("LOGICAL-PATHNAME")));
+            CheckLogicalPathnameNamestring(s.Value, thing);
             return LispLogicalPathname.FromLogicalString(s.Value);
         }
         if (thing is LispVector v && v.IsCharVector)
         {
             string str = v.ToCharString();
-            int colonPos = str.IndexOf(':');
-            if (colonPos <= 0)
-                throw new LispErrorException(new LispTypeError(
-                    "LOGICAL-PATHNAME: not a valid logical pathname namestring", thing,
-                    Startup.Sym("LOGICAL-PATHNAME")));
+            CheckLogicalPathnameNamestring(str, thing);
             return LispLogicalPathname.FromLogicalString(str);
         }
         if (thing is LispFileStream fs)

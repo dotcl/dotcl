@@ -118,8 +118,8 @@ public static class DynamicClassBuilder
             lib.Save();
             return t;
 #else
-            throw new PlatformNotSupportedException(
-                "saving a class library requires .NET 9+ (PersistedAssemblyBuilder)");
+            throw new LispErrorException(new LispProgramError(
+                "saving a class library requires .NET 9+ (PersistedAssemblyBuilder)"));
 #endif
         }
 

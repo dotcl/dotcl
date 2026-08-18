@@ -250,14 +250,14 @@
 ;;; ============================================================
 
 (deftest mop/slot-definition-initform-literal
-  ;; AMOP: should return the initform expression (e.g. 3 for :initform 3).
-  ;; dotcl TODO: source form not preserved — always returns NIL.
-  ;; Test documents current (non-conformant) behavior.
+  ;; AMOP: returns the initform expression (3 for :initform 3). The form is
+  ;; recorded by DEFCLASS alongside the compiled thunk; before that it could
+  ;; only ever answer NIL, since a thunk cannot be turned back into its source.
   (let ((slotd (find-if (lambda (s)
                           (eq (dotcl-mop:slot-definition-name s) 'z))
                         (dotcl-mop:class-direct-slots (find-class 'mop/b)))))
     (dotcl-mop:slot-definition-initform slotd))
-  nil)                        ; TODO: should be 3 per AMOP
+  3)
 
 ;;; ============================================================
 ;;; SLOT-DEFINITION-INITFUNCTION (AMOP §5.7.2)
@@ -706,48 +706,51 @@
 
 ;;; ============================================================
 ;;; Slot definition error validation (from SBCL bug-309072)
-;;; #+nil: uncomment when slot-definition type system is implemented
 ;;; ============================================================
 
-#+nil
-(progn
-  ;; These tests verify that defclass signals errors for malformed
-  ;; slot definitions. Enable when dotcl validates slot options.
-
-  (deftest mop/slot-def-error-bad-initarg
-    ;; :initarg must be a symbol
-    (handler-case
+;; DEFCLASS validates the VALUE of the slot options it knows, not just their
+;; names. These were disabled ("enable when dotcl validates slot options")
+;; until that validation existed.
+(deftest mop/slot-def-error-bad-initarg
+  ;; :initarg must be a symbol (CLHS 7.1.2). A non-symbol used to be stored and
+  ;; then never match anything at MAKE-INSTANCE.
+  (handler-case
       (eval '(defclass mop/bad-initarg () ((s :initarg 42))))
-      (error () :error))
-    :error)
+    (error () :error))
+  :error)
 
-  (deftest mop/slot-def-error-missing-initfunction
-    ;; :initform without :initfunction should still work via thunk generation
-    ;; (this is actually valid — testing the converse: :initfunction alone is ok)
-    (handler-case
+(deftest mop/slot-def-error-unknown-option
+  ;; :initfunction is a slot-definition INITARG, not a DEFCLASS slot option, so
+  ;; naming it here is an unknown option. (This test used to expect :ok, which
+  ;; was wrong: CLHS fixes the set of slot options, and dotcl rejects the rest
+  ;; unless a custom metaclass opts in.)
+  (handler-case
       (progn
         (eval '(defclass mop/ok-initfunction ()
                 ((s :initfunction (lambda () 99)))))
         :ok)
-      (error () :error))
-    :ok)
+    (error () :error))
+  :error)
 
-  (deftest mop/slot-def-error-bad-allocation
-    ;; :allocation must be :instance or :class
-    (handler-case
+(deftest mop/slot-def-error-bad-allocation
+  ;; :allocation must be :instance or :class. :bogus used to be accepted and
+  ;; silently treated as :instance.
+  (handler-case
       (eval '(defclass mop/bad-alloc () ((s :allocation :bogus))))
-      (error () :error))
-    :error)
+    (error () :error))
+  :error)
 
-  (deftest mop/slot-def-error-bad-type
-    ;; :type must be a valid type specifier
-    (handler-case
+(deftest mop/slot-def-ok-type
+  ;; :type is accepted (and, since slot attributes are recorded, readable back
+  ;; through SLOT-DEFINITION-TYPE).
+  (handler-case
       (progn
         (eval '(defclass mop/typed-slot () ((s :type integer))))
-        :ok)
-      (error () :error))
-    :ok)
-) ; end #+nil
+        (dotcl-mop:slot-definition-type
+         (first (dotcl-mop:class-direct-slots (find-class 'mop/typed-slot)))))
+    (error () :error))
+  integer)
+
 
 ;;; ============================================================
 ;;; Summary

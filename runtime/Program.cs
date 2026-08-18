@@ -1156,13 +1156,12 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
             if (buffer.Length > 0) buffer.Append('\n');
             buffer.Append(line);
 
-            // Try to read all forms from the accumulated buffer. Reader
-            // signals "more input needed" by throwing EndOfStreamException
-            // (from ReadStep1 on raw EOF) or a LispError of condition type
-            // END-OF-FILE (from mid-list / mid-string etc. — see
-            // Reader.MakeEndOfFileError). Both mean "keep the buffer and
-            // re-prompt with the continuation indent". Anything else is a
-            // real syntax error: print and drop the buffer.
+            // Try to read all forms from the accumulated buffer. Reader signals
+            // "more input needed" as a LispError of condition type END-OF-FILE
+            // (mid-list, mid-string, after a quote — see
+            // Reader.MakeEndOfFileError), which means "keep the buffer and
+            // re-prompt with the continuation indent". Anything else is a real
+            // syntax error: print and drop the buffer.
             var forms = new List<LispObject>();
             bool incomplete = false;
             bool readError = false;
@@ -1171,10 +1170,6 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
                 var reader = new Reader(new StringReader(buffer.ToString()));
                 while (reader.TryRead(out var expr))
                     forms.Add(expr);
-            }
-            catch (EndOfStreamException)
-            {
-                incomplete = true;
             }
             catch (LispErrorException ex) when (
                 ex.Condition is LispCondition lc && lc.ConditionTypeName == "END-OF-FILE")

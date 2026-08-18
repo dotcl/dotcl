@@ -55,3 +55,30 @@
     (error () :caught-error)
     (storage-condition () :caught-storage-condition))
   :caught-storage-condition)
+
+;;; Recursion that goes Lisp -> .NET delegate -> Lisp at every level. Reflection
+;;; wraps a faulting call's exception by catching and throwing a new one, and the
+;;; handler that undid that wrap re-threw with ExceptionDispatchInfo: two restarted
+;;; exception dispatches per level, each leaving a live handler funclet behind
+;;; while the exception kept travelling. The STORAGE-CONDITION raised at the bottom
+;;; therefore ran out of stack on its way out and became a fatal .NET
+;;; StackOverflowException. Invoking without the wrap, and converting a genuine
+;;; .NET failure only at the level where it originated, leaves the crossing free.
+(defvar *cb-chain-fn* nil)
+
+(defun %cb-chain-rec (n)
+  (if (zerop n) 0 (+ 1 (dotnet:invoke *cb-chain-fn* "Invoke" (- n 1)))))
+
+(setq *cb-chain-fn*
+      (dotnet:make-delegate "System.Func`2[System.Int32,System.Int32]"
+                            (lambda (x) (%cb-chain-rec x))))
+
+(deftest callback-chain.moderate-depth-sanity
+  (%cb-chain-rec 100)
+  100)
+
+(deftest callback-chain.stack-overflow-catchable
+  (handler-case (progn (%cb-chain-rec 10000000) :no-overflow)
+    (error () :caught-error)
+    (storage-condition () :caught-storage-condition))
+  :caught-storage-condition)

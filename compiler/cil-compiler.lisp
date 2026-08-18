@@ -304,6 +304,39 @@
    in both the analysis pass and the code-gen pass.  NIL outside a compile-toplevel
    call, which disables caching (eval-time macro calls are not cached).")
 
+(defvar *macrolet-shadowed* '()
+  "Operator names bound by an enclosing MACROLET at the current lexical position.
+
+   COMPILE-FORM dispatches on *COMPILE-FORM-HANDLERS* before it macroexpands, so
+   a name that is a CL macro but is lowered here as a handler (WHEN, UNLESS, AND,
+   OR, …) would otherwise ignore a MACROLET binding for it and compile the
+   built-in — silently, and differently from the interpreter, which consults its
+   lexical macros first (CLHS 3.1.2.1.2.2 requires the MACROLET to win).
+
+   This list is what tells the dispatcher to step aside.  It is bound where
+   COMPILE-MACROLET registers the expanders, so it cannot drift out of sync with
+   them.  True special operators are never affected: MACROLET cannot shadow those,
+   and SPECIAL-OPERATOR-NAME-P excludes them.")
+
+(defun special-operator-name-p (name)
+  "True for the 25 CL special operators, which no lexical binding may shadow.
+   Shared by the FLET/LABELS override check and the MACROLET one so the two
+   cannot disagree about what is shadowable."
+  (and (symbolp name)
+       (member name '(quote function if progn let let* setq block return-from
+                      tagbody go unwind-protect catch throw flet labels macrolet
+                      symbol-macrolet the locally load-time-value eval-when
+                      multiple-value-call multiple-value-prog1 progv))
+       t))
+
+(defun macrolet-shadowed-p (name)
+  "True when NAME is bound by an enclosing MACROLET and so must expand as that
+   macro rather than dispatch to its built-in handler."
+  (and (symbolp name)
+       (not (special-operator-name-p name))
+       (member name *macrolet-shadowed*)
+       t))
+
 (defvar *macroexpand-scope* '()
   "Stack of enclosing MACROLET scope markers (the source MACRO-DEFS cons of each
    active macrolet) for the current lexical position.  A single source form
@@ -1077,10 +1110,19 @@ through to compile-sym-lookup."
   (and (symbolp sym)
        (member sym '(&rest &body &optional &key &allow-other-keys &aux &whole &environment))))
 
-(defun extract-param-names (params)
-  "Extract variable names (as effective-name strings, see VAR-NAME) from a
-   lambda list, handling &optional/&key specs."
-  (let ((names '()) (state :required))
+(defun map-lambda-list-vars (params visit &optional (bound '()))
+  "Walk PARAMS as a lambda list, left to right, maintaining the scope CLHS
+   3.4.1.5 gives init forms: an init form sees the parameters to its left and
+   no others. VISIT, when non-NIL, is called as (funcall VISIT init-form scope)
+   for each &optional/&key/&aux parameter that has one, with SCOPE the names
+   visible at that point. Returns the scope after the whole lambda list: the
+   parameter names (as VAR-NAME strings) pushed onto BOUND, most recent first.
+
+   This is the only lambda-list state machine in the compiler. It used to be
+   copied per caller, and the copies had already drifted apart on what follows
+   &rest."
+  (let ((state :required)
+        (scope bound))
     (dolist (p params)
       (cond
         ((lambda-list-keyword-p p)
@@ -1090,59 +1132,39 @@ through to compile-sym-lookup."
            (&key (setf state :key))
            (&aux (setf state :aux))
            (t nil)))
+        ;; A non-keyword parameter after the &rest variable is not a valid
+        ;; lambda list; ignore it rather than binding a second rest name.
         ((eq state :done) nil)
         ((eq state :required)
-         (push (var-name p) names))
+         (push (var-name p) scope))
         ((eq state :rest)
-         (push (var-name p) names) (setf state :done))
-        ((eq state :optional)
-         (push (var-name (if (consp p) (car p) p)) names)
-         ;; supplied-p variable (third element of optional spec)
+         (push (var-name p) scope)
+         (setf state :done))
+        (t                              ; :optional / :key / :aux
+         (when (and visit (consp p) (cadr p))
+           (funcall visit (cadr p) scope))
+         ;; The parameter itself becomes visible only after its own init form.
+         (let ((name (if (consp p) (car p) p)))
+           ;; &key ((keyword var) init supplied-p): the variable is the cadr.
+           (when (consp name) (setf name (cadr name)))
+           (push (var-name name) scope))
          (when (and (consp p) (caddr p))
-           (push (var-name (caddr p)) names)))
-        ((eq state :key)
-         (if (consp p)
-             (let ((spec (car p)))
-               (push (var-name (if (consp spec) (cadr spec) spec)) names)
-               ;; supplied-p variable (third element of key spec)
-               (when (caddr p)
-                 (push (var-name (caddr p)) names)))
-             (push (var-name p) names)))
-        ((eq state :aux)
-         (push (var-name (if (consp p) (car p) p)) names))))
-    (nreverse names)))
+           (push (var-name (caddr p)) scope)))))
+    scope))
+
+(defun extract-param-names (params)
+  "Extract variable names (as effective-name strings, see VAR-NAME) from a
+   lambda list, handling &optional/&key specs."
+  (nreverse (map-lambda-list-vars params nil)))
 
 (defun scan-lambda-list-defaults (params bound free-ht)
   "Scan default value forms in &optional/&key parameters for free variable references.
    Per CLHS 3.4.1.5, each init-form may only refer to params to its left,
    so we progressively add param names to bound as we process each default."
-  (let ((state :required)
-        (progressive-bound bound))
-    (dolist (p params)
-      (cond
-        ((lambda-list-keyword-p p)
-         (case p
-           ((&rest &body) (setf state :rest))
-           (&optional (setf state :optional))
-           (&key (setf state :key))
-           (&aux (setf state :aux))
-           (t nil)))
-        ((eq state :required)
-         (push (var-name p) progressive-bound))
-        ((member state '(:optional :key :aux))
-         (when (consp p)
-           (let ((default-form (cadr p)))
-             (when default-form
-               (find-free-vars-expr default-form progressive-bound free-ht))))
-         ;; After evaluating default, this param is now visible to subsequent defaults
-         (let ((name (if (consp p) (car p) p)))
-           (when (consp name) (setf name (cadr name))) ;; &key ((keyword var) default)
-           (push (var-name name) progressive-bound))
-         ;; Also add supplied-p var if present
-         (when (and (consp p) (caddr p))
-           (push (var-name (caddr p)) progressive-bound)))
-        ((eq state :rest)
-         (push (var-name p) progressive-bound))))))
+  (map-lambda-list-vars params
+                        (lambda (init scope) (find-free-vars-expr init scope free-ht))
+                        bound)
+  nil)
 
 ;;; ============================================================
 ;;; Instruction builders (thin wrappers for readability)
@@ -1490,9 +1512,15 @@ through to compile-sym-lookup."
        `(lambda (form &optional ,env-arg)
           (let ((,env-var (or ,env-arg
                               (cons *macros*
+                                    ;; Innermost first: SYMBOL-MACROLET pushes onto
+                                    ;; *SYMBOL-MACROS*, so an outer binding of the
+                                    ;; same name sits behind the inner one and must
+                                    ;; not overwrite it (CLHS 5.1.2.1).
                                     (let ((ht (make-hash-table :test #'equal)))
                                       (dolist (entry *symbol-macros* ht)
-                                        (setf (gethash (symbol-name (car entry)) ht) (cdr entry))))))))
+                                        (let ((key (symbol-name (car entry))))
+                                          (unless (nth-value 1 (gethash key ht))
+                                            (setf (gethash key ht) (cdr entry))))))))))
             (destructuring-bind ,clean-params (cdr form)
               ,@mbody))))
       (t
@@ -1732,15 +1760,18 @@ through to compile-sym-lookup."
       ;; Must come before hash dispatch so flet can shadow built-in functions.
       ;; CL special operators must never be shadowed by flet — explicitly excluded.
       (if (and (symbolp op)
-               (not (member op '(quote function if progn let let* setq block return-from
-                                 tagbody go unwind-protect catch throw flet labels macrolet
-                                 symbol-macrolet the locally load-time-value eval-when
-                                 multiple-value-call multiple-value-prog1 progv)))
+               (not (special-operator-name-p op))
                (local-function-entry op))
           (compile-named-call op (cdr expr))
         ;; Hash table dispatch — O(1) for all registered ops (~250 cases).
         ;; *compile-was-toplevel* is already bound above; handlers use it directly.
-        (let ((handler (and (symbolp op) (gethash op *compile-form-handlers*))))
+        ;; A MACROLET binding for a handler name takes precedence: the handler
+        ;; table lowers several CL macros (WHEN, AND, …) as if they were special
+        ;; forms, but they remain macros the standard lets MACROLET shadow. With
+        ;; the handler skipped, the fallback below finds the local expander.
+        (let ((handler (and (symbolp op)
+                            (not (macrolet-shadowed-p op))
+                            (gethash op *compile-form-handlers*))))
           (if handler
               (funcall handler expr)
             ;; Fallback: cons-op cases, string=-based ops, macro expansion, named-call
@@ -2355,6 +2386,64 @@ through to compile-sym-lookup."
      t)
     (t nil)))
 
+(defun %long-operand-simple-p (expr)
+  "True when EXPR compiles to a straight-line push with no branches, labels or
+   exception regions — the only shape that is safe to leave half-evaluated on the
+   CIL stack while the other operand is compiled."
+  (or (integerp expr)
+      (symbolp expr)
+      (and (consp expr)
+           (member (car expr) '(the + - * 1+ 1- logand logior logxor lognot ash
+                                %dotimes-1+))
+           (every #'%long-operand-simple-p (cdr expr)))))
+
+(defun compile-long-binop-spilled (a b)
+  "Push both operands as int64, evaluating a non-straight-line operand into its
+   own Int64 temp first. Same reason as COMPILE-LONG-BINOP: an operand whose code
+   contains branches or a join label cannot run with the other operand pending on
+   the CIL stack."
+  (if (and (%long-operand-simple-p a) (%long-operand-simple-p b))
+      `(,@(compile-as-long a)
+        ,@(compile-as-long b))
+      (let ((ta (gen-local "LSA")) (tb (gen-local "LSB")))
+        `((:declare-local ,ta "Int64")
+          (:declare-local ,tb "Int64")
+          ,@(compile-as-long a)
+          (:stloc ,ta)
+          ,@(compile-as-long b)
+          (:stloc ,tb)
+          (:ldloc ,ta)
+          (:ldloc ,tb)))))
+
+(defun compile-long-binop (op a b)
+  "Emit a native int64 binop. Each operand that is not straight-line code is
+   evaluated into its own Int64 temp FIRST, so nothing of this expression is
+   pending on the CIL stack while that operand's code runs.
+
+   Leaving operand 1 on the stack across operand 2 is only valid if operand 2 is
+   branch-free. It is not, for instance, when operand 2 is a call to a function
+   proclaimed INLINE whose body is a COND: MAYBE-EXPAND-INLINE rewrites the call
+   to (LET (...) (BLOCK f body)), the block's arms jump to a join label, and the
+   pending operand makes the stack depth at that label disagree between paths.
+   The result was IL the JIT rejects outright — real libraries hit it (fset's
+   CHAMP nodes, where every accessor is an inlined COND used inside fixnum
+   arithmetic), and the failure surfaces only when the method is first CALLED,
+   because JIT is lazy."
+  (if (and (%long-operand-simple-p a) (%long-operand-simple-p b))
+      `(,@(compile-as-long a)
+        ,@(compile-as-long b)
+        (,op))
+      (let ((ta (gen-local "LBA")) (tb (gen-local "LBB")))
+        `((:declare-local ,ta "Int64")
+          (:declare-local ,tb "Int64")
+          ,@(compile-as-long a)
+          (:stloc ,ta)
+          ,@(compile-as-long b)
+          (:stloc ,tb)
+          (:ldloc ,ta)
+          (:ldloc ,tb)
+          (,op)))))
+
 (defun compile-as-long (expr)
   "Compile EXPR leaving an int64 on the stack. Caller must have verified
    fixnum-typed-p; this routine assumes the invariant."
@@ -2414,9 +2503,7 @@ through to compile-sym-lookup."
      (compile-as-long (caddr expr)))
     ((and (consp expr) (= (length expr) 3) (member (car expr) '(+ - *)))
      (let ((op (ecase (car expr) (+ :add) (- :sub) (* :mul))))
-       `(,@(compile-as-long (cadr expr))
-         ,@(compile-as-long (caddr expr))
-         (,op))))
+       (compile-long-binop op (cadr expr) (caddr expr))))
     ((and (consp expr) (= (length expr) 2) (eq (car expr) '1+))
      `(,@(compile-as-long (cadr expr))
        (:ldc-i8 1)
@@ -2434,9 +2521,7 @@ through to compile-sym-lookup."
     ;; Bitwise ops — leaves int64 on stack (callers box if needed)
     ((and (consp expr) (= (length expr) 3) (member (car expr) '(logand logior logxor)))
      (let ((op (ecase (car expr) (logand :and) (logior :or) (logxor :xor))))
-       `(,@(compile-as-long (cadr expr))
-         ,@(compile-as-long (caddr expr))
-         (,op))))
+       (compile-long-binop op (cadr expr) (caddr expr))))
     ((and (consp expr) (= (length expr) 2) (eq (car expr) 'lognot))
      `(,@(compile-as-long (cadr expr))
        (:not)))
@@ -2486,14 +2571,12 @@ through to compile-sym-lookup."
                   (:add "Runtime.AddFixnum")
                   (:sub "Runtime.SubtractFixnum")
                   (:mul "Runtime.MultiplyFixnum"))))
-    `(,@(compile-as-long (first args))
-      ,@(compile-as-long (second args))
+    `(,@(compile-long-binop-spilled (first args) (second args))
       (:call ,helper))))
 
 (defun compile-fixbit-binop (args op)
   "Emit native int64 bitwise binop (AND/OR/XOR), boxing result back to LispObject."
-  `(,@(compile-as-long (first args))
-    ,@(compile-as-long (second args))
+  `(,@(compile-long-binop-spilled (first args) (second args))
     (,op)
     (:call "Fixnum.Make")))
 
@@ -2532,9 +2615,57 @@ through to compile-sym-lookup."
                 (:le '((:cgt) (:ldc-i4 0) (:ceq)))   ; not greater
                 (:ge '((:clt) (:ldc-i4 0) (:ceq)))   ; not less
                 (:ne '((:ceq) (:ldc-i4 0) (:ceq)))))) ; not equal
-    `(,@(compile-as-long (first args))
-      ,@(compile-as-long (second args))
+    `(,@(compile-long-binop-spilled (first args) (second args))
       ,@body)))
+
+(defun literal-symbol-operand (expr)
+  "If EXPR is a quoted symbol literal other than T and NIL, return that symbol.
+   T and NIL are excluded because EQ and EQL bridge the T and NIL objects to
+   the T and NIL symbols, which a plain reference comparison does not do."
+  (and (consp expr)
+       (eq (car expr) 'quote)
+       (let ((s (cadr expr)))
+         (and (symbolp s) (not (null s)) (not (eq s t)) s))))
+
+(defun compile-sym-eq (args)
+  "Emit an inline reference comparison for (EQ x 'SYM) / (EQL x 'SYM).
+   Leaves an i4 (0 or 1) on stack — the same contract as COMPILE-FIXNUM-CMP.
+
+   Runtime.IsTrueEq is Primary on both sides, ReferenceEquals, then a bridge
+   that can only fire when one side is the T or NIL symbol; IsTrueEql adds the
+   number and character cases after that. So against any other symbol literal
+   the whole call reduces to Primary + a reference compare, and the literal
+   side needs neither. What is saved is the call itself, which CASE pays once
+   for every clause it walks past.
+
+   CEQ is symmetric, but the operands are still emitted in source order.
+   Loading a symbol literal is not a pure operation here: a keyword literal
+   interns on every execution, and a literal in another package resolves (and
+   can signal) at execution time. So compiling the other operand first would be
+   observable if the package state changed between compilation and the call.
+   When the literal comes first it goes through a temp rather than staying on
+   the stack, because the other operand may compile to code containing a try
+   region, and CIL only allows entering one with an empty stack."
+  (let* ((lit-first (literal-symbol-operand (first args)))
+         (lit (if lit-first (first args) (second args)))
+         (other (if lit-first (second args) (first args)))
+         (lit-instrs (let ((*in-tail-position* nil) (*in-mv-context* nil))
+                       (compile-expr lit)))
+         (other-instrs (let ((*in-tail-position* nil) (*in-mv-context* nil))
+                         (compile-expr other))))
+    (if lit-first
+        (let ((tmp (gen-local "SE")))
+          `((:declare-local ,tmp "LispObject")
+            ,@lit-instrs
+            (:stloc ,tmp)
+            ,@other-instrs
+            (:call "Runtime.Primary")
+            (:ldloc ,tmp)
+            (:ceq)))
+        `(,@other-instrs
+          (:call "Runtime.Primary")
+          ,@lit-instrs
+          (:ceq)))))
 
 ;;; ============================================================
 ;;; Double-float native arithmetic

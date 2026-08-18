@@ -61,7 +61,10 @@ Done — ran precompiled Lisp with no runtime code generation.
 - The dev SIL core (`cil-out.sil`) is used only at *build* time, to run the
   compiler; the *app* boots from the FASL core (`dotcl.core`), generated during
   the build, which loads without emitting.
-- This proves the contract on plain CoreCLR. Actual AOT validation (NativeAOT,
-  eventually IL2CPP) additionally needs the core/emitter split, so the runtime
-  can build with no `Reflection.Emit` reference at all; this sample is the
-  behavioural proof that gets you there.
+- This proves the contract on plain CoreCLR, where the emitter exists and is
+  merely forbidden. Two sibling samples prove it where the emitter cannot exist:
+  [`PrecompiledLispDemoAot`](../PrecompiledLispDemoAot) is a NativeAOT binary in
+  which `IsDynamicCodeSupported` is `False`, and
+  [`PrecompiledLispDemoWebGL`](../PrecompiledLispDemoWebGL) runs in the browser.
+  The runtime also builds against `netstandard2.0` with no `Reflection.Emit`
+  reference at all (`make build-ns2`), which is what those targets link.

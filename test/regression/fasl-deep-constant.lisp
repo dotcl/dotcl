@@ -124,3 +124,108 @@
 (deftest-compiled-only fasl-chunked-vector.roundtrip
   (%fasl-chunked-vector-case)
   (t 3000 (sub 0) 499 500 (sub 2996) 2999))
+
+;;; MANY medium literals inside ONE top level form. Individually every one of
+;;; them clears the existing caps — not deep, not a long list, not a long vector
+;;; — but they all land in the same method and simply accumulate. That is how a
+;;; single top level form reached megabytes of IL, which the JIT has to compile
+;;; in full when the fasl is loaded. Past a per-method budget each further
+;;; literal goes into its own helper method, so the round trip has to survive
+;;; boundaries that now fall in the middle of a form rather than a literal.
+
+(defun %fasl-many-literals-case ()
+  (let* ((n 60)
+         (per 40)
+         (tmp (format nil "~a/dotcl-manylit-~a"
+                      (or (dotcl:getenv "TEMP") "/tmp")
+                      (get-internal-real-time)))
+         (src (format nil "~a/src.lisp" tmp))
+         (fasl (format nil "~a/src.fasl" tmp)))
+    (ensure-directories-exist (concatenate 'string tmp "/"))
+    (with-open-file (s src :direction :output :if-exists :supersede)
+      (write-string "(defparameter *many* (make-hash-table :test #'eql))" s)
+      (terpri s)
+      ;; One form, so the literals cannot be separated by top level splitting.
+      (write-string "(let ((tbl *many*))" s)
+      (terpri s)
+      (dotimes (i n)
+        (format s "  (setf (gethash ~a tbl) '(" i)
+        (dotimes (j per)
+          (format s "(k~a-~a ~a ~a sym~a) " i j i j j))
+        (write-string "))" s)
+        (terpri s))
+      (write-string "  tbl)" s)
+      (terpri s))
+    (compile-file src)
+    (load fasl)
+    (let ((tbl (symbol-value (read-from-string "*many*"))))
+      (list (hash-table-count tbl)
+            ;; Entries from both sides of the spill boundary, and the tail of a
+            ;; literal that may itself have been continued in another method.
+            (length (gethash 0 tbl))
+            (first (gethash 0 tbl))
+            (first (gethash 59 tbl))
+            (car (last (gethash 59 tbl)))
+            (nth 17 (gethash 30 tbl))
+            ;; A literal must not be shared between two entries.
+            (eq (gethash 0 tbl) (gethash 1 tbl))
+            ;; The helper methods have to be in the fasl itself, not the
+            ;; process-local constant pool.
+            (%fasl-deep-file-contains-p fasl "GetConstant")))))
+
+(deftest-compiled-only fasl-many-literals.roundtrip
+  (%fasl-many-literals-case)
+  (60 40 (k0-0 0 0 sym0) (k59-0 59 0 sym0) (k59-39 59 39 sym39)
+      (k30-17 30 17 sym17) nil nil))
+
+;;; Uninterned symbols in literals get one static field each, so that every
+;;; occurrence of the same gensym loads the same object. All of them used to go
+;;; on CompiledModule, and .NET caps a type at 64K fields — past that the CLR
+;;; refuses the type with "Internal limitation: too many fields", naming neither
+;;; the file nor the cause. Fields now roll over onto holder types, so the EQ
+;;; guarantee has to survive a boundary that falls between two occurrences of
+;;; the same symbol.
+
+(defun %fasl-gensym-holder-case ()
+  (let* ((n 5000)                       ; > MaxFieldsPerHolder, so it rolls over
+         (tmp (format nil "~a/dotcl-gsymhold-~a"
+                      (or (dotcl:getenv "TEMP") "/tmp")
+                      (get-internal-real-time)))
+         (src (format nil "~a/src.lisp" tmp))
+         (fasl (format nil "~a/src.fasl" tmp)))
+    (ensure-directories-exist (concatenate 'string tmp "/"))
+    (with-open-file (s src :direction :output :if-exists :supersede)
+      ;; Each gensym appears twice, in two different top level forms, so the
+      ;; two loads can land on different holder types.
+      (write-string "(defparameter *a* '())" s) (terpri s)
+      (write-string "(defparameter *b* '())" s) (terpri s)
+      ;; One pool of symbol objects, made at compile time, spliced into both
+      ;; forms — so the two occurrences really are the same object and the fasl
+      ;; has to reproduce that.
+      (format s "(eval-when (:compile-toplevel :load-toplevel :execute)~%  ~
+                   (defparameter *pool*~%    ~
+                     (let ((acc '())) (dotimes (i ~a) (push (make-symbol (format nil \"G~~a\" i)) acc))~
+                       (nreverse acc))))" n)
+      (terpri s)
+      (write-string "(defmacro %gen (place)
+  `(progn ,@(mapcar (lambda (g) `(push ',g ,place)) *pool*)))" s)
+      (terpri s)
+      (write-string "(%gen *a*)" s) (terpri s)
+      (write-string "(%gen *b*)" s) (terpri s))
+    (compile-file src)
+    (load fasl)
+    (let ((a (symbol-value (read-from-string "*a*")))
+          (b (symbol-value (read-from-string "*b*"))))
+      (list (length a) (length b)
+            ;; Same gensym, two occurrences, two (possibly different) holders.
+            (every #'eq a b)
+            ;; Distinct gensyms stay distinct.
+            (length (remove-duplicates a :test #'eq))
+            (and (symbolp (first a)) (null (symbol-package (first a))))
+            ;; The rollover actually happened (holder types are named in the
+            ;; assembly's metadata).
+            (%fasl-deep-file-contains-p fasl "CompiledModuleLiterals")))))
+
+(deftest-compiled-only fasl-gensym-holders.eq-across-holders
+  (%fasl-gensym-holder-case)
+  (5000 5000 t 5000 t t))

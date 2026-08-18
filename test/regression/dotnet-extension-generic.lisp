@@ -69,3 +69,32 @@
   (handler-case (progn (dotnet:invoke (dneg-ints 1) "NoSuchMemberHere") :no-error)
     (error () :error))
   :error)
+
+;;; A delegate the caller built says what the other type parameters are: a
+;;; Func<int,string> pins TResult=string. Type-argument inference used to read the
+;;; receiver only and default the rest to object, so the supplied Func<int,string>
+;;; fit no parameter and the very same call that worked with a bare lambda
+;;; resolved to nothing.
+(deftest dneg-explicit-delegate-pins-result-type
+  (dneg-to-list
+   (dotnet:invoke (dneg-ints 1 2 3) "Select"
+                  (dotnet:make-delegate "System.Func`2[System.Int32,System.String]"
+                                        (lambda (x) (format nil "n~d" x)))))
+  ("n1" "n2" "n3"))
+
+;;; Naming the defining class outright is the same call. InvokeMember cannot
+;;; instantiate a generic definition, so this failed while the extension-style call
+;;; on the same list worked.
+(deftest dneg-static-generic-extension-by-name
+  (dneg-to-list (dotnet:static "System.Linq.Enumerable" "Select"
+                               (dneg-ints 1 2 3) (lambda (x) (* x 10))))
+  (10 20 30))
+
+;;; …but only from the class that declares it: naming an unrelated type must not
+;;; reach Enumerable's method.
+(deftest dneg-static-generic-does-not-cross-classes
+  (handler-case (progn (dotnet:static "System.Math" "Select"
+                                      (dneg-ints 1 2 3) (lambda (x) x))
+                       :no-error)
+    (error () :error))
+  :error)

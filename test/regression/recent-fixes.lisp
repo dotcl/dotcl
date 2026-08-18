@@ -91,17 +91,15 @@
 
 ;;; TCO — tail-recursive function shouldn't stack overflow.
 ;;;
-;;; Compiled-only because the tree-walk interpreter does NOT eliminate tail
-;;; calls: each iteration is a real .NET frame, so this blows the stack on an
-;;; emit-free build (where every call is interpreted). That is a genuine
-;;; limitation of that build, not a property of this test — it is tracked on its
-;;; own issue rather than hidden by the skip.
+;;; Both evaluators: the compiler eliminates a self tail call, and the tree-walk
+;;; evaluator hands one to its trampoline, so neither grows the stack per
+;;; iteration.
 (defun tco-count-down (n)
   (if (= n 0)
       :done
       (tco-count-down (- n 1))))
 
-(deftest-compiled-only tco-basic
+(deftest tco-basic
   (tco-count-down 100000)
   :done)
 
@@ -1655,8 +1653,10 @@
   :newest)
 
 
-;;; dotcl-thread must be loadable via the ASDF source-registry
-(deftest asdf-load-dotcl-thread
+;;; dotcl-thread must be loadable via the ASDF source-registry.
+;;; ASDF's LOAD-OP compiles every component, so this needs a build with a
+;;; compiler; a build without one cannot load a system at all today.
+(deftest-compiled-only asdf-load-dotcl-thread
   (progn
     (require "asdf")
     (asdf:load-system "dotcl-thread")
@@ -2539,7 +2539,8 @@
         (ignore-errors (delete-file src))
         (ignore-errors (delete-file fasl))))))
 
-(deftest i370-complex-literal-fasl-roundtrip
+;; COMPILE-FILE needs Reflection.Emit, so a build without it cannot answer this.
+(deftest-compiled-only i370-complex-literal-fasl-roundtrip
   (%i370-roundtrip)
   (#C(3 4) (1 #C(0 1) 2)))
 
@@ -4599,17 +4600,40 @@
   (let ((r (eval (%big488-chunkable 4000))))
     (and (integerp r) (> r 0)))
   t)
-;; The clear-error fallback still holds: when the body mutates an *enclosing
-;; lexical* variable it can't be wrapped in a closure (the mutation would be lost),
-;; so compile-progn leaves it as one method and the catchable "form too large"
-;; PROGRAM-ERROR surfaces instead of an opaque InvalidProgramException.
+;; A body mutating the LET's own lexical variable used to be unchunkable: by the
+;; time compile-progn saw it the variable's boxing was already decided, so a
+;; closure would have captured a stale copy and chunking was refused — leaving
+;; one oversized method and a "form too large" error. The rewrite now happens
+;; before the LET's capture/mutation scan, so the variable is boxed like any
+;; other captured-and-mutated variable and the chunks share the one cell. This
+;; shape compiles, and computes exactly what the plain loop does.
+(defun %big488-lexical (n)
+  `(let ((acc 0))
+     ,@(loop for i below n collect (%big488-heavy i 'acc))
+     acc))
+(defun %big488-expected (n)
+  (let ((acc 0))
+    (dotimes (i n)
+      (setf acc (+ acc
+                   (car (last (list (* i 2) (+ i 1) (- i 1))))
+                   (reduce #'+ (mapcar (lambda (x) (+ x i)) (list i i)))
+                   (length (format nil "~a-~a" i i)))))
+    acc))
+(deftest huge-lexical-mutation-form-chunks-and-matches
+  (= (eval (%big488-lexical 4000)) (%big488-expected 4000))
+  t)
+;; The clear-error fallback still holds where chunking is genuinely unsafe: a raw
+;; native slot (here a declared fixnum) cannot be captured by a closure without
+;; emitting invalid IL, so the body stays one method and the catchable "form too
+;; large" PROGRAM-ERROR surfaces instead of an opaque InvalidProgramException.
 ;; (Small methods that InvalidProgram are genuine codegen bugs and still surface
 ;; unchanged.)
 ;; Compiled-only: "form too large" is a limit of the IL a method can hold. The
 ;; interpreter has no such ceiling, so evaluating this is simply not an error.
-(deftest-compiled-only huge-monolithic-form-signals-clear-error
+(deftest-compiled-only huge-unchunkable-form-signals-clear-error
   (handler-case
       (progn (eval `(let ((acc 0))
+                      (declare (type fixnum acc))
                       ,@(loop for i below 4000 collect (%big488-heavy i 'acc))
                       acc))
              :no-error)
@@ -4880,3 +4904,28 @@
   (handler-case (progn (%ef-bytes "ef-t7.tmp" :external-format :no-such-format) :no-error)
     (error () :errored))
   :errored)
+
+;;; LOGICAL-PATHNAME-TRANSLATIONS of a host that was never defined must signal a
+;;; TYPE-ERROR, not return NIL. Libraries probe for a logical host by catching
+;;; that error and defining the host in the handler (cl-fad's TEMPORARY-FILES is
+;;; the common case); returning NIL skips the handler, leaves the host undefined
+;;; and lets "HOST:NAME" reach the file system as a physical name.
+(deftest logical-pathname-translations-undefined-host-signals
+  (list (handler-case (progn (logical-pathname-translations "NO-SUCH-HOST-XYZ") :no-error)
+          (type-error () :type-error))
+        (progn
+          (setf (logical-pathname-translations "DOTCLLPT") '(("**;*.*.*" "/tmp/**/*.*")))
+          (logical-pathname-translations "DOTCLLPT")))
+  (:type-error (("**;*.*.*" "/tmp/**/*.*"))))
+
+;;; LOGICAL-PATHNAME of a namestring whose host was never defined must signal a
+;;; TYPE-ERROR (CLHS 19.3.1: the host of a logical pathname namestring has to be
+;;; a defined logical host). It used to build a pathname for the unknown host,
+;;; so "HOST:NAME" reached the file system verbatim.
+(deftest logical-pathname-undefined-host-signals
+  (list (handler-case (progn (logical-pathname "NO-SUCH-HOST-XYZ:FOO.LISP") :no-error)
+          (type-error () :type-error))
+        (progn
+          (setf (logical-pathname-translations "DOTCLLP") '(("**;*.*.*" "/tmp/**/*.*")))
+          (typep (logical-pathname "DOTCLLP:FOO.LISP") 'logical-pathname)))
+  (:type-error t))

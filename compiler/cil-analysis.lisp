@@ -143,29 +143,11 @@
                          (let* ((params (cadr e))
                                 (lbody (cddr e))
                                 (inner-bound (append (extract-param-names params) bnd)))
-                           (let ((state :required)
-                                 (progressive-bound bnd))
-                             (dolist (p params)
-                               (cond
-                                 ((lambda-list-keyword-p p)
-                                  (case p
-                                    ((&rest &body) (setf state :rest))
-                                    (&optional (setf state :optional))
-                                    (&key (setf state :key))
-                                    (&aux (setf state :aux))
-                                    (t nil)))
-                                 ((eq state :required)
-                                  (push (var-name p) progressive-bound))
-                                 ((member state '(:optional :key :aux))
-                                  (when (and (consp p) (cadr p))
-                                    (push (cons (cadr p) (cons progressive-bound mdepth)) worklist))
-                                  (let ((name (if (consp p) (car p) p)))
-                                    (when (consp name) (setf name (cadr name)))
-                                    (push (var-name name) progressive-bound))
-                                  (when (and (consp p) (caddr p))
-                                    (push (var-name (caddr p)) progressive-bound)))
-                                 ((eq state :rest)
-                                  (push (var-name p) progressive-bound)))))
+                           (map-lambda-list-vars
+                            params
+                            (lambda (init scope)
+                              (push (cons init (cons scope mdepth)) worklist))
+                            bnd)
                            (dolist (form lbody)
                              (push (cons form (cons inner-bound mdepth)) worklist)))
                          ;; No active symbol-macro: merge the memoized free-var
@@ -392,30 +374,13 @@
                                   (fn-body (cddr fd))
                                   (inner-bound (append (extract-param-names params)
                                                        fn-body-bound)))
-                             ;; Inline scan-lambda-list-defaults for fn params
-                             (let ((state :required)
-                                   (progressive-bound fn-body-bound))
-                               (dolist (p params)
-                                 (cond
-                                   ((lambda-list-keyword-p p)
-                                    (case p
-                                      ((&rest &body) (setf state :rest))
-                                      (&optional (setf state :optional))
-                                      (&key (setf state :key))
-                                      (&aux (setf state :aux))
-                                      (t nil)))
-                                   ((eq state :required)
-                                    (push (var-name p) progressive-bound))
-                                   ((member state '(:optional :key :aux))
-                                    (when (and (consp p) (cadr p))
-                                      (push (cons (cadr p) (cons progressive-bound mdepth)) worklist))
-                                    (let ((name (if (consp p) (car p) p)))
-                                      (when (consp name) (setf name (cadr name)))
-                                      (push (var-name name) progressive-bound))
-                                    (when (and (consp p) (caddr p))
-                                      (push (var-name (caddr p)) progressive-bound)))
-                                   ((eq state :rest)
-                                    (push (var-name p) progressive-bound)))))
+                             ;; Init forms of the fn's own params: same scoping
+                             ;; rule as a lambda's (see MAP-LAMBDA-LIST-VARS).
+                             (map-lambda-list-vars
+                              params
+                              (lambda (init scope)
+                                (push (cons init (cons scope mdepth)) worklist))
+                              fn-body-bound)
                              ;; Push fn body forms
                              (dolist (form fn-body)
                                (push (cons form (cons inner-bound mdepth)) worklist)))))
@@ -512,28 +477,10 @@
     ;; &optional/&key/&aux default forms with progressive left-to-right scoping,
     ;; starting from the empty scope (a default referencing an enclosing-bound var
     ;; is reported here and removed by the caller's BND subtraction).
-    (let ((state :required) (progressive-bound '()))
-      (dolist (p params)
-        (cond
-          ((lambda-list-keyword-p p)
-           (case p
-             ((&rest &body) (setf state :rest))
-             (&optional (setf state :optional))
-             (&key (setf state :key))
-             (&aux (setf state :aux))
-             (t nil)))
-          ((eq state :required)
-           (push (var-name p) progressive-bound))
-          ((member state '(:optional :key :aux))
-           (when (and (consp p) (cadr p))
-             (find-free-vars-expr (cadr p) progressive-bound free-ht))
-           (let ((name (if (consp p) (car p) p)))
-             (when (consp name) (setf name (cadr name)))
-             (push (var-name name) progressive-bound))
-           (when (and (consp p) (caddr p))
-             (push (var-name (caddr p)) progressive-bound)))
-          ((eq state :rest)
-           (push (var-name p) progressive-bound)))))
+    (map-lambda-list-vars params
+                          (lambda (init scope)
+                            (find-free-vars-expr init scope free-ht))
+                          '())
     (dolist (form lbody)
       (find-free-vars-expr form inner-bound free-ht))
     (let ((keys '()))
@@ -860,26 +807,57 @@
 ;;;  adjacent op sequences rather than enumerating locals, so an unknown op simply
 ;;;  fails to match and passes through untouched — safe by construction.)
 
+;;; The DO- macros below are the authoritative description; the list-returning
+;;; functions are derived from them. A pass that walks every instruction of a
+;;; function body should use the macro: the list form conses a fresh one-element
+;;; list per instruction, which at one call per instruction per pass was a
+;;; visible share of the compiler's total allocation.
+
+(defmacro do-instr-local-reads ((var instr) &body body)
+  "Run BODY with VAR bound to each local KEY INSTR reads, including locals
+   carried in nested operand lists. Allocates nothing."
+  (let ((i (gensym "INSTR")) (k (gensym "KEY")))
+    `(let ((,i ,instr))
+       (when (consp ,i)
+         (case (car ,i)
+           (:ldloc (let ((,var (cadr ,i))) ,@body))
+           ;; The debug frame stores (:frame-set NAME KEY) and its box /
+           ;; native-rep variants all read KEY.
+           ((:frame-set :frame-set-box :frame-set-long :frame-set-double :frame-set-single)
+            (let ((,var (caddr ,i))) ,@body))
+           ;; (:dotnet-call-direct-locals TYPE METHOD RECV (ARG...) (PARAM...))
+           ;; RECV and each ARG are locals read by the call.
+           (:dotnet-call-direct-locals
+            (let ((,var (nth 3 ,i))) ,@body)
+            (dolist (,k (nth 4 ,i)) (let ((,var ,k)) ,@body)))
+           (t nil))))))
+
+(defmacro do-instr-local-writes ((var instr) &body body)
+  "Run BODY with VAR bound to each local KEY INSTR writes. Allocates nothing."
+  (let ((i (gensym "INSTR")))
+    `(let ((,i ,instr))
+       (when (and (consp ,i) (eq (car ,i) :stloc))
+         (let ((,var (cadr ,i))) ,@body)))))
+
+(defmacro do-instr-local-refs ((var instr) &body body)
+  "Run BODY with VAR bound to each local KEY INSTR reads or writes (for liveness
+   ranges / use counting). Allocates nothing."
+  (let ((i (gensym "INSTR")))
+    `(let ((,i ,instr))
+       (do-instr-local-writes (,var ,i) ,@body)
+       (do-instr-local-reads (,var ,i) ,@body))))
+
 (defun instr-local-reads (instr)
   "Local KEYs INSTR reads, including locals carried in nested operand lists."
-  (when (consp instr)
-    (case (car instr)
-      (:ldloc (list (cadr instr)))
-      ;; The debug frame stores (:frame-set NAME KEY) and its box / native-rep
-      ;; variants all read KEY.
-      ((:frame-set :frame-set-box :frame-set-long :frame-set-double :frame-set-single)
-       (list (caddr instr)))
-      ;; (:dotnet-call-direct-locals TYPE METHOD RECV (ARG...) (PARAM...))
-      ;; RECV and each ARG are locals read by the call.
-      (:dotnet-call-direct-locals (cons (nth 3 instr) (nth 4 instr)))
-      (t nil))))
+  (let ((acc '()))
+    (do-instr-local-reads (k instr) (push k acc))
+    (nreverse acc)))
 
 (defun instr-local-writes (instr)
   "Local KEYs INSTR writes."
-  (when (consp instr)
-    (case (car instr)
-      (:stloc (list (cadr instr)))
-      (t nil))))
+  (let ((acc '()))
+    (do-instr-local-writes (k instr) (push k acc))
+    (nreverse acc)))
 
 (defun instr-local-refs (instr)
   "All local KEYs INSTR reads or writes (for liveness ranges / use counting)."
@@ -895,9 +873,12 @@
    absent from RENAME is left unchanged). Covers :declare-local/:ldloc/:stloc,
    the debug (:frame-set[-box] NAME KEY) stores, and the RECV + ARG locals of
    :dotnet-call-direct-locals. Other instrs are returned unchanged."
+  ;; RN is a macrolet, not an flet: this runs once per instruction of every
+  ;; function body compiled, and a local function that is also referenced as
+  ;; #'RN materializes a closure object on each entry.
   (if (not (consp instr))
       instr
-      (flet ((rn (k) (or (gethash k rename) k)))
+      (macrolet ((rn (k) `(let ((key ,k)) (or (gethash key rename) key))))
         (case (car instr)
           (:declare-local `(:declare-local ,(rn (cadr instr)) ,(caddr instr)))
           (:ldloc `(:ldloc ,(rn (cadr instr))))
@@ -908,7 +889,7 @@
            `(:dotnet-call-direct-locals
              ,(nth 1 instr) ,(nth 2 instr)
              ,(rn (nth 3 instr))
-             ,(mapcar #'rn (nth 4 instr))
+             ,(loop for k in (nth 4 instr) collect (rn k))
              ,(nth 5 instr)))
           (t instr)))))
 
@@ -933,8 +914,8 @@
       ;; Count writes and reads via the central enumerator so locals embedded in
       ;; nested operands (e.g. :dotnet-call-direct-locals) raise the read count and
       ;; correctly disqualify a key from single-ref removal.
-      (dolist (k (instr-local-writes instr)) (incf (gethash k stloc-count 0)))
-      (dolist (k (instr-local-reads instr))  (incf (gethash k ldloc-count 0))))
+      (do-instr-local-writes (k instr) (incf (gethash k stloc-count 0)))
+      (do-instr-local-reads (k instr)  (incf (gethash k ldloc-count 0))))
     ;; Eligible keys: single stloc, single ldloc, LispObject type
     (let ((single-ref (make-hash-table :test #'equal)))
       (maphash (lambda (key sc)
@@ -1003,6 +984,13 @@
                                           ; store result is dead — pop the raw r8
                                           ; instead. (Float-array setf in
                                           ; statement position.)
+     P8  (:newobj \"LispString\") (:pop)  ->  (:pop)    ; string sibling of P6
+     P9  (:ldstr S) (:pop)              -> {}          ; dead string constant.
+                                          ; P8+P9 compose to delete a string
+                                          ; literal in statement position — a
+                                          ; documentation string compiles to
+                                          ; exactly that, and without this
+                                          ; allocates a LispString per call.
    (P3+P4 compose across the fixpoint to delete the dead nil/unwrap/pop preamble
     that codegen emits at the top of every TCO loop body.)
 
@@ -1075,6 +1063,21 @@
                (setf changed t)
                (push i1 out)
                (setf cur (cddr cur)))
+              ;; P8: wrap a raw string only to discard it. The LispString ctor is
+              ;; pure, so drop the newobj and pop the raw string instead.
+              ((and (consp i1) (eq (car i1) :newobj) (equal (cadr i1) "LispString")
+                    (consp i2) (eq (car i2) :pop))
+               (setf changed t)
+               (push i2 out)
+               (setf cur (cddr cur)))
+              ;; P9: push a string constant then immediately discard it — dead.
+              ;; Composes with P8 to delete a string literal in statement
+              ;; position, which is what a documentation string compiles to: it
+              ;; would otherwise allocate a fresh LispString on every call.
+              ((and (consp i1) (eq (car i1) :ldstr)
+                    (consp i2) (eq (car i2) :pop))
+               (setf changed t)
+               (setf cur (cddr cur)))
               (t
                (push i1 out)
                (setf cur (cdr cur))))))
@@ -1130,14 +1133,14 @@
         (local-type (make-hash-table :test #'equal))
         (pos 0))
     ;; Pass 1: collect types and compute [first-pos, last-pos] for each key.
-    ;; instr-local-refs returns every local a key reads/writes — including those
-    ;; embedded in nested operand lists (:dotnet-call-direct-locals) — so their
-    ;; live ranges extend to the using op and the slot-share scan won't merge
-    ;; another local over a still-live nested reference.
+    ;; do-instr-local-refs visits every local a key reads/writes — including
+    ;; those embedded in nested operand lists (:dotnet-call-direct-locals) — so
+    ;; their live ranges extend to the using op and the slot-share scan won't
+    ;; merge another local over a still-live nested reference.
     (dolist (instr instrs)
       (let ((decl (instr-declared-local instr)))
         (when decl (setf (gethash (car decl) local-type) (cdr decl))))
-      (dolist (key (instr-local-refs instr))
+      (do-instr-local-refs (key instr)
         (unless (gethash key first-pos)
           (setf (gethash key first-pos) pos))
         (setf (gethash key last-pos) pos))

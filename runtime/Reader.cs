@@ -271,6 +271,14 @@ public class Reader
         }
     }
 
+    /// <summary>Read the following forms as part of an enclosing read (CLHS's
+    /// recursive-p): #n= labels defined in one of them stay visible to the next,
+    /// because the label tables are cleared on entering a TOP-level read only.
+    /// Pair with <see cref="ExitRecursiveRead"/> in a finally.</summary>
+    public void EnterRecursiveRead() => _topLevelReadDepth++;
+
+    public void ExitRecursiveRead() => _topLevelReadDepth--;
+
     public bool TryRead(out LispObject result)
     {
         // Sync *read-suppress* dynamic variable
@@ -352,8 +360,13 @@ public class Reader
         {
             int ch = Peek();
 
-            // EOF
-            if (ch == -1) throw new EndOfStreamException("End of input");
+            // EOF. Getting here always means a form was required: TryRead checks
+            // for a clean end of input before it ever calls this, so the only
+            // callers left are the ones reading a component of an object already
+            // begun (a quoted form, a dotted tail, a #. body). CLHS says such an
+            // end of file signals END-OF-FILE whatever eof-error-p says, and a
+            // raw .NET exception here would surface as a PROGRAM-ERROR instead.
+            if (ch == -1) throw MakeEndOfFileError("End of input");
 
             var st = rt.GetSyntaxType((char)ch);
 
@@ -762,12 +775,19 @@ public class Reader
 
     /// <summary>
     /// Expand a backquoted list by processing each element.
-    /// Returns an APPEND of LIST/spliced segments.
+    ///
+    /// Elements that are not spliced are collected into runs and emitted as one
+    /// LIST call per run; a run that reaches a dotted tail becomes LIST*. Only a
+    /// ,@ forces an APPEND. Wrapping every element in its own (LIST x) and
+    /// folding the lot with binary APPEND — the obvious expansion — costs a call
+    /// and a fresh cons per element, and APPEND is variadic, so each one also
+    /// compiles to an args array. Macro bodies are mostly backquote, so this is
+    /// paid by every macro in every program.
     /// </summary>
     private LispObject ExpandBackquoteList(Cons form)
     {
-        var segments = new List<LispObject>();
-        var nspliceIndices = new HashSet<int>();
+        // Element expressions in order, each with whether it splices into place.
+        var items = new List<(LispObject Form, bool Splice)>();
         LispObject current = form;
 
         while (current is Cons c)
@@ -782,37 +802,36 @@ public class Reader
                     // ,@x or ,.x → x (spliced)
                     // Treat ,. same as ,@ (use APPEND not NCONC) to avoid
                     // circular list structures from destructive splicing
-                    var spliceForm = ((Cons)inner.Cdr).Car;
-                    segments.Add(spliceForm);
+                    items.Add((((Cons)inner.Cdr).Car, true));
                 }
                 else if (inner.Car is Symbol uq && ReferenceEquals(uq, Startup.UNQUOTE))
                 {
-                    // ,x → (LIST x)
-                    segments.Add(MakeList(Startup.Sym("LIST"), ((Cons)inner.Cdr).Car));
+                    // ,x → x, as one element
+                    items.Add((((Cons)inner.Cdr).Car, false));
                 }
                 else
                 {
-                    // Nested list → (LIST (expand-backquote inner))
-                    segments.Add(MakeList(Startup.Sym("LIST"), ExpandBackquote(inner)));
+                    // Nested list → its own expansion, as one element
+                    items.Add((ExpandBackquote(inner), false));
                 }
             }
             else if (element is Symbol usym && ReferenceEquals(usym, Startup.UNQUOTE))
             {
                 // Dot-position unquote: `(a . ,b) — but this shouldn't happen
                 // since ReadComma wraps in (UNQUOTE x)
-                segments.Add(MakeList(Startup.Sym("LIST"), element));
+                items.Add((element, false));
             }
             else if (IsBackquoteVector(element))
             {
                 // A nested `#(...) element — expand it recursively (CLHS 2.4.6),
                 // e.g. `#(1 #(2 ,x) 3). Without this it fell to the atom branch and
                 // was quoted, leaving inner unquotes unprocessed.
-                segments.Add(MakeList(Startup.Sym("LIST"), ExpandBackquote(element)));
+                items.Add((ExpandBackquote(element), false));
             }
             else
             {
-                // Atom element → (LIST (QUOTE atom))
-                segments.Add(MakeList(Startup.Sym("LIST"), MakeList(Startup.QUOTE, element)));
+                // Atom element → (QUOTE atom)
+                items.Add((MakeList(Startup.QUOTE, element), false));
             }
 
             current = c.Cdr;
@@ -825,55 +844,95 @@ public class Reader
                 break;
         }
 
-        // Handle dotted tail
+        // The tail of a dotted template is a value, not a list of elements:
+        // `(a . ,b) ends with B itself, `(a . b) with 'B.
+        LispObject? dottedTail = null;
         if (current is not Nil)
         {
-            // Dotted pair tail
-            if (current is Cons dc && dc.Car is Symbol dcs && ReferenceEquals(dcs, Startup.UNQUOTE))
-            {
-                // `(a . ,b) → tail is (UNQUOTE b)
-                segments.Add(((Cons)dc.Cdr).Car);
-            }
-            else
-            {
-                segments.Add(MakeList(Startup.QUOTE, current));
-            }
+            dottedTail = current is Cons dc && dc.Car is Symbol dcs
+                         && ReferenceEquals(dcs, Startup.UNQUOTE)
+                ? ((Cons)dc.Cdr).Car
+                : MakeList(Startup.QUOTE, current);
         }
 
-        // Optimize: if only one segment and no splicing needed
-        if (segments.Count == 1 && current is Nil)
-            return segments[0];
+        if (items.Count == 0)
+            return dottedTail ?? Nil.Instance;
 
-        // Build (APPEND seg1 seg2 ...) for multiple segments
-        // But our Runtime.Append only takes 2 args, so nest them
-        if (segments.Count == 0)
-            return Nil.Instance;
-
-        var result = segments[segments.Count - 1];
-        // If the last segment came from a proper list (nil tail), wrap in append context
-        if (current is Nil && segments.Count > 1)
+        // Build right to left. RESULT is the tail the elements to its left are
+        // consed onto: a dotted tail to start with, then whatever the pieces
+        // further right produced. A run of elements in front of a tail is LIST*;
+        // a run with nothing to its right is LIST, or QUOTE when every element of
+        // it is constant — a template with no unquotes builds nothing at run time
+        // (CLHS 2.4.6 allows the result to share structure with the template).
+        LispObject? result = dottedTail;
+        int end = items.Count;
+        while (end > 0)
         {
-            for (int i = segments.Count - 2; i >= 0; i--)
+            if (items[end - 1].Splice)
             {
-                var op = nspliceIndices.Contains(i) ? Startup.Sym("NCONC") : Startup.Sym("APPEND");
-                result = MakeList(op, segments[i], result);
+                var spliced = items[end - 1].Form;
+                result = result == null
+                    ? spliced
+                    : MakeList(Startup.Sym("APPEND"), spliced, result);
+                end--;
+                continue;
             }
+            int start = end;
+            while (start > 0 && !items[start - 1].Splice) start--;
+            var run = new List<LispObject>();
+            for (int i = start; i < end; i++) run.Add(items[i].Form);
+            result = BuildRun(run, result);
+            end = start;
         }
-        else if (current is not Nil)
+        return result!;
+    }
+
+    /// <summary>
+    /// Emit the code for a run of non-spliced template elements consed onto TAIL
+    /// (null = the run ends the list). Constant elements at the end of the run
+    /// join a quoted tail rather than being built one call at a time.
+    /// </summary>
+    private static LispObject BuildRun(List<LispObject> run, LispObject? tail)
+    {
+        // How many elements at the end of the run are (QUOTE x)? A nested
+        // template that folded to a quoted literal counts, so a constant
+        // sub-template does not force construction of its parent either.
+        int constFrom = run.Count;
+        while (constFrom > 0 && QuotedValue(run[constFrom - 1]) != null) constFrom--;
+
+        var tailQuoted = tail == null ? Nil.Instance : QuotedValue(tail);
+        if (constFrom < run.Count && tailQuoted != null)
         {
-            // Dotted tail: last segment is the tail value
-            for (int i = segments.Count - 2; i >= 0; i--)
-            {
-                var op = nspliceIndices.Contains(i) ? Startup.Sym("NCONC") : Startup.Sym("APPEND");
-                result = MakeList(op, segments[i], result);
-            }
-        }
-        else
-        {
-            // Single segment, already handled above
+            // Fold the constant suffix (and a constant tail) into one literal.
+            LispObject lit = tailQuoted;
+            for (int i = run.Count - 1; i >= constFrom; i--)
+                lit = new Cons(QuotedValue(run[i])!, lit);
+            var folded = MakeList(Startup.QUOTE, lit);
+            if (constFrom == 0) return folded;          // the whole run is constant
+            var head = new List<LispObject>();
+            for (int i = 0; i < constFrom; i++) head.Add(run[i]);
+            head.Add(folded);
+            return MakeListFrom(Startup.Sym("LIST*"), head);
         }
 
-        return result;
+        if (tail == null) return MakeListFrom(Startup.Sym("LIST"), run);
+        var args = new List<LispObject>(run) { tail };
+        return MakeListFrom(Startup.Sym("LIST*"), args);
+    }
+
+    /// <summary>The value inside (QUOTE x), or null if FORM is not a QUOTE.</summary>
+    private static LispObject? QuotedValue(LispObject form) =>
+        form is Cons c && c.Car is Symbol s && ReferenceEquals(s, Startup.QUOTE)
+        && c.Cdr is Cons rest && rest.Cdr is Nil
+            ? rest.Car
+            : null;
+
+    /// <summary>(OP a1 a2 ...) from an operator and its argument forms.</summary>
+    private static LispObject MakeListFrom(LispObject op, List<LispObject> args)
+    {
+        LispObject tail = Nil.Instance;
+        for (int i = args.Count - 1; i >= 0; i--) tail = new Cons(args[i], tail);
+        return new Cons(op, tail);
     }
 
     /// <summary>Reader macro function for , (CLHS 2.4.7).</summary>

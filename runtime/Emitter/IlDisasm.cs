@@ -147,7 +147,7 @@ public static class IlDisasm
     private static LispObject EmitInstr(OpCode op, byte[] il, ref int pc,
         Module module, Dictionary<int, string> labels)
     {
-        string name = op.Name.Replace('.', '-').ToUpperInvariant();
+        string name = (op.Name ?? "UNKNOWN").Replace('.', '-').ToUpperInvariant();
         switch (op.OperandType)
         {
             case OperandType.InlineNone:

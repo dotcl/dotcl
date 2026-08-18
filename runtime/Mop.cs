@@ -65,34 +65,17 @@ public static class Mop
 
 
         // -- Class introspection ------------------------------------------
-        RegisterMop("CLASS-DIRECT-SUPERCLASSES", 1, args =>
-            args[0] is LispClass c ? Runtime.List(c.DirectSuperclasses.Cast<LispObject>().ToArray()) : Nil.Instance);
+        RegisterMop("CLASS-DIRECT-SUPERCLASSES", 1, args => Runtime.ClassDirectSuperclasses(args[0]));
 
-        RegisterMop("CLASS-DIRECT-SUBCLASSES", 1, args =>
-        {
-            if (args[0] is not LispClass c) return Nil.Instance;
-            // Not maintained as a back-link; scan the registry. Cheap enough
-            // for occasional MOP introspection.
-            var subs = new List<LispObject>();
-            foreach (var cls in Runtime.AllClasses())
-                if (Array.IndexOf(cls.DirectSuperclasses, c) >= 0)
-                    subs.Add(cls);
-            return Runtime.List(subs.ToArray());
-        });
+        RegisterMop("CLASS-DIRECT-SUBCLASSES", 1, args => Runtime.ClassDirectSubclasses(args[0]));
 
-        RegisterMop("CLASS-PRECEDENCE-LIST", 1, args =>
-            args[0] is LispClass c ? Runtime.List(c.ClassPrecedenceList.Cast<LispObject>().ToArray()) : Nil.Instance);
+        RegisterMop("CLASS-PRECEDENCE-LIST", 1, args => Runtime.ClassPrecedenceListOf(args[0]));
 
-        RegisterMop("CLASS-FINALIZED-P", 1, args =>
-            // dotcl finalizes eagerly during defclass; treat all classes as
-            // finalized once they exist (forward-referenced ones are not).
-            args[0] is LispClass c && !c.IsForwardReferenced ? T.Instance : Nil.Instance);
+        RegisterMop("CLASS-FINALIZED-P", 1, args => Runtime.ClassFinalizedP(args[0]));
 
-        RegisterMop("CLASS-SLOTS", 1, args =>
-            args[0] is LispClass c ? Runtime.List(c.EffectiveSlots.Cast<LispObject>().ToArray()) : Nil.Instance);
+        RegisterMop("CLASS-SLOTS", 1, args => Runtime.ClassSlots(args[0]));
 
-        RegisterMop("CLASS-DIRECT-SLOTS", 1, args =>
-            args[0] is LispClass c ? Runtime.List(c.DirectSlots.Cast<LispObject>().ToArray()) : Nil.Instance);
+        RegisterMop("CLASS-DIRECT-SLOTS", 1, args => Runtime.ClassDirectSlots(args[0]));
 
         RegisterMop("CLASS-DEFAULT-INITARGS", 1, args =>
         {
@@ -112,41 +95,25 @@ public static class Mop
             return Runtime.List(items);
         });
 
-        RegisterMop("CLASS-PROTOTYPE", 1, args =>
-        {
-            // AMOP: returns "an instance of class" without running initialize-instance.
-            // Must return the SAME instance every call (memoized on the class) —
-            // EQL-method dispatch (e.g. McCLIM define-presentation-method) relies
-            // on (eql class-prototype) being stable across definition and call.
-            if (args[0] is not LispClass c)
-                throw new LispErrorException(new LispTypeError("CLASS-PROTOTYPE: not a class", args[0]));
-            return c.Prototype;
-        });
+        // AMOP: "an instance of class" without running initialize-instance, and the
+        // SAME instance every call (memoized on the class) — EQL-method dispatch
+        // (e.g. McCLIM define-presentation-method) relies on that identity.
+        RegisterMop("CLASS-PROTOTYPE", 1, args => Runtime.ClassPrototypeOf(args[0]));
 
         // -- Slot introspection -------------------------------------------
-        RegisterMop("SLOT-DEFINITION-NAME", 1, args =>
-            args[0] is SlotDefinition s ? s.Name : Nil.Instance);
+        RegisterMop("SLOT-DEFINITION-NAME", 1, args => Runtime.SlotDefinitionName(args[0]));
 
-        RegisterMop("SLOT-DEFINITION-ALLOCATION", 1, args =>
-            args[0] is SlotDefinition s
-                ? Startup.Keyword(s.IsClassAllocation ? "CLASS" : "INSTANCE")
-                : Nil.Instance);
+        RegisterMop("SLOT-DEFINITION-ALLOCATION", 1, args => Runtime.SlotDefinitionAllocation(args[0]));
 
-        RegisterMop("SLOT-DEFINITION-INITARGS", 1, args =>
-            args[0] is SlotDefinition s ? Runtime.List(s.Initargs.Cast<LispObject>().ToArray()) : Nil.Instance);
+        RegisterMop("SLOT-DEFINITION-INITARGS", 1, args => Runtime.SlotDefinitionInitargs(args[0]));
 
-        RegisterMop("SLOT-DEFINITION-INITFUNCTION", 1, args =>
-            args[0] is SlotDefinition s && s.InitformThunk is { } f ? (LispObject)f : Nil.Instance);
+        RegisterMop("SLOT-DEFINITION-INITFUNCTION", 1, args => Runtime.SlotDefinitionInitfunction(args[0]));
 
-        RegisterMop("SLOT-DEFINITION-INITFORM", 1, args =>
-            // dotcl doesn't preserve the source form, only the compiled thunk.
-            // Returning NIL is honest; downstream lib that needs the form
-            // should also handle the no-thunk case.
-            Nil.Instance);
+        RegisterMop("SLOT-DEFINITION-INITFORM", 1, args => Runtime.SlotDefinitionInitform(args[0]));
 
-        RegisterMop("SLOT-DEFINITION-TYPE", 1, args => Startup.Sym("T"));        // not tracked
-        RegisterMop("SLOT-DEFINITION-READERS", 1, args => Nil.Instance);         // not tracked
-        RegisterMop("SLOT-DEFINITION-WRITERS", 1, args => Nil.Instance);         // not tracked
+        RegisterMop("SLOT-DEFINITION-TYPE", 1, args => Runtime.SlotDefinitionType(args[0]));
+        RegisterMop("SLOT-DEFINITION-READERS", 1, args => Runtime.SlotDefinitionReaders(args[0]));
+        RegisterMop("SLOT-DEFINITION-WRITERS", 1, args => Runtime.SlotDefinitionWriters(args[0]));
         RegisterMop("SLOT-DEFINITION-LOCATION", 1, args =>
         {
             // AMOP: a non-negative integer index into the instance layout for
@@ -196,13 +163,9 @@ public static class Mop
         }
 
         // -- Generic function / method introspection ----------------------
-        RegisterMop("GENERIC-FUNCTION-NAME", 1, args =>
-            args[0] is GenericFunction gf ? gf.Name : Nil.Instance);
+        RegisterMop("GENERIC-FUNCTION-NAME", 1, args => Runtime.GenericFunctionName(args[0]));
 
-        RegisterMop("GENERIC-FUNCTION-METHODS", 1, args =>
-            args[0] is GenericFunction gf
-                ? Runtime.List(gf.Methods.Cast<LispObject>().ToArray())
-                : Nil.Instance);
+        RegisterMop("GENERIC-FUNCTION-METHODS", 1, args => Runtime.GenericFunctionMethods(args[0]));
 
         RegisterMop("GENERIC-FUNCTION-METHOD-CLASS", 1, args =>
             (LispObject?)Runtime.FindClassOrNil(Startup.Sym("STANDARD-METHOD")) ?? Nil.Instance);
@@ -253,15 +216,9 @@ public static class Mop
             return result;
         });
 
-        RegisterMop("METHOD-GENERIC-FUNCTION", 1, args =>
-            args[0] is LispMethod m && m.Owner is { } o ? (LispObject)o : Nil.Instance);
+        RegisterMop("METHOD-GENERIC-FUNCTION", 1, args => Runtime.MethodGenericFunction(args[0]));
 
-        RegisterMop("METHOD-LAMBDA-LIST", 1, args =>
-        {
-            if (args[0] is not LispMethod m) return Nil.Instance;
-            return BuildLambdaListPlaceholder(m.RequiredCount, m.OptionalCount,
-                m.HasRest, m.HasKey, m.KeywordNames, m.HasAllowOtherKeys);
-        });
+        RegisterMop("METHOD-LAMBDA-LIST", 1, args => Runtime.MethodLambdaList(args[0]));
 
         // -- Specializer / EQL specializer --------------------------------
         RegisterMop("EQL-SPECIALIZER-OBJECT", 1, args =>
@@ -608,7 +565,7 @@ public static class Mop
         // only needs sym.Function to be set, which is enough.
     }
 
-    private static LispObject BuildLambdaListPlaceholder(
+    internal static LispObject BuildLambdaListPlaceholder(
         int required, int optional, bool hasRest, bool hasKey,
         IReadOnlyList<string> keywordNames, bool hasAOK)
     {

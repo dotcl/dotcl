@@ -8,7 +8,7 @@
 ;;; Compiled code has that try/catch: COMPILE-HANDLER-CASE emits one and converts
 ;;; what it catches. The tree-walk evaluator had none, so
 ;;;
-;;;   (handler-case (make-hash-table :weakness :bogus) (error (c) :caught))
+;;;   (handler-case (dotcl::%throw-raw-clr-exception) (error (c) :caught))
 ;;;
 ;;; returned :CAUGHT compiled and flew past the handler interpreted. It was easy
 ;;; to miss because an enclosing COMPILED handler-case catches the escapee, so the
@@ -38,7 +38,7 @@
 ;;; --- the raw .NET exception is caught by an interpreted handler
 
 (defparameter %ihr-hc
-  '(handler-case (make-hash-table :weakness :bogus)
+  '(handler-case (dotcl::%throw-raw-clr-exception)
     (error (c) (list :caught (type-of c)))))
 
 (deftest-compiled-only interp-handler-raw-dotnet.handler-case-compile
@@ -50,12 +50,17 @@
   (:caught program-error))
 
 ;;; The source really is a raw .NET throw, not a Lisp condition that would have
-;;; been caught anyway: the condition carries the CLR exception type. If
-;;; MAKE-HASH-TABLE is ever changed to signal a Lisp condition directly, this
-;;; fails and the test needs a different raw-throwing source — otherwise the rest
-;;; of this file would keep passing while testing nothing.
+;;; been caught anyway: the condition carries the CLR exception type.
+;;;
+;;; The source is DOTCL::%THROW-RAW-CLR-EXCEPTION, which exists for this test.
+;;; Earlier versions used whatever runtime function happened to throw a raw
+;;; exception at the time -- MAKE-HASH-TABLE with a bad :weakness, then the
+;;; printer radix check -- and each one broke this file the day that bug was
+;;; fixed. Worse than breaking: the file would keep passing while testing
+;;; nothing, if the replacement source had stopped being raw unnoticed. A
+;;; deliberate thrower is the only source that stays raw on purpose.
 (deftest interp-handler-raw-dotnet.source-is-really-raw
-  (%ihr :interpret '(handler-case (make-hash-table :weakness :bogus)
+  (%ihr :interpret '(handler-case (dotcl::%throw-raw-clr-exception)
                      (error (c) (let ((ty (dotnet:exception-type c)))
                                   (and ty (search "ArgumentException"
                                                   (princ-to-string ty))
@@ -67,7 +72,7 @@
 (defparameter %ihr-hb-transfer
   '(catch 'out
     (handler-bind ((error (lambda (c) (throw 'out (list :caught (type-of c))))))
-      (make-hash-table :weakness :bogus))))
+      (dotcl::%throw-raw-clr-exception))))
 
 (deftest-compiled-only interp-handler-raw-dotnet.handler-bind-transfer-compile
   (%ihr :compile %ihr-hb-transfer)
@@ -84,7 +89,7 @@
   '(let ((ran nil))
     (list (handler-case
               (handler-bind ((error (lambda (c) (declare (ignore c)) (setq ran t))))
-                (make-hash-table :weakness :bogus))
+                (dotcl::%throw-raw-clr-exception))
             (error () :propagated))
           ran)))
 
@@ -102,18 +107,18 @@
 
 ;;; a clause whose type does not match must not catch
 (deftest-compiled-only interp-handler-raw-dotnet.type-must-match-compile
-  (%ihr :compile '(handler-case (make-hash-table :weakness :bogus) (type-error () :wrong)))
+  (%ihr :compile '(handler-case (dotcl::%throw-raw-clr-exception) (type-error () :wrong)))
   (:escaped program-error))
 
 (deftest interp-handler-raw-dotnet.type-must-match-interpret
-  (%ihr :interpret '(handler-case (make-hash-table :weakness :bogus) (type-error () :wrong)))
+  (%ihr :interpret '(handler-case (dotcl::%throw-raw-clr-exception) (type-error () :wrong)))
   (:escaped program-error))
 
 ;;; UNWIND-PROTECT cleanup runs on the way out
 (deftest interp-handler-raw-dotnet.unwind-protect-runs-interpret
   (%ihr :interpret '(let ((c nil))
                      (list (handler-case
-                               (unwind-protect (make-hash-table :weakness :bogus)
+                               (unwind-protect (dotcl::%throw-raw-clr-exception)
                                  (setq c :cleaned))
                              (error () :caught))
                            c)))
@@ -122,7 +127,7 @@
 ;;; the innermost handler-case wins
 (deftest interp-handler-raw-dotnet.innermost-wins-interpret
   (%ihr :interpret '(handler-case
-                     (handler-case (make-hash-table :weakness :bogus) (error () :inner))
+                     (handler-case (dotcl::%throw-raw-clr-exception) (error () :inner))
                      (error () :outer)))
   :inner)
 

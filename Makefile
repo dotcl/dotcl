@@ -7,7 +7,7 @@ DOTCL_LISP ?= ros -L sbcl-bin run
 STDBUF ?=
 SETSID ?= $(shell which setsid 2>/dev/null)
 
-.PHONY: all build build-ns2 check-contrib-freshness run clean repl test-core-bytes test-coverage test-ansi-all test-ansi-full test-ansi-extra test-regression test-regression-interp test-regression-emitfree test-pack-nuspec test-save-class-lib test-project-compose test-mop ilverify update-ansi-state commit-ansi-state cross-compile loc publish pack install setup-ansi-test setup-asdf setup-quicklisp setup-cl-bench bench bench-state compile-asdf-fasl compile-asdf-fasls compile-quicklisp-fasl compile-core-fasl compile-contrib-fasls contrib-dotcl-cs contrib-dotcl-jitdisasm gen-char-names
+.PHONY: all build build-ns2 check-contrib-freshness run clean repl test-core-bytes test-coverage test-ansi-all test-ansi-full test-ansi-extra test-regression test-regression-interp test-regression-emitfree test-pack-nuspec test-save-class-lib test-project-compose test-mop ilverify update-ansi-state commit-ansi-state cross-compile selfhost-check selfhost-test seed-install seed-check loc publish pack install setup-ansi-test setup-asdf setup-quicklisp setup-cl-bench bench bench-state bench-survey compile-asdf-fasl compile-asdf-fasls compile-quicklisp-fasl compile-core-fasl compile-contrib-fasls contrib-dotcl-cs contrib-dotcl-jitdisasm gen-char-names
 
 # Source files for cross-compile. Listed once; the recipe and dependency
 # tracking both reference this so adding a file is a single-edit change.
@@ -165,6 +165,13 @@ build-ns2:
 	dotnet build $(DOTCL_ROOT)runtime/DotCL.Runtime.csproj -c Release -f netstandard2.0
 	@echo "=== Building netstandard2.0 runtime (emit-free, JSON-free) ==="
 	dotnet build $(DOTCL_ROOT)runtime/DotCL.Runtime.csproj -c Release -f netstandard2.0 -p:DotclNoJson=true
+	@# net8.0 is the third shipped target framework and the only one that keeps the
+	@# emitter sources while lacking PersistedAssemblyBuilder (.NET 9+), so a field
+	@# assigned only by the .fasl writer reads as never-assigned there. With
+	@# warnings promoted to errors that is a build failure, and it used to surface
+	@# for the first time inside `pack` — during a release. Build it here instead.
+	@echo "=== Building net8.0 runtime (embeddable; emitter present, no fasl writer) ==="
+	dotnet build $(DOTCL_ROOT)runtime/DotCL.Runtime.csproj -c Release -f net8.0
 
 test-ansi-full: build setup-ansi-test
 	$(SETSID) dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --asm $(DOTCL_ROOT)compiler/cil-out.sil $(DOTCL_ROOT)test/test-ansi.lisp
@@ -380,17 +387,19 @@ SUITE ?=
 BENCH ?=
 BENCH_TIMEOUT ?= 600
 
-# bench/ is internal-only (mirror-exclude), so in the public tree these targets
-# have no inputs. Say so and stop, instead of failing partway through on a
-# missing file. The check is a parse-time $(wildcard) rather than a `test -d`
-# guard in the recipe, because each recipe line is its own shell — an `exit 0`
-# on the first line would not stop the remaining ones. Relative path: this make
-# always runs in the repo root, and a native make would not resolve the POSIX
-# form of $(DOTCL_ROOT).
+# The harness ships, but a tree can still be missing it (a source tarball that
+# dropped bench/, say), and then these targets have no inputs. Say so and stop,
+# instead of failing partway through on a missing file. The check is a
+# parse-time $(wildcard) rather than a `test -d` guard in the recipe, because
+# each recipe line is its own shell — an `exit 0` on the first line would not
+# stop the remaining ones. It is also safe to glob at parse time: bench/run.lisp
+# is a checked-in file, not something an earlier recipe line produces. Relative
+# path: this make always runs in the repo root, and a native make would not
+# resolve the POSIX form of $(DOTCL_ROOT).
 ifeq ($(wildcard bench/run.lisp),)
 
 bench bench-state bench-survey:
-	@echo "$@: bench/ is internal-only and is not part of the public tree."
+	@echo "$@: bench/run.lisp not found — the benchmark harness is not present in this tree."
 
 else
 
@@ -427,7 +436,6 @@ bench-state: setup-cl-bench
 # backward compatibility with the coordinator prompt.
 RUNS ?= 5
 WARMUP ?= 1
-PYTHON ?= python3
 # Pin SBCL (see DOTCL_LISP note) so the bench "sbcl" column is really SBCL and
 # not whatever the Roswell default happens to be (#35).
 SBCL_RUN ?= ros -L sbcl-bin run
@@ -444,7 +452,12 @@ bench-survey: setup-cl-bench
 	if [ -n "$(BENCH)" ]; then EVAL_ARGS="$$EVAL_ARGS --eval '(setq *bench-name* \"$(BENCH)\")'"; fi; \
 	eval timeout $(BENCH_TIMEOUT) $(SBCL_RUN) $$EVAL_ARGS --load $(DOTCL_ROOT)bench/run.lisp --eval "'(quit)'" 2>/tmp/bench-survey-sbcl.txt; \
 	rc=$$?; if [ $$rc -eq 124 ]; then echo ";; SBCL TIMEOUT after $(BENCH_TIMEOUT)s"; fi
-	@$(PYTHON) $(DOTCL_ROOT)bench/make-survey-state.py /tmp/bench-survey-dotcl.txt /tmp/bench-survey-sbcl.txt $(DOTCL_ROOT)bench-state.json > /tmp/bench-state-new.json && mv /tmp/bench-state-new.json $(DOTCL_ROOT)bench-state.json
+	@# The aggregation runs on dotcl itself, so the public bench path needs no
+	@# python3. -v:q keeps MSBuild's build output off stdout, which is the state
+	@# file here; a build failure still stops the mv because the exit code is
+	@# non-zero. (--nologo is not a `dotnet run` flag — it would be forwarded to
+	@# the app and displace --asm from argv[0].)
+	@$(SETSID) dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -v:q -- --asm $(DOTCL_ROOT)compiler/cil-out.sil $(DOTCL_ROOT)bench/make-survey-state.lisp /tmp/bench-survey-dotcl.txt /tmp/bench-survey-sbcl.txt $(DOTCL_ROOT)bench-state.json > /tmp/bench-state-new.json && mv /tmp/bench-state-new.json $(DOTCL_ROOT)bench-state.json
 	@echo "Updated bench-state.json"
 
 endif
@@ -464,6 +477,89 @@ $(DOTCL_ROOT)compiler/cil-out.sil: $(CIL_SOURCES) $(DOTCL_ROOT)compiler/cil-comp
 	DOTCL_INPUTS="$(CIL_SOURCES)" DOTCL_OUTPUT="$@" $(DOTCL_LISP) --load $(DOTCL_ROOT)compiler/cil-compile.lisp
 
 cross-compile: $(DOTCL_ROOT)compiler/cil-out.sil
+
+# --- Bootstrapping dotcl with dotcl -------------------------------------
+#
+# The compiler is ordinary ANSI Common Lisp, so any Common Lisp can host the
+# cross-compile — including dotcl. Hosting it with dotcl takes the Lisp
+# toolchain out of the build entirely: .NET is needed anyway, and a released
+# dotcl installs as a .NET tool in ~4 s where installing Roswell in CI takes
+# ~50 s. The per-build cost goes the other way (dotcl ~8 s vs SBCL ~4.6 s), so
+# this is a CI fixed-cost trade, not a speedup.
+#
+# The seed is a RELEASED dotcl, never a locally built one: a build must not be
+# able to poison the thing that builds it, and a pinned version is reproducible.
+# It installs under build/ (gitignored, disposable) rather than the user's
+# global tools, so `rm -rf build/seed` is always the way back.
+#
+# Not yet the default: 0.1.24 predates the fixes that let dotcl host its own
+# cross-compile, and the core it produces from this tree does not work. The
+# first release cut after those fixes can serve as the seed, and flipping the
+# default is then this one line plus a CI lane swap.
+DOTCL_SEED_VERSION ?= 0.1.25
+DOTCL_SEED_DIR := $(DOTCL_ROOT)build/seed
+DOTCL_SEED := $(DOTCL_SEED_DIR)/dotcl$(if $(filter Windows_NT,$(OS)),.cmd,)
+
+$(DOTCL_SEED):
+	@echo "=== Installing seed dotcl $(DOTCL_SEED_VERSION) into build/seed ==="
+	dotnet tool install dotcl --version $(DOTCL_SEED_VERSION) --tool-path $(DOTCL_SEED_DIR)
+
+seed-install: $(DOTCL_SEED)
+
+# Can the pinned seed build this tree? Answers the one question that gates
+# making dotcl the default host. Builds the core with the seed, then rebuilds it
+# with the tree's own runtime (whose reader and codegen are newer), and requires
+# the result to reproduce itself — the same generation check as selfhost-check.
+seed-check: build $(DOTCL_SEED)
+	@echo "=== Building the core with seed dotcl $(DOTCL_SEED_VERSION) ==="
+	@mkdir -p $(DOTCL_ROOT)build/seed-check
+	DOTCL_INPUTS="$(CIL_SOURCES)" DOTCL_OUTPUT="$(DOTCL_ROOT)build/seed-check/stage1.sil" \
+	  $(DOTCL_SEED) --load $(DOTCL_ROOT)compiler/cil-compile.lisp
+	@echo "=== Rebuilding it with the tree's runtime (stage 2) ==="
+	DOTCL_INPUTS="$(CIL_SOURCES)" DOTCL_OUTPUT="$(DOTCL_ROOT)build/seed-check/stage2.sil" \
+	  $(SETSID) dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- \
+	  --asm $(DOTCL_ROOT)build/seed-check/stage1.sil --load $(DOTCL_ROOT)compiler/cil-compile.lisp
+	DOTCL_INPUTS="$(CIL_SOURCES)" DOTCL_OUTPUT="$(DOTCL_ROOT)build/seed-check/stage3.sil" \
+	  $(SETSID) dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- \
+	  --asm $(DOTCL_ROOT)build/seed-check/stage2.sil --load $(DOTCL_ROOT)compiler/cil-compile.lisp
+	@cmp $(DOTCL_ROOT)build/seed-check/stage2.sil $(DOTCL_ROOT)build/seed-check/stage3.sil \
+	  && echo "seed $(DOTCL_SEED_VERSION): OK — stage2 == stage3" \
+	  || (echo "seed $(DOTCL_SEED_VERSION): NOT usable — stage2 != stage3"; exit 1)
+
+# The compiler compiled by itself must reproduce itself, byte for byte.
+#
+# A is the core the tree already has; B is what the compiler running out of A
+# produces from the same sources; C is what B produces. B == C means the
+# compiler is a fixpoint of itself. Comparing against the SBCL-hosted core would
+# NOT show this: the two hosts number gensyms differently, so a byte comparison
+# there is meaningless — it is the generation-to-generation comparison that has
+# to hold.
+#
+# What this catches is a compiler that only works when SBCL is underneath it: a
+# cross-compile flag that never reached the running compiler, and an intrinsic
+# table keyed on the other half of a split package, both showed up here and
+# nowhere else in the suite.
+selfhost-check: build $(DOTCL_ROOT)compiler/cil-out.sil
+	@echo "=== Self-host fixpoint (B == C) ==="
+	@mkdir -p $(DOTCL_ROOT)build/selfhost
+	DOTCL_INPUTS="$(CIL_SOURCES)" DOTCL_OUTPUT="$(DOTCL_ROOT)build/selfhost/genB.sil" \
+	  $(SETSID) dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- \
+	  --asm $(DOTCL_ROOT)compiler/cil-out.sil --load $(DOTCL_ROOT)compiler/cil-compile.lisp
+	DOTCL_INPUTS="$(CIL_SOURCES)" DOTCL_OUTPUT="$(DOTCL_ROOT)build/selfhost/genC.sil" \
+	  $(SETSID) dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- \
+	  --asm $(DOTCL_ROOT)build/selfhost/genB.sil --load $(DOTCL_ROOT)compiler/cil-compile.lisp
+	@cmp $(DOTCL_ROOT)build/selfhost/genB.sil $(DOTCL_ROOT)build/selfhost/genC.sil \
+	  && echo "self-host fixpoint: OK (B == C)" \
+	  || (echo "self-host fixpoint: FAILED — the compiler does not reproduce itself"; exit 1)
+
+# The fixpoint says the compiler reproduces itself, not that what it produces is
+# right — a compiler broken the same way twice is still a fixpoint. This runs the
+# suite on the self-hosted core. Left out of CI deliberately: it re-runs the whole
+# regression suite through a second core and roughly doubles the job.
+selfhost-test: selfhost-check
+	@echo "=== Regression suite on the self-hosted core ==="
+	$(SETSID) dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- \
+	  --asm $(DOTCL_ROOT)build/selfhost/genB.sil $(DOTCL_ROOT)test/regression/run.lisp
 
 publish:
 	dotnet publish $(DOTCL_ROOT)runtime/runtime.csproj --configuration Release -o $(DOTCL_ROOT)out/
@@ -763,12 +859,12 @@ pack: compile-asdf-fasl compile-asdf-fasls compile-quicklisp-fasl compile-core-f
 	# shipped artifact, and it is 230 KB the module provider would never read
 	# (it finds quicklisp.fasl first).
 	rm -f $(DOTCL_ROOT)runtime/contrib/quicklisp/quicklisp.lisp
-	# Strip cross-RID R2R fasls from contrib/asdf/ so each RID nupkg only ships
-	# its own R2R copy (overlaid by ReplaceFaslsWithR2R via runtime/asdf-r2r-<rid>.fasl
-	# which is at runtime/ top-level, separate from contrib/). Without this the
-	# `<None Include="contrib/**" PackagePath="tools/net10.0/any/contrib/">` glob
-	# packs all 6 R2R fasls into every RID's nupkg, and dotnet publish further
-	# duplicates them under tools/net10.0/<rid>/contrib/.
+	# asdf's R2R copy is overlaid from runtime/ top level (ReplaceFaslsWithR2R
+	# reads asdf-r2r-<rid>.fasl and writes it over contrib/asdf/asdf.fasl), so the
+	# copies sitting under contrib/asdf/ are dead weight in every package. Every
+	# other contrib keeps its per-RID R2R here and the csproj does the filtering:
+	# the contrib/** glob drops all *-r2r-*.fasl and the RID being packed is added
+	# back, so a package carries exactly one RID's set instead of all of them.
 	rm -f $(DOTCL_ROOT)runtime/contrib/asdf/asdf-r2r-*.fasl
 	rm -rf $(DOTCL_ROOT)runtime/contrib/dotcl-cs/bin $(DOTCL_ROOT)runtime/contrib/dotcl-cs/obj
 	rm -f $(DOTCL_ROOT)runtime/contrib/dotcl-cs/*.csproj $(DOTCL_ROOT)runtime/contrib/dotcl-cs/*.cs

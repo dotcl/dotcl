@@ -6,6 +6,28 @@ public static partial class Runtime
 {
     // --- Array/Vector operations ---
 
+    /// <summary>An array subscript that must be an integer. A bare cast would raise
+    /// InvalidCastException, which the CLR-exception mapping turns into a
+    /// PROGRAM-ERROR; the spec calls for a TYPE-ERROR naming the bad subscript.</summary>
+    private static int IntArg(string what, string role, LispObject o)
+    {
+        if (o is Fixnum f) return (int)f.Value;
+        throw new LispErrorException(new LispTypeError(
+            $"{what}: {role} must be an integer", o, Startup.Sym("INTEGER")));
+    }
+
+    /// <summary>An array dimension: a non-negative integer. A negative or bignum
+    /// dimension used to reach the allocation and fail there as a raw .NET
+    /// exception.</summary>
+    private static int DimArg(string what, LispObject o)
+    {
+        if (o is Fixnum f && f.Value >= 0 && f.Value <= int.MaxValue) return (int)f.Value;
+        var expected = new Cons(Startup.Sym("INTEGER"),
+            new Cons(Fixnum.Make(0), new Cons(Startup.Sym("*"), Nil.Instance)));
+        throw new LispErrorException(new LispTypeError(
+            $"{what}: dimension must be a non-negative integer", o, expected));
+    }
+
     public static LispObject MakeArray(LispObject[] args)
     {
         // (make-array dimensions &key element-type initial-element initial-contents adjustable fill-pointer)
@@ -13,9 +35,9 @@ public static partial class Runtime
         int[] dimArray;
         int size;
 
-        if (dims is Fixnum fn)
+        if (dims is Fixnum)
         {
-            size = (int)fn.Value;
+            size = DimArg("MAKE-ARRAY", dims);
             dimArray = new[] { size };
         }
         else if (dims is Nil)
@@ -28,12 +50,12 @@ public static partial class Runtime
         {
             var dimList = new List<int>();
             var cur = dims;
-            while (cur is Cons c) { dimList.Add((int)((Fixnum)c.Car).Value); cur = c.Cdr; }
+            while (cur is Cons c) { dimList.Add(DimArg("MAKE-ARRAY", c.Car)); cur = c.Cdr; }
             dimArray = dimList.ToArray();
             size = 1;
             foreach (var d in dimArray) size *= d;
         }
-        else throw new LispErrorException(new LispError($"MAKE-ARRAY: unsupported dimensions: {dims}"));
+        else throw new LispErrorException(new LispTypeError($"MAKE-ARRAY: unsupported dimensions: {dims}", dims));
 
         LispObject? initialElement = null;
         LispObject? initialContents = null;
@@ -104,7 +126,8 @@ public static partial class Runtime
                 srcVec = new LispVector(strItems, "CHARACTER");
                 if (elementType == "T") elementType = "CHARACTER";
             }
-            else throw new LispErrorException(new LispError("MAKE-ARRAY: :displaced-to must be an array"));
+            else throw new LispErrorException(new LispTypeError(
+                "MAKE-ARRAY: :displaced-to must be an array", displacedTo, Startup.Sym("ARRAY")));
             vec = new LispVector(size, srcVec, displacedOffset, elementType, dimArray);
         }
         else if (initialContents != null)
@@ -151,9 +174,9 @@ public static partial class Runtime
         var dims = args[1];
         int[] dimArray;
         int size;
-        if (dims is Fixnum fn)
+        if (dims is Fixnum)
         {
-            size = (int)fn.Value;
+            size = DimArg("ADJUST-ARRAY", dims);
             dimArray = new[] { size };
         }
         else if (dims is Nil)
@@ -166,12 +189,12 @@ public static partial class Runtime
         {
             var dimList = new List<int>();
             var cur = dims;
-            while (cur is Cons c) { dimList.Add((int)((Fixnum)c.Car).Value); cur = c.Cdr; }
+            while (cur is Cons c) { dimList.Add(DimArg("ADJUST-ARRAY", c.Car)); cur = c.Cdr; }
             dimArray = dimList.ToArray();
             size = 1;
             foreach (var d in dimArray) size *= d;
         }
-        else throw new LispErrorException(new LispError($"ADJUST-ARRAY: unsupported dimensions: {dims}"));
+        else throw new LispErrorException(new LispTypeError($"ADJUST-ARRAY: unsupported dimensions: {dims}", dims));
 
         LispObject? initialElement = null;
         LispObject? initialContents = null;
@@ -348,11 +371,51 @@ public static partial class Runtime
         return false;
     }
 
+    /// <summary>Error for an index outside its valid range. The spec makes a bad
+    /// array index a TYPE-ERROR whose expected type is the range the index had to
+    /// fall in, so report (INTEGER 0 (LIMIT)) with the index as the datum.</summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static LispErrorException IndexError(string what, long idx, int limit, string of)
+    {
+        var expected = new Cons(Startup.Sym("INTEGER"),
+            new Cons(Fixnum.Make(0),
+                new Cons(new Cons(Fixnum.Make(limit), Nil.Instance), Nil.Instance)));
+        return new LispErrorException(new LispTypeError(
+            $"{what}: index {idx} out of range for {of} of size {limit}",
+            Fixnum.Make(idx), expected));
+    }
+
+    /// <summary>Validate one subscript per axis and return the row-major index.
+    /// Checking only the flattened index is not enough: on a 2x3 array the
+    /// subscripts (0 5) flatten to 5, which is in range for the storage but
+    /// outside axis 1.</summary>
+    private static int FlatIndex(string what, LispVector v, LispObject[] args, int first, int nidx)
+    {
+        int[] dims = v.Dimensions;
+        if (nidx != dims.Length)
+            throw new LispErrorException(new LispProgramError(
+                $"{what}: {nidx} indices for rank-{dims.Length} array"));
+        int idx = 0;
+        for (int k = 0; k < nidx; k++)
+        {
+            if (args[first + k] is not Fixnum fi)
+                throw new LispErrorException(new LispTypeError(
+                    $"{what}: index must be integer", args[first + k], Startup.Sym("INTEGER")));
+            long i = fi.Value;
+            if ((ulong)i >= (ulong)dims[k])
+                throw IndexError(what, i, dims[k], $"axis {k}");
+            idx = idx * dims[k] + (int)i;
+        }
+        return idx;
+    }
+
     public static LispObject Aref(LispObject array, LispObject index)
     {
-        // Tight fast path: plain 1D LispVector with Fixnum index.
+        // Tight fast path: plain 1D LispVector with Fixnum index. A null
+        // _dimensions is exactly "rank 1", so a multi-dimensional array handed
+        // a single subscript drops to the slow path and is rejected there.
         if (array is LispVector v && index is Fixnum f
-            && v._displacedTo == null && v._bitData == null)
+            && v._displacedTo == null && v._bitData == null && v._dimensions == null)
         {
             if (v._numData != null)
             {
@@ -379,14 +442,17 @@ public static partial class Runtime
             return DotNetToLisp(narr.GetValue(idx));
         if (array is LispVector v)
         {
+            if (v._dimensions != null && v._dimensions.Length != 1)
+                throw new LispErrorException(new LispProgramError(
+                    $"AREF: 1 index for rank-{v._dimensions.Length} array"));
             if (idx < 0 || idx >= v.Capacity)
-                throw new LispErrorException(new LispError($"AREF: index {idx} out of range for array of size {v.Capacity}"));
+                throw IndexError("AREF", idx, v.Capacity, "array");
             return v.GetElement(idx);
         }
         if (array is LispString s)
         {
             if (idx < 0 || idx >= s.Length)
-                throw new LispErrorException(new LispError($"AREF: index {idx} out of range"));
+                throw IndexError("AREF", idx, s.Length, "string");
             return LispChar.Make(s[idx]);
         }
         throw new LispErrorException(new LispTypeError("AREF: not an array", array));
@@ -399,18 +465,9 @@ public static partial class Runtime
         var array = args[0];
         if (array is LispVector v)
         {
-            int[] dims = v.Dimensions;
-            int nidx = args.Length - 1;
-            if (nidx != dims.Length)
-                throw new LispErrorException(new LispProgramError($"AREF: {nidx} indices for rank-{dims.Length} array"));
-            int idx = 0;
-            for (int k = 0; k < nidx; k++)
-            {
-                int i = (int)((Fixnum)args[k + 1]).Value;
-                idx = idx * dims[k] + i;
-            }
+            int idx = FlatIndex("AREF", v, args, 1, args.Length - 1);
             if (idx < 0 || idx >= v.Capacity)
-                throw new LispErrorException(new LispError($"AREF: index out of range"));
+                throw IndexError("AREF", idx, v.Capacity, "array");
             return v.GetElement(idx);
         }
         if (array is LispString s && args.Length == 2)
@@ -419,7 +476,7 @@ public static partial class Runtime
         {
             var indices = new int[args.Length - 1];
             for (int k = 0; k < indices.Length; k++)
-                indices[k] = (int)((Fixnum)args[k + 1]).Value;
+                indices[k] = IntArg("AREF", "index", args[k + 1]);
             return DotNetToLisp(narr.GetValue(indices));
         }
         throw new LispErrorException(new LispTypeError("AREF: not an array", array));
@@ -433,16 +490,9 @@ public static partial class Runtime
         var value = args[args.Length - 1];
         if (array is LispVector v)
         {
-            int[] dims = v.Dimensions;
-            int nidx = args.Length - 2;
-            if (nidx != dims.Length)
-                throw new LispErrorException(new LispProgramError($"(SETF AREF): {nidx} indices for rank-{dims.Length} array"));
-            int idx = 0;
-            for (int k = 0; k < nidx; k++)
-            {
-                int i = (int)((Fixnum)args[k + 1]).Value;
-                idx = idx * dims[k] + i;
-            }
+            int idx = FlatIndex("(SETF AREF)", v, args, 1, args.Length - 2);
+            if (idx < 0 || idx >= v.Capacity)
+                throw IndexError("(SETF AREF)", idx, v.Capacity, "array");
             v.SetElement(idx, value);
             return value;
         }
@@ -451,7 +501,9 @@ public static partial class Runtime
             int nidx = args.Length - 2;
             if (nidx != 1)
                 throw new LispErrorException(new LispProgramError($"(SETF AREF): string requires exactly 1 index, got {nidx}"));
-            int i = (int)((Fixnum)args[1]).Value;
+            int i = IntArg("(SETF AREF)", "index", args[1]);
+            if (i < 0 || i >= ls.Length)
+                throw IndexError("(SETF AREF)", i, ls.Length, "string");
             if (value is not LispChar ch)
                 throw new LispErrorException(new LispTypeError("(SETF AREF): value must be a character for string", value, Startup.Sym("CHARACTER")));
             ls[i] = ch.Value;
@@ -461,7 +513,7 @@ public static partial class Runtime
         {
             var indices = new int[args.Length - 2];
             for (int k = 0; k < indices.Length; k++)
-                indices[k] = (int)((Fixnum)args[k + 1]).Value;
+                indices[k] = IntArg("(SETF AREF)", "index", args[k + 1]);
             narr.SetValue(LispToDotNet(value, narr.GetType().GetElementType()!), indices);
             return value;
         }
@@ -472,7 +524,7 @@ public static partial class Runtime
     public static LispObject ArefSet(LispObject array, LispObject index, LispObject value)
     {
         if (array is LispVector v && index is Fixnum f
-            && v._displacedTo == null && v._bitData == null)
+            && v._displacedTo == null && v._bitData == null && v._dimensions == null)
         {
             if (v._numData != null)
             {
@@ -505,8 +557,11 @@ public static partial class Runtime
         }
         if (array is LispVector v)
         {
+            if (v._dimensions != null && v._dimensions.Length != 1)
+                throw new LispErrorException(new LispProgramError(
+                    $"(SETF AREF): 1 index for rank-{v._dimensions.Length} array"));
             if (idx < 0 || idx >= v.Capacity)
-                throw new LispErrorException(new LispError($"(SETF AREF): index {idx} out of range for array of size {v.Capacity}"));
+                throw IndexError("(SETF AREF)", idx, v.Capacity, "array");
             v.SetElement(idx, value);
             return value;
         }
@@ -514,6 +569,8 @@ public static partial class Runtime
         {
             if (value is not LispChar ch)
                 throw new LispErrorException(new LispTypeError("(SETF AREF): value must be a character for string", value, Startup.Sym("CHARACTER")));
+            if (idx < 0 || idx >= ls.Length)
+                throw IndexError("(SETF AREF)", idx, ls.Length, "string");
             ls[idx] = ch.Value;
             return value;
         }
@@ -527,10 +584,15 @@ public static partial class Runtime
         // Tight fast path: the overwhelming majority of 2D aref calls hit a
         // non-displaced, non-bit LispVector with Fixnum indices. Inline this
         // so JIT can hoist dim/array loads across repeated calls in hot loops.
+        // Each subscript is range-checked against its own axis (as the raw-long
+        // variant below does): a subscript past its axis can still land inside
+        // the flat storage, which would silently read a neighbouring element.
         if (array is LispVector v
             && idx0 is Fixnum f0 && idx1 is Fixnum f1
             && v._displacedTo == null && v._bitData == null
-            && v._dimensions != null)
+            && v._dimensions != null && v._dimensions.Length == 2
+            && (ulong)f0.Value < (ulong)v._dimensions[0]
+            && (ulong)f1.Value < (ulong)v._dimensions[1])
         {
             int i0 = (int)f0.Value;
             int i1 = (int)f1.Value;
@@ -550,15 +612,10 @@ public static partial class Runtime
     private static LispObject Aref2DSlow(LispObject array, LispObject idx0, LispObject idx1)
     {
         if (array is LispVector v)
-        {
-            int[] dims = v.Dimensions;
-            int i0 = (int)((Fixnum)idx0).Value;
-            int i1 = (int)((Fixnum)idx1).Value;
-            int idx = i0 * dims[1] + i1;
-            return v.GetElement(idx);
-        }
+            return v.GetElement(FlatIndex("AREF", v, new[] { idx0, idx1 }, 0, 2));
         if (TryDotNetArray(array, out var narr))
-            return DotNetToLisp(narr.GetValue((int)((Fixnum)idx0).Value, (int)((Fixnum)idx1).Value));
+            return DotNetToLisp(narr.GetValue(IntArg("AREF", "index", idx0),
+                                              IntArg("AREF", "index", idx1)));
         throw new LispErrorException(new LispTypeError("AREF: not an array", array));
     }
 
@@ -569,7 +626,9 @@ public static partial class Runtime
         if (array is LispVector v
             && idx0 is Fixnum f0 && idx1 is Fixnum f1
             && v._displacedTo == null && v._bitData == null
-            && v._dimensions != null)
+            && v._dimensions != null && v._dimensions.Length == 2
+            && (ulong)f0.Value < (ulong)v._dimensions[0]
+            && (ulong)f1.Value < (ulong)v._dimensions[1])
         {
             int i0 = (int)f0.Value;
             int i1 = (int)f1.Value;
@@ -593,10 +652,7 @@ public static partial class Runtime
     {
         if (array is LispVector v)
         {
-            int[] dims = v.Dimensions;
-            int i0 = (int)((Fixnum)idx0).Value;
-            int i1 = (int)((Fixnum)idx1).Value;
-            int idx = i0 * dims[1] + i1;
+            int idx = FlatIndex("(SETF AREF)", v, new[] { idx0, idx1 }, 0, 2);
             // Fast path: direct element access for non-displaced, non-bit,
             // non-numeric-backed arrays
             if (v._displacedTo == null && v._bitData == null && v._numData == null)
@@ -610,7 +666,8 @@ public static partial class Runtime
         if (TryDotNetArray(array, out var narr))
         {
             narr.SetValue(LispToDotNet(value, narr.GetType().GetElementType()!),
-                          (int)((Fixnum)idx0).Value, (int)((Fixnum)idx1).Value);
+                          IntArg("(SETF AREF)", "index", idx0),
+                          IntArg("(SETF AREF)", "index", idx1));
             return value;
         }
         throw new LispErrorException(new LispTypeError("(SETF AREF): not an array", array));
@@ -623,7 +680,10 @@ public static partial class Runtime
         if (array is LispVector v
             && idx0 is Fixnum f0 && idx1 is Fixnum f1 && idx2 is Fixnum f2
             && v._displacedTo == null && v._bitData == null
-            && v._dimensions != null)
+            && v._dimensions != null && v._dimensions.Length == 3
+            && (ulong)f0.Value < (ulong)v._dimensions[0]
+            && (ulong)f1.Value < (ulong)v._dimensions[1]
+            && (ulong)f2.Value < (ulong)v._dimensions[2])
         {
             int i0 = (int)f0.Value;
             int i1 = (int)f1.Value;
@@ -644,14 +704,7 @@ public static partial class Runtime
     private static LispObject Aref3DSlow(LispObject array, LispObject idx0, LispObject idx1, LispObject idx2)
     {
         if (array is LispVector v)
-        {
-            int[] dims = v.Dimensions;
-            int i0 = (int)((Fixnum)idx0).Value;
-            int i1 = (int)((Fixnum)idx1).Value;
-            int i2 = (int)((Fixnum)idx2).Value;
-            int idx = (i0 * dims[1] + i1) * dims[2] + i2;
-            return v.GetElement(idx);
-        }
+            return v.GetElement(FlatIndex("AREF", v, new[] { idx0, idx1, idx2 }, 0, 3));
         throw new LispErrorException(new LispTypeError("AREF: not an array", array));
     }
 
@@ -662,7 +715,10 @@ public static partial class Runtime
         if (array is LispVector v
             && idx0 is Fixnum f0 && idx1 is Fixnum f1 && idx2 is Fixnum f2
             && v._displacedTo == null && v._bitData == null
-            && v._dimensions != null)
+            && v._dimensions != null && v._dimensions.Length == 3
+            && (ulong)f0.Value < (ulong)v._dimensions[0]
+            && (ulong)f1.Value < (ulong)v._dimensions[1]
+            && (ulong)f2.Value < (ulong)v._dimensions[2])
         {
             int i0 = (int)f0.Value;
             int i1 = (int)f1.Value;
@@ -687,11 +743,7 @@ public static partial class Runtime
     {
         if (array is LispVector v)
         {
-            int[] dims = v.Dimensions;
-            int i0 = (int)((Fixnum)idx0).Value;
-            int i1 = (int)((Fixnum)idx1).Value;
-            int i2 = (int)((Fixnum)idx2).Value;
-            int idx = (i0 * dims[1] + i1) * dims[2] + i2;
+            int idx = FlatIndex("(SETF AREF)", v, new[] { idx0, idx1, idx2 }, 0, 3);
             if (v._displacedTo == null && v._bitData == null && v._numData == null)
             {
                 v._elements[idx] = value;
@@ -714,7 +766,7 @@ public static partial class Runtime
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static LispObject ArefL(LispObject array, long index)
     {
-        if (array is LispVector v && v._displacedTo == null)
+        if (array is LispVector v && v._displacedTo == null && v._dimensions == null)
         {
             if (v._bitData == null && v._numData == null
                 && (ulong)index < (ulong)v._elements.Length)
@@ -730,7 +782,7 @@ public static partial class Runtime
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static LispObject ArefSetL(LispObject array, long index, LispObject value)
     {
-        if (array is LispVector v && v._displacedTo == null)
+        if (array is LispVector v && v._displacedTo == null && v._dimensions == null)
         {
             if (v._bitData == null && v._numData == null
                 && (ulong)index < (ulong)v._elements.Length)
@@ -848,7 +900,7 @@ public static partial class Runtime
     public static long ArefNumL(LispObject array, long index)
     {
         if (array is LispVector v && v._numData != null && v._displacedTo == null
-            && (ulong)index < (ulong)v._numLen)
+            && v._dimensions == null && (ulong)index < (ulong)v._numLen)
             return v.NumGet((int)index);
         return ((Fixnum)Aref(array, Fixnum.Make(index))).Value;
     }
@@ -857,7 +909,7 @@ public static partial class Runtime
     public static long ArefSetNumL(LispObject array, long index, long value)
     {
         if (array is LispVector v && v._numData != null && v._displacedTo == null
-            && (ulong)index < (ulong)v._numLen)
+            && v._dimensions == null && (ulong)index < (ulong)v._numLen)
         {
             v.NumSet((int)index, value);
             return value;
@@ -966,7 +1018,8 @@ public static partial class Runtime
     public static double ArefNumD(LispObject array, long index)
     {
         if (array is LispVector v && v._numData != null && v._numKind >= 5
-            && v._displacedTo == null && (ulong)index < (ulong)v._numLen)
+            && v._displacedTo == null && v._dimensions == null
+            && (ulong)index < (ulong)v._numLen)
             return v.NumGetF((int)index);
         return ToDoubleElement(Aref(array, Fixnum.Make(index)));
     }
@@ -975,7 +1028,8 @@ public static partial class Runtime
     public static double ArefSetNumD(LispObject array, long index, double value)
     {
         if (array is LispVector v && v._numData != null && v._numKind >= 5
-            && v._displacedTo == null && (ulong)index < (ulong)v._numLen)
+            && v._displacedTo == null && v._dimensions == null
+            && (ulong)index < (ulong)v._numLen)
         {
             v.NumSetF((int)index, value);
             return value;
@@ -1154,14 +1208,14 @@ public static partial class Runtime
         if (obj is LispStruct s)
         {
             if (idx < 0 || idx >= s.Slots.Length)
-                throw new LispErrorException(new LispError($"STRUCT-REF: index {idx} out of range"));
+                throw IndexError("STRUCT-REF", idx, s.Slots.Length, "structure");
             return s.Slots[idx];
         }
         // Also support LispInstance for structure classes (created by allocate-instance)
         if (obj is LispInstance inst && inst.Class.IsStructureClass)
         {
             if (idx < 0 || idx >= inst.Slots.Length)
-                throw new LispErrorException(new LispError($"STRUCT-REF: index {idx} out of range"));
+                throw IndexError("STRUCT-REF", idx, inst.Slots.Length, "structure");
             return inst.Slots[idx] ?? Nil.Instance;
         }
         { var sv = obj?.ToString() ?? "nil"; throw new LispErrorException(new LispTypeError($"STRUCT-REF: not a structure (idx={idx}, type={obj?.GetType().Name ?? "null"}, val={(sv.Length > 60 ? sv[..60] : sv)})", obj)); }
@@ -1175,7 +1229,7 @@ public static partial class Runtime
         if (obj is LispStruct s)
         {
             if (idx < 0 || idx >= s.Slots.Length)
-                throw new LispErrorException(new LispError($"STRUCT-SET: index {idx} out of range"));
+                throw IndexError("STRUCT-SET", idx, s.Slots.Length, "structure");
             s.Slots[idx] = value;
             return value;
         }
@@ -1183,7 +1237,7 @@ public static partial class Runtime
         if (obj is LispInstance inst && inst.Class.IsStructureClass)
         {
             if (idx < 0 || idx >= inst.Slots.Length)
-                throw new LispErrorException(new LispError($"STRUCT-SET: index {idx} out of range"));
+                throw IndexError("STRUCT-SET", idx, inst.Slots.Length, "structure");
             inst.Slots[idx] = value;
             return value;
         }

@@ -309,11 +309,20 @@ public static partial class Runtime
         return p.IsLocked ? T.Instance : Nil.Instance;
     }
 
+    /// <summary>(OR STRING SYMBOL CHARACTER) - what a string designator may be,
+    /// for the EXPECTED-TYPE of a type-error about one.</summary>
+    private static LispObject StringDesignatorType()
+        => List(Startup.Sym("OR"), Startup.Sym("STRING"), Startup.Sym("SYMBOL"),
+                Startup.Sym("CHARACTER"));
+
     // Local nickname API (CDR 5 / SBCL package-local-nicknames)
     public static LispObject AddPackageLocalNickname(LispObject nick, LispObject actual, LispObject pkg)
     {
         var nickname = nick is LispString ns ? ns.Value : (nick is Symbol nsym ? nsym.Name : null);
-        if (nickname == null) throw new LispErrorException(new LispError("ADD-PACKAGE-LOCAL-NICKNAME: nickname must be a string designator"));
+        if (nickname == null)
+            throw new LispErrorException(new LispTypeError(
+                "ADD-PACKAGE-LOCAL-NICKNAME: nickname must be a string designator",
+                nick, StringDesignatorType()));
         var actualPkg = ResolvePackage(actual, "ADD-PACKAGE-LOCAL-NICKNAME");
         var targetPkg = ResolvePackage(pkg, "ADD-PACKAGE-LOCAL-NICKNAME");
         targetPkg.AddLocalNickname(nickname, actualPkg);
@@ -323,7 +332,10 @@ public static partial class Runtime
     public static LispObject RemovePackageLocalNickname(LispObject nick, LispObject pkg)
     {
         var nickname = nick is LispString ns ? ns.Value : (nick is Symbol nsym ? nsym.Name : null);
-        if (nickname == null) throw new LispErrorException(new LispError("REMOVE-PACKAGE-LOCAL-NICKNAME: nickname must be a string designator"));
+        if (nickname == null)
+            throw new LispErrorException(new LispTypeError(
+                "REMOVE-PACKAGE-LOCAL-NICKNAME: nickname must be a string designator",
+                nick, StringDesignatorType()));
         var targetPkg = ResolvePackage(pkg, "REMOVE-PACKAGE-LOCAL-NICKNAME");
         return targetPkg.RemoveLocalNickname(nickname) ? T.Instance : Nil.Instance;
     }

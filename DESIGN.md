@@ -3,7 +3,9 @@
 .NET 上で動く Common Lisp 処理系。Lisp ソースを CIL (Common
 Intermediate Language) にコンパイルし .NET の JIT で実行する。
 ANSI 規格適合は ansi-test (gitlab.common-lisp.net/ansi-test/ansi-test)
-で 21,928/21,929 (99.99%) pass。
+で 21,944/21,945 (99.99%) pass。CIL を出さない解釈経路 (§3.17) も
+持ち、Reflection.Emit が使えない環境 (netstandard2.0 / AOT) では
+そちらで動く。
 
 このドキュメントは dotcl の **現状の実装** を機構ごとにまとめる
 ノートで、「いま何がどう動いているのか」を実装機構別に記述する。
@@ -378,6 +380,14 @@ intern してメソッド間で共有し、IL サイズを抑える。
 `InvalidProgramException` で実行時エラーになるため、生成側のバグを
 早期に発見する道具として効く。
 
+**検証ゲート**: `make ilverify` が (1) 生成したてのコア (cil-stdlib +
+コンパイラ全体)、(2) `test/ilverify/stress.lisp` (emit を多く踏む
+フィクスチャ)、(3) `contrib/asdf/asdf.fasl` を検証する。3 番目が効くのは
+それが「この検査のために書かれていない実コード」だから。CoreCLR の JIT は
+共変呼び出しや i4/i8 のずれを黙認するが、IL2CPP / WebGL のような AOT
+codegen は拒否するので、25 分の AOT ビルドまで発覚を遅らせないための門。
+CI で毎 push 走る。
+
 ### 3.8 eval / load / compile-file (.sil / .fasl)
 
 **データ表現**: 同じ命令リストが 2 つの経路で消費される。
@@ -483,6 +493,17 @@ ThreadStatic な `List<HandlerBinding[]>` / `List<LispRestart[]>`)
 する — `(handler-case ... (error () ...))` で
 `NullReferenceException` 等が捕まる。Restarts は restart-bind で
 スタックに積み、`_conditionRestarts` で対象 condition と関連付ける。
+
+**深い再帰とスタック枯渇**: .NET の `StackOverflowException` は捕捉
+不能でプロセスが即死するので、そこへ行かせない。`Runtime.Apply` や
+interop の境界など深くなる経路で残スタックを事前に測り
+(`RuntimeHelpers.EnsureSufficientExecutionStack` 系)、足りなければ
+`STORAGE-CONDITION` として signal する。プローブは「投げるのに足る
+64KB」では足りない — signal 自体がコンディションシステムを回すので、
+16 フレーム × 16KB の余白を確保してから判定する。`storage-condition` は
+仕様どおり `error` の**外**に置いてあるので `(handler-case ... (error ...))`
+では捕まらない (SBCL と同じ)。netstandard2.0 には `Try` 形のプローブが
+無いが、投げる形の同 API はあるのでそれを catch して使う。
 
 **ANSI / SBCL との差分**: ANSI 準拠。condition 型は CLOS class
 として定義 (`define-condition` は `defclass` の制限版)。SBCL の
@@ -663,6 +684,43 @@ ASP.NET Core / MonoGame といったフレームワークがそのクラスを�
 .NET の型」として扱える (`samples/` の MauiLispDemo / AspNetLispDemo /
 MonoGameLispDemo / McpServerDemo 参照)。
 
+### 3.17 解釈経路 (emit-free)
+
+**なぜ 2 つ目の評価器があるか**: `Reflection.Emit` が使えない実行環境が
+ある。netstandard2.0 ターゲット (embedding 向け) と、IL2CPP / WebGL の
+ような AOT codegen がそれで、そこでは「S 式 → CIL → JIT」の経路が丸ごと
+成立しない。そのため木を直接歩く評価器 (`%mini-eval`) を持ち、コンパイラ
+経路と同じ意味論を返すことを要求している。
+
+**切り替え**: `dotcl:*evaluator-mode*` が `:compile` (既定) か
+`:interpret`。ビルド側では `DotclEmit` プロパティが emit の有無を決め、
+netstandard2.0 では常に false = 解釈経路だけになる。net10 ビルドで
+`:interpret` を選べるのは、同じスイートを両経路に通して差分を取るため。
+
+**ゲート**: `make test-regression-interp` が回帰スイートを解釈経路で
+走らせる (コンパイル時の診断そのものを見るテストだけ opt out する)。
+`make build-ns2` が emit-free 構成 (plain / JSON-free) をコンパイルする。
+「ns2.0 はビルドが通る」だけでは評価器が一度も実行されないので、前者が本体。
+
+**性能**: コンパイル経路と比べれば桁で遅い。自己末尾呼び出しは
+トランポリンで畳んで深い再帰が溢れないようにしてある。ループ機構と
+ノード単価の削減は継続中 (GitHub issues 参照)。
+
+### 3.18 イメージ出力 (save-application)
+
+`(dotcl:save-application path &key load prelude toplevel executable ...)`
+で、ロード済みの定義を含む配布物を出す。中身は「入力ソースを
+`compile-file` した FASL を束ねたもの」で、`:executable` を付けると
+.NET の実行ファイルとして publish する (`:r2r` で ReadyToRun、RID 指定も
+可能)。
+
+**イメージ状態の再構築について**: SBCL の `save-lisp-and-die` のような
+「実行時ヒープのダンプ」ではない。`defvar` / `defpackage` / リーダー
+マクロなど、コンパイル対象ソースに書かれた定義は FASL の ModuleInit が
+再評価するので自然に復元されるが、**実行時にだけ起きた状態変化は入らない**。
+この線引きが `save-application` の設計そのもの。`Reflection.Emit` を要求
+するので emit-free ビルドでは使えない (コンパイル済み FASL を配る側の道具)。
+
 ## 4. ディレクトリ構成
 
 ```
@@ -703,15 +761,26 @@ dotcl/
   cross-compile` でセルフビルド可能
 - **Step 5**: CL 機能の拡充 (defmacro / loop / 多値 / 型 / defstruct
   / コンディション / CLOS / pathname / compile-file)
-- **Step 6**: ASDF ロードと ansi-test 21,928 / 21,929 (99.99%) 達成
-- **Step 7 (未着手)**: 最適化パス (型推論、unboxed 数値演算、
+- **Step 6**: ASDF ロードと ansi-test 21,944 / 21,945 (99.99%) 達成
+- **Step 7 (進行中)**: 最適化パス (型推論、unboxed 数値演算、
   インライン展開) — 命令リストに対するパスとして挟む A2 の利点を
-  活かす。SBCL の IR1 を参考にしつつ CIL 向けの軽量 IR を別途設計
-- **Step 8 (部分達成)**: セルフホスト。Step 6.2 で Lisp 製コンパイラ
-  が dotcl 上で自身をコンパイル可能に。残りは save-lisp-and-die 相当
-- **Step 9 (未着手)**: Swank / Lem 接続。TCP ソケット +
-  bordeaux-threads + `swank-dotcl.lisp` (defimplementation)。
-  Phase 1 (TCP) と Phase 2 (スレッド基盤) は並行可能
+  活かす。SBCL の IR1 を参考にしつつ CIL 向けの軽量 IR を別途設計。
+  宣言駆動の native 整数演算・インライン展開・コールサイト inline cache は
+  入っており、残りは GitHub issues
+- **Step 8 (達成)**: セルフホスト + イメージ出力。Lisp 製コンパイラが
+  dotcl 上で自身をコンパイルし、`dotcl:save-application` (3.18) で
+  配布物を出せる。SBCL の `save-lisp-and-die` とは range が違う
+  (実行時ヒープのダンプではない)
+- **Step 8.5 (達成)**: 無改変 SBCL のクロスビルドホストとして通る
+  (`./make.sh --xc-host=dotcl` が完走)。処理系としての網羅度を外部の
+  巨大な CL コードで測る駆動源。残っているのは性能 (SBCL ホスト比)
+- **Step 9 (部分達成)**: エディタ接続。Lem の swank fork である micros の
+  dotcl backend が動き、upstream に提出済み (`lem-project/micros#22`)。
+  backtrace / frame-locals / source-location / eval-in-frame / arglist
+  などの中核は実装済みで、xref 呼出グラフや stepping は未実装。
+  SLIME 本家の swank 側は未対応
+- **Step 10 (進行中)**: emit 無しで動く構成 (3.17)。netstandard2.0 /
+  AOT 向けに、解釈経路とプリコンパイル済み FASL だけで CL を回す
 
 未解決課題は GitHub Issues。
 

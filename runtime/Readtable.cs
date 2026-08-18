@@ -126,7 +126,12 @@ public class LispReadtable : LispObject
     public void SetDispatchMacroCharacter(char dispChar, char subChar, Func<Reader, char, int, LispObject?> fn, LispObject? lispFn = null)
     {
         if (!_dispatchTables.TryGetValue(dispChar, out var table))
-            throw new Exception($"{dispChar} is not a dispatching macro character");
+            // PROGRAM-ERROR is the right class here (calling this on a character
+            // that was never made dispatching is a program bug), but a raw
+            // System.Exception reaches the user as one only by accident, via the
+            // CLR-exception mapping.
+            throw new LispErrorException(new LispProgramError(
+                $"SET-DISPATCH-MACRO-CHARACTER: {dispChar} is not a dispatching macro character"));
         var upper = char.ToUpperInvariant(subChar);
         table[upper] = fn;
         if (lispFn != null)

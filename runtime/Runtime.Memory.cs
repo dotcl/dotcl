@@ -159,7 +159,8 @@ public static partial class Runtime
         if (args.Length < 1) throw ArgError("dotnet:load-library", 1, args.Length);
         var path = args[0] is LispString ls ? ls.Value :
                    args[0] is LispVector lv && lv.IsCharVector ? lv.ToCharString() :
-                   throw new LispErrorException(new LispError("dotnet:load-library: path must be a string"));
+                   throw new LispErrorException(new LispTypeError(
+                       "dotnet:load-library: path must be a string", args[0], Startup.Sym("STRING")));
         lock (_cffiLibHandles)
         {
             if (_cffiLibHandles.TryGetValue(path, out var h)) return Fixnum.Make(h.ToInt64());
@@ -193,7 +194,8 @@ public static partial class Runtime
         if (args.Length < 2) throw ArgError("dotnet:find-symbol", 2, args.Length);
         var name = args[0] is LispString ls ? ls.Value :
                    args[0] is LispVector lv && lv.IsCharVector ? lv.ToCharString() :
-                   throw new LispErrorException(new LispError("dotnet:find-symbol: name must be a string"));
+                   throw new LispErrorException(new LispTypeError(
+                       "dotnet:find-symbol: name must be a string", args[0], Startup.Sym("STRING")));
         var handle = new IntPtr(((Fixnum)args[1]).Value);
         if (NativeLibrary.TryGetExport(handle, name, out var ptr))
             return Fixnum.Make(ptr.ToInt64());
@@ -206,7 +208,8 @@ public static partial class Runtime
         if (args.Length < 1) throw ArgError("dotnet:find-symbol-any", 1, args.Length);
         var name = args[0] is LispString ls ? ls.Value :
                    args[0] is LispVector lv && lv.IsCharVector ? lv.ToCharString() :
-                   throw new LispErrorException(new LispError("dotnet:find-symbol-any: name must be a string"));
+                   throw new LispErrorException(new LispTypeError(
+                       "dotnet:find-symbol-any: name must be a string", args[0], Startup.Sym("STRING")));
         lock (_cffiLibHandles)
         {
             foreach (var h in _cffiLibHandles.Values)

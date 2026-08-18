@@ -1202,6 +1202,11 @@ public static partial class Runtime
             }
             return Nil.Instance;
         }
+        // resolved is null only when a synonym stream names an unbound symbol,
+        // which used to reach GetTextReader and fail as a raw .NET exception.
+        if (resolved is null)
+            throw new LispErrorException(new LispError(
+                "LISTEN: synonym stream symbol has no value"));
         TextReader reader = GetTextReader(resolved);
         int p = reader.Peek();
         return p == -1 ? Nil.Instance : T.Instance;
@@ -1929,6 +1934,19 @@ public static partial class Runtime
     public static LispObject ReadPreservingWhitespace(LispObject stream, LispObject eofErrorP, LispObject eofValue)
         => GuardStreamIO(stream, () => ReadPreservingWhitespaceUnguarded(stream, eofErrorP, eofValue));
 
+    /// <summary>The TextReader a Lisp READer should consume for STREAM. Same as
+    /// GetTextReader, except that reading through an echo-stream echoes — the Lisp
+    /// reader works on the TextReader underneath the wrapper, so without this it
+    /// bypasses the echo entirely.</summary>
+    internal static TextReader GetReaderTextReader(LispObject stream)
+    {
+        var inner = GetTextReader(stream);
+        var echo = FindEchoStream(stream);
+        if (echo == null) return inner;
+        var echoWriter = GetTextWriter(echo.OutputStream);
+        return echoWriter == null ? inner : new EchoingTextReader(inner, echoWriter);
+    }
+
     private static LispObject ReadPreservingWhitespaceUnguarded(LispObject stream, LispObject eofErrorP, LispObject eofValue)
     {
         Reader lispReader;
@@ -1938,7 +1956,7 @@ public static partial class Runtime
         }
         else
         {
-            TextReader reader = GetTextReader(stream);
+            TextReader reader = GetReaderTextReader(stream);
             lispReader = new Reader(reader) { LispStreamRef = stream };
             if (stream is LispStream ls3)
             {
@@ -1952,26 +1970,21 @@ public static partial class Runtime
             lispReader.UnreadChar(ls.UnreadCharValue);
             ls.UnreadCharValue = -1;
         }
-        try
+        if (lispReader.TryRead(out var result))
         {
-            if (lispReader.TryRead(out var result))
-            {
-                // After reading, check if the next char is whitespace; if so, "unread" it
-                // Since TryRead already consumes whitespace as delimiter, we need to
-                // push it back. The Reader class may have already consumed it though.
-                // For now, this is best-effort: works for string streams where Peek works.
-                return result;
-            }
-            if (eofErrorP is not Nil)
-                { var eof = new LispError("READ-PRESERVING-WHITESPACE: end of file"); eof.ConditionTypeName = "END-OF-FILE"; eof.StreamErrorStreamRef = stream; throw new LispErrorException(eof); }
-            return eofValue;
+            // The delimiter stays in the stream: the Reader pushes back the
+            // character that ended the token, and the pushback travels with the
+            // stream, so this holds for file and concatenated streams as well as
+            // string ones (test/regression/read-preserving-whitespace.lisp pins
+            // all three). The note that used to sit here called it best-effort
+            // and string-stream-only, which is no longer what it does.
+            return result;
         }
-        catch (EndOfStreamException)
-        {
-            if (eofErrorP is not Nil)
-                throw;
-            return eofValue;
-        }
+        // As in READ: eof-error-p covers only an end of file before any form
+        // began. Mid-object EOF signals END-OF-FILE from the reader regardless.
+        if (eofErrorP is not Nil)
+            { var eof = new LispError("READ-PRESERVING-WHITESPACE: end of file"); eof.ConditionTypeName = "END-OF-FILE"; eof.StreamErrorStreamRef = stream; throw new LispErrorException(eof); }
+        return eofValue;
     }
 
     public static LispObject ReadLine(LispObject stream, LispObject eofErrorP, LispObject eofValue)
@@ -2982,7 +2995,6 @@ public static partial class Runtime
             return ((LispPathname)translated).ToNamestring();
         }
         // CL spec: file operations merge with *default-pathname-defaults*
-        mergeDpd:
         if (!string.IsNullOrEmpty(raw) && !Compat.IsPathFullyQualified(raw))
         {
             var defaults = GetDefaultPathnameDefaults();
@@ -3465,14 +3477,35 @@ public static partial class Runtime
             {
                 streamObj = DynamicBindings.Get(Startup.Sym("*STANDARD-INPUT*"));
             }
-            // recursive-p is args[2] if provided (ignored for now)
+            // recursive-p (args[2]) needs no separate handling: what it asks for is
+            // that this read take part in the enclosing one, and the part that is
+            // observable here is #n= / #n# label scope. Adopting the stream's share
+            // tables gives that for every call, recursive or not — a #n# inside the
+            // delimited list resolves against a label defined outside it, which a
+            // fresh Reader could not see.
             System.IO.TextReader reader = Runtime.GetTextReader(streamObj);
             var lispReader = new Reader(reader) { LispStreamRef = streamObj };
+            if (streamObj is LispStream shareStream)
+                lispReader.AdoptStreamShareTables(shareStream);
             var items = new System.Collections.Generic.List<LispObject>();
+            // The elements are read recursively, so a #n= in one of them is still
+            // in scope for a #n# in the next. Without this each element is a fresh
+            // top-level read, which clears the label tables between elements.
+            lispReader.EnterRecursiveRead();
+            try {
             while (true) {
                 lispReader.SkipWhitespace();
                 int ch = lispReader.Peek();
-                if (ch == -1) throw new LispErrorException(new LispError("READ-DELIMITED-LIST: unexpected end of input"));
+                // CLHS: reaching end of file before the delimiter is an error of
+                // type END-OF-FILE, not a bare simple-error.
+                if (ch == -1)
+                {
+                    var eof = new LispError(
+                        $"READ-DELIMITED-LIST: end of file before the closing {delimChar}");
+                    eof.ConditionTypeName = "END-OF-FILE";
+                    eof.StreamErrorStreamRef = streamObj;
+                    throw new LispErrorException(eof);
+                }
                 if (ch == delimChar) {
                     lispReader.ReadChar();
                     break;
@@ -3480,6 +3513,7 @@ public static partial class Runtime
                 if (lispReader.TryRead(out var obj))
                     items.Add(obj);
             }
+            } finally { lispReader.ExitRecursiveRead(); }
             // Build list from items
             LispObject result = Nil.Instance;
             for (int i = items.Count - 1; i >= 0; i--)

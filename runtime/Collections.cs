@@ -878,7 +878,14 @@ public class LispHashTable : LispObject
             "EQL" => Eql,
             "EQUAL" => LispEqual,
             "EQUALP" => Equalp,
-            _ => throw new ArgumentException($"Unknown hash table test: {test}")
+            // (make-hash-table :test 'string=) is a common slip, so it has to
+            // read as a bad argument (TYPE-ERROR naming the test) rather than
+            // the PROGRAM-ERROR a raw ArgumentException maps to.
+            _ => throw new LispErrorException(new LispTypeError(
+                $"MAKE-HASH-TABLE: unknown :test {test} (expected EQ, EQL, EQUAL or EQUALP)",
+                Startup.Sym(_testName),
+                Runtime.List(Startup.Sym("MEMBER"), Startup.Sym("EQ"), Startup.Sym("EQL"),
+                             Startup.Sym("EQUAL"), Startup.Sym("EQUALP"))))
         };
         Synchronized = synchronized;
         if (weakness != null)
@@ -890,9 +897,13 @@ public class LispHashTable : LispObject
                 case "KEY-AND-VALUE": Weakness = ":KEY-AND-VALUE"; _weakKey = true; _weakValue = true; break;
                 case "KEY-OR-VALUE":  Weakness = ":KEY-OR-VALUE";  _weakKey = true; _weakValue = true; _keyOrValue = true; break;
                 default:
-                    throw new ArgumentException(
-                        $":weakness {weakness.ToLowerInvariant()} invalid " +
-                        "(expected :key, :value, :key-and-value, or :key-or-value)");
+                    throw new LispErrorException(new LispTypeError(
+                        $"MAKE-HASH-TABLE: :weakness {weakness.ToLowerInvariant()} invalid " +
+                        "(expected :key, :value, :key-and-value, or :key-or-value)",
+                        Startup.Keyword(weakness.ToUpperInvariant()),
+                        Runtime.List(Startup.Sym("MEMBER"), Startup.Keyword("KEY"),
+                                     Startup.Keyword("VALUE"), Startup.Keyword("KEY-AND-VALUE"),
+                                     Startup.Keyword("KEY-OR-VALUE"))));
             }
         }
         // Key-weak tables box the key in a WeakKeyBox so the dict doesn't root it;

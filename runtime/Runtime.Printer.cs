@@ -14,7 +14,7 @@ public static partial class Runtime
         var rtSym = Startup.CL.FindSymbol("*READTABLE*").symbol;
         LispObject rtVal;
         if (!DynamicBindings.TryGet(rtSym, out rtVal))
-            rtVal = rtSym?.Value;
+            rtVal = rtSym?.Value ?? Nil.Instance;
         ReadtableCase rtCase = ReadtableCase.Upcase;
         if (rtVal is LispReadtable rt) rtCase = rt.Case;
 
@@ -116,6 +116,32 @@ public static partial class Runtime
     }
 
     /// <summary>
+    /// True if the bare token NAME would read back, in *PACKAGE*, as the
+    /// COMMON-LISP symbol of that name. NIL and T are their own object types
+    /// here, so they skip the accessibility check FormatSymbol does for every
+    /// other symbol — and CLHS 22.1.3.3 grants them no exemption. Printed bare
+    /// in a package that does not inherit COMMON-LISP they read back as a
+    /// DIFFERENT symbol of the same name, breaking print/read consistency
+    /// silently: coalton prints a form and re-reads it in a package that uses
+    /// only its own, so the () in (fn () ...) came back as a foreign NIL and
+    /// its parser rejected the argument list.
+    /// </summary>
+    private static bool ReadsBackAsCl(string name)
+    {
+        var currentPkg = DynamicBindings.Get(Startup.Sym("*PACKAGE*")) as Package;
+        if (currentPkg == null) return true;
+        var (found, status) = currentPkg.FindSymbol(name);
+        return status != SymbolStatus.None
+               && found?.HomePackage != null
+               && found.HomePackage.Name == "COMMON-LISP";
+    }
+
+    /// <summary>COMMON-LISP-qualified form of NAME, with *PRINT-CASE* applied to
+    /// each part the way FormatSymbol does.</summary>
+    private static string QualifiedCl(string name) =>
+        $"{ApplyPrintCase("COMMON-LISP")}:{ApplyPrintCase(name)}";
+
+    /// <summary>
     /// Format a symbol for printing with *PRINT-CASE* applied.
     /// escape=true: prin1-like (with package prefix and escape chars as needed)
     /// escape=false: princ-like (no escape chars)
@@ -178,7 +204,7 @@ public static partial class Runtime
         var rtSym = Startup.CL.FindSymbol("*READTABLE*").symbol;
         LispObject rtVal;
         if (!DynamicBindings.TryGet(rtSym, out rtVal))
-            rtVal = rtSym?.Value;
+            rtVal = rtSym?.Value ?? Nil.Instance;
         LispReadtable? rt = rtVal as LispReadtable;
         ReadtableCase rtCase = rt?.Case ?? ReadtableCase.Upcase;
 
@@ -460,12 +486,16 @@ public static partial class Runtime
                 // (e.g. base >= 30 where T is a digit), escape it
                 if ((escape || GetPrintReadably()) && CouldBeNumber("T"))
                     return "|T|";
+                if ((escape || GetPrintReadably()) && !ReadsBackAsCl("T"))
+                    return QualifiedCl("T");
                 return ApplyPrintCase("T");
             case Nil:
                 // When escape/readably and NIL could be read as a number
                 // (e.g. base >= 24 where N,I,L are all digits), print as ()
                 if ((escape || GetPrintReadably()) && CouldBeNumber("NIL"))
                     return "()";
+                if ((escape || GetPrintReadably()) && !ReadsBackAsCl("NIL"))
+                    return QualifiedCl("NIL");
                 return ApplyPrintCase("NIL");
             case Symbol sym:
                 // *print-circle* check for uninterned symbols
@@ -640,9 +670,9 @@ public static partial class Runtime
         if (num is SingleFloat sf)
         {
             float v = sf.Value;
-            if (float.IsPositiveInfinity(v)) return "#.SINGLE-FLOAT-POSITIVE-INFINITY";
-            if (float.IsNegativeInfinity(v)) return "#.SINGLE-FLOAT-NEGATIVE-INFINITY";
-            if (float.IsNaN(v)) return "#.SINGLE-FLOAT-NAN";
+            if (float.IsPositiveInfinity(v)) return NonFiniteFloatForm(num, "SINGLE-FLOAT-POSITIVE-INFINITY");
+            if (float.IsNegativeInfinity(v)) return NonFiniteFloatForm(num, "SINGLE-FLOAT-NEGATIVE-INFINITY");
+            if (float.IsNaN(v)) return NonFiniteFloatForm(num, "SINGLE-FLOAT-NAN");
 
             if (defaultIsSingle)
             {
@@ -668,9 +698,9 @@ public static partial class Runtime
         else if (num is DoubleFloat df)
         {
             double v = df.Value;
-            if (double.IsPositiveInfinity(v)) return "#.DOUBLE-FLOAT-POSITIVE-INFINITY";
-            if (double.IsNegativeInfinity(v)) return "#.DOUBLE-FLOAT-NEGATIVE-INFINITY";
-            if (double.IsNaN(v)) return "#.DOUBLE-FLOAT-NAN";
+            if (double.IsPositiveInfinity(v)) return NonFiniteFloatForm(num, "DOUBLE-FLOAT-POSITIVE-INFINITY");
+            if (double.IsNegativeInfinity(v)) return NonFiniteFloatForm(num, "DOUBLE-FLOAT-NEGATIVE-INFINITY");
+            if (double.IsNaN(v)) return NonFiniteFloatForm(num, "DOUBLE-FLOAT-NAN");
 
             if (defaultIsDouble)
             {
@@ -738,6 +768,40 @@ public static partial class Runtime
         var sym = Startup.Sym("*PRINT-ESCAPE*");
         if (sym.IsBound && sym.Value != null) return !(sym.Value is Nil);
         return true; // default: escape on
+    }
+
+    /// <summary>How an infinity or NaN prints. There is no standard token for these,
+    /// so the readable form names a constant and evaluates it with #. — which only
+    /// works if the name exists (it does now, in DOTCL) and *READ-EVAL* is true.
+    /// With read-eval off the value cannot be printed readably at all: emit the
+    /// unreadable #&lt;…&gt; form, or signal PRINT-NOT-READABLE if the caller asked for
+    /// readable output. This is the behaviour SBCL has.</summary>
+    private static string NonFiniteFloatForm(LispObject value, string constantName)
+    {
+        if (GetReadEval()) return $"#.DOTCL:{constantName}";
+
+        if (GetPrintReadably())
+        {
+            var err = new LispError(
+                $"cannot print {constantName} readably with *READ-EVAL* NIL");
+            err.ConditionTypeName = "PRINT-NOT-READABLE";
+            throw new LispErrorException(err);
+        }
+        return $"#<DOTCL:{constantName}>";
+    }
+
+    /// <summary>The same choice without the signal, for LispObject.ToString — which
+    /// diagnostics call and which therefore must not throw.</summary>
+    internal static string NonFiniteFloatFormSafe(string constantName)
+        => GetReadEval() ? $"#.DOTCL:{constantName}" : $"#<DOTCL:{constantName}>";
+
+    private static bool GetReadEval()
+    {
+        if (DynamicBindings.TryGet(Startup.Sym("*READ-EVAL*"), out var re))
+            return re is not Nil;
+        var reSym = Startup.Sym("*READ-EVAL*");
+        if (reSym.IsBound && reSym.Value != null) return reSym.Value is not Nil;
+        return true;
     }
 
     private static bool GetPrintReadably()
@@ -910,9 +974,9 @@ public static partial class Runtime
     /// </summary>
     private static string FormatSingleFloat(float value)
     {
-        if (float.IsPositiveInfinity(value)) return "#.SINGLE-FLOAT-POSITIVE-INFINITY";
-        if (float.IsNegativeInfinity(value)) return "#.SINGLE-FLOAT-NEGATIVE-INFINITY";
-        if (float.IsNaN(value)) return "#.SINGLE-FLOAT-NAN";
+        if (float.IsPositiveInfinity(value)) return NonFiniteFloatForm(new SingleFloat(value), "SINGLE-FLOAT-POSITIVE-INFINITY");
+        if (float.IsNegativeInfinity(value)) return NonFiniteFloatForm(new SingleFloat(value), "SINGLE-FLOAT-NEGATIVE-INFINITY");
+        if (float.IsNaN(value)) return NonFiniteFloatForm(new SingleFloat(value), "SINGLE-FLOAT-NAN");
         var s = value.ToString("R", System.Globalization.CultureInfo.InvariantCulture);
         s = NormalizePrinterFloat(s, Math.Abs((double)value));
         var defaultFormat = GetReadDefaultFloatFormat();
@@ -938,9 +1002,9 @@ public static partial class Runtime
     /// </summary>
     private static string FormatDoubleFloat(double value)
     {
-        if (double.IsPositiveInfinity(value)) return "#.DOUBLE-FLOAT-POSITIVE-INFINITY";
-        if (double.IsNegativeInfinity(value)) return "#.DOUBLE-FLOAT-NEGATIVE-INFINITY";
-        if (double.IsNaN(value)) return "#.DOUBLE-FLOAT-NAN";
+        if (double.IsPositiveInfinity(value)) return NonFiniteFloatForm(new DoubleFloat(value), "DOUBLE-FLOAT-POSITIVE-INFINITY");
+        if (double.IsNegativeInfinity(value)) return NonFiniteFloatForm(new DoubleFloat(value), "DOUBLE-FLOAT-NEGATIVE-INFINITY");
+        if (double.IsNaN(value)) return NonFiniteFloatForm(new DoubleFloat(value), "DOUBLE-FLOAT-NAN");
         var s = value.ToString("R", System.Globalization.CultureInfo.InvariantCulture);
         s = NormalizePrinterFloat(s, Math.Abs(value));
         var defaultFormat = GetReadDefaultFloatFormat();
@@ -1401,11 +1465,18 @@ public static partial class Runtime
         if (structClass == null) return false;
         foreach (var method in gf.Methods)
         {
+            // Any method more specific than the default one on T applies, including
+            // one specialized on a parent struct: (:include ...) puts that parent in
+            // this class's precedence list, and CL dispatches print-object like any
+            // other generic function. Comparing against the struct's own class alone
+            // printed a sub-struct as #S(...) while its parent printed through the
+            // user's method (quri returns uri-http from a uri printer, say).
             if (method.Qualifiers.Length == 0
                 && method.Specializers.Length >= 1
                 && method.Specializers[0] is LispClass cls
                 && cls != tClass
-                && cls == structClass)
+                && (cls == structClass
+                    || System.Array.IndexOf(structClass.ClassPrecedenceList, cls) >= 0))
                 return true;
         }
         return false;
@@ -2019,7 +2090,6 @@ public static partial class Runtime
             // Parse :stream keyword and printer variable bindings
             // Per CLHS 3.4.1.4: first value for duplicate keywords takes precedence
             LispObject? streamArg = null;
-            bool streamSeen = false;
             var seenKeys = new System.Collections.Generic.HashSet<string>();
             var bindings = new System.Collections.Generic.List<(Symbol, LispObject)>();
             bool? allowOtherKeys = null;
@@ -2035,7 +2105,6 @@ public static partial class Runtime
                 if (!seenKeys.Add(kw.Name)) continue; // duplicate keyword: skip
                 if (kw.Name == "STREAM") {
                     streamArg = args[i + 1];
-                    streamSeen = true;
                     continue;
                 }
                 var printVar = kw.Name switch {

@@ -142,7 +142,8 @@
               (loop for line = (read-line in nil nil)
                     while line do (write-line line out)))))))))
 
-;;; Patch do-entries to avoid return-from (workaround for compiler block/handler-bind bug)
+;;; Patch do-entries: crash protection + *hang-tests* filter
+;;; Kept in step with the same patch in test-ansi.lisp.
 (in-package :regression-test)
 (defun do-entries (s)
   (format s "~&Doing ~A pending test~:P ~
@@ -154,12 +155,21 @@
     (when (and (pend entry)
                (not (has-disabled-note entry))
                (not (member (name entry) *hang-tests*)))
-      (let ((success? (do-entry entry s)))
+      (let ((success? (handler-case (do-entry entry s)
+                        (error (c)
+                          (format s "~&Test ~:@(~S~) CRASHED: ~A~%" (name entry) c)
+                          (push (name entry) *failed-tests*)
+                          nil))))
         (format s "~@[~<~%~:; ~:@(~S~)~>~]" success?)
         (finish-output s)
         (if success?
             (push (name entry) *passed-tests*)
-            (push (name entry) *failed-tests*)))))
+            (progn
+              (unless (member (name entry) *failed-tests*)
+                (push (name entry) *failed-tests*))
+              (when (and (boundp '*stop-on-failure*) *stop-on-failure*)
+                (finish-output s)
+                (return-from do-entries nil)))))))
   (let ((pending (pending-tests))
         (expected-table (make-hash-table :test #'equal)))
     (dolist (ex *expected-failures*)

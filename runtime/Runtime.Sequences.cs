@@ -2266,7 +2266,7 @@ public static partial class Runtime
                 // Splice matched conses out of the original chain in place, relinking
                 // each survivor's cdr past the removed run. Returns the (possibly new) head.
                 LispObject newHead = listSeq;
-                Cons prev = null;
+                Cons? prev = null;
                 int idx = 0;
                 for (var cur = listSeq; cur is Cons c; idx++)
                 {

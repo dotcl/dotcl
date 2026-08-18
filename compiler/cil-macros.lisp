@@ -352,7 +352,6 @@
         ;; (setf (subseq seq start end) new-seq)
         `(%set-subseq ,(second place) ,(third place) ,(fourth place) ,value)))
 
-;; (setf (compiler-macro-function ...) ...) — no-op stub
 (setf (gethash "GETF" *setf-expanders*)
       (lambda (place value)
         ;; (setf (getf plist-place indicator [default]) value)
@@ -2766,8 +2765,22 @@
                                        (error 'program-error
                                               :format-control "DEFCLASS ~S: duplicate :allocation option in slot ~S"
                                               :format-arguments (list name sname)))
+                                     ;; CLHS 7.1.2: :instance or :class. Anything
+                                     ;; else used to be accepted and then treated
+                                     ;; as :instance, silently.
+                                     (unless (member val '(:instance :class))
+                                       (error 'program-error
+                                              :format-control "DEFCLASS ~S: :allocation must be :INSTANCE or :CLASS in slot ~S, got ~S"
+                                              :format-arguments (list name sname val)))
                                      (setf seen-alloc t))
-                                    ((eq key :initarg) nil)
+                                    ((eq key :initarg)
+                                     ;; CLHS 7.1.2: an initarg name is a symbol.
+                                     ;; A non-symbol used to be stored and then
+                                     ;; never match anything at MAKE-INSTANCE.
+                                     (unless (symbolp val)
+                                       (error 'program-error
+                                              :format-control "DEFCLASS ~S: :initarg must be a symbol in slot ~S, got ~S"
+                                              :format-arguments (list name sname val))))
                                     ((eq key :reader) nil)
                                     ((eq key :writer) nil)
                                     ((eq key :accessor) nil)
@@ -2803,7 +2816,7 @@
                (parsed-slots
                  (mapcar (lambda (spec)
                            (if (symbolp spec)
-                               (list spec nil nil nil nil nil nil nil nil) ; (name initargs initform-present initform accessor reader writer allocation custom-opts)
+                               (list spec nil nil nil nil nil nil nil nil nil) ; (name initargs initform-present initform accessor reader writer allocation custom-opts type)
                                (let* ((sname (car spec))
                                       (props (cdr spec))
                                       (initargs nil)
@@ -2813,7 +2826,8 @@
                                       (readers nil)
                                       (writers nil)
                                       (allocation nil)
-                                      (custom-opts nil))
+                                      (custom-opts nil)
+                                      (slot-type nil))
                                  (loop while props
                                        do (let ((key (pop props))
                                                 (val (pop props)))
@@ -2824,12 +2838,20 @@
                                               ((eq key :reader) (push val readers))
                                               ((eq key :writer) (push val writers))
                                               ((eq key :allocation) (setf allocation val))
+                                              ;; :type is kept for introspection
+                                              ;; (slot-definition-type); dotcl does not
+                                              ;; check slot values against it. It also
+                                              ;; stays in custom-opts below when a custom
+                                              ;; metaclass wants to see the raw plist.
+                                              ((eq key :type)
+                                               (setf slot-type val)
+                                               (push (cons key val) custom-opts))
                                               ;; Non-standard slot options (allowed under a custom
                                               ;; metaclass) are passed to DIRECT-SLOT-DEFINITION-CLASS
                                               ;; and seed the custom slotd's Lisp slots.
                                               (t (push (cons key val) custom-opts)))))
                                  (list sname initargs initform-present initform accessors readers writers allocation
-                                       (nreverse custom-opts)))))
+                                       (nreverse custom-opts) slot-type))))
                          (or slot-specs '())))
                ;; register :reader/:accessor names as slot-reader hints
                ;; (side effect at macro-expansion time, mirroring *struct-accessors*).
@@ -2894,13 +2916,39 @@
                                       ;; options so DIRECT-SLOT-DEFINITION-CLASS can dispatch on
                                       ;; them. Values are quoted (CLOS does not evaluate slot
                                       ;; option values).
-                                      (if (and custom-metaclass-p custom-opts)
-                                          `(%slot-def-raw-options
-                                            ,base
-                                            (list ,@(mapcan (lambda (kv)
-                                                              (list `',(car kv) `',(cdr kv)))
-                                                            custom-opts)))
-                                          base)))
+                                      (let* ((accessors (fifth ps))
+                                             (readers (sixth ps))
+                                             (writers (seventh ps))
+                                             (slot-type (tenth ps))
+                                             ;; AMOP: an :accessor contributes both a
+                                             ;; reader NAME and the writer (SETF NAME).
+                                             (reader-names (reverse (append readers accessors)))
+                                             (writer-names (append (reverse writers)
+                                                                   (mapcar (lambda (a) (list 'setf a))
+                                                                           (reverse accessors))))
+                                             (with-opts
+                                               (if (and custom-metaclass-p custom-opts)
+                                                   `(%slot-def-raw-options
+                                                     ,base
+                                                     (list ,@(mapcan (lambda (kv)
+                                                                       (list `',(car kv) `',(cdr kv)))
+                                                                     custom-opts)))
+                                                   base)))
+                                        ;; Introspectable attributes DEFCLASS already knows.
+                                        ;; Emitted only when there is something to say, so
+                                        ;; the common slot keeps its two-call expansion.
+                                        (if (or reader-names writer-names slot-type
+                                                initform-present)
+                                            `(%slot-def-attrs
+                                              ,with-opts
+                                              (list ,@(mapcar (lambda (r) `',r) reader-names))
+                                              (list ,@(mapcar (lambda (w) `',w) writer-names))
+                                              ',slot-type
+                                              ;; The initform as source: the thunk
+                                              ;; cannot be turned back into it, and
+                                              ;; SLOT-DEFINITION-INITFORM must return it.
+                                              ',(and initform-present initform))
+                                            with-opts))))
                                   parsed-slots)))
                ;; Accessor definitions
                (accessor-defs

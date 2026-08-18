@@ -38,6 +38,8 @@ bench-state.json
 !scripts/ilverify-check.sh
 !scripts/build-quicklisp.sh
 !scripts/contrib-resolve.sh
+!ci/d-number.sh
+!ci/mirror-scrub-workflows.sh
 !samples/**/*.sh
 !test/*/check.sh
 
@@ -103,3 +105,5 @@ runtime/Generated/
 templates/bin/
 templates/obj/
 
+scripts/ilverify-filter/bin/
+scripts/ilverify-filter/obj/

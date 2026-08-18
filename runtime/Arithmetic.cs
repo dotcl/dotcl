@@ -727,7 +727,13 @@ public static class Arithmetic
         // A decimal contributes its exact rational value; standard exact arithmetic then
         // yields a standard rational/integer (never a decimal — conservative extension).
         LispDecimal d => d.AsRatio(),
-        _ => throw new ArgumentException($"Not a rational number: {n}")
+        // A complex reaching here means a real-only operation (FLOOR / CEILING /
+        // TRUNCATE / ROUND …) was handed one: a wrong argument, not a broken
+        // program. A raw ArgumentException here surfaced as PROGRAM-ERROR with no
+        // datum to inspect.
+        _ => throw new LispErrorException(new LispTypeError(
+                 $"not a rational number: {n}", n,
+                 Startup.Sym(n is LispComplex ? "REAL" : "RATIONAL")))
     };
 
     private static LispComplex AsComplex(Number n) => n switch

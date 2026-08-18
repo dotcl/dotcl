@@ -1735,3 +1735,37 @@
                   (not (null (search "T:LibDoc.Point" content)))
                   t)))))
   t)
+
+;;; Constructor parameters. The AspNetLispDemo README claimed :ctor was zero-arg
+;;; only; it is not, and the difference matters because DI containers construct
+;;; objects through their ctor. Reflection and Activator are checked here (both
+;;; live in corelib); the ActivatorUtilities / IServiceProvider path needs the
+;;; ASP.NET shared framework, so that verification lives in the issue instead.
+
+(require "dotnet-class")
+
+(dotnet:define-class "DotclTest.CtorParam" ()
+  (:fields ("Name" String))
+  (:ctor ((name String))
+    (dotnet:%set-invoke self "Name" name))
+  (:methods ("Greet" () :returns String
+              (concatenate 'string "hello " (dotnet:invoke self "Name")))))
+
+(deftest net-class-ctor-with-parameter
+  (dotnet:invoke (dotnet:new "DotclTest.CtorParam" "world") "Greet")
+  "hello world")
+
+(deftest net-class-ctor-signature-visible-to-reflection
+  (let* ((ty (dotnet:resolve-type "DotclTest.CtorParam"))
+         (c (dotnet:invoke (dotnet:invoke ty "GetConstructors") "GetValue" 0))
+         (ps (dotnet:invoke c "GetParameters")))
+    (list (dotnet:invoke ps "Length")
+          (dotnet:invoke (dotnet:invoke (dotnet:invoke ps "GetValue" 0) "ParameterType") "Name")))
+  (1 "String"))
+
+(deftest net-class-ctor-through-activator
+  (let ((ty (dotnet:resolve-type "DotclTest.CtorParam"))
+        (args (dotnet:make-array "System.Object" 1)))
+    (dotnet:invoke args "SetValue" "activator" 0)
+    (dotnet:invoke (dotnet:static "System.Activator" "CreateInstance" ty args) "Greet"))
+  "hello activator")

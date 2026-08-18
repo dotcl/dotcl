@@ -62,7 +62,12 @@ DEFUN works too:
 
 ## Implementation notes
 
-- The dotcl runtime is not thread-safe, so eval is serialized with `_evalLock`.
+- `Eval` serializes its compile/run path on a process-wide lock by default, so a
+  host does not need one of its own. A host that wants many threads compiling at
+  once opts out with `dotcl:set-parallel-eval` (or `DOTCL_PARALLEL_EVAL=1`): the
+  state that path touches is individually race-safe, and the regression suite
+  hammers it with concurrent `defmethod` / `defun` / macro-table writes. As in
+  any Common Lisp, mutation of user-level data stays the caller's business.
 - `DotclHost.LoadCore` boots only once (it takes ~0.3s).
 - The MCP protocol owns stdout, so all logs go to stderr (`LogToStandardErrorThreshold=Trace`).
 - Multiple forms are wrapped in PROGN, so **only the last value** is returned.

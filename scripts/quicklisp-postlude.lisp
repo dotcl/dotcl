@@ -160,9 +160,37 @@ turning that into a failed SETUP would strand the user with no dist at all."
 (defun %report-uninitialized-home (stream)
   (format stream
           "~&;; quicklisp: no dist installed under ~A~@
-             ;; Run (ql:setup) to download and install one from ~A.~%"
+             ;; The first (ql:quickload ...) installs one from ~A,~@
+             ;; or run (ql:setup) now to do it up front.~%"
           (namestring *quicklisp-home*)
           quicklisp::*initial-dist-url*))
+
+;;; (ql:quickload) on a home with no dist — set it up rather than fail
+;;;
+;;; REQUIRE must not touch the network, so a fresh home has no dist when the
+;;; client is loaded. QUICKLOAD is the other side of that: asking for a library
+;;; by name IS the request to go and get it, so failing with "System X not
+;;; found" reports the wrong thing — the system is fine, the home is empty.
+;;;
+;;; So the network moment moves from "the user reads a note and runs a second
+;;; incantation" to "the first quickload takes a few seconds longer", which is
+;;; where a user already expects to wait. SETUP up front still works and is
+;;; still the way to pay that cost at a time you choose.
+(defvar *client-quickload* (fdefinition 'quicklisp:quickload)
+  "The client's own QUICKLOAD, before the auto-setup wrapper below replaced it.")
+
+(defun %quickload-initializing-home (&rest args)
+  "QUICKLOAD, installing a dist first if this home has none."
+  (unless (quicklisp::dists-initialized-p)
+    (format *error-output*
+            "~&;; quicklisp: no dist under ~A yet — installing one first.~%"
+            (namestring *quicklisp-home*))
+    ;; The overlay wrapper, not the client's SETUP: a home initialized by
+    ;; quickload should end up with the same dists as one initialized by hand.
+    (quicklisp:setup))
+  (apply *client-quickload* args))
+
+(setf (fdefinition 'quicklisp:quickload) #'%quickload-initializing-home)
 
 ;; dists-initialized-p is the client's own predicate for "has a dist been
 ;; installed here", reused rather than reimplemented so the two cannot drift.

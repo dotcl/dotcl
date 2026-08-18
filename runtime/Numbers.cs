@@ -164,9 +164,9 @@ public class SingleFloat : Number
 
     public override string ToString()
     {
-        if (float.IsPositiveInfinity(Value)) return "#.SINGLE-FLOAT-POSITIVE-INFINITY";
-        if (float.IsNegativeInfinity(Value)) return "#.SINGLE-FLOAT-NEGATIVE-INFINITY";
-        if (float.IsNaN(Value)) return "#.SINGLE-FLOAT-NAN";
+        if (float.IsPositiveInfinity(Value)) return Runtime.NonFiniteFloatFormSafe("SINGLE-FLOAT-POSITIVE-INFINITY");
+        if (float.IsNegativeInfinity(Value)) return Runtime.NonFiniteFloatFormSafe("SINGLE-FLOAT-NEGATIVE-INFINITY");
+        if (float.IsNaN(Value)) return Runtime.NonFiniteFloatFormSafe("SINGLE-FLOAT-NAN");
         var s = Value.ToString("R");
         if (s.Contains('E') || s.Contains('e'))
             return s;
@@ -193,9 +193,9 @@ public class DoubleFloat : Number
 
     public override string ToString()
     {
-        if (double.IsPositiveInfinity(Value)) return "#.DOUBLE-FLOAT-POSITIVE-INFINITY";
-        if (double.IsNegativeInfinity(Value)) return "#.DOUBLE-FLOAT-NEGATIVE-INFINITY";
-        if (double.IsNaN(Value)) return "#.DOUBLE-FLOAT-NAN";
+        if (double.IsPositiveInfinity(Value)) return Runtime.NonFiniteFloatFormSafe("DOUBLE-FLOAT-POSITIVE-INFINITY");
+        if (double.IsNegativeInfinity(Value)) return Runtime.NonFiniteFloatFormSafe("DOUBLE-FLOAT-NEGATIVE-INFINITY");
+        if (double.IsNaN(Value)) return Runtime.NonFiniteFloatFormSafe("DOUBLE-FLOAT-NAN");
         var s = Value.ToString("R");
         if (s.Contains('E') || s.Contains('e'))
             return s.Replace("E", "d").Replace("e", "d");

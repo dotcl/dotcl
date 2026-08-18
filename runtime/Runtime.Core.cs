@@ -2,6 +2,14 @@ namespace DotCL;
 
 public static partial class Runtime
 {
+    /// <summary>A character argument. Bare casts to LispChar raise
+    /// InvalidCastException, which the CLR-exception mapping reports as
+    /// PROGRAM-ERROR carrying no datum; the spec wants a TYPE-ERROR naming the
+    /// value and CHARACTER.</summary>
+    private static char RequireChar(string who, LispObject arg)
+        => arg is LispChar c ? c.Value
+           : throw new LispErrorException(new LispTypeError(
+               $"{who}: not a character", arg, Startup.Sym("CHARACTER")));
 
     // --- Setf support ---
 
@@ -889,7 +897,15 @@ public static partial class Runtime
         {
             return thunk.Invoke();
         }
-        catch (Exception e)
+        // The filter is what keeps this frame out of the way of everything it does
+        // not convert. Catching every exception and letting RewrapNonLispException
+        // rethrow the pass-through ones restarted dispatch from inside this handler
+        // at every level, and each restarted dispatch stays on the stack while the
+        // exception keeps travelling — so a condition escaping deep interpreted
+        // recursion (one of these frames per interpreted HANDLER-BIND / HANDLER-CASE)
+        // cost stack proportional to the depth and died as an uncatchable .NET
+        // StackOverflowException. Same defect the compiled HANDLER-CASE had.
+        catch (Exception e) when (NeedsRewrap(e))
         {
             RewrapNonLispException(e); // always throws
             throw; // unreachable
@@ -899,6 +915,20 @@ public static partial class Runtime
             HandlerClusterStack.PopCluster();
         }
     }
+
+    /// <summary>Index of TAG in TAGS by identity, or -1. Used from an exception
+    /// filter, so it must not allocate or signal.</summary>
+    private static int IndexOfTag(System.Collections.Generic.List<object> tags, object tag)
+    {
+        for (int i = 0; i < tags.Count; i++)
+            if (ReferenceEquals(tags[i], tag)) return i;
+        return -1;
+    }
+
+    /// <summary>True for an exception RewrapNonLispException would actually convert.
+    /// Everything else it rethrows untouched, so there is no reason to catch it.</summary>
+    private static bool NeedsRewrap(Exception ex)
+        => ex is not LispErrorException && !IsLispControlFlowException(ex);
 
     /// <summary>
     /// restart-case for the tree-walk interpreter. args: (specs thunk) where specs
@@ -931,12 +961,13 @@ public static partial class Runtime
         {
             return thunk.Invoke();
         }
-        catch (RestartInvocationException rie)
+        // Filter rather than catch-and-rethrow, for the reason spelled out on
+        // CallWithHandlerCluster: an invoke-restart aimed at an OUTER restart-case
+        // must not enter this frame at all, or nested restart-cases stack one
+        // restarted dispatch each on the way out.
+        catch (RestartInvocationException rie) when (IndexOfTag(tags, rie.Tag) >= 0)
         {
-            int idx = -1;
-            for (int i = 0; i < tags.Count; i++)
-                if (ReferenceEquals(tags[i], rie.Tag)) { idx = i; break; }
-            if (idx < 0) throw; // not one of ours
+            int idx = IndexOfTag(tags, rie.Tag);
             RestartClusterStack.PopCluster();
             popped = true;
             return handlers[idx].Invoke(rie.Arguments); // handler runs outside the cluster
@@ -1139,7 +1170,9 @@ public static partial class Runtime
             var closureP = (obj is LispFunction lf && lf.Environment != null)
                 ? T.Instance : (LispObject)Nil.Instance;
             LispObject name = (obj is LispFunction nf && !string.IsNullOrEmpty(nf.Name))
-                ? Startup.Sym(nf.Name) : Nil.Instance;
+                // netstandard2.0's IsNullOrEmpty carries no nullability annotation,
+                // so the guard above does not narrow Name there.
+                ? Startup.Sym(nf.Name!) : Nil.Instance;
             return MultipleValues.Values(Nil.Instance, closureP, name);
         });
 
@@ -1371,9 +1404,14 @@ public static partial class Runtime
             return args[1];
         }));
         Emitter.CilAssembler.RegisterFunction("SET-SYNTAX-FROM-CHAR", new LispFunction(args => {
-            if (args.Length < 2) throw new System.Exception("SET-SYNTAX-FROM-CHAR: requires 2+ arguments");
-            char toChar = ((LispChar)args[0]).Value;
-            char fromChar = ((LispChar)args[1]).Value;
+            if (args.Length < 2)
+                throw new LispErrorException(new LispProgramError(
+                    "SET-SYNTAX-FROM-CHAR: requires 2+ arguments"));
+            // Both arguments are characters; a bare cast would raise
+            // InvalidCastException, which reaches the user as PROGRAM-ERROR with
+            // no datum. (setf (readtable-case ...) 'x) style slips land here.
+            char toChar = RequireChar("SET-SYNTAX-FROM-CHAR", args[0]);
+            char fromChar = RequireChar("SET-SYNTAX-FROM-CHAR", args[1]);
             var toRt = args.Length >= 3 && args[2] is LispReadtable rt1 ? rt1
                 : (LispReadtable)DynamicBindings.Get(Startup.Sym("*READTABLE*"));
             var fromRt = args.Length >= 4 && args[3] is LispReadtable rt2 ? rt2
@@ -1409,7 +1447,7 @@ public static partial class Runtime
                     }
                     else
                     {
-                        var textReader = Runtime.GetTextReader(fargs[0]);
+                        var textReader = Runtime.GetReaderTextReader(fargs[0]);
                         reader = new Reader(textReader) { LispStreamRef = fargs[0] };
                         // Propagate *read-suppress* from Lisp dynamic variable into the new Reader.
                         // ReadList/ReadStep1 don't re-sync from the dynamic var, so a new Reader
@@ -1528,7 +1566,7 @@ public static partial class Runtime
                     }
                     else
                     {
-                        var textReader2 = Runtime.GetTextReader(fargs[0]);
+                        var textReader2 = Runtime.GetReaderTextReader(fargs[0]);
                         reader2 = new Reader(textReader2) { LispStreamRef = fargs[0] };
                         // Propagate *read-suppress* into the fresh Reader, same as the
                         // GET-MACRO-CHARACTER path above. Without this a custom dispatch

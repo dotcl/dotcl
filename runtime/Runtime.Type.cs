@@ -1252,13 +1252,28 @@ public static partial class Runtime
         return UpgradeArrayElemType(et1) == UpgradeArrayElemType(et2);
     }
 
-    // CType routing metrics (enable via dotcl:%ctype-stats)
+    // CType routing metrics, off unless asked for: (dotcl:%ctype-stats t) turns
+    // collection on and resets, (dotcl:%ctype-stats) reports. Counting used to be
+    // unconditional, which put an interlocked increment on every SUBTYPEP — a
+    // measurement cost the shipping runtime paid forever for a diagnostic that was
+    // written as temporary. Plain increments: a lost count under threads is
+    // acceptable in a diagnostic, a lock prefix in SUBTYPEP is not.
+    private static bool s_ctypeStatsOn;
     private static long s_ctypeHits;
     private static long s_ctypeMisses;
     private static long s_ctypeErrors;
+
+    public static void SetCTypeStats(bool on)
+    {
+        s_ctypeHits = s_ctypeMisses = s_ctypeErrors = 0;
+        s_ctypeStatsOn = on;
+    }
+
     public static string CTypeStats() =>
-        $"hits={s_ctypeHits} misses={s_ctypeMisses} errors={s_ctypeErrors} " +
-        $"rate={s_ctypeHits * 100 / Math.Max(1, s_ctypeHits + s_ctypeMisses)}%";
+        s_ctypeStatsOn || s_ctypeHits + s_ctypeMisses + s_ctypeErrors > 0
+            ? $"hits={s_ctypeHits} misses={s_ctypeMisses} errors={s_ctypeErrors} " +
+              $"rate={s_ctypeHits * 100 / Math.Max(1, s_ctypeHits + s_ctypeMisses)}%"
+            : "collection off — (dotcl:%ctype-stats t) to start counting";
 
     public static LispObject Subtypep(LispObject type1, LispObject type2)
     {
@@ -1302,15 +1317,15 @@ public static partial class Runtime
             var (result, certain) = CTypeOps.Subtypep(ct1, ct2);
             if (certain)
             {
-                System.Threading.Interlocked.Increment(ref s_ctypeHits);
+                if (s_ctypeStatsOn) s_ctypeHits++;
                 MultipleValues.Set(result ? T.Instance : Nil.Instance, T.Instance);
                 return result ? T.Instance : Nil.Instance;
             }
-            System.Threading.Interlocked.Increment(ref s_ctypeMisses);
+            if (s_ctypeStatsOn) s_ctypeMisses++;
         }
         catch
         {
-            System.Threading.Interlocked.Increment(ref s_ctypeErrors);
+            if (s_ctypeStatsOn) s_ctypeErrors++;
         }
 
         string? name1 = TypeSpecToName(type1);
@@ -1750,13 +1765,9 @@ public static partial class Runtime
                 }
                 var cur2 = comp2ao.Cdr;
                 bool anySupertype = false;
-                bool allCertain = true;
                 while (cur2 is Cons oc)
                 {
-                    var sub2 = Subtypep(type1, oc.Car);
-                    var mv2 = MultipleValues.Get();
-                    if (sub2 != Nil.Instance) { anySupertype = true; break; }
-                    if (mv2[1] == Nil.Instance) { allCertain = false; }
+                    if (Subtypep(type1, oc.Car) != Nil.Instance) { anySupertype = true; break; }
                     cur2 = oc.Cdr;
                 }
                 if (anySupertype)
@@ -1874,13 +1885,9 @@ public static partial class Runtime
             {
                 var cur2 = memberCons.Cdr;
                 bool anySubtype = false;
-                bool allCertain = true;
                 while (cur2 is Cons ac)
                 {
-                    var sub2 = Subtypep(ac.Car, type2);
-                    var mv2 = MultipleValues.Get();
-                    if (sub2 != Nil.Instance) { anySubtype = true; break; }
-                    if (mv2[1] == Nil.Instance) { allCertain = false; }
+                    if (Subtypep(ac.Car, type2) != Nil.Instance) { anySubtype = true; break; }
                     cur2 = ac.Cdr;
                 }
                 if (anySubtype)

@@ -72,3 +72,24 @@
 
 ;; A closure capturing a mutated variable.
 (defun adder (n) (lambda (x) (incf n x)))
+
+;; A DEFUN that is not at top level: registration happens at run time through
+;; CilAssembler.RegisterFunctionOnSymbol, which takes a Symbol. The symbol
+;; arrives widened to LispObject, so the call needs a narrowing castclass to
+;; stay verifiable. Real code hits this constantly (asdf's guarded defuns).
+(defun define-nested (flag)
+  (when flag
+    (defun nested-defun (x) (* x 2)))
+  flag)
+
+;; The same, for a closure defun (free variable captured) and a (setf ...) name.
+(defun define-closure-defun (n)
+  (defun closure-defun (x) (+ x n))
+  (defun (setf nested-place) (v x) (list v x))
+  n)
+
+;; Builtins with a defaulted numeric argument: the default has to be pushed as
+;; an i8 (Fixnum.Make takes a long). DIGIT-CHAR-P without a radix used to push
+;; an i4, which runs but is not verifiable.
+(defun digits-only-p (s)
+  (loop :for c :across s :always (digit-char-p c)))

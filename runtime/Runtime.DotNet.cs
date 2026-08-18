@@ -251,8 +251,16 @@ public static partial class Runtime
                 "DOTCL:%ASYNC-RETURN-MV: requires exactly 1 argument (a list of values)"));
         var vals = new System.Collections.Generic.List<LispObject>();
         for (LispObject c = args[0]; c is Cons cc; c = cc.Cdr) vals.Add(cc.Car);
-        return new LispDotNetObject(
-            System.Threading.Tasks.Task.FromResult(MultipleValues.Values(vals.ToArray())));
+        var parked = MultipleValues.Values(vals.ToArray());
+        // MultipleValues.Values set the count for the values being PARKED IN THE
+        // TASK, but what this function returns is one value, the task itself.
+        // Leaving the count behind made a caller that reads it — anything using
+        // MULTIPLE-VALUE-CALL on this call — see (async (values)) return no values
+        // at all, so the task never reached AWAIT.
+        var task = new LispDotNetObject(
+            System.Threading.Tasks.Task.FromResult(parked));
+        MultipleValues.Reset();
+        return task;
     }
 
     /// <summary>Run a Lisp 0-arg thunk with a captured dynamic environment installed
@@ -316,8 +324,10 @@ public static partial class Runtime
     /// (ClrExceptionType) so dotnet:exception-type / dotnet:handler-bind can
     /// dispatch on it. CONTEXT is the "DOTNET:OP Type.Member" prefix. (dotcl/dotcl#45)</summary>
     private static LispErrorException DotNetInvokeError(string context, System.Reflection.TargetInvocationException tie)
+        => DotNetInvokeError(context, tie.InnerException, tie);
+
+    private static LispErrorException DotNetInvokeError(string context, Exception? inner, Exception outer)
     {
-        var inner = tie.InnerException;
         // A Lisp non-local exit or condition that started inside a callback (a lambda
         // handed to LINQ, an event handler) is passing THROUGH this reflection call on
         // its way to its own target — it is not a failure of the .NET method. Let it
@@ -328,7 +338,7 @@ public static partial class Runtime
             || inner is HandlerCaseInvocationException || inner is RestartInvocationException
             || inner is LispErrorException)
             System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(inner).Throw();
-        return new LispErrorException(new LispError($"{context}: {inner?.Message ?? tie.Message}")
+        return new LispErrorException(new LispError($"{context}: {inner?.Message ?? outer.Message}")
         {
             ClrExceptionType = inner?.GetType(),
             ClrException = inner
@@ -1413,12 +1423,13 @@ public static partial class Runtime
         }
 
         // COM ProgID fallback for genuine ProgIDs (e.g. "Excel.Application",
-        // "Schedule.Service"). On non-Windows GetTypeFromProgID returns
-        // null (does not throw in modern .NET). Skip managed framework
-        // namespaces: they never name a wanted COM component, and "System.*"
-        // collides with legacy .NET Framework COM registrations that crash on
-        // activation.
-        if (!bareTypeName.StartsWith("System.", StringComparison.Ordinal))
+        // "Schedule.Service"). COM registration is a Windows concept, so the
+        // lookup is skipped everywhere else. Skip managed framework namespaces
+        // too: they never name a wanted COM component, and "System.*" collides
+        // with legacy .NET Framework COM registrations that crash on activation.
+        if (!bareTypeName.StartsWith("System.", StringComparison.Ordinal)
+            && System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(
+                   System.Runtime.InteropServices.OSPlatform.Windows))
         {
             try
             {
@@ -1673,9 +1684,45 @@ public static partial class Runtime
         }
         if (method is null) return false;
 
-        result = method.Invoke(target, callArgs);
+        // DoNotWrapExceptions, plus a FILTER that declines anything already Lisp:
+        // both halves are about what a deep recursion through .NET callbacks costs.
+        // Reflection's default wrap is catch + throw-new at EVERY level the call
+        // nests, and the TargetInvocationException handler that undid it re-threw
+        // with ExceptionDispatchInfo — two restarted dispatches per level, each
+        // leaving a live handler funclet behind. A condition escaping recursion
+        // through delegate callbacks therefore died as an uncatchable .NET
+        // StackOverflowException instead of arriving as STORAGE-CONDITION.
+        //
+        // The .NET method's own failure is still reported with its "DOTNET:OP
+        // Type.Member" context, converted at the level where it originated: every
+        // enclosing level sees a Lisp exception and its filter answers "not mine"
+        // without being entered.
+        try
+        {
+            result = method.Invoke(target, DoNotWrapExceptions, null, callArgs, null);
+        }
+        catch (Exception e) when (!IsLispOriginatedException(e))
+        {
+            // Same context text the InvokeMember paths produce: the static entry
+            // point names the type in full, the instance one by its short name.
+            throw DotNetInvokeError(
+                isStatic ? $"DOTNET:STATIC {type.FullName ?? type.Name}.{name}"
+                         : $"DOTNET:INVOKE {type.Name}.{name}", e, e);
+        }
         return true;
     }
+
+    // BindingFlags.DoNotWrapExceptions (0x02000000) is absent from the
+    // netstandard2.0 reference assembly, so it is spelled numerically to compile
+    // for both targets; the running .NET honours the value either way.
+    private const System.Reflection.BindingFlags DoNotWrapExceptions =
+        (System.Reflection.BindingFlags)0x02000000;
+
+    /// <summary>Did this exception come from Lisp — a condition already signalled,
+    /// or a non-local exit on its way to its own target — rather than from the .NET
+    /// method a reflected call just made?</summary>
+    private static bool IsLispOriginatedException(Exception e)
+        => e is LispErrorException || e is AsyncSignalException || IsLispControlFlowException(e);
 
     /// <summary>Pick the method InvokeMember's default binder would select, but only
     /// when it is a plain fixed-arity method (no params / by-ref params, not a
@@ -1944,6 +1991,17 @@ public static partial class Runtime
             // (e.g. Lisp list → T[]), which the binder's runtime-type match misses.
             if (TryInvokeWithMarshalledArgs(type, memberName, null, args.Skip(2).ToArray(), true, out var r2))
                 return DotNetToLisp(r2);
+            // A generic method named outright — (dotnet:static "System.Linq.Enumerable"
+            // "Select" list fn) — reaches none of the above: InvokeMember cannot
+            // instantiate a generic definition, so the very method the caller named by
+            // hand failed while calling it as an extension on the same list worked.
+            // Its first parameter is the receiver, which is what the extension path
+            // already infers type arguments from; restrict it to THIS type so naming a
+            // class does not silently reach another class's extension method.
+            var rest = args.Skip(3).ToArray();
+            if (args.Length >= 3 && LispToDotNetGeneric(args[2]) is object recv
+                && TryInvokeExtensionMethod(recv.GetType(), memberName, recv, rest, out var r3, type))
+                return DotNetToLisp(r3);
             throw;
         }
         catch (System.Reflection.TargetInvocationException tie)
@@ -2149,29 +2207,66 @@ public static partial class Runtime
     private static bool IsMethodTypeParameter(Type t)
         => t.IsGenericParameter && t.DeclaringMethod != null;
 
-    private static Type[]? InferExtensionTypeArgs(System.Reflection.MethodInfo m, Type recvType)
+    private static Type[]? InferExtensionTypeArgs(System.Reflection.MethodInfo m, Type recvType,
+        LispObject[]? lispArgs = null)
     {
         var gps = m.GetGenericArguments();
         var typeArgs = new Type[gps.Length];
-        for (int i = 0; i < typeArgs.Length; i++) typeArgs[i] = typeof(object);
+        var bound = new bool[gps.Length];
         var recvParam = m.GetParameters()[0].ParameterType;
         if (IsMethodTypeParameter(recvParam))
         {
             typeArgs[recvParam.GenericParameterPosition] = recvType;
-            return typeArgs;
+            bound[recvParam.GenericParameterPosition] = true;
         }
-        if (recvParam.IsGenericType)
+        else if (recvParam.IsGenericType)
         {
             var ra = recvParam.GetGenericArguments();
-            if (ra.Length == 1 && IsMethodTypeParameter(ra[0]))
-            {
-                var elem = EnumerableElementType(recvType);
-                if (elem == null) return null;
-                typeArgs[ra[0].GenericParameterPosition] = elem;
-                return typeArgs;
-            }
+            if (ra.Length != 1 || !IsMethodTypeParameter(ra[0])) return null;
+            var elem = EnumerableElementType(recvType);
+            if (elem == null) return null;
+            typeArgs[ra[0].GenericParameterPosition] = elem;
+            bound[ra[0].GenericParameterPosition] = true;
         }
-        return null;
+        else return null;
+
+        // A caller who already built the delegate said what the other type
+        // parameters are: the TResult of Select<TSource,TResult> is right there in
+        // a Func<int,string>'s own signature. Without reading it the method was
+        // instantiated as Select<int,object>, whose Func<int,object> parameter the
+        // supplied Func<int,string> does not fit — so passing an explicit
+        // make-delegate resolved to nothing while the bare lambda worked.
+        var ps = m.GetParameters();
+        if (lispArgs != null)
+            for (int i = 0; i < lispArgs.Length && i + 1 < ps.Length; i++)
+                if (lispArgs[i] is LispDotNetObject dno && dno.Value is Delegate d)
+                    UnifyTypeParams(ps[i + 1].ParameterType, d.GetType(), typeArgs, bound);
+
+        // Anything still open stays object: a Lisp closure carries no return type,
+        // and values come back to Lisp unwrapped anyway. Callers needing a specific
+        // instantiation use dotnet:static-generic.
+        for (int i = 0; i < typeArgs.Length; i++) if (!bound[i]) typeArgs[i] = typeof(object);
+        return typeArgs;
+    }
+
+    /// <summary>Bind method type parameters appearing in DECLARED to the matching
+    /// pieces of ACTUAL (e.g. declared Func&lt;TSource,TResult&gt; against actual
+    /// Func&lt;int,string&gt; binds TSource=int, TResult=string). Already-bound
+    /// parameters are left alone, so the receiver's inference wins.</summary>
+    private static void UnifyTypeParams(Type declared, Type actual, Type[] typeArgs, bool[] bound)
+    {
+        if (IsMethodTypeParameter(declared))
+        {
+            int pos = declared.GenericParameterPosition;
+            if (!bound[pos]) { typeArgs[pos] = actual; bound[pos] = true; }
+            return;
+        }
+        if (!declared.IsGenericType || !actual.IsGenericType) return;
+        if (declared.GetGenericTypeDefinition() != actual.GetGenericTypeDefinition()) return;
+        var da = declared.GetGenericArguments();
+        var aa = actual.GetGenericArguments();
+        if (da.Length != aa.Length) return;
+        for (int i = 0; i < da.Length; i++) UnifyTypeParams(da[i], aa[i], typeArgs, bound);
     }
 
     /// <summary>True when every Lisp function passed for a delegate parameter has an arity
@@ -2191,17 +2286,18 @@ public static partial class Runtime
     }
 
     private static bool TryInvokeExtensionMethod(Type recvType, string methodName, object? target,
-        LispObject[] lispArgs, out object? result)
+        LispObject[] lispArgs, out object? result, Type? onlyFrom = null)
     {
         result = null;
         foreach (var m in ExtensionMethodsNamed(methodName))
         {
+            if (onlyFrom != null && m.DeclaringType != onlyFrom) continue;
             var ps = m.GetParameters();
             if (ps.Length != lispArgs.Length + 1) continue; // +1 for the receiver
             var concrete = m;
             if (m.IsGenericMethodDefinition)
             {
-                var typeArgs = InferExtensionTypeArgs(m, recvType);
+                var typeArgs = InferExtensionTypeArgs(m, recvType, lispArgs);
                 if (typeArgs == null) continue;
                 try { concrete = m.MakeGenericMethod(typeArgs); }
                 catch { continue; }   // constraints (e.g. where T : struct) rule this one out

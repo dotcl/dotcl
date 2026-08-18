@@ -116,7 +116,7 @@ jobs:
       # ── dotnet pack: base pointer + per-RID R2R tool packages in one pass ──
       # Mirror `make pack`: stage all 6 desktop R2R cores at runtime/ top level and run
       # ONE `dotnet pack` over the desktop RID list + `any`. That single pack emits the
-      # base pointer (tools/net10.0/any/DotnetToolSettings.xml) enumerating EVERY listed
+      # base pointer (a DotnetToolSettings.xml, path per SDK) enumerating EVERY listed
       # RID PLUS a dotcl.<rid> R2R package each, so `dotnet tool install -g dotcl` selects
       # the host's fast (~0.16s) R2R build. The old `-p:RuntimeIdentifiers=any` override
       # listed only `any` in the pointer, so installs fell back to the slow (~1.8s) non-R2R
@@ -130,9 +130,11 @@ jobs:
             cp compiler/dotcl-r2r-$rid.core runtime/dotcl-r2r-$rid.core
             cp contrib/asdf/asdf-r2r-$rid.fasl runtime/asdf-r2r-$rid.fasl
           done
-          # Each RID nupkg ships only its own R2R asdf (overlaid via the top-level
-          # asdf-r2r-<rid>.fasl by the csproj's ReplaceFaslsWithR2R); drop the cross-RID
-          # copies the contrib/** glob would otherwise bundle into every package (~9 MB).
+          # asdf is the one contrib whose R2R copy is overlaid from runtime/ top level
+          # (ReplaceFaslsWithR2R reads asdf-r2r-<rid>.fasl), so its copies under
+          # contrib/asdf/ are dead weight in every package. The other contribs keep
+          # their per-RID R2R here: the csproj drops the cross-RID ones and adds back
+          # the RID being packed.
           rm -f runtime/contrib/asdf/asdf-r2r-*.fasl
           # Exclude android via the csproj's DotclToolNoAndroid hook — it rewrites
           # <RuntimeIdentifiers> to the 6 desktop RIDs + `any` inside the project. A
@@ -197,7 +199,19 @@ jobs:
         run: |
           VER=${{ steps.version.outputs.VERSION }}
           nupkg="out/dotcl.$VER.nupkg"
-          xml=$(unzip -p "$nupkg" 'tools/net10.0/any/DotnetToolSettings.xml')
+          # Where the SDK puts the pointer inside the package is the SDK's business,
+          # and it moved: 10.0.302 wrote tools/net10.0/any/DotnetToolSettings.xml,
+          # 10.0.400 writes tools/any/any/. The file itself is byte-identical and a
+          # 10.0.302 client installs 10.0.400 output correctly (both resolve the
+          # host RID package rather than falling back to `any`; measured), so what
+          # this guard cares about is the RID list, not the path. Find the entry.
+          entry=$(unzip -Z1 "$nupkg" | grep -E '(^|/)DotnetToolSettings\.xml$' | head -1)
+          if [ -z "$entry" ]; then
+            echo "ERROR: $nupkg carries no DotnetToolSettings.xml — not a tool pointer package"
+            unzip -Z1 "$nupkg"
+            exit 1
+          fi
+          xml=$(unzip -p "$nupkg" "$entry")
           missing=""
           for rid in win-x64 win-arm64 linux-x64 linux-arm64 osx-x64 osx-arm64; do
             echo "$xml" | grep -q "RuntimeIdentifier=\"$rid\"" || missing="$missing $rid"
@@ -208,7 +222,38 @@ jobs:
             echo "$xml"
             exit 1
           fi
-          echo "OK: pointer enumerates all desktop RIDs — R2R install works"
+          echo "OK: pointer ($entry) enumerates all desktop RIDs — R2R install works"
+
+      # ── Guard: no package may carry another RID's R2R payload ────────────
+      # One pack pass emits every package from a staging dir that holds all six
+      # RIDs' R2R fasls, so a filtering mistake is invisible until someone lists
+      # a published nupkg (0.1.23 and 0.1.24 shipped 70 stray files / 22 MB each).
+      - name: Verify per-RID packages carry only their own R2R
+        run: |
+          VER=${{ steps.version.outputs.VERSION }}
+          fail=0
+          for rid in win-x64 win-arm64 linux-x64 linux-arm64 osx-x64 osx-arm64 any; do
+            nupkg="out/dotcl.$rid.$VER.nupkg"
+            if [ ! -f "$nupkg" ]; then
+              echo "ERROR: $nupkg was not produced"
+              fail=1
+              continue
+            fi
+            # `any` is framework-dependent: it must carry no R2R payload at all.
+            if [ "$rid" = any ]; then
+              stray=$(unzip -Z1 "$nupkg" | grep -- '-r2r-' || true)
+            else
+              stray=$(unzip -Z1 "$nupkg" | grep -- '-r2r-' | grep -v -- "-r2r-$rid\." || true)
+            fi
+            if [ -n "$stray" ]; then
+              echo "ERROR: $nupkg carries R2R payload belonging to other RIDs:"
+              echo "$stray"
+              fail=1
+            else
+              echo "OK: $nupkg"
+            fi
+          done
+          [ "$fail" = 0 ] || exit 1
 
       # (The per-RID R2R tool nupkgs — dotcl.<rid> — are now produced by the single
       #  multi-RID `dotnet pack` in "Pack NuGet packages" above, together with a base
@@ -219,8 +264,8 @@ jobs:
       # dotnet publish -r <rid> --self-contained false cross-compiles on Linux
       # for all 6 RIDs. PublishReadyToRun=true crossgens the runtime assembly to
       # native; dotcl.core / asdf.fasl are injected as the per-RID R2R FASLs, and
-      # the contrib R2R fasls (<name>-r2r-<rid>.fasl) ride along in runtime/contrib
-      # for the resolve-deps probe.
+      # this RID's contrib R2R fasls (<name>-r2r-<rid>.fasl) ride along in the
+      # publish output for the resolve-deps probe.
       - name: Build per-RID tbz
         run: |
           VER=${{ steps.version.outputs.VERSION }}
@@ -232,11 +277,27 @@ jobs:
               -p:Version=$VER \
               -p:PublishReadyToRun=true \
               -o out/publish-$rid/
-            # inject contrib (IL + per-RID R2R contrib fasls) and R2R core/asdf
-            cp -r runtime/contrib out/publish-$rid/contrib
+            # publish already carries contrib/ (the csproj's Content items, with the
+            # cross-RID R2R fasls filtered out), so only the two artifacts that live
+            # outside runtime/contrib are injected here. The former
+            # `cp -r runtime/contrib out/publish-$rid/contrib` did two wrong things:
+            # the destination already existed, so cp created contrib/contrib (a full
+            # second copy of every contrib), and that copy came from the staging dir
+            # holding all six RIDs' R2R fasls.
             cp compiler/dotcl-r2r-$rid.core out/publish-$rid/dotcl.core
             cp contrib/asdf/asdf-r2r-$rid.fasl out/publish-$rid/contrib/asdf/asdf.fasl
             chmod +x out/publish-$rid/runtime 2>/dev/null || true
+            # Guard: one contrib tree, and no other RID's R2R fasls in it.
+            if [ -d out/publish-$rid/contrib/contrib ]; then
+              echo "ERROR: $rid payload nests a second contrib tree under contrib/contrib"
+              exit 1
+            fi
+            stray=$(find out/publish-$rid -name '*-r2r-*' ! -name "*-r2r-$rid.*")
+            if [ -n "$stray" ]; then
+              echo "ERROR: $rid payload carries cross-RID R2R artifacts:"
+              echo "$stray"
+              exit 1
+            fi
             tar -cjf out/dotcl-$rid-$VER.tar.bz2 -C out/publish-$rid .
             size=$(du -h out/dotcl-$rid-$VER.tar.bz2 | awk '{print $1}')
             echo "==> out/dotcl-$rid-$VER.tar.bz2 ($size)"

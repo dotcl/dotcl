@@ -40,10 +40,13 @@ compile-files `main.lisp` at build time and places it under
 
 - **DesktopGL (SDL2 + OpenGL)** is more portable, including ARM64. WindowsDX
   (SharpDX) was confirmed to render nothing on Snapdragon Windows ARM64.
-- **`<RuntimeIdentifier>win-x64</RuntimeIdentifier>`** is used because SDL2's
-  native binary (`MonoGame.Library.SDL`) does not ship win-arm64. Pinning to
-  win-x64 runs it under Prism (x64 emulation). As a dev sample, the performance
-  penalty is acceptable.
+- **`<RuntimeIdentifier>win-x64</RuntimeIdentifier>`** is pinned, which runs the
+  sample under Prism (x64 emulation) on an ARM64 machine. As a dev sample the
+  performance penalty is acceptable. The pin dates from when
+  `MonoGame.Library.SDL` had no win-arm64 native; it ships one now (resolving the
+  package for `win-arm64` lays out an SDL2 binary distinct from the x64 one), so
+  the pin is probably removable — nobody has re-tested the sample natively on
+  ARM64 since.
 
 ## Environment check
 

@@ -31,6 +31,15 @@ public class Package : LispObject
     private readonly ConcurrentDictionary<string, Symbol> _internalSymbols = new();
     private readonly ConcurrentDictionary<string, Symbol> _externalSymbols = new();
     private readonly List<Package> _useList = new();
+
+    /// <summary>Immutable copy of <see cref="_useList"/>, rebuilt inside the lock
+    /// whenever the list changes. FIND-SYMBOL walks it to resolve inherited
+    /// symbols and is on every symbol reference in compiled code, so it must not
+    /// take a lock to do so — that walk was measurable as Monitor.Enter_Slowpath.
+    /// A reader may see a use/unuse that is one step stale, which is no weaker
+    /// than before: the lock was released before the caller acted on the result
+    /// either way.</summary>
+    private volatile Package[] _useSnapshot = Array.Empty<Package>();
     private readonly object _pkgLock = new();
     // Local nicknames: maps nickname string → package (per CDR 5 / SBCL package-local-nicknames)
     private readonly ConcurrentDictionary<string, Package> _localNicknames = new();
@@ -82,19 +91,27 @@ public class Package : LispObject
             return (sym, SymbolStatus.External);
         if (_internalSymbols.TryGetValue(name, out sym))
             return (sym, SymbolStatus.Internal);
-        lock (_pkgLock)
+        foreach (var pkg in _useSnapshot)
         {
-            foreach (var pkg in _useList)
-            {
-                if (pkg._externalSymbols.TryGetValue(name, out sym))
-                    return (sym, SymbolStatus.Inherited);
-            }
+            if (pkg._externalSymbols.TryGetValue(name, out sym))
+                return (sym, SymbolStatus.Inherited);
         }
         return (null!, SymbolStatus.None);
     }
 
     public (Symbol symbol, bool isNew) Intern(string name)
     {
+        // Overwhelmingly the symbol already lives in this package: INTERN is what
+        // every symbol reference in compiled code goes through (Startup.SymInPkg),
+        // so it runs constantly and almost never creates anything. The dictionaries
+        // are concurrent, so answering from them needs no lock — taking one on
+        // every reference showed up as Monitor.Enter_Slowpath in profiles.
+        // Anything not already here (a fresh symbol, or one inherited through the
+        // use-list) still goes the locked route below.
+        if (_externalSymbols.TryGetValue(name, out var existing)
+            || _internalSymbols.TryGetValue(name, out existing))
+            return (existing, false);
+
         lock (_pkgLock)
         {
             var (sym, status) = FindSymbol(name);
@@ -202,7 +219,10 @@ public class Package : LispObject
         lock (_pkgLock)
         {
             if (!_useList.Contains(pkg))
+            {
                 _useList.Add(pkg);
+                _useSnapshot = _useList.ToArray();
+            }
         }
     }
 
@@ -251,6 +271,7 @@ public class Package : LispObject
         lock (_pkgLock)
         {
             _useList.Remove(pkg);
+            _useSnapshot = _useList.ToArray();
         }
     }
 
@@ -365,16 +386,12 @@ public class Package : LispObject
 
     public IEnumerable<Package> UsedByList()
     {
-        // Snapshot of AllPackages. Per-pkg _useList may mutate concurrently,
-        // so each pkg's Contains check takes its own lock.
+        // Snapshot of AllPackages; each package's use-list is read through its
+        // own immutable snapshot, so no per-package lock is needed.
         var snapshot = _allPackages.Values.Distinct().ToList();
         foreach (var pkg in snapshot)
-        {
-            bool contained;
-            lock (pkg._pkgLock)
-                contained = pkg._useList.Contains(this);
-            if (contained) yield return pkg;
-        }
+            if (Array.IndexOf(pkg._useSnapshot, this) >= 0)
+                yield return pkg;
     }
 
     public void Rename(string newName, IEnumerable<string>? newNicknames = null)
@@ -420,6 +437,7 @@ public class Package : LispObject
         {
             // Unuse all packages that this package uses
             _useList.Clear();
+            _useSnapshot = Array.Empty<Package>();
 
             // Unintern all symbols, setting home package to nil
             foreach (var sym in _internalSymbols.Values)

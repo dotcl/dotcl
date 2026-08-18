@@ -185,13 +185,17 @@
          (%crc-step-generic 1 123456789 1099587256329 (ash 1 40)))
   t)
 
-(deftest native-crc-adjustment-matches-generic
+;; Three million iterations of each arm. That is a fraction of a second of
+;; compiled native-int arithmetic — which is what these two assert — and does not
+;; finish at all under the tree-walk evaluator, so a build without a compiler must
+;; skip them rather than hang the suite.
+(deftest-compiled-only native-crc-adjustment-matches-generic
   (equal (%compute-adjustment-typed 1099587256329 3014633)
          (%compute-adjustment-generic 1099587256329 3014633))
   t)
 
 ;; crc remainder stays within the polynomial's bit width (a positive fixnum).
-(deftest native-crc-adjustment-in-range
+(deftest-compiled-only native-crc-adjustment-in-range
   (let ((r (%compute-adjustment-typed 1099587256329 3014633)))
     (and (integerp r) (>= r 0) (< r 1099587256329)))
   t)

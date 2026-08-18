@@ -95,9 +95,20 @@ the manifest.
   `Task<LispObject>`, and `await`s it on the C# side. Directly binding an MVC
   async action (returning `Task<IActionResult>`) needs type conversion, so for
   now going through Minimal API is the simplest.
-- **DI container**: controllers currently assume a parameterless ctor.
-  Constructor injection requires extending the ctor signature on the dotcl side
-  (`dotnet:define-class`'s `:ctor` is currently zero-arg only).
+- **DI container**: the controllers in this sample happen to use a parameterless
+  ctor, but that is not a limitation of `dotnet:define-class` — `:ctor` takes a
+  typed parameter list, and constructor injection works. A class defined as
+
+  ```lisp
+  (dotnet:define-class "Demo.Controller" ()
+    (:fields ("Clock" "Demo.Clock"))
+    (:ctor ((clock "Demo.Clock"))
+      (dotnet:%set-invoke self "Clock" clock))
+    (:methods ("Report" () :returns String ...)))
+  ```
+
+  is constructed by `ActivatorUtilities.CreateInstance` (the mechanism MVC uses
+  for controllers) with the registered service passed to its ctor.
 
 ## See also
 

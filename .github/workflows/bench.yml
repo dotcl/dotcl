@@ -1,0 +1,118 @@
+name: Benchmarks (manual)
+
+# Manual only. Benchmarks are data collection, not a gate, and a CI runner is a
+# noisy place to measure — running them on every push produced numbers nobody
+# could act on. Pull the trigger when you want a comparison, and read it knowing
+# what machine it came from.
+#
+# Uses `make bench-survey`, not `bench-state`: a single run swings by tens of
+# percent here, so the survey's warmup + repeat + median/stddev/cv is the only
+# form worth reading. The run prints its own coefficient of variation — check it
+# before trusting a ratio.
+on:
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: 'cl-bench suite (empty = all; e.g. gabriel)'
+        required: false
+        default: ''
+      bench:
+        description: 'single benchmark name (empty = all; e.g. tak)'
+        required: false
+        default: ''
+      runs:
+        description: 'measured runs per benchmark'
+        required: false
+        default: '5'
+      warmup:
+        description: 'warmup runs discarded before measuring'
+        required: false
+        default: '1'
+      timeout:
+        description: 'per-implementation timeout, seconds'
+        required: false
+        default: '900'
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    # A full survey lands around 20 minutes. The cap is what a hung run costs,
+    # so keep it near the real figure rather than at the largest plausible one.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # The numbers are only meaningful next to the machine that produced them.
+      - name: Runner info
+        run: |
+          echo "=== CPU ===" && lscpu | grep -E 'Model name|^CPU\(s\)|Thread|MHz'
+          echo "=== Memory ===" && free -h
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Setup Roswell
+        run: |
+          curl -L https://raw.githubusercontent.com/roswell/roswell/master/scripts/install-for-ci.sh | bash
+          echo "$HOME/.roswell/bin" >> $GITHUB_PATH
+
+      # Pinned, not the Roswell default: installing another implementation flips
+      # that default, and the "sbcl" column would silently stop being SBCL.
+      - name: SBCL version
+        run: ros -L sbcl-bin run --eval '(progn (format t "~a ~a~%" (lisp-implementation-type) (lisp-implementation-version)) (quit))'
+
+      - name: Cross-compile
+        run: make cross-compile
+
+      - name: Build
+        run: make build
+
+      - name: Run survey
+        run: |
+          make bench-survey \
+            SUITE='${{ inputs.suite }}' \
+            BENCH='${{ inputs.bench }}' \
+            RUNS='${{ inputs.runs }}' \
+            WARMUP='${{ inputs.warmup }}' \
+            BENCH_TIMEOUT='${{ inputs.timeout }}'
+
+      # bench-state.json is rewritten in place by the survey. It is NOT committed
+      # here: a manual run on a shared runner should not move the recorded
+      # baseline, which is kept from a known machine.
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: |
+            bench-state.json
+            /tmp/bench-survey-*.txt
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Benchmark survey"
+            echo ""
+            echo "runs=${{ inputs.runs }} warmup=${{ inputs.warmup }}"
+            echo "suite='${{ inputs.suite }}' bench='${{ inputs.bench }}'"
+            echo ""
+            echo "Runner numbers are not comparable with a workstation run —"
+            echo "read the ratio, and check each entry's cv before trusting it."
+            echo ""
+            if [ -f bench-state.json ]; then
+              echo '```json'
+              cat bench-state.json
+              echo '```'
+            else
+              echo "bench-state.json not produced"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

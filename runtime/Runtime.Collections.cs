@@ -152,19 +152,42 @@ public static partial class Runtime
     // CHAR is like AREF - it ignores the fill pointer and accesses raw elements
     public static LispObject CharAccess(LispObject str, LispObject index)
     {
-        int idx = index is Fixnum fi ? (int)fi.Value : -1;
-        if (str is LispString s) return LispChar.Make(s[idx]);
+        // CHAR/SCHAR address the whole string, fill pointer or not, so the limit
+        // is the storage size. A non-integer index used to become -1 and index
+        // the char[] with it.
+        int idx = IntArg("CHAR", "index", index);
+        if (str is LispString s)
+        {
+            if ((uint)idx >= (uint)s.Length) throw IndexError("CHAR", idx, s.Length, "string");
+            return LispChar.Make(s[idx]);
+        }
         if (str is LispVector v && v.IsCharVector)
+        {
+            if ((uint)idx >= (uint)v.Capacity) throw IndexError("CHAR", idx, v.Capacity, "string");
             return v.GetElement(idx) is LispChar lc ? (LispObject)lc : LispChar.Make('\0');
+        }
         throw new LispErrorException(new LispTypeError("CHAR: invalid arguments", str, Startup.Sym("STRING")));
     }
 
     public static LispObject CharSet(LispObject str, LispObject index, LispObject value)
     {
-        if (index is Fixnum f && value is LispChar c)
+        if (value is LispChar c)
         {
-            if (str is LispString s) { s[(int)f.Value] = c.Value; return value; }
-            if (str is LispVector v && v.IsCharVector) { v.SetElement((int)f.Value, c); return value; }
+            int idx = IntArg("(SETF CHAR)", "index", index);
+            if (str is LispString s)
+            {
+                if ((uint)idx >= (uint)s.Length)
+                    throw IndexError("(SETF CHAR)", idx, s.Length, "string");
+                s[idx] = c.Value;
+                return value;
+            }
+            if (str is LispVector v && v.IsCharVector)
+            {
+                if ((uint)idx >= (uint)v.Capacity)
+                    throw IndexError("(SETF CHAR)", idx, v.Capacity, "string");
+                v.SetElement(idx, c);
+                return value;
+            }
         }
         throw new LispErrorException(new LispTypeError("(SETF CHAR): invalid arguments", str));
     }
@@ -179,6 +202,13 @@ public static partial class Runtime
     {
         if (vec is LispVector v && v.HasFillPointer && fp is Fixnum f)
         {
+            // A fill pointer may sit anywhere from 0 to the total size, the last
+            // position meaning "full". Past that it used to be stored as-is and
+            // blow up later in whatever read the vector next.
+            if (f.Value < 0 || f.Value > v.Capacity)
+                throw new LispErrorException(new LispTypeError(
+                    $"(SETF FILL-POINTER): {f.Value} out of range for vector of size {v.Capacity}",
+                    fp, List(Startup.Sym("INTEGER"), Fixnum.Make(0), Fixnum.Make(v.Capacity))));
             v.SetFillPointer((int)f.Value);
             return fp;
         }
@@ -380,7 +410,9 @@ public static partial class Runtime
     public static LispObject Car(LispObject obj)
     {
         if (obj is Cons c) return c.Car;
-        if (obj is Nil) return Nil.Instance;
+        // Identity, not a type test: NIL is a singleton, and `is Nil` costs a
+        // CastHelpers.IsInstanceOfClass call on this (very hot) path.
+        if (ReferenceEquals(obj, Nil.Instance)) return Nil.Instance;
         var objStr = obj?.ToString() ?? "null";
         if (objStr.Length > 80) objStr = objStr[..80] + "...";
         var frames = new System.Diagnostics.StackTrace(1, false).GetFrames();
@@ -396,7 +428,7 @@ public static partial class Runtime
     public static LispObject Cdr(LispObject obj)
     {
         if (obj is Cons c) return c.Cdr;
-        if (obj is Nil) return Nil.Instance;
+        if (ReferenceEquals(obj, Nil.Instance)) return Nil.Instance;
         throw new LispErrorException(new LispTypeError("CDR: not a list", obj, Startup.Sym("LIST")));
     }
 
@@ -526,6 +558,14 @@ public static partial class Runtime
         return result;
     }
 
+    /// <summary>
+    /// APPEND of two lists: copy A's spine, share B as the tail.
+    /// Iterative on purpose. Recursing once per element used one stack frame per
+    /// cons, so appending a few million elements exhausted the stack — and a .NET
+    /// StackOverflowException cannot be caught, so the whole process died with no
+    /// Lisp-level error. The compiler builds instruction lists with APPEND, so a
+    /// large enough (but legal) source form took the compiler down with it.
+    /// </summary>
     public static LispObject Append(LispObject a, LispObject b)
     {
         if (a is Nil) return b;
@@ -534,7 +574,22 @@ public static partial class Runtime
         // argument, so "how much of the cons traffic is copying" is the question
         // that tells a quadratic list build from an inherent one.
         Diagnostics.AllocCounter.Inc("Cons/append-copy");
-        return new Cons(ca.Car, Append(ca.Cdr, b));
+        var head = new Cons(ca.Car, Nil.Instance);
+        var tail = head;
+        var cur = ca.Cdr;
+        while (true)
+        {
+            if (cur is Nil) { tail.Cdr = b; return head; }
+            // A dotted first argument is an error, and it is the offending tail
+            // (not the whole list) that the recursive version reported.
+            if (cur is not Cons c)
+                throw new LispErrorException(new LispTypeError("APPEND: not a list", cur));
+            Diagnostics.AllocCounter.Inc("Cons/append-copy");
+            var node = new Cons(c.Car, Nil.Instance);
+            tail.Cdr = node;
+            tail = node;
+            cur = c.Cdr;
+        }
     }
 
     public static int ListLength(LispObject obj)
@@ -1616,15 +1671,32 @@ public static partial class Runtime
         // ROW-MAJOR-AREF, %SET-ROW-MAJOR-AREF
         Emitter.CilAssembler.RegisterFunction("ROW-MAJOR-AREF", new LispFunction(args => {
             Runtime.CheckArityExact("ROW-MAJOR-AREF", args, 2);
-            var arr = args[0]; var idx = (int)((Fixnum)args[1]).Value;
-            if (arr is LispVector v2) return v2.GetElement(idx);
-            if (arr is LispString s2) return LispChar.Make(s2[idx]);
+            var arr = args[0]; var idx = Runtime.IntArg("ROW-MAJOR-AREF", "index", args[1]);
+            if (arr is LispVector v2)
+            {
+                if ((uint)idx >= (uint)v2.Capacity)
+                    throw Runtime.IndexError("ROW-MAJOR-AREF", idx, v2.Capacity, "array");
+                return v2.GetElement(idx);
+            }
+            if (arr is LispString s2)
+            {
+                if ((uint)idx >= (uint)s2.Length)
+                    throw Runtime.IndexError("ROW-MAJOR-AREF", idx, s2.Length, "string");
+                return LispChar.Make(s2[idx]);
+            }
             throw new LispErrorException(new LispTypeError("ROW-MAJOR-AREF: not an array", arr));
         }, "ROW-MAJOR-AREF", 2));
         Emitter.CilAssembler.RegisterFunction("%SET-ROW-MAJOR-AREF", new LispFunction(args => {
             Runtime.CheckArityExact("%SET-ROW-MAJOR-AREF", args, 3);
-            var arr = args[0]; var idx = (int)((Fixnum)args[1]).Value; var val = args[2];
-            if (arr is LispVector v2) { v2.SetElement(idx, val); return val; }
+            var arr = args[0]; var val = args[2];
+            var idx = Runtime.IntArg("(SETF ROW-MAJOR-AREF)", "index", args[1]);
+            if (arr is LispVector v2)
+            {
+                if ((uint)idx >= (uint)v2.Capacity)
+                    throw Runtime.IndexError("(SETF ROW-MAJOR-AREF)", idx, v2.Capacity, "array");
+                v2.SetElement(idx, val);
+                return val;
+            }
             throw new LispErrorException(new LispTypeError("(SETF ROW-MAJOR-AREF): not a vector", arr));
         }, "%SET-ROW-MAJOR-AREF", 3));
 

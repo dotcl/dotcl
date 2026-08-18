@@ -29,11 +29,13 @@ if [ ! -x "$ILVERIFY" ] && ! command -v ilverify >/dev/null 2>&1; then
   exit 127
 fi
 
+# The Release runtime is the reference every fasl is verified against, so it has
+# to match the source the fasls were compiled from. Building only when absent
+# left a stale reference behind: a newly added runtime method showed up as
+# "Missing method" in a fasl that was perfectly fine. The build is incremental.
 RUNTIME_DLL="$ROOT/runtime/bin/Release/net10.0/DotCL.Runtime.dll"
-if [ ! -f "$RUNTIME_DLL" ]; then
-  echo "=== Building Release runtime (needed as an ilverify reference) ==="
-  dotnet build "$ROOT/runtime/DotCL.Runtime.csproj" -c Release -f net10.0 -v q
-fi
+echo "=== Building Release runtime (the ilverify reference) ==="
+dotnet build "$ROOT/runtime/DotCL.Runtime.csproj" -c Release -f net10.0 -v q
 
 # Locate the net10 shared framework (holds System.Private.CoreLib etc.).
 # `dotnet --list-runtimes` prints: "Microsoft.NETCore.App <ver> [<path>]"
@@ -57,15 +59,49 @@ dotnet run --project "$ROOT/runtime/runtime.csproj" -- \
             (compile-file \"test/ilverify/stress.lisp\" :output-file \"build/ilverify/stress.dll\" :module-name \"ilvstress\")
             (dotcl:quit 0))"
 
+# A real library compiled by dotcl, when one is available. The fixtures above are
+# written for this check and so only cover what someone thought to write down;
+# asdf is 15k lines of ordinary Lisp nobody wrote for us. Both defects this gate
+# was blind to (a covariant Symbol call, an i4 default radix) showed up here
+# first. Skipped rather than failed when asdf has not been set up.
+ASDF_FASL="$ROOT/contrib/asdf/asdf.fasl"
+ASSEMBLIES=(core stress)
+if [ ! -f "$ASDF_FASL" ]; then
+  echo "note: contrib/asdf/asdf.fasl absent — skipping the real-library check"
+  echo "      (make setup-asdf && make compile-asdf-fasl)"
+elif [ "$ASDF_FASL" -ot "$ROOT/compiler/cil-out.sil" ]; then
+  # The fasl carries the code generation of the compiler that built it, so an
+  # old one reports on old codegen: it can fail for a defect already fixed, or
+  # pass over one just introduced. Either way it is not evidence about the tree
+  # under test. Skip rather than judge. (CI always builds it fresh.)
+  echo "note: contrib/asdf/asdf.fasl is older than compiler/cil-out.sil —"
+  echo "      skipping the real-library check (it would verify stale codegen)."
+  echo "      Refresh it with: rm contrib/asdf/asdf.fasl && make compile-asdf-fasl"
+else
+  cp "$ASDF_FASL" "$OUT/asdf.dll"
+  ASSEMBLIES+=(asdf)
+fi
+
 # Build the -r reference list (every framework dll + the runtime).
 REFS=()
 for f in "$FWDIR"/*.dll; do REFS+=(-r "$f"); done
 REFS+=(-r "$RUNTIME_DLL")
 
+# ILVerify miscounts the stack at a filter that is nested in another clause's
+# handler — a shape ordinary Lisp produces, and one Roslyn hits too. The filter
+# drops exactly those and nothing else; see scripts/ilverify-filter.
+FILTER="dotnet run --project $ROOT/scripts/ilverify-filter/ilverify-filter.csproj -v q --"
+dotnet build "$ROOT/scripts/ilverify-filter/ilverify-filter.csproj" -v q >/dev/null
+
 rc=0
-for asm in core stress; do
+for asm in "${ASSEMBLIES[@]}"; do
   echo "=== ilverify $asm.dll ==="
-  if "$ILVERIFY" "$OUT/$asm.dll" -s System.Private.CoreLib "${REFS[@]}"; then
+  set +e
+  "$ILVERIFY" "$OUT/$asm.dll" -s System.Private.CoreLib "${REFS[@]}" \
+    | $FILTER "$OUT/$asm.dll"
+  status=${PIPESTATUS[1]}
+  set -e
+  if [ "$status" -eq 0 ]; then
     echo "  $asm.dll: VERIFIED"
   else
     echo "  $asm.dll: VERIFICATION FAILED (unverifiable IL — IL2CPP/WebGL would reject this)" >&2

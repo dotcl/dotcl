@@ -130,7 +130,11 @@ public static partial class Runtime
     public static bool IsNilObj(LispObject obj)
     {
         obj = Primary(obj);
-        return obj is Nil || ReferenceEquals(obj, Startup.NIL_SYM);
+        // NIL has a private constructor and a single Instance, so identity IS the
+        // type test — and a pointer compare, unlike `is Nil`, does not go through
+        // CastHelpers.IsInstanceOfClass (which a profile of precompiled code shows
+        // near the top).
+        return ReferenceEquals(obj, Nil.Instance) || ReferenceEquals(obj, Startup.NIL_SYM);
     }
     public static LispObject Null(LispObject obj) => IsNilObj(obj) ? T.Instance : Nil.Instance;
     public static LispObject Not(LispObject obj) => IsNilObj(obj) ? T.Instance : Nil.Instance;

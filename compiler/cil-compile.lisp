@@ -20,6 +20,41 @@
   (load (merge-pathnames "cil-analysis.lisp" dir))
   (load (merge-pathnames "cil-forms.lisp" dir)))
 
+;; Self-host: in a running dotcl the compiler's names are split across two
+;; packages. Its functions are registered under the source package name
+;; (DOTCL.CIL-COMPILER), but every symbol the compiled code handles as data — a
+;; special variable it reads, a key it looks up — resolves through Startup.Sym,
+;; which interns into DOTCL-INTERNAL. Reading the compiler's own sources back in
+;; produces the DOTCL.CIL-COMPILER half, so a form like (%getenv "X") is a
+;; different symbol from the DOTCL-INTERNAL::%GETENV that keys the intrinsic
+;; table, and compiles to a call to a function that does not exist.
+;;
+;; Bridge the halves before anything is read: for each name, keep whichever
+;; symbol actually carries a binding and make the other package see that same
+;; object. A name that already carries a function or value in the source package
+;; (COMPILE-EXPR and the rest of the compiler) is left alone — that is where its
+;; definition lives.
+#+dotcl
+(let ((core (find-package "DOTCL-INTERNAL"))
+      (src (find-package "DOTCL.CIL-COMPILER")))
+  (when (and core src (not (eq core src)))
+    (let ((pending '()))
+      (do-symbols (s core)
+        (when (eq (symbol-package s) core)
+          (push s pending)))
+      (dolist (s pending)
+        (multiple-value-bind (dup status) (find-symbol (symbol-name s) src)
+          (cond ((null dup) (import s src))
+                ((eq dup s))
+                ((or (fboundp dup) (boundp dup)))
+                (t
+                 ;; IMPORT only makes a symbol present, so an external name has
+                 ;; to be re-exported or packages that :USE this one would intern
+                 ;; their own copy and collide with the later DEFPACKAGE.
+                 (unintern dup src)
+                 (import s src)
+                 (when (eq status :external) (export s src)))))))))
+
 (defpackage :dotcl.cil-compile
   (:use :cl :dotcl.cil-compiler))
 (in-package :dotcl.cil-compile)
@@ -152,6 +187,15 @@
                                          (intern "LOCK-PACKAGE" (find-package "DOTCL")))
                                        "COMMON-LISP"))))))
     (setf *cross-compiling* t)
+    ;; Self-host: the compiler that does the work is the one already in the
+    ;; image (package DOTCL-INTERNAL), not the sources this driver's package
+    ;; names. Setting only our own flag leaves the real compiler in run-time
+    ;; mode, where it plants load-time xref registrations and keeps literals as
+    ;; live objects — neither of which a .sil file can carry.
+    #+dotcl
+    (let* ((pkg (find-package "DOTCL-INTERNAL"))
+           (sym (and pkg (find-symbol "*CROSS-COMPILING*" pkg))))
+      (when sym (setf (symbol-value sym) t)))
     ;; Compile the core in bounded units and join the instruction lists with
     ;; (:TOPLEVEL-BOUNDARY). Loaders split there and run each segment as its own
     ;; method, so the core's top-level code is many small methods instead of one
