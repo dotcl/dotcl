@@ -91,3 +91,9 @@
   (remove-if-not (lambda (e) (member (symbol-name (car e)) '("*FS-OUTER*" "*FS-INNER*") :test #'string=))
                  (fs-collect))
   ())
+
+;;; Back to the default. The flag is global and drives codegen at LOAD time, so
+;;; leaving it on here compiles every test file loaded after this one with frame
+;;; bookkeeping -- the two thirds of the suite past this point would then test
+;;; instrumented code and never the code a default build produces.
+(setf dotcl:*emit-frame-locals* nil)

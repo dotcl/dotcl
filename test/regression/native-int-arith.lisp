@@ -199,3 +199,45 @@
   (let ((r (%compute-adjustment-typed 1099587256329 3014633)))
     (and (integerp r) (>= r 0) (< r 1099587256329)))
   t)
+
+;;; ---- MOD / REM on the native int64 path ----
+;;;
+;;; The unboxed path must keep CL's sign rules: MOD's result takes the sign of
+;;; the divisor, REM's the sign of the dividend. A raw CIL remainder gives REM's
+;;; answer for both, so these compare a declared (native) twin against the
+;;; undeclared (generic, boxed) one.
+
+(defun %mod-typed (a b) (declare (fixnum a b)) (mod a b))
+(defun %mod-generic (a b) (mod a b))
+(defun %rem-typed (a b) (declare (fixnum a b)) (rem a b))
+(defun %rem-generic (a b) (rem a b))
+
+(deftest native-mod-signs
+  (let ((pairs '((7 3) (-7 3) (7 -3) (-7 -3) (0 5) (6 3) (-6 3))))
+    (list (mapcar (lambda (p) (%mod-typed (first p) (second p))) pairs)
+          (mapcar (lambda (p) (%mod-generic (first p) (second p))) pairs)))
+  ((1 2 -2 -1 0 0 0) (1 2 -2 -1 0 0 0)))
+
+(deftest native-rem-signs
+  (let ((pairs '((7 3) (-7 3) (7 -3) (-7 -3) (0 5) (6 3) (-6 3))))
+    (list (mapcar (lambda (p) (%rem-typed (first p) (second p))) pairs)
+          (mapcar (lambda (p) (%rem-generic (first p) (second p))) pairs)))
+  ((1 -1 1 -1 0 0 0) (1 -1 1 -1 0 0 0)))
+
+(deftest native-mod-zero-divisor-signals
+  (handler-case (%mod-typed 5 0) (error () :error))
+  :error)
+
+(deftest native-mod-large-fixnums
+  (list (%mod-typed 1099587256329 1000000007)
+        (%mod-generic 1099587256329 1000000007)
+        (%rem-typed -1099587256329 1000000007)
+        (%rem-generic -1099587256329 1000000007))
+  (587248636 587248636 -587248636 -587248636))
+
+(deftest native-mod-loop-counter
+  ;; The shape that motivated it: a DOTIMES counter in an Int64 slot feeding MOD.
+  (let ((s 0))
+    (declare (fixnum s))
+    (dotimes (i 300 s) (setq s (+ s (mod i 7)))))
+  897)

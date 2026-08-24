@@ -26,8 +26,11 @@ defaults:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # The runner comes from the CI_RUNNER repository variable, falling back to
+    # ubuntu-latest where it is unset. Keep the fallback: a repository without
+    # the variable must still build on GitHub-hosted runners.
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 45
     # Full ANSI + bench runs on every push to dotcl/dotcl and on the nightly
     # schedule; other pushes run only the cheap gates below.
     env:
@@ -49,6 +52,8 @@ jobs:
         with:
           dotnet-version: '10.0.x'
 
+      # A runner that keeps its home directory between runs already has this, so
+      # install only when it is missing (saves ~30s per run where it persists).
       - name: Setup Roswell
         run: |
           if ! command -v ros >/dev/null && [ ! -x "$HOME/.roswell/bin/ros" ]; then
@@ -62,8 +67,24 @@ jobs:
       - name: Build
         run: make build
 
+      # The compiler compiled by itself has to reproduce itself. Only this
+      # comparison sees a compiler that silently depends on SBCL being the host:
+      # a cross-compile flag that never reached the running compiler, and an
+      # intrinsic table keyed on the other half of a split package, both passed
+      # every other gate. ~1 min; the heavier selfhost-test (the suite on the
+      # self-hosting core) stays manual.
       - name: Self-host fixpoint
         run: make selfhost-check
+
+      # The other half of the same property: can a RELEASED dotcl build this
+      # tree? selfhost-check only proves the tree reproduces itself, which stays
+      # true even if the last released version can no longer be used as a seed —
+      # and that is what decides whether the build chain can drop its Common Lisp
+      # host. It broke silently once already: 0.1.24 built a core that then died
+      # with "Undefined function: KEY", found by hand months later. ~1 min,
+      # including fetching the pinned seed from nuget.
+      - name: Seed build (a released dotcl builds this tree)
+        run: make seed-check
 
       - name: Compile asdf FASL (required by some regression tests)
         run: make compile-asdf-fasl
@@ -85,6 +106,22 @@ jobs:
       - name: Regression tests (tree-walk interpreter)
         run: make test-regression-interp
 
+      # The suite on a runtime built WITHOUT Reflection.Emit (-p:DotclNoEmit),
+      # which is what AOT / IL2CPP / WebGL / netstandard2.0 ship. The step above
+      # only swaps the evaluator; this one removes the emitter from the build, so
+      # it also covers the runtime functions a compiled call site would otherwise
+      # have inlined past. Nothing ran it before and it was red: `(/ 1.0d0 0.0d0)`
+      # signalled here while the compiled path returned an infinity, so a file
+      # that builds an infinity could not even load.
+      #
+      # One known intermittent failure remains, and it is a real one rather than
+      # a flaky test: concurrent add-method / remove-method can corrupt a hash
+      # table that is not synchronized. It has only ever been seen while another
+      # heavy build shared the machine -- ten clean runs on a quiet one -- so a
+      # red here is worth reading rather than re-running.
+      - name: Regression tests (emit-free build)
+        run: make test-regression-emitfree
+
       # Cheap tripwire (~25s): compile the emit-free netstandard2.0 runtime that
       # AOT/WebGL link against. `make build` only builds the dev net10 runner, so
       # an ns2.0-only break (unguarded Reflection.Emit / broken DOTCL_NO_JSON)
@@ -105,6 +142,94 @@ jobs:
           dotnet tool install --global dotnet-ilverify >/dev/null 2>&1 || true
           export PATH="$PATH:$HOME/.dotnet/tools"
           make ilverify
+
+      # ilverify asks whether the IL is valid; this asks whether the assembly has
+      # a loadable SHAPE — no method too large to JIT cheaply, no type near the
+      # field limit, no oversized #US heap. Those bounds have been crossed four
+      # times, and every time the compile side looked healthy (total IL, fasl
+      # bytes and compile time all flat) while LOAD failed with a diagnostic that
+      # named neither the file nor the cause. All four were found by a user
+      # running out of memory, none by CI.
+      - name: Check fasl shape
+        run: make test-fasl-shape
+
+      # The only test that actually builds projects the way a user does — a Lisp
+      # library consumed by a plain C# app and by a dotcl app, through MSBuild.
+      # Everything above tests the compiler and the runtime; this tests the
+      # shipping path, and it was red for an unknown length of time because
+      # nothing ran it: the build silently compiled a same-named system from
+      # somewhere else in the tree instead of the project's own sources. ~2 min.
+      # Needs the fasl core, which the target builds if absent.
+      - name: Project composition (MSBuild consumers)
+        run: make compile-core-fasl test-project-compose
+
+      # The gates below were in the Makefile but in no workflow. That is not a
+      # theoretical gap: an audit of `make` targets against the workflows found 6
+      # of 17 test targets wired, and the very first unwired one run by hand was
+      # RED -- with-standard-io-syntax had been bent away from CLHS to keep an
+      # ANSI test green, and the test that says so had never executed here.
+      # Together they add ~3 min to a ~15 min run.
+
+      # CLHS-audit tests for behaviour ansi-test does not reach (the
+      # with-standard-io-syntax variable table, pprint dispatch, read-sequence
+      # bounds). ~10s.
+      - name: CLHS audit extras
+        run: make test-ansi-extra
+
+      # AMOP protocol conformance: the metaobject generic functions real
+      # libraries call. ~10s.
+      - name: MOP protocol tests
+        run: make test-mop
+
+      # The embedding API a C# host meets: EnsureCore with no prior Initialize,
+      # a function named the way it is spelled in the Lisp source, and a host
+      # with dynamic code disabled getting a Lisp condition rather than a raw
+      # PlatformNotSupportedException. Builds and runs a real C# host in both
+      # configurations. ~20s.
+      - name: Embedding API (C# host)
+        run: make test-host-api
+
+      # Booting from a core held in memory -- the only way in for a host with no
+      # filesystem, and the only way in at all for the emit-free runtime. ~25s.
+      - name: In-memory core boot
+        run: make test-core-bytes
+
+      # dotcl emits a .NET class library that a separate C# project references at
+      # COMPILE time (interface implemented on the C# side, delegate invoked).
+      # Nothing else here compiles C# against dotcl-emitted metadata. ~70s.
+      - name: save-class-library (C# consumes emitted metadata)
+        run: make test-save-class-lib
+
+      # DOTCL_EMIT_PDB: the .lisp must appear in the PDB with sequence points and
+      # named locals, which is what makes the VS / VS Code debugger show Lisp
+      # source and Locals. ~20s.
+      - name: Debug info (PDB)
+        run: make test-debug-pdb
+
+      # `make pack` builds the nuspec from the project; this asserts the field
+      # rules (donor fields dropped when unsupplied, required fields refused
+      # rather than inherited) without publishing anything. ~20s.
+      - name: Pack nuspec rules
+        run: make test-pack-nuspec
+
+      # The other half of the MSBuild story: the step above builds with the legacy
+      # targets (external process), this one with the ProjectCore targets driving
+      # the in-process tasks -- the configuration every NuGet consumer gets, and
+      # the only one that executes DotCL.Build.Tasks.dll at all. Also the gate on
+      # what a failing build TELLS the user: a dependency that cannot be found is
+      # the first wall a new user hits, and the remedy is a build property they
+      # have no reason to know about. ~90s.
+      - name: Project-core MSBuild tasks
+        run: make test-project-core-build
+
+      # Fetching ansi-test is its own step so a failure there is reported as
+      # what it is. It used to be a prerequisite of the run below, whose `|| true`
+      # (there so a known ANSI failure does not fail the build) also swallowed a
+      # failed clone: the suite then ran zero categories, reported success, and
+      # the run went red three steps later inside the summary formatter.
+      - name: Fetch ansi-test
+        if: env.RUN_FULL == 'true'
+        run: make setup-ansi-test
 
       - name: ANSI tests
         if: env.RUN_FULL == 'true'
@@ -132,11 +257,11 @@ jobs:
         if: env.RUN_FULL == 'true'
         run: make update-ansi-state
 
-      # bench/ is mirror-excluded, so on the public repo this step has no inputs.
-      # RUN_FULL alone is true there, so it used to run on every public push and
-      # fail every time, kept green by the `|| true` — a step that could never
-      # succeed, wearing a passing face. Gate on the file instead, so it runs
-      # exactly where it can work and is honestly reported as skipped elsewhere.
+      # A tree without bench/run.lisp gives this step no inputs, and it used to
+      # run anyway on RUN_FULL alone and fail every time, kept green by the
+      # `|| true` — a step that could never succeed, wearing a passing face.
+      # Gate on the file instead, so it runs exactly where it can work and is
+      # honestly reported as skipped elsewhere.
       # The `|| true` stays on purpose: benchmarks are data collection, not a
       # gate, and a slow or missing SBCL must not fail the build.
       - name: Benchmarks
@@ -156,8 +281,14 @@ jobs:
             if [ -f /tmp/ansi-summary.txt ]; then
               echo '### Per-category (pass / elapsed / alloc)'
               echo '```'
-              # Keep only result + TOTAL lines, drop build noise
-              grep -E '^(cons|strings|sequences|data-and-control-flow|hash-tables|symbols|arrays|types-and-classes|characters|pathnames|files|system-construction|iteration|eval-and-compile|conditions|printer|environment|structures|packages|objects|reader|numbers|streams|misc):|^TOTAL:|^GC TOTAL:' /tmp/ansi-summary.txt
+              # Keep only result + TOTAL lines, drop build noise. The `|| echo`
+              # matters: this step runs under `set -e`, so a grep that matches
+              # nothing (a run that produced no category lines at all) would fail
+              # the job here — pointing at the summary formatter instead of at
+              # whatever actually went wrong upstream. Reporting must never
+              # decide the colour of the run.
+              grep -E '^(cons|strings|sequences|data-and-control-flow|hash-tables|symbols|arrays|types-and-classes|characters|pathnames|files|system-construction|iteration|eval-and-compile|conditions|printer|environment|structures|packages|objects|reader|numbers|streams|misc):|^TOTAL:|^GC TOTAL:' /tmp/ansi-summary.txt \
+                || echo '(no per-category lines — see the ANSI step output)'
               echo '```'
               echo ''
             fi

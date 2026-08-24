@@ -667,3 +667,32 @@ b")
     (coerce (%goc-buf s) 'string))
   "xyab
     z")
+
+;;; A gray output stream that tracks no column at all. Every other output GF
+;;; has a default method on fundamental-output-stream; stream-line-column had
+;;; none, so asking such a stream where it was -- which stream-start-line-p,
+;;; fresh-line and format's ~T all do -- signalled "no applicable method"
+;;; instead of answering "unknown". Callers that catch the error survived; a
+;;; caller that does not (a user calling fresh-line) did not.
+
+(defclass %gray-nocol (dotcl-gray:fundamental-character-output-stream)
+  ((buf :initform (make-string-output-stream) :reader %gray-nocol-buf)))
+
+(defmethod dotcl-gray:stream-write-char ((s %gray-nocol) ch)
+  (write-char ch (%gray-nocol-buf s)))
+
+(deftest gray-line-column-defaults-to-unknown
+  (dotcl-gray:stream-line-column (make-instance '%gray-nocol))
+  nil)
+
+(deftest gray-start-line-p-on-column-less-stream
+  (dotcl-gray:stream-start-line-p (make-instance '%gray-nocol))
+  nil)
+
+(deftest gray-fresh-line-on-column-less-stream
+  (let ((s (make-instance '%gray-nocol)))
+    (write-string "ab" s)
+    (fresh-line s)
+    (get-output-stream-string (%gray-nocol-buf s)))
+  "ab
+")

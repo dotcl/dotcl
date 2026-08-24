@@ -95,11 +95,20 @@ public static partial class Runtime
         LispObject current = list;
         for (int i = 0; i < idx; i++)
         {
-            if (current is Cons c) current = c.Cdr;
-            else return Nil.Instance;
+            if (current is Cons c) { current = c.Cdr; continue; }
+            // Running out of list is NIL; running into a non-list is an error.
+            // Walking off the end silently returned NIL for both, so (nth 1 7)
+            // and (nth 2 '(1 . 2)) answered NIL instead of reporting the
+            // argument -- the rest of the traversal family (CDR, NTHCDR,
+            // COPY-LIST) already rejects it, as does SBCL.
+            if (current is Nil) return Nil.Instance;
+            throw new LispErrorException(new LispTypeError(
+                $"NTH: not a list: {current}", current, Startup.Sym("LIST")));
         }
         if (current is Cons cc) return cc.Car;
-        return Nil.Instance;
+        if (current is Nil) return Nil.Instance;
+        throw new LispErrorException(new LispTypeError(
+            $"NTH: not a list: {current}", current, Startup.Sym("LIST")));
     }
 
     public static LispObject Nthcdr(LispObject n, LispObject list)
@@ -120,6 +129,11 @@ public static partial class Runtime
     public static LispObject Last(LispObject list)
     {
         if (list is Nil) return Nil.Instance;
+        // Same check as the CIL-STDLIB definition: a dotted list is fine, a
+        // non-list is not (the walk below would hand the argument back).
+        if (list is not Cons)
+            throw new LispErrorException(new LispTypeError(
+                $"LAST: not a list: {list}", list, Startup.Sym("LIST")));
         LispObject current = list;
         while (current is Cons c && c.Cdr is Cons)
             current = c.Cdr;
@@ -380,7 +394,11 @@ public static partial class Runtime
         if (primary is MvReturn mv)
         {
             MultipleValues.Reset(); // Consume MV state
-            return List(mv.Values);
+            // Cons the list straight from the values. TOARRAY would build an array for
+            // the inline shapes only for LIST to walk it and drop it again.
+            LispObject list = Nil.Instance;
+            for (int i = mv.Count - 1; i >= 0; i--) list = new Cons(mv[i], list);
+            return list;
         }
 
         // Fallback: thread-static path (backward compat during transition)
@@ -542,7 +560,40 @@ public static partial class Runtime
     public static LispObject Makunbound(LispObject name)
     {
         var sym = GetSymbol(name, "MAKUNBOUND");
+        // Unbinding a constant destroys its value just as assigning to it would,
+        // and NIL/T are constants: (makunbound 'nil) used to succeed.
+        if (sym.IsConstant)
+            throw new LispErrorException(new LispProgramError(
+                $"MAKUNBOUND: {sym.Name} is a constant and cannot be made unbound"));
         return DynamicBindings.Makunbound(sym);
+    }
+
+    /// <summary>
+    /// The error for assigning a constant variable. CONTEXT names the operator so
+    /// the report says which form did it.
+    /// </summary>
+    internal static LispErrorException ConstantAssignmentError(Symbol sym, string context)
+        => new LispErrorException(new LispProgramError(
+            $"{context}: {sym.Name} is a constant and cannot be assigned"));
+
+    /// <summary>
+    /// DEFCONSTANT: set the value and mark the symbol constant, refusing a
+    /// re-definition to a value that is not EQL to the old one (CLHS 11.1.2.1.2 --
+    /// the whole point of the check is that code already compiled against the old
+    /// value would disagree with the new). Re-evaluating the same DEFCONSTANT
+    /// form, which is what loading a file twice does, stays quiet.
+    /// </summary>
+    public static LispObject DefineConstant(LispObject symObj, LispObject value)
+    {
+        if (symObj is not Symbol sym)
+            throw new LispErrorException(new LispTypeError("DEFCONSTANT: not a symbol", symObj));
+        if (sym.IsConstant && DynamicBindings.TryGet(sym, out var old) && !IsTruthy(Eql(old, value)))
+            throw new LispErrorException(new LispError(
+                $"DEFCONSTANT: {sym.Name} is already a constant with the value {old}; "
+                + $"redefining it to {value} would disagree with code compiled against the old value"));
+        DynamicBindings.Set(sym, value);
+        sym.IsConstant = true;
+        return sym;
     }
 
     public static LispObject SymbolConstantP(LispObject obj)
@@ -723,6 +774,11 @@ public static partial class Runtime
     public static LispObject Values(params LispObject[] args) =>
         MultipleValues.Values(args);
 
+    /// <summary>The two-value entry the compiler emits for (VALUES A B), which is the
+    /// overwhelmingly common shape. Skips the argument array the general entry needs.</summary>
+    public static LispObject Values2(LispObject a, LispObject b) =>
+        MultipleValues.Values2(a, b);
+
     /// <summary>
     /// Unwrap MvReturn to its primary value. Inserted by compiler at non-MV positions.
     /// </summary>
@@ -730,7 +786,7 @@ public static partial class Runtime
     {
         if (obj is MvReturn mv)
         {
-            var primary = mv.Values.Length > 0 ? mv.Values[0] : Nil.Instance;
+            var primary = mv.PrimaryValue;
             // Also update thread-static to single value for backward compat
             MultipleValues.Primary(primary);
             return primary;
@@ -1198,17 +1254,27 @@ public static partial class Runtime
         Startup.RegisterBinary("SET", (symObj, val) => {
             if (symObj is not Symbol sym)
                 throw new LispErrorException(new LispTypeError("SET: not a symbol", symObj));
+            // A constant is not assignable, here as in SETQ (the interpreter's
+            // SETQ for a special variable comes through this function).
+            if (sym.IsConstant) throw ConstantAssignmentError(sym, "SET");
             DynamicBindings.Set(sym, val);
             return val;
         });
         Startup.RegisterUnary("SYMBOL-CONSTANT-P", Runtime.SymbolConstantP);
         Startup.RegisterUnary("SET-SYMBOL-CONSTANT", Runtime.SetSymbolConstant);
+        // The DEFCONSTANT primitive: set + mark + refuse a non-EQL redefinition.
+        // The interpreter's DEFCONSTANT calls this rather than SET, which now
+        // (correctly) refuses to assign a symbol that is already constant.
+        Startup.RegisterBinary("%DEFINE-CONSTANT", (symObj, val) => Runtime.DefineConstant(symObj, val));
 
         // COPY-STRUCTURE, MAKE-SYMBOL
         Startup.RegisterUnary("COPY-STRUCTURE", obj => {
             if (obj is not LispStruct s)
                 throw new LispErrorException(new LispTypeError("COPY-STRUCTURE: not a structure", obj));
-            return new LispStruct(s.TypeName, (LispObject[])s.Slots.Clone());
+            var src = s.Slots;
+            var dst = new LispObject[src.Length];
+            Array.Copy(src, dst, src.Length);
+            return new LispStruct(s.TypeName, dst);
         });
         Startup.RegisterUnary("MAKE-SYMBOL", obj =>
             obj is LispString ls ? new Symbol(ls.Value)
@@ -1243,6 +1309,29 @@ public static partial class Runtime
         // A later user redefinition replaces sym.Function with a fresh object
         // that simply lacks the delegate — clean fallback; a shadowing package
         // defines a different symbol and is unaffected.
+        // %ATTACH-ARITH-FAST-PATHS: the same treatment for the n-ary arithmetic
+        // wrappers (+ - * /). Handing #'+ to REDUCE cost 104 B per call -- the
+        // args array plus the &rest list the wrapper's own lambda list builds --
+        // for an addition. Only the 2-argument shape is attached: it reduces
+        // exactly to these C# helpers (the wrapper body compiles the same
+        // two-argument op), while the 1-argument cases are not (+ 0 x) / (- 0 x)
+        // in general and the wrapper handles them.
+        Emitter.CilAssembler.RegisterFunction("%ATTACH-ARITH-FAST-PATHS",
+            new LispFunction(_ => {
+                static void Attach(string name, Func<LispObject, LispObject, LispObject> op)
+                {
+                    var (sym, status) = Startup.CL.FindSymbol(name);
+                    if (status != SymbolStatus.None && sym.Function is LispFunction f
+                        && f is not GenericFunction)
+                        f.SetDirectDelegate(op);
+                }
+                Attach("+", Runtime.Add);
+                Attach("-", Runtime.Subtract);
+                Attach("*", Runtime.Multiply);
+                Attach("/", Runtime.Divide);
+                return Nil.Instance;
+            }, "%ATTACH-ARITH-FAST-PATHS", 0));
+
         Emitter.CilAssembler.RegisterFunction("%ATTACH-NUMERIC-COMPARE-FAST-PATHS",
             new LispFunction(_ => {
                 static void Attach(string name, Func<LispObject, LispObject, LispObject> cmp)
@@ -1477,7 +1566,7 @@ public static partial class Runtime
                     return result;
                 });
             }
-            return MultipleValues.Values(lispFn, nonTerm ? T.Instance : Nil.Instance);
+            return MultipleValues.Values2(lispFn, nonTerm ? T.Instance : Nil.Instance);
         }));
         Emitter.CilAssembler.RegisterFunction("SET-MACRO-CHARACTER", new LispFunction(args => {
             if (args.Length < 2) throw new System.Exception("SET-MACRO-CHARACTER: requires char and function");
@@ -1494,7 +1583,7 @@ public static partial class Runtime
                 // to distinguish (values) from returning nil.
                 // Unwrap MvReturn: per CLHS, only the primary value of a reader macro matters.
                 if (result is MvReturn mv)
-                    return mv.Values.Length > 0 ? mv.Values[0] : null;
+                    return mv.Count > 0 ? mv[0] : null;
                 return (result is Nil && MultipleValues.Count == 0) ? null : result;
             }, nonTerm, lispFn);
             return T.Instance;
@@ -1529,7 +1618,7 @@ public static partial class Runtime
                 });
                 // Unwrap MvReturn: per CLHS, only the primary value of a reader macro matters.
                 if (result is MvReturn mv)
-                    return mv.Values.Length > 0 ? mv.Values[0] : null;
+                    return mv.Count > 0 ? mv[0] : null;
                 return (result is Nil && MultipleValues.Count == 0) ? null : result;
             }, lispFn);
             return T.Instance;

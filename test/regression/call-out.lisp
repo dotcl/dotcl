@@ -423,14 +423,14 @@
     (error (c)
       (let* ((ex (dotnet:exception-object c))
              (inner (dotnet:invoke ex "get_InnerException"))
-             ;; SocketException(10060) is WSAETIMEDOUT on Windows; on Linux/.NET the
-             ;; native ErrorCode is translated to 110 (ETIMEDOUT). Normalize so the
-             ;; test asserts "the inner socket error and its code are reachable"
-             ;; without hardcoding a platform-specific errno.
+             ;; SocketException(10060) is WSAETIMEDOUT on Windows; elsewhere the
+             ;; native ErrorCode is the platform errno for ETIMEDOUT -- 110 on
+             ;; Linux, 60 on macOS/BSD. Normalize so the test asserts "the inner
+             ;; socket error and its code are reachable" without hardcoding one.
              (code (dotnet:invoke inner "get_ErrorCode")))
         (list (dotnet:invoke (dotnet:invoke ex "GetType") "get_Name")
               (dotnet:invoke (dotnet:invoke inner "GetType") "get_Name")
-              (if (member code '(10060 110)) :timed-out code)))))
+              (if (member code '(10060 110 60)) :timed-out code)))))
   ("IOException" "SocketException" :timed-out))
 
 (deftest exception-object-nil-for-lisp-condition

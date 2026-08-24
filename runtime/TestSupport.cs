@@ -45,6 +45,19 @@ namespace DotCL.TestSupport
     // read/write timeout produces. dotnet:exception-object must expose the
     // instance so a handler can walk InnerException and read SocketErrorCode /
     // ErrorCode instead of matching localized message text.
+
+    /// <summary>
+    /// Demo target for the advice contrib and its manual E2E: a plain, jitted
+    /// static method in a normally loaded assembly. Harmony patches those
+    /// reliably, while a method in a Reflection.Emit dynamic assembly (what
+    /// dotnet:define-class produces) is not always patchable on CoreCLR -- so
+    /// the target of the demo cannot itself be defined from Lisp.
+    /// </summary>
+    public static class AdviceDemo
+    {
+        public static int DemoAdd(int a, int b) => a + b;
+    }
+
     public static class Throwers
     {
         public static void ThrowWrapped() =>

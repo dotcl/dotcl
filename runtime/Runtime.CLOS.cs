@@ -588,7 +588,8 @@ public static partial class Runtime
             throw new LispErrorException(new LispTypeError(
                 "METHOD-LAMBDA-LIST: not a method", arg, Startup.Sym("METHOD")));
         if (m.StoredLambdaList is { } given) return given;
-        return Mop.BuildLambdaListPlaceholder(m.RequiredCount, m.OptionalCount,
+        return m.PlaceholderLambdaList ??= Mop.BuildLambdaListPlaceholder(
+            m.RequiredCount, m.OptionalCount,
             m.HasRest, m.HasKey, m.KeywordNames, m.HasAllowOtherKeys);
     }
 
@@ -881,6 +882,7 @@ public static partial class Runtime
         if (cls.DefaultInitargs.Length > 0)
             cls.HasSimpleInitialization = false;
         cls.SimpleInitChecked = false;
+        cls.SharedInitSimpleChecked = false;
         return classObj;
     }
 
@@ -1447,10 +1449,40 @@ public static partial class Runtime
         throw new LispErrorException(condition);
     }
 
+    /// <summary>True when SHARED-INITIALIZE has no method of its own applicable to CLS,
+    /// so the default method is what a dispatch would land on. Cached per class and
+    /// dropped wherever SIMPLEINITCHECKED is (adding or removing a method on either
+    /// initialization generic function, and class redefinition).</summary>
+    private static bool SharedInitializeIsDefault(LispClass cls)
+    {
+        if (cls.SharedInitSimpleChecked) return cls.SharedInitSimpleValid;
+        cls.SharedInitSimpleChecked = true;
+        bool simple = true;
+        _sharedInitializeSym ??= Startup.Sym("SHARED-INITIALIZE");
+        if (_sharedInitializeSym.Function is GenericFunction siGf)
+        {
+            foreach (var m in siGf.Methods)
+            {
+                if (AllTSpecializers(m) && m.Qualifiers.Length == 0) continue;
+                if (IsMethodApplicableToClass(m, cls)) { simple = false; break; }
+            }
+        }
+        cls.SharedInitSimpleValid = simple;
+        return simple;
+    }
+
     public static LispObject InitializeInstance(LispObject[] args)
     {
         // args[0] = instance, args[1..] = initargs
         // Calls shared-initialize with slot-names = T (init all slots)
+
+        // Nothing has a method of its own on SHARED-INITIALIZE for this instance:
+        // the default method is what the dispatch would reach, so run it here on the
+        // array already in hand. The dispatch path has to build (instance T . initargs)
+        // first, which is an array per instance created.
+        if (args[0] is LispInstance fastInst && SharedInitializeIsDefault(fastInst.Class))
+            return SharedInitializeCore(args[0], T.Instance, args, 1);
+
         var sharedInitFn = Startup.Sym("SHARED-INITIALIZE").Function as LispFunction
             ?? throw new LispErrorException(new LispError("SHARED-INITIALIZE not defined"));
         var siArgs = new LispObject[args.Length + 1];
@@ -1608,10 +1640,20 @@ public static partial class Runtime
         return false;
     }
 
+    /// <summary>SHARED-INITIALIZE's default method, in the shape the generic function
+    /// calls it: args[0] = instance, args[1] = slot-names, args[2..] = initargs.</summary>
     public static LispObject SharedInitialize(LispObject[] args)
+        => SharedInitializeCore(args[0], args.Length > 1 ? args[1] : Nil.Instance, args, 2);
+
+    /// <summary>The same work over an initarg SPAN, so a caller that already holds the
+    /// initargs in an array does not have to build a second one shaped
+    /// (instance slot-names . initargs). INITIALIZE-INSTANCE's default method holds
+    /// exactly that array minus the slot-names and was copying it for every instance
+    /// created.</summary>
+    private static LispObject SharedInitializeCore(LispObject instArg, LispObject slotNames0,
+                                                   LispObject[] initargs, int start)
     {
-        // args[0] = instance, args[1] = slot-names (NIL, T, or list of symbols), args[2..] = initargs
-        LispObject obj = args[0];
+        LispObject obj = instArg;
         if (obj is LispInstanceCondition lic) obj = lic.Instance;
         // A class metaobject under a custom metaclass: initialize the metaclass-added
         // slots (those beyond standard-class) from initargs, else their initforms —
@@ -1628,12 +1670,12 @@ public static partial class Runtime
                 string sn = es.Name.Name;
                 if (stdNames.Contains(sn)) continue;
                 bool fromInitarg = false;
-                for (int i = 2; i + 1 < args.Length; i += 2)
-                    if (args[i] is Symbol k && Array.Exists(es.Initargs, ia => ia.Name == k.Name))
-                    { (klass.EnsureExtraSlots())[sn] = args[i + 1]; fromInitarg = true; break; }
+                for (int i = start; i + 1 < initargs.Length; i += 2)
+                    if (initargs[i] is Symbol k && Array.Exists(es.Initargs, ia => ia.Name == k.Name))
+                    { (klass.EnsureExtraSlots())[sn] = initargs[i + 1]; fromInitarg = true; break; }
                 if (fromInitarg) continue;
-                bool inNames = args[1] is T;
-                if (!inNames) for (var c = args[1]; c is Cons cc; c = cc.Cdr) if (cc.Car is Symbol s2 && s2.Name == sn) { inNames = true; break; }
+                bool inNames = slotNames0 is T;
+                if (!inNames) for (var c = slotNames0; c is Cons cc; c = cc.Cdr) if (cc.Car is Symbol s2 && s2.Name == sn) { inNames = true; break; }
                 bool bound = klass.ExtraSlots != null && klass.ExtraSlots.TryGetValue(sn, out var ev) && ev != null;
                 if (inNames && !bound && es.InitformThunk is { } thunk)
                     (klass.EnsureExtraSlots())[sn] = MultipleValues.Primary(thunk.Invoke(Array.Empty<LispObject>()));
@@ -1641,9 +1683,9 @@ public static partial class Runtime
             return klass;
         }
         if (obj is not LispInstance inst)
-            throw new LispErrorException(new LispTypeError("SHARED-INITIALIZE: not a CLOS instance", args[0]));
+            throw new LispErrorException(new LispTypeError("SHARED-INITIALIZE: not a CLOS instance", instArg));
         var cls = inst.Class;
-        LispObject slotNames = args[1];
+        LispObject slotNames = slotNames0;
 
         // For a custom metaclass, instance-allocated slot writes must go through
         // (setf slot-value-using-class) so overrides (e.g. McCLIM's dynamic slots, which
@@ -1662,28 +1704,32 @@ public static partial class Runtime
         }
 
         // Validate initargs: must be even count of key-value pairs with symbol keys
-        int initargCount = args.Length - 2;
+        int initargCount = initargs.Length - start;
         if (initargCount % 2 != 0)
             throw new LispErrorException(new LispProgramError(
                 "SHARED-INITIALIZE: odd number of keyword arguments"));
-        for (int i = 2; i < args.Length; i += 2)
+        for (int i = start; i < initargs.Length; i += 2)
         {
             // NIL and T are valid symbols in CL but separate types in dotcl
-            if (args[i] is not Symbol && args[i] is not Nil && args[i] is not T)
+            if (initargs[i] is not Symbol && initargs[i] is not Nil && initargs[i] is not T)
                 throw new LispErrorException(new LispProgramError(
-                    $"SHARED-INITIALIZE: invalid initarg key {args[i]}"));
+                    $"SHARED-INITIALIZE: invalid initarg key {initargs[i]}"));
         }
 
         // Step 1: Apply initargs (leftmost wins for duplicate keys)
         // CLHS: initargs always override existing slot values (not just unbound slots).
         // Track which slot indices were already set by an earlier initarg in THIS call.
-        var slotsSetByInitarg = new HashSet<int>();
-        for (int i = 2; i + 1 < args.Length; i += 2)
+        //
+        // Built only when there IS an initarg to record. SHARED-INITIALIZE runs for
+        // every instance the initialization protocol touches, and with no initargs
+        // the loop below never executes -- the set was ~64 B allocated to stay empty.
+        HashSet<int>? slotsSetByInitarg = null;
+        for (int i = start; i + 1 < initargs.Length; i += 2)
         {
-            string initargName = args[i] switch
+            string initargName = initargs[i] switch
             {
                 Symbol s => s.Name,
-                _ => args[i].ToString()!
+                _ => initargs[i].ToString()!
             };
             foreach (var slot in cls.EffectiveSlots)
             {
@@ -1697,13 +1743,13 @@ public static partial class Runtime
                             // for :allocation :class slots already bound by a prior
                             // make-instance. Only the first initarg for a given slot in
                             // THIS call wins (slotsSetByInitarg guards duplicates).
-                            if (!slotsSetByInitarg.Contains(idx))
+                            if (slotsSetByInitarg == null || !slotsSetByInitarg.Contains(idx))
                             {
                                 if (slot.IsClassAllocation)
-                                    FindClassSlotOwner(cls, slot.Name.Name).ClassSlotValues[slot.Name.Name] = args[i + 1];
+                                    FindClassSlotOwner(cls, slot.Name.Name).ClassSlotValues[slot.Name.Name] = initargs[i + 1];
                                 else
-                                    StoreInstanceSlot(slot, idx, args[i + 1]);
-                                slotsSetByInitarg.Add(idx);
+                                    StoreInstanceSlot(slot, idx, initargs[i + 1]);
+                                (slotsSetByInitarg ??= new HashSet<int>()).Add(idx);
                             }
                         }
                         break; // Found matching initarg for this slot, no need to check more
@@ -1773,7 +1819,7 @@ public static partial class Runtime
             // if slotNames is NIL, skip initforms
         }
 
-        return args[0]; // return original instance (possibly wrapped)
+        return instArg; // return original instance (possibly wrapped)
     }
 
     public static LispObject MakeInstanceWithInitargs(LispObject classSpec, params LispObject[] initargs)
@@ -1813,9 +1859,7 @@ public static partial class Runtime
             {
                 if (cplCls.Name.Name == "STANDARD-GENERIC-FUNCTION" || cplCls.Name.Name == "GENERIC-FUNCTION")
                 {
-                    GenericFunction? newGf = null;
-                    newGf = new GenericFunction(Startup.Sym("UNNAMED"), -1,
-                        callArgs => Runtime.DispatchGF(newGf!, callArgs));
+                    var newGf = Runtime.NewDispatchingGF(Startup.Sym("UNNAMED"), -1);
                     newGf.RequiredCount = 0;
                     newGf.LambdaListInfoSet = true;
                     newGf.StoredClass = cls;  // track actual Lisp class (may be substandard-generic-function etc.)
@@ -2266,10 +2310,7 @@ public static partial class Runtime
     {
         var sym = ToFunctionNameSymbol(name, "MAKE-GF");
         int ar = arity is Fixnum f ? (int)f.Value : -1;
-        // Create GF with a dispatch function that calls DispatchGF
-        GenericFunction? gf = null;
-        gf = new GenericFunction(sym, ar, args => DispatchGF(gf!, args));
-        return gf;
+        return NewDispatchingGF(sym, ar);
     }
 
     public static LispObject RegisterGF(LispObject name, LispObject gfObj)
@@ -2704,6 +2745,7 @@ public static partial class Runtime
             foreach (var c in _classRegistry.Values)
             {
                 c.SimpleInitChecked = false;
+                c.SharedInitSimpleChecked = false;
                 c.CachedValidInitargKeys = null; // method keys affect valid initargs (CLHS 7.1.2)
                 c.CachedHasCustomInitMethods = null; // the fast-path gate itself
             }
@@ -2893,7 +2935,7 @@ public static partial class Runtime
         LispObject result = Nil.Instance;
         for (int i = applicable.Count - 1; i >= 0; i--)
             result = new Cons(applicable[i], result);
-        return MultipleValues.Values(result, definitive ? T.Instance : Nil.Instance);
+        return MultipleValues.Values2(result, definitive ? T.Instance : Nil.Instance);
     }
 
     /// <summary>CompareMethodSpecificity variant driven by an explicit class list
@@ -2953,12 +2995,32 @@ public static partial class Runtime
         return Nil.Instance;
     }
 
+    /// <summary>The value of an EQL specializer (EQL . (value)), or null when the
+    /// specializer is a class rather than an EQL one.</summary>
+    private static LispObject? EqlSpecializerValue(LispObject spec)
+        => spec is Cons c && c.Car is Symbol s && s.Name == "EQL" && c.Cdr is Cons v
+           ? v.Car : null;
+
     private static bool MethodSignatureMatches(LispMethod a, LispMethod b)
     {
         if (a.Specializers.Length != b.Specializers.Length) return false;
         if (a.Qualifiers.Length != b.Qualifiers.Length) return false;
         for (int i = 0; i < a.Specializers.Length; i++)
-            if (!ReferenceEquals(a.Specializers[i], b.Specializers[i])) return false;
+        {
+            var sa = a.Specializers[i];
+            var sb = b.Specializers[i];
+            if (ReferenceEquals(sa, sb)) continue;
+            // Classes are interned, so identity settles them; an EQL specializer is a
+            // fresh (EQL value) cons on every DEFMETHOD, so two definitions of the same
+            // method are never the same object. Comparing those by identity meant a
+            // redefinition was appended as a SECOND method instead of replacing the
+            // first, and the original kept winning. CLHS 7.6.2: EQL specializers agree
+            // when their values are EQL.
+            var va = EqlSpecializerValue(sa);
+            var vb = EqlSpecializerValue(sb);
+            if (va != null && vb != null && IsTrueEql(va, vb)) continue;
+            return false;
+        }
         for (int i = 0; i < a.Qualifiers.Length; i++)
             if (a.Qualifiers[i].Name != b.Qualifiers[i].Name) return false;
         return true;
@@ -3114,6 +3176,9 @@ public static partial class Runtime
     /// leave a briefly-stale entry, exactly as the previous single-entry cache did.</summary>
     private static void AddDispatchCache(GenericFunction gf, CachedDispatch entry)
     {
+        // Decide the arity-1 fast shape once, here, where the entry is complete:
+        // DISPATCHGF1 then reads one bool instead of re-deriving it per call.
+        entry.ComputeSinglePrimary();
         var old = gf.DispatchCache;
         var list = new List<CachedDispatch>(GenericFunction.DispatchCacheWidth) { entry };
         if (old != null)
@@ -3136,10 +3201,314 @@ public static partial class Runtime
         return true;
     }
 
+    /// <summary>Run a cache hit that has :around methods: the arounds wrap a
+    /// before/primary/after combination, which CALL-NEXT-METHOD reaches through the
+    /// closure passed as the fallback.
+    ///
+    /// This lives in its own method so that DISPATCHGF has no lambda capturing its
+    /// locals. C# allocates a closure's display class where the captured variables
+    /// are declared — on entry to the scope, not where the lambda is written — so
+    /// writing this inline made every dispatch, :around or not, allocate a display
+    /// class it almost never used. That was 56 B of the ~110 B a GF call allocated,
+    /// and it survived returning early from the dispatcher, which is what made it
+    /// hard to place.</summary>
+    private static LispObject InvokeAroundCombination(
+        CachedDispatch cached, List<LispMethod> primary, LispObject[] args)
+        => InvokeAroundCombination(cached.Around, cached.Before, primary, cached.After, args);
+
+    /// <summary>As above, for the cache-miss path, which holds the four method lists
+    /// in locals rather than in a cache entry.</summary>
+    private static LispObject InvokeAroundCombination(
+        List<LispMethod> around, List<LispMethod> before, List<LispMethod> primary,
+        List<LispMethod> after, LispObject[] args)
+        => InvokeWithNextMethods(around, 0, args,
+               a => InvokeStandardCombination(before, primary, after, a));
+
+    /// <summary>Sorts methods by specificity for one call's arguments. A class rather
+    /// than the lambda it replaces: a lambda over ARGS captures the dispatcher's own
+    /// parameter, and C# then allocates a display class on entry to DISPATCHGF — on
+    /// every call, including the cache hits that never sort anything.</summary>
+    private sealed class SpecificityComparer : IComparer<LispMethod>
+    {
+        private readonly LispObject[] _args;
+        private readonly bool _reverse;
+        public SpecificityComparer(LispObject[] args, bool reverse)
+        { _args = args; _reverse = reverse; }
+        public int Compare(LispMethod? a, LispMethod? b)
+            => _reverse ? CompareMethodSpecificity(b!, a!, _args)
+                        : CompareMethodSpecificity(a!, b!, _args);
+    }
+
+    /// <summary>A generic function that dispatches through DISPATCHGF, with the
+    /// arity-1 entry point installed. Every GF whose dispatch is the standard one is
+    /// built here, so the entry points a GF carries are decided in one place.</summary>
+    internal static GenericFunction NewDispatchingGF(Symbol name, int arity)
+    {
+        GenericFunction? gf = null;
+        gf = new GenericFunction(name, arity, args => DispatchGF(gf!, args));
+        gf.SetDirectDelegate((Func<LispObject, LispObject>)(a => DispatchGF1(gf!, a)));
+        gf.SetDirectDelegate((Func<LispObject, LispObject, LispObject>)((a, b) => DispatchGF2(gf!, a, b)));
+        gf.SetDirectDelegate((Func<LispObject, LispObject, LispObject, LispObject>)((a, b, c) => DispatchGF3(gf!, a, b, c)));
+        gf.SetDirectDelegate((Func<LispObject, LispObject, LispObject, LispObject, LispObject>)((a, b, c, d) => DispatchGF4(gf!, a, b, c, d)));
+        return gf;
+    }
+
+    /// <summary>One-argument entry point for generic-function calls, installed as the
+    /// GF's arity-1 direct delegate so INVOKE1 reaches dispatch without building an
+    /// argument array (32 B a call, which is what a GF call allocates once the closure
+    /// in the dispatcher is gone).
+    ///
+    /// Only the shape that needs nothing but the single argument runs here: a warm
+    /// cache entry for this argument's class, one primary method, nothing around it,
+    /// and no keyword checking to do. Everything else — a miss, EQL specializers,
+    /// :around/:before/:after, built-in combinations, the slot reader/writer
+    /// shortcuts, arity errors — builds the array and goes through DISPATCHGF
+    /// unchanged, so this adds a fast path rather than a second dispatcher.</summary>
+    private static LispObject DispatchGF1(GenericFunction gf, LispObject a)
+    {
+        var entry = PlainCacheHit(gf, a, null, null, null, 1);
+        if (entry != null)
+            return entry.SinglePrimary
+                ? InvokeChainLoose(entry.Primary, a, null, null, null, 1)
+                : InvokeCombinationLoose(entry, a, null, null, null, 1);
+        // EQL-specialized generic functions are cached only for one required argument,
+        // so this is the only arity that can take them without an array. The array path
+        // is what an EQL dispatch used to cost even on a warm cache: 32 B a call, and
+        // (defmethod f ((x (eql :k))) ...) is an ordinary way to write a dispatch table.
+        var eqlChain = EqlCacheHit(gf, a);
+        if (eqlChain != null) return InvokeChainLoose(eqlChain, a, null, null, null, 1);
+        return DispatchGF(gf, new[] { a });
+    }
+
+    /// <summary>The method chain a warm EQL-specialized cache entry runs for A, or null
+    /// when this call is not one the loose-argument path can take (no entry, a shape with
+    /// :around/:before/:after or a built-in combination, keyword checking to do, or one of
+    /// the slot reader/writer shortcuts). A matching EQL method runs at the head of the
+    /// precomputed [eql-method, non-EQL primaries...] chain; with no match the non-EQL
+    /// primaries are the whole chain. Mirrors the entry-selection half of DISPATCHGF's
+    /// cache-hit path — the invocation half is INVOKECHAINLOOSE.</summary>
+    private static List<LispMethod>? EqlCacheHit(GenericFunction gf, LispObject a)
+    {
+        var dcache = gf.DispatchCache;
+        if (dcache == null) return null;
+        if (gf.LambdaListInfoSet && gf.HasKey && !gf.HasAllowOtherKeys) return null;
+        int required = gf.LambdaListInfoSet ? gf.RequiredCount : (gf.Arity >= 0 ? gf.Arity : 0);
+        if (required != 1) return null;
+        if (gf.LambdaListInfoSet && !gf.HasRest && !gf.HasKey
+            && 1 > gf.RequiredCount + gf.OptionalCount) return null;
+        foreach (var entry in dcache)
+        {
+            var types = entry.ArgTypes;
+            if (types.Length != 1) continue;
+            if (!ReferenceEquals(types[0], ArgDispatchClass(a))) continue;
+            if (!entry.HasEqlSpecializers || entry.EqlValues == null || entry.EqlChains == null)
+                return null;
+            if (entry.IsBuiltinCombination || entry.Around.Count != 0
+                || entry.Before.Count != 0 || entry.After.Count != 0
+                || entry.ReaderSlotIndex >= 0 || entry.WriterSlotIndex >= 0)
+                return null;
+            var eqlValues = entry.EqlValues;
+            for (int i = 0; i < eqlValues.Length; i++)
+            {
+                // Same comparison the array path uses: identity, then fixnum value,
+                // then the general EQL for the mixed cases.
+                var v = eqlValues[i];
+                if (ReferenceEquals(a, v)
+                    || (a is Fixnum fa
+                        ? v is Fixnum fv && fa.Value == fv.Value
+                        : v is not Fixnum && IsTrueEql(a, v)))
+                    return entry.EqlChains[i];
+            }
+            // No EQL value matched: the class-specialized primaries are what applies.
+            // An empty set is "no applicable method", which DISPATCHGF reports.
+            return entry.Primary.Count > 0 ? entry.Primary : null;
+        }
+        return null;
+    }
+
+    /// <summary>Two-argument twin of DISPATCHGF1.</summary>
+    private static LispObject DispatchGF2(GenericFunction gf, LispObject a, LispObject b)
+    {
+        var entry = PlainCacheHit(gf, a, b, null, null, 2);
+        if (entry != null)
+            return entry.SinglePrimary
+                ? InvokeChainLoose(entry.Primary, a, b, null, null, 2)
+                : InvokeCombinationLoose(entry, a, b, null, null, 2);
+        return DispatchGF(gf, new[] { a, b });
+    }
+
+    /// <summary>Three-argument twin of DISPATCHGF1.</summary>
+    private static LispObject DispatchGF3(GenericFunction gf, LispObject a, LispObject b, LispObject c)
+    {
+        var entry = PlainCacheHit(gf, a, b, c, null, 3);
+        if (entry != null)
+            return entry.SinglePrimary
+                ? InvokeChainLoose(entry.Primary, a, b, c, null, 3)
+                : InvokeCombinationLoose(entry, a, b, c, null, 3);
+        return DispatchGF(gf, new[] { a, b, c });
+    }
+
+    /// <summary>Run a one-primary-with-:before/:after combination on loose arguments.
+    ///
+    /// The auxiliary methods run purely for effect on the same arguments the primary
+    /// gets -- CLHS 7.6.6.2: :before methods most specific first, then the primary,
+    /// then :after methods least specific first, and the value is the primary's.
+    /// None of them can reach CALL-NEXT-METHOD past the single primary, so the whole
+    /// combination needs no arguments array; INVOKECHAINLOOSE handles the primary and
+    /// its next-method state, and the auxiliaries invoke directly by arity.</summary>
+    private static LispObject InvokeCombinationLoose(
+        CachedDispatch entry, LispObject a, LispObject? b, LispObject? c, LispObject? d, int argc)
+    {
+        var before = entry.Before;
+        for (int i = 0; i < before.Count; i++) InvokeLoose(before[i], a, b, c, d, argc);
+        var result = InvokeChainLoose(entry.Primary, a, b, c, d, argc);
+        var after = entry.After;
+        for (int i = 0; i < after.Count; i++) InvokeLoose(after[i], a, b, c, d, argc);
+        return result;
+    }
+
+    /// <summary>Invoke one method on loose arguments, by arity.</summary>
+    private static void InvokeLoose(
+        LispMethod m, LispObject a, LispObject? b, LispObject? c, LispObject? d, int argc)
+    {
+        var fn = m.Function;
+        switch (argc)
+        {
+            case 1: fn.Invoke1(a); break;
+            case 2: fn.Invoke2(a, b!); break;
+            case 3: fn.Invoke3(a, b!, c!); break;
+            default: fn.Invoke4(a, b!, c!, d!); break;
+        }
+    }
+
+    /// <summary>Four-argument twin of DISPATCHGF1. The arity cliff was real: a
+    /// generic function of 1-3 arguments allocated nothing on a warm cache while
+    /// one of 4 allocated 72 B a call, purely because the loose path stopped at
+    /// three. SHARED-INITIALIZE reaches it on every (instance slot-names . initargs)
+    /// call with one initarg pair.</summary>
+    private static LispObject DispatchGF4(
+        GenericFunction gf, LispObject a, LispObject b, LispObject c, LispObject d)
+    {
+        var entry = PlainCacheHit(gf, a, b, c, d, 4);
+        if (entry != null)
+            return entry.SinglePrimary
+                ? InvokeChainLoose(entry.Primary, a, b, c, d, 4)
+                : InvokeCombinationLoose(entry, a, b, c, d, 4);
+        return DispatchGF(gf, new[] { a, b, c, d });
+    }
+
+    /// <summary>The cache entry for these arguments when it is one this path can run
+    /// without an argument array, else null (the caller then goes through DISPATCHGF).
+    ///
+    /// An entry may hold fewer classes than the call has arguments — it records the
+    /// ones dispatch looked at — so the same rule DISPATCHGF's own scan uses applies:
+    /// compare the classes the entry has, ignore the rest.</summary>
+    private static CachedDispatch? PlainCacheHit(
+        GenericFunction gf, LispObject a, LispObject? b, LispObject? c, LispObject? d, int argc)
+    {
+        var dcache = gf.DispatchCache;
+        if (dcache == null) return null;
+        if (gf.LambdaListInfoSet && gf.HasKey && !gf.HasAllowOtherKeys) return null;
+        // Argument count. DISPATCHGF checks this itself and signals a PROGRAM-ERROR,
+        // and these entry points are reached before it: INVOKE2 on a one-argument
+        // generic function lands in DISPATCHGF2, where a cache entry recorded for the
+        // one argument it dispatches on would otherwise match and run the method with
+        // an argument too many. Out of range, hand it to DISPATCHGF to signal.
+        int required = gf.LambdaListInfoSet ? gf.RequiredCount : (gf.Arity >= 0 ? gf.Arity : 0);
+        if (argc < required) return null;
+        if (gf.LambdaListInfoSet && !gf.HasRest && !gf.HasKey
+            && argc > gf.RequiredCount + gf.OptionalCount) return null;
+        foreach (var entry in dcache)
+        {
+            var types = entry.ArgTypes;
+            if (types.Length == 0 || types.Length > argc) continue;
+            if (!ReferenceEquals(types[0], ArgDispatchClass(a))) continue;
+            if (types.Length > 1 && !ReferenceEquals(types[1], ArgDispatchClass(b!))) continue;
+            if (types.Length > 2 && !ReferenceEquals(types[2], ArgDispatchClass(c!))) continue;
+            if (types.Length > 3 && !ReferenceEquals(types[3], ArgDispatchClass(d!))) continue;
+            // Matching entry: either it is a shape this path runs, or nothing else in
+            // the cache can match these classes, so stop either way.
+            return (entry.SinglePrimary || entry.SinglePrimaryWithBeforeAfter) ? entry : null;
+        }
+        return null;
+    }
+
+    /// <summary>Run CHAIN[0] on ARGC loose arguments with the next-method state a method
+    /// body expects. The counterpart of INVOKESTANDARDCOMBINATION for the callers that
+    /// hold the arguments rather than an array. A one-method chain has nowhere for
+    /// CALL-NEXT-METHOD to go, so the body must see the default closures; a longer one
+    /// leaves the captured slots empty, which is how CAPTUREDCNM knows to build from the
+    /// chain state (an EQL-specialized method followed by the class-specialized primaries
+    /// is the case that has more than one). The arguments of the current invocation are
+    /// published lazily — only CALL-NEXT-METHOD with no arguments needs them as a list,
+    /// and it materialises them from the loose slots through CURRENTGFARGS.</summary>
+    private static LispObject InvokeChainLoose(
+        List<LispMethod> primary, LispObject a, LispObject? b, LispObject? c, LispObject? d, int argc)
+    {
+        var savedChain = _nextMethodChain;
+        var savedIndex = _nextMethodIndex;
+        var savedArgs = _currentGFArgs;
+        var savedFallback = _nextMethodFallback;
+        var savedCapturedNmp = _capturedNmp;
+        var savedCapturedCnm = _capturedCnm;
+        var savedArg0 = _currentGFArg0;
+        var savedArg1 = _currentGFArg1;
+        var savedArg2 = _currentGFArg2;
+        var savedArg3 = _currentGFArg3;
+        var savedArgc = _currentGFArgc;
+        _nextMethodChain = primary;
+        _nextMethodIndex = 1;
+        _currentGFArgs = null;
+        _currentGFArg0 = a;
+        _currentGFArg1 = b;
+        _currentGFArg2 = c;
+        _currentGFArg3 = d;
+        _currentGFArgc = argc;
+        _nextMethodFallback = null;
+        // One method: nothing for CALL-NEXT-METHOD to reach, so publish the default
+        // closures. More than one: leave the slots empty so a body that captures builds
+        // from the chain state above.
+        bool single = primary.Count == 1;
+        _capturedNmp = single ? _defaultNmp : null;
+        _capturedCnm = single ? _defaultCnm : null;
+        try
+        {
+            var fn = primary[0].Function;
+            return argc switch
+            {
+                1 => fn.Invoke1(a),
+                2 => fn.Invoke2(a, b!),
+                3 => fn.Invoke3(a, b!, c!),
+                _ => fn.Invoke4(a, b!, c!, d!)
+            };
+        }
+        finally
+        {
+            _nextMethodChain = savedChain;
+            _nextMethodIndex = savedIndex;
+            _currentGFArgs = savedArgs;
+            _currentGFArg0 = savedArg0;
+            _currentGFArg1 = savedArg1;
+            _currentGFArg2 = savedArg2;
+            _currentGFArg3 = savedArg3;
+            _currentGFArgc = savedArgc;
+            _nextMethodFallback = savedFallback;
+            _capturedNmp = savedCapturedNmp;
+            _capturedCnm = savedCapturedCnm;
+        }
+    }
+
     private static LispObject DispatchGF(GenericFunction gf, LispObject[] args)
     {
         // Arity check: signal program-error for too few/too many arguments
         int requiredCount = gf.LambdaListInfoSet ? gf.RequiredCount : (gf.Arity >= 0 ? gf.Arity : 0);
+        // A generic function with no required parameters has nothing to dispatch on:
+        // every call sees the same applicable set, so the cache key is the empty class
+        // vector and the entry matches unconditionally. Only when the lambda list is
+        // actually known -- with LAMBDALISTINFOSET false and no arity, REQUIREDCOUNT is
+        // 0 because nothing was recorded, not because the function takes no arguments,
+        // and an empty key would then match calls that really do dispatch.
+        bool zeroDispatch = gf.LambdaListInfoSet && gf.RequiredCount == 0;
         if (requiredCount > 0 && args.Length < requiredCount)
             throw new LispErrorException(new LispProgramError(
                 $"{gf.Name.Name}: too few arguments ({args.Length}), expected at least {requiredCount}"));
@@ -3274,8 +3643,7 @@ public static partial class Runtime
                         // primaries...] chain — no per-hit list building.
                         var eqlPrimary = cached.EqlChains![eqlIdx];
                         if (cached.Around.Count > 0)
-                            return InvokeWithNextMethods(cached.Around, 0, args,
-                                a => InvokeStandardCombination(cached.Before, eqlPrimary, cached.After, a));
+                            return InvokeAroundCombination(cached, eqlPrimary, args);
                         return InvokeStandardCombination(cached.Before, eqlPrimary, cached.After, args);
                     }
                     // No EQL match — fall through to cached non-EQL result
@@ -3301,8 +3669,7 @@ public static partial class Runtime
                 if (cached.IsBuiltinCombination && cached.Applicable != null)
                     return DispatchBuiltinCombination(gf, cached.Applicable, args);
                 if (cached.Around.Count > 0)
-                    return InvokeWithNextMethods(cached.Around, 0, args,
-                        a => InvokeStandardCombination(cached.Before, cached.Primary, cached.After, a));
+                    return InvokeAroundCombination(cached, cached.Primary, args);
                 return InvokeStandardCombination(cached.Before, cached.Primary, cached.After, args);
         }
 
@@ -3345,7 +3712,8 @@ public static partial class Runtime
             // Cache for built-in combination
             if (!hasEqlSpec)
             {
-                int n = Math.Max(1, requiredCount);
+                // Width 0 for a no-required-parameter GF: see ZERODISPATCH above.
+                int n = zeroDispatch ? 0 : Math.Max(1, requiredCount);
                 var types = new LispClass?[n];
                 for (int i = 0; i < n && i < args.Length; i++)
                     types[i] = ArgDispatchClass(args[i]);
@@ -3387,10 +3755,11 @@ public static partial class Runtime
                 $"No primary method for generic function {gf.Name.Name}"));
 
         // Sort: more specific first
-        primaryMethods.Sort((a, b) => CompareMethodSpecificity(a, b, args));
-        beforeMethods.Sort((a, b) => CompareMethodSpecificity(a, b, args));
-        afterMethods.Sort((a, b) => CompareMethodSpecificity(b, a, args)); // reverse for :after
-        aroundMethods.Sort((a, b) => CompareMethodSpecificity(a, b, args));
+        var bySpecificity = new SpecificityComparer(args, false);
+        primaryMethods.Sort(bySpecificity);
+        beforeMethods.Sort(bySpecificity);
+        afterMethods.Sort(new SpecificityComparer(args, true)); // reverse for :after
+        aroundMethods.Sort(bySpecificity);
 
         // Update monomorphic cache for STANDARD combination.
         //
@@ -3414,7 +3783,8 @@ public static partial class Runtime
         // GFs outside this shape keep the old behavior (recompute per call).
         if (!hasEqlSpec)
         {
-            int n = Math.Max(1, requiredCount);
+            // Width 0 for a no-required-parameter GF: see ZERODISPATCH above.
+            int n = zeroDispatch ? 0 : Math.Max(1, requiredCount);
             var types = new LispClass?[n];
             for (int i = 0; i < n && i < args.Length; i++)
                 types[i] = ArgDispatchClass(args[i]);
@@ -3525,10 +3895,8 @@ public static partial class Runtime
         if (aroundMethods.Count > 0)
         {
             // :around wraps everything
-            return InvokeWithNextMethods(aroundMethods, 0, args,
-                a => {
-                    return InvokeStandardCombination(beforeMethods, primaryMethods, afterMethods, a);
-                });
+            return InvokeAroundCombination(aroundMethods, beforeMethods, primaryMethods,
+                                           afterMethods, args);
         }
         else
         {
@@ -3974,6 +4342,40 @@ public static partial class Runtime
     private static int _nextMethodIndex;
     [ThreadStatic]
     private static LispObject[]? _currentGFArgs;
+    /// <summary>The arguments of an invocation that came through one of the loose-argument
+    /// entry points, which have no array to publish. Read only through
+    /// <see cref="CurrentGFArgs"/>, and only meaningful while _currentGFArgs is null;
+    /// _currentGFArgc says how many of them are live.</summary>
+    [ThreadStatic]
+    private static LispObject? _currentGFArg0;
+    [ThreadStatic]
+    private static LispObject? _currentGFArg1;
+    [ThreadStatic]
+    private static LispObject? _currentGFArg2;
+    [ThreadStatic]
+    private static LispObject? _currentGFArg3;
+    [ThreadStatic]
+    private static int _currentGFArgc;
+
+    /// <summary>The arguments of the invocation in progress, as a list. CALL-NEXT-METHOD
+    /// with no arguments passes these on, and that is the only reader — so the arity-1
+    /// path can skip building the array and have it materialised here instead, on the
+    /// rare call that asks. An invocation with no next method never gets this far
+    /// (the captured closure signals first), so the cost lands only where a real chain
+    /// continues.</summary>
+    private static LispObject[] CurrentGFArgs()
+    {
+        var args = _currentGFArgs;
+        if (args != null) return args;
+        return _currentGFArgc switch
+        {
+            1 => new[] { _currentGFArg0! },
+            2 => new[] { _currentGFArg0!, _currentGFArg1! },
+            3 => new[] { _currentGFArg0!, _currentGFArg1!, _currentGFArg2! },
+            4 => new[] { _currentGFArg0!, _currentGFArg1!, _currentGFArg2!, _currentGFArg3! },
+            _ => System.Array.Empty<LispObject>()
+        };
+    }
     [ThreadStatic]
     // The fallback runs the "next method" when the next-method chain (e.g. the
     // :around list) is exhausted — typically the before/primary/after combination.
@@ -4033,7 +4435,7 @@ public static partial class Runtime
         if (chain == null) return _defaultCnm;
         var closureChain = chain;
         var closureIdx = _nextMethodIndex;
-        var closureArgs = _currentGFArgs!;
+        var closureArgs = CurrentGFArgs();
         var closureFallback = _nextMethodFallback;
         var currentMethod = (closureIdx > 0 && closureIdx - 1 < closureChain.Count)
             ? closureChain[closureIdx - 1] : null;
@@ -4133,7 +4535,7 @@ public static partial class Runtime
         if (_nextMethodChain == null)
             throw new LispErrorException(new LispError("CALL-NEXT-METHOD: no next method"));
 
-        LispObject[] actualArgs = args.Length > 0 ? args : _currentGFArgs!;
+        LispObject[] actualArgs = args.Length > 0 ? args : CurrentGFArgs();
 
         // CLHS 7.6.6.1: When call-next-method is called with arguments,
         // the ordered set of applicable methods must be the same as for the
@@ -4604,9 +5006,7 @@ public static partial class Runtime
             var sgfCls = Runtime.FindClass(Startup.Sym("STANDARD-GENERIC-FUNCTION"));
             var sgfAllocM = Runtime.MakeMethod(new Cons(sgfCls, Nil.Instance), Nil.Instance,
                 new LispFunction(allocArgs => {
-                    GenericFunction? newGf = null;
-                    newGf = new GenericFunction(Startup.Sym("UNNAMED"), -1,
-                        callArgs => Runtime.DispatchGF(newGf!, callArgs));
+                    var newGf = Runtime.NewDispatchingGF(Startup.Sym("UNNAMED"), -1);
                     newGf.RequiredCount = 0;
                     newGf.LambdaListInfoSet = true;
                     return newGf;
@@ -5483,9 +5883,9 @@ public static partial class Runtime
                             var kwSym = Startup.Keyword(m.KeywordNames[i]);
                             kwList = new Cons(kwSym, kwList);
                         }
-                        return MultipleValues.Values(kwList, m.HasAllowOtherKeys ? (LispObject)T.Instance : Nil.Instance);
+                        return MultipleValues.Values2(kwList, m.HasAllowOtherKeys ? (LispObject)T.Instance : Nil.Instance);
                     }
-                    return MultipleValues.Values(Nil.Instance, Nil.Instance);
+                    return MultipleValues.Values2(Nil.Instance, Nil.Instance);
                 }));
             ((LispMethod)fkDefaultMethod).RequiredCount = 1;
             Runtime.AddMethod(fkGF, fkDefaultMethod);

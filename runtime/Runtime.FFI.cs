@@ -85,23 +85,28 @@ static class NativeFFI
         }
         if (targetType == typeof(long))
         {
-            if (arg is Fixnum fx) return fx.Value;
             if (arg is Nil) return 0L;
+            if (arg is Fixnum or Bignum) return Runtime.ToLong(arg, "dotnet:ffi");
             throw new LispErrorException(new LispError(
                 $"dotnet:ffi: cannot convert {arg} to :int64"));
         }
         if (targetType == typeof(ulong))
         {
-            if (arg is Fixnum fx) return (ulong)fx.Value;
             if (arg is Nil) return 0UL;
+            // 2^63..2^64-1 arrive as Bignum
+            if (arg is Fixnum or Bignum) return Runtime.ToULong(arg, "dotnet:ffi");
             throw new LispErrorException(new LispError(
                 $"dotnet:ffi: cannot convert {arg} to :uint64"));
         }
+        // Any real converts, not just the float types and fixnums: a ratio or a
+        // bignum is an ordinary result of Lisp arithmetic ((/ 1 3), (expt 2 70)),
+        // and refusing it made the caller coerce by hand for no reason.
         if (targetType == typeof(float))
         {
             if (arg is DoubleFloat df) return (float)df.Value;
             if (arg is SingleFloat sf) return sf.Value;
             if (arg is Fixnum fx) return (float)fx.Value;
+            if (arg is Bignum or Ratio) return (float)Arithmetic.ToDouble((Number)arg);
             throw new LispErrorException(new LispError(
                 $"dotnet:ffi: cannot convert {arg} to :float"));
         }
@@ -110,6 +115,7 @@ static class NativeFFI
             if (arg is DoubleFloat df) return df.Value;
             if (arg is SingleFloat sf) return (double)sf.Value;
             if (arg is Fixnum fx) return (double)fx.Value;
+            if (arg is Bignum or Ratio) return Arithmetic.ToDouble((Number)arg);
             throw new LispErrorException(new LispError(
                 $"dotnet:ffi: cannot convert {arg} to :double"));
         }
@@ -150,7 +156,7 @@ static class NativeFFI
             int i => Fixnum.Make(i),
             uint u => Fixnum.Make((long)u),
             long l => Fixnum.Make(l),
-            ulong ul => Fixnum.Make((long)ul),
+            ulong ul => Runtime.MakeUnsigned64(ul),
             short s => Fixnum.Make(s),
             ushort us => Fixnum.Make(us),
             sbyte sb => Fixnum.Make(sb),
@@ -162,16 +168,86 @@ static class NativeFFI
         };
     }
 
+    /// <summary>
+    /// Parse an :args list into CLR types, honouring a :VARARGS marker that says
+    /// where the variadic part begins -- what libffi needs ffi_prep_cif_var for.
+    /// Without it every argument looked fixed, and a variadic float never
+    /// arrived: on ARM64 the fixed and the variadic calling conventions put
+    /// floats in different places.
+    /// </summary>
+    static (List<Type> Types, int FixedCount) ParseArgTypes(LispObject argTypesList)
+    {
+        var types = new List<Type>();
+        int fixedCount = -1;
+        for (var cur = argTypesList; cur is Cons c; cur = c.Cdr)
+        {
+            if (IsVarargsMarker(c.Car))
+            {
+                if (fixedCount >= 0)
+                    throw new LispErrorException(new LispError(
+                        "dotnet:ffi: :varargs may appear only once in the argument type list"));
+                fixedCount = types.Count;
+                continue;
+            }
+            types.Add(KeyToType(c.Car));
+        }
+        return (types, fixedCount < 0 ? types.Count : fixedCount);
+    }
+
+    static bool IsVarargsMarker(LispObject o)
+    {
+        var name = o is Symbol s ? s.Name : o is LispString ls ? ls.Value : null;
+        if (name == null) return false;
+        name = name.TrimStart(':').ToUpperInvariant();
+        return name == "VARARGS" || name == "...";
+    }
+
+    /// <summary>
+    /// The CLR type to give an argument in the variadic part.
+    ///
+    /// C promotes a variadic float to double everywhere. On ARM64 Windows the
+    /// variadic part additionally travels in the general-purpose registers and on
+    /// the stack -- never in v0-v7 -- so a double declared as such is written
+    /// where the callee never looks, and sprintf("%.0f", x) printed 0. Declaring
+    /// it as a 64-bit integer (and passing the double's bit pattern) puts it
+    /// exactly where the variadic callee reads from.
+    ///
+    /// Not applied elsewhere: x64 passes variadic floats in the SSE registers the
+    /// ordinary convention already uses, and ARM64 macOS puts the whole variadic
+    /// part on the stack, which this trick would not reproduce.
+    /// </summary>
+    static bool VariadicFloatsAsIntegerBits =>
+        Compat.IsWindows()
+        && System.Runtime.InteropServices.RuntimeInformation.ProcessArchitecture
+           == System.Runtime.InteropServices.Architecture.Arm64;
+
+    static Type VariadicCallType(Type t)
+    {
+        if (t == typeof(float) || t == typeof(double))
+            return VariadicFloatsAsIntegerBits ? typeof(long) : typeof(double);
+        return t;
+    }
+
+    /// <summary>The value for a variadic argument declared as T: a float is
+    /// promoted to double, and passed as its bits where the ABI wants it in an
+    /// integer register.</summary>
+    static object? ConvertVariadicArg(LispObject arg, Type declared)
+    {
+        if (declared == typeof(float) || declared == typeof(double))
+        {
+            var d = (double)ConvertArg(arg, typeof(double))!;
+            return VariadicFloatsAsIntegerBits ? BitConverter.DoubleToInt64Bits(d) : (object)d;
+        }
+        return ConvertArg(arg, declared);
+    }
+
     public static LispObject Call(
         string dll, string func,
         LispObject argTypesList, LispObject retTypeKw,
         LispObject[] nativeArgs)
     {
         Emitter.CilAssembler.EnsureEmitAllowed("native FFI call");
-        // Parse arg types
-        var argTypes = new List<Type>();
-        for (var cur = argTypesList; cur is Cons c; cur = c.Cdr)
-            argTypes.Add(KeyToType(c.Car));
+        var (argTypes, fixedCount) = ParseArgTypes(argTypesList);
 
         var retType = retTypeKw is Nil ? typeof(void) : KeyToType(retTypeKw);
 
@@ -179,8 +255,13 @@ static class NativeFFI
             throw new LispErrorException(new LispError(
                 $"dotnet:ffi: {func} expects {argTypes.Count} args, got {nativeArgs.Length}"));
 
+        // The types the call is MADE with: the variadic part may travel
+        // differently from how it is declared (see VariadicCallType).
+        var callTypes = argTypes.Select((t, i) => i < fixedCount ? t : VariadicCallType(t)).ToList();
+
         // Build or reuse DynamicMethod
-        var sigKey = string.Join(",", argTypes.Select(t => t.Name)) + "→" + retType.Name;
+        var sigKey = string.Join(",", callTypes.Select(t => t.Name)) + "→" + retType.Name
+                     + "|fixed" + fixedCount;
         var cacheKey = (dll, func, sigKey);
         DynamicMethod dm;
         lock (_methodCache)
@@ -188,19 +269,19 @@ static class NativeFFI
             if (!_methodCache.TryGetValue(cacheKey, out dm!))
             {
                 // DynamicMethod params: (IntPtr funcPtr, arg0Type, arg1Type, ...)
-                var allParams = argTypes.Prepend(typeof(IntPtr)).ToArray();
+                var allParams = callTypes.Prepend(typeof(IntPtr)).ToArray();
                 var actualRet = IsVoidType(retType) ? null : retType;
                 dm = new DynamicMethod($"ffi_{func}_{sigKey}", actualRet, allParams,
                                        typeof(NativeFFI), skipVisibility: true);
                 var il = dm.GetILGenerator();
                 // Push native args (positions 1..n)
-                for (int i = 0; i < argTypes.Count; i++)
+                for (int i = 0; i < callTypes.Count; i++)
                     il.Emit(OpCodes.Ldarg, i + 1);
                 // Push funcPtr (position 0) — must be last before calli
                 il.Emit(OpCodes.Ldarg_0);
                 // calli: pops funcPtr last, args before it
                 il.EmitCalli(OpCodes.Calli, CallingConvention.StdCall,
-                             actualRet, argTypes.ToArray());
+                             actualRet, callTypes.ToArray());
                 il.Emit(OpCodes.Ret);
                 _methodCache[cacheKey] = dm;
             }
@@ -214,7 +295,9 @@ static class NativeFFI
         var invokeArgs = new object?[nativeArgs.Length + 1];
         invokeArgs[0] = funcPtr;
         for (int i = 0; i < nativeArgs.Length; i++)
-            invokeArgs[i + 1] = ConvertArg(nativeArgs[i], argTypes[i]);
+            invokeArgs[i + 1] = i < fixedCount
+                ? ConvertArg(nativeArgs[i], argTypes[i])
+                : ConvertVariadicArg(nativeArgs[i], argTypes[i]);
 
         var result = dm.Invoke(null, invokeArgs);
         return ConvertReturn(result, retType);
@@ -230,9 +313,7 @@ static class NativeFFI
         LispObject[] nativeArgs)
     {
         Emitter.CilAssembler.EnsureEmitAllowed("native FFI call");
-        var argTypes = new List<Type>();
-        for (var cur = argTypesList; cur is Cons c; cur = c.Cdr)
-            argTypes.Add(KeyToType(c.Car));
+        var (argTypes, fixedCount) = ParseArgTypes(argTypesList);
 
         var retType = retTypeKw is Nil ? typeof(void) : KeyToType(retTypeKw);
 
@@ -240,23 +321,26 @@ static class NativeFFI
             throw new LispErrorException(new LispError(
                 $"dotnet:%ffi-call-ptr: expects {argTypes.Count} args, got {nativeArgs.Length}"));
 
-        var sigKey = string.Join(",", argTypes.Select(t => t.Name)) + "→" + retType.Name;
+        // See Call: the variadic part may travel differently from how it is declared.
+        var callTypes = argTypes.Select((t, i) => i < fixedCount ? t : VariadicCallType(t)).ToList();
+        var sigKey = string.Join(",", callTypes.Select(t => t.Name)) + "→" + retType.Name
+                     + "|fixed" + fixedCount;
         var cacheKey = ("*ptr*", "*ptr*", sigKey);
         DynamicMethod dm;
         lock (_methodCache)
         {
             if (!_methodCache.TryGetValue(cacheKey, out dm!))
             {
-                var allParams = argTypes.Prepend(typeof(IntPtr)).ToArray();
+                var allParams = callTypes.Prepend(typeof(IntPtr)).ToArray();
                 var actualRet = IsVoidType(retType) ? null : retType;
                 dm = new DynamicMethod($"ffi_ptr_{sigKey}", actualRet, allParams,
                                        typeof(NativeFFI), skipVisibility: true);
                 var il = dm.GetILGenerator();
-                for (int i = 0; i < argTypes.Count; i++)
+                for (int i = 0; i < callTypes.Count; i++)
                     il.Emit(OpCodes.Ldarg, i + 1);
                 il.Emit(OpCodes.Ldarg_0);
                 il.EmitCalli(OpCodes.Calli, CallingConvention.StdCall,
-                             actualRet, argTypes.ToArray());
+                             actualRet, callTypes.ToArray());
                 il.Emit(OpCodes.Ret);
                 _methodCache[cacheKey] = dm;
             }
@@ -265,7 +349,9 @@ static class NativeFFI
         var invokeArgs = new object?[nativeArgs.Length + 1];
         invokeArgs[0] = funcPtr;
         for (int i = 0; i < nativeArgs.Length; i++)
-            invokeArgs[i + 1] = ConvertArg(nativeArgs[i], argTypes[i]);
+            invokeArgs[i + 1] = i < fixedCount
+                ? ConvertArg(nativeArgs[i], argTypes[i])
+                : ConvertVariadicArg(nativeArgs[i], argTypes[i]);
 
         var result = dm.Invoke(null, invokeArgs);
         return ConvertReturn(result, retType);
@@ -296,7 +382,14 @@ static class NativeFFI
             lispArgs[i] = ConvertReturn(nativeArgs[i], e.ArgTypes[i]);
         var lispResult = e.Fn.Invoke(lispArgs);
         if (IsVoidType(e.RetType)) return null;
-        return ConvertArg(lispResult, e.RetType);
+        // A callback body that ends in a multiple-value form hands back an
+        // MvReturn, which has no native representation and used to reach
+        // ConvertArg as-is (TargetInvocationException at the call from C). One
+        // value crosses the boundary, so take the primary and drop the rest --
+        // which is what every other CL implementation's FFI does. cffi hits this
+        // for every :string-returning callback, because its conversion calls
+        // FOREIGN-STRING-ALLOC and that returns (values pointer size).
+        return ConvertArg(MultipleValues.Primary(lispResult), e.RetType);
     }
 
     static readonly MethodInfo _trampolineMI =

@@ -11,7 +11,7 @@ public static partial class Runtime
     public static LispObject Primary(LispObject obj)
     {
         if (obj is MvReturn mv)
-            return mv.Values.Length > 0 ? mv.Values[0] : Nil.Instance;
+            return mv.PrimaryValue;
         return obj;
     }
 

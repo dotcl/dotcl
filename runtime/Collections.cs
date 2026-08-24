@@ -3,7 +3,7 @@ using System.Runtime.CompilerServices;
 
 namespace DotCL;
 
-public class LispStruct : LispObject
+public sealed class LispStruct : LispObject
 {
     public Symbol TypeName { get; }
     public LispObject[] Slots { get; }
@@ -81,7 +81,7 @@ public class LispStruct : LispObject
     }
 }
 
-public class LispVector : LispObject
+public sealed class LispVector : LispObject
 {
     internal LispObject[] _elements;
     private int _fillPointer;
@@ -120,6 +120,12 @@ public class LispVector : LispObject
     /// (and can legally hold dotcl bignums), so it stays on boxed storage.</summary>
     internal static byte NumKindForElementType(string et)
     {
+        // Characters pack into a char[]: 2 bytes per element instead of an
+        // 8-byte reference, and no LispChar per store. The win is the same one
+        // the integer kinds get, and it is the storage a string-building
+        // (vector-push-extend into an adjustable character vector) pays on
+        // every character.
+        if (et == "CHARACTER" || et == "BASE-CHAR" || et == "STANDARD-CHAR") return 7;
         if (et == "FIXNUM") return 4;
         if (et == "SINGLE-FLOAT") return 5;
         if (et == "DOUBLE-FLOAT") return 6;
@@ -145,6 +151,7 @@ public class LispVector : LispObject
             3 => new int[size],
             4 => new long[size],
             5 => new float[size],
+            7 => new char[size],
             _ => new double[size],
         };
     }
@@ -152,7 +159,18 @@ public class LispVector : LispObject
     // True when the numeric backing holds floats (kind 5=float[], 6=double[])
     // rather than integers. Integer kinds cross the compiler boundary as a raw
     // long (NumGet/NumSet); float kinds as a raw double (NumGetF/NumSetF).
-    internal bool IsFloatNumKind => _numKind >= 5;
+    internal bool IsFloatNumKind => _numKind == 5 || _numKind == 6;
+
+    // True when the backing is one the raw long/double element paths understand.
+    // Characters live in _numData too, but they are neither, so the compiler's
+    // unboxed aref helpers must not touch them.
+    internal bool IsRawNumKind => _numKind != 0 && _numKind != 7;
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal char CharGet(int i) => ((char[])_numData!)[i];
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal void CharSet(int i, char c) => ((char[])_numData!)[i] = c;
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal long NumGet(int i) => _numKind switch
@@ -203,9 +221,13 @@ public class LispVector : LispObject
     // Box the element at index i per the backing kind: Fixnum for integer
     // kinds, SingleFloat/DoubleFloat for float kinds.
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    internal LispObject NumBox(int i) => _numKind >= 5
-        ? (_numKind == 5 ? new SingleFloat((float)NumGetF(i)) : (LispObject)new DoubleFloat(NumGetF(i)))
-        : Fixnum.Make(NumGet(i));
+    internal LispObject NumBox(int i) => _numKind switch
+    {
+        7 => LispChar.Make(CharGet(i)),
+        5 => new SingleFloat((float)NumGetF(i)),
+        6 => new DoubleFloat(NumGetF(i)),
+        _ => Fixnum.Make(NumGet(i)),
+    };
 
     // Store a boxed value into numeric backing at (already bounds-checked)
     // index i, dispatching on the backing kind. Returns false when val's type
@@ -213,7 +235,12 @@ public class LispVector : LispObject
     // (boxed) slow path. Integer range violations still throw loudly via NumSet.
     internal bool TryNumStore(int i, LispObject val)
     {
-        if (_numKind >= 5)
+        if (_numKind == 7)
+        {
+            if (val is LispChar lc) { CharSet(i, lc.Value); return true; }
+            return false;
+        }
+        if (IsFloatNumKind)
         {
             switch (val)
             {
@@ -248,6 +275,19 @@ public class LispVector : LispObject
         return _numData;
     }
 
+    /// <summary>The multi-dimensional counterpart of the (size, initialElement,
+    /// elementType) constructor: fills the packed storage directly instead of packing a
+    /// boxed array the caller built. MAKE-ARRAY built a LispObject[SIZE] for every
+    /// array, including the ones whose element type has narrow storage, and the
+    /// constructor then packed it and dropped it — so a 200x200x200 (integer 0 1000)
+    /// array allocated 64 MB of boxed references on the way to its 16 MB ushort[].
+    /// </summary>
+    public LispVector(int size, LispObject initialElement, string elementType, int[] dimensions)
+        : this(size, initialElement, elementType)
+    {
+        _dimensions = dimensions;
+    }
+
     public LispVector(int size, LispObject initialElement, string elementType)
     {
         ElementTypeName = elementType;
@@ -255,15 +295,32 @@ public class LispVector : LispObject
         {
             _bitData = new ulong[(size + 63) / 64];
             _elements = Array.Empty<LispObject>();
-            // If initial element is 1, fill all bits
-            if (initialElement is Fixnum f && f.Value == 1)
-                Compat.Fill(_bitData, ulong.MaxValue);
+            // NIL is "no :initial-element was given" (the storage is already zero);
+            // anything else has to be a bit, like every other store into this array.
+            if (initialElement is not Nil)
+            {
+                if (initialElement is not Fixnum f || (ulong)f.Value > 1UL)
+                    throw BitTypeError(initialElement);
+                if (f.Value == 1)
+                    Compat.Fill(_bitData, ulong.MaxValue);
+            }
         }
         else if ((_numKind = NumKindForElementType(elementType)) != 0)
         {
             _numData = AllocNum(size);
             _elements = Array.Empty<LispObject>();
-            if (_numKind >= 5)
+            if (_numKind == 7)
+            {
+                if (initialElement is LispChar ic)
+                {
+                    if (ic.Value != '\0')
+                        Compat.Fill((char[])_numData, ic.Value);
+                }
+                else if (initialElement is not Nil)
+                    throw new LispErrorException(new LispTypeError(
+                        $"array of element-type {elementType}: cannot store", initialElement));
+            }
+            else if (IsFloatNumKind)
             {
                 if (size > 0 && initialElement is not Nil)
                 {
@@ -353,13 +410,25 @@ public class LispVector : LispObject
         DotCL.Diagnostics.AllocCounter.Inc("LispVector");
     }
 
+    /// <summary>The TYPE-ERROR a value that is not 0 or 1 gets from a bit array.</summary>
+    private static Exception BitTypeError(LispObject val) =>
+        new LispErrorException(new LispTypeError(
+            "array of element-type BIT: value is not a bit", val, Startup.Sym("BIT")));
+
     private static ulong[] PackBits(LispObject[] elements)
     {
         int size = elements.Length;
         var data = new ulong[(size + 63) / 64];
         for (int i = 0; i < size; i++)
         {
-            if (elements[i] is Fixnum f && f.Value != 0)
+            // A slot the caller never filled is C# null (MAKE-ARRAY with neither
+            // :initial-element nor :initial-contents) and means 0; anything else has
+            // to be a bit.
+            var e = elements[i];
+            if (e is null) continue;
+            if (e is not Fixnum f || (ulong)f.Value > 1UL)
+                throw BitTypeError(e);
+            if (f.Value != 0)
                 data[i >> 6] |= 1UL << (i & 63);
         }
         return data;
@@ -418,8 +487,12 @@ public class LispVector : LispObject
         if (_displacedTo != null) { _displacedTo.RawSet(_displacedOffset + index, val); return; }
         if (_bitData != null)
         {
-            long bit = val is Fixnum f ? f.Value : 0;
-            if (bit != 0)
+            // Only 0 and 1 are of type BIT. Folding everything non-zero to 1 (and
+            // everything else to 0) stored a value the array cannot hold and said
+            // nothing: (setf (aref bv 0) 7) left #*100 and (aref bv 0) then read 1.
+            if (val is not Fixnum f || (ulong)f.Value > 1UL)
+                throw BitTypeError(val);
+            if (f.Value != 0)
                 _bitData[index >> 6] |= 1UL << (index & 63);
             else
                 _bitData[index >> 6] &= ~(1UL << (index & 63));
@@ -439,6 +512,9 @@ public class LispVector : LispObject
     public string ToCharString()
     {
         var len = Length;
+        // Packed character storage is already the string's contents.
+        if (_numKind == 7 && _displacedTo == null && len <= _numLen)
+            return new string((char[])_numData!, 0, len);
         var chars = new char[len];
         for (int i = 0; i < len; i++)
         {
@@ -828,7 +904,7 @@ public class LispVector : LispObject
     }
 }
 
-public class LispHashTable : LispObject
+public sealed class LispHashTable : LispObject
 {
     // Storage. The dictionary KEY is:
     //   - strong modes (Weakness null or :VALUE): the LispObject key directly.
@@ -1125,13 +1201,21 @@ public class LispHashTable : LispObject
     }
 
     public void ForEach(Action<LispObject, LispObject> action)
+        => ForEachCore(action, static (a, k, v) => a(k, v));
+
+    /// <summary>MAPHASH's entry: takes the Lisp function itself, so walking a
+    /// table does not build a closure over it on every call.</summary>
+    public void ForEachLisp(LispFunction fn)
+        => ForEachCore(fn, static (f, k, v) => f.Invoke2(k, v));
+
+    private void ForEachCore<TState>(TState state, Action<TState, LispObject, LispObject> action)
     {
         if (Synchronized)
         {
             KeyValuePair<LispObject, LispObject>[] snapshot;
             lock (_lock) snapshot = SnapshotAlive();
             foreach (var pair in snapshot)
-                action(pair.Key, pair.Value);
+                action(state, pair.Key, pair.Value);
             return;
         }
         if (Weakness != null)
@@ -1141,7 +1225,7 @@ public class LispHashTable : LispObject
             // the prune walk.
             var snap = SnapshotAlive();
             foreach (var pair in snap)
-                action(pair.Key, pair.Value);
+                action(state, pair.Key, pair.Value);
             return;
         }
         // Snapshot before iterating so ACTION may add/remove entries during the
@@ -1150,12 +1234,42 @@ public class LispHashTable : LispObject
         // add-lisp-color-aliases inserts aliases while mapping the color table).
         // Iterating Dictionary live would throw InvalidOperationException
         // ("Collection was modified"); snapshotting matches the other impls.
-        var snapshot2 = new KeyValuePair<object, object>[_dict.Count];
-        ((System.Collections.Generic.ICollection<KeyValuePair<object, object>>)_dict)
-            .CopyTo(snapshot2, 0);
-        foreach (var pair in snapshot2)
-            action((LispObject)pair.Key, (LispObject)pair.Value);
+        //
+        // The snapshot buffer is reused per thread: MAPHASH is an iteration, and
+        // allocating an array of every entry on each call made walking a table
+        // cost more than the walk. A nested walk (the action maps another table,
+        // or the same one) finds the buffer in use and allocates its own.
+        int n = _dict.Count;
+        KeyValuePair<object, object>[] buf;
+        bool pooled = false;
+        if (!_forEachBufInUse)
+        {
+            if (_forEachBuf == null || _forEachBuf.Length < n)
+                _forEachBuf = new KeyValuePair<object, object>[n < 16 ? 16 : n];
+            buf = _forEachBuf;
+            _forEachBufInUse = true;
+            pooled = true;
+        }
+        else
+        {
+            buf = new KeyValuePair<object, object>[n];
+        }
+        try
+        {
+            ((System.Collections.Generic.ICollection<KeyValuePair<object, object>>)_dict)
+                .CopyTo(buf, 0);
+            for (int i = 0; i < n; i++)
+                action(state, (LispObject)buf[i].Key, (LispObject)buf[i].Value);
+        }
+        finally
+        {
+            // Do not keep the entries alive through the pooled buffer.
+            if (pooled) { Array.Clear(buf, 0, n); _forEachBufInUse = false; }
+        }
     }
+
+    [ThreadStatic] private static KeyValuePair<object, object>[]? _forEachBuf;
+    [ThreadStatic] private static bool _forEachBufInUse;
 
     // The one EQL. This used to be a partial copy that knew only fixnums,
     // characters and floats, so a hash table could not find a bignum, ratio or
@@ -1365,6 +1479,17 @@ public class LispHashTable : LispObject
                 LispString s => s.Value.ToUpperInvariant().GetHashCode(),
                 LispVector v when v.IsCharVector => v.ToCharString().ToUpperInvariant().GetHashCode(),
                 LispChar c => char.ToUpperInvariant(c.Value).GetHashCode(),
+                // A complex has to hash by its parts: EQUALP compares numbers with
+                // =, so #C(1 2) and #C(1.0d0 2.0d0) are EQUALP and must land in
+                // the same bucket. It also has to agree with a REAL when the
+                // imaginary part is zero, since (= #C(1.0d0 0.0d0) 1.0d0) is true.
+                // Falling into the Number case below asked ToDouble for the value
+                // of a complex, which has none -- so a complex key threw instead
+                // of hashing.
+                LispComplex cx => Arithmetic.ToDouble(cx.Imaginary) == 0.0
+                    ? Arithmetic.ToDouble(cx.Real).GetHashCode()
+                    : HashCode.Combine(Arithmetic.ToDouble(cx.Real).GetHashCode(),
+                                       Arithmetic.ToDouble(cx.Imaginary).GetHashCode()),
                 Number n => Arithmetic.ToDouble(n).GetHashCode(),
                 Cons c => HashCode.Combine(GetEqualpHash(c.Car, depth - 1), GetEqualpHash(c.Cdr, depth - 1)),
                 LispVector v => v.Length == 0 ? 0 : GetEqualpHash(v.ElementAt(0), depth - 1),

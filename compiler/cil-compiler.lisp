@@ -462,12 +462,18 @@
    in the closure-boundary reset as a single registry entry.")
 (%register-closure-fresh '*cstate* +cstate-empty+)
 
-(defun cstate-with (cstate &rest index-value-pairs)
-  "A copy of CSTATE with each +CS-...+ INDEX set to the following VALUE."
-  (let ((v (copy-seq cstate)))
-    (do ((p index-value-pairs (cddr p)))
-        ((null p) v)
-      (setf (svref v (first p)) (second p)))))
+(defmacro cstate-with (cstate &rest index-value-pairs)
+  "A copy of CSTATE with each +CS-...+ INDEX set to the following VALUE.
+
+   A macro rather than a function taking &REST: every compiled form that binds
+   *CSTATE* goes through here, and the &REST list was a cons per pair on each of
+   them (4% of everything a COMPILE allocates). The pairs are written out at all
+   53 call sites, so the expansion is a straight-line sequence of SETFs."
+  (let ((v (gensym "CS")))
+    `(let ((,v (copy-seq ,cstate)))
+       ,@(loop for (index value) on index-value-pairs by #'cddr
+               collect `(setf (svref ,v ,index) ,value))
+       ,v)))
 
 (defun cstate-fresh-function-body ()
   "The pack a non-closure function body compiles under: everything fresh —
@@ -556,6 +562,30 @@
    call-free loops pay nothing per iteration — at the cost of that loop being
    unstoppable by Ctrl-C."
   (svref *cstate* +cs-no-safepoint+))
+
+(defvar *optimize-debug* 1
+  "The DEBUG quality in force for the code being compiled, from
+   (declaim (optimize (debug N))). 0 means a compiled function records no
+   debugger frame: the push is per call and cannot be made cheaper (measured;
+   see the decision record), so the only way not to pay it is not to ask for it.
+   Anything else keeps today's behaviour.")
+
+(defun body-declares-debug-0-p (body)
+  "T when BODY's leading declarations include (optimize ... (debug 0) ...).
+   Docstrings may precede or interleave with the declarations."
+  (loop for form in body
+        while (or (stringp form)
+                  (and (consp form) (eq (car form) 'declare)))
+        thereis (and (consp form) (eq (car form) 'declare)
+                     (loop for d in (cdr form)
+                           thereis (and (consp d)
+                                        (eq (car d) 'optimize)
+                                        (member '(debug 0) (cdr d)
+                                                :test #'equal))))))
+
+(defun debug-frames-off-p (body)
+  "T when the function being compiled from BODY should record no debugger frame."
+  (or (eql *optimize-debug* 0) (body-declares-debug-0-p body)))
 
 (defun body-declares-safety-0-p (body)
   "T when BODY's leading declarations include (optimize ... (safety 0) ...).
@@ -861,26 +891,20 @@ through to compile-sym-lookup."
       (when fn (funcall fn sym)))))
 
 (defun special-var-p (sym)
-  "Check if a symbol is a special (dynamic) variable (includes locally declared specials)."
+  "Check if a symbol is a special (dynamic) variable (includes locally declared specials).
+   Matching is by symbol identity. Specialness belongs to the symbol, so a
+   DEFVAR of FOO in one package must not make another package's FOO special."
   (unless (symbolp sym) (return-from special-var-p nil))
   (or (member sym *specials*)
-      (member (symbol-name sym) *specials* :key #'symbol-name :test #'string=)
       (%runtime-special-p sym)))
 
 (defun global-special-p (sym)
   "Check if a symbol is GLOBALLY special (via defvar/defparameter/proclaim).
-   Used for binding classification: only globally special vars force nested let bindings dynamic."
+   Used for binding classification: only globally special vars force nested let bindings dynamic.
+   By symbol identity, as in SPECIAL-VAR-P."
   (unless (symbolp sym) (return-from global-special-p nil))
   (or (member sym *global-specials*)
-      (member (symbol-name sym) *global-specials* :key #'symbol-name :test #'string=)
       (%runtime-special-p sym)))
-
-(defun global-special-name-p (name)
-  "Name-based (string) variant of GLOBAL-SPECIAL-P. Free-variable analysis
-   collects symbol-name strings, so closure capture uses this to skip globally
-   special vars — those are read dynamically (DynamicBindings.Get), not captured
-   into the closure env."
-  (member name *global-specials* :key #'symbol-name :test #'string=))
 
 (defun same-var-package-p (k sym-pkg)
   "Return (var-name k) if K's package is compatible with SYM-PKG for
@@ -1034,6 +1058,28 @@ through to compile-sym-lookup."
                      (cdr symbol))))
     (t (symbol-name symbol))))
 
+(defun constant-binding-name-p (name)
+  "True when NAME may not be bound as a variable. CLHS 3.1.2.1.1.3: naming a
+   constant variable in any binding form is a program error, and that includes
+   NIL and T (which are constants). One predicate so every binding site --
+   LET/LET*, lambda lists, DO, DOLIST, MULTIPLE-VALUE-BIND, handler-case
+   clauses -- agrees on the answer; the previous state was that assignment was
+   checked (SETQ/SET) and binding was not, so (let ((t 1)) t) quietly returned 1."
+  ;; CONSTANTP, not SYMBOL-CONSTANT-P: on a symbol the two agree (dotcl's
+   ;; CONSTANTP delegates to it, adding NIL/T/keywords), and CONSTANTP is the
+   ;; one that also exists in the host SBCL this function runs in during
+   ;; cross-compilation.
+  (and (symbolp name) (constantp name)))
+
+(defun check-binding-name (name context)
+  "Signal PROGRAM-ERROR if NAME cannot be bound as a variable. CONTEXT names the
+   binding form for the message."
+  (when (constant-binding-name-p name)
+    (error 'program-error
+           :format-control "~a: ~s is a constant and cannot be bound as a variable"
+           :format-arguments (list context name)))
+  name)
+
 (defun parse-lambda-list (params)
   "Parse lambda list → (values required optional key rest-param aux allow-other-keys-p has-key-p).
    &body is treated as &rest. rest-param is NIL if no variadic.
@@ -1054,13 +1100,17 @@ through to compile-sym-lookup."
         ((eq p '&aux) (setf state :aux))
         ((eq state :aux)
          (if (consp p)
-             (push (list (car p) (cadr p)) aux)
-             (push (list p nil) aux)))
-        ((eq state :required) (push p required))
+             (push (list (check-binding-name (car p) "lambda list") (cadr p)) aux)
+             (push (list (check-binding-name p "lambda list") nil) aux)))
+        ((eq state :required) (push (check-binding-name p "lambda list") required))
         ((eq state :optional)
          (if (consp p)
-             (push (list (car p) (cadr p) (caddr p)) optional)
-             (push (list p nil nil) optional)))
+             (progn
+               (when (cddr p) (check-binding-name (caddr p) "lambda list"))
+               (push (list (check-binding-name (car p) "lambda list")
+                           (cadr p) (caddr p))
+                     optional))
+             (push (list (check-binding-name p "lambda list") nil nil) optional)))
         ((eq state :key)
          (if (consp p)
              (let* ((spec (car p))
@@ -1073,9 +1123,13 @@ through to compile-sym-lookup."
                                  (if pkg (package-name pkg) ""))))
                     (default (cadr p))
                     (supplied-p (caddr p)))
+               (check-binding-name var-name "lambda list")
+               (when (cddr p) (check-binding-name supplied-p "lambda list"))
                (push (list key-name var-name default supplied-p key-pkg) key))
-             (push (list (symbol-name p) p nil nil nil) key)))
-        ((eq state :rest) (setf rest-param p) (setf state :done))))
+             (push (list (symbol-name p) (check-binding-name p "lambda list") nil nil nil) key)))
+        ((eq state :rest)
+         (setf rest-param (check-binding-name p "lambda list"))
+         (setf state :done))))
     (values (nreverse required) (nreverse optional) (nreverse key) rest-param (nreverse aux) allow-other-keys-p has-key-p)))
 
 (defun %check-lambda-call-keywords (op args)
@@ -2148,9 +2202,16 @@ through to compile-sym-lookup."
 
 (defun numeric-array-aref-entry (expr)
   "If EXPR is (aref V IDX...) on a proven numeric-backed local with matching
-   rank and fixnum-typed indices, return the info tail: (RANK LO . HI) for
-   integer backing, or (RANK . :single/:double) for float backing; else NIL.
-   numeric-array-aref-info / -float-kind split this by backing."
+   rank, return the info tail: (RANK LO . HI) for integer backing, or
+   (RANK . :single/:double) for float backing; else NIL.
+   numeric-array-aref-info / -float-kind split this by backing.
+
+   The subscripts are not required to be statically fixnum-typed: what this
+   answers is how the ELEMENT is stored, which does not depend on them
+   (COMPILE-INDEX-TO-LONG lowers a subscript of any shape). Requiring it cost
+   the whole unboxed path whenever a loop counter carried no declaration —
+   fft's inner loops are (DO ((I J (+ I LE))) ...), and every element they
+   touched was boxed."
   (and (consp expr)
        (eq (car expr) 'aref)
        (not (local-function-entry 'aref))
@@ -2164,7 +2225,6 @@ through to compile-sym-lookup."
               (eq (lookup-local v) (second entry))
               (not (boxed-var-p v))
               (= (length idxs) (third entry))
-              (every #'fixnum-typed-p idxs)
               (cddr entry)))))
 
 (defun numeric-array-aref-info (expr)
@@ -2269,10 +2329,26 @@ through to compile-sym-lookup."
      (cons +int64-min+ +int64-max+))
     (t nil)))
 
+(defun fold-nary-arith (expr)
+  "(+ a b c) as (+ (+ a b) c), and the same for - and *; anything else unchanged.
+   The three places that decide whether an integer expression can be computed in
+   raw int64 — FIXNUM-TYPED-P, EXPR-INT-RANGE and COMPILE-AS-LONG — each match a
+   two-argument call, so a three-argument one fell off the native path entirely.
+   The cost was not the arithmetic but what it disqualified: an index like
+   (- n i 1) made the whole AREF take the generic path, so reading from a
+   specialized array boxed its element (24 B a read, e.g. every element copy in
+   the fft benchmark). Left-associating is what the n-ary call means (CLHS 12.2),
+   and evaluation stays left to right."
+  (if (and (consp expr) (member (car expr) '(+ - *)) (> (length expr) 3))
+      (let ((op (car expr)))
+        (reduce (lambda (a b) (list op a b)) (cdr expr)))
+      expr))
+
 (defun expr-int-range (expr)
   "Provable inclusive integer range (lo . hi) for EXPR computed entirely within
    int64, or NIL if unknown or any intermediate +/-/*/1+/1- result could exceed
    int64. Used to gate the raw unboxed arithmetic path."
+  (let ((expr (fold-nary-arith expr)))
   (cond
     ((integerp expr) (cons expr expr))
     ((and (consp expr) (= (length expr) 3) (member (car expr) '(+ - *)))
@@ -2286,7 +2362,7 @@ through to compile-sym-lookup."
        (and ra
             (let ((r (range-arith (if (eq (car expr) '1+) '+ '-) ra '(1 . 1))))
               (and (range-fits-int64-p r) r)))))
-    (t (fixnum-leaf-range expr))))
+    (t (fixnum-leaf-range expr)))))
 
 (defun fixnum-arith-unboxed-safe-p (expr)
   "True when the BOXED fixnum fast path may compute EXPR with raw int64 ops and box
@@ -2341,6 +2417,11 @@ through to compile-sym-lookup."
           (fixnum-typed-p (cadr expr))
           (fixnum-typed-p (caddr expr)))
      t)
+    ;; Three or more arguments: the same question about the left-associated form
+    ;; the call stands for. Without this an index like (- n i 1) is not fixnum-
+    ;; typed, which disqualifies the whole AREF from the native path.
+    ((and (consp expr) (member (car expr) '(+ - *)) (> (length expr) 3))
+     (fixnum-typed-p (fold-nary-arith expr)))
     ((and (consp expr) (= (length expr) 2)
           (member (car expr) '(1+ 1-))
           (fixnum-typed-p (cadr expr)))
@@ -2354,6 +2435,12 @@ through to compile-sym-lookup."
     ;; logand/logior/logxor with fixnum operands → fixnum result
     ((and (consp expr) (= (length expr) 3)
           (member (car expr) '(logand logior logxor))
+          (fixnum-typed-p (cadr expr))
+          (fixnum-typed-p (caddr expr)))
+     t)
+    ;; mod/rem of fixnums → fixnum result (|r| < |divisor|, so no promotion)
+    ((and (consp expr) (= (length expr) 3)
+          (member (car expr) '(mod rem))
           (fixnum-typed-p (cadr expr))
           (fixnum-typed-p (caddr expr)))
      t)
@@ -2504,6 +2591,10 @@ through to compile-sym-lookup."
     ((and (consp expr) (= (length expr) 3) (member (car expr) '(+ - *)))
      (let ((op (ecase (car expr) (+ :add) (- :sub) (* :mul))))
        (compile-long-binop op (cadr expr) (caddr expr))))
+    ;; Three or more arguments: emit the left-associated form the call stands for
+    ;; (FIXNUM-TYPED-P accepts it on the same reading).
+    ((and (consp expr) (member (car expr) '(+ - *)) (> (length expr) 3))
+     (compile-as-long (fold-nary-arith expr)))
     ((and (consp expr) (= (length expr) 2) (eq (car expr) '1+))
      `(,@(compile-as-long (cadr expr))
        (:ldc-i8 1)
@@ -2518,6 +2609,12 @@ through to compile-sym-lookup."
      `(,@(compile-as-long (cadr expr))
        (:ldc-i8 1)
        (:add)))
+    ;; mod/rem — leaves int64 on stack. The helpers carry CL's sign rules
+    ;; (MOD follows the divisor, REM truncates); a raw CIL :rem would give REM's
+    ;; answer for both.
+    ((and (consp expr) (= (length expr) 3) (member (car expr) '(mod rem)))
+     `(,@(compile-long-binop-spilled (cadr expr) (caddr expr))
+       (:call ,(if (eq (car expr) 'mod) "Runtime.ModFixnumL" "Runtime.RemFixnumL"))))
     ;; Bitwise ops — leaves int64 on stack (callers box if needed)
     ((and (consp expr) (= (length expr) 3) (member (car expr) '(logand logior logxor)))
      (let ((op (ecase (car expr) (logand :and) (logior :or) (logxor :xor))))
@@ -2549,18 +2646,62 @@ through to compile-sym-lookup."
            (compile-expr expr))
        (:unbox-fixnum)))))
 
+(defun checked-long-arith-p (expr)
+  "True for +/-/* (two operands after folding) or 1+/1- whose operands can all be
+   produced as raw int64. Such an expression can be computed natively with an
+   overflow CHECK even when no range proof exists — the destination is an Int64
+   slot, so a result that overflows has nowhere to go and must signal either way."
+  (let ((expr (fold-nary-arith expr)))
+    (and (consp expr)
+         (or (and (member (car expr) '(+ - *)) (= (length expr) 3)
+                  (fixnum-typed-p (cadr expr)) (fixnum-typed-p (caddr expr)))
+             (and (member (car expr) '(1+ 1-)) (= (length expr) 2)
+                  (fixnum-typed-p (cadr expr)))))))
+
+(defun compile-checked-long-arith (expr)
+  "EXPR as a raw int64, checking for overflow rather than proving it away."
+  (let* ((expr (fold-nary-arith expr))
+         (op (car expr))
+         (helper (ecase op
+                   ((+ 1+) "Runtime.AddFixnumChecked")
+                   ((- 1-) "Runtime.SubtractFixnumChecked")
+                   (* "Runtime.MultiplyFixnumChecked"))))
+    (if (member op '(1+ 1-))
+        `(,@(compile-as-long (cadr expr)) (:ldc-i8 1) (:call ,helper))
+        `(,@(compile-long-binop-spilled (cadr expr) (caddr expr)) (:call ,helper)))))
+
 (defun compile-expr-to-long (expr)
   "Compile EXPR leaving a raw int64 on the stack, without risking silent wrap:
    the raw long path (compile-as-long) is taken only when a value-range proof
-   shows every intermediate fits int64. Otherwise the expression is evaluated
-   boxed on the generic promoting path and unboxed — a declaration-violating
-   bignum then signals (InvalidCast) instead of wrapping. Used to initialize
-   and assign Int64-slot locals."
-  (if (fixnum-arith-unboxed-safe-p expr)
-      (compile-as-long expr)
+   shows every intermediate fits int64. Failing that, arithmetic whose operands
+   are themselves raw goes native with an overflow check — the range proof can
+   never succeed for FIXNUM + FIXNUM (that spans one bit more than int64), so
+   without this every (SETQ ACC (+ ACC X)) in a declared-fixnum loop boxed both
+   operands, called the generic promoting ADD, and unboxed the result. Anything
+   else is evaluated boxed on the generic promoting path and unboxed — a
+   declaration-violating bignum then signals (InvalidCast) instead of wrapping.
+   Used to initialize and assign Int64-slot locals."
+  (cond
+    ((fixnum-arith-unboxed-safe-p expr) (compile-as-long expr))
+    ((checked-long-arith-p expr) (compile-checked-long-arith expr))
+    (t `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
+             (compile-expr expr))
+         (:unbox-fixnum)))))
+
+(defun compile-index-to-long (expr)
+  "Compile an array subscript leaving a raw int64 on the stack. A fixnum-typed
+   subscript lowers natively (COMPILE-EXPR-TO-LONG); anything else is evaluated
+   boxed and converted by Runtime.IndexL, which reports a non-integer subscript
+   the way AREF does — where a bare unbox would surface it as a .NET cast.
+   The unboxed element paths used to demand a statically fixnum-typed subscript,
+   but an element's storage does not depend on the subscript. Requiring it meant
+   an undeclared loop variable — the usual shape, (DO ((I 0 (1+ I))) ...) — boxed
+   every element the loop read."
+  (if (fixnum-typed-p expr)
+      (compile-expr-to-long expr)
       `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
             (compile-expr expr))
-        (:unbox-fixnum))))
+        (:call "Runtime.IndexL"))))
 
 (defun compile-fixnum-binop (args op)
   "Emit native int64 binop, boxing result back to LispObject. All of +/-/*
@@ -2578,6 +2719,13 @@ through to compile-sym-lookup."
   "Emit native int64 bitwise binop (AND/OR/XOR), boxing result back to LispObject."
   `(,@(compile-long-binop-spilled (first args) (second args))
     (,op)
+    (:call "Fixnum.Make")))
+
+(defun compile-fixmod (args op)
+  "Emit native int64 MOD/REM, boxing the result back to LispObject. The result
+   is bounded by the divisor, so it is always a Fixnum -- no promotion check."
+  `(,@(compile-long-binop-spilled (first args) (second args))
+    (:call ,(if (eq op 'mod) "Runtime.ModFixnumL" "Runtime.RemFixnumL"))
     (:call "Fixnum.Make")))
 
 (defun compile-fixbit-not (args)
@@ -2682,6 +2830,12 @@ through to compile-sym-lookup."
    read object already has a definite type, so there is no single/double
    ambiguity — only the reader's choice for an unsuffixed 2.0 was ambiguous,
    and that produces a single-float object here, not a double."
+  ;; A three-argument call means the same thing as nested two-argument ones
+  ;; (CLHS 12.2), but every clause below matches a two-argument call, so
+  ;; (* 2.0d0 z2 aux) was not recognized as double-typed and the enclosing
+  ;; + fell off the native path with it. FOLD-NARY-ARITH is what the integer
+  ;; side already does for the same reason.
+  (let ((expr (fold-nary-arith expr)))
   (cond
     ;; Literal double-float constant — unambiguous (the object is a double).
     ((typep expr 'double-float) t)
@@ -2704,11 +2858,15 @@ through to compile-sym-lookup."
           (double-float-typed-p (cadr expr))
           (double-float-typed-p (caddr expr)))
      t)
+    ;; (abs x) of a double is a double -- same format, no contagion to consider.
+    ((and (consp expr) (= (length expr) 2) (eq (car expr) (quote abs))
+          (double-float-typed-p (cadr expr)))
+     t)
     ;; Unary negate: (- x) where x is double-typed → double.
     ((and (consp expr) (= (length expr) 2) (eq (car expr) '-)
           (double-float-typed-p (cadr expr)))
      t)
-    (t nil)))
+    (t nil))))
 
 (defun float-native-local-kind (sym)
   "If SYM is a lexical local whose slot holds a native float (r8/r4) directly
@@ -2745,6 +2903,9 @@ through to compile-sym-lookup."
 (defun compile-as-double (expr)
   "Compile EXPR leaving a native r8 (double) on the stack.
    Caller must have verified double-float-typed-p."
+  ;; Folded the same way DOUBLE-FLOAT-TYPED-P folds it, so what this walks is
+  ;; the shape that was approved.
+  (let ((expr (fold-nary-arith expr)))
   (cond
     ;; Native r8 slot (double-rep local): the raw double is already in the slot.
     ((eq (float-native-local-kind expr) :double)
@@ -2768,13 +2929,16 @@ through to compile-sym-lookup."
        `(,@(compile-as-double (cadr expr))
          ,@(compile-as-double (caddr expr))
          (,op))))
+    ;; (abs x) → raw magnitude, no box on the way in or out.
+    ((and (consp expr) (= (length expr) 2) (eq (car expr) (quote abs)))
+     `(,@(compile-as-double (cadr expr)) (:call "Math.AbsDouble")))
     ;; Unary negate: (- x) → native r8 neg.
     ((and (consp expr) (= (length expr) 2) (eq (car expr) '-))
      `(,@(compile-as-double (cadr expr)) (:neg)))
     (t
      `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
            (compile-expr expr))
-       (:unbox-double)))))
+       (:unbox-double))))))
 
 (defun compile-double-binop (args op)
   "Emit: compile-as-double a, compile-as-double b, <op>, newobj DoubleFloat."
@@ -2785,13 +2949,19 @@ through to compile-sym-lookup."
 
 (defun compile-double-cmp (args op)
   "Emit native r8 comparison. OP is :lt :le :gt :ge :eq :ne.
-   Leaves an i4 (0 or 1) on stack."
+   Leaves an i4 (0 or 1) on stack.
+
+   NaN is unordered: <, >, <= and >= are all false against it, and only /= is
+   true. <= and >= therefore negate the UNORDERED comparison (cgt.un/clt.un),
+   which is true when the operands are unordered, so the negation is false --
+   negating the ordered form answered true for a NaN, which is how a declared
+   DOUBLE-FLOAT comparison came to disagree with the same comparison undeclared."
   (let ((body (ecase op
-                (:lt '((:clt)))
-                (:gt '((:cgt)))
-                (:eq '((:ceq)))
-                (:le '((:cgt) (:ldc-i4 0) (:ceq)))
-                (:ge '((:clt) (:ldc-i4 0) (:ceq)))
+                (:lt (quote ((:clt))))
+                (:gt (quote ((:cgt))))
+                (:eq (quote ((:ceq))))
+                (:le (quote ((:cgt-un) (:ldc-i4 0) (:ceq))))
+                (:ge (quote ((:clt-un) (:ldc-i4 0) (:ceq))))
                 (:ne '((:ceq) (:ldc-i4 0) (:ceq))))))
     `(,@(compile-as-double (first args))
       ,@(compile-as-double (second args))
@@ -3075,6 +3245,9 @@ through to compile-sym-lookup."
    whose operands are themselves single-float-typed. A literal single-float
    object (e.g. 2.0f0, or 2.0 under the default read format) is recognized;
    its type is already definite."
+  ;; See DOUBLE-FLOAT-TYPED-P: a three-argument call means nested two-argument
+  ;; ones, and every clause below matches only the two-argument shape.
+  (let ((expr (fold-nary-arith expr)))
   (cond
     ;; Literal single-float constant — unambiguous (the object is a single).
     ((typep expr 'single-float) t)
@@ -3097,15 +3270,21 @@ through to compile-sym-lookup."
           (single-float-typed-p (cadr expr))
           (single-float-typed-p (caddr expr)))
      t)
+    ;; (abs x) of a single is a single.
+    ((and (consp expr) (= (length expr) 2) (eq (car expr) (quote abs))
+          (single-float-typed-p (cadr expr)))
+     t)
     ;; Unary negate: (- x) where x is single-typed → single.
     ((and (consp expr) (= (length expr) 2) (eq (car expr) '-)
           (single-float-typed-p (cadr expr)))
      t)
-    (t nil)))
+    (t nil))))
 
 (defun compile-as-single (expr)
   "Compile EXPR leaving a native r4 (float) on the stack.
    Caller must have verified single-float-typed-p."
+  ;; Folded the same way SINGLE-FLOAT-TYPED-P folds it.
+  (let ((expr (fold-nary-arith expr)))
   (cond
     ;; Native r4 slot (single-rep local): the raw float is already in the slot.
     ((eq (float-native-local-kind expr) :single)
@@ -3131,13 +3310,16 @@ through to compile-sym-lookup."
        `(,@(compile-as-single (cadr expr))
          ,@(compile-as-single (caddr expr))
          (,op))))
+    ;; (abs x) → raw magnitude, no box on the way in or out.
+    ((and (consp expr) (= (length expr) 2) (eq (car expr) (quote abs)))
+     `(,@(compile-as-single (cadr expr)) (:conv-r4) (:call "Math.AbsSingle")))
     ;; Unary negate: (- x) → native r4 neg.
     ((and (consp expr) (= (length expr) 2) (eq (car expr) '-))
      `(,@(compile-as-single (cadr expr)) (:neg)))
     (t
      `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
            (compile-expr expr))
-       (:unbox-single)))))
+       (:unbox-single))))))
 
 (defun compile-single-binop (args op)
   "Emit: compile-as-single a, compile-as-single b, <op>, conv.r4, newobj SingleFloat."
@@ -3149,13 +3331,15 @@ through to compile-sym-lookup."
 
 (defun compile-single-cmp (args op)
   "Emit native r4 comparison. OP is :lt :le :gt :ge :eq :ne.
-   Leaves an i4 (0 or 1) on stack."
+   Leaves an i4 (0 or 1) on stack.
+
+   See COMPILE-DOUBLE-CMP for why <= and >= negate the unordered comparison."
   (let ((body (ecase op
-                (:lt '((:clt)))
-                (:gt '((:cgt)))
-                (:eq '((:ceq)))
-                (:le '((:cgt) (:ldc-i4 0) (:ceq)))
-                (:ge '((:clt) (:ldc-i4 0) (:ceq)))
+                (:lt (quote ((:clt))))
+                (:gt (quote ((:cgt))))
+                (:eq (quote ((:ceq))))
+                (:le (quote ((:cgt-un) (:ldc-i4 0) (:ceq))))
+                (:ge (quote ((:clt-un) (:ldc-i4 0) (:ceq))))
                 (:ne '((:ceq) (:ldc-i4 0) (:ceq))))))
     `(,@(compile-as-single (first args))
       ,@(compile-as-single (second args))
@@ -3490,14 +3674,14 @@ through to compile-sym-lookup."
     (if (every #'simple-expr-p idxs)
         `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
               (compile-expr arr))
-          ,@(loop for idx in idxs append (compile-expr-to-long idx))
+          ,@(loop for idx in idxs append (compile-index-to-long idx))
           (:call ,method))
         (let ((idx-tmps (mapcar (lambda (i) (declare (ignore i)) (gen-local "NAI"))
                                 idxs)))
           `(,@(mapcar (lambda (tk) `(:declare-local ,tk "Int64")) idx-tmps)
             ,@(loop for idx in idxs
                     for tk in idx-tmps
-                    append `(,@(compile-expr-to-long idx) (:stloc ,tk)))
+                    append `(,@(compile-index-to-long idx) (:stloc ,tk)))
             ,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
                 (compile-expr arr))
             ,@(mapcar (lambda (tk) `(:ldloc ,tk)) idx-tmps)
@@ -3515,7 +3699,7 @@ through to compile-sym-lookup."
     (if (and (every #'simple-expr-p idxs) (simple-expr-p val))
         `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
               (compile-expr arr))
-          ,@(loop for idx in idxs append (compile-expr-to-long idx))
+          ,@(loop for idx in idxs append (compile-index-to-long idx))
           ,@(compile-expr-to-long val)
           (:call ,method)
           (:call "Fixnum.Make"))
@@ -3526,7 +3710,7 @@ through to compile-sym-lookup."
             (:declare-local ,val-tmp "Int64")
             ,@(loop for idx in idxs
                     for tk in idx-tmps
-                    append `(,@(compile-expr-to-long idx) (:stloc ,tk)))
+                    append `(,@(compile-index-to-long idx) (:stloc ,tk)))
             ,@(compile-expr-to-long val)
             (:stloc ,val-tmp)
             ,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
@@ -3548,14 +3732,14 @@ through to compile-sym-lookup."
     (if (every #'simple-expr-p idxs)
         `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
               (compile-expr arr))
-          ,@(loop for idx in idxs append (compile-expr-to-long idx))
+          ,@(loop for idx in idxs append (compile-index-to-long idx))
           (:call ,method))
         (let ((idx-tmps (mapcar (lambda (i) (declare (ignore i)) (gen-local "NAI"))
                                 idxs)))
           `(,@(mapcar (lambda (tk) `(:declare-local ,tk "Int64")) idx-tmps)
             ,@(loop for idx in idxs
                     for tk in idx-tmps
-                    append `(,@(compile-expr-to-long idx) (:stloc ,tk)))
+                    append `(,@(compile-index-to-long idx) (:stloc ,tk)))
             ,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
                 (compile-expr arr))
             ,@(mapcar (lambda (tk) `(:ldloc ,tk)) idx-tmps)
@@ -3580,7 +3764,7 @@ through to compile-sym-lookup."
       (if (and (every #'simple-expr-p idxs) (simple-expr-p val))
           `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
                 (compile-expr arr))
-            ,@(loop for idx in idxs append (compile-expr-to-long idx))
+            ,@(loop for idx in idxs append (compile-index-to-long idx))
             ,@(val-as-double)
             (:call ,method)
             ,@box)
@@ -3591,7 +3775,7 @@ through to compile-sym-lookup."
               (:declare-local ,val-tmp "Double")
               ,@(loop for idx in idxs
                       for tk in idx-tmps
-                      append `(,@(compile-expr-to-long idx) (:stloc ,tk)))
+                      append `(,@(compile-index-to-long idx) (:stloc ,tk)))
               ,@(val-as-double)
               (:stloc ,val-tmp)
               ,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
@@ -3635,8 +3819,16 @@ through to compile-sym-lookup."
     (:call "Runtime.Puthash")))
 
 (defun compile-values-call (args)
-  `(,@(compile-args-array args)
-    (:call "Runtime.Values")))
+  (cond
+    ;; (values) — a shared marker, no array and no wrapper to build.
+    ((null args) '((:call "MultipleValues.Values0")))
+    ;; Two values: the shape TRUNCATE, FLOOR, ROUND, GETHASH and INTERN return, and
+    ;; the one the argument array cost the most on (40 of the 64 bytes a
+    ;; multiple-value return allocated). RUNTIME.VALUES2 takes them as arguments.
+    ((= (length args) 2)
+     `(,@(compile-binary-call args "Runtime.Values2")))
+    (t `(,@(compile-args-array args)
+         (:call "Runtime.Values")))))
 
 (defun compile-subseq (args)
   "Compile (subseq seq start &optional end)."

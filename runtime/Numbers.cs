@@ -5,7 +5,7 @@ namespace DotCL;
 
 public abstract class Number : LispObject { }
 
-public class Fixnum : Number
+public sealed class Fixnum : Number
 {
     public long Value { get; }
 
@@ -38,7 +38,7 @@ public class Fixnum : Number
     public override int GetHashCode() => Value.GetHashCode();
 }
 
-public class Bignum : Number
+public sealed class Bignum : Number
 {
     public BigInteger Value { get; }
 
@@ -63,7 +63,7 @@ public class Bignum : Number
     public override int GetHashCode() => Value.GetHashCode();
 }
 
-public class Ratio : Number
+public sealed class Ratio : Number
 {
     public BigInteger Numerator { get; }
     public BigInteger Denominator { get; }
@@ -79,6 +79,12 @@ public class Ratio : Number
     {
         if (den == 0) throw new DivideByZeroException("Division by zero");
         if (den < 0) { num = -num; den = -den; }
+        // An integer result needs no reduction. Every exact operation that is not
+        // fixnum-by-fixnum lands here with den = 1 (Arithmetic.Add/Subtract/Multiply
+        // fall through to the rational form), and reducing by GCD 1 still walks the
+        // whole numerator and then divides it twice: BigInteger.op_Division was 43%
+        // of a benchmark whose only operation is multiplication.
+        if (den.IsOne) return Bignum.MakeInteger(num);
         var gcd = BigInteger.GreatestCommonDivisor(BigInteger.Abs(num), den);
         num /= gcd;
         den /= gcd;
@@ -152,7 +158,7 @@ public class LispDecimal : Number
     public override int GetHashCode() => Value.GetHashCode();
 }
 
-public class SingleFloat : Number
+public sealed class SingleFloat : Number
 {
     public float Value { get; }
 
@@ -181,7 +187,7 @@ public class SingleFloat : Number
     public override int GetHashCode() => Value.GetHashCode();
 }
 
-public class DoubleFloat : Number
+public sealed class DoubleFloat : Number
 {
     public double Value { get; }
 
@@ -210,16 +216,30 @@ public class DoubleFloat : Number
     public override int GetHashCode() => Value.GetHashCode();
 }
 
-public class LispComplex : Number
+/// <summary>
+/// A complex number. Two representations, one meaning: DoubleComplex keeps the
+/// parts as raw doubles, BoxedComplex keeps them as Number objects.
+///
+/// Complex arithmetic over doubles is the common case and it used to cost three
+/// objects per operation -- the complex plus a DoubleFloat for each part -- where
+/// one is enough. Which representation a value gets is decided once, in OF: every
+/// double/double pair becomes a DoubleComplex, so the two never describe the same
+/// value and nothing has to compare across them.
+/// </summary>
+public abstract class LispComplex : Number
 {
-    public Number Real { get; }
-    public Number Imaginary { get; }
+    public abstract Number Real { get; }
+    public abstract Number Imaginary { get; }
 
-    public LispComplex(Number real, Number imaginary)
-    {
-        Real = real;
-        Imaginary = imaginary;
-    }
+    /// <summary>The complex with these parts, in whichever representation fits.
+    /// Every construction goes through here (or through OfDoubles).</summary>
+    public static LispComplex Of(Number real, Number imaginary) =>
+        real is DoubleFloat dr && imaginary is DoubleFloat di
+            ? new DoubleComplex(dr.Value, di.Value)
+            : new BoxedComplex(real, imaginary);
+
+    public static LispComplex OfDoubles(double real, double imaginary) =>
+        new DoubleComplex(real, imaginary);
 
     public override string ToString() => $"#C({Real} {Imaginary})";
 
@@ -227,4 +247,38 @@ public class LispComplex : Number
         obj is LispComplex other && Real.Equals(other.Real) && Imaginary.Equals(other.Imaginary);
 
     public override int GetHashCode() => HashCode.Combine(Real, Imaginary);
+}
+
+/// <summary>Both parts double: the values live in the object, unboxed.</summary>
+public sealed class DoubleComplex : LispComplex
+{
+    public readonly double RealValue;
+    public readonly double ImagValue;
+
+    public DoubleComplex(double real, double imaginary)
+    {
+        RealValue = real;
+        ImagValue = imaginary;
+    }
+
+    // Each read boxes. Arithmetic on complex doubles reads the fields instead,
+    // which is the point of this class.
+    public override Number Real => new DoubleFloat(RealValue);
+    public override Number Imaginary => new DoubleFloat(ImagValue);
+}
+
+/// <summary>Anything else: rational parts, single floats, mixed exact values.</summary>
+public sealed class BoxedComplex : LispComplex
+{
+    private readonly Number _real;
+    private readonly Number _imaginary;
+
+    public BoxedComplex(Number real, Number imaginary)
+    {
+        _real = real;
+        _imaginary = imaginary;
+    }
+
+    public override Number Real => _real;
+    public override Number Imaginary => _imaginary;
 }

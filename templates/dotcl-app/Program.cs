@@ -5,4 +5,4 @@ using DotCL;
 DotclHost.Initialize();
 var manifest = Path.Combine(AppContext.BaseDirectory, "dotcl-fasl", "dotcl-deps.txt");
 DotclHost.LoadFromManifest(manifest);
-DotclHost.Call("APP-MAIN");
+DotclHost.Call("APP:APP-MAIN");

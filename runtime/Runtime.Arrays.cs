@@ -152,9 +152,21 @@ public static partial class Runtime
                 fill = Nil.Instance;
             else
                 fill = Nil.Instance;
-            var items = new LispObject[size];
-            for (int j = 0; j < size; j++) items[j] = fill;
-            vec = rank == 1 ? new LispVector(items, elementType) : new LispVector(items, dimArray, elementType);
+            // An element type with packed storage fills that storage directly. Going
+            // through a boxed LispObject[SIZE] first — which the constructor then packs
+            // and drops — costs 8 bytes an element in garbage, four times the array
+            // itself for a (integer 0 1000) one.
+            if (elementType == "BIT" || LispVector.NumKindForElementType(elementType) != 0)
+            {
+                vec = rank == 1 ? new LispVector(size, fill, elementType)
+                                : new LispVector(size, fill, elementType, dimArray);
+            }
+            else
+            {
+                var items = new LispObject[size];
+                for (int j = 0; j < size; j++) items[j] = fill;
+                vec = rank == 1 ? new LispVector(items, elementType) : new LispVector(items, dimArray, elementType);
+            }
         }
 
         if (fillPointer.HasValue)
@@ -896,10 +908,22 @@ public static partial class Runtime
     // inferred element type guarantees the value is a fixnum, and a violation
     // surfaces as a loud InvalidCast rather than a silent wrong value.
 
+    /// <summary>A subscript as a raw long, with the type error CL requires when it is
+    /// not an integer. The compiler uses this where it knows the array's element
+    /// storage -- so the element can be read or written unboxed -- but not that the
+    /// subscript expression is fixnum-typed, which is the ordinary case for an
+    /// undeclared loop variable. A plain castclass would report the violation as a
+    /// .NET InvalidCastException instead, and (AREF A 'X) has to say what AREF says.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static long IndexL(LispObject index)
+        => index is Fixnum f ? f.Value
+           : throw new LispErrorException(new LispTypeError("AREF: index must be integer", index));
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static long ArefNumL(LispObject array, long index)
     {
-        if (array is LispVector v && v._numData != null && v._displacedTo == null
+        if (array is LispVector v && v.IsRawNumKind && v._displacedTo == null
             && v._dimensions == null && (ulong)index < (ulong)v._numLen)
             return v.NumGet((int)index);
         return ((Fixnum)Aref(array, Fixnum.Make(index))).Value;
@@ -908,7 +932,7 @@ public static partial class Runtime
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static long ArefSetNumL(LispObject array, long index, long value)
     {
-        if (array is LispVector v && v._numData != null && v._displacedTo == null
+        if (array is LispVector v && v.IsRawNumKind && v._displacedTo == null
             && v._dimensions == null && (ulong)index < (ulong)v._numLen)
         {
             v.NumSet((int)index, value);
@@ -921,7 +945,7 @@ public static partial class Runtime
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static long ArefNum2DL(LispObject array, long i0, long i1)
     {
-        if (array is LispVector v && v._numData != null && v._displacedTo == null
+        if (array is LispVector v && v.IsRawNumKind && v._displacedTo == null
             && v._dimensions != null && v._dimensions.Length == 2
             && (ulong)i0 < (ulong)v._dimensions[0] && (ulong)i1 < (ulong)v._dimensions[1])
         {
@@ -935,7 +959,7 @@ public static partial class Runtime
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static long ArefSetNum2DL(LispObject array, long i0, long i1, long value)
     {
-        if (array is LispVector v && v._numData != null && v._displacedTo == null
+        if (array is LispVector v && v.IsRawNumKind && v._displacedTo == null
             && v._dimensions != null && v._dimensions.Length == 2
             && (ulong)i0 < (ulong)v._dimensions[0] && (ulong)i1 < (ulong)v._dimensions[1])
         {
@@ -953,7 +977,7 @@ public static partial class Runtime
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static long ArefNum3DL(LispObject array, long i0, long i1, long i2)
     {
-        if (array is LispVector v && v._numData != null && v._displacedTo == null
+        if (array is LispVector v && v.IsRawNumKind && v._displacedTo == null
             && v._dimensions != null && v._dimensions.Length == 3
             && (ulong)i0 < (ulong)v._dimensions[0] && (ulong)i1 < (ulong)v._dimensions[1]
             && (ulong)i2 < (ulong)v._dimensions[2])
@@ -968,7 +992,7 @@ public static partial class Runtime
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static long ArefSetNum3DL(LispObject array, long i0, long i1, long i2, long value)
     {
-        if (array is LispVector v && v._numData != null && v._displacedTo == null
+        if (array is LispVector v && v.IsRawNumKind && v._displacedTo == null
             && v._dimensions != null && v._dimensions.Length == 3
             && (ulong)i0 < (ulong)v._dimensions[0] && (ulong)i1 < (ulong)v._dimensions[1]
             && (ulong)i2 < (ulong)v._dimensions[2])
@@ -1017,7 +1041,7 @@ public static partial class Runtime
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static double ArefNumD(LispObject array, long index)
     {
-        if (array is LispVector v && v._numData != null && v._numKind >= 5
+        if (array is LispVector v && v.IsFloatNumKind
             && v._displacedTo == null && v._dimensions == null
             && (ulong)index < (ulong)v._numLen)
             return v.NumGetF((int)index);
@@ -1027,7 +1051,7 @@ public static partial class Runtime
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static double ArefSetNumD(LispObject array, long index, double value)
     {
-        if (array is LispVector v && v._numData != null && v._numKind >= 5
+        if (array is LispVector v && v.IsFloatNumKind
             && v._displacedTo == null && v._dimensions == null
             && (ulong)index < (ulong)v._numLen)
         {
@@ -1041,7 +1065,7 @@ public static partial class Runtime
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static double ArefNum2DD(LispObject array, long i0, long i1)
     {
-        if (array is LispVector v && v._numData != null && v._numKind >= 5
+        if (array is LispVector v && v.IsFloatNumKind
             && v._displacedTo == null && v._dimensions != null && v._dimensions.Length == 2
             && (ulong)i0 < (ulong)v._dimensions[0] && (ulong)i1 < (ulong)v._dimensions[1])
         {
@@ -1055,7 +1079,7 @@ public static partial class Runtime
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static double ArefSetNum2DD(LispObject array, long i0, long i1, double value)
     {
-        if (array is LispVector v && v._numData != null && v._numKind >= 5
+        if (array is LispVector v && v.IsFloatNumKind
             && v._displacedTo == null && v._dimensions != null && v._dimensions.Length == 2
             && (ulong)i0 < (ulong)v._dimensions[0] && (ulong)i1 < (ulong)v._dimensions[1])
         {
@@ -1073,7 +1097,7 @@ public static partial class Runtime
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static double ArefNum3DD(LispObject array, long i0, long i1, long i2)
     {
-        if (array is LispVector v && v._numData != null && v._numKind >= 5
+        if (array is LispVector v && v.IsFloatNumKind
             && v._displacedTo == null && v._dimensions != null && v._dimensions.Length == 3
             && (ulong)i0 < (ulong)v._dimensions[0] && (ulong)i1 < (ulong)v._dimensions[1]
             && (ulong)i2 < (ulong)v._dimensions[2])
@@ -1088,7 +1112,7 @@ public static partial class Runtime
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static double ArefSetNum3DD(LispObject array, long i0, long i1, long i2, double value)
     {
-        if (array is LispVector v && v._numData != null && v._numKind >= 5
+        if (array is LispVector v && v.IsFloatNumKind
             && v._displacedTo == null && v._dimensions != null && v._dimensions.Length == 3
             && (ulong)i0 < (ulong)v._dimensions[0] && (ulong)i1 < (ulong)v._dimensions[1]
             && (ulong)i2 < (ulong)v._dimensions[2])
@@ -1130,12 +1154,20 @@ public static partial class Runtime
 
     // --- Struct operations ---
 
+    /// <summary>
+    /// Build a structure instance. SLOTS becomes the instance's slot storage, so the
+    /// caller hands it over and must not keep writing to it: every caller builds the
+    /// array for this call and drops it (the compiled %MAKE-STRUCT emits a fresh
+    /// argument array per call, the dynamic entry passes a SubArray, and a C# call
+    /// through the params overload gets a fresh array from the compiler). Copying it
+    /// here instead cost a second array per structure created, which for a two-slot
+    /// structure was a third of the allocation.
+    /// </summary>
     public static LispObject MakeStruct(LispObject typeName, params LispObject[] slots)
     {
         if (typeName is not Symbol sym)
             throw new LispErrorException(new LispTypeError("MAKE-STRUCT: type name must be a symbol", typeName));
-        var result = new LispStruct(sym, (LispObject[])slots.Clone());
-        return result;
+        return new LispStruct(sym, slots);
     }
 
     /// <summary>
@@ -1271,7 +1303,14 @@ public static partial class Runtime
     {
         if (obj is not LispStruct s)
             throw new LispErrorException(new LispTypeError("COPY-STRUCT: not a structure", obj));
-        return new LispStruct(s.TypeName, (LispObject[])s.Slots.Clone());
+        // Array.Clone goes through MemberwiseClone, which is a runtime call that
+        // reads the array's type at run time; allocating and copying is the same
+        // work with none of that. COPY-STRUCTURE of a four-slot structure spent
+        // 0.60 s per 3M copies through Clone and 0.37 s this way.
+        var src = s.Slots;
+        var dst = new LispObject[src.Length];
+        Array.Copy(src, dst, src.Length);
+        return new LispStruct(s.TypeName, dst);
     }
 
 

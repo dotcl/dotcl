@@ -191,25 +191,31 @@
 ;;; Ch.22 FORMAT: ~G (General Floating-Point)
 ;;; ============================================================
 
+;; The exponent marker a float prints with is lower case, so these look for it
+;; with CHAR-EQUAL rather than #\E.
+
 (check "format/~G/F-range"
   ;; 1.5: n=1, dd=6 <= d=7 → use ~F format (no exponent)
   (let ((s (format nil "~G" 1.5)))
-    (assert (not (find #\E s)) () "~G 1.5 should use F format, got ~s" s)))
+    (assert (not (find #\e s :test #'char-equal)) () "~G 1.5 should use F format, got ~s" s)))
 
 (check "format/~G/E-range-small"
-  ;; 0.001: n=-2, dd=9 > d=7 → use ~E format
+  ;; 0.001: n=-2, dd=9 > d=7 → use ~E format. dotcl, SBCL 2.6.6 and ABCL 1.9.3
+  ;; all print an exponent here.
   (let ((s (format nil "~G" 0.001)))
-    (assert (find #\E s) () "~G 0.001 should use E format, got ~s" s)))
+    (assert (find #\e s :test #'char-equal) () "~G 0.001 should use E format, got ~s" s)))
 
-(check "format/~G/E-range-large"
-  ;; 15000000.0: n=8, dd=-1 < 0 → use ~E format
+(check "format/~G/large-uses-F-format"
+  ;; 15000000.0 stays in ~F: dotcl, SBCL 2.6.6 and ABCL 1.9.3 all print
+  ;; "15000000.    ". This test asserted the opposite until the printer was
+  ;; aligned with them; it had been written against dotcl's own output.
   (let ((s (format nil "~G" 15000000.0)))
-    (assert (find #\E s) () "~G 15000000.0 should use E format, got ~s" s)))
+    (assert (not (find #\e s :test #'char-equal)) () "~G 15000000.0 should use F format, got ~s" s)))
 
 (check "format/~G/zero"
   ;; 0.0: n=0, dd=d >= 0 → use ~F format
   (let ((s (format nil "~G" 0.0)))
-    (assert (not (find #\E s)) () "~G 0.0 should use F format, got ~s" s)))
+    (assert (not (find #\e s :test #'char-equal)) () "~G 0.0 should use F format, got ~s" s)))
 
 ;;; ============================================================
 ;;; Ch.22 FORMAT: ~$ (Monetary Floating-Point)

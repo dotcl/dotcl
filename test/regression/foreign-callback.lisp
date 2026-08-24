@@ -93,6 +93,41 @@
     (and (integerp p) (/= p 0)))
   t)
 
+;;; A callback body that ends in a multiple-value form used to kill the call from
+;;; C: the MvReturn has no native representation and reached the argument
+;;; converter as-is, so every invocation raised TargetInvocationException. Only
+;;; one value crosses the boundary, so the extras are dropped and the primary is
+;;; returned -- what every other CL implementation's FFI does.
+;;;
+;;; cffi hits this for every :string-returning callback, because its conversion
+;;; calls FOREIGN-STRING-ALLOC and that returns (values pointer size). Calling
+;;; the pointer through %FFI-CALL-PTR is the same path C takes, and needs no C
+;;; runtime library, so unlike the qsort-style round-trip it runs here.
+(defun %fcb-call (fn arg-types ret-type &rest args)
+  (apply #'dotnet:%ffi-call-ptr
+         (dotnet:make-ffi-callback fn arg-types ret-type)
+         arg-types ret-type args))
+
+(deftest ffi-callback-multiple-values-takes-primary
+  (list (%fcb-call (lambda () (values 1 2)) '() :int)
+        (%fcb-call (lambda (x) (values (* x 2) :extra)) '(:int) :int 21)
+        ;; the cffi :string shape
+        (%fcb-call (lambda () (values 12345 99)) '() :pointer))
+  (1 42 12345))
+
+;;; (VALUES) has no primary; NIL is what the converter then sees.
+(deftest ffi-callback-no-values-is-nil
+  (%fcb-call (lambda () (values)) '() :int)
+  0)
+
+;;; A single value was never broken and must stay put, and a void callback
+;;; ignores whatever the body produced.
+(deftest ffi-callback-single-and-void-unchanged
+  (list (%fcb-call (lambda () 7) '() :int)
+        (%fcb-call (lambda (x) x) '(:int) :int 5)
+        (%fcb-call (lambda () (values 1 2)) '() nil))
+  (7 5 nil))
+
 ;;; --- dotcl:*foreign-callback-propagate* (opt-in) ---
 ;;; Containment keeps a .NET-driven loop alive, but a callback that Lisp itself
 ;;; triggered (a lambda handed to a .NET API) is far easier to debug when the error

@@ -294,6 +294,16 @@ public static class DotclHost
     /// </summary>
     public static void EnsureCore()
     {
+        // Initialize first. It is idempotent and everything below needs the
+        // symbol table; without it the core load reached Startup.Sym on an
+        // uninitialised runtime and died with a NullReferenceException that
+        // named nothing.
+        Initialize();
+        EnsureCoreLoaded();
+    }
+
+    private static void EnsureCoreLoaded()
+    {
         if (_coreLoaded) return;
         var core = FindCore()
             ?? throw new InvalidOperationException(
@@ -405,16 +415,50 @@ public static class DotclHost
     }
 
     /// <summary>
+    /// The package an unqualified name is resolved in, by name. Reads and writes
+    /// the same <c>*PACKAGE*</c> the Lisp side sees, so a host can steer it
+    /// without going through <c>(in-package ...)</c> as a string. Setting it to
+    /// a package that does not exist is an error rather than a silent no-op.
+    /// </summary>
+    public static string CurrentPackage
+    {
+        get
+        {
+            Initialize();
+            return DynamicBindings.Get(Startup.Sym("*PACKAGE*")) is Package p
+                ? p.Name : "COMMON-LISP-USER";
+        }
+        set
+        {
+            Initialize();
+            var pkg = Package.FindPackage(value)
+                ?? throw new InvalidOperationException(
+                    $"DotclHost.CurrentPackage: no package named {value}"
+                    + $"{NameHint(value)}");
+            DynamicBindings.Set(Startup.Sym("*PACKAGE*"), pkg);
+        }
+    }
+
+    /// <summary>
     /// Resolve a function name a host passed in, for <see cref="Call"/>.
     ///
-    /// "PKG:NAME" / "PKG::NAME" names a package explicitly and always wins.
-    /// An unqualified name goes through the normal resolver first (CL and
-    /// dotcl's own packages), and then — only if that found nothing callable —
-    /// through every package that has an fbound symbol of that name. The last
-    /// step is what makes a host call into a Lisp library work: the library's
-    /// entry points live in the library's own package, which the internal
-    /// name-based bridge deliberately does not search. Ambiguity is an error
-    /// rather than a coin flip: the caller is told to qualify the name.
+    /// The string is a SYMBOL NAME, matched exactly -- it is not source text and
+    /// no reader runs over it. "GREET" names what (defun greet ...) defined, and
+    /// "greet" names what (defun |greet| ...) defined. Case folding here would be
+    /// a second, subtly different naming rule beside the reader's: whichever way
+    /// it leaned, one of those two symbols would become unreachable or would
+    /// change meaning the day the other was defined. What a host needs instead is
+    /// to be told what to write, which is what the error below does.
+    ///
+    /// An unqualified name is resolved in <see cref="CurrentPackage"/>, exactly
+    /// as the reader would resolve it there -- inherited symbols included. It is
+    /// NOT searched for across every package: that made a working call start
+    /// failing as ambiguous the day an unrelated library defined the same name,
+    /// and hid which package had answered. A name from elsewhere is written
+    /// "PKG:NAME" (the package name is matched exactly too), or reached by
+    /// setting CurrentPackage. When resolution fails, the packages that do have
+    /// such a function are named in the error, so the convenience survives as a
+    /// diagnostic instead of as a rule.
     /// </summary>
     private static Symbol ResolveCallable(string functionName)
     {
@@ -422,46 +466,85 @@ public static class DotclHost
         if (colon > 0)
         {
             var pkgName = functionName[..colon];
+            bool internalOk = colon + 1 < functionName.Length && functionName[colon + 1] == ':';
             var symName = functionName[colon..].TrimStart(':');
             var pkg = Package.FindPackage(pkgName)
                 ?? throw new InvalidOperationException(
-                    $"DotclHost.Call: no package named {pkgName} (in \"{functionName}\")");
+                    $"DotclHost.Call: no package named {pkgName} (in \"{functionName}\"){NameHint(pkgName)}");
             var (qualified, qualifiedStatus) = pkg.FindSymbol(symName);
             if (qualifiedStatus == SymbolStatus.None)
                 throw new InvalidOperationException(
-                    $"DotclHost.Call: package {pkgName} has no symbol {symName}");
+                    $"DotclHost.Call: package {pkgName} has no symbol {symName}{NameHint(symName)}");
+            // One colon reaches the exported surface, two reach everything --
+            // the same distinction the reader draws, for the same reason: a
+            // package's internals are not part of what it offers.
+            if (!internalOk && qualifiedStatus != SymbolStatus.External)
+                throw new InvalidOperationException(
+                    $"DotclHost.Call: {pkgName} does not export {symName}; "
+                    + $"write \"{pkgName}::{symName}\" to reach it anyway");
             return qualified;
         }
 
-        var sym = Startup.SymFn(functionName);
-        if (sym.Function != null) return sym;
-
-        Symbol? found = null;
-        List<string>? ambiguous = null;
-        foreach (var pkg in Package.AllPackages)
+        var current = DynamicBindings.Get(Startup.Sym("*PACKAGE*")) as Package;
+        if (current != null)
         {
-            var (candidate, status) = pkg.FindSymbol(functionName);
-            // Inherited hits are the same symbol seen through a use-list; only
-            // the home-ish statuses are considered so a symbol counts once.
-            if (status != SymbolStatus.External && status != SymbolStatus.Internal) continue;
-            if (candidate.Function == null) continue;
-            if (found == null || ReferenceEquals(found, candidate)) { found = candidate; continue; }
-            ambiguous ??= new List<string> { $"{found.HomePackage?.Name}::{functionName}" };
-            ambiguous.Add($"{candidate.HomePackage?.Name}::{functionName}");
+            var (sym, status) = current.FindSymbol(functionName);
+            if (status != SymbolStatus.None && sym.Function != null) return sym;
         }
-        if (ambiguous != null)
-            throw new InvalidOperationException(
-                $"DotclHost.Call: {functionName} is ambiguous ({string.Join(", ", ambiguous)}); "
-                + "name the package explicitly, e.g. \"PKG:NAME\"");
-        return found ?? sym;
+        throw new InvalidOperationException(
+            $"DotclHost.Call: no function named {functionName} in "
+            + $"{current?.Name ?? "COMMON-LISP-USER"}{NameHint(functionName)}"
+            + ElsewhereHint(functionName));
     }
 
     /// <summary>
-    /// Call a Lisp function by name with .NET object arguments. The name may be
-    /// package-qualified ("MYLIB:ENTRY"); an unqualified name resolves as
-    /// described on <see cref="ResolveCallable"/>. Each arg is converted via
-    /// <see cref="Runtime.DotNetToLisp"/>; the return is a
-    /// <see cref="LispObject"/>. Use <see cref="LispString.Value"/> etc. to
+    /// The sentence appended when the upcased spelling is the one that exists.
+    /// Nearly every miss here is a host writing the name as it appears in Lisp
+    /// source, where the reader upcased it; saying so costs a line and saves the
+    /// reader of the message a trip through the package system.
+    /// </summary>
+    private static string NameHint(string written)
+    {
+        var upcased = written.ToUpperInvariant();
+        if (upcased == written) return "";
+        bool exists = Package.FindPackage(upcased) != null;
+        if (!exists)
+            foreach (var pkg in Package.AllPackages)
+            {
+                var (_, status) = pkg.FindSymbol(upcased);
+                if (status == SymbolStatus.External || status == SymbolStatus.Internal)
+                { exists = true; break; }
+            }
+        return exists
+            ? $" -- names are matched exactly and \"{upcased}\" does exist "
+              + "(the reader upcases, so a name written lowercase in Lisp source is upcased here)"
+            : "";
+    }
+
+    /// <summary>Packages that do own a function of this exact name, for the
+    /// "not found here" message. Resolution does not consult them.</summary>
+    private static string ElsewhereHint(string functionName)
+    {
+        var owners = new List<string>();
+        foreach (var pkg in Package.AllPackages)
+        {
+            var (candidate, status) = pkg.FindSymbol(functionName);
+            if (status != SymbolStatus.External && status != SymbolStatus.Internal) continue;
+            if (candidate.Function == null) continue;
+            var home = candidate.HomePackage?.Name ?? pkg.Name;
+            if (!owners.Contains(home)) owners.Add(home);
+        }
+        if (owners.Count == 0) return "";
+        return $"; defined in {string.Join(", ", owners)} -- write \"PKG:{functionName}\" "
+             + "or set DotclHost.CurrentPackage";
+    }
+
+    /// <summary>
+    /// Call a Lisp function by name with .NET object arguments. The name is a
+    /// symbol name matched exactly and may be package-qualified ("MYLIB:ENTRY");
+    /// an unqualified name resolves as described on <see cref="ResolveCallable"/>.
+    /// Each arg is converted via <see cref="Runtime.DotNetToLisp"/>; the return is
+    /// a <see cref="LispObject"/>. Use <see cref="LispString.Value"/> etc. to
     /// extract typed results.
     /// </summary>
     public static LispObject Call(string functionName, params object?[] args)
@@ -486,11 +569,6 @@ public static class DotclHost
     /// <see cref="Runtime.DotNetToLisp"/> conversion used on the way in.
     /// </summary>
     public static object? ToClr(LispObject value) => Runtime.LispToDotNetGeneric(value);
-
-    /// <summary>
-    /// Build a Lisp LIST from a .NET sequence, converting each element with the
-    /// same marshalling <see cref="Call"/> applies to arguments.
-    ///
     /// Passing a .NET array or collection straight to <see cref="Call"/> hands
     /// the Lisp side a foreign object, not a sequence — deliberately, so a
     /// byte[] stays the same buffer. This is the explicit way to say "as a Lisp
@@ -659,6 +737,36 @@ public static class DotclHost
         }
     }
 
+    /// <summary>Lisp preamble shared by the build forms: resolve the root system
+    /// of the .asd the build was pointed at, and refuse to build a different one
+    /// that merely shares its name.
+    ///
+    /// ASDF looks systems up by NAME. The build says "compile this file", loads
+    /// it with LOAD-ASD, and then asks FIND-SYSTEM for the name — at which point
+    /// any other .asd of the same name that ASDF can see (its source registry
+    /// scans whole trees) can answer instead, and the build compiles someone
+    /// else's sources without a word. That is not hypothetical: the in-tree
+    /// project-compose fixture is named DotclApp, so is templates/dotcl-app, and
+    /// the build silently produced the template's code.</summary>
+    /// <summary>Evaluate a Lisp source string for its side effects.</summary>
+    private static void EvalLisp(string source) =>
+        Runtime.Eval(MultipleValues.Primary(
+            Runtime.ReadFromString(new LispObject[] { new LispString(source) })));
+
+    private const string RootSystemHelper = @"
+(defun %root-system-of (asd)
+  (flet ((norm (p) (and p (substitute #\/ #\\ (namestring p)))))
+    (let* ((want (norm (truename (pathname asd))))
+           (sys  (asdf:find-system (pathname-name (pathname asd))))
+           (got  (norm (ignore-errors (truename (asdf:system-source-file sys))))))
+      (unless (and got (string-equal got want))
+        (error ""~a defines system ~s, but that name resolves to ~a.~%~
+                Two .asd files in reach of this build define the same system; ~
+                rename one, or keep the other out of the search path.""
+               want (asdf:component-name sys) (or got ""an unknown file"")))
+      sys)))
+";
+
     /// <summary>
     /// Register each user-declared external system directory (the
     /// &lt;DotclAsdSearchPath&gt; items) onto <c>asdf:*central-registry*</c> so the
@@ -723,6 +831,7 @@ public static class DotclHost
         // and side-effects *central-registry* with shipped contrib subdirs.
         Runtime.Eval(MultipleValues.Primary(
             Runtime.ReadFromString(new LispObject[] { new LispString("(require \"asdf\")") })));
+        EvalLisp(RootSystemHelper);
 
         // MSBuild path (manifest to a file): route ASDF's compile cache under
         // obj/ so `dotnet clean` clears it (dotcl/dotcl#53). CLI resolve-deps to
@@ -787,7 +896,18 @@ public static class DotclHost
                  ;; system, returning nil when a :feature condition is unmet. Using
                  ;; asdf:find-system directly returned nil for (:feature ...) forms,
                  ;; dropping those deps from the manifest (e.g. micros' dotcl-thread).
-                 (let ((ds (ignore-errors (asdf/find-component:resolve-dependency-spec sys d))))
+                 ;;
+                 ;; NIL and an error mean different things and used to be handled
+                 ;; the same (ignore-errors, skip): NIL is ""this dependency does
+                 ;; not apply here"", an error is ""this dependency was declared and
+                 ;; cannot be found"". Swallowing the second wrote a manifest that
+                 ;; silently lacked the system, so the build succeeded and the
+                 ;; application failed later, where nothing points back here.
+                 (let ((ds (handler-case
+                               (asdf/find-component:resolve-dependency-spec sys d)
+                             (error (e)
+                               (error ""resolve-deps: ~a depends on ~s, which cannot be found: ~a""
+                                      (asdf:component-name sys) d e)))))
                    (when ds (walk ds))))
                (push sys order)))
            (ensure-fasl (sys)
@@ -814,8 +934,7 @@ public static class DotclHost
                      (dotcl.cil-compiler:compile-file-concatenated concat fasl))))
                fasl)))
     (asdf:load-asd ""{asdLisp}"")
-    (let* ((root (asdf:find-system
-                   (pathname-name (pathname ""{asdLisp}""))))
+    (let* ((root (%root-system-of ""{asdLisp}""))
            (deps (remove root (nreverse (progn (walk root) order)))))
       (let ((stream {manifestForm}))
         (unwind-protect
@@ -873,6 +992,7 @@ public static class DotclHost
         Runtime.Eval(MultipleValues.Primary(
             Runtime.ReadFromString(new LispObject[] { new LispString("(require \"asdf\")") })));
 
+        EvalLisp(RootSystemHelper);
         // Route ASDF's compile cache under obj/ so `dotnet clean` clears it and a
         // stale user-cache fasl can't shadow a regenerated source (dotcl/dotcl#53).
         RedirectAsdfOutput(System.IO.Path.Combine(outDir ?? ".", "asdf-cache"));
@@ -894,8 +1014,7 @@ public static class DotclHost
         var setupForm = $@"
 (progn
   (asdf:load-asd ""{asdLisp}"")
-  (let* ((root (asdf:find-system
-                 (pathname-name (pathname ""{asdLisp}""))))
+  (let* ((root (%root-system-of ""{asdLisp}""))
          (sources (mapcar #'asdf:component-pathname
                           (asdf:component-children root))))
     ;; Load the resolved :depends-on fasls into the image BEFORE compiling the

@@ -25,7 +25,7 @@ public sealed class LispBox
     public LispBox(LispObject value) { Value = value; }
 }
 
-public class Cons : LispObject
+public sealed class Cons : LispObject
 {
     public LispObject Car { get; set; }
     public LispObject Cdr { get; set; }
@@ -64,14 +64,14 @@ public class Cons : LispObject
     }
 }
 
-public class Nil : LispObject
+public sealed class Nil : LispObject
 {
     public static readonly Nil Instance = new Nil();
     private Nil() { }
     public override string ToString() => "NIL";
 }
 
-public class T : LispObject
+public sealed class T : LispObject
 {
     public static readonly T Instance = new T();
     private T() { }

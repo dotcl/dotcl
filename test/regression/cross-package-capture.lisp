@@ -44,3 +44,33 @@
                       (let ((,g2 :second))
                         (lambda () (list ,g1 ,g2)))))))
   (:first :second))
+
+;;; A DEFVAR in one package must not make another package's same-named LEXICAL
+;;; variable special.
+;;;
+;;; SPECIAL-VAR-P / GLOBAL-SPECIAL-P used to fall back to comparing SYMBOL-NAME
+;;; strings, so once any package proclaimed QV special, every QV was treated as
+;;; special. A parameter named QV was then bound dynamically and read
+;;; dynamically, which agrees with itself while the binding is live but loses the
+;;; value the moment a closure outlives the call: the closure skipped capture
+;;; (globally special vars are read from the dynamic environment, not the env
+;;; array) and hit "Unbound variable" when called later.
+
+(defpackage :xpc-sp (:use :cl))
+(defvar xpc-sp::qv 1)
+
+(defun %xpc-thunk (qv) (lambda () qv))
+
+(deftest cross-package-special-name-lexical
+  (funcall (%xpc-thunk 42))
+  42)
+
+;;; The other side of the same rule: the symbol that really is special keeps
+;;; dynamic semantics, i.e. a closure over it reads the innermost binding at call
+;;; time rather than capturing the value.
+(deftest cross-package-special-stays-dynamic
+  (let ((f (lambda () xpc-sp::qv)))
+    (list (funcall f)
+          (let ((xpc-sp::qv 5)) (funcall f))
+          (funcall f)))
+  (1 5 1))

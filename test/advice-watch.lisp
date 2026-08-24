@@ -7,20 +7,20 @@
 (defvar *log* nil)
 
 (defun call-add ()
-  (dotnet:static "DotCL.MethodAdviceBridge" "DemoAdd" 3 4))
+  (dotnet:static "DotCL.TestSupport.AdviceDemo" "DemoAdd" 3 4))
 
 (format t "~&before watch: DemoAdd(3,4) = ~a~%" (call-add))
 
-(advice:watch "DotCL.MethodAdviceBridge" "DemoAdd"
+(advice:watch "DotCL.TestSupport.AdviceDemo" "DemoAdd"
   (lambda (instance args result)
     (declare (ignore instance))
     (push (list :args args :result result) *log*)
     (format t "~&[advice] DemoAdd~s => ~s~%" args result)))
 
 (format t "~&after watch:  DemoAdd(3,4) = ~a~%" (call-add))
-(dotnet:static "DotCL.MethodAdviceBridge" "DemoAdd" 10 20)
+(dotnet:static "DotCL.TestSupport.AdviceDemo" "DemoAdd" 10 20)
 
-(advice:unwatch "DotCL.MethodAdviceBridge" "DemoAdd")
+(advice:unwatch "DotCL.TestSupport.AdviceDemo" "DemoAdd")
 (format t "~&after unwatch: DemoAdd(3,4) = ~a~%" (call-add))
 
 (format t "~&~%captured ~a call(s):~%" (length *log*))
@@ -32,7 +32,7 @@
 
 ;;; --- patch: rewrite the return value in place ---
 (format t "~%--- patch ---~%")
-(advice:patch "DotCL.MethodAdviceBridge" "DemoAdd"
+(advice:patch "DotCL.TestSupport.AdviceDemo" "DemoAdd"
   (lambda (instance args result)
     (declare (ignore instance))
     ;; "fix" the method: return the product instead of whatever it computed.
@@ -40,21 +40,21 @@
 
 (let ((patched (call-add)))                 ; DemoAdd(3,4): original 7, patched 12
   (format t "~&after patch:   DemoAdd(3,4) = ~a  (original 7)~%" patched)
-  (advice:unpatch "DotCL.MethodAdviceBridge" "DemoAdd")
+  (advice:unpatch "DotCL.TestSupport.AdviceDemo" "DemoAdd")
   (let ((restored (call-add)))
     (format t "~&after unpatch: DemoAdd(3,4) = ~a~%" restored)
 
     ;;; --- trace: time each call ---
     (format t "~%--- trace ---~%")
     (defvar *tlog* nil)
-    (advice:trace "DotCL.MethodAdviceBridge" "DemoAdd"
+    (advice:trace "DotCL.TestSupport.AdviceDemo" "DemoAdd"
       (lambda (instance args result seconds)
         (declare (ignore instance result))
         (push (cons args seconds) *tlog*)
         (format t "~&[trace] DemoAdd~s  ~,4Fms~%" args (* seconds 1000.0))))
     (call-add)
-    (dotnet:static "DotCL.MethodAdviceBridge" "DemoAdd" 100 200)
-    (advice:untrace "DotCL.MethodAdviceBridge" "DemoAdd")
+    (dotnet:static "DotCL.TestSupport.AdviceDemo" "DemoAdd" 100 200)
+    (advice:untrace "DotCL.TestSupport.AdviceDemo" "DemoAdd")
     (call-add)                                ; not traced
     (let ((trace-ok (and (= 2 (length *tlog*))
                          (every (lambda (e) (numberp (cdr e))) *tlog*))))

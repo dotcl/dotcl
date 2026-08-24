@@ -15,6 +15,12 @@
     <Nullable>enable</Nullable>
     <!-- ns2.0 defaults to C# 7.3; force latest so only real BCL-API gaps surface. -->
     <LangVersion>latest</LangVersion>
+    <!-- Only so [SkipLocalsInit] is honoured (the compiler requires the unsafe
+         flag for it). It buys the stack probe: that probe stackallocs 16 x 16KB
+         and the default zero-init made the periodic stack check memset 256KB
+         every time, which measured 17.6% of a call-heavy profile. No unsafe
+         code is written anywhere in the assembly. -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <!-- No debug symbols in Release: this library ships inside the dotcl tool
          packages (via the runtime exe's publish) and the DotCL.Runtime NuGet,
          neither of which needs its C# pdb (dotcl reads the .fasl PDB, not this).
@@ -224,6 +230,10 @@
        #if DOTCL_EMIT. -->
   <ItemGroup Condition="'$(DotclEmit)' != 'true'">
     <Compile Remove="Emitter/FaslAssembler.cs" />
+    <!-- Writing a bundle is writing a FASL, so it goes with FaslAssembler. LOADING
+         one stays: the reader lives in Runtime.Misc.cs and works emit-free, which
+         is the whole point of shipping bundles to an AOT/WebGL target. -->
+    <Compile Remove="Emitter/FaslBundle.cs" />
     <Compile Remove="Emitter/CompilerEnv.cs" />
     <Compile Remove="Emitter/IlDisasm.cs" />
     <Compile Remove="Emitter/CilAssembler.Emit.cs" />

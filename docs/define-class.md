@@ -71,6 +71,28 @@ accessors, so `INotifyPropertyChanged` wires itself up when you declare the
 matching event. `:notify t` on a property then makes its setter raise
 `PropertyChanged` for you.
 
+### Parameters the caller reads back (`ref` / `out`)
+
+A parameter type ending in `&` is by-reference — the spelling .NET itself uses,
+so `"System.Int32&"` is C#'s `ref int`. A Lisp function is called with values, so
+such a parameter arrives as a **cell**: read it with `dotnet:deref`, and whatever
+the body leaves in it is what the caller sees after the call. Leaving it alone
+leaves the caller's value alone.
+
+```lisp
+(dotnet:define-class "Demo.Counter" ()
+  (:methods ("Bump" ((n "System.Int32&")) :returns Void :static t
+              (setf (dotnet:deref n) (+ 1 (dotnet:deref n))))))
+```
+
+`out` is the same thing to the CLR; the difference is only that the caller is not
+expected to have set a value first.
+
+This is the implementing side. For *calling* a .NET method that has `out`/`ref`
+parameters, see `dotnet:call-out` in
+[Calling .NET from Lisp](dotnet-package.md), which returns those parameters as
+additional values.
+
 ### Constructors take arguments
 
 A constructor's parameter list is typed like a method's, and `(:base ...)`

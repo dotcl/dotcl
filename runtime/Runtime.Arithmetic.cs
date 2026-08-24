@@ -95,6 +95,107 @@ public static partial class Runtime
         return Fixnum.Make(r);
     }
 
+    // --- Raw int64 arithmetic for a slot that is declared to hold a fixnum ---
+    //
+    // A local declared FIXNUM lives in an Int64 slot, so a result that no longer
+    // fits has nowhere to go: the assignment is a declaration violation and must
+    // be reported. What the compiler used to emit instead was "box both operands,
+    // call the generic promoting Add, unbox the result" -- two allocations and a
+    // generic dispatch per operation, on the hottest shape there is
+    // ((setq acc (+ acc x)) inside a loop). The range proof that gates the raw
+    // path cannot help here: FIXNUM + FIXNUM spans one bit more than int64, so it
+    // never proves, however the program is written.
+    //
+    // These do the same job with the operands and the result staying raw, and
+    // signal where the unbox used to (an InvalidCast surfaced as a PROGRAM-ERROR,
+    // which said nothing about the declaration).
+
+    // --- Float format introspection ---
+    //
+    // These take a FLOAT, not a real: an integer has no format to report on, and
+    // answering for one hid the fact that they were reporting a double's format
+    // for every argument.
+
+    static double FloatArgValue(string who, LispObject o) => o switch
+    {
+        SingleFloat sf => sf.Value,
+        DoubleFloat df => df.Value,
+        _ => throw new LispErrorException(new LispTypeError(
+                 $"{who}: argument is not a float", o, Startup.Sym("FLOAT")))
+    };
+
+    static int FloatFormatDigits(string who, LispObject o) => o switch
+    {
+        SingleFloat => 24,
+        DoubleFloat => 53,
+        _ => throw new LispErrorException(new LispTypeError(
+                 $"{who}: argument is not a float", o, Startup.Sym("FLOAT")))
+    };
+
+    /// <summary>
+    /// Digits actually carried by this value. A denormal has no implicit leading
+    /// one and its stored significand starts with zeros, which are not digits of
+    /// the number: the smallest denormal carries exactly one.
+    /// </summary>
+    static int FloatValuePrecision(LispObject o)
+    {
+        if (o is SingleFloat sf)
+        {
+            if (sf.Value == 0.0f) return 0;
+            // SingleToInt32Bits is absent from netstandard2.0 (the emit-free
+            // target); GetBytes+ToInt32 is the same reinterpret.
+            int bits = BitConverter.ToInt32(BitConverter.GetBytes(sf.Value), 0);
+            return ((bits >> 23) & 0xFF) != 0 ? 24 : BitLength(bits & 0x7FFFFF);
+        }
+        if (o is DoubleFloat df)
+        {
+            if (df.Value == 0.0) return 0;
+            long bits = BitConverter.DoubleToInt64Bits(df.Value);
+            return ((bits >> 52) & 0x7FF) != 0 ? 53 : BitLength(bits & 0xFFFFFFFFFFFFFL);
+        }
+        throw new LispErrorException(new LispTypeError(
+            "FLOAT-PRECISION: argument is not a float", o, Startup.Sym("FLOAT")));
+    }
+
+    static int BitLength(long m)
+    {
+        int n = 0;
+        while (m != 0) { n++; m >>= 1; }
+        return n;
+    }
+
+    static LispErrorException DeclaredFixnumOverflow(System.Numerics.BigInteger value)
+        => new LispErrorException(new LispTypeError(
+            $"result {value} does not fit the declared FIXNUM type of the variable",
+            Bignum.MakeInteger(value), Startup.Sym("FIXNUM")));
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static long AddFixnumChecked(long a, long b)
+    {
+        long r = unchecked(a + b);
+        if (((a ^ r) & (b ^ r)) < 0)
+            throw DeclaredFixnumOverflow((System.Numerics.BigInteger)a + b);
+        return r;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static long SubtractFixnumChecked(long a, long b)
+    {
+        long r = unchecked(a - b);
+        if (((a ^ b) & (a ^ r)) < 0)
+            throw DeclaredFixnumOverflow((System.Numerics.BigInteger)a - b);
+        return r;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static long MultiplyFixnumChecked(long a, long b)
+    {
+        long hi = Compat.BigMul(a, b, out long r);
+        if (hi != (r >> 63))
+            throw DeclaredFixnumOverflow(new System.Numerics.BigInteger(a) * b);
+        return r;
+    }
+
     /// <summary>Subtract int64s, promoting to Bignum on signed overflow.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static LispObject SubtractFixnum(long a, long b)
@@ -133,16 +234,19 @@ public static partial class Runtime
             if (av % bv == 0) return Fixnum.Make(av / bv);
             // Fall through to ratio creation via Arithmetic.Divide
         }
+        // Float division by zero follows IEEE (an infinity, or NaN for 0.0/0.0)
+        // instead of signalling. The compiled path already did: `(/ 1.0d0 0.0d0)`
+        // inside a DEFUN emits a raw IL div and yields an infinity, so signalling
+        // here made one expression answer two ways -- (mapcar #'/ ...) disagreed
+        // with (/ ...), and the emit-free build, which has only this path,
+        // disagreed with every other build. dotcl prints and reads infinities
+        // (DOTCL:DOUBLE-FLOAT-POSITIVE-INFINITY), and dividing by zero is how a
+        // program makes one. Rational division by zero still signals: IEEE says
+        // nothing about rationals, and CLHS asks for the error.
         if (a is DoubleFloat da && b is DoubleFloat db)
-        {
-            if (db.Value == 0.0) throw new LispErrorException(new LispError("/: division by zero") { ConditionTypeName = "DIVISION-BY-ZERO" });
             return new DoubleFloat(da.Value / db.Value);
-        }
         if (a is SingleFloat sfa && b is SingleFloat sfb)
-        {
-            if (sfb.Value == 0.0f) throw new LispErrorException(new LispError("/: division by zero") { ConditionTypeName = "DIVISION-BY-ZERO" });
             return new SingleFloat(sfa.Value / sfb.Value);
-        }
         try { return Arithmetic.Divide(AsNumber(a), AsNumber(b)); }
         catch (DivideByZeroException) { throw new LispErrorException(new LispError("/: division by zero") { ConditionTypeName = "DIVISION-BY-ZERO" }); }
     }
@@ -189,6 +293,19 @@ public static partial class Runtime
           return !Arithmetic.EitherNaN(na, nb) && Arithmetic.Compare(na, nb) < 0 ? T.Instance : Nil.Instance; }
     }
 
+    /// <summary>(>= counter limit) where the counter is a raw Int64 and the limit
+    /// is whatever the program produced. DOTIMES compiles its loop test to this:
+    /// its counter can live in an Int64 slot unconditionally (it starts at 0 and
+    /// only ever gains 1), but the count form is an arbitrary integer, so the
+    /// comparison must still accept a bignum -- and boxing the counter to ask a
+    /// generic (>=) is one allocation per iteration of every loop that did not
+    /// declare its variable.</summary>
+    public static LispObject FixnumGeObject(long a, LispObject b)
+    {
+        if (b is Fixnum fb) return a >= fb.Value ? T.Instance : Nil.Instance;
+        return GreaterEqual(Fixnum.Make(a), b);
+    }
+
     public static LispObject GreaterEqual(LispObject a, LispObject b)
     {
         if (a is Fixnum fa && b is Fixnum fb)
@@ -227,10 +344,39 @@ public static partial class Runtime
 
     // --- Bool-returning comparisons for fused comparison+branch in compile-if ---
 
+    /// <summary>
+    /// Both operands are floats, of the same format or not. CLHS 12.1.4.1 converts
+    /// the shorter format to the longer, so a double comparison answers for every
+    /// pairing. Mixing formats is the ordinary case, not an exotic one: a literal
+    /// like 4.0 reads as a single float, so comparing a computed double against
+    /// one used to fall past the fast path into Compare and a NaN probe.
+    /// NaN needs no special case here -- every operator below is false for an
+    /// unordered pair, which is what the general path's EitherNaN guard produces.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static bool BothFloats(LispObject a, LispObject b, out double x, out double y)
+    {
+        if (a is DoubleFloat da)
+        {
+            x = da.Value;
+            if (b is DoubleFloat db) { y = db.Value; return true; }
+            if (b is SingleFloat sb) { y = sb.Value; return true; }
+            y = 0.0; return false;
+        }
+        if (a is SingleFloat sa)
+        {
+            x = sa.Value;
+            if (b is DoubleFloat db2) { y = db2.Value; return true; }
+            if (b is SingleFloat sb2) { y = sb2.Value; return true; }
+            y = 0.0; return false;
+        }
+        x = y = 0.0; return false;
+    }
+
     public static bool IsTrueGt(LispObject a, LispObject b)
     {
         if (a is Fixnum fa && b is Fixnum fb) return fa.Value > fb.Value;
-        if (a is DoubleFloat da && b is DoubleFloat db) return da.Value > db.Value;
+        if (BothFloats(a, b, out double fx, out double fy)) return fx > fy;
         { var na = AsNumber(a); var nb = AsNumber(b);
           return !Arithmetic.EitherNaN(na, nb) && Arithmetic.Compare(na, nb) > 0; }
     }
@@ -238,7 +384,7 @@ public static partial class Runtime
     public static bool IsTrueLt(LispObject a, LispObject b)
     {
         if (a is Fixnum fa && b is Fixnum fb) return fa.Value < fb.Value;
-        if (a is DoubleFloat da && b is DoubleFloat db) return da.Value < db.Value;
+        if (BothFloats(a, b, out double fx, out double fy)) return fx < fy;
         { var na = AsNumber(a); var nb = AsNumber(b);
           return !Arithmetic.EitherNaN(na, nb) && Arithmetic.Compare(na, nb) < 0; }
     }
@@ -246,7 +392,7 @@ public static partial class Runtime
     public static bool IsTrueGe(LispObject a, LispObject b)
     {
         if (a is Fixnum fa && b is Fixnum fb) return fa.Value >= fb.Value;
-        if (a is DoubleFloat da && b is DoubleFloat db) return da.Value >= db.Value;
+        if (BothFloats(a, b, out double fx, out double fy)) return fx >= fy;
         { var na = AsNumber(a); var nb = AsNumber(b);
           return !Arithmetic.EitherNaN(na, nb) && Arithmetic.Compare(na, nb) >= 0; }
     }
@@ -254,7 +400,7 @@ public static partial class Runtime
     public static bool IsTrueLe(LispObject a, LispObject b)
     {
         if (a is Fixnum fa && b is Fixnum fb) return fa.Value <= fb.Value;
-        if (a is DoubleFloat da && b is DoubleFloat db) return da.Value <= db.Value;
+        if (BothFloats(a, b, out double fx, out double fy)) return fx <= fy;
         { var na = AsNumber(a); var nb = AsNumber(b);
           return !Arithmetic.EitherNaN(na, nb) && Arithmetic.Compare(na, nb) <= 0; }
     }
@@ -262,7 +408,7 @@ public static partial class Runtime
     public static bool IsTrueNumEq(LispObject a, LispObject b)
     {
         if (a is Fixnum fa && b is Fixnum fb) return fa.Value == fb.Value;
-        if (a is DoubleFloat da && b is DoubleFloat db) return da.Value == db.Value;
+        if (BothFloats(a, b, out double fx, out double fy)) return fx == fy;
         return Arithmetic.IsNumericEqual(AsNumber(a), AsNumber(b));
     }
 
@@ -537,10 +683,10 @@ public static partial class Runtime
                 var lc = (LispComplex)baseObj;
                 // (complex single-float) => #c(1.0s0 0.0s0)
                 if (lc.Real is SingleFloat)
-                    return new LispComplex(new SingleFloat(1.0f), new SingleFloat(0.0f));
+                    return new BoxedComplex(new SingleFloat(1.0f), new SingleFloat(0.0f));
                 // (complex double-float) => #c(1.0d0 0.0d0)
                 if (lc.Real is DoubleFloat)
-                    return new LispComplex(new DoubleFloat(1.0), new DoubleFloat(0.0));
+                    return new DoubleComplex(1.0, 0.0);
                 // (complex integer) or (complex rational) => 1
                 return Fixnum.Make(1);
             }
@@ -700,6 +846,21 @@ public static partial class Runtime
         return new DoubleFloat(result_d);
     }
 
+    /// <summary>Raw int64 MOD / REM for the compiler's unboxed fixnum path. Same
+    /// arithmetic as the Fixnum fast paths below -- MOD takes the divisor's sign,
+    /// REM truncates -- and the same behaviour on a zero divisor (the CLR's
+    /// DivideByZeroException, which the condition system already maps).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static long ModFixnumL(long a, long b)
+    {
+        long r = a % b;
+        if (r != 0 && ((r ^ b) < 0)) r += b;
+        return r;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static long RemFixnumL(long a, long b) => a % b;
+
     public static LispObject Mod(LispObject a, LispObject b)
     {
         if (a is Fixnum fa && b is Fixnum fb)
@@ -727,10 +888,10 @@ public static partial class Runtime
             long av = fa.Value, bv = fb.Value;
             long q = Math.DivRem(av, bv, out long r);
             if (r != 0 && ((r ^ bv) < 0)) { q--; r += bv; }
-            return MultipleValues.Values(Fixnum.Make(q), Fixnum.Make(r));
+            return MultipleValues.Values2(Fixnum.Make(q), Fixnum.Make(r));
         }
         var (qq, rr) = Arithmetic.Floor(AsNumber(a), AsNumber(b));
-        return MultipleValues.Values(qq, rr);
+        return MultipleValues.Values2(qq, rr);
     }
     public static LispObject TruncateOp(LispObject a, LispObject b)
     {
@@ -739,20 +900,20 @@ public static partial class Runtime
             long av = fa.Value, bv = fb.Value;
             long q = av / bv;
             long r = av - q * bv;
-            return MultipleValues.Values(Fixnum.Make(q), Fixnum.Make(r));
+            return MultipleValues.Values2(Fixnum.Make(q), Fixnum.Make(r));
         }
         var (qq, rr) = Arithmetic.Truncate(AsNumber(a), AsNumber(b));
-        return MultipleValues.Values(qq, rr);
+        return MultipleValues.Values2(qq, rr);
     }
     public static LispObject CeilingOp(LispObject a, LispObject b)
     {
         var (q, r) = Arithmetic.Ceiling(AsNumber(a), AsNumber(b));
-        return MultipleValues.Values(q, r);
+        return MultipleValues.Values2(q, r);
     }
     public static LispObject RoundOp(LispObject a, LispObject b)
     {
         var (q, r) = Arithmetic.Round(AsNumber(a), AsNumber(b));
-        return MultipleValues.Values(q, r);
+        return MultipleValues.Values2(q, r);
     }
     public static LispObject Lcm(LispObject a, LispObject b) => Arithmetic.Lcm(AsNumber(a), AsNumber(b));
 
@@ -1621,7 +1782,7 @@ public static partial class Runtime
                 var a = Runtime.AsNumber(args[0]);
                 var b = args.Length > 1 ? Runtime.AsNumber(args[1]) : Fixnum.Make(1);
                 var (q, r) = capturedOp(a, b);
-                return MultipleValues.Values(q, r);
+                return MultipleValues.Values2(q, r);
             }, capturedName, -1));
         }
         Emitter.CilAssembler.RegisterFunction("CEILING", new LispFunction(args => {
@@ -1630,7 +1791,7 @@ public static partial class Runtime
             var a = Runtime.AsNumber(args[0]);
             var b = args.Length > 1 ? Runtime.AsNumber(args[1]) : Fixnum.Make(1);
             var (q, r) = Arithmetic.Ceiling(a, b);
-            return MultipleValues.Values(q, r);
+            return MultipleValues.Values2(q, r);
         }, "CEILING", -1));
         Emitter.CilAssembler.RegisterFunction("ROUND", new LispFunction(args => {
             Runtime.CheckArityMin("ROUND", args, 1);
@@ -1638,7 +1799,7 @@ public static partial class Runtime
             var a = Runtime.AsNumber(args[0]);
             var b = args.Length > 1 ? Runtime.AsNumber(args[1]) : Fixnum.Make(1);
             var (q, r) = Arithmetic.Round(a, b);
-            return MultipleValues.Values(q, r);
+            return MultipleValues.Values2(q, r);
         }, "ROUND", -1));
         // FFloor/FCeiling/FTruncate/FRound: float versions
         foreach (var (fname, fop) in new (string, Func<Number, Number, (Number, Number)>)[] {
@@ -1656,7 +1817,7 @@ public static partial class Runtime
                 var a = Runtime.AsNumber(args[0]);
                 var b = args.Length > 1 ? Runtime.AsNumber(args[1]) : Fixnum.Make(1);
                 var (q, r) = capturedOp(a, b);
-                return MultipleValues.Values(q, r);
+                return MultipleValues.Values2(q, r);
             }, capturedName, -1));
         }
 
@@ -1856,24 +2017,44 @@ public static partial class Runtime
         Emitter.CilAssembler.RegisterFunction("FLOAT-RADIX",
             new LispFunction(args => new Fixnum(2), "FLOAT-RADIX", 1));
 
-        // FLOAT-DIGITS: 53 for double-float
+        // FLOAT-DIGITS: how many digits the argument's FORMAT holds -- 24 for a
+        // single, 53 for a double. It answered 53 for every argument, so a single
+        // float claimed a double's mantissa and a non-float got an answer at all.
         Emitter.CilAssembler.RegisterFunction("FLOAT-DIGITS",
-            new LispFunction(args => new Fixnum(53), "FLOAT-DIGITS", 1));
+            new LispFunction(args => new Fixnum(FloatFormatDigits("FLOAT-DIGITS", args[0])),
+                             "FLOAT-DIGITS", 1));
 
-        // FLOAT-PRECISION
+        // FLOAT-PRECISION: how many digits this VALUE actually carries. That is
+        // the format's digit count for a normal float, fewer for a denormal (whose
+        // leading zeros are not significant), and zero for a zero.
         Emitter.CilAssembler.RegisterFunction("FLOAT-PRECISION",
-            new LispFunction(args => {
-                double d = Runtime.ObjToDouble(args[0]);
-                return new Fixnum(d == 0.0 ? 0 : 53);
-            }, "FLOAT-PRECISION", 1));
+            new LispFunction(args => new Fixnum(FloatValuePrecision(args[0])), "FLOAT-PRECISION", 1));
 
-        // FLOAT-SIGN: (float-sign f1 &optional f2) => sign of f1 * magnitude of f2 (default 1.0)
+        // FLOAT-SIGN: (float-sign f1 &optional f2) => the sign of f1 on the
+        // magnitude of f2 (1 by default), IN F2'S FORMAT. Returning a double
+        // whatever came in made (float-sign 1.5) answer 1.0d0 where every other
+        // implementation answers 1.0.
         Emitter.CilAssembler.RegisterFunction("FLOAT-SIGN",
             new LispFunction(args => {
-                double f1 = Runtime.ObjToDouble(args[0]);
-                double f2 = args.Length > 1 ? Runtime.ObjToDouble(args[1]) : 1.0;
-                double sign = (f1 < 0 || (f1 == 0.0 && double.IsNegativeInfinity(1.0/f1))) ? -1.0 : 1.0;
-                return new DoubleFloat(sign * Math.Abs(f2));
+                if (args.Length < 1 || args.Length > 2)
+                    throw new LispErrorException(new LispProgramError(
+                        "FLOAT-SIGN: takes 1 or 2 arguments"));
+                double f1 = FloatArgValue("FLOAT-SIGN", args[0]);
+                // A negative zero is negative here: its sign bit is what the
+                // function reports, and 0.0 < 0 is false.
+                bool neg = f1 < 0 || (f1 == 0.0 && double.IsNegativeInfinity(1.0 / f1));
+                if (args.Length == 1)
+                    return args[0] is SingleFloat
+                        ? (LispObject)new SingleFloat(neg ? -1.0f : 1.0f)
+                        : new DoubleFloat(neg ? -1.0 : 1.0);
+                double f2 = FloatArgValue("FLOAT-SIGN", args[1]);
+                double signed = neg ? -Math.Abs(f2) : Math.Abs(f2);
+                // The result is the sign of the first argument carried on the
+                // magnitude of the second, which is a product of the two -- so
+                // float contagion applies and a double on EITHER side wins.
+                return (args[0] is DoubleFloat || args[1] is DoubleFloat)
+                    ? (LispObject)new DoubleFloat(signed)
+                    : new SingleFloat((float)signed);
             }, "FLOAT-SIGN", -1));
     }
 

@@ -140,18 +140,30 @@ and their transitive dependencies at run time:
         (dotnet:invoke (dotnet:invoke self "get_ApplicationLifetime")
                        "set_MainWindow" win)))))
 
-(let* ((builder (dotnet:static-generic "Avalonia.AppBuilder" "Configure" (list "Hello.App")))
-       (builder (dotnet:static "Avalonia.AppBuilderDesktopExtensions" "UsePlatformDetect" builder))
-       (args    (dotnet:static-generic "System.Array" "Empty" (list "System.String"))))
-  (dotnet:static "Avalonia.ClassicDesktopStyleApplicationLifetimeExtensions"
-                 "StartWithClassicDesktopLifetime" builder args))
+;; Start on the process main thread. macOS AppKit accepts UI work only there.
+(dotcl:call-on-main-thread
+ (lambda ()
+   (let* ((builder (dotnet:static-generic "Avalonia.AppBuilder" "Configure" (list "Hello.App")))
+          (builder (dotnet:static "Avalonia.AppBuilderDesktopExtensions" "UsePlatformDetect" builder))
+          (args    (dotnet:static-generic "System.Array" "Empty" (list "System.String"))))
+     (dotnet:static "Avalonia.ClassicDesktopStyleApplicationLifetimeExtensions"
+                    "StartWithClassicDesktopLifetime" builder args))))
 ```
 
 ![hello-gui window after three clicks](docs/images/hello-gui.png)
 
 The first run downloads Avalonia from NuGet (a minute or two); after that
 it starts in seconds. The same file is in
-[`examples/hello-gui.lisp`](examples/hello-gui.lisp). Note the Lisp side is
+[`examples/hello-gui.lisp`](examples/hello-gui.lisp).
+
+dotcl runs Lisp on a worker thread with a large stack, because deeply nested
+macro expansion needs one. The event loop is handed back to the process main
+thread with `dotcl:call-on-main-thread`, which is what macOS requires of any
+UI work. Windows and X11 do not care either way. `dotcl:call-on-main-thread`
+is newer than 0.1.25; on an older dotcl, drop the wrapper and the sample runs
+as it stands everywhere except macOS.
+
+Note the Lisp side is
 ordinary object wiring — the same `dotnet:new` / `dotnet:invoke` /
 `dotnet:add-event` calls work against WinForms, WPF, or any other .NET UI
 toolkit you have on hand.

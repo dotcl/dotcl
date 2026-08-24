@@ -1087,3 +1087,37 @@
     (handler-case (progn (setf (wic8x 5) 1) :no-error)
       (error () :error)))
   :error)
+
+;;; The other side of the capture rule: a body whose only use of
+;;; CALL-NEXT-METHOD is a plain call keeps no closure, and reads the
+;;; next-method state when the call runs. A generic-function dispatch in
+;;; between must therefore leave that state as it found it.
+
+(defgeneric cnm-direct-inner (x))
+(defmethod cnm-direct-inner ((x integer)) (* x 2))
+
+(defgeneric cnm-direct-gf (x))
+(defclass cnm-direct-base () ())
+(defclass cnm-direct-derived (cnm-direct-base) ())
+
+(defmethod cnm-direct-gf ((x cnm-direct-base)) :base)
+(defmethod cnm-direct-gf ((x cnm-direct-derived))
+  (let ((n (cnm-direct-inner 21)))
+    (list n (call-next-method))))
+
+(deftest cnm-direct-after-inner-dispatch
+  (cnm-direct-gf (make-instance 'cnm-direct-derived))
+  (42 :base))
+
+;;; NEXT-METHOD-P alone, called directly, likewise needs no capture.
+(defgeneric nmp-direct-gf (x))
+(defclass nmp-direct-base () ())
+(defclass nmp-direct-derived (nmp-direct-base) ())
+
+(defmethod nmp-direct-gf ((x nmp-direct-base)) (list :base (next-method-p)))
+(defmethod nmp-direct-gf ((x nmp-direct-derived))
+  (list (next-method-p) (call-next-method)))
+
+(deftest nmp-direct-after-inner-dispatch
+  (nmp-direct-gf (make-instance 'nmp-direct-derived))
+  (t (:base nil)))

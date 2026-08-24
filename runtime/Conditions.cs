@@ -46,6 +46,9 @@ public class LispCondition : LispObject
     public LispObject? OperationRef { get; set; }
     /// <summary>Operands reference for ARITHMETIC-ERROR conditions.</summary>
     public LispObject? OperandsRef { get; set; }
+    /// <summary>The object PRINT-NOT-READABLE was signalled about, so a handler can
+    /// ask what could not be printed rather than parsing it out of the message.</summary>
+    public LispObject? PrintNotReadableObjectRef { get; set; }
     /// <summary>For a condition wrapping a raw .NET exception: the original CLR
     /// exception type, so dotnet:exception-type / dotnet:handler-bind can dispatch
     /// on the specific .NET type. Null for ordinary Lisp conditions. (dotcl/dotcl#45)</summary>
@@ -236,11 +239,36 @@ public class LispRestart : LispObject
 public class HandlerBinding
 {
     public LispObject TypeSpec { get; }
-    public LispFunction Handler { get; }
+    public LispFunction? Handler { get; }
+
+    // A HANDLER-CASE clause instead of a handler function: what its handler did
+    // was throw HandlerCaseInvocationException(tag, index, condition), so the tag
+    // and index are kept here directly. Building a LispFunction (plus the lambda
+    // closing over the pair) for each clause cost ~300 B on every ENTRY into a
+    // handler-case, error or not -- and handler-case is how ordinary code guards
+    // anything.
+    internal readonly object? HcTag;
+    internal readonly int HcClause;
+
     public HandlerBinding(LispObject typeSpec, LispFunction handler)
     {
         TypeSpec = typeSpec;
         Handler = handler;
+    }
+
+    public HandlerBinding(LispObject typeSpec, object hcTag, int hcClause)
+    {
+        TypeSpec = typeSpec;
+        HcTag = hcTag;
+        HcClause = hcClause;
+    }
+
+    /// <summary>Run this binding for CONDITION: call the handler function, or --
+    /// for a handler-case clause -- transfer to that clause.</summary>
+    internal void Run(LispObject condition)
+    {
+        if (Handler != null) { Handler.Invoke(condition); return; }
+        throw new HandlerCaseInvocationException(HcTag!, HcClause, condition);
     }
 }
 
@@ -318,7 +346,7 @@ public static class HandlerClusterStack
                     }
                     try
                     {
-                        binding.Handler.Invoke(condition);
+                        binding.Run(condition);
                         // Handler returned normally → decline, restore and continue
                     }
                     finally

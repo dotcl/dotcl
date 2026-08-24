@@ -32,7 +32,7 @@
 
 ;;; An unqualified call inside the shadowing package reaches that package's
 ;;; definition, not CL's.
-(deftest shadowed-cl-function-name.unqualified-call-uses-own-definition
+(deftest-compiled-only shadowed-cl-function-name.unqualified-call-uses-own-definition
   (funcall (%scfn-compile-in-package
             "SCFN"
             "(lambda () (list (nth 1 '(a b)) (union '(1) '(2))
@@ -40,7 +40,7 @@
   (:scfn-nth :scfn-union :scfn-first :scfn-consp))
 
 ;;; #'name resolves the same way as the call.
-(deftest shadowed-cl-function-name.function-special-form-uses-own-definition
+(deftest-compiled-only shadowed-cl-function-name.function-special-form-uses-own-definition
   (list (funcall (funcall (%scfn-compile-in-package "SCFN" "(lambda () #'nth)")) 1 '(a b))
         (funcall (funcall (%scfn-compile-in-package "SCFN" "(lambda () #'first)")) '(a b)))
   (:scfn-nth :scfn-first))
@@ -53,7 +53,7 @@
 
 ;;; The CL functions themselves are untouched — the shadowing package's
 ;;; definitions must not leak into calls that name the CL symbols.
-(deftest shadowed-cl-function-name.cl-functions-unaffected
+(deftest-compiled-only shadowed-cl-function-name.cl-functions-unaffected
   (list (nth 1 '(a b)) (first '(a b)) (consp '(a))
         (funcall (%scfn-compile-in-package "CL-USER" "(lambda () (nth 1 '(a b)))")))
   (b a t b))
@@ -62,7 +62,7 @@
 ;;; shadowed name, called from a method body in the same package. The reader
 ;;; methods worked before the fix (accessor call sites are package-qualified);
 ;;; the DEFGENERIC ones did not.
-(deftest shadowed-cl-function-name.generic-function-on-shadowed-name
+(deftest-compiled-only shadowed-cl-function-name.generic-function-on-shadowed-name
   (progn
     (funcall (%scfn-compile-in-package
               "SCFN-GF"

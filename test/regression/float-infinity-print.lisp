@@ -60,3 +60,31 @@
 (deftest float-infinity-print.finite-floats-unchanged
   (list (prin1-to-string 1.5d0) (prin1-to-string 1.5f0) (prin1-to-string 0.0d0))
   ("1.5d0" "1.5" "0.0d0"))
+
+;;; One expression, one answer. `(/ 1.0d0 0.0d0)` inside a DEFUN compiles to a
+;;; raw IL div and yields an infinity, but the same division through #'/ used to
+;;; signal DIVISION-BY-ZERO -- so (mapcar #'/ ...) disagreed with (/ ...), and
+;;; the emit-free build, which has only the function, disagreed with every other
+;;; build (it could not even load this file: the infinity above was built by
+;;; dividing). Float division by zero now follows IEEE everywhere; rational
+;;; division by zero still signals.
+
+(defun %fip-div (a b) (funcall #'/ a b))
+
+(deftest float-infinity-print.function-division-matches-compiled
+  (list (prin1-to-string (%fip-div 1.0d0 0.0d0))
+        (prin1-to-string (%fip-inf-d)))
+  ("#.DOTCL:DOUBLE-FLOAT-POSITIVE-INFINITY" "#.DOTCL:DOUBLE-FLOAT-POSITIVE-INFINITY"))
+
+(deftest float-infinity-print.mixed-type-division-is-ieee
+  (prin1-to-string (%fip-div 1 0.0d0))
+  "#.DOTCL:DOUBLE-FLOAT-POSITIVE-INFINITY")
+
+(deftest float-infinity-print.zero-over-zero-is-nan
+  (prin1-to-string (%fip-div 0.0d0 0.0d0))
+  "#.DOTCL:DOUBLE-FLOAT-NAN")
+
+(deftest float-infinity-print.rational-division-by-zero-still-signals
+  (list (handler-case (%fip-div 1 0) (division-by-zero () :signalled))
+        (handler-case (%fip-div 1/2 0) (division-by-zero () :signalled)))
+  (:signalled :signalled))

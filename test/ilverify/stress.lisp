@@ -93,3 +93,27 @@
 ;; an i4, which runs but is not verifiable.
 (defun digits-only-p (s)
   (loop :for c :across s :always (digit-char-p c)))
+
+;; A struct constructor whose slot value contains a branch. The type name is
+;; pushed before the slot values are compiled, so a slot holding a LOOP (or any
+;; branching form) left it pending across a join label -- IL the verifier rejects
+;; and the JIT refuses at the first call ("invalid program"). Found in coalton,
+;; where (make-node-body :nodes (loop ...) :last-node ...) is ordinary style; ten
+;; of its ninety-five fasls carried it.
+(defstruct nb nodes last-node)
+
+(defun make-nb-from (list ctx)
+  (make-nb :nodes (loop :for e :in list :collect (list e ctx))
+           :last-node (if (consp list) (car list) ctx)))
+
+;; The same shape with the branch in the second slot, and with the constructor
+;; nested inside VALUES (how coalton's renamer writes it).
+(defun make-nb-second (list ctx)
+  (values (make-nb :nodes ctx
+                   :last-node (loop :for e :in list :count (consp e)))
+          ctx))
+
+;; INVOKE-RESTART has the same operand shape (designator, then an args array).
+(defun invoke-with-branching-arg (r list)
+  (restart-case (invoke-restart r (loop :for e :in list :collect e))
+    (continue () :ok)))

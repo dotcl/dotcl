@@ -777,6 +777,47 @@ public static partial class Runtime
         catch (System.Net.Sockets.SocketException ex) { throw StreamIOError(stream, ex); }
     }
 
+    // Allocation-free variants of the guard above. The closure form costs a
+    // display object plus a delegate on every call -- paid per character on
+    // WRITE-CHAR, per string on WRITE-STRING -- because the lambda captures the
+    // arguments. Passing those arguments as explicit state lets the lambda be
+    // `static`, which the C# compiler caches in a singleton field: one delegate
+    // per call site for the life of the process, none per call.
+    internal static LispObject GuardStreamIO<T1>(LispObject stream, T1 a1, System.Func<T1, LispObject> io)
+    {
+        try { return io(a1); }
+        catch (System.IO.IOException ex) { throw StreamIOError(stream, ex); }
+        catch (System.ObjectDisposedException ex) { throw StreamIOError(stream, ex); }
+        catch (System.Net.Sockets.SocketException ex) { throw StreamIOError(stream, ex); }
+    }
+
+    internal static LispObject GuardStreamIO<T1, T2>(LispObject stream, T1 a1, T2 a2,
+                                                     System.Func<T1, T2, LispObject> io)
+    {
+        try { return io(a1, a2); }
+        catch (System.IO.IOException ex) { throw StreamIOError(stream, ex); }
+        catch (System.ObjectDisposedException ex) { throw StreamIOError(stream, ex); }
+        catch (System.Net.Sockets.SocketException ex) { throw StreamIOError(stream, ex); }
+    }
+
+    internal static LispObject GuardStreamIO<T1, T2, T3>(LispObject stream, T1 a1, T2 a2, T3 a3,
+                                                         System.Func<T1, T2, T3, LispObject> io)
+    {
+        try { return io(a1, a2, a3); }
+        catch (System.IO.IOException ex) { throw StreamIOError(stream, ex); }
+        catch (System.ObjectDisposedException ex) { throw StreamIOError(stream, ex); }
+        catch (System.Net.Sockets.SocketException ex) { throw StreamIOError(stream, ex); }
+    }
+
+    internal static LispObject GuardStreamIO<T1, T2, T3, T4>(LispObject stream, T1 a1, T2 a2, T3 a3, T4 a4,
+                                                             System.Func<T1, T2, T3, T4, LispObject> io)
+    {
+        try { return io(a1, a2, a3, a4); }
+        catch (System.IO.IOException ex) { throw StreamIOError(stream, ex); }
+        catch (System.ObjectDisposedException ex) { throw StreamIOError(stream, ex); }
+        catch (System.Net.Sockets.SocketException ex) { throw StreamIOError(stream, ex); }
+    }
+
     private static LispErrorException StreamIOError(LispObject stream, Exception ex) =>
         new LispErrorException(new LispError(ex.Message)
         {
@@ -1144,7 +1185,8 @@ public static partial class Runtime
     }
 
     public static LispObject ReadCharNoHang(LispObject streamObj, LispObject eofErrorP, LispObject eofValue)
-        => GuardStreamIO(streamObj, () => ReadCharNoHangUnguarded(streamObj, eofErrorP, eofValue));
+        => GuardStreamIO(streamObj, streamObj, eofErrorP, eofValue,
+                         static (st, ee, ev) => ReadCharNoHangUnguarded(st, ee, ev));
 
     private static LispObject ReadCharNoHangUnguarded(LispObject streamObj, LispObject eofErrorP, LispObject eofValue)
     {
@@ -1176,7 +1218,7 @@ public static partial class Runtime
     }
 
     public static LispObject Listen(LispObject stream)
-        => GuardStreamIO(stream, () => ListenUnguarded(stream));
+        => GuardStreamIO(stream, stream, static st => ListenUnguarded(st));
 
     private static LispObject ListenUnguarded(LispObject stream)
     {
@@ -1255,7 +1297,7 @@ public static partial class Runtime
     };
 
     public static LispObject WriteByte(LispObject byteObj, LispObject stream)
-        => GuardStreamIO(stream, () => WriteByteUnguarded(byteObj, stream));
+        => GuardStreamIO(stream, byteObj, stream, static (b, st) => WriteByteUnguarded(b, st));
 
     private static LispObject WriteByteUnguarded(LispObject byteObj, LispObject stream)
     {
@@ -1784,8 +1826,22 @@ public static partial class Runtime
     {
         if (args.Length < 2)
             throw new LispErrorException(new LispProgramError("WRITE-SEQUENCE: requires at least 2 arguments"));
-        var seq = args[0];
-        var stream = args[1];
+        int start = 0;
+        int end = -1;
+        // Validate keyword args
+        ValidateSequenceKeywords("WRITE-SEQUENCE", args, 2, ref start, ref end);
+        return WriteSequenceCore(args[0], args[1], start, end);
+    }
+
+    /// <summary>Two-argument WRITE-SEQUENCE. Registered as the function's direct
+    /// binary entry so a compiled (write-sequence seq stream) does not build an
+    /// argument array per call -- cl-bench string-concat makes 10^8 of those
+    /// calls, and the array was ~40 bytes of the ~90 the call allocated.</summary>
+    public static LispObject WriteSequence2(LispObject seq, LispObject stream)
+        => WriteSequenceCore(seq, stream, 0, -1);
+
+    private static LispObject WriteSequenceCore(LispObject seq, LispObject stream, int start, int end)
+    {
         // Validate sequence type
         if (seq is not (LispString or LispVector or Cons or Nil))
             throw new LispErrorException(new LispTypeError("WRITE-SEQUENCE: not a proper sequence", seq, Startup.Sym("VECTOR")));
@@ -1796,20 +1852,14 @@ public static partial class Runtime
             if (tail.Cdr is not Nil)
                 throw new LispErrorException(new LispTypeError("WRITE-SEQUENCE: not a proper sequence", seq, Startup.Sym("VECTOR")));
         }
-        int start = 0;
-        int end = -1;
-        // Validate keyword args
-        ValidateSequenceKeywords("WRITE-SEQUENCE", args, 2, ref start, ref end);
 
         // Resolve composite streams
-        if (stream is LispTwoWayStream tws) { args[1] = tws.OutputStream; return WriteSequence(args); }
-        if (stream is LispSynonymStream syn) { args[1] = DynamicBindings.Get(syn.Symbol); return WriteSequence(args); }
-        if (stream is LispEchoStream echoWs) { args[1] = echoWs.OutputStream; return WriteSequence(args); }
+        if (stream is LispTwoWayStream tws) return WriteSequenceCore(seq, tws.OutputStream, start, end);
+        if (stream is LispSynonymStream syn) return WriteSequenceCore(seq, DynamicBindings.Get(syn.Symbol), start, end);
+        if (stream is LispEchoStream echoWs) return WriteSequenceCore(seq, echoWs.OutputStream, start, end);
         if (stream is LispBroadcastStream bs)
         {
-            var origStream = args[1];
-            foreach (var s in bs.Streams) { args[1] = s; WriteSequence(args); }
-            args[1] = origStream;
+            foreach (var s in bs.Streams) WriteSequenceCore(seq, s, start, end);
             return seq;
         }
 
@@ -1932,7 +1982,8 @@ public static partial class Runtime
     }
 
     public static LispObject ReadPreservingWhitespace(LispObject stream, LispObject eofErrorP, LispObject eofValue)
-        => GuardStreamIO(stream, () => ReadPreservingWhitespaceUnguarded(stream, eofErrorP, eofValue));
+        => GuardStreamIO(stream, stream, eofErrorP, eofValue,
+                         static (st, ee, ev) => ReadPreservingWhitespaceUnguarded(st, ee, ev));
 
     /// <summary>The TextReader a Lisp READer should consume for STREAM. Same as
     /// GetTextReader, except that reading through an echo-stream echoes — the Lisp
@@ -1988,7 +2039,8 @@ public static partial class Runtime
     }
 
     public static LispObject ReadLine(LispObject stream, LispObject eofErrorP, LispObject eofValue)
-        => GuardStreamIO(stream, () => ReadLineUnguarded(stream, eofErrorP, eofValue));
+        => GuardStreamIO(stream, stream, eofErrorP, eofValue,
+                         static (st, ee, ev) => ReadLineUnguarded(st, ee, ev));
 
     private static LispObject ReadLineUnguarded(LispObject stream, LispObject eofErrorP, LispObject eofValue)
     {
@@ -2091,7 +2143,8 @@ public static partial class Runtime
     // stream builtins, bypassing the registered LispFunction wrappers — so the
     // stream-error guard must live on the methods themselves.
     public static LispObject ReadChar(LispObject streamObj, LispObject eofErrorP, LispObject eofValue)
-        => GuardStreamIO(streamObj, () => ReadCharUnguarded(streamObj, eofErrorP, eofValue));
+        => GuardStreamIO(streamObj, streamObj, eofErrorP, eofValue,
+                         static (st, ee, ev) => ReadCharUnguarded(st, ee, ev));
 
     private static LispObject ReadCharUnguarded(LispObject streamObj, LispObject eofErrorP, LispObject eofValue)
     {
@@ -2204,7 +2257,8 @@ public static partial class Runtime
     }
 
     public static LispObject PeekChar(LispObject peekType, LispObject streamObj, LispObject eofErrorP, LispObject eofValue)
-        => GuardStreamIO(streamObj, () => PeekCharUnguarded(peekType, streamObj, eofErrorP, eofValue));
+        => GuardStreamIO(streamObj, peekType, streamObj, eofErrorP, eofValue,
+                         static (pt, st, ee, ev) => PeekCharUnguarded(pt, st, ee, ev));
 
     private static LispObject PeekCharUnguarded(LispObject peekType, LispObject streamObj, LispObject eofErrorP, LispObject eofValue)
     {
@@ -2509,7 +2563,7 @@ public static partial class Runtime
     }
 
     public static LispObject WriteChar(LispObject ch, LispObject stream)
-        => GuardStreamIO(stream, () => WriteCharUnguarded(ch, stream));
+        => GuardStreamIO(stream, ch, stream, static (c, st) => WriteCharUnguarded(c, st));
 
     private static LispObject WriteCharUnguarded(LispObject ch, LispObject stream)
     {
@@ -2527,8 +2581,52 @@ public static partial class Runtime
     }
 
     public static LispObject WriteString(LispObject[] args)
-        => GuardStreamIO(args.Length > 1 ? args[1] : Nil.Instance,
-                         () => WriteStringUnguarded(args));
+        => GuardStreamIO(args.Length > 1 ? args[1] : Nil.Instance, args,
+                         static a => WriteStringUnguarded(a));
+
+    // Keyword-free entry points. (write-string s stream) is the shape that
+    // actually runs in output-heavy code, and routing it through the args-array
+    // form costs a LispObject[] per call for nothing -- the compiler emits a
+    // direct call to these instead (see the WRITE-STRING/WRITE-LINE entries in
+    // cil-forms.lisp).
+    public static LispObject WriteString2(LispObject str, LispObject stream)
+        => GuardStreamIO(stream, str, stream, static (t, st) => WriteStringSimple(t, st, false));
+
+    public static LispObject WriteString1(LispObject str)
+        => WriteString2(str, DynamicBindings.Get(Startup.Sym("*STANDARD-OUTPUT*")));
+
+    public static LispObject WriteLine2(LispObject str, LispObject stream)
+        => GuardStreamIO(stream, str, stream, static (t, st) => WriteStringSimple(t, st, true));
+
+    public static LispObject WriteLine1(LispObject str)
+        => WriteLine2(str, DynamicBindings.Get(Startup.Sym("*STANDARD-OUTPUT*")));
+
+    private static LispObject WriteStringSimple(LispObject str, LispObject stream, bool newline)
+    {
+        string s = str switch
+        {
+            LispString ls => ls.Value,
+            LispVector vec when vec.IsCharVector || vec.ElementTypeName == "NIL" => vec.ToCharString(),
+            _ => str.ToString() ?? ""
+        };
+        var writer = ResolveOutputStreamDesignator(stream);
+        if (newline)
+        {
+            // WRITE-LINE's existing path does no pprint bookkeeping; keep it
+            // that way here rather than change behaviour in a perf commit.
+            writer.Write(s);
+            writer.Write('\n');
+            UpdateAtLineStart(stream, '\n');
+        }
+        else
+        {
+            PprintFlushPendingBreak(writer);
+            writer.Write(s);
+            PprintTrackWrite(s);
+            if (s.Length > 0) UpdateAtLineStart(stream, s[s.Length - 1]);
+        }
+        return str;
+    }
 
     private static LispObject WriteStringUnguarded(LispObject[] args)
     {
@@ -2589,7 +2687,10 @@ public static partial class Runtime
 
         var writer = ResolveOutputStreamDesignator(stream);
         PprintFlushPendingBreak(writer);
-        var substr = s.Substring(start, end - start);
+        // The whole-string case is the common one (no :start/:end), and copying
+        // it out only to hand it straight to the writer costs one string per
+        // WRITE-STRING call.
+        var substr = (start == 0 && end == s.Length) ? s : s.Substring(start, end - start);
         writer.Write(substr);
         PprintTrackWrite(substr);
         if (substr.Length > 0) UpdateAtLineStart(stream, substr[substr.Length - 1]);
@@ -2597,8 +2698,8 @@ public static partial class Runtime
     }
 
     public static LispObject WriteLine(LispObject[] args)
-        => GuardStreamIO(args.Length > 1 ? args[1] : Nil.Instance,
-                         () => WriteLineUnguarded(args));
+        => GuardStreamIO(args.Length > 1 ? args[1] : Nil.Instance, args,
+                         static a => WriteLineUnguarded(a));
 
     private static LispObject WriteLineUnguarded(LispObject[] args)
     {
@@ -3032,9 +3133,9 @@ public static partial class Runtime
         if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
         {
             Directory.CreateDirectory(dir);
-            return MultipleValues.Values(resultPn, T.Instance);
+            return MultipleValues.Values2(resultPn, T.Instance);
         }
-        return MultipleValues.Values(resultPn, Nil.Instance);
+        return MultipleValues.Values2(resultPn, Nil.Instance);
     }
 
     public static LispObject DeleteFile(LispObject path)
@@ -3442,13 +3543,18 @@ public static partial class Runtime
         Emitter.CilAssembler.RegisterFunction("READ-SEQUENCE",
             new LispFunction(args => {
                 var stream = args.Length > 1 ? args[1] : (LispObject)Nil.Instance;
-                return Runtime.GuardStreamIO(stream, () => Runtime.ReadSequence(args));
+                return Runtime.GuardStreamIO(stream, args, static a => Runtime.ReadSequence(a));
             }));
-        Emitter.CilAssembler.RegisterFunction("WRITE-SEQUENCE",
-            new LispFunction(args => {
-                var stream = args.Length > 1 ? args[1] : (LispObject)Nil.Instance;
-                return Runtime.GuardStreamIO(stream, () => Runtime.WriteSequence(args));
-            }));
+        var writeSeqFn = new LispFunction(args => {
+            var stream = args.Length > 1 ? args[1] : (LispObject)Nil.Instance;
+            return Runtime.GuardStreamIO(stream, args, static a => Runtime.WriteSequence(a));
+        }, "WRITE-SEQUENCE");
+        // Two-argument direct entry: the common call shape, without the argument
+        // array the variadic entry needs.
+        writeSeqFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject>)((seq, stream) =>
+            Runtime.GuardStreamIO(stream, seq, stream,
+                                  static (sq, st) => Runtime.WriteSequence2(sq, st))));
+        Emitter.CilAssembler.RegisterFunction("WRITE-SEQUENCE", writeSeqFn);
 
         // --- READ-FROM-STRING ---
         Emitter.CilAssembler.RegisterFunction("READ-FROM-STRING", new LispFunction(Runtime.ReadFromString, "READ-FROM-STRING", -1));
@@ -3605,12 +3711,12 @@ public static partial class Runtime
             return ss.Symbol;
         });
         Startup.RegisterUnary("STREAM-ERROR-STREAM", obj => {
-            if (obj is LispInstanceCondition lic)
             {
-                if (lic.Instance.Class.SlotIndex.TryGetValue("STREAM", out int idx))
-                    return lic.Instance.Slots[idx] ?? Nil.Instance;
-                if (lic.StreamErrorStreamRef != null) return lic.StreamErrorStreamRef;
+                var v = Runtime.ConditionSlot(obj, "STREAM");
+                if (v is not Nil) return v;
             }
+            if (obj is LispInstanceCondition lic && lic.StreamErrorStreamRef != null)
+                return lic.StreamErrorStreamRef;
             if (obj is LispCondition lc && lc.StreamErrorStreamRef != null)
                 return lc.StreamErrorStreamRef;
             return Nil.Instance;
@@ -3648,7 +3754,7 @@ public static partial class Runtime
                 Runtime.CheckArityMax("LISTEN", args, 1);
                 var s = args.Length > 0 ? args[0]
                     : DynamicBindings.Get(Startup.Sym("*STANDARD-INPUT*"));
-                return Runtime.GuardStreamIO(s, () => Runtime.Listen(s));
+                return Runtime.Listen(s);
             }, "LISTEN", -1));
         Emitter.CilAssembler.RegisterFunction("CLEAR-INPUT",
             new LispFunction(args => {
@@ -3660,16 +3766,16 @@ public static partial class Runtime
 
         // --- WRITE-BYTE, WRITE-STRING, WRITE-LINE, WRITE-CHAR ---
         Startup.RegisterBinary("WRITE-BYTE",
-            (b, s) => Runtime.GuardStreamIO(s, () => Runtime.WriteByte(b, s)));
+            (b, s) => Runtime.WriteByte(b, s));
         Emitter.CilAssembler.RegisterFunction("WRITE-STRING",
             new LispFunction(args => {
                 var stream = args.Length > 1 ? args[1] : (LispObject)Nil.Instance;
-                return Runtime.GuardStreamIO(stream, () => Runtime.WriteString(args));
+                return Runtime.WriteString(args);
             }));
         Emitter.CilAssembler.RegisterFunction("WRITE-LINE",
             new LispFunction(args => {
                 var stream = args.Length > 1 ? args[1] : (LispObject)Nil.Instance;
-                return Runtime.GuardStreamIO(stream, () => Runtime.WriteLine(args));
+                return Runtime.WriteLine(args);
             }));
         Emitter.CilAssembler.RegisterFunction("WRITE-CHAR",
             new LispFunction(args => {
@@ -3677,7 +3783,7 @@ public static partial class Runtime
                 Runtime.CheckArityMax("WRITE-CHAR", args, 2);
                 var ch = args[0];
                 var stream = args.Length > 1 ? args[1] : DynamicBindings.Get(Startup.Sym("*STANDARD-OUTPUT*"));
-                return Runtime.GuardStreamIO(stream, () => Runtime.WriteChar(ch, stream));
+                return Runtime.WriteChar(ch, stream);
             }));
 
         // --- MAKE-STRING-INPUT-STREAM, MAKE-STRING-OUTPUT-STREAM, MAKE-STRING-OUTPUT-STREAM-TO-STRING ---
@@ -3726,7 +3832,7 @@ public static partial class Runtime
         Emitter.CilAssembler.RegisterFunction("READ-BYTE",
             new LispFunction(args => {
                 var stream = args.Length > 0 ? args[0] : (LispObject)Nil.Instance;
-                return Runtime.GuardStreamIO(stream, () => Runtime.ReadByte(args));
+                return Runtime.GuardStreamIO(stream, args, static a => Runtime.ReadByte(a));
             }));
 
         // --- READ-CHAR-NO-HANG, READ-CHAR, PEEK-CHAR, UNREAD-CHAR ---
@@ -3738,7 +3844,7 @@ public static partial class Runtime
                 var eofValue = args.Length > 2 ? args[2] : Nil.Instance;
                 var recursiveP = args.Length > 3 ? args[3] : Nil.Instance;
                 if (recursiveP is not Nil) eofErrorP = T.Instance;
-                return Runtime.GuardStreamIO(stream, () => Runtime.ReadCharNoHang(stream, eofErrorP, eofValue));
+                return Runtime.ReadCharNoHang(stream, eofErrorP, eofValue);
             }));
         Emitter.CilAssembler.RegisterFunction("READ-CHAR",
             new LispFunction(args => {
@@ -3747,7 +3853,7 @@ public static partial class Runtime
                 var eofErrorP = args.Length > 1 ? args[1] : T.Instance;
                 var eofValue = args.Length > 2 ? args[2] : Nil.Instance;
                 // recursive-p (args[3]) does NOT override eof-error-p (CLHS)
-                return Runtime.GuardStreamIO(stream, () => Runtime.ReadChar(stream, eofErrorP, eofValue));
+                return Runtime.ReadChar(stream, eofErrorP, eofValue);
             }));
         Emitter.CilAssembler.RegisterFunction("PEEK-CHAR",
             new LispFunction(args => {
@@ -3757,7 +3863,7 @@ public static partial class Runtime
                 var eofErrorP = args.Length > 2 ? args[2] : T.Instance;
                 var eofValue = args.Length > 3 ? args[3] : Nil.Instance;
                 // recursive-p (args[4]) does NOT override eof-error-p (CLHS)
-                return Runtime.GuardStreamIO(stream, () => Runtime.PeekChar(peekType, stream, eofErrorP, eofValue));
+                return Runtime.PeekChar(peekType, stream, eofErrorP, eofValue);
             }));
         Emitter.CilAssembler.RegisterFunction("UNREAD-CHAR",
             new LispFunction(args => {
@@ -3782,7 +3888,7 @@ public static partial class Runtime
                 var eofValue = args.Length > 2 ? args[2] : Nil.Instance;
                 var recursiveP = args.Length > 3 ? args[3] : Nil.Instance;
                 if (recursiveP is not Nil) eofErrorP = T.Instance;
-                return Runtime.GuardStreamIO(stream, () => Runtime.ReadPreservingWhitespace(stream, eofErrorP, eofValue));
+                return Runtime.ReadPreservingWhitespace(stream, eofErrorP, eofValue);
             }));
 
         // --- OPEN, CLOSE, PROBE-FILE, TRUENAME, FILE-WRITE-DATE, GET-OUTPUT-STREAM-STRING ---
@@ -3814,7 +3920,7 @@ public static partial class Runtime
                 var eofValue = args.Length > 2 ? args[2] : Nil.Instance;
                 var recursiveP = args.Length > 3 ? args[3] : Nil.Instance;
                 if (recursiveP is not Nil) eofErrorP = T.Instance;
-                return Runtime.GuardStreamIO(stream, () => Runtime.ReadFromStream(stream, eofErrorP, eofValue));
+                return Runtime.ReadFromStream(stream, eofErrorP, eofValue);
             }, "READ", -1));
         Emitter.CilAssembler.RegisterFunction("READ-LINE",
             new LispFunction(args => {
@@ -3824,7 +3930,7 @@ public static partial class Runtime
                 var eofValue = args.Length > 2 ? args[2] : Nil.Instance;
                 var recursiveP = args.Length > 3 ? args[3] : Nil.Instance;
                 if (recursiveP is not Nil) eofErrorP = T.Instance;
-                return Runtime.GuardStreamIO(stream, () => Runtime.ReadLine(stream, eofErrorP, eofValue));
+                return Runtime.ReadLine(stream, eofErrorP, eofValue);
             }, "READ-LINE", -1));
 
         // --- Stream factory functions for composite stream types ---
@@ -3915,7 +4021,8 @@ public static partial class Runtime
                     var stream = args.Length > 0 && args[0] is not Nil
                         ? args[0]
                         : DynamicBindings.Get(Startup.Sym("*STANDARD-OUTPUT*"));
-                    return Runtime.GuardStreamIO(stream, () => { FlushStream(stream); return Nil.Instance; });
+                    return Runtime.GuardStreamIO(stream, stream,
+                                                 static st => { FlushStream(st); return Nil.Instance; });
                 }));
         }
     }

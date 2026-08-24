@@ -222,6 +222,18 @@ internal static class Compat
 
     public static bool IsAsciiDigit(char c) => c >= '0' && c <= '9';
 
+    /// <summary>True when DIR is a symlink or junction rather than a real directory,
+    /// so a caller that deletes directories can leave it alone (deleting through a
+    /// link deletes what it points at). DirectoryInfo.LinkTarget answers this from
+    /// net6 on; the reparse-point attribute is the same question in the form
+    /// netstandard2.0 has.</summary>
+    public static bool IsDirectoryLink(System.IO.DirectoryInfo dir)
+#if NETSTANDARD2_0
+        => (dir.Attributes & System.IO.FileAttributes.ReparsePoint) != 0;
+#else
+        => dir.LinkTarget != null;
+#endif
+
     public static bool IsWindows()
 #if NETSTANDARD2_0
         => RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
@@ -314,6 +326,12 @@ internal static class Compat
     public static bool TryEnsureSufficientExecutionStackWithMargin()
         => ProbePadded(PadFrames);
 
+    // The stackalloc below exists to MOVE the stack pointer, not to hold data:
+    // only its first and last byte are written. Zero-initialising it (the C#
+    // default) made every periodic stack check memset 16 x 16KB = 256KB, which
+    // measured 17.6% of a call-heavy profile (richards). SkipLocalsInit drops
+    // the memset and changes nothing else: the headroom guaranteed is the same.
+    [SkipLocalsInit]
     [MethodImpl(MethodImplOptions.NoInlining)]
     private static bool ProbePadded(int depth)
     {

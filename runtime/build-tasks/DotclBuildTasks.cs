@@ -140,6 +140,34 @@ internal static class DotclBoot
         t.Join();
         edi?.Throw();
     }
+
+    /// <summary>
+    /// What the build prints when the Lisp side refuses. The raw exception is
+    /// missing two things the reader needs. It names an internal step
+    /// ("resolve-deps", "compile-project") that nobody typed -- the command was
+    /// `dotnet build` -- and for the common failure, a dependency that cannot be
+    /// found, it stops at the diagnosis without naming the one build property
+    /// that fixes it. The CL_SOURCE_REGISTRY line is there because that is the
+    /// mechanism people reach for first: the dotcl CLI honours it and the build
+    /// does not, so "it works when I run dotcl but not when I build" is the
+    /// natural next confusion.
+    /// </summary>
+    internal static string FailureMessage(System.Exception ex)
+    {
+        // A SIMPLE-ERROR's type name tells the reader nothing they can act on,
+        // and it sits between two prefixes that do ("dotcl:" and the step). Other
+        // condition types stay: those name a real category.
+        var raw = ex.Message;
+        const string simplePrefix = "SIMPLE-ERROR: ";
+        if (raw.StartsWith(simplePrefix, System.StringComparison.Ordinal))
+            raw = raw.Substring(simplePrefix.Length);
+        var msg = "dotcl: " + raw;
+        if (raw.Contains("cannot be found") || raw.Contains("not found"))
+            msg += "\n  If that system lives outside the project, add its directory:"
+                 + "\n    <ItemGroup><DotclAsdSearchPath Include=\"path/to/dir\" /></ItemGroup>"
+                 + "\n  CL_SOURCE_REGISTRY is honoured by the dotcl CLI but is not read during the build.";
+        return msg;
+    }
 }
 
 /// <summary>
@@ -177,7 +205,7 @@ public sealed class DotclResolveDeps : Task
         try { DotclBoot.RunOnLargeStack(Run); return true; }
         catch (Exception ex)
         {
-            Log.LogError($"dotcl resolve-deps failed for {Asd}: {ex.Message}");
+            Log.LogError(DotclBoot.FailureMessage(ex));
             return false;
         }
     }
@@ -223,7 +251,7 @@ public sealed class DotclCompileProject : Task
         try { DotclBoot.RunOnLargeStack(Run); return true; }
         catch (Exception ex)
         {
-            Log.LogError($"dotcl compile-project failed for {Asd}: {ex.Message}");
+            Log.LogError(DotclBoot.FailureMessage(ex));
             return false;
         }
     }

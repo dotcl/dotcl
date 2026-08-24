@@ -48,8 +48,16 @@ public static partial class Runtime
         else
             throw new LispErrorException(new LispTypeError("FORMAT: format string must be a string", args[0]));
 
-        var formatArgs2 = new LispObject[args.Length - 1];
-        Array.Copy(args, 1, formatArgs2, 0, formatArgs2.Length);
+        // (format dest "no directives") is common enough that the empty argument
+        // array is worth not allocating.
+        LispObject[] formatArgs2;
+        if (args.Length == 1)
+            formatArgs2 = Array.Empty<LispObject>();
+        else
+        {
+            formatArgs2 = new LispObject[args.Length - 1];
+            Array.Copy(args, 1, formatArgs2, 0, formatArgs2.Length);
+        }
 
         if (dest is Nil)
         {
@@ -326,7 +334,11 @@ public static partial class Runtime
     /// Format a floating-point number per CLHS 22.3.3.1 (~F directive).
     /// Parameters: w,d,k,overflowchar,padchar
     /// </summary>
-    private static string FormatFixedFloat(double value, int? w, int? d, int k, char? overflowChar, char padChar, bool atSign, bool isSingle, bool isDouble)
+    /// <param name="shortestDigits">See FormatExponentialFloat: round from the
+    /// shortest round-trip decimal instead of the exact binary expansion. Set
+    /// only by ~G, which derived d from that same representation.</param>
+    private static string FormatFixedFloat(double value, int? w, int? d, int k, char? overflowChar, char padChar, bool atSign, bool isSingle, bool isDouble,
+        bool shortestDigits = false)
     {
         // Apply scale factor: the printed value is value * 10^k
         double scaled = value * Math.Pow(10.0, k);
@@ -345,31 +357,18 @@ public static partial class Runtime
             else
                 raw = absVal.ToString("R", System.Globalization.CultureInfo.InvariantCulture);
 
-            // If the roundtrip format uses exponent notation, convert to fixed
+            // If the roundtrip format uses exponent notation, convert to fixed.
+            //
+            // Re-formatting the double with "F{n}" here printed the EXACT binary
+            // value instead: (format nil "~G" 1.5e12) gave "1500000026624."
+            // where SBCL and ABCL give "1500000000000." -- 1.5e12 is a
+            // single-float, so its exact value is 1500000026624, and the printer
+            // is supposed to use the shortest decimal that reads back EQL
+            // (CLHS 22.1.3.1.3). "R" already produced exactly those digits, so
+            // expand ITS digit string positionally rather than going back
+            // through a float.
             if (raw.Contains('E') || raw.Contains('e'))
-            {
-                // Parse and re-format in fixed notation
-                if (isSingle)
-                {
-                    float fv = float.Parse(raw, System.Globalization.CultureInfo.InvariantCulture);
-                    // Determine enough decimal digits
-                    raw = fv.ToString("G9", System.Globalization.CultureInfo.InvariantCulture);
-                    if (raw.Contains('E') || raw.Contains('e'))
-                    {
-                        // Use decimal to avoid losing precision
-                        int digits = Math.Max(0, -(int)Math.Floor(Math.Log10(fv)) + 8);
-                        raw = fv.ToString($"F{digits}", System.Globalization.CultureInfo.InvariantCulture);
-                        // Trim trailing zeros but keep at least one digit after dot
-                        raw = TrimTrailingZerosFixed(raw);
-                    }
-                }
-                else
-                {
-                    int digits = Math.Max(0, -(int)Math.Floor(Math.Log10(absVal)) + 16);
-                    raw = absVal.ToString($"F{digits}", System.Globalization.CultureInfo.InvariantCulture);
-                    raw = TrimTrailingZerosFixed(raw);
-                }
-            }
+                raw = ExpandScientificToFixed(raw);
 
             if (!raw.Contains('.'))
                 raw += ".0";
@@ -415,8 +414,9 @@ public static partial class Runtime
                 computedD = 6; // fallback
             }
 
-            // Round to computedD digits
-            string formatted = absVal.ToString($"F{computedD}", System.Globalization.CultureInfo.InvariantCulture);
+            // Round to computedD digits, from the round-trip decimal (same reason
+            // as the d-specified branch below).
+            string formatted = RoundShortestToFixed(RoundTripText(absVal, isSingle), computedD);
             if (!formatted.Contains('.'))
                 formatted += ".";
 
@@ -451,8 +451,21 @@ public static partial class Runtime
         }
         else
         {
-            // d is specified: exactly d digits after decimal point
-            string formatted = absVal.ToString($"F{d.Value}", System.Globalization.CultureInfo.InvariantCulture);
+            // d is specified: exactly d digits after decimal point.
+            //
+            // Rounding the WIDENED double prints the exact binary value of a
+            // single-float rather than its shortest round-trip decimal:
+            // (format nil "~G" 1.5e12) came out "1500000026624." where SBCL and
+            // ABCL give "1500000000000.". Round the shortest digit string
+            // instead -- for a single-float those digits are all the value
+            // actually carries, and zeros past them are the right answer.
+            // Always from the round-trip digits, whichever directive asked and
+            // whatever the float's width: (format nil "~,10F" 1.5e12) was
+            // "1500000026624.0000000000" and (format nil "~,20F" 0.1d0) was
+            // "0.10000000000000000555", both of them the exact binary value
+            // where SBCL pads the shortest decimal with zeros. Only ~G's own
+            // calls took this path before.
+            string formatted = RoundShortestToFixed(RoundTripText(absVal, isSingle), d.Value);
             // CLHS requires a decimal point even when d=0
             if (d.Value == 0 && !formatted.Contains('.'))
                 formatted += ".";
@@ -506,6 +519,70 @@ public static partial class Runtime
     /// <summary>
     /// Trim trailing zeros from a fixed-format number string, keeping at least one digit after the decimal point.
     /// </summary>
+    /// <summary>
+    /// Expand a scientific-notation string ("1.5E+12", "1.234E-5") into plain
+    /// fixed-point notation, moving the decimal point through the digit string
+    /// rather than re-rounding the value. The digits it is given are already the
+    /// shortest round-trip representation, and that is what must be printed.
+    /// </summary>
+    /// <summary>
+    /// Render RAW (a shortest-round-trip "R" string, in either fixed or
+    /// scientific notation) with exactly D digits after the decimal point,
+    /// rounding half-up on the digit string. Going through the binary value
+    /// instead would reintroduce the digits past the shortest representation,
+    /// which is the whole thing being avoided.
+    /// </summary>
+    /// <summary>The shortest decimal that reads back as VALUE, as text: the "R"
+    /// round trip of the float's own width.</summary>
+    private static string RoundTripText(double absVal, bool isSingle)
+        => isSingle
+            ? ((float)absVal).ToString("R", System.Globalization.CultureInfo.InvariantCulture)
+            : absVal.ToString("R", System.Globalization.CultureInfo.InvariantCulture);
+
+    private static string RoundShortestToFixed(string raw, int d)
+    {
+        var fixedStr = (raw.Contains('E') || raw.Contains('e'))
+            ? ExpandScientificToFixed(raw)
+            : (raw.Contains('.') ? raw : raw + ".0");
+        int dot = fixedStr.IndexOf('.');
+        string intPart = fixedStr.Substring(0, dot);
+        string frac = fixedStr.Substring(dot + 1);
+        if (frac.Length <= d)
+            return intPart + (d == 0 ? "" : "." + frac.PadRight(d, '0'));
+
+        // Round half-up at position d, carrying through the digit string.
+        var kept = (intPart + frac.Substring(0, d)).ToCharArray();
+        if (frac[d] >= '5')
+        {
+            int i = kept.Length - 1;
+            while (i >= 0)
+            {
+                if (kept[i] == '9') { kept[i] = '0'; i--; }
+                else { kept[i]++; break; }
+            }
+            if (i < 0) kept = ("1" + new string(kept)).ToCharArray();
+        }
+        var all = new string(kept);
+        int intLen = all.Length - d;
+        return d == 0 ? all : all.Substring(0, intLen) + "." + all.Substring(intLen);
+    }
+
+    private static string ExpandScientificToFixed(string raw)
+    {
+        ExtractScientificDigits(raw, out var digits, out int msdExp);
+        if (digits.Length == 0 || digits == "0") return "0.0";
+        if (msdExp >= 0)
+        {
+            // Integer part is digits[0 .. msdExp]; pad with zeros if the digit
+            // string runs out before the decimal point does.
+            if (msdExp + 1 >= digits.Length)
+                return digits + new string('0', msdExp + 1 - digits.Length) + ".0";
+            return digits.Substring(0, msdExp + 1) + "." + digits.Substring(msdExp + 1);
+        }
+        // Value < 1: "0." then -msdExp-1 leading zeros, then the digits.
+        return "0." + new string('0', -msdExp - 1) + digits;
+    }
+
     private static string TrimTrailingZerosFixed(string s)
     {
         int dotPos = s.IndexOf('.');
@@ -595,8 +672,21 @@ public static partial class Runtime
     /// to. Only then take the full expansion, which terminates for every double (at most
     /// 767 significant digits) and leaves the caller's tie rule to act on a real tie.</summary>
     private static void SignificantDigitsForRounding(double absVal, int n,
-                                                     out string allDigits, out int msdExp)
+                                                     out string allDigits, out int msdExp,
+                                                     bool isSingle = false)
     {
+        if (isSingle)
+        {
+            // A single-float carries only the digits of its shortest round-trip
+            // decimal; probing the WIDENED double with "G17" resurrects the exact
+            // binary expansion, so (format nil "~G" 1.234e-5) came out
+            // "1.23399996e-5" instead of "1.234e-5". Zeros past the shortest
+            // representation are the correct digits to round from.
+            ExtractScientificDigits(
+                ((float)absVal).ToString("R", System.Globalization.CultureInfo.InvariantCulture),
+                out allDigits, out msdExp);
+            return;
+        }
         int probe = Math.Max(17, n + 3);
         ExtractScientificDigits(
             absVal.ToString("G" + probe, System.Globalization.CultureInfo.InvariantCulture),
@@ -610,14 +700,74 @@ public static partial class Runtime
         }
     }
 
+    /// <summary>
+    /// CLHS's q for ~G: "the number of digits needed to print arg with no loss of
+    /// information". Counted over the FIXED-POINT free-format text, not over the
+    /// round-trip significand -- 1.0d10 prints as "10000000000." and so needs 11
+    /// digits, which is what puts a round number in ~F rather than ~E. (Length of
+    /// that text less its decimal point, matching SBCL, whose output is the
+    /// reference here; reading "without trailing zeros" strictly would send every
+    /// large round number to ~E instead.)
+    /// </summary>
+    private static int GeneralDigitCount(double value, bool isSingle)
+    {
+        if (value == 0.0 || double.IsNaN(value) || double.IsInfinity(value)) return 0;
+        var inv = System.Globalization.CultureInfo.InvariantCulture;
+        string r = isSingle
+            ? Math.Abs((float)value).ToString("R", inv)
+            : Math.Abs(value).ToString("R", inv);
+        ExtractScientificDigits(r, out var digits, out int msdExp);
+        digits = digits.TrimEnd('0');
+        if (digits.Length == 0) digits = "0";
+        int len;
+        if (msdExp >= 0)
+        {
+            // "1234.5": msdExp+1 integer digits, the point, whatever is left over
+            int intDigits = msdExp + 1;
+            int fracDigits = Math.Max(0, digits.Length - intDigits);
+            len = intDigits + 1 + fracDigits;
+        }
+        else
+        {
+            // ".0001": the point, the zeros that follow it, then the digits
+            len = 1 + (-msdExp - 1) + digits.Length;
+        }
+        return len == 1 ? 1 : len - 1;
+    }
+
+    /// <summary>
+    /// The exponent marker ~E uses when none is given: "e" for a value whose type
+    /// is already *READ-DEFAULT-FLOAT-FORMAT*, otherwise the marker naming the
+    /// type it actually has, so the printed text reads back as the same float.
+    /// </summary>
+    private static char DefaultExponentChar(bool isSingle, bool isDouble)
+    {
+        var fmt = Runtime.GetReadDefaultFloatFormat();
+        bool defaultIsSingle = fmt == "SINGLE-FLOAT" || fmt == "SHORT-FLOAT";
+        bool defaultIsDouble = fmt == "DOUBLE-FLOAT" || fmt == "LONG-FLOAT";
+        if (isSingle) return defaultIsSingle ? 'e' : 'f';
+        if (isDouble) return defaultIsDouble ? 'e' : 'd';
+        return 'e';
+    }
+
+    /// <param name="shortestDigits">Round from the value's shortest round-trip
+    /// decimal rather than its exact binary expansion. Set only by ~G when it
+    /// derived d itself from that same shortest representation; a user-supplied
+    /// d means "round the actual value to d digits" and must use the exact
+    /// expansion (ansi-test FORMAT.E.26 checks that against the rational).</param>
     private static string FormatExponentialFloat(double value, int? w, int? d, int? e, int k,
-        char? overflowChar, char padChar, char? exponentChar, bool atSign, bool isSingle, bool isDouble)
+        char? overflowChar, char padChar, char? exponentChar, bool atSign, bool isSingle, bool isDouble,
+        bool shortestDigits = false)
     {
         bool negative = Compat.IsNegative(value);
         double absVal = Math.Abs(value);
 
-        // Determine exponent character (CLHS default: E per prin1 convention)
-        char expChar = exponentChar ?? 'E';
+        // CLHS 22.3.3.2: with no exptchar parameter the marker is the one PRIN1
+        // would use -- "e" when the value's type is *READ-DEFAULT-FLOAT-FORMAT*,
+        // otherwise the marker for its own type. A bare uppercase E went out for
+        // every float, which disagreed both with the standard and with this
+        // implementation's own printer (which already writes 1.0d10 in lower case).
+        char expChar = exponentChar ?? DefaultExponentChar(isSingle, isDouble);
 
         // Handle zero
         if (absVal == 0.0)
@@ -667,8 +817,16 @@ public static partial class Runtime
         // uses .NET's correctly-rounded algorithm that works for subnormals.
         int exponent;
         {
-            // "G17" gives exact 17-digit round-trip for all doubles including subnormals
-            string gs = absVal.ToString("G17", System.Globalization.CultureInfo.InvariantCulture);
+            // "G17" gives exact 17-digit round-trip for all doubles including
+            // subnormals. For a single-float the WIDENED double is not the value
+            // being printed: 1.0e-4 widens to 9.999999747378752e-5, whose
+            // exponent is one lower. That used to be masked because rounding
+            // those 9s carried back up; once the digits come from the shortest
+            // representation there is no carry, so the exponent has to be read
+            // off the same shortest representation.
+            string gs = (isSingle && shortestDigits)
+                ? ((float)absVal).ToString("R", System.Globalization.CultureInfo.InvariantCulture)
+                : absVal.ToString("G17", System.Globalization.CultureInfo.InvariantCulture);
             int eIdxG = gs.IndexOf('E');
             if (eIdxG < 0) eIdxG = gs.IndexOf('e');
             if (eIdxG >= 0)
@@ -714,8 +872,10 @@ public static partial class Runtime
                 ? ((float)value).ToString("R", System.Globalization.CultureInfo.InvariantCulture)
                 : value.ToString("R", System.Globalization.CultureInfo.InvariantCulture);
             rStr = NormalizePrinterFloat(rStr, absVal);
-            // rStr is now scientific like "1.23456789E7" or "-1.0E-4"
-            int rEIdx = rStr.IndexOf('E');
+            // rStr is now scientific like "1.23456789e7" or "-1.0e-4" (the printer
+            // writes the marker in lower case; accept either).
+            int rEIdx = rStr.IndexOf('e');
+            if (rEIdx < 0) rEIdx = rStr.IndexOf('E');
             if (rEIdx >= 0)
             {
                 string rSigFull = rStr.Substring(0, rEIdx).TrimStart('-'); // e.g. "1.23456789"
@@ -821,7 +981,8 @@ public static partial class Runtime
         if (totalDigitsToEmit < 1) totalDigitsToEmit = 1; // need at least one digit
 
         // Digits to round from — enough that rounding them equals rounding the value.
-        SignificantDigitsForRounding(absVal, totalDigitsToEmit, out string allDigits, out int msdExp);
+        SignificantDigitsForRounding(absVal, totalDigitsToEmit, out string allDigits, out int msdExp,
+                                     isSingle && shortestDigits);
 
         // Round allDigits to totalDigitsToEmit significant digits (round-half-up, then normalize).
         bool carry = false;
@@ -829,10 +990,11 @@ public static partial class Runtime
         {
             int firstDropped = allDigits[totalDigitsToEmit] - '0';
             string truncated = allDigits.Substring(0, totalDigitsToEmit);
-            bool roundUp = firstDropped > 5
-                || (firstDropped == 5 &&
-                    (HasNonZeroAfter(allDigits, totalDigitsToEmit + 1)
-                     || (totalDigitsToEmit > 0 && ((truncated[totalDigitsToEmit - 1] - '0') & 1) != 0)));
+            // An exact tie rounds away from zero, the rule the fixed-point path
+            // (RoundShortestToFixed) already uses and the one SBCL applies. The two
+            // disagreeing showed up as ~G printing 1.234e+3 for (format nil "~,3g"
+            // 1234.5) while its own ~F branch would have rounded up.
+            bool roundUp = firstDropped >= 5;
             if (roundUp)
             {
                 var arr = truncated.ToCharArray();
@@ -1062,10 +1224,45 @@ public static partial class Runtime
         }
     }
 
+    // One StringBuilder per thread, reused. FORMAT allocated a fresh builder (and
+    // its first chunk) on every call -- about half of what (format nil "...")
+    // cost -- while the builder is dead the moment ToString() runs. Re-entrancy
+    // is real here (a directive can call back into Lisp, ~{...~} recurses), so
+    // the pooled one is handed out at most once per thread at a time and any
+    // nested use allocates as before.
+    [ThreadStatic] private static System.Text.StringBuilder? _fmtBuilder;
+    [ThreadStatic] private static bool _fmtBuilderInUse;
+
     private static string FormatString(string template, LispObject[] args, ref int argIdx, bool streamAtLineStart = true,
                                        int initialColumn = 0)
     {
-        var sb = new System.Text.StringBuilder();
+        System.Text.StringBuilder sb;
+        bool pooled = false;
+        if (!_fmtBuilderInUse)
+        {
+            sb = _fmtBuilder ??= new System.Text.StringBuilder(128);
+            sb.Clear();
+            _fmtBuilderInUse = true;
+            pooled = true;
+        }
+        else
+        {
+            sb = new System.Text.StringBuilder();
+        }
+        try
+        {
+            return FormatStringCore(template, args, ref argIdx, sb, streamAtLineStart, initialColumn);
+        }
+        finally
+        {
+            if (pooled) _fmtBuilderInUse = false;
+        }
+    }
+
+    private static string FormatStringCore(string template, LispObject[] args, ref int argIdx,
+                                           System.Text.StringBuilder sb, bool streamAtLineStart = true,
+                                           int initialColumn = 0)
+    {
         int i = 0;
         while (i < template.Length)
         {
@@ -1201,7 +1398,7 @@ public static partial class Runtime
                             // *print-circle* is nil or a scan is already in progress.
                             string s = (colonMod && args[argIdx] is Nil)
                                 ? "()"
-                                : FormatTop(args[argIdx], false);
+                                : FormatAesthetic(args[argIdx]);
                             // ~mincol,colinc,minpad,padcharA
                             int aMincol = GetIntParam(0, 0)!.Value;
                             int aColinc = GetIntParam(1, 1)!.Value;
@@ -1278,7 +1475,7 @@ public static partial class Runtime
                                 DynamicBindings.Push(baseSym, Fixnum.Make(nonIntRadix));
                                 try
                                 {
-                                    sb.Append(FormatObject(arg, false));
+                                    sb.Append(FormatAesthetic(arg, topLevel: false));
                                 }
                                 finally
                                 {
@@ -1400,7 +1597,7 @@ public static partial class Runtime
                             // Per CLHS: if arg is not an integer, print as ~A
                             if (rArg is not Fixnum && rArg is not Bignum)
                             {
-                                sb.Append(FormatObject(rArg, false));
+                                sb.Append(FormatAesthetic(rArg, topLevel: false));
                                 argIdx++;
                                 break;
                             }
@@ -1633,18 +1830,30 @@ public static partial class Runtime
                             double gAbs = Math.Abs(gdv);
                             if (gAbs > 0 && !double.IsInfinity(gAbs) && !double.IsNaN(gAbs))
                                 gN = (int)Math.Floor(Math.Log10(gAbs)) + 1;
-                            // default d: significant digits for the float type
-                            int gDeff = gD ?? (gIsSingle ? 7 : 15);
+                            // CLHS: "If d is omitted, first let q be the number of
+                            // digits needed to print arg with no loss of information
+                            // and without leading or trailing zeros; then let d be
+                            // max(q, min(n, 7))." Using the float type's full
+                            // precision instead (7 / 15) padded every value with
+                            // zeros it never had: (format nil "~g" 1234.5) came out
+                            // "1234.500" where the round-trip needs 5 digits.
+                            int gDeff = gD ?? Math.Max(GeneralDigitCount(gdv, gIsSingle),
+                                                       Math.Min(gN, 7));
                             int gDD = gDeff - gN;
                             // If 0 <= dd <= d, use ~F; otherwise use ~E
                             if (!double.IsNaN(gdv) && !double.IsInfinity(gdv) && gDD >= 0 && gDD <= gDeff)
                             {
-                                sb.Append(FormatFixedFloat(gdv, gWW, gDD, 0, gOverflowChar, gPadChar, atMod, gIsSingle, gIsDouble));
+                                sb.Append(FormatFixedFloat(gdv, gWW, gDD, 0, gOverflowChar, gPadChar, atMod, gIsSingle, gIsDouble,
+                                                           shortestDigits: !gD.HasValue));
                                 sb.Append(new string(gPadChar, gEE));
                             }
                             else
                             {
-                                sb.Append(FormatExponentialFloat(gdv, gW, gD, gE, gK, gOverflowChar, gPadChar, gExpChar, atMod, gIsSingle, gIsDouble));
+                                // The E branch gets the d computed above, not the omitted
+                                // one: ~G decides the digit count once, and ~E must
+                                // print that many (0.0001 -> "1.0000e-4", not "1.0e-4").
+                                sb.Append(FormatExponentialFloat(gdv, gW, gDeff, gE, gK, gOverflowChar, gPadChar, gExpChar, atMod, gIsSingle, gIsDouble,
+                                                                 shortestDigits: !gD.HasValue));
                             }
                             argIdx++;
                         }
@@ -1666,16 +1875,13 @@ public static partial class Runtime
                                 }
                                 else if (atMod)
                                 {
-                                    // ~@C - output in #\name syntax (must be readable).
-                                    // Multi-word UCD names are now readable (#\SOFT HYPHEN)
-                                    // because the reader handles multi-word character names.
-                                    string? cname = GetCharacterName(lc.Value);
-                                    if (cname != null)
-                                        sb.Append("#\\" + cname);
-                                    else if (lc.Value > ' ' && lc.Value < 127)
-                                        sb.Append("#\\" + lc.Value);
-                                    else
-                                        sb.Append($"#\\U+{(int)lc.Value:X4}");
+                                    // ~@C - readable output, which is what PRIN1 already
+                                    // produces: #\a for a graphic character, the name for
+                                    // one that needs it. Preferring the UCD name whenever
+                                    // one exists printed #\LATIN_SMALL_LETTER_A for #\a --
+                                    // readable, but disagreeing with this implementation's
+                                    // own printer and with every other one.
+                                    sb.Append(FormatTop(lc, true));
                                 }
                                 else if (colonMod)
                                 {

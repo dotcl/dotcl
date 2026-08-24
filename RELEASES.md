@@ -3,6 +3,158 @@
 User-facing release notes for dotcl. Each section corresponds to a tagged
 release on the public mirror (dotcl/dotcl).
 
+## v0.1.26 -- 2026-08-23
+
+This release tightens what dotcl accepts, so code that was silently wrong can
+start erroring, and float printing moved onto the standard's rules. Both are
+under Upgrading below. Beyond that: lambda lists are readable from outside so
+SLIME and SLY can show argument hints, C variadic calls pass floats correctly, a
+GUI can start on the process main thread as macOS requires, and calls, closures,
+structures and multiple values got a lot cheaper.
+
+### Upgrading
+
+**Constants can no longer be assigned or bound.** `(setq +c+ 99)` on a
+`defconstant` used to be accepted and really did change the value; so did
+`(setq nil 1)` and `(setq t 1)`. Binding was the same: `(let ((+c+ 5)) ...)`,
+`(lambda (t) ...)`, `(dolist (nil '(1)) ...)`, `(multiple-value-bind (nil b) ...)`,
+a `handler-case` clause variable named `nil`. All signal now, as in SBCL. The one
+that bites working code is a variable named `nil` or `t`, easiest to write in a
+`multiple-value-bind` where you meant to ignore a value: give it a name and
+`(declare (ignore ...))` it.
+
+**Values that used to pass silently now signal:**
+
+- Bit arrays reject values outside their element type: `:initial-element 5`,
+  `:initial-contents '(0 5 1)`, `(setf (aref b 0) 7)`.
+- `nth` and `last` on a non-list, instead of returning `nil` or the argument.
+- `*package*` holding a non-package, with a `type-error` that names it rather
+  than a raw .NET cast message.
+- `dotcl:compare-and-swap` compares with `eql`, not `eq`. A CAS on a fixnum
+  outside the cached range used to fail silently forever.
+- A `defstruct` accessor colliding with the predicate name wins over it (as in
+  SBCL) and warns. `(:predicate ...)` removes the ambiguity.
+- `(/ 1.0d0 0.0d0)` gives the same answer compiled inline as through `funcall`;
+  the two used to disagree about `division-by-zero`.
+- FFI `:uint64` round-trips at or above 2^63 instead of failing or wrapping.
+
+**Float and format output follows the standard:**
+
+- `~F` and `~G` print from the shortest representation that reads back as the
+  same float, including with an explicit digit count, so
+  `(format nil "~,2f" 1.005)` is now `"1.01"`.
+- `~G` takes its digit count from the value, not the float type.
+- `~D` and `~R` fall back to `princ` for a non-integer; `~A` binds
+  `*print-readably*` to `nil`, like `princ`.
+- Exponent markers follow the float's type against `*read-default-float-format*`
+  and are lowercase: `1.0e10`, and `(format nil "~e" 1234.5d0)` is `"1.2345d+3"`.
+- `with-standard-io-syntax` binds `*print-readably*` to `t`, per CLHS.
+- With `*print-readably*` true the printer signals rather than abbreviating deep
+  structure to `(...)`.
+
+### Argument hints in SLIME and SLY
+
+`dotcl:function-lambda-list` returns a lambda list and a second value saying
+whether one was found, for a compiled `defun`, a macro, a generic function and
+an interpreted closure:
+
+```lisp
+(defun f (a &optional b &key c) (list a b c))
+(dotcl:function-lambda-list #'f)   ; => (A &OPTIONAL B &KEY C), T
+```
+
+Functions registered at run time and functions loaded from a `.fasl` answer
+`nil`. Built-ins are the rough edge: most answer `nil`, but some answer a
+placeholder with generated names -- `car` gives `(#:x)` with a second value of
+`t`, which tells you the arity and nothing more.
+
+### Variadic C calls
+
+`:varargs` marks where the variadic part of a call begins, the way libffi's
+`ffi_prep_cif_var` does:
+
+```lisp
+(dotnet:ffi "msvcrt" "sprintf"
+            :args '(:pointer :string :varargs :double) :ret :int
+            buf "d=%.0f" 314.0d0)
+```
+
+Without it every argument goes under the fixed-argument convention, which on
+ARM64 is a different place than the callee reads: a variadic double travels in
+an integer register or on the stack, never in a vector register. Integer-only
+variadic calls were unaffected, which is why this hid for so long. The cffi
+backend inserts the marker itself, so `foreign-funcall-varargs` and a `&rest`
+`defcfun` pass floats correctly now.
+
+### A GUI starts on the process main thread
+
+Lisp runs on a thread with a 256 MB stack, because deeply nested macro expansion
+needs one, and macOS AppKit accepts UI work on the process main thread only --
+so the README's Avalonia sample died there with "IDispatcherImpl belongs to a
+different thread". `dotcl:call-on-main-thread` hands a function to that thread
+and waits for it, which gives a toolkit's event loop the thread it wants:
+
+```lisp
+(dotcl:call-on-main-thread (lambda () (start-the-application)))
+```
+
+Windows and X11 do not care, and the wrapper costs nothing there.
+
+### dotcl clean
+
+ASDF writes compiled systems into a shared cache under your cache home, outside
+any project, where `dotnet clean` never reached. `dotcl clean` empties it;
+`--dry-run`, `--verbose` and `--keep-current` are there.
+
+### Faster and leaner
+
+0.1.25 against this release, same machine, same script, Release build.
+Allocation per operation over a 200,000-iteration loop whose own 16 B per
+iteration is included, so 16 B means the operation allocates nothing:
+
+| | 0.1.25 | 0.1.26 |
+|---|---|---|
+| generic-function call, 1 / 2 / 3 / 4 arguments | 104 / 112 / 120 / 128 B | 16 B |
+| the same with five arguments (still builds an array) | 136 B | 80 B |
+| the same call with one `:after` method | 104 B | 16 B |
+| `make-instance` with an `:after (&key a b)` | 560 B | 376 B |
+| closure capturing one variable (`lambda` or `labels`) | 464 B | 264 B |
+| two values, `(floor 7 2)`, `(gethash :k h)` | 144 B | 56 B |
+| `defstruct` keyword constructor, 2 slots | 224 B | 88 B |
+| `find` / `position` over a list | 56 B | 16 B |
+| `(make-array 1000000 :element-type '(integer 0 1000))` | 9.5 MB | 1.9 MB |
+
+Whole workloads, best of three alternating runs:
+
+- A `.fasl` that is mostly literals (4,000 quoted tuples): 689 KB and 227 ms to
+  load, now 109 KB and 14 ms. Literals are data in the assembly now instead of
+  code that rebuilds them, and that code was what the load was spending on.
+- cl-bench `strings/adjustable`: 23.8 s, now 2.2 s. A character vector holds
+  characters rather than references to them.
+
+### Also
+
+- `(optimize (debug 0))` drops the debugger's per-call frame bookkeeping. Those
+  frames are what `sldb` shows, so it is a trade you opt into.
+- `dotnet:define-class` can declare `ref` and `out` parameters, its emitted
+  methods carry parameter names, and a malformed spec signals a `program-error`
+  instead of failing later inside the emitter.
+- Type aliases in `dotnet::*type-aliases*` are consulted by every
+  type-resolution path, `dotnet:invoke-generic` included.
+- ASDF bundle operations work: a bundle is a container of fasls rather than a
+  concatenation, which a .NET assembly cannot be.
+- Ctrl-C at the REPL prompt has restarts again, including one back to the prompt.
+- The `advice` contrib is pure Lisp, with no C# bridge behind it.
+- Interop shorthand that existed but was undocumented is written down: `ref`,
+  `using`, `deref`.
+
+### Thanks
+
+- Douglas P. Fields, Jr. -- for the reports behind `dotcl clean`, the type-alias
+  fix, and the Ctrl-C restarts, and for keeping at them across releases.
+- Satoshi Imai -- for finding that the README's GUI sample could not run on
+  macOS.
+
 ## v0.1.25 -- 2026-08-18
 
 Where 0.1.24 made the interpreter *correct*, this release makes it usable: deep

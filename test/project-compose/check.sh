@@ -60,7 +60,7 @@ cat > "$WORK/Lib/Lib.asd" <<'EOF'
   :components ((:file "lib")))
 EOF
 cat > "$WORK/Lib/lib.lisp" <<'EOF'
-(defpackage :lib (:use :cl))
+(defpackage :lib (:use :cl) (:export #:lib-greet))
 (in-package :lib)
 (defun lib-greet (name) (format nil "lib greets ~a" name))
 EOF
@@ -94,7 +94,7 @@ namespace Lib
         public static string Greet(string name)
         {
             EnsureLoaded();
-            return DotclHost.ToClr<string>(DotclHost.Call("LIB-GREET", name));
+            return DotclHost.ToClr<string>(DotclHost.Call("LIB:LIB-GREET", name));
         }
     }
 }
@@ -132,7 +132,7 @@ cat > "$WORK/DotclApp/DotclApp.csproj" <<EOF
     <TargetFramework>net10.0</TargetFramework>
     <Nullable>disable</Nullable>
     <ImplicitUsings>disable</ImplicitUsings>
-    <DotclProjectAsd>\$(MSBuildProjectDirectory)/DotclApp.asd</DotclProjectAsd>
+    <DotclProjectAsd>\$(MSBuildProjectDirectory)/PcApp.asd</DotclProjectAsd>
     <DotclRuntimeProject>$RTRUN</DotclRuntimeProject>
     <DotclBaseCore>$CORE</DotclBaseCore>
   </PropertyGroup>
@@ -142,12 +142,12 @@ cat > "$WORK/DotclApp/DotclApp.csproj" <<EOF
   <Import Project="$TARGETS" />
 </Project>
 EOF
-cat > "$WORK/DotclApp/DotclApp.asd" <<'EOF'
-(defsystem "DotclApp"
+cat > "$WORK/DotclApp/PcApp.asd" <<'EOF'
+(defsystem "PcApp"
   :components ((:file "app")))
 EOF
 cat > "$WORK/DotclApp/app.lisp" <<'EOF'
-(defpackage :app (:use :cl))
+(defpackage :app (:use :cl) (:export #:app-main))
 (in-package :app)
 (defun app-main () "app ran")
 EOF
@@ -163,7 +163,7 @@ class Program
         DotclHost.Initialize();
         DotclHost.LoadFromManifest(
             Path.Combine(AppContext.BaseDirectory, "dotcl-fasl", "dotcl-deps.txt"));
-        Console.WriteLine(DotclHost.ToClr<string>(DotclHost.Call("APP-MAIN")));
+        Console.WriteLine(DotclHost.ToClr<string>(DotclHost.Call("APP:APP-MAIN")));
         // The library boots on an already-loaded core: its manifest repeats
         // dotcl.core, which must be skipped rather than loaded again.
         Console.WriteLine(Lib.Lisp.Greet("dotcl app"));
@@ -201,6 +201,62 @@ case "$out2" in
   *"lib greets dotcl app"*) ;;
   *) echo "$out2"; note "dotcl app could not call the referenced Lisp library" ;;
 esac
+
+# --- dependency resolution reports what it cannot find ----------------------
+#
+# The walk over :depends-on used to call ASDF inside IGNORE-ERRORS and skip
+# anything that came back false. NIL and an error mean different things there:
+# NIL is "(:feature :x ...) with :x absent, this dependency does not apply", an
+# error is "this dependency was declared and cannot be found". Treating the
+# second as the first wrote a manifest that silently lacked the system — exit 0,
+# no output, a build that "succeeded" and an application missing a library.
+echo "  checking dependency resolution diagnostics..."
+# The built runner: the file is runtime.exe on Windows and runtime elsewhere, and
+# which configuration exists depends on what was built last. Probe, and fall back
+# to `dotnet run` so this works in a tree that has only sources built.
+DOTCL_EXE=""
+for cand in "$ROOT/runtime/bin/Release/net10.0/runtime" \
+            "$ROOT/runtime/bin/Release/net10.0/runtime.exe" \
+            "$ROOT/runtime/bin/Debug/net10.0/runtime" \
+            "$ROOT/runtime/bin/Debug/net10.0/runtime.exe"; do
+  if [ -x "$cand" ]; then DOTCL_EXE="$cand"; break; fi
+done
+dotcl_run() {
+  if [ -n "$DOTCL_EXE" ]; then
+    "$DOTCL_EXE" "$@"
+  else
+    dotnet run --project "$(win "$ROOT/runtime/runtime.csproj")" -v q --nologo -- "$@"
+  fi
+}
+
+mkdir -p "$WORK/missingdep"
+cat > "$WORK/missingdep/missingdep.asd" <<'EOF'
+(defsystem "missingdep" :depends-on ("no-such-system-anywhere")
+  :components ((:file "missingdep")))
+EOF
+echo '(defpackage :missingdep (:use :cl))' > "$WORK/missingdep/missingdep.lisp"
+
+if out="$(dotcl_run build "$(win "$WORK/missingdep/missingdep.asd")" --resolve-deps 2>&1)"; then
+  note "resolve-deps succeeded for a system whose dependency does not exist"
+else
+  case "$out" in
+    *no-such-system-anywhere*missingdep*|*missingdep*no-such-system-anywhere*) ;;
+    *) echo "$out"; note "resolve-deps failed without naming the system or the dependency" ;;
+  esac
+fi
+
+# The other direction: an unmet :feature dependency is not a missing one, and
+# must not stop the build.
+mkdir -p "$WORK/featuredep"
+cat > "$WORK/featuredep/featuredep.asd" <<'EOF'
+(defsystem "featuredep"
+  :depends-on ((:feature :no-such-feature-here "no-such-system-anywhere"))
+  :components ((:file "featuredep")))
+EOF
+echo '(defpackage :featuredep (:use :cl))' > "$WORK/featuredep/featuredep.lisp"
+
+dotcl_run build "$(win "$WORK/featuredep/featuredep.asd")" --resolve-deps > /dev/null 2>&1 \
+  || note "resolve-deps failed on a dependency whose :feature is absent (it does not apply, so it is not missing)"
 
 if [ "$fail" -eq 0 ]; then
   echo "  OK: Lisp library composes with a plain C# app and with a dotcl app"

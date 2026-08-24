@@ -1769,3 +1769,91 @@
     (dotnet:invoke args "SetValue" "activator" 0)
     (dotnet:invoke (dotnet:static "System.Activator" "CreateInstance" ty args) "Greet"))
   "hello activator")
+
+;;; Parameter names. A MethodBuilder parameter is nameless unless DefineParameter
+;;; says otherwise, so reflection reported "" for every method emitted here. A
+;;; caller that binds arguments BY NAME then has nothing to bind to: Harmony
+;;; picks its __instance / __result / __state injections that way, and DI
+;;; containers do the same. The names were in the Lisp spec all along and were
+;;; dropped on the way down.
+;;;
+;;; Case: a symbol read the ordinary way arrives upcased and is emitted
+;;; lowercase (N -> "n"), while one written with its case preserved is taken
+;;; verbatim -- the only way to spell a name like __originalMethod.
+
+(dotnet:define-class "DotclTest.ParamNames" ()
+  (:methods ("Instance" ((count "System.Int32")) :returns "System.Int32"
+              (declare (ignore self))
+              count)
+            ("Static" ((|__originalMethod| "System.Object") (plain "System.Object"))
+              :returns "System.Void" :static t
+              (declare (ignore |__originalMethod| plain))
+              nil)))
+
+(defun %param-names (method-name)
+  (let* ((ty (dotnet:resolve-type "DotclTest.ParamNames"))
+         (mi (dotnet:invoke ty "GetMethod" method-name))
+         (ps (dotnet:invoke mi "GetParameters")))
+    (loop for i from 0 below (dotnet:invoke ps "Length")
+          collect (dotnet:invoke (dotnet:invoke ps "GetValue" i) "Name"))))
+
+(deftest net-class-instance-method-parameter-name
+  (%param-names "Instance")
+  ("count"))
+
+(deftest net-class-static-method-parameter-names-keep-case
+  (%param-names "Static")
+  ("__originalMethod" "plain"))
+
+;;; Byref parameters. A Lisp function is called with values, so a `ref' / `out'
+;;; parameter had no way to exist: the emitted body marshalled every argument by
+;;; value and nothing was ever written back. Harmony's __state is exactly this
+;;; shape (a prefix stores, a postfix reads), so advice could not be expressed
+;;; in Lisp at all.
+;;;
+;;; A byref parameter now arrives as a cell. What the body leaves in it is
+;;; copied back into the caller's location; a body that does not write leaves
+;;; the caller's value alone. Value types go through box on the way in and
+;;; unbox on the way out, so "System.Int32&" works as well as "System.Object&".
+
+(dotnet:define-class "DotclTest.ByRefParams" ()
+  (:methods ("Stamp" ((|__state| "System.Object&")) :returns "System.Void" :static t
+              (setf (dotnet:deref |__state|) "written")
+              nil)
+            ("Bump" ((n "System.Int32&")) :returns "System.Int32" :static t
+              (setf (dotnet:deref n) (+ 1 (dotnet:deref n)))
+              99)
+            ("Untouched" ((x "System.Object&")) :returns "System.Void" :static t
+              (declare (ignore x))
+              nil)))
+
+(defun %call-byref (method-name initial)
+  "Invoke METHOD-NAME through reflection with one byref arg, returning
+   (values written-back return-value)."
+  (let* ((ty (dotnet:resolve-type "DotclTest.ByRefParams"))
+         (mi (dotnet:invoke ty "GetMethod" method-name))
+         (args (dotnet:make-array "System.Object" 1)))
+    (dotnet:invoke args "SetValue" initial 0)
+    (let ((ret (dotnet:invoke mi "Invoke" nil args)))
+      (values (dotnet:invoke args "GetValue" 0) ret))))
+
+(deftest net-class-byref-object-written-back
+  (nth-value 0 (%call-byref "Stamp" "before"))
+  "written")
+
+(deftest net-class-byref-value-type-round-trips
+  (multiple-value-list (%call-byref "Bump" 41))
+  (42 99))
+
+(deftest net-class-byref-untouched-keeps-callers-value
+  (nth-value 0 (%call-byref "Untouched" "kept"))
+  "kept")
+
+(deftest net-class-byref-parameter-is-byref-in-metadata
+  (let* ((ty (dotnet:resolve-type "DotclTest.ByRefParams"))
+         (p (dotnet:invoke (dotnet:invoke (dotnet:invoke ty "GetMethod" "Stamp")
+                                          "GetParameters")
+                           "GetValue" 0)))
+    (list (dotnet:invoke p "Name")
+          (dotnet:invoke (dotnet:invoke p "ParameterType") "IsByRef")))
+  ("__state" t))

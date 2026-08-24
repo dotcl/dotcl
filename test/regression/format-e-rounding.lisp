@@ -11,31 +11,31 @@
 ;;; exact value 1051215004350025020997632 → 15 digits round UP
 (deftest format-e-rounding.above-tie
   (format nil "~,15,,0e" 1.051215004350025d24)
-  "0.105121500435003E+25")
+  "0.105121500435003d+25")
 
 ;;; exact value 9.480733862209814993681932...e-226 → 15 digits round DOWN
 (deftest format-e-rounding.below-tie
   (format nil "~,15,,0e" 9.480733862209815d-226)
-  "0.948073386220981E-225")
+  "0.948073386220981d-225")
 
 ;;; Fewer digits than the precision limit are unaffected.
 (deftest format-e-rounding.fourteen-digits
   (format nil "~,14,,0e" 1.051215004350025d24)
-  "0.10512150043500E+25")
+  "0.10512150043500d+25")
 
 (deftest format-e-rounding.short
   (list (format nil "~,3,,0e" 1.2345d0) (format nil "~,2e" 1234.5d0))
-  ("0.123E+1" "1.23E+3"))
+  ("0.123d+1" "1.23d+3"))
 
 ;;; A subnormal, where the exact expansion is hundreds of digits long.
 (deftest format-e-rounding.subnormal
   (format nil "~,15,,0e" least-positive-double-float)
-  "0.494065645841247E-323")
+  "0.494065645841247d-323")
 
 ;;; The digit-count-free form still prints the round-trip representation.
 (deftest format-e-rounding.default-digits
   (format nil "~e" 1.051215004350025d24)
-  "1.051215004350025E+24")
+  "1.051215004350025d+24")
 
 ;;; Direct check against exact rational arithmetic, for the two known values and a
 ;;; handful of ordinary ones: the printed digits must equal the exact value rounded

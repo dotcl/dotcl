@@ -26,6 +26,13 @@ public static class DynamicBindings
 
     public static LispObject Get(Symbol sym)
     {
+        // Never dynamically bound: the value is the symbol's own.
+        if (!sym.EverDynamicallyBound)
+        {
+            var v = sym.Value;
+            if (v == null) throw new LispErrorException(new LispUnboundVariable(sym));
+            return v;
+        }
         var syms = _syms;
         if (syms != null)
         {
@@ -48,6 +55,12 @@ public static class DynamicBindings
 
     public static bool TryGet(Symbol sym, out LispObject value)
     {
+        if (!sym.EverDynamicallyBound)
+        {
+            if (sym.Value != null) { value = sym.Value; return true; }
+            value = null!;
+            return false;
+        }
         var syms = _syms;
         if (syms != null)
         {
@@ -69,6 +82,8 @@ public static class DynamicBindings
 
     public static void Push(Symbol sym, LispObject value)
     {
+        // Before the entry is visible: from here on, reads of SYM must scan.
+        sym.EverDynamicallyBound = true;
         if (_syms == null || _top >= _syms.Length) Grow();
         _syms![_top] = sym;
         _vals![_top] = value is UnboundSentinel ? null : value;
@@ -103,6 +118,7 @@ public static class DynamicBindings
 
     public static LispObject Set(Symbol sym, LispObject value)
     {
+        if (!sym.EverDynamicallyBound) { sym.Value = value; return value; }
         var syms = _syms;
         if (syms != null)
         {
@@ -120,6 +136,19 @@ public static class DynamicBindings
         return value;
     }
 
+    /// <summary>
+    /// SETQ's assignment: SET, but refusing a constant variable. CLHS 3.1.2.1.1.3
+    /// makes assigning one an error, and it was silently allowed -- (setq +c+ 99)
+    /// changed the value out from under code that had already been compiled with
+    /// the old one, and (setq nil 1) / (setq t 1) reported success while doing
+    /// nothing. DEFCONSTANT itself goes through Set, not here.
+    /// </summary>
+    public static LispObject SetChecked(Symbol sym, LispObject value)
+    {
+        if (sym.IsConstant) throw Runtime.ConstantAssignmentError(sym, "SETQ");
+        return Set(sym, value);
+    }
+
     public static LispObject SetIfUnbound(Symbol sym, LispObject value)
     {
         if (TryGet(sym, out var existing)) return existing;
@@ -129,6 +158,7 @@ public static class DynamicBindings
 
     public static LispObject Makunbound(Symbol sym)
     {
+        if (!sym.EverDynamicallyBound) { sym.Value = null; return sym; }
         var syms = _syms;
         if (syms != null)
         {

@@ -234,6 +234,22 @@
   "Maps accessor symbol to slot index (integer) for compile-time inlining.
    Only populated for standard (non-typed) structs.")
 
+(defvar *struct-keyword-ctors* (make-hash-table :test #'eq :synchronized t)
+  "Maps a DEFSTRUCT keyword-constructor symbol to (STRUCT-NAME KEYWORDS INITFORMS).
+   A call whose keywords are all constant slot keywords can then be built at the
+   call site (see %STRUCT-CTOR-DIRECT-FORM) instead of paying the &key call: an
+   argument array plus the keyword scan, ~140 B a call. Standard (non-typed)
+   structs only, and the constructor keeps its ordinary &key definition for
+   APPLY, #' and non-constant keywords.")
+
+(defun %register-struct-keyword-ctor (ctor struct-name keywords initforms)
+  "Record CTOR as the keyword constructor of STRUCT-NAME. KEYWORDS and INITFORMS
+   are in slot order. Called from the DEFSTRUCT expansion at compile and load
+   time, after the constructor's own DEFUN, so a later DEFUN of the same name
+   drops the entry again (COMPILE-DEFUN-TOPLEVEL)."
+  (setf (gethash ctor *struct-keyword-ctors*)
+        (list struct-name keywords initforms)))
+
 (defvar *clos-accessor-readers* (make-hash-table :test #'eq :synchronized t)
   "Set of symbols named by DEFCLASS :reader/:accessor — a compile-time HINT that a
    1-arg call is likely a simple slot reader, so compile-named-call emits the
@@ -1642,14 +1658,22 @@
                (body (cddr form))
                (limit-var (gensym "LIMIT"))
                (loop-tag (gensym "DOTIMES-LOOP"))
-               ;; when count-form is statically fixnum, inject fixnum
-               ;; declarations so the generated compare/increment hits the
-               ;; native int64 path. Conservative:
-               ;; only when count-form is statically known fixnum; otherwise
-               ;; bignum inputs would InvalidCastException on unbox.
+               ;; When the count form is statically a fixnum the LIMIT can be
+               ;; declared too, so the loop test is a raw int64 compare. A
+               ;; bignum count would InvalidCastException on that unbox, hence
+               ;; the guard.
                (fx-count (fixnum-typed-p count-form))
-               (fx-decl (when fx-count
-                          `((declare (fixnum ,limit-var ,var))))))
+               ;; The COUNTER is a fixnum whatever the count form is: it starts
+               ;; at 0 and gains 1 per iteration, so it cannot leave fixnum range
+               ;; in any run that finishes. Declaring it puts it in an Int64 slot
+               ;; and removes the Fixnum allocated per iteration -- which every
+               ;; loop over a non-constant bound was paying (22.4 B/iteration).
+               ;; The LIMIT keeps its declaration only when it is statically a
+               ;; fixnum; otherwise it stays boxed and the loop test compares
+               ;; through %fixnum-ge-object, which still handles a bignum count.
+               (fx-decl (if fx-count
+                            `((declare (fixnum ,limit-var ,var)))
+                            `((declare (fixnum ,var))))))
           (multiple-value-bind (decls real-body) (extract-declarations body)
             `(block nil
                (let ((,limit-var ,count-form)
@@ -1658,28 +1682,36 @@
                  ,@decls
                  (tagbody
                   ,loop-tag
-                  (if (>= ,var ,limit-var)
+                  (if ,(if fx-count
+                           `(>= ,var ,limit-var)
+                           `(%fixnum-ge-object ,var ,limit-var))
                       (return ,(or result-form nil)))
                   ,@real-body
                   ;; Fixnum counter: %dotimes-1+ asserts the incremented value
                   ;; fits int64 (this point is only reached while var < limit),
                   ;; enabling a raw native add on an Int64-slot counter where a
                   ;; plain (1+ var) could not prove the +1 stays in range.
-                  (setq ,var ,(if fx-count `(%dotimes-1+ ,var) `(1+ ,var)))
+                  (setq ,var (%dotimes-1+ ,var))
                   (go ,loop-tag))))))))
 
 ;;; --- multiple-value-bind ---
 (setf (gethash 'multiple-value-bind *macros*)
       (lambda (form)
         ;; (multiple-value-bind (v1 v2 ...) expr body...)
+        ;;
+        ;; The values are read out of the per-thread bind snapshot rather than a
+        ;; MULTIPLE-VALUE-LIST: this form is how (gethash ...) / (floor ...) are
+        ;; normally consumed, and a cons per value on every such call is the bulk
+        ;; of what it cost.
         (let* ((vars (cadr form))
                (value-form (caddr form))
                (body (cdddr form))
-               (mvl-var (gensym "MVL")))
-          `(let* ((,mvl-var (multiple-value-list ,value-form))
+               (primary-var (gensym "MVP")))
+          `(let* ((,primary-var (%mv-capture ,value-form))
                   ,@(loop for v in vars
                           for i from 0
-                          collect `(,v (nth ,i ,mvl-var))))
+                          collect `(,v (%mv-nth ,i))))
+             (declare (ignorable ,primary-var))
              ,@body))))
 
 ;;; --- dotcl:async / dotcl:await (step B) ---------------------------
@@ -2465,7 +2497,21 @@
                                                                       (symbol-name (car s))))))
                                            slots))
                ;; All accessor names in order (inherited first, then own)
-               (accessor-names (append (or include-accessor-names nil) own-accessor-names)))
+               (accessor-names (append (or include-accessor-names nil) own-accessor-names))
+               ;; A slot named P under the default conc-name gives an accessor with
+               ;; the same name as the default predicate. ANSI does not say which
+               ;; wins; SBCL keeps the accessor and warns, so we do the same.
+               ;; Suppressing the predicate rather than defining it first also keeps
+               ;; the compiler and the interpreter in step: a compiled call site
+               ;; inlines the accessor from *STRUCT-ACCESSORS*, so a surviving
+               ;; predicate DEFUN would be what an interpreted call reached instead,
+               ;; and the two builds would disagree about what (FOO-P x) means.
+               (effective-pred-name
+                 (cond ((and pred-name (member pred-name accessor-names))
+                        (warn "DEFSTRUCT ~S: accessor ~S has the same name as the structure predicate. ANSI does not specify which one wins; the accessor does here, as in SBCL. Give the predicate its own name with (:predicate NAME) to remove the ambiguity."
+                              name pred-name)
+                        nil)
+                       (t pred-name))))
           ;; Error: :predicate with :type (without :named) is invalid per CLHS
           (when (and type-option pred-raw pred-name (not named-p))
             (error "~A is an invalid DEFSTRUCT option for a typed structure." :predicate))
@@ -2623,6 +2669,22 @@
                                                         type-option named-p initial-offset)
                               ctor-forms)))))
                  (nreverse ctor-forms))
+             ;; Call-site construction for the keyword constructors. Emitted AFTER
+             ;; the DEFUNs above so that the DEFUN handler's invalidation (which
+             ;; drops a stale entry when a name is redefined) does not drop this one.
+             ,@(when (null type-option)
+                 (let ((regs nil))
+                   (dolist (spec constructor-specs)
+                     (when (and spec (eq (car spec) :keyword) (cadr spec))
+                       (push `(eval-when (:compile-toplevel :load-toplevel :execute)
+                                (dotcl.cil-compiler::%register-struct-keyword-ctor
+                                 ',(cadr spec) ',name
+                                 ',(mapcar (lambda (s)
+                                             (intern (symbol-name (car s)) "KEYWORD"))
+                                           all-slots)
+                                 ',(mapcar #'cadr all-slots)))
+                             regs)))
+                   (nreverse regs)))
              ;; Accessors (for all slots including inherited)
              ,@(loop for s in all-slots
                      for acc in accessor-names
@@ -2650,12 +2712,12 @@
                                 `(defun (setf ,acc) (value obj) (setf (aref obj ,idx) value)))))
              ;; Predicate
              ,@(cond
-                 ;; Standard struct: always generate predicate if pred-name
+                 ;; Standard struct: always generate predicate if effective-pred-name
                  ((null type-option)
-                  (when pred-name
-                    `((defun ,pred-name (obj) (%struct-typep obj ',name)))))
+                  (when effective-pred-name
+                    `((defun ,effective-pred-name (obj) (%struct-typep obj ',name)))))
                  ;; Typed struct with :named: generate type-specific predicate
-                 ((and type-option named-p pred-name)
+                 ((and type-option named-p effective-pred-name)
                   ;; Find the child's own name tag position in ctor-layout
                   (let ((name-pos (if ctor-layout
                                       ;; Search from the end for the child's name tag
@@ -2668,10 +2730,10 @@
                                         (or pos (or initial-offset 0)))
                                       (or initial-offset 0))))
                     (if (eq type-option 'list)
-                        `((defun ,pred-name (obj)
+                        `((defun ,effective-pred-name (obj)
                             (and (consp obj)
                                  (eq (nth ,name-pos obj) ',name))))
-                        `((defun ,pred-name (obj)
+                        `((defun ,effective-pred-name (obj)
                             (and (vectorp obj)
                                  (> (length obj) ,name-pos)
                                  (eq (aref obj ,name-pos) ',name)))))))
@@ -3450,6 +3512,38 @@
                      (%walk-replace-cnm (cdr form) cv nv)
                      (cdr form))))))
 
+;;; %cnm-needs-capture-p -- does the body need the CAPTURED closures, or is a
+;;; plain call enough?
+;;;
+;;; The capture above exists for ONE shape: a use of CALL-NEXT-METHOD that can run
+;;; outside this method's dynamic extent -- inside a lambda the body hands to
+;;; someone else, or the function object itself. Everywhere else, a direct
+;;; (call-next-method) reads the thread state at call time and that state is
+;;; correct: a nested generic-function dispatch saves and restores it around
+;;; itself, so by the time control is back in this body the chain is this body's
+;;; again.
+;;;
+;;; The distinction is worth making because the capture is not free: it builds
+;;; TWO closures (CALL-NEXT-METHOD and NEXT-METHOD-P) on every dispatch, whether
+;;; the body uses one, the other, or -- as most methods do -- just calls
+;;; (call-next-method) once, directly.
+(defun %cnm-needs-capture-p (form)
+  (cond ((atom form) nil)
+        ;; #'call-next-method / #'next-method-p: the function object itself escapes
+        ((and (eq (car form) 'function) (consp (cdr form))
+              (member (cadr form) '(call-next-method next-method-p) :test #'eq))
+         t)
+        ;; A nested function: whatever is inside it may run later, under someone
+        ;; else's dispatch.
+        ((and (member (car form) '(lambda function flet labels macrolet) :test #'eq)
+              (%has-cnm-p form))
+         t)
+        ;; A nested defmethod has its own context
+        ((eq (car form) 'defmethod) nil)
+        (t (do ((x form (cdr x)))
+               ((not (consp x)) nil)
+             (when (%cnm-needs-capture-p (car x)) (return t))))))
+
 ;;; --- defmethod ---
 (setf (gethash 'defmethod *macros*)
       (lambda (form)
@@ -3588,7 +3682,7 @@
                                               name))
                                        (cv (gensym "CNM-"))
                                        (nv (gensym "NMP-")))
-                                  (if (some #'%has-cnm-p body)
+                                  (if (some #'%cnm-needs-capture-p body)
                                       `(lambda ,plain-params
                                          ;; Capture THIS invocation's cnm/nmp closures from
                                          ;; thread-local storage (not the global symbol-function,
@@ -4422,7 +4516,7 @@
                  (*print-miser-width* nil)
                  (*print-pretty* nil)
                  (*print-radix* nil)
-                 (*print-readably* nil)
+                 (*print-readably* t)
                  (*print-right-margin* nil)
                  (*read-base* 10)
                  (*read-default-float-format* 'single-float)
@@ -4669,15 +4763,20 @@
             (cond ((eq (car r) :prefix) (setf prefix (cadr r)))
                   ((eq (car r) :per-line-prefix) (setf per-line-prefix (cadr r)))
                   ((eq (car r) :suffix) (setf suffix (cadr r)))))
-          ;; If stream-sym is NIL, bind it to *standard-output*
-          (let ((actual-stream (if (null stream-sym)
-                                   (gensym "PPRINT-STREAM")
-                                   stream-sym))
-                (list-var (gensym "PPRINT-LIST"))
-                (count-var (gensym "PPRINT-COUNT")))
-            `(let ((,actual-stream ,(if (null stream-sym)
-                                        '*standard-output*
-                                        actual-stream)))
+          ;; CLHS PPRINT-LOGICAL-BLOCK: the stream designator NIL means
+          ;; *STANDARD-OUTPUT* and T means *TERMINAL-IO*. Both are constants and
+          ;; neither may be bound, so a designator gets a gensym bound to the
+          ;; stream it names; only a real variable name is bound to itself.
+          ;; T used to fall through and emit (let ((t ...)) ...).
+          (let* ((designator (or (null stream-sym) (eq stream-sym t)))
+                 (actual-stream (if designator
+                                    (gensym "PPRINT-STREAM")
+                                    stream-sym))
+                 (list-var (gensym "PPRINT-LIST"))
+                 (count-var (gensym "PPRINT-COUNT")))
+            `(let ((,actual-stream ,(cond ((null stream-sym) '*standard-output*)
+                                          ((eq stream-sym t) '*terminal-io*)
+                                          (t actual-stream))))
                (declare (ignorable ,actual-stream))
                (let ((,list-var ,list-form)
                      (,count-var 0))

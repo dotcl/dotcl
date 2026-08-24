@@ -180,8 +180,11 @@ public static class Mop
         {
             if (args[0] is not GenericFunction gf) return Nil.Instance;
             if (gf.StoredLambdaList != null) return gf.StoredLambdaList;
-            // Reconstruct a placeholder lambda list from arity info when no stored lambda-list.
-            return BuildLambdaListPlaceholder(gf.RequiredCount, gf.OptionalCount,
+            // Reconstruct a placeholder lambda list from arity info when no stored
+            // lambda-list, and keep it: rebuilding per call handed out a different
+            // list of fresh uninterned symbols every time.
+            return gf.PlaceholderLambdaList ??= BuildLambdaListPlaceholder(
+                gf.RequiredCount, gf.OptionalCount,
                 gf.HasRest, gf.HasKey, gf.KeywordNames, gf.HasAllowOtherKeys);
         });
 
@@ -189,8 +192,8 @@ public static class Mop
         {
             if (args[0] is not GenericFunction gf) return Nil.Instance;
             // Collect required-parameter names from stored lambda-list
-            var ll = gf.StoredLambdaList ?? BuildLambdaListPlaceholder(gf.RequiredCount,
-                gf.OptionalCount, gf.HasRest, gf.HasKey, gf.KeywordNames, gf.HasAllowOtherKeys);
+            var ll = gf.StoredLambdaList ?? (gf.PlaceholderLambdaList ??= BuildLambdaListPlaceholder(gf.RequiredCount,
+                gf.OptionalCount, gf.HasRest, gf.HasKey, gf.KeywordNames, gf.HasAllowOtherKeys));
             LispObject result = Nil.Instance;
             var reqNames = new List<LispObject>();
             var cur = ll;

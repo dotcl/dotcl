@@ -133,6 +133,11 @@
 
 (defun last (list &optional (n 1))
   (%check-index n "LAST")
+  ;; A dotted list is fine here -- (last '(a b . c)) is (b . c) -- but a
+  ;; non-list is not: the walk below simply hands the argument back, so
+  ;; (last 7) answered 7 instead of reporting it (BUTLAST already checks).
+  (unless (listp list)
+    (error 'type-error :datum list :expected-type 'list))
   ;; Return the last n conses of list (two-pointer approach)
   (let ((lead list))
     (dotimes (i n)
@@ -248,6 +253,9 @@
 ;; function-object path with the same C# comparators the 2-arg wrapper
 ;; bodies compile to (identical T/NIL results and type errors).
 (%attach-numeric-compare-fast-paths)
+;; Same for the arithmetic wrappers: #'+ handed to REDUCE / MAPCAR built an
+;; args array and a &rest list per call.
+(%attach-arith-fast-paths)
 
 ;;; ============================================================
 ;;; Sequence functions (list-specialized)
@@ -301,11 +309,28 @@
           (apply function (nreverse args))))))
 
 (defun mapcan (function list &rest more-lists)
-  (let ((tails (cons list more-lists))
-        (result nil))
-    (do ((args (%map-multi tails) (%map-multi tails)))
-        ((null args) result)
-      (setq result (nconc result (apply function (nreverse args)))))))
+  (if (null more-lists)
+      ;; Single list: keep a pointer to the tail instead of NCONCing the whole
+      ;; result again per element, and call FUNCTION directly instead of
+      ;; building an argument list for APPLY. NCONC's own rules are kept: a NIL
+      ;; piece contributes nothing, and a non-list piece is only allowed last.
+      (let ((head nil) (tail nil))
+        (dolist (x list head)
+          (let ((piece (funcall function x)))
+            (cond ((null piece))
+                  ((null head)
+                   (setq head piece)
+                   (setq tail (and (consp piece) (last piece))))
+                  ((null tail)
+                   (error 'type-error :datum head :expected-type 'list))
+                  (t
+                   (setf (cdr tail) piece)
+                   (setq tail (and (consp piece) (last piece))))))))
+      (let ((tails (cons list more-lists))
+            (result nil))
+        (do ((args (%map-multi tails) (%map-multi tails)))
+            ((null args) result)
+          (setq result (nconc result (apply function (nreverse args))))))))
 
 (defun maplist (function list &rest more-lists)
   (if (null more-lists)
@@ -1115,15 +1140,23 @@ Also expands element types within compound type specifiers like (VECTOR etype si
 
 (defun %cas-expand (place old new)
   ;; Returns the PRIOR value of PLACE (sb-ext / CCL / Interlocked.CompareExchange
-  ;; convention), not a T/NIL success flag: success is (eq old ret), and a failed CAS
+  ;; convention), not a T/NIL success flag: success is (eql old ret), and a failed CAS
   ;; hands back the current value for the next retry with no separate (racy) re-read.
+  ;;
+  ;; The comparison is EQL, not EQ. SBCL specifies EQ, but its fixnums are
+  ;; immediates, so EQ there behaves as a value comparison for exactly the objects
+  ;; EQL adds: numbers and characters. Here they are boxed and only a small cache
+  ;; is shared, so EQ would make a CAS on a counter start failing the moment it
+  ;; left that cache -- code ported from sb-ext works up to a point and then
+  ;; silently stops swapping. EQL restores the intended semantics; it costs one
+  ;; type test per attempt, under a lock that already dominates it.
   (multiple-value-bind (temps vals stores setter getter) (get-setf-expansion place)
     (let ((s (car stores)) (o (gensym "OLD")) (n (gensym "NEW")) (cur (gensym "CUR")))
       `(let* (,@(mapcar #'list temps vals) (,o ,old) (,n ,new))
          (%acquire-lock *cas-lock* t)
          (unwind-protect
               (let ((,cur ,getter))
-                (when (eq ,cur ,o) (let ((,s ,n)) ,setter))
+                (when (eql ,cur ,o) (let ((,s ,n)) ,setter))
                 ,cur)
            (%release-lock *cas-lock*))))))
 
@@ -1975,3 +2008,60 @@ and symbol-macro scope is used as the starting point."
       (setf (symbol-function by) #'%xref-who-is-called-by)
       (export who pkg)
       (export by pkg))))
+
+;;; --- Default reports for the standard condition types ---
+;;;
+;;; A condition signalled from Lisp with slots but no :format-control -- e.g.
+;;; (error 'type-error :datum 7 :expected-type 'list), which is how much of this
+;;; file reports a bad argument -- printed as "#<TYPE-ERROR>": the object holds
+;;; the datum and the expected type, and said neither. Conditions raised inside
+;;; the runtime carry their own message and are unaffected (they are not CLOS
+;;; instances, so these methods do not apply to them).
+;;;
+;;; The mechanism is the one DEFINE-CONDITION's :report already uses -- a
+;;; PRINT-OBJECT method that only fires when *PRINT-ESCAPE* is nil -- so a user
+;;; :report on a subclass overrides these by ordinary method specificity. When
+;;; the instance does carry a format control, that wins: CALL-NEXT-METHOD.
+
+(defmacro %define-condition-report ((var class) &body body)
+  "PRINT-OBJECT method for CLASS that reports via BODY when printing for a
+   human and no format control was supplied."
+  `(defmethod print-object ((,var ,class) stream)
+     (cond (*print-escape* (call-next-method))
+           ;; A simple-* subclass carries its own control string: use it, the way
+           ;; the report for SIMPLE-ERROR does.
+           ((simple-condition-format-control ,var)
+            (apply (function format) stream
+                   (simple-condition-format-control ,var)
+                   (simple-condition-format-arguments ,var)))
+           (t ,@body))))
+
+(%define-condition-report (c type-error)
+  (format stream "The value ~s is not of type ~s"
+          (type-error-datum c) (type-error-expected-type c)))
+
+(%define-condition-report (c unbound-variable)
+  (format stream "The variable ~s is unbound." (cell-error-name c)))
+
+(%define-condition-report (c undefined-function)
+  (format stream "The function ~s is undefined." (cell-error-name c)))
+
+(%define-condition-report (c unbound-slot)
+  (format stream "The slot ~s is unbound in the object ~s."
+          (cell-error-name c) (unbound-slot-instance c)))
+
+(%define-condition-report (c cell-error)
+  (format stream "The cell ~s is in error." (cell-error-name c)))
+
+(%define-condition-report (c package-error)
+  (format stream "Package error on ~a." (package-error-package c)))
+
+(%define-condition-report (c file-error)
+  (format stream "Error on file ~a." (file-error-pathname c)))
+
+(%define-condition-report (c stream-error)
+  (format stream "Stream error on ~s." (stream-error-stream c)))
+
+(%define-condition-report (c print-not-readable)
+  (format stream "The object ~a cannot be printed readably."
+          (print-not-readable-object c)))

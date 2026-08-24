@@ -2,6 +2,28 @@ namespace DotCL;
 
 public static partial class Runtime
 {
+    /// <summary>
+    /// Read SLOTNAME off a condition, whichever shape it arrives in. A condition
+    /// signalled from Lisp reaches its accessors either as the
+    /// LispInstanceCondition the signalling machinery wraps it in, or as the bare
+    /// LispInstance -- which is what a PRINT-OBJECT (i.e. a :report) method
+    /// receives. An accessor that knew only the wrapper answered NIL inside the
+    /// very method whose job is to report the condition.
+    /// </summary>
+    internal static LispObject ConditionSlot(LispObject obj, string slotName)
+    {
+        if (obj is LispInstanceCondition lic) obj = lic.Instance;
+        if (obj is not LispInstance inst) return Nil.Instance;
+        if (inst.Class.SlotIndex.TryGetValue(slotName, out int idx) && idx < inst.Slots.Length)
+            return inst.Slots[idx] ?? Nil.Instance;
+        // SlotIndex is the class's own layout; a slot inherited from a
+        // superclass is not in it, so fall through to the same lookup SLOT-VALUE
+        // performs. Unbound reads as absent here -- an accessor asked while
+        // reporting the condition must answer, not signal a second condition.
+        try { return SlotValue(inst, Startup.Sym(slotName)); }
+        catch { return Nil.Instance; }
+    }
+
     // --- Error ---
 
     public static LispObject LispError(LispObject msg)
@@ -644,7 +666,12 @@ public static partial class Runtime
         Emitter.CilAssembler.RegisterFunction("PRINT-NOT-READABLE-OBJECT",
             new LispFunction(args => {
                 Runtime.CheckArityExact("PRINT-NOT-READABLE-OBJECT", args, 1);
-                return Nil.Instance;
+                // Was a stub returning NIL, so a handler could not ask what failed
+                // to print. The printer now records the object on the condition;
+                // one built from Lisp keeps it in the OBJECT slot instead.
+                if (args[0] is LispCondition c && c.PrintNotReadableObjectRef != null)
+                    return c.PrintNotReadableObjectRef;
+                return Runtime.ConditionSlot(args[0], "OBJECT");
             }, "PRINT-NOT-READABLE-OBJECT", -1));
         Emitter.CilAssembler.RegisterFunction("UNBOUND-SLOT-INSTANCE",
             new LispFunction(args => {
@@ -658,9 +685,7 @@ public static partial class Runtime
             }, "UNBOUND-SLOT-INSTANCE", -1));
 
         Startup.RegisterUnary("CELL-ERROR-NAME", obj =>
-            obj is LispCellError ce ? ce.Name :
-            obj is LispInstanceCondition lic && lic.Instance.Class.SlotIndex.TryGetValue("NAME", out var idx) && idx < lic.Instance.Slots.Length ? (lic.Instance.Slots[idx] ?? Nil.Instance) :
-            Nil.Instance);
+            obj is LispCellError ce ? ce.Name : ConditionSlot(obj, "NAME"));
 
         // MAKE-CONDITION
         Emitter.CilAssembler.RegisterFunction("MAKE-CONDITION",
@@ -675,21 +700,15 @@ public static partial class Runtime
         Startup.RegisterUnary("FILE-ERROR-PATHNAME", obj => {
             if (obj is LispCondition cond && cond.FileErrorPathnameRef != null)
                 return cond.FileErrorPathnameRef;
-            if (obj is LispInstanceCondition lic) return Runtime.SlotValue(lic.Instance, Startup.Sym("PATHNAME"));
-            if (obj is LispInstance inst) return Runtime.SlotValue(inst, Startup.Sym("PATHNAME"));
-            return Nil.Instance;
+            return ConditionSlot(obj, "PATHNAME");
         });
         Startup.RegisterUnary("TYPE-ERROR-DATUM", obj => {
             if (obj is LispTypeError te) return te.Datum ?? Nil.Instance;
-            if (obj is LispInstanceCondition lic) return Runtime.SlotValue(lic.Instance, Startup.Sym("DATUM"));
-            if (obj is LispInstance inst) return Runtime.SlotValue(inst, Startup.Sym("DATUM"));
-            return Nil.Instance;
+            return ConditionSlot(obj, "DATUM");
         });
         Startup.RegisterUnary("TYPE-ERROR-EXPECTED-TYPE", obj => {
             if (obj is LispTypeError te) return te.ExpectedType ?? Nil.Instance;
-            if (obj is LispInstanceCondition lic) return Runtime.SlotValue(lic.Instance, Startup.Sym("EXPECTED-TYPE"));
-            if (obj is LispInstance inst) return Runtime.SlotValue(inst, Startup.Sym("EXPECTED-TYPE"));
-            return Nil.Instance;
+            return ConditionSlot(obj, "EXPECTED-TYPE");
         });
         Startup.RegisterUnary("SIMPLE-CONDITION-FORMAT-CONTROL", obj => {
             if (obj is LispInstanceCondition lic)
@@ -748,23 +767,21 @@ public static partial class Runtime
         }, "COMPUTE-RESTARTS", -1));
         Startup.RegisterUnary("PACKAGE-ERROR-PACKAGE", obj => Runtime.PackageErrorPackage(obj));
         Startup.RegisterUnary("ARITHMETIC-ERROR-OPERATION", obj => {
-            if (obj is LispInstanceCondition lic)
             {
-                if (lic.Instance.Class.SlotIndex.TryGetValue("OPERATION", out int idx) && idx < lic.Instance.Slots.Length && lic.Instance.Slots[idx] != null)
-                    return lic.Instance.Slots[idx]!;
-                if (lic.OperationRef != null) return lic.OperationRef;
+                var v = ConditionSlot(obj, "OPERATION");
+                if (v is not Nil) return v;
             }
+            if (obj is LispInstanceCondition lic && lic.OperationRef != null) return lic.OperationRef;
             if (obj is LispCondition lc && lc.OperationRef != null)
                 return lc.OperationRef;
             return Nil.Instance;
         });
         Startup.RegisterUnary("ARITHMETIC-ERROR-OPERANDS", obj => {
-            if (obj is LispInstanceCondition lic)
             {
-                if (lic.Instance.Class.SlotIndex.TryGetValue("OPERANDS", out int idx) && idx < lic.Instance.Slots.Length && lic.Instance.Slots[idx] != null)
-                    return lic.Instance.Slots[idx]!;
-                if (lic.OperandsRef != null) return lic.OperandsRef;
+                var v = ConditionSlot(obj, "OPERANDS");
+                if (v is not Nil) return v;
             }
+            if (obj is LispInstanceCondition lic && lic.OperandsRef != null) return lic.OperandsRef;
             if (obj is LispCondition lc && lc.OperandsRef != null)
                 return lc.OperandsRef;
             return Nil.Instance;

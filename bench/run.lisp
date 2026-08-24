@@ -14,6 +14,28 @@
 (defvar *bench-name* nil  "Specific benchmark name to run (string), or NIL for all in suite")
 (defvar *bench-runs* nil  "If non-nil integer N, survey mode: emit N samples as JSON array. NIL = scalar output (default).")
 (defvar *bench-warmup* 1  "Number of warmup iterations to discard before recording N samples. Ignored in scalar mode.")
+(defvar *bench-consed* t  "When true, also measure bytes allocated per benchmark (emitted as \"<name>/consed\").")
+
+;;; --- Allocation measurement ---
+;;;
+;;; Time alone does not say why a benchmark is slow. The allocation counter does:
+;;; a benchmark that conses an order of magnitude more than another implementation
+;;; is paying for GC and for the allocation itself, and that is a different repair
+;;; from a slow inner loop.
+;;;
+;;; Both hosts expose the same thing -- a monotonic process-wide count of bytes
+;;; allocated since start -- so the delta across a benchmark is its consing.
+;;; dotcl: element 4 of DOTCL:GC-STATS (GC.GetTotalAllocatedBytes).
+;;; SBCL:  SB-EXT:GET-BYTES-CONSED.
+;;; Elsewhere this returns NIL and no "/consed" key is emitted.
+;;;
+;;; The counter is per-thread-buffer accurate, not exact: a delta of a few
+;;; hundred bytes is noise. The numbers that matter here are megabytes.
+
+(defun bench-bytes-consed ()
+  #+dotcl (nth 4 (dotcl:gc-stats))
+  #+(and sbcl (not dotcl)) (sb-ext:get-bytes-consed)
+  #-(or dotcl sbcl) nil)
 
 ;;; --- Results tracking ---
 
@@ -26,11 +48,34 @@
     (format *error-output* ",~%"))
   (incf *bench-count*))
 
-(defun bench-emit-scalar (name elapsed times)
+(defun bench-emit-scalar (name elapsed times consed)
   (bench-emit-comma)
   (format *error-output* "  ~S: ~,3F" name elapsed)
   (finish-output *error-output*)
-  (format t "~&~25A ~8,3F sec  (~D runs)~%" name elapsed times))
+  (format t "~&~25A ~8,3F sec  (~D runs)" name elapsed times)
+  (when consed
+    (bench-emit-comma)
+    (format *error-output* "  ~S: ~D" (bench-consed-key name) consed)
+    (finish-output *error-output*)
+    (format t "  ~,1F MB consed" (/ consed 1048576.0)))
+  (format t "~%"))
+
+(defun bench-consed-key (name)
+  ;; A separate JSON key rather than a nested object: both aggregators
+  ;; (make-state.sh, make-survey-state.lisp) key on "<name>": <value> and carry
+  ;; any name through untouched, so consing gets its own dotcl/sbcl/ratio row
+  ;; with no change on their side.
+  (concatenate 'string name "/consed"))
+
+(defun bench-emit-consed-samples (name samples)
+  (bench-emit-comma)
+  (format *error-output* "  ~S: [" (bench-consed-key name))
+  (let ((first t))
+    (dolist (s samples)
+      (if first (setq first nil) (format *error-output* ", "))
+      (format *error-output* "~D" s)))
+  (format *error-output* "]")
+  (finish-output *error-output*))
 
 (defun bench-emit-samples (name samples times)
   (bench-emit-comma)
@@ -57,26 +102,37 @@
 ;;; Scalar mode (*bench-runs* = NIL): one measurement emitted as "name": 0.123
 ;;; Survey mode (*bench-runs* = N):   N samples emitted as   "name": [s1, s2, ...]
 ;;;                                   after *bench-warmup* warmup iterations are discarded
+;;; Either way, when the host exposes an allocation counter, the bytes consed
+;;; are emitted in the same shape under "name/consed" (*bench-consed* = NIL
+;;; turns that off).
 
 (defmacro bench (name times &body body)
+  ;; The allocation counter is read outside the timed region on both ends, so
+  ;; reading it (which itself conses a little) is not charged to the benchmark.
   `(when (or (null *bench-name*) (string-equal *bench-name* ,name))
      (handler-case
        (if (and *bench-runs* (> *bench-runs* 0))
-           (let (samples)
+           (let (samples consed)
              (dotimes (run (+ *bench-warmup* *bench-runs*))
-               (let ((start (get-internal-real-time)))
+               (let* ((c0 (and *bench-consed* (bench-bytes-consed)))
+                      (start (get-internal-real-time)))
                  (dotimes (i ,times) ,@body)
-                 (when (>= run *bench-warmup*)
-                   (push (float (/ (- (get-internal-real-time) start)
-                                   internal-time-units-per-second))
-                         samples))))
-             (bench-emit-samples ,name (nreverse samples) ,times))
-           (let ((start (get-internal-real-time)))
+                 (let* ((elapsed (float (/ (- (get-internal-real-time) start)
+                                           internal-time-units-per-second)))
+                        (c1 (and *bench-consed* (bench-bytes-consed))))
+                   (when (>= run *bench-warmup*)
+                     (push elapsed samples)
+                     (when (and c0 c1) (push (- c1 c0) consed))))))
+             (bench-emit-samples ,name (nreverse samples) ,times)
+             (when consed (bench-emit-consed-samples ,name (nreverse consed))))
+           (let* ((c0 (and *bench-consed* (bench-bytes-consed)))
+                  (start (get-internal-real-time)))
              (dotimes (i ,times) ,@body)
-             (bench-emit-scalar ,name
-                                (float (/ (- (get-internal-real-time) start)
-                                          internal-time-units-per-second))
-                                ,times)))
+             (let* ((elapsed (float (/ (- (get-internal-real-time) start)
+                                       internal-time-units-per-second)))
+                    (c1 (and *bench-consed* (bench-bytes-consed))))
+               (bench-emit-scalar ,name elapsed ,times
+                                  (and c0 c1 (- c1 c0))))))
        (error (e)
          (bench-emit-null ,name)
          (format t "~&~25A ERROR: ~A~%" ,name e)))))

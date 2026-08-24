@@ -7,7 +7,7 @@ DOTCL_LISP ?= ros -L sbcl-bin run
 STDBUF ?=
 SETSID ?= $(shell which setsid 2>/dev/null)
 
-.PHONY: all build build-ns2 check-contrib-freshness run clean repl test-core-bytes test-coverage test-ansi-all test-ansi-full test-ansi-extra test-regression test-regression-interp test-regression-emitfree test-pack-nuspec test-save-class-lib test-project-compose test-mop ilverify update-ansi-state commit-ansi-state cross-compile selfhost-check selfhost-test seed-install seed-check loc publish pack install setup-ansi-test setup-asdf setup-quicklisp setup-cl-bench bench bench-state bench-survey compile-asdf-fasl compile-asdf-fasls compile-quicklisp-fasl compile-core-fasl compile-contrib-fasls contrib-dotcl-cs contrib-dotcl-jitdisasm gen-char-names
+.PHONY: all build build-ns2 check-contrib-freshness run clean repl test-fasl-shape test-core-bytes test-host-api test-coverage test-ansi-all test-ansi-full test-ansi-extra test-regression test-regression-interp test-regression-emitfree test-pack-nuspec test-save-class-lib test-project-compose test-project-core-build test-mop ilverify update-ansi-state commit-ansi-state cross-compile selfhost-check selfhost-test seed-install seed-check loc publish pack install setup-ansi-test setup-asdf setup-quicklisp setup-cl-bench bench bench-state bench-survey compile-asdf-fasl compile-asdf-fasls compile-quicklisp-fasl compile-core-fasl compile-contrib-fasls contrib-dotcl-cs contrib-dotcl-jitdisasm gen-char-names
 
 # Source files for cross-compile. Listed once; the recipe and dependency
 # tracking both reference this so adding a file is a single-edit change.
@@ -18,6 +18,18 @@ CIL_SOURCES := \
   $(DOTCL_ROOT)compiler/loop.lisp \
   $(DOTCL_ROOT)compiler/cil-analysis.lisp \
   $(DOTCL_ROOT)compiler/cil-forms.lisp
+
+# Runtime (C#) sources. A compiled .fasl carries the code generation of the
+# RUNTIME that produced it as much as the compiler's: the emitter lives here, in
+# C#. cil-out.sil does not move when only C# changes, so a fasl built before such
+# a change stays "up to date" by the .sil dependency alone and keeps its old
+# codegen -- which is how an emitter change that broke loading asdf passed
+# locally and failed in CI, where every run rebuilds the fasl.
+RUNTIME_SOURCES := \
+  $(wildcard $(DOTCL_ROOT)runtime/*.cs) \
+  $(wildcard $(DOTCL_ROOT)runtime/Emitter/*.cs) \
+  $(wildcard $(DOTCL_ROOT)runtime/Diagnostics/*.cs) \
+  $(wildcard $(DOTCL_ROOT)runtime/Generated/*.cs)
 
 all: cross-compile build
 
@@ -52,6 +64,26 @@ check-contrib-freshness:
 	    echo "contrib fasls are newer than cil-out.sil"; \
 	  fi; \
 	fi
+	@# The same question against the RUNTIME sources. The emitter is C#, so a
+	@# fasl can be newer than cil-out.sil and still carry superseded code
+	@# generation. Reported separately because the answer differs: a compiler
+	@# edit makes every fasl "old" and is usually irrelevant, while a C# emitter
+	@# edit is exactly the case that produced a green local run and a red CI one.
+	@newest=$$(ls -t $(RUNTIME_SOURCES) 2>/dev/null | head -1); \
+	if [ -n "$$newest" ]; then \
+	  stale=""; \
+	  for f in $(DOTCL_ROOT)contrib/*/*.fasl $(DOTCL_ROOT)compiler/dotcl.core; do \
+	    case "$$f" in *-r2r-*) continue;; esac; \
+	    [ -f "$$f" ] || continue; \
+	    [ "$$f" -ot "$$newest" ] && stale="$$stale $$f"; \
+	  done; \
+	  if [ -n "$$stale" ]; then \
+	    echo "older than $$(basename $$newest) (built by an older RUNTIME):"; \
+	    for f in $$stale; do echo "  $$f"; done; \
+	  else \
+	    echo "contrib fasls are newer than the runtime sources"; \
+	  fi; \
+	fi
 	@echo ""
 	@# Which file each (require "<name>") actually reaches, and what it hides.
 	@# Comparing timestamps against cil-out.sil (above) says "old" about
@@ -65,7 +97,13 @@ run:
 repl:
 	dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --repl
 
-test-regression: build $(DOTCL_ROOT)compiler/cil-out.sil
+# The suite loads asdf, so it exercises whatever asdf.fasl holds. $(wildcard)
+# rather than a plain prerequisite: a tree that has no fasl yet must not be made
+# to clone and build asdf just to run the suite, but one that HAS a fasl must not
+# run against a stale one. Without this the suite reports on the codegen of
+# whenever the fasl was last built -- green locally, red in CI, which is exactly
+# how a broken emitter change once shipped.
+test-regression: build $(DOTCL_ROOT)compiler/cil-out.sil $(wildcard $(DOTCL_ROOT)contrib/asdf/asdf.fasl)
 	@echo "=== Running dotcl regression tests ==="
 	$(SETSID) dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --asm $(DOTCL_ROOT)compiler/cil-out.sil $(DOTCL_ROOT)test/regression/run.lisp
 
@@ -80,7 +118,7 @@ test-regression: build $(DOTCL_ROOT)compiler/cil-out.sil
 # only — LOAD still compiles top-level forms. This exercises the interpreter
 # wherever a test reaches it through EVAL, which is far better than nothing but
 # is not the same as running the suite ON an emit-free build.
-test-regression-interp: build $(DOTCL_ROOT)compiler/cil-out.sil
+test-regression-interp: build $(DOTCL_ROOT)compiler/cil-out.sil $(wildcard $(DOTCL_ROOT)contrib/asdf/asdf.fasl)
 	@echo "=== Running dotcl regression tests (tree-walk interpreter) ==="
 	$(SETSID) dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --asm $(DOTCL_ROOT)compiler/cil-out.sil --eval '(setq dotcl:*evaluator-mode* :interpret)' $(DOTCL_ROOT)test/regression/run.lisp
 
@@ -99,7 +137,7 @@ test-regression-interp: build $(DOTCL_ROOT)compiler/cil-out.sil
 # framework (see runtime/DotCL.Runtime.csproj), so this differs from a normal run
 # in exactly one axis. It needs the FASL core: --asm of a .sil would itself want
 # the assembler.
-test-regression-emitfree: $(DOTCL_ROOT)compiler/dotcl.core
+test-regression-emitfree: $(DOTCL_ROOT)compiler/dotcl.core $(wildcard $(DOTCL_ROOT)contrib/asdf/asdf.fasl)
 	@echo "=== Running dotcl regression tests (emit-free build) ==="
 	$(SETSID) dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -p:DotclNoEmit=true -- --core $(DOTCL_ROOT)compiler/dotcl.core $(DOTCL_ROOT)test/regression/run.lisp
 
@@ -126,6 +164,17 @@ test-save-class-lib: build
 	@echo "=== Running save-class-library checks ==="
 	sh $(DOTCL_ROOT)test/save-class-lib/check.sh $(DOTCL_ROOT)
 
+
+# The MSBuild integration users actually get: the ProjectCore targets driving the
+# in-process tasks. test-project-compose builds with the legacy targets (which
+# shell out), so nothing else here executes the task assembly at all. Assembles
+# the package layout the targets resolve against and builds a project twice: once
+# with a dependency that cannot be found (the message has to name the remedy) and
+# once with DotclAsdSearchPath set (it has to build).
+test-project-core-build: build $(DOTCL_ROOT)compiler/dotcl.core
+	@echo "=== Running project-core MSBuild task checks ==="
+	sh $(DOTCL_ROOT)test/project-core-build/check.sh $(DOTCL_ROOT)
+
 test-project-compose: build
 	@echo "=== Running project-core composition checks ==="
 	sh $(DOTCL_ROOT)test/project-compose/check.sh $(DOTCL_ROOT)
@@ -133,6 +182,10 @@ test-project-compose: build
 # Booting from a core held in memory (DotclHost.LoadCore(byte[])) — the only way
 # in for a host with no filesystem, and for the emit-free runtime the only way in
 # at all. Covers both the normal and the emit-free build.
+test-host-api: build $(DOTCL_ROOT)compiler/dotcl.core
+	@echo "=== Running embedding-API checks ==="
+	sh $(DOTCL_ROOT)test/host-api/check.sh $(DOTCL_ROOT)
+
 test-core-bytes: build $(DOTCL_ROOT)compiler/dotcl.core
 	@echo "=== Running in-memory core checks ==="
 	sh $(DOTCL_ROOT)test/core-bytes/check.sh $(DOTCL_ROOT)
@@ -153,6 +206,16 @@ test-mop: build $(DOTCL_ROOT)compiler/cil-out.sil
 ilverify: build $(DOTCL_ROOT)compiler/cil-out.sil
 	@echo "=== Verifying emitted CIL (ilverify) ==="
 	bash $(DOTCL_ROOT)scripts/ilverify-check.sh
+
+# ilverify's companion: it asks whether the IL is VALID, this asks whether the
+# assembly has a loadable SHAPE — no single method too large to JIT cheaply, no
+# type near the field limit, no oversized #US heap. Those failures are invisible
+# on the compile side (total IL, fasl bytes and compile time stay flat) and land
+# at LOAD as a diagnostic that names neither file nor cause. Every instance so
+# far was found by a user running out of memory rather than by CI.
+test-fasl-shape: build $(DOTCL_ROOT)compiler/cil-out.sil
+	@echo "=== Checking fasl shape (per-method IL / fields per type / #US heap) ==="
+	bash $(DOTCL_ROOT)scripts/fasl-shape-check.sh
 
 # Compile-only tripwire for the netstandard2.0 runtime — the build that AOT
 # (NativeAOT) and WebGL (Unity IL2CPP) link against. `make build` only compiles
@@ -251,9 +314,20 @@ update-ansi-state:
 	if [ $$has_results -eq 0 ]; then \
 		echo "No /tmp/ansi-*.txt results found; keeping existing ansi-state.json"; \
 	else \
+		: 'Capture the hand-written half of the file BEFORE the redirection below'; \
+		: 'truncates it. Everything between "source" and "categories" is judgement'; \
+		: 'no run can reproduce -- which failures are known and why, which tests a'; \
+		: 'note excludes and what three implementations answered on the same forms'; \
+		: '-- and regenerating without it silently deleted all of it, with'; \
+		: 'commit-ansi-state standing by to commit the deletion.'; \
+		curated=""; \
+		if [ -f $(DOTCL_ROOT)ansi-state.json ]; then \
+			curated=$$(sed -n '/^  "source"/,/^  "categories"/p' $(DOTCL_ROOT)ansi-state.json | sed '$$d'); \
+		fi; \
 		{ \
 		echo '{'; \
 		echo '  "updated": "'"$$(date +%Y-%m-%d)"'",'; \
+		if [ -n "$$curated" ]; then printf '%s\n' "$$curated"; fi; \
 		completed=""; \
 		for cat in $(ANSI_CATEGORIES); do \
 			outfile=/tmp/ansi-$$cat.txt; \
@@ -387,6 +461,27 @@ SUITE ?=
 BENCH ?=
 BENCH_TIMEOUT ?= 600
 
+# Benchmarks measure the RELEASE build. `dotnet run --project` builds Debug, and
+# a Debug assembly is a different implementation to the JIT: it skips the
+# optimisations that depend on the C# compiler's output shape. Sealing the core
+# object types measured 0% through `dotnet run` and -17% on the same
+# machine in Release, because the JIT does not devirtualise `is Cons` in a
+# debuggable assembly. Allocation numbers (the /consed columns) do not depend on
+# the configuration, but every time figure here does.
+#
+# The exe is invoked directly rather than through `dotnet run` for the same
+# reason the profile is collected that way: `dotnet run` also charges its own
+# build check and launcher to the first measurement.
+# Recursive (=), not simple (:=): HOST_RID is defined further down this file, so
+# a simply-expanded assignment here would see it empty and always pick the
+# POSIX name.
+BENCH_EXE_NAME = $(if $(filter win-%,$(HOST_RID)),runtime.exe,runtime)
+BENCH_RUNTIME  = $(DOTCL_ROOT)runtime/bin/Release/net10.0/$(BENCH_EXE_NAME)
+
+.PHONY: bench-build
+bench-build:
+	@dotnet build $(DOTCL_ROOT)runtime/runtime.csproj -c Release -v:q --nologo
+
 # The harness ships, but a tree can still be missing it (a source tarball that
 # dropped bench/, say), and then these targets have no inputs. Say so and stop,
 # instead of failing partway through on a missing file. The check is a
@@ -403,20 +498,20 @@ bench bench-state bench-survey:
 
 else
 
-bench: setup-cl-bench
+bench: setup-cl-bench bench-build
 	@EVAL_ARGS=""; \
 	if [ -n "$(SUITE)" ]; then EVAL_ARGS="--eval '(setq *bench-suite* :$(SUITE))'"; fi; \
 	if [ -n "$(BENCH)" ]; then EVAL_ARGS="$$EVAL_ARGS --eval '(setq *bench-name* \"$(BENCH)\")'"; fi; \
-	eval DOTNET_gcServer=0 $(SETSID) timeout $(BENCH_TIMEOUT) dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --asm $(DOTCL_ROOT)compiler/cil-out.sil $$EVAL_ARGS $(DOTCL_ROOT)bench/run.lisp; \
+	eval DOTNET_gcServer=0 $(SETSID) timeout $(BENCH_TIMEOUT) $(BENCH_RUNTIME) --asm $(DOTCL_ROOT)compiler/cil-out.sil $$EVAL_ARGS $(DOTCL_ROOT)bench/run.lisp; \
 	rc=$$?; if [ $$rc -eq 124 ]; then echo ";; TIMEOUT after $(BENCH_TIMEOUT)s"; fi
 
 # Generate bench-state.json with dotcl and SBCL results side by side
-bench-state: setup-cl-bench
+bench-state: setup-cl-bench bench-build
 	@echo "=== Running benchmarks on dotcl ==="
 	@EVAL_ARGS=""; \
 	if [ -n "$(SUITE)" ]; then EVAL_ARGS="--eval '(setq *bench-suite* :$(SUITE))'"; fi; \
 	if [ -n "$(BENCH)" ]; then EVAL_ARGS="$$EVAL_ARGS --eval '(setq *bench-name* \"$(BENCH)\")'"; fi; \
-	eval DOTNET_gcServer=0 $(SETSID) timeout $(BENCH_TIMEOUT) dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --asm $(DOTCL_ROOT)compiler/cil-out.sil $$EVAL_ARGS $(DOTCL_ROOT)bench/run.lisp 2>/tmp/bench-dotcl.txt; \
+	eval DOTNET_gcServer=0 $(SETSID) timeout $(BENCH_TIMEOUT) $(BENCH_RUNTIME) --asm $(DOTCL_ROOT)compiler/cil-out.sil $$EVAL_ARGS $(DOTCL_ROOT)bench/run.lisp 2>/tmp/bench-dotcl.txt; \
 	rc=$$?; if [ $$rc -eq 124 ]; then echo ";; dotcl TIMEOUT after $(BENCH_TIMEOUT)s"; fi
 	@echo "=== Running benchmarks on SBCL ==="
 	@EVAL_ARGS=""; \
@@ -439,12 +534,12 @@ WARMUP ?= 1
 # Pin SBCL (see DOTCL_LISP note) so the bench "sbcl" column is really SBCL and
 # not whatever the Roswell default happens to be (#35).
 SBCL_RUN ?= ros -L sbcl-bin run
-bench-survey: setup-cl-bench
+bench-survey: setup-cl-bench bench-build
 	@echo "=== Survey dotcl (runs=$(RUNS) warmup=$(WARMUP)) ==="
 	@EVAL_ARGS="--eval '(setq *bench-runs* $(RUNS))' --eval '(setq *bench-warmup* $(WARMUP))'"; \
 	if [ -n "$(SUITE)" ]; then EVAL_ARGS="$$EVAL_ARGS --eval '(setq *bench-suite* :$(SUITE))'"; fi; \
 	if [ -n "$(BENCH)" ]; then EVAL_ARGS="$$EVAL_ARGS --eval '(setq *bench-name* \"$(BENCH)\")'"; fi; \
-	eval DOTNET_gcServer=0 $(SETSID) timeout $(BENCH_TIMEOUT) dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --asm $(DOTCL_ROOT)compiler/cil-out.sil $$EVAL_ARGS $(DOTCL_ROOT)bench/run.lisp 2>/tmp/bench-survey-dotcl.txt; \
+	eval DOTNET_gcServer=0 $(SETSID) timeout $(BENCH_TIMEOUT) $(BENCH_RUNTIME) --asm $(DOTCL_ROOT)compiler/cil-out.sil $$EVAL_ARGS $(DOTCL_ROOT)bench/run.lisp 2>/tmp/bench-survey-dotcl.txt; \
 	rc=$$?; if [ $$rc -eq 124 ]; then echo ";; dotcl TIMEOUT after $(BENCH_TIMEOUT)s"; fi
 	@echo "=== Survey SBCL (runs=$(RUNS) warmup=$(WARMUP)) ==="
 	@EVAL_ARGS="--eval '(setq *bench-runs* $(RUNS))' --eval '(setq *bench-warmup* $(WARMUP))'"; \
@@ -567,7 +662,7 @@ publish:
 # Compile contrib/asdf/asdf.lisp → asdf.fasl (.NET IL assembly) with dotcl
 # itself. .fasl is the shipped artifact (fastest load); .sil and .lisp are
 # not distributed. All 3 are gitignored.
-$(DOTCL_ROOT)contrib/asdf/asdf.fasl: $(DOTCL_ROOT)compiler/cil-out.sil $(DOTCL_ROOT)contrib/asdf/asdf.lisp
+$(DOTCL_ROOT)contrib/asdf/asdf.fasl: $(DOTCL_ROOT)compiler/cil-out.sil $(DOTCL_ROOT)contrib/asdf/asdf.lisp $(RUNTIME_SOURCES)
 	dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --asm $(DOTCL_ROOT)compiler/cil-out.sil --eval '(compile-file "$(DOTCL_ROOT)contrib/asdf/asdf.lisp")'
 
 compile-asdf-fasl: setup-asdf $(DOTCL_ROOT)contrib/asdf/asdf.fasl
@@ -584,7 +679,7 @@ compile-asdf-fasls: compile-asdf-fasl
 # asdf has to be loaded first: the client reads asdf: symbols at read time
 # (client.lisp, dist.lisp, misc.lisp, setup.lisp), exactly as upstream's
 # bootstrap loads asdf.lisp before the client files.
-$(DOTCL_ROOT)contrib/quicklisp/quicklisp.fasl: $(DOTCL_ROOT)compiler/cil-out.sil $(DOTCL_ROOT)contrib/quicklisp/quicklisp.lisp $(DOTCL_ROOT)contrib/asdf/asdf.fasl
+$(DOTCL_ROOT)contrib/quicklisp/quicklisp.fasl: $(DOTCL_ROOT)compiler/cil-out.sil $(DOTCL_ROOT)contrib/quicklisp/quicklisp.lisp $(DOTCL_ROOT)contrib/asdf/asdf.fasl $(RUNTIME_SOURCES)
 	dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --asm $(DOTCL_ROOT)compiler/cil-out.sil --eval '(progn (require "asdf") (compile-file "$(DOTCL_ROOT)contrib/quicklisp/quicklisp.lisp"))'
 
 compile-quicklisp-fasl: setup-quicklisp compile-asdf-fasl $(DOTCL_ROOT)contrib/quicklisp/quicklisp.fasl
@@ -593,9 +688,9 @@ compile-quicklisp-fasl: setup-quicklisp compile-asdf-fasl $(DOTCL_ROOT)contrib/q
 # builds consume these as ready artifacts instead of recompiling
 # contrib source per project. Pattern rule matches contrib/<name>/<name>.lisp
 # → contrib/<name>/<name>.fasl. asdf is handled separately above.
-# CONTRIB_NAMES is auto-detected from contrib/*/ subdirs so that public
-# mirror builds (where externally-sourced contribs are excluded via
-# mirror-exclude) skip the missing dirs gracefully (dotcl/dotcl issue #2).
+# CONTRIB_NAMES is auto-detected from contrib/*/ subdirs, so a tree that does
+# not carry a given contrib skips it gracefully instead of failing on a missing
+# directory (dotcl/dotcl#2).
 CONTRIB_NAMES := $(filter-out asdf quicklisp cil-from-cs,$(notdir $(patsubst %/,%,$(wildcard $(DOTCL_ROOT)contrib/*/))))
 
 CONTRIB_FASLS := $(foreach n,$(CONTRIB_NAMES),$(DOTCL_ROOT)contrib/$(n)/$(n).fasl)
@@ -604,7 +699,23 @@ CONTRIB_FASLS := $(foreach n,$(CONTRIB_NAMES),$(DOTCL_ROOT)contrib/$(n)/$(n).fas
 # like any other contrib: that step only crossgen2's an existing IL fasl.
 CONTRIB_R2R_NAMES := $(CONTRIB_NAMES) quicklisp
 
-$(DOTCL_ROOT)contrib/%.fasl: $(DOTCL_ROOT)contrib/%.lisp $(DOTCL_ROOT)compiler/cil-out.sil
+# Order between contribs. A contrib whose source does (require "other") is
+# compiled with that other contrib LOADED, and the loader prefers its prebuilt
+# .fasl — so a stale one is what the compile sees. Nothing declares this
+# relationship: the .asd files carry no :depends-on and the requirement is a
+# (require ...) in the source, so it is read from the source here.
+#
+# Without it the build is alphabetical and breaks the day one contrib starts
+# using a new export of another: advice (a) began calling dotnet:deref, which
+# lives in dotnet-class (d), and compiling advice failed with "Symbol DEREF is
+# not external in package DOTNET" against the older fasl.
+CONTRIB_REQUIRE_NAMES = $(filter-out $(1),$(filter $(CONTRIB_NAMES),$(shell sed -n 's/.*(require "\([a-z0-9-]*\)").*/\1/p' $(DOTCL_ROOT)contrib/$(1)/$(1).lisp 2>/dev/null)))
+define CONTRIB_ORDER_RULE
+$(DOTCL_ROOT)contrib/$(1)/$(1).fasl: $(foreach d,$(call CONTRIB_REQUIRE_NAMES,$(1)),$(DOTCL_ROOT)contrib/$(d)/$(d).fasl)
+endef
+$(foreach n,$(CONTRIB_NAMES),$(eval $(call CONTRIB_ORDER_RULE,$(n))))
+
+$(DOTCL_ROOT)contrib/%.fasl: $(DOTCL_ROOT)contrib/%.lisp $(DOTCL_ROOT)compiler/cil-out.sil $(RUNTIME_SOURCES)
 	dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --asm $(DOTCL_ROOT)compiler/cil-out.sil --eval '(compile-file "$<")'
 	@n=$$(echo '$*' | cut -d/ -f1); \
 	if [ -d "$(DOTCL_ROOT)runtime/contrib/$$n" ]; then \
@@ -617,7 +728,7 @@ compile-contrib-fasls: $(CONTRIB_FASLS)
 # dotcl:sil-to-fasl. The resulting .fasl loads in ~0.3s vs ~1.0s for .sil
 # because Reader parse (~1.1s) + CIL assemble (~170ms) are both skipped.
 # Ships in the pack as the default core.
-$(DOTCL_ROOT)compiler/dotcl.core: $(DOTCL_ROOT)compiler/cil-out.sil $(DOTCL_ROOT)runtime/Generated/UnicodeCharNames.g.cs
+$(DOTCL_ROOT)compiler/dotcl.core: $(DOTCL_ROOT)compiler/cil-out.sil $(DOTCL_ROOT)runtime/Generated/UnicodeCharNames.g.cs $(RUNTIME_SOURCES)
 	dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --asm $(DOTCL_ROOT)compiler/cil-out.sil --eval '(dotcl:sil-to-fasl "$(DOTCL_ROOT)compiler/cil-out.sil" "$(DOTCL_ROOT)compiler/dotcl.core")'
 
 compile-core-fasl: $(DOTCL_ROOT)compiler/dotcl.core

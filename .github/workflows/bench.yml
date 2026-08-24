@@ -39,7 +39,7 @@ defaults:
 
 jobs:
   bench:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     # A full survey lands around 20 minutes. The cap is what a hung run costs,
     # so keep it near the real figure rather than at the largest plausible one.
     timeout-minutes: 30

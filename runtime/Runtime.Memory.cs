@@ -32,13 +32,47 @@ public static partial class Runtime
         return raw.TrimStart(':').ToUpperInvariant().Replace("-", "_");
     }
 
+
+    // --- Integer coercion helpers for FFI/memory (see also NativeFFI) ---
+    // C unsigned 64-bit values above 2^63-1 arrive as Bignum, so a plain
+    // Fixnum cast is not enough; and reads must come back non-negative.
+
+    /// Coerce a Lisp integer to ulong, accepting the full 0..2^64-1 range.
+    internal static ulong ToULong(LispObject v, string who)
+    {
+        System.Numerics.BigInteger b;
+        if (v is Fixnum fx) b = fx.Value;
+        else if (v is Bignum bn) b = bn.Value;
+        else throw new LispErrorException(new LispError($"{who}: not an integer: {v}"));
+        if (b < 0 || b > ulong.MaxValue)
+            throw new LispErrorException(new LispError($"{who}: {b} out of range for unsigned 64-bit"));
+        return (ulong)b;
+    }
+
+    /// Coerce a Lisp integer to long (signed 64-bit).
+    internal static long ToLong(LispObject v, string who)
+    {
+        System.Numerics.BigInteger b;
+        if (v is Fixnum fx) return fx.Value;
+        else if (v is Bignum bn) b = bn.Value;
+        else throw new LispErrorException(new LispError($"{who}: not an integer: {v}"));
+        if (b < long.MinValue || b > long.MaxValue)
+            throw new LispErrorException(new LispError($"{who}: {b} out of range for signed 64-bit"));
+        return (long)b;
+    }
+
+    /// Build a non-negative Lisp integer from a raw unsigned 64-bit value.
+    internal static LispObject MakeUnsigned64(ulong u) =>
+        u <= long.MaxValue ? Fixnum.Make((long)u)
+                           : (LispObject)Bignum.MakeInteger(u);
+
     // (dotnet:mem-read type addr &optional (offset 0)) -> value
     public static LispObject MemRead(LispObject[] args)
     {
         if (args.Length < 2) throw ArgError("dotnet:mem-read", 2, args.Length);
         var typeName = CffiTypeName(args[0]);
-        var addr = ((Fixnum)args[1]).Value;
-        var offset = args.Length > 2 ? ((Fixnum)args[2]).Value : 0;
+        var addr = AddressArg(args[1], "dotnet:mem-read", "pointer");
+        var offset = args.Length > 2 ? AddressArg(args[2], "dotnet:mem-read", "offset") : 0;
         var ptr = new IntPtr(addr + offset);
         return typeName switch
         {
@@ -57,9 +91,13 @@ public static partial class Runtime
             "LONG_LONG" or "INT64" =>
                 Fixnum.Make(Marshal.ReadInt64(ptr)),
             "UNSIGNED_LONG_LONG" or "UINT64" =>
-                Fixnum.Make(Marshal.ReadInt64(ptr)),
+                MakeUnsigned64((ulong)Marshal.ReadInt64(ptr)),
+            // A single-float, not a double: writing 2.5 and reading it back used to
+            // change the type of the value, and CFFI's (mem-ref p :float) is
+            // specified to give a single. The FFI call path already returns
+            // SingleFloat for a :float result.
             "FLOAT" =>
-                new DoubleFloat(Compat.Int32BitsToSingle(Marshal.ReadInt32(ptr))),
+                new SingleFloat(Compat.Int32BitsToSingle(Marshal.ReadInt32(ptr))),
             "DOUBLE" =>
                 new DoubleFloat(BitConverter.Int64BitsToDouble(Marshal.ReadInt64(ptr))),
             "POINTER" or "PTR" =>
@@ -74,8 +112,8 @@ public static partial class Runtime
         if (args.Length < 3) throw ArgError("dotnet:mem-write", 3, args.Length);
         var value = args[0];
         var typeName = CffiTypeName(args[1]);
-        var addr = ((Fixnum)args[2]).Value;
-        var offset = args.Length > 3 ? ((Fixnum)args[3]).Value : 0;
+        var addr = AddressArg(args[2], "dotnet:mem-write", "pointer");
+        var offset = args.Length > 3 ? AddressArg(args[3], "dotnet:mem-write", "offset") : 0;
         var ptr = new IntPtr(addr + offset);
         switch (typeName)
         {
@@ -89,8 +127,9 @@ public static partial class Runtime
             case "UNSIGNED_INT": case "UINT32": case "UNSIGNED_LONG":
                 Marshal.WriteInt32(ptr, (int)((Fixnum)value).Value); break;
             case "LONG_LONG": case "INT64":
+                Marshal.WriteInt64(ptr, ToLong(value, "dotnet:mem-write")); break;
             case "UNSIGNED_LONG_LONG": case "UINT64":
-                Marshal.WriteInt64(ptr, ((Fixnum)value).Value); break;
+                Marshal.WriteInt64(ptr, unchecked((long)ToULong(value, "dotnet:mem-write"))); break;
             case "FLOAT":
                 var fv = value is DoubleFloat df2 ? (float)df2.Value :
                          value is SingleFloat sf2 ? sf2.Value :
@@ -251,6 +290,20 @@ public static partial class Runtime
         throw new LispErrorException(new LispProgramError(
             "dotnet:%ffi-call-ptr: native FFI requires the emitting runtime (not available on this build)"));
 #endif
+    }
+
+    /// <summary>A pointer or byte offset argument, as an integer. Casting straight
+    /// to Fixnum reported a mistaken argument order as "Unable to cast object of
+    /// type 'DotCL.LispString' to type 'DotCL.Fixnum'", which names neither the
+    /// function nor the parameter -- and the argument order is easy to get wrong
+    /// here, since TYPE comes first.</summary>
+    static long AddressArg(LispObject arg, string fn, string what)
+    {
+        if (arg is Fixnum fx) return fx.Value;
+        if (arg is Bignum) return Runtime.ToLong(arg, fn);
+        if (arg is Nil) return 0;
+        throw new LispErrorException(new LispTypeError(
+            $"{fn}: {what} must be an address (integer), got {arg}", arg, Startup.Sym("INTEGER")));
     }
 
     static LispErrorException ArgError(string fn, int expected, int got) =>

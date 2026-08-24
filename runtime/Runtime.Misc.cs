@@ -6,6 +6,12 @@ namespace DotCL;
 
 public static partial class Runtime
 {
+
+    /// <summary>Resource-name prefix marking a part inside a FASL bundle. Lives
+    /// here rather than with the writer because the loader must recognise a
+    /// bundle on every target, including the emit-free build that cannot write
+    /// one.</summary>
+    internal const string FaslBundlePartPrefix = "dotcl-bundle/";
     // Compiler macro functions registered via define-compiler-macro.
     // ConcurrentDictionary for thread-safe concurrent DEFUN/registration.
     private static readonly ConcurrentDictionary<Symbol, LispFunction> _compilerMacroFunctions = new();
@@ -248,7 +254,8 @@ public static partial class Runtime
     }
 
     public static LispObject ReadFromStream(LispObject stream, LispObject eofErrorP, LispObject eofValue)
-        => GuardStreamIO(stream, () => ReadFromStreamUnguarded(stream, eofErrorP, eofValue));
+        => GuardStreamIO(stream, stream, eofErrorP, eofValue,
+                         static (st, ee, ev) => ReadFromStreamUnguarded(st, ee, ev));
 
     private static LispObject ReadFromStreamUnguarded(LispObject stream, LispObject eofErrorP, LispObject eofValue)
     {
@@ -359,7 +366,9 @@ public static partial class Runtime
             }
         }
 
-        string substring = str.Substring(start, end - start);
+        // Copying the whole string when :start/:end were not given is a copy of
+        // the input on every READ-FROM-STRING -- and callers pass whole files.
+        string substring = (start == 0 && end == str.Length) ? str : str.Substring(start, end - start);
         // Count physical reads from the underlying string so the reported position
         // tracks consumption done via the stream API by reader macros (read-char/read
         // over a make-concatenated-stream wrap, as in babel's #\ reader), which bypass
@@ -379,13 +388,13 @@ public static partial class Runtime
                     reader.ReadChar();
             }
             int pending = reader.PendingLookahead + (stringStream.UnreadCharValue != -1 ? 1 : 0);
-            return MultipleValues.Values(result, Fixnum.Make(start + counting.CharsRead - pending));
+            return MultipleValues.Values2(result, Fixnum.Make(start + counting.CharsRead - pending));
         }
 
         // EOF
         if (eofErrorP is not Nil)
             throw new LispErrorException(new LispError("READ-FROM-STRING: end of string") { ConditionTypeName = "END-OF-FILE", StreamErrorStreamRef = stringStream });
-        return MultipleValues.Values(eofValue, Fixnum.Make(end));
+        return MultipleValues.Values2(eofValue, Fixnum.Make(end));
     }
 
     /// <summary>Read exactly one object from a string and return only it (no
@@ -404,14 +413,38 @@ public static partial class Runtime
         // distort the reconstruction.
         var rtSym = Startup.Sym("*READTABLE*");
         DynamicBindings.Push(rtSym, Startup.StandardReadtable);
+        // The representation was printed under the standard default float format
+        // (see TryEmitConstantViaReader), which decides which floats carry an
+        // exponent marker. Reading it under whatever the loading process happens
+        // to have set would turn a double into a single, or the reverse — the
+        // right value with the wrong type, and no error anywhere.
+        var rdffSym = Startup.Sym("*READ-DEFAULT-FLOAT-FORMAT*");
+        DynamicBindings.Push(rdffSym, Startup.Sym("SINGLE-FLOAT"));
         try
         {
             if (reader.TryRead(out var result))
                 return result;
         }
-        finally { DynamicBindings.Pop(rtSym); }
+        finally { DynamicBindings.Pop(rdffSym); DynamicBindings.Pop(rtSym); }
         throw new LispErrorException(new LispProgramError(
             "fasl: empty representation while reconstructing a constant literal"));
+    }
+
+    /// <summary>Reconstruct a constant from its UTF-8 printed representation, held
+    /// in the fasl's data section rather than in the #US string heap (see
+    /// CilAssembler.EmitReprAsData).</summary>
+    public static LispObject ReadConstantFromUtf8(byte[] utf8) =>
+        ReadConstantFromString(System.Text.Encoding.UTF8.GetString(utf8));
+
+    /// <summary>Same, for a representation too large for one data field.</summary>
+    public static LispObject ReadConstantFromUtf8Parts(byte[][] parts)
+    {
+        int total = 0;
+        foreach (var p in parts) total += p.Length;
+        var all = new byte[total];
+        int at = 0;
+        foreach (var p in parts) { Array.Copy(p, 0, all, at, p.Length); at += p.Length; }
+        return ReadConstantFromUtf8(all);
     }
 
     // --- Modules (provide/require) ---
@@ -1132,6 +1165,89 @@ public static partial class Runtime
     }
 
     /// <summary>Load a .fasl (persisted .NET assembly) file.</summary>
+
+    /// <summary>
+    /// Run a fasl assembly's CompiledModule.ModuleInit, which is what actually
+    /// installs its definitions. A .NET assembly that is not a dotcl fasl is
+    /// reported as a FILE-ERROR naming the file rather than as a bare
+    /// reflection failure.
+    /// </summary>
+    private static void RunFaslModuleInit(System.Reflection.Assembly asm,
+        string filePath, LispObject filespec)
+    {
+        var moduleType = asm.GetType("CompiledModule")
+            ?? throw FaslFileError(
+                $"LOAD: not a dotcl fasl (.NET assembly without a CompiledModule type): {filePath}",
+                filespec);
+        var initMethod = moduleType.GetMethod("ModuleInit")
+            ?? throw FaslFileError(
+                $"LOAD: not a dotcl fasl (CompiledModule has no ModuleInit method): {filePath}",
+                filespec);
+        try
+        {
+            var result = (LispObject?)initMethod.Invoke(null, null) ?? Nil.Instance;
+        }
+        catch (System.Reflection.TargetInvocationException tie) when (tie.InnerException != null)
+        {
+            throw tie.InnerException;
+        }
+    }
+
+    /// <summary>
+    /// If ASM is a bundle written by dotcl:combine-fasls, load every part it
+    /// carries, in bundled order, and return true. Returns false for an ordinary
+    /// fasl so the caller falls through to the single-module path.
+    ///
+    /// The parts are resources rather than merged IL: a fasl is a .NET assembly,
+    /// and merging two of those means reconciling their types and symbol tables,
+    /// while a container preserves each part exactly as compile-file produced it.
+    /// The cost is that the parts load from bytes, so they have no file Location.
+    /// </summary>
+    private static bool LoadFaslBundleParts(System.Reflection.Assembly asm,
+        string filePath, LispObject filespec)
+    {
+        var names = new List<string>();
+        foreach (var n in asm.GetManifestResourceNames())
+            if (n.StartsWith(FaslBundlePartPrefix, StringComparison.Ordinal))
+                names.Add(n);
+        if (names.Count == 0) return false;
+
+        // The index is zero-padded in the name, so ordinal order is bundle order.
+        names.Sort(StringComparer.Ordinal);
+
+        foreach (var n in names)
+        {
+            byte[] bytes;
+            using (var s = asm.GetManifestResourceStream(n)
+                   ?? throw FaslFileError(
+                       $"LOAD: bundle part {n} is unreadable: {filePath}", filespec))
+            {
+                bytes = new byte[s.Length];
+                int read = 0;
+                while (read < bytes.Length)
+                {
+                    int got = s.Read(bytes, read, bytes.Length - read);
+                    if (got <= 0) break;
+                    read += got;
+                }
+            }
+
+            System.Reflection.Assembly part;
+            try
+            {
+                part = System.Reflection.Assembly.Load(bytes);
+            }
+            catch (BadImageFormatException)
+            {
+                throw FaslFileError(
+                    $"LOAD: bundle part {n} is not a .NET assembly: {filePath}", filespec);
+            }
+            WarnOnStaleFaslGeneration(part, filePath);
+            RunFaslModuleInit(part, $"{filePath} [{n}]", filespec);
+        }
+        return true;
+    }
+
     private static LispObject LoadFasl(string filePath, LispObject filespec,
         bool isVerbose, bool isPrint)
     {
@@ -1208,25 +1324,15 @@ public static partial class Runtime
                     $"LOAD: not a dotcl fasl (not a .NET assembly): {filePath}", filespec);
             }
             WarnOnStaleFaslGeneration(asm, faslFull);
+            // A bundle (uiop bundle-op / dotcl:combine-fasls) is an assembly with
+            // no code whose parts ride along as resources. Run each part in the
+            // order they were bundled; a later part may depend on an earlier one.
+            if (LoadFaslBundleParts(asm, filePath, filespec)) return T.Instance;
+
             // A PE file that is not a dotcl fasl: a plain .NET library, or another
             // implementation's fasl that happens to be an assembly. Report it as a
             // FILE-ERROR carrying the pathname, not as the raw reflection failure.
-            var moduleType = asm.GetType("CompiledModule")
-                ?? throw FaslFileError(
-                    $"LOAD: not a dotcl fasl (.NET assembly without a CompiledModule type): {filePath}",
-                    filespec);
-            var initMethod = moduleType.GetMethod("ModuleInit")
-                ?? throw FaslFileError(
-                    $"LOAD: not a dotcl fasl (CompiledModule has no ModuleInit method): {filePath}",
-                    filespec);
-            try
-            {
-                var result = (LispObject?)initMethod.Invoke(null, null) ?? Nil.Instance;
-            }
-            catch (System.Reflection.TargetInvocationException tie) when (tie.InnerException != null)
-            {
-                throw tie.InnerException;
-            }
+            RunFaslModuleInit(asm, filePath, filespec);
             return T.Instance;
         }
         finally
@@ -1239,15 +1345,27 @@ public static partial class Runtime
     }
 
     /// <summary>
-    /// Flatten eval-when and progn bodies into individual top-level forms.
+    /// Flatten the bodies of the top level forms CLHS 3.2.3.1 says carry top level
+    /// forms inside them (PROGN, EVAL-WHEN, LOCALLY, MACROLET, SYMBOL-MACROLET),
+    /// plus macro forms, into individual top-level forms.
     /// This ensures that defvar/defparameter values are set before subsequent
-    /// forms in the same block are compiled (important for macro expansion).
+    /// forms in the same block are compiled (important for macro expansion), and
+    /// it keeps one body from becoming one huge method (one method per form).
     /// </summary>
     private static IEnumerable<LispObject> FlattenTopLevel(LispObject form)
+        => FlattenTopLevel(form, false);
+
+    /// <param name="inLocalMacroScope">True while walking the body of a top level
+    /// MACROLET / SYMBOL-MACROLET. Those bindings are lexical and this flattener
+    /// only knows the global macro table, so a body form is never macroexpanded
+    /// here: expanding a call to a name the MACROLET shadows would take the global
+    /// definition. Splitting the body structurally is still safe, and it is the
+    /// whole point — the Lisp compiler does the expansion later, in scope.</param>
+    private static IEnumerable<LispObject> FlattenTopLevel(LispObject form, bool inLocalMacroScope)
     {
         // Defensive: if a reader macro or macro expander leaked MvReturn, take primary value.
         if (form is MvReturn mvr)
-            form = mvr.Values.Length > 0 ? mvr.Values[0] : Nil.Instance;
+            form = mvr.PrimaryValue;
         if (form is Cons c && c.Car is Symbol sym)
         {
             if (sym.Name == "EVAL-WHEN" && c.Cdr is Cons rest)
@@ -1280,7 +1398,7 @@ public static partial class Runtime
                 var body = c.Cdr;
                 while (body is Cons bodyCell)
                 {
-                    foreach (var sub in FlattenTopLevel(bodyCell.Car))
+                    foreach (var sub in FlattenTopLevel(bodyCell.Car, inLocalMacroScope))
                         yield return sub;
                     body = bodyCell.Cdr;
                 }
@@ -1313,7 +1431,7 @@ public static partial class Runtime
                 {
                     for (var t = lbody; t is Cons tc; t = tc.Cdr)
                     {
-                        foreach (var sub in FlattenTopLevel(tc.Car))
+                        foreach (var sub in FlattenTopLevel(tc.Car, inLocalMacroScope))
                         {
                             LispObject wrapped = new Cons(sub, Nil.Instance);
                             for (int i = decls.Count - 1; i >= 0; i--)
@@ -1324,16 +1442,53 @@ public static partial class Runtime
                     yield break;
                 }
             }
+            // CLHS 3.2.3.1 names MACROLET and SYMBOL-MACROLET alongside LOCALLY:
+            // their bodies are top level forms too. Same shape as LOCALLY, one
+            // element further in — the bindings list rides along with the
+            // declarations onto every body form, so each keeps the local macros
+            // and symbol macros it was written under. Without this a library that
+            // wraps its definitions in one top level MACROLET compiles the whole
+            // body into a single _toplevel_N method — the same failure the LOCALLY
+            // case above fixes, with the same cost at load time.
+            if ((sym.Name == "MACROLET" || sym.Name == "SYMBOL-MACROLET")
+                && c.Cdr is Cons mrest)
+            {
+                var bindings = mrest.Car;
+                var mdecls = new List<LispObject>();
+                LispObject mbody = mrest.Cdr;
+                while (mbody is Cons mrc && mrc.Car is Cons mdc
+                       && mdc.Car is Symbol mdsym && mdsym.Name == "DECLARE")
+                {
+                    mdecls.Add(mrc.Car);
+                    mbody = mrc.Cdr;
+                }
+                int mBodyCount = 0;
+                for (var t = mbody; t is Cons tc; t = tc.Cdr) mBodyCount++;
+                if (mBodyCount > 1)
+                {
+                    for (var t = mbody; t is Cons tc; t = tc.Cdr)
+                    {
+                        foreach (var sub in FlattenTopLevel(tc.Car, true))
+                        {
+                            LispObject wrapped = new Cons(sub, Nil.Instance);
+                            for (int i = mdecls.Count - 1; i >= 0; i--)
+                                wrapped = new Cons(mdecls[i], wrapped);
+                            yield return new Cons(sym, new Cons(bindings, wrapped));
+                        }
+                    }
+                    yield break;
+                }
+            }
             // Per CLHS 3.2.3.1: "If a top level form is a macro form,
             // the macro form is expanded and the result is processed as a top level form."
             // Don't expand forms already handled by ShouldExecuteAtCompileTime or
             // IsEvalWhenForCompileFile — they need their original identity preserved.
-            if (!IsCompileTimeSideEffectForm(sym.Name))
+            if (!inLocalMacroScope && !IsCompileTimeSideEffectForm(sym.Name))
             {
                 var expanded = TryMacroexpand1(form);
                 if (expanded != null && !ReferenceEquals(expanded, form))
                 {
-                    foreach (var sub in FlattenTopLevel(expanded))
+                    foreach (var sub in FlattenTopLevel(expanded, inLocalMacroScope))
                         yield return sub;
                     yield break;
                 }
@@ -1509,14 +1664,14 @@ public static partial class Runtime
             {
                 var result = rmf.Invoke(new LispObject[] { form, Nil.Instance });
                 // Macro functions in CL return single value; unwrap MvReturn if present
-                return result is MvReturn mv ? (mv.Values.Length > 0 ? mv.Values[0] : Nil.Instance) : result;
+                return result is MvReturn mv ? (mv.PrimaryValue) : result;
             }
             // Check compiler macro table
             var compilerFn = Startup.LookupCompilerMacro(sym);
             if (compilerFn != null)
             {
                 var result2 = compilerFn.Invoke(new LispObject[] { form });
-                return result2 is MvReturn mv2 ? (mv2.Values.Length > 0 ? mv2.Values[0] : Nil.Instance) : result2;
+                return result2 is MvReturn mv2 ? mv2.PrimaryValue : result2;
             }
         }
         catch
@@ -1875,6 +2030,16 @@ public static partial class Runtime
                 hbBindings.Add(Runtime.List(type, hfn));
                 // var binding: (var #:c) or nothing
                 LispObject clauseResult;
+                // (error (nil) ...) names the constant NIL. NIL is not a Symbol
+                // instance here, so it used to fall through to the no-variable
+                // branch and be silently accepted; an EMPTY lambda list is the
+                // real "no variable" spelling. CLHS 3.1.2.1.1.3.
+                if (ll is Cons llcc && llcc.Car is Symbol cv0 && cv0.IsConstant)
+                    throw new LispErrorException(new LispProgramError(
+                        $"HANDLER-CASE: {cv0.Name} is a constant and cannot be bound as a variable"));
+                if (ll is Cons llnil && llnil.Car is Nil)
+                    throw new LispErrorException(new LispProgramError(
+                        "HANDLER-CASE: NIL is a constant and cannot be bound as a variable"));
                 if (ll is Cons llc && llc.Car is Symbol v)
                     clauseResult = new Cons(Startup.Sym("LET"),
                         new Cons(Runtime.List(Runtime.List(v, cvar)), cbody));
@@ -3413,6 +3578,25 @@ public static partial class Runtime
             // interpreter; :compile (default) uses the CIL compiler below.
             if (UseInterpreter())
                 return MiniEval(form);
+            // (progn a b) evaluates a and THEN b. Handing the whole progn to the
+            // compiler compiles b before a has run, so anything a installs at run
+            // time that b's compilation needs — a setf expander from DEFSETF, a
+            // symbol macro from DEFINE-SYMBOL-MACRO — is not there yet, and b
+            // compiles against the wrong (or no) definition. Evaluating the
+            // subforms one at a time is what the tree-walk interpreter already
+            // does, and what the same expression does when it comes from a file
+            // (COMPILE-FILE splits a top level PROGN per CLHS 3.2.3.1).
+            // Matched by name, like every other special-operator check in this
+            // file and in the compiler's dispatcher — dotcl resolves operators by
+            // name throughout, so a stricter test here would make EVAL disagree
+            // with what compiling the same form does.
+            if (form is Cons pc && pc.Car is Symbol ps && ps.Name == "PROGN")
+            {
+                LispObject last = Nil.Instance;
+                for (var body = pc.Cdr; body is Cons bc; body = bc.Cdr)
+                    last = Eval(bc.Car);
+                return last;   // multiple values of the last form ride along
+            }
             // Use eval-specific compile path that preserves MvReturn at tail
             // so callers can observe multiple values from form.
             var instrList = CompileTopLevelEval(form);
@@ -4741,6 +4925,22 @@ public static partial class Runtime
                 return args[0] is LispFunction fn ? fn.InterpInfo ?? Nil.Instance : Nil.Instance;
             }, "%FN-INTERP-INFO", 1));
 
+        // %SET-FUNCTION-LAMBDA-LIST fn ll -> fn
+        // Development information, not part of calling: see
+        // LispFunction.StoredLambdaList. Compiled DEFUN records it at emit time,
+        // the interpreter right after it builds the closure.
+        Emitter.CilAssembler.RegisterFunction("%SET-FUNCTION-LAMBDA-LIST",
+            new LispFunction(args => {
+                Runtime.CheckArityExact("%SET-FUNCTION-LAMBDA-LIST", args, 2);
+                if (args[0] is LispFunction fn) fn.StoredLambdaList = args[1];
+                return args[0];
+            }, "%SET-FUNCTION-LAMBDA-LIST", 2));
+        Emitter.CilAssembler.RegisterFunction("%FUNCTION-STORED-LAMBDA-LIST",
+            new LispFunction(args => {
+                Runtime.CheckArityExact("%FUNCTION-STORED-LAMBDA-LIST", args, 1);
+                return args[0] is LispFunction fn ? fn.StoredLambdaList ?? Nil.Instance : Nil.Instance;
+            }, "%FUNCTION-STORED-LAMBDA-LIST", 1));
+
         // %SET-FUNCTION-ARITY fn n -> fn
         // Records how many required parameters the user's lambda list has, which
         // the interpreter's uniformly variadic closures otherwise lose. Compiled
@@ -4976,7 +5176,7 @@ public static partial class Runtime
                 var expanded0 = MacroexpandOnceOrSelf(form0, args.Length > 1 ? args[1] : Nil.Instance);
                 return ReferenceEquals(expanded0, form0)
                     ? MultipleValues.Values(form0, Nil.Instance)
-                    : MultipleValues.Values(expanded0, T.Instance);
+                    : MultipleValues.Values2(expanded0, T.Instance);
             }, "MACROEXPAND-1", -1));
 
         // Single-value MACROEXPAND-1: the expansion, or FORM itself when it does
@@ -5085,7 +5285,7 @@ public static partial class Runtime
             new LispFunction(args => {
                 if (args.Length < 1 || args.Length > 2) throw new LispErrorException(new LispProgramError($"MACROEXPAND: wrong number of arguments: {args.Length} (expected 1-2)"));
                 if (!Compat.TryEnsureSufficientExecutionStack())
-                    return MultipleValues.Values(args[0], Nil.Instance); // bail out: return unexpanded
+                    return MultipleValues.Values2(args[0], Nil.Instance); // bail out: return unexpanded
                 var form = args[0];
                 var env = args.Length > 1 ? args[1] : Nil.Instance;
                 // Extract macro table and symbol-macro table from env
@@ -5153,7 +5353,7 @@ public static partial class Runtime
                     }
                     break;
                 }
-                return MultipleValues.Values(form, anyExpanded ? (LispObject)T.Instance : Nil.Instance);
+                return MultipleValues.Values2(form, anyExpanded ? (LispObject)T.Instance : Nil.Instance);
             }, "MACROEXPAND", -1));
 
         // FBOUNDP. Body extracted to FboundpImpl so the 1-arg direct delegate and
@@ -5356,7 +5556,7 @@ public static partial class Runtime
                     initForm = new Cons(prognSym, body);
                 }
 
-                return MultipleValues.Values(creationForm, initForm);
+                return MultipleValues.Values2(creationForm, initForm);
             }, "MAKE-LOAD-FORM-SAVING-SLOTS", -1));
 
         // COMPILER-MACRO-FUNCTION — look up runtime-registered compiler macros.
@@ -5739,5 +5939,58 @@ public static partial class Runtime
         return false;
     }
 
+
+    /// <summary>
+    /// (dotcl:function-lambda-list fn-or-name) -> (values lambda-list foundp)
+    ///
+    /// What a development tool needs and CL does not provide: SLIME/SLY autodoc,
+    /// DESCRIBE and completion all want the parameters a function was written
+    /// with. FUNCTION-LAMBDA-EXPRESSION is allowed to return NIL and does; ARITY
+    /// counts required parameters only. Other implementations expose exactly this
+    /// (sb-introspect:function-lambda-list, ext:function-lambda-list on ECL/Clasp,
+    /// ext:arglist on CLISP), and a swank/slynk backend can only call whatever
+    /// the implementation offers.
+    ///
+    /// Given a symbol, a macro binding wins over a function binding: a macro's
+    /// documented parameters are its own lambda list, never the (form env) pair
+    /// its expander takes.
+    ///
+    /// The second value distinguishes "no parameters" from "unknown", which is
+    /// the distinction a caller needs -- swank's ARGLIST falls back to
+    /// :not-available rather than showing a function as taking nothing.
+    /// </summary>
+    public static LispObject FunctionLambdaList(LispObject arg)
+    {
+        LispObject target = arg;
+        if (arg is Symbol sym)
+        {
+            var mf = Runtime.MacroFunction(sym);
+            target = mf is not Nil ? mf : (sym.Function ?? (LispObject)Nil.Instance);
+        }
+        LispObject? ll = null;
+        if (target is GenericFunction gf)
+        {
+            // The MOP accessor already reconstructs a placeholder from the arity
+            // counts when no lambda list was stored, and a placeholder is still a
+            // truthful answer about the shape.
+            ll = gf.StoredLambdaList ?? (gf.PlaceholderLambdaList ??= Mop.BuildLambdaListPlaceholder(
+                gf.RequiredCount, gf.OptionalCount, gf.HasRest, gf.HasKey,
+                gf.KeywordNames, gf.HasAllowOtherKeys));
+        }
+        else if (target is LispFunction lf)
+        {
+            ll = lf.StoredLambdaList;
+            // An interpreted closure carries (params env specials k); PARAMS is
+            // the lambda list the user wrote.
+            if (ll == null && lf.InterpInfo is Cons info) ll = info.Car;
+        }
+        if (ll == null)
+        {
+            MultipleValues.Set(Nil.Instance, Nil.Instance);
+            return Nil.Instance;
+        }
+        MultipleValues.Set(ll, T.Instance);
+        return ll;
+    }
 
 }

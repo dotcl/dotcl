@@ -11,7 +11,10 @@
 //   fields     field count grouped by name prefix — _gsym_ (uninterned symbols)
 //              vs _symfn_ (call-site caches) vs _str_ (string literals)
 //   types      per-type field and method counts
-//   all        every mode
+//   limits     assert the shape stays inside safe bounds; exits 1 on a violation
+//              (thresholds are overridable: limits il=262144 fields=8192
+//               methods=32768 us=8388608)
+//   all        every mode except limits
 //
 // Why this exists: loading a fasl means JITting its IL, so what matters for load
 // time and RSS is the SHAPE of the emitted assembly — how many bytes sit in one
@@ -31,6 +34,7 @@
 
 using System.Reflection;
 using System.Reflection.Metadata;
+using System.Reflection.Metadata.Ecma335; // HeapIndex, for the #US heap size
 using System.Reflection.PortableExecutable;
 
 if (args.Length == 0)
@@ -40,7 +44,18 @@ if (args.Length == 0)
 }
 
 string path = args[0];
-var modes = new HashSet<string>(args.Skip(1), StringComparer.OrdinalIgnoreCase);
+// Threshold arguments (name=value) are pulled out before the mode set is built.
+var thresholds = new Dictionary<string, long>();
+var modeArgs = new List<string>();
+foreach (var a in args.Skip(1))
+{
+    int eq = a.IndexOf('=');
+    if (eq > 0 && long.TryParse(a.AsSpan(eq + 1), out long v))
+        thresholds[a.Substring(0, eq).ToLowerInvariant()] = v;
+    else
+        modeArgs.Add(a);
+}
+var modes = new HashSet<string>(modeArgs, StringComparer.OrdinalIgnoreCase);
 if (modes.Count == 0) { modes.Add("summary"); modes.Add("methods"); }
 if (modes.Contains("all")) { modes.UnionWith(new[] { "summary", "methods", "prefixes", "fields", "types" }); }
 
@@ -135,6 +150,57 @@ if (modes.Contains("types"))
         Console.WriteLine($"{nf,10:N0} {nm,10:N0}  {md.GetString(t.Name)}");
     }
     Console.WriteLine();
+}
+
+if (modes.Contains("limits"))
+{
+    // A guard, not a report: the failures these bounds stand for are invisible on
+    // the compile side (total IL, fasl bytes and compile time all stay flat) and
+    // surface at LOAD as a diagnostic that names neither the file nor the cause —
+    // "Internal limitation: too many fields.", a bare InvalidProgramException, or
+    // the process being killed while JITting one huge method. Every past instance
+    // was found by a user's out-of-memory, never by CI.
+    //
+    // The defaults sit far below the hard limits and far above what dotcl emits
+    // today, so they fire on a shape REGRESSION (an unsplit per-form or per-symbol
+    // growth path) rather than on ordinary growth of a big library.
+    long limIl = thresholds.GetValueOrDefault("il", 262_144);
+    long limFields = thresholds.GetValueOrDefault("fields", 8_192);
+    long limMethods = thresholds.GetValueOrDefault("methods", 32_768);
+    long limUs = thresholds.GetValueOrDefault("us", 8_388_608);
+
+    var worstFields = ("", 0);
+    var worstMethods = ("", 0);
+    foreach (var th in md.TypeDefinitions)
+    {
+        var t = md.GetTypeDefinition(th);
+        string tn = md.GetString(t.Name);
+        int nf = t.GetFields().Count, nm = t.GetMethods().Count;
+        if (nf > worstFields.Item2) worstFields = (tn, nf);
+        if (nm > worstMethods.Item2) worstMethods = (tn, nm);
+    }
+    int usHeap = md.GetHeapSize(HeapIndex.UserString);
+
+    int failed = 0;
+    void Check(string what, long value, long limit, string where)
+    {
+        bool ok = value <= limit;
+        if (!ok) failed++;
+        Console.WriteLine($"  {(ok ? "ok  " : "FAIL")} {what,-18} {value,12:N0} / {limit,12:N0}  {where}");
+    }
+    Console.WriteLine($"limits {path}");
+    Check("max_method_il", biggest.Il, limIl, $"{biggest.Type}.{biggest.Name}");
+    Check("fields_per_type", worstFields.Item2, limFields, worstFields.Item1);
+    Check("methods_per_type", worstMethods.Item2, limMethods, worstMethods.Item1);
+    Check("us_heap_bytes", usHeap, limUs, "module-wide (ldstr strings)");
+    Console.WriteLine();
+    if (failed > 0)
+    {
+        Console.Error.WriteLine(
+            $"{path}: {failed} shape limit(s) exceeded. This is a load-time hazard, " +
+            "not a style rule: see the reference points at the top of this file.");
+        return 1;
+    }
 }
 
 return 0;

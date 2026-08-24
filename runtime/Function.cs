@@ -4,7 +4,14 @@ namespace DotCL;
 
 public class LispFunction : LispObject
 {
-    private readonly Func<LispObject[], LispObject> _func;
+    // Null only for a direct-params closure, whose body delegate is called
+    // straight from _directDel + Environment (see MakeDirectClosure): building
+    // an args-array wrapper for it meant a closure object and a delegate on
+    // every closure creation, for a path most closures never take.
+    private readonly Func<LispObject[], LispObject>? _func;
+
+    // Direct-params closure body: Func<object[] env, LispObject a0..aN-1, LispObject>.
+    internal Delegate? _directDel;
     private string? _name;
     public string? Name
     {
@@ -33,6 +40,14 @@ public class LispFunction : LispObject
     // call hot path.
     private string? _frameName;
 
+    /// <summary>Stop recording a debugger frame for this function, keeping its
+    /// name for everything else (error messages, BACKTRACE of its callers,
+    /// DESCRIBE, statistics). What a function compiled under
+    /// (optimize (debug 0)) asks for: the frame push is the one thing on the
+    /// call path that a caller cannot avoid paying, measured at 18% of richards.
+    /// Set after Name, which derives the frame name.</summary>
+    public void SuppressDebugFrame() => _frameName = null;
+
     private static string? FrameNameOf(string? name) =>
         name != null && (name.StartsWith("%MINI-", StringComparison.Ordinal) ||
                          name.StartsWith("%CALL-WITH-", StringComparison.Ordinal))
@@ -56,8 +71,19 @@ public class LispFunction : LispObject
     // everything else, so the trampoline falls back to an ordinary call.
     public LispObject? InterpInfo { get; internal set; }
 
-    public Func<LispObject[], LispObject> RawFunction => _func;
+    // A direct-params closure has no stored args-array delegate; hand out one
+    // over the spreading entry instead (restart-bind takes this, and a closure
+    // handler is rare enough that binding a delegate there costs nothing that
+    // matters).
+    public Func<LispObject[], LispObject> RawFunction => _func ?? CallDirectWithArray;
     public object[]? Environment { get; internal set; }
+    // The lambda list the user wrote, when something recorded it. Nothing in the
+    // call path reads this: it exists so a development tool can answer "what are
+    // this function's arguments?" -- SLIME/SLY autodoc, DESCRIBE, completion.
+    // Arity is not enough (it counts required parameters only) and InterpInfo
+    // exists only for interpreted closures, so a compiled DEFUN had nothing.
+    public LispObject? StoredLambdaList { get; internal set; }
+
     // Debug: SIL body stored when dotcl:*save-sil* is true at defun time
     public LispObject? Sil { get; internal set; }
 
@@ -112,6 +138,17 @@ public class LispFunction : LispObject
         DotCL.Diagnostics.AllocCounter.Inc("LispFunction");
     }
 
+    // Direct-params closure: the body delegate and the environment are held as
+    // they are; every entry point binds them at call time.
+    private LispFunction(Delegate directDel, object[] env, string? fnName, int arity)
+    {
+        _directDel = directDel;
+        Environment = env;
+        StatsName = fnName;   // used for the arity-error message and for stats
+        Arity = arity;
+        DotCL.Diagnostics.AllocCounter.Inc("LispFunction+Closure");
+    }
+
     // Closure constructor: env is stored and passed explicitly on each call
     public LispFunction(Func<object[], LispObject[], LispObject> closureFunc,
                         object[] env, string? name = null, int arity = -1)
@@ -139,61 +176,23 @@ public class LispFunction : LispObject
     // per-call cost are unchanged.
     public static LispFunction MakeDirectClosure(Delegate del, object[] env, string fnName)
     {
-        // The _funcN direct wrappers bind the closure environment; the periodic
-        // stack-overflow check now lives at the single InvokeN choke point (see
-        // Invoke0..Invoke8), so a closure recursing through its own box still hits
-        // a checked entry and raises the catchable Lisp "Stack overflow"
-        // PROGRAM-ERROR rather than an uncatchable .NET StackOverflowException.
-        LispFunction fn;
-        switch (del)
+        // The body delegate and the environment are stored as they are; InvokeN
+        // binds them at call time and CallDirectWithArray covers apply / spread.
+        // Building a per-closure lambda for each of those two paths (plus the
+        // display class they shared) was ~170 B on EVERY closure creation --
+        // paid whether or not the closure was ever called.
+        int arity = del switch
         {
-            case Func<object[], LispObject> d0:
-            {
-                fn = new LispFunction(args => { Runtime.CheckArityExact(fnName, args, 0); return d0(env); }, null, 0);
-                fn._func0 = () => d0(env);
-                break;
-            }
-            case Func<object[], LispObject, LispObject> d1:
-            {
-                fn = new LispFunction(args => { Runtime.CheckArityExact(fnName, args, 1); return d1(env, args[0]); }, null, 1);
-                fn._func1 = a => d1(env, a);
-                break;
-            }
-            case Func<object[], LispObject, LispObject, LispObject> d2:
-            {
-                fn = new LispFunction(args => { Runtime.CheckArityExact(fnName, args, 2); return d2(env, args[0], args[1]); }, null, 2);
-                fn._func2 = (a, b) => d2(env, a, b);
-                break;
-            }
-            case Func<object[], LispObject, LispObject, LispObject, LispObject> d3:
-            {
-                fn = new LispFunction(args => { Runtime.CheckArityExact(fnName, args, 3); return d3(env, args[0], args[1], args[2]); }, null, 3);
-                fn._func3 = (a, b, c) => d3(env, a, b, c);
-                break;
-            }
-            case Func<object[], LispObject, LispObject, LispObject, LispObject, LispObject> d4:
-            {
-                fn = new LispFunction(args => { Runtime.CheckArityExact(fnName, args, 4); return d4(env, args[0], args[1], args[2], args[3]); }, null, 4);
-                fn._func4 = (a, b, c, d) => d4(env, a, b, c, d);
-                break;
-            }
-            case Func<object[], LispObject, LispObject, LispObject, LispObject, LispObject, LispObject> d5:
-            {
-                fn = new LispFunction(args => { Runtime.CheckArityExact(fnName, args, 5); return d5(env, args[0], args[1], args[2], args[3], args[4]); }, null, 5);
-                fn._func5 = (a, b, c, d, e) => d5(env, a, b, c, d, e);
-                break;
-            }
-            case Func<object[], LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject> d6:
-            {
-                fn = new LispFunction(args => { Runtime.CheckArityExact(fnName, args, 6); return d6(env, args[0], args[1], args[2], args[3], args[4], args[5]); }, null, 6);
-                fn._func6 = (a, b, c, d, e, f2) => d6(env, a, b, c, d, e, f2);
-                break;
-            }
-            default:
-                throw new ArgumentException($"MakeDirectClosure: unsupported delegate type {del.GetType().Name}");
-        }
-        fn.Environment = env;
-        return fn;
+            Func<object[], LispObject> => 0,
+            Func<object[], LispObject, LispObject> => 1,
+            Func<object[], LispObject, LispObject, LispObject> => 2,
+            Func<object[], LispObject, LispObject, LispObject, LispObject> => 3,
+            Func<object[], LispObject, LispObject, LispObject, LispObject, LispObject> => 4,
+            Func<object[], LispObject, LispObject, LispObject, LispObject, LispObject, LispObject> => 5,
+            Func<object[], LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject> => 6,
+            _ => throw new ArgumentException($"MakeDirectClosure: unsupported delegate type {del.GetType().Name}")
+        };
+        return new LispFunction(del, env, fnName, arity);
     }
 
     // Lisp-level call stack for debugger backtrace. Each frame keeps the callee
@@ -314,10 +313,11 @@ public class LispFunction : LispObject
         // named callee reached that way was missing from BACKTRACE while the
         // identical call from compiled code (which goes through InvokeN) was
         // listed.
+        var f = _func;
         var n = _frameName;
-        if (n == null) return _func(args);
+        if (n == null) return f != null ? f(args) : CallDirectWithArray(args);
         (s_callStack ??= new Stack<Frame>()).Push(new Frame(n, args));
-        try { return _func(args); }
+        try { return f != null ? f(args) : CallDirectWithArray(args); }
         finally { s_callStack.TryPop(out _); }
     }
 
@@ -329,7 +329,8 @@ public class LispFunction : LispObject
     public LispObject InvokeNoFrame(params LispObject[] args)
     {
         PeriodicStackCheck();
-        return _func(args);
+        var f = _func;
+        return f != null ? f(args) : CallDirectWithArray(args);
     }
 
     // Direct-param invoke: avoids array allocation when _funcN is set.
@@ -416,33 +417,78 @@ public class LispFunction : LispObject
     // instead of a catchable Lisp "Stack overflow" PROGRAM-ERROR. The check is
     // AggressiveInlining and only a thread-static counter increment on the
     // common path (the real stack probe runs every 256th call).
+    /// <summary>Args-array entry for a direct-params closure, which has no _func
+    /// wrapper. Same arity check the wrapper used to perform, then spread.</summary>
+    private LispObject CallDirectWithArray(LispObject[] args)
+    {
+        var env = Environment!;
+        switch (_directDel)
+        {
+            case Func<object[], LispObject> d0:
+                Runtime.CheckArityExact(StatsName ?? "anonymous", args, 0); return d0(env);
+            case Func<object[], LispObject, LispObject> d1:
+                Runtime.CheckArityExact(StatsName ?? "anonymous", args, 1); return d1(env, args[0]);
+            case Func<object[], LispObject, LispObject, LispObject> d2:
+                Runtime.CheckArityExact(StatsName ?? "anonymous", args, 2); return d2(env, args[0], args[1]);
+            case Func<object[], LispObject, LispObject, LispObject, LispObject> d3:
+                Runtime.CheckArityExact(StatsName ?? "anonymous", args, 3); return d3(env, args[0], args[1], args[2]);
+            case Func<object[], LispObject, LispObject, LispObject, LispObject, LispObject> d4:
+                Runtime.CheckArityExact(StatsName ?? "anonymous", args, 4);
+                return d4(env, args[0], args[1], args[2], args[3]);
+            case Func<object[], LispObject, LispObject, LispObject, LispObject, LispObject, LispObject> d5:
+                Runtime.CheckArityExact(StatsName ?? "anonymous", args, 5);
+                return d5(env, args[0], args[1], args[2], args[3], args[4]);
+            case Func<object[], LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject> d6:
+                Runtime.CheckArityExact(StatsName ?? "anonymous", args, 6);
+                return d6(env, args[0], args[1], args[2], args[3], args[4], args[5]);
+            case Func<object[], LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject> d7:
+                Runtime.CheckArityExact(StatsName ?? "anonymous", args, 7);
+                return d7(env, args[0], args[1], args[2], args[3], args[4], args[5], args[6]);
+            case Func<object[], LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject> d8:
+                Runtime.CheckArityExact(StatsName ?? "anonymous", args, 8);
+                return d8(env, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7]);
+        }
+        throw new LispErrorException(new LispProgramError(
+            "internal: closure has no callable body"));
+    }
+
     public LispObject Invoke0()
     {
         if (_func0 != null) { PeriodicStackCheck(); using (PushFrame()) return _func0(); }
+        if (_directDel is Func<object[], LispObject> c0)
+        { PeriodicStackCheck(); using (PushFrame()) return c0(Environment!); }
         return InvokeSlow(Array.Empty<LispObject>());
     }
 
     public LispObject Invoke1(LispObject a)
     {
         if (_func1 != null) { PeriodicStackCheck(); using (PushFrame(a)) return _func1(a); }
+        if (_directDel is Func<object[], LispObject, LispObject> c1)
+        { PeriodicStackCheck(); using (PushFrame(a)) return c1(Environment!, a); }
         return InvokeSlow(new[] { a });
     }
 
     public LispObject Invoke2(LispObject a, LispObject b)
     {
         if (_func2 != null) { PeriodicStackCheck(); using (PushFrame(a, b)) return _func2(a, b); }
+        if (_directDel is Func<object[], LispObject, LispObject, LispObject> c2)
+        { PeriodicStackCheck(); using (PushFrame(a, b)) return c2(Environment!, a, b); }
         return InvokeSlow(new[] { a, b });
     }
 
     public LispObject Invoke3(LispObject a, LispObject b, LispObject c)
     {
         if (_func3 != null) { PeriodicStackCheck(); using (PushFrame(a, b, c)) return _func3(a, b, c); }
+        if (_directDel is Func<object[], LispObject, LispObject, LispObject, LispObject> c3)
+        { PeriodicStackCheck(); using (PushFrame(a, b, c)) return c3(Environment!, a, b, c); }
         return InvokeSlow(new[] { a, b, c });
     }
 
     public LispObject Invoke4(LispObject a, LispObject b, LispObject c, LispObject d)
     {
         if (_func4 != null) { PeriodicStackCheck(); using (PushFrame(a, b, c, d)) return _func4(a, b, c, d); }
+        if (_directDel is Func<object[], LispObject, LispObject, LispObject, LispObject, LispObject> c4)
+        { PeriodicStackCheck(); using (PushFrame(a, b, c, d)) return c4(Environment!, a, b, c, d); }
         return InvokeSlow(new[] { a, b, c, d });
     }
 
@@ -551,10 +597,11 @@ public class LispFunction : LispObject
             s_invokeSlowStats.AddOrUpdate((Name ?? StatsName ?? AnonOriginTag(), args.Length), 1,
                                           static (_, c) => c + 1);
         PeriodicStackCheck();
+        var f = _func;
         var frameName = _frameName;
-        if (frameName == null) return _func(args);
+        if (frameName == null) return f != null ? f(args) : CallDirectWithArray(args);
         (s_callStack ??= new Stack<Frame>()).Push(new Frame(frameName, args));
-        try { return _func(args); }
+        try { return f != null ? f(args) : CallDirectWithArray(args); }
         finally { s_callStack.TryPop(out _); }
     }
 
@@ -568,7 +615,8 @@ public class LispFunction : LispObject
     // Only called with CollectInvokeStats enabled — no cost otherwise.
     private string AnonOriginTag()
     {
-        var m = _closureFunc != null ? _closureFunc.Method : _func.Method;
+        var m = (_closureFunc ?? (Delegate?)_func ?? _directDel)?.Method;
+        if (m == null) return "<anon>";
         var sb = new System.Text.StringBuilder("<anon:");
         foreach (var ch in m.Name)
             if (!char.IsDigit(ch)) sb.Append(ch);
@@ -589,7 +637,9 @@ public class LispFunction : LispObject
         if (_func6 != null) return (_func6, "func-6");
         if (_func7 != null) return (_func7, "func-7");
         if (_func8 != null) return (_func8, "func-8");
-        return (_func, "func");
+        if (_func != null) return (_func, "func");
+        if (_directDel != null) return (_directDel, "closure-direct");
+        return (RawFunction, "func");
     }
 
     public override string ToString() =>

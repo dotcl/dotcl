@@ -133,6 +133,19 @@ public partial class CilAssembler
             throw new LispErrorException(new LispProgramError(
                 $"precompiled-only mode (dotcl:precompiled-only): {what} requires runtime " +
                 "code generation, which is disabled; only precompiled code can run here"));
+#if NET5_0_OR_GREATER
+        // The build has an emitter but the HOST forbids using it: a NativeAOT
+        // publish, or `dotnet run app.cs`, whose file-based-app defaults turn
+        // dynamic code off. Reflection.Emit answers that with a raw
+        // PlatformNotSupportedException from inside AssemblyBuilder, which names
+        // neither the Lisp form nor anything the caller can act on.
+        if (!System.Runtime.CompilerServices.RuntimeFeature.IsDynamicCodeSupported)
+            throw new LispErrorException(new LispProgramError(
+                $"{what} requires runtime code generation, which this host does not " +
+                "support (a NativeAOT publish, or a file-based app -- `dotnet run app.cs` " +
+                "disables dynamic code unless the file says #:property PublishAot=false). " +
+                "Precompiled .fasl code runs here; new code cannot be compiled"));
+#endif
     }
 
     // --- Public API ---
@@ -407,6 +420,30 @@ public partial class CilAssembler
         var checkedSym = Startup.SymForRegistration(name);
         Runtime.CheckPackageLock(checkedSym, "DEFUN");  // may throw if locked
         checkedSym.Function = fn;
+    }
+
+    // Pool slots for package-qualified symbols, keyed by the symbol itself. A
+    // symbol is interned and immortal, so every site naming it can share one
+    // slot -- and must: giving each site its own slot made redefining a function
+    // grow the pool once per definition (the regression the collectible unit
+    // store was introduced for), while the object being pointed at was already
+    // permanent.
+    private static readonly Dictionary<Symbol, int> _symbolConstantIndex = new();
+
+    internal static int AddSymbolConstant(Symbol sym)
+    {
+        lock (_constantsLock)
+        {
+            if (_symbolConstantIndex.TryGetValue(sym, out var idx)) return idx;
+        }
+        int added = AddConstant(sym);
+        lock (_constantsLock)
+        {
+            // Racing threads may both have added one; keep the first.
+            if (_symbolConstantIndex.TryGetValue(sym, out var existing)) return existing;
+            _symbolConstantIndex[sym] = added;
+            return added;
+        }
     }
 
     public static int AddConstant(object value)

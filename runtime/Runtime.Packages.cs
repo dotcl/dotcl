@@ -145,6 +145,22 @@ public static partial class Runtime
         throw new LispErrorException(new LispTypeError($"{context}: not a symbol", obj));
     }
 
+    /// <summary>
+    /// The value of *PACKAGE*, as a package. Everything that defaults a package
+    /// argument to *PACKAGE* goes through here so that a bad value reports as a
+    /// TYPE-ERROR naming the variable and the caller, rather than as whatever the
+    /// .NET cast happens to say. The binding itself is not checked (SBCL declaims
+    /// the variable's type and rejects the binding; doing that here would put a
+    /// test on every dynamic bind), so this is where a NIL *PACKAGE* surfaces.
+    /// </summary>
+    internal static Package CurrentPackage(string context)
+    {
+        var v = DynamicBindings.Get(Startup.Sym("*PACKAGE*"));
+        if (v is Package p) return p;
+        throw new LispErrorException(new LispTypeError(
+            $"{context}: *PACKAGE* is not a package: {v}", v, Startup.Sym("PACKAGE")));
+    }
+
     private static Package ResolvePackage(LispObject pkg, string context)
     {
         if (pkg is Package pp) return pp;
@@ -239,13 +255,13 @@ public static partial class Runtime
 
     public static LispObject PackageErrorPackage(LispObject condition)
     {
-        if (condition is LispInstanceCondition lic)
         {
-            // Try to get the PACKAGE slot from the CLOS instance
-            if (lic.Instance.Class.SlotIndex.TryGetValue("PACKAGE", out int idx))
-                return lic.Instance.Slots[idx] ?? Nil.Instance;
-            if (lic.PackageRef != null) return lic.PackageRef;
+            // The PACKAGE slot, on the wrapper or on the bare instance.
+            var v = ConditionSlot(condition, "PACKAGE");
+            if (v is not Nil) return v;
         }
+        if (condition is LispInstanceCondition lic && lic.PackageRef != null)
+            return lic.PackageRef;
         if (condition is LispCondition lc && lc.PackageRef != null)
             return lc.PackageRef;
         return Nil.Instance;
@@ -253,12 +269,14 @@ public static partial class Runtime
 
     public static LispObject FileErrorPathname(LispObject condition)
     {
-        if (condition is LispInstanceCondition lic)
         {
-            if (lic.Instance.Class.SlotIndex.TryGetValue("PATHNAME", out int idx))
-                return lic.Instance.Slots[idx] ?? Nil.Instance;
-            if (lic.FileErrorPathnameRef != null) return lic.FileErrorPathnameRef;
+            // The PATHNAME slot, on the wrapper or on the bare instance (which is
+            // what a PRINT-OBJECT method receives).
+            var v = ConditionSlot(condition, "PATHNAME");
+            if (v is not Nil) return v;
         }
+        if (condition is LispInstanceCondition lic && lic.FileErrorPathnameRef != null)
+            return lic.FileErrorPathnameRef;
         if (condition is LispCondition lc && lc.FileErrorPathnameRef != null)
             return lc.FileErrorPathnameRef;
         return Nil.Instance;
@@ -400,7 +418,7 @@ public static partial class Runtime
         else if (pkg is Symbol psym) p = Package.FindPackage(psym.Name) ?? throw new LispErrorException(new LispError($"Package not found: {psym.Name}"));
         else if (pkg is LispChar pc) { var pn = pc.Value.ToString(); p = Package.FindPackage(pn) ?? throw new LispErrorException(new LispError($"Package not found: {pn}")); }
         else if (pkg is LispVector pv && pv.IsCharVector) { var pn = pv.ToCharString(); p = Package.FindPackage(pn) ?? throw new LispErrorException(new LispError($"Package not found: {pn}")); }
-        else if (pkg is Nil) p = (Package)DynamicBindings.Get(Startup.Sym("*PACKAGE*"));
+        else if (pkg is Nil) p = CurrentPackage("INTERN");
         else throw new LispErrorException(new LispTypeError("INTERN: invalid package designator", pkg));
 
         var (resultSym, isNew) = p.Intern(symName);
@@ -430,7 +448,7 @@ public static partial class Runtime
     /// the printer and list walkers (proper-list checks are `is Nil`) reject —
     /// e.g. SBCL's UNCROSS rebuilding a type spec via INTERN produced lists whose
     /// tail printed as ". NIL" and made MAPCAR signal "not a proper list".</summary>
-    private static LispObject CanonicalizeSymbol(Symbol sym) =>
+    internal static LispObject CanonicalizeSymbol(Symbol sym) =>
         ReferenceEquals(sym, Startup.NIL_SYM) ? Nil.Instance :
         ReferenceEquals(sym, Startup.T_SYM) ? (LispObject)T.Instance : sym;
 
@@ -696,8 +714,7 @@ public static partial class Runtime
     {
         // (find-symbol name &optional package) → symbol, status
         if (args.Length < 1 || args.Length > 2) throw MakeProgramError("FIND-SYMBOL", 1, 2, args.Length);
-        var pkg = args.Length > 1 ? ResolvePackage(args[1], "FIND-SYMBOL") :
-            (Package)DynamicBindings.Get(Startup.Sym("*PACKAGE*"));
+        var pkg = args.Length > 1 ? ResolvePackage(args[1], "FIND-SYMBOL") : CurrentPackage("FIND-SYMBOL");
         string symName = args[0] switch
         {
             LispString s => s.Value,
@@ -724,8 +741,7 @@ public static partial class Runtime
         // (unintern symbol &optional package)
         if (args.Length < 1 || args.Length > 2) throw MakeProgramError("UNINTERN", 1, 2, args.Length);
         string name = args[0] is Symbol sym ? sym.Name : args[0] is LispString s ? s.Value : args[0] is LispChar uc ? uc.Value.ToString() : args[0] is LispVector uv && uv.IsCharVector ? uv.ToCharString() : args[0].ToString()!;
-        var pkg = args.Length > 1 ? ResolvePackage(args[1], "UNINTERN") :
-            (Package)DynamicBindings.Get(Startup.Sym("*PACKAGE*"));
+        var pkg = args.Length > 1 ? ResolvePackage(args[1], "UNINTERN") : CurrentPackage("UNINTERN");
         return pkg.Unintern(name) ? T.Instance : Nil.Instance;
     }
 

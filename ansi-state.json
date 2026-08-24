@@ -1,0 +1,43 @@
+{
+  "updated": "2026-08-10",
+  "source": "gitlab.common-lisp.net/ansi-test/ansi-test",
+  "total": {"tests": 21945, "pass": 21944, "percent": 99.995, "failures": 1},
+  "known-failures": [
+    "DEFGENERIC.ERROR.1: SBCL-compat warn+fmakunbound — real-library compatibility"
+  ],
+  "narrowed-in-harness": [
+    "PRINT.DOUBLE-FLOAT.4 — re-registered in test/test-ansi.lisp with its random range narrowed by one value, from [-10^7, 10^7-1] to [-10^7+1, 10^7-1]. At the low endpoint |x| = 10^7, which CLHS 22.1.3.1.3 puts OUTSIDE the fixed-point range (10^-3 up to but not including 10^7), so exponential notation is correct and the test's expectation of \"-10000000.0\" is not. Measured on that value: dotcl, SBCL 2.6.1 and ABCL 1.9.3 all print -1.0d7. Before the narrowing it failed on 0.05% of runs (10000 draws), which read as an unreproducible CI red. Not excludable by note — unlike LOOP.1.40-43, ansi-test tags this test with nothing — and the clone is not patched; the harness replaces the entry after the category load, guarded on the upstream body still containing 20000000 so an upstream change is reported instead of silently shadowed. The other 19999999 draws still run."
+  ],
+  "excluded-by-note": [
+    "LOOP.1.40 / LOOP.1.41 / LOOP.1.42 / LOOP.1.43 — :loop-iteration-values-in-finally, registered disabled in test/test-ansi.lisp. What an arithmetic loop's variable holds in FINALLY; CLHS 6.1.2.1.1 is ambiguous and ansi-test tags the four :ansi-spec-problem itself. Measured on the same forms: dotcl 0.1.23, SBCL 2.6.6 and ABCL 1.9.3 all return the stepped-past value (to 5 => 6, below 5 => 5, downto 0 => -1, above 0 => 0); ansi-test expects the in-range one. Real libraries (e.g. babel unibyte encoders) rely on the stepped-past value too.",
+    "EXP.ERROR.8-11 / EXPT.ERROR.8-11 — :no-floating-point-underflow-by-default (8 tests, registered the same way)."
+  ],
+  "categories": {
+    "cons":                        {"tests": 1882, "pass": 1882, "status": "complete"},
+    "strings":                     {"tests": 509,  "pass": 509,  "status": "complete"},
+    "sequences":                   {"tests": 3287, "pass": 3287, "status": "complete"},
+    "data-and-control-flow":       {"tests": 1428, "pass": 1428, "status": "complete"},
+    "hash-tables":                 {"tests": 158,  "pass": 158,  "status": "complete"},
+    "symbols":                     {"tests": 1145, "pass": 1145, "status": "complete"},
+    "arrays":                      {"tests": 1356, "pass": 1356, "status": "complete"},
+    "types-and-classes":           {"tests": 627,  "pass": 627,  "status": "complete"},
+    "characters":                  {"tests": 259,  "pass": 259,  "status": "complete"},
+    "pathnames":                   {"tests": 215,  "pass": 215,  "status": "complete"},
+    "files":                       {"tests": 87,   "pass": 87,   "status": "complete"},
+    "system-construction":         {"tests": 77,   "pass": 77,   "status": "complete"},
+    "iteration":                   {"tests": 843,  "pass": 843,  "status": "complete",
+                                    "note": "LOOP.1.40-43 excluded via the :loop-iteration-values-in-finally note (registered in test/test-ansi.lisp). Measured: dotcl, SBCL 2.6.6 and ABCL 1.9.3 all return the stepped-past value (to 5 => 6); ansi-test expects the in-range one and tags the tests :ansi-spec-problem itself."},
+    "eval-and-compile":            {"tests": 326,  "pass": 326,  "status": "complete"},
+    "conditions":                  {"tests": 673,  "pass": 673,  "status": "complete"},
+    "printer":                     {"tests": 2446, "pass": 2446, "status": "complete"},
+    "environment":                 {"tests": 210,  "pass": 210,  "status": "complete"},
+    "structures":                  {"tests": 1394, "pass": 1394, "status": "complete"},
+    "packages":                    {"tests": 500,  "pass": 500,  "status": "complete"},
+    "objects":                     {"tests": 863,  "pass": 862,  "status": "near-complete",
+                                    "note": "DEFGENERIC.ERROR.1: SBCL-compat warn replaces error for real-library compatibility"},
+    "reader":                      {"tests": 673,  "pass": 673,  "status": "complete"},
+    "numbers":                     {"tests": 1444, "pass": 1444, "status": "complete"},
+    "streams":                     {"tests": 803,  "pass": 803,  "status": "complete"},
+    "misc":                        {"tests": 740,  "pass": 740,  "status": "complete"}
+  }
+}

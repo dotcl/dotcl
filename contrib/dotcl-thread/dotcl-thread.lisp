@@ -163,9 +163,15 @@
 (defvar dotcl::%atomics-lock nil)
 
 ;; Returns the PRIOR value of PLACE (sb-ext / CCL convention), not a T/NIL flag:
-;; success is (eq old ret), and a failed CAS hands back the current value for the
+;; success is (eql old ret), and a failed CAS hands back the current value for the
 ;; next retry with no separate (racy) re-read. Kept in sync with the
 ;; base fallback in cil-stdlib.lisp (%cas-expand).
+;;
+;; The comparison is EQL, not EQ. SBCL specifies EQ, but its fixnums are
+;; immediates, so EQ there behaves as a value comparison for exactly the objects
+;; EQL adds: numbers and characters. Here they are boxed and only a small cache is
+;; shared, so EQ would make a CAS on a counter stop swapping once the value left
+;; that cache.
 (defmacro dotcl::compare-and-swap (place old new)
   (let ((o (gensym "OLD")) (n (gensym "NEW")) (c (gensym "CUR")))
     (multiple-value-bind (temps vals stores writer reader)
@@ -174,7 +180,7 @@
          (dotcl:acquire-lock dotcl::%atomics-lock)
          (unwind-protect
            (let ((,c ,reader))
-             (when (eq ,c ,o)
+             (when (eql ,c ,o)
                (let ((,(car stores) ,n)) ,writer))
              ,c)
            (dotcl:release-lock dotcl::%atomics-lock))))))

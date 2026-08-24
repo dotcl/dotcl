@@ -1,4 +1,4 @@
-(defpackage :lib (:use :cl))
+(defpackage :lib (:use :cl) (:export #:greet #:sum-of-squares))
 (in-package :lib)
 
 ;;; The library's Lisp side. Everything here is compiled into a fasl at build

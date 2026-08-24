@@ -188,7 +188,7 @@ public static partial class Runtime
                 // THIS thread: the values were produced on a continuation thread,
                 // and the thread-static side of the MV protocol did not come along.
                 if (res is MvReturn mv)
-                    return MultipleValues.Values(mv.Values);
+                    return MultipleValues.Values(mv.ToArray());
                 // Task<VoidTaskResult> is the internal shape of a non-generic async
                 // Task; its Result is a private placeholder struct → NIL.
                 if (res != null && res.GetType().FullName == "System.Threading.Tasks.VoidTaskResult")
@@ -686,10 +686,10 @@ public static partial class Runtime
                 // (handler-case's :no-error clause, say) on their way out.
                 var v = TaskResultToLisp(t);
                 next = v is MvReturn mvr
-                    ? (mvr.Values.Length == 0
+                    ? (mvr.Count == 0
                         // No values: a binder still binds NIL (CL semantics).
                         ? cont.Invoke1(Nil.Instance)
-                        : cont.Invoke(mvr.Values))
+                        : cont.Invoke(mvr.ToArray()))
                     : cont.Invoke1(v);   // continuation returns the next Task
             }
             catch (Exception e) { tcs.SetException(e); return; }
@@ -1374,6 +1374,16 @@ public static partial class Runtime
         var type = Type.GetType(typeName);
         if (type != null) return type;
 
+        // "Foo.Bar&" is a byref (C# `ref` / `out`) parameter type. Type.GetType
+        // handles the suffix for corelib names but not for a type that has to be
+        // found by scanning loaded assemblies, so resolve the element and make
+        // the byref here.
+        if (typeName.EndsWith("&", StringComparison.Ordinal))
+        {
+            var elem = SearchDotNetType(typeName[..^1], out cacheable);
+            return elem?.MakeByRefType();
+        }
+
         // Strip ", AssemblyName" suffix before searching loaded assemblies with GetType(),
         // which only accepts unqualified type names.
         string bareTypeName = typeName;
@@ -1447,6 +1457,49 @@ public static partial class Runtime
             return dynType;
         }
 
+        // Last resort: the user's short-name table.
+        var aliased = ResolveViaTypeAlias(typeName);
+        if (aliased != null)
+        {
+            cacheable = false;   // the table is mutable; do not freeze the mapping
+            return aliased;
+        }
+
+        return null;
+    }
+
+    [ThreadStatic] private static bool _inTypeAliasLookup;
+
+    /// <summary>
+    /// Resolve TYPENAME through DOTNET::*TYPE-ALIASES*, the user-extensible table of
+    /// short names ("TEXTURE2D" -> "Microsoft.Xna.Framework.Graphics.Texture2D").
+    /// Only DOTNET:DEFINE-CLASS consulted it, so a name registered there worked in a
+    /// class definition but not as a generic type argument, a constructor name, or
+    /// anywhere else a type is named (dotcl/dotcl issue 38). Resolving it here puts
+    /// every type-name path on the same table.
+    ///
+    /// Runs only after normal resolution has failed, so an alias can never shadow a
+    /// real type. Returns null when the table does not exist -- it is defined by the
+    /// dotnet-class contrib, which a program need not have loaded.
+    /// </summary>
+    private static Type? ResolveViaTypeAlias(string typeName)
+    {
+        if (_inTypeAliasLookup) return null;   // an alias whose target is itself unresolvable
+        var pkg = Package.FindPackage("DOTNET");
+        if (pkg == null) return null;
+        var (sym, status) = pkg.FindSymbol("*TYPE-ALIASES*");
+        if (status == SymbolStatus.None) return null;
+        if (!DynamicBindings.TryGet(sym, out var val) || val is not LispHashTable ht) return null;
+        // The table is keyed by SYMBOL-NAME, i.e. upper case. Try the name as given
+        // first so a table with mixed-case keys still works.
+        foreach (var key in new[] { typeName, typeName.ToUpperInvariant() })
+        {
+            if (!ht.TryGet(new LispString(key), out var mapped)) continue;
+            if (mapped is not LispString ms || ms.Value.Length == 0 || ms.Value == typeName) continue;
+            _inTypeAliasLookup = true;
+            try { return SearchDotNetType(ms.Value, out _); }
+            finally { _inTypeAliasLookup = false; }
+        }
         return null;
     }
 
@@ -2650,6 +2703,10 @@ public static partial class Runtime
                 // emitted as `public static` (no self) — a defun exported into a
                 // library type. Mutually exclusive with override.
                 bool isStatic = false;
+                // Optional 8th element: parameter names, so the emitted signature
+                // can be bound by name (see MethodSpec.ParamNames). Absent in specs
+                // written before names were carried, hence null rather than empty.
+                List<string>? paramNames = null;
                 if (r3.Cdr is Cons r4)
                 {
                     isOverride = r4.Car != Nil.Instance;
@@ -2659,7 +2716,24 @@ public static partial class Runtime
                     {
                         attrSpecsObj = r5.Car;
                         if (r5.Cdr is Cons r6)
+                        {
                             isStatic = r6.Car != Nil.Instance;
+                            if (r6.Cdr is Cons r7 && r7.Car != Nil.Instance)
+                            {
+                                paramNames = new List<string>();
+                                var ncur = r7.Car;
+                                while (ncur is Cons nc)
+                                {
+                                    paramNames.Add(nc.Car switch
+                                    {
+                                        LispString ls2 => ls2.Value,
+                                        Symbol sy => sy.Name,
+                                        _ => nc.Car.ToString() ?? ""
+                                    });
+                                    ncur = nc.Cdr;
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -2703,7 +2777,8 @@ public static partial class Runtime
                 }
 
                 methods.Add(new Emitter.DynamicClassBuilder.MethodSpec(
-                    mname, rtype, paramTypes, lambdaObj, isOverride, methodAttrs, isStatic));
+                    mname, rtype, paramTypes, lambdaObj, isOverride, methodAttrs, isStatic,
+                    paramNames));
                 cur = c.Cdr;
             }
         }
@@ -2912,6 +2987,21 @@ public static partial class Runtime
     /// PropertyChangedEventArgs carrying the property name. Requires a
     /// matching PropertyChanged event to be declared via event-specs.
     /// Returns the full name as a LispString on success.</summary>
+    /// <summary>The message of a class-spec rejection, without the C# plumbing.
+    /// ArgumentException appends "(Parameter 'fields')" — the name of a C#
+    /// parameter of a method the Lisp caller never wrote and cannot see. The text
+    /// before it already says what is wrong with the spec.</summary>
+    private static string ClassSpecMessage(ArgumentException ae)
+    {
+        var msg = ae.Message;
+        if (ae.ParamName != null)
+        {
+            int at = msg.IndexOf($" (Parameter '{ae.ParamName}')", StringComparison.Ordinal);
+            if (at >= 0) msg = msg.Substring(0, at);
+        }
+        return msg;
+    }
+
     public static LispObject DotNetDefineClass(LispObject[] args)
     {
 #if !DOTCL_EMIT
@@ -2961,8 +3051,8 @@ public static partial class Runtime
         }
         catch (ArgumentException ae)
         {
-            throw new LispErrorException(new LispError(
-                $"DOTNET:%DEFINE-CLASS: {ae.Message}"));
+            throw new LispErrorException(new LispProgramError(
+                $"DOTNET:%DEFINE-CLASS: {ClassSpecMessage(ae)}"));
         }
 #endif
     }
@@ -3214,8 +3304,8 @@ public static partial class Runtime
         }
         catch (ArgumentException ae)
         {
-            throw new LispErrorException(new LispError(
-                $"DOTNET:%SAVE-LIBRARY: {ae.Message}"));
+            throw new LispErrorException(new LispProgramError(
+                $"DOTNET:%SAVE-LIBRARY: {ClassSpecMessage(ae)}"));
         }
         catch (PlatformNotSupportedException pnse)
         {

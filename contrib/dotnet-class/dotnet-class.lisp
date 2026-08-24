@@ -163,6 +163,17 @@
            (list ,@ctor-param-types)
            (list ,@base-arg-indices))))
 
+(defun dotnet::%param-name-string (sym)
+  "Emitted .NET name for a parameter written as SYM.
+
+   A symbol read the ordinary way arrives upcased, and .NET parameter names are
+   conventionally lowercase, so N becomes \"n\". A symbol whose name already
+   holds a lowercase letter was written with its case preserved, as
+   |__originalMethod| is, and is taken verbatim: a caller that binds by name
+   needs the exact spelling, and the case cannot be recovered once folded."
+  (let ((s (symbol-name sym)))
+    (if (some #'lower-case-p s) s (string-downcase s))))
+
 (defun dotnet::%method-spec-form (m &optional force-static)
   "Return a form producing one method-spec list for dotnet:%define-class /
    dotnet:%save-library. M is (name params &rest tail); tail begins with
@@ -206,7 +217,9 @@
                ,(if method-attrs
                     `(list ,@(mapcar (lambda (a) `(list ,@a)) method-attrs))
                     'nil)
-               ,static)))))
+               ,static
+               (list ,@(mapcar (function dotnet::%param-name-string)
+                               param-names)))))))
 
 (defun dotnet::%class-spec-args (full-name supers options)
   "Return a LIST of 12 forms = the positional dotnet:%define-class args 0-11
@@ -480,3 +493,23 @@
              (dotnet:invoke ,var "Dispose"))))))
 
 (provide :dotnet-class)
+
+;;; ---------------------------------------------------------------------------
+;;; dotnet:deref: the cell a `ref' / `out' parameter arrives as
+;;;
+;;; (dotnet:deref cell)            -> the caller's current value
+;;; (setf (dotnet:deref cell) val) -> what the caller reads after the call
+;;;
+;;; A Lisp function is called with values, so a parameter the caller expects to
+;;; be written back cannot be an ordinary argument. A method declared with a
+;;; byref parameter type ("System.Object&") receives a DotCL.Emitter.ByRef cell
+;;; instead, and whatever the body leaves in it is copied back on return.
+;;; Leaving it alone leaves the caller's value alone.
+
+(export 'dotnet::deref (find-package :dotnet))
+
+(defun dotnet::deref (cell)
+  (dotnet:invoke cell "Value"))
+
+(defsetf dotnet::deref (cell) (val)
+  `(progn (dotnet:%set-invoke ,cell "Value" ,val) ,val))

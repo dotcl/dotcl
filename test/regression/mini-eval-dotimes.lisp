@@ -23,3 +23,15 @@
   (macrolet ((m () (let ((n 0)) `(quote ,(dotimes (i 3 n) (incf n))))))
     (m))
   3)
+
+;; The variable-count DOTIMES emits the other intrinsic, %FIXNUM-GE-OBJECT
+;; (raw counter vs boxed limit). A macrolet expander runs through %MINI-EVAL,
+;; which needs its own handler for it -- CI's tree-walk regression job caught
+;; the missing one.
+(deftest mini-eval-dotimes.variable-count
+  (macrolet ((m (depth)
+               (let ((acc nil))
+                 (dotimes (i depth) (push i acc))
+                 `(quote ,(nreverse acc)))))
+    (m 4))
+  (0 1 2 3))

@@ -30,6 +30,9 @@ public static class Arithmetic
         // Complex contagion
         if (a is LispComplex || b is LispComplex)
         {
+            if (TryDoubleParts(a, out double aar, out double aai)
+                && TryDoubleParts(b, out double abr, out double abi))
+                return new DoubleComplex(aar + abr, aai + abi);
             var ac = AsComplex(a);
             var bc = AsComplex(b);
             return MakeComplex(Add(ac.Real, bc.Real), Add(ac.Imaginary, bc.Imaginary));
@@ -42,6 +45,9 @@ public static class Arithmetic
             return new SingleFloat(ToSingle(a) + ToSingle(b));
 
         // Exact arithmetic
+        if (a is Bignum or Fixnum && b is Bignum or Fixnum)
+            return Bignum.MakeInteger(IntValue(a) + IntValue(b));
+
         var (an, ad) = AsRational(a);
         var (bn, bd) = AsRational(b);
         return (Number)Ratio.Make(an * bd + bn * ad, ad * bd);
@@ -70,6 +76,9 @@ public static class Arithmetic
 
         if (a is LispComplex || b is LispComplex)
         {
+            if (TryDoubleParts(a, out double sar, out double sai)
+                && TryDoubleParts(b, out double sbr, out double sbi))
+                return new DoubleComplex(sar - sbr, sai - sbi);
             var ac = AsComplex(a);
             var bc = AsComplex(b);
             return MakeComplex(Subtract(ac.Real, bc.Real), Subtract(ac.Imaginary, bc.Imaginary));
@@ -79,6 +88,9 @@ public static class Arithmetic
             return new DoubleFloat(ToDouble(a) - ToDouble(b));
         if (a is SingleFloat || b is SingleFloat)
             return new SingleFloat(ToSingle(a) - ToSingle(b));
+
+        if (a is Bignum or Fixnum && b is Bignum or Fixnum)
+            return Bignum.MakeInteger(IntValue(a) - IntValue(b));
 
         var (an, ad) = AsRational(a);
         var (bn, bd) = AsRational(b);
@@ -106,6 +118,23 @@ public static class Arithmetic
 
         if (a is LispComplex || b is LispComplex)
         {
+            // A real factor scales each part. Going through the (a+bi)(c+di) form
+            // with an imaginary part of zero instead multiplies that zero by the
+            // other part, and 0 * infinity is NaN: (* 1 #C(inf 0.0)) came back as
+            // #C(inf NaN). It also loses a signed zero, since 0*x + 0*y is +0.0
+            // whatever the signs were. Scaling keeps both.
+            if (a is not LispComplex && b is LispComplex bsc)
+                return MakeComplex(Multiply(a, bsc.Real), Multiply(a, bsc.Imaginary));
+            if (b is not LispComplex && a is LispComplex asc)
+                return MakeComplex(Multiply(asc.Real, b), Multiply(asc.Imaginary, b));
+            // All-double: the general form below boxes each of the four products
+            // and both of the sums, seven allocations to produce one result. It
+            // is the same formula over the same doubles rounded at the same
+            // points, so this answers bit-identically without the intermediates.
+            if (TryDoubleParts(a, out double mar, out double mai)
+                && TryDoubleParts(b, out double mbr, out double mbi))
+                return new DoubleComplex(mar * mbr - mai * mbi,
+                                         mar * mbi + mai * mbr);
             var ac = AsComplex(a);
             var bc = AsComplex(b);
             // (a+bi)(c+di) = (ac-bd) + (ad+bc)i
@@ -118,6 +147,12 @@ public static class Arithmetic
             return new DoubleFloat(ToDouble(a) * ToDouble(b));
         if (a is SingleFloat || b is SingleFloat)
             return new SingleFloat(ToSingle(a) * ToSingle(b));
+
+        // Integer by integer: multiply directly. The rational form below would
+        // build two (numerator, denominator) pairs and then reduce by a GCD that
+        // is always 1 -- the reduction alone was 43% of the FACTORIAL benchmark.
+        if (a is Bignum or Fixnum && b is Bignum or Fixnum)
+            return Bignum.MakeInteger(IntValue(a) * IntValue(b));
 
         var (an, ad) = AsRational(a);
         var (bn, bd) = AsRational(b);
@@ -160,19 +195,13 @@ public static class Arithmetic
                 Divide(Add(Multiply(ac.Real, bc.Real), Multiply(ac.Imaginary, bc.Imaginary)), denom),
                 Divide(Subtract(Multiply(ac.Imaginary, bc.Real), Multiply(ac.Real, bc.Imaginary)), denom));
         }
-
+        // Mixed float/rational division: the result type is a float, so IEEE
+        // applies here as it does in Runtime.Divide -- (/ 1 0.0d0) must not
+        // answer differently from (/ 1.0d0 0.0d0).
         if (a is DoubleFloat || b is DoubleFloat)
-        {
-            double bval = ToDouble(b);
-            if (bval == 0.0) throw new DivideByZeroException("Division by zero");
-            return new DoubleFloat(ToDouble(a) / bval);
-        }
+            return new DoubleFloat(ToDouble(a) / ToDouble(b));
         if (a is SingleFloat || b is SingleFloat)
-        {
-            float bval2 = ToSingle(b);
-            if (bval2 == 0.0f) throw new DivideByZeroException("Division by zero");
-            return new SingleFloat(ToSingle(a) / bval2);
-        }
+            return new SingleFloat(ToSingle(a) / ToSingle(b));
 
         var (an, ad) = AsRational(a);
         var (bn, bd) = AsRational(b);
@@ -211,9 +240,16 @@ public static class Arithmetic
             // (max*sqrt(1+(min/max)^2)) so it doesn't over/underflow when re^2/im^2
             // would: e.g. (abs #C(1d170 1d170)) and (abs #C(1d-170 1d-170)) are exact
             // rather than +inf / 0. The naive sqrt(re^2+im^2) squared the magnitude.
-            LispComplex c => (c.Real is SingleFloat && c.Imaginary is SingleFloat)
-                ? (Number)new SingleFloat((float)System.Numerics.Complex.Abs(ToSystemComplex(c)))
-                : new DoubleFloat(System.Numerics.Complex.Abs(ToSystemComplex(c))),
+            // Only a double part makes the magnitude a double. Rational parts give
+            // a single float, because the magnitude is (sqrt (+ (* r r) (* i i)))
+            // and SQRT of a rational answers in the default float format -- ABS of
+            // a complex rational used to be the one place that said double while
+            // SQRT of the same number said single.
+            DoubleComplex dc => new DoubleFloat(
+                System.Numerics.Complex.Abs(new System.Numerics.Complex(dc.RealValue, dc.ImagValue))),
+            LispComplex c => (c.Real is DoubleFloat || c.Imaginary is DoubleFloat)
+                ? (Number)new DoubleFloat(System.Numerics.Complex.Abs(ToSystemComplex(c)))
+                : new SingleFloat((float)System.Numerics.Complex.Abs(ToSystemComplex(c))),
             _ => throw new NotImplementedException()
         };
     }
@@ -459,6 +495,11 @@ public static class Arithmetic
         bool bFloat = b is SingleFloat || b is DoubleFloat;
         // A non-finite float (inf/nan) has no rational value; compare as doubles
         // (matching the float/float path) instead of rationalizing (which throws).
+        // Two floats compare as doubles whether or not either is finite: the
+        // non-finite branch answers with this same expression. Settle it here
+        // rather than probing both operands for finiteness first.
+        if (aFloat && bFloat)
+            return ToDouble(a).CompareTo(ToDouble(b));
         if (IsNonFiniteFloat(a, aFloat) || IsNonFiniteFloat(b, bFloat))
             return ToDouble(a).CompareTo(ToDouble(b));
         if (aFloat && !bFloat) {
@@ -516,6 +557,39 @@ public static class Arithmetic
     }
 
     // --- Floor / Ceiling / Truncate / Round ---
+
+    /// <summary>
+    /// The remainder belonging to a quotient, built from the remainder the
+    /// division already produced.
+    ///
+    /// The four operations below all computed it as a - q*b instead, which is a
+    /// multiplication by a quotient that can be thousands of digits wide -- more
+    /// work than the division that preceded it. DivRem hands back the remainder
+    /// for free, and a rounding adjustment of one moves it by exactly one
+    /// divisor, so an addition finishes the job.
+    ///
+    /// REM and DEN are in the frame the caller normalised to (DEN made positive,
+    /// FLIPPED recording whether both were negated). ADJUST is how the caller
+    /// moved the truncated quotient: -1, 0 or +1. AD and BD are the denominators
+    /// of the two operands, so the exact remainder is the integer one scaled by
+    /// 1/(AD*BD).
+    ///
+    /// Exact operands only. A float operand has to give a float remainder, and
+    /// this answers in the rationals.
+    /// </summary>
+    private static Number ExactRemainder(BigInteger rem, BigInteger den, int adjust,
+                                         bool flipped, BigInteger ad, BigInteger bd)
+    {
+        var r = adjust == 0 ? rem : adjust > 0 ? rem - den : rem + den;
+        if (flipped) r = -r;
+        var scale = ad * bd;
+        return scale.IsOne ? (Number)Bignum.MakeInteger(r) : (Number)Ratio.Make(r, scale);
+    }
+
+    /// <summary>True when both operands are exact, so ExactRemainder applies.</summary>
+    private static bool BothExact(Number a, Number b) =>
+        a is Fixnum or Bignum or Ratio && b is Fixnum or Bignum or Ratio;
+
     public static (Number quotient, Number remainder) Floor(Number a, Number b)
     {
         // Fast path: both Fixnum — avoid BigInteger conversion
@@ -533,11 +607,14 @@ public static class Arithmetic
         var num = an * bd;
         var den = ad * bn;
         // Ensure denominator is positive for consistent sign handling
-        if (den < 0) { num = -num; den = -den; }
+        bool flipped = den < 0;
+        if (flipped) { num = -num; den = -den; }
         var q2 = BigInteger.DivRem(num, den, out var rem);
         // Floor: if remainder < 0, subtract 1 (round toward negative infinity)
-        if (rem < 0) q2 -= 1;
+        int adjust = rem < 0 ? -1 : 0;
+        q2 += adjust;
         var qn = (Number)Bignum.MakeInteger(q2);
+        if (BothExact(a, b)) return (qn, ExactRemainder(rem, den, adjust, flipped, ad, bd));
         var remainder = Subtract(a, Multiply(qn, b));
         return (qn, remainder);
     }
@@ -555,10 +632,13 @@ public static class Arithmetic
         var (bn, bd) = AsRationalAny(b);
         var num = an * bd;
         var den = ad * bn;
-        if (den < 0) { num = -num; den = -den; }
-        // Truncate: DivRem truncates toward zero by default
-        var q2 = BigInteger.DivRem(num, den, out _);
+        bool flipped = den < 0;
+        if (flipped) { num = -num; den = -den; }
+        // Truncate: DivRem truncates toward zero by default, so its remainder is
+        // already the answer -- no adjustment.
+        var q2 = BigInteger.DivRem(num, den, out var rem);
         var qn = (Number)Bignum.MakeInteger(q2);
+        if (BothExact(a, b)) return (qn, ExactRemainder(rem, den, 0, flipped, ad, bd));
         var remainder = Subtract(a, Multiply(qn, b));
         return (qn, remainder);
     }
@@ -578,11 +658,14 @@ public static class Arithmetic
         var (bn, bd) = AsRationalAny(b);
         var num = an * bd;
         var den = ad * bn;
-        if (den < 0) { num = -num; den = -den; }
+        bool flipped = den < 0;
+        if (flipped) { num = -num; den = -den; }
         var q2 = BigInteger.DivRem(num, den, out var rem);
         // Ceiling: if remainder > 0, add 1 (round toward positive infinity)
-        if (rem > 0) q2 += 1;
+        int adjust = rem > 0 ? 1 : 0;
+        q2 += adjust;
         var qn = (Number)Bignum.MakeInteger(q2);
+        if (BothExact(a, b)) return (qn, ExactRemainder(rem, den, adjust, flipped, ad, bd));
         var remainder = Subtract(a, Multiply(qn, b));
         return (qn, remainder);
     }
@@ -593,23 +676,27 @@ public static class Arithmetic
         var (bn, bd) = AsRationalAny(b);
         var num = an * bd;
         var den = ad * bn;
-        if (den < 0) { num = -num; den = -den; }
+        bool flipped = den < 0;
+        if (flipped) { num = -num; den = -den; }
         var q = BigInteger.DivRem(num, den, out var rem);
         // Round to nearest, ties to even
         var absRem2 = BigInteger.Abs(rem) * 2;
         var absDen = BigInteger.Abs(den);
+        int adjust = 0;
         if (absRem2 > absDen)
         {
             // Round away from zero
-            q += rem < 0 ? -1 : 1;
+            adjust = rem < 0 ? -1 : 1;
         }
         else if (absRem2 == absDen)
         {
             // Tie: round to even
             if (!q.IsEven)
-                q += rem < 0 ? -1 : 1;
+                adjust = rem < 0 ? -1 : 1;
         }
+        q += adjust;
         var qn = (Number)Bignum.MakeInteger(q);
+        if (BothExact(a, b)) return (qn, ExactRemainder(rem, den, adjust, flipped, ad, bd));
         var remainder = Subtract(a, Multiply(qn, b));
         return (qn, remainder);
     }
@@ -719,6 +806,12 @@ public static class Arithmetic
         _ => throw new NotImplementedException($"ToDouble not implemented for {n.GetType().Name}")
     };
 
+    /// <summary>The exact integer value of a FIXNUM or BIGNUM. Used by the
+    /// integer fast paths in Add/Subtract/Multiply, which exist so an operation on
+    /// integers does not build a rational and reduce it.</summary>
+    private static BigInteger IntValue(Number n) =>
+        n is Fixnum f ? f.Value : ((Bignum)n).Value;
+
     private static (BigInteger num, BigInteger den) AsRational(Number n) => n switch
     {
         Fixnum f => (f.Value, BigInteger.One),
@@ -736,16 +829,45 @@ public static class Arithmetic
                  Startup.Sym(n is LispComplex ? "REAL" : "RATIONAL")))
     };
 
+    // A complex whose parts are both DoubleFloat, or a real DoubleFloat (whose
+    // imaginary part is an exact zero that every path below would turn into 0.0
+    // anyway). Reading the parts as raw doubles lets the complex operations run
+    // the same formula on the same values without boxing each intermediate.
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static bool TryDoubleParts(Number n, out double re, out double im)
+    {
+        // Reading the fields, not the Real/Imaginary properties: those box.
+        if (n is DoubleComplex dc) { re = dc.RealValue; im = dc.ImagValue; return true; }
+        if (n is DoubleFloat d) { re = d.Value; im = 0.0; return true; }
+        re = im = 0.0; return false;
+    }
+
     private static LispComplex AsComplex(Number n) => n switch
     {
         LispComplex c => c,
-        _ => new LispComplex(n, Fixnum.Make(0))
+        _ => LispComplex.Of(n, Fixnum.Make(0))
     };
 
     private static Number MakeComplex(Number real, Number imag)
     {
+        // Float contagion (CLHS 12.1.4.4) governs the pair, not just the part an
+        // operation happened to touch. Adding a double to #C(1 2) runs the real
+        // parts through ADD and carries the imaginary part across untouched, so
+        // without this the answer was #C(4.5d0 2) -- a complex with one float
+        // part and one rational part, which no CL value may be.
+        if (real is DoubleFloat && imag is not DoubleFloat)
+            imag = new DoubleFloat(ToDouble(imag));
+        else if (imag is DoubleFloat && real is not DoubleFloat)
+            real = new DoubleFloat(ToDouble(real));
+        else if (real is SingleFloat && imag is not SingleFloat)
+            imag = new SingleFloat((float)ToDouble(imag));
+        else if (imag is SingleFloat && real is not SingleFloat)
+            real = new SingleFloat((float)ToDouble(real));
+        // After the widening, not before: a zero imaginary part collapses to the
+        // real number only while it is still exact. Once contagion has made it
+        // 0.0 the value stays complex, which is what CLHS 12.1.5.3 requires.
         if (imag is Fixnum fi && fi.Value == 0) return real;
-        return new LispComplex(real, imag);
+        return LispComplex.Of(real, imag);
     }
 
     public static LispObject MakeComplexPublic(Number real, Number imag)
@@ -764,7 +886,7 @@ public static class Arithmetic
         else if (imag is SingleFloat && real is not SingleFloat)
             real = new SingleFloat((float)ToDouble(real));
         // Per CL spec: if imagpart is 0.0 for floats, still return complex (already float)
-        return new LispComplex(real, imag);
+        return LispComplex.Of(real, imag);
     }
 
     /// <summary>CLHS asin(z) = -i log(iz + sqrt(1-z)*sqrt(1+z)). Used to promote a
@@ -797,7 +919,11 @@ public static class Arithmetic
 
     /// <summary>Convert a LispComplex to System.Numerics.Complex.</summary>
     public static System.Numerics.Complex ToSystemComplex(LispComplex c)
-        => new System.Numerics.Complex(ToDouble(c.Real), ToDouble(c.Imaginary));
+        // The DoubleComplex case first: reading its Real/Imaginary properties
+        // would box both parts on the way to unboxing them again.
+        => c is DoubleComplex dc
+            ? new System.Numerics.Complex(dc.RealValue, dc.ImagValue)
+            : new System.Numerics.Complex(ToDouble(c.Real), ToDouble(c.Imaginary));
 
     /// <summary>Convert a System.Numerics.Complex back to a Lisp number.
     /// If imaginary part is 0, returns just the real part as a DoubleFloat.</summary>
@@ -805,7 +931,7 @@ public static class Arithmetic
     {
         if (c.Imaginary == 0.0)
             return new DoubleFloat(c.Real);
-        return new LispComplex(new DoubleFloat(c.Real), new DoubleFloat(c.Imaginary));
+        return new DoubleComplex(c.Real, c.Imaginary);
     }
 
     /// <summary>Convert a System.Numerics.Complex back, preserving the float type of the original input.</summary>
@@ -819,11 +945,11 @@ public static class Arithmetic
             // If original was complex, keep result as complex even with zero imaginary
             if (c.Imaginary == 0.0 && !originalIsComplex)
                 return new SingleFloat((float)c.Real);
-            return new LispComplex(new SingleFloat((float)c.Real), new SingleFloat((float)c.Imaginary));
+            return new BoxedComplex(new SingleFloat((float)c.Real), new SingleFloat((float)c.Imaginary));
         }
         // DoubleFloat path
         if (c.Imaginary == 0.0 && !originalIsComplex)
             return new DoubleFloat(c.Real);
-        return new LispComplex(new DoubleFloat(c.Real), new DoubleFloat(c.Imaginary));
+        return new DoubleComplex(c.Real, c.Imaginary);
     }
 }

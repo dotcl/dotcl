@@ -348,8 +348,12 @@ cross-compile / load 双方で正しく走るように `cil-compile.lisp` 側で
 `float[]` / `double[]` ストレージと native float local を選ぶ経路が
 その第一歩 (3.1 参照)。呼出側では、名前付き関数や共通アリティの
 組込みに per-arity の direct delegate を装着して引数配列パック
-(InvokeSlow) を回避する最適化を進めている。全面的な型推論最適化は
-引き続き将来課題。
+(InvokeSlow) を回避する最適化を進めている。クロージャも同じ扱いで、
+本体を `(env, a0..aN-1)` 署名で emit すれば直行できる。**これは
+`.fasl` にも適用される** — 適用していなかった間は、同じソースでも
+`compile-file` した途端に呼び出しごとに引数配列を確保していた
+(quickload したライブラリは全部 `.fasl` なので、そちらが通常の形)。
+全面的な型推論最適化は引き続き将来課題。
 
 ### 3.7 CIL アセンブラ
 
@@ -414,8 +418,27 @@ CI で毎 push 走る。
 `compiler/cil-compile.lisp` (compile-file ドライバ)。
 
 **実装上の論点**: 動的経路と静的経路で constants の扱いが異なる。
-動的では `_constants` 配列にぶら下げ、静的ではすべて IL に展開
-(persisted assembly は外部参照を持てないため)。`load-time-value` は
+動的では `_constants` 配列にぶら下げ、静的では **持ち出せる形に
+落とし直す** (persisted assembly は外部プロセスのオブジェクトを
+参照できないため)。落とし方は 2 通りあり、大きさで選ぶ:
+
+- **小さいリテラル**: IL で 1 要素ずつ組み立てる
+- **大きいリテラル (閾値 64 ノード)、および循環・共有のあるグラフ**:
+  印字表現を **UTF-8 で PE のデータセクション** (`DefineInitializedData`)
+  に置き、ロード時に reader で復元する。組み立て IL は 1 回実行する
+  ためだけに必ず JIT されるので、リテラルが支配的なファイルでは
+  **ロード時間の大半が JIT** になっていた (実測: リテラルが IL の 93% を
+  占める合成ファイルで load 壁時計の 97%)。データにすると load が
+  10-20 倍速く、コードのために積むメモリが 8 分の 1 になる。
+  意味論が変わらないグラフに限る — 未 intern シンボル (EQ が壊れる)、
+  構造体/CLOS インスタンス (make-load-form を迂回する)、パス名
+  (version が落ちる)、単純ベクタ以外のベクタ (要素型が落ちる) は
+  組み立て経路に残す。表現は `*print-circle*` で印字し、`*package*` /
+  `*readtable*` / `*read-default-float-format*` を固定して読む
+  (どれか 1 つでも読む側の設定に委ねると、値は合っているのに型や
+  シンボルが変わる)
+
+`load-time-value` は
 sequential ID (`*ltv-counter*`) を振り、`Startup.LoadTimeValueSlot`
 経由で遅延評価する。`.fasl` は **IL only / OS・CPU 非依存** で、
 Windows でビルドした `.fasl` を Linux で load しても動く (NativeAOT
@@ -467,6 +490,12 @@ ThreadStatic のサイドチャネル (`_count` / `_values`) で「最後の明�
 の cleanup 中に多値が破壊されないよう `SaveCount` / `SaveValues`
 / `RestoreSaved` で退避する。多値のヒープアロケーションは SBCL の
 レジスタ渡しに比べると遅いが、頻度が低いので問題化していない。
+**コストが出るのはラッパーではなく単値側の publish** — 1 値の戻りでも
+「これが最後の値だ」をサイドチャネルに書き、その前に `is MvReturn` を
+判定する。precompiled なコードを実行するだけのプロファイルでは、
+型チェック時間の 45% がこの経路 (`MultipleValues.Primary` +
+`UnwrapMv`) に出る。減らすには呼び出し規約の側を触ることになるので、
+別課題として切ってある。
 
 **ANSI / SBCL との差分**: ANSI 準拠。dotcl は `(values)` (0 値) と
 2 値以上のときだけラッパーを生成し、単値は素通し。
@@ -770,7 +799,12 @@ dotcl/
 - **Step 8 (達成)**: セルフホスト + イメージ出力。Lisp 製コンパイラが
   dotcl 上で自身をコンパイルし、`dotcl:save-application` (3.18) で
   配布物を出せる。SBCL の `save-lisp-and-die` とは range が違う
-  (実行時ヒープのダンプではない)
+  (実行時ヒープのダンプではない)。**世代の不動点**も機械で確認して
+  いる: ツリーのコアが作ったコアが更に自分を再生産すること
+  (`make selfhost-check`) と、**出荷済みの dotcl がこのツリーを
+  建てられること** (`make seed-check`) の 2 つを CI が見る。後者が
+  「ビルド鎖から Common Lisp ホストを外せる」条件で、既定のホストを
+  切り替えるかどうかは別の判断として残してある
 - **Step 8.5 (達成)**: 無改変 SBCL のクロスビルドホストとして通る
   (`./make.sh --xc-host=dotcl` が完走)。処理系としての網羅度を外部の
   巨大な CL コードで測る駆動源。残っているのは性能 (SBCL ホスト比)

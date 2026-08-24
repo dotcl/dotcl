@@ -1702,6 +1702,18 @@ public static class Startup
             Emitter.CilAssembler.RegisterFunction("DOTCL:JIT-DISASSEMBLE", jitDasmFn);
         }
         {
+            // Where `dotcl clean` looks, and what it would pick there. Internal:
+            // the cleaning itself is a CLI subcommand, and these exist so the
+            // regression suite can check the location against uiop's own answer
+            // and run the selection rule over a directory it builds itself.
+            var fcRootFn = new LispFunction(FaslCache.FaslCacheRoot, "DOTCL::%FASL-CACHE-ROOT", 0);
+            RegisterDotclInternal("%FASL-CACHE-ROOT", fcRootFn);
+            Emitter.CilAssembler.RegisterFunction("DOTCL::%FASL-CACHE-ROOT", fcRootFn);
+            var fcEntriesFn = new LispFunction(FaslCache.FaslCacheEntries, "DOTCL::%FASL-CACHE-ENTRIES", -1);
+            RegisterDotclInternal("%FASL-CACHE-ENTRIES", fcEntriesFn);
+            Emitter.CilAssembler.RegisterFunction("DOTCL::%FASL-CACHE-ENTRIES", fcEntriesFn);
+        }
+        {
             // Name omitted on purpose: a named fn would push its own frame onto
             // the call stack and appear in its own backtrace output.
             var btFn = new LispFunction(Runtime.Backtrace);
@@ -1915,14 +1927,39 @@ public static class Startup
         }));
 
         // dotcl:combine-fasls — back uiop:combine-fasls (monolithic FASL bundle).
-        // Not yet implemented: a dotcl FASL is a .NET PE assembly and cannot be
-        // concatenated the way most implementations combine object FASLs. The uiop
-        // #+dotcl branch calls here so the wiring is in place once a real merge
-        // (e.g. re-emitting the inputs' sources into one assembly) is built.
+        // The inputs are not concatenated: a dotcl FASL is a .NET PE assembly, so
+        // the output is a container assembly carrying each input as a resource,
+        // which LOAD unpacks in order (Runtime.LoadFaslBundleParts). The
+        // observable contract is uiop's -- one output file, loading it loads
+        // everything, the inputs are no longer needed.
         RegisterDotcl("COMBINE-FASLS", new LispFunction(args => {
+            if (args.Length != 2)
+                throw new LispErrorException(new LispProgramError(
+                    "COMBINE-FASLS: expected (inputs output)"));
+#if DOTCL_EMIT
+            var inputs = new List<string>();
+            var cur = args[0];
+            while (cur is Cons c)
+            {
+                inputs.Add(((LispString)Runtime.Namestring(c.Car)).Value);
+                cur = c.Cdr;
+            }
+            var output = ((LispString)Runtime.Namestring(args[1])).Value;
+            foreach (var input in inputs)
+                if (!File.Exists(input))
+                {
+                    var err = new LispError($"COMBINE-FASLS: input does not exist: {input}");
+                    err.ConditionTypeName = "FILE-ERROR";
+                    err.FileErrorPathnameRef = new LispString(input);
+                    throw new LispErrorException(err);
+                }
+            Emitter.FaslBundle.Write(inputs, output);
+            return LispPathname.FromString(Path.GetFullPath(output));
+#else
             throw new LispErrorException(new LispError(
-                "COMBINE-FASLS: monolithic FASL bundles are not yet supported on dotcl "
-                + "(a FASL is a .NET assembly and cannot be concatenated)."));
+                "COMBINE-FASLS: this build cannot write FASLs, so it cannot write a "
+                + "bundle either (it can load one)."));
+#endif
         }));
 
         // dotcl:*debug-stacktrace* — when true, .NET stack traces are printed on unhandled errors
@@ -1992,6 +2029,35 @@ public static class Startup
         RegisterDotcl("LOCK-PACKAGE", new LispFunction(args => Runtime.LockPackage(args[0])));
         RegisterDotcl("UNLOCK-PACKAGE", new LispFunction(args => Runtime.UnlockPackage(args[0])));
         RegisterDotcl("PACKAGE-LOCKED-P", new LispFunction(args => Runtime.PackageLockedP(args[0])));
+
+        // The DOTIMES loop test. The compiler has an intrinsic for it that keeps
+        // the counter in a raw Int64 slot, but an intrinsic is only reachable
+        // from the compiler: the tree-walk interpreter — the ONLY evaluator on
+        // an emit-free build — sees the expansion as an ordinary call and needs
+        // a function to call. Without this, every interpreted DOTIMES dies with
+        // "Undefined function: %FIXNUM-GE-OBJECT".
+        //
+        // Same meaning as the intrinsic, which is a (>=) whose left side is
+        // known to be a fixnum; the raw-int64 path is an optimization, not a
+        // difference in behaviour.
+        Emitter.CilAssembler.RegisterFunction("%FIXNUM-GE-OBJECT",
+            new LispFunction(args => Runtime.GreaterEqual(args[0], args[1]),
+                             "%FIXNUM-GE-OBJECT", 2));
+
+        // Same shape: the compiler lowers (%getenv "X") to a direct call, and the
+        // compiler's own source uses it (reading DOTCL_DUMP_SIL_FOR), so an
+        // interpreted compiler hit "Undefined function: %GETENV".
+        // MULTIPLE-VALUE-BIND's two intrinsics. Both are ordinary functions as
+        // well, so the tree-walk interpreter (the only evaluator in an emit-free
+        // build) reaches them -- see the intrinsic-function-fallback test.
+        Emitter.CilAssembler.RegisterFunction("%MV-CAPTURE",
+            new LispFunction(args => MultipleValues.CaptureForBind(args[0]), "%MV-CAPTURE", 1));
+        Emitter.CilAssembler.RegisterFunction("%MV-CAPTURE-LIST",
+            new LispFunction(args => MultipleValues.CaptureListForBind(args[0]), "%MV-CAPTURE-LIST", 1));
+        Emitter.CilAssembler.RegisterFunction("%MV-NTH",
+            new LispFunction(args => MultipleValues.BindNth(args[0]), "%MV-NTH", 1));
+        Emitter.CilAssembler.RegisterFunction("%GETENV",
+            new LispFunction(args => Runtime.Getenv(args[0]), "%GETENV", 1));
 
         // Local package nicknames (CDR 5 / compatible with trivial-package-local-nicknames)
         Emitter.CilAssembler.RegisterFunction("%ADD-LOCAL-NICKNAME",
@@ -2078,7 +2144,7 @@ public static class Startup
         }));
 
         // dotcl:save-application — SBCL-style save-lisp-and-die for dotcl.
-        // MVP: :executable nil only. See docs/plans/2026-04-21-save-application-design.md.
+        // MVP: :executable nil only.
         RegisterDotcl("SAVE-APPLICATION", new LispFunction(
             Runtime.SaveApplication, "SAVE-APPLICATION"));
 
@@ -2136,6 +2202,16 @@ public static class Startup
             return new LispString(outPath);
         }, "SIL-TO-FASL", -1));
 #endif
+
+        // dotcl:call-on-main-thread: run a function on the thread the process
+        // started on and return its value. Needed by UI toolkits that only accept
+        // thread 0 (macOS AppKit); see MainThread.cs.
+        RegisterDotcl("CALL-ON-MAIN-THREAD",
+            new LispFunction(MainThread.CallOnMainThread, "CALL-ON-MAIN-THREAD", 1));
+
+        // dotcl:main-thread-p: T on the thread the process started on.
+        RegisterDotcl("MAIN-THREAD-P",
+            new LispFunction(MainThread.MainThreadP, "MAIN-THREAD-P", 0));
 
         // dotcl:gc-stats — (gen0-count gen1-count gen2-count total-memory total-allocated-bytes)
         // Used by TIME to compute before/after deltas.
@@ -2479,6 +2555,9 @@ public static class Startup
             new LispFunction(args =>
                 args[0] is Symbol s && s.IsInlineProclaimed ? (LispObject)T.Instance : Nil.Instance,
                 "GLOBAL-INLINE-P", 1));
+        RegisterDotcl("FUNCTION-LAMBDA-LIST",
+            new LispFunction(args => Runtime.FunctionLambdaList(args[0]),
+                             "FUNCTION-LAMBDA-LIST", 1));
         RegisterDotcl("ALL-THREADS",
             new LispFunction(Runtime.AllThreads, "ALL-THREADS", 0));
         RegisterDotcl("MAKE-LOCK",
@@ -2716,9 +2795,9 @@ public static class Startup
         RegisterDotNet(DotNetPkg, "FREE-MEM", new LispFunction(Runtime.FreeMem, "DOTNET:FREE-MEM", -1),
             "(dotnet:free-mem pointer) => nil\nFree unmanaged memory previously allocated with dotnet:alloc-mem.");
         RegisterDotNet(DotNetPkg, "MEM-READ", new LispFunction(Runtime.MemRead, "DOTNET:MEM-READ", -1),
-            "(dotnet:mem-read pointer type &optional offset) => value\nRead a value of TYPE (e.g. \"int\", \"double\", \"pointer\") from unmanaged memory at\nPOINTER plus optional OFFSET bytes.");
+            "(dotnet:mem-read type pointer &optional offset) => value\nRead a value of TYPE (e.g. :int, :double, :pointer, \"int\") from unmanaged memory\nat POINTER plus optional OFFSET bytes. TYPE comes first, as it does in\ndotnet:mem-write.");
         RegisterDotNet(DotNetPkg, "MEM-WRITE", new LispFunction(Runtime.MemWrite, "DOTNET:MEM-WRITE", -1),
-            "(dotnet:mem-write pointer type value &optional offset) => value\nWrite VALUE as TYPE into unmanaged memory at POINTER plus optional OFFSET bytes.");
+            "(dotnet:mem-write value type pointer &optional offset) => value\nWrite VALUE as TYPE into unmanaged memory at POINTER plus optional OFFSET bytes.");
         RegisterDotNet(DotNetPkg, "TYPE-SIZE", new LispFunction(Runtime.TypeSize, "DOTNET:TYPE-SIZE", -1),
             "(dotnet:type-size type) => bytes\nReturn the marshalled size in bytes of TYPE (cf. C sizeof).");
         RegisterDotNet(DotNetPkg, "TYPE-ALIGN", new LispFunction(Runtime.TypeAlign, "DOTNET:TYPE-ALIGN", -1),

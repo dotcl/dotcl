@@ -73,17 +73,31 @@ public static partial class Runtime
         switch (printCase)
         {
             case "DOWNCASE":
-            {
-                var sb = new System.Text.StringBuilder(name.Length);
-                foreach (char c in name)
-                    sb.Append(isAffected(c) ? char.ToLowerInvariant(c) : c);
-                return sb.ToString();
-            }
             case "UPCASE":
             {
+                bool up = printCase == "UPCASE";
+                // Symbol names are stored upcased and *print-case* defaults to
+                // :upcase, so this conversion usually produces the very string it
+                // was given -- and it was building a new one for every symbol
+                // printed. Scan first; only a name that actually changes is rebuilt.
+                int firstDiff = -1;
+                for (int i = 0; i < name.Length; i++)
+                {
+                    char c = name[i];
+                    if (!isAffected(c)) continue;
+                    char t = up ? char.ToUpperInvariant(c) : char.ToLowerInvariant(c);
+                    if (t != c) { firstDiff = i; break; }
+                }
+                if (firstDiff < 0) return name;
                 var sb = new System.Text.StringBuilder(name.Length);
-                foreach (char c in name)
-                    sb.Append(isAffected(c) ? char.ToUpperInvariant(c) : c);
+                sb.Append(name, 0, firstDiff);
+                for (int i = firstDiff; i < name.Length; i++)
+                {
+                    char c = name[i];
+                    sb.Append(isAffected(c)
+                              ? (up ? char.ToUpperInvariant(c) : char.ToLowerInvariant(c))
+                              : c);
+                }
                 return sb.ToString();
             }
             case "CAPITALIZE":
@@ -176,7 +190,7 @@ public static partial class Runtime
             return $":{escapedName}";
 
         // Check if symbol is accessible in *package*
-        var currentPkg = (Package)DynamicBindings.Get(Startup.Sym("*PACKAGE*"));
+        var currentPkg = CurrentPackage("PRIN1");
         var (found, status) = currentPkg.FindSymbol(sym.Name);
         if (status != SymbolStatus.None && ReferenceEquals(found, sym))
             return escapedName;  // Accessible in current package — no prefix needed
@@ -557,6 +571,7 @@ public static partial class Runtime
                     {
                         var err = new LispError($"Cannot print pathname readably: {pn}");
                         err.ConditionTypeName = "PRINT-NOT-READABLE";
+                        err.PrintNotReadableObjectRef = pn;
                         throw new LispErrorException(err);
                     }
                 }
@@ -644,7 +659,7 @@ public static partial class Runtime
     /// Get the current value of *READ-DEFAULT-FLOAT-FORMAT*.
     /// Returns "SINGLE-FLOAT" by default.
     /// </summary>
-    private static string GetReadDefaultFloatFormat()
+    internal static string GetReadDefaultFloatFormat()
     {
         LispObject val;
         var sym = Startup.Sym("*READ-DEFAULT-FLOAT-FORMAT*");
@@ -785,6 +800,7 @@ public static partial class Runtime
             var err = new LispError(
                 $"cannot print {constantName} readably with *READ-EVAL* NIL");
             err.ConditionTypeName = "PRINT-NOT-READABLE";
+            err.PrintNotReadableObjectRef = value;
             throw new LispErrorException(err);
         }
         return $"#<DOTCL:{constantName}>";
@@ -896,17 +912,20 @@ public static partial class Runtime
     /// </summary>
     private static string NormalizePrinterFloat(string s, double absVal)
     {
-        // Strip positive exponent sign: E+7 → E7; normalize to uppercase E
+        // Strip the positive exponent sign (E+7 -> e7) and settle on a lower-case
+        // marker. Lower case is what the other markers here already use -- 1.0d10,
+        // 1.0f-5 -- and what every other implementation prints; an upper-case E
+        // for single floats was the odd one out.
         if (s.Contains("E+") || s.Contains("e+"))
-            s = s.Replace("E+", "E").Replace("e+", "E");
-        if (s.Contains("e") && !s.Contains("E"))
-            s = s.Replace("e", "E");
+            s = s.Replace("E+", "e").Replace("e+", "e");
+        if (s.Contains("E"))
+            s = s.Replace("E", "e");
 
         // If already in scientific notation, normalize it (add decimal point, strip exp leading zeros)
-        bool hasExponent = s.IndexOf('E') >= 0;
+        bool hasExponent = s.IndexOf('e') >= 0;
         if (hasExponent)
         {
-            int eIdx = s.IndexOf('E');
+            int eIdx = s.IndexOf('e');
             string sigPart = s.Substring(0, eIdx);
             string expStr = s.Substring(eIdx + 1); // e.g. "8" or "-4" or "08"
             // Add decimal point to significand if missing
@@ -918,7 +937,7 @@ public static partial class Runtime
             expMag = expMag.TrimStart('0');
             if (expMag.Length == 0) expMag = "0";
             expStr = (expNeg ? "-" : "") + expMag;
-            s = sigPart + "E" + expStr;
+            s = sigPart + "e" + expStr;
             return s; // already scientific, done
         }
 
@@ -962,7 +981,7 @@ public static partial class Runtime
                 string rest = allDigits.Substring(1).TrimEnd('0');
                 mantissa = allDigits[0] + "." + (rest.Length > 0 ? rest : "0");
             }
-            s = (negative ? "-" : "") + mantissa + "E" + exp.ToString();
+            s = (negative ? "-" : "") + mantissa + "e" + exp.ToString();
         }
         return s;
     }
@@ -1025,6 +1044,26 @@ public static partial class Runtime
 
     private static int _formatConsDepth;
     private const int MaxFormatConsDepth = 256;
+
+    /// <summary>What to emit when the nesting guard trips. The guard exists to keep
+    /// a deeply nested object from overflowing the printer's own stack, and eliding
+    /// is a reasonable answer for ordinary printing. It is not one for readable
+    /// printing: CLHS 22.1.3 gives *print-readably* priority over everything that
+    /// would lose information, so a caller that asked for readable output must get
+    /// an error rather than a shorter object that reads back wrong. A .fasl asks
+    /// for exactly that when it stores a literal as its printed representation.</summary>
+    private static string DepthGuardForm(string elided, LispObject? obj = null)
+    {
+        if (GetPrintReadably())
+        {
+            var err = new LispError(
+                $"cannot print an object nested deeper than {MaxFormatConsDepth} readably");
+            err.ConditionTypeName = "PRINT-NOT-READABLE";
+            err.PrintNotReadableObjectRef = obj;
+            throw new LispErrorException(err);
+        }
+        return elided;
+    }
 
     // *print-circle* support: two-pass algorithm (scan then format)
     // Table states: 1=seen once, 0=seen twice+ (shared), negative=assigned label
@@ -1325,16 +1364,93 @@ public static partial class Runtime
         finally { _circleTable = null; }
     }
 
+    /// <summary>True when *PRINT-PRETTY* is in effect.</summary>
+    private static bool GetPrintPretty()
+    {
+        var sym = Startup.Sym("*PRINT-PRETTY*");
+        if (DynamicBindings.TryGet(sym, out var v)) return v is not Nil;
+        return sym.IsBound && sym.Value != null && sym.Value is not Nil;
+    }
+
+    /// <summary>
+    /// "'X" for (QUOTE X) and "#'CAR" for (FUNCTION CAR), per CLHS 22.1.3.4 --
+    /// only under *PRINT-PRETTY*, and only for the exact two-element form, so
+    /// (QUOTE X Y) and (QUOTE) still print as lists. Returns null when the
+    /// abbreviation does not apply.
+    ///
+    /// Not abbreviating made every printed macroexpansion and every quoted datum
+    /// in a report read as (QUOTE ...), which is both noisier and unlike what any
+    /// other implementation shows.
+    /// </summary>
+    private static string? QuoteAbbreviation(Cons cons, bool escape)
+    {
+        if (cons.Car is not Symbol head) return null;
+        string prefix;
+        if (ReferenceEquals(head, Startup.Sym("QUOTE"))) prefix = "'";
+        else if (ReferenceEquals(head, Startup.Sym("FUNCTION"))) prefix = "#'";
+        else return null;
+        if (cons.Cdr is not Cons rest || rest.Cdr is not Nil) return null;
+        // A shared or circular cons needs its label, which the abbreviation has
+        // nowhere to carry.
+        if (_circleTable != null
+            && (_circleTable.ContainsKey(cons) || _circleTable.ContainsKey(rest)))
+            return null;
+        if (!GetPrintPretty()) return null;
+        return prefix + FormatObject(rest.Car, escape);
+    }
+
     private static string FormatCons(Cons cons, bool escape)
     {
-        if (_formatConsDepth >= MaxFormatConsDepth) return "(...)";
+        if (_formatConsDepth >= MaxFormatConsDepth) return DepthGuardForm("(...)", cons);
+        var abbrev = QuoteAbbreviation(cons, escape);
+        if (abbrev != null) return abbrev;
+        var sb0 = new System.Text.StringBuilder();
+        FormatConsInto(sb0, cons, escape);
+        return sb0.ToString();
+    }
+
+    /// <summary>Append OBJ's printed representation to SB. A nested list goes
+    /// straight into the same builder instead of building its own string for the
+    /// parent to copy in -- which is what made printing a tree cost per NODE
+    /// rather than per character.</summary>
+    private static void FormatObjectInto(System.Text.StringBuilder sb, LispObject obj, bool escape)
+    {
+        // Only the plain-cons case can shortcut: a *print-circle* table means the
+        // object may need a #n= label (FormatObject's preamble), and the pprint
+        // dispatch table can replace the whole rendering.
+        if (obj is Cons c && _circleTable == null)
+        {
+            var dispatched = TryPprintDispatch(obj);
+            if (dispatched != null) { sb.Append(dispatched); return; }
+            // *print-level*: the same cut FormatObject's cons case makes.
+            var level = GetPrintLevel();
+            if (level.HasValue && _formatConsDepth >= level.Value) { sb.Append('#'); return; }
+            if (_formatConsDepth >= MaxFormatConsDepth) { sb.Append(DepthGuardForm("(...)", c)); return; }
+            FormatConsInto(sb, c, escape);
+            return;
+        }
+        sb.Append(FormatObject(obj, escape));
+    }
+
+    private static void FormatConsInto(System.Text.StringBuilder sb, Cons cons, bool escape)
+    {
+        // Same abbreviation as FormatCons, for lists reached as an element of
+        // another list: (list 'a b) rather than (LIST (QUOTE A) B).
+        var abbrev = QuoteAbbreviation(cons, escape);
+        if (abbrev != null) { sb.Append(abbrev); return; }
         _formatConsDepth++;
         try
         {
             var printLength = GetPrintLength();
-            var parts = new List<string>();
+            // Was: a List<string> of the printed elements joined at the end, plus a
+            // HashSet of every cons in the chain for the runaway guard. Both were
+            // allocated per list AND per sublist, which is most of what printing a
+            // tree cost (a 100-element list ran to ~10 KB). The pieces go straight
+            // into a builder, and the guard is Floyd's two pointers -- no table.
+            sb.Append('(');
             LispObject current = cons;
-            var visited = new HashSet<Cons>(ReferenceEqualityComparer.Instance);
+            LispObject slow = cons;
+            bool moveSlow = false;
             int count = 0;
             while (current is Cons c)
             {
@@ -1342,25 +1458,59 @@ public static partial class Runtime
                 if (_circleTable != null && count > 0 && _circleTable.TryGetValue(c, out int cdrState))
                 {
                     if (cdrState < 0) // back-reference
-                        return $"({string.Join(" ", parts)} . #{-cdrState}#)";
+                    {
+                        sb.Append(" . #").Append(-cdrState).Append("#)");
+                        return;
+                    }
                     if (cdrState == 0) // shared CDR, first print — assign label
                     {
                         int label = ++_circleLabelCounter;
                         _circleTable[c] = -label;
                         string rest = FormatCons(c, escape);
-                        return $"({string.Join(" ", parts)} . #{label}={rest})";
+                        sb.Append(" . #").Append(label).Append('=').Append(rest).Append(')');
+                        return;
                     }
                 }
-                if (!visited.Add(c)) { parts.Add("..."); break; }
-                if (printLength.HasValue && count >= printLength.Value) { parts.Add("..."); break; }
-                parts.Add(FormatObject(c.Car, escape));
+                if (printLength.HasValue && count >= printLength.Value)
+                {
+                    if (count > 0) sb.Append(' ');
+                    sb.Append("...");
+                    break;
+                }
+                if (count > 0) sb.Append(' ');
+                FormatObjectInto(sb, c.Car, escape);
                 current = c.Cdr;
                 count++;
+                // Runaway guard: with *print-circle* off a circular CDR chain would
+                // print forever. The meeting point is inside the cycle rather than at
+                // its entry, so a few more elements appear before the "..." than the
+                // per-cons table used to give -- printing a circular list this way is
+                // outside what the standard defines, and terminating is the point.
+                //
+                // Only when there is no circle table: with *print-circle* on, the
+                // table above is what terminates the walk, and it must be reached to
+                // emit the #n# back-reference (ANSI PRINT.CONS.7 prints
+                // #1=(17 . #1#), whose cycle closes after a single element).
+                if (_circleTable == null)
+                {
+                    if (moveSlow) slow = ((Cons)slow).Cdr;
+                    moveSlow = !moveSlow;
+                    if (ReferenceEquals(current, slow))
+                    {
+                        sb.Append(" ...");
+                        current = Nil.Instance;
+                        break;
+                    }
+                }
             }
             if (current is Nil || (current is Cons))
-                return $"({string.Join(" ", parts)})";
-            else
-                return $"({string.Join(" ", parts)} . {FormatObject(current, escape)})";
+            {
+                sb.Append(')');
+                return;
+            }
+            sb.Append(" . ");
+            FormatObjectInto(sb, current, escape);
+            sb.Append(')');
         }
         finally { _formatConsDepth--; }
     }
@@ -1401,7 +1551,7 @@ public static partial class Runtime
 
     private static string FormatCompound(LispObject obj, bool escape)
     {
-        if (_formatConsDepth >= MaxFormatConsDepth) return "#";
+        if (_formatConsDepth >= MaxFormatConsDepth) return DepthGuardForm("#", obj);
         _formatConsDepth++;
         try
         {
@@ -1545,6 +1695,7 @@ public static partial class Runtime
             {
                 var err = new LispError($"Cannot print array readably: element-type {vec.ElementTypeName} not representable");
                 err.ConditionTypeName = "PRINT-NOT-READABLE";
+                err.PrintNotReadableObjectRef = vec;
                 throw new LispErrorException(err);
             }
             var elem = vec.Length > 0 ? vec.ElementAt(0) : Nil.Instance;
@@ -1574,6 +1725,7 @@ public static partial class Runtime
             {
                 var err = new LispError($"Cannot print array readably: element-type {vec.ElementTypeName} not representable");
                 err.ConditionTypeName = "PRINT-NOT-READABLE";
+                err.PrintNotReadableObjectRef = vec;
                 throw new LispErrorException(err);
             }
             var printLength = GetPrintLength();
@@ -1613,6 +1765,7 @@ public static partial class Runtime
         {
             var err = new LispError($"Cannot print array readably: element-type {vec.ElementTypeName} not representable");
             err.ConditionTypeName = "PRINT-NOT-READABLE";
+            err.PrintNotReadableObjectRef = vec;
             throw new LispErrorException(err);
         }
 
@@ -1631,6 +1784,7 @@ public static partial class Runtime
             {
                 var err = new LispError($"Cannot print array readably: dimensions ({string.Join(" ", dims)}) lose information");
                 err.ConditionTypeName = "PRINT-NOT-READABLE";
+                err.PrintNotReadableObjectRef = vec;
                 throw new LispErrorException(err);
             }
         }
@@ -1764,6 +1918,20 @@ public static partial class Runtime
         PprintTrackWrite(text);
         w.Flush();
         return obj;
+    }
+
+    /// <summary>Render as princ does: no escape characters, and *print-readably*
+    /// off. ~A is defined as printing "as by princ", and princ binds BOTH -- with
+    /// only escape suppressed, a true *print-readably* escapes anyway, because
+    /// readably implies escape. TOPLEVEL false renders with FormatObject instead
+    /// of FormatTop, for the directives that print a non-number "in ~A format"
+    /// from inside a larger piece of formatting.</summary>
+    public static string FormatAesthetic(LispObject obj, bool topLevel = true)
+    {
+        var readablySym = Startup.Sym("*PRINT-READABLY*");
+        DynamicBindings.Push(readablySym, Nil.Instance);
+        try { return topLevel ? FormatTop(obj, false) : FormatObject(obj, false); }
+        finally { DynamicBindings.Pop(readablySym); }
     }
 
     public static LispObject Princ(LispObject obj)
@@ -2034,6 +2202,10 @@ public static partial class Runtime
         Emitter.CilAssembler.RegisterFunction("WRITE-TO-STRING", new LispFunction(args => {
             Runtime.CheckArityMin("WRITE-TO-STRING", args, 1);
             var obj = args[0];
+            // No keywords is the ordinary call. The keyword scan below builds a
+            // List and a HashSet before it knows whether there are any, which
+            // made (write-to-string x) cost more than twice (prin1-to-string x).
+            if (args.Length == 1) return Runtime.WriteToString(obj);
             if ((args.Length - 1) % 2 != 0)
                 throw new LispErrorException(new LispProgramError("WRITE-TO-STRING: odd number of keyword arguments"));
             // Check :allow-other-keys (first occurrence wins)
@@ -2085,6 +2257,18 @@ public static partial class Runtime
         Emitter.CilAssembler.RegisterFunction("WRITE", new LispFunction(args => {
             Runtime.CheckArityMin("WRITE", args, 1);
             var obj = args[0];
+            // Same shape as WRITE-TO-STRING above: with no keywords there is
+            // nothing to parse and nothing to bind.
+            if (args.Length == 1)
+            {
+                TextWriter w1 = Runtime.GetOutputWriter(Nil.Instance);
+                var t1 = Runtime.FormatTop(obj, Runtime.GetPrintEscapePublic());
+                Runtime.PprintFlushPendingBreak(w1);
+                w1.Write(t1);
+                Runtime.PprintTrackWrite(t1);
+                w1.Flush();
+                return obj;
+            }
             if ((args.Length - 1) % 2 != 0)
                 throw new LispErrorException(new LispProgramError("WRITE: odd number of keyword arguments"));
             // Parse :stream keyword and printer variable bindings
@@ -2398,7 +2582,7 @@ public static partial class Runtime
                     table = Startup.Sym("*PRINT-PPRINT-DISPATCH*").Value as LispPprintDispatchTable;
             }
             if (table == null || table.Entries.Count == 0)
-                return MultipleValues.Values(Nil.Instance, Nil.Instance);
+                return MultipleValues.Values2(Nil.Instance, Nil.Instance);
             (LispObject TypeSpec, LispObject Function, double Priority)? best = null;
             foreach (var entry in table.Entries.Values)
             {
@@ -2408,8 +2592,8 @@ public static partial class Runtime
                         best = entry;
                 }
             }
-            if (best == null) return MultipleValues.Values(Nil.Instance, Nil.Instance);
-            return MultipleValues.Values(best.Value.Function, T.Instance);
+            if (best == null) return MultipleValues.Values2(Nil.Instance, Nil.Instance);
+            return MultipleValues.Values2(best.Value.Function, T.Instance);
         }, "PPRINT-DISPATCH", -1));
         // SET-PPRINT-DISPATCH: (type-specifier function &optional priority table)
         Emitter.CilAssembler.RegisterFunction("SET-PPRINT-DISPATCH", new LispFunction(args => {

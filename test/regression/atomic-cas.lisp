@@ -107,3 +107,52 @@
       (dolist (th threads) (dotcl-thread:thread-join th)))
     (length *cas-stack*))
   40000)
+
+;; --- the comparison is EQL, not EQ ---
+;; Fixnums are boxed here and only a small range is cached, so an EQ comparison
+;; made a CAS on a counter stop swapping once the value left that cache. The old
+;; value is computed separately from the stored one in each test, so it is a
+;; distinct object that is merely EQL.
+
+(deftest cas-large-fixnum-distinct-object
+  (let* ((stored (* 1000 1000))          ; 1000000, outside the small-int cache
+         (probe  (* 1000 1000))
+         (cell   (list stored)))
+    (list (eq stored probe)              ; distinct objects...
+          (eql stored probe)             ; ...that are EQL
+          (dotcl:compare-and-swap (car cell) probe 0)
+          (car cell)))
+  (nil t 1000000 0))
+
+(deftest cas-bignum-distinct-object
+  (let* ((stored (* 1000000 1000000))
+         (probe  (* 1000000 1000000))
+         (cell   (list stored)))
+    (list (dotcl:compare-and-swap (car cell) probe :swapped) (car cell)))
+  (1000000000000 :swapped))
+
+(deftest cas-float-and-char-by-value
+  (let ((f (list (+ 0.5d0 0.25d0)))
+        (c (list (code-char 955))))
+    (list (dotcl:compare-and-swap (car f) 0.75d0 :f) (car f)
+          (char= (dotcl:compare-and-swap (car c) (code-char 955) :c) (code-char 955))
+          (car c)))
+  (0.75d0 :f t :c))
+
+;; A counter crossing the cached range must keep swapping the whole way.
+(deftest cas-counter-across-cache-boundary
+  (let ((cell (list 65500)))
+    (loop repeat 100
+          for cur = (car cell)
+          do (dotcl:compare-and-swap (car cell) cur (1+ cur)))
+    (car cell))
+  65600)
+
+;; EQL is not EQUAL: two structurally equal conses are still different places,
+;; so a CAS against a copy must fail.
+(deftest cas-cons-stays-identity-compared
+  (let* ((stored (list 1 2))
+         (cell   (list stored)))
+    (list (dotcl:compare-and-swap (car cell) (list 1 2) :swapped)
+          (eq (car cell) stored)))
+  ((1 2) t))

@@ -178,6 +178,16 @@ of the first element not updated (i.e. START + number of elements read)."))
 ;;; Default methods
 ;;; ============================================================
 
+;;; Every other output GF here answers for a class that defines only
+;;; stream-write-char, but stream-line-column had no default -- so a stream
+;;; whose author did not track columns got "no applicable method" from
+;;; stream-start-line-p (which asks for the column), and from fresh-line and
+;;; format's ~T through it. The Gray protocol says an unknown column is NIL,
+;;; and callers already read NIL as "unknown"; only the missing method turned
+;;; that into an error.
+(defmethod stream-line-column ((stream fundamental-output-stream))
+  nil)
+
 (defmethod stream-start-line-p ((stream fundamental-output-stream))
   (eql (stream-line-column stream) 0))
 

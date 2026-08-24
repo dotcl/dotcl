@@ -17,7 +17,7 @@ public static class CliCompletion
         "--core", "--load", "--asd-search-path",
     };
 
-    private static readonly string[] Subcommands = new[] { "repl", "build" };
+    private static readonly string[] Subcommands = new[] { "repl", "build", "clean" };
 
     private static readonly string[] CompletionShells = new[]
     {

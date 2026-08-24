@@ -45,7 +45,7 @@ public static class Lisp
     public static string Greet(string name)
     {
         EnsureLoaded();
-        return DotclHost.ToClr<string>(DotclHost.Call("GREET", name));
+        return DotclHost.ToClr<string>(DotclHost.Call("LIB:GREET", name));
     }
 
     /// <summary>
@@ -57,6 +57,6 @@ public static class Lisp
     {
         EnsureLoaded();
         return DotclHost.ToClr<long>(
-            DotclHost.Call("SUM-OF-SQUARES", DotclHost.ToLispList(numbers)));
+            DotclHost.Call("LIB:SUM-OF-SQUARES", DotclHost.ToLispList(numbers)));
     }
 }

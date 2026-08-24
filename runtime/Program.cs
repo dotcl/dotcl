@@ -21,8 +21,16 @@ class Program
         var thread = new Thread(() => {
             try { MainInner(args); }
             catch (Exception ex) { threadException = ex; }
+            finally { MainThread.Shutdown(); }
         }, stackSize);
+        // Keep the main thread available as a work queue instead of only joining
+        // it: some UI toolkits (macOS AppKit) accept nothing but thread 0, and a
+        // main thread cannot be created after the fact. Lisp submits work with
+        // DOTCL:CALL-ON-MAIN-THREAD. With nothing submitted this blocks exactly
+        // like the Join it replaces. See MainThread.cs.
+        MainThread.Install();
         thread.Start();
+        MainThread.Pump();
         thread.Join();
         if (threadException != null)
             throw threadException;
@@ -184,6 +192,11 @@ Options:
 
 Subcommands:
   repl                         Start REPL (even with --load/--eval)
+  clean                        Remove the shared ASDF compile cache
+                               (one directory per dotcl build under
+                               <cache-home>/common-lisp/; a project's own
+                               obj/ cache goes with `dotnet clean`)
+                               [--dry-run] [--keep-current] [--verbose]
   build <asd> --output <fasl>  Compile an ASDF system to a fasl
   pack --system <name> ...     Package an ASDF system as a dotnet tool nupkg,
                                built by restamping the published dotcl tool
@@ -222,6 +235,33 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
             return;
         }
 
+        // `clean` subcommand: empty the shared ASDF compile cache. Handled here,
+        // before the core loads, because a broken cache is exactly what stops the
+        // core from loading -- cleaning must not depend on what it is fixing.
+        if (!hasUserFasl && args.Length > 0 && args[0] == "clean")
+        {
+            bool cleanDryRun = args.Contains("--dry-run");
+            bool cleanVerbose = args.Contains("--verbose");
+            string? keepPrefix = null;
+            if (args.Contains("--keep-current"))
+            {
+                var v = typeof(Program).Assembly
+                    .GetCustomAttribute<System.Reflection.AssemblyInformationalVersionAttribute>()
+                    ?.InformationalVersion;
+                if (v != null) keepPrefix = $"dotcl-{v}-";
+            }
+            var unknown = args.Skip(1).FirstOrDefault(
+                a => a != "--dry-run" && a != "--verbose" && a != "--keep-current");
+            if (unknown != null)
+            {
+                Console.Error.WriteLine($"dotcl clean: unknown option '{unknown}'");
+                Console.Error.WriteLine("  usage: dotcl clean [--dry-run] [--keep-current] [--verbose]");
+                Environment.Exit(2);
+            }
+            Environment.Exit(FaslCache.Run(cleanDryRun, keepPrefix, cleanVerbose, Console.Out));
+            return;
+        }
+
         // --completion <shell>: emit shell completion script and exit. Handled
         // before core loading so it stays fast (no Lisp init). Completions
         // describe dotcl's own CLI, so an app built on it must not answer them.
@@ -240,8 +280,22 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
 
         // --asm: legacy behavior (run .sil directly, load additional scripts, exit)
         // Used by test-a2 and Makefile targets. No REPL, no core auto-discovery.
-        if (!hasUserFasl && args.Length >= 2 && args[0] == "--asm")
+        //
+        // Accepted anywhere in the command line, not only first. It used to be
+        // recognized at args[0] alone, so putting any other flag ahead of it fell
+        // through to the ordinary path — where --asm is not a known flag, so the
+        // .sil that followed it was LOADed as source and died with "package
+        // COMMON-LISP is locked; cannot redefine EQ", a message that says nothing
+        // about argument order.
+        var asmArgs = HoistAsmFlag(args);
+        if (!hasUserFasl && asmArgs != null)
         {
+            args = asmArgs;
+            if (!File.Exists(args[1]))
+            {
+                Console.Error.WriteLine($"Error: core file not found: {args[1]}");
+                Environment.Exit(2);
+            }
             try
             {
                 RunCore(args[1]);
@@ -261,6 +315,13 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
                     {
                         i++;
                         Runtime.Load(new LispObject[] { new LispString(args[i]) });
+                    }
+                    else if (args[i] == "--asd-search-path" && i + 1 < args.Length)
+                    {
+                        // Same flag the ordinary path takes: the directories are
+                        // pushed onto asdf:*central-registry* once asdf loads.
+                        // Without this case it was LOADed as if it were a file.
+                        Runtime.UserAsdSearchPaths.Add(args[++i]);
                     }
                     else
                         Runtime.Load(new LispObject[] { new LispString(args[i]) });
@@ -470,6 +531,14 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
         ProfileMark("FindCore");
         if (corePath != null)
         {
+            // A core path the user typed can simply not exist. Say that, rather
+            // than letting File.OpenRead's exception out of Main as an unhandled
+            // FileNotFoundException with a stack trace through Program.Main.
+            if (!File.Exists(corePath))
+            {
+                Console.Error.WriteLine($"Error: core file not found: {corePath}");
+                Environment.Exit(2);
+            }
             try { RunCore(corePath); }
             catch (LispSourceException lse)
             {
@@ -636,6 +705,18 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
                 Console.Error.WriteLine(lse.FormatTrace());
                 Environment.Exit(1);
             }
+            // Same treatment as the script-file path below: report and exit 1.
+            // Without this an error with no source location — a --load naming a
+            // file that is not there is the everyday one — left Main as an
+            // unhandled exception, printing a .NET stack trace and exiting 127
+            // where the identical mistake in a positional script exits 1 with a
+            // one-line message.
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"Error: {ex.Message}");
+                if (Startup.DebugStacktrace) Console.Error.WriteLine(ex.StackTrace);
+                Environment.Exit(1);
+            }
         }
 
         ProfileMark("actions");
@@ -694,6 +775,25 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
             Path.Combine(baseDir, "..", "..", "..", "..", "compiler", "cil-out.sil"),
         };
         return candidates.Select(Path.GetFullPath).FirstOrDefault(File.Exists);
+    }
+
+    /// <summary>If the command line asks for <c>--asm &lt;file&gt;</c> anywhere, return it
+    /// rearranged so the pair comes first, with every other argument in its original
+    /// order; otherwise null. The legacy --asm path is written against that shape,
+    /// and rearranging is what keeps the flag's meaning independent of where the
+    /// caller put it.</summary>
+    static string[]? HoistAsmFlag(string[] args)
+    {
+        int at = Array.IndexOf(args, "--asm");
+        if (at < 0 || at + 1 >= args.Length) return null;
+        if (at == 0) return args;
+        var rearranged = new List<string> { "--asm", args[at + 1] };
+        for (int i = 0; i < args.Length; i++)
+        {
+            if (i == at) { i++; continue; }   // skip the pair itself
+            rearranged.Add(args[i]);
+        }
+        return rearranged.ToArray();
     }
 
     /// <summary>Load and execute a compiled core (.sil text or .fasl PE assembly).</summary>
@@ -1111,6 +1211,21 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
 
         while (true)
         {
+            // The ABORT restart covers the WHOLE iteration -- prompt, read and
+            // eval -- not just the evaluation. Ctrl-C arriving while the REPL
+            // waits for input used to reach the debugger with an empty restart
+            // cluster: "Available restarts:" followed by nothing, and no way
+            // back to the prompt except Ctrl-D (dotcl/dotcl issue 61). The
+            // interrupt is delivered at a safepoint on this thread, so the
+            // cluster established here is the one it sees.
+            var abortTag = new object();
+            var abortRestart = new LispRestart("ABORT",
+                _ => Nil.Instance,
+                description: "Return to top level.",
+                tag: abortTag);
+            RestartClusterStack.PushCluster(new[] { abortRestart });
+            try
+            {
             var pkg = DynamicBindings.Get(Startup.Sym("*PACKAGE*")) as Package;
             var pkgName = pkg != null
                 ? new[] { pkg.Name }.Concat(pkg.Nicknames).OrderBy(n => n.Length).First()
@@ -1191,15 +1306,6 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
             if (readError) { buffer.Clear(); continue; }
             buffer.Clear();
 
-            // Establish ABORT restart that returns to REPL prompt
-            var abortTag = new object();
-            var abortRestart = new LispRestart("ABORT",
-                _ => Nil.Instance,
-                description: "Return to top level.",
-                tag: abortTag);
-            RestartClusterStack.PushCluster(new[] { abortRestart });
-            try
-            {
                 foreach (var form in forms)
                 {
                     var result = Runtime.Eval(form);
@@ -1208,10 +1314,12 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
             }
             catch (RestartInvocationException rie) when (ReferenceEquals(rie.Tag, abortTag))
             {
-                // ABORT restart invoked → return to prompt
+                // ABORT invoked -- drop any partial input and re-prompt.
+                buffer.Clear();
             }
             catch (LispErrorException ex) when (ex.Condition is LispInteractiveInterrupt)
             {
+                buffer.Clear();
                 Console.Error.WriteLine("; Interrupted.");
             }
             catch (LispErrorException ex)

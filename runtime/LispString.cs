@@ -1,6 +1,6 @@
 namespace DotCL;
 
-public class LispString : LispObject
+public sealed class LispString : LispObject
 {
     // Copy-on-write backing: at most one of (_str, _chars) is the active source.
     // - LispString(string) starts with _str set and _chars null (no ToCharArray copy).
@@ -117,7 +117,7 @@ public class LispString : LispObject
     public override int GetHashCode() => Value.GetHashCode();
 }
 
-public class LispChar : LispObject
+public sealed class LispChar : LispObject
 {
     public char Value { get; }
 

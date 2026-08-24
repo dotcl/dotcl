@@ -63,6 +63,35 @@ Member names are strings because the Lisp reader upcases bare symbols while .NET
 member names are case-sensitive. A symbol is accepted and contributes its name
 verbatim, so `|Host|` works and `host` correctly does not.
 
+## Indexers
+
+`dotnet:ref` is the indexer without spelling out `get_Item` / `set_Item`, and it
+is a place. Anything with an indexer works — `List<T>`, `Dictionary<K,V>`, and
+plain arrays:
+
+```lisp
+(dotnet:ref list 0)                       ; => 10
+(setf (dotnet:ref list 1) 99)
+(setf (dotnet:ref dict "a") 1)            ; Dictionary<string,int>
+(setf (dotnet:ref (dotnet:new-array "System.Int32" 1 2 3) 2) 42)
+```
+
+Multi-dimensional indexers take several keys: `(dotnet:ref grid row col)`.
+
+## Disposables
+
+`dotnet:using` is C#'s `using`: each variable is bound in turn and `Dispose` is
+called on the way out, including when the body signals. Nested bindings are
+disposed innermost first.
+
+```lisp
+(dotnet:using ((stream (dotnet:new "System.IO.StreamReader" path)))
+  (dotnet:invoke stream "ReadToEnd"))
+```
+
+Both of these come from the `dotnet-class` contrib, so they need
+`(require "dotnet-class")` — the same one `dotnet:define-class` lives in.
+
 ## Types
 
 ```lisp
@@ -162,6 +191,26 @@ of a callback unwind to their target as usual.
 ```
 
 `dotnet:await` blocks the calling thread until the task completes.
+
+## UI threads
+
+Lisp runs on a worker thread with a large stack, because deeply nested macro
+expansion needs one. UI toolkits that accept work on the process main thread
+only, macOS AppKit above all, get it back with `dotcl:call-on-main-thread`:
+
+```lisp
+(dotcl:main-thread-p)                                    ; => NIL
+(dotcl:call-on-main-thread (lambda () (dotcl:main-thread-p)))  ; => T
+```
+
+The call blocks until the function returns and passes its value back, so
+wrapping a GUI's event loop in it hands the main thread to the toolkit for as
+long as the application runs. An error signalled inside reaches the caller's
+handlers rather than the debugger. Windows and X11 impose no such requirement,
+and the wrapper costs nothing there.
+
+For WinForms and WPF on Windows, `dotnet:ui-invoke` and `dotnet:ui-post`
+marshal onto a dedicated STA thread with a message loop instead.
 
 ## Dispatching on .NET types
 

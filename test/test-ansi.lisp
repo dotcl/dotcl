@@ -448,6 +448,52 @@
   "Arithmetic LOOP leaves the stepped value visible in FINALLY (SBCL/ABCL behavior)." t)
 (in-package :cl-user)
 
+;;; PRINT.DOUBLE-FLOAT.4 draws 10000 integers from [-10^7, 10^7-1] and requires
+;;; PRIN1 of each as a double to read back as "N.0". One draw in that range is
+;;; out of spec: CLHS 22.1.3.1.3 fixes free-format printing to |x| < 10^7, so
+;;; -10000000 must print as -1.0d7, not -10000000.0. SBCL 2.6.6 prints -1.0d7
+;;; there too, so it is the test's endpoint, not an implementation difference.
+;;; Odds per run are 10000/20000000 = 0.05%, which showed up as a CI red that
+;;; nothing local could reproduce.
+;;;
+;;; Narrow the range by that one value instead of skipping the test: the other
+;;; 19999999 draws are real printer coverage. Upstream carries no note to
+;;; disable, so this replaces the entry (ansi-test/ is a fresh clone and cannot
+;;; hold a #+dotcl edit). The guard makes the override self-invalidating: if the
+;;; upstream body stops matching what was patched here, it is left alone and
+;;; reported rather than silently shadowed.
+(in-package :cl-test)
+(let* ((entry (cadr (gethash 'print.double-float.4 regression-test::*entries-table*)))
+       (form (and entry (regression-test::form entry))))
+  (if (and form (search "20000000" (let ((*print-readably* nil)) (princ-to-string form))))
+      (deftest print.double-float.4
+        (let ((chars *possible-double-float-exponent-markers*))
+          (loop for type in '(short-float double-float long-float)
+                nconc
+                (and (not (subtypep 'double-float type))
+                     (with-standard-io-syntax
+                      (let ((*print-readably* nil)
+                            (*read-default-float-format* type))
+                        ;; Upstream: (- (random 20000000) 10000000), whose lower
+                        ;; endpoint -10^7 is the one value CLHS prints in
+                        ;; exponential form.
+                        (loop for i = (- (random 19999999) 9999999)
+                              for f = (float i 0.0d0)
+                              for s1 = (with-output-to-string (s) (prin1 f s))
+                              for len1 = (length s1)
+                              for s2 = (format nil "~A.0" i)
+                              repeat 10000
+                              unless (or (/= i (rational f))
+                                         (and (> len1 4)
+                                              (string-equal s1 s2 :start1 0 :end1 (- len1 2))
+                                              (eql (char s1 (- len1 1)) #\0)
+                                              (member (char s1 (- len1 2)) chars)))
+                              collect (list type i f s1 s2)))))))
+        nil)
+      (format t "~&;; note: PRINT.DOUBLE-FLOAT.4 no longer matches the patched form; ~
+                 leaving the upstream test as is~%")))
+(in-package :cl-user)
+
 ;;; Run the tests — must be in CL-TEST package since tests use read-from-string
 ;;; and expect symbols to be interned in CL-TEST (where they were defined)
 (in-package :cl-test)

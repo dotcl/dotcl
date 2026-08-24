@@ -880,11 +880,21 @@
       instr
       (macrolet ((rn (k) `(let ((key ,k)) (or (gethash key rename) key))))
         (case (car instr)
-          (:declare-local `(:declare-local ,(rn (cadr instr)) ,(caddr instr)))
-          (:ldloc `(:ldloc ,(rn (cadr instr))))
-          (:stloc `(:stloc ,(rn (cadr instr))))
+          ;; Each case answers INSTR itself when its key is not renamed. Most
+          ;; instructions of a body mention a local, and most of those locals are
+          ;; not the ones being merged, so rebuilding every one of them was the
+          ;; bulk of what this pass allocated.
+          (:declare-local (let ((n (rn (cadr instr))))
+                            (if (eq n (cadr instr)) instr
+                                `(:declare-local ,n ,(caddr instr)))))
+          (:ldloc (let ((n (rn (cadr instr))))
+                    (if (eq n (cadr instr)) instr `(:ldloc ,n))))
+          (:stloc (let ((n (rn (cadr instr))))
+                    (if (eq n (cadr instr)) instr `(:stloc ,n))))
           ((:frame-set :frame-set-box :frame-set-long :frame-set-double :frame-set-single)
-           `(,(car instr) ,(cadr instr) ,(rn (caddr instr))))
+           (let ((n (rn (caddr instr))))
+             (if (eq n (caddr instr)) instr
+                 `(,(car instr) ,(cadr instr) ,n))))
           (:dotnet-call-direct-locals
            `(:dotnet-call-direct-locals
              ,(nth 1 instr) ,(nth 2 instr)
@@ -991,6 +1001,20 @@
                                           ; documentation string compiles to
                                           ; exactly that, and without this
                                           ; allocates a LispString per call.
+     P10 (:newobj \"DoubleFloat\") (:unbox-double) -> {}  ; box a native value and
+     P10 (:call \"Fixnum.Make\") (:unbox-fixnum)   -> {}  ; take it straight back
+                                          ; out. The unbox casts to the type the
+                                          ; box was just made as and reads the
+                                          ; field the ctor just wrote, so the
+                                          ; pair is identity. Every assignment
+                                          ; into a native slot whose value came
+                                          ; from a Lisp-object expression had
+                                          ; this shape.
+     P11 UnwrapMv UnwrapMv              -> UnwrapMv    ; the second cannot do
+                                          ; anything: values never nest, so the
+                                          ; first call's result is never an
+                                          ; MvReturn. Every LOOP body iteration
+                                          ; carried the pair.
    (P3+P4 compose across the fixpoint to delete the dead nil/unwrap/pop preamble
     that codegen emits at the top of every TCO loop body.)
 
@@ -1070,6 +1094,38 @@
                (setf changed t)
                (push i2 out)
                (setf cur (cddr cur)))
+              ;; P10: box a native value and immediately take it back out. The
+              ;; unbox is a castclass to the type the box was just made as, then
+              ;; a read of the field the ctor just wrote, so the pair returns the
+              ;; operand unchanged and the box is garbage the moment it exists.
+              ;; This is the shape every assignment into a native slot has when
+              ;; the value came from an expression that produces a Lisp object:
+              ;; (setq z1 (+ ...)) on a DOUBLE-FLOAT local emitted
+              ;; newobj DoubleFloat / unbox-double / stloc, one allocation per
+              ;; assignment in the loop it was declared to make allocation-free.
+              ((and (consp i1) (consp i2)
+                    (or (and (eq (car i1) :newobj) (eq (car i2) :unbox-double)
+                             (equal (cadr i1) "DoubleFloat"))
+                        (and (eq (car i1) :newobj) (eq (car i2) :unbox-single)
+                             (equal (cadr i1) "SingleFloat"))
+                        (and (eq (car i1) :newobj) (eq (car i2) :unbox-decimal)
+                             (equal (cadr i1) "LispDecimal"))
+                        (and (eq (car i1) :call) (eq (car i2) :unbox-fixnum)
+                             (equal (cadr i1) "Fixnum.Make"))))
+               (setf changed t)
+               (setf cur (cddr cur)))
+              ;; P11: unwrap a multiple-value return twice in a row. The second
+              ;; call cannot do anything: values never nest, so what the first
+              ;; call returns is never an MvReturn and the second one hands it
+              ;; straight back, side effect included (there is one -- it narrows
+              ;; the thread's value state -- and the first call already did it).
+              ;; The pair appears where a form that unwraps its own result sits in
+              ;; statement position, which is every iteration of a LOOP body.
+              ((and (consp i1) (eq (car i1) :call) (equal (cadr i1) "Runtime.UnwrapMv")
+                    (consp i2) (eq (car i2) :call) (equal (cadr i2) "Runtime.UnwrapMv"))
+               (setf changed t)
+               (push i1 out)
+               (setf cur (cddr cur)))
               ;; P9: push a string constant then immediately discard it — dead.
               ;; Composes with P8 to delete a string literal in statement
               ;; position, which is what a documentation string compiles to: it
@@ -1100,21 +1156,84 @@
        instrs
        (%merge-disjoint-locals instrs))))
 
+(defconstant +slot-merge-min-locals+ 32
+  "Fewest LispObject locals a body must declare before slot sharing runs at all.")
+
+(defvar *slot-merge-off* :unread
+  "Diagnostic: when DOTCL_NO_SLOT_MERGE is set, %MERGE-DISJOINT-LOCALS becomes the
+   identity. Read from the environment once and cached, NOT a special variable a
+   script can SETQ: the compiled compiler's own specials are different symbol
+   objects from the ones the reader interns, so a (setq dotcl.cil-compiler::*x* nil)
+   in a loaded file silently does nothing (same reason %MAYBE-DUMP-DEFUN-SIL is
+   gated by an env var).
+
+   It exists because measuring this pass by editing it is confounded: the compiler
+   compiles itself, so an edited pass also changes the code doing the measuring.")
+
+(defun %slot-merge-off-p ()
+  (when (eq *slot-merge-off* :unread)
+    (setf *slot-merge-off*
+          (unless *cross-compiling*
+            (let ((v (%getenv "DOTCL_NO_SLOT_MERGE")))
+              (and (stringp v) (> (length v) 0))))))
+  *slot-merge-off*)
+
+(defvar *slot-merge-stage* :unread
+  "Diagnostic: DOTCL_SLOT_MERGE_STAGE=1 stops after the pre-scan, =2 after the
+   live-range analysis, unset runs the whole pass. Lets the cost of each half be
+   measured from ONE build, which is what the self-compiling compiler requires.")
+
+(defun %slot-merge-stage ()
+  (when (eq *slot-merge-stage* :unread)
+    (setf *slot-merge-stage*
+          (unless *cross-compiling*
+            (let ((v (%getenv "DOTCL_SLOT_MERGE_STAGE")))
+              (and (stringp v) (> (length v) 0) (parse-integer v :junk-allowed t))))))
+  *slot-merge-stage*)
+
 (defun %merge-disjoint-locals (instrs)
+  (when (%slot-merge-off-p)
+    (return-from %merge-disjoint-locals instrs))
   "Linear-scan slot sharing: merge LispObject locals whose flat live ranges
    do not overlap. When last-use(K1) < first-def(K2) in flat instruction order,
    K2 can reuse K1's slot. Reduces local variable count across exclusive cond arms.
    Applied once per function body. Does NOT recurse into nested :body lists.
    Skipped entirely when any backward branch is present (loops, TCO)."
-  ;; Pre-scan: bail out if any backward branch is present.
-  ;; A backward branch targets a label whose position <= the branch's own position.
-  ;; :leave counts: a tagbody that elides its GoException try/catch (compile-tagbody
-  ;; no-catch path) uses (:leave loop-label) for its backward loop edge and has no
-  ;; trailing (:br loop-label), so :leave is the only backward-branch signal. Missing
-  ;; it lets the linear scan treat a loop as straight-line code and wrongly merge
-  ;; live-overlapping slots. Forward :leave (block / handler-case exit) has target >
-  ;; position and does not trip this.
-  (let ((label-pos (make-hash-table :test #'equal))
+  ;; Cheap pre-pass, allocating nothing: a body with fewer than two LispObject
+  ;; locals has nothing to merge, and one with no branch instruction cannot have a
+  ;; backward branch. Both are the common case (every small function), and the work
+  ;; below builds six hash tables and rebuilds the instruction list twice before it
+  ;; can discover that it has nothing to do. Slot merging was a quarter of all the
+  ;; conses a trivial COMPILE allocated.
+  (let ((lispobj-declares 0)
+        (any-branch nil))
+    (dolist (instr instrs)
+      (when (consp instr)
+        (cond ((eq (car instr) :declare-local)
+               (when (and (stringp (caddr instr)) (string= (caddr instr) "LispObject"))
+                 (incf lispobj-declares)))
+              ((member (car instr) '(:br :brtrue :brfalse :leave))
+               (setq any-branch t)))))
+    ;; Below the threshold the pass is not worth what it costs. Measured on 400
+    ;; DEFUNs with LET*/COND bodies: slot sharing is 27% of everything COMPILE-FILE
+    ;; allocates (372 -> 272 MB) and buys 0.5% off the fasl, with no measurable
+    ;; difference in how fast the compiled code runs (takl / deriv / richards, both
+    ;; orders, differences inside the noise). What it IS for is the body with
+    ;; hundreds of locals, where the IL local count is a real limit -- so keep it
+    ;; there and skip it for the small functions that make up almost every file.
+    (when (or (< lispobj-declares +slot-merge-min-locals+)
+              (eql (%slot-merge-stage) 1))
+      (return-from %merge-disjoint-locals instrs))
+    ;; Bail out if any backward branch is present. A backward branch targets a label
+    ;; whose position <= the branch's own position. :leave counts: a tagbody that
+    ;; elides its GoException try/catch (compile-tagbody no-catch path) uses
+    ;; (:leave loop-label) for its backward loop edge and has no trailing
+    ;; (:br loop-label), so :leave is the only backward-branch signal. Missing it lets
+    ;; the linear scan treat a loop as straight-line code and wrongly merge
+    ;; live-overlapping slots. Forward :leave (block / handler-case exit) has
+    ;; target > position and does not trip this.
+    (when any-branch
+      (let ((label-pos (make-hash-table :test #'equal))
         (scan-pos 0))
     (dolist (instr instrs)
       (when (and (consp instr) (eq (car instr) :label))
@@ -1127,7 +1246,7 @@
                    (let ((tgt (gethash (cadr instr) label-pos)))
                      (and tgt (<= tgt fwd-pos))))
           (return-from %merge-disjoint-locals instrs))
-        (incf fwd-pos))))
+        (incf fwd-pos))))))
   (let ((first-pos  (make-hash-table :test #'equal))
         (last-pos   (make-hash-table :test #'equal))
         (local-type (make-hash-table :test #'equal))
@@ -1175,23 +1294,22 @@
                   (setf free-slots (delete slot free-slots :test #'eq))
                   (push (cons lp canonical) free-slots))
                 (push (cons lp key) free-slots))))
-        (when (zerop (hash-table-count rename))
+        (when (or (zerop (hash-table-count rename)) (eql (%slot-merge-stage) 2))
           (return-from %merge-disjoint-locals instrs))
         ;; Pass 2: apply RENAME to every local (central rewriter handles stloc/
         ;; ldloc/declare-local and nested :dotnet-call-direct-locals locals), then
         ;; drop duplicate :declare-local entries that collapsed onto a shared slot.
-        (let ((seen-declare (make-hash-table :test #'equal)))
-          (remove nil
-                  (mapcar (lambda (instr)
-                            (let* ((new (rewrite-instr-locals instr rename))
-                                   (decl (instr-declared-local new)))
-                              (if decl
-                                  (if (gethash (car decl) seen-declare)
-                                      nil
-                                      (progn (setf (gethash (car decl) seen-declare) t)
-                                             new))
-                                  new)))
-                          instrs)))))))
+        ;; One pass, not MAPCAR followed by REMOVE: the pair rebuilt the whole
+        ;; instruction list twice.
+        (let ((seen-declare (make-hash-table :test #'equal))
+              (out (quote ())))
+          (dolist (instr instrs (nreverse out))
+            (let* ((new (rewrite-instr-locals instr rename))
+                   (decl (instr-declared-local new)))
+              (cond ((null decl) (push new out))
+                    ((gethash (car decl) seen-declare))   ; duplicate declare: drop
+                    (t (setf (gethash (car decl) seen-declare) t)
+                       (push new out))))))))))
 
 ;;; ============================================================
 ;;; Top-level compilation

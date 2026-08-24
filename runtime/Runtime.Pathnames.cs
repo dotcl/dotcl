@@ -740,10 +740,10 @@ public static partial class Runtime
                 var thing = args[0];
 
                 if (thing is LispPathname pn)
-                    return MultipleValues.Values(pn, Fixnum.Make(0));
+                    return MultipleValues.Values2(pn, Fixnum.Make(0));
 
                 if (thing is LispFileStream fs2)
-                    return MultipleValues.Values(LispPathname.FromString(fs2.FilePath), Fixnum.Make(0));
+                    return MultipleValues.Values2(LispPathname.FromString(fs2.FilePath), Fixnum.Make(0));
 
                 string str;
                 if (thing is LispString ls) str = ls.Value;
@@ -777,7 +777,7 @@ public static partial class Runtime
                 var substr = str.Substring(start, end - start);
                 if (substr.Length == 0)
                 {
-                    return MultipleValues.Values(LispPathname.FromString(""), Fixnum.Make(end));
+                    return MultipleValues.Values2(LispPathname.FromString(""), Fixnum.Make(end));
                 }
 
                 try
@@ -787,12 +787,12 @@ public static partial class Runtime
                         result = LispLogicalPathname.FromLogicalString(substr);
                     else
                         result = LispPathname.FromString(substr);
-                    return MultipleValues.Values(result, Fixnum.Make(end));
+                    return MultipleValues.Values2(result, Fixnum.Make(end));
                 }
                 catch
                 {
                     if (junkAllowed)
-                        return MultipleValues.Values(Nil.Instance, Fixnum.Make(start));
+                        return MultipleValues.Values2(Nil.Instance, Fixnum.Make(start));
                     throw new LispErrorException(new LispError($"PARSE-NAMESTRING: cannot parse \"{substr}\""));
                 }
             }));

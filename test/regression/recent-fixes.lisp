@@ -179,13 +179,13 @@
   ;; prin1 must NOT include + in exponent
   (let ((*print-readably* nil)
         (*read-default-float-format* 'single-float))
-    (not (search "E+" (prin1-to-string 1.5e10))))
+    (not (search "e+" (prin1-to-string 1.5e10))))
   t)
 
 (deftest d615-format-tilde-e-positive-exponent-sign
   ;; ~e MUST include + for positive exponents
   (let ((*read-default-float-format* 'single-float))
-    (not (null (search "E+" (format nil "~e" 1.5e10)))))
+    (not (null (search "e+" (format nil "~e" 1.5e10)))))
   t)
 
 (deftest d615-format-e-matches-prin1-plus
@@ -364,17 +364,17 @@
   ;; Format of subnormal double: digits must come from the exact rational
   ;; (not from Math.Pow(10, exp) which loses precision for subnormals).
   (format nil "~,15,,0e" 9.63d-322)
-  "0.963428009390431E-321")
+  "0.963428009390431d-321")
 
 (deftest d654-format-e-width-trim-zero-frac
   ;; ~5e on 1.0: width-derived d=0 means no fraction digits ("1." not "1.0")
   (format nil "~5e" 1.0)
-  "1.E+0")
+  "1.e+0")
 
 (deftest d654-format-e-k-scaling
   ;; ~,d,,k: k>=1 => k digits before dot, d-k+1 after.
   (format nil "~,2,,2e" 0.05)
-  "50.0E-3")
+  "50.0e-3")
 
 ;;; self-TCO must not emit `br` that crosses a try/finally from a
 ;;; special LET. Regression for invalid-IL crash observed in cl-bench stak.
@@ -2923,7 +2923,8 @@
       (list (null via-find)            ; find-system can't handle (:feature ...) — the bug
             (not (null via-resolve)))))) ; resolve-dependency-spec does — the fix
 
-(deftest i390-feature-dependency-spec-resolves
+;; asdf:find-system compiles the system it finds, so this one needs an emitter.
+(deftest-compiled-only i390-feature-dependency-spec-resolves
   (%i390-feature-dep-resolution)
   (t t))
 
@@ -3673,9 +3674,9 @@
 (deftest pprint-literal-before-iteration-order
   (let* ((out (let ((*print-pretty* t))
                 (format nil "~@<Pre ~{~/rf420-pr/~@:_~}~:>" (list :a))))
-         (pi (search "Pre" out))
+         (pre-i (search "Pre" out))
          (ai (search "<:A>" out)))
-    (and pi ai (< pi ai) t))
+    (and pre-i ai (< pre-i ai) t))
   t)
 
 ;; macroexpand-cache scope: the cache keyed expansions by form (cons) only,

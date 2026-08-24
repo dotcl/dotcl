@@ -33,8 +33,15 @@
         (dotnet:invoke (dotnet:invoke self "get_ApplicationLifetime")
                        "set_MainWindow" win)))))
 
-(let* ((builder (dotnet:static-generic "Avalonia.AppBuilder" "Configure" (list "Hello.App")))
-       (builder (dotnet:static "Avalonia.AppBuilderDesktopExtensions" "UsePlatformDetect" builder))
-       (args    (dotnet:static-generic "System.Array" "Empty" (list "System.String"))))
-  (dotnet:static "Avalonia.ClassicDesktopStyleApplicationLifetimeExtensions"
-                 "StartWithClassicDesktopLifetime" builder args))
+;;; Start the application on the process main thread. dotcl runs Lisp on a
+;;; worker thread with a big stack, and macOS AppKit accepts UI work on the main
+;;; thread only; CALL-ON-MAIN-THREAD puts the event loop back where the toolkit
+;;; wants it and returns when the application exits. Windows and X11 do not care,
+;;; so the wrapper costs nothing there.
+(dotcl:call-on-main-thread
+ (lambda ()
+   (let* ((builder (dotnet:static-generic "Avalonia.AppBuilder" "Configure" (list "Hello.App")))
+          (builder (dotnet:static "Avalonia.AppBuilderDesktopExtensions" "UsePlatformDetect" builder))
+          (args    (dotnet:static-generic "System.Array" "Empty" (list "System.String"))))
+     (dotnet:static "Avalonia.ClassicDesktopStyleApplicationLifetimeExtensions"
+                    "StartWithClassicDesktopLifetime" builder args))))

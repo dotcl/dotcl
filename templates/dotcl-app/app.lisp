@@ -1,4 +1,4 @@
-(defpackage :app (:use :cl))
+(defpackage :app (:use :cl) (:export #:app-main))
 (in-package :app)
 
 ;;; Entry point called from Program.cs. Build in Debug and press F5, then set a

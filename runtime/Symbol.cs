@@ -1,6 +1,6 @@
 namespace DotCL;
 
-public class Symbol : LispObject
+public sealed class Symbol : LispObject
 {
     public string Name { get; }
 
@@ -36,6 +36,16 @@ public class Symbol : LispObject
     public volatile LispObject? SetfFunction;
     public LispObject Plist { get; set; }
     public bool IsSpecial { get; set; }
+
+    // True once this symbol has ever been dynamically bound (LET of a special,
+    // PROGV, a restored snapshot) on any thread. A symbol that has not been is
+    // the common case for a DEFVAR that is only ever SETQ'd, and its reads can
+    // skip the binding stack entirely -- the scan (plus the three thread-static
+    // reads it needs) measured 5% of a call-heavy profile. Set, never cleared:
+    // a stale TRUE only costs a scan that finds nothing, while a stale FALSE
+    // would read past a live binding, so the flag is deliberately one-way.
+    public bool EverDynamicallyBound;
+
     public bool IsConstant { get; set; }
 
     /// <summary>

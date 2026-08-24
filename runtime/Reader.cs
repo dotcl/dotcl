@@ -1,3 +1,4 @@
+using System;
 using System.Linq;
 using System.Numerics;
 using System.Text;
@@ -26,11 +27,25 @@ public class Token
 
     public int Length => Chars.Count;
 
+    // A scratch buffer per thread: turning a token into its string ran through a
+    // StringBuilder (object + first chunk + the result) for every symbol and
+    // number the reader saw. Only the result string has to be allocated.
+    [ThreadStatic] private static char[]? _scratch;
+
+    private static char[] Scratch(int n)
+    {
+        var buf = _scratch;
+        if (buf == null || buf.Length < n) buf = _scratch = new char[n < 64 ? 64 : n];
+        return buf;
+    }
+
     public override string ToString()
     {
-        var sb = new StringBuilder(Chars.Count);
-        foreach (var tc in Chars) sb.Append(tc.Ch);
-        return sb.ToString();
+        int n = Chars.Count;
+        if (n == 0) return string.Empty;
+        var buf = Scratch(n);
+        for (int i = 0; i < n; i++) buf[i] = Chars[i].Ch;
+        return new string(buf, 0, n);
     }
 
     /// <summary>
@@ -48,10 +63,13 @@ public class Token
     /// <summary>Extract substring from token chars.</summary>
     public string Substring(int start, int length)
     {
-        var sb = new StringBuilder(length);
-        for (int i = start; i < start + length && i < Chars.Count; i++)
-            sb.Append(Chars[i].Ch);
-        return sb.ToString();
+        int end = start + length;
+        if (end > Chars.Count) end = Chars.Count;
+        int n = end - start;
+        if (n <= 0) return string.Empty;
+        var buf = Scratch(n);
+        for (int i = 0; i < n; i++) buf[i] = Chars[start + i].Ch;
+        return new string(buf, 0, n);
     }
 
     public string Substring(int start) => Substring(start, Chars.Count - start);
@@ -1685,7 +1703,7 @@ public class Reader
             return number;
 
         // It's a symbol
-        return ParseSymbol(token);
+        return ParseSymbol(token, tokenStr);
     }
 
     /// <summary>
@@ -1984,7 +2002,10 @@ public class Reader
     /// Interpret a token as a symbol per CLHS 2.3.5.
     /// Only unescaped colons are package markers.
     /// </summary>
-    private LispObject ParseSymbol(Token token)
+    // TOKENSTR: the token's string when the caller already built it (READ-ATOM
+    // needs it for number parsing), so the unqualified-symbol path does not build
+    // the same string a second time for every symbol read.
+    private LispObject ParseSymbol(Token token, string? tokenStr = null)
     {
         // Find first unescaped colon
         int colonPos = token.FindUnescapedColon();
@@ -2030,17 +2051,25 @@ public class Reader
                 return new Symbol(symName); // don't pollute packages in suppressed mode
             }
 
+            // A package-qualified name needs the same NIL/T canonicalization the
+            // unqualified path below does: the CL package's table holds plain
+            // Symbol entries for NIL and T, so CL:NIL read back a "second NIL"
+            // that EQ, NULL and NOT accept but a compiled test position does not
+            // (it compares against Nil.Instance), giving one object two answers
+            // for whether it is false. Reached by anything that prints a symbol
+            // with a package prefix and reads it back -- FASL literals print
+            // fully qualified, which is how SBCL's cross-build hit it.
             if (isInternal)
             {
                 var (sym, _) = pkg.Intern(symName);
-                return sym;
+                return Runtime.CanonicalizeSymbol(sym);
             }
             else
             {
                 // Single colon: external symbol access only (CLHS 2.3.5)
                 var (sym, status) = pkg.FindSymbol(symName);
                 if (status == SymbolStatus.External)
-                    return sym;
+                    return Runtime.CanonicalizeSymbol(sym);
                 // Not external — signal error per spec (B7)
                 if (_readSuppress) return new Symbol(symName);
                 throw MakeReaderError($"Symbol \"{symName}\" is not external in package \"{pkgName}\"");
@@ -2048,7 +2077,7 @@ public class Reader
         }
 
         // No unescaped colon — unqualified symbol in current package
-        var tokenStr = token.ToString();
+        tokenStr ??= token.ToString();
         var starPkg = DynamicBindings.Get(Startup.Sym("*PACKAGE*"));
         var currentPackage = (starPkg is Package curPkg) ? curPkg : (Package.FindPackage("CL-USER") ?? Startup.CL);
         var (symbol, _) = currentPackage.Intern(tokenStr);

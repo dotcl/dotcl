@@ -424,6 +424,34 @@ public static partial class Runtime
             (typeName == "VECTOR" && resultType is Cons rtc && rtc.Cdr is Cons rtc2 &&
              rtc2.Car is Symbol etSym && etSym.Name is "CHARACTER" or "BASE-CHAR" or "STANDARD-CHAR"))
         {
+            // Strings only -- which is what (concatenate 'string a b) almost always
+            // is: the total length is known before copying, so the result can be
+            // built once instead of growing a StringBuilder through its chunks.
+            bool allStrings = true;
+            int total = 0;
+            foreach (var seq in sequences)
+            {
+                if (seq is LispString ss) total += ss.Value.Length;
+                else { allStrings = false; break; }
+            }
+            if (allStrings)
+            {
+                if (sequences.Length == 0) return new LispString("");
+                if (sequences.Length == 1) return new LispString(((LispString)sequences[0]).Value);
+                if (sequences.Length == 2)
+                    return new LispString(string.Concat(((LispString)sequences[0]).Value,
+                                                        ((LispString)sequences[1]).Value));
+                var buf = new char[total];
+                int pos = 0;
+                foreach (var seq in sequences)
+                {
+                    var v = ((LispString)seq).Value;
+                    v.CopyTo(0, buf, pos, v.Length);
+                    pos += v.Length;
+                }
+                return new LispString(new string(buf, 0, total));
+            }
+
             var sb = new System.Text.StringBuilder();
             foreach (var seq in sequences)
             {
@@ -666,10 +694,15 @@ public static partial class Runtime
         if (seq is Nil) return Nil.Instance;
         if (seq is Cons)
         {
-            var items = new List<LispObject>();
-            var cur = seq;
-            while (cur is Cons c) { items.Add(c.Car); cur = c.Cdr; }
-            var arr = items.ToArray();
+            // Count first, then fill: going through a List and ToArray copied the
+            // elements twice before the comparator ran once.
+            int n = 0;
+            for (var p = seq; p is Cons pc; p = pc.Cdr) n++;
+            var arr = new LispObject[n];
+            {
+                int i = 0;
+                for (var p = seq; p is Cons pc; p = pc.Cdr) arr[i++] = pc.Car;
+            }
             SortObjects(arr, fn, keyFn, stable);
             return List(arr);
         }
@@ -806,7 +839,7 @@ public static partial class Runtime
                     real = AsNumber(Coerce(real, partType));
                     imag = AsNumber(Coerce(imag, partType));
                 }
-                return new LispComplex(real, imag);
+                return LispComplex.Of(real, imag);
             }
             // Compound float types — e.g. (DOUBLE-FLOAT low high), which a deftype
             // like Maxima's FLONUM expands to ((&optional low high) -> (double-float
@@ -1129,6 +1162,11 @@ public static partial class Runtime
                                    LispObject k1, LispObject v1, LispObject k2, LispObject v2) =>
         FindCore(item, seq, ParseSeqKwArgs(new[] { k1, v1, k2, v2 }, 0, "FIND"));
 
+    // 2-arg direct entry: (find item seq) with no keywords -- the shape most
+    // call sites have. Skips the args array the variadic path builds.
+    public static LispObject Find2(LispObject item, LispObject seq) =>
+        FindCore(item, seq, new SeqKwArgs());
+
     private static LispObject FindCore(LispObject item, LispObject seq, in SeqKwArgs kw)
     {
         int len = seq is LispVector v ? v.Length : seq is LispString ls ? ls.Length : (int)((Fixnum)Length(seq)).Value;
@@ -1269,9 +1307,15 @@ public static partial class Runtime
     {
         if (args.Length < 2)
             throw new LispErrorException(new LispProgramError("POSITION: too few arguments"));
-        var item = args[0];
-        var seq = args[1];
-        var kw = ParseSeqKwArgs(args, 2, "POSITION");
+        return PositionCore(args[0], args[1], ParseSeqKwArgs(args, 2, "POSITION"));
+    }
+
+    // 2-arg direct entry: (position item seq), the shape most call sites have.
+    public static LispObject Position2(LispObject item, LispObject seq) =>
+        PositionCore(item, seq, new SeqKwArgs());
+
+    private static LispObject PositionCore(LispObject item, LispObject seq, in SeqKwArgs kw)
+    {
         int len = seq is LispVector v ? v.Length : seq is LispString ls ? ls.Length : (int)((Fixnum)Length(seq)).Value;
         int start = kw.Start;
         int end = kw.End ?? len;
@@ -1910,6 +1954,26 @@ public static partial class Runtime
         if (hasUnknown && allowOtherKeys != true)
             throw new LispErrorException(new LispProgramError("REDUCE: unknown keyword argument"));
 
+        // A forward fold over a list needs no materialisation: the elements are
+        // already reachable in order. Collecting them into a List and then an
+        // array copied the sequence twice before the first call to FN.
+        if (!fromEnd && startOpt == null && endOpt == null && (seq is Cons || seq is Nil))
+        {
+            LispObject acc;
+            var cur = seq;
+            if (hasIV) acc = iv;
+            else
+            {
+                if (cur is not Cons first)
+                    return UnwrapMv(fn.Invoke(Array.Empty<LispObject>()));
+                acc = ApplyKeyFn(keyFn, first.Car);
+                cur = first.Cdr;
+            }
+            for (; cur is Cons c; cur = c.Cdr)
+                acc = UnwrapMv(fn.Invoke2(acc, ApplyKeyFn(keyFn, c.Car)));
+            return acc;
+        }
+
         // Get elements as array for direct access
         int len;
         LispObject[] elems;
@@ -2229,6 +2293,27 @@ public static partial class Runtime
         // Local function for list sequences
         LispObject RemoveCoreList(LispObject listSeq, int start, int? endOpt, bool fromEnd, int? maxRem)
         {
+            // The ordinary shape -- whole list, no :count, no :from-end, not
+            // destructive -- walks once and conses only the survivors. The
+            // general path below first materialises every element into a List
+            // and every dropped index into a HashSet, which is most of what
+            // (remove-if p list) cost.
+            if (!destructive && !fromEnd && !maxRem.HasValue && start == 0 && endOpt == null)
+            {
+                Cons? head = null, tail = null;
+                bool removedAny = false;
+                for (var cur0 = listSeq; cur0 is Cons c0; cur0 = c0.Cdr)
+                {
+                    if (matches(c0.Car)) { removedAny = true; continue; }
+                    var cell = new Cons(c0.Car, Nil.Instance);
+                    if (tail == null) head = cell; else tail.Cdr = cell;
+                    tail = cell;
+                }
+                // Nothing removed: same identity the general path returns.
+                if (!removedAny) return listSeq;
+                return head ?? (LispObject)Nil.Instance;
+            }
+
             // Collect all elements with indices
             var allElems = new System.Collections.Generic.List<LispObject>();
             for (var cur = listSeq; cur is Cons c; cur = c.Cdr)
@@ -2851,10 +2936,10 @@ public static partial class Runtime
     }
 
     public static LispObject Search(LispObject seq1, LispObject seq2)
-    {
-        // Delegate to full implementation with no keyword args
-        return SearchFull(new LispObject[] { seq1, seq2 });
-    }
+        // No keywords: straight to the core. Wrapping the two arguments in an
+        // array so the keyword parser could look at them was an allocation per
+        // (search a b), which is the shape most call sites have.
+        => SearchCore(seq1, seq2, false, null, null, null, 0, null, 0, null);
 
     public static LispObject SearchFull(LispObject[] args)
     {
@@ -2903,11 +2988,22 @@ public static partial class Runtime
             }
         }
 
-        Func<LispObject, LispObject, bool> elemTest;
-        if (testFn != null) elemTest = (a, b) => IsTruthy(testFn.Invoke2(a, b));
-        else if (testNotFn != null) elemTest = (a, b) => !IsTruthy(testNotFn.Invoke2(a, b));
-        else elemTest = (a, b) => IsTrueEql(a, b);
+        return SearchCore(seq1, seq2, fromEnd, testFn, testNotFn, keyFn, start1, end1, start2, end2);
+    }
 
+    // The element test as a plain call rather than a delegate: building the
+    // :test / :test-not closures forced a display class on every SEARCH, keyword
+    // or not.
+    private static bool SearchElemTest(LispFunction? testFn, LispFunction? testNotFn,
+                                       LispObject a, LispObject b)
+        => testFn != null ? IsTruthy(testFn.Invoke2(a, b))
+         : testNotFn != null ? !IsTruthy(testNotFn.Invoke2(a, b))
+         : IsTrueEql(a, b);
+
+    private static LispObject SearchCore(LispObject seq1, LispObject seq2, bool fromEnd,
+                                         LispFunction? testFn, LispFunction? testNotFn, LispFunction? keyFn,
+                                         int start1, int? end1, int start2, int? end2)
+    {
         int len1 = ReplaceSeqLength(seq1), len2 = ReplaceSeqLength(seq2);
         int e1 = end1 ?? len1, e2 = end2 ?? len2;
         CheckBoundingIndices(start1, e1, len1, "SEARCH");
@@ -2962,7 +3058,7 @@ public static partial class Runtime
                 {
                     var a = ApplyKeyFn(keyFn, ReplaceSeqGet(seq1, start1 + j));
                     var b = ApplyKeyFn(keyFn, ReplaceSeqGet(seq2, i + j));
-                    if (!elemTest(a, b)) match = false;
+                    if (!SearchElemTest(testFn, testNotFn, a, b)) match = false;
                 }
                 if (match) return Fixnum.Make(i);
             }
@@ -2976,7 +3072,7 @@ public static partial class Runtime
                 {
                     var a = ApplyKeyFn(keyFn, ReplaceSeqGet(seq1, start1 + j));
                     var b = ApplyKeyFn(keyFn, ReplaceSeqGet(seq2, i + j));
-                    if (!elemTest(a, b)) match = false;
+                    if (!SearchElemTest(testFn, testNotFn, a, b)) match = false;
                 }
                 if (match) return Fixnum.Make(i);
             }
@@ -3018,6 +3114,7 @@ public static partial class Runtime
             new LispFunction(args => Runtime.Fill(args)));
         // FIND, FIND-IF, FIND-IF-NOT
         var findFn = new LispFunction(args => Runtime.Find(args));
+        findFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject>)Runtime.Find2);
         findFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject>)Runtime.Find6);
         Emitter.CilAssembler.RegisterFunction("FIND", findFn);
         var findIfFn = new LispFunction(args => Runtime.FindIf(args));
@@ -3034,8 +3131,9 @@ public static partial class Runtime
                 return Runtime.FindIf(newArgs);
             }));
         // POSITION, POSITION-IF, POSITION-IF-NOT
-        Emitter.CilAssembler.RegisterFunction("POSITION",
-            new LispFunction(args => Runtime.Position(args)));
+        var positionFn = new LispFunction(args => Runtime.Position(args));
+        positionFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject>)Runtime.Position2);
+        Emitter.CilAssembler.RegisterFunction("POSITION", positionFn);
         Emitter.CilAssembler.RegisterFunction("POSITION-IF",
             new LispFunction(args => Runtime.PositionIf(args)));
         Emitter.CilAssembler.RegisterFunction("POSITION-IF-NOT",

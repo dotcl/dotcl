@@ -4,6 +4,24 @@ using System.Reflection.Emit;
 namespace DotCL.Emitter;
 
 /// <summary>
+/// The cell a <c>ref</c> / <c>out</c> parameter becomes on the Lisp side.
+///
+/// A Lisp function is called with values, so a parameter the caller expects to
+/// be written back cannot be expressed as an ordinary argument. The emitted
+/// method therefore reads the location, wraps the value here, hands the cell to
+/// Lisp, and copies <see cref="Value"/> back into the location when the body
+/// returns. Reading is <c>(dotnet:invoke cell "Value")</c> and writing is
+/// <c>(setf (dotnet:deref cell) x)</c>; a body that never writes leaves the
+/// caller's value untouched.
+/// </summary>
+public sealed class ByRef
+{
+    public object? Value;
+    public ByRef(object? value) { Value = value; }
+    public override string ToString() => $"#<byref {Value}>";
+}
+
+/// <summary>
 /// Runtime emission of named public .NET classes via AssemblyBuilder +
 /// TypeBuilder. Part of the defclass-cil roadmap:
 ///   Step 1: named class, default ctor, fixed Greet() method
@@ -60,7 +78,13 @@ public static class DynamicClassBuilder
     public record MethodSpec(string Name, Type ReturnType, IReadOnlyList<Type> ParamTypes,
                              LispObject LispBody, bool IsOverride = false,
                              IReadOnlyList<CustomAttributeBuilder>? Attributes = null,
-                             bool IsStatic = false);
+                             bool IsStatic = false,
+                             // Parameter names, when the caller supplied them. Emitted with
+                             // DefineParameter so reflection reports them: a consumer that
+                             // matches parameters BY NAME (Harmony injects its __instance /
+                             // __result / __state that way, and so do most DI containers)
+                             // cannot see a method whose parameters are nameless.
+                             IReadOnlyList<string>? ParamNames = null);
 
     // multi-ctor support: one spec per constructor overload.
     public record CtorSpec(
@@ -836,6 +860,8 @@ public static class DynamicClassBuilder
 
         var method = tb.DefineMethod(m.Name, attrs, m.ReturnType, paramArr);
 
+        DefineParameterNames(method, m.ParamNames, paramArr.Length);
+
         // Apply method-level CustomAttributes (e.g., [HttpGet], [Route])
         // before emitting IL so MVC controller discovery sees them on the
         // built MethodInfo.
@@ -856,23 +882,10 @@ public static class DynamicClassBuilder
         // self (object)
         il.Emit(OpCodes.Ldarg_0);
 
-        // new object[paramCount]
-        il.Emit(OpCodes.Ldc_I4, paramArr.Length);
-        il.Emit(OpCodes.Newarr, typeof(object));
-
-        for (int i = 0; i < paramArr.Length; i++)
-        {
-            il.Emit(OpCodes.Dup);
-            il.Emit(OpCodes.Ldc_I4, i);
-            il.Emit(OpCodes.Ldarg, i + 1); // +1: skip `this`
-            if (paramArr[i].IsValueType)
-                il.Emit(OpCodes.Box, paramArr[i]);
-            il.Emit(OpCodes.Stelem_Ref);
-        }
-
+        var cells = EmitArgMarshal(il, paramArr, 1); // +1: skip `this`
         il.Emit(OpCodes.Call, DispatchMI);
 
-        EmitReturnConversion(il, m.ReturnType);
+        EmitDispatchTail(il, m.ReturnType, paramArr, 1, cells);
 
         if (baseMethod != null)
             tb.DefineMethodOverride(method, baseMethod);
@@ -880,6 +893,26 @@ public static class DynamicClassBuilder
         if (ifaceTargets != null)
             foreach (var target in ifaceTargets)
                 tb.DefineMethodOverride(method, target);
+    }
+
+    /// <summary>
+    /// Name the emitted parameters. Reflection reports a MethodBuilder parameter
+    /// as unnamed unless DefineParameter says otherwise, and a caller that binds
+    /// by name then has nothing to bind to. Silent when the spec carries no
+    /// names, and tolerant of a short list so a partially named signature is
+    /// still emitted.
+    /// </summary>
+    private static void DefineParameterNames(MethodBuilder method,
+        IReadOnlyList<string>? names, int paramCount)
+    {
+        if (names == null) return;
+        var n = Math.Min(names.Count, paramCount);
+        for (int i = 0; i < n; i++)
+        {
+            if (string.IsNullOrEmpty(names[i])) continue;
+            // Position is 1-based: 0 is the return value.
+            method.DefineParameter(i + 1, ParameterAttributes.None, names[i]);
+        }
     }
 
     /// <summary>
@@ -895,6 +928,8 @@ public static class DynamicClassBuilder
             MethodAttributes.Public | MethodAttributes.Static | MethodAttributes.HideBySig,
             m.ReturnType, paramArr);
 
+        DefineParameterNames(method, m.ParamNames, paramArr.Length);
+
         if (m.Attributes != null)
             foreach (var ab2 in m.Attributes)
                 method.SetCustomAttribute(ab2);
@@ -907,21 +942,32 @@ public static class DynamicClassBuilder
         il.Emit(OpCodes.Ldtoken, m.ReturnType);
         il.Emit(OpCodes.Call, GetTypeFromHandleMI);
 
-        il.Emit(OpCodes.Ldc_I4, paramArr.Length);
-        il.Emit(OpCodes.Newarr, typeof(object));
-        for (int i = 0; i < paramArr.Length; i++)
-        {
-            il.Emit(OpCodes.Dup);
-            il.Emit(OpCodes.Ldc_I4, i);
-            il.Emit(OpCodes.Ldarg, i); // static: arg 0 is the first parameter
-            if (paramArr[i].IsValueType)
-                il.Emit(OpCodes.Box, paramArr[i]);
-            il.Emit(OpCodes.Stelem_Ref);
-        }
-
+        var cells = EmitArgMarshal(il, paramArr, 0); // static: arg 0 is the first parameter
         il.Emit(OpCodes.Call, DispatchStaticMI);
 
-        EmitReturnConversion(il, m.ReturnType);
+        EmitDispatchTail(il, m.ReturnType, paramArr, 0, cells);
+    }
+
+    /// <summary>
+    /// Emit what follows the dispatch call: copy any byref cells back into the
+    /// caller's locations, then convert and return. The dispatch result is on
+    /// the stack when this is called, so with byrefs present it is parked in a
+    /// local first -- the write-back sequence needs a clean stack.
+    /// </summary>
+    private static void EmitDispatchTail(ILGenerator il, Type returnType,
+        Type[] paramArr, int argOffset, LocalBuilder?[] cells)
+    {
+        if (!HasByRef(cells))
+        {
+            EmitReturnConversion(il, returnType);
+            return;
+        }
+
+        var result = il.DeclareLocal(typeof(object));
+        il.Emit(OpCodes.Stloc, result);
+        EmitByRefWriteBack(il, paramArr, argOffset, cells);
+        il.Emit(OpCodes.Ldloc, result);
+        EmitReturnConversion(il, returnType);
     }
 
     /// <summary>
@@ -942,7 +988,6 @@ public static class DynamicClassBuilder
         il.Emit(OpCodes.Ret);
     }
 
-    /// <summary>
     /// Emit a public event: a private delegate backing field, public
     /// <c>add_Name</c>/<c>remove_Name</c> accessors that combine/remove the
     /// handler, and an <see cref="EventBuilder"/> tying them together. If a
@@ -1136,6 +1181,103 @@ public static class DynamicClassBuilder
                 $"Cannot override: {baseType.FullName}.{name} returns {candidate.ReturnType.FullName}, " +
                 $"not {returnType.FullName}");
         return candidate;
+    }
+
+    private static readonly ConstructorInfo ByRefCtor =
+        typeof(ByRef).GetConstructor(new[] { typeof(object) })!;
+
+    private static readonly FieldInfo ByRefValueField =
+        typeof(ByRef).GetField(nameof(ByRef.Value))!;
+
+    /// <summary>
+    /// Marshal the declared parameters into the <c>object[]</c> both dispatchers
+    /// take, leaving the array on the stack. ARGOFFSET is 1 for an instance
+    /// method (arg 0 is <c>this</c>) and 0 for a static one.
+    ///
+    /// A byref parameter cannot travel as a value, since the caller expects to
+    /// read back what the body wrote. It becomes a <see cref="ByRef"/> cell
+    /// holding the current value; <see cref="EmitByRefWriteBack"/> copies the
+    /// cell's contents into the caller's location after the body returns.
+    /// Returns the cell local per parameter, null for the by-value ones.
+    /// </summary>
+    private static LocalBuilder?[] EmitArgMarshal(ILGenerator il, Type[] paramArr, int argOffset)
+    {
+        var cells = new LocalBuilder?[paramArr.Length];
+
+        il.Emit(OpCodes.Ldc_I4, paramArr.Length);
+        il.Emit(OpCodes.Newarr, typeof(object));
+
+        for (int i = 0; i < paramArr.Length; i++)
+        {
+            var pt = paramArr[i];
+            if (pt.IsByRef)
+            {
+                // Build the cell first; the sequence is stack-balanced, so the
+                // array reference underneath is undisturbed.
+                var elem = pt.GetElementType()!;
+                var cell = il.DeclareLocal(typeof(ByRef));
+                cells[i] = cell;
+                il.Emit(OpCodes.Ldarg, i + argOffset);
+                EmitLoadIndirect(il, elem);
+                if (elem.IsValueType) il.Emit(OpCodes.Box, elem);
+                il.Emit(OpCodes.Newobj, ByRefCtor);
+                il.Emit(OpCodes.Stloc, cell);
+            }
+
+            il.Emit(OpCodes.Dup);
+            il.Emit(OpCodes.Ldc_I4, i);
+            if (pt.IsByRef)
+            {
+                il.Emit(OpCodes.Ldloc, cells[i]!);
+            }
+            else
+            {
+                il.Emit(OpCodes.Ldarg, i + argOffset);
+                if (pt.IsValueType) il.Emit(OpCodes.Box, pt);
+            }
+            il.Emit(OpCodes.Stelem_Ref);
+        }
+
+        return cells;
+    }
+
+    /// <summary>
+    /// Copy each byref cell back into the location its parameter points at.
+    /// Emitted after the dispatch call and before the return conversion, so a
+    /// body that wrote to the cell is visible to the caller.
+    /// </summary>
+    private static void EmitByRefWriteBack(ILGenerator il, Type[] paramArr,
+        int argOffset, LocalBuilder?[] cells)
+    {
+        for (int i = 0; i < paramArr.Length; i++)
+        {
+            if (cells[i] == null) continue;
+            var elem = paramArr[i].GetElementType()!;
+            il.Emit(OpCodes.Ldarg, i + argOffset);
+            il.Emit(OpCodes.Ldloc, cells[i]!);
+            il.Emit(OpCodes.Ldfld, ByRefValueField);
+            if (elem.IsValueType) il.Emit(OpCodes.Unbox_Any, elem);
+            else if (elem != typeof(object)) il.Emit(OpCodes.Castclass, elem);
+            EmitStoreIndirect(il, elem);
+        }
+    }
+
+    private static bool HasByRef(LocalBuilder?[] cells)
+    {
+        foreach (var c in cells) if (c != null) return true;
+        return false;
+    }
+
+    private static void EmitLoadIndirect(ILGenerator il, Type elem)
+    {
+        if (elem.IsValueType) il.Emit(OpCodes.Ldobj, elem);
+        else il.Emit(OpCodes.Ldind_Ref);
+    }
+
+    private static void EmitStoreIndirect(ILGenerator il, Type elem)
+    {
+        if (elem.IsValueType) il.Emit(OpCodes.Stobj, elem);
+        else il.Emit(OpCodes.Stind_Ref);
     }
 
     private static readonly MethodInfo GetTypeFromHandleMI =
