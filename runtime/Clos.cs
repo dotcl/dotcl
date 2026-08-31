@@ -29,6 +29,17 @@ public class SlotDefinition : LispObject
     /// <summary>True when :allocation :class was specified (shared slot stored on class, not instance).</summary>
     public bool IsClassAllocation { get; set; }
 
+    /// <summary>An :allocation other than :INSTANCE or :CLASS. CLHS 7.1.2 allows only
+    /// those two, but that rule is about STANDARD-CLASS: under a custom metaclass AMOP
+    /// has the metaclass decide what an allocation means, and it needs the keyword to
+    /// decide with. Null for the two standard allocations, which stay on the bool.</summary>
+    public Symbol? Allocation { get; set; }
+
+    /// <summary>The allocation as AMOP reports it, whichever of the two representations
+    /// holds it.</summary>
+    public Symbol AllocationKeyword
+        => Allocation ?? Startup.Keyword(IsClassAllocation ? "CLASS" : "INSTANCE");
+
     /// <summary>True for effective slot definitions (STANDARD-EFFECTIVE-SLOT-DEFINITION),
     /// false for direct slot definitions (STANDARD-DIRECT-SLOT-DEFINITION).</summary>
     public bool IsEffective { get; set; }
@@ -66,6 +77,12 @@ public class SlotDefinition : LispObject
     /// DEFCLASS slot specifier, used as the &rest initargs when DIRECT-SLOT-DEFINITION-CLASS
     /// is consulted for a custom metaclass. Null for slots defined under STANDARD-CLASS.</summary>
     public LispObject? RawOptions { get; set; }
+
+    /// <summary>The :documentation the slot was defined with, NIL when it has none.
+    /// AMOP passes it to EFFECTIVE-SLOT-DEFINITION-CLASS and DOCUMENTATION reads it
+    /// back, so it has to live on the slot definition rather than in the global
+    /// documentation table -- an effective slot definition is built, not defined.</summary>
+    public LispObject Documentation { get; set; } = Nil.Instance;
 
     public SlotDefinition(Symbol name, Symbol[]? initargs = null, LispFunction? initformThunk = null, bool isClassAllocation = false)
     {
@@ -119,9 +136,15 @@ public class LispClass : LispObject
     /// <summary>Slot names for #S reader macro support.</summary>
     public Symbol[]? StructSlotNames { get; set; }
     /// <summary>Direct default initargs defined by this class (before inheritance merge).</summary>
-    public (Symbol Key, LispFunction Thunk)[] DirectDefaultInitargs { get; set; } = Array.Empty<(Symbol, LispFunction)>();
+    /// <summary>The canonicalized default initargs AMOP asks for: the name, the
+    /// initform as source, and the function that evaluates it. The form is what
+    /// CLASS-DIRECT-DEFAULT-INITARGS has to show -- a thunk cannot be turned back
+    /// into it.</summary>
+    public (Symbol Key, LispObject Form, LispFunction Thunk)[] DirectDefaultInitargs { get; set; }
+        = Array.Empty<(Symbol, LispObject, LispFunction)>();
     /// <summary>Effective default initargs (merged from CPL, most specific first).</summary>
-    public (Symbol Key, LispFunction Thunk)[] DefaultInitargs { get; set; } = Array.Empty<(Symbol, LispFunction)>();
+    public (Symbol Key, LispObject Form, LispFunction Thunk)[] DefaultInitargs { get; set; }
+        = Array.Empty<(Symbol, LispObject, LispFunction)>();
     /// <summary>Storage for :allocation :class slots (shared across all instances).
     /// ConcurrentDictionary: a :class slot's initform can fire on the make-instance
     /// hot path, so parallel make-instance / setf slot-value on the same class write
@@ -255,6 +278,13 @@ public class LispClass : LispObject
         {
             ClassPrecedenceList = ComputeCPL();
             EffectiveSlots = ComputeEffectiveSlots();
+            // AMOP has finalization go through COMPUTE-SLOTS, and the list it hands
+            // back IS the class's effective slots -- the order included, which is the
+            // whole point of a metaclass that reorders them. Runs before the layout
+            // indices below are handed out, so slot access follows the answer. Quiet
+            // until somebody has specialised it.
+            if (Runtime.ComputeSlotsHook?.Invoke(this) is { } requested)
+                EffectiveSlots = requested;
             _initargSlotMap = null; // invalidate cached initarg→slot mapping
             _canUseFastPath = null;
             CachedHasCustomInitMethods = null;
@@ -265,11 +295,19 @@ public class LispClass : LispObject
             {
                 slotIndex[EffectiveSlots[i].Name.Name] = i;
                 // Instance-allocated slots get their layout index as location; :class
-                // allocation slots are not in the per-instance vector.
-                EffectiveSlots[i].Location = EffectiveSlots[i].IsClassAllocation ? -1 : i;
+                // allocation slots are not in the per-instance vector, and neither is
+                // one whose metaclass defined its own allocation -- that slot is the
+                // metaclass's business, reached through SLOT-VALUE-USING-CLASS.
+                EffectiveSlots[i].Location =
+                    (EffectiveSlots[i].IsClassAllocation || EffectiveSlots[i].Allocation != null)
+                        ? -1 : i;
             }
             SlotIndex = slotIndex;
             ComputeEffectiveDefaultInitargs();
+            // AMOP has finalization go through COMPUTE-DEFAULT-INITARGS. The hook runs
+            // after the class computed its own, so a metaclass that specialises it sees
+            // (and can replace) the answer; nothing happens until one does.
+            Runtime.DefaultInitargsHook?.Invoke(this);
 
             // Build initarg-to-slot cache for fast make-instance path
             var initargMap = new Dictionary<string, int>();
@@ -304,13 +342,13 @@ public class LispClass : LispObject
     public void ComputeEffectiveDefaultInitargs()
     {
         var seen = new HashSet<string>();
-        var result = new List<(Symbol Key, LispFunction Thunk)>();
+        var result = new List<(Symbol Key, LispObject Form, LispFunction Thunk)>();
         foreach (var cls in ClassPrecedenceList)
         {
-            foreach (var (key, thunk) in cls.DirectDefaultInitargs)
+            foreach (var (key, form, thunk) in cls.DirectDefaultInitargs)
             {
                 if (seen.Add(key.Name))
-                    result.Add((key, thunk));
+                    result.Add((key, form, thunk));
             }
         }
         DefaultInitargs = result.ToArray();
@@ -476,7 +514,9 @@ public class LispClass : LispObject
             allInitargs.Count > 0 ? allInitargs.ToArray() : null,
             initform,
             primary.IsClassAllocation) { IsEffective = true, SlotType = slotType,
-                                         Initform = initformSource };
+                                         Initform = initformSource,
+                                         Allocation = primary.Allocation,
+                                         Documentation = primary.Documentation };
     }
 
     private SlotDefinition[] ComputeEffectiveSlots()
@@ -539,7 +579,15 @@ public sealed class LispInstance : LispObject
 
     public override string ToString() => $"#<{Class.Name.Name}>";
 
-    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, System.WeakReference<LispInstance>>
+    // Strong, deliberately. A reference to a make-load-form literal compiles to a
+    // lookup by key -- the creation form runs once, in its own top-level method,
+    // and every use of the literal reads the cache. Holding the result weakly meant
+    // a GC between load and use turned the literal into NIL, silently: a fasl that
+    // worked when freshly compiled started handing out NIL later in the same session
+    // (cffi's defcallback embeds a type object this way, so an argument stopped being
+    // translated and a pointer reached Lisp code as an integer). Lifetime is now the
+    // process; the bound is the number of distinct make-load-form literals loaded.
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, LispInstance>
         _internCache = new();
 
     // NOTE: deliberately does NOT populate _internCache. CLHS 3.2.4.2 requires the
@@ -560,18 +608,38 @@ public sealed class LispInstance : LispObject
     /// <summary>FASL load-time: evaluate make-load-form creation form once and cache by key.</summary>
     public static LispObject InternViaEval(string key, LispObject creationForm)
     {
-        if (_internCache.TryGetValue(key, out var weakRef) && weakRef.TryGetTarget(out var existing))
+        if (_internCache.TryGetValue(key, out var existing))
             return existing;
-        // Nil means "just look up" — creation form already evaluated elsewhere
-        if (creationForm is Nil) return Nil.Instance;
+        // Nil means "just look up" — the creation form ran in its own top-level method
+        // earlier in this same fasl, so a miss is not a legitimate state. Reporting it
+        // beats the old silent Nil.Instance, which turned a lost literal into a wrong
+        // value that surfaced far away from the cause.
+        if (creationForm is Nil)
+            throw new LispErrorException(new LispError(
+                $"FASL: load-form literal {key} was not created before it was referenced"));
         var obj = Runtime.Eval(creationForm);
         if (obj is LispInstance result)
         {
-            _internCache[key] = new System.WeakReference<LispInstance>(result);
+            _internCache[key] = result;
             return result;
         }
         return obj;
     }
+}
+
+/// <summary>An EQL specializer metaobject. AMOP makes these objects with identity:
+/// INTERN-EQL-SPECIALIZER answers the same one for two EQL objects, so specializers
+/// can be compared with EQ and a method's specializer list holds metaobjects rather
+/// than a list that merely looks like one. The older representation -- the list
+/// (EQL object) -- is still accepted everywhere a specializer is read, because that
+/// is what a caller writing one by hand produces.</summary>
+public sealed class EqlSpecializer : LispObject
+{
+    public LispObject Object { get; }
+
+    public EqlSpecializer(LispObject obj) { Object = obj; }
+
+    public override string ToString() => $"#<EQL-SPECIALIZER {Object}>";
 }
 
 /// <summary>
@@ -579,9 +647,16 @@ public sealed class LispInstance : LispObject
 /// </summary>
 public class LispMethod : LispObject
 {
-    public LispObject[] Specializers { get; set; }  // LispClass or (eql value) cons
+    public LispObject[] Specializers { get; set; }  // LispClass, EqlSpecializer, or (eql value)
     public Symbol[] Qualifiers { get; set; }         // :BEFORE, :AFTER, :AROUND, or empty
     public LispFunction Function { get; set; }
+
+    /// <summary>The method function as AMOP defines it: called with a list of the
+    /// generic function's arguments and a list of the next methods. dotcl's own
+    /// method functions take the arguments spread, which is what dispatch calls, so
+    /// this holds the AMOP-shaped one -- the object a user passed with the :FUNCTION
+    /// initarg, or a view built over the internal one on first ask.</summary>
+    public LispFunction? ProcessedParameterFunction { get; set; }
     public int RequiredCount { get; set; }
     public int OptionalCount { get; set; }
     public bool HasRest { get; set; }
@@ -604,6 +679,22 @@ public class LispMethod : LispObject
     /// effective slot-definition it accesses. Backs DOTCL-MOP:ACCESSOR-METHOD-SLOT-DEFINITION.
     /// Null for ordinary methods.</summary>
     public SlotDefinition? AccessorSlot { get; set; }
+
+    /// <summary>The class this method is an instance of, when DEFMETHOD asked the
+    /// generic function for one and got something other than STANDARD-METHOD. Null
+    /// for the ordinary case, where CLASS-OF answers STANDARD-METHOD. Mirrors
+    /// SlotDefinition.MetaClass.</summary>
+    public LispClass? MetaClass { get; set; }
+
+    /// <summary>Slots added by a user-defined method class. A method is not a
+    /// LispInstance and has no slot vector; this is the same escape hatch LispClass,
+    /// GenericFunction and SlotDefinition use. Null until one is written.</summary>
+    public System.Collections.Concurrent.ConcurrentDictionary<string, LispObject?>? ExtraSlots;
+
+    /// <summary>Atomically obtain the ExtraSlots table, creating it on first use.</summary>
+    public System.Collections.Concurrent.ConcurrentDictionary<string, LispObject?> EnsureExtraSlots()
+        => ExtraSlots ?? System.Threading.Interlocked.CompareExchange(
+               ref ExtraSlots, new(), null) ?? ExtraSlots;
 
     public LispMethod(LispObject[] specializers, Symbol[] qualifiers, LispFunction function)
     {
@@ -633,6 +724,13 @@ internal class CachedDispatch
     // them as always present. A site that forgets one is a bug, not a state to
     // handle at each use.
     public LispClass?[] ArgTypes = null!;
+
+    /// <summary>The effective method for these argument classes, as a function, when
+    /// this generic function's invocation goes through the AMOP protocol. Null for the
+    /// ordinary entries, which carry resolved method lists instead. Built once per
+    /// argument-class vector, exactly like the rest of this entry, so the protocol is
+    /// consulted on a cache miss rather than on every call.</summary>
+    public LispFunction? EffectiveMethodFunction;
     public List<LispMethod> Around = null!;
     public List<LispMethod> Before = null!;
     public List<LispMethod> Primary = null!;
@@ -672,36 +770,42 @@ internal class CachedDispatch
     /// <summary>Slot-name symbol for WriterSlotIndex. Only meaningful when >= 0.</summary>
     public Symbol? WriterSlotName;
 
-    /// <summary>True when this entry runs exactly one primary method with nothing
-    /// around it: no :around/:before/:after, no EQL specializers, no built-in
+    /// <summary>True when this entry runs a plain chain of primary methods with
+    /// nothing around it: no :around/:before/:after, no EQL specializers, no built-in
     /// combination, and not one of the slot reader/writer shortcuts. That is the shape
-    /// the loose-argument entry points (DISPATCHGF1/2/3) can run without building an
+    /// the loose-argument entry points (DISPATCHGF1/2/3/4) can run without building an
     /// argument array, so it is decided once here rather than re-derived from five list
-    /// lengths on every call.</summary>
-    public bool SinglePrimary;
-    /// <summary>One primary with :before and/or :after around it and no :around --
-    /// the shape the loose-argument path can run without materialising an
-    /// arguments array. Mutually exclusive with <see cref="SinglePrimary"/>.</summary>
-    public bool SinglePrimaryWithBeforeAfter;
+    /// lengths on every call.
+    ///
+    /// The chain may hold more than one method: INVOKECHAINLOOSE publishes the chain
+    /// state a body needs for CALL-NEXT-METHOD either way. Requiring exactly one was a
+    /// restriction, not a safety condition -- and it meant a generic function paid 32 B
+    /// on every call as soon as a second method became applicable, which is what any
+    /// class hierarchy with a specialized method looks like.</summary>
+    public bool PlainPrimaryChain;
+    /// <summary>The same chain with :before and/or :after around it and no :around --
+    /// also runnable without materialising an arguments array. Mutually exclusive with
+    /// <see cref="PlainPrimaryChain"/>.</summary>
+    public bool PrimaryChainWithBeforeAfter;
 
-    /// <summary>Set SINGLEPRIMARY from the fields the cache-store path has just
+    /// <summary>Set the two shape flags from the fields the cache-store path has just
     /// filled. Called there, after the entry is complete.</summary>
-    public void ComputeSinglePrimary()
+    public void ComputePlainPrimaryChain()
     {
-        SinglePrimary = Around.Count == 0 && Before.Count == 0 && After.Count == 0
-                            && Primary.Count == 1
+        PlainPrimaryChain = Around.Count == 0 && Before.Count == 0 && After.Count == 0
+                            && Primary.Count >= 1
                             && !HasEqlSpecializers && !IsBuiltinCombination
                             && ReaderSlotIndex < 0 && WriterSlotIndex < 0;
-        // The same shape with :before and/or :after methods around the single
-        // primary. Those run for effect, before and after it, on the same
-        // arguments -- no next-method chain reaches them -- so the loose-argument
-        // path can run the whole combination without ever building the array.
+        // The same shape with :before and/or :after methods around the primary
+        // chain. Those run for effect, before and after it, on the same arguments
+        // -- no next-method chain reaches them -- so the loose-argument path can
+        // run the whole combination without ever building the array.
         // Worth separating because ONE :after method used to cost 32 B on every
         // call to the generic function, and (defmethod initialize-instance :after
         // ...) is an ordinary thing to write.
-        SinglePrimaryWithBeforeAfter = !SinglePrimary
+        PrimaryChainWithBeforeAfter = !PlainPrimaryChain
                             && Around.Count == 0
-                            && Primary.Count == 1
+                            && Primary.Count >= 1
                             && !HasEqlSpecializers && !IsBuiltinCombination
                             && ReaderSlotIndex < 0 && WriterSlotIndex < 0;
     }
@@ -753,9 +857,31 @@ public sealed class WriterCache
     }
 }
 
+/// <summary>A method combination metaobject. AMOP has FIND-METHOD-COMBINATION
+/// return one of these and GENERIC-FUNCTION-METHOD-COMBINATION hand it back;
+/// dotcl decides the combination from a symbol plus its arguments, so this is a
+/// thin record of exactly that, carrying no behaviour of its own. It exists
+/// because closer-mop and portable metaobject code test the result with
+/// (typep x 'method-combination), which a bare symbol fails.</summary>
+public sealed class MethodCombinationObject : LispObject
+{
+    /// <summary>The method combination type name, e.g. STANDARD, PROGN, +.</summary>
+    public Symbol TypeName { get; }
+    /// <summary>The options the combination was found with, as a list.</summary>
+    public LispObject Options { get; }
+
+    public MethodCombinationObject(Symbol typeName, LispObject options)
+    {
+        TypeName = typeName;
+        Options = options;
+    }
+
+    public override string ToString() => $"#<METHOD-COMBINATION {TypeName.Name}>";
+}
+
 public class GenericFunction : LispFunction
 {
-    public new Symbol Name { get; }
+    public new Symbol Name { get; internal set; }
 
     // Method list is copy-on-write for thread safety: dispatch reads an
     // immutable snapshot (the `Methods` property returns the current array, which
@@ -775,10 +901,32 @@ public class GenericFunction : LispFunction
     /// <summary>Publish a new method array (volatile write). Call under MethodsLock.</summary>
     internal void ReplaceMethods(LispMethod[] methods) => _methods = methods;
     public LispFunction? DispatchFunction { get; set; }
+
+    /// <summary>Whether this generic function's invocation goes through
+    /// COMPUTE-APPLICABLE-METHODS and friends, i.e. whether a method on one of those
+    /// applies to it. Null until asked; cleared for every generic function when a
+    /// method is added to or removed from one of the protocol generic functions.</summary>
+    public bool? UsesInvocationProtocol { get; set; }
+
+    /// <summary>Slots added by a user-defined generic function class. A generic
+    /// function is callable, so it cannot also be a LispInstance and carry a slot
+    /// vector; this is the same escape hatch LispClass and SlotDefinition use for
+    /// metaobjects whose class declares slots. Null until one is written.</summary>
+    public System.Collections.Concurrent.ConcurrentDictionary<string, LispObject?>? ExtraSlots;
+
+    /// <summary>Atomically obtain the ExtraSlots table, creating it on first use.</summary>
+    public System.Collections.Concurrent.ConcurrentDictionary<string, LispObject?> EnsureExtraSlots()
+        => ExtraSlots ?? System.Threading.Interlocked.CompareExchange(
+               ref ExtraSlots, new(), null) ?? ExtraSlots;
     /// <summary>Method combination type: null means STANDARD, otherwise the operator symbol (+, LIST, APPEND, etc.)</summary>
     public Symbol? MethodCombination { get; set; }
     /// <summary>Method combination arguments from defgeneric (:method-combination name arg1 arg2 ...)</summary>
     public LispObject[]? MethodCombinationArgs { get; set; }
+    /// <summary>Declarations for the generic function, as a list. AMOP passes
+    /// them with the :DECLARATIONS initarg and reads them back with
+    /// GENERIC-FUNCTION-DECLARATIONS; ANSI DEFGENERIC spells the same thing
+    /// (declare ...), and both land here. NIL when none were given.</summary>
+    public LispObject Declarations { get; set; } = Nil.Instance;
     /// <summary>:argument-precedence-order as a permutation of required-parameter
     /// indices (CLHS 7.6.6.1.2). null means natural left-to-right order.</summary>
     public int[]? ArgumentPrecedenceOrder { get; set; }

@@ -453,15 +453,21 @@
   t)
 
 (deftest mop/method-specializers-eql
-  ;; AMOP: eql specializer method should return an eql-specializer metaobject.
-  ;; dotcl: stores eql specializers as (EQL value) cons cells instead.
-  ;; Test documents current representation.
+  ;; AMOP: an EQL specializer is a metaobject, not a list. It used to be an
+  ;; (EQL value) cons here; the test asserted that and so went red when the
+  ;; representation was fixed. What it should check is what its own TODO said:
+  ;; the specializer is of type EQL-SPECIALIZER, and it is interned, so asking
+  ;; for the same object twice gives the same metaobject.
   (let ((eql-m (find-if (lambda (m)
                            (let ((s (first (dotcl-mop:method-specializers m))))
                              (and (null (dotcl-mop:method-qualifiers m))
-                                  (and (consp s) (eq (car s) 'eql)))))
+                                  (typep s 'dotcl-mop:eql-specializer))))
                          (dotcl-mop:generic-function-methods #'mop/gf-eql))))
-    (notnot eql-m))            ; TODO: s should be typep 'eql-specializer per AMOP
+    (and eql-m
+         (let ((s (first (dotcl-mop:method-specializers eql-m))))
+           (and (eql (dotcl-mop:eql-specializer-object s) 42)
+                (eq s (dotcl-mop:intern-eql-specializer 42))
+                t))))
   t)
 
 ;;; ============================================================

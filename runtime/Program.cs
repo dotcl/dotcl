@@ -36,6 +36,30 @@ class Program
             throw threadException;
     }
 
+    // Global options that take a value, so a scan for the subcommand has to step
+    // over two tokens rather than one. Kept next to the flag list below because
+    // the two are read together and drift apart silently otherwise.
+    static readonly string[] _globalsWithValue =
+        { "--core", "--asm", "--load", "--eval", "--asd-search-path", "--completion" };
+    static readonly string[] _globalFlags =
+        { "--no-init", "--readline", "--no-readline", "--help", "--version" };
+
+    /// <summary>Index of the first argument that is not a global option (nor the
+    /// value of one), or -1 if there is none. Stops at anything unrecognised, so
+    /// an unknown flag is left to the ordinary path exactly as before.</summary>
+    static int FirstNonGlobalArg(string[] args)
+    {
+        for (int i = 0; i < args.Length; i++)
+        {
+            var a = args[i];
+            if (_globalsWithValue.Contains(a)) { i++; continue; }   // skip its value too
+            if (_globalFlags.Contains(a)) continue;
+            if (a.StartsWith("--")) return -1;                      // unknown flag: leave it alone
+            return i;
+        }
+        return -1;
+    }
+
     // True when the REPL is active — CancelKeyPress delivers interrupt instead of killing process.
     // volatile: read from the SIGINT signal handler, which runs on another thread.
     static volatile bool _replMode = false;
@@ -171,16 +195,16 @@ class Program
             Console.WriteLine(@"dotcl [options] [script-file [arguments...]]
 
 Usage:
-  dotcl                        Start a REPL
+  dotcl repl                   Start a REPL
   dotcl file.lisp [args...]    Run file.lisp as a script, then exit
-  dotcl --load file.lisp       Load file.lisp and continue in the REPL
+  dotcl --load file.lisp       Load file.lisp, then exit
   dotcl --eval ""(+ 1 2)""       Evaluate an expression, then exit
 
 Options:
   --help                       Display this message
   --version                    Display version information
   --core <file>                Use specified core file
-  --load <file>                Load a file (REPL continues unless an action exits)
+  --load <file>                Load a file, then exit (add `repl` to stay)
   --eval <expr>                Evaluate an expression
   --no-init                    Skip loading the user init file (REPL/--eval/--load)
   --readline / --no-readline   Force the line-editing REPL on / off
@@ -191,7 +215,9 @@ Options:
                                after asdf loads (repeatable)
 
 Subcommands:
-  repl                         Start REPL (even with --load/--eval)
+  repl                         Start a REPL, or stay in one when --load /
+                               --eval are done. Must come before a script file:
+                               after one it is that script's argument
   clean                        Remove the shared ASDF compile cache
                                (one directory per dotcl build under
                                <cache-home>/common-lisp/; a project's own
@@ -238,8 +264,19 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
         // `clean` subcommand: empty the shared ASDF compile cache. Handled here,
         // before the core loads, because a broken cache is exactly what stops the
         // core from loading -- cleaning must not depend on what it is fixing.
-        if (!hasUserFasl && args.Length > 0 && args[0] == "clean")
+        //
+        // Found by skipping the global options rather than by looking at args[0]:
+        // with a global in front, `dotcl --core x.core clean` used to fall through
+        // to the ordinary path, where `clean` is not a flag, so it was taken as a
+        // script name and reported as "LOAD: file not found: .../clean". --help,
+        // --version and pack are all position-independent already; this is the
+        // odd one out. Scanning stops at the first token that is neither a known
+        // global nor its value, so an unknown flag leaves the behaviour exactly
+        // as it was (see the separate question of rejecting unknown flags).
+        int cleanIdx = FirstNonGlobalArg(args);
+        if (!hasUserFasl && cleanIdx >= 0 && args[cleanIdx] == "clean")
         {
+            args = args.Skip(cleanIdx).ToArray();
             bool cleanDryRun = args.Contains("--dry-run");
             bool cleanVerbose = args.Contains("--verbose");
             string? keepPrefix = null;
@@ -299,12 +336,9 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
             try
             {
                 RunCore(args[1]);
-                bool replMode = false;
                 for (int i = 2; i < args.Length; i++)
                 {
-                    if (args[i] == "--repl")
-                        replMode = true;
-                    else if (args[i] == "--eval" && i + 1 < args.Length)
+                    if (args[i] == "--eval" && i + 1 < args.Length)
                     {
                         i++;
                         var reader = new Reader(new StringReader(args[i]));
@@ -326,11 +360,6 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
                     else
                         Runtime.Load(new LispObject[] { new LispString(args[i]) });
                 }
-                if (replMode)
-                {
-                    RunRepl();
-                    return;
-                }
             }
             catch (LispSourceException lse)
             {
@@ -346,7 +375,8 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
         }
 
 
-        // New-style invocation: auto-discover (or --core override) + optional scripts + REPL
+        // New-style invocation: auto-discover (or --core override) + optional scripts,
+        // and the REPL when the `repl` subcommand asks for it
         // Supports --load <file> (SBCL-compatible) and --eval <expr> interleaved with scripts.
         var rest = new List<string>(args);
         string? coreOverride = null;
@@ -458,18 +488,21 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
             }
         }
 
-        // Extract "repl" subcommand
+        // Extract the `repl` subcommand -- but only where a subcommand can be, which
+        // is the first argument that is not a global option or a global's value. Once
+        // a file has been named, everything after it belongs to that script, `repl`
+        // included: a script has to be able to receive any argument, and a word that
+        // the launcher quietly takes for itself is a trap for whatever invokes it.
+        // "Run this and then leave me in the REPL" is spelled `--load file repl`,
+        // where the file is dotcl's instruction rather than the program.
         bool explicitRepl = false;
         if (!hasUserFasl)
         {
-            for (int i = 0; i < rest.Count; i++)
+            int at = FirstNonGlobalArg(rest.ToArray());
+            if (at >= 0 && rest[at] == "repl")
             {
-                if (rest[i] == "repl")
-                {
-                    explicitRepl = true;
-                    rest.RemoveAt(i);
-                    break;
-                }
+                explicitRepl = true;
+                rest.RemoveAt(at);
             }
         }
 
@@ -509,8 +542,16 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
         List<string> positionalArgv = new();
         for (int i = 0; i < rest.Count; i++)
         {
-            if ((rest[i] == "--load" || rest[i] == "--eval") && i + 1 < rest.Count)
+            if (rest[i] == "--load" || rest[i] == "--eval")
             {
+                // A value-taking option with nothing after it used to fall
+                // through and be dropped, so `dotcl --eval` did nothing and then
+                // looked like an ordinary start.
+                if (i + 1 >= rest.Count)
+                {
+                    Console.Error.WriteLine($"dotcl: {rest[i]} requires an argument");
+                    Environment.Exit(2);
+                }
                 actions.Add((rest[i][2..], rest[i + 1]));
                 i++;
             }
@@ -519,6 +560,20 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
                 positionalScript = rest[i];
                 positionalArgv = rest.GetRange(i + 1, rest.Count - (i + 1));
                 break;
+            }
+            else
+            {
+                // Anything else starting with '-' reached here without matching a
+                // known option: it was silently discarded, which turned a typo
+                // (`--evla '(princ 1)'`) into a run that did nothing. Arguments
+                // meant for a script are not affected -- the loop stops at the
+                // script name above, and everything after it is the script's.
+                // The build/pack subcommands parse their own options in their own
+                // loops and never reach this one, so the MSBuild integration is
+                // out of scope here.
+                Console.Error.WriteLine($"dotcl: unknown option '{rest[i]}'");
+                Console.Error.WriteLine("  dotcl --help for usage");
+                Environment.Exit(2);
             }
         }
         bool scriptMode = positionalScript != null;
@@ -664,6 +719,16 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
                 if (Startup.DebugStacktrace) Console.Error.WriteLine(ex.StackTrace);
                 Environment.Exit(1);
             }
+            // Reachable only as `dotcl repl file.lisp`, where the subcommand comes
+            // before the file: after the file, `repl` is one of the file's arguments.
+            // Returning without honouring it would drop the word on the floor.
+            if (explicitRepl)
+            {
+                bool enableReadlineAfterScript = readlinePref ?? !Console.IsInputRedirected;
+                if (enableReadlineAfterScript && Startup.ReadlineHook == null)
+                    TryEnableReadline();
+                RunRepl();
+            }
             return;
         }
 
@@ -721,8 +786,22 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
 
         ProfileMark("actions");
 
-        // REPL if: explicit "repl" subcommand, or no actions.
-        if (explicitRepl || scripts.Count == 0)
+        // REPL only when asked for it. The `repl` subcommand exists precisely so
+        // that entering the REPL is a thing you say, not a thing that happens
+        // when nothing else matched -- an invocation whose arguments were not
+        // understood should not look like a successful start. Dropping into the
+        // REPL on an empty action list is what made a mistyped flag
+        // (`dotcl --evla '(...)'`) read as a normal REPL start.
+        if (!explicitRepl && scripts.Count == 0 && positionalScript == null)
+        {
+            Console.Error.WriteLine("dotcl: nothing to do.");
+            Console.Error.WriteLine("  dotcl repl                 Start a REPL");
+            Console.Error.WriteLine("  dotcl <file> [args...]     Run a script");
+            Console.Error.WriteLine("  dotcl --eval \"<form>\"      Evaluate a form");
+            Console.Error.WriteLine("  dotcl --help               Full usage");
+            Environment.Exit(2);
+        }
+        if (explicitRepl)
         {
             // Auto-enable the line-editing REPL (dotcl-repl) unless overridden.
             // Default: on for an interactive console, off when stdin is piped /

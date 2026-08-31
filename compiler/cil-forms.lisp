@@ -110,15 +110,42 @@
         (append (butlast instrs 1) '((:tail-prefix)) (list last))
         instrs)))
 
+(defun %conditional-arms (form)
+  "(test then [else]) for FORM when it is an IF / WHEN / UNLESS, else NIL.
+   WHEN and UNLESS are lowered here the same way their handlers lower them."
+  (case (car form)
+    (if (when (<= 3 (length form) 4) (cdr form)))
+    (when (when (>= (length form) 2)
+            (list (cadr form) (cons 'progn (cddr form)))))
+    (unless (when (>= (length form) 2)
+              (list (cadr form) nil (cons 'progn (cddr form)))))))
+
 (defun compile-and-pop (form)
   "Compile FORM for effect. Uses void call variants when available to avoid allocation.
    Returns CIL instructions without (:pop) if a void variant was used."
-  (if (and (consp form)
-           (eq (car form) 'vector-push-extend)
-           (= (length (cdr form)) 2))
+  (let ((op (and (consp form) (symbolp (car form)) (car form))))
+    (cond
       ;; Direct vector-push-extend in for-effect position: use void variant (no Fixnum.Make)
-      (compile-binary-call (cdr form) "Runtime.VectorPushExtendVoid2")
-      `(,@(compile-expr form) (:pop))))
+      ((and (eq op 'vector-push-extend) (= (length (cdr form)) 2))
+       (compile-binary-call (cdr form) "Runtime.VectorPushExtendVoid2"))
+      ;; A conditional whose value is discarded compiles its arms for effect too.
+      ;; Otherwise both arms must leave a value at the branch merge, and an arm
+      ;; that assigns to a native-slot variable boxes it to do so -- for a value
+      ;; nobody reads. (SETQ inside a WHEN in a loop body is the shape where this
+      ;; costs the most: one box an iteration.)
+      ((and op (member op '(if when unless))
+            (not (macrolet-shadowed-p op))
+            (not (local-function-entry op))
+            (%conditional-arms form))
+       (compile-if (%conditional-arms form) t))
+      ;; Every form of a discarded PROGN is discarded, the last one included.
+      ;; Without this the arms above stop here, since WHEN's body arrives wrapped
+      ;; in one.
+      ((and (eq op 'progn)
+            (not (macrolet-shadowed-p op))
+            (not (local-function-entry op)))
+       (loop for sub in (cdr form) append (compile-and-pop sub)))
+      (t `(,@(compile-expr form) (:pop))))))
 
 ;;; ============================================================
 ;;; Named function call (user-defined)
@@ -408,7 +435,20 @@
     (if local-fn
         ;; Local function (flet/labels): load from local or box, cast, invoke
         (let ((key (second local-fn))
-              (boxed-p (third local-fn)))
+              (boxed-p (third local-fn))
+              (caps (fourth local-fn)))
+          ;; Capture-lifted function (see %LIFT-CAPTURES): the variables its body
+          ;; used to close over are passed as trailing arguments. Only legal while
+          ;; each one still resolves to the SLOT it had where the FLET was written
+          ;; -- a shadowing binding, or a call from inside a nested closure that
+          ;; captured its own copy, gives a different slot, and then the lifted
+          ;; compile is abandoned for the ordinary closure path.
+          (when caps
+            (dolist (c caps)
+              (unless (eq (lookup-local (car c)) (cdr c))
+                (throw (%lift-capture-tag local-fn) :lift-aborted)))
+            (setq args (append args (mapcar #'car caps))
+                  n-args (length args)))
           (if (<= n-args 8)
               ;; Direct invoke for small arg count (0-8 args, no array allocation)
               (let* ((da (compile-direct-call-args args))
@@ -503,12 +543,17 @@
               (or (eql (second cond-expr) 0) (eql (third cond-expr) 0)))
          (let ((non-zero-arg (if (eql (second cond-expr) 0) (third cond-expr) (second cond-expr))))
            (list :unary "Runtime.IsTrueZerop" (list non-zero-arg))))
-        ;; Double-float-typed fast path: both args statically double-float →
-        ;; native r8 compare. Emitted as compile-double-cmp.
+        ;; Float-typed fast path: both args statically float → native r8 compare.
+        ;; Emitted as compile-double-cmp, which widens a single-float operand.
+        ;;
+        ;; Mixing formats is the ordinary case, not an exotic one: a literal like
+        ;; 4.0 reads as a single float, so (> (abs z) 4.0) on a double had one
+        ;; operand of each format and fell off this path entirely -- the double
+        ;; got boxed and the comparison went through the generic entry.
         ((and (= nargs 2)
               (member op '(< > <= >= = /=))
-              (double-float-typed-p (first args))
-              (double-float-typed-p (second args)))
+              (float-typed-p (first args))
+              (float-typed-p (second args)))
          (list :double-cmp
                (ecase op (< :lt) (> :gt) (<= :le) (>= :ge) (= :eq) (/= :ne))
                args))
@@ -654,11 +699,30 @@
          (:call "MultipleValues.Reset")
          (,(if branch-on-true :brtrue :brfalse) ,label))))))
 
-(defun compile-if (args)
+(defun compile-if (args &optional for-effect)
+  "Compile (IF test then [else]).
+   FOR-EFFECT: the value is discarded, so compile each arm for effect too and
+   emit nothing where a missing ELSE would have produced NIL. Otherwise both arms
+   have to leave a value at the branch merge, and an arm that assigns to a
+   native-slot variable boxes it to do so -- for a value nobody reads. A SETQ
+   inside a WHEN in a loop body is where that costs the most."
   (let ((else-label (gen-label "ELSE"))
         (end-label (gen-label "END"))
         (cond-expr (first args))
         (fused-method nil))
+   (flet ((then-arm ()
+            (if for-effect
+                (let ((*in-tail-position* nil) (*in-mv-context* nil))
+                  (compile-and-pop (second args)))
+                (compile-expr (second args))))
+          (else-arm ()
+            (cond ((third args)
+                   (if for-effect
+                       (let ((*in-tail-position* nil) (*in-mv-context* nil))
+                         (compile-and-pop (third args)))
+                       (compile-expr (third args))))
+                  (for-effect (quote ()))
+                  (t (let ((*in-tail-position* nil)) (emit-nil))))))
     ;; Check for fused comparison+branch optimization
     (cond
       ;; Fused comparison: skip IsTruthy (still reset MV)
@@ -671,23 +735,19 @@
                (:sym-eq (compile-sym-eq (third fused-method)))
                (:double-cmp (compile-double-cmp (third fused-method) (second fused-method)))))
          (:brfalse ,else-label)
-         ,@(compile-expr (second args))
+         ,@(then-arm)
          (:br ,end-label)
          (:label ,else-label)
-         ,@(if (third args)
-               (compile-expr (third args))
-               (let ((*in-tail-position* nil)) (emit-nil)))
+         ,@(else-arm)
          (:label ,end-label)))
       ;; (if (and ...) then else): chain brfalse to else for each condition
       ((and (consp cond-expr) (eq (car cond-expr) 'and) (cddr cond-expr))
        `(,@(loop for sub in (cdr cond-expr)
                  append (compile-boolean-branch sub else-label nil))
-         ,@(compile-expr (second args))
+         ,@(then-arm)
          (:br ,end-label)
          (:label ,else-label)
-         ,@(if (third args)
-               (compile-expr (third args))
-               (let ((*in-tail-position* nil)) (emit-nil)))
+         ,@(else-arm)
          (:label ,end-label)))
       ;; (if (or ...) then else): chain brtrue to then for each, fall through to else
       ((and (consp cond-expr) (eq (car cond-expr) 'or) (cddr cond-expr))
@@ -698,12 +758,10 @@
                    else
                      append (compile-boolean-branch sub else-label nil))
            (:label ,or-true)
-           ,@(compile-expr (second args))
+           ,@(then-arm)
            (:br ,end-label)
            (:label ,else-label)
-           ,@(if (third args)
-                 (compile-expr (third args))
-                 (let ((*in-tail-position* nil)) (emit-nil)))
+           ,@(else-arm)
            (:label ,end-label))))
       ;; Fused (not x) / (null x): negate the branch
       ((and (consp cond-expr)
@@ -721,24 +779,20 @@
                      (:sym-eq (compile-sym-eq (third inner-fused)))
                      (:double-cmp (compile-double-cmp (third inner-fused) (second inner-fused)))))
                (:brtrue ,else-label)  ;; Negate: branch to else when TRUE
-               ,@(compile-expr (second args))
+               ,@(then-arm)
                (:br ,end-label)
                (:label ,else-label)
-               ,@(if (third args)
-                     (compile-expr (third args))
-                     (let ((*in-tail-position* nil)) (emit-nil)))
+               ,@(else-arm)
                (:label ,end-label))
              ;; Default: IsTruthy + negate
              `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr (cadr cond-expr)))
                (:call "Runtime.IsTruthy")
                (:call "MultipleValues.Reset")
                (:brtrue ,else-label)  ;; Negate: branch to else when TRUE (meaning (not x) is false)
-               ,@(compile-expr (second args))
+               ,@(then-arm)
                (:br ,end-label)
                (:label ,else-label)
-               ,@(if (third args)
-                     (compile-expr (third args))
-                     (let ((*in-tail-position* nil)) (emit-nil)))
+               ,@(else-arm)
                (:label ,end-label)))))
       ;; Default: general condition
       (t
@@ -746,13 +800,11 @@
          (:call "Runtime.IsTruthy")
          (:call "MultipleValues.Reset")
          (:brfalse ,else-label)
-         ,@(compile-expr (second args))
+         ,@(then-arm)
          (:br ,end-label)
          (:label ,else-label)
-         ,@(if (third args)
-               (compile-expr (third args))
-               (let ((*in-tail-position* nil)) (emit-nil)))
-         (:label ,end-label))))))
+         ,@(else-arm)
+         (:label ,end-label)))))))
 
 ;;; ============================================================
 ;;; progn
@@ -1170,6 +1222,29 @@
         (finish-output *error-output*))))
   result)
 
+(defun %declares-special-p (body names)
+  "T when BODY declares any of NAMES special.
+
+   A parameter the direct entry binds with a LET* instead of receiving as a real
+   parameter loses a SPECIAL declaration: the declaration sits at the head of the
+   body, inside the implicit block, so the LET* never sees it and binds the name
+   lexically. The array XEP binds it dynamically. Rather than reconstruct the
+   declaration in the right place, such a function simply does not get a direct
+   entry -- it is rare, and the XEP is correct.
+
+   BODY may be the implicit-block wrapper, so a leading BLOCK is looked through."
+  (let ((forms (if (and (consp body) (null (cdr body))
+                        (consp (car body)) (eq (caar body) 'block))
+                   (cddr (car body))
+                   body)))
+    (dolist (f forms nil)
+      (unless (and (consp f) (eq (car f) 'declare)) (return nil))
+      (dolist (d (cdr f))
+        (when (and (consp d) (eq (car d) 'special))
+          (dolist (v (cdr d))
+            (when (member (var-name v) names :test #'string=)
+              (return-from %declares-special-p t))))))))
+
 (defun %optional-direct-eligible-p (required optional has-key-p rest-param aux)
   "T if a required+&optional function can carry typed direct delegates for its
    concrete arities in addition to the array XEP. Requires: at least one optional,
@@ -1181,6 +1256,85 @@
   (and optional (not has-key-p) (null rest-param) (null aux)
        (<= (+ (length required) (length optional)) 8)
        (every (lambda (o) (null (third o))) optional)))   ; no supplied-p var
+
+(defun %key-direct-eligible-p (required optional key rest-param aux)
+  "T if a required+&key function can carry a typed direct delegate for its
+   required-only arity in addition to the array XEP.
+
+   A variadic LispFunction has one entry, taking LispObject[], so a call builds
+   an array even when it passes no keywords at all -- and that is most calls to
+   a &key function. Requires: at least one key param, no &optional/&rest/&aux,
+   no supplied-p var, and required <= 8 (the direct-delegate arity ceiling).
+   The default forms are unrestricted: an absent key is bound by a LET* in the
+   direct body, which evaluates the form at call time exactly where the array
+   XEP would. A supplied-p var is fine too: on this arity none of them are
+   supplied, so each is bound to NIL."
+  (and key (null optional) (null rest-param) (null aux)
+       (<= (length required) 8)))
+
+(defun %key-binding-forms (key kw-var val-var)
+  "LET* bindings for the key params. When KW-VAR is NIL none are supplied and
+   each takes its default; otherwise the one keyword KW-VAR names takes VAL-VAR
+   and the rest take their defaults. LET* rather than LET: CL binds key defaults
+   in order and a later one may read an earlier parameter."
+  (loop for k in key
+        for kw = (intern (first k) "KEYWORD")
+        append (if kw-var
+                   (if (fourth k)
+                       (list (list (second k) `(if (eq ,kw-var ',kw) ,val-var ,(third k)))
+                             (list (fourth k) `(if (eq ,kw-var ',kw) t nil)))
+                       (list (list (second k) `(if (eq ,kw-var ',kw) ,val-var ,(third k)))))
+                   (if (fourth k)
+                       (list (list (second k) (third k)) (list (fourth k) nil))
+                       (list (list (second k) (third k)))))))
+
+(defun %build-key-direct-body (required key wrapped-body kw-var val-var
+                               &optional allow-other-keys-p fn-name)
+  "The body for one typed arity. With KW-VAR, an unrecognized keyword is
+   signalled before any default runs -- the array entry signals before entering
+   the body, and a default may have a side effect."
+  (declare (ignore required))
+  (let ((bindings (%key-binding-forms key kw-var val-var)))
+    (if kw-var
+        `((unless (or ,@(loop for k in key
+                              collect `(eq ,kw-var ',(intern (first k) "KEYWORD")))
+                      (eq ,kw-var :allow-other-keys)
+                      ,@(when allow-other-keys-p '(t)))
+            (error 'program-error
+                   :format-control "~a: unrecognized keyword argument ~s"
+                   :format-arguments (list ,fn-name ,kw-var)))
+          (let* ,bindings ,@wrapped-body))
+        `((let* ,bindings ,@wrapped-body)))))
+
+(defun %build-key-direct-specs (required key wrapped-body fn-name fn-pkg fn-symbol
+                                allow-other-keys-p implicit-keys-p)
+  "((ARITY SELF-P DIRECT-BODY) ...) for the arities of a &key function that can
+   be typed:
+
+     required            -- no keywords supplied, each key takes its default
+     required + 2        -- exactly one keyword pair, which is the shape most
+                            calls that DO pass a keyword have ((position x l
+                            :test #'eq), (sort l #'< :key #'car), ...)
+
+   The second one keeps a single copy of the body: which key was named is a
+   per-binding IF, not a copy of the body per key. It is only built when every
+   key is an implicit keyword -- an explicit ((:kw var) default) names a symbol
+   whose package the generated comparison would have to reconstruct."
+  (let* ((specs '())
+         (base (%build-key-direct-body required key wrapped-body nil nil)))
+    (multiple-value-bind (body-instrs self-p)
+        (compile-function-body-direct required base fn-name fn-pkg fn-symbol)
+      (push (list (length required) (if self-p t nil) body-instrs) specs))
+    (when (and implicit-keys-p (<= (+ (length required) 2) 8))
+      (let* ((kw-var (gensym "KW")) (val-var (gensym "KVAL"))
+             (params (append required (list kw-var val-var)))
+             (body (%build-key-direct-body required key wrapped-body kw-var val-var
+                                           allow-other-keys-p fn-name)))
+        (multiple-value-bind (body-instrs self-p)
+            (compile-function-body-direct params body fn-name fn-pkg fn-symbol)
+          (push (list (+ (length required) 2) (if self-p t nil) body-instrs) specs))))
+    (nreverse specs)))
+
 
 (defun %build-optional-direct-specs (required optional wrapped-body fn-name fn-pkg fn-symbol)
   "Build ((ARITY DIRECT-BODY) ...) for each concrete arity N in
@@ -1387,7 +1541,7 @@
         (remhash name *inline-defs*)))
   (multiple-value-bind (required optional key rest-param aux allow-other-keys-p has-key-p)
       (parse-lambda-list params)
-    (declare (ignore allow-other-keys-p))
+
     (let* ((param-names (mapcar #'var-name required))
            ;; Every variable the lambda list binds in the body. The analysis
            ;; context below must report ALL of them as bound — not just the
@@ -1535,11 +1689,22 @@
             ;; the fasl path ignores :direct-delegates and stays array-only.
             (t
               (let ((direct-specs
-                      (when (and (symbolp name)
-                                 (%optional-direct-eligible-p required optional has-key-p rest-param aux))
-                        (%build-optional-direct-specs
-                         required optional wrapped-body
-                         (mangle-name name) (cadr pkg-spec) name))))
+                      (when (symbolp name)
+                        (cond
+                          ((and (%optional-direct-eligible-p required optional has-key-p rest-param aux)
+                                (not (%declares-special-p wrapped-body (mapcar #'car optional))))
+                           (%build-optional-direct-specs
+                            required optional wrapped-body
+                            (mangle-name name) (cadr pkg-spec) name))
+                          ;; Same idea for &key: the required-only call is the
+                          ;; one that can be typed, and it is the common one.
+                          ((and (%key-direct-eligible-p required optional key rest-param aux)
+                                (not (%declares-special-p wrapped-body (mapcar #'second key))))
+                           (%build-key-direct-specs
+                            required key wrapped-body
+                            (mangle-name name) (cadr pkg-spec) name
+                            allow-other-keys-p
+                            (every (lambda (k) (null (fifth k))) key)))))))
                 `((:defmethod ,(mangle-name name)
                    ,@pkg-spec
                    ,@(when (debug-frames-off-p wrapped-body) '(:no-frame t))
@@ -2305,6 +2470,18 @@
         (:call "CilAssembler.GetFunctionBySymbol")
         (:stloc ,self-fn-local))))
 
+(defvar *lift-block-tags* nil)
+
+(defun %lift-param-block-tags (params local-keys)
+  "The *BLOCK-TAGS* entries a lifted function gets from its own parameters."
+  (loop for outer in *lift-block-tags*
+        for bname = (car outer)
+        for tag-var = (block-tag-var-name bname)
+        for hit = (find-if (lambda (p) (string= (var-name p) tag-var)) params)
+        when hit
+          collect (cons bname (list (cdr (assoc hit local-keys :test #'eq))
+                                    nil nil nil nil (sixth (cdr outer))))))
+
 (defun compile-function-body-direct (params body &optional (fn-name "") fn-pkg fn-symbol)
   "Compile function body with direct parameter passing (no args array).
    Only for functions with exactly required params, no optional/key/rest.
@@ -2371,7 +2548,9 @@
       (let ((*cstate* (cstate-with *cstate*
                         +cs-locals+ local-keys
                         +cs-boxed-vars+ (params-boxed-vars all-params needs-boxing)
+                        +cs-block-tags+ (%lift-param-block-tags all-params local-keys)
                         +cs-no-safepoint+ (body-declares-safety-0-p body)))
+            (*lift-block-tags* nil)
             (*symbol-macros* (params-shadowed-symbol-macros all-params)))
         (let ((param-instrs
                 ;; Native body: arg0 is the self LispFunction (threaded for
@@ -4112,12 +4291,23 @@
                          needs-boxing)
                  (or (compile-env-boxed-fvs outer-env) '()))
                 +cs-local-functions+
-                (loop for (fn-name fn-key fn-boxed-p) in (compile-env-local-functions outer-env)
+                (loop for outer-fn in (compile-env-local-functions outer-env)
+                      for fn-name = (first outer-fn)
+                      for fn-key = (second outer-fn)
+                      for fn-boxed-p = (third outer-fn)
                       for mangled = (concatenate 'string "__LABELFN_" fn-name)
                       for captured = (or (find mangled free-vars :key #'var-name :test #'string=)
                                          (find fn-name free-vars :key #'var-name :test #'string=))
                       when captured
                       collect (let ((env-entry (assoc captured env-locals :test #'eq)))
+                                ;; A capture-lifted function cannot be reached from
+                                ;; here: its extra parameters name slots of the
+                                ;; ENCLOSING frame, which this closure has not
+                                ;; captured, so a call from inside would pass the
+                                ;; wrong count. Unwind and recompile the FLET the
+                                ;; ordinary way.
+                                (when (fourth outer-fn)
+                                  (throw (%lift-capture-tag outer-fn) :lift-aborted))
                                 (list fn-name (cdr env-entry) fn-boxed-p)))
                 +cs-block-tags+
                 (loop for (bname . binfo) in (compile-env-block-tags outer-env)
@@ -5863,31 +6053,187 @@
                                                                    (cstate-locals)))))
             (compile-progn real-body))))))
 
+;;; --- FLET/LABELS capture lifting ---
+;;;
+;;; A local function that closes over anything builds a LispFunction every time
+;;; control enters its FLET, and a LispFunction is 248 bytes. A local function
+;;; that closes over NOTHING is compiled once as a constant and costs nothing. So
+;;; when the captured variables can be passed as extra arguments instead, the
+;;; local function drops into the constant path and the per-entry allocation goes
+;;; to zero. The captured variable keeps its own name as the extra parameter, so
+;;; the body needs no rewriting -- references to it resolve to the parameter.
+;;;
+;;; This is only valid while every call site can still reach the same BINDING the
+;;; body would have closed over. That is checked at each call site by slot
+;;; identity, not by name: if the variable no longer resolves to the slot it had
+;;; where the FLET was written -- an inner binding shadows it, or the call sits
+;;; inside a nested closure that captured a copy -- the whole lifted compile is
+;;; thrown away and the form is recompiled the ordinary way.
+
+(defun %lift-capture-tag (entry)
+  "The abort tag of a lifted local-function ENTRY, or NIL. Each lifted FLET has
+   its own tag: a call site must unwind to the FLET whose entry it consulted, not
+   to whichever lifted FLET happens to be innermost."
+  (fifth entry))
+
+(defun %liftable-block-tag-p (name)
+  "T when NAME is the synthetic variable of a NAMED block that is in scope here,
+   so passing it as an argument gives the lifted function a working RETURN-FROM.
+
+   BLOCK NIL is excluded. Every LOOP, DO and DOLIST establishes one, so several
+   are in scope at once and the innermost is not the one the local function was
+   written against -- the slot-identity check at the call site then aborts the
+   lift from inside a block whose own compilation is already under way."
+  (and (cstate-block-tags)
+       (find-if (lambda (b)
+                  (and (car b) (string= (block-tag-var-name (car b)) name)))
+                (cstate-block-tags))
+       t))
+
+(defun %lift-captures (params body)
+  "The lexical locals BODY closes over that can be passed as extra required
+   parameters instead, as a list of (SYMBOL . SLOT-KEY), or :NONE when some
+   capture cannot be.
+
+   A capture is liftable only when reading it at a call site is the same as
+   reading it in the closure would have been. Boxed variables are excluded
+   because boxing means the variable is assigned somewhere, so its value at call
+   time and at FLET-entry time can differ. Natively-typed slots (Int64, r8, r4,
+   Decimal) are excluded because passing one as an argument would box it, moving
+   the allocation rather than removing it. Synthetic slots (block tags, tagbody
+   ids, labels cells) are excluded because they are machinery the closure
+   protocol re-establishes from the env, not values the body reads."
+  (let ((caps '()))
+    (dolist (sym (find-free-vars-with-defaults params body) (nreverse caps))
+      (let ((entry (local-entry sym)))
+        (when entry
+          (when (or (boxed-var-p sym)
+                    ;; A synthetic slot -- a block tag, a tagbody id, a labels
+                    ;; cell -- is not a value the body reads. COMPILE-LAMBDA
+                    ;; rebuilds the block/go tables from the captured ENV, and a
+                    ;; lifted function has no env, so a RETURN-FROM out of one
+                    ;; would find no block at all.
+                    (and (%synthetic-capture-name-p (var-name (car entry)))
+                         (not (%liftable-block-tag-p (var-name (car entry)))))
+                    (native-slot-p sym (cstate-long-locals))
+                    (native-slot-p sym (cstate-native-double-locals))
+                    (native-slot-p sym (cstate-native-single-locals))
+                    (native-slot-p sym (cstate-native-decimal-locals)))
+            (return-from %lift-captures :none))
+          (pushnew (cons (car entry) (cdr entry)) caps :key #'cdr))))))
+
+(defun %symbol-only-in-operator-position-p (name forms)
+  "T when the symbol NAME occurs in FORMS only as the operator of a call.
+   Anything else -- #'NAME, NAME as an argument, NAME inside a quoted form's
+   neighbours -- means the function is used as a VALUE, which a lifted function
+   cannot be: its arity no longer matches what it was written with."
+  (labels ((walk (x)
+             (cond ((eq x name) nil)
+                   ((not (consp x)) t)
+                   ((eq (car x) 'quote) t)
+                   ;; A declaration names the function without using its value:
+                   ;; (declare (inline f)) is a hint about calls to F, and
+                   ;; treating it as a value reference would decline every local
+                   ;; function anyone bothered to declare.
+                   ((eq (car x) 'declare) t)
+                   (t (let ((rest (if (eq (car x) name) (cdr x) x)))
+                        (loop
+                          (cond ((null rest) (return t))
+                                ((not (consp rest)) (return (walk rest)))
+                                ((not (walk (car rest))) (return nil))
+                                (t (setq rest (cdr rest)))))))))) 
+    (every #'walk forms)))
+
+(defun %labels-self-free-p (name forms)
+  "T when FORMS -- one LABELS definition.s own body -- never names itself.
+   Such a definition is an FLET: nothing can see the binding the box exists for.
+
+   (RETURN-FROM NAME ...) does not count. It names the implicit BLOCK, not the
+   function, and FLET establishes that block too. Excluding it would decline
+   every local function that returns early, which is most of them."
+  (labels ((walk (x)
+             (cond ((eq x name) nil)
+                   ((not (consp x)) t)
+                   ((and (eq (car x) 'return-from) (eq (cadr x) name))
+                    (walk (cddr x)))
+                   (t (and (walk (car x)) (walk (cdr x)))))))
+    (every #'walk forms)))
+
+(defun %lift-plan (fdef body)
+  "The lift plan for one FLET definition FDEF as (PARAMS CAPS), or NIL.
+   BODY is the FLET body, which decides whether the function is ever used as a
+   value. Only symbol-named, required-only functions qualify, and the lifted
+   arity has to stay inside the direct-call range."
+  (let ((name (car fdef))
+        (params (cadr fdef))
+        (fn-body (cddr fdef)))
+    (and (symbolp name)
+         (labels-required-only-params-p params)
+         (%symbol-only-in-operator-position-p name body)
+         (let ((caps (%lift-captures params fn-body)))
+           (and (consp caps)
+                ;; 8 is where the direct-call entries stop. It used to have to be
+                ;; 6: INVOKE7 and INVOKE8 built the debugger's frame array on
+                ;; every call, which turned lifting into a per-ENTRY saving paid
+                ;; for by a per-CALL cost, and a local function is normally called
+                ;; more than once per entry. Those two entries now skip the array
+                ;; for an anonymous callee, exactly as INVOKE5/INVOKE6 do, so the
+                ;; cost is gone and the trade needs no counting again. Arity 7,
+                ;; eight calls per entry: 2528 B unlifted, 2848 lifted before that
+                ;; fix, 2208 after.
+                (<= (+ (length params) (length caps)) 8)
+                (notany (lambda (c) (member (car c) params :test #'eq)) caps)
+                (list params caps))))))
+
 (defun compile-flet (fn-defs body)
-  "Compile (flet ((name (params) body...) ...) body...)."
+  "Compile (flet ((name (params) body...) ...) body...).
+   Tries the capture-lifting path first (see %LIFT-CAPTURES); a call site that
+   cannot reach the original binding throws back here and the ordinary closure
+   path runs instead."
+  (let ((plans (mapcar (lambda (f) (%lift-plan f body)) fn-defs)))
+    (if (notany #'identity plans)
+        (%compile-flet-1 fn-defs body nil)
+        (let* ((tag (list '#:flet-lift))
+               (result (catch tag (%compile-flet-1 fn-defs body (cons tag plans)))))
+          (if (eq result :lift-aborted)
+              (%compile-flet-1 fn-defs body nil)
+              result)))))
+
+(defun %compile-flet-1 (fn-defs body lift)
+  "One compile of an FLET. LIFT is NIL for the ordinary closure path, or
+   (TAG . PLANS) with one plan per definition (NIL where that definition is not
+   being lifted)."
   (let ((fn-instrs '())
         (new-local-fns '())
-        (new-locals '()))
+        (new-locals '())
+        (tag (car lift))
+        (plans (cdr lift)))
     ;; Compile each function definition in OUTER scope (flet functions can't see each other)
     (dolist (fdef fn-defs)
       (let* ((name (car fdef))
-             (params (cadr fdef))
+             (plan (pop plans))
+             (caps (second plan))
+             ;; The captured variables become extra required parameters, keeping
+             ;; their own names so the body reads them without being rewritten.
+             (params (if plan (append (cadr fdef) (mapcar #'car caps)) (cadr fdef)))
              (fn-body (cddr fdef))
              (name-str (mangle-name name))
              (key (gen-local name-str)))
         ;; Compile the lambda (in current scope, not extended)
         ;; CL spec: flet creates an implicit block named after the function
         ;; For (setf sym) names, use progn instead of block (block requires a symbol)
-        (let ((lambda-instrs (if (and (symbolp name)
-                                      (some (lambda (f) (form-has-return-from-p name f)) fn-body))
-                                 (compile-lambda params `((block ,name ,@fn-body)))
-                                 (compile-lambda params fn-body))))
+        (let ((lambda-instrs
+                (let ((*lift-block-tags* (if plan (cstate-block-tags) nil)))
+                  (if (and (symbolp name)
+                           (some (lambda (f) (form-has-return-from-p name f)) fn-body))
+                      (compile-lambda params `((block ,name ,@fn-body)))
+                      (compile-lambda params fn-body)))))
           (setf fn-instrs
                 (append fn-instrs
                         `((:declare-local ,key "LispObject")
                           ,@lambda-instrs
                           (:stloc ,key))))
-          (push (list name-str key nil) new-local-fns)
+          (push (list name-str key nil (and plan caps) (and plan tag)) new-local-fns)
           ;; Track in *locals* so closures can capture flet functions.
           ;; Use BOTH the plain name and the __LABELFN_ prefix (same key):
           ;; - Plain name: backward compat (#'flet-fn value capture)
@@ -5998,11 +6344,19 @@
    loop for mutual tail call optimization. Otherwise uses boxed closures."
   (let* ((n-fns (length fn-defs))
          (first-arity (and fn-defs (length (cadr (first fn-defs))))))
-    (if (and (>= n-fns 2)
-             (every (lambda (f) (labels-required-only-params-p (cadr f))) fn-defs)
-             (every (lambda (f) (= (length (cadr f)) first-arity)) fn-defs))
-        (compile-labels-mutual-tco fn-defs body first-arity)
-        (compile-labels-boxed fn-defs body))))
+    (cond
+      ;; One function that never names itself is an FLET: nothing can see the
+      ;; binding the box exists for. Routing it there is what lets capture
+      ;; lifting reach it, and the box it drops is an allocation of its own.
+      ((and (= n-fns 1)
+            (symbolp (car (first fn-defs)))
+            (%labels-self-free-p (car (first fn-defs)) (cddr (first fn-defs))))
+       (compile-flet fn-defs body))
+      ((and (>= n-fns 2)
+            (every (lambda (f) (labels-required-only-params-p (cadr f))) fn-defs)
+            (every (lambda (f) (= (length (cadr f)) first-arity)) fn-defs))
+       (compile-labels-mutual-tco fn-defs body first-arity))
+      (t (compile-labels-boxed fn-defs body)))))
 
 (defun compile-labels-boxed (fn-defs body)
   "Compile (labels ...) using boxed closures (no mutual-TCO optimization)."
@@ -7942,9 +8296,10 @@
           `(,@(compile-value-arg (second expr))
             ,@(compile-value-arg (third expr))
             (:call "Runtime.SetSlotDefRawOptions"))))
-  ;; (%slot-def-attrs slotd readers writers type) → slotd
+  ;; (%slot-def-attrs slotd readers writers type initform) -> slotd
   ;; Carries the introspectable slot attributes DEFCLASS parses (reader/writer
-  ;; names, declared type) onto the slot definition.
+  ;; names, declared type, the initform as source, the documentation) onto the
+  ;; slot definition.
   (setf (gethash '%slot-def-attrs h)
         (lambda (expr)
           `(,@(compile-value-arg (second expr))
@@ -7953,6 +8308,15 @@
             ,@(compile-value-arg (fifth expr))
             ,@(compile-value-arg (sixth expr))
             (:call "Runtime.SetSlotDefAttrs"))))
+  ;; (%slot-def-doc slotd documentation) -> slotd
+  ;; Its own call rather than a sixth argument above: a compiled FASL names the
+  ;; runtime method it calls, so widening that signature stops every FASL built
+  ;; before the change from loading.
+  (setf (gethash '%slot-def-doc h)
+        (lambda (expr)
+          `(,@(compile-value-arg (second expr))
+            ,@(compile-value-arg (third expr))
+            (:call "Runtime.SetSlotDefDocumentation"))))
   (setf (gethash '%register-class h) (lambda (expr) (compile-unary-call (cdr expr) "Runtime.RegisterClass")))
   (setf (gethash '%set-class-default-initargs h)
         (lambda (expr)
@@ -8011,9 +8375,13 @@
   (setf (gethash '%method-specializers h) (lambda (expr) (compile-unary-call (cdr expr) "Runtime.MethodSpecializers")))
   (setf (gethash '%method-qualifiers h) (lambda (expr) (compile-unary-call (cdr expr) "Runtime.MethodQualifiers")))
   (setf (gethash '%method-function h) (lambda (expr) (compile-unary-call (cdr expr) "Runtime.MethodFunction")))
-  (setf (gethash 'call-next-method h)
+  (setf (gethash (quote call-next-method) h)
         (lambda (expr)
-          `(,@(compile-args-array (cdr expr)) (:call "Runtime.CallNextMethod"))))
+          ;; No arguments means "the same arguments", which the loose entry can
+          ;; pass along without materialising them into an array.
+          (if (cdr expr)
+              `(,@(compile-args-array (cdr expr)) (:call "Runtime.CallNextMethod"))
+              (quote ((:call "Runtime.CallNextMethodLoose"))))))
   (setf (gethash 'next-method-p h)
         (lambda (expr)
           (if (cdr expr)
@@ -8478,6 +8846,23 @@
         (lambda (expr)
           (let ((args (cdr expr)))
             (if (cddr args)
+                ;; Two lists is the common multi-list shape, and Runtime.Mapcar2
+                ;; takes them as separate arguments: no array for the lists, and
+                ;; none for the cursors MapcarN keeps. The same stack rule as below
+                ;; applies, so the function and both lists go to temps first.
+                (if (null (cdddr args))
+                    (let ((fn-tmp (gen-local "MAPFN"))
+                          (l1-tmp (gen-local "MAPL1"))
+                          (l2-tmp (gen-local "MAPL2")))
+                      `((:declare-local ,fn-tmp "LispObject")
+                        (:declare-local ,l1-tmp "LispObject")
+                        (:declare-local ,l2-tmp "LispObject")
+                        ,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
+                            `(,@(compile-expr (first args)) (:stloc ,fn-tmp)
+                              ,@(compile-expr (second args)) (:stloc ,l1-tmp)
+                              ,@(compile-expr (third args)) (:stloc ,l2-tmp)))
+                        (:ldloc ,fn-tmp) (:ldloc ,l1-tmp) (:ldloc ,l2-tmp)
+                        (:call "Runtime.Mapcar2")))
                 ;; Multi-list MAPCAR. Evaluate the function into a temp FIRST so the
                 ;; stack is empty before compile-args-array compiles the list args.
                 ;; Leaving the function value on the stack while a list arg expands
@@ -8499,7 +8884,7 @@
                     (:stloc ,arr-tmp)
                     (:ldloc ,fn-tmp)
                     (:ldloc ,arr-tmp)
-                    (:call "Runtime.MapcarN")))
+                    (:call "Runtime.MapcarN"))))
                 (compile-binary-call args "Runtime.Mapcar")))))
 
   ;; Property list
@@ -8570,6 +8955,26 @@
             (:call "MultipleValues.CaptureForBind"))))
   (setf (gethash '%mv-nth h)
         (lambda (expr) (compile-unary-call (cdr expr) "MultipleValues.BindNth")))
+  ;; (NTH-VALUE n form) with a literal N reads the value straight out of what
+  ;; FORM returned. The macro expansion it otherwise takes is
+  ;; (NTH n (MULTIPLE-VALUE-LIST form)), which builds the whole list of values to
+  ;; hand back one of them -- three conses to read value 1 of three. A computed
+  ;; index still goes through the macro.
+  (setf (gethash 'nth-value h)
+        (lambda (expr)
+          (let ((n (cadr expr))
+                (form (caddr expr)))
+            (if (and (integerp n) (<= 0 n))
+                `((:call "MultipleValues.Reset")
+                  ;; Same shape as MULTIPLE-VALUE-LIST below: keep MV context so
+                  ;; the values survive, block tail so a self-tail-call argument
+                  ;; does not TCO past the read.
+                  ,@(let ((*in-tail-position* nil) (*in-mv-context* t))
+                      (compile-expr form))
+                  (:ldc-i4 ,n)
+                  (:call "Runtime.NthValueOf"))
+                (compile-expr `(nth ,n (multiple-value-list ,form)))))))
+
   (setf (gethash 'multiple-value-list h)
         (lambda (expr)
           `((:call "MultipleValues.Reset")

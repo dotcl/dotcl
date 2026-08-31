@@ -539,6 +539,28 @@ interop の境界など深くなる経路で残スタックを事前に測り
 ような stack frame キャプチャによる restart 表現ではなく、明示的な
 struct stack を持つ。
 
+#### Lisp と CLR の境界での振る舞い
+
+condition と .NET 例外は同じ機構に乗っているので、境界を越えるときの
+規則は「変換」ではなく「どちらの捕まえ方が効くか」で決まる。
+
+| 経路 | 振る舞い |
+| --- | --- |
+| Lisp → .NET 呼び出しで .NET 例外 | `handler-case` が raw 例外をそのまま捕まえる。`dotnet:new` は `TargetInvocationException` の inner を剥がす。socket I/O のように意味が対応するものは `STREAM-ERROR` 等へ寄せてある |
+| .NET → Lisp コールバックから condition が脱出 | `LispErrorException` として C# 側へ透過する。境界でハンドラクラスタを積むので、対話デバッガに落ちることはない。`storage-condition` だけは境界で封じ込める |
+| REPL のトップレベル | デバッガと restart が出る |
+| Lisp が main の実行ファイル | 利用者が `handler-case` を書く。既定のトップレベルハンドラは置いていない |
+| 深い再帰・スタック枯渇 | 上記のとおり `storage-condition` 化 |
+| スレッド | ハンドラクラスタもリスタートもスレッドごと。ワーカースレッドには abort リスタートが無い |
+| 割り込み | Ctrl+C は `INTERACTIVE-INTERRUPT` として配送する |
+
+**コールバック境界の既定は「透過」で、切り替えの設定は用意しない。**
+ホスト側 (ASP.NET Core のような) は例外を受け取れば自分の作法で扱う —
+実測では Lisp のエラーが 500 になり、サーバは生き続ける。ログして
+コールバックだけ中断する、その場でデバッガに入る、といった選択肢を
+設定として持たせることもできるが、それを必要とする具体的な用途が
+まだ 1 つも出ていないため、契約を増やさない側に倒している。
+
 ### 3.12 CLOS / MOP
 
 **データ表現**: `LispClass` (Symbol Name, DirectSlots, CPL array,

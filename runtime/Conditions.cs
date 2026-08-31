@@ -614,11 +614,30 @@ public static class ConditionSystem
     /// the periodic check in LispFunction.Invoke — can still be stopped by
     /// Ctrl-C. Bodies declared (optimize (safety 0)) opt out at compile time.
     /// </summary>
+    /// The two branches below are what makes this method inlinable, and it has to
+    /// be: it sits on the back edge of every loop, so a real call there is a
+    /// barrier the JIT cannot see through. In a loop that chases pointers -- the
+    /// shape of every list traversal -- that barrier stops the processor
+    /// overlapping the dependent loads, and the poll cost 7 ns an element rather
+    /// than the nothing it costs when inlined. Everything that can allocate,
+    /// throw or call is in PollInterruptSlow.
+    [System.Runtime.CompilerServices.MethodImpl(
+        System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
     public static void PollInterrupt()
     {
         PollCount++;
         // Tier 2: INTERRUPT-THREAD functions queued for this thread run here.
         // The counter gate keeps the common case to one volatile static read.
+        if (System.Threading.Volatile.Read(ref Runtime.SafepointInterruptsPending) != 0
+            || _interruptRequested)
+            PollInterruptSlow();
+    }
+
+    /// <summary>The safepoint's work, on the rare path where there is any.</summary>
+    [System.Runtime.CompilerServices.MethodImpl(
+        System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static void PollInterruptSlow()
+    {
         if (System.Threading.Volatile.Read(ref Runtime.SafepointInterruptsPending) != 0)
             Runtime.RunPendingInterruptsAtSafepoint();
         if (!_interruptRequested) return;

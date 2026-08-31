@@ -844,15 +844,27 @@ public static partial class Runtime
     /// </summary>
     private static void UseAsdfSourceLoadingWithoutCompiler()
     {
+        // A REQUIRE-SYSTEM is exempt: it has no source to load -- its LOAD-OP just
+        // calls REQUIRE, which is how dotcl's own contribs are reached, and REQUIRE
+        // finds a prebuilt fasl. Sending those through LOAD-SOURCE-OP silently did
+        // nothing (that operation has no method for the class), so the contrib never
+        // loaded and the failure surfaced later as a missing package.
         const string form = @"
 (unless (find :dotcl-emit *features*)
   (let ((ls (find-symbol ""LOAD-SYSTEM"" ""ASDF""))
         (op (find-symbol ""OPERATE"" ""ASDF""))
-        (src (find-symbol ""LOAD-SOURCE-OP"" ""ASDF"")))
+        (src (find-symbol ""LOAD-SOURCE-OP"" ""ASDF""))
+        (load-op (find-symbol ""LOAD-OP"" ""ASDF""))
+        (finder (find-symbol ""FIND-SYSTEM"" ""ASDF""))
+        (reqsys (find-symbol ""REQUIRE-SYSTEM"" ""ASDF"")))
     (when (and ls op src (fboundp op))
       (setf (fdefinition ls)
             (lambda (system &rest keys)
-              (apply (fdefinition op) src system keys)
+              (let ((found (and finder reqsys (fboundp finder)
+                                (ignore-errors (funcall (fdefinition finder) system)))))
+                (apply (fdefinition op)
+                       (if (and found (typep found reqsys)) load-op src)
+                       system keys))
               t)))))";
         try
         {

@@ -7,7 +7,7 @@ DOTCL_LISP ?= ros -L sbcl-bin run
 STDBUF ?=
 SETSID ?= $(shell which setsid 2>/dev/null)
 
-.PHONY: all build build-ns2 check-contrib-freshness run clean repl test-fasl-shape test-core-bytes test-host-api test-coverage test-ansi-all test-ansi-full test-ansi-extra test-regression test-regression-interp test-regression-emitfree test-pack-nuspec test-save-class-lib test-project-compose test-project-core-build test-mop ilverify update-ansi-state commit-ansi-state cross-compile selfhost-check selfhost-test seed-install seed-check loc publish pack install setup-ansi-test setup-asdf setup-quicklisp setup-cl-bench bench bench-state bench-survey compile-asdf-fasl compile-asdf-fasls compile-quicklisp-fasl compile-core-fasl compile-contrib-fasls contrib-dotcl-cs contrib-dotcl-jitdisasm gen-char-names
+.PHONY: all build build-ns2 check-contrib-freshness run clean repl test-fasl-shape test-core-bytes test-host-api test-coverage test-ansi-all test-ansi-full test-ansi-extra test-regression test-regression-interp test-regression-emitfree test-pack-nuspec test-save-class-lib test-project-compose test-project-core-build test-mop test-kestrel ilverify update-ansi-state commit-ansi-state cross-compile selfhost-check selfhost-test seed-install seed-check loc publish pack install setup-ansi-test setup-asdf setup-quicklisp setup-cl-bench bench bench-state bench-survey compile-asdf-fasl compile-asdf-fasls compile-quicklisp-fasl compile-core-fasl compile-contrib-fasls contrib-dotcl-cs contrib-dotcl-jitdisasm gen-char-names
 
 # Source files for cross-compile. Listed once; the recipe and dependency
 # tracking both reference this so adding a file is a single-edit change.
@@ -91,11 +91,10 @@ check-contrib-freshness:
 	@# which is the part that explains an edit not taking effect.
 	@bash $(DOTCL_ROOT)scripts/contrib-resolve.sh $(DOTCL_ROOT)
 
-run:
-	dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj
+run: repl
 
 repl:
-	dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --repl
+	dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- repl
 
 # The suite loads asdf, so it exercises whatever asdf.fasl holds. $(wildcard)
 # rather than a plain prerequisite: a tree that has no fasl yet must not be made
@@ -103,8 +102,20 @@ repl:
 # run against a stale one. Without this the suite reports on the codegen of
 # whenever the fasl was last built -- green locally, red in CI, which is exactly
 # how a broken emitter change once shipped.
+# The tree state a measurement came from. Measurements get quoted in commit
+# messages and release notes, so the numbers a local run produces end up in the
+# repository -- and a worktree shared with another session, or one with your own
+# half-finished edit in it, produces numbers for code that is not the commit.
+# The build already stamps -dirty; this puts the same fact next to the counts.
+# In CI the checkout is clean, so the line is just the tag.
+define TREE_STAMP
+	@echo "=== tree: `git -C $(DOTCL_ROOT). describe --tags --dirty --always` ==="
+	@git -C $(DOTCL_ROOT). status --porcelain --untracked-files=no | sed "s/^/=== dirty: /"
+endef
+
 test-regression: build $(DOTCL_ROOT)compiler/cil-out.sil $(wildcard $(DOTCL_ROOT)contrib/asdf/asdf.fasl)
 	@echo "=== Running dotcl regression tests ==="
+	$(TREE_STAMP)
 	$(SETSID) dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --asm $(DOTCL_ROOT)compiler/cil-out.sil $(DOTCL_ROOT)test/regression/run.lisp
 
 # The same suite with EVAL routed through the emit-free tree-walk interpreter.
@@ -198,6 +209,14 @@ test-mop: build $(DOTCL_ROOT)compiler/cil-out.sil
 	@echo "=== Running AMOP protocol conformance tests ==="
 	$(SETSID) dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --asm $(DOTCL_ROOT)compiler/cil-out.sil $(DOTCL_ROOT)test/mop-protocol.lisp
 
+# The dotcl-kestrel contrib serving a Lack application. Separate from
+# test-regression on purpose: it needs the ASP.NET Core shared framework (present
+# wherever the .NET SDK is), and the Lack half quickloads, so it needs the network
+# on a machine that has not seen Lack before.
+test-kestrel: build $(DOTCL_ROOT)compiler/cil-out.sil
+	@echo "=== Running dotcl-kestrel HTTP checks ==="
+	$(SETSID) dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --asm $(DOTCL_ROOT)compiler/cil-out.sil $(DOTCL_ROOT)test/kestrel/app.lisp
+
 # Assert the emitter produces VERIFIABLE CIL (no covariant calls / stack-type
 # mismatches). Unverifiable IL runs on CoreCLR but is rejected by strict AOT C++
 # codegens (Unity IL2CPP / WebGL). Catches such codegen regressions in seconds
@@ -237,6 +256,7 @@ build-ns2:
 	dotnet build $(DOTCL_ROOT)runtime/DotCL.Runtime.csproj -c Release -f net8.0
 
 test-ansi-full: build setup-ansi-test
+	$(TREE_STAMP)
 	$(SETSID) dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --asm $(DOTCL_ROOT)compiler/cil-out.sil $(DOTCL_ROOT)test/test-ansi.lisp
 
 ANSI_CATEGORIES := symbols eval-and-compile data-and-control-flow iteration \
@@ -519,7 +539,7 @@ bench-state: setup-cl-bench bench-build
 	if [ -n "$(BENCH)" ]; then EVAL_ARGS="$$EVAL_ARGS --eval '(setq *bench-name* \"$(BENCH)\")'"; fi; \
 	eval timeout $(BENCH_TIMEOUT) $(SBCL_RUN) $$EVAL_ARGS --load $(DOTCL_ROOT)bench/run.lisp --eval "'(quit)'" 2>/tmp/bench-sbcl.txt; \
 	rc=$$?; if [ $$rc -eq 124 ]; then echo ";; SBCL TIMEOUT after $(BENCH_TIMEOUT)s"; fi
-	@$(DOTCL_ROOT)bench/make-state.sh /tmp/bench-dotcl.txt /tmp/bench-sbcl.txt $(DOTCL_ROOT)bench-state.json > /tmp/bench-state-new.json && mv /tmp/bench-state-new.json $(DOTCL_ROOT)bench-state.json
+	@bash $(DOTCL_ROOT)bench/make-state.sh /tmp/bench-dotcl.txt /tmp/bench-sbcl.txt $(DOTCL_ROOT)bench-state.json > /tmp/bench-state-new.json && mv /tmp/bench-state-new.json $(DOTCL_ROOT)bench-state.json
 	@echo "Updated bench-state.json"
 	@cat $(DOTCL_ROOT)bench-state.json
 
@@ -528,7 +548,7 @@ bench-state: setup-cl-bench bench-build
 #   make bench-survey [SUITE=...] [BENCH=...] [RUNS=5] [WARMUP=1]
 # Merges into bench-state.json as dotcl_stats / sbcl_stats fields,
 # while keeping top-level dotcl/sbcl/ratio pointing at the median for
-# backward compatibility with the coordinator prompt.
+# backward compatibility with existing consumers of the file.
 RUNS ?= 5
 WARMUP ?= 1
 # Pin SBCL (see DOTCL_LISP note) so the bench "sbcl" column is really SBCL and

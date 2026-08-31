@@ -1,8 +1,9 @@
 # Calling .NET from Lisp
 
-Everything in this guide is in the `dotnet:` package, which is available without
-loading anything. Every form below was run against dotcl and shows its real
-result.
+Everything in this guide is in the `dotnet:` package, which is there from the
+start -- with two exceptions, `dotnet:ref` and `dotnet:using`, which come from a
+contrib and are marked where they appear. Every form below was run against dotcl
+and shows its real result.
 
 Numbers have rules of their own — which .NET numeric types arrive as which Lisp
 types, when an integer argument is rejected, and how `System.Decimal` works.
@@ -64,6 +65,9 @@ member names are case-sensitive. A symbol is accepted and contributes its name
 verbatim, so `|Host|` works and `host` correctly does not.
 
 ## Indexers
+
+*(`dotnet:ref` needs `(require "dotnet-class")` -- see the end of the next
+section.)*
 
 `dotnet:ref` is the indexer without spelling out `get_Item` / `set_Item`, and it
 is a place. Anything with an indexer works — `List<T>`, `Dictionary<K,V>`, and

@@ -17,7 +17,14 @@
                  :qualifiers '()
                  :lambda-list '(x)
                  :specializers (list (find-class 'amc-thing))
-                 :function (lambda (x) (declare (ignore x)) :from-amop)))
+                 ;; AMOP: a method function is called with a list of the generic
+                 ;; function's arguments and a list of the next methods -- not with
+                 ;; the arguments spread. dotcl calls it that way now; a
+                 ;; one-argument function written for the older shape now signals
+                 ;; on the argument count rather than being called wrongly.
+                 :function (lambda (args next-methods)
+                             (declare (ignore args next-methods))
+                             :from-amop)))
 
 (deftest amop-method-construction.specializers
   (mapcar #'class-name (dotcl-mop:method-specializers *amc-method*))

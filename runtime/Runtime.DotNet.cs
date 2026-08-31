@@ -838,7 +838,8 @@ public static partial class Runtime
         {
             if (targetType.IsAssignableFrom(boxed.HintType))
                 return boxed.Value;
-            return Convert.ChangeType(boxed.Value, targetType);
+            return UserDefinedConversion(boxed.Value, targetType)
+                   ?? Convert.ChangeType(boxed.Value, targetType);
         }
 
         // LispDotNetObject: unwrap
@@ -846,7 +847,11 @@ public static partial class Runtime
         {
             if (targetType.IsAssignableFrom(dno.Type))
                 return dno.Value;
-            return Convert.ChangeType(dno.Value, targetType);
+            // A wrapped value reaches its target through the same implicit operator
+            // C# would apply (DateTime -> DateTimeOffset). Convert.ChangeType knows
+            // only IConvertible, so without this the call reads as "method not found".
+            return UserDefinedConversion(dno.Value, targetType)
+                   ?? Convert.ChangeType(dno.Value, targetType);
         }
 
         // Nullable<T>: marshal to the underlying type so bool? mirrors plain bool
@@ -1032,8 +1037,49 @@ public static partial class Runtime
         // LispObject, e.g. DotclHost.ToClrArray.
         if (targetType.IsInstanceOfType(arg)) return arg;
 
+        // A user-defined implicit conversion. C# applies these silently, and .NET
+        // APIs are designed around that: ASP.NET takes StringValues, PathString and
+        // HostString where the caller writes a string, and reflection offers no
+        // conversion at all, so those calls read as "method not found". Only
+        // implicit operators are used -- an explicit one is a cast the C# caller
+        // had to write, so applying it here would convert where C# would not.
+        var converted = TryUserDefinedConversion(arg, targetType);
+        if (converted != null) return converted;
+
         throw new LispErrorException(new LispTypeError(
             $"Cannot convert {arg.GetType().Name} to {targetType.Name}", arg));
+    }
+
+    /// <summary>The result of an implicit conversion operator taking the marshalled
+    /// form of ARG and producing TARGETTYPE, or null when neither type declares one.</summary>
+    private static object? TryUserDefinedConversion(LispObject arg, Type targetType)
+    {
+        object? source;
+        try { source = LispToDotNetGeneric(arg); }
+        catch { return null; }
+        return source == null ? null : UserDefinedConversion(source, targetType);
+    }
+
+    /// <summary>SOURCE converted to TARGETTYPE by an implicit conversion operator, or
+    /// null when neither type declares one. Both sides are searched, as C# does.</summary>
+    private static object? UserDefinedConversion(object source, Type targetType)
+    {
+        var sourceType = source.GetType();
+        if (targetType.IsAssignableFrom(sourceType)) return source;
+
+        foreach (var declaring in new[] { targetType, sourceType })
+        {
+            foreach (var m in declaring.GetMethods(System.Reflection.BindingFlags.Public
+                                                   | System.Reflection.BindingFlags.Static))
+            {
+                if (m.Name != "op_Implicit" || m.ReturnType != targetType) continue;
+                var ps = m.GetParameters();
+                if (ps.Length != 1 || !ps[0].ParameterType.IsAssignableFrom(sourceType)) continue;
+                try { return m.Invoke(null, new[] { source }); }
+                catch (System.Reflection.TargetInvocationException) { return null; }
+            }
+        }
+        return null;
     }
 
     /// <summary>Collect the elements of a Lisp proper list or vector (non-char)
@@ -1327,12 +1373,25 @@ public static partial class Runtime
     /// signalling when the type can't be resolved. Used where a resolution attempt
     /// is speculative (e.g. trying a name with and without a backtick-arity suffix).</summary>
     internal static Type? TryResolveDotNetType(string typeName)
-    {
-        try { return ResolveDotNetType(typeName); }
-        catch { return null; }
-    }
+        => ResolveDotNetTypeOrNull(typeName);
 
     internal static Type ResolveDotNetType(string typeName)
+        => ResolveDotNetTypeOrNull(typeName)
+           ?? throw new LispErrorException(new LispError($"DOTNET: type not found: {typeName}"));
+
+    /// <summary>
+    /// The resolution itself, answering null for "no such type" rather than signalling.
+    ///
+    /// A speculative lookup must not signal. MAKE-GENERIC-TYPE tries a name without its
+    /// backtick-arity before adding one, and when that attempt signalled, the caller's
+    /// own HANDLER-BIND ran -- for an internal guess the caller never made. Worse, the
+    /// old form of this function was `try { ... } catch { return null; }`, and a bare
+    /// catch takes everything: a handler that answered with RETURN-FROM had its exit
+    /// swallowed here, so the handler's effects stood while its transfer of control did
+    /// not. That is how usocket's test suite reported a test as aborted while its value
+    /// was correct -- the abort flag was set by a handler whose escape never happened.
+    /// </summary>
+    private static Type? ResolveDotNetTypeOrNull(string typeName)
     {
         // Outermost call owns the dirty-flag check so the probe's own loads
         // (which re-enter via AssemblyLoad, not via this method) don't clear the
@@ -1355,9 +1414,7 @@ public static partial class Runtime
                 ProbeLoadBaseDir();
                 t = SearchDotNetType(typeName, out cacheable);
             }
-            if (t == null)
-                throw new LispErrorException(new LispError($"DOTNET: type not found: {typeName}"));
-            if (cacheable) _typeCache[typeName] = t;
+            if (t != null && cacheable) _typeCache[typeName] = t;
             return t;
         }
         finally { if (outer) _inTypeResolve = false; }
@@ -1839,8 +1896,7 @@ public static partial class Runtime
         result = null;
         var flags = System.Reflection.BindingFlags.Public
             | (isStatic ? System.Reflection.BindingFlags.Static : System.Reflection.BindingFlags.Instance);
-        System.Reflection.MethodInfo? best = null;
-        int bestLen = int.MaxValue;
+        var candidates = new List<System.Reflection.MethodInfo>();
         foreach (var m in type.GetMethods(flags))
         {
             if (m.Name != name || m.IsGenericMethodDefinition) continue;
@@ -1850,26 +1906,39 @@ public static partial class Runtime
             for (int i = lispArgs.Length; i < ps.Length; i++)
                 if (!ps[i].IsOptional) { tailOptional = false; break; }
             if (!tailOptional) continue;
-            if (ps.Length < bestLen) { best = m; bestLen = ps.Length; }   // closest match
+            candidates.Add(m);
         }
-        if (best == null) return false;
+        if (candidates.Count == 0) return false;
 
-        var bps = best.GetParameters();
-        var full = new object?[bps.Length];
-        try
+        // Closest arity first (fewest filled-in defaults), declaration order within
+        // an arity -- OrderBy is stable. Each candidate is tried in turn rather than
+        // committing to one up front: an overload set can differ only in the type of
+        // a parameter the caller did supply (JsonDocument.Parse has five overloads,
+        // all of arity 2), and picking by arity alone lands on whichever reflection
+        // returned first, then reports "method not found" when the supplied argument
+        // does not convert to that one.
+        foreach (var m in candidates.OrderBy(m => m.GetParameters().Length))
         {
-            for (int i = 0; i < lispArgs.Length; i++)
-                full[i] = LispToDotNet(lispArgs[i], bps[i].ParameterType);
-        }
-        catch { return false; }   // supplied args not convertible to this overload
-        for (int i = lispArgs.Length; i < bps.Length; i++)
-            full[i] = bps[i].HasDefaultValue ? bps[i].DefaultValue : Type.Missing;
+            var bps = m.GetParameters();
+            var full = new object?[bps.Length];
+            bool ok = true;
+            try
+            {
+                for (int i = 0; i < lispArgs.Length; i++)
+                    full[i] = LispToDotNet(lispArgs[i], bps[i].ParameterType);
+            }
+            catch { ok = false; }   // supplied args not convertible to this overload
+            if (!ok) continue;
+            for (int i = lispArgs.Length; i < bps.Length; i++)
+                full[i] = bps[i].HasDefaultValue ? bps[i].DefaultValue : Type.Missing;
 
-        try { result = best.Invoke(target, full); return true; }
-        catch (System.Reflection.TargetInvocationException tie)
-        {
-            throw DotNetInvokeError($"DOTNET:{(isStatic ? "STATIC" : "INVOKE")} {type.Name}.{name}", tie);
+            try { result = m.Invoke(target, full); return true; }
+            catch (System.Reflection.TargetInvocationException tie)
+            {
+                throw DotNetInvokeError($"DOTNET:{(isStatic ? "STATIC" : "INVOKE")} {type.Name}.{name}", tie);
+            }
         }
+        return false;
     }
 
     /// <summary>Pre-empt InvokeMember for the one case its default binder gets
@@ -2177,6 +2246,12 @@ public static partial class Runtime
             // (e.g. Lisp list → T[]), which the binder's runtime-type match misses.
             if (TryInvokeWithMarshalledArgs(type, memberName, target, args.Skip(2).ToArray(), false, out var r2))
                 return DotNetToLisp(r2);
+            // A member of an interface the type implements explicitly. Tried before
+            // extension methods: it is the object's own member, where an extension
+            // method is someone else's static function that happens to accept it.
+            if (TryInvokeInterfaceMember(type, (args[0] as LispDotNetBoxed)?.HintType,
+                                         memberName, target, callArgs, InstanceReadFlags, out var iface))
+                return DotNetToLisp(iface);
             // Last resort: an extension method (e.g. LINQ's Enumerable.Where) —
             // a static method elsewhere whose first parameter accepts the receiver.
             try
@@ -2202,6 +2277,13 @@ public static partial class Runtime
     // instance-method calls pay nothing.
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, System.Reflection.MethodInfo[]>
         _extensionMethodsByName = new();
+
+    /// <summary>Drop the extension-method index. Called when an assembly loads: the
+    /// index is keyed by name and each entry records what was loaded at the moment
+    /// that name was first asked for, so a name probed before its assembly arrived
+    /// would otherwise stay empty for the rest of the session -- which is the normal
+    /// order for a nuget:require'd package.</summary>
+    public static void ClearExtensionMethodCache() => _extensionMethodsByName.Clear();
 
     private static System.Reflection.MethodInfo[] ExtensionMethodsNamed(string name)
         => _extensionMethodsByName.GetOrAdd(name, n =>
@@ -2338,15 +2420,160 @@ public static partial class Runtime
         return true;
     }
 
+    /// <summary>
+    /// A member the runtime type implements explicitly, e.g. List&lt;T&gt;'s
+    /// ICollection&lt;T&gt;.IsReadOnly or IFeatureCollection's indexer. An explicit
+    /// implementation is private on the concrete type, so InvokeMember never sees
+    /// it; reflection through the interface dispatches to it correctly.
+    ///
+    /// HINT is the type a dotnet:cast asked for: given one, only that interface is
+    /// considered, which is how a caller picks between interfaces declaring the
+    /// same name. Given none, every implemented interface declaring the name is a
+    /// candidate, and candidates reaching different implementations are reported
+    /// rather than guessed between -- List&lt;T&gt;.IsReadOnly comes from both
+    /// ICollection&lt;T&gt; and IList, which are separate implementations free to
+    /// disagree.
+    /// </summary>
+    private static bool TryInvokeInterfaceMember(Type type, Type? hint, string memberName,
+        object? target, object?[] callArgs, System.Reflection.BindingFlags flags, out object? result)
+    {
+        result = null;
+        if (target == null) return false;
+
+        bool cast = hint != null && hint.IsInterface && hint.IsInstanceOfType(target);
+        // A cast names one interface: that one answers if it declares the member. Only
+        // when it does not do the interfaces it inherits come into play -- an inherited
+        // member (IHeaderDictionary's Keys comes from IDictionary<,>) still has to be
+        // reachable, but a member both declare (Item) must not read as ambiguous when
+        // the caller already said which interface they meant. Without a hint,
+        // GetInterfaces returns the whole set at once.
+        var candidates = new List<Type>();
+        foreach (var pool in cast
+                     ? new[] { new[] { hint! }, hint!.GetInterfaces() }
+                     : new[] { type.GetInterfaces() })
+        {
+            foreach (var iface in pool)
+                if (iface.GetMember(memberName,
+                        System.Reflection.MemberTypes.Method | System.Reflection.MemberTypes.Property,
+                        System.Reflection.BindingFlags.Public
+                        | System.Reflection.BindingFlags.Instance).Length > 0)
+                    candidates.Add(iface);
+            if (candidates.Count > 0) break;
+        }
+        if (candidates.Count == 0) return false;
+
+        if (candidates.Count > 1)
+        {
+            var impls = new HashSet<System.Reflection.MethodInfo>();
+            foreach (var iface in candidates)
+            {
+                var impl = InterfaceImplTarget(type, iface, memberName);
+                if (impl != null) impls.Add(impl);
+            }
+            if (impls.Count > 1)
+                throw new LispErrorException(new LispError(
+                    $"DOTNET:INVOKE: {type.Name} implements {memberName} separately for "
+                    + string.Join(" and ", candidates.Select(c => c.Name))
+                    + "; name the one you mean with dotnet:cast"));
+        }
+
+        result = candidates[0].InvokeMember(memberName, flags, null, target, callArgs);
+        return true;
+    }
+
+    /// <summary>The generic method definition for NAME on an interface TYPE implements,
+    /// for when the concrete type does not expose it because the implementation is
+    /// explicit. Same rule as TryInvokeInterfaceMember: a dotnet:cast hint narrows the
+    /// search to one interface, and two interfaces reaching different implementations
+    /// are reported rather than chosen between.</summary>
+    private static System.Reflection.MethodInfo? FindInterfaceGenericMethod(
+        Type type, Type? hint, object target, string name, int typeArgCount, int paramCount)
+    {
+        var pool = hint != null && hint.IsInterface && hint.IsInstanceOfType(target)
+            ? new[] { hint }
+            : type.GetInterfaces();
+        var found = new List<(Type Iface, System.Reflection.MethodInfo Method)>();
+        foreach (var iface in pool)
+        {
+            var m = iface.GetMethods(System.Reflection.BindingFlags.Public
+                                     | System.Reflection.BindingFlags.Instance)
+                .FirstOrDefault(x => x.Name == name
+                                  && x.IsGenericMethodDefinition
+                                  && x.GetGenericArguments().Length == typeArgCount
+                                  && x.GetParameters().Length == paramCount);
+            if (m != null) found.Add((iface, m));
+        }
+        if (found.Count == 0) return null;
+        if (found.Count > 1)
+        {
+            var impls = new HashSet<System.Reflection.MethodInfo>();
+            foreach (var (iface, m) in found)
+            {
+                try
+                {
+                    var map = type.GetInterfaceMap(iface);
+                    for (int i = 0; i < map.InterfaceMethods.Length; i++)
+                        if (map.InterfaceMethods[i] == m) { impls.Add(map.TargetMethods[i]); break; }
+                }
+                catch (ArgumentException) { }
+            }
+            if (impls.Count > 1)
+                throw new LispErrorException(new LispError(
+                    $"DOTNET:INVOKE-GENERIC: {type.Name} implements {name} separately for "
+                    + string.Join(" and ", found.Select(f => f.Iface.Name))
+                    + "; name the one you mean with dotnet:cast"));
+        }
+        return found[0].Method;
+    }
+
+    /// <summary>The method on TYPE that satisfies IFACE's MEMBERNAME, or null when
+    /// the map does not name it. Used only to tell two candidate interfaces apart.</summary>
+    private static System.Reflection.MethodInfo? InterfaceImplTarget(Type type, Type iface, string memberName)
+    {
+        var property = iface.GetProperty(memberName);
+        var probe = property != null
+            ? (property.GetGetMethod() ?? property.GetSetMethod())
+            : iface.GetMethods().FirstOrDefault(m => m.Name == memberName);
+        if (probe == null) return null;
+        try
+        {
+            var map = type.GetInterfaceMap(iface);
+            for (int i = 0; i < map.InterfaceMethods.Length; i++)
+                if (map.InterfaceMethods[i] == probe) return map.TargetMethods[i];
+        }
+        catch (ArgumentException) { }   // not an interface this type implements directly
+        return null;
+    }
+
     private static bool TryInvokeExtensionMethod(Type recvType, string methodName, object? target,
         LispObject[] lispArgs, out object? result, Type? onlyFrom = null)
     {
         result = null;
+        // Two passes over the candidates: an overload whose arity matches exactly
+        // is taken before one that needs its optional parameters filled in, so
+        // relaxing the arity test cannot change which overload an existing call
+        // resolves to. Extension methods carry optional parameters all over the
+        // BCL and ASP.NET Core -- HttpResponse.WriteAsync(text, CancellationToken
+        // = default) is the shape -- and an exact-arity-only test reported those
+        // as "method not found". Ordinary methods (TryInvokeWithOptionalDefaults)
+        // and constructors already fill defaults.
+        for (int pass = 0; pass < 2; pass++)
         foreach (var m in ExtensionMethodsNamed(methodName))
         {
             if (onlyFrom != null && m.DeclaringType != onlyFrom) continue;
             var ps = m.GetParameters();
-            if (ps.Length != lispArgs.Length + 1) continue; // +1 for the receiver
+            if (pass == 0)
+            {
+                if (ps.Length != lispArgs.Length + 1) continue; // +1 for the receiver
+            }
+            else
+            {
+                if (ps.Length <= lispArgs.Length + 1) continue;
+                bool tailOptional = true;
+                for (int i = lispArgs.Length + 1; i < ps.Length; i++)
+                    if (!ps[i].IsOptional) { tailOptional = false; break; }
+                if (!tailOptional) continue;
+            }
             var concrete = m;
             if (m.IsGenericMethodDefinition)
             {
@@ -2373,6 +2600,8 @@ public static partial class Runtime
             }
             catch { ok = false; }
             if (!ok) continue;
+            for (int i = lispArgs.Length + 1; i < ps.Length; i++)
+                callArgs[i] = ps[i].HasDefaultValue ? ps[i].DefaultValue : Type.Missing;
             result = concrete.Invoke(null, callArgs); // method's own throw → TargetInvocationException
             return true;
         }
@@ -2401,10 +2630,77 @@ public static partial class Runtime
             type.InvokeMember(memberName, InstanceWriteFlags, null, target, callArgs);
             return args[args.Length - 1];
         }
+        catch (MissingMethodException)
+        {
+            var hint = (args[0] as LispDotNetBoxed)?.HintType;
+            // The setter's parameter types are what the value has to fit, and the
+            // generic marshaller does not know them: an ASP.NET header indexer takes
+            // StringValues where the caller wrote a string.
+            if (TrySetPropertyWithMarshalledArgs(type, hint, memberName, target,
+                                                 args.Skip(2).ToArray()))
+                return args[args.Length - 1];
+            // The write side of the same gap the read side closed: a member the type
+            // implements explicitly for an interface is private on the type, so an
+            // indexer like IHeaderDictionary's is unreachable by name. Same rule --
+            // a dotnet:cast hint picks the interface, ambiguity is reported.
+            if (TryInvokeInterfaceMember(type, hint, memberName, target, callArgs,
+                                         InstanceWriteFlags, out _))
+                return args[args.Length - 1];
+            throw;
+        }
         catch (System.Reflection.TargetInvocationException tie)
         {
             throw DotNetInvokeError($"DOTNET:%SET-INVOKE {type.Name}.{memberName}", tie);
         }
+    }
+
+    /// <summary>Assign a property by marshalling each argument to the setter's declared
+    /// parameter type, for setters the generic path cannot satisfy -- an ASP.NET header
+    /// indexer takes StringValues where the caller wrote a string. The type is searched
+    /// first, then the interfaces it implements (a dotnet:cast hint narrows that to one
+    /// interface and its bases), which is also how an explicitly implemented indexer is
+    /// reached.</summary>
+    private static bool TrySetPropertyWithMarshalledArgs(Type type, Type? hint, string memberName,
+        object? target, LispObject[] lispArgs)
+    {
+        if (target == null || lispArgs.Length == 0) return false;
+
+        var pool = new List<Type> { type };
+        if (hint != null && hint.IsInterface && hint.IsInstanceOfType(target))
+        {
+            pool.Add(hint);
+            pool.AddRange(hint.GetInterfaces());
+        }
+        else pool.AddRange(type.GetInterfaces());
+
+        foreach (var declaring in pool)
+        {
+            foreach (var prop in declaring.GetProperties(System.Reflection.BindingFlags.Public
+                                                         | System.Reflection.BindingFlags.Instance))
+            {
+                if (prop.Name != memberName) continue;
+                var setter = prop.GetSetMethod();
+                if (setter == null) continue;
+                var ps = setter.GetParameters();          // index parameters, then the value
+                if (ps.Length != lispArgs.Length) continue;
+                var callArgs = new object?[ps.Length];
+                bool ok = true;
+                try
+                {
+                    for (int i = 0; i < ps.Length; i++)
+                        callArgs[i] = LispToDotNet(lispArgs[i], ps[i].ParameterType);
+                }
+                catch { ok = false; }
+                if (!ok) continue;                        // not this overload
+                try { setter.Invoke(target, callArgs); }
+                catch (System.Reflection.TargetInvocationException tie)
+                {
+                    throw DotNetInvokeError($"DOTNET:%SET-INVOKE {type.Name}.{memberName}", tie);
+                }
+                return true;
+            }
+        }
+        return false;
     }
 
     public static LispObject DotNetNew(LispObject[] args)
@@ -3626,6 +3922,21 @@ public static partial class Runtime
         // response (e.g. an HTTP/WebSocket reply written through a non-binary to-stream).
         var encoding = new System.Text.UTF8Encoding(false);
 
+        // One-way streams are ordinary outside the socket case this was written for:
+        // an HTTP request body only reads, a response body only writes, and so do
+        // File.OpenRead / File.OpenWrite. Building both halves regardless made every
+        // one of them throw out of the StreamReader/StreamWriter constructor
+        // ("Stream was not writable" / "not readable") before any Lisp code ran.
+        // Flushing follows the two-way case: the writer buffers until finish-output
+        // or close.
+        if (!netStream.CanWrite)
+            return new LispInputStream(
+                new System.IO.StreamReader(netStream, encoding, false, 4096, leaveOpen: true));
+        if (!netStream.CanRead)
+            return new LispOutputStream(
+                new System.IO.StreamWriter(netStream, encoding, 4096, leaveOpen: true)
+                { AutoFlush = false });
+
         var reader = new System.IO.StreamReader(netStream, encoding, false, 4096, leaveOpen: true);
         var writer = new System.IO.StreamWriter(netStream, encoding, 4096, leaveOpen: true)
         {
@@ -4144,6 +4455,11 @@ public static partial class Runtime
                      && m.GetGenericArguments().Length == typeArgNames.Count
                      && m.GetParameters().Length == lispArgs.Length)
             .FirstOrDefault()
+            // Not on the concrete type: it may be implemented explicitly for an
+            // interface, where the method is private and only reachable through the
+            // interface (IFeatureCollection.Get<TFeature> is the shape).
+            ?? FindInterfaceGenericMethod(type, (args[0] as LispDotNetBoxed)?.HintType,
+                                          target, memberName, typeArgNames.Count, lispArgs.Length)
             ?? throw new LispErrorException(new LispError(
                 $"DOTNET:INVOKE-GENERIC: no generic instance method {type.Name}.{memberName} " +
                 $"with {typeArgNames.Count} type arg(s) and {lispArgs.Length} parameter(s)"));

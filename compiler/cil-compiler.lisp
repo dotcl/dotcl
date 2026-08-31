@@ -1237,6 +1237,29 @@ through to compile-sym-lookup."
 ;;; Quote / literal compilation
 ;;; ============================================================
 
+(defun %externalizable-constant-p (obj)
+  "True when OBJ written to the cross-compile output and read back means the same
+thing, AND nothing in this compiler will try to modify it in place.
+
+Strings, numbers and characters qualify, and lists of them. Symbols do not:
+which package they land in is decided by the reader that reads the output, not
+by the compiler that wrote it.
+
+Keywords would survive the round trip, but they are excluded on purpose. An
+instruction list is a list of keyword-headed forms, and the compiler builds its
+output by NCONCing instruction lists together. A constant template that reaches
+one of those NCONCs must not be shared, or the appended tail stays attached to
+the literal and the next compilation inherits it."
+  (cond ((null obj) t)
+        ((eq obj t) t)
+        ((consp obj) (and (%externalizable-constant-p (car obj))
+                          (%externalizable-constant-p (cdr obj))))
+        ((stringp obj) (= (array-rank obj) 1))
+        ((numberp obj) t)
+        ((characterp obj) t)
+        ((keywordp obj) t)   ; DETECTOR
+        (t nil)))
+
 (defun compile-quoted (obj)
   "Compile a quoted datum to instruction list."
   (cond
@@ -1257,10 +1280,20 @@ through to compile-sym-lookup."
          (compile-sym-lookup obj)
          `((:load-const ,obj))))
     ((consp obj)
-     ;; At runtime (not cross-compiling), use load-const to preserve EQL identity
-     ;; of cons objects (important for CASE with dynamic list keys).
-     ;; During cross-compile, use MakeCons to avoid sharing mutable constants.
-     (if *cross-compiling*
+     ;; A quoted list is one object, not a recipe. LOAD-CONST puts it in the
+     ;; constant pool, so every evaluation of the site yields the same list --
+     ;; which is what the standard says about a literal, and what every other
+     ;; implementation does.
+     ;;
+     ;; Cross-compilation cannot always take that road: the output is text, and
+     ;; a symbol written there is read back into whatever package the reader is
+     ;; in, not the one the compiler meant. So symbols still go through
+     ;; COMPILE-SYM-LOOKUP and the list around them is rebuilt with MAKECONS.
+     ;; Data that means the same on both sides of the file does not need that,
+     ;; and the standard library's dispatch tables -- lists of strings handed to
+     ;; MEMBER -- are exactly that shape. They were being consed again on every
+     ;; single call.
+     (if (and *cross-compiling* (not (%externalizable-constant-p obj)))
          `(,@(compile-quoted (car obj))
            ,@(compile-quoted (cdr obj))
            (:call "Runtime.MakeCons"))
@@ -2401,6 +2434,14 @@ through to compile-sym-lookup."
     ;; aref on a proven numeric-backed array local: elements are integers
     ;; within the storage range (stores are range-checked by the runtime).
     ((numeric-array-aref-info expr) t)
+    ;; (if c a b) with both arms fixnum-typed. Needs the else arm: a two-armed
+    ;; IF yields NIL when the test fails, which is not a fixnum. Without this
+    ;; the whole branch falls to the boxed path, and since a recursive function
+    ;; is usually shaped (if base recur), that is where the boxing survives.
+    ((and (consp expr) (eq (car expr) 'if) (= (length expr) 4)
+          (fixnum-typed-p (caddr expr))
+          (fixnum-typed-p (cadddr expr)))
+     t)
     ((and (consp expr) (eq (car expr) 'the)
           (let ((ty (cadr expr)))
             (or (eq ty 'fixnum)
@@ -2554,10 +2595,16 @@ through to compile-sym-lookup."
      (let ((n-args (length (cdr expr))))
        `(,(if (eq (cstate-self-fn-local) :arg0) '(:ldarg 0)
               `(:ldloc ,(cstate-self-fn-local)))
-         ,@(mapcan (lambda (arg)
-                     (let ((*in-tail-position* nil) (*in-mv-context* nil))
-                       (compile-as-long arg)))
-                   (cdr expr))
+         ;; APPEND, not MAPCAN. A backquoted instruction list whose tail is all
+         ;; constant folds to one literal for that tail, so COMPILE-AS-LONG can
+         ;; hand back a list whose last cons is a literal shared by every call
+         ;; that took the same branch. MAPCAN would NCONC the next argument's
+         ;; instructions onto it, and they would still be there the next time
+         ;; that branch is taken -- carrying a local from a function compiled
+         ;; earlier into a body that never declared it.
+         ,@(loop for arg in (cdr expr)
+                 append (let ((*in-tail-position* nil) (*in-mv-context* nil))
+                          (compile-as-long arg)))
          (:callvirt ,(invoke-native-name n-args))
          (:unbox-fixnum))))
     ;; Declared-fixnum local: load slot (LispObject) then unbox.
@@ -2580,6 +2627,22 @@ through to compile-sym-lookup."
     ((numeric-array-aref-info expr)
      (compile-numeric-aref-as-long
       (cadr expr) (cddr expr) (car (numeric-array-aref-info expr))))
+    ;; (if c a b), both arms fixnum-typed: branch with a raw int64 on each path
+    ;; instead of boxing at the merge. The condition goes through the same
+    ;; compile-boolean-branch the ordinary IF uses, so fused comparisons and
+    ;; and/or/not chains behave identically here.
+    ((and (consp expr) (eq (car expr) 'if) (= (length expr) 4)
+          (fixnum-typed-p (caddr expr))
+          (fixnum-typed-p (cadddr expr)))
+     (let ((else-label (gen-label "LONGELSE"))
+           (end-label (gen-label "LONGEND")))
+       `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
+             (compile-boolean-branch (cadr expr) else-label nil))
+         ,@(compile-as-long (caddr expr))
+         (:br ,end-label)
+         (:label ,else-label)
+         ,@(compile-as-long (cadddr expr))
+         (:label ,end-label))))
     ((and (consp expr) (eq (car expr) 'the))
      ;; (the fixnum E): the declaration asserts E is a fixnum, so lower E
      ;; natively via compile-as-long — it handles +/-/*/1+/1-/locals as raw
@@ -2940,6 +3003,20 @@ through to compile-sym-lookup."
            (compile-expr expr))
        (:unbox-double))))))
 
+(defun float-typed-p (expr)
+  "T if EXPR is statically known to produce a float, of either format."
+  (or (double-float-typed-p expr) (single-float-typed-p expr)))
+
+(defun compile-as-double-widened (expr)
+  "Compile a float-typed EXPR leaving a native r8, widening a single-float one.
+   CLHS 12.1.4.1 compares a mixed pair in the longer format, and widening a
+   single to a double is exact, so a comparison can take either format this way.
+   COMPILE-AS-DOUBLE alone cannot: on a single-typed expression it falls through
+   to the generic path and unboxes a SingleFloat as a DoubleFloat."
+  (if (double-float-typed-p expr)
+      (compile-as-double expr)
+      `(,@(compile-as-single expr) (:conv-r8))))
+
 (defun compile-double-binop (args op)
   "Emit: compile-as-double a, compile-as-double b, <op>, newobj DoubleFloat."
   `(,@(compile-as-double (first args))
@@ -2963,8 +3040,8 @@ through to compile-sym-lookup."
                 (:le (quote ((:cgt-un) (:ldc-i4 0) (:ceq))))
                 (:ge (quote ((:clt-un) (:ldc-i4 0) (:ceq))))
                 (:ne '((:ceq) (:ldc-i4 0) (:ceq))))))
-    `(,@(compile-as-double (first args))
-      ,@(compile-as-double (second args))
+    `(,@(compile-as-double-widened (first args))
+      ,@(compile-as-double-widened (second args))
       ,@body)))
 
 ;;; ============================================================
@@ -3785,18 +3862,48 @@ through to compile-sym-lookup."
               (:call ,method)
               ,@box))))))
 
+;;; LIST / LIST* build their conses inline for a small, fixed argument count.
+;;;
+;;; Both used to hand their arguments to a runtime function through an array, so
+;;; the call cost 24 + 8n bytes on top of the conses it returned. Writing the same
+;;; conses by hand already cost exactly the conses and nothing else. Measured
+;;; against SBCL -- whose cons is 16 bytes to a .NET object's 32, so 2x is the
+;;; floor here -- (cons a (cons b nil)) sat exactly on that floor while
+;;; (list a b) was 40 bytes above it. LIST is in every library there is.
+;;;
+;;; Left-to-right argument order is preserved: nested CONS evaluates its car
+;;; before its cdr. The bound keeps the emitted nesting from growing without
+;;; limit; past it the array is the cheaper shape.
+
+(defparameter +inline-list-max-args+ 8
+  "Longest LIST / LIST* call whose conses are emitted inline instead of through
+   the args-array runtime entry.")
+
+(defun %nested-cons-form (args tail)
+  "(CONS a1 (CONS a2 ... TAIL)) for ARGS = (a1 a2 ...)."
+  (let ((form tail))
+    (dolist (a (reverse args) form)
+      (setq form `(cons ,a ,form)))))
+
 (defun compile-list-call (args)
-  (if (null args)
-      (emit-nil)
-      `(,@(compile-args-array args)
-        (:call "Runtime.List")
-        (:call "MultipleValues.Primary"))))
+  (cond
+    ((null args) (emit-nil))
+    ((<= (length args) +inline-list-max-args+)
+     (compile-expr (%nested-cons-form args nil)))
+    (t `(,@(compile-args-array args)
+         (:call "Runtime.List")
+         (:call "MultipleValues.Primary")))))
 
 (defun compile-list-star-call (args)
-  (if (null args)
-      (error "LIST* requires at least one argument")
-      `(,@(compile-args-array args)
-        (:call "Runtime.ListStar"))))
+  (cond
+    ((null args) (error "LIST* requires at least one argument"))
+    ;; (LIST* x) is x. Compiling it as such removes a call, and there is no cons
+    ;; to build.
+    ((null (cdr args)) (compile-expr (car args)))
+    ((<= (length args) +inline-list-max-args+)
+     (compile-expr (%nested-cons-form (butlast args) (car (last args)))))
+    (t `(,@(compile-args-array args)
+         (:call "Runtime.ListStar")))))
 
 (defun compile-gethash (args)
   (let ((nargs (length args)))
@@ -3822,6 +3929,13 @@ through to compile-sym-lookup."
   (cond
     ;; (values) — a shared marker, no array and no wrapper to build.
     ((null args) '((:call "MultipleValues.Values0")))
+    ;; (values x) is "the primary value of x, published as the only value", which
+    ;; is exactly what MULTIPLEVALUES.PRIMARY does -- and it publishes through a
+    ;; per-thread cached array, so nothing is allocated. Going through the general
+    ;; entry built a LispObject[1] the callee then threw away, 32 bytes a call.
+    ((null (cdr args))
+     `(,@(let ((*in-mv-context* t)) (compile-expr (car args)))
+       (:call "MultipleValues.Primary")))
     ;; Two values: the shape TRUNCATE, FLOOR, ROUND, GETHASH and INTERN return, and
     ;; the one the argument array cost the most on (40 of the 64 bytes a
     ;; multiple-value return allocated). RUNTIME.VALUES2 takes them as arguments.

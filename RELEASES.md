@@ -3,6 +3,199 @@
 User-facing release notes for dotcl. Each section corresponds to a tagged
 release on the public mirror (dotcl/dotcl).
 
+## v0.1.27 -- 2026-08-31
+
+The metaobject protocol is the headline. A probe covering 94 of the 95 AMOP
+behaviours closer-mop's `features.lisp` tracks now reports 94 conforms, 0
+deviates, 0 errors on dotcl, matching what SBCL scores through the same probe.
+It read 46 conforms, 32 deviates, 16 errors when this cycle started, so code
+that builds on the metaobject protocol has a lot more ground to stand on.
+
+Alongside that: the command line has a contract, so a mistyped flag is an error
+instead of a silent REPL; scripts can read their own arguments; NuGet
+dependencies resolve once and keep working on a machine with no SDK; and the
+sequence functions and generic function dispatch allocate a great deal less,
+with `(map 'list #'1+ l)` over a five element list down from 1816 to 320 bytes
+a call.
+
+### Upgrading
+
+**dotcl no longer starts a REPL by accident.** An unrecognized flag used to be
+dropped without a word, and with nothing left to do dotcl started a REPL and
+exited 0. A calling script could not tell that from success:
+
+    $ dotcl --evla '(princ 1)'
+    dotcl REPL. Ctrl+D to exit.
+
+What changes:
+
+- `dotcl` with nothing to do prints usage and exits 2.
+- An unknown option starting with `-` exits 2 with `unknown option '...'`.
+- `--load` or `--eval` with no value exits 2 with `requires an argument`.
+- `--load file.lisp` loads the file and exits. It used to continue into a REPL.
+- The REPL starts only when asked: `dotcl repl`, `dotcl repl script.lisp`, or
+  `dotcl --load app.lisp repl`.
+
+If a script or CI job relied on `dotcl --load setup.lisp` dropping into a REPL,
+or on a stray flag being ignored, it changes here.
+
+**Arguments after a script name belong to the script.** `dotcl app.lisp repl`
+passes `"repl"` to the script and does not start a REPL. Nothing after the
+script name is taken by the launcher, so a program calling your script can pass
+any word it likes. Subcommands are read in the position a subcommand can
+occupy: after the global options, before the script.
+
+**Method functions follow AMOP's calling convention.** A method function is now
+called with two arguments, the argument list and the list of next methods, as
+AMOP specifies and SBCL does. dotcl used to spread the arguments:
+
+    (funcall (method-function m) (list 2) '())     ; AMOP, and now dotcl
+    (funcall (method-function m) 2)                ; what dotcl used to want
+
+Code that passes `:function` to `(make-instance 'standard-method ...)` with a
+spread lambda has to change shape. This does not fail silently: the argument
+count no longer matches and it signals at the call.
+
+### The metaobject protocol
+
+Enough of AMOP is in place to port code that specializes it rather than merely
+uses CLOS:
+
+- **Funcallable instances.** `funcallable-standard-class`, and
+  `set-funcallable-instance-function` to say what calling one does.
+- **Custom metaclasses.** A metaclass can define its own `:allocation`, and the
+  order `compute-slots` returns is the order the slots get. Slot
+  `:documentation` reaches the slot definition, and default initargs come back
+  in AMOP's canonical form.
+- **Dispatch you can replace.** `compute-discriminating-function` is wired into
+  the call path, as are `compute-applicable-methods-using-classes`,
+  `compute-applicable-methods` and `compute-effective-method`.
+- **Method construction.** `defmethod` asks the generic function for its
+  `generic-function-method-class` and passes the method lambda through
+  `make-method-lambda`; `defgeneric` asks for the method combination.
+  `find-method-combination` exists, and long-form method combinations reach
+  `call-next-method`.
+- **EQL specializers are metaobjects**, interned, with `eql-specializer-object`.
+- **Undefined superclasses** become a `forward-referenced-class` instead of an
+  error, so classes can be defined in either order.
+- **The dependent protocol** does something: `add-dependent`,
+  `remove-dependent`, `map-dependents`, `update-dependent`.
+- Generic function classes can add slots that instances actually carry;
+  `(setf generic-function-name)` and reinitialization work; `class-of` and
+  `type-of` answer with the metaobject classes.
+- A user-defined method class can add slots, and they are readable through
+  `slot-value` and an accessor like any other.
+
+One known gap: the lambda handed to `make-method-lambda` is dotcl's spread form
+rather than AMOP's two-argument form, so a `make-method-lambda` method that
+takes that shape apart will not see what AMOP describes. Rebuilding it and
+passing it on, which is what most of them do, works.
+
+### Scripts
+
+`dotcl:script-arguments` returns the list of strings passed to the script, with
+neither the program name nor dotcl's own flags in it, and `nil` outside a
+script. The uiop-compatible `dotcl:command-line-arguments` is still there, but
+it is the shape that made people write
+`(second (member "--" ... :test #'string=))` to get at an argument.
+
+`docs/scripting.md` is new: arguments, exit codes, shebang lines, how `--load`
+differs from running a script, and startup cost.
+
+### NuGet dependencies
+
+`nuget:require` resolves a package once and keeps the result:
+
+- Resolution lands in a stable path under the same cache root the fasl cache
+  uses, so a second process reuses it. Measured on a warm NuGet cache, 1.53 s
+  falls to 0.01 s, because the cost was starting MSBuild rather than
+  downloading anything.
+- Only exact versions are reused. A floating request like `"13.*"` asks for
+  whatever is newest, and answering that from a directory laid down days ago
+  would quietly pin what the caller deliberately left open.
+- An application shipped with `dotcl pack --bundle DIR` looks next to its own
+  executable first, so it runs on a machine with no .NET SDK and no network.
+  A bundled layout is used even for a floating request: the answer was decided
+  at build time, and an installed program should not go re-check it.
+
+### Calling .NET
+
+- Members of an **explicit interface implementation** are reachable, through
+  `invoke-generic` as well.
+- A method with **optional parameters** can be called without them instead of
+  reporting no such method.
+- **Implicit conversion operators** are applied, including on the write path.
+- **Extension methods from an assembly loaded after startup** are visible.
+  They used to be invisible forever.
+- `dotnet:to-stream` wraps a one-way .NET stream.
+- An internal guess no longer runs a user's handler and swallows its non-local
+  exit.
+
+`docs/dotnet-package.md` now says up front that `dotnet:ref` and `dotnet:using`
+need `(require "dotnet-class")`. The note existed, but it sat after the examples
+that fail without it.
+
+### Serving HTTP with Kestrel
+
+`contrib/dotcl-kestrel` runs a Lack application on ASP.NET Core's Kestrel:
+
+    (require "dotcl-kestrel")
+    (dotcl-kestrel:run
+      (lambda (env)
+        (declare (ignore env))
+        (list 200 (list :content-type "text/plain") (list "hello")))
+      :port 5000)
+
+The request body is read before the Lisp handler runs and the response is
+written after it returns, both asynchronously, so `AllowSynchronousIO` stays
+off. A Lack application returns its body as a value, which fits that shape
+exactly.
+
+### Allocation
+
+The work this cycle targeted allocation that only shows up in real libraries,
+which is why `cl-bench` never saw it. The largest single cause was that a
+closure with no captured variables, sitting inside a fasl, was rebuilt on every
+call, so it cost nothing when a file was loaded from source and 376 bytes a call
+once the same file had been compiled.
+
+Bytes allocated per call, from one harness run in a v0.1.26 worktree and at
+v0.1.27, Release, 200,000 iterations, the two alternated. Every figure includes
+the 16 B the measuring loop itself costs, so a row reading 16 allocates nothing:
+
+| | v0.1.26 | v0.1.27 |
+| --- | --- | --- |
+| `(map 'list #'1+ l)`, l of length 5 | 1816 B | **320 B** |
+| `(remove-duplicates l)`, l of length 5 | 656 B | **240 B** |
+| `(call-next-method)` | 72 B | **16 B** |
+| generic function, 2 applicable methods | 48 B | **16 B** |
+| rational add, coprime denominators | 400 B | **288 B** |
+| rational multiply, bignum terms | 272 B | **168 B** |
+
+Behind those: direct entry points for `SEARCH`, `COUNT`, `COUNT-IF`,
+`POSITION-IF`, `REDUCE`, `RASSOC` and `GETF`; `REMOVE`, `SUBSTITUTE`, `DELETE`,
+`SORT`, `COERCE`, `CONCATENATE`, `MISMATCH`, `MAP` and the set operations no
+longer materializing a sequence before answering; `LIST` and `LIST*` no longer
+building an argument array beside the conses they return; local functions that
+are only called losing their closure; typed entry points for calls to a `&key`
+function that pass no keywords, or one pair; `shared-initialize` no longer
+building a hash set to initialize one initarg; and rational arithmetic
+rewritten to Knuth 4.5.1 rather than the ad-hoc special cases it had grown.
+
+### Fixes
+
+- A `make-load-form` literal in a fasl could quietly become `NIL` under GC.
+- `NCONC` could rewrite the tail of a folded constant template, so a function
+  returned something different the second time it was called.
+- A fasl literal depended on how the compiling image happened to see it.
+- `(type-of <a class object>)` always answered `T`.
+- `:from-end` with `:count` called the test function more often than the
+  sequence functions are allowed to.
+- `dotcl clean` works after global options instead of only as the first
+  argument.
+- contrib `.asd` files are `require-system` stubs now, so loading a contrib
+  through ASDF and through `require` take the same path.
+
 ## v0.1.26 -- 2026-08-23
 
 This release tightens what dotcl accepts, so code that was silently wrong can

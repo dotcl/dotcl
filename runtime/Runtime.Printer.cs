@@ -200,11 +200,23 @@ public static partial class Runtime
             ? EscapeSymbolName(sym.HomePackage.Name)
             : ApplyPrintCase(sym.HomePackage.Name);
         var (_, homeStatus) = sym.HomePackage.FindSymbol(sym.Name);
-        if (homeStatus == SymbolStatus.External)
+        if (homeStatus == SymbolStatus.External && !ForceInternalSymbolSyntax)
             return $"{pkgName}:{escapedName}";
         else
             return $"{pkgName}::{escapedName}";
     }
+
+    /// <summary>While set, a package-qualified symbol always prints with `::`, whether
+    /// or not it is external right now.
+    ///
+    /// Whether a symbol is external is state of the image doing the printing, but a fasl
+    /// literal is read back in a different one. A file that quotes the very symbols its
+    /// own toplevel EXPORT makes external -- cl+ssl's package.lisp is the shape -- got a
+    /// literal printed with single colons by an image where cl+ssl happened to be loaded,
+    /// and that text cannot be read at the point in the fasl where the export has not run
+    /// yet. `::` reads either way, so the fasl says what it means rather than what its
+    /// author's image happened to know.</summary>
+    [ThreadStatic] public static bool ForceInternalSymbolSyntax;
 
     /// <summary>
     /// Check if a symbol name needs escaping for round-trip readability.

@@ -1121,3 +1121,65 @@
 (deftest nmp-direct-after-inner-dispatch
   (nmp-direct-gf (make-instance 'nmp-direct-derived))
   (t (:base nil)))
+
+;;; A long-form method combination whose effective method is
+;;; (call-method m (next...)): the next-method list is what call-next-method
+;;; inside M walks. It used to be dropped, so call-next-method signalled
+;;; "no next method" under a long-form combination while the same methods under
+;;; the standard combination worked.
+
+(define-method-combination lfmc-chained ()
+  ((primary () :required t))
+  `(call-method ,(first primary) ,(rest primary)))
+
+(defclass lfmc-parent () ())
+(defclass lfmc-child (lfmc-parent) ())
+
+(defgeneric lfmc-h (x) (:method-combination lfmc-chained))
+(defmethod lfmc-h ((x lfmc-parent)) (list :parent))
+(defmethod lfmc-h ((x lfmc-child)) (cons :child (call-next-method)))
+
+(deftest long-form-combination-call-next-method
+  (lfmc-h (make-instance 'lfmc-child))
+  (:child :parent))
+
+(deftest long-form-combination-next-method-p
+  (progn
+    (defgeneric lfmc-p (x) (:method-combination lfmc-chained))
+    (defmethod lfmc-p ((x lfmc-parent)) (list (notnot (next-method-p))))
+    (defmethod lfmc-p ((x lfmc-child)) (cons (notnot (next-method-p)) (call-next-method)))
+    (lfmc-p (make-instance 'lfmc-child)))
+  (t nil))
+
+(deftest long-form-combination-single-method-has-no-next
+  (progn
+    (defgeneric lfmc-one (x) (:method-combination lfmc-chained))
+    (defmethod lfmc-one ((x lfmc-parent)) (notnot (next-method-p)))
+    (lfmc-one (make-instance 'lfmc-parent)))
+  nil)
+
+;; Two initargs naming the same slot, or the same initarg twice: the leftmost
+;; occurrence in the call supplies the value and later ones must not overwrite it
+;; (CLHS 7.1.4). shared-initialize guards this with a bitmask over slot layout
+;; indices, so these are the tests that hold the guard in place.
+(defclass si-dup () ((a :initarg :a :initarg :also-a)))
+
+(deftest shared-initialize-leftmost-initarg-wins
+  (list (slot-value (make-instance 'si-dup :a 1 :also-a 2) 'a)
+        (slot-value (make-instance 'si-dup :also-a 2 :a 1) 'a)
+        (slot-value (make-instance 'si-dup :a 1 :a 3) 'a))
+  (1 2 1))
+
+;; Past 64 slots the mask runs out and the guard falls back to a set. A slot at
+;; an index beyond the mask has to be guarded the same way.
+(eval `(defclass si-wide ()
+         ,(loop for i from 0 below 70
+                collect (list (intern (format nil "SI-WIDE-~D" i))
+                              :initarg (intern (format nil "S~D" i) "KEYWORD")
+                              :initarg (intern (format nil "T~D" i) "KEYWORD")))))
+
+(deftest shared-initialize-duplicate-guard-past-the-mask
+  (let ((object (make-instance 'si-wide :s69 1 :t69 2 :s0 3 :t0 4)))
+    (list (slot-value object (intern "SI-WIDE-69"))
+          (slot-value object (intern "SI-WIDE-0"))))
+  (1 3))

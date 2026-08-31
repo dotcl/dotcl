@@ -2830,7 +2830,13 @@
                                      ;; CLHS 7.1.2: :instance or :class. Anything
                                      ;; else used to be accepted and then treated
                                      ;; as :instance, silently.
-                                     (unless (member val '(:instance :class))
+                                     ;; That rule is about STANDARD-CLASS. AMOP has the
+                                     ;; metaclass decide what an allocation means, so
+                                     ;; under a custom metaclass the keyword is not ours
+                                     ;; to reject -- the same rule the unknown-slot-option
+                                     ;; check below follows.
+                                     (unless (or custom-metaclass-p
+                                                 (member val '(:instance :class)))
                                        (error 'program-error
                                               :format-control "DEFCLASS ~S: :allocation must be :INSTANCE or :CLASS in slot ~S, got ~S"
                                               :format-arguments (list name sname val)))
@@ -2889,7 +2895,11 @@
                                       (writers nil)
                                       (allocation nil)
                                       (custom-opts nil)
-                                      (slot-type nil))
+                                      ;; the keys that have already been seen twice, so a
+                                      ;; third occurrence appends rather than nesting
+                                      (multi-opts nil)
+                                      (slot-type nil)
+                                      (slot-doc nil))
                                  (loop while props
                                        do (let ((key (pop props))
                                                 (val (pop props)))
@@ -2899,21 +2909,50 @@
                                               ((eq key :accessor) (push val accessors))
                                               ((eq key :reader) (push val readers))
                                               ((eq key :writer) (push val writers))
-                                              ((eq key :allocation) (setf allocation val))
+                                              ;; A metaclass-defined allocation also goes
+                                              ;; into the raw plist: the two standard ones
+                                              ;; are carried by the slot definition itself,
+                                              ;; anything else has to reach the metaclass.
+                                              ((eq key :allocation)
+                                               (setf allocation val)
+                                               (unless (member val '(:instance :class))
+                                                 (push (cons key val) custom-opts)))
                                               ;; :type is kept for introspection
                                               ;; (slot-definition-type); dotcl does not
                                               ;; check slot values against it. It also
                                               ;; stays in custom-opts below when a custom
                                               ;; metaclass wants to see the raw plist.
+                                              ;; AMOP hands the slot documentation to
+                                              ;; EFFECTIVE-SLOT-DEFINITION-CLASS and
+                                              ;; DOCUMENTATION reads it back off the
+                                              ;; slot definition, so it has to reach
+                                              ;; the runtime rather than stay in the
+                                              ;; raw plist.
+                                              ((eq key :documentation)
+                                               (setf slot-doc val))
                                               ((eq key :type)
                                                (setf slot-type val)
                                                (push (cons key val) custom-opts))
                                               ;; Non-standard slot options (allowed under a custom
                                               ;; metaclass) are passed to DIRECT-SLOT-DEFINITION-CLASS
                                               ;; and seed the custom slotd's Lisp slots.
-                                              (t (push (cons key val) custom-opts)))))
+                                              ;; AMOP: a slot option given more than
+                                              ;; once reaches DIRECT-SLOT-DEFINITION-CLASS
+                                              ;; as a list of the values. One occurrence
+                                              ;; stays the value itself, which is what
+                                              ;; the other hosts do.
+                                              (t (let ((seen (assoc key custom-opts)))
+                                                   (cond
+                                                     ((null seen)
+                                                      (push (cons key val) custom-opts))
+                                                     ((member key multi-opts)
+                                                      (setf (cdr seen)
+                                                            (append (cdr seen) (list val))))
+                                                     (t
+                                                      (setf (cdr seen) (list (cdr seen) val))
+                                                      (push key multi-opts))))))))
                                  (list sname initargs initform-present initform accessors readers writers allocation
-                                       (nreverse custom-opts) slot-type))))
+                                       (nreverse custom-opts) slot-type slot-doc))))
                          (or slot-specs '())))
                ;; register :reader/:accessor names as slot-reader hints
                ;; (side effect at macro-expansion time, mirroring *struct-accessors*).
@@ -2982,6 +3021,7 @@
                                              (readers (sixth ps))
                                              (writers (seventh ps))
                                              (slot-type (tenth ps))
+                                             (slot-doc (nth 10 ps))
                                              ;; AMOP: an :accessor contributes both a
                                              ;; reader NAME and the writer (SETF NAME).
                                              (reader-names (reverse (append readers accessors)))
@@ -2999,7 +3039,8 @@
                                         ;; Introspectable attributes DEFCLASS already knows.
                                         ;; Emitted only when there is something to say, so
                                         ;; the common slot keeps its two-call expansion.
-                                        (if (or reader-names writer-names slot-type
+                                        (let ((with-attrs
+                                                (if (or reader-names writer-names slot-type
                                                 initform-present)
                                             `(%slot-def-attrs
                                               ,with-opts
@@ -3010,7 +3051,14 @@
                                               ;; cannot be turned back into it, and
                                               ;; SLOT-DEFINITION-INITFORM must return it.
                                               ',(and initform-present initform))
-                                            with-opts))))
+                                            with-opts)))
+                                          ;; The documentation gets its own call, so a
+                                          ;; slot without one emits nothing extra and
+                                          ;; a FASL built before this keeps finding the
+                                          ;; attribute setter it was compiled against.
+                                          (if slot-doc
+                                              `(%slot-def-doc ,with-attrs ',slot-doc)
+                                              with-attrs)))))
                                   parsed-slots)))
                ;; Accessor definitions
                (accessor-defs
@@ -3053,8 +3101,12 @@
                  (when default-initargs-forms
                    (let ((args nil))
                      (dolist (pair (reverse default-initargs-forms))
+                       ;; AMOP's canonicalized default initarg is (name form
+                       ;; function): the form has to be carried because a thunk
+                       ;; cannot be turned back into it.
                        (setf args (append args
                                           (list `',(first pair)
+                                                `',(second pair)
                                                 `(lambda () ,(second pair))))))
                      `(%set-class-default-initargs
                        (find-class ',name)
@@ -3441,6 +3493,20 @@
                ,@(if mc-args
                      `((%set-method-combination-args %gf (list ,@mc-args)))
                      nil)
+               ;; AMOP: defgeneric asks for the method combination metaobject by
+               ;; name. dotcl decides the combination from the symbol either way;
+               ;; the call is what a generic function class specializes.
+               (%note-method-combination %gf ',(or mc-name 'standard) (list ,@mc-args))
+               ;; (declare ...) option: AMOP reads the same list back with
+               ;; GENERIC-FUNCTION-DECLARATIONS, which is what closer-mop asks for.
+               ;; CLHS allows the option once; appending keeps a repeated one from
+               ;; silently dropping the earlier specifiers.
+               ,@(let ((decls nil))
+                   (dolist (opt options)
+                     (when (and (consp opt) (symbolp (car opt))
+                                (string= (symbol-name (car opt)) "DECLARE"))
+                       (setf decls (append decls (cdr opt)))))
+                   (if decls `((%set-gf-declarations %gf (quote ,decls))) nil))
                ;; Set symbol-function to the GF object directly
                (setf (fdefinition ',name) %gf))
              ;; Process inline :method definitions and mark them as from defgeneric
@@ -3544,6 +3610,26 @@
                ((not (consp x)) nil)
              (when (%cnm-needs-capture-p (car x)) (return t))))))
 
+;;; AMOP has DEFMETHOD hand its method lambda to MAKE-METHOD-LAMBDA and compile
+;;; what comes back, which is how a generic function class wraps method bodies.
+;;; That happens here, at macroexpansion time, because that is when there is a
+;;; form to process and a compiler to give it to.
+;;;
+;;; Two things have to be true. The compiler has to be running inside dotcl --
+;;; while cross-compiling the host has no generic functions to ask. And the
+;;; generic function has to exist already, since it is its class that decides:
+;;; a DEFMETHOD that creates the generic function on the spot gets the
+;;; unprocessed lambda, which is the fallback every implementation makes here.
+;;; %MAKE-METHOD-LAMBDA-FOR answers with the form unchanged in both cases, and
+;;; also while nobody has specialised the protocol.
+(defun %method-lambda-via-protocol (name lambda-form)
+  (if *cross-compiling*
+      lambda-form
+      (let ((processed (%make-method-lambda-for name lambda-form)))
+        (if (and (consp processed) (eq (car processed) 'lambda))
+            processed
+            lambda-form))))
+
 ;;; --- defmethod ---
 (setf (gethash 'defmethod *macros*)
       (lambda (form)
@@ -3588,7 +3674,7 @@
                             ;; Handle EQL specializers: (param (eql value))
                             (cond
                               ((and (consp spec) (eq (car spec) 'eql))
-                               (push `(list 'eql ,(cadr spec)) specializers))
+                               (push `(%intern-eql-specializer ,(cadr spec)) specializers))
                               ;; A specializer may be a class object, not just a
                               ;; class-name symbol — e.g. (param #.(find-class 'foo)).
                               ;; Use it directly; passing a class object to find-class
@@ -3677,7 +3763,9 @@
                    (let ((%m (%make-method
                                (list ,@specializers)
                                ,qual-list
-                               ,(let* ((bn (if (and (consp name) (eq (car name) 'setf))
+                               ,(%method-lambda-via-protocol
+                                 name
+                                 (let* ((bn (if (and (consp name) (eq (car name) (quote setf)))
                                               (cadr name)
                                               name))
                                        (cv (gensym "CNM-"))
@@ -3694,12 +3782,15 @@
                                                          (%walk-replace-cnm b cv nv))
                                                        body))))
                                       `(lambda ,plain-params
-                                         (block ,bn ,@body)))))))
+                                         (block ,bn ,@body))))))))
                      (%set-method-lambda-list-info %m ,m-required-count ,m-optional-count
                                                    ,(if m-has-rest t nil)
                                                    ,(if m-has-key t nil)
                                                    ,(if m-has-allow-other-keys t nil)
                                                    (list ,@(mapcar (lambda (k) `',k) m-keyword-names)))
+                     ;; AMOP: defmethod asks the generic function what class its
+                     ;; methods are, and the method is an instance of the answer.
+                     (%note-method-class (%find-gf ',name) %m)
                      (%add-method (%find-gf ',name) %m)
                      ,@(when (and docstring (not *cross-compiling*))
                          `((funcall #'(setf documentation) ,docstring %m t)))

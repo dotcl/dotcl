@@ -284,7 +284,11 @@ public static class Startup
         // is loaded: a name that missed (or resolved elsewhere) before may now
         // resolve, and a reloaded module must re-resolve rather than keep a
         // stale Type. Guarded so the base-dir probe's own loads don't self-clear.
-        AppDomain.CurrentDomain.AssemblyLoad += (_, _) => Runtime.MarkTypeCacheDirty();
+        AppDomain.CurrentDomain.AssemblyLoad += (_, _) =>
+        {
+            Runtime.MarkTypeCacheDirty();
+            Runtime.ClearExtensionMethodCache();
+        };
 
         // Create packages
         CL = new Package("COMMON-LISP", "CL");
@@ -1092,13 +1096,16 @@ public static class Startup
         return ReferenceEquals(a, b);
     }
 
-    /// <summary>Convert a Lisp list to an array.</summary>
+    /// <summary>Convert a Lisp list to an array, counting it first so that exactly
+    /// one array of the right size is allocated.</summary>
     internal static LispObject[] ListToArray(Cons list)
     {
-        var result = new List<LispObject>();
-        LispObject cur = list;
-        while (cur is Cons c) { result.Add(c.Car); cur = c.Cdr; }
-        return result.ToArray();
+        int n = 0;
+        for (LispObject cur = list; cur is Cons c; cur = c.Cdr) n++;
+        var result = new LispObject[n];
+        int i = 0;
+        for (LispObject cur = list; cur is Cons c; cur = c.Cdr) result[i++] = c.Car;
+        return result;
     }
 
     // FlushStream: moved to Runtime.IO.cs
@@ -2111,6 +2118,21 @@ public static class Startup
             return Nil.Instance; // unreachable
         }));
 
+        // dotcl:script-arguments — what a script was given, and nothing else.
+        //
+        // COMMAND-LINE-ARGUMENTS below is shaped for uiop, which means a script's own
+        // arguments sit behind a "--" marker: reading the first element of it answers
+        // "dotcl", which is what everyone writes first and it is always wrong. This is
+        // the plain list, empty when dotcl was not started on a script.
+        RegisterDotcl("SCRIPT-ARGUMENTS", new LispFunction(args => {
+            LispObject result = Nil.Instance;
+            var sa = Runtime.ScriptArgs;
+            if (sa != null)
+                for (int i = sa.Count - 1; i >= 0; i--)
+                    result = new Cons(new LispString(sa[i]), result);
+            return result;
+        }, "SCRIPT-ARGUMENTS", 0));
+
         // dotcl:command-line-arguments — argv as uiop:raw-command-line-arguments
         // expects it on dotcl.
         //
@@ -2351,6 +2373,50 @@ public static class Startup
         // dotcl:%phase-time — charge a thunk's elapsed time to a named phase.
         // Lets the Lisp compiler mark its own phase boundaries; a no-op beyond
         // calling the thunk unless DOTCL_PHASE_PROF=1.
+        // dotcl::%invoke-native-ret — call a function through the raw-return native
+        // entry (long args in, long out), the way a compiled call site will once
+        // those call sites exist. Diagnostic, not API: until the compiler emits
+        // them, this is the only thing that reaches InvokeNativeRetN, and without
+        // it the fallback arms would ship unexercised.
+        RegisterDotclInternal("%INVOKE-NATIVE-RET", new LispFunction(args => {
+            if (args.Length < 2 || args.Length > 5 || args[0] is not LispFunction fn)
+                throw new LispErrorException(new LispProgramError(
+                    "DOTCL::%INVOKE-NATIVE-RET: requires (function arg1 .. arg4)"));
+            long Arg(int i) => args[i] is Fixnum f
+                ? f.Value
+                : throw new LispErrorException(new LispTypeError(
+                      "DOTCL::%INVOKE-NATIVE-RET: arguments must be fixnums",
+                      args[i], Sym("FIXNUM")));
+            long r = args.Length switch
+            {
+                2 => fn.InvokeNativeRet1(Arg(1)),
+                3 => fn.InvokeNativeRet2(Arg(1), Arg(2)),
+                4 => fn.InvokeNativeRet3(Arg(1), Arg(2), Arg(3)),
+                _ => fn.InvokeNativeRet4(Arg(1), Arg(2), Arg(3), Arg(4)),
+            };
+            return Fixnum.Make(r);
+        }, "DOTCL::%INVOKE-NATIVE-RET", -1));
+
+        // dotcl::%invoke-native — same, for the raw-argument entry (long args in,
+        // LispObject out). Exercises the other fallback arm.
+        RegisterDotclInternal("%INVOKE-NATIVE", new LispFunction(args => {
+            if (args.Length < 2 || args.Length > 5 || args[0] is not LispFunction fn)
+                throw new LispErrorException(new LispProgramError(
+                    "DOTCL::%INVOKE-NATIVE: requires (function arg1 .. arg4)"));
+            long Arg(int i) => args[i] is Fixnum f
+                ? f.Value
+                : throw new LispErrorException(new LispTypeError(
+                      "DOTCL::%INVOKE-NATIVE: arguments must be fixnums",
+                      args[i], Sym("FIXNUM")));
+            return args.Length switch
+            {
+                2 => fn.InvokeNative1(Arg(1)),
+                3 => fn.InvokeNative2(Arg(1), Arg(2)),
+                4 => fn.InvokeNative3(Arg(1), Arg(2), Arg(3)),
+                _ => fn.InvokeNative4(Arg(1), Arg(2), Arg(3), Arg(4)),
+            };
+        }, "DOTCL::%INVOKE-NATIVE", -1));
+
         RegisterDotclInternal("%PHASE-TIME", new LispFunction(args => {
             if (args.Length != 2 || args[1] is not LispFunction thunk)
                 throw new LispErrorException(new LispProgramError(

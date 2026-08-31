@@ -210,6 +210,13 @@ public static partial class Runtime
             if (IsTrueEql(item, c.Car)) return current;
             current = c.Cdr;
         }
+        // Walking off a dotted list without finding the item is a type error --
+        // this is where MEMBER learns the list was improper. MemberCore, which
+        // the keyword-taking entries use, has always checked; this two-argument
+        // entry (what the compiler emits for (member x l)) did not, so the set
+        // functions built on it silently accepted a dotted second argument.
+        if (current is not Nil)
+            throw new LispErrorException(new LispTypeError("MEMBER: not a proper list", current, Startup.Sym("LIST")));
         return Nil.Instance;
     }
 
@@ -271,6 +278,11 @@ public static partial class Runtime
     public static LispObject Caddr(LispObject obj) => Car(Cdr(Cdr(obj)));
 
     // --- Plist operations ---
+
+    /// <summary>(GETF plist indicator) -- the two-argument shape, so the call does
+    /// not build an args array just to supply the NIL default.</summary>
+    public static LispObject Getf(LispObject plist, LispObject indicator) =>
+        Getf(plist, indicator, Nil.Instance);
 
     public static LispObject Getf(LispObject plist, LispObject indicator, LispObject defaultVal)
     {
@@ -743,30 +755,84 @@ public static partial class Runtime
         return head;
     }
 
+    /// <summary>MAPCAR over exactly two lists, as a direct entry: (MAPCAR f a b) is
+    /// the common multi-list shape, and reaching it without an argument array means
+    /// the call allocates nothing before the walk begins.</summary>
+    public static LispObject Mapcar2(LispObject func, LispObject l1, LispObject l2)
+    {
+        var fn = CoerceToFunction(func);
+        Cons? head = null, tail = null;
+        LispObject a = l1, b = l2;
+        while (a is Cons c0 && b is Cons c1)
+        {
+            a = c0.Cdr; b = c1.Cdr;
+            var cell = new Cons(UnwrapMv(fn.Invoke2(c0.Car, c1.Car)), Nil.Instance);
+            if (tail == null) { head = cell; tail = cell; }
+            else { tail.Cdr = cell; tail = cell; }
+        }
+        return (LispObject?)head ?? Nil.Instance;
+    }
+
+    /// <summary>MAPCAR over two or more lists.
+    ///
+    /// The result conses are built as the walk goes, the way the one-list MAPCAR
+    /// above already did. This used to collect into a List, call ToArray, and hand
+    /// that to LIST -- three intermediates for a result it could write directly --
+    /// and build a fresh argument array for the callee on EVERY element on top of
+    /// that. Two lists of three elements cost 663.9 bytes where SBCL costs 47.2,
+    /// against a 94.4-byte floor (a .NET cons is twice the size of an SBCL cons).
+    ///
+    /// Two, three and four lists call through the per-arity entries, so those need
+    /// no argument array at all. Beyond that one is still built per element: it
+    /// cannot be reused, because a callee with andrest may keep it.</summary>
     public static LispObject MapcarN(LispObject func, LispObject[] lists)
     {
         var fn = CoerceToFunction(func);
         int nLists = lists.Length;
         var cursors = new LispObject[nLists];
         for (int i = 0; i < nLists; i++) cursors[i] = lists[i];
-        var results = new List<LispObject>();
+        Cons? head = null, tail = null;
         while (true)
         {
-            var args = new LispObject[nLists];
-            bool done = false;
-            for (int i = 0; i < nLists; i++)
+            LispObject value;
+            if (nLists == 2)
             {
-                if (cursors[i] is Cons c)
-                {
-                    args[i] = c.Car;
-                    cursors[i] = c.Cdr;
-                }
-                else { done = true; break; }
+                if (cursors[0] is not Cons c0 || cursors[1] is not Cons c1) break;
+                cursors[0] = c0.Cdr; cursors[1] = c1.Cdr;
+                value = UnwrapMv(fn.Invoke2(c0.Car, c1.Car));
             }
-            if (done) break;
-            results.Add(UnwrapMv(fn.Invoke(args)));
+            else if (nLists == 3)
+            {
+                if (cursors[0] is not Cons c0 || cursors[1] is not Cons c1 ||
+                    cursors[2] is not Cons c2) break;
+                cursors[0] = c0.Cdr; cursors[1] = c1.Cdr; cursors[2] = c2.Cdr;
+                value = UnwrapMv(fn.Invoke3(c0.Car, c1.Car, c2.Car));
+            }
+            else if (nLists == 4)
+            {
+                if (cursors[0] is not Cons c0 || cursors[1] is not Cons c1 ||
+                    cursors[2] is not Cons c2 || cursors[3] is not Cons c3) break;
+                cursors[0] = c0.Cdr; cursors[1] = c1.Cdr;
+                cursors[2] = c2.Cdr; cursors[3] = c3.Cdr;
+                value = UnwrapMv(fn.Invoke4(c0.Car, c1.Car, c2.Car, c3.Car));
+            }
+            else
+            {
+                var args = new LispObject[nLists];
+                bool done = false;
+                for (int i = 0; i < nLists; i++)
+                {
+                    if (cursors[i] is Cons c) { args[i] = c.Car; cursors[i] = c.Cdr; }
+                    else { done = true; break; }
+                }
+                if (done) break;
+                value = UnwrapMv(fn.Invoke(args));
+            }
+            var cell = new Cons(value, Nil.Instance);
+            if (tail == null) { head = cell; tail = cell; }
+            else { tail.Cdr = cell; tail = cell; }
         }
-        return List(results.ToArray());
+        return (LispObject?)head ?? Nil.Instance;
     }
 
     // --- Multiple values ---
@@ -776,6 +842,35 @@ public static partial class Runtime
 
     /// <summary>The two-value entry the compiler emits for (VALUES A B), which is the
     /// overwhelmingly common shape. Skips the argument array the general entry needs.</summary>
+    /// <summary>The N-th value of what a form returned, without building the list of
+    /// all of them. NTH-VALUE otherwise expands to (NTH n (MULTIPLE-VALUE-LIST
+    /// form)), which conses once per value to hand back one.
+    ///
+    /// PRIMARY is the form's result. The values reach here two ways and both have
+    /// to be read, exactly as MULTIPLEVALUESLIST1 does it: an MvReturn carries them
+    /// itself, while a callee that only published to the thread state (every C#
+    /// builtin returning several values, FIND-SYMBOL and GETHASH among them)
+    /// returns the primary alone. The thread state is this call's only when its
+    /// count is set and its first value is that primary -- otherwise it belongs to
+    /// some earlier call and index 0 is the whole answer.
+    ///
+    /// The state is consumed either way, so a surrounding MULTIPLE-VALUE-LIST does
+    /// not see values NTH-VALUE already reduced to one.</summary>
+    public static LispObject NthValueOf(LispObject primary, int n)
+    {
+        if (primary is MvReturn mv)
+        {
+            MultipleValues.Reset();
+            return mv[n];
+        }
+        int count = MultipleValues.Count;
+        LispObject[] vals = count > 0 ? MultipleValues.Get() : Array.Empty<LispObject>();
+        MultipleValues.Reset();
+        if (count > 0 && vals.Length > 0 && ReferenceEquals(vals[0], primary))
+            return n >= 0 && n < vals.Length ? vals[n] : Nil.Instance;
+        return n == 0 ? primary : Nil.Instance;
+    }
+
     public static LispObject Values2(LispObject a, LispObject b) =>
         MultipleValues.Values2(a, b);
 
@@ -794,18 +889,35 @@ public static partial class Runtime
         return obj;
     }
 
+    /// <summary>VALUES-LIST. Counts the list first and fills one array of exactly
+    /// that size: the previous version grew a List and then copied it with ToArray,
+    /// so a three-element list paid for the List, its backing array, and the copy
+    /// on top of the array MvReturn keeps. The count walk is cheap next to that,
+    /// and it is also where an improper list has to be caught anyway.
+    ///
+    /// Zero, one and two values need no array at all -- MvReturn carries up to two
+    /// inline -- so those go to the entries that take them as arguments.</summary>
     public static LispObject ValuesList(LispObject list)
     {
-        var items = new System.Collections.Generic.List<LispObject>();
+        int n = 0;
         var cur = list;
-        while (cur is Cons c)
-        {
-            items.Add(c.Car);
-            cur = c.Cdr;
-        }
+        while (cur is Cons c) { n++; cur = c.Cdr; }
         if (cur is not Nil)
             throw new LispErrorException(new LispTypeError("VALUES-LIST: not a proper list", list));
-        return MultipleValues.Values(items.ToArray());
+        switch (n)
+        {
+            case 0: return MultipleValues.Values0();
+            case 1: return MultipleValues.Primary(((Cons)list).Car);
+            case 2:
+            {
+                var c0 = (Cons)list;
+                return MultipleValues.Values2(c0.Car, ((Cons)c0.Cdr).Car);
+            }
+        }
+        var items = new LispObject[n];
+        cur = list;
+        for (int i = 0; i < n; i++) { var c = (Cons)cur; items[i] = c.Car; cur = c.Cdr; }
+        return MultipleValues.Values(items);
     }
 
     // --- Control flow helpers ---
@@ -1281,9 +1393,11 @@ public static partial class Runtime
             : obj is LispVector lv && lv.IsCharVector ? new Symbol(lv.ToCharString())
             : throw new LispErrorException(new LispTypeError("MAKE-SYMBOL: not a string", obj)));
 
-        // MAPCAR (variadic)
-        Emitter.CilAssembler.RegisterFunction("MAPCAR",
-            new LispFunction(args => {
+        // MAPCAR (variadic). Direct entries for one and two lists, the shapes real
+        // code writes: without them the call built an argument array before MAPCAR
+        // even started, and the two-list entry also skips copying the lists out of
+        // that array into another one.
+        var mapcarFn = new LispFunction(args => {
                 if (args.Length < 2)
                     throw new LispErrorException(new LispProgramError("MAPCAR: too few arguments"));
                 if (args.Length == 2)
@@ -1291,7 +1405,11 @@ public static partial class Runtime
                 var lists = new LispObject[args.Length - 1];
                 Array.Copy(args, 1, lists, 0, lists.Length);
                 return Runtime.MapcarN(args[0], lists);
-            }));
+            });
+        mapcarFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject>)Runtime.Mapcar);
+        mapcarFn.SetDirectDelegate(
+            (Func<LispObject, LispObject, LispObject, LispObject>)Runtime.Mapcar2);
+        Emitter.CilAssembler.RegisterFunction("MAPCAR", mapcarFn);
 
         // STRING-TRIM, STRING-LEFT-TRIM, STRING-RIGHT-TRIM
         Startup.RegisterBinary("STRING-TRIM", Runtime.StringTrim);

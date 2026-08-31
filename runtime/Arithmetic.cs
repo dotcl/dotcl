@@ -50,6 +50,7 @@ public static class Arithmetic
 
         var (an, ad) = AsRational(a);
         var (bn, bd) = AsRational(b);
+        if (BothExact(a, b)) return RationalAddSub(an, ad, bn, bd, false);
         return (Number)Ratio.Make(an * bd + bn * ad, ad * bd);
     }
 
@@ -94,6 +95,7 @@ public static class Arithmetic
 
         var (an, ad) = AsRational(a);
         var (bn, bd) = AsRational(b);
+        if (BothExact(a, b)) return RationalAddSub(an, ad, bn, bd, true);
         return (Number)Ratio.Make(an * bd - bn * ad, ad * bd);
     }
 
@@ -156,6 +158,7 @@ public static class Arithmetic
 
         var (an, ad) = AsRational(a);
         var (bn, bd) = AsRational(b);
+        if (BothExact(a, b)) return RationalMultiply(an, ad, bn, bd);
         return (Number)Ratio.Make(an * bn, ad * bd);
     }
 
@@ -205,6 +208,17 @@ public static class Arithmetic
 
         var (an, ad) = AsRational(a);
         var (bn, bd) = AsRational(b);
+        // Division is multiplication by the reciprocal, which is the divisor
+        // turned upside down -- still a reduced fraction, once the sign is moved
+        // to the numerator.
+        if (BothExact(a, b))
+        {
+            if (bn.IsZero) throw new DivideByZeroException("Division by zero");
+            var rn = bd;
+            var rd = bn;
+            if (rd.Sign < 0) { rn = -rn; rd = -rd; }
+            return RationalMultiply(an, ad, rn, rd);
+        }
         return (Number)Ratio.Make(an * bd, ad * bn);
     }
 
@@ -477,6 +491,12 @@ public static class Arithmetic
         if (aFloat && bFloat)
             return ToDouble(a) == ToDouble(b);
 
+        // Two integers compare as themselves. The rational form below multiplies
+        // each by the other.s denominator, and an integer.s denominator is 1: a
+        // full BigInteger multiply that copies the whole magnitude to produce the
+        // number it started with. ZEROP on a bignum coefficient does this.
+        if (a is Bignum or Fixnum && b is Bignum or Fixnum)
+            return IntValue(a) == IntValue(b);
         var (an, ad) = AsRational(a);
         var (bn, bd) = AsRational(b);
         return an * bd == bn * ad;
@@ -517,6 +537,9 @@ public static class Arithmetic
         if (aFloat && bFloat)
             return ToDouble(a).CompareTo(ToDouble(b));
 
+        // See IsNumericEqualSlow: two integers need no cross-multiplication.
+        if (a is Bignum or Fixnum && b is Bignum or Fixnum)
+            return IntValue(a).CompareTo(IntValue(b));
         var (an, ad) = AsRational(a);
         var (bn, bd) = AsRational(b);
         return (an * bd).CompareTo(bn * ad);
@@ -811,6 +834,61 @@ public static class Arithmetic
     /// integers does not build a rational and reduce it.</summary>
     private static BigInteger IntValue(Number n) =>
         n is Fixnum f ? f.Value : ((Bignum)n).Value;
+
+    // --- Exact rational arithmetic (Knuth 4.5.1) ---
+    //
+    // The naive way to add or multiply two fractions is to combine them and then
+    // reduce the result by a GCD. That GCD runs on the products, which are about
+    // twice as long as the operands, and it is the dominant cost. Taking the
+    // common factors out FIRST -- from the denominators for a sum, crosswise for
+    // a product -- means every GCD runs on operand-sized numbers, and in the
+    // common case where they share no factor it means no reduction at all.
+    //
+    // Both operands must be reduced fractions with positive denominators, which
+    // is what AsRational gives for a Fixnum, a Bignum or a Ratio (a Ratio is
+    // reduced by construction). A LispDecimal is not covered.
+
+    /// <summary>GCD with the cases that need no division taken first. GCD of a
+    /// thousand-digit number with 1 still divides it, for an answer that was
+    /// known by inspection.</summary>
+    private static BigInteger GcdFast(BigInteger x, BigInteger y)
+    {
+        if (x.IsOne || y.IsOne) return BigInteger.One;
+        if (x.IsZero) return y;
+        if (y.IsZero) return x;
+        return BigInteger.GreatestCommonDivisor(x, y);
+    }
+
+    /// <summary>AN/AD + BN/BD (or minus, when SUBTRACT), already in lowest terms.</summary>
+    private static Number RationalAddSub(BigInteger an, BigInteger ad,
+                                         BigInteger bn, BigInteger bd, bool subtract)
+    {
+        if (subtract) bn = -bn;
+        var g1 = GcdFast(ad, bd);
+        // Denominators with no common factor: the sum over their product is
+        // already in lowest terms. This is every integer-plus-fraction, and most
+        // fraction pairs.
+        if (g1.IsOne) return Ratio.MakeReduced(an * bd + bn * ad, ad * bd);
+        var ad1 = ad / g1;
+        var t = an * (bd / g1) + bn * ad1;
+        var g2 = GcdFast(BigInteger.Abs(t), g1);
+        return Ratio.MakeReduced(t / g2, ad1 * (bd / g2));
+    }
+
+    /// <summary>(AN/AD) * (BN/BD), already in lowest terms.</summary>
+    private static Number RationalMultiply(BigInteger an, BigInteger ad,
+                                           BigInteger bn, BigInteger bd)
+    {
+        // Cancel each numerator against the OTHER denominator: that is where a
+        // common factor can be, and the numbers are still operand-sized here.
+        // Dividing by a factor of 1 is skipped -- BigInteger divides even by one,
+        // and for coprime operands that would be four such divisions.
+        var g1 = GcdFast(BigInteger.Abs(an), bd);
+        var g2 = GcdFast(BigInteger.Abs(bn), ad);
+        var num = (g1.IsOne ? an : an / g1) * (g2.IsOne ? bn : bn / g2);
+        var den = (g2.IsOne ? ad : ad / g2) * (g1.IsOne ? bd : bd / g1);
+        return Ratio.MakeReduced(num, den);
+    }
 
     private static (BigInteger num, BigInteger den) AsRational(Number n) => n switch
     {

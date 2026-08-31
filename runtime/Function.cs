@@ -520,21 +520,74 @@ public class LispFunction : LispObject
 
     public LispObject Invoke7(LispObject a, LispObject b, LispObject c, LispObject d, LispObject e, LispObject f, LispObject g)
     {
-        if (_func7 != null) { PeriodicStackCheck(); var args = new[] { a, b, c, d, e, f, g }; using (PushFrame(args)) return _func7(a, b, c, d, e, f, g); }
+        if (_func7 != null)
+        {
+            PeriodicStackCheck();
+            // Same anonymous-callee skip as Invoke5/Invoke6. Without it these two
+            // arities allocated the frame array on every call even when nothing
+            // would ever read it, which is a per-CALL cost against the per-ENTRY
+            // saving the compiler's capture lifting is trying to buy.
+            if (_frameName == null) return _func7(a, b, c, d, e, f, g);
+            var args = new[] { a, b, c, d, e, f, g };
+            using (PushFrame(args)) return _func7(a, b, c, d, e, f, g);
+        }
         return InvokeSlow(new[] { a, b, c, d, e, f, g });
     }
 
     public LispObject Invoke8(LispObject a, LispObject b, LispObject c, LispObject d, LispObject e, LispObject f, LispObject g, LispObject h)
     {
-        if (_func8 != null) { PeriodicStackCheck(); var args = new[] { a, b, c, d, e, f, g, h }; using (PushFrame(args)) return _func8(a, b, c, d, e, f, g, h); }
+        if (_func8 != null)
+        {
+            PeriodicStackCheck();
+            if (_frameName == null) return _func8(a, b, c, d, e, f, g, h);
+            var args = new[] { a, b, c, d, e, f, g, h };
+            using (PushFrame(args)) return _func8(a, b, c, d, e, f, g, h);
+        }
         return InvokeSlow(new[] { a, b, c, d, e, f, g, h });
     }
 
-    // Native fixnum invoke: long args avoid boxing, LispObject return is body result
-    public LispObject InvokeNative1(long a) => _nativeFunc1!(this, a);
-    public LispObject InvokeNative2(long a, long b) => _nativeFunc2!(this, a, b);
-    public LispObject InvokeNative3(long a, long b, long c) => _nativeFunc3!(this, a, b, c);
-    public LispObject InvokeNative4(long a, long b, long c, long d) => _nativeFunc4!(this, a, b, c, d);
+    // Native fixnum invoke: long args avoid boxing, LispObject return is body result.
+    //
+    // The null arms matter as soon as a call site names a function other than the
+    // one it sits in. A call site compiles against what the callee looked like
+    // then; the callee is fetched from its symbol on every call (LOAD-SYM-FN
+    // caches the Symbol, not the function), so by the time the call runs the
+    // function may have been redefined into one with no native entry at all --
+    // interpreted, or with arguments that are not declared fixnums. Boxing the
+    // arguments and going through the ordinary entry gives the same answer, only
+    // slower, which is the property that lets a call site assume a native entry
+    // without the assumption being load-bearing for correctness.
+    public LispObject InvokeNative1(long a) =>
+        _nativeFunc1 != null ? _nativeFunc1(this, a)
+                             : Invoke1(Fixnum.Make(a));
+    public LispObject InvokeNative2(long a, long b) =>
+        _nativeFunc2 != null ? _nativeFunc2(this, a, b)
+                             : Invoke2(Fixnum.Make(a), Fixnum.Make(b));
+    public LispObject InvokeNative3(long a, long b, long c) =>
+        _nativeFunc3 != null ? _nativeFunc3(this, a, b, c)
+                             : Invoke3(Fixnum.Make(a), Fixnum.Make(b), Fixnum.Make(c));
+    public LispObject InvokeNative4(long a, long b, long c, long d) =>
+        _nativeFunc4 != null ? _nativeFunc4(this, a, b, c, d)
+                             : Invoke4(Fixnum.Make(a), Fixnum.Make(b), Fixnum.Make(c), Fixnum.Make(d));
+
+    // Raw-return native invoke: long args in, long out. The callee-side entry
+    // that would avoid boxing the result does not exist yet, so these go through
+    // the argument-side native entry and turn the result back into a long: a
+    // redefined callee may return something that is not a fixnum at all, and that
+    // has to reach the caller as a Lisp TYPE-ERROR naming the value, not as an
+    // InvalidCastException from the middle of the call sequence.
+    public long InvokeNativeRet1(long a) => AsRawFixnum(InvokeNative1(a));
+    public long InvokeNativeRet2(long a, long b) => AsRawFixnum(InvokeNative2(a, b));
+    public long InvokeNativeRet3(long a, long b, long c) => AsRawFixnum(InvokeNative3(a, b, c));
+    public long InvokeNativeRet4(long a, long b, long c, long d) =>
+        AsRawFixnum(InvokeNative4(a, b, c, d));
+
+    private long AsRawFixnum(LispObject v) =>
+        v is Fixnum f
+            ? f.Value
+            : throw new LispErrorException(new LispTypeError(
+                  $"{StatsName ?? Name ?? "anonymous function"}: declared to return a fixnum, returned {v}",
+                  v, Startup.Sym("FIXNUM")));
 
     // Install a native long→LispObject delegate for the appropriate arity.
     public void SetNativeDelegate(Delegate del)

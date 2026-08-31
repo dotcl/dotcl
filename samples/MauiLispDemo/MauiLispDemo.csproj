@@ -80,7 +80,7 @@
 	     deliberately not bumped every release — this sample shows the shipping
 	     flow, not the latest runtime. -->
 	<ItemGroup>
-		<PackageReference Include="DotCL.Runtime" Version="0.1.18" />
+		<PackageReference Include="DotCL.Runtime" Version="0.1.26" />
 	</ItemGroup>
 
 	<!-- MainPage.xaml embedded as an assembly manifest resource.

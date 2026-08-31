@@ -98,5 +98,51 @@ namespace DotCL.TestSupport
         public ColorBox(ColorVal c, double opacity = 1.0) { Tag = $"color {c.R} op {opacity}"; }
         public ColorBox(uint argb) { Tag = $"uint {argb}"; }
     }
+
+    // Explicit interface implementations: private on the concrete type, so
+    // reflection over its public members cannot see them. No BCL type expresses
+    // the generic-method case conveniently, and dotnet:%define-class cannot emit
+    // an explicit implementation.
+    public interface IEcho
+    {
+        T Echo<T>(T value);
+        string Where { get; }
+    }
+
+    public class ExplicitEcho : IEcho
+    {
+        public string Where => "class";                 // shadowed by the explicit one
+        T IEcho.Echo<T>(T value) => value;
+        string IEcho.Where => "interface";
+    }
+
+    // A struct reachable from a string only through an implicit operator, the
+    // shape ASP.NET uses everywhere (StringValues, PathString, HostString). The
+    // setter below takes it, so assigning a string has to apply the operator.
+    public struct Tag
+    {
+        public string Text;
+        public Tag(string text) { Text = text; }
+        public static implicit operator Tag(string s) => new Tag(s);
+        public override string ToString() => Text ?? "";
+    }
+
+    public class TagBox
+    {
+        public Tag Slot { get; set; }
+        public string Read() => Slot.ToString();
+    }
+
+    // An interface whose members are implemented explicitly, one of them inherited
+    // from a base interface: a cast to IDerived has to reach BaseValue as well.
+    public interface IBase { int BaseValue { get; } }
+    public interface IDerived : IBase { int OwnValue { get; } }
+
+    public class Layered : IDerived
+    {
+        int IBase.BaseValue => 1;
+        int IDerived.OwnValue => 2;
+    }
+
 }
 #endif

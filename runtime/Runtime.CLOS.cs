@@ -132,6 +132,27 @@ public static partial class Runtime
         return fwd;
     }
 
+    /// <summary>Called when a class gains or loses a direct superclass, so AMOP.s
+    /// ADD-DIRECT-SUBCLASS / REMOVE-DIRECT-SUBCLASS run. Installed by Mop.Init;
+    /// null until then, so class registration during the bootstrap is unaffected.</summary>
+    public static Action<LispObject, LispObject, bool>? DirectSubclassHook;
+
+    /// <summary>Report the difference between a class.s old and new direct
+    /// superclasses. A redefinition that drops a superclass has to report the drop,
+    /// or a metaobject class keeping its own registry would keep a stale entry.</summary>
+    private static void NotifyDirectSubclasses(LispClass[] oldSupers, LispClass[] newSupers,
+        LispClass subclass)
+    {
+        var hook = DirectSubclassHook;
+        if (hook == null) return;
+        foreach (var super in oldSupers)
+            if (System.Array.IndexOf(newSupers, super) < 0)
+                hook(super, subclass, false);
+        foreach (var super in newSupers)
+            if (System.Array.IndexOf(oldSupers, super) < 0)
+                hook(super, subclass, true);
+    }
+
     public static LispObject RegisterClass(LispObject cls)
     {
         if (cls is not LispClass lc)
@@ -153,6 +174,7 @@ public static partial class Runtime
         if (existing != null && !existing.IsBuiltIn && !existing.IsStructureClass
             && !existing.NameCleared && ReferenceEquals(existing.Name, lc.Name))
         {
+            NotifyDirectSubclasses(existing.DirectSuperclasses, lc.DirectSuperclasses, existing);
             existing.DirectSlots = lc.DirectSlots;
             existing.DirectSuperclasses = lc.DirectSuperclasses;
             existing.DirectDefaultInitargs = lc.DirectDefaultInitargs;
@@ -181,6 +203,7 @@ public static partial class Runtime
                 _classRegistry.TryGetValue(normalizedSym, out var fwdRef) &&
                 fwdRef != null && fwdRef.IsForwardReferenced)
             {
+                NotifyDirectSubclasses(fwdRef.DirectSuperclasses, lc.DirectSuperclasses, fwdRef);
                 fwdRef.DirectSlots = lc.DirectSlots;
                 fwdRef.DirectSuperclasses = lc.DirectSuperclasses;
                 fwdRef.DirectDefaultInitargs = lc.DirectDefaultInitargs;
@@ -195,6 +218,7 @@ public static partial class Runtime
             }
         }
         _classRegistry[lc.Name] = lc;
+        NotifyDirectSubclasses(System.Array.Empty<LispClass>(), lc.DirectSuperclasses, lc);
         // Re-finalize any classes that have this as a forward-referenced superclass
         RefinalizeDependents(lc);
         return cls;
@@ -550,8 +574,7 @@ public static partial class Runtime
     }
 
     public static LispObject SlotDefinitionAllocation(LispObject arg)
-        => Startup.Keyword(RequireSlotDef("SLOT-DEFINITION-ALLOCATION", arg).IsClassAllocation
-            ? "CLASS" : "INSTANCE");
+        => RequireSlotDef("SLOT-DEFINITION-ALLOCATION", arg).AllocationKeyword;
 
     /// <summary>The declared :type, T when the slot did not name one.</summary>
     public static LispObject SlotDefinitionType(LispObject arg)
@@ -605,6 +628,308 @@ public static partial class Runtime
         return List(subs.ToArray());
     }
 
+    /// <summary>Apply the generic function initargs AMOP names. Shared by
+    /// initialize-instance and reinitialize-instance so the two cannot drift.
+    /// RENAMING says whether :NAME may replace a name that is already there:
+    /// initialization only fills in an unnamed one, while (SETF GENERIC-FUNCTION-NAME)
+    /// exists precisely to change it.</summary>
+    internal static void ApplyGenericFunctionInitargs(GenericFunction gf, LispObject[] args,
+        bool renaming)
+    {
+        for (int i = 1; i + 1 < args.Length; i += 2)
+        {
+            if (args[i] is not Symbol ks) continue;
+            if (ks.Name == "LAMBDA-LIST")
+                ParseLambdaListIntoGF(gf, args[i + 1]);
+            else if (ks.Name == "DECLARATIONS")
+                gf.Declarations = args[i + 1];
+            else if (ks.Name == "NAME" && args[i + 1] is Symbol ns
+                     && (renaming || gf.Name.Name == "UNNAMED"))
+            {
+                gf.Name = ns;
+                ns.Function = gf;
+                Runtime.RegisterGF(ns, gf);
+            }
+        }
+    }
+
+    /// <summary>The three generic functions the invocation protocol goes through, with
+    /// the default method each was registered with. Set by Mop.Init; null before that.
+    /// Identity is what decides whether a generic function has been customized -- the
+    /// question is not whether a method exists but whether one applies to THIS generic
+    /// function. Asking the weaker question makes one user's specialisation change how
+    /// every generic function in the image is dispatched.</summary>
+    internal static (GenericFunction Gf, LispMethod Default)[]? InvocationProtocolGfs;
+
+    /// <summary>True once any method has been added to one of them. Until then every
+    /// generic function keeps the ordinary path, and the arity fast paths never even
+    /// build an argument array to ask.</summary>
+    internal static volatile bool AnyInvocationProtocolCustomized;
+
+    /// <summary>Called when a method is added to or removed from one of the protocol
+    /// generic functions: every generic function has to ask again, and every cached
+    /// dispatch built under the old answer is stale.</summary>
+    internal static void InvocationProtocolChanged()
+    {
+        AnyInvocationProtocolCustomized = true;
+        foreach (var gf in AllGenericFunctions())
+        {
+            gf.UsesInvocationProtocol = null;
+            gf.InvalidateCache();
+        }
+    }
+
+    /// <summary>A method was added to or removed from GF: if GF is one of the protocol
+    /// generic functions, every other generic function's answer is stale.</summary>
+    private static void NoteInvocationProtocolMethodChange(GenericFunction gf)
+    {
+        if (InvocationProtocolGfs is not { } protocols) return;
+        foreach (var (protocolGf, _) in protocols)
+            if (ReferenceEquals(gf, protocolGf)) { InvocationProtocolChanged(); return; }
+    }
+
+    /// <summary>Whether this generic function's calls go through the protocol. Asked
+    /// once per generic function and remembered.</summary>
+    internal static bool UsesInvocationProtocol(GenericFunction gf)
+    {
+        if (!AnyInvocationProtocolCustomized || InvocationProtocolGfs is not { } protocols)
+            return false;
+        if (gf.UsesInvocationProtocol is bool known) return known;
+        bool customized = false;
+        foreach (var (protocolGf, defaultMethod) in protocols)
+        {
+            if (protocolGf.Methods.Count <= 1) continue;
+            // The protocol generic functions themselves keep the ordinary path: asking
+            // one of them how to dispatch would need it to dispatch first.
+            if (ReferenceEquals(gf, protocolGf)) { gf.UsesInvocationProtocol = false; return false; }
+            // The argument list has to be as long as the protocol generic function's
+            // required parameters, or nothing is applicable and the answer is a
+            // silent no: COMPUTE-EFFECTIVE-METHOD takes three.
+            int required = Math.Max(1, protocolGf.RequiredCount);
+            var probeArgs = new LispObject[required];
+            probeArgs[0] = gf;
+            for (int i = 1; i < required; i++) probeArgs[i] = Nil.Instance;
+            var applicable = ComputeApplicableMethods(protocolGf, List(probeArgs));
+            if (applicable is Cons c && !ReferenceEquals(c.Car, defaultMethod))
+            { customized = true; break; }
+        }
+        gf.UsesInvocationProtocol = customized;
+        return customized;
+    }
+
+    /// <summary>The effective method for these arguments, obtained the AMOP way:
+    /// COMPUTE-APPLICABLE-METHODS, then COMPUTE-EFFECTIVE-METHOD, then
+    /// COMPUTE-EFFECTIVE-METHOD-FUNCTION. Returns null when the protocol cannot answer,
+    /// in which case the caller falls back to dotcl's own dispatch.</summary>
+    private static LispFunction? EffectiveMethodThroughProtocol(GenericFunction gf,
+                                                                LispObject[] args)
+    {
+        if (Startup.Sym("COMPUTE-APPLICABLE-METHODS").Function is not LispFunction cam)
+            return null;
+        var (cemSym, cemStatus) = Mop.MopPkg.FindSymbol("COMPUTE-EFFECTIVE-METHOD");
+        var (cemfSym, cemfStatus) = Mop.MopPkg.FindSymbol("COMPUTE-EFFECTIVE-METHOD-FUNCTION");
+        if (cemStatus == SymbolStatus.None || cemfStatus == SymbolStatus.None) return null;
+        if (cemSym.Function is not LispFunction cem || cemfSym.Function is not LispFunction cemf)
+            return null;
+        // AMOP asks COMPUTE-APPLICABLE-METHODS-USING-CLASSES first and only falls back
+        // when its second value says the answer is not definitive. The cache here is
+        // keyed by argument class, so the class-based question is the one that matches
+        // what is being stored.
+        LispObject methods = Nil.Instance;
+        var (camucSym, camucStatus) = Mop.MopPkg.FindSymbol("COMPUTE-APPLICABLE-METHODS-USING-CLASSES");
+        if (camucStatus != SymbolStatus.None && camucSym.Function is LispFunction camuc)
+        {
+            var classes = new LispObject[Math.Max(0, Math.Min(args.Length, gf.RequiredCount))];
+            for (int i = 0; i < classes.Length; i++)
+                classes[i] = (LispObject?)ArgDispatchClass(args[i]) ?? Nil.Instance;
+            var answer = camuc.Invoke(new LispObject[] { gf, List(classes) });
+            var primary = MultipleValues.Primary(answer);
+            var values = MultipleValues.Get();
+            bool definitive = values.Length > 1 && values[1] is not Nil;
+            if (definitive) methods = primary;
+        }
+        if (methods is Nil)
+            methods = MultipleValues.Primary(cam.Invoke(new LispObject[] { gf, List(args) }));
+        if (methods is Nil) return null;
+        var combination = gf.MethodCombination ?? Startup.Sym("STANDARD");
+        var form = MultipleValues.Primary(cem.Invoke(new LispObject[] { gf, combination, methods }));
+        return MultipleValues.Primary(cemf.Invoke(new LispObject[] { gf, form, Nil.Instance }))
+               as LispFunction;
+    }
+
+    /// <summary>The dependents AMOP's dependent protocol keeps per metaobject. A weak
+    /// table rather than a field on each metaobject class: dependents are rare, the
+    /// protocol applies to any metaobject, and a metaobject that is dropped should not
+    /// be held alive by a list nobody asked about.</summary>
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<LispObject,
+        List<LispObject>> _dependents = new();
+
+    /// <summary>The initargs of a reinitialization, without the metaobject the method
+    /// received as its first argument: UPDATE-DEPENDENT is told what changed, not who.
+    /// Copied out by hand rather than sliced: `args[1..]` lowers to a call to
+    /// RuntimeHelpers.GetSubArray, which the netstandard2.0 target does not have.</summary>
+    private static LispObject[] SkipInstanceArg(LispObject[] args)
+    {
+        if (args.Length <= 1) return Array.Empty<LispObject>();
+        var rest = new LispObject[args.Length - 1];
+        Array.Copy(args, 1, rest, 0, rest.Length);
+        return rest;
+    }
+
+    public static LispObject AddDependent(LispObject metaobject, LispObject dependent)
+    {
+        var list = _dependents.GetOrCreateValue(metaobject);
+        lock (list)
+            if (!list.Any(d => ReferenceEquals(d, dependent))) list.Add(dependent);
+        return metaobject;
+    }
+
+    public static LispObject RemoveDependent(LispObject metaobject, LispObject dependent)
+    {
+        if (_dependents.TryGetValue(metaobject, out var list))
+            lock (list) list.RemoveAll(d => ReferenceEquals(d, dependent));
+        return metaobject;
+    }
+
+    public static LispObject MapDependents(LispObject metaobject, LispObject function)
+    {
+        if (function is LispFunction fn && _dependents.TryGetValue(metaobject, out var list))
+        {
+            LispObject[] snapshot;
+            lock (list) snapshot = list.ToArray();
+            foreach (var dependent in snapshot) fn.Invoke(new[] { dependent });
+        }
+        return Nil.Instance;
+    }
+
+    /// <summary>Tell a metaobject's dependents that it changed, as AMOP requires after
+    /// reinitialization and after adding or removing a method. Nothing happens, and no
+    /// generic function is called, until something has been registered as a dependent.</summary>
+    internal static void NotifyDependents(LispObject metaobject, params LispObject[] initargs)
+    {
+        if (!_dependents.TryGetValue(metaobject, out var list)) return;
+        LispObject[] snapshot;
+        lock (list) snapshot = list.ToArray();
+        if (snapshot.Length == 0) return;
+        if (Startup.Sym("UPDATE-DEPENDENT").Function is not LispFunction update)
+        {
+            var (mopSym, status) = Mop.MopPkg.FindSymbol("UPDATE-DEPENDENT");
+            if (status == SymbolStatus.None || mopSym.Function is not LispFunction mopUpdate) return;
+            update = mopUpdate;
+        }
+        foreach (var dependent in snapshot)
+        {
+            var args = new LispObject[2 + initargs.Length];
+            args[0] = metaobject;
+            args[1] = dependent;
+            Array.Copy(initargs, 0, args, 2, initargs.Length);
+            update.Invoke(args);
+        }
+    }
+
+    /// <summary>Called when DEFCLASS creates an accessor method, so AMOP's
+    /// READER-METHOD-CLASS / WRITER-METHOD-CLASS run. Installed by Mop.Init; null
+    /// until then. The bool says whether the accessor reads.</summary>
+    public static Action<LispClass, SlotDefinition, bool>? AccessorMethodClassHook;
+
+    /// <summary>Called while a class is being finalized, so AMOP's
+    /// COMPUTE-DEFAULT-INITARGS runs. Installed by Mop.Init; null until then.</summary>
+    public static Action<LispClass>? DefaultInitargsHook;
+
+    /// <summary>Called while a class is being finalized, so AMOP's COMPUTE-SLOTS runs
+    /// and the list it returns becomes the class's effective slots. Returns null to
+    /// leave the class's own answer alone, which is what happens until a metaclass
+    /// specialises the protocol. Installed by Mop.Init.</summary>
+    public static Func<LispClass, SlotDefinition[]?>? ComputeSlotsHook;
+
+    /// <summary>Called when a generic function.s methods or initialization change,
+    /// so AMOP.s COMPUTE-DISCRIMINATING-FUNCTION runs and its answer is installed.
+    /// Installed by Mop.Init; null until then.</summary>
+    public static Action<GenericFunction>? DiscriminatingFunctionHook;
+
+
+    /// <summary>Called by DEFMETHOD so AMOP's GENERIC-FUNCTION-METHOD-CLASS runs and
+    /// the method it names becomes the method's class. Installed by Mop.Init; null
+    /// until then, and it answers null while nobody has specialised the protocol, so
+    /// an ordinary DEFMETHOD pays nothing.</summary>
+    public static Func<GenericFunction, LispClass?>? MethodClassHook;
+
+    /// <summary>Called by DEFGENERIC so AMOP's FIND-METHOD-COMBINATION runs. The
+    /// combination dotcl uses is still decided from the symbol; what this adds is the
+    /// call, which is the hook a metaobject class specialises. Installed by Mop.Init.</summary>
+    public static Action<GenericFunction, LispObject, LispObject>? MethodCombinationHook;
+
+    /// <summary>Called by DEFMETHOD, at macroexpansion time, so AMOP's
+    /// MAKE-METHOD-LAMBDA processes the method lambda and the processed one is what
+    /// gets compiled. Returns null to leave the lambda alone, which is the answer
+    /// while nobody has specialised the protocol. Installed by Mop.Init.</summary>
+    public static Func<GenericFunction, LispObject, LispObject?>? MakeMethodLambdaHook;
+
+    /// <summary>DEFMETHOD: hand the method lambda to MAKE-METHOD-LAMBDA and take back
+    /// what it returns. The generic function has to exist already for there to be a
+    /// class to ask -- a DEFMETHOD that creates one gets the unprocessed lambda, the
+    /// same fallback every implementation makes here.</summary>
+    public static LispObject MakeMethodLambdaFor(LispObject name, LispObject lambdaForm)
+    {
+        if (MakeMethodLambdaHook is not { } hook) return lambdaForm;
+        if (FindGF(name) is not GenericFunction gf) return lambdaForm;
+        return hook(gf, lambdaForm) ?? lambdaForm;
+    }
+
+    /// <summary>DEFMETHOD: ask the generic function what class its methods are, and
+    /// record the answer on the method. A generic function whose class does not
+    /// specialise the protocol answers nothing and the method stays a STANDARD-METHOD.</summary>
+    public static LispObject NoteMethodClass(LispObject gfObj, LispObject methodObj)
+    {
+        if (gfObj is GenericFunction gf && methodObj is LispMethod method
+            && MethodClassHook is { } hook && hook(gf) is { } cls)
+        {
+            method.MetaClass = cls;
+            // A method is an instance of its method class, so the slots that class
+            // adds get the initialization protocol run on them -- initforms, and any
+            // INITIALIZE-INSTANCE :after the user wrote for the method class. DEFMETHOD
+            // passes no initargs for those slots, so the initforms are what fill them.
+            // Only reached once a generic function class has specialised
+            // GENERIC-FUNCTION-METHOD-CLASS, so an ordinary DEFMETHOD pays nothing.
+            if (Startup.Sym("INITIALIZE-INSTANCE").Function is LispFunction iiFn)
+                iiFn.Invoke(new LispObject[] { method });
+        }
+        return methodObj;
+    }
+
+    /// <summary>DEFGENERIC: ask the generic function for the method combination
+    /// metaobject named by its :METHOD-COMBINATION option.</summary>
+    public static LispObject NoteMethodCombination(LispObject gfObj, LispObject name,
+                                                   LispObject options)
+    {
+        if (gfObj is GenericFunction gf && MethodCombinationHook is { } hook)
+            hook(gf, name, options);
+        return gfObj;
+    }
+
+    private static void NotifyDiscriminatingFunction(GenericFunction gf)
+        => DiscriminatingFunctionHook?.Invoke(gf);
+
+    /// <summary>dotcl.s standard dispatch as a function object, for
+    /// COMPUTE-DISCRIMINATING-FUNCTION to return.</summary>
+    public static LispFunction StandardDiscriminatingFunction(GenericFunction gf)
+        => new LispFunction(args => DispatchGFCore(gf, args),
+            $"discriminating function for {gf.Name.Name}", -1);
+
+    /// <summary>Called for each specializer of a method being added to or removed
+    /// from a generic function, so AMOP.s ADD-DIRECT-METHOD / REMOVE-DIRECT-METHOD
+    /// run. Installed by Mop.Init; null until then, which is what keeps the
+    /// bootstrap (which adds methods before the MOP package exists) working.</summary>
+    public static Action<LispObject, LispObject, bool>? DirectMethodHook;
+
+    private static void NotifyDirectMethod(LispMethod method, bool adding)
+    {
+        var hook = DirectMethodHook;
+        if (hook == null) return;
+        foreach (var specializer in method.Specializers)
+            hook(specializer, method, adding);
+    }
+
     /// <summary>Iterate all registered generic functions. Used by
     /// DOTCL-MOP:SPECIALIZER-DIRECT-METHODS / SPECIALIZER-DIRECT-GENERIC-FUNCTIONS
     /// (no specializer→method back-link is maintained, so we scan).</summary>
@@ -619,6 +944,72 @@ public static partial class Runtime
 
     public static LispObject MakeClass(LispObject name, LispObject supersList, LispObject slotDefsList)
         => MakeClassCore(name, supersList, slotDefsList, null);
+
+    /// <summary>Resolve the :DIRECT-SUPERCLASSES and :DIRECT-SLOTS initargs AMOP uses
+    /// for class creation. Shared by ENSURE-CLASS and by MAKE-INSTANCE on a class
+    /// metaobject class, so the two read the same canonical plists the same way.</summary>
+    internal static (LispObject Supers, LispObject SlotDefs) ParseClassInitargs(
+        LispObject supersSpec, LispObject slotsSpec)
+    {
+        LispObject supersList = Nil.Instance;
+        {
+            var resolved = new List<LispObject>();
+            for (var c = supersSpec; c is Cons cc; c = cc.Cdr)
+            {
+                LispObject sup = cc.Car switch
+                {
+                    LispClass sc => sc,
+                    Symbol sn => FindClassOrNil(sn),
+                    _ => Nil.Instance
+                };
+                if (sup is LispClass) resolved.Add(sup);
+            }
+            for (int i = resolved.Count - 1; i >= 0; i--) supersList = new Cons(resolved[i], supersList);
+        }
+        LispObject slotDefsList = Nil.Instance;
+        {
+            var sds = new List<LispObject>();
+            for (var c = slotsSpec; c is Cons cc; c = cc.Cdr)
+            {
+                if (cc.Car is not Cons) continue;
+                LispObject sName = Nil.Instance, sInitargs = Nil.Instance, sInitfn = Nil.Instance;
+                for (var p = cc.Car; p is Cons pc && pc.Cdr is Cons pv; p = pv.Cdr)
+                {
+                    if (pc.Car is Symbol pk)
+                    {
+                        if (pk == Startup.Keyword("NAME")) sName = pv.Car;
+                        else if (pk == Startup.Keyword("INITARGS")) sInitargs = pv.Car;
+                        else if (pk == Startup.Keyword("INITFUNCTION")) sInitfn = pv.Car;
+                    }
+                }
+                if (sName is Symbol) sds.Add(MakeSlotDef(sName, sInitargs, sInitfn));
+            }
+            for (int i = sds.Count - 1; i >= 0; i--) slotDefsList = new Cons(sds[i], slotDefsList);
+        }
+        return (supersList, slotDefsList);
+    }
+
+    /// <summary>MAKE-INSTANCE on a class metaobject class makes a class (AMOP). The
+    /// result is not registered under a name: an anonymous class is reachable only
+    /// through the object, which is the point of it. A :NAME initarg still names it,
+    /// but naming is what ENSURE-CLASS is for.</summary>
+    internal static LispObject MakeClassMetaobject(LispClass metaclass, LispObject[] initargs)
+    {
+        LispObject supersSpec = Nil.Instance, slotsSpec = Nil.Instance;
+        Symbol nameSym = Startup.Sym("NIL");
+        for (int i = 0; i + 1 < initargs.Length; i += 2)
+        {
+            if (initargs[i] is not Symbol k) continue;
+            if (k == Startup.Keyword("DIRECT-SUPERCLASSES")) supersSpec = initargs[i + 1];
+            else if (k == Startup.Keyword("DIRECT-SLOTS")) slotsSpec = initargs[i + 1];
+            else if (k == Startup.Keyword("NAME") && initargs[i + 1] is Symbol ns) nameSym = ns;
+        }
+        // AMOP: with no direct superclasses, a standard class gets STANDARD-OBJECT.
+        if (supersSpec is Nil && FindClassOrNil(Startup.Sym("STANDARD-OBJECT")) is LispClass stdObj)
+            supersSpec = new Cons(stdObj, Nil.Instance);
+        var (supers, slotDefs) = ParseClassInitargs(supersSpec, slotsSpec);
+        return MakeClassFull(nameSym, supers, slotDefs, metaclass);
+    }
 
     public static LispObject MakeClassFull(LispObject name, LispObject supersList, LispObject slotDefsList, LispObject metaclassObj)
         => MakeClassCore(name, supersList, slotDefsList, metaclassObj as LispClass);
@@ -644,9 +1035,18 @@ public static partial class Runtime
                 supers.Add(sc);
             cur = c.Cdr;
         }
-        // Default to STANDARD-OBJECT if no supers
-        if (supers.Count == 0 && _classRegistry.TryGetValue(Startup.Sym("STANDARD-OBJECT"), out var stdObj))
-            supers.Add(stdObj);
+        // Default to STANDARD-OBJECT if no supers -- except under
+        // FUNCALLABLE-STANDARD-CLASS, where AMOP names FUNCALLABLE-STANDARD-OBJECT.
+        // A class whose instances are callable is not a STANDARD-OBJECT.
+        if (supers.Count == 0)
+        {
+            bool funcallable = metaclass != null
+                && metaclass.ClassPrecedenceList.Any(m => m.Name.Name == "FUNCALLABLE-STANDARD-CLASS");
+            var defaultSuper = Startup.Sym(funcallable ? "FUNCALLABLE-STANDARD-OBJECT"
+                                                       : "STANDARD-OBJECT");
+            if (_classRegistry.TryGetValue(defaultSuper, out var stdObj))
+                supers.Add(stdObj);
+        }
 
         // Collect slot definitions
         var slots = new List<SlotDefinition>();
@@ -670,6 +1070,11 @@ public static partial class Runtime
             {
                 // Skip T — always valid
                 if (super.Name.Name == "T") continue;
+                // A superclass that has not been defined yet is a placeholder, so there
+                // is no metaclass pair to validate: what its class will be is exactly
+                // what is not known. The class stays unfinalized until the real
+                // definition arrives, which is when the pair becomes a real question.
+                if (super.IsForwardReferenced) continue;
                 var result = validateGF.Invoke(new LispObject[] { tempCls, super });
                 if (result is Nil)
                     throw new LispErrorException(new LispError(
@@ -761,7 +1166,17 @@ public static partial class Runtime
     public static LispObject SetSlotDefRawOptions(LispObject slotdObj, LispObject options)
     {
         if (slotdObj is SlotDefinition sd)
+        {
             sd.RawOptions = options;
+            // DEFCLASS passes a metaclass-defined :allocation through here, since the
+            // two standard ones are already on the bool. Reading it now means
+            // EFFECTIVE-SLOT-DEFINITION-CLASS and SLOT-DEFINITION-ALLOCATION see the
+            // keyword the user wrote.
+            for (var c = options; c is Cons rc && rc.Cdr is Cons rv; c = rv.Cdr)
+                if (rc.Car is Symbol k && k.Name == "ALLOCATION" && rv.Car is Symbol av
+                    && av.Name != "INSTANCE" && av.Name != "CLASS")
+                    sd.Allocation = av;
+        }
         return slotdObj;
     }
 
@@ -783,12 +1198,33 @@ public static partial class Runtime
         return slotdObj;
     }
 
+    /// <summary>The slot :documentation, attached by its own call rather than as a
+    /// sixth argument to SetSlotDefAttrs: a compiled FASL names the runtime method it
+    /// calls, so widening that signature stops every FASL built before the change
+    /// from loading. A slot with no documentation emits no call at all.</summary>
+    public static LispObject SetSlotDefDocumentation(LispObject slotdObj, LispObject documentation)
+    {
+        if (slotdObj is SlotDefinition sd) sd.Documentation = documentation;
+        return slotdObj;
+    }
+
+    /// <summary>The :documentation of a slot definition, NIL when it has none.</summary>
+    public static LispObject SlotDefinitionDocumentation(LispObject arg)
+        => RequireSlotDef("SLOT-DEFINITION-DOCUMENTATION", arg).Documentation;
+
+    /// <summary>Convert a Lisp list to an array. Counts the list first and fills one
+    /// exact-size array. Growing a List and copying it out allocates the List, its
+    /// backing store (rounded up to a power of two) and the copy, all to produce one
+    /// array whose length a free extra walk already knew.</summary>
     private static LispObject[] ListToArray(LispObject list)
     {
-        var items = new List<LispObject>();
-        for (var cur = list; cur is Cons c; cur = c.Cdr)
-            items.Add(c.Car);
-        return items.Count > 0 ? items.ToArray() : Array.Empty<LispObject>();
+        int n = 0;
+        for (var cur = list; cur is Cons c; cur = c.Cdr) n++;
+        if (n == 0) return Array.Empty<LispObject>();
+        var items = new LispObject[n];
+        int i = 0;
+        for (var cur = list; cur is Cons c; cur = c.Cdr) items[i++] = c.Car;
+        return items;
     }
 
     /// <summary>AMOP DIRECT-SLOT-DEFINITION-CLASS protocol: for each direct slot of a class
@@ -862,17 +1298,29 @@ public static partial class Runtime
         if (classObj is not LispClass cls)
             throw new LispErrorException(new LispTypeError("SET-CLASS-DEFAULT-INITARGS: not a class", classObj));
 
-        var result = new List<(Symbol Key, LispFunction Thunk)>();
+        // Two shapes are accepted. (key thunk ...) is what a FASL compiled before the
+        // initform source was carried emits; (key form thunk ...) is what DEFCLASS
+        // emits now. They are told apart by what follows the key, and a form is never
+        // a function object -- it is source. Accepting both is what keeps an older
+        // FASL loading, which widening this method's signature would not have.
+        var result = new List<(Symbol Key, LispObject Form, LispFunction Thunk)>();
         var cur = initargsList;
         while (cur is Cons c1)
         {
             var key = c1.Car as Symbol;
             if (c1.Cdr is Cons c2)
             {
-                var thunk = c2.Car as LispFunction;
+                if (c2.Car is LispFunction oldShapeThunk)
+                {
+                    if (key != null) result.Add((key, Nil.Instance, oldShapeThunk));
+                    cur = c2.Cdr;
+                    continue;
+                }
+                var form = c2.Car;
+                var thunk = (c2.Cdr as Cons)?.Car as LispFunction;
                 if (key != null && thunk != null)
-                    result.Add((key, thunk));
-                cur = c2.Cdr;
+                    result.Add((key, form, thunk));
+                cur = c2.Cdr is Cons c3 ? c3.Cdr : Nil.Instance;
             }
             else break;
         }
@@ -906,6 +1354,14 @@ public static partial class Runtime
                 return cbase;
             return Nil.Instance;
         }
+        // Method combination metaobjects: one built-in class, no metaclass of
+        // their own.
+        if (obj is MethodCombinationObject)
+        {
+            if (_classRegistry.TryGetValue(Startup.Sym("METHOD-COMBINATION"), out var mc))
+                return mc;
+            return Nil.Instance;
+        }
         if (obj is LispDotNetObject dn)
             return EnsureDotNetTypeClass(dn.Type);
         // Slot-definition metaobject with a customized class (direct-/effective-
@@ -916,6 +1372,15 @@ public static partial class Runtime
         // LispClass objects: return their metaclass
         if (obj is LispClass lc)
         {
+            // A class named as a superclass before it was defined is a placeholder, and
+            // AMOP gives placeholders their own class. Defining the class for real
+            // clears the flag on this same object, which is the CHANGE-CLASS the
+            // protocol describes: the identity a dependent class already holds does
+            // not move.
+            if (lc.IsForwardReferenced
+                && _classRegistry.TryGetValue(Startup.Sym("FORWARD-REFERENCED-CLASS"),
+                                              out var fwdMeta))
+                return fwdMeta;
             // Custom metaclass takes priority
             if (!lc.IsBuiltIn && !lc.IsStructureClass && lc.Metaclass != null)
                 return lc.Metaclass;
@@ -931,6 +1396,14 @@ public static partial class Runtime
             if (_classRegistry.TryGetValue(Startup.Sym("STANDARD-GENERIC-FUNCTION"), out var sgfClass)) return sgfClass;
             return Nil.Instance;
         }
+        if (obj is EqlSpecializer)
+        {
+            if (_classRegistry.TryGetValue(Startup.Sym("EQL-SPECIALIZER"), out var eqlCls))
+                return eqlCls;
+            return Nil.Instance;
+        }
+        if (obj is LispMethod lmmc && lmmc.MetaClass != null)
+            return lmmc.MetaClass;
         if (obj is LispMethod)
         {
             if (_classRegistry.TryGetValue(Startup.Sym("STANDARD-METHOD"), out var methodClass)) return methodClass;
@@ -1129,6 +1602,31 @@ public static partial class Runtime
                 return MultipleValues.Primary(csu.Invoke(new LispObject[] {
                     klass.Metaclass, klass, slotName is Symbol ? slotName : Startup.Sym(name) }));
         }
+        // A generic function under a user-defined generic function class holds that
+        // class's slots the same way. The object is callable, so it cannot also be a
+        // LispInstance; without this the class reports slots its instances cannot
+        // hold, which is what closer-mop's own generic function class ran into.
+        if (obj is GenericFunction gfObj && gfObj.StoredClass != null)
+        {
+            if (gfObj.ExtraSlots != null && gfObj.ExtraSlots.TryGetValue(name, out var gv))
+                return gv ?? Nil.Instance;
+            if (gfObj.StoredClass.SlotIndex.ContainsKey(name)
+                && Startup.Sym("SLOT-UNBOUND").Function is LispFunction gsu)
+                return MultipleValues.Primary(gsu.Invoke(new LispObject[] {
+                    gfObj.StoredClass, gfObj, slotName is Symbol ? slotName : Startup.Sym(name) }));
+        }
+        // A method under a user-defined method class, the same way. Reached when
+        // GENERIC-FUNCTION-METHOD-CLASS named a class that adds slots, which is how
+        // metaobject code hangs its own information on a method.
+        if (obj is LispMethod meth && meth.MetaClass != null)
+        {
+            if (meth.ExtraSlots != null && meth.ExtraSlots.TryGetValue(name, out var mv))
+                return mv ?? Nil.Instance;
+            if (meth.MetaClass.SlotIndex.ContainsKey(name)
+                && Startup.Sym("SLOT-UNBOUND").Function is LispFunction msu)
+                return MultipleValues.Primary(msu.Invoke(new LispObject[] {
+                    meth.MetaClass, meth, slotName is Symbol ? slotName : Startup.Sym(name) }));
+        }
         if (obj is LispCondition cond)
         {
             var ccls = ClassOf(cond) as LispClass;
@@ -1224,6 +1722,20 @@ public static partial class Runtime
         if (obj is LispClass klass && klass.Metaclass != null && klass.Metaclass.SlotIndex.ContainsKey(name))
         {
             (klass.EnsureExtraSlots())[name] = value;
+            return value;
+        }
+        // The same for a generic function under a user-defined generic function class.
+        if (obj is GenericFunction gfObj && gfObj.StoredClass != null
+            && gfObj.StoredClass.SlotIndex.ContainsKey(name))
+        {
+            (gfObj.EnsureExtraSlots())[name] = value;
+            return value;
+        }
+        // And for a method under a user-defined method class.
+        if (obj is LispMethod meth && meth.MetaClass != null
+            && meth.MetaClass.SlotIndex.ContainsKey(name))
+        {
+            (meth.EnsureExtraSlots())[name] = value;
             return value;
         }
         if (obj is LispCondition cond)
@@ -1358,6 +1870,9 @@ public static partial class Runtime
                 ? T.Instance : Nil.Instance;
         if (obj is LispClass klass && klass.Metaclass != null)
             return klass.ExtraSlots != null && klass.ExtraSlots.TryGetValue(name, out var cbv) && cbv != null
+                ? T.Instance : Nil.Instance;
+        if (obj is LispMethod meth && meth.MetaClass != null)
+            return meth.ExtraSlots != null && meth.ExtraSlots.TryGetValue(name, out var mbv) && mbv != null
                 ? T.Instance : Nil.Instance;
         if (obj is LispCondition cond)
         {
@@ -1682,6 +2197,74 @@ public static partial class Runtime
             }
             return klass;
         }
+        // A generic function under a user-defined generic function class: the same
+        // contract applied to its ExtraSlots. Its class's own slots (the ones
+        // STANDARD-GENERIC-FUNCTION already has) are the runtime object's business,
+        // so only the slots the user class adds are handled here.
+        // A generic function with no user-defined class adds no slots, so there is
+        // nothing to initialize -- but it is not an error either. REINITIALIZE-INSTANCE
+        // reaches here through its primary method, and (SETF GENERIC-FUNCTION-NAME) is
+        // defined in terms of that.
+        if (obj is GenericFunction plainGf && plainGf.StoredClass == null)
+            return plainGf;
+        if (obj is GenericFunction gfInit && gfInit.StoredClass is { } gfClass)
+        {
+            var inheritedNames = new HashSet<string>();
+            if (_classRegistry.TryGetValue(Startup.Sym("STANDARD-GENERIC-FUNCTION"), out var sgfO)
+                && sgfO is LispClass sgfC)
+                foreach (var es0 in sgfC.EffectiveSlots) inheritedNames.Add(es0.Name.Name);
+            foreach (var es in gfClass.EffectiveSlots)
+            {
+                string sn = es.Name.Name;
+                if (inheritedNames.Contains(sn)) continue;
+                bool fromInitarg = false;
+                for (int i = start; i + 1 < initargs.Length; i += 2)
+                    if (initargs[i] is Symbol k && Array.Exists(es.Initargs, ia => ia.Name == k.Name))
+                    { (gfInit.EnsureExtraSlots())[sn] = initargs[i + 1]; fromInitarg = true; break; }
+                if (fromInitarg) continue;
+                bool inNames = slotNames0 is T;
+                if (!inNames)
+                    for (var c = slotNames0; c is Cons cc; c = cc.Cdr)
+                        if (cc.Car is Symbol s2 && s2.Name == sn) { inNames = true; break; }
+                bool bound = gfInit.ExtraSlots != null
+                    && gfInit.ExtraSlots.TryGetValue(sn, out var gv0) && gv0 != null;
+                if (inNames && !bound && es.InitformThunk is { } gfThunk)
+                    (gfInit.EnsureExtraSlots())[sn] =
+                        MultipleValues.Primary(gfThunk.Invoke(Array.Empty<LispObject>()));
+            }
+            return gfInit;
+        }
+        // A method under a user-defined method class: the same contract applied to its
+        // ExtraSlots. Only the slots the user class adds are handled here; the ones
+        // STANDARD-METHOD already has live on the runtime object and are applied by
+        // the INITIALIZE-INSTANCE :after for STANDARD-METHOD.
+        if (obj is LispMethod methInit && methInit.MetaClass is { } methClass)
+        {
+            var inheritedNames = new HashSet<string>();
+            if (_classRegistry.TryGetValue(Startup.Sym("STANDARD-METHOD"), out var smO)
+                && smO is LispClass smC)
+                foreach (var es0 in smC.EffectiveSlots) inheritedNames.Add(es0.Name.Name);
+            foreach (var es in methClass.EffectiveSlots)
+            {
+                string sn = es.Name.Name;
+                if (inheritedNames.Contains(sn)) continue;
+                bool fromInitarg = false;
+                for (int i = start; i + 1 < initargs.Length; i += 2)
+                    if (initargs[i] is Symbol k && Array.Exists(es.Initargs, ia => ia.Name == k.Name))
+                    { (methInit.EnsureExtraSlots())[sn] = initargs[i + 1]; fromInitarg = true; break; }
+                if (fromInitarg) continue;
+                bool inNames = slotNames0 is T;
+                if (!inNames)
+                    for (var c = slotNames0; c is Cons cc; c = cc.Cdr)
+                        if (cc.Car is Symbol s2 && s2.Name == sn) { inNames = true; break; }
+                bool bound = methInit.ExtraSlots != null
+                    && methInit.ExtraSlots.TryGetValue(sn, out var mv0) && mv0 != null;
+                if (inNames && !bound && es.InitformThunk is { } methThunk)
+                    (methInit.EnsureExtraSlots())[sn] =
+                        MultipleValues.Primary(methThunk.Invoke(Array.Empty<LispObject>()));
+            }
+            return methInit;
+        }
         if (obj is not LispInstance inst)
             throw new LispErrorException(new LispTypeError("SHARED-INITIALIZE: not a CLOS instance", instArg));
         var cls = inst.Class;
@@ -1720,10 +2303,13 @@ public static partial class Runtime
         // CLHS: initargs always override existing slot values (not just unbound slots).
         // Track which slot indices were already set by an earlier initarg in THIS call.
         //
-        // Built only when there IS an initarg to record. SHARED-INITIALIZE runs for
-        // every instance the initialization protocol touches, and with no initargs
-        // the loop below never executes -- the set was ~64 B allocated to stay empty.
-        HashSet<int>? slotsSetByInitarg = null;
+        // A bitmask, not a set: slot layout indices are small and dense, so 64 bits
+        // cover every class anyone writes, and the common case then allocates nothing.
+        // SHARED-INITIALIZE runs for every instance the initialization protocol
+        // touches, so a per-call HashSet is paid by every MAKE-INSTANCE that passes an
+        // initarg. The set is still built for a class with more than 64 slots.
+        long slotsSetMask = 0;
+        HashSet<int>? slotsSetWide = null;
         for (int i = start; i + 1 < initargs.Length; i += 2)
         {
             string initargName = initargs[i] switch
@@ -1742,14 +2328,18 @@ public static partial class Runtime
                             // CLHS: initargs always override the existing slot value, even
                             // for :allocation :class slots already bound by a prior
                             // make-instance. Only the first initarg for a given slot in
-                            // THIS call wins (slotsSetByInitarg guards duplicates).
-                            if (slotsSetByInitarg == null || !slotsSetByInitarg.Contains(idx))
+                            // THIS call wins (the mask above guards duplicates).
+                            bool alreadySet = idx < 64
+                                ? (slotsSetMask & (1L << idx)) != 0
+                                : slotsSetWide != null && slotsSetWide.Contains(idx);
+                            if (!alreadySet)
                             {
                                 if (slot.IsClassAllocation)
                                     FindClassSlotOwner(cls, slot.Name.Name).ClassSlotValues[slot.Name.Name] = initargs[i + 1];
                                 else
                                     StoreInstanceSlot(slot, idx, initargs[i + 1]);
-                                (slotsSetByInitarg ??= new HashSet<int>()).Add(idx);
+                                if (idx < 64) slotsSetMask |= 1L << idx;
+                                else (slotsSetWide ??= new HashSet<int>()).Add(idx);
                             }
                         }
                         break; // Found matching initarg for this slot, no need to check more
@@ -1843,6 +2433,13 @@ public static partial class Runtime
         else
             throw new LispErrorException(new LispTypeError("MAKE-INSTANCE: invalid class specifier", classSpec));
 
+        // A class metaobject class makes a class, not an ordinary instance. Checked
+        // before the initarg validation below: :DIRECT-SUPERCLASSES and :DIRECT-SLOTS
+        // are class-creation initargs, not slots of STANDARD-CLASS.
+        foreach (var cplCls in cls.ClassPrecedenceList)
+            if (cplCls.Name.Name == "CLASS")
+                return MakeClassMetaobject(cls, initargs);
+
         // Cannot instantiate built-in classes
         if (cls.IsBuiltIn)
             throw new LispErrorException(new LispError(
@@ -1868,9 +2465,28 @@ public static partial class Runtime
                 }
                 if (cplCls.Name.Name == "METHOD")
                 {
-                    allocated2 = new LispMethod();
+                    var newMethod = new LispMethod();
+                    // Track the actual Lisp class, the way the generic function branch
+                    // above does with StoredClass: CLASS-OF has to answer the class
+                    // that was instantiated, and the slots it adds beyond
+                    // STANDARD-METHOD are initialized against it.
+                    if (cls.Name.Name != "STANDARD-METHOD") newMethod.MetaClass = cls;
+                    allocated2 = newMethod;
                     break;
                 }
+            }
+            // A funcallable instance that is not a generic function still has to BE
+            // callable, and on dotcl the callable object that carries a class and
+            // slots is the generic function. It starts with no methods, so calling
+            // one before SET-FUNCALLABLE-INSTANCE-FUNCTION says there is no
+            // applicable method -- AMOP leaves that case undefined.
+            if (allocated2 == null && IsFuncallableClass(cls))
+            {
+                var funcallable = Runtime.NewDispatchingGF(Startup.Sym("UNNAMED"), -1);
+                funcallable.RequiredCount = 0;
+                funcallable.LambdaListInfoSet = true;
+                funcallable.StoredClass = cls;
+                allocated2 = funcallable;
             }
             if (allocated2 != null)
             {
@@ -1988,7 +2604,7 @@ public static partial class Runtime
 
             // Check if any defaults need to be added
             var extras = new List<LispObject>();
-            foreach (var (key, thunk) in cls.DefaultInitargs)
+            foreach (var (key, initformSource, thunk) in cls.DefaultInitargs)
             {
                 if (!suppliedKeys.Contains(key.Name))
                 {
@@ -2142,7 +2758,7 @@ public static partial class Runtime
         // Also check default-initargs for :allow-other-keys t
         if (!allowOtherKeys)
         {
-            foreach (var (key, thunk) in cls.DefaultInitargs)
+            foreach (var (key, initformSource, thunk) in cls.DefaultInitargs)
             {
                 if (key.Name == "ALLOW-OTHER-KEYS")
                 {
@@ -2166,7 +2782,7 @@ public static partial class Runtime
                 foreach (var slot in cls.EffectiveSlots)
                     foreach (var ia in slot.Initargs)
                         validKeys.Add(ia.Name);
-                foreach (var (key, _) in cls.DefaultInitargs)
+                foreach (var (key, _, _) in cls.DefaultInitargs)
                     validKeys.Add(key.Name);
                 // CLHS 7.1.2: keyword args of applicable initialize-instance and
                 // shared-initialize methods are also valid initargs.
@@ -2579,6 +3195,15 @@ public static partial class Runtime
         }
     }
 
+    public static LispObject SetGFDeclarations(LispObject gfObj, LispObject declarations)
+    {
+        if (gfObj is not GenericFunction gf)
+            throw new LispErrorException(new LispTypeError(
+                "SET-GF-DECLARATIONS: not a generic function", gfObj));
+        gf.Declarations = declarations;
+        return gfObj;
+    }
+
     public static LispObject SetMethodCombination(LispObject gfObj, LispObject mcName)
     {
         if (gfObj is not GenericFunction gf)
@@ -2731,6 +3356,10 @@ public static partial class Runtime
         // per-class make-instance fast-path caches (else already-instantiated
         // classes silently skip it).
         InvalidateSimpleInitCaches(gf);
+        NotifyDirectMethod(method, adding: true);
+        NotifyDiscriminatingFunction(gf);
+        NotifyDependents(gf, Startup.Sym("ADD-METHOD"), method);
+        NoteInvocationProtocolMethodChange(gf);
         return gf;
     }
 
@@ -2779,6 +3408,10 @@ public static partial class Runtime
         // Removing an INITIALIZE-INSTANCE / SHARED-INITIALIZE method also changes
         // the make-instance fast-path eligibility — invalidate the per-class caches.
         InvalidateSimpleInitCaches(gf);
+        NotifyDirectMethod(method, adding: false);
+        NotifyDiscriminatingFunction(gf);
+        NotifyDependents(gf, Startup.Sym("REMOVE-METHOD"), method);
+        NoteInvocationProtocolMethodChange(gf);
         return gf;
     }
 
@@ -2914,14 +3547,13 @@ public static partial class Runtime
                                            && !DotNetVarianceApplicable(specCls, argCls)))
                     { ok = false; break; }
                 }
-                else if (spec is Cons eqlc && eqlc.Car is Symbol es && es.Name == "EQL"
-                         && eqlc.Cdr is Cons ev)
+                else if (EqlSpecializerValue(spec) is { } eqlObj)
                 {
                     // An (eql OBJ) method can only apply when an argument IS obj, which
                     // is possible only if obj is an instance of argCls. If so the result
                     // is non-definitive (a specific arg of this class might or might not
                     // be obj); otherwise the method simply never applies for this class.
-                    var objCls = ClassOf(ev.Car) as LispClass;
+                    var objCls = ClassOf(eqlObj) as LispClass;
                     if (argCls != null && objCls != null
                         && Array.IndexOf(objCls.ClassPrecedenceList, argCls) >= 0)
                         definitive = false;
@@ -2948,8 +3580,8 @@ public static partial class Runtime
         {
             int i = (apo != null && k < apo.Length && apo[k] < n) ? apo[k] : k;
             if (ReferenceEquals(a.Specializers[i], b.Specializers[i])) continue;
-            bool aIsEql = a.Specializers[i] is Cons eqlA && eqlA.Car is Symbol symA && symA.Name == "EQL";
-            bool bIsEql = b.Specializers[i] is Cons eqlB && eqlB.Car is Symbol symB && symB.Name == "EQL";
+            bool aIsEql = EqlSpecializerValue(a.Specializers[i]) != null;
+            bool bIsEql = EqlSpecializerValue(b.Specializers[i]) != null;
             if (aIsEql && !bIsEql) return -1;
             if (!aIsEql && bIsEql) return 1;
             if (aIsEql && bIsEql) continue;
@@ -2984,22 +3616,61 @@ public static partial class Runtime
             SlotDefinition? slotd = null;
             foreach (var s in cls.EffectiveSlots)
                 if (s.Name.Name == slotName.Name) { slotd = s; break; }
+            // Where the class sits in the method's specializers says which way the
+            // accessor goes: a reader takes the object first, a writer takes the value
+            // first. The generic function's name does not -- a :writer slot option
+            // names one like any other function, only an :accessor writer is (SETF x).
+            int classPosition = -1;
             if (slotd != null)
                 foreach (var m in gf.Methods)
-                    if (m.Qualifiers.Length == 0 && Array.IndexOf(m.Specializers, cls) >= 0)
-                    { m.AccessorSlot = slotd; break; }
+                {
+                    int at = Array.IndexOf(m.Specializers, cls);
+                    if (m.Qualifiers.Length == 0 && at >= 0)
+                    { m.AccessorSlot = slotd; classPosition = at; break; }
+                }
             // The AccessorSlot tag is what RecomputeAccessorFlags keys on; the method
             // was already added (with AccessorSlot null then), so recompute now.
             gf.RecomputeAccessorFlags();
+            // AMOP has class initialization ask the metaclass what class an accessor
+            // method should be. dotcl makes plain standard methods, so the answer is
+            // not used to build anything -- what the protocol buys here is the call.
+            // A writer generic function is named (SETF name).
+            if (slotd != null && classPosition >= 0)
+                AccessorMethodClassHook?.Invoke(cls, slotd, classPosition == 0);
         }
         return Nil.Instance;
     }
 
-    /// <summary>The value of an EQL specializer (EQL . (value)), or null when the
-    /// specializer is a class rather than an EQL one.</summary>
-    private static LispObject? EqlSpecializerValue(LispObject spec)
-        => spec is Cons c && c.Car is Symbol s && s.Name == "EQL" && c.Cdr is Cons v
-           ? v.Car : null;
+    /// <summary>The interned EQL specializers, keyed by the specialized object with
+    /// EQL as the test -- which is what INTERN-EQL-SPECIALIZER means by "the same".
+    /// Built on first use so nothing about it runs during the bootstrap.</summary>
+    private static LispHashTable? _eqlSpecializers;
+    private static readonly object _eqlSpecializerLock = new();
+
+    /// <summary>AMOP INTERN-EQL-SPECIALIZER: the specializer metaobject for OBJ, the
+    /// same one every time two objects are EQL, so EQ answers the question callers
+    /// actually ask.</summary>
+    public static LispObject InternEqlSpecializer(LispObject obj)
+    {
+        lock (_eqlSpecializerLock)
+        {
+            _eqlSpecializers ??= new LispHashTable("EQL");
+            if (_eqlSpecializers.TryGet(obj, out var found) && found is EqlSpecializer)
+                return found;
+            var made = new EqlSpecializer(obj);
+            _eqlSpecializers.Set(obj, made);
+            return made;
+        }
+    }
+
+    /// <summary>The object an EQL specializer specializes on, or null when the
+    /// specializer is a class rather than an EQL one. Both representations are read
+    /// here: the EQL-SPECIALIZER metaobject INTERN-EQL-SPECIALIZER hands out, and the
+    /// list (EQL object) that a caller writing a specializer by hand produces.</summary>
+    internal static LispObject? EqlSpecializerValue(LispObject spec)
+        => spec is EqlSpecializer es ? es.Object
+           : spec is Cons c && c.Car is Symbol s && s.Name == "EQL" && c.Cdr is Cons v
+             ? v.Car : null;
 
     private static bool MethodSignatureMatches(LispMethod a, LispMethod b)
     {
@@ -3056,11 +3727,37 @@ public static partial class Runtime
         return result;
     }
 
+    /// <summary>The next methods of the call in progress, as AMOP hands them to a
+    /// method function. Empty outside a dispatch.</summary>
+    internal static LispObject CurrentNextMethods()
+    {
+        var chain = _nextMethodChain;
+        if (chain == null) return Nil.Instance;
+        LispObject result = Nil.Instance;
+        for (int i = chain.Count - 1; i >= _nextMethodIndex; i--)
+            if (i >= 0 && i < chain.Count) result = new Cons(chain[i], result);
+        return result;
+    }
+
     public static LispObject MethodFunction(LispObject methodObj)
     {
         if (methodObj is not LispMethod m)
             throw new LispErrorException(new LispTypeError("METHOD-FUNCTION: not a method", methodObj));
-        return m.Function;
+        // AMOP: a method function takes the arguments as a list and the next methods
+        // as a list. dotcl's own take them spread, which is what dispatch calls, so
+        // what is handed out is a view over that -- built once and kept, so
+        // METHOD-FUNCTION answers the same object every time.
+        if (m.ProcessedParameterFunction is { } amop) return amop;
+        var raw = m.Function;
+        var view = new LispFunction(args =>
+        {
+            var callArgs = new List<LispObject>();
+            if (args.Length > 0)
+                for (var c = args[0]; c is Cons cc; c = cc.Cdr) callArgs.Add(cc.Car);
+            return raw.Invoke(callArgs.ToArray());
+        }, "METHOD-FUNCTION view", -1);
+        m.ProcessedParameterFunction = view;
+        return view;
     }
 
     /// <summary>
@@ -3178,7 +3875,7 @@ public static partial class Runtime
     {
         // Decide the arity-1 fast shape once, here, where the entry is complete:
         // DISPATCHGF1 then reads one bool instead of re-deriving it per call.
-        entry.ComputeSinglePrimary();
+        entry.ComputePlainPrimaryChain();
         var old = gf.DispatchCache;
         var list = new List<CachedDispatch>(GenericFunction.DispatchCacheWidth) { entry };
         if (old != null)
@@ -3266,9 +3963,14 @@ public static partial class Runtime
     /// unchanged, so this adds a fast path rather than a second dispatcher.</summary>
     private static LispObject DispatchGF1(GenericFunction gf, LispObject a)
     {
+        if (gf.DispatchFunction is LispFunction df1) return df1.Invoke(new[] { a });
+        // The protocol route needs the argument array anyway; the check itself is one
+        // static bool read until someone specialises one of the three.
+        if (AnyInvocationProtocolCustomized && UsesInvocationProtocol(gf))
+            return DispatchGFCore(gf, new[] { a });
         var entry = PlainCacheHit(gf, a, null, null, null, 1);
         if (entry != null)
-            return entry.SinglePrimary
+            return entry.PlainPrimaryChain
                 ? InvokeChainLoose(entry.Primary, a, null, null, null, 1)
                 : InvokeCombinationLoose(entry, a, null, null, null, 1);
         // EQL-specialized generic functions are cached only for one required argument,
@@ -3329,9 +4031,12 @@ public static partial class Runtime
     /// <summary>Two-argument twin of DISPATCHGF1.</summary>
     private static LispObject DispatchGF2(GenericFunction gf, LispObject a, LispObject b)
     {
+        if (gf.DispatchFunction is LispFunction df2) return df2.Invoke(new[] { a, b });
+        if (AnyInvocationProtocolCustomized && UsesInvocationProtocol(gf))
+            return DispatchGFCore(gf, new[] { a, b });
         var entry = PlainCacheHit(gf, a, b, null, null, 2);
         if (entry != null)
-            return entry.SinglePrimary
+            return entry.PlainPrimaryChain
                 ? InvokeChainLoose(entry.Primary, a, b, null, null, 2)
                 : InvokeCombinationLoose(entry, a, b, null, null, 2);
         return DispatchGF(gf, new[] { a, b });
@@ -3340,9 +4045,12 @@ public static partial class Runtime
     /// <summary>Three-argument twin of DISPATCHGF1.</summary>
     private static LispObject DispatchGF3(GenericFunction gf, LispObject a, LispObject b, LispObject c)
     {
+        if (gf.DispatchFunction is LispFunction df3) return df3.Invoke(new[] { a, b, c });
+        if (AnyInvocationProtocolCustomized && UsesInvocationProtocol(gf))
+            return DispatchGFCore(gf, new[] { a, b, c });
         var entry = PlainCacheHit(gf, a, b, c, null, 3);
         if (entry != null)
-            return entry.SinglePrimary
+            return entry.PlainPrimaryChain
                 ? InvokeChainLoose(entry.Primary, a, b, c, null, 3)
                 : InvokeCombinationLoose(entry, a, b, c, null, 3);
         return DispatchGF(gf, new[] { a, b, c });
@@ -3389,9 +4097,12 @@ public static partial class Runtime
     private static LispObject DispatchGF4(
         GenericFunction gf, LispObject a, LispObject b, LispObject c, LispObject d)
     {
+        if (gf.DispatchFunction is LispFunction df4) return df4.Invoke(new[] { a, b, c, d });
+        if (AnyInvocationProtocolCustomized && UsesInvocationProtocol(gf))
+            return DispatchGFCore(gf, new[] { a, b, c, d });
         var entry = PlainCacheHit(gf, a, b, c, d, 4);
         if (entry != null)
-            return entry.SinglePrimary
+            return entry.PlainPrimaryChain
                 ? InvokeChainLoose(entry.Primary, a, b, c, d, 4)
                 : InvokeCombinationLoose(entry, a, b, c, d, 4);
         return DispatchGF(gf, new[] { a, b, c, d });
@@ -3428,7 +4139,7 @@ public static partial class Runtime
             if (types.Length > 3 && !ReferenceEquals(types[3], ArgDispatchClass(d!))) continue;
             // Matching entry: either it is a shape this path runs, or nothing else in
             // the cache can match these classes, so stop either way.
-            return (entry.SinglePrimary || entry.SinglePrimaryWithBeforeAfter) ? entry : null;
+            return (entry.PlainPrimaryChain || entry.PrimaryChainWithBeforeAfter) ? entry : null;
         }
         return null;
     }
@@ -3500,6 +4211,22 @@ public static partial class Runtime
 
     private static LispObject DispatchGF(GenericFunction gf, LispObject[] args)
     {
+        // A discriminating function installed on this generic function replaces
+        // dispatch entirely -- applicable methods, the cache and the combination are
+        // all its business now. Checked at every entry point, arity fast paths
+        // included, or an installed function would be bypassed by exactly the calls
+        // that are most common. Null on every generic function until something
+        // installs one, so the cost on the usual path is a field read.
+        if (gf.DispatchFunction is LispFunction dfN) return dfN.Invoke(args);
+        return DispatchGFCore(gf, args);
+    }
+
+    /// <summary>dotcl.s own dispatch with the discriminating-function check skipped.
+    /// COMPUTE-DISCRIMINATING-FUNCTION.s default method hands this back, so a user
+    /// method that calls CALL-NEXT-METHOD and installs the result gets standard
+    /// dispatch instead of looping back through the function it just installed.</summary>
+    internal static LispObject DispatchGFCore(GenericFunction gf, LispObject[] args)
+    {
         // Arity check: signal program-error for too few/too many arguments
         int requiredCount = gf.LambdaListInfoSet ? gf.RequiredCount : (gf.Arity >= 0 ? gf.Arity : 0);
         // A generic function with no required parameters has nothing to dispatch on:
@@ -3546,6 +4273,10 @@ public static partial class Runtime
         }
         if (cached != null)
         {
+                // The AMOP route: this generic function's effective method for these
+                // argument classes was built by the protocol on the miss below.
+                if (cached.EffectiveMethodFunction is { } cachedEmf)
+                    return cachedEmf.Invoke(args);
                 // Item2: specialized standard slot reader — read the slot directly,
                 // skipping keyword/eql checks and effective-method construction. The cache
                 // entry was only stored for this shape (1 dispatch arg, single accessor
@@ -3673,6 +4404,32 @@ public static partial class Runtime
                 return InvokeStandardCombination(cached.Before, cached.Primary, cached.After, args);
         }
 
+        // A generic function whose invocation protocol someone specialised is dispatched
+        // through it. The answer is cached per argument-class vector like everything
+        // else here, so the protocol runs on a miss rather than on every call. If it
+        // cannot answer (no applicable methods, or the pieces are missing), fall through
+        // to dotcl's own dispatch, which reports no-applicable-method the usual way.
+        if (UsesInvocationProtocol(gf))
+        {
+            var protocolEmf = EffectiveMethodThroughProtocol(gf, args);
+            if (protocolEmf != null)
+            {
+                var protocolTypes = new LispClass?[Math.Min(args.Length, Math.Max(1, requiredCount))];
+                for (int i = 0; i < protocolTypes.Length; i++)
+                    protocolTypes[i] = ArgDispatchClass(args[i]);
+                AddDispatchCache(gf, new CachedDispatch
+                {
+                    ArgTypes = protocolTypes,
+                    Around = new List<LispMethod>(),
+                    Before = new List<LispMethod>(),
+                    Primary = new List<LispMethod>(),
+                    After = new List<LispMethod>(),
+                    EffectiveMethodFunction = protocolEmf
+                });
+                return protocolEmf.Invoke(args);
+            }
+        }
+
         // Find applicable methods
         var applicable = new List<LispMethod>();
         bool hasEqlSpec = false;
@@ -3682,7 +4439,7 @@ public static partial class Runtime
                 applicable.Add(method);
             if (!hasEqlSpec)
                 foreach (var spec in method.Specializers)
-                    if (spec is Cons) { hasEqlSpec = true; break; }
+                    if (EqlSpecializerValue(spec) != null) { hasEqlSpec = true; break; }
         }
 
         if (applicable.Count == 0)
@@ -3841,7 +4598,7 @@ public static partial class Runtime
             {
                 bool hasEql = false;
                 foreach (var spec in m.Specializers)
-                    if (spec is Cons) { hasEql = true; break; }
+                    if (EqlSpecializerValue(spec) != null) { hasEql = true; break; }
                 if (!hasEql) continue;
                 if (m.Qualifiers.Length != 0) { cacheable = false; break; }
                 eqlMethods.Add(m);
@@ -3857,7 +4614,7 @@ public static partial class Runtime
                 {
                     bool hasEql = false;
                     foreach (var spec in m.Specializers)
-                        if (spec is Cons) { hasEql = true; break; }
+                        if (EqlSpecializerValue(spec) != null) { hasEql = true; break; }
                     if (!hasEql) nonEqlPrimary.Add(m);
                 }
                 // Precompute per-EQL-method dispatch data: the EQL value (the
@@ -3869,7 +4626,7 @@ public static partial class Runtime
                 var eqlChains = new List<LispMethod>[eqlArr.Length];
                 for (int i = 0; i < eqlArr.Length; i++)
                 {
-                    eqlValues[i] = ((Cons)((Cons)eqlArr[i].Specializers[0]).Cdr).Car;
+                    eqlValues[i] = EqlSpecializerValue(eqlArr[i].Specializers[0])!;
                     var chain = new List<LispMethod>(1 + nonEqlPrimary.Count) { eqlArr[i] };
                     chain.AddRange(nonEqlPrimary);
                     eqlChains[i] = chain;
@@ -4056,6 +4813,13 @@ public static partial class Runtime
         return result;
     }
 
+    /// <summary>Run an effective method form on a call.s arguments. The private
+    /// evaluator below is the one dispatch already uses; this is the entry point
+    /// DOTCL-MOP:COMPUTE-EFFECTIVE-METHOD-FUNCTION hands out as a closure, so the
+    /// two cannot read the same form differently.</summary>
+    public static LispObject ApplyEffectiveMethodForm(LispObject form, LispObject[] args)
+        => EvalEffectiveMethodForm(form, args);
+
     /// <summary>
     /// Evaluate an effective method form from a long-form method combination.
     /// Handles CALL-METHOD and MAKE-METHOD special forms.
@@ -4068,10 +4832,39 @@ public static partial class Runtime
             {
                 if (sym.Name == "CALL-METHOD")
                 {
-                    // (call-method method next-method-list)
+                    // (call-method method next-method-list). The next-method list
+                    // is what CALL-NEXT-METHOD inside the method walks, so it has
+                    // to be installed as the chain rather than dropped: without it
+                    // a long-form method combination silently loses
+                    // CALL-NEXT-METHOD while the standard one keeps it.
                     var methodObj = (c.Cdr is Cons mc1) ? mc1.Car : Nil.Instance;
+                    var nextForm = (c.Cdr is Cons mc2 && mc2.Cdr is Cons mc3)
+                        ? mc3.Car : Nil.Instance;
                     if (methodObj is LispMethod method)
-                        return method.Function.Invoke(args);
+                    {
+                        var chain = new List<LispMethod> { method };
+                        for (var rest = nextForm; rest is Cons nc; rest = nc.Cdr)
+                        {
+                            if (nc.Car is LispMethod nextMethod) { chain.Add(nextMethod); continue; }
+                            // (make-method form): a method whose body is the form.
+                            // The standard combination builds exactly this for the
+                            // around chain -- (call-method around ((make-method
+                            // (call-method primary nil)))) -- so without it
+                            // CALL-NEXT-METHOD out of an :around method has nowhere
+                            // to go. The body re-enters this evaluator, which
+                            // installs the inner form.s own chain.
+                            if (nc.Car is Cons mm && mm.Car is Symbol mms
+                                && mms.Name == "MAKE-METHOD" && mm.Cdr is Cons mmBody)
+                            {
+                                var body = mmBody.Car;
+                                var synthetic = (LispMethod)MakeMethod(Nil.Instance, Nil.Instance,
+                                    new LispFunction(inner => EvalEffectiveMethodForm(body, inner),
+                                        "MAKE-METHOD body", -1));
+                                chain.Add(synthetic);
+                            }
+                        }
+                        return InvokeWithNextMethods(chain, 0, args, null);
+                    }
                     if (methodObj is LispFunction fn)
                         return fn.Invoke(args);
                     throw new LispErrorException(new LispError($"CALL-METHOD: invalid method object {methodObj}"));
@@ -4530,6 +5323,54 @@ public static partial class Runtime
         throw new LispErrorException(new LispError("CALL-NEXT-METHOD: no next method"));
     }
 
+    /// <summary>
+    /// (CALL-NEXT-METHOD) with no arguments, from a body whose invocation came in
+    /// on the loose-argument path. Runs the next method on the same loose slots,
+    /// so a chain of N methods builds no argument array at any step -- the array
+    /// form had to materialise one per link just to pass the arguments along
+    /// unchanged, which is what the no-argument call means.
+    ///
+    /// Hands over to the array form for everything it cannot run itself: an
+    /// invocation that already holds an array, an exhausted chain (where the
+    /// fallback runs), or an arity the loose slots do not cover.
+    /// </summary>
+    public static LispObject CallNextMethodLoose()
+    {
+        var chain = _nextMethodChain;
+        if (chain == null)
+            throw new LispErrorException(new LispError("CALL-NEXT-METHOD: no next method"));
+        int idx = _nextMethodIndex;
+        if (_currentGFArgs != null || idx >= chain.Count
+            || _currentGFArgc < 1 || _currentGFArgc > 4)
+            return CallNextMethod();
+
+        var savedIndex = _nextMethodIndex;
+        var savedCapturedNmp = _capturedNmp;
+        var savedCapturedCnm = _capturedCnm;
+        _nextMethodIndex = idx + 1;
+        // The next body builds its own closures from the chain state if it
+        // captures, exactly as INVOKEWITHNEXTMETHODS arranges for the array path.
+        _capturedNmp = null;
+        _capturedCnm = null;
+        try
+        {
+            var fn = chain[idx].Function;
+            return _currentGFArgc switch
+            {
+                1 => fn.Invoke1(_currentGFArg0!),
+                2 => fn.Invoke2(_currentGFArg0!, _currentGFArg1!),
+                3 => fn.Invoke3(_currentGFArg0!, _currentGFArg1!, _currentGFArg2!),
+                _ => fn.Invoke4(_currentGFArg0!, _currentGFArg1!, _currentGFArg2!, _currentGFArg3!)
+            };
+        }
+        finally
+        {
+            _nextMethodIndex = savedIndex;
+            _capturedNmp = savedCapturedNmp;
+            _capturedCnm = savedCapturedCnm;
+        }
+    }
+
     public static LispObject CallNextMethod(params LispObject[] args)
     {
         if (_nextMethodChain == null)
@@ -4655,10 +5496,10 @@ public static partial class Runtime
                 else if (!IsTruthy(Typep(args[i], cls.Name)))
                     return false;
             }
-            // EQL specializer: (eql value)
-            else if (spec is Cons eqlSpec && eqlSpec.Car is Symbol sym && sym.Name == "EQL")
+            // EQL specializer: the metaobject, or the (EQL value) list
+            else if (EqlSpecializerValue(spec) is { } eqlValue)
             {
-                if (!IsTrueEql(args[i], ((Cons)eqlSpec.Cdr).Car))
+                if (!IsTrueEql(args[i], eqlValue))
                     return false;
             }
         }
@@ -4679,8 +5520,8 @@ public static partial class Runtime
             if (ReferenceEquals(a.Specializers[i], b.Specializers[i])) continue;
 
             // EQL specializer is always more specific than a class specializer (CLHS 7.6.6.2)
-            bool aIsEql = a.Specializers[i] is Cons eqlA && eqlA.Car is Symbol symA && symA.Name == "EQL";
-            bool bIsEql = b.Specializers[i] is Cons eqlB && eqlB.Car is Symbol symB && symB.Name == "EQL";
+            bool aIsEql = EqlSpecializerValue(a.Specializers[i]) != null;
+            bool bIsEql = EqlSpecializerValue(b.Specializers[i]) != null;
             if (aIsEql && !bIsEql) return -1; // a (EQL) is more specific
             if (!aIsEql && bIsEql) return 1;  // b (EQL) is more specific
             if (aIsEql && bIsEql) continue;   // both EQL, move to next parameter
@@ -4847,6 +5688,19 @@ public static partial class Runtime
     {
         foreach (var s in cls.ClassPrecedenceList)
             if (s.Name.Name == "GENERIC-FUNCTION" || s.Name.Name == "METHOD") return true;
+        return IsFuncallableClass(cls);
+    }
+
+    /// <summary>True for a class whose instances must be callable: AMOP's
+    /// FUNCALLABLE-STANDARD-CLASS as the metaclass, or FUNCALLABLE-STANDARD-OBJECT in
+    /// the precedence list.</summary>
+    internal static bool IsFuncallableClass(LispClass cls)
+    {
+        if (cls.Metaclass is { } meta)
+            foreach (var m in meta.ClassPrecedenceList)
+                if (m.Name.Name == "FUNCALLABLE-STANDARD-CLASS") return true;
+        foreach (var s in cls.ClassPrecedenceList)
+            if (s.Name.Name == "FUNCALLABLE-STANDARD-OBJECT") return true;
         return false;
     }
 
@@ -4970,14 +5824,13 @@ public static partial class Runtime
                 new LispFunction(args => {
                     var newName = args[0];
                     var cls = args[1];
-                    if (cls is not LispClass lc)
+                    if (cls is not LispClass)
                         throw new LispErrorException(new LispTypeError("(SETF CLASS-NAME): not a class", cls));
-                    if (newName is Symbol sym)
-                        lc.Name = sym;
-                    else if (newName is Nil)
-                        lc.NameCleared = true;
-                    else
-                        lc.Name = Startup.Sym(newName.ToString());
+                    // AMOP defines this as reinitialization, not a field write, so a
+                    // metaclass with a REINITIALIZE-INSTANCE method sees the change.
+                    // The :after below is what actually applies the name.
+                    if (Startup.Sym("REINITIALIZE-INSTANCE").Function is LispFunction reinit)
+                        reinit.Invoke(new LispObject[] { cls, Startup.Keyword("NAME"), newName });
                     return newName;
                 }));
             ((LispMethod)scnDefaultMethod).RequiredCount = 2;
@@ -5419,6 +6272,13 @@ public static partial class Runtime
         RegClos("%MAKE-CLASS-FULL", a => Runtime.MakeClassFull(a[0], a[1], a[2], a[3]), 4);
         RegClos("%SLOT-DEF-RAW-OPTIONS", a => Runtime.SetSlotDefRawOptions(a[0], a[1]), 2);
         RegClos("%SLOT-DEF-ATTRS", a => Runtime.SetSlotDefAttrs(a[0], a[1], a[2], a[3], a[4]), 5);
+        RegClos("%SLOT-DEF-DOC", a => Runtime.SetSlotDefDocumentation(a[0], a[1]), 2);
+        RegClos("%SLOT-DEF-DOCUMENTATION", a => Runtime.SlotDefinitionDocumentation(a[0]), 1);
+        // Used by DOCUMENTATION's default method, which is read by the host Lisp
+        // during the cross compile and so cannot name the MOP package: anything that
+        // is not a slot definition answers NIL and falls through to the table.
+        RegClos("%SLOT-DEF-DOCUMENTATION-OR-NIL",
+            a => a[0] is SlotDefinition sd ? sd.Documentation : Nil.Instance, 1);
         RegClos("%SET-CLASS-DEFAULT-INITARGS", a => Runtime.SetClassDefaultInitargs(a[0], a[1]), 2);
         RegClos("%FIND-CLASS-OR-NIL", a => Runtime.FindClassOrNil(a[0]), 1);
         RegClos("%SPECIALIZER-CLASS", a => Runtime.SpecializerClass(a[0]), 1);
@@ -5434,12 +6294,17 @@ public static partial class Runtime
         RegClos("%SET-METHOD-LAMBDA-LIST-INFO", Runtime.SetMethodLambdaListInfo);
         RegClos("%MAKE-METHOD", a => Runtime.MakeMethod(a[0], a[1], a[2]), 3);
         RegClos("%ADD-METHOD", a => Runtime.AddMethod(a[0], a[1]), 2);
+        RegClos("%NOTE-METHOD-CLASS", a => Runtime.NoteMethodClass(a[0], a[1]), 2);
+        RegClos("%NOTE-METHOD-COMBINATION", a => Runtime.NoteMethodCombination(a[0], a[1], a[2]), 3);
+        RegClos("%MAKE-METHOD-LAMBDA-FOR", a => Runtime.MakeMethodLambdaFor(a[0], a[1]), 2);
+        RegClos("%INTERN-EQL-SPECIALIZER", a => Runtime.InternEqlSpecializer(a[0]), 1);
         RegClos("%GF-METHODS", a => Runtime.GetGFMethods(a[0]), 1);
         RegClos("%METHOD-SPECIALIZERS", a => Runtime.MethodSpecializers(a[0]), 1);
         RegClos("%METHOD-QUALIFIERS", a => Runtime.MethodQualifiers(a[0]), 1);
         RegClos("%METHOD-FUNCTION", a => Runtime.MethodFunction(a[0]), 1);
         RegClos("%CLEAR-DEFGENERIC-INLINE-METHODS", a => Runtime.ClearDefgenericInlineMethods(a[0]), 1);
         RegClos("%MARK-DEFGENERIC-INLINE-METHOD", a => Runtime.MarkDefgenericInlineMethod(a[0], a[1]), 2);
+        RegClos("%SET-GF-DECLARATIONS", a => Runtime.SetGFDeclarations(a[0], a[1]), 2);
         RegClos("%SET-METHOD-COMBINATION", a => Runtime.SetMethodCombination(a[0], a[1]), 2);
         RegClos("%SET-METHOD-COMBINATION-ORDER", a => Runtime.SetMethodCombinationOrder(a[0], a[1]), 2);
         RegClos("%SET-METHOD-COMBINATION-ARGS", a => Runtime.SetMethodCombinationArgs(a[0], a[1]), 2);
@@ -5608,6 +6473,18 @@ public static partial class Runtime
                             if (specList is not Cons sc) { match = false; break; }
                             if (!ReferenceEquals(method.Specializers[i], sc.Car))
                             {
+                                // EQL specializers compare by the object they specialize
+                                // on, so the metaobject and the list (EQL object) name
+                                // the same method whichever side each is written as.
+                                var mEql = EqlSpecializerValue(method.Specializers[i]);
+                                var sEql = EqlSpecializerValue(sc.Car);
+                                if (mEql != null || sEql != null)
+                                {
+                                    if (mEql == null || sEql == null || !IsTrueEql(mEql, sEql))
+                                    { match = false; break; }
+                                    specList = sc.Cdr;
+                                    continue;
+                                }
                                 string mName = method.Specializers[i] is LispClass mc ? mc.Name.Name
                                     : method.Specializers[i] is Symbol ms ? ms.Name
                                     : method.Specializers[i].ToString();
@@ -5660,22 +6537,54 @@ public static partial class Runtime
                 new LispFunction(Runtime.InitializeInstance));
             Runtime.AddMethod(gf, defaultMethod);
 
-            // initialize-instance primary for GENERIC-FUNCTION — skip shared-initialize (no Lisp slots)
+            // initialize-instance primary for GENERIC-FUNCTION. dotcl's own generic
+            // functions have no Lisp slots and skip shared-initialize; one made from a
+            // user-defined generic function class does have them (they live in
+            // ExtraSlots), so for those the standard protocol runs and initargs and
+            // initforms are applied.
             {
                 var gfPrimCls = Runtime.FindClass(Startup.Sym("GENERIC-FUNCTION"));
                 var gfPrimM = Runtime.MakeMethod(new Cons(gfPrimCls, Nil.Instance), Nil.Instance,
-                    new LispFunction(args => args[0]));
+                    new LispFunction(args =>
+                    {
+                        if (args[0] is GenericFunction userGf && userGf.StoredClass != null
+                            && Startup.Sym("SHARED-INITIALIZE").Function is LispFunction siFn)
+                        {
+                            var siArgs = new LispObject[args.Length + 1];
+                            siArgs[0] = args[0];
+                            siArgs[1] = T.Instance;
+                            Array.Copy(args, 1, siArgs, 2, args.Length - 1);
+                            siFn.Invoke(siArgs);
+                        }
+                        return args[0];
+                    }));
                 ((LispMethod)gfPrimM).RequiredCount = 1;
                 ((LispMethod)gfPrimM).HasRest = true;
                 ((LispMethod)gfPrimM).HasAllowOtherKeys = true;
                 Runtime.AddMethod(gf, gfPrimM);
             }
 
-            // initialize-instance primary for METHOD — skip shared-initialize (no Lisp slots)
+            // initialize-instance primary for METHOD. A STANDARD-METHOD has no Lisp
+            // slots and skips shared-initialize; one made from a user-defined method
+            // class does have them (they live in ExtraSlots), so for those the standard
+            // protocol runs and initargs and initforms are applied. Mirrors the
+            // GENERIC-FUNCTION primary above.
             {
                 var mPrimCls = Runtime.FindClass(Startup.Sym("METHOD"));
                 var mPrimM = Runtime.MakeMethod(new Cons(mPrimCls, Nil.Instance), Nil.Instance,
-                    new LispFunction(args => args[0]));
+                    new LispFunction(args =>
+                    {
+                        if (args[0] is LispMethod userMethod && userMethod.MetaClass != null
+                            && Startup.Sym("SHARED-INITIALIZE").Function is LispFunction siFn)
+                        {
+                            var siArgs = new LispObject[args.Length + 1];
+                            siArgs[0] = args[0];
+                            siArgs[1] = T.Instance;
+                            Array.Copy(args, 1, siArgs, 2, args.Length - 1);
+                            siFn.Invoke(siArgs);
+                        }
+                        return args[0];
+                    }));
                 ((LispMethod)mPrimM).RequiredCount = 1;
                 ((LispMethod)mPrimM).HasRest = true;
                 ((LispMethod)mPrimM).HasAllowOtherKeys = true;
@@ -5689,18 +6598,12 @@ public static partial class Runtime
                 var gfAfterM = Runtime.MakeMethod(new Cons(gfCls2, Nil.Instance), afterQuals,
                     new LispFunction(args => {
                         if (args[0] is not GenericFunction ugf) return args[0];
-                        for (int i = 1; i + 1 < args.Length; i += 2)
-                        {
-                            if (args[i] is not Symbol ks) continue;
-                            if (ks.Name == "LAMBDA-LIST")
-                                ParseLambdaListIntoGF(ugf, args[i + 1]);
-                            else if (ks.Name == "NAME" && args[i + 1] is Symbol ns
-                                     && ugf.Name.Name == "UNNAMED")
-                            {
-                                ns.Function = ugf;
-                                Runtime.RegisterGF(ns, ugf);
-                            }
-                        }
+                        ApplyGenericFunctionInitargs(ugf, args, renaming: false);
+                        // A generic function with no methods yet never reaches
+                        // ADD-METHOD, so this is the only point where a class of
+                        // generic function that computes its own dispatch gets to
+                        // do so before the first call.
+                        NotifyDiscriminatingFunction(ugf);
                         return ugf;
                     }));
                 ((LispMethod)gfAfterM).RequiredCount = 1;
@@ -5725,7 +6628,20 @@ public static partial class Runtime
                                     m.Specializers = CollectList(args[i + 1]);
                                     break;
                                 case "FUNCTION":
-                                    if (args[i + 1] is LispFunction mf) m.Function = mf;
+                                    // AMOP: the function passed here takes (args
+                                    // next-methods). Dispatch calls method functions
+                                    // with the arguments spread, so what is stored is
+                                    // an adapter; METHOD-FUNCTION still answers the
+                                    // object that was passed in.
+                                    if (args[i + 1] is LispFunction mf)
+                                    {
+                                        m.ProcessedParameterFunction = mf;
+                                        m.Function = new LispFunction(callArgs =>
+                                            mf.Invoke(new LispObject[] {
+                                                Runtime.List(callArgs),
+                                                Runtime.CurrentNextMethods() }),
+                                            "method function adapter", -1);
+                                    }
                                     break;
                                 case "LAMBDA-LIST":
                                     ParseLambdaListIntoMethod(m, args[i + 1]);
@@ -5759,6 +6675,62 @@ public static partial class Runtime
             var defaultMethod = Runtime.MakeMethod(specializers, qualifiers,
                 new LispFunction(Runtime.ReinitializeInstance));
             Runtime.AddMethod(gf, defaultMethod);
+
+            // reinitialize-instance :after for CLASS — applies :NAME, which is how
+            // (SETF CLASS-NAME) changes a name. NIL clears the proper name rather than
+            // naming the class NIL (CLHS ensure-class: redefinition only happens under
+            // a class's proper name).
+            {
+                var riClsQuals = new Cons(Startup.Keyword("AFTER"), Nil.Instance);
+                var riClsCls = Runtime.FindClass(Startup.Sym("CLASS"));
+                var riClsM = Runtime.MakeMethod(new Cons(riClsCls, Nil.Instance), riClsQuals,
+                    new LispFunction(args =>
+                    {
+                        if (args[0] is not LispClass target) return args[0];
+                        for (int i = 1; i + 1 < args.Length; i += 2)
+                        {
+                            if (args[i] is not Symbol k || k.Name != "NAME") continue;
+                            if (args[i + 1] is Symbol newSym) target.Name = newSym;
+                            else if (args[i + 1] is Nil) target.NameCleared = true;
+                            else target.Name = Startup.Sym(args[i + 1].ToString());
+                        }
+                        // AMOP: reinitializing a class that was already finalized
+                        // finalizes it again, through the generic function so a
+                        // metaclass method is heard.
+                        if (!target.IsForwardReferenced
+                            && Startup.Sym("FINALIZE-INHERITANCE").Function is LispFunction fi)
+                            fi.Invoke(new LispObject[] { target });
+                        NotifyDependents(target, SkipInstanceArg(args));
+                        return target;
+                    }));
+                ((LispMethod)riClsM).RequiredCount = 1;
+                ((LispMethod)riClsM).HasRest = true;
+                ((LispMethod)riClsM).HasAllowOtherKeys = true;
+                Runtime.AddMethod(gf, riClsM);
+            }
+
+            // reinitialize-instance :after for GENERIC-FUNCTION
+            // initialization applies, with :NAME now allowed to replace an existing
+            // name: AMOP defines (SETF GENERIC-FUNCTION-NAME) as reinitialization.
+            // The discriminating function is recomputed afterwards, since the lambda
+            // list it was built for may have changed.
+            {
+                var riAfterQuals = new Cons(Startup.Keyword("AFTER"), Nil.Instance);
+                var riGfCls = Runtime.FindClass(Startup.Sym("GENERIC-FUNCTION"));
+                var riGfM = Runtime.MakeMethod(new Cons(riGfCls, Nil.Instance), riAfterQuals,
+                    new LispFunction(args =>
+                    {
+                        if (args[0] is not GenericFunction rgf) return args[0];
+                        ApplyGenericFunctionInitargs(rgf, args, renaming: true);
+                        NotifyDiscriminatingFunction(rgf);
+                        NotifyDependents(rgf, SkipInstanceArg(args));
+                        return rgf;
+                    }));
+                ((LispMethod)riGfM).RequiredCount = 1;
+                ((LispMethod)riGfM).HasRest = true;
+                ((LispMethod)riGfM).HasAllowOtherKeys = true;
+                Runtime.AddMethod(gf, riGfM);
+            }
         }
 
         // describe-object as GF with default method on T
@@ -6115,44 +7087,7 @@ public static partial class Runtime
                 Symbol ms => Runtime.FindClassOrNil(ms) as LispClass,
                 _ => null
             };
-            // Resolve superclasses: each entry is a class object or a class name.
-            LispObject supersList = Nil.Instance;
-            {
-                var resolved = new List<LispObject>();
-                for (var c = supersSpec; c is Cons cc; c = cc.Cdr)
-                {
-                    LispObject sup = cc.Car switch
-                    {
-                        LispClass sc => sc,
-                        Symbol sn => Runtime.FindClassOrNil(sn),
-                        _ => Nil.Instance
-                    };
-                    if (sup is LispClass) resolved.Add(sup);
-                }
-                for (int i = resolved.Count - 1; i >= 0; i--) supersList = new Cons(resolved[i], supersList);
-            }
-            // Convert canonical direct-slot plists (:name N :initargs (..) :initfunction fn ..)
-            // to SlotDefinitions.
-            LispObject slotDefsList = Nil.Instance;
-            {
-                var sds = new List<LispObject>();
-                for (var c = slotsSpec; c is Cons cc; c = cc.Cdr)
-                {
-                    if (cc.Car is not Cons) continue;
-                    LispObject sName = Nil.Instance, sInitargs = Nil.Instance, sInitfn = Nil.Instance;
-                    for (var p = cc.Car; p is Cons pc && pc.Cdr is Cons pv; p = pv.Cdr)
-                    {
-                        if (pc.Car is Symbol pk)
-                        {
-                            if (pk == Startup.Keyword("NAME")) sName = pv.Car;
-                            else if (pk == Startup.Keyword("INITARGS")) sInitargs = pv.Car;
-                            else if (pk == Startup.Keyword("INITFUNCTION")) sInitfn = pv.Car;
-                        }
-                    }
-                    if (sName is Symbol) sds.Add(Runtime.MakeSlotDef(sName, sInitargs, sInitfn));
-                }
-                for (int i = sds.Count - 1; i >= 0; i--) slotDefsList = new Cons(sds[i], slotDefsList);
-            }
+            var (supersList, slotDefsList) = Runtime.ParseClassInitargs(supersSpec, slotsSpec);
             // Pass metaclass-slot initargs (e.g. :type-name) into the class object's single
             // init so shared-initialize applies them before inherited initialize-instance
             // :after runs. RegisterClass copies ExtraSlots to the existing/forward-ref class,

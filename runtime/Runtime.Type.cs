@@ -79,6 +79,17 @@ public static partial class Runtime
 
     public static bool IsTrueTypep(LispObject obj, LispObject typeSpec) => Typep(obj, typeSpec) is not Nil;
 
+    /// <summary>Whether a generic function object is one because its class says so.
+    /// A funcallable instance of a user class shares the representation without being
+    /// a generic function; its StoredClass is that user class.</summary>
+    private static bool IsGenericFunctionClass(GenericFunction gf)
+    {
+        if (gf.StoredClass is not { } cls) return true;
+        foreach (var c in cls.ClassPrecedenceList)
+            if (c.Name.Name == "GENERIC-FUNCTION") return true;
+        return false;
+    }
+
     public static LispObject Typep(LispObject obj, LispObject typeSpec)
     {
         if (typeSpec is Symbol || typeSpec is Nil || typeSpec is T)
@@ -142,6 +153,18 @@ public static partial class Runtime
                     foreach (var c in sdClass.ClassPrecedenceList)
                         if (ReferenceEquals(c, resolvedCls)) return T.Instance;
                     // No match against a known class — fall through (could be T/ATOM).
+                }
+            }
+            // Method combination and EQL specializer metaobjects: neither is a
+            // LispInstance, so the CPL of CLASS-OF is what answers (typep s
+            // 'eql-specializer) and (typep s 'dotcl-mop:specializer).
+            if (typeSpec is Symbol mcSym && (obj is MethodCombinationObject || obj is EqlSpecializer))
+            {
+                var resolvedCls = FindClassOrNil(mcSym) as LispClass;
+                if (resolvedCls != null && ClassOf(obj) is LispClass mcClass)
+                {
+                    foreach (var c in mcClass.ClassPrecedenceList)
+                        if (ReferenceEquals(c, resolvedCls)) return T.Instance;
                 }
             }
             // A class metaobject's type is its metaclass: walk (class-of class)'s CPL so
@@ -610,8 +633,12 @@ public static partial class Runtime
         "STANDARD-CHAR" => obj is LispChar lc && IsStandardChar(lc.Value),
         "EXTENDED-CHAR" => false, // base-char = character in dotcl, so extended-char is empty
         "FUNCTION" => obj is LispFunction,
-        "GENERIC-FUNCTION" => obj is GenericFunction,
-        "STANDARD-GENERIC-FUNCTION" => obj is GenericFunction,
+        // A funcallable instance of a user class is represented as a generic function
+        // (that is the callable object dotcl has), but it is not one: its class says
+        // what it is. Only an object whose class is absent or actually a generic
+        // function class answers to these.
+        "GENERIC-FUNCTION" => obj is GenericFunction gfp && IsGenericFunctionClass(gfp),
+        "STANDARD-GENERIC-FUNCTION" => obj is GenericFunction sgfp && IsGenericFunctionClass(sgfp),
         "COMPILED-FUNCTION" => obj is LispFunction && obj is not GenericFunction,
         "VECTOR" => (obj is LispVector vv && vv.Rank == 1) || obj is LispString,
         "BIT-VECTOR" => obj is LispVector bv && bv.IsBitVector && bv.Rank == 1,
@@ -673,7 +700,11 @@ public static partial class Runtime
         "STRUCTURE-OBJECT" => obj is LispStruct,
         "STRUCTURE-CLASS" => obj is LispClass lsc && lsc.IsStructureClass,
         "STANDARD-OBJECT" => (obj is LispInstance li2 && !li2.Class.IsBuiltIn) || obj is LispClass || obj is LispMethod || obj is LispCondition || obj is LispStream || obj is GenericFunction,
-        "STANDARD-CLASS" => obj is LispClass lcs && !lcs.IsBuiltIn && !lcs.IsStructureClass,
+        // A forward-referenced placeholder is not a standard class yet; it becomes one
+        // when the class is defined for real.
+        "STANDARD-CLASS" => obj is LispClass lcs && !lcs.IsBuiltIn && !lcs.IsStructureClass
+                            && !lcs.IsForwardReferenced,
+        "FORWARD-REFERENCED-CLASS" => obj is LispClass lcf && lcf.IsForwardReferenced,
         "BUILT-IN-CLASS" => obj is LispClass lcb && lcb.IsBuiltIn,
         "CLASS" => obj is LispClass,
         "METHOD" => obj is LispMethod,

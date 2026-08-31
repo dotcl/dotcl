@@ -23,7 +23,7 @@
     <!-- A published version, deliberately not bumped every release: this sample
          demonstrates the shipping flow (PackageReference + project-core), not
          the latest runtime. It builds against whatever it pins here. -->
-    <PackageReference Include="DotCL.Runtime" Version="0.1.18" />
+    <PackageReference Include="DotCL.Runtime" Version="0.1.26" />
   </ItemGroup>
 
 </Project>

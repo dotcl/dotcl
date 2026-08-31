@@ -20,6 +20,7 @@ Neither needs a build step: both work from a running image.
 (require "dotnet-class")  ; dotnet:define-class — subclass a .NET type
 (require "dotnet-ffi")    ; P/Invoke to native libraries
 (require "dotcl-socket")  ; sockets
+(require "dotcl-kestrel") ; HTTP server (ASP.NET Core's Kestrel), serves a Lack app
 (require "dotcl-thread")  ; threads (bordeaux-threads style)
 (require "dotcl-gray")    ; Gray streams
 (require "dotcl-repl")    ; a nicer REPL
@@ -106,6 +107,10 @@ The package identity has more axes than a name, so they are keywords:
 
 `nuget:resolve` is the same thing but returns the counts and the output
 directory, if you want to see what was laid down.
+
+[`examples/http-json.lisp`](../examples/http-json.lisp) puts this together in a
+script you can run: it resolves a package, awaits an async .NET method, and
+reads the JSON that comes back.
 
 ## Shipping an application that uses them
 

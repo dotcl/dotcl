@@ -406,6 +406,36 @@ public static partial class Runtime
             throw new LispErrorException(new LispTypeError("CONCATENATE: not a sequence", seq));
     }
 
+    /// <summary>Total element count of the sequences. Knowing it up front lets
+    /// CONCATENATE fill one exact-size result instead of growing a List and copying
+    /// it out. Walking a list twice is free next to that.</summary>
+    private static int TotalSequenceLength(LispObject[] sequences)
+    {
+        int n = 0;
+        foreach (var seq in sequences)
+        {
+            if (seq is Nil) continue;
+            else if (seq is Cons) { for (var cur = seq; cur is Cons c; cur = c.Cdr) n++; }
+            else if (seq is LispString s) n += s.Length;
+            else if (seq is LispVector v) n += v.Length;
+            else throw new LispErrorException(new LispTypeError("CONCATENATE: not a sequence", seq));
+        }
+        return n;
+    }
+
+    /// <summary>Fill items with every element of the sequences in order. The array must
+    /// be exactly TotalSequenceLength long.</summary>
+    private static void FillSequenceElements(LispObject[] sequences, LispObject[] items)
+    {
+        int k = 0;
+        foreach (var seq in sequences)
+        {
+            if (seq is Cons) { for (var cur = seq; cur is Cons c; cur = c.Cdr) items[k++] = c.Car; }
+            else if (seq is LispString s) { foreach (char ch in s.Value) items[k++] = LispChar.Make(ch); }
+            else if (seq is LispVector v) { for (int i = 0; i < v.Length; i++) items[k++] = v.ElementAt(i); }
+        }
+    }
+
     public static LispObject Concatenate(LispObject resultType, params LispObject[] sequences)
     {
         // Determine the effective type name, handling compound type specifiers like (vector * *)
@@ -481,9 +511,25 @@ public static partial class Runtime
             throw new LispErrorException(new LispError("CONCATENATE: SEQUENCE is abstract and cannot be used as a result type"));
         if (typeName == "LIST" || typeName == "CONS")
         {
-            var items = new List<LispObject>();
-            foreach (var seq in sequences) CollectSequenceElements(seq, items);
-            return List(items.ToArray());
+            // Cons the answer as the sequences are walked. Collecting into a List and
+            // handing its array to List conses exactly these cells anyway, after
+            // paying for the List, its backing store and the copy.
+            Cons? head = null, tail = null;
+            void Emit(LispObject x)
+            {
+                var cell = new Cons(x, Nil.Instance);
+                if (tail == null) head = cell; else tail.Cdr = cell;
+                tail = cell;
+            }
+            foreach (var seq in sequences)
+            {
+                if (seq is Nil) continue;
+                else if (seq is Cons) { for (var cur = seq; cur is Cons c; cur = c.Cdr) Emit(c.Car); }
+                else if (seq is LispString cs) { foreach (char ch in cs.Value) Emit(LispChar.Make(ch)); }
+                else if (seq is LispVector cv) { for (int i = 0; i < cv.Length; i++) Emit(cv.ElementAt(i)); }
+                else throw new LispErrorException(new LispTypeError("CONCATENATE: not a sequence", seq));
+            }
+            return head ?? (LispObject)Nil.Instance;
         }
         if (typeName == "NULL")
         {
@@ -495,8 +541,9 @@ public static partial class Runtime
         }
         if (typeName == "VECTOR" || typeName == "SIMPLE-VECTOR" || typeName == "ARRAY" || typeName == "SIMPLE-ARRAY")
         {
-            var items = new List<LispObject>();
-            foreach (var seq in sequences) CollectSequenceElements(seq, items);
+            int count = TotalSequenceLength(sequences);
+            var items = new LispObject[count];
+            FillSequenceElements(sequences, items);
             // For (simple-array element-type dims) or (vector element-type n): parse element type
             string elemTypeName = "T";
             if (resultType is Cons rtc0)
@@ -508,13 +555,13 @@ public static partial class Runtime
                 var dimsSpec = (rtc0.Cdr as Cons)?.Cdr as Cons;
                 var sizeArg = dimsSpec?.Car;
                 if (sizeArg is Fixnum sizeF)
-                    if (items.Count != (int)sizeF.Value)
-                        throw new LispErrorException(new LispTypeError($"CONCATENATE: result has {items.Count} elements, type requires {sizeF.Value}", resultType));
+                    if (count != (int)sizeF.Value)
+                        throw new LispErrorException(new LispTypeError($"CONCATENATE: result has {count} elements, type requires {sizeF.Value}", resultType));
                 else if (sizeArg is Cons sizeList && sizeList.Car is Fixnum dimFix)
-                    if (items.Count != (int)dimFix.Value)
-                        throw new LispErrorException(new LispTypeError($"CONCATENATE: result has {items.Count} elements, type requires {dimFix.Value}", resultType));
+                    if (count != (int)dimFix.Value)
+                        throw new LispErrorException(new LispTypeError($"CONCATENATE: result has {count} elements, type requires {dimFix.Value}", resultType));
             }
-            return new LispVector(items.ToArray(), elemTypeName);
+            return new LispVector(items, elemTypeName);
         }
         // Try deftype expansion for compound or named sequence types
         if (resultType is Symbol typeAlias && TypeExpanders.TryGetValue(typeAlias.Name, out var concatExpander))
@@ -659,6 +706,34 @@ public static partial class Runtime
     // the predicate considers equal. Stability is obtained by sorting a
     // permutation of indices and breaking ties on the index, so both modes share
     // one comparator and one exception-unwrapping path.
+    /// <summary>Comparator for SORT. Passing a lambda here allocated a display class
+    /// for the captured predicate and key, a delegate over it, and the wrapper
+    /// Array.Sort puts around a Comparison -- three objects before the first
+    /// comparison ran. One object holding the two functions does the same work.</summary>
+    private sealed class LispComparer : System.Collections.Generic.IComparer<LispObject>
+    {
+        private readonly LispFunction _fn;
+        private readonly LispFunction? _keyFn;
+        public LispComparer(LispFunction fn, LispFunction? keyFn) { _fn = fn; _keyFn = keyFn; }
+        public int Compare(LispObject? a, LispObject? b) => SortCompare(_fn, _keyFn, a!, b!);
+    }
+
+    /// <summary>Comparator for STABLE-SORT: orders a permutation of indices and breaks
+    /// ties on the index, so elements the predicate calls equal keep their order.</summary>
+    private sealed class LispStableComparer : System.Collections.Generic.IComparer<int>
+    {
+        private readonly LispObject[] _src;
+        private readonly LispFunction _fn;
+        private readonly LispFunction? _keyFn;
+        public LispStableComparer(LispObject[] src, LispFunction fn, LispFunction? keyFn)
+        { _src = src; _fn = fn; _keyFn = keyFn; }
+        public int Compare(int i, int j)
+        {
+            int c = SortCompare(_fn, _keyFn, _src[i], _src[j]);
+            return c != 0 ? c : i.CompareTo(j);
+        }
+    }
+
     private static void SortObjects(LispObject[] items, LispFunction fn, LispFunction? keyFn, bool stable)
     {
         // .NET wraps comparator exceptions in InvalidOperationException or ArgumentException.
@@ -667,17 +742,13 @@ public static partial class Runtime
         {
             if (!stable)
             {
-                Array.Sort(items, (a, b) => SortCompare(fn, keyFn, a, b));
+                Array.Sort(items, new LispComparer(fn, keyFn));
                 return;
             }
             var src = (LispObject[])items.Clone();
             var order = new int[items.Length];
             for (int i = 0; i < order.Length; i++) order[i] = i;
-            Array.Sort(order, (i, j) =>
-            {
-                int c = SortCompare(fn, keyFn, src[i], src[j]);
-                return c != 0 ? c : i.CompareTo(j);
-            });
+            Array.Sort(order, new LispStableComparer(src, fn, keyFn));
             for (int i = 0; i < items.Length; i++) items[i] = src[order[i]];
         }
         catch (InvalidOperationException ioe) { UnwrapSortException(ioe); }
@@ -704,7 +775,15 @@ public static partial class Runtime
                 for (var p = seq; p is Cons pc; p = pc.Cdr) arr[i++] = pc.Car;
             }
             SortObjects(arr, fn, keyFn, stable);
-            return List(arr);
+            // ANSI lets SORT destroy the list it was given, and the vector and string
+            // paths right below already write their result back in place. Reusing the
+            // cells we just walked saves consing the whole list a second time, which
+            // was the largest part of sorting a short list.
+            {
+                int i = 0;
+                for (var p = seq; p is Cons pc; p = pc.Cdr) pc.Car = arr[i++];
+            }
+            return seq;
         }
         if (seq is LispString str)
         {
@@ -862,18 +941,20 @@ public static partial class Runtime
         {
             case "LIST":
                 if (obj is Nil || obj is Cons) return obj;
+                // Cons the result straight from the source. Filling an array and
+                // handing it to List conses exactly the same cells and then drops
+                // the array, which for a short sequence is most of the cost.
                 if (obj is LispString s)
                 {
-                    var items = new LispObject[s.Length];
-                    for (int i = 0; i < s.Length; i++)
-                        items[i] = LispChar.Make(s[i]);
-                    return List(items);
+                    LispObject sacc = Nil.Instance;
+                    for (int i = s.Length - 1; i >= 0; i--) sacc = new Cons(LispChar.Make(s[i]), sacc);
+                    return sacc;
                 }
                 if (obj is LispVector lv)
                 {
-                    var items2 = new LispObject[lv.Length];
-                    for (int i3 = 0; i3 < lv.Length; i3++) items2[i3] = lv.ElementAt(i3);
-                    return List(items2);
+                    LispObject vacc = Nil.Instance;
+                    for (int i3 = lv.Length - 1; i3 >= 0; i3--) vacc = new Cons(lv.ElementAt(i3), vacc);
+                    return vacc;
                 }
                 throw new LispErrorException(new LispTypeError("COERCE: cannot coerce to list", obj));
 
@@ -979,13 +1060,7 @@ public static partial class Runtime
                 // Any LispVector or LispString satisfies VECTOR — return as-is
                 if (obj is LispVector || obj is LispString) return obj;
                 if (obj is Nil) return new LispVector(Array.Empty<LispObject>());
-                if (obj is Cons)
-                {
-                    var vitems = new System.Collections.Generic.List<LispObject>();
-                    LispObject vcur = obj;
-                    while (vcur is Cons vc) { vitems.Add(vc.Car); vcur = vc.Cdr; }
-                    return new LispVector(vitems.ToArray());
-                }
+                if (obj is Cons) return new LispVector(ListToArray(obj));
                 throw new LispErrorException(new LispTypeError("COERCE: cannot coerce to vector", obj));
 
             case "SIMPLE-VECTOR":
@@ -993,13 +1068,7 @@ public static partial class Runtime
                 if (obj is LispVector sv2 && (sv2.ElementTypeName == null || sv2.ElementTypeName == "T"))
                     return obj;
                 if (obj is Nil) return new LispVector(Array.Empty<LispObject>());
-                if (obj is Cons)
-                {
-                    var items = new System.Collections.Generic.List<LispObject>();
-                    LispObject cur = obj;
-                    while (cur is Cons cc) { items.Add(cc.Car); cur = cc.Cdr; }
-                    return new LispVector(items.ToArray());
-                }
+                if (obj is Cons) return new LispVector(ListToArray(obj));
                 if (obj is LispString vs)
                 {
                     var items = new LispObject[vs.Length];
@@ -1019,17 +1088,15 @@ public static partial class Runtime
             case "BIT-VECTOR": case "SIMPLE-BIT-VECTOR":
                 if (obj is LispVector bv && bv.IsBitVector) return obj;
                 {
-                    var bitItems = new System.Collections.Generic.List<LispObject>();
-                    if (obj is Nil) { /* empty */ }
-                    else if (obj is Cons)
+                    if (obj is Nil) return new LispVector(Array.Empty<LispObject>(), "BIT");
+                    if (obj is Cons) return new LispVector(ListToArray(obj), "BIT");
+                    if (obj is LispVector sv)
                     {
-                        var cur = obj;
-                        while (cur is Cons c2) { bitItems.Add(c2.Car); cur = c2.Cdr; }
+                        var bitItems = new LispObject[sv.Length];
+                        for (int i2 = 0; i2 < sv.Length; i2++) bitItems[i2] = sv.ElementAt(i2);
+                        return new LispVector(bitItems, "BIT");
                     }
-                    else if (obj is LispVector sv)
-                        for (int i2 = 0; i2 < sv.Length; i2++) bitItems.Add(sv.ElementAt(i2));
-                    else throw new LispErrorException(new LispTypeError("COERCE: cannot coerce to bit-vector", obj));
-                    return new LispVector(bitItems.ToArray(), "BIT");
+                    throw new LispErrorException(new LispTypeError("COERCE: cannot coerce to bit-vector", obj));
                 }
 
             case "FUNCTION":
@@ -1174,14 +1241,17 @@ public static partial class Runtime
         int end = kw.End ?? len;
         CheckBoundingIndices(start, end, len, "FIND");
 
+        // :FROM-END over something indexable walks backwards and stops at the first
+        // match -- the answer is the rightmost one either way, but scanning forward and
+        // keeping the last applied the test to every element. POSITION already did it
+        // this way; FIND did not.
         if (seq is LispVector vec)
         {
             if (kw.FromEnd)
             {
-                LispObject result = Nil.Instance;
-                for (int i = start; i < end; i++)
-                    if (SeqTestMatch(item, vec[i], kw)) result = vec[i];
-                return result;
+                for (int i = end - 1; i >= start; i--)
+                    if (SeqTestMatch(item, vec[i], kw)) return vec[i];
+                return Nil.Instance;
             }
             for (int i = start; i < end; i++)
                 if (SeqTestMatch(item, vec[i], kw)) return vec[i];
@@ -1191,13 +1261,12 @@ public static partial class Runtime
         {
             if (kw.FromEnd)
             {
-                LispObject result = Nil.Instance;
-                for (int i = start; i < end; i++)
+                for (int i = end - 1; i >= start; i--)
                 {
                     var ch = LispChar.Make(str[i]);
-                    if (SeqTestMatch(item, ch, kw)) result = ch;
+                    if (SeqTestMatch(item, ch, kw)) return ch;
                 }
-                return result;
+                return Nil.Instance;
             }
             for (int i = start; i < end; i++)
             {
@@ -1244,13 +1313,13 @@ public static partial class Runtime
         {
             if (kw.FromEnd)
             {
-                LispObject result = Nil.Instance;
-                for (int i = start; i < end; i++)
+                // Backwards, stopping at the first match: see FindCore.
+                for (int i = end - 1; i >= start; i--)
                 {
                     var elem = ApplySeqKey(kw, vec[i]);
-                    if (IsTruthy(predFn.Invoke1(elem))) result = vec[i];
+                    if (IsTruthy(predFn.Invoke1(elem))) return vec[i];
                 }
-                return result;
+                return Nil.Instance;
             }
             for (int i = start; i < end; i++)
             {
@@ -1263,14 +1332,13 @@ public static partial class Runtime
         {
             if (kw.FromEnd)
             {
-                LispObject result = Nil.Instance;
-                for (int i = start; i < end; i++)
+                for (int i = end - 1; i >= start; i--)
                 {
                     var ch = LispChar.Make(str[i]);
                     var elem = ApplySeqKey(kw, ch);
-                    if (IsTruthy(predFn.Invoke1(elem))) result = ch;
+                    if (IsTruthy(predFn.Invoke1(elem))) return ch;
                 }
-                return result;
+                return Nil.Instance;
             }
             for (int i = start; i < end; i++)
             {
@@ -1362,9 +1430,16 @@ public static partial class Runtime
     {
         if (args.Length < 2)
             throw new LispErrorException(new LispProgramError("POSITION-IF: too few arguments"));
-        var predFn = CoerceToFunction(args[0]);
-        var seq = args[1];
-        var kw = ParseSeqKwArgs(args, 2, "POSITION-IF");
+        return PositionIfCore(CoerceToFunction(args[0]), args[1], ParseSeqKwArgs(args, 2, "POSITION-IF"));
+    }
+
+    /// <summary>(POSITION-IF predicate sequence) as a direct entry: the two arguments
+    /// arrive in registers instead of an array built for the variadic entry to walk.</summary>
+    public static LispObject PositionIf2(LispObject pred, LispObject seq) =>
+        PositionIfCore(CoerceToFunction(pred), seq, new SeqKwArgs());
+
+    private static LispObject PositionIfCore(LispFunction predFn, LispObject seq, in SeqKwArgs kw)
+    {
         int len = seq is LispVector v ? v.Length : seq is LispString ls ? ls.Length : (int)((Fixnum)Length(seq)).Value;
         int start = kw.Start;
         int end = kw.End ?? len;
@@ -1446,9 +1521,16 @@ public static partial class Runtime
     {
         if (args.Length < 2)
             throw new LispErrorException(new LispProgramError("COUNT: too few arguments"));
-        var item = args[0];
-        var seq = args[1];
-        var kw = ParseSeqKwArgs(args, 2, "COUNT");
+        return CountCore(args[0], args[1], ParseSeqKwArgs(args, 2, "COUNT"));
+    }
+
+    /// <summary>(COUNT item sequence) as a direct entry: the two arguments arrive in
+    /// registers instead of an array built for the variadic entry to walk.</summary>
+    public static LispObject Count2(LispObject item, LispObject seq) =>
+        CountCore(item, seq, new SeqKwArgs());
+
+    private static LispObject CountCore(LispObject item, LispObject seq, in SeqKwArgs kw)
+    {
         int len = seq is LispVector v ? v.Length : seq is LispString ls ? ls.Length : (int)((Fixnum)Length(seq)).Value;
         int start = kw.Start;
         int end = kw.End ?? len;
@@ -1493,9 +1575,16 @@ public static partial class Runtime
     {
         if (args.Length < 2)
             throw new LispErrorException(new LispProgramError("COUNT-IF: too few arguments"));
-        var predFn = CoerceToFunction(args[0]);
-        var seq = args[1];
-        var kw = ParseSeqKwArgs(args, 2, "COUNT-IF");
+        return CountIfCore(CoerceToFunction(args[0]), args[1], ParseSeqKwArgs(args, 2, "COUNT-IF"));
+    }
+
+    /// <summary>(COUNT-IF predicate sequence) as a direct entry: the two arguments
+    /// arrive in registers instead of an array built for the variadic entry to walk.</summary>
+    public static LispObject CountIf2(LispObject pred, LispObject seq) =>
+        CountIfCore(CoerceToFunction(pred), seq, new SeqKwArgs());
+
+    private static LispObject CountIfCore(LispFunction predFn, LispObject seq, in SeqKwArgs kw)
+    {
         int len = seq is LispVector v ? v.Length : seq is LispString ls ? ls.Length : (int)((Fixnum)Length(seq)).Value;
         int start = kw.Start;
         int end = kw.End ?? len;
@@ -1543,46 +1632,78 @@ public static partial class Runtime
         public bool IsEqTest, IsEqlTest; // fast path flags
     }
 
+    private struct ListKwSeen { public bool Test, TestNot, Key, Unknown; }
+
+    /// <summary>Apply one keyword pair. The first setting of a keyword wins, which is
+    /// what the standard says about a repeated keyword argument.</summary>
+    private static void ApplyListKw(ref ListKwArgs kw, ref ListKwSeen seen,
+                                    LispObject key, LispObject val, string fnName)
+    {
+        if (key is not Symbol s)
+            throw new LispErrorException(new LispProgramError($"{fnName}: keyword must be a symbol, got {key}"));
+        switch (s.Name)
+        {
+            case "TEST": if (!seen.Test) { kw.Test = CoerceToFunction(val); seen.Test = true; } break;
+            case "TEST-NOT": if (!seen.TestNot) { kw.TestNot = CoerceToFunction(val); seen.TestNot = true; } break;
+            case "KEY": if (!seen.Key) { if (val is not Nil) kw.Key = CoerceToFunction(val); seen.Key = true; } break;
+            case "ALLOW-OTHER-KEYS": break;
+            default: seen.Unknown = true; break;
+        }
+    }
+
+    // EQ and EQL are looked up once. FindSymbol is a hash lookup, and it ran on
+    // every MEMBER/ASSOC call that passed a :test.
+    private static Symbol? s_eqlSym, s_eqSym;
+
+    /// <summary>Work out which comparison fast path the parsed keywords allow.</summary>
+    private static void FinishListKw(ref ListKwArgs kw)
+    {
+        if (kw.TestNot != null || kw.Key != null) return;
+        if (kw.Test == null) { kw.IsEqlTest = true; return; }
+        s_eqlSym ??= Startup.CL.FindSymbol("EQL").symbol;
+        s_eqSym ??= Startup.CL.FindSymbol("EQ").symbol;
+        if (kw.Test == s_eqlSym?.Function) kw.IsEqlTest = true;
+        else if (kw.Test == s_eqSym?.Function) kw.IsEqTest = true;
+    }
+
     private static ListKwArgs ParseListKwArgs(LispObject[] args, int kwStart, string fnName)
     {
         var kw = new ListKwArgs();
-        int kwCount = args.Length - kwStart;
-        if (kwCount % 2 != 0)
+        if ((args.Length - kwStart) % 2 != 0)
             throw new LispErrorException(new LispProgramError($"{fnName}: odd number of keyword arguments"));
         bool? allowOtherKeys = null;
-        bool hasUnknown = false;
-        bool testSet = false, testNotSet = false, keySet = false;
         for (int i = kwStart; i < args.Length - 1; i += 2)
             if (args[i] is Symbol kw0 && kw0.Name == "ALLOW-OTHER-KEYS" && allowOtherKeys == null)
                 allowOtherKeys = IsTruthy(args[i + 1]);
+        var seen = default(ListKwSeen);
         for (int i = kwStart; i < args.Length - 1; i += 2)
-        {
-            if (args[i] is not Symbol s)
-                throw new LispErrorException(new LispProgramError($"{fnName}: keyword must be a symbol, got {args[i]}"));
-            switch (s.Name)
-            {
-                case "TEST": if (!testSet) { kw.Test = CoerceToFunction(args[i + 1]); testSet = true; } break;
-                case "TEST-NOT": if (!testNotSet) { kw.TestNot = CoerceToFunction(args[i + 1]); testNotSet = true; } break;
-                case "KEY": if (!keySet) { if (args[i + 1] is not Nil) kw.Key = CoerceToFunction(args[i + 1]); keySet = true; } break;
-                case "ALLOW-OTHER-KEYS": break;
-                default: hasUnknown = true; break;
-            }
-        }
-        if (hasUnknown && allowOtherKeys != true)
+            ApplyListKw(ref kw, ref seen, args[i], args[i + 1], fnName);
+        if (seen.Unknown && allowOtherKeys != true)
             throw new LispErrorException(new LispProgramError($"{fnName}: unknown keyword argument"));
-        // Detect fast paths
-        if (kw.TestNot == null && kw.Key == null)
-        {
-            if (kw.Test == null) kw.IsEqlTest = true;
-            else
-            {
-                // Check if test function is the EQL or EQ symbol-function
-                var eqlSym = Startup.CL.FindSymbol("EQL").symbol;
-                var eqSym = Startup.CL.FindSymbol("EQ").symbol;
-                if (kw.Test == eqlSym?.Function) kw.IsEqlTest = true;
-                else if (kw.Test == eqSym?.Function) kw.IsEqTest = true;
-            }
-        }
+        FinishListKw(ref kw);
+        return kw;
+    }
+
+    /// <summary>One or two keyword pairs, straight from a direct entry's parameters.
+    /// The pairs arrive in registers, and putting them into an array so the general
+    /// parser could walk it was the whole cost of the call: 40 bytes for
+    /// (member x l :test #'string=), which is how most of the standard library
+    /// dispatches on a name.</summary>
+    private static ListKwArgs ParseListKwPairs(LispObject k1, LispObject v1,
+                                               LispObject k2, LispObject v2,
+                                               bool hasSecond, string fnName)
+    {
+        var kw = new ListKwArgs();
+        bool? allowOtherKeys = null;
+        if (k1 is Symbol a1 && a1.Name == "ALLOW-OTHER-KEYS") allowOtherKeys = IsTruthy(v1);
+        if (allowOtherKeys == null && hasSecond && k2 is Symbol a2 && a2.Name == "ALLOW-OTHER-KEYS")
+            allowOtherKeys = IsTruthy(v2);
+        var seen = default(ListKwSeen);
+        ApplyListKw(ref kw, ref seen, k1, v1, fnName);
+        if (hasSecond) ApplyListKw(ref kw, ref seen, k2, v2, fnName);
+        if (seen.Unknown && allowOtherKeys != true)
+            throw new LispErrorException(new LispProgramError($"{fnName}: unknown keyword argument"));
+        FinishListKw(ref kw);
         return kw;
     }
 
@@ -1620,7 +1741,7 @@ public static partial class Runtime
     // through the exact shared parser (over a 2-element array — half the
     // allocation of the InvokeSlow path's 4-element args array).
     public static LispObject Member4(LispObject item, LispObject list, LispObject k, LispObject v) =>
-        MemberCore(item, list, ParseListKwArgs(new[] { k, v }, 0, "MEMBER"));
+        MemberCore(item, list, ParseListKwPairs(k, v, Nil.Instance, Nil.Instance, false, "MEMBER"));
 
     // 6-arg direct entry: (member item list k1 v1 k2 v2) — two keyword pairs,
     // e.g. (member x l :key #'symbol-name :test #'string=), which the compiler's
@@ -1628,13 +1749,13 @@ public static partial class Runtime
     // over a 4-element array; the InvokeSlow path's 6-element args array is skipped.
     public static LispObject Member6(LispObject item, LispObject list,
                                      LispObject k1, LispObject v1, LispObject k2, LispObject v2) =>
-        MemberCore(item, list, ParseListKwArgs(new[] { k1, v1, k2, v2 }, 0, "MEMBER"));
+        MemberCore(item, list, ParseListKwPairs(k1, v1, k2, v2, true, "MEMBER"));
 
     private static LispObject MemberCore(LispObject item, LispObject list, in ListKwArgs kw)
     {
         if (list is Nil) return Nil.Instance;
         if (list is not Cons)
-            throw new LispErrorException(new LispTypeError("MEMBER: not a proper list", list));
+            throw new LispErrorException(new LispTypeError("MEMBER: not a proper list", list, Startup.Sym("LIST")));
 
         // Fast path: eq test, no key
         if (kw.IsEqTest)
@@ -1642,7 +1763,7 @@ public static partial class Runtime
             var cur = list;
             for (; cur is Cons c; cur = c.Cdr)
                 if (IsEqRef(item, c.Car)) return c;
-            if (cur is not Nil) throw new LispErrorException(new LispTypeError("MEMBER: not a proper list", cur));
+            if (cur is not Nil) throw new LispErrorException(new LispTypeError("MEMBER: not a proper list", cur, Startup.Sym("LIST")));
             return Nil.Instance;
         }
         // Fast path: eql test, no key
@@ -1651,7 +1772,7 @@ public static partial class Runtime
             var cur = list;
             for (; cur is Cons c; cur = c.Cdr)
                 if (IsTrueEql(item, c.Car)) return c;
-            if (cur is not Nil) throw new LispErrorException(new LispTypeError("MEMBER: not a proper list", cur));
+            if (cur is not Nil) throw new LispErrorException(new LispTypeError("MEMBER: not a proper list", cur, Startup.Sym("LIST")));
             return Nil.Instance;
         }
         // General case
@@ -1659,7 +1780,7 @@ public static partial class Runtime
             var cur = list;
             for (; cur is Cons c; cur = c.Cdr)
                 if (ListTestMatch(item, c.Car, kw)) return c;
-            if (cur is not Nil) throw new LispErrorException(new LispTypeError("MEMBER: not a proper list", cur));
+            if (cur is not Nil) throw new LispErrorException(new LispTypeError("MEMBER: not a proper list", cur, Startup.Sym("LIST")));
             return Nil.Instance;
         }
     }
@@ -1723,11 +1844,11 @@ public static partial class Runtime
         AdjoinCore(item, list, s_eqlListKw);
 
     public static LispObject Adjoin4(LispObject item, LispObject list, LispObject k, LispObject v) =>
-        AdjoinCore(item, list, ParseListKwArgs(new[] { k, v }, 0, "ADJOIN"));
+        AdjoinCore(item, list, ParseListKwPairs(k, v, Nil.Instance, Nil.Instance, false, "ADJOIN"));
 
     public static LispObject Adjoin6(LispObject item, LispObject list,
                                      LispObject k1, LispObject v1, LispObject k2, LispObject v2) =>
-        AdjoinCore(item, list, ParseListKwArgs(new[] { k1, v1, k2, v2 }, 0, "ADJOIN"));
+        AdjoinCore(item, list, ParseListKwPairs(k1, v1, k2, v2, true, "ADJOIN"));
 
     private static LispObject AdjoinCore(LispObject item, LispObject list, in ListKwArgs kw)
     {
@@ -1757,13 +1878,13 @@ public static partial class Runtime
         AssocCore(item, alist, s_eqlListKw);
 
     public static LispObject Assoc4(LispObject item, LispObject alist, LispObject k, LispObject v) =>
-        AssocCore(item, alist, ParseListKwArgs(new[] { k, v }, 0, "ASSOC"));
+        AssocCore(item, alist, ParseListKwPairs(k, v, Nil.Instance, Nil.Instance, false, "ASSOC"));
 
     // 6-arg direct entry: (assoc item alist k1 v1 k2 v2) — two keyword pairs.
     // See Member6.
     public static LispObject Assoc6(LispObject item, LispObject alist,
                                     LispObject k1, LispObject v1, LispObject k2, LispObject v2) =>
-        AssocCore(item, alist, ParseListKwArgs(new[] { k1, v1, k2, v2 }, 0, "ASSOC"));
+        AssocCore(item, alist, ParseListKwPairs(k1, v1, k2, v2, true, "ASSOC"));
 
     /// NIL is a legal (skipped) alist element; any other non-cons is a type error.
     private static void CheckAssocEntry(LispObject entry)
@@ -1856,9 +1977,20 @@ public static partial class Runtime
     {
         if (args.Length < 2)
             throw new LispErrorException(new LispProgramError("RASSOC: too few arguments"));
-        var item = args[0];
-        var alist = args[1];
-        var kw = ParseListKwArgs(args, 2, "RASSOC");
+        return RassocCore(args[0], args[1], ParseListKwArgs(args, 2, "RASSOC"));
+    }
+
+    /// <summary>(RASSOC item alist) as a direct entry: the two arguments arrive in
+    /// registers instead of an array built for the variadic entry to walk.</summary>
+    public static LispObject Rassoc2(LispObject item, LispObject alist) =>
+        RassocCore(item, alist, s_eqlListKw);
+
+    /// <summary>(RASSOC item alist kw val), the other shape that shows up.</summary>
+    public static LispObject Rassoc4(LispObject item, LispObject alist, LispObject k, LispObject v) =>
+        RassocCore(item, alist, ParseListKwPairs(k, v, Nil.Instance, Nil.Instance, false, "RASSOC"));
+
+    private static LispObject RassocCore(LispObject item, LispObject alist, in ListKwArgs kw)
+    {
         if (alist is Nil) return Nil.Instance;
 
         // Fast path: eql test, no key
@@ -1953,7 +2085,22 @@ public static partial class Runtime
         }
         if (hasUnknown && allowOtherKeys != true)
             throw new LispErrorException(new LispProgramError("REDUCE: unknown keyword argument"));
+        return ReduceCore(fn, seq, keyFn, fromEnd, hasIV, iv, startOpt, endOpt);
+    }
 
+    /// <summary>(REDUCE function sequence) as a direct entry: the two arguments arrive
+    /// in registers instead of an array built for the variadic entry to walk.</summary>
+    public static LispObject Reduce2(LispObject fn, LispObject seq)
+    {
+        if (seq is not Nil && seq is not Cons && seq is not LispVector && seq is not LispString)
+            throw new LispErrorException(new LispTypeError("REDUCE: not a sequence", seq));
+        return ReduceCore(CoerceToFunction(fn), seq, null, false, false, Nil.Instance, null, null);
+    }
+
+    private static LispObject ReduceCore(LispFunction fn, LispObject seq, LispFunction? keyFn,
+                                         bool fromEnd, bool hasIV, LispObject iv,
+                                         int? startOpt, int? endOpt)
+    {
         // A forward fold over a list needs no materialisation: the elements are
         // already reachable in order. Collecting them into a List and then an
         // array copied the sequence twice before the first call to FN.
@@ -2067,6 +2214,46 @@ public static partial class Runtime
     }
 
     // REMOVE: (remove item sequence &key test test-not key count from-end start end)
+    // --- element predicates as structs, not delegates ---
+    //
+    // RemoveCore and friends used to take a Func<LispObject, bool>. Every call
+    // therefore allocated a display class (the lambda captures the item or the
+    // predicate plus the SeqKwArgs struct, which is copied into it) and a delegate
+    // on top -- about 128 bytes before the walk even started, on a call whose
+    // whole job might be two conses. Measured: (remove 2 '(1 2 3)) cost 247.9
+    // bytes where SBCL costs 15.7.
+    //
+    // A struct type parameter is the same shape the bit-vector word ops already
+    // use here: the JIT specialises the method per struct, so Match is a direct
+    // call and nothing is allocated. IElemMatch exists only to constrain it.
+    private interface IElemMatch { bool Match(LispObject elem); }
+
+    /// <summary>(REMOVE item seq ...) / (DELETE item seq ...): the element matches
+    /// when the :TEST (or :TEST-NOT) says it equals ITEM, after :KEY.</summary>
+    private readonly struct ItemMatch : IElemMatch
+    {
+        private readonly LispObject _item;
+        private readonly SeqKwArgs _kw;
+        public ItemMatch(LispObject item, SeqKwArgs kw) { _item = item; _kw = kw; }
+        public bool Match(LispObject elem) => SeqTestMatch(_item, elem, _kw);
+    }
+
+    /// <summary>(REMOVE-IF pred seq ...) and its NOT / DELETE variants: the element
+    /// matches when the predicate says so, after :KEY.</summary>
+    private readonly struct PredMatch : IElemMatch
+    {
+        private readonly LispFunction _pred;
+        private readonly SeqKwArgs _kw;
+        private readonly bool _negate;
+        public PredMatch(LispFunction pred, SeqKwArgs kw, bool negate)
+        { _pred = pred; _kw = kw; _negate = negate; }
+        public bool Match(LispObject elem)
+        {
+            var t = IsTruthy(_pred.Invoke1(ApplySeqKey(_kw, elem)));
+            return _negate ? !t : t;
+        }
+    }
+
     public static LispObject RemoveFull(LispObject[] args)
     {
         if (args.Length < 2)
@@ -2076,7 +2263,7 @@ public static partial class Runtime
         if (seq is not Nil && seq is not Cons && seq is not LispVector && seq is not LispString)
             throw new LispErrorException(new LispTypeError("REMOVE: not a sequence", seq));
         var kw = ParseSeqKwArgs(args, 2, "REMOVE");
-        return RemoveCore(seq, kw, (elem) => SeqTestMatch(item, elem, kw));
+        return RemoveCore(seq, kw, new ItemMatch(item, kw));
     }
 
     // 2-arg direct entry: (remove item seq) — no keywords, default EQL test.
@@ -2087,7 +2274,7 @@ public static partial class Runtime
         if (seq is not Nil && seq is not Cons && seq is not LispVector && seq is not LispString)
             throw new LispErrorException(new LispTypeError("REMOVE: not a sequence", seq));
         var kw = new SeqKwArgs();
-        return RemoveCore(seq, kw, (elem) => SeqTestMatch(item, elem, kw));
+        return RemoveCore(seq, kw, new ItemMatch(item, kw));
     }
 
     // 4-arg direct entry: (remove item seq k v) — one keyword pair, e.g.
@@ -2100,7 +2287,7 @@ public static partial class Runtime
         if (seq is not Nil && seq is not Cons && seq is not LispVector && seq is not LispString)
             throw new LispErrorException(new LispTypeError("REMOVE: not a sequence", seq));
         var kw = ParseSeqKwArgs(new[] { k, v }, 0, "REMOVE");
-        return RemoveCore(seq, kw, (elem) => SeqTestMatch(item, elem, kw));
+        return RemoveCore(seq, kw, new ItemMatch(item, kw));
     }
 
     // 6-arg direct entry: (remove item seq k1 v1 k2 v2) — two keyword pairs,
@@ -2111,7 +2298,7 @@ public static partial class Runtime
         if (seq is not Nil && seq is not Cons && seq is not LispVector && seq is not LispString)
             throw new LispErrorException(new LispTypeError("REMOVE: not a sequence", seq));
         var kw = ParseSeqKwArgs(new[] { k1, v1, k2, v2 }, 0, "REMOVE");
-        return RemoveCore(seq, kw, (elem) => SeqTestMatch(item, elem, kw));
+        return RemoveCore(seq, kw, new ItemMatch(item, kw));
     }
 
     // REMOVE-IF: (remove-if predicate sequence &key key count from-end start end)
@@ -2152,12 +2339,7 @@ public static partial class Runtime
 
     private static LispObject RemoveIfCore(LispFunction predFn, LispObject seq, SeqKwArgs kw, bool negate = false)
     {
-        var result = RemoveCore(seq, kw, (elem) =>
-        {
-            var val = ApplySeqKey(kw, elem);
-            var t = IsTruthy(predFn.Invoke1(val));
-            return negate ? !t : t;
-        });
+        var result = RemoveCore(seq, kw, new PredMatch(predFn, kw, negate));
         // The last predicate call may have left secondary values in the MV register
         // (e.g. a predicate calling SUBTYPEP, which returns two values). REMOVE-IF
         // yields exactly one value, so install the result as the primary, clearing
@@ -2176,7 +2358,18 @@ public static partial class Runtime
         if (seq is not Nil && seq is not Cons && seq is not LispVector && seq is not LispString)
             throw new LispErrorException(new LispTypeError("DELETE: not a sequence", seq));
         var kw = ParseSeqKwArgs(args, 2, "DELETE");
-        return RemoveCore(seq, kw, (elem) => SeqTestMatch(item, elem, kw), destructive: true);
+        return RemoveCore(seq, kw, new ItemMatch(item, kw), destructive: true);
+    }
+
+    /// <summary>(DELETE item seq) with no keywords, as a direct entry. The list
+    /// path allocates nothing at all now, so the argument array the call used to
+    /// build was the whole cost of a DELETE that splices in place.</summary>
+    public static LispObject Delete2(LispObject item, LispObject seq)
+    {
+        if (seq is not Nil && seq is not Cons && seq is not LispVector && seq is not LispString)
+            throw new LispErrorException(new LispTypeError("DELETE: not a sequence", seq));
+        var kw = new SeqKwArgs();
+        return RemoveCore(seq, kw, new ItemMatch(item, kw), destructive: true);
     }
 
     // 4-arg direct entry: (delete item seq kw val) — one keyword pair (e.g.
@@ -2187,7 +2380,7 @@ public static partial class Runtime
         if (seq is not Nil && seq is not Cons && seq is not LispVector && seq is not LispString)
             throw new LispErrorException(new LispTypeError("DELETE: not a sequence", seq));
         var kw = ParseSeqKwArgs(new[] { k, v }, 0, "DELETE");
-        return RemoveCore(seq, kw, (elem) => SeqTestMatch(item, elem, kw), destructive: true);
+        return RemoveCore(seq, kw, new ItemMatch(item, kw), destructive: true);
     }
 
     // DELETE-IF: like REMOVE-IF but destructive on list arguments.
@@ -2200,11 +2393,7 @@ public static partial class Runtime
         if (seq is not Nil && seq is not Cons && seq is not LispVector && seq is not LispString)
             throw new LispErrorException(new LispTypeError("DELETE-IF: not a sequence", seq));
         var kw = ParseSeqKwArgs(args, 2, "DELETE-IF");
-        var result = RemoveCore(seq, kw, (elem) =>
-        {
-            var val = ApplySeqKey(kw, elem);
-            return IsTruthy(predFn.Invoke1(val));
-        }, destructive: true);
+        var result = RemoveCore(seq, kw, new PredMatch(predFn, kw, false), destructive: true);
         return MultipleValues.Primary(result);
     }
 
@@ -2213,7 +2402,19 @@ public static partial class Runtime
     // list, matched conses are spliced out of the original chain in place (SBCL
     // semantics) so code that discards the return value and relies on in-place
     // mutation — e.g. Maxima rempropchk / mfunction-delete — works.
-    private static LispObject RemoveCore(LispObject seq, SeqKwArgs kw, Func<LispObject, bool> matches, bool destructive = false)
+    /// <summary>Element I of a vector or string, for the indexed REMOVE walk. A
+    /// method rather than the `i =&gt; vec[i]` lambda it replaces: that lambda captured
+    /// a local of RemoveCore, which forced the whole method.s closure -- including
+    /// the ones the LIST path uses -- onto the heap on every call, list or not.
+    /// Measured at 96 bytes a call before the walk began.</summary>
+    private static LispObject SeqElemAt(LispObject seq, int i)
+        => seq is LispVector v ? v[i]
+         : seq is LispString s ? LispChar.Make(s[i])
+         : throw new LispErrorException(new LispTypeError("not an indexed sequence", seq));
+
+    private static LispObject RemoveCore<TMatch>(LispObject seq, SeqKwArgs kw, TMatch matches,
+                                                bool destructive = false)
+        where TMatch : struct, IElemMatch
     {
         if (seq is Nil) return Nil.Instance;
 
@@ -2234,8 +2435,7 @@ public static partial class Runtime
             int start = kw.Start;
             int end = kw.End ?? len;
             CheckBoundingIndices(start, end, len, "REMOVE");
-            return RemoveCoreIndexed(len, start, end, kw.FromEnd, maxRemove,
-                i => vec[i], seq);
+            return RemoveCoreIndexed(len, start, end, kw.FromEnd, maxRemove, seq);
         }
         if (seq is LispString str)
         {
@@ -2243,8 +2443,7 @@ public static partial class Runtime
             int start = kw.Start;
             int end = kw.End ?? len;
             CheckBoundingIndices(start, end, len, "REMOVE");
-            return RemoveCoreIndexed(len, start, end, kw.FromEnd, maxRemove,
-                i => LispChar.Make(str[i]), seq);
+            return RemoveCoreIndexed(len, start, end, kw.FromEnd, maxRemove, seq);
         }
         // List. Its length is only needed to validate the range — the walk itself
         // does not need it — so it is computed here rather than inside the walk.
@@ -2256,37 +2455,57 @@ public static partial class Runtime
 
         // Local function for indexed sequences (vector/string)
         LispObject RemoveCoreIndexed(int len, int start, int end, bool fromEnd, int? maxRem,
-            Func<int, LispObject> getElem, LispObject origSeq)
+            LispObject origSeq)
         {
+            // Mark the positions to drop in a bitmap, then fill one exact-size result.
+            // Both branches used to grow a List of every surviving element and copy it
+            // out; the FROM-END one added a List of match positions and a HashSet on
+            // top. A REMOVE that matched nothing paid for all of that before finding
+            // out the answer was the sequence it was handed.
+            int words = (len + 63) >> 6;
+            Span<ulong> drop = words <= 8 ? stackalloc ulong[8] : new ulong[words];
+            drop = drop.Slice(0, words);
+            drop.Clear();
+            int removed = 0;
+
             if (fromEnd && maxRem.HasValue)
             {
-                // FROM-END with COUNT: find all match positions, remove last maxRem
-                var matchPositions = new System.Collections.Generic.List<int>();
-                for (int i = start; i < end; i++)
-                    if (matches(getElem(i))) matchPositions.Add(i);
-                // Take the last maxRem positions (rightmost matches)
-                var removeSet = new System.Collections.Generic.HashSet<int>();
-                for (int i = matchPositions.Count - 1; i >= 0 && removeSet.Count < maxRem.Value; i--)
-                    removeSet.Add(matchPositions[i]);
-                var result = new System.Collections.Generic.List<LispObject>();
-                for (int i = 0; i < len; i++)
-                    if (!removeSet.Contains(i)) result.Add(getElem(i));
-                return removeSet.Count == 0 ? origSeq : CoerceResult(result, origSeq);
+                // Walk backwards and stop once COUNT matches have been found: that is
+                // the whole point of :FROM-END, and the test is what it costs. Marking
+                // every match forward and then unmarking the leftmost excess gave the
+                // same answer while calling the test on the entire range -- observable
+                // when the test has side effects, and needless work when COUNT is small
+                // and the sequence is long.
+                for (int i = end - 1; i >= start && removed < maxRem.Value; i--)
+                    if (matches.Match(SeqElemAt(origSeq, i)))
+                    { drop[i >> 6] |= 1UL << (i & 63); removed++; }
             }
             else
             {
-                // Forward scan: remove first maxRem matches in [start,end)
-                var result = new System.Collections.Generic.List<LispObject>();
-                int removed = 0;
-                for (int i = 0; i < len; i++)
+                for (int i = start; i < end; i++)
                 {
-                    var elem = getElem(i);
-                    if (i >= start && i < end && (!maxRem.HasValue || removed < maxRem.Value) && matches(elem))
-                        removed++;
-                    else
-                        result.Add(elem);
+                    if (maxRem.HasValue && removed >= maxRem.Value) break;
+                    if (matches.Match(SeqElemAt(origSeq, i)))
+                    { drop[i >> 6] |= 1UL << (i & 63); removed++; }
                 }
-                return removed == 0 ? origSeq : CoerceResult(result, origSeq);
+            }
+
+            if (removed == 0) return origSeq;
+
+            if (origSeq is LispString ostr)
+            {
+                var chars = new char[len - removed];
+                int ci = 0;
+                for (int i = 0; i < len; i++)
+                    if ((drop[i >> 6] & (1UL << (i & 63))) == 0) chars[ci++] = ostr[i];
+                return new LispString(new string(chars));
+            }
+            {
+                var items = new LispObject[len - removed];
+                int k = 0;
+                for (int i = 0; i < len; i++)
+                    if ((drop[i >> 6] & (1UL << (i & 63))) == 0) items[k++] = SeqElemAt(origSeq, i);
+                return new LispVector(items, ((LispVector)origSeq).ElementTypeName);
             }
         }
 
@@ -2298,19 +2517,48 @@ public static partial class Runtime
             // general path below first materialises every element into a List
             // and every dropped index into a HashSet, which is most of what
             // (remove-if p list) cost.
+            // DELETE on a list, ordinary shape: splice the matches out of the
+            // chain in place. Nothing is allocated at all -- the general path
+            // below built a List of every element and a HashSet of every dropped
+            // index to reach the same answer.
+            if (destructive && !fromEnd && !maxRem.HasValue && start == 0 && endOpt == null)
+            {
+                var keptHead = listSeq;
+                while (keptHead is Cons hc && matches.Match(hc.Car)) keptHead = hc.Cdr;
+                if (keptHead is not Cons prev) return keptHead;
+                for (var cur1 = prev.Cdr; cur1 is Cons c1; cur1 = c1.Cdr)
+                {
+                    if (matches.Match(c1.Car)) prev.Cdr = c1.Cdr;
+                    else prev = c1;
+                }
+                return keptHead;
+            }
+
             if (!destructive && !fromEnd && !maxRem.HasValue && start == 0 && endOpt == null)
             {
+                // Find the first element to drop before consing anything. When
+                // nothing matches -- which is most calls -- the answer is the list
+                // itself and this allocates nothing at all; the previous version
+                // copied the whole list and then threw the copy away.
+                var first = listSeq;
+                while (first is Cons f && !matches.Match(f.Car)) first = f.Cdr;
+                if (first is not Cons) return listSeq;
+
+                // Copy the untouched prefix, then walk the rest consing survivors.
                 Cons? head = null, tail = null;
-                bool removedAny = false;
-                for (var cur0 = listSeq; cur0 is Cons c0; cur0 = c0.Cdr)
+                for (var cur0 = listSeq; !ReferenceEquals(cur0, first); cur0 = ((Cons)cur0).Cdr)
                 {
-                    if (matches(c0.Car)) { removedAny = true; continue; }
+                    var cell = new Cons(((Cons)cur0).Car, Nil.Instance);
+                    if (tail == null) head = cell; else tail.Cdr = cell;
+                    tail = cell;
+                }
+                for (var cur0 = ((Cons)first).Cdr; cur0 is Cons c0; cur0 = c0.Cdr)
+                {
+                    if (matches.Match(c0.Car)) continue;
                     var cell = new Cons(c0.Car, Nil.Instance);
                     if (tail == null) head = cell; else tail.Cdr = cell;
                     tail = cell;
                 }
-                // Nothing removed: same identity the general path returns.
-                if (!removedAny) return listSeq;
                 return head ?? (LispObject)Nil.Instance;
             }
 
@@ -2326,19 +2574,19 @@ public static partial class Runtime
             var removeSet = new System.Collections.Generic.HashSet<int>();
             if (fromEnd && maxRem.HasValue)
             {
-                // FROM-END with COUNT: match positions in [start,end), drop rightmost maxRem
-                var matchPositions = new System.Collections.Generic.List<int>();
-                for (int i = start; i < end; i++)
-                    if (matches(allElems[i])) matchPositions.Add(i);
-                for (int i = matchPositions.Count - 1; i >= 0 && removeSet.Count < maxRem.Value; i--)
-                    removeSet.Add(matchPositions[i]);
+                // FROM-END with COUNT: walk backwards and stop at COUNT matches, so the
+                // test is applied to the right end of the sequence and no further. The
+                // elements are already in hand here, so this costs nothing over the
+                // forward scan it replaces.
+                for (int i = end - 1; i >= start && removeSet.Count < maxRem.Value; i--)
+                    if (matches.Match(allElems[i])) removeSet.Add(i);
             }
             else
             {
                 // Forward scan: drop first maxRem matches in [start,end)
                 int removed = 0;
                 for (int i = 0; i < len; i++)
-                    if (i >= start && i < end && (!maxRem.HasValue || removed < maxRem.Value) && matches(allElems[i]))
+                    if (i >= start && i < end && (!maxRem.HasValue || removed < maxRem.Value) && matches.Match(allElems[i]))
                         { removeSet.Add(i); removed++; }
             }
 
@@ -2375,6 +2623,18 @@ public static partial class Runtime
     }
 
     // SUBSTITUTE: (substitute newitem olditem sequence &key test test-not key count from-end start end)
+    /// <summary>(SUBSTITUTE new old seq) with no keywords, as a direct entry: the
+    /// call reaches it without building an argument array, which was the last
+    /// allocation left on this shape once the core stopped materialising the whole
+    /// sequence twice.</summary>
+    public static LispObject Substitute3(LispObject newitem, LispObject olditem, LispObject seq)
+    {
+        if (seq is not Nil && seq is not Cons && seq is not LispVector && seq is not LispString)
+            throw new LispErrorException(new LispTypeError("SUBSTITUTE: not a sequence", seq));
+        var kw = new SeqKwArgs();
+        return SubstituteCore(newitem, seq, kw, new ItemMatch(olditem, kw));
+    }
+
     public static LispObject SubstituteFull(LispObject[] args)
     {
         if (args.Length < 3)
@@ -2385,7 +2645,7 @@ public static partial class Runtime
         if (seq is not Nil && seq is not Cons && seq is not LispVector && seq is not LispString)
             throw new LispErrorException(new LispTypeError("SUBSTITUTE: not a sequence", seq));
         var kw = ParseSeqKwArgs(args, 3, "SUBSTITUTE");
-        return SubstituteCore(newitem, seq, kw, (elem) => SeqTestMatch(olditem, elem, kw));
+        return SubstituteCore(newitem, seq, kw, new ItemMatch(olditem, kw));
     }
 
     // SUBSTITUTE-IF: (substitute-if newitem predicate sequence &key key count from-end start end)
@@ -2399,11 +2659,7 @@ public static partial class Runtime
         if (seq is not Nil && seq is not Cons && seq is not LispVector && seq is not LispString)
             throw new LispErrorException(new LispTypeError("SUBSTITUTE-IF: not a sequence", seq));
         var kw = ParseSeqKwArgs(args, 3, "SUBSTITUTE-IF");
-        return SubstituteCore(newitem, seq, kw, (elem) =>
-        {
-            var val = ApplySeqKey(kw, elem);
-            return IsTruthy(predFn.Invoke1(val));
-        });
+        return SubstituteCore(newitem, seq, kw, new PredMatch(predFn, kw, false));
     }
 
     // NSUBSTITUTE: (nsubstitute newitem olditem sequence &key test test-not key count from-end start end)
@@ -2417,7 +2673,7 @@ public static partial class Runtime
         if (seq is not Nil && seq is not Cons && seq is not LispVector && seq is not LispString)
             throw new LispErrorException(new LispTypeError("NSUBSTITUTE: not a sequence", seq));
         var kw = ParseSeqKwArgs(args, 3, "NSUBSTITUTE");
-        return NsubstituteCore(newitem, seq, kw, (elem) => SeqTestMatch(olditem, elem, kw));
+        return NsubstituteCore(newitem, seq, kw, new ItemMatch(olditem, kw));
     }
 
     // NSUBSTITUTE-IF: (nsubstitute-if newitem predicate sequence &key key count from-end start end)
@@ -2431,21 +2687,36 @@ public static partial class Runtime
         if (seq is not Nil && seq is not Cons && seq is not LispVector && seq is not LispString)
             throw new LispErrorException(new LispTypeError("NSUBSTITUTE-IF: not a sequence", seq));
         var kw = ParseSeqKwArgs(args, 3, "NSUBSTITUTE-IF");
-        return NsubstituteCore(newitem, seq, kw, (elem) =>
-        {
-            var val = ApplySeqKey(kw, elem);
-            return IsTruthy(predFn.Invoke1(val));
-        });
+        return NsubstituteCore(newitem, seq, kw, new PredMatch(predFn, kw, false));
     }
 
     // Core substitute logic (non-destructive)
-    private static LispObject SubstituteCore(LispObject newitem, LispObject seq, SeqKwArgs kw, Func<LispObject, bool> matches)
+    private static LispObject SubstituteCore<TMatch>(LispObject newitem, LispObject seq,
+                                                     SeqKwArgs kw, TMatch matches)
+        where TMatch : struct, IElemMatch
     {
         if (seq is Nil) return Nil.Instance;
 
         int? maxSub = kw.Count;
         if (maxSub.HasValue && maxSub.Value <= 0)
             return CopySeq(seq);
+
+        // The ordinary shape -- a list, whole range, no :COUNT, no :FROM-END --
+        // walks once and conses the answer. The general path below materialises
+        // every element into a List, builds a second List of the result, and
+        // hands that to the coercion, which is three intermediates for a list it
+        // could write directly.
+        if (seq is Cons && !kw.FromEnd && !maxSub.HasValue && kw.Start == 0 && kw.End == null)
+        {
+            Cons? subHead = null, subTail = null;
+            for (var cur = seq; cur is Cons c; cur = c.Cdr)
+            {
+                var cell = new Cons(matches.Match(c.Car) ? newitem : c.Car, Nil.Instance);
+                if (subTail == null) subHead = cell; else subTail.Cdr = cell;
+                subTail = cell;
+            }
+            return subHead ?? (LispObject)Nil.Instance;
+        }
 
         // Collect elements
         var allElems = new System.Collections.Generic.List<LispObject>();
@@ -2478,7 +2749,7 @@ public static partial class Runtime
             for (int i = end - 1; i >= start; i--)
             {
                 if (maxSub.HasValue && subbed >= maxSub.Value) break;
-                if (matches(allElems[i])) { subSet.Add(i); subbed++; }
+                if (matches.Match(allElems[i])) { subSet.Add(i); subbed++; }
             }
             var result = new System.Collections.Generic.List<LispObject>();
             for (int i = 0; i < len; i++)
@@ -2492,7 +2763,7 @@ public static partial class Runtime
             int subbed = 0;
             for (int i = 0; i < len; i++)
             {
-                if (i >= start && i < end && (!maxSub.HasValue || subbed < maxSub.Value) && matches(allElems[i]))
+                if (i >= start && i < end && (!maxSub.HasValue || subbed < maxSub.Value) && matches.Match(allElems[i]))
                 {
                     result.Add(newitem);
                     subbed++;
@@ -2505,7 +2776,9 @@ public static partial class Runtime
     }
 
     // Core nsubstitute logic (destructive)
-    private static LispObject NsubstituteCore(LispObject newitem, LispObject seq, SeqKwArgs kw, Func<LispObject, bool> matches)
+    private static LispObject NsubstituteCore<TMatch>(LispObject newitem, LispObject seq,
+                                                      SeqKwArgs kw, TMatch matches)
+        where TMatch : struct, IElemMatch
     {
         if (seq is Nil) return Nil.Instance;
 
@@ -2526,7 +2799,7 @@ public static partial class Runtime
                 for (int i = end - 1; i >= start; i--)
                 {
                     if (maxSub.HasValue && subbed >= maxSub.Value) break;
-                    if (matches(vec[i])) { vec.SetElement(i, newitem); subbed++; }
+                    if (matches.Match(vec[i])) { vec.SetElement(i, newitem); subbed++; }
                 }
             }
             else
@@ -2535,7 +2808,7 @@ public static partial class Runtime
                 for (int i = start; i < end; i++)
                 {
                     if (maxSub.HasValue && subbed >= maxSub.Value) break;
-                    if (matches(vec[i])) { vec.SetElement(i, newitem); subbed++; }
+                    if (matches.Match(vec[i])) { vec.SetElement(i, newitem); subbed++; }
                 }
             }
             return seq;
@@ -2564,7 +2837,7 @@ public static partial class Runtime
                 for (int i = cells.Count - 1; i >= 0; i--)
                 {
                     if (maxSub.HasValue && subbed >= maxSub.Value) break;
-                    if (matches(cells[i].Car)) { cells[i].Car = newitem; subbed++; }
+                    if (matches.Match(cells[i].Car)) { cells[i].Car = newitem; subbed++; }
                 }
             }
             else
@@ -2573,7 +2846,7 @@ public static partial class Runtime
                 for (int i = 0; i < cells.Count; i++)
                 {
                     if (maxSub.HasValue && subbed >= maxSub.Value) break;
-                    if (matches(cells[i].Car)) { cells[i].Car = newitem; subbed++; }
+                    if (matches.Match(cells[i].Car)) { cells[i].Car = newitem; subbed++; }
                 }
             }
             return seq;
@@ -2585,72 +2858,99 @@ public static partial class Runtime
     {
         if (args.Length < 1)
             throw new LispErrorException(new LispProgramError("REMOVE-DUPLICATES: too few arguments"));
-        var seq = args[0];
+        return RemoveDuplicatesCore(args[0], ParseSeqKwArgs(args, 1, "REMOVE-DUPLICATES"));
+    }
+
+    /// <summary>(REMOVE-DUPLICATES sequence) as a direct entry: the argument arrives in
+    /// a register instead of an array built for the variadic entry to walk.</summary>
+    public static LispObject RemoveDuplicates1(LispObject seq) =>
+        RemoveDuplicatesCore(seq, new SeqKwArgs());
+
+    private static LispObject RemoveDuplicatesCore(LispObject seq, in SeqKwArgs kw)
+    {
         if (seq is not Nil && seq is not Cons && seq is not LispVector && seq is not LispString)
             throw new LispErrorException(new LispTypeError("REMOVE-DUPLICATES: not a sequence", seq));
-        var kw = ParseSeqKwArgs(args, 1, "REMOVE-DUPLICATES");
         if (seq is Nil) return Nil.Instance;
 
-        // Collect all elements
-        var allElems = new System.Collections.Generic.List<LispObject>();
+        // A list is walked into one exact-size array, because the scan below indexes
+        // arbitrarily and re-walking the list per index would make an already
+        // quadratic algorithm cubic. A vector or string is indexed where it stands.
+        // The previous version grew a List of every element, a bool[] of every
+        // index, and a second List of the survivors, then copied that out again.
+        LispObject[]? elems = null;
         int len;
-        if (seq is LispVector vec)
-        {
-            len = vec.Length;
-            for (int i = 0; i < len; i++) allElems.Add(vec[i]);
-        }
-        else if (seq is LispString str)
-        {
-            len = str.Length;
-            for (int i = 0; i < len; i++) allElems.Add(LispChar.Make(str[i]));
-        }
-        else
-        {
-            for (var cur = seq; cur is Cons c; cur = c.Cdr) allElems.Add(c.Car);
-            len = allElems.Count;
-        }
+        if (seq is LispVector v0) len = v0.Length;
+        else if (seq is LispString s0) len = s0.Length;
+        else { elems = ListToArray(seq); len = elems.Length; }
 
         int start = kw.Start;
         int end = kw.End ?? len;
         CheckBoundingIndices(start, end, len, "REMOVE-DUPLICATES");
 
-        // Determine which elements are duplicates
-        var isDup = new bool[len];
+        LispObject At(int i) => elems != null ? elems[i] : SeqElemAt(seq, i);
+
+        // Duplicate positions go in a bitmap -- on the stack for sequences up to
+        // 512 elements.
+        int words = (len + 63) >> 6;
+        Span<ulong> dup = words <= 8 ? stackalloc ulong[8] : new ulong[words];
+        dup = dup.Slice(0, words);
+        dup.Clear();
+        int removed = 0;
+
         for (int i = start; i < end; i++)
         {
-            if (isDup[i]) continue;
-            var ki = ApplySeqKey(kw, allElems[i]);
+            if ((dup[i >> 6] & (1UL << (i & 63))) != 0) continue;
+            var ki = ApplySeqKey(kw, At(i));
             if (kw.FromEnd)
             {
-                // from-end=t: keep first occurrence, mark later duplicates
+                // from-end=t: keep the first occurrence, mark the later ones
                 for (int j = i + 1; j < end; j++)
                 {
-                    if (isDup[j]) continue;
-                    var kj = ApplySeqKey(kw, allElems[j]);
-                    if (SeqTestMatch2(ki, kj, kw))
-                        isDup[j] = true;
+                    if ((dup[j >> 6] & (1UL << (j & 63))) != 0) continue;
+                    if (SeqTestMatch2(ki, ApplySeqKey(kw, At(j)), kw))
+                    { dup[j >> 6] |= 1UL << (j & 63); removed++; }
                 }
             }
             else
             {
-                // default: keep last occurrence, mark earlier duplicates
+                // default: keep the last occurrence, mark the earlier ones
                 for (int j = i + 1; j < end; j++)
                 {
-                    if (isDup[j]) continue;
-                    var kj = ApplySeqKey(kw, allElems[j]);
-                    if (SeqTestMatch2(ki, kj, kw))
-                    {
-                        isDup[i] = true;
-                        break;
-                    }
+                    if ((dup[j >> 6] & (1UL << (j & 63))) != 0) continue;
+                    if (SeqTestMatch2(ki, ApplySeqKey(kw, At(j)), kw))
+                    { dup[i >> 6] |= 1UL << (i & 63); removed++; break; }
                 }
             }
         }
 
-        var result = new System.Collections.Generic.List<LispObject>();
-        for (int i = 0; i < len; i++)
-            if (!isDup[i]) result.Add(allElems[i]);
-        return CoerceResult(result, seq);
+        if (seq is LispString ostr)
+        {
+            var chars = new char[len - removed];
+            int k = 0;
+            for (int i = 0; i < len; i++)
+                if ((dup[i >> 6] & (1UL << (i & 63))) == 0) chars[k++] = ostr[i];
+            return new LispString(new string(chars));
+        }
+        if (seq is LispVector ovec)
+        {
+            var items = new LispObject[len - removed];
+            int k = 0;
+            for (int i = 0; i < len; i++)
+                if ((dup[i >> 6] & (1UL << (i & 63))) == 0) items[k++] = ovec[i];
+            return new LispVector(items, ovec.ElementTypeName);
+        }
+        {
+            // Cons the survivors straight out of the array.
+            Cons? head = null, tail = null;
+            for (int i = 0; i < len; i++)
+            {
+                if ((dup[i >> 6] & (1UL << (i & 63))) != 0) continue;
+                var cell = new Cons(elems![i], Nil.Instance);
+                if (tail == null) head = cell; else tail.Cdr = cell;
+                tail = cell;
+            }
+            return head ?? (LispObject)Nil.Instance;
+        }
     }
 
     // Test match for remove-duplicates (two elements, not item+elem)
@@ -2926,12 +3226,7 @@ public static partial class Runtime
             return elems;
         }
         if (seq is Nil) return Array.Empty<LispObject>();
-        if (seq is Cons)
-        {
-            var list = new System.Collections.Generic.List<LispObject>();
-            for (var cur = seq; cur is Cons c; cur = c.Cdr) list.Add(c.Car);
-            return list.ToArray();
-        }
+        if (seq is Cons) return ListToArray(seq);
         throw new LispErrorException(new LispTypeError($"{fnName}: not a sequence", seq));
     }
 
@@ -2940,6 +3235,86 @@ public static partial class Runtime
         // array so the keyword parser could look at them was an allocation per
         // (search a b), which is the shape most call sites have.
         => SearchCore(seq1, seq2, false, null, null, null, 0, null, 0, null);
+
+    // Keyword state for SEARCH, filled one (key value) pair at a time so the
+    // direct entries below need no argument array. First-wins on duplicates,
+    // which is what the args-array path does.
+    private struct SearchKwState
+    {
+        public bool FromEnd;
+        public LispFunction? TestFn, TestNotFn, KeyFn;
+        public int Start1, Start2;
+        public int? End1, End2;
+        public bool AllowOtherKeys;
+        public bool FeSet, TestSet, TestNotSet, KeySet, S1Set, S2Set, E1Set, E2Set;
+    }
+
+    private static void ApplySearchKw(LispObject k, LispObject v, ref SearchKwState st)
+    {
+        if (k is not Symbol kw)
+            throw new LispErrorException(new LispProgramError(
+                $"SEARCH: keyword must be a symbol, got {k}"));
+        switch (kw.Name)
+        {
+            case "FROM-END": if (!st.FeSet) { st.FromEnd = IsTruthy(v); st.FeSet = true; } break;
+            case "TEST": if (!st.TestSet) { st.TestFn = CoerceToFunction(v); st.TestSet = true; } break;
+            case "TEST-NOT": if (!st.TestNotSet) { st.TestNotFn = CoerceToFunction(v); st.TestNotSet = true; } break;
+            case "KEY": if (!st.KeySet) { st.KeyFn = v is Nil ? null : CoerceToFunction(v); st.KeySet = true; } break;
+            case "START1": if (!st.S1Set) { st.Start1 = (int)((Fixnum)v).Value; st.S1Set = true; } break;
+            case "END1": if (!st.E1Set && v is Fixnum f1) { st.End1 = (int)f1.Value; st.E1Set = true; } break;
+            case "START2": if (!st.S2Set) { st.Start2 = (int)((Fixnum)v).Value; st.S2Set = true; } break;
+            case "END2": if (!st.E2Set && v is Fixnum f2) { st.End2 = (int)f2.Value; st.E2Set = true; } break;
+            case "ALLOW-OTHER-KEYS": break;
+            default:
+                if (!st.AllowOtherKeys)
+                    throw new LispErrorException(new LispProgramError(
+                        $"SEARCH: unknown keyword :{kw.Name}"));
+                break;
+        }
+    }
+
+    // True when (K V) is :allow-other-keys, in which case OUT carries its value.
+    private static bool IsAllowOtherKeysPair(LispObject? k, LispObject v, out bool value)
+    {
+        value = false;
+        if (k is Symbol s && s.Name == "ALLOW-OTHER-KEYS") { value = IsTruthy(v); return true; }
+        return false;
+    }
+
+    /// <summary>SEARCH with up to three keyword pairs, taken as separate arguments.
+    /// SEARCH was the one sequence builtin with no direct entries at all -- not even
+    /// the two-argument one, which already existed as a method -- so every call
+    /// built an argument array. cl-ppcre's scanner makes one (search pattern string
+    /// :start2 s :end2 e) per SCAN, and paid 88 bytes for the array each time.</summary>
+    private static LispObject SearchKeys(LispObject seq1, LispObject seq2,
+                                         LispObject? k1, LispObject? v1,
+                                         LispObject? k2, LispObject? v2,
+                                         LispObject? k3, LispObject? v3)
+    {
+        var st = default(SearchKwState);
+        // First pass, first-wins, exactly as the args-array path does it.
+        if (k1 != null && IsAllowOtherKeysPair(k1, v1!, out var a1)) st.AllowOtherKeys = a1;
+        else if (k2 != null && IsAllowOtherKeysPair(k2, v2!, out var a2)) st.AllowOtherKeys = a2;
+        else if (k3 != null && IsAllowOtherKeysPair(k3, v3!, out var a3)) st.AllowOtherKeys = a3;
+        if (k1 != null) ApplySearchKw(k1, v1!, ref st);
+        if (k2 != null) ApplySearchKw(k2, v2!, ref st);
+        if (k3 != null) ApplySearchKw(k3, v3!, ref st);
+        return SearchCore(seq1, seq2, st.FromEnd, st.TestFn, st.TestNotFn, st.KeyFn,
+                          st.Start1, st.End1, st.Start2, st.End2);
+    }
+
+    public static LispObject Search4(LispObject seq1, LispObject seq2,
+                                     LispObject k1, LispObject v1)
+        => SearchKeys(seq1, seq2, k1, v1, null, null, null, null);
+
+    public static LispObject Search6(LispObject seq1, LispObject seq2,
+                                     LispObject k1, LispObject v1, LispObject k2, LispObject v2)
+        => SearchKeys(seq1, seq2, k1, v1, k2, v2, null, null);
+
+    public static LispObject Search8(LispObject seq1, LispObject seq2,
+                                     LispObject k1, LispObject v1, LispObject k2, LispObject v2,
+                                     LispObject k3, LispObject v3)
+        => SearchKeys(seq1, seq2, k1, v1, k2, v2, k3, v3);
 
     public static LispObject SearchFull(LispObject[] args)
     {
@@ -3095,10 +3470,14 @@ public static partial class Runtime
     internal static void RegisterSequenceBuiltins()
     {
         // COUNT, COUNT-IF, COUNT-IF-NOT
-        Emitter.CilAssembler.RegisterFunction("COUNT",
-            new LispFunction(args => Runtime.Count(args)));
-        Emitter.CilAssembler.RegisterFunction("COUNT-IF",
-            new LispFunction(args => Runtime.CountIf(args)));
+        // COUNT and COUNT-IF: a two-argument direct entry, so (count x l) reaches
+        // the body without building an args array for the variadic entry to walk.
+        var countFn = new LispFunction(args => Runtime.Count(args));
+        countFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject>)Runtime.Count2);
+        Emitter.CilAssembler.RegisterFunction("COUNT", countFn);
+        var countIfFn = new LispFunction(args => Runtime.CountIf(args));
+        countIfFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject>)Runtime.CountIf2);
+        Emitter.CilAssembler.RegisterFunction("COUNT-IF", countIfFn);
         Emitter.CilAssembler.RegisterFunction("COUNT-IF-NOT",
             new LispFunction(args =>
             {
@@ -3134,8 +3513,9 @@ public static partial class Runtime
         var positionFn = new LispFunction(args => Runtime.Position(args));
         positionFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject>)Runtime.Position2);
         Emitter.CilAssembler.RegisterFunction("POSITION", positionFn);
-        Emitter.CilAssembler.RegisterFunction("POSITION-IF",
-            new LispFunction(args => Runtime.PositionIf(args)));
+        var positionIfFn = new LispFunction(args => Runtime.PositionIf(args));
+        positionIfFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject>)Runtime.PositionIf2);
+        Emitter.CilAssembler.RegisterFunction("POSITION-IF", positionIfFn);
         Emitter.CilAssembler.RegisterFunction("POSITION-IF-NOT",
             new LispFunction(args =>
             {
@@ -3147,8 +3527,9 @@ public static partial class Runtime
                 return Runtime.PositionIf(newArgs);
             }));
         // REDUCE
-        Emitter.CilAssembler.RegisterFunction("REDUCE",
-            new LispFunction(args => Runtime.Reduce(args)));
+        var reduceFn = new LispFunction(args => Runtime.Reduce(args));
+        reduceFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject>)Runtime.Reduce2);
+        Emitter.CilAssembler.RegisterFunction("REDUCE", reduceFn);
         // MEMBER, MEMBER-IF, MEMBER-IF-NOT
         // MEMBER/ASSOC: attach direct entries for the dominant call shapes
         // ((item list) and (item list kw val) — e.g. :test #'string=). The
@@ -3196,8 +3577,10 @@ public static partial class Runtime
                 return Runtime.AssocIf(newArgs);
             }));
         // RASSOC, RASSOC-IF, RASSOC-IF-NOT
-        Emitter.CilAssembler.RegisterFunction("RASSOC",
-            new LispFunction(args => Runtime.RassocFull(args)));
+        var rassocFn = new LispFunction(args => Runtime.RassocFull(args));
+        rassocFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject>)Runtime.Rassoc2);
+        rassocFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject, LispObject, LispObject>)Runtime.Rassoc4);
+        Emitter.CilAssembler.RegisterFunction("RASSOC", rassocFn);
         Emitter.CilAssembler.RegisterFunction("RASSOC-IF",
             new LispFunction(args => Runtime.RassocIf(args)));
         Emitter.CilAssembler.RegisterFunction("RASSOC-IF-NOT",
@@ -3231,6 +3614,7 @@ public static partial class Runtime
         Emitter.CilAssembler.RegisterFunction("REMOVE-IF-NOT", removeIfNotFn);
         // DELETE, DELETE-IF, DELETE-IF-NOT — destructive on list args.
         var deleteFn = new LispFunction(args => Runtime.DeleteFull(args));
+        deleteFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject>)Runtime.Delete2);
         deleteFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject, LispObject, LispObject>)Runtime.Delete4);
         Emitter.CilAssembler.RegisterFunction("DELETE", deleteFn);
         Emitter.CilAssembler.RegisterFunction("DELETE-IF",
@@ -3245,8 +3629,10 @@ public static partial class Runtime
                 return Runtime.DeleteIf(newArgs);
             }));
         // SUBSTITUTE, SUBSTITUTE-IF, SUBSTITUTE-IF-NOT
-        Emitter.CilAssembler.RegisterFunction("SUBSTITUTE",
-            new LispFunction(args => Runtime.SubstituteFull(args)));
+        var substituteFn = new LispFunction(args => Runtime.SubstituteFull(args));
+        substituteFn.SetDirectDelegate(
+            (Func<LispObject, LispObject, LispObject, LispObject>)Runtime.Substitute3);
+        Emitter.CilAssembler.RegisterFunction("SUBSTITUTE", substituteFn);
         Emitter.CilAssembler.RegisterFunction("SUBSTITUTE-IF",
             new LispFunction(args => Runtime.SubstituteIf(args)));
         Emitter.CilAssembler.RegisterFunction("SUBSTITUTE-IF-NOT",
@@ -3288,10 +3674,12 @@ public static partial class Runtime
         // MISMATCH, REMOVE-DUPLICATES, DELETE-DUPLICATES, REPLACE
         Emitter.CilAssembler.RegisterFunction("MISMATCH",
             new LispFunction(args => Runtime.MismatchFull(args)));
-        Emitter.CilAssembler.RegisterFunction("REMOVE-DUPLICATES",
-            new LispFunction(args => Runtime.RemoveDuplicatesFull(args)));
-        Emitter.CilAssembler.RegisterFunction("DELETE-DUPLICATES",
-            new LispFunction(args => Runtime.RemoveDuplicatesFull(args)));
+        var removeDupFn = new LispFunction(args => Runtime.RemoveDuplicatesFull(args));
+        removeDupFn.SetDirectDelegate((Func<LispObject, LispObject>)Runtime.RemoveDuplicates1);
+        Emitter.CilAssembler.RegisterFunction("REMOVE-DUPLICATES", removeDupFn);
+        var deleteDupFn = new LispFunction(args => Runtime.RemoveDuplicatesFull(args));
+        deleteDupFn.SetDirectDelegate((Func<LispObject, LispObject>)Runtime.RemoveDuplicates1);
+        Emitter.CilAssembler.RegisterFunction("DELETE-DUPLICATES", deleteDupFn);
         Emitter.CilAssembler.RegisterFunction("REPLACE",
             new LispFunction(args => { Runtime.CheckArityMin("REPLACE", args, 2); return Runtime.Replace(args); }));
         // MAKE-STRING
@@ -3402,9 +3790,16 @@ public static partial class Runtime
         stableSortFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject>)Runtime.StableSort);
         stableSortFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject, LispObject, LispObject>)Runtime.StableSort4);
         Emitter.CilAssembler.RegisterFunction("STABLE-SORT", stableSortFn);
-        // SEARCH
-        Emitter.CilAssembler.RegisterFunction("SEARCH",
-            new LispFunction(args => Runtime.SearchFull(args)));
+        // SEARCH. Direct entries for the shapes real code writes: no keywords, and
+        // one to three keyword pairs. Without them every call built an argument
+        // array, including the two-argument one whose implementation already
+        // existed but was never installed.
+        var searchFn = new LispFunction(args => Runtime.SearchFull(args));
+        searchFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject>)Runtime.Search);
+        searchFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject, LispObject, LispObject>)Runtime.Search4);
+        searchFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject>)Runtime.Search6);
+        searchFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject>)Runtime.Search8);
+        Emitter.CilAssembler.RegisterFunction("SEARCH", searchFn);
         // COPY-SEQ
         Startup.RegisterUnary("COPY-SEQ", Runtime.CopySeq);
 

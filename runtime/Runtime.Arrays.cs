@@ -28,23 +28,49 @@ public static partial class Runtime
             $"{what}: dimension must be a non-negative integer", o, expected));
     }
 
+    /// <summary>(MAKE-ARRAY n) on a plain one-dimensional general vector: build it
+    /// straight, with no argument array anywhere. Everything else -- a dimension
+    /// list, rank 0, any keyword -- goes to the shared body, which reads its
+    /// keywords out of an array.</summary>
+    public static LispObject MakeArray1(LispObject dims)
+    {
+        if (dims is Fixnum f && f.Value >= 0 && f.Value <= int.MaxValue)
+            return new LispVector((int)f.Value, Nil.Instance, "T");
+        return MakeArray(new[] { dims });
+    }
+
+    /// <summary>(MAKE-ARRAY n :INITIAL-ELEMENT x) -- the one keyword shape common
+    /// enough to be worth its own path. Any other keyword falls through.</summary>
+    public static LispObject MakeArray3(LispObject dims, LispObject k, LispObject v)
+    {
+        if (dims is Fixnum f && f.Value >= 0 && f.Value <= int.MaxValue
+            && k is Symbol ks && ks.Name == "INITIAL-ELEMENT")
+            return new LispVector((int)f.Value, v, "T");
+        return MakeArray(new[] { dims, k, v });
+    }
+
     public static LispObject MakeArray(LispObject[] args)
     {
         // (make-array dimensions &key element-type initial-element initial-contents adjustable fill-pointer)
         var dims = args[0];
-        int[] dimArray;
+        // Null for a one-dimensional array, where every constructor below takes
+        // the rank-1 overload and never looks at it. Building the int[1] anyway
+        // cost 32 bytes on every (MAKE-ARRAY n), which is most of them.
+        int[]? dimArray = null;
+        int rank;
         int size;
 
         if (dims is Fixnum)
         {
             size = DimArg("MAKE-ARRAY", dims);
-            dimArray = new[] { size };
+            rank = 1;
         }
         else if (dims is Nil)
         {
             // rank-0 array: 0 dimensions, but 1 element (the scalar)
             size = 1;
             dimArray = Array.Empty<int>();
+            rank = 0;
         }
         else if (dims is Cons)
         {
@@ -52,6 +78,7 @@ public static partial class Runtime
             var cur = dims;
             while (cur is Cons c) { dimList.Add(DimArg("MAKE-ARRAY", c.Car)); cur = c.Cdr; }
             dimArray = dimList.ToArray();
+            rank = dimArray.Length;
             size = 1;
             foreach (var d in dimArray) size *= d;
         }
@@ -107,7 +134,7 @@ public static partial class Runtime
             }
         }
 
-        int rank = dimArray.Length;
+
         LispVector vec;
         if (displacedTo != null)
         {
@@ -128,13 +155,15 @@ public static partial class Runtime
             }
             else throw new LispErrorException(new LispTypeError(
                 "MAKE-ARRAY: :displaced-to must be an array", displacedTo, Startup.Sym("ARRAY")));
-            vec = new LispVector(size, srcVec, displacedOffset, elementType, dimArray);
+            vec = new LispVector(size, srcVec, displacedOffset, elementType,
+                                 dimArray ?? new[] { size });
         }
         else if (initialContents != null)
         {
             var items = new LispObject[size];
             FlattenContents(initialContents, items, 0, rank);
-            vec = rank == 1 ? new LispVector(items, elementType) : new LispVector(items, dimArray, elementType);
+            vec = rank == 1 ? new LispVector(items, elementType)
+                            : new LispVector(items, dimArray!, elementType);
         }
         else
         {
@@ -159,13 +188,14 @@ public static partial class Runtime
             if (elementType == "BIT" || LispVector.NumKindForElementType(elementType) != 0)
             {
                 vec = rank == 1 ? new LispVector(size, fill, elementType)
-                                : new LispVector(size, fill, elementType, dimArray);
+                                : new LispVector(size, fill, elementType, dimArray!);
             }
             else
             {
                 var items = new LispObject[size];
                 for (int j = 0; j < size; j++) items[j] = fill;
-                vec = rank == 1 ? new LispVector(items, elementType) : new LispVector(items, dimArray, elementType);
+                vec = rank == 1 ? new LispVector(items, elementType)
+                            : new LispVector(items, dimArray!, elementType);
             }
         }
 

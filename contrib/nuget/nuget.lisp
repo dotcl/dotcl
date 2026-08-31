@@ -27,7 +27,7 @@
 (defpackage :nuget
   (:use :cl)
   (:shadow #:require)
-  (:export #:require #:resolve))
+  (:export #:require #:resolve #:cache-root #:bundled-root))
 
 (in-package :nuget)
 
@@ -56,6 +56,54 @@
          (dir (%combine base name)))
     (dotnet:static "System.IO.Directory" "CreateDirectory" dir)
     dir))
+
+(defun cache-root ()
+  "Where laid-out packages are kept, so a later process can reuse them.
+
+A sibling of the fasl cache rather than a path of its own: that one already
+decides where dotcl may write on this platform (XDG_CACHE_HOME, LOCALAPPDATA,
+~/.cache), and having two answers to the same question is how they drift apart."
+  (%combine (dotnet:static "System.IO.Path" "GetDirectoryName"
+                           (funcall (find-symbol "%FASL-CACHE-ROOT" "DOTCL")))
+            "dotcl-nuget"))
+
+(defun bundled-root ()
+  "Where a packaged application carries the packages it was built against.
+
+`dotcl pack --bundle DIR' copies DIR next to the installed executable, so a
+layout under DIR/nuget/ arrives as a sibling of the program. Looking there first
+is what lets a shipped application start on a machine with no .NET SDK and no
+network -- resolving otherwise means running `dotnet build'."
+  (let ((exe (ignore-errors (dotnet:static "System.Environment" "ProcessPath"))))
+    (when exe
+      (%combine (dotnet:static "System.IO.Path" "GetDirectoryName" exe) "nuget"))))
+
+(defun %exact-version-p (version)
+  "True when VERSION names one release rather than a moving target.
+
+Only an exact version is worth keeping across processes. A floating spec
+(\"*\", \"13.*\", \"*-*\") or a range asks for whatever is newest, and answering
+it from a directory laid out days ago would quietly pin what the caller
+deliberately left open -- with no way to tell, since finding out means asking
+the network, which is the work being skipped."
+  (and (stringp version)
+       (plusp (length version))
+       (not (find-if (lambda (c) (find c "*[]() ,")) version))))
+
+(defun %layout-key (package version rid tfm source)
+  "A directory name that stands for exactly this request."
+  (let ((raw (format nil "~A_~A_~A_~A~@[_~A~]" package version rid tfm source)))
+    (map 'string (lambda (c) (if (or (alphanumericp c) (find c "._-")) c #\_)) raw)))
+
+(defun %layout-complete-p (dir)
+  "True when DIR holds a finished layout.
+
+A build that died halfway leaves a directory behind, and reusing that would be
+worse than rebuilding: the assemblies that did get copied would register and the
+missing ones would surface much later as a type that cannot be resolved. The
+marker file is written last, so its presence means the build returned 0."
+  (and (dotnet:static "System.IO.Directory" "Exists" dir)
+       (dotnet:static "System.IO.File" "Exists" (%combine dir "dotcl-nuget-complete"))))
 
 (defun %run-dotnet (arg-string working-dir)
   "Run `dotnet ARG-STRING` in WORKING-DIR. Returns (values exit-code stdout+stderr)."
@@ -145,25 +193,64 @@ A package is identified by several axes besides its name, so they are keywords:
   (let* ((version (or version (if prerelease "*-*" "*")))
          (rid (or rid (%current-rid)))
          (tfm (or tfm (%current-tfm)))
-         (proj-dir (%temp-project-dir))
-         (csproj (%combine proj-dir "proj.csproj"))
-         (out-dir (%combine proj-dir "out")))
-    (%write-text csproj (%csproj package version rid tfm))
-    (multiple-value-bind (code log)
-        (%run-dotnet (format nil "build \"~A\" -c Release -o \"~A\"~@[ --source \"~A\"~]"
-                             csproj out-dir source)
-                     proj-dir)
-      (unless (zerop code)
-        (error "nuget: `dotnet build` failed (exit ~D) for ~A ~A:~%~A"
-               code package version log)))
+         (key (%layout-key package version rid tfm source))
+         (keep (%exact-version-p version))
+         (bundled (let ((root (bundled-root)))
+                    (when root
+                      (let ((dir (%combine root key)))
+                        (when (%layout-complete-p dir) dir)))))
+         (out-dir (cond
+                    ;; What the application shipped with wins, whatever the
+                    ;; version spec says. A floating spec is not reused from the
+                    ;; cache because "newest" can still change -- but a bundled
+                    ;; layout is the answer the build already committed to, and
+                    ;; a shipped program has no business asking the network
+                    ;; whether something newer came out.
+                    (bundled bundled)
+                    (keep (%combine (cache-root) key))
+                    (t (%combine (%temp-project-dir) "out")))))
+    ;; An exact version laid out by an earlier process is the same bytes this
+    ;; build would produce, so registering it is the whole job. `dotnet build'
+    ;; costs a second and a half even when every package is already in NuGet's
+    ;; own cache, because it is MSBuild starting up, not the download.
+    (unless (or bundled (and keep (%layout-complete-p out-dir)))
+      (let* ((proj-dir (%temp-project-dir))
+             (csproj (%combine proj-dir "proj.csproj")))
+        (%write-text csproj (%csproj package version rid tfm))
+        (multiple-value-bind (code log)
+            (%run-dotnet (format nil "build \"~A\" -c Release -o \"~A\"~@[ --source \"~A\"~]"
+                                 csproj out-dir source)
+                         proj-dir)
+          (unless (zerop code)
+            (error "nuget: `dotnet build` failed (exit ~D) for ~A ~A:~%~A"
+                   code package version log)))
+        ;; Last, so a half-written layout is never mistaken for a usable one.
+        (when keep
+          (%write-text (%combine out-dir "dotcl-nuget-complete") version))))
     (multiple-value-bind (managed native) (%register-output out-dir "proj")
       (values managed native out-dir))))
 
+(defvar *resolved* (make-hash-table :test #'equal)
+  "Package identities already resolved in this session, mapped to their output
+directory. REQUIRE consults it; RESOLVE always does the work.")
+
 (defun require (package &rest keys &key version source prerelease rid tfm)
   "Like RESOLVE but intended as the user entry point. Returns T on success.
-Accepts the same keywords as RESOLVE (:version :source :prerelease :rid :tfm)."
-  (declare (ignore version source prerelease rid tfm))
-  (apply #'resolve package keys)
-  t)
+Accepts the same keywords as RESOLVE (:version :source :prerelease :rid :tfm).
+
+Asking twice for the same package in one session does the work once. RESOLVE runs
+`dotnet build' on a throwaway project, which costs over a second even when every
+assembly is already in NuGet's cache, and a program that reaches for a package
+from several files would otherwise pay that each time. Call RESOLVE directly to
+force a fresh restore -- that is the only way the answer changes within a session,
+since a floating version can pick up a release published while the process runs."
+  (let ((key (list package
+                   (or version (if prerelease "*-*" "*"))
+                   source
+                   (or rid (%current-rid))
+                   (or tfm (%current-tfm)))))
+    (unless (gethash key *resolved*)
+      (setf (gethash key *resolved*) (nth-value 2 (apply #'resolve package keys))))
+    t))
 
 (provide "dotcl-nuget")

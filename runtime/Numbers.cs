@@ -93,6 +93,24 @@ public sealed class Ratio : Number
         return new Ratio(num, den);
     }
 
+    /// <summary>
+    /// A ratio whose numerator and denominator the caller knows to be coprime.
+    /// Skips the GCD, which is the whole cost where that promise can be made:
+    /// reducing two hundred-digit numbers by a divisor known in advance to be 1.
+    /// Sign normalisation and the collapse to an integer still happen here.
+    ///
+    /// Only for callers that can prove it. MAKE is the one to use otherwise.
+    /// </summary>
+    public static Number MakeReduced(BigInteger num, BigInteger den)
+    {
+        if (den == 0) throw new DivideByZeroException("Division by zero");
+        if (den < 0) { num = -num; den = -den; }
+        // A zero numerator is the integer zero whatever denominator it arrives
+        // with, and a cancelling sum can arrive with one larger than 1.
+        if (den.IsOne || num.IsZero) return Bignum.MakeInteger(num);
+        return new Ratio(num, den);
+    }
+
     public override string ToString() => $"{Numerator}/{Denominator}";
 
     public override bool Equals(object? obj) =>

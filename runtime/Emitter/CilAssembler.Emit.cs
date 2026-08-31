@@ -1216,6 +1216,43 @@ public partial class CilAssembler
         }
     }
 
+    /// <summary>FASL mode only: begin the "build this function once" guard around a
+    /// capture-free LAMBDA / FLET / LABELS. Emits `cache ?? { ... }` and returns the
+    /// label the constructed value falls through to; the caller must finish with
+    /// EndFaslFunctionCache.
+    ///
+    /// In-process assembly builds the LispFunction at assembly time and loads it as
+    /// a constant, so a capture-free local function costs nothing per call. The FASL
+    /// emitter had no equivalent: it emitted the construction itself, so every call
+    /// of a FASL-compiled function containing one allocated a fresh LispFunction, a
+    /// delegate and a wrapper -- 376 bytes a call, measured. Everything ASDF builds
+    /// is a FASL, so that was every library.
+    ///
+    /// One instance per code site is what "captures nothing" means, and it is what
+    /// the in-process path already produces, so this also removes a divergence
+    /// between the two. Racing threads may build two and store either; both are
+    /// equivalent, exactly as for the closure-delegate cache.</summary>
+    private System.Reflection.Emit.Label BeginFaslFunctionCache(
+        int fnId, out System.Reflection.Emit.FieldBuilder field)
+    {
+        field = _faslTypeBuilder!.DefineField($"fn_cache_{fnId}", typeof(LispFunction),
+            FieldAttributes.Public | FieldAttributes.Static);
+        var done = _il.DefineLabel();
+        _il.Emit(OpCodes.Ldsfld, field);
+        _il.Emit(OpCodes.Dup);
+        _il.Emit(OpCodes.Brtrue, done);
+        _il.Emit(OpCodes.Pop);
+        return done;
+    }
+
+    private void EndFaslFunctionCache(System.Reflection.Emit.FieldBuilder field,
+                                      System.Reflection.Emit.Label done)
+    {
+        _il.Emit(OpCodes.Dup);
+        _il.Emit(OpCodes.Stsfld, field);
+        _il.MarkLabel(done);
+    }
+
     private void HandleMakeFunction(Cons instr)
     {
         // (:make-function :param-count N :body (...) [:name "NAME"] [:ll-shape "o2k1r"])
@@ -1249,6 +1286,7 @@ public partial class CilAssembler
         if (_faslMode && _faslTypeBuilder != null)
         {
             int fnId = Interlocked.Increment(ref _faslClosureCount);
+            var cacheDone = BeginFaslFunctionCache(fnId, out var cacheField);
             string methodName = $"fn_{fnId}";
             var method = _faslTypeBuilder.DefineMethod(methodName,
                 MethodAttributes.Public | MethodAttributes.Static,
@@ -1272,6 +1310,7 @@ public partial class CilAssembler
             _il.Emit(OpCodes.Ldc_I4, paramCount);
             _il.Emit(OpCodes.Newobj, typeof(LispFunction)
                 .GetConstructor(new[] { typeof(Func<LispObject[], LispObject>), typeof(string), typeof(int) })!);
+            EndFaslFunctionCache(cacheField, cacheDone);
         }
         else
         {
@@ -1328,6 +1367,7 @@ public partial class CilAssembler
             for (int i = 0; i < paramCount; i++) directParamTypes[i] = typeof(LispObject);
 
             int fnId = Interlocked.Increment(ref _faslClosureCount);
+            var cacheDone = BeginFaslFunctionCache(fnId, out var cacheField);
             string bodyName = $"fnd_body_{fnId}";
             var bodyMethod = _faslTypeBuilder.DefineMethod(bodyName,
                 MethodAttributes.Public | MethodAttributes.Static,
@@ -1382,6 +1422,7 @@ public partial class CilAssembler
                 _il.Emit(OpCodes.Newobj, FaslAssembler.TypedFuncCtors[paramCount]);
                 _il.Emit(OpCodes.Callvirt, FaslAssembler.SetDirectDelegateMI);
             }
+            EndFaslFunctionCache(cacheField, cacheDone);
             return;
         }
 
@@ -3674,10 +3715,14 @@ public partial class CilAssembler
         // Silent: the literal is still a number of the right value, just the
         // wrong type.
         DynamicBindings.Push(rdffSym, Startup.Sym("SINGLE-FLOAT"));
+        // ...and with `::` for every qualified symbol, so the text does not depend on
+        // which symbols happen to be external in THIS image. See ForceInternalSymbolSyntax.
+        Runtime.ForceInternalSymbolSyntax = true;
         try { repr = ((LispString)Runtime.WriteToString(val)).Value; }
         catch { return false; }                      // unprintable (e.g. unreadable struct)
         finally
         {
+            Runtime.ForceInternalSymbolSyntax = false;
             DynamicBindings.Pop(rdffSym);
             DynamicBindings.Pop(pkgSym);
             DynamicBindings.Pop(pnSym); DynamicBindings.Pop(plSym);
@@ -4657,6 +4702,8 @@ public partial class CilAssembler
             ["Runtime.Apply"] = typeof(Runtime).GetMethod("Apply")!,
             ["Runtime.Mapcar"] = typeof(Runtime).GetMethod("Mapcar")!,
             ["Runtime.MapcarN"] = typeof(Runtime).GetMethod("MapcarN")!,
+            ["Runtime.NthValueOf"] = typeof(Runtime).GetMethod("NthValueOf")!,
+            ["Runtime.Mapcar2"] = typeof(Runtime).GetMethod("Mapcar2")!,
 
             // Runtime - rest args
             ["Runtime.CollectRestArgs"] = typeof(Runtime).GetMethod("CollectRestArgs")!,
@@ -4846,6 +4893,7 @@ public partial class CilAssembler
             ["Runtime.MakeSlotDef"] = typeof(Runtime).GetMethod("MakeSlotDef")!,
             ["Runtime.MakeSlotDefWithAllocation"] = typeof(Runtime).GetMethod("MakeSlotDefWithAllocation")!,
             ["Runtime.SetSlotDefRawOptions"] = typeof(Runtime).GetMethod("SetSlotDefRawOptions")!,
+            ["Runtime.SetSlotDefDocumentation"] = typeof(Runtime).GetMethod("SetSlotDefDocumentation")!,
             ["Runtime.SetSlotDefAttrs"] = typeof(Runtime).GetMethod("SetSlotDefAttrs")!,
             ["Runtime.SetClassDefaultInitargs"] = typeof(Runtime).GetMethod("SetClassDefaultInitargs")!,
             ["Runtime.ClassOf"] = typeof(Runtime).GetMethod("ClassOf")!,
@@ -4884,6 +4932,7 @@ public partial class CilAssembler
             ["Runtime.MethodQualifiers"] = typeof(Runtime).GetMethod("MethodQualifiers")!,
             ["Runtime.MethodFunction"] = typeof(Runtime).GetMethod("MethodFunction")!,
             ["Runtime.CallNextMethod"] = typeof(Runtime).GetMethod("CallNextMethod")!,
+            ["Runtime.CallNextMethodLoose"] = typeof(Runtime).GetMethod("CallNextMethodLoose")!,
             ["Runtime.NextMethodP"] = typeof(Runtime).GetMethod("NextMethodP")!,
             ["Runtime.CapturedCnm"] = typeof(Runtime).GetMethod("CapturedCnm")!,
             ["Runtime.CapturedNmp"] = typeof(Runtime).GetMethod("CapturedNmp")!,

@@ -4,7 +4,7 @@
        library (DotCL.Runtime.csproj) — inherit this <Version> via MSBuild's automatic
        Directory.Build.props import. Bump the release version HERE only. -->
   <PropertyGroup>
-    <Version>0.1.26</Version>
+    <Version>0.1.27</Version>
   </PropertyGroup>
 
   <!-- The build has no compiler warnings, and stays that way: a warning stops it.

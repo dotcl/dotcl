@@ -487,72 +487,127 @@
                 (funcall test k item))
         (return t)))))
 
-(defun union (list1 list2 &key (test #'eql) test-not (key #'identity))
-  (let ((key (or key #'identity))
-        (result (copy-list list2)))
-    (dolist (x list1 result)
-      (unless (%set-member (funcall key x) list2 test test-not key)
-        (push x result)))))
+;;; The set functions all have the same shape: walk LIST1 and ask whether each
+;;; element is in LIST2. Asking used to always go through %SET-MEMBER, which
+;;; takes five arguments -- and a five-argument call to a *named* function
+;;; allocates an array to record its call frame (the frame keeps its first four
+;;; arguments in inline slots and has nowhere to put a fifth). That was 64 bytes
+;;; per element of LIST1, on functions that otherwise cost only their result:
+;;; (subsetp l5 l5), which builds nothing at all, cost 368 bytes.
+;;;
+;;; With no :TEST, :TEST-NOT or :KEY -- which is how these are nearly always
+;;; called -- the question is exactly what MEMBER answers, and MEMBER is a C#
+;;; builtin with a two-argument direct entry. The supplied-p flags decide, so
+;;; passing :TEST #'EQL explicitly still takes the general path rather than
+;;; being second-guessed.
 
-(defun nunion (list1 list2 &key (test #'eql) test-not (key #'identity))
-  (union list1 list2 :test test :test-not test-not :key key))
+(defun union (list1 list2 &key (test nil test-p) test-not (key nil key-p))
+  (let ((result (copy-list list2)))
+    (if (or test-p test-not key-p)
+        (let ((test (if test-p test #'eql))
+              (key (or key #'identity)))
+          (dolist (x list1 result)
+            (unless (%set-member (funcall key x) list2 test test-not key)
+              (push x result))))
+        (dolist (x list1 result)
+          (unless (member x list2) (push x result))))))
 
-(defun intersection (list1 list2 &key (test #'eql) test-not (key #'identity))
-  (let ((key (or key #'identity))
-        (result nil))
-    (dolist (x list1 (nreverse result))
-      (when (%set-member (funcall key x) list2 test test-not key)
-        (push x result)))))
+(defun nunion (list1 list2 &key (test nil test-p) test-not (key nil key-p))
+  (if (or test-p test-not key-p)
+      (union list1 list2 :test (if test-p test #'eql) :test-not test-not :key key)
+      (union list1 list2)))
 
-(defun nintersection (list1 list2 &key (test #'eql) test-not (key #'identity))
-  (intersection list1 list2 :test test :test-not test-not :key key))
+(defun intersection (list1 list2 &key (test nil test-p) test-not (key nil key-p))
+  (let ((result nil))
+    (if (or test-p test-not key-p)
+        (let ((test (if test-p test #'eql))
+              (key (or key #'identity)))
+          (dolist (x list1 (nreverse result))
+            (when (%set-member (funcall key x) list2 test test-not key)
+              (push x result))))
+        (dolist (x list1 (nreverse result))
+          (when (member x list2) (push x result))))))
 
-(defun set-difference (list1 list2 &key (test #'eql) test-not (key #'identity))
-  (let ((key (or key #'identity))
-        (result nil))
-    (dolist (x list1 (nreverse result))
-      (unless (%set-member (funcall key x) list2 test test-not key)
-        (push x result)))))
+(defun nintersection (list1 list2 &key (test nil test-p) test-not (key nil key-p))
+  (if (or test-p test-not key-p)
+      (intersection list1 list2 :test (if test-p test #'eql) :test-not test-not :key key)
+      (intersection list1 list2)))
 
-(defun nset-difference (list1 list2 &key (test #'eql) test-not (key #'identity))
-  (set-difference list1 list2 :test test :test-not test-not :key key))
+(defun set-difference (list1 list2 &key (test nil test-p) test-not (key nil key-p))
+  (let ((result nil))
+    (if (or test-p test-not key-p)
+        (let ((test (if test-p test #'eql))
+              (key (or key #'identity)))
+          (dolist (x list1 (nreverse result))
+            (unless (%set-member (funcall key x) list2 test test-not key)
+              (push x result))))
+        (dolist (x list1 (nreverse result))
+          (unless (member x list2) (push x result))))))
 
-(defun set-exclusive-or (list1 list2 &key (test #'eql) test-not (key #'identity))
+(defun nset-difference (list1 list2 &key (test nil test-p) test-not (key nil key-p))
+  (if (or test-p test-not key-p)
+      (set-difference list1 list2 :test (if test-p test #'eql) :test-not test-not :key key)
+      (set-difference list1 list2)))
+
+(defun set-exclusive-or (list1 list2 &key (test nil test-p) test-not (key nil key-p))
   ;; Elements in list1 not in list2: test called as (test (key e1) (key e2))
   ;; Elements in list2 not in list1: test also called as (test (key e1) (key e2))
   ;; so for second pass we use %set-member-rev to keep list1-key as first arg
-  (let ((key (or key #'identity))
-        (result nil))
-    (dolist (x list1)
-      (unless (%set-member (funcall key x) list2 test test-not key)
-        (push x result)))
-    (dolist (x list2)
-      (unless (%set-member-rev (funcall key x) list1 test test-not key)
-        (push x result)))
+  (let ((result nil))
+    (if (or test-p test-not key-p)
+        (let ((test (if test-p test #'eql))
+              (key (or key #'identity)))
+          (dolist (x list1)
+            (unless (%set-member (funcall key x) list2 test test-not key)
+              (push x result)))
+          (dolist (x list2)
+            (unless (%set-member-rev (funcall key x) list1 test test-not key)
+              (push x result))))
+        (progn
+          (dolist (x list1)
+            (unless (member x list2) (push x result)))
+          (dolist (x list2)
+            (unless (member x list1) (push x result)))))
     result))
 
-(defun nset-exclusive-or (list1 list2 &key (test #'eql) test-not (key #'identity))
-  (set-exclusive-or list1 list2 :test test :test-not test-not :key key))
+(defun nset-exclusive-or (list1 list2 &key (test nil test-p) test-not (key nil key-p))
+  (if (or test-p test-not key-p)
+      (set-exclusive-or list1 list2 :test (if test-p test #'eql) :test-not test-not :key key)
+      (set-exclusive-or list1 list2)))
 
-(defun subsetp (list1 list2 &key (test #'eql) test-not (key #'identity))
-  (let ((key (or key #'identity)))
-    (dolist (x list1 t)
-      (unless (%set-member (funcall key x) list2 test test-not key)
-        (return nil)))))
+(defun subsetp (list1 list2 &key (test nil test-p) test-not (key nil key-p))
+  (if (or test-p test-not key-p)
+      (let ((test (if test-p test #'eql))
+            (key (or key #'identity)))
+        (dolist (x list1 t)
+          (unless (%set-member (funcall key x) list2 test test-not key)
+            (return nil))))
+      (dolist (x list1 t)
+        (unless (member x list2) (return nil)))))
 
 ;;; ============================================================
 ;;; Tree operations
 ;;; ============================================================
 
-(defun tree-equal (tree1 tree2 &key (test #'eql) test-not)
-  (if (consp tree1)
-      (and (consp tree2)
-           (tree-equal (car tree1) (car tree2) :test test :test-not test-not)
-           (tree-equal (cdr tree1) (cdr tree2) :test test :test-not test-not))
-      (and (not (consp tree2))
+;;; The recursion used to pass :TEST and :TEST-NOT down at every node, so each
+;;; cons in the tree cost a keyword argument list on the way in. They do not
+;;; change, so they are carried positionally instead. A LABELS closure would
+;;; have read them from the enclosing frame, but that closure is allocated on
+;;; every call to TREE-EQUAL, including the ones that answer from an atom
+;;; without recursing at all -- a named helper with four parameters costs
+;;; nothing (a call frame records its first four arguments in inline slots).
+(defun %tree-equal-1 (a b test test-not)
+  (if (consp a)
+      (and (consp b)
+           (%tree-equal-1 (car a) (car b) test test-not)
+           (%tree-equal-1 (cdr a) (cdr b) test test-not))
+      (and (not (consp b))
            (if test-not
-               (not (not (funcall test-not tree1 tree2)))
-               (if (funcall test tree1 tree2) t nil)))))
+               (not (funcall test-not a b))
+               (if (funcall test a b) t nil)))))
+
+(defun tree-equal (tree1 tree2 &key (test #'eql) test-not)
+  (%tree-equal-1 tree1 tree2 test test-not))
 
 (defun subst (new old tree &key (test #'eql) test-not (key #'identity))
   (let ((key (or key #'identity)))
@@ -705,23 +760,45 @@
       (t :unknown))))
 
 (defun map (result-type function &rest sequences)
-  ;; Convert all sequences to lists for uniform processing
   (let* ((result-type (if result-type (%typexpand-full result-type) result-type))
-         (seq-lists (mapcar #'%seq-to-list sequences))
          (result nil)
          (cat (%map-rt-category result-type)))
-    ;; Step through all sequences in parallel
-    (block outer
-      (loop
-        (let ((args nil)
-              (done nil))
-          (dolist (lst seq-lists)
-            (when (null lst) (setq done t)))
-          (when done (return-from outer))
-          (dolist (lst seq-lists)
-            (push (car lst) args))
-          (push (apply function (nreverse args)) result)
-          (setq seq-lists (mapcar #'cdr seq-lists)))))
+    (cond
+      ;; One sequence, which is nearly every call: walk it and call the function
+      ;; directly. The parallel path below builds an argument list per element,
+      ;; reverses it and APPLYs it.
+      ((and sequences (null (cdr sequences)))
+       (let ((seq (car sequences)))
+         (if (listp seq)
+             (dolist (x seq) (push (funcall function x) result))
+             (dotimes (i (length seq))
+               (push (funcall function (elt seq i)) result)))))
+      ;; Two sequences: the shape the rest of the calls have. Walk both with
+      ;; plain cursors -- no argument list, no APPLY, and nothing rebuilt per
+      ;; element.
+      ((and sequences (cdr sequences) (null (cddr sequences)))
+       (let ((a (%seq-to-list (first sequences)))
+             (b (%seq-to-list (second sequences))))
+         (loop
+           (when (or (null a) (null b)) (return))
+           (push (funcall function (car a) (car b)) result)
+           (setq a (cdr a))
+           (setq b (cdr b)))))
+      (t
+       ;; Three or more: step through them in parallel. SEQ-LISTS is built here,
+       ;; so the cursors are advanced in place rather than rebuilding the whole
+       ;; list of them for every element.
+       (let ((seq-lists (mapcar #'%seq-to-list sequences)))
+         (block outer
+           (loop
+             (let ((args nil))
+               (do ((c seq-lists (cdr c))) ((null c))
+                 (when (null (car c)) (return-from outer)))
+               (do ((c seq-lists (cdr c))) ((null c))
+                 (push (caar c) args))
+               (push (apply function (nreverse args)) result)
+               (do ((c seq-lists (cdr c))) ((null c))
+                 (setf (car c) (cdar c)))))))))
     (setq result (nreverse result))
     (cond
       ((eq cat :nil) nil)
@@ -1270,7 +1347,14 @@ Also expands element types within compound type specifiers like (VECTOR etype si
 
 ;; Helper to get documentation (returns single value, not gethash's two values)
 (defun %get-doc (obj doc-type)
-  (values (gethash (%doc-key obj doc-type) *documentation-table*)))
+  ;; A slot definition carries its own documentation. AMOP passes it to
+  ;; EFFECTIVE-SLOT-DEFINITION-CLASS, and an effective slot definition is built
+  ;; rather than defined, so nothing ever registered it in the table below.
+  ;; %SLOT-DEF-DOCUMENTATION-OR-NIL answers NIL for everything else, which keeps
+  ;; this file free of a reference to the MOP package -- it is read by the host
+  ;; Lisp during the cross compile, where that package does not exist.
+  (or (%slot-def-documentation-or-nil obj)
+      (values (gethash (%doc-key obj doc-type) *documentation-table*))))
 
 ;; --- DOCUMENTATION methods ---
 

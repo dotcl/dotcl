@@ -36,12 +36,12 @@ with that name, and `ToString` overrides the one on `System.Object`.
 ```
 
 The supers list names the base class. A type name is either a **string**, used
-verbatim, or a **symbol**, looked up in `dotnet::*type-aliases*` — a table of
+verbatim, or a **symbol**, looked up in `dotnet:*type-aliases*` — a table of
 common BCL short names. An unknown symbol is an error at expansion time, so a
 typo does not survive to run time. Add your own:
 
 ```lisp
-(setf (gethash "CONTROLLERBASE" dotnet::*type-aliases*)
+(setf (gethash "CONTROLLERBASE" dotnet:*type-aliases*)
       "Microsoft.AspNetCore.Mvc.ControllerBase")
 ```
 
