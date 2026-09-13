@@ -91,8 +91,14 @@ public class Reader
     // so this stays correct without per-char column bookkeeping.
     private int _lineStartPos = 0;
     private int CurCol => Position - _lineStartPos + 1;
-    private Dictionary<int, LispObject> _shareLabels = new();
-    private Dictionary<int, SharePlaceholder> _sharePlaceholders = new();
+    // #n= / #n# label tables. Built only when the share syntax actually turns up:
+    // an empty Dictionary is ~80 bytes and there are two of them, so every READ --
+    // and every READ-FROM-STRING, which builds a fresh Reader -- paid 160 bytes for
+    // a feature almost no input uses.
+    private Dictionary<int, LispObject>? _shareLabels;
+    private Dictionary<int, SharePlaceholder>? _sharePlaceholders;
+    private Dictionary<int, LispObject> ShareLabels => _shareLabels ??= new();
+    private Dictionary<int, SharePlaceholder> SharePlaceholders => _sharePlaceholders ??= new();
     // Nesting depth of the public top-level Read/TryRead. #n=/#n# label scope is one
     // outermost read (CLHS 2.4.8.15/2.4.8.16), but a stream's Reader is cached and
     // reused across reads — so the label tables must be cleared when a new top-level
@@ -141,8 +147,8 @@ public class Reader
     {
         if (stream.ShareLabels == null)
         {
-            stream.ShareLabels = _shareLabels;
-            stream.SharePlaceholders = _sharePlaceholders;
+            stream.ShareLabels = ShareLabels;
+            stream.SharePlaceholders = SharePlaceholders;
         }
         else
         {
@@ -268,7 +274,7 @@ public class Reader
         var savedSuppress = _readSuppress;
         if (dynSuppress) _readSuppress = true;
         WhitespaceTerminated = false;
-        if (_topLevelReadDepth++ == 0) { _shareLabels.Clear(); _sharePlaceholders.Clear(); }
+        if (_topLevelReadDepth++ == 0) { _shareLabels?.Clear(); _sharePlaceholders?.Clear(); }
         try
         {
             while (true)
@@ -304,7 +310,7 @@ public class Reader
         bool dynSuppress = DynamicBindings.Get(suppressSym) is not Nil;
         var savedSuppress = _readSuppress;
         if (dynSuppress) _readSuppress = true;
-        if (_topLevelReadDepth++ == 0) { _shareLabels.Clear(); _sharePlaceholders.Clear(); }
+        if (_topLevelReadDepth++ == 0) { _shareLabels?.Clear(); _sharePlaceholders?.Clear(); }
         try
         {
             while (true)
@@ -1187,15 +1193,15 @@ public class Reader
         if (label == -1) throw MakeReaderError("#= requires a numeric label");
         // Pre-register a placeholder so self-references (#n#) during Read() can find it
         SharePlaceholder? ph = null;
-        if (!_sharePlaceholders.TryGetValue(label, out ph))
+        if (!SharePlaceholders.TryGetValue(label, out ph))
         {
             ph = new SharePlaceholder(label);
-            _sharePlaceholders[label] = ph;
+            SharePlaceholders[label] = ph;
         }
         var obj = Read();
-        _shareLabels[label] = obj;
+        ShareLabels[label] = obj;
         ph.Value = obj;
-        _sharePlaceholders.Remove(label);
+        SharePlaceholders.Remove(label);
         // Patch any structures containing this placeholder
         PatchPlaceholders(obj, ph, obj, new HashSet<object>());
         return obj;
@@ -1257,15 +1263,23 @@ public class Reader
         // #n# — reference to shared structure
         if (_readSuppress) return Nil.Instance;
         if (label == -1) throw MakeReaderError("## requires a numeric label");
-        if (_shareLabels.TryGetValue(label, out var obj))
+        if (ShareLabels.TryGetValue(label, out var obj))
             return obj;
-        // Forward reference: return placeholder
-        if (!_sharePlaceholders.TryGetValue(label, out var ph))
-        {
-            ph = new SharePlaceholder(label);
-            _sharePlaceholders[label] = ph;
-        }
-        return ph;
+        // A placeholder exists only while the matching #n= is being read, which is
+        // what makes (#1=(a . #1#)) work: READSHARELABEL registers it before it
+        // reads the body. Finding one here means the reference is inside its own
+        // label's object.
+        if (SharePlaceholders.TryGetValue(label, out var ph))
+            return ph;
+        // Otherwise the label has not been used yet. CLHS 2.4.8.16 allows #n# only
+        // where #n= has ALREADY labelled an object, so this is an error -- and it
+        // has to be one here rather than a placeholder invented on demand. Such a
+        // placeholder escaped into the caller's structure: for "#1#" alone it came
+        // back as the object itself, and for "(#1# #1=(a))" it stayed in the list
+        // unpatched, because PATCHPLACEHOLDERS walks the object just read and the
+        // enclosing list is still being built. It printed as (A) while failing
+        // CONSP and erroring on CAR.
+        throw MakeReaderError($"#{label}# has no matching #{label}=");
     }
 
     internal LispObject ReadBitVector(int numArg = -1)
@@ -2094,6 +2108,41 @@ public class Reader
     /// then calls the registered dispatch function from the readtable.
     /// Called as the reader macro function for dispatching macro characters like #.
     /// </summary>
+    /// <summary>`#<n>U` -- the nth uninterned symbol of the fasl being loaded.
+    /// Only ever produced by the printer while writing a fasl literal (see
+    /// Runtime.UninternedSymbolIndexer) and only ever read while
+    /// Runtime.FaslUninternedTable is bound, i.e. inside ReadConstantFromString
+    /// for that same fasl. Reading it anywhere else is a malformed literal, not
+    /// a user error, so it signals rather than inventing a symbol.</summary>
+    /// <summary>`#K(TYPE slot ...)` -- a structure in a fasl literal, slots in
+    /// order and named only by their type. Builds the object the way the fasl
+    /// loader's intern path does, without consulting the structure class: the
+    /// class need not exist in the loading image at the moment the literal is
+    /// read, and a user print-object method cannot get in the way (the printer
+    /// skips it for this syntax).</summary>
+    internal LispObject ReadFaslStruct()
+    {
+        var list = Read();
+        if (list is not Cons head || head.Car is not Symbol typeSym)
+            throw MakeReaderError("#K requires (type-name slot...)");
+        var slots = new List<LispObject>();
+        for (var rest = head.Cdr; rest is Cons c; rest = c.Cdr)
+            slots.Add(c.Car);
+        return new LispStruct(typeSym, slots.ToArray());
+    }
+
+    internal LispObject ReadFaslUninterned(int? n)
+    {
+        var table = Runtime.FaslUninternedTable;
+        if (table == null)
+            throw new LispErrorException(new LispProgramError(
+                "#U is only readable while loading a fasl literal"));
+        if (n is not int idx || idx < 0 || idx >= table.Length)
+            throw new LispErrorException(new LispProgramError(
+                $"fasl: uninterned symbol index {(n?.ToString() ?? "missing")} is outside the file's table of {table.Length}"));
+        return table[idx];
+    }
+
     internal LispObject? DispatchMacro(LispReadtable rt, char dispChar)
     {
         int ch = ReadChar();
@@ -2173,6 +2222,8 @@ public class Reader
         rt.SetDispatchMacroCharacter('#', '(', (r, c, n) => r.ReadVector(n));
         rt.SetDispatchMacroCharacter('#', '*', (r, c, n) => r.ReadBitVector(n));
         rt.SetDispatchMacroCharacter('#', ':', (r, c, n) => r.ReadUninterned());
+        rt.SetDispatchMacroCharacter('#', 'U', (r, c, n) => r.ReadFaslUninterned(n));
+        rt.SetDispatchMacroCharacter('#', 'K', (r, c, n) => r.ReadFaslStruct());
         rt.SetDispatchMacroCharacter('#', '=', (r, c, n) => r.ReadShareLabel(n));
         rt.SetDispatchMacroCharacter('#', '#', (r, c, n) => r.ReadShareRef(n));
         rt.SetDispatchMacroCharacter('#', '.', (r, c, n) => r.ReadReadTimeEval());

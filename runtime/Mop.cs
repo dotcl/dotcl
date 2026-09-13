@@ -389,9 +389,15 @@ public static class Mop
 
         // MAKE-METHOD-LAMBDA (gf method lambda-expression environment): AMOP has
         // DEFMETHOD go through this, and portable metaobject code specialises it to
-        // wrap method bodies. dotcl's version hands the lambda expression back
-        // unchanged, which is what it always did -- the point of the change is that
-        // it is now a generic function, so specialising it is possible at all.
+        // wrap method bodies.
+        //
+        // The default method returns the shape AMOP specifies: a lambda of two
+        // parameters, the arguments as a list and the next methods as a list. That is
+        // what portable wrapping code calls the result of CALL-NEXT-METHOD with, so
+        // handing back dotcl's own spread lambda instead made such code fail on every
+        // method whose argument count was not two. DEFMETHOD converts the answer back
+        // to the spread shape dispatch calls, so the conversion costs only the generic
+        // functions that have actually specialised the protocol.
         //
         // The same function object is installed on the DOTCL-INTERNAL symbol of the
         // same name, which held the earlier flat registration: one name, one
@@ -401,7 +407,7 @@ public static class Mop
             var anyCls4 = (LispClass)Runtime.FindClass(Startup.Sym("T"));
             RegisterMopGF("MAKE-METHOD-LAMBDA", 4,
                 new LispClass[] { gfCls4, anyCls4, anyCls4, anyCls4 },
-                args => args.Length > 2 ? args[2] : Nil.Instance);
+                args => args.Length > 2 ? AmopMethodLambda(args[2]) : Nil.Instance);
             var mopMml = MopPkg.Intern("MAKE-METHOD-LAMBDA").Item1;
             var (internalMml, internalStatus) = Startup.Internal.FindSymbol("MAKE-METHOD-LAMBDA");
             if (internalStatus != SymbolStatus.None && mopMml.Function is LispFunction mmlFn)
@@ -409,11 +415,20 @@ public static class Mop
 
             // DEFMETHOD runs its method lambda through MAKE-METHOD-LAMBDA and compiles
             // what comes back, which is how a generic function class wraps method
-            // bodies. Quiet until somebody has specialised it: the default method hands
-            // the form back unchanged, so calling it for every DEFMETHOD would be pure
-            // cost. The lambda handed over is dotcl's own, with the arguments spread --
-            // METHOD-FUNCTION converts at the boundary, and that is where the AMOP shape
-            // (arguments list, next methods) is produced.
+            // bodies. Quiet until somebody has specialised it: calling it for every
+            // DEFMETHOD would be pure cost while the answer is the default one.
+            //
+            // The lambda handed over as LAMBDA-EXPRESSION is dotcl's own, with the
+            // arguments spread, which is what SBCL hands over too. What comes back is
+            // in the AMOP shape, and DEFMETHOD converts it back.
+            //
+            // "Somebody specialised the protocol" is not enough to ask: the default
+            // method answers the AMOP shape for any generic function, so asking on
+            // behalf of one nobody customised would have DEFMETHOD convert that answer
+            // back -- an argument list built per call, on every method defined in the
+            // image after the first specialisation anywhere in it. What decides is
+            // whether a method other than the default applies to THIS generic function.
+            var mmlDefault = ((GenericFunction)mopMml.Function!).Methods[0];
             Runtime.MakeMethodLambdaHook = (gf, form) =>
             {
                 if (mopMml.Function is not GenericFunction mmlGf || mmlGf.Methods.Count <= 1)
@@ -421,8 +436,10 @@ public static class Mop
                 LispObject prototype = Nil.Instance;
                 if (Runtime.MethodClassHook?.Invoke(gf) is { IsBuiltIn: false } methodClass)
                     prototype = methodClass.Prototype;
-                var answer = MultipleValues.Primary(
-                    mmlGf.Invoke(new LispObject[] { gf, prototype, form, Nil.Instance }));
+                var callArgs = new LispObject[] { gf, prototype, form, Nil.Instance };
+                if (!Runtime.HasSpecialisedMethodFor(mmlGf, mmlDefault, callArgs))
+                    return null;
+                var answer = MultipleValues.Primary(mmlGf.Invoke(callArgs));
                 return answer is Cons c && ReferenceEquals(c.Car, Startup.Sym("LAMBDA"))
                        ? answer : null;
             };
@@ -827,6 +844,28 @@ public static class Mop
     }
 
     // --- helpers -------------------------------------------------------------
+
+    /// <summary>The AMOP shape of a method lambda: two parameters, the arguments as a
+    /// list and the next methods as a list. What MAKE-METHOD-LAMBDA's default method
+    /// answers, so that portable code can call it the way AMOP says.
+    ///
+    /// Built around dotcl's own spread lambda rather than rewritten from its parts:
+    /// optionals, keyword defaults and the CALL-NEXT-METHOD capture keep being
+    /// processed by the one lambda that already knows how, and cannot drift from it.
+    /// The names are interned in DOTCL-MOP the way SBCL interns its own in SB-PCL.</summary>
+    internal static LispObject AmopMethodLambda(LispObject spreadLambda)
+    {
+        if (spreadLambda is not Cons c || !ReferenceEquals(c.Car, Startup.Sym("LAMBDA")))
+            return spreadLambda;
+        var argsSym = MopPkg.Intern(".METHOD-ARGS.").Item1;
+        var nextSym = MopPkg.Intern(".NEXT-METHODS.").Item1;
+        return Runtime.List(
+            Startup.Sym("LAMBDA"),
+            Runtime.List(argsSym, nextSym),
+            Runtime.List(Startup.Sym("DECLARE"),
+                         Runtime.List(Startup.Sym("IGNORABLE"), nextSym)),
+            Runtime.List(Startup.Sym("APPLY"), spreadLambda, argsSym));
+    }
 
     // Create a MOP GF with a single default method specializing on the given classes.
     private static void RegisterMopGF(string name, int arity, LispClass[] specializers,

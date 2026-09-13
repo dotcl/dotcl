@@ -27,7 +27,7 @@
 (defpackage :nuget
   (:use :cl)
   (:shadow #:require)
-  (:export #:require #:resolve #:cache-root #:bundled-root))
+  (:export #:require #:resolve #:cache-root #:bundled-root #:stage-bundle))
 
 (in-package :nuget)
 
@@ -252,5 +252,56 @@ since a floating version can pick up a release published while the process runs.
     (unless (gethash key *resolved*)
       (setf (gethash key *resolved*) (nth-value 2 (apply #'resolve package keys))))
     t))
+
+(defun %copy-tree (src dst)
+  "Copy every file under SRC to the same relative place under DST."
+  (let* ((arr (dotnet:static "System.IO.Directory" "GetFiles" src "*"
+                             (dotnet:static "System.IO.SearchOption" "AllDirectories")))
+         (n (dotnet:invoke arr "get_Length"))
+         (prefix (length src)))
+    (dotnet:static "System.IO.Directory" "CreateDirectory" dst)
+    (dotimes (i n n)
+      (let* ((from (aref arr i))
+             ;; SRC came from Path.Combine, so it is a prefix of every entry;
+             ;; +1 drops the separator.
+             (to (%combine dst (subseq from (1+ prefix)))))
+        (dotnet:static "System.IO.Directory" "CreateDirectory"
+                       (dotnet:static "System.IO.Path" "GetDirectoryName" to))
+        (dotnet:static "System.IO.File" "Copy" from to t)))))
+
+(defun stage-bundle (dir &optional rid)
+  "Copy the layouts resolved in this session into DIR/nuget/, and return how many.
+
+With RID, only the layouts for that RuntimeIdentifier are copied. `dotcl pack'
+builds one package per RID and each carries its own bundle, so a Windows package
+has no use for the Linux assets and should not pay for them.
+
+DIR is what `dotcl pack --bundle' places beside the installed executable, and
+BUNDLED-ROOT reads back from there. Staging is therefore the step that lets a
+packaged application start on a machine with no .NET SDK and no network: the
+layout the build committed to travels with it, under the same key RESOLVE will
+compute for the same request.
+
+A floating version spec is staged like any other. It is keyed by the spec as
+written (\"13.*\"), not by what it resolved to, which is exactly what makes the
+shipped program stop asking: the answer the build settled on is the answer,
+whatever has been published since (see the BUNDLED branch in RESOLVE).
+
+The completion marker is written here rather than copied: a layout built for a
+floating spec never had one (only an exact version is kept across processes),
+and without it the shipped copy would be ignored as half-written."
+  (let ((root (%combine dir "nuget"))
+        (n 0))
+    (maphash
+     (lambda (id out-dir)
+       (destructuring-bind (package version source entry-rid tfm) id
+         (when (and (or (null rid) (equal rid entry-rid))
+                    (dotnet:static "System.IO.Directory" "Exists" out-dir))
+           (let ((target (%combine root (%layout-key package version entry-rid tfm source))))
+             (%copy-tree out-dir target)
+             (%write-text (%combine target "dotcl-nuget-complete") version)
+             (incf n)))))
+     *resolved*)
+    n))
 
 (provide "dotcl-nuget")

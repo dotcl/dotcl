@@ -178,16 +178,19 @@
   (60 40 (k0-0 0 0 sym0) (k59-0 59 0 sym0) (k59-39 59 39 sym39)
       (k30-17 30 17 sym17) nil nil))
 
-;;; Uninterned symbols in literals get one static field each, so that every
-;;; occurrence of the same gensym loads the same object. All of them used to go
-;;; on CompiledModule, and .NET caps a type at 64K fields — past that the CLR
-;;; refuses the type with "Internal limitation: too many fields", naming neither
-;;; the file nor the cause. Fields now roll over onto holder types, so the EQ
-;;; guarantee has to survive a boundary that falls between two occurrences of
-;;; the same symbol.
+;;; Every occurrence of the same gensym in a fasl's literals has to load the
+;;; same object. That used to be one static field per symbol: all on
+;;; CompiledModule at first, which hit the CLR's 64K-fields-per-type cap on a
+;;; real library ("Internal limitation: too many fields", naming neither the
+;;; file nor the cause), then spread over holder types that roll over every few
+;;; thousand fields. The symbols now live in one array built from a names blob,
+;;; so the EQ guarantee no longer depends on where a field landed -- and a file
+;;; whose only literals are gensyms has no reason to roll a holder over at all.
+;;; Both halves are checked: identity across separate top level forms, and the
+;;; absence of the per-symbol fields themselves.
 
 (defun %fasl-gensym-holder-case ()
-  (let* ((n 5000)                       ; > MaxFieldsPerHolder, so it rolls over
+  (let* ((n 5000)                       ; enough to have overflowed the old cap
          (tmp (format nil "~a/dotcl-gsymhold-~a"
                       (or (dotcl:getenv "TEMP") "/tmp")
                       (get-internal-real-time)))
@@ -222,10 +225,16 @@
             ;; Distinct gensyms stay distinct.
             (length (remove-duplicates a :test #'eq))
             (and (symbolp (first a)) (null (symbol-package (first a))))
-            ;; The rollover actually happened (holder types are named in the
-            ;; assembly's metadata).
-            (%fasl-deep-file-contains-p fasl "CompiledModuleLiterals")))))
+            ;; No field per symbol. The field names are in the assembly's
+            ;; metadata, so their absence is observable from here; the array
+            ;; that replaced them is _gsyms, which this does not match.
+            ;;
+            ;; This used to assert that no holder type existed at all, on the
+            ;; grounds that 5000 gensyms were the only thing that could force a
+            ;; rollover. That stopped being true once every top level literal
+            ;; started taking a field of its own, so it now says what it means.
+            (not (%fasl-deep-file-contains-p fasl "_gsym_"))))))
 
-(deftest-compiled-only fasl-gensym-holders.eq-across-holders
+(deftest-compiled-only fasl-gensym-table.eq-across-forms
   (%fasl-gensym-holder-case)
   (5000 5000 t 5000 t t))

@@ -3622,13 +3622,42 @@
 ;;; unprocessed lambda, which is the fallback every implementation makes here.
 ;;; %MAKE-METHOD-LAMBDA-FOR answers with the form unchanged in both cases, and
 ;;; also while nobody has specialised the protocol.
+;;; AMOP's method function takes the arguments as a list and the next methods as
+;;; a list, and MAKE-METHOD-LAMBDA answers in that shape -- it is what portable
+;;; wrapping code calls the result of CALL-NEXT-METHOD with. Dispatch calls method
+;;; functions with the arguments spread, so the answer is converted back here, at
+;;; the one place that still has the method's lambda list.
+;;;
+;;; Only the required parameters can be named. Everything after the first lambda
+;;; list keyword is collected by &REST, so optionals, keywords and their defaults
+;;; keep being processed by the original lambda, which is inside the answer.
+(defun %required-params (lambda-list)
+  (let ((r nil))
+    (dolist (p lambda-list (nreverse r))
+      (when (and (symbolp p)
+                 (member p '(&optional &rest &body &key &allow-other-keys &aux)))
+        (return (nreverse r)))
+      (push p r))))
+
+(defun %respread-method-lambda (lambda-list amop-lambda)
+  (let ((required (%required-params lambda-list))
+        (more (gensym "MARGS-")))
+    `(lambda (,@required &rest ,more)
+       (funcall ,amop-lambda
+                (list* ,@required ,more)
+                (%current-next-methods)))))
+
 (defun %method-lambda-via-protocol (name lambda-form)
   (if *cross-compiling*
       lambda-form
       (let ((processed (%make-method-lambda-for name lambda-form)))
-        (if (and (consp processed) (eq (car processed) 'lambda))
-            processed
-            lambda-form))))
+        (cond
+          ;; Nobody specialised the protocol, or there was no generic function to
+          ;; ask: the form came straight back, and nothing needs converting.
+          ((eq processed lambda-form) lambda-form)
+          ((and (consp processed) (eq (car processed) 'lambda))
+           (%respread-method-lambda (cadr lambda-form) processed))
+          (t lambda-form)))))
 
 ;;; --- defmethod ---
 (setf (gethash 'defmethod *macros*)
@@ -3887,6 +3916,35 @@
                        :format-arguments (list pkg-name n))))
             ;; === End validation ===
             ;; Generate code
+            ;; A package named in :USE / :IMPORT-FROM may be one of this
+            ;; DEFPACKAGE's own local nicknames. It does not name a package
+            ;; there, and this refuses it.
+            ;;
+            ;; Local nicknames belong to the package doing the reading:
+            ;; FIND-PACKAGE resolves them against *PACKAGE*, which during a
+            ;; DEFPACKAGE is whatever package the form is read in, never the one
+            ;; being defined. A nickname declared on the package this form is
+            ;; read in therefore DOES work in these clauses -- in SBCL as well --
+            ;; and only the form's own nicknames do not.
+            ;;
+            ;; Resolving them here instead would work, and dotcl did for a while.
+            ;; It was dropped because the difference is invisible: the source is
+            ;; accepted by every implementation that has local nicknames and
+            ;; means something else in this one. What it buys is an abbreviation
+            ;; in the same form that declares it -- convenience for a program,
+            ;; not something a library should have to be written against.
+            (flet ((local-nickname-clash (name clause)
+                     (let ((hit (assoc name local-nicknames :test #'string=)))
+                       (when hit
+                         `(error 'simple-package-error
+                                 :package ,name
+                                 :format-control
+                                 "DEFPACKAGE ~A: ~A in ~A is a package-local nickname of ~
+~A declared by this very form, and a local nickname does not name a package in a ~
+DEFPACKAGE clause (it resolves against *PACKAGE*, which is not the package being ~
+defined). Write ~A here, or declare the nickname on the package this form is read in."
+                                 :format-arguments
+                                 (list ,pkg-name ,name ,clause ,(cdr hit) ,(cdr hit)))))))
             (let ((use-forms nil) (export-forms nil)
                   (import-forms nil) (shadow-forms nil)
                   (nickname-forms nil) (intern-forms nil)
@@ -3913,7 +3971,8 @@
                        ;; missing package by its actual name instead of NIL
                        ;; when find-package would fail.
                        (dolist (u args)
-                         (push `(%package-use ,pkg-var ,(string u))
+                         (push (or (local-nickname-clash (string u) ":USE")
+                                   `(%package-use ,pkg-var ,(string u)))
                                use-forms)))
                       ((member key '(:export) :test #'eq)
                        (dolist (s args)
@@ -3941,6 +4000,8 @@
                            ;; we can fall back to DOTCL-MOP and also import the "package
                            ;; name" string as a symbol (it was a MOP fn, not a real pkg).
                            (push
+                             (or (and pkg-name-valid
+                                      (local-nickname-clash from-pkg ":IMPORT-FROM"))
                              (if pkg-name-valid
                                `(let ((,pkg-obj-var (find-package ,from-pkg)))
                                   (cond
@@ -3952,7 +4013,7 @@
                                               (if status
                                                   (%package-import ,pkg-var sym)
                                                   (restart-case
-                                                      (error 'package-error
+                                                      (error 'simple-package-error
                                                              :package ,from-pkg
                                                              :format-control "DEFPACKAGE: symbol ~A not found in package ~A"
                                                              :format-arguments (list ,sym-name ,from-pkg))
@@ -3960,19 +4021,38 @@
                                                       :report "Skip importing this symbol."
                                                       nil)))))
                                          sym-names))
-                                    (t
-                                     ;; Source package missing: fall back to DOTCL-MOP.
-                                     ;; The "package name" was likely a MOP function name
-                                     ;; whose #+feature guard stripped the real package name.
+                                    ;; Source package missing, and the name in the
+                                    ;; package position is itself a MOP symbol:
+                                    ;; the real package name was a #+sbcl #:sb-mop
+                                    ;; / #+ecl #:clos guard that the reader
+                                    ;; stripped, so what is left is the first
+                                    ;; SYMBOL of the list standing in for it.
+                                    ;; Import it and the rest from DOTCL-MOP.
+                                    ((find-symbol ,from-pkg (find-package "DOTCL-MOP"))
                                      (let ((mop (find-package "DOTCL-MOP")))
-                                       (when mop
-                                         (multiple-value-bind (sym ok) (find-symbol ,from-pkg mop)
-                                           (when ok (%package-import ,pkg-var sym)))
-                                         ,@(mapcar
-                                             (lambda (sym-name)
-                                               `(multiple-value-bind (sym ok) (find-symbol ,sym-name mop)
-                                                  (when ok (%package-import ,pkg-var sym))))
-                                             sym-names))))))
+                                       (multiple-value-bind (sym ok) (find-symbol ,from-pkg mop)
+                                         (when ok (%package-import ,pkg-var sym)))
+                                       ,@(mapcar
+                                           (lambda (sym-name)
+                                             `(multiple-value-bind (sym ok) (find-symbol ,sym-name mop)
+                                                (when ok (%package-import ,pkg-var sym))))
+                                           sym-names)))
+                                    (t
+                                     ;; A package that simply is not there. The
+                                     ;; MOP fallback used to swallow this too, so
+                                     ;; a typo -- or a package the user meant to
+                                     ;; load first -- produced a DEFPACKAGE that
+                                     ;; quietly imported nothing, or worse, a
+                                     ;; DOTCL-MOP symbol that happened to share a
+                                     ;; name with one of the requested ones.
+                                     (restart-case
+                                         (error 'simple-package-error
+                                                :package ,from-pkg
+                                                :format-control "DEFPACKAGE: :IMPORT-FROM package ~A does not exist"
+                                                :format-arguments (list ,from-pkg))
+                                       (continue ()
+                                         :report "Skip this :IMPORT-FROM clause."
+                                         nil)))))
                                ;; Package name is not a string/symbol (e.g. (error ...) form):
                                ;; skip it and import sym-names from DOTCL-MOP directly.
                                `(let ((mop (find-package "DOTCL-MOP")))
@@ -3982,6 +4062,7 @@
                                           `(multiple-value-bind (sym ok) (find-symbol ,sym-name mop)
                                              (when ok (%package-import ,pkg-var sym))))
                                         sym-names))))
+                             )
                              import-forms))))
                       ((member key '(:shadow) :test #'eq)
                        (dolist (s args)
@@ -4002,6 +4083,8 @@
                                                                 raw-syms))))
                          (let ((pkg-obj-var (gensym "FROMPKG")))
                            (push
+                             (or (and pkg-name-valid
+                                      (local-nickname-clash from-pkg ":SHADOWING-IMPORT-FROM"))
                              (if pkg-name-valid
                                `(let ((,pkg-obj-var (find-package ,from-pkg)))
                                   (cond
@@ -4013,7 +4096,7 @@
                                               (if status
                                                   (%shadowing-import sym ,pkg-var)
                                                   (restart-case
-                                                      (error 'package-error
+                                                      (error 'simple-package-error
                                                              :package ,from-pkg
                                                              :format-control "DEFPACKAGE: symbol ~A not found in package ~A"
                                                              :format-arguments (list ,sym-name ,from-pkg))
@@ -4021,16 +4104,26 @@
                                                       :report "Skip importing this symbol."
                                                       nil)))))
                                          sym-names))
-                                    (t
+                                    ;; Same reader-stripped MOP shape as
+                                    ;; :IMPORT-FROM above.
+                                    ((find-symbol ,from-pkg (find-package "DOTCL-MOP"))
                                      (let ((mop (find-package "DOTCL-MOP")))
-                                       (when mop
-                                         (multiple-value-bind (sym ok) (find-symbol ,from-pkg mop)
-                                           (when ok (%shadowing-import sym ,pkg-var)))
-                                         ,@(mapcar
-                                             (lambda (sym-name)
-                                               `(multiple-value-bind (sym ok) (find-symbol ,sym-name mop)
-                                                  (when ok (%shadowing-import sym ,pkg-var))))
-                                             sym-names))))))
+                                       (multiple-value-bind (sym ok) (find-symbol ,from-pkg mop)
+                                         (when ok (%shadowing-import sym ,pkg-var)))
+                                       ,@(mapcar
+                                           (lambda (sym-name)
+                                             `(multiple-value-bind (sym ok) (find-symbol ,sym-name mop)
+                                                (when ok (%shadowing-import sym ,pkg-var))))
+                                           sym-names)))
+                                    (t
+                                     (restart-case
+                                         (error 'simple-package-error
+                                                :package ,from-pkg
+                                                :format-control "DEFPACKAGE: :SHADOWING-IMPORT-FROM package ~A does not exist"
+                                                :format-arguments (list ,from-pkg))
+                                       (continue ()
+                                         :report "Skip this :SHADOWING-IMPORT-FROM clause."
+                                         nil)))))
                                `(let ((mop (find-package "DOTCL-MOP")))
                                   (when mop
                                     ,@(mapcar
@@ -4038,6 +4131,7 @@
                                           `(multiple-value-bind (sym ok) (find-symbol ,sym-name mop)
                                              (when ok (%shadowing-import sym ,pkg-var))))
                                         sym-names))))
+                             )
                              shadowing-import-forms))))
                       ((member key '(:nicknames) :test #'eq)
                        (dolist (n args)
@@ -4054,7 +4148,7 @@
                 (let ((nick-var (gensym "NICK")))
                   (push `(let ((,nick-var (find-package ,n)))
                            (when (and ,nick-var (not (eq ,nick-var ,pkg-var)))
-                             (error 'package-error
+                             (error 'simple-package-error
                                     :package ,n
                                     :format-control "DEFPACKAGE ~A: nickname ~A conflicts with existing package"
                                     :format-arguments (list ,pkg-name ,n))))
@@ -4062,13 +4156,25 @@
               (let ((inner `(let ((,pkg-var (%make-package ,pkg-name)))
                               ,@(nreverse nickname-check-forms)
                               ,@(nreverse nickname-forms)
+                              ;; Local nicknames are installed before the clauses
+                              ;; that name packages. They belong to the package
+                              ;; being defined, but FIND-PACKAGE resolves
+                              ;; nicknames against *PACKAGE*, which during
+                              ;; DEFPACKAGE is whatever package the form is being
+                              ;; read in -- so a nickname declared here was not
+                              ;; visible to :USE / :IMPORT-FROM below, and the
+                              ;; clause silently did nothing. Installing them
+                              ;; first is not enough on its own (see the
+                              ;; nickname alist consulted at expansion time), but
+                              ;; it is what makes the package object carry them
+                              ;; while the rest of the form runs.
+                              ,@(nreverse local-nickname-forms)
                               ,@(nreverse shadow-forms)
                               ,@(nreverse shadowing-import-forms)
                               ,@(nreverse use-forms)
                               ,@(nreverse import-forms)
                               ,@(nreverse intern-forms)
                               ,@(nreverse export-forms)
-                              ,@(nreverse local-nickname-forms)
                               ,@(nreverse doc-forms)
                               ,pkg-var)))
                 ;; In compile-file mode, wrap with eval-when so macrolet-expanded
@@ -4076,7 +4182,7 @@
                 ;; Skip during cross-compilation: %make-package is dotcl-internal.
                 (if *compile-file-mode*
                     `(eval-when (:compile-toplevel :load-toplevel :execute) ,inner)
-                    inner)))))))
+                    inner))))))))
 
 ;;; --- do-symbols / do-external-symbols ---
 
@@ -4343,7 +4449,7 @@
           ;; (This is a simplified version - real CL does compile-time switch)
           `(let ((pkg (find-package ,name)))
              (unless pkg
-               (error 'package-error :package ,name
+               (error 'simple-package-error :package ,name
                       :format-control "No package named ~S exists."
                       :format-arguments (list ,name)))
              (setq *package* pkg)

@@ -99,3 +99,47 @@
   (handler-case (error 'type-error :datum 7 :expected-type 'list)
     (error (e) (prin1-to-string e)))
   "#<TYPE-ERROR>")
+
+;;; --- a package error that carries a message --------------------------------
+;;;
+;;; PACKAGE-ERROR has no format control of its own: the slots belong to
+;;; SIMPLE-CONDITION, and signalling a PACKAGE-ERROR with :FORMAT-CONTROL puts
+;;; the text where nothing can read it back. Every message DEFPACKAGE writes
+;;; about a package went that way and reported as "Package error on X."
+;;;
+;;; SIMPLE-PACKAGE-ERROR has both supers, so the text is where the inherited
+;;; report can find it while a PACKAGE-ERROR handler still catches it. It is an
+;;; internal name (SBCL keeps its own in SB-INT for the same reason) -- what user
+;;; code handles is PACKAGE-ERROR, which is what the tests below do.
+
+(deftest condition-report.simple-package-error-reports-its-message
+  (%cr-report (lambda ()
+                (error 'dotcl-internal::simple-package-error
+                       :package "P"
+                       :format-control "no package named ~A here"
+                       :format-arguments (list "P"))))
+  "no package named P here")
+
+(deftest condition-report.simple-package-error-is-a-package-error
+  (handler-case (error 'dotcl-internal::simple-package-error
+                       :package "P" :format-control "x" :format-arguments nil)
+    (package-error (e) (list :caught (package-error-package e)))
+    (error () :wrong-type))
+  (:caught "P"))
+
+;;; The messages DEFPACKAGE and IN-PACKAGE write, through the whole path: still
+;;; PACKAGE-ERRORs, and now saying what went wrong rather than naming the
+;;; package and stopping.
+(defpackage #:cr-source (:use) (:export #:present))
+
+(deftest condition-report.defpackage-messages-survive
+  (flet ((msg (form)
+           (handler-case (progn (eval form) :no-error)
+             (package-error (e) (princ-to-string e))
+             (error (e) (list :wrong-type (type-of e))))))
+    (list (msg '(defpackage #:cr-x1 (:use #:cl) (:import-from #:cr-source #:absent)))
+          (msg '(defpackage #:cr-x2 (:use #:cl) (:import-from #:cr-no-such-package #:x)))
+          (msg '(in-package #:cr-no-such-package))))
+  ("DEFPACKAGE: symbol ABSENT not found in package CR-SOURCE"
+   "DEFPACKAGE: :IMPORT-FROM package CR-NO-SUCH-PACKAGE does not exist"
+   "No package named \"CR-NO-SUCH-PACKAGE\" exists."))

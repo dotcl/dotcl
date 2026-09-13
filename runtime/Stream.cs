@@ -32,6 +32,197 @@ public class PositionTrackingReader : TextReader
     }
 }
 
+
+/// <summary>Character file input that knows its byte offset.
+///
+/// FILE-POSITION on a character file stream reports where the next character
+/// starts, in bytes -- that is what SBCL answers, and what the seek side of
+/// FILE-POSITION here has always taken. Asking a StreamReader could not produce
+/// it: BaseStream.Position is where the BUFFER was filled to, so one READ-CHAR
+/// of a ten-byte file answered 10. It was right only when the buffer happened to
+/// be empty (before the first read, right after a seek, at end of file).
+///
+/// The fix is not to re-encode the characters handed out -- that invents
+/// questions about line terminators, byte order marks and surrogate pairs. It is
+/// to decode with a Decoder, which reports how many bytes each decode consumed,
+/// and to count those. Because the count lives under the decode rather than in
+/// the reading API, READLINE and READTOEND need no special case.
+///
+/// Bytes are read from the file a block at a time; only the decoding is done a
+/// character at a time, so this costs no extra system calls.
+/// </summary>
+public sealed class ByteTrackingReader : TextReader
+{
+    private readonly System.IO.Stream _stream;
+    private readonly System.Text.Decoder _decoder;
+    private readonly bool _utf8;
+    private readonly byte[] _bytes = new byte[4096];
+    private int _byteLen;                 // bytes in _bytes
+    private int _bytePos;                 // consumed within _bytes
+    private readonly char[] _pending = new char[2];
+    private int _pendingLen, _pendingPos; // chars decoded but not yet handed out
+    private long _pendingBytes;           // bytes behind the pending characters
+
+    /// <summary>Byte offset of the next character. Bytes whose characters have been
+    /// decoded but not yet handed out are not counted: a surrogate pair reports its
+    /// four bytes when its second half is read, so the value only ever lands on a
+    /// character boundary.</summary>
+    public long BytePosition { get; private set; }
+
+    public System.IO.Stream BaseStream => _stream;
+    public System.Text.Encoding CurrentEncoding { get; }
+
+    public ByteTrackingReader(System.IO.Stream stream, System.Text.Encoding encoding,
+                              bool skipPreamble)
+    {
+        _stream = stream;
+        CurrentEncoding = encoding;
+        _decoder = encoding.GetDecoder();
+        _utf8 = encoding.CodePage == 65001;
+        if (skipPreamble) SkipPreamble();
+    }
+
+    /// <summary>A byte order mark is not part of the text, so the first character
+    /// starts after it. StreamReader consumes it invisibly; here it has to be
+    /// consumed explicitly or every position would be off by its length.</summary>
+    private void SkipPreamble()
+    {
+        var pre = CurrentEncoding.GetPreamble();
+        if (pre.Length == 0 || !_stream.CanSeek) return;
+        var head = new byte[pre.Length];
+        long at = _stream.Position;
+        int got = _stream.Read(head, 0, head.Length);
+        bool match = got == pre.Length;
+        for (int i = 0; match && i < pre.Length; i++) if (head[i] != pre[i]) match = false;
+        if (match) BytePosition = _stream.Position;
+        else _stream.Position = at;
+    }
+
+    /// <summary>Called after the owner seeks the underlying stream: everything
+    /// decoded so far belongs to the old position.</summary>
+    public void ResetTo(long bytePosition)
+    {
+        _decoder.Reset();
+        _byteLen = _bytePos = 0;
+        _pendingLen = _pendingPos = 0;
+        _pendingBytes = 0;
+        BytePosition = bytePosition;
+    }
+
+    /// <summary>Decode exactly one more character sequence into _pending.
+    /// Returns false at end of input.</summary>
+    private bool FillPending()
+    {
+        while (true)
+        {
+            if (_bytePos >= _byteLen)
+            {
+                _byteLen = _stream.Read(_bytes, 0, _bytes.Length);
+                _bytePos = 0;
+                if (_byteLen <= 0)
+                {
+                    // Flush whatever the decoder still holds (an incomplete
+                    // sequence at end of file becomes the replacement character).
+                    _pendingLen = _decoder.GetChars(System.Array.Empty<byte>(), 0, 0,
+                                                    _pending, 0, flush: true);
+                    _pendingPos = 0;
+                    _pendingBytes = 0;
+                    return _pendingLen > 0;
+                }
+            }
+            // A UTF-8 byte below 0x80 is one character on its own. Source files are
+            // very nearly all such bytes, and taking them without going through the
+            // decoder is what keeps this reader close to a StreamReader: the
+            // per-byte Convert call cost about 40% on READ-LINE without it.
+            if (_utf8 && _bytes[_bytePos] < 0x80)
+            {
+                _pending[0] = (char)_bytes[_bytePos];
+                _bytePos++;
+                _pendingBytes += 1;
+                _pendingLen = 1;
+                _pendingPos = 0;
+                return true;
+            }
+            // One byte at a time so the bytes are attributed to exactly the
+            // characters they produced. The bytes are already in memory.
+            _decoder.Convert(_bytes, _bytePos, 1, _pending, 0, _pending.Length,
+                             flush: false, out int bytesUsed, out int charsUsed,
+                             out _);
+            _bytePos += bytesUsed;
+            _pendingBytes += bytesUsed;
+            if (charsUsed > 0)
+            {
+                _pendingLen = charsUsed;
+                _pendingPos = 0;
+                return true;
+            }
+        }
+    }
+
+    public override int Read()
+    {
+        if (_pendingPos >= _pendingLen && !FillPending()) return -1;
+        char c = _pending[_pendingPos++];
+        if (_pendingPos >= _pendingLen)
+        {
+            BytePosition += _pendingBytes;
+            _pendingBytes = 0;
+        }
+        return c;
+    }
+
+    public override int Peek()
+    {
+        if (_pendingPos >= _pendingLen && !FillPending()) return -1;
+        return _pending[_pendingPos];
+    }
+
+    public override int Read(char[] buffer, int index, int count)
+    {
+        int n = 0;
+        while (n < count)
+        {
+            int c = Read();
+            if (c == -1) break;
+            buffer[index + n++] = (char)c;
+        }
+        return n;
+    }
+
+    public override string? ReadLine()
+    {
+        int first = Read();
+        if (first == -1) return null;
+        var sb = new System.Text.StringBuilder();
+        int c = first;
+        while (c != -1 && c != '\n')
+        {
+            if (c == '\r')
+            {
+                if (Peek() == '\n') Read();
+                return sb.ToString();
+            }
+            sb.Append((char)c);
+            c = Read();
+        }
+        return sb.ToString();
+    }
+
+    public override string ReadToEnd()
+    {
+        var sb = new System.Text.StringBuilder();
+        int c;
+        while ((c = Read()) != -1) sb.Append((char)c);
+        return sb.ToString();
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing) _stream.Dispose();
+        base.Dispose(disposing);
+    }
+}
+
 public abstract class LispStream : LispObject
 {
     public abstract bool IsInput { get; }
@@ -108,7 +299,7 @@ public class LispFileStream : LispStream
     public LispPathname? OriginalPathname { get; set; }
 
     // Input file stream
-    public LispFileStream(StreamReader reader, string path)
+    public LispFileStream(ByteTrackingReader reader, string path)
     {
         InputReader = reader;
         FilePath = path;
@@ -122,7 +313,7 @@ public class LispFileStream : LispStream
     }
 
     // Bidirectional file stream
-    public LispFileStream(StreamReader reader, StreamWriter writer, string path)
+    public LispFileStream(ByteTrackingReader reader, StreamWriter writer, string path)
     {
         InputReader = reader;
         OutputWriter = writer;

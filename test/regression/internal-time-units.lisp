@@ -36,7 +36,7 @@
 ;; Run time is CPU time, so a busy loop must move it, and it must move by
 ;; roughly what real time moved -- same unit, same order. The 10000x bug fails
 ;; this by six orders of magnitude.
-(deftest internal-time.run-time-same-unit-as-real-time
+(deftest-runtime-once internal-time.run-time-same-unit-as-real-time
   (let* ((r0 (get-internal-real-time))
          (c0 (get-internal-run-time)))
     (%itu-busy 3000000)
@@ -49,7 +49,7 @@
 
 ;; Resolution: the whole point of the change. Sampling around work far shorter
 ;; than a 15.6 ms timer tick has to produce more than one distinct value.
-(deftest internal-time.resolves-below-a-timer-tick
+(deftest-runtime-once internal-time.resolves-below-a-timer-tick
   (let ((seen '()))
     (dotimes (i 12)
       (%itu-busy 20000)

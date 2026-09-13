@@ -65,10 +65,17 @@ scratch.txt
 ## ANSI test artifacts (generated at project root)
 *.txt
 *.fasl
+# Ahead-of-time siblings (<name>.fasl.r2r-<rid>, dotcl.core.r2r-<rid>). The
+# marker sits after the whole filename so that *.fasl globs do not match one,
+# which also means this rule has to name them itself.
+*.r2r-*
 *.ufsl
 *.tmp
 test/regression/.tmp-*/
 *.sil
+# ...except the legacy .sil fixtures: they are checked in precisely because they
+# are output, emitted by a released dotcl and never regenerated.
+!test/regression/legacy-sil/*.sil
 /*.lsp
 compile-file-*
 COMPILE-FILE-*

@@ -35,6 +35,15 @@ public sealed class LispString : LispObject
 
     public string Value => _str ?? new string(_chars!);
 
+    // Read-only bulk access that does NOT materialize. RAWCHARS is the write
+    // accessor: it turns a string-backed LispString into a char[]-backed one
+    // permanently, and from then on VALUE has to build a fresh System.String on
+    // every read. A read-only scan that reaches for RAWCHARS therefore makes
+    // every later STRING= / STRING< / STRING-TRIM on that object allocate --
+    // (SEARCH "wor" s) did exactly that, and the cost stayed with S for the rest
+    // of the image's life. Bulk readers use this instead.
+    internal ReadOnlySpan<char> Chars => _chars is { } c ? c : _str.AsSpan();
+
     // Bulk access for Array.Fill / Array.Copy optimizations — forces materialization
     internal char[] RawChars
     {

@@ -236,6 +236,57 @@ definition. So `List<int>` picks `:any-list` above, `String[]` picks
 `(typep obj 'class-name)` and `subtypep` agree with that ordering, and
 `dotnet:class-for-type` returns the class object for a type.
 
+## What can I call?
+
+Members are named with strings, so the name, its casing, the overloads and the
+optional parameters all have to come from somewhere. `dotnet:members` asks the
+runtime:
+
+```lisp
+(dotnet:members "System.Net.Sockets.TcpClient" :prefix "Connect")
+;; => ((:name "Connect" :kind :method :static nil
+;;      :signature "(String, Int32) => Void"
+;;      :declaring-type "System.Net.Sockets.TcpClient")
+;;     (:name "ConnectAsync" ... :signature "(IPAddress, Int32) => Task")
+;;     ...)
+```
+
+The first argument is a type name, a resolved `System.Type`, or any .NET object
+-- an object answers for its runtime type, so a value already in hand can be
+asked what it takes:
+
+```lisp
+(let ((sb (dotnet:new "System.Text.StringBuilder")))
+  (dotnet:members sb :prefix "AppendLine"))
+```
+
+Keyword arguments narrow the listing: `:kind` (`:method` `:property` `:field`
+`:event` `:constructor`), `:prefix` (case-insensitive), `:static` (`:both`, the
+default, `:static`, `:instance`), `:inherited` (default `t`) and `:extensions`
+(default `t`).
+
+Two details make the output match what you are about to write. Property
+accessors appear under the names `dotnet:invoke` takes, not as bare property
+names:
+
+```lisp
+(dotnet:members "System.Text.StringBuilder" :prefix "set_")
+;; => set_Capacity (Int32) => Void / set_Chars (Int32, Char) => Void / ...
+```
+
+And an optional trailing parameter is marked with `?`, because omitting one is
+what makes a call fail to resolve:
+
+```lisp
+(dotnet:members "Microsoft.AspNetCore.Http.HttpResponse" :prefix "Write")
+;; => WriteAsync (String, CancellationToken?) => Task
+;;    WriteAsync (String, Encoding, CancellationToken?) => Task
+```
+
+Extension methods are included, with the receiver dropped from the parameter
+list so the signature reads as the call: `WriteAsync` above is one, and so is
+LINQ over a string.
+
 ## Loading assemblies
 
 ```lisp

@@ -1336,6 +1336,44 @@
     (nreverse specs)))
 
 
+
+(defun %rest-direct-eligible-p (required optional key rest-param aux)
+  "T if a required+&rest function can carry typed direct delegates for the call
+   shapes that pass a small, fixed number of extra arguments, in addition to the
+   array XEP.
+
+   A variadic LispFunction has one entry, taking LispObject[], so every call to a
+   &rest function builds an array -- including (F 1), where the rest list is NIL
+   and nothing needs collecting at all. On a typed arity the extra arguments
+   arrive as real parameters and a LET* binds the rest parameter to a fresh list
+   of exactly them, which is what the array entry would have consed. (LIST) with
+   no arguments is NIL, so the required-only arity allocates nothing.
+
+   Requires: a rest param, no &optional/&key/&aux (those compose with &rest in
+   ways the array entry handles and this shape does not), and required <= 8."
+  (and rest-param (null optional) (null key) (null aux)
+       (<= (length required) 8)))
+
+(defun %build-rest-direct-specs (required rest-param wrapped-body fn-name fn-pkg fn-symbol)
+  "((ARITY SELF-P DIRECT-BODY) ...) for the arities of a &rest function that can
+   be typed: required + 0, +1 and +2 extra arguments.
+
+   The cut at 2 is where the shapes stop being common: (F A) and (F A X) are what
+   callers write, and each further arity is another copy of the body in the image.
+   Anything longer, and APPLY, still go through the array XEP."
+  (let ((rn (length required))
+        (specs '()))
+    (loop for extra from 0 to 2
+          for n = (+ rn extra)
+          when (<= n 8)
+            do (let* ((xs (loop repeat extra collect (gensym "REST")))
+                      (direct-params (append required xs))
+                      (direct-body `((let ((,rest-param (list ,@xs))) ,@wrapped-body))))
+                 (multiple-value-bind (body-instrs self-p)
+                     (compile-function-body-direct direct-params direct-body
+                                                   fn-name fn-pkg fn-symbol)
+                   (push (list n (if self-p t nil) body-instrs) specs))))
+    (nreverse specs)))
 (defun %build-optional-direct-specs (required optional wrapped-body fn-name fn-pkg fn-symbol)
   "Build ((ARITY DIRECT-BODY) ...) for each concrete arity N in
    [len(required) .. len(required)+len(optional)]. For arity N the first
@@ -1704,7 +1742,16 @@
                             required key wrapped-body
                             (mangle-name name) (cadr pkg-spec) name
                             allow-other-keys-p
-                            (every (lambda (k) (null (fifth k))) key)))))))
+                            (every (lambda (k) (null (fifth k))) key)))
+                          ;; Same idea for &rest: the extra arguments become real
+                          ;; parameters and the rest list is consed from exactly
+                          ;; them -- (F 1), where the list is empty, then costs
+                          ;; nothing at all.
+                          ((and (%rest-direct-eligible-p required optional key rest-param aux)
+                                (not (%declares-special-p wrapped-body (list rest-param))))
+                           (%build-rest-direct-specs
+                            required rest-param wrapped-body
+                            (mangle-name name) (cadr pkg-spec) name))))))
                 `((:defmethod ,(mangle-name name)
                    ,@pkg-spec
                    ,@(when (debug-frames-off-p wrapped-body) '(:no-frame t))
@@ -6154,6 +6201,13 @@
   (labels ((walk (x)
              (cond ((eq x name) nil)
                    ((not (consp x)) t)
+                   ;; A quoted constant is data: a symbol inside it names
+                   ;; nothing, so descending is both pointless and unsafe. A
+                   ;; literal read with #n= can be circular, and this walk has
+                   ;; no cycle detection -- it ran off the stack instead.
+                   ;; %SYMBOL-ONLY-IN-OPERATOR-POSITION-P, the FLET-side walker,
+                   ;; already stops here, which is why FLET never showed it.
+                   ((eq (car x) 'quote) t)
                    ((and (eq (car x) 'return-from) (eq (cadr x) name))
                     (walk (cddr x)))
                    (t (and (walk (car x)) (walk (cdr x)))))))
@@ -6185,6 +6239,47 @@
                 (notany (lambda (c) (member (car c) params :test #'eq)) caps)
                 (list params caps))))))
 
+(defun make-local-inline-plan (name params fn-body)
+  "The plan MAYBE-EXPAND-LOCAL-INLINE substitutes at a call site, or NIL when
+   this local function cannot be substituted at all. Built where the FLET or
+   LABELS is compiled, so the snapshot it takes is the definition's own
+   environment -- the whole point of the plan.
+
+   Refused for a lambda list that is not all-required (an &optional/&key/&rest
+   expansion would have to replicate defaulting rules; the ordinary call already
+   does), for a body past *LOCAL-INLINE-BODY-SIZE-LIMIT*, and for a body that
+   names itself -- a substituted copy would call the binding it is inside."
+  (when (and name
+             (symbolp name)
+             (every #'symbolp params)
+             (notany (lambda (p) (member p lambda-list-keywords)) params)
+             (%labels-self-free-p name fn-body)
+             (< (%form-size fn-body (1+ *local-inline-body-size-limit*))
+                (1+ *local-inline-body-size-limit*)))
+    (let ((decls '())
+          (rest fn-body))
+      ;; The leading declarations stay OUTSIDE the block: they belong to the
+      ;; binding form's body, and (block name (declare ...)) is not a
+      ;; declaration position (same reason as MAYBE-EXPAND-INLINE).
+      (loop while (and (consp rest) (consp (car rest)) (eq (caar rest) 'declare))
+            do (push (pop rest) decls))
+      (list name params (nreverse decls) rest
+            ;; The implicit block only has to be built where something returns
+            ;; from it -- the same test the closure path uses to decide.
+            (some (lambda (f) (form-has-return-from-p name f)) rest)
+            ;; NAME is excluded along with the parameters. A self-free body can
+            ;; still name itself in a RETURN-FROM, which names the implicit
+            ;; block -- and the expansion rebuilds that block itself, so the
+            ;; name means there exactly what it meant here. Left in, it would
+            ;; refuse every early-returning local function, which is most of
+            ;; them: at the call site the name is bound to the very binding
+            ;; being substituted, and where the body was written it was not.
+            (%local-inline-snapshot fn-body (cons name params))
+            *macroexpand-scope*
+            ;; Mutable: how many more call sites may take a copy.
+            (list *local-inline-call-limit*)))))
+
+
 (defun compile-flet (fn-defs body)
   "Compile (flet ((name (params) body...) ...) body...).
    Tries the capture-lifting path first (see %LIFT-CAPTURES); a call site that
@@ -6207,7 +6302,11 @@
         (new-local-fns '())
         (new-locals '())
         (tag (car lift))
-        (plans (cdr lift)))
+        (plans (cdr lift))
+        ;; The names this body declared INLINE. Read here rather than at the
+        ;; call site: the declaration is about the binding, and the plan it
+        ;; enables has to snapshot the environment the definition sits in.
+        (inline-names (extract-inline body)))
     ;; Compile each function definition in OUTER scope (flet functions can't see each other)
     (dolist (fdef fn-defs)
       (let* ((name (car fdef))
@@ -6218,22 +6317,38 @@
              (params (if plan (append (cadr fdef) (mapcar #'car caps)) (cadr fdef)))
              (fn-body (cddr fdef))
              (name-str (mangle-name name))
-             (key (gen-local name-str)))
+             (key (gen-local name-str))
+             ;; The 6th element of the entry is the inline plan: present only
+             ;; where this body declared this function INLINE and the definition
+             ;; can actually be substituted (MAKE-LOCAL-INLINE-PLAN). Built from
+             ;; the SOURCE lambda list and body, not the lifted ones: capture
+             ;; lifting is about the closure this may end up not needing.
+             (inl-plan (and (member name inline-names :test #'eq)
+                            (make-local-inline-plan name (cadr fdef) (cddr fdef)))))
         ;; Compile the lambda (in current scope, not extended)
         ;; CL spec: flet creates an implicit block named after the function
         ;; For (setf sym) names, use progn instead of block (block requires a symbol)
-        (let ((lambda-instrs
-                (let ((*lift-block-tags* (if plan (cstate-block-tags) nil)))
-                  (if (and (symbolp name)
-                           (some (lambda (f) (form-has-return-from-p name f)) fn-body))
-                      (compile-lambda params `((block ,name ,@fn-body)))
-                      (compile-lambda params fn-body)))))
-          (setf fn-instrs
-                (append fn-instrs
-                        `((:declare-local ,key "LispObject")
-                          ,@lambda-instrs
-                          (:stloc ,key))))
-          (push (list name-str key nil (and plan caps) (and plan tag)) new-local-fns)
+        (flet ((compile-the-lambda ()
+                 (let ((*lift-block-tags* (if plan (cstate-block-tags) nil)))
+                   (if (and (symbolp name)
+                            (some (lambda (f) (form-has-return-from-p name f)) fn-body))
+                       (compile-lambda params `((block ,name ,@fn-body)))
+                       (compile-lambda params fn-body)))))
+          ;; A definition that may be inlined away is compiled LATER, and only if
+          ;; the body turns out to still reach the binding. Not merely dropped
+          ;; after the fact: compiling a closure that contains a RETURN-FROM out
+          ;; of an enclosing block is what tells that block it needs a tag and a
+          ;; try/filter, and throwing the instructions away afterwards does not
+          ;; take the flag back. Compiled and discarded, the inlined escape still
+          ;; costs its block the 32-byte tag it no longer needs.
+          (push (if inl-plan
+                    (list key #'compile-the-lambda nil)
+                    (list key nil `((:declare-local ,key "LispObject")
+                                    ,@(compile-the-lambda)
+                                    (:stloc ,key))))
+                fn-instrs)
+          (push (list name-str key nil (and plan caps) (and plan tag) inl-plan)
+                new-local-fns)
           ;; Track in *locals* so closures can capture flet functions.
           ;; Use BOTH the plain name and the __LABELFN_ prefix (same key):
           ;; - Plain name: backward compat (#'flet-fn value capture)
@@ -6250,13 +6365,33 @@
     ;; Compile body with extended local-functions AND locals.
     ;; Also track flet source defs so compile-defmacro can wrap its eval
     ;; with flet bindings (e.g. SBCL macros.lisp wraps defmacro in flet).
-    (let ((*cstate* (cstate-with *cstate*
-                      +cs-local-functions+ (append (nreverse new-local-fns)
-                                                   (cstate-local-functions))
-                      +cs-locals+ (append (nreverse new-locals) (cstate-locals))))
-          (*compile-time-flet-defs* (append fn-defs *compile-time-flet-defs*)))
-      `(,@fn-instrs
-        ,@(compile-progn body)))))
+    (let ((body-instrs
+            (let ((*cstate* (cstate-with *cstate*
+                              +cs-local-functions+ (append (nreverse new-local-fns)
+                                                           (cstate-local-functions))
+                              +cs-locals+ (append (nreverse new-locals)
+                                                  (cstate-locals))))
+                  (*compile-time-flet-defs* (append fn-defs *compile-time-flet-defs*)))
+              (compile-progn body))))
+      ;; Back in the outer environment, which is where a deferred definition has
+      ;; to be compiled: an FLET function cannot see the bindings this form makes.
+      (append
+       ;; An inline-declared function whose local never appears in the compiled
+       ;; body was substituted at every call site, and nothing else reached the
+       ;; binding -- #'f as a value, a closure capturing it, a call the
+       ;; substitution refused all put the local back in. Never compiling it is
+       ;; the difference between an inlined escape that still pays for its
+       ;; closure and one that costs nothing.
+       (loop for entry in (nreverse fn-instrs)
+             for key = (first entry)
+             for deferred = (second entry)
+             append (cond ((null deferred) (third entry))
+                          ((%instr-tree-contains-symbol-p body-instrs key)
+                           `((:declare-local ,key "LispObject")
+                             ,@(funcall deferred)
+                             (:stloc ,key)))
+                          (t nil)))
+       body-instrs))))
 
 (defun labels-required-only-params-p (params)
   "Return T if PARAMS is a required-only lambda list with no &optional/&key/&rest/&aux."
@@ -7055,7 +7190,6 @@
   (let* ((result-key (gen-local "HCRES"))
          (outer-end-label (gen-label "HCOUTEREND"))
          (inner-end-label (gen-label "HCINNEREND"))
-         (hc-tag-key (gen-local "HCTAG"))
          (cond-key (gen-local "HCCOND"))
          (exobj-key (gen-local "HCEXOBJ"))
          (specs-key (gen-local "HCSPECS"))
@@ -7083,9 +7217,8 @@
          ;; filter's handler block (a brfalse cannot leave a funclet).
          (ci-skip-labels (loop for i from 0 below n
                                collect (gen-label (format nil "HCCISKIP~d" i)))))
-    `(;; Create unique tag for this handler-case instance
-      (:declare-local ,hc-tag-key "Object")
-      (:newobj "Object") (:stloc ,hc-tag-key)
+    `(;; No tag object: the cluster array built below is allocated once per entry
+      ;; and is already unique, so it identifies this handler-case invocation.
       ;; Shared condition local (set before dispatching to clause body)
       (:declare-local ,cond-key "LispObject")
       ,@(emit-nil) (:stloc ,cond-key)
@@ -7093,19 +7226,12 @@
       (:declare-local ,ci-key "Int32")
       ;; The in-flight exception, kept by the filter for the handler.
       (:declare-local ,exobj-key "Object")
-      ;; Clause type specifiers in clause order, for the filter's type match. Built
-      ;; once here rather than re-emitted per handler: they are literals, and the
-      ;; filter must stay a straight predicate.
-      (:declare-local ,specs-key "LispObject[]")
-      (:ldc-i4 ,n)
-      (:newarr "LispObject")
-      ,@(loop for (type-spec var handler-body) in parsed
-              for i from 0
-              append `((:dup) (:ldc-i4 ,i)
-                       ,@(%handler-type-spec-load type-spec)
-                       (:stelem-ref)))
-      (:stloc ,specs-key)
-      ;; Build HandlerBinding[] for our handler-case cluster
+      ;; The cluster: one HandlerBinding per clause, carrying the type specifier the
+      ;; filter matches on and the clause index. Kept in a local because the filter
+      ;; reads the specifiers from it -- a second array of the same specifiers, and a
+      ;; tag object to identify the invocation, were 56 bytes on every entry saying
+      ;; what this array already says.
+      (:declare-local ,specs-key "HandlerBinding[]")
       (:ldc-i4 ,n)
       (:newarr "HandlerBinding")
       ,@(loop for (type-spec var handler-body) in parsed
@@ -7113,13 +7239,13 @@
               append `((:dup) (:ldc-i4 ,i)
                         ;; Type specifier (symbol/class name, or compound list literal)
                         ,@(%handler-type-spec-load type-spec)
-                        ;; The clause is identified by (tag, index); the binding
-                        ;; carries them itself, so entering a handler-case builds
-                        ;; no handler function per clause.
-                        (:ldloc ,hc-tag-key)
+                        ;; The clause is identified by (cluster, index); the binding
+                        ;; carries the index, so entering a handler-case builds no
+                        ;; handler function per clause.
                         (:ldc-i4 ,i)
-                        (:newobj "HandlerBindingHc")
+                        (:newobj "HandlerBindingHcCluster")
                         (:stelem-ref)))
+      (:dup) (:stloc ,specs-key)
       (:call "HandlerClusterStack.PushCluster")
       ;; Result local
       (:declare-local ,result-key "LispObject")
@@ -7157,9 +7283,8 @@
       ;; uncatchable .NET StackOverflowException.
       (:begin-filter-block)
       (:dup) (:stloc ,exobj-key)
-      (:ldloc ,hc-tag-key)
       (:ldloc ,specs-key)
-      (:call "ControlFlowFilters.HandlerCaseClause")
+      (:call "ControlFlowFilters.HandlerCaseClauseCluster")
       (:stloc ,ci-key)
       (:ldloc ,ci-key) (:ldc-i4 -1) (:cgt)
       (:begin-filter-handler)
@@ -8001,7 +8126,19 @@
             (:call "Runtime.FixnumGeObject"))))
   (setf (gethash '<= h) (lambda (expr) (compile-nary-comparison (cdr expr) '<= "Runtime.LessEqual")))
   (setf (gethash '= h) (lambda (expr) (compile-nary-comparison (cdr expr) '= "Runtime.NumEqual")))
-  (setf (gethash '/= h) (lambda (expr) `(,@(compile-args-array (cdr expr)) (:call "Runtime.NumNotEqualN"))))
+  ;; /= is the one comparison that is not transitive: (/= a b c) asks that all
+  ;; three be pairwise distinct, so it cannot be chained the way < and = are, and
+  ;; the N-ary entry takes the arguments as an array. Two arguments have nothing
+  ;; pairwise about them -- (/= a b) is exactly (not (= a b)) -- so the binary
+  ;; entry that has been sitting in the runtime unused takes them directly. The
+  ;; array path cost 80 bytes on every call of the commonest arity: one
+  ;; LispObject[] for the arguments and one Number[] inside the callee.
+  (setf (gethash '/= h)
+        (lambda (expr)
+          (let ((args (cdr expr)))
+            (if (= (length args) 2)
+                (compile-binary-call args "Runtime.NumNotEqual" "/=")
+                `(,@(compile-args-array args) (:call "Runtime.NumNotEqualN"))))))
 
   ;; Equality
   (setf (gethash 'eq h) (lambda (expr) (compile-binary-call (cdr expr) "Runtime.Eq")))
@@ -8834,13 +8971,17 @@
   (setf (gethash 'reverse h) (lambda (expr) (compile-unary-call (cdr expr) "Runtime.Reverse" "REVERSE")))
   (setf (gethash 'coerce h) (lambda (expr) (compile-binary-call (cdr expr) "Runtime.Coerce")))
 
-  ;; Higher-order
+  ;; (APPLY f a b ... list). One or two fixed arguments ahead of the list go to a
+  ;; runtime entry that takes them positionally. The general rewrite below conses a
+  ;; LIST* prefix per call, for a list APPLY then walks straight back apart.
   (setf (gethash 'apply h)
         (lambda (expr)
           (let ((args (cdr expr)))
-            (if (cddr args)
-                (compile-expr `(apply ,(car args) (list* ,@(cdr args))))
-                (compile-binary-call args "Runtime.Apply")))))
+            (cond
+              ((null (cddr args)) (compile-binary-call args "Runtime.Apply"))
+              ((null (cdddr args)) (compile-ternary-call args "Runtime.ApplySpread1"))
+              ((null (cddddr args)) (compile-quaternary-call args "Runtime.ApplySpread2"))
+              (t (compile-expr `(apply ,(car args) (list* ,@(cdr args)))))))))
   (setf (gethash 'maphash h) (lambda (expr) (compile-binary-call (cdr expr) "Runtime.Maphash")))
   (setf (gethash 'mapcar h)
         (lambda (expr)

@@ -87,10 +87,16 @@ static class PackRestamp
     /// Restamp the dotcl packages in <paramref name="sourceDir"/> into
     /// <paramref name="outputDir"/>. Returns the produced nupkg paths.
     /// </summary>
+    /// <remarks>BUNDLEFORRID answers the bundle directory for one RID, or null for
+    /// none, and falls back to BUNDLEDIR. Per RID rather than one directory for all
+    /// of them because a bundle can hold platform-specific payload: the NuGet
+    /// layouts pack stages carry native assets chosen for one RID, and the package
+    /// for another platform has no use for them.</remarks>
     public static List<string> Run(
         string sourceDir, string? dotclVersion, string newId, string command,
         string version, string faslPath, string? bundleDir,
-        IReadOnlyList<string> rids, string outputDir, Meta? meta, bool dryRun)
+        IReadOnlyList<string> rids, string outputDir, Meta? meta, bool dryRun,
+        Func<string, string?>? bundleForRid = null)
     {
         dotclVersion ??= InferDotclVersion(sourceDir);
 
@@ -128,7 +134,9 @@ static class PackRestamp
                                 ridMap: rids, faslPath: null, bundleDir: null, meta, outputDir));
         foreach (var (rid, path) in ridPkgs)
             produced.Add(RestampOne(path, $"dotcl.{rid}", $"{newId}.{rid}", version, command,
-                                    ridMap: null, faslPath: faslPath, bundleDir: bundleDir, meta, outputDir));
+                                    ridMap: null, faslPath: faslPath,
+                                    bundleDir: bundleForRid?.Invoke(rid) ?? bundleDir,
+                                    meta, outputDir));
         return produced;
     }
 

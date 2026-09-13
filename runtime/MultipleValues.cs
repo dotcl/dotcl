@@ -98,6 +98,16 @@ public static class MultipleValues
         _count = 2;
     }
 
+    /// <summary>Publish one value without an array, for the same reason SETPAIR
+    /// exists. GET already reads a one-value pair state, so this is the same
+    /// representation with the second slot unused.</summary>
+    public static void SetOne(LispObject a)
+    {
+        _values = null;
+        _pair0 = a;
+        _count = 1;
+    }
+
     public static LispObject[] Get()
     {
         if (_count <= 0) return Array.Empty<LispObject>();
@@ -156,6 +166,18 @@ public static class MultipleValues
         SetPair(a, b);
         return new MvReturn(a, b);
     }
+
+    /// <summary>The single-value half of VALUES2: publish A as the only value and
+    /// return it, which is exactly what VALUES2 followed by RUNTIME.UNWRAPMV does --
+    /// UnwrapMv takes the primary out of the MvReturn and collapses the thread state
+    /// to that one value. A caller in single-value position wants only that, so the
+    /// MvReturn VALUES2 allocates for it is dead the instant it is made (40 B on
+    /// every GETHASH, FLOOR, TRUNCATE, ROUND, CEILING ...). The peephole rewrites
+    /// the call pair to the twin entry that ends here instead.
+    ///
+    /// B is still passed so the two entries read the same at the call site and a
+    /// caller cannot accidentally pair the wrong secondary with the primary.</summary>
+    public static LispObject Values2Primary(LispObject a, LispObject b) => Primary(a);
 
     public static LispObject Values(params LispObject[] vals)
     {

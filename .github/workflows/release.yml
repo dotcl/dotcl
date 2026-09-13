@@ -97,7 +97,7 @@ jobs:
       # crossgen2 the core / asdf / contrib fasls per RID so the tbz distribution
       # ships pre-native FASLs (cold RunCore ~3.37s → ~50ms). crossgen2
       # cross-compiles from the ubuntu host for every target RID. Runs before the
-      # contrib staging below so the <name>-r2r-<rid>.fasl land in runtime/contrib.
+      # contrib staging below so the <name>.fasl.r2r-<rid> land in runtime/contrib.
       - name: Compile R2R FASLs (per RID)
         run: make compile-core-fasl-r2r-all compile-asdf-fasl-r2r-all compile-contrib-fasls-r2r-all
 
@@ -127,15 +127,15 @@ jobs:
         run: |
           mkdir -p out
           for rid in win-x64 win-arm64 linux-x64 linux-arm64 osx-x64 osx-arm64; do
-            cp compiler/dotcl-r2r-$rid.core runtime/dotcl-r2r-$rid.core
-            cp contrib/asdf/asdf-r2r-$rid.fasl runtime/asdf-r2r-$rid.fasl
+            cp compiler/dotcl.core.r2r-$rid runtime/dotcl.core.r2r-$rid
+            cp contrib/asdf/asdf.fasl.r2r-$rid runtime/asdf.fasl.r2r-$rid
           done
           # asdf is the one contrib whose R2R copy is overlaid from runtime/ top level
-          # (ReplaceFaslsWithR2R reads asdf-r2r-<rid>.fasl), so its copies under
+          # (ReplaceFaslsWithR2R reads asdf.fasl.r2r-<rid>), so its copies under
           # contrib/asdf/ are dead weight in every package. The other contribs keep
           # their per-RID R2R here: the csproj drops the cross-RID ones and adds back
           # the RID being packed.
-          rm -f runtime/contrib/asdf/asdf-r2r-*.fasl
+          rm -f runtime/contrib/asdf/asdf.fasl.r2r-*
           # Exclude android via the csproj's DotclToolNoAndroid hook — it rewrites
           # <RuntimeIdentifiers> to the 6 desktop RIDs + `any` inside the project. A
           # ;-list cannot be passed as a command-line -p:RuntimeIdentifiers (bare ; ->
@@ -149,7 +149,7 @@ jobs:
           # Drop the staged per-RID cores; the tbz publish below stages its own (from
           # compiler/), so runtime/ should be clean of them first.
           for rid in win-x64 win-arm64 linux-x64 linux-arm64 osx-x64 osx-arm64; do
-            rm -f runtime/dotcl-r2r-$rid.core runtime/asdf-r2r-$rid.fasl
+            rm -f runtime/dotcl.core.r2r-$rid runtime/asdf.fasl.r2r-$rid
           done
           # Build the in-process project-core MSBuild task FIRST so the library
           # pack bundles tasks/DotCL.Build.Tasks.dll. DotCL.Runtime.csproj
@@ -241,9 +241,9 @@ jobs:
             fi
             # `any` is framework-dependent: it must carry no R2R payload at all.
             if [ "$rid" = any ]; then
-              stray=$(unzip -Z1 "$nupkg" | grep -- '-r2r-' || true)
+              stray=$(unzip -Z1 "$nupkg" | grep -- '\.r2r-' || true)
             else
-              stray=$(unzip -Z1 "$nupkg" | grep -- '-r2r-' | grep -v -- "-r2r-$rid\." || true)
+              stray=$(unzip -Z1 "$nupkg" | grep -- '\.r2r-' | grep -v -- "\.r2r-$rid$" || true)
             fi
             if [ -n "$stray" ]; then
               echo "ERROR: $nupkg carries R2R payload belonging to other RIDs:"
@@ -264,7 +264,7 @@ jobs:
       # dotnet publish -r <rid> --self-contained false cross-compiles on Linux
       # for all 6 RIDs. PublishReadyToRun=true crossgens the runtime assembly to
       # native; dotcl.core / asdf.fasl are injected as the per-RID R2R FASLs, and
-      # this RID's contrib R2R fasls (<name>-r2r-<rid>.fasl) ride along in the
+      # this RID's contrib R2R fasls (<name>.fasl.r2r-<rid>) ride along in the
       # publish output for the resolve-deps probe.
       - name: Build per-RID tbz
         run: |
@@ -284,15 +284,15 @@ jobs:
             # the destination already existed, so cp created contrib/contrib (a full
             # second copy of every contrib), and that copy came from the staging dir
             # holding all six RIDs' R2R fasls.
-            cp compiler/dotcl-r2r-$rid.core out/publish-$rid/dotcl.core
-            cp contrib/asdf/asdf-r2r-$rid.fasl out/publish-$rid/contrib/asdf/asdf.fasl
+            cp compiler/dotcl.core.r2r-$rid out/publish-$rid/dotcl.core
+            cp contrib/asdf/asdf.fasl.r2r-$rid out/publish-$rid/contrib/asdf/asdf.fasl
             chmod +x out/publish-$rid/runtime 2>/dev/null || true
             # Guard: one contrib tree, and no other RID's R2R fasls in it.
             if [ -d out/publish-$rid/contrib/contrib ]; then
               echo "ERROR: $rid payload nests a second contrib tree under contrib/contrib"
               exit 1
             fi
-            stray=$(find out/publish-$rid -name '*-r2r-*' ! -name "*-r2r-$rid.*")
+            stray=$(find out/publish-$rid -name '*.r2r-*' ! -name "*.r2r-$rid")
             if [ -n "$stray" ]; then
               echo "ERROR: $rid payload carries cross-RID R2R artifacts:"
               echo "$stray"

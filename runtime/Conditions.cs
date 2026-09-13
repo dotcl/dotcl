@@ -242,18 +242,36 @@ public class HandlerBinding
     public LispFunction? Handler { get; }
 
     // A HANDLER-CASE clause instead of a handler function: what its handler did
-    // was throw HandlerCaseInvocationException(tag, index, condition), so the tag
-    // and index are kept here directly. Building a LispFunction (plus the lambda
+    // was throw HandlerCaseInvocationException(tag, index, condition), so the
+    // index is kept here directly. Building a LispFunction (plus the lambda
     // closing over the pair) for each clause cost ~300 B on every ENTRY into a
     // handler-case, error or not -- and handler-case is how ordinary code guards
     // anything.
-    internal readonly object? HcTag;
+    //
+    // No tag: the invocation is identified by the CLUSTER ARRAY, which is already
+    // allocated per entry and already unique. Carrying a separate tag object meant
+    // allocating one more thing per entry to say what an object already on hand
+    // said. SIGNAL has the cluster when it throws, so the binding does not need it.
+    // IsHandlerCaseClause tells the two shapes apart.
     internal readonly int HcClause;
+
+    /// <summary>Only set by the three-argument constructor, which exists for fasls
+    /// compiled before the cluster became the identity. A fasl is a shipped artifact
+    /// and keeps running against a newer runtime, so the constructor it baked a
+    /// token for has to stay -- and a binding built that way still has to be found
+    /// by the filter that fasl also baked, which compares against this tag.</summary>
+    internal readonly object? HcTag;
 
     public HandlerBinding(LispObject typeSpec, LispFunction handler)
     {
         TypeSpec = typeSpec;
         Handler = handler;
+    }
+
+    public HandlerBinding(LispObject typeSpec, int hcClause)
+    {
+        TypeSpec = typeSpec;
+        HcClause = hcClause;
     }
 
     public HandlerBinding(LispObject typeSpec, object hcTag, int hcClause)
@@ -263,13 +281,7 @@ public class HandlerBinding
         HcClause = hcClause;
     }
 
-    /// <summary>Run this binding for CONDITION: call the handler function, or --
-    /// for a handler-case clause -- transfer to that clause.</summary>
-    internal void Run(LispObject condition)
-    {
-        if (Handler != null) { Handler.Invoke(condition); return; }
-        throw new HandlerCaseInvocationException(HcTag!, HcClause, condition);
-    }
+    internal bool IsHandlerCaseClause => Handler == null;
 }
 
 /// <summary>
@@ -346,7 +358,15 @@ public static class HandlerClusterStack
                     }
                     try
                     {
-                        binding.Run(condition);
+                        // A handler-case clause transfers to its clause body; the
+                        // cluster array identifies which handler-case invocation.
+                        // HCTAG is set only by a binding an older fasl built; that
+                        // fasl's filter compares against that object, so throw with
+                        // whichever identity the binding was made with.
+                        if (binding.IsHandlerCaseClause)
+                            throw new HandlerCaseInvocationException(
+                                binding.HcTag ?? cluster, binding.HcClause, condition);
+                        binding.Handler!.Invoke(condition);
                         // Handler returned normally → decline, restore and continue
                     }
                     finally

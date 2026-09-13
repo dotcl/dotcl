@@ -1483,6 +1483,15 @@ public static partial class Runtime
             for (int i = 0; i < slots.Length; i++) slots[i] = Nil.Instance;
             return new LispStruct(lc.Name, slots);
         }
+        // A metaobject class needs its C# representation here too, for the same reason
+        // MAKE-INSTANCE has a branch for it: ALLOCATE-INSTANCE dispatches on
+        // (class-of cls) = STANDARD-CLASS, so a method specialized on STANDARD-METHOD or
+        // STANDARD-GENERIC-FUNCTION never becomes applicable. Without it, allocating a
+        // user-defined method class produced an object that ADD-METHOD rejects and whose
+        // slots INITIALIZE-INSTANCE leaves untouched. Checked after the structure-class
+        // branch so struct allocation keeps its own path.
+        if (HasSpecializedAllocator(lc) && AllocateSpecialized(lc) is { } metaobject)
+            return metaobject;
         return new LispInstance(lc);
     }
 
@@ -1816,7 +1825,12 @@ public static partial class Runtime
                 return SlotValueDirect(inst, idx, s, s.Name);
             }
         }
-        return Emitter.CilAssembler.GetFunctionBySymbol(cell.Sym).Invoke(new LispObject[] { obj });
+        // INVOKE1, not INVOKE with a one-element array: this is the path every call
+        // of an accessor takes once its generic function holds anything but reader
+        // methods -- one hand-written DEFMETHOD on the same name is enough, and that
+        // is ordinary CLOS, not a corner. The array was 32 bytes on each of those
+        // calls; the one-argument entry dispatches without one.
+        return Emitter.CilAssembler.GetFunctionBySymbol(cell.Sym).Invoke1(obj);
     }
 
     /// <summary>Item3c: the writer twin of <see cref="ReaderIC"/> — the compile-time-inlined
@@ -1850,8 +1864,9 @@ public static partial class Runtime
                 return SetSlotValueDirect(inst, idx, s.Name, newval);
             }
         }
+        // INVOKE2 for the same reason as the reader's INVOKE1 above.
         return Emitter.CilAssembler.GetSetfFunctionBySymbol(cell.Sym)
-                                   .Invoke(new LispObject[] { newval, obj });
+                                   .Invoke2(newval, obj);
     }
 
     public static LispObject SlotBoundp(LispObject obj, LispObject slotName)
@@ -1881,7 +1896,7 @@ public static partial class Runtime
             {
                 TryReadNativeConditionSlot(cond, name, out var cval);
                 LispObject cb = cval != null ? T.Instance : (LispObject)Nil.Instance;
-                MultipleValues.Set(cb);
+                MultipleValues.SetOne(cb);
                 return cb;
             }
             if (Startup.Sym("SLOT-MISSING").Function is LispFunction csm)
@@ -1889,7 +1904,7 @@ public static partial class Runtime
                 var r = Primary(csm.Invoke(new LispObject[] { ccls ?? (LispObject)Nil.Instance, cond,
                     slotName is Symbol ? slotName : Startup.Sym(name), Startup.Sym("SLOT-BOUNDP") }));
                 LispObject cb = IsTruthy(r) ? T.Instance : (LispObject)Nil.Instance;
-                MultipleValues.Set(cb);
+                MultipleValues.SetOne(cb);
                 return cb;
             }
             throw new LispErrorException(new LispError(
@@ -1906,7 +1921,7 @@ public static partial class Runtime
                 // exactly one value so any secondary values slot-missing returned (it may
                 // legally return (values nil x)) do not leak to the caller. ANSI SLOT-MISSING.8.
                 LispObject b = IsTruthy(result) ? T.Instance : (LispObject)Nil.Instance;
-                MultipleValues.Set(b);
+                MultipleValues.SetOne(b);
                 return b;
             }
             throw new LispErrorException(new LispError(
@@ -2024,25 +2039,50 @@ public static partial class Runtime
             return lc;
         }
         // Per CLHS 7.1.2: validate initargs against slots + applicable method &key params.
-        if (args[0] is LispInstance li)
+        // Nothing to validate when no initargs were supplied, which is the common
+        // (REINITIALIZE-INSTANCE x) call -- and skipping it also skips the walk over
+        // every method of two generic functions.
+        if (args.Length > 1 && args[0] is LispInstance li)
         {
-            // Collect &key names from applicable reinitialize-instance and shared-initialize methods.
-            // If any method has &allow-other-keys, skip validation entirely.
-            var methodKeys = new HashSet<string>();
-            bool allowOtherKeysFromMethod = CollectMethodKeys(li,
-                Startup.Sym("REINITIALIZE-INSTANCE"), methodKeys)
-                || CollectMethodKeys(li, Startup.Sym("SHARED-INITIALIZE"), methodKeys);
+            // Collect &key names from applicable reinitialize-instance and shared-initialize
+            // methods. If any method has &allow-other-keys, skip validation entirely.
+            // The set stays null until a name is actually added: the usual case is no
+            // &key method at all, and an empty HashSet allocated per call is the same
+            // waste SHARED-INITIALIZE had.
+            HashSet<string>? methodKeys = null;
+            bool allowOtherKeysFromMethod =
+                CollectMethodKeys(li, Startup.Sym("REINITIALIZE-INSTANCE"), ref methodKeys)
+                || CollectMethodKeys(li, Startup.Sym("SHARED-INITIALIZE"), ref methodKeys);
             if (!allowOtherKeysFromMethod)
                 ValidateInitargs(li.Class, args, 1, methodKeys);
         }
-        // Calls shared-initialize with slot-names = NIL (don't init unbound slots)
+        // Calls shared-initialize with slot-names = NIL (don't init unbound slots).
+        // The small arities pass the arguments positionally: building the array only to
+        // insert NIL at index 1 was the other half of this call's cost, and
+        // (REINITIALIZE-INSTANCE x) / one initarg pair are what callers actually write.
         var sharedInitFn = Startup.Sym("SHARED-INITIALIZE").Function as LispFunction
             ?? throw new LispErrorException(new LispError("SHARED-INITIALIZE not defined"));
-        var siArgs = new LispObject[args.Length + 1];
-        siArgs[0] = args[0];
-        siArgs[1] = Nil.Instance;
-        Array.Copy(args, 1, siArgs, 2, args.Length - 1);
-        sharedInitFn.Invoke(siArgs);
+        switch (args.Length)
+        {
+            case 1:
+                sharedInitFn.Invoke2(args[0], Nil.Instance);
+                break;
+            case 3:
+                sharedInitFn.Invoke4(args[0], Nil.Instance, args[1], args[2]);
+                break;
+            case 5:
+                sharedInitFn.Invoke6(args[0], Nil.Instance, args[1], args[2], args[3], args[4]);
+                break;
+            default:
+            {
+                var siArgs = new LispObject[args.Length + 1];
+                siArgs[0] = args[0];
+                siArgs[1] = Nil.Instance;
+                Array.Copy(args, 1, siArgs, 2, args.Length - 1);
+                sharedInitFn.Invoke(siArgs);
+                break;
+            }
+        }
         return args[0]; // reinitialize-instance returns the instance
     }
 
@@ -2085,18 +2125,20 @@ public static partial class Runtime
         return false;
     }
 
-    /// <summary>Collect &key names from applicable methods of the given GF for this instance.
-    /// Returns true if any applicable method has &allow-other-keys (meaning validation can be skipped).</summary>
-    private static bool CollectMethodKeys(LispInstance inst, Symbol gfSym, HashSet<string> keys)
+    /// <summary>Collect &key names from the applicable methods of GFSYM for INST into KEYS,
+    /// creating the set only when there is a name to put in it. Returns true if any
+    /// applicable method has &allow-other-keys, in which case the caller skips validation
+    /// and the set is not needed at all.</summary>
+    private static bool CollectMethodKeys(LispInstance inst, Symbol gfSym, ref HashSet<string>? keys)
     {
         if (gfSym.Function is not GenericFunction gf) return false;
-        foreach (var method in gf.Methods)
+        foreach (var method in gf.MethodsArray)
         {
             if (!IsMethodApplicable(method, inst)) continue;
             if (method.HasAllowOtherKeys) return true;
             if (method.HasKey)
                 foreach (var kn in method.KeywordNames)
-                    keys.Add(kn);
+                    (keys ??= new HashSet<string>()).Add(kn);
         }
         return false;
     }
@@ -2114,7 +2156,7 @@ public static partial class Runtime
     private static bool AddMethodKeysForClass(LispClass cls, Symbol gfSym, HashSet<string> keys)
     {
         if (gfSym.Function is not GenericFunction gf) return false;
-        foreach (var method in gf.Methods)
+        foreach (var method in gf.MethodsArray)
         {
             if (!IsMethodApplicableToClass(method, cls)) continue;
             if (method.HasAllowOtherKeys) return true;
@@ -2450,44 +2492,7 @@ public static partial class Runtime
         // (allocate-instance GF dispatch uses class-of(cls)=STANDARD-CLASS so can't specialize on subclass names.)
         if (HasSpecializedAllocator(cls))
         {
-            LispObject? allocated2 = null;
-            // Walk CPL to find the most specific recognized type
-            foreach (var cplCls in cls.ClassPrecedenceList)
-            {
-                if (cplCls.Name.Name == "STANDARD-GENERIC-FUNCTION" || cplCls.Name.Name == "GENERIC-FUNCTION")
-                {
-                    var newGf = Runtime.NewDispatchingGF(Startup.Sym("UNNAMED"), -1);
-                    newGf.RequiredCount = 0;
-                    newGf.LambdaListInfoSet = true;
-                    newGf.StoredClass = cls;  // track actual Lisp class (may be substandard-generic-function etc.)
-                    allocated2 = newGf;
-                    break;
-                }
-                if (cplCls.Name.Name == "METHOD")
-                {
-                    var newMethod = new LispMethod();
-                    // Track the actual Lisp class, the way the generic function branch
-                    // above does with StoredClass: CLASS-OF has to answer the class
-                    // that was instantiated, and the slots it adds beyond
-                    // STANDARD-METHOD are initialized against it.
-                    if (cls.Name.Name != "STANDARD-METHOD") newMethod.MetaClass = cls;
-                    allocated2 = newMethod;
-                    break;
-                }
-            }
-            // A funcallable instance that is not a generic function still has to BE
-            // callable, and on dotcl the callable object that carries a class and
-            // slots is the generic function. It starts with no methods, so calling
-            // one before SET-FUNCALLABLE-INSTANCE-FUNCTION says there is no
-            // applicable method -- AMOP leaves that case undefined.
-            if (allocated2 == null && IsFuncallableClass(cls))
-            {
-                var funcallable = Runtime.NewDispatchingGF(Startup.Sym("UNNAMED"), -1);
-                funcallable.RequiredCount = 0;
-                funcallable.LambdaListInfoSet = true;
-                funcallable.StoredClass = cls;
-                allocated2 = funcallable;
-            }
+            LispObject? allocated2 = AllocateSpecialized(cls);
             if (allocated2 != null)
             {
                 var iiSym2 = Startup.Sym("INITIALIZE-INSTANCE");
@@ -3814,12 +3819,11 @@ public static partial class Runtime
     /// method allows other keys. Must run on BOTH the cache-hit and cache-miss dispatch
     /// paths — earlier it lived only on the cache-miss path, so a warm monomorphic cache
     /// silently skipped the check (ANSI DEFMETHOD.ERROR.14/15).</summary>
-    private static void ValidateGenericKeywords(GenericFunction gf, IReadOnlyList<LispMethod> applicable, LispObject[] args)
+    /// <summary>The keyword-portion checks that do not depend on which methods apply:
+    /// an even number of pairs, symbol keys, and the :ALLOW-OTHER-KEYS escape. False
+    /// when the unknown-keyword check is to be skipped.</summary>
+    private static bool KeywordPortionNeedsCheck(GenericFunction gf, LispObject[] args, int keyStart)
     {
-        if (!(gf.LambdaListInfoSet && gf.HasKey && !gf.HasAllowOtherKeys)) return;
-        int keyStart = gf.RequiredCount + gf.OptionalCount;
-        if (args.Length <= keyStart) return;
-
         // CLHS 3.5.1.6: the keyword portion must be an even number of pairs whose
         // keys are symbols. (sym 1 2) and (sym 1 :y) [no value] are program-errors.
         int keyLen = args.Length - keyStart;
@@ -3839,29 +3843,142 @@ public static partial class Runtime
             if (args[i] is Symbol ks && ks.Name == "ALLOW-OTHER-KEYS"
                 && ks.HomePackage?.Name == "KEYWORD")
             {
-                if (args[i + 1] is not Nil) return; // suppress unknown-key check
-                break;                              // first wins; nil → validate
+                if (args[i + 1] is not Nil) return false; // suppress unknown-key check
+                break;                                    // first wins; nil → validate
             }
         }
+        return true;
+    }
+
+    private static void ValidateGenericKeywords(GenericFunction gf, IReadOnlyList<LispMethod> applicable, LispObject[] args)
+    {
+        if (!(gf.LambdaListInfoSet && gf.HasKey && !gf.HasAllowOtherKeys)) return;
+        int keyStart = gf.RequiredCount + gf.OptionalCount;
+        if (args.Length <= keyStart) return;
+        if (!KeywordPortionNeedsCheck(gf, args, keyStart)) return;
 
         // Check if any applicable method has &allow-other-keys or &rest (without &key)
-        var allowedKeywords = new HashSet<string> { "ALLOW-OTHER-KEYS" }; // always valid per CLHS 3.4.1.4.1
-        foreach (var m in applicable)
+        for (int mi = 0; mi < applicable.Count; mi++)
         {
+            var m = applicable[mi];
             if (m.HasAllowOtherKeys || (m.HasRest && !m.HasKey)) return;
-            foreach (var kw in m.KeywordNames)
-                allowedKeywords.Add(kw);
         }
-        // Also add GF-level keywords
-        foreach (var kw in gf.KeywordNames)
-            allowedKeywords.Add(kw);
 
+        // The accepted keywords used to be collected into a fresh HashSet here, on
+        // every call that passed a keyword: the set, the two arrays it grows, and an
+        // enumerator over the applicable list (an interface, so foreach boxes one) --
+        // all to test membership against the handful of names a method declares. Scan
+        // the lists instead. The counts are tiny (a few keywords, a few applicable
+        // methods) and nothing is allocated.
         for (int i = keyStart; i + 1 < args.Length; i += 2)
         {
-            if (args[i] is Symbol ks2 && !allowedKeywords.Contains(ks2.Name))
+            if (args[i] is Symbol ks2 && !AcceptsKeyword(gf, applicable, ks2.Name))
                 throw new LispErrorException(new LispProgramError(
                     $"{gf.Name.Name}: invalid keyword argument :{ks2.Name}"));
         }
+    }
+
+    /// <summary>Keyword validation against a warm cache entry, reading its method
+    /// lists where they lie. They used to be concatenated into one fresh List whose
+    /// only purpose was this check, rebuilt on every call that passed a keyword.</summary>
+    private static void ValidateGenericKeywords(GenericFunction gf, CachedDispatch cached, LispObject[] args)
+    {
+        int keyStart = gf.RequiredCount + gf.OptionalCount;
+        if (args.Length <= keyStart) return;
+        if (!KeywordPortionNeedsCheck(gf, args, keyStart)) return;
+
+        if (cached.Applicable is { } appl)
+        {
+            if (ListAcceptsAnyKeyword(appl)) return;
+        }
+        else if (ListAcceptsAnyKeyword(cached.Around) || ListAcceptsAnyKeyword(cached.Before)
+                 || ListAcceptsAnyKeyword(cached.Primary) || ListAcceptsAnyKeyword(cached.After)
+                 || EqlMethodsAcceptAnyKeyword(cached, args))
+            return;
+
+        for (int i = keyStart; i + 1 < args.Length; i += 2)
+        {
+            if (args[i] is Symbol ks && !EntryAcceptsKeyword(gf, cached, args, ks.Name))
+                throw new LispErrorException(new LispProgramError(
+                    $"{gf.Name.Name}: invalid keyword argument :{ks.Name}"));
+        }
+    }
+
+    private static bool ListAcceptsAnyKeyword(List<LispMethod> methods)
+    {
+        for (int i = 0; i < methods.Count; i++)
+        {
+            var m = methods[i];
+            if (m.HasAllowOtherKeys || (m.HasRest && !m.HasKey)) return true;
+        }
+        return false;
+    }
+
+    private static bool EqlMethodsAcceptAnyKeyword(CachedDispatch cached, LispObject[] args)
+    {
+        if (cached.EqlMethods == null) return false;
+        foreach (var m in cached.EqlMethods)
+            if (IsMethodApplicable(m, args)
+                && (m.HasAllowOtherKeys || (m.HasRest && !m.HasKey))) return true;
+        return false;
+    }
+
+    private static bool ListHasKeyword(List<LispMethod> methods, string name)
+    {
+        for (int i = 0; i < methods.Count; i++)
+        {
+            var names = methods[i].KeywordNames;
+            for (int j = 0; j < names.Count; j++)
+                if (names[j] == name) return true;
+        }
+        return false;
+    }
+
+    private static bool EntryAcceptsKeyword(GenericFunction gf, CachedDispatch cached,
+                                            LispObject[] args, string name)
+    {
+        if (name == "ALLOW-OTHER-KEYS") return true;
+        if (cached.Applicable is { } appl)
+        {
+            if (ListHasKeyword(appl, name)) return true;
+        }
+        else
+        {
+            if (ListHasKeyword(cached.Around, name) || ListHasKeyword(cached.Before, name)
+                || ListHasKeyword(cached.Primary, name) || ListHasKeyword(cached.After, name))
+                return true;
+            if (cached.EqlMethods != null)
+                foreach (var m in cached.EqlMethods)
+                {
+                    if (!IsMethodApplicable(m, args)) continue;
+                    var names = m.KeywordNames;
+                    for (int j = 0; j < names.Count; j++)
+                        if (names[j] == name) return true;
+                }
+        }
+        var gfNames = gf.KeywordNames;
+        for (int i = 0; i < gfNames.Count; i++)
+            if (gfNames[i] == name) return true;
+        return false;
+    }
+
+    /// <summary>Whether NAME is a keyword some applicable method or the generic
+    /// function itself declares. :ALLOW-OTHER-KEYS is always accepted (CLHS
+    /// 3.4.1.4.1).</summary>
+    private static bool AcceptsKeyword(GenericFunction gf,
+                                       IReadOnlyList<LispMethod> applicable, string name)
+    {
+        if (name == "ALLOW-OTHER-KEYS") return true;
+        for (int mi = 0; mi < applicable.Count; mi++)
+        {
+            var names = applicable[mi].KeywordNames;
+            for (int i = 0; i < names.Count; i++)
+                if (names[i] == name) return true;
+        }
+        var gfNames = gf.KeywordNames;
+        for (int i = 0; i < gfNames.Count; i++)
+            if (gfNames[i] == name) return true;
+        return false;
     }
 
     /// <summary>add ENTRY to GF's N-way dispatch cache. Rebuilds an immutable
@@ -3979,7 +4096,42 @@ public static partial class Runtime
         // (defmethod f ((x (eql :k))) ...) is an ordinary way to write a dispatch table.
         var eqlChain = EqlCacheHit(gf, a);
         if (eqlChain != null) return InvokeChainLoose(eqlChain, a, null, null, null, 1);
+        // A cached slot-reader shortcut. PLAINCACHEHIT declines this shape (the entry is
+        // not a primary chain), and the array path below existed only to hand args[0] to
+        // the same SLOTVALUEDIRECT this can call with the argument it already has.
+        //
+        // It is reached by every call of an accessor whose generic function holds
+        // anything besides reader methods -- one hand-written DEFMETHOD on the same name
+        // is enough, and that is ordinary CLOS. The compile-time READERIC shortcut also
+        // stands down for such a function (its SIMPLEREADERSLOT is null), so those calls
+        // arrive here, and each was paying 32 bytes for a one-element array.
+        var rd = ReaderCacheHit(gf, a);
+        if (rd != null && a is LispInstance readerInst)
+            return SlotValueDirect(readerInst, rd.ReaderSlotIndex,
+                                   rd.ReaderSlotName!, rd.ReaderSlotName!.Name);
         return DispatchGF(gf, new[] { a });
+    }
+
+    /// <summary>The warm cache entry that serves A by reading a slot, or null when this
+    /// call is not that shape. Mirrors the reader arm of DISPATCHGF's cache-hit path,
+    /// including its precedence: an effective method built by the AMOP protocol runs
+    /// instead, so an entry carrying one is not this.</summary>
+    private static CachedDispatch? ReaderCacheHit(GenericFunction gf, LispObject a)
+    {
+        var dcache = gf.DispatchCache;
+        if (dcache == null) return null;
+        if (gf.LambdaListInfoSet && gf.HasKey && !gf.HasAllowOtherKeys) return null;
+        foreach (var entry in dcache)
+        {
+            var types = entry.ArgTypes;
+            if (types.Length != 1) continue;
+            if (!ReferenceEquals(types[0], ArgDispatchClass(a))) continue;
+            // First matching entry decides: nothing else in the cache can match this
+            // class, so a non-reader entry means "not this path" rather than "keep going".
+            return entry.ReaderSlotIndex >= 0 && entry.EffectiveMethodFunction == null
+                ? entry : null;
+        }
+        return null;
     }
 
     /// <summary>The method chain a warm EQL-specialized cache entry runs for A, or null
@@ -4293,24 +4445,15 @@ public static partial class Runtime
                 // Keyword validation must run on the cache-hit path too — a warm
                 // monomorphic cache otherwise skips the unknown-keyword check that the
                 // cache-miss path performs (ANSI DEFMETHOD.ERROR.14/15).
-                if (gf.LambdaListInfoSet && gf.HasKey && !gf.HasAllowOtherKeys)
-                {
-                    List<LispMethod> cachedApplicable;
-                    if (cached.Applicable != null)
-                        cachedApplicable = cached.Applicable;
-                    else
-                    {
-                        cachedApplicable = new List<LispMethod>();
-                        cachedApplicable.AddRange(cached.Around);
-                        cachedApplicable.AddRange(cached.Before);
-                        cachedApplicable.AddRange(cached.Primary);
-                        cachedApplicable.AddRange(cached.After);
-                        if (cached.EqlMethods != null)
-                            foreach (var em in cached.EqlMethods)
-                                if (IsMethodApplicable(em, args)) cachedApplicable.Add(em);
-                    }
-                    ValidateGenericKeywords(gf, cachedApplicable, args);
-                }
+                //
+                // Only when a keyword was actually passed. The applicable list below
+                // is collected into a fresh List whose sole use is this check, and the
+                // check answers immediately when the call has no keyword portion --
+                // so a plain call to a generic function that merely HAS &key was
+                // building a list, and its backing array, for nothing.
+                if (gf.LambdaListInfoSet && gf.HasKey && !gf.HasAllowOtherKeys
+                    && args.Length > gf.RequiredCount + gf.OptionalCount)
+                    ValidateGenericKeywords(gf, cached, args);
                 // For EQL specializers: check if any EQL method matches (takes
                 // priority — the cache is only stored for single-required-arg GFs,
                 // where an applicable EQL method is always the most specific and at
@@ -5472,6 +5615,19 @@ public static partial class Runtime
         return 0;
     }
 
+    /// <summary>Whether a protocol generic function has a method other than its own
+    /// default that applies to these arguments. A hook that only checks the method
+    /// count learns that somebody, somewhere, specialised the protocol; this tells it
+    /// whether the specialisation applies to the metaobject in hand.</summary>
+    internal static bool HasSpecialisedMethodFor(GenericFunction gf, LispMethod defaultMethod,
+                                                 LispObject[] args)
+    {
+        foreach (var m in gf.MethodsArray)
+            if (!ReferenceEquals(m, defaultMethod) && IsMethodApplicable(m, args))
+                return true;
+        return false;
+    }
+
     private static bool IsMethodApplicable(LispMethod method, LispObject[] args)
     {
         for (int i = 0; i < method.Specializers.Length; i++)
@@ -5682,6 +5838,54 @@ public static partial class Runtime
                 ? T.Instance : Nil.Instance;
 
         return Nil.Instance;
+    }
+
+    /// <summary>Allocate the C# object a metaobject class needs, or null when CLS is an
+    /// ordinary class. A method class must produce a LispMethod and a generic function
+    /// class a GenericFunction: a LispInstance that merely answers the right CLASS-OF is
+    /// neither, so it cannot be given to ADD-METHOD or funcalled, and the
+    /// INITIALIZE-INSTANCE primary for METHOD passes non-LispMethod arguments straight
+    /// through. Both MAKE-INSTANCE and ALLOCATE-INSTANCE come here for the same reason:
+    /// ALLOCATE-INSTANCE dispatches on (class-of cls) = STANDARD-CLASS, so a method
+    /// specialized on STANDARD-METHOD is never applicable.</summary>
+    private static LispObject? AllocateSpecialized(LispClass cls)
+    {
+        // Walk CPL to find the most specific recognized type
+        foreach (var cplCls in cls.ClassPrecedenceList)
+        {
+            if (cplCls.Name.Name == "STANDARD-GENERIC-FUNCTION" || cplCls.Name.Name == "GENERIC-FUNCTION")
+            {
+                var newGf = Runtime.NewDispatchingGF(Startup.Sym("UNNAMED"), -1);
+                newGf.RequiredCount = 0;
+                newGf.LambdaListInfoSet = true;
+                newGf.StoredClass = cls;  // track actual Lisp class (may be substandard-generic-function etc.)
+                return newGf;
+            }
+            if (cplCls.Name.Name == "METHOD")
+            {
+                var newMethod = new LispMethod();
+                // Track the actual Lisp class, the way the generic function branch
+                // above does with StoredClass: CLASS-OF has to answer the class
+                // that was instantiated, and the slots it adds beyond
+                // STANDARD-METHOD are initialized against it.
+                if (cls.Name.Name != "STANDARD-METHOD") newMethod.MetaClass = cls;
+                return newMethod;
+            }
+        }
+        // A funcallable instance that is not a generic function still has to BE
+        // callable, and on dotcl the callable object that carries a class and
+        // slots is the generic function. It starts with no methods, so calling
+        // one before SET-FUNCALLABLE-INSTANCE-FUNCTION says there is no
+        // applicable method -- AMOP leaves that case undefined.
+        if (IsFuncallableClass(cls))
+        {
+            var funcallable = Runtime.NewDispatchingGF(Startup.Sym("UNNAMED"), -1);
+            funcallable.RequiredCount = 0;
+            funcallable.LambdaListInfoSet = true;
+            funcallable.StoredClass = cls;
+            return funcallable;
+        }
+        return null;
     }
 
     private static bool HasSpecializedAllocator(LispClass cls)
@@ -6297,6 +6501,7 @@ public static partial class Runtime
         RegClos("%NOTE-METHOD-CLASS", a => Runtime.NoteMethodClass(a[0], a[1]), 2);
         RegClos("%NOTE-METHOD-COMBINATION", a => Runtime.NoteMethodCombination(a[0], a[1], a[2]), 3);
         RegClos("%MAKE-METHOD-LAMBDA-FOR", a => Runtime.MakeMethodLambdaFor(a[0], a[1]), 2);
+        RegClos("%CURRENT-NEXT-METHODS", a => Runtime.CurrentNextMethods(), 0);
         RegClos("%INTERN-EQL-SPECIALIZER", a => Runtime.InternEqlSpecializer(a[0]), 1);
         RegClos("%GF-METHODS", a => Runtime.GetGFMethods(a[0]), 1);
         RegClos("%METHOD-SPECIALIZERS", a => Runtime.MethodSpecializers(a[0]), 1);

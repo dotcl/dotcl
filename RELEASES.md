@@ -3,6 +3,101 @@
 User-facing release notes for dotcl. Each section corresponds to a tagged
 release on the public mirror (dotcl/dotcl).
 
+## v0.1.28 -- 2026-09-13
+
+A maintenance release: conformance fixes and allocation work, with one thing to
+read before upgrading. FORMAT, the package system and a couple of sequence
+functions now signal where they used to carry on silently, so code that appears
+to work can start erroring. The Upgrading section below lists every case.
+
+The rest is quieter. Compiled code loads faster and FASLs are smaller -- loading
+Coalton, the largest system regularly built on dotcl, went from 33 seconds to 10
+and its FASLs are 37 percent smaller. An ASDF system can declare the NuGet
+packages it needs. An editor can ask a running image about the name under the
+cursor.
+
+### Upgrading
+
+Several places that accepted broken code now signal. Every one of them was
+silent before, so code that looks like it works can start erroring here.
+
+- **FORMAT checks its arguments.** A directive that runs out of arguments
+  signals, and so does an unknown directive. Directives that take parameters
+  check the ones they are given.
+- **`:import-from` naming a package that does not exist signals.** It used to be
+  accepted and import nothing.
+- **`defpackage` rejects a clause that refers to the package being defined by one
+  of its own local nicknames.**
+- **`MISMATCH` checks its bounding indices.** `:start` and `:end` outside the
+  sequence signal instead of being taken as given.
+- **`#n#` with no matching `#n=` signals a reader error.** It used to return an
+  internal placeholder object, which then turned up somewhere far from the read.
+- **`UPGRADED-ARRAY-ELEMENT-TYPE` answers with the element type dotcl actually
+  uses** for such an array. The two disagreed; code that branches on the answer
+  may now take a different branch.
+
+One change goes the other way: `~^` outside an enclosing construct ends FORMAT,
+as the standard says, where it used to signal an error.
+
+### Loading compiled code
+
+A FASL used to build its literals by running emitted IL. Structures, uninterned
+symbols and shared or circular structure now travel as text that the reader
+rebuilds on load, which is cheaper to produce, smaller to ship and faster to
+load. On Coalton's 293 files the load went from 91 to 52 seconds on this change
+alone, with the FASLs down from 128 MB to 81 MB.
+
+On top of that, dotcl now loads an ahead-of-time compiled (ReadyToRun) sibling
+of a FASL when it finds one next to it, which takes that load to 10 seconds.
+The siblings for the runtime core, ASDF and the bundled contribs ship for every
+supported platform. `(dotcl:r2r-stats)` reports how many loads took the
+ahead-of-time path, so "it is there but unused" is visible rather than silent.
+ASDF can write a sibling for the systems it compiles too; that is off by default
+and switched on with `dotcl:*compile-r2r*`.
+
+### NuGet dependencies in a system definition
+
+A system can name the NuGet packages it needs, and building it resolves them:
+
+    (defsystem "my-app"
+      :defsystem-depends-on ("dotcl-nuget-asdf")
+      :serial t
+      :components ((:nuget "Newtonsoft.Json" :nuget-version "13.*")
+                   (:file "app")))
+
+The version goes in `:nuget-version`, not `:version` -- ASDF takes `:version`
+for itself and quietly drops a floating version like `13.*`, so `:version` on a
+`:nuget` component is an error that says which keyword to use. Packaged
+applications also carry the layout for every platform they ship to, not only the
+one that packed them.
+
+### Editors
+
+Editors can query a live image through one entry point: what the name under the
+cursor is, its reference URL, and completions that know the file's package. .NET
+completion covers type and member names, including types from assemblies that
+are not loaded yet, and shows the documentation text .NET carries for them. The
+bundled REPL completes on TAB, which previously did nothing.
+
+### Smaller and quieter
+
+Ordinary calls allocate less: entering `handler-case` (136 bytes down to 80),
+`APPLY` (120 to 300 bytes), `&rest` functions called with nothing to collect,
+generic functions that check keyword arguments (a hash set per call), slot
+accessors, `FIND-SYMBOL`, `/=`, and calls that return two values. `FORMAT`,
+`MISMATCH`, `SUBSTITUTE`, `READ` and string comparison each stopped building
+something they did not need.
+
+Fixes worth calling out: `FILE-POSITION` on a character file reflects what was
+read, and no longer points one character ahead after `UNREAD-CHAR`; an image
+started from a core keeps its lambda lists, so argument lists are available
+again; `make-method-lambda` answers in the shape AMOP specifies;
+`allocate-instance` on a method class returns a method; a `progn` that returns
+zero values in the middle no longer swallows the last value; a .NET method
+returning void no longer produces a value; type and member names work when
+given as non-simple strings; and a condition signalled with `:format-control`
+reports with that message.
+
 ## v0.1.27 -- 2026-08-31
 
 The metaobject protocol is the headline. A probe covering 94 of the 95 AMOP

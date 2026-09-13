@@ -77,7 +77,12 @@ public class LispFunction : LispObject
     // matters).
     public Func<LispObject[], LispObject> RawFunction => _func ?? CallDirectWithArray;
     public object[]? Environment { get; internal set; }
-    // The lambda list the user wrote, when something recorded it. Nothing in the
+    // The lambda list the user wrote, when something recorded it. A function that
+    // came out of a FASL holds it as the LispString it was written as until
+    // something asks, because a FASL has no constant pool to hang a list on and
+    // building one per function at load time would charge every start-up for what
+    // almost nothing reads. FUNCTION-LAMBDA-LIST does that reading; no other
+    // reader of this slot should assume it is a list. Nothing in the
     // call path reads this: it exists so a development tool can answer "what are
     // this function's arguments?" -- SLIME/SLY autodoc, DESCRIBE, completion.
     // Arity is not enough (it counts required parameters only) and InterpInfo

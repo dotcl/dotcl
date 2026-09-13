@@ -711,7 +711,7 @@ public static class DotclHost
     /// the fly via concatenate-source-op. When <paramref name="rootSourcesOut"/>
     /// is non-null, also writes the root system's component source paths in
     /// declared order (used by MSBuild as Inputs). <paramref name="targetRid"/>,
-    /// when given, prefers <c>&lt;name&gt;-r2r-&lt;rid&gt;.fasl</c> if present.
+    /// when given, prefers <c>&lt;name&gt;.fasl.r2r-&lt;rid&gt;</c> if present.
     /// </summary>
     /// <summary>
     /// Load each user-supplied build-init script (the &lt;DotclBuildInit&gt; items)
@@ -867,7 +867,7 @@ public static class DotclHost
         // next to the manifest — i.e. under obj/.../dotcl-fasl/ — instead of polluting
         // each dep's source dir. That makes them cleanable by `dotnet clean` (which wipes
         // obj/), at the cost of recompiling deps per project (the .NET obj/ model). The
-        // CompileProject load step uses the same convention. A prebuilt -r2r-<rid> AOT
+        // CompileProject load step uses the same convention. A prebuilt .fasl.r2r-<rid> AOT
         // fasl shipped next to the dep source is still preferred read-only. Direct CLI
         // resolve-deps to stdout (manifestOut == null) keeps the old next-to-source cache.
         string? depCacheDir = null;
@@ -916,7 +916,7 @@ public static class DotclHost
                     (name (asdf:component-name sys))
                     (r2r-fasl {(targetRid == null
                         ? "nil"
-                        : $"(concatenate 'string dir name \"-r2r-\" \"{targetRid}\" \".fasl\")")})
+                        : $"(concatenate 'string dir name \".fasl.r2r-\" \"{targetRid}\")")})
                     (fasl {DepFaslForm("name")}))
                (when (and r2r-fasl (probe-file r2r-fasl))
                  (return-from ensure-fasl r2r-fasl))
@@ -1007,6 +1007,10 @@ public static class DotclHost
         var concatLisp = (outDir == null ? "" : outDir.Replace("\\", "/") + "/")
                        + System.IO.Path.GetFileNameWithoutExtension(outputPath)
                        + ".concat.lisp";
+        // Beside the concat, under obj/: generated, and cleaned with everything else.
+        var preambleLisp = (outDir == null ? "" : outDir.Replace("\\", "/") + "/")
+                         + System.IO.Path.GetFileNameWithoutExtension(outputPath)
+                         + ".nuget-preamble.lisp";
         // Phase 1: load the asd, load the resolved :depends-on fasls, and
         // concatenate the root's sources into the concat file. Return the ordered
         // source namestrings so we can build a concat-line -> (file, line) map for
@@ -1015,8 +1019,28 @@ public static class DotclHost
 (progn
   (asdf:load-asd ""{asdLisp}"")
   (let* ((root (%root-system-of ""{asdLisp}""))
-         (sources (mapcar #'asdf:component-pathname
-                          (asdf:component-children root))))
+         ;; Only the children that have a source to contribute. A component can
+         ;; legitimately have none -- (:nuget ...) declares a NuGet package, not a
+         ;; file -- and its COMPONENT-PATHNAME is then the system's own directory,
+         ;; which CONCATENATE-FILES tried to read and failed on: the whole build
+         ;; died with ""File not found: <system dir>/"".
+         (sources (loop for c in (asdf:component-children root)
+                        when (asdf:input-files 'asdf:compile-op c)
+                          collect (asdf:component-pathname c)))
+         ;; What those file-less components asked for, turned back into source:
+         ;; the concatenated unit is not loaded through ASDF, so nothing else
+         ;; would ever perform them (see DOTCL-NUGET-ASDF). Written as a file of
+         ;; its own and put first, rather than prepended to the concatenation, so
+         ;; that the concat-line -> source-line map stays exact.
+         (nuget-asdf (find-package ""DOTCL-NUGET-ASDF""))
+         (preamble (when nuget-asdf
+                     (funcall (find-symbol ""SYSTEM-NUGET-PREAMBLE"" nuget-asdf) root))))
+    (when preamble
+      (let ((path ""{preambleLisp}""))
+        (with-open-file (o path :direction :output :if-exists :supersede
+                                :if-does-not-exist :create)
+          (write-string preamble o))
+        (setf sources (cons (pathname path) sources))))
     ;; Load the resolved :depends-on fasls into the image BEFORE compiling the
     ;; root, so the deps' defpackage/macros are available at the root's compile
     ;; time — same as a standard ASDF load-op-then-compile. Without this the
@@ -1156,13 +1180,25 @@ public static class DotclHost
         // monolithic-concatenate-source-op writes the concat into asdf's shared
         // cache; copy it to a writable work file next to the output (keep the
         // cached one pristine), append the optional launcher, then compile.
+        // A (:nuget ...) component is not a file, and ASDF's concatenation gathers
+        // files, so the declaration would be dropped here -- in the one direction
+        // that matters, since the artifact this builds is what runs where there is
+        // no .NET SDK. DOTCL-NUGET-ASDF turns the declarations back into source,
+        // which goes in front of the system's own code so the packages are
+        // registered before anything names a type from them. The package exists
+        // only when the .asd asked for it (:defsystem-depends-on), which
+        // FIND-SYSTEM above has by then loaded.
         var form = $@"
 (let* ((sys (asdf:find-system ""{sysEsc}""))
-       (op 'asdf:monolithic-concatenate-source-op))
+       (op 'asdf:monolithic-concatenate-source-op)
+       (nuget-asdf (find-package ""DOTCL-NUGET-ASDF""))
+       (preamble (when nuget-asdf
+                   (funcall (find-symbol ""SYSTEM-NUGET-PREAMBLE"" nuget-asdf) sys))))
   (asdf:operate op sys)
   (let ((concat (namestring (first (asdf:output-files op sys))))
         (work ""{workConcat}""))
     (with-open-file (o work :direction :output :if-exists :supersede :if-does-not-exist :create)
+      (when preamble (write-string preamble o))
       (with-open-file (i concat)
         (loop for line = (read-line i nil :eof) until (eq line :eof)
               do (write-line line o))))

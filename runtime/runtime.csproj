@@ -80,7 +80,7 @@
     <ProjectReference Include="DotCL.Runtime.csproj" />
   </ItemGroup>
 
-  <!-- Keep every per-RID R2R fasl (*-r2r-<rid>.fasl) out of the contrib/** glob,
+  <!-- Keep every per-RID R2R fasl (*.fasl.r2r-<rid>) out of the contrib/** glob,
        then add back only the one RID being built (see the item group below). The
        staging directory holds all six RIDs' copies because a single pack pass
        emits every package from it, but a given package must carry exactly one:
@@ -88,8 +88,8 @@
        per-RID package (dotcl.<rid>) carries its own. Without the add-back this
        glob shipped all six R2R sets in all six packages (~22 MB of waste each). -->
   <PropertyGroup>
-    <ContribR2RExclude>contrib/**/*-r2r-*.fasl</ContribR2RExclude>
-    <ContribOwnR2R Condition="'$(RuntimeIdentifier)' != '' and '$(RuntimeIdentifier)' != 'any'">contrib/**/*-r2r-$(RuntimeIdentifier).fasl</ContribOwnR2R>
+    <ContribR2RExclude>contrib/**/*.fasl.r2r-*</ContribR2RExclude>
+    <ContribOwnR2R Condition="'$(RuntimeIdentifier)' != '' and '$(RuntimeIdentifier)' != 'any'">contrib/**/*.fasl.r2r-$(RuntimeIdentifier)</ContribOwnR2R>
   </PropertyGroup>
 
   <ItemGroup>
@@ -119,7 +119,7 @@
       <CopyToPublishDirectory>Always</CopyToPublishDirectory>
     </Content>
     <!-- Add back this RID's own R2R contrib fasls (empty glob for the any-RID
-         package). ResolveDeps probes contrib/<n>/<n>-r2r-<rid>.fasl and falls
+         package). ResolveDeps probes contrib/<n>/<n>.fasl.r2r-<rid> and falls
          back to the IL fasl, so this is what makes contrib load pre-native. -->
     <None Include="$(ContribOwnR2R)" Condition="Exists('contrib') and '$(ContribOwnR2R)' != ''">
       <Pack>true</Pack>
@@ -130,6 +130,28 @@
       <CopyToPublishDirectory>Always</CopyToPublishDirectory>
     </Content>
   </ItemGroup>
+
+  <!-- Both copies above are conditional on their source existing, but MSBuild
+       never removes an output copy whose source has gone away. runtime/contrib/
+       is produced by `make pack` and deleted again, so a tree that packed once
+       keeps a contrib/ tree in bin/ forever, and the module search starts at
+       AppContext.BaseDirectory, which in a dev run IS that directory. The
+       leftovers then shadow the source tree's contrib/ and (require "x") loads a
+       months-old fasl. The symptom is a missing export, which reads as a bug in
+       the contrib rather than as a stale build output, and running through
+       `dotnet run` does not avoid it: the base directory is the same either way.
+       Same story for a leftover dotcl.core, where the stale payload would be the
+       compiler itself. Delete each copy once its source is gone. -->
+  <Target Name="RemoveOrphanedPayloadCopies" BeforeTargets="BeforeBuild">
+    <Message Importance="high" Text="removing $(OutputPath)contrib: no contrib/ to copy from (stale copies shadow the source tree)"
+             Condition="!Exists('contrib') and Exists('$(OutputPath)contrib')" />
+    <RemoveDir Directories="$(OutputPath)contrib"
+               Condition="!Exists('contrib') and Exists('$(OutputPath)contrib')" />
+    <Message Importance="high" Text="removing $(OutputPath)dotcl.core: no dotcl.core to copy from"
+             Condition="!Exists('dotcl.core') and Exists('$(OutputPath)dotcl.core')" />
+    <Delete Files="$(OutputPath)dotcl.core"
+            Condition="!Exists('dotcl.core') and Exists('$(OutputPath)dotcl.core')" />
+  </Target>
 
   <!-- save-application :executable t hook -->
   <ItemGroup Condition="'$(DotclUserFasl)' != ''">
@@ -174,14 +196,14 @@
   <Target Name="ReplaceFaslsWithR2R"
           AfterTargets="Publish"
           Condition="'$(RuntimeIdentifier)' != ''">
-    <Copy SourceFiles="dotcl-r2r-$(RuntimeIdentifier).core"
+    <Copy SourceFiles="dotcl.core.r2r-$(RuntimeIdentifier)"
           DestinationFiles="$(PublishDir)dotcl.core"
           OverwriteReadOnlyFiles="true"
-          Condition="Exists('dotcl-r2r-$(RuntimeIdentifier).core')" />
-    <Copy SourceFiles="asdf-r2r-$(RuntimeIdentifier).fasl"
+          Condition="Exists('dotcl.core.r2r-$(RuntimeIdentifier)')" />
+    <Copy SourceFiles="asdf.fasl.r2r-$(RuntimeIdentifier)"
           DestinationFiles="$(PublishDir)contrib/asdf/asdf.fasl"
           OverwriteReadOnlyFiles="true"
-          Condition="Exists('asdf-r2r-$(RuntimeIdentifier).fasl')" />
+          Condition="Exists('asdf.fasl.r2r-$(RuntimeIdentifier)')" />
   </Target>
 
 </Project>

@@ -67,6 +67,19 @@ jobs:
       - name: Build
         run: make build
 
+      # Cheap tripwire (~60s): compile the emit-free netstandard2.0 runtime that
+      # AOT/WebGL link against. `make build` only builds the dev net10 runner, so
+      # an ns2.0-only break (unguarded Reflection.Emit / a BCL overload that ns2.0
+      # does not have) would otherwise surface only in a heavy AOT/IL2CPP build.
+      # Both repos, every push.
+      #
+      # Placed here, straight after Build, rather than after the three test
+      # suites: it is a compile, so nothing below can influence it, and leaving it
+      # at minute 21 meant an ns2.0-only break -- which is what it caught last --
+      # took the whole run to report. Now it reports at about minute 2.
+      - name: Build emit-free ns2.0 runtime (tripwire)
+        run: make build-ns2
+
       # The compiler compiled by itself has to reproduce itself. Only this
       # comparison sees a compiler that silently depends on SBCL being the host:
       # a cross-compile flag that never reached the running compiler, and an
@@ -122,14 +135,6 @@ jobs:
       - name: Regression tests (emit-free build)
         run: make test-regression-emitfree
 
-      # Cheap tripwire (~25s): compile the emit-free netstandard2.0 runtime that
-      # AOT/WebGL link against. `make build` only builds the dev net10 runner, so
-      # an ns2.0-only break (unguarded Reflection.Emit / broken DOTCL_NO_JSON)
-      # would otherwise surface only in a heavy AOT/IL2CPP build. Both repos,
-      # every push.
-      - name: Build emit-free ns2.0 runtime (tripwire)
-        run: make build-ns2
-
       # Assert the emitted CIL is VERIFIABLE, not merely JIT-acceptable: CoreCLR
       # tolerates a covariant call or an i4 where an i8 is wanted, IL2CPP/WebGL
       # do not, and a 25-minute AOT build is a terrible place to find out. The
@@ -161,6 +166,7 @@ jobs:
       # somewhere else in the tree instead of the project's own sources. ~2 min.
       # Needs the fasl core, which the target builds if absent.
       - name: Project composition (MSBuild consumers)
+        if: env.RUN_FULL == 'true'
         run: make compile-core-fasl test-project-compose
 
       # The gates below were in the Makefile but in no workflow. That is not a
@@ -187,29 +193,34 @@ jobs:
       # PlatformNotSupportedException. Builds and runs a real C# host in both
       # configurations. ~20s.
       - name: Embedding API (C# host)
+        if: env.RUN_FULL == 'true'
         run: make test-host-api
 
       # Booting from a core held in memory -- the only way in for a host with no
       # filesystem, and the only way in at all for the emit-free runtime. ~25s.
       - name: In-memory core boot
+        if: env.RUN_FULL == 'true'
         run: make test-core-bytes
 
       # dotcl emits a .NET class library that a separate C# project references at
       # COMPILE time (interface implemented on the C# side, delegate invoked).
       # Nothing else here compiles C# against dotcl-emitted metadata. ~70s.
       - name: save-class-library (C# consumes emitted metadata)
+        if: env.RUN_FULL == 'true'
         run: make test-save-class-lib
 
       # DOTCL_EMIT_PDB: the .lisp must appear in the PDB with sequence points and
       # named locals, which is what makes the VS / VS Code debugger show Lisp
       # source and Locals. ~20s.
       - name: Debug info (PDB)
+        if: env.RUN_FULL == 'true'
         run: make test-debug-pdb
 
       # `make pack` builds the nuspec from the project; this asserts the field
       # rules (donor fields dropped when unsupplied, required fields refused
       # rather than inherited) without publishing anything. ~20s.
       - name: Pack nuspec rules
+        if: env.RUN_FULL == 'true'
         run: make test-pack-nuspec
 
       # The other half of the MSBuild story: the step above builds with the legacy
@@ -220,6 +231,7 @@ jobs:
       # the first wall a new user hits, and the remedy is a build property they
       # have no reason to know about. ~90s.
       - name: Project-core MSBuild tasks
+        if: env.RUN_FULL == 'true'
         run: make test-project-core-build
 
       # Fetching ansi-test is its own step so a failure there is reported as

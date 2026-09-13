@@ -881,39 +881,73 @@ public static partial class Runtime
     }
     public static LispObject Gcd(LispObject a, LispObject b) => Arithmetic.Gcd(AsNumber(a), AsNumber(b));
 
-    public static LispObject FloorOp(LispObject a, LispObject b)
+    // FLOOR/TRUNCATE/CEILING/ROUND each come in two entries over one core. The
+    // OP entry returns both values; the OPPRIMARY entry is what the peephole
+    // swaps in when the call site is in single-value position, where the MvReturn
+    // would be built and unwrapped in consecutive instructions.
+    private static (LispObject Q, LispObject R) FloorParts(LispObject a, LispObject b)
     {
         if (a is Fixnum fa && b is Fixnum fb)
         {
             long av = fa.Value, bv = fb.Value;
             long q = Math.DivRem(av, bv, out long r);
             if (r != 0 && ((r ^ bv) < 0)) { q--; r += bv; }
-            return MultipleValues.Values2(Fixnum.Make(q), Fixnum.Make(r));
+            return (Fixnum.Make(q), Fixnum.Make(r));
         }
-        var (qq, rr) = Arithmetic.Floor(AsNumber(a), AsNumber(b));
-        return MultipleValues.Values2(qq, rr);
+        return Arithmetic.Floor(AsNumber(a), AsNumber(b));
     }
-    public static LispObject TruncateOp(LispObject a, LispObject b)
+    public static LispObject FloorOp(LispObject a, LispObject b)
+    {
+        var (q, r) = FloorParts(a, b);
+        return MultipleValues.Values2(q, r);
+    }
+    public static LispObject FloorOpPrimary(LispObject a, LispObject b)
+    {
+        var (q, r) = FloorParts(a, b);
+        return MultipleValues.Values2Primary(q, r);
+    }
+
+    private static (LispObject Q, LispObject R) TruncateParts(LispObject a, LispObject b)
     {
         if (a is Fixnum fa && b is Fixnum fb)
         {
             long av = fa.Value, bv = fb.Value;
             long q = av / bv;
             long r = av - q * bv;
-            return MultipleValues.Values2(Fixnum.Make(q), Fixnum.Make(r));
+            return (Fixnum.Make(q), Fixnum.Make(r));
         }
-        var (qq, rr) = Arithmetic.Truncate(AsNumber(a), AsNumber(b));
-        return MultipleValues.Values2(qq, rr);
+        return Arithmetic.Truncate(AsNumber(a), AsNumber(b));
     }
+    public static LispObject TruncateOp(LispObject a, LispObject b)
+    {
+        var (q, r) = TruncateParts(a, b);
+        return MultipleValues.Values2(q, r);
+    }
+    public static LispObject TruncateOpPrimary(LispObject a, LispObject b)
+    {
+        var (q, r) = TruncateParts(a, b);
+        return MultipleValues.Values2Primary(q, r);
+    }
+
     public static LispObject CeilingOp(LispObject a, LispObject b)
     {
         var (q, r) = Arithmetic.Ceiling(AsNumber(a), AsNumber(b));
         return MultipleValues.Values2(q, r);
     }
+    public static LispObject CeilingOpPrimary(LispObject a, LispObject b)
+    {
+        var (q, r) = Arithmetic.Ceiling(AsNumber(a), AsNumber(b));
+        return MultipleValues.Values2Primary(q, r);
+    }
     public static LispObject RoundOp(LispObject a, LispObject b)
     {
         var (q, r) = Arithmetic.Round(AsNumber(a), AsNumber(b));
         return MultipleValues.Values2(q, r);
+    }
+    public static LispObject RoundOpPrimary(LispObject a, LispObject b)
+    {
+        var (q, r) = Arithmetic.Round(AsNumber(a), AsNumber(b));
+        return MultipleValues.Values2Primary(q, r);
     }
     public static LispObject Lcm(LispObject a, LispObject b) => Arithmetic.Lcm(AsNumber(a), AsNumber(b));
 

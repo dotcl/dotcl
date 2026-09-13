@@ -374,6 +374,16 @@ public static partial class Runtime
 
     private static int FlattenContents(LispObject contents, LispObject[] items, int idx, int rank = 1)
     {
+        if (rank <= 0)
+        {
+            // A zero-dimensional array holds exactly one element, and
+            // :initial-contents IS that element rather than a sequence holding
+            // it (CLHS make-array). Falling through to the leaf case spread the
+            // list instead and stored its first element, so #0A(1 2) built the
+            // array #0A1.
+            if (idx < items.Length) items[idx++] = contents;
+            return idx;
+        }
         if (rank <= 1)
         {
             // Leaf level: iterate sequence, store each element as-is (no recursion into sub-lists)

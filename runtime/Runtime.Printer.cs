@@ -180,6 +180,16 @@ public static partial class Runtime
 
         if (sym.HomePackage == null)
         {
+            // Printing a fasl literal: an uninterned symbol becomes an index into
+            // the file's symbol table rather than a name. #:NAME would read back as
+            // a FRESH symbol every time, which is why the reader route used to
+            // refuse any literal containing one -- and in a Coalton fasl that is
+            // 97% of the emitted IL. The index reads back as the one Symbol the
+            // table holds, so EQ survives both inside one literal and across
+            // literals in the same file, which is what the inline route's static
+            // field bought.
+            if (UninternedSymbolIndexer != null)
+                return $"#{UninternedSymbolIndexer(sym)}U";
             // Per CLHS 22.1.3.3.1: #: prefix only when *print-gensym* is true
             // *print-readably* overrides: always show prefix
             if (GetPrintGensym() || GetPrintReadably())
@@ -195,10 +205,16 @@ public static partial class Runtime
         if (status != SymbolStatus.None && ReferenceEquals(found, sym))
             return escapedName;  // Accessible in current package — no prefix needed
 
-        // Need package prefix
-        string pkgName = SymbolNeedsEscaping(sym.HomePackage.Name)
-            ? EscapeSymbolName(sym.HomePackage.Name)
-            : ApplyPrintCase(sym.HomePackage.Name);
+        // Need package prefix. A local nickname of the home package in the
+        // package being printed FROM wins over the physical name: that is the
+        // name this package can read back, and the reason the nickname was
+        // declared. *PRINT-READABLY* does not change this -- the text stays
+        // readable, in the package it would be read in.
+        string homeName = currentPkg.LocalNicknameFor(sym.HomePackage)
+                          ?? sym.HomePackage.Name;
+        string pkgName = SymbolNeedsEscaping(homeName)
+            ? EscapeSymbolName(homeName)
+            : ApplyPrintCase(homeName);
         var (_, homeStatus) = sym.HomePackage.FindSymbol(sym.Name);
         if (homeStatus == SymbolStatus.External && !ForceInternalSymbolSyntax)
             return $"{pkgName}:{escapedName}";
@@ -217,6 +233,13 @@ public static partial class Runtime
     /// yet. `::` reads either way, so the fasl says what it means rather than what its
     /// author's image happened to know.</summary>
     [ThreadStatic] public static bool ForceInternalSymbolSyntax;
+
+    /// <summary>While set, an uninterned symbol prints as `#<index>U` instead of
+    /// `#:NAME`, the index being what this function assigns it in the fasl's
+    /// uninterned-symbol table. Set only while printing a fasl literal; the
+    /// syntax is read back by ReadConstantFromString, which binds the matching
+    /// table, and by nothing else.</summary>
+    [ThreadStatic] public static Func<Symbol, int>? UninternedSymbolIndexer;
 
     /// <summary>
     /// Check if a symbol name needs escaping for round-trip readability.
@@ -1094,10 +1117,30 @@ public static partial class Runtime
 
     [ThreadStatic] private static bool _inPprintDispatch;
 
+    /// <summary>Objects whose dispatch function is currently running.
+    ///
+    /// A dispatch function prints the parts of its object with WRITE or PRINC, and
+    /// those parts have to reach the table too -- a table with an entry for CONS
+    /// and one for STRING must apply the STRING entry to the strings inside the
+    /// cons. Disabling dispatch for everything printed inside a dispatch function
+    /// (which is what a single in-progress flag did) made every such table print
+    /// its own top level and then fall back to the ordinary printer underneath,
+    /// so strings came out unescaped and nested conses lost their custom syntax.
+    ///
+    /// What must not happen is a function re-entering itself on the SAME object,
+    /// so the guard is per object rather than global.</summary>
+    [ThreadStatic] private static List<LispObject>? _pprintDispatchInProgress;
+
     /// <summary>Try pprint dispatch table. Returns formatted string or null.</summary>
     private static string? TryPprintDispatch(LispObject obj)
     {
-        if (_inPprintDispatch) return null; // prevent recursion
+        if (_inPprintDispatch) return null; // dispatch switched off outright
+        if (_pprintDispatchInProgress != null)
+        {
+            for (int i = 0; i < _pprintDispatchInProgress.Count; i++)
+                if (ReferenceEquals(_pprintDispatchInProgress[i], obj))
+                    return null; // this object's own function is running
+        }
         // Check *print-pretty*
         LispObject prettyVal;
         bool pretty = false;
@@ -1130,7 +1173,7 @@ public static partial class Runtime
         if (best == null) return null;
 
         // Call the dispatch function with a string-output-stream and the object
-        _inPprintDispatch = true;
+        (_pprintDispatchInProgress ??= new List<LispObject>()).Add(obj);
         try
         {
             var sw = new System.IO.StringWriter();
@@ -1145,7 +1188,7 @@ public static partial class Runtime
                 fn.Invoke(new LispObject[] { stream, obj });
             return sw.ToString();
         }
-        finally { _inPprintDispatch = false; }
+        finally { _pprintDispatchInProgress!.RemoveAt(_pprintDispatchInProgress.Count - 1); }
     }
 
     /// <summary>Check if obj matches a type specifier (basic support for EQL and symbol types).</summary>
@@ -1574,6 +1617,14 @@ public static partial class Runtime
             // LispStruct: check for specialized print-object method first
             if (obj is LispStruct st)
             {
+                // Writing a fasl literal: positional syntax, and no print-object
+                // dispatch. A user's method is free to print something that does
+                // not read back, and #S needs the structure class to exist in the
+                // LOADING image to map slot names onto slots -- which is not
+                // guaranteed, while the object itself only ever needed its type
+                // symbol and its slots in order. This is the same escape hatch as
+                // #<n>U: produced only here, read only by ReadConstantFromString.
+                if (FaslStructSyntax) return FormatStructForFasl(st, escape);
                 var poSym = Startup.Sym("PRINT-OBJECT");
                 if (poSym?.Function is GenericFunction gf && HasSpecializedPrintObjectMethod(gf, st)
                     && EnterPrintObject(st))
@@ -1642,6 +1693,24 @@ public static partial class Runtime
                 return true;
         }
         return false;
+    }
+
+    /// <summary>While set, a structure prints as `#K(TYPE slot ...)`: slots in
+    /// their own order, no slot names, no print-object. Set only while printing a
+    /// fasl literal.</summary>
+    [ThreadStatic] public static bool FaslStructSyntax;
+
+    private static string FormatStructForFasl(LispStruct st, bool escape)
+    {
+        var sb = new System.Text.StringBuilder("#K(");
+        sb.Append(FormatObject(st.TypeName, escape));
+        foreach (var slot in st.Slots)
+        {
+            sb.Append(' ');
+            sb.Append(FormatObject(slot, escape));
+        }
+        sb.Append(')');
+        return sb.ToString();
     }
 
     private static string FormatStruct(LispStruct st, bool escape)

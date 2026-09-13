@@ -53,7 +53,6 @@ check-contrib-freshness:
 	if [ -f "$$sil" ]; then \
 	  stale=""; \
 	  for f in $(DOTCL_ROOT)contrib/*/*.fasl; do \
-	    case "$$f" in *-r2r-*) continue;; esac; \
 	    [ -f "$$f" ] || continue; \
 	    [ "$$f" -ot "$$sil" ] && stale="$$stale $$f"; \
 	  done; \
@@ -73,7 +72,6 @@ check-contrib-freshness:
 	if [ -n "$$newest" ]; then \
 	  stale=""; \
 	  for f in $(DOTCL_ROOT)contrib/*/*.fasl $(DOTCL_ROOT)compiler/dotcl.core; do \
-	    case "$$f" in *-r2r-*) continue;; esac; \
 	    [ -f "$$f" ] || continue; \
 	    [ "$$f" -ot "$$newest" ] && stale="$$stale $$f"; \
 	  done; \
@@ -862,6 +860,8 @@ prime-crossgen2:
 runtime_ref = $(shell ls -d $(NUGET_PKG_DIR)/microsoft.netcore.app.runtime.$(1)/*/runtimes/$(1)/lib/net10.0 2>/dev/null | sort -V | tail -1)
 
 # Generate compile-{core,asdf}-fasl-r2r-<rid> targets for each RID.
+# (target names keep the -r2r- infix; the FILES they produce use .r2r-<rid>
+#  after the full name, so that a *.fasl or *.core glob never matches one.)
 define R2R_RULES
 compile-core-fasl-r2r-$(1): compile-core-fasl prime-crossgen2
 	dotnet publish $$(DOTCL_ROOT)runtime/runtime.csproj -c Release -r $(1) --self-contained false -p:PublishReadyToRun=true >/dev/null
@@ -873,7 +873,7 @@ compile-core-fasl-r2r-$(1): compile-core-fasl prime-crossgen2
 	  -r "$$(DOTCL_ROOT)runtime/bin/Release/net10.0/$(1)/publish/runtime.dll" \
 	  -r "$$(DOTCL_ROOT)runtime/bin/Release/net10.0/$(1)/publish/DotCL.Runtime.dll" \
 	  --targetos $(TARGETOS_$(1)) --targetarch $(TARGETARCH_$(1)) -O \
-	  -o $$(DOTCL_ROOT)compiler/dotcl-r2r-$(1).core
+	  -o $$(DOTCL_ROOT)compiler/dotcl.core.r2r-$(1)
 	rm -f $$(DOTCL_ROOT)compiler/dotcl.core.dll
 
 compile-asdf-fasl-r2r-$(1): compile-asdf-fasl compile-core-fasl-r2r-$(1)
@@ -886,7 +886,7 @@ compile-asdf-fasl-r2r-$(1): compile-asdf-fasl compile-core-fasl-r2r-$(1)
 	  -r "$$(DOTCL_ROOT)runtime/bin/Release/net10.0/$(1)/publish/DotCL.Runtime.dll" \
 	  -r "$$(DOTCL_ROOT)compiler/dotcl.core.dll" \
 	  --targetos $(TARGETOS_$(1)) --targetarch $(TARGETARCH_$(1)) -O \
-	  -o $$(DOTCL_ROOT)contrib/asdf/asdf-r2r-$(1).fasl
+	  -o $$(DOTCL_ROOT)contrib/asdf/asdf.fasl.r2r-$(1)
 	rm -f $$(DOTCL_ROOT)contrib/asdf/asdf.fasl.dll $$(DOTCL_ROOT)compiler/dotcl.core.dll
 endef
 
@@ -896,7 +896,7 @@ compile-core-fasl-r2r-all: $(addprefix compile-core-fasl-r2r-,$(R2R_RIDS))
 compile-asdf-fasl-r2r-all: $(addprefix compile-asdf-fasl-r2r-,$(R2R_RIDS))
 
 # R2R-compile each contrib IL fasl per RID with the same crossgen2 pattern as
-# asdf. Produces contrib/<name>/<name>-r2r-<rid>.fasl next to the IL fasl so the
+# asdf. Produces contrib/<name>/<name>.fasl.r2r-<rid> next to the IL fasl so the
 # --target-rid dep resolver (DotclHost.ResolveDeps) probes and prefers it,
 # falling back to the IL fasl when no R2R copy is present. Contrib fasls are
 # compiled against runtime + core only (no cross-contrib assembly refs), so the
@@ -919,7 +919,7 @@ compile-contrib-fasls-r2r-$(1): compile-contrib-fasls compile-quicklisp-fasl com
 		  -r "$$(DOTCL_ROOT)runtime/bin/Release/net10.0/$(1)/publish/DotCL.Runtime.dll" \
 		  -r "$$(DOTCL_ROOT)compiler/dotcl.core.dll" \
 		  --targetos $(TARGETOS_$(1)) --targetarch $(TARGETARCH_$(1)) -O \
-		  -o "$$(DOTCL_ROOT)contrib/$$$$n/$$$$n-r2r-$(1).fasl"; \
+		  -o "$$(DOTCL_ROOT)contrib/$$$$n/$$$$n.fasl.r2r-$(1)"; \
 		rm -f "$$$$fasl.dll"; \
 	done
 	rm -f $$(DOTCL_ROOT)compiler/dotcl.core.dll
@@ -957,7 +957,7 @@ contrib-dotcl-jitdisasm:
 #             PACK_VERSION=0.1.x-dev
 #
 # Keep R2R_RIDS and the RuntimeIdentifiers override in step: the recipe stages one
-# dotcl-r2r-<rid>.core per R2R_RIDS entry. A ;-list cannot be passed here (see the
+# dotcl.core.r2r-<rid> per R2R_RIDS entry. A ;-list cannot be passed here (see the
 # note in runtime/runtime.csproj), so this only expresses a single RID. Such a set
 # is what `dotcl pack --from` consumes.
 PACK_ARGS ?=
@@ -980,8 +980,8 @@ pack: compile-asdf-fasl compile-asdf-fasls compile-quicklisp-fasl compile-core-f
 	rm -rf $(DOTCL_ROOT)runtime/contrib
 	cp $(DOTCL_ROOT)compiler/dotcl.core $(DOTCL_ROOT)runtime/dotcl.core
 	@for rid in $(R2R_RIDS); do \
-		cp $(DOTCL_ROOT)compiler/dotcl-r2r-$$rid.core $(DOTCL_ROOT)runtime/dotcl-r2r-$$rid.core; \
-		cp $(DOTCL_ROOT)contrib/asdf/asdf-r2r-$$rid.fasl $(DOTCL_ROOT)runtime/asdf-r2r-$$rid.fasl; \
+		cp $(DOTCL_ROOT)compiler/dotcl.core.r2r-$$rid $(DOTCL_ROOT)runtime/dotcl.core.r2r-$$rid; \
+		cp $(DOTCL_ROOT)contrib/asdf/asdf.fasl.r2r-$$rid $(DOTCL_ROOT)runtime/asdf.fasl.r2r-$$rid; \
 	done
 	mkdir -p $(DOTCL_ROOT)runtime/contrib/asdf
 	cp -r $(DOTCL_ROOT)contrib/*/ $(DOTCL_ROOT)runtime/contrib/
@@ -991,12 +991,12 @@ pack: compile-asdf-fasl compile-asdf-fasls compile-quicklisp-fasl compile-core-f
 	# (it finds quicklisp.fasl first).
 	rm -f $(DOTCL_ROOT)runtime/contrib/quicklisp/quicklisp.lisp
 	# asdf's R2R copy is overlaid from runtime/ top level (ReplaceFaslsWithR2R
-	# reads asdf-r2r-<rid>.fasl and writes it over contrib/asdf/asdf.fasl), so the
+	# reads asdf.fasl.r2r-<rid> and writes it over contrib/asdf/asdf.fasl), so the
 	# copies sitting under contrib/asdf/ are dead weight in every package. Every
 	# other contrib keeps its per-RID R2R here and the csproj does the filtering:
-	# the contrib/** glob drops all *-r2r-*.fasl and the RID being packed is added
+	# the contrib/** glob drops all *.fasl.r2r-* and the RID being packed is added
 	# back, so a package carries exactly one RID's set instead of all of them.
-	rm -f $(DOTCL_ROOT)runtime/contrib/asdf/asdf-r2r-*.fasl
+	rm -f $(DOTCL_ROOT)runtime/contrib/asdf/asdf.fasl.r2r-*
 	rm -rf $(DOTCL_ROOT)runtime/contrib/dotcl-cs/bin $(DOTCL_ROOT)runtime/contrib/dotcl-cs/obj
 	rm -f $(DOTCL_ROOT)runtime/contrib/dotcl-cs/*.csproj $(DOTCL_ROOT)runtime/contrib/dotcl-cs/*.cs
 	cp $(DOTCL_ROOT)contrib/asdf/asdf.fasl $(DOTCL_ROOT)runtime/contrib/asdf/asdf.fasl
@@ -1007,7 +1007,7 @@ pack: compile-asdf-fasl compile-asdf-fasls compile-quicklisp-fasl compile-core-f
 	dotnet pack $(DOTCL_ROOT)runtime/DotCL.Runtime.csproj --configuration Release -o $(DOTCL_ROOT)out/ $(_PACK_VERSION_ARG)
 	rm -f $(DOTCL_ROOT)runtime/dotcl.core
 	@for rid in $(R2R_RIDS); do \
-		rm -f $(DOTCL_ROOT)runtime/dotcl-r2r-$$rid.core $(DOTCL_ROOT)runtime/asdf-r2r-$$rid.fasl; \
+		rm -f $(DOTCL_ROOT)runtime/dotcl.core.r2r-$$rid $(DOTCL_ROOT)runtime/asdf.fasl.r2r-$$rid; \
 	done
 
 # Install as global dotnet tool from local package

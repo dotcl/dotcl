@@ -1104,12 +1104,26 @@ public static partial class Runtime
         }
     }
 
+    /// <summary>The name a type-name or member-name argument spells.
+    /// A CL string has two runtime representations here -- LispString, and a
+    /// char-backed LispVector for a base-string, one with a fill pointer, or the
+    /// result of SUBSEQ on either -- and interop is reached with both, so neither
+    /// may fall through to ToString and arrive as a printed vector of characters.
+    /// A symbol contributes its name, without the colon a keyword prints with.</summary>
+    internal static string NameArg(LispObject arg) => arg switch
+    {
+        LispString s => s.Value,
+        LispVector v when v.IsCharVector => v.ToCharString(),
+        Symbol sym => sym.Name,
+        _ => arg.ToString() ?? ""
+    };
+
     /// <summary>Resolve a Lisp value naming a .NET type: a type-name string,
     /// a symbol, or an already-wrapped System.Type.</summary>
     internal static Type ResolveElementTypeArg(LispObject arg)
     {
         if (arg is LispDotNetObject dno && dno.Value is Type t) return t;
-        string typeName = arg switch { LispString ls => ls.Value, _ => arg.ToString() ?? "" };
+        string typeName = NameArg(arg);
         return ResolveDotNetType(typeName);
     }
 
@@ -1165,11 +1179,7 @@ public static partial class Runtime
             throw new LispErrorException(new LispProgramError(
                 "DOTNET:LOAD-ASSEMBLY: wrong number of arguments: " + args.Length + " (expected 1)"));
 
-        string path = args[0] switch
-        {
-            LispString ls => ls.Value,
-            _ => args[0].ToString() ?? ""
-        };
+        string path = NameArg(args[0]);
 
         // If no path separators and no .dll extension, treat as assembly name.
         // Try Assembly.Load first (base runtime), then search shared framework dirs
@@ -1252,7 +1262,13 @@ public static partial class Runtime
     /// so the probe does not invalidate itself.</summary>
     internal static void MarkTypeCacheDirty()
     {
-        if (!_inTypeResolve) _typeCacheDirty = true;
+        if (!_inTypeResolve)
+        {
+            _typeCacheDirty = true;
+            // The set of nameable types moved too; TypeNameIndex rebuilds on the
+            // next completion rather than here, so a load stays cheap.
+            _assemblySetEpoch++;
+        }
     }
 
     /// <summary>DOTNET:CLEAR-TYPE-CACHE — drop all memoized resolve-type entries.
@@ -1261,6 +1277,7 @@ public static partial class Runtime
     {
         _typeCache.Clear();
         _probedSinceDirty = false;
+        _assemblySetEpoch++;
     }
 
     /// <summary>Extra directories, besides AppContext.BaseDirectory, that
@@ -1336,6 +1353,7 @@ public static partial class Runtime
         // A name string, a symbol, or an already-resolved System.Type (idempotent, so a
         // composed generic type can be passed back through without special-casing).
         if (args[0] is not LispString && args[0] is not Symbol
+            && !(args[0] is LispVector nv && nv.IsCharVector)
             && !(args[0] is LispDotNetObject dno && dno.Value is Type))
             throw new LispErrorException(new LispTypeError(
                 "DOTNET:RESOLVE-TYPE: type must be a name string, a symbol, or a System.Type", args[0]));
@@ -1577,8 +1595,8 @@ public static partial class Runtime
     public static LispObject DotNetMethodReturnType(LispObject[] args)
     {
         if (args.Length < 2) return Nil.Instance;
-        string? typeName = (args[0] as LispString)?.Value;
-        string? methodName = (args[1] as LispString)?.Value;
+        string? typeName = args[0] is Nil ? null : NameArg(args[0]);
+        string? methodName = args[1] is Nil ? null : NameArg(args[1]);
         if (typeName == null || methodName == null) return Nil.Instance;
 
         var paramTypeNames = new System.Collections.Generic.List<string>();
@@ -1761,6 +1779,44 @@ public static partial class Runtime
     // null value = "this signature is not cacheable; always use InvokeMember".
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<InvokeKey, System.Reflection.MethodInfo?>
         _invokeMethodCache = new();
+
+    // (type, method name, argument count) -> "every overload with that shape
+    // returns void". Used only by the reflective entry points: the compiled typed
+    // path resolves the exact overload and answers from its MethodInfo instead
+    // (see EmitDotnetResultMarshal). Keyed without argument TYPES because the
+    // InvokeMember path never reveals which overload its binder chose, and that
+    // path is taken for things as ordinary as passing NIL -- keyed on types, the
+    // same call would answer differently depending on which path ran. Measured
+    // over the core BCL that costs almost nothing: of 38,700 method names, 28 mix
+    // void and non-void overloads, and only Monitor.TryEnter/2 and
+    // SemaphoreSlim.Wait/1 stay mixed once the argument count is taken into
+    // account. Those two keep returning a value.
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<(Type, string, int), bool>
+        _voidReturnCache = new();
+
+    private static bool IsVoidReturningCall(Type type, string name, int argCount)
+    {
+        return _voidReturnCache.GetOrAdd((type, name, argCount), key =>
+        {
+            bool sawAny = false;
+            System.Reflection.MethodInfo[] ms;
+            try
+            {
+                ms = key.Item1.GetMethods(System.Reflection.BindingFlags.Public
+                                          | System.Reflection.BindingFlags.Static
+                                          | System.Reflection.BindingFlags.Instance);
+            }
+            catch { return false; }
+            foreach (var m in ms)
+            {
+                if (m.Name != key.Item2 || m.IsGenericMethodDefinition) continue;
+                if (m.GetParameters().Length != key.Item3) continue;
+                if (m.ReturnType != typeof(void)) return false;
+                sawAny = true;
+            }
+            return sawAny;
+        });
+    }
 
     /// <summary>Fast path for dotnet:invoke / dotnet:static plain method calls:
     /// resolve the MethodInfo once (cached) then invoke it directly, skipping
@@ -2075,14 +2131,29 @@ public static partial class Runtime
     /// <summary>(dotnet:static "Type" "Member" &rest args)
     /// Read-side entry point for static methods, properties, and fields.
     /// Type.InvokeMember dispatches based on member kind + arg count.</summary>
+    /// <summary>DOTNET:STATIC. A void call produces no values; see DotNetInvoke.</summary>
     public static LispObject DotNetStatic(LispObject[] args)
+    {
+        var value = DotNetStaticImpl(args);
+        try
+        {
+            if (args.Length >= 2
+                && IsVoidReturningCall(ResolveDotNetType(NameArg(args[0])),
+                                       NameArg(args[1]), args.Length - 2))
+                return MultipleValues.Values0();
+        }
+        catch (Exception) { }
+        return MultipleValues.Primary(value);
+    }
+
+    private static LispObject DotNetStaticImpl(LispObject[] args)
     {
         if (args.Length < 2)
             throw new LispErrorException(new LispProgramError(
                 "DOTNET:STATIC: requires at least 2 arguments (type-name member-name &rest args)"));
 
-        string typeName = args[0] switch { LispString ls => ls.Value, _ => args[0].ToString() ?? "" };
-        string memberName = args[1] switch { LispString ls => ls.Value, _ => args[1].ToString() ?? "" };
+        string typeName = NameArg(args[0]);
+        string memberName = NameArg(args[1]);
         var type = ResolveDotNetType(typeName);
         var callArgs = LispArgsToDotNetGeneric(args.Skip(2).ToArray());
 
@@ -2141,8 +2212,8 @@ public static partial class Runtime
             throw new LispErrorException(new LispProgramError(
                 "DOTNET:%SET-STATIC: requires at least 3 arguments (type-name member-name [indexers...] value)"));
 
-        string typeName = args[0] switch { LispString ls => ls.Value, _ => args[0].ToString() ?? "" };
-        string memberName = args[1] switch { LispString ls => ls.Value, _ => args[1].ToString() ?? "" };
+        string typeName = NameArg(args[0]);
+        string memberName = NameArg(args[1]);
         var type = ResolveDotNetType(typeName);
         var callArgs = LispArgsToDotNetGeneric(args.Skip(2).ToArray());
 
@@ -2183,7 +2254,31 @@ public static partial class Runtime
                 "Stack overflow in dotnet:invoke"));
     }
 
+    /// <summary>
+    /// DOTNET:INVOKE. A method that returns void produces no values, matching what
+    /// the compiled typed path emits (EmitDotnetResultMarshal). Reflection reports
+    /// a void return and a null return identically, so the answer comes from the
+    /// signature rather than from the result.
+    ///
+    /// The single value is republished on the way out because an ARGUMENT of this
+    /// call may itself have been a void call: the count is thread state, so the
+    /// zero published there would otherwise still be standing.
+    /// </summary>
     public static LispObject DotNetInvoke(LispObject[] args)
+    {
+        var value = DotNetInvokeImpl(args);
+        try
+        {
+            var target = InvocationReceiver(args[0]);
+            if (target != null
+                && IsVoidReturningCall(target.GetType(), NameArg(args[1]), args.Length - 2))
+                return MultipleValues.Values0();
+        }
+        catch (Exception) { }
+        return MultipleValues.Primary(value);
+    }
+
+    private static LispObject DotNetInvokeImpl(LispObject[] args)
     {
         InteropStackCheck();
         if (args.Length < 2)
@@ -2196,7 +2291,7 @@ public static partial class Runtime
                 "DOTNET:INVOKE: first argument must be a .NET object, string, character or number",
                 args[0]));
 
-        string memberName = args[1] switch { LispString ls => ls.Value, _ => args[1].ToString() ?? "" };
+        string memberName = NameArg(args[1]);
         var type = target.GetType();
         var callArgs = LispArgsToDotNetGeneric(args.Skip(2).ToArray());
 
@@ -2621,7 +2716,7 @@ public static partial class Runtime
                 "DOTNET:%SET-INVOKE: first argument must be a .NET object", args[0]));
 
         var target = dno.Value;
-        string memberName = args[1] switch { LispString ls => ls.Value, _ => args[1].ToString() ?? "" };
+        string memberName = NameArg(args[1]);
         var type = target.GetType();
         var callArgs = LispArgsToDotNetGeneric(args.Skip(2).ToArray());
 
@@ -2703,7 +2798,17 @@ public static partial class Runtime
         return false;
     }
 
+    /// <summary>
+    /// DOTNET:NEW. The constructor body is Lisp and may end in a void interop call,
+    /// which publishes zero values; the instance is one value, so say so. Without
+    /// this, (dotnet:invoke (dotnet:new C) "get_N") returned no values at all.
+    /// </summary>
     public static LispObject DotNetNew(LispObject[] args)
+    {
+        return MultipleValues.Primary(DotNetNewImpl(args));
+    }
+
+    private static LispObject DotNetNewImpl(LispObject[] args)
     {
         if (args.Length < 1)
             throw new LispErrorException(new LispProgramError(
@@ -2716,7 +2821,7 @@ public static partial class Runtime
             type = resolvedType;
         else
         {
-            string typeName = args[0] switch { LispString ls => ls.Value, _ => args[0].ToString() ?? "" };
+            string typeName = NameArg(args[0]);
             type = ResolveDotNetType(typeName);
         }
 
@@ -2844,20 +2949,12 @@ public static partial class Runtime
     /// </summary>
     private static ParsedClassSpec ParseClassSpec(LispObject[] a)
     {
-        string fullName = a[0] switch
-        {
-            LispString ls => ls.Value,
-            _ => a[0].ToString() ?? ""
-        };
+        string fullName = NameArg(a[0]);
 
         Type? baseType = null;
         if (a.Length >= 2 && a[1] != Nil.Instance)
         {
-            string baseName = a[1] switch
-            {
-                LispString ls => ls.Value,
-                _ => a[1].ToString() ?? ""
-            };
+            string baseName = NameArg(a[1]);
             baseType = ResolveDotNetType(baseName);
         }
 
@@ -2875,16 +2972,8 @@ public static partial class Runtime
                 var nameObj = spec.Car;
                 var typeObj = spec.Cdr is Cons c2 ? c2.Car : Nil.Instance;
 
-                string fname = nameObj switch
-                {
-                    LispString ls => ls.Value,
-                    _ => nameObj.ToString() ?? ""
-                };
-                string tname = typeObj switch
-                {
-                    LispString ls => ls.Value,
-                    _ => typeObj.ToString() ?? ""
-                };
+                string fname = NameArg(nameObj);
+                string tname = NameArg(typeObj);
                 fields.Add((fname, ResolveDotNetType(tname)));
                 cur = c.Cdr;
             }
@@ -2902,11 +2991,7 @@ public static partial class Runtime
                         "DOTNET:%DEFINE-CLASS: each attr spec must be a (type-name ctor-args...) list",
                         c.Car));
                 var typeObj = spec.Car;
-                string tname = typeObj switch
-                {
-                    LispString ls => ls.Value,
-                    _ => typeObj.ToString() ?? ""
-                };
+                string tname = NameArg(typeObj);
                 var attrType = ResolveDotNetType(tname);
 
                 // Collect ctor args (rest of spec).
@@ -2961,16 +3046,8 @@ public static partial class Runtime
                         "DOTNET:%DEFINE-CLASS: method spec missing lambda"));
                 var lambdaObj = r3.Car;
 
-                string mname = nameObj switch
-                {
-                    LispString ls => ls.Value,
-                    _ => nameObj.ToString() ?? ""
-                };
-                string rname = retObj switch
-                {
-                    LispString ls => ls.Value,
-                    _ => retObj.ToString() ?? ""
-                };
+                string mname = NameArg(nameObj);
+                string rname = NameArg(retObj);
                 Type rtype = rname == "System.Void" ? typeof(void) : ResolveDotNetType(rname);
 
                 var paramTypes = new List<Type>();
@@ -2978,11 +3055,7 @@ public static partial class Runtime
                 while (pcur is Cons pc)
                 {
                     var ptObj = pc.Car;
-                    string ptname = ptObj switch
-                    {
-                        LispString ls => ls.Value,
-                        _ => ptObj.ToString() ?? ""
-                    };
+                    string ptname = NameArg(ptObj);
                     paramTypes.Add(ResolveDotNetType(ptname));
                     pcur = pc.Cdr;
                 }
@@ -3045,11 +3118,7 @@ public static partial class Runtime
                                 "DOTNET:%DEFINE-CLASS: each method attr spec must be a (type-name ctor-args...) list",
                                 ac.Car));
                         var atypeObj = aspec.Car;
-                        string atname = atypeObj switch
-                        {
-                            LispString ls => ls.Value,
-                            _ => atypeObj.ToString() ?? ""
-                        };
+                        string atname = NameArg(atypeObj);
                         var attrType = ResolveDotNetType(atname);
 
                         var actorArgs = new List<LispObject>();
@@ -3106,16 +3175,8 @@ public static partial class Runtime
                 var notifyObj = (rest is Cons c2a && c2a.Cdr is Cons c3)
                     ? c3.Car : Nil.Instance;
 
-                string pname = nameObj switch
-                {
-                    LispString ls => ls.Value,
-                    _ => nameObj.ToString() ?? ""
-                };
-                string tname = typeObj switch
-                {
-                    LispString ls => ls.Value,
-                    _ => typeObj.ToString() ?? ""
-                };
+                string pname = NameArg(nameObj);
+                string tname = NameArg(typeObj);
                 bool notify = notifyObj != Nil.Instance;
                 propertySpecs.Add((pname, ResolveDotNetType(tname), notify));
                 cur = c.Cdr;
@@ -3130,11 +3191,7 @@ public static partial class Runtime
             while (cur is Cons c)
             {
                 var entry = c.Car;
-                string tname = entry switch
-                {
-                    LispString ls => ls.Value,
-                    _ => entry.ToString() ?? ""
-                };
+                string tname = NameArg(entry);
                 interfaceSpecs.Add(ResolveDotNetType(tname));
                 cur = c.Cdr;
             }
@@ -3154,16 +3211,8 @@ public static partial class Runtime
                 var nameObj = spec.Car;
                 var typeObj = spec.Cdr is Cons c2 ? c2.Car : Nil.Instance;
 
-                string ename = nameObj switch
-                {
-                    LispString ls => ls.Value,
-                    _ => nameObj.ToString() ?? ""
-                };
-                string tname = typeObj switch
-                {
-                    LispString ls => ls.Value,
-                    _ => typeObj.ToString() ?? ""
-                };
+                string ename = NameArg(nameObj);
+                string tname = NameArg(typeObj);
                 eventSpecs.Add((ename, ResolveDotNetType(tname)));
                 cur = c.Cdr;
             }
@@ -3176,11 +3225,7 @@ public static partial class Runtime
             var cur = a[9];
             while (cur is Cons c)
             {
-                string tname = c.Car switch
-                {
-                    LispString ls => ls.Value,
-                    _ => c.Car.ToString() ?? ""
-                };
+                string tname = NameArg(c.Car);
                 userCtorParamTypes.Add(ResolveDotNetType(tname));
                 cur = c.Cdr;
             }
@@ -3230,11 +3275,7 @@ public static partial class Runtime
                 var pcur = paramTypesObj;
                 while (pcur is Cons pc)
                 {
-                    string ptname = pc.Car switch
-                    {
-                        LispString ls => ls.Value,
-                        _ => pc.Car.ToString() ?? ""
-                    };
+                    string ptname = NameArg(pc.Car);
                     paramTypes.Add(ResolveDotNetType(ptname));
                     pcur = pc.Cdr;
                 }
@@ -3318,11 +3359,7 @@ public static partial class Runtime
         string? saveToPath = null;
         if (args.Length >= 13 && args[12] != Nil.Instance)
         {
-            saveToPath = args[12] switch
-            {
-                LispString ls => ls.Value,
-                _ => args[12].ToString() ?? ""
-            };
+            saveToPath = NameArg(args[12]);
         }
 
         try
@@ -3392,12 +3429,7 @@ public static partial class Runtime
             throw new LispErrorException(new LispProgramError(
                 "DOTNET:%SAVE-LIBRARY: requires 4 arguments (save-path assembly-name version member-spec-list)"));
 
-        static string Str(LispObject o) => o switch
-        {
-            LispString ls => ls.Value,
-            Symbol sy => sy.Name,
-            _ => o.ToString() ?? ""
-        };
+        static string Str(LispObject o) => NameArg(o);
 
         string savePath = Str(args[0]);
         string asmName = Str(args[1]);
@@ -3640,7 +3672,7 @@ public static partial class Runtime
         var baseType  = selfType.BaseType
             ?? throw new LispErrorException(new LispError(
                 $"DOTNET:CALL-BASE: {selfType.FullName} has no base type"));
-        string methodName = args[1] switch { LispString ls => ls.Value, _ => args[1].ToString() ?? "" };
+        string methodName = NameArg(args[1]);
         var callArgs  = LispArgsToDotNetGeneric(args.Skip(2).ToArray());
 
         // Find best-matching method on base type by name + arg count.
@@ -3689,7 +3721,7 @@ public static partial class Runtime
             throw new LispErrorException(new LispProgramError(
                 "DOTNET:BOX: requires 2 arguments (value type-name)"));
 
-        string typeName = args[1] switch { LispString ls => ls.Value, _ => args[1].ToString() ?? "" };
+        string typeName = NameArg(args[1]);
         var type = ResolveDotNetType(typeName);
         var converted = LispToDotNet(args[0], type);
         return new LispDotNetBoxed(converted!, type);
@@ -3771,7 +3803,7 @@ public static partial class Runtime
         }
         else
         {
-            openName = args[0] switch { LispString ls => ls.Value, Symbol sym => sym.Name, _ => args[0].ToString() ?? "" };
+            openName = NameArg(args[0]);
             openType = TryResolveDotNetType(openName);
             if ((openType == null || !openType.IsGenericTypeDefinition) && !openName.Contains('`'))
                 openType = TryResolveDotNetType($"{openName}`{typeArgForms.Count}");
@@ -3821,12 +3853,7 @@ public static partial class Runtime
                 case LispDotNetObject dno when dno.Value.GetType() == type:
                     acc |= Convert.ToInt64(dno.Value); break;
                 default:
-                    string name = args[i] switch
-                    {
-                        LispString ls => ls.Value,
-                        Symbol sym    => sym.Name,
-                        _             => args[i].ToString() ?? ""
-                    };
+                    string name = NameArg(args[i]);
                     object parsed;
                     try { parsed = Enum.Parse(type, name, ignoreCase: true); }
                     catch (Exception e)
@@ -3972,12 +3999,7 @@ public static partial class Runtime
             delegateType = t0;
         else
         {
-            string typeName = args[0] switch
-            {
-                LispString ls => ls.Value,
-                Symbol s      => s.Name,
-                _             => args[0].ToString() ?? ""
-            };
+            string typeName = NameArg(args[0]);
             delegateType = ResolveDotNetType(typeName)
                 ?? throw new LispErrorException(new LispProgramError(
                     $"DOTNET:MAKE-DELEGATE: cannot resolve type '{typeName}'"));
@@ -4163,7 +4185,7 @@ public static partial class Runtime
             throw new LispErrorException(new LispProgramError(
                 "DOTNET:CALL-OUT: requires type-or-obj method-name &rest in-args"));
 
-        string memberName = args[1] switch { LispString ls => ls.Value, _ => args[1].ToString() ?? "" };
+        string memberName = NameArg(args[1]);
         var lispInArgs   = args.Skip(2).ToArray();
 
         System.Reflection.MethodInfo method;
@@ -4184,7 +4206,7 @@ public static partial class Runtime
         else
         {
             // Static call
-            string typeName = args[0] switch { LispString ls => ls.Value, _ => args[0].ToString() ?? "" };
+            string typeName = NameArg(args[0]);
             type   = ResolveDotNetType(typeName);
             target = null;
             method = FindOutMethod(type, memberName, lispInArgs.Length,
@@ -4263,14 +4285,14 @@ public static partial class Runtime
             throw new LispErrorException(new LispProgramError(
                 "DOTNET:CALL-OUT-GENERIC: requires type-or-obj method-name type-args-list &rest in-args"));
 
-        string memberName = args[1] switch { LispString ls => ls.Value, _ => args[1].ToString() ?? "" };
+        string memberName = NameArg(args[1]);
 
         // Parse type-args list (a Lisp list of type-name strings).
         var typeArgNames = new System.Collections.Generic.List<string>();
         var cursor = args[2];
         while (cursor is Cons c)
         {
-            typeArgNames.Add(c.Car switch { LispString ls => ls.Value, _ => c.Car.ToString() ?? "" });
+            typeArgNames.Add(NameArg(c.Car));
             cursor = c.Cdr;
         }
 
@@ -4287,7 +4309,7 @@ public static partial class Runtime
         }
         else
         {
-            string typeName = args[0] switch { LispString ls => ls.Value, _ => args[0].ToString() ?? "" };
+            string typeName = NameArg(args[0]);
             type   = ResolveDotNetType(typeName);
             target = null;
             flags  = System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static;
@@ -4373,7 +4395,7 @@ public static partial class Runtime
 
         // The declaring type and each type arg may be a name string/symbol or an
         // already-resolved System.Type (e.g. from dotnet:make-generic-type).
-        string memberName = args[1] switch { LispString ls => ls.Value, _ => args[1].ToString() ?? "" };
+        string memberName = NameArg(args[1]);
         var    type       = ResolveElementTypeArg(args[0]);
         string typeName   = type.FullName ?? type.Name;
         var    lispArgs   = args.Skip(3).ToArray();
@@ -4435,7 +4457,7 @@ public static partial class Runtime
                 args[0]));
 
         var    type       = target.GetType();
-        string memberName = args[1] switch { LispString ls => ls.Value, _ => args[1].ToString() ?? "" };
+        string memberName = NameArg(args[1]);
         var    lispArgs   = args.Skip(3).ToArray();
 
         // Parse type-args list
@@ -4443,7 +4465,7 @@ public static partial class Runtime
         var cursor = args[2];
         while (cursor is Cons c)
         {
-            typeArgNames.Add(c.Car switch { LispString ls => ls.Value, _ => c.Car.ToString() ?? "" });
+            typeArgNames.Add(NameArg(c.Car));
             cursor = c.Cdr;
         }
 
@@ -4482,4 +4504,445 @@ public static partial class Runtime
             throw DotNetInvokeError($"DOTNET:INVOKE-GENERIC {type.Name}.{memberName}", tie);
         }
     }
+
+    // ---- Member discovery ------------------------------------------------
+    //
+    // The interop surface spells .NET members as strings, so nothing in the
+    // image tells a reader what may be called on a value: the name, its
+    // casing, the overloads and the optional parameters all have to be known
+    // in advance. Reflection knows all of it already, so expose it as data
+    // that a person at the REPL -- or an editor asking on their behalf -- can
+    // read.
+
+    private static string MemberTypeName(Type t)
+        => t.IsGenericType
+           ? t.Name.Split('`')[0] + "<" + string.Join(", ", t.GetGenericArguments().Select(MemberTypeName)) + ">"
+           : t.Name;
+
+    private static string MemberParams(System.Reflection.ParameterInfo[] ps)
+        => "(" + string.Join(", ", ps.Select(p =>
+               MemberTypeName(p.ParameterType) + (p.IsOptional ? "?" : ""))) + ")";
+
+    private static string MemberSignature(System.Reflection.MemberInfo m) => m switch
+    {
+        System.Reflection.MethodInfo mi =>
+            MemberParams(mi.GetParameters()) + " => " + MemberTypeName(mi.ReturnType),
+        System.Reflection.ConstructorInfo ci => MemberParams(ci.GetParameters()),
+        System.Reflection.PropertyInfo pi => MemberTypeName(pi.PropertyType),
+        System.Reflection.FieldInfo fi => MemberTypeName(fi.FieldType),
+        System.Reflection.EventInfo ei => MemberTypeName(ei.EventHandlerType ?? typeof(object)),
+        _ => ""
+    };
+
+    private static string MemberKind(System.Reflection.MemberInfo m) => m switch
+    {
+        System.Reflection.ConstructorInfo => "CONSTRUCTOR",
+        System.Reflection.MethodInfo => "METHOD",
+        System.Reflection.PropertyInfo => "PROPERTY",
+        System.Reflection.FieldInfo => "FIELD",
+        System.Reflection.EventInfo => "EVENT",
+        _ => "MEMBER"
+    };
+
+    private static bool MemberIsStatic(System.Reflection.MemberInfo m) => m switch
+    {
+        System.Reflection.MethodBase mb => mb.IsStatic,
+        System.Reflection.FieldInfo fi => fi.IsStatic,
+        System.Reflection.PropertyInfo pi => (pi.GetMethod ?? pi.SetMethod)?.IsStatic ?? false,
+        System.Reflection.EventInfo ei => (ei.AddMethod ?? ei.RemoveMethod)?.IsStatic ?? false,
+        _ => false
+    };
+
+    /// <summary>
+    /// Extension methods that apply to TYPE, gathered from the static classes of
+    /// every loaded assembly. They matter more here than in C#: the ASP.NET and
+    /// LINQ surfaces are largely extension methods, and dotnet:invoke reaches
+    /// them by name, so a listing that omitted them would omit the calls people
+    /// actually write.
+    /// </summary>
+    private static IEnumerable<System.Reflection.MethodInfo> ExtensionMethodsFor(Type type)
+    {
+        foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+        {
+            Type[] types;
+            try { types = asm.GetTypes(); }
+            catch (System.Reflection.ReflectionTypeLoadException e)
+            { types = e.Types.Where(t => t != null).ToArray()!; }
+            catch { continue; }
+
+            foreach (var host in types)
+            {
+                if (host == null || !host.IsSealed || !host.IsAbstract || host.IsGenericType) continue;
+                if (!host.IsDefined(typeof(System.Runtime.CompilerServices.ExtensionAttribute), false)) continue;
+                System.Reflection.MethodInfo[] methods;
+                try
+                {
+                    methods = host.GetMethods(System.Reflection.BindingFlags.Public
+                                              | System.Reflection.BindingFlags.Static);
+                }
+                catch { continue; }
+                foreach (var mi in methods)
+                {
+                    if (!mi.IsDefined(typeof(System.Runtime.CompilerServices.ExtensionAttribute), false)) continue;
+                    var ps = mi.GetParameters();
+                    if (ps.Length == 0) continue;
+                    var recv = ps[0].ParameterType;
+                    bool applies;
+                    try { applies = recv.IsAssignableFrom(type); }
+                    catch { applies = false; }
+                    // A generic receiver (IEnumerable<T> and friends) never answers
+                    // IsAssignableFrom for a closed type, so match the definition.
+                    if (!applies && recv.IsGenericType)
+                    {
+                        var def = recv.GetGenericTypeDefinition();
+                        applies = type.GetInterfaces().Append(type).Any(
+                            i => i.IsGenericType && i.GetGenericTypeDefinition() == def);
+                    }
+                    if (applies) yield return mi;
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// <lispdoc>(dotnet:members type-or-object &amp;key kind prefix static inherited extensions) -- List the .NET members reachable on a type, or on the runtime type of an object, as a list of plists (:name :kind :static :signature :declaring-type). KIND keeps one of :method :property :field :event :constructor; PREFIX keeps names starting with a string (case-insensitive); STATIC is :both (default), :static or :instance; INHERITED defaults to T; EXTENSIONS defaults to T and adds the extension methods that apply to the type. Property accessors are listed under their real names (get_Item, set_Width) because those are the names dotnet:invoke takes.</lispdoc>
+    /// </summary>
+    [LispDoc("DOTNET:MEMBERS")]
+    public static LispObject DotNetMembers(LispObject[] args)
+    {
+        if (args.Length < 1)
+            throw new LispErrorException(new LispProgramError(
+                "DOTNET:MEMBERS: requires at least 1 argument (type or object)"));
+
+        Type type = args[0] is LispDotNetObject dno
+            ? (dno.Value is Type asType ? asType : dno.Type)
+            : ResolveElementTypeArg(args[0]);
+
+        string? kind = null, prefix = null, statics = "BOTH";
+        bool inherited = true, extensions = true, documentation = false;
+        for (int i = 1; i + 1 < args.Length; i += 2)
+        {
+            if (args[i] is not Symbol kw) continue;
+            var v = args[i + 1];
+            switch (kw.Name)
+            {
+                // String designators throughout: a keyword argument may arrive as
+                // a symbol, a simple string, or a string with a fill pointer --
+                // the last is what SUBSEQ of an adjustable string hands back, and
+                // matching only LispString silently dropped the filter, so every
+                // member came back as if no prefix had been given.
+                case "KIND":
+                    kind = v == Nil.Instance ? null : ToStringDesignator(v, "DOTNET:MEMBERS");
+                    break;
+                case "PREFIX":
+                    prefix = v == Nil.Instance ? null : ToStringDesignator(v, "DOTNET:MEMBERS");
+                    break;
+                case "STATIC":
+                    statics = v == Nil.Instance ? "BOTH" : ToStringDesignator(v, "DOTNET:MEMBERS");
+                    break;
+                case "INHERITED": inherited = v != Nil.Instance; break;
+                case "EXTENSIONS": extensions = v != Nil.Instance; break;
+                case "DOCUMENTATION": documentation = v != Nil.Instance; break;
+            }
+        }
+
+        var flags = System.Reflection.BindingFlags.Public;
+        if (statics != "INSTANCE") flags |= System.Reflection.BindingFlags.Static;
+        if (statics != "STATIC") flags |= System.Reflection.BindingFlags.Instance;
+        if (!inherited) flags |= System.Reflection.BindingFlags.DeclaredOnly;
+
+        var rows = new List<(string Name, string Kind, bool Static, string Sig, string Owner)>();
+        foreach (var m in type.GetMembers(flags))
+        {
+            var k = MemberKind(m);
+            if (k == "MEMBER") continue;
+            rows.Add((m.Name, k, MemberIsStatic(m), MemberSignature(m),
+                      m.DeclaringType?.FullName ?? type.FullName ?? ""));
+        }
+
+        // An extension method is called instance-style through dotnet:invoke, so
+        // it is reported as an instance member with the receiver dropped from the
+        // printed parameter list -- otherwise the signature would not match the
+        // call the reader is about to write.
+        if (extensions && statics != "STATIC")
+            foreach (var mi in ExtensionMethodsFor(type))
+                rows.Add((mi.Name, "METHOD", false,
+                          MemberParams(mi.GetParameters().Skip(1).ToArray())
+                              + " => " + MemberTypeName(mi.ReturnType),
+                          mi.DeclaringType?.FullName ?? ""));
+
+        IEnumerable<(string Name, string Kind, bool Static, string Sig, string Owner)> result = rows;
+        if (kind != null)
+            result = result.Where(r => string.Equals(r.Kind, kind, StringComparison.OrdinalIgnoreCase));
+        if (!string.IsNullOrEmpty(prefix))
+            result = result.Where(r => r.Name.StartsWith(prefix!, StringComparison.OrdinalIgnoreCase));
+
+        LispObject list = Nil.Instance;
+        foreach (var r in result
+                     .GroupBy(r => r.Name + "|" + r.Sig).Select(g => g.First())
+                     .OrderBy(r => r.Name, StringComparer.Ordinal)
+                     .ThenBy(r => r.Sig, StringComparer.Ordinal)
+                     .Reverse()
+                     .ToList())
+        {
+            var plist = Runtime.List(
+                Startup.Keyword("NAME"), new LispString(r.Name),
+                Startup.Keyword("KIND"), Startup.Keyword(r.Kind),
+                Startup.Keyword("STATIC"), r.Static ? T.Instance : Nil.Instance,
+                Startup.Keyword("SIGNATURE"), new LispString(r.Sig),
+                Startup.Keyword("DECLARING-TYPE"), new LispString(r.Owner));
+            // The sentence the framework ships for this member, when it has been
+            // asked for and the file it is in has already been read.
+            var summary = documentation ? SummaryFor(type, r.Name) : null;
+            if (summary != null)
+                plist = new Cons(Startup.Keyword("DOCUMENTATION"),
+                                 new Cons(new LispString(summary), plist));
+            list = new Cons(plist, list);
+        }
+        return list;
+    }
+
+
+    // ---- Type-name index -------------------------------------------------
+    //
+    // Completing (dotnet:new "System.Text.Str asks a different question from
+    // completing a member: there is no receiver to resolve, only the set of
+    // types this image can name. That set changes when an assembly loads, which
+    // is the same event the resolve-type cache already watches, so the index
+    // rides on the same epoch instead of inventing a second notion of staleness.
+
+    private static volatile int _assemblySetEpoch;
+    private static string[]? _typeNameIndex;
+    private static int _typeNameIndexEpoch = -1;
+    private static readonly object _typeNameIndexLock = new();
+
+    /// <summary>Public type names across loaded assemblies, sorted for prefix search.
+    /// Generic arity suffixes are dropped: (dotnet:make-generic-type "…List" …) is
+    /// how a generic is named here, so List`1 would be a name nobody types.</summary>
+    private static string[] TypeNameIndex()
+    {
+        var epoch = _assemblySetEpoch;
+        var index = _typeNameIndex;
+        if (index != null && _typeNameIndexEpoch == epoch) return index;
+
+        lock (_typeNameIndexLock)
+        {
+            if (_typeNameIndex != null && _typeNameIndexEpoch == epoch) return _typeNameIndex;
+
+            var names = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var assembly in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                Type[] types;
+                try { types = assembly.GetExportedTypes(); }
+                catch (System.Reflection.ReflectionTypeLoadException e)
+                { types = e.Types.Where(t => t != null).ToArray()!; }
+                catch { continue; }
+
+                foreach (var type in types)
+                {
+                    var full = type?.FullName;
+                    if (full == null) continue;
+                    int tick = full.IndexOf('`');
+                    names.Add(tick >= 0 ? full.Substring(0, tick) : full);
+                }
+            }
+            var sorted = names.ToArray();
+            Array.Sort(sorted, StringComparer.OrdinalIgnoreCase);
+            _typeNameIndex = sorted;
+            _typeNameIndexEpoch = epoch;
+            return sorted;
+        }
+    }
+
+    /// <summary>Index of the first entry not ordered before PREFIX.</summary>
+    private static int LowerBound(string[] sorted, string prefix)
+    {
+        int low = 0, high = sorted.Length;
+        while (low < high)
+        {
+            int mid = (low + high) / 2;
+            if (StringComparer.OrdinalIgnoreCase.Compare(sorted[mid], prefix) < 0) low = mid + 1;
+            else high = mid;
+        }
+        return low;
+    }
+
+    /// <summary>
+    /// <lispdoc>(dotnet:type-names prefix &amp;key limit) -- The type names starting with PREFIX, as a list of plists (:name :kind). KIND is :class for a type and :namespace for a name that only leads to more names: completing "System.Te" answers with the namespace "System.Text." as well as the types directly under it, the way a namespace is stepped into one segment at a time. LIMIT caps the result (default 200). The set is indexed once per change to the loaded assemblies, so a package resolved with nuget:require shows up without restarting.</lispdoc>
+    /// </summary>
+    [LispDoc("DOTNET:TYPE-NAMES")]
+    public static LispObject DotNetTypeNames(LispObject[] args)
+    {
+        string prefix = (args.Length >= 1 && args[0] is not Nil)
+            ? ToStringDesignator(args[0], "DOTNET:TYPE-NAMES") : "";
+        int limit = 200;
+        for (int i = 1; i + 1 < args.Length; i += 2)
+            if (args[i] is Symbol kw && kw.Name == "LIMIT" && args[i + 1] is Fixnum lf)
+                limit = (int)lf.Value;
+
+        // Loaded assemblies answer at once; the metadata scan of what is merely
+        // available lands later, and until it does the caller is told the list
+        // is partial.
+        StartMetadataScan(_assemblySetEpoch);
+        var namespaces = new List<string>();
+        var seenNamespaces = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var seenTypes = new HashSet<string>(StringComparer.Ordinal);
+        var types = new List<string>();
+
+        foreach (var sorted in new[] { TypeNameIndex(), _metadataTypeNames })
+        {
+            if (sorted == null) continue;
+            for (int i = LowerBound(sorted, prefix); i < sorted.Length; i++)
+            {
+                var name = sorted[i];
+                if (!name.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) break;
+                var rest = name.Substring(prefix.Length);
+                int dot = rest.IndexOf('.');
+                if (dot >= 0)
+                {
+                    // A name that continues past a dot contributes the namespace
+                    // it leads into, not itself: one step at a time, or "System."
+                    // alone would answer with every type in the framework.
+                    var space = name.Substring(0, prefix.Length + dot + 1);
+                    if (seenNamespaces.Add(space)) namespaces.Add(space);
+                }
+                else if (types.Count < limit && seenTypes.Add(name))
+                {
+                    types.Add(name);
+                }
+            }
+        }
+        namespaces.Sort(StringComparer.OrdinalIgnoreCase);
+        types.Sort(StringComparer.OrdinalIgnoreCase);
+
+        LispObject result = Nil.Instance;
+        var kindNamespace = Startup.Keyword("NAMESPACE");
+        var kindClass = Startup.Keyword("CLASS");
+        var nameKey = Startup.Keyword("NAME");
+        var kindKey = Startup.Keyword("KIND");
+        foreach (var name in Enumerable.Reverse(types))
+            result = new Cons(Runtime.List(nameKey, new LispString(name), kindKey, kindClass), result);
+        foreach (var space in Enumerable.Reverse(namespaces.Take(limit).ToList()))
+            result = new Cons(Runtime.List(nameKey, new LispString(space), kindKey, kindNamespace), result);
+        // Second value: whether this is everything. A client that speaks LSP
+        // turns a NIL here into isIncomplete, which is how it learns to ask
+        // again while the scan is still running.
+        return MultipleValues.Values2(result,
+                                      TypeNameIndexComplete ? T.Instance : Nil.Instance);
+    }
+
+
+    // ---- Types that are available but not loaded ------------------------
+    //
+    // The index above answers with what this image has loaded, which is not
+    // what a reader is choosing from: (dotnet:new "System.Text.Json. offers
+    // nothing until something has pulled that assembly in, even though naming
+    // the type would load it -- ResolveDotNetType already loads by namespace
+    // prefix when a type is actually used.
+    //
+    // The gap is discovery, not use, so it is closed by reading metadata rather
+    // than by loading: a PEReader over the framework's own directory lists the
+    // public types without putting a single assembly into the execution
+    // context. Typing stays free of side effects, which is the same line the
+    // completion of a receiver holds.
+    //
+    // Cost is a file scan whose size depends on the machine and on whether the
+    // pages are warm, so nothing here waits for it: the scan runs on a
+    // background thread and the answer improves when it lands. Callers ask
+    // TypeNameIndexComplete and tell their client the list is partial (LSP's
+    // isIncomplete), which makes the client ask again as the reader types.
+
+    private static string[]? _metadataTypeNames;
+    private static int _metadataEpoch = -1;
+#if !NETSTANDARD2_0
+    // Only the scan reads this, and the scan is compiled away on the emit-free
+    // build (warnings are errors there, and an unread field is one).
+    private static int _metadataScanStartedFor = -1;
+    private static readonly object _metadataLock = new();
+#endif
+
+    /// <summary>Whether the type-name index has its metadata half for the current
+    /// assembly set. False while the background scan is still running.</summary>
+    internal static bool TypeNameIndexComplete
+        => _metadataEpoch == _assemblySetEpoch;
+
+#if !NETSTANDARD2_0
+    private static IEnumerable<string> MetadataScanDirectories()
+    {
+        // The shared framework, found through the assembly every image has.
+        var core = typeof(object).Assembly.Location;
+        if (!string.IsNullOrEmpty(core))
+        {
+            var dir = System.IO.Path.GetDirectoryName(core);
+            if (dir != null) yield return dir;
+        }
+        // What this application shipped with.
+        var baseDir = AppContext.BaseDirectory;
+        if (!string.IsNullOrEmpty(baseDir)) yield return baseDir;
+    }
+
+    /// <summary>Public type names in one assembly file, read without loading it.</summary>
+    private static void ReadTypeNames(string path, HashSet<string> into)
+    {
+        using var stream = System.IO.File.OpenRead(path);
+        using var reader = new System.Reflection.PortableExecutable.PEReader(stream);
+        if (!reader.HasMetadata) return;
+        // GetMetadataReader is an extension in System.Reflection.Metadata; this
+        // file carries no usings, so it is named in full.
+        var metadata = System.Reflection.Metadata.PEReaderExtensions.GetMetadataReader(reader);
+        foreach (var handle in metadata.TypeDefinitions)
+        {
+            var definition = metadata.GetTypeDefinition(handle);
+            // Public, top level. A nested type's name is only reachable through
+            // its parent, and the parent is already here.
+            var visibility = definition.Attributes
+                             & System.Reflection.TypeAttributes.VisibilityMask;
+            if (visibility != System.Reflection.TypeAttributes.Public) continue;
+
+            var space = metadata.GetString(definition.Namespace);
+            var name = metadata.GetString(definition.Name);
+            if (string.IsNullOrEmpty(name)) continue;
+            int tick = name.IndexOf('`');
+            if (tick >= 0) name = name.Substring(0, tick);
+            into.Add(string.IsNullOrEmpty(space) ? name : space + "." + name);
+        }
+    }
+
+    private static void StartMetadataScan(int epoch)
+    {
+        lock (_metadataLock)
+        {
+            if (_metadataScanStartedFor == epoch) return;
+            _metadataScanStartedFor = epoch;
+        }
+        System.Threading.Tasks.Task.Run(() =>
+        {
+            var names = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var directory in MetadataScanDirectories())
+            {
+                string[] files;
+                try { files = System.IO.Directory.GetFiles(directory, "*.dll"); }
+                catch { continue; }
+                foreach (var file in files)
+                {
+                    try { ReadTypeNames(file, names); }
+                    catch { /* not a managed assembly, or unreadable: skip it */ }
+                }
+            }
+            var sorted = names.ToArray();
+            Array.Sort(sorted, StringComparer.OrdinalIgnoreCase);
+            lock (_metadataLock)
+            {
+                // A load that happened while the scan ran moved the epoch on; the
+                // result still describes the files on disk, so it is kept, and
+                // the next call starts a fresh scan for the newer epoch.
+                _metadataTypeNames = sorted;
+                _metadataEpoch = epoch;
+            }
+        });
+    }
+#else
+    private static void StartMetadataScan(int epoch) { }
+#endif
+
 }

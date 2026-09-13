@@ -61,7 +61,7 @@ public static partial class Runtime
 
         if (dest is Nil)
         {
-            var result = FormatString(formatString, formatArgs2);
+            var result = FormatStringTop(formatString, formatArgs2);
             return new LispString(result);
         }
 
@@ -75,7 +75,7 @@ public static partial class Runtime
         while (resolved is LispSynonymStream syn2) resolved = DynamicBindings.Get(syn2.Symbol);
         bool atLineStart = resolved is LispStream ls2 ? ls2.AtLineStart : true;
 
-        var result2 = FormatString(formatString, formatArgs2, atLineStart,
+        var result2 = FormatStringTop(formatString, formatArgs2, atLineStart,
                                    StreamInitialColumn(resolved));
 
         // Write result and update AtLineStart
@@ -1107,6 +1107,36 @@ public static partial class Runtime
         return full;
     }
 
+
+    /// <summary>The top of a FORMAT operation. A ~^ that reaches here had no
+    /// ~{...~} or ~<...~> around it to terminate, and CLHS 22.3.9.2 says it then
+    /// ends the whole operation with what has been produced so far. The exception
+    /// is control flow, not an error: letting it out of FORMAT turned
+    /// (format nil "~a~^b" 1) into a PROGRAM-ERROR where it should be "1".</summary>
+
+    /// <summary>A directive needed an argument and none was left. CLHS 22.3 makes
+    /// FORMAT an error when the arguments run out; dotcl printed nothing for the
+    /// directive and carried on, so a control string with the wrong argument count
+    /// produced quietly incomplete output -- worst where it is building the text of
+    /// another error.
+    ///
+    /// This is NOT the case for ~^ or for the iteration directives: running out is
+    /// how they decide to stop, and ~#[ counts what is left on purpose.</summary>
+    private static void MissingFormatArg(char directive)
+        => throw new LispErrorException(new LispProgramError(
+            $"FORMAT: no argument left for directive ~{directive}"));
+    private static string FormatStringTop(string template, LispObject[] args,
+                                          bool streamAtLineStart = true, int initialColumn = 0)
+    {
+        try
+        {
+            return FormatString(template, args, streamAtLineStart, initialColumn);
+        }
+        catch (FormatUpAndOutException ex)
+        {
+            return ex.PartialOutput;
+        }
+    }
     private static string FormatString(string template, LispObject[] args, bool streamAtLineStart = true,
                                        int initialColumn = 0)
     {
@@ -1158,8 +1188,18 @@ public static partial class Runtime
         bool atLineStart = resolved is LispStream ls2 ? ls2.AtLineStart : true;
 
         int argIdx = 0;
-        var result = FormatString(template, args, ref argIdx, atLineStart,
+        string result;
+        try
+        {
+            result = FormatString(template, args, ref argIdx, atLineStart,
                                   StreamInitialColumn(resolved));
+        }
+        catch (FormatUpAndOutException ex)
+        {
+            // Same as FORMATSTRINGTOP: a ~^ with nothing around it to terminate
+            // ends the operation here rather than escaping as an error.
+            result = ex.PartialOutput;
+        }
 
         if (dest is T)
         {
@@ -1270,7 +1310,10 @@ public static partial class Runtime
             {
                 i++;
                 // Parse prefix parameters: comma-separated list of number, 'char, v/V, or #
-                var prefixParams = new System.Collections.Generic.List<object?>(); // int, char, "V", or null
+                // Most directives carry no prefix parameters at all (~A, ~S, ~D, ~%),
+                // so the list is not built until one turns up: an empty List plus the
+                // resolved-parameter array below were 56 bytes per directive.
+                System.Collections.Generic.List<object?>? prefixParams = null; // int, char, "V", or null
                 bool colonMod = false;
                 bool atMod = false;
 
@@ -1290,17 +1333,17 @@ public static partial class Runtime
 
                     if (i < template.Length && (template[i] == 'v' || template[i] == 'V'))
                     {
-                        prefixParams.Add("V"); // marker: use next format arg
+                        (prefixParams ??= new System.Collections.Generic.List<object?>()).Add("V"); // marker: use next format arg
                         i++;
                     }
                     else if (i < template.Length && template[i] == '#')
                     {
-                        prefixParams.Add("#"); // marker: remaining arg count (resolved after V params)
+                        (prefixParams ??= new System.Collections.Generic.List<object?>()).Add("#"); // marker: remaining arg count (resolved after V params)
                         i++;
                     }
                     else if (i < template.Length && template[i] == '\'' && i + 1 < template.Length)
                     {
-                        prefixParams.Add(template[i + 1]); // character param
+                        (prefixParams ??= new System.Collections.Generic.List<object?>()).Add(template[i + 1]); // character param
                         i += 2;
                     }
                     else if (i < template.Length && (char.IsDigit(template[i]) || ((template[i] == '-' || template[i] == '+') && i + 1 < template.Length && char.IsDigit(template[i + 1]))))
@@ -1310,32 +1353,35 @@ public static partial class Runtime
                         while (i < template.Length && char.IsDigit(template[i]))
                             i++;
                         if (long.TryParse(template[numStart..i], out long lv))
-                            prefixParams.Add((int)Compat.Clamp(lv, int.MinValue, int.MaxValue));
+                            (prefixParams ??= new System.Collections.Generic.List<object?>()).Add((int)Compat.Clamp(lv, int.MinValue, int.MaxValue));
                         else
-                            prefixParams.Add(template[numStart] == '-' ? int.MinValue : int.MaxValue);
+                            (prefixParams ??= new System.Collections.Generic.List<object?>()).Add(template[numStart] == '-' ? int.MinValue : int.MaxValue);
                     }
                     else if (i < template.Length && template[i] == ',')
                     {
                         // empty parameter (just comma) — add null placeholder
-                        prefixParams.Add(null);
+                        (prefixParams ??= new System.Collections.Generic.List<object?>()).Add(null);
                     }
                     else
                     {
                         // No parameter found — if this was the first position, no params at all
-                        if (prefixParams.Count == 0)
+                        if (prefixParams == null || prefixParams.Count == 0)
                             break;
                         // Otherwise this was after a comma with no value — empty param
-                        prefixParams.Add(null);
+                        (prefixParams ??= new System.Collections.Generic.List<object?>()).Add(null);
                         break;
                     }
                 }
 
                 // Resolve prefix params: V consumes an arg, # is remaining-arg-count (after V resolution)
-                var resolvedParams = new object?[prefixParams.Count];
+                int pcount = prefixParams?.Count ?? 0;
+                var resolvedParams = pcount == 0
+                    ? System.Array.Empty<object?>()
+                    : new object?[pcount];
                 // First pass: resolve V params (which consume args)
-                for (int pi = 0; pi < prefixParams.Count; pi++)
+                for (int pi = 0; pi < pcount; pi++)
                 {
-                    var p = prefixParams[pi];
+                    var p = prefixParams![pi];
                     if (p is string s && s == "V")
                     {
                         if (argIdx < args.Length)
@@ -1388,7 +1434,8 @@ public static partial class Runtime
                 switch (directive)
                 {
                     case 'A': // aesthetic (princ-like)
-                        if (argIdx < args.Length)
+                        if (argIdx >= args.Length) MissingFormatArg(directive);
+                        else
                         {
                             // FormatTop, not FormatObject: ~A and ~S print an arbitrary
                             // object, so they are exactly where *print-circle* has to be
@@ -1428,7 +1475,8 @@ public static partial class Runtime
                         }
                         break;
                     case 'S': // standard (prin1-like)
-                        if (argIdx < args.Length)
+                        if (argIdx >= args.Length) MissingFormatArg(directive);
+                        else
                         {
                             string s = (colonMod && args[argIdx] is Nil)
                                 ? "()"
@@ -1463,7 +1511,8 @@ public static partial class Runtime
                     case 'B': // binary
                     case 'O': // octal
                     case 'X': // hex
-                        if (argIdx < args.Length)
+                        if (argIdx >= args.Length) MissingFormatArg(directive);
+                        else
                         {
                             var arg = args[argIdx];
                             // Per CLHS 22.3.2.2: if arg is not an integer, print as ~A
@@ -1591,7 +1640,8 @@ public static partial class Runtime
                         }
                         break;
                     case 'R': // radix
-                        if (argIdx < args.Length)
+                        if (argIdx >= args.Length) MissingFormatArg(directive);
+                        else
                         {
                             var rArg = args[argIdx];
                             // Per CLHS: if arg is not an integer, print as ~A
@@ -1691,7 +1741,8 @@ public static partial class Runtime
                         }
                         break;
                     case '$': // monetary floating point ~d,n,w,padchar$
-                        if (argIdx < args.Length)
+                        if (argIdx >= args.Length) MissingFormatArg(directive);
+                        else
                         {
                             var dArg = args[argIdx];
                             double dDv = dArg switch
@@ -1742,7 +1793,8 @@ public static partial class Runtime
                         }
                         break;
                     case 'F': // fixed-format floating point ~w,d,k,overflowchar,padcharF
-                        if (argIdx < args.Length)
+                        if (argIdx >= args.Length) MissingFormatArg(directive);
+                        else
                         {
                             var fArg = args[argIdx];
                             bool fIsSingle = fArg is SingleFloat;
@@ -1768,7 +1820,8 @@ public static partial class Runtime
                         }
                         break;
                     case 'E': // exponential floating point ~w,d,e,k,overflowchar,padchar,exponentcharE
-                        if (argIdx < args.Length)
+                        if (argIdx >= args.Length) MissingFormatArg(directive);
+                        else
                         {
                             var eArg = args[argIdx];
                             bool eIsSingle = eArg is SingleFloat;
@@ -1796,7 +1849,8 @@ public static partial class Runtime
                         }
                         break;
                     case 'G': // general floating point: ~w,d,e,k,overflowchar,padchar,exponentcharG
-                        if (argIdx < args.Length)
+                        if (argIdx >= args.Length) MissingFormatArg(directive);
+                        else
                         {
                             var gArg = args[argIdx];
                             bool gIsSingle = gArg is SingleFloat;
@@ -1859,7 +1913,8 @@ public static partial class Runtime
                         }
                         break;
                     case 'C': // character
-                        if (argIdx < args.Length)
+                        if (argIdx >= args.Length) MissingFormatArg(directive);
+                        else
                         {
                             if (args[argIdx] is LispChar lc)
                             {
@@ -1941,6 +1996,7 @@ public static partial class Runtime
                         if (atMod)
                         {
                             // ~@[...~] — if arg is non-nil, process body without consuming arg
+                            if (argIdx >= args.Length) MissingFormatArg(directive);
                             if (argIdx < args.Length && args[argIdx] is not Nil)
                             {
                                 // Arg is non-nil: don't consume it, process body with remaining args
@@ -1960,6 +2016,7 @@ public static partial class Runtime
                             // ~:[false~;true~] — boolean. Consume the test arg, then process
                             // the clause in place on the shared arg pointer (same reasons as
                             // the numeric ~[ below: ~:* backup + arg-consumption propagation).
+                            if (argIdx >= args.Length) MissingFormatArg(directive);
                             if (argIdx < args.Length)
                             {
                                 int ci = args[argIdx] is Nil ? 0 : 1;
@@ -1975,9 +2032,13 @@ public static partial class Runtime
                         }
                         else
                         {
-                            // ~[c0~;c1~;...~] or ~n[c0~;c1~;...~] — numeric selection
+                            // ~[c0~;c1~;...~] or ~n[c0~;c1~;...~] — numeric selection.
+                            // ~n[ and ~#[ take their index from the prefix parameter and
+                            // consume nothing; the bare form needs an argument.
                             int ci;
                             bool consumed = false;
+                            if (!prefixParam.HasValue && argIdx >= args.Length)
+                                MissingFormatArg(directive);
                             if (prefixParam.HasValue)
                             {
                                 // ~n[...~] — prefix parameter provides the index
@@ -2141,6 +2202,7 @@ public static partial class Runtime
                         else if (colonMod)
                         {
                             // ~:{body~}: take one list arg; each element is a sublist
+                            if (argIdx >= args.Length) MissingFormatArg(directive);
                             if (argIdx < args.Length)
                             {
                                 var listArg = args[argIdx++];
@@ -2184,6 +2246,7 @@ public static partial class Runtime
                         else
                         {
                             // ~{body~}: take one list arg, iterate over its elements
+                            if (argIdx >= args.Length) MissingFormatArg(directive);
                             if (argIdx < args.Length)
                             {
                                 var listArg = args[argIdx++];
@@ -2219,14 +2282,33 @@ public static partial class Runtime
                         break;
                     }
                     case '*': // skip/goto args
+                        // The resulting position has to stay inside the argument list.
+                        // Walking off either end used to be silent, so (format nil "~*")
+                        // with no arguments, or ~2@* past the end, printed the rest of the
+                        // control string against arguments that were not there.
                         if (atMod)
-                            argIdx = prefixParam ?? 0; // goto absolute position
+                        {
+                            int target = prefixParam ?? 0;
+                            if (target < 0 || target > args.Length) MissingFormatArg(directive);
+                            argIdx = target;
+                        }
                         else if (colonMod)
-                            argIdx = Math.Max(0, argIdx - (prefixParam ?? 1)); // back up
+                        {
+                            int back = prefixParam ?? 1;
+                            if (argIdx - back < 0) MissingFormatArg(directive);
+                            argIdx -= back;
+                        }
                         else
-                            argIdx += prefixParam ?? 1; // skip forward
+                        {
+                            int fwd = prefixParam ?? 1;
+                            if (argIdx + fwd > args.Length) MissingFormatArg(directive);
+                            argIdx += fwd;
+                        }
                         break;
                     case '?': // recursive processing
+                        // ~? needs the control string; ~? also needs the argument list
+                        // after it. Neither was checked, so (format nil "~?") printed nothing.
+                        if (argIdx >= args.Length) MissingFormatArg(directive);
                         if (argIdx < args.Length && args[argIdx] is LispString fmtStr)
                         {
                             argIdx++;
@@ -2371,7 +2453,8 @@ public static partial class Runtime
                     {
                         if (colonMod)
                             argIdx = Math.Max(0, argIdx - 1); // back up one arg
-                        if (argIdx < args.Length)
+                        if (argIdx >= args.Length) MissingFormatArg(directive);
+                        else
                         {
                             bool isOne = args[argIdx] is Fixnum fp && fp.Value == 1;
                             if (atMod)
@@ -3017,15 +3100,16 @@ public static partial class Runtime
                     case 'W': // write: print arg using current print settings
                     {
                         if (argIdx >= args.Length)
-                            break;
+                            MissingFormatArg(directive);
                         var obj = args[argIdx++];
                         sb.Append(FormatTop(obj, GetPrintEscapePublic()));
                         break;
                     }
                     default:
-                        sb.Append('~');
-                        sb.Append(directive);
-                        break;
+                        // CLHS 22.3: an unrecognised directive is an error. Echoing it
+                        // back let a typo pass for output.
+                        throw new LispErrorException(new LispProgramError(
+                            $"FORMAT: unknown directive ~{directive}"));
                 }
             }
             else

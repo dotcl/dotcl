@@ -12,7 +12,7 @@
     (dotimes (i n) (push i l))
     l))
 
-(deftest append-three-million-elements
+(deftest-runtime-once append-three-million-elements
   (let ((r (append (%append-test-list 3000000) '(:tail))))
     (list (length r) (first r) (car (last r))))
   (3000001 2999999 :tail))

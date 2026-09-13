@@ -250,6 +250,21 @@
              (pop rest))
     result))
 
+(defun extract-inline (body)
+  "Collect function names from (declare (inline f ...)) forms at the head of
+   BODY. Returns a list of symbols (possibly empty). The FLET/LABELS counterpart
+   of EXTRACT-NOTINLINE: the declaration sits in the binding form's body, which
+   is where a local function's INLINE request is written."
+  (let ((result '())
+        (rest body))
+    (loop while (and rest (consp (car rest)) (eq (caar rest) 'declare))
+          do (dolist (decl (cdar rest))
+               (when (and (consp decl) (eq (car decl) 'inline))
+                 (dolist (f (cdr decl))
+                   (when (symbolp f) (push f result)))))
+             (pop rest))
+    result))
+
 (defvar *inline-defs* (make-hash-table :test #'eq :synchronized t)
   "Function-name symbol -> (LAMBDA-LIST . BODY) for functions whose DEFUN was
    compiled while the name was proclaimed INLINE. Filled by COMPILE-DEFUN,
@@ -1260,6 +1275,27 @@ the literal and the next compilation inherits it."
         ((keywordp obj) t)   ; DETECTOR
         (t nil)))
 
+(defun compile-quoted-cached (obj)
+  "COMPILE-QUOTED, but when the result is a recipe rather than a constant, wrap
+   it so the recipe runs once and the value is kept.
+
+   Cross-compilation cannot put a symbol inside :LOAD-CONST (the text would be
+   read back into whatever package the reader is in), so a quoted list of
+   symbols comes out as LOAD-SYM + MAKECONS -- a chain that rebuilds the list on
+   every call. SPECIAL-OPERATOR-NAME-P, whose whole body is a MEMBER against a
+   25 element quoted list, cost 800 bytes a call for exactly this reason, and it
+   is one of the two hottest allocation sites in the compiler itself.
+
+   :LOAD-CONST-CACHED keeps the recipe (so the symbols are still resolved at
+   first use, and nothing has to exist earlier than it does now) and stores the
+   result, which is what a literal is supposed to be anyway."
+  (let ((instrs (compile-quoted obj)))
+    (if (and *cross-compiling*
+             (cdr instrs)                    ; more than one instruction = a recipe
+             (consp obj))
+        `((:load-const-cached ,instrs))
+        instrs)))
+
 (defun compile-quoted (obj)
   "Compile a quoted datum to instruction list."
   (cond
@@ -1774,6 +1810,144 @@ the literal and the next compilation inherits it."
                  ,@(nreverse decls)
                  (block ,op ,@rest)))))))))
 
+;;; --- Inlining a LOCAL function: (declare (inline f)) in an FLET/LABELS ---
+;;;
+;;; The declaration was read and thrown away. Honouring it buys more than the
+;;; call it saves: a local function is compiled as its own .NET method, so a
+;;; RETURN-FROM out of it -- to a block outside, the way a scanner gives up --
+;;; leaves that method, and leaving a .NET frame is only possible by throwing.
+;;; Unwinding costs about 288 bytes per frame crossed. Substituted into the
+;;; caller, the identical RETURN-FROM is a LEAVE and costs nothing: writing the
+;;; function as a MACROLET instead already measured 0 bytes where the local
+;;; function measured 608.
+;;;
+;;; The substitution has the same shape as the global one (MAYBE-EXPAND-INLINE):
+;;; (let ((p arg) ...) decls... (block f body...)). Hygiene is where the two
+;;; differ. A body proclaimed inline globally was written at top level, so only
+;;; a binding at the CALL site can capture it. A local function's body was
+;;; written in the middle of a lexical environment and means the bindings that
+;;; were in scope THERE; moved elsewhere in that same environment, every name it
+;;; uses must still mean the same binding.
+;;;
+;;; So the plan records, for every symbol the body mentions, what that symbol
+;;; resolved to where the function was written -- variable, local function,
+;;; block, go tag, symbol macro -- and a call site substitutes only when all of
+;;; them still resolve identically (EQ on the binding entry, not on the name).
+;;; Anything that rebinds one of those names in between refuses, and a refusal
+;;; is an ordinary call. The walk is deliberately blunt: every symbol, not the
+;;; free ones, so a name the body binds itself can refuse too. Over-refusing
+;;; costs speed; under-refusing would be a wrong answer.
+;;;
+;;; Two cases fall out of that rule rather than needing their own: a body that
+;;; calls itself (the name is bound at the call site and was not where the body
+;;; was written, so it never matches), and a call from inside a closure (the
+;;; closure boundary resets the locals, so any free variable refuses).
+
+(defvar *local-inline-body-size-limit* 500
+  "Maximum cons count of a local function body that will be substituted at a
+   call site. Much more generous than *INLINE-BODY-SIZE-LIMIT*: a global
+   proclamation is a standing order about every call to a name, while
+   (declare (inline f)) inside an FLET names one function in one scope, written
+   by someone looking at it. cl-ppcre's ADVANCE-FN, the case this was built for,
+   is a few hundred conses.")
+
+(defvar *local-inline-call-limit* 4
+  "How many call sites one local function binding may be substituted into. The
+   body is copied at each one, so N sites cost N copies of it; the declaration
+   asks for the substitution but says nothing about how much code it is worth.")
+
+(defun %local-inline-bindings (sym)
+  "Everything SYM could name in the current scope: variable, local function,
+   block, go tag, symbol macro. The tuple a local inline plan compares, so the
+   list of things a substitution has to keep meaning has one definition."
+  (list (local-entry sym)
+        (local-function-entry sym)
+        (assoc sym (cstate-block-tags))
+        (assoc sym (cstate-go-tags))
+        (assoc sym *symbol-macros*)))
+
+(defun %local-inline-snapshot (body params)
+  "For every symbol BODY mentions other than PARAMS, what it resolves to here.
+   PARAMS are excluded because the expansion's own LET binds them. QUOTE
+   subforms are skipped: a quoted symbol names no binding."
+  (let ((seen '())
+        (result '()))
+    (labels ((walk (x)
+               (cond ((and x (symbolp x))
+                      (unless (or (member x params :test #'eq)
+                                  (member x seen :test #'eq))
+                        (push x seen)
+                        (push (cons x (%local-inline-bindings x)) result)))
+                     ((consp x)
+                      (unless (eq (car x) 'quote)
+                        (walk (car x))
+                        (walk (cdr x)))))))
+      (walk body))
+    result))
+
+(defun %local-inline-env-matches-p (snapshot)
+  "True when every symbol in SNAPSHOT still resolves to exactly the binding it
+   resolved to where the function was written."
+  (every (lambda (entry)
+           (every #'eq (%local-inline-bindings (car entry)) (cdr entry)))
+         snapshot))
+
+(defvar *local-inline-report* nil
+  "When true, every decision about substituting a local function is printed to
+   *ERROR-OUTPUT*: the ones taken, and for the ones refused, which names no
+   longer mean what they meant where the body was written.
+
+   An INLINE declaration that quietly does nothing is otherwise invisible --
+   the program is correct either way, and only the allocation says which
+   happened -- so this is how to ask whether a declaration took.")
+
+(defun %local-inline-note (op ok snapshot)
+  "Report one substitution decision when *LOCAL-INLINE-REPORT* asks for it."
+  (when *local-inline-report*
+    (if ok
+        (format *error-output* "~&; inlined local ~s~%" op)
+        (format *error-output* "~&; local ~s not inlined here~@[ (rebound: ~s)~]~%"
+                op
+                (loop for entry in snapshot
+                      unless (every #'eq (%local-inline-bindings (car entry))
+                                    (cdr entry))
+                        collect (car entry))))))
+
+(defun maybe-expand-local-inline (op expr)
+  "If OP names a local function whose FLET/LABELS declared it INLINE, and its
+   body still means here what it meant where it was written, return the call
+   EXPR rewritten as a LET over that body; else NIL.
+
+   Refused when the argument count does not match, when the budget of call sites
+   is spent, when a MACROLET scope is active that was not active at the
+   definition, when OP is NOTINLINE here, when OP is already being substituted,
+   and -- the one that does the work -- when any name the body mentions resolves
+   to a different binding at this call site. Every refusal leaves an ordinary
+   call, so none of them can be wrong, only slower."
+  (let ((plan (nth 5 (local-function-entry op))))
+    (when (and plan
+               (not (member op *inlining-stack*))
+               (not (member op *notinline-functions*)))
+      (destructuring-bind (name params decls body blockp snapshot scope budget) plan
+        (let ((args (cdr expr))
+              (ok nil))
+          (when (and (= (length args) (length params))
+                     (plusp (car budget))
+                     (eq scope *macroexpand-scope*)
+                     (setq ok (%local-inline-env-matches-p snapshot)))
+            (decf (car budget)))
+          (%local-inline-note op ok snapshot)
+          (when ok
+            ;; NAME, not OP: entries are matched by mangled name, so the call
+            ;; could spell the function with a symbol from another package,
+            ;; while the body's RETURN-FROM names the defining symbol.
+            `(let ,(mapcar #'list params args)
+               ,@decls
+               ,@(if blockp
+                     `((block ,name ,@body))
+                     body))))))))
+
+
 (defun maybe-expand-compiler-macro (op expr)
   "If OP names a compiler macro and isn't shadowed by a local function, apply it to
    the call form EXPR (CLHS 3.2.2.1). Return the expansion, or NIL when there is no
@@ -1842,14 +2016,21 @@ the literal and the next compilation inherits it."
       (try-eval expr))
     ;; quote fast path
     (if (eq op 'quote)
-        (compile-quoted (cadr expr))
+        (compile-quoted-cached (cadr expr))
       ;; Local flet/labels function override (shadowing built-ins):
       ;; Must come before hash dispatch so flet can shadow built-in functions.
       ;; CL special operators must never be shadowed by flet — explicitly excluded.
       (if (and (symbolp op)
                (not (special-operator-name-p op))
                (local-function-entry op))
-          (compile-named-call op (cdr expr))
+          ;; An INLINE declaration in the binding form substitutes the body
+          ;; here instead of calling it, when the body still means the same
+          ;; thing at this call site (MAYBE-EXPAND-LOCAL-INLINE).
+          (let ((inl (maybe-expand-local-inline op expr)))
+            (if inl
+                (let ((*inlining-stack* (cons op *inlining-stack*)))
+                  (compile-expr inl))
+                (compile-named-call op (cdr expr))))
         ;; Hash table dispatch — O(1) for all registered ops (~250 cases).
         ;; *compile-was-toplevel* is already bound above; handlers use it directly.
         ;; A MACROLET binding for a handler name takes precedence: the handler
@@ -3422,6 +3603,33 @@ the literal and the next compilation inherits it."
       ,@(compile-as-single (second args))
       ,@body)))
 
+(defun %nary-fixnum-foldable-p (op args)
+  "True when (OP . ARGS) should keep folding into binary calls past the arity
+   cutoff below, because every step will take the native fixnum path.
+
+   The cutoff exists to stop a long argument list from expanding into a chain of
+   binary calls; the array form is one call instead. But it is keyed on the
+   count alone, so a fixnum-declared (+ x x ... x) of nine arguments falls to
+   Runtime.AddN, which takes LispObject[] -- and building that array costs MORE
+   than the chain it replaced. A fixnum declaration then made the code allocate
+   where the undeclared form allocated nothing, which is backwards.
+
+   Every argument has to be fixnum-typed for this: the fold re-tests the pair at
+   each step, and one generic argument puts the accumulator back on the boxed
+   path, where the chain has no advantage over the array.
+
+   Overflow is NOT asked about here, and must not be. Whether the whole sum fits
+   int64 is exactly what the range prover cannot show for an unbounded fixnum,
+   so requiring it would decline every case this exists for. The fold does not
+   need it: each binary step tests FIXNUM-ARITH-UNBOXED-SAFE-P for itself and
+   takes the promoting Runtime.Add when the proof fails, so an overflowing
+   intermediate still becomes a bignum. All this predicate decides is chain
+   versus array, and the chain is never less correct than the array."
+  (declare (ignore op))
+  (and (fixnum-typed-p (first args))
+       (fixnum-typed-p (second args))
+       (every #'fixnum-typed-p (cddr args))))
+
 (defun compile-add (args)
   (case (length args)
     (0 (emit-fixnum 0))
@@ -3452,7 +3660,7 @@ the literal and the next compilation inherits it."
        ((eql (first args) 1)
         (compile-unary-call (list (second args)) "Runtime.Increment" "1+"))
        (t (compile-binary-call args "Runtime.Add"))))
-    (t (if (<= (length args) 8)
+    (t (if (or (<= (length args) 8) (%nary-fixnum-foldable-p '+ args))
            (compile-expr (cons '+ (cons (list '+ (first args) (second args)) (cddr args))))
            `(,@(compile-args-array args) (:call "Runtime.AddN"))))))
 
@@ -3490,7 +3698,7 @@ the literal and the next compilation inherits it."
        ((eql (second args) 1)
         (compile-unary-call (list (first args)) "Runtime.Decrement" "1-"))
        (t (compile-binary-call args "Runtime.Subtract"))))
-    (t (if (<= (length args) 8)
+    (t (if (or (<= (length args) 8) (%nary-fixnum-foldable-p '- args))
            (compile-expr (cons '- (cons (list '- (first args) (second args)) (cddr args))))
            `(,@(compile-args-array args) (:call "Runtime.SubtractN"))))))
 
@@ -3513,7 +3721,7 @@ the literal and the next compilation inherits it."
              (fixnum-arith-unboxed-safe-p (cons '* args)))
         (compile-fixnum-binop args :mul))
        (t (compile-binary-call args "Runtime.Multiply"))))
-    (t (if (<= (length args) 8)
+    (t (if (or (<= (length args) 8) (%nary-fixnum-foldable-p '* args))
            (compile-expr (cons '* (cons (list '* (first args) (second args)) (cddr args))))
            `(,@(compile-args-array args) (:call "Runtime.MultiplyN"))))))
 
@@ -3535,7 +3743,7 @@ the literal and the next compilation inherits it."
        ((and (single-float-typed-p (first args)) (single-float-typed-p (second args)))
         (compile-single-binop args :div))
        (t (compile-binary-call args "Runtime.Divide"))))
-    (t (if (<= (length args) 8)
+    (t (if (or (<= (length args) 8) (%nary-fixnum-foldable-p '/ args))
            (compile-expr (cons '/ (cons (list '/ (first args) (second args)) (cddr args))))
            `(,@(compile-args-array args) (:call "Runtime.DivideN"))))))
 

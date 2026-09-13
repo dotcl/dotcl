@@ -437,7 +437,7 @@ public static partial class Runtime
                 _                      => Startup.Keyword("INTERNAL"),
             };
         }
-        MultipleValues.Set(canonical, status);
+        MultipleValues.SetPair(canonical, status);
         return canonical;
     }
 
@@ -710,18 +710,34 @@ public static partial class Runtime
         return p;
     }
 
+    /// <summary>
+    /// FIND-SYMBOL's variadic entry. Deliberately tiny, and it does nothing with
+    /// ARGS but read the two elements: the caller's argument array is built by
+    /// the compiler on every call, and the JIT only keeps it on the stack while
+    /// it can prove the array does not escape -- which needs this method to be
+    /// small enough to inline. With the whole implementation inlined here the
+    /// array went to the heap, costing 32 bytes a call on a path the compiler and
+    /// the reader take constantly. INTERN was already in this shape (see
+    /// InternSymbolV, which delegates to InternSymbol) and already cost nothing.
+    /// </summary>
     public static LispObject FindSymbolL(LispObject[] args)
     {
-        // (find-symbol name &optional package) → symbol, status
         if (args.Length < 1 || args.Length > 2) throw MakeProgramError("FIND-SYMBOL", 1, 2, args.Length);
-        var pkg = args.Length > 1 ? ResolvePackage(args[1], "FIND-SYMBOL") : CurrentPackage("FIND-SYMBOL");
-        string symName = args[0] switch
+        return FindSymbolIn(args[0], args.Length > 1 ? args[1] : null);
+    }
+
+    /// <summary>FIND-SYMBOL proper. PKG null means *PACKAGE*.</summary>
+    private static LispObject FindSymbolIn(LispObject nameArg, LispObject? pkgArg)
+    {
+        // (find-symbol name &optional package) → symbol, status
+        var pkg = pkgArg != null ? ResolvePackage(pkgArg, "FIND-SYMBOL") : CurrentPackage("FIND-SYMBOL");
+        string symName = nameArg switch
         {
             LispString s => s.Value,
             Symbol sym => sym.Name,
             LispChar c => c.Value.ToString(),
             LispVector v when v.IsCharVector => v.ToCharString(),
-            _ => args[0].ToString()!
+            _ => nameArg.ToString()!
         };
         var (foundSym, status) = pkg.FindSymbol(symName);
         LispObject statusSym = status switch
@@ -732,7 +748,7 @@ public static partial class Runtime
             _ => Nil.Instance
         };
         var foundCanonical = status == SymbolStatus.None ? Nil.Instance : CanonicalizeSymbol(foundSym);
-        MultipleValues.Set(foundCanonical, statusSym);
+        MultipleValues.SetPair(foundCanonical, statusSym);
         return foundCanonical;
     }
 

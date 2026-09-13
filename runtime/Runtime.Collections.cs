@@ -1017,6 +1017,17 @@ public static partial class Runtime
         throw new LispErrorException(new LispTypeError($"{fname}: not a string designator", obj));
     }
 
+    // The comparison entries take the characters, not a System.String: a
+    // char[]-backed LispString (one that has been written to, or passed to a
+    // function that materialized it) builds a fresh string on every VALUE read,
+    // so going through the designator made each STRING= allocate.
+    private static ReadOnlySpan<char> ToStringSpan(LispObject obj, string fname)
+    {
+        if (obj is LispString s) return s.Chars;
+        if (obj is Symbol sym) return sym.Name.AsSpan();
+        return ToStringDesignator(obj, fname).AsSpan();
+    }
+
     public static LispObject StringTrim(LispObject charBag, LispObject obj)
     {
         var chars = GetTrimChars(charBag);
@@ -1209,7 +1220,12 @@ public static partial class Runtime
         // Fast path: string-to-string copy using direct char access
         if (target is LispString ts && source is LispString ss)
         {
-            Array.Copy(ss.RawChars, start2, ts.RawChars, start1, copyLen);
+            // Destination first: RAWCHARS is the write accessor and materializes.
+            // The source only needs reading, so it keeps whatever backing it had --
+            // reaching for RAWCHARS there would make every later comparison on the
+            // source string allocate a fresh System.String.
+            var dest = ts.RawChars.AsSpan(start1, copyLen);
+            ss.Chars.Slice(start2, copyLen).CopyTo(dest);
             return target;
         }
         // When target == source and ranges overlap, buffer source elements first to avoid clobbering
@@ -1473,6 +1489,8 @@ public static partial class Runtime
         return new LispHashTable("EQL");
     }
 
+    // GETHASH has the same two entries as FLOOR: the second is what the peephole
+    // swaps in at a call site that discards the found-p value.
     public static LispObject Gethash(LispObject key, LispObject table, LispObject? defaultValue = null)
     {
         if (table is not LispHashTable ht)
@@ -1482,6 +1500,14 @@ public static partial class Runtime
         return MultipleValues.Values2(defaultValue ?? Nil.Instance, Nil.Instance);
     }
 
+    public static LispObject GethashPrimary(LispObject key, LispObject table, LispObject? defaultValue = null)
+    {
+        if (table is not LispHashTable ht)
+            throw new LispErrorException(new LispTypeError("GETHASH: not a hash-table", table));
+        if (ht.TryGet(key, out var value))
+            return MultipleValues.Values2Primary(value, T.Instance);
+        return MultipleValues.Values2Primary(defaultValue ?? Nil.Instance, Nil.Instance);
+    }
     public static LispObject HashTablePairs(LispObject table)
     {
         if (table is not LispHashTable ht)
@@ -1741,15 +1767,27 @@ public static partial class Runtime
         // UPGRADED-ARRAY-ELEMENT-TYPE
         Emitter.CilAssembler.RegisterFunction("UPGRADED-ARRAY-ELEMENT-TYPE", new LispFunction(args => {
             if (args.Length < 1 || args.Length > 2) throw new LispErrorException(new LispProgramError($"UPGRADED-ARRAY-ELEMENT-TYPE: wrong number of arguments: {args.Length}"));
-            var typeSpec = args[0];
-            string name = typeSpec is Symbol s ? s.Name : typeSpec is T ? "T" : typeSpec is Nil ? "NIL" : "T";
-            return Startup.Sym(name switch {
-                "BIT" => "BIT",
-                "CHARACTER" or "STANDARD-CHAR" => "CHARACTER",
-                "BASE-CHAR" => "BASE-CHAR",  // keep BASE-CHAR distinct
-                "NIL" => "NIL",
-                _ => "T"
-            });
+            // The answer has to be the element type an array built from this
+            // specifier actually reports: CLHS defines ARRAY-ELEMENT-TYPE as the
+            // upgraded type, so the two cannot disagree. MAKE-ARRAY routes the
+            // specifier through PARSE-ELEMENT-TYPE-NAME -- which is where
+            // (integer 0 100) becomes (unsigned-byte 8) and where the unboxed
+            // backings are chosen -- so ask the same function rather than keeping
+            // a second, smaller table here. That second table claimed T for
+            // (unsigned-byte 8), double-float and the rest, while the arrays
+            // themselves were specialized, so portable code that tests for a
+            // specialization with UPGRADED-ARRAY-ELEMENT-TYPE took the fallback
+            // path against arrays that were not general at all.
+            //
+            // Only the specifiers MAKE-ARRAY actually specializes may come back
+            // as themselves. For anything else the storage is general, and the
+            // answer has to be T: the upgraded type must be a supertype of the
+            // argument and must preserve subtype relations (CLHS 15.1.2.1), and
+            // a name like EQL taken from the head of (eql 8) is neither.
+            var name = Runtime.ParseElementTypeName(args[0]);
+            bool specialized = name is "BIT" or "CHARACTER" or "BASE-CHAR" or "NIL" or "T"
+                               || LispVector.NumKindForElementType(name) != 0;
+            return specialized ? Runtime.ElementTypeNameToType(name) : Startup.Sym("T");
         }));
 
         // ARRAY-DIMENSION

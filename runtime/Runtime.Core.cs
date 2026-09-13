@@ -447,16 +447,120 @@ public static partial class Runtime
     public static LispObject Apply(LispObject func, LispObject argList)
     {
         var fn = CoerceToFunction(func);
-        var args = new List<LispObject>();
-        var current = argList;
-        while (current is Cons c)
+        // Walk once to learn the length. Collecting into a List<> and calling
+        // ToArray cost three objects for a length that the walk already knows: the
+        // List, its power-of-two backing array, and the copy. Nothing user-defined
+        // runs during the walk, so counting first is free.
+        int n = ApplyTailLength(argList);
+        // Small arities go through the positional entries, which is what makes the
+        // same call written as FUNCALL allocate nothing: when the callee has a direct
+        // delegate there is no argument array at all. When it does not, InvokeN falls
+        // back to InvokeSlow with the array these would have built anyway.
+        // The cut is at 4: Invoke5..8 build a frame array of their own for a named
+        // callee, so the saving past 4 is partial, and APPLY with that many spread
+        // arguments is not a shape callers write.
+        if (n <= 4)
         {
-            args.Add(c.Car);
-            current = c.Cdr;
+            var c0 = argList as Cons;
+            switch (n)
+            {
+                case 0: return fn.Invoke0();
+                case 1: return fn.Invoke1(c0!.Car);
+                case 2:
+                {
+                    var c1 = (Cons)c0!.Cdr;
+                    return fn.Invoke2(c0.Car, c1.Car);
+                }
+                case 3:
+                {
+                    var c1 = (Cons)c0!.Cdr; var c2 = (Cons)c1.Cdr;
+                    return fn.Invoke3(c0.Car, c1.Car, c2.Car);
+                }
+                case 4:
+                {
+                    var c1 = (Cons)c0!.Cdr; var c2 = (Cons)c1.Cdr; var c3 = (Cons)c2.Cdr;
+                    return fn.Invoke4(c0.Car, c1.Car, c2.Car, c3.Car);
+                }
+            }
         }
-        if (current is not Nil)
-            throw new LispErrorException(new LispTypeError("APPLY: last argument is not a proper list", argList, Startup.Sym("LIST")));
-        return fn.Invoke(args.ToArray());
+        var args = new LispObject[n];
+        FillFromList(args, 0, argList, n);
+        return fn.Invoke(args);
+    }
+
+    /// <summary>APPLY with one fixed argument ahead of the list: (APPLY F A LIST).
+    /// The compiler used to rewrite this to (APPLY F (LIST* A LIST)), which conses a
+    /// fresh prefix cell per call for a list that APPLY then immediately walks apart
+    /// again. Passing the fixed arguments positionally makes (APPLY F A LIST) cost
+    /// what (APPLY F LIST) costs.</summary>
+    public static LispObject ApplySpread1(LispObject func, LispObject a, LispObject argList)
+    {
+        var fn = CoerceToFunction(func);
+        int n = ApplyTailLength(argList);
+        switch (n)
+        {
+            case 0: return fn.Invoke1(a);
+            case 1: return fn.Invoke2(a, ((Cons)argList).Car);
+            case 2:
+            {
+                var c0 = (Cons)argList; var c1 = (Cons)c0.Cdr;
+                return fn.Invoke3(a, c0.Car, c1.Car);
+            }
+            case 3:
+            {
+                var c0 = (Cons)argList; var c1 = (Cons)c0.Cdr; var c2 = (Cons)c1.Cdr;
+                return fn.Invoke4(a, c0.Car, c1.Car, c2.Car);
+            }
+        }
+        var args = new LispObject[n + 1];
+        args[0] = a;
+        FillFromList(args, 1, argList, n);
+        return fn.Invoke(args);
+    }
+
+    /// <summary>APPLY with two fixed arguments ahead of the list. See APPLYSPREAD1.</summary>
+    public static LispObject ApplySpread2(LispObject func, LispObject a, LispObject b,
+                                          LispObject argList)
+    {
+        var fn = CoerceToFunction(func);
+        int n = ApplyTailLength(argList);
+        switch (n)
+        {
+            case 0: return fn.Invoke2(a, b);
+            case 1: return fn.Invoke3(a, b, ((Cons)argList).Car);
+            case 2:
+            {
+                var c0 = (Cons)argList; var c1 = (Cons)c0.Cdr;
+                return fn.Invoke4(a, b, c0.Car, c1.Car);
+            }
+        }
+        var args = new LispObject[n + 2];
+        args[0] = a;
+        args[1] = b;
+        FillFromList(args, 2, argList, n);
+        return fn.Invoke(args);
+    }
+
+    /// <summary>Length of APPLY's last argument, signalling if it is not a proper list.
+    /// Shared so the spread entries report the same condition, naming the same object,
+    /// as plain APPLY.</summary>
+    private static int ApplyTailLength(LispObject argList)
+    {
+        int n = 0;
+        for (var cur = argList; ; )
+        {
+            if (cur is Cons c) { n++; cur = c.Cdr; continue; }
+            if (cur is not Nil)
+                throw new LispErrorException(new LispTypeError(
+                    "APPLY: last argument is not a proper list", argList, Startup.Sym("LIST")));
+            return n;
+        }
+    }
+
+    private static void FillFromList(LispObject[] args, int start, LispObject list, int n)
+    {
+        var cur = list;
+        for (int i = 0; i < n; i++) { var c = (Cons)cur; args[start + i] = c.Car; cur = c.Cdr; }
     }
 
     // CL special operators — fdefinition on these should not throw; they are fbound
@@ -672,6 +776,37 @@ public static partial class Runtime
                 return $"{hname}-{nbF.Value}";
             if (hname == "UNSIGNED-BYTE" || hname == "SIGNED-BYTE") return hname;
             if (hname is "SINGLE-FLOAT" or "DOUBLE-FLOAT" or "SHORT-FLOAT" or "LONG-FLOAT" or "FLOAT") return hname;
+            // Narrow integer types have to land in the same lattice as the wide
+            // ones: (eql 1) is a subtype of BIT, so upgrading it to T while BIT
+            // upgrades to BIT would break the rule that upgrading preserves
+            // subtype relations (CLHS 15.1.2.1). Normalize them to (integer lo hi)
+            // and fall through to the range logic below.
+            if (hname == "EQL" && etCons.Cdr is Cons eqlC && eqlC.Car is Fixnum eqlF)
+                return ParseElementTypeName(
+                    Runtime.List(Startup.Sym("INTEGER"), eqlF, eqlF));
+            if (hname == "MOD" && etCons.Cdr is Cons modC && modC.Car is Fixnum modF
+                && modF.Value > 0)
+                return ParseElementTypeName(
+                    Runtime.List(Startup.Sym("INTEGER"), Fixnum.Make(0),
+                                 Fixnum.Make(modF.Value - 1)));
+            if (hname == "INTEGER")
+            {
+                // Exclusive bounds are written as a one-element list: (integer 0 (256))
+                // is 0..255, which is what makes it an (unsigned-byte 8) rather than
+                // the general storage an unrecognized specifier would get.
+                if (etCons.Cdr is Cons xloC && xloC.Cdr is Cons xhiC)
+                {
+                    var lowSpec = xloC.Car;
+                    var highSpec = xhiC.Car;
+                    var lowFix = lowSpec is Cons lc && lc.Car is Fixnum lf
+                                 ? Fixnum.Make(lf.Value + 1) : lowSpec;
+                    var highFix = highSpec is Cons hc && hc.Car is Fixnum hf
+                                  ? Fixnum.Make(hf.Value - 1) : highSpec;
+                    if (!ReferenceEquals(lowFix, lowSpec) || !ReferenceEquals(highFix, highSpec))
+                        return ParseElementTypeName(
+                            Runtime.List(Startup.Sym("INTEGER"), lowFix, highFix));
+                }
+            }
             if (hname == "INTEGER")
             {
                 // (integer LO HI) with constant bounds upgrades to the canonical
@@ -873,6 +1008,13 @@ public static partial class Runtime
 
     public static LispObject Values2(LispObject a, LispObject b) =>
         MultipleValues.Values2(a, b);
+
+    /// <summary>The single-value twin of VALUES2, for the peephole. A written
+    /// (VALUES A B) in single-value position compiles to VALUES2 followed by
+    /// UNWRAPMV, and UNWRAPMV of what VALUES2 returns is MULTIPLEVALUES.PRIMARY of
+    /// A -- so the MvReturn VALUES2 builds is dead the instant it is made.</summary>
+    public static LispObject Values2Primary(LispObject a, LispObject b) =>
+        MultipleValues.Values2Primary(a, b);
 
     /// <summary>
     /// Unwrap MvReturn to its primary value. Inserted by compiler at non-MV positions.

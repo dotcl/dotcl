@@ -46,12 +46,37 @@
 ;;;     nothing rebinds it — so testing it alone let every compile-time test run
 ;;;     on the one build that can never satisfy them. :DOTCL-EMIT is the feature
 ;;;     that answers the question directly.
+;;; True when the image compiles what it runs. The consing assertions and the
+;;; measurements that feed them are statements about emitted code, so both are
+;;; skipped in the tree-walk and emit-free builds -- a measurement loop left
+;;; running there is thousands of interpreted iterations for a number nobody
+;;; looks at.
+(defun compiled-mode-p ()
+  (not (or (and (symbolp dotcl:*evaluator-mode*)
+                (string= (symbol-name dotcl:*evaluator-mode*) "INTERPRET"))
+           (not (find :dotcl-emit *features*)))))
+
 (defmacro deftest-compiled-only (name form &rest expected)
-  `(unless (or (and (symbolp dotcl:*evaluator-mode*)
-                    (string= (symbol-name dotcl:*evaluator-mode*) "INTERPRET"))
-               (not (find :dotcl-emit *features*)))
+  `(when (compiled-mode-p)
      (deftest ,name ,form ,@expected)))
 
+
+;;; A test whose subject is a runtime (C#) function and whose cost is large.
+;;;
+;;; Running such a test in every evaluator mode buys nothing: the function, its
+;;; frame size and the 256 MB stack it runs on are the same in all of them, so
+;;; the size that makes the test meaningful is the same too. Saying it three
+;;; times costs minutes and adds no coverage.
+;;;
+;;; Distinct from DEFTEST-COMPILED-ONLY, which skips the other modes because the
+;;; assertion is about emitted code and cannot hold there. Here it would hold --
+;;; it just takes minutes to hold again.
+;;;
+;;; Only for the expensive assertion. The cheap ones in the same file stay in
+;;; every mode, where they cost nothing and catch mode-specific surprises.
+(defmacro deftest-runtime-once (name form &rest expected)
+  `(when (compiled-mode-p)
+     (deftest ,name ,form ,@expected)))
 (defmacro do-tests-summary ()
   '(progn
      (print (list *pass-count* 'PASSED *fail-count* 'FAILED
@@ -71,3 +96,30 @@
   (let ((c (gensym "C")))
     `(handler-case (progn ,form nil)
        (,condition-type (,c) t))))
+
+;;; --- Allocation measurement, for the consing assertions ---
+;;;
+;;; Element 4 of DOTCL:GC-STATS is a process-wide monotonic count of bytes
+;;; allocated, so anything else alive in the image only ever adds to a sample.
+;;; MIN of a few runs keeps the least-polluted one, and taking the DIFFERENCE
+;;; between two loop lengths cancels whatever the harness itself costs.
+;;;
+;;; The counts are deliberately small. These assertions compare per-operation
+;;; bounds of tens to hundreds of bytes, which the counter resolves at 10^4
+;;; iterations as well as at 10^5 (per-op measured stable to 1% across
+;;; 400000/100000, 40000/10000 and 20000/5000). Every permanent test costs CI
+;;; time in three modes, so the larger counts bought nothing.
+;;;
+;;; FN takes an iteration count and runs its body that many times. Callers write
+;;; the bound in bytes per operation, which is the number the design records
+;;; quote, rather than as a product with the loop length.
+(defun bytes-per-op (fn &optional (big 40000) (small 10000))
+  (flet ((sample (n)
+           (let ((best nil))
+             (dotimes (r 3 best)
+               (let ((before (nth 4 (dotcl:gc-stats))))
+                 (funcall fn n)
+                 (let ((used (- (nth 4 (dotcl:gc-stats)) before)))
+                   (when (or (null best) (< used best)) (setq best used))))))))
+    (funcall fn 1000)                   ; warm: first-call JIT is not the subject
+    (/ (- (sample big) (sample small)) (float (- big small)))))

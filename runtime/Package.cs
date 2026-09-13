@@ -306,6 +306,30 @@ public class Package : LispObject
         _localNicknames.TryGetValue(nickname, out var p) ? p : null;
     public IEnumerable<(string Nick, Package Pkg)> LocalNicknames =>
         _localNicknames.Select(kv => (kv.Key, kv.Value));
+
+    /// <summary>
+    /// The local nickname this package has for PKG, or null when it has none.
+    /// The printer uses it so a symbol prints the way this package can read it
+    /// back: declaring a nickname is mostly about not writing the long physical
+    /// name, and printing the physical name anyway does not round-trip.
+    ///
+    /// Several nicknames may point at one package; the shortest wins, ties
+    /// broken by ordinal, so the choice does not depend on hash order and the
+    /// same image prints the same text twice.
+    /// </summary>
+    public string? LocalNicknameFor(Package pkg)
+    {
+        string? best = null;
+        foreach (var kv in _localNicknames)
+        {
+            if (!ReferenceEquals(kv.Value, pkg)) continue;
+            if (best == null || kv.Key.Length < best.Length
+                || (kv.Key.Length == best.Length
+                    && string.CompareOrdinal(kv.Key, best) < 0))
+                best = kv.Key;
+        }
+        return best;
+    }
     // Return a snapshot under _pkgLock so iteration by another thread does
     // not race with Use / Unuse mutating the underlying List<Package>
     // Same pattern below for ShadowingSymbolNames and Nicknames.

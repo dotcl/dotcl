@@ -896,6 +896,12 @@ public class GenericFunction : LispFunction
     /// the property reads the volatile array reference once, so a concurrent
     /// ReplaceMethods swap cannot tear an in-progress loop.</summary>
     public IReadOnlyList<LispMethod> Methods => _methods;
+    /// <summary>The same snapshot as METHODS, typed as the array it actually is.
+    /// Enumerating through the IReadOnlyList interface allocates an enumerator on
+    /// every loop; a hot path that walks the methods (initarg validation runs two of
+    /// these per REINITIALIZE-INSTANCE) uses this instead. Read the reference once,
+    /// exactly as the property does, so the loop cannot tear.</summary>
+    internal LispMethod[] MethodsArray => _methods;
     /// <summary>Lock held while building+publishing a new method array (write path only).</summary>
     internal object MethodsLock => _methodsLock;
     /// <summary>Publish a new method array (volatile write). Call under MethodsLock.</summary>

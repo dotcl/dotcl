@@ -217,3 +217,66 @@
                     (gfa1-rest *gfa1-a*) (gfa1-rest *gfa1-a* 1 2))))
     r)
   ((:opt nil) (:opt 5) (:rest) (:rest 1 2)))
+
+;;; --- an accessor whose generic function holds more than reader methods ------
+;;;
+;;; :ACCESSOR makes a reader method; a hand-written DEFMETHOD on the same name is
+;;; ordinary CLOS (cl-ppcre writes exactly this: STR reads the slot of one class
+;;; and is a method on another). It used to make every call of that accessor
+;;; allocate: the compile-time reader shortcut stands down for such a function,
+;;; and the warm cache entry it lands on is a slot-reader entry, which the
+;;; arity-1 path declined -- leaving the array-taking dispatcher, and a
+;;; one-element array per call.
+;;;
+;;; The reader shortcut is now served here too, so what decides is the receiver's
+;;; class, not whether some other class has a method of its own.
+
+(defclass gfa1-acc () ((s :initarg :s :accessor gfa1-s)))
+(defclass gfa1-elsewhere () ())
+(defmethod gfa1-s ((x gfa1-elsewhere)) :from-elsewhere)
+
+(defvar *gfa1-acc* (make-instance 'gfa1-acc :s :slot-value))
+(defvar *gfa1-else* (make-instance 'gfa1-elsewhere))
+
+(deftest gf-arity1.accessor-with-another-method-dispatches
+  (let ((r nil))
+    (dotimes (i 50)
+      (setf r (list (gfa1-s *gfa1-acc*) (gfa1-s *gfa1-else*))))
+    r)
+  (:slot-value :from-elsewhere))
+
+;;; Writing still goes through the writer, and the reader sees it.
+(deftest gf-arity1.accessor-with-another-method-writes
+  (let ((o (make-instance 'gfa1-acc :s :first)))
+    (dotimes (i 50) (setf (gfa1-s o) :second))
+    (gfa1-s o))
+  :second)
+
+;;; An unbound slot still takes the SLOT-UNBOUND route rather than answering NIL.
+(deftest gf-arity1.accessor-with-another-method-unbound
+  (let ((o (make-instance 'gfa1-acc)))
+    (dotimes (i 50) (ignore-errors (gfa1-s o)))
+    (handler-case (gfa1-s o) (error () :error)))
+  :error)
+
+(defun %gfa1-bytes () (nth 4 (dotcl:gc-stats)))
+
+(defun %gfa1-read-loop (n)
+  (declare (fixnum n))
+  (let ((r nil))
+    (do ((i 0 (1+ i))) ((= i n) r)
+      (declare (fixnum i))
+      (setq r (gfa1-s *gfa1-acc*)))))
+
+(defun %gfa1-per-call ()
+  (%gfa1-read-loop 2000)
+  (let ((best nil))
+    (dotimes (r 5 best)
+      (let ((before (%gfa1-bytes)))
+        (%gfa1-read-loop 100000)
+        (let ((used (floor (- (%gfa1-bytes) before) 100000)))
+          (when (or (null best) (< used best)) (setq best used)))))))
+
+(deftest-compiled-only gf-arity1.accessor-with-another-method-allocates-nothing
+  (%gfa1-per-call)
+  0)

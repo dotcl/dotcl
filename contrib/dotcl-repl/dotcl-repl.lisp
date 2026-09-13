@@ -27,8 +27,16 @@
 (defvar *history* '())
 (defvar *history-max* 500)
 
-;;; Called with (prefix buffer) → list of completion strings.
-;;; nil means no completion support.
+;;; Called with (text offset) -- the whole input line and the cursor position --
+;;; and returns either NIL or a plist
+;;;
+;;;   (:start N :end M :items ((:label "Append" :detail "(String) => ...") ...))
+;;;
+;;; where START and END delimit the text to replace. This is the shape
+;;; dotcl-lsp-api:completions returns, and the same shape an editor needs, so a
+;;; completer written for one serves the other. It replaces an older contract
+;;; that took a prefix string: a prefix cannot say where a candidate starts,
+;;; which breaks as soon as the token is a string literal (a .NET member name).
 (defvar *completer* nil)
 
 ;;; ── East Asian Width ────────────────────────────────────────────────────────
@@ -168,21 +176,70 @@
 
 ;;; ── Completion ──────────────────────────────────────────────────────────────
 
+(defun common-prefix (strings)
+  "Longest string that starts every one of STRINGS."
+  (if (null strings)
+      ""
+      (let ((result (first strings)))
+        (dolist (s (rest strings) result)
+          (let ((n (min (length result) (length s))))
+            (setf result
+                  (subseq result 0 (or (mismatch result s :end1 n :end2 n) n))))))))
+
 (defun complete (buf point)
-  "Return (new-buf new-point) after tab completion, or nil if no change."
+  "Return (new-buf new-point items-to-show) after tab completion, or NIL.
+
+The completer sees the whole line and the cursor, and says which span its
+candidates replace, so completing inside a string literal works the same as
+completing a symbol. A unique candidate is inserted; several are extended as far
+as they agree and then listed, the way a shell does it."
   (when *completer*
-    (let* ((content (coerce (subseq buf 0 point) 'string))
-           ;; Find start of current token
-           (token-start (or (position-if (lambda (c) (member c '(#\Space #\( #\) #\' #\`)))
-                                         content :from-end t)
-                            -1))
-           (prefix (subseq content (1+ token-start)))
-           (candidates (funcall *completer* prefix content)))
-      (when (= (length candidates) 1)
-        (let* ((completion (car candidates))
-               (suffix (subseq completion (length prefix)))
-               (new-content (concatenate 'string content suffix)))
-          (list (coerce new-content 'list) (length new-content)))))))
+    (let* ((text (coerce buf 'string))
+           (result (funcall *completer* text point)))
+      (when result
+        (let* ((start (getf result :start))
+               (end (getf result :end))
+               (items (getf result :items))
+               (labels* (mapcar (lambda (i) (getf i :label)) items))
+               (typed (subseq text start end))
+               (common (common-prefix labels*)))
+          (cond
+            ((null items) nil)
+            ;; Something to insert: one candidate, or a shared prefix longer
+            ;; than what is already there.
+            ((> (length common) (length typed))
+             (let ((new-text (concatenate 'string
+                                          (subseq text 0 start)
+                                          common
+                                          (subseq text end))))
+               (list (coerce new-text 'list)
+                     (+ start (length common))
+                     (when (rest items) items))))
+            ;; Nothing more to insert, but the reader deserves to see what the
+            ;; choices are -- with .NET members the signature is the point.
+            ((rest items) (list buf point items))
+            (t nil)))))))
+
+(defparameter *completion-display-limit* 20)
+
+(defun show-completions (items)
+  "Print candidates one per line, label then detail."
+  (let ((width (max 20 (terminal-width)))
+        (shown (min (length items) *completion-display-limit*)))
+    (write-str (format nil "~%"))
+    (dolist (item (subseq items 0 shown))
+      (let* ((label (getf item :label))
+             (detail (getf item :detail))
+             (line (if detail
+                       (format nil "  ~vA  ~A" (min 24 (max 8 (length label)))
+                               label detail)
+                       (format nil "  ~A" label))))
+        (write-str (format nil "~A~%"
+                           (if (> (length line) (1- width))
+                               (subseq line 0 (1- width))
+                               line)))))
+    (when (> (length items) shown)
+      (write-str (format nil "  ... ~A more~%" (- (length items) shown))))))
 
 ;;; ── Main readline ───────────────────────────────────────────────────────────
 
@@ -310,7 +367,14 @@
              (when result
                (setf buf (first result)
                      point (second result))
-               (redraw prompt-col buf point))))
+               (let ((items (third result)))
+                 (cond (items
+                        ;; The listing scrolls the line away, so put the prompt
+                        ;; and the input back underneath it.
+                        (show-completions items)
+                        (write-str prompt)
+                        (redraw prompt-col buf point))
+                       (t (redraw prompt-col buf point)))))))
 
           ;; Ctrl+K — kill to end of line
           ((and (console-key= ki "K") (key-ctrl-p ki))
@@ -341,3 +405,24 @@
 (defun disable ()
   "Restore the default Console.ReadLine-based REPL read."
   (dotcl::%set-repl-readline-hook nil))
+
+;;; ── Default completer ───────────────────────────────────────────────────────
+;;;
+;;; TAB is worth nothing without a completer, and requiring every reader to
+;;; write one is a poor trade for a bundled REPL. dotcl-lsp-api answers exactly
+;;; the shape *completer* wants, so wire it here when it is available and leave
+;;; TAB inert when it is not.
+
+(defun install-default-completer ()
+  "Set *COMPLETER* from dotcl-lsp-api, and return T when one was installed."
+  (when (null *completer*)
+    (ignore-errors (require "dotcl-lsp-api"))
+    (let* ((package (find-package "DOTCL-LSP-API"))
+           (symbol (and package (find-symbol "COMPLETIONS" package))))
+      (when (and symbol (fboundp symbol))
+        (setf *completer* (symbol-function symbol))
+        t))))
+
+(install-default-completer)
+
+(provide "dotcl-repl")

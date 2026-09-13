@@ -436,6 +436,66 @@ public static partial class Runtime
     public static LispObject ReadConstantFromUtf8(byte[] utf8) =>
         ReadConstantFromString(System.Text.Encoding.UTF8.GetString(utf8));
 
+    /// <summary>The uninterned symbols of the fasl whose literal is being read,
+    /// indexed by the `#<n>U` syntax the printer emitted. Bound only around one
+    /// read; nested reads cannot happen because reading a literal never loads
+    /// another fasl.</summary>
+    [ThreadStatic] public static Symbol[]? FaslUninternedTable;
+
+    /// <summary>Read a literal that names uninterned symbols by index.</summary>
+    public static LispObject ReadConstantFromUtf8(byte[] utf8, Symbol[] table)
+    {
+        var saved = FaslUninternedTable;
+        FaslUninternedTable = table;
+        try { return ReadConstantFromUtf8(utf8); }
+        finally { FaslUninternedTable = saved; }
+    }
+
+    /// <summary>Same, for a representation too large for one data field.</summary>
+    public static LispObject ReadConstantFromUtf8Parts(byte[][] parts, Symbol[] table)
+    {
+        var saved = FaslUninternedTable;
+        FaslUninternedTable = table;
+        try { return ReadConstantFromUtf8Parts(parts); }
+        finally { FaslUninternedTable = saved; }
+    }
+
+    /// <summary>Rebuild a fasl's uninterned symbols from the names blob the
+    /// emitter wrote. Netstring framing ("5:GENSY6:FOOBAR") rather than a
+    /// separator, because a symbol name may contain any character at all --
+    /// including whatever separator we would have picked.
+    ///
+    /// One array in place of one static field per symbol: a Coalton fasl had
+    /// 114,451 of those fields, which is what forced literal fields to be split
+    /// across holder types at 4096 apiece to stay under the 65,535-per-type
+    /// limit.</summary>
+    public static Symbol[] BuildUninternedTable(byte[][] parts)
+    {
+        int total = 0;
+        foreach (var p in parts) total += p.Length;
+        var all = new byte[total];
+        int at = 0;
+        foreach (var p in parts) { System.Array.Copy(p, 0, all, at, p.Length); at += p.Length; }
+        return BuildUninternedTable(all);
+    }
+
+    public static Symbol[] BuildUninternedTable(byte[] utf8)
+    {
+        var text = System.Text.Encoding.UTF8.GetString(utf8);
+        var syms = new List<Symbol>();
+        int at = 0;
+        while (at < text.Length)
+        {
+            int colon = text.IndexOf(':', at);
+            if (colon < 0 || !Compat.TryParseInt(text.AsSpan(at, colon - at), out int len))
+                throw new LispErrorException(new LispProgramError(
+                    "fasl: malformed uninterned symbol table"));
+            syms.Add(new Symbol(text.Substring(colon + 1, len), null));
+            at = colon + 1 + len;
+        }
+        return syms.ToArray();
+    }
+
     /// <summary>Same, for a representation too large for one data field.</summary>
     public static LispObject ReadConstantFromUtf8Parts(byte[][] parts)
     {
@@ -666,6 +726,7 @@ public static partial class Runtime
                         RegisterContribWithAsdf(searchDirs.ToArray());
                         InstallAsdfModuleProvider();
                         UseAsdfSourceLoadingWithoutCompiler();
+                        InstallAsdfR2rHook();
                     }
                     return T.Instance;
                 }
@@ -774,8 +835,11 @@ public static partial class Runtime
     }
 
     /// <summary>
-    /// After ASDF is loaded, push all contrib subdirectories to asdf:*central-registry*
-    /// so that dotcl's built-in shims (trivial-gray-streams etc.) take priority over QL.
+    /// After ASDF is loaded, push every contrib subdirectory onto
+    /// asdf:*central-registry*, so the bundled systems (dotcl-gray, dotcl-socket and
+    /// the rest) are found by name without the user registering a source directory.
+    /// The central registry is searched before the source registry, so a bundled
+    /// name wins over a same-named system found elsewhere.
     /// </summary>
     private static void RegisterContribWithAsdf(IEnumerable<string> searchDirs)
     {
@@ -842,6 +906,39 @@ public static partial class Runtime
     /// generation has no *LOAD-SYSTEM-OPERATION* to set), so the redirection has
     /// to replace the function. Builds that have a compiler are untouched.
     /// </summary>
+    /// <summary>Have ASDF write an ahead-of-time sibling for each fasl it
+    /// compiles, when dotcl:*compile-r2r* says so. The method is always installed
+    /// and reads the variable when it runs, so the decision can be made (or bound
+    /// around one operation) at any point, not only before ASDF was loaded. It has to be ASDF that asks: ASDF
+    /// compiles to a temporary output and renames it into place, so a hook inside
+    /// COMPILE-FILE sees a name that no longer exists a moment later (the siblings
+    /// came out as &lt;name&gt;-tmpXXXXXXXX.fasl.r2r-&lt;rid&gt; and were never found again).
+    ///
+    /// Nothing above this needs to know: the system is still compiled and loaded as
+    /// the same .fasl, and the sibling is picked up at load or ignored if stale.
+    /// </summary>
+    private static void InstallAsdfR2rHook()
+    {
+        const string form = @"
+(let ((perform (find-symbol ""PERFORM"" ""ASDF""))
+      (cop     (find-symbol ""COMPILE-OP"" ""ASDF""))
+      (src     (find-symbol ""CL-SOURCE-FILE"" ""ASDF""))
+      (outs    (find-symbol ""OUTPUT-FILES"" ""ASDF"")))
+  (when (and perform cop src outs)
+    (eval `(defmethod ,perform :after ((op ,cop) (c ,src))
+             (when dotcl:*compile-r2r*
+               (dolist (f (,outs op c))
+                 (when (equal (pathname-type f) ""fasl"")
+                   (ignore-errors (dotcl:write-r2r-sibling (namestring f))))))))))";
+        try
+        {
+            var read = MultipleValues.Primary(
+                Runtime.ReadFromString(new LispObject[] { new LispString(form) }));
+            Runtime.Eval(read);
+        }
+        catch { }
+    }
+
     private static void UseAsdfSourceLoadingWithoutCompiler()
     {
         // A REQUIRE-SYSTEM is exempt: it has no source to load -- its LOAD-OP just
@@ -1260,6 +1357,209 @@ public static partial class Runtime
         return true;
     }
 
+    /// <summary>Write <c>&lt;fasl&gt;.r2r-&lt;rid&gt;</c> next to a freshly compiled fasl,
+    /// when DOTCL_R2R_AFTER_COMPILE is set. Loading picks it up automatically
+    /// (see TryFindR2rSibling), so ASDF and everything above it need to know
+    /// nothing: they still compile and load the same .fasl.
+    ///
+    /// Off by default because the trade is real and depends on the file. It costs
+    /// a crossgen2 run per fasl and roughly 4x the disk, and buys back the JIT at
+    /// every load. Worth it for something like Coalton, which is compiled rarely
+    /// and loaded often; not obviously worth it for a file being edited.
+    ///
+    /// Silent on every failure: no crossgen2 on this machine, an unsupported
+    /// target, a crossgen2 that refuses the image. The fasl is complete either way
+    /// and the loader falls back to it.</summary>
+    /// <summary>Write the sibling unconditionally. ASDF compiles to a temporary
+    /// output and renames it into place, so a hook inside COMPILE-FILE only ever
+    /// sees the temporary name; the caller that knows the final path has to ask.
+    /// </summary>
+    internal static void WriteR2rSibling(string faslPath)
+    {
+        try
+        {
+            var rid = PortableRid();
+            var cg = FindCrossgen2(rid);
+            if (rid == null || !File.Exists(faslPath)) return;
+            if (cg == null)
+            {
+                // Asked for and unavailable is worth saying once. Every other way
+                // this route has failed was silent, and this is the one a user is
+                // most likely to hit: crossgen2 is not in the SDK, it is a NuGet
+                // pack the SDK restores when something asks for ReadyToRun.
+                if (!_warnedNoCrossgen2)
+                {
+                    _warnedNoCrossgen2 = true;
+                    Console.Error.WriteLine(
+                        ";; note: dotcl:*compile-r2r* is true but crossgen2 was not found,");
+                    Console.Error.WriteLine(
+                        ";;       so no ahead-of-time siblings are being written.");
+                    Console.Error.WriteLine(
+                        $";;       Restore it once with:  dotnet publish -p:PublishReadyToRun=true -r {rid}");
+                    Console.Error.WriteLine(
+                        ";;       Set dotcl:*compile-r2r* to nil to stop asking.");
+                }
+                return;
+            }
+
+            // crossgen2 wants an assembly-looking input, and writing the output
+            // straight onto the final name would leave a truncated sibling behind
+            // if it fails midway -- one that is NEWER than the fasl, so the loader
+            // would prefer it.
+            var tmpIn = Path.Combine(Path.GetTempPath(),
+                $"dotcl-r2r-{Guid.NewGuid():N}.dll");
+            var tmpOut = tmpIn + ".out";
+            File.Copy(faslPath, tmpIn, true);
+            try
+            {
+                var psi = new System.Diagnostics.ProcessStartInfo(cg)
+                {
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                };
+                Compat.AddArg(psi, tmpIn);
+                Compat.AddArg(psi, "-r");
+                Compat.AddArg(psi, Path.Combine(
+                    System.Runtime.InteropServices.RuntimeEnvironment.GetRuntimeDirectory(), "*.dll"));
+                Compat.AddArg(psi, "-r");
+                Compat.AddArg(psi, Path.Combine(AppContext.BaseDirectory, "*.dll"));
+                Compat.AddArg(psi, "--targetos");
+                Compat.AddArg(psi, rid.StartsWith("win") ? "windows"
+                                 : rid.StartsWith("osx") ? "osx" : "linux");
+                Compat.AddArg(psi, "--targetarch");
+                Compat.AddArg(psi, rid.Substring(rid.LastIndexOf('-') + 1));
+                Compat.AddArg(psi, "-O");
+                Compat.AddArg(psi, "-o");
+                Compat.AddArg(psi, tmpOut);
+                using var proc = System.Diagnostics.Process.Start(psi);
+                if (proc == null) return;
+                proc.StandardOutput.ReadToEnd();
+                var err = proc.StandardError.ReadToEnd();
+                proc.WaitForExit();
+                if (proc.ExitCode != 0 || !File.Exists(tmpOut))
+                {
+                    if (!_warnedCrossgen2Failed)
+                    {
+                        _warnedCrossgen2Failed = true;
+                        var why = err.Trim();
+                        if (why.Length > 300) why = why.Substring(0, 300) + " ...";
+                        Console.Error.WriteLine(
+                            $";; note: crossgen2 failed on {Path.GetFileName(faslPath)} (exit {proc.ExitCode});");
+                        Console.Error.WriteLine(
+                            ";;       loading falls back to the IL fasl.");
+                        if (why.Length > 0) Console.Error.WriteLine(";;       " + why);
+                    }
+                    return;
+                }
+                var dest = faslPath + ".r2r-" + rid;
+                Compat.MoveFile(tmpOut, dest, true);
+                // The loader ignores a sibling older than its fasl; make sure a
+                // filesystem with coarse timestamps cannot make this one look old.
+                File.SetLastWriteTimeUtc(dest, DateTime.UtcNow);
+            }
+            finally
+            {
+                try { File.Delete(tmpIn); } catch { }
+                try { if (File.Exists(tmpOut)) File.Delete(tmpOut); } catch { }
+            }
+        }
+        catch { }
+    }
+
+    private static bool _warnedNoCrossgen2;
+    private static bool _warnedCrossgen2Failed;
+
+    /// <summary>The crossgen2 host tool from the restored NuGet packages, highest
+    /// version. Returns null when it is not on this machine -- it ships with the
+    /// SDK's R2R support, not with a dotcl install.</summary>
+    private static string? FindCrossgen2(string? rid)
+    {
+        if (rid == null) return null;
+        var home = Environment.GetEnvironmentVariable("NUGET_PACKAGES")
+                   ?? Path.Combine(Environment.GetFolderPath(
+                          Environment.SpecialFolder.UserProfile), ".nuget", "packages");
+        var pkg = Path.Combine(home, $"microsoft.netcore.app.crossgen2.{rid}");
+        if (!Directory.Exists(pkg)) return null;
+        var exe = rid.StartsWith("win") ? "crossgen2.exe" : "crossgen2";
+        string? best = null;
+        Version? bestV = null;
+        foreach (var dir in Directory.EnumerateDirectories(pkg))
+        {
+            var cand = Path.Combine(dir, "tools", exe);
+            if (!File.Exists(cand)) continue;
+            Version.TryParse(Path.GetFileName(dir).Split('-')[0], out var v);
+            if (best == null || (v != null && bestV != null && v > bestV)) { best = cand; bestV = v; }
+        }
+        return best;
+    }
+
+    /// <summary>The portable os-arch RID (linux-x64, win-arm64, osx-x64 ...),
+    /// which is how the build names its per-RID artifacts.</summary>
+    /// <summary>How many fasls were loaded from an ahead-of-time sibling, and how
+    /// many were loaded at all. Every way this route has failed so far has been
+    /// silent -- a sibling written under a temporary name, one left older than its
+    /// fasl, one named for the wrong spelling of the RID -- and each looked exactly
+    /// like success from the outside. Two counters make the difference visible.
+    /// </summary>
+    public static long R2rFaslsLoaded;
+    public static long FaslsLoaded;
+
+    internal static string? PortableRidForLisp() => PortableRid();
+
+    private static string? PortableRid()
+    {
+        string os = System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(
+                        System.Runtime.InteropServices.OSPlatform.Windows) ? "win"
+                  : System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(
+                        System.Runtime.InteropServices.OSPlatform.OSX) ? "osx"
+                  : System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(
+                        System.Runtime.InteropServices.OSPlatform.Linux) ? "linux"
+                  : null!;
+        if (os == null) return null;
+        string? arch = System.Runtime.InteropServices.RuntimeInformation.ProcessArchitecture switch
+        {
+            System.Runtime.InteropServices.Architecture.X64 => "x64",
+            System.Runtime.InteropServices.Architecture.Arm64 => "arm64",
+            System.Runtime.InteropServices.Architecture.X86 => "x86",
+            _ => null,
+        };
+        return arch == null ? null : $"{os}-{arch}";
+    }
+
+    /// <summary>The ahead-of-time compiled sibling of a fasl, if there is one for
+    /// this platform and it is not older than the fasl itself. Returns null when
+    /// there is none, when it is stale, or when dotcl:*load-r2r* is NIL.</summary>
+    private static string? TryFindR2rSibling(string faslFull)
+    {
+        if (DynamicBindings.Get(Startup.SymInPkg("*LOAD-R2R*", "DOTCL")) is Nil) return null;
+        try
+        {
+            var dir = Path.GetDirectoryName(faslFull);
+            if (dir == null) return null;
+            var baseName = Path.GetFileName(faslFull);
+            // Two spellings. RuntimeIdentifier is the specific one the process was
+            // built for (ubuntu.24.04-x64 here), while everything that PRODUCES
+            // these files -- the Makefile's HOST_RID, crossgen2's package names,
+            // the per-RID contrib fasls -- uses the portable os-arch form. Probe the
+            // portable spelling first because that is what the tooling writes;
+            // a distro-specific build that pinned its own is still found.
+            string? cand = null;
+            foreach (var rid in new[] { PortableRid(), Compat.RuntimeIdentifier })
+            {
+                if (rid == null) continue;
+                var c = Path.Combine(dir, $"{baseName}.r2r-{rid}");
+                if (File.Exists(c)) { cand = c; break; }
+            }
+            if (cand == null) return null;
+            // Older than the fasl means the fasl was rebuilt and this is left over.
+            // Equal is fine: a sibling produced from the fasl can share its second.
+            return File.GetLastWriteTimeUtc(cand) >= File.GetLastWriteTimeUtc(faslFull)
+                ? cand : null;
+        }
+        catch { return null; }
+    }
+
     private static LispObject LoadFasl(string filePath, LispObject filespec,
         bool isVerbose, bool isPrint)
     {
@@ -1297,7 +1597,26 @@ public static partial class Runtime
             System.Reflection.Assembly asm;
             try
             {
-                if (Environment.GetEnvironmentVariable("DOTCL_FASL_LOADFROM") == "1")
+                // An ahead-of-time sibling, <name>.fasl.r2r-<rid>, holds the same
+                // module already compiled to native code. Loading it BY PATH is
+                // what makes the runtime use that code: an assembly loaded from a
+                // byte array is not file-backed and its R2R code is ignored, so
+                // the two halves only pay off together.
+                //
+                // A sibling rather than a replacement: the .fasl stays the artifact
+                // ASDF compares against its source, so nothing has to be told that
+                // the file it planned around was swapped, and a stale sibling is
+                // ignored rather than silently preferred. The marker goes after the
+                // whole filename, not into the stem: a sibling must not match a
+                // *.fasl glob, or every caller that walks fasls has to remember to
+                // exclude it (the Makefile and two csprojs each used to).
+                var r2rPath = TryFindR2rSibling(faslFull);
+                if (r2rPath != null)
+                {
+                    asm = System.Reflection.Assembly.LoadFrom(r2rPath);
+                    R2rFaslsLoaded++;
+                }
+                else if (Environment.GetEnvironmentVariable("DOTCL_FASL_LOADFROM") == "1")
                 {
                     // Load by path so the module is file-backed. A coverage profiler
                     // picks its targets per loaded module and skips anything without a
@@ -1335,6 +1654,7 @@ public static partial class Runtime
                 throw FaslFileError(
                     $"LOAD: not a dotcl fasl (not a .NET assembly): {filePath}", filespec);
             }
+            FaslsLoaded++;
             WarnOnStaleFaslGeneration(asm, faslFull);
             // A bundle (uiop bundle-op / dotcl:combine-fasls) is an assembly with
             // no code whose parts ride along as resources. Run each part in the
@@ -3082,8 +3402,12 @@ public static partial class Runtime
 
         var publishOut = Path.Combine(Path.GetTempPath(),
             $"dotcl-publish-{Guid.NewGuid():N}");
-        var rid = targetRid
-            ?? System.Runtime.InteropServices.RuntimeInformation.RuntimeIdentifier;
+        // COMPAT.RUNTIMEIDENTIFIER answers null only on netstandard2.0, which has no
+        // run-time RID. That build cannot publish anyway, but the type is nullable on
+        // every target, so say what is missing rather than pass null down.
+        var rid = targetRid ?? Compat.RuntimeIdentifier
+            ?? throw new LispErrorException(new LispError(
+                "SAVE-APPLICATION: this build has no runtime identifier; pass :TARGET-RID"));
 
         try
         {
@@ -3604,9 +3928,22 @@ public static partial class Runtime
             // with what compiling the same form does.
             if (form is Cons pc && pc.Car is Symbol ps && ps.Name == "PROGN")
             {
+                // PROGN returns the values of its LAST form and discards the rest.
+                // Discarding has to include the thread value state: a subform that
+                // published NO values -- a :VOID foreign call, a (VALUES) -- left
+                // COUNT at 0, and a last form that publishes nothing of its own (a
+                // constant, a variable reference) then inherited that count, so
+                // (progn (values) x) answered no values instead of X. The sentinel a
+                // reset leaves means "one value, the one returned", which is exactly
+                // what such a form produces. The reset before the loop covers the
+                // empty body, whose value is one NIL.
                 LispObject last = Nil.Instance;
+                MultipleValues.Reset();
                 for (var body = pc.Cdr; body is Cons bc; body = bc.Cdr)
+                {
                     last = Eval(bc.Car);
+                    if (bc.Cdr is Cons) MultipleValues.Reset();
+                }
                 return last;   // multiple values of the last form ride along
             }
             // Use eval-specific compile path that preserves MvReturn at tail
@@ -5971,6 +6308,29 @@ public static partial class Runtime
     /// the distinction a caller needs -- swank's ARGLIST falls back to
     /// :not-available rather than showing a function as taking nothing.
     /// </summary>
+    /// <summary>Record a function's lambda list as the text it was written as.
+    /// Called from the IL a FASL emits, once per function it defines.</summary>
+    public static void SetLambdaListSource(LispFunction fn, string text)
+        => fn.StoredLambdaList = new LispString(text);
+    /// <summary>Read a FASL-carried lambda list, once, replacing the text with what
+    /// it read. A portable lambda list names its variables with uninterned symbols,
+    /// so nothing here depends on which package is current. A text that will not
+    /// read is dropped rather than retried: it is display information, and the
+    /// caller is a tool drawing one line of it.</summary>
+    private static LispObject? ParseStoredLambdaListText(LispFunction fn, LispString text)
+    {
+        fn.StoredLambdaList = null;
+        try
+        {
+            // READ-FROM-STRING answers with its position as a second value; keeping
+            // the pair would hand that on as this function's own second value.
+            var parsed = UnwrapMv(ReadFromString(new LispObject[] { text }));
+            fn.StoredLambdaList = parsed;
+            return parsed;
+        }
+        catch { return null; }
+    }
+
     public static LispObject FunctionLambdaList(LispObject arg)
     {
         LispObject target = arg;
@@ -5992,16 +6352,19 @@ public static partial class Runtime
         else if (target is LispFunction lf)
         {
             ll = lf.StoredLambdaList;
+            // A FASL carries the list as the text it was written as (see
+            // LispFunction.StoredLambdaList); this is the reader of it.
+            if (ll is LispString text) ll = ParseStoredLambdaListText(lf, text);
             // An interpreted closure carries (params env specials k); PARAMS is
             // the lambda list the user wrote.
             if (ll == null && lf.InterpInfo is Cons info) ll = info.Car;
         }
         if (ll == null)
         {
-            MultipleValues.Set(Nil.Instance, Nil.Instance);
+            MultipleValues.SetPair(Nil.Instance, Nil.Instance);
             return Nil.Instance;
         }
-        MultipleValues.Set(ll, T.Instance);
+        MultipleValues.SetPair(ll, T.Instance);
         return ll;
     }
 

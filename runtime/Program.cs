@@ -414,7 +414,7 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
         //       Walk the :depends-on graph, emit one fasl path per line in load
         //       order to <p> (or stdout). With --root-sources-out, also emit the
         //       root system's component source paths (MSBuild Inputs).
-        //       --target-rid prefers <dir>/<name>-r2r-<rid>.fasl when present.
+        //       --target-rid prefers <dir>/<name>.fasl.r2r-<rid> when present.
         // The flags below are build-internal and intentionally absent from
         // --help / completion.
         bool buildMode = !hasUserFasl && rest.Count > 0 && rest[0] == "build";
@@ -950,6 +950,80 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
     /// MSBuild owns the incremental decision via Inputs/Outputs on the
     /// component source files.
     /// </summary>
+    /// <summary>Stage the NuGet layouts each packaged RID needs, one bundle directory
+    /// per RID, and answer a lookup from RID to that directory (null when the system
+    /// declares no packages, so a pack without any passes the user's --bundle through
+    /// untouched).
+    ///
+    /// Every RID is laid out, not only the one this machine runs: `dotcl pack` builds
+    /// a package per platform and a package that carries another platform's assets
+    /// carries nothing it can use. Laying one out means a `dotnet build` per RID, so
+    /// this is the slow part of packing an app that declares packages -- and it is
+    /// the work the shipped program would otherwise have to do on first start, on a
+    /// machine that may have neither the SDK nor a network.
+    ///
+    /// A RID that will not lay out is reported and skipped: a package can have
+    /// nothing for a platform, and the answer to that is to ship what does exist and
+    /// let the rest resolve on the target, not to refuse to build for it.
+    ///
+    /// The user's own --bundle is copied into each RID's directory rather than
+    /// written into: it is their directory, and a pack should not leave anything
+    /// behind in it.</summary>
+    static Func<string, string?>? StageNugetBundles(string? userBundle, string faslPath,
+                                                    string system, IReadOnlyList<string> rids)
+    {
+        var pkg = Package.FindPackage("NUGET");
+        if (pkg == null) return null;                       // nothing ever required
+        var stage = pkg.FindSymbol("STAGE-BUNDLE");
+        if (stage.status == SymbolStatus.None || stage.symbol.Function == null) return null;
+
+        var asdf = Package.FindPackage("DOTCL-NUGET-ASDF");
+        var resolveForRid = asdf?.FindSymbol("RESOLVE-SYSTEM-FOR-RID");
+
+        var root = Path.Combine(Path.GetDirectoryName(Path.GetFullPath(faslPath))!, "pack-bundle");
+        if (Directory.Exists(root)) Directory.Delete(root, recursive: true);
+
+        var map = new Dictionary<string, string>();
+        foreach (var rid in rids)
+        {
+            // "any" is the RID-agnostic package: there is no platform to lay out
+            // for, so it ships without a bundle and resolves on the target.
+            if (rid == "any") continue;
+
+            if (resolveForRid != null && resolveForRid.Value.status != SymbolStatus.None
+                && resolveForRid.Value.symbol.Function is LispFunction rf)
+            {
+                var failed = rf.Invoke2(new LispString(system), new LispString(rid));
+                for (var c = failed; c is Cons cell; c = cell.Cdr)
+                    if (cell.Car is Cons f)
+                        Console.Error.WriteLine(
+                            $"pack: {rid}: {Runtime.PrincToString(f.Car)} not laid out, it "
+                            + $"will resolve on the target ({Runtime.PrincToString(f.Cdr)})");
+            }
+
+            var dir = Path.Combine(root, rid);
+            Directory.CreateDirectory(dir);
+            if (userBundle != null) CopyTree(Path.GetFullPath(userBundle), dir);
+            var n = ((LispFunction)stage.symbol.Function)
+                .Invoke2(new LispString(dir.Replace("\\", "/")), new LispString(rid));
+            var count = n is Fixnum fx ? (int)fx.Value : 0;
+            if (count == 0 && userBundle == null) { Directory.Delete(dir, recursive: true); continue; }
+            Console.WriteLine($"pack: {rid}: bundled {count} NuGet layout(s)");
+            map[rid] = dir;
+        }
+        return map.Count == 0 ? null : (rid => map.TryGetValue(rid, out var d) ? d : null);
+    }
+
+    static void CopyTree(string from, string to)
+    {
+        foreach (var f in Directory.GetFiles(from, "*", SearchOption.AllDirectories))
+        {
+            var dst = Path.Combine(to, Path.GetRelativePath(from, f));
+            Directory.CreateDirectory(Path.GetDirectoryName(dst)!);
+            File.Copy(f, dst, overwrite: true);
+        }
+    }
+
     static void RunCompileProject(string asdPath, string outputPath, string[]? buildInit = null, string[]? searchPaths = null, bool debugInfo = false)
     {
         try { DotclHost.CompileProject(asdPath, outputPath, buildInit, searchPaths, debugInfo); }
@@ -1123,12 +1197,31 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
         }
         Console.WriteLine($"pack: built user fasl  {faslPath}");
 
+        // Step 1b: carry the NuGet packages each packaged platform needs. Building
+        // the fasl ran the (:nuget ...) declarations -- they are compiled into the
+        // unit as NUGET:REQUIRE calls -- so this process already holds a laid-out
+        // copy for the RID it packs on; the other RIDs are laid out here. Copying
+        // them beside the executable is what lets the packaged app start where
+        // there is no .NET SDK and no network: NUGET:BUNDLED-ROOT is consulted
+        // before the cache and before `dotnet build`.
+        Func<string, string?>? bundleForRid = null;
+        try
+        {
+            bundleForRid = StageNugetBundles(o.Bundle, faslPath, o.System!, rids);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"pack: staging NuGet layouts failed: {ex.Message}");
+            return 1;
+        }
+
         // Step 2: restamp the published dotcl tool packages into this app's.
         List<string> produced;
         try
         {
             produced = PackRestamp.Run(o.From!, o.DotclVersion, o.Id!, o.Command!, o.Version!,
-                                       faslPath, o.Bundle, rids, o.Output!, meta, dryRun: false);
+                                       faslPath, o.Bundle, rids, o.Output!, meta, dryRun: false,
+                                       bundleForRid);
         }
         catch (Exception ex)
         {

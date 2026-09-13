@@ -743,6 +743,19 @@ public static partial class Runtime
         return 1;
     }
 
+    /// <summary>True when the stream reads characters rather than bytes. Only there
+    /// does the reader's decoded byte count mean anything: a binary stream never
+    /// goes through the decoder (READ-BYTE takes the bytes straight off BaseStream),
+    /// so its position has to keep coming from BaseStream as it always did.</summary>
+    private static bool IsCharacterFileStream(LispFileStream fs)
+    {
+        var et = fs.ElementType;
+        if (et is Cons) return false;                       // (unsigned-byte N) etc.
+        if (et is Symbol s)
+            return s.Name == "CHARACTER" || s.Name == "BASE-CHAR" || s.Name == "T";
+        return true;                                        // default element-type
+    }
+
     // Stream-argument predicates for composite-stream constructors. Accept both
     // native LispStream instances and Gray CLOS streams (LispInstance), matching
     // the INPUT-STREAM-P / OUTPUT-STREAM-P generic — so MAKE-TWO-WAY-STREAM etc.
@@ -863,11 +876,41 @@ public static partial class Runtime
         }
     }
 
-    private static StreamReader MakeReader(System.IO.Stream s, System.Text.Encoding? enc)
-        // With an explicit encoding, BOM sniffing must be off: a latin-1 file whose
-        // first bytes happen to look like a BOM would otherwise be decoded as UTF-8.
-        => enc == null ? new StreamReader(s)
-                       : new StreamReader(s, enc, detectEncodingFromByteOrderMarks: false);
+    // Character file input goes through ByteTrackingReader so FILE-POSITION can
+    // report the byte offset of the next character. A StreamReader cannot: its
+    // BaseStream.Position is where the buffer was filled to, which is the whole
+    // file after one READ-CHAR.
+    //
+    // With an explicit encoding, BOM sniffing must be off: a latin-1 file whose
+    // first bytes happen to look like a BOM would otherwise be decoded as UTF-8.
+    // Without one, StreamReader's default sniffed the mark, so the same sniffing
+    // happens here rather than silently losing it.
+    private static ByteTrackingReader MakeReader(System.IO.Stream s, System.Text.Encoding? enc)
+        => enc == null ? new ByteTrackingReader(s, SniffEncoding(s), skipPreamble: true)
+                       : new ByteTrackingReader(s, enc, skipPreamble: false);
+
+    /// <summary>The encoding a byte order mark names, or UTF-8 when there is none --
+    /// what StreamReader's default constructor decides. The mark itself is left in
+    /// place; the reader consumes it, so that its byte count starts after it.</summary>
+    private static System.Text.Encoding SniffEncoding(System.IO.Stream s)
+    {
+        if (!s.CanSeek) return new System.Text.UTF8Encoding(false);
+        long at = s.Position;
+        var head = new byte[4];
+        int n = s.Read(head, 0, 4);
+        s.Position = at;
+        if (n >= 4 && head[0] == 0xFF && head[1] == 0xFE && head[2] == 0 && head[3] == 0)
+            return new System.Text.UTF32Encoding(bigEndian: false, byteOrderMark: true);
+        if (n >= 4 && head[0] == 0 && head[1] == 0 && head[2] == 0xFE && head[3] == 0xFF)
+            return new System.Text.UTF32Encoding(bigEndian: true, byteOrderMark: true);
+        if (n >= 3 && head[0] == 0xEF && head[1] == 0xBB && head[2] == 0xBF)
+            return new System.Text.UTF8Encoding(encoderShouldEmitUTF8Identifier: true);
+        if (n >= 2 && head[0] == 0xFF && head[1] == 0xFE)
+            return new System.Text.UnicodeEncoding(bigEndian: false, byteOrderMark: true);
+        if (n >= 2 && head[0] == 0xFE && head[1] == 0xFF)
+            return new System.Text.UnicodeEncoding(bigEndian: true, byteOrderMark: true);
+        return new System.Text.UTF8Encoding(false);
+    }
 
     private static StreamWriter MakeWriter(System.IO.Stream s, System.Text.Encoding? enc)
         => enc == null ? new StreamWriter(s) : new StreamWriter(s, enc);
@@ -1507,7 +1550,7 @@ public static partial class Runtime
         // Bivalent stream: read-byte draws from the same byte source as read-char.
         if (stream is LispBidirectionalStream bvi && bvi.Reader is BivalentStreamReader bsr)
             return bsr.ReadRawByte();
-        if (stream is LispFileStream fs && fs.InputReader is StreamReader sr)
+        if (stream is LispFileStream fs && fs.InputReader is ByteTrackingReader sr)
             return sr.BaseStream.ReadByte();
         if (stream is LispConcatenatedStream cs)
         {
@@ -2090,13 +2133,13 @@ public static partial class Runtime
         {
             if (IsTruthy(eofErrorP))
                 throw new LispErrorException(MakeEndOfFileError(stream));
-            MultipleValues.Set(eofValue, T.Instance);
+            MultipleValues.SetPair(eofValue, T.Instance);
             return eofValue;
         }
 
         var result = new LispString(sb.ToString());
         var missingNewlineP = foundNewline ? (LispObject)Nil.Instance : T.Instance;
-        MultipleValues.Set(result, missingNewlineP);
+        MultipleValues.SetPair(result, missingNewlineP);
         return result;
     }
 
@@ -2387,12 +2430,25 @@ public static partial class Runtime
         if (args[0] is LispStringInputStream sis)
         {
             if (args.Length == 1)
-                return Fixnum.Make(sis.Position);
+            {
+                // A character pushed back with UNREAD-CHAR has not been consumed:
+                // the next READ-CHAR returns it again, so the stream sits one
+                // character before what the underlying reader has taken. Reading
+                // and unreading a character has to leave the position where it
+                // started, which is how code that peeks by read-then-unread --
+                // Eclector's whitespace skipping, for one -- reports where a form
+                // began.
+                return Fixnum.Make(sis.Position - (sis.UnreadCharValue != -1 ? 1 : 0));
+            }
             // Setf position: reposition the underlying StringReader
             if (args[1] is Fixnum pos)
             {
                 if (sis.SeekToPosition((int)pos.Value))
+                {
+                    // The pushed-back character belonged to the old position.
+                    sis.UnreadCharValue = -1;
                     return Fixnum.Make(pos.Value);
+                }
             }
             return Nil.Instance;
         }
@@ -2441,10 +2497,30 @@ public static partial class Runtime
             try
             {
                 int byteWidth = GetBinaryByteWidth(fs);
-                if (fs.InputReader is StreamReader sr)
+                if (fs.InputReader is ByteTrackingReader sr && IsCharacterFileStream(fs))
                 {
-                    long pos = sr.BaseStream.Position;
+                    // The reader's own count, not BaseStream.Position: the latter is
+                    // where the byte buffer was filled to, which is past every
+                    // character not yet handed out. That is the whole bug -- one
+                    // READ-CHAR of a ten-byte file answered 10.
+                    //
+                    // A character pushed back with UNREAD-CHAR has not been consumed,
+                    // so the stream sits one character before what the reader has
+                    // taken. The string input branch above makes the same adjustment.
+                    long pos = sr.BytePosition;
+                    if (fs.UnreadCharValue != -1)
+                        pos -= sr.CurrentEncoding.GetByteCount(
+                                   new[] { (char)fs.UnreadCharValue });
+                    if (pos < 0) pos = 0;
                     return Fixnum.Make(byteWidth > 1 ? pos / byteWidth : pos);
+                }
+                // Binary file stream: the bytes never reach the decoder, since
+                // READ-BYTE takes them straight off BaseStream. Its position is
+                // exact there, and is what this always answered.
+                if (fs.InputReader is ByteTrackingReader bsr)
+                {
+                    long bpos = bsr.BaseStream.Position;
+                    return Fixnum.Make(byteWidth > 1 ? bpos / byteWidth : bpos);
                 }
                 if (fs.OutputWriter is StreamWriter sw)
                 {
@@ -2482,13 +2558,13 @@ public static partial class Runtime
 
             try
             {
-                if (fs.InputReader is StreamReader sr)
+                if (fs.InputReader is ByteTrackingReader sr)
                 {
                     if (isEnd)
                         sr.BaseStream.Seek(0, SeekOrigin.End);
                     else
                         sr.BaseStream.Seek(newPos, SeekOrigin.Begin);
-                    sr.DiscardBufferedData();
+                    sr.ResetTo(sr.BaseStream.Position);
                     return T.Instance;
                 }
                 if (fs.OutputWriter is StreamWriter sw)
@@ -2526,7 +2602,7 @@ public static partial class Runtime
         try
         {
             int byteWidth = GetBinaryByteWidth(fs);
-            if (fs.InputReader is StreamReader sr)
+            if (fs.InputReader is ByteTrackingReader sr)
                 return Fixnum.Make(sr.BaseStream.Length / byteWidth);
             if (fs.OutputWriter is StreamWriter sw)
             {

@@ -217,23 +217,27 @@ public static partial class Runtime
         Primary(obj) is Symbol sym && sym.HomePackage != null && sym.HomePackage.Name == "KEYWORD"
             ? T.Instance : Nil.Instance;
 
+    /// <summary>The type an array whose storage is named ET reports as its element
+    /// type. Shared with UPGRADED-ARRAY-ELEMENT-TYPE, which has to answer with the
+    /// same type an array built from the same specifier would report.</summary>
+    internal static LispObject ElementTypeNameToType(string et)
+    {
+        if (et == "NIL") return Nil.Instance;
+        // Compound types stored as "UNSIGNED-BYTE-8", "SIGNED-BYTE-16", etc.
+        // — reconstruct the list form (UNSIGNED-BYTE 8).
+        if (et.StartsWith("UNSIGNED-BYTE-") || et.StartsWith("SIGNED-BYTE-"))
+        {
+            int dash = et.LastIndexOf('-');
+            if (int.TryParse(et.Substring(dash + 1), out int n))
+                return new Cons(Startup.Sym(et[..dash]), new Cons(Fixnum.Make(n), Nil.Instance));
+        }
+        return Startup.Sym(et);
+    }
+
     public static LispObject ArrayElementType(LispObject array)
     {
         if (array is LispString) return Startup.Sym("CHARACTER");
-        if (array is LispVector v)
-        {
-            var et = v.ElementTypeName;
-            if (et == "NIL") return Nil.Instance;
-            // Compound types stored as "UNSIGNED-BYTE-8", "SIGNED-BYTE-16", etc.
-            // — reconstruct the list form (UNSIGNED-BYTE 8).
-            if (et.StartsWith("UNSIGNED-BYTE-") || et.StartsWith("SIGNED-BYTE-"))
-            {
-                int dash = et.LastIndexOf('-');
-                if (int.TryParse(et.Substring(dash + 1), out int n))
-                    return new Cons(Startup.Sym(et[..dash]), new Cons(Fixnum.Make(n), Nil.Instance));
-            }
-            return Startup.Sym(et);
-        }
+        if (array is LispVector v) return ElementTypeNameToType(v.ElementTypeName);
         throw new LispErrorException(new LispTypeError("ARRAY-ELEMENT-TYPE", array, Startup.Sym("ARRAY")));
     }
 

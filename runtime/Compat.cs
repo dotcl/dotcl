@@ -203,6 +203,31 @@ internal static class Compat
 #endif
     }
 
+
+    /// <summary>int.TryParse over a span. The span overloads of the numeric parsers
+    /// are .NET Core 2.1+ / net5.0+; System.Memory gives ns2.0 the ReadOnlySpan&lt;char&gt;
+    /// type but not those overloads, so there the span has to be materialised. Calling
+    /// int.TryParse(span, ...) directly compiles on the desktop targets and fails only
+    /// on the ns2.0 tripwire, which is why it goes through here.</summary>
+    public static bool TryParseInt(ReadOnlySpan<char> s, out int value)
+    {
+#if NETSTANDARD2_0
+        return int.TryParse(s.ToString(), out value);
+#else
+        return int.TryParse(s, out value);
+#endif
+    }
+    /// <summary>RUNTIMEINFORMATION.RUNTIMEIDENTIFIER is net5.0+. netstandard2.0 has
+    /// no run-time RID at all, so answer null there and let the caller fall through to
+    /// whatever it computes itself. Naming it directly compiles on the desktop targets
+    /// and fails only on the ns2.0 tripwire, which is why it goes through here.</summary>
+    public static string? RuntimeIdentifier =>
+#if NETSTANDARD2_0
+        null;
+#else
+        System.Runtime.InteropServices.RuntimeInformation.RuntimeIdentifier;
+#endif
+
     public static int SingleToInt32Bits(float value)
 #if NETSTANDARD2_0
         => BitConverter.ToInt32(BitConverter.GetBytes(value), 0);

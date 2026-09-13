@@ -112,6 +112,10 @@ public static class ControlFlowFilters
     /// handler funclet behind at every level (deep recursion with a handler-case
     /// per level died as an uncatchable .NET StackOverflowException at ~20k
     /// frames, a depth the same recursion survives a hundredfold without one).</summary>
+    /// <remarks>This is the pre-cluster-identity shape, kept because code compiled
+    /// before the change baked a reference to it: a fasl bakes the method token, and
+    /// a .sil names it. Same predicate, with the tag and the specifiers passed
+    /// separately.</remarks>
     public static int HandlerCaseClause(object ex, object tag, LispObject[] specs)
     {
         if (ex is HandlerCaseInvocationException hci)
@@ -122,6 +126,25 @@ public static class ControlFlowFilters
         if (cond == null) return -1;
         for (int i = 0; i < specs.Length; i++)
             if (Runtime.IsTruthy(Runtime.Typep(cond, specs[i]))) return i;
+        return -1;
+    }
+
+    /// <summary>HANDLER-CASE clause filter, cluster form: CLUSTER is both the type
+    /// specifiers to match against and the identity of this handler-case invocation.
+    /// It is allocated once per entry, so it is already unique, and SIGNAL throws
+    /// with the cluster it found the clause in. A separate tag object and a separate
+    /// specifier array said the same two things and cost 56 bytes on every entry,
+    /// signalled or not.</summary>
+    public static int HandlerCaseClause(object ex, HandlerBinding[] cluster)
+    {
+        if (ex is HandlerCaseInvocationException hci)
+            return ReferenceEquals(hci.Tag, cluster)
+                   && hci.ClauseIndex >= 0 && hci.ClauseIndex < cluster.Length
+                ? hci.ClauseIndex : -1;
+        var cond = ConditionOf(ex);
+        if (cond == null) return -1;
+        for (int i = 0; i < cluster.Length; i++)
+            if (Runtime.IsTruthy(Runtime.Typep(cond, cluster[i].TypeSpec))) return i;
         return -1;
     }
 

@@ -2140,6 +2140,21 @@ and symbol-macro scope is used as the starting point."
 (%define-condition-report (c package-error)
   (format stream "Package error on ~a." (package-error-package c)))
 
+;;; A package error that carries its own message.
+;;;
+;;; PACKAGE-ERROR has no format control of its own, so signalling one with
+;;; :FORMAT-CONTROL puts the text nowhere the report can reach: the standard
+;;; slots are SIMPLE-CONDITION's, and PACKAGE-ERROR is not one. The message is
+;;; dropped and the report falls back to "Package error on X." -- which is how
+;;; every message DEFPACKAGE writes about a package ("symbol X not found in
+;;; package Y") was being thrown away.
+;;;
+;;; Both supers, so a handler for PACKAGE-ERROR still catches it and
+;;; PACKAGE-ERROR-PACKAGE still answers, while the inherited report finds the
+;;; format control. SBCL has the same class for the same reason
+;;; (SB-INT:SIMPLE-PACKAGE-ERROR).
+(define-condition simple-package-error (simple-condition package-error) ())
+
 (%define-condition-report (c file-error)
   (format stream "Error on file ~a." (file-error-pathname c)))
 

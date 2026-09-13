@@ -112,6 +112,8 @@ public class FaslAssembler
         typeof(CilAssembler).GetMethod("GetFunctionBySymbol")!;
     internal static readonly MethodInfo GetSetfFunctionBySymbolMI =
         typeof(CilAssembler).GetMethod("GetSetfFunctionBySymbol")!;
+    internal static readonly MethodInfo SetLambdaListSourceMI =
+        typeof(Runtime).GetMethod("SetLambdaListSource")!;
     internal static readonly MethodInfo SetDirectDelegateMI =
         typeof(LispFunction).GetMethod("SetDirectDelegate")!;
     internal static readonly MethodInfo SetNativeDelegateMI =
@@ -328,18 +330,21 @@ public class FaslAssembler
                         pendingHead = null;
                         pendingTail = null;
                     }
-                    var (name, paramNames, bodyInstrs, defPkg, selfArg0, noFrame) = ParseDefmethodForm(inner);
+                    var (name, paramNames, bodyInstrs, defPkg, selfArg0, noFrame, lambdaList, directDelegates) = ParseDefmethodForm(inner);
                     int id = _methodCount++;
                     var onBody = _emitDebug ? RecordBodyMethod : (Action<MethodBuilder, CilAssembler>?)null;
                     if (sym.Name == "DEFMETHOD-DIRECT")
                         EmitDefmethodDirectInto(_tb, _initIl, _structInternMap,
-                            name, paramNames.Count, bodyInstrs, defPkg, id, selfArg0, onBody, noFrame);
+                            name, paramNames.Count, bodyInstrs, defPkg, id, selfArg0, onBody, noFrame,
+                            lambdaList);
                     else if (sym.Name == "DEFMETHOD-NATIVE")
                         EmitDefmethodNativeInto(_tb, _initIl, _structInternMap,
-                            name, paramNames.Count, bodyInstrs, defPkg, id, onBody, noFrame);
+                            name, paramNames.Count, bodyInstrs, defPkg, id, onBody, noFrame,
+                            lambdaList);
                     else
                         EmitDefmethodInto(_tb, _initIl, _structInternMap,
-                            name, paramNames.Count, bodyInstrs, defPkg, id, onBody, noFrame);
+                            name, paramNames.Count, bodyInstrs, defPkg, id, onBody, noFrame,
+                            lambdaList, directDelegates);
                 }
                 else
                 {
@@ -484,7 +489,7 @@ public class FaslAssembler
 
     // --- Shared parsing helper used by both FaslAssembler and CilAssembler FASL branch ---
 
-    internal static (string name, List<string> paramNames, LispObject body, string? defPkg, bool selfArg0, bool noFrame)
+    internal static (string name, List<string> paramNames, LispObject body, string? defPkg, bool selfArg0, bool noFrame, string? lambdaList, LispObject? directDelegates)
         ParseDefmethodForm(Cons instr)
     {
         // Parse: (:defmethod[-direct] "NAME" [:pkg "PKG"] [:self T] :params ("P1" ...) :body (...))
@@ -497,6 +502,8 @@ public class FaslAssembler
         string? defPkg = null;
         bool selfArg0 = false;
         bool noFrame = false;
+        string? lambdaList = null;
+        LispObject? directDelegates = null;
 
         while (plist is Cons pc)
         {
@@ -524,12 +531,23 @@ public class FaslAssembler
                 case "SELF":
                     selfArg0 = val is not Nil;  // self threaded as arg0
                     break;
+                case "LAMBDA-LIST":
+                    // Development information, written out as text: see
+                    // LispFunction.LambdaListSource.
+                    lambdaList = Runtime.FormatObject(val, true);
+                    break;
+                case "DIRECT-DELEGATES":
+                    // The concrete arities of an &optional / &key / &rest function.
+                    // Dropping these here is what made every such function loaded
+                    // from a fasl take the args-array entry.
+                    directDelegates = val;
+                    break;
             }
             plist = CilAssembler.Cddr(pc);
         }
 
         if (bodyInstrs == null) throw new Exception("FASL DEFMETHOD: missing :body");
-        return (name, paramNames, bodyInstrs, defPkg, selfArg0, noFrame);
+        return (name, paramNames, bodyInstrs, defPkg, selfArg0, noFrame, lambdaList, directDelegates);
     }
 
     // --- Core static emitters, callable from both FaslAssembler and CilAssembler FASL mode ---
@@ -543,7 +561,7 @@ public class FaslAssembler
         TypeBuilder tb, ILGenerator initIl, CilAssembler.FaslStructInternMap structMap,
         string name, int paramCount, LispObject bodyInstrs, string? defPkg, int id,
         bool selfArg0 = false, Action<MethodBuilder, CilAssembler>? onBodyMethod = null,
-        bool noFrame = false)
+        bool noFrame = false, string? lambdaList = null)
     {
         if (paramCount > 8)
             throw new Exception($"FASL DEFMETHOD-DIRECT: param-count {paramCount} > 8 not supported");
@@ -622,7 +640,7 @@ public class FaslAssembler
         // 3. Registration IL (includes _funcN for direct-call fast path). selfArg0 binds
         // the direct delegate's target to fn (open-instance, self bound).
         EmitRegistrationInto(initIl, name, wrapperMethod, paramCount, defPkg, bodyMethod, noFrame: noFrame,
-            selfBound: selfArg0);
+            selfBound: selfArg0, lambdaList: lambdaList);
     }
 
     /// <summary>
@@ -634,7 +652,8 @@ public class FaslAssembler
     internal static void EmitDefmethodInto(
         TypeBuilder tb, ILGenerator initIl, CilAssembler.FaslStructInternMap structMap,
         string name, int paramCount, LispObject bodyInstrs, string? defPkg, int id,
-        Action<MethodBuilder, CilAssembler>? onBodyMethod = null, bool noFrame = false)
+        Action<MethodBuilder, CilAssembler>? onBodyMethod = null, bool noFrame = false,
+        string? lambdaList = null, LispObject? directDelegates = null)
     {
         string methodName = SanitizeName(name) + "_" + id;
         var method = tb.DefineMethod(methodName,
@@ -653,8 +672,16 @@ public class FaslAssembler
         innerAsm.Assemble(bodyInstrs);
         if (onBodyMethod != null) onBodyMethod(method, innerAsm);
 
+        // Typed entries for the concrete arities of an &optional / &key / &rest
+        // function. The JIT path builds these from :direct-delegates as
+        // DynamicMethods; a fasl needs real methods on the TypeBuilder, but the
+        // delegate it installs at load is the same one. Without this every such
+        // function loaded from a fasl fell back to the args-array entry -- and we
+        // ship fasls, so that was the only shape a user ever ran.
+        var extraDirect = BuildDirectDelegateMethods(tb, structMap, methodName, directDelegates);
         // No _funcN for plain DEFMETHOD — body signature is LispObject[] -> LispObject.
-        EmitRegistrationInto(initIl, name, method, paramCount, defPkg, directBodyMethod: null, noFrame: noFrame);
+        EmitRegistrationInto(initIl, name, method, paramCount, defPkg, directBodyMethod: null, noFrame: noFrame,
+            lambdaList: lambdaList, extraDirect: extraDirect);
     }
 
     /// <summary>
@@ -665,7 +692,8 @@ public class FaslAssembler
     internal static void EmitDefmethodNativeInto(
         TypeBuilder tb, ILGenerator initIl, CilAssembler.FaslStructInternMap structMap,
         string name, int paramCount, LispObject bodyInstrs, string? defPkg, int id,
-        Action<MethodBuilder, CilAssembler>? onBodyMethod = null, bool noFrame = false)
+        Action<MethodBuilder, CilAssembler>? onBodyMethod = null, bool noFrame = false,
+        string? lambdaList = null)
     {
         if (paramCount < 1 || paramCount > 4)
             throw new Exception($"FASL DEFMETHOD-NATIVE: param-count {paramCount} not supported (1-4)");
@@ -764,7 +792,53 @@ public class FaslAssembler
         // delegate's target from null to fn.
         EmitRegistrationInto(initIl, name, wrapperMethod, paramCount, defPkg,
             directBodyMethod: directMethod, nativeBodyMethod: nativeMethod,
-            selfBound: true, noFrame: noFrame);
+            selfBound: true, noFrame: noFrame, lambdaList: lambdaList);
+    }
+
+    /// <summary>One typed arity of an &amp;optional / &amp;key / &amp;rest function:
+    /// the arity, whether the body wants the LispFunction threaded in as its
+    /// leading argument, and the method holding it.</summary>
+    private readonly record struct DirectArity(int Arity, bool SelfP, MethodBuilder Method);
+
+    /// <summary>Compile each ((arity self-p body) ...) spec into a method on the
+    /// fasl's type. The JIT path builds the same thing with DynamicMethod; a fasl
+    /// needs real methods, but the delegate installed at load is identical.</summary>
+    private static List<DirectArity> BuildDirectDelegateMethods(
+        TypeBuilder tb, CilAssembler.FaslStructInternMap structMap,
+        string baseName, LispObject? directDelegates)
+    {
+        var result = new List<DirectArity>();
+        if (directDelegates is not Cons) return result;
+        int n = 0;
+        for (var dd = directDelegates; dd is Cons ddc; dd = ddc.Cdr)
+        {
+            if (ddc.Car is not Cons spec) continue;
+            if (Runtime.Car(spec) is not Fixnum arityFx) continue;
+            int arity = (int)arityFx.Value;
+            if (arity < 0 || arity > 8) continue;
+            bool selfP = Runtime.Cadr(spec) is not Nil;
+            var body = Runtime.Caddr(spec);
+
+            int nParams = selfP ? arity + 1 : arity;
+            var types = new Type[nParams];
+            int off = selfP ? 1 : 0;
+            if (selfP) types[0] = typeof(LispFunction);
+            for (int i = 0; i < arity; i++) types[off + i] = typeof(LispObject);
+
+            var m = tb.DefineMethod($"{baseName}_dd{arity}_{n++}",
+                MethodAttributes.Public | MethodAttributes.Static,
+                typeof(LispObject), types);
+            var asm = new CilAssembler
+            {
+                _il = m.GetILGenerator(),
+                _faslMode = true,
+                _faslTypeBuilder = tb,
+                _faslStructMap = structMap,
+            };
+            asm.Assemble(body);
+            result.Add(new DirectArity(arity, selfP, m));
+        }
+        return result;
     }
 
     /// <summary>
@@ -780,7 +854,8 @@ public class FaslAssembler
     private static void EmitRegistrationInto(
         ILGenerator il, string name, MethodBuilder wrapperMethod, int paramCount,
         string? defPkg, MethodBuilder? directBodyMethod, MethodBuilder? nativeBodyMethod = null,
-        bool selfBound = false, bool noFrame = false)
+        bool selfBound = false, bool noFrame = false, string? lambdaList = null,
+        List<DirectArity>? extraDirect = null)
     {
         var fnLocal = il.DeclareLocal(typeof(LispFunction));
 
@@ -794,6 +869,17 @@ public class FaslAssembler
         il.Emit(OpCodes.Ldc_I4, paramCount);
         il.Emit(OpCodes.Newobj, LispFuncCtor);
         il.Emit(OpCodes.Stloc, fnLocal);
+
+        // How the function is called, for a tool to show. Carried as the text it
+        // was written as and parsed only if something asks: a FASL has no constant
+        // pool to hang the list on, and building one per function at load time
+        // would charge every start-up for what almost nothing reads.
+        if (lambdaList != null)
+        {
+            il.Emit(OpCodes.Ldloc, fnLocal);
+            il.Emit(OpCodes.Ldstr, lambdaList);
+            il.Emit(OpCodes.Call, SetLambdaListSourceMI);
+        }
 
         // (optimize (debug 0)): keep the name, drop the debugger frame.
         if (noFrame)
@@ -813,6 +899,20 @@ public class FaslAssembler
             il.Emit(OpCodes.Ldftn, directBodyMethod);
             il.Emit(OpCodes.Newobj, TypedFuncCtors[paramCount]);
             il.Emit(OpCodes.Callvirt, SetDirectDelegateMI);
+        }
+
+        // The extra typed arities, installed the same way: a self-taking body binds
+        // fn as the delegate's target so the open signature still matches Func<...>.
+        if (extraDirect != null)
+        {
+            foreach (var d in extraDirect)
+            {
+                il.Emit(OpCodes.Ldloc, fnLocal);
+                if (d.SelfP) il.Emit(OpCodes.Ldloc, fnLocal); else il.Emit(OpCodes.Ldnull);
+                il.Emit(OpCodes.Ldftn, d.Method);
+                il.Emit(OpCodes.Newobj, TypedFuncCtors[d.Arity]);
+                il.Emit(OpCodes.Callvirt, SetDirectDelegateMI);
+            }
         }
 
         // Install _nativeFuncN for native long→long fast path
@@ -912,6 +1012,9 @@ public class FaslAssembler
             "FASL emission (compile-file) requires .NET 9+; this runtime build runs precompiled .fasl only"));
 #else
         EmitPreinternSymbols();
+        // Before the initializer is closed: the array every uninterned symbol is
+        // indexed out of, built from a names blob rather than from per-symbol IL.
+        _structInternMap.EmitUninternedTableInit(_cctorIl);
 
         // return Nil.Instance
         _initIl.Emit(OpCodes.Ldsfld,

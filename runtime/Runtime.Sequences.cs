@@ -86,8 +86,8 @@ public static partial class Runtime
     // Compare substrings; returns (mismatchPos, cmpSign) where:
     //   mismatchPos = index in s1 of first difference (or start1 + min(len1,len2))
     //   cmpSign = negative(s1<s2), 0(equal), positive(s1>s2)
-    private static (int pos, int cmp) CompareSubstrings(string s1, int start1, int end1,
-        string s2, int start2, int end2, bool ignoreCase)
+    private static (int pos, int cmp) CompareSubstrings(ReadOnlySpan<char> s1, int start1, int end1,
+        ReadOnlySpan<char> s2, int start2, int end2, bool ignoreCase)
     {
         int len1 = end1 - start1, len2 = end2 - start2;
         int minLen = Math.Min(len1, len2);
@@ -118,8 +118,8 @@ public static partial class Runtime
     private static (int pos, int cmp) CompareFull2(LispObject a, LispObject b,
                                                    string fname, bool ignoreCase)
     {
-        var s1 = ToStringDesignator(a, fname);
-        var s2 = ToStringDesignator(b, fname);
+        var s1 = ToStringSpan(a, fname);
+        var s2 = ToStringSpan(b, fname);
         return CompareSubstrings(s1, 0, s1.Length, s2, 0, s2.Length, ignoreCase);
     }
 
@@ -2718,6 +2718,56 @@ public static partial class Runtime
             return subHead ?? (LispObject)Nil.Instance;
         }
 
+
+        // A string or vector answer has exactly the input's length -- SUBSTITUTE
+        // replaces elements, it never adds or drops one -- so it can be written
+        // straight into a destination of that size. The general path below
+        // materialises every element into a List, builds a second List of the
+        // result, and hands that to the coercion: three intermediates for a
+        // sequence whose size was known before the walk started. That is the
+        // shape REMOVE was taken out of; SUBSTITUTE still had it.
+        //
+        // :FROM-END is left to the general path. It changes which elements are
+        // replaced only together with :COUNT, and getting that right needs the
+        // right-to-left marking pass the code below already has.
+        if (!kw.FromEnd && (seq is LispString || seq is LispVector))
+        {
+            int flen = seq is LispString fs ? fs.Length : ((LispVector)seq).Length;
+            int fstart = kw.Start;
+            int fend = kw.End ?? flen;
+            CheckBoundingIndices(fstart, fend, flen, "SUBSTITUTE");
+            int subbed = 0;
+            if (seq is LispString sstr)
+            {
+                var chars = new char[flen];
+                for (int i = 0; i < flen; i++)
+                {
+                    var elem = LispChar.Make(sstr[i]);
+                    bool take = i >= fstart && i < fend
+                                && (!maxSub.HasValue || subbed < maxSub.Value)
+                                && matches.Match(elem);
+                    if (take) subbed++;
+                    // The cast is what makes a non-character NEWITEM an error, as
+                    // it was when the coercion did it -- and, as there, only when
+                    // something actually matched.
+                    chars[i] = ((LispChar)(take ? newitem : elem)).Value;
+                }
+                return new LispString(new string(chars));
+            }
+            var svec = (LispVector)seq;
+            var items = new LispObject[flen];
+            for (int i = 0; i < flen; i++)
+            {
+                var elem = svec[i];
+                bool take = i >= fstart && i < fend
+                            && (!maxSub.HasValue || subbed < maxSub.Value)
+                            && matches.Match(elem);
+                if (take) subbed++;
+                items[i] = take ? newitem : elem;
+            }
+            return new LispVector(items, svec.ElementTypeName);
+        }
+
         // Collect elements
         var allElems = new System.Collections.Generic.List<LispObject>();
         int len;
@@ -3167,18 +3217,41 @@ public static partial class Runtime
         if (hasUnknown && allowOtherKeys != true)
             throw new LispErrorException(new LispProgramError("MISMATCH: unknown keyword argument"));
 
-        // Collect elements from both sequences
-        var elems1 = CollectSeqElements(seq1, "MISMATCH");
-        var elems2 = CollectSeqElements(seq2, "MISMATCH");
-        int len1 = elems1.Length;
-        int len2 = elems2.Length;
+        return MismatchCore(seq1, seq2, testFn, testNotFn, keyFn, s1, e1opt, s2, e2opt, fromEnd);
+    }
+
+    /// <summary>(MISMATCH a b) with no keywords: straight to the core. Wrapping the
+    /// two arguments in an array so the keyword parser could look at them was an
+    /// allocation per call, the same one SEARCH's two-argument entry removed.</summary>
+    public static LispObject Mismatch2(LispObject seq1, LispObject seq2)
+        => MismatchCore(seq1, seq2, null, null, null, 0, null, 0, null, false);
+
+    private static LispObject MismatchCore(LispObject seq1, LispObject seq2,
+                                           LispFunction? testFn, LispFunction? testNotFn,
+                                           LispFunction? keyFn,
+                                           int s1, int? e1opt, int s2, int? e2opt, bool fromEnd)
+    {
+        int len1 = SeqLengthChecked(seq1, "MISMATCH");
+        int len2 = SeqLengthChecked(seq2, "MISMATCH");
         int e1 = e1opt ?? len1;
         int e2 = e2opt ?? len2;
+        // MISMATCH was the one bounding-index taker that did not check: SEARCH,
+        // SUBSTITUTE, REPLACE and FILL all call this. Without it a reversed or
+        // out-of-range range produced an answer instead of an error, and it could
+        // be a negative index -- (mismatch "hi" "hello" :start2 4 :end2 2) answered
+        // -2. Both sequences are checked, SEQ1 first, so the message names the
+        // range the caller wrote first.
+        CheckBoundingIndices(s1, e1, len1, "MISMATCH");
+        CheckBoundingIndices(s2, e2, len2, "MISMATCH");
         int count1 = e1 - s1;
         int count2 = e2 - s2;
 
         if (fromEnd)
         {
+            // Reading from the right needs random access, which a list does not
+            // have; this direction keeps the copy.
+            var elems1 = CollectSeqElements(seq1, "MISMATCH");
+            var elems2 = CollectSeqElements(seq2, "MISMATCH");
             for (int i = 1; i <= count1 && i <= count2; i++)
             {
                 var x1 = elems1[e1 - i];
@@ -3195,10 +3268,16 @@ public static partial class Runtime
         }
         else
         {
+            // Forward: each element is read once and in order, so a cursor is
+            // enough. Copying both sequences into LispObject[] first -- for a
+            // walk that usually stops at the first difference -- was most of what
+            // MISMATCH cost.
+            var cur1 = new ForwardSeqCursor(seq1, s1);
+            var cur2 = new ForwardSeqCursor(seq2, s2);
             for (int i = 0; i < count1 && i < count2; i++)
             {
-                var x1 = elems1[s1 + i];
-                var x2 = elems2[s2 + i];
+                var x1 = cur1.Next();
+                var x2 = cur2.Next();
                 var k1 = ApplyKeyFn(keyFn, x1);
                 var k2 = ApplyKeyFn(keyFn, x2);
                 bool match = testNotFn != null ? !IsTruthy(testNotFn.Invoke2(k1, k2))
@@ -3207,6 +3286,56 @@ public static partial class Runtime
                 if (!match) return Fixnum.Make(s1 + i);
             }
             return count1 == count2 ? (LispObject)Nil.Instance : Fixnum.Make(s1 + Math.Min(count1, count2));
+        }
+    }
+
+    /// <summary>The sequence's length, with the same type check COLLECTSEQELEMENTS
+    /// makes, but without copying it.</summary>
+    private static int SeqLengthChecked(LispObject seq, string fnName)
+    {
+        if (seq is LispVector v) return v.Length;
+        if (seq is LispString s) return s.Length;
+        if (seq is Nil) return 0;
+        if (seq is Cons)
+        {
+            int n = 0;
+            for (var c = seq; c is Cons cc; c = cc.Cdr) n++;
+            return n;
+        }
+        throw new LispErrorException(new LispTypeError($"{fnName}: not a sequence", seq));
+    }
+
+    /// <summary>Reads one sequence left to right without copying it: an index for a
+    /// string or vector, a cons pointer for a list. NEXT is only called as many
+    /// times as the caller's bounds allow, so it does not re-check them.</summary>
+    private struct ForwardSeqCursor
+    {
+        private readonly LispVector? _vec;
+        private readonly LispString? _str;
+        private LispObject? _cell;
+        private int _idx;
+
+        public ForwardSeqCursor(LispObject seq, int start)
+        {
+            _vec = seq as LispVector;
+            _str = seq as LispString;
+            _idx = start;
+            _cell = null;
+            if (_vec == null && _str == null)
+            {
+                var c = seq;
+                for (int i = 0; i < start && c is Cons cc; i++) c = cc.Cdr;
+                _cell = c;
+            }
+        }
+
+        public LispObject Next()
+        {
+            if (_vec != null) return _vec[_idx++];
+            if (_str != null) return LispChar.Make(_str[_idx++]);
+            var cell = (Cons)_cell!;
+            _cell = cell.Cdr;
+            return cell.Car;
         }
     }
 
@@ -3395,8 +3524,8 @@ public static partial class Runtime
         // Fast path: string-to-string search with default EQL test
         if (seq1 is LispString searchStr1 && seq2 is LispString searchStr2 && keyFn == null && testFn == null && testNotFn == null)
         {
-            var chars1 = searchStr1.RawChars;
-            var chars2 = searchStr2.RawChars;
+            var chars1 = searchStr1.Chars;
+            var chars2 = searchStr2.Chars;
             if (fromEnd)
             {
                 for (int i = limit; i >= start2; i--)
@@ -3672,8 +3801,9 @@ public static partial class Runtime
         Emitter.CilAssembler.RegisterFunction("NOTANY",
             new LispFunction(args => Runtime.IsTruthy(Runtime.Some(args)) ? Nil.Instance : T.Instance));
         // MISMATCH, REMOVE-DUPLICATES, DELETE-DUPLICATES, REPLACE
-        Emitter.CilAssembler.RegisterFunction("MISMATCH",
-            new LispFunction(args => Runtime.MismatchFull(args)));
+        var mismatchFn = new LispFunction(args => Runtime.MismatchFull(args));
+        mismatchFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject>)Runtime.Mismatch2);
+        Emitter.CilAssembler.RegisterFunction("MISMATCH", mismatchFn);
         var removeDupFn = new LispFunction(args => Runtime.RemoveDuplicatesFull(args));
         removeDupFn.SetDirectDelegate((Func<LispObject, LispObject>)Runtime.RemoveDuplicates1);
         Emitter.CilAssembler.RegisterFunction("REMOVE-DUPLICATES", removeDupFn);

@@ -1403,7 +1403,13 @@
 
 ;;; MAKE-METHOD-LAMBDA: defmethod hands its method lambda over at macroexpansion
 ;;; time and compiles what comes back, so a generic function class can wrap method
-;;; bodies. The lambda handed over is dotcl's own, with the arguments spread.
+;;; bodies. The lambda handed over is dotcl's own, with the arguments spread; what
+;;; comes back is in the AMOP shape, which is a different thing -- see
+;;; AMOP-METHOD-LAMBDA-SHAPE.
+;;;
+;;; A method here edits the lambda expression and lets CALL-NEXT-METHOD turn it
+;;; into a method lambda. That is the portable idiom: only the default method
+;;; knows how to make one.
 
 (defvar *mop-mml-asked* nil)
 (defvar *mop-mml-body-ran* nil)
@@ -1412,11 +1418,13 @@
   (:metaclass dotcl-mop:funcallable-standard-class))
 (defmethod dotcl-mop:make-method-lambda
     ((gf mop-mml-gf) method lambda-expression environment)
-  (declare (ignore method environment))
   (setf *mop-mml-asked* t)
-  (list* (first lambda-expression)
-         (second lambda-expression)
-         (cons '(setf *mop-mml-body-ran* t) (cddr lambda-expression))))
+  (call-next-method gf method
+                    (list* (first lambda-expression)
+                           (second lambda-expression)
+                           (cons '(setf *mop-mml-body-ran* t)
+                                 (cddr lambda-expression)))
+                    environment))
 
 (defgeneric mop-mml-through (x) (:generic-function-class mop-mml-gf))
 

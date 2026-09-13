@@ -822,6 +822,34 @@ public static class Startup
         SetDoubleFloatConst("LEAST-POSITIVE-NORMALIZED-LONG-FLOAT", 2.2250738585072014e-308);
         SetDoubleFloatConst("LEAST-NEGATIVE-NORMALIZED-LONG-FLOAT", -2.2250738585072014e-308);
 
+        // Ahead-of-time sibling for a fasl: <fasl>.r2r-<rid>. Loading prefers it
+        // when present (Runtime.TryFindR2rSibling), so the caller only has to say
+        // WHEN, never how it is found.
+        // (dotcl:r2r-stats) => (loaded-from-sibling . fasls-loaded)
+        DotclPkg.Export(SymInPkg("R2R-STATS", "DOTCL"));
+        Emitter.CilAssembler.RegisterFunction("R2R-STATS", new LispFunction(args =>
+            new Cons(Fixnum.Make(Runtime.R2rFaslsLoaded),
+                     Fixnum.Make(Runtime.FaslsLoaded)), "R2R-STATS"));
+        SymInPkg("R2R-STATS", "DOTCL").Function =
+            Emitter.CilAssembler.GetFunction("R2R-STATS");
+
+        // Returns T when a sibling was written.
+        //
+        // On the symbol as well as in the assembler's table: the ASDF :after hook
+        // is EVALuated, and an interpreted call goes through SYMBOL-FUNCTION.
+        // Registering only one of the two makes it callable from compiled code and
+        // invisible to eval, which fails silently inside the hook's ignore-errors.
+        DotclPkg.Export(SymInPkg("WRITE-R2R-SIBLING", "DOTCL"));
+        RegisterUnaryOnSymbol("WRITE-R2R-SIBLING", "DOTCL", a => {
+            var path = a is LispString ls ? ls.Value
+                     : a is LispPathname lp ? lp.ToNamestring()
+                     : throw new LispErrorException(new LispProgramError(
+                           "WRITE-R2R-SIBLING: not a pathname designator"));
+            Runtime.WriteR2rSibling(path);
+            return System.IO.File.Exists(path + ".r2r-" + Runtime.PortableRidForLisp())
+                ? (LispObject)T.Instance : Nil.Instance;
+        });
+
         // Float bit-level access. Non-standard, so these land in DOTCL-INTERNAL —
         // SymForRegistration's fallback — and are reached from other packages through
         // the bridge in Startup.SymFn, which is consulted only AFTER the caller's own
@@ -1109,6 +1137,14 @@ public static class Startup
     }
 
     // FlushStream: moved to Runtime.IO.cs
+
+    /// <summary>RegisterUnary, and also on the symbol so SYMBOL-FUNCTION finds it.</summary>
+    internal static void RegisterUnaryOnSymbol(string name, string pkg, Func<LispObject, LispObject> fn)
+    {
+        RegisterUnary(name, fn);
+        var sym = SymInPkg(name, pkg);
+        sym.Function = Emitter.CilAssembler.GetFunction(name);
+    }
 
     internal static void RegisterUnary(string name, Func<LispObject, LispObject> fn)
     {
@@ -1851,6 +1887,29 @@ public static class Startup
     private static void RegisterDotclFunctions()
     {
         // dotcl:*save-sil* — when true, defun stores SIL on symbol plist as %SIL
+        // dotcl:*compile-r2r* / dotcl:*load-r2r* — the ahead-of-time sibling of a
+        // fasl (<fasl>.r2r-<rid>). Writing one costs a crossgen2 run per file and
+        // ~4x the disk; reading one removes the JIT at load (Coalton: 33 s -> 11 s,
+        // 490 MB -> 397 MB, for +9.5% compile time). Whether that trade is worth
+        // taking depends on how the file is used, so it is a decision the image
+        // makes, not a property of the build.
+        //
+        // Variables rather than environment: they can be bound around one
+        // operation, changed after startup, and seen by ASDF at the moment it
+        // compiles. The environment only picks the initial value, for a CI or make
+        // invocation that has no Lisp to run first.
+        var compileR2rSym = SymInPkg("*COMPILE-R2R*", "DOTCL");
+        DotclPkg.Export(compileR2rSym);
+        compileR2rSym.IsSpecial = true;
+        compileR2rSym.Value = Environment.GetEnvironmentVariable("DOTCL_R2R_AFTER_COMPILE") == "1"
+            ? T.Instance : (LispObject)Nil.Instance;
+
+        var loadR2rSym = SymInPkg("*LOAD-R2R*", "DOTCL");
+        DotclPkg.Export(loadR2rSym);
+        loadR2rSym.IsSpecial = true;
+        loadR2rSym.Value = Environment.GetEnvironmentVariable("DOTCL_NO_R2R_FASL") == "1"
+            ? Nil.Instance : (LispObject)T.Instance;
+
         var saveSilSym = SymInPkg("*SAVE-SIL*", "DOTCL");
         DotclPkg.Export(saveSilSym);
         saveSilSym.IsSpecial = true;
@@ -2837,6 +2896,12 @@ public static class Startup
             return Runtime.DotNetHintType(args[0]);
         }, "DOTNET:HINT-TYPE", 1),
             "(dotnet:hint-type obj) => type-or-nil\nFor a dotnet:box value, return its hint type (the user-supplied static type used\nto choose overloads) as a System.Type; NIL if OBJ carries no hint. See\ndotnet:object-type for the actual runtime type.");
+        RegisterDotNet(DotNetPkg, "TYPE-NAMES", new LispFunction(Runtime.DotNetTypeNames, "DOTNET:TYPE-NAMES", -1),
+            "(dotnet:type-names prefix &key limit) => list of plists\nThe type names starting with PREFIX, as (:name :kind). KIND is :class for a type and\n:namespace for a name that only leads to more names, so \"System.Te\" answers with the\nnamespace \"System.Text.\" as well as the types directly under it. LIMIT caps the\nresult (default 200). Indexed once per change to the loaded assemblies, so a package\npulled in with nuget:require shows up without restarting.");
+        RegisterDotNet(DotNetPkg, "DOCUMENTATION", new LispFunction(Runtime.DotNetDocumentation, "DOTNET:DOCUMENTATION", -1),
+            "(dotnet:documentation type-or-object &optional member-name) => plist-or-nil\nThe prose .NET ships for a type, or for one of its members: (:summary :parameters\n:returns :exceptions), where :parameters and :exceptions are alists. Read from the XML\nfile beside the assembly, or from the reference pack for the shared framework (which\nships none). NIL when nothing documents it. A property accessor is answered under the\nproperty (get_Length as Length), and an inherited member under the type that declares\nit. e.g. (dotnet:documentation \"System.Text.StringBuilder\" \"AppendLine\").");
+        RegisterDotNet(DotNetPkg, "MEMBERS", new LispFunction(Runtime.DotNetMembers, "DOTNET:MEMBERS", -1),
+            "(dotnet:members type-or-object &key kind prefix static inherited extensions documentation) => list of plists\nList what can be called on a type, or on the runtime type of an object: each entry is a plist\n(:name :kind :static :signature :declaring-type). KIND keeps one of :method :property :field\n:event :constructor; PREFIX keeps names starting with a string (case-insensitive); STATIC is\n:both (default), :static or :instance; INHERITED defaults to T; EXTENSIONS defaults to T and\nadds the extension methods that apply to the type. DOCUMENTATION adds :documentation, the\nsentence .NET ships for the member, to the entries that have one. Property accessors are listed under the\nnames dotnet:invoke takes (get_Item, set_Width).");
         RegisterDotNet(DotNetPkg, "OBJECT-TYPE", new LispFunction(args => {
             if (args.Length != 1) throw new LispErrorException(new LispProgramError($"DOTNET:OBJECT-TYPE: requires 1 argument, got {args.Length}"));
             return Runtime.DotNetObjectType(args[0]);

@@ -1326,7 +1326,7 @@ public static partial class Runtime
         // If both arguments are the same symbol, it's trivially a subtype of itself
         if (type1 is Symbol && ReferenceEquals(type1, type2))
         {
-            MultipleValues.Set(T.Instance, T.Instance);
+            MultipleValues.SetPair(T.Instance, T.Instance);
             return T.Instance;
         }
 
@@ -1349,7 +1349,7 @@ public static partial class Runtime
             if (certain)
             {
                 if (s_ctypeStatsOn) s_ctypeHits++;
-                MultipleValues.Set(result ? T.Instance : Nil.Instance, T.Instance);
+                MultipleValues.SetPair(result ? T.Instance : Nil.Instance, T.Instance);
                 return result ? T.Instance : Nil.Instance;
             }
             if (s_ctypeStatsOn) s_ctypeMisses++;
@@ -1365,7 +1365,7 @@ public static partial class Runtime
         // NIL is the bottom type — subtype of everything (CLHS 4.2.2)
         if (name1 == "NIL")
         {
-            MultipleValues.Set(T.Instance, T.Instance);
+            MultipleValues.SetPair(T.Instance, T.Instance);
             return T.Instance;
         }
 
@@ -1374,7 +1374,7 @@ public static partial class Runtime
             bool result = CheckSubtype(name1, name2);
             if (result)
             {
-                MultipleValues.Set(T.Instance, T.Instance);
+                MultipleValues.SetPair(T.Instance, T.Instance);
                 return T.Instance;
             }
             // If name1 is not a known built-in type, not a registered user type (deftype),
@@ -1385,10 +1385,10 @@ public static partial class Runtime
                 || FindClassByName(name1) != null;
             if (!type1Known)
             {
-                MultipleValues.Set(Nil.Instance, Nil.Instance);
+                MultipleValues.SetPair(Nil.Instance, Nil.Instance);
                 return Nil.Instance;
             }
-            MultipleValues.Set(Nil.Instance, T.Instance);
+            MultipleValues.SetPair(Nil.Instance, T.Instance);
             return Nil.Instance;
         }
 
@@ -1401,7 +1401,7 @@ public static partial class Runtime
             var (base2, low2, lowInc2, high2, highInc2) = interval2.Value;
             bool result = NumericIntervalSubtype(base1, low1, lowInc1, high1, highInc1,
                                                   base2, low2, lowInc2, high2, highInc2);
-            MultipleValues.Set(result ? T.Instance : Nil.Instance, T.Instance);
+            MultipleValues.SetPair(result ? T.Instance : Nil.Instance, T.Instance);
             return result ? T.Instance : Nil.Instance;
         }
         // type1 is compound numeric but type2 is a plain name
@@ -1418,22 +1418,22 @@ public static partial class Runtime
                 bool unboundedHigh = rawHigh == null || (rawHigh is Symbol ws2 && ws2.Name == "*");
                 // (INTEGER n n) where n is Bignum: singleton bignum range
                 if (rawLow is Bignum && rawHigh is Bignum)
-                { MultipleValues.Set(T.Instance, T.Instance); return T.Instance; }
+                { MultipleValues.SetPair(T.Instance, T.Instance); return T.Instance; }
                 // (INTEGER (max-fixnum) *): exclusive bound at MOST-POSITIVE-FIXNUM = positive bignums
                 if (unboundedHigh && rawLow is Cons lowExcl && lowExcl.Car is Fixnum lef && lef.Value == long.MaxValue)
-                { MultipleValues.Set(T.Instance, T.Instance); return T.Instance; }
+                { MultipleValues.SetPair(T.Instance, T.Instance); return T.Instance; }
                 // (INTEGER * (min-fixnum)): exclusive bound at MOST-NEGATIVE-FIXNUM = negative bignums
                 if (unboundedLow && rawHigh is Cons highExcl && highExcl.Car is Fixnum hef && hef.Value == long.MinValue)
-                { MultipleValues.Set(T.Instance, T.Instance); return T.Instance; }
+                { MultipleValues.SetPair(T.Instance, T.Instance); return T.Instance; }
                 // (INTEGER n n) where n is Fixnum: definitely not a bignum
                 if (rawLow is Fixnum && rawHigh is Fixnum)
-                { MultipleValues.Set(Nil.Instance, T.Instance); return Nil.Instance; }
+                { MultipleValues.SetPair(Nil.Instance, T.Instance); return Nil.Instance; }
                 // Otherwise uncertain
-                MultipleValues.Set(Nil.Instance, Nil.Instance);
+                MultipleValues.SetPair(Nil.Instance, Nil.Instance);
                 return Nil.Instance;
             }
             bool result = CheckSubtype(base1, name2);
-            MultipleValues.Set(result ? T.Instance : Nil.Instance, T.Instance);
+            MultipleValues.SetPair(result ? T.Instance : Nil.Instance, T.Instance);
             return result ? T.Instance : Nil.Instance;
         }
 
@@ -1453,7 +1453,7 @@ public static partial class Runtime
                 if (interval2Bounded && name1 is "BIGNUM" or "INTEGER")
                 {
                     // BIGNUM/INTEGER can exceed any finite bound
-                    MultipleValues.Set(Nil.Instance, T.Instance); return Nil.Instance;
+                    MultipleValues.SetPair(Nil.Instance, T.Instance); return Nil.Instance;
                 }
                 if (interval2Bounded && name1 == "FIXNUM")
                 {
@@ -1461,14 +1461,14 @@ public static partial class Runtime
                     bool fitsLow = !low2.HasValue || low2.Value <= (double)long.MinValue;
                     bool fitsHigh = !high2.HasValue || high2.Value >= (double)long.MaxValue;
                     bool fits = fitsLow && fitsHigh;
-                    MultipleValues.Set(fits ? T.Instance : Nil.Instance, T.Instance);
+                    MultipleValues.SetPair(fits ? T.Instance : Nil.Instance, T.Instance);
                     return fits ? T.Instance : Nil.Instance;
                 }
-                MultipleValues.Set(T.Instance, T.Instance); return T.Instance;
+                MultipleValues.SetPair(T.Instance, T.Instance); return T.Instance;
             }
-            if (!super) { MultipleValues.Set(Nil.Instance, T.Instance); return Nil.Instance; }
+            if (!super) { MultipleValues.SetPair(Nil.Instance, T.Instance); return Nil.Instance; }
             // name1 is a supertype of base2: not a subtype of the interval
-            MultipleValues.Set(Nil.Instance, T.Instance); return Nil.Instance;
+            MultipleValues.SetPair(Nil.Instance, T.Instance); return Nil.Instance;
         }
 
         // Handle ARRAY/VECTOR compound type specifiers
@@ -1485,7 +1485,7 @@ public static partial class Runtime
             bool simpleRequired = type2 is Cons c2h && c2h.Car is Symbol cs2 && cs2.Name.Contains("SIMPLE");
             if (!simpleRequired && name2 != null) simpleRequired = name2.Contains("SIMPLE");
             if (simpleRequired && !simple1) res = false;
-            MultipleValues.Set(res ? T.Instance : Nil.Instance, T.Instance);
+            MultipleValues.SetPair(res ? T.Instance : Nil.Instance, T.Instance);
             return res ? T.Instance : Nil.Instance;
         }
         // arr1 is array type but arr2 is plain name (non-array)
@@ -1504,7 +1504,7 @@ public static partial class Runtime
                        (name2 == "SIMPLE-BASE-STRING" && isRank1 && isCharElem && isSimple) ? true :
                        (name2 == "SIMPLE-ARRAY" && arr1.Value.ElemType != "*") ? false : // conservative
                        false;
-            MultipleValues.Set(res ? T.Instance : Nil.Instance, T.Instance);
+            MultipleValues.SetPair(res ? T.Instance : Nil.Instance, T.Instance);
             return res ? T.Instance : Nil.Instance;
         }
         // arr2 is array type but arr1 is plain name (non-compound)
@@ -1531,7 +1531,7 @@ public static partial class Runtime
                     }
                 }
             }
-            MultipleValues.Set(res ? T.Instance : Nil.Instance, T.Instance);
+            MultipleValues.SetPair(res ? T.Instance : Nil.Instance, T.Instance);
             return res ? T.Instance : Nil.Instance;
         }
 
@@ -1548,12 +1548,12 @@ public static partial class Runtime
                 if (cx1 == "*" && cx2 == "*")
                 {
                     // Both bare COMPLEX → equivalent
-                    MultipleValues.Set(T.Instance, T.Instance); return T.Instance;
+                    MultipleValues.SetPair(T.Instance, T.Instance); return T.Instance;
                 }
                 if (cx2 == "*")
                 {
                     // (COMPLEX type) <: COMPLEX → always true
-                    MultipleValues.Set(T.Instance, T.Instance); return T.Instance;
+                    MultipleValues.SetPair(T.Instance, T.Instance); return T.Instance;
                 }
                 if (cx1 == "*")
                 {
@@ -1563,7 +1563,7 @@ public static partial class Runtime
                     // It's only a subtype of (COMPLEX type) if (COMPLEX type) covers everything
                     // That only happens if all our upgraded types (REAL, SF, DF) equal ucpt(type)
                     // which is impossible since they differ. So: false.
-                    MultipleValues.Set(Nil.Instance, T.Instance); return Nil.Instance;
+                    MultipleValues.SetPair(Nil.Instance, T.Instance); return Nil.Instance;
                 }
                 // Both are specific compound types — compare upgraded part types.
                 // CLHS 12.1.5.3: (complex T1) <: (complex T2) if ucpt(T1) = ucpt(T2).
@@ -1574,7 +1574,7 @@ public static partial class Runtime
                 var up2 = UpgradeComplexPartTypeName(cx2);
                 if (up1 == up2)
                 {
-                    MultipleValues.Set(T.Instance, T.Instance); return T.Instance;
+                    MultipleValues.SetPair(T.Instance, T.Instance); return T.Instance;
                 }
                 // Fallback: check if part type T1 <: part type T2 via raw subtypep
                 var raw1 = ExtractComplexPartTypeRaw(type1, name1);
@@ -1586,17 +1586,17 @@ public static partial class Runtime
                     var partCertain = mv.Length > 1 ? mv[1] : Nil.Instance;
                     if (partSub != Nil.Instance && partCertain != Nil.Instance)
                     {
-                        MultipleValues.Set(T.Instance, T.Instance); return T.Instance;
+                        MultipleValues.SetPair(T.Instance, T.Instance); return T.Instance;
                     }
                 }
-                MultipleValues.Set(Nil.Instance, T.Instance);
+                MultipleValues.SetPair(Nil.Instance, T.Instance);
                 return Nil.Instance;
             }
             if (cx1 != null && name2 != null)
             {
                 // (COMPLEX type) <: COMPLEX, NUMBER, T
                 bool res = name2 is "COMPLEX" or "NUMBER" or "T" or "ATOM";
-                MultipleValues.Set(res ? T.Instance : Nil.Instance, T.Instance);
+                MultipleValues.SetPair(res ? T.Instance : Nil.Instance, T.Instance);
                 return res ? T.Instance : Nil.Instance;
             }
             if (cx2 != null && name1 != null)
@@ -1605,13 +1605,13 @@ public static partial class Runtime
                 {
                     // name1 <: COMPLEX: true if name1 is COMPLEX
                     bool res2 = name1 == "COMPLEX";
-                    MultipleValues.Set(res2 ? T.Instance : Nil.Instance, T.Instance);
+                    MultipleValues.SetPair(res2 ? T.Instance : Nil.Instance, T.Instance);
                     return res2 ? T.Instance : Nil.Instance;
                 }
                 // name1 <: (COMPLEX type): COMPLEX <: (COMPLEX type) only if all ucpts
                 // are subtypes of ucpt(type), which requires ucpt(type) = REAL
                 bool res = name1 == "COMPLEX" && UpgradeComplexPartTypeName(cx2) == "REAL";
-                MultipleValues.Set(res ? T.Instance : Nil.Instance, T.Instance);
+                MultipleValues.SetPair(res ? T.Instance : Nil.Instance, T.Instance);
                 return res ? T.Instance : Nil.Instance;
             }
         }
@@ -1629,13 +1629,13 @@ public static partial class Runtime
         {
             // (CONS NIL ...) or (CONS ... NIL) is empty type: subtype of everything
             if (IsNilType(car1) || IsNilType(cdr1))
-            { MultipleValues.Set(T.Instance, T.Instance); return T.Instance; }
+            { MultipleValues.SetPair(T.Instance, T.Instance); return T.Instance; }
 
             if (car2 != null)
             {
                 // type2 with NIL component: only empty types are subtypes
                 if (IsNilType(car2) || IsNilType(cdr2))
-                { MultipleValues.Set(Nil.Instance, T.Instance); return Nil.Instance; }
+                { MultipleValues.SetPair(Nil.Instance, T.Instance); return Nil.Instance; }
 
                 // (CONS A B) <: (CONS C D) iff A <: C and B <: D (treating * as T)
                 // Use raw LispObjects for compound type specifiers (OR, AND, etc.)
@@ -1680,8 +1680,8 @@ public static partial class Runtime
                 }
                 bool res = carOk && cdrOk;
                 if (!res && !certain)
-                { MultipleValues.Set(Nil.Instance, Nil.Instance); return Nil.Instance; }
-                MultipleValues.Set(res ? T.Instance : Nil.Instance, T.Instance);
+                { MultipleValues.SetPair(Nil.Instance, Nil.Instance); return Nil.Instance; }
+                MultipleValues.SetPair(res ? T.Instance : Nil.Instance, T.Instance);
                 return res ? T.Instance : Nil.Instance;
             }
         }
@@ -1719,31 +1719,31 @@ public static partial class Runtime
 
                 if (name1 is "SIMPLE-STRING" or "SIMPLE-BASE-STRING")
                 {
-                    if (!dimOk) { MultipleValues.Set(Nil.Instance, T.Instance); return Nil.Instance; }
+                    if (!dimOk) { MultipleValues.SetPair(Nil.Instance, T.Instance); return Nil.Instance; }
                     if (isSimpleRequired)
                     {
                         // simple-string is subtype of (simple-array * (*)) if element type is * or character-compatible
                         // But NOT if element type is specifically "CHARACTER" or "BASE-CHAR" (nil arrays excluded)
                         if (etName is "*")
-                        { MultipleValues.Set(T.Instance, T.Instance); return T.Instance; }
+                        { MultipleValues.SetPair(T.Instance, T.Instance); return T.Instance; }
                         // CHARACTER/BASE-CHAR: nil element vectors are strings but not character-typed
-                        MultipleValues.Set(Nil.Instance, T.Instance); return Nil.Instance;
+                        MultipleValues.SetPair(Nil.Instance, T.Instance); return Nil.Instance;
                     }
                     else
                     {
                         if (etName is "*" or "CHARACTER" or "BASE-CHAR")
-                        { MultipleValues.Set(Nil.Instance, T.Instance); return Nil.Instance; }
-                        MultipleValues.Set(T.Instance, T.Instance); return T.Instance;
+                        { MultipleValues.SetPair(Nil.Instance, T.Instance); return Nil.Instance; }
+                        MultipleValues.SetPair(T.Instance, T.Instance); return T.Instance;
                     }
                 }
                 if (name1 is "STRING" or "BASE-STRING")
                 {
                     // STRING is not necessarily simple
-                    if (isSimpleRequired) { MultipleValues.Set(Nil.Instance, T.Instance); return Nil.Instance; }
-                    if (!dimOk) { MultipleValues.Set(Nil.Instance, T.Instance); return Nil.Instance; }
+                    if (isSimpleRequired) { MultipleValues.SetPair(Nil.Instance, T.Instance); return Nil.Instance; }
+                    if (!dimOk) { MultipleValues.SetPair(Nil.Instance, T.Instance); return Nil.Instance; }
                     if (etName is "*" or "CHARACTER" or "BASE-CHAR")
-                    { MultipleValues.Set(Nil.Instance, T.Instance); return Nil.Instance; }
-                    MultipleValues.Set(T.Instance, T.Instance); return T.Instance;
+                    { MultipleValues.SetPair(Nil.Instance, T.Instance); return Nil.Instance; }
+                    MultipleValues.SetPair(T.Instance, T.Instance); return T.Instance;
                 }
             }
 
@@ -1772,10 +1772,10 @@ public static partial class Runtime
                     cur2 = ac.Cdr;
                 }
                 if (allSupertype)
-                { MultipleValues.Set(T.Instance, T.Instance); return T.Instance; }
+                { MultipleValues.SetPair(T.Instance, T.Instance); return T.Instance; }
                 if (allCertain)
-                { MultipleValues.Set(Nil.Instance, T.Instance); return Nil.Instance; }
-                MultipleValues.Set(Nil.Instance, Nil.Instance); return Nil.Instance;
+                { MultipleValues.SetPair(Nil.Instance, T.Instance); return Nil.Instance; }
+                MultipleValues.SetPair(Nil.Instance, Nil.Instance); return Nil.Instance;
             }
             if (head2ao == "OR")
             {
@@ -1791,8 +1791,8 @@ public static partial class Runtime
                         cur1 = oc1.Cdr;
                     }
                     if (allSubtype)
-                    { MultipleValues.Set(T.Instance, T.Instance); return T.Instance; }
-                    MultipleValues.Set(Nil.Instance, Nil.Instance); return Nil.Instance;
+                    { MultipleValues.SetPair(T.Instance, T.Instance); return T.Instance; }
+                    MultipleValues.SetPair(Nil.Instance, Nil.Instance); return Nil.Instance;
                 }
                 var cur2 = comp2ao.Cdr;
                 bool anySupertype = false;
@@ -1802,10 +1802,10 @@ public static partial class Runtime
                     cur2 = oc.Cdr;
                 }
                 if (anySupertype)
-                { MultipleValues.Set(T.Instance, T.Instance); return T.Instance; }
+                { MultipleValues.SetPair(T.Instance, T.Instance); return T.Instance; }
                 // Can't conclude: type1 might still be subtype of the union
                 // even if it's not a subtype of any individual member
-                MultipleValues.Set(Nil.Instance, Nil.Instance); return Nil.Instance;
+                MultipleValues.SetPair(Nil.Instance, Nil.Instance); return Nil.Instance;
             }
         }
 
@@ -1819,7 +1819,7 @@ public static partial class Runtime
             var subOfInner = Subtypep(type1, inner);
             if (subOfInner != Nil.Instance)
             {
-                MultipleValues.Set(Nil.Instance, T.Instance);
+                MultipleValues.SetPair(Nil.Instance, T.Instance);
                 return Nil.Instance;
             }
             // Use CType disjoint check (no recursive Subtypep — pure CType algebra)
@@ -1829,12 +1829,12 @@ public static partial class Runtime
                 var ctInner = TypeParser.Parse(inner);
                 if (CTypeOps.AreDisjoint(ct1, ctInner))
                 {
-                    MultipleValues.Set(T.Instance, T.Instance);
+                    MultipleValues.SetPair(T.Instance, T.Instance);
                     return T.Instance;
                 }
             }
             catch { /* Parse failed — return uncertain */ }
-            MultipleValues.Set(Nil.Instance, Nil.Instance);
+            MultipleValues.SetPair(Nil.Instance, Nil.Instance);
             return Nil.Instance;
         }
 
@@ -1852,15 +1852,15 @@ public static partial class Runtime
                 if (etName1 == "NIL")
                 {
                     if (name2 is "STRING" or "VECTOR" or "ARRAY" or "SEQUENCE" or "T")
-                    { MultipleValues.Set(T.Instance, T.Instance); return T.Instance; }
+                    { MultipleValues.SetPair(T.Instance, T.Instance); return T.Instance; }
                     if (name2 is "SIMPLE-STRING" or "SIMPLE-ARRAY")
                     {
-                        if (isSimple1) { MultipleValues.Set(T.Instance, T.Instance); return T.Instance; }
-                        MultipleValues.Set(Nil.Instance, T.Instance); return Nil.Instance;
+                        if (isSimple1) { MultipleValues.SetPair(T.Instance, T.Instance); return T.Instance; }
+                        MultipleValues.SetPair(Nil.Instance, T.Instance); return Nil.Instance;
                     }
                     // nil arrays are NOT base-string or simple-base-string
                     if (name2 is "BASE-STRING" or "SIMPLE-BASE-STRING" or "SIMPLE-VECTOR")
-                    { MultipleValues.Set(Nil.Instance, T.Instance); return Nil.Instance; }
+                    { MultipleValues.SetPair(Nil.Instance, T.Instance); return Nil.Instance; }
                 }
             }
         }
@@ -1879,9 +1879,9 @@ public static partial class Runtime
                     cur = mc.Cdr;
                 }
                 if (allMatch)
-                { MultipleValues.Set(T.Instance, T.Instance); return T.Instance; }
+                { MultipleValues.SetPair(T.Instance, T.Instance); return T.Instance; }
                 else
-                { MultipleValues.Set(Nil.Instance, T.Instance); return Nil.Instance; }
+                { MultipleValues.SetPair(Nil.Instance, T.Instance); return Nil.Instance; }
             }
 
             // (INTEGER low high) <: type2 handled via name lookup (both are names)
@@ -1905,10 +1905,10 @@ public static partial class Runtime
                     cur2 = oc.Cdr;
                 }
                 if (allSubtype)
-                { MultipleValues.Set(T.Instance, T.Instance); return T.Instance; }
+                { MultipleValues.SetPair(T.Instance, T.Instance); return T.Instance; }
                 if (allCertain)
-                { MultipleValues.Set(Nil.Instance, T.Instance); return Nil.Instance; }
-                MultipleValues.Set(Nil.Instance, Nil.Instance); return Nil.Instance;
+                { MultipleValues.SetPair(Nil.Instance, T.Instance); return Nil.Instance; }
+                MultipleValues.SetPair(Nil.Instance, Nil.Instance); return Nil.Instance;
             }
 
             // (AND t1 t2 ...) <: type2: if ANY member is subtype, then AND is subtype
@@ -1922,15 +1922,15 @@ public static partial class Runtime
                     cur2 = ac.Cdr;
                 }
                 if (anySubtype)
-                { MultipleValues.Set(T.Instance, T.Instance); return T.Instance; }
+                { MultipleValues.SetPair(T.Instance, T.Instance); return T.Instance; }
                 // Can't conclude: intersection of AND members might be empty
                 // (disjoint types), making it a subtype of anything
-                MultipleValues.Set(Nil.Instance, Nil.Instance); return Nil.Instance;
+                MultipleValues.SetPair(Nil.Instance, Nil.Instance); return Nil.Instance;
             }
         }
 
         // Can't determine the relationship
-        MultipleValues.Set(Nil.Instance, Nil.Instance);
+        MultipleValues.SetPair(Nil.Instance, Nil.Instance);
         return Nil.Instance;
     }
 

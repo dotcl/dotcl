@@ -962,8 +962,74 @@
                        instrs))))))
 
 ;;; ============================================================
+;;; A &REST list nobody reads
+;;; ============================================================
+
+(defun elide-unused-rest-list (instrs)
+  "Delete the construction of a &REST list that the body never reads.
+
+   A &REST parameter binds a freshly consed list of the remaining arguments, and
+   the emitter builds it whether or not the body looks at it. It very often does
+   not -- (defmethod initialize-instance :after ((x c) &rest initargs) (declare
+   (ignore initargs)) ...) is the standard way to write a method that wants the
+   protocol but not the arguments, and every such method conses one list per call,
+   per level of the class hierarchy.
+
+   The test is on the emitted instructions, not the source: a local that no
+   instruction reads cannot be read, whatever a macro in the body expanded to.
+   That also makes this self-disabling under debug info emission -- (:frame-set
+   NAME KEY) counts as a read, so a build that wants the in-process debugger to
+   show the variable keeps the list.
+
+   The shape matched is exactly what COMPILE-ARGS-PARAM-INSTRS emits for a rest
+   parameter, ending in the store; anything else is left alone."
+  (let ((reads (make-hash-table :test #'equal))
+        (dropped (make-hash-table :test #'equal))
+        (out '()))
+    (dolist (i instrs)
+      (do-instr-local-reads (k i) (setf (gethash k reads) t)))
+    (dolist (i instrs)
+      (let ((prev (first out)) (prev2 (second out)) (prev3 (third out)))
+        (if (and (consp i) (eq (car i) :stloc)
+                 (not (gethash (cadr i) reads))
+                 (consp prev) (eq (car prev) :call)
+                 (equal (cadr prev) "Runtime.CollectRestArgs")
+                 (consp prev2) (eq (car prev2) :ldc-i4)
+                 (consp prev3) (eq (car prev3) :ldarg))
+            (progn (setf (gethash (cadr i) dropped) t)
+                   (setq out (cdddr out)))
+            (push i out))))
+    (if (zerop (hash-table-count dropped))
+        instrs
+        (remove-if (lambda (i)
+                     (and (consp i) (eq (car i) :declare-local)
+                          (gethash (cadr i) dropped)))
+                   (nreverse out)))))
+
+;;; ============================================================
 ;;; Slot sharing: merge LispObject locals with disjoint flat ranges
 ;;; ============================================================
+
+(defparameter +mv-primary-twins+
+  '(("Runtime.Gethash"      . "Runtime.GethashPrimary")
+    ("Runtime.FloorOp"      . "Runtime.FloorOpPrimary")
+    ("Runtime.TruncateOp"   . "Runtime.TruncateOpPrimary")
+    ("Runtime.CeilingOp"    . "Runtime.CeilingOpPrimary")
+    ("Runtime.RoundOp"      . "Runtime.RoundOpPrimary")
+    ;; A written (VALUES A B), which is what the tail of every two-value function
+    ;; is. In single-value position it is the same call pair as the entries above.
+    ("Runtime.Values2"      . "Runtime.Values2Primary"))
+  "Runtime entries that return two values, paired with an entry that returns only
+   the primary. The peephole (P12) swaps in the second when the call is followed
+   by Runtime.UnwrapMv, i.e. when the call site is in single-value position.
+
+   A pair belongs here only when `TWIN(x)` is observably identical to
+   `UnwrapMv(ORIGINAL(x))` -- same computation, same thread value state (one
+   value, the primary), same conditions signalled in the same order. The twins
+   are written as two entries over one core in the runtime so that stays true.
+
+   Not a DEFCONSTANT: a list literal under DEFCONSTANT is re-evaluated to a
+   fresh, non-EQL list when the file is reloaded, which SBCL rejects.")
 
 (defun peephole-optimize (instrs)
   "Local peephole pass over a finalized SIL instruction list. Removes
@@ -1015,6 +1081,15 @@
                                           ; first call's result is never an
                                           ; MvReturn. Every LOOP body iteration
                                           ; carried the pair.
+     P12 (:call F) (:call \"Runtime.UnwrapMv\")  ->  (:call F-primary)
+                                          ; F returns two values and the unwrap
+                                          ; throws the second away. The twin
+                                          ; entry publishes the primary and
+                                          ; returns it without building the
+                                          ; MvReturn: 40 B off every GETHASH /
+                                          ; FLOOR / TRUNCATE / CEILING / ROUND
+                                          ; in single-value position. Pairs are
+                                          ; in +mv-primary-twins+.
    (P3+P4 compose across the fixpoint to delete the dead nil/unwrap/pop preamble
     that codegen emits at the top of every TCO loop body.)
 
@@ -1126,6 +1201,19 @@
                (setf changed t)
                (push i1 out)
                (setf cur (cddr cur)))
+              ;; P12: a call that returns two values, followed immediately by the
+              ;; unwrap that throws the second one away. Both halves are then
+              ;; equivalent to the single-value twin entry, which publishes the
+              ;; primary and returns it without building the MvReturn -- 40 B on
+              ;; every such call. The table is the whole list of pairs; a name
+              ;; that is not in it is left alone.
+              ((and (consp i1) (eq (car i1) :call)
+                    (consp i2) (eq (car i2) :call) (equal (cadr i2) "Runtime.UnwrapMv")
+                    (assoc (cadr i1) +mv-primary-twins+ :test #'equal))
+               (setf changed t)
+               (push (list :call (cdr (assoc (cadr i1) +mv-primary-twins+ :test #'equal)))
+                     out)
+               (setf cur (cddr cur)))
               ;; P9: push a string constant then immediately discard it — dead.
               ;; Composes with P8 to delete a string literal in statement
               ;; position, which is what a documentation string compiles to: it
@@ -1153,8 +1241,8 @@
   ;; The classic "debug builds don't reuse slots" tradeoff. Peephole still runs.
   (peephole-optimize
    (if *emit-source-lines*
-       instrs
-       (%merge-disjoint-locals instrs))))
+       (elide-unused-rest-list instrs)
+       (%merge-disjoint-locals (elide-unused-rest-list instrs)))))
 
 (defconstant +slot-merge-min-locals+ 32
   "Fewest LispObject locals a body must declare before slot sharing runs at all.")
@@ -1316,7 +1404,15 @@
 ;;; ============================================================
 
 (defun compile-toplevel (expr)
-  "Compile a top-level expression. Returns instruction list."
+  "Compile a top-level expression. Returns instruction list.
+
+   The peephole runs here for the same reason it runs on every function body:
+   codegen emits the boxed form of a native-slot store and lets the pass delete
+   the box when the value is discarded. Without it, a declared FIXNUM loop
+   written at top level -- a script, or the REPL -- boxed its counter once per
+   iteration and threw the box away, 16 B/iteration that the same loop inside a
+   DEFUN did not pay. Slot sharing is deliberately not run alongside it: it saves
+   slots rather than allocation, and top-level forms rarely reach its threshold."
   (let ((*cstate* (cstate-with *cstate*
                                +cs-locals+ '() +cs-block-tags+ '() +cs-go-tags+ '()
                                +cs-boxed-vars+ '() +cs-local-functions+ '()))
@@ -1328,7 +1424,7 @@
         (*macroexpand-cache* (make-hash-table :test #'eq))
         (*bmr-cache* (make-hash-table :test #'eq))
         (*ffv-free-cache* (make-hash-table :test #'eq)))
-    `(,@(compile-expr expr)
+    `(,@(peephole-optimize (compile-expr expr))
       (:ret))))
 
 (defun compile-toplevel-eval (expr)
@@ -1347,5 +1443,5 @@
         (*macroexpand-cache* (make-hash-table :test #'eq))
         (*bmr-cache* (make-hash-table :test #'eq))
         (*ffv-free-cache* (make-hash-table :test #'eq)))
-    `(,@(compile-expr expr)
+    `(,@(peephole-optimize (compile-expr expr))
       (:ret))))

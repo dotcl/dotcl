@@ -786,6 +786,9 @@ public partial class CilAssembler
             case "LOAD-CONST":
                 EmitLoadConst(Cadr(c));
                 break;
+            case "LOAD-CONST-CACHED":
+                EmitCachedConst(Cadr(c));
+                break;
             case "LOAD-SYM":
             {
                 // Resolve at runtime (not assembly time) so later
@@ -1071,7 +1074,9 @@ public partial class CilAssembler
             // both unavailable.
             int faslId = Interlocked.Increment(ref _faslClosureCount);
             FaslAssembler.EmitDefmethodInto(_faslTypeBuilder, _il, _faslStructMap!,
-                name, paramNames.Count, bodyInstrs, defPkg, faslId, noFrame: noFrame);
+                name, paramNames.Count, bodyInstrs, defPkg, faslId, noFrame: noFrame,
+                lambdaList: lambdaList != null ? Runtime.FormatObject(lambdaList, true) : null,
+                directDelegates: directDelegates);
             return;
         }
 
@@ -1091,7 +1096,7 @@ public partial class CilAssembler
         if (noFrame) fn.SuppressDebugFrame();
 
         // Attach typed direct delegates for an &optional function's concrete
-        // arities (non-fasl path only). The array XEP `del` above still backs
+        // arities. The fasl path does the same from EmitDefmethodInto. The array XEP `del` above still backs
         // apply and any arity without a direct delegate; these just let a fixed-
         // arity call skip the args-array InvokeSlow detour.
         if (directDelegates is Cons)
@@ -1600,7 +1605,8 @@ public partial class CilAssembler
             // (including _funcN direct-call fast path) into the current ILGenerator.
             int faslId = Interlocked.Increment(ref _faslClosureCount);
             FaslAssembler.EmitDefmethodDirectInto(_faslTypeBuilder, _il, _faslStructMap!,
-                name, paramCount, bodyInstrs, defPkg, faslId, selfArg0, noFrame: noFrame);
+                name, paramCount, bodyInstrs, defPkg, faslId, selfArg0, noFrame: noFrame,
+                lambdaList: lambdaList != null ? Runtime.FormatObject(lambdaList, true) : null);
             return;
         }
 
@@ -1945,7 +1951,8 @@ public partial class CilAssembler
         {
             int faslId = Interlocked.Increment(ref _faslClosureCount);
             FaslAssembler.EmitDefmethodNativeInto(_faslTypeBuilder, _il, _faslStructMap!,
-                name, paramCount, bodyInstrs, defPkg, faslId, noFrame: noFrame);
+                name, paramCount, bodyInstrs, defPkg, faslId, noFrame: noFrame,
+                lambdaList: lambdaList != null ? Runtime.FormatObject(lambdaList, true) : null);
             return;
         }
 
@@ -2533,7 +2540,17 @@ public partial class CilAssembler
     {
         if (method.ReturnType == typeof(void))
         {
-            _il.Emit(OpCodes.Ldsfld, typeof(Nil).GetField("Instance")!);
+            // A void method produces no values, the way a Lisp function that
+            // returns nothing does. Used where one value is wanted it still reads
+            // as NIL, so callers that ignore the result are unaffected; what
+            // changes is that MULTIPLE-VALUE-LIST of it is empty.
+            //
+            // This is the one place the question can be answered exactly: the
+            // overload has already been resolved, so there is no guessing from the
+            // result (a void return and a null return arrive identically) or from
+            // the name (a few BCL names have both void and value-returning
+            // overloads).
+            _il.Emit(OpCodes.Call, typeof(MultipleValues).GetMethod("Values0")!);
         }
         else
         {
@@ -2661,6 +2678,33 @@ public partial class CilAssembler
         _il.Emit(OpCodes.Switch, labels.ToArray());
     }
 
+    /// <summary>A constant the cross compiler could only give as a recipe: the
+    /// instructions build it, and this keeps the result. Same shape as the literal
+    /// cache in EmitLoadConstInline, for the same reason -- a literal is one
+    /// object, and rebuilding it per call is both wrong and expensive.
+    ///
+    /// Filled at first use, not in the type initializer: the recipe resolves
+    /// symbols by name, and the packages they live in are made by earlier top
+    /// level forms of the same file.</summary>
+    private void EmitCachedConst(LispObject instrs)
+    {
+        if (!_faslMode || _faslStructMap?.UninternedTypeBuilder == null)
+        {
+            Assemble(instrs);   // JIT path: the constant pool already shares it
+            return;
+        }
+        var field = _faslStructMap.DefineLiteralCacheField();
+        var done = _il.DefineLabel();
+        _il.Emit(OpCodes.Ldsfld, field);
+        _il.Emit(OpCodes.Dup);
+        _il.Emit(OpCodes.Brtrue, done);
+        _il.Emit(OpCodes.Pop);
+        Assemble(instrs);
+        _il.Emit(OpCodes.Dup);
+        _il.Emit(OpCodes.Stsfld, field);
+        _il.MarkLabel(done);
+    }
+
     private void EmitLoadConst(LispObject val)
     {
         if (_faslMode)
@@ -2771,11 +2815,16 @@ public partial class CilAssembler
             _holderFields++;
             return (_holderType!, _holderCctor!);
         }
-        private readonly Dictionary<Symbol, System.Reflection.Emit.FieldBuilder> _uninternedFields =
+        private readonly Dictionary<Symbol, int> _uninternedIndex =
             new(ReferenceEqualityComparer.Instance);
-        private static readonly System.Reflection.ConstructorInfo _symbolCtor2 =
-            typeof(Symbol).GetConstructor(new[] { typeof(string), typeof(Package) })!;
-        private int _uninternedCounter;
+        private readonly List<string> _uninternedNames = new();
+        private readonly List<Symbol> _uninternedSymbols = new();
+
+        /// <summary>Verification only (DOTCL_LITERAL_VERIFY): the very symbols the
+        /// indices name, so a round trip can be compared with EQUAL. The emitted
+        /// code rebuilds equivalent ones from the names blob.</summary>
+        public IReadOnlyList<Symbol> UninternedSymbolsForVerify => _uninternedSymbols;
+        private System.Reflection.Emit.FieldBuilder? _uninternedTableField;
 
         public FaslStructInternMap(string modulePrefix)
         {
@@ -3016,25 +3065,98 @@ public partial class CilAssembler
         /// Get or create a static field for an uninterned symbol so that all uses within
         /// this FASL resolve to the SAME Symbol object (preserves EQ-ness across make-load-form).
         /// </summary>
-        public System.Reflection.Emit.FieldBuilder GetOrCreateUninternedSymbolField(Symbol sym)
+        private int _litCacheCounter;
+
+        /// <summary>A static field holding one top level literal, filled the first
+        /// time the code that names it runs. CLHS 3.2.4.4: the literal in compiled
+        /// code is ONE object -- calling the function twice has to give the same
+        /// one, and a destructive change to it has to stick. Building it at each
+        /// use gave a fresh copy every call, which also made every call allocate
+        /// the whole graph.</summary>
+        public System.Reflection.Emit.FieldBuilder DefineLiteralCacheField()
         {
-            if (_uninternedFields.TryGetValue(sym, out var field))
-                return field;
-            // Filled from the holder's type initializer rather than ModuleInit.
-            // Same reasoning as the call-site caches: a compiled body reads these
-            // fields and can be reached from anywhere in ModuleInit, so "we store
-            // it earlier in ModuleInit" is not a guarantee. It also keeps the
-            // 114k-symbol case out of one 1.8 MB ModuleInit.
-            var (tb, il) = FieldHolder();
-            field = tb.DefineField($"_gsym_{_uninternedCounter++}",
-                typeof(Symbol), System.Reflection.FieldAttributes.Public | System.Reflection.FieldAttributes.Static);
-            // Emit init: new Symbol(name, null); stsfld field
-            il.Emit(System.Reflection.Emit.OpCodes.Ldstr, sym.Name);
-            il.Emit(System.Reflection.Emit.OpCodes.Ldnull);
-            il.Emit(System.Reflection.Emit.OpCodes.Newobj, _symbolCtor2);
-            il.Emit(System.Reflection.Emit.OpCodes.Stsfld, field);
-            _uninternedFields[sym] = field;
-            return field;
+            var (tb, _) = FieldHolder();
+            return tb.DefineField($"_lit_{_litCacheCounter++}", typeof(LispObject),
+                System.Reflection.FieldAttributes.Public | System.Reflection.FieldAttributes.Static);
+        }
+
+        public int GetOrCreateUninternedSymbolIndex(Symbol sym)
+        {
+            if (_uninternedIndex.TryGetValue(sym, out var i)) return i;
+            i = _uninternedNames.Count;
+            _uninternedNames.Add(sym.Name);
+            _uninternedSymbols.Add(sym);
+            _uninternedIndex[sym] = i;
+            return i;
+        }
+
+        /// <summary>The one Symbol[] every use of an uninterned symbol indexes.
+        /// Defined on the primary holder so that reading it runs that type's
+        /// initializer, which is where the array is built (see
+        /// EmitUninternedTableInit).</summary>
+        public System.Reflection.Emit.FieldBuilder UninternedTableField()
+        {
+            return _uninternedTableField ??= UninternedTypeBuilder!.DefineField(
+                "_gsyms", typeof(Symbol[]),
+                System.Reflection.FieldAttributes.Public | System.Reflection.FieldAttributes.Static);
+        }
+
+        /// <summary>Fill the Symbol[] from a names blob, at the end of the primary
+        /// holder's initializer. Nothing earlier in that initializer reads the
+        /// array, and everything that does read it (a _const helper, a top-level
+        /// body) runs later, when the fasl is loaded.
+        ///
+        /// The names travel as data, not as construction IL: this used to be one
+        /// static field and four instructions per symbol, which for a Coalton fasl
+        /// meant 114,451 fields and the holder-splitting that exists to keep them
+        /// under the per-type limit.</summary>
+        public void EmitUninternedTableInit(System.Reflection.Emit.ILGenerator il)
+        {
+            if (_uninternedNames.Count == 0 || _uninternedTableField == null) return;
+            var sb = new System.Text.StringBuilder();
+            foreach (var n in _uninternedNames)
+            {
+                var bytes = System.Text.Encoding.UTF8.GetByteCount(n);
+                sb.Append(bytes).Append(':').Append(n);
+            }
+            var blob = System.Text.Encoding.UTF8.GetBytes(sb.ToString());
+            var initArray = typeof(System.Runtime.CompilerServices.RuntimeHelpers)
+                .GetMethod("InitializeArray", new[] { typeof(System.Array), typeof(RuntimeFieldHandle) })!;
+            void EmitBlob(byte[] b)
+            {
+                var f = DefineLiteralData(b);
+                il.Emit(System.Reflection.Emit.OpCodes.Ldc_I4, b.Length);
+                il.Emit(System.Reflection.Emit.OpCodes.Newarr, typeof(byte));
+                il.Emit(System.Reflection.Emit.OpCodes.Dup);
+                il.Emit(System.Reflection.Emit.OpCodes.Ldtoken, f);
+                il.Emit(System.Reflection.Emit.OpCodes.Call, initArray);
+            }
+            if (blob.Length <= MaxLiteralDataChunk)
+            {
+                EmitBlob(blob);
+                il.Emit(System.Reflection.Emit.OpCodes.Call,
+                    typeof(Runtime).GetMethod("BuildUninternedTable", new[] { typeof(byte[]) })!);
+            }
+            else
+            {
+                int parts = (blob.Length + MaxLiteralDataChunk - 1) / MaxLiteralDataChunk;
+                il.Emit(System.Reflection.Emit.OpCodes.Ldc_I4, parts);
+                il.Emit(System.Reflection.Emit.OpCodes.Newarr, typeof(byte[]));
+                for (int i = 0; i < parts; i++)
+                {
+                    int start = i * MaxLiteralDataChunk;
+                    int len = System.Math.Min(MaxLiteralDataChunk, blob.Length - start);
+                    var chunk = new byte[len];
+                    System.Array.Copy(blob, start, chunk, 0, len);
+                    il.Emit(System.Reflection.Emit.OpCodes.Dup);
+                    il.Emit(System.Reflection.Emit.OpCodes.Ldc_I4, i);
+                    EmitBlob(chunk);
+                    il.Emit(System.Reflection.Emit.OpCodes.Stelem_Ref);
+                }
+                il.Emit(System.Reflection.Emit.OpCodes.Call,
+                    typeof(Runtime).GetMethod("BuildUninternedTable", new[] { typeof(byte[][]) })!);
+            }
+            il.Emit(System.Reflection.Emit.OpCodes.Stsfld, _uninternedTableField);
         }
 
         // Symbols this compilation unit names in a package other than CL/KEYWORD.
@@ -3093,8 +3215,44 @@ public partial class CilAssembler
     private string Track(string s) =>
         _faslStructMap?.TrackString(s) ?? s;
 
-    /// <summary>Emit IL to construct a constant value inline (for FASL mode).</summary>
+    /// <summary>Set on the assembler that fills a _const_N helper: the call site
+    /// that reaches the helper is already behind a literal cache, so caching the
+    /// same graph again inside would only add a second field.</summary>
+    private bool _suppressLiteralCache;
+
+    /// <summary>Emit IL to construct a constant value inline (for FASL mode).
+    ///
+    /// A top level literal is built once and kept in a static field. Without that
+    /// the construction IL sits in the function body and runs on every call: the
+    /// literal came back as a different object each time (so EQ on it was NIL and a
+    /// destructive change to it vanished), and the whole graph was allocated per
+    /// call. Both only in a fasl -- loading the same source kept one object -- so it
+    /// showed up only in what we ship.
+    ///
+    /// Filled at first use rather than in the type initializer: a literal can name
+    /// a class or a symbol that an earlier top level form in the same file
+    /// establishes, and the initializer runs before any of them.</summary>
     internal void EmitLoadConstInline(LispObject val)
+    {
+        if (_inlineDepth == 0 && _faslMode && !_suppressLiteralCache
+            && _faslStructMap?.UninternedTypeBuilder != null)
+        {
+            var field = _faslStructMap.DefineLiteralCacheField();
+            var done = _il.DefineLabel();
+            _il.Emit(OpCodes.Ldsfld, field);
+            _il.Emit(OpCodes.Dup);
+            _il.Emit(OpCodes.Brtrue, done);
+            _il.Emit(OpCodes.Pop);
+            EmitLoadConstInlineBody(val);
+            _il.Emit(OpCodes.Dup);
+            _il.Emit(OpCodes.Stsfld, field);
+            _il.MarkLabel(done);
+            return;
+        }
+        EmitLoadConstInlineBody(val);
+    }
+
+    private void EmitLoadConstInlineBody(LispObject val)
     {
         _inlineDepth++;
         try
@@ -3122,6 +3280,15 @@ public partial class CilAssembler
         if (_inlineDepth == 1)
         {
             var kind = AnalyzeConstantGraph(val);
+            if (LiteralCensus)
+            {
+                // Every literal, whichever route it ends up on -- the question is
+                // what fraction of a rejected graph is actually unprintable, and
+                // that cannot be seen from inside the reader-safety check, which
+                // some routes never reach.
+                ConstantIsReaderSafe(val, out _);
+                Console.Error.WriteLine($"#CENSUS-KIND {kind}");
+            }
             if (kind == ConstGraphKind.Cyclic)
             {
                 if (!TryEmitConstantViaReader(val))
@@ -3222,8 +3389,9 @@ public partial class CilAssembler
                     // FASL mode: uninterned symbols must be deduplicated so the same
                     // Symbol object is used everywhere in this assembly (preserves EQ-ness
                     // across make-load-form boundaries — e.g. gensym'd ctor names in defcontext).
-                    var field = _faslStructMap.GetOrCreateUninternedSymbolField(sym);
-                    _il.Emit(OpCodes.Ldsfld, field);
+                    _il.Emit(OpCodes.Ldsfld, _faslStructMap.UninternedTableField());
+                    _il.Emit(OpCodes.Ldc_I4, _faslStructMap.GetOrCreateUninternedSymbolIndex(sym));
+                    _il.Emit(OpCodes.Ldelem_Ref);
                 }
                 else
                 {
@@ -3615,18 +3783,25 @@ public partial class CilAssembler
     // cheaper than the fixed cost of setting up a read. The crossover was
     // measured, not guessed; DOTCL_LITERAL_READER_MIN_NODES re-derives it (set it
     // to a huge value to turn this route off entirely and compare).
+    //
+    // 64 was read off a synthetic file of uniform literals, where it is the point
+    // at which the read pays for itself. On real code it was far too high: a
+    // literal below the threshold keeps its structures on the make-load-form
+    // route, which builds the creation form as IL and EVALUATES it at load, and
+    // Coalton did that 70,019 times for 44 seconds. Those literals are small
+    // individually and never reach 64 nodes. The synthetic table already showed
+    // the read winning at 8 nodes (0.641 -> 0.455 s); it just could not show what
+    // staying on the other route costs, because a synthetic literal has no
+    // structures in it.
     private static readonly int ReaderPathMinNodes =
         int.TryParse(Environment.GetEnvironmentVariable("DOTCL_LITERAL_READER_MIN_NODES"),
-                     out var v) && v > 0 ? v : 64;
+                     out var v) && v > 0 ? v : 8;
 
     /// <summary>Whether every node of this constant graph comes back from
     /// PRINT then READ as the same thing, so the reader path is a pure
     /// size-for-time trade with no change in meaning. Also counts the nodes.</summary>
     /// <remarks>What is deliberately NOT on the list, and why:
     /// <list type="bullet">
-    /// <item>uninterned symbols — the inline path gives every occurrence of one
-    /// Symbol object the same static field, so it stays EQ across separate
-    /// literals in the file. Read back, each literal would make its own.</item>
     /// <item>structures and CLOS instances — they are emitted through the
     /// make-load-form protocol, with creation and initialization forms ordered
     /// per object. Printing bypasses that entirely.</item>
@@ -3638,9 +3813,20 @@ public partial class CilAssembler
     /// </list>
     /// Anything unlisted falls through to inline emission, which handles every
     /// case; this predicate only decides which of two correct routes is used.</remarks>
+    /// <summary>Set DOTCL_LITERAL_CENSUS to make the reader-safety walk finish
+    /// instead of stopping at the first node it cannot print, and report what it
+    /// found: one line per literal on stderr, `#CENSUS nodes=N bad=K types=...`.
+    /// The question it answers is whether a rejected literal is unprintable
+    /// throughout or printable except for a handful of nodes -- i.e. whether
+    /// splitting a literal into text plus a few holes would pay.</summary>
+    private static readonly bool LiteralCensus =
+        Environment.GetEnvironmentVariable("DOTCL_LITERAL_CENSUS") != null;
+
     private static bool ConstantIsReaderSafe(LispObject val, out int nodes)
     {
         nodes = 0;
+        bool safe = true;
+        Dictionary<string, int>? bad = LiteralCensus ? new() : null;
         var stack = new Stack<LispObject>();
         stack.Push(val);
         var seen = new HashSet<LispObject>(ReferenceEqualityComparer.Instance);
@@ -3663,23 +3849,233 @@ public partial class CilAssembler
                 case LispComplex cx:
                     stack.Push(cx.Real); stack.Push(cx.Imaginary);
                     continue;
-                case Symbol sym:
-                    if (sym.HomePackage == null) return false;   // uninterned
+                case Symbol:
+                    // Uninterned symbols included: the printer writes them as an
+                    // index into the fasl's table and the reader takes the very
+                    // object the table holds, so EQ survives the round trip. See
+                    // Runtime.UninternedSymbolIndexer.
                     continue;
                 case Cons c:
                     if (!seen.Add(c)) continue;
                     stack.Push(c.Car); stack.Push(c.Cdr);
                     continue;
                 case LispVector vec:
-                    if (vec._dimensions != null || vec.ElementTypeName != "T") return false;
+                    if (vec._dimensions != null || vec.ElementTypeName != "T")
+                    {
+                        if (bad == null) return false;
+                        safe = false;
+                        Bump(bad, vec._dimensions != null
+                            ? "array:multidim" : "array:" + vec.ElementTypeName);
+                        continue;
+                    }
                     if (!seen.Add(vec)) continue;
                     for (int i = 0; i < vec.Length; i++) stack.Push(vec.ElementAt(i));
                     continue;
+                case LispStruct ls when StructReadsBackAsPrinted(ls):
+                    // A struct prints as #S(TYPE :SLOT value ...) and the reader
+                    // rebuilds it by allocating and filling slots by name -- the
+                    // same thing make-load-form-saving-slots asks for, minus the
+                    // cost of carrying its creation form as code and evaluating
+                    // it. Only when that IS what the object's make-load-form
+                    // says: a custom method has to be honoured, and is (the
+                    // check per instance, since a method may branch on the
+                    // object). See StructReadsBackAsPrinted.
+                    if (!seen.Add(ls)) continue;
+                    foreach (var slot in ls.Slots)
+                        if (slot is LispObject so) stack.Push(so);
+                    continue;
                 default:
-                    return false;
+                    if (bad == null) return false;
+                    safe = false;
+                    Bump(bad, node.GetType().Name);
+                    // Keep walking INTO the node where we can, so the count is of
+                    // nodes and not of subtrees: a struct near the root would
+                    // otherwise hide everything under it and make the graph look
+                    // small and hopeless.
+                    foreach (var child in CensusChildren(node)) stack.Push(child);
+                    continue;
             }
         }
-        return true;
+        if (bad != null)
+        {
+            var types = string.Join(",", bad.OrderByDescending(kv => kv.Value)
+                                            .Select(kv => $"{kv.Key}:{kv.Value}"));
+            int badCount = bad.Values.Sum();
+            Console.Error.WriteLine(
+                $"#CENSUS nodes={nodes} bad={badCount} safe={(safe ? 1 : 0)} types={types}");
+        }
+        return safe;
+    }
+
+    /// <summary>Whether printing this struct and reading it back gives an object
+    /// with the same class and the same slots -- i.e. whether the text route is
+    /// allowed to replace its make-load-form creation form.
+    ///
+    /// Two things have to hold. The reader must be able to rebuild it: #S needs
+    /// the structure class to be findable with its slot names when the literal
+    /// is read, which is the same requirement the creation form's
+    /// (find-class 'name) already carries. And make-load-form must be asking for
+    /// exactly that and nothing else -- a custom method can do anything, and a
+    /// method may branch on the object (Coalton has one that consults a cache by
+    /// depth), so this asks per instance rather than per class.
+    ///
+    /// The shape it accepts is what make-load-form-saving-slots produces:
+    ///   (let ((v (allocate-instance (find-class 'TYPE))))
+    ///     (setf (slot-value v 'SLOT) 'VALUE) ...
+    ///     v)
+    /// with a setf for every slot of the object and each value the object's own.
+    /// Anything else falls back to the creation form as before.</summary>
+    /// <summary>Print under the same bindings the fasl route uses, for the
+    /// round-trip self-check. Verification only.</summary>
+    private string? PrintFaslRepr(LispObject val, bool namesTable)
+    {
+        var pcSym = Startup.Sym("*PRINT-CIRCLE*");
+        var prSym = Startup.Sym("*PRINT-READABLY*");
+        var plSym = Startup.Sym("*PRINT-LEVEL*");
+        var pnSym = Startup.Sym("*PRINT-LENGTH*");
+        var pkgSym = Startup.Sym("*PACKAGE*");
+        var rdffSym = Startup.Sym("*READ-DEFAULT-FLOAT-FORMAT*");
+        DynamicBindings.Push(pcSym, T.Instance);
+        DynamicBindings.Push(prSym, T.Instance);
+        DynamicBindings.Push(plSym, Nil.Instance);
+        DynamicBindings.Push(pnSym, Nil.Instance);
+        DynamicBindings.Push(pkgSym, Startup.KeywordPkg);
+        DynamicBindings.Push(rdffSym, Startup.Sym("SINGLE-FLOAT"));
+        Runtime.ForceInternalSymbolSyntax = true;
+        Runtime.FaslStructSyntax = _faslMode;
+        if (namesTable)
+        {
+            var map = _faslStructMap!;
+            Runtime.UninternedSymbolIndexer = map.GetOrCreateUninternedSymbolIndex;
+        }
+        try { return ((LispString)Runtime.WriteToString(val)).Value; }
+        catch { return null; }
+        finally
+        {
+            Runtime.UninternedSymbolIndexer = null;
+            Runtime.FaslStructSyntax = false;
+            Runtime.ForceInternalSymbolSyntax = false;
+            DynamicBindings.Pop(rdffSym);
+            DynamicBindings.Pop(pkgSym);
+            DynamicBindings.Pop(pnSym); DynamicBindings.Pop(plSym);
+            DynamicBindings.Pop(prSym); DynamicBindings.Pop(pcSym);
+        }
+    }
+
+    private static string Truncate(string s, int n) =>
+        s.Length <= n ? s : s.Substring(0, n) + " ...";
+
+    /// <summary>The uninterned symbols named so far, as the array the reader
+    /// wants. Verification only -- the emitted code builds its own from the blob.
+    /// </summary>
+    private Symbol[] BuildVerifyTable()
+    {
+        var syms = _faslStructMap!.UninternedSymbolsForVerify;
+        var a = new Symbol[syms.Count];
+        for (int i = 0; i < syms.Count; i++) a[i] = syms[i];
+        return a;
+    }
+
+    private static bool StructReadsBackAsPrinted(LispStruct ls)
+    {
+        if (Runtime.FindClassOrNil(ls.TypeName) is not LispClass cls
+            || !cls.IsStructureClass || cls.StructSlotNames == null
+            || cls.StructSlotNames.Length != ls.Slots.Length)
+            return false;
+
+        // No make-load-form to honour -- no method, or one that signals -- is the
+        // case TryEmitViaLoadForm already answers by falling back to the direct
+        // intern path, which allocates the struct and fills its slots. That is
+        // what #S does, so the text route is equivalent there too.
+        var mlfSym = Startup.Sym("MAKE-LOAD-FORM");
+        if (mlfSym?.Function == null) return true;
+        LispObject form;
+        try
+        {
+            var raw = Runtime.Funcall(mlfSym.Function, ls);
+            form = raw is MvReturn mv && mv.Count > 0 ? mv[0] : raw;
+        }
+        catch { return true; }
+        if (form is Nil) return true;   // same fallback
+        return FormIsSlotSaving(ls, cls, form);
+    }
+
+    /// <summary>Whether a make-load-form creation form is exactly what
+    /// make-load-form-saving-slots produces for this object:
+    ///   (let ((v (allocate-instance (find-class 'TYPE))))
+    ///     (setf (slot-value v 'SLOT) 'VALUE) ...
+    ///     v)
+    /// with a setf for every slot and each value the object's own. When it is,
+    /// the form carries no information beyond "allocate this type and put these
+    /// values in its slots", which both the text route (#K) and the direct
+    /// intern route express without building the form or evaluating it.</summary>
+    private static bool FormIsSlotSaving(LispStruct ls, LispClass cls, LispObject form)
+    {
+        var slotNames = cls.StructSlotNames;
+        if (slotNames == null || slotNames.Length != ls.Slots.Length) return false;
+        // (let ((v <alloc>)) <setf>... v)
+        if (form is not Cons let || !IsSym(let.Car, "LET")) return false;
+        if (Nth(let, 1) is not Cons bindings || bindings.Cdr is not Nil) return false;
+        if (bindings.Car is not Cons binding || binding.Car is not Symbol var) return false;
+        if (Nth(binding, 1) is not Cons alloc || !IsSym(alloc.Car, "ALLOCATE-INSTANCE"))
+            return false;
+        if (Nth(alloc, 1) is not Cons findClass || !IsSym(findClass.Car, "FIND-CLASS")
+            || Unquote(Nth(findClass, 1)) is not Symbol typeName
+            || !ReferenceEquals(typeName, ls.TypeName))
+            return false;
+
+        var assigned = new bool[ls.Slots.Length];
+        var body = let.Cdr is Cons c2 ? c2.Cdr : Nil.Instance;
+        while (body is Cons b)
+        {
+            if (b.Cdr is Nil)
+                return ReferenceEquals(b.Car, var) && System.Array.TrueForAll(assigned, x => x);
+            if (b.Car is not Cons setf || !IsSym(setf.Car, "SETF")) return false;
+            if (Nth(setf, 1) is not Cons place || !IsSym(place.Car, "SLOT-VALUE")
+                || !ReferenceEquals(Nth(place, 1), var)
+                || Unquote(Nth(place, 2)) is not Symbol slotName)
+                return false;
+            int idx = System.Array.FindIndex(slotNames, n => ReferenceEquals(n, slotName));
+            if (idx < 0 || assigned[idx]) return false;
+            if (!ReferenceEquals(Unquote(Nth(setf, 2)), ls.Slots[idx])) return false;
+            assigned[idx] = true;
+            body = b.Cdr;
+        }
+        return false;
+    }
+
+    private static bool IsSym(LispObject o, string name) =>
+        o is Symbol s && s.Name == name;
+
+    private static LispObject Nth(LispObject list, int n)
+    {
+        while (n-- > 0 && list is Cons c) list = c.Cdr;
+        return list is Cons head ? head.Car : Nil.Instance;
+    }
+
+    /// <summary>(QUOTE x) -> x; anything else unchanged. The creation form quotes
+    /// every value it stores, so the comparison is against what was quoted.</summary>
+    private static LispObject Unquote(LispObject o) =>
+        o is Cons c && IsSym(c.Car, "QUOTE") && c.Cdr is Cons q ? q.Car : o;
+
+    private static void Bump(Dictionary<string, int> d, string k) =>
+        d[k] = d.TryGetValue(k, out var n) ? n + 1 : 1;
+
+    /// <summary>Census only: the parts of an unprintable node that are themselves
+    /// literal graph. Slots of a struct, elements of any array. Best effort --
+    /// this drives a measurement, not code generation.</summary>
+    private static IEnumerable<LispObject> CensusChildren(LispObject node)
+    {
+        switch (node)
+        {
+            case LispStruct ls:
+                for (int i = 0; i < ls.Slots.Length; i++)
+                    if (ls.Slots[i] is LispObject o) yield return o;
+                break;
+            case LispVector v:
+                for (int i = 0; i < v.Length; i++) yield return v.ElementAt(i);
+                break;
+        }
     }
 
     /// <summary>Emit IL that reconstructs a constant at load time by reading its
@@ -3718,10 +4114,28 @@ public partial class CilAssembler
         // ...and with `::` for every qualified symbol, so the text does not depend on
         // which symbols happen to be external in THIS image. See ForceInternalSymbolSyntax.
         Runtime.ForceInternalSymbolSyntax = true;
+        // Uninterned symbols print as `#<n>U`, an index into this fasl's symbol
+        // table, so the literal round-trips with EQ intact. Only in fasl mode:
+        // AssembleAndRun has no table to index, and there `#:NAME` losing identity
+        // is the behaviour that was already there.
+        bool namesTable = _faslMode && _faslStructMap?.UninternedTypeBuilder != null;
+        bool usedTable = false;
+        Runtime.FaslStructSyntax = _faslMode;
+        if (namesTable)
+        {
+            var map = _faslStructMap!;
+            Runtime.UninternedSymbolIndexer = sym =>
+            {
+                usedTable = true;
+                return map.GetOrCreateUninternedSymbolIndex(sym);
+            };
+        }
         try { repr = ((LispString)Runtime.WriteToString(val)).Value; }
         catch { return false; }                      // unprintable (e.g. unreadable struct)
         finally
         {
+            Runtime.UninternedSymbolIndexer = null;
+            Runtime.FaslStructSyntax = false;
             Runtime.ForceInternalSymbolSyntax = false;
             DynamicBindings.Pop(rdffSym);
             DynamicBindings.Pop(pkgSym);
@@ -3740,7 +4154,35 @@ public partial class CilAssembler
         // guarantee has to be restated here.
         if (_faslMode) RecordSymbolsForPreintern(val);
 
-        if (!EmitReprAsData(repr))
+        // Self-check: read the text back now and compare. The route is only
+        // correct if print then read gives the same object graph, and a literal
+        // that does not survive it fails much later as a wrong VALUE -- not as an
+        // error at the point it was written. Off unless asked.
+        if (Environment.GetEnvironmentVariable("DOTCL_LITERAL_VERIFY") == "1")
+        {
+            try
+            {
+                var utf8 = System.Text.Encoding.UTF8.GetBytes(repr);
+                var back = namesTable && usedTable
+                    ? Runtime.ReadConstantFromUtf8(utf8, BuildVerifyTable())
+                    : Runtime.ReadConstantFromUtf8(utf8);
+                // Compare the TEXT, not the objects: EQUAL is EQ on structures, so
+                // comparing objects calls every struct literal a mismatch. What the
+                // route has to guarantee is that printing the result again gives
+                // the same text.
+                var again = PrintFaslRepr(back, namesTable);
+                if (again != repr)
+                    Console.Error.WriteLine(
+                        $"#LITROUNDTRIP mismatch:\n  wrote: {Truncate(repr, 160)}\n  read : {Truncate(again ?? "<unprintable>", 160)}");
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine(
+                    $"#LITROUNDTRIP error {ex.GetType().Name}: {Truncate(repr, 200)}");
+            }
+        }
+
+        if (!EmitReprAsData(repr, usedTable))
         {
             _il.Emit(OpCodes.Ldstr, Track(repr));
             _il.Emit(OpCodes.Call, typeof(Runtime).GetMethod("ReadConstantFromString", new[] { typeof(string) })!);
@@ -3828,7 +4270,7 @@ public partial class CilAssembler
     /// front of holding literals as data, and it does not apply here: the data
     /// section has no such limit, and the blob is copied out in one memcpy
     /// (InitializeArray) instead of being decoded token by token.</remarks>
-    private bool EmitReprAsData(string repr)
+    private bool EmitReprAsData(string repr, bool withUninternedTable = false)
     {
         if (!_faslMode || _faslStructMap == null || _faslTypeBuilder == null) return false;
         var utf8 = System.Text.Encoding.UTF8.GetBytes(repr);
@@ -3848,8 +4290,15 @@ public partial class CilAssembler
         if (utf8.Length <= MaxLiteralDataChunk)
         {
             EmitBlob(utf8);
-            _il.Emit(OpCodes.Call,
-                typeof(Runtime).GetMethod("ReadConstantFromUtf8", new[] { typeof(byte[]) })!);
+            if (withUninternedTable)
+            {
+                _il.Emit(OpCodes.Ldsfld, _faslStructMap.UninternedTableField());
+                _il.Emit(OpCodes.Call, typeof(Runtime).GetMethod("ReadConstantFromUtf8",
+                    new[] { typeof(byte[]), typeof(Symbol[]) })!);
+            }
+            else
+                _il.Emit(OpCodes.Call,
+                    typeof(Runtime).GetMethod("ReadConstantFromUtf8", new[] { typeof(byte[]) })!);
             return true;
         }
         // Larger than one data field may hold: emit the pieces into a byte[][] and
@@ -3868,8 +4317,15 @@ public partial class CilAssembler
             EmitBlob(chunk);
             _il.Emit(OpCodes.Stelem_Ref);
         }
-        _il.Emit(OpCodes.Call,
-            typeof(Runtime).GetMethod("ReadConstantFromUtf8Parts", new[] { typeof(byte[][]) })!);
+        if (withUninternedTable)
+        {
+            _il.Emit(OpCodes.Ldsfld, _faslStructMap.UninternedTableField());
+            _il.Emit(OpCodes.Call, typeof(Runtime).GetMethod("ReadConstantFromUtf8Parts",
+                new[] { typeof(byte[][]), typeof(Symbol[]) })!);
+        }
+        else
+            _il.Emit(OpCodes.Call,
+                typeof(Runtime).GetMethod("ReadConstantFromUtf8Parts", new[] { typeof(byte[][]) })!);
         return true;
     }
 
@@ -4142,6 +4598,7 @@ public partial class CilAssembler
             // It has to cross into the helper, or a cyclic struct graph would
             // spill back and forth between methods forever.
             _inlineVisited = _inlineVisited,
+            _suppressLiteralCache = true,
         };
         inner.EmitLoadConstInline(val);
         il.Emit(OpCodes.Ret);
@@ -4235,6 +4692,15 @@ public partial class CilAssembler
             var raw = Runtime.Funcall(mlfSym.Function, ls);
             LispObject form = raw is MvReturn mv && mv.Count > 0 ? mv[0] : raw;
             if (form is Nil) return false;
+            // A creation form that only allocates and fills slots says nothing the
+            // direct intern path does not already do, and that path neither builds
+            // the form as a literal nor evaluates it at load. Coalton spent 44
+            // seconds in 70,019 of these evaluations; the forms were all this shape.
+            if (Runtime.FindClassOrNil(ls.TypeName) is LispClass cls2
+                && cls2.IsStructureClass && cls2.StructSlotNames != null
+                && cls2.StructSlotNames.Length == ls.Slots.Length
+                && FormIsSlotSaving(ls, cls2, form))
+                return false;
             _il.Emit(OpCodes.Ldstr, Track(internKey));
             EmitLoadConstInline(form);
             _il.Emit(OpCodes.Call, typeof(LispStruct).GetMethod("InternViaEval",
@@ -4632,6 +5098,12 @@ public partial class CilAssembler
             ["Runtime.TruncateOp"] = typeof(Runtime).GetMethod("TruncateOp")!,
             ["Runtime.CeilingOp"] = typeof(Runtime).GetMethod("CeilingOp")!,
             ["Runtime.RoundOp"] = typeof(Runtime).GetMethod("RoundOp")!,
+            // Single-value twins: the peephole swaps these in when the call site
+            // discards the secondary value (see MultipleValues.Values2Primary).
+            ["Runtime.FloorOpPrimary"] = typeof(Runtime).GetMethod("FloorOpPrimary")!,
+            ["Runtime.TruncateOpPrimary"] = typeof(Runtime).GetMethod("TruncateOpPrimary")!,
+            ["Runtime.CeilingOpPrimary"] = typeof(Runtime).GetMethod("CeilingOpPrimary")!,
+            ["Runtime.RoundOpPrimary"] = typeof(Runtime).GetMethod("RoundOpPrimary")!,
             ["Runtime.Min"] = typeof(Runtime).GetMethod("Min")!,
             ["Runtime.Max"] = typeof(Runtime).GetMethod("Max")!,
             ["Runtime.Gcd"] = typeof(Runtime).GetMethod("Gcd")!,
@@ -4700,6 +5172,8 @@ public partial class CilAssembler
 
             // Runtime - higher-order
             ["Runtime.Apply"] = typeof(Runtime).GetMethod("Apply")!,
+            ["Runtime.ApplySpread1"] = typeof(Runtime).GetMethod("ApplySpread1")!,
+            ["Runtime.ApplySpread2"] = typeof(Runtime).GetMethod("ApplySpread2")!,
             ["Runtime.Mapcar"] = typeof(Runtime).GetMethod("Mapcar")!,
             ["Runtime.MapcarN"] = typeof(Runtime).GetMethod("MapcarN")!,
             ["Runtime.NthValueOf"] = typeof(Runtime).GetMethod("NthValueOf")!,
@@ -4712,12 +5186,14 @@ public partial class CilAssembler
             ["Runtime.MakeHashTable"] = typeof(Runtime).GetMethod("MakeHashTable")!,
             ["Runtime.MakeHashTable0"] = typeof(Runtime).GetMethod("MakeHashTable0")!,
             ["Runtime.Gethash"] = typeof(Runtime).GetMethod("Gethash")!,
+            ["Runtime.GethashPrimary"] = typeof(Runtime).GetMethod("GethashPrimary")!,
             ["Runtime.Puthash"] = typeof(Runtime).GetMethod("Puthash")!,
             ["Runtime.Remhash"] = typeof(Runtime).GetMethod("Remhash")!,
 
             // Runtime - values
             ["Runtime.Values"] = typeof(Runtime).GetMethod("Values")!,
             ["Runtime.Values2"] = typeof(Runtime).GetMethod("Values2")!,
+            ["Runtime.Values2Primary"] = typeof(Runtime).GetMethod("Values2Primary")!,
             ["Runtime.MultipleValuesList"] = typeof(Runtime).GetMethod("MultipleValuesList")!,
             ["Runtime.MultipleValuesList1"] = typeof(Runtime).GetMethod("MultipleValuesList1")!,
             ["Runtime.UnwrapMv"] = typeof(Runtime).GetMethod("UnwrapMv")!,
@@ -5111,8 +5587,15 @@ public partial class CilAssembler
             // Exception-filter predicates
             ["ControlFlowFilters.CatchTagMatches"] =
                 typeof(ControlFlowFilters).GetMethod("CatchTagMatches")!,
+            // Two shapes, two names. A .sil compiled by an older dotcl names
+            // HandlerCaseClause and pushes (tag, specs); rebinding that name to the
+            // cluster form makes such a .sil assemble into an invalid program.
             ["ControlFlowFilters.HandlerCaseClause"] =
-                typeof(ControlFlowFilters).GetMethod("HandlerCaseClause")!,
+                typeof(ControlFlowFilters).GetMethod("HandlerCaseClause",
+                    new[] { typeof(object), typeof(object), typeof(LispObject[]) })!,
+            ["ControlFlowFilters.HandlerCaseClauseCluster"] =
+                typeof(ControlFlowFilters).GetMethod("HandlerCaseClause",
+                    new[] { typeof(object), typeof(HandlerBinding[]) })!,
             ["ControlFlowFilters.HandlerCaseCondition"] =
                 typeof(ControlFlowFilters).GetMethod("HandlerCaseCondition")!,
             ["ControlFlowFilters.RestartCaseTag"] =
@@ -5166,10 +5649,13 @@ public partial class CilAssembler
                 .GetConstructor(new[] { typeof(object), typeof(int) })!,
             ["HandlerBinding"] = typeof(HandlerBinding)
                 .GetConstructor(new[] { typeof(LispObject), typeof(LispFunction) })!,
-            // handler-case clause: (type-spec, tag, clause-index) -- no handler
-            // function object per clause per entry.
+            // handler-case clause: no handler function object per clause per entry.
+            // The older name takes (type-spec, tag, clause-index) and stays bound to
+            // that shape for .sil compiled before the cluster carried the identity.
             ["HandlerBindingHc"] = typeof(HandlerBinding)
                 .GetConstructor(new[] { typeof(LispObject), typeof(object), typeof(int) })!,
+            ["HandlerBindingHcCluster"] = typeof(HandlerBinding)
+                .GetConstructor(new[] { typeof(LispObject), typeof(int) })!,
             ["LispRestart"] = typeof(LispRestart)
                 .GetConstructor(new[] { typeof(string), typeof(Func<LispObject[], LispObject>),
                                         typeof(string), typeof(object), typeof(bool) })!,
