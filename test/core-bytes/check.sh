@@ -1,5 +1,5 @@
 #!/bin/sh
-# Booting from a core held in memory — DotclHost.LoadCore(byte[]).
+# Booting from a core held in memory: DotclHost.LoadCore(byte[]).
 #
 # A host with no filesystem (a browser fetches the core over HTTP) has no path to
 # hand the loader, and an emit-free runtime has no other way in: assembling SIL
@@ -8,13 +8,25 @@
 # worth of Lisp then works.
 #
 # Run against both runtimes:
-#   1. the normal build            — the overload must not have broken the usual path
-#   2. -p:DotclNoEmit=true         — the configuration a browser actually gets
+#   1. the normal build: the overload must not have broken the usual path
+#   2. -p:DotclNoEmit=true: the configuration a browser actually gets
 # Case 2 is the one that matters; case 1 is there so a desktop regression shows up
 # here rather than only in whatever ships.
 #
 # Usage: check.sh <repo-root>
 set -eu
+
+# A missing prerequisite is a convenience skip when this is run by hand, but in
+# CI a skip is indistinguishable from a pass: the gate quietly stops gating and
+# nothing in the log says so. DOTCL_CI=1 (set at the job level in
+# .github/workflows/ci.yml) makes it a failure instead.
+skip_or_fail() {
+  echo "$1"
+  if [ "${DOTCL_CI:-}" = "1" ]; then
+    echo "  DOTCL_CI=1: a skipped check counts as a failure here" >&2
+    exit 1
+  fi
+}
 # Absolute: the generated project lives outside the tree and references the
 # runtime by path, so a relative ROOT would resolve against its own directory.
 ROOT="$(cd "${1%/}" && pwd)"
@@ -23,7 +35,7 @@ ROOT="$(cd "${1%/}" && pwd)"
 win() { if command -v cygpath >/dev/null 2>&1; then cygpath -m "$1"; else echo "$1"; fi; }
 
 if [ ! -f "$ROOT/compiler/dotcl.core" ]; then
-  echo "  SKIP: compiler/dotcl.core not built (make compile-core-fasl)"
+  skip_or_fail "  SKIP: compiler/dotcl.core not built (make compile-core-fasl)"
   exit 0
 fi
 

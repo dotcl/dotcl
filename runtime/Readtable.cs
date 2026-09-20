@@ -30,7 +30,7 @@ public class LispReadtable : LispObject
     // Syntax type for each character. Characters not in this map are Constituent by default.
     private readonly Dictionary<char, SyntaxType> _syntaxTypes = new();
 
-    // Reader macro functions: char → C# delegate (stream, char) → LispObject?
+    // Reader macro functions: char -> C# delegate (stream, char) -> LispObject?
     // null return means "no value produced" (re-enter step 1)
     private readonly Dictionary<char, Func<Reader, char, LispObject?>> _macroFunctions = new();
 
@@ -41,12 +41,21 @@ public class LispReadtable : LispObject
     // Used by GET-MACRO-CHARACTER to return the function the user passed to SET-MACRO-CHARACTER
     private readonly Dictionary<char, LispObject> _lispMacroFunctions = new();
 
-    // Dispatch tables: dispatching-char → (sub-char → dispatch function(stream, sub-char, numarg))
+    // Dispatch tables: dispatching-char -> (sub-char -> dispatch function(stream, sub-char, numarg))
     private readonly Dictionary<char, Dictionary<char, Func<Reader, char, int, LispObject?>>> _dispatchTables = new();
 
     // Original Lisp function objects for user-set dispatch macro sub-characters
     // Used by GET-DISPATCH-MACRO-CHARACTER to return the function the user passed to SET-DISPATCH-MACRO-CHARACTER
     private readonly Dictionary<char, Dictionary<char, LispObject>> _lispDispatchFunctions = new();
+
+    // The reader macro function of every dispatching macro character, in every
+    // readtable. One object rather than one per readtable: the dispatcher is the
+    // same in all of them and resolves the dispatch table from the readtable in
+    // force, so what a readtable owns is the table, not the function. Sharing it
+    // is what lets GET-MACRO-CHARACTER answer EQ for # in two copies of a
+    // readtable, which is how a merge decides the two agree (ReaderMacroWrappers).
+    private static readonly Func<Reader, char, LispObject?> _dispatchMacroFunction =
+        (reader, c) => reader.DispatchMacro(c);
 
     public ReadtableCase Case { get; set; } = ReadtableCase.Upcase;
 
@@ -112,8 +121,8 @@ public class LispReadtable : LispObject
         if (nonTerminating) _nonTerminating.Add(ch); else _nonTerminating.Remove(ch);
         if (!_dispatchTables.ContainsKey(ch))
             _dispatchTables[ch] = new Dictionary<char, Func<Reader, char, int, LispObject?>>();
-        // Register DispatchMacro as the reader macro function for this dispatching char.
-        _macroFunctions[ch] = (reader, c) => reader.DispatchMacro(this, c);
+        // The shared dispatcher, not a closure over this readtable.
+        _macroFunctions[ch] = _dispatchMacroFunction;
     }
 
     /// <summary>Get the dispatch table for a dispatching macro character.</summary>
@@ -198,9 +207,7 @@ public class LispReadtable : LispObject
         {
             var newTable = new Dictionary<char, Func<Reader, char, int, LispObject?>>(srcTable);
             _dispatchTables[toChar] = newTable;
-            // Re-register macro function to reference this readtable's dispatch table
-            // (the copied lambda from fromReadtable captures the wrong readtable reference)
-            _macroFunctions[toChar] = (reader, c) => reader.DispatchMacro(this, c);
+            _macroFunctions[toChar] = _dispatchMacroFunction;
         }
         else
         {
@@ -226,12 +233,8 @@ public class LispReadtable : LispObject
         _lispDispatchFunctions.Clear();
         foreach (var kv in source._lispDispatchFunctions)
             _lispDispatchFunctions[kv.Key] = new Dictionary<char, LispObject>(kv.Value);
-        // Re-register DispatchMacro closures to reference this readtable (not source)
-        foreach (var kv in _dispatchTables)
-        {
-            var dispChar = kv.Key;
-            _macroFunctions[dispChar] = (reader, c) => reader.DispatchMacro(this, c);
-        }
+        // The dispatcher is shared, so a copied entry already points at it; the
+        // dispatch tables above are what had to be copied.
     }
 
     /// <summary>Create a deep copy of this readtable.</summary>
@@ -247,12 +250,8 @@ public class LispReadtable : LispObject
             copy._dispatchTables[kv.Key] = new Dictionary<char, Func<Reader, char, int, LispObject?>>(kv.Value);
         foreach (var kv in _lispDispatchFunctions)
             copy._lispDispatchFunctions[kv.Key] = new Dictionary<char, LispObject>(kv.Value);
-        // Re-register DispatchMacro closures to reference the copy (not source)
-        foreach (var kv in copy._dispatchTables)
-        {
-            var dispChar = kv.Key;
-            copy._macroFunctions[dispChar] = (reader, c) => reader.DispatchMacro(copy, c);
-        }
+        // The dispatcher is shared, so the copied entries already point at it;
+        // the dispatch tables above are what had to be copied.
         return copy;
     }
 
@@ -273,7 +272,7 @@ public class LispReadtable : LispObject
 
     /// <summary>
     /// Create the standard readtable with default CL syntax (CLHS 2.1.4 Figure 2-7).
-    /// Reader macro functions are NOT set here — they must be registered after Reader is available.
+    /// Reader macro functions are NOT set here: they must be registered after Reader is available.
     /// </summary>
     public static LispReadtable CreateStandard()
     {
@@ -308,4 +307,30 @@ public class LispReadtable : LispObject
 
         return rt;
     }
+}
+
+/// <summary>
+/// The Lisp callable that stands for a reader macro written in C#.
+///
+/// GET-MACRO-CHARACTER has to hand back something a Lisp caller can FUNCALL,
+/// and for the built-in macros there is no Lisp function to hand back -- only a
+/// C# delegate -- so one is wrapped around it. Wrapping on every call made the
+/// answer a different object every time, which breaks callers that compare what
+/// they got: named-readtables decides whether two readtables agree on a
+/// character by EQ on the two functions, so merging any two readtables reported
+/// a conflict on every character with a built-in macro (the standard " among
+/// them) and DEFREADTABLE (:merge :standard) could not run.
+///
+/// Keyed by the delegate, so the identity of the answer follows the identity of
+/// the macro function: COPY-READTABLE shares the delegates it copies, and two
+/// copies of the standard readtable therefore agree. Dispatching characters are
+/// the exception on purpose -- each readtable gets its own closure over itself,
+/// so # differs between copies, which is what SBCL does too.
+/// </summary>
+public static class ReaderMacroWrappers
+{
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<object, LispObject> _wrappers = new();
+
+    public static LispObject ForDelegate(object csFn, Func<LispObject> make)
+        => _wrappers.GetValue(csFn, _ => make());
 }

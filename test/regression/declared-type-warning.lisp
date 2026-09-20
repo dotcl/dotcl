@@ -9,7 +9,7 @@
 
 ;;; Every test here probes a COMPILE-TIME diagnostic through EVAL, so all of them
 ;;; are compiled-only: under :interpret nothing is analysed, which makes the
-;;; "warns" cases fail and — the reason none of them may stay a plain DEFTEST —
+;;; "warns" cases fail and, the reason none of them may stay a plain DEFTEST,
 ;;; makes the "stays quiet" cases pass vacuously.
 
 (defun %dtw-warned-p (form)
@@ -58,7 +58,7 @@
   "#m3.75")
 
 ;;; A bare DECIMAL is a different symbol, so the compiler's decimal path does not
-;;; fire — which is exactly the case worth reporting.
+;;; fire: which is exactly the case worth reporting.
 (deftest-compiled-only declared-type-warning-bare-decimal
   (%dtw-warned-p '(defun %dtw-7 (x y) (declare (type decimal x y)) (+ x y)))
   t)

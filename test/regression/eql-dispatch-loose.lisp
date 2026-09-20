@@ -66,7 +66,7 @@
           (error () :error)))
   ((:only nil) :error))
 
-;;; Auxiliary methods must keep working — the shortcut declines these shapes.
+;;; Auxiliary methods must keep working: the shortcut declines these shapes.
 (defvar *edl-trace* '())
 (defgeneric edl-aux (x))
 (defmethod edl-aux ((x (eql :a))) (push :primary *edl-trace*) :primary)

@@ -1,4 +1,4 @@
-# MauiLispDemo — a recipe for embedding dotcl in a C# project (MAUI edition)
+# MauiLispDemo: a recipe for embedding dotcl in a C# project (MAUI edition)
 
 A sample that demonstrates the boilerplate for **embedding dotcl as an
 in-process runtime in an existing .NET project**, using a MAUI Windows / Android
@@ -21,17 +21,17 @@ Below the title, a list of snippets (a CollectionView) is shown; selecting one
 puts that snippet's body in the editor (`Editor`) below. The buttons at the
 bottom are:
 
-- **🌐** — switch the snippet display language.
-- **▶ Run my-click** — call the function `(defun my-click ...)` defined on the
-  Lisp side. Redefine `my-click` in the editor → press ▶ and the new behavior
+- **🌐**, switch the snippet display language.
+- **> Run my-click**, call the function `(defun my-click ...)` defined on the
+  Lisp side. Redefine `my-click` in the editor -> press > and the new behavior
   runs immediately (live coding).
-- **Evaluate** — `read` → `eval` the editor's content and print the result on
+- **Evaluate**: `read` -> `eval` the editor's content and print the result on
   the bottom line. Side effects such as `defun` / `defparameter` persist within
   the session.
 
 If a snippet performs a VM operation like `(setf (slot-value vm 'count) ...)`,
 the UI updates immediately via INotifyPropertyChanged. Overwriting a Lisp
-function and then pressing `▶` swaps the behavior — that is the feel of "a MAUI
+function and then pressing `>` swaps the behavior; that is the feel of "a MAUI
 app built in Lisp".
 
 ## Embedding recipe
@@ -66,11 +66,11 @@ DotclHost.LoadCore(DotclHost.FindCore() ?? throw ...);
 DotclHost.LoadLispFile(Path.Combine(AppContext.BaseDirectory, "main.lisp"));
 ```
 
-`DotclHost` (`runtime/DotclHost.cs`) is the embedding façade. The order is
-`Initialize → LoadCore → LoadLispFile`. In MAUI, run it at the top of
+`DotclHost` (`runtime/DotclHost.cs`) is the embedding facade. The order is
+`Initialize -> LoadCore -> LoadLispFile`. In MAUI, run it at the top of
 `CreateMauiApp` in `MauiProgram.cs`.
 
-### 3. C# ↔ Lisp wiring
+### 3. C# <-> Lisp wiring
 
 At a framework fixed point on the C# side (for MAUI, `App.CreateWindow`), call a
 Lisp function, unwrap the result, and hand it to the framework:
@@ -91,7 +91,7 @@ etc. Its `Value` property gives the raw instance.
 
 ## Lisp-side prefabs
 
-### `MauiLispDemo.MainVM` — VM (INotifyPropertyChanged + ICommand)
+### `MauiLispDemo.MainVM`: VM (INotifyPropertyChanged + ICommand)
 
 ```lisp
 (dotnet:define-class "MauiLispDemo.MainVM" (Object)
@@ -111,7 +111,7 @@ etc. Its `Value` property gives the raw instance.
 - The `ICommand` property holds a Lisp lambda wrapped in `LispCommand` (the XAML
   side uses `Command="{Binding IncrementCommand}"`).
 
-### `MauiLispDemo.MainPage` — a ContentPage subclass
+### `MauiLispDemo.MainPage`: a ContentPage subclass
 
 ```lisp
 (dotnet:define-class "MauiLispDemo.MainPage" (ContentPage)
@@ -184,5 +184,5 @@ adb / scrcpy, troubleshooting).
 
 ## See also
 
-- `runtime/DotclHost.cs` — the full embedding API.
-- `contrib/dotnet-class/` — macros such as `dotnet:define-class`.
+- `runtime/DotclHost.cs`, the full embedding API.
+- `contrib/dotnet-class/`, macros such as `dotnet:define-class`.

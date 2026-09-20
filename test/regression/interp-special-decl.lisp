@@ -2,8 +2,8 @@
 ;;; dynamic (CLHS 3.3.4). WHICH binding that reaches depends on whether the
 ;;; enclosing form bound V:
 ;;;
-;;;   bound here  — the enclosing form's own binding becomes dynamic
-;;;   free here   — the reference must reach an OUTER special binding, and the
+;;;   bound here, the enclosing form's own binding becomes dynamic
+;;;   free here, the reference must reach an OUTER special binding, and the
 ;;;                 declaration must NOT rebind anything
 ;;;
 ;;; The interpreter took the value out of the lexical alist unconditionally,
@@ -39,7 +39,7 @@
   (%sd :interpret %sd-locally)
   :good)
 
-;;; ansi-test DO.19 shape — the declaration is in a DO body that binds nothing.
+;;; ansi-test DO.19 shape: the declaration is in a DO body that binds nothing.
 (defparameter %sd-do-free
   '(let ((x :good)) (declare (special x))
      (let ((x :bad)) (do nil (t x) (declare (special x))))))

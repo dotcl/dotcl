@@ -9,7 +9,7 @@ public static class Arithmetic
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static Number Add(Number a, Number b)
     {
-        // Fixnum fast path — avoid BigInteger when result fits in long
+        // Fixnum fast path: avoid BigInteger when result fits in long
         if (a is Fixnum fa && b is Fixnum fb)
         {
             long av = fa.Value, bv = fb.Value, r = av + bv;
@@ -19,7 +19,7 @@ public static class Arithmetic
             return new Bignum((BigInteger)av + bv);
         }
 
-        // SingleFloat fast path — common in numeric code
+        // SingleFloat fast path: common in numeric code
         if (a is SingleFloat sfa && b is SingleFloat sfb)
             return new SingleFloat(sfa.Value + sfb.Value);
 
@@ -103,7 +103,7 @@ public static class Arithmetic
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static Number Multiply(Number a, Number b)
     {
-        // Fixnum fast path — use checked to detect overflow
+        // Fixnum fast path: use checked to detect overflow
         if (a is Fixnum fa && b is Fixnum fb)
         {
             try { return Fixnum.Make(checked(fa.Value * fb.Value)); }
@@ -175,9 +175,9 @@ public static class Arithmetic
             if (anyFloat)
             {
                 // Float complex division via System.Numerics (Smith's algorithm): the
-                // denominator is scaled, so c²+d² no longer over/underflows for extreme
-                // magnitudes. The naive ((c²+d²)) form made (/ z (abs z)) for |z|~1e±170
-                // hit divide-by-zero (denom→0) or NaN (denom→inf). Maxima signum(complex)
+                // denominator is scaled, so c^2+d^2 no longer over/underflows for extreme
+                // magnitudes. The naive ((c^2+d^2)) form made (/ z (abs z)) for |z|~1e+/-170
+                // hit divide-by-zero (denom->0) or NaN (denom->inf). Maxima signum(complex)
                 // depends on this.
                 var bcx = ToSystemComplex(bc);
                 if (bcx.Real == 0.0 && bcx.Imaginary == 0.0)
@@ -192,7 +192,7 @@ public static class Arithmetic
                     : MakeComplex(new DoubleFloat(q.Real), new DoubleFloat(q.Imaginary));
             }
             // Exact (integer/rational) complex division: (a+bi)/(c+di) =
-            // ((ac+bd) + (bc-ad)i) / (c²+d²). BigInteger arithmetic — no overflow.
+            // ((ac+bd) + (bc-ad)i) / (c^2+d^2). BigInteger arithmetic: no overflow.
             var denom = Add(Multiply(bc.Real, bc.Real), Multiply(bc.Imaginary, bc.Imaginary));
             return MakeComplex(
                 Divide(Add(Multiply(ac.Real, bc.Real), Multiply(ac.Imaginary, bc.Imaginary)), denom),
@@ -233,7 +233,7 @@ public static class Arithmetic
             Ratio => Subtract(Fixnum.Make(0), a),
             SingleFloat sf => new SingleFloat(-sf.Value),
             DoubleFloat df => new DoubleFloat(-df.Value),
-            LispDecimal d => Negate(d.ToRational()),   // standard op → standard (rational) result
+            LispDecimal d => Negate(d.ToRational()),   // standard op -> standard (rational) result
             LispComplex c => MakeComplex(Negate(c.Real), Negate(c.Imaginary)),
             _ => throw new NotImplementedException()
         };
@@ -249,7 +249,7 @@ public static class Arithmetic
             Ratio r => r.Numerator >= 0 ? a : (Number)Ratio.Make(-r.Numerator, r.Denominator),
             SingleFloat sf => new SingleFloat(System.Math.Abs(sf.Value)),
             DoubleFloat df => new DoubleFloat(System.Math.Abs(df.Value)),
-            LispDecimal d => Abs(d.ToRational()),   // standard op → standard (rational) result
+            LispDecimal d => Abs(d.ToRational()),   // standard op -> standard (rational) result
             // Magnitude via System.Numerics.Complex.Abs, which uses a scaled hypot
             // (max*sqrt(1+(min/max)^2)) so it doesn't over/underflow when re^2/im^2
             // would: e.g. (abs #C(1d170 1d170)) and (abs #C(1d-170 1d-170)) are exact
@@ -390,7 +390,7 @@ public static class Arithmetic
 
         var q = BigInteger.DivRem(scaledNum, den, out var rem);
 
-        // Normalize so q has exactly 54 bits (handles ±1 bit from estimate)
+        // Normalize so q has exactly 54 bits (handles +/-1 bit from estimate)
         int qBits = (int)q.GetBitLength();
         while (qBits < 54)
         {
@@ -422,7 +422,7 @@ public static class Arithmetic
             {
                 // Rounding carried into a 54th bit. Halving q (q >>= 1) must be
                 // compensated by shift-- (the result is q * 2^-shift, so a smaller q
-                // needs a smaller shift to hold the value) — same convention as the
+                // needs a smaller shift to hold the value): same convention as the
                 // guard-bit extraction above. shift++ here turned (2^N-1)/2^N into 0.25.
                 q >>= 1;
                 shift--;
@@ -546,7 +546,7 @@ public static class Arithmetic
     }
 
     /// <summary>True if either operand is a NaN float. The ordering predicates
-    /// (&lt; &lt;= &gt; &gt;=) must return false when an operand is NaN — IEEE comparisons
+    /// (&lt; &lt;= &gt; &gt;=) must return false when an operand is NaN; IEEE comparisons
     /// with NaN are "unordered", but Compare() returns a total order (CompareTo
     /// ranks NaN below everything), so callers must check this first.</summary>
     public static bool EitherNaN(Number a, Number b)
@@ -615,12 +615,12 @@ public static class Arithmetic
 
     public static (Number quotient, Number remainder) Floor(Number a, Number b)
     {
-        // Fast path: both Fixnum — avoid BigInteger conversion
+        // Fast path: both Fixnum: avoid BigInteger conversion
         if (a is Fixnum fa && b is Fixnum fb)
         {
             long av = fa.Value, bv = fb.Value;
             long q = Math.DivRem(av, bv, out long r);
-            // Floor: round toward negative infinity — adjust if remainder has different sign from divisor
+            // Floor: round toward negative infinity: adjust if remainder has different sign from divisor
             if (r != 0 && ((r ^ bv) < 0)) { q--; r += bv; }
             return (Fixnum.Make(q), Fixnum.Make(r));
         }
@@ -673,7 +673,7 @@ public static class Arithmetic
         {
             long av = fa.Value, bv = fb.Value;
             long q = Math.DivRem(av, bv, out long r);
-            // Ceiling: round toward positive infinity — adjust if remainder has same sign as divisor
+            // Ceiling: round toward positive infinity: adjust if remainder has same sign as divisor
             if (r != 0 && ((r ^ bv) >= 0)) { q++; r -= bv; }
             return (Fixnum.Make(q), Fixnum.Make(r));
         }
@@ -734,14 +734,14 @@ public static class Arithmetic
         // If either argument is single-float, result is single-float
         if (a is SingleFloat || b is SingleFloat)
             return new SingleFloat((float)qd);
-        // Both rational → single-float
+        // Both rational -> single-float
         return new SingleFloat((float)qd);
     }
 
     // --- FFloor / FCeiling / FTruncate / FRound ---
     // A non-finite float (inf/nan) can't be rounded to a rational. All four
-    // float-result roundings just return the (float) value itself — SBCL returns
-    // the infinity/NaN as the quotient — instead of going through Floor/Truncate
+    // float-result roundings just return the (float) value itself, SBCL returns
+    // the infinity/NaN as the quotient, instead of going through Floor/Truncate
     // which would rationalize and throw. (Integer-result floor/truncate still
     // error on infinity, matching SBCL; only the f* float-result forms differ.)
     private static bool TryFNonFinite(Number a, Number b, out (Number quotient, Number remainder) result)
@@ -896,10 +896,10 @@ public static class Arithmetic
         Bignum b => (b.Value, BigInteger.One),
         Ratio r => (r.Numerator, r.Denominator),
         // A decimal contributes its exact rational value; standard exact arithmetic then
-        // yields a standard rational/integer (never a decimal — conservative extension).
+        // yields a standard rational/integer (never a decimal: conservative extension).
         LispDecimal d => d.AsRatio(),
         // A complex reaching here means a real-only operation (FLOOR / CEILING /
-        // TRUNCATE / ROUND …) was handed one: a wrong argument, not a broken
+        // TRUNCATE / ROUND ...) was handed one: a wrong argument, not a broken
         // program. A raw ArgumentException here surfaced as PROGRAM-ERROR with no
         // datum to inspect.
         _ => throw new LispErrorException(new LispTypeError(

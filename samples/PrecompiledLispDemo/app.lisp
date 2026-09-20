@@ -1,4 +1,4 @@
-;;;; app.lisp — the application's Lisp code, precompiled to app.fasl at build
+;;;; app.lisp: the application's Lisp code, precompiled to app.fasl at build
 ;;;; time. At run time the host loads app.fasl (no code generation) and calls
 ;;;; these functions; this file's source is never read or eval'd by the shipped
 ;;;; app. host-log is a host C# function exposed via DotclHost.Register.

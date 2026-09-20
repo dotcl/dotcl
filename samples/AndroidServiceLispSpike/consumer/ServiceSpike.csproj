@@ -1,0 +1,46 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Minimal net10.0-android app (no MAUI) whose only Java-visible types come
+    from .dll files emitted by Common Lisp. Nothing here is written in C#: the
+    referenced assemblies carry the [Service] and [Activity] types, and this
+    project exists only to give the Android build something to generate Android
+    Callable Wrappers for.
+
+    Each emit script writes its own assembly, and both are referenced when
+    present, so the project builds after running either one or both of them.
+
+    AndroidLinkMode=None keeps the trimmer from removing the emitted types,
+    which nothing in this project references.
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>net10.0-android</TargetFramework>
+    <SupportedOSPlatformVersion>24.0</SupportedOSPlatformVersion>
+    <OutputType>Exe</OutputType>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <ApplicationId>com.dotcl.lispservicespike</ApplicationId>
+    <ApplicationVersion>1</ApplicationVersion>
+    <ApplicationDisplayVersion>1.0</ApplicationDisplayVersion>
+    <AndroidLinkMode>None</AndroidLinkMode>
+    <RuntimeIdentifier>android-arm64</RuntimeIdentifier>
+    <EnableDefaultCompileItems>true</EnableDefaultCompileItems>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="LispAndroidSpike" Condition="Exists('../out/LispAndroidSpike.dll')">
+      <HintPath>../out/LispAndroidSpike.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="LispAndroidActivitySpike" Condition="Exists('../out/LispAndroidActivitySpike.dll')">
+      <HintPath>../out/LispAndroidActivitySpike.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="DotCL.Runtime">
+      <HintPath>../../../runtime/bin/Debug/net10.0/DotCL.Runtime.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+  </ItemGroup>
+
+</Project>

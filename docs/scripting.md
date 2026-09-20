@@ -60,6 +60,15 @@ Falling off the end of the file exits 0. `dotcl:quit` sets the code:
 An unhandled error also exits non-zero, after printing the condition, so a script
 that does nothing about failure still reports it to the shell.
 
+That holds even when a restart is available. In a REPL an unhandled error stops
+at the debugger and you pick a restart; a script run has nobody to ask, so the
+debugger prints the condition and the restarts that were available and then
+unwinds, and the process exits non-zero. It does not choose a restart on the
+program's behalf -- the restarts in scope usually belong to a library rather than
+to the script, so taking one would resume at the next form as though the error
+had been handled. If a script should carry on past a particular error, say so
+with `handler-case` or `handler-bind` around the form that signals it.
+
 ## Running a script directly
 
 A `#!` line on the first line is ignored, so a script can be executable on

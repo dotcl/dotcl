@@ -1,4 +1,4 @@
-;;; dotcl-cltl2:macroexpand-all — the code walker.
+;;; dotcl-cltl2:macroexpand-all: the code walker.
 ;;;
 ;;; A structural walker (expand, recurse on the result) gets the easy cases but
 ;;; cannot handle scope: it has no way to put a MACROLET definition in scope for
@@ -80,7 +80,7 @@
   (mea '(let ((v 0)) (setq v (mea-twice 1))))
   (let ((v 0)) (setq v (progn 1 1))))
 
-;;; Compiler-internal macros (cond/when/and/or) expand too — walkers rely on it.
+;;; Compiler-internal macros (cond/when/and/or) expand too: walkers rely on it.
 (deftest mea-cond-expands
   (let ((r (mea '(cond (a 1) (t 2)))))
     (eq (car r) 'if))

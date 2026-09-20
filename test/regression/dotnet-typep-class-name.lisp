@@ -1,6 +1,6 @@
 ;;; (typep <.NET object> 'class-name) must agree with the class-object form and
-;;; with dispatch. It used to answer NIL for every .NET class name — only a class
-;;; OBJECT worked — so (typep sb 'stringbuilder) was NIL while
+;;; with dispatch. It used to answer NIL for every .NET class name, only a class
+;;; OBJECT worked, so (typep sb 'stringbuilder) was NIL while
 ;;; (typep sb (dotnet:class-for-type "System.Text.StringBuilder")) was T.
 ;;;
 ;;; The lookup also has to register the object's type first: .NET classes are

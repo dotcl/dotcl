@@ -2,7 +2,7 @@
 ;;;
 ;;; The runtime throws plain .NET exceptions in many places (throw new
 ;;; ArgumentException and friends). A .NET throw never goes through SIGNAL, and a
-;;; handler cluster is only consulted BY signal — so nothing connected the two
+;;; handler cluster is only consulted BY signal: so nothing connected the two
 ;;; unless something wrapped the body in a try/catch.
 ;;;
 ;;; Compiled code has that try/catch: COMPILE-HANDLER-CASE emits one and converts
@@ -12,7 +12,7 @@
 ;;;
 ;;; returned :CAUGHT compiled and flew past the handler interpreted. It was easy
 ;;; to miss because an enclosing COMPILED handler-case catches the escapee, so the
-;;; condition still looks handled from outside — the divergence only shows when
+;;; condition still looks handled from outside: the divergence only shows when
 ;;; the handler-case itself is the interpreted one.
 ;;;
 ;;; The fix: %MINI-EVAL now implements HANDLER-BIND itself instead of letting the
@@ -82,7 +82,7 @@
   (%ihr :interpret %ihr-hb-transfer)
   (:caught program-error))
 
-;;; A handler that returns normally declines. The condition then propagates —
+;;; A handler that returns normally declines. The condition then propagates;
 ;;; it cannot resume at the throw point, because by the time a .NET exception is
 ;;; catchable those frames are gone. The flag proves the handler did run.
 (defparameter %ihr-hb-decline
@@ -173,7 +173,7 @@
                      r))
   nil)
 
-;;; a lexical macro of the same name still shadows the special handling — the
+;;; a lexical macro of the same name still shadows the special handling; the
 ;;; evaluator checks the lexical macro environment before its own form table
 (deftest interp-handler-raw-dotnet.macrolet-shadows-interpret
   (%ihr :interpret '(macrolet ((handler-bind (bindings &body body)

@@ -56,7 +56,7 @@ public static partial class Runtime
     }
 
     /// <summary>Compare two strings under ONE bounds keyword pair without building an
-    /// args array — the (string= name prefix :end1 n) shape, which prefix checks make the
+    /// args array: the (string= name prefix :end1 n) shape, which prefix checks make the
     /// most common keyworded string comparison by a wide margin. Returns false when the
     /// pair is anything else (:allow-other-keys, a non-integer bound, an unknown keyword),
     /// leaving the caller to fall back to the shared variadic parser so behaviour and
@@ -112,9 +112,9 @@ public static partial class Runtime
     // family (installed as _func2 at registration so Invoke2 skips InvokeSlow's
     // args-array path). Semantically identical to the variadic entry with
     // args.Length == 2: ParseStringCmpArgs then reduces to two ToStringDesignator
-    // coercions and a full-range compare — no keyword loop runs, no arity/
+    // coercions and a full-range compare: no keyword loop runs, no arity/
     // odd-keyword error can fire. Each 2-arg entry keeps its own function's
-    // (pos, cmp) → result mapping unchanged.
+    // (pos, cmp) -> result mapping unchanged.
     private static (int pos, int cmp) CompareFull2(LispObject a, LispObject b,
                                                    string fname, bool ignoreCase)
     {
@@ -320,7 +320,7 @@ public static partial class Runtime
     /// <summary>Check that START and END really are bounding indices of a sequence of
     /// LENGTH elements (CLHS: 0 &lt;= start &lt;= end &lt;= length), signalling a type error if
     /// not. Without this a too-large END silently produced a wrong answer rather than an
-    /// error — (subseq '(1 2 3) 0 99) returned the list padded with 96 NILs.</summary>
+    /// error: (subseq '(1 2 3) 0 99) returned the list padded with 96 NILs.</summary>
     private static void CheckBoundingIndices(int start, int end, int length, string fname)
     {
         if (start < 0 || start > length)
@@ -610,7 +610,7 @@ public static partial class Runtime
         return SortImpl(seq, predicate, null, stable: true);
     }
 
-    // 4-arg direct entry: (sort seq pred k v) — the only keyword SORT takes is
+    // 4-arg direct entry: (sort seq pred k v): the only keyword SORT takes is
     // :key, so the single pair is decoded here instead of running the general
     // scan over an args array. Anything else (an unknown keyword, or
     // :allow-other-keys paired with one) falls back to SortFull so there is a
@@ -701,7 +701,7 @@ public static partial class Runtime
         // Otherwise it's a genuine sort inconsistency (e.g. inconsistent comparator) - ignore
     }
 
-    // Sort ITEMS in place. Array.Sort is introsort — fine for SORT, which ANSI
+    // Sort ITEMS in place. Array.Sort is introsort: fine for SORT, which ANSI
     // leaves unstable, but STABLE-SORT must keep the original order of elements
     // the predicate considers equal. Stability is obtained by sorting a
     // permutation of indices and breaking ties on the index, so both modes share
@@ -854,7 +854,7 @@ public static partial class Runtime
                 var rest2 = rest1?.Cdr as Cons;          // (dims) or (size)
                 var sizeSpec = rest2?.Car;               // dims list (*) or fixnum size or *
 
-                // Parse element type — * and T both mean "any element"
+                // Parse element type: * and T both mean "any element"
                 string elemTypeName = "T";
                 if (elemTypeSpec != null && !(elemTypeSpec is T) && !(elemTypeSpec is Symbol wc && wc.Name == "*"))
                     elemTypeName = ParseElementTypeName(elemTypeSpec);
@@ -890,7 +890,7 @@ public static partial class Runtime
                 }
                 return result;
             }
-            // Try compound deftype expansion: (my-type args...) → expanded type
+            // Try compound deftype expansion: (my-type args...) -> expanded type
             if (TypeExpanders.TryGetValue(headSym.Name, out var compExpander))
             {
                 var compArgs = ToList(compType.Cdr).ToArray();
@@ -909,8 +909,8 @@ public static partial class Runtime
                 if (num is LispComplex cx) { real = cx.Real; imag = cx.Imaginary; }
                 else { real = num; imag = Fixnum.Make(0); }
                 // Coerce each part through Coerce(part, partType) rather than matching
-                // a literal float name, so a deftype part — e.g. (complex flonum), where
-                // flonum is a deftype expanding to double-float — is expanded and the
+                // a literal float name, so a deftype part: e.g. (complex flonum), where
+                // flonum is a deftype expanding to double-float: is expanded and the
                 // parts converted. A wildcard/absent part type leaves the parts as-is.
                 if (partType is not null && partType is not Nil
                     && !(partType is Symbol wsym && wsym.Name == "*"))
@@ -920,7 +920,7 @@ public static partial class Runtime
                 }
                 return LispComplex.Of(real, imag);
             }
-            // Compound float types — e.g. (DOUBLE-FLOAT low high), which a deftype
+            // Compound float types: e.g. (DOUBLE-FLOAT low high), which a deftype
             // like Maxima's FLONUM expands to ((&optional low high) -> (double-float
             // * *), since deftype optionals default to * not nil). Range bounds are
             // irrelevant to the coercion target; coerce to the base float type
@@ -960,7 +960,7 @@ public static partial class Runtime
 
             case "STRING": case "SIMPLE-STRING": case "BASE-STRING": case "SIMPLE-BASE-STRING":
                 if (obj is LispString) return obj;
-                if (obj is Nil) return new LispString("");  // empty list → empty string
+                if (obj is Nil) return new LispString("");  // empty list -> empty string
                 if (obj is Symbol sym) return new LispString(sym.Name);
                 if (obj is T) return new LispString("T");
                 if (obj is LispChar ch) return new LispString(ch.Value.ToString());
@@ -981,14 +981,14 @@ public static partial class Runtime
                     // For a SIMPLE-STRING target the result must be a *simple* string
                     // (CLHS): a fill-pointered / adjustable / displaced char-vector must
                     // be copied to a fresh simple string, not returned as-is. Returning
-                    // the non-simple vector broke code that (coerce … 'simple-string)s
-                    // and then relies on simplicity — e.g. cl-ppcre's
+                    // the non-simple vector broke code that (coerce ... 'simple-string)s
+                    // and then relies on simplicity: e.g. cl-ppcre's
                     // maybe-coerce-to-simple-string on parser-built adjustable strings.
                     bool wantSimple = typeName is "SIMPLE-STRING" or "SIMPLE-BASE-STRING";
                     // A char-vector already satisfies (BASE-)STRING. For a SIMPLE
                     // target return it as-is only if it is already simple (matches
                     // CheckSimpleType's SIMPLE-STRING criterion: no fill pointer,
-                    // rank 1) — CLHS: coerce returns the object itself when it is
+                    // rank 1): CLHS: coerce returns the object itself when it is
                     // already of the type. Otherwise fall through and copy.
                     if (vec.IsCharVector
                         && (!wantSimple || (!vec.HasFillPointer && vec.Rank == 1)))
@@ -1028,9 +1028,9 @@ public static partial class Runtime
                 throw new LispErrorException(new LispTypeError("COERCE: cannot coerce to double-float", obj));
 
             case "DECIMAL":
-                // dotcl:decimal — a distinct exactness category. Exact reals (integer,
+                // dotcl:decimal: a distinct exactness category. Exact reals (integer,
                 // ratio) convert exactly or signal (a denominator with a prime factor
-                // other than 2/5, e.g. 1/3, is not representable — no silent rounding).
+                // other than 2/5, e.g. 1/3, is not representable: no silent rounding).
                 // A float is the explicit escape hatch out of the decimal/float mixing
                 // ban, so coercing one imports its value via the .NET decimal cast (lossy
                 // by nature of the source, ~15 significant digits).
@@ -1057,7 +1057,7 @@ public static partial class Runtime
                 throw new LispErrorException(new LispTypeError("COERCE: cannot coerce to decimal", obj));
 
             case "VECTOR":
-                // Any LispVector or LispString satisfies VECTOR — return as-is
+                // Any LispVector or LispString satisfies VECTOR: return as-is
                 if (obj is LispVector || obj is LispString) return obj;
                 if (obj is Nil) return new LispVector(Array.Empty<LispObject>());
                 if (obj is Cons) return new LispVector(ListToArray(obj));
@@ -1221,7 +1221,7 @@ public static partial class Runtime
         return FindCore(args[0], args[1], ParseSeqKwArgs(args, 2, "FIND"));
     }
 
-    // 6-arg direct entry: (find item seq k1 v1 k2 v2) — two keyword pairs, e.g.
+    // 6-arg direct entry: (find item seq k1 v1 k2 v2): two keyword pairs, e.g.
     // (find name l :key #'symbol-name :test #'string=), which the compiler runs
     // per special/local-function lookup. Shared parser over a 4-element array;
     // the InvokeSlow path's 6-element args array is skipped. See Member6.
@@ -1296,7 +1296,7 @@ public static partial class Runtime
         return FindIfCore(predFn, args[1], ParseSeqKwArgs(args, 2, "FIND-IF"));
     }
 
-    // 2-arg direct entry: (find-if pred seq) — no keywords. Skips the args array
+    // 2-arg direct entry: (find-if pred seq): no keywords. Skips the args array
     // and the ParseSeqKwArgs scan (a default SeqKwArgs is exactly its zero-keyword
     // result). See RemoveIf2.
     public static LispObject FindIf2(LispObject pred, LispObject seq) =>
@@ -1728,22 +1728,22 @@ public static partial class Runtime
         return MemberCore(item, list, kw);
     }
 
-    // No-keyword ListKwArgs — provably what ParseListKwArgs returns for zero
-    // keyword pairs (loops don't run; TestNot/Key null, Test null → IsEqlTest).
+    // No-keyword ListKwArgs: provably what ParseListKwArgs returns for zero
+    // keyword pairs (loops don't run; TestNot/Key null, Test null -> IsEqlTest).
     // Shared by the 2-arg direct entries of MEMBER/ASSOC.
     private static readonly ListKwArgs s_eqlListKw = new ListKwArgs { IsEqlTest = true };
 
-    // 2-arg direct entry: (member item list) — no keyword pairs.
+    // 2-arg direct entry: (member item list): no keyword pairs.
     public static LispObject Member2(LispObject item, LispObject list) =>
         MemberCore(item, list, s_eqlListKw);
 
     // 4-arg direct entry: (member item list kw val). The keyword pair goes
-    // through the exact shared parser (over a 2-element array — half the
+    // through the exact shared parser (over a 2-element array: half the
     // allocation of the InvokeSlow path's 4-element args array).
     public static LispObject Member4(LispObject item, LispObject list, LispObject k, LispObject v) =>
         MemberCore(item, list, ParseListKwPairs(k, v, Nil.Instance, Nil.Instance, false, "MEMBER"));
 
-    // 6-arg direct entry: (member item list k1 v1 k2 v2) — two keyword pairs,
+    // 6-arg direct entry: (member item list k1 v1 k2 v2): two keyword pairs,
     // e.g. (member x l :key #'symbol-name :test #'string=), which the compiler's
     // special-variable lookup performs per variable reference. Same shared parser
     // over a 4-element array; the InvokeSlow path's 6-element args array is skipped.
@@ -1828,7 +1828,7 @@ public static partial class Runtime
         return Nil.Instance;
     }
 
-    // ADJOIN: (adjoin item list &key key test test-not) —
+    // ADJOIN: (adjoin item list &key key test test-not);
     // (if (member (funcall key item) list :key key :test test) list (cons item list)).
     // The key is applied to ITEM for the comparison, but the element consed on is
     // the original ITEM. PUSHNEW expands into this, so the keyworded shapes are
@@ -1873,14 +1873,14 @@ public static partial class Runtime
         return AssocCore(item, alist, kw);
     }
 
-    // 2-/4-arg direct entries — see Member2/Member4.
+    // 2-/4-arg direct entries: see Member2/Member4.
     public static LispObject Assoc2(LispObject item, LispObject alist) =>
         AssocCore(item, alist, s_eqlListKw);
 
     public static LispObject Assoc4(LispObject item, LispObject alist, LispObject k, LispObject v) =>
         AssocCore(item, alist, ParseListKwPairs(k, v, Nil.Instance, Nil.Instance, false, "ASSOC"));
 
-    // 6-arg direct entry: (assoc item alist k1 v1 k2 v2) — two keyword pairs.
+    // 6-arg direct entry: (assoc item alist k1 v1 k2 v2): two keyword pairs.
     // See Member6.
     public static LispObject Assoc6(LispObject item, LispObject alist,
                                     LispObject k1, LispObject v1, LispObject k2, LispObject v2) =>
@@ -1899,10 +1899,10 @@ public static partial class Runtime
         if (alist is Nil) return Nil.Instance;
 
         // A NIL element is allowed and skipped (CLHS assoc); anything else that is
-        // not a cons is a type error. Runtime.Assoc — what the compiler emits inline
-        // for the 2-argument call — already signalled it, so (assoc 'z '((a . b) :bad))
+        // not a cons is a type error. Runtime.Assoc, what the compiler emits inline
+        // for the 2-argument call, already signalled it, so (assoc 'z '((a . b) :bad))
         // errored when written literally but returned NIL through #'ASSOC, on BOTH
-        // evaluator paths (ansi-test ASSOC.ERROR.11) — the same divergence unary #'-
+        // evaluator paths (ansi-test ASSOC.ERROR.11): the same divergence unary #'-
         // had, where the inlined form is right and the function object is not.
         // The extra test only runs for entries that are not conses, so the eq/eql
         // fast paths keep their cost.
@@ -2266,7 +2266,7 @@ public static partial class Runtime
         return RemoveCore(seq, kw, new ItemMatch(item, kw));
     }
 
-    // 2-arg direct entry: (remove item seq) — no keywords, default EQL test.
+    // 2-arg direct entry: (remove item seq): no keywords, default EQL test.
     // Skips the args array and the ParseSeqKwArgs scan (a default SeqKwArgs is
     // exactly its zero-keyword result). See RemoveIf2.
     public static LispObject Remove2(LispObject item, LispObject seq)
@@ -2277,11 +2277,11 @@ public static partial class Runtime
         return RemoveCore(seq, kw, new ItemMatch(item, kw));
     }
 
-    // 4-arg direct entry: (remove item seq k v) — one keyword pair, e.g.
+    // 4-arg direct entry: (remove item seq k v): one keyword pair, e.g.
     // (remove x list :test #'string=) or (remove x list :key #'car). This is by
     // far the most common REMOVE shape in the compiler itself. The shared keyword
     // parser runs over a 2-element array, so only the args array of the InvokeSlow
-    // path is saved — same trade-off as Member4/Assoc4.
+    // path is saved: same trade-off as Member4/Assoc4.
     public static LispObject Remove4(LispObject item, LispObject seq, LispObject k, LispObject v)
     {
         if (seq is not Nil && seq is not Cons && seq is not LispVector && seq is not LispString)
@@ -2290,7 +2290,7 @@ public static partial class Runtime
         return RemoveCore(seq, kw, new ItemMatch(item, kw));
     }
 
-    // 6-arg direct entry: (remove item seq k1 v1 k2 v2) — two keyword pairs,
+    // 6-arg direct entry: (remove item seq k1 v1 k2 v2): two keyword pairs,
     // e.g. (remove x l :key #'car :test #'string=).
     public static LispObject Remove6(LispObject item, LispObject seq,
                                      LispObject k1, LispObject v1, LispObject k2, LispObject v2)
@@ -2313,7 +2313,7 @@ public static partial class Runtime
         return RemoveIfCore(predFn, seq, ParseSeqKwArgs(args, 2, "REMOVE-IF"));
     }
 
-    // 2-arg direct entry: (remove-if pred seq) — no keywords. The compiler calls
+    // 2-arg direct entry: (remove-if pred seq): no keywords. The compiler calls
     // this shape frequently (bound-name filtering). Skips the args array and the
     // ParseSeqKwArgs scan; a default SeqKwArgs is exactly ParseSeqKwArgs's zero-
     // keyword result (all fields default).
@@ -2325,7 +2325,7 @@ public static partial class Runtime
         return RemoveIfCore(predFn, seq, new SeqKwArgs());
     }
 
-    // 2-arg direct entry: (remove-if-not pred seq) — no keywords. Inverts the
+    // 2-arg direct entry: (remove-if-not pred seq): no keywords. Inverts the
     // predicate inline (negate: true) rather than allocating a negating wrapper
     // LispFunction the way the args-array registration does, so both the args
     // array and the per-element wrapper InvokeSlow are avoided. See RemoveIf2.
@@ -2372,7 +2372,7 @@ public static partial class Runtime
         return RemoveCore(seq, kw, new ItemMatch(item, kw), destructive: true);
     }
 
-    // 4-arg direct entry: (delete item seq kw val) — one keyword pair (e.g.
+    // 4-arg direct entry: (delete item seq kw val): one keyword pair (e.g.
     // :test #'eq). Pure addition (DeleteFull unchanged); shared parser over a
     // 2-element array. See Remove2 / Member4.
     public static LispObject Delete4(LispObject item, LispObject seq, LispObject k, LispObject v)
@@ -2401,7 +2401,7 @@ public static partial class Runtime
     // DELETE/DELETE-IF (destructive=true). When destructive and the sequence is a
     // list, matched conses are spliced out of the original chain in place (SBCL
     // semantics) so code that discards the return value and relies on in-place
-    // mutation — e.g. Maxima rempropchk / mfunction-delete — works.
+    // mutation, e.g. Maxima rempropchk / mfunction-delete, works.
     /// <summary>Element I of a vector or string, for the indexed REMOVE walk. A
     /// method rather than the `i =&gt; vec[i]` lambda it replaces: that lambda captured
     /// a local of RemoveCore, which forced the whole method.s closure -- including
@@ -2423,7 +2423,7 @@ public static partial class Runtime
         if (maxRemove.HasValue && maxRemove.Value <= 0)
         {
             // count <= 0: nothing removed. Return the original sequence (eq), as
-            // SBCL/CCL and most impls do — many libraries (e.g. Maxima add2lnc)
+            // SBCL/CCL and most impls do: many libraries (e.g. Maxima add2lnc)
             // rely on (setq x (delete .. x)) preserving x's cons when no element
             // matches, so a following (nconc x ..) still mutates the shared list.
             return seq;
@@ -2445,8 +2445,8 @@ public static partial class Runtime
             CheckBoundingIndices(start, end, len, "REMOVE");
             return RemoveCoreIndexed(len, start, end, kw.FromEnd, maxRemove, seq);
         }
-        // List. Its length is only needed to validate the range — the walk itself
-        // does not need it — so it is computed here rather than inside the walk.
+        // List. Its length is only needed to validate the range, the walk itself
+        // does not need it, so it is computed here rather than inside the walk.
         {
             int listLen = (int)((Fixnum)Length(seq)).Value;
             CheckBoundingIndices(kw.Start, kw.End ?? listLen, listLen, "REMOVE");
@@ -3588,7 +3588,7 @@ public static partial class Runtime
     {
         if (obj is LispString) return obj;
         if (obj is LispVector v && v.IsCharVector && v.Rank == 1) return obj; // rank-1 char-vector is a string
-        // CLHS: STRING of a symbol is its name — the same string SYMBOL-NAME
+        // CLHS: STRING of a symbol is its name: the same string SYMBOL-NAME
         // answers with, so share it (SBCL does too).
         if (obj is Symbol sym) return sym.NameString;
         if (obj is Nil || obj is T) return SymbolName(obj);
@@ -3661,7 +3661,7 @@ public static partial class Runtime
         Emitter.CilAssembler.RegisterFunction("REDUCE", reduceFn);
         // MEMBER, MEMBER-IF, MEMBER-IF-NOT
         // MEMBER/ASSOC: attach direct entries for the dominant call shapes
-        // ((item list) and (item list kw val) — e.g. :test #'string=). The
+        // ((item list) and (item list kw val): e.g. :test #'string=). The
         // 2-arg entry skips the args array entirely; the 4-arg entry runs the
         // exact shared keyword parser over a 2-element array.
         var memberFn = new LispFunction(args => Runtime.MemberFull(args));
@@ -3741,7 +3741,7 @@ public static partial class Runtime
             });
         removeIfNotFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject>)Runtime.RemoveIfNot2);
         Emitter.CilAssembler.RegisterFunction("REMOVE-IF-NOT", removeIfNotFn);
-        // DELETE, DELETE-IF, DELETE-IF-NOT — destructive on list args.
+        // DELETE, DELETE-IF, DELETE-IF-NOT: destructive on list args.
         var deleteFn = new LispFunction(args => Runtime.DeleteFull(args));
         deleteFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject>)Runtime.Delete2);
         deleteFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject, LispObject, LispObject>)Runtime.Delete4);
@@ -3860,7 +3860,7 @@ public static partial class Runtime
             var fn = new LispFunction(variadic, name, -1);
             fn.SetDirectDelegate(twoArg);
             // 4 args = one keyword pair, e.g. the (string= name prefix :end1 n) that
-            // prefix checks are written with — the dominant keyworded shape.
+            // prefix checks are written with: the dominant keyworded shape.
             fn.SetDirectDelegate(fourArg);
             Emitter.CilAssembler.RegisterFunction(name, fn);
         }

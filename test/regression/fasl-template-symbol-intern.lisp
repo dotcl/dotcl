@@ -1,11 +1,11 @@
 ;;; A symbol that appears only inside a macro's backquote template must exist in
-;;; its package as soon as the .fasl is loaded — before anything expands the
+;;; its package as soon as the .fasl is loaded: before anything expands the
 ;;; macro. SBCL interns the whole constant pool at load time; dotcl emitted the
 ;;; constant's Startup.SymInPkg call inline in the macro body, so the symbol only
 ;;; came into existence when the macro was first expanded.
 ;;;
 ;;; Symptom: a later file's (defpackage ... (:import-from other-pkg #:sym)) could
-;;; not find the symbol — lparallel's TIME-REMAINING (defined only inside the
+;;; not find the symbol: lparallel's TIME-REMAINING (defined only inside the
 ;;; WITH-COUNTDOWN template) was unresolvable from cons-queue / vector-queue,
 ;;; which the lparallel fork worked around by exporting it.
 ;;;
@@ -26,7 +26,7 @@
     (compile-file src)
     (let ((fasl (concatenate 'string (subseq src 0 (- (length src) 5)) ".fasl")))
       (load fasl))
-    ;; Interned by the load itself — the macro has not been expanded yet.
+    ;; Interned by the load itself: the macro has not been expanded yet.
     (list (not (null (find-symbol "SECRET-SYM" "TMPLSYM-PKG")))
           ;; ...and a later defpackage can import it, the reported symptom.
           (not (null (eval (read-from-string

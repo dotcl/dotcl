@@ -1,5 +1,5 @@
-;;; A literal that cannot be rebuilt cons-by-cons — circular, or with shared
-;;; structure whose EQ identity has to survive — is compiled into its printed
+;;; A literal that cannot be rebuilt cons-by-cons, circular, or with shared
+;;; structure whose EQ identity has to survive, is compiled into its printed
 ;;; representation plus a load-time read of it. That representation now travels
 ;;; in the fasl's data section (DefineInitializedData) instead of the module's
 ;;; #US string heap, and comes back through a UTF-8 decode.

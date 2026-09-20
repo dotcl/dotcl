@@ -141,7 +141,7 @@
   (%the-wide-add 1267650600228229401496703205376)
   1267650600228229401496703205377)
 
-;;; (the (signed-byte 56) E) — fits int64, native path, value correct.
+;;; (the (signed-byte 56) E): fits int64, native path, value correct.
 (defun %the-narrow-logand (x)
   (logand (the (signed-byte 56) x) 255))
 
@@ -186,7 +186,7 @@
   t)
 
 ;; Three million iterations of each arm. That is a fraction of a second of
-;; compiled native-int arithmetic — which is what these two assert — and does not
+;; compiled native-int arithmetic, which is what these two assert, and does not
 ;; finish at all under the tree-walk evaluator, so a build without a compiler must
 ;; skip them rather than hang the suite.
 (deftest-compiled-only native-crc-adjustment-matches-generic

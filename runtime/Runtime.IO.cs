@@ -16,7 +16,7 @@ public static partial class Runtime
     [ThreadStatic] private static bool _pprintPendingFillBreak;
     [ThreadStatic] private static int _pprintColumnAtLastFillCheck;
     // XP-style buffering: defer conditional newlines and process at outermost block end
-    // These fields are NOT saved/restored per inner block — they persist across the full outermost block.
+    // These fields are NOT saved/restored per inner block: they persist across the full outermost block.
     [ThreadStatic] private static bool _pprintBuffering;        // are we buffering for XP processing?
     [ThreadStatic] private static int _pprintBufferNestLevel;   // nesting level (0 = outermost)
     [ThreadStatic] private static int _pprintBufferStart;       // StringWriter position at outermost block start
@@ -470,7 +470,7 @@ public static partial class Runtime
             }
             else if (nestLevel == 0)
             {
-                // Own-level conditional newline — adjust indent by colShift
+                // Own-level conditional newline: adjust indent by colShift
                 ownTokens2.Add((tok.pos - bufStart, tok.kind, Math.Max(0, tok.indent + colShift), tok.plp, -1, -1));
             }
         }
@@ -568,7 +568,7 @@ public static partial class Runtime
                 while (result.Length > 0 && result[result.Length - 1] == ' ')
                     result.Length--;
                 result.Append('\n');
-                // If remaining content starts with \n (mandatory newline), skip indent—
+                // If remaining content starts with \n (mandatory newline), skip indent;
                 // the mandatory newline will immediately override it, and the indent
                 // would produce orphaned whitespace on an otherwise empty line.
                 bool remainingStartsNewline = (adjPos < contentEnd && content[adjPos] == '\n');
@@ -758,7 +758,7 @@ public static partial class Runtime
 
     // Stream-argument predicates for composite-stream constructors. Accept both
     // native LispStream instances and Gray CLOS streams (LispInstance), matching
-    // the INPUT-STREAM-P / OUTPUT-STREAM-P generic — so MAKE-TWO-WAY-STREAM etc.
+    // the INPUT-STREAM-P / OUTPUT-STREAM-P generic: so MAKE-TWO-WAY-STREAM etc.
     // agree with the stream protocol instead of testing the C# LispStream type.
     internal static bool IsInputStreamArg(LispObject o)
         => (o is LispStream s && s.IsInput)
@@ -778,7 +778,7 @@ public static partial class Runtime
     /// STREAM-ERROR carrying the stream (CLHS: an I/O failure on a stream is a
     /// stream-error, and the portable peer-disconnect idiom is
     /// (handler-case (read-char s) (stream-error ...))). Without this the raw
-    /// IOException surfaced as PROGRAM-ERROR — wrong type, no stream slot. The
+    /// IOException surfaced as PROGRAM-ERROR: wrong type, no stream slot. The
     /// original exception rides along for dotnet:exception-object (a stream
     /// timeout is an IOException whose InnerException holds the SocketException
     /// with the error code).</summary>
@@ -2029,7 +2029,7 @@ public static partial class Runtime
                          static (st, ee, ev) => ReadPreservingWhitespaceUnguarded(st, ee, ev));
 
     /// <summary>The TextReader a Lisp READer should consume for STREAM. Same as
-    /// GetTextReader, except that reading through an echo-stream echoes — the Lisp
+    /// GetTextReader, except that reading through an echo-stream echoes; the Lisp
     /// reader works on the TextReader underneath the wrapper, so without this it
     /// bypasses the echo entirely.</summary>
     internal static TextReader GetReaderTextReader(LispObject stream)
@@ -2183,7 +2183,7 @@ public static partial class Runtime
     }
 
     // The compiler emits direct (:call "Runtime.ReadChar") etc. for the common
-    // stream builtins, bypassing the registered LispFunction wrappers — so the
+    // stream builtins, bypassing the registered LispFunction wrappers; so the
     // stream-error guard must live on the methods themselves.
     public static LispObject ReadChar(LispObject streamObj, LispObject eofErrorP, LispObject eofValue)
         => GuardStreamIO(streamObj, streamObj, eofErrorP, eofValue,
@@ -2325,7 +2325,7 @@ public static partial class Runtime
                 if ((char)stream.UnreadCharValue == targetChar.Value)
                     return LispChar.Make((char)stream.UnreadCharValue);
                 // Consume unread char (doesn't match). Per CLHS, unread chars are assumed
-                // already echoed — don't echo again.
+                // already echoed: don't echo again.
                 stream.UnreadCharValue = -1;
             }
             int ch;
@@ -2353,7 +2353,7 @@ public static partial class Runtime
                 if (readtable.GetSyntaxType((char)stream.UnreadCharValue) != SyntaxType.Whitespace)
                     return LispChar.Make((char)stream.UnreadCharValue);
                 // Consume whitespace unread char. Per CLHS, unread chars are assumed
-                // already echoed — don't echo again.
+                // already echoed: don't echo again.
                 stream.UnreadCharValue = -1;
             }
             int ch;
@@ -2615,7 +2615,7 @@ public static partial class Runtime
     }
 
     /// <summary>Resolve a CL stream designator to a TextWriter.
-    /// NIL → *standard-output*, T → *terminal-io* (output side), stream → stream's writer.</summary>
+    /// NIL -> *standard-output*, T -> *terminal-io* (output side), stream -> stream's writer.</summary>
     private static TextWriter ResolveOutputStreamDesignator(LispObject stream)
     {
         if (stream is Nil)
@@ -3021,7 +3021,19 @@ public static partial class Runtime
         if (File.Exists(filePath))
             return LispPathname.FromString(Path.GetFullPath(filePath));
         if (Directory.Exists(filePath))
-            return LispPathname.FromString(Path.GetFullPath(filePath));
+        {
+            // CLHS 21.4: probe-file answers the TRUENAME. A directory's truename
+            // carries its last component in the directory part, so the namestring
+            // ends in a separator -- TRUENAME already appends one, and returning
+            // the caller's own spelling here left the two disagreeing about the
+            // same file. Everything that asks "is this a directory?" by probing
+            // and looking at the shape of the answer read a directory as a file:
+            // uiop:directory-exists-p said no for "/path/to/dir" written without
+            // the slash, and uiop:file-exists-p said yes.
+            var full = Path.GetFullPath(filePath);
+            if (!full.EndsWith('/')) full += "/";
+            return LispPathname.FromString(full);
+        }
         return Nil.Instance;
     }
 
@@ -3098,7 +3110,7 @@ public static partial class Runtime
         catch { return null; }
     }
 
-    /// <summary>True when PN's directory is (:absolute ...) — a rooted directory that
+    /// <summary>True when PN's directory is (:absolute ...): a rooted directory that
     /// needs no merge with *default-pathname-defaults*.</summary>
     private static bool PathnameDirectoryIsAbsolute(LispPathname pn)
         => pn.DirectoryComponent is Cons d && d.Car is Symbol s && s.Name == "ABSOLUTE";
@@ -3140,10 +3152,10 @@ public static partial class Runtime
         else if (pathSpec is LispPathname p)
         {
             // CLHS: file ops resolve against *default-pathname-defaults*. Merge at the
-            // PATHNAME level (merge-pathnames) — keeps P's device, merges its directory
+            // PATHNAME level (merge-pathnames): keeps P's device, merges its directory
             // with DPD's absolute directory. This is what resolves a :relative-directory
-            // pathname — whose Windows namestring is the drive-relative "C:scratch"
-            // (device set, but no separator, so NOT absolute) — against DPD instead of
+            // pathname, whose Windows namestring is the drive-relative "C:scratch"
+            // (device set, but no separator, so NOT absolute), against DPD instead of
             // drive C:'s process-global current directory. Absolute dirs need no merge.
             if (PathnameDirectoryIsAbsolute(p)) return p.ToNamestring();
             var dpd = GetDefaultPathnameDefaultsPathname();
@@ -3154,7 +3166,7 @@ public static partial class Runtime
         else
             // CLHS: a pathname designator is a pathname, string, or file stream.
             // Falling through to ToString() turned (open nil ...) into a file
-            // literally named "NIL" — the classic unset-config-variable bug,
+            // literally named "NIL": the classic unset-config-variable bug,
             // silently succeeding with a side effect instead of signalling.
             throw new LispErrorException(new LispTypeError(
                 "Not a pathname designator (expected pathname, string, or file stream)",
@@ -3162,7 +3174,7 @@ public static partial class Runtime
 
         // Expand a leading ~ for STRING/char-vector specs (LispPathname args were
         // already expanded by FromString). Without this, LOAD/OPEN/PROBE-FILE on
-        // "~/foo" treated ~ as a relative segment → cwd/~/foo (#19).
+        // "~/foo" treated ~ as a relative segment -> cwd/~/foo (#19).
         raw = LispPathname.ExpandHome(raw);
 
         if (IsLogicalPathnameString(raw))
@@ -3195,7 +3207,7 @@ public static partial class Runtime
         if (args.Length < 1) throw new LispErrorException(new LispProgramError("ENSURE-DIRECTORIES-EXIST: wrong number of arguments: 0 (expected at least 1)"));
         var pathSpec = args[0];
         string filePath = ResolvePhysicalPath(pathSpec);
-        // Check for wild pathnames — signal file-error
+        // Check for wild pathnames: signal file-error
         var pn = pathSpec is LispPathname ? (LispPathname)pathSpec : LispPathname.FromString(filePath);
         if (HasWildComponent(pn))
         {
@@ -3233,7 +3245,7 @@ public static partial class Runtime
         }
         // A directory pathname (no name/type) designates a directory. CLHS leaves
         // delete-file on a directory implementation-defined; like SBCL, delete the
-        // directory (non-recursive — Directory.Delete throws if it is non-empty,
+        // directory (non-recursive: Directory.Delete throws if it is non-empty,
         // which surfaces as the file-error below). Lets the ANSI suite delete a
         // scratch subdirectory via delete-file (ENSURE-DIRECTORIES-EXIST.8).
         if (Directory.Exists(filePath))
@@ -3243,7 +3255,7 @@ public static partial class Runtime
                 Directory.Delete(filePath, false);
                 return T.Instance;
             }
-            catch (IOException) { /* non-empty or in use → fall through to file-error */ }
+            catch (IOException) { /* non-empty or in use -> fall through to file-error */ }
         }
         // CLHS says: If delete-file fails, an error of type file-error is signaled
         var err = new LispError($"DELETE-FILE: could not delete {filePath}");
@@ -3359,8 +3371,8 @@ public static partial class Runtime
         }
 
         // Overwrite an existing target: CL rename-file replaces it (POSIX rename
-        // semantics, as SBCL/CCL do), and asdf's atomic-write idiom (write temp →
-        // rename onto the final path) depends on this — without overwrite the
+        // semantics, as SBCL/CCL do), and asdf's atomic-write idiom (write temp ->
+        // rename onto the final path) depends on this: without overwrite the
         // second build of any system throws "file already exists" from load-asd.
         Compat.MoveFile(oldFile, targetFile, overwrite: true);
 
@@ -3380,7 +3392,7 @@ public static partial class Runtime
             if (!string.IsNullOrEmpty(defaults))
                 filePath = Path.Combine(defaults, filePath);
         }
-        // Check for wild pathnames — signal file-error
+        // Check for wild pathnames: signal file-error
         if (path is LispPathname wp && HasWildComponent(wp))
         {
             var err = new LispError($"FILE-WRITE-DATE: wild pathname not allowed: {wp.ToNamestring()}");
@@ -3405,7 +3417,7 @@ public static partial class Runtime
     /// becomes a directory pathname (trailing separator, NAME and TYPE both NIL),
     /// not a file pathname that happens to name a directory.
     ///
-    /// Callers rely on telling the two apart — uiop:directory-files enumerates
+    /// Callers rely on telling the two apart: uiop:directory-files enumerates
     /// with a wild pattern and then drops the results for which
     /// UIOP:DIRECTORY-PATHNAME-P holds. Reporting a subdirectory as #P".../assets"
     /// rather than #P".../assets/" defeats that filter, and the caller goes on to
@@ -3423,7 +3435,7 @@ public static partial class Runtime
     /// <summary>Kept only so FASLs compiled before the two DIRECTORY
     /// implementations were merged keep loading: a FASL is real IL and names the
     /// method it called, so deleting this one breaks every previously compiled
-    /// caller of DIRECTORY — including the contrib quicklisp and asdf FASLs that
+    /// caller of DIRECTORY: including the contrib quicklisp and asdf FASLs that
     /// ship with the release. It forwards; there is no second implementation.</summary>
     public static LispObject LispDirectory(LispObject[] args) => DirectoryFunc(args);
 
@@ -3434,12 +3446,12 @@ public static partial class Runtime
 
         ValidateDirectoryComponent(args[0]);
         // Parse keyword args (accept any, only :allow-other-keys matters)
-        // Get pathname from first arg — translate logical pathnames
+        // Get pathname from first arg: translate logical pathnames
         string namestring = ResolvePhysicalPath(args[0]);
         if (string.IsNullOrEmpty(namestring)) namestring = ".";
 
         // Detect directory-only search: pathname has no name/type component.
-        // e.g. (directory "path/*/") has name=NIL, type=NIL — return directories, not files.
+        // e.g. (directory "path/*/") has name=NIL, type=NIL: return directories, not files.
         bool wantsDirs = false;
         if (args[0] is LispPathname pnCheck)
             wantsDirs = (pnCheck.NameComponent is Nil || pnCheck.NameComponent == null)
@@ -3469,7 +3481,7 @@ public static partial class Runtime
             if (wantsDirs)
             {
                 // Strip trailing slashes to get the directory wildcard path.
-                // e.g. "C:/foo/*/" → "C:/foo/*"
+                // e.g. "C:/foo/*/" -> "C:/foo/*"
                 string dirWildPath = namestring.TrimEnd('/', '\\');
                 string searchDir = Path.GetDirectoryName(dirWildPath) ?? ".";
                 string dirWild = Path.GetFileName(dirWildPath);
@@ -3477,7 +3489,7 @@ public static partial class Runtime
                 if (string.IsNullOrEmpty(searchDir)) searchDir = ".";
 
                 // A wildcard may sit in the directory part rather than the last
-                // segment — "dists/*/" — so expand the whole path, not just the
+                // segment, "dists/*/", so expand the whole path, not just the
                 // final component.
                 if (searchDir.Contains('*') || searchDir.Contains('?'))
                 {
@@ -3662,7 +3674,7 @@ public static partial class Runtime
             // recursive-p (args[2]) needs no separate handling: what it asks for is
             // that this read take part in the enclosing one, and the part that is
             // observable here is #n= / #n# label scope. Adopting the stream's share
-            // tables gives that for every call, recursive or not — a #n# inside the
+            // tables gives that for every call, recursive or not: a #n# inside the
             // delimited list resolves against a label defined outside it, which a
             // fresh Reader could not see.
             System.IO.TextReader reader = Runtime.GetTextReader(streamObj);
@@ -3736,7 +3748,7 @@ public static partial class Runtime
         Startup.RegisterUnary("STREAM-ELEMENT-TYPE", obj => {
             if (obj is LispStream ls) return ls.ElementType ?? Startup.Sym("CHARACTER");
             // Gray streams: no stream-element-type generic, so report the protocol
-            // default — CHARACTER for character streams, (unsigned-byte 8) for binary.
+            // default: CHARACTER for character streams, (unsigned-byte 8) for binary.
             if (obj is LispInstance gc && (Runtime.IsGrayInputStream(gc) || Runtime.IsGrayOutputStream(gc)))
                 return Startup.Sym("CHARACTER");
             if (obj is LispInstance gb && (Runtime.IsGrayBinaryInputStream(gb) || Runtime.IsGrayBinaryOutputStream(gb)))
@@ -3822,8 +3834,8 @@ public static partial class Runtime
         // --- LISTEN, CLEAR-INPUT ---
         // CLHS gives both &OPTIONAL INPUT-STREAM, defaulting to *STANDARD-INPUT*.
         // RegisterUnary made the argument mandatory, which never showed on the
-        // compiled path because the compiler supplies the default at the call site
-        // — so (listen) reached the function with zero arguments only under EVAL
+        // compiled path because the compiler supplies the default at the call site,
+        // so (listen) reached the function with zero arguments only under EVAL
         // (ansi-test LISTEN.3/.4, CLEAR-INPUT.2).
         Emitter.CilAssembler.RegisterFunction("LISTEN",
             new LispFunction(args => {
@@ -3996,7 +4008,15 @@ public static partial class Runtime
                 var eofValue = args.Length > 2 ? args[2] : Nil.Instance;
                 var recursiveP = args.Length > 3 ? args[3] : Nil.Instance;
                 if (recursiveP is not Nil) eofErrorP = T.Instance;
-                return Runtime.ReadFromStream(stream, eofErrorP, eofValue);
+                var readValue = Runtime.ReadFromStream(stream, eofErrorP, eofValue);
+                // READ returns exactly one value. Inside, "no value" is how a reader
+                // macro that consumed only whitespace or a comment reports itself, and
+                // a Lisp-level macro function (what GET-MACRO-CHARACTER hands back, so
+                // every readtable merged from the standard one) says that by publishing
+                // ZERO values. That is an internal protocol; letting it out made a READ
+                // whose input merely started with a comment return no values at all.
+                MultipleValues.Reset();
+                return readValue;
             }, "READ", -1));
         Emitter.CilAssembler.RegisterFunction("READ-LINE",
             new LispFunction(args => {
@@ -4082,7 +4102,7 @@ public static partial class Runtime
                     // Gray output stream: trampoline to the corresponding generic
                     // (stream-force-output / stream-finish-output / stream-clear-output)
                     // so streamp=T instances are accepted. Binary gray streams count
-                    // too — flexi-streams' classes are binary output streams, and
+                    // too: flexi-streams' classes are binary output streams, and
                     // testing only the character predicate rejected the very objects
                     // write-char and streamp had already accepted.
                     if (args.Length > 0 && args[0] is LispInstance gi

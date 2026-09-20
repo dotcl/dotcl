@@ -1,4 +1,4 @@
-;;; dotcl-gray.lisp — Gray stream implementation for dotcl
+;;; dotcl-gray.lisp: Gray stream implementation for dotcl
 ;;;
 ;;; Usage: (require "dotcl-gray")
 ;;;

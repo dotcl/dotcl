@@ -3,8 +3,8 @@
 ;;;
 ;;; Bug: the backquote markers UNQUOTE / QUASIQUOTE / UNQUOTE-SPLICING are
 ;;; interned in the CL package by the reader, and Startup.SymFn (the resolver
-;;; for unqualified compiled call sites) returned any CL symbol it found —
-;;; even one with no function — so a call to crypto::unquote in ironclad
+;;; for unqualified compiled call sites) returned any CL symbol it found,
+;;; even one with no function, so a call to crypto::unquote in ironclad
 ;;; resolved to the unbound CL::UNQUOTE and signaled UNDEFINED-FUNCTION
 ;;; despite (fboundp 'crypto::unquote) => T.
 ;;;

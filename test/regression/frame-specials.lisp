@@ -1,4 +1,4 @@
-;;; DOTCL:FRAME-SPECIALS — the dynamic (special-variable) bindings in effect, for
+;;; DOTCL:FRAME-SPECIALS: the dynamic (special-variable) bindings in effect, for
 ;;; the debugger. The counterpart of FRAME-LOCALS, which shows only lexicals: a
 ;;; frame view without specials is half a view, since (let ((*x* 1)) ...) puts its
 ;;; value on the dynamic binding stack, not in a slot.
@@ -73,7 +73,7 @@
       (list (third (find "*FS-INNER*" frame0 :key (lambda (e) (symbol-name (car e))) :test #'string=))
             (third (find "*FS-INNER*" frame1 :key (lambda (e) (symbol-name (car e))) :test #'string=))
             (third (find "*FS-OUTER*" frame1 :key (lambda (e) (symbol-name (car e))) :test #'string=)))))
-  ;; frame 0 is the probe itself — *fs-inner* was bound before it started.
+  ;; frame 0 is the probe itself: *fs-inner* was bound before it started.
   ;; frame 1 is FS-DEEP, which bound it. *fs-outer* belongs to the caller either way.
   (:caller :own :caller))
 

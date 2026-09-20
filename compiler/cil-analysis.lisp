@@ -1,4 +1,4 @@
-;;; cil-analysis.lisp — Free variable, mutation, and capture analysis
+;;; cil-analysis.lisp: Free variable, mutation, and capture analysis
 ;;; Part of the CIL compiler (A2 instruction list architecture)
 
 (in-package :dotcl.cil-compiler)
@@ -55,7 +55,7 @@
 
 (defun find-free-vars-expr (expr bound free-ht)
   "Walk expr finding free variable references. Results accumulated in free-ht.
-   Iterative worklist version — no recursion depth limit."
+   Iterative worklist version; no recursion depth limit."
   (let ((worklist (list (cons expr (cons bound 0)))))
     (loop while worklist do
       (let* ((item (pop worklist))
@@ -117,13 +117,13 @@
                     ((and (symbolp head) (eq head 'defun)) nil)
                     ;; cond: each clause is (test . body) and EVERY element is an
                     ;; evaluated expression. The generic walk below would treat a
-                    ;; clause whose test is a symbol — e.g. (cond (start-anchored-p ...)) —
+                    ;; clause whose test is a symbol, e.g. (cond (start-anchored-p ...)),
                     ;; as a function call (car = function name), dropping the test as a
                     ;; free-variable reference. When that name is also a captured local
                     ;; AND a global function (Lisp-2), the variable then isn't captured
                     ;; into the closure env and reads "Unbound variable" at run time.
                     ;; Scan all elements of each clause as expressions. (case/typecase
-                    ;; differ: their clause cars are unevaluated keys — handled generically.)
+                    ;; differ: their clause cars are unevaluated keys: handled generically.)
                     ((and (symbolp head) (eq head 'cond))
                      (do-list-safe (clause (cdr e))
                        (when (consp clause)
@@ -136,7 +136,7 @@
                          ;; (e.g. a lambda parameter) may shadow a symbol-macro of
                          ;; the same name (CLHS 3.4.2). The candidate memo drops the
                          ;; enclosing BND, so it would lose that shadow and re-expand
-                         ;; the symbol-macro — infinitely if it is self-referential
+                         ;; the symbol-macro: infinitely if it is self-referential
                          ;; (regression: symbol-macro-param-shadow-nested-lambda).
                          ;; Fall back to the exact inline descent, which carries the
                          ;; full enclosing BND. Rare, so the O(depth^2) is acceptable.
@@ -234,7 +234,7 @@
                               ;; yet. Emit BOTH names as candidates; the enclosing
                               ;; merge's real local-bound-p keeps the labels-fn
                               ;; (mangled) and/or the variable (plain) that is
-                              ;; actually bound. Over-collecting is harmless — merge
+                              ;; actually bound. Over-collecting is harmless: merge
                               ;; drops names that are not local-bound.
                               (when (and arg (not (special-var-p arg)))
                                 (let ((plain-name (symbol-name arg))
@@ -333,7 +333,7 @@
                             (sm-body (cddr e))
                             ;; A symbol-macro shadows an enclosing lexical variable of
                             ;; the same name in the body, so drop those names from the
-                            ;; bound set — a reference to them is the symbol-macro, not
+                            ;; bound set: a reference to them is the symbol-macro, not
                             ;; a variable. Must match compile-symbol-macrolet, else the
                             ;; free/mutation analysis and codegen disagree on boxing.
                             (body-bnd (remove-if
@@ -366,7 +366,7 @@
                                             for name = (car fd)
                                             when (symbolp name) collect (symbol-name name))))
                        ;; Function bodies see outer scope (flet) or same scope (labels)
-                       ;; Labels fn-names are NOT added to fn body bound — they are captured
+                       ;; Labels fn-names are NOT added to fn body bound: they are captured
                        ;; as free vars via boxed variables in *locals*
                        (let ((fn-body-bound bnd))
                          (dolist (fd fn-defs)
@@ -388,7 +388,7 @@
                        (let ((body-bound (append fn-names bnd)))
                          (dolist (form lbody)
                            (push (cons form (cons body-bound mdepth)) worklist)))))
-                    ;; CLOS primitives — analyze sub-expressions normally
+                    ;; CLOS primitives: analyze sub-expressions normally
                     ((and (symbolp head) (member head '(%make-class %make-slot-def %register-class %set-class-default-initargs
                                                         find-class %find-class-or-nil class-of class-name
                                                         slot-value slot-boundp %set-slot-value
@@ -420,7 +420,7 @@
                              ;; Labels function mangled name capture.
                              ;; head=NIL is admitted too: a local function may
                              ;; be named NIL (ANSI LABELS.24) and its box must
-                             ;; be captured — the local-bound-p check below
+                             ;; be captured: the local-bound-p check below
                              ;; gates this to scopes where such a fn exists.
                              (when (symbolp head)
                                (let* ((name (symbol-name head))
@@ -433,11 +433,11 @@
                              ;; Generic walk. The car is in function position only when
                              ;; it is a SYMBOL (function name) or a (setf sym) / (lambda ...)
                              ;; compound form. Symbols in function position must NOT be pushed
-                             ;; as variable references — doing so would loop on symbol-macros
-                             ;; from with-accessors (e.g. (disabled-commands #:OBJ) →
-                             ;; push disabled-commands symbol → expand to (disabled-commands
-                             ;; #:OBJ) → repeat). Lambda-car means immediate application —
-                             ;; scan it. (setf sym) is a compound function name — skip it.
+                             ;; as variable references: doing so would loop on symbol-macros
+                             ;; from with-accessors (e.g. (disabled-commands #:OBJ) ->
+                             ;; push disabled-commands symbol -> expand to (disabled-commands
+                             ;; #:OBJ) -> repeat). Lambda-car means immediate application;
+                             ;; scan it. (setf sym) is a compound function name: skip it.
                              ;; Any OTHER cons in car position means the form is NOT a function
                              ;; call (e.g. a cond clause ((test-form ...) result)), so we push
                              ;; all sub-expressions including the car.
@@ -517,13 +517,13 @@
 ;;; MUTATED side records setq/setf/incf/... targets (independent of inside-lambda,
 ;;; matching find-mutated-vars). CAPTURED side marks a var-names reference seen
 ;;; while inside-lambda. Crucially, a mutation target symbol is BOTH recorded
-;;; (mutated) AND pushed onto the worklist (so it can be capture-marked) — the old
+;;; (mutated) AND pushed onto the worklist (so it can be capture-marked); the old
 ;;; captured pass relied on its generic walk pushing the target; dropping that
 ;;; push would lose the capture mark and silently skip boxing (the
 ;;; mutation-loss class). Returns (values mutated-names captured-names).
 ;;;
 ;;; VAR-NAMES may be the sentinel :ALL, meaning "every referenced symbol is a
-;;; capture candidate" — used by %boundary-mut-ref to collect the full mutated
+;;; capture candidate": used by %boundary-mut-ref to collect the full mutated
 ;;; and referenced sets of a nested lambda once, so the enclosing walks reuse
 ;;; them instead of re-descending (O(depth^2) -> O(depth) on nested
 ;;; closures). Sound to memoize because this walk never consults *locals*:
@@ -553,7 +553,7 @@
                  (remhash name *macros*))))
           ;; Bare symbol that is a symbol-macro: mark captured if applicable, and
           ;; ALSO expand it so a mutation hidden in the expansion is still seen
-          ;; (fable pitfall #2 — do both actions, not either).
+          ;; (fable pitfall #2: do both actions, not either).
           ((and (symbolp e) e
                 (not (eq e :restore-symbol-macros)) (not (eq e :restore-macro))
                 (< mdepth *macro-expand-depth-limit*)
@@ -795,8 +795,8 @@
 ;;; ============================================================
 ;;; Every analysis pass that ENUMERATES or REWRITES locals must go through these
 ;;; helpers. A local-bearing SIL op is described in exactly one place here, so a
-;;; new op that carries local KEYs — whether as a direct operand or embedded in a
-;;; nested operand list — is taught to every pass by editing only this section.
+;;; new op that carries local KEYs, whether as a direct operand or embedded in a
+;;; nested operand list, is taught to every pass by editing only this section.
 ;;; Authoritative op set (CilAssembler.Emit.cs): :declare-local, :ldloc, :stloc,
 ;;; :dotnet-call-direct-locals (RECV + ARG list). Background: a missed
 ;;; nested-operand local once let slot-sharing orphan a merged local into an
@@ -805,7 +805,7 @@
 ;;;
 ;;; (peephole-optimize is intentionally NOT a client: it pattern-matches fixed
 ;;;  adjacent op sequences rather than enumerating locals, so an unknown op simply
-;;;  fails to match and passes through untouched — safe by construction.)
+;;;  fails to match and passes through untouched: safe by construction.)
 
 ;;; The DO- macros below are the authoritative description; the list-returning
 ;;; functions are derived from them. A pass that walks every instruction of a
@@ -1048,7 +1048,7 @@
                                           ; side effect (Nil is not an MvReturn)
      P4  (:ldsfld \"Nil.Instance\") (:pop) -> {}        ; push-Nil-then-discard is dead
      P5  (:call \"Fixnum.Make\") (:pop)   ->  (:pop)    ; boxing a value only to
-                                          ; discard it — Fixnum.Make is pure, so
+                                          ; discard it: Fixnum.Make is pure, so
                                           ; pop the raw long instead. (Int64-slot
                                           ; setq in statement position; composes
                                           ; with P2 to a bare native store.)
@@ -1057,13 +1057,13 @@
      P6  (:newobj \"LispDecimal\") (:pop) ->  (:pop)   ; and the decimal slot's box
                                           ; ctor is pure (value + alloc counter),
                                           ; so boxing a discarded native float
-                                          ; store result is dead — pop the raw r8
+                                          ; store result is dead: pop the raw r8
                                           ; instead. (Float-array setf in
                                           ; statement position.)
      P8  (:newobj \"LispString\") (:pop)  ->  (:pop)    ; string sibling of P6
      P9  (:ldstr S) (:pop)              -> {}          ; dead string constant.
                                           ; P8+P9 compose to delete a string
-                                          ; literal in statement position — a
+                                          ; literal in statement position: a
                                           ; documentation string compiles to
                                           ; exactly that, and without this
                                           ; allocates a LispString per call.
@@ -1095,7 +1095,7 @@
 
    Matches only strictly-adjacent instructions. A :label (the only branch
    target form in SIL) between instructions breaks adjacency in the list, so
-   it naturally blocks a match — no control-flow analysis needed, and the
+   it naturally blocks a match; no control-flow analysis needed, and the
    rewrites are valid even inside loops/TCO."
   (let ((changed t))
     (loop while changed do
@@ -1114,7 +1114,7 @@
                (setf changed t)
                (setf cur (cddr cur)))
               ;; P2: dup a value, store it, discard the duplicate. The dup/pop
-              ;; bracket cancels — stack-equivalent to a bare store. (Assignment
+              ;; bracket cancels: stack-equivalent to a bare store. (Assignment
               ;; forms leave their value on the stack; in statement position it
               ;; is then popped, so codegen emits dup;stloc;pop.)
               ((and (consp i1) (eq (car i1) :dup)
@@ -1129,12 +1129,12 @@
                (setf changed t)
                (push i1 out)
                (setf cur (cddr cur)))
-              ;; P4: push a Nil constant then immediately discard it — dead.
+              ;; P4: push a Nil constant then immediately discard it: dead.
               ((and (consp i1) (eq (car i1) :ldsfld) (equal (cadr i1) "Nil.Instance")
                     (consp i2) (eq (car i2) :pop))
                (setf changed t)
                (setf cur (cddr cur)))
-              ;; P5: box a raw long only to discard it. Fixnum.Make is pure —
+              ;; P5: box a raw long only to discard it. Fixnum.Make is pure;
               ;; drop the call and pop the operand instead.
               ((and (consp i1) (eq (car i1) :call) (equal (cadr i1) "Fixnum.Make")
                     (consp i2) (eq (car i2) :pop))
@@ -1150,14 +1150,25 @@
                (setf changed t)
                (push i2 out)
                (setf cur (cddr cur)))
-              ;; P7: UnwrapMv of a freshly-boxed float is identity — a DoubleFloat
+              ;; P7: UnwrapMv of a freshly-boxed float is identity: a DoubleFloat
               ;; / SingleFloat is never an MvReturn. Codegen wraps a setf result
               ;; in UnwrapMv (twice, in a statement-position dotimes body); drop it
               ;; so the newobj becomes adjacent to the pop and P6 can then delete
-              ;; the whole dead box. (Fixnum.Make's surviving box is invisible in
-              ;; alloc profiles thanks to the small-int cache; a float box is not.)
+              ;; the whole dead box.
               ((and (consp i1) (eq (car i1) :newobj)
                     (member (cadr i1) '("DoubleFloat" "SingleFloat" "LispDecimal") :test #'equal)
+                    (consp i2) (eq (car i2) :call) (equal (cadr i2) "Runtime.UnwrapMv"))
+               (setf changed t)
+               (push i1 out)
+               (setf cur (cddr cur)))
+              ;; P7 for a boxed fixnum: same identity, same reason. This was left
+              ;; out on the reading that Fixnum.Make's small-integer cache makes
+              ;; the surviving box free, and that is only true below 65536 -- a
+              ;; loop counter stored into a struct slot allocated one box per
+              ;; iteration past that (measured: 934,467 Fixnums in 1,000,000
+              ;; iterations). With the UnwrapMv gone, P5 reaches the pop and the
+              ;; box disappears in statement position.
+              ((and (consp i1) (eq (car i1) :call) (equal (cadr i1) "Fixnum.Make")
                     (consp i2) (eq (car i2) :call) (equal (cadr i2) "Runtime.UnwrapMv"))
                (setf changed t)
                (push i1 out)
@@ -1214,7 +1225,7 @@
                (push (list :call (cdr (assoc (cadr i1) +mv-primary-twins+ :test #'equal)))
                      out)
                (setf cur (cddr cur)))
-              ;; P9: push a string constant then immediately discard it — dead.
+              ;; P9: push a string constant then immediately discard it: dead.
               ;; Composes with P8 to delete a string literal in statement
               ;; position, which is what a documentation string compiles to: it
               ;; would otherwise allocate a fresh LispString on every call.
@@ -1340,8 +1351,8 @@
         (local-type (make-hash-table :test #'equal))
         (pos 0))
     ;; Pass 1: collect types and compute [first-pos, last-pos] for each key.
-    ;; do-instr-local-refs visits every local a key reads/writes — including
-    ;; those embedded in nested operand lists (:dotnet-call-direct-locals) — so
+    ;; do-instr-local-refs visits every local a key reads/writes, including
+    ;; those embedded in nested operand lists (:dotnet-call-direct-locals), so
     ;; their live ranges extend to the using op and the slot-share scan won't
     ;; merge another local over a still-live nested reference.
     (dolist (instr instrs)

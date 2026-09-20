@@ -1,7 +1,7 @@
 ;;; project-core CONCATENATED build (dotcl build <asd> --output) evaluates
 ;;; toplevel module/package setup forms at compile time, so a macro provided by a
 ;;; bare (load ...) / (require ...) in an earlier part of the concatenated unit is
-;;; available when a later part compiles — instead of being miscompiled as an
+;;; available when a later part compiles: instead of being miscompiled as an
 ;;; undefined function call (the symptom when ASDF :components were split).
 ;;;
 ;;; compile-file-concatenated is the entry the C# build driver calls; it binds
@@ -9,7 +9,7 @@
 ;;; symbol identity with compile-form's read). We exercise it directly here with a
 ;;; hand-written concatenated source, so the test needs no asdf and no .asd.
 ;;;
-;;; NOTE: stay in the default load package (CL-USER) — an (in-package ...) into a
+;;; NOTE: stay in the default load package (CL-USER): an (in-package ...) into a
 ;;; (:use :cl)-only package hides the framework's DEFTEST macro and makes the test
 ;;; name read as an unbound variable. Helpers are pc325- prefixed to avoid clashes.
 
@@ -35,7 +35,7 @@
     (pc325-write-text mod
       "(in-package :cl-user)
        (defmacro pc325-mac () 4242)")
-    ;; Bare (load ...) — NOT wrapped in eval-when. The fix must make this take
+    ;; Bare (load ...): NOT wrapped in eval-when. The fix must make this take
     ;; compile-time effect within the concatenated unit.
     (pc325-write-text src
       (format nil "(load ~s)~%(defparameter cl-user::*pc325-result* (pc325-mac))~%" modf))

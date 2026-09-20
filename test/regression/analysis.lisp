@@ -223,7 +223,7 @@
     )
   300)
 
-;;; Five-level nested lambdas each capturing a distinct outer var — the
+;;; Five-level nested lambdas each capturing a distinct outer var: the
 ;;; intrinsic set of each inner lambda must propagate every still-free
 ;;; name up through all enclosing levels.
 (deftest analysis-memo-deep-multi-capture
@@ -376,7 +376,7 @@
 ;;; macro is a binding occurrence, not a call. The compiler's return-from
 ;;; scanner and mutation/capture walk must not macroexpand it: doing so fires
 ;;; the macro's compile-time side effects. SBCL's assembler INST macro is one
-;;; real case — modarith.lisp has (labels ((commutativep (inst) ...)) ...), and
+;;; real case: modarith.lisp has (labels ((commutativep (inst) ...)) ...), and
 ;;; INST WARNs on an undefined mnemonic, which set compile-file failure-p.
 
 (defvar *bindpos-expand-count* 0)
@@ -386,7 +386,7 @@
   (incf *bindpos-expand-count*)
   ''expanded)
 
-;; labels param named after the macro — a binding, never called.
+;; labels param named after the macro: a binding, never called.
 (defun bindpos-labels (x)
   (labels ((pick (bindpos-marker) (list bindpos-marker)))
     (pick x)))
@@ -406,7 +406,7 @@
   *bindpos-expand-count*
   0)
 
-;; And they behave correctly — the name is an ordinary binding.
+;; And they behave correctly: the name is an ordinary binding.
 (deftest bindpos-labels-result (bindpos-labels 'a) (a))
 (deftest bindpos-flet-result (bindpos-flet 'b) (b))
 (deftest bindpos-let-result (bindpos-let 'c) (c))

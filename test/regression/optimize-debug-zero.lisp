@@ -16,7 +16,7 @@
   t)
 
 ;; Compiled-only: the declaration is an instruction to the compiler, and an
-;; emit-free build has none — the interpreter records the frame either way. The
+;; emit-free build has none: the interpreter records the frame either way. The
 ;; other tests here hold in both builds and stay ungated.
 (deftest-compiled-only optimize-debug.declare-drops-the-frame
   (member "ODZ-DECLARED" (odz-declared) :test #'equal)

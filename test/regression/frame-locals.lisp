@@ -1,4 +1,4 @@
-;;; DOTCL:FRAME-LOCALS — in-process lexical variables of a running frame, for the
+;;; DOTCL:FRAME-LOCALS: in-process lexical variables of a running frame, for the
 ;;; CL-native debugger (sldb frame locals, the debugger's :bt). Compiling with
 ;;; DOTCL:*EMIT-FRAME-LOCALS* true makes each body record its user lexicals in a
 ;;; runtime debug frame; with it false (the default) nothing is recorded and the
@@ -96,7 +96,7 @@
 ;;; Named functions reached through a call path that pushes no call-stack frame:
 ;;; APPLY and the runtime's call to *DEBUGGER-HOOK* both go through
 ;;; LispFunction.Invoke(params). Such a body runs at its caller's depth, so it
-;;; must not take over the caller's backtrace position — the frame an sldb user
+;;; must not take over the caller's backtrace position: the frame an sldb user
 ;;; is looking at when the hook runs.
 (defun fl-borrowed (a)
   (let ((q (* a 2)))
@@ -143,7 +143,7 @@
 ;;; recording is emitted IL: DOTCL:*EMIT-FRAME-LOCALS* makes each compiled body
 ;;; store its lexicals into a runtime debug frame. An emit-free build has no
 ;;; compiler to emit it, so those frames hold nothing and the question has no
-;;; answer there — as opposed to a wrong one. The cases asserting that NOTHING is
+;;; answer there: as opposed to a wrong one. The cases asserting that NOTHING is
 ;;; recorded stay ordinary DEFTESTs: they are meaningful under either evaluator.
 
 (deftest-compiled-only frame-locals-params-and-let
@@ -192,7 +192,7 @@
   (progn (fl-setq 3) *fl-captured*)
   (("A" . 3) ("S" . 8)))
 
-;;; A tail self-call rebinds the parameters and loops inside one frame — the frame
+;;; A tail self-call rebinds the parameters and loops inside one frame; the frame
 ;;; must show the current iteration's arguments.
 (deftest-compiled-only frame-locals-follows-tail-call-rebind
   (progn (fl-tco 3 0) *fl-captured*)
@@ -249,13 +249,13 @@
 ;;; owns the innermost backtrace position and reads as ITS variables. It used to
 ;;; push none and borrow its caller's position (hence the name): a named callee
 ;;; was then absent from BACKTRACE when reached through APPLY while the identical
-;;; compiled call listed it, and the tree-walk evaluator — which calls everything
-;;; this way — showed no user frames at all.
+;;; compiled call listed it, and the tree-walk evaluator, which calls everything
+;;; this way, showed no user frames at all.
 (deftest-compiled-only frame-locals-borrowed-frame-keeps-caller-locals
   (progn (fl-borrow-caller 3) *fl-captured*)
   (("A" . 3) ("Q" . 6)))
 
-;;; The caller's own locals are still reachable, one frame further out — the
+;;; The caller's own locals are still reachable, one frame further out; the
 ;;; APPLY'd callee added a position rather than replacing one.
 (deftest-compiled-only frame-locals-apply-caller-one-frame-out
   (progn (fl-borrow-caller-2 3) *fl-captured*)

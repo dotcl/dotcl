@@ -14,7 +14,7 @@
 ;;; Only the decisions are tested here. Resolving for real needs the network and
 ;;; the .NET SDK, so it belongs to a bring-up run rather than this suite.
 
-(require "nuget")
+(require "dotcl-nuget")
 
 (defun nlk-exact-p (version)
   (funcall (find-symbol "%EXACT-VERSION-P" "NUGET") version))

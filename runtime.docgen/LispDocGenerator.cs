@@ -46,7 +46,7 @@ namespace DotCL {
             var lispName = GetLispNameFromSyntax(method);
             if (lispName is null) continue;
 
-            // Read doc comment directly from syntax trivia — works without GenerateDocumentationFile.
+            // Read doc comment directly from syntax trivia: works without GenerateDocumentationFile.
             var xmlDoc = ReadDocTrivia(method);
             if (xmlDoc is null) continue;
 
@@ -69,7 +69,7 @@ namespace DotCL {
         context.AddSource("GeneratedDocs.g.cs", sb.ToString());
     }
 
-    // Extract LispName from [LispDoc("NAME")] attribute syntax — no semantic model needed.
+    // Extract LispName from [LispDoc("NAME")] attribute syntax: no semantic model needed.
     private static string? GetLispNameFromSyntax(MethodDeclarationSyntax method)
     {
         foreach (var attrList in method.AttributeLists)

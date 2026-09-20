@@ -22,7 +22,7 @@
 ;;; Output is one line per operation:
 ;;;   #M <elapsed-s> <op> rss=<kB> drss=<kB since previous line> <component>
 ;;; The drss on a line is the cost of the work between the PREVIOUS line and this
-;;; one — so the load cost of a file appears on the line after its LOAD-OP.
+;;; one: so the load cost of a file appears on the line after its LOAD-OP.
 ;;;
 ;;; Cold and warm runs differ by an order of magnitude per file (one component
 ;;; measured +2.74 GB cold and +175 MB warm, because a cold run compiles as it

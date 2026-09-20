@@ -1,4 +1,4 @@
-;;; test/mop-protocol.lisp — AMOP protocol conformance tests for DOTCL-MOP
+;;; test/mop-protocol.lisp: AMOP protocol conformance tests for DOTCL-MOP
 ;;;
 ;;; Covers the generic functions specified in Chapters 5-6 of
 ;;; "The Art of the Metaobject Protocol" (Kiczales et al.).
@@ -7,7 +7,7 @@
 ;;;   dotnet run --project runtime/runtime.csproj -- --asm compiler/cil-out.sil \
 ;;;     test/framework.lisp test/mop-protocol.lisp
 ;;;
-;;; Key: AMOP §N.N references the relevant section of the protocol.
+;;; Key: AMOP N.N references the relevant section of the protocol.
 
 (load "test/framework.lisp")
 
@@ -49,7 +49,7 @@
   (:default-initargs :s1 99))
 
 ;;; ============================================================
-;;; CLASS-DIRECT-SUPERCLASSES (AMOP §5.4.3)
+;;; CLASS-DIRECT-SUPERCLASSES (AMOP 5.4.3)
 ;;; ============================================================
 
 (deftest mop/class-direct-superclasses-exact
@@ -73,7 +73,7 @@
   t)
 
 ;;; ============================================================
-;;; CLASS-DIRECT-SUBCLASSES (AMOP §5.4.3)
+;;; CLASS-DIRECT-SUBCLASSES (AMOP 5.4.3)
 ;;; ============================================================
 
 (deftest mop/class-direct-subclasses-contains-child
@@ -89,7 +89,7 @@
   t)
 
 ;;; ============================================================
-;;; CLASS-PRECEDENCE-LIST (AMOP §5.4.3)
+;;; CLASS-PRECEDENCE-LIST (AMOP 5.4.3)
 ;;; ============================================================
 
 (deftest mop/class-precedence-list-self-first
@@ -105,7 +105,7 @@
   t)
 
 (deftest mop/class-precedence-list-monotonic
-  ;; mop/c inherits b then a — a must come before standard-object
+  ;; mop/c inherits b then a: a must come before standard-object
   (let* ((cpl (dotcl-mop:class-precedence-list (find-class 'mop/c)))
          (names (mapcar (lambda (c) (class-name c)) cpl)))
     (< (position 'mop/b names) (position 'mop/a names)))
@@ -117,7 +117,7 @@
   t)
 
 ;;; ============================================================
-;;; CLASS-FINALIZED-P (AMOP §5.4.1)
+;;; CLASS-FINALIZED-P (AMOP 5.4.1)
 ;;; ============================================================
 
 (deftest mop/class-finalized-p-used-class
@@ -131,7 +131,7 @@
   t)
 
 ;;; ============================================================
-;;; CLASS-SLOTS / CLASS-DIRECT-SLOTS (AMOP §5.4.3)
+;;; CLASS-SLOTS / CLASS-DIRECT-SLOTS (AMOP 5.4.3)
 ;;; ============================================================
 
 (deftest mop/class-slots-includes-inherited
@@ -152,7 +152,7 @@
 
 (deftest mop/class-slots-are-slot-definitions
   ;; AMOP: each element of class-slots must be a standard-slot-definition.
-  ;; dotcl TODO: SlotDefinition C# objects have no Lisp class yet — type-of returns T.
+  ;; dotcl TODO: SlotDefinition C# objects have no Lisp class yet: type-of returns T.
   ;; For now verify they have a slot-definition-name (duck-type check).
   (every (lambda (s)
            (symbolp (dotcl-mop:slot-definition-name s)))
@@ -161,7 +161,7 @@
 
 ;;; ============================================================
 ;;; CLASS-DEFAULT-INITARGS / CLASS-DIRECT-DEFAULT-INITARGS
-;;; (AMOP §5.4.3)
+;;; (AMOP 5.4.3)
 ;;; ============================================================
 
 (deftest mop/class-default-initargs-present
@@ -182,7 +182,7 @@
   t)
 
 ;;; ============================================================
-;;; CLASS-PROTOTYPE (AMOP §5.4.3)
+;;; CLASS-PROTOTYPE (AMOP 5.4.3)
 ;;; ============================================================
 
 (deftest mop/class-prototype-type
@@ -195,7 +195,7 @@
   t)
 
 ;;; ============================================================
-;;; SLOT-DEFINITION-NAME (AMOP §5.7.2)
+;;; SLOT-DEFINITION-NAME (AMOP 5.7.2)
 ;;; ============================================================
 
 (deftest mop/slot-definition-name-correct
@@ -206,7 +206,7 @@
   z)
 
 ;;; ============================================================
-;;; SLOT-DEFINITION-ALLOCATION (AMOP §5.7.2)
+;;; SLOT-DEFINITION-ALLOCATION (AMOP 5.7.2)
 ;;; ============================================================
 
 (deftest mop/slot-definition-allocation-instance
@@ -224,7 +224,7 @@
   :class)
 
 ;;; ============================================================
-;;; SLOT-DEFINITION-INITARGS (AMOP §5.7.2)
+;;; SLOT-DEFINITION-INITARGS (AMOP 5.7.2)
 ;;; ============================================================
 
 (deftest mop/slot-definition-initargs-keyword-list
@@ -246,7 +246,7 @@
   t)
 
 ;;; ============================================================
-;;; SLOT-DEFINITION-INITFORM (AMOP §5.7.2)
+;;; SLOT-DEFINITION-INITFORM (AMOP 5.7.2)
 ;;; ============================================================
 
 (deftest mop/slot-definition-initform-literal
@@ -260,7 +260,7 @@
   3)
 
 ;;; ============================================================
-;;; SLOT-DEFINITION-INITFUNCTION (AMOP §5.7.2)
+;;; SLOT-DEFINITION-INITFUNCTION (AMOP 5.7.2)
 ;;; ============================================================
 
 (deftest mop/slot-definition-initfunction-callable
@@ -279,7 +279,7 @@
   t)
 
 ;;; ============================================================
-;;; SLOT-DEFINITION-LOCATION (AMOP §5.7.2)
+;;; SLOT-DEFINITION-LOCATION (AMOP 5.7.2)
 ;;; ============================================================
 
 (deftest mop/slot-definition-location-non-negative-integer
@@ -333,7 +333,7 @@
   t)
 
 ;;; ============================================================
-;;; GENERIC-FUNCTION-NAME (AMOP §6.7.2)
+;;; GENERIC-FUNCTION-NAME (AMOP 6.7.2)
 ;;; ============================================================
 
 (deftest mop/generic-function-name-symbol
@@ -345,7 +345,7 @@
   t)
 
 ;;; ============================================================
-;;; GENERIC-FUNCTION-METHODS (AMOP §6.7.2)
+;;; GENERIC-FUNCTION-METHODS (AMOP 6.7.2)
 ;;; ============================================================
 
 (deftest mop/generic-function-methods-count
@@ -359,7 +359,7 @@
   t)
 
 ;;; ============================================================
-;;; GENERIC-FUNCTION-LAMBDA-LIST (AMOP §6.7.2)
+;;; GENERIC-FUNCTION-LAMBDA-LIST (AMOP 6.7.2)
 ;;; ============================================================
 
 (deftest mop/generic-function-lambda-list-arity-1
@@ -371,7 +371,7 @@
   t)
 
 ;;; ============================================================
-;;; GENERIC-FUNCTION-METHOD-CLASS (AMOP §6.7.2)
+;;; GENERIC-FUNCTION-METHOD-CLASS (AMOP 6.7.2)
 ;;; ============================================================
 
 (deftest mop/generic-function-method-class-is-standard-method
@@ -381,7 +381,7 @@
   t)
 
 ;;; ============================================================
-;;; GENERIC-FUNCTION-METHOD-COMBINATION (AMOP §6.7.2)
+;;; GENERIC-FUNCTION-METHOD-COMBINATION (AMOP 6.7.2)
 ;;; ============================================================
 
 (deftest mop/generic-function-method-combination-not-null
@@ -389,7 +389,7 @@
   t)
 
 ;;; ============================================================
-;;; METHOD-GENERIC-FUNCTION (AMOP §6.7.2)
+;;; METHOD-GENERIC-FUNCTION (AMOP 6.7.2)
 ;;; ============================================================
 
 (deftest mop/method-generic-function-identity
@@ -399,7 +399,7 @@
   t)
 
 ;;; ============================================================
-;;; METHOD-LAMBDA-LIST (AMOP §6.7.2)
+;;; METHOD-LAMBDA-LIST (AMOP 6.7.2)
 ;;; ============================================================
 
 (deftest mop/method-lambda-list-length
@@ -409,7 +409,7 @@
   t)
 
 ;;; ============================================================
-;;; METHOD-QUALIFIERS (AMOP §6.7.2)
+;;; METHOD-QUALIFIERS (AMOP 6.7.2)
 ;;; ============================================================
 
 (deftest mop/method-qualifiers-primary-empty
@@ -429,7 +429,7 @@
   t)
 
 ;;; ============================================================
-;;; METHOD-SPECIALIZERS (AMOP §6.7.2)
+;;; METHOD-SPECIALIZERS (AMOP 6.7.2)
 ;;; ============================================================
 
 (deftest mop/method-specializers-length
@@ -471,7 +471,7 @@
   t)
 
 ;;; ============================================================
-;;; EQL-SPECIALIZER-OBJECT / INTERN-EQL-SPECIALIZER (AMOP §6.4)
+;;; EQL-SPECIALIZER-OBJECT / INTERN-EQL-SPECIALIZER (AMOP 6.4)
 ;;; ============================================================
 
 (deftest mop/eql-specializer-roundtrip
@@ -494,7 +494,7 @@
   t)
 
 ;;; ============================================================
-;;; EXTRACT-LAMBDA-LIST / EXTRACT-SPECIALIZER-NAMES (AMOP §6.3)
+;;; EXTRACT-LAMBDA-LIST / EXTRACT-SPECIALIZER-NAMES (AMOP 6.3)
 ;;; ============================================================
 
 (deftest mop/extract-lambda-list-simple
@@ -513,7 +513,7 @@
   (mop/a))
 
 (deftest mop/extract-specializer-names-default
-  ;; (x) — no specializer — becomes (t)
+  ;; (x), no specializer, becomes (t)
   (dotcl-mop:extract-specializer-names '(x))
   (t))
 
@@ -523,7 +523,7 @@
   (mop/a t))
 
 ;;; ============================================================
-;;; VALIDATE-SUPERCLASS (AMOP §5.4.2)
+;;; VALIDATE-SUPERCLASS (AMOP 5.4.2)
 ;;; ============================================================
 
 (deftest mop/validate-superclass-standard-standard
@@ -613,14 +613,14 @@
   t)
 
 ;;; ============================================================
-;;; Unimplemented — expected to fail (mark as known missing)
+;;; Unimplemented: expected to fail (mark as known missing)
 ;;; ============================================================
 
 ;;; The following functions are specified by AMOP but not yet
 ;;; implemented in DOTCL-MOP. These tests document what's missing.
 
 (deftest mop/TODO-slot-value-using-class
-  ;; AMOP §5.5.1: (slot-value-using-class class instance slotd) -> value
+  ;; AMOP 5.5.1: (slot-value-using-class class instance slotd) -> value
   (handler-case
     (let* ((inst (make-instance 'mop/a :x 77))
            (slotd (find-if (lambda (s) (eq (dotcl-mop:slot-definition-name s) 'x))
@@ -631,7 +631,7 @@
   77)
 
 (deftest mop/TODO-compute-slots
-  ;; AMOP §5.4.1: (compute-slots class) -> list of effective slot definitions
+  ;; AMOP 5.4.1: (compute-slots class) -> list of effective slot definitions
   (handler-case
     (length (dotcl-mop:compute-slots (find-class 'mop/a)))
     (undefined-function () :not-implemented)
@@ -639,7 +639,7 @@
   2)
 
 (deftest mop/TODO-finalize-inheritance
-  ;; AMOP §5.4.1: (finalize-inheritance class) -> unspecified, side-effects CPL
+  ;; AMOP 5.4.1: (finalize-inheritance class) -> unspecified, side-effects CPL
   (handler-case
     (progn (dotcl-mop:finalize-inheritance (find-class 'mop/a)) t)
     (undefined-function () :not-implemented)
@@ -647,7 +647,7 @@
   t)
 
 (deftest mop/TODO-compute-effective-method
-  ;; AMOP §6.5: (compute-effective-method gf combination applicable-methods)
+  ;; AMOP 6.5: (compute-effective-method gf combination applicable-methods)
   (handler-case
     (let* ((gf #'mop/gf3)
            (comb (dotcl-mop:generic-function-method-combination gf))
@@ -658,7 +658,7 @@
   t)
 
 (deftest mop/TODO-method-function
-  ;; AMOP §6.7.2: (method-function method) -> function
+  ;; AMOP 6.7.2: (method-function method) -> function
   (handler-case
     (let ((m (first (dotcl-mop:generic-function-methods #'mop/gf3))))
       (functionp (dotcl-mop:method-function m)))
@@ -684,7 +684,7 @@
   t)
 
 (deftest mop/typep-cpl-conformance-inherited
-  ;; mop/c instance is typep of mop/a (inherited) — mop/a must be in CPL
+  ;; mop/c instance is typep of mop/a (inherited): mop/a must be in CPL
   (let* ((inst (make-instance 'mop/c))
          (cpl (dotcl-mop:class-precedence-list (class-of inst))))
     (notnot (and (typep inst 'mop/c)

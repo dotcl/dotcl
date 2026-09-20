@@ -70,8 +70,8 @@
   ;; A NEW variable declared via define-compile-state automatically joins the
   ;; closure-boundary reset: fresh inside, outer value restored outside.
   ;; The variable identity is read back from the registry (the compiled defvar
-  ;; may intern the symbol in a different package than this test file's reader
-  ;; — the registry entry is the single source of truth).
+  ;; may intern the symbol in a different package than this test file's reader;
+  ;; the registry entry is the single source of truth).
   (let ((dcs (%csr-sym "DEFINE-COMPILE-STATE"))
         (cwf (symbol-function (%csr-sym "CALL-WITH-FRESH-CLOSURE-STATE")))
         (dummy (intern "*CSR-DUMMY-STATE*" "CL-USER")))

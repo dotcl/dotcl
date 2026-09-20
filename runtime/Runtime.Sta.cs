@@ -8,7 +8,7 @@ namespace DotCL;
 /// dotnet:ui-post   runs a Lisp lambda on the STA thread without waiting.
 ///
 /// A window belongs to the thread that created it and only that thread may pump its
-/// messages, so UI work cannot run on the REPL's thread — hence the dedicated STA
+/// messages, so UI work cannot run on the REPL's thread: hence the dedicated STA
 /// thread and the marshalling. Apartments are a COM concept, which is why this is
 /// Windows-only: the dependency is Thread.SetApartmentState, not any UI framework.
 /// System.Windows.Forms is never referenced here; the caller loads it (or WPF, or
@@ -73,7 +73,7 @@ internal static class DotNetSta
 
         var appType = FindType("System.Windows.Forms.Application")
             ?? throw new LispErrorException(new LispProgramError(
-                "DOTNET:UI-INVOKE: System.Windows.Forms not loaded — call " +
+                "DOTNET:UI-INVOKE: System.Windows.Forms not loaded; call " +
                 "(dotnet:load-assembly \"System.Windows.Forms\") first"));
 
         var ctxType = FindType("System.Windows.Forms.WindowsFormsSynchronizationContext")!;

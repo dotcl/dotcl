@@ -167,7 +167,7 @@
     (dotcl-mop:eql-specializer-object spec))
   42)
 
-;;; --- slot-value-using-class dispatch (AMOP §5.4) ---
+;;; --- slot-value-using-class dispatch (AMOP 5.4) ---
 
 (defclass svuc-meta (standard-class) ())
 (defmethod validate-superclass ((c svuc-meta) (s standard-class)) t)
@@ -298,7 +298,7 @@
   (:hi t))
 
 ;;; A class metaobject runs the metaclass's inherited initialize-instance
-;;; :after — a slot computed by :after (no initform/initarg) is bound on the class.
+;;; :after: a slot computed by :after (no initform/initarg) is bound on the class.
 (defclass mop-meta-mixin2 () ((computed :accessor mop-computed)))
 (defmethod initialize-instance :after ((o mop-meta-mixin2) &key)
   (unless (slot-boundp o 'computed) (setf (slot-value o 'computed) :by-after)))

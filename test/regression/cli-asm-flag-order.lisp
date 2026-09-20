@@ -11,7 +11,7 @@
 ;;; AFTER --asm made it "LOAD: file not found: --asd-search-path".
 ;;;
 ;;; The behaviour under test is argument handling in main, so each case runs this
-;;; same executable again. Two children, because two orders — the plain
+;;; same executable again. Two children, because two orders: the plain
 ;;; "--asm first, nothing in front" case is what the whole suite already runs on.
 
 (defvar *cli-exe*
@@ -60,7 +60,7 @@
   (0 t))
 
 ;;; The other half: after --asm the flag must be consumed as a flag, not LOADed
-;;; as a file. Kept cheap — no asdf — because what broke here was argument
+;;; as a file. Kept cheap, no asdf, because what broke here was argument
 ;;; handling, and the child dying at all is the signal.
 
 (deftest cli-asm-flag-order.search-path-after-asm-is-not-a-file

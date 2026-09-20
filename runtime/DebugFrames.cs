@@ -5,12 +5,12 @@ namespace DotCL;
 /// debugger. Created by <see cref="DebugFrames.Enter"/> from IL the compiler emits
 /// at body entry when frame-locals mode is on; each user variable binding then
 /// stores itself here with <see cref="Set"/>. Nothing of this exists in the normal
-/// (frame-locals off) code path — no frame is opened and no store IL is emitted.
+/// (frame-locals off) code path: no frame is opened and no store IL is emitted.
 /// </summary>
 public sealed class DebugFrame
 {
-    /// <summary>Lisp name of this body's function, or — for a lambda, which has no
-    /// name of its own — of the caller whose call-stack frame it runs under (null
+    /// <summary>Lisp name of this body's function, or, for a lambda, which has no
+    /// name of its own, of the caller whose call-stack frame it runs under (null
     /// at top level). Used together with <see cref="CallDepth"/> to match a debugger
     /// backtrace frame to its locals.</summary>
     internal readonly string? FunctionName;
@@ -18,7 +18,7 @@ public sealed class DebugFrame
     /// <summary>LispFunction call-stack depth at body entry.</summary>
     internal readonly int CallDepth;
 
-    /// <summary>True for a body that runs without a call-stack frame of its own —
+    /// <summary>True for a body that runs without a call-stack frame of its own;
     /// a lambda / closure, or a named function reached through a call path that
     /// pushes no frame. Such a frame borrows its caller's depth, so it neither
     /// evicts the caller's frame nor outranks it when the debugger asks for that
@@ -31,7 +31,7 @@ public sealed class DebugFrame
     /// being inspected rather than to its callers.</summary>
     internal readonly int DynDepth;
 
-    // Insertion-ordered name → holder: either the value itself, or, for a boxed
+    // Insertion-ordered name -> holder: either the value itself, or, for a boxed
     // variable, the heap cell holding it (resolved by Read at print time, so
     // later mutations through the box are seen). Rebinding the same name
     // overwrites in place, so a variable appears once and shows its newest value
@@ -47,7 +47,7 @@ public sealed class DebugFrame
     }
 
     /// <summary>Record a lexical binding. Called from emitted IL right after the
-    /// variable's slot is stored, and again after every assignment to it — the
+    /// variable's slot is stored, and again after every assignment to it; the
     /// frame holds the value, so it has to follow.</summary>
     public void Set(string name, LispObject value) => Store(name, value);
 
@@ -98,12 +98,12 @@ public sealed class DebugFrame
 /// A frame is opened by IL at body entry, but never explicitly closed: wrapping
 /// every compiled body in a try/finally just to pop would fight tail calls and
 /// change codegen far beyond the debug annotation. Instead <see cref="Enter"/>
-/// drops the frames that provably cannot be live any more — anything deeper than
+/// drops the frames that provably cannot be live any more: anything deeper than
 /// the frame being entered (its callee has returned), and, at the same depth,
 /// anything a body with a call-stack frame of its own enters over (that frame was
 /// pushed after the ones already sitting at this depth, so they have returned). A
-/// body that pushed no call-stack frame and therefore shares its caller's depth —
-/// a lambda, or a named function reached through a path that pushes no frame —
+/// body that pushed no call-stack frame and therefore shares its caller's depth,
+/// a lambda, or a named function reached through a path that pushes no frame,
 /// evicts only earlier such frames, leaving its caller's own live locals alone.
 /// </summary>
 public static class DebugFrames
@@ -119,7 +119,7 @@ public static class DebugFrames
     /// LispFunction.Invoke(params) pushes none, so a function reached that way
     /// (APPLY, and the way the runtime calls *debugger-hook*) runs at its caller's
     /// depth. Comparing OWNNAME with the innermost frame's name tells the two
-    /// apart; without that check such a body would inherit its caller's identity —
+    /// apart; without that check such a body would inherit its caller's identity;
     /// evicting the caller's locals and answering for its backtrace position,
     /// which is exactly the frame an sldb user is looking at.</summary>
     public static DebugFrame Enter(string? ownName)
@@ -131,7 +131,7 @@ public static class DebugFrames
         for (int i = frames.Count - 1; i >= 0; i--)
         {
             var f = frames[i];
-            if (f.CallDepth < depth) break; // shallower ⇒ still live, and so is everything before it
+            if (f.CallDepth < depth) break; // shallower => still live, and so is everything before it
             if (f.CallDepth > depth || !borrowed || f.Borrowed) frames.RemoveAt(i);
         }
         // A lambda has no name to be found under, so it is recorded under the frame
@@ -145,7 +145,7 @@ public static class DebugFrames
 
     /// <summary>Locals of backtrace frame FRAMEINDEX (0 = innermost, same
     /// numbering as DOTCL:BACKTRACE) as an alist (("NAME" . value) ...), or NIL
-    /// when that frame recorded none — it was compiled without frame-locals mode,
+    /// when that frame recorded none: it was compiled without frame-locals mode,
     /// is a C#-implemented function, or simply binds nothing.</summary>
     /// <summary>A frame's locals rendered one "NAME = value" line per variable, for
     /// the debugger's :locals and DOTCL:PRINT-FRAME-LOCALS (which share the
@@ -167,7 +167,7 @@ public static class DebugFrames
     /// <summary>
     /// The dynamic (special-variable) bindings on this thread's stack, innermost
     /// first, as ((SYMBOL value . own-p) ...). OWN-P is true for a binding this
-    /// frame or something it called established — the rest belong to its callers.
+    /// frame or something it called established: the rest belong to its callers.
     ///
     /// Unlike locals, this does not depend on frame-locals mode: the binding stack
     /// is always there. What FRAMEINDEX buys is only the OWN-P split, so an

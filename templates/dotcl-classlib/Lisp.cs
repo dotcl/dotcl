@@ -7,7 +7,7 @@ namespace DotclLibrary;
 /// compiled to DotclLibrary.fasl at build time; the methods here boot the dotcl
 /// runtime once, load that fasl, and call in.
 ///
-/// Consumers reference this project and call <c>Lisp.Greet("world")</c> — they
+/// Consumers reference this project and call <c>Lisp.Greet("world")</c>; they
 /// never see the runtime or the fasl.
 /// </summary>
 public static class Lisp
@@ -27,7 +27,7 @@ public static class Lisp
         {
             if (_loaded) return;
             DotclHost.Initialize();
-            // Boot the base image unless the host already did — a consuming app
+            // Boot the base image unless the host already did: a consuming app
             // may be a dotcl project itself and have loaded it.
             DotclHost.EnsureCore();
             // This library's own manifest. It is named after the project rather

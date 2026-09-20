@@ -65,7 +65,7 @@
   (%lc-let*-body 300)
   (1 302))
 
-;;; A raw native slot must NOT be chunked — capturing one would emit invalid IL.
+;;; A raw native slot must NOT be chunked: capturing one would emit invalid IL.
 ;;; The refusal path still has to compile and give the right answer.
 (defmacro %lc-fixnum-body (n)
   `(let ((acc 0))

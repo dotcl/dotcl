@@ -1,4 +1,4 @@
-;;; dotcl-float.lisp — IEEE float bit<->value primitives backed by
+;;; dotcl-float.lisp: IEEE float bit<->value primitives backed by
 ;;; System.BitConverter via dotnet:static. No C# helper DLL; System.BitConverter
 ;;; is in System.Runtime and always resolvable.
 ;;;

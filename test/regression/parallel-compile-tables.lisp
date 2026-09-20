@@ -6,7 +6,7 @@
 ;;; variable, which does a check-then-insert on the global *uninterned-var-names*
 ;;; table; two workers inserting at once tore the backing Dictionary and left it
 ;;; permanently corrupt ("non-concurrent collection ... corrupted"), so a later
-;;; unrelated compile — e.g. expanding DEFTEST — crashed. Fix: the mutable global
+;;; unrelated compile, e.g. expanding DEFTEST, crashed. Fix: the mutable global
 ;;; compiler tables (*uninterned-var-names*, *function-return-types*, setf /
 ;;; struct / accessor registries, ...) are created :synchronized t.
 ;;;
@@ -59,9 +59,9 @@
 
 ;;; Regression for the *uninterned-var-counter* lost-update under parallel-eval.
 ;;; VAR-NAME mints "NAME#:N" for each distinct uninterned symbol; N came from a
-;;; plain (incf) on a special var — a non-atomic read-modify-write. Under
+;;; plain (incf) on a special var: a non-atomic read-modify-write. Under
 ;;; (set-parallel-eval t) two workers could read the same N and mint identical
-;;; name strings for DISTINCT gensyms — not a crash, a silent capture hazard
+;;; name strings for DISTINCT gensyms: not a crash, a silent capture hazard
 ;;; (an uninterned var wrongly aliasing another in closure capture). Fix: the
 ;;; counter is an ATOMIC-LONG bumped with ATOMIC-LONG-INCF.
 ;;;

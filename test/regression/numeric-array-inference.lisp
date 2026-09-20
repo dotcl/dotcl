@@ -28,7 +28,7 @@
 
 ;; The whole inner loop must be on the raw-long entries: no boxed Aref2D,
 ;; no generic Runtime.Add.
-;;; DEFTEST-COMPILED-ONLY below: the fast array paths are a compiler inference —
+;;; DEFTEST-COMPILED-ONLY below: the fast array paths are a compiler inference;
 ;;; element types are deduced and unboxed access is emitted. There is nothing to
 ;;; infer without a compiler, so an emit-free build takes the generic path.
 
@@ -90,7 +90,7 @@
   (list (%nai2-displace-flip nil) (%nai2-displace-flip t))
   (4 20))
 
-;; A mutated (setq'd) array local is NOT inferred — and stays correct.
+;; A mutated (setq'd) array local is NOT inferred: and stays correct.
 (defun %nai2-mutated (n)
   (declare (fixnum n))
   (let ((v (make-array n :element-type '(unsigned-byte 8) :initial-element 1)))
@@ -103,7 +103,7 @@
   (%nai2-mutated 5)
   50)
 
-;;; ---- float-backed inference (single-float→float[], double-float→double[]):
+;;; ---- float-backed inference (single-float->float[], double-float->double[]):
 ;;; aref reads/writes the element as a native r8 (Runtime.ArefNum*D), and the
 ;;; inner arithmetic stays on the double-float native path (no DoubleFloat box,
 ;;; no generic Runtime.Add). phase 2.
@@ -137,7 +137,7 @@
 
 ;; ArefNum*D on both sides and NO generic Runtime.Add (the inner-loop add runs
 ;; on the native r8 path). A newobj DoubleFloat may still appear for the boxed
-;; RETURN value (aref c 0) and the literal — only the arithmetic must be raw.
+;; RETURN value (aref c 0) and the literal: only the arithmetic must be raw.
 (deftest-compiled-only naf-daxpy-local-sil
   (let ((sil (princ-to-string (dotcl:function-sil #'%naf-daxpy-local))))
     (list (notnot (search "ArefNumD" sil))
@@ -151,7 +151,7 @@
 
 ;; Box-free proof: when the float flow is entirely statement-position (the
 ;; function returns a fixnum, not a boxed aref), the peephole (P6/P7) deletes
-;; every DoubleFloat box — the inner loop is pure native r8, zero heap boxing.
+;; every DoubleFloat box: the inner loop is pure native r8, zero heap boxing.
 (defun %naf-boxfree (n)
   (declare (fixnum n))
   (let ((a (make-array n :element-type 'double-float :initial-element 2d0))
@@ -233,7 +233,7 @@
 ;;; shape). Copy-propagation carries the backing through a bare alias binding
 ;;; (the Gabriel fft's (prog ((ar areal)) ...)). phase 3.
 
-;; Typed double-float array parameters — array-to-array store, box-free.
+;; Typed double-float array parameters: array-to-array store, box-free.
 (defun %naf-param-daxpy (a b c n)
   (declare (type (simple-array double-float (*)) a b c) (fixnum n))
   (dotimes (i n)
@@ -274,7 +274,7 @@
     (list (aref a 0) (aref a 3) (aref a 4)))
   (6.0 6.0 3.0))
 
-;; copy propagation: (prog ((ar a)) ...) aliases the typed param — aref on the
+;; copy propagation: (prog ((ar a)) ...) aliases the typed param: aref on the
 ;; alias still routes to the native path (the Gabriel fft shape).
 (defun %naf-alias (a n)
   (declare (type (simple-array double-float (*)) a) (fixnum n))
@@ -299,13 +299,13 @@
   (6.0d0 7.0d0 8.0d0))
 
 ;; a caller passing a NON-float-backed array to a float-typed param must not
-;; corrupt — the runtime fast path re-checks kind and coerces via the boxed path.
+;; corrupt: the runtime fast path re-checks kind and coerces via the boxed path.
 (defun %naf-param-read (a i)
   (declare (type (simple-array double-float (*)) a) (fixnum i))
   (aref a i))
 
 (deftest naf-param-type-mismatch-safe
-  ;; general (element-type t) vector holding a double — ArefNumD fast path
+  ;; general (element-type t) vector holding a double: ArefNumD fast path
   ;; misses (_numKind 0), falls back to boxed coerce.
   (let ((v (make-array 2 :initial-element 0)))
     (setf (aref v 1) 3.5d0)

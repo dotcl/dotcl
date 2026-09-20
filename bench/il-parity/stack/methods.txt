@@ -1,0 +1,4 @@
+# C# method            Lisp function
+Stack.Push             ILP-STACK-PUSH
+Stack.Pop              ILP-STACK-POP
+Stack.Peek             ILP-STACK-PEEK

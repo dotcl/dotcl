@@ -1,5 +1,5 @@
 ;;; %MINI-EVAL (dotcl's compile-time tree-walk interpreter, used for MACROLET and
-;;; other interpreted expander bodies) had no handler for %DOTIMES-1+ — the compiler
+;;; other interpreted expander bodies) had no handler for %DOTIMES-1+; the compiler
 ;;; intrinsic that dotcl's DOTIMES macro emits for a fixnum counter. A macro whose
 ;;; expander body used DOTIMES and was expanded through %MINI-EVAL therefore called
 ;;; %DOTIMES-1+ as an undefined function (seen in the SBCL make-host-2 build via the

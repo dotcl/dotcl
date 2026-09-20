@@ -1,0 +1,19 @@
+{
+  "//": "Hand-written explanations, one sentence per system, merged into docs/library-status.md as the 'why' column. This file is written by people and read by render.lisp; the check run (run-quickload.sh) never touches it, which is the whole point -- a re-measurement rewrites 'note' from the raw error and would otherwise erase the reason behind it.",
+
+  "//published": "Every sentence here is published verbatim in the table, so write it for a reader outside this repository: English, no internal issue numbers, and an issue reference only if it is an issue in the public dotcl/dotcl repository. Identifiers and error text are Markdown here, so wrap them in backticks: only the cell separator is escaped for you.",
+
+  "//scope": "Say WHY the row looks the way it does, not what the error was -- 'note' already carries that. A row that needs no explanation has no entry here.",
+
+  "postmodern": "`cl-postgres.asd` pulls usocket in through an allowlist of implementations but its code reaches for usocket through a denylist, so every implementation missing from that allowlist hits this; quickloading usocket first makes postmodern load unchanged.",
+
+  "sdl2": "Not a dotcl failure: after about 340 seconds of compiling, the SDL2 library this host finds is not an image this arm64 machine can load (`ERROR_BAD_EXE_FORMAT`).",
+
+  "hu.dwim.logger": "Loads about two runs in three, and the failure mode follows the ASDF cache state rather than the code, so this row can differ between runs.",
+
+  "reblocks": "The `typep` gap that used to stop this row is fixed, and it now reaches the same missing `WITHOUT-INTERRUPTS` package as the metatilities family.",
+
+  "reblocks-parenscript": "Fails while loading `reblocks`, for the reason given on that row.",
+
+  "generic-cl": "Reaches a list-valued `defconstant` in a file that is compiled and loaded in one image, so the form runs twice and the second value is a freshly consed list rather than the same one. SBCL refuses that too; it never gets there because the file is only built on implementations without native CLTL2 environment access."
+}

@@ -65,7 +65,7 @@ public class LispFunction : LispObject
     // What the tree-walk evaluator needs to run this function's BODY without
     // calling the function: its lambda list, captured environment, special
     // parameters and body continuation. Only interpreted closures carry it, and
-    // only their trampoline reads it — a tail call whose callee has this can be
+    // only their trampoline reads it: a tail call whose callee has this can be
     // continued in the caller's own loop instead of on a new .NET frame, which is
     // what makes interpreted tail recursion run in constant stack. Null for
     // everything else, so the trampoline falls back to an ordinary call.
@@ -98,7 +98,7 @@ public class LispFunction : LispObject
     // statistics used to collapse every lambda of one registration method into a
     // single <anon:<RegisterSequenceBuiltins>b___> bucket. RegisterFunction fills
     // this in so the counters name the symbol instead. Read only while
-    // CollectInvokeStats is on — no hot-path cost.
+    // CollectInvokeStats is on: no hot-path cost.
     internal string? StatsName;
 
     // Closure delegate: receives explicit env array
@@ -124,7 +124,7 @@ public class LispFunction : LispObject
     internal Func<LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject>? _func7;
     internal Func<LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject>? _func8;
 
-    // Native delegates: (self, long args) → LispObject return.
+    // Native delegates: (self, long args) -> LispObject return.
     // Avoids boxing of ARGUMENTS (the main allocation bottleneck in fixnum recursion).
     // Return is still LispObject so the body compiles unchanged.
     // The leading LispFunction is the function itself, threaded through so a native
@@ -174,7 +174,7 @@ public class LispFunction : LispObject
     // apply / spread-arg calls working: it performs the same
     // Runtime.CheckArityExact the compiled args-array body used to perform
     // (identical error type and message), then spreads the array. The direct
-    // _funcN path needs no check — the delegate signature structurally
+    // _funcN path needs no check: the delegate signature structurally
     // guarantees the argc (an InvokeM call with M != N finds _funcM null and
     // falls back to the wrapper). fnName is captured only by the wrapper
     // lambda; Name stays null like every closure, so PushFrame behavior and
@@ -234,7 +234,7 @@ public class LispFunction : LispObject
     [ThreadStatic] private static Stack<Frame>? s_callStack;
 
     /// <summary>Number of Lisp frames on this thread's call stack. A body's own
-    /// frame is already pushed while it runs, so this is that body's depth —
+    /// frame is already pushed while it runs, so this is that body's depth;
     /// DebugFrames uses it to tie a frame's locals to its backtrace position.</summary>
     internal static int CallStackDepth => s_callStack?.Count ?? 0;
 
@@ -313,8 +313,8 @@ public class LispFunction : LispObject
             ConditionSystem.CheckInterrupt();
         }
         // Push a debugger frame, exactly as InvokeSlow does for the same
-        // args-array shape. This is the entry every non-emitted caller uses —
-        // APPLY, and the tree-walk evaluator's own call site — so without it a
+        // args-array shape. This is the entry every non-emitted caller uses,
+        // APPLY, and the tree-walk evaluator's own call site, so without it a
         // named callee reached that way was missing from BACKTRACE while the
         // identical call from compiled code (which goes through InvokeN) was
         // listed.
@@ -355,7 +355,7 @@ public class LispFunction : LispObject
 
     // Push the current function name onto the debugger call stack and return a
     // scope whose Dispose pops it. Struct + `using` keeps this alloc-free (no
-    // closure, no boxing); functions with no frame name skip the stack — that is
+    // closure, no boxing); functions with no frame name skip the stack; that is
     // anonymous functions, plus the tree-walk evaluator's own helpers.
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private FrameScope PushFrame()
@@ -416,7 +416,7 @@ public class LispFunction : LispObject
     // Each InvokeN fast path calls PeriodicStackCheck before dispatching to
     // _funcN: this is the single choke point for every direct-delegate call
     // (assembler-installed simple functions, FASL closures, C# builtins, and
-    // MakeDirectClosure closures — grep confirms nothing calls _funcN directly).
+    // MakeDirectClosure closures: grep confirms nothing calls _funcN directly).
     // Without it, deep non-TCO recursion through the fast path never reaches
     // InvokeSlow's check and dies as an uncatchable .NET StackOverflowException
     // instead of a catchable Lisp "Stack overflow" PROGRAM-ERROR. The check is
@@ -594,7 +594,7 @@ public class LispFunction : LispObject
                   $"{StatsName ?? Name ?? "anonymous function"}: declared to return a fixnum, returned {v}",
                   v, Startup.Sym("FIXNUM")));
 
-    // Install a native long→LispObject delegate for the appropriate arity.
+    // Install a native long->LispObject delegate for the appropriate arity.
     public void SetNativeDelegate(Delegate del)
     {
         switch (del)
@@ -670,7 +670,7 @@ public class LispFunction : LispObject
     // C# lambdas carry a compiler-generated name embedding the enclosing
     // method (e.g. "<MakeHandlerCaseFunction>b__1_0"). Digits are stripped so
     // per-instance names (closure_42) collapse into one statistics key.
-    // Only called with CollectInvokeStats enabled — no cost otherwise.
+    // Only called with CollectInvokeStats enabled: no cost otherwise.
     private string AnonOriginTag()
     {
         var m = (_closureFunc ?? (Delegate?)_func ?? _directDel)?.Method;

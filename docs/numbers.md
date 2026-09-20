@@ -19,7 +19,7 @@ unwrap.
 ```
 
 There is one exception, `System.Decimal`, described at the end: it carries
-information — the number of decimal places — that no Lisp number can hold.
+information, the number of decimal places, that no Lisp number can hold.
 
 ## What comes back
 
@@ -35,7 +35,7 @@ information — the number of decimal places — that no Lisp number can hold.
 | `Decimal` | `decimal` | a dotcl type; see below |
 
 The integer widths are not distinct Lisp types. An `Int128` result is an
-integer, and if it happens to be small it is a fixnum — there is no
+integer, and if it happens to be small it is a fixnum; there is no
 `int128` to typecase on. What is 128 bits wide is the .NET side of the
 boundary, not the value.
 
@@ -51,8 +51,8 @@ value:
 ```
 
 "Fits the width" is deliberately not "is within the parameter's declared range".
-Common Lisp has no unsigned integer types, so `(ldb (byte 32 0) x)` — the only
-way to name a 32-bit pattern — always produces a non-negative integer. A
+Common Lisp has no unsigned integer types, so `(ldb (byte 32 0) x)`, the only
+way to name a 32-bit pattern, always produces a non-negative integer. A
 **signed** target therefore also accepts the unsigned form of the same pattern
 and reinterprets it:
 
@@ -82,7 +82,7 @@ Write one with `#m`, and it prints the same way:
 (dotcl:decimalp #m1.50)    ; => T
 ```
 
-It is a real number but neither rational nor float — a third exactness
+It is a real number but neither rational nor float; a third exactness
 category:
 
 ```lisp
@@ -98,7 +98,7 @@ category:
 
 Ordinary arithmetic never produces a decimal. Mixing one into a standard
 operation gives you the exact rational the decimal denotes, so the number of
-decimal places — meaningless once you have left the decimal domain — does not
+decimal places, meaningless once you have left the decimal domain, does not
 silently follow the value around:
 
 ```lisp
@@ -120,7 +120,7 @@ and the decimal places are preserved:
 ```
 
 Mixing a decimal with a float inside such a scope is an error, not a silent
-conversion — the same rule .NET itself applies:
+conversion; the same rule .NET itself applies:
 
 ```lisp
 (defun dmix (x y) (declare (type dotcl:decimal x) (type double-float y)) (+ x y))
@@ -149,5 +149,5 @@ precision:
 ```
 
 This matters beyond `typep`. Widening a binary32 result to `double-float` would
-not add precision it never had — it would only print the binary32 rounding error
+not add precision it never had; it would only print the binary32 rounding error
 at binary64 width, and pull every later operation into double precision.

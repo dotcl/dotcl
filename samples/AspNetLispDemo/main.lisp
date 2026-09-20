@@ -1,4 +1,4 @@
-;;; main.lisp — ASP.NET Core controller in Lisp.
+;;; main.lisp: ASP.NET Core controller in Lisp.
 ;;;
 ;;; Defines a Microsoft.AspNetCore.Mvc.ControllerBase subclass via
 ;;; dotnet:define-class. Program.cs's ApplicationPart adoption picks
@@ -42,7 +42,7 @@
 ;;; to a Minimal API route and awaits the Task, writing its result to the response.
 ;;; This exercises the Task-producing side of dotcl:async: an (async ...) block
 ;;; awaits a real .NET Task (Task.Delay) then yields a value, all off the request
-;;; thread — no thread-per-request blocking.
+;;; thread: no thread-per-request blocking.
 (defun async-hello ()
   "Return a Task<LispObject> that completes (after a simulated async delay) with a
    greeting string. The C# host awaits it as the request handler's result."

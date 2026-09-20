@@ -10,6 +10,9 @@ ANSI 規格適合は ansi-test (gitlab.common-lisp.net/ansi-test/ansi-test)
 このドキュメントは dotcl の **現状の実装** を機構ごとにまとめる
 ノートで、「いま何がどう動いているのか」を実装機構別に記述する。
 
+CLHS や SBCL と**意図的にずらしてある挙動**は 1 枚にまとめてある:
+`docs/deviations.md`。
+
 ## 1. 背景
 
 SBCL ARM64 Windows ポート (2026-02 upstream 取り込み) のあと、
@@ -423,20 +426,52 @@ CI で毎 push 走る。
 参照できないため)。落とし方は 2 通りあり、大きさで選ぶ:
 
 - **小さいリテラル**: IL で 1 要素ずつ組み立てる
-- **大きいリテラル (閾値 64 ノード)、および循環・共有のあるグラフ**:
+- **大きいリテラル (閾値 8 ノード)、および循環・共有のあるグラフ**:
   印字表現を **UTF-8 で PE のデータセクション** (`DefineInitializedData`)
   に置き、ロード時に reader で復元する。組み立て IL は 1 回実行する
   ためだけに必ず JIT されるので、リテラルが支配的なファイルでは
   **ロード時間の大半が JIT** になっていた (実測: リテラルが IL の 93% を
   占める合成ファイルで load 壁時計の 97%)。データにすると load が
   10-20 倍速く、コードのために積むメモリが 8 分の 1 になる。
-  意味論が変わらないグラフに限る — 未 intern シンボル (EQ が壊れる)、
-  構造体/CLOS インスタンス (make-load-form を迂回する)、パス名
-  (version が落ちる)、単純ベクタ以外のベクタ (要素型が落ちる) は
+  意味論が変わらないグラフに限る — パス名 (version が落ちる)、
+  単純ベクタ以外のベクタ (要素型が落ちる)、CLOS インスタンスは
   組み立て経路に残す。表現は `*print-circle*` で印字し、`*package*` /
   `*readtable*` / `*read-default-float-format*` を固定して読む
   (どれか 1 つでも読む側の設定に委ねると、値は合っているのに型や
   シンボルが変わる)
+
+判定はリテラル 1 個をまるごと 1 単位で行うので、**読めないノードが
+1 つ混ざると全体が組み立て経路に落ちる**。ここを広げる方向で 3 段階
+動いた:
+
+- **未 intern シンボル**: fasl ごとの表への添字として `#<n>U` で印字し、
+  reader は表の実体を返す。EQ がリテラル内でもリテラル間でも保つので、
+  除外条件から外した
+- **構造体**: `#K` で印字する。`make-load-form` がまさに
+  「割り付けてスロットを埋める」だけを求めている場合に限る (判定は
+  クラス単位でなく**インスタンス単位** — 分岐する make-load-form が
+  実在する)。`make-load-form-saving-slots` の生成フォームを s 式
+  リテラルとして組み立てて load 時に `Eval` していた経路が消える。
+  生成フォームが slot-saving の形と一致するなら emitter 側でも
+  `Eval` を通さず直接 intern する
+- **閾値**: 64 は合成ファイルで測った値で、そこには構造体が無かった。
+  実ライブラリでは閾値未満のリテラルに入った構造体が `Eval` 経路に
+  残り続けていたので 8 に下げた
+
+**リテラルは静的フィールドに一度だけ**組み立てる。本体に直接置くと
+呼び出しのたびに作り直され、`(eq (f) (f))` が NIL になり破壊的変更も
+消える (CLHS 3.2.4.4 違反)。**ソースから load する開発木では再現せず、
+`.fasl` で配った形でだけ壊れる**ため長く見えていなかった。
+同じ性質の無言の破損を機械で捕まえる道具が 2 つある:
+`DOTCL_LITERAL_VERIFY=1` (印字 → 読み直し → 印字の往復をその場で検算)、
+`DOTCL_LITERAL_CENSUS` (拒否されたリテラルの内訳)。
+
+**fasl の「形」の CI ガード**: 壊れ方が load 側にしか出ず、総バイト数にも
+コンパイル時間にも現れない種類の退行があるので、`make test-fasl-shape`
+が最大メソッド IL バイト数・型あたりフィールド/メソッド数・`#US` ヒープを
+閾値付きで検査する。CLHS 3.2.3.1 の 5 つの包み (PROGN / EVAL-WHEN /
+LOCALLY / MACROLET / SYMBOL-MACROLET) で flattener が降りるのをやめると
+単一の巨大メソッドに潰れるので、そこを踏む fixture を置いてある
 
 `load-time-value` は
 sequential ID (`*ltv-counter*`) を振り、`Startup.LoadTimeValueSlot`
@@ -446,12 +481,58 @@ Windows でビルドした `.fasl` を Linux で load しても動く (NativeAOT
 `module-provide-contrib` は `.fasl` → `.sil` → `.lisp` の順で
 contrib を解決する。
 
+**R2R 兄弟 fasl**: load 時の JIT は上の「IL のみ」の代償なので、そこを
+ahead-of-time に倒す経路を別に持つ。`foo.fasl` の隣に
+`foo.fasl.r2r-<rid>` (crossgen2 が同じモジュールをネイティブ化したもの)
+があれば load はそちらを使い、無ければ元の `.fasl` に落ちる。設計上の
+決めは 4 つ:
+
+- **置き換えではなく兄弟**。`.fasl` は asdf がソースと新旧を比べる成果物の
+  ままなので、計画した対象がすり替わっていることを誰にも教えなくてよい。
+  兄弟が `.fasl` より古ければ無視するので、作り直した fasl が古い
+  ネイティブコードに黙って上書きされることがない
+- **パスで読む**。既定の fasl ロードは `Assembly.Load(byte[])` だが、
+  バイト配列から読んだアセンブリの R2R コードは CLR が使わない。
+  兄弟だけ `Assembly.LoadFrom` で読む
+- **目印は拡張子の後ろ** (`*.fasl.r2r-<rid>`、ステム側ではない)。
+  ステムに入れると `*.fasl` に一致してしまい、fasl を列挙する側
+  (Makefile・2 つの csproj・crossgen2 のループ) が同じ除外を 4 回書く
+  ことになっていた
+- **可否は環境変数でなくスペシャル変数**。`dotcl:*compile-r2r*` (既定
+  NIL、asdf が fasl をコンパイルしたら兄弟も作る) と `dotcl:*load-r2r*`
+  (既定 T、読むとき兄弟を使う)。同じビルドでも「このシステムのコンパイル
+  の間だけ」が書けるべきで、それは処理系の設定ではなく image の判断。
+  環境変数は初期値を決めるだけに降格した
+
+作る側は asdf の `perform :after ((compile-op) (cl-source-file))` から
+`dotcl:write-r2r-sibling` を呼ぶ。`compile-file` の中ではフックできない
+— asdf は一時名でコンパイルして後からリネームするので、最終パスを
+知っているのは asdf の側だけ。この経路の失敗は全部「動くが遅い」なので
+外から成功と区別がつかず、観測手段を 2 つ付けてある:
+`(dotcl:r2r-stats)` が (兄弟から読んだ数 . 読んだ fasl の総数) を返し、
+crossgen2 が無いなど**頼まれて出来なかったとき**はプロセスごとに 1 度だけ
+復旧手順を stderr に書く (頼まれていないときは何も言わない)。
+
+**fasl が運ぶ情報は SIL より狭くなりうる**。`.sil` を読む経路は
+`:defmethod` ディレクティブの `:lambda-list` をそのまま `StoredLambdaList`
+に入れるが、fasl の書き出しがそれを見ておらず、**core から起動した image
+だけラムダリストを失っていた** (`.sil` 起動で 160/663、core 起動で 13/663。
+差は `cil-stdlib.lisp` で Lisp で書かれた標準関数)。配布物は core 側なので、
+インストールした dotcl では常にこちらだった。fasl でも運ぶようにしたが、
+**リストとしてではなく書かれたままのテキストとして**運ぶ — fasl には定数
+プールが無く、関数ごとにリストを組み立てる IL を起動時に走らせると、
+ほとんど誰も読まない情報のために毎回の起動が払う。`StoredLambdaList` に
+文字列のまま置き、`dotcl:function-lambda-list` が聞かれたときに 1 度だけ
+読み替える (移植可能なラムダリストは変数名が未 intern シンボルなので、
+読み戻しにパッケージが要らない)。
+
 **ANSI / SBCL との差分**: SBCL の FASL は machine-code を含むため
 プラットフォーム固有だが、dotcl の `.fasl` は IL のみで cross-platform。
 代わりに SBCL のような起動時のネイティブコード即実行はできず、
-load 時に CLR JIT が走る。実測 (ASDF を `.fasl` / `.sil` / `.lisp` で
-ロードした時間) で `.fasl` 0.73s / `.sil` 1.77s / `.lisp` 3.38s と
-`.fasl` が圧倒的に速い。
+load 時に CLR JIT が走る (上の R2R 兄弟はこの差を per-RID の追加成果物
+として埋める形で、`.fasl` 自体は OS・CPU 非依存のまま)。実測 (ASDF を
+`.fasl` / `.sil` / `.lisp` でロードした時間) で `.fasl` 0.73s /
+`.sil` 1.77s / `.lisp` 3.38s と `.fasl` が圧倒的に速い。
 
 ### 3.9 動的束縛 (special variables)
 
@@ -554,6 +635,17 @@ condition と .NET 例外は同じ機構に乗っているので、境界を越�
 | スレッド | ハンドラクラスタもリスタートもスレッドごと。ワーカースレッドには abort リスタートが無い |
 | 割り込み | Ctrl+C は `INTERACTIVE-INTERRUPT` として配送する |
 
+境界の実装側の規則が 2 つある。**内部の投機的な探索で signal しない**:
+`dotnet:make-generic-type` は与えられた名前のまま引き、失敗したら
+`` `N `` を足して引き直す、という当て推量をするが、その 1 回目が signal
+していると、**呼び出し側が頼んでいない探索でユーザの `handler-bind` が
+走る**。解決の本体は NIL を返す関数に分け、signal するのは本物の失敗だけに
+してある。もう 1 つは **interop の隙間に裸の `catch` を置かない**こと。
+dotcl は `return-from` の転送を例外として実装しているので、`catch { return
+null; }` は非局所脱出を飲む。上の当て推量はこの 2 つを同時に踏んでいて、
+「ハンドラは走ったのに脱出だけ消える」= テストが値は正しいのに abort 扱い、
+という形で 1 年近く原因不明のまま残っていた。
+
 **コールバック境界の既定は「透過」で、切り替えの設定は用意しない。**
 ホスト側 (ASP.NET Core のような) は例外を受け取れば自分の作法で扱う —
 実測では Lisp のエラーが 500 になり、サーバは生き続ける。ログして
@@ -586,11 +678,42 @@ default-initargs / shared-initialize / class slot のレイアウトに
 は `(eql X)` の cons で表現。クラス再定義は in-place 更新 + dependents
 の re-finalize。
 
-**ANSI / SBCL との差分**: ANSI 準拠。SBCL のような metaclass 階層を
-細かく実装する代わりに `IsBuiltIn` / `IsStructureClass` 等の flag
-で簡略化。dispatch cache は 1 エントリの IC のみ (SBCL は polymorphic
-inline cache + DAG)。Method combination は string registry ベースで
-基本的なものだけ提供。
+**AMOP 適合**: closer-mop の `features.lisp` が見る 95 項目のうち 94 を
+通す (残り 1 は dotcl のメソッドラムダが spread 形で、AMOP の 2 引数形
+ではないこと)。ここに至る過程で 2 種類の作業をした。
+
+1 つ目は **metaobject を実体にする**こと。EQL specializer は `(eql x)` の
+cons ではなく intern される `eql-specializer` オブジェクト (AMOP は EQL な
+2 つに同じ metaobject を返せと言う = `eq` で比べられる必要がある)。
+未定義の superclass の placeholder は `forward-referenced-class` を自分の
+クラスとして返す。`(make-instance 'standard-class ...)` でクラスが作れる
+(クラス生成が名前経由の `ensure-class` に寄っていて、この経路が無かった)。
+`funcallable-standard-class` のインスタンスは呼べて
+`set-funcallable-instance-function` が効く。利用者定義のメソッドクラスが
+足したスロットも読める。
+
+2 つ目は **プロトコル関数を総称関数に格上げ**すること
+(`compute-slots` / `compute-applicable-methods-using-classes` /
+`generic-function-method-class` / `compute-effective-method` /
+`make-method-lambda` / `compute-discriminating-function`)。既定メソッドは
+今の実装をそのまま呼ぶ。closer-mop は**プロトコル関数が総称関数である
+ことを前提にしている** (`only-standard-methods` が渡された関数それぞれに
+`generic-function-methods` を呼ぶ) ので、平の関数だとそこで落ちていた。
+
+呼び出しの側をプロトコルに通すかは**ゲートの置き方が要点**。常に
+`compute-applicable-methods` を通すとディスパッチキャッシュも arity 別の
+直接デリゲートも失う。ゲートを「プロトコル関数に既定以外のメソッドがあるか」
+にすると、**誰か一人が specialize した瞬間に image 内の全総称関数**が
+包まれて確保が増える (一度これをやって確保テストが鳴った)。正しい条件は
+「**この**総称関数に適用されるメソッドが既定以外か」で、静的 bool による
+早期棄却と 2 段にしてある。
+
+**ANSI / SBCL との差分**: ANSI 準拠。標準の metaobject は上記のとおり
+実体を持つが、built-in クラスと構造体クラスは SBCL のようなメタクラス
+階層ではなく `LispClass` の `IsBuiltIn` / `IsStructureClass` フラグで
+区別する。dispatch cache は 4 エントリの inline cache (SBCL は
+polymorphic inline cache + DAG)。Method combination は string registry
+ベースで基本的なものだけ提供。
 
 ### 3.13 マクロ / setf / LOOP
 
@@ -728,6 +851,43 @@ FullName specializer を焼けば常に正しく解決する。`dotnet:class-for
 この登録クラスを型 (`System.Type` or 型名) から直接引く公開 API で、閉じた
 ジェネリック型の長い assembly-qualified 名を綴らずに specializer を得られる。
 
+**NuGet 依存の宣言と解決 (contrib `nuget` / `dotcl-nuget-asdf`)**:
+`dotnet:require` (上記、nuget.org から直接 DL) とは別に、依存グラフごと
+解決する経路がある。`nuget:require` は 1 パッケージだけを
+`<PackageReference>` した使い捨て csproj に `dotnet build` を回し、
+**版統一済みの推移閉包**を出力ディレクトリに平らに並べてから、managed /
+RID 固有 native に分けてリゾルバに登録する (`project.assets.json` の形を
+追うより、ディレクトリを走査する方が追従点が少ない)。結果の置き場は
+4 段:
+
+1. **実行ファイルの隣** (`<app-dir>/nuget/<key>/`) — `dotcl pack --bundle`
+   が置く。あれば無条件にこれ。**指定が浮動版でも使う** (2 と規則が逆):
+   浮動は「今いちばん新しいもの」だが、インストール済みのプログラムが
+   それを確かめに行くべきではない
+2. **固定版**ならユーザキャッシュ (`nuget:cache-root`、fasl キャッシュの
+   兄弟に置いて「この OS でどこに書いてよいか」の答えを 2 つ持たない)
+3. **浮動版**は使い捨て temp (「最新」は変わりうるので跨いで再利用しない)
+4. 無ければ `dotnet build`。パッケージが NuGet のキャッシュに全部載って
+   いても 1.5〜2 秒かかる (ダウンロードではなく MSBuild の起動)
+
+宣言側は ASDF のコンポーネントクラス
+(`(:nuget "Id" :nuget-version "13.0.3")`)。`:depends-on` の文法は閉じた
+集合なので NuGet パッケージを綴る場所が無く、ASDF が用意している拡張点は
+コンポーネントクラスの方 (cffi-grovel が `:cffi-grovel-file` で使うのと
+同じ手)。**`:version` は使えない** — ASDF 自身のコンポーネント初期化引数で、
+`defsystem` が横取りして自分のバージョン文法に通すため、固定版は通って
+浮動版だけ黙って NIL に落ちるという最悪の形で壊れる。自前の
+`:nuget-version` にし、`:version` が書かれていたら error にする。
+
+「ファイルではないコンポーネント」は**出荷経路で 2 度消えた**: ASDF の
+連結は `cl-source-file` しか拾わないので `dotcl pack` では宣言が落ち、
+`dotcl build` は逆にコンポーネントのパス名を読もうとして落ちた。宣言を
+ソースに戻す (`system-nuget-preamble` が `nuget:require` の呼び出しを
+生成して連結単位の先頭に置く) ことで、出荷物が自分でパッケージを要求し、
+同梱 layout の中でそれを見つける形にしてある。同梱は **RID ごとに解決して
+RID ごとの bundle** に入れる — pack した機械の RID だけ入れると、残りの
+パッケージは起動時に `dotnet build` に戻る空手形になる。
+
 **ANSI / SBCL との差分**: ANSI 範囲外の dotcl 拡張。SBCL の CFFI が
 foreign function call に閉じているのに対し、dotcl の `dotnet:` は
 **CLR の同一型システム上で Lisp のクラスが定義される** ため、MAUI /
@@ -785,12 +945,23 @@ dotcl/
                assembler (Emitter/CilAssembler.cs と FaslAssembler.cs)、
                組み込み関数。機能別に Runtime.*.cs と LispObject 由来
                クラスに分割
-  contrib/     Lisp 製拡張置き場 (ASDF を中心に、雑多なモジュールを
-               含む — 公開向けの整理は未着手)
-  samples/     dotcl を host する .NET 統合サンプル (MauiLispDemo /
-               AspNetLispDemo / MonoGameLispDemo / McpServerDemo)
+  contrib/     同梱モジュール 16 本 (nuget / dotcl-nuget-asdf /
+               dotnet-class / dotnet-ffi / dotcl-thread / dotcl-socket /
+               dotcl-kestrel / dotcl-gray / dotcl-repl / dotcl-lsp-api /
+               advice / clrmd / decompiler / dotcl-cs / dotcl-float /
+               dotcl-jitdisasm)。1 ディレクトリ 1 モジュールで、
+               それぞれに README.md がある。`.asd` は require-system の
+               スタブなので、ASDF 経由と `require` 経由が同じ経路に
+               落ちる。ビルドが取り込む asdf/ と quicklisp/ もここに
+               置かれる (生成物でリポジトリには入らない)
+  samples/     dotcl を host する .NET 統合サンプル 8 本 (MauiLispDemo /
+               AspNetLispDemo / MonoGameLispDemo / McpServerDemo /
+               HotReloadDemo / PrecompiledLispDemo の 3 変種)。索引は
+               samples/README.md
   examples/    Lisp スニペット集 (Windows interop など)
-  docs/        windows.md ほか、トピック別の運用メモ
+  docs/        トピック別のガイド (libraries.md / dotcl-pack.md /
+               scripting.md / readytorun.md / windows.md ほか)。索引は
+               docs/README.md
   test/        regression/ (dotcl 固有回帰テスト)、framework.lisp
   Makefile     build オーケストレーション
   README.md    ユーザ向け入口
@@ -834,9 +1005,26 @@ dotcl/
   dotcl backend が動き、upstream に提出済み (`lem-project/micros#22`)。
   backtrace / frame-locals / source-location / eval-in-frame / arglist
   などの中核は実装済みで、xref 呼出グラフや stepping は未実装。
-  SLIME 本家の swank 側は未対応
+  SLIME 本家の swank 側は未対応。プロトコルに依らない側は contrib
+  `dotcl-lsp-api` に寄せてあり (カーソル位置の補完候補・リファレンス
+  URL・その名前が何か)、同梱 REPL の TAB 補完も同じ口を使う
 - **Step 10 (進行中)**: emit 無しで動く構成 (3.17)。netstandard2.0 /
   AOT 向けに、解釈経路とプリコンパイル済み FASL だけで CL を回す
+
+直近 2 リリースがどこに進んだか (利用者向けの記述は RELEASES.md):
+
+- **v0.1.27**: メタオブジェクトプロトコル (3.12)。closer-mop の
+  `features.lisp` が見る 95 項目のうち 94 で conform、deviate 0 / error 0 —
+  同じプローブで SBCL と並ぶ。このサイクルの開始時は 46 conforms /
+  32 deviates / 16 errors だった。ほかにコマンドラインの契約 (綴りを
+  間違えたフラグが黙って REPL にならず error になる)、スクリプトが自分の
+  引数を読めること、NuGet の解決が SDK の無い機械でも効き続けること
+- **v0.1.28**: load の速度 (3.8)。fasl のリテラルをデータ側に載せ、
+  R2R 兄弟を読むようにして、coalton の load が 33 秒から 10 秒になった。
+  ASDF システムが自分の NuGet 依存を宣言できるようになり (3.16)、
+  エディタが生きた image にカーソル下の名前を訊けるようになった。
+  規格側では FORMAT・パッケージ系・いくつかの列関数が、黙って通していた
+  壊れた入力を signal するようになっている (移行時の注意は RELEASES.md)
 
 未解決課題は GitHub Issues。
 

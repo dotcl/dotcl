@@ -25,11 +25,23 @@
 #
 # Usage: check.sh <repo-root>
 set -eu
+
+# A missing prerequisite is a convenience skip when this is run by hand, but in
+# CI a skip is indistinguishable from a pass: the gate quietly stops gating and
+# nothing in the log says so. DOTCL_CI=1 (set at the job level in
+# .github/workflows/ci.yml) makes it a failure instead.
+skip_or_fail() {
+  echo "$1"
+  if [ "${DOTCL_CI:-}" = "1" ]; then
+    echo "  DOTCL_CI=1: a skipped check counts as a failure here" >&2
+    exit 1
+  fi
+}
 ROOT="$(cd "${1%/}" && pwd)"
 win() { if command -v cygpath >/dev/null 2>&1; then cygpath -m "$1"; else echo "$1"; fi; }
 
 if [ ! -f "$ROOT/compiler/dotcl.core" ]; then
-  echo "  SKIP: compiler/dotcl.core not built (make compile-core-fasl)"
+  skip_or_fail "  SKIP: compiler/dotcl.core not built (make compile-core-fasl)"
   exit 0
 fi
 

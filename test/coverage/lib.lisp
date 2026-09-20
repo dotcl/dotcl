@@ -1,4 +1,4 @@
-;;; lib.lisp — the file whose coverage is measured. Deliberately only partly
+;;; lib.lisp: the file whose coverage is measured. Deliberately only partly
 ;;; exercised by driver.lisp, so the report has to tell covered from uncovered
 ;;; rather than just naming the file.
 (in-package :cl-user)

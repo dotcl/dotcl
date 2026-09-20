@@ -6,7 +6,7 @@
 ;;;
 ;;; %PUSH-RESTART-CLUSTER tested the spec's name with `pair.Car is Symbol`. NIL is
 ;;; its own class here rather than a Symbol, so that test was false and the
-;;; anonymous restart was DROPPED ENTIRELY — no error, it simply did not exist.
+;;; anonymous restart was DROPPED ENTIRELY: no error, it simply did not exist.
 ;;; COMPILE-RESTART-CASE emits the name as the string "NIL" and builds the
 ;;; LispRestart[] itself, so it never went through that code; only the interpreted
 ;;; path, which takes the macro expansion, was affected

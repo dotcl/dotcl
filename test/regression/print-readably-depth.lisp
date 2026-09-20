@@ -5,7 +5,7 @@
 ;;; It is the wrong answer under *PRINT-READABLY* T. CLHS 22.1.3 gives
 ;;; *print-readably* priority over everything that would lose information, and
 ;;; requires an error when readable output is impossible. Eliding produced a
-;;; SHORTER object that read back as something else — for a caller that stores
+;;; SHORTER object that read back as something else: for a caller that stores
 ;;; the representation and reads it later (a .fasl storing a literal), a silently
 ;;; wrong constant, or a read error far from the cause: a 1500-deep literal came
 ;;; back as the text "(...)", and loading it failed with "a token consisting
@@ -17,7 +17,7 @@
     (dotimes (i depth x)
       (setf x (list x)))))
 
-;;; Under *print-readably*, past the bound, an error — not a shortened string.
+;;; Under *print-readably*, past the bound, an error: not a shortened string.
 
 (deftest print-readably-deep-list-signals
   (handler-case
@@ -56,7 +56,7 @@
       (and (stringp s) (search "..." s) t)))
   t)
 
-;;; Depths within the bound print in full either way — the guard must not fire
+;;; Depths within the bound print in full either way: the guard must not fire
 ;;; early and turn an ordinary literal into an error.
 
 (deftest print-readably-shallow-round-trips

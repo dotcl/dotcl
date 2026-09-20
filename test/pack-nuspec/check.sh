@@ -6,17 +6,30 @@
 #   1. .asd metadata (:description / :homepage / :source-control / :author /
 #      :license) lands in the nuspec, and a README next to the .asd is packaged.
 #   2. Fields the app supplies neither in its .asd nor on the command line are
-#      DROPPED rather than inherited — a donor projectUrl / repository / tags /
+#      DROPPED rather than inherited: a donor projectUrl / repository / tags /
 #      copyright under a different package id is wrong attribution, not stale.
 #   3. NuGet's required fields (description, authors) are refused rather than
 #      inherited: packing without them fails, with a message naming both ways
 #      to supply them.
 #
-# Requires a directory of published dotcl packages (`make pack`). Skips — does
-# not fail — when they are absent, so the suite still runs on a fresh clone.
+# Requires a directory of published dotcl packages (`make pack`). Skips -- does
+# not fail -- when they are absent, so the suite still runs on a fresh clone,
+# unless DOTCL_CI=1 says this is CI, where a skip would be read as a pass.
 #
 # Usage: check.sh <repo-root> [from-dir]
 set -eu
+
+# A missing prerequisite is a convenience skip when this is run by hand, but in
+# CI a skip is indistinguishable from a pass: the gate quietly stops gating and
+# nothing in the log says so. DOTCL_CI=1 (set at the job level in
+# .github/workflows/ci.yml) makes it a failure instead.
+skip_or_fail() {
+  echo "$1"
+  if [ "${DOTCL_CI:-}" = "1" ]; then
+    echo "  DOTCL_CI=1: a skipped check counts as a failure here" >&2
+    exit 1
+  fi
+}
 ROOT="${1%/}"
 FROM="${2:-$ROOT/out}"
 RT="$ROOT/runtime/runtime.csproj"
@@ -27,18 +40,18 @@ for p in "$FROM"/dotcl.*.nupkg; do
   [ -e "$p" ] || continue
   # Only the pointer package is dotcl.<version>.nupkg; a RID package starts the
   # middle segment with the rid (dotcl.win-arm64.<version>.nupkg). Discriminate
-  # on "starts with a digit", the same rule PackRestamp.InferDotclVersion uses —
+  # on "starts with a digit", the same rule PackRestamp.InferDotclVersion uses;
   # the version itself contains dots, so counting them does not work.
   b="${p##*/}"; b="${b#dotcl.}"; b="${b%.nupkg}"
   case "$b" in [0-9]*) ;; *) continue ;; esac
   ver="$b"
 done
 if [ -z "$ver" ]; then
-  echo "SKIP: no dotcl.<version>.nupkg in $FROM (run 'make pack' first)"
+  skip_or_fail "SKIP: no dotcl.<version>.nupkg in $FROM (run 'make pack' first)"
   exit 0
 fi
 if [ ! -f "$CORE" ]; then
-  echo "SKIP: $CORE missing (run 'make pack' or 'make compile-core-fasl' first)"
+  skip_or_fail "SKIP: $CORE missing (run 'make pack' or 'make compile-core-fasl' first)"
   exit 0
 fi
 echo "=== donor: dotcl $ver from $FROM ==="

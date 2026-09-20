@@ -1,5 +1,5 @@
 ;;;; Differential test: %mini-eval (tree-walk interpreter) vs eval (compiler).
-;;;; The compiler is the oracle — for each form, the interpreted result must
+;;;; The compiler is the oracle: for each form, the interpreted result must
 ;;;; EQUAL the compiled result (or both must signal an error). This validates
 ;;;; the emit-free evaluator that will back eval on AOT/IL2CPP/ns2.0 targets.
 ;;;; Run: dotnet run ... -- --asm compiler/cil-out.sil test/interp/diff.lisp
@@ -84,7 +84,7 @@
   (ignore-errors (+ 1 2))
   ;; KNOWN LIMITATION (not asserted): (ignore-errors (error "x")) returns the
   ;; condition as a 2nd value when compiled; the interpreter currently returns
-  ;; only the primary NIL — multiple values are dropped when a handler does a
+  ;; only the primary NIL: multiple values are dropped when a handler does a
   ;; non-local exit through the native Signal frame. Primary value is correct.
   ;; handler-bind that declines -> propagates to outer handler-case
   (handler-case
@@ -232,7 +232,7 @@
   (keywordp :foo)
   ;; intern / gensym omitted here: stateful, and the harness evaluates each form
   ;; twice (compiled then interpreted), so the second call legitimately sees
-  ;; different state — not a differential signal.
+  ;; different state: not a differential signal.
   (find-symbol "CAR" :cl)
   (symbol-package 'car)
   ;; --- strings ---
@@ -294,7 +294,7 @@
   (handler-case (values 1 2) (:no-error (a b) (+ a b)))
   (handler-case (error "e") (error () :err) (:no-error (v) v))
   ;; (ignore-errors's 2nd value is a fresh condition object each eval, so it is
-  ;; not equalp across the two runs — verified separately that interp returns
+  ;; not equalp across the two runs: verified separately that interp returns
   ;; (NIL <condition>) like the compiler.
   (with-simple-restart (skip "skip it") (invoke-restart 'skip))
   ;; --- lambda-list edges: &aux, supplied-p, ((:kw var) ...) ---
@@ -344,7 +344,7 @@
   ;;     defstruct setf accessor.
   ;; (define-setf-expander + same-unit (setf (dmid ...)) is intentionally NOT here:
   ;;  the compiler expands the setf at COMPILE time, before the expander is
-  ;;  registered at load time, so it errors — a legitimate compile/runtime ordering
+  ;;  registered at load time, so it errors: a legitimate compile/runtime ordering
   ;;  difference, not an interpreter bug. The interpreter evaluates sequentially and
   ;;  handles it; verified separately.)
   (progn (deftype dsmall () '(integer 0 9))
@@ -390,7 +390,7 @@
   (coerce 1 'double-float)
   (the integer (+ 2 3))
   (typep #c(1 2) '(complex integer))
-  ;; --- advanced loop clauses (expand to tagbody/go — stress interp) ---
+  ;; --- advanced loop clauses (expand to tagbody/go: stress interp) ---
   (loop named outer for i from 0 do (when (= i 3) (return-from outer i)))
   (loop for x in '(1 3 5 8) thereis (and (evenp x) x))
   (loop for x in '(2 4 6) always (evenp x))
@@ -434,7 +434,7 @@
   (flet ((g (n) (when (> n 0) (return-from g :pos)) :nonpos)) (list (g 5) (g -1)))
   (labels ((rec (n acc) (if (zerop n) (return-from rec acc) (rec (1- n) (+ acc n))))) (rec 5 0))
   (macrolet ((m (n) (if (zerop n) 0 `(+ ,n (m ,(1- n)))))) (m 5))
-  ;; NOTE: two shadowing cases are intentionally excluded — the interpreter is
+  ;; NOTE: two shadowing cases are intentionally excluded: the interpreter is
   ;; ANSI-correct but the COMPILER (the oracle) is wrong, so they cannot use
   ;; compiler-as-oracle. Tracked as a separate compiler bug:
   ;;   (flet ((lst ...)) (macrolet ((lst ...)) (lst 1 2)))   ; macrolet must shadow flet

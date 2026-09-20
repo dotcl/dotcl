@@ -2,7 +2,7 @@
 ;;;
 ;;; It used to answer NIL: LOAD wrapped the source in a plain StringReader while
 ;;; COMPILE-FILE wrapped it in a position-tracking one. A reader macro that
-;;; records source locations then had NIL where an offset belongs — eclector does
+;;; records source locations then had NIL where an offset belongs: eclector does
 ;;; this, and so does coalton (whose reader macro runs its entire front end), so
 ;;; every coalton form in a LOADed file died with "Not a number: NIL" while the
 ;;; same file went through COMPILE-FILE fine. The asymmetry is what made it look

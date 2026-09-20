@@ -36,7 +36,7 @@ with that name, and `ToString` overrides the one on `System.Object`.
 ```
 
 The supers list names the base class. A type name is either a **string**, used
-verbatim, or a **symbol**, looked up in `dotnet:*type-aliases*` — a table of
+verbatim, or a **symbol**, looked up in `dotnet:*type-aliases*`; a table of
 common BCL short names. An unknown symbol is an error at expansion time, so a
 typo does not survive to run time. Add your own:
 
@@ -55,14 +55,25 @@ typo does not survive to run time. Add your own:
 | `(:properties ("Name" Type [:notify t]))` | a property with a backing field |
 | `(:events ("Name" DelegateType) ...)` | a private delegate field plus the `add_`/`remove_` pair |
 | `(:implements IFoo IBar)` | interface implementations |
-| `(:attributes ("System.ObsoleteAttribute" "message"))` | attributes on the type |
+| `(:attributes ("System.ObsoleteAttribute" "message" :diagnostic-id "X1"))` | attributes on the type |
 
 In a method spec the name is a string, the parameters are symbols bound as
 lexical variables in the body, and the body is an implicit `progn` whose last
 value is converted to the declared return type (`Void` discards it).
 
+An attribute spec is `(type-name constructor-arg... :member value...)`. The
+arguments before the first keyword go to the attribute's constructor; from the
+first keyword on, each pair names a settable property or a public field. Most
+.NET attributes are shaped that way: a short constructor plus named properties.
+So `[Service(Name = "Worker")]` is written `("Android.App.ServiceAttribute"
+:name "Worker")`. A member name matches case-insensitively with dashes removed,
+so `:main-launcher`, `:mainlauncher` and `"MainLauncher"` all reach
+`MainLauncher`. Naming a read-only property, or one that does not exist, is an
+error rather than a silent omission. The same spec shape works in a method's
+`:attributes` option.
+
 `:override t` after `:returns` emits the method as an override of a matching
-virtual method on the base hierarchy — that is how `ToString` above replaces
+virtual method on the base hierarchy; that is how `ToString` above replaces
 `System.Object`'s.
 
 A method whose name and signature match a declared interface is emitted as that
@@ -73,7 +84,7 @@ matching event. `:notify t` on a property then makes its setter raise
 
 ### Parameters the caller reads back (`ref` / `out`)
 
-A parameter type ending in `&` is by-reference — the spelling .NET itself uses,
+A parameter type ending in `&` is by-reference, the spelling .NET itself uses,
 so `"System.Int32&"` is C#'s `ref int`. A Lisp function is called with values, so
 such a parameter arrives as a **cell**: read it with `dotnet:deref`, and whatever
 the body leaves in it is what the caller sees after the call. Leaving it alone
@@ -103,8 +114,8 @@ forwards to the base constructor:
 ```
 
 This is what makes constructor injection work: a class defined this way is
-constructed by `ActivatorUtilities.CreateInstance` — the mechanism ASP.NET uses
-for controllers — with the registered service passed to the constructor. See
+constructed by `ActivatorUtilities.CreateInstance`, the mechanism ASP.NET uses
+for controllers, with the registered service passed to the constructor. See
 [`samples/AspNetLispDemo`](../samples/AspNetLispDemo) for that in place.
 
 ## Where the type lives
@@ -121,7 +132,7 @@ from the moment the form is evaluated. Two consequences worth knowing:
 
 Emitting a type needs run-time code generation, so `define-class` is not
 available where that is forbidden (NativeAOT, IL2CPP, the browser). Precompiled
-Lisp still runs there — see [Using libraries](libraries.md) and the
+Lisp still runs there; see [Using libraries](libraries.md) and the
 `PrecompiledLispDemo*` samples.
 
 ## Producing a .dll for C# to reference
@@ -140,6 +151,6 @@ same clause syntax as `define-class`, plus `:module` (a static-function holder),
     (:functions ("Square" ((x Int32)) :returns Int32 (* x x)))))
 ```
 
-Enums, constant holders and field-only structs come out **standalone** — pure
-metadata with no reference to `DotCL.Runtime` — so a consumer that only touches
+Enums, constant holders and field-only structs come out **standalone**, pure
+metadata with no reference to `DotCL.Runtime`, so a consumer that only touches
 those needs nothing from dotcl at run time.

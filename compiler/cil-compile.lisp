@@ -1,12 +1,12 @@
-;;; cil-compile.lisp — Portable driver for Lisp CIL compiler (A2)
+;;; cil-compile.lisp: Portable driver for Lisp CIL compiler (A2)
 ;;;
 ;;; Usage:
 ;;;   DOTCL_INPUTS="f1.lisp f2.lisp" DOTCL_OUTPUT="out.sil" sbcl --load cil-compile.lisp
 ;;;   DOTCL_INPUTS="f1.lisp f2.lisp" DOTCL_OUTPUT="out.sil" ros run --load cil-compile.lisp
 ;;;
 ;;; Environment variables:
-;;;   DOTCL_INPUTS  — space-separated list of input .lisp files
-;;;   DOTCL_OUTPUT  — output file path
+;;;   DOTCL_INPUTS, space-separated list of input .lisp files
+;;;   DOTCL_OUTPUT, output file path
 
 ;; In dotcl, the compiler is already loaded from the core (.sil file).
 ;; Reloading would create symbol identity conflicts between the cross-compiled
@@ -22,8 +22,8 @@
 
 ;; Self-host: in a running dotcl the compiler's names are split across two
 ;; packages. Its functions are registered under the source package name
-;; (DOTCL.CIL-COMPILER), but every symbol the compiled code handles as data — a
-;; special variable it reads, a key it looks up — resolves through Startup.Sym,
+;; (DOTCL.CIL-COMPILER), but every symbol the compiled code handles as data, a
+;; special variable it reads, a key it looks up, resolves through Startup.Sym,
 ;; which interns into DOTCL-INTERNAL. Reading the compiler's own sources back in
 ;; produces the DOTCL.CIL-COMPILER half, so a form like (%getenv "X") is a
 ;; different symbol from the DOTCL-INTERNAL::%GETENV that keys the intrinsic
@@ -32,7 +32,7 @@
 ;; Bridge the halves before anything is read: for each name, keep whichever
 ;; symbol actually carries a binding and make the other package see that same
 ;; object. A name that already carries a function or value in the source package
-;; (COMPILE-EXPR and the rest of the compiler) is left alone — that is where its
+;; (COMPILE-EXPR and the rest of the compiler) is left alone: that is where its
 ;; definition lives.
 #+dotcl
 (let ((core (find-package "DOTCL-INTERNAL"))
@@ -191,7 +191,7 @@
     ;; image (package DOTCL-INTERNAL), not the sources this driver's package
     ;; names. Setting only our own flag leaves the real compiler in run-time
     ;; mode, where it plants load-time xref registrations and keeps literals as
-    ;; live objects — neither of which a .sil file can carry.
+    ;; live objects: neither of which a .sil file can carry.
     #+dotcl
     (let* ((pkg (find-package "DOTCL-INTERNAL"))
            (sym (and pkg (find-symbol "*CROSS-COMPILING*" pkg))))
@@ -203,7 +203,7 @@
     ;; forms nested in one giant PROGN), locals/labels stay segment-scoped, and
     ;; the peak cost of assembling or JITting the toplevel is per segment.
     ;; Segments never span files, so file order and per-file scoping hold.
-    ;; Loading order is unchanged — the segments run in sequence.
+    ;; Loading order is unchanged: the segments run in sequence.
     (let* ((chunk (let ((s (portable-getenv "DOTCL_SEG_FORMS")))
                     (if (and s (> (length s) 0))
                         (parse-integer s)

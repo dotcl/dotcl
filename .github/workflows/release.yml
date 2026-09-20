@@ -11,7 +11,7 @@ defaults:
     shell: bash
 
 jobs:
-  # ── Job 1: run regression tests (subset of CI) ──────────────────────────
+  # -- Job 1: build smoke (the test suites gate in ci.yml, not here) -------
   test:
     runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 15
@@ -31,17 +31,29 @@ jobs:
           curl -L https://raw.githubusercontent.com/roswell/roswell/master/scripts/install-for-ci.sh | bash
           echo "$HOME/.roswell/bin" >> $GITHUB_PATH
 
-      # Build smoke only. Regression + ANSI already gated on every master push
-      # (ci.yml) and locally before tagging; re-running the full regression here
-      # is redundant. Tags are cut from validated local state, so this job just
-      # confirms the release artifacts still cross-compile + build on ubuntu.
+      # Build smoke only: no test suite runs in this job, despite what its name
+      # used to say.
+      #
+      # Regression really is gated on every master push: ci.yml runs the compiled,
+      # interpreted and emit-free suites regardless of RUN_FULL, so re-running them
+      # here would be redundant.
+      #
+      # ANSI is NOT. ci.yml guards it with `if: env.RUN_FULL == 'true'`, which is
+      # false for an internal push (RUN_FULL is only the public mirror or the
+      # nightly schedule), and even when it does run the step ends in `|| true` so
+      # a failure cannot turn the build red. What actually stands between a
+      # regression and a tag is the local `make test-ansi-full` the release
+      # checklist requires at step 1b: a human running a command, not CI.
+      #
+      # So this job confirms one thing: the release artifacts still cross-compile
+      # and build on ubuntu.
       - name: Cross-compile
         run: make cross-compile
 
       - name: Build
         run: make build
 
-  # ── Job 2: build nupkg + tbz and create GitHub Release ──────────────────
+  # -- Job 2: build nupkg + tbz and create GitHub Release ------------------
   release:
     needs: test
     runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
@@ -71,98 +83,47 @@ jobs:
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
             echo "VERSION=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
           else
-            # workflow_dispatch on a branch — use a sentinel version so pack
+            # workflow_dispatch on a branch: use a sentinel version so pack
             # produces a recognisably-not-a-real-release artifact.
             echo "VERSION=0.0.0-dispatch" >> "$GITHUB_OUTPUT"
           fi
 
-      # ── Compiler SIL output ──────────────────────────────────────────────
+      # -- Compiler SIL output ----------------------------------------------
       - name: Cross-compile (generate cil-out.sil)
         run: make cross-compile
 
-      # ── FASL artifacts ───────────────────────────────────────────────────
-      # compile-core-fasl: cil-out.sil → compiler/dotcl.core (PE assembly)
-      - name: Compile core FASL
-        run: make compile-core-fasl
-
-      # compile-asdf-fasl: contrib/asdf/asdf.lisp → contrib/asdf/asdf.fasl
-      - name: Compile asdf FASL
-        run: make compile-asdf-fasl
-
-      # contrib-dotcl-cs: publish Roslyn helper DLL into contrib/dotcl-cs/lib/
-      - name: Build dotcl-cs contrib
-        run: make contrib-dotcl-cs
-
-      # ── R2R (ReadyToRun) FASL artifacts ──────────────────────────────────
-      # crossgen2 the core / asdf / contrib fasls per RID so the tbz distribution
-      # ships pre-native FASLs (cold RunCore ~3.37s → ~50ms). crossgen2
-      # cross-compiles from the ubuntu host for every target RID. Runs before the
-      # contrib staging below so the <name>.fasl.r2r-<rid> land in runtime/contrib.
-      - name: Compile R2R FASLs (per RID)
-        run: make compile-core-fasl-r2r-all compile-asdf-fasl-r2r-all compile-contrib-fasls-r2r-all
-
-      # ── Stage runtime/contrib/ (mirrors the pack target) ─────────────────
-      - name: Stage contrib for packing
-        run: |
-          rm -rf runtime/contrib
-          cp compiler/dotcl.core runtime/dotcl.core
-          mkdir -p runtime/contrib/asdf
-          cp -r contrib/*/ runtime/contrib/
-          rm -f runtime/contrib/asdf/asdf.lisp runtime/contrib/asdf/asdf.sil
-          rm -rf runtime/contrib/dotcl-cs/bin runtime/contrib/dotcl-cs/obj
-          rm -f runtime/contrib/dotcl-cs/*.csproj runtime/contrib/dotcl-cs/*.cs
-          cp contrib/asdf/asdf.fasl runtime/contrib/asdf/asdf.fasl
-
-      # ── dotnet pack: base pointer + per-RID R2R tool packages in one pass ──
-      # Mirror `make pack`: stage all 6 desktop R2R cores at runtime/ top level and run
-      # ONE `dotnet pack` over the desktop RID list + `any`. That single pack emits the
-      # base pointer (a DotnetToolSettings.xml, path per SDK) enumerating EVERY listed
-      # RID PLUS a dotcl.<rid> R2R package each, so `dotnet tool install -g dotcl` selects
-      # the host's fast (~0.16s) R2R build. The old `-p:RuntimeIdentifiers=any` override
-      # listed only `any` in the pointer, so installs fell back to the slow (~1.8s) non-R2R
-      # `any` build and the per-RID R2R packages were orphaned. PublishReadyToRun
-      # defaults to true in the csproj (R2R applies per-RID; `any` stays IL). android RIDs
-      # are intentionally excluded here (release deferral).
+      # -- Pack: one `make pack`, the same recipe used locally --------------
+      # `make pack` owns the whole chain: the core / asdf / contrib FASLs, the
+      # per-RID crossgen2 R2R siblings, staging runtime/contrib/ and the per-RID
+      # cores at runtime/ top level, the in-process MSBuild task, both packs, and
+      # the cleanup afterwards. Those steps used to be copied into this file one
+      # by one; the copy went stale when the R2R artifacts were renamed, and since
+      # nothing before a tag exercises this path, the break only surfaced after
+      # the tag was pushed. One recipe, one caller.
+      #
+      # The single multi-RID pack emits the base pointer (a DotnetToolSettings.xml
+      # enumerating EVERY listed RID) plus a dotcl.<rid> R2R package each, so
+      # `dotnet tool install -g dotcl` selects the host's fast (~0.16s) R2R build.
+      # An earlier `-p:RuntimeIdentifiers=any` override listed only `any` in the
+      # pointer, so installs fell back to the slow (~1.8s) non-R2R `any` build and
+      # the per-RID R2R packages were orphaned.
+      #
+      # The version goes through PACK_VERSION, never as -p:Version in PACK_ARGS:
+      # PACK_ARGS reaches the tool pack only, and the library pack that follows
+      # would rewrite the shared output at the un-overridden version: leaving a
+      # runtime.dll that demands one DotCL.Runtime version next to a
+      # DotCL.Runtime.dll that claims another. DotclToolNoAndroid rewrites
+      # <RuntimeIdentifiers> to the 6 desktop RIDs + `any` inside the project
+      # (android is excluded here, release deferral); a ;-list cannot be passed
+      # on the command line (bare ; -> MSB1006, %3B -> NETSDK1083 single-RID).
       - name: Pack NuGet packages
         run: |
           mkdir -p out
-          for rid in win-x64 win-arm64 linux-x64 linux-arm64 osx-x64 osx-arm64; do
-            cp compiler/dotcl.core.r2r-$rid runtime/dotcl.core.r2r-$rid
-            cp contrib/asdf/asdf.fasl.r2r-$rid runtime/asdf.fasl.r2r-$rid
-          done
-          # asdf is the one contrib whose R2R copy is overlaid from runtime/ top level
-          # (ReplaceFaslsWithR2R reads asdf.fasl.r2r-<rid>), so its copies under
-          # contrib/asdf/ are dead weight in every package. The other contribs keep
-          # their per-RID R2R here: the csproj drops the cross-RID ones and adds back
-          # the RID being packed.
-          rm -f runtime/contrib/asdf/asdf.fasl.r2r-*
-          # Exclude android via the csproj's DotclToolNoAndroid hook — it rewrites
-          # <RuntimeIdentifiers> to the 6 desktop RIDs + `any` inside the project. A
-          # ;-list cannot be passed as a command-line -p:RuntimeIdentifiers (bare ; ->
-          # MSB1006; %3B -> NETSDK1083 single-RID), so the flag carries the intent and
-          # the literal list lives in XML.
-          dotnet pack runtime/runtime.csproj \
-            --configuration Release \
-            -o out/ \
-            -p:Version=${{ steps.version.outputs.VERSION }} \
-            -p:DotclToolNoAndroid=true
-          # Drop the staged per-RID cores; the tbz publish below stages its own (from
-          # compiler/), so runtime/ should be clean of them first.
-          for rid in win-x64 win-arm64 linux-x64 linux-arm64 osx-x64 osx-arm64; do
-            rm -f runtime/dotcl.core.r2r-$rid runtime/asdf.fasl.r2r-$rid
-          done
-          # Build the in-process project-core MSBuild task FIRST so the library
-          # pack bundles tasks/DotCL.Build.Tasks.dll. DotCL.Runtime.csproj
-          # includes it with Condition="Exists(...)", so if the task is not built
-          # the pack silently omits it and ships a broken project-core build
-          # (MSB4036 for <DotclProjectAsd> consumers — was the 0.1.12 regression).
-          dotnet build runtime/build-tasks/DotCL.Build.Tasks.csproj --configuration Release
-          dotnet pack runtime/DotCL.Runtime.csproj \
-            --configuration Release \
-            -o out/ \
-            -p:Version=${{ steps.version.outputs.VERSION }}
+          make pack \
+            PACK_VERSION=${{ steps.version.outputs.VERSION }} \
+            PACK_ARGS=-p:DotclToolNoAndroid=true
 
-      # ── Pack DotCL.Sdk (MSBuild SDK) + dotcl-app templates ───────────────
+      # -- Pack DotCL.Sdk (MSBuild SDK) + dotcl-app templates ---------------
       # The flagship developer experience: `dotnet new dotcl-app` (template) and
       # `<Project Sdk="DotCL.Sdk">` (build/F5-debug). Both reference the runtime
       # version stamped into Sdk.props / template.json by `make set-version`, kept
@@ -179,7 +140,7 @@ jobs:
             -o out/ \
             -p:Version=${{ steps.version.outputs.VERSION }}
 
-      # ── Guard: fail the release if the project-core task didn't get bundled ──
+      # -- Guard: fail the release if the project-core task didn't get bundled --
       - name: Verify project-core task is bundled
         run: |
           VER=${{ steps.version.outputs.VERSION }}
@@ -192,7 +153,7 @@ jobs:
             exit 1
           fi
 
-      # ── Guard: the base tool pointer must enumerate every per-RID package ──
+      # -- Guard: the base tool pointer must enumerate every per-RID package --
       # If it lists only `any`, `dotnet tool install -g dotcl` picks the slow non-R2R
       # build and the per-RID R2R packages are orphaned. Fail the release loudly.
       - name: Verify tool pointer enumerates all RIDs
@@ -207,7 +168,7 @@ jobs:
           # this guard cares about is the RID list, not the path. Find the entry.
           entry=$(unzip -Z1 "$nupkg" | grep -E '(^|/)DotnetToolSettings\.xml$' | head -1)
           if [ -z "$entry" ]; then
-            echo "ERROR: $nupkg carries no DotnetToolSettings.xml — not a tool pointer package"
+            echo "ERROR: $nupkg carries no DotnetToolSettings.xml; not a tool pointer package"
             unzip -Z1 "$nupkg"
             exit 1
           fi
@@ -222,9 +183,9 @@ jobs:
             echo "$xml"
             exit 1
           fi
-          echo "OK: pointer ($entry) enumerates all desktop RIDs — R2R install works"
+          echo "OK: pointer ($entry) enumerates all desktop RIDs; R2R install works"
 
-      # ── Guard: no package may carry another RID's R2R payload ────────────
+      # -- Guard: no package may carry another RID's R2R payload ------------
       # One pack pass emits every package from a staging dir that holds all six
       # RIDs' R2R fasls, so a filtering mistake is invisible until someone lists
       # a published nupkg (0.1.23 and 0.1.24 shipped 70 stray files / 22 MB each).
@@ -241,9 +202,9 @@ jobs:
             fi
             # `any` is framework-dependent: it must carry no R2R payload at all.
             if [ "$rid" = any ]; then
-              stray=$(unzip -Z1 "$nupkg" | grep -- '\.r2r-' || true)
+              stray=$(unzip -Z1 "$nupkg" | grep -E -- '\.r2r-|-r2r-' || true)
             else
-              stray=$(unzip -Z1 "$nupkg" | grep -- '\.r2r-' | grep -v -- "\.r2r-$rid$" || true)
+              stray=$(unzip -Z1 "$nupkg" | grep -E -- '\.r2r-|-r2r-' | grep -v -- "\.r2r-$rid$" || true)
             fi
             if [ -n "$stray" ]; then
               echo "ERROR: $nupkg carries R2R payload belonging to other RIDs:"
@@ -255,12 +216,12 @@ jobs:
           done
           [ "$fail" = 0 ] || exit 1
 
-      # (The per-RID R2R tool nupkgs — dotcl.<rid> — are now produced by the single
+      # (The per-RID R2R tool nupkgs, dotcl.<rid>, are now produced by the single
       #  multi-RID `dotnet pack` in "Pack NuGet packages" above, together with a base
       #  pointer that enumerates every RID. A separate per-RID `-p:RuntimeIdentifier=$rid`
       #  loop is no longer needed and would only duplicate those packages.)
 
-      # ── Per-RID tbz for Roswell (R2R) ────────────────────────────────────
+      # -- Per-RID tbz for Roswell (R2R) ------------------------------------
       # dotnet publish -r <rid> --self-contained false cross-compiles on Linux
       # for all 6 RIDs. PublishReadyToRun=true crossgens the runtime assembly to
       # native; dotcl.core / asdf.fasl are injected as the per-RID R2R FASLs, and
@@ -292,7 +253,7 @@ jobs:
               echo "ERROR: $rid payload nests a second contrib tree under contrib/contrib"
               exit 1
             fi
-            stray=$(find out/publish-$rid -name '*.r2r-*' ! -name "*.r2r-$rid")
+            stray=$(find out/publish-$rid \( -name '*.r2r-*' -o -name '*-r2r-*' \) ! -name "*.r2r-$rid")
             if [ -n "$stray" ]; then
               echo "ERROR: $rid payload carries cross-RID R2R artifacts:"
               echo "$stray"
@@ -304,13 +265,13 @@ jobs:
             rm -rf out/publish-$rid
           done
 
-      # ── Clean up staged runtime files ────────────────────────────────────
+      # -- Clean up staged runtime files ------------------------------------
       - name: Clean staged artifacts from runtime/
         run: |
           rm -f runtime/dotcl.core
           rm -rf runtime/contrib
 
-      # ── Create GitHub Release and upload nupkg + tbz ─────────────────────
+      # -- Create GitHub Release and upload nupkg + tbz ---------------------
       # Tag push only. Skipped for workflow_dispatch (manual / experiment).
       - name: Create GitHub Release
         if: github.event_name == 'push'

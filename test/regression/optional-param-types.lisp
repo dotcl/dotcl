@@ -1,7 +1,7 @@
 ;;; Regression tests: type declarations on &optional/&key parameters must be
 ;;; visible during the defun ANALYSIS pass. The macroexpansion cache shares one
 ;;; expansion between analysis and code-gen, and dotimes consults
-;;; fixnum-typed-p on its count form at expansion time — if the analysis pass
+;;; fixnum-typed-p on its count form at expansion time: if the analysis pass
 ;;; reported optional params as unbound, the cached expansion lacked the
 ;;; fixnum declaration and the whole native loop/aref path silently died for
 ;;; any (&optional (size N)) function (the cl-bench array benchmarks' shape).

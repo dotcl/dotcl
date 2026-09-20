@@ -40,7 +40,7 @@
   :hooked t)
 
 ;; Local macrolet expanders (reified environment tables) go through the hook
-;; too — dotcl-cltl2:macroexpand-all drives macroexpand-1 with such tables.
+;; too: dotcl-cltl2:macroexpand-all drives macroexpand-1 with such tables.
 (deftest macroexpand-hook.counted-through-walker
   (let ((count 0))
     (let ((*macroexpand-hook*

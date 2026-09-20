@@ -9,22 +9,22 @@ using DotCL.Emitter;
 namespace DotCL.Contrib.DotclCs;
 
 /// <summary>
-/// In-memory C# → CIL S-expression disassembler, backing the dotcl-cs
+/// In-memory C# -> CIL S-expression disassembler, backing the dotcl-cs
 /// contrib. Replaces the previous dotnet-CLI-subprocess path (runtime's
 /// CsBuilder.cs, removed in C2).
 ///
 /// Compile flow:
 ///   CSharpSyntaxTree.ParseText(body)
-///     → CSharpCompilation.Create(... dynamic library ...).Emit(MemoryStream)
-///     → Assembly.Load(bytes)
-///     → first public static method → IlDisasm.DisassembleMethod
+///     -> CSharpCompilation.Create(... dynamic library ...).Emit(MemoryStream)
+///     -> Assembly.Load(bytes)
+///     -> first public static method -> IlDisasm.DisassembleMethod
 ///
 /// No temp files, no subprocess. ~50ms warm per call (was ~2.7s via dotnet
 /// build CLI).
 /// </summary>
 public static class RoslynCompiler
 {
-    // Cached — trusted references for "normal" C# inline snippets.
+    // Cached: trusted references for "normal" C# inline snippets.
     // Minimal: mscorlib so the typical `System.Math.Sin` etc. resolves.
     private static MetadataReference[]? _references;
 
@@ -33,7 +33,7 @@ public static class RoslynCompiler
         if (_references != null) return _references;
         // Pull references from every assembly currently loaded that has a
         // non-dynamic Location. Good enough for user snippets that reference
-        // System.* types — and covers the DotCL runtime too if a snippet ever
+        // System.* types: and covers the DotCL runtime too if a snippet ever
         // wants to interop there.
         var refs = new List<MetadataReference>();
         foreach (var a in AppDomain.CurrentDomain.GetAssemblies())

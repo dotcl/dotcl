@@ -7,7 +7,7 @@
 ;;; is deliberately permissive: it answers macros with their macro-function and
 ;;; special operators with a stub that dies when called. So on the interpreted
 ;;; path
-;;;   (funcall 'progn 1)       → ERROR "Cannot call special operator PROGN"
+;;;   (funcall 'progn 1)       -> ERROR "Cannot call special operator PROGN"
 ;;;   (funcall 'defconstant x) => PROGRAM-ERROR (the MACRO's arity mismatch)
 ;;; and neither the condition type nor the CELL-ERROR-NAME matched
 ;;; (ansi-test FUNCALL.ERROR.1 / .2 / .3).

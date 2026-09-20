@@ -70,7 +70,7 @@ var app = builder.Build();
 app.MapControllers();
 
 // Async endpoint (Task-producing side). The Lisp `async-hello` returns a
-// .NET Task<LispObject> built by (dotcl:async ...) — it awaits a real Task.Delay
+// .NET Task<LispObject> built by (dotcl:async ...): it awaits a real Task.Delay
 // off the request thread, then yields a value. We await that Task here and write
 // its (string) result, so the request completes without a thread blocked on the
 // delay. This is the Minimal-API trampoline the README flagged as the lighter

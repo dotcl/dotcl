@@ -2,7 +2,7 @@
 ;;; index expression is statically fixnum-typed, the compiler lowers indices
 ;;; as raw int64 and calls the Runtime.*L variants. The fast path only covers
 ;;; plain (non-displaced, non-bit) LispVectors; everything else must re-box
-;;; and defer to the generic path with identical behavior — these tests pin
+;;; and defer to the generic path with identical behavior: these tests pin
 ;;; that equivalence, plus bounds behavior and evaluation order.
 
 ;;; ---- basic reads/writes with fixnum-typed indices ----
@@ -46,7 +46,7 @@
   (%nai-3d 5)
   231)
 
-;; svref with a typed index. (Compare as a list — EQUAL doesn't descend vectors.)
+;; svref with a typed index. (Compare as a list: EQUAL doesn't descend vectors.)
 (deftest nai-svref
   (let ((v (vector 10 20 30)))
     (dotimes (i 3)
@@ -72,7 +72,7 @@
 
 ;;; ---- fallback equivalence: exotic arrays with typed indices ----
 
-;; Displaced array: fast path must reject and defer — reads/writes go
+;; Displaced array: fast path must reject and defer: reads/writes go
 ;; through to the underlying array.
 (deftest nai-displaced
   (let* ((base (make-array 10 :initial-element 0))

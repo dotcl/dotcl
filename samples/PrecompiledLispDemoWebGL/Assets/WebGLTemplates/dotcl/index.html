@@ -34,23 +34,23 @@
 </head>
 <body>
   <header>
-    <b>dotcl</b> — Common Lisp on .NET, running in your browser via
+    <b>dotcl</b>; Common Lisp on .NET, running in your browser via
     <b>Unity IL2CPP / WebGL</b>. <span>Precompiled Lisp draws the curve; type Lisp
-    below to change it live — emit-free, no server, no recompile.</span>
+    below to change it live; emit-free, no server, no recompile.</span>
   </header>
   <div id="wrap">
     <canvas id="unity-canvas" width="600" height="600" tabindex="-1"></canvas>
     <div id="side">
       <pre id="dotcl-out"></pre>
       <div id="row">
-        <textarea id="dotcl-in" rows="2" placeholder="(setf *fx* 7)   — type any Lisp; Enter evaluates, Shift+Enter inserts a newline"
+        <textarea id="dotcl-in" rows="2" placeholder="(setf *fx* 7); type any Lisp; Enter evaluates, Shift+Enter inserts a newline"
                   autocomplete="off" spellcheck="false" disabled></textarea>
         <button id="dotcl-eval" disabled>Eval</button>
       </div>
       <div class="hint">try:
-        <code data-x="(setf *fx* 7)">(setf *fx* 7)</code> ·
-        <code data-x="(setf *amp* 0.5)">(setf *amp* 0.5)</code> ·
-        <code data-x="(setf *spin* 4)">(setf *spin* 4)</code> ·
+        <code data-x="(setf *fx* 7)">(setf *fx* 7)</code> &middot;
+        <code data-x="(setf *amp* 0.5)">(setf *amp* 0.5)</code> &middot;
+        <code data-x="(setf *spin* 4)">(setf *spin* 4)</code> &middot;
         <code data-x="(defun px (i n tick) (* *amp* (cos (* *fx* (/ (* 2 pi i) n)))))">redefine px</code>
       </div>
     </div>

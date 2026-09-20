@@ -1,5 +1,5 @@
 ;;; Regression: an inlined body compiles at the call site under the CALLER's
-;;; tail/TCO context — and that inheritance is load-bearing, not incidental.
+;;; tail/TCO context: and that inheritance is load-bearing, not incidental.
 ;;; A call in tail position stays a tail of the caller after inlining, so a
 ;;; tail call back to the enclosing function inside the inlined body must ride
 ;;; the caller's TCO loop (deep recursion survives), and the inlined tail form
@@ -30,7 +30,7 @@
 (deftest itp-inline-nontail (itp-f3 5) (5 :END))
 
 ;; A self-call of the inlinee inside its own inlined body is refused by the
-;; inlining stack and must compile as a normal call to the inlinee — not
+;; inlining stack and must compile as a normal call to the inlinee; not
 ;; match the enclosing function's TCO loop.
 (declaim (inline itp-g4))
 (defun itp-g4 (x) (if (<= x 0) 0 (+ 1 (itp-g4 (- x 1)))))

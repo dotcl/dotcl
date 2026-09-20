@@ -1,4 +1,4 @@
-;;; xref (who-calls) — the compiler records caller→callee edges for every
+;;; xref (who-calls): the compiler records caller->callee edges for every
 ;;; named call and #'name reference while a defun body compiles, and plants a
 ;;; load-time registration so the table also rebuilds on fasl load.
 ;;; dotcl:who-calls returns callers of a name; dotcl:who-is-called-by returns

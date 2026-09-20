@@ -10,7 +10,7 @@
     <RootNamespace>DotCL.Contrib.DotclCs</RootNamespace>
     <!-- Don't pollute the runtime's PackAsTool metadata -->
     <PackAsTool>false</PackAsTool>
-    <!-- We ship only Roslyn + our helper DLL via lib/ — the runtime DLL is
+    <!-- We ship only Roslyn + our helper DLL via lib/; the runtime DLL is
          already in the tool package, so suppress its copy. -->
     <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
     <!-- Keep only English satellite resources; Roslyn ships translations in

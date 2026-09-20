@@ -17,7 +17,7 @@ public class SlotDefinition : LispObject
     /// <summary>Writer names: a symbol for :writer, the list (SETF name) for :accessor.</summary>
     public LispObject[] Writers { get; set; } = Array.Empty<LispObject>();
 
-    /// <summary>The slot's declared :type, T when unspecified. Introspection only —
+    /// <summary>The slot's declared :type, T when unspecified. Introspection only;
     /// dotcl does not check slot values against it.</summary>
     public LispObject SlotType { get; set; } = T.Instance;
 
@@ -114,7 +114,7 @@ public class LispClass : LispObject
     /// <summary>Serializes (re)definition of THIS class. FinalizeClass mutates the
     /// class's non-concurrent caches (SlotIndex, InitargToSlotIndex, EffectiveSlots,
     /// CPL); under set-parallel-eval two threads re-defining the same class name
-    /// concurrently otherwise corrupt those Dictionaries. Cold path — taken
+    /// concurrently otherwise corrupt those Dictionaries. Cold path: taken
     /// only during defclass/ensure-class, never during dispatch or make-instance.</summary>
     internal readonly object DefLock = new();
     /// <summary>True for built-in classes (BUILT-IN-CLASS metaclass). False for user-defined (STANDARD-CLASS).</summary>
@@ -125,7 +125,7 @@ public class LispClass : LispObject
     public bool IsDotNetInterface { get; set; }
     /// <summary>The .NET type this class stands for, or null for an ordinary Lisp
     /// class. Dispatch consults it for the assignabilities a class precedence list
-    /// cannot enumerate — a variant generic (List&lt;String&gt; is an
+    /// cannot enumerate: a variant generic (List&lt;String&gt; is an
     /// IEnumerable&lt;Object&gt;) would need every instantiation of every supertype
     /// of every type argument spelled out.</summary>
     public System.Type? DotNetType { get; set; }
@@ -150,7 +150,7 @@ public class LispClass : LispObject
     /// hot path, so parallel make-instance / setf slot-value on the same class write
     /// concurrently. Usage is TryGetValue/indexer only (no lock; hot path).</summary>
     public System.Collections.Concurrent.ConcurrentDictionary<string, LispObject?> ClassSlotValues { get; } = new();
-    /// <summary>Slot values this class holds as an instance of its (custom) metaclass —
+    /// <summary>Slot values this class holds as an instance of its (custom) metaclass;
     /// i.e. slots the metaclass adds beyond STANDARD-CLASS. Null until populated.
     /// Lets slot-value on a class metaobject read metaclass-defined slots,
     /// mirroring SlotDefinition.ExtraSlots.
@@ -184,7 +184,7 @@ public class LispClass : LispObject
     /// When false, the fast make-instance path must be skipped.</summary>
     private bool? _canUseFastPath;
     /// <summary>Cached class prototype (AMOP class-prototype): a single per-class
-    /// instance reused across calls. Must be stable — define-presentation-method
+    /// instance reused across calls. Must be stable: define-presentation-method
     /// (McCLIM) and other code dispatch via (eql class-prototype), which only
     /// works if the same object is returned every time. Lazily created.</summary>
     private LispInstance? _prototype;
@@ -225,7 +225,7 @@ public class LispClass : LispObject
         // race here: the old code assigned the empty Dictionary to the shared
         // field first and populated it afterwards, so a concurrent reader (or a
         // second builder) mutated/read a half-built non-concurrent Dictionary and
-        // tripped ".NET: concurrent update corrupted its state" — the flaky
+        // tripped ".NET: concurrent update corrupted its state": the flaky
         // parallel-eval/mop crash. With publish-when-complete a reader sees
         // either null (and harmlessly rebuilds an identical map) or a complete,
         // thereafter-immutable map. Matches the CachedValidInitargKeys builder.
@@ -285,7 +285,7 @@ public class LispClass : LispObject
             // until somebody has specialised it.
             if (Runtime.ComputeSlotsHook?.Invoke(this) is { } requested)
                 EffectiveSlots = requested;
-            _initargSlotMap = null; // invalidate cached initarg→slot mapping
+            _initargSlotMap = null; // invalidate cached initarg->slot mapping
             _canUseFastPath = null;
             CachedHasCustomInitMethods = null;
             CachedIsConditionClass = null;
@@ -331,7 +331,7 @@ public class LispClass : LispObject
             SimpleInitChecked = false;
             SharedInitSimpleChecked = false;
         }
-        // Slot layout may have changed — invalidate any call-site reader inline caches
+        // Slot layout may have changed: invalidate any call-site reader inline caches
         // that snapshotted this class's old (class, index) pair.
         GenericFunction.BumpMethodEpoch();
     }
@@ -444,7 +444,7 @@ public class LispClass : LispObject
                     }
                 }
                 // No placed class has any candidate as a direct super (only happens
-                // for the very first pick, which is this class) — take the first.
+                // for the very first pick, which is this class): take the first.
                 if (chosen == null)
                     chosen = candidates[0];
             }
@@ -481,7 +481,7 @@ public class LispClass : LispObject
                 if (seenInitargs.Add(ia.Name))
                     allInitargs.Add(ia);
 
-        // Most specific initform (first one that has it) — the thunk that runs and
+        // Most specific initform (first one that has it): the thunk that runs and
         // the source form that AMOP reports come from the same slot definition.
         LispFunction? initform = null;
         LispObject initformSource = Nil.Instance;
@@ -502,7 +502,7 @@ public class LispClass : LispObject
         LispObject slotType = T.Instance;
         foreach (var d in defs)
         {
-            // "No :type given" is T.Instance, which is not a Symbol — checking
+            // "No :type given" is T.Instance, which is not a Symbol: checking
             // only for the symbol T made every subclass slot look type-specific.
             if (d.SlotType is T || (d.SlotType is Symbol s && s.Name == "T")) continue;
             slotType = d.SlotType;
@@ -602,7 +602,7 @@ public sealed class LispInstance : LispObject
     // instance by key, later references (emitted with a Nil form) look it up.
     public static void PreRegisterIntern(string key, LispInstance inst)
     {
-        // intentionally empty — see note above
+        // intentionally empty: see note above
     }
 
     /// <summary>FASL load-time: evaluate make-load-form creation form once and cache by key.</summary>
@@ -610,7 +610,7 @@ public sealed class LispInstance : LispObject
     {
         if (_internCache.TryGetValue(key, out var existing))
             return existing;
-        // Nil means "just look up" — the creation form ran in its own top-level method
+        // Nil means "just look up": the creation form ran in its own top-level method
         // earlier in this same fasl, so a miss is not a legitimate state. Reporting it
         // beats the old silent Nil.Instance, which turned a lost literal into a wrong
         // value that surfaced far away from the cause.
@@ -743,16 +743,16 @@ internal class CachedDispatch
     /// (see the DispatchGF cache-store comment), so each entry's EQL specializer is
     /// at argument position 0.</summary>
     public LispMethod[]? EqlMethods;
-    /// <summary>EqlMethods[i]'s EQL value (precomputed — the hit path compares the
+    /// <summary>EqlMethods[i]'s EQL value (precomputed: the hit path compares the
     /// argument against this directly instead of re-walking the specializer cons).</summary>
     public LispObject[]? EqlValues;
     /// <summary>Precomputed effective primary chain for EqlMethods[i]:
-    /// [EqlMethods[i], ..non-EQL primaries..] — avoids a per-hit list allocation.</summary>
+    /// [EqlMethods[i], ..non-EQL primaries..]: avoids a per-hit list allocation.</summary>
     public List<LispMethod>[]? EqlChains;
 
     /// <summary>Specialized standard slot READER. When >= 0, the single
     /// applicable method is an accessor reader for the instance-allocated slot at this
-    /// index in ArgTypes[0]'s layout — no before/after/around/eql, standard metaclass.
+    /// index in ArgTypes[0]'s layout: no before/after/around/eql, standard metaclass.
     /// The hit path reads the slot directly (SlotValueDirect), skipping effective-method
     /// construction and the reader lambda call. -1 = not a specialized reader.</summary>
     public int ReaderSlotIndex = -1;
@@ -762,7 +762,7 @@ internal class CachedDispatch
 
     /// <summary>Specialized standard slot WRITER ((setf accessor)). When
     /// >= 0, the single applicable method is an accessor writer for the instance-
-    /// allocated slot at this index in the OBJECT's layout — object is the last required
+    /// allocated slot at this index in the OBJECT's layout: object is the last required
     /// arg (args[1] for a 2-arg setf writer), new value is args[0], no aux/eql, standard
     /// metaclass. The hit path writes the slot directly (SetSlotValueDirect). -1 = not
     /// a specialized writer.</summary>
@@ -821,7 +821,7 @@ internal class CachedDispatch
 /// any class re-layout bumps the epoch and forces a miss + re-resolve.</summary>
 public sealed class ReaderCache
 {
-    /// <summary>The accessor name — used to (re)resolve the GF on a miss.</summary>
+    /// <summary>The accessor name: used to (re)resolve the GF on a miss.</summary>
     internal readonly Symbol Sym;
     internal volatile Entry? E;
     public ReaderCache(Symbol sym) { Sym = sym; }
@@ -838,12 +838,12 @@ public sealed class ReaderCache
 /// <summary>The writer twin of <see cref="ReaderCache"/>: a per-call-site monomorphic
 /// inline cache for a simple slot writer, baked once per <c>(setf (accessor obj) v)</c>
 /// call site and read/filled by <see cref="Runtime.WriterIC"/>. Same publication and
-/// soundness rules — an immutable <see cref="Entry"/> published through the volatile
+/// soundness rules: an immutable <see cref="Entry"/> published through the volatile
 /// <see cref="E"/> field, invalidated wholesale by a <see cref="GenericFunction.MethodEpoch"/>
 /// bump (defmethod on the writer, class re-layout).</summary>
 public sealed class WriterCache
 {
-    /// <summary>The accessor name — the (SETF name) function is re-resolved from it on a miss.</summary>
+    /// <summary>The accessor name: the (SETF name) function is re-resolved from it on a miss.</summary>
     internal readonly Symbol Sym;
     internal volatile Entry? E;
     public WriterCache(Symbol sym) { Sym = sym; }
@@ -889,7 +889,7 @@ public class GenericFunction : LispFunction
     // it), while mutations (ADD-METHOD / REMOVE-METHOD / defgeneric-inline clear)
     // build a new array under `MethodsLock` and atomically publish it via the
     // volatile field. A plain List<T> here let concurrent enumerate-vs-Add corrupt
-    // the applicable-method set → spurious "CALL-NEXT-METHOD: no next method".
+    // the applicable-method set -> spurious "CALL-NEXT-METHOD: no next method".
     private readonly object _methodsLock = new();
     private volatile LispMethod[] _methods = System.Array.Empty<LispMethod>();
     /// <summary>Read-only snapshot of the GF's methods. Enumeration is consistent:
@@ -948,8 +948,8 @@ public class GenericFunction : LispFunction
     public bool LambdaListInfoSet { get; set; }
     /// <summary>The placeholder lambda list rebuilt from the arity when no real one
     /// was given, kept so repeated calls answer the same list. The parameter names
-    /// in it are fresh uninterned symbols — that is deliberate, since dotcl does not
-    /// keep the source names — but rebuilding it per call made
+    /// in it are fresh uninterned symbols, that is deliberate, since dotcl does not
+    /// keep the source names, but rebuilding it per call made
     /// (equal (generic-function-lambda-list g) (generic-function-lambda-list g))
     /// false, which no caller expects.</summary>
     internal LispObject? PlaceholderLambdaList;
@@ -966,7 +966,7 @@ public class GenericFunction : LispFunction
     /// <summary>N-way polymorphic dispatch cache. An immutable array of recent
     /// successful dispatches (most-recent first), swapped atomically via this `volatile`
     /// field so a concurrent InvalidateCache (defmethod) / cache-fill publishes a
-    /// complete snapshot — a reader never sees a torn array, worst case a complete but
+    /// complete snapshot: a reader never sees a torn array, worst case a complete but
     /// slightly stale one. Bounded to <see cref="DispatchCacheWidth"/> entries: a call
     /// site that cycles through up to that many argument-class combinations stays warm,
     /// where the old single-entry monomorphic cache missed on every alternation.</summary>
@@ -986,7 +986,7 @@ public class GenericFunction : LispFunction
     internal static volatile int MethodEpoch;
     internal static void BumpMethodEpoch() => System.Threading.Interlocked.Increment(ref MethodEpoch);
 
-    /// <summary>Non-null iff this GF is a PURE simple slot reader — every
+    /// <summary>Non-null iff this GF is a PURE simple slot reader: every
     /// method is an unqualified defclass-generated accessor reader for a slot of this
     /// (common) name, no user/aux methods. Then a call site can read the slot directly
     /// via Runtime.ReaderFast, skipping the whole dispatch. Cleared (null) the moment any

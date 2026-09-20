@@ -21,7 +21,7 @@ public sealed class ProcessStreamReader : System.IO.TextReader
 
     /// <summary>Drain one or more child readers into a single shared buffer. Passing
     /// both stdout and stderr merges them into one stream (uiop's
-    /// :error-output :output — send stderr to the same place as stdout). True EOF is
+    /// :error-output :output: send stderr to the same place as stdout). True EOF is
     /// reported only once every producer has drained to end.</summary>
     public ProcessStreamReader(System.Diagnostics.Process proc, params System.IO.TextReader[] inners)
     {
@@ -41,7 +41,7 @@ public sealed class ProcessStreamReader : System.IO.TextReader
                         lock (_lock) { _buf.Append(chunk, 0, n); System.Threading.Monitor.PulseAll(_lock); }
                     }
                 }
-                catch { /* pipe closed/broken — treat as EOF */ }
+                catch { /* pipe closed/broken; treat as EOF */ }
                 finally
                 {
                     lock (_lock) { if (--_pending <= 0) _eof = true; System.Threading.Monitor.PulseAll(_lock); }
@@ -162,7 +162,7 @@ public sealed class LispProcess : LispObject
     /// <summary>Spawn PROGRAM with ARGUMENTS, wiring stdin/stdout/stderr per the
     /// given redirection specs. File dispositions are validated up front so errors
     /// surface synchronously (before the child runs), as the other implementations rely on.
-    /// NOTE: character streams only — :element-type (unsigned-byte 8) is not yet handled.</summary>
+    /// NOTE: character streams only: :element-type (unsigned-byte 8) is not yet handled.</summary>
     public static LispProcess Launch(
         string program, System.Collections.Generic.List<string> arguments, string? directory,
         LispObject input, LispObject output, LispObject error,
@@ -193,7 +193,7 @@ public sealed class LispProcess : LispObject
             // sb-ext:run-program :environment semantics: the "VAR=value" list
             // REPLACES the child's entire environment (psi.Environment starts as a
             // copy of the parent's, so clear it first). A null list means the key
-            // was omitted — inherit the parent environment unchanged.
+            // was omitted: inherit the parent environment unchanged.
             psi.Environment.Clear();
             foreach (var kv in environment)
             {

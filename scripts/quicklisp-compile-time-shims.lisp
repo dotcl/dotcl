@@ -2,13 +2,13 @@
 ;;;; Emitted between the client's package.lisp and its remaining components.
 ;;;;
 ;;;; The client is normally built by ASDF with :serial t, where each file is
-;;;; LOADed before the next is compiled — so a plain toplevel DEFVAR in file N
+;;;; LOADed before the next is compiled: so a plain toplevel DEFVAR in file N
 ;;;; already has its value when file N+1 is macroexpanded. Concatenating the
 ;;;; components into one COMPILE-FILE removes that: toplevel forms get compiled,
 ;;;; not executed, and a macro expander that reads such a variable at expansion
 ;;;; time finds it unbound.
 ;;;;
-;;;; ql-impl:definterface is the one expander that does this — it records each
+;;;; ql-impl:definterface is the one expander that does this: it records each
 ;;;; interface in *interfaces* while expanding. Binding the variable here, at
 ;;;; compile time, is enough: the client's own
 ;;;;

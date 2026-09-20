@@ -1,10 +1,10 @@
-;;; DEFSTRUCT :conc-name — an explicitly supplied prefix always builds a NEW
+;;; DEFSTRUCT :conc-name: an explicitly supplied prefix always builds a NEW
 ;;; accessor name and interns it in *PACKAGE*, even when the prefix is the empty
 ;;; string. Only a missing/NIL argument makes the accessor the slot symbol
 ;;; itself. dotcl conflated the two (both were treated as "accessor = slot
 ;;; symbol"), so (:conc-name "") on a slot named other-pkg::a defined the
 ;;; accessor in OTHER-PKG. Calls then only worked because the unqualified
-;;; call-site bridge found the foreign symbol — the ansi-test structures-02
+;;; call-site bridge found the foreign symbol: the ansi-test structures-02
 ;;; cases (struct-test-36) leaned on exactly that.
 
 (deftest defstruct-conc-name.empty-string-interns-in-current-package

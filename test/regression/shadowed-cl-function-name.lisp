@@ -3,8 +3,8 @@
 ;;;
 ;;; Bug: an unqualified compiled call emits (:load-sym-fn NAME PKG), and
 ;;; Startup.SymFn resolved NAME against the CL package BEFORE the call site's
-;;; own package. Any name CL also has — and CL has FIRST, REST, NTH, CONSP,
-;;; SECOND, ATOM, NULL, UNION, … — therefore reached the CL function, and the
+;;; own package. Any name CL also has, and CL has FIRST, REST, NTH, CONSP,
+;;; SECOND, ATOM, NULL, UNION, ..., therefore reached the CL function, and the
 ;;; package's own definition was unreachable from inside that package. The
 ;;; symbol's function cell was set correctly, so (symbol-function 'pkg::nth)
 ;;; returned the right function while (nth ...) and #'nth did not: the call
@@ -51,7 +51,7 @@
         (funcall (symbol-function 'scfn::first) '(a b)))
   (:scfn-nth :scfn-first))
 
-;;; The CL functions themselves are untouched — the shadowing package's
+;;; The CL functions themselves are untouched: the shadowing package's
 ;;; definitions must not leak into calls that name the CL symbols.
 (deftest-compiled-only shadowed-cl-function-name.cl-functions-unaffected
   (list (nth 1 '(a b)) (first '(a b)) (consp '(a))

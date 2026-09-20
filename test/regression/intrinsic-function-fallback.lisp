@@ -2,15 +2,15 @@
 ;;;
 ;;; An intrinsic is an entry in the compiler's form-handler table: the compiler
 ;;; lowers the call to IL directly and never looks for a function. The
-;;; interpreter has no such table — it evaluates the expansion as an ordinary
-;;; call — so an intrinsic with no function binding is an "Undefined function"
+;;; interpreter has no such table, it evaluates the expansion as an ordinary
+;;; call, so an intrinsic with no function binding is an "Undefined function"
 ;;; the moment any macro that expands into it is interpreted. That interpreter is
 ;;; the ONLY evaluator on an emit-free build, which is what AOT and WebGL ship.
 ;;;
 ;;; It has bitten twice: %FIXNUM-GE-OBJECT (added with the DOTIMES counter work,
 ;;; broke every interpreted DOTIMES) and %GETENV (used by the compiler's own
-;;; source). Both were found late — one by CI on another lane's commit, one by
-;;; reading — so this checks the whole table at once instead.
+;;; source). Both were found late, one by CI on another lane's commit, one by
+;;; reading, so this checks the whole table at once instead.
 ;;;
 ;;; The allowlist below is for intrinsics the interpreter handles by name in
 ;;; %MINI-EVAL because a function binding cannot work: their arguments are not

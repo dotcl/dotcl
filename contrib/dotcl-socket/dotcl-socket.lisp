@@ -1,14 +1,14 @@
-;;; dotcl-socket.lisp — TCP socket support for dotcl
+;;; dotcl-socket.lisp: TCP socket support for dotcl
 ;;;
 ;;; Usage: (require "dotcl-socket")
 ;;;
 ;;; Provides DOTCL-SOCKET package with:
-;;;   make-server-socket host port &key backlog → server-socket (LispDotNetObject)
-;;;   socket-accept server-socket → bidirectional-stream
-;;;   local-port server-socket → integer
-;;;   socket-close socket-or-server-socket → t
-;;;   socket-connect host port → bidirectional-stream
-;;;   socket-stream socket → bidirectional-stream
+;;;   make-server-socket host port &key backlog -> server-socket (LispDotNetObject)
+;;;   socket-accept server-socket -> bidirectional-stream
+;;;   local-port server-socket -> integer
+;;;   socket-close socket-or-server-socket -> t
+;;;   socket-connect host port -> bidirectional-stream
+;;;   socket-stream socket -> bidirectional-stream
 
 (defpackage :dotcl-socket
   (:use :cl)

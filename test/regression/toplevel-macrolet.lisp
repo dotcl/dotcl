@@ -2,7 +2,7 @@
 ;;; forms (CLHS 3.2.3.1), with the local macros and declarations still in effect.
 ;;;
 ;;; The flattener descended PROGN, EVAL-WHEN and LOCALLY but stopped at these two,
-;;; so a whole MACROLET body stayed one form and compiled into one method — the
+;;; so a whole MACROLET body stayed one form and compiled into one method; the
 ;;; same failure LOCALLY had (a file that puts a few hundred definitions inside one
 ;;; top level MACROLET produced multi-MB of IL in a single method, JITted at load).
 ;;; These tests pin the semantics the splitting must not disturb.
@@ -40,7 +40,7 @@
   *tl-ml-c*
   105)
 
-;;; Declarations between the bindings and the body survive the split — each form
+;;; Declarations between the bindings and the body survive the split; each form
 ;;; is re-wrapped carrying them.
 (macrolet ((%tl-ml-get (name) `(symbol-value ',name)))
   (declare (special *tl-ml-d*))

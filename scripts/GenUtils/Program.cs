@@ -1,4 +1,4 @@
-// gen-utils — code generation utilities for dotcl build
+// gen-utils: code generation utilities for dotcl build
 // Usage:
 //   gen-utils download   <url> <output-file>
 //   gen-utils char-names <ucd-file> <output-cs-file>
@@ -21,7 +21,7 @@ static async Task<int> CmdDownload(string[] args)
     using var client = new HttpClient();
     var text = await client.GetStringAsync(url);
     File.WriteAllText(path, text, Encoding.UTF8);
-    Console.WriteLine($"Wrote {new FileInfo(path).Length / 1024}KB → {path}");
+    Console.WriteLine($"Wrote {new FileInfo(path).Length / 1024}KB -> {path}");
     return 0;
 }
 

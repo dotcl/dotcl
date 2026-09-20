@@ -2,11 +2,11 @@
 ;;;
 ;;; A call to a global function used to resolve the callee's name through
 ;;; Startup.SymFn on EVERY call. SymFn memoizes, but its key is
-;;; name + "\0" + package — a string allocated and hashed per call. Each emitted
+;;; name + "\0" + package: a string allocated and hashed per call. Each emitted
 ;;; call site now carries its own cache cell, filled on first execution.
 ;;;
 ;;; Contract: resolution still happens at RUNTIME and a MISS IS NOT PINNED.
-;;; Concretely — a call site compiled before its callee exists must pick the
+;;; Concretely: a call site compiled before its callee exists must pick the
 ;;; callee up once it is defined, and redefinition must always be observed.
 
 ;;; ---- a miss is not pinned ----

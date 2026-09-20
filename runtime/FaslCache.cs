@@ -102,7 +102,7 @@ public static class FaslCache
     /// <summary>
     /// The `dotcl clean` subcommand. Removes the per-build cache directories and
     /// reports what went. KEEPPREFIX, when given, spares the directories whose name
-    /// starts with it — "dotcl-{this build's version}-", so --keep-current does not
+    /// starts with it: "dotcl-{this build's version}-", so --keep-current does not
     /// force the next start to recompile. A prefix rather than an exact name: the
     /// OS/architecture suffix is ASDF's to spell, and the version alone (which
     /// carries the commit) already identifies the build.
@@ -157,7 +157,7 @@ public static class FaslCache
 
     /// <summary>
     /// Lisp entry points, for the regression tests: (dotcl::%fasl-cache-root) and
-    /// (dotcl::%fasl-cache-entries root) — the second so a test can point the
+    /// (dotcl::%fasl-cache-entries root): the second so a test can point the
     /// selection rule at a directory it built itself instead of the user's cache.
     /// </summary>
     public static LispObject FaslCacheRoot(LispObject[] args)

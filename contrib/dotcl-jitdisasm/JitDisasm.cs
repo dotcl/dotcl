@@ -116,7 +116,7 @@ public static class JitDisasmContrib
         }
     }
 
-    // Register name. wantSp=true → reg 31 prints as "sp" (base/dest in add/ldr/str),
+    // Register name. wantSp=true -> reg 31 prints as "sp" (base/dest in add/ldr/str),
     // otherwise reg 31 is the zero register.
     private static string Areg(uint n, bool is64, bool wantSp = false)
         => n == 31 ? (wantSp ? "sp" : (is64 ? "xzr" : "wzr")) : (is64 ? "x" : "w") + n;
@@ -195,7 +195,7 @@ public static class JitDisasmContrib
             string mn = (sub ? "sub" : "add") + (s ? "s" : "");
             return $"{mn} {Areg(rd, is64)}, {Areg(rn, is64)}, {Areg(rm, is64)}";
         }
-        // --- logical shifted register (orr → mov alias) ---
+        // --- logical shifted register (orr -> mov alias) ---
         if ((w & 0x7F200000u) == 0x2A000000u) // orr (shifted reg)
         {
             bool is64 = (w & 0x80000000u) != 0;

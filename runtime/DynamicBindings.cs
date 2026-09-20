@@ -194,7 +194,7 @@ public static class DynamicBindings
     /// <summary>
     /// Snapshot the current thread's dynamic bindings so they can be re-installed on
     /// another thread (used when a .NET callback / async continuation must run with
-    /// the specials that were in effect where it was registered — see Runtime.DotNet).
+    /// the specials that were in effect where it was registered: see Runtime.DotNet).
     /// NOT used for MAKE-THREAD: new Lisp threads deliberately do not inherit bindings.
     /// Scans from top; first occurrence of each symbol is the effective binding.
     /// </summary>
@@ -230,7 +230,7 @@ public static class DynamicBindings
 
     /// <summary>
     /// The bindings currently on this thread's stack, innermost first, as
-    /// (symbol, value, depth) — for the debugger, which shows what specials are
+    /// (symbol, value, depth): for the debugger, which shows what specials are
     /// in effect and (via DEPTH) which of them a given frame established.
     ///
     /// Every binding is listed, not just the effective one per symbol: a shadowed

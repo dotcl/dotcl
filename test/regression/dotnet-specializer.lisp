@@ -75,7 +75,7 @@
 
 ;;; .NET generic variance. List<String> implements IEnumerable<String>, and
 ;;; IEnumerable<out T> is covariant, so the CLR says it is also an
-;;; IEnumerable<Object> — an assignability no class precedence list can
+;;; IEnumerable<Object>: an assignability no class precedence list can
 ;;; enumerate (it would need every instantiation over every supertype of every
 ;;; type argument). Dispatch asks the CLR for the specializers a generic
 ;;; function actually has, and ranks such a match just ahead of T.

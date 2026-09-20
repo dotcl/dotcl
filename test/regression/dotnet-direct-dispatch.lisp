@@ -1,4 +1,4 @@
-;;; Typed direct-callvirt codegen — direct dispatch for a known-typed dotnet:invoke.
+;;; Typed direct-callvirt codegen: direct dispatch for a known-typed dotnet:invoke.
 ;;; %dotnet-call-direct emits a direct callvirt to the resolved .NET method (no
 ;;; runtime InvokeMember / member lookup). Shape:
 ;;;   (%dotnet-call-direct "Type.FullName" "Method" (param-type-strings...) recv arg...)
@@ -112,7 +112,7 @@
   4)
 
 (deftest direct-surface-box-mixed-with-the
-  ;; Receiver via THE, argument via BOX — both recognized.
+  ;; Receiver via THE, argument via BOX: both recognized.
   (let ((sb (dotnet:new "System.Text.StringBuilder")))
     (dotnet:invoke (the (dotnet "System.Text.StringBuilder") sb) "Append"
                    (dotnet:box "xy" "System.String"))

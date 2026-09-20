@@ -1,4 +1,4 @@
-# McpServerDemo — dotcl as an MCP tool
+# McpServerDemo: dotcl as an MCP tool
 
 A minimal sample that exposes dotcl (Common Lisp on .NET) as a **Model Context
 Protocol** server. When Claude Desktop / Cursor / any MCP client calls
@@ -10,7 +10,7 @@ think with", directly.
 
 ## Exposed tool
 
-- **`lisp_eval(code)`** — takes Common Lisp source and returns
+- **`lisp_eval(code)`**: takes Common Lisp source and returns
   `(prin1-to-string (progn <code>))`. Side effects such as DEFUN / DEFVAR are
   session-persistent (they live as long as the server process does).
 
@@ -51,14 +51,14 @@ In a Claude Desktop conversation:
 
 > Evaluate (+ 1 2 3 4 5) with dotcl
 
-→ Claude calls `lisp_eval` and `"15"` comes back.
+-> Claude calls `lisp_eval` and `"15"` comes back.
 
 DEFUN works too:
 
 > Evaluate (defun fact (n) (if (<= n 1) 1 (* n (fact (- n 1))))),
 > then evaluate (fact 10)
 
-→ the first call defines fact, the second returns `"3628800"`.
+-> the first call defines fact, the second returns `"3628800"`.
 
 ## Implementation notes
 

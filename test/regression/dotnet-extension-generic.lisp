@@ -3,7 +3,7 @@
 ;;; Only single-type-parameter extension methods used to resolve, so LINQ's
 ;;; Select<TSource,TResult> was uncallable: TResult cannot be inferred from a Lisp
 ;;; closure (it has no return type). Type parameters that the receiver does not
-;;; determine now default to System.Object, which keeps such methods callable —
+;;; determine now default to System.Object, which keeps such methods callable;
 ;;; values come back to Lisp unwrapped anyway.
 ;;;
 ;;; Overload choice also has to respect the Lisp function's arity: Select and Where
@@ -90,7 +90,7 @@
                                (dneg-ints 1 2 3) (lambda (x) (* x 10))))
   (10 20 30))
 
-;;; …but only from the class that declares it: naming an unrelated type must not
+;;; ...but only from the class that declares it: naming an unrelated type must not
 ;;; reach Enumerable's method.
 (deftest dneg-static-generic-does-not-cross-classes
   (handler-case (progn (dotnet:static "System.Math" "Select"

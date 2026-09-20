@@ -1,7 +1,7 @@
 ;;; A malformed class spec is an error in the program's structure, so it has to
 ;;; reach the caller as PROGRAM-ERROR. The builder rejects these with C#
 ;;; ArgumentException (42 sites), and the entry point used to wrap them in a
-;;; plain ERROR — which no (handler-case ... (program-error ...)) catches, and
+;;; plain ERROR: which no (handler-case ... (program-error ...)) catches, and
 ;;; which nothing else about the message distinguishes from a genuine runtime
 ;;; failure.
 ;;;
@@ -32,7 +32,7 @@
                                         ("M" () :returns "System.Int32" 2)))))
   (t nil))
 
-;;; A well-formed spec still defines its class — the mapping must not swallow
+;;; A well-formed spec still defines its class: the mapping must not swallow
 ;;; anything that was working.
 
 (dotnet:define-class "DcseTest.Ok" ()

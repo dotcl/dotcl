@@ -16,7 +16,7 @@ public class FaslAssembler
 {
     // Writing a .fasl needs PersistedAssemblyBuilder, which is .NET 9+. On an
     // older target framework the whole implementation below compiles out and
-    // these fields are left declared but never written — which is exactly what
+    // these fields are left declared but never written: which is exactly what
     // CS0649 / CS0169 report. Keeping the declarations (rather than guarding
     // them too) keeps the class shape identical across target frameworks, so
     // only the assignments move.
@@ -44,7 +44,7 @@ public class FaslAssembler
     private string? _debugSourcePath;
     // Project build over a concatenated unit: (startLine, path) per source file,
     // where startLine is the file's first line within the concat. Non-null selects
-    // multi-document PDB — each method is attributed to the file its body came from
+    // multi-document PDB: each method is attributed to the file its body came from
     // and its concat lines are remapped to that file's own line numbers. Null keeps
     // the single-document path (plain compile-file of one .lisp).
     private (int startLine, string path)[]? _debugLineMap;
@@ -198,8 +198,8 @@ public class FaslAssembler
 #else
         // An AssemblyName simple-name rejects characters the parser reads as
         // attribute syntax (e.g. '=' and ',' from "name=value, ..."), so a source
-        // file whose basename contains one — e.g. serapeum's vector=.lisp, giving
-        // module name "vector=_<guid>" — made new AssemblyName throw "The given
+        // file whose basename contains one: e.g. serapeum's vector=.lisp, giving
+        // module name "vector=_<guid>": made new AssemblyName throw "The given
         // assembly name was invalid.". The module name is only an internal
         // assembly / LTV-namespace identifier (a guid suffix keeps it unique), so
         // replacing the offending characters is lossless in practice.
@@ -267,7 +267,7 @@ public class FaslAssembler
         // any branch/label OR any local-variable declaration appears at the
         // outer level. If so, splitting at defmethod boundaries would orphan
         // labels from their branches, or orphan (:ldloc X)/(:stloc X) from
-        // their (:declare-local X) — each helper has its own label and local
+        // their (:declare-local X): each helper has its own label and local
         // table. Symptoms: "Label N has not been marked",
         // "Undeclared local: X_N".
         bool hasDefmethod = false;
@@ -299,7 +299,7 @@ public class FaslAssembler
 
         if (hasDefmethod && (hasBranch || hasOuterLocal))
         {
-            // Cannot safely split — emit the whole form into one helper method.
+            // Cannot safely split: emit the whole form into one helper method.
             // _faslMode DEFMETHOD handling still extracts the nested body into
             // its own persisted method; only the outer label/local chain
             // stays inline in the helper. This preserves helper-scoped tables
@@ -381,7 +381,7 @@ public class FaslAssembler
     /// Emit a monolithic top-level form into _initIl, without splitting.
     /// Unlike AddTopLevelForm (which segments at defmethod boundaries), this
     /// assembles the whole form into the init method. For forms whose
-    /// locals/labels span the entire body — a .sil produced before the
+    /// locals/labels span the entire body: a .sil produced before the
     /// cross-compiler segmented its output at (:TOPLEVEL-BOUNDARY); current
     /// ones go through AddTopLevelForm per segment. Only one such form can be
     /// added: its :RET ends the init method. Relies on CilAssembler's _faslMode
@@ -679,13 +679,13 @@ public class FaslAssembler
         // function loaded from a fasl fell back to the args-array entry -- and we
         // ship fasls, so that was the only shape a user ever ran.
         var extraDirect = BuildDirectDelegateMethods(tb, structMap, methodName, directDelegates);
-        // No _funcN for plain DEFMETHOD — body signature is LispObject[] -> LispObject.
+        // No _funcN for plain DEFMETHOD: body signature is LispObject[] -> LispObject.
         EmitRegistrationInto(initIl, name, method, paramCount, defPkg, directBodyMethod: null, noFrame: noFrame,
             lambdaList: lambdaList, extraDirect: extraDirect);
     }
 
     /// <summary>
-    /// Emit a DEFMETHOD-NATIVE (native long→long body) into the TypeBuilder.
+    /// Emit a DEFMETHOD-NATIVE (native long->long body) into the TypeBuilder.
     /// Generates: native body method (long params), direct LispObject wrapper,
     /// array wrapper, and registration with both _funcN and _nativeFuncN set.
     /// </summary>
@@ -749,7 +749,7 @@ public class FaslAssembler
         // 3. Array wrapper: static LispObject Name_wrap_N(LispObject[] args)
         // This is the slow fallback (apply / arity-mismatched calls); the hot paths are
         // _funcN (self bound to fn) and _nativeFuncN (self passed by InvokeNativeN). Since
-        // the LispFunction is built FROM this delegate, it can't capture fn — so resolve
+        // the LispFunction is built FROM this delegate, it can't capture fn; so resolve
         // self here via the symbol once per array call (cheap relative to the array path).
         bool isSetf = name.StartsWith("(SETF ") && name.EndsWith(")");
         string wrapperName = SanitizeName(name) + "_" + id;
@@ -844,7 +844,7 @@ public class FaslAssembler
     /// <summary>
     /// Emit IL to register a function: build Func&lt;LispObject[], LispObject&gt;
     /// delegate from wrapperMethod, wrap in LispFunction, optionally install a
-    /// typed _funcN delegate (when directBodyMethod != null and arity ≤ 8),
+    /// typed _funcN delegate (when directBodyMethod != null and arity <= 8),
     /// then register on the appropriate symbols.
     ///
     /// For (SETF NAME): emits RegisterSetfFunctionOnSymbol.
@@ -915,7 +915,7 @@ public class FaslAssembler
             }
         }
 
-        // Install _nativeFuncN for native long→long fast path
+        // Install _nativeFuncN for native long->long fast path
         if (nativeBodyMethod != null && paramCount >= 1 && paramCount <= 4)
         {
             il.Emit(OpCodes.Ldloc, fnLocal);
@@ -965,7 +965,7 @@ public class FaslAssembler
     /// <summary>
     /// Emit load-time pre-interning for every symbol this fasl names (see
     /// Startup.PreinternSymbol). Called at the END of ModuleInit so the file's own
-    /// defpackage forms have already run — a symbol whose package this fasl
+    /// defpackage forms have already run: a symbol whose package this fasl
     /// defines is then interned in the right place, and one whose package is
     /// missing is skipped by the guard in PreinternSymbol.
     ///
@@ -1049,7 +1049,7 @@ public class FaslAssembler
         }
         // PersistedAssemblyBuilder writes exception clauses in an order the CLR
         // rejects when one exception block is nested inside another's handler
-        // (an unwind-protect whose cleanup contains handler-case / catch / …).
+        // (an unwind-protect whose cleanup contains handler-case / catch / ...).
         FaslEhOrder.Fix(outputPath);
         if (retargetCorlib != null)
             FaslCorlibRetarget.RetargetCorlib(outputPath, retargetCorlib);
@@ -1063,7 +1063,7 @@ public class FaslAssembler
     /// Declared OUTSIDE the NET9_0_OR_GREATER block below on purpose: sil-to-fasl in
     /// Startup sets it on every target framework, while only the stamping itself is
     /// version-specific. Inside the block it compiled on net10.0 and vanished on
-    /// net8.0, which nothing local builds — the break surfaced at pack time.</summary>
+    /// net8.0, which nothing local builds: the break surfaced at pack time.</summary>
     internal string? SelfGeneration;
 
 #if NET9_0_OR_GREATER
@@ -1072,7 +1072,7 @@ public class FaslAssembler
     /// compares it with the running one and warns on a mismatch: a fasl carries the
     /// code generation of the compiler that built it, so one built before a codegen
     /// fix keeps the old behaviour and the fix looks inert. No stamp is written when
-    /// the generation cannot be determined (a core loaded from memory) — an absent
+    /// the generation cannot be determined (a core loaded from memory); an absent
     /// stamp is treated as "unknown", never as a mismatch.</summary>
     private void StampCoreGeneration()
     {
@@ -1095,14 +1095,14 @@ public class FaslAssembler
     /// generate the metadata + IL stream ourselves so we can attach a debug
     /// directory pointing at a PDB. The PDB carries one document (the source
     /// file) and one sequence point per recorded body method, at the source line
-    /// of its top-level form — enough to bind a breakpoint on a defun and show
+    /// of its top-level form: enough to bind a breakpoint on a defun and show
     /// source-mapped frames. Finer, per-expression stepping is a later step.
     /// </summary>
     private void SaveWithDebugInfo(string outputPath)
     {
         // Mark the assembly debuggable with the JIT optimizer disabled. Without
         // this the JIT optimizes the fasl's methods and a debugger shows "optimized
-        // code" — locals get elided and stepping is unreliable even with a valid
+        // code": locals get elided and stepping is unreliable even with a valid
         // PDB. Must be set before GenerateMetadata so it lands in the metadata.
         try
         {
@@ -1165,7 +1165,7 @@ public class FaslAssembler
                 // Pick this method's document and, for a project build, remap its
                 // concat line numbers to the originating file's own lines. A defun
                 // body (and its nested closures) comes from one file, so a single
-                // document per method suffices — no in-method document switching.
+                // document per method suffices: no in-method document switching.
                 DocumentHandle methodDoc;
                 List<(int offset, int sl, int sc, int el, int ec)> pts;
                 if (_debugLineMap != null)
@@ -1186,7 +1186,7 @@ public class FaslAssembler
 
                 // Build the scope list: the method-wide scope [0, ilLength) holding
                 // parameters, plus each nested let/let* scope. LocalScope rows must
-                // be sorted by (StartOffset asc, Length desc) within a method — an
+                // be sorted by (StartOffset asc, Length desc) within a method: an
                 // enclosing scope precedes those it contains. Skip empty scopes.
                 var scopes = new List<(int start, int length, List<(int index, string name)> vars)>();
                 if (info.localVars.Count > 0)
@@ -1210,7 +1210,7 @@ public class FaslAssembler
                         method: MetadataTokens.MethodDefinitionHandle(row),
                         importScope: default,
                         variableList: firstVar,
-                        // No local constants — point one past the (empty) table.
+                        // No local constants: point one past the (empty) table.
                         constantList: MetadataTokens.LocalConstantHandle(1),
                         startOffset: sc.start,
                         length: sc.length);
@@ -1244,7 +1244,7 @@ public class FaslAssembler
     }
 
     /// <summary>Add a source-file document to the PDB with its SHA-256 checksum.
-    /// The hash lets a debugger verify the on-disk source matches; best-effort —
+    /// The hash lets a debugger verify the on-disk source matches; best-effort;
     /// an unreadable file yields a document with no hash.</summary>
     private static DocumentHandle AddSourceDocument(MetadataBuilder pdb, string path)
     {
@@ -1336,8 +1336,8 @@ public class FaslAssembler
             }
             else
             {
-                b.WriteCompressedSignedInteger(sl - prevSl);          // ΔStartLine
-                b.WriteCompressedSignedInteger(sc - prevSc);          // ΔStartColumn
+                b.WriteCompressedSignedInteger(sl - prevSl);          // DeltaStartLine
+                b.WriteCompressedSignedInteger(sc - prevSc);          // DeltaStartColumn
             }
 
             prevOffset = offset;

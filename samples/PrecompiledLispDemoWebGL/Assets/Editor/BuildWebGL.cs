@@ -23,11 +23,11 @@ public static class BuildWebGL
         // Smallest output: no exceptions table, brotli-free, gzip is fine for a demo.
         PlayerSettings.WebGL.compressionFormat = WebGLCompressionFormat.Gzip;
         // Decompression fallback: the JS loader gunzips the .gz assets client-side,
-        // so the build runs on ANY static server — including ones that don't set
+        // so the build runs on ANY static server: including ones that don't set
         // Content-Encoding: gzip (e.g. a plain Lisp lack.app.directory / Python
         // http.server). Without this, the server must send that header itself.
         PlayerSettings.WebGL.decompressionFallback = true;
-        // Custom page with the Lisp input box (SendMessage → DemoBootstrap.EvalFromJs).
+        // Custom page with the Lisp input box (SendMessage -> DemoBootstrap.EvalFromJs).
         PlayerSettings.WebGL.template = "PROJECT:dotcl";
 
         // The LineRenderer material uses Shader.Find("Sprites/Default") at run time;

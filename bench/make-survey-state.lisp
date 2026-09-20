@@ -1,4 +1,4 @@
-;;;; make-survey-state.lisp — merge dotcl + sbcl survey stderr into bench-state.json
+;;;; make-survey-state.lisp: merge dotcl + sbcl survey stderr into bench-state.json
 ;;;;
 ;;;; Usage: dotcl bench/make-survey-state.lisp <dotcl-stderr> <sbcl-stderr> [existing-bench-state.json]
 ;;;;
@@ -42,7 +42,7 @@
 ;;; Number formatting
 ;;;
 ;;; Rounding goes through RATIONAL so the decimal digit is decided on the exact
-;;; binary value of the double, ties to even — what Python's round(x, n) does.
+;;; binary value of the double, ties to even: what Python's round(x, n) does.
 ;;; Rounding the scaled double instead would decide some boundary cases on the
 ;;; error introduced by the scaling.
 ;;; ------------------------------------------------------------------
@@ -358,7 +358,7 @@
   "The file arguments, under either way of starting this script.
    `dotcl make-survey-state.lisp a b c` puts them after a \"--\" marker, while
    the development invocation `dotcl --asm cil-out.sil make-survey-state.lisp a b c`
-   loads each remaining path in turn and leaves the host argv untouched — there
+   loads each remaining path in turn and leaves the host argv untouched; there
    the arguments are whatever follows this file's own path."
   (let* ((args (dotcl:command-line-arguments))
          (delimited (member "--" args :test #'string=)))

@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- The C# half of the IL parity set: every <name>/Ref.cs compiled into one
+       assembly, Release, so the IL under comparison is the IL a user would
+       ship. Optimize is set explicitly rather than left to the configuration,
+       because the whole point of the file is which instructions come out. -->
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <OutputType>Library</OutputType>
+    <AssemblyName>IlParityRefs</AssemblyName>
+    <RootNamespace>IlParity</RootNamespace>
+    <Nullable>enable</Nullable>
+    <Optimize>true</Optimize>
+    <DebugType>none</DebugType>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="*/Ref.cs" />
+  </ItemGroup>
+
+</Project>

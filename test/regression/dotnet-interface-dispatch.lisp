@@ -1,6 +1,6 @@
 ;;; .NET interfaces take part in CLOS dispatch: EnsureDotNetTypeClass makes every
 ;;; implemented interface a superclass, and orders the class precedence list
-;;; concrete-classes → interfaces (most derived first) → T. Before this only the
+;;; concrete-classes -> interfaces (most derived first) -> T. Before this only the
 ;;; BaseType chain was mapped, so a method on IEnumerable never applied.
 
 (defun dnid-list-of (elt-type)

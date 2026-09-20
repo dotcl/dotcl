@@ -12,7 +12,7 @@ public class LispCondition : LispObject
     /// those arguments are arbitrary objects: rendering them when the condition is
     /// created runs the printer under whatever printer variables happened to be in
     /// effect at the signalling site, not the ones in effect where the condition is
-    /// finally reported. SBCL's compiler relies on the difference — it binds
+    /// finally reported. SBCL's compiler relies on the difference: it binds
     /// *PRINT-CIRCLE* to T around reporting, and the type objects it reports on hold
     /// each other, so rendering early printed a cycle with no circle detection and
     /// never came back.
@@ -55,7 +55,7 @@ public class LispCondition : LispObject
     public System.Type? ClrExceptionType { get; set; }
     /// <summary>For a condition wrapping a raw .NET exception: the exception
     /// instance itself, exposed via dotnet:exception-object so handlers can read
-    /// type-specific detail the message loses — SocketException.SocketErrorCode,
+    /// type-specific detail the message loses: SocketException.SocketErrorCode,
     /// the InnerException chain (an IOException around a socket timeout), etc.
     /// Null for ordinary Lisp conditions.</summary>
     public System.Exception? ClrException { get; set; }
@@ -96,7 +96,7 @@ public class LispProgramError : LispError
 
 /// <summary>STORAGE-CONDITION (stack or heap exhaustion). Deliberately NOT a
 /// LispError: the spec places it under SERIOUS-CONDITION but outside ERROR, so
-/// handler-case (error ...) must not catch it — matching SBCL, whose
+/// handler-case (error ...) must not catch it: matching SBCL, whose
 /// control-stack-exhausted / heap-exhausted-error are pure storage-conditions.</summary>
 public class LispStorageCondition : LispCondition
 {
@@ -308,7 +308,7 @@ public static class HandlerClusterStack
     /// <summary>Current cluster-stack depth.</summary>
     public static int Depth => _clusters?.Count ?? 0;
 
-    /// <summary>Shallow copy of the live cluster stack (bottom→top), or null if
+    /// <summary>Shallow copy of the live cluster stack (bottom->top), or null if
     /// empty. Used to carry handler-bind clusters across an async await boundary,
     /// where the continuation runs on a different (ThreadStatic) thread.</summary>
     public static List<HandlerBinding[]>? Snapshot()
@@ -367,7 +367,7 @@ public static class HandlerClusterStack
                             throw new HandlerCaseInvocationException(
                                 binding.HcTag ?? cluster, binding.HcClause, condition);
                         binding.Handler!.Invoke(condition);
-                        // Handler returned normally → decline, restore and continue
+                        // Handler returned normally -> decline, restore and continue
                     }
                     finally
                     {
@@ -403,7 +403,7 @@ public static class RestartClusterStack
 
     public static int Depth => _clusters?.Count ?? 0;
 
-    /// <summary>Shallow copy of the live restart-cluster stack (bottom→top), or
+    /// <summary>Shallow copy of the live restart-cluster stack (bottom->top), or
     /// null if empty. Carries restart-case clusters across an async await
     /// boundary so find-restart / compute-restarts / invoke-restart see them on
     /// the continuation thread (which has fresh ThreadStatic stacks). Mirrors
@@ -630,8 +630,8 @@ public static class ConditionSystem
     /// <summary>
     /// Loop back-edge safepoint. The compiler emits a call to this on the
     /// back-edge of compiled loops (tagbody dispatch, TCO self/mutual loops) so
-    /// a loop whose body contains no Lisp calls — and therefore never reaches
-    /// the periodic check in LispFunction.Invoke — can still be stopped by
+    /// a loop whose body contains no Lisp calls, and therefore never reaches
+    /// the periodic check in LispFunction.Invoke, can still be stopped by
     /// Ctrl-C. Bodies declared (optimize (safety 0)) opt out at compile time.
     /// </summary>
     /// The two branches below are what makes this method inlinable, and it has to
@@ -699,14 +699,14 @@ public static class ConditionSystem
     {
         CheckBreakOnSignals(condition);
         HandlerClusterStack.Signal(condition);
-        // Not handled → invoke debugger (per CLHS)
+        // Not handled -> invoke debugger (per CLHS)
         var invokeDebugger = Startup.Sym("INVOKE-DEBUGGER");
         if (invokeDebugger.Function is LispFunction invDbgFn)
         {
             // No debugger frame: this is ERROR handing control over, not a call
             // the user made. Recording it would put INVOKE-DEBUGGER between
             // *DEBUGGER-HOOK* and the frame that signalled, shifting every index
-            // the hook reads (a user (invoke-debugger c) still gets a frame — it
+            // the hook reads (a user (invoke-debugger c) still gets a frame: it
             // goes through the ordinary compiled call path).
             invDbgFn.InvokeNoFrame(condition);
         }
@@ -725,7 +725,7 @@ public static class ConditionSystem
         // handler in place and return, so the invoking handler kept running and
         // HANDLER-BIND went on to the next applicable clause. Code that muffles a
         // STYLE-WARNING under a handler-bind listing both STYLE-WARNING and WARNING
-        // therefore ran the WARNING clause as well — SBCL's compiler does exactly that
+        // therefore ran the WARNING clause as well: SBCL's compiler does exactly that
         // (COMPILER-STYLE-WARNING-HANDLER muffles, COMPILER-WARNING-HANDLER sets
         // *FAILURE-P*), so every cross-compiled file printed its diagnostics twice and
         // any file with a style warning failed with "FAILURE-P was set".
@@ -748,7 +748,7 @@ public static class ConditionSystem
         }
         if (!muffled)
         {
-            // Not handled → print warning to *error-output*
+            // Not handled -> print warning to *error-output*
             try
             {
                 var errSym = Startup.Sym("*ERROR-OUTPUT*");

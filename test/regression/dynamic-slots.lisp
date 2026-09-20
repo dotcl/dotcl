@@ -84,7 +84,7 @@
 (defclass dynslot-widget ()
   ((x :dynamic t :accessor dynslot-x)
    (y :initarg :y :initform 99 :accessor dynslot-y)
-   ;; A dynamic slot WITH an initform — the McCLIM stream-recording-p case.
+   ;; A dynamic slot WITH an initform: the McCLIM stream-recording-p case.
    (z :dynamic t :initform 5 :accessor dynslot-z))
   (:metaclass dynslot-metaclass))
 

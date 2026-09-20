@@ -1,7 +1,7 @@
 ;;; Stale *tco-self-symbol* regression tests.
 ;;;
 ;;; A labels function G (non-capturing, same arity as the enclosing defun F)
-;;; containing a tail call to F must re-enter F — not falsely match the
+;;; containing a tail call to F must re-enter F: not falsely match the
 ;;; self-TCO identity check against the enclosing defun's symbol and branch
 ;;; to G's own TCO loop. Two facets: labels directly inside the defun, and
 ;;; labels inside a closure inside the defun (closure-boundary reset).

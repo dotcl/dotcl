@@ -2,13 +2,13 @@
 ;;; with a variable, a function, or a block without disturbing any of them.
 ;;;
 ;;; The interpreter pushed tags onto the same alist ENV as variables, keyed by
-;;; the tag symbol. That was not merely a shadowing bug — it was destructive:
+;;; the tag symbol. That was not merely a shadowing bug: it was destructive:
 ;;;
 ;;;   (let ((even nil))
 ;;;     (dotimes (i 8) ... (go even) ... even (push i even) ...))
 ;;;
-;;; the tag EVEN and the variable EVEN shared one entry, so (push i even) — a
-;;; SETQ — overwrote the GO-TARGET with a list, and the NEXT (go even) failed
+;;; the tag EVEN and the variable EVEN shared one entry, so (push i even), a
+;;; SETQ, overwrote the GO-TARGET with a list, and the NEXT (go even) failed
 ;;; with "%mini-eval: go tag EVEN not found". The first iteration worked, so the
 ;;; failure only appeared once the tag was branched to twice.
 ;;; (ansi-test DOTIMES.12 and the DO / DOLIST / TAGBODY tests of that shape.)
@@ -77,7 +77,7 @@
   (%gtn :interpret %gtn-dolist)
   (((1 3) (2 4))))
 
-;;; The variable must still be readable and writable through its OWN binding —
+;;; The variable must still be readable and writable through its OWN binding;
 ;;; the collision used to route reads of EVEN to the tag entry too.
 (deftest interp-go-tag-namespace.variable-unharmed-interpret
   (%gtn :interpret '(let ((tag 10))

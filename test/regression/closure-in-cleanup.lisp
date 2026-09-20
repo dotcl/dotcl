@@ -2,7 +2,7 @@
 ;;; special-variable let): *in-try-block* / *in-finally-block* are reset at
 ;;; the closure boundary (the closure body is a separate CLR method, outside
 ;;; the outer try/finally region), so closure-internal block/return-from and
-;;; tagbody/go take the local leave path — results must be unchanged.
+;;; tagbody/go take the local leave path: results must be unchanged.
 
 (defvar *cic-special* nil)
 
@@ -55,7 +55,7 @@
   7)
 
 ;; Nested: closure made in cleanup contains its own unwind-protect whose
-;; protected form does return-from through it — the closure's own
+;; protected form does return-from through it: the closure's own
 ;; *in-finally-block* discipline must still apply inside.
 (deftest closure-in-cleanup.nested-uwp
   (let ((log nil)

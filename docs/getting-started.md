@@ -1,0 +1,257 @@
+# Getting started
+
+From an empty machine to a Common Lisp executable you can hand to someone
+else. Every command below was run as written; the output quoted under each
+one is the real output, on Windows on ARM64 with dotcl 0.1.28.
+
+Along the way: install dotcl, create a project from a template, run it, add a
+library to it, and publish a standalone `.exe`.
+
+## 1. What you need
+
+The .NET SDK, version 10 or newer. Nothing else: no Roswell, no SBCL, no
+`make`. Those are needed only to build dotcl itself (step 2c).
+
+```console
+$ dotnet --version
+10.0.302
+```
+
+See the install table in the [README](../README.md) if `dotnet` is missing.
+
+## 2. Install dotcl
+
+Three ways. Pick one; (a) is the shortest.
+
+### 2a. As a .NET tool
+
+```console
+$ dotnet tool install --global dotcl
+You can invoke the tool using the following command: dotcl
+Tool 'dotcl' (version '0.1.28') was successfully installed.
+```
+
+`--global` puts it on `PATH` (`~/.dotnet/tools`). To keep it out of the way,
+install it into a directory of your own with `--tool-path <dir>` and call it
+by path.
+
+Check it:
+
+```console
+$ dotcl --eval "(format t \"hello, ~a ~a~%\" (lisp-implementation-type) (lisp-implementation-version))"
+hello, dotcl 0.1.28
+
+$ dotcl repl
+dotcl REPL. Ctrl+D to exit.
+CL-USER> (+ 1 2)
+3
+```
+
+### 2b. From a per-RID tarball
+
+Every release page carries one archive per runtime identifier, named
+`dotcl-<rid>-<version>.tar.bz2`, for the six desktop RIDs (`win-x64`,
+`win-arm64`, `linux-x64`, `linux-arm64`, `osx-x64`, `osx-arm64`). It holds the
+runtime, the core image and the bundled contrib tree, already compiled
+ahead-of-time for that RID. This is the route Roswell users take.
+
+```console
+$ curl -sLO https://github.com/dotcl/dotcl/releases/download/v0.1.28/dotcl-win-arm64-0.1.28.tar.bz2
+$ ls -l dotcl-win-arm64-0.1.28.tar.bz2
+-rw-r--r-- 1 ... 13046308 ... dotcl-win-arm64-0.1.28.tar.bz2
+
+$ mkdir dotcl && tar -xjf dotcl-win-arm64-0.1.28.tar.bz2 -C dotcl
+$ ls dotcl
+DotCL.Runtime.dll  contrib  dotcl.core  runtime.deps.json
+runtime.dll  runtime.exe  runtime.runtimeconfig.json
+```
+
+The executable in the archive is `runtime.exe` (`runtime` on Linux and macOS),
+and it takes the same arguments the `dotcl` tool does:
+
+```console
+$ dotcl/runtime.exe --eval "(format t \"~a ~a on ~a~%\" (lisp-implementation-type) (lisp-implementation-version) (software-type))"
+dotcl 0.1.28 on Microsoft Windows 10.0.26200
+```
+
+13 MB to download, 47 MB unpacked. The archive is framework-dependent: it
+still wants the .NET 10 runtime installed (it does not carry its own).
+
+### 2c. From source
+
+Only if you want to work on dotcl itself. It needs Roswell/SBCL to bootstrap
+the compiler; see [Building from source](../README.md#building-from-source).
+
+## 3. Your first project
+
+The templates ship as their own package:
+
+```console
+$ dotnet new install DotCL.Templates
+Success: DotCL.Templates@0.1.28 installed the following templates:
+Template Name              Short Name      Language     Tags
+-------------------------  --------------  -----------  ---------------------------
+Common Lisp Class Library  dotcl-classlib  Common Lisp  Library/Windows/Linux/macOS
+Common Lisp Console App    dotcl-app       Common Lisp  Console/Windows/Linux/macOS
+```
+
+Create an app and run it:
+
+```console
+$ dotnet new dotcl-app -n hello
+The template "Common Lisp Console App" was created successfully.
+
+$ cd hello
+$ dotnet run
+[build] hello: compiling 1 source(s)
+[build]   .../hello/app.lisp
+Hello from dotcl
+```
+
+That is the whole loop: edit `app.lisp`, `dotnet run` again.
+
+### What the template wrote
+
+Four files:
+
+| File | What it is |
+|------|------------|
+| `app.lisp` | your Lisp code, with `app-main` as the entry point |
+| `hello.asd` | the ASDF system: which files, in which order, and what they depend on |
+| `hello.csproj` | an ordinary .NET project that adds two things (below) |
+| `Program.cs` | a five-line C# `Main` that boots the runtime and calls `APP:APP-MAIN` |
+
+The csproj is an ordinary `Microsoft.NET.Sdk` project plus one package
+reference and one property:
+
+```xml
+<PropertyGroup>
+  <DotclProjectAsd>$(MSBuildProjectDirectory)/hello.asd</DotclProjectAsd>
+</PropertyGroup>
+
+<ItemGroup>
+  <PackageReference Include="DotCL.Runtime" Version="0.1.28" />
+</ItemGroup>
+```
+
+`DotclProjectAsd` is what turns a .NET build into a Lisp build: the package
+brings MSBuild targets that walk the `.asd`, compile the system to a FASL, and
+copy the FASL plus the base core image into the output as `dotcl-fasl/`.
+`Program.cs` then loads `dotcl-fasl/dotcl-deps.txt` at startup. Nothing is
+compiled at run time, and no `dotnet tool install` is needed to build: the
+compile happens in-process, out of the package.
+
+The properties that steer this are listed in [SDK and MSBuild
+properties](sdk.md). There is also a `DotCL.Sdk` MSBuild SDK, which writes the
+`PackageReference` for you; the template does not use it so that the generated
+project stays an ordinary csproj you can read.
+
+## 4. Add a library
+
+Dependencies go in the `.asd`, the way they do in any ASDF system. dotcl does
+not scan `~/quicklisp`, so a build points at the library's directory itself
+with `DotclAsdSearchPath` (one item per directory; each is pushed onto
+`asdf:*central-registry*` before dependency resolution).
+
+Get the library:
+
+```console
+$ git clone --depth 1 https://gitlab.common-lisp.net/alexandria/alexandria.git ../lib/alexandria
+Cloning into '../lib/alexandria'...
+```
+
+Declare it in `hello.asd`:
+
+```lisp
+(defsystem "hello"
+  :depends-on ("alexandria")
+  :components ((:file "app")))
+```
+
+Point the build at it, in `hello.csproj`:
+
+```xml
+<ItemGroup>
+  <DotclAsdSearchPath Include="../lib/alexandria/" />
+</ItemGroup>
+```
+
+Use it in `app.lisp`:
+
+```lisp
+(defpackage :app (:use :cl) (:export #:app-main))
+(in-package :app)
+
+(defun app-main ()
+  (format t "~a~%" (alexandria:iota 5))
+  (format t "~a~%" (alexandria:hash-table-keys
+                    (alexandria:alist-hash-table '((:a . 1))))))
+```
+
+```console
+$ dotnet run
+[resolve-deps] compiling alexandria...
+[build] hello: compiling 1 source(s)
+[build]   .../hello/app.lisp
+(0 1 2 3 4)
+(A)
+```
+
+The dependency is compiled once and bundled next to your own FASL, so the
+published app does not depend on where the sources were.
+
+Two things this is not:
+
+- **Not the only route.** Systems bundled with dotcl (`dotcl-thread`,
+  `dotnet-ffi`, `nuget`, and the rest of contrib) are found without a search
+  path. NuGet packages are a separate axis: a `PackageReference` in the csproj,
+  or a `(:nuget "Id" :nuget-version "...")` component in the `.asd`.
+  [Using libraries](libraries.md) covers both.
+- **Not the same as `CL_SOURCE_REGISTRY`.** That variable works when you run
+  the `dotcl` command, and is ignored by the MSBuild build. If a system loads
+  from the command line but not from `dotnet build`, this asymmetry is why:
+  add a `DotclAsdSearchPath` item.
+
+## 5. Publish an executable
+
+```console
+$ dotnet publish -c Release -r win-arm64 --self-contained
+[resolve-deps] compiling alexandria...
+[build] hello: compiling 1 source(s)
+  hello -> .../hello/bin/Release/net10.0/win-arm64/publish/
+```
+
+Use your own RID in place of `win-arm64` (`win-x64`, `linux-x64`,
+`linux-arm64`, `osx-x64`, `osx-arm64`).
+
+What comes out, in `bin/Release/net10.0/win-arm64/publish/`:
+
+| Path | Size |
+|------|------|
+| `hello.exe` | 137 KB |
+| `dotcl-fasl/dotcl.core` | 1.9 MB (the base image) |
+| `dotcl-fasl/alexandria.fasl` | 656 KB (the dependency) |
+| `dotcl-fasl/hello.fasl` | 5.5 KB (your code) |
+| the whole directory | 100 MB, 249 files (most of it the self-contained .NET runtime) |
+
+```console
+$ ./bin/Release/net10.0/win-arm64/publish/hello.exe
+(0 1 2 3 4)
+(A)
+```
+
+That directory is the thing you ship. With `--self-contained` the target
+machine needs no .NET installed; drop `--self-contained` for a much smaller
+output that requires the .NET 10 runtime on the target.
+
+Smaller and faster variants are a separate topic: ahead-of-time compiled FASLs
+in [ReadyToRun siblings](readytorun.md), and native AOT in
+`samples/PrecompiledLispDemoAot/`.
+
+## Where to go next
+
+- [Using libraries](libraries.md): ASDF, Quicklisp, NuGet dependencies
+- [SDK and MSBuild properties](sdk.md): every property the build reads
+- [Writing scripts](scripting.md): no project at all, just a `.lisp` file
+- [Packaging an app](dotcl-pack.md): ship an ASDF system as a `dotnet tool`
+- [Calling .NET from Lisp](dotnet-package.md): the `dotnet:` package

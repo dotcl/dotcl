@@ -54,9 +54,9 @@ public static partial class Runtime
             // Fallback by name: handles cross-package aliases (e.g. DOTCL-MOP:SLOT-DEFINITION
             // vs DOTCL-INTERNAL:SLOT-DEFINITION registered by Startup, and dotnet:define-class
             // simple-name lookup). Only reached when there is no package-qualified entry, so
-            // distinct same-named user classes — which DO get their own exact entry, see
-            // FindOrForwardClass / RegisterClass — never fall through to here.
-            // Do NOT apply for uninterned symbols (gensyms) — they have unique identity
+            // distinct same-named user classes, which DO get their own exact entry, see
+            // FindOrForwardClass / RegisterClass, never fall through to here.
+            // Do NOT apply for uninterned symbols (gensyms): they have unique identity
             // and converting them to interned symbols breaks forward-ref resolution.
             if (sym.HomePackage != null)
                 return Startup.Sym(sym.Name);
@@ -82,7 +82,7 @@ public static partial class Runtime
         return Nil.Instance;
     }
 
-    /// <summary>A DEFMETHOD parameter specializer designator → the class to specialize on.
+    /// <summary>A DEFMETHOD parameter specializer designator -> the class to specialize on.
     /// Accepts everything FIND-CLASS does, plus .NET type designators: a type-name string,
     /// an already-resolved System.Type (e.g. from dotnet:resolve-type or
     /// dotnet:make-generic-type), and a symbol that names a .NET type with no CLOS class
@@ -158,7 +158,7 @@ public static partial class Runtime
         if (cls is not LispClass lc)
             throw new LispErrorException(new LispTypeError("REGISTER-CLASS: not a class", cls));
         // CLHS TYPE: the class name must not already name a declaration. Every
-        // class-defining operator lands here — defclass, defstruct and
+        // class-defining operator lands here: defclass, defstruct and
         // define-condition all register a class.
         CheckTypeNameAvailable(lc.Name, "DEFCLASS");
         // Prevent redefining built-in classes (CLHS 4.3.7)
@@ -181,7 +181,7 @@ public static partial class Runtime
             existing.IsForwardReferenced = false;
             // Carry over a (changed) metaclass and its slot values, so re-defining /
             // re-ensure-class'ing a class under a different :metaclass actually switches
-            // it — e.g. McCLIM resolving a forward-referenced-class to its real
+            // it: e.g. McCLIM resolving a forward-referenced-class to its real
             // presentation-type-class metaclass.
             existing.Metaclass = lc.Metaclass;
             existing.ExtraSlots = lc.ExtraSlots;
@@ -348,7 +348,7 @@ public static partial class Runtime
         // An open-constructed type (List<T>.GetInterfaces() yields IList<T> with the
         // declaring type's own parameter) has no FullName and is not a type any object
         // can be an instance of. Collapse it to its generic definition, which is the
-        // wildcard class users specialize on — otherwise it would register a second,
+        // wildcard class users specialize on: otherwise it would register a second,
         // nameless class under the same display name and warn about the collision.
         if (type.IsConstructedGenericType && type.ContainsGenericParameters)
             type = type.GetGenericTypeDefinition();
@@ -362,7 +362,7 @@ public static partial class Runtime
         if (_classRegistry.TryGetValue(simpleSym, out var existingByName))
         {
             // The simple name is already taken. Adopt that class only if it is NOT
-            // another .NET type's class — otherwise two same-named types from
+            // another .NET type's class: otherwise two same-named types from
             // different namespaces (e.g. System.Collections.ArrayList vs Other.ArrayList)
             // would share one Lisp class and misdirect class-of/typep/dispatch.
             // existingByName cannot be THIS type's class: the _dotNetTypeRegistry
@@ -398,7 +398,7 @@ public static partial class Runtime
         // Interfaces are superclasses too, so a method specialized on IEnumerable
         // applies to every implementor. They rank below the whole concrete chain:
         // the precedence list is concrete classes, then interfaces (most derived
-        // first), then the T tail — dotcl's T standing for the object/lisp tail.
+        // first), then the T tail: dotcl's T standing for the object/lisp tail.
         var ifaceClasses = new List<LispClass>();
         foreach (var itf in OrderInterfacesMostDerivedFirst(type.GetInterfaces()))
         {
@@ -443,7 +443,7 @@ public static partial class Runtime
             if (!ReferenceEquals(upperSym, simpleSym) && !_classRegistry.ContainsKey(upperSym))
                 _classRegistry[upperSym] = cls;
             // Always alias the class under its FullName too, so the FullName is a
-            // deterministic, load-order-independent specializer for EVERY type —
+            // deterministic, load-order-independent specializer for EVERY type;
             // not just the loser of a same-simple-name collision (whose FullName is
             // registered in the else branch below). A code generator can then emit
             // the FullName specializer for any type and have it resolve, without
@@ -464,7 +464,7 @@ public static partial class Runtime
         return cls;
     }
 
-    /// <summary>Reconstruct a LispInstance from fasl — called by fasl load-time code.</summary>
+    /// <summary>Reconstruct a LispInstance from fasl: called by fasl load-time code.</summary>
     public static LispObject MakeFaslInstance(string pkgName, string symName, LispObject[] slots)
     {
         var sym = Startup.SymInPkg(symName, pkgName);
@@ -489,7 +489,7 @@ public static partial class Runtime
     /// <summary>The classes that name C as a direct superclass, as a list.
     /// Not maintained as a back-link; scanning the registry is cheap enough for
     /// occasional MOP introspection. Shared by CL:CLASS-DIRECT-SUBCLASSES and
-    /// DOTCL-MOP:CLASS-DIRECT-SUBCLASSES so the two cannot drift apart — the
+    /// DOTCL-MOP:CLASS-DIRECT-SUBCLASSES so the two cannot drift apart; the
     /// argument check lives here for the same reason: with it at the call sites,
     /// one returned NIL for a non-class and the other signalled, and which one
     /// answered depended on the platform's registration order.</summary>
@@ -520,7 +520,7 @@ public static partial class Runtime
         => ToLispList(RequireClass("CLASS-DIRECT-SUPERCLASSES", arg).DirectSuperclasses);
 
     /// <summary>The CPL, falling back to (C) for a class whose list has not been
-    /// computed — without that, DOTCL-MOP's version dereferenced a null array.</summary>
+    /// computed: without that, DOTCL-MOP's version dereferenced a null array.</summary>
     public static LispObject ClassPrecedenceListOf(LispObject arg)
     {
         var c = RequireClass("CLASS-PRECEDENCE-LIST", arg);
@@ -530,7 +530,7 @@ public static partial class Runtime
     }
 
     /// <summary>dotcl finalizes eagerly during DEFCLASS, so every class that exists
-    /// is finalized — except a forward-referenced one, which by definition is not.
+    /// is finalized: except a forward-referenced one, which by definition is not.
     /// The CL-side registration answered T even for those.</summary>
     public static LispObject ClassFinalizedP(LispObject arg)
         => RequireClass("CLASS-FINALIZED-P", arg).IsForwardReferenced ? Nil.Instance : T.Instance;
@@ -932,7 +932,7 @@ public static partial class Runtime
 
     /// <summary>Iterate all registered generic functions. Used by
     /// DOTCL-MOP:SPECIALIZER-DIRECT-METHODS / SPECIALIZER-DIRECT-GENERIC-FUNCTIONS
-    /// (no specializer→method back-link is maintained, so we scan).</summary>
+    /// (no specializer->method back-link is maintained, so we scan).</summary>
     public static IEnumerable<GenericFunction> AllGenericFunctions() => _gfRegistry.Values;
 
     public static void InternClassByName(string name, LispObject cls)
@@ -1021,6 +1021,19 @@ public static partial class Runtime
     public static LispObject MakeClassFullWithInitargs(LispObject name, LispObject supersList, LispObject slotDefsList, LispObject metaclassObj, LispObject[] extraInitargs)
         => MakeClassCore(name, supersList, slotDefsList, metaclassObj as LispClass, extraInitargs);
 
+    // The same thing for DEFCLASS, which has the initargs as a Lisp list rather than
+    // an array: a class option that is not :METACLASS, :DEFAULT-INITARGS or
+    // :DOCUMENTATION is an initarg for the metaclass, so DEFCLASS builds a plist of
+    // them and calls this. Kept separate from the array version because builtins are
+    // reflected by method name, so an overload would make the lookup ambiguous.
+    public static LispObject MakeClassFullOptions(LispObject name, LispObject supersList, LispObject slotDefsList, LispObject metaclassObj, LispObject extraInitargs)
+    {
+        var extra = new List<LispObject>();
+        for (var cur = extraInitargs; cur is Cons c; cur = c.Cdr)
+            extra.Add(c.Car);
+        return MakeClassCore(name, supersList, slotDefsList, metaclassObj as LispClass, extra.ToArray());
+    }
+
     private static LispObject MakeClassCore(LispObject name, LispObject supersList, LispObject slotDefsList, LispClass? metaclass, LispObject[]? extraInitargs = null)
     {
         if (name is not Symbol sym)
@@ -1068,7 +1081,7 @@ public static partial class Runtime
             tempCls.Metaclass = metaclass; // needed for validate-superclass dispatch on (c mm)
             foreach (var super in supers)
             {
-                // Skip T — always valid
+                // Skip T: always valid
                 if (super.Name.Name == "T") continue;
                 // A superclass that has not been defined yet is a placeholder, so there
                 // is no metaclass pair to validate: what its class will be is exactly
@@ -1093,13 +1106,13 @@ public static partial class Runtime
             // A class is an instance of its metaclass. Run the real CLOS init protocol
             // on the class object so the metaclass's added slots get their initforms
             // AND any inherited initialize-instance / shared-initialize :after
-            // methods fire — e.g. a slot computed by an :after method. The
+            // methods fire: e.g. a slot computed by an :after method. The
             // shared-initialize primary handles a LispClass's ExtraSlots above.
             if (Startup.Sym("INITIALIZE-INSTANCE").Function is LispFunction iiFn)
             {
                 // Pass the metaclass-slot initargs (e.g. :type-name from ensure-class) so
                 // shared-initialize applies them to the class object's ExtraSlots BEFORE any
-                // inherited initialize-instance :after runs — matching the ordinary instance
+                // inherited initialize-instance :after runs: matching the ordinary instance
                 // init order. Otherwise an :after that reads an initarg-filled slot sees it
                 // UNBOUND.
                 LispObject[] iiArgs;
@@ -1262,7 +1275,7 @@ public static partial class Runtime
     /// For each effective slot of <paramref name="metaClass"/>, take the value from a matching
     /// initarg in <paramref name="optionsPlist"/> if provided, otherwise evaluate its initform.
     /// Used for both direct (options from the slot spec) and effective (options empty, initforms
-    /// only — e.g. McCLIM's DYNAMIC slot reads a dynamically-bound special) slot defs.</summary>
+    /// only: e.g. McCLIM's DYNAMIC slot reads a dynamically-bound special) slot defs.</summary>
     internal static void InitializeSlotdExtraSlots(SlotDefinition slotd, LispClass metaClass, LispObject? optionsPlist)
     {
         foreach (var es in metaClass.EffectiveSlots)
@@ -1340,8 +1353,8 @@ public static partial class Runtime
             return inst.Class;
         if (obj is LispInstanceCondition lic)
             return lic.Instance.Class;
-        // Native (runtime-signaled) condition objects — e.g. the DIVISION-BY-ZERO
-        // from (/ 1 0), the TYPE-ERROR from (car 3) — carry their class name in
+        // Native (runtime-signaled) condition objects: e.g. the DIVISION-BY-ZERO
+        // from (/ 1 0), the TYPE-ERROR from (car 3): carry their class name in
         // ConditionTypeName, which type-of/typep already use. Resolve the same
         // registered class here so class-of agrees, instead of falling through the
         // switch to T. LispInstanceCondition (CLOS-backed user conditions)
@@ -1468,14 +1481,14 @@ public static partial class Runtime
         // A structure-class instance must be a LispStruct, not a CLOS LispInstance:
         // equalp compares two LispStructs slot-by-slot and returns NIL if either side
         // is a LispInstance, and make-load-form-saving-slots emits allocate-instance as
-        // a struct's creation form — so an allocate-instance'd struct that round-trips
+        // a struct's creation form: so an allocate-instance'd struct that round-trips
         // through a fasl would otherwise never be equalp to a normally-built one (broke
         // Coalton's equalp-on-KIND type checking).
         //
         // Slots are left NIL (the dotcl stand-in for unbound): allocate-instance must
         // NOT run slot initforms (that is initialize-instance's job). Running them broke
         // the common required-slot idiom (id (required 'id) :read-only t), where the
-        // initform signals — so allocate-instance, and thus the make-load-form-saving-slots
+        // initform signals: so allocate-instance, and thus the make-load-form-saving-slots
         // creation form, errored. The INIT form restores real slot values on the round-trip.
         if (lc.IsStructureClass)
         {
@@ -1511,8 +1524,8 @@ public static partial class Runtime
         return new LispInstance(cls);
     }
 
-    // Native (runtime-signaled) conditions — e.g. the DIVISION-BY-ZERO from (/ 1 0),
-    // the TYPE-ERROR from (car 3), the SIMPLE-ERROR from (error "x") — are LispCondition
+    // Native (runtime-signaled) conditions: e.g. the DIVISION-BY-ZERO from (/ 1 0),
+    // the TYPE-ERROR from (car 3), the SIMPLE-ERROR from (error "x"); are LispCondition
     // objects, not CLOS LispInstances. They still answer (typep c 'standard-object) => T
     // and class-of correctly , so MOP slot access must work too. The standard
     // condition slots are stored in C# fields rather than a Slots array; map them here so
@@ -1584,8 +1597,8 @@ public static partial class Runtime
         if (obj is LispStruct st)
         {
             var stCls = FindClassOrNil(st.TypeName) as LispClass;
-            if (stCls != null && stCls.SlotIndex.TryGetValue(name, out int stIdx) && stIdx < st.Slots.Length)
-                return st.Slots[stIdx] ?? Nil.Instance;
+            if (stCls != null && stCls.SlotIndex.TryGetValue(name, out int stIdx) && stIdx < st.SlotCount)
+                return st.GetSlot(stIdx) ?? Nil.Instance;
             throw new LispErrorException(new LispError($"SLOT-VALUE: no slot named {name} in struct {st.TypeName.Name}"));
         }
         // Slot-definition metaobjects with a custom slot-definition class carry their
@@ -1664,7 +1677,7 @@ public static partial class Runtime
             throw new LispErrorException(new LispError(
                 $"SLOT-VALUE: no slot named {name} in class {inst.Class.Name.Name}"));
         }
-        // AMOP §5.4: dispatch through slot-value-using-class for custom metaclasses
+        // AMOP 5.4: dispatch through slot-value-using-class for custom metaclasses
         if (inst.Class.Metaclass != null && Startup.Sym("SLOT-VALUE-USING-CLASS").Function is LispFunction svucFn)
             return svucFn.Invoke(new LispObject[] { inst.Class, inst, inst.Class.EffectiveSlots[idx] });
         return SlotValueDirect(inst, idx, slotName, name);
@@ -1715,9 +1728,9 @@ public static partial class Runtime
         if (obj is LispStruct st)
         {
             var stCls = FindClassOrNil(st.TypeName) as LispClass;
-            if (stCls != null && stCls.SlotIndex.TryGetValue(name, out int stIdx) && stIdx < st.Slots.Length)
+            if (stCls != null && stCls.SlotIndex.TryGetValue(name, out int stIdx) && stIdx < st.SlotCount)
             {
-                st.Slots[stIdx] = value;
+                st.SetSlot(stIdx, value);
                 return value;
             }
             throw new LispErrorException(new LispError($"SET-SLOT-VALUE: no slot named {name} in struct {st.TypeName.Name}"));
@@ -1773,7 +1786,7 @@ public static partial class Runtime
             throw new LispErrorException(new LispError(
                 $"SET-SLOT-VALUE: no slot named {name} in class {inst.Class.Name.Name}"));
         }
-        // AMOP §5.4: dispatch through (setf slot-value-using-class) for custom metaclasses
+        // AMOP 5.4: dispatch through (setf slot-value-using-class) for custom metaclasses
         if (inst.Class.Metaclass != null && Startup.Sym("SLOT-VALUE-USING-CLASS").SetfFunction is LispFunction setfSvucFn)
             return setfSvucFn.Invoke(new LispObject[] { value, inst.Class, inst, inst.Class.EffectiveSlots[idx] });
         return SetSlotValueDirect(inst, idx, name, value);
@@ -1795,9 +1808,9 @@ public static partial class Runtime
 
     /// <summary>Item3b: compile-time-inlined fast path for a call to a simple
     /// slot-reader accessor GF, backed by a per-call-site monomorphic inline cache
-    /// (<paramref name="cell"/>, baked once by the assembler). On a hit — same class as
-    /// last time and the method-system epoch unchanged — the slot is read straight from
-    /// the instance vector, with no GF resolution, no dispatch, and no name→index lookup.
+    /// (<paramref name="cell"/>, baked once by the assembler). On a hit, same class as
+    /// last time and the method-system epoch unchanged, the slot is read straight from
+    /// the instance vector, with no GF resolution, no dispatch, and no name->index lookup.
     /// A miss re-resolves the accessor and refills the cell; anything that isn't a plain
     /// instance-allocated simple reader (redefined/extended accessor, custom metaclass,
     /// class-allocated or unbound slot) falls through to a normal 1-arg invocation, so
@@ -1811,7 +1824,7 @@ public static partial class Runtime
                 && ReferenceEquals(inst.Class, e.Cls))
             {
                 var v = inst.Slots[e.Idx];
-                if (v != null) return v;   // bound slot (bound NIL is non-null) — hot path
+                if (v != null) return v;   // bound slot (bound NIL is non-null); hot path
                 // unbound slot: fall to full path for the SLOT-UNBOUND protocol
             }
             else if (Emitter.CilAssembler.GetFunctionBySymbol(cell.Sym) is GenericFunction gf
@@ -1833,7 +1846,7 @@ public static partial class Runtime
         return Emitter.CilAssembler.GetFunctionBySymbol(cell.Sym).Invoke1(obj);
     }
 
-    /// <summary>Item3c: the writer twin of <see cref="ReaderIC"/> — the compile-time-inlined
+    /// <summary>Item3c: the writer twin of <see cref="ReaderIC"/>: the compile-time-inlined
     /// fast path for <c>(setf (accessor obj) newval)</c>, backed by a per-call-site
     /// monomorphic inline cache. Arguments keep the (SETF name) generic function's own
     /// order (new value first, object second) so the call site evaluates its argument forms
@@ -1876,8 +1889,8 @@ public static partial class Runtime
         if (obj is LispStruct st)
         {
             var stCls = FindClassOrNil(st.TypeName) as LispClass;
-            if (stCls != null && stCls.SlotIndex.TryGetValue(name, out int stIdx) && stIdx < st.Slots.Length)
-                return st.Slots[stIdx] != null ? T.Instance : Nil.Instance;
+            if (stCls != null && stCls.SlotIndex.TryGetValue(name, out int stIdx) && stIdx < st.SlotCount)
+                return st.GetSlot(stIdx) != null ? T.Instance : Nil.Instance;
             return Nil.Instance;
         }
         if (obj is SlotDefinition slotd)
@@ -1927,7 +1940,7 @@ public static partial class Runtime
             throw new LispErrorException(new LispError(
                 $"SLOT-BOUNDP: no slot named {name} in class {inst.Class.Name.Name}"));
         }
-        // AMOP §5.4: dispatch through slot-boundp-using-class for custom metaclasses.
+        // AMOP 5.4: dispatch through slot-boundp-using-class for custom metaclasses.
         if (inst.Class.Metaclass != null && Startup.Sym("SLOT-BOUNDP-USING-CLASS").Function is LispFunction sbucFn)
             return IsTruthy(Primary(sbucFn.Invoke(new LispObject[] { inst.Class, inst, inst.Class.EffectiveSlots[idx] })))
                 ? T.Instance : Nil.Instance;
@@ -2213,7 +2226,7 @@ public static partial class Runtime
         LispObject obj = instArg;
         if (obj is LispInstanceCondition lic) obj = lic.Instance;
         // A class metaobject under a custom metaclass: initialize the metaclass-added
-        // slots (those beyond standard-class) from initargs, else their initforms —
+        // slots (those beyond standard-class) from initargs, else their initforms;
         // the shared-initialize contract applied to ExtraSlots. Reached via the
         // real initialize-instance protocol so inherited :after methods run.
         if (obj is LispClass klass && klass.Metaclass != null)
@@ -2550,7 +2563,7 @@ public static partial class Runtime
 
         // Fast path: no default initargs, no custom init methods, not a condition class,
         // and no class-allocated slots with initargs (which need special handling).
-        // Directly set slots from initargs using cached initarg→slot map, then apply initforms.
+        // Directly set slots from initargs using cached initarg->slot map, then apply initforms.
         // This avoids GF dispatch, array allocation, and redundant initarg validation.
         if (!customMeta && cls.DefaultInitargs.Length == 0 && cls.CanUseFastMakeInstance
             && !IsConditionClass(cls) && !HasCustomInitMethods(cls))
@@ -2732,7 +2745,7 @@ public static partial class Runtime
             }
             return false;
         }
-        return true; // EQL specializer — conservative
+        return true; // EQL specializer; conservative
     }
 
     /// <summary>Validate initargs against class slot initargs and default initargs.</summary>
@@ -2852,7 +2865,7 @@ public static partial class Runtime
         return Nil.Instance;
     }
 
-    // 1-arg direct entry for MACRO-FUNCTION — (macro-function name). Replicates
+    // 1-arg direct entry for MACRO-FUNCTION: (macro-function name). Replicates
     // the args-array registration's single-argument branch exactly, so the
     // compiler's per-form macro check ((macro-function sym), very hot) skips the
     // args array and the InvokeSlow detour. The 2-arg (&optional environment)
@@ -2904,8 +2917,8 @@ public static partial class Runtime
     {
         // Only DOTCL-INTERNAL (and null) symbols get the bare "(SETF NAME)" key;
         // all other packages (including COMMON-LISP) get a package-qualified key.
-        // This ensures that the FindGF setf fallback — which searches for bare
-        // "(SETF NAME)" keys — can only ever match C#-startup-registered GFs
+        // This ensures that the FindGF setf fallback, which searches for bare
+        // "(SETF NAME)" keys, can only ever match C#-startup-registered GFs
         // (whose accessor is always a DOTCL-INTERNAL symbol), never user-created
         // GFs like (setf cl:documentation).  Without this, (setf acclimation:doc)
         // bleeds into (setf cl:documentation) via the fallback.
@@ -2918,7 +2931,7 @@ public static partial class Runtime
     private static Symbol ToFunctionNameSymbol(LispObject name, string context)
     {
         if (name is Symbol sym) return sym;
-        // (setf foo) → intern a stable symbol named "(SETF FOO)" for identity-based registry
+        // (setf foo) -> intern a stable symbol named "(SETF FOO)" for identity-based registry
         if (name is Cons c && c.Car is Symbol setfSym && setfSym.Name == "SETF"
             && c.Cdr is Cons c2 && c2.Car is Symbol accessor)
         {
@@ -3411,7 +3424,7 @@ public static partial class Runtime
             }
         }
         // Removing an INITIALIZE-INSTANCE / SHARED-INITIALIZE method also changes
-        // the make-instance fast-path eligibility — invalidate the per-class caches.
+        // the make-instance fast-path eligibility: invalidate the per-class caches.
         InvalidateSimpleInitCaches(gf);
         NotifyDirectMethod(method, adding: false);
         NotifyDiscriminatingFunction(gf);
@@ -3526,7 +3539,7 @@ public static partial class Runtime
     /// COMPUTE-APPLICABLE-METHODS but the arguments are given as classes, so it
     /// returns (values methods definitive-p). definitive-p is NIL when an applicable
     /// method has an EQL specializer, since EQL applicability can't be decided from a
-    /// class alone — the caller must fall back to COMPUTE-APPLICABLE-METHODS.</summary>
+    /// class alone: the caller must fall back to COMPUTE-APPLICABLE-METHODS.</summary>
     public static LispObject ComputeApplicableMethodsUsingClasses(LispObject gfObj, LispObject classList)
     {
         if (gfObj is not GenericFunction gf)
@@ -3791,7 +3804,7 @@ public static partial class Runtime
     // Memoized dispatch classes for the hottest builtin argument types. ClassOf
     // on a builtin resolves Startup.Sym("NAME") + a registry hash lookup on
     // EVERY call, and ArgDispatchClass runs for every argument of every GF
-    // dispatch (cache compare + applicability checks) — e.g. (gf instance i)
+    // dispatch (cache compare + applicability checks): e.g. (gf instance i)
     // with a fixnum i paid the INTEGER lookup per call. Builtin classes are
     // registered once at startup and CL forbids redefining them, so a one-shot
     // memo is safe. Types with special ClassOf handling (conditions, .NET
@@ -3817,7 +3830,7 @@ public static partial class Runtime
     /// the applicable methods plus GF-level keywords (CLHS 7.6.5). Signals program-error
     /// for an unknown keyword unless :allow-other-keys t is passed or some applicable
     /// method allows other keys. Must run on BOTH the cache-hit and cache-miss dispatch
-    /// paths — earlier it lived only on the cache-miss path, so a warm monomorphic cache
+    /// paths: earlier it lived only on the cache-miss path, so a warm monomorphic cache
     /// silently skipped the check (ANSI DEFMETHOD.ERROR.14/15).</summary>
     /// <summary>The keyword-portion checks that do not depend on which methods apply:
     /// an even number of pairs, symbol keys, and the :ALLOW-OTHER-KEYS escape. False
@@ -3837,14 +3850,14 @@ public static partial class Runtime
                     $"{gf.Name.Name}: keyword argument key is not a symbol: {args[i]}"));
         }
 
-        // :allow-other-keys — only the FIRST occurrence's value is honored (CLHS 3.4.1.4.1).
+        // :allow-other-keys: only the FIRST occurrence's value is honored (CLHS 3.4.1.4.1).
         for (int i = keyStart; i + 1 < args.Length; i += 2)
         {
             if (args[i] is Symbol ks && ks.Name == "ALLOW-OTHER-KEYS"
                 && ks.HomePackage?.Name == "KEYWORD")
             {
                 if (args[i + 1] is not Nil) return false; // suppress unknown-key check
-                break;                                    // first wins; nil → validate
+                break;                                    // first wins; nil -> validate
             }
         }
         return true;
@@ -3984,7 +3997,7 @@ public static partial class Runtime
     /// <summary>add ENTRY to GF's N-way dispatch cache. Rebuilds an immutable
     /// array with ENTRY at the front (most-recent), dropping any existing entry that
     /// has the same argument classes (ENTRY replaces it) and capping at
-    /// DispatchCacheWidth, then publishes it with one volatile write — a concurrent
+    /// DispatchCacheWidth, then publishes it with one volatile write: a concurrent
     /// reader sees the whole old or whole new array, never a partial one. Racing fills
     /// may lose an entry (a future miss re-fills it); a race with InvalidateCache can
     /// leave a briefly-stale entry, exactly as the previous single-entry cache did.</summary>
@@ -4021,7 +4034,7 @@ public static partial class Runtime
     ///
     /// This lives in its own method so that DISPATCHGF has no lambda capturing its
     /// locals. C# allocates a closure's display class where the captured variables
-    /// are declared — on entry to the scope, not where the lambda is written — so
+    /// are declared, on entry to the scope, not where the lambda is written, so
     /// writing this inline made every dispatch, :around or not, allocate a display
     /// class it almost never used. That was 56 B of the ~110 B a GF call allocated,
     /// and it survived returning early from the dispatcher, which is what made it
@@ -4040,7 +4053,7 @@ public static partial class Runtime
 
     /// <summary>Sorts methods by specificity for one call's arguments. A class rather
     /// than the lambda it replaces: a lambda over ARGS captures the dispatcher's own
-    /// parameter, and C# then allocates a display class on entry to DISPATCHGF — on
+    /// parameter, and C# then allocates a display class on entry to DISPATCHGF; on
     /// every call, including the cache hits that never sort anything.</summary>
     private sealed class SpecificityComparer : IComparer<LispMethod>
     {
@@ -4074,9 +4087,9 @@ public static partial class Runtime
     ///
     /// Only the shape that needs nothing but the single argument runs here: a warm
     /// cache entry for this argument's class, one primary method, nothing around it,
-    /// and no keyword checking to do. Everything else — a miss, EQL specializers,
+    /// and no keyword checking to do. Everything else: a miss, EQL specializers,
     /// :around/:before/:after, built-in combinations, the slot reader/writer
-    /// shortcuts, arity errors — builds the array and goes through DISPATCHGF
+    /// shortcuts, arity errors: builds the array and goes through DISPATCHGF
     /// unchanged, so this adds a fast path rather than a second dispatcher.</summary>
     private static LispObject DispatchGF1(GenericFunction gf, LispObject a)
     {
@@ -4140,7 +4153,7 @@ public static partial class Runtime
     /// the slot reader/writer shortcuts). A matching EQL method runs at the head of the
     /// precomputed [eql-method, non-EQL primaries...] chain; with no match the non-EQL
     /// primaries are the whole chain. Mirrors the entry-selection half of DISPATCHGF's
-    /// cache-hit path — the invocation half is INVOKECHAINLOOSE.</summary>
+    /// cache-hit path: the invocation half is INVOKECHAINLOOSE.</summary>
     private static List<LispMethod>? EqlCacheHit(GenericFunction gf, LispObject a)
     {
         var dcache = gf.DispatchCache;
@@ -4263,8 +4276,8 @@ public static partial class Runtime
     /// <summary>The cache entry for these arguments when it is one this path can run
     /// without an argument array, else null (the caller then goes through DISPATCHGF).
     ///
-    /// An entry may hold fewer classes than the call has arguments — it records the
-    /// ones dispatch looked at — so the same rule DISPATCHGF's own scan uses applies:
+    /// An entry may hold fewer classes than the call has arguments, it records the
+    /// ones dispatch looked at, so the same rule DISPATCHGF's own scan uses applies:
     /// compare the classes the entry has, ignore the rest.</summary>
     private static CachedDispatch? PlainCacheHit(
         GenericFunction gf, LispObject a, LispObject? b, LispObject? c, LispObject? d, int argc)
@@ -4303,7 +4316,7 @@ public static partial class Runtime
     /// leaves the captured slots empty, which is how CAPTUREDCNM knows to build from the
     /// chain state (an EQL-specialized method followed by the class-specialized primaries
     /// is the case that has more than one). The arguments of the current invocation are
-    /// published lazily — only CALL-NEXT-METHOD with no arguments needs them as a list,
+    /// published lazily: only CALL-NEXT-METHOD with no arguments needs them as a list,
     /// and it materialises them from the loose slots through CURRENTGFARGS.</summary>
     private static LispObject InvokeChainLoose(
         List<LispMethod> primary, LispObject a, LispObject? b, LispObject? c, LispObject? d, int argc)
@@ -4429,7 +4442,7 @@ public static partial class Runtime
                 // argument classes was built by the protocol on the miss below.
                 if (cached.EffectiveMethodFunction is { } cachedEmf)
                     return cachedEmf.Invoke(args);
-                // Item2: specialized standard slot reader — read the slot directly,
+                // Item2: specialized standard slot reader: read the slot directly,
                 // skipping keyword/eql checks and effective-method construction. The cache
                 // entry was only stored for this shape (1 dispatch arg, single accessor
                 // primary, no aux methods, standard metaclass, instance-allocated slot), so
@@ -4437,12 +4450,12 @@ public static partial class Runtime
                 if (cached.ReaderSlotIndex >= 0 && args[0] is LispInstance readerInst)
                     return SlotValueDirect(readerInst, cached.ReaderSlotIndex,
                                            cached.ReaderSlotName!, cached.ReaderSlotName!.Name);
-                // Item2b: specialized standard slot writer — write the slot directly.
+                // Item2b: specialized standard slot writer: write the slot directly.
                 // (setf accessor) is arity 2: object = args[1], new value = args[0].
                 if (cached.WriterSlotIndex >= 0 && args.Length >= 2 && args[1] is LispInstance writerInst)
                     return SetSlotValueDirect(writerInst, cached.WriterSlotIndex,
                                               cached.WriterSlotName!.Name, args[0]);
-                // Keyword validation must run on the cache-hit path too — a warm
+                // Keyword validation must run on the cache-hit path too: a warm
                 // monomorphic cache otherwise skips the unknown-keyword check that the
                 // cache-miss path performs (ANSI DEFMETHOD.ERROR.14/15).
                 //
@@ -4455,7 +4468,7 @@ public static partial class Runtime
                     && args.Length > gf.RequiredCount + gf.OptionalCount)
                     ValidateGenericKeywords(gf, cached, args);
                 // For EQL specializers: check if any EQL method matches (takes
-                // priority — the cache is only stored for single-required-arg GFs,
+                // priority: the cache is only stored for single-required-arg GFs,
                 // where an applicable EQL method is always the most specific and at
                 // most one EQL value can match; see the cache-store comment).
                 if (cached.HasEqlSpecializers && cached.EqlValues != null)
@@ -4480,7 +4493,7 @@ public static partial class Runtime
                     {
                         var eqlMatch = cached.EqlMethods![eqlIdx];
                         // Fast path: no around/before/after and no non-EQL primaries
-                        // → invoke EQL method directly with minimal overhead
+                        // -> invoke EQL method directly with minimal overhead
                         if (cached.Around.Count == 0 && cached.Before.Count == 0
                             && cached.After.Count == 0 && cached.Primary.Count == 0)
                         {
@@ -4494,7 +4507,7 @@ public static partial class Runtime
                             _nextMethodIndex = 0;
                             _currentGFArgs = args;
                             _nextMethodFallback = null;
-                            // Reset the captured cnm/nmp slots too — otherwise a body
+                            // Reset the captured cnm/nmp slots too: otherwise a body
                             // that captures CALL-NEXT-METHOD would see an enclosing
                             // dispatch's closure instead of "no next method".
                             _capturedNmp = null;
@@ -4514,17 +4527,17 @@ public static partial class Runtime
                             }
                         }
                         // General case: use the precomputed [eql-method, non-EQL
-                        // primaries...] chain — no per-hit list building.
+                        // primaries...] chain: no per-hit list building.
                         var eqlPrimary = cached.EqlChains![eqlIdx];
                         if (cached.Around.Count > 0)
                             return InvokeAroundCombination(cached, eqlPrimary, args);
                         return InvokeStandardCombination(cached.Before, eqlPrimary, cached.After, args);
                     }
-                    // No EQL match — fall through to cached non-EQL result
+                    // No EQL match: fall through to cached non-EQL result
                 }
                 // EQL cache with no matching EQL method and no non-EQL primaries:
-                // mirror the miss path (no-applicable → fallback fn or error;
-                // applicable-but-no-primary → error). Non-EQL caches always have
+                // mirror the miss path (no-applicable -> fallback fn or error;
+                // applicable-but-no-primary -> error). Non-EQL caches always have
                 // >= 1 primary (the miss path throws before storing otherwise).
                 if (cached.HasEqlSpecializers && cached.Primary.Count == 0)
                 {
@@ -4667,14 +4680,14 @@ public static partial class Runtime
         // only, so two calls with the same classes but different EQL values
         // (e.g. (cv :seq x) vs (cv :other x)) share the single cache slot. A
         // class-keyed hit therefore must re-check the EQL methods against the
-        // actual argument values — that is what the hit path's EqlMethods scan
+        // actual argument values: that is what the hit path's EqlMethods scan
         // does. Storing such a cache is only correct when the hit path's
         // reconstruction ("matching EQL method is the most specific primary,
         // prepended to the cached non-EQL primaries") provably matches CLHS
         // 7.6.6 ordering:
         //   - exactly 1 required (dispatch) position: with a single position an
         //     applicable EQL method always beats every class-specialized method,
-        //     and two distinct EQL methods can never both be applicable — so
+        //     and two distinct EQL methods can never both be applicable: so
         //     "prepend the (unique) EQL match" IS the sorted order. With 2+
         //     positions a class method can out-rank an EQL method (leftmost
         //     comparison), so those GFs stay uncached.
@@ -4688,7 +4701,7 @@ public static partial class Runtime
             var types = new LispClass?[n];
             for (int i = 0; i < n && i < args.Length; i++)
                 types[i] = ArgDispatchClass(args[i]);
-            // Item2: specialize a standard slot READER — one dispatch arg, a single
+            // Item2: specialize a standard slot READER: one dispatch arg, a single
             // accessor primary with no before/after/around, a standard-metaclass instance
             // and an instance-allocated slot. The hit path then reads the slot directly
             // (SlotValueDirect), which is exactly what the reader method's body does, minus
@@ -4708,7 +4721,7 @@ public static partial class Runtime
                     readerIdx = sidx;
                     readerName = asd.Name;
                 }
-                // Item2b: (setf accessor) writer — object is the last required arg
+                // Item2b: (setf accessor) writer: object is the last required arg
                 // (args[requiredCount-1]), new value is args[0]. Write the slot directly.
                 else if (requiredCount == 2
                     && args.Length >= 2 && args[1] is LispInstance winst && winst.Class.Metaclass == null
@@ -4855,7 +4868,7 @@ public static partial class Runtime
                 }
                 else if (spec.QualifierPattern is Cons qpCons)
                 {
-                    // Pattern is a list like (:around . *) — match head qualifier
+                    // Pattern is a list like (:around . *): match head qualifier
                     if (qpCons.Car is Symbol headSym)
                         matches = m.Qualifiers.Length > 0 && m.Qualifiers[0].Name == headSym.Name;
                 }
@@ -5224,7 +5237,7 @@ public static partial class Runtime
         List<LispMethod> before, List<LispMethod> primary, List<LispMethod> after,
         LispObject[] args)
     {
-        // Fast path: single primary, no before/after → minimal next-method setup
+        // Fast path: single primary, no before/after -> minimal next-method setup
         if (before.Count == 0 && after.Count == 0 && primary.Count == 1)
         {
             var savedChain = _nextMethodChain;
@@ -5235,7 +5248,7 @@ public static partial class Runtime
             _nextMethodIndex = 1;
             _currentGFArgs = args;
             _nextMethodFallback = null;
-            // Single primary, no before/after → there is no next method. Publish the
+            // Single primary, no before/after -> there is no next method. Publish the
             // default closures thread-locally (the body capture sees "no next method").
             // These were previously installed on the global symbol-functions, which a
             // concurrent dispatch could read mid-window and mis-signal.
@@ -5265,7 +5278,7 @@ public static partial class Runtime
         // Primary methods with call-next-method chain
         var result = InvokeWithNextMethods(primary, 0, args, null);
 
-        // :after methods (least specific first — already sorted that way)
+        // :after methods (least specific first: already sorted that way)
         foreach (var m in after)
             m.Function.Invoke(args);
 
@@ -5294,7 +5307,7 @@ public static partial class Runtime
     private static int _currentGFArgc;
 
     /// <summary>The arguments of the invocation in progress, as a list. CALL-NEXT-METHOD
-    /// with no arguments passes these on, and that is the only reader — so the arity-1
+    /// with no arguments passes these on, and that is the only reader; so the arity-1
     /// path can skip building the array and have it materialised here instead, on the
     /// rare call that asks. An invocation with no next method never gets this far
     /// (the captured closure signals first), so the cost lands only where a real chain
@@ -5314,7 +5327,7 @@ public static partial class Runtime
     }
     [ThreadStatic]
     // The fallback runs the "next method" when the next-method chain (e.g. the
-    // :around list) is exhausted — typically the before/primary/after combination.
+    // :around list) is exhausted: typically the before/primary/after combination.
     // It takes the actual arguments so that (call-next-method ...) with EXPLICIT
     // arguments propagates them to that combination (CLHS 7.6.6.1), rather than
     // capturing the original generic-function arguments.
@@ -5325,7 +5338,7 @@ public static partial class Runtime
     // intrinsics (CapturedCnm/CapturedNmp below). These MUST be thread-local: they
     // used to be published by mutating the GLOBAL symbol-functions of
     // CALL-NEXT-METHOD / NEXT-METHOD-P, which a second thread dispatching
-    // concurrently would clobber — the victim method then captured the other
+    // concurrently would clobber: the victim method then captured the other
     // thread's closure (or the fast-path "no next method" stub) and signalled a
     // spurious "CALL-NEXT-METHOD: no next method" / wrong dispatch (the
     // residual race after the method list became copy-on-write).
@@ -5359,7 +5372,7 @@ public static partial class Runtime
     /// InvokeWithNextMethods installs before invoking the method body. The
     /// defmethod compiler only emits this capture (in the body prologue, before
     /// anything can disturb the thread state) when the body actually mentions
-    /// CALL-NEXT-METHOD / NEXT-METHOD-P — so methods that never use them pay no
+    /// CALL-NEXT-METHOD / NEXT-METHOD-P: so methods that never use them pay no
     /// per-dispatch closure allocation at all. The lazily built closure snapshots
     /// the same values the previous eager version captured, keeping indefinite
     /// extent (CLHS 7.6.6.1).</summary>
@@ -5561,7 +5574,7 @@ public static partial class Runtime
     /// <summary>Is SPECCLS applicable to an argument of ARGCLS through an assignability
     /// the class precedence list does not carry? .NET generic variance is the case that
     /// matters: List&lt;String&gt; implements IEnumerable&lt;String&gt;, and the covariant
-    /// IEnumerable&lt;out T&gt; makes that assignable to IEnumerable&lt;Object&gt; — but
+    /// IEnumerable&lt;out T&gt; makes that assignable to IEnumerable&lt;Object&gt;; but
     /// enumerating it in the CPL would mean spelling out every instantiation over every
     /// supertype of every type argument. Asking the CLR the question only for the
     /// specializers a generic function actually has keeps it bounded.
@@ -5759,7 +5772,7 @@ public static partial class Runtime
 
         // Copy slot values for slots with same name in both old and new class (CLHS 7.2).
         // A slot that is :allocation :class in the NEW class is NOT affected by
-        // change-class — it keeps its existing shared value and must not be
+        // change-class: it keeps its existing shared value and must not be
         // overwritten from the old instance (CLHS 7.2.1; ANSI CHANGE-CLASS.3.2).
         foreach (var newSlot in newClass.EffectiveSlots)
         {
@@ -6059,7 +6072,7 @@ public static partial class Runtime
             ((LispMethod)aiDefaultMethod).HasRest = true;
             Runtime.AddMethod(aiGF, aiDefaultMethod);
 
-            // allocate-instance (standard-generic-function) → real GenericFunction
+            // allocate-instance (standard-generic-function) -> real GenericFunction
             var sgfCls = Runtime.FindClass(Startup.Sym("STANDARD-GENERIC-FUNCTION"));
             var sgfAllocM = Runtime.MakeMethod(new Cons(sgfCls, Nil.Instance), Nil.Instance,
                 new LispFunction(allocArgs => {
@@ -6072,7 +6085,7 @@ public static partial class Runtime
             ((LispMethod)sgfAllocM).HasRest = true;
             Runtime.AddMethod(aiGF, sgfAllocM);
 
-            // allocate-instance (standard-method) → raw LispMethod
+            // allocate-instance (standard-method) -> raw LispMethod
             var smCls = Runtime.FindClass(Startup.Sym("STANDARD-METHOD"));
             var smAllocM = Runtime.MakeMethod(new Cons(smCls, Nil.Instance), Nil.Instance,
                 new LispFunction(allocArgs => new LispMethod()));
@@ -6107,10 +6120,10 @@ public static partial class Runtime
         }
         Startup.RegisterBinary("SLOT-BOUNDP", Runtime.SlotBoundp);
         Startup.RegisterBinary("SLOT-VALUE", Runtime.SlotValue);
-        // SLOT-VALUE-USING-CLASS and (SETF SLOT-VALUE-USING-CLASS) as proper GFs (AMOP §5.4)
+        // SLOT-VALUE-USING-CLASS and (SETF SLOT-VALUE-USING-CLASS) as proper GFs (AMOP 5.4)
         {
             var tCls = Runtime.FindClass(Startup.Sym("T"));
-            // SLOT-VALUE-USING-CLASS (class instance slot-def) → value
+            // SLOT-VALUE-USING-CLASS (class instance slot-def) -> value
             var svucSym = Startup.Sym("SLOT-VALUE-USING-CLASS");
             var svucGF = (GenericFunction)Runtime.MakeGF(svucSym, new Fixnum(3));
             svucGF.RequiredCount = 3;
@@ -6133,7 +6146,7 @@ public static partial class Runtime
             }));
             ((LispMethod)svucDefault).RequiredCount = 3;
             Runtime.AddMethod(svucGF, svucDefault);
-            // (SETF SLOT-VALUE-USING-CLASS) (new-value class instance slot-def) → new-value
+            // (SETF SLOT-VALUE-USING-CLASS) (new-value class instance slot-def) -> new-value
             var setfSvucName = new Cons(Startup.Sym("SETF"), new Cons(svucSym, Nil.Instance));
             var setfSvucGF = (GenericFunction)Runtime.MakeGF(setfSvucName, new Fixnum(4));
             setfSvucGF.RequiredCount = 4;
@@ -6157,7 +6170,7 @@ public static partial class Runtime
             ((LispMethod)setfSvucDefault).RequiredCount = 4;
             Runtime.AddMethod(setfSvucGF, setfSvucDefault);
 
-            // SLOT-BOUNDP-USING-CLASS (class instance slot-def) → boolean (AMOP §5.4).
+            // SLOT-BOUNDP-USING-CLASS (class instance slot-def) -> boolean (AMOP 5.4).
             // The default consults the raw slot vector; custom metaclasses (e.g. McCLIM's
             // dynamic slots) override to consult their own backing store so initforms and
             // slot-boundp see the right state.
@@ -6184,7 +6197,7 @@ public static partial class Runtime
             ((LispMethod)sbucDefault).RequiredCount = 3;
             Runtime.AddMethod(sbucGF, sbucDefault);
 
-            // SLOT-MAKUNBOUND-USING-CLASS (class instance slot-def) → instance (AMOP §5.4).
+            // SLOT-MAKUNBOUND-USING-CLASS (class instance slot-def) -> instance (AMOP 5.4).
             var smucSym = Startup.Sym("SLOT-MAKUNBOUND-USING-CLASS");
             var smucGF = (GenericFunction)Runtime.MakeGF(smucSym, new Fixnum(3));
             smucGF.RequiredCount = 3;
@@ -6247,7 +6260,7 @@ public static partial class Runtime
                 throw new LispErrorException(new LispError(
                     $"SLOT-MAKUNBOUND: no slot named {name} in class {inst.Class.Name.Name}"));
             }
-            // AMOP §5.4: dispatch through slot-makunbound-using-class for custom metaclasses.
+            // AMOP 5.4: dispatch through slot-makunbound-using-class for custom metaclasses.
             if (inst.Class.Metaclass != null && Startup.Sym("SLOT-MAKUNBOUND-USING-CLASS").Function is LispFunction smucFn)
             {
                 smucFn.Invoke(new LispObject[] { inst.Class, inst, inst.Class.EffectiveSlots[idx] });
@@ -6417,7 +6430,7 @@ public static partial class Runtime
         // PROGRAM-ERROR. The compiler rejects it statically (the next-method-p
         // special-form handler) and the per-invocation captured closure checks it
         // at call time, but this globally registered function silently ignored
-        // whatever it was handed — so an interpreted method body, where the
+        // whatever it was handed: so an interpreted method body, where the
         // operator resolves through this binding, returned NIL/T instead of
         // signalling. Same check as CapturedNmp, so all three paths agree.
         Emitter.CilAssembler.RegisterFunction("NEXT-METHOD-P",
@@ -6435,7 +6448,7 @@ public static partial class Runtime
         // (:call "Runtime.X") via the special-form table; the compiled path is
         // unaffected. defclass/defgeneric/defmethod macro-expand into calls to
         // these (DOTCL-INTERNAL package), so the interpreter must be able to
-        // apply them. All map to existing Runtime methods — no new emit.
+        // apply them. All map to existing Runtime methods: no new emit.
         // A fixed-arity builtin also gets a typed direct delegate, so a call site of
         // that arity reaches it through Invoke0..3 instead of InvokeSlow (which pushes
         // a call-stack frame and re-checks the argument count). The wrapper still packs
@@ -6460,7 +6473,7 @@ public static partial class Runtime
         RegClos("%MAKE-SLOT-DEF", a => Runtime.MakeSlotDef(a[0], a[1], a[2]), 3);
         // The :ALLOCATION :CLASS variant of the slot-def lowering target. It was the
         // one member of this family with no function binding, so the DEFCLASS
-        // expansion — which the tree-walk evaluator runs as real code — died with
+        // expansion, which the tree-walk evaluator runs as real code, died with
         // "Undefined function: %MAKE-SLOT-DEF-WITH-ALLOCATION" as soon as a slot
         // carried :allocation (ansi-test CLASS-REDEFINITION.1/2/3). Compiled code
         // never noticed: the compiler emits Runtime.MakeSlotDefWithAllocation
@@ -6474,6 +6487,8 @@ public static partial class Runtime
         // runs the expansion as real code, so every (defclass ... (:metaclass ...))
         // died with "Undefined function: %MAKE-CLASS-FULL".
         RegClos("%MAKE-CLASS-FULL", a => Runtime.MakeClassFull(a[0], a[1], a[2], a[3]), 4);
+        RegClos("%MAKE-CLASS-FULL-OPTIONS",
+            a => Runtime.MakeClassFullOptions(a[0], a[1], a[2], a[3], a[4]), 5);
         RegClos("%SLOT-DEF-RAW-OPTIONS", a => Runtime.SetSlotDefRawOptions(a[0], a[1]), 2);
         RegClos("%SLOT-DEF-ATTRS", a => Runtime.SetSlotDefAttrs(a[0], a[1], a[2], a[3], a[4]), 5);
         RegClos("%SLOT-DEF-DOC", a => Runtime.SetSlotDefDocumentation(a[0], a[1]), 2);
@@ -6519,6 +6534,14 @@ public static partial class Runtime
         RegClos("%MAKE-STRUCT", a => Runtime.MakeStruct(a[0], a.SubArray(1)));
         RegClos("%STRUCT-REF", a => Runtime.StructRef(a[0], a[1]), 2);
         RegClos("%STRUCT-SET", a => Runtime.StructSet(a[0], a[1], a[2]), 3);
+        RegClos("%CHECK-SLOT-TYPE",
+                a => Runtime.CheckSlotType(a[0], a[1], a[2], a[3]), 4);
+        // Two arguments as well as three: a FASL compiled before layouts carried
+        // a version calls this with the pair it knew about, and it still means
+        // "version 0" -- which is what its call sites were compiled against.
+        RegClos("%STRUCT-REGISTER-LAYOUT",
+                a => Runtime.StructRegisterLayout(a[0], a[1],
+                                                  a.Length > 2 ? a[2] : Fixnum.Make(0)));
         RegClos("%STRUCT-TYPEP", a => Runtime.StructTypep(a[0], a[1]), 2);
         RegClos("%COPY-STRUCT", a => Runtime.CopyStruct(a[0]), 1);
         // array/string element-set intrinsics (setf aref / setf char).
@@ -6577,7 +6600,7 @@ public static partial class Runtime
             if (args.Length < 2) throw new Exception("(SETF FIND-CLASS): too few arguments");
             var newVal = args[0];
             // Key by the ORIGINAL package-qualified symbol, never the bare-name-normalized
-            // one — otherwise (setf (find-class 'pa::seq) ...) and (setf (find-class 'pb::seq) ...)
+            // one: otherwise (setf (find-class 'pa::seq) ...) and (setf (find-class 'pb::seq) ...)
             // both land on DOTCL-INTERNAL::SEQ and the second clobbers the first. fset's
             // post.lisp aliases its classes into the FSET2 package exactly this way.
             var sym = (args[1] is Symbol orig && orig.HomePackage != null) ? orig : ToClassSymbol(args[1]);
@@ -6796,7 +6819,7 @@ public static partial class Runtime
                 Runtime.AddMethod(gf, mPrimM);
             }
 
-            // initialize-instance :after for GenericFunction — apply initargs
+            // initialize-instance :after for GenericFunction: apply initargs
             {
                 var afterQuals = new Cons(Startup.Keyword("AFTER"), Nil.Instance);
                 var gfCls2 = Runtime.FindClass(Startup.Sym("GENERIC-FUNCTION"));
@@ -6816,7 +6839,7 @@ public static partial class Runtime
                 ((LispMethod)gfAfterM).HasAllowOtherKeys = true;
                 Runtime.AddMethod(gf, gfAfterM);
 
-                // initialize-instance :after for standard-method — set qualifiers/specializers/function
+                // initialize-instance :after for standard-method: set qualifiers/specializers/function
                 var smCls2 = Runtime.FindClass(Startup.Sym("STANDARD-METHOD"));
                 var smAfterM = Runtime.MakeMethod(new Cons(smCls2, Nil.Instance), afterQuals,
                     new LispFunction(args => {
@@ -6881,7 +6904,7 @@ public static partial class Runtime
                 new LispFunction(Runtime.ReinitializeInstance));
             Runtime.AddMethod(gf, defaultMethod);
 
-            // reinitialize-instance :after for CLASS — applies :NAME, which is how
+            // reinitialize-instance :after for CLASS: applies :NAME, which is how
             // (SETF CLASS-NAME) changes a name. NIL clears the proper name rather than
             // naming the class NIL (CLHS ensure-class: redefinition only happens under
             // a class's proper name).
@@ -7144,7 +7167,7 @@ public static partial class Runtime
             return SlotDefinitionInitfunction(args[0]);
         }, "SLOT-DEFINITION-INITFUNCTION", 1));
 
-        // SLOT-DEFINITION-ALLOCATION → :instance or :class
+        // SLOT-DEFINITION-ALLOCATION -> :instance or :class
         Emitter.CilAssembler.RegisterFunction("SLOT-DEFINITION-ALLOCATION", new LispFunction(args => {
             if (args.Length != 1) throw new LispErrorException(new LispProgramError("SLOT-DEFINITION-ALLOCATION: wrong arg count"));
             return SlotDefinitionAllocation(args[0]);
@@ -7179,9 +7202,9 @@ public static partial class Runtime
             return ClassDirectSuperclasses(args[0]);
         }, "CLASS-DIRECT-SUPERCLASSES", 1));
 
-        // CLASS-DIRECT-SUBCLASSES — the same implementation DOTCL-MOP exposes.
+        // CLASS-DIRECT-SUBCLASSES: the same implementation DOTCL-MOP exposes.
         // This used to be a stub returning NIL for every class, so the answer
-        // depended on which symbol the caller reached: dotcl-mop:… was right and
+        // depended on which symbol the caller reached: dotcl-mop:... was right and
         // the CL one silently wrong. GENERIC-FUNCTION-LAMBDA-LIST had the same
         // split and returned NIL only on Linux (see below).
         Emitter.CilAssembler.RegisterFunction("CLASS-DIRECT-SUBCLASSES", new LispFunction(args => {
@@ -7195,13 +7218,13 @@ public static partial class Runtime
             return ClassPrecedenceListOf(args[0]);
         }, "CLASS-PRECEDENCE-LIST", 1));
 
-        // CLASS-FINALIZED-P — all dotcl classes are considered finalized
+        // CLASS-FINALIZED-P: all dotcl classes are considered finalized
         Emitter.CilAssembler.RegisterFunction("CLASS-FINALIZED-P", new LispFunction(args => {
             if (args.Length != 1) throw new LispErrorException(new LispProgramError("CLASS-FINALIZED-P: wrong arg count"));
             return ClassFinalizedP(args[0]);
         }, "CLASS-FINALIZED-P", 1));
 
-        // CLASS-PROTOTYPE — make a prototype instance of a class
+        // CLASS-PROTOTYPE: make a prototype instance of a class
         Emitter.CilAssembler.RegisterFunction("CLASS-PROTOTYPE", new LispFunction(args => {
             if (args.Length != 1) throw new LispErrorException(new LispProgramError("CLASS-PROTOTYPE: wrong arg count"));
             return ClassPrototypeOf(args[0]);
@@ -7222,7 +7245,7 @@ public static partial class Runtime
         // GENERIC-FUNCTION-LAMBDA-LIST is registered by Mop.cs (returns the stored
         // lambda-list / arity placeholder). A leftover stub here returned NIL for any
         // GF and, depending on startup registration order, shadowed the real one on
-        // some platforms (Linux) but not others (Windows) — making
+        // some platforms (Linux) but not others (Windows): making
         // generic-function-lambda-list return NIL only on Linux. Removed so only
         // Mop.cs registers it.
 
@@ -7240,7 +7263,7 @@ public static partial class Runtime
             throw new LispErrorException(new LispTypeError("METHOD-SPECIALIZERS: not a method", args[0]));
         }, "METHOD-SPECIALIZERS", 1));
 
-        // METHOD-GENERIC-FUNCTION — the generic function this method is attached
+        // METHOD-GENERIC-FUNCTION: the generic function this method is attached
         // to, or NIL while it is unattached. The comment here used to say "not
         // tracked in dotcl" and the body returned NIL for every method, but
         // LispMethod.Owner has tracked it all along (ADD-METHOD sets it,
@@ -7250,7 +7273,7 @@ public static partial class Runtime
             return MethodGenericFunction(args[0]);
         }, "METHOD-GENERIC-FUNCTION", 1));
 
-        // METHOD-LAMBDA-LIST — rebuilt from the recorded arity (dotcl does not
+        // METHOD-LAMBDA-LIST: rebuilt from the recorded arity (dotcl does not
         // keep the source lambda list). Used to return NIL for every method here
         // while DOTCL-MOP returned the real shape.
         Emitter.CilAssembler.RegisterFunction("METHOD-LAMBDA-LIST", new LispFunction(args => {
@@ -7258,14 +7281,14 @@ public static partial class Runtime
             return MethodLambdaList(args[0]);
         }, "METHOD-LAMBDA-LIST", 1));
 
-        // MAKE-METHOD-LAMBDA — stub (needed by some MOP code)
+        // MAKE-METHOD-LAMBDA: stub (needed by some MOP code)
         Emitter.CilAssembler.RegisterFunction("MAKE-METHOD-LAMBDA", new LispFunction(args => {
             // (make-method-lambda gf method lambda-form env)
             if (args.Length < 3) throw new LispErrorException(new LispProgramError("MAKE-METHOD-LAMBDA: wrong arg count"));
             return args[2];  // return the lambda form as-is
         }, "MAKE-METHOD-LAMBDA"));
 
-        // ENSURE-CLASS — create/redefine a class honoring :metaclass,
+        // ENSURE-CLASS: create/redefine a class honoring :metaclass,
         // :direct-superclasses, and :direct-slots, then register it. Mirrors what
         // DEFCLASS expands to (%register-class (%make-class-full ...)) so a custom
         // metaclass is preserved (AMOP). Previously a stub that ignored them.

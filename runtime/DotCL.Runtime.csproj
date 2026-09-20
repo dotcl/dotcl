@@ -35,15 +35,15 @@
        further down read it, so the two can never disagree.
 
        Off where the platform forbids generating code at run time:
-         - netstandard2.0 — System.Reflection.Emit is not in the API surface
-         - browser-wasm   — the API is present but the runtime rejects it
+         - netstandard2.0, System.Reflection.Emit is not in the API surface
+         - browser-wasm, the API is present but the runtime rejects it
        Keyed off the RID (and a browser TFM) rather than the framework alone,
        because a wasm build is net10.0, not netstandard2.0: gating on the framework
        would have defined DOTCL_EMIT for it and produced a build whose compiler
        cannot run.
 
        DotclNoEmit=true forces it off for any target. That is how the emit-free
-       runtime gets built — and therefore run and tested — on an ordinary desktop
+       runtime gets built, and therefore run and tested, on an ordinary desktop
        framework, instead of only as a netstandard2.0 library that also drags in an
        older BCL. It isolates "no emit" from everything else that differs. -->
   <PropertyGroup>
@@ -61,9 +61,9 @@
     <PackageId>DotCL.Runtime</PackageId>
     <!-- <Version> comes from runtime/Directory.Build.props (single source of truth). -->
     <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
-    <Description>Common Lisp on .NET — embeddable runtime library</Description>
+    <Description>Common Lisp on .NET; embeddable runtime library</Description>
     <Authors>SANO Masatoshi</Authors>
-    <Copyright>Copyright © 2026 SANO Masatoshi</Copyright>
+    <Copyright>Copyright (c) 2026 SANO Masatoshi</Copyright>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageProjectUrl>https://github.com/dotcl/dotcl</PackageProjectUrl>
     <RepositoryUrl>https://github.com/dotcl/dotcl.git</RepositoryUrl>
@@ -75,7 +75,7 @@
     <!-- Building for the browser narrows this to browser-wasm alone. With the wasm
          workload present the SDK resolves a Mono runtime pack for every declared
          RID, and Microsoft.NETCore.App.Runtime.Mono.win-x64 (and the other desktop
-         ones) does not exist — restore fails before anything is compiled. The list
+         ones) does not exist; restore fails before anything is compiled. The list
          above is what the desktop packages ship; a wasm build needs none of it. -->
     <RuntimeIdentifiers Condition="$(RuntimeIdentifier.StartsWith('browser'))">browser-wasm</RuntimeIdentifiers>
   </PropertyGroup>
@@ -101,7 +101,12 @@
          the per-RID tool packages (dotcl.<rid>), not in this framework-dependent
          library package. Without this exclude the contrib/** glob bundled all 6 RIDs'
          R2R fasls (~35MB), tripling the package. -->
-    <None Include="contrib/**/*" Exclude="contrib/**/*.cs;contrib/**/*.dll;contrib/**/*.fasl.r2r-*"
+    <!-- Both R2R spellings: the current *.fasl.r2r-<rid> and the pre-rename
+         <name>-r2r-<rid>.fasl that an older tree still holds. This list is a twin
+         of ContribR2RExclude in runtime.csproj; it was written out literally here
+         and so missed the rename, leaving 22 MB of other RIDs' siblings in this
+         package (asdf-r2r-*.fasl alone is 6 x ~7 MB). Keep the two in step. -->
+    <None Include="contrib/**/*" Exclude="contrib/**/*.cs;contrib/**/*.dll;contrib/**/*.fasl.r2r-*;contrib/**/*-r2r-*"
           Condition="Exists('contrib')" Pack="true" PackagePath="dotclassets/contrib/" />
     <None Include="build/DotCL.Runtime.targets" Pack="true" PackagePath="build/" />
     <None Include="build/DotCL.Runtime.targets" Pack="true" PackagePath="buildTransitive/" />
@@ -113,7 +118,7 @@
     <!-- Project-core build: the targets that drive the in-process tasks. The task
          assembly itself (tasks/DotCL.Build.Tasks.dll) is built and added to the
          package by the _PackProjectCoreTask target below, which ERRORS if the build
-         didn't produce it — so the package can never silently ship without the task.
+         didn't produce it; so the package can never silently ship without the task.
          A previous release (0.1.12) shipped without it: the old item was guarded by
          Condition=Exists, so when the task hadn't been built at pack time it was
          dropped silently, and consumers using it as a build task hit MSB4036 (#44). -->
@@ -128,7 +133,7 @@
 
   <!-- Build the in-process project-core MSBuild task and pack it under tasks/.
        Runs before pack collects files. The task ProjectReferences this library, so
-       it can only be built after this project — hence a pack-time MSBuild call here
+       it can only be built after this project; hence a pack-time MSBuild call here
        rather than a ProjectReference. Fails loudly if the DLL is missing instead of
        silently shipping a package whose targets reference a non-existent task. -->
   <Target Name="_PackProjectCoreTask" BeforeTargets="GenerateNuspec">
@@ -143,7 +148,7 @@
            Text="Project-core MSBuild task not found at $(_DotclTaskDll) after building build-tasks. The package would ship without tasks/DotCL.Build.Tasks.dll and break for build-task consumers (#44)." />
   </Target>
 
-  <!-- Exclude Program.cs — entry point lives in the dotcl tool project -->
+  <!-- Exclude Program.cs; entry point lives in the dotcl tool project -->
   <ItemGroup>
     <Compile Remove="Program.cs" />
     <!-- PackRestamp.cs is `dotcl pack` tooling (rewrites nupkgs on the packaging
@@ -177,14 +182,14 @@
 
   <!-- DotclSta: can a single-threaded apartment be created? Decided once, like
        DotclEmit above, so the constant and the source exclusion cannot drift apart.
-       Gates Runtime.Sta.cs — the STA thread and message loop behind
-       dotnet:ui-invoke / ui-post — and, through DOTCL_NO_STA, the registration of
+       Gates Runtime.Sta.cs, the STA thread and message loop behind
+       dotnet:ui-invoke / ui-post, and, through DOTCL_NO_STA, the registration of
        those two functions in Startup.cs, which would otherwise name a type that is
        no longer compiled.
 
        Apartments are a COM concept, so this is Windows-only; the dependency is
        Thread.SetApartmentState, not any UI framework. System.Windows.Forms is never
-       referenced here — the caller loads it and it is looked up reflectively.
+       referenced here; the caller loads it and it is looked up reflectively.
 
        Off for any non-Windows RID, for a host that is not Windows, and for ns2.0.
        browser is listed explicitly: a wasm build is net10.0 and its RID is neither
@@ -237,10 +242,10 @@
     <Compile Remove="Emitter/CompilerEnv.cs" />
     <Compile Remove="Emitter/IlDisasm.cs" />
     <Compile Remove="Emitter/CilAssembler.Emit.cs" />
-    <!-- Runtime .NET class generation (AssemblyBuilder/TypeBuilder) — emit-only;
+    <!-- Runtime .NET class generation (AssemblyBuilder/TypeBuilder); emit-only;
          dotnet:define-class throws on this target (guarded in Runtime.DotNet.cs). -->
     <Compile Remove="Emitter/DynamicClassBuilder.cs" />
-    <!-- Dynamic native FFI (DynamicMethod + calli) — emit-only. -->
+    <!-- Dynamic native FFI (DynamicMethod + calli); emit-only. -->
     <Compile Remove="Runtime.FFI.cs" />
   </ItemGroup>
 
@@ -250,7 +255,7 @@
                       ReferenceOutputAssembly="false" />
   </ItemGroup>
 
-  <!-- DotclNoJson: build a JSON-free runtime — drops dotnet:require (NuGet load)
+  <!-- DotclNoJson: build a JSON-free runtime; drops dotnet:require (NuGet load)
        and its only dependency, System.Text.Json. Used for targets whose BCL lacks
        System.Text.Json and that can't load NuGet at run time anyway (Unity IL2CPP/
        WebGL): build with -p:DotclNoJson=true. Off by default. -->

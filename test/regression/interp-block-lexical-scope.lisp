@@ -2,7 +2,7 @@
 ;;;
 ;;; %MINI-EVAL's BLOCK used the block-name symbol itself as the CATCH tag, which
 ;;; made the scope DYNAMIC. A same-named inner BLOCK then hid the outer one for
-;;; everything running inside it — including a closure whose text is lexically
+;;; everything running inside it: including a closure whose text is lexically
 ;;; outside.
 ;;;
 ;;;   (block done
@@ -16,7 +16,7 @@
 ;;;
 ;;; The fix gives every BLOCK entry a fresh tag recorded in its own namespace in
 ;;; ENV (%MINI-BLOCKS). A closure carries the ENV it was made in, so looking the
-;;; tag up there is exactly the lexical rule — the same shape GO tags use.
+;;; tag up there is exactly the lexical rule: the same shape GO tags use.
 
 (defun %bl (mode form)
   (let ((dotcl:*evaluator-mode* mode))

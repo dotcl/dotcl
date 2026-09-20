@@ -38,7 +38,7 @@
   (sort (list 3 1 2) #'< :bogus t :allow-other-keys t)
   (1 2 3))
 
-;;; APPLY takes the args-array path — it must produce the same answer.
+;;; APPLY takes the args-array path: it must produce the same answer.
 (deftest sort-direct.apply-matches-direct
   (equal (sort (list 3 1 2) #'< :key #'identity)
          (apply #'sort (list (list 3 1 2) #'< :key #'identity)))

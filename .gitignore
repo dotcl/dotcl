@@ -7,6 +7,12 @@ runtime/sdk/bin/
 runtime/sdk/obj/
 test/debug-pdb/pdbcheck/bin/
 test/debug-pdb/pdbcheck/obj/
+bench/il-parity/bin/
+bench/il-parity/obj/
+bench/il-parity/tool/bin/
+bench/il-parity/tool/obj/
+bench/csharp-parity/bin/
+bench/csharp-parity/obj/
 output/
 
 ## Generated
@@ -35,14 +41,20 @@ bench-state.json
 
 ## temp Scripts
 *.sh
-# …but committed tooling scripts are kept.
+# ...but committed tooling scripts are kept.
 !scripts/ilverify-check.sh
 !scripts/fasl-shape-check.sh
 !scripts/build-quicklisp.sh
 !scripts/contrib-resolve.sh
 !ci/d-number.sh
 !ci/mirror-scrub-workflows.sh
+!test/ansi-failures.sh
+!test/ansi-gate.sh
 !bench/make-state.sh
+!bench/check-ratios.sh
+!bench/il-parity/check-counts.sh
+!bench/csharp-parity/make-parity-state.sh
+!bench/library-status/run-quickload.sh
 !samples/**/*.sh
 !test/*/check.sh
 
@@ -64,6 +76,16 @@ scratch.txt
 
 ## ANSI test artifacts (generated at project root)
 *.txt
+# ...except the per-case method maps, which are the comparator's input, not output.
+!bench/il-parity/*/methods.txt
+# ...except the library-status target list: it is generated, but from dist
+# metadata rather than from a run, so it is checked in and reviewed as the input
+# to the next stage (bench/library-status/README.md).
+!bench/library-status/targets.txt
+# ...and the hand-picked list, which is the opposite: written by hand and read
+# by rank.lisp, so losing it would lose the only record of why those targets
+# are on the list at all.
+!bench/library-status/hand-picked.txt
 *.fasl
 # Ahead-of-time siblings (<name>.fasl.r2r-<rid>, dotcl.core.r2r-<rid>). The
 # marker sits after the whole filename so that *.fasl globs do not match one,
@@ -87,6 +109,9 @@ sandbox/
 docs/**/*.mp4
 docs/**/*~
 out/
+# Disposable build artifacts: the pinned seed install, the selfhost stages, and
+# the marker that keeps all of it out of a scanning source registry.
+/build/
 runtime/contrib/
 contrib/asdf/
 contrib/quicklisp/

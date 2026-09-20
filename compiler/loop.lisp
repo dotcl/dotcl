@@ -51,9 +51,9 @@
 ;; $aclHeader: loop.cl,v 1.5 91/12/04 01:13:48 cox acl4_1 $
 
 ;;;; LOOP Iteration Macro
-;;;; Ported from CMUCL for dotcl — implementation-specific parts removed.
+;;;; Ported from CMUCL for dotcl: implementation-specific parts removed.
 
-;;; No separate package — all symbols in host's current package
+;;; No separate package: all symbols in host's current package
 ;;; CL package must be unlocked before loading this file (see cil-compile.ros)
 
 ;;; Technology.
@@ -1567,7 +1567,7 @@ collected result will be returned as the value of the LOOP."
 	 ;;
 	 ;; STEPS = PRE-LOOP-STEPS = (var val); both go through loop-make-psetq so
 	 ;; the *loop-before-loop* form matches the step form and loop-body merges
-	 ;; the first assignment into the start of the body — i.e. AFTER the loop
+	 ;; the first assignment into the start of the body: i.e. AFTER the loop
 	 ;; prologue, so an earlier :initially clause runs first, per ANSI CL
 	 ;; 6.1.7.2 (prologue clauses execute in source order). This matches SBCL.
 	 ;; A PRE-LOOP-PSEUDO-STEP (loop-make-desetq) here would not match the psetq
@@ -2039,7 +2039,7 @@ collected result will be returned as the value of the LOOP."
 	 ;; This avoids needing WITH-PACKAGE-ITERATOR.
 	 (collector (cond ((or (equal symbol-types '(:internal :external :inherited))
 			      (equal symbol-types '(:external :internal :inherited)))
-			   ;; all symbols (symbol/symbols path) — includes inherited
+			   ;; all symbols (symbol/symbols path): includes inherited
 			   `(%package-all-symbols ,pkg))
 			  ((equal symbol-types '(:external))
 			   ;; external symbols only
@@ -2261,7 +2261,7 @@ collected result will be returned as the value of the LOOP."
 ;;; These replicate the defmacro logic so they work on both HOST and TARGET.
 
 (defun %expand-loop-copylist* (form)
-  ;; (loop-copylist* l) → (copy-list l)
+  ;; (loop-copylist* l) -> (copy-list l)
   (let ((l (cadr form)))
     `(copy-list ,l)))
 
@@ -2433,7 +2433,7 @@ collected result will be returned as the value of the LOOP."
                  (nreverse ans)))
              (pify (l) (if (null (cdr l)) (car l) `(progn ,@l)))
              (makebody ()
-               ;; Prologue first — see the LOOP-BODY macro above, which this
+               ;; Prologue first: see the LOOP-BODY macro above, which this
                ;; mirrors. Emitting BEFORE-LOOP first ran a FOR clause's first
                ;; assignment, and a first termination test, ahead of a
                ;; textually-earlier :initially.
@@ -2519,7 +2519,7 @@ collected result will be returned as the value of the LOOP."
                   (push expanded result)
                   (setf current (cdr current))))
        (if (and (not changed) (null current))
-           form  ;; Nothing changed — return original
+           form  ;; Nothing changed; return original
            (let ((proper (nreverse result)))
              (if (null current)
                  proper

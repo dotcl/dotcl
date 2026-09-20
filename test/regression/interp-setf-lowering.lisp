@@ -1,13 +1,13 @@
 ;;; SETF of SYMBOL-VALUE and of GET expand into the lowering targets
 ;;; %SET-SYMBOL-VALUE and PUT-PROP. The compiler recognises both in its
 ;;; special-form emit table and calls Runtime.SetSymbolValue / Runtime.PutProp
-;;; inline, so neither name ever got a function binding — and the tree-walk
+;;; inline, so neither name ever got a function binding: and the tree-walk
 ;;; interpreter resolves an operator through SYMBOL-FUNCTION. An interpreted
 ;;;   (setf (symbol-value s) v)   died with "Undefined function: %SET-SYMBOL-VALUE"
 ;;;   (setf (get s k) v)          died with "Undefined function: PUT-PROP"
 ;;; This is the same class as the package/setf lowering targets that were given
-;;; function entities earlier — the compiler's name test being the only
-;;; definition — and the fix follows the PUTHASH precedent already in
+;;; function entities earlier, the compiler's name test being the only
+;;; definition, and the fix follows the PUTHASH precedent already in
 ;;; cil-forms.lisp.
 ;;;
 ;;; Both evaluator paths are asserted by binding dotcl:*evaluator-mode* around

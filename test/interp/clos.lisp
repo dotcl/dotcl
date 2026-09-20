@@ -1,4 +1,4 @@
-;;;; CLOS evaluated by the tree-walk interpreter (%mini-eval) — no compilation.
+;;;; CLOS evaluated by the tree-walk interpreter (%mini-eval): no compilation.
 ;;;; defclass / defgeneric / defmethod / defstruct expand to runtime CLOS
 ;;;; intrinsics that are registered as callable functions; method bodies become
 ;;;; interpreted closures. Run under :interpret.

@@ -12,7 +12,7 @@ namespace DotCL.Emitter;
 /// the portable <c>netstandard</c> facade instead of <c>System.Private.CoreLib</c>.
 ///
 /// Why: the dev compiler runs on CoreCLR, so <see cref="System.Reflection.Emit.PersistedAssemblyBuilder"/>
-/// stamps every base-type reference (System.Object/Int64/Func&lt;&gt;/…) as living in
+/// stamps every base-type reference (System.Object/Int64/Func&lt;&gt;/...) as living in
 /// <c>System.Private.CoreLib</c>. NativeAOT shares that corlib so the fasl links there,
 /// but Unity's IL2CPP/Mono BCL exposes only <c>netstandard</c>/<c>mscorlib</c> and cannot
 /// resolve <c>System.Private.CoreLib</c>. A netstandard-referencing fasl loads under
@@ -20,8 +20,8 @@ namespace DotCL.Emitter;
 /// type-forwarders redirect the base types to the real corlib).
 ///
 /// The rewrite is a surgical in-place byte patch of the single AssemblyRef row:
-/// name string (<c>System.Private.CoreLib</c> → <c>netstandard</c>, shorter so it fits),
-/// version (→ 2.1.0.0) and public-key token (→ the netstandard facade token). Offsets are
+/// name string (<c>System.Private.CoreLib</c> -> <c>netstandard</c>, shorter so it fits),
+/// version (-> 2.1.0.0) and public-key token (-> the netstandard facade token). Offsets are
 /// located with the public <see cref="MetadataReader"/> table/heap-offset APIs, so no
 /// hand-rolled metadata-header parsing. The patched file is re-read and verified.
 /// </summary>
@@ -30,7 +30,7 @@ internal static class FaslCorlibRetarget
     private const string SpclName = "System.Private.CoreLib";
     private const string NetstandardName = "netstandard";
 
-    // Well-known netstandard facade identity — matches Unity IL2CPP's netstandard.dll
+    // Well-known netstandard facade identity: matches Unity IL2CPP's netstandard.dll
     // (netstandard, 2.1.0.0, PublicKeyToken=cc7b13ffcd2ddd51).
     private const ushort NsMajor = 2, NsMinor = 1, NsBuild = 0, NsRevision = 0;
     private static readonly byte[] NetstandardToken =
@@ -108,12 +108,12 @@ internal static class FaslCorlibRetarget
 
         // 3) Name string in #Strings, in place. "System.Private.CoreLib" (22) is longer
         //    than "netstandard" (11), so it fits; the trailing bytes become an
-        //    unreferenced orphan string (harmless — nothing indexes into them).
+        //    unreferenced orphan string (harmless: nothing indexes into them).
         var newName = System.Text.Encoding.UTF8.GetBytes(NetstandardName);
         Array.Copy(newName, 0, bytes, nameFileOffset, newName.Length);
         bytes[nameFileOffset + newName.Length] = 0; // null terminator
 
-        // 4) PublicKeyOrToken blob → [0x08][netstandard 8-byte token], in place. Any
+        // 4) PublicKeyOrToken blob -> [0x08][netstandard 8-byte token], in place. Any
         //    leftover bytes of the old (larger) blob become unreferenced heap data.
         bytes[blobFileOffset] = (byte)NetstandardToken.Length; // compressed length 8 = one byte
         Array.Copy(NetstandardToken, 0, bytes, blobFileOffset + 1, NetstandardToken.Length);

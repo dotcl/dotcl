@@ -106,7 +106,7 @@
             (push form forms)
             (setq pos next)))
     (mapcar (lambda (f)
-              ;; (eval-when (...) (cl:require "nuget") (funcall (find-symbol ...) NAME . args))
+              ;; (eval-when (...) (cl:require "dotcl-nuget") (funcall (find-symbol ...) NAME . args))
               (let ((call (car (last f))))
                 (cons (third call) (nthcdr 3 call))))
             (reverse forms)))

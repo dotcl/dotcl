@@ -1,7 +1,7 @@
 ;;; A literal nested deeper than the emitter's inline-depth cap must still be
 ;;; rebuilt by the .fasl itself. Past the cap the constant used to be parked in
 ;;; the process-local constant pool and reloaded with CilAssembler.GetConstant,
-;;; which the compiling process resolves fine — but a *fresh* process loading the
+;;; which the compiling process resolves fine: but a *fresh* process loading the
 ;;; fasl reads whatever unrelated object happens to sit at that index (or indexes
 ;;; past the pool and dies with an index-out-of-bounds).
 ;;;
@@ -126,8 +126,8 @@
   (t 3000 (sub 0) 499 500 (sub 2996) 2999))
 
 ;;; MANY medium literals inside ONE top level form. Individually every one of
-;;; them clears the existing caps — not deep, not a long list, not a long vector
-;;; — but they all land in the same method and simply accumulate. That is how a
+;;; them clears the existing caps: not deep, not a long list, not a long vector,
+;;; but they all land in the same method and simply accumulate. That is how a
 ;;; single top level form reached megabytes of IL, which the JIT has to compile
 ;;; in full when the fasl is loaded. Past a per-method budget each further
 ;;; literal goes into its own helper method, so the round trip has to survive
@@ -203,7 +203,7 @@
       (write-string "(defparameter *a* '())" s) (terpri s)
       (write-string "(defparameter *b* '())" s) (terpri s)
       ;; One pool of symbol objects, made at compile time, spliced into both
-      ;; forms — so the two occurrences really are the same object and the fasl
+      ;; forms: so the two occurrences really are the same object and the fasl
       ;; has to reproduce that.
       (format s "(eval-when (:compile-toplevel :load-toplevel :execute)~%  ~
                    (defparameter *pool*~%    ~

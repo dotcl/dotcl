@@ -6,7 +6,7 @@ public sealed class LispString : LispObject
     // - LispString(string) starts with _str set and _chars null (no ToCharArray copy).
     // - First mutating access (index set, ToUpperInPlace, RawChars) materializes _chars.
     // This is the dominant LispString allocation pattern (format/printer output) where
-    // the result is consumed read-only — making the ToCharArray copy pure waste.
+    // the result is consumed read-only: making the ToCharArray copy pure waste.
     private string? _str;
     private char[]? _chars;
 
@@ -44,7 +44,7 @@ public sealed class LispString : LispObject
     // of the image's life. Bulk readers use this instead.
     internal ReadOnlySpan<char> Chars => _chars is { } c ? c : _str.AsSpan();
 
-    // Bulk access for Array.Fill / Array.Copy optimizations — forces materialization
+    // Bulk access for Array.Fill / Array.Copy optimizations: forces materialization
     internal char[] RawChars
     {
         get

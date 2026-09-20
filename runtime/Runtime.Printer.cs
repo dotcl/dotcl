@@ -36,7 +36,7 @@ public static partial class Runtime
 
             case ReadtableCase.Invert:
             {
-                // All uppercase → all lowercase; all lowercase → all uppercase; mixed → as-is
+                // All uppercase -> all lowercase; all lowercase -> all uppercase; mixed -> as-is
                 // *print-case* is ignored for :invert
                 bool hasUpper = false, hasLower = false;
                 foreach (char c in name)
@@ -133,7 +133,7 @@ public static partial class Runtime
     /// True if the bare token NAME would read back, in *PACKAGE*, as the
     /// COMMON-LISP symbol of that name. NIL and T are their own object types
     /// here, so they skip the accessibility check FormatSymbol does for every
-    /// other symbol — and CLHS 22.1.3.3 grants them no exemption. Printed bare
+    /// other symbol: and CLHS 22.1.3.3 grants them no exemption. Printed bare
     /// in a package that does not inherit COMMON-LISP they read back as a
     /// DIFFERENT symbol of the same name, breaking print/read consistency
     /// silently: coalton prints a form and re-reads it in a package that uses
@@ -168,8 +168,8 @@ public static partial class Runtime
 
         if (!effectiveEscape)
         {
-            // princ: print the symbol name only. The package prefix — including
-            // the keyword colon and the #: for uninterned symbols — is printed
+            // princ: print the symbol name only. The package prefix, including
+            // the keyword colon and the #: for uninterned symbols, is printed
             // only when *print-escape* / *print-readably* is true (CLHS 22.1.3.3).
             // SBCL: (princ-to-string :foo) => "FOO", not ":FOO".
             return name;
@@ -203,7 +203,7 @@ public static partial class Runtime
         var currentPkg = CurrentPackage("PRIN1");
         var (found, status) = currentPkg.FindSymbol(sym.Name);
         if (status != SymbolStatus.None && ReferenceEquals(found, sym))
-            return escapedName;  // Accessible in current package — no prefix needed
+            return escapedName;  // Accessible in current package; no prefix needed
 
         // Need package prefix. A local nickname of the home package in the
         // package being printed FROM wins over the physical name: that is the
@@ -247,7 +247,7 @@ public static partial class Runtime
     /// </summary>
     private static bool SymbolNeedsEscaping(string name)
     {
-        if (name.Length == 0) return true; // empty name → ||
+        if (name.Length == 0) return true; // empty name -> ||
 
         // Get current readtable and its case
         var rtSym = Startup.CL.FindSymbol("*READTABLE*").symbol;
@@ -290,7 +290,7 @@ public static partial class Runtime
                     if (char.IsUpper(c)) return true;
                     break;
                 case ReadtableCase.Invert:
-                    // Invert: all-upper → all-lower, all-lower → all-upper, mixed → preserve
+                    // Invert: all-upper -> all-lower, all-lower -> all-upper, mixed -> preserve
                     // The printer also inverts in ApplyPrintCase, so it should round-trip.
                     break;
                 case ReadtableCase.Preserve:
@@ -388,7 +388,7 @@ public static partial class Runtime
                 char upper = char.ToUpperInvariant(c);
                 if (IsDigitInBase(c, radix)) { hasDigit = true; continue; }
                 if (c == '+' || c == '-' || c == '/' || c == '.' || c == '^' || c == '_') continue;
-                // Number markers: D E F L S — only count as number markers if they're NOT valid digits
+                // Number markers: D E F L S: only count as number markers if they're NOT valid digits
                 if (!IsDigitInBase(c, radix) && "DEFLS".IndexOf(upper) >= 0)
                 {
                     hasNonDigitLetter = true;
@@ -451,7 +451,7 @@ public static partial class Runtime
             if (_circleTable.TryGetValue(obj, out int circState))
             {
                 if (circState < 0) return $"#{-circState}#"; // back-reference
-                if (circState == 0) // first occurrence — assign label
+                if (circState == 0) // first occurrence; assign label
                 {
                     int label = ++_circleLabelCounter;
                     _circleTable[obj] = -label;
@@ -478,7 +478,7 @@ public static partial class Runtime
             // A user define-condition with :report generates a print-object method on the
             // condition class; under *print-escape*=NIL it produces the report. The
             // condition is a LispInstanceCondition wrapping the CLOS instance, so it never
-            // reaches the LispInstance print-object dispatch below — route it here, else the
+            // reaches the LispInstance print-object dispatch below: route it here, else the
             // native FormatControl/Message fallback prints "#<TYPE>".
             if (condReport is LispInstanceCondition lic)
             {
@@ -492,7 +492,7 @@ public static partial class Runtime
                     // escape=false path; InvokePrintObjectBound binds it to NIL.
                     // No catch: a real error inside the user's print-object (e.g. a TYPE-ERROR
                     // in a parser-library report) must propagate, not be swallowed into
-                    // "#<TYPE>" — that hid the true cause during debugging.
+                    // "#<TYPE>": that hid the true cause during debugging.
                     try { return InvokePrintObjectBound(gf, lic.Instance, false); }
                     finally { ExitPrintObject(lic.Instance); }
                 }
@@ -552,7 +552,7 @@ public static partial class Runtime
                     && _circleTable.TryGetValue(sym, out int symState))
                 {
                     if (symState < 0) return $"#{-symState}#"; // back-reference
-                    if (symState == 0) // shared, first print — assign label
+                    if (symState == 0) // shared, first print; assign label
                     {
                         int label = ++_circleLabelCounter;
                         _circleTable[sym] = -label;
@@ -566,7 +566,7 @@ public static partial class Runtime
                 if (_circleTable != null && _circleTable.TryGetValue(cons, out int cState))
                 {
                     if (cState < 0) return $"#{-cState}#"; // back-reference
-                    if (cState == 0) // shared, first print — assign label
+                    if (cState == 0) // shared, first print; assign label
                     {
                         int label = ++_circleLabelCounter;
                         _circleTable[cons] = -label;
@@ -592,7 +592,7 @@ public static partial class Runtime
             case DoubleFloat df:
                 return FormatDoubleFloat(df.Value);
             case LispDecimal dec:
-                // #m<value> — round-trippable, scale preserved (InvariantCulture).
+                // #m<value>: round-trippable, scale preserved (InvariantCulture).
                 return "#m" + dec.Value.ToString(System.Globalization.CultureInfo.InvariantCulture);
             case LispPathname pn:
             {
@@ -821,10 +821,10 @@ public static partial class Runtime
     }
 
     /// <summary>How an infinity or NaN prints. There is no standard token for these,
-    /// so the readable form names a constant and evaluates it with #. — which only
+    /// so the readable form names a constant and evaluates it with #.; which only
     /// works if the name exists (it does now, in DOTCL) and *READ-EVAL* is true.
     /// With read-eval off the value cannot be printed readably at all: emit the
-    /// unreadable #&lt;…&gt; form, or signal PRINT-NOT-READABLE if the caller asked for
+    /// unreadable #&lt;...&gt; form, or signal PRINT-NOT-READABLE if the caller asked for
     /// readable output. This is the behaviour SBCL has.</summary>
     private static string NonFiniteFloatForm(LispObject value, string constantName)
     {
@@ -841,7 +841,7 @@ public static partial class Runtime
         return $"#<DOTCL:{constantName}>";
     }
 
-    /// <summary>The same choice without the signal, for LispObject.ToString — which
+    /// <summary>The same choice without the signal, for LispObject.ToString; which
     /// diagnostics call and which therefore must not throw.</summary>
     internal static string NonFiniteFloatFormSafe(string constantName)
         => GetReadEval() ? $"#.DOTCL:{constantName}" : $"#<DOTCL:{constantName}>";
@@ -1204,7 +1204,7 @@ public static partial class Runtime
         {
             return IsTruthy(Typep(obj, typeSym));
         }
-        // Any other (compound) type specifier — (MEMBER ...), (AND ...), (OR ...),
+        // Any other (compound) type specifier: (MEMBER ...), (AND ...), (OR ...),
         // (SATISFIES ...), (NOT ...), etc. Delegate to TYPEP so set-pprint-dispatch
         // can key on the full set of type specifiers (ANSI PPRINT-DISPATCH.7-9: a
         // (MEMBER x y) entry must match both x and y).
@@ -1258,7 +1258,7 @@ public static partial class Runtime
         {
             // Structure slots are part of the graph. Leaving them out meant a cycle
             // closing through a slot was never detected, and FormatStruct printed the
-            // object again at every turn — unbounded output at full CPU rather than
+            // object again at every turn: unbounded output at full CPU rather than
             // #1=#S(...  #1#). The format side already looks structures up here; only
             // this pass was missing them.
             if (table.TryGetValue(st, out int state))
@@ -1267,7 +1267,7 @@ public static partial class Runtime
                 return;
             }
             table[st] = 1;
-            foreach (var slot in st.Slots)
+            foreach (var slot in st.SlotsSnapshot())
                 ScanCircle(slot, table);
         }
         else if (obj is LispInstance inst)
@@ -1509,7 +1509,7 @@ public static partial class Runtime
             int count = 0;
             while (current is Cons c)
             {
-                // *print-circle*: check CDR for circularity (skip first element — handled by caller)
+                // *print-circle*: check CDR for circularity (skip first element: handled by caller)
                 if (_circleTable != null && count > 0 && _circleTable.TryGetValue(c, out int cdrState))
                 {
                     if (cdrState < 0) // back-reference
@@ -1517,7 +1517,7 @@ public static partial class Runtime
                         sb.Append(" . #").Append(-cdrState).Append("#)");
                         return;
                     }
-                    if (cdrState == 0) // shared CDR, first print — assign label
+                    if (cdrState == 0) // shared CDR, first print; assign label
                     {
                         int label = ++_circleLabelCounter;
                         _circleTable[c] = -label;
@@ -1572,14 +1572,14 @@ public static partial class Runtime
 
     // Objects currently inside their own print-object dispatch, tracked by reference
     // identity. Re-entering the SAME object falls back to the default printer (guards
-    // against self-recursion), but a nested DIFFERENT object — even of the same
-    // category (struct-in-struct, instance-in-instance) — must dispatch its own
+    // against self-recursion), but a nested DIFFERENT object, even of the same
+    // category (struct-in-struct, instance-in-instance), must dispatch its own
     // print-object. A per-category boolean wrongly suppressed all same-category
     // nesting, falling inner objects back to #S(...) / #<...>.
     [System.ThreadStatic] private static HashSet<object>? _printObjectActive;
 
     /// <summary>Begin print-object dispatch for OBJ. Returns false if OBJ is already
-    /// being printed (self-recursion) — caller must use the default printer then.</summary>
+    /// being printed (self-recursion): caller must use the default printer then.</summary>
     private static bool EnterPrintObject(object obj)
         => (_printObjectActive ??= new HashSet<object>(
                 System.Collections.Generic.ReferenceEqualityComparer.Instance)).Add(obj);
@@ -1704,7 +1704,7 @@ public static partial class Runtime
     {
         var sb = new System.Text.StringBuilder("#K(");
         sb.Append(FormatObject(st.TypeName, escape));
-        foreach (var slot in st.Slots)
+        foreach (var slot in st.SlotsSnapshot())
         {
             sb.Append(' ');
             sb.Append(FormatObject(slot, escape));
@@ -1723,7 +1723,7 @@ public static partial class Runtime
         var sb = new System.Text.StringBuilder("#S(");
         sb.Append(st.TypeName.Name);
 
-        int slotCount = st.Slots.Length;
+        int slotCount = st.SlotCount;
         int limit = printLength.HasValue ? Math.Min(printLength.Value, slotCount) : slotCount;
 
         for (int i = 0; i < limit; i++)
@@ -1736,7 +1736,7 @@ public static partial class Runtime
                 sb.Append(slotNames[i].Name);
                 sb.Append(' ');
             }
-            sb.Append(FormatObject(st.Slots[i], escape));
+            sb.Append(FormatObject(st.GetSlot(i), escape));
         }
 
         if (printLength.HasValue && slotCount > printLength.Value)
@@ -1851,7 +1851,7 @@ public static partial class Runtime
         }
 
         // Check if array has zero-size dimensions that make it unreadable
-        // e.g., (0 3) prints as #2A() but reads back as (0 0) — not similar
+        // e.g., (0 3) prints as #2A() but reads back as (0 0): not similar
         if (GetPrintReadably() && rank >= 2)
         {
             bool hasZero = false;
@@ -1944,7 +1944,7 @@ public static partial class Runtime
 
     /// <summary>
     /// Resolve a stream designator to a TextWriter for output.
-    /// NIL → *standard-output*, T → *terminal-io*, otherwise extract writer from stream object.
+    /// NIL -> *standard-output*, T -> *terminal-io*, otherwise extract writer from stream object.
     /// </summary>
     public static TextWriter GetOutputWriter(LispObject stream)
     {
@@ -2088,7 +2088,7 @@ public static partial class Runtime
         try
         {
             var s = FormatTop(obj, true);
-            return s.Length > 80 ? s.Substring(0, 79) + "…" : s;
+            return s.Length > 80 ? s.Substring(0, 79) + "..." : s;
         }
         catch
         {
@@ -2105,7 +2105,7 @@ public static partial class Runtime
 
     public static LispObject PrincToString(LispObject obj)
     {
-        // CLHS: princ-to-string ≡ (write-to-string obj :escape nil :readably nil)
+        // CLHS: princ-to-string == (write-to-string obj :escape nil :readably nil)
         var readablySym = Startup.Sym("*PRINT-READABLY*");
         DynamicBindings.Push(readablySym, Nil.Instance);
         try
@@ -2395,8 +2395,8 @@ public static partial class Runtime
                 else if (allowOtherKeys != true)
                     throw new LispErrorException(new LispProgramError($"WRITE: unknown keyword argument :{kw.Name}"));
             }
-            // Resolve output stream. GetOutputWriter handles the NIL→*standard-output*
-            // and T→*terminal-io* designators plus output/file/two-way/echo/synonym/
+            // Resolve output stream. GetOutputWriter handles the NIL->*standard-output*
+            // and T->*terminal-io* designators plus output/file/two-way/echo/synonym/
             // broadcast/gray streams uniformly; do not reimplement a narrower subset
             // here (which previously dropped gray streams to Console.Out).
             TextWriter writer = Runtime.GetOutputWriter(streamArg ?? Nil.Instance);
@@ -2626,7 +2626,7 @@ public static partial class Runtime
             Runtime.PprintListWithNewlines(w, list, colonP, "FILL", tabSize);
             return Nil.Instance;
         }, "PPRINT-TABULAR", -1));
-        // COPY-PPRINT-DISPATCH: (&optional table) — 0-1 args
+        // COPY-PPRINT-DISPATCH: (&optional table): 0-1 args
         Emitter.CilAssembler.RegisterFunction("COPY-PPRINT-DISPATCH", new LispFunction(args => {
             if (args.Length > 1)
                 throw new LispErrorException(new LispProgramError("COPY-PPRINT-DISPATCH: too many arguments"));
@@ -2644,7 +2644,7 @@ public static partial class Runtime
                 $"COPY-PPRINT-DISPATCH: argument must be a pprint dispatch table or NIL, got {source}",
                 source, Startup.Sym("NULL")));
         }, "COPY-PPRINT-DISPATCH", -1));
-        // PPRINT-DISPATCH: (object &optional table) — 1-2 args
+        // PPRINT-DISPATCH: (object &optional table): 1-2 args
         Emitter.CilAssembler.RegisterFunction("PPRINT-DISPATCH", new LispFunction(args => {
             if (args.Length < 1)
                 throw new LispErrorException(new LispProgramError("PPRINT-DISPATCH: requires at least 1 argument"));

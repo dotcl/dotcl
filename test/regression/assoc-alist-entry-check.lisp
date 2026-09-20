@@ -4,10 +4,10 @@
 ;;; a type-error (ansi-test ASSOC.ERROR.11).
 ;;;
 ;;; ASSOC has two implementations:
-;;;   * Runtime.Assoc — what the compiler emits inline for a 2-argument call
-;;;   * AssocCore     — the registered #'ASSOC (funcall / apply / interpreted path)
+;;;   * Runtime.Assoc, what the compiler emits inline for a 2-argument call
+;;;   * AssocCore, the registered #'ASSOC (funcall / apply / interpreted path)
 ;;; Only the former checked the entries, so a literal (assoc ...) errored while the
-;;; same call through #'ASSOC returned NIL — a divergence present on BOTH evaluator
+;;; same call through #'ASSOC returned NIL: a divergence present on BOTH evaluator
 ;;; paths, the same shape as unary #'- .
 ;;;
 ;;; That is why the compiled cases below also fail before the fix.

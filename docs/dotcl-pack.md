@@ -16,14 +16,18 @@ command -- they never install Lisp or dotcl.
 - **The dotcl runtime packages to build on**, gathered in one directory
   (`--from`): the base `dotcl.<version>.nupkg` plus one
   `dotcl.<rid>.<version>.nupkg` for each platform you target. Fetch them from
-  NuGet into a folder (adjust the version and add a line per RID you want):
+  NuGet into a folder (set `V` to the dotcl version you want to build on --
+  the published versions are listed on
+  [nuget.org/packages/dotcl](https://www.nuget.org/packages/dotcl) -- and add a
+  line per RID you want):
 
   ```
+  V=<version>
   mkdir dotcl-pkgs
-  curl -L -o dotcl-pkgs/dotcl.0.1.26.nupkg \
-    https://api.nuget.org/v3-flatcontainer/dotcl/0.1.26/dotcl.0.1.26.nupkg
-  curl -L -o dotcl-pkgs/dotcl.win-arm64.0.1.26.nupkg \
-    https://api.nuget.org/v3-flatcontainer/dotcl.win-arm64/0.1.26/dotcl.win-arm64.0.1.26.nupkg
+  curl -L -o dotcl-pkgs/dotcl.$V.nupkg \
+    https://api.nuget.org/v3-flatcontainer/dotcl/$V/dotcl.$V.nupkg
+  curl -L -o dotcl-pkgs/dotcl.win-arm64.$V.nupkg \
+    https://api.nuget.org/v3-flatcontainer/dotcl.win-arm64/$V/dotcl.win-arm64.$V.nupkg
   ```
 
   Keep the filenames exactly as above -- `dotcl pack` looks them up by name.
@@ -35,7 +39,7 @@ greeting:
 
 ```
 dotcl pack --system hello --id hello-tool --command hello --version 0.1.0 \
-           -o out/ --from ./dotcl-pkgs/ --dotcl-version 0.1.26 \
+           -o out/ --from ./dotcl-pkgs/ --dotcl-version "$V" \
            --rids win-arm64 --toplevel hello:main --asd-search-path .
 ```
 
@@ -104,7 +108,7 @@ Ship the packages instead. `nuget:cache-root` names the directory where a
 resolved package was laid out, one subdirectory per request:
 
 ```lisp
-(require "nuget")
+(require "dotcl-nuget")
 (nuget:resolve "Newtonsoft.Json" :version "13.0.3")
 (nuget:cache-root)
 ;; => ".../cache/dotcl-nuget"    with "Newtonsoft.Json_13.0.3_win-arm64_net10.0" inside

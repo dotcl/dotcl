@@ -5,10 +5,10 @@
 ;;; (require "x") via asdf:module-provide-asdf), and restores *modules* so
 ;;; the compile-time require is transient. But it did NOT clear ASDF's
 ;;; *registered-systems*: the require registered the system and set its
-;;; load-op stamp (component-loaded-p → T). A load-time re-(require "x")
-;;; then ran module-provide-asdf → find-system returned the stale stamped
-;;; system → component-loaded-p was T → load-system no-op'd → the fasl was
-;;; never reloaded → the stripped functions stayed unbound → callers
+;;; load-op stamp (component-loaded-p -> T). A load-time re-(require "x")
+;;; then ran module-provide-asdf -> find-system returned the stale stamped
+;;; system -> component-loaded-p was T -> load-system no-op'd -> the fasl was
+;;; never reloaded -> the stripped functions stayed unbound -> callers
 ;;; signaled UNDEFINED-FUNCTION. The fix calls asdf:clear-system for each
 ;;; module added to *modules* during the compile, so the load-time require
 ;;; rebuilds an unstamped system and actually reloads the fasl.
@@ -49,7 +49,7 @@
     (let ((cs (find-symbol "CLEAR-SYSTEM" "ASDF")))
       (when cs (funcall cs "cfri-mod")))
     ;; Driver: a compile-time (require "cfri-mod") loads the contrib during
-    ;; compile (module-provide-asdf → load-system → registers cfri-mod in
+    ;; compile (module-provide-asdf -> load-system -> registers cfri-mod in
     ;; *registered-systems* with load-op stamp set; cfri-mod:fn becomes fbound).
     ;; The finally strip nulls cfri-mod:fn.Function (newly fbound this compile)
     ;; and restores *modules*. WITHOUT the fix, the stale *registered-systems*

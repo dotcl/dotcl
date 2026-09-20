@@ -1,13 +1,13 @@
 ;;;; Task Scheduler demo for dotcl on Windows
 ;;;;
 ;;;; Drives the Schedule.Service COM API from Lisp via dotnet:invoke /
-;;;; dotnet:new. Registers two tasks — one logon-trigger, one event-
-;;;; trigger reacting to USB plug events — runs the logon one on-demand for
+;;;; dotnet:new. Registers two tasks, one logon-trigger, one event-
+;;;; trigger reacting to USB plug events, runs the logon one on-demand for
 ;;;; instant audible feedback (SAPI.SpVoice via task-scheduler-payload.lisp),
 ;;;; waits for Enter, then unregisters both.
 ;;;;
 ;;;; Works only on Windows. Requires the dev tree (uses dotnet run --project
-;;;; runtime/runtime.csproj) — for production use the packed dotcl.exe path.
+;;;; runtime/runtime.csproj): for production use the packed dotcl.exe path.
 ;;;;
 ;;;; Usage (from repo root):
 ;;;;   dotnet run --project runtime/runtime.csproj -- \
@@ -16,7 +16,7 @@
 (format t "=== dotcl Task Scheduler demo ===~%")
 
 ;; -----------------------------------------------------------------------
-;; Path discovery — locate the dev tree from this file's load path so the
+;; Path discovery: locate the dev tree from this file's load path so the
 ;; registered task knows how to invoke dotcl with our payload script.
 ;; -----------------------------------------------------------------------
 
@@ -33,7 +33,7 @@
             payload)))
 
 ;; -----------------------------------------------------------------------
-;; Schedule.Service helpers — thin wrappers over the COM IDispatch chain.
+;; Schedule.Service helpers: thin wrappers over the COM IDispatch chain.
 ;; -----------------------------------------------------------------------
 
 (defun %connect-service ()
@@ -100,7 +100,7 @@
           (dotnet:static "System.Environment" "UserName")))
 
 ;; TASK_CREATE_OR_UPDATE = 6, TASK_LOGON_INTERACTIVE_TOKEN = 3.
-;; The userId VARIANT must be a real user string (not Type.Missing — late-
+;; The userId VARIANT must be a real user string (not Type.Missing; late-
 ;; bound COM with Missing here yields E_ACCESSDENIED on some builds).
 (defun register-task (folder name def)
   (dotnet:invoke folder "RegisterTaskDefinition"
@@ -139,7 +139,7 @@
      (let* ((svc  (%connect-service))
             (root (%folder svc)))
 
-       ;; Task 1: logon trigger (restricted to current user — see %add-logon-trigger)
+       ;; Task 1: logon trigger (restricted to current user: see %add-logon-trigger)
        (let ((def (%new-task-def svc))
              (uid (current-user-id)))
          (%add-logon-trigger def "LogonTrigger" uid)
@@ -168,7 +168,7 @@
            (format t "  - ~a~%" n)))
 
        ;; Run on-demand for instant audible feedback (don't wait for logon)
-       (format t "~%Running DotclLogonHello on-demand — listen for SAPI voice...~%")
+       (format t "~%Running DotclLogonHello on-demand; listen for SAPI voice...~%")
        (run-task-now root "DotclLogonHello")
 
        (format t "~%Press Enter to unregister demo tasks and exit... ")

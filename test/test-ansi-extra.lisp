@@ -1,4 +1,4 @@
-;;; test-ansi-extra.lisp — additional tests covering gaps found during CLHS audit.
+;;; test-ansi-extra.lisp: additional tests covering gaps found during CLHS audit.
 ;;; Verifies behaviour not covered by the ansi-test suite.
 ;;;
 ;;; Each test uses (assert ...) or (unless ... (error ...)) and signals an
@@ -144,7 +144,7 @@
     (assert (string= s "#<SYMBOL bar>") () ":type+body: expected ~s, got ~s" "#<SYMBOL bar>" s)))
 
 (check "print-unreadable-object/:type-nil-runtime"
-  ;; :type is evaluated at runtime — nil flag should suppress type printing
+  ;; :type is evaluated at runtime: nil flag should suppress type printing
   (let* ((flag nil)
          (s (with-output-to-string (out)
                (print-unreadable-object ('foo out :type flag) (write-string "x" out)))))
@@ -195,12 +195,12 @@
 ;; with CHAR-EQUAL rather than #\E.
 
 (check "format/~G/F-range"
-  ;; 1.5: n=1, dd=6 <= d=7 → use ~F format (no exponent)
+  ;; 1.5: n=1, dd=6 <= d=7 -> use ~F format (no exponent)
   (let ((s (format nil "~G" 1.5)))
     (assert (not (find #\e s :test #'char-equal)) () "~G 1.5 should use F format, got ~s" s)))
 
 (check "format/~G/E-range-small"
-  ;; 0.001: n=-2, dd=9 > d=7 → use ~E format. dotcl, SBCL 2.6.6 and ABCL 1.9.3
+  ;; 0.001: n=-2, dd=9 > d=7 -> use ~E format. dotcl, SBCL 2.6.6 and ABCL 1.9.3
   ;; all print an exponent here.
   (let ((s (format nil "~G" 0.001)))
     (assert (find #\e s :test #'char-equal) () "~G 0.001 should use E format, got ~s" s)))
@@ -213,7 +213,7 @@
     (assert (not (find #\e s :test #'char-equal)) () "~G 15000000.0 should use F format, got ~s" s)))
 
 (check "format/~G/zero"
-  ;; 0.0: n=0, dd=d >= 0 → use ~F format
+  ;; 0.0: n=0, dd=d >= 0 -> use ~F format
   (let ((s (format nil "~G" 0.0)))
     (assert (not (find #\e s :test #'char-equal)) () "~G 0.0 should use F format, got ~s" s)))
 
@@ -295,7 +295,7 @@
             () "fresh-line after write-string: expected \"abc\\n\", got ~s" s)))
 
 (check "fresh-line/after-terpri"
-  ;; After terpri, already at line start — fresh-line should not output newline
+  ;; After terpri, already at line start: fresh-line should not output newline
   (let ((s (with-output-to-string (out)
               (write-string "abc" out)
               (terpri out)

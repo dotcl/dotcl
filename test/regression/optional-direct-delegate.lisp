@@ -5,7 +5,7 @@
 ;;; wrapping LET, so it must return exactly what the array XEP would. These tests
 ;;; pin the observable behaviour across every arity, default use/override, an
 ;;; early return-from in the body, and a self-recursive &optional (which is left
-;;; on the array XEP — its direct body would need self-arg0 threading).
+;;; on the array XEP: its direct body would need self-arg0 threading).
 
 (defun od-two (a &optional (b 10) (c 100))
   (+ a b c))
@@ -45,7 +45,7 @@
 
 ;;; Non-constant &optional defaults also get direct delegates. The absent
 ;;; optionals are bound by a LET* inside the direct body, so the default form is
-;;; evaluated at call time exactly where the args-array entry would evaluate it —
+;;; evaluated at call time exactly where the args-array entry would evaluate it;
 ;;; including a special variable's current value and a default that reads an
 ;;; earlier parameter. Before this, only literal defaults qualified, which left
 ;;; the whole (fn x &optional (pkg *package*)) family on the slow path.
@@ -87,7 +87,7 @@
 
 ;;; &aux no longer forces the args-array path. It is not an argument-passing
 ;;; feature but sequential binding, so the direct path binds it with a LET* around
-;;; the body — under any leading declarations, which belong to the parameters.
+;;; the body: under any leading declarations, which belong to the parameters.
 
 (defun aux-direct-basic (x &aux (y 10)) (+ x y))
 (deftest aux-direct-basic-call

@@ -1,11 +1,11 @@
 ;;; Regression: a type declaration must cover only the binding it was written
 ;;; for. An inner binding of the same name is a different variable.
 ;;;
-;;; The type-local tables (*fixnum-locals*, *double-float-locals*, …) are keyed
+;;; The type-local tables (*fixnum-locals*, *double-float-locals*, ...) are keyed
 ;;; by variable NAME string and were only appended to when entering a binding
 ;;; form, never filtered. So (let ((n 1)) (declare (fixnum n)) (let ((n 2.5d0))
 ;;; (* n 2))) still saw "N" as declared fixnum inside the inner LET and unboxed
-;;; the DoubleFloat slot as a Fixnum — a hard InvalidCastException, not a wrong
+;;; the DoubleFloat slot as a Fixnum: a hard InvalidCastException, not a wrong
 ;;; value.
 
 (deftest type-decl-shadow-double
@@ -29,7 +29,7 @@
       (+ n 1)))
   18446744073709551613)
 
-;;; let* binds sequentially — same rule.
+;;; let* binds sequentially: same rule.
 (deftest type-decl-shadow-let*
   (let ((n 2))
     (declare (fixnum n))

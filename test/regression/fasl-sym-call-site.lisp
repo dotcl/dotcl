@@ -3,7 +3,7 @@
 ;;; The JIT path got one call-site cell per :load-sym-fn site, rooted in the
 ;;; constant pool. A .fasl has no constant pool to root anything in, so
 ;;; compile-file'd code kept resolving its callees through Startup.SymFn on
-;;; every call — a string concatenation and a dictionary probe each time,
+;;; every call: a string concatenation and a dictionary probe each time,
 ;;; measured at ~58 ns per call more than the same code loaded from source.
 ;;; The cell now lives in a static field of the generated type, filled by that
 ;;; type's initializer (so the CLR guarantees it exists before any body runs).
@@ -13,7 +13,7 @@
 ;;; What is specific here is that all of it has to survive the compile-file /
 ;;; load round trip.
 
-;; Scratch directory for the generated .lisp/.fasl pairs — outside the tree, so
+;; Scratch directory for the generated .lisp/.fasl pairs: outside the tree, so
 ;; a run never leaves build products in the repository (and a loaded .fasl is a
 ;; loaded assembly, which Windows will not let the test delete afterwards).
 ;;

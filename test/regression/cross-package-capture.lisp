@@ -3,8 +3,8 @@
 ;;;
 ;;; The free-variable table used to be keyed by variable NAME string, so XP-A::V
 ;;; and XP-B::V shared one slot: the closure captured a single value and both
-;;; references read it. The failure was silent — (list xp-a::v xp-b::v) returned
-;;; (2 2) instead of (1 2) — because the env slot was interned into the compiler's
+;;; references read it. The failure was silent, (list xp-a::v xp-b::v) returned
+;;; (2 2) instead of (1 2), because the env slot was interned into the compiler's
 ;;; own package, which the lookup rule treats as matching any package.
 ;;;
 ;;; Keying the table by symbol identity (and keying the env slot by the captured

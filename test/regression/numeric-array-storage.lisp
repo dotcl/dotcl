@@ -2,8 +2,8 @@
 ;;; element types map to byte[]/ushort[]/int[]/long[] backings (with
 ;;; (integer LO HI) upgraded to the canonical fixed-width type), mirroring
 ;;; the bit-vector _bitData pattern. Contract: identical observable behavior
-;;; to general storage — aref/setf, adjust-array, fill-pointer growth,
-;;; displacement, sequence functions — plus loud errors on element-type
+;;; to general storage, aref/setf, adjust-array, fill-pointer growth,
+;;; displacement, sequence functions, plus loud errors on element-type
 ;;; violations (never a silent wrap).
 
 ;; (integer LO HI) upgrades to the canonical fixed-width element type.
@@ -160,7 +160,7 @@
     (format nil "~a" v))
   "#(1 2 3)")
 
-;;; ---- float element-type storage (single-float → float[], double-float →
+;;; ---- float element-type storage (single-float -> float[], double-float ->
 ;;; double[]) ----
 
 (deftest nas-float-upgrade-single

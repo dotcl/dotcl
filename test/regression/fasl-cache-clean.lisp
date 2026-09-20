@@ -1,4 +1,4 @@
-;;; `dotcl clean` — removing the shared ASDF compile cache.
+;;; `dotcl clean`: removing the shared ASDF compile cache.
 ;;;
 ;;; ASDF writes every fasl it compiles under
 ;;; {cache-home}/common-lisp/{implementation-identifier}/, outside any project

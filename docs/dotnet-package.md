@@ -5,7 +5,7 @@ start -- with two exceptions, `dotnet:ref` and `dotnet:using`, which come from a
 contrib and are marked where they appear. Every form below was run against dotcl
 and shows its real result.
 
-Numbers have rules of their own — which .NET numeric types arrive as which Lisp
+Numbers have rules of their own, which .NET numeric types arrive as which Lisp
 types, when an integer argument is rejected, and how `System.Decimal` works.
 See [Numbers across the .NET boundary](numbers.md).
 
@@ -17,7 +17,7 @@ See [Numbers across the .NET boundary](numbers.md).
 (dotnet:invoke sb "ToString")                     ; => "hi"
 ```
 
-`dotnet:invoke` reaches methods and properties through the same call — a property
+`dotnet:invoke` reaches methods and properties through the same call; a property
 needs **no `get_` prefix**, and it is a place:
 
 ```lisp
@@ -70,7 +70,7 @@ verbatim, so `|Host|` works and `host` correctly does not.
 section.)*
 
 `dotnet:ref` is the indexer without spelling out `get_Item` / `set_Item`, and it
-is a place. Anything with an indexer works — `List<T>`, `Dictionary<K,V>`, and
+is a place. Anything with an indexer works; `List<T>`, `Dictionary<K,V>`, and
 plain arrays:
 
 ```lisp
@@ -94,7 +94,7 @@ disposed innermost first.
 ```
 
 Both of these come from the `dotnet-class` contrib, so they need
-`(require "dotnet-class")` — the same one `dotnet:define-class` lives in.
+`(require "dotnet-class")`; the same one `dotnet:define-class` lives in.
 
 ## Types
 
@@ -113,7 +113,7 @@ instead of being spelled as one assembly-qualified string:
                                   (list "System.String"))))     ; Action<List<string>>
 ```
 
-A resolved type is accepted anywhere a type name is — `dotnet:new`,
+A resolved type is accepted anywhere a type name is; `dotnet:new`,
 `dotnet:make-delegate`, `dotnet:static-generic`, and as a method specializer.
 
 ## Collections and LINQ
@@ -128,7 +128,7 @@ A resolved type is accepted anywhere a type name is — `dotnet:new`,
 ```
 
 Extension methods resolve after instance methods, so LINQ reads normally. A Lisp
-lambda becomes the delegate, and the overload is chosen by its argument count —
+lambda becomes the delegate, and the overload is chosen by its argument count;
 one argument for the plain form, two for the indexed one:
 
 ```lisp
@@ -147,7 +147,7 @@ matters.
 (dotnet:enum-or "System.IO.FileAccess" "Read" "Write")          ; => ReadWrite
 
 (multiple-value-list (dotnet:call-out "System.Int32" "TryParse" "42"))
-;; => (T 42)   — return value first, then each out/ref parameter
+;; => (T 42): return value first, then each out/ref parameter
 ```
 
 A .NET exception arrives as a Lisp condition that remembers its CLR type:
@@ -183,7 +183,7 @@ instead:
 `dotcl:*foreign-callback-handler*` is the other hook: a function of one argument
 (the condition) whose value becomes the callback's result.
 
-Non-local exits are not affected by containment — `return-from` and `throw` out
+Non-local exits are not affected by containment; `return-from` and `throw` out
 of a callback unwind to their target as usual.
 
 ## Tasks
@@ -295,3 +295,118 @@ LINQ over a string.
 
 Types from a loaded assembly resolve by name afterwards. For NuGet packages, see
 [Using libraries](libraries.md).
+
+## Conditions in a .NET host
+
+The other direction: a .NET application that embeds dotcl (`DotclHost`) and runs
+Lisp code from its own entry points. A Lisp condition that no Lisp handler takes
+has to become something the host can catch, and `SetThrowingDebuggerHook` is what
+binds `*debugger-hook*` to do that instead of stopping in the interactive
+debugger -- which a server or a game loop has no console to answer.
+
+What it throws is a `DotclConditionException`, and the condition survives on it:
+`Condition` is the live condition object, `ConditionType` its Lisp type name,
+`Message` its report string, and `ClrException` the .NET exception it wraps when
+the failure came from a .NET call. A condition a Lisp handler takes never reaches
+the host at all.
+
+```csharp
+DotclHost.EnsureCore();
+DotclHost.SetThrowingDebuggerHook();
+
+try { DotclHost.EvalString("(error \"boom ~a\" 42)"); }
+catch (DotclConditionException e)
+{
+    // e.ConditionType is "SIMPLE-ERROR", e.Message is "boom 42",
+    // e.Condition is the condition itself -- hand it back to Lisp to read
+    // its slots, and e.ClrException is non-null if .NET raised the failure.
+}
+```
+
+Choosing a **restart** is a different job, and the catch block is too late for
+it: by the time the exception reaches the host, the Lisp stack the restart lives
+on has already unwound. The decision has to happen while that stack is still
+standing, so make the hook itself ask the host:
+
+```csharp
+// The host decides which restart to use; Lisp invokes it in place.
+DotclHost.Register("host-restart-for", args => "USE-VALUE");
+DotclHost.EvalString(@"(setq *debugger-hook*
+  (lambda (c hook)
+    (declare (ignore hook))
+    (let ((r (find-restart (intern (host-restart-for (princ-to-string c)) :cl-user) c)))
+      (when r (invoke-restart r 99)))))");
+
+// The restart returns 99 to the RESTART-CASE, so nothing is thrown at all.
+var v = DotclHost.EvalString("(restart-case (error \"needs a value\") (use-value (x) x))");
+```
+
+One asymmetry to know about: a failure raised by the runtime itself -- a .NET
+method that threw, reached through `dotnet:invoke` -- is thrown directly as a
+`LispErrorException` rather than routed through `*debugger-hook*`, so a host that
+wants to catch everything catches that type too. It carries the same condition
+(`e.Condition`), with the original .NET exception on
+`e.Condition.ClrException`.
+
+`SetThrowingDebuggerHook(false)` selects the older behaviour, where the hook
+throws an `InvalidOperationException` whose message is `"TYPE: report"` and which
+carries nothing else.
+
+## Stack size when embedding
+
+The `dotcl` executable runs Lisp on a thread it creates with a **256 MB** stack
+(`runtime/Program.cs`). A host that calls `DotclHost` from its own threads gets
+whatever those threads have, which for a .NET thread pool worker or a plain
+`new Thread(...)` is the default **1 MB**. Nothing in `DotclHost` changes that,
+and nothing warns about it.
+
+It matters because the recursion depth the two allow is not in the same range.
+Compiling deeply nested code, expanding a macro that recurses over a large form,
+and walking a deep list in Lisp all recurse in .NET frames. A workload that the
+`dotcl` executable runs without noticing can end a 1 MB host thread with a
+`StackOverflowException` -- which .NET does not let anything catch: the process
+goes, with no condition, no handler, and no `finally`.
+
+So: if the Lisp you run is anything more than short calls into shallow
+functions, **run it on a thread you gave a large stack**, and keep using that
+one thread.
+
+```csharp
+// 256 MB, the same figure the dotcl executable uses.
+Exception? failure = null;
+var lisp = new Thread(() => {
+    try
+    {
+        DotclHost.EnsureCore();
+        DotclHost.EvalString("(load \"app.lisp\")");
+    }
+    catch (Exception e) { failure = e; }
+}, 256 * 1024 * 1024);
+lisp.Start();
+lisp.Join();
+if (failure != null) throw failure;
+```
+
+Reusing one such thread is worth more than the stack alone: dotcl keeps
+per-thread state (special-variable bindings, handler and restart clusters, the
+catch-tag stack), so a host that hops between pool threads gets a fresh dynamic
+environment on each hop, and a `handler-bind` established on one thread is not
+in scope on the next.
+
+### On a `RunOnLispThread` helper
+
+`DotclHost` could own that thread and expose `RunOnLispThread(Action)`. It is
+deliberately **not** added yet, and the reason is that it would be the second
+answer to a question dotcl already answers once: `dotcl:call-on-main-thread`
+exists because macOS AppKit accepts work from thread 0 and nothing else, so the
+executable keeps the real main thread as a work queue and Lisp submits to it.
+
+A host embedding dotcl in a UI application needs both properties at once -- a
+large stack and, on macOS, thread 0 -- and thread 0 cannot be created after the
+fact. A helper that owns "the Lisp thread" without knowing about that constraint
+would be right for a console host and wrong for a UI one, and the two would then
+disagree about which thread is "the" Lisp thread.
+
+The decision is to design the two together, as one story about which thread Lisp
+runs on, rather than add the easy half now. Until then the snippet above is the
+supported shape, and it is what the executable itself does.

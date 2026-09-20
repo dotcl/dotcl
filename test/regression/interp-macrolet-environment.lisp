@@ -53,7 +53,7 @@
   2)
 
 ;;; The expansion actually reached must be the symbol macro's, not merely
-;;; "something other than A" — a fix that returns garbage would also pass above.
+;;; "something other than A": a fix that returns garbage would also pass above.
 (defparameter %mle-value
   '(symbol-macrolet ((a b))
      (macrolet ((foo (x &environment env) `',(macroexpand x env)))

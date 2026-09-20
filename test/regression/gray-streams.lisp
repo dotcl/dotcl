@@ -573,7 +573,7 @@ b")
 ;;; Binary gray streams must be accepted wherever character ones are. The
 ;;; force-output / finish-output / clear-output trampoline (and clear-input)
 ;;; tested only the character predicate, so a binary gray stream was rejected
-;;; as "not a stream designator" — even though streamp and write-byte had
+;;; as "not a stream designator": even though streamp and write-byte had
 ;;; already accepted the same object. flexi-streams builds binary gray streams,
 ;;; so drakma and anything layering on it tripped over this.
 (defclass %gray-bin-out (dotcl-gray:fundamental-binary-output-stream) ())
@@ -607,7 +607,7 @@ b")
 
 ;;; unread-char on a gray stream must dispatch to STREAM-UNREAD-CHAR.
 ;;; Previously ResolveLispStream dropped the CLOS instance to
-;;; *standard-input* — the unread char was pushed onto stdin and lost
+;;; *standard-input*: the unread char was pushed onto stdin and lost
 ;;; from the gray stream (flexi-streams peek/unread silently misread).
 (defclass %gray-in-unread (dotcl-gray:fundamental-character-input-stream)
   ((chars :initarg :chars :accessor %giu-chars)))

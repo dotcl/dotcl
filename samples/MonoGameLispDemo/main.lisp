@@ -1,4 +1,4 @@
-;;; main.lisp — MonoGame Game subclass written in Lisp.
+;;; main.lisp: MonoGame Game subclass written in Lisp.
 ;;;
 ;;; Demonstrates `dotnet:define-class` against the MonoGame `Game` class.
 ;;; Update + Draw are overridden to animate the background color over
@@ -32,13 +32,13 @@
          (b (round (* 255 (abs (- 1.0 frac)))))
          (r 0) (g 0) (bl 0))
     (case phase
-      (0 (setf r b g a bl 0))      ; red→green
-      (1 (setf r 0 g b bl a))      ; green→blue
-      (2 (setf r a g 0 bl b)))     ; blue→red
+      (0 (setf r b g a bl 0))      ; red->green
+      (1 (setf r 0 g b bl a))      ; green->blue
+      (2 (setf r a g 0 bl b)))     ; blue->red
     (dotnet:new "Microsoft.Xna.Framework.Color" r g bl)))
 
 ;; Demo.LispGame: subclass of Game. The constructor must instantiate a
-;; GraphicsDeviceManager(this) — its mere construction registers it on
+;; GraphicsDeviceManager(this): its mere construction registers it on
 ;; the Game so GraphicsDevice gets initialized later.
 (dotnet:define-class "Demo.LispGame" (Game)
   (:ctor ()

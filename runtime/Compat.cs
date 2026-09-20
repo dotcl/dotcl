@@ -73,7 +73,7 @@ internal static class Compat
         return true;
     }
 
-    /// <summary>BigInteger.ToByteArray(isUnsigned, isBigEndian) — net5.0+ instance overload.
+    /// <summary>BigInteger.ToByteArray(isUnsigned, isBigEndian): net5.0+ instance overload.
     /// On net5.0+ the instance method wins; this extension only binds on ns2.0.</summary>
     public static byte[] ToByteArray(this BigInteger value, bool isUnsigned, bool isBigEndian = false)
     {
@@ -323,8 +323,8 @@ internal static class Compat
     public static bool TryEnsureSufficientExecutionStack()
 #if NETSTANDARD2_0
     {
-        // netstandard2.0 has only the throwing form of the probe — the Try*
-        // variant arrived in netstandard2.1 — so the exception IS the false
+        // netstandard2.0 has only the throwing form of the probe, the Try*
+        // variant arrived in netstandard2.1, so the exception IS the false
         // return. Same check underneath, and the path that runs per call (the
         // success path) costs the same as the Try form. Returning a constant
         // true here instead would leave every deep-recursion defence built on
@@ -336,16 +336,16 @@ internal static class Compat
         => RuntimeHelpers.TryEnsureSufficientExecutionStack();
 #endif
 
-    // The runtime's fixed probe only guarantees ~64KB of headroom — enough to
+    // The runtime's fixed probe only guarantees ~64KB of headroom: enough to
     // THROW, but signalling the resulting STORAGE-CONDITION runs the whole
     // condition system on top of the exhausted stack (HandlerClusterStack.Signal
-    // → Typep handler matching → possibly a handler-bind handler body), and fat
+    // -> Typep handler matching -> possibly a handler-bind handler body), and fat
     // per-call frames (Runtime.Apply, interop delegate marshalling) advance the
     // stack further between periodic checks. Passing here means at least
-    // PadFrames×PadBytes + the fixed probe of headroom remain, so the signal
+    // PadFramesxPadBytes + the fixed probe of headroom remain, so the signal
     // path has room to run. Each level verifies the fixed probe BEFORE its
     // stackalloc, so the padding itself can never trip a fatal overflow.
-    private const int PadFrames = 16;   // 16 × 16KB = 256KB extra headroom
+    private const int PadFrames = 16;   // 16 x 16KB = 256KB extra headroom
     private const int PadBytes = 16 * 1024;
 
     public static bool TryEnsureSufficientExecutionStackWithMargin()
@@ -457,11 +457,11 @@ internal static class Compat
         // Windows: mirror the BCL reference implementation.
         if (path.Length < 2) return false;
         if (IsDirSep(path[0]))
-            return IsDirSep(path[1]); // "\\server" / "\\?\" device → qualified; "\foo" → not
+            return IsDirSep(path[1]); // "\\server" / "\\?\" device -> qualified; "\foo" -> not
         return path.Length >= 3
             && path[1] == ':'
             && IsDirSep(path[2])
-            && char.IsLetter(path[0]); // "C:\..." → qualified; "C:foo" → drive-relative
+            && char.IsLetter(path[0]); // "C:\..." -> qualified; "C:foo" -> drive-relative
 #else
         return System.IO.Path.IsPathFullyQualified(path);
 #endif

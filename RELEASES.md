@@ -3,6 +3,234 @@
 User-facing release notes for dotcl. Each section corresponds to a tagged
 release on the public mirror (dotcl/dotcl).
 
+## v0.1.29 -- 2026-09-19
+
+Two things carry this release: real libraries load, and the compiler acts on
+type declarations. `docs/library-status.md` now records what happens for every
+Quicklisp library with three or more dependents, and 336 of those 423 load on
+dotcl.
+
+A declared local, struct slot or array element is now held in its declared
+representation rather than boxed, so the code stops paying for a box on every
+access.
+
+Alongside that, there is a getting-started guide that takes you from an empty
+machine to a published executable, and a C# host gets a proper error contract
+and can read multiple values, special variables and Lisp output.
+
+Three changes can break code that works today: a script that reaches the
+debugger now stops with a non-zero exit instead of quietly carrying on, a THROW
+with no CATCH is a CONTROL-ERROR you can handle rather than a dead process, and
+a DEFSTRUCT slot with a declared type is checked on every store. The section
+below has every case.
+
+### Upgrading
+
+Most of these were silent before, so code that looks like it works can start
+erroring here.
+
+- **Non-interactive dotcl no longer picks a restart for you.** A script run with
+  `--load`, `--eval` or a closed stdin that reaches the debugger now prints the
+  condition, unwinds, and exits non-zero. It used to take the innermost ABORT
+  restart and carry on, so a script that hit an error still exited 0. If yours
+  relied on that to get to the end, it will now stop where the error is.
+- **A THROW with no outstanding CATCH signals CONTROL-ERROR at the throw site.**
+  You can catch it: a `handler-case` for `control-error` around the THROW now
+  sees it, where before the throw escaped as a .NET exception and killed the
+  process during LOAD. Around `dotnet:await` it still works, because inside an
+  `async` continuation the check waits for the awaiting side.
+- **A DEFSTRUCT slot with a declared type is checked on every store.** Storing
+  the wrong type signals `type-error` even under `(safety 0)`: a slot whose type
+  fits in an Int64 (`fixnum`, `(unsigned-byte 32)`, ...) or is `double-float` is
+  now stored unboxed, so there is nowhere to put a value of another type. Code
+  that got away with `(setf (foo-count x) nil)` against a `fixnum` slot must fix
+  the declaration or the store. Constructors check too. `single-float` slots
+  stay boxed.
+- **Redefining a DEFSTRUCT with a different slot layout now signals** from
+  accessors compiled against the old layout, and from new accessors applied to
+  old instances. Recompile the callers; the message names the structure, both
+  layouts and that fix. Before, an accessor quietly read whatever slot sat at
+  its old position. Re-evaluating an unchanged DEFSTRUCT is still a no-op.
+- **`(declaim (optimize (safety 0)))` now reaches the loops in the functions
+  compiled after it.** Those loops drop their interrupt safepoint, so Ctrl+C
+  will not stop them -- exactly as if you had written the declaration in the
+  function body. A body declaration still wins either way, and `(debug N)`
+  behaves the same.
+- **`(the fixnum ...)` is trusted under `(safety 0)`.** The compiler keeps the
+  value unboxed and believes you, so a `the` that is not true now gives a wrong
+  answer rather than a slower right one. At safety 1 and above it is checked:
+  an overflow signals `type-error` instead of producing a bignum, in the
+  interpreter as well.
+- **`(+ a b)` on two fixnums is no longer inferred to return a fixnum.** It
+  never did, and code that bound such a result and used it as a raw integer
+  could fail with a cast error when the sum overflowed. Write
+  `(the fixnum ...)` where you know the range.
+- **`DotclHost.SetThrowingDebuggerHook()` throws `DotclConditionException`.** If
+  you were catching the old `InvalidOperationException` and its report string,
+  `SetThrowingDebuggerHook(false)` gives it back.
+- **The build-tool half of `DotclHost` moved to `DotclBuild`** (`ResolveDeps`,
+  `CompileProject`, `PackFasl`, `ReadSystemMeta`). The old names still work,
+  marked obsolete for one release.
+- **Four bundled contribs are renamed**: `advice`, `clrmd`, `decompiler` and
+  `nuget` are now `dotcl-advice`, `dotcl-clrmd`, `dotcl-decompiler` and
+  `dotcl-nuget`, like every other bundled system. `(require "nuget")` and the
+  other old names signal an error naming the new system, so a `require` is the
+  one line to change. The package names (`nuget:`, `advice:`, ...) do not move.
+
+### Fixes
+
+**Reader and FORMAT**
+
+- After a `;` comment, a `(` returning the empty list was taken as "no value"
+  and `()` vanished from the form, under any readtable built through
+  named-readtables. mgl-pax loads now.
+- `#.` whose form returned no values put a NIL where the standard says the
+  reader should read nothing at all. metacopy loads now.
+- `*read-suppress*` interned the symbols it read, so a form skipped by `#+nil`
+  could leave a symbol behind in the current package and make a later IMPORT
+  conflict. hu.dwim.walker loads now.
+- `get-macro-character` returned a fresh wrapper on every call for a built-in
+  macro character, so two lookups of the same readtable compared unequal and
+  named-readtables reported a reader macro conflict. jonathan, log4cl-extras,
+  40ants-logging and cl-pattern load now.
+- `~[` looked for its closing `~]` without skipping prefix parameters, so `~#[`
+  did not nest and a later directive was reported as unknown. 3d-vectors loads
+  now.
+
+**Compiler**
+
+- `LET*` pushed a special binding before entering the region that pops it, so a
+  non-local exit from a later init form left the binding in place for the rest
+  of the thread. serapeum and pathname-utils load now.
+- A declaration at the head of a function body was ignored when the body
+  contained a `return-from`. In such a function `(optimize (safety 0))`,
+  `(optimize (debug N))`, a `(the fixnum ...)` license and a structure slot type
+  check all silently did nothing.
+- A `labels` function that passed a lambda calling itself to `some`, `mapcar` or
+  any other function failed at run time with an undefined function: the lambda
+  never captured the local function. closure-html loads now.
+- A `labels` function that captures a variable from its surroundings is compiled
+  as a closure; its tail self-call is now a loop instead of a stack frame per
+  iteration.
+- A setf expander for a `:accessor`, and for a local `(setf f)` function,
+  expanded to `((setf f) new obj)`, which is not a well-formed form. A code
+  walker such as iterate refused it. cl-csv and lisp-unit2 load now.
+- `defconstant` did not take effect while the file that defines it was still
+  being compiled, so a macro later in the same file could not read it.
+- An array index beyond the range of a 32-bit integer was truncated and read a
+  different element instead of signalling.
+- `dotcl-cltl2:compiler-let` expanded to a plain `LET`, which is wrong at both
+  ends: the bindings were not in place while the body was being expanded, and
+  they were in place at run time. It now binds while it expands the body and
+  binds nothing afterwards, which is what CLtL1 asks for.
+
+**Classes and types**
+
+- `defclass` rejected a class option it did not recognize. Such an option is an
+  initialization argument for the metaclass, and is now passed on as AMOP
+  specifies. contextl loads now.
+- Two built-in classes listed the same pair of superclasses in opposite orders,
+  so a class inheriting both from a generic function class and from a funcallable
+  mixin had no possible class precedence list at all. vellum loads now.
+- `typep` read the element type of `(simple-array X (*))` literally instead of
+  upgrading it, so an ordinary vector failed a test against a `simple-array` of
+  some structure or class. docs-builder loads now.
+- `documentation` answered NIL when given a class object, where the same query
+  through the class name answered.
+
+**Errors and tools**
+
+- Redefining a constant to a value that is not EQL still signals, but the error
+  now carries a CONTINUE restart that installs the new value, as SBCL's does.
+  There used to be no way past it short of `unintern`.
+- An error about conflicting package names reported `Package error on NIL.` and
+  dropped its own message, which is the message that says which symbol and which
+  package.
+- `dotcl pack` exited with `unknown option` whatever options it was given. It
+  packs again.
+- The dist ships trivial-cltl2 with the one line trivia needs, so the trivia
+  cluster and thirteen more libraries in the status table load now.
+
+### Declared code
+
+A declaration now decides how a value is stored, not only what the compiler may
+assume. Against the same kernel written in C#:
+
+- A scan over a declared `(simple-array fixnum (*))` went from 8.6 times the C#
+  time to 0.83, and a plain declared fixnum loop from 1.6 to 1.0. `aref` reads
+  the element directly, the element buffer is taken out once when the variable
+  is bound, and `(length x)` is known to be a fixnum so the loop bound is not
+  unboxed every iteration.
+- A structure of declared integer slots went from 15.6 to 5.6. A slot declared
+  `fixnum`, any integer type that fits in an Int64, or `double-float` holds the
+  raw value: reading it allocates nothing and there is no cast on either side.
+- Scanning a megabyte with `(char-code (schar s i))` went from 103 times to 5.9
+  and now allocates nothing, where it used to allocate 23 MB. Character
+  comparisons compare codes as integers, and a `let` variable declared
+  `character` bound to a literal or to `(schar s i)` lives in a raw slot.
+- A double loop went from 6.6 to 1.0: a literal in declared float arithmetic is
+  an IL immediate instead of a constant-pool lookup on every use.
+- A parameter declared FIXNUM lives in an Int64 slot and feeds native arithmetic
+  directly. Declaring an FTYPE used to cost a little rather than pay: `fib` took
+  81 ms with the declaration against 77 ms without, in the same process. It now
+  takes 65 ms against 78 ms.
+- A DO loop whose step variables are declared runs at 1.4 times DOTIMES, from 25
+  times. The step temporaries that DO introduces carry the declaration you wrote
+  for the variables.
+- `(the double-float (sqrt x))` compiles to the native square root when `x` is
+  known to be a double. At safety 1 and above a negative argument signals
+  `type-error`, as it does in SBCL; under `(safety 0)` the result is unspecified.
+- A type declared for a `let*` variable now reaches the init forms of the
+  variables bound after it, as CLHS 3.3.4 requires. Declared float bindings used
+  to fall back to generic arithmetic in a sibling init.
+
+  two sides instruction by instruction and fails when dotcl emits more than it
+  did before.
+
+### Attributes
+
+- `dotnet:define-class` and `dotnet:library` can set named properties and fields
+  on an attribute, not only its constructor arguments:
+
+      (:attributes ("Android.App.ActivityAttribute"
+                    :main-launcher t :label "Lisp Activity" :exported t))
+
+  The first keyword ends the positional arguments. Names match without regard to
+  case or hyphens, so `:main-launcher` finds `MainLauncher`. Attributes whose
+  constructor takes nothing and whose settings are all properties were
+  unreachable before, which is most of the Android ones.
+
+### Embedding
+
+- `DotclHost.CallMv` and `EvalStringMv` return all values. `GetSpecial` and
+  `SetSpecial` read and write any special variable. `SetStandardOutput` and
+  `SetErrorOutput` redirect Lisp output to a `TextWriter`.
+- `LoadCore` no longer reports the core as loaded when loading threw, and
+  `Initialize` is safe to call from several threads at once.
+- The embedding notes say what stack size a host thread needs and why.
+
+### Documentation
+
+- `docs/getting-started.md`: install, `dotnet new dotcl-app`, add a library,
+  publish a self-contained executable. Every command in it was run; the output
+  shown is real.
+- `docs/library-status.md`: the 423 Quicklisp libraries with three or more
+  dependents, each loaded on dotcl, with the reason for every failure. 336 of
+  them load. swank loads from the slime the dotcl dist ships, which carries the
+  dotcl backend; the slime pinned in the Quicklisp dist does not.
+- `docs/sdk.md` (the MSBuild properties, including which ones the build computes
+  for you), `docs/readytorun.md`, `docs/deviations.md` (where dotcl knowingly
+  differs from CLHS or SBCL, and why), a NuGet section in `docs/libraries.md`
+  covering the three ways to declare a package, `dotcl:function-lambda-list` for
+  editors, an index for `samples/` that reaches all eight of them, and a README
+  in every bundled contrib.
+
+### Thanks
+
+- Douglas P. Fields, Jr. -- for the report on getting conditions and restarts
+  out of a C#-driven program, which is what the new host error contract answers,
+  and for the documentation plan the getting-started guide follows.
+
 ## v0.1.28 -- 2026-09-13
 
 A maintenance release: conformance fixes and allocation work, with one thing to
@@ -470,7 +698,7 @@ answered "yes, there is room" unconditionally.
 ### Errors say what they are
 
 Operations that used to surface a raw .NET exception, or a bare `simple-error`,
-now signal the condition the standard specifies — so `handler-case` clauses for
+now signal the condition the standard specifies, so `handler-case` clauses for
 `type-error`, `end-of-file` and friends actually fire:
 
 - array index and dimension arguments, `(setf (aref ...))` bounds, `char`,
@@ -504,7 +732,7 @@ builds:
 - **ASDF loads there.** Previously `require`-ing it on a build without a compiler
   failed outright.
 - An interpreted closure keeps its required-argument count, so .NET generics that
-  inspect it — LINQ's `Select`, for instance — resolve.
+  inspect it, LINQ's `Select`, for instance, resolve.
 - `(defclass ... (:metaclass ...))` no longer calls an undefined function.
 
 ### Quicklisp on a fresh machine
@@ -539,7 +767,7 @@ silently.
 - Macros compile to less code. A backquote template used to build its result one
   element at a time and glue the pieces with `append`; a run of elements is now a
   single `list` (or `list*` before a dotted tail), and a template with no unquotes
-  is a literal — which is what it should have been, and what it is elsewhere.
+  is a literal, which is what it should have been, and what it is elsewhere.
   A string literal in a `.fasl` is likewise built once rather than on every
   evaluation.
 
@@ -565,7 +793,7 @@ cannot drift apart unnoticed again.
 
 These builds evaluate through the interpreter. What was broken and now works:
 
-- `load` on a `.lisp` file — previously it could not read source at all.
+- `load` on a `.lisp` file: previously it could not read source at all.
 - Backtraces show your frames instead of the interpreter's internals.
 - `handler-case` and `handler-bind` catch exceptions thrown by .NET, not only
   conditions signalled from Lisp.
@@ -574,7 +802,7 @@ These builds evaluate through the interpreter. What was broken and now works:
 - Lambda lists are checked: wrong argument counts signal a `program-error`
   instead of being accepted or crashing.
 
-Beyond that, a long tail of semantic differences from the compiler is corrected —
+Beyond that, a long tail of semantic differences from the compiler is corrected:
 `block` scope was dynamic, `macrolet` leaked into the global macro table, the
 function and variable namespaces were shared, `symbol-macrolet` did not reach
 `&environment`, `restart-case` did not associate its restarts with the condition,
@@ -586,15 +814,15 @@ New `:dotcl-emit` feature so code can ask which kind of build it is on.
 
 Libraries commonly read their own version at load time with
 `(asdf:component-version (asdf:find-system :self))`. A bundle has no `.asd`
-files, so that form used to signal and the whole image refused to load —
+files, so that form used to signal and the whole image refused to load;
 dexador and cl-str both do this. `save-application` now records the systems it
 bundled, with the versions read at build time, so those forms answer correctly
 in the deployed image.
 
 ### Numbers across the .NET boundary
 
-The rules — which .NET numeric types arrive as which Lisp types, when an integer
-argument is rejected, and how `System.Decimal` works — are now written down in
+The rules, which .NET numeric types arrive as which Lisp types, when an integer
+argument is rejected, and how `System.Decimal` works, are now written down in
 `docs/numbers.md`, with every example run against dotcl.
 
 ## v0.1.23 -- 2026-08-06
@@ -732,7 +960,7 @@ now come from the standard .NET tools, unmodified.
 
 ### Debugging: locals in every frame
 
-- The built-in debugger walks frames and shows their locals — including
+- The built-in debugger walks frames and shows their locals: including
   variables in boxed cells, natively-stored (unboxed) locals, and dynamic
   (special) variables. The same view is wired into SLIME's debugger, with
   eval-in-frame.
@@ -752,7 +980,7 @@ now come from the standard .NET tools, unmodified.
 ### Profiling and coverage with stock .NET tools
 
 - dotcl compiles Lisp functions to real .NET methods under their Lisp names,
-  so `dotnet-trace` CPU profiles show your functions directly — no dotcl-side
+  so `dotnet-trace` CPU profiles show your functions directly; no dotcl-side
   setup. See `docs/profiling.md`.
 - Line coverage of `.lisp` sources works with the standard .NET coverage
   tools via the emitted PDBs. See `docs/coverage.md`.
@@ -768,7 +996,7 @@ now come from the standard .NET tools, unmodified.
 - `bordeaux-threads:interrupt-thread` gained a first tier: threads blocked in
   waits (locks, sleeps, joins) can be interrupted; `destroy-thread` ends the
   thread quietly.
-- `file-position` now works through Gray stream bridges — thanks to
+- `file-position` now works through Gray stream bridges: thanks to
   Bohong Huang for the fix.
 
 ## v0.1.21 -- 2026-07-25
@@ -1137,7 +1365,7 @@ established Common Lisp.
 
 - `decode-float` / `integer-decode-float` now signal on NaN and infinities and
   preserve the sign of negative zero.
-- `eql` compares floats bit-for-bit, so `±0.0` and distinct NaNs behave per the
+- `eql` compares floats bit-for-bit, so `+/-0.0` and distinct NaNs behave per the
   standard.
 - Integer division by zero signals `division-by-zero` (catchable by handlers)
   instead of escaping as a host error.
@@ -1145,7 +1373,7 @@ established Common Lisp.
   spurious overflow and underflow. Comparisons and ordering involving floating
   infinities, NaNs, and rationals were corrected.
 - `expt` / `exp` flush floating underflow to `0.0` rather than erroring;
-  `(expt ±1 huge-exponent)` stays an integer; `asin` / `acos` / `acosh` /
+  `(expt +/-1 huge-exponent)` stays an integer; `asin` / `acos` / `acosh` /
   `atanh` branch into the complex plane exactly where CLHS requires.
 
 ### CLOS and the metaobject protocol

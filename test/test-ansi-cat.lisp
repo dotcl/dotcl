@@ -40,7 +40,7 @@
 ;;; creating different symbols (CL-TEST::RANDOM-CASE vs CL-USER::RANDOM-CASE).
 (in-package :cl-test)
 
-;;; Load ansi-aux-macros BEFORE universe.lsp — the gitlab ansi-test repo
+;;; Load ansi-aux-macros BEFORE universe.lsp: the gitlab ansi-test repo
 ;;; shadows handler-case/handler-bind in :cl-test and provides replacements
 ;;; in ansi-aux-macros.lsp. universe.lsp uses handler-case, so the macros
 ;;; must be available by the time it loads.
@@ -59,12 +59,12 @@
 ;;; Create fixture files needed by various test categories
 (in-package :cl-user)
 
-;;; sandbox directory — must exist before we create any sandbox/* files below.
+;;; sandbox directory: must exist before we create any sandbox/* files below.
 ;;; do-tests in rt.lsp sets *default-pathname-defaults* to (truename #P"sandbox/")
 ;;; at test-run time, so ALL fixture files must live in sandbox/.
 (ensure-directories-exist "sandbox/dummy.txt")
 
-;;; types-and-classes — class-precedence-lists.txt must be in sandbox/
+;;; types-and-classes: class-precedence-lists.txt must be in sandbox/
 (dolist (name '("class-precedence-lists.txt"))
   (unless (probe-file name)
     (with-open-file (s name :direction :output :if-does-not-exist :create)
@@ -86,7 +86,7 @@
       (with-open-file (s sandbox-name :direction :output :if-does-not-exist :create)
         (declare (ignore s))))))
 
-;;; files — create in both project root and sandbox/
+;;; files: create in both project root and sandbox/
 (dolist (name '("truename.txt" "probe-file.txt" "file-author.txt"
                 "file-write-date.txt" "ensure-directories-exist.txt" "file-error.txt"))
   (unless (probe-file name)
@@ -111,7 +111,7 @@
 ;;; Re-create scratch directory (needed by streams tests that open scratch/foo.txt)
 (ensure-directories-exist "scratch/foo.txt")
 
-;;; streams test data files (in project root AND sandbox/ — do-tests rebinds DPD to sandbox/)
+;;; streams test data files (in project root AND sandbox/: do-tests rebinds DPD to sandbox/)
 (dolist (name '("file-position.txt" "file-length.txt" "input-stream-p.txt"
                 "output-stream-p.txt" "open-stream-p.txt" "listen.txt"))
   (with-open-file (s name :direction :output :if-exists :supersede)

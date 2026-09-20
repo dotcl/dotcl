@@ -32,7 +32,7 @@
   <Target Name="DotclPackFasl">
     <ItemGroup>
       <!-- The fasls and this project's manifest; dotcl.core is not matched (and
-           not wanted — it comes from DotCL.Runtime). -->
+           not wanted; it comes from DotCL.Runtime). -->
       <TfmSpecificPackageFile Include="$(IntermediateOutputPath)dotcl-fasl\*.fasl;$(IntermediateOutputPath)dotcl-fasl\$(MSBuildProjectName).deps.txt">
         <PackagePath>build/dotcl-fasl/</PackagePath>
       </TfmSpecificPackageFile>

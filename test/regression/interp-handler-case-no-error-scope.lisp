@@ -5,7 +5,7 @@
 ;;;
 ;;; The C# HANDLER-CASE expansion wrapped the protected form as
 ;;; (multiple-value-call (lambda ll . nbody) EXPR), which ran the :no-error body
-;;; INSIDE the HANDLER-BIND — so this form's own error clause caught it:
+;;; INSIDE the HANDLER-BIND: so this form's own error clause caught it:
 ;;;
 ;;;   (handler-case (handler-case (values)
 ;;;                   (error () 'bad)
@@ -16,7 +16,7 @@
 ;;; (ansi-test HANDLER-CASE.25).
 ;;;
 ;;; The fix stashes EXPR's values, leaves the HANDLER-BIND by GO, and applies the
-;;; :no-error function from a tagbody segment — the same place the error clause
+;;; :no-error function from a tagbody segment: the same place the error clause
 ;;; bodies run, which is by construction outside the handlers.
 
 (defun %hc (mode form)

@@ -7,26 +7,26 @@ code at run time**, calling between C# and Lisp in both directions.
 Here **"precompiled" / "emit-less" means: no runtime code generation** (no
 `Reflection.Emit`, no JIT of Lisp). It does *not* refer to static linking. This
 is the same constraint an AOT / IL2CPP target imposes, so this sample is how you
-validate that dotcl logic will run on those targets — on plain CoreCLR, today.
+validate that dotcl logic will run on those targets; on plain CoreCLR, today.
 
 ## How it works
 
 1. **Build time** (`precompile.lisp`): the `PrecompileLisp` MSBuild target runs
-   the dotcl compiler to produce two precompiled .NET IL assemblies —
+   the dotcl compiler to produce two precompiled .NET IL assemblies;
    `app.fasl` (this app's Lisp, from `app.lisp`) and `dotcl.core` (the runtime
    core, converted from the dev SIL core via `dotcl:sil-to-fasl`). The *compiler*
-   uses `Reflection.Emit` — that is the dev/build side, not the shipped side.
+   uses `Reflection.Emit`; that is the dev/build side, not the shipped side.
 2. **Run time** (`Program.cs`): the host
-   - `DotclHost.Initialize()` + `LoadCore("dotcl.core")` — boot the runtime; a
+   - `DotclHost.Initialize()` + `LoadCore("dotcl.core")`: boot the runtime; a
      FASL core loads via ModuleInit, so even **boot generates no code**,
-   - `DotclHost.PrecompiledOnly = true` — **forbid all runtime codegen** from here,
-   - `DotclHost.Register("host-log", ...)` — expose a C# function to Lisp,
-   - `DotclHost.LoadLispFile("app.fasl")` — load the precompiled image (no codegen),
-   - `DotclHost.Call("FIB", 20)` etc. — call Lisp from C#,
-   - `greet` calls back into `host-log` — call C# from Lisp,
+   - `DotclHost.PrecompiledOnly = true`, **forbid all runtime codegen** from here,
+   - `DotclHost.Register("host-log", ...)`, expose a C# function to Lisp,
+   - `DotclHost.LoadLispFile("app.fasl")`: load the precompiled image (no codegen),
+   - `DotclHost.Call("FIB", 20)` etc., call Lisp from C#,
+   - `greet` calls back into `host-log`, call C# from Lisp,
    - and a final `EvalString("(+ 1 2)")` shows that runtime `eval` is now blocked.
 
-   Everything after boot — registration, loading the app, and running it — happens
+   Everything after boot, registration, loading the app, and running it, happens
    under `PrecompiledOnly`, so the whole app lifecycle is provably emit-less.
 
 `app.lisp`'s source is never read or `eval`'d by the running app; only the
@@ -38,7 +38,7 @@ precompiled `app.fasl` is loaded.
 dotnet run
 ```
 
-(Requires `compiler/cil-out.sil` to exist — build it once from the repo root with
+(Requires `compiler/cil-out.sil` to exist; build it once from the repo root with
 `make cross-compile`.)
 
 ## Expected output
@@ -53,7 +53,7 @@ greet returned name length = 5
 
 eval blocked as expected: precompiled-only mode (dotcl:precompiled-only): ...
 
-Done — ran precompiled Lisp with no runtime code generation.
+Done; ran precompiled Lisp with no runtime code generation.
 ```
 
 ## Notes

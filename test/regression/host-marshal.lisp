@@ -1,7 +1,7 @@
 ;;; Regression: DotclHost's explicit collection conversions.
 ;;;
 ;;; A .NET array handed to DotclHost.Call arrives as a foreign object, not as a
-;;; Lisp sequence — deliberately, so a byte[] stays the same buffer. That left a
+;;; Lisp sequence: deliberately, so a byte[] stays the same buffer. That left a
 ;;; host with no way to say "pass this as a Lisp list": the dotcl-classlib
 ;;; template had to take its arguments as &rest scalars. ToLispList /
 ;;; ToLispVector are that way in; ToClrArray / ToClrList are the way back.

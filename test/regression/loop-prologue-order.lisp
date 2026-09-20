@@ -1,4 +1,4 @@
-;;; LOOP prologue ordering — ANSI CL 6.1.7.2 (prologue clauses run in source
+;;; LOOP prologue ordering: ANSI CL 6.1.7.2 (prologue clauses run in source
 ;;; order) and SBCL compatibility.
 ;;;
 ;;; For "for var = form" WITHOUT then, the assignment runs in the loop body
@@ -66,7 +66,7 @@
 ;;; order); a textually-later :initially runs after it. dotcl previously stranded
 ;;; the FIRST assignment ahead of the whole prologue ((:FIRST :INIT ...)). Values
 ;;; below are what SBCL produces. (The step is evaluated once per iteration
-;;; including a final wasted one — SBCL does the same, hence two :THEN for a
+;;; including a final wasted one: SBCL does the same, hence two :THEN for a
 ;;; two-element list.)
 
 ;; initially textually BEFORE `for = first then next` : initially runs first.
@@ -93,7 +93,7 @@
   (:init :first :then :then))
 
 ;; `for = first then next` sits in source order between two initially clauses.
-;; Both initially clauses still run before the FIRST form — same reason. SBCL
+;; Both initially clauses still run before the FIRST form: same reason. SBCL
 ;; 2.6.1 gives (:I1 :I2 :FIRST).
 (deftest loop-prologue-for-equals-then-between-initially
   (let ((l '()))
@@ -111,7 +111,7 @@
 
 ;; Successive FOR clauses bind like LET* (ANSI CL 6.1.2.1); only AND makes them
 ;; parallel. A later clause's init form has to see the value the earlier clause
-;; established on this same iteration. SBCL's fasl writer depends on it —
+;; established on this same iteration. SBCL's fasl writer depends on it;
 ;; WRITE-VAR-INTEGER reads its own stepped variable from the next FOR clause, and
 ;; with the variable still NIL it emitted a varint without its continuation bit,
 ;; which made GENESIS reject the layout it decoded.

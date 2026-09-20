@@ -5,7 +5,7 @@
 ;;; types in this implementation, so they used to skip the accessibility check
 ;;; every other symbol goes through and printed bare. In a package that does not
 ;;; use COMMON-LISP that output reads back as a DIFFERENT symbol of the same
-;;; name — print/read consistency broken with no error anywhere.
+;;; name: print/read consistency broken with no error anywhere.
 ;;;
 ;;; Found through coalton: its (coalton ...) macro prints a form and re-reads
 ;;; it, and its test package uses only its own packages, so the () in

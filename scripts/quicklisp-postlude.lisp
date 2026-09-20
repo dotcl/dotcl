@@ -1,6 +1,6 @@
 ;;;; dotcl postlude for the bundled quicklisp client. Emitted after the client's
 ;;;; own components by scripts/build-quicklisp.sh, and so runs when the contrib
-;;;; fasl is loaded — i.e. at (require "quicklisp").
+;;;; fasl is loaded: i.e. at (require "quicklisp").
 ;;;;
 ;;;; Upstream this is the tail of the quicklisp home's setup.lisp, which ends by
 ;;;; calling (quicklisp:setup). dotcl cannot call it unconditionally: setup runs
@@ -12,11 +12,11 @@
 ;;;;
 ;;;; The flip side of that rule: (ql:setup) IS the user asking for the network,
 ;;;; so it installs the dotcl overlay dist too. Everything a dotcl user needs is
-;;;; then reachable from the two things the printed messages already name —
-;;;; (require "quicklisp") and (ql:setup) — with no third incantation to look up.
+;;;; then reachable from the two things the printed messages already name,
+;;;; (require "quicklisp") and (ql:setup), with no third incantation to look up.
 ;;;;
 ;;;; Once a dist is present setup touches the network for nothing, so the normal
-;;;; case — every run after the first — is wired up automatically.
+;;;; case, every run after the first, is wired up automatically.
 
 (in-package #:ql-setup)
 
@@ -24,15 +24,15 @@
 ;;;
 ;;; ql-http speaks plain HTTP over its own socket code and has no TLS, so
 ;;; anything served over https is unreachable with the stock client. The client
-;;; does export the hook for it — *fetch-scheme-functions* dispatches FETCH on
-;;; the URL scheme — so this is a registration, not a patch: the shipped client
+;;; does export the hook for it, *fetch-scheme-functions* dispatches FETCH on
+;;; the URL scheme, so this is a registration, not a patch: the shipped client
 ;;; source stays identical to what was submitted upstream.
 
 (defvar *https-credentials-function* nil
   "Called with a host name; returns an alist of (header-name . value) to send,
 or NIL for none. Left unset, https requests are anonymous, which is what a
 public dist needs. Setting it is how a private dist or an in-house server
-becomes reachable — dotcl never embeds a token and never assumes a particular
+becomes reachable; dotcl never embeds a token and never assumes a particular
 host.")
 
 (defun %credentials-for (host)
@@ -94,7 +94,7 @@ ql-http:http-fetch, so callers cannot tell the two apart."
 (defvar *offer-dotcl-dist* t
   "Whether dotcl offers the overlay dist at all: (ql:setup) installs it, and a
 (require \"quicklisp\") that finds it missing says so. Set to NIL for a
-stock-only quicklisp home — nothing is installed and nothing is printed.")
+stock-only quicklisp home; nothing is installed and nothing is printed.")
 
 (defun dotcl-dist ()
   (ql-dist:find-dist "dotcl"))
@@ -107,7 +107,7 @@ network fetch, or after *OFFER-DOTCL-DIST* was turned back on.
 
 Deliberately not run from (require :quicklisp): it touches the network, and a
 require that quietly reaches out is the wrong default. Once installed nothing
-further is needed — the preference is stored in the quicklisp home, so every
+further is needed; the preference is stored in the quicklisp home, so every
 later session picks the patched releases without asking."
   (unless (dotcl-dist)
     (ql-dist:install-dist *dotcl-dist-url* :prompt nil))
@@ -125,14 +125,14 @@ later session picks the patched releases without asking."
              ;; Run (ql-setup:install-dotcl-dist) for the dotcl-patched libraries,~@
              ;; or (setf ql-setup:*offer-dotcl-dist* nil) to stop seeing this.~%"))
 
-;;; (ql:setup) — where the overlay gets installed
+;;; (ql:setup): where the overlay gets installed
 ;;;
 ;;; SETUP is the point where the user has asked for the network: on a fresh home
 ;;; it downloads and installs the stock dist. Fetching the overlay in the same
 ;;; breath is the difference between "dotcl gives you the patched releases" and
 ;;; "dotcl gives you the patched releases once you find out about a second
-;;; incantation". The constraint from the header — require must not touch the
-;;; network — is untouched: the require path below calls the client's own SETUP
+;;; incantation". The constraint from the header, require must not touch the
+;;; network, is untouched: the require path below calls the client's own SETUP
 ;;; directly, not this wrapper.
 ;;;
 ;;; The client's function is wrapped here rather than edited: the bundled branch
@@ -165,12 +165,12 @@ turning that into a failed SETUP would strand the user with no dist at all."
           (namestring *quicklisp-home*)
           quicklisp::*initial-dist-url*))
 
-;;; (ql:quickload) on a home with no dist — set it up rather than fail
+;;; (ql:quickload) on a home with no dist: set it up rather than fail
 ;;;
 ;;; REQUIRE must not touch the network, so a fresh home has no dist when the
 ;;; client is loaded. QUICKLOAD is the other side of that: asking for a library
 ;;; by name IS the request to go and get it, so failing with "System X not
-;;; found" reports the wrong thing — the system is fine, the home is empty.
+;;; found" reports the wrong thing: the system is fine, the home is empty.
 ;;;
 ;;; So the network moment moves from "the user reads a note and runs a second
 ;;; incantation" to "the first quickload takes a few seconds longer", which is
@@ -183,7 +183,7 @@ turning that into a failed SETUP would strand the user with no dist at all."
   "QUICKLOAD, installing a dist first if this home has none."
   (unless (quicklisp::dists-initialized-p)
     (format *error-output*
-            "~&;; quicklisp: no dist under ~A yet — installing one first.~%"
+            "~&;; quicklisp: no dist under ~A yet; installing one first.~%"
             (namestring *quicklisp-home*))
     ;; The overlay wrapper, not the client's SETUP: a home initialized by
     ;; quickload should end up with the same dists as one initialized by hand.

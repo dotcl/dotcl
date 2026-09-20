@@ -1,6 +1,6 @@
 #!/bin/bash
 # Show, for every contrib module, which file (require "<name>") will actually
-# load — and what that file is hiding.
+# load: and what that file is hiding.
 #
 # The question this answers is "why is my edit not taking effect". The module
 # loader searches several directories in order and takes the first hit, so an

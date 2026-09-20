@@ -2,7 +2,7 @@
 // Test-only interop helpers. Compiled into DEBUG builds only (the regression suite runs
 // on the Debug build via `dotnet run`), so these types are ABSENT from shipped Release
 // artifacts. They exercise interop surface that BCL types and runtime-emitted
-// (dotnet:%define-class) classes cannot express — e.g. C# optional parameters with
+// (dotnet:%define-class) classes cannot express: e.g. C# optional parameters with
 // default values (dotcl/dotcl#24).
 namespace DotCL.TestSupport
 {
@@ -41,7 +41,7 @@ namespace DotCL.TestSupport
         public ThrowingCtor(int n) => throw new System.ArgumentOutOfRangeException(nameof(n), "ctor boom " + n);
     }
 
-    // Throws an IOException wrapping a SocketException — the shape a stream
+    // Throws an IOException wrapping a SocketException: the shape a stream
     // read/write timeout produces. dotnet:exception-object must expose the
     // instance so a handler can walk InnerException and read SocketErrorCode /
     // ErrorCode instead of matching localized message text.
@@ -68,7 +68,7 @@ namespace DotCL.TestSupport
     // Plain `ref` parameters (in-out) for dotnet:call-out: the caller supplies
     // the initial value and receives the updated one as an extra return value.
     // StringBuilder is a non-IConvertible reference type, so a misclassified
-    // ref slot (arg shifted into the wrong parameter) fails loudly — the same
+    // ref slot (arg shifted into the wrong parameter) fails loudly: the same
     // shape as Socket.ReceiveFrom(byte[], ref EndPoint).
     public class RefParams
     {
@@ -82,14 +82,14 @@ namespace DotCL.TestSupport
         public static string Describe(ref System.Text.StringBuilder sb) => "one:" + sb;
         public static string Describe(ref System.Text.StringBuilder sb, int n) => "two:" + sb + n;
 
-        // A ref that REPLACES its referent — the extra value must be the new object.
+        // A ref that REPLACES its referent: the extra value must be the new object.
         public static bool Replace(ref string s) { s = s + "-replaced"; return true; }
     }
 
     // Ctor set mirrors Avalonia.Media.SolidColorBrush exactly: (),
-    // (ColorVal, double opacity = 1), (uint). There is NO 1-arg (ColorVal) ctor —
+    // (ColorVal, double opacity = 1), (uint). There is NO 1-arg (ColorVal) ctor;
     // a single ColorVal must select the 2-param ctor with its opacity defaulted,
-    // not the fixed-arity (uint) ctor (which would Convert.ChangeType the struct →
+    // not the fixed-arity (uint) ctor (which would Convert.ChangeType the struct ->
     // IConvertible). Exercises the optional-tail ctor path.
     public class ColorBox
     {

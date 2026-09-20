@@ -87,7 +87,7 @@ public static partial class Runtime
                 if (_pprintActive) PprintTrackWrite(result2);
             }
             // *standard-output* may be a Gray output stream (a CLOS instance, not a
-            // LispOutputStream) or another LispStream — route it through GetTextWriter,
+            // LispOutputStream) or another LispStream: route it through GetTextWriter,
             // the same trampoline the explicit-stream path uses, so
             // (format t ...) reaches it instead of leaking to the console.
             else if (resolvedStream is LispStream
@@ -128,7 +128,7 @@ public static partial class Runtime
 
     /// <summary>A print base / radix must be an integer in [2, 36]. This used to
     /// throw ArgumentException, which the CLR-exception mapping reports as a
-    /// PROGRAM-ERROR — but passing 40 for :base is a bad argument, not a broken
+    /// PROGRAM-ERROR: but passing 40 for :base is a bad argument, not a broken
     /// program, and a handler could not see which value was rejected.</summary>
     private static void CheckRadix(int radix)
     {
@@ -629,7 +629,7 @@ public static partial class Runtime
             string fracPart = mant.Substring(dotIdx + 1);
             if (intPart.Length == 0 || (intPart == "0"))
             {
-                // "0.00012345" → leading zeros in frac define exponent
+                // "0.00012345" -> leading zeros in frac define exponent
                 int lz = 0;
                 while (lz < fracPart.Length && fracPart[lz] == '0') lz++;
                 digits = fracPart.Substring(lz);
@@ -663,12 +663,12 @@ public static partial class Runtime
     /// Asking for N+3 digits is not the same as asking for the value: .NET rounds exactly
     /// at whatever precision is requested, so rounding that result again at N is a double
     /// rounding, and the two disagree when the discarded part sits right at the tie. (With
-    /// G17 — enough to round-trip a double, not enough to round it — ~E printed
+    /// G17, enough to round-trip a double, not enough to round it, ~E printed
     /// 1.051215004350025d24 to 15 digits as ...435002 where the exact value gives ...435003:
     /// G17's last digit 5 looks like an exact tie, while the real remainder is above it.)
     ///
     /// So: probe at N+3, which decides every case except digits[N] == '5' followed by
-    /// zeros — precisely the shape a tie, a hair above it, and a hair below it all collapse
+    /// zeros: precisely the shape a tie, a hair above it, and a hair below it all collapse
     /// to. Only then take the full expansion, which terminates for every double (at most
     /// 767 significant digits) and leaves the caller's tie rule to act on a real tie.</summary>
     private static void SignificantDigitsForRounding(double absVal, int n,
@@ -980,7 +980,7 @@ public static partial class Runtime
         }
         if (totalDigitsToEmit < 1) totalDigitsToEmit = 1; // need at least one digit
 
-        // Digits to round from — enough that rounding them equals rounding the value.
+        // Digits to round from: enough that rounding them equals rounding the value.
         SignificantDigitsForRounding(absVal, totalDigitsToEmit, out string allDigits, out int msdExp,
                                      isSingle && shortestDigits);
 
@@ -1013,7 +1013,7 @@ public static partial class Runtime
             allDigits = allDigits + new string('0', totalDigitsToEmit - allDigits.Length);
         }
 
-        // Handle carry (e.g. 9.99 → 10.00): exponent bumps up
+        // Handle carry (e.g. 9.99 -> 10.00): exponent bumps up
         if (carry)
         {
             exponent++;
@@ -1165,7 +1165,7 @@ public static partial class Runtime
             }
             catch (LispErrorException)
             {
-                // no applicable method — column unknown
+                // no applicable method: column unknown
             }
         }
         return 0;
@@ -1248,9 +1248,9 @@ public static partial class Runtime
     /// StringBuilder and flushes it to _pprintStream at ~_ / ~I / block boundaries.
     /// A nested structural directive (~[ clause, ~{ body, indirect ~{~}) recursively
     /// formats into its OWN StringBuilder, and an inner ~_ there flushes straight to
-    /// _pprintStream — jumping ahead of the parent's still-staged content (e.g.
+    /// _pprintStream: jumping ahead of the parent's still-staged content (e.g.
     /// "While parsing X. " staged in the parent, while the clause's "Expected:~@:_"
-    /// flushes first → reordered output). Flushing the parent's staged content right
+    /// flushes first -> reordered output). Flushing the parent's staged content right
     /// before recursing preserves source order. No-op outside a
     /// pretty logical block (_pprintActive false), so non-pretty FORMAT is unaffected.
     private static void PprintStageFlush(System.Text.StringBuilder sb)
@@ -1359,15 +1359,15 @@ public static partial class Runtime
                     }
                     else if (i < template.Length && template[i] == ',')
                     {
-                        // empty parameter (just comma) — add null placeholder
+                        // empty parameter (just comma): add null placeholder
                         (prefixParams ??= new System.Collections.Generic.List<object?>()).Add(null);
                     }
                     else
                     {
-                        // No parameter found — if this was the first position, no params at all
+                        // No parameter found: if this was the first position, no params at all
                         if (prefixParams == null || prefixParams.Count == 0)
                             break;
-                        // Otherwise this was after a comma with no value — empty param
+                        // Otherwise this was after a comma with no value: empty param
                         (prefixParams ??= new System.Collections.Generic.List<object?>()).Add(null);
                         break;
                     }
@@ -1440,7 +1440,7 @@ public static partial class Runtime
                             // FormatTop, not FormatObject: ~A and ~S print an arbitrary
                             // object, so they are exactly where *print-circle* has to be
                             // established. Going straight to FormatObject skipped the scan
-                            // pass, so a shared or circular argument printed untangled —
+                            // pass, so a shared or circular argument printed untangled;
                             // for a graph that loops, forever. FormatTop costs nothing when
                             // *print-circle* is nil or a scan is already in progress.
                             string s = (colonMod && args[argIdx] is Nil)
@@ -1594,13 +1594,13 @@ public static partial class Runtime
                                 }
                                 else
                                 {
-                                    // Should not reach here — non-integers handled above
+                                    // Should not reach here: non-integers handled above
                                     numStr = FormatObject(arg, false);
                                     isNum = false;
                                 }
                             }
 
-                            // : modifier — insert commachar between groups of comma-interval digits
+                            // : modifier: insert commachar between groups of comma-interval digits
                             if (colonMod && isNum)
                             {
                                 bool neg = numStr.StartsWith("-");
@@ -1623,13 +1623,13 @@ public static partial class Runtime
                                 }
                             }
 
-                            // @ modifier — prepend + for non-negative
+                            // @ modifier: prepend + for non-negative
                             if (atMod && isNum && !numStr.StartsWith("-"))
                             {
                                 numStr = "+" + numStr;
                             }
 
-                            // mincol — pad with padchar on the left
+                            // mincol: pad with padchar on the left
                             if (radixMincol > numStr.Length)
                             {
                                 numStr = new string(radixPadchar, radixMincol - numStr.Length) + numStr;
@@ -1675,12 +1675,12 @@ public static partial class Runtime
                                 }
                                 else
                                 {
-                                    // Should not reach here — non-integers handled above
+                                    // Should not reach here: non-integers handled above
                                     rNumStr = FormatObject(rArg, false);
                                     rIsNum = false;
                                 }
 
-                                // : modifier — insert commachar between groups
+                                // : modifier: insert commachar between groups
                                 if (colonMod && rIsNum)
                                 {
                                     bool neg = rNumStr.StartsWith("-");
@@ -1702,11 +1702,11 @@ public static partial class Runtime
                                     }
                                 }
 
-                                // @ modifier — prepend + for non-negative
+                                // @ modifier: prepend + for non-negative
                                 if (atMod && rIsNum && !rNumStr.StartsWith("-"))
                                     rNumStr = "+" + rNumStr;
 
-                                // mincol — pad with padchar on the left
+                                // mincol: pad with padchar on the left
                                 if (rMincol > rNumStr.Length)
                                     rNumStr = new string(rPadchar, rMincol - rNumStr.Length) + rNumStr;
 
@@ -1733,7 +1733,7 @@ public static partial class Runtime
                                 }
                                 else
                                 {
-                                    // Should not reach here — non-integers handled above
+                                    // Should not reach here: non-integers handled above
                                     sb.Append(FormatObject(rArg, false));
                                 }
                             }
@@ -1995,7 +1995,7 @@ public static partial class Runtime
                         var (clauses, hasDefault) = ParseConditionalClauses(template, ref i);
                         if (atMod)
                         {
-                            // ~@[...~] — if arg is non-nil, process body without consuming arg
+                            // ~@[...~]: if arg is non-nil, process body without consuming arg
                             if (argIdx >= args.Length) MissingFormatArg(directive);
                             if (argIdx < args.Length && args[argIdx] is not Nil)
                             {
@@ -2013,7 +2013,7 @@ public static partial class Runtime
                         }
                         else if (colonMod)
                         {
-                            // ~:[false~;true~] — boolean. Consume the test arg, then process
+                            // ~:[false~;true~]: boolean. Consume the test arg, then process
                             // the clause in place on the shared arg pointer (same reasons as
                             // the numeric ~[ below: ~:* backup + arg-consumption propagation).
                             if (argIdx >= args.Length) MissingFormatArg(directive);
@@ -2032,7 +2032,7 @@ public static partial class Runtime
                         }
                         else
                         {
-                            // ~[c0~;c1~;...~] or ~n[c0~;c1~;...~] — numeric selection.
+                            // ~[c0~;c1~;...~] or ~n[c0~;c1~;...~]: numeric selection.
                             // ~n[ and ~#[ take their index from the prefix parameter and
                             // consume nothing; the bare form needs an argument.
                             int ci;
@@ -2041,7 +2041,7 @@ public static partial class Runtime
                                 MissingFormatArg(directive);
                             if (prefixParam.HasValue)
                             {
-                                // ~n[...~] — prefix parameter provides the index
+                                // ~n[...~]: prefix parameter provides the index
                                 ci = prefixParam.Value;
                             }
                             else if (argIdx < args.Length && args[argIdx] is Fixnum fi2)
@@ -2891,7 +2891,7 @@ public static partial class Runtime
                             else if (resolvedParams[pi] is char cv2) effectiveParams.Add((int)cv2);
                             else if (resolvedParams[pi] is Bignum bv2) effectiveParams.Add(bv2);
                             else if (resolvedParams[pi] != null) effectiveParams.Add(0);
-                            // null (from V consuming nil) is skipped → omitted
+                            // null (from V consuming nil) is skipped -> omitted
                         }
                         int paramCount = effectiveParams.Count;
 
@@ -3385,6 +3385,35 @@ public static partial class Runtime
         return body.ToString();
     }
 
+    /// <summary>
+    /// Step over a directive's prefix parameters and modifiers, leaving POS on the
+    /// directive character itself. HASCOLON reports a : modifier.
+    ///
+    /// A scanner that looks for the end of a block has to agree with the real
+    /// parser about where each directive ends, or it mistakes a directive
+    /// character for a block delimiter. Skipping only digits is not enough: a
+    /// prefix parameter is also # (argument count), v (take it from an argument),
+    /// 'c (a character), a sign, or several of those separated by commas -- and
+    /// ~#[ is common enough that missing it made every ~[ nested in a conditional
+    /// close the outer one instead of itself.
+    /// </summary>
+    private static void SkipDirectivePrefix(string template, ref int pos, out bool hasColon)
+    {
+        hasColon = false;
+        while (pos < template.Length)
+        {
+            char ch = template[pos];
+            if (ch == ':') { hasColon = true; pos++; }
+            else if (char.IsDigit(ch) || ch == ',' || ch == '-' || ch == '+' ||
+                     ch == 'v' || ch == 'V' || ch == '#' || ch == '@')
+                pos++;
+            else if (ch == '\'' && pos + 1 < template.Length)
+                pos += 2; // 'c -- the character itself may be any directive character
+            else
+                break;
+        }
+    }
+
     private static (List<string> clauses, bool hasDefault) ParseConditionalClauses(string template, ref int pos)
     {
         var clauses = new List<string>();
@@ -3398,15 +3427,7 @@ public static partial class Runtime
             {
                 int start = pos;
                 pos++;
-                // skip numeric prefix
-                while (pos < template.Length && char.IsDigit(template[pos])) pos++;
-                // skip modifiers
-                string mods = "";
-                while (pos < template.Length && (template[pos] == ':' || template[pos] == '@'))
-                {
-                    mods += template[pos];
-                    pos++;
-                }
+                SkipDirectivePrefix(template, ref pos, out bool hasColonMod);
                 if (pos >= template.Length) break;
                 char d = char.ToUpper(template[pos]);
                 pos++;
@@ -3435,7 +3456,7 @@ public static partial class Runtime
                 {
                     clauses.Add(current.ToString());
                     current.Clear();
-                    lastSepWasColon = mods.Contains(':');
+                    lastSepWasColon = hasColonMod;
                 }
                 else
                 {
@@ -3535,7 +3556,7 @@ public static partial class Runtime
                 }
                 // Skip modifiers : @
                 while (di < s.Length && (s[di] == ':' || s[di] == '@')) di++;
-                // Now at directive char — any valid directive means this has format content
+                // Now at directive char: any valid directive means this has format content
                 if (di < s.Length)
                     return true;
             }
@@ -3575,7 +3596,7 @@ public static partial class Runtime
                     else if (dc == '>')
                     {
                         depth = Math.Max(0, depth - 1);
-                        // ~:> means logical block — error in justify
+                        // ~:> means logical block: error in justify
                         if (hasColon) return true;
                     }
                     else if (depth == 0)

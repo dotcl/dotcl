@@ -1,6 +1,6 @@
 ;;; STABLE-SORT must preserve the original order of elements the predicate
 ;;; considers equal (CLHS 17.3). It used to share SORT's Array.Sort/List.Sort
-;;; path (introsort — unstable), so equal keys came out in an arbitrary order.
+;;; path (introsort: unstable), so equal keys came out in an arbitrary order.
 ;;;
 ;;; The lists here are long enough that the underlying introsort actually
 ;;; reorders equal elements; a 2- or 3-element case can pass by accident.
@@ -12,7 +12,7 @@
       (push (cons (mod i groups) i) r))))
 
 (defun ss-tags-per-key (sorted)
-  "Tags of SORTED grouped in encounter order — must be ascending within a key."
+  "Tags of SORTED grouped in encounter order; must be ascending within a key."
   (mapcar #'cdr sorted))
 
 (defun ss-ascending-within-keys-p (sorted)
@@ -37,7 +37,7 @@
    (coerce (stable-sort (coerce (ss-tagged 60 3) 'vector) #'< :key #'car) 'list))
   t)
 
-;;; No :key — the predicate itself declares elements equal.
+;;; No :key: the predicate itself declares elements equal.
 (deftest stable-sort.no-key-equal-elements-keep-order
   (ss-ascending-within-keys-p
    (stable-sort (ss-tagged 50 2) (lambda (a b) (< (car a) (car b)))))

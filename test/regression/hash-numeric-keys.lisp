@@ -3,7 +3,7 @@
 ;;; value; bignums, ratios and complexes used to fall through to an identity
 ;;; hash, and the table's private EQL knew only fixnums/characters/floats.
 ;;; SBCL's inline-constant table is an EQUAL table keyed by lists holding raw
-;;; float constants — every miss appended a duplicate constant to the code
+;;; float constants: every miss appended a duplicate constant to the code
 ;;; object it was compiling.
 
 (defun ht-roundtrip (test k1 k2)

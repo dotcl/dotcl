@@ -1,4 +1,4 @@
-;;; DotclHost.Call — the host API a C# program uses to call into Lisp.
+;;; DotclHost.Call: the host API a C# program uses to call into Lisp.
 ;;;
 ;;; The string it takes is a SYMBOL NAME, matched exactly, and an unqualified
 ;;; one means the current package. Neither half is obvious, and each replaced a

@@ -1,0 +1,4 @@
+# C# method            Lisp function
+HashTable.Hash         ILP-HASH-INDEX
+HashTable.Put          ILP-HASH-PUT
+HashTable.Get          ILP-HASH-GET

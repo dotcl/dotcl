@@ -1,0 +1,4 @@
+# C# method            Lisp function
+Vec2.Length            ILP-VEC2-LENGTH
+Vec2.Normalize         ILP-VEC2-NORMALIZE
+Vec2.Dot               ILP-VEC2-DOT

@@ -7,7 +7,7 @@ DOTCL_LISP ?= ros -L sbcl-bin run
 STDBUF ?=
 SETSID ?= $(shell which setsid 2>/dev/null)
 
-.PHONY: all build build-ns2 check-contrib-freshness run clean repl test-fasl-shape test-core-bytes test-host-api test-coverage test-ansi-all test-ansi-full test-ansi-extra test-regression test-regression-interp test-regression-emitfree test-pack-nuspec test-save-class-lib test-project-compose test-project-core-build test-mop test-kestrel ilverify update-ansi-state commit-ansi-state cross-compile selfhost-check selfhost-test seed-install seed-check loc publish pack install setup-ansi-test setup-asdf setup-quicklisp setup-cl-bench bench bench-state bench-survey compile-asdf-fasl compile-asdf-fasls compile-quicklisp-fasl compile-core-fasl compile-contrib-fasls contrib-dotcl-cs contrib-dotcl-jitdisasm gen-char-names
+.PHONY: il-parity il-parity-accept all build build-ns2 check-contrib-freshness run clean repl test-fasl-shape test-core-bytes test-host-api test-cli-exit test-coverage test-ansi-all test-ansi-gate library-status test-ansi-full test-ansi-extra test-regression test-regression-interp test-regression-emitfree test-pack-nuspec test-save-class-lib test-project-compose test-project-core-build test-mop test-kestrel ilverify update-ansi-state commit-ansi-state cross-compile selfhost-check selfhost-test seed-install seed-check loc publish pack install setup-ansi-test setup-asdf setup-quicklisp setup-cl-bench bench bench-state bench-survey compile-asdf-fasl compile-asdf-fasls compile-quicklisp-fasl compile-core-fasl compile-contrib-fasls contrib-dotcl-cs contrib-dotcl-jitdisasm gen-char-names
 
 # Source files for cross-compile. Listed once; the recipe and dependency
 # tracking both reference this so adding a file is a single-edit change.
@@ -118,20 +118,20 @@ test-regression: build $(DOTCL_ROOT)compiler/cil-out.sil $(wildcard $(DOTCL_ROOT
 
 # The same suite with EVAL routed through the emit-free tree-walk interpreter.
 # That interpreter is the ONLY evaluator on netstandard2.0 (AOT/WebGL) builds,
-# and `build-ns2` merely compiles that runtime — it runs no tests, so until this
+# and `build-ns2` merely compiles that runtime: it runs no tests, so until this
 # target existed the evaluator those builds depend on had never been executed by
 # CI at all. Tests asserting a compile-time diagnostic (a warning, the IL size
 # limit, refusal to generate code) opt out via DEFTEST-COMPILED-ONLY.
 #
 # Scope, so this is not read as more than it is: *evaluator-mode* redirects EVAL
-# only — LOAD still compiles top-level forms. This exercises the interpreter
+# only: LOAD still compiles top-level forms. This exercises the interpreter
 # wherever a test reaches it through EVAL, which is far better than nothing but
 # is not the same as running the suite ON an emit-free build.
 test-regression-interp: build $(DOTCL_ROOT)compiler/cil-out.sil $(wildcard $(DOTCL_ROOT)contrib/asdf/asdf.fasl)
 	@echo "=== Running dotcl regression tests (tree-walk interpreter) ==="
 	$(SETSID) dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --asm $(DOTCL_ROOT)compiler/cil-out.sil --eval '(setq dotcl:*evaluator-mode* :interpret)' $(DOTCL_ROOT)test/regression/run.lisp
 
-# The same suite ON an emit-free build — no System.Reflection.Emit anywhere, so
+# The same suite ON an emit-free build: no System.Reflection.Emit anywhere, so
 # the tree-walk interpreter is the only evaluator and even LOAD of a .lisp goes
 # through it. This is what `test-regression-interp` above is only a proxy for:
 # there, LOAD still compiles each top-level form, so an interpreted DEFUN never
@@ -139,7 +139,7 @@ test-regression-interp: build $(DOTCL_ROOT)compiler/cil-out.sil $(wildcard $(DOT
 # found there.
 #
 # NOT wired into CI yet: it currently stops at test/regression/macroexpand-hook.lisp
-# with a stack overflow — an interpreted *MACROEXPAND-HOOK* re-enters, because the
+# with a stack overflow: an interpreted *MACROEXPAND-HOOK* re-enters, because the
 # interpreter macroexpands the hook's own body on every call. Tracked separately.
 #
 # -p:DotclNoEmit=true flips the DOTCL_EMIT constant off for an ordinary desktop
@@ -188,7 +188,7 @@ test-project-compose: build
 	@echo "=== Running project-core composition checks ==="
 	sh $(DOTCL_ROOT)test/project-compose/check.sh $(DOTCL_ROOT)
 
-# Booting from a core held in memory (DotclHost.LoadCore(byte[])) — the only way
+# Booting from a core held in memory (DotclHost.LoadCore(byte[])); the only way
 # in for a host with no filesystem, and for the emit-free runtime the only way in
 # at all. Covers both the normal and the emit-free build.
 test-host-api: build $(DOTCL_ROOT)compiler/dotcl.core
@@ -198,6 +198,13 @@ test-host-api: build $(DOTCL_ROOT)compiler/dotcl.core
 test-core-bytes: build $(DOTCL_ROOT)compiler/dotcl.core
 	@echo "=== Running in-memory core checks ==="
 	sh $(DOTCL_ROOT)test/core-bytes/check.sh $(DOTCL_ROOT)
+
+# What a script run does with an error the program never handled: the exit code
+# and whether the forms after it ran. A process-level property, so it cannot be
+# a regression test inside the image.
+test-cli-exit: build $(DOTCL_ROOT)compiler/cil-out.sil
+	@echo "=== Running script exit-code checks ==="
+	sh $(DOTCL_ROOT)test/cli-exit/check.sh $(DOTCL_ROOT)
 
 test-ansi-extra: build $(DOTCL_ROOT)compiler/cil-out.sil
 	@echo "=== Running CLHS audit extra tests ==="
@@ -225,7 +232,7 @@ ilverify: build $(DOTCL_ROOT)compiler/cil-out.sil
 	bash $(DOTCL_ROOT)scripts/ilverify-check.sh
 
 # ilverify's companion: it asks whether the IL is VALID, this asks whether the
-# assembly has a loadable SHAPE — no single method too large to JIT cheaply, no
+# assembly has a loadable SHAPE: no single method too large to JIT cheaply, no
 # type near the field limit, no oversized #US heap. Those failures are invisible
 # on the compile side (total IL, fasl bytes and compile time stay flat) and land
 # at LOAD as a diagnostic that names neither file nor cause. Every instance so
@@ -234,7 +241,7 @@ test-fasl-shape: build $(DOTCL_ROOT)compiler/cil-out.sil
 	@echo "=== Checking fasl shape (per-method IL / fields per type / #US heap) ==="
 	bash $(DOTCL_ROOT)scripts/fasl-shape-check.sh
 
-# Compile-only tripwire for the netstandard2.0 runtime — the build that AOT
+# Compile-only tripwire for the netstandard2.0 runtime: the build that AOT
 # (NativeAOT) and WebGL (Unity IL2CPP) link against. `make build` only compiles
 # the dev net10 runner, so an unguarded Reflection.Emit use (absent on ns2.0) or
 # a broken DOTCL_NO_JSON #if would otherwise surface only in a heavy AOT/IL2CPP
@@ -249,7 +256,7 @@ build-ns2:
 	@# emitter sources while lacking PersistedAssemblyBuilder (.NET 9+), so a field
 	@# assigned only by the .fasl writer reads as never-assigned there. With
 	@# warnings promoted to errors that is a build failure, and it used to surface
-	@# for the first time inside `pack` — during a release. Build it here instead.
+	@# for the first time inside `pack`; during a release. Build it here instead.
 	@echo "=== Building net8.0 runtime (embeddable; emitter present, no fasl writer) ==="
 	dotnet build $(DOTCL_ROOT)runtime/DotCL.Runtime.csproj -c Release -f net8.0
 
@@ -268,6 +275,12 @@ test-ansi-all: build setup-ansi-test
 		tmp=$$(mktemp /tmp/dotcl-ansi-XXXXXX.lisp); \
 		cat $(DOTCL_ROOT)test/test-ansi-cat.lisp > $$tmp; \
 		echo "(load \"ansi-test/$$cat/load.lsp\")" >> $$tmp; \
+		: 'The suite adjustments (test/ansi-exclusions.lisp) go AFTER the category'; \
+		: 'load -- loading a category re-reads the suite notes and would undo them'; \
+		: '-- and before do-tests. Without this the per-category runs counted the'; \
+		: 'twelve intentional deviations as failures, so CI and the single-process'; \
+		: 'runner reported different numbers.'; \
+		echo "(load \"$(DOTCL_ROOT)test/ansi-exclusions.lisp\")" >> $$tmp; \
 		echo "(let ((s0 (dotcl:gc-stats)))" >> $$tmp; \
 		echo "  (let ((*load-pathname* nil) (*load-truename* nil)) (rt:do-tests))" >> $$tmp; \
 		echo "  (let ((s1 (dotcl:gc-stats)))" >> $$tmp; \
@@ -324,6 +337,29 @@ test-ansi-all: build setup-ansi-test
 	printf "%-25s %5d/%5d pass (%d failures)\n" "TOTAL:" $$total_pass $$total_tests $$total_fail; \
 	printf "%-25s gen0=%d gen1=%d gen2=%d alloc=%dMB\n" "GC TOTAL:" $$total_gen0 $$total_gen1 $$total_gen2 $$((total_alloc / 1048576))
 
+# docs/library-status.md, end to end: try every system in targets.txt with this
+# build (stage 2), then render the table from what happened (stage 3). Stage 1
+# (choosing the targets from a dist) is a separate, rarer run -- see
+# bench/library-status/README.md.
+#
+# LIMIT=1 does one system, which is how to check the pipeline without paying for
+# the whole list. The measurement is deliberately serial and bounds each system
+# rather than the run; the script explains why.
+#
+# Rendering runs on the host Lisp, not on dotcl: it is text handling over a JSON
+# file, and it has to work in a tree where nothing has been installed yet.
+library-status: build $(DOTCL_ROOT)compiler/cil-out.sil
+	@sh $(DOTCL_ROOT)bench/library-status/run-quickload.sh $(DOTCL_ROOT).
+	@DOTCL_VERSION="$$(git -C $(DOTCL_ROOT). describe --tags --always)" \
+	  $(DOTCL_LISP) --load $(DOTCL_ROOT)bench/library-status/render.lisp
+
+# The gate over an ANSI run: the set of failing test names must be the set
+# ansi-state.json records. Runs against the outputs test-ansi-all left behind,
+# and BEFORE update-ansi-state -- which rewrites that record from the same run
+# and would make any comparison afterwards trivially true.
+test-ansi-gate:
+	@sh $(DOTCL_ROOT)test/ansi-gate.sh $(DOTCL_ROOT)ansi-state.json $(ANSI_CATEGORIES)
+
 update-ansi-state:
 	@has_results=0; \
 	for cat in $(ANSI_CATEGORIES); do \
@@ -333,24 +369,52 @@ update-ansi-state:
 		echo "No /tmp/ansi-*.txt results found; keeping existing ansi-state.json"; \
 	else \
 		: 'Capture the hand-written half of the file BEFORE the redirection below'; \
-		: 'truncates it. Everything between "source" and "categories" is judgement'; \
-		: 'no run can reproduce -- which failures are known and why, which tests a'; \
-		: 'note excludes and what three implementations answered on the same forms'; \
-		: '-- and regenerating without it silently deleted all of it, with'; \
+		: 'truncates it. Everything between "source" and "total" is judgement no'; \
+		: 'run can reproduce -- why a known failure is accepted, which tests a note'; \
+		: 'excludes and what three implementations answered on the same forms --'; \
+		: 'and regenerating without it silently deleted all of it, with'; \
 		: 'commit-ansi-state standing by to commit the deletion.'; \
+		: 'Everything from "total" on is generated: the counts and the failing-test'; \
+		: 'names came from a run, and hand-carrying them is how the file came to'; \
+		: 'disagree with both CI and the local suite.'; \
 		curated=""; \
 		if [ -f $(DOTCL_ROOT)ansi-state.json ]; then \
-			curated=$$(sed -n '/^  "source"/,/^  "categories"/p' $(DOTCL_ROOT)ansi-state.json | sed '$$d'); \
+			curated=$$(sed -n '/^  "source"/,/^  "total"/p' $(DOTCL_ROOT)ansi-state.json | sed '$$d'); \
 		fi; \
 		{ \
 		echo '{'; \
 		echo '  "updated": "'"$$(date +%Y-%m-%d)"'",'; \
 		if [ -n "$$curated" ]; then printf '%s\n' "$$curated"; fi; \
+		: 'Totals, summed over the categories that produced output.'; \
+		sum_tests=0; sum_fail=0; \
+		for cat in $(ANSI_CATEGORIES); do \
+			outfile=/tmp/ansi-$$cat.txt; \
+			[ -f "$$outfile" ] || continue; \
+			t=$$(grep -a "" "$$outfile" | grep -o '[0-9]* tests total' | awk '{print $$1}' | tail -1); \
+			[ -n "$$t" ] || continue; \
+			f=$$(grep -a "" "$$outfile" | grep 'out of .* total tests failed' | awk '{print $$1}' | tail -1); \
+			[ -n "$$f" ] || f=0; \
+			sum_tests=$$((sum_tests + t)); sum_fail=$$((sum_fail + f)); \
+		done; \
+		sum_pass=$$((sum_tests - sum_fail)); \
+		pct=$$(awk -v p=$$sum_pass -v t=$$sum_tests 'BEGIN{ if (t > 0) printf "%.3f", 100*p/t; else printf "0" }'); \
+		echo "  \"total\": {\"tests\": $$sum_tests, \"pass\": $$sum_pass, \"percent\": $$pct, \"failures\": $$sum_fail},"; \
+		: 'The failing-test names themselves, from the same outputs the gate reads'; \
+		: '(test/ansi-failures.sh), so the recorded set and the checked set cannot'; \
+		: 'be written differently. Why each one is accepted: known-failure-notes,'; \
+		: 'in the hand-written half above.'; \
+		printf '  "known-failures": ['; \
+		kf_first=1; \
+		for n in $$(sh $(DOTCL_ROOT)test/ansi-failures.sh $(ANSI_CATEGORIES)); do \
+			if [ $$kf_first -eq 0 ]; then printf ', '; fi; kf_first=0; \
+			printf '"%s"' "$$n"; \
+		done; \
+		printf '],\n'; \
 		completed=""; \
 		for cat in $(ANSI_CATEGORIES); do \
 			outfile=/tmp/ansi-$$cat.txt; \
-			if [ -f "$$outfile" ] && strings "$$outfile" | grep -q 'No tests failed'; then \
-				total=$$(strings "$$outfile" | grep -o '[0-9]* tests total' | awk '{print $$1}'); \
+			if [ -f "$$outfile" ] && grep -a "" "$$outfile" | grep -q 'No tests failed'; then \
+				total=$$(grep -a "" "$$outfile" | grep -o '[0-9]* tests total' | awk '{print $$1}'); \
 				if [ -n "$$total" ] && [ "$$total" -gt 0 ] 2>/dev/null; then \
 					completed="$$completed \"$$cat\","; \
 				fi; \
@@ -367,9 +431,9 @@ update-ansi-state:
 				printf '    %-30s {"tests": null, "pass": null, "status": "untested", "blocker": null}' "\"$$cat\":"; \
 				continue; \
 			fi; \
-			total=$$(strings "$$outfile" | grep -o '[0-9]* tests total' | awk '{print $$1}'); \
-			fail_line=$$(strings "$$outfile" | grep 'out of .* total tests failed'); \
-			no_fail=$$(strings "$$outfile" | grep 'No tests failed'); \
+			total=$$(grep -a "" "$$outfile" | grep -o '[0-9]* tests total' | awk '{print $$1}'); \
+			fail_line=$$(grep -a "" "$$outfile" | grep 'out of .* total tests failed'); \
+			no_fail=$$(grep -a "" "$$outfile" | grep 'No tests failed'); \
 			if [ -z "$$total" ]; then \
 				blocker=$$(tail -5 "$$outfile" | head -1 | sed 's/"/\\"/g' | cut -c1-80); \
 				printf '    %-30s {"tests": null, "pass": null, "status": "blocked", "blocker": "%s"}' "\"$$cat\":" "$$blocker"; \
@@ -439,7 +503,7 @@ setup-asdf:
 	@# Unconditionally, not only when build/asdf.lisp is missing: make-asdf.sh
 	@# concatenates to a .tmp and cmp-and-moves, so unchanged source leaves the
 	@# file (and its mtime) alone. Guarding on existence instead made a branch
-	@# switch invisible — the concatenation from the old branch stayed behind and
+	@# switch invisible; the concatenation from the old branch stayed behind and
 	@# kept being copied on to contrib/, so the rebuilt fasl was still the old one.
 	@cd $(DOTCL_ROOT)asdf && sh make-asdf.sh
 	@mkdir -p $(DOTCL_ROOT)contrib/asdf
@@ -479,6 +543,17 @@ SUITE ?=
 BENCH ?=
 BENCH_TIMEOUT ?= 600
 
+# Where the measuring targets keep their intermediate output. Inside the
+# worktree, not /tmp: this repo is worked in several worktrees at once, and /tmp
+# is shared by all of them. These particular files are the ones whose contents
+# get copied into TRACKED files -- counts-baseline.tsv by il-parity-accept,
+# bench-state.json by the three bench writers -- so two lanes measuring at the
+# same time do not just interfere, they put the other lane's numbers in your
+# commit. That happened: an il-parity-accept recorded a baseline measured by
+# another worktree, and only the row ORDER gave it away. Same shape as the git
+# stash being shared across worktrees. out/ is gitignored.
+BENCH_TMP = $(DOTCL_ROOT)out/bench
+
 # Benchmarks measure the RELEASE build. `dotnet run --project` builds Debug, and
 # a Debug assembly is a different implementation to the JIT: it skips the
 # optimisations that depend on the C# compiler's output shape. Sealing the core
@@ -504,7 +579,7 @@ bench-build:
 # dropped bench/, say), and then these targets have no inputs. Say so and stop,
 # instead of failing partway through on a missing file. The check is a
 # parse-time $(wildcard) rather than a `test -d` guard in the recipe, because
-# each recipe line is its own shell — an `exit 0` on the first line would not
+# each recipe line is its own shell: an `exit 0` on the first line would not
 # stop the remaining ones. It is also safe to glob at parse time: bench/run.lisp
 # is a checked-in file, not something an earlier recipe line produces. Relative
 # path: this make always runs in the repo root, and a native make would not
@@ -512,7 +587,7 @@ bench-build:
 ifeq ($(wildcard bench/run.lisp),)
 
 bench bench-state bench-survey:
-	@echo "$@: bench/run.lisp not found — the benchmark harness is not present in this tree."
+	@echo "$@: bench/run.lisp not found; the benchmark harness is not present in this tree."
 
 else
 
@@ -525,19 +600,20 @@ bench: setup-cl-bench bench-build
 
 # Generate bench-state.json with dotcl and SBCL results side by side
 bench-state: setup-cl-bench bench-build
+	@mkdir -p $(BENCH_TMP)
 	@echo "=== Running benchmarks on dotcl ==="
 	@EVAL_ARGS=""; \
 	if [ -n "$(SUITE)" ]; then EVAL_ARGS="--eval '(setq *bench-suite* :$(SUITE))'"; fi; \
 	if [ -n "$(BENCH)" ]; then EVAL_ARGS="$$EVAL_ARGS --eval '(setq *bench-name* \"$(BENCH)\")'"; fi; \
-	eval DOTNET_gcServer=0 $(SETSID) timeout $(BENCH_TIMEOUT) $(BENCH_RUNTIME) --asm $(DOTCL_ROOT)compiler/cil-out.sil $$EVAL_ARGS $(DOTCL_ROOT)bench/run.lisp 2>/tmp/bench-dotcl.txt; \
+	eval DOTNET_gcServer=0 $(SETSID) timeout $(BENCH_TIMEOUT) $(BENCH_RUNTIME) --asm $(DOTCL_ROOT)compiler/cil-out.sil $$EVAL_ARGS $(DOTCL_ROOT)bench/run.lisp 2>$(BENCH_TMP)/bench-dotcl.txt; \
 	rc=$$?; if [ $$rc -eq 124 ]; then echo ";; dotcl TIMEOUT after $(BENCH_TIMEOUT)s"; fi
 	@echo "=== Running benchmarks on SBCL ==="
 	@EVAL_ARGS=""; \
 	if [ -n "$(SUITE)" ]; then EVAL_ARGS="--eval '(setq *bench-suite* :$(SUITE))'"; fi; \
 	if [ -n "$(BENCH)" ]; then EVAL_ARGS="$$EVAL_ARGS --eval '(setq *bench-name* \"$(BENCH)\")'"; fi; \
-	eval timeout $(BENCH_TIMEOUT) $(SBCL_RUN) $$EVAL_ARGS --load $(DOTCL_ROOT)bench/run.lisp --eval "'(quit)'" 2>/tmp/bench-sbcl.txt; \
+	eval timeout $(BENCH_TIMEOUT) $(SBCL_RUN) $$EVAL_ARGS --load $(DOTCL_ROOT)bench/run.lisp --eval "'(quit)'" 2>$(BENCH_TMP)/bench-sbcl.txt; \
 	rc=$$?; if [ $$rc -eq 124 ]; then echo ";; SBCL TIMEOUT after $(BENCH_TIMEOUT)s"; fi
-	@bash $(DOTCL_ROOT)bench/make-state.sh /tmp/bench-dotcl.txt /tmp/bench-sbcl.txt $(DOTCL_ROOT)bench-state.json > /tmp/bench-state-new.json && mv /tmp/bench-state-new.json $(DOTCL_ROOT)bench-state.json
+	@bash $(DOTCL_ROOT)bench/make-state.sh $(BENCH_TMP)/bench-dotcl.txt $(BENCH_TMP)/bench-sbcl.txt $(DOTCL_ROOT)bench-state.json > $(BENCH_TMP)/bench-state-new.json && mv $(BENCH_TMP)/bench-state-new.json $(DOTCL_ROOT)bench-state.json
 	@echo "Updated bench-state.json"
 	@cat $(DOTCL_ROOT)bench-state.json
 
@@ -553,27 +629,120 @@ WARMUP ?= 1
 # not whatever the Roswell default happens to be (#35).
 SBCL_RUN ?= ros -L sbcl-bin run
 bench-survey: setup-cl-bench bench-build
+	@mkdir -p $(BENCH_TMP)
 	@echo "=== Survey dotcl (runs=$(RUNS) warmup=$(WARMUP)) ==="
 	@EVAL_ARGS="--eval '(setq *bench-runs* $(RUNS))' --eval '(setq *bench-warmup* $(WARMUP))'"; \
 	if [ -n "$(SUITE)" ]; then EVAL_ARGS="$$EVAL_ARGS --eval '(setq *bench-suite* :$(SUITE))'"; fi; \
 	if [ -n "$(BENCH)" ]; then EVAL_ARGS="$$EVAL_ARGS --eval '(setq *bench-name* \"$(BENCH)\")'"; fi; \
-	eval DOTNET_gcServer=0 $(SETSID) timeout $(BENCH_TIMEOUT) $(BENCH_RUNTIME) --asm $(DOTCL_ROOT)compiler/cil-out.sil $$EVAL_ARGS $(DOTCL_ROOT)bench/run.lisp 2>/tmp/bench-survey-dotcl.txt; \
+	eval DOTNET_gcServer=0 $(SETSID) timeout $(BENCH_TIMEOUT) $(BENCH_RUNTIME) --asm $(DOTCL_ROOT)compiler/cil-out.sil $$EVAL_ARGS $(DOTCL_ROOT)bench/run.lisp 2>$(BENCH_TMP)/bench-survey-dotcl.txt; \
 	rc=$$?; if [ $$rc -eq 124 ]; then echo ";; dotcl TIMEOUT after $(BENCH_TIMEOUT)s"; fi
 	@echo "=== Survey SBCL (runs=$(RUNS) warmup=$(WARMUP)) ==="
 	@EVAL_ARGS="--eval '(setq *bench-runs* $(RUNS))' --eval '(setq *bench-warmup* $(WARMUP))'"; \
 	if [ -n "$(SUITE)" ]; then EVAL_ARGS="$$EVAL_ARGS --eval '(setq *bench-suite* :$(SUITE))'"; fi; \
 	if [ -n "$(BENCH)" ]; then EVAL_ARGS="$$EVAL_ARGS --eval '(setq *bench-name* \"$(BENCH)\")'"; fi; \
-	eval timeout $(BENCH_TIMEOUT) $(SBCL_RUN) $$EVAL_ARGS --load $(DOTCL_ROOT)bench/run.lisp --eval "'(quit)'" 2>/tmp/bench-survey-sbcl.txt; \
+	eval timeout $(BENCH_TIMEOUT) $(SBCL_RUN) $$EVAL_ARGS --load $(DOTCL_ROOT)bench/run.lisp --eval "'(quit)'" 2>$(BENCH_TMP)/bench-survey-sbcl.txt; \
 	rc=$$?; if [ $$rc -eq 124 ]; then echo ";; SBCL TIMEOUT after $(BENCH_TIMEOUT)s"; fi
 	@# The aggregation runs on dotcl itself, so the public bench path needs no
 	@# python3. -v:q keeps MSBuild's build output off stdout, which is the state
 	@# file here; a build failure still stops the mv because the exit code is
-	@# non-zero. (--nologo is not a `dotnet run` flag — it would be forwarded to
+	@# non-zero. (--nologo is not a `dotnet run` flag; it would be forwarded to
 	@# the app and displace --asm from argv[0].)
-	@$(SETSID) dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -v:q -- --asm $(DOTCL_ROOT)compiler/cil-out.sil $(DOTCL_ROOT)bench/make-survey-state.lisp /tmp/bench-survey-dotcl.txt /tmp/bench-survey-sbcl.txt $(DOTCL_ROOT)bench-state.json > /tmp/bench-state-new.json && mv /tmp/bench-state-new.json $(DOTCL_ROOT)bench-state.json
+	@$(SETSID) dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -v:q -- --asm $(DOTCL_ROOT)compiler/cil-out.sil $(DOTCL_ROOT)bench/make-survey-state.lisp $(BENCH_TMP)/bench-survey-dotcl.txt $(BENCH_TMP)/bench-survey-sbcl.txt $(DOTCL_ROOT)bench-state.json > $(BENCH_TMP)/bench-state-new.json && mv $(BENCH_TMP)/bench-state-new.json $(DOTCL_ROOT)bench-state.json
 	@echo "Updated bench-state.json"
 
 endif
+
+# --- C# parity benchmark -------------------------------------------------
+#
+# cl-bench answers "how does dotcl compare to another Lisp". This answers a
+# different question that nothing else in the tree measured: does user code
+# with every declaration written out compete with C# on the same machine?
+# Seven kernels, one pair each (bench/csharp-parity/kernels.lisp and
+# Program.cs), same input sizes, same min-of-3-after-1-warmup harness.
+#
+# Both halves are measured in Release for the reason given above BENCH_RUNTIME:
+# a Debug assembly is a different implementation to the JIT.
+#
+# Same parse-time guard as the cl-bench targets: a tree missing the sources
+# gets one clear line instead of a failure partway through a recipe.
+PARITY_DIR      = $(DOTCL_ROOT)bench/csharp-parity
+PARITY_EXE_NAME = $(if $(filter win-%,$(HOST_RID)),parity.exe,parity)
+PARITY_EXE      = $(PARITY_DIR)/bin/Release/net10.0/$(PARITY_EXE_NAME)
+# Each half is run in this many processes and the per-kernel minimum is kept.
+# Both halves already take the minimum of 5 samples inside one process; that
+# settled the in-process spread to a few percent but left up to 1.3x between
+# processes, which is more than the CI threshold is trying to detect.
+PARITY_PASSES  ?= 2
+
+.PHONY: bench-parity
+
+ifeq ($(wildcard bench/csharp-parity/kernels.lisp),)
+
+bench-parity:
+	@echo "$@: bench/csharp-parity not found; the parity benchmark is not present in this tree."
+
+else
+
+# cross-compile is a real prerequisite here, unlike in the cl-bench targets: a
+# fresh clone has no cil-out.sil, and without it the dotcl half fails with a
+# missing-file error that says nothing about what to do next.
+bench-parity: cross-compile bench-build
+	@mkdir -p $(BENCH_TMP)
+	@echo "=== Building the C# side ==="
+	@dotnet build $(PARITY_DIR)/Parity.csproj -c Release -v:q --nologo
+	@rm -f $(BENCH_TMP)/parity-csharp.txt $(BENCH_TMP)/parity-dotcl.txt
+	@for pass in $$(seq 1 $(PARITY_PASSES)); do \
+	    echo "=== pass $$pass/$(PARITY_PASSES): C# ==="; \
+	    $(PARITY_EXE) | tee -a $(BENCH_TMP)/parity-csharp.txt; \
+	    echo "=== pass $$pass/$(PARITY_PASSES): dotcl ==="; \
+	    DOTNET_gcServer=0 $(SETSID) timeout $(BENCH_TIMEOUT) $(BENCH_RUNTIME) --asm $(DOTCL_ROOT)compiler/cil-out.sil $(PARITY_DIR)/kernels.lisp < /dev/null | tee -a $(BENCH_TMP)/parity-dotcl.txt; \
+	done
+	@bash $(PARITY_DIR)/make-parity-state.sh $(BENCH_TMP)/parity-csharp.txt $(BENCH_TMP)/parity-dotcl.txt $(DOTCL_ROOT)bench-state.json > $(BENCH_TMP)/parity-state-new.json && mv $(BENCH_TMP)/parity-state-new.json $(DOTCL_ROOT)bench-state.json
+	@echo "Updated bench-state.json"
+	@bash $(DOTCL_ROOT)bench/check-ratios.sh $(DOTCL_ROOT)bench-state.json $(DOTCL_ROOT)bench/ratio-baseline.json $(HOST_RID)
+
+endif
+
+
+## --- IL parity (bench/il-parity) ------------------------------------------
+##
+## The time benchmark above asks whether dotcl is in the contest; this asks
+## which instructions are the difference. It is deterministic -- same compiler,
+## same source, same counts on any machine -- so the gate has no threshold: a
+## category that goes up is a real regression.
+
+ILP_DIR      = $(DOTCL_ROOT)bench/il-parity
+ILP_TOOL_EXE = $(ILP_DIR)/tool/bin/Release/net10.0/$(if $(filter win-%,$(HOST_RID)),ilparity.exe,ilparity)
+ILP_REF_DLL  = $(ILP_DIR)/bin/Release/net10.0/IlParityRefs.dll
+ILP_CASES    = stack hash heap ring tokenizer vec2
+ILP_COUNTS   = $(BENCH_TMP)/il-parity-counts.tsv
+
+.PHONY: il-parity il-parity-accept
+
+il-parity: cross-compile bench-build
+	@mkdir -p $(BENCH_TMP)
+	@echo "=== Building the C# reference assembly and the comparator ==="
+	@dotnet build $(ILP_DIR)/Refs.csproj -c Release -v:q --nologo
+	@dotnet build $(ILP_DIR)/tool/ilparity.csproj -c Release -v:q --nologo
+	@echo "=== Self-check and compile-file (dotcl) ==="
+	@IL_PARITY_ROOT="$(ILP_DIR)" $(SETSID) $(BENCH_RUNTIME) --asm $(DOTCL_ROOT)compiler/cil-out.sil $(ILP_DIR)/run.lisp < /dev/null
+	@echo ""
+	@echo "=== Instruction counts and surplus ==="
+	@for c in $(ILP_CASES); do \
+	    $(ILP_TOOL_EXE) compare $(ILP_DIR)/$$c $(ILP_REF_DLL) $(ILP_DIR)/$$c/impl.fasl; \
+	done
+	@rm -f $(ILP_COUNTS)
+	@for c in $(ILP_CASES); do \
+	    $(ILP_TOOL_EXE) counts $(ILP_DIR)/$$c $(ILP_REF_DLL) $(ILP_DIR)/$$c/impl.fasl >> $(ILP_COUNTS); \
+	done
+	@echo "=== Gate (dotcl counts against bench/il-parity/counts-baseline.tsv) ==="
+	@bash $(ILP_DIR)/check-counts.sh $(ILP_DIR)/counts-baseline.tsv $(ILP_COUNTS)
+
+## Record the current counts as the baseline. Run it when a count went DOWN, or
+## when a case was added -- never to make a rise go away.
+il-parity-accept:
+	@cp $(ILP_COUNTS) $(ILP_DIR)/counts-baseline.tsv
+	@echo "recorded $(ILP_DIR)/counts-baseline.tsv"
 
 setup-cl-bench:
 	@if [ ! -d $(DOTCL_ROOT)cl-bench ]; then \
@@ -594,7 +763,7 @@ cross-compile: $(DOTCL_ROOT)compiler/cil-out.sil
 # --- Bootstrapping dotcl with dotcl -------------------------------------
 #
 # The compiler is ordinary ANSI Common Lisp, so any Common Lisp can host the
-# cross-compile — including dotcl. Hosting it with dotcl takes the Lisp
+# cross-compile: including dotcl. Hosting it with dotcl takes the Lisp
 # toolchain out of the build entirely: .NET is needed anyway, and a released
 # dotcl installs as a .NET tool in ~4 s where installing Roswell in CI takes
 # ~50 s. The per-build cost goes the other way (dotcl ~8 s vs SBCL ~4.6 s), so
@@ -613,17 +782,33 @@ DOTCL_SEED_VERSION ?= 0.1.25
 DOTCL_SEED_DIR := $(DOTCL_ROOT)build/seed
 DOTCL_SEED := $(DOTCL_SEED_DIR)/dotcl$(if $(filter Windows_NT,$(OS)),.cmd,)
 
+# build/ holds artifacts, not sources, and the seed is a whole released dotcl --
+# its shipped contrib tree included. A source registry told to scan this checkout
+# (the CI runner has a (:tree <workspace>) entry) then resolves systems out of an
+# old release's contrib instead of out of this tree, which is how (require
+# "nuget") went on succeeding after the bundled contribs were renamed. ASDF stops
+# walking a directory that carries this marker, so build/ stays out of the
+# registry whatever is unpacked underneath it.
+DOTCL_BUILD_SRCREG := $(DOTCL_ROOT)build/.cl-source-registry.cache
+
+$(DOTCL_BUILD_SRCREG):
+	@mkdir -p $(DOTCL_ROOT)build
+	@printf '(:source-registry-cache)\n' > $@
+
 $(DOTCL_SEED):
 	@echo "=== Installing seed dotcl $(DOTCL_SEED_VERSION) into build/seed ==="
 	dotnet tool install dotcl --version $(DOTCL_SEED_VERSION) --tool-path $(DOTCL_SEED_DIR)
 
-seed-install: $(DOTCL_SEED)
+# The marker is a prerequisite of its own rather than a line in the rule above:
+# the seed is a file target, so a tree that already has one skips that rule
+# entirely and would never get the marker written.
+seed-install: $(DOTCL_SEED) $(DOTCL_BUILD_SRCREG)
 
 # Can the pinned seed build this tree? Answers the one question that gates
 # making dotcl the default host. Builds the core with the seed, then rebuilds it
 # with the tree's own runtime (whose reader and codegen are newer), and requires
-# the result to reproduce itself — the same generation check as selfhost-check.
-seed-check: build $(DOTCL_SEED)
+# the result to reproduce itself: the same generation check as selfhost-check.
+seed-check: build $(DOTCL_SEED) $(DOTCL_BUILD_SRCREG)
 	@echo "=== Building the core with seed dotcl $(DOTCL_SEED_VERSION) ==="
 	@mkdir -p $(DOTCL_ROOT)build/seed-check
 	DOTCL_INPUTS="$(CIL_SOURCES)" DOTCL_OUTPUT="$(DOTCL_ROOT)build/seed-check/stage1.sil" \
@@ -636,8 +821,8 @@ seed-check: build $(DOTCL_SEED)
 	  $(SETSID) dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- \
 	  --asm $(DOTCL_ROOT)build/seed-check/stage2.sil --load $(DOTCL_ROOT)compiler/cil-compile.lisp
 	@cmp $(DOTCL_ROOT)build/seed-check/stage2.sil $(DOTCL_ROOT)build/seed-check/stage3.sil \
-	  && echo "seed $(DOTCL_SEED_VERSION): OK — stage2 == stage3" \
-	  || (echo "seed $(DOTCL_SEED_VERSION): NOT usable — stage2 != stage3"; exit 1)
+	  && echo "seed $(DOTCL_SEED_VERSION): OK, stage2 == stage3" \
+	  || (echo "seed $(DOTCL_SEED_VERSION): NOT usable, stage2 != stage3"; exit 1)
 
 # The compiler compiled by itself must reproduce itself, byte for byte.
 #
@@ -645,7 +830,7 @@ seed-check: build $(DOTCL_SEED)
 # produces from the same sources; C is what B produces. B == C means the
 # compiler is a fixpoint of itself. Comparing against the SBCL-hosted core would
 # NOT show this: the two hosts number gensyms differently, so a byte comparison
-# there is meaningless — it is the generation-to-generation comparison that has
+# there is meaningless: it is the generation-to-generation comparison that has
 # to hold.
 #
 # What this catches is a compiler that only works when SBCL is underneath it: a
@@ -663,10 +848,10 @@ selfhost-check: build $(DOTCL_ROOT)compiler/cil-out.sil
 	  --asm $(DOTCL_ROOT)build/selfhost/genB.sil --load $(DOTCL_ROOT)compiler/cil-compile.lisp
 	@cmp $(DOTCL_ROOT)build/selfhost/genB.sil $(DOTCL_ROOT)build/selfhost/genC.sil \
 	  && echo "self-host fixpoint: OK (B == C)" \
-	  || (echo "self-host fixpoint: FAILED — the compiler does not reproduce itself"; exit 1)
+	  || (echo "self-host fixpoint: FAILED; the compiler does not reproduce itself"; exit 1)
 
 # The fixpoint says the compiler reproduces itself, not that what it produces is
-# right — a compiler broken the same way twice is still a fixpoint. This runs the
+# right: a compiler broken the same way twice is still a fixpoint. This runs the
 # suite on the self-hosted core. Left out of CI deliberately: it re-runs the whole
 # regression suite through a second core and roughly doubles the job.
 selfhost-test: selfhost-check
@@ -677,7 +862,7 @@ selfhost-test: selfhost-check
 publish:
 	dotnet publish $(DOTCL_ROOT)runtime/runtime.csproj --configuration Release -o $(DOTCL_ROOT)out/
 
-# Compile contrib/asdf/asdf.lisp → asdf.fasl (.NET IL assembly) with dotcl
+# Compile contrib/asdf/asdf.lisp -> asdf.fasl (.NET IL assembly) with dotcl
 # itself. .fasl is the shipped artifact (fastest load); .sil and .lisp are
 # not distributed. All 3 are gitignored.
 $(DOTCL_ROOT)contrib/asdf/asdf.fasl: $(DOTCL_ROOT)compiler/cil-out.sil $(DOTCL_ROOT)contrib/asdf/asdf.lisp $(RUNTIME_SOURCES)
@@ -690,7 +875,7 @@ compile-asdf-fasl: setup-asdf $(DOTCL_ROOT)contrib/asdf/asdf.fasl
 # (os-cond is runtime for dotcl), so target-features-per-OS baking is unnecessary.
 compile-asdf-fasls: compile-asdf-fasl
 
-# Compile contrib/quicklisp/quicklisp.lisp → quicklisp.fasl, same shape as asdf
+# Compile contrib/quicklisp/quicklisp.lisp -> quicklisp.fasl, same shape as asdf
 # above: the .lisp is generated (concatenated client components) and the .fasl is
 # the shipped artifact. Both are gitignored.
 #
@@ -705,7 +890,7 @@ compile-quicklisp-fasl: setup-quicklisp compile-asdf-fasl $(DOTCL_ROOT)contrib/q
 # Pre-build IL fasls for every contrib that ships a .asd. Project-core
 # builds consume these as ready artifacts instead of recompiling
 # contrib source per project. Pattern rule matches contrib/<name>/<name>.lisp
-# → contrib/<name>/<name>.fasl. asdf is handled separately above.
+# -> contrib/<name>/<name>.fasl. asdf is handled separately above.
 # CONTRIB_NAMES is auto-detected from contrib/*/ subdirs, so a tree that does
 # not carry a given contrib skips it gracefully instead of failing on a missing
 # directory (dotcl/dotcl#2).
@@ -719,14 +904,15 @@ CONTRIB_R2R_NAMES := $(CONTRIB_NAMES) quicklisp
 
 # Order between contribs. A contrib whose source does (require "other") is
 # compiled with that other contrib LOADED, and the loader prefers its prebuilt
-# .fasl — so a stale one is what the compile sees. Nothing declares this
+# .fasl: so a stale one is what the compile sees. Nothing declares this
 # relationship: the .asd files carry no :depends-on and the requirement is a
 # (require ...) in the source, so it is read from the source here.
 #
 # Without it the build is alphabetical and breaks the day one contrib starts
-# using a new export of another: advice (a) began calling dotnet:deref, which
-# lives in dotnet-class (d), and compiling advice failed with "Symbol DEREF is
-# not external in package DOTNET" against the older fasl.
+# using a new export of another: dotcl-advice began calling dotnet:deref, which
+# lives in dotnet-class, and compiling it failed with "Symbol DEREF is not
+# external in package DOTNET" against the older fasl. (The two sorted the wrong
+# way round back when that contrib was still called plain "advice".)
 CONTRIB_REQUIRE_NAMES = $(filter-out $(1),$(filter $(CONTRIB_NAMES),$(shell sed -n 's/.*(require "\([a-z0-9-]*\)").*/\1/p' $(DOTCL_ROOT)contrib/$(1)/$(1).lisp 2>/dev/null)))
 define CONTRIB_ORDER_RULE
 $(DOTCL_ROOT)contrib/$(1)/$(1).fasl: $(foreach d,$(call CONTRIB_REQUIRE_NAMES,$(1)),$(DOTCL_ROOT)contrib/$(d)/$(d).fasl)
@@ -742,7 +928,7 @@ $(DOTCL_ROOT)contrib/%.fasl: $(DOTCL_ROOT)contrib/%.lisp $(DOTCL_ROOT)compiler/c
 
 compile-contrib-fasls: $(CONTRIB_FASLS)
 
-# Convert cil-out.sil → dotcl.core (PE assembly, FASL format) via
+# Convert cil-out.sil -> dotcl.core (PE assembly, FASL format) via
 # dotcl:sil-to-fasl. The resulting .fasl loads in ~0.3s vs ~1.0s for .sil
 # because Reader parse (~1.1s) + CIL assemble (~170ms) are both skipped.
 # Ships in the pack as the default core.
@@ -758,7 +944,7 @@ compile-core-fasl: $(DOTCL_ROOT)compiler/dotcl.core
 # code for any target.
 R2R_RIDS := win-x64 win-arm64 linux-x64 linux-arm64 osx-x64 osx-arm64
 
-# Map RID → (targetos, targetarch) for crossgen2 cross-compile flags.
+# Map RID -> (targetos, targetarch) for crossgen2 cross-compile flags.
 TARGETOS_win-x64 := windows
 TARGETARCH_win-x64 := x64
 TARGETOS_win-arm64 := windows
@@ -780,8 +966,8 @@ _DOTNET_RID := $(shell dotnet --info 2>/dev/null | awk '/^[[:space:]]*RID:/ {pri
 _HOST_ARCH  := $(lastword $(subst -, ,$(_DOTNET_RID)))
 # $(strip ...) is REQUIRED: the multi-line $(if) below collapses each `\`
 # continuation's indentation to a leading space, so without strip _HOST_OS
-# becomes " linux" (leading space) on non-Windows hosts → HOST_RID " linux-x64"
-# → the crossgen2 wildcard path gets a space and matches nothing
+# becomes " linux" (leading space) on non-Windows hosts -> HOST_RID " linux-x64"
+# -> the crossgen2 wildcard path gets a space and matches nothing
 # ("crossgen2 not found (HOST_RID=  linux-x64)", #21). Windows takes the first
 # (non-continued) branch so it was unaffected.
 _HOST_OS    := $(strip $(if $(filter win-%,$(_DOTNET_RID)),win,\
@@ -815,8 +1001,8 @@ NUGET_PKG_DIR := $(subst \,/,$(HOME))/.nuget/packages
 
 # Pick the HIGHEST installed version, not the first match: a glob returns
 # lexicographic order, so a cache holding both 10.0.x and a future 11.0.x would
-# keep selecting the stale 10.0.x ("10" < "11" as strings) — hence sort -V.
-# (Both build hosts — Linux CI and MSYS2 — ship GNU sort.)
+# keep selecting the stale 10.0.x ("10" < "11" as strings): hence sort -V.
+# (Both build hosts, Linux CI and MSYS2, ship GNU sort.)
 #
 # Glob with `ls`, NOT $(wildcard): make caches the directory listings it reads
 # for a wildcard for the life of the process, so once a lookup finds no pack,
@@ -839,7 +1025,7 @@ prime-crossgen2:
 	dotnet publish $(DOTCL_ROOT)runtime/runtime.csproj -c Release -r $(HOST_RID) --self-contained false -p:PublishReadyToRun=true
 	@# Locate the pack in the SHELL, not via $(CROSSGEN2). make expands EVERY line
 	@# of a recipe before it runs the first one, so a make-level lookup here would
-	@# report the state from before the publish above — this check could only ever
+	@# report the state from before the publish above; this check could only ever
 	@# pass when the pack happened to be cached already, and failed outright on a
 	@# runner whose cache started empty. The publish output is left visible for the
 	@# same reason: when the restore is the thing that went wrong, that log is the
@@ -854,7 +1040,7 @@ prime-crossgen2:
 	echo "crossgen2: $$cg"
 
 # Per-RID runtime ref dir (NuGet cache; populated by `dotnet publish -r <rid>`).
-# Highest version, and shell glob rather than $(wildcard) — see CROSSGEN2 above
+# Highest version, and shell glob rather than $(wildcard): see CROSSGEN2 above
 # for both. This one is restored by the publish inside the very rule that reads
 # it, so the wildcard directory cache would bite here too.
 runtime_ref = $(shell ls -d $(NUGET_PKG_DIR)/microsoft.netcore.app.runtime.$(1)/*/runtimes/$(1)/lib/net10.0 2>/dev/null | sort -V | tail -1)
@@ -951,7 +1137,7 @@ contrib-dotcl-jitdisasm:
 # Extra args for the tool `dotnet pack` only. Release CI packs the full RID matrix
 # and needs none of these. Locally, crossgen2 can only emit R2R for the host RID,
 # and a RID it cannot compile suppresses the base pointer package for the whole
-# pack — so a local package set has to be limited to the host:
+# pack: so a local package set has to be limited to the host:
 #
 #   make pack R2R_RIDS=win-arm64 PACK_ARGS=-p:RuntimeIdentifiers=win-arm64 \
 #             PACK_VERSION=0.1.x-dev
@@ -965,7 +1151,7 @@ PACK_ARGS ?=
 # Version for the pack, applied to BOTH projects. Never pass -p:Version in
 # PACK_ARGS: that reaches the tool pack only, and the library pack below runs
 # afterwards and rewrites the shared bin/Release/net10.0/ output at the
-# un-overridden version — leaving a runtime.dll that demands one DotCL.Runtime
+# un-overridden version: leaving a runtime.dll that demands one DotCL.Runtime
 # version next to a DotCL.Runtime.dll that claims another, which cannot start.
 # The per-RID publish dirs (and so the nupkgs) stay consistent either way, so the
 # breakage only shows up when running the plain build output.

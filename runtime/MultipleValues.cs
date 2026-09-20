@@ -88,7 +88,7 @@ public static class MultipleValues
     }
 
     /// <summary>Publish two values without an array. The array a (VALUES A B) used to
-    /// build was 40 bytes on every TRUNCATE, FLOOR, GETHASH … and nothing reads it as
+    /// build was 40 bytes on every TRUNCATE, FLOOR, GETHASH ... and nothing reads it as
     /// an array unless MULTIPLE-VALUE-LIST or an unwind-protect asks.</summary>
     public static void SetPair(LispObject a, LispObject b)
     {
@@ -159,7 +159,7 @@ public static class MultipleValues
     }
 
     /// <summary>Two values, published and wrapped without an array. This is the shape
-    /// TRUNCATE, FLOOR, ROUND, GETHASH, INTERN … return, so it is where the 40-byte
+    /// TRUNCATE, FLOOR, ROUND, GETHASH, INTERN ... return, so it is where the 40-byte
     /// array a multiple-value return used to carry is worth removing.</summary>
     public static LispObject Values2(LispObject a, LispObject b)
     {
@@ -305,7 +305,7 @@ public static class MultipleValues
     public static void Reset()
     {
         _count = -1; // Sentinel: no explicit values call yet
-        // Don't null _values — Get() checks _count first, saves a ThreadStatic write
+        // Don't null _values: Get() checks _count first, saves a ThreadStatic write
     }
 
     // Save/restore for unwind-protect: preserve body's secondary values across cleanup

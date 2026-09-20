@@ -1,17 +1,17 @@
 using DotCL;
 
-// PrecompiledLispDemo — a plain .NET console host that embeds dotcl, loads a
+// PrecompiledLispDemo: a plain .NET console host that embeds dotcl, loads a
 // PRECOMPILED Lisp image (app.fasl) and runs it with NO runtime code generation,
 // calling between C# and Lisp in both directions. After the precompiled image is
 // loaded we turn on DotclHost.PrecompiledOnly, which makes any attempt to JIT
-// (eval/compile, define-class, FFI) throw — the same constraint an AOT/IL2CPP
+// (eval/compile, define-class, FFI) throw: the same constraint an AOT/IL2CPP
 // target imposes. This proves precompiled dotcl runs emit-less.
 
 string dir = AppContext.BaseDirectory;
 
 DotclHost.Initialize();
-// Boot the FASL core (compiler+stdlib). A FASL loads via ModuleInit — already
-// compiled IL — so booting does not generate any code.
+// Boot the FASL core (compiler+stdlib). A FASL loads via ModuleInit, already
+// compiled IL, so booting does not generate any code.
 DotclHost.LoadCore(Path.Combine(dir, "dotcl.core"));
 
 // From boot onward, assert the runtime never generates code. Registering host
@@ -26,7 +26,7 @@ DotclHost.Register("host-log", args =>
     return null; // NIL
 });
 
-// Load the precompiled application image (ModuleInit — no code generation).
+// Load the precompiled application image (ModuleInit: no code generation).
 DotclHost.LoadLispFile(Path.Combine(dir, "app.fasl"));
 
 // C# -> Lisp: call the precompiled functions.
@@ -41,11 +41,11 @@ Console.WriteLine($"greet returned name length = {len}\n");
 try
 {
     DotclHost.EvalString("(+ 1 2)");
-    Console.WriteLine("eval succeeded — UNEXPECTED under PrecompiledOnly");
+    Console.WriteLine("eval succeeded; UNEXPECTED under PrecompiledOnly");
 }
 catch (Exception e)
 {
     Console.WriteLine($"eval blocked as expected: {e.Message.Split('\n')[0]}");
 }
 
-Console.WriteLine("\nDone — ran precompiled Lisp with no runtime code generation.");
+Console.WriteLine("\nDone; ran precompiled Lisp with no runtime code generation.");

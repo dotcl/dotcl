@@ -5,7 +5,7 @@
 ;;; funclet, and that funclet stays live for the rest of the exception's journey,
 ;;; so crossing N handler-cases stacked N dispatches. Recursion with a handler-case
 ;;; per level therefore died as an uncatchable .NET StackOverflowException at
-;;; ~20000 frames — a depth the same recursion survives a hundredfold with no
+;;; ~20000 frames: a depth the same recursion survives a hundredfold with no
 ;;; handler-case in it, so this was the rethrow chain and not the recursion.
 ;;; Matching the clause in a CIL exception FILTER lets a level that owns nothing
 ;;; decline without being entered.

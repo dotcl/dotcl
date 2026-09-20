@@ -546,7 +546,7 @@ public static partial class Runtime
     internal static string? SummaryFor(Type type, string? memberName)
         => DocumentationFor(type, memberName, wait: false)?.Summary;
 
-    /// <summary>DOTNET:DOCUMENTATION — the prose .NET ships for a type or one of its
+    /// <summary>DOTNET:DOCUMENTATION: the prose .NET ships for a type or one of its
     /// members, as (:summary :parameters :returns :exceptions), or NIL when neither
     /// an XML file beside the assembly nor the reference pack describes it.</summary>
     public static LispObject DotNetDocumentation(LispObject[] args)

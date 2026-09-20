@@ -1,9 +1,9 @@
-;;; C#→Lisp callback boundary error handling.
+;;; C#->Lisp callback boundary error handling.
 ;;; A Lisp error inside a callback invoked from .NET (a make-delegate delegate, an
 ;;; event handler, or a %define-class method override) must NOT tear through the
 ;;; host as TargetInvocationException. Runtime.InvokeForeignCallback catches the
 ;;; LispErrorException and routes the condition to dotcl:*foreign-callback-handler*
-;;; (default: report + return NIL → marshaled to the return type's default).
+;;; (default: report + return NIL -> marshaled to the return type's default).
 
 ;;; --- delegate boundary (CreateLispDelegate) ---
 

@@ -1,5 +1,5 @@
 ;;; RESTART-CASE over a signaling form must associate its restarts with the
-;;; condition that form signals — on BOTH evaluator paths.
+;;; condition that form signals: on BOTH evaluator paths.
 ;;;
 ;;; CLHS RESTART-CASE: when the protected form is a call to SIGNAL / ERROR /
 ;;; CERROR / WARN, "or a macro form which macroexpands into such a list",
@@ -7,8 +7,8 @@
 ;;; one condition: (FIND-RESTART name c) and (COMPUTE-RESTARTS c) must not offer
 ;;; them for any other condition.
 ;;;
-;;; COMPILE-RESTART-CASE did this; the RESTART-CASE macro expansion — the route
-;;; the tree-walk interpreter actually takes — did not. So a handler that
+;;; COMPILE-RESTART-CASE did this; the RESTART-CASE macro expansion, the route
+;;; the tree-walk interpreter actually takes, did not. So a handler that
 ;;; resignalled reached the INNER restart-case's clause through
 ;;; (FIND-RESTART 'FOO c) even though that restart belonged to a different
 ;;; condition (ansi-test RESTART-CASE.25-31, COMPUTE-RESTARTS.9).

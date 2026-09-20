@@ -17,16 +17,32 @@
 #
 # Usage: check.sh <repo-root>
 set -eu
+
+# A missing prerequisite is a convenience skip when this is run by hand, but in
+# CI a skip is indistinguishable from a pass: the gate quietly stops gating and
+# nothing in the log says so. DOTCL_CI=1 (set at the job level in
+# .github/workflows/ci.yml) makes it a failure instead.
+skip_or_fail() {
+  echo "$1"
+  if [ "${DOTCL_CI:-}" = "1" ]; then
+    echo "  DOTCL_CI=1: a skipped check counts as a failure here" >&2
+    exit 1
+  fi
+}
 ROOT="$(cd "${1%/}" && pwd)"
 win() { if command -v cygpath >/dev/null 2>&1; then cygpath -m "$1"; else echo "$1"; fi; }
 
 if [ ! -f "$ROOT/compiler/dotcl.core" ]; then
-  echo "  SKIP: compiler/dotcl.core not built (make compile-core-fasl)"
+  skip_or_fail "  SKIP: compiler/dotcl.core not built (make compile-core-fasl)"
   exit 0
 fi
 
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
+# The lifecycle host below lives in its own tree, not under $WORK: the SDK globs
+# **/*.cs, so a second Program.cs anywhere beneath the first project would be
+# compiled into it (two sets of top-level statements).
+WORK2="$(mktemp -d)"
+trap 'rm -rf "$WORK" "$WORK2"' EXIT
 
 cat > "$WORK/Program.cs" <<'CSEOF2'
 using DotCL;
@@ -69,8 +85,11 @@ try
 catch (LispErrorException e) { Console.WriteLine($"EVAL-REFUSED {e.Message}"); }
 CSEOF2
 
-emit_csproj() { # $1 = extra property block
-  cat > "$WORK/hostapi.csproj" <<CSPROJEOF
+emit_csproj() { # $1 = directory to write into (default: $WORK)
+  dir="${1:-$WORK}"
+  mkdir -p "$dir"
+  [ "$dir" = "$WORK" ] || cp "$WORK/DotCL.Runtime.dll" "$dir/DotCL.Runtime.dll"
+  cat > "$dir/hostapi.csproj" <<CSPROJEOF
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>Exe</OutputType>
@@ -88,12 +107,15 @@ emit_csproj() { # $1 = extra property block
 CSPROJEOF
 }
 
-build_and_run() { # $1 = label
+build_and_run() { # $1 = label, $2 = directory (default: $WORK)
   label="$1"
-  ( cd "$WORK" && dotnet build hostapi.csproj -c Release -o bin ) > "$WORK/host.log" 2>&1 \
-    || { echo "FAIL ($label): building the host"; tail -20 "$WORK/host.log"; exit 1; }
-  cp "$ROOT/compiler/dotcl.core" "$WORK/bin/dotcl.core"
-  dotnet "$WORK/bin/hostapi.dll" 2>&1
+  dir="${2:-$WORK}"
+  # To stderr: every caller runs this inside $(...), which would swallow a
+  # failure message on stdout and leave the script exiting in silence.
+  ( cd "$dir" && dotnet build hostapi.csproj -c Release -o bin ) > "$dir/host.log" 2>&1 \
+    || { echo "FAIL ($label): building the host" >&2; tail -20 "$dir/host.log" >&2; exit 1; }
+  cp "$ROOT/compiler/dotcl.core" "$dir/bin/dotcl.core"
+  dotnet "$dir/bin/hostapi.dll" 2>&1
 }
 
 want() { # $1 = label, $2 = output, $3 = expected line
@@ -124,6 +146,220 @@ want "host" "$out" "defined in MYLIB"
 want "host" "$out" "QUALIFIED :FROM-MYLIB"
 want "host" "$out" "AFTER-SET MYLIB :FROM-MYLIB"
 echo "PASS (host): names match exactly, unqualified means the current package, and a miss says what to write"
+
+# -- lifecycle: initialization races and a failed core load -----------------
+# Its own directory and process: both facts below are about what a FRESH
+# process does, and the run above has already initialized and loaded a core.
+echo "=== lifecycle (concurrent Initialize, failed LoadCore) ==="
+LIFE="$WORK2/lifecycle"
+mkdir -p "$LIFE"
+cat > "$LIFE/Program.cs" <<'CSEOF3'
+using DotCL;
+
+// Eight threads reach Initialize at once, the way a host with several entry
+// points into Lisp does. Nobody may throw, and the bootstrap runs once.
+Console.WriteLine($"INIT-COUNT-BEFORE {DotclHost.InitializeCount}");
+var start = new ManualResetEventSlim(false);
+var errors = new System.Collections.Concurrent.ConcurrentQueue<string>();
+var threads = new Thread[8];
+for (int i = 0; i < threads.Length; i++)
+{
+    threads[i] = new Thread(() =>
+    {
+        start.Wait();
+        try { DotclHost.Initialize(); }
+        catch (Exception e) { errors.Enqueue($"{e.GetType().Name}: {e.Message}"); }
+    });
+    threads[i].Start();
+}
+start.Set();
+foreach (var t in threads) t.Join();
+foreach (var e in errors) Console.WriteLine($"INIT-ERROR {e}");
+Console.WriteLine($"INIT-ERRORS {errors.Count}");
+Console.WriteLine($"INIT-COUNT {DotclHost.InitializeCount}");
+
+// A core load that fails must leave CoreLoaded false -- otherwise EnsureCore
+// becomes a no-op and the host runs on an image that was never booted.
+Console.WriteLine($"LC-BEFORE {DotclHost.CoreLoaded}");
+try
+{
+    DotclHost.LoadCore(Path.Combine(AppContext.BaseDirectory, "no-such-file.core"));
+    Console.WriteLine("LC-MISSING none");
+}
+catch (Exception e) { Console.WriteLine($"LC-MISSING {e.GetType().Name}"); }
+Console.WriteLine($"LC-AFTER-FAILURE {DotclHost.CoreLoaded}");
+
+// And the next attempt, with a core that exists, still works.
+DotclHost.LoadCore(Path.Combine(AppContext.BaseDirectory, "dotcl.core"));
+Console.WriteLine($"LC-AFTER-SUCCESS {DotclHost.CoreLoaded}");
+Console.WriteLine($"LC-EVAL {DotclHost.ToClr<string>(DotclHost.EvalString("(format nil \"~a\" (+ 1 2))"))}");
+CSEOF3
+emit_csproj "$LIFE"
+out="$(build_and_run "lifecycle" "$LIFE")"
+want "lifecycle" "$out" "INIT-COUNT-BEFORE 0"
+want "lifecycle" "$out" "INIT-ERRORS 0"
+want "lifecycle" "$out" "INIT-COUNT 1"
+want "lifecycle" "$out" "LC-BEFORE False"
+want "lifecycle" "$out" "LC-MISSING FileNotFoundException"
+want "lifecycle" "$out" "LC-AFTER-FAILURE False"
+want "lifecycle" "$out" "LC-AFTER-SUCCESS True"
+want "lifecycle" "$out" "LC-EVAL 3"
+echo "PASS (lifecycle): concurrent Initialize bootstraps once, a failed LoadCore leaves the host loadable"
+
+# -- what a condition looks like on the .NET side ---------------------------
+# Its own process for the same reason: the debugger hook is process-wide state.
+echo "=== conditions (typed exception, wrapped .NET exception, handled in Lisp) ==="
+COND="$WORK2/conditions"
+mkdir -p "$COND"
+cat > "$COND/Program.cs" <<'CSEOF4'
+using DotCL;
+
+DotclHost.EnsureCore();
+DotclHost.SetThrowingDebuggerHook();
+
+// (c) A Lisp ERROR arrives as a condition, not as a string.
+try { DotclHost.EvalString("(error \"boom ~a\" 42)"); Console.WriteLine("LISP-ERR none"); }
+catch (DotclConditionException e)
+{
+    Console.WriteLine($"LISP-ERR type={e.ConditionType} msg={e.Message} clr={(e.ClrException == null ? "null" : e.ClrException.GetType().Name)}");
+    // The condition object is live: Lisp can still read it.
+    DotclHost.Register("host-condition", _ => e.Condition);
+    Console.WriteLine($"LISP-ERR-REPORT {DotclHost.ToClr<string>(DotclHost.EvalString("(princ-to-string (host-condition))"))}");
+    Console.WriteLine($"LISP-ERR-TYPEP {DotclHost.EvalString("(typep (host-condition) 'simple-error)")}");
+}
+
+// (d) A .NET exception raised through interop keeps the original exception.
+// The runtime throws such a failure directly (LispErrorException) rather than
+// running the debugger hook, so a host sees it as itself -- with the condition,
+// and the CLR exception, on it.
+const string clrBoom = "(dotnet:invoke (dotnet:new \"System.Collections.ArrayList\") \"RemoveAt\" 5)";
+try { DotclHost.EvalString(clrBoom); Console.WriteLine("CLR-RAW none"); }
+catch (LispErrorException e)
+{
+    var inner = e.Condition.ClrException;
+    Console.WriteLine($"CLR-RAW type={e.Condition.ConditionTypeName} clr={(inner == null ? "null" : inner.GetType().Name)}");
+}
+
+// Signalled as a condition (a Lisp handler re-signals it, or any code calls
+// ERROR on it), the same failure reaches the hook -- and the .NET exception is
+// still attached to it there.
+try
+{
+    DotclHost.EvalString($"(handler-case {clrBoom} (error (c) (error c)))");
+    Console.WriteLine("CLR-ERR none");
+}
+catch (DotclConditionException e)
+{
+    var inner = e.ClrException;
+    Console.WriteLine($"CLR-ERR type={e.ConditionType} clr={(inner == null ? "null" : inner.GetType().Name)}");
+}
+
+// (e) A condition the Lisp side handles never reaches the host.
+try
+{
+    var v = DotclHost.EvalString("(handler-case (error \"caught inside\") (error (c) (format nil \"handled: ~a\" c)))");
+    Console.WriteLine($"HANDLED {DotclHost.ToClr<string>(v)}");
+}
+catch (Exception e) { Console.WriteLine($"HANDLED escaped {e.GetType().Name}"); }
+
+// The old string-only behaviour is still selectable for a host written against it.
+DotclHost.SetThrowingDebuggerHook(false);
+try { DotclHost.EvalString("(error \"legacy ~a\" 7)"); Console.WriteLine("LEGACY none"); }
+catch (InvalidOperationException e) { Console.WriteLine($"LEGACY {e.Message}"); }
+CSEOF4
+emit_csproj "$COND"
+out="$(build_and_run "conditions" "$COND")"
+want "conditions" "$out" "LISP-ERR type=SIMPLE-ERROR msg=boom 42 clr=null"
+want "conditions" "$out" "LISP-ERR-REPORT boom 42"
+want "conditions" "$out" "LISP-ERR-TYPEP T"
+want "conditions" "$out" "CLR-RAW type=ERROR clr=ArgumentOutOfRangeException"
+want "conditions" "$out" "CLR-ERR type=ERROR clr=ArgumentOutOfRangeException"
+want "conditions" "$out" "HANDLED handled:"
+printf '%s\n' "$out" | grep -q "HANDLED escaped" \
+  && { echo "FAIL (conditions): a condition handled in Lisp still reached the host"; printf '%s\n' "$out"; exit 1; }
+want "conditions" "$out" "LEGACY SIMPLE-ERROR: legacy 7"
+echo "PASS (conditions): the condition object reaches the host, a wrapped .NET exception survives, and Lisp-handled conditions do not escape"
+
+echo "=== values, specials, output streams ==="
+VAL="$WORK2/values"
+mkdir -p "$VAL"
+cat > "$VAL/Program.cs" <<'CSEOF5'
+using DotCL;
+
+DotclHost.EnsureCore();
+
+// --- multiple values -------------------------------------------------------
+// Call returns the primary value only; CallMv keeps them all. FLOOR is the
+// smallest function where the second value is the point.
+var q = DotclHost.Call("FLOOR", 7, 2);
+var all = DotclHost.CallMv("FLOOR", 7, 2);
+Console.WriteLine($"MV-PRIMARY {DotclHost.ToClr(q)} MV-COUNT {all.Length} "
+                  + $"MV-0 {DotclHost.ToClr(all[0])} MV-1 {DotclHost.ToClr(all[1])}");
+
+// A function returning nothing gives an empty array, not one NIL: the
+// difference a host could not see before.
+DotclHost.EvalString("(defun nothing () (values))");
+Console.WriteLine($"MV-NONE {DotclHost.CallMv("NOTHING").Length}");
+
+// The ordinary single-value case is one element, never null.
+var one = DotclHost.CallMv("LIST", 1, 2);
+Console.WriteLine($"MV-ONE {one.Length} {one[0] is not null}");
+
+// EvalStringMv keeps the values of the LAST form.
+var ev = DotclHost.EvalStringMv("(values :a :b :c)");
+Console.WriteLine($"MV-EVAL {ev.Length} {DotclHost.ToClr(ev[2])}");
+
+// --- special variables -----------------------------------------------------
+DotclHost.EvalString("(defparameter *host-var* 41)");
+Console.WriteLine($"SP-GET {DotclHost.ToClr(DotclHost.GetSpecial("*HOST-VAR*"))}");
+DotclHost.SetSpecial("*HOST-VAR*", 42);
+Console.WriteLine($"SP-SET {DotclHost.ToClr(DotclHost.EvalString("*host-var*"))}");
+
+// Qualified names resolve like Call's do, and a built-in special is reachable.
+Console.WriteLine($"SP-QUALIFIED {DotclHost.ToClr(DotclHost.GetSpecial("COMMON-LISP:*PRINT-BASE*"))}");
+DotclHost.SetSpecial("CL:*PRINT-BASE*", 16);
+Console.WriteLine($"SP-RADIX {DotclHost.ToClr(DotclHost.EvalString("(format nil \"~a\" 255)"))}");
+DotclHost.SetSpecial("CL:*PRINT-BASE*", 10);
+
+// A name nothing defines yet is created, so the Lisp side can read it back.
+DotclHost.SetSpecial("*HOST-MADE-THIS*", "from the host");
+Console.WriteLine($"SP-NEW {DotclHost.ToClr(DotclHost.EvalString("*host-made-this*"))}");
+
+try { DotclHost.GetSpecial("*NEVER-BOUND-AT-ALL*"); Console.WriteLine("SP-UNBOUND none"); }
+catch (InvalidOperationException e) { Console.WriteLine($"SP-UNBOUND {e.Message}"); }
+
+// --- output streams --------------------------------------------------------
+var buf = new System.IO.StringWriter();
+DotclHost.SetStandardOutput(buf);
+DotclHost.EvalString("(princ \"captured\") (terpri)");
+DotclHost.SetStandardOutput(null);
+Console.WriteLine($"OUT-CAPTURED {buf.ToString().Trim()}");
+Console.WriteLine("OUT-RESTORED still on console");
+
+var ebuf = new System.IO.StringWriter();
+DotclHost.SetErrorOutput(ebuf);
+DotclHost.EvalString("(format *error-output* \"diagnostic\")");
+DotclHost.SetErrorOutput(null);
+Console.WriteLine($"ERR-CAPTURED {ebuf.ToString().Trim()}");
+CSEOF5
+emit_csproj "$VAL"
+out="$(build_and_run "values" "$VAL")"
+want "values" "$out" "MV-PRIMARY 3 MV-COUNT 2 MV-0 3 MV-1 1"
+want "values" "$out" "MV-NONE 0"
+want "values" "$out" "MV-ONE 1 True"
+want "values" "$out" "MV-EVAL 3 :C"
+want "values" "$out" "SP-GET 41"
+want "values" "$out" "SP-SET 42"
+want "values" "$out" "SP-QUALIFIED 10"
+want "values" "$out" "SP-RADIX FF"
+want "values" "$out" "SP-NEW from the host"
+want "values" "$out" "SP-UNBOUND"
+want "values" "$out" "is unbound"
+want "values" "$out" "OUT-CAPTURED captured"
+want "values" "$out" "OUT-RESTORED still on console"
+want "values" "$out" "ERR-CAPTURED diagnostic"
+echo "  ok: 14 assertions"
+
 echo "=== host with dynamic code disabled (NativeAOT / file-based app) ==="
 cat > "$WORK/runtimeconfig.template.json" <<'RCEOF'
 {

@@ -1,9 +1,9 @@
-// CLtL2 environment access — DOTCL-CLTL2 package.
+// CLtL2 environment access: DOTCL-CLTL2 package.
 //
 // trivial-cltl2 :use's a per-implementation CLtL2 package (sb-cltl2 on SBCL,
 // etc.); dotcl had none, so the exported symbols (define-declaration /
 // variable-information / ...) were unbound and trivia failed to load
-// ("Unbound variable: OPTIMIZER" — define-declaration compiled as a plain call).
+// ("Unbound variable: OPTIMIZER": define-declaration compiled as a plain call).
 //
 // dotcl's macro &environment carries no lexical information (always NIL), so a
 // full CLtL2 implementation is impossible. This is a DEFENSIVE MINIMAL backend:
@@ -46,7 +46,7 @@ public static class Cltl2
     }
 
     /// <summary>(macroexpand-all form &amp;optional env). The walker itself is
-    /// %MACROEXPAND-ALL in cil-stdlib.lisp — a code walker is far easier to get
+    /// %MACROEXPAND-ALL in cil-stdlib.lisp: a code walker is far easier to get
     /// right in Lisp, and the SIL round-trip problem that keeps the other
     /// functions here only affects a defun whose NAME lives in this package.
     /// Resolved lazily because the core is loaded after Init runs.</summary>
@@ -74,10 +74,10 @@ public static class Cltl2
         return Nil.Instance;
     }
 
-    // (variable-information variable &optional env) — no lexical env, so no info.
+    // (variable-information variable &optional env): no lexical env, so no info.
     public static LispObject VariableInformation(LispObject[] args) => NoInfo();
 
-    // (function-information function &optional env) — likewise.
+    // (function-information function &optional env): likewise.
     public static LispObject FunctionInformation(LispObject[] args) => NoInfo();
 
     // (declaration-information decl-name &optional env). Standard OPTIMIZE gets a
@@ -95,7 +95,7 @@ public static class Cltl2
         return Nil.Instance;
     }
 
-    // (augment-environment env &key ...) — no env object to extend; return it
+    // (augment-environment env &key ...): no env object to extend; return it
     // unchanged so later *-information on it stays "no info".
     public static LispObject AugmentEnvironment(LispObject[] args)
         => args.Length >= 1 ? args[0] : Nil.Instance;

@@ -3,7 +3,7 @@
 ;;; It used to cons the copy of its first argument on the way out of a
 ;;; per-element recursion, so a long enough list exhausted the stack. A .NET
 ;;; StackOverflowException cannot be caught, so this killed the process outright
-;;; rather than signalling — and the compiler builds instruction lists with
+;;; rather than signalling: and the compiler builds instruction lists with
 ;;; APPEND, so a large (but perfectly legal) source form took the compiler with
 ;;; it. Three million elements was past the edge; two million was not.
 

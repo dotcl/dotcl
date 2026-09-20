@@ -1,4 +1,4 @@
-;;;; app.lisp — the application's Lisp code, precompiled to a stable-named .NET
+;;;; app.lisp: the application's Lisp code, precompiled to a stable-named .NET
 ;;;; IL assembly (appfasl.dll, internal assembly name "appfasl") at build time.
 ;;;; At publish time the NativeAOT compiler bakes that assembly into the native
 ;;;; image; at run time the host invokes its CompiledModule.ModuleInit directly

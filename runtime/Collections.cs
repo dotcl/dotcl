@@ -6,16 +6,333 @@ namespace DotCL;
 public sealed class LispStruct : LispObject
 {
     public Symbol TypeName { get; }
-    public LispObject[] Slots { get; }
+
+    /// <summary>The slot values, boxed, one array entry per slot.
+    ///
+    /// Private on purpose: every read and write goes through GetSlot / SetSlot /
+    /// SlotCount below. While this is the only storage a structure has, those
+    /// are one-line forwarders and the indirection buys nothing -- but a slot
+    /// whose declared type has a machine representation does not want to live
+    /// in a LispObject[] at all, and a field that 50 call sites index directly
+    /// cannot grow a second storage behind it. The accessors are where that
+    /// choice will be made once, instead of at each of the 50.</summary>
+    private readonly LispObject[] _slots;
+
+    /// <summary>Raw storage for the slots whose declared type fits an int64.
+    /// Null when the structure has none, which is every structure that did not
+    /// use :TYPE -- those pay nothing for this, not even a null field read on
+    /// the fast paths, because the null check is the fast path's first test.
+    ///
+    /// Parallel to _slots rather than replacing it: _slots keeps its full
+    /// length so a slot index means the same thing everywhere, and _layout says
+    /// which entries live over here instead. An entry in _slots for a raw slot
+    /// is never read.</summary>
+    internal readonly long[]? _longs;
+
+    /// <summary>Per-slot storage map, or null when every slot is boxed and the
+    /// structure has never been redefined. Index by slot number: -1 = boxed
+    /// (use _slots), >= 0 = the position in _longs. Shared by every instance of
+    /// the structure type, so an instance carries one reference rather than a
+    /// copy.
+    ///
+    /// Each entry is (VERSION &lt;&lt; 16) | POSITION, with POSITION = SlotBoxed
+    /// meaning the slot lives in _slots. VERSION says which definition of the
+    /// structure built this instance, and it is repeated in every entry rather
+    /// than kept in a field of its own for two reasons: a field would grow
+    /// every structure object by 8 bytes (four references fit an aligned 56, an
+    /// int does not), and a reader that has to check the version has already
+    /// loaded the entry -- the check is then a compare against a value in a
+    /// register instead of a second load. Measured: separate storage cost the
+    /// struct-slots kernel 5.58 -> 8.36 against C#, the packed form nothing.</summary>
+    internal readonly int[]? _layout;
+
+    /// <summary>A layout entry is (VERSION &lt;&lt; 16) | (KIND &lt;&lt; 15) |
+    /// POSITION, with POSITION = SlotBoxed meaning "in _slots".
+    ///
+    /// Everything a raw read needs is in that one int, and the bits are laid
+    /// out so the reader tests all of it at once: XOR the entry with the
+    /// caller's version bits (and with SlotKindDouble when it wants a double)
+    /// and what comes back is the position if every field agreed, and a number
+    /// past the end of the raw array if any of them did not. One load, one
+    /// XOR, one unsigned compare -- and that compare is the bounds check the
+    /// array access needed anyway.</summary>
+    internal const int SlotPosMask = 0x7FFF;
+
+    /// <summary>The POSITION field of a layout entry that says "not raw".</summary>
+    internal const int SlotBoxed = SlotPosMask;
+
+    /// <summary>The KIND bit of a layout entry: set for a raw double.</summary>
+    internal const int SlotKindDouble = 0x8000;
+
+    /// <summary>Where the layout version sits in a layout entry, and in the
+    /// packed slot constant a call site emits.</summary>
+    internal const int LayoutVersionShift = 16;
+
+    /// <summary>The version field of a layout entry or a packed constant.</summary>
+    internal const int LayoutVersionMask = ~0xFFFF;
+
+    /// <summary>A double lives in the same long[] as its IEEE bits rather than
+    /// in an array of its own. One raw array means one field on every structure
+    /// instead of two, and one bounds-checked access rather than a choice
+    /// between two arrays on the hot path; the conversion is
+    /// BitConverter.Int64BitsToDouble, which is a register move, not a call.
+    /// Which of the two a slot holds is a bit of its layout entry.</summary>
+    internal const byte RawLong = 0;
+    internal const byte RawDouble = 1;
+
+    public int SlotCount => _slots.Length;
+
+    public LispObject GetSlot(int index)
+    {
+        if (_layout != null)
+        {
+            int entry = _layout[index];
+            int pos = entry & SlotPosMask;
+            if (pos != SlotBoxed)
+                return (entry & SlotKindDouble) != 0
+                    ? new DoubleFloat(BitConverter.Int64BitsToDouble(_longs![pos]))
+                    : Fixnum.Make(_longs![pos]);
+        }
+        return _slots[index];
+    }
+
+    public void SetSlot(int index, LispObject value)
+    {
+        if (_layout != null)
+        {
+            int entry = _layout[index];
+            int pos = entry & SlotPosMask;
+            if (pos != SlotBoxed)
+            {
+                // A raw slot holds a machine number. Anything else means the
+                // declared type was violated somewhere the compiler did not
+                // check (safety 0, or a path that predates the check), and the
+                // boxed storage cannot take it because there is none -- so it
+                // is reported rather than silently dropped.
+                if ((entry & SlotKindDouble) != 0)
+                {
+                    if (value is not DoubleFloat d)
+                        throw new LispErrorException(new LispTypeError(
+                            $"{TypeName}: slot {index} holds a raw double, got {value}",
+                            value, Startup.Sym("DOUBLE-FLOAT")));
+                    _longs![pos] = BitConverter.DoubleToInt64Bits(d.Value);
+                    return;
+                }
+                if (value is not Fixnum f)
+                    throw new LispErrorException(new LispTypeError(
+                        $"{TypeName}: slot {index} holds a raw integer, got {value}",
+                        value, Startup.Sym("FIXNUM")));
+                _longs![pos] = f.Value;
+                return;
+            }
+        }
+        _slots[index] = value;
+    }
+
+    /// <summary>The layout entry for slot INDEX: version and position in one
+    /// int. A structure with no layout answers "boxed, version 0" -- which is
+    /// exactly what a call site compiled against a structure that was never
+    /// redefined expects, so the common case needs no extra test.
+    ///
+    /// Callers decode this once and pass the POSITION to the raw accessors
+    /// below, instead of indexing the layout a second time per access the way
+    /// the separate RawPos / GetSlotRaw pair did.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal int LayoutEntry(int index) => _layout == null ? SlotBoxed : _layout[index];
+
+    /// <summary>The raw int64 at POS, when POS is a position in the raw array.
+    /// POS comes from a layout entry XORed with what the caller expected, so
+    /// anything the caller got wrong -- the version, the kind, or a slot that
+    /// is not raw at all -- lands outside the array and answers false. The
+    /// range test is the bounds check the read needed anyway.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal bool TryRawLong(int pos, out long value)
+    {
+        var longs = _longs;
+        if (longs != null && (uint)pos < (uint)longs.Length)
+        {
+            value = longs[pos];
+            return true;
+        }
+        value = 0;
+        return false;
+    }
+
+    /// <summary>Store an int64 at POS, or answer false. See TryRawLong.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal bool TrySetRaw(int pos, long value)
+    {
+        var longs = _longs;
+        if (longs != null && (uint)pos < (uint)longs.Length)
+        {
+            longs[pos] = value;
+            return true;
+        }
+        return false;
+    }
+
+    /// <summary>RawLong / RawDouble for a slot the layout says is raw.</summary>
+    internal byte RawKind(int index)
+        => (LayoutEntry(index) & SlotKindDouble) != 0 ? RawDouble : RawLong;
+
+    /// <summary>Which definition of the structure built this instance. 0 for a
+    /// structure whose DEFSTRUCT has never been re-evaluated with a different
+    /// slot layout, which is what a compiled call site assumes unless it says
+    /// otherwise. Read off any entry, since every entry carries it; only the
+    /// error path needs this, because the check itself compares the entry the
+    /// reader already loaded.</summary>
+    internal int LayoutVersion
+        => _layout == null || _layout.Length == 0 ? 0 : _layout[0] >> LayoutVersionShift;
+
+    /// <summary>The slot values as one array, for the callers that need to hand
+    /// the whole set somewhere: PRINT, COPY-STRUCTURE, the FASL literal writer.
+    /// Callers must treat it as a snapshot and not write through it -- writing
+    /// goes through SetSlot, which is what a second storage would have to
+    /// intercept.</summary>
+    public LispObject[] SlotsSnapshot()
+    {
+        if (_layout == null) return _slots;
+        // A structure with raw slots has no single array holding every value,
+        // so the snapshot is built. The callers are the cold ones -- printing,
+        // COPY-STRUCTURE, the FASL literal writer, EQUALP -- and they want the
+        // values, not the storage.
+        var all = new LispObject[_slots.Length];
+        for (int i = 0; i < all.Length; i++) all[i] = GetSlot(i);
+        return all;
+    }
 
     // Intern cache for EQ-preserving FASL deserialization.
     // Uses WeakReference values so GC can collect structs no longer referenced elsewhere.
     private static readonly ConcurrentDictionary<string, WeakReference<LispStruct>> _internCache = new();
 
+    /// <summary>Slot layouts by structure name. A DEFSTRUCT with at least one
+    /// slot whose declared type fits an int64 registers one at load time; every
+    /// other structure never appears here and reads a null layout.
+    ///
+    /// The lookup happens once per structure CREATED, not per slot accessed --
+    /// the instance carries the layout reference afterwards. That is why the
+    /// split lives in this constructor rather than in MakeStruct: a FASL
+    /// literal, COPY-STRUCTURE and the reader all build structures through
+    /// here, and a structure built by one of them has to have the same shape as
+    /// one built by the constructor function.</summary>
+    private static readonly ConcurrentDictionary<Symbol, int[]> _layouts = new();
+
+    /// <summary>Record which slots of TYPENAME are raw, and which definition of
+    /// TYPENAME this is. POS has one entry per slot: the position in the raw
+    /// array, or -1 for a boxed slot. KIND says what the bits at that position
+    /// mean. VERSION is folded into every entry.
+    ///
+    /// A structure with no raw slot at version 0 is removed rather than
+    /// recorded: that is every structure in a program that uses no :TYPE and
+    /// redefines nothing, and a null layout is what keeps its slot access down
+    /// to one array read.</summary>
+    /// <summary>The shape this had before layouts carried a version. Kept
+    /// because a shipped FASL calls what it was compiled against.</summary>
+    public static void RegisterLayout(Symbol typeName, int[] pos, byte[] kind)
+        => RegisterLayout(typeName, pos, kind, 0);
+
+    public static void RegisterLayout(Symbol typeName, int[] pos, byte[] kind, int version)
+    {
+        bool anyRaw = false;
+        // A position has 15 bits and a version 15 more. Nothing real comes
+        // close, and a structure that did would lose only the raw storage --
+        // the slot falls back to the boxed path it had before any of this.
+        foreach (var p in pos) if (p >= 0 && p < SlotBoxed) { anyRaw = true; break; }
+        int ver = version & SlotPosMask;
+        if (anyRaw || ver != 0)
+        {
+            var entries = new int[pos.Length];
+            for (int i = 0; i < pos.Length; i++)
+                entries[i] = (ver << LayoutVersionShift)
+                             | (pos[i] >= 0 && pos[i] < SlotBoxed
+                                ? pos[i] | (kind[i] == RawDouble ? SlotKindDouble : 0)
+                                : SlotBoxed);
+            _layouts[typeName] = entries;
+        }
+        else _layouts.TryRemove(typeName, out _);
+    }
+
+    /// <summary>A layout map with every slot boxed, carrying VERSION. Used when
+    /// an instance cannot take the raw storage its type registered -- a value
+    /// of the wrong type, stored where no check ran -- and the version still
+    /// has to be remembered. Null at version 0, where a null layout says the
+    /// same thing and costs less.</summary>
+    private static int[]? BoxedMap(int slotCount, int version)
+    {
+        if (version == 0) return null;
+        var m = new int[slotCount];
+        int entry = (version << LayoutVersionShift) | SlotBoxed;
+        for (int i = 0; i < slotCount; i++) m[i] = entry;
+        return m;
+    }
+
     public LispStruct(Symbol typeName, LispObject[] slots)
+        : this(typeName, slots,
+               _layouts.TryGetValue(typeName, out var registered)
+               && registered.Length == slots.Length ? registered : null)
+    {
+    }
+
+    /// <summary>A copy of SOURCE holding VALUES, keeping SOURCE's layout.
+    ///
+    /// COPY-STRUCTURE of an instance built by an older definition has to stay
+    /// that definition's shape. Rebuilding it against what the structure means
+    /// NOW would leave the values at the positions the old definition gave them
+    /// while the copy claimed the current version -- which is the silent misread
+    /// the version exists to stop, reintroduced by the one operation that
+    /// carries values from one instance to another.</summary>
+    internal LispStruct(LispStruct source, LispObject[] values)
+        : this(source.TypeName, values, source._layout)
+    {
+    }
+
+    private LispStruct(Symbol typeName, LispObject[] slots, int[]? map)
     {
         TypeName = typeName;
-        Slots = slots;
+        _slots = slots;
+        if (map != null)
+        {
+            _layout = map;
+            int n = 0;
+            for (int i = 0; i < slots.Length; i++) if ((map[i] & SlotPosMask) != SlotBoxed) n++;
+            // A structure that is only here to carry a version has no raw
+            // storage at all.
+            _longs = n > 0 ? new long[n] : null;
+            for (int i = 0; i < slots.Length; i++)
+            {
+                int entry = map[i];
+                int pos = entry & SlotPosMask;
+                if (pos == SlotBoxed) continue;
+                // A slot value of the wrong type here means the declaration was
+                // violated before the checks existed, or under safety 0. Keep
+                // the value rather than lose it: the raw storage is dropped for
+                // this instance and it behaves exactly as it did before.
+                if ((entry & SlotKindDouble) != 0)
+                {
+                    if (slots[i] is not DoubleFloat d)
+                    {
+                        // Dropping the raw storage must not drop the version
+                        // with it: the instance still came from this definition
+                        // and accessors compiled against it are still right
+                        // about where its slots are.
+                        _longs = null;
+                        _layout = BoxedMap(slots.Length, entry >> LayoutVersionShift);
+                        break;
+                    }
+                    _longs![pos] = BitConverter.DoubleToInt64Bits(d.Value);
+                }
+                else
+                {
+                    if (slots[i] is not Fixnum f)
+                    {
+                        _longs = null;
+                        _layout = BoxedMap(slots.Length, entry >> LayoutVersionShift);
+                        break;
+                    }
+                    _longs![pos] = f.Value;
+                }
+            }
+        }
         DotCL.Diagnostics.AllocCounter.Inc("LispStruct");
     }
 
@@ -70,9 +387,9 @@ public sealed class LispStruct : LispObject
             return "#S(...)";
         try
         {
-            var parts = new string[Slots.Length];
-            for (int i = 0; i < Slots.Length; i++)
-                parts[i] = Slots[i].ToString();
+            var parts = new string[SlotCount];
+            for (int i = 0; i < SlotCount; i++)
+                parts[i] = GetSlot(i).ToString();
             if (parts.Length == 0)
                 return $"#S({TypeName.Name})";
             return $"#S({TypeName.Name} {string.Join(" ", parts)})";
@@ -107,7 +424,7 @@ public sealed class LispVector : LispObject
     // concrete array type of _numData.
     internal Array? _numData;   // byte[] | ushort[] | int[] | long[] | float[] | double[] per _numKind
     internal int _numLen;       // _numData.Length (Array.Length on the abstract
-                                // static type is a runtime call, not ldlen — hot
+                                // static type is a runtime call, not ldlen: hot
                                 // aref paths bounds-check against this instead)
     internal byte _numKind;    // 0=none 1=u8 2=u16 3=i32 4=i64 5=f4(float[]) 6=f8(double[])
 
@@ -279,7 +596,7 @@ public sealed class LispVector : LispObject
     /// elementType) constructor: fills the packed storage directly instead of packing a
     /// boxed array the caller built. MAKE-ARRAY built a LispObject[SIZE] for every
     /// array, including the ones whose element type has narrow storage, and the
-    /// constructor then packed it and dropped it — so a 200x200x200 (integer 0 1000)
+    /// constructor then packed it and dropped it: so a 200x200x200 (integer 0 1000)
     /// array allocated 64 MB of boxed references on the way to its 16 MB ushort[].
     /// </summary>
     public LispVector(int size, LispObject initialElement, string elementType, int[] dimensions)
@@ -471,7 +788,7 @@ public sealed class LispVector : LispObject
     // Returns true if array was created with :adjustable t
     public bool IsAdjustable { get => _isAdjustable; set => _isAdjustable = value; }
 
-    // Raw element get/set — handles displacement transparently
+    // Raw element get/set: handles displacement transparently
     private LispObject RawGet(int index)
     {
         if (_displacedTo != null) return _displacedTo.RawGet(_displacedOffset + index);
@@ -1057,10 +1374,10 @@ public sealed class LispHashTable : LispObject
         bool valOk = !_weakValue || v != null;
         bool alive = _keyOrValue ? (keyOk || valOk) : (keyOk && valOk);
         if (!alive) return null;
-        // For OR-mode a side may be dead but the other alive; surface NIL? No —
+        // For OR-mode a side may be dead but the other alive; surface NIL? No;
         // CL semantics keep the pair; if one side is collected the entry is
         // logically gone for use. We require both resolvable to hand back a pair;
-        // a half-dead OR entry is treated as live-but-unusable → prune lazily.
+        // a half-dead OR entry is treated as live-but-unusable -> prune lazily.
         if (k == null || v == null) return null;
         return (k, v);
     }
@@ -1367,9 +1684,9 @@ public sealed class LispHashTable : LispObject
             if (a is LispStruct sa && b is LispStruct sb)
             {
                 if (sa.TypeName.Name != sb.TypeName.Name) return false;
-                if (sa.Slots.Length != sb.Slots.Length) return false;
-                for (int i = 0; i < sa.Slots.Length; i++)
-                    if (!Equalp(sa.Slots[i], sb.Slots[i])) return false;
+                if (sa.SlotCount != sb.SlotCount) return false;
+                for (int i = 0; i < sa.SlotCount; i++)
+                    if (!Equalp(sa.GetSlot(i), sb.GetSlot(i))) return false;
                 return true;
             }
             return false;
@@ -1418,7 +1735,7 @@ public sealed class LispHashTable : LispObject
         // EQL compares numbers by type and value, so every number must hash by
         // value. Falling through to the identity hash (as bignums, ratios and
         // complexes used to) puts two EQL keys in different buckets, and the
-        // table can never find them again — EQUAL inherits this through its
+        // table can never find them again: EQUAL inherits this through its
         // number case, which is how a float-keyed EQUAL table silently
         // accumulated one entry per lookup. Returns null for non-numbers.
         // Collisions across types are fine (1 vs 1.0d0 hash alike); the test
@@ -1454,7 +1771,7 @@ public sealed class LispHashTable : LispObject
                 Cons c => HashCode.Combine(GetEqualHash(c.Car, depth - 1), GetEqualHash(c.Cdr, depth - 1)),
                 LispVector bv when bv.IsBitVector => HashBitVector(bv),
                 // EQUAL falls back to EQL for numbers and characters, so they
-                // must hash by value here too — including inside a cons, which
+                // must hash by value here too: including inside a cons, which
                 // is how SBCL's inline-constant table keys its float constants.
                 _ => NumericOrCharHash(obj)
                      ?? System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(obj)
@@ -1587,7 +1904,7 @@ public class LispRandomState : LispObject
 /// <summary>Pprint dispatch table (stub for ANSI compliance).</summary>
 public class LispPprintDispatchTable : LispObject
 {
-    /// <summary>Entries: type-specifier-key → (type-specifier, function, priority)</summary>
+    /// <summary>Entries: type-specifier-key -> (type-specifier, function, priority)</summary>
     public Dictionary<string, (LispObject TypeSpec, LispObject Function, double Priority)> Entries { get; }
 
     public LispPprintDispatchTable()
@@ -1615,7 +1932,7 @@ public class LispWeakPointer : LispObject
 
     public LispWeakPointer(LispObject target)
     {
-        // trackResurrection: false — value becomes unreachable once collected.
+        // trackResurrection: false: value becomes unreachable once collected.
         _ref = new WeakReference<LispObject>(target);
     }
 

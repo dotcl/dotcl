@@ -1,4 +1,4 @@
-;;; Regression tests for CLR type ↔ Lisp class identity (same-simple-name collision).
+;;; Regression tests for CLR type <-> Lisp class identity (same-simple-name collision).
 ;;; Two distinct .NET types that share a simple name (different namespaces) must map
 ;;; to DISTINCT Lisp classes; class-of / typep must not conflate them. Before the
 ;;; fix, EnsureDotNetTypeClass adopted the first same-simple-name class for the
@@ -65,7 +65,7 @@
   (t t nil nil))
 
 ;; Registering in the reverse order gives the same result (the winner flips, but
-;; both FullName specializers still resolve correctly — that is the whole point).
+;; both FullName specializers still resolve correctly: that is the whole point).
 (deftest d492-fullname-specializer-reverse-order
   (progn
     (dotnet:%define-class "Collide.BetaNs.Cog492")
@@ -110,7 +110,7 @@
   ("Object" nil))
 
 ;;; dotnet:box of a primitive to an interface/base type it implements.
-;;; Previously "Cannot convert Fixnum to IComparable" — LispToDotNet only handled
+;;; Previously "Cannot convert Fixnum to IComparable": LispToDotNet only handled
 ;;; concrete primitive targets. Now a primitive boxes at its natural .NET type when
 ;;; the target is assignable from it.
 

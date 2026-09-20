@@ -2,7 +2,7 @@
 ;;;   dotnet run --project runtime/runtime.csproj -- --asm compiler/cil-out.sil test/advice-watch.lisp
 ;;; (needs network on first run to resolve Lib.Harmony from NuGet)
 
-(require "advice")
+(require "dotcl-advice")
 
 (defvar *log* nil)
 

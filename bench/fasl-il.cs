@@ -6,9 +6,9 @@
 // Modes (default: summary methods):
 //   summary    totals: types / methods / fields / total IL / largest method
 //   methods    the largest method bodies, with locals and maxstack
-//   prefixes   IL grouped by method-name prefix — _const_ (literal construction)
+//   prefixes   IL grouped by method-name prefix: _const_ (literal construction)
 //              vs _toplevel_ vs closure_ vs function bodies
-//   fields     field count grouped by name prefix — _gsym_ (uninterned symbols)
+//   fields     field count grouped by name prefix: _gsym_ (uninterned symbols)
 //              vs _symfn_ (call-site caches) vs _str_ (string literals)
 //   types      per-type field and method counts
 //   limits     assert the shape stays inside safe bounds; exits 1 on a violation
@@ -17,8 +17,8 @@
 //   all        every mode except limits
 //
 // Why this exists: loading a fasl means JITting its IL, so what matters for load
-// time and RSS is the SHAPE of the emitted assembly — how many bytes sit in one
-// method, how many fields sit on one type — and none of that is visible from the
+// time and RSS is the SHAPE of the emitted assembly, how many bytes sit in one
+// method, how many fields sit on one type, and none of that is visible from the
 // Lisp side or from the fasl's size on disk. Measurements taken with earlier
 // throwaway versions of this tool drove four separate fixes to how constants and
 // top-level forms are split across methods; the tool itself was never committed,
@@ -156,7 +156,7 @@ if (modes.Contains("limits"))
 {
     // A guard, not a report: the failures these bounds stand for are invisible on
     // the compile side (total IL, fasl bytes and compile time all stay flat) and
-    // surface at LOAD as a diagnostic that names neither the file nor the cause —
+    // surface at LOAD as a diagnostic that names neither the file nor the cause;
     // "Internal limitation: too many fields.", a bare InvalidProgramException, or
     // the process being killed while JITting one huge method. Every past instance
     // was found by a user's out-of-memory, never by CI.

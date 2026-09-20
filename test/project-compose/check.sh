@@ -2,10 +2,10 @@
 # project-core composition check: a Lisp LIBRARY consumed by another project.
 #
 # Two consumer shapes, both against the in-tree runtime (no NuGet):
-#   1. a plain C# app that references the library  — the library's facade boots
+#   1. a plain C# app that references the library: the library's facade boots
 #      the runtime and loads the library's own manifest
 #   2. a dotcl app (it has its own .asd, so it loads its own manifest first) that
-#      also calls into the library — here the library's fasl must still load, and
+#      also calls into the library: here the library's fasl must still load, and
 #      the core must NOT be loaded twice
 #
 # Shape 2 used to be broken two ways: the deployed manifest name was fixed
@@ -15,6 +15,18 @@
 #
 # Usage: check.sh <repo-root>
 set -eu
+
+# A missing prerequisite is a convenience skip when this is run by hand, but in
+# CI a skip is indistinguishable from a pass: the gate quietly stops gating and
+# nothing in the log says so. DOTCL_CI=1 (set at the job level in
+# .github/workflows/ci.yml) makes it a failure instead.
+skip_or_fail() {
+  echo "$1"
+  if [ "${DOTCL_CI:-}" = "1" ]; then
+    echo "  DOTCL_CI=1: a skipped check counts as a failure here" >&2
+    exit 1
+  fi
+}
 # Absolute: the generated csproj files live outside the tree and reference the
 # runtime by path, so a relative ROOT would resolve against their own directory.
 ROOT="$(cd "${1%/}" && pwd)"
@@ -27,7 +39,7 @@ TARGETS="$(win "$ROOT/runtime/build/Dotcl.targets")"
 CORE="$(win "$ROOT/compiler/dotcl.core")"
 
 if [ ! -f "$ROOT/compiler/dotcl.core" ]; then
-  echo "  SKIP: compiler/dotcl.core not built (make compile-core-fasl)"
+  skip_or_fail "  SKIP: compiler/dotcl.core not built (make compile-core-fasl)"
   exit 0
 fi
 
@@ -208,7 +220,7 @@ esac
 # anything that came back false. NIL and an error mean different things there:
 # NIL is "(:feature :x ...) with :x absent, this dependency does not apply", an
 # error is "this dependency was declared and cannot be found". Treating the
-# second as the first wrote a manifest that silently lacked the system — exit 0,
+# second as the first wrote a manifest that silently lacked the system; exit 0,
 # no output, a build that "succeeded" and an application missing a library.
 echo "  checking dependency resolution diagnostics..."
 # The built runner: the file is runtime.exe on Windows and runtime elsewhere, and

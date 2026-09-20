@@ -7,7 +7,7 @@
 ;;; again by the body.
 ;;;
 ;;; Contract, in order of importance:
-;;;   1. Results are identical to the boxed path — in particular the TIGHT range
+;;;   1. Results are identical to the boxed path: in particular the TIGHT range
 ;;;      proved for the binding survives the promotion, so a product that leaves
 ;;;      int64 still promotes to a bignum instead of wrapping.
 ;;;   2. The promotion is refused wherever an Int64 slot could not hold the value
@@ -115,7 +115,7 @@
 ;;; ---- 3. promotion is refused where the slot could not hold the value ----
 
 ;; Mutated: a SETQ could store a value outside the proven range (here a bignum),
-;; which an Int64 slot cannot hold. Must stay boxed — and stay correct.
+;; which an Int64 slot cannot hold. Must stay boxed: and stay correct.
 (defun %nis-mutated (a)
   (declare (type (signed-byte 56) a))
   (let ((v (* a 2)))

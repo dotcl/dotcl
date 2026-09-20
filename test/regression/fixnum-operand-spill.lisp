@@ -7,7 +7,7 @@
 ;;; expansion is (LET (...) (BLOCK f body)), the block's arms jump to a join
 ;;; label, and the pending operand makes the stack depth at that label disagree
 ;;; between the incoming paths. The JIT rejected the method outright
-;;; (InvalidProgramException) — and only when it was first CALLED, because JIT is
+;;; (InvalidProgramException): and only when it was first CALLED, because JIT is
 ;;; lazy, so the failure surfaced far from the code that caused it.
 ;;;
 ;;; Non-straight-line operands are now evaluated into Int64 temps first. These
@@ -18,7 +18,7 @@
 
 (declaim (inline fos-cond-accessor))
 (defun fos-cond-accessor (x)
-  ;; A COND with differently shaped arms — the shape that made the inline
+  ;; A COND with differently shaped arms: the shape that made the inline
   ;; expansion branch.
   (cond ((null x) 0)
         ((consp x) (the fixnum (car x)))

@@ -2,7 +2,7 @@
 
   <!--
     Packs the DotCL.Sdk MSBuild SDK. This project ships NO
-    assembly — only Sdk/Sdk.props + Sdk/Sdk.targets, which MSBuild auto-imports
+    assembly; only Sdk/Sdk.props + Sdk/Sdk.targets, which MSBuild auto-imports
     for any consumer that writes <Project Sdk="DotCL.Sdk">.
 
     Version is inherited from runtime/Directory.Build.props, so DotCL.Sdk and
@@ -28,9 +28,9 @@
     <SuppressDependenciesWhenPacking>true</SuppressDependenciesWhenPacking>
     <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
 
-    <Description>MSBuild SDK for Common Lisp on .NET — build/pack/F5 a dotcl app as a first-class MSBuild project.</Description>
+    <Description>MSBuild SDK for Common Lisp on .NET; build/pack/F5 a dotcl app as a first-class MSBuild project.</Description>
     <Authors>SANO Masatoshi</Authors>
-    <Copyright>Copyright © 2026 SANO Masatoshi</Copyright>
+    <Copyright>Copyright (c) 2026 SANO Masatoshi</Copyright>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageProjectUrl>https://github.com/dotcl/dotcl</PackageProjectUrl>
     <RepositoryUrl>https://github.com/dotcl/dotcl.git</RepositoryUrl>

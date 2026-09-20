@@ -47,20 +47,25 @@ done <<< "$dotcl_results"
 
 # Collect existing entries not in new results
 existing_order=()
-declare -A ex_dotcl ex_sbcl ex_ratio ex_status
+declare -A ex_raw
 if [ -n "$existing_file" ] && [ -f "$existing_file" ]; then
     while IFS= read -r line; do
-        # Match lines like:    "name": {"dotcl": ..., "sbcl": ..., "ratio": ...}
-        name=$(echo "$line" | sed -n 's/.*"\([^"]*\)": {"dotcl":.*/\1/p')
+        # Match any entry line:    "name": {...}
+        #
+        # Not only the {"dotcl": ...} shape this script writes. bench-state.json
+        # also carries rows from the C# parity benchmark, whose fields are
+        # different (csharp_ms / dotcl_ms / ratio), and a name pattern tied to
+        # one shape silently deleted them on every cl-bench run. Keeping the
+        # payload verbatim preserves any shape without this script having to
+        # know them all.
+        # The closing brace is required so the `"benchmarks": {` header, which
+        # opens an object and never closes it on its own line, is not read as
+        # an entry named "benchmarks".
+        name=$(echo "$line" | sed -n 's/^ *"\([^"]*\)": {.*},\{0,1\}$/\1/p')
         [ -z "$name" ] && continue
         [ -n "${new_names[$name]+_}" ] && continue
         existing_order+=("$name")
-        ex_dotcl["$name"]=$(echo "$line" | sed 's/.*"dotcl": \([^,]*\).*/\1/')
-        ex_sbcl["$name"]=$(echo "$line" | sed 's/.*"sbcl": \([^,]*\).*/\1/')
-        ex_ratio["$name"]=$(echo "$line" | sed 's/.*"ratio": \([^,}]*\).*/\1/')
-        if echo "$line" | grep -q '"status"'; then
-            ex_status["$name"]=$(echo "$line" | sed 's/.*"status": "\([^"]*\)".*/\1/')
-        fi
+        ex_raw["$name"]=$(echo "$line" | sed 's/^ *"[^"]*": //; s/,$//')
     done < "$existing_file"
 fi
 
@@ -96,22 +101,18 @@ for i in "${!all_names[@]}"; do
                 status=', "status": "sbcl-zero"'
             fi
         fi
+        comma=","
+        if [ $i -eq $((total - 1)) ]; then comma=""; fi
+
+        printf '    "%s": {"dotcl": %s, "sbcl": %s, "ratio": %s%s}%s\n' \
+            "$name" "$dotcl_out" "$sbcl_out" "$ratio" "$status" "$comma"
     else
-        # Existing entry preserved
-        dotcl_out="${ex_dotcl[$name]}"
-        sbcl_out="${ex_sbcl[$name]}"
-        ratio="${ex_ratio[$name]}"
-        status=""
-        if [ -n "${ex_status[$name]+_}" ] && [ -n "${ex_status[$name]}" ]; then
-            status=", \"status\": \"${ex_status[$name]}\""
-        fi
+        # Existing entry, carried through verbatim.
+        comma=","
+        if [ $i -eq $((total - 1)) ]; then comma=""; fi
+
+        printf '    "%s": %s%s\n' "$name" "${ex_raw[$name]}" "$comma"
     fi
-
-    comma=","
-    if [ $i -eq $((total - 1)) ]; then comma=""; fi
-
-    printf '    "%s": {"dotcl": %s, "sbcl": %s, "ratio": %s%s}%s\n' \
-        "$name" "$dotcl_out" "$sbcl_out" "$ratio" "$status" "$comma"
 done
 
 echo "  }"

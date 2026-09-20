@@ -1,4 +1,4 @@
-;;; Regression: CLHS TYPE — "A symbol cannot be both the name of a type and the
+;;; Regression: CLHS TYPE: "A symbol cannot be both the name of a type and the
 ;;; name of a declaration. Defining a symbol as the name of a class, structure,
 ;;; condition, or type, when the symbol has been declared as a declaration name,
 ;;; or vice versa, signals an error."

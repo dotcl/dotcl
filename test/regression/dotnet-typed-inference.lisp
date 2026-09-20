@@ -1,7 +1,7 @@
 ;;; Typed direct-callvirt type inference: a (dotnet:invoke VAR "M" ...)
 ;;; on a bare local variable lowers to %dotnet-call-direct when VAR's .NET type
 ;;; is known from its let/let* init form (dotnet:new / dotnet:box / the), with no
-;;; explicit THE at the call site. The lowering is purely a speed optimization —
+;;; explicit THE at the call site. The lowering is purely a speed optimization;
 ;;; these tests assert the results stay correct, plus that the compiler macro
 ;;; actually fires (and declines when it must), so a regression to the dynamic
 ;;; path is still caught behaviorally but a regression in the *inference* is too.
@@ -183,7 +183,7 @@
 ;;; %merge-disjoint-locals must track the RECV/ARG locals carried inside a
 ;;; :dotnet-call-direct-locals op (typed dotnet:invoke lowering). Those locals
 ;;; live in nested lists, invisible to the slot-share liveness scan, so an earlier
-;;; short-lived LispObject local freed a slot the scan reused for a DARG — renaming
+;;; short-lived LispObject local freed a slot the scan reused for a DARG; renaming
 ;;; the DARG's declare/stloc while the nested op reference stayed DARG_n, yielding
 ;;; "Undeclared local: DARG_n" at assembly time. Compiling this body (3 dead locals
 ;;; before a typed invoke with a typed arg) must succeed and run.

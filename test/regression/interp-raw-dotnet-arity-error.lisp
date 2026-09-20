@@ -14,7 +14,7 @@
 ;;; PARSE-NAMESTRING.ERROR.1).
 ;;;
 ;;; The assertion therefore puts HANDLER-CASE INSIDE the form being EVAL'd.
-;;; Outside — in the compiled test function — it would catch the .NET exception
+;;; Outside, in the compiled test function, it would catch the .NET exception
 ;;; too, and gate nothing.
 
 (defun %rde (mode form)

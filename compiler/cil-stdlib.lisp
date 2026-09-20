@@ -1,8 +1,8 @@
-;;; cil-stdlib.lisp — Standard library functions implemented in Lisp
+;;; cil-stdlib.lisp: Standard library functions implemented in Lisp
 ;;; These are compiled alongside user code to provide higher-order
 ;;; sequence functions, set operations, and other utilities.
 ;;;
-;;; NOTE: No (in-package ...) here — this file is compiled as user code,
+;;; NOTE: No (in-package ...) here: this file is compiled as user code,
 ;;; not loaded into the compiler's own package.
 
 ;;; ============================================================
@@ -214,7 +214,7 @@
 (defun + (&rest args)
   (let ((result 0))
     (dolist (x args result) (setq result (+ result x)))))
-;; CLHS: (- number &rest more) — zero arguments is a program-error. The unary case
+;; CLHS: (- number &rest more): zero arguments is a program-error. The unary case
 ;; is a sign flip, not "subtract from 0": (- 0.0) is -0.0, and compile-sub uses
 ;; Runtime.Negate for the same reason. The (- x) / (- result x) below lower to the
 ;; inline two-argument op, so this is not self-recursive.
@@ -248,7 +248,7 @@
     (dolist (x more t) (if (>= prev x) (setq prev x) (return nil)))))
 
 ;; Attach 2-arg direct delegates to the comparison wrapper function objects
-;; just defined (#'< handed to SORT etc. — the funcall path). Compiled call
+;; just defined (#'< handed to SORT etc.: the funcall path). Compiled call
 ;; sites already inline via compile-nary-comparison; this covers the
 ;; function-object path with the same C# comparators the 2-arg wrapper
 ;; bodies compile to (identical T/NIL results and type errors).
@@ -465,11 +465,11 @@
 
 ;;; ADJOIN lives in C# (Runtime.AdjoinFull and its 2/4/6-arg direct entries).
 ;;; A &key Lisp defun gets no typed direct delegate, so every (adjoin item list
-;;; :test ...) — which is what PUSHNEW expands into — went through the variadic
+;;; :test ...), which is what PUSHNEW expands into, went through the variadic
 ;;; XEP and an args array.
 
 ;;; Helper: test if item (already key-applied) is in list using test/test-not/key
-;;; Calls (test item (key x)) — item is first arg
+;;; Calls (test item (key x)): item is first arg
 (defun %set-member (item list test test-not key)
   (dolist (x list nil)
     (let ((k (funcall key x)))
@@ -478,7 +478,7 @@
                 (funcall test item k))
         (return t)))))
 
-;;; Like %set-member but calls (test (key x) item) — item is second arg
+;;; Like %set-member but calls (test (key x) item): item is second arg
 (defun %set-member-rev (item list test test-not key)
   (dolist (x list nil)
     (let ((k (funcall key x)))
@@ -748,7 +748,7 @@
       ((null rt) :nil)
       ((null name) :unknown)
       ((member name '("STRING" "SIMPLE-STRING" "BASE-STRING" "SIMPLE-BASE-STRING") :test #'string=) :string)
-      ;; (vector character) and similar char-vector types → :string
+      ;; (vector character) and similar char-vector types -> :string
       ((and (string= name "VECTOR") (consp rt) (consp (cdr rt))
             (symbolp (cadr rt))
             (member (symbol-name (cadr rt)) '("CHARACTER" "BASE-CHAR" "STANDARD-CHAR") :test #'string=))
@@ -811,18 +811,18 @@
        (coerce result 'bit-vector))
       ((eq cat :vector)
        ;; Check the compound size constraint. The third element means
-       ;; different things per base type (CLHS): (vector elt N) — N is a
-       ;; LENGTH; (array elt N) / (simple-array elt N) — N is a RANK, and
+       ;; different things per base type (CLHS): (vector elt N), N is a
+       ;; LENGTH; (array elt N) / (simple-array elt N), N is a RANK, and
        ;; a length constraint is spelled (simple-array elt (N)). SBCL's
-       ;; perfectly-hashable maps into (simple-array (unsigned-byte 32) 1)
-       ;; — rank 1, any length.
+       ;; perfectly-hashable maps into (simple-array (unsigned-byte 32) 1);
+       ;; rank 1, any length.
        (when (and (consp result-type) (consp (cdr result-type)) (consp (cddr result-type)))
          (let* ((base-name (symbol-name (car result-type)))
                 (arrayp (member base-name '("ARRAY" "SIMPLE-ARRAY") :test #'string=))
                 (spec (caddr result-type))
                 (required-length
                   (cond ((not arrayp) (and (integerp spec) spec))
-                        ;; (array elt (N)) — single-dimension length
+                        ;; (array elt (N)): single-dimension length
                         ((and (consp spec) (integerp (car spec)) (null (cdr spec)))
                          (car spec))
                         (t nil))))
@@ -1182,11 +1182,11 @@ Also expands element types within compound type specifiers like (VECTOR etype si
             (logand value mask))))
 
 (defun %set-ldb (bytespec integer new-value)
-  "Setter helper for (setf (ldb bytespec place) val) — returns new integer."
+  "Setter helper for (setf (ldb bytespec place) val); returns new integer."
   (dpb new-value bytespec integer))
 
 (defun %set-mask-field (bytespec integer new-value)
-  "Setter helper for (setf (mask-field bytespec place) val) — returns new integer."
+  "Setter helper for (setf (mask-field bytespec place) val); returns new integer."
   (deposit-field new-value bytespec integer))
 
 ;;; --- get-setf-expansion (CL public function) ---
@@ -1199,7 +1199,7 @@ Also expands element types within compound type specifiers like (VECTOR etype si
 ;;; ===== Generic atomic operations on arbitrary CL places =====
 ;;;
 ;;; dotcl:compare-and-swap / atomic-incf / atomic-decf. Lock-based (a single
-;;; global monitor) — correct among concurrent atomic operations, but NOT
+;;; global monitor): correct among concurrent atomic operations, but NOT
 ;;; lock-free. Because these expand through GET-SETF-EXPANSION, every place SETF
 ;;; understands works uniformly: a special/lexical variable, CAR/CDR, SVREF/AREF,
 ;;; GETHASH, SLOT-VALUE, a struct slot, etc. The place subforms are captured to
@@ -1209,7 +1209,7 @@ Also expands element types within compound type specifiers like (VECTOR etype si
 ;;;
 ;;; The DOTCL-package macro names are interned and registered at runtime rather
 ;;; than written with dotcl:: reader syntax, because the SBCL cross-compile host
-;;; that reads this file has no DOTCL package — the same reason
+;;; that reads this file has no DOTCL package: the same reason
 ;;; without-package-locks is registered from C#. Helper functions and the lock
 ;;; special variable stay unqualified (internal); only the user-facing macro
 ;;; names need to live in DOTCL.
@@ -1294,14 +1294,14 @@ Also expands element types within compound type specifiers like (VECTOR etype si
   (labels ((simplest (lo hi)
              (multiple-value-bind (fl rem) (floor lo)
                (cond
-                 ((zerop rem) fl)                 ; LO is an integer — simplest possible
+                 ((zerop rem) fl)                 ; LO is an integer; simplest possible
                  ((< fl (floor hi)) (1+ fl))      ; integer FL+1 lies in (LO, HI]
                  (t (+ fl (/ (simplest (/ (- hi fl)) (/ (- lo fl))))))))))
     (simplest lo hi)))
 
 (defun rationalize (x)
   "Return the SIMPLEST rational that rounds to X (CLHS): the smallest-denominator
-   rational within X's rounding interval — not RATIONAL's exact fraction. E.g.
+   rational within X's rounding interval; not RATIONAL's exact fraction. E.g.
    (rationalize 3.2d0) => 16/5, (rationalize 0.1d0) => 1/10."
   (cond
     ((rationalp x) x)
@@ -1333,7 +1333,7 @@ Also expands element types within compound type specifiers like (VECTOR etype si
 
 ;;; ===== DOCUMENTATION generic function (CLHS) =====
 
-;; Global storage: (cons object doc-type) → string
+;; Global storage: (cons object doc-type) -> string
 (defvar *%pprint-level* 0)
 
 (defvar *compilation-unit-depth* 0)
@@ -1364,7 +1364,7 @@ Also expands element types within compound type specifiers like (VECTOR etype si
 (defmethod documentation ((x t) (doc-type t))
   (%get-doc x doc-type))
 
-;; (documentation <function> 't) — function object documentation
+;; (documentation <function> 't): function object documentation
 (defmethod documentation ((x function) (doc-type (eql t)))
   (%get-doc x t))
 
@@ -1372,7 +1372,7 @@ Also expands element types within compound type specifiers like (VECTOR etype si
 (defmethod documentation ((x function) (doc-type (eql 'function)))
   (documentation x t))
 
-;; (documentation <symbol> 'function) — user-set docs first, then built-in docs
+;; (documentation <symbol> 'function): user-set docs first, then built-in docs
 ;; registered via [LispDoc]/SetFunctionDoc (mirrors the variable path) (#25).
 (defmethod documentation ((x symbol) (doc-type (eql 'function)))
   (or (%get-doc x 'function)
@@ -1399,7 +1399,7 @@ Also expands element types within compound type specifiers like (VECTOR etype si
 (defmethod documentation ((x symbol) (doc-type (eql 'setf)))
   (%get-doc x 'setf))
 
-;; (documentation <list> 'function) — for (setf foo)
+;; (documentation <list> 'function): for (setf foo)
 (defmethod documentation ((x list) (doc-type (eql 'function)))
   (%get-doc x 'function))
 
@@ -1410,6 +1410,25 @@ Also expands element types within compound type specifiers like (VECTOR etype si
 ;; (documentation <package> 't)
 (defmethod documentation ((x package) (doc-type (eql t)))
   (%get-doc x t))
+
+;; (documentation <class> 'type) and (documentation <class> t).
+;;
+;; DEFCLASS files its docstring under the class NAME, which is what
+;; (documentation 'foo 'type) reads. A caller holding the class OBJECT -- what
+;; FIND-CLASS and CLASS-OF hand back, and the only thing a metaobject walker
+;; has -- fell through to the default T/T method, which looked the object
+;; itself up in the table and found nothing.
+;;
+;; The object is consulted first so that a (SETF DOCUMENTATION) applied to the
+;; class object is what comes back; the name is the fallback, which is where
+;; DEFCLASS put it. An anonymous class has no name and stops at the first.
+(defmethod documentation ((x class) (doc-type (eql 'type)))
+  (or (%get-doc x 'type)
+      (let ((name (class-name x)))
+        (and name (%get-doc name 'type)))))
+
+(defmethod documentation ((x class) (doc-type (eql t)))
+  (documentation x 'type))
 
 ;; --- (SETF DOCUMENTATION) methods ---
 
@@ -1496,7 +1515,7 @@ Also expands element types within compound type specifiers like (VECTOR etype si
       (remhash (%doc-key x t) *documentation-table*))
   new-value)
 
-;; (documentation <symbol> 't) — check function, then variable
+;; (documentation <symbol> 't): check function, then variable
 (defmethod documentation ((x symbol) (doc-type (eql t)))
   (%get-doc x t))
 
@@ -1548,7 +1567,7 @@ against existing methods and invalidates the dispatch cache (CLHS 7.6.4)."
                                 apo-indices lambda-list))))
 
 (defun ensure-generic-function (name &rest args)
-  ;; Odd number of keyword args → program-error
+  ;; Odd number of keyword args -> program-error
   (when (oddp (length args))
     (error 'program-error))
   (let ((lambda-list-p nil)
@@ -1564,7 +1583,7 @@ against existing methods and invalidates the dispatch cache (CLHS 7.6.4)."
         ((eq (car rest) :argument-precedence-order)
          (setf apo-params (cadr rest) apo-p t))))
     ;; If already fbound: must be a GF; apply lambda-list / precedence updates
-    ;; in place (CLHS — ensure-generic-function reinitializes the existing GF).
+    ;; in place (CLHS: ensure-generic-function reinitializes the existing GF).
     (if (fboundp name)
         (let ((fn (fdefinition name)))
           (unless (typep fn 'generic-function) (error 'program-error))
@@ -1679,16 +1698,16 @@ DOTNET-VALID-TYPED-LOCALS), an alist (name-string . type-string)."
              (and ty (cons ty x))))
       (and (consp x)
            (cond
-             ;; (dotnet:box E "T") — literal type in 3rd position
+             ;; (dotnet:box E "T"): literal type in 3rd position
              ((and (%dotnet-in-pkg (car x) "BOX")
                    (consp (cdr x)) (consp (cddr x)) (null (cdddr x))
                    (stringp (caddr x)))
               (cons (caddr x) x))
-             ;; (dotnet:new "T" ...) — literal type in 2nd position
+             ;; (dotnet:new "T" ...): literal type in 2nd position
              ((and (%dotnet-in-pkg (car x) "NEW")
                    (consp (cdr x)) (stringp (cadr x)))
               (cons (cadr x) x))
-             ;; (dotnet:invoke R "M" ...) — typed-return propagation
+             ;; (dotnet:invoke R "M" ...): typed-return propagation
              ((%dotnet-in-pkg (car x) "INVOKE")
               (let ((rty (%dotnet-invoke-return-type x env)))
                 (and rty (cons rty x))))
@@ -1697,7 +1716,7 @@ DOTNET-VALID-TYPED-LOCALS), an alist (name-string . type-string)."
 (defun %dotnet-invoke-return-type (x env)
   "If X is (dotnet:invoke R \"M\" ARG...) with a statically typed receiver R and
 fully statically typed arguments, and M's resolved return type is directable
-(marshals to a LispDotNetObject — see runtime %DOTNET-METHOD-RETURN-TYPE), return
+(marshals to a LispDotNetObject; see runtime %DOTNET-METHOD-RETURN-TYPE), return
 that return-type string; else NIL. Mutually recursive with %DOTNET-STATIC-TYPE so
 chains of any depth resolve. The inner call need not itself lower to a direct
 callvirt: both the direct and the dynamic path return a LispDotNetObject of the
@@ -1743,7 +1762,7 @@ overload), so this never changes behaviour, only speed."
     (let ((sym (find-symbol "INVOKE" pkg)))
       (when sym (%register-compiler-macro-rt sym #'%dotnet-invoke-direct-cm)))))
 
-;;; dotnet:handler-bind — handler-bind that dispatches on specific .NET exception
+;;; dotnet:handler-bind: handler-bind that dispatches on specific .NET exception
 ;;; types (dotcl/dotcl#45). Each clause is ("Type.Name" (var) body...). When a
 ;;; condition wraps a raw .NET exception whose CLR type is the named type or a
 ;;; subtype (dotnet:exception-typep), the matching clause runs; the clause body is
@@ -1751,8 +1770,8 @@ overload), so this never changes behaviour, only speed."
 ;;; Non-matching / non-.NET conditions propagate.
 ;;;
 ;;; Registered at load time via find-package/intern (no literal dotnet: prefix) so
-;;; the SBCL cross-compile host — which has no DOTNET package and would otherwise
-;;; read-suppress a #+dotcl form right out of the core — compiles it fine; it runs
+;;; the SBCL cross-compile host, which has no DOTNET package and would otherwise
+;;; read-suppress a #+dotcl form right out of the core, compiles it fine; it runs
 ;;; when the built core loads and DOTNET exists. The resolved exception-typep symbol
 ;;; is spliced into the expansion, so the macro body needs no dotnet: literal either.
 (let ((pkg (find-package "DOTNET")))
@@ -1776,15 +1795,15 @@ overload), so this never changes behaviour, only speed."
                                                        ,@(cddr cl))))))))
                      ,@body))))))))
 
-;;; dotnet:-> — a left-to-right member chain, so nested interop reads in call order:
+;;; dotnet:->: a left-to-right member chain, so nested interop reads in call order:
 ;;;   (dotnet:-> uri "Host" ("Substring" 0 7) "ToUpper")
 ;;; instead of the inside-out
 ;;;   (dotnet:invoke (dotnet:invoke (dotnet:invoke uri "Host") "Substring" 0 7) "ToUpper")
 ;;; A step is a member name, or (member-name arg...) to pass arguments. Property and
-;;; field reads need no getter prefix — dotnet:invoke resolves those too — and the
+;;; field reads need no getter prefix, dotnet:invoke resolves those too, and the
 ;;; whole chain is a place: (setf (dotnet:-> sb "Capacity") 64).
 ;;;
-;;; dotnet:doto — apply several members to ONE object and return it:
+;;; dotnet:doto: apply several members to ONE object and return it:
 ;;;   (dotnet:doto sb ("Append" "a") ("Append" "b"))
 ;;;
 ;;; Member names are strings because the Lisp reader upcases bare symbols while .NET
@@ -2035,20 +2054,20 @@ and symbol-macro scope is used as the starting point."
 
 ;;; --- xref (who-calls) runtime tables ---
 ;;;
-;;; The compiler records CALLER→CALLEE edges while compiling each named
+;;; The compiler records CALLER->CALLEE edges while compiling each named
 ;;; function and plants a load-time (dotcl:%xref-note caller callees) call in
 ;;; the compiled output. The tables live here; registration replaces the
 ;;; caller's whole edge set, so redefinition / fasl reload drops stale edges
-;;; naturally. Keys are function names: symbols or (setf sym) lists — hence
+;;; naturally. Keys are function names: symbols or (setf sym) lists; hence
 ;;; EQUAL tables (equal on interned symbols is identity).
 ;;; DOTCL-package names are interned at load time, not written with dotcl:
 ;;; reader syntax, because the SBCL cross-compile host has no DOTCL package.
 
 (defvar *xref-callee-table* (make-hash-table :test 'equal)
-  "caller name → list of callee names (compile-order).")
+  "caller name -> list of callee names (compile-order).")
 
 (defvar *xref-caller-table* (make-hash-table :test 'equal)
-  "callee name → list of caller names.")
+  "callee name -> list of caller names.")
 
 (defvar *xref-lock* (%make-lock "dotcl-xref"))
 

@@ -13,12 +13,24 @@ on:
     # Nightly full ANSI + bench (03:00 JST = 18:00 UTC).
     - cron: '0 18 * * *'
 
-# Cancel superseded in-flight runs per ref so a burst of pushes doesn't each
-# spawn a full ~15-min run; only the tip finishes (no coverage loss on the
-# landed commit).
+# Two different policies, because the two kinds of ref want opposite things.
+#
+# Branches and pull requests: cancel the superseded runs. A burst of pushes
+# should not each spawn a full ~29-min run, and verifying a commit that has
+# already been rewritten buys nothing -- only the tip needs to be green.
+#
+# master: never cancel; queue instead. Every commit that lands has to be
+# verified on its own, because when master goes red the bisect is done by hand:
+# a cancelled run leaves a commit that is neither known-good nor known-bad, and
+# a stretch of those turns a one-commit search into a manual re-run of each.
+# On 2026-09-14 eleven pushes landed in six hours; three runs finished and the
+# other eight commits proved nothing. Putting the sha in the group key gives
+# every master run a group of its own, so they line up behind each other
+# instead of killing each other. One runner at ~29 min absorbs eleven pushes a
+# day, so the cost is that the answer arrives late -- not that it never comes.
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.ref == 'refs/heads/master' && format('ci-{0}-{1}', github.ref, github.sha) || format('ci-{0}', github.ref) }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
 
 defaults:
   run:
@@ -30,11 +42,57 @@ jobs:
     # ubuntu-latest where it is unset. Keep the fallback: a repository without
     # the variable must still build on GitHub-hosted runners.
     runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
-    timeout-minutes: 45
-    # Full ANSI + bench runs on every push to dotcl/dotcl and on the nightly
-    # schedule; other pushes run only the cheap gates below.
+    # 30 -> 45 -> 60 -> 90. A job that dies at the ceiling reports as a failure
+    # of whatever step happened to be running, which is the least informative
+    # red there is, so the ceiling has to stay well clear of the measurements:
+    #
+    #   push     ~24 min  (regression 245s + interpreter 161s + emit-free ~550s
+    #                      is two thirds of it), ~29 with the gates below ungated
+    #   nightly  ~41 min  measured 2026-09-13, and that was BEFORE the pack path
+    #                     (~5 min) was added below
+    #
+    # The nightly is what forced 60: at 45 the next one would have been decided
+    # by the ceiling rather than by a result. It then happened anyway. Four
+    # nightlies in a row (09-16 through 09-19) were cancelled at exactly 60,
+    # always inside ANSI, so the ANSI gate, the ansi-state.json update and the
+    # benchmarks did not run for four days and nobody noticed: a ceiling is a
+    # wall, and a wall says nothing until you are through it.
+    #
+    # What grew between 09-13 and 09-18, measured step by step:
+    #
+    #   Pack path (nightly)                 0.0 -> 10.5 min
+    #   Regression tests (emit-free build)  7.3 -> 15.7 min
+    #
+    # The pack path is not a regression: it exited immediately on `unknown
+    # option` until `dotcl pack` itself was fixed, so this is the first time it has
+    # really run. The emit-free doubling is unexplained -- the corpus grew 11%
+    # over the same days, not 115% -- and is tracked separately.
+    #
+    # ANSI is not the cause: 9.6 min on 09-13, 9.7 on 09-18. The 09-18 nightly
+    # spent 60.5 min and was cut 9.7 min into ANSI; finishing ANSI plus the
+    # benchmarks (1.9 min) puts a full nightly near 73. 90 leaves room for the
+    # emit-free investigation to land either way.
+    #
+    # Execution time is steady -- 36-39 min per push job across the period. The
+    # spread in `gh run list` (39 to 128 min) is queue time on a single runner,
+    # which this ceiling does not govern.
+    timeout-minutes: 90
+    # RUN_FULL now means one thing: the steps that cost ten minutes or more
+    # (ANSI and the benchmarks). It used to gate seven cheap gates as well, so
+    # those ran only on the public mirror and the nightly -- never on an
+    # internal push, never on a fork PR, which is where they were most needed.
+    # A gate that runs on one repository is not a gate.
+    #
+    # Anything else that is nightly-only says so directly with
+    # `github.event_name == 'schedule'` (the pack path, and the nuspec check
+    # that consumes what it produces).
     env:
       RUN_FULL: ${{ github.repository == 'dotcl/dotcl' || github.event_name == 'schedule' }}
+      # Read by the test/*/check.sh scripts. Each of them SKIPs (exit 0) when a
+      # prerequisite is missing, which keeps them pleasant to run by hand on a
+      # fresh clone -- and makes them useless here, because a skip and a pass
+      # look identical in the step list. With this set, a skip is a failure.
+      DOTCL_CI: "1"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -46,6 +104,17 @@ jobs:
           echo "=== CPU ===" && lscpu | grep -E 'Model name|^CPU\(s\)|Thread'
           echo "=== Memory ===" && free -h
           echo "=== Disk ===" && df -h /
+          # Arm the measurement the last step of this job reports. memory.peak
+          # is a high-water mark that lives as long as the cgroup does, and the
+          # runner is a long-lived service rather than a fresh container, so
+          # without this reset the number would be the largest any job on this
+          # machine ever reached. Resetting it by writing is a kernel >= 6.8
+          # feature; when the write is refused nothing changes here and the
+          # reporting step prints the ancestors' figures instead.
+          cg=$(awk -F: '$1 == "0" { print $3 }' /proc/self/cgroup 2>/dev/null || true)
+          echo 0 > "/sys/fs/cgroup${cg}/memory.peak" 2>/dev/null \
+            && echo "=== memory.peak reset: yes ===" \
+            || echo "=== memory.peak reset: no (kernel < 6.8, or not writable) ==="
 
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
@@ -91,7 +160,7 @@ jobs:
 
       # The other half of the same property: can a RELEASED dotcl build this
       # tree? selfhost-check only proves the tree reproduces itself, which stays
-      # true even if the last released version can no longer be used as a seed —
+      # true even if the last released version can no longer be used as a seed;
       # and that is what decides whether the build chain can drop its Common Lisp
       # host. It broke silently once already: 0.1.24 built a core that then died
       # with "Undefined function: KEY", found by hand months later. ~1 min,
@@ -111,7 +180,7 @@ jobs:
 
       # The same suite with EVAL routed through the emit-free tree-walk
       # interpreter. That interpreter is the ONLY evaluator on the netstandard2.0
-      # build below, which CI merely COMPILES — so until this step it had never
+      # build below, which CI merely COMPILES: so until this step it had never
       # been executed here at all, and it was broken: interpreted DEFPACKAGE
       # signalled "Undefined function: %MAKE-PACKAGE", multi-threaded EVAL
       # deadlocked, and an unmatched THROW killed the process outright.
@@ -149,7 +218,7 @@ jobs:
           make ilverify
 
       # ilverify asks whether the IL is valid; this asks whether the assembly has
-      # a loadable SHAPE — no method too large to JIT cheaply, no type near the
+      # a loadable SHAPE: no method too large to JIT cheaply, no type near the
       # field limit, no oversized #US heap. Those bounds have been crossed four
       # times, and every time the compile side looked healthy (total IL, fasl
       # bytes and compile time all flat) while LOAD failed with a diagnostic that
@@ -158,7 +227,7 @@ jobs:
       - name: Check fasl shape
         run: make test-fasl-shape
 
-      # The only test that actually builds projects the way a user does — a Lisp
+      # The only test that actually builds projects the way a user does; a Lisp
       # library consumed by a plain C# app and by a dotcl app, through MSBuild.
       # Everything above tests the compiler and the runtime; this tests the
       # shipping path, and it was red for an unknown length of time because
@@ -166,7 +235,6 @@ jobs:
       # somewhere else in the tree instead of the project's own sources. ~2 min.
       # Needs the fasl core, which the target builds if absent.
       - name: Project composition (MSBuild consumers)
-        if: env.RUN_FULL == 'true'
         run: make compile-core-fasl test-project-compose
 
       # The gates below were in the Makefile but in no workflow. That is not a
@@ -174,7 +242,11 @@ jobs:
       # of 17 test targets wired, and the very first unwired one run by hand was
       # RED -- with-standard-io-syntax had been bent away from CLHS to keep an
       # ANSI test green, and the test that says so had never executed here.
-      # Together they add ~3 min to a ~15 min run.
+      #
+      # Measured on the nightly of 2026-09-13, they cost 5m34s together
+      # (project-compose 1m54 incl. compile-core-fasl, save-class-lib 1m35,
+      # project-core-build 59s, core-bytes 30s, debug-pdb 23s, host-api 13s).
+      # That is the whole price of running them on every push.
 
       # CLHS-audit tests for behaviour ansi-test does not reach (the
       # with-standard-io-syntax variable table, pprint dispatch, read-sequence
@@ -193,35 +265,30 @@ jobs:
       # PlatformNotSupportedException. Builds and runs a real C# host in both
       # configurations. ~20s.
       - name: Embedding API (C# host)
-        if: env.RUN_FULL == 'true'
         run: make test-host-api
 
       # Booting from a core held in memory -- the only way in for a host with no
       # filesystem, and the only way in at all for the emit-free runtime. ~25s.
       - name: In-memory core boot
-        if: env.RUN_FULL == 'true'
         run: make test-core-bytes
+
+      # What a script run does with an error nothing handled: exit code, and
+      # whether the forms after it ran. Process-level, so no regression test in
+      # the image can see it. ~15s.
+      - name: Script exit codes
+        run: make test-cli-exit
 
       # dotcl emits a .NET class library that a separate C# project references at
       # COMPILE time (interface implemented on the C# side, delegate invoked).
       # Nothing else here compiles C# against dotcl-emitted metadata. ~70s.
       - name: save-class-library (C# consumes emitted metadata)
-        if: env.RUN_FULL == 'true'
         run: make test-save-class-lib
 
       # DOTCL_EMIT_PDB: the .lisp must appear in the PDB with sequence points and
       # named locals, which is what makes the VS / VS Code debugger show Lisp
       # source and Locals. ~20s.
       - name: Debug info (PDB)
-        if: env.RUN_FULL == 'true'
         run: make test-debug-pdb
-
-      # `make pack` builds the nuspec from the project; this asserts the field
-      # rules (donor fields dropped when unsupplied, required fields refused
-      # rather than inherited) without publishing anything. ~20s.
-      - name: Pack nuspec rules
-        if: env.RUN_FULL == 'true'
-        run: make test-pack-nuspec
 
       # The other half of the MSBuild story: the step above builds with the legacy
       # targets (external process), this one with the ProjectCore targets driving
@@ -231,8 +298,58 @@ jobs:
       # the first wall a new user hits, and the remedy is a build property they
       # have no reason to know about. ~90s.
       - name: Project-core MSBuild tasks
-        if: env.RUN_FULL == 'true'
         run: make test-project-core-build
+
+      # -- Walk the release pack path without a tag -------------------------
+      # release.yml runs `make pack` only on a tag push, so a break anywhere in
+      # the packaging chain (a renamed R2R artifact, a csproj glob, a dropped
+      # staging step) surfaced for the first time AFTER the tag was already
+      # pushed, forcing a re-tag. v0.1.28 was cut twice for exactly that.
+      #
+      # One RID walks the whole chain: crossgen2, the runtime/ staging, both
+      # packs and the cleanup afterwards. ~5 min, which is why this is schedule
+      # only -- RUN_FULL would also fire it on every push to the public mirror.
+      # The two `test -f` lines are the point: a pack that exits 0 without
+      # producing the base pointer or the per-RID package is the failure mode
+      # that reaches a release.
+      #
+      # The version is throwaway but not arbitrary: `dotcl pack` refuses a --from
+      # payload older than the first release whose runtime loads a loose user
+      # fasl (PackRestamp.LoaderFloor), and it reads that off the version string,
+      # so a 0.0.0 donor is refused however new the bits actually are. The step
+      # below packs from this one.
+      - name: Pack path (nightly, one RID)
+        if: github.event_name == 'schedule'
+        run: |
+          make pack \
+            R2R_RIDS=linux-x64 \
+            PACK_VERSION=0.1.99-nightly \
+            PACK_ARGS=-p:DotclToolNoAndroid=true
+          test -f out/dotcl.0.1.99-nightly.nupkg
+          test -f out/dotcl.linux-x64.0.1.99-nightly.nupkg
+          ls -l out/*0.1.99-nightly*.nupkg
+
+      # `make pack` builds the nuspec from the project; this asserts the field
+      # rules (donor fields dropped when unsupplied, required fields refused
+      # rather than inherited) without publishing anything. ~20s.
+      #
+      # It needs a directory of published dotcl packages to restamp, and its
+      # check.sh SKIPs when there is none -- which is what it did in EVERY run
+      # it was ever enabled for: it sat above the step that produces them, so
+      # `out/` was always empty and the step finished in 4 seconds wearing a
+      # passing face. It now runs directly after the pack above, on the same
+      # nightly condition, using those packages as the donor. That is also why
+      # it is not one of the every-push gates: the donor costs ~5 min to make.
+      - name: Pack nuspec rules (nightly; donor = the packages above)
+        if: github.event_name == 'schedule'
+        run: make test-pack-nuspec
+
+      # Cleanup is its own step so it also runs when the two above fail: `out/`
+      # and the staged runtime/contrib are hundreds of MB on a runner that keeps
+      # its disk between runs.
+      - name: Clean up pack artifacts
+        if: ${{ always() && github.event_name == 'schedule' }}
+        run: rm -rf out runtime/contrib
 
       # Fetching ansi-test is its own step so a failure there is reported as
       # what it is. It used to be a prerequisite of the run below, whose `|| true`
@@ -243,9 +360,13 @@ jobs:
         if: env.RUN_FULL == 'true'
         run: make setup-ansi-test
 
+      # No `|| true`: the suite's own result is judged by the gate below (a known
+      # failure must not fail this step), but everything else this command can
+      # fail for -- the build, a missing runtime, the clone -- was being swallowed
+      # too, which is how the run stayed green while reporting nothing.
       - name: ANSI tests
         if: env.RUN_FULL == 'true'
-        run: make test-ansi-all STDBUF="stdbuf -oL" 2>&1 | tee /tmp/ansi-summary.txt || true
+        run: make test-ansi-all STDBUF="stdbuf -oL" 2>&1 | tee /tmp/ansi-summary.txt
 
       - name: Generate failure details
         if: ${{ always() && env.RUN_FULL == 'true' }}
@@ -265,13 +386,23 @@ jobs:
             /tmp/ansi-failures.txt
             /tmp/ansi-summary.txt
 
+      # The gate: the set of failing test names must be the set ansi-state.json
+      # records. Not a count -- ansi-test is an upstream clone whose total moves
+      # on its own, so a real regression can arrive in a run whose count is
+      # unchanged. Runs after the outputs are uploaded (so a red is diagnosable
+      # from the artifact) and BEFORE the state file is regenerated below, which
+      # would otherwise rewrite the very record being checked.
+      - name: ANSI gate
+        if: env.RUN_FULL == 'true'
+        run: make test-ansi-gate
+
       - name: Update ansi-state.json
         if: env.RUN_FULL == 'true'
         run: make update-ansi-state
 
       # A tree without bench/run.lisp gives this step no inputs, and it used to
       # run anyway on RUN_FULL alone and fail every time, kept green by the
-      # `|| true` — a step that could never succeed, wearing a passing face.
+      # `|| true`: a step that could never succeed, wearing a passing face.
       # Gate on the file instead, so it runs exactly where it can work and is
       # honestly reported as skipped elsewhere.
       # The `|| true` stays on purpose: benchmarks are data collection, not a
@@ -279,6 +410,24 @@ jobs:
       - name: Benchmarks
         if: env.RUN_FULL == 'true' && hashFiles('bench/run.lisp') != ''
         run: make bench-state || true
+
+      # Unlike the step above, this one is a gate and has no `|| true`. It can
+      # be: it compares dotcl against a C# program in this repository, so there
+      # is no external toolchain to be missing, and the check itself is a
+      # comparison against recorded ratios in bench/ratio-baseline.json rather
+      # than against absolute times.
+      #
+      # It runs after `make bench-state` on purpose. bench-parity merges into
+      # the same bench-state.json, so running it second means the cl-bench rows
+      # are present and the median half of the check has something to work with.
+      #
+      # A platform with no recorded baseline is reported as unbaselined and
+      # passes, printing its measured ratios in the format the baseline file
+      # wants. That is how a new runner gets its first numbers: read them out
+      # of this step's log and commit them.
+      - name: Benchmark ratio gate
+        if: env.RUN_FULL == 'true' && hashFiles('bench/csharp-parity/kernels.lisp') != ''
+        run: make bench-parity
 
       - name: Disk usage (after)
         if: always()
@@ -296,11 +445,11 @@ jobs:
               # Keep only result + TOTAL lines, drop build noise. The `|| echo`
               # matters: this step runs under `set -e`, so a grep that matches
               # nothing (a run that produced no category lines at all) would fail
-              # the job here — pointing at the summary formatter instead of at
+              # the job here: pointing at the summary formatter instead of at
               # whatever actually went wrong upstream. Reporting must never
               # decide the colour of the run.
               grep -E '^(cons|strings|sequences|data-and-control-flow|hash-tables|symbols|arrays|types-and-classes|characters|pathnames|files|system-construction|iteration|eval-and-compile|conditions|printer|environment|structures|packages|objects|reader|numbers|streams|misc):|^TOTAL:|^GC TOTAL:' /tmp/ansi-summary.txt \
-                || echo '(no per-category lines — see the ANSI step output)'
+                || echo '(no per-category lines; see the ANSI step output)'
               echo '```'
               echo ''
             fi
@@ -332,3 +481,120 @@ jobs:
               echo "bench-state.json not generated"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
+
+      # What this job actually costs in memory, written to the step summary.
+      #
+      # Informational only, and deliberately incapable of failing the job: the
+      # body runs under `set +e` and the step ends with `exit 0`. Reporting must
+      # never decide the colour of a run, and a sizing measurement least of all.
+      #
+      # The question it answers: the push job (regression + interpreter +
+      # emit-free, two thirds of the wall clock) is the only thing that runs on
+      # every commit, while the nightly path peaks around 3.6 GB. If the push
+      # job fits well under 3 GB, a second small box can take the pushes and the
+      # bigger one can be kept for the nightly -- which is what turns a queue of
+      # master runs into two lanes. A week of these numbers decides it.
+      #
+      # memory.peak is the cgroup high-water mark, reset at the top of the job
+      # where the kernel allows it. Ancestors are printed unreset so the figure
+      # is still readable if the reset was refused, and /proc/self/cgroup is
+      # printed so it is clear which cgroup the number belongs to (the job's
+      # processes are children of a long-lived service, not of a container).
+      - name: Memory peak (informational)
+        if: always()
+        run: |
+          set +e
+          show_mem() {
+            for f in memory.peak memory.current memory.max \
+                     memory.max_usage_in_bytes memory.usage_in_bytes memory.limit_in_bytes; do
+              [ -r "$1/$f" ] && echo "$1/$f = $(cat "$1/$f")"
+            done
+          }
+          {
+            echo "## Job memory"
+            echo ""
+            echo '```'
+            echo "nproc: $(nproc)"
+            echo ""
+            echo "--- /proc/self/cgroup ---"
+            cat /proc/self/cgroup
+            echo ""
+            echo "--- cgroup memory (this cgroup first, then its ancestors) ---"
+            cg2=$(awk -F: '$1 == "0" { print $3 }' /proc/self/cgroup)
+            cg1=$(awk -F: '$2 ~ /(^|,)memory(,|$)/ { print $3; exit }' /proc/self/cgroup)
+            for base in "/sys/fs/cgroup${cg2}" ${cg1:+"/sys/fs/cgroup/memory${cg1}"}; do
+              d="$base"
+              while : ; do
+                case "$d" in /sys/fs/cgroup*) ;; *) break ;; esac
+                show_mem "$d"
+                nd=$(dirname "$d")
+                [ "$nd" = "$d" ] && break
+                d="$nd"
+              done
+            done
+            echo ""
+            echo "--- free -m ---"
+            free -m
+            echo ""
+            echo "--- /usr/bin/time ---"
+            if [ -x /usr/bin/time ]; then
+              echo "present (the three heavy steps can be wrapped in /usr/bin/time -v)"
+            else
+              echo "absent (apt-get install time) -- the cgroup figures above are the only route"
+            fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY" 2>&1
+          exit 0
+
+  # -- macOS, nightly only --------------------------------------------------
+  # macOS has had no CI at all, while release.yml packs osx-x64 and osx-arm64 on
+  # every tag: the platform ships without ever having run the suite. This is the
+  # smallest thing that changes that -- one regression run, nightly.
+  #
+  # Public repository only: GitHub-hosted macOS bills at 10x, Actions on a public
+  # repository are free and unmetered, and the mirror is where the osx packages
+  # are published anyway.
+
+
+  # continue-on-error because the SBCL bootstrap here is unproven: the Linux job
+  # gets its host Lisp from roswell's install-for-ci.sh, which this does not use.
+  # It must not be made a required check until it has been green for a while.
+  macos:
+    if: github.event_name == 'schedule' && github.repository == 'dotcl/dotcl'
+    runs-on: macos-latest
+    timeout-minutes: 40
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      # The Makefile's cross-compile host is `ros -L sbcl-bin run`, so what is
+      # needed is roswell plus an sbcl-bin it can select -- not a brew-installed
+      # sbcl, which that command line would not use.
+      - name: Setup Roswell
+        run: |
+          brew install roswell
+          ros install sbcl-bin
+          echo "$HOME/.roswell/bin" >> $GITHUB_PATH
+
+      - name: Cross-compile
+        run: make cross-compile
+
+      - name: Build
+        run: make build
+
+      # Same reason as in the Linux job: some regression tests load asdf.
+      - name: Compile asdf FASL (required by some regression tests)
+        run: make compile-asdf-fasl
+
+      # Deliberately just this one: the point is "does dotcl run on macOS at
+      # all", not a second copy of the whole Linux matrix.
+      - name: Regression tests
+        run: make test-regression

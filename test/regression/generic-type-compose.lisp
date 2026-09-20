@@ -4,8 +4,8 @@
 ;;; argument, so nested generics compose. Same for dotnet:static-generic's
 ;;; declaring type / type args and for dotnet:resolve-type (idempotent).
 ;;;
-;;; The expected AQNs are never spelled out here — they carry the runtime's
-;;; Version/PublicKeyToken — so each check compares a composed type against the
+;;; The expected AQNs are never spelled out here, they carry the runtime's
+;;; Version/PublicKeyToken, so each check compares a composed type against the
 ;;; same type resolved from a short AQN.
 
 (defparameter *gtc-inner*

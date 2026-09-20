@@ -12,7 +12,7 @@
        Skippable with <DisableImplicitDotCLRuntimeReference>true</...> for a
        consumer that wants to pin the runtime itself (mirrors the framework's
        DisableImplicitFrameworkReferences pattern). Without that flag, a consumer
-       must NOT also add <PackageReference DotCL.Runtime> — the SDK owns it. -->
+       must NOT also add <PackageReference DotCL.Runtime>; the SDK owns it. -->
   <ItemGroup Condition="'$(DisableImplicitDotCLRuntimeReference)' != 'true'">
     <PackageReference Include="DotCL.Runtime" Version="$(DotCLRuntimeVersion)" />
   </ItemGroup>
@@ -31,7 +31,7 @@
 
     Contract: DotclBuild runs once per build, after the .asd has been compiled to
     a fasl and the deployment manifest written (i.e. after _DotCLInjectAssets),
-    and only when <DotclProjectAsd> is set. It is intentionally empty — it exists
+    and only when <DotclProjectAsd> is set. It is intentionally empty; it exists
     solely as a stable name to schedule around. The public *input* contract is
     the non-underscore properties/items: DotclProjectAsd, DotclBaseCore, and the
     DotclAsdSearchPath / DotclBuildInit item groups.

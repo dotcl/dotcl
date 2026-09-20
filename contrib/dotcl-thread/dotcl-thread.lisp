@@ -1,4 +1,4 @@
-;;; dotcl-thread.lisp — Thread support for dotcl (bordeaux-threads compatible)
+;;; dotcl-thread.lisp: Thread support for dotcl (bordeaux-threads compatible)
 ;;;
 ;;; Usage: (require "dotcl-thread")
 ;;;

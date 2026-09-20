@@ -1,15 +1,15 @@
 # dotcl
 
 Common Lisp implementation on .NET. Lisp source is compiled to CIL
-(Common Intermediate Language) and runs on the .NET JIT — so the same
+(Common Intermediate Language) and runs on the .NET JIT, so the same
 Lisp image runs on Windows, macOS, and Linux across x86-64 and ARM64
 without per-platform porting work.
 
-**Broadly conforms to the ANSI Common Lisp standard** — verified
+**Broadly conforms to the ANSI Common Lisp standard**: verified
 against the
 [ansi-test suite](https://gitlab.common-lisp.net/ansi-test/ansi-test).
 
-**Try it without installing anything** — the
+**Try it without installing anything**: the
 [playground](https://dotcl.github.io/playground/) is dotcl compiled to
 WebAssembly, running in the browser tab you open it in. Nothing is sent
 anywhere; the Lisp runs on your machine.
@@ -22,8 +22,8 @@ anywhere; the Lisp runs on your machine.
 - **Writing .NET code in Lisp.** The `dotnet:` package gives direct
   access to .NET types: `(dotnet:new "System.Text.StringBuilder")`,
   `(dotnet:invoke sb "Append" "x")`, `(dotnet:static "System.Math" "Sin"
-  1.0)`. You can subclass .NET types from Lisp via `dotnet:define-class`
-  — the compiler emits real .NET classes, so frameworks like MAUI,
+  1.0)`. You can subclass .NET types from Lisp via `dotnet:define-class`;
+  the compiler emits real .NET classes, so frameworks like MAUI,
   ASP.NET Core, and MonoGame just see them as ordinary subclasses.
 - **Cross-platform CL with NuGet ecosystem access.** Any NuGet package
   is reachable from Lisp; any Quicklisp library that doesn't rely on
@@ -44,14 +44,21 @@ dotcl --eval "(format t \"hello, ~a~%\" (lisp-implementation-type))"
 
 # Run a file
 dotcl --load my-program.lisp
+
+# Or start from a project template and build an .exe
+dotnet new install DotCL.Templates && dotnet new dotcl-app -n hello
 ```
 
 For Roswell users, per-RID tarballs are also published on each
 [release page](https://github.com/dotcl/dotcl/releases).
 
+New to dotcl? [Getting started](docs/getting-started.md) takes it from here:
+install, project template, adding a library, and `dotnet publish` to a
+standalone executable.
+
 ### Prerequisites
 
-- **.NET SDK 10+** — see install table below
+- **.NET SDK 10+**: see install table below
 
 #### Installing .NET SDK 10
 
@@ -59,7 +66,7 @@ For Roswell users, per-RID tarballs are also published on each
 |----|---------|
 | macOS (Homebrew) | `brew install --cask dotnet-sdk` |
 | Ubuntu 24.04+ | `sudo apt install dotnet-sdk-10.0` |
-| Debian | add the Microsoft package repository, then `apt install dotnet-sdk-10.0` — see [official guide](https://learn.microsoft.com/dotnet/core/install/linux-debian) |
+| Debian | add the Microsoft package repository, then `apt install dotnet-sdk-10.0`; see [official guide](https://learn.microsoft.com/dotnet/core/install/linux-debian) |
 | Windows (winget) | `winget install Microsoft.DotNet.SDK.10` |
 | Windows (Scoop) | `scoop install dotnet-sdk` |
 | Cross-platform script | [`dotnet-install.sh` / `dotnet-install.ps1`](https://learn.microsoft.com/dotnet/core/tools/dotnet-install-script) |
@@ -81,35 +88,35 @@ make cross-compile` rebuilds the compiler using dotcl itself.
 
 #### Building on Windows
 
-You only need this if you are hacking on dotcl itself — to *use* dotcl,
+You only need this if you are hacking on dotcl itself; to *use* dotcl,
 install the `dotcl` tool or grab a per-RID tarball above; no `make` or
 Roswell required.
 
 To build from source on Windows:
 
-- **`make`** — the build needs GNU Make. Git Bash (bundled with
+- **`make`**: the build needs GNU Make. Git Bash (bundled with
   [Git for Windows](https://gitforwindows.org/)) ships GNU Make and works;
   run the commands above from a Git Bash prompt. WSL works too.
-- **Path translation** — run the build from Git Bash (`/c/...` paths) rather
+- **Path translation**: run the build from Git Bash (`/c/...` paths) rather
   than a shell that rewrites paths to Cygwin form (`/cygdrive/c/...`). The
   Roswell/SBCL bootstrap reads the paths verbatim, so `/cygdrive/...` paths
   it can't open surface as a `SB-INT:SIMPLE-FILE-ERROR` during
   `make cross-compile`.
-- **`dotcl` not found after `make install`** — `make install` registers
+- **`dotcl` not found after `make install`**: `make install` registers
   `dotcl` as a .NET global tool under `~/.dotnet/tools`, which is on `PATH`
   in PowerShell but often not in Git Bash. Add it there with
   `export PATH="$HOME/.dotnet/tools:$PATH"` (or run `dotcl` from PowerShell).
 
 ## A GUI in five minutes
 
-A cross-platform desktop window from one plain Lisp file — no C# project,
+A cross-platform desktop window from one plain Lisp file; no C# project,
 no csproj. `nuget` (bundled, dotcl 0.1.16+) resolves NuGet packages
 and their transitive dependencies at run time:
 
 ```lisp
-;;;; hello-gui.lisp — run with:  dotcl --load hello-gui.lisp
+;;;; hello-gui.lisp: run with:  dotcl --load hello-gui.lisp
 (require "dotnet-class")                         ; dotnet:define-class (ships with dotcl)
-(require "nuget")                          ; NuGet resolver (ships with dotcl)
+(require "dotcl-nuget")                          ; NuGet resolver (ships with dotcl)
 (nuget:require "Avalonia.Desktop" :version "12.0.4")
 (nuget:require "Avalonia.Themes.Fluent" :version "12.0.4")
 (dotnet:load-assembly "Avalonia.Desktop")
@@ -160,46 +167,60 @@ dotcl runs Lisp on a worker thread with a large stack, because deeply nested
 macro expansion needs one. The event loop is handed back to the process main
 thread with `dotcl:call-on-main-thread`, which is what macOS requires of any
 UI work. Windows and X11 do not care either way. `dotcl:call-on-main-thread`
-is newer than 0.1.25; on an older dotcl, drop the wrapper and the sample runs
+was added in 0.1.26; on an earlier dotcl, drop the wrapper and the sample runs
 as it stands everywhere except macOS.
 
 Note the Lisp side is
-ordinary object wiring — the same `dotnet:new` / `dotnet:invoke` /
+ordinary object wiring; the same `dotnet:new` / `dotnet:invoke` /
 `dotnet:add-event` calls work against WinForms, WPF, or any other .NET UI
 toolkit you have on hand.
 
 ## Showcase
 
-- **[paalam](https://github.com/dotcl/paalam)** — a NeeView-style
+- **[paalam](https://github.com/dotcl/paalam)**: a NeeView-style
   image / comic / PDF viewer (Avalonia). UI and application logic are
   Common Lisp end to end: CLOS protocol for page sources
   (folder / zip / rar / PDF), Lisp threads for prefetch, `dotnet:ffi`
   for PDFium text extraction, installers for Windows / macOS / Linux.
   Read it as the scaled-up version of the five-minute example above.
 
-- **[playa](https://github.com/dotcl/playa)** — an Emacs-style split-tiling
+- **[playa](https://github.com/dotcl/playa)**: an Emacs-style split-tiling
   video / music player (Avalonia + LibVLCSharp). Split the window into panes
   and play a different video in each, every pane with its own playlist,
-  volume and position. UI and application logic are Common Lisp end to end —
+  volume and position. UI and application logic are Common Lisp end to end;
   even the `Avalonia.Application` subclass is emitted from Lisp via
-  `dotnet:define-class` — with C# only for boot and the native input shims.
-  Lisp is ahead-of-time compiled at build time via project-core.
+  `dotnet:define-class`; with C# only for boot and the native input shims.
+  The Lisp is compiled ahead of time by the project's own `dotnet build`: an
+  in-process build step walks the `.asd` dependencies and writes a `.fasl` for
+  each, so the app that ships loads compiled assemblies, not sources.
 
 ## Samples
 
-Working integrations in `samples/`:
+Working integrations in [`samples/`](samples/); a .NET host embedding dotcl,
+or Lisp compiled ahead of time and shipped where nothing may be generated at
+run time:
 
-- **MauiLispDemo** — a .NET MAUI app (Windows + Android) where
-  `Application` / `ContentPage` / view model are all defined in Lisp
-  via `dotnet:define-class`.
-- **AspNetLispDemo** — ASP.NET Core controller written in Lisp, with
-  attribute routing.
-- **MonoGameLispDemo** — `Game` subclass in Lisp; the `Draw` override
-  runs on the MonoGame frame loop and animates the background colour.
-- **McpServerDemo** — Model Context Protocol server exposing a Lisp
-  REPL to MCP clients (Claude Desktop, etc.).
+- **[MauiLispDemo](samples/MauiLispDemo/)**: a .NET MAUI app (Windows +
+  Android) where `Application` / `ContentPage` / view model are all defined in
+  Lisp via `dotnet:define-class`.
+- **[AspNetLispDemo](samples/AspNetLispDemo/)**: ASP.NET Core controller
+  written in Lisp, with attribute routing.
+- **[MonoGameLispDemo](samples/MonoGameLispDemo/)**: `Game` subclass in Lisp;
+  the `Draw` override runs on the MonoGame frame loop and animates the
+  background colour.
+- **[McpServerDemo](samples/McpServerDemo/)**: Model Context Protocol server
+  exposing a Lisp REPL to MCP clients (Claude Desktop, etc.).
+- **[HotReloadDemo](samples/HotReloadDemo/)**: a running host re-loads a
+  `.lisp` file on every save, no restart.
+- **[PrecompiledLispDemo](samples/PrecompiledLispDemo/)**: precompiled Lisp
+  with run-time codegen switched off, on ordinary CoreCLR.
+- **[PrecompiledLispDemoAot](samples/PrecompiledLispDemoAot/)**: the same
+  inside a NativeAOT native binary, where `Reflection.Emit` does not exist.
+- **[PrecompiledLispDemoWebGL](samples/PrecompiledLispDemoWebGL/)**, and in a
+  browser, as a Unity IL2CPP WebGL build.
 
-Each sample's `README.md` walks through the boot pattern.
+[`samples/README.md`](samples/README.md) says what each one needs installed;
+each sample's own `README.md` walks through the boot pattern.
 
 ## Architecture
 

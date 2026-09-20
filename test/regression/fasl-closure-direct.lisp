@@ -4,7 +4,7 @@
 ;;; The fasl emitter used to give every closure body the args-array signature
 ;;; (object[] env, LispObject[] args), and _funcN can only be installed when the
 ;;; body's signature carries the arguments. So every call to a closure that came
-;;; from a compiled library allocated a LispObject[] — 32 bytes a call — and went
+;;; from a compiled library allocated a LispObject[], 32 bytes a call, and went
 ;;; through the slow args-array path, while the same source compiled in the
 ;;; session did not. Quickloaded libraries are all fasls, so this was the common
 ;;; case, not the rare one.

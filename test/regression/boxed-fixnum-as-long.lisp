@@ -3,7 +3,7 @@
 ;;; A local that is both mutated and captured by a closure lives in a
 ;;; LispObject[1] box cell. compile-as-long's declared-fixnum branch loaded the
 ;;; local's slot and emitted :unbox-fixnum directly, which casts the cell array
-;;; itself to Fixnum — a hard InvalidCastException at run time. Reached via
+;;; itself to Fixnum: a hard InvalidCastException at run time. Reached via
 ;;; e.g. (the fixnum (- j lo)) initializing a fixnum-declared local, where J is
 ;;; boxed: the arithmetic recursion of compile-as-long hit the bare local.
 ;;; (lparallel's psort granularity variants died this way: the plet closures
@@ -32,7 +32,7 @@
   :big)
 
 ;;; Mutation applied through the closure AFTER the fixnum-typed read was
-;;; compiled — both reads must see the current cell value.
+;;; compiled: both reads must see the current cell value.
 (deftest boxed-fixnum-as-long-reread
   (let ((i 0) (acc nil) (thunk nil))
     (declare (type fixnum i))

@@ -21,7 +21,7 @@
   (clos-area (make-instance 'clos-square :side 5))
   25)
 
-;;; Method combination — standard :around/:before/:after
+;;; Method combination: standard :around/:before/:after
 (defvar *clos-log* nil)
 (defgeneric clos-logged (x))
 (defclass clos-base-obj ())
@@ -44,7 +44,7 @@
 (defmethod clos-area ((s clos-child))
   (+ (call-next-method) 1))
 
-;;; Initarg validation — invalid initarg should error
+;;; Initarg validation: invalid initarg should error
 (deftest clos-invalid-initarg-error
   (signals-error (make-instance 'clos-point :z 99) error)
   t)
@@ -57,7 +57,7 @@
     (list (clos-person-name p) (clos-person-age p)))
   ("Alice" 30))
 
-;;; defstruct :read-only — accessor works
+;;; defstruct :read-only: accessor works
 (defstruct clos-ro-struct
   (value 0 :read-only t))
 
@@ -85,7 +85,7 @@
   "hello")
 
 (deftest clos-condition-invalid-initarg
-  ;; :no-such-slot is NOT a valid initarg — should signal an error
+  ;; :no-such-slot is NOT a valid initarg: should signal an error
   (signals-error (make-condition 'clos-test-condition :no-such-slot 42) error)
   t)
 
@@ -95,7 +95,7 @@
   ((val :initarg :val :accessor ri-val :initform 0)))
 
 (deftest clos-reinitialize-instance-invalid-initarg
-  ;; :no-such-key is not a valid initarg — should signal an error (no custom methods on this class)
+  ;; :no-such-key is not a valid initarg: should signal an error (no custom methods on this class)
   (signals-error (reinitialize-instance (make-instance 'clos-ri-obj) :no-such-key 42) error)
   t)
 
@@ -115,7 +115,7 @@
   (typep (make-instance 'typep-test-pa:widget) 'typep-test-pa:widget)
   t)
 
-;;; next-method-p fast path — funcall #'next-method-p must agree with
+;;; next-method-p fast path: funcall #'next-method-p must agree with
 ;;; compiled (next-method-p) even when an :around method for the same GF was
 ;;; dispatched previously (which set nmpSym.Function to a stale closure).
 
@@ -127,7 +127,7 @@
 (defmethod nmp-gf ((x nmp-base))
   (list (next-method-p) (funcall #'next-method-p)))
 
-;; :around + primary for nmp-derived — exercises InvokeWithNextMethods which
+;; :around + primary for nmp-derived: exercises InvokeWithNextMethods which
 ;; sets nmpSym.Function; after this dispatch nmpSym.Function must be restored
 (defmethod nmp-gf :around ((x nmp-derived))
   (call-next-method))
@@ -334,7 +334,7 @@
     (slot-value (make-instance 'i333-cb :a1 'y) 'a))
   y)
 
-;; class redefinition identity (CLHS ensure-class — redefine in place only
+;; class redefinition identity (CLHS ensure-class: redefine in place only
 ;; when the name is still the existing class's PROPER name). After clearing the
 ;; old class's proper name (setf class-name nil / find-class nil / rename), a
 ;; defclass under that name must produce a fresh, distinct class; an instance of
@@ -407,7 +407,7 @@
      (program-error () :prog-err))
    (handler-case (progn (i333-kw-gf2 1 :allow-other-keys nil
                                        :allow-other-keys t :bogus t) :no-error)
-     (program-error () :prog-err)))                              ; first aok nil → validate
+     (program-error () :prog-err)))                              ; first aok nil -> validate
   (:prog-err :prog-err))
 
 ;; slot-boundp on a missing slot must return a SINGLE generalized boolean
@@ -425,7 +425,7 @@
   (nil))
 
 ;; change-class must NOT overwrite an :allocation :class slot of the target
-;; class from the old instance — a shared slot keeps its existing class value
+;; class from the old instance: a shared slot keeps its existing class value
 ;; (CLHS 7.2.1). Here target slot a is class-allocated and was made unbound;
 ;; after change-class the (instance-allocated) old a=1 must not rebind it.
 ;; ANSI CHANGE-CLASS.3.2.
@@ -486,11 +486,11 @@
 
 ;;; Cross-package same-named classes must stay distinct even when one is
 ;;; forward-referenced by a subclass (FindOrForwardClass used to key the
-;;; placeholder by bare name → DOTCL-INTERNAL::SEQ, so a later same-named class
+;;; placeholder by bare name -> DOTCL-INTERNAL::SEQ, so a later same-named class
 ;;; in another package shadowed the earlier one; cl-ppcre::seq vs fset::seq).
 (defpackage :i408-pa (:use :cl))
 (defpackage :i408-pb (:use :cl))
-;; child references the (not-yet-defined) parent → parent is forward-referenced
+;; child references the (not-yet-defined) parent -> parent is forward-referenced
 (defclass i408-pa::child (i408-pa::node) ())
 (defclass i408-pa::node () ((aa :initarg :aa :accessor i408-pa::aa)))
 (defclass i408-pb::child (i408-pb::node) ())
@@ -607,7 +607,7 @@
   (nil nil))
 
 ;; EQL-only GF called with a non-matching value of the SAME class after the
-;; cache is warm → no-applicable-method error (hit-path guard).
+;; cache is warm -> no-applicable-method error (hit-path guard).
 (deftest eql-cache-no-applicable
   (progn
     (%eqlc-only :a)
@@ -639,7 +639,7 @@
         (%eqlc-inval 8))
   (:old :new :old))
 
-;; Multi-required-arg EQL GFs stay uncached — CLHS ordering where a class
+;; Multi-required-arg EQL GFs stay uncached: CLHS ordering where a class
 ;; method out-ranks an EQL method via the leftmost position must hold.
 (defgeneric %eqlc-two (x y))
 (defmethod %eqlc-two ((x integer) y) (list :int-first (when (next-method-p) (call-next-method))))
@@ -659,7 +659,7 @@
   (list (%clos-cospec (cons 1 2)) (%clos-cospec 99))
   (:cons-class-object :fallback))
 
-;;; dotnet:class-for-type — public lookup of the CLOS class dotcl registers for a
+;;; dotnet:class-for-type: public lookup of the CLOS class dotcl registers for a
 ;;; .NET type, so user code never hand-spells a specializer symbol (dotcl/dotcl#50).
 ;;; Returns a class object usable directly as a #. specializer.
 (deftest class-for-type-is-class
@@ -674,7 +674,7 @@
           (eq c (dotnet:class-for-type (dotnet:resolve-type "System.Text.StringBuilder")))))
   (t t t))
 
-;;; Closed generic — the motivating case: its auto-derived name is an ugly
+;;; Closed generic: the motivating case: its auto-derived name is an ugly
 ;;; assembly-qualified string, but class-for-type hands back the class directly.
 (deftest class-for-type-closed-generic
   (typep (dotnet:class-for-type
@@ -716,7 +716,7 @@
   (:int-list :other))
 
 ;;; ============================================================
-;;; N-way polymorphic dispatch cache — correctness across
+;;; N-way polymorphic dispatch cache: correctness across
 ;;; alternating argument classes (the old monomorphic cache only
 ;;; ever held one class key; the poly cache must still dispatch to
 ;;; the right method for each, and invalidate on defmethod).
@@ -912,7 +912,7 @@
   8)
 
 ;; One call site warmed on the base class, then hit with a subclass whose slot
-;; sits at a different index — must miss and refill, not read the stale index.
+;; sits at a different index: must miss and refill, not read the stale index.
 (defclass %ricb () ((a :initarg :a :accessor ricg)))
 (defclass %rics (%ricb) ((z :initarg :z) (a :initarg :a :accessor ricg)))
 (defun %ric-read (o) (ricg o))
@@ -1025,7 +1025,7 @@
   (2 (0 1 2)))
 
 ;; One write site warmed on the base class, then hit with a subclass whose slot
-;; sits at a different index — must miss and refill, not write the stale index.
+;; sits at a different index: must miss and refill, not write the stale index.
 (defclass %wicb () ((a :initarg :a :accessor wicg)))
 (defclass %wics (%wicb) ((z :initarg :z :initform 0) (a :initarg :a :accessor wicg)))
 (defun %wic-write (o v) (setf (wicg o) v))

@@ -17,7 +17,7 @@ public abstract class LispObject
 // class instead, so the VS Locals window shows the variable's value directly
 // (via DebuggerDisplay) rather than a one-element array. It is purely a
 // display/representation choice and is never mixed with LispObject[] boxes
-// within a single (debug) compilation. Not a LispObject — it holds one.
+// within a single (debug) compilation. Not a LispObject: it holds one.
 [System.Diagnostics.DebuggerDisplay("{Value}")]
 public sealed class LispBox
 {

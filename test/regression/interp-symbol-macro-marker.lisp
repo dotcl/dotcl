@@ -4,7 +4,7 @@
 ;;; symbol-macrolet binding and EVALUATES ITS SECOND ELEMENT AS A VARIABLE. That
 ;;; marker used to be the interned symbol DOTCL-INTERNAL::SYMBOL-MACRO.
 ;;;
-;;; The SIL loader materialises that symbol LAZILY — it appears in the package the
+;;; The SIL loader materialises that symbol LAZILY: it appears in the package the
 ;;; moment the interpreter first evaluates a SYMBOL-MACROLET. From then on
 ;;; DO-SYMBOLS / DO-ALL-SYMBOLS hand the interpreter's own sentinel back to user
 ;;; code, so any interpreted variable holding a list (the DOLIST variable walking
@@ -18,7 +18,7 @@
 ;;;
 ;;; The lazy interning is what made this look state-dependent and unreproducible:
 ;;; the same form passes until something, somewhere, interprets a SYMBOL-MACROLET.
-;;; The reported variable name changes between runs for the same reason — what
+;;; The reported variable name changes between runs for the same reason; what
 ;;; sits next to the marker depends on the package's symbol order.
 ;;;
 ;;; The fix makes the marker uninterned with MAKE-SYMBOL. It belongs to no

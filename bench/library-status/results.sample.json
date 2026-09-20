@@ -1,0 +1,20 @@
+[
+  {"system": "alexandria",
+   "release": "alexandria-20241012-git",
+   "status": "ok",
+   "issue": null,
+   "checked": "2026-09-14",
+   "note": "test suite run with fiveam"},
+  {"system": "cl-ppcre",
+   "release": "cl-ppcre-20250622-git",
+   "status": "load-only",
+   "issue": null,
+   "checked": "2026-09-14",
+   "note": ""},
+  {"system": "cffi",
+   "release": "cffi-20250622-git",
+   "status": "fail",
+   "issue": 53,
+   "checked": "2026-09-14",
+   "note": "example row -- not a measurement"}
+]

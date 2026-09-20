@@ -7,7 +7,7 @@ namespace DotCL.Emitter;
 /// Emit-side (System.Reflection.Emit) half of <see cref="CilAssembler"/>: walks an
 /// instruction list (S-expression data from the Lisp compiler) and translates each
 /// instruction to ILGenerator calls. Excluded from the netstandard2.0 build
-/// (Compile Remove in DotCL.Runtime.csproj) — an emit-free target can load and run
+/// (Compile Remove in DotCL.Runtime.csproj): an emit-free target can load and run
 /// precompiled .fasl images but cannot JIT new code. The emit-free
 /// registry/constant-pool/guards live in CilAssembler.cs.
 /// </summary>
@@ -19,27 +19,27 @@ public partial class CilAssembler
 
     /// <summary>The exact type the instruction just emitted left on the stack, when
     /// it is known. Set by the symbol loaders (whose runtime method returns Symbol)
-    /// and read by the next instruction only — a one-instruction lookback, not a
+    /// and read by the next instruction only: a one-instruction lookback, not a
     /// stack model. Lets a redundant castclass be dropped instead of emitted.</summary>
     private Type? _lastPushedType;
 
     // FASL mode: emit constants inline in IL instead of using constant pool
     internal bool _faslMode;
-    // TypeBuilder for FASL mode — used to define closure body methods
+    // TypeBuilder for FASL mode: used to define closure body methods
     internal TypeBuilder? _faslTypeBuilder;
     private static int _faslClosureCount;
 
     // Debug info: when non-null, a (:line SL SC EL EC) instruction records
     // (ILOffset, startLine, startCol, endLine, endCol) here so FaslAssembler can
     // emit sequence points spanning the exact source form. Deduped by (startLine,
-    // startCol) within a method. Null (the default) → (:line ...) is a no-op.
+    // startCol) within a method. Null (the default) -> (:line ...) is a no-op.
     internal List<(int offset, int sl, int sc, int el, int ec)>? _seqPoints;
     private (int sl, int sc) _lastSeqPos = (-1, -1);
 
     // Debug info: when non-null, a (:local-var LOCALNAME SOURCENAME) instruction
     // records (localSlotIndex, SOURCENAME) here so FaslAssembler can emit a PDB
     // LocalVariable row and the debugger's Locals window shows the source name.
-    // Null → the marker is a no-op. Only user lexicals are marked (the compiler
+    // Null -> the marker is a no-op. Only user lexicals are marked (the compiler
     // emits these only for non-temp, non-boxed, non-special bindings).
     internal List<(int index, string name)>? _localVars;
 
@@ -94,7 +94,7 @@ public partial class CilAssembler
     private static LispErrorException TooLargeError(int size) =>
         new LispErrorException(new LispProgramError(
             $"form too large to compile: it emits {size} bytes of CIL for a single method, " +
-            "exceeding the CLR's per-method size limit. Split it into smaller pieces — e.g. " +
+            "exceeding the CLR's per-method size limit. Split it into smaller pieces; e.g. " +
             "compile/eval statements individually or in chunks, or move sub-parts into their " +
             "own functions."));
 
@@ -118,9 +118,9 @@ public partial class CilAssembler
         if (holder.Count > 0) RegisterUnit(unitId, holder);
         var fn = (Func<LispObject>)dm.CreateDelegate(typeof(Func<LispObject>));
         // Runtime.Eval serializes COMPILATION on _evalLock (the compiler/assembler
-        // are not thread-safe), but the compiled form is now built — running it must
+        // are not thread-safe), but the compiled form is now built: running it must
         // NOT hold the lock: the form may block waiting on other threads (e.g. an
-        // lparallel `each` over APL execute `⍎`) that themselves need the lock to
+        // lparallel `each` over APL execute `execute`) that themselves need the lock to
         // compile, which deadlocks. Release the lock across the run and re-acquire
         // after, keeping the outer `lock` balanced. (Nested evals each release
         // at their own AssembleAndRunSingle, so the count is 1 here.)
@@ -283,12 +283,12 @@ public partial class CilAssembler
         };
         var fn = LispFunction.MakeDirectClosure(
             GetClosureDelegate(holder, dmIndex, delType), env, fnName);
-        // Pin the unit — same lifetime contract as MakeClosure.
+        // Pin the unit: same lifetime contract as MakeClosure.
         fn.RetainUnit = holder;
         return fn;
     }
 
-    // Emit IL that loads a unit-scoped constant and casts it to LispObject —
+    // Emit IL that loads a unit-scoped constant and casts it to LispObject;
     // the collectible counterpart of (ldc.i4 idx; call GetConstant). Used for
     // MAKE-FUNCTION lambda objects so a transient compile's lambda is reclaimed
     // with its unit instead of pinned in the global pool forever .
@@ -324,8 +324,8 @@ public partial class CilAssembler
     // Register the run-once function re-registration constant (defun / (setf NAME) /
     // function definitions emit IL that re-registers fn after fmakunbound at runtime)
     // in the collectible per-unit store when a unit is active, so redefining or
-    // fmakunbound-ing the name lets the old LispFunction — and the DynamicMethod JIT
-    // code behind it — collect instead of being pinned in the global _constants pool
+    // fmakunbound-ing the name lets the old LispFunction, and the DynamicMethod JIT
+    // code behind it, collect instead of being pinned in the global _constants pool
     // forever (the Coalton GB-working-set leak; the closure-DM fix moved only inner
     // lambdas, leaving top-level definition constants here). Falls back to the global
     // pool if no unit is active. If fn's body built closures into this unit, pin the
@@ -401,7 +401,7 @@ public partial class CilAssembler
                 }
             }
             // A string literal reaches the assembler as (:LDSTR s) (:NEWOBJ
-            // "LispString") — a .sil file is text, so it cannot carry the live
+            // "LispString"): a .sil file is text, so it cannot carry the live
             // object the way an in-process compile does. Taken literally that
             // builds a fresh LispString every time the expression is EVALUATED.
             // The literal is a constant (CLHS 3.7.1), so hoist it: one object per
@@ -461,7 +461,7 @@ public partial class CilAssembler
 
         // What the PREVIOUS instruction left on the stack, when we know it exactly.
         // Only the symbol loaders set it (they call a method whose return type is
-        // Symbol), and it survives exactly one instruction — long enough for the
+        // Symbol), and it survives exactly one instruction: long enough for the
         // CASTCLASS that almost always follows to notice it has nothing to do.
         var prevPushed = _lastPushedType;
         _lastPushedType = null;
@@ -515,6 +515,12 @@ public partial class CilAssembler
                 // Raw System.Decimal slot: box into a LispDecimal on the way into
                 // the frame, the same as the native float slots.
                 EmitFrameSetNative(GetString(Cadr(c)), GetSymbolName(Caddr(c)), "LispDecimal", true);
+                break;
+            case "FRAME-SET-CHAR":
+                // Raw character-code slot: rebuild the character so the debugger
+                // shows a character rather than the code.
+                EmitFrameSetNative(GetString(Cadr(c)), GetSymbolName(Caddr(c)), "LispChar.Make", false,
+                                   convI4: true);
                 break;
             case "SCOPE-BEGIN":
                 if (_localVars != null)
@@ -635,7 +641,7 @@ public partial class CilAssembler
                 break;
             case "UNBOX-FIXNUM":
                 // Expects LispObject on stack; leaves long value.
-                // Throws InvalidCastException if not a Fixnum — caller must
+                // Throws InvalidCastException if not a Fixnum: caller must
                 // guarantee this (e.g. via (the fixnum ...) declaration).
                 _il.Emit(OpCodes.Castclass, typeof(Fixnum));
                 _il.Emit(OpCodes.Call, _methodCache["Fixnum.get_Value"]);
@@ -648,7 +654,7 @@ public partial class CilAssembler
                 _il.Emit(OpCodes.Castclass, typeof(SingleFloat));
                 _il.Emit(OpCodes.Call, _methodCache["SingleFloat.get_Value"]);
                 break;
-            // LispDecimal → raw System.Decimal, and native decimal ops.
+            // LispDecimal -> raw System.Decimal, and native decimal ops.
             case "UNBOX-DECIMAL":
                 _il.Emit(OpCodes.Castclass, typeof(LispDecimal));
                 _il.Emit(OpCodes.Call, _methodCache["LispDecimal.get_Value"]);
@@ -724,6 +730,39 @@ public partial class CilAssembler
             case "CONST-STR-ARRAY":
                 EmitConstStringArray(Cadr(c));
                 break;
+            // Element access straight against a concrete buffer, for a local
+            // declared (simple-array <integer type> (*)). The CLR bounds-checks
+            // the access itself, so the index only has to be narrowed to i4.
+            case "LDELEM-I8":
+                _il.Emit(OpCodes.Ldelem_I8);
+                break;
+            case "LDELEM-I4":
+                _il.Emit(OpCodes.Ldelem_I4);
+                _il.Emit(OpCodes.Conv_I8);
+                break;
+            case "LDELEM-U2":
+                _il.Emit(OpCodes.Ldelem_U2);
+                _il.Emit(OpCodes.Conv_I8);
+                break;
+            case "LDELEM-U1":
+                _il.Emit(OpCodes.Ldelem_U1);
+                _il.Emit(OpCodes.Conv_I8);
+                break;
+            case "STELEM-I8":
+                _il.Emit(OpCodes.Stelem_I8);
+                break;
+            case "STELEM-I4":
+                _il.Emit(OpCodes.Conv_I4);
+                _il.Emit(OpCodes.Stelem_I4);
+                break;
+            case "STELEM-U2":
+                _il.Emit(OpCodes.Conv_U2);
+                _il.Emit(OpCodes.Stelem_I2);
+                break;
+            case "STELEM-U1":
+                _il.Emit(OpCodes.Conv_U1);
+                _il.Emit(OpCodes.Stelem_I1);
+                break;
             case "LDELEM-REF":
                 _il.Emit(OpCodes.Ldelem_Ref);
                 break;
@@ -741,6 +780,12 @@ public partial class CilAssembler
                 break;
             case "NEG":
                 _il.Emit(OpCodes.Neg);
+                break;
+            // Narrow an int64 subscript to a native int for ldelem/stelem. The
+            // CLR bounds-checks the native-int value, so an out-of-range
+            // subscript is still caught -- conv.i4 would wrap it first.
+            case "CONV-I":
+                _il.Emit(OpCodes.Conv_I);
                 break;
             case "CONV-I4":
                 _il.Emit(OpCodes.Conv_I4);
@@ -761,7 +806,7 @@ public partial class CilAssembler
             // stack and must leave 1 (handle) or 0 (keep unwinding); the handler
             // block that follows starts with the exception on the stack, as a catch
             // block does. Lets a tag-matching construct decline without catching and
-            // rethrowing — see ControlFlowFilters.
+            // rethrowing: see ControlFlowFilters.
             case "BEGIN-FILTER-BLOCK":
                 _il.BeginExceptFilterBlock();
                 break;
@@ -800,7 +845,7 @@ public partial class CilAssembler
                 _il.Emit(OpCodes.Ldstr, _faslMode ? Track(symName) : symName);
                 _il.Emit(OpCodes.Call, _methodCache["Startup.Sym"]);
                 // Startup.Sym returns Symbol, and a Symbol is usable wherever a
-                // LispObject is wanted, so the widening cast was never needed —
+                // LispObject is wanted, so the widening cast was never needed;
                 // and it forced the narrowing one that usually follows to be a
                 // second cast rather than a no-op.
                 _lastPushedType = typeof(Symbol);
@@ -846,7 +891,7 @@ public partial class CilAssembler
                     _il.Emit(OpCodes.Call, _symFnSiteResolve);
                 }
                 // Both arms leave a Symbol (SymFnSite.Resolve and Startup.SymFn
-                // both return one), so the widening cast was dead — and this is
+                // both return one), so the widening cast was dead: and this is
                 // the call-site path, so it was dead on every named call.
                 _lastPushedType = typeof(Symbol);
                 break;
@@ -883,7 +928,7 @@ public partial class CilAssembler
                 if (_faslMode)
                 {
                     // The global constant pool is not serialized into a .fasl, so bake
-                    // a fresh cell per call (correct — it just always misses and
+                    // a fresh cell per call (correct: it just always misses and
                     // re-resolves the accessor, i.e. no worse than a normal GF call).
                     _il.Emit(OpCodes.Ldstr, Track(ricName));
                     _il.Emit(OpCodes.Ldstr, Track(ricPkg));
@@ -894,7 +939,7 @@ public partial class CilAssembler
                 else
                 {
                     // JIT mode: one rooted cell in the constant pool per call site, so
-                    // the monomorphic (class → slot-index) fill persists across calls.
+                    // the monomorphic (class -> slot-index) fill persists across calls.
                     var cell = new ReaderCache(Startup.SymInPkg(ricName, ricPkg));
                     int idx = AddConstant(cell);
                     _il.Emit(OpCodes.Ldc_I4, idx);
@@ -1194,7 +1239,7 @@ public partial class CilAssembler
         }
 
         // Emit runtime code to re-register the function. This is needed when
-        // fmakunbound precedes defun in the same progn — the assembly-time
+        // fmakunbound precedes defun in the same progn: the assembly-time
         // registration above gets undone by fmakunbound at runtime, so we must
         // re-register after fmakunbound has executed.
         var fnc = AddReRegisterConstant(fn);
@@ -1332,7 +1377,7 @@ public partial class CilAssembler
             var fn = new LispFunction(del, fnName, paramCount);
 
             // Push the function onto the stack (unit-scoped so a dropped compile
-            // result is collectible — S5).
+            // result is collectible: S5).
             if (noFrame) fn.SuppressDebugFrame();
             PushUnitFunction(fn, before);
         }
@@ -1758,7 +1803,7 @@ public partial class CilAssembler
                     var (s, _) = pkg.Intern(name);
                     // Don't overwrite inherited CL-package symbol functions from other packages.
                     // e.g. SB-C uses CL, so (defun compile-file ...) in SB-C would
-                    // overwrite CL:COMPILE-FILE — protect the host's built-in functions.
+                    // overwrite CL:COMPILE-FILE: protect the host's built-in functions.
                     var homePkg = s.HomePackage;
                     isForeignCL = homePkg != null && homePkg != pkg
                         && homePkg.Name == "COMMON-LISP";
@@ -1776,7 +1821,7 @@ public partial class CilAssembler
         else if (name.StartsWith("(SETF ") && name.EndsWith(")"))
         {
             // (SETF NAME): register fn on the target NAME symbol's SetfFunction slot
-            // HandleDefun had this, but HandleDefunDirect was missing it — causing
+            // HandleDefun had this, but HandleDefunDirect was missing it: causing
             // (defun (setf foo) ...) to silently fail to register when use-direct=true.
             var targetName = name.Substring(6, name.Length - 7);
             try
@@ -1821,7 +1866,7 @@ public partial class CilAssembler
     // Build the LispFunction for a self-threaded direct function, arities 0-8.
     // directDm is the static method LispObject M(LispFunction self, LispObject p0...).
     // _funcN gets a closed delegate over fn (self bound) so a non-tail self-call
-    // (LispFunction.InvokeN → _funcN) reaches the receiver with no per-entry symbol
+    // (LispFunction.InvokeN -> _funcN) reaches the receiver with no per-entry symbol
     // lookup. The array wrapper is the slow apply/arity-mismatch fallback; it can't
     // capture fn at construction so it uses fnRef, assigned right after construction.
     private static LispFunction BuildSelfDirectFunction(DynamicMethod directDm, string name, int paramCount)
@@ -2104,8 +2149,8 @@ public partial class CilAssembler
         // Stack already has: object[] env (built by preceding instructions)
         // (:make-closure :param-count N :env-size M :env-map (...) :body (...)
         //                [:direct t :fn-name "NAME"])
-        // :direct marks a required-only (≤6 params) closure whose body reads
-        // params exclusively via :load-arg and omits the arity-check prefix —
+        // :direct marks a required-only (<=6 params) closure whose body reads
+        // params exclusively via :load-arg and omits the arity-check prefix;
         // eligible for the per-arity direct-delegate path.
         var plist = instr.Cdr;
         int paramCount = 0;
@@ -2136,7 +2181,7 @@ public partial class CilAssembler
         // Determine which env slots are boxed from env-map. "boxed" cells are
         // LispObject[1] (the normal representation, and labels function cells);
         // "lispbox" cells are the debug-only LispBox class (data variables under
-        // DOTCL_EMIT_PDB — see LispBox). They cast differently on load.
+        // DOTCL_EMIT_PDB: see LispBox). They cast differently on load.
         var boxedSlots = new HashSet<int>();
         var lispboxSlots = new HashSet<int>();
         if (envMap != null)
@@ -2167,7 +2212,7 @@ public partial class CilAssembler
             // A .fasl closure gets the same per-arity direct body the in-process
             // path gets. Emitting it on the args-array signature meant every call
             // to a closure defined in a compiled library went through the
-            // args-array wrapper — one LispObject[] allocated per call — because
+            // args-array wrapper, one LispObject[] allocated per call, because
             // _funcN can only be installed when the body's signature carries the
             // arguments. That is the whole difference between a closure a session
             // compiled and the same closure loaded from a .fasl.
@@ -2204,7 +2249,7 @@ public partial class CilAssembler
             innerAsm._faslStructMap = _faslStructMap;
             innerAsm._boxedEnvSlots = boxedSlots;
             innerAsm._lispboxEnvSlots = lispboxSlots;
-            // A :direct body reads its parameters as arguments (:load-arg i →
+            // A :direct body reads its parameters as arguments (:load-arg i ->
             // ldarg i+1) and omits the compiler's arity-check prefix, because the
             // delegate signature makes argc structural and MakeDirectClosure's
             // args-array wrapper runs the same Runtime.CheckArityExact. When the
@@ -2230,7 +2275,7 @@ public partial class CilAssembler
             _il.Emit(OpCodes.Ldloc, envLocal);
             if (faslDirect)
             {
-                // LispFunction.MakeDirectClosure(del, env, fnName) — the same
+                // LispFunction.MakeDirectClosure(del, env, fnName): the same
                 // factory MakeClosureDirect uses, which installs _funcN plus the
                 // arity-checking args-array wrapper. No RetainUnit here: the body
                 // lives in the loaded assembly, not in a collectible unit holder.
@@ -2254,7 +2299,7 @@ public partial class CilAssembler
             // LispObject a0..aN-1); :load-arg i maps to ldarg (i+1). The
             // compiler only marks :direct on required-only bodies that read
             // params exclusively via :load-arg (and omits the arity-check
-            // prefix — MakeDirectClosure's args-array wrapper performs it).
+            // prefix: MakeDirectClosure's args-array wrapper performs it).
             var paramTypes = new Type[paramCount + 1];
             paramTypes[0] = typeof(object[]);
             for (int i = 1; i < paramTypes.Length; i++) paramTypes[i] = typeof(LispObject);
@@ -2325,7 +2370,7 @@ public partial class CilAssembler
     private HashSet<int>? _boxedEnvSlots;
 
     // For closure body: which env slots hold debug-only LispBox cells (data
-    // variables under DOTCL_EMIT_PDB — see LispBox). Disjoint from _boxedEnvSlots.
+    // variables under DOTCL_EMIT_PDB: see LispBox). Disjoint from _boxedEnvSlots.
     private HashSet<int>? _lispboxEnvSlots;
 
     // For direct-params closure bodies: :load-arg i maps to ldarg (i+1)
@@ -2405,7 +2450,7 @@ public partial class CilAssembler
     // the stack: a typed object reference for reference types, or a managed pointer
     // to the unboxed value for value types (via `unbox`). For value types the
     // caller must prefix the call with `constrained. type` so both the value type's
-    // own methods and inherited virtuals (ToString, …) dispatch correctly.
+    // own methods and inherited virtuals (ToString, ...) dispatch correctly.
     private bool EmitDirectReceiver(LocalBuilder recv, Type type)
     {
         _il.Emit(OpCodes.Ldloc, recv);
@@ -2420,7 +2465,7 @@ public partial class CilAssembler
     // callvirt. Value-type receiver (this = managed pointer from `unbox`): a
     // virtual method (e.g. ToString) needs `constrained. type; callvirt`, while a
     // non-virtual one (most struct methods / property getters like get_Year) needs
-    // a plain `call` — constrained.callvirt on a non-virtual method misdispatches.
+    // a plain `call`: constrained.callvirt on a non-virtual method misdispatches.
     private void EmitTypedInstanceCall(MethodInfo method, bool valueRecv, Type type)
     {
         if (!valueRecv)
@@ -2457,7 +2502,7 @@ public partial class CilAssembler
     {
         // Stack on entry: [ receiver : LispObject ]. Direct dispatch for a
         // known-typed, zero-argument dotnet:invoke: unwrap the receiver to its
-        // static .NET type and callvirt the resolved method — no runtime member
+        // static .NET type and callvirt the resolved method: no runtime member
         // lookup / InvokeMember. Falls back to the dynamic path when the target
         // can't be resolved directly (see ResolveDirectTarget).
         var recvTmp = _il.DeclareLocal(typeof(LispObject));
@@ -2572,7 +2617,7 @@ public partial class CilAssembler
 
     /// <summary>A castclass to a type the value provably already has is dead work:
     /// the JIT still calls the cast helper unless it can prove otherwise, and this
-    /// pattern is everywhere — every (:load-sym "X") (:castclass "Symbol") pair.
+    /// pattern is everywhere: every (:load-sym "X") (:castclass "Symbol") pair.
     /// PREVPUSHED is the exact type the previous instruction left, when known.</summary>
     private void EmitCastclass(string name, Type? prevPushed = null)
     {
@@ -2752,7 +2797,7 @@ public partial class CilAssembler
         // Debug info collection (opt-in, shared across every body assembler for
         // this fasl). When non-null, top-level function bodies and nested
         // closures/lambdas append their DebugMethodInfo here; FaslAssembler creates
-        // it under DOTCL_EMIT_PDB and reads it at Save. Null → no debug info.
+        // it under DOTCL_EMIT_PDB and reads it at Save. Null -> no debug info.
         internal List<DebugMethodInfo>? DebugSink;
 
         // These are written by FaslAssembler, whose implementation needs .NET 9+.
@@ -2760,7 +2805,7 @@ public partial class CilAssembler
         // the code that reads them checks for that; CS0649 is reporting the shape,
         // not a bug.
 #pragma warning disable CS0649
-        // Per-FASL uninterned symbol deduplication: same Symbol object → same static field.
+        // Per-FASL uninterned symbol deduplication: same Symbol object -> same static field.
         // Set by FaslAssembler after construction.
         internal System.Reflection.Emit.TypeBuilder? UninternedTypeBuilder;
         internal System.Reflection.Emit.ILGenerator? UninternedInitIl;
@@ -2774,12 +2819,12 @@ public partial class CilAssembler
         // names neither the file nor the cause. The type initializer that fills
         // them is one method too, so its IL grows with every field and the JIT
         // pays for all of it at load. coalton's library/format bakes 114,451
-        // uninterned symbols into its literals — 1.8x the field cap.
+        // uninterned symbols into its literals: 1.8x the field cap.
         //
         // Roll the fields over onto fresh holder types before either limit
         // bites. Each holder fills its own fields from its own type
         // initializer, which the CLR runs before the first access to that
-        // holder — the same guarantee the single .cctor gave, now per holder
+        // holder: the same guarantee the single .cctor gave, now per holder
         // and lazily, so a file only pays for the literals it reaches.
         private const int MaxFieldsPerHolder = 4096;
 #pragma warning disable CS0649
@@ -2953,7 +2998,7 @@ public partial class CilAssembler
         /// <summary>
         /// Static field holding the call-site symbol cache for NAME (optionally
         /// qualified by its home PKG at compile time). Without it, FASL code
-        /// resolves the callee through Startup.SymFn on every call — a string
+        /// resolves the callee through Startup.SymFn on every call: a string
         /// concatenation and a dictionary probe per call, which measured as
         /// ~57 ns more per call than the JIT path's constant-pool cell.
         /// </summary>
@@ -3163,7 +3208,7 @@ public partial class CilAssembler
         // FaslAssembler emits pre-interning calls for them at the end of ModuleInit
         // so that a symbol reachable only from a constant that has not run yet
         // (e.g. one appearing solely inside a macro's backquote template) still
-        // exists in its package right after the fasl is loaded — SBCL interns the
+        // exists in its package right after the fasl is loaded: SBCL interns the
         // whole constant pool at load time, and defpackage :import-from in a later
         // file relies on that.
         private readonly HashSet<(string Name, string Package)> _preinternSymbols = new();
@@ -3259,7 +3304,7 @@ public partial class CilAssembler
         {
         // Budget exhausted for this method: continue this literal in its own
         // helper method (which starts with a fresh budget). Only aggregates are
-        // worth a method — spilling an atom would cost more IL than it saves.
+        // worth a method: spilling an atom would cost more IL than it saves.
         // No recursion risk: the helper's own budget starts at zero, so the very
         // value that triggered the spill is emitted inline there.
         if (_faslMode && _faslTypeBuilder != null
@@ -3270,11 +3315,11 @@ public partial class CilAssembler
         }
         _constNodes++;
         // A circular constant literal (e.g. '#1=(1 2 3 . #1#)) cannot be rebuilt by
-        // the naive cons-by-cons inline emitter — the cdr-flatten loop spins on the
+        // the naive cons-by-cons inline emitter: the cdr-flatten loop spins on the
         // cycle and OOMs. Shared (acyclic but #N=-coalesced) structure rebuilds but
         // loses EQ identity, since inline duplicates each occurrence. Both are fixed
         // by emitting a load-time (read-from-string "<*print-circle* repr>"), which
-        // reconstructs the graph — sharing and cycles — exactly. (The non-FASL path
+        // reconstructs the graph, sharing and cycles, exactly. (The non-FASL path
         // stores the live object in the constant pool, so it never hit this.)
         // cl-store circ.*/correct.list tests.
         if (_inlineDepth == 1)
@@ -3302,8 +3347,8 @@ public partial class CilAssembler
             // EQ identity across occurrences but reconstructs equal values.
 
             // A large ordinary literal goes the same way, for size rather than
-            // correctness. Building it inline emits IL proportional to the graph
-            // — roughly 25 bytes a node — and that IL is JITted at load to be run
+            // correctness. Building it inline emits IL proportional to the graph;
+            // roughly 25 bytes a node: and that IL is JITted at load to be run
             // exactly once. Measured on a literal-heavy fasl: 97% of load time is
             // JIT, and the memory it commits for that code is several times the
             // data the literal produces. As text it is data, and reading is work
@@ -3325,11 +3370,11 @@ public partial class CilAssembler
                 // FASL: continue in a helper method instead. The constant pool is
                 // process-local, so a fasl that reaches into it picks up whatever
                 // unrelated object sits at that index in the loading process (or
-                // indexes past the pool) — silent corruption of the literal.
+                // indexes past the pool): silent corruption of the literal.
                 EmitFaslDeepConstant(val);
                 return;
             }
-            // Too deep — fallback to constant pool (same process only)
+            // Too deep: fallback to constant pool (same process only)
             int idx2 = AddConstant(val);
             _il.Emit(OpCodes.Ldc_I4, idx2);
             _il.Emit(OpCodes.Call, _getConstant);
@@ -3388,7 +3433,7 @@ public partial class CilAssembler
                 {
                     // FASL mode: uninterned symbols must be deduplicated so the same
                     // Symbol object is used everywhere in this assembly (preserves EQ-ness
-                    // across make-load-form boundaries — e.g. gensym'd ctor names in defcontext).
+                    // across make-load-form boundaries: e.g. gensym'd ctor names in defcontext).
                     _il.Emit(OpCodes.Ldsfld, _faslStructMap.UninternedTableField());
                     _il.Emit(OpCodes.Ldc_I4, _faslStructMap.GetOrCreateUninternedSymbolIndex(sym));
                     _il.Emit(OpCodes.Ldelem_Ref);
@@ -3561,7 +3606,7 @@ public partial class CilAssembler
                 _inlineVisited ??= new HashSet<LispStruct>(ReferenceEqualityComparer.Instance);
                 if (!_inlineVisited.Add(ls))
                 {
-                    // Circular reference — fall back to constant pool
+                    // Circular reference: fall back to constant pool
                     int idxCyc = AddConstant(val);
                     _il.Emit(OpCodes.Ldc_I4, idxCyc);
                     _il.Emit(OpCodes.Call, _getConstant);
@@ -3574,7 +3619,7 @@ public partial class CilAssembler
                     {
                         // Inside hash table values: skip interning to save string space
                         EmitLoadConstInline(ls.TypeName);
-                        var slotsArr2 = ls.Slots;
+                        var slotsArr2 = ls.SlotsSnapshot();
                         _il.Emit(OpCodes.Ldc_I4, slotsArr2.Length);
                         _il.Emit(OpCodes.Newarr, typeof(LispObject));
                         for (int si = 0; si < slotsArr2.Length; si++)
@@ -3600,7 +3645,7 @@ public partial class CilAssembler
                         // returned creation form rather than directly serializing raw slots.
                         if (_faslMode && TryEmitViaLoadForm(ls, internKey))
                         {
-                            // done — IL emitted by TryEmitViaLoadForm
+                            // done: IL emitted by TryEmitViaLoadForm
                         }
                         else
                         {
@@ -3608,7 +3653,7 @@ public partial class CilAssembler
                                 LispStruct.PreRegisterIntern(internKey, ls);
                             _il.Emit(OpCodes.Ldstr, Track(internKey));
                             EmitLoadConstInline(ls.TypeName);
-                            var slotsArr = ls.Slots;
+                            var slotsArr = ls.SlotsSnapshot();
                             _il.Emit(OpCodes.Ldc_I4, slotsArr.Length);
                             _il.Emit(OpCodes.Newarr, typeof(LispObject));
                             for (int si = 0; si < slotsArr.Length; si++)
@@ -3634,7 +3679,7 @@ public partial class CilAssembler
                 break;
             case LispHashTable ht:
             {
-                // Small hash tables: inline construction (≤20 entries)
+                // Small hash tables: inline construction (<=20 entries)
                 // Large ones: in FASL mode, emit as helper methods (self-contained, no _constants).
                 // In non-FASL (AssembleAndRun), fall back to constant pool (same-process, ok).
                 const int MaxHtInline = 20;
@@ -3687,7 +3732,7 @@ public partial class CilAssembler
                 }
                 else
                 {
-                    // Anonymous function — fall back to constant pool
+                    // Anonymous function: fall back to constant pool
                     int idxFn = AddConstant(val);
                     _il.Emit(OpCodes.Ldc_I4, idxFn);
                     _il.Emit(OpCodes.Call, _getConstant);
@@ -3726,7 +3771,7 @@ public partial class CilAssembler
             default:
                 // Fallback: constant pool. This resolves correctly in-process
                 // (AssembleAndRun, and compile-file+load within the same process,
-                // e.g. make-load-form of a LispClass) but NOT across processes —
+                // e.g. make-load-form of a LispClass) but NOT across processes;
                 // the pool is per-process and not serialized into the fasl. Warn so
                 // the cross-process risk is visible. (Types that must round-trip
                 // cross-process need a dedicated inline case above, as LispComplex
@@ -3767,8 +3812,8 @@ public partial class CilAssembler
             var (node, phase) = st.Pop();
             if (node is not Cons && node is not LispVector) continue;
             if (phase == 1) { onPath.Remove(node); continue; }
-            if (onPath.Contains(node)) return ConstGraphKind.Cyclic;  // back-edge → cycle
-            if (!done.Add(node)) { shared = true; continue; }         // reached again (acyclic) → shared
+            if (onPath.Contains(node)) return ConstGraphKind.Cyclic;  // back-edge -> cycle
+            if (!done.Add(node)) { shared = true; continue; }         // reached again (acyclic) -> shared
             onPath.Add(node);
             st.Push((node, 1));                                       // exit marker
             if (node is Cons c) { st.Push((c.Cdr, 0)); st.Push((c.Car, 0)); }
@@ -3802,12 +3847,12 @@ public partial class CilAssembler
     /// size-for-time trade with no change in meaning. Also counts the nodes.</summary>
     /// <remarks>What is deliberately NOT on the list, and why:
     /// <list type="bullet">
-    /// <item>structures and CLOS instances — they are emitted through the
+    /// <item>structures and CLOS instances: they are emitted through the
     /// make-load-form protocol, with creation and initialization forms ordered
     /// per object. Printing bypasses that entirely.</item>
-    /// <item>pathnames — a namestring drops the version component.</item>
+    /// <item>pathnames: a namestring drops the version component.</item>
     /// <item>vectors that are not simple general vectors (bit vectors,
-    /// specialized element types, multi-dimensional arrays) — the printed form
+    /// specialized element types, multi-dimensional arrays): the printed form
     /// does not carry the element type, so the array comes back a different
     /// type than it went in.</item>
     /// </list>
@@ -3881,7 +3926,7 @@ public partial class CilAssembler
                     // check per instance, since a method may branch on the
                     // object). See StructReadsBackAsPrinted.
                     if (!seen.Add(ls)) continue;
-                    foreach (var slot in ls.Slots)
+                    foreach (var slot in ls.SlotsSnapshot())
                         if (slot is LispObject so) stack.Push(so);
                     continue;
                 default:
@@ -3980,7 +4025,7 @@ public partial class CilAssembler
     {
         if (Runtime.FindClassOrNil(ls.TypeName) is not LispClass cls
             || !cls.IsStructureClass || cls.StructSlotNames == null
-            || cls.StructSlotNames.Length != ls.Slots.Length)
+            || cls.StructSlotNames.Length != ls.SlotCount)
             return false;
 
         // No make-load-form to honour -- no method, or one that signals -- is the
@@ -4012,7 +4057,7 @@ public partial class CilAssembler
     private static bool FormIsSlotSaving(LispStruct ls, LispClass cls, LispObject form)
     {
         var slotNames = cls.StructSlotNames;
-        if (slotNames == null || slotNames.Length != ls.Slots.Length) return false;
+        if (slotNames == null || slotNames.Length != ls.SlotCount) return false;
         // (let ((v <alloc>)) <setf>... v)
         if (form is not Cons let || !IsSym(let.Car, "LET")) return false;
         if (Nth(let, 1) is not Cons bindings || bindings.Cdr is not Nil) return false;
@@ -4024,7 +4069,7 @@ public partial class CilAssembler
             || !ReferenceEquals(typeName, ls.TypeName))
             return false;
 
-        var assigned = new bool[ls.Slots.Length];
+        var assigned = new bool[ls.SlotCount];
         var body = let.Cdr is Cons c2 ? c2.Cdr : Nil.Instance;
         while (body is Cons b)
         {
@@ -4037,7 +4082,7 @@ public partial class CilAssembler
                 return false;
             int idx = System.Array.FindIndex(slotNames, n => ReferenceEquals(n, slotName));
             if (idx < 0 || assigned[idx]) return false;
-            if (!ReferenceEquals(Unquote(Nth(setf, 2)), ls.Slots[idx])) return false;
+            if (!ReferenceEquals(Unquote(Nth(setf, 2)), ls.GetSlot(idx))) return false;
             assigned[idx] = true;
             body = b.Cdr;
         }
@@ -4069,8 +4114,8 @@ public partial class CilAssembler
         switch (node)
         {
             case LispStruct ls:
-                for (int i = 0; i < ls.Slots.Length; i++)
-                    if (ls.Slots[i] is LispObject o) yield return o;
+                for (int i = 0; i < ls.SlotCount; i++)
+                    if (ls.GetSlot(i) is LispObject o) yield return o;
                 break;
             case LispVector v:
                 for (int i = 0; i < v.Length; i++) yield return v.ElementAt(i);
@@ -4082,7 +4127,7 @@ public partial class CilAssembler
     /// *print-circle* representation, instead of the naive inline cons-walk (which
     /// loops forever on a cycle and duplicates shared structure). The representation
     /// is computed now and re-read via read-from-string in the loading process.
-    /// Returns false (emitting nothing) if the value cannot be printed readably —
+    /// Returns false (emitting nothing) if the value cannot be printed readably;
     /// the caller then errors (cyclic) or falls back to inline (shared).</summary>
     private bool TryEmitConstantViaReader(LispObject val)
     {
@@ -4106,7 +4151,7 @@ public partial class CilAssembler
         // Print floats under the standard default format, and read them back the
         // same way (ReadConstantFromString pins the same value). Which floats get
         // an exponent marker depends on *read-default-float-format*, so a file
-        // compiled under DOUBLE-FLOAT wrote its doubles bare — and a loading
+        // compiled under DOUBLE-FLOAT wrote its doubles bare: and a loading
         // process with the standard default read them back as single floats.
         // Silent: the literal is still a number of the right value, just the
         // wrong type.
@@ -4143,7 +4188,7 @@ public partial class CilAssembler
             DynamicBindings.Pop(prSym); DynamicBindings.Pop(pcSym);
         }
 
-        // Runtime.ReadConstantFromString(repr) — reads one object, no multiple-values
+        // Runtime.ReadConstantFromString(repr): reads one object, no multiple-values
         // side effect (READ-FROM-STRING leaves a stray position value that can leak
         // through the FASL module-init).
         // The inline path records every symbol it names so the fasl interns them
@@ -4265,7 +4310,7 @@ public partial class CilAssembler
     /// Returns false when there is no type to hang data on (the in-process JIT path,
     /// which has no PE at all) so the caller falls back to Ldstr.</summary>
     /// <remarks>Ldstr would put the representation in the module-wide #US heap,
-    /// which the token encoding caps at 16 MB for the whole module — shared with
+    /// which the token encoding caps at 16 MB for the whole module: shared with
     /// every other string literal and symbol name. That cap is the next wall in
     /// front of holding literals as data, and it does not apply here: the data
     /// section has no such limit, and the blob is copied out in one memcpy
@@ -4344,12 +4389,12 @@ public partial class CilAssembler
         {
             // Emit the creation form as its OWN top-level method (ahead of the
             // referencing form in _initIl) so creation and init forms interleave
-            // per object at load time — (create a)(init a)(create b)(init b) —
+            // per object at load time, (create a)(init a)(create b)(init b),
             // matching CLHS make-load-form ordering and SBCL. Dependencies are
             // emitted first; the inline reference here becomes an intern lookup.
             var key = EnsureInstanceCreatedTopLevel(li, mlfSym.Function);
             if (key != null) { EmitInstanceLookup(key); return; }
-            // key == null: make-load-form errored, or a creation-form cycle — fall
+            // key == null: make-load-form errored, or a creation-form cycle: fall
             // through to the direct-slot fallback below (old inline behavior).
         }
         // No make-load-form defined: fallback to direct slot serialization
@@ -4373,14 +4418,14 @@ public partial class CilAssembler
     /// top-level method appended to _initIl, after first ensuring the creation form's
     /// referenced instances are themselves created (so their forms precede this one).
     /// After the creation, eagerly emits any init forms whose dependencies are now
-    /// satisfied — giving the per-object (create,init) interleave CLHS/SBCL require.
+    /// satisfied: giving the per-object (create,init) interleave CLHS/SBCL require.
     /// Returns the intern key, or null if make-load-form is unusable here (errored, or
     /// an in-progress creation cycle) so the caller can fall back to inline emission.
     /// </summary>
     private string? EnsureInstanceCreatedTopLevel(LispInstance li, LispObject mlfFn)
     {
         if (_faslStructMap!.TryGetInstanceKey(li, out var existing))
-            // Registered but not yet created ⇒ we are inside its own dep recursion
+            // Registered but not yet created => we are inside its own dep recursion
             // (a creation-form cycle, which is degenerate). Signal fallback.
             return _faslStructMap.IsCreated(li) ? existing : null;
 
@@ -4488,7 +4533,7 @@ public partial class CilAssembler
     /// LOAD: for the same 100k-cons data, load-time peak RSS was +13MB when the
     /// conses were spread over 200 methods but +680MB when they sat in 4, because
     /// the JIT's working set grows faster than the method body it compiles. The
-    /// compiling process never sees this — it builds the literal directly.
+    /// compiling process never sees this: it builds the literal directly.
     /// </summary>
     private void EmitFaslChunkedList(List<LispObject> cars, LispObject tail)
     {
@@ -4574,7 +4619,7 @@ public partial class CilAssembler
     /// FASL mode: continue a constant that exceeded the inline depth cap in a fresh
     /// static helper method, and call it. The call resets both the emitter's nesting
     /// depth and the IL evaluation stack (the helper returns a single value), which is
-    /// what the cap exists to bound — while keeping the FASL self-contained.
+    /// what the cap exists to bound: while keeping the FASL self-contained.
     /// </summary>
     /// <summary>Aggregates whose materialization can be large enough to deserve
     /// its own method. Atoms emit a handful of bytes, less than the call site.</summary>
@@ -4615,7 +4660,7 @@ public partial class CilAssembler
     /// </summary>
     private void EmitFaslLargeHashTable(LispHashTable ht, List<KeyValuePair<LispObject, LispObject>> entries)
     {
-        const int ChunkSize = 1500; // ~1500 entries × ~30 bytes/entry = ~45KB, safely under 64KB IL limit
+        const int ChunkSize = 1500; // ~1500 entries x ~30 bytes/entry = ~45KB, safely under 64KB IL limit
         int htId = Interlocked.Increment(ref _faslClosureCount);
         var setMethod = typeof(LispHashTable).GetMethod("Set",
             new[] { typeof(LispObject), typeof(LispObject) })!;
@@ -4698,7 +4743,7 @@ public partial class CilAssembler
             // seconds in 70,019 of these evaluations; the forms were all this shape.
             if (Runtime.FindClassOrNil(ls.TypeName) is LispClass cls2
                 && cls2.IsStructureClass && cls2.StructSlotNames != null
-                && cls2.StructSlotNames.Length == ls.Slots.Length
+                && cls2.StructSlotNames.Length == ls.SlotCount
                 && FormIsSlotSaving(ls, cls2, form))
                 return false;
             _il.Emit(OpCodes.Ldstr, Track(internKey));
@@ -4724,7 +4769,7 @@ public partial class CilAssembler
 
     private static void AppendInternKey(System.Text.StringBuilder sb, LispObject obj, int depth, HashSet<LispStruct> visited)
     {
-        if (depth > 20) { sb.Append("…"); return; }
+        if (depth > 20) { sb.Append("..."); return; }
         switch (obj)
         {
             case Nil: sb.Append("N"); break;
@@ -4743,7 +4788,7 @@ public partial class CilAssembler
                 if (!visited.Add(ls)) { sb.Append("#CYCLE"); break; }
                 sb.Append("#S(");
                 AppendInternKey(sb, ls.TypeName, depth + 1, visited);
-                foreach (var slot in ls.Slots)
+                foreach (var slot in ls.SlotsSnapshot())
                 {
                     sb.Append(' ');
                     AppendInternKey(sb, slot, depth + 1, visited);
@@ -4790,8 +4835,8 @@ public partial class CilAssembler
     // Frame-locals mode: the DebugFrame this body opened at entry. One
     // CilAssembler instance emits one method (every body path constructs a fresh
     // one), so this slot belongs to that method. Null when the compiler emitted no
-    // (:frame-enter) — frame-locals off, or a context with no body prologue such
-    // as a top-level form — in which case (:frame-set ...) is a no-op rather than
+    // (:frame-enter), frame-locals off, or a context with no body prologue such
+    // as a top-level form, in which case (:frame-set ...) is a no-op rather than
     // IL referring to a slot that does not exist.
     private LocalBuilder? _dbgFrame;
 
@@ -4818,14 +4863,18 @@ public partial class CilAssembler
     }
 
     /// A native-rep slot (Int64 / Double / Single) holds a raw value, so it is boxed
-    /// into the matching Lisp object on the way into the debug frame — the frame
+    /// into the matching Lisp object on the way into the debug frame: the frame
     /// hands out LispObjects. Debug-only cost (one box per store).
-    private void EmitFrameSetNative(string sourceName, string localName, string conv, bool newobj)
+    private void EmitFrameSetNative(string sourceName, string localName, string conv, bool newobj,
+                                    bool convI4 = false)
     {
         if (_dbgFrame == null || !_locals.TryGetValue(localName, out var slot)) return;
         _il.Emit(OpCodes.Ldloc, _dbgFrame);
         _il.Emit(OpCodes.Ldstr, Track(sourceName));
         _il.Emit(OpCodes.Ldloc, slot);
+        // A character-code slot is an int64 (the width the comparison path
+        // wants) and LispChar.Make takes a char, so it narrows first.
+        if (convI4) _il.Emit(OpCodes.Conv_I4);
         if (newobj) EmitNewobj(conv); else EmitCall(conv);
         EmitCall("DebugFrame.Set");
     }
@@ -5092,6 +5141,10 @@ public partial class CilAssembler
             // matter here: -0.0 gives +0.0 and NaN stays NaN.
             ["Math.AbsDouble"] = typeof(System.Math).GetMethod("Abs", new[] { typeof(double) })!,
             ["Math.AbsSingle"] = typeof(System.Math).GetMethod("Abs", new[] { typeof(float) })!,
+            // SQRT of a declared double. The checked entry is the (safety 1) one:
+            // a negative argument means the declared type is wrong.
+            ["Math.SqrtDouble"] = typeof(System.Math).GetMethod("Sqrt", new[] { typeof(double) })!,
+            ["Runtime.SqrtDoubleChecked"] = typeof(Runtime).GetMethod("SqrtDoubleChecked")!,
             ["Runtime.Mod"] = typeof(Runtime).GetMethod("Mod")!,
             ["Runtime.Rem"] = typeof(Runtime).GetMethod("Rem")!,
             ["Runtime.FloorOp"] = typeof(Runtime).GetMethod("FloorOp")!,
@@ -5198,12 +5251,12 @@ public partial class CilAssembler
             ["Runtime.MultipleValuesList1"] = typeof(Runtime).GetMethod("MultipleValuesList1")!,
             ["Runtime.UnwrapMv"] = typeof(Runtime).GetMethod("UnwrapMv")!,
 
-            // DebugFrames — frame-locals mode only (see DebugFrames.cs)
+            // DebugFrames: frame-locals mode only (see DebugFrames.cs)
             ["DebugFrames.Enter"] = typeof(DebugFrames).GetMethod("Enter")!,
             ["DebugFrame.Set"] = typeof(DebugFrame).GetMethod("Set")!,
             ["DebugFrame.SetBox"] = typeof(DebugFrame).GetMethod("SetBox")!,
 
-            // ConditionSystem — loop back-edge interrupt safepoint
+            // ConditionSystem: loop back-edge interrupt safepoint
             ["ConditionSystem.PollInterrupt"] = typeof(ConditionSystem).GetMethod("PollInterrupt")!,
 
             // MultipleValues
@@ -5233,11 +5286,23 @@ public partial class CilAssembler
             // Raw-long-value variants for inferred numeric-backed array locals
             ["Runtime.IndexL"] = typeof(Runtime).GetMethod("IndexL")!,
             ["Runtime.ArefNumL"] = typeof(Runtime).GetMethod("ArefNumL")!,
+            ["Runtime.BackingI64"] = typeof(Runtime).GetMethod("BackingI64")!,
+            ["Runtime.BackingI32"] = typeof(Runtime).GetMethod("BackingI32")!,
+            ["Runtime.BackingU16"] = typeof(Runtime).GetMethod("BackingU16")!,
+            ["Runtime.BackingU8"] = typeof(Runtime).GetMethod("BackingU8")!,
+            ["Runtime.CheckStoreI32"] = typeof(Runtime).GetMethod("CheckStoreI32")!,
+            ["Runtime.CheckStoreU16"] = typeof(Runtime).GetMethod("CheckStoreU16")!,
+            ["Runtime.CheckStoreU8"] = typeof(Runtime).GetMethod("CheckStoreU8")!,
             ["Runtime.ArefSetNumL"] = typeof(Runtime).GetMethod("ArefSetNumL")!,
             ["Runtime.ArefNum2DL"] = typeof(Runtime).GetMethod("ArefNum2DL")!,
             ["Runtime.ArefSetNum2DL"] = typeof(Runtime).GetMethod("ArefSetNum2DL")!,
             ["Runtime.ArefNum3DL"] = typeof(Runtime).GetMethod("ArefNum3DL")!,
             ["Runtime.ArefSetNum3DL"] = typeof(Runtime).GetMethod("ArefSetNum3DL")!,
+            // Raw-long character code out of a string, for (char-code (schar s i))
+            ["Runtime.CharCodeAtL"] = typeof(Runtime).GetMethod("CharCodeAtL")!,
+            ["Runtime.CharCodeOfL"] = typeof(Runtime).GetMethod("CharCodeOfL")!,
+            // The character itself out of a string, for a bare (schar s i)
+            ["Runtime.CharAtL"] = typeof(Runtime).GetMethod("CharAtL")!,
             // Raw-double-value variants for inferred float-backed array locals
             ["Runtime.ArefNumD"] = typeof(Runtime).GetMethod("ArefNumD")!,
             ["Runtime.ArefSetNumD"] = typeof(Runtime).GetMethod("ArefSetNumD")!,
@@ -5256,8 +5321,14 @@ public partial class CilAssembler
             ["Runtime.MakeStruct"] = typeof(Runtime).GetMethod("MakeStruct")!,
             ["Runtime.StructRef"] = typeof(Runtime).GetMethod("StructRef")!,
             ["Runtime.StructRefI"] = typeof(Runtime).GetMethod("StructRefI")!,
+            // Raw-long slot read/write for fixnum-typed struct slots
+            ["Runtime.StructRefL"] = typeof(Runtime).GetMethod("StructRefL")!,
+            ["Runtime.StructSetL"] = typeof(Runtime).GetMethod("StructSetL")!,
             ["Runtime.StructSet"] = typeof(Runtime).GetMethod("StructSet")!,
             ["Runtime.StructSetI"] = typeof(Runtime).GetMethod("StructSetI")!,
+            ["Runtime.CheckSlotType"] = typeof(Runtime).GetMethod("CheckSlotType")!,
+            ["Runtime.StructRefD"] = typeof(Runtime).GetMethod("StructRefD")!,
+            ["Runtime.StructSetD"] = typeof(Runtime).GetMethod("StructSetD")!,
             ["Runtime.StructTypep"] = typeof(Runtime).GetMethod("StructTypep")!,
             ["Runtime.CopyStruct"] = typeof(Runtime).GetMethod("CopyStruct")!,
 
@@ -5366,6 +5437,7 @@ public partial class CilAssembler
             ["Runtime.RegisterClass"] = typeof(Runtime).GetMethod("RegisterClass")!,
             ["Runtime.MakeClass"] = typeof(Runtime).GetMethod("MakeClass")!,
             ["Runtime.MakeClassFull"] = typeof(Runtime).GetMethod("MakeClassFull")!,
+            ["Runtime.MakeClassFullOptions"] = typeof(Runtime).GetMethod("MakeClassFullOptions")!,
             ["Runtime.MakeSlotDef"] = typeof(Runtime).GetMethod("MakeSlotDef")!,
             ["Runtime.MakeSlotDefWithAllocation"] = typeof(Runtime).GetMethod("MakeSlotDefWithAllocation")!,
             ["Runtime.SetSlotDefRawOptions"] = typeof(Runtime).GetMethod("SetSlotDefRawOptions")!,
@@ -5546,8 +5618,12 @@ public partial class CilAssembler
                 typeof(Runtime).GetMethod("IsLispControlFlowException")!,
             ["Runtime.ThrowControlError"] =
                 typeof(Runtime).GetMethod("ThrowControlError")!,
+            // Builds the exception a THROW raises, or signals CONTROL-ERROR when
+            // the tag has no outstanding CATCH.
+            ["Runtime.MakeCatchThrow"] =
+                typeof(Runtime).GetMethod("MakeCatchThrow")!,
 
-            // Fixnum.Value getter — used by compile-as-long for fast-path
+            // Fixnum.Value getter: used by compile-as-long for fast-path
             // fixnum arithmetic on (the fixnum ...) expressions.
             ["Fixnum.get_Value"] =
                 typeof(Fixnum).GetProperty("Value")!.GetGetMethod()!,
@@ -5556,7 +5632,7 @@ public partial class CilAssembler
             ["SingleFloat.get_Value"] =
                 typeof(SingleFloat).GetProperty("Value")!.GetGetMethod()!,
             // Native System.Decimal arithmetic for (declare (type decimal x))
-            // scopes — scale-preserving decimal ops, unlike the undeclared rational path.
+            // scopes: scale-preserving decimal ops, unlike the undeclared rational path.
             ["LispDecimal.get_Value"] =
                 typeof(LispDecimal).GetProperty("Value")!.GetGetMethod()!,
             ["Decimal.op_Addition"] =
@@ -5672,6 +5748,14 @@ public partial class CilAssembler
             ["Object[]"] = typeof(object[]),
             ["Int32"] = typeof(int),
             ["Int64"] = typeof(long),
+            // Concrete element buffers for the hoisted simple-array path: a
+            // local of this type holds the vector's own storage, so an AREF in
+            // the body is a bare ldelem instead of a helper call that re-derives
+            // the same buffer on every element.
+            ["Int64[]"] = typeof(long[]),
+            ["Int32[]"] = typeof(int[]),
+            ["UInt16[]"] = typeof(ushort[]),
+            ["Byte[]"] = typeof(byte[]),
             ["Double"] = typeof(double),
             ["Single"] = typeof(float),
             // A local slot holding a raw System.Decimal, for the declared-decimal

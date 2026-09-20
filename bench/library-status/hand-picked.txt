@@ -1,0 +1,36 @@
+# Hand-picked targets: the other axis.
+#
+# The ranked list answers "what does the ecosystem lean on". It cannot answer
+# "what does someone actually sit in front of": an application, or a library
+# whose value is that it stresses one part of the compiler hard, is at the end
+# of the dependency graph and nothing depends on it, so it ranks nowhere. These
+# are chosen by hand for that reason, and the order here means nothing.
+#
+# Source: the bring-up candidate backlog (the tracking issue for feeding real
+# applications back into the runtime). Entries are the ones still open or still
+# unverified there.
+#
+# This file is edited by hand. rank.lisp copies it into targets.txt as a
+# separate section, skipping any name the ranked part already covers -- a
+# hand-picked target that is also widely depended upon is measured once, in the
+# ranked table where it already belongs.
+#
+# One system name per line. Lines starting with # are comments.
+
+# Type inference and codegen under stress; the compile-speed wall is the open
+# question here, not correctness.
+coalton
+
+# APL: arrays, numerics, and a code generator that emits very large methods.
+april
+
+# Already in the ranked list, kept here only so the set is written down in one
+# place -- rank.lisp will not duplicate them:
+#   cl-ppcre   (rank 3)    regex codegen; perl-corpus completion unverified
+#   lparallel  (rank 44)   threads and atomics; kill-tasks re-check unverified
+#   mcclim     (rank 139)  CLOS/MOP/concurrency/GUI; the low-level API is a
+#                          design question, not a load failure
+#
+# Not in the Quicklisp dist, so this harness cannot reach it. Bring-up for it
+# runs from a source checkout:
+#   lem        concurrent application

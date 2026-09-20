@@ -1,4 +1,4 @@
-;;; Regression tests for dotcl:async / dotcl:await — non-blocking async (step B)
+;;; Regression tests for dotcl:async / dotcl:await: non-blocking async (step B)
 ;;; The (dotcl:async ...) block returns a .NET Task; we drive it to completion with
 ;;; the blocking dotnet:await to assert the computed value.
 
@@ -78,7 +78,7 @@
                                  (list *async-ctx* a b)))))
   (:two 1 2))
 
-;;; no surrounding binding → the global value
+;;; no surrounding binding -> the global value
 (deftest d1303-special-global
   (dotnet:await (dotcl:async
                   (dotcl:await (dotnet:static "System.Threading.Tasks.Task" "Delay" 1))
@@ -86,7 +86,7 @@
   :global)
 
 ;;; handler-bind established inside an async block stays active across an
-;;; await — a condition signaled in a continuation (post-await) finds the handler,
+;;; await: a condition signaled in a continuation (post-await) finds the handler,
 ;;; even though the continuation runs on a thread-pool thread.
 (defvar *hb-log* nil)
 
@@ -105,7 +105,7 @@
       (list outcome *hb-log*)))
   (:caught-outer (:handled)))
 
-;;; handler-bind with no condition signaled → handler not called, body value returned
+;;; handler-bind with no condition signaled -> handler not called, body value returned
 (deftest d1304-handler-bind-no-signal
   (progn
     (setq *hb-log* nil)
@@ -118,7 +118,7 @@
       (list v *hb-log*)))
   (:ok nil))
 
-;;; unwind-protect across await — cleanup runs after the protected form
+;;; unwind-protect across await: cleanup runs after the protected form
 ;;; settles, and the protected form's value is returned.
 (defvar *up-log* nil)
 
@@ -174,7 +174,7 @@
                     (error (e) (list :caught (and (search "boom" (format nil "~A" e)) t))))))
   (:caught t))
 
-;;; no condition → protected value returned, no clause run
+;;; no condition -> protected value returned, no clause run
 (deftest d1306-handler-case-no-error
   (dotnet:await (dotcl:async
                   (handler-case
@@ -316,11 +316,11 @@
                     (outer () :outer))))
   :outer)
 
-;;; with-simple-restart (macro → restart-case) works across await via the
+;;; with-simple-restart (macro -> restart-case) works across await via the
 ;;; macroexpand fallback in %async-cps; invoking the restart yields (values nil t)
 ;;; but in single-value position the primary value nil is seen.
 ;; WITH-SIMPLE-RESTART returns two values when its restart is invoked (NIL and T),
-;; and the async path now carries both — the same as the synchronous form. It used
+;; and the async path now carries both: the same as the synchronous form. It used
 ;; to deliver only NIL, which is what this test expected before multiple values
 ;; survived an (async ...) block.
 (deftest i339-restart-with-simple-restart-invoke

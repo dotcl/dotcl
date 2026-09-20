@@ -4,7 +4,7 @@
 ;;; (CLHS 5.1.2.1), which the compiler implements by dropping that variable from
 ;;; *LOCALS* for the body. The drop matched by NAME STRING, so a symbol-macro for
 ;;; SM-B::X also hid the unrelated lexical SM-A::X and the reference expanded to
-;;; the macro — silently, with the wrong value. The mirror image lived in the
+;;; the macro: silently, with the wrong value. The mirror image lived in the
 ;;; closure-body path, which drops symbol-macros shadowed by captured locals:
 ;;; there a captured SM-A::Y removed the SM-B::Y symbol-macro, and the reference
 ;;; failed with "Unbound variable".

@@ -15,11 +15,11 @@ namespace DotCL.Diagnostics;
 /// functions unreliable.
 ///
 /// Nesting is not modelled: each site measures its own span, and sites are
-/// chosen so they do not contain one another. Sum of phases ≈ wall time.
+/// chosen so they do not contain one another. Sum of phases ~ wall time.
 ///
 /// Usage from Lisp:
-///   (dotcl:phase-report)          → prints phases, slowest first
-///   (dotcl:phase-report-reset)    → zero all phases
+///   (dotcl:phase-report)          -> prints phases, slowest first
+///   (dotcl:phase-report-reset)    -> zero all phases
 ///
 /// When disabled (default) Time() runs the action with one branch of overhead.
 /// </summary>

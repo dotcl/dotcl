@@ -4,9 +4,9 @@
 # document table names the .lisp, and the collector reports against that.
 #
 # Two things have to hold, and this script asserts both:
-#   1. the report names lib.lisp at all — it only does when the fasl is loaded
+#   1. the report names lib.lisp at all: it only does when the fasl is loaded
 #      file-backed, hence DOTCL_FASL_LOADFROM=1
-#   2. a function the driver never calls shows as uncovered — otherwise the
+#   2. a function the driver never calls shows as uncovered: otherwise the
 #      numbers are not measuring anything
 #
 # Needs the dotnet-coverage tool: dotnet tool install -g dotnet-coverage
@@ -43,7 +43,7 @@ test -f "$REPORT" || { echo "FAIL: no coverage report was written"; exit 1; }
 
 # 1. The .lisp has to appear as a source file.
 grep -q 'filename="[^"]*lib\.lisp"' "$REPORT" \
-  || { echo "FAIL: lib.lisp is absent from the report — was the fasl loaded file-backed?"; exit 1; }
+  || { echo "FAIL: lib.lisp is absent from the report; was the fasl loaded file-backed?"; exit 1; }
 echo "PASS: report names lib.lisp"
 
 # 2. The uncalled function has to be uncovered, and a called one covered.

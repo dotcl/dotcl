@@ -1,8 +1,8 @@
 #!/usr/bin/env sh
 # Generate the three managed plugins Unity IL2CPP links into the WebGL build:
-#   Assets/Plugins/DotCL.Runtime.dll  — emit-free, JSON-free netstandard2.0 runtime
-#   Assets/Plugins/dotclcore.dll      — runtime core (stable-named, netstandard-retargeted fasl)
-#   Assets/Plugins/appfasl.dll        — this app's Lisp (stable-named, netstandard-retargeted fasl)
+#   Assets/Plugins/DotCL.Runtime.dll, emit-free, JSON-free netstandard2.0 runtime
+#   Assets/Plugins/dotclcore.dll, runtime core (stable-named, netstandard-retargeted fasl)
+#   Assets/Plugins/appfasl.dll: this app's Lisp (stable-named, netstandard-retargeted fasl)
 # Cross-platform (only needs the dotnet SDK); build.sh runs this before Unity.
 set -e
 HERE="$(cd "$(dirname "$0")" && pwd)"

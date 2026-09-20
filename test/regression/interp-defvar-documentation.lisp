@@ -3,7 +3,7 @@
 ;;; COMPILE-DEFVAR emitted the Runtime.SetVariableDocumentation call, but the
 ;;; three %MINI-EVAL cases never read the form's fourth element, so a variable
 ;;; defined through EVAL always answered NIL to
-;;; (documentation name 'variable) — ansi-test DEFVAR.4/5, DEFPARAMETER.4/5.
+;;; (documentation name 'variable): ansi-test DEFVAR.4/5, DEFPARAMETER.4/5.
 ;;;
 ;;; The documentation is updated INDEPENDENTLY of the value: DEFVAR skips the init
 ;;; form when the variable is already bound, but still rewrites the documentation

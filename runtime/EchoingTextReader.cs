@@ -4,7 +4,7 @@ namespace DotCL;
 
 /// <summary>
 /// A TextReader that copies every character it actually reads to a second
-/// writer — what an ECHO-STREAM has to do (CLHS 21.1.3).
+/// writer: what an ECHO-STREAM has to do (CLHS 21.1.3).
 ///
 /// The Lisp reader consumes a stream through a TextReader, and it got that
 /// reader from underneath the echo-stream wrapper, so READ and
@@ -14,7 +14,7 @@ namespace DotCL;
 /// Only Read echoes. Peek does not: peeking is not reading, and the Lisp
 /// reader peeks constantly to decide whether a character terminates a token.
 /// A character the reader pushes back after reading it stays echoed, which is
-/// what SBCL does too — (read-preserving-whitespace) on "abc def" echoes
+/// what SBCL does too: (read-preserving-whitespace) on "abc def" echoes
 /// "abc " there, the trailing space included, even though the space is still
 /// available to the next read.
 /// </summary>

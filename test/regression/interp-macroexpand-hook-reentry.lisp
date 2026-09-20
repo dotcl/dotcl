@@ -2,13 +2,13 @@
 ;;;
 ;;; An INTERPRETED hook used to recurse forever. The tree-walk evaluator
 ;;; macroexpands the hook's own body on every call, so a hook whose body contains
-;;; any macro — (incf count) is enough — expands it, which calls MACROEXPAND-1,
+;;; any macro, (incf count) is enough, expands it, which calls MACROEXPAND-1,
 ;;; which calls the hook, and so on. The process died on a .NET stack overflow,
 ;;; which cannot be caught, so the failure took the whole test run with it.
 ;;;
 ;;; A COMPILED hook never showed this: its body was expanded once at compile time,
 ;;; so nothing expands while it runs. That is why the ordinary harness stayed
-;;; green — LOAD compiles the DEFTEST form, so the hook lambda is compiled — and
+;;; green, LOAD compiles the DEFTEST form, so the hook lambda is compiled, and
 ;;; why this only surfaced on an emit-free build, where everything is interpreted.
 ;;;
 ;;; MACROEXPAND-1 now calls the expander directly while a hook is running. A hook

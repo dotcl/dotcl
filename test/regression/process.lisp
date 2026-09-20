@@ -1,4 +1,4 @@
-;;; Regression tests for dotcl:launch-process — streaming process handle.
+;;; Regression tests for dotcl:launch-process: streaming process handle.
 ;;; Uses `dotnet --version` as a portable child process (present on Windows local
 ;;; and Linux CI). Exercises the launch-program/process-info building blocks:
 ;;; live output stream, pid, blocking wait, exit code, liveness.
@@ -78,15 +78,15 @@
   (progn
     (dotnet:static "System.Environment" "SetEnvironmentVariable" "DOTCL_ENV_TEST" "leaky")
     (prog1 (list
-            ;; omitted key → child inherits the parent's environment
+            ;; omitted key -> child inherits the parent's environment
             (string= (%env-echo) "leaky")
-            ;; explicit list without the var → whole environment replaced, no leak
+            ;; explicit list without the var -> whole environment replaced, no leak
             (not (string= (%env-echo :environment '("DOTCL_OTHER=x")) "leaky")))
       (dotnet:static "System.Environment" "SetEnvironmentVariable"
                      "DOTCL_ENV_TEST" (dotnet:null))))
   (t t))
 
-;;; error :output (uiop's :error-output :output — merge stderr into stdout).
+;;; error :output (uiop's :error-output :output: merge stderr into stdout).
 ;;; Portable check: stdout is still delivered through the single merged stream.
 ;;; (Full stderr-into-stdout merge verified manually with a dual-output child;
 ;;; a portable dual-output child is fragile across Windows/Linux CI.)

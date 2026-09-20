@@ -187,7 +187,7 @@ public static partial class Runtime
         var (existing, status) = p.FindSymbol(s.Name);
         if (status != SymbolStatus.None && !ReferenceEquals(existing, s))
         {
-            // Name conflict — signal correctable error with CONTINUE restart
+            // Name conflict: signal correctable error with CONTINUE restart
             var restart = new LispRestart("CONTINUE",
                 _ => Nil.Instance,
                 description: $"Unintern {existing} from {p.Name} and import {s}.");
@@ -195,19 +195,19 @@ public static partial class Runtime
             try
             {
                 var condition = MakeConditionFromType(
-                    Startup.Sym("PACKAGE-ERROR"),
+                    Startup.Sym("SIMPLE-PACKAGE-ERROR"),
                     new LispObject[] {
-                        Startup.Sym(":PACKAGE"), p,
-                        Startup.Sym(":FORMAT-CONTROL"),
+                        Startup.Keyword("PACKAGE"), p,
+                        Startup.Keyword("FORMAT-CONTROL"),
                         new LispString($"IMPORT: importing ~A into package ~A conflicts with existing symbol ~A."),
-                        Startup.Sym(":FORMAT-ARGUMENTS"),
+                        Startup.Keyword("FORMAT-ARGUMENTS"),
                         new Cons(s, new Cons(new LispString(p.Name), new Cons(existing!, Nil.Instance)))
                     });
                 ConditionSystem.Error(condition);
             }
             catch (RestartInvocationException rie) when (ReferenceEquals(rie.Tag, restart.Tag))
             {
-                // CONTINUE restart — unintern existing and retry
+                // CONTINUE restart: unintern existing and retry
                 p.Unintern(existing!.Name);
                 goto retry;
             }
@@ -295,7 +295,7 @@ public static partial class Runtime
         // Only block redefinition of symbols that are already exported.
         // Internal symbols in a locked package (e.g. freshly interned ones) are allowed.
         if (!home.IsExternalSymbol(sym.Name)) return;
-        // Consult DOTCL:*PACKAGE-LOCKS-DISABLED* — without-package-locks binds this to T.
+        // Consult DOTCL:*PACKAGE-LOCKS-DISABLED*: without-package-locks binds this to T.
         var disabledSym = Startup.SymInPkg("*PACKAGE-LOCKS-DISABLED*", "DOTCL");
         if (DynamicBindings.TryGet(disabledSym, out var disabled) && disabled is not Nil)
             return;
@@ -306,7 +306,7 @@ public static partial class Runtime
         throw new LispErrorException(err);
     }
 
-    // Package lock API (DOTCL:LOCK-PACKAGE etc.) — step 1: plumbing, no enforcement.
+    // Package lock API (DOTCL:LOCK-PACKAGE etc.): step 1: plumbing, no enforcement.
     public static LispObject LockPackage(LispObject pkg)
     {
         var p = ResolvePackage(pkg, "LOCK-PACKAGE");
@@ -445,7 +445,7 @@ public static partial class Runtime
     /// objects. The reader yields Nil.Instance / T.Instance for the tokens NIL and T,
     /// but the package table stores plain Symbol entries; INTERN / FIND-SYMBOL
     /// returning the raw entries created a "second NIL" that EQ / NULL accept but
-    /// the printer and list walkers (proper-list checks are `is Nil`) reject —
+    /// the printer and list walkers (proper-list checks are `is Nil`) reject;
     /// e.g. SBCL's UNCROSS rebuilding a type spec via INTERN produced lists whose
     /// tail printed as ". NIL" and made MAPCAR signal "not a proper list".</summary>
     internal static LispObject CanonicalizeSymbol(Symbol sym) =>
@@ -514,19 +514,19 @@ public static partial class Runtime
             try
             {
                 var condition = MakeConditionFromType(
-                    Startup.Sym("PACKAGE-ERROR"),
+                    Startup.Sym("SIMPLE-PACKAGE-ERROR"),
                     new LispObject[] {
-                        Startup.Sym(":PACKAGE"), existing,
-                        Startup.Sym(":FORMAT-CONTROL"),
+                        Startup.Keyword("PACKAGE"), existing,
+                        Startup.Keyword("FORMAT-CONTROL"),
                         new LispString($"A package named ~A already exists."),
-                        Startup.Sym(":FORMAT-ARGUMENTS"),
+                        Startup.Keyword("FORMAT-ARGUMENTS"),
                         new Cons(new LispString(name), Nil.Instance)
                     });
                 ConditionSystem.Error(condition);
             }
             catch (RestartInvocationException rie) when (ReferenceEquals(rie.Tag, restart.Tag))
             {
-                // CONTINUE restart was invoked — return the existing package
+                // CONTINUE restart was invoked: return the existing package
                 return existing;
             }
             finally
@@ -564,12 +564,12 @@ public static partial class Runtime
                     try
                     {
                         var condition = MakeConditionFromType(
-                            Startup.Sym("PACKAGE-ERROR"),
+                            Startup.Sym("SIMPLE-PACKAGE-ERROR"),
                             new LispObject[] {
-                                Startup.Sym(":PACKAGE"), existingNick,
-                                Startup.Sym(":FORMAT-CONTROL"),
+                                Startup.Keyword("PACKAGE"), existingNick,
+                                Startup.Keyword("FORMAT-CONTROL"),
                                 new LispString($"MAKE-PACKAGE: nickname ~A conflicts with existing package ~A."),
-                                Startup.Sym(":FORMAT-ARGUMENTS"),
+                                Startup.Keyword("FORMAT-ARGUMENTS"),
                                 new Cons(new LispString(nick),
                                     new Cons(new LispString(existingNick.Name), Nil.Instance))
                             });
@@ -577,7 +577,7 @@ public static partial class Runtime
                     }
                     catch (RestartInvocationException rie) when (ReferenceEquals(rie.Tag, restart.Tag))
                     {
-                        // CONTINUE restart was invoked — skip this nickname
+                        // CONTINUE restart was invoked: skip this nickname
                         cur = c.Cdr;
                         continue;
                     }
@@ -626,12 +626,12 @@ public static partial class Runtime
                 try
                 {
                     var condition = MakeConditionFromType(
-                        Startup.Sym("PACKAGE-ERROR"),
+                        Startup.Sym("SIMPLE-PACKAGE-ERROR"),
                         new LispObject[] {
-                            Startup.Sym(":PACKAGE"), new LispString(n),
-                            Startup.Sym(":FORMAT-CONTROL"),
+                            Startup.Keyword("PACKAGE"), new LispString(n),
+                            Startup.Keyword("FORMAT-CONTROL"),
                             new LispString($"DELETE-PACKAGE: there is no package named ~A."),
-                            Startup.Sym(":FORMAT-ARGUMENTS"),
+                            Startup.Keyword("FORMAT-ARGUMENTS"),
                             new Cons(new LispString(n), Nil.Instance)
                         });
                     ConditionSystem.Error(condition);
@@ -651,7 +651,7 @@ public static partial class Runtime
         // 1. If already deleted, return NIL
         if (pkg.IsDeleted) return Nil.Instance;
 
-        // 2. Check used-by-list — signal correctable error with CONTINUE restart
+        // 2. Check used-by-list: signal correctable error with CONTINUE restart
         retry:
         var usedBy = pkg.UsedByList().ToList();
         if (usedBy.Count > 0)
@@ -665,12 +665,12 @@ public static partial class Runtime
             {
                 // Create a proper PACKAGE-ERROR condition via MakeConditionFromType
                 var condition = MakeConditionFromType(
-                    Startup.Sym("PACKAGE-ERROR"),
+                    Startup.Sym("SIMPLE-PACKAGE-ERROR"),
                     new LispObject[] {
-                        Startup.Sym(":PACKAGE"), pkg,
-                        Startup.Sym(":FORMAT-CONTROL"),
+                        Startup.Keyword("PACKAGE"), pkg,
+                        Startup.Keyword("FORMAT-CONTROL"),
                         new LispString($"Package ~A is used by other packages: ~A."),
-                        Startup.Sym(":FORMAT-ARGUMENTS"),
+                        Startup.Keyword("FORMAT-ARGUMENTS"),
                         new Cons(new LispString(pkg.Name),
                             new Cons(new LispString(names), Nil.Instance))
                     });
@@ -678,7 +678,7 @@ public static partial class Runtime
             }
             catch (RestartInvocationException rie) when (ReferenceEquals(rie.Tag, restart.Tag))
             {
-                // CONTINUE restart was invoked — unuse from all and retry
+                // CONTINUE restart was invoked: unuse from all and retry
                 foreach (var p2 in usedBy)
                     p2.UnusePackage(pkg);
                 goto retry;
@@ -729,7 +729,7 @@ public static partial class Runtime
     /// <summary>FIND-SYMBOL proper. PKG null means *PACKAGE*.</summary>
     private static LispObject FindSymbolIn(LispObject nameArg, LispObject? pkgArg)
     {
-        // (find-symbol name &optional package) → symbol, status
+        // (find-symbol name &optional package) -> symbol, status
         var pkg = pkgArg != null ? ResolvePackage(pkgArg, "FIND-SYMBOL") : CurrentPackage("FIND-SYMBOL");
         string symName = nameArg switch
         {
@@ -870,7 +870,7 @@ public static partial class Runtime
         Startup.RegisterBinary("%COLLECT-PACKAGE-ITERATOR-ENTRIES", Runtime.CollectPackageIteratorEntries);
         // The lowering targets DEFPACKAGE / EXPORT / IMPORT / SHADOW / ... expand
         // into. compile-expr recognises them by SYMBOL-NAME and emits the direct
-        // call, so a compiled caller never reaches these bindings — but the
+        // call, so a compiled caller never reaches these bindings: but the
         // tree-walk interpreter (the only evaluator on emit-free builds) resolves
         // an operator through SYMBOL-FUNCTION, and without a binding every
         // interpreted DEFPACKAGE died on "Undefined function: %MAKE-PACKAGE".

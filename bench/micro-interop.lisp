@@ -9,7 +9,7 @@
 ;;; Run:
 ;;;   dotnet run --project runtime -- --asm compiler/cil-out.sil bench/micro-interop.lisp
 ;;;
-;;; min-of-RUNS after WARMUP discards (noise floor ~±30% on 1-shot).
+;;; min-of-RUNS after WARMUP discards (noise floor ~+/-30% on 1-shot).
 
 (defvar *reps* 1000000)   ; invoke calls per sample
 (defvar *runs* 5)

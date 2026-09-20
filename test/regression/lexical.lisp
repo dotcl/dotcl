@@ -16,7 +16,7 @@
 
 ;; A lambda uses one symbol as &aux, a nested lambda's let binds the other
 ;; (same printed name, different package). The nested lambda references the
-;; &aux var — it must capture the &aux value, not the let value. Before the
+;; &aux var: it must capture the &aux value, not the let value. Before the
 ;; fix, lookup-local matched cross-package and returned the wrong binding.
 (deftest-compiled-only multipackage-lexical.closure-captures-aux-not-let
   (let ((arg (gensym "ARG"))
@@ -33,7 +33,7 @@
         (equalp (funcall fn #(1 2 3 4 5)) #(1)))))
   t)
 
-;; Same structure, but the reference is read directly (not via subseq) — the
+;; Same structure, but the reference is read directly (not via subseq); the
 ;; closure must return the &aux value (the array), not the let value (the
 ;; length, a fixnum).
 (deftest-compiled-only multipackage-lexical.closure-returns-aux-value

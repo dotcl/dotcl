@@ -1,10 +1,10 @@
 ;;; The compiler recognises a set of internal lowering targets by SYMBOL-NAME
-;;; (%MAKE-PACKAGE, %PACKAGE-EXPORT, %SET-ELT, ... — the forms DEFPACKAGE, the
+;;; (%MAKE-PACKAGE, %PACKAGE-EXPORT, %SET-ELT, ...: the forms DEFPACKAGE, the
 ;;; package functions and the SETF expanders macroexpand into) and emits a direct
 ;;; runtime call for each. For most of them that name test was the *only*
 ;;; definition: the symbol carried no function. The tree-walk interpreter
 ;;; resolves an operator through SYMBOL-FUNCTION, so every interpreted DEFPACKAGE
-;;; died on "Undefined function: %MAKE-PACKAGE" — and on emit-free
+;;; died on "Undefined function: %MAKE-PACKAGE": and on emit-free
 ;;; (netstandard2.0) builds the interpreter is the only evaluator there is.
 ;;;
 ;;; These tests drive %MINI-EVAL directly, so they run under the ordinary
@@ -80,7 +80,7 @@
   (("MEB-X" "MEB-Y") ("MEB-X")))
 
 ;;; --- %DOTNET-CALL-DIRECT: a compiler intrinsic whose third argument is a
-;;; literal list of parameter types, so it cannot be given a function binding —
+;;; literal list of parameter types, so it cannot be given a function binding;
 ;;; the interpreter needs its own special-form case. Dropping the overload hint
 ;;; and going through DOTNET:INVOKE is the same call the assembler itself falls
 ;;; back to when it cannot resolve the overload.

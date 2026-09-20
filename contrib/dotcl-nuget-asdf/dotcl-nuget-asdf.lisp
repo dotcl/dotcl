@@ -29,7 +29,7 @@
 ;;; or name it in a :depends-on.
 
 (require "asdf")
-(require "nuget")
+(require "dotcl-nuget")
 
 (defpackage :dotcl-nuget-asdf
   (:use :cl)

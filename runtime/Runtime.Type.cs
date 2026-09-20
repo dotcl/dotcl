@@ -7,7 +7,7 @@ public static partial class Runtime
     // "PKG::NAME" for other packages, so a non-CL deftype whose name matches
     // a built-in type (e.g. SBCL's host-side SB-XC:COMPLEX -> COMPLEXNUM)
     // shadows the built-in for ITS symbol only.
-    // ConcurrentDictionary: runtime DEFTYPE writes this (TypeExpanders[key]=…) while
+    // ConcurrentDictionary: runtime DEFTYPE writes this (TypeExpanders[key]=...) while
     // typep/subtypep/etc. read it (TryGetValue/ContainsKey). A concurrent DEFTYPE on
     // one thread and a type test on another otherwise corrupts a plain Dictionary.
     // All uses are TryGetValue / indexer-set / ContainsKey, which ConcurrentDictionary
@@ -33,22 +33,22 @@ public static partial class Runtime
         new HashSet<string> { "DECIMAL", "WEAK-POINTER" };
 
     /// <summary>
-    /// (dotcl:known-type-name-p symbol) — NIL if SYMBOL names no type, else a
+    /// (dotcl:known-type-name-p symbol): NIL if SYMBOL names no type, else a
     /// keyword saying HOW it is known:
     ///   :DEFTYPE  a DEFTYPE expander registered for this exact symbol
-    ///   :BUILTIN  a built-in type name — matched by NAME, so a same-named
+    ///   :BUILTIN  a built-in type name: matched by NAME, so a same-named
     ///             symbol from any package answers here
     ///   :NAME     a DEFTYPE expander registered under this name in another package
     ///   :CLASS    a class
     ///
     /// Mirrors the order CType.ParseSymbol resolves a symbol specifier in, so a
-    /// NIL answer means exactly "ParseSymbol falls back to an opaque NamedType"
-    /// — a declaration the compiler then drops on the floor without a word.
+    /// NIL answer means exactly "ParseSymbol falls back to an opaque NamedType";
+    /// a declaration the compiler then drops on the floor without a word.
     ///
     /// The distinction between :DEFTYPE/:CLASS (identity) and :BUILTIN/:NAME
     /// (name) is what lets a caller notice that e.g. CL-USER::DECIMAL satisfies
     /// TYPEP by name while the compiler's declaration-driven decimal
-    /// arithmetic — which is keyed on the DOTCL symbol — will not fire.
+    /// arithmetic, which is keyed on the DOTCL symbol, will not fire.
     /// </summary>
     public static LispObject KnownTypeNameP(LispObject[] args)
     {
@@ -59,7 +59,7 @@ public static partial class Runtime
         var name = sym.Name;
         if (TryGetQualifiedTypeExpander(sym, out _)) return Startup.Keyword("DEFTYPE");
         // dotcl's own extension types are identity-gated. TYPEP matches built-in
-        // names by name, so CL-USER::DECIMAL passes (typep x 'decimal) — but the
+        // names by name, so CL-USER::DECIMAL passes (typep x 'decimal): but the
         // compiler's declaration-driven native paths key on the DOTCL symbol, so
         // a declaration written with any other same-named symbol buys nothing.
         // Answering NIL here is what lets a caller say so instead of the
@@ -94,7 +94,7 @@ public static partial class Runtime
     {
         if (typeSpec is Symbol || typeSpec is Nil || typeSpec is T)
         {
-            // Fast path: struct type check — avoid full switch when positive match
+            // Fast path: struct type check: avoid full switch when positive match
             if (typeSpec is Symbol typeSym && obj is LispStruct st)
             {
                 if (ReferenceEquals(st.TypeName, typeSym) || st.TypeName.Name == typeSym.Name)
@@ -107,7 +107,7 @@ public static partial class Runtime
                     foreach (var a in stCls.ClassPrecedenceList)
                         if (ReferenceEquals(a, tgtCls)) return T.Instance;
                     // Target is a known class but struct doesn't inherit from it.
-                    // If target is a structure class, struct can't match — skip CheckSimpleType.
+                    // If target is a structure class, struct can't match: skip CheckSimpleType.
                     if (tgtCls.IsStructureClass) return Nil.Instance;
                 }
                 // Fall through: type might be T, ATOM, STRUCTURE-OBJECT, etc.
@@ -143,7 +143,7 @@ public static partial class Runtime
                 }
             }
             // Slot-definition metaobjects dispatch by their (possibly customized)
-            // CLOS class — walk its CPL so (typep slotd 'standard-effective-slot-
+            // CLOS class: walk its CPL so (typep slotd 'standard-effective-slot-
             // definition) and dispatch on a custom slot-def class both work.
             if (typeSpec is Symbol sdClsSym && obj is SlotDefinition)
             {
@@ -152,7 +152,7 @@ public static partial class Runtime
                 {
                     foreach (var c in sdClass.ClassPrecedenceList)
                         if (ReferenceEquals(c, resolvedCls)) return T.Instance;
-                    // No match against a known class — fall through (could be T/ATOM).
+                    // No match against a known class: fall through (could be T/ATOM).
                 }
             }
             // Method combination and EQL specializer metaobjects: neither is a
@@ -177,11 +177,11 @@ public static partial class Runtime
                 {
                     foreach (var c in objMeta.ClassPrecedenceList)
                         if (ReferenceEquals(c, resolvedCls)) return T.Instance;
-                    // No match against a known class — fall through (could be T/ATOM/etc.).
+                    // No match against a known class: fall through (could be T/ATOM/etc.).
                 }
             }
             // A symbol naming a class, tested against a .NET object: the .NET type's
-            // class precedence list decides, by identity — the same rule dispatch and
+            // class precedence list decides, by identity: the same rule dispatch and
             // (typep obj <class-object>) use. Without this the two disagreed:
             // (typep sb 'stringbuilder) was NIL while passing the class object, or
             // asking (subtypep 'stringbuilder ...), said otherwise.
@@ -305,7 +305,7 @@ public static partial class Runtime
                 case "BASE-STRING":
                 case "SIMPLE-BASE-STRING":
                 {
-                    // (string) or (string *) or (string N) — check type then optional length
+                    // (string) or (string *) or (string N): check type then optional length
                     if (!CheckSimpleType(obj, headName)) return Nil.Instance;
                     var sizeSpec = compound.Cdr is Cons sc ? sc.Car : null;
                     if (sizeSpec == null || (sizeSpec is Symbol ss && ss.Name == "*"))
@@ -382,7 +382,7 @@ public static partial class Runtime
                 case "BIT-VECTOR":
                 case "SIMPLE-BIT-VECTOR":
                 {
-                    // (bit-vector size) or (bit-vector *) — only size arg, no element-type
+                    // (bit-vector size) or (bit-vector *): only size arg, no element-type
                     if (!CheckSimpleType(obj, headName)) return Nil.Instance;
                     if (compound.Cdr is Cons bvSizeCons)
                     {
@@ -450,7 +450,7 @@ public static partial class Runtime
                                 // A dotcl Fixnum is a full 64-bit signed long (most-positive-fixnum
                                 // = 2^63-1). (signed-byte n) admits [-2^(n-1), 2^(n-1)-1]. For n < 64
                                 // that range is narrower than the long range, so large fixnums can
-                                // overflow it — e.g. 2^63-1 does NOT fit in (signed-byte 63).
+                                // overflow it: e.g. 2^63-1 does NOT fit in (signed-byte 63).
                                 if (bits < 64)
                                 {
                                     long min = -(1L << (bits - 1)), max = (1L << (bits - 1)) - 1;
@@ -492,7 +492,7 @@ public static partial class Runtime
                 }
                 case "INTEGER":
                 {
-                    // Range type: (integer low high) — use Arithmetic.Compare for exact comparison
+                    // Range type: (integer low high): use Arithmetic.Compare for exact comparison
                     if (!CheckSimpleType(obj, headName)) return Nil.Instance;
                     if (obj is not Number numObj) return Nil.Instance;
                     var rest = compound.Cdr;
@@ -539,7 +539,7 @@ public static partial class Runtime
                 case "REAL":
                 case "RATIONAL":
                 {
-                    // Range type: (float low high), etc. — use Arithmetic.Compare for exact comparison
+                    // Range type: (float low high), etc.: use Arithmetic.Compare for exact comparison
                     if (!CheckSimpleType(obj, headName)) return Nil.Instance;
                     if (obj is not Number numObj) return Nil.Instance;
                     var rest = compound.Cdr;
@@ -759,7 +759,7 @@ public static partial class Runtime
             var aa = ToList(etAC.Cdr).ToArray();
             return ArrayElementTypeMatches(obj, Funcall(etAE2, aa));
         }
-        // String/char-vector → element type is CHARACTER (not T)
+        // String/char-vector -> element type is CHARACTER (not T)
         if (obj is LispString)
             return elemType is Symbol es && es.Name is "CHARACTER" or "BASE-CHAR" or "STANDARD-CHAR";
         if (obj is LispVector v)
@@ -783,7 +783,7 @@ public static partial class Runtime
     // Check if a LispVector's ElementTypeName matches a compound element-type specifier like (unsigned-byte 8)
     private static bool MatchesElementType(LispObject elemTypeSpec, string storedET)
     {
-        // Expand deftype aliases (e.g., unicode-char → character) before matching
+        // Expand deftype aliases (e.g., unicode-char -> character) before matching
         if (elemTypeSpec is Symbol etAliasSym && TypeExpanders.TryGetValue(etAliasSym.Name, out var etAliasExp))
             return MatchesElementType(Funcall(etAliasExp), storedET);
         if (elemTypeSpec is Cons etAliasCons && etAliasCons.Car is Symbol etAliasHead
@@ -792,6 +792,11 @@ public static partial class Runtime
             var aliasArgs = ToList(etAliasCons.Cdr).ToArray();
             return MatchesElementType(Funcall(etAliasExp2, aliasArgs), storedET);
         }
+        // NIL reads as the empty list, not as a symbol named NIL, so it would
+        // otherwise fall past every case below to the "generic vector accepts
+        // anything" line. It upgrades to NIL: an array of element type NIL can
+        // hold nothing, and an ordinary vector is not one.
+        if (elemTypeSpec is Nil) return storedET == "NIL";
         if (elemTypeSpec is Symbol esym)
         {
             string etName = esym.Name;
@@ -805,7 +810,15 @@ public static partial class Runtime
                 "SINGLE-FLOAT" or "SHORT-FLOAT" => storedET is "SINGLE-FLOAT" or "SHORT-FLOAT" or "FLOAT",
                 "DOUBLE-FLOAT" or "LONG-FLOAT" => storedET is "DOUBLE-FLOAT" or "LONG-FLOAT",
                 "FLOAT" => storedET is "FLOAT" or "SINGLE-FLOAT" or "SHORT-FLOAT" or "DOUBLE-FLOAT" or "LONG-FLOAT",
-                _ => storedET == etName
+                // Everything above is an element type arrays are specialized on
+                // here, so what reaches this line is one that is not -- and an
+                // element type with no specialization upgrades to T (CLHS
+                // 15.1.2.1). (SIMPLE-ARRAY LOGGER-STATE *) therefore means
+                // (SIMPLE-ARRAY T *) and an ordinary vector satisfies it: the
+                // element type says what the array may hold, not what is in it.
+                // NIL is excluded above, where it belongs -- it upgrades to NIL,
+                // not to T.
+                _ => storedET == etName || storedET == "T"
             };
         }
         if (elemTypeSpec is Cons etCons && etCons.Car is Symbol etHead)
@@ -813,7 +826,7 @@ public static partial class Runtime
             string headN = etHead.Name;
             if (headN == "UNSIGNED-BYTE")
             {
-                // (unsigned-byte n) — stored as "UNSIGNED-BYTE-n" or "UNSIGNED-BYTE" or "INTEGER"
+                // (unsigned-byte n): stored as "UNSIGNED-BYTE-n" or "UNSIGNED-BYTE" or "INTEGER"
                 if (etCons.Cdr is Cons nbC && nbC.Car is Fixnum nbF)
                     return storedET == $"UNSIGNED-BYTE-{nbF.Value}" || storedET == "UNSIGNED-BYTE" || storedET == "INTEGER" || storedET == "FIXNUM";
                 return storedET.StartsWith("UNSIGNED-BYTE") || storedET == "INTEGER" || storedET == "FIXNUM";
@@ -827,7 +840,7 @@ public static partial class Runtime
             if (headN == "COMPLEX") return storedET.StartsWith("COMPLEX") || storedET == "T";
             if (headN is "INTEGER" or "FIXNUM" or "BIGNUM" or "RATIONAL")
             {
-                // (integer low high) — matches if stored element type is an integer-compatible type
+                // (integer low high): matches if stored element type is an integer-compatible type
                 return storedET is "INTEGER" or "FIXNUM" or "BIGNUM"
                     || storedET.StartsWith("UNSIGNED-BYTE") || storedET.StartsWith("SIGNED-BYTE");
             }
@@ -858,10 +871,10 @@ public static partial class Runtime
         "INTEGER", "FIXNUM", "RATIONAL", "RATIO",
         "REAL", "NUMBER", "FLOAT",
         "SINGLE-FLOAT", "DOUBLE-FLOAT", "SHORT-FLOAT", "LONG-FLOAT"
-        // Note: BIGNUM intentionally omitted — handled specially via CheckSubtype/BigNum logic
+        // Note: BIGNUM intentionally omitted: handled specially via CheckSubtype/BigNum logic
     };
 
-    // Parse interval bound: * → null (unbounded), (n) → exclusive n, n → inclusive n
+    // Parse interval bound: * -> null (unbounded), (n) -> exclusive n, n -> inclusive n
     // Returns (value, inclusive) where null means unbounded
     private static (double? value, bool inclusive) ParseIntervalBound(LispObject? bound)
     {
@@ -879,7 +892,7 @@ public static partial class Runtime
             if (bc.Car is SingleFloat esf) return ((double)esf.Value, false);
             if (bc.Car is DoubleFloat edf) return (edf.Value, false);
         }
-        return (null, true); // unknown → treat as unbounded
+        return (null, true); // unknown -> treat as unbounded
     }
 
     // Extract numeric interval from type spec like (INTEGER 0 10) or (INTEGER * 10) etc.
@@ -952,7 +965,7 @@ public static partial class Runtime
         (low2, lowInc2) = NormalizeBound(low2, lowInc2, true, base2);
         (high2, highInc2) = NormalizeBound(high2, highInc2, false, base2);
 
-        // Now check interval containment: [low1,high1] ⊆ [low2,high2]
+        // Now check interval containment: [low1,high1] subset-of [low2,high2]
         // low bound: low1 >= low2 (accounting for inclusive/exclusive)
         if (low2.HasValue)
         {
@@ -1080,7 +1093,7 @@ public static partial class Runtime
     /// <summary>Extract the raw LispObject part type from a complex type specifier.</summary>
     private static LispObject? ExtractComplexPartTypeRaw(LispObject spec, string? name)
     {
-        if (name == "COMPLEX") return null; // bare COMPLEX symbol → no specific part type
+        if (name == "COMPLEX") return null; // bare COMPLEX symbol -> no specific part type
         if (spec is Cons c && c.Car is Symbol h && h.Name == "COMPLEX")
         {
             var arg = c.Cdr is Cons cc ? cc.Car : null;
@@ -1099,7 +1112,7 @@ public static partial class Runtime
             "NIL" => "NIL",
             "SINGLE-FLOAT" or "SHORT-FLOAT" => "SINGLE-FLOAT",
             "DOUBLE-FLOAT" or "LONG-FLOAT" => "DOUBLE-FLOAT",
-            "*" => "REAL", // wildcard means any part type → REAL
+            "*" => "REAL", // wildcard means any part type -> REAL
             _ => "REAL"
         };
     }
@@ -1236,19 +1249,19 @@ public static partial class Runtime
     }
     private static bool ArrayDimsSubtype(ArrayTypeInfo a1, ArrayTypeInfo a2)
     {
-        // a2.Rank == -1 means any rank → always ok
+        // a2.Rank == -1 means any rank -> always ok
         if (a2.Rank == -1) return true;
-        // a1.Rank == -1 means any rank → not necessarily subtype of specific rank
+        // a1.Rank == -1 means any rank -> not necessarily subtype of specific rank
         if (a1.Rank == -1) return false;
         if (a1.Rank != a2.Rank) return false;
         // Same rank: check specific dimension sizes
         if (a2.Dims == null) return true; // a2 doesn't constrain sizes (rank-only spec)
-        // a2.Dims is all-wildcards → equivalent to no constraint
+        // a2.Dims is all-wildcards -> equivalent to no constraint
         if (a2.Dims.All(d => d == null)) return true;
         if (a1.Dims == null) return false; // a1 is unconstrained but a2 has specific sizes
         for (int i = 0; i < a1.Dims.Count && i < a2.Dims.Count; i++)
         {
-            if (a2.Dims[i] == null) continue; // a2's dim is * → ok
+            if (a2.Dims[i] == null) continue; // a2's dim is * -> ok
             if (a1.Dims[i] == null) return false; // a1's dim is * but a2 requires specific
             if (a1.Dims[i] != a2.Dims[i]) return false;
         }
@@ -1274,7 +1287,7 @@ public static partial class Runtime
 
     private static bool ArrayElemSubtype(string et1, string et2)
     {
-        if (et2 == "*") return true;    // et2 is wildcard → always ok
+        if (et2 == "*") return true;    // et2 is wildcard -> always ok
         if (et1 == "*") return false;   // et1 is any but et2 requires specific
         // CHAR-OR-NIL is an internal type for STRING/SIMPLE-STRING element matching
         if (et2 == CharOrNilMarker) return et1 is "CHARACTER" or "BASE-CHAR" or "STANDARD-CHAR" or "NIL";
@@ -1285,7 +1298,7 @@ public static partial class Runtime
 
     // CType routing metrics, off unless asked for: (dotcl:%ctype-stats t) turns
     // collection on and resets, (dotcl:%ctype-stats) reports. Counting used to be
-    // unconditional, which put an interlocked increment on every SUBTYPEP — a
+    // unconditional, which put an interlocked increment on every SUBTYPEP; a
     // measurement cost the shipping runtime paid forever for a diagnostic that was
     // written as temporary. Plain increments: a lost count under threads is
     // acceptable in a diagnostic, a lock prefix in SUBTYPEP is not.
@@ -1304,7 +1317,7 @@ public static partial class Runtime
         s_ctypeStatsOn || s_ctypeHits + s_ctypeMisses + s_ctypeErrors > 0
             ? $"hits={s_ctypeHits} misses={s_ctypeMisses} errors={s_ctypeErrors} " +
               $"rate={s_ctypeHits * 100 / Math.Max(1, s_ctypeHits + s_ctypeMisses)}%"
-            : "collection off — (dotcl:%ctype-stats t) to start counting";
+            : "collection off; (dotcl:%ctype-stats t) to start counting";
 
     public static LispObject Subtypep(LispObject type1, LispObject type2)
     {
@@ -1336,7 +1349,7 @@ public static partial class Runtime
         var expanded2 = ExpandTypeSpecifier(type2);
         if (!ReferenceEquals(expanded2, type2)) return Subtypep(type1, expanded2);
 
-        // Normalize trivial compound types: (AND) → T, (OR) → NIL, (NOT T) → NIL, (NOT NIL) → T
+        // Normalize trivial compound types: (AND) -> T, (OR) -> NIL, (NOT T) -> NIL, (NOT NIL) -> T
         type1 = NormalizeTrivialCompound(type1);
         type2 = NormalizeTrivialCompound(type2);
 
@@ -1362,7 +1375,7 @@ public static partial class Runtime
         string? name1 = TypeSpecToName(type1);
         string? name2 = TypeSpecToName(type2);
 
-        // NIL is the bottom type — subtype of everything (CLHS 4.2.2)
+        // NIL is the bottom type: subtype of everything (CLHS 4.2.2)
         if (name1 == "NIL")
         {
             MultipleValues.SetPair(T.Instance, T.Instance);
@@ -1378,7 +1391,7 @@ public static partial class Runtime
                 return T.Instance;
             }
             // If name1 is not a known built-in type, not a registered user type (deftype),
-            // and not a CLOS class, we cannot be certain it's not a subtype — return uncertain.
+            // and not a CLOS class, we cannot be certain it's not a subtype: return uncertain.
             // Per CLHS: subtypep may return (nil nil) when it cannot determine the relationship.
             bool type1Known = _typeAncestors.ContainsKey(name1)
                 || TypeExpanders.ContainsKey(name1)
@@ -1446,7 +1459,7 @@ public static partial class Runtime
             bool super = CheckSubtype(base2, name1);
             if (sub)
             {
-                // name1 ⊂ base2, but we must also check if interval bounds constrain it.
+                // name1 subset-of base2, but we must also check if interval bounds constrain it.
                 // BIGNUM and INTEGER are unbounded, so they're NOT subtypes of any bounded interval.
                 // FIXNUM has a fixed range, so check against interval bounds.
                 bool interval2Bounded = low2.HasValue || high2.HasValue;
@@ -1547,25 +1560,25 @@ public static partial class Runtime
                 // cx="*" means bare COMPLEX = union of all complex subtypes
                 if (cx1 == "*" && cx2 == "*")
                 {
-                    // Both bare COMPLEX → equivalent
+                    // Both bare COMPLEX -> equivalent
                     MultipleValues.SetPair(T.Instance, T.Instance); return T.Instance;
                 }
                 if (cx2 == "*")
                 {
-                    // (COMPLEX type) <: COMPLEX → always true
+                    // (COMPLEX type) <: COMPLEX -> always true
                     MultipleValues.SetPair(T.Instance, T.Instance); return T.Instance;
                 }
                 if (cx1 == "*")
                 {
-                    // COMPLEX <: (COMPLEX type) → true only if all ucpt collapse to same
-                    // COMPLEX includes SF, DF, and REAL complex numbers, so false unless type→REAL
+                    // COMPLEX <: (COMPLEX type) -> true only if all ucpt collapse to same
+                    // COMPLEX includes SF, DF, and REAL complex numbers, so false unless type->REAL
                     // But actually bare COMPLEX = (COMPLEX *) which is all complex numbers
                     // It's only a subtype of (COMPLEX type) if (COMPLEX type) covers everything
                     // That only happens if all our upgraded types (REAL, SF, DF) equal ucpt(type)
                     // which is impossible since they differ. So: false.
                     MultipleValues.SetPair(Nil.Instance, T.Instance); return Nil.Instance;
                 }
-                // Both are specific compound types — compare upgraded part types.
+                // Both are specific compound types: compare upgraded part types.
                 // CLHS 12.1.5.3: (complex T1) <: (complex T2) if ucpt(T1) = ucpt(T2).
                 // Also: if T1 <: T2, then (complex T1) <: (complex T2) by set inclusion,
                 // because (complex T2) includes all specialized representations whose
@@ -1622,7 +1635,7 @@ public static partial class Runtime
         // (CONS * *) = (CONS T T) = CONS (all conses)
         var cons1 = ConsTypeArgs(type1); // null if not CONS compound
         var cons2 = ConsTypeArgs(type2);
-        // Normalize: CONS symbol → (CONS * *)
+        // Normalize: CONS symbol -> (CONS * *)
         var (car1, cdr1) = cons1 ?? (name1 == "CONS" ? ("*", "*") : (null!, null!));
         var (car2, cdr2) = cons2 ?? (name2 == "CONS" ? ("*", "*") : (null!, null!));
         if (car1 != null)
@@ -1822,7 +1835,7 @@ public static partial class Runtime
                 MultipleValues.SetPair(Nil.Instance, T.Instance);
                 return Nil.Instance;
             }
-            // Use CType disjoint check (no recursive Subtypep — pure CType algebra)
+            // Use CType disjoint check (no recursive Subtypep: pure CType algebra)
             try
             {
                 var ct1 = TypeParser.Parse(type1);
@@ -1833,7 +1846,7 @@ public static partial class Runtime
                     return T.Instance;
                 }
             }
-            catch { /* Parse failed — return uncertain */ }
+            catch { /* Parse failed; return uncertain */ }
             MultipleValues.SetPair(Nil.Instance, Nil.Instance);
             return Nil.Instance;
         }
@@ -1943,7 +1956,7 @@ public static partial class Runtime
             case Symbol sym: return sym.Name;
             case LispClass cls: return cls.Name.Name;
             case Cons cons when cons.Car is Symbol head:
-                // (COMPLEX), (COMPLEX *) → "COMPLEX"
+                // (COMPLEX), (COMPLEX *) -> "COMPLEX"
                 if (head.Name == "COMPLEX")
                 {
                     var arg = cons.Cdr is Cons cc ? cc.Car : null;
@@ -2024,7 +2037,7 @@ public static partial class Runtime
     public static bool IsBuiltinTypeName(string name) => _typeAncestors.ContainsKey(name);
 
     /// <summary>
-    /// Does SYM already name a type — a deftype expander, a class (defclass,
+    /// Does SYM already name a type: a deftype expander, a class (defclass,
     /// defstruct, define-condition all register one), or a built-in type name?
     /// </summary>
     public static bool NamesAType(Symbol sym) =>
@@ -2076,7 +2089,7 @@ public static partial class Runtime
             // dotcl extensions. DECIMAL sits under REAL but deliberately not
             // under RATIONAL or FLOAT: it is a third exactness category
             // (numberp/realp = T, rationalp/floatp = NIL). Listing them here is
-            // what makes them answer as types — TYPEP knows them from
+            // what makes them answer as types: TYPEP knows them from
             // CheckSimpleType, but the hierarchy is what SUBTYPEP and
             // KnownTypeNameP consult.
             ["DECIMAL"] = new[] { "REAL", "NUMBER", "T" },

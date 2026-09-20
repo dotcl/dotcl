@@ -11,14 +11,14 @@
 ;;; was only reachable by getting into the function body through the interpreter
 ;;; (28 ansi-test failures under :interpret).
 ;;;
-;;; Every case asserts both modes — the compiled half records that it was already
+;;; Every case asserts both modes: the compiled half records that it was already
 ;;; correct, the interpreted half is the real gate.
 
 (defun %ba-interpret (form)
   "Evaluate FORM under the interpreter and classify the failure. A PROGRAM-ERROR
    alone is NOT enough to call it fixed: the unchecked path also produced one,
    because the .NET IndexOutOfRange / Overflow gets wrapped on its way out. What
-   distinguishes a real check is that the report states the arity — the leaked
+   distinguishes a real check is that the report states the arity; the leaked
    .NET message says \"Index was outside the bounds of the array.\" instead. This
    is the assertion that gates the fix."
   (let ((dotcl:*evaluator-mode* :interpret))
@@ -83,7 +83,7 @@
 (def-arity-test "UNREAD-CHAR"        (unread-char))
 
 ;;; ------------------------------------------------------------------
-;;; The upper bound — pass extra arguments to builtins whose maximum CLHS fixes.
+;;; The upper bound: pass extra arguments to builtins whose maximum CLHS fixes.
 ;;;
 ;;; Adding the lower bound (above) left the upper one unchecked. A raw
 ;;; LispFunction simply ignores args.Length > n, so surplus arguments were dropped
@@ -131,7 +131,7 @@
 ;;; its lower bound match the rest.
 (def-arity-test "RANDOM"            (random))
 
-;;; valid calls must still be accepted — this change adds errors, so watch the
+;;; valid calls must still be accepted: this change adds errors, so watch the
 ;;; false-positive side
 (deftest builtin-arity.max-valid-calls-still-work
   (let ((dotcl:*evaluator-mode* :interpret))

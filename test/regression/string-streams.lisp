@@ -23,7 +23,7 @@
     (file-position s))
   2)
 
-;; Seeking to the end (position == length) is valid — leaves the stream at EOF.
+;; Seeking to the end (position == length) is valid: leaves the stream at EOF.
 ;; Previously SeekToPosition rejected `>= _endOffset`, so this returned NIL.
 (deftest string-stream-file-position-to-eof-return
   (file-position (make-string-input-stream "hi") 2)  ; length 2, seek to EOF

@@ -12,7 +12,7 @@ public static partial class Runtime
         bool hostSet = false, deviceSet = false, nameSet = false, typeSet = false, directorySet = false, versionSet = false;
 
         // Helper: convert a value to the appropriate LispObject for a pathname component.
-        // :WILD keyword → stored as-is; string → LispString; NIL → null; otherwise stored as-is.
+        // :WILD keyword -> stored as-is; string -> LispString; NIL -> null; otherwise stored as-is.
         static LispObject? ToComponent(LispObject val)
         {
             if (val is Nil) return null;
@@ -159,7 +159,7 @@ public static partial class Runtime
             // A nil path directory can match a pattern that only contains ** (zero dirs allowed)
             if (wildDir is Cons wc)
             {
-                // Check: (:absolute :wild-inferiors) or (:relative :wild-inferiors) — ** matches zero dirs
+                // Check: (:absolute :wild-inferiors) or (:relative :wild-inferiors); ** matches zero dirs
                 var wFirst = wc.Car;
                 bool isAbsOrRel = wFirst is Symbol ws0 && (ws0.Name == "ABSOLUTE" || ws0.Name == "RELATIVE");
                 if (isAbsOrRel && wc.Cdr is Cons wRest
@@ -278,9 +278,9 @@ public static partial class Runtime
 
     private static LispObject? TranslateComponent(LispObject? src, LispObject? from, LispObject? to)
     {
-        if (to == null) return src; // nil in dest → use source
-        if (to is Symbol ts && ts.Name == "WILD") return src; // :wild in dest → use source
-        if (to is LispString tstr && tstr.Value == "*") return src; // "*" in dest → use source
+        if (to == null) return src; // nil in dest -> use source
+        if (to is Symbol ts && ts.Name == "WILD") return src; // :wild in dest -> use source
+        if (to is LispString tstr && tstr.Value == "*") return src; // "*" in dest -> use source
         return to;
     }
 
@@ -381,7 +381,7 @@ public static partial class Runtime
         // remain a LispLogicalPathname so downstream ResolvePhysicalPath translates it
         // through its host's translations. Returning a plain LispPathname here merged the
         // logical host into the namestring (e.g. "//CLTESTCOMPILE-FILE-TEST-LP.fasl",
-        // which on Windows became "\CLTESTCOMPILE-FILE-TEST-LP.fasl") — ANSI COMPILE-FILE.17.
+        // which on Windows became "\CLTESTCOMPILE-FILE-TEST-LP.fasl"): ANSI COMPILE-FILE.17.
         var fasl = new LispString("fasl");
         return p is LispLogicalPathname
             ? new LispLogicalPathname(p.Host, p.Device, p.DirectoryComponent, p.NameComponent, fasl, p.Version)

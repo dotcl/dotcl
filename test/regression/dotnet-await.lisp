@@ -1,4 +1,4 @@
-;;; Regression tests for dotnet:await — blocking await of .NET awaitables (step A)
+;;; Regression tests for dotnet:await: blocking await of .NET awaitables (step A)
 
 ;;; non-generic Task completes -> NIL (void)
 (deftest d1301-await-task-void

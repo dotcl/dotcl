@@ -3,7 +3,7 @@
 ;;; .NET has no way to interrupt arbitrary running code (Thread.Abort is gone),
 ;;; so delivery rides Thread.Interrupt: a thread sitting in a wait (SLEEP, JOIN,
 ;;; condition-variable, semaphore) is thrown out of it, and the queued function
-;;; runs there. A thread busy computing is not interrupted — the function stays
+;;; runs there. A thread busy computing is not interrupted: the function stays
 ;;; queued until it next blocks. That boundary is the contract, not a bug; the
 ;;; tests below only exercise the blocking side.
 ;;;
@@ -29,7 +29,7 @@
       (list *it-flag* (dotcl-thread:thread-alive-p th))))
   (:ran nil))
 
-;;; A non-local exit from the queued function unwinds the target thread — this
+;;; A non-local exit from the queued function unwinds the target thread; this
 ;;; is how a timeout is delivered. The thread's own handler catches it.
 (deftest interrupt-thread-non-local-exit
   (let* ((result (dotcl-thread:make-thread
@@ -64,7 +64,7 @@
   :sem-ran)
 
 ;;; DESTROY-THREAD pokes the target the same way (that is all .NET offers), but
-;;; queues nothing — so the interrupt must still end the thread rather than be
+;;; queues nothing: so the interrupt must still end the thread rather than be
 ;;; swallowed as a spurious wakeup. bt's generic WITH-TIMEOUT destroys its
 ;;; watchdog on the normal path, and a watchdog that survived would go on to
 ;;; deliver a stale timeout.

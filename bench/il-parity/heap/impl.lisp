@@ -1,0 +1,88 @@
+;;;; A binary min-heap of fixnums, against IlParity.Heap.
+;;;;
+;;;; The sift loops are the interesting part: index arithmetic that either stays
+;;;; in registers or spills through an object per step. Both sides are written
+;;;; as a loop with an explicit exit, so a difference in the IL is a difference
+;;;; in lowering rather than in phrasing.
+
+(in-package :cl-user)
+
+(defstruct (ilp-heap (:constructor %make-ilp-heap (items count)))
+  (items (make-array 0 :element-type 'fixnum) :type (simple-array fixnum (*)))
+  (count 0 :type fixnum))
+
+(defun ilp-heap-new (capacity)
+  (declare (fixnum capacity) (optimize (speed 3) (safety 0) (debug 0)))
+  (%make-ilp-heap (make-array capacity :element-type 'fixnum :initial-element 0) 0))
+
+(defun ilp-heap-push (h v)
+  (declare (type ilp-heap h) (fixnum v)
+           (optimize (speed 3) (safety 0) (debug 0)))
+  (let ((items (ilp-heap-items h))
+        (i (ilp-heap-count h)))
+    (declare (type (simple-array fixnum (*)) items) (fixnum i))
+    (setf (aref items i) v)
+    (setf (ilp-heap-count h) (the fixnum (1+ i)))
+    (loop while (> i 0)
+          do (let ((parent (the fixnum (ash (the fixnum (1- i)) -1))))
+               (declare (fixnum parent))
+               (when (<= (the fixnum (aref items parent)) (the fixnum (aref items i)))
+                 (return))
+               (let ((tmp (the fixnum (aref items parent))))
+                 (declare (fixnum tmp))
+                 (setf (aref items parent) (the fixnum (aref items i)))
+                 (setf (aref items i) tmp))
+               (setq i parent)))
+    v))
+
+(defun ilp-heap-pop (h)
+  (declare (type ilp-heap h) (optimize (speed 3) (safety 0) (debug 0)))
+  (let* ((items (ilp-heap-items h))
+         (top (the fixnum (aref items 0)))
+         (n (the fixnum (1- (ilp-heap-count h))))
+         (i 0))
+    (declare (type (simple-array fixnum (*)) items) (fixnum top n i))
+    (setf (ilp-heap-count h) n)
+    (setf (aref items 0) (the fixnum (aref items n)))
+    (loop
+      (let ((left (the fixnum (+ (the fixnum (* 2 i)) 1))))
+        (declare (fixnum left))
+        (when (>= left n) (return))
+        (let ((small left)
+              (right (the fixnum (1+ left))))
+          (declare (fixnum small right))
+          (when (and (< right n)
+                     (< (the fixnum (aref items right)) (the fixnum (aref items left))))
+            (setq small right))
+          (when (<= (the fixnum (aref items i)) (the fixnum (aref items small)))
+            (return))
+          (let ((tmp (the fixnum (aref items i))))
+            (declare (fixnum tmp))
+            (setf (aref items i) (the fixnum (aref items small)))
+            (setf (aref items small) tmp))
+          (setq i small))))
+    top))
+
+(defun ilp-heap-size (h)
+  (declare (type ilp-heap h) (optimize (speed 3) (safety 0) (debug 0)))
+  (the fixnum (ilp-heap-count h)))
+
+(defun ilp-heap-selfcheck (n)
+  (declare (fixnum n) (optimize (speed 3) (safety 0) (debug 0)))
+  (let ((h (ilp-heap-new (the fixnum (1+ n))))
+        (acc 0)
+        (prev -1))
+    (declare (fixnum acc prev))
+    (dotimes (i n)
+      (declare (fixnum i))
+      (ilp-heap-push h (the fixnum (mod (the fixnum (* i 37)) 101))))
+    (dotimes (i n)
+      (declare (fixnum i))
+      (let ((v (ilp-heap-pop h)))
+        (declare (fixnum v))
+        ;; Pops come out non-decreasing; fold that into the answer so a broken
+        ;; sift shows up as a different number, not just a slow one.
+        (when (< v prev) (setq acc (the fixnum (- acc 1000))))
+        (setq prev v)
+        (setq acc (the fixnum (+ acc (the fixnum (* v (the fixnum (1+ i)))))))))
+    acc))

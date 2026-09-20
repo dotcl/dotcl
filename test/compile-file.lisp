@@ -1,5 +1,5 @@
-;;; compile-file.lisp — Tests for compile-file content correctness
-;;; Tests that various Lisp constructs survive compile-file → load round-trip.
+;;; compile-file.lisp: Tests for compile-file content correctness
+;;; Tests that various Lisp constructs survive compile-file -> load round-trip.
 ;;; Complements ansi-test/system-construction/compile-file.lsp which tests
 ;;; the compile-file protocol (return values, pathnames, warnings).
 

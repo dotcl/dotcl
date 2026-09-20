@@ -46,7 +46,7 @@
   4)
 
 ;;; A NOTINLINE declaration of the function name suppresses its compiler macro
-;;; for calls in that scope (CLHS 3.2.2.1.1) — previously dotcl ignored notinline
+;;; for calls in that scope (CLHS 3.2.2.1.1): previously dotcl ignored notinline
 ;;; and the CM always fired (ANSI DEFINE-COMPILER-MACRO.7).
 (defun %cm-ni-fn (x) (* x 1000))                     ; real fn: *1000
 (define-compiler-macro %cm-ni-fn (x) `(* ,x 2))      ; CM: *2
@@ -89,7 +89,7 @@
   (signals-error (symbol-package 42) type-error)
   t)
 
-;;; TCO — tail-recursive function shouldn't stack overflow.
+;;; TCO: tail-recursive function shouldn't stack overflow.
 ;;;
 ;;; Both evaluators: the compiler eliminates a self tail call, and the tree-walk
 ;;; evaluator hands one to its trampoline, so neither grows the stack per
@@ -152,14 +152,14 @@
   (when new-x (setf (d616-x obj) new-x)))
 
 (deftest d616-method-key-accepted
-  ;; :new-x is declared as &key in the :before method — should not signal
+  ;; :new-x is declared as &key in the :before method: should not signal
   (let ((obj (make-instance 'd616-test-class :x 1)))
     (reinitialize-instance obj :new-x 42)
     (d616-x obj))
   42)
 
 (deftest d616-unknown-key-rejected
-  ;; :z is not declared by any method or slot — should signal
+  ;; :z is not declared by any method or slot: should signal
   (let ((obj (make-instance 'd616-test-class :x 1)))
     (not (null (handler-case
                  (progn (reinitialize-instance obj :z 99) nil)
@@ -206,7 +206,7 @@
 ;;; SB-KERNEL:SINGLE-FLOAT-BITS and broke make-host-1). They were put in CL on the
 ;;; premise that nibbles calls them as CL symbols; it calls them unqualified and
 ;;; gets its own portable NIBBLES:: definitions. Reachability is what matters, and
-;;; the DOTCL-INTERNAL bridge provides it — the round-trip tests below cover that.
+;;; the DOTCL-INTERNAL bridge provides it: the round-trip tests below cover that.
 (deftest d613-single-float-bits-not-in-cl
   (null (find-symbol "SINGLE-FLOAT-BITS" "COMMON-LISP"))
   t)
@@ -248,7 +248,7 @@
 ;;; that progn is COMPILED, because a later DEFSTRUCT builds its accessor names at
 ;;; macroexpansion time and interns them in *PACKAGE*. A file gets this from the
 ;;; loader, which splits a toplevel progn and compiles+runs each piece in turn; that
-;;; split does not reach inside MACROLET, and EVAL of a whole progn never gets it —
+;;; split does not reach inside MACROLET, and EVAL of a whole progn never gets it;
 ;;; so both shapes interned the accessors in the wrong package. (SBCL puts them in
 ;;; those two packages for both.) *PACKAGE* is rebound so the test cannot leak.
 (defpackage "CT-ORDER-PKG-A" (:use "CL"))
@@ -290,7 +290,7 @@
   `(quote ,env))
 
 (deftest d618-environment-not-ignored
-  ;; In a simple eval context, environment is typically nil — verify the macro expands
+  ;; In a simple eval context, environment is typically nil: verify the macro expands
   (let ((result (d618-env-macro ignore-me)))
     t)
   t)
@@ -384,7 +384,7 @@
 (defun %d664-f ()
   (if (< %d664-a 10)
       %d664-a
-      (let ((%d664-a (1- %d664-a)))  ; special LET → try/finally around body
+      (let ((%d664-a (1- %d664-a)))  ; special LET -> try/finally around body
         (%d664-f))))                  ; self-tail-call must NOT emit raw br
 
 (deftest d664-tco-across-special-let
@@ -423,7 +423,7 @@
   103.5)
 
 (deftest d667-fixnum-literal-optimization
-  ;; Both literals — optimization fires but result is correct.
+  ;; Both literals: optimization fires but result is correct.
   (+ 1 2 3 4 5)
   15)
 
@@ -451,7 +451,7 @@
   (:yes :no))
 
 (deftest d668-fixnum-cmp-in-not
-  ;; (if (not (= a b)) ...) — inverted branch path through fused cmp.
+  ;; (if (not (= a b)) ...): inverted branch path through fused cmp.
   (if (not (= (the fixnum 1) (the fixnum 2))) :diff :same)
   :diff)
 
@@ -633,7 +633,7 @@
 ;;; and idempotent re-require short-circuits even when the contrib's
 ;;; file forgot to call (provide ...).
 (deftest d688-require-first-returns-non-nil
-  ;; Use a contrib that doesn't call (provide ...) itself —
+  ;; Use a contrib that doesn't call (provide ...) itself;
   ;; dotcl-cs is such a module (intentionally). Require should
   ;; auto-push its name so the set-difference is non-nil.
   (consp (require "dotcl-cs"))
@@ -676,11 +676,11 @@
 ;;; Toy reproducer: macro that stores a gensym on a plist during expansion.
 ;;; A second macro reads the plist to produce a reference to that gensym.
 ;;; Without caching, analysis re-expands %d709-sif (clobbering the plist),
-;;; then code-gen sees the old gensym → unbound-variable.
+;;; then code-gen sees the old gensym -> unbound-variable.
 
 (let ((%d709-sym nil))
   (defmacro %d709-sif (test then else)
-    ;; Fresh gensym each time — plist-store style (like anaphora's sif)
+    ;; Fresh gensym each time: plist-store style (like anaphora's sif)
     (let ((g (gensym "SIF")))
       (setf (get '%d709-sym-key :current) g)
       `(let ((,g ,test))
@@ -707,7 +707,7 @@
 ;;; Per CLHS, get-setf-expansion's storing form must return the values of
 ;;; the store variables. The car/cdr/nth cases in %get-setf-expansion
 ;;; previously used (rplaca ...) / (rplacd ...) / (rplaca (nthcdr ...) ...)
-;;; directly, which return the cons — leaking through incf/decf as primary
+;;; directly, which return the cons: leaking through incf/decf as primary
 ;;; value. Symptom: anaphora ASIF.1 got (1) instead of 1.
 
 (deftest d712-incf-car-returns-value
@@ -751,7 +751,7 @@
 ;;; asdf.fasl (could not find (setf asdf::operate-level)).
 ;;;
 ;;; Symbol accesses are wrapped in `read-from-string` so that reading this file
-;;; does not require the d713-pkg package to exist yet — it is created inside
+;;; does not require the d713-pkg package to exist yet: it is created inside
 ;;; the compile-file source below.
 (defun %d713-setf-fn-fasl ()
   (let* ((tmp (format nil "~a/dotcl-d713-~a"
@@ -772,7 +772,7 @@
            (setf-place (list 'setf place-sym)))
       (and (fboundp place-sym)
            (fboundp setf-place)
-           ;; Invoke the setf function directly — avoids a second read of the
+           ;; Invoke the setf function directly: avoids a second read of the
            ;; package-qualified symbol at test form evaluation time.
            (eql (funcall (fdefinition setf-place) 42) 42)
            (eql (funcall place-sym) 42)))))
@@ -896,7 +896,7 @@
   (single-float t 4 1 0 1 1))
 
 ;;; dotnet:invoke / dotnet:static unified InvokeMember dispatch
-;;; (method, property, field — both read and setf).
+;;; (method, property, field: both read and setf).
 (deftest d741-invoke-method-and-property-and-setf
   (let ((sb (dotnet:new "System.Text.StringBuilder")))
     (dotnet:invoke sb "Append" "hello")
@@ -1158,7 +1158,7 @@
           nconc (%m (copy-seq x))))
   (a b c d e f g i))
 
-;;; Windows long path (>MAX_PATH=260) — regression check that .NET 10
+;;; Windows long path (>MAX_PATH=260): regression check that .NET 10
 ;;; handles these transparently. Works even when LongPathsEnabled=0.
 #+windows
 (deftest d850-windows-long-path
@@ -1244,7 +1244,7 @@
   42)
 
 ;;; native fixnum self-call path (box/unbox elimination)
-;;; tak with all fixnum params + fixnum return → native body compiled,
+;;; tak with all fixnum params + fixnum return -> native body compiled,
 ;;; inner recursive calls use InvokeNative3 instead of boxing round-trip
 (defun %d903-tak (x y z)
   (declare (fixnum x y z))
@@ -1369,7 +1369,7 @@
   6)
 
 (deftest d919-labels-non-tail-call-still-works
-  ;; Non-tail calls to labels fns use boxes (closures) — still correct
+  ;; Non-tail calls to labels fns use boxes (closures): still correct
   (labels ((double (n) (if (= n 0) 0 (+ 2 (double (1- n)))))
            (triple (n) (if (= n 0) 0 (+ 3 (triple (1- n)))))
            )
@@ -1431,7 +1431,7 @@
     'type-error)
   t)
 
-;;; CLHS 3.2.4.2 — make-load-form protocol in FASL compiler
+;;; CLHS 3.2.4.2: make-load-form protocol in FASL compiler
 ;;; When a struct constant is embedded in compiled code and make-load-form
 ;;; is defined for its type, the FASL loader must invoke the creation form
 ;;; rather than directly serializing raw slots.
@@ -1466,7 +1466,7 @@
     (eql (%mlf-box2-val (symbol-value (find-symbol "*MLF-TEST-VAL*"))) 99))
   t)
 
-;;; CLHS 3.2.4.2 — the make-load-form CREATION form must be EVALUATED at LOAD
+;;; CLHS 3.2.4.2: the make-load-form CREATION form must be EVALUATED at LOAD
 ;;; time, not bypassed by returning the compile-time instance. The compile-time
 ;;; intern pre-registration used to make InternViaEval cache-HIT the compile-time
 ;;; object and skip the creation-form eval, so creation-form side effects never
@@ -1492,7 +1492,7 @@
           (%mlf-name (symbol-value (find-symbol "*MLF-C*")))))
   (t foo))
 
-;;; FMAKUNBOUND must clear a macro definition too — including a macro defined on
+;;; FMAKUNBOUND must clear a macro definition too: including a macro defined on
 ;;; a gensym. The *macros* table is keyed by symbol identity; FMAKUNBOUND cleared
 ;;; it by a LispString of the name, leaving the symbol-keyed entry, so FBOUNDP /
 ;;; MACRO-FUNCTION still found the macro afterward (ANSI FMAKUNBOUND.3).
@@ -1623,7 +1623,7 @@
   (t t nil))
 
 ;;; A defstruct slot whose name is a SPECIAL variable must not shadow that
-;;; variable in later slots' default initforms — the keyword constructor binds
+;;; variable in later slots' default initforms: the keyword constructor binds
 ;;; such a slot via a gensym, not the special symbol (ANSI STRUCTURE-60-1).
 (defvar *rf-st60* 100)
 (defstruct rf-struct-60
@@ -1663,7 +1663,7 @@
     (not (null (find-package "DOTCL-THREAD"))))
   t)
 
-;;; dotcl:backtrace — named-function call stack, innermost first
+;;; dotcl:backtrace: named-function call stack, innermost first
 (defun %bt-c () (dotcl:backtrace))
 (defun %bt-b () (%bt-c))
 (defun %bt-a () (%bt-b))
@@ -1835,10 +1835,10 @@
            (setf (documentation 'dotcl:save-application 'function) nil)))
   "user override")
 
-;;; #19 — a leading ~ in a STRING file spec must expand to the user home
+;;; #19: a leading ~ in a STRING file spec must expand to the user home
 ;;; on the LOAD/OPEN/PROBE-FILE path (ResolvePhysicalPath), not just for
 ;;; (pathname "~/..."). Previously (load "~/x") treated ~ as a relative segment
-;;; → cwd/~/x. probe-file "~" exercises ResolvePhysicalPath; home always exists,
+;;; -> cwd/~/x. probe-file "~" exercises ResolvePhysicalPath; home always exists,
 ;;; so a correct expansion returns a non-nil pathname with no literal ~.
 (deftest d1146-tilde-string-expands-on-file-ops
   (let ((p (probe-file "~")))
@@ -1878,7 +1878,7 @@
 ;;; compile-file must not leak compile-time *modules* mutations. A
 ;;; (provide "x") (or (require "x")) evaluated at :compile-toplevel pushed "x"
 ;;; into the global *modules* and survived compile-file, while the matching
-;;; compile-time defuns were stripped — so a later load-time (require "x")
+;;; compile-time defuns were stripped: so a later load-time (require "x")
 ;;; saw "x" already in *modules*, skipped re-loading, and the module's
 ;;; functions stayed unbound. Surfaced as quicklisp's compile-time
 ;;; (require "dotcl-socket") leaving ql-dotcl:socket-connect undefined on the
@@ -1892,7 +1892,7 @@
     (with-open-file (s src :direction :output :if-exists :supersede)
       (format s "(eval-when (:compile-toplevel) (provide \"dotcl-cfmod-phantom\"))~%"))
     (compile-file src)
-    ;; Provided only at compile time → must not survive into the image's *modules*.
+    ;; Provided only at compile time -> must not survive into the image's *modules*.
     (and (member "dotcl-cfmod-phantom" *modules* :test #'string=) t)))
 
 (deftest-compiled-only compile-file-does-not-leak-compile-time-modules
@@ -1973,7 +1973,7 @@
 ;;; UNC paths (\\server\share\...) must keep the server as the pathname host and
 ;;; round-trip. Previously the leading // was dropped (RemoveEmptyEntries split),
 ;;; giving (:absolute "server" "share" ...) with host NIL, which reconstructed to
-;;; a bogus local \server\share\... — directory returned nothing and probe-file
+;;; a bogus local \server\share\...: directory returned nothing and probe-file
 ;;; was NIL on a perfectly valid mapped UNC path. (Filesystem-independent here.)
 (deftest unc-pathname-host
   (pathname-host (pathname "//srv/share/dir/file.txt"))
@@ -2011,7 +2011,7 @@
                (%refs-p-276 (cdr tree) key))))) ; tail self-call (TCO target)
 
 (deftest issue276-or-nontail-self-truthy-deep
-  ;; ( :x :x ... (:ldloc 7) ) with a 60-deep spine — the match is in a deep
+  ;; ( :x :x ... (:ldloc 7) ) with a 60-deep spine: the match is in a deep
   ;; car, reached only via the non-tail OR arm while the tail arm loops the cdr.
   (%refs-p-276
    (let ((lst '((:ldloc 7))))
@@ -2041,8 +2041,8 @@
 ;; intermediate args makes 4 eval-and-compile ANSI tests (EVAL-WHEN.1,
 ;; DEFINE-COMPILER-MACRO.4/7, MACRO-FUNCTION.15) flip to FAIL. Investigation
 ;; investigation found these are state-ordering-fragile, not a deterministic
-;; AND miscompile: one root cause — a bare {:execute} eval-when at top level of
-;; a compiled file leaked its body into the fasl — was fixed independently
+;; AND miscompile: one root cause, a bare {:execute} eval-when at top level of
+;; a compiled file leaked its body into the fasl, was fixed independently
 ;; (see issue333-eval-when-execute-only-discarded-in-compiled-file below and
 ;; the compile-eval-when change). That alone makes eval-and-compile 318/318
 ;; standalone, but adding the AND fix still perturbs cross-test state. The AND
@@ -2050,8 +2050,8 @@
 
 ;;; rename-file must replace an existing target (POSIX rename / SBCL semantics).
 ;;; Previously it used File.Move without overwrite, so renaming onto an existing
-;;; file threw "Cannot create a file when that file already exists" — which broke
-;;; asdf's atomic-write idiom (write temp → rename onto final), making the second
+;;; file threw "Cannot create a file when that file already exists"; which broke
+;;; asdf's atomic-write idiom (write temp -> rename onto final), making the second
 ;;; build of any external system fail in load-asd.
 (deftest rename-file-overwrites-existing
   (let ((src "dotcl-rf-src.tmp")
@@ -2070,7 +2070,7 @@
 ;;; compiled file must be DISCARDED: its body is neither run at compile time nor
 ;;; placed into the fasl's load code. Previously compile-eval-when emitted the
 ;;; body whenever :execute was present (or lt-p ex-p), so loading the compiled
-;;; file wrongly ran the :execute-only body — an extra side effect.  Fixed to
+;;; file wrongly ran the :execute-only body: an extra side effect.  Fixed to
 ;;; emit-for-load iff :load-toplevel is present at top level.
 (defparameter *ew-discard-collector* nil)
 (deftest-compiled-only issue333-eval-when-execute-only-discarded-in-compiled-file
@@ -2112,8 +2112,8 @@
       (ignore-errors (delete-file fasl))))
   (:load))
 
-;;; DEFUN of a (setf name) function returns the function name itself — the list
-;;; (SETF name) — not a symbol interned from the mangled string "(SETF name)".
+;;; DEFUN of a (setf name) function returns the function name itself, the list
+;;; (SETF name), not a symbol interned from the mangled string "(SETF name)".
 ;;; compile-defun emitted the mangled symbol for non-symbol names, so
 ;;; (eval `(defun (setf ,g) ...)) returned |(SETF G)| instead of (SETF G)
 ;;; (ANSI DEFINE-COMPILER-MACRO.4).
@@ -2159,7 +2159,7 @@
 ;;; compile-file-pathname of a LOGICAL pathname must stay logical (keep its host),
 ;;; so the default output is translated through the host's translations. Returning
 ;;; a physical pathname that reused the logical host mashed host+name into the
-;;; namestring ("//CLTEST..." → "\CLTEST..." on Windows), breaking compile-file of
+;;; namestring ("//CLTEST..." -> "\CLTEST..." on Windows), breaking compile-file of
 ;;; a logical pathname (ANSI COMPILE-FILE.17).
 (deftest compile-file-pathname-logical-stays-logical
   (progn
@@ -2188,7 +2188,7 @@
 ;;; (e.g. LOOP ... COLLECT). The compiler pushed the function value, then
 ;;; compiled the list args (building the array) with that value still on the
 ;;; stack; a LOOP arg's try-block entry then violated CIL's empty-stack rule
-;;; → "CLR detected an invalid program" (inquisitor resolve-states).
+;;; -> "CLR detected an invalid program" (inquisitor resolve-states).
 ;;; Fixed by stashing function + arg-array in temps so the stack is empty
 ;;; while each list arg compiles.
 (defun %mapcarn-loop-a (p) (mapcar (lambda (a i) (list a i)) p (loop for i below (length p) collect i)))
@@ -2265,7 +2265,7 @@
 ;;; Finalizers: dotcl:finalize returns the object; cancel-finalization
 ;;; returns T when a finalizer was registered, NIL otherwise; run-finalizers
 ;;; returns a count. (Whether/when GC actually fires a finalizer is
-;;; timing-dependent and verified manually, not asserted here — same policy as
+;;; timing-dependent and verified manually, not asserted here: same policy as
 ;;; the weak-pointer/weak-hash-table tests above.)
 (deftest i342-finalize-api
   (let ((obj (list 'x)))
@@ -2280,7 +2280,7 @@
 ;;; %mini-eval MACROLET case, and three cil-analysis walkers); the analysis copies
 ;;; inlined (destructuring-bind PARAMS (cdr form) ...), omitting &whole handling,
 ;;; and the analysis pass caches its expansion in *macroexpand-cache* for compile
-;;; to reuse — so &whole var bound to (cdr form) even though compile-macrolet was
+;;; to reuse: so &whole var bound to (cdr form) even though compile-macrolet was
 ;;; correct. Now all sites share %macrolet-expander-form (MACROLET.4/12).
 (deftest i350-macrolet-whole
   (list
@@ -2296,7 +2296,7 @@
 
 ;;; get-setf-expansion of a function-call place yields the CLHS 5.1.2.5 store
 ;;; form (funcall #'(setf f) store temps...), with the args bound to temps and
-;;; evaluated once — not a re-emitted (setf place store). gethash/get/char/
+;;; evaluated once: not a re-emitted (setf place store). gethash/get/char/
 ;;; slot-value/symbol-value/cadr/cdar are modeled explicitly in %get-setf-expansion
 ;;; (matching the SETF macro's setters) so they keep their real store forms and
 ;;; the funcall fallback only applies to genuine (setf f) function places
@@ -2368,7 +2368,7 @@
 ;;; namestring is drive-relative ("C:scratch/..."): ResolvePhysicalPath must merge it
 ;;; with DPD (CL :relative-directory semantics), not resolve it against drive C:'s
 ;;; process-global cwd, or delete-file and ensure-directories-exist diverge and the
-;;; created flag comes back NIL (ENSURE-DIRECTORIES-EXIST.8 — Windows-only).
+;;; created flag comes back NIL (ENSURE-DIRECTORIES-EXIST.8: Windows-only).
 (defun %i355-ede ()
   (let* ((base (format nil "~a/dotcl-i355-~a/" (or (dotcl:getenv "TEMP") "/tmp")
                        (get-internal-real-time)))
@@ -2390,7 +2390,7 @@
   (%i355-ede)
   (t t t))
 
-;;; dotcl:package-locally-nicknamed-by-list — the packages that have a local
+;;; dotcl:package-locally-nicknamed-by-list: the packages that have a local
 ;;; nickname for the given package. Completes dotcl's PLN API so the
 ;;; ../trivial-package-local-nicknames fork can import all four operators from
 ;;; the DOTCL package instead of dotcl shipping a contrib stub.
@@ -2406,7 +2406,7 @@
       (ignore-errors (delete-package targ))))
   (("I356-HOST") nil))
 
-;;; princ / ~A must NOT print the package prefix of a symbol — including the
+;;; princ / ~A must NOT print the package prefix of a symbol: including the
 ;;; keyword colon and the #: of an uninterned symbol (CLHS 22.1.3.3: the prefix
 ;;; is printed only when *print-escape* / *print-readably* is true). The keyword
 ;;; case previously leaked the colon ((princ-to-string :foo) => ":FOO"), which
@@ -2439,7 +2439,7 @@
 
 ;;; CIL codegen: (setf (svref/aref/schar/elt place idx) VALUE) where VALUE is a
 ;;; try-based non-local exit (block/return, loop with finally/return) produced
-;;; unverifiable IL — the array-store path (%set-elt / %set-char) pushed array+
+;;; unverifiable IL: the array-store path (%set-elt / %set-char) pushed array+
 ;;; index onto the CIL stack, then entered the value's try region with a
 ;;; non-empty stack ("enter try block with nonempty stack"). Now spilled to
 ;;; temps like the function-call path. Found via the upstream flexi-streams
@@ -2504,7 +2504,7 @@
 
 ;;; A self-recursive call in cond TEST position must not be TCO'd into a
 ;;; jump.  When the recursion returns NIL the clause is skipped (CLHS), so the
-;;; following clauses — including the t clause — must still be evaluated.
+;;; following clauses, including the t clause, must still be evaluated.
 (defun %i373-r (x)
   (cond ((atom x) nil)        ; base: atom -> nil
         ((%i373-r (car x)))   ; test-only self-recursive arm; (r 'z) -> nil
@@ -2526,7 +2526,7 @@
 
 ;;; Complex literals must survive compile-file -> load (the fasl writer
 ;;; had no inline encoding for LispComplex and silently corrupted the constant
-;;; pool — a list element #C(0 1) came back as an unrelated string constant).
+;;; pool: a list element #C(0 1) came back as an unrelated string constant).
 (defun %i370-roundtrip ()
   (let ((src (merge-pathnames "i370-cplx-tmp.lisp" *default-pathname-defaults*)))
     (with-open-file (s src :direction :output :if-exists :supersede)
@@ -2595,7 +2595,7 @@
   (coerce 3 '(single-float 0.0))
   3.0)
 
-;; typep/subtypep already worked — guard they still do
+;; typep/subtypep already worked: guard they still do
 (deftest i374-typep-computed-deftype
   (typep 1.0d0 '%i374-flonum)
   t)
@@ -2632,7 +2632,7 @@
 
 ;;; delete / delete-if / delete-if-not must be DESTRUCTIVE on a list: splice the
 ;;; matched conses out of the original chain in place (SBCL semantics), so code
-;;; that discards the return value and relies on in-place mutation works — e.g.
+;;; that discards the return value and relies on in-place mutation works; e.g.
 ;;; Maxima rempropchk / mfunction-delete do (delete x list ...) without setq.
 ;;; remove stays non-destructive.
 (deftest delete-splices-list-in-place
@@ -2722,14 +2722,14 @@
     (run 1))
   7)
 
-;; Guard: a body reference to a mutated outer var was already correct — keep it so.
+;; Guard: a body reference to a mutated outer var was already correct; keep it so.
 (deftest flet-body-reads-current-outer-var
   (flet ((run (x) (let ((a x)) (flet ((g () a)) (setq a 99) (g)))))
     (run 1))
   99)
 
 ;;; Comparing a non-finite float (inf/nan) with an integer/rational must not throw
-;;; "RATIONAL: infinity cannot be converted" — a non-finite float has no rational
+;;; "RATIONAL: infinity cannot be converted": a non-finite float has no rational
 ;;; value, so </>/=/min/max compare as doubles instead of rationalizing. (Maxima's
 ;;; float-inf-p does (< x 0), which broke string/fortran output of any inf float.)
 (deftest float-infinity-vs-rational-compare
@@ -2791,7 +2791,7 @@
 ;;; (coerce x '(complex <deftype>)) must expand the nested part deftype and convert
 ;;; the real/imag parts, not just literal float part names. fixed top-level
 ;;; deftype coerce; this is the nested-in-complex case. (Maxima float-zeta does
-;;; (coerce s '(complex flonum)) — flonum being a deftype — and broke without this.)
+;;; (coerce s '(complex flonum)), flonum being a deftype, and broke without this.)
 (deftype %i384-simpf () 'double-float)
 (deftype %i384-compf (&optional lo) (if lo `(double-float ,lo) 'double-float))
 (deftest i384-coerce-complex-nested-deftype
@@ -2833,7 +2833,7 @@
   (t t t t))
 
 ;;; A user define-compiler-macro must be removed by (setf (compiler-macro-function
-;;; name) nil) and by fmakunbound — otherwise a stale compiler macro keeps rewriting
+;;; name) nil) and by fmakunbound: otherwise a stale compiler macro keeps rewriting
 ;;; calls after the function is killed and redefined with a different signature
 ;;; (Maxima defmfun's $foo -> $foo-impl rewrite; rtest_translator 180/197).
 (defun %i386a (&rest a) (declare (ignore a)) :real)
@@ -2891,7 +2891,7 @@
   (1.0d0 1.0d0 1.0d0 0.0d0 0.9999999999999999d0 0.6666666666666666d0 0.5d0))
 
 ;;; The project-core dependency walk must resolve ASDF feature-conditional
-;;; dependency specifiers — (:feature :dotcl "x") — not just plain names. asdf:find-system
+;;; dependency specifiers, (:feature :dotcl "x"), not just plain names. asdf:find-system
 ;;; returns NIL for such a spec, dropping the dependency from the build manifest (so the
 ;;; fasl loads without its contrib and fails later). asdf/find-component:resolve-dependency-spec
 ;;; normalizes the spec to the system. (asdf symbols via read-from-string so reading this
@@ -2920,8 +2920,8 @@
            (via-find    (ignore-errors (funcall (read-from-string "asdf:find-system") dep)))
            (via-resolve (funcall (read-from-string "asdf/find-component:resolve-dependency-spec")
                                  root dep)))
-      (list (null via-find)            ; find-system can't handle (:feature ...) — the bug
-            (not (null via-resolve)))))) ; resolve-dependency-spec does — the fix
+      (list (null via-find)            ; find-system can't handle (:feature ...), the bug
+            (not (null via-resolve)))))) ; resolve-dependency-spec does, the fix
 
 ;; asdf:find-system compiles the system it finds, so this one needs an emitter.
 (deftest-compiled-only i390-feature-dependency-spec-resolves
@@ -2933,8 +2933,8 @@
 ;;; allocate-instance as a struct's creation form) and is equalp to a normally-built
 ;;; one. A LispInstance there made equalp always NIL (broke Coalton). Slots are left
 ;;; NIL (unbound stand-in): allocate-instance must NOT run slot initforms (that is
-;;; initialize-instance's job), or the required-slot idiom — (id (required 'id)
-;;; :read-only t), whose initform signals — would make allocate-instance error.
+;;; initialize-instance's job), or the required-slot idiom, (id (required 'id)
+;;; :read-only t), whose initform signals, would make allocate-instance error.
 (defstruct i391-foo (a 0))
 (defstruct i391-k)
 (defun %i391-required (name) (error "slot ~S required but not supplied" name))
@@ -3005,7 +3005,7 @@
     (dotnet:invoke ms "set_Position" 0)
     (let* ((s2 (dotnet:to-stream ms :bivalent t))
            (buf (make-array 6 :element-type '(unsigned-byte 8))))
-      (cons (read-sequence buf s2) (coerce buf 'list)))) ; (6 72 84 84 80 13 10) — first byte 72, no BOM
+      (cons (read-sequence buf s2) (coerce buf 'list)))) ; (6 72 84 84 80 13 10); first byte 72, no BOM
   (6 72 84 84 80 13 10))
 
 ;; eql compares floats by bits: (eql 0.0 -0.0)=NIL (= gives T); bit-identical NaNs are
@@ -3105,7 +3105,7 @@
 
 ;; class-of a signaled native condition returns the correct class (matching type-of). Previously
 ;; ClassOf had no LispCondition case and fell through to #<STANDARD-CLASS T>, which broke
-;; cl-store's condition save (class-of → class-slots) with a STORE-ERROR.
+;; cl-store's condition save (class-of -> class-slots) with a STORE-ERROR.
 (deftest-compiled-only i400-class-of-signaled-condition
   (flet ((cn (c) (class-name (class-of c))))
     (list (handler-case (/ 1 0)      (division-by-zero (c) (cn c)))
@@ -3166,7 +3166,7 @@
        "(in-package :cl-user)
         ;; nested labels in a defun body (the minimal repro)
         (defun cf-nested () (let ((x '#1=(1 2 3 #2=(#2#) . #1#))) x))
-        ;; same #1= label reused in a second defun — must NOT leak across forms
+        ;; same #1= label reused in a second defun: must NOT leak across forms
         (defun cf-a () '#1=(10 20 30 . #1#))
         (defun cf-b () '#1=(40 50 60 . #1#))" s))
     (compile-file src :output-file fasl)
@@ -3272,7 +3272,7 @@
   :slot-missing)
 
 ;;; CAR/CDR on a non-list signal a TYPE-ERROR whose expected-type is LIST
-;;; (previously NIL — Runtime.Car/Cdr omitted the expected type). cxr functions
+;;; (previously NIL: Runtime.Car/Cdr omitted the expected type). cxr functions
 ;;; compose CAR/CDR so they inherit it.
 (deftest car-type-error-expected-type
   (handler-case (car 3) (type-error (c)
@@ -3313,7 +3313,7 @@
   t)
 
 ;;; symbol-macrolet whose expansion is NIL must still expand (not fall through to a
-;;; special-variable reference → UNBOUND-VARIABLE). lookup-symbol-macro now returns
+;;; special-variable reference -> UNBOUND-VARIABLE). lookup-symbol-macro now returns
 ;;; found-p so a NIL expansion is distinguished from an unregistered symbol.
 ;;; (Root cause of trivia CONSTANT-PATTERN / HASH-TABLE-ENTRY: (match nil (nil t)).)
 (deftest symbol-macrolet-nil-expansion
@@ -3375,7 +3375,7 @@
   (10 99 30))
 
 ;;; handler-bind/handler-case/restart-bind/restart-case had macro-function=T but
-;;; macroexpand-1 returned them unexpanded (expanded-p=NIL) — an inconsistency that
+;;; macroexpand-1 returned them unexpanded (expanded-p=NIL): an inconsistency that
 ;;; breaks code walkers. macroexpand-1 now yields a portable, eval-equivalent
 ;;; expansion. The compiler is unaffected (it uses its compile-form handlers).
 (deftest handler-bind-macroexpands
@@ -3508,7 +3508,7 @@
     (reverse log))
   (:idx :val))
 
-;; (setf f) function whose value is not an echo of val — the setf form yields it
+;; (setf f) function whose value is not an echo of val: the setf form yields it
 (defun (setf reg-414-cons) (v x) (cons v x))
 (deftest setf-fn-fallback-returns-setter-value
   (setf (reg-414-cons 'a) 'b)
@@ -3573,7 +3573,7 @@
 
 ;;; FORMAT ~[...~] processed its chosen clause on a SubArray copy starting past the
 ;;; consumed selector, so a ~:* in the clause couldn't back up to the selector and the
-;;; args the clause consumed were not propagated — an enclosing ~{...~} then over-
+;;; args the clause consumed were not propagated: an enclosing ~{...~} then over-
 ;;; iterated on the leftovers. Now the clause runs in place on the shared arg pointer
 ;;; (esrap error-report). Tests use a function directive to make arg flow visible.
 (defun reg-417-pt (stream obj &optional c a) (declare (ignore c a)) (format stream "<~S>" obj))
@@ -3585,7 +3585,7 @@
 (deftest format-cond-clause-consumes-and-propagates
   ;; ~{~{...~[~*~:;~:*<~A>~{...~}~]~}~}: the inner ~{~} destructures (:R 1 (:E));
   ;; ~[ consumes the selector, ~:* backs up to read it, the nested ~{~} consumes the
-  ;; rest — so the inner ~{~} sees the list exhausted and the outer iterates only once
+  ;; rest: so the inner ~{~} sees the list exhausted and the outer iterates only once
   ;; (no leftover (:E) reused as a fresh round).
   (format nil "~{~{=~A ~[~*~:;~:*<~A>~{~/reg-417-pt/~}~]~}~^|~}" '((:r 1 (:e))))
   "=R <1><:E>")
@@ -3619,7 +3619,7 @@
       (princ "A" s) (pprint-newline :mandatory s) (princ "B" s)))
   #.(format nil "A~%B"))
 
-;; with *print-pretty* nil, ~<...~:> degrades to justification (CLHS) — no break
+;; with *print-pretty* nil, ~<...~:> degrades to justification (CLHS); no break
 (deftest format-logical-block-mandatory-disabled-when-not-pretty
   (let ((*print-pretty* nil)) (format nil "~@<A~:@_B~:>"))
   "AB")
@@ -3649,7 +3649,7 @@
     (equal (cons 1 v1) (cons 1 v2)))
   nil)
 
-;; long list with a string tail — no stack overflow
+;; long list with a string tail: no stack overflow
 (deftest equal-long-list-string-tail
   (let ((big (let ((acc nil)) (dotimes (i 3000) (push i acc)) acc)))
     (equal (cons big "t") (cons big "t")))
@@ -3681,7 +3681,7 @@
 
 ;; macroexpand-cache scope: the cache keyed expansions by form (cons) only,
 ;; ignoring the macro environment. A form spliced (via ,@body) into both a real-
-;; macro context and a shadowing macrolet got ONE expansion reused for both —
+;; macro context and a shadowing macrolet got ONE expansion reused for both;
 ;; here the shadowed RF421-REAL leaked into the non-shadowed branch. (Root cause
 ;; of esrap's parse-position off-by-one: it disabled the packrat with-cached-result
 ;; in rules whose body was spliced this way.) The cache is now keyed by (form,scope).
@@ -3701,7 +3701,7 @@
 ;; compile-time keyword check: a direct call to a fixed-&key lambda with a literal unknown
 ;; keyword must WARN at compile time (CLHS 3.5.1.4 static diagnosis). A known
 ;; keyword must stay silent. (esrap CONDITION.INVALID-ARGUMENT-COMBINATIONS
-;; depends on this — its parse compiler-macro generates such a call for :raw t.)
+;; depends on this: its parse compiler-macro generates such a call for :raw t.)
 (deftest-compiled-only warn-unknown-keyword-in-lambda-call
   (list
    (handler-case (progn (compile nil '(lambda () ((lambda (&key a) a) :bad 1))) :no-warn)
@@ -3712,7 +3712,7 @@
 
 ;; defstruct (:print-function fn) / (:print-object fn): the printer name was
 ;; spliced UNQUOTED into the generated print-object method's funcall, so it was
-;; referenced as a variable (unbound) instead of a function — the printer never
+;; referenced as a variable (unbound) instead of a function: the printer never
 ;; ran and output fell back to #S(...). Wrapping in (function ...) fixes both
 ;; symbol and lambda forms. (fset's containers print via :print-function.)
 (defun rf423-pf (obj stream depth) (declare (ignore depth)) (format stream "<PF:~A>" (rf423a-n obj)))
@@ -3730,7 +3730,7 @@
   ("<PF:7>" "<PO:9>" "<L:3>" "#S(RF423D :N 5)"))
 
 ;; pprint-logical-block :prefix/:per-line-prefix/:suffix must print regardless of
-;; *print-pretty* (CLHS) — only dynamic newline/indent is gated on pretty. The
+;; *print-pretty* (CLHS): only dynamic newline/indent is gated on pretty. The
 ;; macro wrongly wrapped the prefix/suffix write-string in (when *print-pretty* ...),
 ;; so under *print-pretty*=NIL (e.g. with-standard-io-syntax) the delimiters
 ;; vanished. (fset containers print their #{...} delimiters via this path.)
@@ -3818,7 +3818,7 @@
   100000)
 
 ;; read (token accumulation) must cross make-concatenated-stream component
-;; boundaries — it stopped at the first component's EOF while read-char/peek-char
+;; boundaries: it stopped at the first component's EOF while read-char/peek-char
 ;; crossed correctly. GetTextReader now returns a spanning reader for concatenated
 ;; streams. (babel's #\ reader builds a concatenated stream and re-reads the token.)
 (defun rf427 (&rest parts)
@@ -3912,7 +3912,7 @@
 ;; LOOP arithmetic stepping: the iteration variable is stepped THEN tested, so
 ;; after termination it holds the first out-of-bound value (CLHS 6.1.2.1.1,
 ;; matching SBCL). A prior "fix" terminated before the step, leaving the variable
-;; one short — which silently broke return-value counts in libraries (e.g. babel's
+;; one short: which silently broke return-value counts in libraries (e.g. babel's
 ;; unibyte encoder `finally (return (- di d-start))`).
 (deftest loop-finally-arith-var-overshoots
   (list (loop for x from 1 to 5 finally (return x))                ; => 6
@@ -3931,7 +3931,7 @@
 
 ;; DotNetToLisp must unbox the small integer types (byte/sbyte/short/ushort/
 ;; uint/ulong), not just int/long. C# type patterns don't widen, so byte used
-;; to fall through to a boxed LispDotNetObject — aref on a byte[] (UTF-8 codecs,
+;; to fall through to a boxed LispDotNetObject: aref on a byte[] (UTF-8 codecs,
 ;; binary protocols) returned #<DOTNET System.Byte N> instead of a CL integer.
 (deftest dotnet-byte-unboxed
   (let* ((enc (dotnet:static "System.Text.Encoding" "get_UTF8"))
@@ -3963,7 +3963,7 @@
 ;; Extended require phase 1: register-assembly-path / register-native-path populate
 ;; the resolver tables the Default ALC's Resolving / ResolvingUnmanagedDll hooks
 ;; consult. (Full managed+native resolution against a real NuGet package is verified
-;; manually — see D-file — since it needs a machine-local nupkg; here we assert the
+;; manually, see D-file, since it needs a machine-local nupkg; here we assert the
 ;; registration API contract: callable, accepts (name path), returns the path.)
 (deftest dotcl-register-resolver-paths-api
   (list (dotcl:register-assembly-path "Dotcl.Test.Asm" "/tmp/dotcl-test/Asm.dll")
@@ -4011,7 +4011,7 @@
 
 ;; MV-propagating context must not leak into value-discarding / single-value
 ;; positions. (block nil (setf (acc (gethash k h)) v)) compiled the gethash
-;; call without UnwrapMv — block bodies compile with MV propagation on for
+;; call without UnwrapMv: block bodies compile with MV propagation on for
 ;; their value, and that flag leaked through the setf expansion into
 ;; %struct-set's object argument, so STRUCT-SET received a raw multiple-values
 ;; wrapper and errored "not a structure". dolist/do/loop expand to block, which
@@ -4077,7 +4077,7 @@
   ((list :first 1) (list :second 2)))
 
 ;; throw's result-form values must reach the catch as multiple values even
-;; when the throw sits in a non-last (value-discarding) position — after the
+;; when the throw sits in a non-last (value-discarding) position: after the
 ;; MV-context tightening the values were unwrapped to one. (ANSI CATCH.7/8)
 (deftest throw-values-through-catch
   (list (multiple-value-list (catch 'foo 'a (throw 'foo (values)) 'c))
@@ -4088,7 +4088,7 @@
 ;; re-expanded inside that let (CLHS 3.1.2.1.1). The mutated/captured-vars
 ;; analysis walkers ignored let shadowing, so such an expansion (the shape of
 ;; SBCL's POLICY macro qualities) re-expanded itself once per depth level with
-;; branching — an effectively infinite (2^50) analysis; make-host-1 hung on
+;; branching: an effectively infinite (2^50) analysis; make-host-1 hung on
 ;; compiling knownfun.lisp. Also checks the shadowing semantics themselves.
 (deftest symbol-macro-let-shadow-no-blowup
   (symbol-macrolet ((q (let ((q 1)) (if (= q 1) 10 q))))
@@ -4099,7 +4099,7 @@
 ;; "(" reader macro assembles the form via per-element (read stream) calls
 ;; (SBCL's cold-build read-list). CompileFile/Load used to leave their Reader
 ;; unlinked from the stream, so ReadFromStream spun up a second Reader whose
-;; per-toplevel-form share-table clearing ran once per ELEMENT — a #1= defined
+;; per-toplevel-form share-table clearing ran once per ELEMENT: a #1= defined
 ;; in one element was cleared before the sibling #1# was read, leaking a raw
 ;; placeholder into the fasl constant pool (make-host-1: extra-arg-refs blew
 ;; up with "LENGTH: not a sequence").
@@ -4146,9 +4146,9 @@
   a)
 
 ;; A closure's &key parameter binding a special via ((:key *var*) default)
-;; emitted a 3-argument call to the 4-argument Runtime.FindKeyArgByName —
+;; emitted a 3-argument call to the 4-argument Runtime.FindKeyArgByName;
 ;; the explicit key-package string was pushed only in the non-closure defun
-;; path — so the closure's IL underflowed the stack and the JIT rejected the
+;; path: so the closure's IL underflowed the stack and the JIT rejected the
 ;; whole method (InvalidProgramException at first call). SBCL's
 ;; sb-xc:compile-file (a flet-captured defun with such keys) hit this at
 ;; make-host-2 stem 1.
@@ -4191,9 +4191,9 @@
 
 ;; CL scoping is by symbol identity, but dotcl's free-variable analysis and
 ;; closure-capture machinery key locals by symbol-name STRING. An uninterned
-;; binding with the same name as an interned variable — SBCL's XC gensym is
+;; binding with the same name as an interned variable: SBCL's XC gensym is
 ;; (make-symbol "CONSTRAINTS") with no counter, so its once-only temps all
-;; print as #:CONSTRAINTS — made the closure capture the gensym's value
+;; print as #:CONSTRAINTS: made the closure capture the gensym's value
 ;; (a vector) where the user body referenced the interned hash-table:
 ;; make-host-2 stem 6 died with "GETHASH: not a hash-table" inside
 ;; JOIN-EQUALITY-CONSTRAINTS. Fixed by VAR-NAME: uninterned variable symbols
@@ -4221,7 +4221,7 @@
   (:one :two :outer))
 
 ;; labels mutual-TCO inlines each label body as a dispatch section whose
-;; params live in plain shared locals — but the section inherited the OUTER
+;; params live in plain shared locals: but the section inherited the OUTER
 ;; scope's *boxed-vars* / numeric type-locals. A label param named like a
 ;; boxed outer variable (here TYPE, boxed because the labels closures
 ;; capture it) compiled its references as box-derefs of a raw value:
@@ -4247,7 +4247,7 @@
 ;; A :key function returning multiple values handed its raw MvReturn wrapper
 ;; to :test / comparisons in the C# sequence functions (only the primary
 ;; value may flow, CLHS 3.1.7). SBCL's XC %find-position calls POSITION with
-;; :key #'parse-optional-arg-spec (4 values) and :test #'string= — STRING=
+;; :key #'parse-optional-arg-spec (4 values) and :test #'string=: STRING=
 ;; got the MvReturn and died at make-host-2 stem 8. Same class: REDUCE's
 ;; function result fed back as the accumulator unwrapped.
 (defun mv-key (x) (values (car x) (cadr x)))
@@ -4268,7 +4268,7 @@
 ;; (setf (pkg:compiler-macro-function ...)) via a non-CL symbol named
 ;; COMPILER-MACRO-FUNCTION (e.g. SB-XC:COMPILER-MACRO-FUNCTION) was hijacked
 ;; into dotcl's own compiler-macro table (%register-compiler-macro-rt),
-;; never reaching the place's own #'(setf pkg:compiler-macro-function) —
+;; never reaching the place's own #'(setf pkg:compiler-macro-function);
 ;; same shape as the MACRO-FUNCTION no-op fixed earlier.
 (defpackage "SETF-CMF-SHADOW-TEST" (:use))
 (defvar *scmf-store* nil)
@@ -4291,7 +4291,7 @@
 ;; RANK (or dimension list) per CLHS: (simple-array (unsigned-byte 32) 1)
 ;; means rank 1 / any length, but MAP signaled TYPE-ERROR unless the result
 ;; had length 1. SBCL's perfectly-hashable maps key hashes into exactly that
-;; type — make-host-2 stem 22 (src/compiler/policy) died in the debugger.
+;; type: make-host-2 stem 22 (src/compiler/policy) died in the debugger.
 (deftest map-simple-array-rank-spec
   (list (length (map '(simple-array (unsigned-byte 32) 1) #'identity '(1 2 3)))
         (length (map '(simple-array (unsigned-byte 32) (3)) #'identity '(1 2 3)))
@@ -4304,8 +4304,8 @@
 
 ;; NSUBST / NSUBST-IF / NSUBST-IF-NOT were aliases of their non-destructive
 ;; SUBST counterparts. Callers that mutate a tree in place and discard the
-;; return value — SBCL's propagate-lvar-annotations nsubsts annotation dep
-;; lists when lvars are substituted — silently kept the old tree: the deps
+;; return value, SBCL's propagate-lvar-annotations nsubsts annotation dep
+;; lists when lvars are substituted, silently kept the old tree: the deps
 ;; pointed at dead lvars (derived type NIL) and every funarg call-type check
 ;; in the XC warned "called with (NIL ...)", failing make-host-2 stem 26.
 (deftest nsubst-is-destructive
@@ -4357,8 +4357,8 @@
 
 ;; A lambda-list parameter shadows an enclosing symbol-macro of the same name
 ;; (CLHS 3.4.2), including inside nested lambdas. A self-referential symbol-macro
-;; whose name is a param — serapeum define-env-method's (self (slot-value self
-;; 'self)) — used to loop the compiler forever when the param was referenced
+;; whose name is a param, serapeum define-env-method's (self (slot-value self
+;; 'self)), used to loop the compiler forever when the param was referenced
 ;; inside a nested lambda (the nested lambda's free-var scan re-expanded the
 ;; symbol-macro endlessly). If this regresses, compilation HANGS.
 (symbol-macrolet ((smpsh-self (slot-value smpsh-self 'smpsh-self)))
@@ -4371,7 +4371,7 @@
 ;; A macro's &environment must carry lexically-enclosing symbol-macrolet
 ;; bindings, so (macroexpand-1 'sym env) in the macro body expands them (CLHS
 ;; macro &environment / macroexpand). dotcl's runtime macro registration wrapped
-;; the expander to pass a NIL env, so symbol-macros were invisible — serapeum's
+;; the expander to pass a NIL env, so symbol-macros were invisible; serapeum's
 ;; with-boolean uses symbol-macrolet as a compile-time channel and broke.
 (defmacro me473-probe (&environment env)
   (multiple-value-bind (exp win) (macroexpand-1 'me473-foo env)
@@ -4412,7 +4412,7 @@
 ;; same name (e.g. a captured LOOP variable) must bind the condition into a plain
 ;; slot, not inherit the outer var's boxed representation. It used to compile the
 ;; clause-body reference as a boxed slot[0] ldelem-ref on the condition object,
-;; throwing ArrayTypeMismatchException at runtime when the handler fired — which
+;; throwing ArrayTypeMismatchException at runtime when the handler fired; which
 ;; broke ANSI SET-SYNTAX-FROM-CHAR.MULTIPLE-ESCAPE.
 (defun hc468-shadow ()
   (loop for c in '(1 2)
@@ -4424,7 +4424,7 @@
 ;; (setf (car/cdr/cadr/cdar PLACE) VALUE): the place subform is evaluated (into a
 ;; temp) BEFORE the value form (CLHS 5.1.1.1). The car/cdr fast-paths bound the
 ;; value first and re-evaluated the subform in rplaca/rplacd, so a VALUE that
-;; reassigns the subform variable stored into the NEW binding — self-reference.
+;; reassigns the subform variable stored into the NEW binding: self-reference.
 ;; This broke serapeum with-collector's head/tail trick
 ;; (setf (cdr tail) (setf tail (list x))), so collecting always returned empty.
 (defun sf474-collect (items)
@@ -4445,8 +4445,8 @@
 ;; FUNCTION special form consults the lexical environment). compile-function-ref's
 ;; (function (setf name)) case skipped *local-functions* and always took the
 ;; global SetfFunction path, so the setf-function fallback expansion
-;; (funcall #'(setf name) …) failed with "Undefined function: (SETF NAME)" inside
-;; the flet that binds it — eclector's set-standard-syntax-types.
+;; (funcall #'(setf name) ...) failed with "Undefined function: (SETF NAME)" inside
+;; the flet that binds it: eclector's set-standard-syntax-types.
 (defun %setf475-eclector (readtable)
   (let ((log '()))
     (flet (((setf syntax) (syntax-type char)
@@ -4471,8 +4471,8 @@
     (setf (thing :a) 1))
   (:stored :a 1))
 
-;; A redefined top-level function's LispFunction — and the DynamicMethod JIT code
-;; behind it — must not be pinned in the global constant pool forever. The
+;; A redefined top-level function's LispFunction, and the DynamicMethod JIT code
+;; behind it, must not be pinned in the global constant pool forever. The
 ;; run-once re-registration constant now lives in the collectible per-unit store,
 ;; so redefining a name many times (literal-free body, so the only per-definition
 ;; constant is the re-registration fn) and running GC reclaims the dead
@@ -4491,8 +4491,8 @@
   (t t))
 
 ;; Backquote must process ,/,@ inside a #(...) vector template, not just lists
-;; (CLHS 2.4.6). `#(...) ≡ (apply #'vector `(...)). The reader used to quote the
-;; whole vector, leaving (UNQUOTE x) forms as literal elements — which broke SBCL's
+;; (CLHS 2.4.6). `#(...) == (apply #'vector `(...)). The reader used to quote the
+;; whole vector, leaving (UNQUOTE x) forms as literal elements: which broke SBCL's
 ;; backquoted `+static-symbols+` vector (LENGTH: not a sequence).
 (defvar *bqv-x* 42)
 (defvar *bqv-l* (list 'p 'q))
@@ -4507,12 +4507,12 @@
     (list (length v) (svref v 2) (typep v 'simple-vector)))
   (4 q t))
 
-;; make-instance with an initarg value that contains a tagbody (loop/dolist —
+;; make-instance with an initarg value that contains a tagbody (loop/dolist;
 ;; which emit :LEAVE and labels requiring an empty CIL stack) was compiled with
 ;; the class still on the stack (the %make-instance-with-initargs emit pushed the
 ;; class before pre-evaluating the initargs), producing a stack-unbalanced method
 ;; = invalid CIL (InvalidProgramException at first call). Broke cl-ppcre back-
-;; references: (make-instance 'alternation :choices (loop … collect …)).
+;; references: (make-instance 'alternation :choices (loop ... collect ...)).
 (defclass mi482-holder () ((items :initarg :items :reader mi482-items)))
 (defun mi482-make (lst)
   (make-instance 'mi482-holder :items (loop for x in lst collect (* x x))))
@@ -4528,7 +4528,7 @@
 ;; (coerce X 'simple-string) must yield a *simple* string (CLHS): a fill-pointered
 ;; / adjustable / displaced char-vector must be copied to a fresh simple string,
 ;; not returned as-is. Returning the non-simple vector broke cl-ppcre's
-;; maybe-coerce-to-simple-string on parser-built adjustable strings — a trailing
+;; maybe-coerce-to-simple-string on parser-built adjustable strings; a trailing
 ;; empty group (?:) then dropped the preceding match.
 (deftest coerce-adjustable-to-simple-string
   (let ((a (make-array 4 :element-type 'character :fill-pointer 2 :adjustable t
@@ -4542,11 +4542,11 @@
     (simple-string-p (coerce a 'simple-string)))
   t)
 
-;; A non-top-level (defun) — nested inside a conditional — must register the
+;; A non-top-level (defun), nested inside a conditional, must register the
 ;; function at RUNTIME (only when the branch executes), not at assembly time.
 ;; It used to compile to :defmethod, which registers at assembly time even inside
-;; an untaken branch, so (unless (fboundp 'x) (defun x …)) / (if nil (defun x …))
-;; defined X unconditionally — breaking cross-file defdfun defaults (bordeaux-
+;; an untaken branch, so (unless (fboundp 'x) (defun x ...)) / (if nil (defun x ...))
+;; defined X unconditionally: breaking cross-file defdfun defaults (bordeaux-
 ;; threads) on fresh compile.
 (deftest nested-defun-false-guard-does-not-define
   (progn (eval '(unless t (defun %nd486-a () 1)))
@@ -4558,7 +4558,7 @@
   (progn (eval '(when t (defun %nd486-d () :yes)))
          (funcall '%nd486-d))
   :yes)
-;; guarded fboundp-default pattern (defdfun): impl already bound → default skipped
+;; guarded fboundp-default pattern (defdfun): impl already bound -> default skipped
 (defun %nd486-impl () :impl)
 (deftest nested-defun-fboundp-guard-preserves-impl
   (progn (eval '(unless (fboundp '%nd486-impl) (defun %nd486-impl () :default)))
@@ -4603,7 +4603,7 @@
   t)
 ;; A body mutating the LET's own lexical variable used to be unchunkable: by the
 ;; time compile-progn saw it the variable's boxing was already decided, so a
-;; closure would have captured a stale copy and chunking was refused — leaving
+;; closure would have captured a stale copy and chunking was refused; leaving
 ;; one oversized method and a "form too large" error. The rewrite now happens
 ;; before the LET's capture/mutation scan, so the variable is boxed like any
 ;; other captured-and-mutated variable and the chunks share the one cell. This
@@ -4643,10 +4643,10 @@
     (error () :other-error))
   :clear-error)
 
-;; A MACROLET-local macro that expands to (return-from <enclosing-defun> …) must
+;; A MACROLET-local macro that expands to (return-from <enclosing-defun> ...) must
 ;; resolve the defun's implicit block. The return-from is hidden in the macrolet's
 ;; quasiquoted expander, so the use-direct fast path (which skips the block wrapper
-;; when no literal return-from is seen) dropped the implicit block → "no block
+;; when no literal return-from is seen) dropped the implicit block -> "no block
 ;; named F". Now a body containing a macrolet keeps the block wrapper.
 (defun %rf487-simple (x)
   (macrolet ((adv () `(return-from %rf487-simple :done)))
@@ -4693,11 +4693,11 @@
   (multiple-value-list (integer-decode-float 3.2f0))
   (13421773 -22 1))
 
-;; dotcl/dotcl issue 51: a macro that expands to (return-from <defun-name> …) must
+;; dotcl/dotcl issue 51: a macro that expands to (return-from <defun-name> ...) must
 ;; resolve the implicit defun block even when the macro call is nested inside a
 ;; special form. The block-elision (use-direct) scan only expanded TOP-LEVEL macro
-;; calls, so a macro under (progn …)/(when …)/(let …) was missed and compiling the
-;; expanded return-from signalled "no block named …".
+;; calls, so a macro under (progn ...)/(when ...)/(let ...) was missed and compiling the
+;; expanded return-from signalled "no block named ...".
 (defmacro i51-ret () `(return-from i51-progn 5))
 (defun i51-progn () (progn (i51-ret)) 99)
 (deftest issue51-return-from-macro-in-progn (i51-progn) 5)
@@ -4716,7 +4716,7 @@
 (deftest issue51-return-from-macro-direct (i51-direct) 13)
 
 ;; a known-function intrinsic in tail position whose argument is a self
-;; tail-call must still execute — the intrinsic entries compiled args without
+;; tail-call must still execute: the intrinsic entries compiled args without
 ;; binding *in-tail-position* nil, so the self-call fired TCO and the intrinsic
 ;; call became unreachable dead code (side effect silently lost).
 (defun i502-tsc (n) (if (zerop n) 0 (princ (i502-tsc (- n 1)))))
@@ -4734,7 +4734,7 @@
 ;; (setf (pkg:readtable-case obj) mode) via a non-CL symbol named READTABLE-CASE
 ;; (e.g. eclector.readtable:readtable-case, which :shadows cl:readtable-case with its
 ;; own CLOS protocol) was hijacked into the built-in %set-readtable-case expander and
-;; fataled with "not a readtable" — the (setf compiler-macro-function)/(setf
+;; fataled with "not a readtable": the (setf compiler-macro-function)/(setf
 ;; macro-function) hijack, 3rd instance. It must reach the place's own
 ;; #'(setf pkg:readtable-case). Blocks eclector/mallet bring-up.
 (defpackage "SETF-RTC-SHADOW-TEST" (:use))
@@ -4753,15 +4753,15 @@
 ;; dotcl built that restart as a restart-bind style restart, so MUFFLE-WARNING
 ;; called its function in place and returned; the invoking handler ran on, and
 ;; HANDLER-BIND went to the next applicable clause. A handler-bind naming both
-;; STYLE-WARNING and WARNING — which is how SBCL's compiler separates "note it"
-;; from "this file failed" — therefore ran both, so every cross-compiled file
+;; STYLE-WARNING and WARNING, which is how SBCL's compiler separates "note it"
+;; from "this file failed", therefore ran both, so every cross-compiled file
 ;; printed its diagnostics twice and any file with a mere style warning was
 ;; reported as a failure.
 (define-condition muffle-probe-style (style-warning) ()
   (:report (lambda (c s) (declare (ignore c)) (write-string "probe" s))))
 ;; *print-circle* has to see structure slots. The scan pass that marks shared and
 ;; circular objects walked conses, uninterned symbols and vectors, but not the slots
-;; of structures or instances — though the printing pass already looked structures up
+;; of structures or instances: though the printing pass already looked structures up
 ;; in the same table. A cycle closing through a slot was therefore never marked, and
 ;; the printer emitted the object afresh at every turn: unbounded output at full CPU
 ;; instead of a #1= label. SBCL's compiler binds *print-circle* to T and PRINC-TO-STRINGs
@@ -4797,7 +4797,7 @@
 ;; A condition's report has to be rendered where it is asked for, not where the
 ;; condition was signalled. WARN ran its format control over the caller's arguments
 ;; immediately, so the printer saw the printer variables of the signalling site. The
-;; reporter is the one that knows how it wants the objects printed — SBCL's compiler
+;; reporter is the one that knows how it wants the objects printed; SBCL's compiler
 ;; binds *PRINT-CIRCLE* to T and PRINC-TO-STRINGs the condition, and rendering early
 ;; meant a cyclic argument was printed with no circle detection at all.
 (deftest warn-report-renders-at-report-time
@@ -4821,7 +4821,7 @@
 
 ;;; NIL is not a pathname designator (CLHS: pathname / string / file stream).
 ;;; The file-op entry point used to fall through to ToString and silently
-;;; create a file literally named "NIL" in the cwd — the classic
+;;; create a file literally named "NIL" in the cwd: the classic
 ;;; (with-open-file (s (uiop:getenv "UNSET_VAR") ...)) bug, succeeding with a
 ;;; side effect instead of signalling.
 (deftest open-nil-signals-type-error
@@ -4899,7 +4899,7 @@
       (delete-file "ef-t6.tmp")))
   (:latin-1 :default))
 
-;;; An unrecognised format must signal rather than silently encode as UTF-8 —
+;;; An unrecognised format must signal rather than silently encode as UTF-8;
 ;;; a misspelled name looked like it took effect before.
 (deftest external-format-unknown-signals
   (handler-case (progn (%ef-bytes "ef-t7.tmp" :external-format :no-such-format) :no-error)

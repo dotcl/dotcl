@@ -1,10 +1,10 @@
 using DotCL;
 
-// HotReloadDemo — a plain .NET console host that embeds dotcl and hot-reloads
+// HotReloadDemo: a plain .NET console host that embeds dotcl and hot-reloads
 // its Lisp "handler layer" while running. Lisp has redefinition semantics
 // built into the language, so unlike .NET Hot Reload (MetadataUpdateHandler)
 // there is no restriction on what an edit may change: signatures, new
-// functions, new macros, new classes — a re-load just installs the new
+// functions, new macros, new classes: a re-load just installs the new
 // definitions and the next call uses them.
 //
 // Run with `dotnet run` from this directory, then edit handlers.lisp and save.
@@ -12,7 +12,7 @@ using DotCL;
 string script = Path.Combine(Environment.CurrentDirectory, "handlers.lisp");
 if (!File.Exists(script))
 {
-    Console.Error.WriteLine($"handlers.lisp not found at {script} — run `dotnet run` from the HotReloadDemo directory.");
+    Console.Error.WriteLine($"handlers.lisp not found at {script}; run `dotnet run` from the HotReloadDemo directory.");
     return 1;
 }
 
@@ -35,7 +35,7 @@ static string? FindRepoCore()
 
 // A failed load (typo mid-edit) must not kill the host: report it and keep
 // serving with the previous definitions. That is the whole point of a
-// hot-reload loop — the image only moves forward on a load that succeeds.
+// hot-reload loop: the image only moves forward on a load that succeeds.
 void LoadHandlers(string reason)
 {
     try
@@ -45,7 +45,7 @@ void LoadHandlers(string reason)
     }
     catch (Exception ex)
     {
-        Console.WriteLine($"[reload] {reason}: FAILED, keeping old definitions — {ex.Message}");
+        Console.WriteLine($"[reload] {reason}: FAILED, keeping old definitions; {ex.Message}");
     }
 }
 
@@ -69,7 +69,7 @@ watcher.Changed += (_, _) =>
     LoadHandlers("file changed");
 };
 
-Console.WriteLine("host running — edit handlers.lisp and save to hot-reload (Ctrl+C to quit)");
+Console.WriteLine("host running; edit handlers.lisp and save to hot-reload (Ctrl+C to quit)");
 for (long n = 1; ; n++)
 {
     try

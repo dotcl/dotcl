@@ -4,13 +4,13 @@
 
     Activated only when the consumer sets <DotclProjectAsd>. It compiles an ASDF
     system to a fasl (+ dependency fasls + a deployment manifest) entirely from
-    the packaged assets — no repo checkout, no `dotnet tool install`. The work is
+    the packaged assets; no repo checkout, no `dotnet tool install`. The work is
     done in-process by DotCL.Build.Tasks (tasks/DotCL.Build.Tasks.dll), which
     loads the runtime the package already ships under lib/net10.0/ rather than a
     second bundled copy.
 
     Imported from DotCL.Runtime.targets. Plain embedders (no DotclProjectAsd) are
-    untouched — every target below is gated on it.
+    untouched; every target below is gated on it.
 
     Requires the .NET 10 SDK's MSBuild: the FASL emitter is net10-only, so the
     runtime assembly used here is lib/net10.0/DotCL.Runtime.dll regardless of the
@@ -52,10 +52,10 @@
   <!-- The shared BeforeTargets hook list: run before output collection /
        asset-pack / Android-assets / Maui / BeforeBuild. -->
 
-  <!-- Step 1: resolve the :depends-on graph → dep fasl manifest + root sources.
+  <!-- Step 1: resolve the :depends-on graph -> dep fasl manifest + root sources.
        DependsOnTargets=ResolveReferences populates @(ReferenceCopyLocalPaths)
        (and builds ProjectReferences) so their assemblies' dirs can be handed to
-       the task as assembly probe paths — that's what lets compile-time
+       the task as assembly probe paths; that's what lets compile-time
        (dotnet:resolve-type ...) see PackageReference / ProjectReference types. -->
   <Target Name="_DotCLResolveDeps"
           DependsOnTargets="ResolveReferences"

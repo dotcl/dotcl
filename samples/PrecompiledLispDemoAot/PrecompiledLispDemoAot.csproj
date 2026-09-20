@@ -8,7 +8,7 @@
          runtime asset linked in is the *netstandard2.0* build of DotCL.Runtime
          (see the Reference below), where System.Reflection.Emit is PHYSICALLY
          EXCLUDED. This proves the emit-free runtime survives a platform that
-         forbids codegen — the property the AOT/IL2CPP target actually requires. -->
+         forbids codegen; the property the AOT/IL2CPP target actually requires. -->
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
@@ -48,8 +48,8 @@
 
   <!-- Step 2: precompile app.lisp -> appfasl.dll and the dev SIL core ->
        dotclcore.dll, both with STABLE assembly names (file name == module name),
-       using the dev compiler (runtime.csproj, net10, which DOES have Reflection.Emit
-       — that is the dev/build side). Runs before reference resolution so the
+       using the dev compiler (runtime.csproj, net10, which DOES have Reflection.Emit;
+       that is the dev/build side). Runs before reference resolution so the
        dotclcore/appfasl HintPaths exist. -->
   <Target Name="PrecompileLisp" BeforeTargets="ResolveAssemblyReferences"
           Inputs="app.lisp;precompile.lisp;..\..\compiler\cil-out.sil"

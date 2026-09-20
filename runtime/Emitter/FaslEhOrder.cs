@@ -10,7 +10,7 @@ namespace DotCL.Emitter;
 /// <summary>
 /// Post-processes a freshly-saved .fasl so its exception-handling clauses are
 /// ordered the way the CLR requires: a clause nested inside another clause's
-/// protected region — its try, its filter, or its handler — must be listed
+/// protected region, its try, its filter, or its handler, must be listed
 /// before the clause that encloses it.
 ///
 /// Why: <see cref="System.Reflection.Emit.PersistedAssemblyBuilder"/> orders the
@@ -21,7 +21,7 @@ namespace DotCL.Emitter;
 /// InvalidProgramException the moment it is JITted.
 ///
 /// The shape that hits this is ordinary Lisp: any construct that needs an
-/// exception block inside an unwind-protect cleanup — (unwind-protect x
+/// exception block inside an unwind-protect cleanup: (unwind-protect x
 /// (ignore-errors ...)), a CATCH in a cleanup, and so on. The same code emitted
 /// through the runtime ILGenerator (a DynamicMethod, i.e. everything that is not
 /// compile-file) is ordered correctly, so this only ever showed up in .fasl.

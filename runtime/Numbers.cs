@@ -120,12 +120,12 @@ public sealed class Ratio : Number
 }
 
 /// <summary>A first-class CLR <see cref="decimal"/> (System.Decimal) value: a base-10,
-/// scale-preserving number (96-bit mantissa × 10^-scale). Distinct third exactness
-/// category — <c>numberp</c>/<c>realp</c>=T but <c>rationalp</c>=<c>floatp</c>=NIL — so
-/// that trailing-zero / scale information (1.00m ≠ representation of 1) survives, which a
+/// scale-preserving number (96-bit mantissa x 10^-scale). Distinct third exactness
+/// category, <c>numberp</c>/<c>realp</c>=T but <c>rationalp</c>=<c>floatp</c>=NIL, so
+/// that trailing-zero / scale information (1.00m != representation of 1) survives, which a
 /// CL ratio would normalize away. It arises only from explicit construction (#m literal),
 /// coercion, or .NET interop; standard arithmetic treats it by its exact rational value and
-/// yields standard tower types (conservative extension — existing code never meets it).</summary>
+/// yields standard tower types (conservative extension: existing code never meets it).</summary>
 public class LispDecimal : Number
 {
     public decimal Value { get; }
@@ -158,7 +158,7 @@ public class LispDecimal : Number
         return (Number)Ratio.Make(num, den);
     }
 
-    // "#m1.50" — round-trippable, scale preserved (InvariantCulture "." decimal point).
+    // "#m1.50": round-trippable, scale preserved (InvariantCulture "." decimal point).
     public override string ToString() =>
         "#m" + Value.ToString(System.Globalization.CultureInfo.InvariantCulture);
 

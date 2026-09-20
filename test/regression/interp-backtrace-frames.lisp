@@ -20,14 +20,14 @@
 ;;;      function pushed nothing. It is now named, exactly as the compiler names
 ;;;      what it emits.
 ;;;
-;;; A third gap turned up on the way: LispFunction.Invoke(params) — the entry used
-;;; by APPLY and by the evaluator's own call site — pushed no frame at all, so a
+;;; A third gap turned up on the way: LispFunction.Invoke(params), the entry used
+;;; by APPLY and by the evaluator's own call site, pushed no frame at all, so a
 ;;; named callee reached through APPLY was missing from a COMPILED backtrace too.
 ;;;
 ;;; The parity target is what the compiler produces: global named definitions
 ;;; (DEFUN, DEFMETHOD) appear; FLET, LABELS and plain LAMBDA do not. The two
 ;;; evaluators are asserted against that same shape below, each under function
-;;; names only its own mode ever defines — sharing names would let a stale
+;;; names only its own mode ever defines: sharing names would let a stale
 ;;; compiled definition answer for the interpreted case.
 
 ;;; The -COMPILE halves are DEFTEST-COMPILED-ONLY: an emit-free build has no
@@ -115,7 +115,7 @@
 
 ;;; --- APPLY reaches a named callee, and now records it (both evaluators)
 
-;;; The compiled side goes straight to the callee — the compiler turns this APPLY
+;;; The compiled side goes straight to the callee: the compiler turns this APPLY
 ;;; into an ordinary call, so no APPLY frame is recorded whether the argument list
 ;;; is constant or built at run time. (The APPLY that does reach Runtime.Apply,
 ;;; and so depends on Invoke recording a frame, is covered in frame-locals.lisp.)
@@ -128,7 +128,7 @@
 ;;; APPLY itself is a Lisp DEFUN in the standard library. The compiler open-codes
 ;;; the call, so no APPLY frame exists there; the interpreter really calls the
 ;;; function, so one does. That difference is the compiler's inlining showing
-;;; through, not the frame machinery diverging — asserted as it is rather than
+;;; through, not the frame machinery diverging: asserted as it is rather than
 ;;; papered over, since suppressing it would mean hiding a call that happened.
 (deftest interp-backtrace.apply-interpret
   (%ibt :interpret '(progn (defun %ibt-i-ap (x) (declare (ignore x)) (dotcl:backtrace))
@@ -139,7 +139,7 @@
 ;;; --- over-fix guards: naming must stop where the compiler stops -----------
 ;;;
 ;;; A compiled backtrace lists neither FLET, LABELS nor plain LAMBDA frames, so
-;;; naming every interpreted closure — the obvious way to write the fix — would
+;;; naming every interpreted closure, the obvious way to write the fix, would
 ;;; make the interpreted path list MORE than the compiled one. Each case below is
 ;;; asserted for both evaluators so the pair has to move together.
 
@@ -176,7 +176,7 @@
 ;;; --- the primitives that stand in for a special form stay invisible too
 ;;;
 ;;; %MINI-EVAL implements HANDLER-BIND by calling %CALL-WITH-HANDLER-CLUSTER,
-;;; which runs the body as a thunk — so that primitive sat on the call stack for
+;;; which runs the body as a thunk: so that primitive sat on the call stack for
 ;;; the whole body and appeared between the user's own frames, where compiled
 ;;; code (which emits the cluster inline) shows nothing.
 
@@ -199,7 +199,7 @@
                            (%ibt-i-hbm)))
   ("%IBT-I-HBL" "%IBT-I-HBM"))
 
-;;; the handler still runs — suppressing the FRAME must not suppress the handler
+;;; the handler still runs: suppressing the FRAME must not suppress the handler
 (deftest interp-backtrace.suppressed-frame-still-handles-interpret
   (%ibt :interpret '(handler-case (error "boom") (error () :caught)))
   :caught)

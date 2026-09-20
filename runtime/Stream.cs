@@ -486,7 +486,7 @@ public class LispBroadcastStream : LispStream
 /// <summary>Concatenated stream: reads from component streams in sequence.</summary>
 public class LispConcatenatedStream : LispStream
 {
-    // LispObject[] components — see LispTwoWayStream (Gray stream support).
+    // LispObject[] components: see LispTwoWayStream (Gray stream support).
     public LispObject[] Streams { get; }
     public int CurrentIndex { get; set; } = 0;
     public override bool IsInput => true;
@@ -501,7 +501,7 @@ public class LispConcatenatedStream : LispStream
 /// <summary>Echo stream: reads from input, echoes to output.</summary>
 public class LispEchoStream : LispStream
 {
-    // LispObject components — see LispTwoWayStream for why (Gray stream support +
+    // LispObject components: see LispTwoWayStream for why (Gray stream support +
     // accessor identity).
     public LispObject InputStream { get; }
     public LispObject OutputStream { get; }
@@ -594,7 +594,7 @@ public class LispBinaryStream : LispStream
 
 /// <summary>TextReader over a raw byte Stream that does NOT read ahead, so the same
 /// stream can serve both character I/O (read-char/read-line) and raw byte I/O
-/// (read-byte) without losing buffered bytes — a "bivalent" stream, as SBCL's socket
+/// (read-byte) without losing buffered bytes: a "bivalent" stream, as SBCL's socket
 /// streams are. Characters are decoded one UTF-8 codepoint at a time, pulling only the
 /// bytes that codepoint needs; ReadRawByte / PeekRawByte draw from the same byte source
 /// (a tiny pushback ring), so char and byte reads stay coordinated.</summary>

@@ -5,7 +5,7 @@
 ;;; dispatch from inside the handler funclet, and that funclet stays live for the
 ;;; rest of the exception's journey, so crossing N restart-cases stacked N
 ;;; dispatches: the crossing cost grew quadratically (20000 levels took 3.2s) and at
-;;; 50000 the process died as an uncatchable .NET StackOverflowException — a depth
+;;; 50000 the process died as an uncatchable .NET StackOverflowException; a depth
 ;;; the same recursion descends four times over when no restart is invoked.
 ;;; Matching the tag in a CIL exception FILTER lets a level that owns nothing
 ;;; decline without being entered.

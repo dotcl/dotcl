@@ -1,4 +1,4 @@
-// MOP (Meta-Object Protocol) wrappers — DOTCL-MOP package.
+// MOP (Meta-Object Protocol) wrappers: DOTCL-MOP package.
 //
 // Expose dotcl's existing CLOS introspection so that
 // closer-mop's #+dotcl arm (and our fork's closer-dotcl.lisp) can
@@ -7,7 +7,7 @@
 // This file does NOT implement protocol functions that change CLOS
 // semantics (compute-discriminating-function, make-method-lambda, etc.).
 // Stubs are provided where the API is queried but customization isn't
-// supported yet — calling them will signal an error directing the user
+// supported yet: calling them will signal an error directing the user
 // to file an issue.
 namespace DotCL;
 
@@ -22,7 +22,7 @@ public static class Mop
         // -- Class symbols expected by closer-mop's :import-from ----------
         // Intern + export the metaobject class names so closer-mop's defpackage
         // succeeds. Symbols whose underlying class doesn't exist yet are still
-        // accessible but unbound as classes — actual usage will fail later
+        // accessible but unbound as classes: actual usage will fail later
         // (acceptable for libraries that only need import-from to work).
         foreach (var name in new[] {
             // Class symbols
@@ -96,7 +96,7 @@ public static class Mop
         });
 
         // AMOP: "an instance of class" without running initialize-instance, and the
-        // SAME instance every call (memoized on the class) — EQL-method dispatch
+        // SAME instance every call (memoized on the class): EQL-method dispatch
         // (e.g. McCLIM define-presentation-method) relies on that identity.
         RegisterMop("CLASS-PROTOTYPE", 1, args => Runtime.ClassPrototypeOf(args[0]));
 
@@ -253,13 +253,13 @@ public static class Mop
 
         RegisterMop("INTERN-EQL-SPECIALIZER", 1, args => Runtime.InternEqlSpecializer(args[0]));
 
-        // ACCESSOR-METHOD-SLOT-DEFINITION (method) → the slot-definition the accessor
+        // ACCESSOR-METHOD-SLOT-DEFINITION (method) -> the slot-definition the accessor
         // reads/writes. DEFCLASS tags reader/writer/accessor methods with their slot
         // via %REGISTER-ACCESSOR-METHOD; ordinary methods return NIL.
         RegisterMop("ACCESSOR-METHOD-SLOT-DEFINITION", 1, args =>
             args[0] is LispMethod m && m.AccessorSlot is { } sd ? (LispObject)sd : Nil.Instance);
 
-        // METHOD-FUNCTION (method) → the method's function object. AMOP: the function
+        // METHOD-FUNCTION (method) -> the method's function object. AMOP: the function
         // called with (args next-methods); dotcl's method Function already follows the
         // call-method calling convention used by the dispatcher.
         // AMOP shape: (args next-methods). Runtime.MethodFunction hands out the view
@@ -267,7 +267,7 @@ public static class Mop
         RegisterMop("METHOD-FUNCTION", 1, args =>
             args[0] is LispMethod ? Runtime.MethodFunction(args[0]) : Nil.Instance);
 
-        // READER-METHOD-CLASS / WRITER-METHOD-CLASS (class slotd &rest initargs) →
+        // READER-METHOD-CLASS / WRITER-METHOD-CLASS (class slotd &rest initargs) ->
         // the class of accessor methods. dotcl creates plain standard methods for
         // accessors, so the metaobject class is STANDARD-METHOD.
         // Generic, so a metaclass can answer with an accessor method class of its own.
@@ -283,7 +283,7 @@ public static class Mop
                         ?? Nil.Instance);
         }
 
-        // SPECIALIZER-DIRECT-METHODS (specializer) → every method that has SPECIALIZER
+        // SPECIALIZER-DIRECT-METHODS (specializer) -> every method that has SPECIALIZER
         // in its specializer list. No back-link is kept, so scan all GFs' methods.
         // Specializers are LispClass (eq) or (eql X) conses (structural compare).
         RegisterMop("SPECIALIZER-DIRECT-METHODS", 1, args =>
@@ -297,7 +297,7 @@ public static class Mop
             return Runtime.List(found.ToArray());
         });
 
-        // SPECIALIZER-DIRECT-GENERIC-FUNCTIONS (specializer) → every GF that has a
+        // SPECIALIZER-DIRECT-GENERIC-FUNCTIONS (specializer) -> every GF that has a
         // method specialized on SPECIALIZER (each GF at most once).
         RegisterMop("SPECIALIZER-DIRECT-GENERIC-FUNCTIONS", 1, args =>
         {
@@ -378,7 +378,7 @@ public static class Mop
             return Runtime.List(items);
         });
 
-        // COMPUTE-APPLICABLE-METHODS-USING-CLASSES (gf classes) → (values methods
+        // COMPUTE-APPLICABLE-METHODS-USING-CLASSES (gf classes) -> (values methods
         // definitive-p). definitive-p is NIL when applicability depends on an EQL
         // specializer (undecidable from a class), so the caller falls back to
         // COMPUTE-APPLICABLE-METHODS on the actual arguments.
@@ -487,7 +487,7 @@ public static class Mop
             };
         }
 
-        // COMPUTE-EFFECTIVE-METHOD (gf method-combination methods) → the effective
+        // COMPUTE-EFFECTIVE-METHOD (gf method-combination methods) -> the effective
         // method form for the STANDARD method combination (CLHS 7.6.6.2). METHODS is
         // the applicable list most-specific-first. Non-standard combinations are not
         // synthesized here (dotcl's own dispatcher handles them internally).
@@ -508,7 +508,7 @@ public static class Mop
         // ENSURE-CLASS-USING-CLASS (class name &rest initargs): the functional core of
         // DEFCLASS. dotcl's ENSURE-CLASS already creates-or-reinitializes by name
         // (RegisterClass copies into an existing/forward-ref class), so the class arg
-        // (nil when not yet defined) is informational — delegate by name + initargs.
+        // (nil when not yet defined) is informational: delegate by name + initargs.
         RegisterMop("ENSURE-CLASS-USING-CLASS", -1, args =>
         {
             if (args.Length < 2)
@@ -537,15 +537,15 @@ public static class Mop
         });
 
         // -- Protocol GFs (extensible via defmethod) ----------------------
-        // VALIDATE-SUPERCLASS: default = standard-class/standard-class → T, else NIL
+        // VALIDATE-SUPERCLASS: default = standard-class/standard-class -> T, else NIL
         {
             var cls2     = (LispClass)Runtime.FindClass(Startup.Sym("CLASS"));
             var stdCls2  = (LispClass)Runtime.FindClass(Startup.Sym("STANDARD-CLASS"));
             var builtIn2 = (LispClass)Runtime.FindClass(Startup.Sym("BUILT-IN-CLASS"));
-            // (class class) → NIL  (least-specific default)
+            // (class class) -> NIL  (least-specific default)
             RegisterMopGF("VALIDATE-SUPERCLASS", 2,
                 new LispClass[] { cls2, cls2 }, args => Nil.Instance);
-            // (standard-class standard-class) → T
+            // (standard-class standard-class) -> T
             RegisterMopGFMethod("VALIDATE-SUPERCLASS",
                 new LispClass[] { stdCls2, stdCls2 }, args => T.Instance);
         }
@@ -565,10 +565,10 @@ public static class Mop
             var stdDirect = (LispClass)Runtime.FindClass(Startup.Sym("STANDARD-DIRECT-SLOT-DEFINITION"));
             var stdEffective = (LispClass)Runtime.FindClass(Startup.Sym("STANDARD-EFFECTIVE-SLOT-DEFINITION"));
 
-            // DIRECT-SLOT-DEFINITION-CLASS (class &rest initargs) → STANDARD-DIRECT-SLOT-DEFINITION
+            // DIRECT-SLOT-DEFINITION-CLASS (class &rest initargs) -> STANDARD-DIRECT-SLOT-DEFINITION
             RegisterMopGF("DIRECT-SLOT-DEFINITION-CLASS", -1,
                 new LispClass[] { classCls }, args => stdDirect);
-            // EFFECTIVE-SLOT-DEFINITION-CLASS (class &rest initargs) → STANDARD-EFFECTIVE-SLOT-DEFINITION
+            // EFFECTIVE-SLOT-DEFINITION-CLASS (class &rest initargs) -> STANDARD-EFFECTIVE-SLOT-DEFINITION
             RegisterMopGF("EFFECTIVE-SLOT-DEFINITION-CLASS", -1,
                 new LispClass[] { classCls }, args => stdEffective);
             // COMPUTE-EFFECTIVE-SLOT-DEFINITION (class name direct-slot-definitions)
@@ -788,8 +788,8 @@ public static class Mop
         // -- Required-args / extract-lambda-list (closer-mop utilities) --
         RegisterMop("EXTRACT-LAMBDA-LIST", 1, args =>
         {
-            // (extract-lambda-list specialized-lambda-list) — strip specializers.
-            // (m (x integer) (y string)) → (x y)
+            // (extract-lambda-list specialized-lambda-list): strip specializers.
+            // (m (x integer) (y string)) -> (x y)
             return ExtractLambdaList(args[0]);
         });
 
@@ -798,7 +798,7 @@ public static class Mop
 
         RegisterMop("REQUIRED-ARGS", -1, args =>
         {
-            // (required-args lambda-list &optional reduce) → list of required parameter names.
+            // (required-args lambda-list &optional reduce) -> list of required parameter names.
             var ll = args[0];
             var result = new List<LispObject>();
             for (var cur = ll; cur is Cons c; cur = c.Cdr)
@@ -822,7 +822,7 @@ public static class Mop
         };
         // Gap-fill: every DOTCL-MOP symbol still unbound after the RegisterMop/
         // RegisterMopGF calls above was flat-registered via
-        // CilAssembler.RegisterFunction BEFORE Mop.Init ran — so the
+        // CilAssembler.RegisterFunction BEFORE Mop.Init ran: so the
         // RegisterFunction mirror couldn't fire (MopPkg was null). Adopt the
         // Function from the same-named fbound symbol in CL or DOTCL-INTERNAL
         // (matching Startup.SymForRegistration's lookup precedence) so
@@ -992,7 +992,7 @@ public static class Mop
         // that path goes through Startup.Sym(fullName) which would intern a
         // bogus DOTCL-INTERNAL symbol named "DOTCL-MOP:GENERIC-FUNCTION-NAME"
         // (with the colon in the name) and clobber things via the cross-package
-        // bridge. Symbol-based dispatch (compile-named-call → GetFunctionBySymbol)
+        // bridge. Symbol-based dispatch (compile-named-call -> GetFunctionBySymbol)
         // only needs sym.Function to be set, which is enough.
     }
 
@@ -1031,7 +1031,7 @@ public static class Mop
         var result = new List<LispObject>();
         for (var cur = ll; cur is Cons c; cur = c.Cdr)
         {
-            // (param specializer) → param ; or bare param
+            // (param specializer) -> param ; or bare param
             if (c.Car is Cons spec && spec.Car is Symbol)
                 result.Add(spec.Car);
             else

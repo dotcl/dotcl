@@ -1,4 +1,4 @@
-;;; A compound form whose operator is neither a symbol nor a cons — (0 1 2) —
+;;; A compound form whose operator is neither a symbol nor a cons, (0 1 2),
 ;;; is a program error, not a compiler crash.
 ;;;
 ;;; Bug: compile-expr fell through the cons-op cases into the string=-based
@@ -10,7 +10,7 @@
 ;;;
 ;;; Fix: emit a deferred PROGRAM-ERROR naming the form (the
 ;;; compile-static-program-error idiom), so compilation of the rest of the file
-;;; proceeds and running the form reports what is wrong — as SBCL does.
+;;; proceeds and running the form reports what is wrong: as SBCL does.
 
 (defun ifc-error-of (form)
   "Compile and run FORM, returning (type-of condition) or :no-error."

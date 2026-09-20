@@ -5,7 +5,7 @@ namespace DotCL;
 
 internal static class DotNetEvents
 {
-    // Lisp handler → (delegate type → cached Delegate). Weak-keyed on the
+    // Lisp handler -> (delegate type -> cached Delegate). Weak-keyed on the
     // LispObject so a handler's delegate pool is GC'd when the handler
     // itself becomes unreachable. Lets AddEvent and RemoveEvent share the
     // same Delegate instance for a given (handler, delegateType) pair so

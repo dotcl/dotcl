@@ -3,7 +3,7 @@
 ;;; DIRECTORY used to have two implementations. Compiled calls reached one of
 ;;; them through a name mapping in the assembler; #'DIRECTORY was bound to the
 ;;; other. The two disagreed: the first omitted subdirectories entirely, the
-;;; second returned them as file pathnames — #P".../sub" rather than
+;;; second returned them as file pathnames: #P".../sub" rather than
 ;;; #P".../sub/", with NAME "sub" instead of NIL.
 ;;;
 ;;; Both halves matter to callers. UIOP:DIRECTORY-FILES enumerates with a wild
@@ -48,7 +48,7 @@ TYPE, so it appears here as :DIR."
 
 ;; The wildcard is not always in the last segment. Quicklisp finds its dists with
 ;; "dists/*/distinfo.txt", and only one of the two former implementations could
-;; do it — which is how both of them stayed broken: each call path worked for
+;; do it: which is how both of them stayed broken: each call path worked for
 ;; the cases its own callers exercised.
 (deftest directory-wild-directory-component
   (let ((root (dirtest-root)))
@@ -69,7 +69,7 @@ TYPE, so it appears here as :DIR."
   ("deep"))
 
 ;; The subdirectory's own name survives in the directory component, so callers
-;; can still recover it — dropping it is the other way this could be got wrong.
+;; can still recover it: dropping it is the other way this could be got wrong.
 (deftest directory-subdirectory-keeps-its-name
   (let* ((entries (directory (merge-pathnames "*.*" (dirtest-root))))
          (dir (find-if (lambda (p) (null (pathname-name p))) entries)))

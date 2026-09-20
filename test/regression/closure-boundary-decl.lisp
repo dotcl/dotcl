@@ -4,8 +4,8 @@
 ;;;
 ;;; The compile-state registry rebinds those tables around every closure body,
 ;;; but only the tables declared to participate. The native-representation and
-;;; proven-range tables were split across the two declaration forms — the Int64
-;;; one participated while its double/single analogs did not — so the invariant
+;;; proven-range tables were split across the two declaration forms, the Int64
+;;; one participated while its double/single analogs did not, so the invariant
 ;;; held by accident (entries are pinned to a slot key, and the closure body's
 ;;; fresh locals never re-derive an outer key) rather than by the reset.
 ;;;
@@ -68,7 +68,7 @@
       (list (funcall f 1.25d0) (+ cbd-a::v 1))))
   ((1.25d0) 5))
 
-;;; Two closure levels deep — the reset must hold at every boundary, not just
+;;; Two closure levels deep: the reset must hold at every boundary, not just
 ;;; the outermost one.
 (deftest nested-closure-param-shadows-fixnum-decl
   (let ((v 10))
@@ -79,7 +79,7 @@
       (list (funcall f) v)))
   ((1.25d0) 10))
 
-;;; The opposite direction: capturing a declared variable must keep working —
+;;; The opposite direction: capturing a declared variable must keep working;
 ;;; the closure body reads it through its env slot and the declaration still
 ;;; describes the value it holds.
 (deftest closure-captures-fixnum-declared-var

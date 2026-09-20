@@ -31,7 +31,7 @@ public static partial class Runtime
 
     /// <summary>
     /// 2-arg NCONC, matching the stdlib Lisp implementation exactly:
-    /// (nconc a b) = a is nil → b; otherwise (rplacd (last a) b) then a —
+    /// (nconc a b) = a is nil -> b; otherwise (rplacd (last a) b) then a;
     /// DESTRUCTIVE and structure-sharing per CL. NOT to be confused with
     /// Nconc2 above, which deliberately COPIES its first argument (a CLOS
     /// method-combination helper only). LAST on a non-cons A returns A itself
@@ -240,7 +240,7 @@ public static partial class Runtime
     }
 
     /// <summary>
-    /// Fast path for (member item list :test #'eq) — uses reference equality.
+    /// Fast path for (member item list :test #'eq): uses reference equality.
     /// </summary>
     public static LispObject MemberEq(LispObject item, LispObject list)
     {
@@ -254,7 +254,7 @@ public static partial class Runtime
     }
 
     /// <summary>
-    /// Fast path for (assoc key alist :test #'eq) — uses reference equality.
+    /// Fast path for (assoc key alist :test #'eq): uses reference equality.
     /// </summary>
     public static LispObject AssocEq(LispObject key, LispObject alist)
     {
@@ -563,7 +563,7 @@ public static partial class Runtime
         for (int i = 0; i < n; i++) { var c = (Cons)cur; args[start + i] = c.Car; cur = c.Cdr; }
     }
 
-    // CL special operators — fdefinition on these should not throw; they are fbound
+    // CL special operators: fdefinition on these should not throw; they are fbound
     public static readonly HashSet<string> _specialOperators = new(StringComparer.OrdinalIgnoreCase)
     {
         "BLOCK", "CATCH", "EVAL-WHEN", "FLET", "FUNCTION", "GO", "IF", "LABELS",
@@ -574,14 +574,14 @@ public static partial class Runtime
 
     public static LispObject Fdefinition(LispObject name)
     {
-        // Handle (setf sym) names — sym.SetfFunction is authoritative.
+        // Handle (setf sym) names: sym.SetfFunction is authoritative.
         if (name is Cons c2 && c2.Car is Symbol setfKw && setfKw.Name == "SETF"
             && c2.Cdr is Cons rest2 && rest2.Car is Symbol setfTarget && rest2.Cdr is Nil)
         {
             if (setfTarget.SetfFunction is LispFunction setfFn) return setfFn;
             throw new LispErrorException(new LispUndefinedFunction(name));
         }
-        // Any other cons is not a valid function name — signal type-error (CLHS).
+        // Any other cons is not a valid function name: signal type-error (CLHS).
         if (name is Cons)
             throw new LispErrorException(new LispTypeError(
                 "FDEFINITION: not a valid function name (expected symbol or (setf symbol))", name));
@@ -589,7 +589,7 @@ public static partial class Runtime
         if (sym.Function is LispFunction fn) return fn;
         // Check macro table before erroring
         if (_macroFunctions.TryGetValue(sym, out var mfn)) return mfn;
-        // Special operators are fbound — return a stub rather than erroring
+        // Special operators are fbound: return a stub rather than erroring
         if (_specialOperators.Contains(sym.Name))
             return new LispFunction(_ => throw new LispErrorException(
                 new LispError($"Cannot call special operator {sym.Name} as a function")), sym.Name);
@@ -637,7 +637,7 @@ public static partial class Runtime
                 if (macrosSym != null && status != SymbolStatus.None
                     && macrosSym.Value is LispHashTable macrosTable)
                 {
-                    // *macros* is keyed by SYMBOL identity (eq test) — matching
+                    // *macros* is keyed by SYMBOL identity (eq test): matching
                     // %REGISTER-MACRO-FUNCTION-RT (macrosTable.Set(sym, ...)) and
                     // Startup.LookupCompilerMacro (TryGet(sym)). Removing by a
                     // LispString of the name left the symbol-keyed entry intact, so
@@ -704,9 +704,32 @@ public static partial class Runtime
         if (symObj is not Symbol sym)
             throw new LispErrorException(new LispTypeError("DEFCONSTANT: not a symbol", symObj));
         if (sym.IsConstant && DynamicBindings.TryGet(sym, out var old) && !IsTruthy(Eql(old, value)))
-            throw new LispErrorException(new LispError(
-                $"DEFCONSTANT: {sym.Name} is already a constant with the value {old}; "
-                + $"redefining it to {value} would disagree with code compiled against the old value"));
+        {
+            // Correctable, as in SBCL: the writer may know the new value is the
+            // one that counts. Without the restart there is no way past this
+            // short of UNINTERN, and the commonest way to arrive here is a list
+            // or string constant whose file was compiled and loaded in one
+            // image -- the same form twice, the second value not EQL to the
+            // first because it is a fresh object.
+            var restart = new LispRestart("CONTINUE",
+                _ => Nil.Instance,
+                description: $"Set {sym.Name} to the new value.");
+            RestartClusterStack.PushCluster(new[] { restart });
+            try
+            {
+                ConditionSystem.Error(new LispError(
+                    $"DEFCONSTANT: {sym.Name} is already a constant with the value {old}; "
+                    + $"redefining it to {value} would disagree with code compiled against the old value"));
+            }
+            catch (RestartInvocationException rie) when (ReferenceEquals(rie.Tag, restart.Tag))
+            {
+                // CONTINUE: fall through to the assignment below.
+            }
+            finally
+            {
+                RestartClusterStack.PopCluster();
+            }
+        }
         DynamicBindings.Set(sym, value);
         sym.IsConstant = true;
         return sym;
@@ -760,7 +783,7 @@ public static partial class Runtime
                 _ => (string?)null
             };
             if (known != null) return known;
-            // Try expanding via deftype (e.g. 'octet → '(unsigned-byte 8))
+            // Try expanding via deftype (e.g. 'octet -> '(unsigned-byte 8))
             if (Runtime.TypeExpanders.TryGetValue(ets.Name, out var expander))
             {
                 var expanded = Funcall(expander);
@@ -1098,8 +1121,8 @@ public static partial class Runtime
     /// Map a well-known CLR exception to its ANSI condition type so handler-case /
     /// handler-bind can catch it specifically, instead of the generic PROGRAM-ERROR
     /// wrapper. A raw .NET DivideByZeroException (integer 0-divide via ratio
-    /// construction, TRUNCATE/REM/MOD, etc.) must surface as DIVISION-BY-ZERO — a
-    /// subtype of ARITHMETIC-ERROR — not PROGRAM-ERROR. Returns null when there is
+    /// construction, TRUNCATE/REM/MOD, etc.) must surface as DIVISION-BY-ZERO, a
+    /// subtype of ARITHMETIC-ERROR, not PROGRAM-ERROR. Returns null when there is
     /// no specific mapping (caller falls back to PROGRAM-ERROR).
     /// </summary>
     private static LispCondition? MapWellKnownClrException(Exception ex)
@@ -1114,6 +1137,21 @@ public static partial class Runtime
         // handler-case (error ...) deliberately does not catch this.
         if (ex is OutOfMemoryException)
             return new LispStorageCondition(ex.Message)
+            { ClrExceptionType = ex.GetType(), ClrException = ex };
+        // A subscript outside the array. The helper paths raise this as a
+        // TYPE-ERROR themselves, and so must the paths that index a concrete
+        // element buffer directly and let the CLR do the bounds check -- the
+        // condition a program sees for an out-of-range AREF should not depend
+        // on which lowering the compiler picked.
+        // A real LispTypeError, not a LispError wearing the name: HANDLER-CASE
+        // matches clause types with TYPEP, which asks what the object IS.
+        // The subscript itself is not recoverable from the CLR exception, so
+        // DATUM stays NIL where the helper paths can name the index.
+        if (ex is IndexOutOfRangeException)
+            return new LispTypeError(ex.Message, Nil.Instance,
+                                     new Cons(Startup.Sym("INTEGER"),
+                                         new Cons(Fixnum.Make(0),
+                                             new Cons(Startup.Sym("*"), Nil.Instance))))
             { ClrExceptionType = ex.GetType(), ClrException = ex };
         return null;
     }
@@ -1136,8 +1174,8 @@ public static partial class Runtime
     /// ThreadInterruptedException counts as control flow too: it is how
     /// DESTROY-THREAD ends a thread (and how a not-ours interrupt propagates
     /// out of a blocking primitive). Wrapping it as a PROGRAM-ERROR let any
-    /// (handler-case ... (error ...)) swallow a DESTROY-THREAD — the thread
-    /// refused to die — and defeated MakeThread's silent-termination catch,
+    /// (handler-case ... (error ...)) swallow a DESTROY-THREAD, the thread
+    /// refused to die, and defeated MakeThread's silent-termination catch,
     /// which reports "Thread ... error" for what is a routine retirement
     /// (bordeaux-threads' WITH-TIMEOUT destroys its watchdog on every
     /// successful body). SBCL behaves the same way: thread termination is a
@@ -1148,6 +1186,52 @@ public static partial class Runtime
            ex is GoException || ex is RestartInvocationException ||
            ex is HandlerCaseInvocationException ||
            ex is System.Threading.ThreadInterruptedException;
+
+    /// <summary>
+    /// The CONTROL-ERROR that a THROW with no outstanding CATCH has to become
+    /// (CLHS 5.2: "if there is no outstanding catcher ... an error of type
+    /// control-error is signaled"), or null when EX is not such a throw -- either
+    /// it is not a throw at all, or a CATCH for its tag is still on the stack and
+    /// the exception is on its way there.
+    ///
+    /// Every boundary where a Lisp form stops being evaluated needs this, and
+    /// each one that forgets it turns a Lisp-level error into a dead process:
+    /// EVAL had the check and LOAD did not, so a library whose load-time THROW
+    /// missed its catcher killed the host instead of signalling
+    /// (fset, and serapeum behind it).
+    /// </summary>
+    public static LispErrorException? UnmatchedThrowError(Exception ex)
+        => ex is CatchThrowException cte && !CatchTagStack.HasMatchingCatch(cte.Tag)
+           ? new LispErrorException(new LispControlError(
+               $"Attempt to THROW to tag {cte.Tag} but no catching CATCH form was found"))
+           : null;
+
+    /// <summary>
+    /// The exception a compiled THROW raises -- unless no CATCH for TAG is
+    /// outstanding, in which case this signals the CLHS 5.2 CONTROL-ERROR instead
+    /// and does not return normally.
+    ///
+    /// The check belongs here, at the throw site, and not at the boundary the
+    /// exception eventually reaches: a HANDLER-CASE for CONTROL-ERROR around the
+    /// THROW is gone by the time the exception leaves EVAL or LOAD, so converting
+    /// it there produces an error nothing can catch -- and, where no boundary
+    /// converted it at all, a .NET exception that killed the process.
+    ///
+    /// Cost: a walk of the thread's catch-tag list, which is empty or a few deep,
+    /// against an exception construction and unwind that is already orders of
+    /// magnitude more. A matched throw finds its tag at the top of that list.
+    /// </summary>
+    public static CatchThrowException MakeCatchThrow(LispObject tag, LispObject value)
+    {
+        // Inside an async continuation this thread's catch tags are not the whole
+        // answer: the awaiting thread's are reachable through the Task fault this
+        // exception is about to become, and AWAIT rethrows it there. Deferring the
+        // decision one step keeps the condition intact; see AsyncContinuation.
+        if (!AsyncContinuation.Active && !CatchTagStack.HasMatchingCatch(tag))
+            ConditionSystem.Error(new LispControlError(
+                $"Attempt to THROW to tag {tag} but no catching CATCH form was found"));
+        return new CatchThrowException(tag, value);
+    }
 
     /// <summary>
     /// Signal CONTROL-ERROR for unmatched THROW (no active CATCH for the tag).
@@ -1162,7 +1246,7 @@ public static partial class Runtime
     public static void RewrapNonLispException(Exception ex)
     {
         // Rethrow Lisp control flow exceptions as-is. ThreadInterruptedException
-        // is control flow too (thread termination) — see IsLispControlFlowException.
+        // is control flow too (thread termination): see IsLispControlFlowException.
         if (ex is BlockReturnException || ex is CatchThrowException ||
             ex is GoException || ex is RestartInvocationException ||
             ex is LispErrorException || ex is HandlerCaseInvocationException ||
@@ -1185,7 +1269,7 @@ public static partial class Runtime
 
     /// <summary>
     /// Establish a handler-bind cluster and run a thunk under it. Mirrors what
-    /// compile-handler-bind emits (PushCluster / try body / catch → rewrap /
+    /// compile-handler-bind emits (PushCluster / try body / catch -> rewrap /
     /// finally PopCluster), but callable from Lisp so the emit-free tree-walk
     /// interpreter (%mini-eval) can implement handler-bind / handler-case
     /// without generating code. Uses no Reflection.Emit.
@@ -1211,7 +1295,7 @@ public static partial class Runtime
         // not convert. Catching every exception and letting RewrapNonLispException
         // rethrow the pass-through ones restarted dispatch from inside this handler
         // at every level, and each restarted dispatch stays on the stack while the
-        // exception keeps travelling — so a condition escaping deep interpreted
+        // exception keeps travelling: so a condition escaping deep interpreted
         // recursion (one of these frames per interpreted HANDLER-BIND / HANDLER-CASE)
         // cost stack proportional to the depth and died as an uncatchable .NET
         // StackOverflowException. Same defect the compiled HANDLER-CASE had.
@@ -1245,7 +1329,7 @@ public static partial class Runtime
     /// is a list of (name-symbol . handler-function). Establishes the restart
     /// cluster, runs the body thunk; if an invoke-restart targets one of these
     /// restarts (matched by tag via RestartInvocationException), pops the cluster
-    /// and runs that restart's handler with the invocation arguments — mirroring
+    /// and runs that restart's handler with the invocation arguments: mirroring
     /// compile-restart-case. Emit-free.
     /// </summary>
     public static LispObject CallWithRestartCluster(LispObject[] args)
@@ -1318,7 +1402,7 @@ public static partial class Runtime
 
     /// <summary>Push a handler cluster from ((type-spec . handler-fn) ...). Paired with
     /// %POP-HANDLER-CLUSTER (via unwind-protect) by the HANDLER-BIND macro expansion, so
-    /// the expansion keeps the body INLINE (progn) rather than in a lambda thunk — code
+    /// the expansion keeps the body INLINE (progn) rather than in a lambda thunk; code
     /// walkers can then walk into the body. Same cluster mechanism as the
     /// HANDLER-BIND special form; HandlerClusterStack.Signal restores clusters in a
     /// finally, so the pop stays balanced even on a non-local exit from a handler.</summary>
@@ -1345,8 +1429,8 @@ public static partial class Runtime
         var restarts = new System.Collections.Generic.List<LispRestart>();
         for (var c = bindingsList; c is Cons cc; c = cc.Cdr)
         {
-            // An ANONYMOUS restart — (nil () :report ... ) in RESTART-CASE, or
-            // WITH-SIMPLE-RESTART with a NIL name — is legal (CLHS): it cannot be
+            // An ANONYMOUS restart: (nil () :report ... ) in RESTART-CASE, or
+            // WITH-SIMPLE-RESTART with a NIL name: is legal (CLHS): it cannot be
             // found by name, but it is still established and still shows up in
             // COMPUTE-RESTARTS. NIL is its own class here rather than a Symbol, so
             // the `pair.Car is Symbol` test silently DROPPED it and the restart was
@@ -1471,7 +1555,7 @@ public static partial class Runtime
         // We don't retain source lambda expressions, so the first value is nil.
         // The SECOND value must be true unless the function was DEFINITELY not
         // produced by closing over a non-null lexical environment (CLHS). A
-        // LispFunction with a captured Environment is a closure → true; otherwise
+        // LispFunction with a captured Environment is a closure -> true; otherwise
         // nil. Always returning nil mislabelled real closures (ANSI
         // FUNCTION-LAMBDA-EXPRESSION.2). The third value (name) is returned when
         // the function carries one.
@@ -1498,7 +1582,7 @@ public static partial class Runtime
         });
         // %GET-VARIABLE-DOCUMENTATION
         Startup.RegisterUnary("%GET-VARIABLE-DOCUMENTATION", Runtime.GetVariableDocumentation);
-        // %GET-FUNCTION-DOCUMENTATION — bridge [LispDoc]/SetFunctionDoc to the DOCUMENTATION GF
+        // %GET-FUNCTION-DOCUMENTATION: bridge [LispDoc]/SetFunctionDoc to the DOCUMENTATION GF
         Startup.RegisterUnary("%GET-FUNCTION-DOCUMENTATION", Runtime.GetFunctionDocumentation);
 
         // SPECIAL-OPERATOR-P (re-register as variadic for funcall compatibility)
@@ -1525,10 +1609,10 @@ public static partial class Runtime
         Startup.RegisterUnary("COPY-STRUCTURE", obj => {
             if (obj is not LispStruct s)
                 throw new LispErrorException(new LispTypeError("COPY-STRUCTURE: not a structure", obj));
-            var src = s.Slots;
+            var src = s.SlotsSnapshot();
             var dst = new LispObject[src.Length];
             Array.Copy(src, dst, src.Length);
-            return new LispStruct(s.TypeName, dst);
+            return new LispStruct(s, dst);
         });
         Startup.RegisterUnary("MAKE-SYMBOL", obj =>
             obj is LispString ls ? new Symbol(ls.Value)
@@ -1567,7 +1651,7 @@ public static partial class Runtime
         // Runtime.LessThan-family call and returns the same T/NIL, so the
         // delegate result is identical incl. type errors (same C# comparator).
         // A later user redefinition replaces sym.Function with a fresh object
-        // that simply lacks the delegate — clean fallback; a shadowing package
+        // that simply lacks the delegate: clean fallback; a shadowing package
         // defines a different symbol and is unaffected.
         // %ATTACH-ARITH-FAST-PATHS: the same treatment for the n-ary arithmetic
         // wrappers (+ - * /). Handing #'+ to REDUCE cost 104 B per call -- the
@@ -1610,7 +1694,7 @@ public static partial class Runtime
             }, "%ATTACH-NUMERIC-COMPARE-FAST-PATHS", 0));
 
         // Character comparisons (variadic N-arg). Each chained comparison also
-        // gets 2-/3-arg direct entries — exact unrolls of the pairwise loop
+        // gets 2-/3-arg direct entries: exact unrolls of the pairwise loop
         // (same cmp order and errors), skipping the args-array InvokeSlow for
         // the dominant call shapes, e.g. (char<= #\0 c #\9) in digit-char-p.
         static LispFunction NaryCharChain(string opName,
@@ -1641,7 +1725,7 @@ public static partial class Runtime
                     if (Runtime.IsTruthy(Runtime.CharEqual(args[i], args[j]))) return Nil.Instance;
             return T.Instance;
         });
-        // All-pairs inequality: (0,1) / (0,1),(0,2),(1,2) — same pair order.
+        // All-pairs inequality: (0,1) / (0,1),(0,2),(1,2): same pair order.
         charNeFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject>)((a, b) =>
             Runtime.IsTruthy(Runtime.CharEqual(a, b)) ? Nil.Instance : (LispObject)T.Instance));
         charNeFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject, LispObject>)((a, b, c) =>
@@ -1781,10 +1865,12 @@ public static partial class Runtime
             if (lispFn == null)
             {
                 var csFn = fn;
-                lispFn = new LispFunction(fargs => {
+                // One wrapper per macro function, not one per call: callers compare
+                // what GET-MACRO-CHARACTER returns (see ReaderMacroWrappers).
+                lispFn = ReaderMacroWrappers.ForDelegate(csFn, () => new LispFunction(fargs => {
                     // Reuse the stream's live CachedReader when present, same as the
                     // GET-DISPATCH-MACRO-CHARACTER wrapper below: a fresh Reader here
-                    // both loses look-ahead push-back on return and — worse — can get
+                    // both loses look-ahead push-back on return and, worse, can get
                     // installed as the stream's CachedReader by the dispatch adapter
                     // while carrying a ReadSuppress=true baseline (when created inside
                     // a #+/#- discard), permanently suppressing all subsequent reads
@@ -1819,12 +1905,19 @@ public static partial class Runtime
                     var result = csFn(reader, macroChar);
                     if (result == null)
                     {
-                        // C# macro returned no value — signal zero values to Lisp caller
+                        // C# macro returned no value: signal zero values to Lisp caller
                         MultipleValues.Set();
                         return Nil.Instance;
                     }
+                    // One value, said so. Without this the zero-values state a
+                    // PREVIOUS no-value macro left behind (a ; comment is the common
+                    // one) is still current, and a caller that reads the count to
+                    // decide whether a value was produced discards this one whenever
+                    // it happens to be NIL -- which is exactly what ( returns for the
+                    // empty list. Every () after a comment vanished from the form.
+                    MultipleValues.Reset();
                     return result;
-                });
+                }));
             }
             return MultipleValues.Values2(lispFn, nonTerm ? T.Instance : Nil.Instance);
         }));
@@ -1900,10 +1993,12 @@ public static partial class Runtime
             if (csFn2 != null)
             {
                 var capturedCsFn = csFn2;
-                return new LispFunction(fargs => {
+                // One wrapper per sub-character function, for the same reason as
+                // GET-MACRO-CHARACTER above (see ReaderMacroWrappers).
+                return ReaderMacroWrappers.ForDelegate(capturedCsFn, () => new LispFunction(fargs => {
                     // When invoked during a READ (the common case: a custom dispatch
                     // handler delegating back to the built-in one), reuse the stream's
-                    // live CachedReader — the one the enclosing read is running on — so
+                    // live CachedReader, the one the enclosing read is running on, so
                     // any look-ahead the built-in handler pushes back (e.g. the
                     // longest-match scan in ReadCharacterLiteral) lands in the SAME
                     // reader and is re-read. A fresh Reader would buffer the pushed-back
@@ -1937,7 +2032,7 @@ public static partial class Runtime
                     var res2 = capturedCsFn(reader2, sc, narg);
                     if (res2 == null) { MultipleValues.Set(); return Nil.Instance; }
                     return res2;
-                });
+                }));
             }
             return Nil.Instance;
         }));

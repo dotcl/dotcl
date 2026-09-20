@@ -1,12 +1,12 @@
-;;; dotcl-cs.lisp — Compile and embed C# code in dotcl via Roslyn.
+;;; dotcl-cs.lisp: Compile and embed C# code in dotcl via Roslyn.
 ;;;
 ;;; Usage: (require "dotcl-cs")
 ;;;
 ;;; Provides:
 ;;;   dotcl-cs:disassemble-cs body-string
-;;;     → list of (:OP operand) instructions, dotcl-SIL-shaped.
+;;;     -> list of (:OP operand) instructions, dotcl-SIL-shaped.
 ;;;   dotcl-cs:inline-cs (bindings &key returns body)
-;;;     → macro that splices C# IL inline into the enclosing dotcl function.
+;;;     -> macro that splices C# IL inline into the enclosing dotcl function.
 ;;;
 ;;; Implementation:
 ;;;   Loads the contrib's own lib/ directory (Roslyn + a small C# helper
@@ -40,7 +40,7 @@
 (defun ensure-lib-loaded ()
   (unless *lib-loaded*
     (unless *contrib-dir*
-      (error "dotcl-cs: *contrib-dir* not captured — contrib loaded outside of Load?"))
+      (error "dotcl-cs: *contrib-dir* not captured; contrib loaded outside of Load?"))
     (let ((lib-dir (make-pathname
                     :directory (append (pathname-directory *contrib-dir*)
                                        (list "lib"))
@@ -105,7 +105,7 @@
            (intern "%INLINE-CS-SPLICED" "DOTCL-INTERNAL"))
        ,lisp-vals :returns ,returns ,sil)))
 
-;; Intentionally NO (provide "dotcl-cs") here — a regression test relies
+;; Intentionally NO (provide "dotcl-cs") here: a regression test relies
 ;; on this contrib being a module that forgets to call provide, so that
 ;; require's auto-push behaviour can be exercised. If you add provide here,
 ;; update the corresponding regression test to use a different

@@ -1,4 +1,4 @@
-;;; framework.lisp — Lightweight deftest framework
+;;; framework.lisp: Lightweight deftest framework
 ;;;
 ;;; Loaded by the dotcl-specific test harnesses before their test bodies:
 ;;;   test/regression/run.lisp   (make test-regression)
@@ -27,7 +27,7 @@
 ;;; Some tests assert a COMPILER behaviour rather than a language behaviour: a
 ;;; compile-time warning, a compile-time type error, the IL size limit, or the
 ;;; refusal to generate code. The tree-walk interpreter does none of those
-;;; things — it has no compile phase to diagnose from — so on those forms its
+;;; things, it has no compile phase to diagnose from, so on those forms its
 ;;; answer is legitimately different, not wrong. Mark such tests with this so
 ;;; the suite can also be run as a gate on the emit-free evaluator:
 ;;;
@@ -35,15 +35,15 @@
 ;;;     --eval '(setq dotcl:*evaluator-mode* :interpret)' test/regression/run.lisp
 ;;;
 ;;; Skipping is the point: a compile-time-diagnostic test left in place under
-;;; :interpret either fails, or — worse, for the ones asserting that a real type
-;;; declaration stays QUIET — passes vacuously, because nothing was analysed.
+;;; :interpret either fails, or, worse, for the ones asserting that a real type
+;;; declaration stays QUIET, passes vacuously, because nothing was analysed.
 ;;; The predicate matches Runtime.UseInterpreter (by symbol name, so 'INTERPRET
 ;;; and :INTERPRET both count).
 ;;; Two ways to end up without a compiler, and both must skip:
 ;;;   * *EVALUATOR-MODE* is :INTERPRET on an ordinary build
 ;;;   * the build has no Reflection.Emit at all (netstandard2.0 / wasm /
-;;;     -p:DotclNoEmit=true). There *EVALUATOR-MODE* still reads :COMPILE —
-;;;     nothing rebinds it — so testing it alone let every compile-time test run
+;;;     -p:DotclNoEmit=true). There *EVALUATOR-MODE* still reads :COMPILE,
+;;;     nothing rebinds it, so testing it alone let every compile-time test run
 ;;;     on the one build that can never satisfy them. :DOTCL-EMIT is the feature
 ;;;     that answers the question directly.
 ;;; True when the image compiles what it runs. The consing assertions and the
@@ -58,6 +58,21 @@
 
 (defmacro deftest-compiled-only (name form &rest expected)
   `(when (compiled-mode-p)
+     (deftest ,name ,form ,@expected)))
+
+;;; True when the image has an emitter at all, whatever *EVALUATOR-MODE* says.
+;;; The distinction from COMPILED-MODE-P matters for the tests that read back
+;;; emitted code with DOTCL:FUNCTION-SIL: DEFUN goes through the compiler even
+;;; under :INTERPRET (only the surrounding EVAL is a tree walk), so the SIL is
+;;; there and those assertions still mean something. On an emit-free build
+;;; nothing is emitted, FUNCTION-SIL answers NIL, and every count taken from it
+;;; is 0 -- which makes "this instruction is gone" pass for the wrong reason and
+;;; "this slot is native" fail for the wrong reason.
+(defun emitting-mode-p ()
+  (and (find :dotcl-emit *features*) t))
+
+(defmacro deftest-emitting-only (name form &rest expected)
+  `(when (emitting-mode-p)
      (deftest ,name ,form ,@expected)))
 
 

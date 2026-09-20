@@ -1,6 +1,6 @@
 ;;; LET* is sequential: each binding is in effect while the REMAINING init forms
 ;;; are evaluated (CLHS 3.1.2.1.1.2). The interpreter collected the special
-;;; bindings and PROGV'd them all at the end, which got that backwards — a later
+;;; bindings and PROGV'd them all at the end, which got that backwards; a later
 ;;; init form ran with the special still at its outer value, and then PROGV
 ;;; installed the saved value over whatever that form had done to it.
 ;;;

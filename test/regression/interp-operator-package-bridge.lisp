@@ -1,7 +1,7 @@
 ;;; A symbol in OPERATOR position must resolve the way a compiled call does.
 ;;;
-;;; dotcl registers a good deal of its runtime on symbols in its own packages —
-;;; DOTCL-MOP, DOTCL-INTERNAL, DOTCL — and CilAssembler bridges a bare name across
+;;; dotcl registers a good deal of its runtime on symbols in its own packages,
+;;; DOTCL-MOP, DOTCL-INTERNAL, DOTCL, and CilAssembler bridges a bare name across
 ;;; those packages when it resolves a named call. So compiled code can write
 ;;;
 ;;;   (class-precedence-list (find-class 'foo))
@@ -49,7 +49,7 @@
   (%opb :interpret '(listp (class-slots (find-class '%opb-a))))
   t)
 
-;;; the three routes must agree — that disagreement was the bug
+;;; the three routes must agree: that disagreement was the bug
 (deftest interp-operator-bridge.routes-agree-interpret
   (%opb :interpret '(let ((c (find-class '%opb-b)))
                      (list (length (class-precedence-list c))
@@ -84,7 +84,7 @@
 ;;; cross-package-fn-aliasing.lisp asserts this for COMPILED calls: a qualified
 ;;; call to an unbound symbol signals UNDEFINED-FUNCTION rather than resolving to
 ;;; a same-named bound function in another package. Those tests go through
-;;; COMPILE, so they cannot see the interpreted path — and routing operator
+;;; COMPILE, so they cannot see the interpreted path: and routing operator
 ;;; position through the bridge is exactly the change that could have broken it.
 ;;;
 ;;; It holds because Package.IsBridgeSource admits only dotcl's own packages, so

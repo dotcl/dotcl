@@ -56,7 +56,7 @@ public sealed class ByRef
 /// through AppDomain.CurrentDomain.GetAssemblies(), which is the path
 /// ResolveDotNetType already uses. For saved, C#-referenceable libraries,
 /// BeginLibrary/LibraryBuilder accumulate MANY types into one persisted
-/// assembly (the aggregation unit — a real library is more than one type);
+/// assembly (the aggregation unit: a real library is more than one type);
 /// PopulateType is the shared per-type emitter both paths call.
 /// </summary>
 public static class DynamicClassBuilder
@@ -71,7 +71,7 @@ public static class DynamicClassBuilder
     private static readonly Dictionary<(string, string), LispObject> _methodHandlers
         = new();
 
-    // IsStatic maps a Lisp defun to a `public static` method (no `self`) — the
+    // IsStatic maps a Lisp defun to a `public static` method (no `self`); the
     // shape a function library exports (System.Math-style). A static method
     // cannot be an override or interface impl, so IsStatic and IsOverride are
     // mutually exclusive.
@@ -125,7 +125,7 @@ public static class DynamicClassBuilder
         if (string.IsNullOrEmpty(fullName))
             throw new ArgumentException("fullName must be non-empty", nameof(fullName));
 
-        // saveToPath != null → the type goes into a saved, C#-referenceable
+        // saveToPath != null -> the type goes into a saved, C#-referenceable
         // facade assembly (stage 1). A single-type save is just a one-class library,
         // so we route through the aggregation layer (BeginLibrary/AddClass/Save)
         // to keep one code path for "populate a module + retarget corlib".
@@ -326,7 +326,7 @@ public static class DynamicClassBuilder
                     if (!raisersByEvent.TryGetValue("PropertyChanged", out var found))
                         throw new ArgumentException(
                             $"property {name} has :notify t but no PropertyChanged event " +
-                            "declared — add (:events (\"PropertyChanged\" PropertyChangedEventHandler))",
+                            "declared; add (:events (\"PropertyChanged\" PropertyChangedEventHandler))",
                             nameof(properties));
                     raiserInfo = found;
                 }
@@ -335,8 +335,8 @@ public static class DynamicClassBuilder
         }
 
         // Constructor(s). Two paths:
-        //   ctorSpecs != null → multi-ctor: one tb.DefineConstructor per spec.
-        //   ctorSpecs == null → single-ctor: backward-compat path using ctorBody /
+        //   ctorSpecs != null -> multi-ctor: one tb.DefineConstructor per spec.
+        //   ctorSpecs == null -> single-ctor: backward-compat path using ctorBody /
         //                       ctorParamTypes / baseCtorArgIndices.
         if (ctorSpecs != null && ctorSpecs.Count > 0)
         {
@@ -478,8 +478,8 @@ public static class DynamicClassBuilder
     /// <summary>
     /// Begin a saved class library: a single persisted assembly that many types
     /// are added to (via <see cref="LibraryBuilder.AddClass"/>) before one
-    /// <see cref="LibraryBuilder.Save"/>. This is the aggregation unit — the
-    /// original "1 define-class → 1 assembly" cannot express a real library.
+    /// <see cref="LibraryBuilder.Save"/>. This is the aggregation unit; the
+    /// original "1 define-class -> 1 assembly" cannot express a real library.
     /// The saved DLL is a C#-referenceable facade (stage 1 semantics extended to N
     /// types): its method bodies dispatch through <see cref="DispatchLispMethod"/>,
     /// so consuming it at runtime needs DotCL.Runtime + the Lisp loaded (stage 2
@@ -487,7 +487,7 @@ public static class DynamicClassBuilder
     /// </summary>
     /// <param name="savePath">Path the .dll is written to on Save().</param>
     /// <param name="assemblyName">
-    /// Library assembly simple-name — what a C# consumer references. Sanitized
+    /// Library assembly simple-name: what a C# consumer references. Sanitized
     /// to a legal AssemblyName.
     /// </param>
     /// <param name="version">Optional assembly version stamped into metadata.</param>
@@ -576,7 +576,7 @@ public static class DynamicClassBuilder
         /// <summary>
         /// Add one public enum type. Unlike a class facade, an enum is pure
         /// metadata (named constants over an integral underlying type), so the
-        /// emitted type is genuinely standalone — a C# consumer uses it with no
+        /// emitted type is genuinely standalone: a C# consumer uses it with no
         /// DotCL.Runtime dependency and no Lisp loaded. <paramref name="members"/>
         /// pairs each literal name with its value (already the underlying type).
         /// </summary>
@@ -617,7 +617,7 @@ public static class DynamicClassBuilder
         /// <summary>
         /// Add a public delegate type of the given signature. A delegate is a
         /// sealed type over System.MulticastDelegate with a runtime-provided
-        /// (object,IntPtr) ctor and Invoke method — pure metadata, so the emitted
+        /// (object,IntPtr) ctor and Invoke method: pure metadata, so the emitted
         /// type is standalone (a C# consumer references it as a callback type with
         /// no DotCL.Runtime). Both members are MethodImplAttributes.Runtime, i.e.
         /// the CLR supplies their bodies; this is the canonical reflection-emit
@@ -648,8 +648,8 @@ public static class DynamicClassBuilder
 
         /// <summary>
         /// Add a public value type (C# <c>struct</c>) with public instance
-        /// fields. Like enums/consts a fields-only struct is pure data — no Lisp
-        /// dispatch — so the emitted type is standalone (a C# consumer reads/
+        /// fields. Like enums/consts a fields-only struct is pure data, no Lisp
+        /// dispatch, so the emitted type is standalone (a C# consumer reads/
         /// writes its fields with no DotCL.Runtime). Emitted sequential-layout
         /// sealed over System.ValueType; the implicit default ctor zero-inits.
         /// </summary>
@@ -670,7 +670,7 @@ public static class DynamicClassBuilder
 
         /// <summary>
         /// Add a static holder type of <c>public const</c> fields. Each constant
-        /// is a compile-time literal (SetConstant) — like an enum it is pure
+        /// is a compile-time literal (SetConstant): like an enum it is pure
         /// metadata, so the type is standalone (no DotCL.Runtime, no Lisp) and
         /// the value is inlined into a C# consumer. Only literal-capable field
         /// types are valid (the integral/floating primitives, bool, char, string,
@@ -818,7 +818,7 @@ public static class DynamicClassBuilder
     /// <c>object[]</c>, dispatches to the registered Lisp lambda, then
     /// unboxes/casts the result to the declared return type.
     /// If <c>m.IsStatic</c> is true, a <c>public static</c> method is emitted
-    /// (no <c>self</c>; dispatch through <see cref="DispatchLispStatic"/>) —
+    /// (no <c>self</c>; dispatch through <see cref="DispatchLispStatic"/>);
     /// the shape a function library exports.
     /// Otherwise an instance method through <see cref="DispatchLispMethod"/>:
     /// if <c>m.IsOverride</c> is true it is Virtual and tied to a matching base
@@ -875,7 +875,7 @@ public static class DynamicClassBuilder
         il.Emit(OpCodes.Ldstr, fullName);
         il.Emit(OpCodes.Ldstr, dispatchKey);
 
-        // ldtoken + GetTypeFromHandle → Type
+        // ldtoken + GetTypeFromHandle -> Type
         il.Emit(OpCodes.Ldtoken, m.ReturnType);
         il.Emit(OpCodes.Call, GetTypeFromHandleMI);
 
@@ -993,7 +993,7 @@ public static class DynamicClassBuilder
     /// handler, and an <see cref="EventBuilder"/> tying them together. If a
     /// declared interface carries a matching add_/remove_ slot (same name and
     /// delegate type) the accessors are emitted as implicit interface impls
-    /// via <see cref="TypeBuilder.DefineMethodOverride"/>. Not thread-safe —
+    /// via <see cref="TypeBuilder.DefineMethodOverride"/>. Not thread-safe;
     /// uses plain Delegate.Combine/Remove rather than Interlocked.CompareExchange.
     /// </summary>
     private static (MethodBuilder Raiser, Type[] ParamTypes) EmitEvent(
@@ -1310,7 +1310,7 @@ public static class DynamicClassBuilder
         for (int i = 0; i < args.Length; i++)
             lispArgs[i + 1] = Runtime.DotNetToLisp(args[i]);
 
-        // Cross the C#→Lisp boundary through InvokeForeignCallback so a Lisp error
+        // Cross the C#->Lisp boundary through InvokeForeignCallback so a Lisp error
         // in the override body is handled (dotcl:*foreign-callback-handler*) rather
         // than escaping as TargetInvocationException and crashing the .NET caller.
         var result = Runtime.InvokeForeignCallback(lispFn, lispArgs);

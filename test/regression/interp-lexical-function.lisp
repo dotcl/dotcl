@@ -1,6 +1,6 @@
 ;;; (FUNCTION name) must find a lexical FLET / LABELS binding before the global
 ;;; definition. The tree-walk interpreter went straight to SYMBOL-FUNCTION, so
-;;; #'f inside (flet ((f ...)) ...) missed the local function entirely — an
+;;; #'f inside (flet ((f ...)) ...) missed the local function entirely; an
 ;;; UNDEFINED-FUNCTION when nothing global had that name, and silently the WRONG
 ;;; function when something did. ansi-test BLOCK.5 / BLOCK.10 are the shape that
 ;;; caught it: #'%f handed to MAPCAR, where %f is an FLET that RETURN-FROMs.
@@ -30,7 +30,7 @@
   (%ilf-eval :interpret %ilf-block5)
   good)
 
-;;; A lexical binding must SHADOW an existing global of the same name — the
+;;; A lexical binding must SHADOW an existing global of the same name; the
 ;;; failure mode that stays silent rather than signalling.
 (defun %ilf-shadowed () :global)
 

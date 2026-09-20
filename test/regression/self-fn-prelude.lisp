@@ -4,7 +4,7 @@
 ;;;   load-sym-pkg NAME PKG / castclass Symbol / GetFunctionBySymbol / stloc
 ;;; so that a NON-TAIL self-call had a LispFunction to invoke. A tail self-call
 ;;; becomes a TCO branch and never reads it, and most functions do not call
-;;; themselves at all — so for most functions that was a symbol lookup plus a
+;;; themselves at all: so for most functions that was a symbol lookup plus a
 ;;; function lookup on every single entry, and the JIT cannot remove it because
 ;;; GetFunctionBySymbol is an opaque call.
 ;;;
@@ -32,7 +32,7 @@
   (%sfp-plain 3 4)
   7)
 
-;; A tail self-call compiles to a TCO branch, not a funcall — still no prelude.
+;; A tail self-call compiles to a TCO branch, not a funcall: still no prelude.
 (defun %sfp-tail (n acc)
   (if (<= n 0) acc (%sfp-tail (- n 1) (+ acc n))))
 
@@ -82,7 +82,7 @@
   (%sfp-fib 20)
   6765)
 
-;; Non-tail AND tail self-call in the same body — the mix the arg0 threading
+;; Non-tail AND tail self-call in the same body: the mix the arg0 threading
 ;; has to keep straight.
 (defun %sfp-mixed (n acc)
   (cond ((<= n 0) acc)
@@ -145,7 +145,7 @@
   103)
 
 ;; A self-call from INSIDE a closure. The closure compiles to its own method, so
-;; it cannot reach a self LispFunction threaded into the outer one as arg0 — it
+;; it cannot reach a self LispFunction threaded into the outer one as arg0; it
 ;; has to resolve the name itself.
 (defun %sfp-closure (n)
   (if (= n 0)

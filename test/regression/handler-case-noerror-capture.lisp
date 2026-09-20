@@ -3,7 +3,7 @@
 ;;; bodies are emitted as LAMBDA bodies by the macro expansion. Previously
 ;;; find-captured-vars-expr walked handler-case/restart-case clause bodies with
 ;;; in-lambda = nil, so a var mutated only there was seen as mutated-but-not-
-;;; captured and skipped boxing — the setf hit a stack copy and was lost.
+;;; captured and skipped boxing: the setf hit a stack copy and was lost.
 ;;;
 ;;; This surfaced in the SBCL cross-build: reduce-constants uses
 ;;;   (handler-case (funcall fun a b) (arithmetic-error () ...)

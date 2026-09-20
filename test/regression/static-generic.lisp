@@ -1,6 +1,6 @@
 ;;; Regression tests for dotnet:static-generic: generic static methods
 
-;;; Enumerable.Where<int> — filter list with lambda predicate
+;;; Enumerable.Where<int>: filter list with lambda predicate
 (deftest d895-linq-where-basic
   (let* ((lst (dotnet:new "System.Collections.Generic.List`1[System.Int32]"))
          (pred (dotnet:make-delegate "System.Func`2[System.Int32,System.Boolean]"
@@ -18,7 +18,7 @@
             (dotnet:invoke result "get_Item" 1))))
   (2 5 7))
 
-;;; Enumerable.Select<int,int> — transform
+;;; Enumerable.Select<int,int>: transform
 (deftest d895-linq-select
   (let* ((lst (dotnet:new "System.Collections.Generic.List`1[System.Int32]"))
          (sel (dotnet:make-delegate "System.Func`2[System.Int32,System.Int32]"

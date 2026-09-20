@@ -10,6 +10,6 @@
                          :if-exists :append :if-does-not-exist :create)
     (format s "~a fired by task scheduler~%"
             (dotnet:static "System.DateTime" "Now")))
-  ;; SVSFlagsAsync = 1 — return immediately (process can exit before audio finishes
+  ;; SVSFlagsAsync = 1: return immediately (process can exit before audio finishes
   ;; if 0 is passed and the process is killed), but we want to wait so use 0.
   (dotnet:invoke voice "Speak" "Good morning. This is a notification from dotcl." 0))

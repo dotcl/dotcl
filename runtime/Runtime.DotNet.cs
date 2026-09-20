@@ -55,8 +55,8 @@ public static partial class Runtime
         return DotNetNullMarker;
     }
 
-    // Tracks dynamically-defined class names (uppercase simple name → Type) for
-    // case-insensitive resolution from Lisp symbols (e.g. symbol Animal → "ANIMAL").
+    // Tracks dynamically-defined class names (uppercase simple name -> Type) for
+    // case-insensitive resolution from Lisp symbols (e.g. symbol Animal -> "ANIMAL").
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, Type>
         _dotNetDynTypeByUpperName = new(StringComparer.OrdinalIgnoreCase);
 
@@ -86,13 +86,13 @@ public static partial class Runtime
                 ? Fixnum.Make((long)nu)
                 : (LispObject)Bignum.MakeInteger((System.Numerics.BigInteger)(ulong)nu),
             // BigInteger is the CLR's arbitrary-precision integer and CL's integer
-            // type is unbounded, so it maps onto the standard tower exactly — no
+            // type is unbounded, so it maps onto the standard tower exactly: no
             // extension value escapes. Without this a BigInteger result is an opaque
             // wrapper that numberp/arithmetic reject.
             System.Numerics.BigInteger bi => Bignum.MakeInteger(bi),
 #if NET7_0_OR_GREATER
             // Int128/UInt128 are fixed-width VIEWS of values the CL tower already
-            // holds exactly, so they read as ordinary integers — no extension value
+            // holds exactly, so they read as ordinary integers: no extension value
             // escapes. What is distinct about them (width, overflow, unboxed
             // storage) lives on the .NET side of the boundary, not in the value.
             Int128 i128 => Bignum.MakeInteger((System.Numerics.BigInteger)i128),
@@ -109,7 +109,7 @@ public static partial class Runtime
             // Half is a 16-bit IEEE float; single-float is the narrowest CL format
             // that holds every one of its values exactly, so the widening loses
             // nothing. Like Int128, what is distinct about Half (storage width,
-            // interop layout) stays on the .NET side — no new Lisp float format.
+            // interop layout) stays on the .NET side: no new Lisp float format.
             Half h => new SingleFloat((float)h),
 #endif
             // Preserve decimal as a first-class scale-keeping value (not a normalized
@@ -190,7 +190,7 @@ public static partial class Runtime
                 if (res is MvReturn mv)
                     return MultipleValues.Values(mv.ToArray());
                 // Task<VoidTaskResult> is the internal shape of a non-generic async
-                // Task; its Result is a private placeholder struct → NIL.
+                // Task; its Result is a private placeholder struct -> NIL.
                 if (res != null && res.GetType().FullName == "System.Threading.Tasks.VoidTaskResult")
                     return Nil.Instance;
                 return DotNetToLisp(res);
@@ -219,7 +219,27 @@ public static partial class Runtime
             throw new LispErrorException(new LispProgramError(
                 "DOTNET:AWAIT: not an awaitable .NET object: " + args[0]));
 
-        task.GetAwaiter().GetResult();   // block; unwraps AggregateException to the inner exception
+        try
+        {
+            task.GetAwaiter().GetResult();   // block; unwraps AggregateException to the inner exception
+        }
+        catch (Exception ex)
+        {
+            // This is the other half of AsyncContinuation: a THROW inside a
+            // continuation did not decide "no catcher" there, because the tags
+            // that could catch it are on THIS stack and the fault is how it gets
+            // here. Now it has arrived, so the question can be answered -- and
+            // if the answer is still no, it becomes the CLHS 5.2 CONTROL-ERROR
+            // at this boundary instead of escaping as a bare .NET exception.
+            // Deferred again while this thread is itself a continuation: its own
+            // fault route is still ahead.
+            if (!AsyncContinuation.Active)
+            {
+                var unmatched = UnmatchedThrowError(ex);
+                if (unmatched != null) throw unmatched;
+            }
+            throw;
+        }
         return TaskResultToLisp(task);
     }
 
@@ -242,7 +262,7 @@ public static partial class Runtime
     /// The macro hands the block's values as a list (collected with
     /// MULTIPLE-VALUE-CALL, so nothing is dropped at the call boundary); this lifts
     /// them back into the MV protocol and parks the result in a completed Task.
-    /// One value stays a bare value — the common case allocates nothing extra.
+    /// One value stays a bare value: the common case allocates nothing extra.
     /// </summary>
     public static LispObject AsyncReturnMv(LispObject[] args)
     {
@@ -254,8 +274,8 @@ public static partial class Runtime
         var parked = MultipleValues.Values(vals.ToArray());
         // MultipleValues.Values set the count for the values being PARKED IN THE
         // TASK, but what this function returns is one value, the task itself.
-        // Leaving the count behind made a caller that reads it — anything using
-        // MULTIPLE-VALUE-CALL on this call — see (async (values)) return no values
+        // Leaving the count behind made a caller that reads it, anything using
+        // MULTIPLE-VALUE-CALL on this call, see (async (values)) return no values
         // at all, so the task never reached AWAIT.
         var task = new LispDotNetObject(
             System.Threading.Tasks.Task.FromResult(parked));
@@ -272,6 +292,7 @@ public static partial class Runtime
     {
         var baseDepth = DynamicBindings.Depth;
         var hBaseDepth = HandlerClusterStack.Depth;
+        AsyncContinuation.Enter();
         try
         {
             DynamicBindings.Restore(dyn);
@@ -280,6 +301,7 @@ public static partial class Runtime
         }
         finally
         {
+            AsyncContinuation.Exit();
             DynamicBindings.TruncateTo(baseDepth);
             HandlerClusterStack.TruncateTo(hBaseDepth);
         }
@@ -330,7 +352,7 @@ public static partial class Runtime
     {
         // A Lisp non-local exit or condition that started inside a callback (a lambda
         // handed to LINQ, an event handler) is passing THROUGH this reflection call on
-        // its way to its own target — it is not a failure of the .NET method. Let it
+        // its way to its own target: it is not a failure of the .NET method. Let it
         // continue unchanged; wrapping it turned (return-from b ...) across a callback
         // into an error reading "DOTNET:INVOKE Func`2.Invoke: block return", and lost
         // the original condition of a Lisp error.
@@ -350,7 +372,7 @@ public static partial class Runtime
         if (ex is AsyncSignalException ase) return ase.Condition;
         if (ex is LispErrorException le) return le.Condition;
         if (ex is HandlerCaseInvocationException hce) return hce.Condition;
-        // raw .NET → program-error; append the .NET type + StackTrace only under
+        // raw .NET -> program-error; append the .NET type + StackTrace only under
         // dotcl:*debug-stacktrace* so ordinary error reports stay clean. Preserve
         // the CLR type so dotnet:exception-type / dotnet:handler-bind can dispatch.
         return new LispProgramError(
@@ -365,6 +387,7 @@ public static partial class Runtime
     {
         var baseDepth = DynamicBindings.Depth;
         var hBaseDepth = HandlerClusterStack.Depth;
+        AsyncContinuation.Enter();
         try
         {
             DynamicBindings.Restore(dyn);
@@ -373,6 +396,7 @@ public static partial class Runtime
         }
         finally
         {
+            AsyncContinuation.Exit();
             DynamicBindings.TruncateTo(baseDepth);
             HandlerClusterStack.TruncateTo(hBaseDepth);
         }
@@ -433,7 +457,7 @@ public static partial class Runtime
         System.Threading.Tasks.TaskCompletionSource<LispObject> tcs)
     {
         var inner = UnwrapAggregate(ex);
-        // Control-flow transfers are not conditions — let them propagate.
+        // Control-flow transfers are not conditions: let them propagate.
         if (inner is BlockReturnException || inner is CatchThrowException ||
             inner is GoException || inner is RestartInvocationException)
         { tcs.SetException(inner); return; }
@@ -443,7 +467,7 @@ public static partial class Runtime
         catch (Exception he) { tcs.SetException(he); return; }   // a handler clause threw
 
         if (ReferenceEquals(result, AsyncDeclineMarker.Instance))
-        { tcs.SetException(inner); return; }                     // no clause matched → re-raise
+        { tcs.SetException(inner); return; }                     // no clause matched -> re-raise
 
         var next = ToTask(result);
         if (next == null) { tcs.SetResult(result); return; }
@@ -457,8 +481,8 @@ public static partial class Runtime
 
     /// <summary>
     /// (dotcl:%async-unwind-protect body-thunk cleanup-thunk) => task
-    /// Async unwind-protect. Runs BODY-THUNK (→ Task); once it settles (success,
-    /// fault, or cancel) runs CLEANUP-THUNK (→ Task) for effect, then propagates
+    /// Async unwind-protect. Runs BODY-THUNK (-> Task); once it settles (success,
+    /// fault, or cancel) runs CLEANUP-THUNK (-> Task) for effect, then propagates
     /// BODY's original outcome. A fault raised by the cleanup itself supersedes the
     /// body's outcome (as in synchronous CL). The cleanup runs under the dynamic
     /// environment captured where the unwind-protect was established.
@@ -502,7 +526,7 @@ public static partial class Runtime
         => new LispErrorException(new LispProgramError(
             "DOTCL:%ASYNC-UNWIND-PROTECT: thunk did not return an awaitable"));
 
-    /// <summary>Run CLEANUP (→ Task) under the captured env; on its completion call
+    /// <summary>Run CLEANUP (-> Task) under the captured env; on its completion call
     /// onCleanupDone, unless the cleanup itself faults (which then supersedes).</summary>
     private static void RunCleanupThen(LispFunction cleanupThunk,
         Dictionary<Symbol, LispObject>? dyn, List<HandlerBinding[]>? handlers,
@@ -550,7 +574,7 @@ public static partial class Runtime
 
         var names = Runtime.ToList(args[0]);
         var cluster = new LispRestart[names.Count];
-        // tag → clause name, so a caught RestartInvocationException maps back to the
+        // tag -> clause name, so a caught RestartInvocationException maps back to the
         // clause to dispatch. Tags are reference-unique per LispRestart.
         var tagNames = new Dictionary<object, string>(names.Count);
         for (int i = 0; i < names.Count; i++)
@@ -593,7 +617,7 @@ public static partial class Runtime
         if (inner is not RestartInvocationException rie || !tagNames.TryGetValue(rie.Tag, out var name))
         { tcs.SetException(inner); return; }
 
-        // args list (the invoke-restart arguments) → Lisp list for the dispatch fn.
+        // args list (the invoke-restart arguments) -> Lisp list for the dispatch fn.
         LispObject argList = Nil.Instance;
         for (int i = rie.Arguments.Length - 1; i >= 0; i--) argList = new Cons(rie.Arguments[i], argList);
 
@@ -616,6 +640,7 @@ public static partial class Runtime
     {
         var baseDepth = DynamicBindings.Depth;
         var hBaseDepth = HandlerClusterStack.Depth;
+        AsyncContinuation.Enter();
         try
         {
             DynamicBindings.Restore(dyn);
@@ -624,6 +649,7 @@ public static partial class Runtime
         }
         finally
         {
+            AsyncContinuation.Exit();
             DynamicBindings.TruncateTo(baseDepth);
             HandlerClusterStack.TruncateTo(hBaseDepth);
         }
@@ -672,6 +698,7 @@ public static partial class Runtime
             var baseDepth = DynamicBindings.Depth;
             var hBaseDepth = HandlerClusterStack.Depth;
             var rBaseDepth = RestartClusterStack.Depth;
+            AsyncContinuation.Enter();
             try
             {
                 DynamicBindings.Restore(dynSnapshot);    // install captured specials
@@ -695,6 +722,7 @@ public static partial class Runtime
             catch (Exception e) { tcs.SetException(e); return; }
             finally
             {
+                AsyncContinuation.Exit();
                 DynamicBindings.TruncateTo(baseDepth);
                 HandlerClusterStack.TruncateTo(hBaseDepth);
                 RestartClusterStack.TruncateTo(rBaseDepth);
@@ -717,7 +745,7 @@ public static partial class Runtime
     }
 
     // Platform-width bounds for nint/nuint, as the widest signed 64-bit value that
-    // can still be represented — a long never exceeds nuint's real maximum on a
+    // can still be represented: a long never exceeds nuint's real maximum on a
     // 64-bit process, so clamping the check at long.MaxValue there is exact.
     private static readonly long NIntMin = IntPtr.Size == 8 ? long.MinValue : int.MinValue;
     private static readonly long NIntMax = IntPtr.Size == 8 ? long.MaxValue : int.MaxValue;
@@ -733,12 +761,12 @@ public static partial class Runtime
 
     /// <summary>Marshal a CL integer into a fixed-width CLR integer parameter, signalling a
     /// Lisp type-error when it does not fit instead of wrapping silently (an unchecked
-    /// (byte)300 is 44 — a store that looks like it worked). Returns null when targetType is
+    /// (byte)300 is 44: a store that looks like it worked). Returns null when targetType is
     /// not a fixed-width integer, so the caller goes on to try float/decimal/object.
     ///
     /// A SIGNED target also accepts the value written as an unsigned N-bit pattern and
-    /// reinterprets it: CL has no way to write a negative bit pattern, so (ldb (byte 32 0) x)
-    /// — the idiomatic name for 32 bits — is always non-negative, and that is exactly what
+    /// reinterprets it: CL has no way to write a negative bit pattern, so (ldb (byte 32 0) x);
+    /// the idiomatic name for 32 bits: is always non-negative, and that is exactly what
     /// callers hand to BitConverter.Int32BitsToSingle and friends. Unsigned targets stay
     /// strict, because (ldb ...) already produces non-negative values there and a negative
     /// argument is far likelier to be a mistake than a request for all-ones. A value that
@@ -773,7 +801,7 @@ public static partial class Runtime
                           || (targetType == typeof(nuint) && IntPtr.Size == 8);
         if (unsigned64 && v.Sign > 0 && v <= UInt64MaxInt)
             return targetType == typeof(ulong) ? (object)(ulong)v : (nuint)(ulong)v;
-        // Signed 64-bit targets take the unsigned 64-bit pattern too — the same
+        // Signed 64-bit targets take the unsigned 64-bit pattern too: the same
         // reinterpretation the long overload does for the narrower widths, which is
         // how (ldb (byte 64 0) x) reaches BitConverter.Int64BitsToDouble.
         bool signed64 = targetType == typeof(long)
@@ -794,7 +822,7 @@ public static partial class Runtime
             return (UInt128)BigIntegerFits(v, 0, UInt128MaxInt, targetType, arg);
 #endif
         // Signal only for targets this method owns; anything else falls through so
-        // the caller can keep trying (BigInteger, decimal, object, …).
+        // the caller can keep trying (BigInteger, decimal, object, ...).
         if (IntegerToFixedWidthOwns(targetType))
             throw new LispErrorException(new LispTypeError(
                 $"integer out of System.{targetType.Name} range", arg, Startup.Sym("INTEGER")));
@@ -829,7 +857,7 @@ public static partial class Runtime
     /// <summary>Convert a LispObject to a .NET type based on target parameter type.</summary>
     public static object? LispToDotNet(LispObject arg, Type targetType)
     {
-        // (dotnet:null) marker → an explicit .NET null, for any reference or
+        // (dotnet:null) marker -> an explicit .NET null, for any reference or
         // Nullable<T> target (e.g. a null/indeterminate CheckBox.IsChecked).
         if (ReferenceEquals(arg, DotNetNullMarker)) return null;
 
@@ -855,9 +883,9 @@ public static partial class Runtime
         }
 
         // Nullable<T>: marshal to the underlying type so bool? mirrors plain bool
-        // (t→true, nil→false) and int?/etc. accept their value. nil maps to null
+        // (t->true, nil->false) and int?/etc. accept their value. nil maps to null
         // for non-bool nullables (no false analog); (dotnet:null) is the explicit
-        // null for all. Without this, nil → Activator.CreateInstance(Nullable<T>)
+        // null for all. Without this, nil -> Activator.CreateInstance(Nullable<T>)
         // = null, so bool? could never receive false.
         var underlyingType = Nullable.GetUnderlyingType(targetType);
         if (underlyingType != null)
@@ -866,7 +894,7 @@ public static partial class Runtime
             return LispToDotNet(arg, underlyingType);
         }
 
-        // Nil → null or false
+        // Nil -> null or false
         if (arg is Nil)
         {
             if (targetType == typeof(bool)) return false;
@@ -874,15 +902,15 @@ public static partial class Runtime
             return Activator.CreateInstance(targetType);
         }
 
-        // T → true
+        // T -> true
         if (arg is T && targetType == typeof(bool))
             return true;
 
-        // Fixnum → numeric types
+        // Fixnum -> numeric types
         if (arg is Fixnum fx)
         {
             // The small integer types are symmetric with DotNetToLisp's read side:
-            // without them a (setf (aref a i) n) into a sbyte[]/ushort[]/uint[]/…
+            // without them a (setf (aref a i) n) into a sbyte[]/ushort[]/uint[]/...
             // (dotnet:make-array store) fails with "Cannot convert Fixnum to SByte".
             var narrowed = IntegerToFixedWidth(fx.Value, targetType, arg);
             if (narrowed != null) return narrowed;
@@ -897,7 +925,7 @@ public static partial class Runtime
             if (targetType == typeof(object)) return fx.Value;
         }
 
-        // DoubleFloat → double/float/Half. Narrowing to float/Half rounds to nearest
+        // DoubleFloat -> double/float/Half. Narrowing to float/Half rounds to nearest
         // and overflows to an infinity, exactly as the corresponding C# cast does.
         if (arg is DoubleFloat df)
         {
@@ -910,7 +938,7 @@ public static partial class Runtime
             if (targetType == typeof(object)) return df.Value;
         }
 
-        // SingleFloat → float/double/Half
+        // SingleFloat -> float/double/Half
         if (arg is SingleFloat sf)
         {
             if (targetType == typeof(float)) return sf.Value;
@@ -922,7 +950,7 @@ public static partial class Runtime
             if (targetType == typeof(object)) return sf.Value;
         }
 
-        // LispDecimal → decimal (exact) / float / double
+        // LispDecimal -> decimal (exact) / float / double
         if (arg is LispDecimal ld)
         {
             if (targetType == typeof(decimal)) return ld.Value;
@@ -931,19 +959,19 @@ public static partial class Runtime
             if (targetType == typeof(object)) return ld.Value;
         }
 
-        // Bignum → BigInteger: the exact counterpart of the read side, so an integer
+        // Bignum -> BigInteger: the exact counterpart of the read side, so an integer
         // too wide for a fixnum can be passed into a BigInteger-typed parameter.
         if (arg is Bignum bnB)
         {
             if (targetType == typeof(System.Numerics.BigInteger)) return bnB.Value;
-            // …and into a fixed-width one it still fits. A ulong/nuint above
+            // ...and into a fixed-width one it still fits. A ulong/nuint above
             // long.MaxValue comes back OUT of .NET as a bignum, so without this a
             // value an API just returned cannot be passed back IN.
             var wide = IntegerToFixedWidth(bnB.Value, targetType, arg);
             if (wide != null) return wide;
         }
 
-        // Bignum / Ratio → decimal: exact-or-throw, so a computed CL real can be passed to
+        // Bignum / Ratio -> decimal: exact-or-throw, so a computed CL real can be passed to
         // a decimal-typed .NET parameter without silent precision loss.
         if (arg is Bignum bnD && targetType == typeof(decimal))
         {
@@ -955,14 +983,14 @@ public static partial class Runtime
         if (arg is Ratio rtD && targetType == typeof(decimal))
             return RationalToDecimalExact(rtD.Numerator, rtD.Denominator, arg);
 
-        // LispString → string
+        // LispString -> string
         if (arg is LispString ls)
         {
             if (targetType == typeof(string)) return ls.Value;
             if (targetType == typeof(object)) return ls.Value;
         }
 
-        // Char-backed LispVector (BASE-STRING / fill-pointered string) → string.
+        // Char-backed LispVector (BASE-STRING / fill-pointered string) -> string.
         // CL strings have two runtime representations (LispString and char
         // LispVector); both must marshal to System.String for .NET interop.
         if (arg is LispVector cv && cv.IsCharVector)
@@ -971,7 +999,7 @@ public static partial class Runtime
             if (targetType == typeof(object)) return cv.ToCharString();
         }
 
-        // LispFunction → delegate (Func<>, Action<>, EventHandler<>, etc.)
+        // LispFunction -> delegate (Func<>, Action<>, EventHandler<>, etc.)
         if (arg is LispFunction fn && typeof(Delegate).IsAssignableFrom(targetType))
             return CreateLispDelegate(fn, targetType);
 
@@ -992,7 +1020,7 @@ public static partial class Runtime
             }
         }
 
-        // Lisp sequence (list or vector) → typed array T[]. Lets a Lisp list or
+        // Lisp sequence (list or vector) -> typed array T[]. Lets a Lisp list or
         // vector be passed where an array-typed parameter or property is expected
         // (e.g. set_FileTypeFilter with FilePickerFileType[], Patterns with
         // string[]). Each element is marshalled to the element type. An already
@@ -1007,10 +1035,10 @@ public static partial class Runtime
         }
 
         // Interface or base-class target (IComparable, IConvertible, IFormattable,
-        // ValueType, …) that a primitive value's natural .NET type satisfies: box at
+        // ValueType, ...) that a primitive value's natural .NET type satisfies: box at
         // that natural type. Lets dotnet:box / a typed parameter accept e.g. an int
         // where IComparable is wanted. Concrete primitive targets (int,
-        // double, string, …) are handled by the branches above.
+        // double, string, ...) are handled by the branches above.
         {
             object? natural = arg switch
             {
@@ -1032,7 +1060,7 @@ public static partial class Runtime
         if (targetType == typeof(object)) return arg;
 
         // A parameter typed in terms of the Lisp object model itself (LispObject,
-        // Cons, LispVector, …) takes the value unchanged — no marshalling was
+        // Cons, LispVector, ...) takes the value unchanged: no marshalling was
         // ever wanted. This is how Lisp code calls a host API that speaks
         // LispObject, e.g. DotclHost.ToClrArray.
         if (targetType.IsInstanceOfType(arg)) return arg;
@@ -1217,15 +1245,15 @@ public static partial class Runtime
     // that reads project.assets.json after `dotnet restore`). The Default ALC's
     // Resolving / ResolvingUnmanagedDll hooks (Startup.cs) consult these so a managed
     // assembly resolves to the exact version-unified path and a native library resolves
-    // to its RID-specific path — without baking any NuGet logic into the runtime.
+    // to its RID-specific path: without baking any NuGet logic into the runtime.
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, string>
         _registeredAssemblyPaths = new(StringComparer.OrdinalIgnoreCase);
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, string>
         _registeredNativePaths = new(StringComparer.OrdinalIgnoreCase);
 
-    /// <summary>Register managed assembly simple-name → absolute .dll path (dotcl:register-assembly-path).</summary>
+    /// <summary>Register managed assembly simple-name -> absolute .dll path (dotcl:register-assembly-path).</summary>
     internal static void RegisterAssemblyPath(string name, string path) => _registeredAssemblyPaths[name] = path;
-    /// <summary>Register native library name → absolute path (dotcl:register-native-path).</summary>
+    /// <summary>Register native library name -> absolute path (dotcl:register-native-path).</summary>
     internal static void RegisterNativePath(string name, string path) => _registeredNativePaths[name] = path;
     /// <summary>Look up a registered managed assembly path by simple name, or null.</summary>
     internal static string? FindRegisteredAssembly(string name) =>
@@ -1240,7 +1268,7 @@ public static partial class Runtime
     // of loaded assemblies changes (AssemblyLoad fires MarkTypeCacheDirty), so
     // a module reload re-resolves every name once on next use rather than
     // returning a stale Type. Only successful resolutions of stable .NET
-    // assembly types are cached — failures and dynamically-defined Lisp types
+    // assembly types are cached: failures and dynamically-defined Lisp types
     // are never cached (a later load / redefinition must be able to change the
     // answer). Cleared strong refs also let a collectible ALC actually unload.
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, Type>
@@ -1257,7 +1285,7 @@ public static partial class Runtime
     [ThreadStatic] private static bool _inTypeResolve;
 
     /// <summary>Invalidate the resolve-type cache on the next resolution. Called
-    /// from the AssemblyLoad hook (Startup) — a new assembly may change what a
+    /// from the AssemblyLoad hook (Startup): a new assembly may change what a
     /// name resolves to. No-op while a resolution (incl. its probe) is in flight
     /// so the probe does not invalidate itself.</summary>
     internal static void MarkTypeCacheDirty()
@@ -1271,7 +1299,7 @@ public static partial class Runtime
         }
     }
 
-    /// <summary>DOTNET:CLEAR-TYPE-CACHE — drop all memoized resolve-type entries.
+    /// <summary>DOTNET:CLEAR-TYPE-CACHE: drop all memoized resolve-type entries.
     /// The next resolve-type re-resolves against the current assembly set.</summary>
     internal static void ClearTypeCache()
     {
@@ -1282,7 +1310,7 @@ public static partial class Runtime
 
     /// <summary>Extra directories, besides AppContext.BaseDirectory, that
     /// ProbeLoadBaseDir scans for managed assemblies. A host whose referenced
-    /// assemblies sit somewhere other than the app base registers them here —
+    /// assemblies sit somewhere other than the app base registers them here;
     /// notably the in-process MSBuild compile task, where BaseDirectory is the
     /// .NET SDK's own dir, not the consumer project's output, so its
     /// PackageReference / ProjectReference types would otherwise be invisible to
@@ -1314,7 +1342,7 @@ public static partial class Runtime
                         .LoadFromAssemblyPath(System.IO.Path.GetFullPath(dll));
 #endif
                 }
-                catch { /* not a managed assembly, or already loaded — ignore */ }
+                catch { /* not a managed assembly, or already loaded; ignore */ }
             }
         }
     }
@@ -1340,7 +1368,7 @@ public static partial class Runtime
         return null;
     }
 
-    /// <summary>DOTNET:RESOLVE-TYPE — resolve a .NET System.Type by name (searching loaded
+    /// <summary>DOTNET:RESOLVE-TYPE: resolve a .NET System.Type by name (searching loaded
     /// assemblies, loading by namespace prefix, and COM ProgIDs on Windows), returning it
     /// wrapped as a .NET object. The result can be inspected or passed anywhere a
     /// System.Type is expected (it unwraps to the Type). Signals an error if not found.
@@ -1360,7 +1388,7 @@ public static partial class Runtime
         return new LispDotNetObject(ResolveElementTypeArg(args[0]));
     }
 
-    /// <summary>DOTNET:CLEAR-TYPE-CACHE — drop all memoized resolve-type entries so
+    /// <summary>DOTNET:CLEAR-TYPE-CACHE: drop all memoized resolve-type entries so
     /// the next resolution re-searches the current assembly set. Returns T.</summary>
     public static LispObject DotNetClearTypeCache(LispObject[] args)
     {
@@ -1368,9 +1396,9 @@ public static partial class Runtime
         return T.Instance;
     }
 
-    /// <summary>DOTNET:CLASS-FOR-TYPE — return the CLOS class DotCL uses (registering
+    /// <summary>DOTNET:CLASS-FOR-TYPE: return the CLOS class DotCL uses (registering
     /// it lazily on first call) for a .NET type, so user code can obtain a specializer
-    /// class object without hand-spelling a class symbol — which is especially awkward
+    /// class object without hand-spelling a class symbol: which is especially awkward
     /// for closed generics, whose auto-derived name is a long assembly-qualified string.
     /// The argument is a System.Type (as from dotnet:resolve-type / dotnet:make-generic-type)
     /// or a type-name string/symbol. The returned class object is usable directly as a
@@ -1441,7 +1469,7 @@ public static partial class Runtime
     /// <summary>The actual type search: loaded assemblies, namespace-prefix load,
     /// mscorlib/netstandard facades, COM ProgID, then dynamically-defined Lisp
     /// types. Returns null (not throwing) on miss. CACHEABLE is false for a
-    /// dynamic Lisp type hit — those can be redefined, so they must not be
+    /// dynamic Lisp type hit: those can be redefined, so they must not be
     /// memoized.</summary>
     private static Type? SearchDotNetType(string typeName, out bool cacheable)
     {
@@ -1472,7 +1500,7 @@ public static partial class Runtime
         }
 
         // Try to load the assembly based on namespace prefix
-        // e.g., "System.Net.IPAddress" → try loading "System.Net" assembly
+        // e.g., "System.Net.IPAddress" -> try loading "System.Net" assembly
         var parts = bareTypeName.Split('.');
         for (int len = parts.Length - 1; len >= 1; len--)
         {
@@ -1491,7 +1519,7 @@ public static partial class Runtime
         // above misses it). The mscorlib / netstandard facades type-forward most
         // of the BCL surface, so resolving through them triggers the real
         // assembly load. e.g. "System.Collections.Queue" actually lives in
-        // System.Collections.NonGeneric — resolvable as "...Queue, mscorlib".
+        // System.Collections.NonGeneric: resolvable as "...Queue, mscorlib".
         // Crucial: this must run BEFORE the COM ProgID fallback, because some
         // legacy types (System.Collections.Queue, ArrayList, ...) are ALSO
         // registered as .NET Framework COM components (mscoree.dll). Activating
@@ -1582,7 +1610,7 @@ public static partial class Runtime
     /// Compile-time helper for typed-return inference. Given a
     /// receiver type name, an instance method name, and a list of parameter-type
     /// name strings, resolve the method's static return type and return its FullName
-    /// as a LispString — but ONLY when a value of that static type is guaranteed to
+    /// as a LispString: but ONLY when a value of that static type is guaranteed to
     /// marshal back (DotNetToLisp) to a LispDotNetObject, so it can serve as the
     /// receiver of a subsequent typed direct callvirt. Returns NIL for void, an
     /// unresolvable type / overload, a natively-marshaled primitive or string, or
@@ -1628,11 +1656,11 @@ public static partial class Runtime
 
     /// <summary>
     /// True when EVERY runtime value of static type RT marshals (DotNetToLisp) to a
-    /// LispDotNetObject — the precondition for using such a value as a typed direct
+    /// LispDotNetObject: the precondition for using such a value as a typed direct
     /// callvirt receiver. Value types are exact (sealed), so any non-primitive
     /// struct / enum qualifies. Reference types are polymorphic: a slot typed as
     /// object / ValueType / Enum / an interface could hold a string or boxed
-    /// primitive (which marshal to LispString / Fixnum / …), so those are excluded;
+    /// primitive (which marshal to LispString / Fixnum / ...), so those are excluded;
     /// any other concrete or abstract class is safe because string and the boxed
     /// primitives are not assignable to it.
     /// </summary>
@@ -1675,7 +1703,7 @@ public static partial class Runtime
 
     /// <summary>The receiver a Lisp value stands for in an instance call, or null when it
     /// does not stand for one. A .NET object is itself; a Lisp scalar that .NET hands back
-    /// unwrapped — string, character, number — becomes its CLR counterpart, so a value that
+    /// unwrapped, string, character, number, becomes its CLR counterpart, so a value that
     /// came OUT of a .NET call can be called back into:
     /// <c>(dotnet:invoke (dotnet:invoke x "get_Name") "ToUpper")</c>.
     /// NIL and T are deliberately excluded: NIL is ambiguous between null, false and the
@@ -1730,18 +1758,18 @@ public static partial class Runtime
         | System.Reflection.BindingFlags.SetProperty
         | System.Reflection.BindingFlags.SetField;
 
-    // ── dotnet:invoke / dotnet:static method-resolution cache ────────────────────
+    // -- dotnet:invoke / dotnet:static method-resolution cache --------------------
     // Type.InvokeMember re-runs member-name lookup + default-Binder overload
     // resolution on every call. Cache the resolved MethodInfo keyed by (runtime
-    // type OBJECT, member name, arg runtime types) — exactly the inputs the binder
-    // uses — so a hot interop loop pays resolution only once and then goes straight
+    // type OBJECT, member name, arg runtime types), exactly the inputs the binder
+    // uses, so a hot interop loop pays resolution only once and then goes straight
     // to MethodInfo.Invoke (which .NET 8+ backs with a cached fast invoker stub).
     // Pure reflection, no Reflection.Emit, so the fast path is AOT/IL2CPP-safe.
     //
     // Only plain fixed-arity method calls are cached. COM/IDispatch targets (one
     // shared __ComObject type, per-object member set), params / by-ref methods,
     // generic definitions, null args, and property/field access all fall through to
-    // the unchanged InvokeMember path — the cache can never alter overload
+    // the unchanged InvokeMember path: the cache can never alter overload
     // resolution, COM dispatch, or the #24 optional-argument fallback.
     //
     // Keying on the Type OBJECT (not its name) makes class redefinition safe: a
@@ -1833,7 +1861,7 @@ public static partial class Runtime
         // per-object. Caching by Type would serve another object's dispatch.
         if (type.IsCOMObject) return false;
 
-        // A null arg has no runtime type → can't key it or overload-resolve it; let
+        // A null arg has no runtime type -> can't key it or overload-resolve it; let
         // InvokeMember's binder handle null matching.
         var argTypes = new Type[callArgs.Length];
         for (int i = 0; i < callArgs.Length; i++)
@@ -1854,7 +1882,7 @@ public static partial class Runtime
         // both halves are about what a deep recursion through .NET callbacks costs.
         // Reflection's default wrap is catch + throw-new at EVERY level the call
         // nests, and the TargetInvocationException handler that undid it re-threw
-        // with ExceptionDispatchInfo — two restarted dispatches per level, each
+        // with ExceptionDispatchInfo: two restarted dispatches per level, each
         // leaving a live handler funclet behind. A condition escaping recursion
         // through delegate callbacks therefore died as an uncatchable .NET
         // StackOverflowException instead of arriving as STORAGE-CONDITION.
@@ -1884,8 +1912,8 @@ public static partial class Runtime
     private const System.Reflection.BindingFlags DoNotWrapExceptions =
         (System.Reflection.BindingFlags)0x02000000;
 
-    /// <summary>Did this exception come from Lisp — a condition already signalled,
-    /// or a non-local exit on its way to its own target — rather than from the .NET
+    /// <summary>Did this exception come from Lisp, a condition already signalled,
+    /// or a non-local exit on its way to its own target, rather than from the .NET
     /// method a reflected call just made?</summary>
     private static bool IsLispOriginatedException(Exception e)
         => e is LispErrorException || e is AsyncSignalException || IsLispControlFlowException(e);
@@ -2000,7 +2028,7 @@ public static partial class Runtime
     /// <summary>Pre-empt InvokeMember for the one case its default binder gets
     /// wrong: when a same-arity catch-all <c>(object, ...)</c> overload coexists
     /// with a fully-typed one, InvokeMember may box an integer/pointer arg to the
-    /// object overload — e.g. <c>Marshal.WriteIntPtr(object,int,IntPtr)</c> gets
+    /// object overload: e.g. <c>Marshal.WriteIntPtr(object,int,IntPtr)</c> gets
     /// picked over <c>(IntPtr,int,IntPtr)</c> and writes into a boxed value
     /// instead of native memory (corrupting char** builds; dotcl/dotcl FFI
     /// regression). Fires ONLY when an object-param overload is present AND a
@@ -2055,19 +2083,19 @@ public static partial class Runtime
             {
                 throw DotNetInvokeError($"DOTNET:{(isStatic ? "STATIC" : "INVOKE")} {type.Name}.{name}", tie);
             }
-            catch (ArgumentException) { /* not this overload after all — try next typed one */ }
+            catch (ArgumentException) { /* not this overload after all; try next typed one */ }
         }
         return false;
     }
 
     /// <summary>Fallback for dotnet:invoke / dotnet:static when InvokeMember's
     /// default binder finds no overload, because it matches on the args' Lisp
-    /// runtime types and can't see conversions like Lisp-list → T[] or
-    /// Lisp-fn → delegate. Finds a same-name, same-arity, fixed (no ref/params)
+    /// runtime types and can't see conversions like Lisp-list -> T[] or
+    /// Lisp-fn -> delegate. Finds a same-name, same-arity, fixed (no ref/params)
     /// method whose declared parameter types every supplied arg marshals to via
     /// LispToDotNet, and invokes it. Purely additive: only runs after the binder
     /// has already failed. Prefers candidates with an array parameter so the
-    /// list→T[] case is deterministic. Returns true and sets RESULT on success.</summary>
+    /// list->T[] case is deterministic. Returns true and sets RESULT on success.</summary>
     private static bool TryInvokeWithMarshalledArgs(
         Type type, string name, object? target, LispObject[] lispArgs, bool isStatic, out object? result)
     {
@@ -2089,7 +2117,7 @@ public static partial class Runtime
         }
         // Order candidates by specificity so the fallback picks the intended
         // overload, not a catch-all:
-        //   1. fewer System.Object parameters first — an obsolete (object, ...)
+        //   1. fewer System.Object parameters first: an obsolete (object, ...)
         //      overload must lose to the typed one. e.g. Marshal.WriteIntPtr has
         //      both (IntPtr,int,IntPtr) and (object,int,IntPtr); since a Lisp
         //      integer marshals to object just as readily as to IntPtr, the object
@@ -2123,7 +2151,7 @@ public static partial class Runtime
             {
                 throw DotNetInvokeError($"DOTNET:{(isStatic ? "STATIC" : "INVOKE")} {type.Name}.{name}", tie);
             }
-            catch (ArgumentException) { /* wrong overload — try next */ }
+            catch (ArgumentException) { /* wrong overload; try next */ }
         }
         return false;
     }
@@ -2159,7 +2187,7 @@ public static partial class Runtime
 
         // See DotNetInvoke: marshal with declared param types first when an arg is
         // nil, so value-type / Nullable<value> params get the natural default
-        // (bool/bool? → false) rather than null.
+        // (bool/bool? -> false) rather than null.
         if (args.Skip(2).Any(a => a is Nil)
             && TryInvokeWithMarshalledArgs(type, memberName, null, args.Skip(2).ToArray(), true, out var pre))
             return DotNetToLisp(pre);
@@ -2177,15 +2205,15 @@ public static partial class Runtime
         }
         catch (MissingMethodException)
         {
-            // No exact overload — retry allowing omitted C# optional parameters (#24).
+            // No exact overload: retry allowing omitted C# optional parameters (#24).
             if (TryInvokeWithOptionalDefaults(type, memberName, null, args.Skip(2).ToArray(), true, out var r))
                 return DotNetToLisp(r);
             // Or retry marshalling each arg to a candidate's declared param types
-            // (e.g. Lisp list → T[]), which the binder's runtime-type match misses.
+            // (e.g. Lisp list -> T[]), which the binder's runtime-type match misses.
             if (TryInvokeWithMarshalledArgs(type, memberName, null, args.Skip(2).ToArray(), true, out var r2))
                 return DotNetToLisp(r2);
-            // A generic method named outright — (dotnet:static "System.Linq.Enumerable"
-            // "Select" list fn) — reaches none of the above: InvokeMember cannot
+            // A generic method named outright, (dotnet:static "System.Linq.Enumerable"
+            // "Select" list fn), reaches none of the above: InvokeMember cannot
             // instantiate a generic definition, so the very method the caller named by
             // hand failed while calling it as an extension on the same list worked.
             // Its first parameter is the receiver, which is what the extension path
@@ -2238,7 +2266,7 @@ public static partial class Runtime
     // StackOverflowException. Worse, the DEEP margin matters here: after the
     // condition is thrown, every interop level catches and rethrows
     // (TargetInvocationException unwrap), and .NET's managed exception
-    // dispatch (EH.DispatchEx) runs on the remaining stack — with only the
+    // dispatch (EH.DispatchEx) runs on the remaining stack: with only the
     // fixed probe's headroom the DISPATCH itself overflows. So every 16th
     // interop call runs the margined probe (~256KB headroom, room for signal
     // + EH dispatch); the other 15 run the cheap fixed probe as a backstop.
@@ -2314,11 +2342,11 @@ public static partial class Runtime
 
         // Lisp NIL is ambiguous between .NET null and a value-type default (bool
         // false, etc.). The generic binder path below treats it as null, which is
-        // wrong for value-type / Nullable<value> parameters — e.g.
+        // wrong for value-type / Nullable<value> parameters: e.g.
         // (dotnet:invoke cb "set_IsChecked" nil) keeps IsChecked null instead of
         // false. When any arg is nil, first try parameter-type-aware marshalling
         // (LispToDotNet with the declared param type) so nil maps to the param's
-        // natural default (bool/bool? → false, ref/string/int? → null).
+        // natural default (bool/bool? -> false, ref/string/int? -> null).
         // Reference/string params still resolve to null, so this only changes the
         // previously-broken value-type case.
         if (args.Skip(2).Any(a => a is Nil)
@@ -2334,11 +2362,11 @@ public static partial class Runtime
         }
         catch (MissingMethodException)
         {
-            // No exact overload — retry allowing omitted C# optional parameters (#24).
+            // No exact overload: retry allowing omitted C# optional parameters (#24).
             if (TryInvokeWithOptionalDefaults(type, memberName, target, args.Skip(2).ToArray(), false, out var r))
                 return DotNetToLisp(r);
             // Or retry marshalling each arg to a candidate's declared param types
-            // (e.g. Lisp list → T[]), which the binder's runtime-type match misses.
+            // (e.g. Lisp list -> T[]), which the binder's runtime-type match misses.
             if (TryInvokeWithMarshalledArgs(type, memberName, target, args.Skip(2).ToArray(), false, out var r2))
                 return DotNetToLisp(r2);
             // A member of an interface the type implements explicitly. Tried before
@@ -2347,7 +2375,7 @@ public static partial class Runtime
             if (TryInvokeInterfaceMember(type, (args[0] as LispDotNetBoxed)?.HintType,
                                          memberName, target, callArgs, InstanceReadFlags, out var iface))
                 return DotNetToLisp(iface);
-            // Last resort: an extension method (e.g. LINQ's Enumerable.Where) —
+            // Last resort: an extension method (e.g. LINQ's Enumerable.Where);
             // a static method elsewhere whose first parameter accepts the receiver.
             try
             {
@@ -2389,7 +2417,7 @@ public static partial class Runtime
             {
                 Type[] types;
                 try { types = asm.GetTypes(); }
-                catch { continue; } // ReflectionTypeLoadException etc. — skip assembly
+                catch { continue; } // ReflectionTypeLoadException etc.; skip assembly
                 foreach (var t in types)
                 {
                     // Extension methods live in static classes (sealed + abstract).
@@ -2427,13 +2455,13 @@ public static partial class Runtime
     /// (the TSource of <c>IEnumerable&lt;TSource&gt;</c>, or T itself for <c>this T x</c>) is
     /// inferred from the receiver; every other type parameter defaults to System.Object.
     /// A Lisp closure carries no return type, so TResult of Select&lt;TSource,TResult&gt; is not
-    /// inferable — object keeps such methods callable, and values come back to Lisp
+    /// inferable: object keeps such methods callable, and values come back to Lisp
     /// unwrapped anyway. Callers who need a specific instantiation use
     /// dotnet:static-generic.</summary>
     /// <summary>True for a type parameter declared by a METHOD (the T of
     /// <c>Select&lt;T,R&gt;</c>), as opposed to one declared by a type. Spelled out rather
-    /// than using Type.IsGenericMethodParameter, which netstandard2.0 — the target the
-    /// emit-free runtime builds against — does not have.</summary>
+    /// than using Type.IsGenericMethodParameter, which netstandard2.0, the target the
+    /// emit-free runtime builds against, does not have.</summary>
     private static bool IsMethodTypeParameter(Type t)
         => t.IsGenericParameter && t.DeclaringMethod != null;
 
@@ -2464,7 +2492,7 @@ public static partial class Runtime
         // parameters are: the TResult of Select<TSource,TResult> is right there in
         // a Func<int,string>'s own signature. Without reading it the method was
         // instantiated as Select<int,object>, whose Func<int,object> parameter the
-        // supplied Func<int,string> does not fit — so passing an explicit
+        // supplied Func<int,string> does not fit: so passing an explicit
         // make-delegate resolved to nothing while the bare lambda worked.
         var ps = m.GetParameters();
         if (lispArgs != null)
@@ -2697,7 +2725,7 @@ public static partial class Runtime
             if (!ok) continue;
             for (int i = lispArgs.Length + 1; i < ps.Length; i++)
                 callArgs[i] = ps[i].HasDefaultValue ? ps[i].DefaultValue : Type.Missing;
-            result = concrete.Invoke(null, callArgs); // method's own throw → TargetInvocationException
+            result = concrete.Invoke(null, callArgs); // method's own throw -> TargetInvocationException
             return true;
         }
         return false;
@@ -2843,7 +2871,7 @@ public static partial class Runtime
             // A true parameterless ctor (value types always have one).
             if (type.IsValueType || type.GetConstructor(Type.EmptyTypes) != null)
                 return new LispDotNetObject(Construct(() => Activator.CreateInstance(type)));
-            // Otherwise fall back to an all-optional ctor, supplying its defaults —
+            // Otherwise fall back to an all-optional ctor, supplying its defaults;
             // C#'s `new T()` does the same (e.g. FluentTheme(Uri? baseUri = null)).
             var optCtor = type.GetConstructors()
                 .Where(c => c.GetParameters().Length > 0 && c.GetParameters().All(p => p.IsOptional))
@@ -2857,7 +2885,7 @@ public static partial class Runtime
                     defaults[i] = ps[i].HasDefaultValue ? ps[i].DefaultValue : Type.Missing;
                 return new LispDotNetObject(Construct(() => optCtor.Invoke(defaults)));
             }
-            // No usable ctor — let Activator throw its descriptive error.
+            // No usable ctor: let Activator throw its descriptive error.
             return new LispDotNetObject(Construct(() => Activator.CreateInstance(type)));
         }
 
@@ -2865,9 +2893,9 @@ public static partial class Runtime
         // A ctor is a candidate when the supplied arg count fits between its
         // required and total param count, with any omitted trailing params all
         // optional (filled with their defaults below). This admits e.g.
-        // SolidColorBrush(Color, double opacity = 1) for a single Color arg —
+        // SolidColorBrush(Color, double opacity = 1) for a single Color arg;
         // without it the only fixed-arity 1-param ctor is (uint), and the Color
-        // gets Convert.ChangeType'd to uint → "Object must implement IConvertible"
+        // gets Convert.ChangeType'd to uint -> "Object must implement IConvertible"
         // Mirrors TryInvokeWithOptionalDefaults for methods (#24).
         var ctors = type.GetConstructors().Where(c => {
             var ps = c.GetParameters();
@@ -2942,8 +2970,155 @@ public static partial class Runtime
         List<Emitter.DynamicClassBuilder.CtorSpec>? CtorSpecs);
 
     /// <summary>
+    /// Build one <see cref="System.Reflection.Emit.CustomAttributeBuilder"/> from a
+    /// Lisp attribute spec <c>(type-name ctor-arg... :member value...)</c>.
+    ///
+    /// Arguments before the first keyword are the attribute constructor's positional
+    /// arguments; from the first keyword on, the spec reads as keyword/value pairs
+    /// naming a settable property or a public field. Most .NET attributes are shaped
+    /// that way -- a parameterless constructor plus named properties -- so without the
+    /// keyword half, <c>[Service(Name = "x")]</c> and <c>[Activity(MainLauncher = true)]</c>
+    /// could not be expressed at all.
+    ///
+    /// A member name matches case-insensitively with dashes removed, so
+    /// <c>:main-launcher</c>, <c>:mainlauncher</c> and <c>"MainLauncher"</c> all reach
+    /// <c>MainLauncher</c>. An exact spelling wins over a loose match, which keeps two
+    /// members differing only in case unambiguous.
+    ///
+    /// WHO names the caller's spec kind for error messages ("attr spec" for a type-level
+    /// attribute, "method attr spec" for a method-level one).
+    /// </summary>
+    private static System.Reflection.Emit.CustomAttributeBuilder ParseAttributeSpec(
+        LispObject specObj, string who)
+    {
+        if (specObj is not Cons spec)
+            throw new LispErrorException(new LispTypeError(
+                $"DOTNET:%DEFINE-CLASS: each {who} must be a (type-name ctor-args... :member value...) list",
+                specObj));
+
+        string tname = NameArg(spec.Car);
+        var attrType = ResolveDotNetType(tname);
+
+        // Split the rest into positional args and keyword/value pairs. The first
+        // keyword ends the positional run: an attribute constructor argument is a
+        // literal (string/number/enum/type), never a keyword.
+        var ctorLispArgs = new List<LispObject>();
+        var named = new List<(string Name, LispObject Value)>();
+        var cur = spec.Cdr;
+        while (cur is Cons c)
+        {
+            if (IsKeywordArg(c.Car))
+            {
+                if (c.Cdr is not Cons vc)
+                    throw new LispErrorException(new LispError(
+                        $"DOTNET:%DEFINE-CLASS: {who} for {tname}: {NameArg(c.Car)} has no value"));
+                named.Add((NameArg(c.Car), vc.Car));
+                cur = vc.Cdr;
+                continue;
+            }
+            if (named.Count > 0)
+                throw new LispErrorException(new LispError(
+                    $"DOTNET:%DEFINE-CLASS: {who} for {tname}: positional argument after a named one"));
+            ctorLispArgs.Add(c.Car);
+            cur = c.Cdr;
+        }
+
+        var ctors = attrType.GetConstructors()
+            .Where(ci => ci.GetParameters().Length == ctorLispArgs.Count).ToArray();
+        if (ctors.Length == 0)
+            throw new LispErrorException(new LispError(
+                $"DOTNET:%DEFINE-CLASS: no constructor on {tname} with {ctorLispArgs.Count} arguments"));
+        var ctor = ctors[0];
+        var ctorParamTypes = ctor.GetParameters();
+        var ctorArgs = new object?[ctorLispArgs.Count];
+        for (int i = 0; i < ctorLispArgs.Count; i++)
+            ctorArgs[i] = LispToDotNet(ctorLispArgs[i], ctorParamTypes[i].ParameterType);
+
+        if (named.Count == 0)
+            return new System.Reflection.Emit.CustomAttributeBuilder(ctor, ctorArgs);
+
+        var props = new List<System.Reflection.PropertyInfo>();
+        var propValues = new List<object?>();
+        var fields = new List<System.Reflection.FieldInfo>();
+        var fieldValues = new List<object?>();
+
+        foreach (var (name, valueObj) in named)
+        {
+            var prop = FindAttributeMember(attrType.GetProperties(
+                System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance),
+                p => p.Name, name);
+            if (prop != null)
+            {
+                if (!prop.CanWrite)
+                    throw new LispErrorException(new LispError(
+                        $"DOTNET:%DEFINE-CLASS: {who} for {tname}: property {prop.Name} is read-only"));
+                props.Add(prop);
+                propValues.Add(LispToDotNet(valueObj, prop.PropertyType));
+                continue;
+            }
+
+            var field = FindAttributeMember(attrType.GetFields(
+                System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance),
+                f => f.Name, name);
+            if (field != null)
+            {
+                if (field.IsInitOnly)
+                    throw new LispErrorException(new LispError(
+                        $"DOTNET:%DEFINE-CLASS: {who} for {tname}: field {field.Name} is readonly"));
+                fields.Add(field);
+                fieldValues.Add(LispToDotNet(valueObj, field.FieldType));
+                continue;
+            }
+
+            throw new LispErrorException(new LispError(
+                $"DOTNET:%DEFINE-CLASS: {who} for {tname}: no settable property or public field named {name}"));
+        }
+
+        return new System.Reflection.Emit.CustomAttributeBuilder(
+            ctor, ctorArgs,
+            props.ToArray(), propValues.ToArray(),
+            fields.ToArray(), fieldValues.ToArray());
+    }
+
+    /// <summary>
+    /// True when ARG is a keyword symbol, i.e. the start of the named half of an
+    /// attribute spec. A string is deliberately NOT a keyword here: a string in the
+    /// positional run is an attribute constructor argument.
+    /// </summary>
+    private static bool IsKeywordArg(LispObject arg)
+        => arg is Symbol sym && sym.HomePackage == Startup.KeywordPkg;
+
+    /// <summary>
+    /// Find the member of CANDIDATES whose name matches SPELLING. An exact match wins;
+    /// otherwise the comparison ignores case and dashes, so a Lisp keyword
+    /// (<c>:main-launcher</c>, read as MAIN-LAUNCHER) reaches a PascalCase member.
+    /// Answers null when nothing matches, and signals when the loose match is
+    /// ambiguous rather than picking one of them.
+    /// </summary>
+    private static T? FindAttributeMember<T>(T[] candidates, Func<T, string> nameOf,
+        string spelling) where T : class
+    {
+        foreach (var c in candidates)
+            if (nameOf(c) == spelling) return c;
+
+        static string Fold(string s) => s.Replace("-", "").ToUpperInvariant();
+        var folded = Fold(spelling);
+        T? found = null;
+        foreach (var c in candidates)
+        {
+            if (Fold(nameOf(c)) != folded) continue;
+            if (found != null)
+                throw new LispErrorException(new LispError(
+                    $"DOTNET:%DEFINE-CLASS: {spelling} is ambiguous: " +
+                    $"matches both {nameOf(found)} and {nameOf(c)}"));
+            found = c;
+        }
+        return found;
+    }
+
+    /// <summary>
     /// Parse dotnet:%define-class positional args 0-11 (any trailing save-to-path
-    /// at index 12 is ignored here — the caller handles it) into a
+    /// at index 12 is ignored here: the caller handles it) into a
     /// <see cref="ParsedClassSpec"/>. Behavior-preserving extraction of the old
     /// inline parsing so %save-library can reuse it per class.
     /// </summary>
@@ -2986,32 +3161,7 @@ public static partial class Runtime
             var cur = a[3];
             while (cur is Cons c)
             {
-                if (c.Car is not Cons spec)
-                    throw new LispErrorException(new LispTypeError(
-                        "DOTNET:%DEFINE-CLASS: each attr spec must be a (type-name ctor-args...) list",
-                        c.Car));
-                var typeObj = spec.Car;
-                string tname = NameArg(typeObj);
-                var attrType = ResolveDotNetType(tname);
-
-                // Collect ctor args (rest of spec).
-                var ctorLispArgs = new List<LispObject>();
-                var acur = spec.Cdr;
-                while (acur is Cons ac) { ctorLispArgs.Add(ac.Car); acur = ac.Cdr; }
-
-                // Find a ctor matching argcount.
-                var ctors = attrType.GetConstructors()
-                    .Where(ci => ci.GetParameters().Length == ctorLispArgs.Count).ToArray();
-                if (ctors.Length == 0)
-                    throw new LispErrorException(new LispError(
-                        $"DOTNET:%DEFINE-CLASS: no constructor on {tname} with {ctorLispArgs.Count} arguments"));
-                var ctor = ctors[0];
-                var ctorParamTypes = ctor.GetParameters();
-                var ctorArgs = new object?[ctorLispArgs.Count];
-                for (int i = 0; i < ctorLispArgs.Count; i++)
-                    ctorArgs[i] = LispToDotNet(ctorLispArgs[i], ctorParamTypes[i].ParameterType);
-
-                attrs.Add(new System.Reflection.Emit.CustomAttributeBuilder(ctor, ctorArgs));
+                attrs.Add(ParseAttributeSpec(c.Car, "attr spec"));
                 cur = c.Cdr;
             }
         }
@@ -3069,7 +3219,7 @@ public static partial class Runtime
                 bool isOverride = false;
                 LispObject? attrSpecsObj = null;
                 // Optional 7th element: static flag. When truthy the method is
-                // emitted as `public static` (no self) — a defun exported into a
+                // emitted as `public static` (no self): a defun exported into a
                 // library type. Mutually exclusive with override.
                 bool isStatic = false;
                 // Optional 8th element: parameter names, so the emitted signature
@@ -3113,30 +3263,7 @@ public static partial class Runtime
                     var acur = attrSpecsObj;
                     while (acur is Cons ac)
                     {
-                        if (ac.Car is not Cons aspec)
-                            throw new LispErrorException(new LispTypeError(
-                                "DOTNET:%DEFINE-CLASS: each method attr spec must be a (type-name ctor-args...) list",
-                                ac.Car));
-                        var atypeObj = aspec.Car;
-                        string atname = NameArg(atypeObj);
-                        var attrType = ResolveDotNetType(atname);
-
-                        var actorArgs = new List<LispObject>();
-                        var aacur = aspec.Cdr;
-                        while (aacur is Cons aac) { actorArgs.Add(aac.Car); aacur = aac.Cdr; }
-
-                        var actors = attrType.GetConstructors()
-                            .Where(ci => ci.GetParameters().Length == actorArgs.Count).ToArray();
-                        if (actors.Length == 0)
-                            throw new LispErrorException(new LispError(
-                                $"DOTNET:%DEFINE-CLASS: no constructor on {atname} with {actorArgs.Count} arguments"));
-                        var actor = actors[0];
-                        var actorParamTypes = actor.GetParameters();
-                        var actorArgsArr = new object?[actorArgs.Count];
-                        for (int i = 0; i < actorArgs.Count; i++)
-                            actorArgsArr[i] = LispToDotNet(actorArgs[i], actorParamTypes[i].ParameterType);
-
-                        methodAttrs.Add(new System.Reflection.Emit.CustomAttributeBuilder(actor, actorArgsArr));
+                        methodAttrs.Add(ParseAttributeSpec(ac.Car, "method attr spec"));
                         acur = ac.Cdr;
                     }
                 }
@@ -3325,7 +3452,7 @@ public static partial class Runtime
     /// matching PropertyChanged event to be declared via event-specs.
     /// Returns the full name as a LispString on success.</summary>
     /// <summary>The message of a class-spec rejection, without the C# plumbing.
-    /// ArgumentException appends "(Parameter 'fields')" — the name of a C#
+    /// ArgumentException appends "(Parameter 'fields')": the name of a C#
     /// parameter of a method the Lisp caller never wrote and cannot see. The text
     /// before it already says what is wrong with the spec.</summary>
     private static string ClassSpecMessage(ArgumentException ae)
@@ -3355,7 +3482,7 @@ public static partial class Runtime
         string fullName = s.FullName;
 
         // arg 12: save-to-path. Non-nil emits a saved, C#-referenceable facade
-        // .dll (the dotcl→C# library path) instead of an in-process Run type.
+        // .dll (the dotcl->C# library path) instead of an in-process Run type.
         string? saveToPath = null;
         if (args.Length >= 13 && args[12] != Nil.Instance)
         {
@@ -3376,7 +3503,7 @@ public static partial class Runtime
                 return new LispString(type.FullName ?? fullName);
             // Register as CLOS class so class-of/type-of/find-class work for instances.
             EnsureDotNetTypeClass(type);
-            // Register by uppercase name for resolution from Lisp symbols (e.g. Animal → ANIMAL).
+            // Register by uppercase name for resolution from Lisp symbols (e.g. Animal -> ANIMAL).
             _dotNetDynTypeByUpperName[type.Name] = type;
             if (type.FullName != null && type.FullName != type.Name)
                 _dotNetDynTypeByUpperName[type.FullName] = type;
@@ -3399,18 +3526,18 @@ public static partial class Runtime
     /// (KIND DOC . rest) where KIND is a keyword and DOC is a type-level
     /// &lt;summary&gt; string (or nil) written to a sidecar &lt;name&gt;.xml. KIND is one of:
     ///   (:class full-name base fields attrs methods ctor-body properties
-    ///           interfaces events ctor-param-types base-ctor-arg-indices ctor-specs)
-    ///     — the positional slots dotnet:%define-class takes (save-to-path omitted).
-    ///       A method-spec may carry a 7th static-flag element (defun → static).
-    ///   (:enum full-name underlying-type-name (member-name value)...) — a public
+    ///           interfaces events ctor-param-types base-ctor-arg-indices ctor-specs);
+    ///     the positional slots dotnet:%define-class takes (save-to-path omitted).
+    ///       A method-spec may carry a 7th static-flag element (defun -> static).
+    ///   (:enum full-name underlying-type-name (member-name value)...): a public
     ///       enum; underlying defaults to System.Int32 when nil.
-    ///   (:constants full-name (member-name type-name value)...) — a static holder
+    ///   (:constants full-name (member-name type-name value)...): a static holder
     ///       of public const fields.
-    ///   (:struct full-name (field-name type-name)...) — a public value type of
+    ///   (:struct full-name (field-name type-name)...): a public value type of
     ///       public fields.
-    ///   (:interface full-name (method-name return-type-name (param-type-name...))...)
-    ///       — a public interface of abstract method signatures.
-    ///   (:delegate full-name return-type-name (param-type-name...)) — a public
+    ///   (:interface full-name (method-name return-type-name (param-type-name...))...);
+    ///       a public interface of abstract method signatures.
+    ///   (:delegate full-name return-type-name (param-type-name...)): a public
     ///       delegate (callback) type of the given signature.
     /// Unlike class facades, enums / const holders / structs / interfaces /
     /// delegates are pure metadata: standalone, needing no runtime/Lisp. Returns
@@ -3644,7 +3771,7 @@ public static partial class Runtime
     }
 
 #if DOTCL_EMIT
-    // Cache: (selfType, methodName, paramTypeSig) → DynamicMethod for non-virtual base call.
+    // Cache: (selfType, methodName, paramTypeSig) -> DynamicMethod for non-virtual base call.
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<(Type, string, string), System.Reflection.Emit.DynamicMethod>
         _baseCallCache = new();
 #endif
@@ -3767,7 +3894,7 @@ public static partial class Runtime
     }
 
     /// <summary>
-    /// <lispdoc>(dotnet:make-generic-type open-type type-args-list) -- Construct a closed generic System.Type from an open generic type definition and a Lisp list of type-argument names. open-type is the open definition name, with or without the CLR backtick-arity suffix (e.g. "System.Collections.Generic.Dictionary`2" or just "System.Collections.Generic.Dictionary" — the arity is inferred from the type-args list). The result is a System.Type usable with dotnet:new, dotnet:static-generic type args, etc. Example: (dotnet:make-generic-type "System.Collections.Generic.Dictionary" '("System.String" "System.Int32")). (dotcl/dotcl#45)</lispdoc>
+    /// <lispdoc>(dotnet:make-generic-type open-type type-args-list) -- Construct a closed generic System.Type from an open generic type definition and a Lisp list of type-argument names. open-type is the open definition name, with or without the CLR backtick-arity suffix (e.g. "System.Collections.Generic.Dictionary`2" or just "System.Collections.Generic.Dictionary"; the arity is inferred from the type-args list). The result is a System.Type usable with dotnet:new, dotnet:static-generic type args, etc. Example: (dotnet:make-generic-type "System.Collections.Generic.Dictionary" '("System.String" "System.Int32")). (dotcl/dotcl#45)</lispdoc>
     /// </summary>
     [LispDoc("DOTNET:MAKE-GENERIC-TYPE")]
     public static LispObject DotNetMakeGenericType(LispObject[] args)
@@ -3777,7 +3904,7 @@ public static partial class Runtime
                 "DOTNET:MAKE-GENERIC-TYPE: requires open-type and type-args-list"));
 
         // Parse the type-args list. Each element is a type-name string/symbol OR an
-        // already-resolved System.Type — the latter is what makes nesting composable:
+        // already-resolved System.Type: the latter is what makes nesting composable:
         // (make-generic-type "System.Action" (list (make-generic-type "...Task" ...)))
         // instead of spelling the whole assembly-qualified name by hand.
         var typeArgForms = new System.Collections.Generic.List<LispObject>();
@@ -3978,7 +4105,7 @@ public static partial class Runtime
     /// <summary>
     /// <lispdoc>(dotnet:make-delegate type-name function) -- Wrap a Lisp function as a .NET delegate. type-name is e.g. "System.Func`2[System.String,System.Boolean]". The delegate can be passed to any .NET method expecting that delegate type. LispFunction arguments are auto-converted via dotnet:call when the target parameter type is a delegate.</lispdoc>
     /// Wrap a Lisp <paramref name="fn"/> as a .NET delegate of <paramref name="delegateType"/>.
-    /// Each call to the delegate marshals .NET args → LispObject, calls <paramref name="fn"/>,
+    /// Each call to the delegate marshals .NET args -> LispObject, calls <paramref name="fn"/>,
     /// then marshals the LispObject result back to the delegate's return type.
     /// </summary>
     [LispDoc("DOTNET:MAKE-DELEGATE")]
@@ -4016,7 +4143,7 @@ public static partial class Runtime
     /// Build a .NET delegate of <paramref name="delegateType"/> that, when invoked,
     /// marshals its arguments to LispObject[], calls <paramref name="fn"/>, and
     /// marshals the return value back to the delegate's return type.
-    /// Uses Expression.Lambda — no raw IL required.
+    /// Uses Expression.Lambda: no raw IL required.
     /// </summary>
     internal static Delegate CreateLispDelegate(LispFunction fn, Type delegateType)
     {
@@ -4041,7 +4168,7 @@ public static partial class Runtime
                     System.Linq.Expressions.Expression.Convert(p, typeof(object))))
             .ToArray();
 
-        // Runtime.InvokeForeignCallback(fn, new LispObject[] { ... }) — wraps
+        // Runtime.InvokeForeignCallback(fn, new LispObject[] { ... }): wraps
         // fn.Invoke so a Lisp error inside the callback is handled at the boundary
         // (dotcl:*foreign-callback-handler*) instead of crashing the .NET caller.
         var argsArray = System.Linq.Expressions.Expression.NewArrayInit(
@@ -4055,14 +4182,14 @@ public static partial class Runtime
         System.Linq.Expressions.Expression body;
         if (returnType == typeof(void))
         {
-            // Action<…>: discard return value
+            // Action<...>: discard return value
             body = System.Linq.Expressions.Expression.Block(
                 callFn,
                 System.Linq.Expressions.Expression.Empty());
         }
         else
         {
-            // Func<…,TResult>: marshal LispObject result → TResult
+            // Func<...,TResult>: marshal LispObject result -> TResult
             var lispToDotNet = typeof(Runtime)
                 .GetMethod(nameof(LispToDotNet), new[] { typeof(LispObject), typeof(Type) })!;
             var converted = System.Linq.Expressions.Expression.Call(
@@ -4090,14 +4217,14 @@ public static partial class Runtime
         => IsTruthy(DynamicBindings.Get(ForeignCbPropagateSym));
 
     /// <summary>
-    /// Invoke a Lisp function at a C#→Lisp callback boundary (a delegate built by
+    /// Invoke a Lisp function at a C#->Lisp callback boundary (a delegate built by
     /// CreateLispDelegate, an event handler, or a dotnet:%define-class method
     /// override), keeping a Lisp error from tearing through the host. Such errors
-    /// otherwise escape as LispErrorException → TargetInvocationException and crash
+    /// otherwise escape as LispErrorException -> TargetInvocationException and crash
     /// the .NET caller (e.g. a MonoGame Game.Run loop calling an overridden Draw).
     ///
     /// On a LispErrorException the condition is handed to dotcl:*foreign-callback-
-    /// handler* — a function of one argument (the condition) whose return value
+    /// handler*: a function of one argument (the condition) whose return value
     /// becomes the callback's result. When that variable is NIL (the default) the
     /// condition is reported to *error-output* and NIL is returned, so the marshal
     /// layer yields the return type's default and the host keeps running. Non-Lisp
@@ -4106,7 +4233,7 @@ public static partial class Runtime
     public static LispObject InvokeForeignCallback(LispObject fn, LispObject[] args)
     {
         // Establish a handler-bind for ERROR around the callback (like handler-case)
-        // so the condition is intercepted at the SIGNAL point — before the error
+        // so the condition is intercepted at the SIGNAL point: before the error
         // function would invoke the debugger. That matters because the host caller
         // is typically a non-interactive loop (a 60fps Game.Run, an event handler);
         // entering the debugger there would hang. The handler unwinds to the catch
@@ -4119,8 +4246,8 @@ public static partial class Runtime
         HandlerClusterStack.PushCluster(new[] { new HandlerBinding(Startup.Sym("ERROR"), handler) });
         // Set when dotcl:*foreign-callback-propagate* asks for the caller to see the
         // error. It is re-signalled AFTER the try, because signalling inside the catch
-        // would hit this boundary's own ERROR handler — still on the cluster stack until
-        // the finally runs — and bounce straight back here.
+        // would hit this boundary's own ERROR handler, still on the cluster stack until
+        // the finally runs, and bounce straight back here.
         LispCondition? propagate = null;
         try
         {
@@ -4225,7 +4352,7 @@ public static partial class Runtime
             // Only a true `out` param is caller-invisible. A plain `ref` param is
             // in-out: the caller must supply its initial value (Socket.ReceiveFrom's
             // ref EndPoint). Treating ref as out shifted the remaining in-args into
-            // the wrong parameter slots → "Object must implement IConvertible".
+            // the wrong parameter slots -> "Object must implement IConvertible".
             if (p.IsOut)
             {
                 callArgs[i] = null; // placeholder; filled by .NET on return
@@ -4717,7 +4844,7 @@ public static partial class Runtime
     private static readonly object _typeNameIndexLock = new();
 
     /// <summary>Public type names across loaded assemblies, sorted for prefix search.
-    /// Generic arity suffixes are dropped: (dotnet:make-generic-type "…List" …) is
+    /// Generic arity suffixes are dropped: (dotnet:make-generic-type "...List" ...) is
     /// how a generic is named here, so List`1 would be a name nobody types.</summary>
     private static string[] TypeNameIndex()
     {

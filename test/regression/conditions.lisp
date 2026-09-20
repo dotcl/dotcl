@@ -26,7 +26,7 @@
     (error () :caught))
   :caught)
 
-;;; nested handler-case — innermost matching handler wins
+;;; nested handler-case: innermost matching handler wins
 (deftest handler-case-nested
   (handler-case
       (handler-case (error "inner")
@@ -116,8 +116,8 @@
                 (continue () :report "Continue" nil)))))
   success)
 
-;;; handler-case / handler-bind clauses with COMPOUND type specifiers — (or ...),
-;;; (and ...) — used to be stringified into one bogus symbol and never matched
+;;; handler-case / handler-bind clauses with COMPOUND type specifiers, (or ...),
+;;; (and ...), used to be stringified into one bogus symbol and never matched
 ;;; (only bare class names worked). Now loaded as a literal for Runtime.Typep.
 (deftest handler-case-or-compound-type
   (handler-case (car 3)

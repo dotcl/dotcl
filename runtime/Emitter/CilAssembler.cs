@@ -5,14 +5,14 @@ namespace DotCL.Emitter;
 /// runtime-code-generation guards. This half compiles on every target,
 /// including netstandard2.0, where it has no dependency on
 /// System.Reflection.Emit. The IL-emitting half lives in CilAssembler.Emit.cs
-/// (Compile Remove'd on netstandard2.0). A precompiled .fasl image — already
-/// IL — reaches GetFunction*/RegisterFunction*/GetConstant here at load/run
+/// (Compile Remove'd on netstandard2.0). A precompiled .fasl image, already
+/// IL, reaches GetFunction*/RegisterFunction*/GetConstant here at load/run
 /// time without ever touching the emitter.
 /// </summary>
 public partial class CilAssembler
 {
     // Function registry is per-symbol (sym.Function / sym.SetfFunction).
-    // The former flat `_functions` ConcurrentDictionary was removed —
+    // The former flat `_functions` ConcurrentDictionary was removed;
     // Startup.Sym(name).Function is now the sole source of truth.
 
     // Constant pool for non-inline literals. Stored as a raw object[] so
@@ -27,7 +27,7 @@ public partial class CilAssembler
     //
     // Closure inner-lambda DynamicMethods used to go into the global _constants
     // pool (via AddConstant) and were rooted forever, so the unmanaged JIT code
-    // behind each one never freed — the dominant RSS driver on large loads
+    // behind each one never freed: the dominant RSS driver on large loads
     // (Coalton / SBCL XC). The fix routes those DMs through a store keyed by the
     // compilation unit (one AssembleAndRunSingle = one unit) so a later phase can
     // make whole units collectible once the enclosing compiled function is
@@ -35,20 +35,20 @@ public partial class CilAssembler
     //
     // S3 is the scaffolding only: the unit store is a permanent global root
     // (entries are never removed), so this is behavior-equivalent to the old
-    // global pool — a pure refactor whose acceptance test is zero regression and
+    // global pool: a pure refactor whose acceptance test is zero regression and
     // an unchanged dynamic-method count from dotcl:emit-pool-stats. S4 makes the
     // store collectible.
     //
     // The map holds each unit's closure-DM list only *weakly* : the
     // strong owners are the LispFunctions that can call MakeClosure into that
-    // unit (the enclosing defun/lambda and the closures it builds — they pin the
+    // unit (the enclosing defun/lambda and the closures it builds: they pin the
     // holder via LispFunction.RetainUnit), plus AssembleAndRunSingle's own local
     // for the duration of the unit's first run. Once all of those die, the holder
     // (a List<object>) is collected, its DynamicMethods become unreferenced, and
-    // the unmanaged JIT code behind them frees — the RSS leak.
+    // the unmanaged JIT code behind them frees: the RSS leak.
     //
     // Concurrency: a unit's list is appended only during that unit's assembly
-    // walk (single-threaded — Assemble emits IL, it does not run Lisp), and the
+    // walk (single-threaded: Assemble emits IL, it does not run Lisp), and the
     // unit's MakeClosure calls cannot execute until after that IL is created, so
     // the list is frozen by the time any reader touches it. The map is a
     // ConcurrentDictionary so a runtime thread building a closure can read while
@@ -61,7 +61,7 @@ public partial class CilAssembler
     // the unit's closure body DMs; both are set only during the IL walk (which
     // never runs Lisp) and restored after, so a re-entrant assembly triggered by
     // the toplevel form's execution gets its own unit. Declared here (emit-free
-    // half) so AddConstant — which roots parent functions — can pin the holder
+    // half) so AddConstant, which roots parent functions, can pin the holder
     // onto them; the field is plain data and is harmless on netstandard2.0 where
     // the emit half is compiled out.
     [ThreadStatic] internal static int _currentUnitId;
@@ -108,7 +108,7 @@ public partial class CilAssembler
         _unitStore.TryGetValue(unitId, out var wr) && wr.TryGetTarget(out var holder) ? holder : null;
 
     /// <summary>Load a unit-scoped constant (e.g. a MAKE-FUNCTION lambda object)
-    /// from emitted IL — the per-unit, collectible counterpart of GetConstant.
+    /// from emitted IL: the per-unit, collectible counterpart of GetConstant.
     /// The holder is live whenever this runs: the loading code either runs once
     /// under AssembleAndRunSingle's GC.KeepAlive, or is a rooted function that
     /// pins the holder via RetainUnit.</summary>
@@ -121,7 +121,7 @@ public partial class CilAssembler
     /// <summary>Precompiled-only mode: when true, any attempt to generate code at
     /// runtime (eval/compile of compound forms, dotnet:define-class, native FFI
     /// thunks) throws instead of emitting. Lets a host run a precompiled-only
-    /// image and fail loudly if something tries to JIT — the same constraint an
+    /// image and fail loudly if something tries to JIT: the same constraint an
     /// AOT/IL2CPP target imposes. Running already-compiled code is unaffected.</summary>
     public static bool PrecompiledOnly;
 
@@ -153,7 +153,7 @@ public partial class CilAssembler
     public static LispObject AssembleAndRun(LispObject instrList)
     {
 #if DOTCL_EMIT
-        // Check for :toplevel-boundary markers — split and run each segment
+        // Check for :toplevel-boundary markers: split and run each segment
         // individually so that defvar values are available for subsequent
         // macro expansion within the same eval-when block.
         var segments = SplitAtBoundaries(instrList);
@@ -168,7 +168,7 @@ public partial class CilAssembler
 #else
         throw new LispErrorException(new LispProgramError(
             "this runtime was built without System.Reflection.Emit; eval/compile of new " +
-            "code is unavailable — only precompiled .fasl code can run here"));
+            "code is unavailable; only precompiled .fasl code can run here"));
 #endif
     }
 
@@ -200,8 +200,8 @@ public partial class CilAssembler
     }
 
     /// <summary>
-    /// True when a mangled function-name string denotes a compound name —
-    /// "(SETF X)", "(CAS X)", etc. — which registers on a target symbol's slot
+    /// True when a mangled function-name string denotes a compound name;
+    /// "(SETF X)", "(CAS X)", etc.: which registers on a target symbol's slot
     /// rather than as an ordinary symbol-function. Such names both start with
     /// '(' and end with ')'. A plain symbol whose print-name merely starts with
     /// '(' (e.g. SB-FORMAT::|(-COMPILER|, the ~( format directive handler) is NOT
@@ -217,8 +217,8 @@ public partial class CilAssembler
 
     /// <summary>
     /// Cross-package bridge for plain function lookup: search dotcl's own packages
-    /// (Package.IsBridgeSource) for a same-named symbol whose Function slot is set
-    /// — replaces the old _functions flat table. A library's package is never
+    /// (Package.IsBridgeSource) for a same-named symbol whose Function slot is set;
+    /// replaces the old _functions flat table. A library's package is never
     /// asked, so an undefined function stays undefined instead of silently
     /// resolving to an unrelated same-named one. The symbol's home package is
     /// skipped (its own Function slot was already checked by the caller). The hit
@@ -246,8 +246,8 @@ public partial class CilAssembler
     /// <summary>
     /// The symbol NAME names in the package the current form is being defined in.
     /// The :defmethod path registers a function on NAME interned in *PACKAGE*
-    /// (see HandleDefmethod), which for a mangled uninterned name — the
-    /// "(SETF G123)" that DEFUN of (setf #:g) produces — is neither CL nor
+    /// (see HandleDefmethod), which for a mangled uninterned name, the
+    /// "(SETF G123)" that DEFUN of (setf #:g) produces, is neither CL nor
     /// DOTCL-INTERNAL, the only packages Startup.Sym consults. The string-based
     /// lookups below have to mirror the registration or the uninterned-fixup
     /// round trip cannot find what it just registered. Returns null if *PACKAGE*
@@ -311,12 +311,12 @@ public partial class CilAssembler
     }
 
     /// <summary>
-    /// Symbol-based function lookup — authoritative for package-qualified
+    /// Symbol-based function lookup: authoritative for package-qualified
     /// compiled calls. Returns sym.Function or signals UNDEFINED-FUNCTION.
     /// Unqualified compiled calls resolve via Startup.Sym's bare-name bridge
     /// at symbol-resolution time (emit :load-sym), so sym.Function is already
     /// the registered function when reached here. The cross-package bridge
-    /// (FindFunctionAcrossPackages) is NOT applied here — a package-qualified
+    /// (FindFunctionAcrossPackages) is NOT applied here: a package-qualified
     /// call to an unbound symbol is undefined (matches SBCL semantics).
     /// </summary>
     public static LispFunction GetFunctionBySymbol(Symbol sym)
@@ -325,7 +325,7 @@ public partial class CilAssembler
         throw new LispErrorException(new LispUndefinedFunction(sym));
     }
 
-    /// <summary>Symbol-based setf function lookup — sym.SetfFunction is authoritative.</summary>
+    /// <summary>Symbol-based setf function lookup: sym.SetfFunction is authoritative.</summary>
     public static LispFunction GetSetfFunctionBySymbol(Symbol sym)
     {
         if (sym.SetfFunction is LispFunction setfFn) return setfFn;
@@ -352,7 +352,7 @@ public partial class CilAssembler
             if (Startup.Sym(targetName).SetfFunction is LispFunction fn) return fn;
             return FindSetfFunctionAcrossPackages(targetName);
         }
-        // Plain names deliberately check only sym.Function — no cross-package
+        // Plain names deliberately check only sym.Function: no cross-package
         // search (historical asymmetry with GetFunction, preserved as-is).
         return Startup.Sym(name).Function as LispFunction;
     }
@@ -450,7 +450,7 @@ public partial class CilAssembler
     {
         // A function rooted in the global pool (defun re-registration, anonymous
         // lambda) whose body built closures must keep that unit's closure DMs
-        // alive as long as it can call MakeClosure into the unit — otherwise the
+        // alive as long as it can call MakeClosure into the unit: otherwise the
         // weak unit map would let the holder collect and a later call would fault.
         // This is the single chokepoint every rooted parent function passes
         // through, so retention is set here rather than at each emit site. The
@@ -493,9 +493,9 @@ public partial class CilAssembler
         System.Threading.Volatile.Read(ref _constants)[index];
 
     /// <summary>Diagnostic snapshot of the global constant pool. Returns
-    /// the live entry count, how many are retained DynamicMethods — each roots a
+    /// the live entry count, how many are retained DynamicMethods: each roots a
     /// JIT-compiled body whose unmanaged code never frees because the static pool
-    /// is never reset — and the remaining data literals. The DynamicMethod count
+    /// is never reset: and the remaining data literals. The DynamicMethod count
     /// is the proxy for the off-GC-heap JIT memory that drives RSS growth on large
     /// loads (SBCL XC / Coalton). Used to size the per-compilation-unit pool work.</summary>
     public static (int total, int dynamicMethods, int data) ConstantsPoolStats()
@@ -509,7 +509,7 @@ public partial class CilAssembler
             if (arr[i] is System.Reflection.Emit.DynamicMethod) dm++;
         // Closure body DMs live in the per-unit store, not the global
         // pool. Count the live ones (a weak holder may already be collected) so
-        // the dynamic-method total reflects what is still rooted — the figure
+        // the dynamic-method total reflects what is still rooted: the figure
         // that should now *fall* when closure-producing functions are dropped.
         foreach (var wr in _unitStore.Values)
         {

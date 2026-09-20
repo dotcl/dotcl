@@ -1,12 +1,12 @@
 ;;; The tree-walk evaluator must not spend a .NET frame per tail-recursive
-;;; iteration. Without this, a tail-recursive loop — the ordinary CL idiom — could
+;;; iteration. Without this, a tail-recursive loop, the ordinary CL idiom, could
 ;;; not be written at all on a build with no compiler (netstandard2.0 / WASM /
 ;;; AOT), where every call is interpreted: 100000 iterations exhausted the stack.
 ;;;
 ;;; A call in tail position is returned to the trampoline the evaluator wraps
 ;;; around each function body rather than made, and the body is re-entered in that
 ;;; same frame. Only a call back into the SAME function is treated this way, which
-;;; is exactly what the compiler optimizes — so the two evaluators still agree,
+;;; is exactly what the compiler optimizes: so the two evaluators still agree,
 ;;; including on what BACKTRACE shows.
 ;;;
 ;;; Each test runs under :INTERPRET through EVAL so it exercises the evaluator on
@@ -53,7 +53,7 @@
 
 ;;; A closure that escapes its BLOCK by RETURN-FROM must still find the block
 ;;; alive. Handing a call to a DIFFERENT function to the trampoline would unwind
-;;; the block first and the throw would land on a dead tag — which is why only
+;;; the block first and the throw would land on a dead tag: which is why only
 ;;; self calls are handed over.
 
 (deftest interp-tail-calls.return-from-through-an-escaping-closure
@@ -64,7 +64,7 @@
                 (%itc-esc 3)))
   (3 2 1 :own 0))
 
-;;; Non-tail recursion is unaffected — it still builds its frames and returns the
+;;; Non-tail recursion is unaffected: it still builds its frames and returns the
 ;;; accumulated result.
 
 (deftest interp-tail-calls.non-tail-recursion-still-accumulates

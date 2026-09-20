@@ -1,7 +1,7 @@
 ;;; ADJOIN moved from a &key Lisp defun to C# with 2/4/6-arg direct entries
 ;;; (PUSHNEW expands into the keyworded shapes). The entries decode their own
 ;;; keyword pairs, so :test / :test-not / :key must agree with the args-array
-;;; path — and the key must be applied to the ITEM for the comparison while the
+;;; path: and the key must be applied to the ITEM for the comparison while the
 ;;; element consed on stays the original item.
 
 (deftest adjoin-direct.absent-eql
@@ -71,7 +71,7 @@
     l)
   ((2 . new) (1 . old)))
 
-;;; APPLY takes the args-array path — same answer.
+;;; APPLY takes the args-array path: same answer.
 (deftest adjoin-direct.apply-matches-direct
   (equal (adjoin "c" (list "a") :test #'equal)
          (apply #'adjoin "c" (list (list "a") :test #'equal)))

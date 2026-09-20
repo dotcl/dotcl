@@ -1,6 +1,6 @@
 ;;; compile-file's post-compile strip (ANSI 3.2.3.1: compile-time defuns of
 ;;; the file must not stay fbound) must NOT wipe definitions that a nested
-;;; LOAD brought in during the compile — those are real global side effects
+;;; LOAD brought in during the compile: those are real global side effects
 ;;; of loading OTHER files. Restoring *modules* alone did not help the
 ;;; (require ...) case: ASDF tracks completed systems independently, so the
 ;;; later fasl-load's require was a no-op and e.g. micros' backend was left

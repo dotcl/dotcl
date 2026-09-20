@@ -1,7 +1,7 @@
 ;;; Regression tests for (DECLAIM (INLINE f)) actually substituting the
 ;;; definition at call sites.
 ;;;
-;;; The proclamation used to be recorded and then ignored — every call still
+;;; The proclamation used to be recorded and then ignored: every call still
 ;;; went through the full call sequence. A DEFUN compiled while its name is
 ;;; proclaimed inline now has its (lambda-list . body) kept, and a later call
 ;;; site with a matching argument count is rewritten to
@@ -9,7 +9,7 @@
 ;;; which the existing machinery already compiles correctly.
 ;;;
 ;;; INLINE is a request, not an order (CLHS 3.2.2.1.3), so every refusal below
-;;; is allowed to be conservative — it costs speed, never correctness. What is
+;;; is allowed to be conservative: it costs speed, never correctness. What is
 ;;; NOT allowed is a substitution that changes the answer, which is what most of
 ;;; these tests are about.
 
@@ -34,7 +34,7 @@
   (%inl-use-add2 5)
   15)
 
-;; No proclamation → ordinary call.
+;; No proclamation -> ordinary call.
 (defun %inl-plain2 (a b) (+ a b))
 (defun %inl-use-plain2 (x) (%inl-plain2 x 10))
 
@@ -43,9 +43,9 @@
 ;;; compiler nothing is ever substituted, so every one of them would report
 ;;; "not substituted" and pass or fail for a reason unrelated to what it tests.
 ;;;
-;;; The capture tests are NOT compiled-only. They assert ordinary CL scoping —
+;;; The capture tests are NOT compiled-only. They assert ordinary CL scoping;
 ;;; that a local FLET / LABELS / MACROLET does not reach into a separately
-;;; defined function — which must hold under either evaluator.
+;;; defined function: which must hold under either evaluator.
 
 (deftest-compiled-only inl-no-proclamation-not-substituted
   (%inl-calls-p #'%inl-use-plain2 "%INL-PLAIN2")
@@ -82,7 +82,7 @@
   (%inl-dynbind 42)
   42)
 
-;; Arguments are evaluated exactly once, left to right — the substitution is an
+;; Arguments are evaluated exactly once, left to right: the substitution is an
 ;; application, not a textual splice of each argument into every use.
 (defvar *inl-log* nil)
 (defun %inl-note (x) (push x *inl-log*) x)
@@ -110,7 +110,7 @@
 
 ;; The classic inline bug. %INL-CALLS-HELPER was written at top level, so its
 ;; HELPER is the global one. Dropped inside a caller's FLET of the same name it
-;; would silently become the caller's — a wrong answer. The substitution is
+;; would silently become the caller's: a wrong answer. The substitution is
 ;; refused instead.
 (defun %inl-helper () :global)
 (declaim (inline %inl-calls-helper))
@@ -144,7 +144,7 @@
   (:macro :global))
 
 ;; An FLET that shadows a name the body does NOT use must not block the
-;; substitution — the guard is per-name, not "any flet in scope".
+;; substitution: the guard is per-name, not "any flet in scope".
 (defun %inl-unrelated-flet (x)
   (flet ((%inl-unrelated () :unused))
     (declare (ignorable #'%inl-unrelated))

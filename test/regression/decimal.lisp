@@ -1,4 +1,4 @@
-;;; Item A: first-class CLR decimal (LispDecimal) — reader/printer, predicates,
+;;; Item A: first-class CLR decimal (LispDecimal): reader/printer, predicates,
 ;;; exact rational round-trip, tower participation by value, and .NET marshalling.
 
 ;; --- reader / printer (#m, scale preserved) ---
@@ -124,12 +124,12 @@
 
 ;; (the dotcl:decimal E) is a "strong" trigger: native decimal arithmetic even without a
 ;; declared local. Bare-literal arithmetic (dec-arith-degrades-to-rational) stays on
-;; the standard tower — only a declared decimal / (the decimal) opts into native ops.
+;; the standard tower: only a declared decimal / (the decimal) opts into native ops.
 (deftest-compiled-only dec-the-triggers-native
   (princ-to-string (+ (the dotcl:decimal #m1.50) (the dotcl:decimal #m2.25)))
   "#m3.75")
 
-(deftest dec-bare-literal-degrades      ; no declaration → standard tower (invariant #1)
+(deftest dec-bare-literal-degrades      ; no declaration -> standard tower (invariant #1)
   (list (dotcl:decimalp (+ #m1.50 #m2.25)) (- #m1.5))
   (nil -3/2))
 
@@ -197,7 +197,7 @@
   (typep (coerce 7 'decimal) 'dotcl:decimal)
   t)
 
-;;; --- native decimal slots (scope ④) ---
+;;; --- native decimal slots (scope 4) ---
 ;;; A declared-decimal, non-captured lexical with a decimal-typed init gets a slot
 ;;; holding a raw System.Decimal. Arithmetic then runs without the get_Value/newobj
 ;;; pair per operation, and the box only reappears when the value crosses back into
@@ -228,16 +228,22 @@
     (princ-to-string (+ a b)))
   "#m1.75")
 
-;; Known gap, fixed here so it cannot change silently: a LET* sibling init does
-;; not see this form's declarations, so (+ a #m0.25) is undeclared arithmetic and
-;; degrades to a rational on the standard tower. The slot therefore must NOT be
-;; declared native — a Decimal slot holding a rational would be a hard cast error.
-(deftest dec-native-slot-let*-sibling-init-degrades
+;; This was the known gap, pinned here so it could not change silently: a LET*
+;; sibling init did not see this form's declarations, so (+ a #m0.25) was
+;; undeclared arithmetic and degraded to a rational on the standard tower.
+;;
+;; The gap is closed. A binding type declaration in a LET* body applies from the
+;; binding it names onwards, so B's init sees A declared DECIMAL and the addition
+;; stays on the decimal tower. The assertion is kept -- pointing the other way --
+;; because the degraded answer would be just as silent coming back. It is
+;; emitting-only: the interpreter does not have a native decimal slot, so the
+;; representation this test pins does not exist there.
+(deftest-emitting-only dec-native-slot-let*-sibling-init-stays-decimal
   (let* ((a #m1.50)
          (b (+ a #m0.25)))
     (declare (type dotcl:decimal a b))
-    b)
-  7/4)
+    (list (dotcl:decimalp b) (princ-to-string b)))
+  (t "#m1.75"))
 
 ;; A captured variable keeps the boxed slot (env capture stores an object), so the
 ;; closure and the body still agree on the value.
@@ -248,7 +254,7 @@
       (list (princ-to-string x) (princ-to-string (funcall peek)))))
   ("#m2.50" "#m2.50"))
 
-;; Mixing with a float in a declared scope is still a compile-time error — the
+;; Mixing with a float in a declared scope is still a compile-time error; the
 ;; native slot does not open a back door around the guard. Compiled-only: the
 ;; guard lives in the compiler, so the interpreter reaches the generic + instead.
 (deftest-compiled-only dec-native-slot-mix-still-errors

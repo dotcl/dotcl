@@ -1,0 +1,4 @@
+# C# method            Lisp function
+Ring.Enqueue           ILP-RING-ENQUEUE
+Ring.Dequeue           ILP-RING-DEQUEUE
+Ring.Peek              ILP-RING-PEEK

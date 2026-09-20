@@ -1,19 +1,19 @@
 ;;; ~E must round the VALUE, not a rounded decimal of it.
 ;;;
-;;; The digits used to come from ToString("G17") — enough to round-trip a double,
+;;; The digits used to come from ToString("G17"): enough to round-trip a double,
 ;;; not enough to round one. Rounding those 17 digits again at 15 is a double
 ;;; rounding, and the two disagree when the discarded part sits at the tie:
 ;;; G17 shows a trailing 5 with nothing after it, so a value just above the tie
 ;;; looks exactly on it. The values below are two such doubles, found by the same
-;;; comparison the (randomised) ANSI test FORMAT.E.26 makes — which is why that
+;;; comparison the (randomised) ANSI test FORMAT.E.26 makes: which is why that
 ;;; test failed only on some runs.
 
-;;; exact value 1051215004350025020997632 → 15 digits round UP
+;;; exact value 1051215004350025020997632 -> 15 digits round UP
 (deftest format-e-rounding.above-tie
   (format nil "~,15,,0e" 1.051215004350025d24)
   "0.105121500435003d+25")
 
-;;; exact value 9.480733862209814993681932...e-226 → 15 digits round DOWN
+;;; exact value 9.480733862209814993681932...e-226 -> 15 digits round DOWN
 (deftest format-e-rounding.below-tie
   (format nil "~,15,,0e" 9.480733862209815d-226)
   "0.948073386220981d-225")
@@ -52,7 +52,7 @@
          (scaled (* r (expt 10 scale)))
          (down (floor scaled))
          (up (ceiling scaled)))
-    ;; ceiling can carry to D+1 digits (999... → 1000...); the printer would then
+    ;; ceiling can carry to D+1 digits (999... -> 1000...); the printer would then
     ;; re-normalise, so compare only when it does not.
     (cons (princ-to-string down)
           (princ-to-string (if (> up down) up down)))))

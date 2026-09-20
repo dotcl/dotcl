@@ -1,7 +1,7 @@
 ;;; Regression tests for string literals in compiled code.
 ;;;
 ;;; A .sil file is text, so a string literal reaches the assembler as
-;;; (:ldstr s) (:newobj "LispString") — taken literally that builds a fresh
+;;; (:ldstr s) (:newobj "LispString"): taken literally that builds a fresh
 ;;; LispString every time the expression is EVALUATED, not once per site. The
 ;;; literal is a constant (CLHS 3.7.1), so it is now built once: from the
 ;;; constant pool in the JIT path, and from a static field filled by the type

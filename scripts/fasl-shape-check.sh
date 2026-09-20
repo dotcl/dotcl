@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# fasl-shape-check.sh — assert dotcl's emitted fasls keep a loadable SHAPE.
+# fasl-shape-check.sh: assert dotcl's emitted fasls keep a loadable SHAPE.
 #
 # A fasl is a .NET assembly, and what decides whether loading it is cheap or
 # fatal is not its size but its shape: how many IL bytes sit in ONE method, how
 # many fields sit on ONE type, how much string data sits in the module-wide #US
 # heap. Those bounds have been crossed four times in this repo. Each time the
-# compile side looked perfectly healthy — total IL, fasl bytes and compile time
-# barely moved — and the failure landed at LOAD, as one of:
+# compile side looked perfectly healthy, total IL, fasl bytes and compile time
+# barely moved, and the failure landed at LOAD, as one of:
 #
 #   "Internal limitation: too many fields."   (one type past 65,535 fields)
 #   InvalidProgramException                   (one method too large to JIT)
@@ -23,7 +23,7 @@
 #           (test/fasl-shape/shape.lisp). It carries 400 definitions inside each
 #           of PROGN / EVAL-WHEN / LOCALLY / MACROLET / SYMBOL-MACROLET, so if
 #           the flattener stops descending any one of them, that body collapses
-#           into a single method of roughly 46 KB — well past this target's
+#           into a single method of roughly 46 KB: well past this target's
 #           tight threshold, while everything else about the fasl stays put.
 #   core    the compiler and standard library compiled by themselves: the
 #           largest thing dotcl emits from its own sources.
@@ -69,12 +69,12 @@ $TOOL "$OUT/core.dll" limits || rc=1
 
 ASDF_FASL="$ROOT/contrib/asdf/asdf.fasl"
 if [ ! -f "$ASDF_FASL" ]; then
-  echo "note: contrib/asdf/asdf.fasl absent — skipping the real-library check"
+  echo "note: contrib/asdf/asdf.fasl absent; skipping the real-library check"
   echo "      (make setup-asdf && make compile-asdf-fasl)"
 elif [ "$ASDF_FASL" -ot "$ROOT/compiler/cil-out.sil" ]; then
   # A fasl carries the code generation of the compiler that built it, so an old
   # one reports on old codegen. Skip rather than judge. (CI builds it fresh.)
-  echo "note: contrib/asdf/asdf.fasl is older than compiler/cil-out.sil —"
+  echo "note: contrib/asdf/asdf.fasl is older than compiler/cil-out.sil; "
   echo "      skipping the real-library check (it would measure stale codegen)."
   echo "      Refresh it with: rm contrib/asdf/asdf.fasl && make compile-asdf-fasl"
 else
@@ -83,7 +83,7 @@ else
 fi
 
 if [ "$rc" -ne 0 ]; then
-  echo "FASL SHAPE CHECK FAILED — the offending method or type is named above." >&2
+  echo "FASL SHAPE CHECK FAILED; the offending method or type is named above." >&2
   echo "Do not raise the threshold to make this pass: the bound stands for a" >&2
   echo "load-time failure that no compile-side measurement can see." >&2
 fi

@@ -75,8 +75,8 @@
   `(a ,@*bqe-l* . ,*bqe-tl*)
   (a x y . z))
 
-;;; A splice that is not last is copied — APPEND copies all but its final
-;;; argument — so mutating the source afterwards must not reach the result.
+;;; A splice that is not last is copied, APPEND copies all but its final
+;;; argument, so mutating the source afterwards must not reach the result.
 ;;; (A trailing ,@ is the final argument and does share, which is APPEND's
 ;;; contract, so it is not asserted here.)
 (deftest backquote-expansion.splice-copies

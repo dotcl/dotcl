@@ -101,8 +101,8 @@ public class Reader
     private Dictionary<int, SharePlaceholder> SharePlaceholders => _sharePlaceholders ??= new();
     // Nesting depth of the public top-level Read/TryRead. #n=/#n# label scope is one
     // outermost read (CLHS 2.4.8.15/2.4.8.16), but a stream's Reader is cached and
-    // reused across reads — so the label tables must be cleared when a new top-level
-    // read begins (depth 0→1), not when a reader macro re-enters Read mid-form. Without
+    // reused across reads: so the label tables must be cleared when a new top-level
+    // read begins (depth 0->1), not when a reader macro re-enters Read mid-form. Without
     // this, a #1= in one form leaks into the next form's #1#.
     private int _topLevelReadDepth;
     /// <summary>Thread-static backquote nesting level shared across all Readers.
@@ -118,7 +118,7 @@ public class Reader
     public int Position { get; private set; }
 
     /// <summary>Chars pulled from the underlying input but currently held in lookahead
-    /// (pushback / prepend buffer) — i.e. read physically but not logically consumed.
+    /// (pushback / prepend buffer): i.e. read physically but not logically consumed.
     /// Used by READ-FROM-STRING to derive position from the underlying reader's char
     /// count even when reader-macros consume via the stream API (read-char/read over a
     /// concatenated wrap), which bypasses this Reader's own Position counter.</summary>
@@ -357,7 +357,7 @@ public class Reader
     private int PeekSkipNothing()
     {
         // Skip whitespace to check for true EOF.
-        // We must NOT skip macro characters here — after set-syntax-from-char,
+        // We must NOT skip macro characters here: after set-syntax-from-char,
         // any character could have any macro function. Let ReadStep1 handle them.
         while (true)
         {
@@ -422,9 +422,9 @@ public class Reader
                     {
                         var result = fn(this, (char)ch);
                         if (result != null) return result;
-                        return null; // no value produced — return to caller
+                        return null; // no value produced; return to caller
                     }
-                    // No function registered — treat as constituent (shouldn't happen for standard chars)
+                    // No function registered: treat as constituent (shouldn't happen for standard chars)
                     var token = new Token();
                     token.Chars.Add(new TokenChar(rt.ApplyCase((char)ch), false));
                     return AccumulateAndInterpret(rt, token);
@@ -502,7 +502,7 @@ public class Reader
             }
         }
 
-        // Mixed case or no alphabetic chars → leave as-is
+        // Mixed case or no alphabetic chars -> leave as-is
         if ((hasUpper && hasLower) || (!hasUpper && !hasLower)) return;
 
         for (int i = 0; i < token.Chars.Count; i++)
@@ -526,7 +526,7 @@ public class Reader
         while (true)
         {
             int ch = Peek();
-            if (ch == -1) return; // EOF → step 10
+            if (ch == -1) return; // EOF -> step 10
 
             var st = rt.GetSyntaxType((char)ch);
 
@@ -559,14 +559,14 @@ public class Reader
                     continue; // back to step 8
 
                 case SyntaxType.TerminatingMacro:
-                    // Don't consume — unread
-                    return; // → step 10
+                    // Don't consume: unread
+                    return; // -> step 10
 
                 case SyntaxType.Whitespace:
                     // CLHS 2.2 step 8: whitespace terminates token, is unread
                     // read (not read-preserving-whitespace) will consume it later
                     WhitespaceTerminated = true;
-                    return; // → step 10
+                    return; // -> step 10
 
                 case SyntaxType.Invalid:
                     ReadChar();
@@ -599,7 +599,7 @@ public class Reader
             if (st == SyntaxType.MultipleEscape)
             {
                 ReadChar(); // consume closing '|'
-                return; // → back to step 8
+                return; // -> back to step 8
             }
             else if (st == SyntaxType.SingleEscape)
             {
@@ -655,14 +655,29 @@ public class Reader
         if (!token.HasEscaped && !_readSuppress && TryParseNumber(tokenStr, out var number))
             return number;
 
+        // CLHS 23.2, *READ-SUPPRESS*: the token is still parsed, but "no symbols
+        // are interned". Interning it anyway leaves a symbol behind in whatever
+        // package was current, from a form the program deliberately skipped.
+        //
+        // That is not theoretical. hu.dwim.def keeps a worked-out definition under
+        // #+nil next to the expansion it actually uses; reading the file interned
+        // HU.DWIM.DEF::CLASS* from the skipped form, and the IMPORT of
+        // HU.DWIM.DEFCLASS-STAR:CLASS* into that package later failed with a name
+        // conflict against a symbol nothing had ever defined.
+        //
+        // Returning before PARSE-SYMBOL also drops the package-marker handling for
+        // suppressed tokens, which is the same rule: a package that does not exist
+        // must not be an error inside a form that is being skipped.
+        if (_readSuppress) return Nil.Instance;
+
         // Symbol interpretation
         return ParseSymbol(token);
     }
 
-    /// <summary>Reader macro function for '(' — read a list (CLHS 2.4.1).</summary>
+    /// <summary>Reader macro function for '(': read a list (CLHS 2.4.1).</summary>
     internal LispObject ReadList(char _triggerChar)
     {
-        // Line of the opening paren — used to source-map the resulting form for
+        // Line of the opening paren: used to source-map the resulting form for
         // debug info (only when line tracking is active; see Runtime.SourceLineTable).
         int startLine = _line;
         // Column of the opening paren (already consumed, so it sits at Position-1).
@@ -682,8 +697,8 @@ public class Reader
                 break;
             }
 
-            // Check for dot — per CLHS, a token of just "." is the consing dot
-            // Under *read-suppress*, skip dot detection entirely — treat as regular token
+            // Check for dot, per CLHS, a token of just "." is the consing dot
+            // Under *read-suppress*, skip dot detection entirely, treat as regular token
             if (ch == '.' && !_readSuppress)
             {
                 ReadChar();
@@ -715,7 +730,7 @@ public class Reader
                 }
             }
 
-            // Read next element — ReadStep1 may return null for skipped forms (#+ etc.)
+            // Read next element: ReadStep1 may return null for skipped forms (#+ etc.)
             var item = ReadStep1();
             if (item != null)
                 items.Add(item);
@@ -763,7 +778,7 @@ public class Reader
 
     private LispObject ExpandBackquote(LispObject form)
     {
-        // `#(v1 v2 ...) ≡ (apply #'vector `(v1 v2 ...)) — CLHS 2.4.6. Read as a
+        // `#(v1 v2 ...) == (apply #'vector `(v1 v2 ...)): CLHS 2.4.6. Read as a
         // LispVector, so build the element list, expand it as a backquoted list,
         // then apply VECTOR to the result (freshly constructing the vector).
         if (IsBackquoteVector(form))
@@ -774,17 +789,17 @@ public class Reader
                 listTemplate = new Cons(vec.ElementAt(i), listTemplate);
             var listExpansion = listTemplate is Cons lc
                 ? ExpandBackquoteList(lc)
-                : (LispObject)Nil.Instance;  // `#() → (apply #'vector nil)
+                : (LispObject)Nil.Instance;  // `#() -> (apply #'vector nil)
             return MakeList(Startup.Sym("APPLY"),
                             MakeList(Startup.Sym("FUNCTION"), Startup.Sym("VECTOR")),
                             listExpansion);
         }
 
-        // Atom → (QUOTE atom)
+        // Atom -> (QUOTE atom)
         if (form is not Cons cons)
             return MakeList(Startup.QUOTE, form);
 
-        // (UNQUOTE x) → x
+        // (UNQUOTE x) -> x
         if (cons.Car is Symbol sym1 && ReferenceEquals(sym1, Startup.UNQUOTE))
             return ((Cons)cons.Cdr).Car;
 
@@ -803,7 +818,7 @@ public class Reader
     /// Elements that are not spliced are collected into runs and emitted as one
     /// LIST call per run; a run that reaches a dotted tail becomes LIST*. Only a
     /// ,@ forces an APPEND. Wrapping every element in its own (LIST x) and
-    /// folding the lot with binary APPEND — the obvious expansion — costs a call
+    /// folding the lot with binary APPEND, the obvious expansion, costs a call
     /// and a fresh cons per element, and APPEND is variadic, so each one also
     /// compiles to an args array. Macro bodies are mostly backquote, so this is
     /// paid by every macro in every program.
@@ -823,46 +838,46 @@ public class Reader
                 if (inner.Car is Symbol us && (ReferenceEquals(us, Startup.UNQUOTE_SPLICING)
                     || ReferenceEquals(us, Startup.UNQUOTE_NSPLICING)))
                 {
-                    // ,@x or ,.x → x (spliced)
+                    // ,@x or ,.x -> x (spliced)
                     // Treat ,. same as ,@ (use APPEND not NCONC) to avoid
                     // circular list structures from destructive splicing
                     items.Add((((Cons)inner.Cdr).Car, true));
                 }
                 else if (inner.Car is Symbol uq && ReferenceEquals(uq, Startup.UNQUOTE))
                 {
-                    // ,x → x, as one element
+                    // ,x -> x, as one element
                     items.Add((((Cons)inner.Cdr).Car, false));
                 }
                 else
                 {
-                    // Nested list → its own expansion, as one element
+                    // Nested list -> its own expansion, as one element
                     items.Add((ExpandBackquote(inner), false));
                 }
             }
             else if (element is Symbol usym && ReferenceEquals(usym, Startup.UNQUOTE))
             {
-                // Dot-position unquote: `(a . ,b) — but this shouldn't happen
+                // Dot-position unquote: `(a . ,b): but this shouldn't happen
                 // since ReadComma wraps in (UNQUOTE x)
                 items.Add((element, false));
             }
             else if (IsBackquoteVector(element))
             {
-                // A nested `#(...) element — expand it recursively (CLHS 2.4.6),
+                // A nested `#(...) element: expand it recursively (CLHS 2.4.6),
                 // e.g. `#(1 #(2 ,x) 3). Without this it fell to the atom branch and
                 // was quoted, leaving inner unquotes unprocessed.
                 items.Add((ExpandBackquote(element), false));
             }
             else
             {
-                // Atom element → (QUOTE atom)
+                // Atom element -> (QUOTE atom)
                 items.Add((MakeList(Startup.QUOTE, element), false));
             }
 
             current = c.Cdr;
 
-            // Check if CDR is (UNQUOTE x) — a dotted-pair unquote like `(a . ,b)
+            // Check if CDR is (UNQUOTE x): a dotted-pair unquote like `(a . ,b)
             // The reader produces (a . (UNQUOTE b)) which is a 3-element list,
-            // but we must NOT iterate into it — break and let the dotted-tail handler process it.
+            // but we must NOT iterate into it: break and let the dotted-tail handler process it.
             if (current is Cons nextC && nextC.Car is Symbol nextSym
                 && ReferenceEquals(nextSym, Startup.UNQUOTE))
                 break;
@@ -886,7 +901,7 @@ public class Reader
         // consed onto: a dotted tail to start with, then whatever the pieces
         // further right produced. A run of elements in front of a tail is LIST*;
         // a run with nothing to its right is LIST, or QUOTE when every element of
-        // it is constant — a template with no unquotes builds nothing at run time
+        // it is constant: a template with no unquotes builds nothing at run time
         // (CLHS 2.4.6 allows the result to share structure with the template).
         LispObject? result = dottedTail;
         int end = items.Count;
@@ -1009,7 +1024,7 @@ public class Reader
         return new LispString(sb.ToString());
     }
 
-    // ReadHash is no longer needed — '#' is handled via DispatchMacro + dispatch table.
+    // ReadHash is no longer needed: '#' is handled via DispatchMacro + dispatch table.
 
     internal LispObject ReadArrayLiteral(int rank)
     {
@@ -1188,7 +1203,7 @@ public class Reader
 
     internal LispObject ReadShareLabel(int label)
     {
-        // #n= obj — define shared structure label
+        // #n= obj: define shared structure label
         if (_readSuppress) { Read(); return Nil.Instance; }
         if (label == -1) throw MakeReaderError("#= requires a numeric label");
         // Pre-register a placeholder so self-references (#n#) during Read() can find it
@@ -1236,14 +1251,14 @@ public class Reader
         }
         else if (root is LispStruct st)
         {
-            for (int i = 0; i < st.Slots.Length; i++)
+            for (int i = 0; i < st.SlotCount; i++)
             {
-                if (st.Slots[i] is SharePlaceholder p && p == ph)
+                if (st.GetSlot(i) is SharePlaceholder p && p == ph)
                 {
-                    st.Slots[i] = replacement;
+                    st.SetSlot(i, replacement);
                 }
                 else
-                    PatchPlaceholders(st.Slots[i], ph, replacement, visited);
+                    PatchPlaceholders(st.GetSlot(i), ph, replacement, visited);
             }
         }
         else if (root is LispInstance inst)
@@ -1260,7 +1275,7 @@ public class Reader
 
     internal LispObject ReadShareRef(int label)
     {
-        // #n# — reference to shared structure
+        // #n#: reference to shared structure
         if (_readSuppress) return Nil.Instance;
         if (label == -1) throw MakeReaderError("## requires a numeric label");
         if (ShareLabels.TryGetValue(label, out var obj))
@@ -1284,8 +1299,8 @@ public class Reader
 
     internal LispObject ReadBitVector(int numArg = -1)
     {
-        // #*0110... → bit vector (LispVector of Fixnum 0/1)
-        // #n*01... → bit vector of length n, fill remaining with last bit
+        // #*0110... -> bit vector (LispVector of Fixnum 0/1)
+        // #n*01... -> bit vector of length n, fill remaining with last bit
         if (_readSuppress)
         {
             // In suppress mode, consume all constituent characters (not just 0/1)
@@ -1305,7 +1320,7 @@ public class Reader
             else if (ch == '1') { ReadChar(); bits.Add(Fixnum.Make(1)); }
             else if (ch != -1 && !IsTerminating(ch) && !char.IsWhiteSpace((char)ch))
             {
-                // Non-bit constituent character (e.g., '2') — signal error
+                // Non-bit constituent character (e.g., '2'): signal error
                 throw MakeReaderError($"Invalid bit character '{(char)ch}' in bit vector");
             }
             else break;
@@ -1329,7 +1344,7 @@ public class Reader
 
     internal LispObject ReadPathnameShorthand()
     {
-        // #P"..." → pathname object
+        // #P"..." -> pathname object
         var str = Read();
         if (_readSuppress) return new Symbol("NIL");
         string? nameStr = null;
@@ -1347,9 +1362,9 @@ public class Reader
         throw MakeReaderError($"#P requires a string argument, got: {str}");
     }
 
-    internal LispObject ReadReadTimeEval()
+    internal LispObject? ReadReadTimeEval()
     {
-        // #. form — read and evaluate at read time
+        // #. form: read and evaluate at read time
         // CLHS 2.4.8.6: signal reader-error if *read-eval* is NIL
         var readEvalSym = Startup.Sym("*READ-EVAL*");
         var readEval = DynamicBindings.Get(readEvalSym);
@@ -1360,14 +1375,38 @@ public class Reader
             throw MakeEndOfFileError("EOF after #.");
         var form = Read();
         if (_readSuppress) return new Symbol("NIL"); // suppress mode: return dummy
-        // #. only uses the primary value; unwrap MvReturn so it doesn't leak
-        // into source data.
-        return MultipleValues.Primary(Runtime.Eval(form));
+        var value = Runtime.Eval(form);
+        // A reader macro that produces NO values has read no object at all, and
+        // the reader carries on as if the characters had been whitespace -- the
+        // same answer a comment gives (CLHS 2.2: a macro function returning zero
+        // values makes the reader start over). Taking the primary value here
+        // instead turned `#.(values)` into NIL, so a form that meant "nothing"
+        // contributed a NIL to whatever list it sat in.
+        //
+        // metacopy writes its DEFPACKAGE that way:
+        //
+        //     (:use #:common-lisp #:moptilities #:metacopy-system
+        //           #.(if *load-with-contextl* '#:contextl (values)))
+        //
+        // and the NIL became a package designator, failing the load with
+        // "USE-PACKAGE: no package named NIL".
+        if (value is MvReturn mv && mv.Count == 0)
+        {
+            // Evaluating the form left the values count at zero. Nothing outside
+            // the reader asked for that -- READ returns one object -- and leaving
+            // it set made the count leak into whatever the caller did next, so a
+            // later (multiple-value-list (handler-case ...)) saw no values at all.
+            MultipleValues.Reset();
+            return null;
+        }
+        // Otherwise #. contributes only the primary value; unwrap MvReturn so it
+        // does not leak into source data.
+        return MultipleValues.Primary(value);
     }
 
     internal LispObject ReadFunctionShorthand()
     {
-        // #'name → (FUNCTION name)
+        // #'name -> (FUNCTION name)
         // Signal end-of-file if EOF is encountered
         if (PeekSkipWhitespaceOnly() == -1)
             throw MakeEndOfFileError("EOF after #'");
@@ -1377,7 +1416,7 @@ public class Reader
 
     internal LispObject ReadCharacterLiteral()
     {
-        // #\x, #\Space, #\SOFT HYPHEN, #\L B BAR SYMBOL, #\GREEK CAPITAL LETTER ALPHA WITH OXIA, …
+        // #\x, #\Space, #\SOFT HYPHEN, #\L B BAR SYMBOL, #\GREEK CAPITAL LETTER ALPHA WITH OXIA, ...
         // Algorithm: read the first char; if not followed by anything interesting, return it.
         // Otherwise read all space-separated words eagerly, then find the LONGEST name match.
         // This handles both single-word standard names (Space, Newline) and multi-word UCD
@@ -1388,7 +1427,7 @@ public class Reader
         int peeked = Peek();
 
         // Quick return: single char followed by a non-space terminator or EOF
-        // (e.g. #\L) or #\L" or #\L; — never the start of a multi-word name)
+        // (e.g. #\L) or #\L" or #\L;: never the start of a multi-word name)
         if (peeked == -1 || (IsTerminating(peeked) && peeked != ' '))
             return _readSuppress ? (LispObject)Nil.Instance : LispChar.Make((char)first);
 
@@ -1418,12 +1457,12 @@ public class Reader
         if (_readSuppress) return Nil.Instance;
 
         // The character name is the single constituent token in firstName (read up to
-        // the first whitespace/terminator/EOF, which was only peeked — not consumed).
+        // the first whitespace/terminator/EOF, which was only peeked: not consumed).
         // Per CLHS, #\ reads ONE token; space-separated multi-word names are not #\
         // syntax. Multi-glyph UCD names print with underscores (#\LATIN_SMALL_LETTER_A)
         // and name-char accepts those, so they still round-trip. Resolving from one
-        // token — rather than scanning ahead over space-separated words and pushing the
-        // surplus back — avoids over-reading, which desynced custom dispatch and
+        // token, rather than scanning ahead over space-separated words and pushing the
+        // surplus back, avoids over-reading, which desynced custom dispatch and
         // concatenated-stream readers (the look-ahead was consumed from the underlying
         // stream but the push-back went to a buffer the enclosing read couldn't see).
         if (firstName.Length == 1)
@@ -1436,8 +1475,8 @@ public class Reader
 
     internal LispObject ReadVector(int numArg = -1)
     {
-        // #( ... ) → vector
-        // #n( ... ) → vector of length n, fill remaining with last element
+        // #( ... ) -> vector
+        // #n( ... ) -> vector of length n, fill remaining with last element
         var items = new List<LispObject>();
         while (true)
         {
@@ -1472,7 +1511,7 @@ public class Reader
 
     internal LispObject? ReadBlockComment()
     {
-        // #| ... |# — nested block comments; produces no value
+        // #| ... |#: nested block comments; produces no value
         int depth = 1;
         while (depth > 0)
         {
@@ -1494,7 +1533,7 @@ public class Reader
 
     internal LispObject ReadUninterned()
     {
-        // #:name → uninterned symbol (token already uppercased by ReadToken)
+        // #:name -> uninterned symbol (token already uppercased by ReadToken)
         var token = ReadToken();
         if (GetCurrentReadtable().Case == ReadtableCase.Invert) ApplyInvertCase(token);
         if (_readSuppress) return Nil.Instance;
@@ -1520,7 +1559,7 @@ public class Reader
         if (shouldInclude)
             return Read();
 
-        // Feature not matched — read in suppressed mode (tolerates unknown packages).
+        // Feature not matched: read in suppressed mode (tolerates unknown packages).
         // Must bind the Lisp *READ-SUPPRESS* dynamic variable in addition to the C# field,
         // so that Lisp reader macros (e.g. Coalton's readtable open-paren handler) also see
         // suppression and skip eclector-based parsing of the excluded form.
@@ -1535,10 +1574,10 @@ public class Reader
 
     /// <summary>
     /// Recursively evaluate a feature expression:
-    ///   symbol        → Startup.HasFeature(name)
-    ///   (OR f1 f2 ..) → any sub-feature matches
-    ///   (AND f1 f2..) → all sub-features match
-    ///   (NOT f)       → sub-feature does not match
+    ///   symbol        -> Startup.HasFeature(name)
+    ///   (OR f1 f2 ..) -> any sub-feature matches
+    ///   (AND f1 f2..) -> all sub-features match
+    ///   (NOT f)       -> sub-feature does not match
     /// </summary>
     private static bool EvaluateFeature(LispObject feature)
     {
@@ -1591,12 +1630,12 @@ public class Reader
                 {
                     if (cons.Cdr is Cons nc)
                         return !EvaluateFeature(nc.Car);
-                    return true; // (NOT) with no arg → true
+                    return true; // (NOT) with no arg -> true
                 }
             }
         }
 
-        // Unknown feature expression form → false
+        // Unknown feature expression form -> false
         return false;
     }
 
@@ -1647,7 +1686,7 @@ public class Reader
         }
     }
 
-    /// <summary>#m1.50 or #m"1.50" — read a first-class CLR decimal, scale preserved.
+    /// <summary>#m1.50 or #m"1.50": read a first-class CLR decimal, scale preserved.
     /// The token form is base-independent (unlike a `1.50m` suffix, whose `m` would be a
     /// digit at *read-base* >= 23); the string form is handy for programmatic scales.</summary>
     internal LispObject ReadDecimal()
@@ -1816,7 +1855,7 @@ public class Reader
             }
         }
 
-        // Ratio: N/D — uses *read-base*
+        // Ratio: N/D: uses *read-base*
         int slashPos = upper.IndexOf('/');
         if (slashPos > 0 && slashPos < upper.Length - 1 && !upper[(slashPos + 1)..].Contains('/'))
         {
@@ -1844,7 +1883,7 @@ public class Reader
             }
         }
 
-        // Integer — uses *read-base* (check before floats so that hex digits
+        // Integer: uses *read-base* (check before floats so that hex digits
         // like D/E/F are not misinterpreted as float exponent markers)
         if (IsAllDigitsInBase(upper, readBase))
         {
@@ -1936,8 +1975,8 @@ public class Reader
 
         // Find exponent marker and replace with E for parsing
         // CLHS 2.3.1.1: exponent markers determine float type:
-        //   S/F → single-float, D/L → double-float, E → *read-default-float-format*
-        //   No marker → *read-default-float-format*
+        //   S/F -> single-float, D/L -> double-float, E -> *read-default-float-format*
+        //   No marker -> *read-default-float-format*
         bool hasExplicitMarker = false;
         bool isDouble = false;
         var normalized = new StringBuilder(token.Length);
@@ -2024,7 +2063,7 @@ public class Reader
         // Find first unescaped colon
         int colonPos = token.FindUnescapedColon();
 
-        // Keyword :NAME — unescaped colon at position 0
+        // Keyword :NAME: unescaped colon at position 0
         // ::NAME (double-colon at start) is also treated as keyword :NAME per most impls
         if (colonPos == 0)
         {
@@ -2084,13 +2123,13 @@ public class Reader
                 var (sym, status) = pkg.FindSymbol(symName);
                 if (status == SymbolStatus.External)
                     return Runtime.CanonicalizeSymbol(sym);
-                // Not external — signal error per spec (B7)
+                // Not external: signal error per spec (B7)
                 if (_readSuppress) return new Symbol(symName);
                 throw MakeReaderError($"Symbol \"{symName}\" is not external in package \"{pkgName}\"");
             }
         }
 
-        // No unescaped colon — unqualified symbol in current package
+        // No unescaped colon: unqualified symbol in current package
         tokenStr ??= token.ToString();
         var starPkg = DynamicBindings.Get(Startup.Sym("*PACKAGE*"));
         var currentPackage = (starPkg is Package curPkg) ? curPkg : (Package.FindPackage("CL-USER") ?? Startup.CL);
@@ -2143,6 +2182,16 @@ public class Reader
         return table[idx];
     }
 
+    /// <summary>
+    /// The dispatcher for a dispatching macro character, reading its sub-character
+    /// in the readtable that is in force. The readtable is resolved here rather
+    /// than captured so that every readtable can share one dispatcher object --
+    /// what differs between readtables is the dispatch table, which is data, not
+    /// the function that reads it (see ReaderMacroWrappers).
+    /// </summary>
+    internal LispObject? DispatchMacro(char dispChar)
+        => DispatchMacro(GetCurrentReadtable(), dispChar);
+
     internal LispObject? DispatchMacro(LispReadtable rt, char dispChar)
     {
         int ch = ReadChar();
@@ -2179,7 +2228,7 @@ public class Reader
         throw MakeReaderError($"Unknown {dispChar} dispatch character: {(char)ch}");
     }
 
-    /// <summary>Reader macro function for ; — line comment (CLHS 2.4.4).</summary>
+    /// <summary>Reader macro function for ;: line comment (CLHS 2.4.4).</summary>
     internal LispObject? ReadLineComment(char _triggerChar)
     {
         while (true)
@@ -2190,7 +2239,7 @@ public class Reader
         return null; // no value produced
     }
 
-    /// <summary>Reader macro function for ) — error (CLHS 2.4.2).</summary>
+    /// <summary>Reader macro function for ): error (CLHS 2.4.2).</summary>
     internal LispObject? ReadRightParen(char _triggerChar)
     {
         throw MakeReaderError("Unexpected ')'");
@@ -2237,7 +2286,7 @@ public class Reader
         rt.SetDispatchMacroCharacter('#', 'P', (r, c, n) => r.ReadPathnameShorthand());
         rt.SetDispatchMacroCharacter('#', 'R', (r, c, n) => r.ReadRadixNumber(n));
         rt.SetDispatchMacroCharacter('#', 'S', (r, c, n) => r.ReadStructureLiteral());
-        // #m<token> / #m"<string>" — a first-class CLR decimal, scale preserved (dotcl).
+        // #m<token> / #m"<string>": a first-class CLR decimal, scale preserved (dotcl).
         rt.SetDispatchMacroCharacter('#', 'M', (r, c, n) => r.ReadDecimal());
         rt.SetDispatchMacroCharacter('#', 'X', (r, c, n) => r.ReadRadixNumber(16));
         // CLHS: #) and #< signal error

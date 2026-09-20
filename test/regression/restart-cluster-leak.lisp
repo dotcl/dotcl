@@ -65,7 +65,7 @@
 ;;; HANDLER-CASE had the identical leak: a non-local exit (return-from / go) through
 ;;; the body :leave's out of the try, bypassing the handler-cluster pop. A later
 ;;; signal then fired the stale handler and threw HandlerCaseInvocationException past
-;;; the (gone) frame — the actual SBCL make-host-2 irrat crash. Fixed the same way.
+;;; the (gone) frame: the actual SBCL make-host-2 irrat crash. Fixed the same way.
 
 (defun %hc-hdepth () (nth-value 0 (dotcl:%handler-cluster-depth)))
 

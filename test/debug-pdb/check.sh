@@ -1,7 +1,7 @@
 #!/bin/sh
 # Debug-path check: compile the corpus with DOTCL_EMIT_PDB both unset and set,
-# and assert (1) the results are identical (the debug codegen path — extra
-# markers + disabled slot-merge — must not miscompile) and (2) the emitted PDB
+# and assert (1) the results are identical (the debug codegen path, extra
+# markers + disabled slot-merge, must not miscompile) and (2) the emitted PDB
 # reads back cleanly with a source hash and well-formed sequence points/scopes.
 #
 # Usage: check.sh <repo-root>
@@ -31,7 +31,7 @@ DOTCL_EMIT_PDB=1 run "$WORK/out-on.txt"
 
 # 1. Results must match between the two codegen paths.
 if ! diff -u "$WORK/out-off.txt" "$WORK/out-on.txt"; then
-  echo "FAIL: debug-on output differs from debug-off — the debug codegen path miscompiled"
+  echo "FAIL: debug-on output differs from debug-off; the debug codegen path miscompiled"
   exit 1
 fi
 if ! grep -q "===CORPUS-END===" "$WORK/out-on.txt"; then

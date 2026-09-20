@@ -28,7 +28,7 @@
   (%dotimes-fixnum-count 10)
   45)
 
-;; Counter values beyond the Fixnum cache (> 65535) — boxing at use sites
+;; Counter values beyond the Fixnum cache (> 65535): boxing at use sites
 ;; must produce correct fresh boxes, and the native increment must not wrap.
 (deftest long-rep-dotimes-large
   (%dotimes-fixnum-count 100000)
@@ -94,7 +94,7 @@
   0)
 
 ;; setq with a non-provable value (full-range fixnum multiply): must route
-;; through the promoting boxed path — value stays exact.
+;; through the promoting boxed path: value stays exact.
 (deftest long-rep-setq-unprovable
   (let ((x 5))
     (declare (fixnum x))
@@ -144,7 +144,7 @@
   9)
 
 ;; Rebinding the same name as an untyped (non-fixnum) local must shadow the
-;; Int64 slot — inner references go through the ordinary boxed slot.
+;; Int64 slot: inner references go through the ordinary boxed slot.
 (deftest long-rep-shadow-untyped
   (let ((x 1))
     (declare (fixnum x))

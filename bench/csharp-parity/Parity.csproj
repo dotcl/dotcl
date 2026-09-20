@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Reference point for the parity benchmark: the same seven kernels a
+       user would write in Lisp, written in C# and built the way a normal
+       Release build of an application is built. Nothing here is tuned beyond
+       that; the point is the ratio against ordinary C#, not against the
+       fastest C# obtainable. -->
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <AssemblyName>parity</AssemblyName>
+    <RootNamespace>Parity</RootNamespace>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <Optimize>true</Optimize>
+    <TieredPGO>true</TieredPGO>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <!-- Server GC would change the allocation behaviour of a process that
+         barely allocates, for no gain, and it is not what the dotcl side
+         runs under. -->
+    <ServerGarbageCollection>false</ServerGarbageCollection>
+  </PropertyGroup>
+
+</Project>

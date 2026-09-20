@@ -152,12 +152,12 @@ public class ClassCType : CType
 }
 
 // ============================================================
-// TypeParser: type specifier → CType
+// TypeParser: type specifier -> CType
 // ============================================================
 
 public static class TypeParser
 {
-    // Cache: symbol identity → parsed CType. Uses symbol reference equality so that
+    // Cache: symbol identity -> parsed CType. Uses symbol reference equality so that
     // pkg1::FOO and pkg2::FOO (same name, different packages) cache independently.
     // ConcurrentDictionary for thread safety. Symbol does not override Equals, so default
     // reference equality applies without a custom comparer.
@@ -190,13 +190,13 @@ public static class TypeParser
                 return ParseCompound(cons, expanding);
 
             case LispClass cls:
-                // Built-in type classes → NamedType for consistent comparison
+                // Built-in type classes -> NamedType for consistent comparison
                 if (Runtime.IsBuiltinTypeName(cls.Name.Name))
                     return NamedType.Get(cls.Name.Name);
                 return new ClassCType(cls);
 
             default:
-                // Unknown specifier — treat as named type
+                // Unknown specifier: treat as named type
                 return NamedType.Get(specifier.ToString() ?? "?");
         }
     }
@@ -205,7 +205,7 @@ public static class TypeParser
     {
         var name = sym.Name;
 
-        // Check cache (keyed by symbol identity — package-aware)
+        // Check cache (keyed by symbol identity: package-aware)
         if (_symbolCache.TryGetValue(sym, out var cached))
             return cached;
 
@@ -217,7 +217,7 @@ public static class TypeParser
             return qResult;
         }
 
-        // Built-in type names — return singleton NamedType
+        // Built-in type names: return singleton NamedType
         if (Runtime.IsBuiltinTypeName(name) || name == "T" || name == "NIL" || name == "*")
         {
             var nt = NamedType.Get(name);
@@ -232,7 +232,7 @@ public static class TypeParser
             expanding ??= new HashSet<string>();
             if (!expanding.Add(name))
             {
-                // Circular — return as named type (best effort)
+                // Circular: return as named type (best effort)
                 var nt = NamedType.Get(name);
                 _symbolCache[sym] = nt;
                 return nt;
@@ -254,7 +254,7 @@ public static class TypeParser
             }
             catch
             {
-                // Expansion failed — treat as named type
+                // Expansion failed: treat as named type
                 var nt = NamedType.Get(name);
                 _symbolCache[sym] = nt;
                 return nt;
@@ -265,7 +265,7 @@ public static class TypeParser
             }
         }
 
-        // Check CLOS class registry — exact symbol lookup first (respects package),
+        // Check CLOS class registry: exact symbol lookup first (respects package),
         // then fallback by name for symbols without home package or unregistered packages.
         var cls = Runtime.FindClassOrNil(sym) as LispClass
                   ?? Runtime.FindClassByName(name);
@@ -276,7 +276,7 @@ public static class TypeParser
             return ct;
         }
 
-        // Unknown type — keep as NamedType
+        // Unknown type: keep as NamedType
         var named = NamedType.Get(name);
         _symbolCache[sym] = named;
         return named;
@@ -330,7 +330,7 @@ public static class TypeParser
             case "COMPLEX":
                 throw new NotSupportedException("complex compound type");
 
-            // Function / Values — stub for now
+            // Function / Values: stub for now
             case "FUNCTION" or "VALUES":
                 return NamedType.Get(headName);
 
@@ -437,9 +437,9 @@ public static class TypeParser
 
     private static CType ParseByteMod(string headName, LispObject? args)
     {
-        // (UNSIGNED-BYTE n) → (INTEGER 0 (2^n - 1))
-        // (SIGNED-BYTE n) → (INTEGER -(2^(n-1)) (2^(n-1) - 1))
-        // (MOD n) → (INTEGER 0 (n - 1))
+        // (UNSIGNED-BYTE n) -> (INTEGER 0 (2^n - 1))
+        // (SIGNED-BYTE n) -> (INTEGER -(2^(n-1)) (2^(n-1) - 1))
+        // (MOD n) -> (INTEGER 0 (n - 1))
         if (args is not Cons c || c.Car is Symbol ws && ws.Name == "*")
             return NamedType.Get(headName == "MOD" ? "UNSIGNED-BYTE" : headName);
 
@@ -503,7 +503,7 @@ public static class TypeParser
 
         if (simple)
         {
-            // SIMPLE-VECTOR: (SIMPLE-VECTOR [size]) — element type is always T
+            // SIMPLE-VECTOR: (SIMPLE-VECTOR [size]): element type is always T
             et = NamedType.Get("T");
             if (args is Cons c1 && c1.Car is not (Symbol { Name: "*" }))
                 size = c1.Car;
@@ -531,11 +531,11 @@ public static class TypeParser
 
     private static CType ParseSpecializedVector(string headName, LispObject? args)
     {
-        // STRING → (ARRAY CHARACTER (*))
-        // SIMPLE-STRING → (SIMPLE-ARRAY CHARACTER (*))
-        // BIT-VECTOR → (ARRAY BIT (*))
+        // STRING -> (ARRAY CHARACTER (*))
+        // SIMPLE-STRING -> (SIMPLE-ARRAY CHARACTER (*))
+        // BIT-VECTOR -> (ARRAY BIT (*))
         // etc.
-        // Keep as NamedType for now — handled by the hierarchy table
+        // Keep as NamedType for now: handled by the hierarchy table
         // Full array-type normalization is Phase 2 work
         return NamedType.Get(headName);
     }
@@ -612,7 +612,7 @@ public static class CTypeOps
             if (nt2.Name == "NIL")
             {
                 if (ct1 is NamedType nt1nil && nt1nil.Name == "NIL") return (true, true);
-                // Complex ct1 might be empty (e.g., (AND X (NOT X))) — can't be sure
+                // Complex ct1 might be empty (e.g., (AND X (NOT X))): can't be sure
                 return (false, false);
             }
         }
@@ -622,7 +622,7 @@ public static class CTypeOps
             if (nt1.Name == "T")
             {
                 if (ct2 is NamedType nt2t && nt2t.Name == "T") return (true, true);
-                // T <: non-T — false, but might not be certain for complex ct2
+                // T <: non-T: false, but might not be certain for complex ct2
                 return (false, false);
             }
         }
@@ -644,7 +644,7 @@ public static class CTypeOps
             return SubtypepIntersection1(inter1, ct2);
         if (ct1 is NegationType)
         {
-            // (NOT A) <: B — hard in general. Only handle B=T (already done above).
+            // (NOT A) <: B: hard in general. Only handle B=T (already done above).
             return (false, false);
         }
 
@@ -686,7 +686,7 @@ public static class CTypeOps
         if (ct1 is MemberType mem1)
             return SubtypepMember(mem1, ct2);
 
-        // SATISFIES — cannot determine in general
+        // SATISFIES: cannot determine in general
         if (ct1 is SatisfiesType || ct2 is SatisfiesType)
             return (false, false);
 
@@ -697,16 +697,16 @@ public static class CTypeOps
 
     private static (bool, bool) SubtypepNot(CType ct1, NegationType neg2)
     {
-        // Special case: ct1 = (NOT X), ct2 = (NOT Y) → ct1 ⊆ ct2 iff Y ⊆ X
+        // Special case: ct1 = (NOT X), ct2 = (NOT Y) -> ct1 subset-of ct2 iff Y subset-of X
         if (ct1 is NegationType neg1)
         {
             return Subtypep(neg2.Inner, neg1.Inner);
         }
         // ct1 <: (NOT inner) iff ct1 and inner are disjoint
         var (isSub, cert) = Subtypep(ct1, neg2.Inner);
-        if (isSub) return (false, true);  // ct1 ⊆ inner → ct1 ⊄ (NOT inner)
+        if (isSub) return (false, true);  // ct1 subset-of inner -> ct1 not-subset-of (NOT inner)
         if (cert && AreDisjoint(ct1, neg2.Inner))
-            return (true, true);  // definitely disjoint → ct1 ⊆ (NOT inner)
+            return (true, true);  // definitely disjoint -> ct1 subset-of (NOT inner)
         return (false, false);
     }
 
@@ -728,7 +728,7 @@ public static class CTypeOps
 
     /// <summary>
     /// Check if a union type is provably universal (= T).
-    /// Detects (OR X (NOT X)) and (OR X (NOT Y)) where Y ⊆ X patterns.
+    /// Detects (OR X (NOT X)) and (OR X (NOT Y)) where Y subset-of X patterns.
     /// </summary>
     private static bool IsUniversalUnion(UnionType union)
     {
@@ -740,7 +740,7 @@ public static class CTypeOps
                 for (int j = 0; j < types.Length; j++)
                 {
                     if (j == i) continue;
-                    // If neg.Inner ⊆ types[j], then (OR types[j] (NOT neg.Inner)) = T
+                    // If neg.Inner subset-of types[j], then (OR types[j] (NOT neg.Inner)) = T
                     var (sub, cert) = Subtypep(neg.Inner, types[j]);
                     if (sub && cert) return true;
                 }
@@ -791,7 +791,7 @@ public static class CTypeOps
         if (IsEmptyIntersection(inter1))
             return (true, true);
         // Try reducing the intersection to a single numeric range.
-        // e.g., (AND FIXNUM UNSIGNED-BYTE) → (INTEGER 0 most-positive-fixnum)
+        // e.g., (AND FIXNUM UNSIGNED-BYTE) -> (INTEGER 0 most-positive-fixnum)
         var reduced = ReduceIntersectionToNumeric(inter1);
         if (reduced != null)
         {
@@ -854,7 +854,7 @@ public static class CTypeOps
 
     /// <summary>
     /// Check if an intersection type is provably empty.
-    /// Detects (AND X (NOT X)) and (AND X (NOT Y)) where X ⊆ Y patterns.
+    /// Detects (AND X (NOT X)) and (AND X (NOT Y)) where X subset-of Y patterns.
     /// </summary>
     private static bool IsEmptyIntersection(IntersectionType inter)
     {
@@ -874,7 +874,7 @@ public static class CTypeOps
                 {
                     if (j == i) continue;
                     var (sub, cert) = Subtypep(types[j], neg.Inner);
-                    if (sub && cert) return true;  // types[j] ⊆ neg.Inner → types[j] AND (NOT neg.Inner) = empty
+                    if (sub && cert) return true;  // types[j] subset-of neg.Inner -> types[j] AND (NOT neg.Inner) = empty
                 }
             }
         }
@@ -898,7 +898,7 @@ public static class CTypeOps
         bool n1Known = Runtime.IsBuiltinTypeName(n1.Name) || Runtime.FindClassByName(n1.Name) != null;
         bool n2Known = Runtime.IsBuiltinTypeName(n2.Name) || Runtime.FindClassByName(n2.Name) != null;
         if (n1Known && n2Known) return (false, true);
-        return (false, false);  // Unknown type — can't be sure
+        return (false, false);  // Unknown type; can't be sure
     }
 
     // --- Numeric types ---
@@ -914,7 +914,7 @@ public static class CTypeOps
         NormalizeBounds(num1, out var low1, out var lowExcl1, out var high1, out var highExcl1);
         NormalizeBounds(num2, out var low2, out var lowExcl2, out var high2, out var highExcl2);
 
-        // Check interval containment: [low1, high1] ⊆ [low2, high2]
+        // Check interval containment: [low1, high1] subset-of [low2, high2]
         if (!BoundContained(low1, lowExcl1, low2, lowExcl2, isLow: true))
             return (false, true);
         if (!BoundContained(high1, highExcl1, high2, highExcl2, isLow: false))
@@ -928,7 +928,7 @@ public static class CTypeOps
     {
         low = num.Low; lowExcl = num.LowExclusiveP;
         high = num.High; highExcl = num.HighExclusiveP;
-        // Only normalize for integer types: exclusive → inclusive by ±1
+        // Only normalize for integer types: exclusive -> inclusive by +/-1
         if (num.NumClass != "INTEGER") return;
         if (low != null && lowExcl)
         {
@@ -944,7 +944,7 @@ public static class CTypeOps
 
     private static (bool, bool) SubtypepNumericNamed(NumericType num, NamedType named)
     {
-        // (INTEGER 0 10) <: NUMBER → true if INTEGER <: NUMBER
+        // (INTEGER 0 10) <: NUMBER -> true if INTEGER <: NUMBER
         if (Runtime.CheckSubtypeByName(num.NumClass, named.Name)) return (true, true);
         // Try converting named type to numeric range: FIXNUM, BIT, UNSIGNED-BYTE
         var namedNum = NamedToNumericType(named.Name);
@@ -995,11 +995,11 @@ public static class CTypeOps
         // Try converting named type to numeric range first
         var namedNum = NamedToNumericType(named.Name);
         if (namedNum != null) return SubtypepNumeric(namedNum, num);
-        // INTEGER <: (INTEGER 0 10) → only if named is a bounded subrange
+        // INTEGER <: (INTEGER 0 10) -> only if named is a bounded subrange
         if (!Runtime.CheckSubtypeByName(named.Name, num.NumClass))
             return (false, Runtime.IsBuiltinTypeName(named.Name));
         if (num.Low != null || num.High != null)
-            return (false, false);  // unbounded named vs bounded numeric — uncertain
+            return (false, false);  // unbounded named vs bounded numeric; uncertain
         return (true, true);
     }
 
@@ -1042,9 +1042,9 @@ public static class CTypeOps
     private static bool BoundContained(LispObject? inner, bool innerExcl,
                                         LispObject? outer, bool outerExcl, bool isLow)
     {
-        // outer is unbounded → always contained
+        // outer is unbounded -> always contained
         if (outer == null) return true;
-        // inner is unbounded but outer is bounded → not contained
+        // inner is unbounded but outer is bounded -> not contained
         if (inner == null) return false;
 
         // Compare bound values
@@ -1056,8 +1056,8 @@ public static class CTypeOps
             // For low bounds: inner_low >= outer_low
             if (cmp > 0) return true;
             if (cmp < 0) return false;
-            // Equal: inner_excl=T, outer_excl=F → inner is tighter → contained
-            // inner_excl=F, outer_excl=T → inner includes boundary, outer doesn't → not contained
+            // Equal: inner_excl=T, outer_excl=F -> inner is tighter -> contained
+            // inner_excl=F, outer_excl=T -> inner includes boundary, outer doesn't -> not contained
             return innerExcl || !outerExcl;
         }
         else
@@ -1106,7 +1106,7 @@ public static class CTypeOps
         if (a2.Dimensions != null)
         {
             if (a1.Dimensions == null) return (false, false);
-            // Both have dimensions — compare
+            // Both have dimensions: compare
             if (!DimensionsMatch(a1.Dimensions, a2.Dimensions))
                 return (false, true);
         }
@@ -1130,7 +1130,7 @@ public static class CTypeOps
                 bool w2 = cc2.Car is Symbol s2 && s2.Name == "*";
                 if (!w1 && !w2)
                 {
-                    // Both are specific dimensions — must match for subtype
+                    // Both are specific dimensions: must match for subtype
                     if (cc1.Car is Fixnum df1 && cc2.Car is Fixnum df2)
                     {
                         if (df1.Value != df2.Value) return false;
@@ -1195,12 +1195,12 @@ public static class CTypeOps
         // Also check built-in hierarchy for structure-object etc.
         if (c1.Class.IsStructureClass && Runtime.CheckSubtypeByName("STRUCTURE-OBJECT", n2.Name))
             return (true, true);
-        return (false, false);  // conservative — named type might be a deftype alias
+        return (false, false);  // conservative; named type might be a deftype alias
     }
 
     private static (bool, bool) SubtypepNamedClass(NamedType n1, ClassCType c2)
     {
-        // Named type <: Class type — check if the named type is a known subclass
+        // Named type <: Class type: check if the named type is a known subclass
         if (Runtime.FindClassByName(n1.Name) is LispClass cls)
         {
             foreach (var c in cls.ClassPrecedenceList)
@@ -1214,7 +1214,7 @@ public static class CTypeOps
 
     private static (bool, bool) SubtypepMember(MemberType mem, CType ct2)
     {
-        // Fast path: (MEMBER a b c) <: (MEMBER ...) — check set containment
+        // Fast path: (MEMBER a b c) <: (MEMBER ...): check set containment
         if (ct2 is MemberType mem2)
         {
             foreach (var obj in mem.Members)
@@ -1256,7 +1256,7 @@ public static class CTypeOps
     public static bool IsTypep(LispObject obj, CType ct)
     {
         // Convert CType back to specifier and use existing Typep
-        // This is a temporary bridge — Phase 3 will replace Typep entirely
+        // This is a temporary bridge: Phase 3 will replace Typep entirely
         try
         {
             var spec = CTypeToSpecifier(ct);
@@ -1364,7 +1364,7 @@ public static class CTypeOps
         ["STANDARD-CHAR"] = "CHARACTER", ["EXTENDED-CHAR"] = "CHARACTER",
         // SYMBOL group
         ["SYMBOL"] = "SYMBOL", ["KEYWORD"] = "SYMBOL", ["BOOLEAN"] = "SYMBOL", ["NULL"] = "SYMBOL",
-        // CONS group (only CONS itself — LIST includes NIL which is SYMBOL)
+        // CONS group (only CONS itself: LIST includes NIL which is SYMBOL)
         ["CONS"] = "CONS",
         // ARRAY group
         ["ARRAY"] = "ARRAY", ["VECTOR"] = "ARRAY", ["SIMPLE-ARRAY"] = "ARRAY",

@@ -5,7 +5,7 @@
 ;;;
 ;;; Deterministic setup: build a loopback TCP pair, prime the server-side
 ;;; stream's reader/writer, then Dispose the underlying NetworkStream so every
-;;; subsequent read/write fails like a dead peer — no RST timing, no platform
+;;; subsequent read/write fails like a dead peer: no RST timing, no platform
 ;;; variance (an actual reset can surface as clean EOF on some platforms).
 
 (defun %dead-socket-stream ()
@@ -48,7 +48,7 @@
   :stream-error)
 
 ;;; The original CLR exception rides on the condition, so a handler can still
-;;; classify the failure (dotnet:exception-object → error codes, inner chain).
+;;; classify the failure (dotnet:exception-object -> error codes, inner chain).
 (deftest dead-socket-error-carries-exception-object
   (let ((s (%dead-socket-stream)))
     (handler-case (progn (read-char s nil :eof) :no-error)

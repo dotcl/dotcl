@@ -35,13 +35,13 @@ public class Package : LispObject
     /// <summary>Immutable copy of <see cref="_useList"/>, rebuilt inside the lock
     /// whenever the list changes. FIND-SYMBOL walks it to resolve inherited
     /// symbols and is on every symbol reference in compiled code, so it must not
-    /// take a lock to do so — that walk was measurable as Monitor.Enter_Slowpath.
+    /// take a lock to do so: that walk was measurable as Monitor.Enter_Slowpath.
     /// A reader may see a use/unuse that is one step stale, which is no weaker
     /// than before: the lock was released before the caller acted on the result
     /// either way.</summary>
     private volatile Package[] _useSnapshot = Array.Empty<Package>();
     private readonly object _pkgLock = new();
-    // Local nicknames: maps nickname string → package (per CDR 5 / SBCL package-local-nicknames)
+    // Local nicknames: maps nickname string -> package (per CDR 5 / SBCL package-local-nicknames)
     private readonly ConcurrentDictionary<string, Package> _localNicknames = new();
 
     private static readonly ConcurrentDictionary<string, Package> _allPackages = new();
@@ -75,7 +75,7 @@ public class Package : LispObject
     /// dotcl's own packages produces a DIFFERENT symbol object that must still
     /// reach the registered function (dotcl-thread's %make-thread is the case
     /// this was built for). They
-    /// are not a general "same name means same function" rule — letting an
+    /// are not a general "same name means same function" rule: letting an
     /// arbitrary library's package answer turns an undefined function into a
     /// silent call of an unrelated one (uiop:emptyp for a user's EMPTYP).
     /// So only dotcl's own namespace may serve as a bridge source.
@@ -104,7 +104,7 @@ public class Package : LispObject
         // Overwhelmingly the symbol already lives in this package: INTERN is what
         // every symbol reference in compiled code goes through (Startup.SymInPkg),
         // so it runs constantly and almost never creates anything. The dictionaries
-        // are concurrent, so answering from them needs no lock — taking one on
+        // are concurrent, so answering from them needs no lock: taking one on
         // every reference showed up as Monitor.Enter_Slowpath in profiles.
         // Anything not already here (a fresh symbol, or one inherited through the
         // use-list) still goes the locked route below.
@@ -448,7 +448,7 @@ public class Package : LispObject
 
     // Package lock: when true, definers that would rebind symbols
     // whose home package is this package must signal a package-lock-violation.
-    // Step 1: plumbing only — no enforcement yet.
+    // Step 1: plumbing only: no enforcement yet.
     public bool IsLocked { get; set; }
 
     /// <summary>

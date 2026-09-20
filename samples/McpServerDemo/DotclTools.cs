@@ -38,7 +38,7 @@ public sealed class DotclTools
      Description(
         "Evaluate a Common Lisp form in the dotcl image and return the " +
         "printed representation of the primary value (via PRIN1-TO-STRING). " +
-        "Multiple forms are wrapped in a PROGN — only the last value is returned. " +
+        "Multiple forms are wrapped in a PROGN; only the last value is returned. " +
         "Side effects (DEFUN / DEFVAR / DEFPARAMETER) persist across calls.")]
     public static string LispEval(
         [Description("Common Lisp source, e.g. \"(+ 1 2)\" or \"(mapcar #'1+ '(1 2 3))\"")]

@@ -59,7 +59,7 @@
       (dotnet:invoke base "get_FullName")))
   "System.Object")
 
-;;; Nil base arg behaves the same as the 1-arg form — NEW is instantiable.
+;;; Nil base arg behaves the same as the 1-arg form: NEW is instantiable.
 (deftest d772-nil-base-behaves-default
   (progn
     (dotnet:%define-class "DotclTest.NetClassF" nil)
@@ -109,7 +109,7 @@
       (dotnet:invoke obj "Label")))
   "hello")
 
-;;; Multiple fields — each stored independently
+;;; Multiple fields: each stored independently
 (deftest d773-multiple-fields
   (progn
     (dotnet:%define-class "DotclTest.FieldClassC" nil
@@ -188,6 +188,102 @@
       (dotnet:invoke attrs "get_Length")))
   2)
 
+;;; Named properties and fields. Most .NET attributes are shaped as a
+;;; parameterless (or short) constructor plus named properties, so an attr spec
+;;; reads keyword/value pairs after its positional arguments.
+;;;
+;;; ObsoleteAttribute is the useful test subject because it has both halves:
+;;; Message and IsError are constructor-only (read-only properties), while
+;;; DiagnosticId and UrlFormat are settable.
+
+;;; Positional constructor arguments and a named property in one spec. The
+;;; positional half still reaches the (string, bool) constructor.
+(deftest d2625-attribute-named-property
+  (progn
+    (dotnet:%define-class "DotclTest.AttrNamedA" nil nil
+      '(("System.ObsoleteAttribute" "old" t :diagnostic-id "DOTCL001")))
+    (let* ((type (dotnet:resolve-type "DotclTest.AttrNamedA"))
+           (attrs (dotnet:invoke type "GetCustomAttributes" t))
+           (first (dotnet:invoke attrs "GetValue" 0)))
+      (list (dotnet:invoke first "get_Message")
+            (dotnet:invoke first "get_IsError")
+            (dotnet:invoke first "get_DiagnosticId"))))
+  ("old" t "DOTCL001"))
+
+;;; Named properties with no positional arguments at all, spelled both squashed
+;;; and with dashes. A member name matches case-insensitively with dashes
+;;; removed, so :diagnosticid and :url-format both land.
+(deftest d2625-attribute-named-only
+  (progn
+    (dotnet:%define-class "DotclTest.AttrNamedB" nil nil
+      '(("System.ObsoleteAttribute" :diagnosticid "D2" :url-format "http://x/{0}")))
+    (let* ((type (dotnet:resolve-type "DotclTest.AttrNamedB"))
+           (attrs (dotnet:invoke type "GetCustomAttributes" t))
+           (first (dotnet:invoke attrs "GetValue" 0)))
+      (list (dotnet:invoke first "get_DiagnosticId")
+            (dotnet:invoke first "get_UrlFormat"))))
+  ("D2" "http://x/{0}"))
+
+;;; An enum-typed named property takes the integral value.
+(deftest d2625-attribute-named-enum
+  (progn
+    (dotnet:%define-class "DotclTest.AttrNamedC" nil nil
+      '(("System.Diagnostics.Tracing.EventAttribute" 1 :level 4)))
+    (let* ((type (dotnet:resolve-type "DotclTest.AttrNamedC"))
+           (attrs (dotnet:invoke type "GetCustomAttributes" t))
+           (first (dotnet:invoke attrs "GetValue" 0)))
+      (dotnet:invoke (dotnet:invoke first "get_Level") "ToString")))
+  "Informational")
+
+;;; Method-level attr specs go through the same parser.
+(deftest d2625-attribute-named-on-method
+  (progn
+    (dotnet:%define-class "DotclTest.AttrNamedD" nil nil nil
+      (list (list "Greet" "System.String" nil
+                  (lambda (self) (declare (ignore self)) "hi")
+                  nil
+                  '(("System.ObsoleteAttribute" :diagnostic-id "M1")))))
+    (let* ((type (dotnet:resolve-type "DotclTest.AttrNamedD"))
+           (method (dotnet:invoke type "GetMethod" "Greet"))
+           (attrs (dotnet:invoke method "GetCustomAttributes" t))
+           (first (dotnet:invoke attrs "GetValue" 0)))
+      (dotnet:invoke first "get_DiagnosticId")))
+  "M1")
+
+;;; A name that is neither a settable property nor a public field is an error,
+;;; rather than being silently dropped.
+(deftest d2625-attribute-unknown-member-rejected
+  (signals-error
+    (dotnet:%define-class "DotclTest.AttrNamedBadE" nil nil
+      '(("System.ObsoleteAttribute" :no-such-member 1)))
+    error)
+  t)
+
+;;; A constructor-only property cannot be set as a named one.
+(deftest d2625-attribute-readonly-member-rejected
+  (signals-error
+    (dotnet:%define-class "DotclTest.AttrNamedBadF" nil nil
+      '(("System.ObsoleteAttribute" :message "x")))
+    error)
+  t)
+
+;;; A trailing keyword with no value is an error.
+(deftest d2625-attribute-dangling-keyword-rejected
+  (signals-error
+    (dotnet:%define-class "DotclTest.AttrNamedBadG" nil nil
+      '(("System.ObsoleteAttribute" :diagnostic-id)))
+    error)
+  t)
+
+;;; Positional arguments may not follow named ones: the first keyword ends the
+;;; positional run, so a later non-keyword is a mistake worth reporting.
+(deftest d2625-attribute-positional-after-named-rejected
+  (signals-error
+    (dotnet:%define-class "DotclTest.AttrNamedBadH" nil nil
+      '(("System.ObsoleteAttribute" :diagnostic-id "d" "stray")))
+    error)
+  t)
+
 ;;; Unknown attribute type name is an error
 (deftest d774-unknown-attribute-rejected
   (signals-error
@@ -201,7 +297,7 @@
 ;;; Lisp lambda through DispatchLispMethod. self is passed as the first
 ;;; Lisp arg.
 
-;;; String returning method, no params — Greet re-cast as a proper method spec
+;;; String returning method, no params: Greet re-cast as a proper method spec
 ;;; test. Parallels d771-invoke-greet but explicitly exercises 5-arg form.
 (deftest d776-string-return-no-params
   (progn
@@ -212,7 +308,7 @@
       (dotnet:invoke obj "Label")))
   "constant")
 
-;;; Int param + int return — ldarg/box/stelem/unbox.any path for value types.
+;;; Int param + int return: ldarg/box/stelem/unbox.any path for value types.
 (deftest d776-int-param-int-return
   (progn
     (dotnet:%define-class "DotclTest.MethodClassB" nil nil nil
@@ -232,7 +328,7 @@
       (dotnet:invoke obj "Add" 10 32)))
   42)
 
-;;; String param + string return — castclass path for reference types
+;;; String param + string return: castclass path for reference types
 (deftest d776-string-param-string-return
   (progn
     (dotnet:%define-class "DotclTest.MethodClassD" nil nil nil
@@ -334,7 +430,7 @@
             (dotnet:invoke obj "Add" 10))))
   (5 15))
 
-;;; Via attributes — 3rd option of the macro
+;;; Via attributes: 3rd option of the macro
 (deftest d777-macro-attributes
   (progn
     (dotnet:define-class "DotclTest.MacroClassC" ("System.Object")
@@ -347,7 +443,7 @@
       (dotnet:invoke first "get_Message")))
   "macro-attached")
 
-;;; Base class inheritance also works via macro — 1st element of 2nd arg is the base
+;;; Base class inheritance also works via macro: 1st element of 2nd arg is the base
 (deftest d777-macro-inheritance
   (progn
     (dotnet:define-class "DotclTest.MacroException" ("System.Exception"))
@@ -357,7 +453,7 @@
       (dotnet:invoke base "get_FullName")))
   "System.Exception")
 
-;;; Void return + side effects — method body can call other methods
+;;; Void return + side effects: method body can call other methods
 (deftest d777-macro-void-method
   (progn
     (dotnet:define-class "DotclTest.MacroClassD" ("System.Object")
@@ -589,7 +685,7 @@
   "custom-tostring")
 
 ;;; A method without :override t is a new shadow, so calling base through the type
-;;; would normally return the base — but here we do not verify the behavioral split
+;;; would normally return the base: but here we do not verify the behavioral split
 ;;; between override and non-override versions (dotnet:invoke is name-resolution based).
 ;;; Instead we verify via reflection that the Virtual bit is set when overriding.
 (deftest d786-override-method-is-virtual
@@ -604,7 +700,7 @@
       (dotnet:invoke mi "get_IsVirtual")))
   t)
 
-;;; Override with an argument — System.Object.Equals(Object)
+;;; Override with an argument: System.Object.Equals(Object)
 (deftest d786-override-equals
   (progn
     (dotnet:%define-class "DotclTest.OverrideC" nil nil nil
@@ -775,7 +871,7 @@
       (dotnet:invoke obj "Extra")))
   "extra-value")
 
-;;; Via macro (:implements ...) path — symbol short-names are also OK
+;;; Via macro (:implements ...) path: symbol short-names are also OK
 (deftest d787-macro-implements
   (progn
     (dotnet:define-class "DotclTest.MacroDisposable" (Object)
@@ -866,7 +962,7 @@
   t)
 
 ;;; Implement INotifyPropertyChanged and attach a PropertyChanged event
-;;; → add_/remove_PropertyChanged satisfies the interface slot
+;;; -> add_/remove_PropertyChanged satisfies the interface slot
 ;;; (Type.GetType cannot resolve System.ObjectModel's INotifyPropertyChanged
 ;;;  without an assembly-qualified name, so here we use GetInterfaces via
 ;;;  reflection and match by FullName)
@@ -909,7 +1005,7 @@
       t))
   t)
 
-;;; Via macro (:events ...) path — symbol short-names are also OK
+;;; Via macro (:events ...) path: symbol short-names are also OK
 (deftest d788-macro-events
   (progn
     (dotnet:define-class "DotclTest.EventMacro" (Object)
@@ -966,7 +1062,7 @@
   t)
 
 ;;; sender-pattern: parameter count of OnName(args) is delegate Invoke params - 1
-;;; (System.EventHandler.Invoke(object,EventArgs) → OnClicked(EventArgs))
+;;; (System.EventHandler.Invoke(object,EventArgs) -> OnClicked(EventArgs))
 (deftest d789-sender-pattern-strips-first
   (progn
     (dotnet:%define-class "DotclTest.RaiserC" nil nil nil nil nil nil nil
@@ -1150,8 +1246,8 @@
            (fired 0))
       (dotnet:add-event obj "PropertyChanged"
                         (lambda (s a) (declare (ignore s a)) (incf fired)))
-      (dotnet:%set-invoke obj "Internal" 10)  ; no notify → does not fire
-      (dotnet:%set-invoke obj "Title" "x")    ; notify → fires
+      (dotnet:%set-invoke obj "Internal" 10)  ; no notify -> does not fire
+      (dotnet:%set-invoke obj "Title" "x")    ; notify -> fires
       fired))
   1)
 
@@ -1164,7 +1260,7 @@
     error)
   t)
 
-;;; Multiple :notify properties — correct name is notified on each set
+;;; Multiple :notify properties: correct name is notified on each set
 (deftest d790-multiple-notify-properties
   (progn
     (dotnet:define-class "DotclTest.NotifyProp4" (Object)
@@ -1185,7 +1281,7 @@
       (reverse names)))
   ("A" "B" "A"))
 
-;;; Full MVVM scaffold — boilerplate eliminated without SetX wrappers
+;;; Full MVVM scaffold: boilerplate eliminated without SetX wrappers
 (deftest d790-mvvm-no-boilerplate
   (progn
     (dotnet:define-class "DotclTest.CleanVM" (Object)
@@ -1210,7 +1306,7 @@
 ;;; -------------------------------------------------------------------------
 ;;; Auto-property integration
 
-;;; Integration of properties + ctor + methods — ViewModel equivalent pattern
+;;; Integration of properties + ctor + methods: ViewModel equivalent pattern
 (deftest d785-integration-viewmodel
   (progn
     (dotnet:define-class "DotclTest.ViewModel" (Object)
@@ -1269,7 +1365,7 @@
     (dotnet:invoke sw "ToString"))
   "hello")
 
-;;; Multiple bindings — each resource is independently bound
+;;; Multiple bindings: each resource is independently bound
 (deftest d893-using-multiple-bindings
   (let ((r '()))
     (dotnet:using ((a (dotnet:new "System.IO.StringWriter"))
@@ -1281,7 +1377,7 @@
     (reverse r))
   ("first" "second"))
 
-;;; Empty bindings — plain progn
+;;; Empty bindings: plain progn
 (deftest d893-using-no-bindings
   (dotnet:using ()
     42)
@@ -1360,7 +1456,7 @@
   (typep (class-of (dotnet:new "DotclTest.ClsBase2")) 'built-in-class)
   t)
 
-;;; find-class works via the uppercase Lisp symbol (reader upcases ClsBase3 → CLSBASE3)
+;;; find-class works via the uppercase Lisp symbol (reader upcases ClsBase3 -> CLSBASE3)
 (deftest d1101-find-class-works
   (string= (symbol-name (class-name (find-class 'clsbase3))) "ClsBase3")
   t)
@@ -1387,7 +1483,7 @@
 ;;; -------------------------------------------------------------------------
 ;;; method overloading and constructor overloading
 
-;;; Same method name, different arity → each dispatches correctly
+;;; Same method name, different arity -> each dispatches correctly
 (deftest d1106-method-overload-by-arity
   (progn
     (dotnet:%define-class "DotclTest.OverloadA" nil nil nil
@@ -1400,7 +1496,7 @@
             (dotnet:invoke obj "Add" 3 4))))
   (10 7))
 
-;;; Same method name, different param types → different body
+;;; Same method name, different param types -> different body
 (deftest d1106-method-overload-by-type
   (progn
     (dotnet:%define-class "DotclTest.OverloadB" nil nil nil
@@ -1506,7 +1602,7 @@
   42)
 
 ;;; -------------------------------------------------------------------------
-;;; Step 6: save-library — aggregate MANY types into one C#-referenceable .dll.
+;;; Step 6: save-library: aggregate MANY types into one C#-referenceable .dll.
 ;;; The saved DLL is a facade (persisted, unloadable in this process), so these
 ;;; tests assert emission succeeds, the primitive returns the save-path, and a
 ;;; non-empty .dll lands on disk. C#-consumability is covered end-to-end by
@@ -1523,7 +1619,7 @@
        (with-open-file (s path :element-type '(unsigned-byte 8))
          (> (file-length s) 0))))
 
-;;; dotnet:%save-library primitive: tagged member-spec-list — two :class instance
+;;; dotnet:%save-library primitive: tagged member-spec-list: two :class instance
 ;;; types + a static function (7th method-spec element = static-flag). One DLL.
 (deftest savelib-primitive-multi-type
   (let ((path (%savelib-temp-path "dotcl-savelib-prim")))
@@ -1591,7 +1687,7 @@
   t)
 
 ;;; %save-library tagged :enum members: an enum-only library (no classes) is
-;;; valid — enums are standalone metadata. Underlying nil defaults to Int32.
+;;; valid: enums are standalone metadata. Underlying nil defaults to Int32.
 (deftest savelib-enum-only
   (let ((path (%savelib-temp-path "dotcl-savelib-enum")))
     (list
@@ -1651,7 +1747,7 @@
 ;;; Exception type: a class deriving System.Exception whose ctor forwards its
 ;;; message to base with NO body. Such a base-forwarding-only ctor emits no Lisp
 ;;; dispatch, so the type is standalone (a C# consumer throws/catches it with no
-;;; DotCL.Runtime — asserted end-to-end in test/save-class-lib/check.sh).
+;;; DotCL.Runtime: asserted end-to-end in test/save-class-lib/check.sh).
 (deftest library-macro-exception-type
   (let ((path (%savelib-temp-path "dotcl-library-exc")))
     (dotnet:library ("LibExc" :version "1.0.0.0" :path path)
@@ -1661,7 +1757,7 @@
   t)
 
 ;;; In-process: a base-forwarding-only ctor (no body) still constructs correctly
-;;; via dotnet:new — the null-body ctor calls base and returns.
+;;; via dotnet:new: the null-body ctor calls base and returns.
 (deftest define-class-base-forwarding-ctor
   (progn
     (dotnet:define-class "DcExcTest.AppError" ("System.Exception")
@@ -1697,7 +1793,7 @@
     (%file-nonempty-p path))
   t)
 
-;;; dotnet:library :interface — a standalone abstract-method contract. Assert a
+;;; dotnet:library :interface: a standalone abstract-method contract. Assert a
 ;;; non-empty DLL; C#-implementability is asserted end-to-end in check.sh.
 (deftest library-macro-interface
   (let ((path (%savelib-temp-path "dotcl-library-iface")))
@@ -1708,7 +1804,7 @@
     (%file-nonempty-p path))
   t)
 
-;;; dotnet:library :delegate — a standalone callback type. Assert a non-empty
+;;; dotnet:library :delegate: a standalone callback type. Assert a non-empty
 ;;; DLL; C#-usability is asserted end-to-end in check.sh.
 (deftest library-macro-delegate
   (let ((path (%savelib-temp-path "dotcl-library-del")))

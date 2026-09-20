@@ -17,7 +17,7 @@
          (documentation (find-package "DEFPACKAGE-DOC-PROBE") t))
   "replaced")
 
-;; No :documentation option — NIL, not an error.
+;; No :documentation option: NIL, not an error.
 (defpackage "DEFPACKAGE-DOC-PROBE-2" (:use "CL"))
 
 (deftest defpackage-documentation-absent

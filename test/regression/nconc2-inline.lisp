@@ -1,4 +1,4 @@
-;;; 2-arg NCONC compiler inline (Runtime.Nconc2) — semantics must match the
+;;; 2-arg NCONC compiler inline (Runtime.Nconc2): semantics must match the
 ;;; stdlib &rest defun exactly, on both the compiled call-site path and the
 ;;; funcall (Lisp function object) path.
 

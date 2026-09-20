@@ -7,7 +7,7 @@ namespace DotCL;
 /// Minimal HTTP(S) transport: GET a URL and write the body to a file.
 ///
 /// This exists because stock quicklisp speaks only plain HTTP over its own
-/// socket code — it has no TLS at all — while everything worth fetching today
+/// socket code, it has no TLS at all, while everything worth fetching today
 /// is https. On .NET the whole of TLS, redirects, gzip, proxies and certificate
 /// validation comes from the BCL, so the transport is a thin wrapper rather
 /// than the cl+ssl/OpenSSL dependency other implementations need.
@@ -19,7 +19,7 @@ namespace DotCL;
 internal static class DotclHttp
 {
     // AllowAutoRedirect is off on purpose. .NET drops the Authorization header
-    // on every automatic redirect — right for a cross-origin hop to a signed URL
+    // on every automatic redirect: right for a cross-origin hop to a signed URL
     // (a GitHub release asset redirects to objects.githubusercontent.com, and
     // the token must not follow it), wrong for a redirect that stays on the same
     // host and still needs the credential. Following redirects by hand keeps
@@ -30,8 +30,8 @@ internal static class DotclHttp
     private static string AsString(LispObject o) =>
         o is LispString s ? s.Value : o.ToString()!;
 
-    // Some hosts refuse a request with no User-Agent outright — api.github.com
-    // answers 403 — so send one by default. A header supplied by the caller
+    // Some hosts refuse a request with no User-Agent outright, api.github.com
+    // answers 403, so send one by default. A header supplied by the caller
     // wins, which is how a caller identifies itself as something more specific.
     private static readonly string DefaultUserAgent =
         "dotcl/" + (typeof(Runtime).Assembly

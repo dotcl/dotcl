@@ -2,7 +2,7 @@
 ;;;
 ;;; COMPILE-DEFUN emits (setf documentation) for it; the %MINI-EVAL DEFUN case did
 ;;; not. %MINI-FN-LAMBDA hoists the string out of the implicit block, but hoisting
-;;; only MOVES it — as a form in the lambda body it is evaluated and discarded, so
+;;; only MOVES it: as a form in the lambda body it is evaluated and discarded, so
 ;;; (documentation 'f 'function) answered NIL for anything defined through EVAL.
 ;;; Same shape as the DEFVAR / DEFPARAMETER / DEFCONSTANT family.
 ;;;

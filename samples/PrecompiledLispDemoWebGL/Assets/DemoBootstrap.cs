@@ -3,18 +3,18 @@ using System.Runtime.InteropServices;
 using UnityEngine;
 using DotCL;
 
-// DemoBootstrap — the WebGL headline: an animated curve whose every point is
+// DemoBootstrap: the WebGL headline: an animated curve whose every point is
 // computed by precompiled Common Lisp each frame, running inside a Unity IL2CPP
 // WebGL build (IsDynamicCodeSupported = False, no Reflection.Emit). A browser
-// input box EVALs Lisp at run time — e.g. (setf *fx* 7) or a whole (defun px ...)
-// — and the curve changes live, through the tree-walk interpreter, no recompile.
+// input box EVALs Lisp at run time: e.g. (setf *fx* 7) or a whole (defun px ...),
+// and the curve changes live, through the tree-walk interpreter, no recompile.
 //
 // Lisp drives the visuals: Update() calls the precompiled PX/PY/HUE (in appfasl,
 // baked into the build) per point; EvalFromJs() routes browser input through the
 // emit-free evaluator, mutating the special variables PX/PY read. The two Lisp
 // images (dotclcore/appfasl) are referenced as fixed-name assemblies and booted
 // by stable name via DotclHost.RunLinkedModuleByName (Assembly.Load on the
-// already-linked assembly — never Assembly.LoadFrom, unavailable under IL2CPP).
+// already-linked assembly: never Assembly.LoadFrom, unavailable under IL2CPP).
 public class DemoBootstrap : MonoBehaviour
 {
 #if UNITY_WEBGL && !UNITY_EDITOR
@@ -39,7 +39,7 @@ public class DemoBootstrap : MonoBehaviour
     {
 #if UNITY_WEBGL && !UNITY_EDITOR
         // By default the Unity WebGL canvas captures ALL keyboard input on the
-        // page, so the HTML <textarea> next to it never receives keystrokes —
+        // page, so the HTML <textarea> next to it never receives keystrokes;
         // you can't type into the REPL. Turning this off makes Unity capture
         // keys only while the canvas itself is focused, letting the input box work.
         WebGLInput.captureAllKeyboardInput = false;
@@ -49,7 +49,7 @@ public class DemoBootstrap : MonoBehaviour
         DotclHost.SetThrowingDebuggerHook();   // Lisp errors throw back to C#, not the debugger
         Log($"IsDynamicCodeSupported = {System.Runtime.CompilerServices.RuntimeFeature.IsDynamicCodeSupported}");
 
-        // Boot the FASL core and the app image — build-time-linked, by stable name.
+        // Boot the FASL core and the app image: build-time-linked, by stable name.
         DotclHost.RunLinkedModuleByName("dotclcore");
         DotclHost.Register("host-log", a => { Log($"    [Lisp] {a[0]}"); return null; });
         DotclHost.RunLinkedModuleByName("appfasl");
@@ -62,7 +62,7 @@ public class DemoBootstrap : MonoBehaviour
         SetupScene();
         _booted = true;
         Log("Curve is live. Try evaluating:  (setf *fx* 7)   (setf *amp* 0.5)   (setf *spin* 4)");
-        Log("…or redefine it whole:  (defun px (i n tick) (* *amp* (cos (* *fx* (/ (* 2 pi i) n)))))");
+        Log("...or redefine it whole:  (defun px (i n tick) (* *amp* (cos (* *fx* (/ (* 2 pi i) n)))))");
     }
 
     private void SetupScene()
@@ -89,7 +89,7 @@ public class DemoBootstrap : MonoBehaviour
         if (!_booted) return;
         _tick += 1.0;
 
-        // Lisp computes every point this frame (precompiled → fast).
+        // Lisp computes every point this frame (precompiled -> fast).
         for (int i = 0; i < N; i++)
         {
             double x = DotclHost.ToClr<double>(DotclHost.Call("PX", i, N, _tick));

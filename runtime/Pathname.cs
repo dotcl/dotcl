@@ -146,7 +146,7 @@ public class LispPathname : LispObject
 
     /// <summary>Reconstruct a pathname from its namestring but with an explicit
     /// VERSION component. A namestring carries no version syntax, so a plain
-    /// FromString round-trip drops the version (e.g. :NEWEST → nil). The FASL
+    /// FromString round-trip drops the version (e.g. :NEWEST -> nil). The FASL
     /// serializer uses this to preserve the version of a literal pathname embedded
     /// via #. (ANSI COMPILE-FILE.16: *compile-file-pathname* has version :newest).</summary>
     public static LispPathname FromStringWithVersion(string path, LispObject? version)

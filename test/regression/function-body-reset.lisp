@@ -1,11 +1,11 @@
 ;;; Regression: a function body compiled inside another body is a separate CLR
-;;; method, so it must not inherit the enclosing body's compile context — the
+;;; method, so it must not inherit the enclosing body's compile context; the
 ;;; same rule the closure boundary follows.
 ;;;
 ;;; Most per-compilation state now travels in the *CSTATE* pack: the closure
 ;;; boundary resets it to the empty pack via the registry, and the function-body
 ;;; paths build theirs from CSTATE-FRESH-FUNCTION-BODY (fresh except the
-;;; tco-self-symbol / tco-local-fn-key handoff the caller passes in — the
+;;; tco-self-symbol / tco-local-fn-key handoff the caller passes in; the
 ;;; self-call fast path reads those on purpose). A new pack slot therefore
 ;;; participates in every reset by construction. The behaviour tests below pin
 ;;; the rule; the registry test at the bottom pins the few remaining
@@ -79,7 +79,7 @@
 ;;; and compile-function-body-direct (cil-forms.lisp) must do with the new
 ;;; variable, then update this list.
 ;;; The registry-mechanism test registers dummy state of its own, so those are
-;;; filtered out here — this list is about the compiler's real state.
+;;; filtered out here: this list is about the compiler's real state.
 (defun fbr-registered-state-names ()
   (let ((s (find-symbol "*CLOSURE-FRESH-STATE*" "DOTCL-INTERNAL")))
     (when (and s (boundp s))

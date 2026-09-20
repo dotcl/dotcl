@@ -1,4 +1,4 @@
-;;; corpus.lisp — a spread of forms compiled BOTH with and without DOTCL_EMIT_PDB
+;;; corpus.lisp: a spread of forms compiled BOTH with and without DOTCL_EMIT_PDB
 ;;; to check the debug codegen path (markers + disabled slot-merge) produces the
 ;;; same results as the normal path. Each function is deterministic (no time /
 ;;; random / hash-table iteration order). (run-corpus) prints one line per case;
@@ -31,7 +31,7 @@
     (list (funcall c) (funcall c) (funcall c))))
 
 ;; A boxed var (mutated + captured) that is ALSO read and written in the
-;; defining frame — exercises the box read (compile-var-ref) and box write
+;; defining frame: exercises the box read (compile-var-ref) and box write
 ;; (compile-setq) paths in the defining frame, not just inside the closure.
 (defun boxed-in-frame ()
   (let ((total 0))
@@ -57,7 +57,7 @@
   (let ((s (format nil "~a ~a" greeting name)))
     (if loud (string-upcase s) s)))
 
-;; labels — local mutual recursion
+;; labels: local mutual recursion
 (defun parity (n)
   (labels ((ev (k) (if (zerop k) t (od (1- k))))
            (od (k) (if (zerop k) nil (ev (1- k)))))

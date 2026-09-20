@@ -8,7 +8,7 @@
 
 (setf dotcl:*save-sil* t)
 
-;; Accumulator loop over a double-float local — the box-free proof. The whole
+;; Accumulator loop over a double-float local: the box-free proof. The whole
 ;; float flow is statement-position (returns a fixnum), so the peephole (P6/P7)
 ;; deletes every DoubleFloat box: no newobj DoubleFloat survives.
 (defun %nfl-acc (n)
@@ -57,7 +57,7 @@
   (let ((acc 0d0))
     (declare (double-float acc))
     (dotimes (i n) (setq acc (+ acc 1d0)))
-    ;; list boxes acc; format consumes it — exercises the generic read path
+    ;; list boxes acc; format consumes it: exercises the generic read path
     (car (list acc))))
 
 (deftest nfl-generic-read

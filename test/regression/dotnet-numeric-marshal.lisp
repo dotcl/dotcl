@@ -39,7 +39,7 @@
   (dotnet:static "System.Numerics.BitOperations" "PopCount" 18446744073709551615)
   64)
 
-(deftest fixed-width-ulong-round-trip     ; …including one .NET just handed back
+(deftest fixed-width-ulong-round-trip     ; ...including one .NET just handed back
   (let ((m (dotnet:static "System.UInt64" "MaxValue")))
     (list (integerp m)
           (dotnet:static "System.Numerics.BitOperations" "PopCount" m)))
@@ -69,8 +69,8 @@
   :type-error)
 
 ;;; A signed target also takes the value written as an unsigned N-bit pattern.
-;;; CL has no way to write a negative bit pattern — (ldb (byte 32 0) x) is the
-;;; idiomatic name for 32 bits and is always non-negative — so rejecting it would
+;;; CL has no way to write a negative bit pattern, (ldb (byte 32 0) x) is the
+;;; idiomatic name for 32 bits and is always non-negative, so rejecting it would
 ;;; make BitConverter-style reinterpretation unreachable.
 
 (deftest fixed-width-signed-int-accepts-unsigned-pattern

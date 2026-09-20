@@ -1,7 +1,7 @@
 ;;; save-application: a bundled image answers ASDF about the systems it contains.
 ;;;
 ;;; Libraries routinely bind their own version at load time from
-;;; (asdf:component-version (asdf:find-system :self)) — dexador and cl-str both
+;;; (asdf:component-version (asdf:find-system :self)): dexador and cl-str both
 ;;; do. A bundle has no .asd files, so on the deployed side that form signalled
 ;;; MISSING-COMPONENT and the whole image refused to load. save-application now
 ;;; emits asdf:register-preloaded-system for every system in the closure, with
@@ -9,7 +9,7 @@
 ;;;
 ;;; Hermetic and in-process: writes a temp .asd + source, builds a core from it,
 ;;; then takes the system back out of ASDF's registry and off the search path
-;;; before loading that core — the deployment situation, without a sub-process.
+;;; before loading that core: the deployment situation, without a sub-process.
 ;;; The test asserts that removal actually worked before drawing any conclusion,
 ;;; so it cannot pass by accident. asdf symbols are reached through
 ;;; read-from-string so loading this file does not require asdf up front.

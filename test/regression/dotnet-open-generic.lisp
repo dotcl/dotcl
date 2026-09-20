@@ -52,7 +52,7 @@
   ("List<Int32>" "List<T>"))
 
 ;;; An open-constructed interface (IList<T> as List<T> declares it) must collapse to
-;;; the generic definition — otherwise a second, nameless class with the same display
+;;; the generic definition: otherwise a second, nameless class with the same display
 ;;; name gets registered and the wildcard specializer would miss it.
 (deftest dnog-open-constructed-collapses-to-definition
   (let ((from-cpl (find "IList<T>" (class-precedence-list (dnog-list-class "System.Int32"))

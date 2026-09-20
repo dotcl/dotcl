@@ -9,15 +9,28 @@
 #   2. consume: a second C# app references that DLL and does
 #               `new MyLib.Calculator().Add(2,3)`. If it COMPILES, the emitted
 #               type is genuinely C#-referenceable (the stage 1 deliverable). We
-#               assert compile, not run — the facade body still dispatches to a
+#               assert compile, not run: the facade body still dispatches to a
 #               Lisp lambda, so running needs the Lisp loaded (stage 2 removes that).
 #   3. corlib:  assert the DLL references the netstandard facade, not
 #               System.Private.CoreLib (the retarget that makes it referenceable).
 #
-# PersistedAssemblyBuilder needs .NET 9+; skips cleanly otherwise.
+# PersistedAssemblyBuilder needs .NET 9+; skips cleanly otherwise (but not under
+# DOTCL_CI=1 -- see skip_or_fail below).
 #
 # Usage: check.sh <repo-root>
 set -eu
+
+# A missing prerequisite is a convenience skip when this is run by hand, but in
+# CI a skip is indistinguishable from a pass: the gate quietly stops gating and
+# nothing in the log says so. DOTCL_CI=1 (set at the job level in
+# .github/workflows/ci.yml) makes it a failure instead.
+skip_or_fail() {
+  echo "$1"
+  if [ "${DOTCL_CI:-}" = "1" ]; then
+    echo "  DOTCL_CI=1: a skipped check counts as a failure here" >&2
+    exit 1
+  fi
+}
 ROOT="${1%/}"
 RT="$ROOT/runtime/DotCL.Runtime.csproj"
 # dotnet (a Windows exe) needs a Windows-style path in the csproj; an MSYS
@@ -72,7 +85,7 @@ EOF
 echo "=== emit facade DLL ==="
 if ! (cd "$WORK/emit" && dotnet run -- "$DLL" 2>"$WORK/emit.log" | grep -q EMIT-OK); then
   if grep -q "PlatformNotSupported\|requires .NET 9" "$WORK/emit.log" 2>/dev/null; then
-    echo "SKIP: PersistedAssemblyBuilder unavailable (needs .NET 9+)"; exit 0
+    skip_or_fail "SKIP: PersistedAssemblyBuilder unavailable (needs .NET 9+)"; exit 0
   fi
   echo "  emit failed:"; tail -5 "$WORK/emit.log"; exit 1
 fi
@@ -122,8 +135,8 @@ else
   note "consumer failed to compile against the emitted DLL"; tail -8 "$WORK/consume.log"
 fi
 
-# --- library (aggregation): MANY types → ONE DLL ----------------------------
-# The stage 1 prototype was "1 define-class → 1 assembly"; a real library needs several
+# --- library (aggregation): MANY types -> ONE DLL ----------------------------
+# The stage 1 prototype was "1 define-class -> 1 assembly"; a real library needs several
 # types in one DLL. BeginLibrary/AddClass/Save is that aggregation unit. Here
 # two classes go into a single MyPack.dll and a SEPARATE C# app references BOTH
 # from that one DLL. The emit harness also asserts the two Types share one
@@ -161,7 +174,7 @@ class Emit2 {
             new DynamicClassBuilder.MethodSpec("Hello", typeof(string),
                 new Type[] { typeof(string) }, body),
         });
-        // A function library: defun → public static. IsStatic:true.
+        // A function library: defun -> public static. IsStatic:true.
         var t3 = lib.AddClass("MyPack.MathOps", methods: new List<DynamicClassBuilder.MethodSpec> {
             new DynamicClassBuilder.MethodSpec("Square", typeof(int),
                 new Type[] { typeof(int) }, body, IsStatic: true),
@@ -177,7 +190,7 @@ EOF
 
 echo "=== emit library DLL (3 types incl. static fn, 1 assembly) ==="
 if ! (cd "$WORK/emit2" && dotnet run -- "$LIB" 2>"$WORK/emit2.log" | grep -q EMIT2-OK); then
-  note "library emit failed (3 types → 1 DLL)"; tail -8 "$WORK/emit2.log"
+  note "library emit failed (3 types -> 1 DLL)"; tail -8 "$WORK/emit2.log"
 fi
 [ -f "$LIB" ] || note "no library DLL produced"
 if grep -aq "System.Private.CoreLib" "$LIB" 2>/dev/null; then
@@ -226,7 +239,7 @@ fi
 # a cross-compiled cil-out.sil.
 SIL="$ROOT/compiler/cil-out.sil"
 if [ ! -f "$SIL" ]; then
-  echo "SKIP-LISP: no cil-out.sil (run 'make cross-compile' first)"
+  skip_or_fail "SKIP-LISP: no cil-out.sil (run 'make cross-compile' first)"
 else
   LLIB="$WORK/MyLisp.dll"
   LLIB_W="$LLIB"; LISPF="$WORK/emit.lisp"; LISPF_W="$LISPF"
@@ -234,7 +247,7 @@ else
     LLIB_W="$(cygpath -m "$LLIB")"; LISPF_W="$(cygpath -m "$LISPF")"
   fi
   cat > "$LISPF" <<EOF
-;; dotnet:%define-class arg 12 = save-to-path → emit a saved facade DLL.
+;; dotnet:%define-class arg 12 = save-to-path -> emit a saved facade DLL.
 ;; args: full-name base fields attrs methods ctor-body props ifaces events
 ;;       ctor-param-types base-ctor-indices ctor-specs save-to-path
 (dotnet:%define-class
@@ -292,7 +305,7 @@ EOF
   # The dotnet:library macro (contrib/dotnet-class) expands to a single
   # dotnet:%save-library call: MANY types (two instance classes + a static
   # function module) into ONE .dll, from real dotcl code. A separate C# app
-  # references all three from that one library — the multi-type/static analogue
+  # references all three from that one library: the multi-type/static analogue
   # of the single-type test above, exercised through the Lisp surface.
   CLIB="$WORK/MyLibPack.dll"
   CLIB_W="$CLIB"; LIBF="$WORK/lib.lisp"; LIBF_W="$LIBF"
@@ -360,7 +373,7 @@ EOF
   # --- Lisp-driven ENUM + CONST: STANDALONE types (no runtime/Lisp needed) ----
   # Enums and const holders are pure metadata, unlike the method facades above.
   # The consumer here references AND RUNS them with NO DotCL.Runtime reference at
-  # all — real, executable .NET metadata rather than facades that dispatch back
+  # all: real, executable .NET metadata rather than facades that dispatch back
   # into Lisp. Also asserts enum auto-increment (Blue == 2) and const values.
   EPACK="$WORK/EnumPack.dll"
   EPACK_W="$EPACK"; ENUMF="$WORK/enum.lisp"; ENUMF_W="$ENUMF"
@@ -372,11 +385,11 @@ EOF
 (dotnet:library ("EnumPack" :version "1.0.0.0" :path "$EPACK_W")
   (:enum "EnumPack.Color" :doc "Primary colors." "Red" "Green" "Blue")
   (:enum "EnumPack.Flags" :underlying Int32 ("A" 1) ("B" 2) ("C" 4) "D")
-  ;; const holder — also standalone metadata (literals inline into the consumer)
+  ;; const holder: also standalone metadata (literals inline into the consumer)
   (:constants "EnumPack.Config"
     ("MaxRetries" Int32 7)
     ("ApiUrl" String "https://example.com"))
-  ;; struct — a standalone value type (public fields, no dispatch)
+  ;; struct: a standalone value type (public fields, no dispatch)
   (:struct "EnumPack.Point" ("X" Int32) ("Y" Int32)))
 (format t "ENUM-EMIT-OK~%")
 EOF
@@ -400,7 +413,7 @@ EOF
   fi
 
   mkdir -p "$WORK/consume5"
-  # NOTE: deliberately NO ProjectReference to DotCL.Runtime — the enum must be
+  # NOTE: deliberately NO ProjectReference to DotCL.Runtime: the enum must be
   # standalone. If this compiles+runs, the enum carries no runtime dependency.
   cat > "$WORK/consume5/consume5.csproj" <<EOF
 <Project Sdk="Microsoft.NET.Sdk">
@@ -444,7 +457,7 @@ EOF
   # --- Lisp-driven EXCEPTION TYPE: STANDALONE (throw/catch, no runtime) --------
   # A class deriving System.Exception whose ctor only forwards its message to
   # base emits no Lisp dispatch, so the type is standalone. The consumer here
-  # THROWS and CATCHES it with NO DotCL.Runtime reference — a CL condition mapped
+  # THROWS and CATCHES it with NO DotCL.Runtime reference: a CL condition mapped
   # to a real .NET exception a C# app uses natively.
   XPACK="$WORK/ExcPack.dll"
   XPACK_W="$XPACK"; XF="$WORK/exc.lisp"; XF_W="$XF"
@@ -466,7 +479,7 @@ EOF
   [ -f "$XPACK" ] || note "no exception-type DLL produced"
 
   mkdir -p "$WORK/consume6"
-  # NO ProjectReference to DotCL.Runtime — the exception must be standalone.
+  # NO ProjectReference to DotCL.Runtime: the exception must be standalone.
   cat > "$WORK/consume6/consume6.csproj" <<EOF
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
@@ -506,8 +519,8 @@ EOF
 
   # --- Lisp-driven INTERFACE: STANDALONE contract a C# class implements --------
   # An interface is pure signature metadata. Here dotcl defines IShape and a C#
-  # class IMPLEMENTS it (class Circle : IShape) and is used through the interface
-  # — all with NO DotCL.Runtime reference. Proves the emitted interface is a real,
+  # class IMPLEMENTS it (class Circle : IShape) and is used through the interface;
+  # all with NO DotCL.Runtime reference. Proves the emitted interface is a real,
   # implementable .NET contract.
   IPACK="$WORK/IfacePack.dll"
   IPACK_W="$IPACK"; IFF="$WORK/iface.lisp"; IFF_W="$IFF"
@@ -520,7 +533,7 @@ EOF
   (:interface "IfacePack.IShape"
     ("Area" () :returns Double)
     ("Scale" ((factor Double)) :returns Void))
-  ;; delegate — a standalone callback type (runtime-provided machinery)
+  ;; delegate: a standalone callback type (runtime-provided machinery)
   (:delegate "IfacePack.BinaryOp" ((a Int32) (b Int32)) :returns Int32))
 (format t "IFACE-EMIT-OK~%")
 EOF
@@ -532,7 +545,7 @@ EOF
   [ -f "$IPACK" ] || note "no interface DLL produced"
 
   mkdir -p "$WORK/consume7"
-  # NO ProjectReference to DotCL.Runtime — a C# class implements the interface.
+  # NO ProjectReference to DotCL.Runtime: a C# class implements the interface.
   cat > "$WORK/consume7/consume7.csproj" <<EOF
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>

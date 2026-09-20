@@ -4,7 +4,7 @@
 ;;; another variable that merely shares the name.
 ;;;
 ;;; They were keyed by name. Because the fact is about the slot, a same-named
-;;; inner binding could not be handled by dropping the entry — dropping
+;;; inner binding could not be handled by dropping the entry: dropping
 ;;; un-declared a slot that was still live and still native, and the next read of
 ;;; it emitted a boxed load against a raw Int64/Double slot. Symptom:
 ;;; NullReferenceException, or AccessViolationException when the mismatch reached
@@ -12,7 +12,7 @@
 ;;;
 ;;; The mirror image came from *small-int-locals*: an inner (let ((f 3))) proved
 ;;; the range of ITS f, and an outer f holding a native double inherited it by
-;;; name — native fixnum multiply against an r8 slot.
+;;; name: native fixnum multiply against an r8 slot.
 
 (defpackage :nss-a (:use))
 (defpackage :nss-b (:use))
@@ -65,7 +65,7 @@
       (* n 2)))
   5.0d0)
 
-;;; let* sequential bindings — the second binding shadows by name only.
+;;; let* sequential bindings: the second binding shadows by name only.
 (deftest native-slot-let*
   (let ((nss-a::k 2))
     (declare (fixnum nss-a::k))
@@ -74,7 +74,7 @@
       (list (+ nss-a::k 1) r)))
   (3 3.0d0))
 
-;;; Native r4 slot — the single-float table is the third of the same shape.
+;;; Native r4 slot: the single-float table is the third of the same shape.
 (deftest native-slot-single-outer
   (let ((nss-a::s 1.5))
     (declare (single-float nss-a::s))
@@ -82,7 +82,7 @@
       (list (+ nss-a::s 0.5) (+ nss-b::s 4))))
   (2.0 7))
 
-;;; The outer slot is still native after the shadowing scope closes — the fix is
+;;; The outer slot is still native after the shadowing scope closes; the fix is
 ;;; "the inner binding never reached the entry", not "the entry was restored".
 (deftest native-slot-restore-after-shadow
   (let ((n 3))
@@ -93,7 +93,7 @@
 
 ;;; A local function's parameter shadowing an enclosing native slot. The params
 ;;; of a labels group are plain shared LispObject slots, and that body no longer
-;;; filters the native tables by name — it relies on the params' fresh keys.
+;;; filters the native tables by name: it relies on the params' fresh keys.
 (deftest native-slot-labels-param-shadow
   (let ((n 5))
     (declare (fixnum n))

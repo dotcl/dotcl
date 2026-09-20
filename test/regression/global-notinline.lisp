@@ -1,16 +1,16 @@
-;;; Regression: CLHS 3.2.2.1.1 — a NOTINLINE declaration of a function name
+;;; Regression: CLHS 3.2.2.1.1: a NOTINLINE declaration of a function name
 ;;; suppresses its compiler macro for calls in the declaration's scope. A
 ;;; PROCLAIM (or the DECLAIM that expands to one) puts the declaration in scope
 ;;; everywhere, so it has to suppress too.
 ;;;
 ;;; Only the lexical (declare (notinline f)) was honored. DECLAIM dropped every
-;;; spec it did not itself understand — it handled SPECIAL and FTYPE and threw
-;;; the rest away — and PROCLAIM only ever looked at SPECIAL, so a global
+;;; spec it did not itself understand, it handled SPECIAL and FTYPE and threw
+;;; the rest away, and PROCLAIM only ever looked at SPECIAL, so a global
 ;;; NOTINLINE was silently ignored and the compiler macro kept firing. The
 ;;; symptom is quietly different code, not an error.
 ;;;
 ;;; Compiler macros only fire while compiling, so every test that asserts one
-;;; fired — or that a declaration stopped it firing — is compiled-only. Without a
+;;; fired, or that a declaration stopped it firing, is compiled-only. Without a
 ;;; compiler they all answer :FUNCTION, which makes half of them pass vacuously.
 
 (defun gni-f (x) (list :function x))

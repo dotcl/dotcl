@@ -1,4 +1,4 @@
-;;; dotnet:define-class — user-facing macro wrapping DOTNET:%DEFINE-CLASS.
+;;; dotnet:define-class: user-facing macro wrapping DOTNET:%DEFINE-CLASS.
 ;;;
 ;;; Loaded via `(require :dotnet-class)` (module-provide-contrib finds
 ;;; contrib/dotnet-class/dotnet-class.lisp) or explicit (load ...).
@@ -10,7 +10,7 @@
 ;;;       ("FieldName" Int32)
 ;;;       ("OtherField" "System.String"))
 ;;;     (:attributes
-;;;       ("System.ObsoleteAttribute" "message"))
+;;;       ("System.ObsoleteAttribute" "message" :diagnostic-id "X1"))
 ;;;     (:ctor ()
 ;;;       ;; runs after base.ctor; `self' is bound to the new instance
 ;;;       body-forms...)
@@ -25,6 +25,14 @@
 ;;; After `:returns TYPE' a method spec may carry `:override t` to emit the
 ;;; method as an override of a matching virtual method on the base class
 ;;; hierarchy.
+;;;
+;;; An attribute spec is (type-name constructor-arg... :member value...).
+;;; Arguments before the first keyword are the attribute constructor's; from the
+;;; first keyword on, each pair sets a settable property or a public field, which
+;;; is how most .NET attributes are configured. A member name matches
+;;; case-insensitively with dashes removed, so :main-launcher, :mainlauncher and
+;;; "MainLauncher" all reach MainLauncher. The same shape works in a method
+;;; spec's :attributes option.
 ;;;
 ;;; (:implements IFoo IBar ...) declares interface implementations. Any method
 ;;; in (:methods ...) whose name+signature matches an interface method is
@@ -43,7 +51,7 @@
 ;;; declared via (:events ...).
 ;;;
 ;;; Type names are either strings (used verbatim) or symbols (looked up in
-;;; DOTNET::*TYPE-ALIASES* — a hash-table keyed by symbol-name, containing
+;;; DOTNET::*TYPE-ALIASES*: a hash-table keyed by symbol-name, containing
 ;;; common BCL short-names). Unknown symbols signal a compile-time error;
 ;;; users extend the table to add MAUI / ASP.NET / user types.
 ;;;
@@ -115,7 +123,7 @@
     ((symbolp spec)
      (or (gethash (symbol-name spec) dotnet::*type-aliases*)
          ;; Dynamically-defined classes registered in CLOS by a previous
-         ;; dotnet:define-class — pass the symbol-name through for C# resolution.
+         ;; dotnet:define-class: pass the symbol-name through for C# resolution.
          (and (find-class spec nil) (symbol-name spec))
          (error "dotnet:define-class: unknown type short-name ~S.~%  ~
                  Register via (setf (gethash ~S dotnet::*type-aliases*) \"Namespace.Full.Name\") ~
@@ -133,7 +141,7 @@
    returns, with no Lisp dispatch. Such a ctor needs no runtime, so a type whose
    only members are base-forwarding ctors (e.g. a CL condition mapped to a .NET
    exception: (:class \"MyError\" (\"System.Exception\") (:ctor ((m String)) (:base m))))
-   is STANDALONE — a C# consumer can throw/catch it with no DotCL.Runtime."
+   is STANDALONE; a C# consumer can throw/catch it with no DotCL.Runtime."
   (let* ((ctor-params (first ctor-form))
          (ctor-body-raw (rest ctor-form))
          ;; Extract optional (:base ...) leading form
@@ -148,7 +156,7 @@
                                    ctor-params))
          (base-arg-indices (mapcar (lambda (n)
                                      (or (position n ctor-param-names :test #'eq)
-                                         (error "dotnet:define-class: (:base ~S) — ~S is not a ctor param" n n)))
+                                         (error "dotnet:define-class: (:base ~S); ~S is not a ctor param" n n)))
                                    base-arg-names))
          ;; SELF must be interned in the CALLER's package -- the package the
          ;; method body's bare `self' is read in -- not this file's compile-time
@@ -178,7 +186,7 @@
   "Return a form producing one method-spec list for dotnet:%define-class /
    dotnet:%save-library. M is (name params &rest tail); tail begins with
    :returns TYPE then optional :override / :attributes / :static options, then
-   the body forms. A static method (via :static t or FORCE-STATIC — the latter
+   the body forms. A static method (via :static t or FORCE-STATIC; the latter
    used by a library :module's :functions) is emitted with NO self parameter and
    sets the 7th static-flag element, so it becomes a `public static' member."
   (destructuring-bind (name params &rest tail) m
@@ -207,7 +215,7 @@
         `(list ,name ,(dotnet::%resolve-type return-type)
                (list ,@param-types)
                ,(if static
-                    ;; static → no self (DispatchLispStatic funcalls with just
+                    ;; static -> no self (DispatchLispStatic funcalls with just
                     ;; the declared params).
                     `(lambda (,@param-names) ,@body)
                     `(lambda (,self-sym ,@param-names)
@@ -284,7 +292,7 @@
          'nil)
      'nil   ; arg 9: ctor-param-types (unused; ctors go via arg 11)
      'nil   ; arg 10: base-ctor-arg-indices (unused; ctors go via arg 11)
-     ;; arg 11: ctor-specs-list — one entry per :ctor form
+     ;; arg 11: ctor-specs-list: one entry per :ctor form
      (if ctor-forms
          `(list ,@(mapcar #'dotnet::%process-ctor-form ctor-forms))
          'nil))))
@@ -292,7 +300,7 @@
 (defmacro dotnet:define-class (full-name supers &body options)
   `(dotnet:%define-class ,@(dotnet::%class-spec-args full-name supers options)))
 
-;;; dotnet:library — aggregate several types into ONE C#-referenceable .dll.
+;;; dotnet:library: aggregate several types into ONE C#-referenceable .dll.
 ;;;
 ;;;   (dotnet:library ("MyPack" :version "1.2.3.0" :path "out/MyPack.dll")
 ;;;     (:class "MyPack.Calculator" ()
@@ -307,23 +315,23 @@
 ;;; simple name a C# consumer references; PATH defaults to "<assembly-name>.dll".
 ;;; Each member-form is one of the following. It expands to a tagged member-spec
 ;;; (KIND . rest) in dotnet:%save-library's single member-spec-list:
-;;;   (:class full-name (supers) options...) — same option syntax as
+;;;   (:class full-name (supers) options...): same option syntax as
 ;;;      define-class; a facade type (methods dispatch to Lisp).
-;;;   (:module full-name options...) — base-less class whose :functions are
+;;;   (:module full-name options...): base-less class whose :functions are
 ;;;      `public static' members. A :methods entry may also carry :static t.
-;;;   (:enum full-name [:underlying Type] member...) — a public enum. Each
+;;;   (:enum full-name [:underlying Type] member...): a public enum. Each
 ;;;      member is "Name" (auto-incremented from 0, or one past the previous
 ;;;      explicit value) or ("Name" value). Enums are pure metadata: the
 ;;;      emitted type is STANDALONE (no DotCL.Runtime, no Lisp at runtime).
-;;;   (:constants full-name ("Name" Type value)...) — a static holder of public
+;;;   (:constants full-name ("Name" Type value)...): a static holder of public
 ;;;      const fields. Also standalone (const literals inline into the consumer).
 ;;;      Type must be a literal-capable primitive/string/enum.
-;;;   (:struct full-name ("Field" Type)...) — a public value type (struct) with
+;;;   (:struct full-name ("Field" Type)...): a public value type (struct) with
 ;;;      public fields. Standalone (a fields-only struct is pure data).
-;;;   (:interface full-name ("Method" ((param Type)...) :returns Type)...) — a
+;;;   (:interface full-name ("Method" ((param Type)...) :returns Type)...); a
 ;;;      public interface of abstract method signatures. Standalone (pure
 ;;;      signature metadata a C# consumer references and implements).
-;;;   (:delegate full-name ((param Type)...) :returns Type) — a public delegate
+;;;   (:delegate full-name ((param Type)...) :returns Type): a public delegate
 ;;;      (callback) type. Standalone (runtime-provided delegate machinery).
 ;;;
 ;;; Any member may carry a type-level doc summary: a (:doc "...") option for
@@ -456,8 +464,8 @@
 ;;; ---------------------------------------------------------------------------
 ;;; dotnet:ref: indexer sugar (get_Item / set_Item)
 ;;;
-;;; (dotnet:ref obj key)           → (dotnet:invoke obj "get_Item" key)
-;;; (setf (dotnet:ref obj key) val)→ (dotnet:invoke obj "set_Item" key val)
+;;; (dotnet:ref obj key)           -> (dotnet:invoke obj "get_Item" key)
+;;; (setf (dotnet:ref obj key) val)-> (dotnet:invoke obj "set_Item" key val)
 ;;;
 ;;; Works with any .NET type that exposes an indexer (List<T>, Dictionary<K,V>,
 ;;; arrays via reflection, etc.).
@@ -476,7 +484,7 @@
 ;;; (dotnet:using ((var init-expr) ...) body...)
 ;;;
 ;;; Binds each VAR to INIT-EXPR in sequence and guarantees (dotnet:invoke var
-;;; "Dispose") is called on exit — even if BODY signals an error.  Resources
+;;; "Dispose") is called on exit: even if BODY signals an error.  Resources
 ;;; are disposed in innermost-first order, matching C# `using` semantics.
 
 (export 'dotnet::using (find-package :dotnet))

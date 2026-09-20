@@ -60,7 +60,7 @@ class Program
         return -1;
     }
 
-    // True when the REPL is active — CancelKeyPress delivers interrupt instead of killing process.
+    // True when the REPL is active: CancelKeyPress delivers interrupt instead of killing process.
     // volatile: read from the SIGINT signal handler, which runs on another thread.
     static volatile bool _replMode = false;
 
@@ -116,17 +116,17 @@ class Program
                 args2.Cancel = true;          // don't kill the process
                 ConditionSystem.RequestInterrupt();
             }
-            // else: default behavior — process exits with SIGINT
+            // else: default behavior: process exits with SIGINT
         };
 
         // On Unix, Console.CancelKeyPress never fires: the REPL reads raw fd 0 and
         // deliberately avoids .NET's Unix console driver (which is where CancelKeyPress
         // is wired), so Ctrl-C would otherwise terminate the process outright. Deliver
-        // the interrupt through a PosixSignalRegistration for SIGINT instead — the same
+        // the interrupt through a PosixSignalRegistration for SIGINT instead; the same
         // driver-independent mechanism used for SIGTERM/SIGHUP/SIGQUIT below. Windows
         // keeps using CancelKeyPress above; this path is Unix-only to avoid double
         // handling. In non-REPL (script) mode, leave Cancel=false so the default action
-        // still terminates the process — unchanged from before.
+        // still terminates the process: unchanged from before.
         if (!OperatingSystem.IsWindows())
         {
             try
@@ -138,12 +138,12 @@ class Program
                         {
                             if (_replMode)
                             {
-                                ctx.Cancel = true;   // don't terminate — interrupt instead
+                                ctx.Cancel = true;   // don't terminate; interrupt instead
                                 ConditionSystem.RequestInterrupt();
                             }
                         }));
             }
-            catch { /* SIGINT not registerable here — best-effort */ }
+            catch { /* SIGINT not registerable here; best-effort */ }
         }
 
         // Restore the terminal on exit (Unix). .NET's Console driver switches
@@ -152,7 +152,7 @@ class Program
         // not reliably emit the matching reset (rmkx: ESC[?1l ESC>) when the
         // process exits via Environment.Exit / EOF / signal. The terminal is
         // then left in application mode, so arrow keys send ESC O A instead of
-        // ESC [ A — this conflicts with rlwrap's readline (garbled / "16R"
+        // ESC [ A: this conflicts with rlwrap's readline (garbled / "16R"
         // cursor-report fragments) and requires `stty sane` after a crash.
         // We emit the reset ourselves on ProcessExit. Best-effort, TTY only,
         // opt-out via DOTCL_NO_TTY_RESTORE=1.
@@ -162,7 +162,7 @@ class Program
             AppDomain.CurrentDomain.ProcessExit += (_, _) => RestoreTerminal();
 
             // ProcessExit does NOT fire when the process is killed by a signal
-            // (SIGTERM from `kill`, SIGHUP on terminal close, SIGQUIT) — the
+            // (SIGTERM from `kill`, SIGHUP on terminal close, SIGQUIT): the
             // terminal is then left in application mode and needs `stty sane`
             // (public dotcl/dotcl#37 symptom 2, signal path). Trap the catchable
             // termination signals, restore the terminal, then let the default
@@ -181,12 +181,12 @@ class Program
                         System.Runtime.InteropServices.PosixSignalRegistration.Create(
                             sig, _ => RestoreTerminal()));
                 }
-                catch { /* signal not supported on this platform — best-effort */ }
+                catch { /* signal not supported on this platform; best-effort */ }
             }
         }
 
         // --help / --version: handled before core loading for fast response.
-        // Skipped when a user FASL is present — then this executable IS an
+        // Skipped when a user FASL is present: then this executable IS an
         // application and every argument belongs to it (see HasUserFasl).
         bool hasUserFasl = HasUserFasl();
 
@@ -320,7 +320,7 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
         //
         // Accepted anywhere in the command line, not only first. It used to be
         // recognized at args[0] alone, so putting any other flag ahead of it fell
-        // through to the ordinary path — where --asm is not a known flag, so the
+        // through to the ordinary path: where --asm is not a known flag, so the
         // .sil that followed it was LOADed as source and died with "package
         // COMMON-LISP is locked; cannot redefine EQ", a message that says nothing
         // about argument order.
@@ -403,7 +403,7 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
             i++;
         }
 
-        // `build` subcommand — the user-facing entry point for ASDF project
+        // `build` subcommand: the user-facing entry point for ASDF project
         // builds. Invoked by the MSBuild integration (runtime/build/Dotcl.targets).
         // Two modes off the same positional <asd>:
         //   dotcl build <asd> --output <fasl>
@@ -445,7 +445,7 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
             }
         }
 
-        // `pack` subcommand — package an ASDF system as a dotnet-tool nupkg
+        // `pack` subcommand: package an ASDF system as a dotnet-tool nupkg
         //   dotcl pack --system <name> --id <pkgid> --command <cmd>
         //              --version <ver> -o <dir> --from <dotcl-nupkg-dir>
         //              [--dotcl-version <ver>] [--toplevel <fn>]
@@ -533,14 +533,31 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
 
         // Collect ordered --load/--eval actions. The FIRST bare (non-flag) token
         // is the positional script file; once seen, parsing stops and every
-        // remaining token (flag or not) becomes the script's argv — the Unix
+        // remaining token (flag or not) becomes the script's argv: the Unix
         // convention that args after the script belong to the program, not to
         // dotcl. This also stops data args (e.g. an image path) from being
         // mis-loaded as Lisp source.
+        //
+        // Skipped entirely under `build` and `pack`: those subcommands have
+        // already parsed the whole of REST in their own loops above, and their
+        // options are not dotcl's. `build` used to survive this loop by
+        // accident -- it leaves its own "build" token in REST, so the bare-token
+        // rule below stopped the scan at once -- while `pack` removes its token
+        // and so handed its first option straight to the unknown-option exit.
+        // Neither subcommand ever reaches the script path (both dispatch and
+        // return before SCRIPTMODE is read), so nothing this loop computes is
+        // wanted on those two paths.
+        //
+        // Skipped for a packed application as well. Its argv belongs to the
+        // program, not to dotcl: TryRunEmbeddedUserFasl below returns before
+        // anything this loop computes is read, so the only effect the loop could
+        // have there is to reject the application's own options -- a tool packed
+        // with `dotcl pack` or save-application could not be given a `--format`
+        // or a `--help` of its own.
         var actions = new List<(string kind, string value)>();
         string? positionalScript = null;
         List<string> positionalArgv = new();
-        for (int i = 0; i < rest.Count; i++)
+        for (int i = 0; !hasUserFasl && !buildMode && !packMode && i < rest.Count; i++)
         {
             if (rest[i] == "--load" || rest[i] == "--eval")
             {
@@ -568,9 +585,9 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
                 // (`--evla '(princ 1)'`) into a run that did nothing. Arguments
                 // meant for a script are not affected -- the loop stops at the
                 // script name above, and everything after it is the script's.
-                // The build/pack subcommands parse their own options in their own
-                // loops and never reach this one, so the MSBuild integration is
-                // out of scope here.
+                // Subcommand options are not affected either: the loop header
+                // declines to run at all under build/pack, so the MSBuild
+                // integration is out of scope here.
                 Console.Error.WriteLine($"dotcl: unknown option '{rest[i]}'");
                 Console.Error.WriteLine("  dotcl --help for usage");
                 Environment.Exit(2);
@@ -607,7 +624,7 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
         // then exit. Produced via `dotnet publish /p:DotclUserFasl=...` which
         // bundles the user's compiled .fasl as a manifest resource named
         // "dotcl.user.fasl" (see runtime.csproj). Skipped for normal
-        // runs — the resource is only present in save-application-built exes.
+        // runs: the resource is only present in save-application-built exes.
         if (TryRunEmbeddedUserFasl())
             return;
 
@@ -771,8 +788,8 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
                 Environment.Exit(1);
             }
             // Same treatment as the script-file path below: report and exit 1.
-            // Without this an error with no source location — a --load naming a
-            // file that is not there is the everyday one — left Main as an
+            // Without this an error with no source location, a --load naming a
+            // file that is not there is the everyday one, left Main as an
             // unhandled exception, printing a .NET stack trace and exiting 127
             // where the identical mistake in a positional script exits 1 with a
             // one-line message.
@@ -807,7 +824,7 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
             // Default: on for an interactive console, off when stdin is piped /
             // redirected (the custom reader uses Console.ReadKey, which has no
             // meaning for non-interactive input). A user init file may already
-            // have enabled it — don't clobber that.
+            // have enabled it: don't clobber that.
             bool enableReadline = readlinePref ?? !Console.IsInputRedirected;
             if (enableReadline && Startup.ReadlineHook == null)
                 TryEnableReadline();
@@ -883,8 +900,8 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
         // be recognised on load. Only the path is kept here; hashing it is
         // deferred to the first fasl save/check so startup pays nothing.
         Startup.CorePath = filePath;
-        // Detect PE signature ("MZ") at byte 0 — PersistedAssemblyBuilder output.
-        // Any other bytes → treat as SIL text and fall through to Reader.
+        // Detect PE signature ("MZ") at byte 0: PersistedAssemblyBuilder output.
+        // Any other bytes -> treat as SIL text and fall through to Reader.
         byte[] header = new byte[2];
         using (var fs = File.OpenRead(filePath))
         {
@@ -931,7 +948,7 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
     /// </summary>
     static void RunResolveDeps(string asdPath, string? manifestOut, string? rootSourcesOut, string? targetRid = null, string[]? buildInit = null, string[]? searchPaths = null)
     {
-        try { DotclHost.ResolveDeps(asdPath, manifestOut, rootSourcesOut, targetRid, buildInit, searchPaths); }
+        try { DotclBuild.ResolveDeps(asdPath, manifestOut, rootSourcesOut, targetRid, buildInit, searchPaths); }
         catch (System.IO.FileNotFoundException ex)
         {
             Console.Error.WriteLine(ex.Message);
@@ -945,7 +962,7 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
     /// order using <c>asdf::concatenate-files</c>, then <c>compile-file</c>s
     /// the result into <paramref name="outputPath"/>.
     ///
-    /// Only the root system is compiled — :depends-on'd contribs stay as
+    /// Only the root system is compiled: :depends-on'd contribs stay as
     /// pre-built fasls (resolved via --resolve-deps and bundled separately).
     /// MSBuild owns the incremental decision via Inputs/Outputs on the
     /// component source files.
@@ -1026,7 +1043,7 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
 
     static void RunCompileProject(string asdPath, string outputPath, string[]? buildInit = null, string[]? searchPaths = null, bool debugInfo = false)
     {
-        try { DotclHost.CompileProject(asdPath, outputPath, buildInit, searchPaths, debugInfo); }
+        try { DotclBuild.CompileProject(asdPath, outputPath, buildInit, searchPaths, debugInfo); }
         catch (System.IO.FileNotFoundException ex)
         {
             Console.Error.WriteLine(ex.Message);
@@ -1085,7 +1102,7 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
         }
 
         // Fail fast, before building the fasl, if the --from payload predates the
-        // loose-fasl loader — a tool restamped from it would silently run a REPL.
+        // loose-fasl loader: a tool restamped from it would silently run a REPL.
         try { PackRestamp.EnsureLoaderCapablePayload(o.DotclVersion ?? PackRestamp.InferDotclVersion(o.From!)); }
         catch (Exception ex) { Console.Error.WriteLine($"pack: {ex.Message}"); return 1; }
 
@@ -1124,9 +1141,9 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
         // rather than inherited from dotcl (see PackRestamp.Meta).
         var asdSearch = Runtime.UserAsdSearchPaths.Count > 0
             ? Runtime.UserAsdSearchPaths.ToArray() : null;
-        var asd = DotclHost.ReadSystemMeta(o.System!, asdSearch);
+        var asd = DotclBuild.ReadSystemMeta(o.System!, asdSearch);
 
-        // A README sitting next to the .asd is the package README by default —
+        // A README sitting next to the .asd is the package README by default;
         // the same convention every other packaging tool uses.
         string? readmePath = o.Readme;
         if (readmePath == null && asd?.AsdDirectory != null)
@@ -1182,7 +1199,7 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
         try
         {
             Console.Error.WriteLine($"[pack] system '{o.System}' -> {faslPath}");
-            DotclHost.PackFasl(o.System!, faslPath, o.Toplevel, null, searchPaths);
+            DotclBuild.PackFasl(o.System!, faslPath, o.Toplevel, null, searchPaths);
         }
         catch (LispSourceException lse)
         {
@@ -1239,9 +1256,9 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
     /// <summary>
     /// Run a user FASL if one is present, then signal the caller to exit. Two
     /// sources, in order:
-    ///   1. An embedded "dotcl.user.fasl" manifest resource — exes produced by
+    ///   1. An embedded "dotcl.user.fasl" manifest resource: exes produced by
     ///      dotcl:save-application with :executable t.
-    ///   2. A loose "dotcl.user.fasl" file next to the executable — the
+    ///   2. A loose "dotcl.user.fasl" file next to the executable: the
     ///      `dotcl pack` restamp path drops the fasl into the tool package's
     ///      tools/net10.0/&lt;rid&gt;/ dir (alongside runtime.exe) rather than
     ///      embedding it in the assembly, since a published nupkg is restamped,
@@ -1257,8 +1274,8 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
     /// the dotcl CLI, so every argument belongs to the app: dotcl's own flags
     /// (--help / --version / --completion / --asm) and subcommands (build /
     /// pack / repl) must all stand down. Otherwise an app that legitimately
-    /// defines those names — roswell has its own `ros build` and `ros --version`
-    /// — would have them silently answered by dotcl instead.
+    /// defines those names: roswell has its own `ros build` and `ros --version`;
+    /// would have them silently answered by dotcl instead.
     ///
     /// Must agree with TryRunEmbeddedUserFasl about what counts as present: if
     /// this says no and that says yes, dotcl eats the app's arguments.
@@ -1291,18 +1308,41 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
         var loosePath = System.IO.Path.Combine(AppContext.BaseDirectory, "dotcl.user.fasl");
         if (System.IO.File.Exists(loosePath))
         {
-            RunUserFaslBytes(System.IO.File.ReadAllBytes(loosePath), loosePath);
+            // Prefer the ahead-of-time sibling, exactly as LOAD does. An assembly
+            // read into a byte array is not file-backed, so .NET ignores whatever
+            // ReadyToRun code it holds -- which meant a packed application's own
+            // code was JITted at every start no matter how the image was built,
+            // while the runtime and core underneath it were native. That is the
+            // case where it costs most: the application is the whole program and
+            // it starts once per invocation.
+            var r2r = Runtime.FindR2rSibling(System.IO.Path.GetFullPath(loosePath));
+            // Counted like any other fasl, so (dotcl:r2r-stats) answers for the
+            // application too -- it is the one fasl a packed tool cares about.
+            Runtime.FaslsLoaded++;
+            if (r2r != null)
+            {
+                Runtime.R2rFaslsLoaded++;
+                RunUserFaslAssembly(System.Reflection.Assembly.LoadFrom(r2r), r2r);
+            }
+            else
+            {
+                RunUserFaslBytes(System.IO.File.ReadAllBytes(loosePath), loosePath);
+            }
             return true;
         }
         return false;
     }
 
-    /// <summary>Load a user FASL (PE assembly bytes) and invoke its
-    /// CompiledModule.ModuleInit, preserving *package* across the run.
-    /// <paramref name="what"/> names the source for diagnostics.</summary>
+    /// <summary>Load a user FASL from PE assembly bytes and run it. The embedded
+    /// case has no file to load from, so it cannot use a ReadyToRun sibling.</summary>
     static void RunUserFaslBytes(byte[] bytes, string what)
+        => RunUserFaslAssembly(System.Reflection.Assembly.Load(bytes), what);
+
+    /// <summary>Invoke a user FASL's CompiledModule.ModuleInit, preserving
+    /// *package* across the run. <paramref name="what"/> names the source for
+    /// diagnostics.</summary>
+    static void RunUserFaslAssembly(System.Reflection.Assembly userAsm, string what)
     {
-        var userAsm = System.Reflection.Assembly.Load(bytes);
         var t = userAsm.GetType("CompiledModule")
             ?? throw new InvalidOperationException($"{what}: CompiledModule type not found");
         var mi = t.GetMethod("ModuleInit",
@@ -1371,9 +1411,11 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
     static void RunRepl()
     {
         _replMode = true;
+        // From here on there is a human at the prompt, so the debugger may ask.
+        Debugger.InteractiveRepl = true;
         // Read input through OpenReplStdin (raw fd 0 on a Unix TTY) rather than
         // Console.In / Console.ReadLine, which would route through .NET's Unix
-        // console driver and switch the tty into raw mode — breaking rlwrap and
+        // console driver and switch the tty into raw mode: breaking rlwrap and
         // leaking arrow-key escapes. Only do this for the default read path; a
         // raw readline hook (dotcl-repl) does its own ReadKey-based editing.
         var stdin = Startup.ReadlineHook == null ? OpenReplStdin() : Console.In;
@@ -1445,7 +1487,7 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
 
             // Try to read all forms from the accumulated buffer. Reader signals
             // "more input needed" as a LispError of condition type END-OF-FILE
-            // (mid-list, mid-string, after a quote — see
+            // (mid-list, mid-string, after a quote: see
             // Reader.MakeEndOfFileError), which means "keep the buffer and
             // re-prompt with the continuation indent". Anything else is a real
             // syntax error: print and drop the buffer.
@@ -1544,7 +1586,7 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
         if (System.Threading.Interlocked.Exchange(ref _terminalRestored, 1) != 0) return;
         try
         {
-            // fd 1 = stdout — the same fd .NET wrote the smkx (ESC[?1h ESC=) to.
+            // fd 1 = stdout: the same fd .NET wrote the smkx (ESC[?1h ESC=) to.
             // Only act when it is a real terminal, so redirected output stays clean.
             if (isatty(1) != 1) return;
             // ESC[?1l = normal cursor keys, ESC> = numeric keypad.

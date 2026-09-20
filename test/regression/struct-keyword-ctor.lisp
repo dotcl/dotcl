@@ -69,7 +69,7 @@
     (error () :error))
   :error)
 
-;;; :include — the inherited slots are part of the same slot order.
+;;; :include: the inherited slots are part of the same slot order.
 (defstruct (skc-child (:include skc)) c)
 (deftest struct-kw-ctor-include
   (let ((s (make-skc-child :a 1 :c 3)))
@@ -124,7 +124,7 @@
 
 ;;; Each instance owns its slot storage. The values handed to the constructor
 ;;; become that storage rather than being copied into it, so two instances built
-;;; from equal arguments must still be independent — through the rewritten call
+;;; from equal arguments must still be independent: through the rewritten call
 ;;; site and through the constructor itself.
 (deftest struct-slot-storage-not-shared
   (let ((a (make-skc :a 1 :b 2))

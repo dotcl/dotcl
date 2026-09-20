@@ -10,7 +10,7 @@
 ;;; flag first.
 
 ;; A pending interrupt stops a call-free loop. If the poll is broken this
-;; hangs the suite rather than passing silently — that is the point.
+;; hangs the suite rather than passing silently: that is the point.
 (deftest interrupt-poll.bare-loop-stops
   (handler-case
       (progn (dotnet:static "DotCL.ConditionSystem" "RequestInterrupt")
@@ -51,7 +51,7 @@
   t)
 
 ;; Tier 2: INTERRUPT-THREAD reaches a thread that is COMPUTING (spinning in a
-;; call-free loop), not waiting — the queued function runs at the safepoint
+;; call-free loop), not waiting: the queued function runs at the safepoint
 ;; and its throw unwinds the worker out of the loop.
 (deftest interrupt-poll.interrupt-thread-computing
   (let ((th (dotcl:make-thread

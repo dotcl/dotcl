@@ -1,7 +1,7 @@
 ;;; dotnet:invoke accepts a Lisp scalar as the receiver.
 ;;;
 ;;; .NET calls hand strings, characters and numbers back to Lisp unwrapped, so the
-;;; obvious follow-up call — (dotnet:invoke (dotnet:invoke x "get_Name") "ToUpper") —
+;;; obvious follow-up call, (dotnet:invoke (dotnet:invoke x "get_Name") "ToUpper"),
 ;;; used to fail with "first argument must be a .NET object". Inside a callback it
 ;;; was worse: the error was contained at the boundary and the result came back NIL.
 ;;;

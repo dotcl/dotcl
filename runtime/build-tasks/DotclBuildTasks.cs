@@ -44,8 +44,8 @@ internal static class DotclBoot
             // MSBuildLoadContext. The compiler loads FASLs (the base core and the
             // compiled outputs) via Assembly.LoadFrom, which always resolves into
             // the Default ALC; those FASLs reference DotCL.Runtime, so the runtime
-            // must live in Default for them — and for the task's own DotclHost
-            // calls — to bind to the *same* instance. (A non-default ALC falls
+            // must live in Default for them, and for the task's own DotclHost
+            // calls, to bind to the *same* instance. (A non-default ALC falls
             // back to Default when its own Load returns null, so the task resolves
             // there too.) Binding is by simple name, so a version skew between a
             // FASL's recorded reference and the loaded runtime is tolerated.
@@ -70,7 +70,7 @@ internal static class DotclBoot
     /// <summary>
     /// Initialize the runtime, point contrib discovery at the packaged contrib
     /// tree, and load the base core once. Idempotent across task invocations in
-    /// the same MSBuild process. Touches DotCL.* — only call after InstallResolver.
+    /// the same MSBuild process. Touches DotCL.*: only call after InstallResolver.
     /// </summary>
     public static void Boot(string baseCore, string? contribDir,
                             IEnumerable<string>? referenceDirs = null)
@@ -97,7 +97,7 @@ internal static class DotclBoot
             if (!_coreLoaded)
             {
                 DotclHost.LoadCore(baseCore);
-                // No console here — surface Lisp errors as exceptions (→ MSBuild
+                // No console here: surface Lisp errors as exceptions (-> MSBuild
                 // errors) rather than stalling in the interactive debugger.
                 DotclHost.SetThrowingDebuggerHook();
                 _coreLoaded = true;
@@ -110,7 +110,7 @@ internal static class DotclBoot
     /// The recursive-descent compiler can recurse deeply on large/deep Lisp
     /// sources; the MSBuild worker thread's default (~1 MB) stack overflows
     /// intermittently there. The CLI avoids this by running on a 256 MB
-    /// stack thread — mirror that here. Exceptions propagate to the caller with
+    /// stack thread: mirror that here. Exceptions propagate to the caller with
     /// their original stack trace.
     /// </summary>
     /// <summary>Distinct directories holding the given reference assembly files
@@ -187,10 +187,10 @@ public sealed class DotclResolveDeps : Task
     public string? RuntimeAssemblyPath { get; set; }
     /// <summary>@(DotclBuildInit): Lisp scripts loaded before dependency
     /// resolution so the project can make external systems discoverable
-    /// (e.g. (pushnew … asdf:*central-registry*) / boot quicklisp).</summary>
+    /// (e.g. (pushnew ... asdf:*central-registry*) / boot quicklisp).</summary>
     public ITaskItem[]? BuildInit { get; set; }
     /// <summary>@(DotclAsdSearchPath): external system directories pushed onto
-    /// asdf:*central-registry* before resolution — the declarative form of the
+    /// asdf:*central-registry* before resolution: the declarative form of the
     /// build-init pushnew.</summary>
     public ITaskItem[]? AsdSearchPath { get; set; }
     /// <summary>@(ReferenceCopyLocalPaths): the consumer's referenced .NET
@@ -213,7 +213,7 @@ public sealed class DotclResolveDeps : Task
     private void Run()
     {
         DotclBoot.Boot(BaseCore, ContribDir, DotclBoot.ReferenceDirs(ReferencePath));
-        DotclHost.ResolveDeps(Asd, ManifestOut, RootSourcesOut,
+        DotclBuild.ResolveDeps(Asd, ManifestOut, RootSourcesOut,
                               string.IsNullOrEmpty(TargetRid) ? null : TargetRid,
                               BuildInit?.Select(i => i.GetMetadata("FullPath")).ToArray(),
                               AsdSearchPath?.Select(i => i.GetMetadata("FullPath")).ToArray());
@@ -259,7 +259,7 @@ public sealed class DotclCompileProject : Task
     private void Run()
     {
         DotclBoot.Boot(BaseCore, ContribDir, DotclBoot.ReferenceDirs(ReferencePath));
-        DotclHost.CompileProject(Asd, Output, BuildInit?.Select(i => i.GetMetadata("FullPath")).ToArray(),
+        DotclBuild.CompileProject(Asd, Output, BuildInit?.Select(i => i.GetMetadata("FullPath")).ToArray(),
                                  AsdSearchPath?.Select(i => i.GetMetadata("FullPath")).ToArray(),
                                  DebugInfo);
     }

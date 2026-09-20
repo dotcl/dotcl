@@ -6,12 +6,12 @@
 ;;; a stub returning NIL for every class on one side while the other walked the
 ;;; registry, and GENERIC-FUNCTION-LAMBDA-LIST had the same split and returned
 ;;; NIL only on Linux. Both were fixed by pointing each pair at one shared
-;;; implementation — but they remain two separate function objects wrapping it,
+;;; implementation: but they remain two separate function objects wrapping it,
 ;;; so nothing stops a later edit from touching one side alone.
 ;;;
 ;;; This pins the property instead of the mechanism: for every name registered on
 ;;; both sides, both answer the same. The last test is the one that keeps the
-;;; list honest — a NEW double registration fails until someone adds it here and
+;;; list honest: a NEW double registration fails until someone adds it here and
 ;;; checks that the two agree.
 
 (defclass mnp-base () ((a :initform 1 :initarg :a :accessor mnp-a :type integer)))
@@ -43,7 +43,7 @@
     ("SLOT-DEFINITION-WRITERS"      :slotd)))
 
 ;;; Names registered on both sides as ONE shared function object. Nothing to
-;;; compare — sameness is stronger than agreement — but they still have to be
+;;; compare, sameness is stronger than agreement, but they still have to be
 ;;; listed, so the completeness check below stays exhaustive.
 (defparameter *mnp-shared-object-pairs*
   '("ENSURE-CLASS" "MAKE-METHOD-LAMBDA" "METHOD-QUALIFIERS" "METHOD-SPECIALIZERS"
@@ -84,7 +84,7 @@
   nil)
 
 ;;; Every name that IS registered on both sides has to be in the table above.
-;;; Without this, a new double registration lands unchecked — which is how the
+;;; Without this, a new double registration lands unchecked: which is how the
 ;;; two CLASS-DIRECT-SUBCLASSES implementations drifted apart in the first place.
 
 ;;; The shared-object ones really are one object, not two that happen to agree.
@@ -102,7 +102,7 @@
   nil)
 
 ;;; A lambda list rebuilt from arity uses fresh uninterned parameter names, which
-;;; is fine — but it was rebuilt on EVERY call, so asking the same method twice
+;;; is fine: but it was rebuilt on EVERY call, so asking the same method twice
 ;;; gave two lists that were not even EQUAL. Callers that cache or compare a
 ;;; lambda list saw it change under them.
 

@@ -6,7 +6,15 @@ public static class Debugger
     private static int _nestLevel;
 
     /// <summary>
-    /// Enter the interactive debugger. Never returns normally —
+    /// True once a REPL is driving this process. Only then is there somebody to
+    /// read the debugger's prompt and choose a restart; a script run started
+    /// with a file argument, --eval or --load has nobody, and the debugger must
+    /// report and unwind rather than pick a restart on its own.
+    /// </summary>
+    public static volatile bool InteractiveRepl;
+
+    /// <summary>
+    /// Enter the interactive debugger. Never returns normally;
     /// only exits via non-local transfer (restart invocation).
     /// </summary>
     public static LispObject Enter(LispObject condition)
@@ -21,6 +29,17 @@ public static class Debugger
         var restarts = CollectRestarts(condition);
         PrintRestarts(restarts);
 
+        // Nobody is here to answer the prompt. Choosing a restart on the
+        // caller's behalf is worse than stopping: the innermost ABORT usually
+        // belongs to a library (ASDF establishes one per system it loads), so
+        // the script resumes at the next form as if the error had been handled
+        // and the process still exits 0.
+        if (!InteractiveRepl)
+        {
+            throw new LispErrorException(new LispError(
+                $"Debugger: non-interactive session; {condType}: {condMsg}"));
+        }
+
         int level = _nestLevel;
         _nestLevel++;
         // Selected backtrace frame, the one :locals reports on and :up / :down
@@ -34,7 +53,7 @@ public static class Debugger
                 var line = Console.ReadLine();
                 if (line == null)
                 {
-                    // EOF on stdin — try ABORT restart; if none available, throw to escape
+                    // EOF on stdin: try ABORT restart; if none available, throw to escape
                     var abortRestart = RestartClusterStack.FindRestartByName("ABORT", condition);
                     if (abortRestart == null)
                     {
@@ -204,7 +223,7 @@ public static class Debugger
             Console.Error.WriteLine($"; {(i == current ? "-->" : "   ")} {i,2}: {frames[i]}");
     }
 
-    /// <summary>Print the selected frame's call form and its locals — what :frame,
+    /// <summary>Print the selected frame's call form and its locals: what :frame,
     /// :up and :down show after moving.</summary>
     private static void PrintFrame(int idx)
     {
@@ -243,7 +262,7 @@ public static class Debugger
         var lines = DebugFrames.FormatLocals(idx);
         if (lines.Length == 0)
         {
-            Console.Error.WriteLine("; (no locals recorded for this frame — compile with");
+            Console.Error.WriteLine("; (no locals recorded for this frame; compile with");
             Console.Error.WriteLine(";  dotcl:*emit-frame-locals* true to record them)");
             return;
         }
@@ -253,7 +272,7 @@ public static class Debugger
 
     /// <summary>Print the special-variable bindings in effect, marking with * the
     /// ones the selected frame (or something it called) established. Needs no
-    /// frame-locals mode — the binding stack is always there.</summary>
+    /// frame-locals mode: the binding stack is always there.</summary>
     private static void PrintFrameSpecials(int idx)
     {
         var lines = DebugFrames.FormatSpecials(idx);

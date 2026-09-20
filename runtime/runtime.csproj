@@ -12,9 +12,9 @@
     <PackageId>dotcl</PackageId>
     <!-- <Version> comes from runtime/Directory.Build.props (single source of truth). -->
     <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
-    <Description>Common Lisp on .NET — compiles CL to CIL and runs via .NET JIT</Description>
+    <Description>Common Lisp on .NET; compiles CL to CIL and runs via .NET JIT</Description>
     <Authors>SANO Masatoshi</Authors>
-    <Copyright>Copyright © 2026 SANO Masatoshi</Copyright>
+    <Copyright>Copyright (c) 2026 SANO Masatoshi</Copyright>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageProjectUrl>https://github.com/dotcl/dotcl</PackageProjectUrl>
     <RepositoryUrl>https://github.com/dotcl/dotcl.git</RepositoryUrl>
@@ -26,8 +26,8 @@
     <PublishReadyToRun>true</PublishReadyToRun>
 
     <!-- No C# debug symbols in Release. The runtime never reads its own pdb at
-         run time — dotcl's Lisp-level backtraces and frame source come from the
-         .fasl's own PDB, not runtime.pdb / DotCL.Runtime.pdb — so shipping them
+         run time, dotcl's Lisp-level backtraces and frame source come from the
+         .fasl's own PDB, not runtime.pdb / DotCL.Runtime.pdb, so shipping them
          in the distributed tool is ~0.6 MB of dead weight. Scoped to Release so
          Debug builds keep full pdbs and local C# debugging is unaffected; only
          the pack (which builds Release) drops them. DotCL.Runtime.csproj carries
@@ -40,8 +40,8 @@
        roswell) via a few -p:Dotcl* properties, without leaking global properties into
        DotCL.Runtime.csproj (a bare -p:PackageId does, causing "Ambiguous project name").
        Default (all unset) = the plain `dotcl` tool pack, unchanged.
-         DotclToolPackageId / DotclToolCommandName — rename the produced tool.
-         DotclToolNoAndroid=true — drop the android RIDs. A ;-list RID override cannot be
+         DotclToolPackageId / DotclToolCommandName, rename the produced tool.
+         DotclToolNoAndroid=true, drop the android RIDs. A ;-list RID override cannot be
            passed on the command line (bare ; -> MSB1006; %3B -> NETSDK1083 single-RID),
            so the desktop+any list is written here as a literal, gated by a boolean flag.
            dotcl's own release.yml uses this to keep android deferred. -->
@@ -58,7 +58,7 @@
 
   <!-- dotcl-app bundle: extra files shipped alongside the tool (e.g. roswell's
        quicklisp-client + SharpCompress.dll). Packed into the any/ fallback and copied
-       into every per-RID publish with subdirectory structure preserved — replacing the
+       into every per-RID publish with subdirectory structure preserved; replacing the
        old post-pack nupkg unzip/inject surgery. Inert unless DotclAppBundle is set. -->
   <ItemGroup Condition="'$(_DotclAppBundleGlob)' != ''">
     <None Include="$(_DotclAppBundleGlob)" Pack="true" PackagePath="tools/net10.0/any/" />
@@ -69,7 +69,7 @@
     </Content>
   </ItemGroup>
 
-  <!-- Only the CLI sources — all runtime sources live in DotCL.Runtime.csproj -->
+  <!-- Only the CLI sources; all runtime sources live in DotCL.Runtime.csproj -->
   <ItemGroup>
     <Compile Remove="**/*.cs" />
     <Compile Include="Program.cs" />
@@ -88,7 +88,13 @@
        per-RID package (dotcl.<rid>) carries its own. Without the add-back this
        glob shipped all six R2R sets in all six packages (~22 MB of waste each). -->
   <PropertyGroup>
-    <ContribR2RExclude>contrib/**/*.fasl.r2r-*</ContribR2RExclude>
+    <!-- Two spellings: the current one, and the pre-rename <name>-r2r-<rid>.fasl
+         that an older working tree still holds. The legacy spelling was only ever
+         used for R2R siblings, and nothing adds it back, so dropping it outright
+         is right: left in, a stale tree packs all six RIDs' copies into every
+         package (90 entries and 5.8 MB -> 33 MB in the any-RID one). A fresh CI
+         checkout never has them, so this only ever bit local packs. -->
+    <ContribR2RExclude>contrib/**/*.fasl.r2r-*;contrib/**/*-r2r-*</ContribR2RExclude>
     <ContribOwnR2R Condition="'$(RuntimeIdentifier)' != '' and '$(RuntimeIdentifier)' != 'any'">contrib/**/*.fasl.r2r-$(RuntimeIdentifier)</ContribOwnR2R>
   </PropertyGroup>
 

@@ -1,6 +1,6 @@
 ;;;; IL-verifiability stress fixture (compiled, then checked with ilverify).
 ;;;;
-;;;; Purpose: dotcl's emitter must produce VERIFIABLE CIL — no covariant calls
+;;;; Purpose: dotcl's emitter must produce VERIFIABLE CIL: no covariant calls
 ;;;; (passing a base LispObject where a derived type like Symbol is required
 ;;;; without a castclass), no stack-type mismatches, etc. CoreCLR's JIT tolerates
 ;;;; such IL, but strict AOT C++ codegens (Unity IL2CPP / WebGL) reject it. This

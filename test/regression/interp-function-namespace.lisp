@@ -4,8 +4,8 @@
 ;;; test. Three consequences, all fixed together by giving functions their own
 ;;; key (the same move go tags needed):
 ;;;
-;;;   1. a (SETF F) local function was invisible — a CONS key can never match
-;;;      under EQL — however it was referenced;
+;;;   1. a (SETF F) local function was invisible, a CONS key can never match
+;;;      under EQL, however it was referenced;
 ;;;   2. a VARIABLE whose value happened to be a function answered in operator
 ;;;      position:  (let ((list #'car)) (list 1 2))  called CAR;
 ;;;   3. a global MACRO beat a lexical function of the same name, because

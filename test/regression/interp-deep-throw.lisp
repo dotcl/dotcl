@@ -4,7 +4,7 @@
 ;;; as a CATCH. While CATCH matched its tag by catching every CatchThrowException
 ;;; and rethrowing the ones belonging to an outer CATCH, every frame a THROW
 ;;; crossed left a live handler funclet and a restarted exception dispatch behind
-;;; it, so a THROW cost stack proportional to the depth it travelled — about as
+;;; it, so a THROW cost stack proportional to the depth it travelled; about as
 ;;; much again as the recursion had already used. Deep enough recursion therefore
 ;;; turned a catchable STORAGE-CONDITION into a fatal .NET StackOverflowException:
 ;;; the handler ran, and the RETURN-FROM leaving it died on the way out, taking

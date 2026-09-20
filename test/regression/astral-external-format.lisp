@@ -2,7 +2,7 @@
 ;;;
 ;;; dotcl characters are UTF-16 code units (char-code-limit 65536, ABCL-style):
 ;;; code-char of a code point above #xFFFF is NIL. When DECODING, an astral
-;;; code point must not vanish or split the line — it streams as a surrogate
+;;; code point must not vanish or split the line: it streams as a surrogate
 ;;; pair (two characters), matching .NET string semantics. This is what keeps
 ;;; e.g. Unicode data files (NormalizationTest.txt contains U+242EE in a
 ;;; comment) readable line-by-line: read-line must yield ONE line
@@ -12,7 +12,7 @@
   (let ((path "astral-regression-tmp.bin"))
     (unwind-protect
         (progn
-          ;; "A<U+242EE>B\nC\n" — U+242EE encodes as F0 A4 8B AE
+          ;; "A<U+242EE>B\nC\n": U+242EE encodes as F0 A4 8B AE
           (with-open-file (s path :direction :output
                              :element-type '(unsigned-byte 8)
                              :if-exists :supersede)

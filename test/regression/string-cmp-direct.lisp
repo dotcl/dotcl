@@ -1,5 +1,5 @@
 ;;; The string comparison family has 4-arg direct entries for a single bounds
-;;; keyword pair — (string= name prefix :end1 n), which is how prefix checks are
+;;; keyword pair: (string= name prefix :end1 n), which is how prefix checks are
 ;;; written and by far the most common keyworded shape. The entry decodes the pair
 ;;; itself, so it must agree with the args-array path in every case; anything it
 ;;; does not handle (:allow-other-keys, a non-integer bound, an unknown keyword,
@@ -75,7 +75,7 @@
 
 ;;; Bounding indices are now validated (CLHS: 0 <= start <= end <= length). They
 ;;; used to be taken as given, so a too-large :end quietly compared the whole
-;;; string — and (subseq '(1 2 3) 0 99) built a list padded with NILs.
+;;; string: and (subseq '(1 2 3) 0 99) built a list padded with NILs.
 (defmacro scd-errors (name form)
   `(deftest ,name (handler-case (progn ,form :no-error) (type-error () :type-error)) :type-error))
 
@@ -89,7 +89,7 @@
 (scd-errors scd-subseq-vector    (subseq (vector 1 2 3) 0 99))
 (scd-errors scd-subseq-start     (subseq (list 1 2 3) 9))
 
-;;; Valid bounds — including the empty range and the full range — still work.
+;;; Valid bounds, including the empty range and the full range, still work.
 (deftest scd-bounds-still-ok
   (list (string= "abc" "abd" :end1 2 :end2 2)
         (string= "abc" "abc" :start1 3 :start2 3)

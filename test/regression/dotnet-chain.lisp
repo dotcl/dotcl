@@ -1,4 +1,4 @@
-;;; dotnet:-> — member chain in call order, and dotnet:doto — several members
+;;; dotnet:->, member chain in call order, and dotnet:doto, several members
 ;;; applied to one object. Both expand to plain dotnet:invoke calls; they exist
 ;;; because nested interop otherwise reads inside-out:
 ;;;   (dotnet:invoke (dotnet:invoke (dotnet:invoke uri "Host") "Substring" 0 7) "ToUpper")

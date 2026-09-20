@@ -130,7 +130,7 @@
 ;;; the evaluation stack is empty when VALUE is compiled. If VALUE contains a
 ;;; try block (a handler-case, or a LOOP `being each hash-value` which expands
 ;;; with one), pushing obj+slot inline first left the stack non-empty at the
-;;; try-block entry → InvalidProgramException. Regression for quicklisp
+;;; try-block entry -> InvalidProgramException. Regression for quicklisp
 ;;; install-dist (slot-unbound for PROVIDED-SYSTEMS does exactly this).
 (defclass ssv-holder () ((s :accessor ssv-s :initform nil)))
 
@@ -152,7 +152,7 @@
 ;;; A cond clause whose TEST is a symbol that is BOTH a captured local variable
 ;;; and a global function name (Lisp-2) must capture the variable. Free-var
 ;;; analysis treated the clause (sap ...) as a function call (car = fn name) and
-;;; dropped `sap` as a free-var ref, so it wasn't captured → "Unbound variable"
+;;; dropped `sap` as a free-var ref, so it wasn't captured -> "Unbound variable"
 ;;; at run time. Surfaced via cl-ppcre create-scanner-aux's `start-anchored-p`
 ;;; (a defgeneric) reused as a closure-captured parameter in (cond (start-anchored-p ...)).
 (defun cap-anchored-p (x) (declare (ignore x)) :global-fn)
@@ -211,7 +211,7 @@
     (list (funcall a 5) (funcall b 5) (funcall a 1)))
   (15 105 11))
 
-;; A counter closure mutating its captured binding across many calls — exercises
+;; A counter closure mutating its captured binding across many calls; exercises
 ;; the same body method resolved repeatedly from the unit store.
 (defun s3-counter ()
   (let ((c 0)) (lambda () (incf c))))
@@ -246,7 +246,7 @@
   (15 105))
 
 ;; Nested closures resolve a SIBLING body DM when the outer closure is called
-;; after a GC — the outer closure must keep its unit alive for the inner build.
+;; after a GC: the outer closure must keep its unit alive for the inner build.
 (defun s4-nested (a) (lambda (b) (lambda (c) (+ a b c))))
 
 (deftest s4-nested-closure-survives-gc

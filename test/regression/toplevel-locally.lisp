@@ -27,7 +27,7 @@
   *tl-locally-c*
   105)
 
-;;; The declarations survive the split — each form is re-wrapped carrying them.
+;;; The declarations survive the split: each form is re-wrapped carrying them.
 (locally (declare (special *tl-locally-d*))
   (defun %tl-locally-get-d () *tl-locally-d*)
   (defun %tl-locally-get-d2 () *tl-locally-d*))

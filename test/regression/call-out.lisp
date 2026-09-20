@@ -1,13 +1,13 @@
 ;;; Regression tests for dotnet:call-out: ref/out parameter support
 
-;;; Int32.TryParse(string, out int) — static, successful parse
+;;; Int32.TryParse(string, out int): static, successful parse
 (deftest d894-try-parse-success
   (multiple-value-bind (ok n)
       (dotnet:call-out "System.Int32" "TryParse" "42")
     (list ok n))
   (t 42))
 
-;;; Int32.TryParse — failure case returns nil + 0
+;;; Int32.TryParse: failure case returns nil + 0
 (deftest d894-try-parse-failure
   (multiple-value-bind (ok n)
       (dotnet:call-out "System.Int32" "TryParse" "not-a-number")
@@ -21,7 +21,7 @@
     (and ok (< (abs (- n 3.14)) 0.001)))
   t)
 
-;;; Dictionary.TryGetValue — instance method with out param
+;;; Dictionary.TryGetValue: instance method with out param
 (deftest d894-dict-try-get-value
   (let ((d (dotnet:new "System.Collections.Generic.Dictionary`2[System.String,System.Int32]")))
     (setf (dotnet:ref d "answer") 42)
@@ -30,7 +30,7 @@
       (list found val)))
   (t 42))
 
-;;; TryGetValue — key absent
+;;; TryGetValue: key absent
 (deftest d894-dict-try-get-missing
   (let ((d (dotnet:new "System.Collections.Generic.Dictionary`2[System.String,System.Int32]")))
     (multiple-value-bind (found val)
@@ -83,7 +83,7 @@
 ;;; (object, int, ...) catch-all: Marshal.WriteIntPtr(IntPtr,int,IntPtr) and
 ;;; ReadIntPtr(IntPtr,int) over WriteIntPtr(object,int,IntPtr) / ReadIntPtr(object,int).
 ;;; Picking the object overload boxes the pointer arg and reads/writes the box
-;;; instead of native memory — silently corrupting char** builds.
+;;; instead of native memory: silently corrupting char** builds.
 (deftest static-marshal-offset-overload-round-trips
   (let* ((m "System.Runtime.InteropServices.Marshal")
          (p (dotnet:static m "StringToHGlobalAnsi" "hi"))
@@ -178,7 +178,7 @@
   t)
 
 (deftest issue302-enum-case-sensitive-distinguished
-  ;; Ordinal (case-sensitive) → "a" and "A" differ.
+  ;; Ordinal (case-sensitive) -> "a" and "A" differ.
   (dotnet:static "System.String" "Equals" "a" "A" "Ordinal")
   nil)
 
@@ -247,7 +247,7 @@
 
 ;;; dotnet:new ctor selection must admit a ctor whose trailing params are all
 ;;; optional (filling their defaults), so a wrapped value-type struct arg picks
-;;; ColorBox(ColorVal, double=1) over the fixed-arity ColorBox(uint) — which
+;;; ColorBox(ColorVal, double=1) over the fixed-arity ColorBox(uint); which
 ;;; would Convert.ChangeType(struct, uint) and fail "Object must implement
 ;;; IConvertible". Models Avalonia.Media.SolidColorBrush(Color).
 (deftest issue357-ctor-optional-tail-prefers-struct-over-uint
@@ -256,7 +256,7 @@
     (dotnet:invoke b "Tag"))
   "color 128 op 1")
 
-;;; dotnet:call-out-generic — generic method + out/ref parameters combined
+;;; dotnet:call-out-generic: generic method + out/ref parameters combined
 ;;; (dotcl/dotcl#45). dotnet:static-generic/invoke-generic handle generics but
 ;;; not out/ref; dotnet:call-out handles out/ref but not open generic defs.
 ;;; Enum.TryParse<TEnum>(string, out TEnum) exercises both at once.
@@ -273,7 +273,7 @@
     ok)
   nil)
 
-;;; dotnet:make-array — sized typed .NET array creation, 1-D and multi-dim
+;;; dotnet:make-array: sized typed .NET array creation, 1-D and multi-dim
 ;;; (dotcl/dotcl#45). Distinct from dotnet:new-array (which fills from elements).
 (deftest issue45-make-array-1d
   (let ((a (dotnet:make-array "System.Int32" 3)))
@@ -317,7 +317,7 @@
     (error () :errored))
   :errored)
 
-;;; dotnet:enum-or — combine [Flags] enum members with bitwise OR (dotcl/dotcl#45).
+;;; dotnet:enum-or: combine [Flags] enum members with bitwise OR (dotcl/dotcl#45).
 ;;; Members may be name strings/symbols (case-insensitive), integers, or enum values.
 (deftest issue45-enum-or-names
   (dotnet:invoke (dotnet:enum-or "System.IO.FileAccess" "Read" "Write") "ToString")
@@ -338,7 +338,7 @@
     (error () :errored))
   :errored)
 
-;;; dotnet:make-generic-type — construct a closed generic System.Type from an
+;;; dotnet:make-generic-type: construct a closed generic System.Type from an
 ;;; open definition + type-arg names; usable directly with dotnet:new (which now
 ;;; accepts a resolved System.Type as its first arg). (dotcl/dotcl#45)
 (deftest issue45-make-generic-type-infer-arity
@@ -387,7 +387,7 @@
 ;;; dotnet:handler-bind dispatches on specific .NET exception types.
 ;; A drive-less relative filename in an existing directory (the CWD) so the
 ;; open fails with FileNotFoundException on every OS. A "C:/..." path is a
-;; *missing directory* on Unix → DirectoryNotFoundException, which made this
+;; *missing directory* on Unix -> DirectoryNotFoundException, which made this
 ;; test platform-dependent (green on Windows, red on macOS/Linux).
 (defun %i368-open-missing ()
   (dotnet:invoke (dotnet:static "System.IO.File" "OpenRead" "dotcl-nonexistent-zzz-file.txt")
@@ -408,7 +408,7 @@
   nil)
 
 ;;; dotnet:exception-object exposes the exception INSTANCE (not just its type),
-;;; so a handler can read type-specific properties and walk InnerException —
+;;; so a handler can read type-specific properties and walk InnerException;
 ;;; e.g. the SocketException (with its error code) inside the IOException a
 ;;; stream read timeout raises. Message text is localized; codes are not.
 (deftest exception-object-exposes-instance
@@ -456,7 +456,7 @@
 ;;; dotnet:call-out with a plain `ref` parameter: ref is in-out, so the caller
 ;;; supplies the initial value and receives the updated one as an extra return
 ;;; value. Previously ref was classified like `out` (no in-arg consumed), which
-;;; shifted the remaining args into the wrong parameter slots — for a method
+;;; shifted the remaining args into the wrong parameter slots: for a method
 ;;; like Socket.ReceiveFrom(byte[], ref EndPoint) the EndPoint landed in a
 ;;; SocketFlags slot and died with "Object must implement IConvertible".
 (deftest call-out-ref-consumes-initial-value
@@ -479,7 +479,7 @@
           (values (dotnet:call-out "DotCL.TestSupport.RefParams" "Describe" sb 5))))
   ("one:z" "two:z5"))
 
-;;; BCL end-to-end: Array.Resize<T>(ref T[], int) — a ref reference-type param
+;;; BCL end-to-end: Array.Resize<T>(ref T[], int): a ref reference-type param
 ;;; on a generic method (dotnet:call-out-generic shares the classification).
 (deftest call-out-generic-ref-array-resize
   (let ((a (dotnet:make-array "System.Int32" 2)))
@@ -515,7 +515,7 @@
     (error (c) (notnot (dotnet:exception-typep c "System.FormatException"))))
   t)
 
-;;; (dotcl/dotcl#45): extension-method resolution — dotnet:invoke falls back
+;;; (dotcl/dotcl#45): extension-method resolution: dotnet:invoke falls back
 ;;; to a static [Extension] method whose first param accepts the receiver. Covers
 ;;; non-generic and single-type-param generic (inferred from IEnumerable<T>),
 ;;; e.g. LINQ Enumerable.Count/Where/First on a List<int>.

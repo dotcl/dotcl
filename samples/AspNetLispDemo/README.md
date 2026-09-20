@@ -1,4 +1,4 @@
-# AspNetLispDemo — write an ASP.NET Core Controller in Lisp
+# AspNetLispDemo: write an ASP.NET Core Controller in Lisp
 
 A minimal sample that embeds dotcl as an in-process runtime inside an ASP.NET
 Core process and **defines a `Microsoft.AspNetCore.Mvc.ControllerBase` subtype
@@ -22,7 +22,7 @@ hello from async lisp
 
 `/api/hello` is a synchronous MVC controller; `/api/async-hello` wires a Lisp
 `(dotcl:async ...)` handler (the Task producer side) to a Minimal API route. The
-latter does not block the request thread — the `dotcl:await` inside the handler
+latter does not block the request thread; the `dotcl:await` inside the handler
 waits on a real .NET Task (`Task.Delay`) on the thread pool.
 
 ## The Lisp side
@@ -55,7 +55,7 @@ The whole of `main.lisp` is ~10 lines:
 
 ## The C# side (`Program.cs`)
 
-dotcl boot → start ASP.NET → adopt the dynamic assembly as an ApplicationPart:
+dotcl boot -> start ASP.NET -> adopt the dynamic assembly as an ApplicationPart:
 
 ```csharp
 DotclHost.Initialize();
@@ -96,7 +96,7 @@ the manifest.
   async action (returning `Task<IActionResult>`) needs type conversion, so for
   now going through Minimal API is the simplest.
 - **DI container**: the controllers in this sample happen to use a parameterless
-  ctor, but that is not a limitation of `dotnet:define-class` — `:ctor` takes a
+  ctor, but that is not a limitation of `dotnet:define-class`; `:ctor` takes a
   typed parameter list, and constructor injection works. A class defined as
 
   ```lisp

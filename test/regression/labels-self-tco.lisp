@@ -6,7 +6,7 @@
 ;;; speculation is accepted only when the generated body is provably
 ;;; self-contained (no box-key reference, no orphan code after a TCO branch);
 ;;; otherwise it falls back to the unchanged closure path. So every non-tail /
-;;; captured / guarded shape must still return the correct value — the fix may
+;;; captured / guarded shape must still return the correct value: the fix may
 ;;; never trade correctness for the optimization.
 
 ;; Core: single self-tail-recursion at depth 3M must TCO (not overflow).
@@ -50,7 +50,7 @@
 
 ;; Guard for the intrinsic-argument TCO hazard: a tail self-call sitting in an
 ;; intrinsic argument (print) must NOT be accepted as a bare direct TCO that
-;; strands the print as dead code — it falls back and the print runs.
+;; strands the print as dead code: it falls back and the print runs.
 (deftest labels-self-tco.intrinsic-arg-guard
   (let* ((out (make-string-output-stream))
          (r (let ((*standard-output* out))

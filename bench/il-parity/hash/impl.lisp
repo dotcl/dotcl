@@ -1,0 +1,93 @@
+;;;; An open-addressed hash table with fixnum keys, against IlParity.HashTable.
+;;;;
+;;;; Three parallel arrays and a mask, linear probing. Key 0 is a legal key, so
+;;;; occupancy lives in its own array rather than in a reserved key value.
+
+(in-package :cl-user)
+
+(defconstant +ilp-hash-full+ 1)
+
+(defstruct (ilp-hash (:constructor %make-ilp-hash (keys values state mask count)))
+  (keys (make-array 0 :element-type 'fixnum) :type (simple-array fixnum (*)))
+  (values (make-array 0 :element-type 'fixnum) :type (simple-array fixnum (*)))
+  (state (make-array 0 :element-type '(unsigned-byte 8))
+         :type (simple-array (unsigned-byte 8) (*)))
+  (mask 0 :type fixnum)
+  (count 0 :type fixnum))
+
+(defun ilp-hash-new (capacity)
+  "CAPACITY must be a power of two -- the mask is what makes the wrap a single
+   LOGAND instead of a division."
+  (declare (fixnum capacity) (optimize (speed 3) (safety 0) (debug 0)))
+  (%make-ilp-hash (make-array capacity :element-type 'fixnum :initial-element 0)
+                  (make-array capacity :element-type 'fixnum :initial-element 0)
+                  (make-array capacity :element-type '(unsigned-byte 8)
+                                       :initial-element 0)
+                  (the fixnum (1- capacity))
+                  0))
+
+(defun ilp-hash-index (h key)
+  (declare (type ilp-hash h) (fixnum key)
+           (optimize (speed 3) (safety 0) (debug 0)))
+  (let ((x (the fixnum (* key 2654435761))))
+    (declare (fixnum x))
+    (the fixnum (logand (the fixnum (logxor x (the fixnum (ash x -15))))
+                        (ilp-hash-mask h)))))
+
+(defun ilp-hash-put (h key value)
+  (declare (type ilp-hash h) (fixnum key value)
+           (optimize (speed 3) (safety 0) (debug 0)))
+  (let ((keys (ilp-hash-keys h))
+        (state (ilp-hash-state h))
+        (mask (ilp-hash-mask h))
+        (i (ilp-hash-index h key)))
+    (declare (type (simple-array fixnum (*)) keys)
+             (type (simple-array (unsigned-byte 8) (*)) state)
+             (fixnum mask i))
+    (loop while (= (the fixnum (aref state i)) +ilp-hash-full+)
+          do (when (= (the fixnum (aref keys i)) key)
+               (setf (aref (ilp-hash-values h) i) value)
+               (return-from ilp-hash-put value))
+             (setq i (the fixnum (logand (the fixnum (1+ i)) mask))))
+    (setf (aref keys i) key)
+    (setf (aref (ilp-hash-values h) i) value)
+    (setf (aref state i) +ilp-hash-full+)
+    (setf (ilp-hash-count h) (the fixnum (1+ (ilp-hash-count h))))
+    value))
+
+(defun ilp-hash-get (h key not-found)
+  "The value for KEY, or NOT-FOUND when it is absent -- returned rather than
+   signalled, so the probe loop is the only control flow in the function."
+  (declare (type ilp-hash h) (fixnum key not-found)
+           (optimize (speed 3) (safety 0) (debug 0)))
+  (let ((keys (ilp-hash-keys h))
+        (state (ilp-hash-state h))
+        (mask (ilp-hash-mask h))
+        (i (ilp-hash-index h key)))
+    (declare (type (simple-array fixnum (*)) keys)
+             (type (simple-array (unsigned-byte 8) (*)) state)
+             (fixnum mask i))
+    (loop while (= (the fixnum (aref state i)) +ilp-hash-full+)
+          do (when (= (the fixnum (aref keys i)) key)
+               (return-from ilp-hash-get (the fixnum (aref (ilp-hash-values h) i))))
+             (setq i (the fixnum (logand (the fixnum (1+ i)) mask))))
+    not-found))
+
+(defun ilp-hash-size (h)
+  (declare (type ilp-hash h) (optimize (speed 3) (safety 0) (debug 0)))
+  (the fixnum (ilp-hash-count h)))
+
+(defun ilp-hash-selfcheck (n)
+  (declare (fixnum n) (optimize (speed 3) (safety 0) (debug 0)))
+  (let ((h (ilp-hash-new 1024))
+        (acc 0))
+    (declare (fixnum acc))
+    (dotimes (i n)
+      (declare (fixnum i))
+      (ilp-hash-put h (the fixnum (* i 7)) (the fixnum (* i 11))))
+    (dotimes (i n)
+      (declare (fixnum i))
+      (setq acc (the fixnum (+ acc (ilp-hash-get h (the fixnum (* i 7)) -1)))))
+    (setq acc (the fixnum (+ acc (ilp-hash-get h 999999 -1))))
+    (setq acc (the fixnum (+ acc (ilp-hash-size h))))
+    acc))

@@ -166,8 +166,30 @@ public static partial class Runtime
 
     static LispErrorException DeclaredFixnumOverflow(System.Numerics.BigInteger value)
         => new LispErrorException(new LispTypeError(
-            $"result {value} does not fit the declared FIXNUM type of the variable",
+            $"result {value} does not fit the declared FIXNUM type",
             Bignum.MakeInteger(value), Startup.Sym("FIXNUM")));
+
+    static LispErrorException DeclaredDoubleSqrtOfNegative(double value)
+        => new LispErrorException(new LispTypeError(
+            $"(SQRT {value}) is a COMPLEX, not the declared DOUBLE-FLOAT",
+            new DoubleFloat(value), Startup.Sym("DOUBLE-FLOAT")));
+
+    /// <summary>
+    /// SQRT of a double where the program has declared the result a
+    /// DOUBLE-FLOAT. The square root of a negative double is a COMPLEX, so on
+    /// that input the declaration is false, and a violated declaration reports
+    /// as the TYPE-ERROR it is rather than handing back the NaN Math.Sqrt
+    /// returns -- a NaN would travel silently through the rest of the
+    /// computation. This is the same treatment a declared FIXNUM that overflows
+    /// gets, and like that one it applies from (safety 1) up: at (safety 0) the
+    /// compiler emits Math.Sqrt directly and a violation is undefined.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static double SqrtDoubleChecked(double x)
+    {
+        if (x < 0.0) throw DeclaredDoubleSqrtOfNegative(x);
+        return System.Math.Sqrt(x);
+    }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static long AddFixnumChecked(long a, long b)
@@ -469,7 +491,7 @@ public static partial class Runtime
             return true;
         if (a is Fixnum fa && b is Fixnum fb) return fa.Value == fb.Value;
         // eql compares floats by bit representation (CLHS): finer than =, (eql 0.0 -0.0)=NIL,
-        // bit-identical NaNs are eql=T. Value compare (==) would give NaN!=NaN, 0.0==-0.0 — a mismatch.
+        // bit-identical NaNs are eql=T. Value compare (==) would give NaN!=NaN, 0.0==-0.0; a mismatch.
         if (a is DoubleFloat da && b is DoubleFloat db)
             return BitConverter.DoubleToInt64Bits(da.Value) == BitConverter.DoubleToInt64Bits(db.Value);
         if (a is SingleFloat sa && b is SingleFloat sb)
@@ -744,7 +766,7 @@ public static partial class Runtime
 
             // base of magnitude 1 has an exact integer power for ANY exponent. Handle
             // these before the int.MaxValue check below, which otherwise falls a huge
-            // exponent through to the float path and returns 1.0/-1.0 instead of 1/-1 —
+            // exponent through to the float path and returns 1.0/-1.0 instead of 1/-1;
             // corrupting e.g. Maxima's CRE coefficients in (rat (%e^N)) for N >= 2^31.
             if (bigBase.IsOne) return Fixnum.Make(1);
             if (bigBase == System.Numerics.BigInteger.MinusOne)
@@ -961,7 +983,7 @@ public static partial class Runtime
     private static LispObject MakeInteger(System.Numerics.BigInteger n) =>
         n >= long.MinValue && n <= long.MaxValue ? Fixnum.Make((long)n) : Bignum.MakeInteger(n);
 
-    // Binary bitwise operations — avoid LispObject[] allocation for common 2-arg case
+    // Binary bitwise operations: avoid LispObject[] allocation for common 2-arg case
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static LispObject Logior2(LispObject a, LispObject b)
     {
@@ -984,7 +1006,7 @@ public static partial class Runtime
         return MakeInteger(GetBigInt(a) ^ GetBigInt(b));
     }
 
-    // Bitwise logical operations — fixnum fast paths avoid BigInteger allocation
+    // Bitwise logical operations: fixnum fast paths avoid BigInteger allocation
     public static LispObject Logior(LispObject[] args)
     {
         if (args.Length == 2 && args[0] is Fixnum f0 && args[1] is Fixnum f1)
@@ -1136,9 +1158,9 @@ public static partial class Runtime
         return (n & (System.Numerics.BigInteger.One << (int)bitIdx)) != 0 ? T.Instance : Nil.Instance;
     }
 
-    // CL documentation storage: (symbol, doc-type-string) → LispObject
+    // CL documentation storage: (symbol, doc-type-string) -> LispObject
     // ConcurrentDictionary: (setf documentation) on separate threads writes this
-    // while documentation reads it — a plain Dictionary corrupts under concurrent write.
+    // while documentation reads it: a plain Dictionary corrupts under concurrent write.
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<(string sym, string docType), LispObject> _docs = new();
 
     // Called by GeneratedDocs.Register() (source-generated from [LispDoc] attributes).
@@ -1222,7 +1244,7 @@ public static partial class Runtime
         {
             // Check if stream was opened with a logical pathname
             if (fs.OriginalPathname is LispLogicalPathname lp) return lp;
-            // CLHS: stream — the associated pathname must be a logical pathname
+            // CLHS: stream: the associated pathname must be a logical pathname
             var p = LispPathname.FromString(fs.FilePath);
             if (p is LispLogicalPathname lp2) return lp2;
             // Check if the file path looks like a logical pathname
@@ -1277,7 +1299,7 @@ public static partial class Runtime
         {
             if (c.Car is Cons rule)
             {
-                // rule = (from-wildcard to-wildcard) — elements may be strings or pathnames
+                // rule = (from-wildcard to-wildcard): elements may be strings or pathnames
                 var fromObj = rule.Car;
                 var toObj = (rule.Cdr is Cons cdr2) ? cdr2.Car : null;
                 if (toObj == null) { cur = c.Cdr; continue; }
@@ -1533,7 +1555,7 @@ public static partial class Runtime
             Ratio r => r,
             SingleFloat sf => Runtime.DoubleToRational((double)sf.Value),
             DoubleFloat df => Runtime.DoubleToRational(df.Value),
-            LispDecimal d => d.ToRational(),   // exact — a decimal is always rational
+            LispDecimal d => d.ToRational(),   // exact; a decimal is always rational
             _ => throw new LispErrorException(new LispTypeError("RATIONAL: not real", obj))
         });
 
@@ -1802,7 +1824,7 @@ public static partial class Runtime
             return Fixnum.Make((int)n.GetBitLength());
         });
 
-        // Floor/Ceiling/Truncate/Round: (func number &optional divisor) → (values quotient remainder)
+        // Floor/Ceiling/Truncate/Round: (func number &optional divisor) -> (values quotient remainder)
         foreach (var (fname, fop) in new (string, Func<Number, Number, (Number, Number)>)[] {
             ("FLOOR",    Arithmetic.Floor),
             ("TRUNCATE", Arithmetic.Truncate),
@@ -1980,7 +2002,7 @@ public static partial class Runtime
             new LispFunction(args => {
                 // A single-float must be decoded from its OWN 24-bit representation,
                 // not promoted to double (which yields a 53-bit mantissa and a tiny
-                // exponent). That broke anything relying on the true ulp — e.g.
+                // exponent). That broke anything relying on the true ulp: e.g.
                 // rationalize's rounding interval on single-floats.
                 if (args[0] is SingleFloat sfv)
                 {

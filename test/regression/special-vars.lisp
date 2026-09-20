@@ -57,7 +57,7 @@
     saved)
   55)
 
-;;; &aux + body (declare (special x)) — body x reads the dynamic value,
+;;; &aux + body (declare (special x)): body x reads the dynamic value,
 ;;; not the lexically-shadowed captured value. Mirrors ANSI DEFUN.5.
 (deftest aux-body-special-free
   (let ((x 1)) (declare (special x))

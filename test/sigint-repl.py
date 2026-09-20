@@ -7,7 +7,7 @@ PosixSignalRegistration. This test drives a real pty, starts an infinite
 call-heavy loop, sends SIGINT to the process, and asserts the REPL survives
 (the debugger's ABORT restart returns to top level and further forms evaluate).
 
-Not part of `make test-regression` — signal wiring cannot be exercised from the
+Not part of `make test-regression`; signal wiring cannot be exercised from the
 Lisp test harness, so run this manually:
 
     dotnet build runtime/runtime.csproj -c Release -f net10.0

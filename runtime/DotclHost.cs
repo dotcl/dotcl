@@ -20,17 +20,40 @@ public static class DotclHost
 {
     private static bool _initialized;
     private static bool _coreLoaded;
+    private static readonly object _initLock = new object();
+    private static int _initializeCount;
 
     /// <summary>
     /// Bootstraps the Lisp runtime (packages, readtable, core functions).
-    /// Safe to call multiple times; only the first call does work.
+    /// Safe to call multiple times and from several threads at once; only the
+    /// first call does work.
+    ///
+    /// The lock is what makes the second sentence true. A host with more than
+    /// one entry point into Lisp (a web request, a game callback, a plugin)
+    /// reaches this from whichever thread arrives first, and an unguarded
+    /// check-then-set let two of them into the bootstrap together. Monitor is
+    /// re-entrant, so a nested Initialize on the same thread still passes.
     /// </summary>
     public static void Initialize()
     {
-        if (_initialized) return;
-        Startup.Initialize();
-        _initialized = true;
+        lock (_initLock)
+        {
+            if (_initialized) return;
+            Startup.Initialize();
+            // Only after it returns: a bootstrap that threw has not happened,
+            // and the next caller must be allowed to try again.
+            _initializeCount++;
+            _initialized = true;
+        }
     }
+
+    /// <summary>
+    /// How many times <see cref="Initialize"/> has actually run the bootstrap in
+    /// this process. 0 before the first call, 1 afterwards however many threads
+    /// called it. Hosts do not need this; it is what lets a test say that
+    /// concurrent callers bootstrapped once rather than merely not crashing.
+    /// </summary>
+    public static int InitializeCount => _initializeCount;
 
     /// <summary>
     /// Locate a bundled dotcl core (.fasl PE or .sil text). Looks next to
@@ -108,7 +131,7 @@ public static class DotclHost
             var corePath = System.IO.Path.Combine(destRoot, "dotcl.core");
             return System.IO.File.Exists(corePath) ? corePath : null;
         }
-        catch { return null; }   // any reflection/IO failure → fall back to file probes
+        catch { return null; }   // any reflection/IO failure -> fall back to file probes
     }
 
     private static void ExtractAssetTree(object assets,
@@ -140,25 +163,29 @@ public static class DotclHost
     /// </summary>
     public static void LoadCore(string filePath)
     {
-        _coreLoaded = true;
+        bool isPeImage;
         byte[] header = new byte[2];
         using (var fs = System.IO.File.OpenRead(filePath))
         {
             int n = fs.Read(header, 0, 2);
-            if (n >= 2 && header[0] == 0x4D && header[1] == 0x5A)
-            {
-                LoadCoreFasl(filePath);
-                return;
-            }
+            isPeImage = n >= 2 && header[0] == 0x4D && header[1] == 0x5A;
         }
 
-        RunCoreSil(System.IO.File.ReadAllText(filePath), filePath);
+        if (isPeImage)
+            LoadCoreFasl(filePath);
+        else
+            RunCoreSil(System.IO.File.ReadAllText(filePath), filePath);
+
+        // Last, not first: a load that threw has not loaded a core, and
+        // CoreLoaded saying otherwise turns EnsureCore into a no-op that leaves
+        // the host on an image that was never booted.
+        _coreLoaded = true;
     }
 
     /// <summary>
     /// Load and execute a compiled core already in memory. Same two formats as
-    /// <see cref="LoadCore(string)"/> — a FASL PE assembly (the "MZ" header) or SIL
-    /// text — for a host with no filesystem to read from. A browser fetches the core
+    /// <see cref="LoadCore(string)"/>, a FASL PE assembly (the "MZ" header) or SIL
+    /// text, for a host with no filesystem to read from. A browser fetches the core
     /// over HTTP and hands the bytes straight here; there is no path to open.
     ///
     /// The PE form goes through Assembly.Load(byte[]), so the module has no file
@@ -173,16 +200,14 @@ public static class DotclHost
     {
         if (coreImage == null || coreImage.Length == 0)
             throw new ArgumentException("LoadCore: the core image is empty", nameof(coreImage));
-        _coreLoaded = true;
 
         if (coreImage.Length >= 2 && coreImage[0] == 0x4D && coreImage[1] == 0x5A)
-        {
             RunCoreModuleInit(System.Reflection.Assembly.Load(coreImage), "FASL core (in memory)");
-            return;
-        }
+        else
+            RunCoreSil(System.Text.Encoding.UTF8.GetString(coreImage), "core (in memory)");
 
-        var source = System.Text.Encoding.UTF8.GetString(coreImage);
-        RunCoreSil(source, "core (in memory)");
+        // Set after the load succeeds, for the reason LoadCore(string) does.
+        _coreLoaded = true;
     }
 
     private static void LoadCoreFasl(string filePath)
@@ -193,7 +218,7 @@ public static class DotclHost
     private static void RunCoreModuleInit(System.Reflection.Assembly asm, string what)
     {
         // Same reason as Program.RunCoreFasl: the generation stamp is read off the
-        // core assembly, so an embedding host must record it too — including the
+        // core assembly, so an embedding host must record it too: including the
         // in-memory path, which has no file to fall back to.
         Startup.CoreAssembly = asm;
         var t = asm.GetType("CompiledModule")
@@ -251,9 +276,9 @@ public static class DotclHost
 
     /// <summary>
     /// Build-time-link convenience over <see cref="RunLinkedModule"/>: resolve an
-    /// already-baked-in compiled module by its stable assembly NAME — the
+    /// already-baked-in compiled module by its stable assembly NAME: the
     /// <c>:module-name</c> passed to <c>compile-file</c> / <c>dotcl:sil-to-fasl</c>,
-    /// which must equal the referenced file's base name — and run its
+    /// which must equal the referenced file's base name: and run its
     /// <c>CompiledModule.ModuleInit</c>. Uses <see cref="Assembly.Load(AssemblyName)"/>
     /// on an assembly that is already linked into the image; it never calls
     /// <c>Assembly.LoadFrom</c> (PlatformNotSupported under NativeAOT), so it is the
@@ -287,7 +312,7 @@ public static class DotclHost
 
     /// <summary>
     /// Load the bundled core unless one is already loaded. Idempotent, so a
-    /// component that must run on a booted image — a library facade, a plugin —
+    /// component that must run on a booted image, a library facade, a plugin,
     /// can call it without knowing whether the host booted dotcl first. Loading
     /// a core twice is not benign: the second pass redefines CL functions and
     /// signals "package COMMON-LISP is locked".
@@ -335,8 +360,8 @@ public static class DotclHost
     ///
     /// Loading is idempotent per entry: the core is loaded at most once per
     /// process, and a FASL whose module is already in <c>*MODULES*</c> is
-    /// skipped. Several manifests can therefore be loaded in one process — an
-    /// app's own plus one per referenced Lisp library — with the overlap (the
+    /// skipped. Several manifests can therefore be loaded in one process, an
+    /// app's own plus one per referenced Lisp library, with the overlap (the
     /// core, shared contribs) paid for once. Re-loading the core is not benign:
     /// it redefines CL functions and signals "package COMMON-LISP is locked".
     ///
@@ -364,7 +389,7 @@ public static class DotclHost
                 ? fileName
                 : System.IO.Path.Combine(dir, fileName);
 
-            // Module name is the filename without extension, lowercased —
+            // Module name is the filename without extension, lowercased;
             // matching the keyword/string normalization REQUIRE applies. The
             // base image is "dotcl" and is tracked by _coreLoaded rather than
             // *MODULES*: it is a core, not a library.
@@ -391,7 +416,7 @@ public static class DotclHost
     }
 
     /// <summary>
-    /// True if MODULENAME is already on <c>*MODULES*</c> — i.e. a manifest load
+    /// True if MODULENAME is already on <c>*MODULES*</c>: i.e. a manifest load
     /// or a REQUIRE has brought it in.
     /// </summary>
     private static bool ModuleProvided(Symbol modulesSym, string moduleName)
@@ -560,17 +585,179 @@ public static class DotclHost
     }
 
     /// <summary>
-    /// Convert a Lisp result to its natural .NET representation: NIL → null,
-    /// T → true, integers → int (or long when out of int range), floats →
-    /// double/float, strings → string, a wrapped .NET object → the object
+    /// <see cref="Call"/> keeping every value the function returned, not just the
+    /// primary one. A Lisp function returns as many values as it likes -- FLOOR
+    /// returns two, GETHASH returns the value and whether it was present, and a
+    /// host that only ever sees the first cannot tell "absent" from "present and
+    /// NIL". The array is the values in order; a function returning no values at
+    /// all gives an empty array, and the ordinary single-value case gives one
+    /// element (never null).
+    /// </summary>
+    public static LispObject[] CallMv(string functionName, params object?[] args)
+    {
+        var sym = ResolveCallable(functionName);
+        if (sym.Function is not LispFunction fn)
+            throw new InvalidOperationException(
+                $"DotclHost.CallMv: symbol {functionName} has no function binding");
+        var lispArgs = new LispObject[args.Length];
+        for (int i = 0; i < args.Length; i++)
+            lispArgs[i] = Runtime.DotNetToLisp(args[i]);
+        // Clear the channel first, so "did the callee publish?" is a question
+        // about THIS call. Without it a previous (values) is still current and a
+        // function that returns one value the ordinary way looks like it returned
+        // none -- the same trap the compiled call sequence avoids the same way.
+        MultipleValues.Reset();
+        return ValuesOf(fn.Invoke(lispArgs));
+    }
+
+    /// <summary>
+    /// <see cref="EvalString"/> keeping every value of the LAST form, for the
+    /// same reason as <see cref="CallMv"/>. Earlier forms are evaluated for
+    /// effect, exactly as EvalString does.
+    /// </summary>
+    public static LispObject[] EvalStringMv(string source)
+    {
+        var reader = new Reader(new System.IO.StringReader(source));
+        LispObject last = Nil.Instance;
+        MultipleValues.Reset();
+        while (reader.TryRead(out var form))
+        {
+            MultipleValues.Reset();
+            last = Runtime.Eval(form);
+        }
+        return ValuesOf(last);
+    }
+
+    /// <summary>
+    /// The values a call produced, given its primary result. Valid only
+    /// immediately after the call, and only when the channel was reset just
+    /// before it -- the callers here do both.
+    ///
+    /// Three shapes reach this. MvReturn is the boxed form the protocol uses
+    /// when values cross a boundary that cannot carry the channel. A negative
+    /// count means nobody published, which is how a function returning one value
+    /// the ordinary way looks. Otherwise the channel is what the callee
+    /// published, including the zero-length case for (VALUES).
+    /// </summary>
+    private static LispObject[] ValuesOf(LispObject primary)
+    {
+        if (primary is MvReturn mv) return mv.ToArray();
+        if (MultipleValues.Count < 0) return new[] { primary };
+        return MultipleValues.Get();
+    }
+
+    /// <summary>
+    /// The value of a special variable, by name. Resolution follows the same
+    /// rule as <see cref="Call"/>: "*FOO*" in <see cref="CurrentPackage"/>,
+    /// "PKG:*FOO*" for an exported one, "PKG::*FOO*" to reach an internal one.
+    /// The name is a SYMBOL NAME, so it is matched exactly -- write it the way
+    /// the reader would have produced it, in upper case.
+    ///
+    /// This is the general form of <see cref="CurrentPackage"/>, which stays as
+    /// the convenience for the one variable every host touches.
+    /// </summary>
+    public static LispObject GetSpecial(string variableName)
+    {
+        Initialize();
+        var sym = ResolveVariable(variableName);
+        if (!DynamicBindings.TryGet(sym, out var value))
+            throw new InvalidOperationException(
+                $"DotclHost.GetSpecial: {variableName} is unbound");
+        return value;
+    }
+
+    /// <summary>
+    /// Set a special variable by name, converting VALUE with
+    /// <see cref="Runtime.DotNetToLisp"/> the way <see cref="Call"/> converts
+    /// arguments. Pass a <see cref="LispObject"/> to set it exactly.
+    ///
+    /// This assigns the CURRENT binding, which is what a host wants: it is the
+    /// global one unless the host is called back from inside a LET of that
+    /// variable, and then assigning the innermost binding is the CL meaning of
+    /// SETQ anyway.
+    /// </summary>
+    public static void SetSpecial(string variableName, object? value)
+    {
+        Initialize();
+        var sym = ResolveVariable(variableName);
+        DynamicBindings.Set(sym, value is LispObject lo ? lo : Runtime.DotNetToLisp(value));
+    }
+
+    /// <summary>
+    /// Resolve a variable name the way <see cref="ResolveCallable"/> resolves a
+    /// function name, minus the requirement that it name a function. An
+    /// unqualified name that names nothing yet is interned in the current
+    /// package, so SetSpecial can create a variable the Lisp side then reads --
+    /// which is the point of having a setter at all.
+    /// </summary>
+    private static Symbol ResolveVariable(string variableName)
+    {
+        var colon = variableName.IndexOf(':');
+        if (colon > 0)
+        {
+            var pkgName = variableName[..colon];
+            bool internalOk = colon + 1 < variableName.Length && variableName[colon + 1] == ':';
+            var symName = variableName[colon..].TrimStart(':');
+            var pkg = Package.FindPackage(pkgName)
+                ?? throw new InvalidOperationException(
+                    $"DotclHost.GetSpecial/SetSpecial: no package named {pkgName} "
+                    + $"(in \"{variableName}\"){NameHint(pkgName)}");
+            var (qualified, qualifiedStatus) = pkg.FindSymbol(symName);
+            if (qualifiedStatus == SymbolStatus.None)
+                throw new InvalidOperationException(
+                    $"DotclHost.GetSpecial/SetSpecial: package {pkgName} has no symbol "
+                    + $"{symName}{NameHint(symName)}");
+            if (!internalOk && qualifiedStatus != SymbolStatus.External)
+                throw new InvalidOperationException(
+                    $"DotclHost.GetSpecial/SetSpecial: {pkgName} does not export {symName}; "
+                    + $"write \"{pkgName}::{symName}\" to reach it anyway");
+            return qualified;
+        }
+        var current = DynamicBindings.Get(Startup.Sym("*PACKAGE*")) as Package;
+        if (current != null) return current.Intern(variableName).symbol;
+        return Startup.Sym(variableName);
+    }
+
+    /// <summary>
+    /// Send what Lisp writes to <c>*STANDARD-OUTPUT*</c> to WRITER. A host that
+    /// embeds Lisp usually has somewhere of its own for output -- a log, a text
+    /// box, a test buffer -- and without this the only way there was to write
+    /// Lisp code that bound the stream itself.
+    ///
+    /// Passing null restores the process's own standard output. The writer is
+    /// used as given: the caller owns it, including flushing and disposal.
+    /// </summary>
+    public static void SetStandardOutput(System.IO.TextWriter? writer)
+        => SetOutputStream("*STANDARD-OUTPUT*", writer, System.Console.Out);
+
+    /// <summary>
+    /// The <c>*ERROR-OUTPUT*</c> counterpart of <see cref="SetStandardOutput"/>.
+    /// Separate because a host usually wants diagnostics somewhere else than
+    /// program output, which is the distinction the two variables exist for.
+    /// </summary>
+    public static void SetErrorOutput(System.IO.TextWriter? writer)
+        => SetOutputStream("*ERROR-OUTPUT*", writer, System.Console.Error);
+
+    private static void SetOutputStream(string variableName, System.IO.TextWriter? writer,
+                                        System.IO.TextWriter fallback)
+    {
+        Initialize();
+        DynamicBindings.Set(Startup.Sym(variableName),
+                            new LispOutputStream(writer ?? fallback));
+    }
+
+    /// <summary>
+    /// Convert a Lisp result to its natural .NET representation: NIL -> null,
+    /// T -> true, integers -> int (or long when out of int range), floats ->
+    /// double/float, strings -> string, a wrapped .NET object -> the object
     /// itself. Values without a natural scalar counterpart (lists, symbols,
-    /// hash-tables, …) are returned as the underlying <see cref="LispObject"/>,
+    /// hash-tables, ...) are returned as the underlying <see cref="LispObject"/>,
     /// which the caller can inspect or walk directly. Inverse of the
     /// <see cref="Runtime.DotNetToLisp"/> conversion used on the way in.
     /// </summary>
     public static object? ToClr(LispObject value) => Runtime.LispToDotNetGeneric(value);
     /// Passing a .NET array or collection straight to <see cref="Call"/> hands
-    /// the Lisp side a foreign object, not a sequence — deliberately, so a
+    /// the Lisp side a foreign object, not a sequence: deliberately, so a
     /// byte[] stays the same buffer. This is the explicit way to say "as a Lisp
     /// list", for calling a function that takes one sequence argument.
     /// </summary>
@@ -597,7 +784,7 @@ public static class DotclHost
     }
 
     /// <summary>
-    /// Convert a Lisp sequence — a list or a vector — to a .NET array, each
+    /// Convert a Lisp sequence, a list or a vector, to a .NET array, each
     /// element converted to <typeparamref name="T"/> as <see cref="ToClr{T}"/>
     /// does. NIL is the empty sequence, so it yields an empty array.
     /// </summary>
@@ -645,8 +832,8 @@ public static class DotclHost
 
     /// <summary>
     /// Precompiled-only mode. When enabled, any attempt to generate code at
-    /// runtime — eval/compile of compound forms, dotnet:define-class, native FFI
-    /// thunks — throws instead of emitting. A host that loads a precompiled image
+    /// runtime, eval/compile of compound forms, dotnet:define-class, native FFI
+    /// thunks, throws instead of emitting. A host that loads a precompiled image
     /// can set this after loading to assert it never JITs, mirroring an AOT/IL2CPP
     /// target. Running already-compiled code is unaffected.
     /// </summary>
@@ -658,7 +845,7 @@ public static class DotclHost
 
     /// <summary>
     /// Expose a host .NET function to Lisp under NAME, callable like any Lisp
-    /// function (the counterpart of <see cref="Call"/>'s Lisp→C# direction).
+    /// function (the counterpart of <see cref="Call"/>'s Lisp->C# direction).
     /// The symbol is interned in CL-USER, so Lisp code reads <c>(name ...)</c>
     /// without a package prefix. Arguments arrive as natural .NET values (same
     /// conversion as <see cref="ToClr"/>) and the return is converted back via
@@ -682,22 +869,41 @@ public static class DotclHost
     /// Bind <c>*debugger-hook*</c> so an unhandled condition throws back to the
     /// .NET caller instead of entering the interactive debugger. For
     /// non-interactive hosts (MSBuild tasks, servers) with no console to drive
-    /// the debugger — otherwise a Lisp error stalls on "stdin closed". The thrown
-    /// <see cref="InvalidOperationException"/> carries the condition type + message.
+    /// the debugger: otherwise a Lisp error stalls on "stdin closed".
+    ///
+    /// Throws <see cref="DotclConditionException"/>, which carries the condition
+    /// object, its type name and any wrapped .NET exception. A host that wants
+    /// to act on the failure, read the condition's slots, choose a restart,
+    /// needs the condition, and flattening it into a message string threw that
+    /// away. <see cref="SetThrowingDebuggerHook(bool)"/> selects the older
+    /// <see cref="InvalidOperationException"/> form for a host that matches on it.
     /// </summary>
-    public static void SetThrowingDebuggerHook()
+    public static void SetThrowingDebuggerHook() => SetThrowingDebuggerHook(true);
+
+    /// <summary>
+    /// <see cref="SetThrowingDebuggerHook()"/>, choosing what it throws.
+    /// TYPED true (what the no-argument overload does) throws
+    /// <see cref="DotclConditionException"/>. TYPED false restores the original
+    /// behaviour, an <see cref="InvalidOperationException"/> whose message is
+    /// <c>"TYPE: report"</c> and which carries nothing else, for a host written
+    /// against it. The no-argument overload is kept as its own signature rather
+    /// than made a defaulted parameter: code already compiled against it (a
+    /// shipped fasl, a host assembly) calls that exact signature.
+    /// </summary>
+    public static void SetThrowingDebuggerHook(bool typed)
     {
         var hookSym = Startup.Sym("*DEBUGGER-HOOK*");
         DynamicBindings.Set(hookSym, new LispFunction(a =>
         {
             var cond = a.Length > 0 ? a[0] : Nil.Instance;
+            if (typed) throw new DotclConditionException(cond);
             var msg = cond is LispCondition lc ? lc.Message : cond.ToString();
             var typeName = cond is LispCondition lc2 ? lc2.ConditionTypeName : "ERROR";
             throw new InvalidOperationException($"{typeName}: {msg}");
         }, "*NON-INTERACTIVE-DEBUGGER-HOOK*", 2));
     }
 
-    // ── Project-core build (ASDF → fasl) ────────────────────────────────────
+    // -- Project-core build (ASDF -> fasl) ------------------------------------
     // Shared by the `dotcl build` CLI subcommand (runtime/Program.cs) and the
     // MSBuild integration. Assumes Initialize() + LoadCore() have already run.
     // These throw on error (FileNotFoundException for a missing .asd); callers
@@ -716,8 +922,8 @@ public static class DotclHost
     /// <summary>
     /// Load each user-supplied build-init script (the &lt;DotclBuildInit&gt; items)
     /// before dependency resolution. dotcl does NOT auto-scan ~/quicklisp etc.; a
-    /// build that needs external systems makes them discoverable here — e.g. the
-    /// script does (pushnew #p"…/foo/" asdf:*central-registry*) or boots quicklisp.
+    /// build that needs external systems makes them discoverable here; e.g. the
+    /// script does (pushnew #p".../foo/" asdf:*central-registry*) or boots quicklisp.
     /// Build-time only: the shipped runtime never runs these, so it can't end up
     /// depending on the dev machine's paths. Called after (require "asdf").
     /// </summary>
@@ -742,7 +948,7 @@ public static class DotclHost
     /// that merely shares its name.
     ///
     /// ASDF looks systems up by NAME. The build says "compile this file", loads
-    /// it with LOAD-ASD, and then asks FIND-SYSTEM for the name — at which point
+    /// it with LOAD-ASD, and then asks FIND-SYSTEM for the name: at which point
     /// any other .asd of the same name that ASDF can see (its source registry
     /// scans whole trees) can answer instead, and the build compiles someone
     /// else's sources without a word. That is not hypothetical: the in-tree
@@ -771,7 +977,7 @@ public static class DotclHost
     /// Register each user-declared external system directory (the
     /// &lt;DotclAsdSearchPath&gt; items) onto <c>asdf:*central-registry*</c> so the
     /// project's <c>:depends-on</c> resolves systems that live outside the shipped
-    /// contrib — without dotcl auto-scanning the dev machine. This is the
+    /// contrib: without dotcl auto-scanning the dev machine. This is the
     /// declarative common case; &lt;DotclBuildInit&gt; remains the escape hatch for
     /// anything a plain dir list can't express (booting quicklisp, etc.). Like
     /// build-init, this runs at build time only and never in the shipped runtime.
@@ -784,8 +990,8 @@ public static class DotclHost
         {
             if (string.IsNullOrWhiteSpace(d)) continue;
             // A directory arg whose value ends in "\" gets a trailing quote
-            // glued on by Windows command-line escaping (\" → literal "), since
-            // the MSBuild Exec passes %(FullPath) of a dir (…\extlib\) quoted.
+            // glued on by Windows command-line escaping (\" -> literal "), since
+            // the MSBuild Exec passes %(FullPath) of a dir (...\extlib\) quoted.
             // Strip the surrounding-quote artifact before resolving.
             var t = d.Trim().Trim('"');
             if (t.Length == 0) continue;
@@ -800,11 +1006,11 @@ public static class DotclHost
     /// <summary>
     /// Route ASDF's compile output under <paramref name="cacheDir"/> (a dir
     /// inside the project's obj/) instead of the default user cache
-    /// (~/.cache/common-lisp/…). ASDF caches each system's component fasls keyed
+    /// (~/.cache/common-lisp/...). ASDF caches each system's component fasls keyed
     /// by source path; that cache lives outside the project and survives
     /// `dotnet clean`, so a regenerated source can be shadowed by a stale cached
     /// fasl (dotcl/dotcl#53). Sending it under obj/ makes `dotnet clean` (which
-    /// wipes obj/) clear it too — one project-local cache, no external trap. The
+    /// wipes obj/) clear it too: one project-local cache, no external trap. The
     /// source tree is mirrored under the dir so distinct sources never collide.
     /// Called after (require "asdf"), before any load/compile. MSBuild path only
     /// (the CLI keeps ASDF's default shared cache).
@@ -821,7 +1027,32 @@ public static class DotclHost
             Runtime.ReadFromString(new LispObject[] { new LispString(form) })));
     }
 
-    public static void ResolveDeps(string asdPath, string? manifestOut, string? rootSourcesOut, string? targetRid = null, string[]? buildInit = null, string[]? searchPaths = null)
+    // The build-tool entry points moved to DotclBuild, which is where a build
+    // tool should look for them; these forward so code compiled against the old
+    // names keeps working for one release. Removing a member is what breaks a
+    // shipped fasl, so the names go out with a warning first rather than
+    // disappearing. The implementations below are unchanged.
+    [System.Obsolete("Moved to DotclBuild.ResolveDeps.")]
+    public static void ResolveDeps(string asdPath, string? manifestOut, string? rootSourcesOut,
+                                   string? targetRid = null, string[]? buildInit = null,
+                                   string[]? searchPaths = null)
+        => DotclBuild.ResolveDeps(asdPath, manifestOut, rootSourcesOut, targetRid, buildInit, searchPaths);
+
+    [System.Obsolete("Moved to DotclBuild.CompileProject.")]
+    public static void CompileProject(string asdPath, string outputPath, string[]? buildInit = null,
+                                      string[]? searchPaths = null, bool debugInfo = false)
+        => DotclBuild.CompileProject(asdPath, outputPath, buildInit, searchPaths, debugInfo);
+
+    [System.Obsolete("Moved to DotclBuild.PackFasl.")]
+    public static void PackFasl(string system, string outputFasl, string? toplevel = null,
+                                string[]? buildInit = null, string[]? searchPaths = null)
+        => DotclBuild.PackFasl(system, outputFasl, toplevel, buildInit, searchPaths);
+
+    [System.Obsolete("Moved to DotclBuild.ReadSystemMeta.")]
+    public static DotclBuild.SystemMeta? ReadSystemMeta(string system, string[]? searchPaths = null)
+        => DotclBuild.ReadSystemMeta(system, searchPaths);
+
+    internal static void ResolveDepsCore(string asdPath, string? manifestOut, string? rootSourcesOut, string? targetRid = null, string[]? buildInit = null, string[]? searchPaths = null)
     {
         var absAsd = System.IO.Path.GetFullPath(asdPath);
         if (!System.IO.File.Exists(absAsd))
@@ -864,7 +1095,7 @@ public static class DotclHost
             : $"(open \"{rootSourcesOut.Replace("\\", "/")}\" :direction :output :if-exists :supersede)";
         // Project-based dep fasl cache (dotcl/dotcl#47): when a manifest path is given
         // (the MSBuild build), put on-the-fly-compiled dep fasls in a "deps/" subdir
-        // next to the manifest — i.e. under obj/.../dotcl-fasl/ — instead of polluting
+        // next to the manifest, i.e. under obj/.../dotcl-fasl/, instead of polluting
         // each dep's source dir. That makes them cleanable by `dotnet clean` (which wipes
         // obj/), at the cost of recompiling deps per project (the .NET obj/ model). The
         // CompileProject load step uses the same convention. A prebuilt .fasl.r2r-<rid> AOT
@@ -960,7 +1191,7 @@ public static class DotclHost
     /// <paramref name="outputPath"/>. Only the root system is compiled;
     /// dependencies stay as pre-built fasls resolved by <see cref="ResolveDeps"/>.
     /// </summary>
-    public static void CompileProject(string asdPath, string outputPath, string[]? buildInit = null, string[]? searchPaths = null, bool debugInfo = false)
+    internal static void CompileProjectCore(string asdPath, string outputPath, string[]? buildInit = null, string[]? searchPaths = null, bool debugInfo = false)
     {
         var absAsd = System.IO.Path.GetFullPath(asdPath);
         if (!System.IO.File.Exists(absAsd))
@@ -1043,7 +1274,7 @@ public static class DotclHost
         (setf sources (cons (pathname path) sources))))
     ;; Load the resolved :depends-on fasls into the image BEFORE compiling the
     ;; root, so the deps' defpackage/macros are available at the root's compile
-    ;; time — same as a standard ASDF load-op-then-compile. Without this the
+    ;; time: same as a standard ASDF load-op-then-compile. Without this the
     ;; root must itself (require :dep), because the concatenated unit holds only
     ;; the root's own sources. The dep fasls are the
     ;; ones resolve-deps built at the project deps/ cache dir, in topo order.
@@ -1074,7 +1305,7 @@ public static class DotclHost
         var lineMap = BuildConcatLineMap(sourcePaths);
 
         // Progress trace (dotcl/dotcl#48 point 2): which files this build compiles,
-        // in order — so a failing build shows what was processed before the error.
+        // in order: so a failing build shows what was processed before the error.
         System.Console.Error.WriteLine(
             $"[build] {System.IO.Path.GetFileNameWithoutExtension(absAsd)}: compiling {sourcePaths.Length} source(s)");
         foreach (var sp in sourcePaths)
@@ -1084,7 +1315,7 @@ public static class DotclHost
         // *concatenate-build* (cross-compiled, so the binding shares symbol identity
         // with the compiler's read) so the compiler evaluates toplevel
         // require/use-package/load at compile time within the single concatenated
-        // unit — restoring the compile+load interleaving a normal multi-file load-op
+        // unit: restoring the compile+load interleaving a normal multi-file load-op
         // would have given the original :components.
         //
         // EmitBuildSourceLocations makes COMPILE-FILE attach the concat file + form
@@ -1131,8 +1362,8 @@ public static class DotclHost
 
     /// <summary>
     /// Build a single self-contained FASL for <c>dotcl pack</c>: monolithic-
-    /// concatenate the named ASDF system — its root sources AND all dependency
-    /// sources — via <c>asdf:monolithic-concatenate-source-op</c>, then
+    /// concatenate the named ASDF system, its root sources AND all dependency
+    /// sources, via <c>asdf:monolithic-concatenate-source-op</c>, then
     /// <c>compile-file-concatenated</c> the result into
     /// <paramref name="outputFasl"/>. Unlike <see cref="CompileProject"/> (root
     /// only, deps stay as separate fasls) the produced FASL loads standalone, so
@@ -1144,7 +1375,7 @@ public static class DotclHost
     /// already invokes its entry at load time (e.g. a roswell <c>&lt;name&gt;/exe</c>
     /// launcher) needs none.
     /// </summary>
-    public static void PackFasl(string system, string outputFasl, string? toplevel = null,
+    internal static void PackFaslCore(string system, string outputFasl, string? toplevel = null,
                                 string[]? buildInit = null, string[]? searchPaths = null)
     {
         var absOut = System.IO.Path.GetFullPath(outputFasl);
@@ -1219,19 +1450,6 @@ public static class DotclHost
         }
     }
 
-    /// <summary>
-    /// Metadata read off an ASDF system definition, used to fill in nuspec
-    /// fields for `dotcl pack`. Every field is null when the .asd omits it.
-    /// </summary>
-    public sealed class SystemMeta
-    {
-        public string? Description;
-        public string? Homepage;
-        public string? SourceControlUrl;
-        public string? Author;
-        public string? License;
-        public string? AsdDirectory;   // where to look for a sibling README
-    }
 
     /// <summary>
     /// Read the standard metadata slots off an ASDF system. `dotcl pack` uses
@@ -1239,9 +1457,9 @@ public static class DotclHost
     /// inheriting the description and URLs of the dotcl packages it was
     /// restamped from. Returns a SystemMeta whose fields are null where the .asd
     /// is silent; returns null if the system cannot be found at all (packing
-    /// proceeds — the fasl build reports a missing system with a better error).
+    /// proceeds: the fasl build reports a missing system with a better error).
     /// </summary>
-    public static SystemMeta? ReadSystemMeta(string system, string[]? searchPaths = null)
+    internal static DotclBuild.SystemMeta? ReadSystemMetaCore(string system, string[]? searchPaths = null)
     {
         try
         {
@@ -1275,7 +1493,7 @@ public static class DotclHost
                 cur = c.Cdr;
             }
             while (items.Count < 6) items.Add(null);
-            return new SystemMeta
+            return new DotclBuild.SystemMeta
             {
                 Description = items[0],
                 Homepage = items[1],
@@ -1323,7 +1541,7 @@ public static class DotclHost
                 foreach (var b in System.IO.File.ReadAllBytes(sourcePaths[i]))
                     if (b == (byte)'\n') newlines++;
             }
-            catch { /* unreadable source — leave start where it is */ }
+            catch { /* unreadable source; leave start where it is */ }
             start += newlines;
         }
         return map;

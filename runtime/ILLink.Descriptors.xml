@@ -10,7 +10,7 @@
   sources. Enumerating the reachable surface is not an option: the compiler emits
   calls across most of the runtime, and the set changes whenever it does.
 
-  Trimming the framework is unaffected — this preserves only DotCL.Runtime.
+  Trimming the framework is unaffected; this preserves only DotCL.Runtime.
   An application that never loads a core or a FASL can drop this with
   -p:DotclPreserveForTrimming=false.
 -->

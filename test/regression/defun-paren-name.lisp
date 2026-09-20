@@ -1,6 +1,6 @@
 ;;; Regression: DEFUN of a symbol whose print-name starts with #\( must
 ;;; register the function like any other symbol. The mangled name string is
-;;; used to distinguish compound function names — (SETF x), (CAS x) — which
+;;; used to distinguish compound function names, (SETF x), (CAS x), which
 ;;; register on a target symbol's slot rather than as a symbol-function. That
 ;;; discriminator used StartsWith("(") alone, which also matched a plain symbol
 ;;; whose name merely starts with '(' (e.g. SB-FORMAT::|(-COMPILER|, the ~(
@@ -34,7 +34,7 @@
          (funcall (aref *paren-expander-vec* 0) 21))
   42)
 
-;;; A paren that is NOT leading must still work (it always did) — guard against
+;;; A paren that is NOT leading must still work (it always did): guard against
 ;;; over-broadening the compound classification.
 (defun |mid(paren| (x) (* x 3))
 

@@ -55,7 +55,7 @@ public static partial class Runtime
         if (a is Fixnum fa && b is Fixnum fb && fa.Value == fb.Value) return T.Instance;
         if (a is LispChar ca && b is LispChar cb && ca.Value == cb.Value) return T.Instance;
         // eql compares floats by bit representation (CLHS): (eql 0.0 -0.0)=NIL, bit-identical
-        // NaNs are eql=T. Value compare (==) would give NaN!=NaN, 0.0==-0.0 — a mismatch.
+        // NaNs are eql=T. Value compare (==) would give NaN!=NaN, 0.0==-0.0; a mismatch.
         if (a is SingleFloat sa && b is SingleFloat sb
             && Compat.SingleToInt32Bits(sa.Value) == Compat.SingleToInt32Bits(sb.Value)) return T.Instance;
         if (a is DoubleFloat da && b is DoubleFloat db
@@ -75,14 +75,14 @@ public static partial class Runtime
     {
         a = Primary(a); b = Primary(b);
         // Loop (not recurse) along the cons spine so a long list can't overflow, and so the
-        // dotted-pair tail re-runs the eql/string/... checks below — the tail of a cons must
+        // dotted-pair tail re-runs the eql/string/... checks below: the tail of a cons must
         // be compared with EQUAL too, not eql, e.g. (equal (cons 1 "x") (cons 1 "x")) must be
         // T even though (eql "x" "x") is NIL. A plain mismatched atom falls through to
         // the final "return NIL", so this terminates.
         while (true)
         {
             if (IsTrueEql(a, b)) return T.Instance;
-            // String comparison: LispString or char-vector — compare by content
+            // String comparison: LispString or char-vector: compare by content
             bool aIsStr = a is LispString || (a is LispVector av && av.IsCharVector);
             bool bIsStr = b is LispString || (b is LispVector bv && bv.IsCharVector);
             if (aIsStr && bIsStr)
@@ -118,7 +118,7 @@ public static partial class Runtime
                 a = ca.Cdr; b = cb.Cdr;
                 continue;
             }
-            // Mismatched (one cons / one not) or two non-equal atoms → not EQUAL.
+            // Mismatched (one cons / one not) or two non-equal atoms -> not EQUAL.
             return Nil.Instance;
         }
     }
@@ -131,7 +131,7 @@ public static partial class Runtime
     {
         obj = Primary(obj);
         // NIL has a private constructor and a single Instance, so identity IS the
-        // type test — and a pointer compare, unlike `is Nil`, does not go through
+        // type test: and a pointer compare, unlike `is Nil`, does not go through
         // CastHelpers.IsInstanceOfClass (which a profile of precompiled code shows
         // near the top).
         return ReferenceEquals(obj, Nil.Instance) || ReferenceEquals(obj, Startup.NIL_SYM);
@@ -173,7 +173,7 @@ public static partial class Runtime
         if (obj is not Number)
             throw new LispErrorException(new LispTypeError("IMAGPART: argument is not a number", obj, Startup.Sym("NUMBER")));
         if (obj is LispComplex c) return c.Imaginary;
-        // For a real x, imagpart is (* 0 x): a signed float zero (negative float → -0.0).
+        // For a real x, imagpart is (* 0 x): a signed float zero (negative float -> -0.0).
         // A fixed +0.0 would make (eql (imagpart -1.5) (* 0 -1.5)) mismatch (IMAGPART.4).
         return obj switch
         {
@@ -223,8 +223,8 @@ public static partial class Runtime
     internal static LispObject ElementTypeNameToType(string et)
     {
         if (et == "NIL") return Nil.Instance;
-        // Compound types stored as "UNSIGNED-BYTE-8", "SIGNED-BYTE-16", etc.
-        // — reconstruct the list form (UNSIGNED-BYTE 8).
+        // Compound types stored as "UNSIGNED-BYTE-8", "SIGNED-BYTE-16", etc.;
+        // reconstruct the list form (UNSIGNED-BYTE 8).
         if (et.StartsWith("UNSIGNED-BYTE-") || et.StartsWith("SIGNED-BYTE-"))
         {
             int dash = et.LastIndexOf('-');
@@ -305,7 +305,7 @@ public static partial class Runtime
         Startup.RegisterUnary("TYPE-OF", Runtime.TypeOf);
         Startup.RegisterUnary("RATIONALP", Runtime.Rationalp);
 
-        // dotcl:decimalp — non-standard predicate for the first-class CLR decimal
+        // dotcl:decimalp: non-standard predicate for the first-class CLR decimal
         // (LispDecimal). Exported from DOTCL but NOT imported into CL-USER: like the
         // dotnet:/dotcl: interop surface, a non-standard extension stays qualified rather
         // than contaminating CL-USER. Callers write dotcl:decimalp (or (use-package :dotcl)).

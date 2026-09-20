@@ -11,8 +11,8 @@ namespace DotCL.Diagnostics;
 /// so the overhead on hot-path constructors is negligible.
 ///
 /// Usage from Lisp:
-///   (dotcl:alloc-report)          → prints counts, sorted descending
-///   (dotcl:alloc-report-reset)    → zero all counters
+///   (dotcl:alloc-report)          -> prints counts, sorted descending
+///   (dotcl:alloc-report-reset)    -> zero all counters
 ///
 /// Or set DOTCL_ALLOC_PROF=1 and (dotcl:alloc-report) on exit.
 ///

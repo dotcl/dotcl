@@ -2,15 +2,15 @@
 ;;; binding (CLHS 5.1.2.1).
 ;;;
 ;;; The environment object handed to an expander carries its symbol macros as a
-;;; hash table built from *SYMBOL-MACROS*, which SYMBOL-MACROLET pushes onto — so
+;;; hash table built from *SYMBOL-MACROS*, which SYMBOL-MACROLET pushes onto; so
 ;;; an outer binding of a name sits BEHIND the inner one in that alist. The
 ;;; builder wrote every entry into the table in order, letting the outer binding
 ;;; overwrite the inner one, so shadowing came out backwards and the OUTERMOST
 ;;; expansion won. The macrolet table three lines above it already skipped
 ;;; already-present keys for exactly this reason.
 ;;;
-;;; Only the tree-walk evaluator reached the broken builder — the compiler hands
-;;; expanders an environment it builds itself — so the compiled path was right and
+;;; Only the tree-walk evaluator reached the broken builder, the compiler hands
+;;; expanders an environment it builds itself, so the compiled path was right and
 ;;; the emit-free suite was where it showed.
 
 (defmacro %ism-probe (&environment env) `(list ',(macroexpand-1 '%ism-foo env)))

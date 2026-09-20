@@ -2,7 +2,7 @@
 ;;;
 ;;; (write-to-string rs :readably t) emits
 ;;; #.(...MAKE-RANDOM-STATE-FROM-SEEDS a b). The constructor is a dotcl extension
-;;; living in DOTCL-INTERNAL, but it was spelled COMMON-LISP:: — and that symbol
+;;; living in DOTCL-INTERNAL, but it was spelled COMMON-LISP::: and that symbol
 ;;; has no function.
 ;;;
 ;;; The compiled path worked because the compiler resolves a call by NAME through

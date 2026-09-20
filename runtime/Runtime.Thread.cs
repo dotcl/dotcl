@@ -11,7 +11,7 @@ public class LispThread : LispObject
 
     /// <summary>
     /// Functions queued by INTERRUPT-THREAD, to run ON this thread the next time
-    /// it notices — which, on .NET, means when a blocking wait it is sitting in
+    /// it notices: which, on .NET, means when a blocking wait it is sitting in
     /// throws ThreadInterruptedException. See Runtime.InterruptThread.
     /// </summary>
     public System.Collections.Concurrent.ConcurrentQueue<LispObject> PendingInterrupts { get; }
@@ -206,7 +206,7 @@ public partial class Runtime
             LispObject? result = null;
             // Establish a top-level ABORT restart for this worker thread, like the
             // REPL does for the main thread (Program.cs), so a concurrency library
-            // that terminates a worker via (invoke-restart 'abort) finds one —
+            // that terminates a worker via (invoke-restart 'abort) finds one;
             // compute-restarts was empty in worker threads, breaking lparallel's
             // active-worker-replacement (invoke-abort-thread). The stack is
             // [ThreadStatic], so this cluster is private to this thread.
@@ -223,14 +223,14 @@ public partial class Runtime
             }
             catch (RestartInvocationException rie) when (ReferenceEquals(rie.Tag, abortTag))
             {
-                // (invoke-restart 'abort) in the worker → unwind the body and end
+                // (invoke-restart 'abort) in the worker -> unwind the body and end
                 // the thread cleanly, returning NIL.
                 result = Nil.Instance;
             }
             catch (System.Threading.ThreadInterruptedException)
             {
                 // DESTROY-THREAD. Asking a thread to die is not an error to
-                // report — and the caller doing it routinely (bordeaux-threads'
+                // report: and the caller doing it routinely (bordeaux-threads'
                 // WITH-TIMEOUT retires its watchdog this way on every successful
                 // body) would otherwise print on every normal completion.
                 result = Nil.Instance;
@@ -265,7 +265,7 @@ public partial class Runtime
         return lispThread;
     }
 
-    /// <summary>(bt:current-thread) → thread object</summary>
+    /// <summary>(bt:current-thread) -> thread object</summary>
     public static LispObject CurrentThread(LispObject[] args)
     {
         if (_currentLispThread == null)
@@ -276,7 +276,7 @@ public partial class Runtime
         return _currentLispThread;
     }
 
-    /// <summary>(bt:thread-alive-p thread) → boolean</summary>
+    /// <summary>(bt:thread-alive-p thread) -> boolean</summary>
     public static LispObject ThreadAliveP(LispObject[] args)
     {
         if (args.Length < 1 || args[0] is not LispThread lt)
@@ -284,7 +284,7 @@ public partial class Runtime
         return lt.Thread.IsAlive ? T.Instance : Nil.Instance;
     }
 
-    /// <summary>(dotcl:thread-object thread) → the underlying System.Threading.Thread,
+    /// <summary>(dotcl:thread-object thread) -> the underlying System.Threading.Thread,
     /// wrapped as a .NET object so it can be inspected or passed to .NET APIs
     /// (e.g. ManagedThreadId, Priority, IsBackground) (dotcl/dotcl#26).</summary>
     public static LispObject ThreadObject(LispObject[] args)
@@ -295,20 +295,20 @@ public partial class Runtime
     }
 
     /// <summary>
-    /// (dotcl:interrupt-thread thread function) — queue FUNCTION to run on
+    /// (dotcl:interrupt-thread thread function): queue FUNCTION to run on
     /// THREAD and poke the thread so it notices.
     ///
     /// Delivery is what .NET can offer without VM support: Thread.Interrupt
     /// unblocks a thread sitting in a wait (SLEEP, JOIN, lock/condition-variable/
     /// semaphore) and nothing else. A thread busy in a computation is NOT
-    /// interrupted — the function stays queued until that thread next blocks.
+    /// interrupted: the function stays queued until that thread next blocks.
     /// This covers the timeout cases that matter in practice (I/O, locks,
     /// condition variables); killing a compute loop needs cooperative safepoints
     /// in generated code, which is a separate, much larger change.
     ///
     /// The function runs on the target thread at the point where the wait was
     /// interrupted, so a non-local exit from it (SIGNAL, THROW, an ABORT
-    /// restart) unwinds that thread — which is how a timeout is delivered.
+    /// restart) unwinds that thread: which is how a timeout is delivered.
     /// If it returns normally, the interrupted wait gives up and returns.
     /// </summary>
     public static LispObject InterruptThread(LispObject[] args)
@@ -346,7 +346,7 @@ public partial class Runtime
     /// short, but a compute loop never waits.
     ///
     /// The Thread.Interrupt() poke that accompanied the enqueue has NOT fired
-    /// here (this thread was computing), so after draining we absorb it —
+    /// here (this thread was computing), so after draining we absorb it;
     /// otherwise the thread's next legitimate wait dies with a spurious
     /// interrupt that RunPendingInterrupts cannot claim (the DESTROY-THREAD
     /// contract makes the blocking primitives rethrow "not ours"). The absorb
@@ -383,7 +383,7 @@ public partial class Runtime
     /// Run every function INTERRUPT-THREAD queued for the current thread, in
     /// order; return whether there was anything to run. Called from the blocking
     /// primitives when their wait is cut short by Thread.Interrupt. A queued
-    /// function that exits non-locally takes the rest of the queue with it —
+    /// function that exits non-locally takes the rest of the queue with it;
     /// same as any handler that unwinds.
     ///
     /// A false return means the interrupt was not one of ours: DESTROY-THREAD
@@ -394,7 +394,7 @@ public partial class Runtime
     public static bool RunPendingInterrupts()
     {
         // The main thread has no LispThread until someone asks for one, and
-        // INTERRUPT-THREAD can only have been handed one that exists — so look
+        // INTERRUPT-THREAD can only have been handed one that exists: so look
         // it up rather than creating a fresh (empty) one here.
         var self = _currentLispThread
                    ?? (_threadRegistry.TryGetValue(Thread.CurrentThread.ManagedThreadId, out var reg)
@@ -414,15 +414,15 @@ public partial class Runtime
     }
 
     /// <summary>Sentinel queued by DESTROY-THREAD. When either drain dequeues
-    /// it, the target thread throws ThreadInterruptedException on itself —
+    /// it, the target thread throws ThreadInterruptedException on itself;
     /// the same control-flow exception a destroy delivers to a waiting
-    /// thread — so unwind-protect cleanups run and the thread dies.</summary>
+    /// thread: so unwind-protect cleanups run and the thread dies.</summary>
     private static readonly Symbol s_destroyRequest = new Symbol("%DESTROY-THREAD-REQUEST%");
 
     /// <summary>(bt:destroy-thread thread)
     ///
     /// Thread.Interrupt alone only reaches a thread that is (or next goes)
-    /// waiting — a compute-bound thread (lparallel's kill-tasks target shape)
+    /// waiting: a compute-bound thread (lparallel's kill-tasks target shape)
     /// would never die. So also queue a destroy sentinel: the safepoint drain
     /// picks it up at the next loop back-edge / periodic check and the thread
     /// terminates itself from compiled code, running its cleanups on the way
@@ -439,7 +439,7 @@ public partial class Runtime
         return T.Instance;
     }
 
-    /// <summary>(bt:thread-name thread) → string</summary>
+    /// <summary>(bt:thread-name thread) -> string</summary>
     public static LispObject ThreadName(LispObject[] args)
     {
         if (args.Length < 1 || args[0] is not LispThread lt)
@@ -447,21 +447,21 @@ public partial class Runtime
         return new LispString(lt.ThreadName);
     }
 
-    /// <summary>(bt:threadp object) → boolean</summary>
+    /// <summary>(bt:threadp object) -> boolean</summary>
     public static LispObject Threadp(LispObject[] args)
     {
         if (args.Length < 1) return Nil.Instance;
         return args[0] is LispThread ? T.Instance : Nil.Instance;
     }
 
-    /// <summary>(bt:make-lock &optional name) → lock</summary>
+    /// <summary>(bt:make-lock &optional name) -> lock</summary>
     public static LispObject MakeLock(LispObject[] args)
     {
         string name = args.Length > 0 && args[0] is LispString ls ? ls.Value : "anonymous";
         return new LispLock(name);
     }
 
-    /// <summary>(bt:acquire-lock lock &optional wait-p timeout-sec) → boolean</summary>
+    /// <summary>(bt:acquire-lock lock &optional wait-p timeout-sec) -> boolean</summary>
     public static LispObject AcquireLock(LispObject[] args)
     {
         if (args.Length < 1 || args[0] is not LispLock lk)
@@ -522,7 +522,7 @@ public partial class Runtime
         return T.Instance;
     }
 
-    /// <summary>(bt:thread-join thread) → thread's return value</summary>
+    /// <summary>(bt:thread-join thread) -> thread's return value</summary>
     public static LispObject ThreadJoin(LispObject[] args)
     {
         if (args.Length < 1 || args[0] is not LispThread lt)
@@ -532,14 +532,14 @@ public partial class Runtime
         return lt.ReturnValue ?? Nil.Instance;
     }
 
-    /// <summary>(bt:thread-yield) — hint to scheduler</summary>
+    /// <summary>(bt:thread-yield): hint to scheduler</summary>
     public static LispObject ThreadYield(LispObject[] args)
     {
         Thread.Yield();
         return T.Instance;
     }
 
-    /// <summary>(bt:make-recursive-lock &optional name) → lock (re-entrant)</summary>
+    /// <summary>(bt:make-recursive-lock &optional name) -> lock (re-entrant)</summary>
     public static LispObject MakeRecursiveLock(LispObject[] args)
     {
         string name = args.Length > 0 && args[0] is LispString ls ? ls.Value : "anonymous";
@@ -548,7 +548,7 @@ public partial class Runtime
 
     // --- Condition variables ---
 
-    /// <summary>(bt:make-condition-variable &key name) → cv</summary>
+    /// <summary>(bt:make-condition-variable &key name) -> cv</summary>
     public static LispObject MakeConditionVariable(LispObject[] args)
     {
         string name = "anonymous";
@@ -623,7 +623,7 @@ public partial class Runtime
         return signaled ? T.Instance : Nil.Instance;
     }
 
-    /// <summary>(bt:condition-notify cv) — wake one waiter</summary>
+    /// <summary>(bt:condition-notify cv): wake one waiter</summary>
     public static LispObject ConditionNotify(LispObject[] args)
     {
         if (args.Length < 1 || args[0] is not LispConditionVariable cv)
@@ -634,7 +634,7 @@ public partial class Runtime
         return T.Instance;
     }
 
-    /// <summary>(bt:condition-broadcast cv) — wake all waiters</summary>
+    /// <summary>(bt:condition-broadcast cv): wake all waiters</summary>
     public static LispObject ConditionBroadcast(LispObject[] args)
     {
         if (args.Length < 1 || args[0] is not LispConditionVariable cv)
@@ -647,7 +647,7 @@ public partial class Runtime
 
     // --- Semaphores ---
 
-    /// <summary>(bt:make-semaphore &key name count) → semaphore</summary>
+    /// <summary>(bt:make-semaphore &key name count) -> semaphore</summary>
     public static LispObject MakeSemaphore(LispObject[] args)
     {
         string name = "anonymous";
@@ -667,7 +667,7 @@ public partial class Runtime
         return new LispSemaphore(name, count);
     }
 
-    /// <summary>(bt:signal-semaphore sem &optional n) — release N tokens (default 1)</summary>
+    /// <summary>(bt:signal-semaphore sem &optional n): release N tokens (default 1)</summary>
     public static LispObject SignalSemaphore(LispObject[] args)
     {
         if (args.Length < 1 || args[0] is not LispSemaphore sem)
@@ -678,7 +678,7 @@ public partial class Runtime
         return T.Instance;
     }
 
-    /// <summary>(bt:wait-on-semaphore sem &key timeout) — acquire 1 token, block if none</summary>
+    /// <summary>(bt:wait-on-semaphore sem &key timeout): acquire 1 token, block if none</summary>
     public static LispObject WaitOnSemaphore(LispObject[] args)
     {
         if (args.Length < 1 || args[0] is not LispSemaphore sem)
@@ -716,7 +716,7 @@ public partial class Runtime
         return T.Instance;
     }
 
-    /// <summary>(dotcl:all-threads) → list of all live LispThread objects</summary>
+    /// <summary>(dotcl:all-threads) -> list of all live LispThread objects</summary>
     public static LispObject AllThreads(LispObject[] args)
     {
         CurrentThread([]);  // Ensure main thread is registered
@@ -727,11 +727,11 @@ public partial class Runtime
         return result;
     }
 
-    /// <summary>(dotcl:lockp x) → T if X is a lock (recursive or not).</summary>
+    /// <summary>(dotcl:lockp x) -> T if X is a lock (recursive or not).</summary>
     public static LispObject Lockp(LispObject[] args)
         => args.Length > 0 && args[0] is LispLock ? T.Instance : Nil.Instance;
 
-    /// <summary>(dotcl:recursive-lock-p x) → T if X is a recursive lock.</summary>
+    /// <summary>(dotcl:recursive-lock-p x) -> T if X is a recursive lock.</summary>
     public static LispObject RecursiveLockP(LispObject[] args)
         => args.Length > 0 && args[0] is LispLock { Recursive: true } ? T.Instance : Nil.Instance;
 

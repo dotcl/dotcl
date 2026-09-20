@@ -3,7 +3,7 @@
 ;;;
 ;;; COMPILE-FORM dispatches on *COMPILE-FORM-HANDLERS* before it macroexpands,
 ;;; which is right for special forms but wrong for the CL macros lowered the same
-;;; way — WHEN, UNLESS, AND, OR, INCF, DOLIST and friends. A MACROLET binding for
+;;; way: WHEN, UNLESS, AND, OR, INCF, DOLIST and friends. A MACROLET binding for
 ;;; one of those was ignored and the built-in compiled instead, silently, while
 ;;; the tree-walk interpreter (which consults its lexical macros first) returned
 ;;; the shadowed expansion. The two evaluators disagreed on the same source.

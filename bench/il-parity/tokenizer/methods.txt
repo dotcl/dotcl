@@ -1,0 +1,3 @@
+# C# method            Lisp function
+Tokenizer.NextToken    ILP-TOK-NEXT
+Tokenizer.Digest       ILP-TOK-DIGEST

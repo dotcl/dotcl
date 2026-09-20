@@ -8,7 +8,7 @@
 //   top      how many callers to print (default 15)
 //
 // Why this exists: `dotnet-trace report topN` answers WHICH method is hot and
-// nothing else. Every perf decision after that needs the caller — "castclass is
+// nothing else. Every perf decision after that needs the caller: "castclass is
 // 10% of the run" is not actionable until you know whether the calls come from
 // the IL dotcl emits or from type tests inside the runtime's own C#, because
 // those are different repairs. That attribution was done by hand out of the
@@ -42,7 +42,7 @@ int top = args.Length > 3 && int.TryParse(args[3], out var t) ? t : 15;
 using var doc = JsonDocument.Parse(File.ReadAllText(path));
 var root = doc.RootElement;
 
-// shared.frames[i].name — the frame table every sample indexes into.
+// shared.frames[i].name: the frame table every sample indexes into.
 var frames = root.GetProperty("shared").GetProperty("frames")
     .EnumerateArray()
     .Select(f => f.TryGetProperty("name", out var n) ? (n.GetString() ?? "") : "")

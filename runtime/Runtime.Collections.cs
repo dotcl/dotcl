@@ -144,7 +144,7 @@ public static partial class Runtime
                 result = new LispVector(size, Fixnum.Make(0), "BIT");
         }
 
-        // Fast path: all three have packed bit data → operate on ulong[] directly
+        // Fast path: all three have packed bit data -> operate on ulong[] directly
         if (a1._bitData != null && a2._bitData != null && result._bitData != null)
         {
             int words = a1._bitData.Length;
@@ -256,6 +256,67 @@ public static partial class Runtime
             return v.GetElement(idx) is LispChar lc ? (LispObject)lc : LispChar.Make('\0');
         }
         throw new LispErrorException(new LispTypeError("CHAR: invalid arguments", str, Startup.Sym("STRING")));
+    }
+
+    /// <summary>
+    /// (CHAR-CODE (SCHAR s i)) -- and the CHAR spelling of it -- as a raw int64.
+    /// The typed entry for a string scan, the counterpart of ArefNumL for a
+    /// numeric array: no boxed index on the way in and no LispChar on the way
+    /// out, which is the whole cost of the loop when the body does nothing but
+    /// accumulate codes. Scanning 1 MB allocated 983,042 Fixnums (one per index
+    /// past the small-integer cache) before this existed.
+    ///
+    /// Anything the fast path does not recognise -- an adjustable string, an
+    /// index out of range, a non-string -- falls through to CHAR itself, so the
+    /// error a caller sees is the one CHAR signals rather than a .NET cast.
+    /// </summary>
+    [System.Runtime.CompilerServices.MethodImpl(
+        System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    public static long CharCodeAtL(LispObject str, long index)
+    {
+        if (str is LispString s && (ulong)index < (ulong)s.Length)
+            return s[(int)index];
+        return ((Fixnum)CharCode(CharAccess(str, Fixnum.Make(index)))).Value;
+    }
+
+    /// <summary>
+    /// (SCHAR s i) -- and the CHAR spelling of it -- with a raw int64 index.
+    /// The value-position counterpart of CharCodeAtL: the character object is
+    /// still what comes out, but the subscript never becomes a Fixnum on the
+    /// way in and the call reaches the element read directly instead of going
+    /// through a symbol lookup and a virtual Invoke.
+    ///
+    /// Anything the fast path does not recognise falls through to CHAR itself,
+    /// so the error a caller sees is the one CHAR signals: an index out of
+    /// range, a non-string, and the adjustable or fill-pointered string, which
+    /// is a LispVector rather than a LispString and whose elements are not the
+    /// ones a direct read would return.
+    /// </summary>
+    [System.Runtime.CompilerServices.MethodImpl(
+        System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    public static LispObject CharAtL(LispObject str, long index)
+    {
+        if (str is LispString s && (ulong)index < (ulong)s.Length)
+            return LispChar.Make(s[(int)index]);
+        return CharAccess(str, Fixnum.Make(index));
+    }
+
+    /// <summary>
+    /// CHAR-CODE as a raw int64, for a value the compiler already believes is a
+    /// character (a local declared CHARACTER). Comparing two characters is
+    /// comparing their codes, so the comparison operators lower to this and an
+    /// integer compare rather than building a boolean object and testing it.
+    ///
+    /// A violated declaration signals the TYPE-ERROR CHAR-CODE would, not a .NET
+    /// cast failure: the declaration is the writer's, and being wrong about it
+    /// has to read as a type error.
+    /// </summary>
+    [System.Runtime.CompilerServices.MethodImpl(
+        System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    public static long CharCodeOfL(LispObject c)
+    {
+        if (c is LispChar lc) return lc.Value;
+        return ((Fixnum)CharCode(c)).Value;
     }
 
     public static LispObject CharSet(LispObject str, LispObject index, LispObject value)
@@ -614,7 +675,7 @@ public static partial class Runtime
 
     public static void CheckNoUnknownKeys2(string name, LispObject[] args, int keyStart, string[] validKeys, string[]? validKeyPackages)
     {
-        // If fewer args than keyStart, no keyword args were passed — nothing to check
+        // If fewer args than keyStart, no keyword args were passed: nothing to check
         if (args.Length <= keyStart) return;
         // Check for odd number of keyword arguments
         if ((args.Length - keyStart) % 2 != 0)
@@ -662,7 +723,7 @@ public static partial class Runtime
                     }
                     else
                     {
-                        // No package constraint — match by name only (legacy behavior for normal &key)
+                        // No package constraint: match by name only (legacy behavior for normal &key)
                         if (kpkg == "KEYWORD") { found = true; break; }
                     }
                 }
@@ -693,7 +754,7 @@ public static partial class Runtime
     /// <summary>
     /// APPEND of two lists: copy A's spine, share B as the tail.
     /// Iterative on purpose. Recursing once per element used one stack frame per
-    /// cons, so appending a few million elements exhausted the stack — and a .NET
+    /// cons, so appending a few million elements exhausted the stack: and a .NET
     /// StackOverflowException cannot be caught, so the whole process died with no
     /// Lisp-level error. The compiler builds instruction lists with APPEND, so a
     /// large enough (but legal) source form took the compiler down with it.
@@ -842,7 +903,7 @@ public static partial class Runtime
             }
             current = c.Cdr is Cons rest ? rest.Cdr : Nil.Instance;
         }
-        // Not found — prepend indicator + value
+        // Not found: prepend indicator + value
         sym.Plist = new Cons(indicator, new Cons(value, sym.Plist));
         return value;
     }
@@ -1594,7 +1655,7 @@ public static partial class Runtime
         // BUTLAST
         Startup.RegisterUnary("BUTLAST", Runtime.Butlast);
 
-        // VECTOR constructor: (vector &rest args) → simple-vector
+        // VECTOR constructor: (vector &rest args) -> simple-vector
         Emitter.CilAssembler.RegisterFunction("VECTOR", new LispFunction(
             args => new LispVector(args), "VECTOR", -1));
 
@@ -2066,7 +2127,7 @@ public static partial class Runtime
         Startup.RegisterBinary("CHAR", Runtime.CharAccess);
         Startup.RegisterBinary("SCHAR", Runtime.CharAccess);
 
-        // %SET-CHAR / %SET-ELT — the lowering (setf char) / (setf elt) expand to.
+        // %SET-CHAR / %SET-ELT: the lowering (setf char) / (setf elt) expand to.
         // compile-expr recognises both by SYMBOL-NAME and emits the direct call;
         // these bindings exist so the tree-walk interpreter, which resolves an
         // operator through SYMBOL-FUNCTION, can evaluate the same expansion.

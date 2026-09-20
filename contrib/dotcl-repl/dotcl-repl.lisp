@@ -1,4 +1,4 @@
-;;; dotcl-repl.lisp — Terminal readline for dotcl
+;;; dotcl-repl.lisp: Terminal readline for dotcl
 ;;;
 ;;; Usage: (require "dotcl-repl")
 ;;;        (dotcl-repl:readline "CL-USER> ")
@@ -22,7 +22,7 @@
 
 (in-package :dotcl-repl)
 
-;;; ── Public state ────────────────────────────────────────────────────────────
+;;; -- Public state ------------------------------------------------------------
 
 (defvar *history* '())
 (defvar *history-max* 500)
@@ -39,7 +39,7 @@
 ;;; which breaks as soon as the token is a string literal (a .NET member name).
 (defvar *completer* nil)
 
-;;; ── East Asian Width ────────────────────────────────────────────────────────
+;;; -- East Asian Width --------------------------------------------------------
 
 (defun char-display-width (ch)
   "Return 1 for narrow, 2 for wide (CJK) characters."
@@ -69,7 +69,7 @@
 (defun string-display-width (str &optional (end (length str)))
   (loop for i below end sum (char-display-width (char str i))))
 
-;;; ── System.Console wrappers ─────────────────────────────────────────────────
+;;; -- System.Console wrappers -------------------------------------------------
 
 (defun console-read-key ()
   "Read a ConsoleKeyInfo without echo. Returns the .NET object."
@@ -127,7 +127,7 @@
 (defun write-ch (ch)
   (dotnet:static "System.Console" "Write" ch))
 
-;;; ── Display helpers ─────────────────────────────────────────────────────────
+;;; -- Display helpers ---------------------------------------------------------
 
 (defun terminal-width ()
   (let ((w (dotnet:static "System.Console" "get_WindowWidth")))
@@ -153,7 +153,7 @@
          (cursor-abs-row (+ start-row (floor cursor-abs-col w))))
     ;; Move to prompt column on current row basis
     (set-cursor-col prompt-col)
-    ;; Clear to end of line (and beyond if multiline — simple: rewrite)
+    ;; Clear to end of line (and beyond if multiline: simple: rewrite)
     (write-str content)
     ;; Clear remainder
     (let* ((total-display (string-display-width content))
@@ -165,7 +165,7 @@
     (set-cursor-col (mod cursor-abs-col w))
     cursor-abs-row))
 
-;;; ── History ─────────────────────────────────────────────────────────────────
+;;; -- History -----------------------------------------------------------------
 
 (defun history-push (line)
   (when (and (> (length line) 0)
@@ -174,7 +174,7 @@
     (when (> (length *history*) *history-max*)
       (setf *history* (subseq *history* 0 *history-max*)))))
 
-;;; ── Completion ──────────────────────────────────────────────────────────────
+;;; -- Completion --------------------------------------------------------------
 
 (defun common-prefix (strings)
   "Longest string that starts every one of STRINGS."
@@ -241,7 +241,7 @@ as they agree and then listed, the way a shell does it."
     (when (> (length items) shown)
       (write-str (format nil "  ... ~A more~%" (- (length items) shown))))))
 
-;;; ── Main readline ───────────────────────────────────────────────────────────
+;;; -- Main readline -----------------------------------------------------------
 
 (defun readline (prompt)
   "Read a line with editing. Returns the string, or NIL on EOF (Ctrl+D)
@@ -270,13 +270,13 @@ as they agree and then listed, the way a shell does it."
              (history-push line)
              (return line)))
 
-          ;; Ctrl+D — EOF
+          ;; Ctrl+D: EOF
           ((and (console-key= ki "D") (key-ctrl-p ki))
            (when (null buf)
              (write-str (format nil "~%"))
              (return nil)))
 
-          ;; Ctrl+C — clear line
+          ;; Ctrl+C: clear line
           ((and (console-key= ki "C") (key-ctrl-p ki))
            (write-str "^C")
            (write-str (format nil "~%"))
@@ -334,7 +334,7 @@ as they agree and then listed, the way a shell does it."
                             (terminal-width))))
              (set-cursor-col col)))
 
-          ;; Up arrow — history previous
+          ;; Up arrow: history previous
           ((console-key= ki "UpArrow")
            (let ((history *history*)
                  (next-idx (1+ hist-idx)))
@@ -346,7 +346,7 @@ as they agree and then listed, the way a shell does it."
                (setf point (length buf))
                (redraw prompt-col buf point))))
 
-          ;; Down arrow — history next
+          ;; Down arrow: history next
           ((console-key= ki "DownArrow")
            (cond
              ((> hist-idx 0)
@@ -361,7 +361,7 @@ as they agree and then listed, the way a shell does it."
               (setf point (length buf))
               (redraw prompt-col buf point))))
 
-          ;; Tab — completion
+          ;; Tab: completion
           ((console-key= ki "Tab")
            (let ((result (complete buf point)))
              (when result
@@ -376,12 +376,12 @@ as they agree and then listed, the way a shell does it."
                         (redraw prompt-col buf point))
                        (t (redraw prompt-col buf point)))))))
 
-          ;; Ctrl+K — kill to end of line
+          ;; Ctrl+K: kill to end of line
           ((and (console-key= ki "K") (key-ctrl-p ki))
            (setf buf (subseq buf 0 point))
            (redraw prompt-col buf point))
 
-          ;; Ctrl+U — kill to beginning
+          ;; Ctrl+U: kill to beginning
           ((and (console-key= ki "U") (key-ctrl-p ki))
            (setf buf (subseq buf point)
                  point 0)
@@ -396,7 +396,7 @@ as they agree and then listed, the way a shell does it."
            (incf point)
            (redraw prompt-col buf point)))))))
 
-;;; ── REPL integration ────────────────────────────────────────────────────────
+;;; -- REPL integration --------------------------------------------------------
 
 (defun enable ()
   "Wire dotcl-repl:readline into the REPL read loop."
@@ -406,7 +406,7 @@ as they agree and then listed, the way a shell does it."
   "Restore the default Console.ReadLine-based REPL read."
   (dotcl::%set-repl-readline-hook nil))
 
-;;; ── Default completer ───────────────────────────────────────────────────────
+;;; -- Default completer -------------------------------------------------------
 ;;;
 ;;; TAB is worth nothing without a completer, and requiring every reader to
 ;;; write one is a poor trade for a bundled REPL. dotcl-lsp-api answers exactly

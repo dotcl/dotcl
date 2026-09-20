@@ -1,5 +1,5 @@
 ;;; A Lisp non-local exit started inside a callback (a lambda handed to a .NET
-;;; API) is passing THROUGH the reflection call on its way to its own target — it
+;;; API) is passing THROUGH the reflection call on its way to its own target; it
 ;;; is not a failure of the .NET method. It used to be caught as a
 ;;; TargetInvocationException and rewritten into an error, so
 ;;;   (block b (dotnet:invoke fn "Invoke" 7))   ; lambda does (return-from b ...)

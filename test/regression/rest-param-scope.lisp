@@ -15,7 +15,7 @@
     (error (e) (princ-to-string e))))
 
 (defun %rp-names-p (fn name)
-  "T when the arity error report starts with NAME — the point of the message is
+  "T when the arity error report starts with NAME; the point of the message is
    to say which call was wrong."
   (let ((msg (%rp-arity-message fn)))
     (and (stringp msg)

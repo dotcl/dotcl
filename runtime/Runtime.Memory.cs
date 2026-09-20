@@ -241,7 +241,7 @@ public static partial class Runtime
         return Nil.Instance;
     }
 
-    // (dotnet:find-symbol-any func-name) -> address or NIL — searches all loaded libraries
+    // (dotnet:find-symbol-any func-name) -> address or NIL: searches all loaded libraries
     public static LispObject FindSymbolAny(LispObject[] args)
     {
         if (args.Length < 1) throw ArgError("dotnet:find-symbol-any", 1, args.Length);

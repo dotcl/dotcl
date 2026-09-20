@@ -1,0 +1,3 @@
+# C# method            Lisp function
+Heap.Push              ILP-HEAP-PUSH
+Heap.Pop               ILP-HEAP-POP

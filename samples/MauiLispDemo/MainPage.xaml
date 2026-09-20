@@ -7,7 +7,7 @@
           Padding="12" RowSpacing="8">
 
         <Label Grid.Row="0"
-               Text="dotcl Lisp demo — select a snippet, edit, evaluate"
+               Text="dotcl Lisp demo; select a snippet, edit, evaluate"
                FontSize="16"
                HorizontalOptions="Center" />
 
@@ -35,7 +35,7 @@
                                Spacing="8">
             <Button Text="🌐"
                     Command="{Binding ToggleLanguageCommand}" />
-            <Button Text="▶ Run my-click"
+            <Button Text="> Run my-click"
                     Command="{Binding RunCommand}" />
             <Button Text="{Binding EvaluateButtonText}"
                     Command="{Binding EvaluateCommand}" />

@@ -18,7 +18,7 @@
 		<Nullable>enable</Nullable>
 
 		<!-- Runtime XAML inflation so MAUI doesn't run the source-gen pass
-		     (which expects x:Class to resolve to a C# partial class —
+		     (which expects x:Class to resolve to a C# partial class;
 		     Lisp-defined types don't exist until dotcl starts). -->
 		<MauiXamlInflator>Runtime</MauiXamlInflator>
 
@@ -77,7 +77,7 @@
 	     old inner-build tweaks are unneeded: no NETSDK1150 (no Exe project ref in
 	     the self-contained Android build) and no per-RID reset (the package's
 	     no-RID runtime.dll is reused across RIDs). Pinned to a published version,
-	     deliberately not bumped every release — this sample shows the shipping
+	     deliberately not bumped every release; this sample shows the shipping
 	     flow, not the latest runtime. -->
 	<ItemGroup>
 		<PackageReference Include="DotCL.Runtime" Version="0.1.26" />

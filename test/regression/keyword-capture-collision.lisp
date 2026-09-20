@@ -12,7 +12,7 @@
 ;;; (with-program-input/output/error-output nesting + place-setter + a labels /
 ;;; unwind-protect / if-let body), which made `(uiop:run-program ... :output
 ;;; :string)` break whenever asdf was compiled by the affected compiler. The
-;;; reproduction reuses that verbatim structure — the bug is sensitive to the
+;;; reproduction reuses that verbatim structure: the bug is sensitive to the
 ;;; free-var walk order, so a simplified body does not trigger it.
 
 (defmacro kcc-if-let ((var val) then &optional else)

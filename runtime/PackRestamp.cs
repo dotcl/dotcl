@@ -10,17 +10,17 @@ namespace DotCL;
 /// tool packages: unzip, rewrite the package id / version / command name, drop
 /// the app's fasl next to the runtime, rezip. The runtime images in the
 /// per-RID packages are reused byte-for-byte, so packing needs no csproj, no
-/// `dotnet pack` child process, and no local crossgen — which matters because
+/// `dotnet pack` child process, and no local crossgen: which matters because
 /// crossgen2 cannot produce R2R images for a RID other than the host's, so a
 /// from-source pack can only ever cover the machine it runs on.
 ///
 /// Three package shapes take part, all of them restamped:
-///   dotcl              — the pointer package (DotnetTool). Carries no runtime;
+///   dotcl: the pointer package (DotnetTool). Carries no runtime;
 ///                        its DotnetToolSettings.xml maps each RID to the
 ///                        dotcl.&lt;rid&gt; package that does.
-///   dotcl.&lt;rid&gt;  — self-contained payload (DotnetToolRidPackage), an
+///   dotcl.&lt;rid&gt;: self-contained payload (DotnetToolRidPackage), an
 ///                        apphost plus R2R images.
-///   dotcl.any          — the framework-dependent payload, launched via
+///   dotcl.any: the framework-dependent payload, launched via
 ///                        `dotnet runtime.dll` rather than an apphost.
 /// </summary>
 static class PackRestamp
@@ -101,7 +101,7 @@ static class PackRestamp
         dotclVersion ??= InferDotclVersion(sourceDir);
 
         // A payload runtime older than the loose-fasl loader would restamp into a
-        // tool that starts a REPL instead of running the app — fail loudly first.
+        // tool that starts a REPL instead of running the app: fail loudly first.
         EnsureLoaderCapablePayload(dotclVersion);
 
         // Resolve every input up front so a missing RID package is reported as
@@ -164,7 +164,7 @@ static class PackRestamp
 
     /// <summary>
     /// Pick the dotcl version out of a directory of published packages. Only
-    /// the pointer package is named dotcl.&lt;version&gt;.nupkg — the RID ones
+    /// the pointer package is named dotcl.&lt;version&gt;.nupkg: the RID ones
     /// have a RID between the id and the version, so a digit after "dotcl."
     /// identifies the base.
     /// </summary>
@@ -236,7 +236,7 @@ static class PackRestamp
             var name = entry.FullName;
 
             // An author signature covers the package hash, so it cannot survive
-            // a rewrite — packages pulled from nuget.org carry one.
+            // a rewrite: packages pulled from nuget.org carry one.
             if (name.Equals(".signature.p7s", StringComparison.OrdinalIgnoreCase))
                 continue;
 
@@ -440,7 +440,7 @@ static class PackRestamp
 
     /// <summary>
     /// Rename the installed command, and in the pointer package replace the RID
-    /// map wholesale — it must name the app's own RID packages, and only the
+    /// map wholesale: it must name the app's own RID packages, and only the
     /// ones actually being produced.
     /// </summary>
     static byte[] RewriteToolSettings(
@@ -522,7 +522,7 @@ static class PackRestamp
     /// Timestamp for the entry. Never leave this to CreateEntry's default: it
     /// stamps every entry with the current time, which both dates the package
     /// into the future (see SourceTimestamp) and flattens the relative order of
-    /// the files — ASDF then sees bundled sources as no older than the fasls
+    /// the files: ASDF then sees bundled sources as no older than the fasls
     /// built from them and recompiles them on every run.
     /// </param>
     static void WriteEntry(ZipArchive zip, string name, byte[] bytes,

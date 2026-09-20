@@ -1,0 +1,24 @@
+{
+  "//": "Recorded time ratios that bench/check-ratios.sh gates against. A measured ratio above baseline * threshold fails the build. Refresh instructions are in docs/profiling.md.",
+
+  "threshold": 1.2,
+
+  "//ratios": "Keyed by platform, because a ratio is only reproducible on the machine it was recorded on. A platform with no entries here is reported as unbaselined and does not fail: the run prints its measured ratios in this file's format so they can be pasted in.",
+
+  "//re-recorded": "win-arm64/parity/double-loop, array-walk and fixnum-loop were re-recorded on 2026-09-16 on the same machine, after float literals stopped going through the constant pool, after AREF on an array-typed local reached the unboxed element path and then the hoisted element buffer, and after a tagbody that is a simple loop stopped carrying the GO dispatch. win-arm64/parity/struct-slots was re-recorded on 2026-09-16 after structure slots declared to hold an int64 moved to raw storage. Every other entry is from the run described under \"recorded\".",
+
+  "recorded": {
+    "win-arm64": "2026-09-14, Snapdragon X Plus X1P42100 (Qualcomm Oryon), 8 cores, Windows 11 ARM64, .NET SDK 10.0.302, median of 3 make bench-parity runs (which agreed to within 5%)"
+  },
+
+  "ratios": {
+    "win-arm64/parity/tak": 2.26,
+    "//fib": "Lowered from 6.94 when (the fixnum ...) became a range license. The one contended parity run available measured 2.94; 4.00 is deliberately looser than that, because a ratio taken while another session was on the machine is not a number to gate on. Retake it with make bench-parity on a quiet machine and tighten.",
+    "win-arm64/parity/fib": 4.00,
+    "win-arm64/parity/fixnum-loop": 1.00,
+    "win-arm64/parity/double-loop": 1.00,
+    "win-arm64/parity/array-walk": 0.83,
+    "win-arm64/parity/struct-slots": 5.58,
+    "win-arm64/parity/string-walk": 5.93
+  }
+}

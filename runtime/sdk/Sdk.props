@@ -1,6 +1,6 @@
 <Project>
   <!--
-    DotCL.Sdk — MSBuild SDK for Common-Lisp-on-.NET projects.
+    DotCL.Sdk; MSBuild SDK for Common-Lisp-on-.NET projects.
 
     Lets a Common Lisp .NET app be as small as:
 
@@ -13,12 +13,12 @@
     It wraps Microsoft.NET.Sdk and injects the DotCL.Runtime PackageReference,
     which brings the project-core build (ProjectCore.targets) in
     transitively. That pipeline walks the .asd's :depends-on, compiles the
-    system to a fasl, and writes a deployment manifest into the app output — the
+    system to a fasl, and writes a deployment manifest into the app output; the
     same flow a hand-written <PackageReference DotCL.Runtime> + <DotclProjectAsd>
     project uses today, minus the boilerplate.
 
     Structure decision: the SDK loads ON TOP of ProjectCore's in-process
-    tasks. It does not add a third build implementation — it is sugar over the
+    tasks. It does not add a third build implementation; it is sugar over the
     existing one.
 
     Import order: this Sdk.props is imported at the very top of the consuming
@@ -49,11 +49,11 @@
 
   <PropertyGroup>
     <!-- Version of the DotCL.Runtime package this SDK injects. Defaults to the
-         runtime the SDK shipped with (SDK and Runtime release in lockstep — both
+         runtime the SDK shipped with (SDK and Runtime release in lockstep; both
          inherit the same <Version> from runtime/Directory.Build.props). Override
          <DotCLRuntimeVersion> to pin a different runtime.
          NOTE: kept in sync with the SDK package version at pack time; the literal
          below is the fallback for a locally built SDK. -->
-    <DotCLRuntimeVersion Condition="'$(DotCLRuntimeVersion)' == ''">0.1.28</DotCLRuntimeVersion>
+    <DotCLRuntimeVersion Condition="'$(DotCLRuntimeVersion)' == ''">0.1.29</DotCLRuntimeVersion>
   </PropertyGroup>
 </Project>

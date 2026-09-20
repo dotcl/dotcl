@@ -57,10 +57,10 @@
   2)
 
 ;; The failing return IS the current cell value, usable directly as the next OLD in a
-;; retry — no separate (racy) re-read (rationale: old-value beats a boolean flag).
+;; retry: no separate (racy) re-read (rationale: old-value beats a boolean flag).
 (deftest cas-failure-returns-current-for-retry
   (let ((cell (list 100)))
-    (let* ((prev (dotcl:compare-and-swap (car cell) 999 -1))   ; mismatch → returns 100
+    (let* ((prev (dotcl:compare-and-swap (car cell) 999 -1))   ; mismatch -> returns 100
            (ok   (dotcl:compare-and-swap (car cell) prev 200))) ; retry with prev succeeds
       (list prev ok (car cell))))
   (100 100 200))

@@ -11,7 +11,19 @@ public static partial class Runtime
     /// PROGRAM-ERROR; the spec calls for a TYPE-ERROR naming the bad subscript.</summary>
     private static int IntArg(string what, string role, LispObject o)
     {
-        if (o is Fixnum f) return (int)f.Value;
+        // Range-checked, not a bare cast. Every array and string path narrows
+        // the subscript to int, and narrowing wraps: (AREF V 4294967296) became
+        // (AREF V 0) and returned an element where it had to signal. No
+        // sequence this runtime can build reaches int, so a subscript outside
+        // it is out of range for any of them.
+        if (o is Fixnum f)
+        {
+            if (f.Value >= int.MinValue && f.Value <= int.MaxValue) return (int)f.Value;
+            throw new LispErrorException(new LispTypeError(
+                $"{what}: {role} {f.Value} is out of range", o,
+                new Cons(Startup.Sym("INTEGER"),
+                    new Cons(Fixnum.Make(0), new Cons(Startup.Sym("*"), Nil.Instance)))));
+        }
         throw new LispErrorException(new LispTypeError(
             $"{what}: {role} must be an integer", o, Startup.Sym("INTEGER")));
     }
@@ -182,8 +194,8 @@ public static partial class Runtime
             else
                 fill = Nil.Instance;
             // An element type with packed storage fills that storage directly. Going
-            // through a boxed LispObject[SIZE] first — which the constructor then packs
-            // and drops — costs 8 bytes an element in garbage, four times the array
+            // through a boxed LispObject[SIZE] first, which the constructor then packs
+            // and drops, costs 8 bytes an element in garbage, four times the array
             // itself for a (integer 0 1000) one.
             if (elementType == "BIT" || LispVector.NumKindForElementType(elementType) != 0)
             {
@@ -476,9 +488,11 @@ public static partial class Runtime
             }
             else
             {
-                int idx = (int)f.Value;
-                if ((uint)idx < (uint)v._elements.Length)
-                    return v._elements[idx] ?? Nil.Instance;
+                // Compared as a long: narrowing first would wrap a subscript
+                // past int into range and read the wrong element.
+                long li = f.Value;
+                if ((ulong)li < (ulong)v._elements.Length)
+                    return v._elements[(int)li] ?? Nil.Instance;
             }
         }
         return ArefSlow(array, index);
@@ -487,9 +501,7 @@ public static partial class Runtime
     [MethodImpl(MethodImplOptions.NoInlining)]
     private static LispObject ArefSlow(LispObject array, LispObject index)
     {
-        if (index is not Fixnum f)
-            throw new LispErrorException(new LispTypeError("AREF: index must be integer", index));
-        int idx = (int)f.Value;
+        int idx = IntArg("AREF", "index", index);
         if (TryDotNetArray(array, out var narr))
             return DotNetToLisp(narr.GetValue(idx));
         if (array is LispVector v)
@@ -585,10 +597,11 @@ public static partial class Runtime
             }
             else
             {
-                int idx = (int)f.Value;
-                if ((uint)idx < (uint)v._elements.Length)
+                // Compared as a long, for the reason AREF's read path is.
+                long li = f.Value;
+                if ((ulong)li < (ulong)v._elements.Length)
                 {
-                    v._elements[idx] = value;
+                    v._elements[(int)li] = value;
                     return value;
                 }
             }
@@ -599,9 +612,7 @@ public static partial class Runtime
     [MethodImpl(MethodImplOptions.NoInlining)]
     private static LispObject ArefSetSlow(LispObject array, LispObject index, LispObject value)
     {
-        if (index is not Fixnum f)
-            throw new LispErrorException(new LispTypeError("(SETF AREF): index must be integer", index));
-        int idx = (int)f.Value;
+        int idx = IntArg("(SETF AREF)", "index", index);
         if (TryDotNetArray(array, out var narr))
         {
             narr.SetValue(LispToDotNet(value, narr.GetType().GetElementType()!), idx);
@@ -944,7 +955,7 @@ public static partial class Runtime
     // long, so a hot loop like (setf (aref a i j) (+ (aref b i j) (aref c i j)))
     // runs without any Fixnum boxing at all. The fast path requires the
     // numeric backing; anything else (adjusted to displaced, bit-packed after
-    // a [0,1] upgrade, plain boxed) takes the boxed entry and unboxes — the
+    // a [0,1] upgrade, plain boxed) takes the boxed entry and unboxes; the
     // inferred element type guarantees the value is a fixnum, and a violation
     // surfaces as a loud InvalidCast rather than a silent wrong value.
 
@@ -959,6 +970,94 @@ public static partial class Runtime
     public static long IndexL(LispObject index)
         => index is Fixnum f ? f.Value
            : throw new LispErrorException(new LispTypeError("AREF: index must be integer", index));
+
+    // --- Hoisted element storage -----------------------------------------
+    //
+    // A local declared (simple-array <integer type> (*)) names storage whose
+    // identity cannot change while the binding lives: CLHS says a simple array
+    // is neither displaced nor adjustable nor fill-pointered, and ADJUST-ARRAY
+    // on one produces a fresh array rather than rewriting this one. So the
+    // element buffer can be fetched ONCE, when the variable is bound, and every
+    // AREF in the body can then be a bare ldelem against it -- which is the
+    // whole difference between 2 ns and 0.2 ns per element, because the checks
+    // ArefNum*L repeats (is it a vector, which backing kind, is it displaced,
+    // is it rank 1) are the same answer on every iteration and the JIT will not
+    // hoist them on its own.
+    //
+    // The declaration is checked here, once, and a violation is reported as the
+    // TYPE-ERROR it is. That check is per binding, not per element, so it costs
+    // nothing measurable and it is kept at every safety level: without it a
+    // false declaration would reach the ldelem as a null buffer and surface as
+    // a NullReferenceException, which is worse than the boxed-path behavior it
+    // replaces.
+
+    private static Exception BackingTypeError(LispObject array, string elementType)
+    {
+        var expected = new Cons(Startup.Sym("SIMPLE-ARRAY"),
+            new Cons(Startup.Sym(elementType),
+                new Cons(new Cons(Startup.Sym("*"), Nil.Instance), Nil.Instance)));
+        return new LispErrorException(new LispTypeError(
+            $"declared (SIMPLE-ARRAY {elementType} (*)), got {Typep2Name(array)}",
+            array, expected));
+    }
+
+    private static string Typep2Name(LispObject o) =>
+        o is LispVector lv
+            ? (lv.IsDisplaced ? $"a displaced array of {lv.ElementTypeName}"
+               : $"an array of {lv.ElementTypeName}")
+            : o.ToString();
+
+    /// <summary>The int64 element buffer of a vector declared
+    /// (simple-array fixnum (*)) / (simple-array (signed-byte 64) (*)).</summary>
+    public static long[] BackingI64(LispObject array)
+    {
+        if (array is LispVector v && v._dimensions == null && v._displacedTo == null
+            && v._numData is long[] d)
+            return d;
+        throw BackingTypeError(array, "FIXNUM");
+    }
+
+    public static int[] BackingI32(LispObject array)
+    {
+        if (array is LispVector v && v._dimensions == null && v._displacedTo == null
+            && v._numData is int[] d)
+            return d;
+        throw BackingTypeError(array, "SIGNED-BYTE-32");
+    }
+
+    public static ushort[] BackingU16(LispObject array)
+    {
+        if (array is LispVector v && v._dimensions == null && v._displacedTo == null
+            && v._numData is ushort[] d)
+            return d;
+        throw BackingTypeError(array, "UNSIGNED-BYTE-16");
+    }
+
+    public static byte[] BackingU8(LispObject array)
+    {
+        if (array is LispVector v && v._dimensions == null && v._displacedTo == null
+            && v._numData is byte[] d)
+            return d;
+        throw BackingTypeError(array, "UNSIGNED-BYTE-8");
+    }
+
+    /// <summary>The element-type violation an out-of-width store would commit,
+    /// as the error NumSet raises for the same value on the boxed path. The
+    /// hoisted store path has no LispVector to ask, so the check is here.</summary>
+    public static long CheckStoreU8(long v)
+        => (ulong)v <= byte.MaxValue ? v
+           : throw new LispErrorException(new LispTypeError(
+               $"element value {v} does not fit (UNSIGNED-BYTE 8)", Fixnum.Make(v)));
+
+    public static long CheckStoreU16(long v)
+        => (ulong)v <= ushort.MaxValue ? v
+           : throw new LispErrorException(new LispTypeError(
+               $"element value {v} does not fit (UNSIGNED-BYTE 16)", Fixnum.Make(v)));
+
+    public static long CheckStoreI32(long v)
+        => v >= int.MinValue && v <= int.MaxValue ? v
+           : throw new LispErrorException(new LispTypeError(
+               $"element value {v} does not fit (SIGNED-BYTE 32)", Fixnum.Make(v)));
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static long ArefNumL(LispObject array, long index)
@@ -1057,7 +1156,7 @@ public static partial class Runtime
     // with zero SingleFloat/DoubleFloat boxing. single-float backing widens to
     // double on read and narrows on store (both exact). The fast path requires
     // float numeric backing (_numKind >= 5); anything else (adjusted to
-    // displaced, boxed) takes the boxed entry and coerces — a violation of the
+    // displaced, boxed) takes the boxed entry and coerces: a violation of the
     // inferred element type surfaces loudly rather than as a silent wrong value.
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -1214,12 +1313,70 @@ public static partial class Runtime
     /// Fast struct slot access with raw int index (avoids Fixnum boxing).
     /// Used by compiler for constant-index struct accessors.
     /// </summary>
-    public static LispObject StructRefI(LispObject obj, int idx)
+    /// <summary>Bits of a packed slot constant that hold the index; the rest
+    /// hold the layout version the call site was compiled against.</summary>
+    internal const int SlotVersionShift = 16;
+    internal const int SlotIndexMask = (1 << SlotVersionShift) - 1;
+
+    /// <summary>The layout entry for the slot a packed constant names, once the
+    /// instance is confirmed to come from the definition the caller was
+    /// compiled against.
+    ///
+    /// A compiled call site addresses a slot by position, so a structure
+    /// redefined with its slots in a different order leaves every caller
+    /// compiled against the old definition reading a valid index into a valid
+    /// instance -- the wrong slot, silently. The version travels in the same
+    /// constant as the index (0 packs to the index itself, so nothing that was
+    /// never redefined pays for this) and the two have to agree.
+    ///
+    /// The entry carries the instance's version in the same bits, so the check
+    /// is an XOR of two values the reader needed anyway: no second load, and
+    /// the position comes back in the same register the caller goes on to
+    /// use.</summary>
+    /// <summary>The position of the slot's raw storage, if every field of the
+    /// layout entry is what the caller expects: the version the call site was
+    /// compiled against, and KIND (0 for a raw integer, SlotKindDouble for a
+    /// raw double). Anything else comes back as a number past the end of the
+    /// raw array, so the caller's range test rejects it -- no separate
+    /// comparison for the version, and none for the kind.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static int RawPosOf(LispStruct s, int packed, int kind)
+        => s.LayoutEntry(packed & SlotIndexMask)
+           ^ (packed & LispStruct.LayoutVersionMask) ^ kind;
+
+    /// <summary>The layout entry for the slot a packed constant names, with the
+    /// version checked. The slow paths use this: the fast ones fold the check
+    /// into RawPosOf above and only come here to find out what went wrong.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static int SlotEntry(LispStruct s, int packed)
+    {
+        int entry = s.LayoutEntry(packed & SlotIndexMask);
+        if (((entry ^ packed) >> SlotVersionShift) != 0)
+            throw StaleSlotAccess(s, packed >> SlotVersionShift);
+        return entry;
+    }
+
+    /// <summary>The slot index inside a packed constant, version checked.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static int SlotIndex(LispStruct s, int packed)
+    {
+        SlotEntry(s, packed);
+        return packed & SlotIndexMask;
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static LispErrorException StaleSlotAccess(LispStruct s, int want)
+        => new LispErrorException(new LispError(
+            $"structure {s.TypeName} was redefined (slot layout version {s.LayoutVersion}, "
+            + $"this accessor was compiled against {want}); recompile the caller"));
+
+    public static LispObject StructRefI(LispObject obj, int packed)
     {
         if (obj is LispStruct s)
         {
-            return s.Slots[idx];
+            return s.GetSlot(SlotIndex(s, packed));
         }
+        int idx = packed & SlotIndexMask;
         if (obj is LispInstance inst && inst.Class.IsStructureClass)
             return inst.Slots[idx] ?? Nil.Instance;
         // SBCL treats packages as structs; map slot indices to Package properties
@@ -1236,6 +1393,83 @@ public static partial class Runtime
             }
             throw new LispErrorException(new LispTypeError($"STRUCT-REF: not a structure (idx={idx}, type={obj?.GetType().Name ?? "null"}, val={(sv.Length > 60 ? sv[..60] : sv)}) stack={frames}", obj));
         }
+    }
+
+    /// <summary>
+    /// A struct slot holding a fixnum, read as a raw int64 -- the counterpart of
+    /// ArefNumL for a structure. The ordinary path hands back a LispObject, which
+    /// a fixnum-declared caller then unwraps and unboxes: two more calls per read
+    /// for a value that was a long all along.
+    ///
+    /// Anything that is not a plain LispStruct slot holding a Fixnum goes through
+    /// StructRefI, so a non-structure, a wrong index or a non-fixnum slot value
+    /// reports exactly what it reported before.
+    /// </summary>
+    /// <summary>A structure slot declared DOUBLE-FLOAT, read as a raw double.
+    /// The counterpart of StructRefL for the other raw kind.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static double StructRefD(LispObject obj, int packed)
+    {
+        if (obj is LispStruct s && (uint)(packed & SlotIndexMask) < (uint)s.SlotCount
+            && s.TryRawLong(RawPosOf(s, packed, LispStruct.SlotKindDouble), out long bits))
+            return BitConverter.Int64BitsToDouble(bits);
+        return ((DoubleFloat)StructRefI(obj, packed)).Value;
+    }
+
+    /// <summary>A double stored into a structure slot without boxing it.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static double StructSetD(LispObject obj, int packed, double value)
+    {
+        if (obj is LispStruct s && (uint)(packed & SlotIndexMask) < (uint)s.SlotCount
+            && s.TrySetRaw(RawPosOf(s, packed, LispStruct.SlotKindDouble),
+                           BitConverter.DoubleToInt64Bits(value)))
+            return value;
+        StructSetI(obj, packed, new DoubleFloat(value));
+        return value;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static long StructRefL(LispObject obj, int packed)
+    {
+        if (obj is LispStruct s && (uint)(packed & SlotIndexMask) < (uint)s.SlotCount)
+        {
+            // A raw slot is already an int64: no Fixnum in between, which is the
+            // whole point of the raw storage.
+            if (s.TryRawLong(RawPosOf(s, packed, LispStruct.RawLong), out long raw))
+                return raw;
+            if (s.GetSlot(SlotIndex(s, packed)) is Fixnum f) return f.Value;
+        }
+        return ((Fixnum)StructRefI(obj, packed)).Value;
+    }
+
+    /// <summary>
+    /// A fixnum stored into a struct slot without boxing it first, returning the
+    /// value so (SETF (accessor x) v) still answers v. The box was the whole
+    /// allocation of a struct-writing loop: 23.8 bytes per iteration, one Fixnum
+    /// per store above the small-integer cache.
+    ///
+    /// Only a plain LispStruct with an in-range index takes the fast path, and
+    /// even then the value is boxed on the way in -- the slot holds LispObjects.
+    /// What is saved is the box on the DISCARDED path: in statement position the
+    /// caller emits no temp and no unwrap, and Fixnum.Make's cache covers the
+    /// common small values. Everything else falls back to StructSetI, so slot
+    /// type checking and error reporting are unchanged.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static long StructSetL(LispObject obj, int packed, long value)
+    {
+        if (obj is LispStruct s && (uint)(packed & SlotIndexMask) < (uint)s.SlotCount)
+        {
+            // Into a raw slot the value goes as it is. The Fixnum.Make below is
+            // what a declared-fixnum slot used to pay on every store even
+            // though nothing ever looked at the object.
+            if (s.TrySetRaw(RawPosOf(s, packed, LispStruct.RawLong), value))
+                return value;
+            s.SetSlot(SlotIndex(s, packed), Fixnum.Make(value));
+            return value;
+        }
+        StructSetI(obj, packed, Fixnum.Make(value));
+        return value;
     }
 
     /// <summary>Map SBCL's package struct slot indices to dotcl Package properties.</summary>
@@ -1257,13 +1491,66 @@ public static partial class Runtime
     /// Fast struct slot set with raw int index (avoids Fixnum boxing).
     /// Used by compiler for constant-index struct setf accessors.
     /// </summary>
-    public static LispObject StructSetI(LispObject obj, int idx, LispObject value)
+    /// <summary>Signal unless VALUE is of the declared type of a structure slot.
+    ///
+    /// DEFSTRUCT's :TYPE used to be dropped during macroexpansion, so a slot
+    /// declared (:type fixnum) accepted a string in silence. CLHS 3.3.1 leaves a
+    /// violated declaration undefined, and silence is a legal choice, but it is
+    /// the least useful one: the writer said what belongs in the slot, and the
+    /// cost of holding them to it is one TYPEP on a store.
+    ///
+    /// The compiler drops the call entirely under (safety 0), so this is the
+    /// safety 1+ behavior only. Returns the value so it can wrap a store.</summary>
+    /// <summary>Record which slots of a structure type are stored raw.
+    /// POSITIONS is a list with one entry per slot: the index into the raw
+    /// array, or -1 for a slot that stays boxed. Emitted by DEFSTRUCT at load
+    /// time, and only when at least one slot qualifies.</summary>
+    /// <summary>The shape this had before layouts carried a version. Kept
+    /// because a shipped FASL calls what it was compiled against.</summary>
+    public static LispObject StructRegisterLayout(LispObject typeName, LispObject positions)
+        => StructRegisterLayout(typeName, positions, Fixnum.Make(0));
+
+    public static LispObject StructRegisterLayout(LispObject typeName, LispObject positions,
+                                                  LispObject version)
+    {
+        if (typeName is not Symbol sym)
+            throw new LispErrorException(new LispTypeError(
+                "%STRUCT-REGISTER-LAYOUT: type name must be a symbol", typeName));
+        // Each entry is (POSITION . KIND); KIND is 0 for a raw integer and 1 for
+        // a raw double. A boxed slot has position -1.
+        var pos = new List<int>();
+        var kind = new List<byte>();
+        for (var cur = positions; cur is Cons c; cur = c.Cdr)
+        {
+            if (c.Car is Cons pair)
+            {
+                pos.Add(pair.Car is Fixnum pf ? (int)pf.Value : -1);
+                kind.Add(pair.Cdr is Fixnum kf ? (byte)kf.Value : LispStruct.RawLong);
+            }
+            else { pos.Add(-1); kind.Add(LispStruct.RawLong); }
+        }
+        LispStruct.RegisterLayout(sym, pos.ToArray(), kind.ToArray(),
+                                  version is Fixnum vf ? (int)vf.Value : 0);
+        return Nil.Instance;
+    }
+
+    public static LispObject CheckSlotType(LispObject value, LispObject type,
+                                           LispObject structName, LispObject slotName)
+    {
+        if (Typep(value, type) is not Nil) return value;
+        throw new LispErrorException(new LispTypeError(
+            $"{structName}: slot {slotName} is declared {type}, got {value}",
+            value, type));
+    }
+
+    public static LispObject StructSetI(LispObject obj, int packed, LispObject value)
     {
         if (obj is LispStruct s)
         {
-            s.Slots[idx] = value;
+            s.SetSlot(SlotIndex(s, packed), value);
             return value;
         }
+        int idx = packed & SlotIndexMask;
         if (obj is LispInstance inst && inst.Class.IsStructureClass)
         {
             inst.Slots[idx] = value;
@@ -1276,12 +1563,17 @@ public static partial class Runtime
     {
         if (index is not Fixnum f)
             throw new LispErrorException(new LispTypeError("STRUCT-REF: index must be integer", index));
-        int idx = (int)f.Value;
+        // The accessor functions DEFSTRUCT writes call this with the same packed
+        // constant a compiled call site emits, so the version check is the same
+        // one -- an interpreted call must not read a slot a compiled call would
+        // refuse.
+        int packed = (int)f.Value;
+        int idx = packed & SlotIndexMask;
         if (obj is LispStruct s)
         {
-            if (idx < 0 || idx >= s.Slots.Length)
-                throw IndexError("STRUCT-REF", idx, s.Slots.Length, "structure");
-            return s.Slots[idx];
+            if (idx < 0 || idx >= s.SlotCount)
+                throw IndexError("STRUCT-REF", idx, s.SlotCount, "structure");
+            return s.GetSlot(SlotIndex(s, packed));
         }
         // Also support LispInstance for structure classes (created by allocate-instance)
         if (obj is LispInstance inst && inst.Class.IsStructureClass)
@@ -1297,12 +1589,13 @@ public static partial class Runtime
     {
         if (index is not Fixnum f)
             throw new LispErrorException(new LispTypeError("STRUCT-SET: index must be integer", index));
-        int idx = (int)f.Value;
+        int packed = (int)f.Value;
+        int idx = packed & SlotIndexMask;
         if (obj is LispStruct s)
         {
-            if (idx < 0 || idx >= s.Slots.Length)
-                throw IndexError("STRUCT-SET", idx, s.Slots.Length, "structure");
-            s.Slots[idx] = value;
+            if (idx < 0 || idx >= s.SlotCount)
+                throw IndexError("STRUCT-SET", idx, s.SlotCount, "structure");
+            s.SetSlot(SlotIndex(s, packed), value);
             return value;
         }
         // Also support LispInstance for structure classes (created by allocate-instance)
@@ -1347,10 +1640,10 @@ public static partial class Runtime
         // reads the array's type at run time; allocating and copying is the same
         // work with none of that. COPY-STRUCTURE of a four-slot structure spent
         // 0.60 s per 3M copies through Clone and 0.37 s this way.
-        var src = s.Slots;
+        var src = s.SlotsSnapshot();
         var dst = new LispObject[src.Length];
         Array.Copy(src, dst, src.Length);
-        return new LispStruct(s.TypeName, dst);
+        return new LispStruct(s, dst);
     }
 
 

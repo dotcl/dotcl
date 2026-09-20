@@ -2,7 +2,7 @@
 ;;; the established restart on BOTH evaluator paths.
 ;;;
 ;;; RESTART-CASE macroexpands into RESTART-BIND, which macroexpands into
-;;; %PUSH-RESTART-CLUSTER — and that expansion used to DROP the options, on the
+;;; %PUSH-RESTART-CLUSTER: and that expansion used to DROP the options, on the
 ;;; premise that "restart options are kept by the compile-form handler; this
 ;;; expansion is for macroexpand-1 / walkers". That premise does not hold for the
 ;;; tree-walk interpreter, which takes the macro path as its real evaluation
@@ -51,7 +51,7 @@
   "A report")
 
 ;;; --- :report as a function, closing over the establishing scope
-;;; (ansi RESTART-CASE.21 — the report function is an FLET)
+;;; (ansi RESTART-CASE.21: the report function is an FLET)
 
 (defparameter %ro-report-fn
   '(with-output-to-string (s)

@@ -11,7 +11,7 @@ public static class MauiProgram
 		// ships a single bundle dir alongside the app: dotcl.core,
 		// the contrib dependency FASLs (just dotnet-class for this demo),
 		// and MauiLispDemo.fasl (compiled from main.lisp at build time).
-		// LoadFromManifest reads the manifest and loads them in order — so
+		// LoadFromManifest reads the manifest and loads them in order: so
 		// after this call, MainVM, MainPage, BUILD-MAIN-PAGE etc. are all
 		// defined and ready for App.CreateWindow to invoke.
 		InitializeDotcl();
@@ -85,7 +85,7 @@ public static class MauiProgram
 		catch (Exception ex)
 		{
 			Log($"[dotcl] InitializeDotcl failed: {ex}");
-			// Don't rethrow — let the MAUI window come up so the user can at
+			// Don't rethrow: let the MAUI window come up so the user can at
 			// least see the app started; the App.CreateWindow fallback will
 			// surface errors.
 		}

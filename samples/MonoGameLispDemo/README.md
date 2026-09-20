@@ -1,4 +1,4 @@
-# MonoGameLispDemo — a recipe for embedding dotcl in a C# project (MonoGame edition)
+# MonoGameLispDemo: a recipe for embedding dotcl in a C# project (MonoGame edition)
 
 A sample that demonstrates the boilerplate for **embedding dotcl as an
 in-process runtime in an existing .NET project**, using a MonoGame DesktopGL
@@ -15,7 +15,7 @@ Key points:
 
 ## When you launch the demo
 
-A window opens and the background gradates red → green → blue → red on a 6-second
+A window opens and the background gradates red -> green -> blue -> red on a 6-second
 cycle. The `Game.Update` / `Game.Draw` loop runs on the MonoGame side, and only
 the Lisp code inside the `Draw` override (calling `pulse-color` to build a
 `Color`) is evaluated each frame.
@@ -24,16 +24,16 @@ the Lisp code inside the `Draw` override (calling `pulse-color` to build a
 
 ```
 MonoGameLispDemo/
-├── MonoGameLispDemo.csproj   # net10.0-windows / win-x64 / DesktopGL
-├── MonoGameLispDemo.asd      # ASDF definition: depends-on dotnet-class
-├── main.lisp                 # emits Demo.LispGame via define-class
-├── Program.cs                # boot + Run() only
-└── CsharpSanityGame.cs       # environment check (launch with --csharp-sanity)
++-- MonoGameLispDemo.csproj   # net10.0-windows / win-x64 / DesktopGL
++-- MonoGameLispDemo.asd      # ASDF definition: depends-on dotnet-class
++-- main.lisp                 # emits Demo.LispGame via define-class
++-- Program.cs                # boot + Run() only
++-- CsharpSanityGame.cs       # environment check (launch with --csharp-sanity)
 ```
 
 The `<Import Project=".../Dotcl.targets" />` in `MonoGameLispDemo.csproj`
 compile-files `main.lisp` at build time and places it under
-`bin/.../dotcl-fasl/` (project-core flow). At run time
+`bin/.../dotcl-fasl/` as a `.fasl` plus a manifest. At run time
 `DotclHost.LoadFromManifest` reads the manifest and loads everything together.
 
 ## Why DesktopGL / win-x64
@@ -45,7 +45,7 @@ compile-files `main.lisp` at build time and places it under
   performance penalty is acceptable. The pin dates from when
   `MonoGame.Library.SDL` had no win-arm64 native; it ships one now (resolving the
   package for `win-arm64` lays out an SDL2 binary distinct from the x64 one), so
-  the pin is probably removable — nobody has re-tested the sample natively on
+  the pin is probably removable; nobody has re-tested the sample natively on
   ARM64 since.
 
 ## Environment check

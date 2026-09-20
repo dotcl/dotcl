@@ -14,7 +14,7 @@
 ;;;
 ;;; A literal (- 0.0) is inlined by the compiler and is correct, so the bug showed
 ;;; ONLY through FUNCALL / APPLY / REDUCE, where the DEFUN is what runs. It is
-;;; therefore not an interpreter-only problem — the compiled cases below also fail
+;;; therefore not an interpreter-only problem: the compiled cases below also fail
 ;;; before the fix.
 
 (defun %mf (mode form)

@@ -4,7 +4,7 @@
 ;;; %MINI-EVAL case only did the SET and the PROCLAIM, so a constant defined
 ;;; through EVAL was an ordinary special variable and CONSTANTP answered NIL.
 ;;;
-;;; That reaches past introspection — SYMBOL-MACROLET's program-error check and
+;;; That reaches past introspection: SYMBOL-MACROLET's program-error check and
 ;;; anything else asking CONSTANTP saw an ordinary variable. No test here gates
 ;;; that consequence, though: DEFCONSTANT also proclaims the name SPECIAL, and
 ;;; SYMBOL-MACROLET-VIOLATION-P refuses on EITHER condition, so such a case

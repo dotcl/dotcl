@@ -6,7 +6,7 @@
 ;;; claim zero of them. Overload selection for a .NET delegate parameter reads it:
 ;;; Enumerable.Select has a Func<T,R> and a Func<T,int,R> overload told apart by
 ;;; arity, so a one-argument Lisp lambda matched NEITHER and the call failed with
-;;; "Method ... Select not found" — on any build when interpreted, and on an
+;;; "Method ... Select not found": on any build when interpreted, and on an
 ;;; emit-free build always, since there everything is interpreted.
 ;;;
 ;;; The arity is asserted through its consequence rather than read directly:

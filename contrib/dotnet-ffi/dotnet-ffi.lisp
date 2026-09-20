@@ -1,4 +1,4 @@
-;;; dotnet-ffi.lisp — dotnet:define-ffi macro
+;;; dotnet-ffi.lisp: dotnet:define-ffi macro
 ;;; Wraps dotnet:%ffi-call for declarative native function bindings.
 ;;;
 ;;; Usage:

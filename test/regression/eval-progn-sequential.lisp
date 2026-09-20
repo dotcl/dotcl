@@ -2,8 +2,8 @@
 ;;;
 ;;; The compiling evaluator handed the whole PROGN to the compiler as one unit,
 ;;; so b was compiled before a had run. Anything a installs at run time that b's
-;;; compilation needs — a setf expander from DEFSETF, a symbol macro from
-;;; DEFINE-SYMBOL-MACRO — was not there yet, and b compiled against no
+;;; compilation needs, a setf expander from DEFSETF, a symbol macro from
+;;; DEFINE-SYMBOL-MACRO, was not there yet, and b compiled against no
 ;;; definition at all: (setf (place 1) 2) became a call to an undefined
 ;;; #'(setf place).
 ;;;

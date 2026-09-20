@@ -4,7 +4,7 @@
 ;;; PersistedAssemblyBuilder orders a method's exception clauses by where their
 ;;; try blocks end. That is correct while nesting happens through try blocks, but
 ;;; a try nested inside an enclosing clause's HANDLER starts after that handler's
-;;; try has already ended, so the enclosing clause is written first — and the CLR
+;;; try has already ended, so the enclosing clause is written first; and the CLR
 ;;; rejects the method with InvalidProgramException as soon as it is JITted.
 ;;; dotcl reorders the clauses after saving the fasl.
 ;;;

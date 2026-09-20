@@ -8,7 +8,7 @@
 ;;; SBCL signals UNDEFINED-FUNCTION; DotCL used to signal STACK-OVERFLOW.
 ;;;
 ;;; Fix: GetFunctionBySymbol is authoritative for package-qualified
-;;; compiled calls — returns sym.Function or signals UNDEFINED-FUNCTION,
+;;; compiled calls: returns sym.Function or signals UNDEFINED-FUNCTION,
 ;;; with NO cross-package bridge. The compiler's compile-fn-sym-lookup
 ;;; emits :load-sym-pkg for package-qualified calls (authoritative) and
 ;;; :load-sym (bare Startup.Sym, which bridges at symbol-resolution) for
@@ -40,7 +40,7 @@
   (nil t t))
 
 ;;; When the target symbol is bound, the package-qualified call resolves
-;;; to it directly — no aliasing, no undefined-function.
+;;; to it directly: no aliasing, no undefined-function.
 (deftest-compiled-only cross-package-fn-aliasing.bound-qualified-call-resolves
   (progn
     (fmakunbound 'xpa-lib:foo)
@@ -133,7 +133,7 @@
 ;;; The unqualified-call bridge exists for one reason: the C# runtime registers
 ;;; its helpers on CL / DOTCL-INTERNAL symbols, so Lisp code that reads such a
 ;;; name in another package produces a different symbol object that still has to
-;;; reach the registered function. It bridges only from dotcl's own packages —
+;;; reach the registered function. It bridges only from dotcl's own packages;
 ;;; an arbitrary library's package answering would turn an undefined function
 ;;; into a silent call of an unrelated same-named one.
 (deftest-compiled-only cross-package-fn-aliasing.unqualified-call-bridges-to-dotcl-packages
@@ -145,7 +145,7 @@
   t)
 
 ;;; Same rule on the (funcall 'sym) path, and the hit is never cached on the
-;;; caller's symbol — a failed funcall must not leave the symbol FBOUNDP.
+;;; caller's symbol: a failed funcall must not leave the symbol FBOUNDP.
 (deftest cross-package-fn-aliasing.funcall-does-not-bridge-to-user-packages
   (progn
     (fmakunbound 'xpa-a:bar)

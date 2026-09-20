@@ -42,7 +42,7 @@ An existing ~/quicklisp/ wins, so a machine already set up by the stock
 installer keeps working. Otherwise the home lives under dotcl's own per-user
 directory rather than squatting on ~/quicklisp: %APPDATA%/dotcl/quicklisp/ on
 Windows (the same root as dotcl:user-init-file), $XDG_DATA_HOME/dotcl/quicklisp/
-on Unix — dists/ is bulk data rather than configuration, so XDG places it under
+on Unix; dists/ is bulk data rather than configuration, so XDG places it under
 ~/.local/share, not ~/.config."
   (let ((classic (merge-pathnames "quicklisp/" (user-homedir-pathname))))
     (if (probe-file classic)

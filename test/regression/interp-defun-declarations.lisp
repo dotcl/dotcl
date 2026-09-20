@@ -8,7 +8,7 @@
 ;;; know which names the enclosing form bound when it walks the block's body, so a
 ;;; parameter's SPECIAL declaration looks FREE. The free rule is "read it
 ;;; dynamically, do not rebind", so the lexical entry is dropped and no dynamic
-;;; binding is made — the body then reads an unbound variable:
+;;; binding is made: the body then reads an unbound variable:
 ;;;
 ;;;   (defun f (x &aux (y 10)) (declare (special x)) (+ x y))
 ;;;   (f 5)   ;; => Unbound variable: X

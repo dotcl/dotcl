@@ -1,7 +1,7 @@
-;;;; app.lisp — precompiled to a stable-named .NET IL assembly (appfasl.dll) at
+;;;; app.lisp: precompiled to a stable-named .NET IL assembly (appfasl.dll) at
 ;;;; build time; Unity IL2CPP bakes it into the WebGL build. The host calls these
 ;;;; from C# every frame to drive an animated curve, and a browser input box can
-;;;; EVAL Lisp at run time to change the curve live — emit-free, no recompile.
+;;;; EVAL Lisp at run time to change the curve live: emit-free, no recompile.
 
 ;; Curve parameters as global special variables. A browser eval like
 ;; (setf *fx* 7) or (setf *amp* 0.5) mutates these and the animation changes on

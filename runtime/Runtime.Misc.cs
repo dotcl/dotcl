@@ -41,7 +41,7 @@ public static partial class Runtime
 
     /// <summary>Warn when a .fasl was produced by a different compiler than the one
     /// running. A fasl holds the code generation of the compiler that built it, so
-    /// one built before a codegen fix silently keeps the old behaviour — the fix
+    /// one built before a codegen fix silently keeps the old behaviour; the fix
     /// looks inert and the search goes to the compiler instead of to the artifact.
     /// Warn only; the fasl is still loadable and usually still correct. A fasl with
     /// no stamp (built before stamping existed, or by a core loaded from memory) is
@@ -62,7 +62,7 @@ public static partial class Runtime
                 $";; warning: {faslPath} was compiled by a different dotcl core " +
                 $"(fasl {stamped}, running {current}).");
             Console.Error.WriteLine(
-                ";;          It keeps that core's code generation — recompile it if a " +
+                ";;          It keeps that core's code generation; recompile it if a " +
                 "compiler fix seems to have no effect.");
         }
         catch { /* diagnostics must never break a load */ }
@@ -99,7 +99,7 @@ public static partial class Runtime
                 if (r == null) return -1;
                 int c = r.Read();
                 if (c != -1) return c;
-                _cs.CurrentIndex++; // component exhausted between Peek and Read — advance
+                _cs.CurrentIndex++; // component exhausted between Peek and Read; advance
             }
         }
     }
@@ -206,7 +206,7 @@ public static partial class Runtime
     // detect Gray streams by class NAME walked over the precedence list,
     // not by FindClassByName + reference compare. FindClassByName does a linear
     // scan of the class registry and returns the FIRST class whose bare name
-    // matches — so when a second class of the same name exists (e.g. after
+    // matches: so when a second class of the same name exists (e.g. after
     // (asdf:load-system :trivial-gray-streams), which defines its own
     // FUNDAMENTAL-CHARACTER-OUTPUT-STREAM in another package), it can return a
     // class that is NOT the one in this instance's CPL, making the reference
@@ -254,8 +254,18 @@ public static partial class Runtime
     }
 
     public static LispObject ReadFromStream(LispObject stream, LispObject eofErrorP, LispObject eofValue)
-        => GuardStreamIO(stream, stream, eofErrorP, eofValue,
-                         static (st, ee, ev) => ReadFromStreamUnguarded(st, ee, ev));
+    {
+        var value = GuardStreamIO(stream, stream, eofErrorP, eofValue,
+                                  static (st, ee, ev) => ReadFromStreamUnguarded(st, ee, ev));
+        // READ returns exactly one value. Inside, "no value" is how a reader macro
+        // that consumed only whitespace or a comment reports itself, and a Lisp-level
+        // macro function (what GET-MACRO-CHARACTER hands back, so every readtable
+        // merged from the standard one) says that by publishing ZERO values. That is
+        // an internal protocol; letting it out made a READ whose input merely started
+        // with a comment return no values at all.
+        MultipleValues.Reset();
+        return value;
+    }
 
     private static LispObject ReadFromStreamUnguarded(LispObject stream, LispObject eofErrorP, LispObject eofValue)
     {
@@ -416,7 +426,7 @@ public static partial class Runtime
         // The representation was printed under the standard default float format
         // (see TryEmitConstantViaReader), which decides which floats carry an
         // exponent marker. Reading it under whatever the loading process happens
-        // to have set would turn a double into a single, or the reverse — the
+        // to have set would turn a double into a single, or the reverse: the
         // right value with the wrong type, and no error anywhere.
         var rdffSym = Startup.Sym("*READ-DEFAULT-FLOAT-FORMAT*");
         DynamicBindings.Push(rdffSym, Startup.Sym("SINGLE-FLOAT"));
@@ -537,6 +547,27 @@ public static partial class Runtime
         }
     }
 
+    /// <summary>
+    /// The four contribs that used to ship under an unprefixed name, and what
+    /// they are called now. Four general words (advice, clrmd, decompiler,
+    /// nuget) sitting in asdf:*central-registry* quietly won over a system of
+    /// the same name belonging to the user, so they were given the dotcl-
+    /// prefix the other bundled systems already had.
+    ///
+    /// Consulted only after every module provider has declined, so a user who
+    /// does have their own "nuget" system still gets it: this only turns the
+    /// failure that would otherwise say nothing into one that names the new
+    /// module.
+    /// </summary>
+    private static string? RenamedContribHint(string name) => name.ToLowerInvariant() switch
+    {
+        "advice" => "this contrib was renamed to \"dotcl-advice\"",
+        "clrmd" => "this contrib was renamed to \"dotcl-clrmd\"",
+        "decompiler" => "this contrib was renamed to \"dotcl-decompiler\"",
+        "nuget" => "this contrib was renamed to \"dotcl-nuget\"",
+        _ => null
+    };
+
     public static LispObject Require(LispObject[] args)
     {
         if (args.Length == 0)
@@ -556,7 +587,7 @@ public static partial class Runtime
         for (LispObject c = DynamicBindings.Get(modulesSym); c is Cons cc; c = cc.Cdr)
             if (cc.Car is LispString s) before.Add(s.Value);
 
-        // Already in *modules* — nothing to do, empty diff = NIL.
+        // Already in *modules*: nothing to do, empty diff = NIL.
         if (before.Contains(name)) return Nil.Instance;
 
         // If pathname-list provided, load them
@@ -579,7 +610,7 @@ public static partial class Runtime
         }
         else
         {
-            // No pathnames — call *module-provider-functions* (SBCL-compatible)
+            // No pathnames: call *module-provider-functions* (SBCL-compatible)
             var mpfSym = Startup.Sym("*MODULE-PROVIDER-FUNCTIONS*");
             LispObject providers = DynamicBindings.Get(mpfSym);
             bool found = false;
@@ -604,7 +635,10 @@ public static partial class Runtime
                 providers = pc.Cdr;
             }
             if (!found)
-                throw new LispErrorException(new LispError($"REQUIRE: module \"{name}\" not found"));
+                throw new LispErrorException(new LispError(
+                    RenamedContribHint(name) is string hint
+                        ? $"REQUIRE: module \"{name}\" not found -- {hint}"
+                        : $"REQUIRE: module \"{name}\" not found"));
         }
 
         // Some contribs' files forget to call (provide ...), which would
@@ -620,7 +654,7 @@ public static partial class Runtime
                 new Cons(new LispString(name), DynamicBindings.Get(modulesSym)));
 
         // Collect names added to *modules* during this call. *modules* is
-        // prepended newest-first; iterating head→tail and prepending to the
+        // prepended newest-first; iterating head->tail and prepending to the
         // result reverses to chronological order of the PROVIDE calls.
         LispObject added = Nil.Instance;
         for (LispObject c = DynamicBindings.Get(modulesSym); c is Cons cc; c = cc.Cdr)
@@ -635,7 +669,7 @@ public static partial class Runtime
     /// Extra contrib search paths added by host applications (MAUI, etc.)
     /// whose contrib bundle lives somewhere other than
     /// <c>AppContext.BaseDirectory/contrib</c>. Each path is the parent of a
-    /// contrib tree — i.e. candidate files are <c>&lt;path&gt;/name/name.ext</c>.
+    /// contrib tree: i.e. candidate files are <c>&lt;path&gt;/name/name.ext</c>.
     /// Entries are prepended to the search order so hosts can override.
     /// </summary>
     public static readonly List<string> ContribExtraSearchPaths = new();
@@ -677,7 +711,7 @@ public static partial class Runtime
         var searchDirs = new List<string>();
         searchDirs.AddRange(ContribExtraSearchPaths);
         searchDirs.Add(Path.Combine(baseDir, "contrib"));
-        // Dev fallbacks: runtime/bin/Debug/net10.0/ → runtime/contrib/ or
+        // Dev fallbacks: runtime/bin/Debug/net10.0/ -> runtime/contrib/ or
         // project-root contrib/
         searchDirs.Add(Path.Combine(baseDir, "..", "..", "..", "contrib"));
         searchDirs.Add(Path.Combine(baseDir, "..", "..", "..", "..", "contrib"));
@@ -708,9 +742,9 @@ public static partial class Runtime
                     }
                     // The quicklisp client reads asdf: symbols (client.lisp,
                     // dist.lisp, misc.lisp, setup.lisp). Loading its fasl with
-                    // asdf absent does not fail here — the references are
+                    // asdf absent does not fail here: the references are
                     // resolved lazily and the ASDF package is never even
-                    // created — so the breakage would surface much later as a
+                    // created: so the breakage would surface much later as a
                     // missing-package error inside quickload. Pull asdf in
                     // first, the way upstream's bootstrap loads asdf.lisp ahead
                     // of the client. The nested Require re-enters _modulesLock
@@ -769,7 +803,7 @@ public static partial class Runtime
         // (backslashes or a C: drive) fails ASDF's absolute-pathname check.
         // dotcl's own CL parse-namestring already parses native Windows paths
         // correctly (drive -> device), so on Windows we route native paths through it
-        // (lossless — the drive is preserved) and let genuine unix-style namestrings
+        // (lossless: the drive is preserved) and let genuine unix-style namestrings
         // fall through to the original. This replaces an earlier lossy version that
         // stripped the drive (wrong on non-C: drives).
         const string patch = @"
@@ -871,7 +905,7 @@ public static partial class Runtime
 
     /// <summary>
     /// After ASDF loads, push its module provider onto CL:*MODULE-PROVIDER-FUNCTIONS*
-    /// so that (require "some-asdf-system") falls back to ASDF — the way SBCL wires
+    /// so that (require "some-asdf-system") falls back to ASDF: the way SBCL wires
     /// asdf:module-provide-asdf into sb-ext:*module-provider-functions* (asdf's
     /// footer.lisp does this only for known implementations; dotcl is not in that
     /// feature list, and dotcl's hook lives in CL, not sb-ext, so the integration
@@ -1043,7 +1077,7 @@ public static partial class Runtime
         bool isVerbose = verbose is not Nil;
         bool isPrint = print is not Nil;
 
-        // CLHS: filespec can be a stream — read and eval forms from it directly
+        // CLHS: filespec can be a stream: read and eval forms from it directly
         if (filespec is LispStream)
         {
             if (isVerbose)
@@ -1121,7 +1155,7 @@ public static partial class Runtime
             w.Flush();
         }
 
-        // Handle persisted .NET assembly — detect by PE header ("MZ"), not extension
+        // Handle persisted .NET assembly: detect by PE header ("MZ"), not extension
         if (IsPeAssembly(filePath))
         {
             try { return LoadFasl(filePath, filespec, isVerbose, isPrint); }
@@ -1206,7 +1240,7 @@ public static partial class Runtime
                                 // is loaded by evaluating its top-level forms. Without
                                 // this branch an emit-free runtime could boot its FASL
                                 // core and answer --eval, but LOAD of any .lisp died on
-                                // the CilAssembler guard — which is why the suite had
+                                // the CilAssembler guard: which is why the suite had
                                 // never been run on such a build.
                                 result = Eval(subForm);
 #endif
@@ -1215,7 +1249,16 @@ public static partial class Runtime
                     }
                     catch (Exception ex)
                     {
-                        // Don't wrap control flow exceptions — they must reach their
+                        // A THROW whose catcher is gone is not control flow any more,
+                        // it is the CONTROL-ERROR of CLHS 5.2. Checked before the
+                        // control-flow test below, which would otherwise let it past
+                        // LOAD and out of the process: a library with a load-time
+                        // THROW that misses its catcher killed the host instead of
+                        // signalling something a handler could take. EVAL has had
+                        // this check; LOAD did not.
+                        var unmatched = Runtime.UnmatchedThrowError(ex);
+                        if (unmatched != null) throw unmatched;
+                        // Don't wrap control flow exceptions: they must reach their
                         // intended catch blocks (handler-case, block, catch, go, restart).
                         if (Runtime.IsLispControlFlowException(ex))
                             throw;
@@ -1527,6 +1570,16 @@ public static partial class Runtime
         return arch == null ? null : $"{os}-{arch}";
     }
 
+    /// <summary>The ahead-of-time sibling of a fasl, or null when there is none.
+    /// The launcher needs this for a packed application's own fasl, which lives
+    /// outside LOAD. Safe before the core is up: anything needing Lisp state
+    /// answers null rather than throwing.</summary>
+    public static string? FindR2rSibling(string faslFull)
+    {
+        try { return TryFindR2rSibling(faslFull); }
+        catch { return null; }
+    }
+
     /// <summary>The ahead-of-time compiled sibling of a fasl, if there is one for
     /// this platform and it is not older than the fasl itself. Returns null when
     /// there is none, when it is stale, or when dotcl:*load-r2r* is NIL.</summary>
@@ -1590,8 +1643,8 @@ public static partial class Runtime
             // debugger has symbols for this in-memory module directly: an
             // assembly loaded from bytes carries no file Location, so the
             // debugger cannot otherwise discover a co-located pdb. This is what
-            // makes a deployed dotcl app — whose fasl LoadFromManifest loads from
-            // bin/dotcl-fasl/ — break/step in its .lisp under a Debug build.
+            // makes a deployed dotcl app, whose fasl LoadFromManifest loads from
+            // bin/dotcl-fasl/, break/step in its .lisp under a Debug build.
             var faslFull = Path.GetFullPath(filePath);
             var pdbPath = Path.ChangeExtension(faslFull, ".pdb");
             System.Reflection.Assembly asm;
@@ -1620,7 +1673,7 @@ public static partial class Runtime
                 {
                     // Load by path so the module is file-backed. A coverage profiler
                     // picks its targets per loaded module and skips anything without a
-                    // Location, so an assembly loaded from bytes is invisible to it —
+                    // Location, so an assembly loaded from bytes is invisible to it;
                     // which is the whole reason this switch exists: with it set, an
                     // off-the-shelf .NET coverage collector reports line coverage
                     // against the .lisp itself, out of the PDB's document table.
@@ -1629,8 +1682,8 @@ public static partial class Runtime
                     // caches the assembly against that path: recompiling a fasl and
                     // LOADing it again in the same session would fail to write on
                     // Windows, and elsewhere would return the assembly already loaded.
-                    // A coverage run does not do that — it is one process that compiles,
-                    // loads, runs and exits — so the switch costs it nothing.
+                    // A coverage run does not do that, it is one process that compiles,
+                    // loads, runs and exits, so the switch costs it nothing.
                     asm = System.Reflection.Assembly.LoadFrom(faslFull);
                 }
                 else
@@ -1692,7 +1745,7 @@ public static partial class Runtime
     /// only knows the global macro table, so a body form is never macroexpanded
     /// here: expanding a call to a name the MACROLET shadows would take the global
     /// definition. Splitting the body structurally is still safe, and it is the
-    /// whole point — the Lisp compiler does the expansion later, in scope.</param>
+    /// whole point: the Lisp compiler does the expansion later, in scope.</param>
     private static IEnumerable<LispObject> FlattenTopLevel(LispObject form, bool inLocalMacroScope)
     {
         // Defensive: if a reader macro or macro expander leaked MvReturn, take primary value.
@@ -1738,7 +1791,7 @@ public static partial class Runtime
             }
             // Per CLHS 3.2.3.1, the body of a top level LOCALLY is likewise
             // processed as top level forms, with the declarations still in
-            // effect — so each body form is re-wrapped in its own LOCALLY.
+            // effect: so each body form is re-wrapped in its own LOCALLY.
             // The Lisp side already agrees (compile-locally keeps
             // *at-toplevel*); only this flattener did not, so a file whose
             // definitions sit inside one top level LOCALLY compiled its whole
@@ -1776,11 +1829,11 @@ public static partial class Runtime
             }
             // CLHS 3.2.3.1 names MACROLET and SYMBOL-MACROLET alongside LOCALLY:
             // their bodies are top level forms too. Same shape as LOCALLY, one
-            // element further in — the bindings list rides along with the
+            // element further in: the bindings list rides along with the
             // declarations onto every body form, so each keeps the local macros
             // and symbol macros it was written under. Without this a library that
             // wraps its definitions in one top level MACROLET compiles the whole
-            // body into a single _toplevel_N method — the same failure the LOCALLY
+            // body into a single _toplevel_N method: the same failure the LOCALLY
             // case above fixes, with the same cost at load time.
             if ((sym.Name == "MACROLET" || sym.Name == "SYMBOL-MACROLET")
                 && c.Cdr is Cons mrest)
@@ -1814,7 +1867,7 @@ public static partial class Runtime
             // Per CLHS 3.2.3.1: "If a top level form is a macro form,
             // the macro form is expanded and the result is processed as a top level form."
             // Don't expand forms already handled by ShouldExecuteAtCompileTime or
-            // IsEvalWhenForCompileFile — they need their original identity preserved.
+            // IsEvalWhenForCompileFile: they need their original identity preserved.
             if (!inLocalMacroScope && !IsCompileTimeSideEffectForm(sym.Name))
             {
                 var expanded = TryMacroexpand1(form);
@@ -1884,7 +1937,7 @@ public static partial class Runtime
     // Active COMPILE-FILE "was fbound before" snapshots, innermost last.
     // A nested LOAD during compile-file re-snapshots into every pair so the
     // post-compile strip keeps definitions that came from loading other files
-    // (e.g. a compile-time (require ...)) — see CompileFile.
+    // (e.g. a compile-time (require ...)): see CompileFile.
     [ThreadStatic]
     private static Stack<(HashSet<Symbol> Fn, HashSet<Symbol> Setf)>? s_compileFilePreSetsTS;
     private static Stack<(HashSet<Symbol> Fn, HashSet<Symbol> Setf)> s_compileFilePreSets
@@ -1909,7 +1962,7 @@ public static partial class Runtime
     }
 
     /// <summary>
-    /// DOTCL:FUNCTION-SOURCE-LOCATION (name) — where NAME (a symbol) was most
+    /// DOTCL:FUNCTION-SOURCE-LOCATION (name): where NAME (a symbol) was most
     /// recently defined by a top-level definer (defun/defmethod/defclass/...) under
     /// LOAD or COMPILE-FILE, as the plist (:FILE "path" :LINE n), or NIL if unknown.
     /// Backs the swank/micros sldb frame-source-location and find-definitions so
@@ -1929,7 +1982,7 @@ public static partial class Runtime
     /// Identity-keyed map from a read form (a cons) to the source line where its
     /// opening paren appeared. Populated by the Reader only while non-null, which
     /// COMPILE-FILE arranges under DOTCL_EMIT_PDB so the compiler can attach
-    /// per-expression sequence points. Off (null) → the Reader does no work.
+    /// per-expression sequence points. Off (null) -> the Reader does no work.
     /// Thread-static: compile is single-threaded per file and this avoids sharing.
     /// </summary>
     [ThreadStatic] internal static Dictionary<object, (int sl, int sc, int el, int ec)>? SourceLineTable;
@@ -1943,7 +1996,7 @@ public static partial class Runtime
     }
 
     /// <summary>The function COMPILE-FILE installs in the compiler's
-    /// *EMIT-SOURCE-LINES* under DOTCL_EMIT_PDB: (fn form) → the form's source span
+    /// *EMIT-SOURCE-LINES* under DOTCL_EMIT_PDB: (fn form) -> the form's source span
     /// as a list (start-line start-col end-line end-col), or NIL. The compiler
     /// funcalls it per form; NIL means "no source position" (e.g. a
     /// macroexpansion-produced form), which correctly yields no sequence point.</summary>
@@ -1960,7 +2013,7 @@ public static partial class Runtime
     }
 
     /// <summary>
-    /// DOTCL:RECORD-DEFINITION-SOURCES (form file line) — run the same definition
+    /// DOTCL:RECORD-DEFINITION-SOURCES (form file line): run the same definition
     /// walker LOAD/COMPILE-FILE use on FORM, attributing any definitions to
     /// FILE:LINE. Lets a tool that compiles a single form outside LOAD/COMPILE-FILE
     /// (e.g. swank-compile-string on C-c C-c, which receives the buffer filename and
@@ -1982,10 +2035,10 @@ public static partial class Runtime
             return null;
         try
         {
-            // For DEFSTRUCT — let the Lisp compiler's find-macro-expander handle
+            // For DEFSTRUCT: let the Lisp compiler's find-macro-expander handle
             // it. The C# macro function table might contain
             // SBCL's broken 12MB expansion from src/code/defstruct.lisp.
-            // DEFKNOWN — SBCL macro that calls split-type-info at expansion time.
+            // DEFKNOWN: SBCL macro that calls split-type-info at expansion time.
             // C# expansion may succeed but produce forms that fail in the Lisp compiler.
             // Skip to let Lisp compiler handle macro expansion + eval in one step.
             if (sym.Name == "DEFSTRUCT" || sym.Name == "DEFKNOWN")
@@ -2052,6 +2105,13 @@ public static partial class Runtime
         or "SHADOWING-IMPORT" or "EXPORT" or "IMPORT" or "REQUIRE" or "PROVIDE"
         or "DEFTYPE"  // CLHS: deftype has compile-time effects (type name available during compilation)
         or "DEFCLASS" or "DEFINE-CONDITION"  // CLHS: defclass has compile-time effects (class name available for find-class during compilation)
+        // CLHS 3.2.3.1: DEFCONSTANT's name must be recognized as a constant
+        // variable while the rest of the file is compiled, and every
+        // implementation makes the VALUE readable there too -- which is what a
+        // macro expander in the same file needs. series keeps a list of special
+        // operators in a DEFCONSTANT and reads it from a macro expander a few
+        // hundred lines later; without this that read said "Unbound variable".
+        or "DEFCONSTANT"
             => true,
         _ => false
     };
@@ -2094,7 +2154,7 @@ public static partial class Runtime
         // Per CLHS 3.2.3.1 (Figure 3-7), at top level in compile-file the
         // behavior is determined solely by :compile-toplevel (eval now) and
         // :load-toplevel (place in fasl). :execute is irrelevant here and does
-        // NOT promote the body into the fasl — e.g. {:compile-toplevel :execute}
+        // NOT promote the body into the fasl: e.g. {:compile-toplevel :execute}
         // is evaluated at compile time and discarded, NOT written to the fasl
         // (promoting it on :execute leaked the body into the load image).
         // A bare {:execute} (no ct/lt) is handled by the Lisp compile-eval-when
@@ -2129,7 +2189,7 @@ public static partial class Runtime
         var OR = Startup.Sym("OR");
         var LET = Startup.Sym("LET");
 
-        // WHEN: (when test . body) → (if test (progn . body))
+        // WHEN: (when test . body) -> (if test (progn . body))
         Runtime.RegisterMacroFunction(Startup.Sym("WHEN"), new LispFunction(args => {
             Runtime.CheckArityExact("WHEN-MACRO-EXPANDER", args, 2);
             if (args[0] is not Cons form || form.Cdr is not Cons rest)
@@ -2142,7 +2202,7 @@ public static partial class Runtime
             return new Cons(IF, new Cons(test, new Cons(progn, Nil.Instance)));
         }, "WHEN-MACRO-EXPANDER", 2));
 
-        // UNLESS: (unless test . body) → (if (not test) (progn . body))
+        // UNLESS: (unless test . body) -> (if (not test) (progn . body))
         Runtime.RegisterMacroFunction(Startup.Sym("UNLESS"), new LispFunction(args => {
             Runtime.CheckArityExact("UNLESS-MACRO-EXPANDER", args, 2);
             if (args[0] is not Cons form || form.Cdr is not Cons rest)
@@ -2156,7 +2216,7 @@ public static partial class Runtime
             return new Cons(IF, new Cons(notTest, new Cons(progn, Nil.Instance)));
         }, "UNLESS-MACRO-EXPANDER", 2));
 
-        // AND: (and) → t  (and x) → x  (and x . rest) → (if x (and . rest) nil)
+        // AND: (and) -> t  (and x) -> x  (and x . rest) -> (if x (and . rest) nil)
         Runtime.RegisterMacroFunction(AND, new LispFunction(args => {
             Runtime.CheckArityExact("AND-MACRO-EXPANDER", args, 2);
             var compilerFn = Startup.LookupCompilerMacro(AND);
@@ -2164,18 +2224,18 @@ public static partial class Runtime
             var form = args[0] as Cons;
             if (form == null) return args[0];
             var rest = form.Cdr;
-            if (rest is Nil) return T.Instance; // (and) → t
+            if (rest is Nil) return T.Instance; // (and) -> t
             if (rest is Cons c1)
             {
-                if (c1.Cdr is Nil) return c1.Car; // (and x) → x
-                // (and x . rest) → (if x (and . rest) nil)
+                if (c1.Cdr is Nil) return c1.Car; // (and x) -> x
+                // (and x . rest) -> (if x (and . rest) nil)
                 var andRest = new Cons(AND, c1.Cdr);
                 return new Cons(IF, new Cons(c1.Car, new Cons(andRest, new Cons(Nil.Instance, Nil.Instance))));
             }
             return args[0];
         }, "AND-MACRO-EXPANDER", 2));
 
-        // OR: (or) → nil  (or x) → x  (or x . rest) → (let ((#:g x)) (if #:g #:g (or . rest)))
+        // OR: (or) -> nil  (or x) -> x  (or x . rest) -> (let ((#:g x)) (if #:g #:g (or . rest)))
         Runtime.RegisterMacroFunction(OR, new LispFunction(args => {
             Runtime.CheckArityExact("OR-MACRO-EXPANDER", args, 2);
             var compilerFn = Startup.LookupCompilerMacro(OR);
@@ -2183,10 +2243,10 @@ public static partial class Runtime
             var form = args[0] as Cons;
             if (form == null) return args[0];
             var rest = form.Cdr;
-            if (rest is Nil) return Nil.Instance; // (or) → nil
+            if (rest is Nil) return Nil.Instance; // (or) -> nil
             if (rest is Cons c1)
             {
-                if (c1.Cdr is Nil) return c1.Car; // (or x) → x
+                if (c1.Cdr is Nil) return c1.Car; // (or x) -> x
                 var gSym = (Symbol)Runtime.Gensym(new LispString("OR-VAL"));
                 var orRest = new Cons(OR, c1.Cdr);
                 var binding = new Cons(new Cons(gSym, new Cons(c1.Car, Nil.Instance)), Nil.Instance);
@@ -2196,9 +2256,9 @@ public static partial class Runtime
             return args[0];
         }, "OR-MACRO-EXPANDER", 2));
 
-        // COND: (cond) → nil
-        // (cond (test) . rest) → (let ((#:g test)) (if #:g #:g (cond . rest)))
-        // (cond (test . body) . rest) → (if test (progn . body) (cond . rest))
+        // COND: (cond) -> nil
+        // (cond (test) . rest) -> (let ((#:g test)) (if #:g #:g (cond . rest)))
+        // (cond (test . body) . rest) -> (if test (progn . body) (cond . rest))
         Runtime.RegisterMacroFunction(Startup.Sym("COND"), new LispFunction(args => {
             Runtime.CheckArityExact("COND-MACRO-EXPANDER", args, 2);
             var compilerFn = Startup.LookupCompilerMacro(Startup.Sym("COND"));
@@ -2206,7 +2266,7 @@ public static partial class Runtime
             var form = args[0] as Cons;
             if (form == null) return args[0];
             var clauses = form.Cdr;
-            if (clauses is Nil) return Nil.Instance; // (cond) → nil
+            if (clauses is Nil) return Nil.Instance; // (cond) -> nil
             if (clauses is not Cons c1) return args[0];
             var clause = c1.Car as Cons;
             if (clause == null) return args[0];
@@ -2215,7 +2275,7 @@ public static partial class Runtime
             var restClauses = new Cons(Startup.Sym("COND"), c1.Cdr);
             if (body is Nil)
             {
-                // (cond (test) . rest) → (let ((#:g test)) (if #:g #:g (cond . rest)))
+                // (cond (test) . rest) -> (let ((#:g test)) (if #:g #:g (cond . rest)))
                 var gSym = (Symbol)Runtime.Gensym(new LispString("COND-VAL"));
                 var binding = new Cons(new Cons(gSym, new Cons(test, Nil.Instance)), Nil.Instance);
                 var ifForm = new Cons(IF, new Cons(gSym, new Cons(gSym, new Cons(restClauses, Nil.Instance))));
@@ -2228,9 +2288,9 @@ public static partial class Runtime
         // handler-bind / handler-case / restart-bind / restart-case are implemented as
         // compile-form handlers (the compiler dispatches them directly, before macro
         // expansion), but MACRO-FUNCTION reported them as macros while MACROEXPAND-1
-        // returned them unexpanded — an inconsistency that breaks code walkers.
+        // returned them unexpanded: an inconsistency that breaks code walkers.
         // Register real expanders so MACROEXPAND-1 yields a portable, walkable, eval-able
-        // equivalent (CLHS: macro-function non-nil ⇒ macroexpand-1 expands). The compiler
+        // equivalent (CLHS: macro-function non-nil => macroexpand-1 expands). The compiler
         // is unaffected: compile-form checks its handler table first, and the Lisp
         // find-macro-expander only consults runtime macro-functions for DOTCL-package
         // symbols, so these CL-package entries never divert compilation/analysis.
@@ -2253,7 +2313,7 @@ public static partial class Runtime
         var POP_RB = Startup.Sym("%POP-RESTART-CLUSTER");
 
         // (handler-bind ((type fn)...) . body)
-        //   → (progn (%push-handler-cluster (list (cons 'type fn)...))
+        //   -> (progn (%push-handler-cluster (list (cons 'type fn)...))
         //            (unwind-protect (progn . body) (%pop-handler-cluster)))
         // Body stays INLINE in a progn (not a lambda thunk), so code walkers can walk it
         //. HandlerClusterStack.Signal restores clusters in a finally, so the
@@ -2271,7 +2331,7 @@ public static partial class Runtime
         }, "HANDLER-BIND-MACRO-EXPANDER", 2));
 
         // (restart-bind ((name fn . opts)...) . body)
-        //   → (progn (%push-restart-cluster
+        //   -> (progn (%push-restart-cluster
         //              (list (list 'name fn desc report test interactive)...))
         //            (unwind-protect (progn . body) (%pop-restart-cluster)))
         // Body inline.
@@ -2281,13 +2341,13 @@ public static partial class Runtime
         // expansion is for macroexpand-1 / walkers". That premise is false for the
         // tree-walk interpreter: RESTART-CASE macroexpands into RESTART-BIND, which
         // macroexpands through HERE, so this is the real evaluation path whenever a
-        // restart is established by EVAL — and the only one on emit-free builds.
+        // restart is established by EVAL: and the only one on emit-free builds.
         // Dropping the options meant an interpreted restart could not report itself
         // (printing gave "#<RESTART FOO>") and its :TEST never ran, so FIND-RESTART
         // returned a restart the test excludes (ansi-test RESTART-CASE.19/20/21).
         //
         // Option forms are spliced UNEVALUATED so they are evaluated in the
-        // establishing environment, exactly like the function itself — :report may
+        // establishing environment, exactly like the function itself: :report may
         // be a closure over the surrounding scope. A string :report-function is the
         // description rather than a function (CLHS restart-case :report).
         Runtime.RegisterMacroFunction(Startup.Sym("RESTART-BIND"), new LispFunction(margs => {
@@ -2304,7 +2364,7 @@ public static partial class Runtime
                         var val = ov.Car;
                         // A bare symbol names the FUNCTION, not a variable (CLHS:
                         // the option takes a function designator). Splicing it raw
-                        // made the interpreter read it as a variable — which only
+                        // made the interpreter read it as a variable: which only
                         // appeared to work while FLET bindings shared the variable
                         // alist. compile-restart-case does the same (function x)
                         // wrapping, so both paths agree.
@@ -2328,7 +2388,7 @@ public static partial class Runtime
         }, "RESTART-BIND-MACRO-EXPANDER", 2));
 
         // (handler-case EXPR (type (var) . body)... [(:no-error ll . nbody)])
-        //   → (block #:b (let ((#:c nil)) (tagbody
+        //   -> (block #:b (let ((#:c nil)) (tagbody
         //        (handler-bind ((type (lambda (#:g) (setq #:c #:g) (go #:t)))...)
         //          (return-from #:b EXPR))   ; EXPR wrapped in mv-call of :no-error fn if present
         //        #:t (return-from #:b (let ((var #:c)) . body)) ...)))
@@ -2383,7 +2443,7 @@ public static partial class Runtime
             // protected form, wrapping with :no-error mv-call when present
             // CLHS HANDLER-CASE: the :NO-ERROR clause's body runs only after the
             // handlers are no longer active, so an error it signals must reach the
-            // NEXT outer handler — not this form's own clauses. Wrapping EXPR in
+            // NEXT outer handler: not this form's own clauses. Wrapping EXPR in
             // MULTIPLE-VALUE-CALL of the :no-error function, as this expansion used
             // to, ran that body INSIDE the HANDLER-BIND, so
             //   (handler-case (handler-case (values)
@@ -2394,7 +2454,7 @@ public static partial class Runtime
             // this right, so it showed only under EVAL.
             //
             // Instead stash EXPR's values, leave the HANDLER-BIND by GO, and apply
-            // the :no-error function from a tagbody segment — the same place the
+            // the :no-error function from a tagbody segment: the same place the
             // error clauses run, which is by construction outside the handlers.
             LispObject protectedReturn;
             Symbol? vvar = null;
@@ -2433,14 +2493,14 @@ public static partial class Runtime
         }, "HANDLER-CASE-MACRO-EXPANDER", 2));
 
         // (restart-case EXPR (name (args...) [:report r][:interactive i][:test t] . body)...)
-        //   → (block #:b (let ((#:av nil)) (tagbody
+        //   -> (block #:b (let ((#:av nil)) (tagbody
         //        (return-from #:b
         //          (restart-bind ((name (lambda (&rest #:a) (setq #:av #:a) (go #:tag))
         //                          opts...)...) EXPR))
         //        #:tag (return-from #:b (apply (lambda (args...) . body) #:av)) ...)))
         //
         // When EXPR is a signaling form, it is additionally wrapped so the restarts
-        // this form establishes are associated with the condition it signals — see
+        // this form establishes are associated with the condition it signals; see
         // WrapSignalingRestartCaseBody below.
         Runtime.RegisterMacroFunction(Startup.Sym("RESTART-CASE"), new LispFunction(margs => {
             if (margs[0] is not Cons form || form.Cdr is not Cons rest) return margs[0];
@@ -2492,7 +2552,7 @@ public static partial class Runtime
     }
 
     /// CLHS RESTART-CASE: when the protected form is a call to SIGNAL, ERROR,
-    /// CERROR or WARN — "or a macro form which macroexpands into such a list" —
+    /// CERROR or WARN, "or a macro form which macroexpands into such a list",
     /// WITH-CONDITION-RESTARTS is used implicitly, so the restarts this
     /// RESTART-CASE establishes belong to the condition that form signals and are
     /// invisible to any other condition. compile-restart-case (cil-forms.lisp)
@@ -2561,7 +2621,7 @@ public static partial class Runtime
     ///
     /// An INTERPRETED hook re-enters without this. The tree-walk evaluator
     /// macroexpands the hook's own body on every call, so a hook whose body
-    /// contains any macro — (incf count) is enough — expands it, which calls
+    /// contains any macro, (incf count) is enough, expands it, which calls
     /// MACROEXPAND-1, which calls the hook, forever. The process dies on a .NET
     /// stack overflow, which cannot be caught. A COMPILED hook never showed this:
     /// its body was expanded once at compile time, so nothing expands while it
@@ -2569,13 +2629,13 @@ public static partial class Runtime
     ///
     /// The effect is that a hook does not observe expansions performed by its own
     /// body. That is the only terminating reading for an evaluator that expands at
-    /// eval time, and it leaves what the hook is for — seeing the expansions of
-    /// the code being walked — intact.
+    /// eval time, and it leaves what the hook is for, seeing the expansions of
+    /// the code being walked, intact.
     [ThreadStatic] private static bool _inMacroexpandHook;
 
     /// <summary>
     /// When true, COMPILE-FILE emits a Portable PDB even without the
-    /// DOTCL_EMIT_PDB env var — set by CompileProject on a Debug build so a
+    /// DOTCL_EMIT_PDB env var: set by CompileProject on a Debug build so a
     /// dotcl project is source-debuggable without the caller exporting the var.
     /// </summary>
     [ThreadStatic] internal static bool BuildEmitPdb;
@@ -2613,7 +2673,7 @@ public static partial class Runtime
         LispObject? targetFeaturesArg = null;
         LispObject? moduleNameArg = null;
         LispObject? corlibNameArg = null;
-        bool emitSil = false; // default: PE assembly (.fasl); :sil t → also write text SIL
+        bool emitSil = false; // default: PE assembly (.fasl); :sil t -> also write text SIL
         bool allowOtherKeys = false;
 
         // Check for odd number of keyword arguments
@@ -2647,13 +2707,13 @@ public static partial class Runtime
                     emitSil = args[i + 1] is not Nil;
                     break;
                 case "TARGET-FEATURES": targetFeaturesArg ??= args[i + 1]; break;
-                // :module-name — pin the FASL's .NET assembly/module name to a
+                // :module-name: pin the FASL's .NET assembly/module name to a
                 // stable string instead of the default basename_<guid8>. Required
                 // for build-time-linked (NativeAOT/IL2CPP) deployment, where the
                 // assembly is referenced by a fixed name and the file name must
                 // match it. The caller owns uniqueness across co-loaded modules.
                 case "MODULE-NAME": moduleNameArg ??= args[i + 1]; break;
-                // :corlib-name — rewrite the emitted fasl's corlib reference to a
+                // :corlib-name: rewrite the emitted fasl's corlib reference to a
                 // portable facade (only "netstandard"). For build-time-linked
                 // deployment on BCLs without System.Private.CoreLib (Unity IL2CPP/
                 // WebGL). Default (null) keeps System.Private.CoreLib (CoreCLR/AOT).
@@ -2755,7 +2815,7 @@ public static partial class Runtime
 
         // Snapshot *modules*. A compile-time (require "x") (e.g. eval-when
         // :compile-toplevel) loads a contrib whose defuns are reverted by the
-        // Function/SetfFunction strip in `finally` below — but the *modules*
+        // Function/SetfFunction strip in `finally` below: but the *modules*
         // push is a dynamic-var mutation not covered by that strip, so without
         // this it would persist, leaving the module marked-loaded yet undefined.
         // A later load-time (require "x") would then see it in *modules* and
@@ -2765,7 +2825,7 @@ public static partial class Runtime
         var modulesSym2 = Startup.Sym("*MODULES*");
         var oldModules = DynamicBindings.Get(modulesSym2);
 
-        // :target-features — rebind *features* so reader conditionals (#+/#-) and
+        // :target-features: rebind *features* so reader conditionals (#+/#-) and
         // os-cond macro expansions see the target platform, not the host.
         // Used for cross-compiling asdf.fasl for Linux/Win/macOS from any host.
         var featuresSym = Startup.Sym("*FEATURES*");
@@ -2779,14 +2839,14 @@ public static partial class Runtime
         // (try-eval), but per ANSI 3.2.3.1 those definitions must NOT
         // leak into the global environment after compile-file returns
         // (otherwise (compile-file foo.lisp) would side-effect (fboundp 'bar)
-        // for any defun in foo.lisp — failing pfdietz COMPILE-FILE.* tests).
+        // for any defun in foo.lisp: failing pfdietz COMPILE-FILE.* tests).
         var preFn = new System.Collections.Generic.HashSet<Symbol>();
         var preSetf = new System.Collections.Generic.HashSet<Symbol>();
         SnapshotFboundSymbols(preFn, preSetf);
         // Definitions brought in by a nested LOAD (e.g. a compile-time
         // (require "module") that ASDF resolves and loads) are real global
-        // side effects of loading OTHER files — not compile-time defuns of
-        // THIS file — and must survive the post-compile strip. Runtime.Load
+        // side effects of loading OTHER files, not compile-time defuns of
+        // THIS file, and must survive the post-compile strip. Runtime.Load
         // re-snapshots into these same sets after each load while the pair is
         // on this stack, which whitelists everything the load defined.
         // (Restoring *modules* alone is not enough: ASDF tracks completed
@@ -2807,7 +2867,7 @@ public static partial class Runtime
         // The load-time-value compiler handler uses this to namespace LTV slot IDs per module,
         // preventing cross-run collisions when FASLs compiled in different sessions share IDs.
         // Use Startup.Sym (not SymInPkg) so we get the same symbol object that cil-out.sil's
-        // (:LOAD-SYM "*CURRENT-MODULE-ID*") resolves to — cross-compiled code uses bare LOAD-SYM
+        // (:LOAD-SYM "*CURRENT-MODULE-ID*") resolves to: cross-compiled code uses bare LOAD-SYM
         // (because *cross-compiling* suppresses LOAD-SYM-PKG emission), so the symbol lives in
         // DOTCL-INTERNAL, not DOTCL.CIL-COMPILER.
         Symbol? moduleIdSym = null;
@@ -2829,7 +2889,7 @@ public static partial class Runtime
             // read-list on "(") reads elements via (read stream); without this link
             // ReadFromStream spins up a second Reader whose per-form table clearing
             // runs once per ELEMENT, so a #n= registered in one element is gone by
-            // the time the sibling #n# is read — the placeholder then leaks into
+            // the time the sibling #n# is read: the placeholder then leaks into
             // the compiled fasl as an unresolved constant.
             compileStream.CachedReader = reader;
             reader.AdoptStreamShareTables(compileStream);
@@ -2856,7 +2916,7 @@ public static partial class Runtime
             };
             HandlerClusterStack.PushCluster(handlerCluster);
 
-            // FASL assembler (always — .fasl is the default output)
+            // FASL assembler (always: .fasl is the default output)
             var faslAsm = new DotCL.Emitter.FaslAssembler(faslModuleName);
             // Opt-in Portable PDB emission: DOTCL_EMIT_PDB writes a sidecar
             // .pdb mapping compiled forms to their source lines, so a debugger can
@@ -2876,7 +2936,7 @@ public static partial class Runtime
                     faslAsm.EnableDebugInfo(BuildDebugSourceOverride ?? Path.GetFullPath(inputPath));
                 SourceLineTable = new Dictionary<object, (int, int, int, int)>(ReferenceEqualityComparer.Instance);
                 // The compiled compiler reads *EMIT-SOURCE-LINES* via a bare-name
-                // (:LOAD-SYM ...) = Startup.Sym, so set the SAME symbol instance —
+                // (:LOAD-SYM ...) = Startup.Sym, so set the SAME symbol instance;
                 // SymInPkg("...","DOTCL.CIL-COMPILER") would be a different symbol
                 // (symbol-identity gotcha) and the compiler would never see it.
                 emitLinesSym = Startup.Sym("*EMIT-SOURCE-LINES*");
@@ -2903,7 +2963,7 @@ public static partial class Runtime
                 writer?.WriteLine(";; -*- dotcl-compiled -*-");
                 while (DotCL.Diagnostics.PhaseTimer.Time("read", () => reader.TryRead(out var f) ? f : null) is { } form)
                 {
-                    // Line where this top-level form began — used to attribute a
+                    // Line where this top-level form began: used to attribute a
                     // compile error to the source location under a project build,
                     // and to record definition locations for frame-source-location.
                     int formLine = reader.LastFormLine;
@@ -2996,7 +3056,7 @@ public static partial class Runtime
             s_compileFilePreSets.Pop();
             // Strip newly-defined Function / SetfFunction values that escaped
             // from compile-time defun/defmethod try-eval. Anything that was already
-            // fbound before compile-file is left untouched — only WE clean up
+            // fbound before compile-file is left untouched: only WE clean up
             // the side-effects WE introduced.
             // Also clear the GF registry for stripped symbols so that when the
             // compiled fasl is later loaded, %find-gf returns NIL and the GF is
@@ -3025,8 +3085,8 @@ public static partial class Runtime
             // require that went through asdf:module-provide-asdf), clear the ASDF
             // registry entry so a load-time re-require actually re-loads. module-provide-asdf
             // registers the system in *registered-systems* and sets the load-op stamp
-            // (component-loaded-p → T); without clear-system, the load-time require's
-            // module-provide-asdf → find-system returns the stale registered system,
+            // (component-loaded-p -> T); without clear-system, the load-time require's
+            // module-provide-asdf -> find-system returns the stale registered system,
             // component-loaded-p is T, load-system no-ops, and the fasl is never loaded.
             // clear-system does (remhash name *registered-systems*) +
             // (unset-asdf-cache-entry '(find-system name)), making the old stamped system
@@ -3044,7 +3104,7 @@ public static partial class Runtime
                     if (cc.Car is LispString s && !beforeSet.Contains(s.Value))
                     {
                         try { clearSystem.Invoke(new LispObject[] { new LispString(s.Value.ToLowerInvariant()) }); }
-                        catch { /* a module asdf does not own (plain provide/require) — nothing to clear */ }
+                        catch { /* a module asdf does not own (plain provide/require); nothing to clear */ }
                     }
             }
 
@@ -3084,7 +3144,7 @@ public static partial class Runtime
     /// </description></item>
     /// <item><term>:prelude</term><description>
     ///   Pathname or list of pathnames, compiled <em>before</em> the :system closure.
-    ///   For what a bundled library needs to find already in place while it loads —
+    ///   For what a bundled library needs to find already in place while it loads;
     ///   typically ASDF answers about itself, which a bundle has no .asd files to give.
     ///   Its contents are the caller's to write: standing in for a system that is not
     ///   there is only safe where nothing will act on the answer.
@@ -3183,9 +3243,9 @@ public static partial class Runtime
         //
         // The slot before the closure exists because a deployed image is not the
         // image the sources were written for. Libraries reasonably ask ASDF about
-        // themselves while loading — cl-str binds its +version+ from
+        // themselves while loading: cl-str binds its +version+ from
         // (asdf:component-version (asdf:find-system "str")), Lem does the same for
-        // its own version and git revision — and in a bundle there are no .asd
+        // its own version and git revision: and in a bundle there are no .asd
         // files for ASDF to find, so those forms signal and the load stops.
         //
         // Whatever answers them has to be in place before their own file runs, and
@@ -3194,7 +3254,7 @@ public static partial class Runtime
         // different thing from this function inventing system definitions on its
         // own. Registering a system that does not exist is a lie ASDF will repeat
         // to anything that asks it later, which is tolerable only where nothing
-        // asks — a browser page that never loads another system — and that is a
+        // asks, a browser page that never loads another system, and that is a
         // judgement about the target, which only the caller can make.
         var sources = new List<string>(
             preludeSources.Count + asdfsources.Count + userSources.Count);
@@ -3273,8 +3333,8 @@ public static partial class Runtime
 
             // Tell ASDF which systems this image already contains, before any of
             // their own files run. Libraries routinely bind their version from
-            // (asdf:component-version (asdf:find-system :self)) at load time —
-            // dexador and cl-str both do — and a bundle has no .asd files, so
+            // (asdf:component-version (asdf:find-system :self)) at load time,
+            // dexador and cl-str both do, and a bundle has no .asd files, so
             // those forms would signal and stop the load.
             //
             // register-preloaded-system is ASDF's own answer for "in the image,
@@ -3341,7 +3401,7 @@ public static partial class Runtime
                         faslAsm.AddTopLevelForm(CompileTopLevel(patchForm));
                 }
 
-                // Append `(funcall (symbol-function 'TOPLEVEL))` — late-bound
+                // Append `(funcall (symbol-function 'TOPLEVEL))`: late-bound
                 // so redefinitions (e.g. by asdf) resolve to the current definition
                 // at runtime.
                 var quoteSym = Startup.Sym("QUOTE");
@@ -3441,7 +3501,7 @@ public static partial class Runtime
                     $"SAVE-APPLICATION: dotnet publish failed (exit {proc.ExitCode})."
                     + $" stderr: {stderr.TrimEnd()} stdout tail: {TailLines(stdout, 10)}"));
 
-            // Default AssemblyName for runtime.csproj is "runtime" — find it and
+            // Default AssemblyName for runtime.csproj is "runtime": find it and
             // copy to the user's target path.
             var exeName = Compat.IsWindows() ? "runtime.exe" : "runtime";
             var producedExe = Path.Combine(publishOut, exeName);
@@ -3499,7 +3559,7 @@ public static partial class Runtime
         var baseDir = AppContext.BaseDirectory;
         var candidates = new[]
         {
-            // dev tree: runtime/bin/{Debug,Release}/netXX → 4 levels up to repo root
+            // dev tree: runtime/bin/{Debug,Release}/netXX -> 4 levels up to repo root
             Path.Combine(baseDir, "..", "..", "..", "..", "runtime", "runtime.csproj"),
             // less common: exe living next to the csproj
             Path.Combine(baseDir, "runtime.csproj"),
@@ -3559,7 +3619,7 @@ public static partial class Runtime
     /// own files at a time; see the comment on the query for why.
     /// </summary>
     /// <summary>Source files of a system's transitive closure, dependencies first.
-    /// SYSTEMS receives the (name, version) of every system walked — read here while
+    /// SYSTEMS receives the (name, version) of every system walked: read here while
     /// the building image still has a real ASDF registry, so the deployed image can
     /// answer for itself. See the register-preloaded-system emission in
     /// BuildFaslFromSources.</summary>
@@ -3577,8 +3637,8 @@ public static partial class Runtime
         // Walk the system graph here rather than asking asdf for the whole
         // closure at once. required-components with :other-systems t is not
         // transitively closed: asked for lem-server-min it returns 492 files
-        // including dexador's, while asked for dexador alone — same image, same
-        // run — it returns 212 that include all of alexandria, which the larger
+        // including dexador's, while asked for dexador alone, same image, same
+        // run, it returns 212 that include all of alexandria, which the larger
         // answer omits entirely. A core built from the larger answer compiles and
         // then refuses to load with "No package named ALEXANDRIA".
         //
@@ -3586,7 +3646,7 @@ public static partial class Runtime
         // close over system-depends-on to get the systems, order them
         // dependencies-first, and take each system's own files from asdf.
         //
-        // Dependency designators are not all plain names — dexador declares
+        // Dependency designators are not all plain names: dexador declares
         // (FEATURE WINDOWS winhttp) and (VERSION uiop "3.1.1") among others. A
         // :feature clause whose expression is false is not a dependency at all,
         // and :require names a module rather than a system.
@@ -3737,11 +3797,11 @@ public static partial class Runtime
     /// (MVP scope). Respects eval-when per CLHS 3.2.3.1.
     /// </summary>
     // Deliberately NOT the compile-file rule above, which runs only the forms
-    // CLHS gives compile-time semantics (defmacro, defpackage, defclass, …) and
+    // CLHS gives compile-time semantics (defmacro, defpackage, defclass, ...) and
     // merely emits the rest. That rule is right for one file compiled against an
     // image that already holds its dependencies. Here a whole dependency closure
     // is compiled in order, and a macro in a later file routinely expands by
-    // calling a function an earlier file defined — emit-without-running leaves
+    // calling a function an earlier file defined: emit-without-running leaves
     // that function absent for the remainder of the build. So every top-level
     // form is run exactly once as it is emitted: the load-as-you-go that ASDF's
     // bundle operations perform, and that the intended clean-image build needs
@@ -3749,7 +3809,7 @@ public static partial class Runtime
     //
     // log4cl is where this stops being theoretical. Its defs.lisp
     // fmakunbounds a list of names under (eval-when (:compile-toplevel :execute)
-    // ...) — :load-toplevel deliberately absent — so that it survives being
+    // ...), :load-toplevel deliberately absent, so that it survives being
     // loaded over an older version. Compiling it therefore deletes those
     // definitions from the building image, while the defgeneric in naming.lisp
     // that would restore them is emitted rather than run. Every later
@@ -3770,7 +3830,7 @@ public static partial class Runtime
         var full = Path.GetFullPath(inputPath);
 
         // A source file that finds a data file beside itself is an ordinary
-        // pattern — cl-mustache reads its version.lisp-expr through
+        // pattern: cl-mustache reads its version.lisp-expr through
         // (merge-pathnames "version.lisp-expr"
         //                  (or *compile-file-pathname* *load-truename*))
         // in a #. at read time. Leaving these unbound makes merge-pathnames fall
@@ -3850,7 +3910,7 @@ public static partial class Runtime
     /// race-free, so we make Eval implicitly single-threaded at the
     /// runtime level. Hosts (DotclHost callers, McpServer, ASP.NET
     /// controllers) do not need to add their own _evalLock.
-    /// `lock` is reentrant on the same thread, so Lisp → C# → Lisp
+    /// `lock` is reentrant on the same thread, so Lisp -> C# -> Lisp
     /// callbacks (e.g. dotnet:funcall, condition handlers) work fine.
     /// Removing this serialization is future work; the preparation to make
     /// individual operations race-free is already in place.
@@ -3865,7 +3925,7 @@ public static partial class Runtime
     /// concurrent-safe; CLOS method lists copy-on-write; constant pool + function
     /// registry locked; *macros* a synchronized table), so many threads can
     /// compile/call without the global lock. Proving full race-freedom is a
-    /// non-goal — user-level cons/array mutation stays the caller's responsibility,
+    /// non-goal: user-level cons/array mutation stays the caller's responsibility,
     /// as in any CL. Intended for hosts that call compiled functions from many
     /// threads (e.g. a probe/REPL attached to a multi-threaded .NET service).
     /// </summary>
@@ -3906,7 +3966,7 @@ public static partial class Runtime
         // that conversion has to happen on BOTH evaluator paths. It used to wrap
         // the compiled branch only, so under the interpreter the raw .NET
         // CatchThrowException escaped all the way to Program.Main and killed the
-        // process — the ansi-test run died there rather than reporting a failure.
+        // process: the ansi-test run died there rather than reporting a failure.
         try
         {
 #if DOTCL_EMIT
@@ -3916,14 +3976,14 @@ public static partial class Runtime
                 return MiniEval(form);
             // (progn a b) evaluates a and THEN b. Handing the whole progn to the
             // compiler compiles b before a has run, so anything a installs at run
-            // time that b's compilation needs — a setf expander from DEFSETF, a
-            // symbol macro from DEFINE-SYMBOL-MACRO — is not there yet, and b
+            // time that b's compilation needs, a setf expander from DEFSETF, a
+            // symbol macro from DEFINE-SYMBOL-MACRO, is not there yet, and b
             // compiles against the wrong (or no) definition. Evaluating the
             // subforms one at a time is what the tree-walk interpreter already
             // does, and what the same expression does when it comes from a file
             // (COMPILE-FILE splits a top level PROGN per CLHS 3.2.3.1).
             // Matched by name, like every other special-operator check in this
-            // file and in the compiler's dispatcher — dotcl resolves operators by
+            // file and in the compiler's dispatcher: dotcl resolves operators by
             // name throughout, so a stricter test here would make EVAL disagree
             // with what compiling the same form does.
             if (form is Cons pc && pc.Car is Symbol ps && ps.Name == "PROGN")
@@ -3958,13 +4018,13 @@ public static partial class Runtime
         }
         catch (CatchThrowException cte)
         {
-            // If a matching (catch tag ...) exists outside this eval, let the exception
-            // propagate so the outer catch can handle it.
-            if (CatchTagStack.HasMatchingCatch(cte.Tag))
-                throw;
-            // Unmatched THROW at eval boundary: signal control-error per CL spec
-            throw new LispErrorException(new LispControlError(
-                $"Attempt to THROW to tag {cte.Tag} but no catching CATCH form was found"));
+            // If a matching (catch tag ...) exists outside this eval, let the
+            // exception propagate so the outer catch can handle it; otherwise it is
+            // the CLHS 5.2 control-error. Shared with LOAD's boundary so the two
+            // cannot answer differently (UnmatchedThrowError).
+            var unmatched = Runtime.UnmatchedThrowError(cte);
+            if (unmatched == null) throw;
+            throw unmatched;
         }
     }
 
@@ -3988,7 +4048,7 @@ public static partial class Runtime
         // _evalLock serializes COMPILATION, and must not be held while a form
         // RUNS: a form that blocks waiting on other threads which themselves need
         // to compile deadlocks. The compiled path releases it around the
-        // run inside AssembleAndRunSingle — but the interpreter never goes there,
+        // run inside AssembleAndRunSingle: but the interpreter never goes there,
         // so on this path the lock stayed held for the whole evaluation and that
         // same deadlock came back whenever eval interprets. Interpreting IS
         // running (no compiler or assembler is involved), so release for the whole
@@ -4007,7 +4067,7 @@ public static partial class Runtime
     /// without crashing if init-forms reference not-yet-defined functions.
     /// Bind *compile-file-mode* to NIL during the inner eval so that the
     /// recursive compile-form for FORM does not retrigger the defun
-    /// handler's compile-time eval branch — that would recurse on the
+    /// handler's compile-time eval branch: that would recurse on the
     /// same defun until the depth guard fires.
     /// </summary>
     public static LispObject TryEval(LispObject form)
@@ -4058,7 +4118,7 @@ public static partial class Runtime
     {
         // prefix must be a string or non-negative integer (unsigned-byte).
         // CL strings include simple-strings AND character vectors of any element-type
-        // CHARACTER/BASE-CHAR/STANDARD-CHAR — accept both LispString and IsCharVector.
+        // CHARACTER/BASE-CHAR/STANDARD-CHAR: accept both LispString and IsCharVector.
         if (prefix is Fixnum fi && fi.Value >= 0)
             return new Symbol($"G{fi.Value}");
         if (prefix is Bignum bi && bi.Value >= 0)
@@ -4178,7 +4238,7 @@ public static partial class Runtime
         ("Can", '\x18'), ("Em",  '\x19'), ("Sub", '\x1a'), ("Esc", '\x1b'),
         ("Fs",  '\x1c'), ("Gs",  '\x1d'), ("Rs",  '\x1e'), ("Us",  '\x1f'),
         // Unicode names that appear in real Lisp libraries
-        ("No-break_space", ' '),
+        ("No-break_space", (char)0x00A0),
         ("Ideographic_space", (char)0x3000),        // U+3000 CJK IDEOGRAPHIC SPACE (cl-str)
         ("Zero_width_no-break_space", (char)0xfeff), // U+FEFF BOM/ZWNBSP (id3v2)
         ("Greek_small_letter_lamda", (char)0x03bb),  // U+03BB GREEK SMALL LETTER LAMDA (fn)
@@ -4222,7 +4282,7 @@ public static partial class Runtime
         var upper = s.ToUpper();
         foreach (var (name, ch) in _charNames)
             if (name.ToUpper() == upper) return ch;
-        // UCD lookup: normalize underscores to spaces (e.g. "LATIN_SMALL_LETTER_A" → "LATIN SMALL LETTER A")
+        // UCD lookup: normalize underscores to spaces (e.g. "LATIN_SMALL_LETTER_A" -> "LATIN SMALL LETTER A")
         if (Ucd.NameToChar.TryGetValue(upper.Replace('_', ' '), out char ucdCh))
             return ucdCh;
         // Handle U+XXXX format names
@@ -4244,7 +4304,7 @@ public static partial class Runtime
                 // Non-BMP: dotcl's char type is 16-bit; substitute U+FFFD (replacement char).
                 // cl-html5-parser uses these as noncharacter sentinels; U+FFFD is an acceptable
                 // proxy since it never appears as valid parsed content either.
-                return '�';
+                return (char)0xFFFD;
             }
         }
         return null;
@@ -4538,7 +4598,7 @@ public static partial class Runtime
         return Nil.Instance;
     }
 
-    // dotcl:emit-pool-stats — (total-entries dynamic-methods data-literals committed-bytes)
+    // dotcl:emit-pool-stats: (total-entries dynamic-methods data-literals committed-bytes)
     // Diagnostic for the CilAssembler constant-pool retention leak: the
     // global pool roots every compiled DynamicMethod forever, so DYNAMIC-METHODS
     // tracks the JIT-backed code that never frees. COMMITTED-BYTES is the GC's
@@ -4660,7 +4720,7 @@ public static partial class Runtime
     }
 
     /// <summary>
-    /// DOTCL:BACKTRACE — return the current Lisp call stack as a list of
+    /// DOTCL:BACKTRACE: return the current Lisp call stack as a list of
     /// function-name strings, innermost (most recent) frame first. Only named
     /// functions are tracked (see LispFunction call-stack push/pop); anonymous
     /// lambdas and native-fixnum self-calls do not appear. This function itself
@@ -4676,7 +4736,7 @@ public static partial class Runtime
     }
 
     /// <summary>
-    /// DOTCL:BACKTRACE-WITH-ARGS — like DOTCL:BACKTRACE, but each frame is a list
+    /// DOTCL:BACKTRACE-WITH-ARGS: like DOTCL:BACKTRACE, but each frame is a list
     /// (NAME arg0 arg1 ...) whose args are the actual captured argument objects,
     /// innermost (most recent) frame first. Lets a debugger / error handler inspect
     /// the arguments a frame was called with, not just function names (cf.
@@ -4693,7 +4753,7 @@ public static partial class Runtime
     }
 
     /// <summary>
-    /// DOTCL:FRAME-LOCALS (&amp;optional (n 0)) — the lexical variables of backtrace
+    /// DOTCL:FRAME-LOCALS (&amp;optional (n 0)): the lexical variables of backtrace
     /// frame N (0 = innermost, same numbering as DOTCL:BACKTRACE) as an alist
     /// (("NAME" . value) ...) in binding order. NIL when the frame recorded none:
     /// its function was compiled with frame-locals mode off (the default), is
@@ -4715,12 +4775,12 @@ public static partial class Runtime
     }
 
     /// <summary>
-    /// DOTCL:FRAME-SPECIALS (&amp;optional (n 0)) — the dynamic (special-variable)
+    /// DOTCL:FRAME-SPECIALS (&amp;optional (n 0)): the dynamic (special-variable)
     /// bindings in effect, innermost first, as ((SYMBOL value . own-p) ...).
     /// OWN-P is true for the ones backtrace frame N or its callees established.
     ///
     /// Every binding is listed, including ones shadowed by an inner rebinding of
-    /// the same symbol — that is what a reader of nested LETs wants to see.
+    /// the same symbol: that is what a reader of nested LETs wants to see.
     /// Unlike FRAME-LOCALS this needs no frame-locals mode: the binding stack is
     /// always there, and N only decides where the OWN-P line falls.
     /// </summary>
@@ -4739,7 +4799,7 @@ public static partial class Runtime
     }
 
     /// <summary>
-    /// DOTCL:PRINT-FRAME-LOCALS (&amp;optional (n 0) stream) — print backtrace frame
+    /// DOTCL:PRINT-FRAME-LOCALS (&amp;optional (n 0) stream): print backtrace frame
     /// N's lexical variables, one "NAME = value" line each, indented. Defaults to
     /// *ERROR-OUTPUT*. Same rendering the debugger's :locals command uses.
     /// </summary>
@@ -4769,7 +4829,7 @@ public static partial class Runtime
     }
 
     /// <summary>
-    /// DOTCL:PRINT-BACKTRACE (&amp;optional stream) — print the current call stack
+    /// DOTCL:PRINT-BACKTRACE (&amp;optional stream): print the current call stack
     /// as numbered frames. Defaults to *ERROR-OUTPUT* (cf. sb-debug:print-backtrace).
     /// </summary>
     public static LispObject PrintBacktrace(LispObject[] args)
@@ -4860,7 +4920,7 @@ public static partial class Runtime
         return arg?.ToString() ?? "NIL";
     }
 
-    // Trace infrastructure: maps function name key → original (unwrapped) function
+    // Trace infrastructure: maps function name key -> original (unwrapped) function
     private static readonly ConcurrentDictionary<string, LispFunction> _tracedOriginals = new();
     private static readonly ConcurrentDictionary<string, LispObject> _tracedNames = new();
 
@@ -5115,7 +5175,7 @@ public static partial class Runtime
     private static readonly System.Collections.Concurrent.ConcurrentQueue<LispObject>
         _finalizerQueue = new();
 
-    /// <summary>(finalize object function) — run FUNCTION (a thunk) some time
+    /// <summary>(finalize object function): run FUNCTION (a thunk) some time
     /// after OBJECT is garbage-collected. Returns OBJECT.</summary>
     public static LispObject Finalize(LispObject obj, LispObject function)
     {
@@ -5124,7 +5184,7 @@ public static partial class Runtime
         return obj;
     }
 
-    /// <summary>(cancel-finalization object) — remove OBJECT's finalizers.
+    /// <summary>(cancel-finalization object): remove OBJECT's finalizers.
     /// Returns T if any were registered.</summary>
     public static LispObject CancelFinalization(LispObject obj)
     {
@@ -5216,7 +5276,7 @@ public static partial class Runtime
             new LispFunction(args => {
                 Runtime.CheckArityMin("FUNCALL", args, 1);
                 if (args[0] is LispFunction f) return f.Invoke(args.SubArray(1));
-                // A symbol designator is resolved by CoerceToFunction — the same
+                // A symbol designator is resolved by CoerceToFunction: the same
                 // coercion the compiled general FUNCALL path emits. It used to go
                 // through Fdefinition, which is deliberately more permissive: it
                 // answers for macros and hands back a stub for special operators,
@@ -5232,7 +5292,7 @@ public static partial class Runtime
 
         // The same coercion, callable from Lisp: %MINI-EVAL uses it to resolve a
         // symbol in OPERATOR position. It used to call SYMBOL-FUNCTION directly,
-        // which has no cross-package bare-name bridge — so a function registered
+        // which has no cross-package bare-name bridge: so a function registered
         // on a DOTCL-MOP / DOTCL-INTERNAL symbol was callable from compiled code
         // (CilAssembler.GetFunctionBySymbol bridges) and through FUNCALL, but not
         // as a plain (name args...) form under the interpreter:
@@ -5251,7 +5311,7 @@ public static partial class Runtime
         // Names a function after the fact. The tree-walk evaluator needs it: a
         // compiled DEFUN gets its name at emit time, but the interpreter builds
         // an ordinary anonymous closure, and an anonymous callee pushes no
-        // debugger frame — so BACKTRACE saw nothing of the user's own calls on
+        // debugger frame: so BACKTRACE saw nothing of the user's own calls on
         // an emit-free build. Naming the closure makes the two evaluators agree.
         Emitter.CilAssembler.RegisterFunction("%SET-FUNCTION-NAME",
             new LispFunction(args => {
@@ -5314,7 +5374,7 @@ public static partial class Runtime
                 {
                     // For (setf foo) style names: nameSym.SetfFunction is the authoritative
                     // storage. Do NOT call CilAssembler.RegisterFunction with the bare
-                    // "(SETF FOO)" key — that would set Startup.Sym("FOO").SetfFunction
+                    // "(SETF FOO)" key: that would set Startup.Sym("FOO").SetfFunction
                     // (i.e., cl:documentation) instead of the actual nameSym's SetfFunction,
                     // causing package-crossing corruption (e.g. acclimation:documentation's
                     // 4-arg setf GF overwriting cl:documentation.SetfFunction).
@@ -5326,7 +5386,7 @@ public static partial class Runtime
                         // CL-package canonical symbol so string-based GetFunction("(SETF name)")
                         // can find it (FDEFINITION.5). For interned symbols in other
                         // packages (e.g. acclimation:documentation), DO NOT pollute the CL
-                        // canonical symbol — that would overwrite cl:documentation.SetfFunction
+                        // canonical symbol: that would overwrite cl:documentation.SetfFunction
                         // and break unrelated callers (cross-package pollution regression).
                         if (nameSym.HomePackage == null)
                         {
@@ -5402,7 +5462,7 @@ public static partial class Runtime
                 else if (declKind.Name == "DECLARATION")
                 {
                     // CLHS TYPE: a symbol cannot name both a type and a
-                    // declaration. This is the "or vice versa" direction — the
+                    // declaration. This is the "or vice versa" direction: the
                     // type definers check the flag set here.
                     var rest = declCons.Cdr;
                     while (rest is Cons c)
@@ -5487,7 +5547,7 @@ public static partial class Runtime
         // CLHS: MACROEXPAND-1 invokes the expansion function through
         // *MACROEXPAND-HOOK*. The default hook FUNCALL is the fast path (call the
         // expander directly, no symbol-value read cost beyond the null check); a
-        // rebound hook — walker guards, tracing, memoizing expanders — gets
+        // rebound hook, walker guards, tracing, memoizing expanders, gets
         // (funcall hook expander form env). One-argument expanders (local
         // macrolet tables, compiler macros) are wrapped so the hook always sees
         // the standard two-argument calling convention.
@@ -5611,7 +5671,7 @@ public static partial class Runtime
                 return form;
         }
 
-        // %CALL-WITH-HANDLER-CLUSTER — handler-bind primitive for the emit-free
+        // %CALL-WITH-HANDLER-CLUSTER: handler-bind primitive for the emit-free
         // tree-walk interpreter (%mini-eval). (alist thunk) -> establishes the
         // cluster, runs thunk under it. Mirrors compile-handler-bind.
         Emitter.CilAssembler.RegisterFunction("%CALL-WITH-HANDLER-CLUSTER",
@@ -5721,8 +5781,8 @@ public static partial class Runtime
                 if (args.Length < 1 || args.Length > 2)
                     throw new LispErrorException(new LispProgramError($"COMPILE: wrong number of arguments: {args.Length} (expected 1-2)"));
                 // (compile name lambda-expression): compile the lambda, and when NAME is
-                // non-nil install the result as NAME's definition, returning NAME (CLHS
-                // — "compile replaces the function definition of name"). fiveam's run-time
+                // non-nil install the result as NAME's definition, returning NAME (CLHS;
+                // "compile replaces the function definition of name"). fiveam's run-time
                 // test compilation relies on this side effect.
                 if (args.Length > 1 && args[1] is not Nil)
                 {
@@ -5862,12 +5922,12 @@ public static partial class Runtime
                 {
                     if (cls != null && cls.StructSlotNames != null)
                     {
-                        for (int i = 0; i < cls.StructSlotNames.Length && i < structObj.Slots.Length; i++)
+                        for (int i = 0; i < cls.StructSlotNames.Length && i < structObj.SlotCount; i++)
                         {
                             var slotSym = cls.StructSlotNames[i];
                             if (slotNamesSupplied && !MlfsListContainsSymbol(slotNamesList, slotSym))
                                 continue;
-                            var slotVal = structObj.Slots[i];
+                            var slotVal = structObj.GetSlot(i);
                             var svForm = new Cons(slotValueSym, new Cons(obj, new Cons(new Cons(quoteSym, new Cons(slotSym, Nil.Instance)), Nil.Instance)));
                             var setfForm = new Cons(setfSym, new Cons(svForm, new Cons(new Cons(quoteSym, new Cons(slotVal, Nil.Instance)), Nil.Instance)));
                             setfForms.Add(setfForm);
@@ -5908,7 +5968,7 @@ public static partial class Runtime
                 return MultipleValues.Values2(creationForm, initForm);
             }, "MAKE-LOAD-FORM-SAVING-SLOTS", -1));
 
-        // COMPILER-MACRO-FUNCTION — look up runtime-registered compiler macros.
+        // COMPILER-MACRO-FUNCTION: look up runtime-registered compiler macros.
         // Body extracted to CompilerMacroFunctionImpl so the 1-arg direct delegate
         // and the args-array wrapper share the same code path (the optional env
         // argument was already ignored by the wrapper).
@@ -5919,7 +5979,7 @@ public static partial class Runtime
         cmfFn.SetDirectDelegate((Func<LispObject, LispObject>)CompilerMacroFunctionImpl);
         Emitter.CilAssembler.RegisterFunction("COMPILER-MACRO-FUNCTION", cmfFn);
 
-        // %REGISTER-COMPILER-MACRO-RT — store a compiler macro function at runtime.
+        // %REGISTER-COMPILER-MACRO-RT: store a compiler macro function at runtime.
         Startup.RegisterBinary("%REGISTER-COMPILER-MACRO-RT", (nameObj, fn) => {
             // (setf foo) form: a cons (setf . (foo . nil))
             if (nameObj is Cons setfCons && setfCons.Car is Symbol setfSym && setfSym.Name == "SETF") {
@@ -5938,7 +5998,7 @@ public static partial class Runtime
             return fn;
         });
 
-        // %DOTNET-METHOD-RETURN-TYPE — compile-time return-type resolution for the
+        // %DOTNET-METHOD-RETURN-TYPE: compile-time return-type resolution for the
         // typed-return inference of the DOTNET:INVOKE compiler macro.
         Emitter.CilAssembler.RegisterFunction("%DOTNET-METHOD-RETURN-TYPE",
             new LispFunction(Runtime.DotNetMethodReturnType, "%DOTNET-METHOD-RETURN-TYPE", -1));
@@ -5969,7 +6029,7 @@ public static partial class Runtime
                             && macrosSym.Value is LispHashTable macrosTable)
                         {
                             if (macrosTable.Get(sym, Nil.Instance) is not Nil)
-                                return fn;  // CL macro already registered — don't overwrite
+                                return fn;  // CL macro already registered; don't overwrite
                             break;
                         }
                     }
@@ -6060,7 +6120,7 @@ public static partial class Runtime
             return value;
         });
 
-        // Load-time-value slot access (per-module namespaced — prevents cross-run collisions)
+        // Load-time-value slot access (per-module namespaced: prevents cross-run collisions)
         Emitter.CilAssembler.RegisterFunction("%HAS-LTV-SLOT-IN", new LispFunction(args => {
             var moduleId = ((LispString)args[0]).Value;
             var slotId = (int)((Fixnum)args[1]).Value;
@@ -6248,7 +6308,7 @@ public static partial class Runtime
                 {
                     Runtime.CheckTypeNameAvailable(s, "DEFTYPE");
                     Runtime.TypeExpanders[Runtime.TypeExpanderKey(s)] = args[1];
-                    // Plain-name alias for cross-package references — but never
+                    // Plain-name alias for cross-package references: but never
                     // for a built-in type name (that would hijack e.g. CL:COMPLEX
                     // for every package; such deftypes work via their own symbol).
                     if (!Runtime.IsBuiltinTypeName(s.Name))
@@ -6264,7 +6324,7 @@ public static partial class Runtime
         // Used by find-free-vars-expr to bail out before .NET StackOverflowException.
         // The args-array wrapper ignores its arguments entirely, so the 0-arg
         // direct delegate is the identical code path (extra-arg calls still fall
-        // back to the wrapper, which also ignores them — unchanged).
+        // back to the wrapper, which also ignores them: unchanged).
         var stackSpaceFn = new LispFunction(_ =>
             Compat.TryEnsureSufficientExecutionStack()
                 ? (LispObject)T.Instance : Nil.Instance,

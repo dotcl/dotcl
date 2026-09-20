@@ -6,7 +6,7 @@
 ;;; a global macro of the same name existed it always won and the MACROLET had no
 ;;; effect (ansi-test MACROLET.50, and the MACROLET.16 entries naming CL macros).
 ;;; For a name with no global definition the lookup fell through to *MACROS* and
-;;; worked — so this broke ONLY for names that were already defined, which is
+;;; worked: so this broke ONLY for names that were already defined, which is
 ;;; what made it hard to see.
 ;;;
 ;;; The same path also lost NIL and T as operators: neither is an instance of the
@@ -15,7 +15,7 @@
 ;;; (ansi-test MACROLET.15).
 ;;;
 ;;; The fix also records MACROLET bindings in their own namespace in ENV
-;;; (%MINI-MACROS) and has operator dispatch consult it BEFORE MACROEXPAND-1 —
+;;; (%MINI-MACROS) and has operator dispatch consult it BEFORE MACROEXPAND-1;
 ;;; the same shape FLET bindings (%MINI-FDEFN) and GO tags (%MINI-GO-TAGS) use.
 
 (defmacro %mls-global () :bad)
@@ -71,7 +71,7 @@
                            (%m))))
   (:inner :outer))
 
-;;; an inner FLET shadows an outer MACROLET (CLHS 3.1.2.1.2.4) — this rejects a
+;;; an inner FLET shadows an outer MACROLET (CLHS 3.1.2.1.2.4): this rejects a
 ;;; fix that merely swaps the precedence
 (deftest interp-macrolet-shadowing.inner-flet-wins-interpret
   (%mls :interpret '(macrolet ((%m () :macro))
@@ -105,7 +105,7 @@
 ;;; built from the globals, so a lexical entry would have been invisible to
 ;;; (MACROEXPAND x env).
 ;;;
-;;; The cost was that EVERY form interpreted during that extent saw them —
+;;; The cost was that EVERY form interpreted during that extent saw them;
 ;;; including the body of a separately defined function the body happened to
 ;;; call. That body has nothing to do with the MACROLET's scope.
 ;;;
@@ -124,7 +124,7 @@
           (macrolet ((%mls-h () :macro)) (list (%mls-h) (%mls-c)))))
 
 ;;; (:MACRO :GLOBAL): the MACROLET applies to the form it encloses, and %MLS-C's
-;;; body is not that form — it was defined elsewhere and only called from here.
+;;; body is not that form: it was defined elsewhere and only called from here.
 (deftest interp-macrolet-scope.no-leak-into-callee-interpret
   (%mls :interpret %mls-leak)
   (:macro :global))
@@ -133,7 +133,7 @@
   (%mls :compile %mls-leak)
   (:macro :global))
 
-;;; the callee is unchanged afterwards either way — the old code restored the
+;;; the callee is unchanged afterwards either way: the old code restored the
 ;;; global entry on exit, so this passed even while the leak existed
 (deftest interp-macrolet-scope.callee-unchanged-after-interpret
   (%mls :interpret '(%mls-c))
@@ -155,7 +155,7 @@
                        (%mls-probe2))))
   t)
 
-;;; an expander's &ENVIRONMENT reaches SYMBOL-MACROLET bindings too — the
+;;; an expander's &ENVIRONMENT reaches SYMBOL-MACROLET bindings too; the
 ;;; environment now carries both halves
 (deftest interp-macrolet-scope.environment-sees-symbol-macro-interpret
   (%mls :interpret '(symbol-macrolet ((%mls-s (list :sm)))

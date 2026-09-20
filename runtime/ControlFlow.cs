@@ -40,7 +40,7 @@ public class CatchThrowException : Exception
     public CatchThrowException(LispObject tag, LispObject value)
         : base("catch throw")
     {
-        // Called from CIL newobj — return cached instance via static Get
+        // Called from CIL newobj: return cached instance via static Get
         Tag = tag;
         Value = value;
     }
@@ -74,7 +74,7 @@ public static class ControlFlowFilters
         => ex is CatchThrowException c && ReferenceEquals(c.Tag, tag) ? 1 : 0;
 
     /// <summary>Filter predicate for BLOCK: does this non-local RETURN-FROM target
-    /// the block whose tag is TAG? Same reasoning as CatchTagMatches — a block that
+    /// the block whose tag is TAG? Same reasoning as CatchTagMatches: a block that
     /// caught every BlockReturnException to rethrow the ones it did not own paid a
     /// stacked dispatch for each level a return crossed.</summary>
     public static int BlockTagMatches(object ex, LispObject tag)
@@ -104,7 +104,7 @@ public static class ControlFlowFilters
     /// HandlerCaseInvocationException (thrown by the handler function
     /// HandlerClusterStack.Signal called) is recognized by identity and carries the
     /// clause index with it. Anything else is matched by type against SPECS, the
-    /// clause type specifiers in clause order — first match wins, as CL requires.
+    /// clause type specifiers in clause order: first match wins, as CL requires.
     ///
     /// Running this as a CIL filter is what keeps a signal that crosses N nested
     /// handler-cases from costing N stacked exception dispatches: a frame that
@@ -228,6 +228,38 @@ public static class CatchTagStack
 }
 
 /// <summary>
+/// Marks the dynamic extent in which Lisp is running as the continuation of an
+/// (ASYNC ...) block, on a thread the async machinery handed the work to.
+///
+/// It exists for one question: whether a THROW with no CATCH on THIS thread is
+/// already an error. Normally it is, and reporting it at the throw site is what
+/// keeps a HANDLER-CASE for CONTROL-ERROR around the THROW able to see it. In a
+/// continuation it is not: the catch tags of the code that awaited this block
+/// are on the awaiting thread's stack, and the exception's route back to them is
+/// the Task fault, which is exactly what the continuation's caller turns it
+/// into. Deciding "no catcher" here would replace the condition actually being
+/// signalled -- the one the awaiting HANDLER-CASE was written for -- with a
+/// CONTROL-ERROR about a tag the user never wrote.
+///
+/// So inside a continuation the check is not skipped, only deferred: the throw
+/// travels as a Task fault, DOTNET:AWAIT rethrows it on the awaiting thread, and
+/// if no catcher is outstanding THERE it becomes CONTROL-ERROR at that boundary.
+///
+/// A depth, not a flag: a continuation that awaits an already-completed Task
+/// runs the inner continuation inline on the same thread, so these nest.
+/// </summary>
+public static class AsyncContinuation
+{
+    [ThreadStatic] private static int _depth;
+
+    public static bool Active => _depth > 0;
+
+    public static void Enter() => _depth++;
+
+    public static void Exit() => _depth--;
+}
+
+/// <summary>
 /// Wraps an exception with source location information (file + line).
 /// Nested loads produce a chain of LispSourceExceptions forming a stack trace.
 /// </summary>
@@ -276,7 +308,7 @@ public class LispSourceException : Exception
         // Under dotcl:*debug-stacktrace*, append the underlying .NET exception's
         // type and stack trace. Without this a raw .NET exception (e.g.
         // ArrayTypeMismatchException) that unwinds past all Lisp handlers loses
-        // its origin entirely — the Lisp backtrace is empty because the frames
+        // its origin entirely: the Lisp backtrace is empty because the frames
         // already unwound.
         if (Startup.DebugStacktrace && cur != null && !string.IsNullOrEmpty(cur.StackTrace))
         {
@@ -290,7 +322,7 @@ public class LispSourceException : Exception
     /// error in their Error List with click-to-navigate (dotcl/dotcl#48):
     ///   file(line): error DOTCL: message
     ///     from outer(line)
-    /// The innermost (deepest) frame — where compilation actually failed — is the
+    /// The innermost (deepest) frame, where compilation actually failed, is the
     /// clickable canonical error; outer frames are informational `from` lines.
     public string FormatMsBuildDiagnostic()
     {

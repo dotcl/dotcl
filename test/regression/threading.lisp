@@ -86,7 +86,7 @@
 
 (deftest d657-semaphore-producer-consumer
   ;; Both worker threads accumulate into ACC, so the increments must be guarded by a
-  ;; lock — an unsynchronized (incf acc) read-modify-write loses an update and the
+  ;; lock: an unsynchronized (incf acc) read-modify-write loses an update and the
   ;; sum flakes to 1 or 10 instead of 11.
   (let ((sem  (dotcl-thread:make-semaphore :count 0))
         (lock (dotcl-thread:make-lock))
@@ -105,7 +105,7 @@
   (let ((lock (dotcl-thread:make-lock))
         (cv   (dotcl-thread:make-condition-variable)))
     (dotcl-thread:with-lock-held (lock)
-      ;; No notifier — should time out and return NIL.
+      ;; No notifier: should time out and return NIL.
       (dotcl-thread:condition-wait cv lock :timeout 0.05)))
   nil)
 
@@ -208,7 +208,7 @@
 
 (deftest d659-dynbind-concurrent-stress
   ;; 4 threads x 100 iterations: each binds *shared* to a unique value
-  ;; and reads it back. Zero mismatches → per-thread isolation works.
+  ;; and reads it back. Zero mismatches -> per-thread isolation works.
   (let* ((n 100)
          (lock (dotcl-thread:make-lock))
          (errors (list 0))
@@ -276,7 +276,7 @@
                            :name (format nil "phil-~D" ci))))))
     (dolist (th threads) (dotcl-thread:thread-join th))
     (reduce #'+ eat-counts))
-  250)  ; 5 philosophers × 50 rounds
+  250)  ; 5 philosophers x 50 rounds
 
 ;;; Producer-consumer with condition-variable, lock-protected increment.
 (defparameter *%d660-queue* nil)
@@ -329,7 +329,7 @@
   ;;         = 19900      + 2019900 = 2039800
   2039800)
 
-;;; #26 — dotcl:thread-object exposes the underlying .NET Thread.
+;;; #26: dotcl:thread-object exposes the underlying .NET Thread.
 (deftest d1124-thread-object-managed-id
   (let ((th (dotcl:make-thread (lambda () 42) :name "d1124")))
     (prog1 (integerp (dotnet:invoke (dotcl:thread-object th) "get_ManagedThreadId"))
@@ -414,8 +414,8 @@
 ;;; the GLOBAL symbol-functions of CALL-NEXT-METHOD/NEXT-METHOD-P just before invoking
 ;;; the method, which captured them via (symbol-function 'call-next-method). A second
 ;;; thread dispatching concurrently clobbered that global mid-window, so the victim
-;;; captured the wrong closure — or the single-primary fast path's "no next method"
-;;; stub — and signalled a spurious CALL-NEXT-METHOD: no next method. The handoff is
+;;; captured the wrong closure, or the single-primary fast path's "no next method"
+;;; stub, and signalled a spurious CALL-NEXT-METHOD: no next method. The handoff is
 ;;; now thread-local (%captured-call-next-method / Runtime.CapturedCnm).
 ;;;   Thread A hammers a deep call-next-method chain; thread B hammers a single-primary
 ;;; leaf GF (whose fast path installs the "no next method" default). A correct dispatch
@@ -523,9 +523,9 @@
   :untouched)
 
 ;; Runtime.Eval serializes compilation on the global _evalLock, but must NOT hold
-;; it while RUNNING the compiled form — a form that blocks waiting on worker
+;; it while RUNNING the compiled form: a form that blocks waiting on worker
 ;; threads which themselves need to compile (eval) deadlocks (main holds the lock,
-;; workers block acquiring it). Mirrors lparallel `each` over APL execute ⍎¨.
+;; workers block acquiring it). Mirrors lparallel `each` over APL execute execute-each.
 ;; If this regresses, the test HANGS.
 (deftest i490-eval-releases-lock-during-run
   (eval '(let ((threads (loop for i below 4 collect

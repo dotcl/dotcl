@@ -1,8 +1,8 @@
-;;;; hello-gui.lisp — a cross-platform GUI from plain Common Lisp.
+;;;; hello-gui.lisp: a cross-platform GUI from plain Common Lisp.
 ;;;; Run with:  dotcl --load hello-gui.lisp
 
 (require "dotnet-class")                         ; dotnet:define-class (ships with dotcl)
-(require "nuget")                          ; NuGet resolver (ships with dotcl)
+(require "dotcl-nuget")                          ; NuGet resolver (ships with dotcl)
 (nuget:require "Avalonia.Desktop" :version "12.0.4") ; pulls Avalonia + platform backends
 (nuget:require "Avalonia.Themes.Fluent" :version "12.0.4")
 (dotnet:load-assembly "Avalonia.Desktop")        ; UsePlatformDetect lives here

@@ -3,7 +3,7 @@
 ;;; %mini-bind-params bound whatever it was given: a missing required argument
 ;;; silently became NIL, an extra one was dropped, and an unknown :KEY was
 ;;; ignored. Compiled functions have always checked, so this only showed up
-;;; where a function is INTERPRETED — and the biggest such source is a DEFSTRUCT
+;;; where a function is INTERPRETED: and the biggest such source is a DEFSTRUCT
 ;;; created through EVAL, whose accessors then are interpreted closures:
 ;;;
 ;;;   (defstruct sa a b)          ; LOAD compiles it   -> (sa-p) signals
@@ -84,7 +84,7 @@
   (%illc :interpret '(funcall (lambda (a &rest r &key b) (list a r b)) 1 :b 2))
   :no-error)
 
-;;; Values still bind correctly — the check must not disturb the binding itself.
+;;; Values still bind correctly: the check must not disturb the binding itself.
 (deftest interp-lambda-list-check.binding-still-correct-interpret
   (let ((dotcl:*evaluator-mode* :interpret))
     (eval '(funcall (lambda (a &optional (b 9) &key (c 7)) (list a b c)) 1)))

@@ -40,12 +40,12 @@ public static partial class Runtime
     {
         if (args.Length == 0)
             return ConditionSystem.Error(new LispError("Unknown error"));
-        // (error condition-object) — pass through
+        // (error condition-object): pass through
         if (args[0] is LispCondition cond)
             return ConditionSystem.Error(cond);
         if (args[0] is LispInstance errInst)
             return ConditionSystem.Error(new LispInstanceCondition(errInst));
-        // (error 'condition-type) or (error 'condition-type :initarg val ...) — create condition instance
+        // (error 'condition-type) or (error 'condition-type :initarg val ...); create condition instance
         if (args[0] is Symbol sym)
         {
             var initargs = args.SubArray(1);
@@ -54,7 +54,7 @@ public static partial class Runtime
                 return ConditionSystem.Error(lic);
             return ConditionSystem.Error(condObj);
         }
-        // (error function &rest args) — function is a format control (e.g. from formatter)
+        // (error function &rest args): function is a format control (e.g. from formatter)
         if (args[0] is LispFunction fn)
         {
             // Call the function with a string-output-stream to get the message
@@ -220,7 +220,7 @@ public static partial class Runtime
             var initargs = args.Length > 1 ? args.SubArray(1) : Array.Empty<LispObject>();
             return ConditionSystem.Signal(MakeConditionFromType(sym, initargs));
         }
-        // String message — preserve format control/arguments
+        // String message: preserve format control/arguments
         var sc = new LispCondition(args[0].ToString());
         sc.ConditionTypeName = "SIMPLE-CONDITION";
         if (args[0] is LispString fmtStr)
@@ -236,8 +236,8 @@ public static partial class Runtime
         Symbol sym;
         // A condition coerces to itself. Callers that funnel an already-built condition
         // back through MAKE-CONDITION are common (SBCL's compiler does it while reporting
-        // an error it just caught). Rejecting it replaced the real condition — an
-        // UNDEFINED-FUNCTION naming the function that was actually missing — with an
+        // an error it just caught). Rejecting it replaced the real condition, an
+        // UNDEFINED-FUNCTION naming the function that was actually missing, with an
         // unrelated TYPE-ERROR about MAKE-CONDITION's own argument, so the diagnosis was
         // destroyed at the point it mattered most. CLHS leaves a non-type-specifier
         // argument undefined, which makes returning it permitted and strictly more useful.
@@ -285,7 +285,7 @@ public static partial class Runtime
             }
             if (types.Count > 0)
             {
-                // Try each type — if one is a subtype of all others, use it
+                // Try each type: if one is a subtype of all others, use it
                 foreach (var t in types)
                 {
                     bool subtypeOfAll = true;
@@ -301,7 +301,7 @@ public static partial class Runtime
                     if (subtypeOfAll) return t;
                 }
                 // If no single type works, try known intersection types
-                // e.g., (AND simple-condition type-error) → simple-type-error
+                // e.g., (AND simple-condition type-error) -> simple-type-error
                 return FindIntersectionConditionType(types);
             }
         }
@@ -498,7 +498,7 @@ public static partial class Runtime
         }
         if (args[0] is LispCondition c)
         {
-            // Extra args with condition object → type-error
+            // Extra args with condition object -> type-error
             if (args.Length > 1)
                 throw new LispErrorException(new LispTypeError("WARN: extra arguments with condition object", args[0]));
             if (!IsTruthy(Typep(c, Startup.Sym("WARNING"))))
@@ -632,7 +632,7 @@ public static partial class Runtime
                 try
                 {
                     HandlerClusterStack.Signal(condition);
-                    // No handler took it — enter debugger with CONTINUE restart still on stack.
+                    // No handler took it: enter debugger with CONTINUE restart still on stack.
                     // *debugger-hook* is called first (matching invoke-debugger behaviour).
                     var hookSym = Startup.Sym("*DEBUGGER-HOOK*");
                     if (DynamicBindings.TryGet(hookSym, out var hookVal) && hookVal is not Nil)
@@ -803,7 +803,7 @@ public static partial class Runtime
                     DynamicBindings.Pop(hookSym);
                 }
             }
-            // Hook returned or was NIL → enter standard debugger
+            // Hook returned or was NIL -> enter standard debugger
             // Debugger.Enter never returns normally (exits via restart invocation)
             return Debugger.Enter(condition);
         });
@@ -844,7 +844,7 @@ public static partial class Runtime
             }
             catch (RestartInvocationException rie) when (ReferenceEquals(rie.Tag, continueTag))
             {
-                // CONTINUE restart invoked → return NIL from break
+                // CONTINUE restart invoked -> return NIL from break
             }
             finally
             {

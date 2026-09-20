@@ -7,12 +7,12 @@ public sealed class Symbol : LispObject
     /// <summary>
     /// The LISP string SYMBOL-NAME answers with, made once per symbol.
     /// A symbol's name never changes, and CLHS leaves modifying the returned
-    /// string undefined, so one instance can be shared — SBCL does the same
+    /// string undefined, so one instance can be shared: SBCL does the same
     /// ((eq (symbol-name 'x) (symbol-name 'x)) is true there).
     ///
     /// Worth caching because the compiler asks constantly: its locals /
     /// free-variable machinery is string-keyed (VAR-NAME), so a fresh string
-    /// per call put 11.7M LispStrings — 28% of all objects allocated — into a
+    /// per call put 11.7M LispStrings, 28% of all objects allocated, into a
     /// single COMPILE-FILE of contrib/asdf/asdf.lisp.
     /// </summary>
     private LispString? _nameString;

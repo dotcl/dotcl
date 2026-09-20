@@ -161,7 +161,7 @@ static class NativeFFI
             ushort us => Fixnum.Make(us),
             sbyte sb => Fixnum.Make(sb),
             byte b => Fixnum.Make(b),
-            float f => new SingleFloat(f),   // binary32 — see DotNetToLisp
+            float f => new SingleFloat(f),   // binary32; see DotNetToLisp
             double d => new DoubleFloat(d),
             bool bv => bv ? T.Instance : Nil.Instance,
             _ => Runtime.DotNetToLisp(result)
@@ -260,7 +260,7 @@ static class NativeFFI
         var callTypes = argTypes.Select((t, i) => i < fixedCount ? t : VariadicCallType(t)).ToList();
 
         // Build or reuse DynamicMethod
-        var sigKey = string.Join(",", callTypes.Select(t => t.Name)) + "→" + retType.Name
+        var sigKey = string.Join(",", callTypes.Select(t => t.Name)) + "->" + retType.Name
                      + "|fixed" + fixedCount;
         var cacheKey = (dll, func, sigKey);
         DynamicMethod dm;
@@ -277,7 +277,7 @@ static class NativeFFI
                 // Push native args (positions 1..n)
                 for (int i = 0; i < callTypes.Count; i++)
                     il.Emit(OpCodes.Ldarg, i + 1);
-                // Push funcPtr (position 0) — must be last before calli
+                // Push funcPtr (position 0): must be last before calli
                 il.Emit(OpCodes.Ldarg_0);
                 // calli: pops funcPtr last, args before it
                 il.EmitCalli(OpCodes.Calli, CallingConvention.StdCall,
@@ -323,7 +323,7 @@ static class NativeFFI
 
         // See Call: the variadic part may travel differently from how it is declared.
         var callTypes = argTypes.Select((t, i) => i < fixedCount ? t : VariadicCallType(t)).ToList();
-        var sigKey = string.Join(",", callTypes.Select(t => t.Name)) + "→" + retType.Name
+        var sigKey = string.Join(",", callTypes.Select(t => t.Name)) + "->" + retType.Name
                      + "|fixed" + fixedCount;
         var cacheKey = ("*ptr*", "*ptr*", sigKey);
         DynamicMethod dm;
@@ -372,7 +372,7 @@ static class NativeFFI
     static readonly List<Delegate> _callbackRoots = new();
 
     /// <summary>Invoked (via the emitted thunk) when native code calls the callback.
-    /// Marshals native args → Lisp, runs the Lisp function, marshals the result back.</summary>
+    /// Marshals native args -> Lisp, runs the Lisp function, marshals the result back.</summary>
     public static object? CallbackTrampoline(int id, object?[] nativeArgs)
     {
         CallbackEntry e;

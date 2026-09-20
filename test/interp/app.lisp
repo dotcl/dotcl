@@ -2,7 +2,7 @@
 ;;;; (:interpret). Unlike the form-unit diff harness, this validates that
 ;;;; interpreted def-forms (defmacro/defun/defclass/defgeneric/defmethod/
 ;;;; define-condition/defstruct) defined EARLIER in the file are correctly used
-;;;; by LATER interpreted code — cross-form interpreter state, closures with
+;;;; by LATER interpreted code: cross-form interpreter state, closures with
 ;;;; accumulated state, and conditions/restarts crossing function boundaries.
 ;;;; This is the "real app on the ns2.0/AOT eval path" integration check.
 ;;;; Run: dotnet run ... -- --asm compiler/cil-out.sil test/interp/app.lisp
@@ -50,7 +50,7 @@
 (defgeneric describe-shape (s))
 (defmethod describe-shape ((s shape)) (format nil "area=~,1F" (area s)))
 (defclass circle (shape) ((r :initarg :r :reader r)))
-(defmethod area ((c circle)) (* 3 (r c) (r c)))     ; pi≈3 for exact ints
+(defmethod area ((c circle)) (* 3 (r c) (r c)))     ; pi~3 for exact ints
 (defclass square (shape) ((side :initarg :side :reader side)))
 (defmethod area ((s square)) (* (side s) (side s)))
 (expect "clos-dispatch"

@@ -1,7 +1,7 @@
 ;;; Behaviour EVAL must exhibit identically on both evaluator paths.
 ;;;
 ;;; These bind dotcl:*evaluator-mode* around the EVAL under test, so the
-;;; interpreter is exercised from the ordinary compiled harness — no separate
+;;; interpreter is exercised from the ordinary compiled harness: no separate
 ;;; interpreted run needed to catch a regression here. That matters because
 ;;; the tree-walk interpreter is the ONLY evaluator on emit-free
 ;;; (netstandard2.0) builds, where nothing else would notice.
@@ -9,7 +9,7 @@
 ;;; An unmatched THROW leaving EVAL is a CONTROL-ERROR (CLHS; ansi-test
 ;;; THROW-ERROR). The conversion used to wrap the compiled branch of
 ;;; EvalCompound only, so under the interpreter the raw .NET CatchThrowException
-;;; escaped to Program.Main and killed the process outright — running ansi-test
+;;; escaped to Program.Main and killed the process outright: running ansi-test
 ;;; with :interpret died at THROW-ERROR instead of reporting a failure.
 
 (defun %ieb-throw-unmatched (mode)
@@ -26,7 +26,7 @@
   (%ieb-throw-unmatched :interpret)
   :control-error)
 
-;;; A THROW whose CATCH is outside the EVAL must still reach it — the
+;;; A THROW whose CATCH is outside the EVAL must still reach it: the
 ;;; control-error conversion must not swallow a legitimate non-local exit.
 
 (defun %ieb-throw-to-outer (mode)

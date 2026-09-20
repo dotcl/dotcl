@@ -1,6 +1,6 @@
 ;;; REMOVE has typed direct-call entries for the 4-arg (one keyword pair) and
 ;;; 6-arg (two keyword pairs) shapes, next to the existing 2-arg one. They must
-;;; agree with the args-array path in every keyword combination — the direct
+;;; agree with the args-array path in every keyword combination: the direct
 ;;; entries run the shared keyword parser over their own small array, so a
 ;;; mistake there would silently change :count / :start / :from-end handling
 ;;; only for calls compiled at that exact arity.
