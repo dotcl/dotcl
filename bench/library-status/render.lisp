@@ -20,6 +20,21 @@
 ;;;; and merged here as the "why" column. The check run never opens that file,
 ;;;; so re-measuring cannot erase it.
 ;;;;
+;;;; The test stage (run-tests.sh) writes a third file, one verdict per system
+;;;; whose test suite was run:
+;;;;
+;;;;   [{"system": "split-sequence", "checked": "2026-09-25",
+;;;;     "verdict": "pass",          ; pass | fail | error | no-result |
+;;;;                                 ; timeout | load-fail
+;;;;     "framework": "fiveam", "passed": 120, "failed": 0, ...}, ...]
+;;;;
+;;;; It is merged here rather than written into the results, so that a load
+;;;; check and a test run can be redone independently. A row that loads
+;;;; (load-only or patched) is shown as ok only when its verdict is "pass";
+;;;; every other verdict leaves the status alone and is shown in the "tests"
+;;;; column, so a suite that was not run, ran nothing recognisable, or failed
+;;;; can be told apart from one that passed.
+;;;;
 ;;;; Run it with any conforming Lisp:
 ;;;;
 ;;;;   sbcl --non-interactive --load bench/library-status/render.lisp
@@ -30,10 +45,11 @@
 ;;;;   LIBRARY_STATUS_JSON         results to render  (default results.json)
 ;;;;   LIBRARY_STATUS_TARGETS      row order          (default targets.txt)
 ;;;;   LIBRARY_STATUS_ANNOTATIONS  the why column     (default annotations.json)
+;;;;   LIBRARY_STATUS_TESTS_JSON   test verdicts      (default tests.json)
 ;;;;   LIBRARY_STATUS_OUT          markdown to write  (default ../../docs/library-status.md)
 ;;;;   DOTCL_VERSION               version that was measured (default "unknown")
 ;;;;
-;;;; MAIN takes the same five as keyword arguments, for calling it by hand.
+;;;; MAIN takes the same six as keyword arguments, for calling it by hand.
 ;;;;
 ;;;; The table is published, so the "issue" field must name an issue in the
 ;;;; public dotcl/dotcl repository, and an annotation sentence is published
@@ -235,8 +251,8 @@ ranking for the second half that does not exist.")
 ;;; --- markdown --------------------------------------------------------------
 
 (defparameter *status-legend*
-  '(("ok" . "loads, and the library's own test suite passes")
-    ("load-only" . "loads; its test suite has not been run here")
+  '(("ok" . "loads, and the library's own test suite ran here and passed")
+    ("load-only" . "loads; its test suite was not run here, or did not pass (the tests column says which)")
     ("patched" . "loads from the patched release in the dotcl dist overlay")
     ("fail" . "does not load")
     ("not checked" . "not measured in this run"))
@@ -316,20 +332,73 @@ from the results alone, it just has an empty WHY column."
                    parsed))
       '()))
 
+(defun %read-tests (path)
+  "The test verdicts as a hash table system -> object, empty when there is no
+file. Absent is not an error: no suite has been run, and every row says so."
+  (let ((table (make-hash-table :test #'equal)))
+    (when (probe-file path)
+      (dolist (entry (%parse-json (%read-file path)))
+        (let ((system (%field entry "system")))
+          (when system (setf (gethash system table) entry)))))
+    table))
+
+(defun %loads-p (row)
+  (member (%field row "status") '("load-only" "patched") :test #'equal))
+
+(defun %status-for (row tests)
+  "The status to show. Only a row that loads and whose suite passed becomes
+ok; the stored status is shown unchanged otherwise."
+  (let ((status (or (%field row "status") "not checked"))
+        (test (gethash (%field row "system") tests)))
+    (if (and (%loads-p row) test (equal (%field test "verdict") "pass"))
+        "ok"
+        status)))
+
+(defun %tests-cell (row tests)
+  "What the test stage saw, in a few words, and when, or \"\" when it has not run.
+
+The verdicts other than pass are spelled out rather than left blank: a blank
+would read as \"nothing to report\", and \"ran, but printed nothing a
+recogniser knows\" is exactly what must not look like that. The date is the test
+run's own; the checked column beside it is the load check's, and the two are
+redone independently."
+  (let ((test (gethash (%field row "system") tests)))
+    (if (or (null test) (not (%loads-p row)))
+        ""
+        (let* ((verdict (or (%field test "verdict") "?"))
+               (framework (or (%field test "framework") "-"))
+               (passed (or (%field test "passed") 0))
+               (failed (or (%field test "failed") 0))
+               (checked (%field test "checked"))
+               (text (cond ((string= verdict "pass")
+                            (format nil "~A: ~D passed" framework passed))
+                           ((string= verdict "fail")
+                            (format nil "~A: ~D of ~D failed" framework failed (+ passed failed)))
+                           ((string= verdict "no-result") "ran; no recognised result")
+                           ((string= verdict "error")
+                            (if (string= framework "-")
+                                "error"
+                                (format nil "~A: error after ~D passed" framework passed)))
+                           ((string= verdict "timeout") "timeout")
+                           ((string= verdict "load-fail") "test system did not load")
+                           (t verdict))))
+          (if checked (format nil "~A (~A)" text checked) text)))))
+
 (defun %row-for (system by-system)
   "The result object for SYSTEM, or a placeholder saying it was not measured."
   (or (gethash system by-system)
       (list (cons "system" system)
             (cons "status" "not checked"))))
 
-(defun %write-rows (out rows annotations)
-  (format out "~%| system | status | issue | checked | why | note |~%")
-  (format out "| --- | --- | --- | --- | --- | --- |~%")
+(defun %write-rows (out rows annotations tests)
+  (format out "~%| system | status | tests | issue | checked | why | note |~%")
+  (format out "| --- | --- | --- | --- | --- | --- | --- |~%")
   (dolist (row rows)
     (let ((system (or (%field row "system") "?")))
-      (format out "| ~A | `~A` | ~A | ~A | ~A | ~A |~%"
+      (format out "| ~A | `~A` | ~A | ~A | ~A | ~A | ~A |~%"
               (%escape-cell system)
-              (or (%field row "status") "not checked")
+              (%status-for row tests)
+              (%escape-cell (%tests-cell row tests))
               (%issue-cell (%field row "issue"))
               (%escape-cell (or (%field row "checked") ""))
               ;; Prose a person wrote, so it is rendered as prose; only the cell
@@ -337,7 +406,18 @@ from the results alone, it just has an empty WHY column."
               (%escape-cell (or (%annotation annotations system) ""))
               (%code-cell (or (%field row "note") ""))))))
 
-(defun %write-markdown (path rows dist dotcl-version extra annotations
+(defparameter *tests-legend*
+  '(("<framework>: N passed" . "the suite ran and every check passed (the row is ok)")
+    ("<framework>: K of N failed" . "the suite ran and K checks failed")
+    ("<framework>: error after N passed" . "the suite started, then signalled or exited abnormally")
+    ("ran; no recognised result" . "the test operation finished but printed no summary a recogniser knows; not a pass")
+    ("error" . "the test operation signalled before any recognised summary")
+    ("timeout" . "the test run hit its time bound")
+    ("test system did not load" . "the library loads but its test system does not")
+    ("(blank)" . "the suite has not been run"))
+  "The values of the tests column, in the order they are explained.")
+
+(defun %write-markdown (path rows dist dotcl-version extra annotations tests
                         &optional hand-picked-rows)
   (with-open-file (out path :direction :output :if-exists :supersede
                             :if-does-not-exist :create :external-format :utf-8)
@@ -355,16 +435,23 @@ from the results alone, it just has an empty WHY column."
     (format out "| status | meaning |~%| --- | --- |~%")
     (loop for (status . meaning) in *status-legend*
           do (format out "| `~A` | ~A |~%" status meaning))
-    (%write-rows out (append rows extra) annotations)
+    (format out "~%The tests column is what running the library's own test suite~%")
+    (format out "(`asdf:test-system`) printed, read by a recogniser for the test~%")
+    (format out "framework (fiveam, rt, rove, prove, parachute, stefil, fiasco,~%")
+    (format out "clunit, Try).~%~%")
+    (format out "| tests | meaning |~%| --- | --- |~%")
+    (loop for (value . meaning) in *tests-legend*
+          do (format out "| ~A | ~A |~%" value meaning))
+    (%write-rows out (append rows extra) annotations tests)
     (when hand-picked-rows
       (format out "~%## Hand-picked~%~%")
       (format out "Chosen by hand rather than by referrer count: an application,~%")
       (format out "or a library whose value is that it stresses one part of the~%")
       (format out "compiler hard, sits at the end of the dependency graph and~%")
       (format out "ranks nowhere. The order in this table means nothing.~%")
-      (%write-rows out hand-picked-rows annotations))))
+      (%write-rows out hand-picked-rows annotations tests))))
 
-(defun main (&key json targets out dotcl-version annotations)
+(defun main (&key json targets out dotcl-version annotations tests)
   (let* ((here (directory-namestring
                 (or *load-truename* *default-pathname-defaults*)))
          (json (or json (%env "LIBRARY_STATUS_JSON"
@@ -372,6 +459,9 @@ from the results alone, it just has an empty WHY column."
          (annotations (or annotations
                           (%env "LIBRARY_STATUS_ANNOTATIONS"
                                 (namestring (merge-pathnames "annotations.json" here)))))
+         (tests (or tests
+                    (%env "LIBRARY_STATUS_TESTS_JSON"
+                          (namestring (merge-pathnames "tests.json" here)))))
          (targets (or targets (%env "LIBRARY_STATUS_TARGETS"
                                     (namestring (merge-pathnames "targets.txt" here)))))
          (out (or out (%env "LIBRARY_STATUS_OUT"
@@ -381,6 +471,7 @@ from the results alone, it just has an empty WHY column."
     (multiple-value-bind (order hand-picked dist) (%read-targets targets)
       (let ((results (%parse-json (%read-file json)))
             (annotations (%read-annotations annotations))
+            (tests (%read-tests tests))
             (by-system (make-hash-table :test #'equal)))
         (dolist (result results)
           (let ((system (%field result "system")))
@@ -397,8 +488,9 @@ from the results alone, it just has an empty WHY column."
                                    (let ((s (%field result "system")))
                                      (or (member s order :test #'string=)
                                          (member s hand-picked :test #'string=))))
-                                 results)))
-          (%write-markdown out rows dist dotcl-version extra annotations
+                                 results))
+               (all (append rows extra hand-picked-rows)))
+          (%write-markdown out rows dist dotcl-version extra annotations tests
                            hand-picked-rows)
           (format t "~&wrote ~A~%" out)
           (format t "~D ranked rows (~D measured), ~D hand-picked, ~D extra, ~D annotated~%"
@@ -408,6 +500,11 @@ from the results alone, it just has an empty WHY column."
                   (length extra)
                   (count-if (lambda (pair) (%annotation annotations (car pair)))
                             annotations))
+          (format t "status:~{ ~A ~D~}~%"
+                  (loop for status in '("ok" "load-only" "patched" "fail" "not checked")
+                        collect status
+                        collect (count status all :key (lambda (row) (%status-for row tests))
+                                                  :test #'equal)))
           (length rows))))))
 
 (main)

@@ -28,8 +28,7 @@
 
 (defun %par-tmp (name)
   (concatenate 'string
-               (substitute #\/ (code-char 92)
-                           (or (dotcl:getenv "TMPDIR") (dotcl:getenv "TEMP") "/tmp"))
+               (regression-temp-dir)
                "/" name))
 
 (defun %par-portable-rid ()

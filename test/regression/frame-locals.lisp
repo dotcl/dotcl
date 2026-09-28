@@ -263,9 +263,17 @@
 
 ;;; The sldb case: *DEBUGGER-HOOK* runs at the depth of the frame that signalled,
 ;;; and the debugger must see that frame's variables, not the hook's own.
-(deftest-compiled-only frame-locals-debugger-hook-sees-signalling-frame
-  (progn (fl-hook-caller 2) *fl-captured*)
-  (("A" . 2) ("S" . 6)))
+;;;
+;;; *DEFTEST-CONTAIN-ERRORS* is NIL here because this test's subject IS the
+;;; unhandled path. DEFTEST wraps a test in HANDLER-CASE so one failure cannot
+;;; take the run down, but a handled condition never reaches the debugger, so
+;;; the hook would never run. Rewriting it to call INVOKE-DEBUGGER directly was
+;;; tried and is NOT equivalent: the hook then runs at a different depth and
+;;; (FRAME-LOCALS 0) answers NIL, which is the very thing being measured.
+(let ((*deftest-contain-errors* nil))
+  (deftest-compiled-only frame-locals-debugger-hook-sees-signalling-frame
+    (progn (fl-hook-caller 2) *fl-captured*)
+    (("A" . 2) ("S" . 6))))
 
 (deftest frame-locals-index-past-end
   (dotcl:frame-locals 999)

@@ -7,11 +7,13 @@
 
   "postmodern": "`cl-postgres.asd` pulls usocket in through an allowlist of implementations but its code reaches for usocket through a denylist, so every implementation missing from that allowlist hits this; quickloading usocket first makes postmodern load unchanged.",
 
+  "chanl": "The one failing check is `STUMBLERS` in `DEADLOCK`, and SBCL fails it the same way: it asks `yes-or-no-p`, and a test run with no terminal gets `END-OF-FILE` there instead of an answer.",
+
   "sdl2": "Not a dotcl failure: after about 340 seconds of compiling, the SDL2 library this host finds is not an image this arm64 machine can load (`ERROR_BAD_EXE_FORMAT`).",
 
   "hu.dwim.logger": "Loads about two runs in three, and the failure mode follows the ASDF cache state rather than the code, so this row can differ between runs.",
 
-  "reblocks": "The `typep` gap that used to stop this row is fixed, and it now reaches the same missing `WITHOUT-INTERRUPTS` package as the metatilities family.",
+  "reblocks": "Now stops in `moptilities`: its `slot-names` calls `get-structure` on every implementation except SBCL, and `get-structure` has no branch for dotcl, so it signals `not yet implemented`.",
 
   "reblocks-parenscript": "Fails while loading `reblocks`, for the reason given on that row.",
 

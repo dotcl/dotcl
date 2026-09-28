@@ -225,12 +225,13 @@ public static class TypeParser
             return nt;
         }
 
-        // Check for deftype expander
-        if (Runtime.TypeExpanders.TryGetValue(name, out var expander))
+        // Check for a deftype expander registered for this very symbol
+        if (Runtime.TryGetTypeExpander(sym, out var expander))
         {
             // Circular expansion detection
+            var expKey = Runtime.TypeExpanderKey(sym);
             expanding ??= new HashSet<string>();
-            if (!expanding.Add(name))
+            if (!expanding.Add(expKey))
             {
                 // Circular: return as named type (best effort)
                 var nt = NamedType.Get(name);
@@ -261,14 +262,13 @@ public static class TypeParser
             }
             finally
             {
-                expanding.Remove(name);
+                expanding.Remove(expKey);
             }
         }
 
-        // Check CLOS class registry: exact symbol lookup first (respects package),
-        // then fallback by name for symbols without home package or unregistered packages.
-        var cls = Runtime.FindClassOrNil(sym) as LispClass
-                  ?? Runtime.FindClassByName(name);
+        // Check CLOS class registry by symbol. A symbol that names no class is not
+        // resolved to a same-named class from another package.
+        var cls = Runtime.FindClassOrNil(sym) as LispClass;
         if (cls != null)
         {
             var ct = new ClassCType(cls);
@@ -544,8 +544,7 @@ public static class TypeParser
 
     private static CType ParseCompoundDeftype(Symbol head, LispObject? args, HashSet<string>? expanding)
     {
-        if (!Runtime.TryGetQualifiedTypeExpander(head, out var expander)
-            && !Runtime.TypeExpanders.TryGetValue(head.Name, out expander!))
+        if (!Runtime.TryGetTypeExpander(head, out var expander))
             return NamedType.Get(head.Name);
 
         expanding ??= new HashSet<string>();
@@ -889,14 +888,16 @@ public static class CTypeOps
         if (Runtime.CheckSubtypeByName(n1.Name, n2.Name))
             return (true, true);
         // Also check CLOS class registry for user-defined types
-        if (Runtime.FindClassByName(n1.Name) is LispClass cls1)
+        // A NamedType is a built-in or unknown name (a symbol naming a class parses to
+        // ClassCType), so only dotcl's own classes are looked up by name here.
+        if (Runtime.FindSystemClassByName(n1.Name) is LispClass cls1)
         {
             foreach (var c in cls1.ClassPrecedenceList)
                 if (c.Name.Name == n2.Name) return (true, true);
         }
         // Only definitive if BOTH types are known (built-in or CLOS class)
-        bool n1Known = Runtime.IsBuiltinTypeName(n1.Name) || Runtime.FindClassByName(n1.Name) != null;
-        bool n2Known = Runtime.IsBuiltinTypeName(n2.Name) || Runtime.FindClassByName(n2.Name) != null;
+        bool n1Known = Runtime.IsBuiltinTypeName(n1.Name) || Runtime.FindSystemClassByName(n1.Name) != null;
+        bool n2Known = Runtime.IsBuiltinTypeName(n2.Name) || Runtime.FindSystemClassByName(n2.Name) != null;
         if (n1Known && n2Known) return (false, true);
         return (false, false);  // Unknown type; can't be sure
     }
@@ -1189,6 +1190,12 @@ public static class CTypeOps
 
     private static (bool, bool) SubtypepClassNamed(ClassCType c1, NamedType n2)
     {
+        // A NamedType that is neither built-in nor one of dotcl's own classes came
+        // from a symbol naming nothing (a symbol naming a class parses to ClassCType),
+        // so a same-named class in the CPL is some other package's class.
+        if (!Runtime.IsBuiltinTypeName(n2.Name) && n2.Name is not ("T" or "NIL" or "*")
+            && Runtime.FindSystemClassByName(n2.Name) == null)
+            return (false, false);
         // Check CPL for the named type
         foreach (var c in c1.Class.ClassPrecedenceList)
             if (c.Name.Name == n2.Name) return (true, true);
@@ -1201,7 +1208,7 @@ public static class CTypeOps
     private static (bool, bool) SubtypepNamedClass(NamedType n1, ClassCType c2)
     {
         // Named type <: Class type: check if the named type is a known subclass
-        if (Runtime.FindClassByName(n1.Name) is LispClass cls)
+        if (Runtime.FindSystemClassByName(n1.Name) is LispClass cls)
         {
             foreach (var c in cls.ClassPrecedenceList)
                 if (ReferenceEquals(c, c2.Class) || c.Name.Name == c2.Class.Name.Name)

@@ -44,6 +44,17 @@ public sealed class LispString : LispObject
     // of the image's life. Bulk readers use this instead.
     internal ReadOnlySpan<char> Chars => _chars is { } c ? c : _str.AsSpan();
 
+    // The two backings, exposed for reading only. A per-element read through
+    // LENGTH and then the indexer asks which backing is live twice, and the
+    // JIT keeps both questions in the loop: on a 1 MB scan that second test,
+    // and the bounds check that goes with it, cost more than the character
+    // load. A caller that selects the backing once can read its length and its
+    // element off the same object. Neither is a licence to write: a write has
+    // to go through the indexer or RAWCHARS so that the copy-on-write
+    // invariant (at most one backing live) is maintained.
+    internal char[]? CharsOrNull => _chars;
+    internal string? StrOrNull => _str;
+
     // Bulk access for Array.Fill / Array.Copy optimizations: forces materialization
     internal char[] RawChars
     {
@@ -144,8 +155,30 @@ public sealed class LispChar : LispObject
         DotCL.Diagnostics.AllocCounter.Inc("LispChar");
     }
 
-    public static LispChar Make(char value) =>
-        value < 128 ? AsciiCache[value] : new LispChar(value);
+    // Every character is one object, not just ASCII: EQ on characters is
+    // implementation-dependent in the standard, but every mainstream
+    // implementation makes it true for the same character, and libraries rely on
+    // it (cl-ppcre's charset compares stored characters with EQ, and missed
+    // every non-ASCII member when (code-char 200) was a fresh object each time).
+    // Two-level and filled lazily, so a program that never leaves ASCII pays
+    // nothing; CompareExchange so two threads cannot publish different objects
+    // for one character.
+    private static readonly LispChar?[]?[] Pages = new LispChar?[]?[256];
+
+    public static LispChar Make(char value)
+    {
+        if (value < 128) return AsciiCache[value];
+        var page = Pages[value >> 8];
+        if (page == null)
+        {
+            System.Threading.Interlocked.CompareExchange(ref Pages[value >> 8], new LispChar?[256], null);
+            page = Pages[value >> 8]!;
+        }
+        var c = page[value & 0xFF];
+        if (c != null) return c;
+        System.Threading.Interlocked.CompareExchange(ref page[value & 0xFF], new LispChar(value), null);
+        return page[value & 0xFF]!;
+    }
 
     public override string ToString()
     {

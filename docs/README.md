@@ -16,6 +16,8 @@ look; the documents below go deeper on one topic each.
 - [SDK and MSBuild properties](sdk.md): every property a Lisp build reads,
   and which knob adds a dependency
 - [Packaging an app](dotcl-pack.md): turn an ASDF system into a dotnet tool
+- [The REPL](repl.md): starting one, the line editor, the init file, and what
+  happens when a form signals
 - [Writing scripts](scripting.md): arguments, exit codes, shebang, and how
   `--load` differs from a positional file
 - [Deliberate deviations](deviations.md): where dotcl knowingly differs from

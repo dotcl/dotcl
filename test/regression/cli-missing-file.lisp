@@ -64,9 +64,7 @@
 ;;; A present file still loads through the same path.
 (deftest cli-missing-file.load-present-file-still-works
   (let* ((path (concatenate 'string
-                            (substitute #\/ #\\ (or (dotcl:getenv "TMPDIR")
-                                                    (dotcl:getenv "TEMP")
-                                                    "/tmp"))
+                            (regression-temp-dir)
                             "/dotcl-cli-mf.lisp")))
     (with-open-file (s path :direction :output :if-exists :supersede)
       (write-string "(format t \"~&LOADED=~s~%\" :yes)" s))

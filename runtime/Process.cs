@@ -133,6 +133,123 @@ public sealed class LispProcess : LispObject
         return Process.ExitCode;
     }
 
+    /// <summary>A ProcessStartInfo that runs PROGRAM with ARGUMENTS, each argument
+    /// reaching the child as the same string.
+    ///
+    /// On Windows a .bat/.cmd file is not an executable: CreateProcess runs it as
+    /// cmd.exe /c with the whole command line, and cmd gives its own meaning to
+    /// % ^ &amp; | &lt; &gt; ( ) in it. The MSVCRT-style quoting .NET applies to
+    /// ArgumentList is not enough there: a&amp;b runs b, %PATH% is expanded. So for a
+    /// batch file the cmd.exe command line is built here instead, quoting for cmd
+    /// (the same scheme Rust's std::process uses):
+    ///   - an argument with anything but ASCII letters, digits and #$*+-./:?@\_ is
+    ///     put in double quotes, so the batch file sees it quoted in %1 (%~1 drops
+    ///     the quotes). Inside quotes cmd takes ^ &amp; | &lt; &gt; ( ) as text.
+    ///   - an embedded " is doubled, and backslashes before it or before the closing
+    ///     quote are doubled, so a batch file that forwards %* to an .exe hands it
+    ///     the original argument.
+    ///   - % is written as %%cd:~,% so that cmd never expands a variable reference.
+    ///   - delayed expansion (!), AutoRun commands and command extensions are pinned
+    ///     with /v:OFF /d /e:ON.
+    /// An argument with CR, LF or NUL cannot be passed this way (cmd ends the
+    /// command at a line break), so it is refused with an error.</summary>
+    internal static System.Diagnostics.ProcessStartInfo MakeStartInfo(
+        string program, System.Collections.Generic.IList<string> arguments)
+    {
+        if (Compat.IsWindows() && IsBatchFile(program))
+            return new System.Diagnostics.ProcessStartInfo(
+                System.IO.Path.Combine(System.Environment.SystemDirectory, "cmd.exe"),
+                BatchCommandLine(ResolveBatchFile(program), arguments));
+        var psi = new System.Diagnostics.ProcessStartInfo(program);
+        foreach (var a in arguments) Compat.AddArg(psi, a);
+        return psi;
+    }
+
+    private static bool IsBatchFile(string program)
+    {
+        // Windows ignores trailing dots and spaces in a file name: "x.bat. " is x.bat.
+        var p = program.TrimEnd('.', ' ');
+        return p.EndsWith(".bat", System.StringComparison.OrdinalIgnoreCase)
+            || p.EndsWith(".cmd", System.StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>The batch file's full path, found as CreateProcess would find it (the
+    /// current directory, then PATH); cmd.exe would search from the child's working
+    /// directory instead. A name that is not found is returned unchanged and cmd
+    /// reports it.</summary>
+    private static string ResolveBatchFile(string program)
+    {
+        if (program.IndexOfAny(new[] { '/', '\\', ':' }) >= 0)
+            return System.IO.Path.GetFullPath(program);
+        var here = System.IO.Path.Combine(System.Environment.CurrentDirectory, program);
+        if (System.IO.File.Exists(here)) return here;
+        var path = System.Environment.GetEnvironmentVariable("PATH") ?? "";
+        foreach (var dir in path.Split(System.IO.Path.PathSeparator))
+        {
+            if (dir.Length == 0) continue;
+            try
+            {
+                var cand = System.IO.Path.Combine(dir.Trim('"'), program);
+                if (System.IO.File.Exists(cand)) return cand;
+            }
+            catch (System.ArgumentException) { }
+        }
+        return program;
+    }
+
+    private static string BatchCommandLine(string script, System.Collections.Generic.IList<string> arguments)
+    {
+        if (script.IndexOf('"') >= 0 || script.EndsWith("\\"))
+            throw new LispErrorException(new LispError(
+                $"Cannot run batch file {script}: its name contains a double quote or ends with a backslash"));
+        // cmd.exe /c "<line>": cmd removes the first and the last quote of <line>.
+        var sb = new System.Text.StringBuilder("/e:ON /v:OFF /d /c \"\"");
+        foreach (char c in script) AppendForCmd(sb, c);
+        sb.Append('"');
+        for (int i = 0; i < arguments.Count; i++)
+        {
+            var arg = arguments[i];
+            if (arg.IndexOfAny(new[] { '\r', '\n', '\0' }) >= 0)
+                throw new LispErrorException(new LispError(
+                    $"Cannot pass argument {i + 1} to batch file {script}: cmd.exe cannot "
+                    + "receive a carriage return, line feed or NUL character in an argument"));
+            sb.Append(' ');
+            bool quote = arg.Length == 0;
+            foreach (char c in arg)
+                if (!(c < 128 && (char.IsLetterOrDigit(c) || "#$*+-./:?@\\_".IndexOf(c) >= 0)))
+                { quote = true; break; }
+            if (quote) sb.Append('"');
+            int backslashes = 0;
+            foreach (char c in arg)
+            {
+                if (c == '\\') { backslashes++; sb.Append(c); continue; }
+                if (c == '"')
+                {
+                    sb.Append('\\', backslashes);   // n backslashes become 2n before a quote
+                    sb.Append('"');                 // and the quote is doubled
+                }
+                AppendForCmd(sb, c);
+                backslashes = 0;
+            }
+            if (quote)
+            {
+                sb.Append('\\', backslashes);
+                sb.Append('"');
+            }
+        }
+        sb.Append('"');
+        return sb.ToString();
+    }
+
+    // A % is written as %%cd:~,% and comes out of cmd's expansion as a single %:
+    // the first % is kept and %cd:~,% (an empty substring of CD) expands to nothing,
+    // so no text between two percent signs is ever taken as a variable name.
+    private static void AppendForCmd(System.Text.StringBuilder sb, char c)
+    {
+        if (c == '%') sb.Append("%%cd:~,");
+        sb.Append(c);
+    }
+
     private static bool IsKw(LispObject o, string name) => o is Symbol s && s == Startup.Keyword(name);
     private static bool IsInherit(LispObject o) => o is T || IsKw(o, "INHERIT");
 
@@ -178,15 +295,12 @@ public sealed class LispProcess : LispObject
         if (FilePath(output) is string outPath0) CheckOutputExists(outPath0, ifOutputExists);
         if (!mergeErr && FilePath(error) is string errPath0) CheckOutputExists(errPath0, ifErrorOutputExists);
 
-        var psi = new System.Diagnostics.ProcessStartInfo(program)
-        {
-            UseShellExecute = false,
-            CreateNoWindow = true,
-            RedirectStandardInput = !IsInherit(input),
-            RedirectStandardOutput = !outInherit,
-            RedirectStandardError = mergeErr ? !outInherit : !IsInherit(error),
-        };
-        foreach (var a in arguments) Compat.AddArg(psi, a);
+        var psi = MakeStartInfo(program, arguments);
+        psi.UseShellExecute = false;
+        psi.CreateNoWindow = true;
+        psi.RedirectStandardInput = !IsInherit(input);
+        psi.RedirectStandardOutput = !outInherit;
+        psi.RedirectStandardError = mergeErr ? !outInherit : !IsInherit(error);
         if (!string.IsNullOrEmpty(directory)) psi.WorkingDirectory = directory;
         if (environment != null)
         {
@@ -211,7 +325,18 @@ public sealed class LispProcess : LispObject
             inStream = new LispOutputStream(proc.StandardInput);
         else if (FilePath(input) is string inPath)
             helpers.Add(Spawn("dotcl-feed-stdin", () => {
-                try { using var f = new System.IO.StreamReader(inPath); Copy(f, proc.StandardInput); }
+                // Copy the file's bytes as they are, as SBCL does when it hands the
+                // file to the child. Going through a TextReader/TextWriter pair would
+                // drop a leading BOM and mangle bytes that are not valid in the
+                // decoding encoding.
+                try
+                {
+                    using var f = new System.IO.FileStream(inPath, System.IO.FileMode.Open,
+                        System.IO.FileAccess.Read, System.IO.FileShare.ReadWrite);
+                    var sink = proc.StandardInput.BaseStream;
+                    f.CopyTo(sink);
+                    sink.Flush();
+                }
                 finally { try { proc.StandardInput.Close(); } catch { } }
             }));
         else if (!IsInherit(input))

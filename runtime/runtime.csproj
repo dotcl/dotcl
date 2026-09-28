@@ -74,6 +74,7 @@
     <Compile Remove="**/*.cs" />
     <Compile Include="Program.cs" />
     <Compile Include="PackRestamp.cs" />
+    <Compile Include="PackR2r.cs" />
   </ItemGroup>
 
   <ItemGroup>

@@ -50,6 +50,24 @@
    for out-of-process debuggers; this one is for the CL-native debugger.
    User-visible as DOTCL:*EMIT-FRAME-LOCALS* (the same symbol; Startup imports it).")
 
+
+(defvar *backing-arm* :both
+  "Which arm a hoisted element access emits.
+
+   :BOTH   the null test and both arms, for an access that is not inside a
+           body the caller unswitched.
+   :FAST   the bare ldelem only. Legal only where the caller has already
+           tested every hoisted buffer in scope and branched.
+   :HELPER the per-element helper only, for the copy the caller emits for the
+           case where some buffer was NIL.
+
+   The test is loop-invariant, so leaving it at the access is what costs: on
+   the array-walk kernel the per-access form turned a 7-instruction single
+   block with a fall-through back-edge into 11 instructions across 4 blocks,
+   because the test also stopped the JIT hoisting the data base and the length
+   out of the loop. Testing once and emitting the body twice puts the fast copy
+   back to the original block.")
+
 (defvar *compile-file-mode* nil
   "T when compiling via compile-file. Controls eval-when behavior per CLHS 3.2.3.1:
    :compile-toplevel -> eval at compile time, :load-toplevel -> emit CIL for load.")
@@ -187,10 +205,52 @@
    Not reset by compile-toplevel (defmacro has global effect).")
 
 (defvar *function-return-types* (make-hash-table :test #'eq :synchronized t)
-  "symbol -> return-type (currently only 'fixnum is honored).
-   Populated by (declaim (ftype (function (...) ret) name...)).
-   Used by fixnum-typed-p to recognize `(name args...)` as statically
-   fixnum-typed, which then enables native int64 paths in arithmetic.")
+  "symbol -> return-type.
+   Populated by (declaim (ftype (function (...) ret) name...)), and by the
+   return type inferred from a DEFUN body (see *INFERRED-RETURN-TYPE-NAMES*).
+   Read through FUNCTION-RETURN-TYPE, never directly, by fixnum-typed-p and
+   fixnum-leaf-range (FIXNUM), double-float-typed-p (DOUBLE-FLOAT, LONG-FLOAT),
+   single-float-typed-p (SINGLE-FLOAT) and single-value-form-p (atomic types),
+   which then enable the native int64 / r8 / r4 paths and skip the MV unwrap.")
+
+(defvar *inferred-return-type-names* (make-hash-table :test #'eq :synchronized t)
+  "symbol -> the compilation unit (see %RETURN-TYPE-UNIT) in which its
+   *FUNCTION-RETURN-TYPES* entry was inferred from a DEFUN body, or NIL when
+   it was inferred outside any unit. Absent for a declaimed entry.
+
+   A declaimed ftype is the user's promise about every definition of the name
+   and is honored everywhere. An inferred type describes one definition, and
+   CLHS 3.2.2.3 lets a call assume which definition it reaches only when the
+   caller is that definition itself (a recursive call) or is in the same file
+   as it. So FUNCTION-RETURN-TYPE answers an inferred entry only for those two
+   callers. Anything else (the REPL, a source LOAD, another file) compiles the
+   call without the type, and so stays correct when the function is later
+   redefined to return something else.")
+
+(defvar *return-type-self* nil
+  "The name of the DEFUN whose body is being compiled, for the recursive-call
+   case of FUNCTION-RETURN-TYPE.")
+
+(defun %return-type-unit ()
+  "The compilation unit an inferred return type is recorded against and
+   checked against. :CORE while cross-compiling the core (one closed unit).
+   Under COMPILE-FILE, the (truename . load-truename) pair: every COMPILE-FILE
+   binds a fresh truename object, and a source LOAD nested inside one (an
+   EVAL-WHEN at compile time) binds a fresh load truename, so the functions it
+   defines are not taken to be in the file. NIL otherwise."
+  (cond (*cross-compiling* :core)
+        ((and *compile-file-mode* *compile-file-truename*)
+         (cons *compile-file-truename* *load-truename*))
+        (t nil)))
+
+(defun %in-return-type-unit-p (unit)
+  "Is UNIT, as recorded by %RETURN-TYPE-UNIT, the unit being compiled now?"
+  (cond ((null unit) nil)
+        ((eq unit :core) (and *cross-compiling* t))
+        (t (and (not *cross-compiling*)
+                *compile-file-mode*
+                (eq (car unit) *compile-file-truename*)
+                (eq (cdr unit) *load-truename*)))))
 
 (defvar *symbol-macros* '()
   "Alist of (symbol . expansion) for symbol-macrolet. Dynamically scoped.")
@@ -333,6 +393,125 @@
    them.  True special operators are never affected: MACROLET cannot shadow those,
    and SPECIAL-OPERATOR-NAME-P excludes them.")
 
+(defvar *lexical-operators* '()
+  "Alist of the lexical operator bindings that decide what a macro call means at
+   the current position, innermost first: (NAME . EXPANDER) for a MACROLET
+   binding, (NAME) for an FLET / LABELS binding that hides a macro of the same
+   name. This is the CAR of the &ENVIRONMENT object (%LEXICAL-MACRO-ENVIRONMENT),
+   so MACROEXPAND-1 with that environment sees a local function hide a global
+   macro (CLHS 3.1.2.1.2.2) and a MACROLET binding win over a global macro.
+
+   An FLET name is only entered when it hides a macro (%FLET-MACRO-SHADOWS): an
+   entry for any other name would change no expansion, and keeping the list
+   empty keeps the environment NIL in the common case.")
+
+(defun %flet-macro-shadows (fn-defs)
+  "The names among the FLET / LABELS definitions FN-DEFS that are macros or
+   have a compiler macro at the current position, and so are hidden by the
+   local function inside its scope. Usually NIL."
+  (let ((out '()))
+    (dolist (d fn-defs (nreverse out))
+      (let ((name (and (consp d) (car d))))
+        (when (and name (symbolp name)
+                   (let ((e (assoc name *lexical-operators*)))
+                     (if e
+                         (cdr e)
+                         (or (find-macro-expander name)
+                             ;; A local function also hides a global compiler
+                             ;; macro, which COMPILER-MACRO-FUNCTION with this
+                             ;; environment has to see.
+                             (compiler-macro-function name)))))
+          (push name out))))))
+
+(defun %lexical-function-p (name)
+  "True when an FLET / LABELS binding in *LEXICAL-OPERATORS* hides the macro
+   NAME at the current position."
+  (let ((e (and *lexical-operators* (assoc name *lexical-operators*))))
+    (and e (null (cdr e)))))
+
+(defun %lexical-macro-p (name)
+  "True when the innermost lexical operator binding of NAME is a MACROLET, so
+   a local function of that name from an outer FLET / LABELS is hidden."
+  (let ((e (and *lexical-operators* (assoc name *lexical-operators*))))
+    (and e (cdr e) t)))
+
+(defun %mv-call-lambda-bind (form)
+  "When FORM is (MULTIPLE-VALUE-CALL #'(LAMBDA (&OPTIONAL v... [&REST r]) . body)
+   value-form), the shape the standard MULTIPLE-VALUE-BIND expansion has, return
+   the equivalent binding through the per-thread value snapshot:
+     (LET* ((#:p (%MV-CAPTURE value-form)) (v (%MV-NTH 0)) ...) . body)
+   Otherwise NIL.
+
+   MACROEXPAND-1 hands code walkers MULTIPLE-VALUE-BIND in that portable form,
+   and a walker that expands a body (iterate, cl-cont) gives it back to be
+   compiled. Compiled as a real call it would build a closure and a list of the
+   values; this keeps it as cheap as the MULTIPLE-VALUE-BIND written directly.
+   The analysis walks take the same rewrite, so both passes see one form.
+
+   Only plain variables: no defaults or supplied-p parameters. An &REST variable
+   must be declared IGNORE (or IGNORABLE), since nothing binds it here."
+  (let ((fn (cadr form))
+        (args (cddr form)))
+    (when (and (consp args) (null (cdr args)) (consp fn))
+      (let ((lam (cond ((and (eq (car fn) 'function) (consp (cdr fn)) (null (cddr fn))
+                             (consp (cadr fn)) (eq (car (cadr fn)) 'lambda))
+                        (cadr fn))
+                       ((eq (car fn) 'lambda) fn))))
+        (when (and lam (consp (cdr lam)) (consp (cadr lam))
+                   (eq (car (cadr lam)) '&optional))
+          (let ((vars '()) (rest nil) (ll (cdr (cadr lam))))
+            (flet ((plain-var (v)
+                     (and v (symbolp v) (not (eq v t)) (not (keywordp v))
+                          (not (member v lambda-list-keywords))
+                          (not (constantp v)))))
+              (loop
+                (cond ((null ll) (return))
+                      ((not (consp ll)) (return-from %mv-call-lambda-bind nil))
+                      ((eq (car ll) '&rest)
+                       (unless (and (consp (cdr ll)) (plain-var (cadr ll)) (null (cddr ll)))
+                         (return-from %mv-call-lambda-bind nil))
+                       (setq rest (cadr ll))
+                       (return))
+                      (t
+                       (let ((p (car ll)))
+                         ;; v, (v) or (v nil)
+                         (cond ((plain-var p) (push p vars))
+                               ((and (consp p) (plain-var (car p))
+                                     (or (null (cdr p))
+                                         (and (consp (cdr p)) (null (cadr p))
+                                              (null (cddr p)))))
+                                (push (car p) vars))
+                               (t (return-from %mv-call-lambda-bind nil))))
+                       (setq ll (cdr ll))))))
+            (let ((body (cddr lam)))
+              (when rest
+                ;; Drop REST from the leading IGNORE / IGNORABLE declarations; it
+                ;; is not bound any more. Without such a declaration the body may
+                ;; read it, so keep the call.
+                (let ((found nil) (out '()))
+                  (loop while (and (consp body) (consp (car body))
+                                   (eq (car (car body)) 'declare))
+                        do (let ((specs '()))
+                             (dolist (spec (cdr (car body)))
+                               (if (and (consp spec)
+                                        (member (car spec) '(ignore ignorable))
+                                        (member rest (cdr spec)))
+                                   (let ((others (remove rest (cdr spec))))
+                                     (setq found t)
+                                     (when others (push (cons (car spec) others) specs)))
+                                   (push spec specs)))
+                             (when specs (push (cons 'declare (nreverse specs)) out))
+                             (setq body (cdr body))))
+                  (unless found (return-from %mv-call-lambda-bind nil))
+                  (setq body (append (nreverse out) body))))
+              (let ((p (gensym "MVP")))
+                `(let* ((,p (%mv-capture ,(car args)))
+                        ,@(let ((i -1))
+                            (mapcar (lambda (v) (list v (list '%mv-nth (incf i))))
+                                    (nreverse vars))))
+                   (declare (ignorable ,p))
+                   ,@body)))))))))
+
 (defun special-operator-name-p (name)
   "True for the 25 CL special operators, which no lexical binding may shadow.
    Shared by the FLET/LABELS override check and the MACROLET one so the two
@@ -364,6 +543,38 @@
    between the two passes; preserving their shared-expansion contract (one
    expansion object reused across passes, important for gensym identity).")
 
+(defvar *expansion-uncacheable* nil
+  "Set to T by LOOKUP-SYMBOL-MACRO while a macro expander runs, when the
+   expansion used a global symbol macro in a context that cannot tell whether
+   an enclosing lexical binding shadows it (the analysis walks: see
+   *SM-WALKER-CONTEXT*). CACHED-MACROEXPAND then does not store the result, so
+   the code-generation pass expands the form again with the real *LOCALS*.")
+
+(defvar *sm-walker-context* nil
+  "T while an analysis walk (free-variable / mutation) runs a macro expander.
+   Those walks do not bind *LOCALS* for the bindings inside the form they
+   walk, and walk nested lambdas once per form independent of their
+   enclosing bindings, so a global symbol macro looked up there may in fact be
+   shadowed by a LET in the walked code.")
+
+(defvar *sm-walker-bound* :none
+  "The free-variable walk's bound-name list (BND) at the form being expanded,
+   or :NONE outside that walk. Names in it are lexical variables bound inside
+   the walked form, which shadow a symbol macro of the same name.")
+
+(defvar *sm-interp-env* :none
+  "The tree-walk interpreter's lexical ENV alist while it macroexpands a form,
+   or :NONE. LOOKUP-SYMBOL-MACRO resolves names against it there.")
+
+;; Proclaimed special here for LOOKUP-SYMBOL-MACRO; the value is given where the
+;; interpreter defines it (cil-forms.lisp).
+(defvar *%mini-symbol-macro-marker*)
+
+(defvar *sm-global-hits* nil
+  "Global symbol macros LOOKUP-SYMBOL-MACRO resolved inside an analysis walk.
+   The walk treats each as a possible reference to a variable of that name,
+   since the expansion it walks may be the wrong one.")
+
 (defun %macroexpand-scope= (a b)
   "Identity comparison of two macroexpand scopes (lists of eq markers)."
   (loop (cond ((eq a b) (return t))
@@ -394,9 +605,16 @@
              (cell (assoc *macroexpand-scope* by-scope :test #'%macroexpand-scope=)))
         (if cell
             (cdr cell)
-            (let ((result (with-phase "macroexpand" (funcall expander form))))
-              (setf (gethash form *macroexpand-cache*)
-                    (cons (cons *macroexpand-scope* result) by-scope))
+            (let ((result nil) (uncacheable nil))
+              (let ((*expansion-uncacheable* nil))
+                (setf result (with-phase "macroexpand" (funcall expander form))
+                      uncacheable *expansion-uncacheable*))
+              (if uncacheable
+                  ;; An enclosing expansion that embeds this one is just as
+                  ;; context-dependent, so it must not be cached either.
+                  (setf *expansion-uncacheable* t)
+                  (setf (gethash form *macroexpand-cache*)
+                        (cons (cons *macroexpand-scope* result) by-scope)))
               result)))
       (funcall expander form)))
 
@@ -432,6 +650,18 @@
    fixnum-typed-p reports them as fixnum. Values are boxed LispObject at
    the slot; unboxing happens inline in compile-as-long (castclass Fixnum
    + get_Value). Caller-side guarantee: the user's declaration contract.")
+
+(defvar *fixnum-wrap-licensed* nil
+  "When true, FIXNUM-TYPED-P also accepts +, -, *, 1+, 1- of fixnum-typed
+   operands that no range proof covers. COMPILE-AS-LONG computes those with the
+   raw, wrapping int64 op, so the value is right only modulo 2^64. That is
+   enough exactly where the result goes into a place declared FIXNUM (a
+   declared parameter of a native self-call, for instance): a result outside
+   int64 violates the declaration, and a wrapped one is the writer's problem.
+   Everywhere else the default NIL applies, and FIXNUM-TYPED-P means the int64
+   COMPILE-AS-LONG leaves is the exact value. Range proofs (EXPR-INT-RANGE)
+   and the operands of MOD, REM and a right shift, which look at the whole
+   value rather than its low bits, always ask with it NIL.")
 
 (defvar *character-locals* '()
   "List of symbol-name strings for lexical locals declared (character X) /
@@ -478,9 +708,10 @@
 (defparameter +cs-no-safepoint+ 23)
 (defparameter +cs-array-backing-locals+ 24)
 (defparameter +cs-native-char-locals+ 25)
+(defparameter +cs-struct-backing-locals+ 26)
 (defparameter +cstate-empty+
   (vector '() '() '() '() '() '() '() nil nil nil nil nil nil nil nil nil nil nil
-          '() '() '() '() '() nil '() '()))
+          '() '() '() '() '() nil '() '() '()))
 
 (defvar *cstate* +cstate-empty+
   "The key-verified table pack; see the section comment above. Participates
@@ -853,6 +1084,24 @@
    while (lookup-local NAME) still resolves to it."
   (svref *cstate* +cs-array-backing-locals+))
 
+(defun cstate-struct-backing-locals ()
+  "Alist (NAME-STRING KEY . BACKING-SYMBOL) of locals declared to hold a
+   structure that has raw slot storage, whose raw int64 array was fetched once
+   at binding time into BACKING-SYMBOL, an Int64[] slot.
+
+   A raw slot read or write on such a local is a bare ldelem/stelem at a
+   constant position against that slot, guarded by one test of the slot against
+   null, instead of a helper call that re-derives the array, the layout entry
+   and the position from the object on every access. BACKING-SYMBOL is null
+   whenever the fetch could not be made -- the wrong layout version, no raw
+   storage, not a structure -- and the null arm is the code that ran before, so
+   nothing about the answers or the errors changes.
+
+   KEY pins the binding exactly as the array table does: a consumer only trusts
+   the entry while (lookup-local NAME) still resolves to it, which is what
+   makes a shadowing binding or a closure re-key self-invalidating."
+  (svref *cstate* +cs-struct-backing-locals+))
+
 (defun cstate-numeric-array-locals ()
   "Alist (NAME-STRING KEY RANK LO . HI) of let locals proven to hold a
    numeric-backed array (make-array init with bounded-integer element type).
@@ -995,12 +1244,32 @@ through to compile-sym-lookup."
                  (symbol-function s)))))
       (when fn (funcall fn sym)))))
 
+(defun %standard-special-p (sym)
+  "True when SYM is one of the special variables the standard defines in
+   COMMON-LISP: every external CL symbol named *...* (the standard gives
+   earmuffs to exactly those), plus the REPL variables + ++ +++ - / // ///
+   (* ** *** are covered by the earmuff test, * by the list).
+   While cross-compiling, %RUNTIME-SPECIAL-P cannot answer and nothing DEFVARs
+   these, so without this a LET of *PACKAGE* or *PRINT-LENGTH* in the core
+   would bind lexically. By name, so it holds on any host's CL symbols."
+  (let ((pkg (symbol-package sym)))
+    (and pkg
+         (string= (package-name pkg) "COMMON-LISP")
+         (let ((name (symbol-name sym)))
+           (and (eq (nth-value 1 (find-symbol name pkg)) :external)
+                (or (and (> (length name) 1)
+                         (char= (char name 0) #\*)
+                         (char= (char name (1- (length name))) #\*))
+                    (member name '("*" "+" "++" "+++" "-" "/" "//" "///")
+                            :test #'string=)))))))
+
 (defun special-var-p (sym)
   "Check if a symbol is a special (dynamic) variable (includes locally declared specials).
    Matching is by symbol identity. Specialness belongs to the symbol, so a
    DEFVAR of FOO in one package must not make another package's FOO special."
   (unless (symbolp sym) (return-from special-var-p nil))
   (or (member sym *specials*)
+      (and *cross-compiling* (%standard-special-p sym))
       (%runtime-special-p sym)))
 
 (defun global-special-p (sym)
@@ -1009,6 +1278,7 @@ through to compile-sym-lookup."
    By symbol identity, as in SPECIAL-VAR-P."
   (unless (symbolp sym) (return-from global-special-p nil))
   (or (member sym *global-specials*)
+      (and *cross-compiling* (%standard-special-p sym))
       (%runtime-special-p sym)))
 
 (defun same-var-package-p (k sym-pkg)
@@ -1477,11 +1747,43 @@ the literal and the next compilation inherits it."
                               :key (lambda (k) (if (and (symbolp k) (symbol-package k))
                                                    (var-name k) nil))
                               :test #'string=)))))
-    (if cell
-        (values (cdr cell) t)
-        ;; Check global symbol macros from DEFINE-SYMBOL-MACRO
-        (multiple-value-bind (val found) (gethash sym *global-symbol-macros*)
-          (if found (values val t) (values nil nil))))))
+    (cond
+      ;; Under the tree-walk interpreter the lexical environment is its ENV
+      ;; alist, not *LOCALS* / *SYMBOL-MACROS*: a variable entry shadows, a
+      ;; symbol-macrolet entry is (name marker expansion).
+      ((listp *sm-interp-env*)
+       (let ((b (assoc sym *sm-interp-env*)))
+         (cond
+           ((and b (consp (cdr b)) (eq (cadr b) *%mini-symbol-macro-marker*))
+            (values (caddr b) t))
+           (b (values nil nil))
+           (cell (values (cdr cell) t))
+           (t (multiple-value-bind (val found) (gethash sym *global-symbol-macros*)
+                (if found (values val t) (values nil nil)))))))
+      ;; Inside the free-variable walk, a name bound by a LET / lambda within
+      ;; the walked form shadows any symbol macro visible here: the walk
+      ;; drops a name from BND where a SYMBOL-MACROLET inside rebinds it, but
+      ;; it does not remove shadowed entries from *SYMBOL-MACROS*.
+      ((and (listp *sm-walker-bound*) *sm-walker-bound*
+            (bnd-member-p sym *sm-walker-bound*))
+       (values nil nil))
+      (cell (values (cdr cell) t))
+      ;; A lexical variable binding of the same name shadows a global symbol
+      ;; macro (CLHS 3.1.1). Lexical symbol macros are removed from
+      ;; *SYMBOL-MACROS* when LET binds the name, but the global table is not
+      ;; scoped, so it has to be checked against *LOCALS* here. Without this,
+      ;; SETQ / SETF / INCF of a LET-bound name used the global expansion.
+      ((local-entry sym) (values nil nil))
+      (t
+       ;; Check global symbol macros from DEFINE-SYMBOL-MACRO
+       (multiple-value-bind (val found) (gethash sym *global-symbol-macros*)
+         (cond
+           ((not found) (values nil nil))
+           (t
+            (when *sm-walker-context*
+              (setf *expansion-uncacheable* t)
+              (push sym *sm-global-hits*))
+            (values val t))))))))
 
 (defun compile-var-ref (sym)
   "Compile a variable reference."
@@ -1558,6 +1860,7 @@ the literal and the next compilation inherits it."
              (let ((pkg (symbol-package (car expr))))
                (and pkg (member (package-name pkg) '("SB-INT" "SB-IMPL") :test #'string=))))
     (setf expr (macroexpand-1 expr)))
+  (setf expr (fold-constant-symbol expr))
   (cond
     ((integerp expr)
      (if (typep expr '(integer #.(- (expt 2 63)) #.(1- (expt 2 63))))
@@ -1588,9 +1891,13 @@ the literal and the next compilation inherits it."
   "Compile expression. Unwraps MvReturn unless in MV-propagating position.
    Tail positions (*in-tail-position* t) propagate MV to the caller.
    MV-context positions (*in-mv-context* t, e.g. inside multiple-value-list)
-   also propagate. Single-value forms never produce MvReturn so no unwrap."
+   also propagate. Single-value forms never produce MvReturn so no unwrap.
+   A structure slot read is single-valued too, but it is not recognisable from
+   the form alone, so it is settled from the code that was actually emitted
+   (STRUCT-SLOT-READ-EMITTED-P)."
   (let ((code (compile-expr-raw expr)))
-    (let ((c2 (if (or *in-mv-context* *in-tail-position* (single-value-form-p expr))
+    (let ((c2 (if (or *in-mv-context* *in-tail-position* (single-value-form-p expr)
+                      (struct-slot-read-emitted-p expr code))
                   code
                   `(,@code (:call "Runtime.UnwrapMv")))))
       ;; Debug info: prepend a source-span marker for literally-written cons forms
@@ -1607,8 +1914,10 @@ the literal and the next compilation inherits it."
    Forces unwrap even in MV context. Used at positions that must always be single-valued."
   (if (single-value-form-p expr)
       (compile-expr-raw expr)
-      `(,@(compile-expr-raw expr)
-        (:call "Runtime.UnwrapMv"))))
+      (let ((code (compile-expr-raw expr)))
+        (if (struct-slot-read-emitted-p expr code)
+            code
+            `(,@code (:call "Runtime.UnwrapMv"))))))
 
 ;;; ============================================================
 ;;; Form dispatch
@@ -1619,17 +1928,24 @@ the literal and the next compilation inherits it."
 
 (defun %reify-macro-environment ()
   "Reify the compiler's current lexical macro / symbol-macro scope into the
-   (macros-ht . symbol-macros-ht) environment object that macroexpand-1 and
+   (lexical-operators . symbol-macros-ht) environment object that macroexpand-1 and
    macroexpand read (see the MACROEXPAND-1 runtime). Macro expanders built by
    defmacro/macrolet call this to supply &environment, so a macro can
    macroexpand-1 a symbol-macro that is lexically in scope at the call site;
    e.g. serapeum with-boolean's %all-branches% channel. *macros* is
    already a hash table; the symbol-macro side is keyed by symbol-name.
-   Returns NIL when no lexical symbol-macro is in scope (top-level / the common
-   case), so a macro's (if env ...) still reads a null environment there; only
-   a real symbol-macrolet scope produces a non-NIL reified env."
-  (when *symbol-macros*
-    (cons *macros*
+   Returns NIL when no lexical symbol-macro or operator binding is in scope
+   (top-level / the common case), so a macro's (if env ...) still reads a null
+   environment there."
+  (when (or *symbol-macros* *lexical-operators*)
+    (%lexical-macro-environment)))
+
+(defun %lexical-macro-environment ()
+  "The (lexical-operators . symbol-macros-ht) environment for the current
+   position, even when both are empty. The CAR is *LEXICAL-OPERATORS*, which
+   MACROEXPAND-1 searches before the global macro tables."
+  (cons *lexical-operators*
+        (when *symbol-macros*
           (let ((ht (make-hash-table :test #'equal)))
             ;; *symbol-macros* is innermost-first (compile-symbol-macrolet prepends
             ;; new bindings), so on nested same-name symbol-macrolet the FIRST entry
@@ -1727,20 +2043,10 @@ the literal and the next compilation inherits it."
        ;; COMPILE-MACROLET registers its expanders in *MACROS* for the extent of
        ;; the body, so the globals are the right source there.
        ;;
-       ;; Shape either way: (macro-table . symbol-macro-table), which is what
-       ;; MACROEXPAND-1 destructures.
+       ;; Shape either way: (lexical-operators . symbol-macro-table), which is
+       ;; what MACROEXPAND-1 destructures.
        `(lambda (form &optional ,env-arg)
-          (let ((,env-var (or ,env-arg
-                              (cons *macros*
-                                    ;; Innermost first: SYMBOL-MACROLET pushes onto
-                                    ;; *SYMBOL-MACROS*, so an outer binding of the
-                                    ;; same name sits behind the inner one and must
-                                    ;; not overwrite it (CLHS 5.1.2.1).
-                                    (let ((ht (make-hash-table :test #'equal)))
-                                      (dolist (entry *symbol-macros* ht)
-                                        (let ((key (symbol-name (car entry))))
-                                          (unless (nth-value 1 (gethash key ht))
-                                            (setf (gethash key ht) (cdr entry))))))))))
+          (let ((,env-var (or ,env-arg (%lexical-macro-environment))))
             (destructuring-bind ,clean-params (cdr form)
               ,@mbody))))
       (t
@@ -1792,6 +2098,42 @@ the literal and the next compilation inherits it."
    carries no proclamations of its own."
   (and *global-notinline-p-fn* (funcall *global-notinline-p-fn* sym)))
 
+(defun function-return-type (name)
+  "The return type a call to the global function NAME may be compiled against,
+   or NIL. A declaimed ftype always answers. An inferred one answers only for a
+   recursive call from NAME's own body, or for a call in the same unit
+   (COMPILE-FILE, or the core build) as the definition it was inferred from,
+   and not when NAME is NOTINLINE (CLHS 3.2.2.3). The caller must still rule out
+   a local function of the same name."
+  (multiple-value-bind (ty found) (gethash name *function-return-types*)
+    (when found
+      (multiple-value-bind (unit inferred) (gethash name *inferred-return-type-names*)
+        (cond ((not inferred) ty)
+              ((or (member name *notinline-functions*)
+                   (%global-notinline-p name))
+               nil)
+              ((eq name *return-type-self*) ty)
+              ((%in-return-type-unit-p unit) ty)
+              (t nil))))))
+
+(defun record-inferred-return-type (name type)
+  "Record TYPE (NIL: nothing could be inferred) as the inferred return type of
+   the DEFUN of NAME being compiled, replacing an earlier inferred one: each
+   definition answers for itself. A declaimed entry is left alone. When the
+   same type is re-inferred outside any unit (COMPILE-FILE evaluating the same
+   DEFUN at compile time), the unit it was first recorded in is kept."
+  (multiple-value-bind (old found) (gethash name *function-return-types*)
+    (multiple-value-bind (old-unit inferred) (gethash name *inferred-return-type-names*)
+      (cond ((and found (not inferred)) nil)
+            ((null type)
+             (remhash name *function-return-types*)
+             (remhash name *inferred-return-type-names*))
+            (t
+             (let ((unit (%return-type-unit)))
+               (setf (gethash name *function-return-types*) type)
+               (setf (gethash name *inferred-return-type-names*)
+                     (if (and (null unit) found (equal old type)) old-unit unit))))))))
+
 (defvar *global-inline-p-fn*
   (ignore-errors
    (let ((sym (find-symbol "GLOBAL-INLINE-P" "DOTCL")))
@@ -1817,33 +2159,48 @@ the literal and the next compilation inherits it."
     n))
 
 (defun %inline-body-capturable-p (body params)
-  "True when substituting BODY at the current call site could bind one of its
-   free names to something the definition never meant.
+  "True when BODY, placed at the current lexical position, could have one of its
+   free names bound by something the text of BODY does not show.
 
-   The body was written at top level, so its free function names mean the GLOBAL
-   ones. Dropped verbatim inside a caller's FLET/LABELS of the same name, they
-   would silently mean the caller's local function instead; the classic
-   inline-hygiene bug, and a wrong ANSWER, not just wrong speed. MACROLET can do
-   the same to any name at all, and its bindings live in the global macro table
-   while the scope is active, so there is nothing per-name to consult: an active
-   macrolet scope refuses the substitution outright.
+   Used at both ends of inline substitution. At a call site, the body was
+   recorded where no lexical binding captured its free names, so they mean the
+   GLOBAL ones; dropped verbatim inside a caller's FLET/LABELS, MACROLET or
+   SYMBOL-MACROLET of the same name they would silently mean the caller's local
+   binding instead, which is the classic inline-hygiene bug and a wrong ANSWER,
+   not just wrong speed. At the DEFUN, a body that uses a name bound by an
+   enclosing MACROLET (a top-level MACROLET around a group of DEFUNs is common)
+   cannot be recorded at all: substituted anywhere outside that MACROLET, the
+   local macro would compile as a call to an undefined function.
+
+   Only the names that actually appear in BODY matter, so a MACROLET that binds
+   unrelated names neither blocks the substitution nor the recording. An active
+   macro scope whose names are not known here (none of the lists below carries
+   any) refuses outright, as before.
 
    PARAMS are excluded because the expansion's own lambda binds them."
-  (or *macroexpand-scope*
-      (and (cstate-local-functions)
+  (let ((locals (cstate-local-functions)))
+    (cond ((and *macroexpand-scope*
+                (null *macrolet-shadowed*)
+                (null *symbol-macros*))
+           t)
+          ((not (or locals *macrolet-shadowed* *symbol-macros*))
+           nil)
+          (t
            (let ((hit nil))
              (labels ((walk (x)
                         (cond (hit nil)
                               ((symbolp x)
                                (when (and x (not (member x params))
-                                          (local-function-entry x))
+                                          (or (member x *macrolet-shadowed*)
+                                              (assoc x *symbol-macros*)
+                                              (and locals (local-function-entry x))))
                                  (setf hit t)))
                               ((consp x)
                                (unless (eq (car x) 'quote)
                                  (walk (car x))
                                  (walk (cdr x)))))))
                (walk body))
-             hit))))
+             hit)))))
 
 (defun maybe-expand-inline (op expr)
   "If OP names a function proclaimed INLINE whose definition was recorded, return
@@ -2069,9 +2426,18 @@ the literal and the next compilation inherits it."
         ;; common case, and what every user-defined compiler macro receives
         ;; (define-compiler-macro ignores its environment argument). Returning the
         ;; original form (eq) is the standard way to decline expansion.
-        (let ((expansion (funcall expander expr
-                                  (and (cstate-dotnet-typed-locals)
-                                       (dotnet-valid-typed-locals)))))
+        ;; A call whose arguments do not fit the compiler macro's lambda list
+        ;; makes the expander signal a PROGRAM-ERROR. As in SBCL, that is
+        ;; reported as a warning and the form is compiled as an ordinary call
+        ;; (a compiler macro is only ever an optional rewrite, CLHS 3.2.2.1),
+        ;; so the function itself gets to report the call, or accept it.
+        (let ((expansion
+                (handler-case (funcall expander expr
+                                       (and (cstate-dotnet-typed-locals)
+                                            (dotnet-valid-typed-locals)))
+                  (program-error (e)
+                    (warn "Error during compiler-macroexpansion of ~s: ~a" expr e)
+                    expr))))
           (unless (eq expansion expr) expansion))))))
 
 (defun compile-form (expr)
@@ -2117,9 +2483,11 @@ the literal and the next compilation inherits it."
       ;; Local flet/labels function override (shadowing built-ins):
       ;; Must come before hash dispatch so flet can shadow built-in functions.
       ;; CL special operators must never be shadowed by flet: explicitly excluded.
+      ;; Not when a MACROLET inside the FLET rebinds the name as a macro.
       (if (and (symbolp op)
                (not (special-operator-name-p op))
-               (local-function-entry op))
+               (local-function-entry op)
+               (not (%lexical-macro-p op)))
           ;; An INLINE declaration in the binding form substitutes the body
           ;; here instead of calling it, when the body still means the same
           ;; thing at this call site (MAYBE-EXPAND-LOCAL-INLINE).
@@ -2290,7 +2658,8 @@ the literal and the next compilation inherits it."
               ;; Preserves top-level-ness per CLHS 3.2.3.1.
               ((and (symbolp op)
                     (find-macro-expander op)
-                    (not (local-function-entry op)))
+                    (or (not (local-function-entry op))
+                        (%lexical-macro-p op)))
                (let* ((expander (find-macro-expander op))
                       (expanded (cached-macroexpand expr expander))
                       (*at-toplevel* *compile-was-toplevel*))
@@ -2435,21 +2804,37 @@ the literal and the next compilation inherits it."
 
 (defun %backing-slot-type (kind)
   "CIL local type for a KIND element buffer."
-  (ecase kind (1 "Byte[]") (2 "UInt16[]") (3 "Int32[]") (4 "Int64[]")))
+  (ecase kind (1 "Byte[]") (2 "UInt16[]") (3 "Int32[]") (4 "Int64[]")
+         (:char "Char[]")))
 
 (defun %backing-fetch-call (kind)
-  "Runtime entry that checks the declaration once and returns the buffer."
-  (ecase kind
-    (1 "Runtime.BackingU8") (2 "Runtime.BackingU16")
-    (3 "Runtime.BackingI32") (4 "Runtime.BackingI64")))
+  "Runtime entry that checks the declaration once and returns the buffer.
+
+   Above (safety 0) the *Checked entry: it signals a TYPE-ERROR where the plain
+   one answers null for a non-simple array (adjustable, fill-pointered,
+   displaced), which a SIMPLE-* declaration says the value is not. At (safety 0)
+   the declaration is trusted, and the null sends each access to the
+   per-element helper, which reads the right values. The branch is on the path
+   the plain fetch takes when it declines, so a true declaration pays nothing."
+  (if (compiling-at-safety-0-p)
+      (ecase kind
+        (1 "Runtime.BackingU8") (2 "Runtime.BackingU16")
+        (3 "Runtime.BackingI32") (4 "Runtime.BackingI64")
+        (:char "Runtime.BackingChars"))
+      (ecase kind
+        (1 "Runtime.BackingU8Checked") (2 "Runtime.BackingU16Checked")
+        (3 "Runtime.BackingI32Checked") (4 "Runtime.BackingI64Checked")
+        (:char "Runtime.BackingCharsChecked"))))
 
 (defun %backing-ldelem (kind)
   "Element load leaving a raw int64."
-  (ecase kind (1 :ldelem-u1) (2 :ldelem-u2) (3 :ldelem-i4) (4 :ldelem-i8)))
+  (ecase kind (1 :ldelem-u1) (2 :ldelem-u2) (3 :ldelem-i4) (4 :ldelem-i8)
+         (:char :ldelem-u2)))
 
 (defun %backing-stelem (kind)
   "Element store taking a raw int64 (the narrowing conv is in the opcode)."
-  (ecase kind (1 :stelem-u1) (2 :stelem-u2) (3 :stelem-i4) (4 :stelem-i8)))
+  (ecase kind (1 :stelem-u1) (2 :stelem-u2) (3 :stelem-i4) (4 :stelem-i8)
+         (:char :stelem-u2)))
 
 (defun %backing-store-check (kind)
   "Runtime entry that signals the element-type violation an out-of-width store
@@ -2458,7 +2843,150 @@ the literal and the next compilation inherits it."
    opcode without this would wrap the value instead."
   (ecase kind
     (1 "Runtime.CheckStoreU8") (2 "Runtime.CheckStoreU16")
-    (3 "Runtime.CheckStoreI32") (4 nil)))
+    (3 "Runtime.CheckStoreI32") (4 nil) (:char nil)))
+
+
+(defun %simple-string-backing-kind (type)
+  "The :CHAR backing kind for a SIMPLE-STRING type specifier of rank 1, else NIL.
+
+   Accepts the names CL gives the same thing -- SIMPLE-STRING and
+   SIMPLE-BASE-STRING -- and the spelled-out (SIMPLE-ARRAY CHARACTER (*)) with
+   its BASE-CHAR and STANDARD-CHAR variants.
+
+   Unlike %SIMPLE-ARRAY-BACKING-KIND this carries no safety argument of its own,
+   because the declaration is not one here: a plain (MAKE-ARRAY n
+   :element-type 'CHARACTER) is a simple string under CLHS while being a
+   LispVector rather than a LispString, and programs pass adjustable and
+   displaced character vectors under the declaration (SIMPLE-STRING-P used to
+   accept them). The soundness lives entirely in Runtime.BackingChars, which
+   takes the char[] of a LispString or of a simple rank-1 character LispVector
+   and answers null for everything it cannot pin, and in the null arm every access
+   carries. Above (safety 0) the fetch is BackingCharsChecked, which signals for
+   the one case that is certainly a false declaration, a non-simple array, and
+   still answers null for the rest."
+  (labels ((char-elt-p (e)
+             (and (symbolp e)
+                  (member (symbol-name e) '("CHARACTER" "BASE-CHAR" "STANDARD-CHAR")
+                          :test #'string=))))
+    (and (or (and (symbolp type)
+                  (member (symbol-name type) '("SIMPLE-STRING" "SIMPLE-BASE-STRING")
+                          :test #'string=))
+             (and (consp type)
+                  (symbolp (car type))
+                  (string= (symbol-name (car type)) "SIMPLE-ARRAY")
+                  (consp (cdr type))
+                  (char-elt-p (cadr type))
+                  (let ((dims (and (cddr type) (caddr type))))
+                    (and (consp dims) (null (cdr dims))
+                         (or (eq (car dims) '*) (integerp (car dims)))))))
+         :char)))
+
+;;; Checking a SIMPLE-* array declaration where the variable is bound.
+;;;
+;;; Above (safety 0) a binding declared SIMPLE-ARRAY / SIMPLE-STRING /
+;;; SIMPLE-BASE-STRING / SIMPLE-VECTOR / SIMPLE-BIT-VECTOR (the name or a
+;;; compound spec headed by it) signals a TYPE-ERROR when the value is an array
+;;; that is not simple: adjustable, fill-pointered or displaced. That is the one
+;;; way such a declaration can be false that the declaration-driven fast paths
+;;; would otherwise absorb silently, by falling back to the per-element helper.
+;;;
+;;; Where the element storage is hoisted, the prologue's fetch already tells a
+;;; non-simple array apart (see %BACKING-FETCH-CALL), so the check costs
+;;; nothing there and %CHECK-SIMPLE-DECL compiles to nothing. Everywhere else
+;;; it is one inlined type test per binding.
+;;;
+;;; Only the non-simple case is checked. A value that is not an array at all is
+;;; left to the operations that use it, as for every other declaration here.
+
+(defparameter +simple-array-type-names+
+  '("SIMPLE-ARRAY" "SIMPLE-STRING" "SIMPLE-BASE-STRING" "SIMPLE-VECTOR"
+    "SIMPLE-BIT-VECTOR"))
+
+(defun %simple-array-decl-spec-p (spec)
+  "T when SPEC names a type every member of which is a simple array: one of
+   +SIMPLE-ARRAY-TYPE-NAMES+ or a compound spec headed by one. Matched by
+   SYMBOL-NAME, like the backing kinds, across the cross-compile package split."
+  (let ((head (if (consp spec) (car spec) spec)))
+    (and head
+         (symbolp head)
+         (member (symbol-name head) +simple-array-type-names+ :test #'string=)
+         t)))
+
+(defun simple-array-declared-vars (decl-forms names)
+  "(VAR . SPEC) for each variable among NAMES (VAR-NAME strings) that the
+   DECLARE forms at the head of DECL-FORMS declare with a SIMPLE-* array type,
+   first declaration wins. A variable also declared IGNORE is left out, since
+   checking it would read it."
+  (let ((result '()) (ignored '()))
+    (dolist (form decl-forms)
+      (unless (and (consp form) (eq (car form) 'declare)) (return))
+      (dolist (decl (cdr form))
+        (when (consp decl)
+          (cond
+            ((and (symbolp (car decl))
+                  (member (symbol-name (car decl)) '("IGNORE" "IGNORABLE")
+                          :test #'string=))
+             (dolist (v (cdr decl))
+               (when (symbolp v) (push (var-name v) ignored))))
+            (t
+             (let* ((typed (and (symbolp (car decl))
+                                (string= (symbol-name (car decl)) "TYPE")))
+                    (spec (if typed (cadr decl) (car decl)))
+                    (vars (if typed (cddr decl) (cdr decl))))
+               (when (%simple-array-decl-spec-p spec)
+                 (dolist (v vars)
+                   (when (and (symbolp v) v
+                              (member (var-name v) names :test #'string=)
+                              (not (assoc (var-name v) result :test #'string=)))
+                     (push (list (var-name v) v spec) result))))))))))
+    (loop for (name v spec) in (nreverse result)
+          unless (member name ignored :test #'string=)
+            collect (cons v spec))))
+
+(defun simple-decl-check-forms (decl-forms names)
+  "The (%CHECK-SIMPLE-DECL VAR 'SPEC) statements for SIMPLE-ARRAY-DECLARED-VARS."
+  (loop for (v . spec) in (simple-array-declared-vars decl-forms names)
+        collect `(%check-simple-decl ,v (quote ,spec))))
+
+(defun insert-simple-decl-checks (body names)
+  "BODY with its SIMPLE-* declaration checks inserted right after its leading
+   DECLARE forms, for the variables among NAMES (symbols or VAR-NAME strings)
+   the form being compiled binds. BODY itself, EQ, when there is none."
+  (let* ((names (mapcar (lambda (n) (if (stringp n) n (var-name n))) names))
+         (checks (and names (simple-decl-check-forms body names))))
+    (if (null checks)
+        body
+        (let ((decls '()) (rest body))
+          (loop while (and rest (consp (car rest)) (eq (caar rest) 'declare))
+                do (push (pop rest) decls))
+          (append (nreverse decls) checks rest)))))
+
+(defun %hoisted-backing-entry-p (var)
+  "T when VAR's element storage is hoisted in the current scope (any kind), so
+   the prologue's fetch has already checked its declaration."
+  (and (symbolp var)
+       var
+       (boundp '*cstate*)
+       (let ((e (assoc (var-name var) (cstate-array-backing-locals)
+                       :test #'string=)))
+         (and e
+              (eq (lookup-local var) (second e))
+              (not (boxed-var-p var))
+              t))))
+
+(defun string-backing-entry (var)
+  "VAR's hoisted char[] entry, or NIL. Keyed and re-checked the way
+   ARRAY-BACKING-ENTRY is, so a shadow or a closure re-key self-invalidates."
+  (and (symbolp var)
+       var
+       (boundp '*cstate*)
+       (let ((e (assoc (var-name var) (cstate-array-backing-locals)
+                       :test #'string=)))
+         (and e
+              (eq (cdddr e) :char)
+              (eq (lookup-local var) (second e))
+              (not (boxed-var-p var))
+              e))))
 
 (defun array-backing-entry (expr)
   "For (AREF V IDX) on a rank-1 local with a hoisted element buffer, its
@@ -2475,9 +3003,56 @@ the literal and the next compilation inherits it."
        (let ((e (assoc (var-name (cadr expr)) (cstate-array-backing-locals)
                        :test #'string=)))
          (and e
+              (not (eq (cdddr e) :char))
               (eq (lookup-local (cadr expr)) (second e))
               (not (boxed-var-p (cadr expr)))
               e))))
+
+(defun struct-backing-slot (entry)
+  "The Int64[] slot holding ENTRY's hoisted raw slot array."
+  (third entry))
+
+(defun struct-backing-type (entry)
+  "The structure name ENTRY's binding was declared to hold. The fetch compares
+   it against the instance's own, because a position is read out of the
+   DECLARED structure's layout and another structure maps the same slot index
+   elsewhere."
+  (fourth entry))
+
+(defun struct-backing-version (entry)
+  "The structure layout version ENTRY's binding was compiled against. The fetch
+   compares it against the instance's, so a caller holding positions from an
+   older definition gets null and falls back rather than reading the wrong
+   slot -- the same thing the packed per-access constant does, asked once."
+  (fifth entry))
+
+(defun struct-backing-entry (obj packed)
+  "For a raw slot read or write at the constant PACKED index on the local
+   variable OBJ, (BACKING-ENTRY RAW-POSITION . KIND) when OBJ's raw slot array
+   was hoisted and the slot PACKED names is a raw one; else NIL.
+
+   Re-checks the binding key and the boxed flag exactly as ARRAY-BACKING-ENTRY
+   does, so a shadowing binding or a closure re-key self-invalidates.
+
+   PACKED carries the layout version the ACCESS was compiled against, and it
+   must be the version the BINDING was compiled against, or the position taken
+   from the binding's layout would describe a different definition. In one
+   image they always agree; the test is what keeps that from being an
+   assumption. When they disagree, or the slot is boxed, the access compiles
+   the way it does today, which is also what reports a stale layout."
+  (and (symbolp obj)
+       obj
+       (integerp packed)
+       (boundp '*cstate*)
+       (let ((e (assoc (var-name obj) (cstate-struct-backing-locals)
+                       :test #'string=)))
+         (and e
+              (eq (lookup-local obj) (second e))
+              (not (boxed-var-p obj))
+              (= (ash packed (- +slot-version-shift+)) (struct-backing-version e))
+              (let ((cell (nth (logand packed (1- (ash 1 +slot-version-shift+)))
+                               (cdr (cddddr e)))))
+                (and cell (>= (car cell) 0) (cons e cell)))))))
 
 (defun %array-type-numeric-info (type)
   "For an array type specifier (simple-array ELT DIMS) / (array ELT DIMS) /
@@ -2589,32 +3164,84 @@ the literal and the next compilation inherits it."
               (push (list* (var-name var) key info) result))))))
     result))
 
+(defun struct-accessor-array-info (expr)
+  "For (ACCESSOR OBJ) where ACCESSOR reads a structure slot declared to hold an
+   array whose element type gets an unboxed backing, the *numeric-array-locals*
+   info tail of that declaration -- (RANK LO . HI) or (RANK . :single/:double);
+   else NIL.
+
+   A slot read has no binding to hang a declaration on, so the slot's own :TYPE
+   is the only evidence there is. It is the same evidence FIXNUM-TYPED-P already
+   acts on for a slot declared to hold an integer, and it buys the same thing
+   here: without it, an array reached through its accessor rather than through a
+   declared local went down the generic per-element path even though the
+   declaration said exactly which backing it has.
+
+   Only the element read is decided here. The buffer is NOT hoisted (that is
+   ARRAY-BACKING-ENTRY, which requires a plain local), so a slot whose contents
+   contradict the declaration still falls back to the boxed path in the runtime
+   rather than being rejected -- the declaration stays a hint, as it is for a
+   parameter."
+  (and (consp expr)
+       (= (length expr) 2)
+       (symbolp (car expr))
+       (not (local-function-entry (car expr)))
+       (boundp '*struct-accessor-types*)
+       (let ((ty (gethash (car expr) *struct-accessor-types*)))
+         (and ty (%array-type-numeric-info ty)))))
+
 (defun numeric-array-aref-entry (expr)
   "If EXPR is (aref V IDX...) on a proven numeric-backed local with matching
    rank, return the info tail: (RANK LO . HI) for integer backing, or
    (RANK . :single/:double) for float backing; else NIL.
    numeric-array-aref-info / -float-kind split this by backing.
 
+   V may also be a structure accessor call whose slot is declared to hold such
+   an array (STRUCT-ACCESSOR-ARRAY-INFO), which is what puts
+   (AREF (ACC X) I) on the same element path as (AREF A I) on a declared local.
+
    The subscripts are not required to be statically fixnum-typed: what this
    answers is how the ELEMENT is stored, which does not depend on them
    (COMPILE-INDEX-TO-LONG lowers a subscript of any shape). Requiring it cost
    the whole unboxed path whenever a loop counter carried no declaration;
    fft's inner loops are (DO ((I J (+ I LE))) ...), and every element they
-   touched was boxed."
+   touched was boxed.
+
+   (ROW-MAJOR-AREF V I) is answered too, but only when V is rank 1: there the
+   row-major index IS the subscript (CLHS ROW-MAJOR-AREF), so the form reads
+   exactly the element (AREF V I) does and every consumer of this answer, which
+   takes the array and subscripts from (CADR EXPR) / (CDDR EXPR), compiles it
+   unchanged. It is admitted with exactly one subscript, so the rank check
+   below accepts only a rank-1 array. A higher rank would need a flat-index
+   entry the runtime helpers do not have, so it stays on the generic call.
+
+   A declaration the contents contradict fails as it does for AREF: the
+   helper's fallback subscripts the actual array with one index, which signals
+   for an array of another rank rather than reading a wrong element."
   (and (consp expr)
-       (eq (car expr) 'aref)
-       (not (local-function-entry 'aref))
+       (or (and (eq (car expr) 'aref)
+                (not (local-function-entry 'aref)))
+           (and (eq (car expr) 'row-major-aref)
+                (not (local-function-entry 'row-major-aref))
+                (consp (cdr expr))
+                (consp (cddr expr))
+                (null (cdddr expr))))
        (consp (cdr expr))
-       (symbolp (cadr expr))
        (boundp '*cstate*)
-       (let* ((v (cadr expr))
-              (idxs (cddr expr))
-              (entry (assoc (var-name v) (cstate-numeric-array-locals) :test #'string=)))
-         (and entry
-              (eq (lookup-local v) (second entry))
-              (not (boxed-var-p v))
-              (= (length idxs) (third entry))
-              (cddr entry)))))
+       (let ((v (cadr expr))
+             (idxs (cddr expr)))
+         (if (symbolp v)
+             (let ((entry (assoc (var-name v) (cstate-numeric-array-locals)
+                                 :test #'string=)))
+               (and entry
+                    (eq (lookup-local v) (second entry))
+                    (not (boxed-var-p v))
+                    (= (length idxs) (third entry))
+                    (cddr entry)))
+             (let ((info (struct-accessor-array-info v)))
+               (and info
+                    (= (length idxs) (car info))
+                    info))))))
 
 (defun numeric-array-aref-info (expr)
   "Integer-backed aref only: (RANK LO . HI), else NIL. The (cdr info) is a
@@ -2669,6 +3296,97 @@ the literal and the next compilation inherits it."
     ;; stays in int64, keeping the whole store expression native.
     ((let ((info (numeric-array-aref-info expr)))
        (and info (cdr info))))
+    ;; A structure slot declared to hold a bounded integer -> the DECLARED
+    ;; range. FIXNUM-TYPED-P has taken this leaf since the slot storage became
+    ;; raw, and COMPILE-AS-LONG has the matching STRUCT-SLOT-REF clause, but
+    ;; the third of the three places that decide raw int64 did not, so
+    ;; EXPR-INT-RANGE answered NIL and four downstream proofs failed together:
+    ;; 1+ / 1- stayed on Runtime.Increment, FIXNUM-BINOP-NATIVE-P refused the
+    ;; whole arithmetic expression, a subscript did not reach the raw element
+    ;; path, and a LET bound from a slot got no Int64 slot.
+    ;;
+    ;; The declared type, not the full fixnum range: a slot declared
+    ;; (SIGNED-BYTE 32) proves things a FIXNUM one cannot, and this is the
+    ;; only place that knows which it was.
+    ((and (consp expr) (= (length expr) 2) (symbolp (car expr))
+          (not (local-function-entry (car expr)))
+          (boundp '*struct-accessor-types*)
+          (let ((ty (gethash (car expr) *struct-accessor-types*)))
+            (and ty
+                 (let ((r (if (eq ty 'fixnum)
+                              (cons +int64-min+ +int64-max+)
+                              (integer-type-range ty))))
+                   (and r (range-fits-int64-p r) r))))))
+    ;; (char-code (schar s i)) -> [0, 65535]. FIXNUM-TYPED-P has taken this
+    ;; composition since COMPILE-AS-LONG grew the Runtime.CharCodeAtL lowering
+    ;; for it, but FIXNUM-LEAF-RANGE did not, so the range was NIL and the
+    ;; arithmetic around a string scan stayed generic even though the character
+    ;; code itself was already arriving as a raw int64.
+    ;;
+    ;; The bound is entirely an argument from the type, with no step that holds
+    ;; only on this machine. Every return of Runtime.CharCodeAtL is a C# char
+    ;; widened to long: the two string backings, the char[] of a LispVector,
+    ;; and Runtime.CharCode of a LispChar, whose Value is declared char. A
+    ;; System.Char is 16 bits unsigned, so [0, 65535] holds for the same reason
+    ;; the runtime type-checks, and CHAR-CODE-LIMIT is 65536 to match.
+    ((string-char-code-ref expr)
+     (cons 0 65535))
+    ;; (mod X N) / (rem X N) with a constant integer divisor -> the range the
+    ;; divisor forces. Unlike the three leaves above, the lowering here was
+    ;; ALREADY reachable: Runtime.ModFixnumL is emitted today for a mod whose
+    ;; operands are fixnum-typed. What was not reachable is the arithmetic
+    ;; AROUND it -- (* 3 (mod i 10)) lowered the mod natively and then called
+    ;; the generic multiply, because EXPR-INT-RANGE had nothing to say about
+    ;; the mod's result and so could not prove the product fits.
+    ;;
+    ;; Which is why this one has to be the TIGHT range and a conservative full
+    ;; int64 range would be worth nothing: [int64min, int64max] times [3,3]
+    ;; does not fit, so the enclosing proof fails exactly as it did before.
+    ;;
+    ;; The bounds are CLHS 12.1.3.1's sign rules and not a guess about
+    ;; magnitude. MOD takes the sign of the DIVISOR, so a positive N gives
+    ;; [0, N-1] and a negative one [N+1, 0]. REM takes the sign of the NUMBER,
+    ;; so either way it is [-(|N|-1), |N|-1]. A zero divisor is excluded
+    ;; because it has no result to bound, and the dividend must be
+    ;; fixnum-typed: (mod 5.5 2) is 1.5, and a float result has no integer
+    ;; range at all.
+    ((and (consp expr) (= (length expr) 3)
+          (member (car expr) '(mod rem))
+          (not (local-function-entry (car expr)))
+          (integerp (caddr expr))
+          (not (zerop (caddr expr)))
+          (fixnum-typed-p (cadr expr))
+          (let* ((d (caddr expr))
+                 (m (1- (abs d)))
+                 (r (if (eq (car expr) 'mod)
+                        (if (plusp d) (cons 0 m) (cons (- m) 0))
+                        (cons (- m) m))))
+            (and (range-fits-int64-p r) r))))
+    ;; (length x) -> [0, 2^31-1]. The other half of the same omission the slot
+    ;; clause above fixes: FIXNUM-TYPED-P has long taken LENGTH as an integer
+    ;; leaf, but FIXNUM-LEAF-RANGE never did, so EXPR-INT-RANGE answered NIL
+    ;; for it. COMPILE-AS-LONG has no LENGTH clause at all -- the generic
+    ;; call is correct and stays -- so everything this buys is downstream of
+    ;; the range: 1+ / 1- go native, FIXNUM-BINOP-NATIVE-P admits the whole
+    ;; expression, and a LET bound from a length earns an Int64 slot.
+    ;;
+    ;; Two arguments hold the bound up and they are not the same kind.
+    ;;
+    ;; From the type: all four returns of Runtime.Length are Fixnum.Make of a
+    ;; C# int -- 0 for NIL, the counter for a list, s.Length, v.Length -- and
+    ;; every one is non-negative. That is what gives [0, int32max], and it
+    ;; holds for the same reason the code type-checks.
+    ;;
+    ;; From the machine: the list arm counts into an int, so a list of more
+    ;; than 2^31 conses would overflow it. No such list exists -- 2^31 conses
+    ;; is 32 GB and the counting loop would not finish -- but that is an
+    ;; argument about this machine, not about the type. Anyone widening this
+    ;; bound, or reusing it where the count does not come from memory the
+    ;; process holds, is leaning on the second argument and should know it.
+    ((and (consp expr) (= (length expr) 2)
+          (eq (car expr) 'length)
+          (not (local-function-entry 'length)))
+     (cons 0 (1- (ash 1 31))))
     ;; Raw int64 local (native body) or declared-fixnum local -> full int64 range.
     ((and (symbolp expr)
           (boundp '*cstate*)
@@ -2697,6 +3415,13 @@ the literal and the next compilation inherits it."
     ((and (consp expr) (= (length expr) 2) (eq (car expr) '%dotimes-1+)
           (fixnum-typed-p (cadr expr)))
      (cons +int64-min+ +int64-max+))
+    ;; (logand X M) with M non-negative: [0, max M], and exact even when X is
+    ;; only right modulo 2^64 (see FIXNUM-TYPED-P).
+    ((and (consp expr) (= (length expr) 3) (eq (car expr) 'logand)
+          (let ((m (%logand-nonneg-operand (cadr expr) (caddr expr))))
+            (and m
+                 (fixnum-wrap-typed-p (if (eq m (cadr expr)) (caddr expr) (cadr expr)))
+                 (cons 0 (cdr (expr-int-range m)))))))
     ;; Bitwise results stay within int64 (conservatively the full range).
     ((and (consp expr) (= (length expr) 3)
           (member (car expr) '(logand logior logxor))
@@ -2712,8 +3437,7 @@ the literal and the next compilation inherits it."
      (cons +int64-min+ +int64-max+))
     ;; Declared-fixnum function return.
     ((and (consp expr) (symbolp (car expr))
-          (boundp '*function-return-types*)
-          (eq (gethash (car expr) *function-return-types*) 'fixnum)
+          (eq (function-return-type (car expr)) 'fixnum)
           (not (local-function-entry (car expr))))
      (cons +int64-min+ +int64-max+))
     (t nil)))
@@ -2731,13 +3455,48 @@ the literal and the next compilation inherits it."
   (if (and (consp expr) (member (car expr) '(+ - *)) (> (length expr) 3))
       (let ((op (car expr)))
         (reduce (lambda (a b) (list op a b)) (cdr expr)))
+      (fold-constant-symbol expr)))
+
+(defun foldable-constant-symbol-p (expr)
+  "True when EXPR is a symbol naming a constant variable whose value is a number
+   or a character, so a reference to it may be compiled as that literal.
+   CLHS 3.2.2.3 lets a reference to a constant variable be replaced by its
+   value, and DEFCONSTANT requires the value to be available at compile time
+   and to stay the same (a non-EQL redefinition has undefined consequences).
+   Only numbers and characters are folded: their identity is EQL, so a fresh
+   literal cannot be told apart from the value the symbol holds. A list or
+   string constant keeps its single object and stays a variable read.
+   Nothing is folded while cross-compiling: there the values come from the
+   host Lisp, whose constants are not the target's (MOST-POSITIVE-FIXNUM,
+   CHAR-CODE-LIMIT and friends differ between SBCL and dotcl)."
+  (and (symbolp expr)
+       expr
+       (not (eq expr t))
+       (not (keywordp expr))
+       (not *cross-compiling*)
+       (constantp expr)
+       (boundp expr)
+       (not (lookup-local expr))
+       (not (nth-value 1 (lookup-symbol-macro expr)))
+       (typep (symbol-value expr) '(or number character))))
+
+(defun fold-constant-symbol (expr)
+  "EXPR with a reference to a foldable constant (FOLDABLE-CONSTANT-SYMBOL-P)
+   replaced by its value; anything else unchanged. Applied where the typed
+   paths look at a form before compiling it, so a constant is seen as the
+   literal it stands for: (setf (aref a i) +k+) then takes the same raw store
+   as (setf (aref a i) 1) instead of reading the symbol through the dynamic
+   binding lookup and falling to the generic store."
+  (if (foldable-constant-symbol-p expr)
+      (symbol-value expr)
       expr))
 
 (defun expr-int-range (expr)
   "Provable inclusive integer range (lo . hi) for EXPR computed entirely within
    int64, or NIL if unknown or any intermediate +/-/*/1+/1- result could exceed
    int64. Used to gate the raw unboxed arithmetic path."
-  (let ((expr (fold-nary-arith expr)))
+  (let ((expr (fold-nary-arith expr))
+        (*fixnum-wrap-licensed* nil))
   (cond
     ((integerp expr) (cons expr expr))
     ((and (consp expr) (= (length expr) 3) (member (car expr) '(+ - *)))
@@ -2751,6 +3510,18 @@ the literal and the next compilation inherits it."
        (and ra
             (let ((r (range-arith (if (eq (car expr) '1+) '+ '-) ra '(1 . 1))))
               (and (range-fits-int64-p r) r)))))
+    ;; (if c a b): the value is one arm or the other, so its range is the
+    ;; union of theirs. Both arms are needed: a two-armed IF answers NIL when
+    ;; the test fails. FIXNUM-TYPED-P and COMPILE-AS-LONG already take this
+    ;; shape (raw int64 on each path); without the union here every consumer
+    ;; that asks for a proof -- 1+ / 1-, the binop fast path, an Int64 slot's
+    ;; init -- saw no range and compiled the IF boxed, arms included.
+    ((and (consp expr) (eq (car expr) 'if) (= (length expr) 4))
+     (let ((ra (expr-int-range (caddr expr))))
+       (and ra
+            (let ((rb (expr-int-range (cadddr expr))))
+              (and rb
+                   (cons (min (car ra) (car rb)) (max (cdr ra) (cdr rb))))))))
     (t (fixnum-leaf-range expr)))))
 
 (defun fixnum-binop-native-p (op args)
@@ -2807,13 +3578,43 @@ the literal and the next compilation inherits it."
               (not (local-function-entry (car inner)))
               (cons (cadr inner) (caddr inner))))))
 
+(defun fixnum-exact-p (expr)
+  "True when COMPILE-AS-LONG of EXPR yields EXPR's exact value, not just its low
+   64 bits: FIXNUM-TYPED-P with *FIXNUM-WRAP-LICENSED* NIL. Callers that may
+   themselves run under the license (the fixnum-typed-p clauses for MOD, REM,
+   ASH) use this for the operands whose high bits they read."
+  (let ((*fixnum-wrap-licensed* nil))
+    (fixnum-typed-p expr)))
+
+(defun fixnum-wrap-typed-p (expr)
+  "FIXNUM-TYPED-P under *FIXNUM-WRAP-LICENSED*: COMPILE-AS-LONG of EXPR is
+   EXPR's value modulo 2^64. Only for a result that lands in a place declared
+   FIXNUM; see *FIXNUM-WRAP-LICENSED*."
+  (let ((*fixnum-wrap-licensed* t))
+    (fixnum-typed-p expr)))
+
+(defun %logand-nonneg-operand (a b)
+  "For (LOGAND A B), the operand whose exact value is known non-negative, or
+   NIL. LOGAND with a non-negative int64 keeps only bits below 63, and those
+   are the same in the wrapped and the true value of the other operand, so the
+   other one needs only FIXNUM-TYPED-P under the license."
+  (flet ((nonneg (x) (let ((r (expr-int-range x)))
+                       (and r (>= (car r) 0) (range-fits-int64-p r)
+                            (fixnum-exact-p x)))))
+    (cond ((nonneg b) b)
+          ((nonneg a) a)
+          (t nil))))
+
 (defun fixnum-typed-p (expr)
   "Return T if EXPR is statically known to produce a Fixnum value.
    Recognizes: literal integers in fixnum range, (the fixnum E),
    references to lexical locals declared fixnum (via *fixnum-locals*),
    calls to functions declared (declaim (ftype (function (...) fixnum) NAME)),
    and fixnum-typed arithmetic (+, -, *, 1+, 1-) whose operands are
-   themselves fixnum-typed."
+   themselves fixnum-typed and whose result a range proof keeps in int64.
+   The int64 COMPILE-AS-LONG leaves for such an EXPR is its exact value; under
+   *FIXNUM-WRAP-LICENSED* only its value modulo 2^64."
+  (setf expr (fold-constant-symbol expr))
   (cond
     ((integerp expr) (and (<= -4611686018427387904 expr 4611686018427387903)))
     ;; Direct Int64 local in native function body: already long, no unbox needed
@@ -2857,10 +3658,15 @@ the literal and the next compilation inherits it."
                 (let ((r (integer-type-range ty)))
                   (and r (range-fits-int64-p r))))))
      t)
+    ;; +, -, *: fixnum-typed operands are not enough. COMPILE-AS-LONG computes
+    ;; them with the raw int64 op, which wraps, so the result is exact only
+    ;; where a range proof says it fits -- or where the license says the low
+    ;; 64 bits are all the destination keeps.
     ((and (consp expr) (= (length expr) 3)
           (member (car expr) '(+ - *))
           (fixnum-typed-p (cadr expr))
-          (fixnum-typed-p (caddr expr)))
+          (fixnum-typed-p (caddr expr))
+          (or *fixnum-wrap-licensed* (expr-int-range expr)))
      t)
     ;; Three or more arguments: the same question about the left-associated form
     ;; the call stands for. Without this an index like (- n i 1) is not fixnum-
@@ -2869,7 +3675,8 @@ the literal and the next compilation inherits it."
      (fixnum-typed-p (fold-nary-arith expr)))
     ((and (consp expr) (= (length expr) 2)
           (member (car expr) '(1+ 1-))
-          (fixnum-typed-p (cadr expr)))
+          (fixnum-typed-p (cadr expr))
+          (or *fixnum-wrap-licensed* (expr-int-range expr)))
      t)
     ;; %dotimes-1+: dotimes-emitted increment whose result is asserted to fit
     ;; int64 (counter < limit at the increment site), fixnum-typed like 1+.
@@ -2877,17 +3684,31 @@ the literal and the next compilation inherits it."
           (eq (car expr) '%dotimes-1+)
           (fixnum-typed-p (cadr expr)))
      t)
-    ;; logand/logior/logxor with fixnum operands -> fixnum result
+    ;; logand/logior/logxor with fixnum operands -> fixnum result. Each bit of
+    ;; the result depends on the same bit of the operands only, so exact
+    ;; operands give an exact result and wrapped ones a wrapped one.
     ((and (consp expr) (= (length expr) 3)
           (member (car expr) '(logand logior logxor))
           (fixnum-typed-p (cadr expr))
           (fixnum-typed-p (caddr expr)))
      t)
-    ;; mod/rem of fixnums -> fixnum result (|r| < |divisor|, so no promotion)
+    ;; (logand X M) with M exact and non-negative is exact even when X is
+    ;; wrapped: only bits below 63 survive, and wrapping keeps those.
+    ;; (logand (+ a b) #xFFFFFFFF) is how 32-bit modular arithmetic is written.
+    ((and (consp expr) (= (length expr) 3)
+          (eq (car expr) 'logand)
+          (not *fixnum-wrap-licensed*)
+          (let ((m (%logand-nonneg-operand (cadr expr) (caddr expr))))
+            (and m
+                 (fixnum-wrap-typed-p (if (eq m (cadr expr)) (caddr expr) (cadr expr))))))
+     t)
+    ;; mod/rem of fixnums -> fixnum result (|r| < |divisor|, so no promotion).
+    ;; The operands must be exact: the remainder of a wrapped value is not the
+    ;; remainder of the true one.
     ((and (consp expr) (= (length expr) 3)
           (member (car expr) '(mod rem))
-          (fixnum-typed-p (cadr expr))
-          (fixnum-typed-p (caddr expr)))
+          (fixnum-exact-p (cadr expr))
+          (fixnum-exact-p (caddr expr)))
      t)
     ;; lognot with fixnum operand -> fixnum result
     ((and (consp expr) (= (length expr) 2)
@@ -2899,9 +3720,12 @@ the literal and the next compilation inherits it."
     ;; mod 64), so it is only safe to treat as a raw long when both operands are
     ;; constants and the folded result fits in int64. Negative shifts (right
     ;; shift) always shrink and stay in range.
+    ;; The shifted value must be EXACT (FIXNUM-EXACT-P), not merely
+    ;; fixnum-typed: a right shift exposes the high bits, which a wrapped
+    ;; product or sum has lost.
     ((and (consp expr) (= (length expr) 3)
           (eq (car expr) 'ash)
-          (fixnum-typed-p (cadr expr))
+          (fixnum-exact-p (cadr expr))
           (integerp (caddr expr))
           (let ((n (caddr expr)))
             (or (< n 0)
@@ -2945,8 +3769,7 @@ the literal and the next compilation inherits it."
     ;; Declared-fixnum function return: (name ...) where name has an
     ;; ftype declaration promising a fixnum result.
     ((and (consp expr) (symbolp (car expr))
-          (boundp '*function-return-types*)
-          (eq (gethash (car expr) *function-return-types*) 'fixnum)
+          (eq (function-return-type (car expr)) 'fixnum)
           ;; Must not be shadowed by a local flet/labels function.
           (not (local-function-entry (car expr))))
      t)
@@ -3013,6 +3836,7 @@ the literal and the next compilation inherits it."
 (defun compile-as-long (expr)
   "Compile EXPR leaving an int64 on the stack. Caller must have verified
    fixnum-typed-p; this routine assumes the invariant."
+  (setf expr (fold-constant-symbol expr))
   (cond
     ((integerp expr)
      `((:ldc-i8 ,expr)))
@@ -3029,7 +3853,8 @@ the literal and the next compilation inherits it."
           (string= (mangle-name (car expr)) (cstate-native-self-name))
           (not (local-function-entry (car expr)))
           (let ((n (length (cdr expr)))) (and (>= n 1) (<= n 4)))
-          (every #'fixnum-typed-p (cdr expr)))
+          ;; The parameters of a native self are all declared FIXNUM.
+          (every #'fixnum-wrap-typed-p (cdr expr)))
      (let ((n-args (length (cdr expr))))
        `(,(if (eq (cstate-self-fn-local) :arg0) '(:ldarg 0)
               `(:ldloc ,(cstate-self-fn-local)))
@@ -3122,7 +3947,11 @@ the literal and the next compilation inherits it."
     ;; mod/rem: leaves int64 on stack. The helpers carry CL's sign rules
     ;; (MOD follows the divisor, REM truncates); a raw CIL :rem would give REM's
     ;; answer for both.
-    ((and (consp expr) (= (length expr) 3) (member (car expr) '(mod rem)))
+    ;; The operands are re-checked for exactness because this can be reached
+    ;; under THE or under the license, where nobody asked about them; a wrapped
+    ;; operand takes the generic path through the fallback below.
+    ((and (consp expr) (= (length expr) 3) (member (car expr) '(mod rem))
+          (fixnum-exact-p (cadr expr)) (fixnum-exact-p (caddr expr)))
      `(,@(compile-long-binop-spilled (cadr expr) (caddr expr))
        (:call ,(if (eq (car expr) 'mod) "Runtime.ModFixnumL" "Runtime.RemFixnumL"))))
     ;; Bitwise ops: leaves int64 on stack (callers box if needed)
@@ -3135,12 +3964,14 @@ the literal and the next compilation inherits it."
     ;; ash with constant shift. fixnum-typed-p guarantees we only get here for a
     ;; negative shift (right shift, always safe) or a constant base whose folded
     ;; result fits int64: fold that to a literal so no overflowing SHL is emitted.
-    ((and (consp expr) (= (length expr) 3) (eq (car expr) 'ash) (integerp (caddr expr)))
+    ((and (consp expr) (= (length expr) 3) (eq (car expr) 'ash) (integerp (caddr expr))
+          (or (>= (caddr expr) 0) (fixnum-exact-p (cadr expr))))
      (let ((n (caddr expr)) (x (cadr expr)))
        (cond
          ((< n 0)
+          ;; Count capped at 63: CIL SHR takes it mod 64 (see COMPILE-ASH-FAST).
           `(,@(compile-as-long x)
-            (:ldc-i4 ,(- n))
+            (:ldc-i4 ,(min 63 (- n)))
             (:shr)))
          ((integerp x)
           `((:ldc-i8 ,(ash x n))))
@@ -3167,6 +3998,14 @@ the literal and the next compilation inherits it."
                   (fixnum-typed-p (cadr expr)) (fixnum-typed-p (caddr expr)))
              (and (member (car expr) '(1+ 1-)) (= (length expr) 2)
                   (fixnum-typed-p (cadr expr)))))))
+
+(defun fixnum-long-lowerable-p (expr)
+  "True when COMPILE-EXPR-TO-LONG lowers EXPR natively and exactly: either
+   FIXNUM-TYPED-P (exact), or top-level +, -, *, 1+, 1- of such operands, which
+   it computes with an overflow check. For destinations that need an int64 and
+   have no use for a bignum anyway -- an array subscript above all -- where an
+   overflow signalling is as good as a generic call signalling later."
+  (or (fixnum-typed-p expr) (checked-long-arith-p expr)))
 
 (defun compile-checked-long-arith (expr)
   "EXPR as a raw int64, checking for overflow rather than proving it away."
@@ -3207,7 +4046,7 @@ the literal and the next compilation inherits it."
    but an element's storage does not depend on the subscript. Requiring it meant
    an undeclared loop variable, the usual shape, (DO ((I 0 (1+ I))) ...), boxed
    every element the loop read."
-  (if (fixnum-typed-p expr)
+  (if (fixnum-long-lowerable-p expr)
       (compile-expr-to-long expr)
       `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
             (compile-expr expr))
@@ -3249,16 +4088,19 @@ the literal and the next compilation inherits it."
    Returns NIL if not applicable (non-constant shift)."
   (let ((x (first args))
         (n (second args)))
-    (when (and (fixnum-typed-p x) (integerp n))
+    (when (and (fixnum-exact-p x) (integerp n))
       (if (>= n 0)
           ;; Left shift can overflow int64 (and raw CIL shl masks count mod 64),
           ;; so route through Runtime.AshLeftLong which promotes to Bignum.
           `(,@(compile-as-long x)
             (:ldc-i4 ,n)
             (:call "Runtime.AshLeftLong"))
-          ;; Right shift of a fixnum-typed long always fits: native SHR is safe.
+          ;; Right shift of a fixnum-typed long always fits: native SHR is safe
+          ;; once the count is capped. CIL SHR takes the count mod 64, so
+          ;; (ash x -64) came back as x; any count >= 63 leaves only the sign
+          ;; (0 or -1), which is what SHR by 63 gives.
           `(,@(compile-as-long x)
-            (:ldc-i4 ,(- n))
+            (:ldc-i4 ,(min 63 (- n)))
             (:shr)
             (:call "Fixnum.Make"))))))
 
@@ -3276,6 +4118,7 @@ the literal and the next compilation inherits it."
 
    Anything else is left to the generic comparison: this is an optimization,
    and declining it can only cost speed."
+  (setf expr (fold-constant-symbol expr))
   (cond
     ((characterp expr) `((:ldc-i8 ,(char-code expr))))
     ;; A raw-code slot IS the code: the read is the whole operand. This is the
@@ -3388,6 +4231,18 @@ the literal and the next compilation inherits it."
 ;;; double) arithmetic with a final newobj DoubleFloat to box the result.
 ;;; ============================================================
 
+(defun %double-float-type-spec-p (ty)
+  "T for a type specifier that names the double-float format: DOUBLE-FLOAT,
+   LONG-FLOAT (the same format here, as the structure slot clause of
+   DOUBLE-FLOAT-TYPED-P already assumes), or a range of either."
+  (or (member ty '(double-float long-float))
+      (and (consp ty) (member (car ty) '(double-float long-float)))))
+
+(defun %single-float-type-spec-p (ty)
+  "T for SINGLE-FLOAT or a range of it."
+  (or (eq ty 'single-float)
+      (and (consp ty) (eq (car ty) 'single-float))))
+
 (defun double-float-typed-p (expr)
   "Return T if EXPR is statically known to produce a DoubleFloat value.
    Recognizes: (the double-float E), local vars declared double-float
@@ -3429,6 +4284,16 @@ the literal and the next compilation inherits it."
           (boundp '*struct-accessor-types*)
           (member (gethash (car expr) *struct-accessor-types*)
                   '(double-float long-float)))
+     t)
+    ;; Declared double-float function return: (name ...) where name has a
+    ;; return type promising a double (see FUNCTION-RETURN-TYPE for which
+    ;; inferred ones count). The fixnum sibling is the last clause of
+    ;; FIXNUM-TYPED-P. COMPILE-AS-DOUBLE lowers it through its generic
+    ;; fallback: the call, then an unbox of the returned DoubleFloat.
+    ((and (consp expr) (symbolp (car expr))
+          (%double-float-type-spec-p (function-return-type (car expr)))
+          ;; Must not be shadowed by a local flet/labels function.
+          (not (local-function-entry (car expr))))
      t)
     ((and (consp expr) (= (length expr) 3)
           (member (car expr) '(+ - * /))
@@ -3533,11 +4398,14 @@ the literal and the next compilation inherits it."
           (member (gethash (car expr) *struct-accessor-types*)
                   '(double-float long-float))
           (struct-slot-ref expr))
-     (let ((ref (struct-slot-ref expr)))
-       `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
-             (compile-expr (car ref)))
-         (:ldc-i4 ,(cdr ref))
-         (:call "Runtime.StructRefD"))))
+     (let* ((ref (struct-slot-ref expr))
+            (hit (struct-backing-entry (car ref) (cdr ref))))
+       (if (and hit (eql (cddr hit) 1))
+           (%struct-backing-read hit (car ref) (cdr ref))
+           `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
+                 (compile-expr (car ref)))
+             (:ldc-i4 ,(cdr ref))
+             (:call "Runtime.StructRefD")))))
     ;; aref on a double-float-backed array local -> raw r8 read, no box.
     ((eq (numeric-array-aref-float-kind expr) :double)
      (compile-numeric-aref-float (cadr expr) (cddr expr)
@@ -3659,7 +4527,7 @@ the literal and the next compilation inherits it."
    declared in many places is mentioned once rather than once per binding form.")
 
 (defun %declared-type-known-p (spec)
-  "How SPEC is known as a type (:DEFTYPE / :BUILTIN / :NAME / :CLASS), or NIL.
+  "How SPEC is known as a type (:DEFTYPE / :BUILTIN / :CLASS), or NIL.
    Only bare symbols are judged: a compound specifier's head is a separate
    question, and NIL/T reach here as their own objects rather than symbols."
   (cond ((null *known-type-name-p-fn*) :builtin)   ; cross-compile host: never warn
@@ -3858,6 +4726,7 @@ the literal and the next compilation inherits it."
    (CODE-CHAR N) is excluded for a harder reason: CLHS lets it answer NIL for a
    code at or above CHAR-CODE-LIMIT, and NIL is not a value a raw code slot can
    hold. The integer and float slots have no equivalent of that."
+  (setf expr (fold-constant-symbol expr))
   (or (characterp expr)
       (and (consp expr) (= (length expr) 3) (eq (car expr) 'schar)
            (not (local-function-entry 'schar)))))
@@ -3872,6 +4741,7 @@ the literal and the next compilation inherits it."
    two shapes leave an i8, and the comparison that consumes them cannot mix
    widths. Keeping the slot at i8 makes the hot read -- the comparison -- a bare
    LDLOC, and puts the one narrowing on the generic read, which is the rare one."
+  (setf expr (fold-constant-symbol expr))
   (cond
     ((characterp expr) `((:ldc-i8 ,(char-code expr))))
     ((character-typed-p expr)
@@ -3967,6 +4837,12 @@ the literal and the next compilation inherits it."
           (let ((ty (cadr expr)))
             (or (eq ty 'single-float)
                 (and (consp ty) (eq (car ty) 'single-float)))))
+     t)
+    ;; Declared single-float function return; see the same clause in
+    ;; DOUBLE-FLOAT-TYPED-P.
+    ((and (consp expr) (symbolp (car expr))
+          (%single-float-type-spec-p (function-return-type (car expr)))
+          (not (local-function-entry (car expr))))
      t)
     ((and (consp expr) (= (length expr) 3)
           (member (car expr) '(+ - * /))
@@ -4392,8 +5268,58 @@ the literal and the next compilation inherits it."
             ,@(when val-p `((:ldloc ,val-tmp)))
             (:call ,method))))))
 
+(defun %string-backing-read (entry idx fall-instrs boxp)
+  "A character read against STR's hoisted char[] buffer, with FALL-INSTRS as the
+   arm that runs when there is no buffer. BOXP leaves a character object
+   (LispChar.Make); otherwise the raw code stays as a native int.
+
+   The buffer slot is NIL whenever Runtime.BackingChars declined -- a LispString
+   still holding a System.String, or a character vector that is not simple
+   (adjustable, fill-pointered, displaced) or not rank 1. A simple character
+   LispVector, which is what (MAKE-ARRAY n :element-type 'CHARACTER) builds, is
+   fetched like a LispString's char[]. FALL-INSTRS is the typed call that ran before this
+   path existed, so declining costs the speed and nothing else. Only one arm
+   runs, so a subscript with a side effect is evaluated exactly once."
+  (let* ((back (third entry))
+         (fall (gen-label "SBFALL"))
+         (done (gen-label "SBDONE"))
+         (fast (if (simple-expr-p idx)
+                   `((:ldloc ,back)
+                     ,@(compile-index-to-long idx)
+                     (:conv-i)
+                     (:ldelem-u2)
+                     ,@(when boxp '((:call "LispChar.Make"))))
+                   (let ((tk (gen-local "SBI")))
+                     `((:declare-local ,tk "Int64")
+                       ,@(compile-index-to-long idx)
+                       (:stloc ,tk)
+                       (:ldloc ,back)
+                       (:ldloc ,tk)
+                       (:conv-i)
+                       (:ldelem-u2)
+                       ,@(when boxp '((:call "LispChar.Make"))))))))
+    (ecase *backing-arm*
+      (:fast fast)
+      (:helper fall-instrs)
+      (:both `((:ldloc ,back)
+               (:brfalse ,fall)
+               ,@fast
+               (:br ,done)
+               (:label ,fall)
+               ,@fall-instrs
+               (:label ,done))))))
+
 (defun compile-string-char-code-as-long (str idx)
-  "Emit (char-code (schar STR IDX)) as a raw int64 (Runtime.CharCodeAtL).
+  "Emit (char-code (schar STR IDX)) as a raw int64. When STR has a hoisted
+   char[] buffer the read is a bare ldelem against it with the typed call as the
+   other arm; otherwise it is the typed call alone."
+  (let ((back (string-backing-entry str)))
+    (if back
+        (%string-backing-read back idx (%string-char-code-call str idx) nil)
+        (%string-char-code-call str idx))))
+
+(defun %string-char-code-call (str idx)
+  "The typed call form: (char-code (schar STR IDX)) as a raw int64 (Runtime.CharCodeAtL).
    STR stays a LispObject -- the runtime entry decides whether it is the simple
    string it can read directly -- and IDX is lowered the way an array subscript
    is. A non-simple subexpression is evaluated into a temp first, so the stack is
@@ -4417,7 +5343,15 @@ the literal and the next compilation inherits it."
           (:call "Runtime.CharCodeAtL")))))
 
 (defun compile-string-char-as-object (str idx)
-  "Emit (schar STR IDX) as one typed call (Runtime.CharAtL), leaving the
+  "Emit (schar STR IDX), leaving the character on the stack. Hoisted buffer with
+   the typed call as the other arm, exactly as the code read is."
+  (let ((back (string-backing-entry str)))
+    (if back
+        (%string-backing-read back idx (%string-char-call str idx) t)
+        (%string-char-call str idx))))
+
+(defun %string-char-call (str idx)
+  "The typed call form: (schar STR IDX) as one call (Runtime.CharAtL), leaving the
    character on the stack.
 
    The value-position counterpart of COMPILE-STRING-CHAR-CODE-AS-LONG, and it
@@ -4445,58 +5379,154 @@ the literal and the next compilation inherits it."
           (:ldloc ,idx-tmp)
           (:call "Runtime.CharAtL")))))
 
-(defun compile-backing-aref-as-long (entry idx)
+(defun compile-backing-aref-as-long (entry idx fall-instrs)
   "Emit (AREF V IDX) as a bare element load against V's hoisted buffer, leaving
-   a raw int64. The subscript is narrowed to a native int rather than an i4, so
-   the CLR's own bounds check still rejects a subscript outside the array
-   (conv.i4 would wrap one into range first)."
-  (let ((back (third entry))
-        (kind (cdddr entry)))
-    (if (simple-expr-p idx)
-        `((:ldloc ,back)
-          ,@(compile-index-to-long idx)
-          (:conv-i)
-          (,(%backing-ldelem kind)))
-        (let ((tk (gen-local "NAI")))
-          `((:declare-local ,tk "Int64")
-            ,@(compile-index-to-long idx)
-            (:stloc ,tk)
-            (:ldloc ,back)
-            (:ldloc ,tk)
-            (:conv-i)
-            (,(%backing-ldelem kind)))))))
+   a raw int64, with FALL-INSTRS as the arm that runs when there is no buffer.
+   The subscript is narrowed to a native int rather than an i4, so the CLR's own
+   bounds check still rejects a subscript outside the array (conv.i4 would wrap
+   one into range first).
 
-(defun compile-backing-aref-set (entry idx val)
-  "Emit (SETF (AREF V IDX) VAL) against V's hoisted buffer. The value is
-   range-checked for the narrow kinds first -- the opcode's narrowing would
-   wrap an out-of-width value where the boxed store path signals -- and left
-   BOXED on the stack for the general setf contract, as the helper path does."
+   The buffer slot is NIL whenever the fetch declined -- a fill-pointered or
+   adjustable vector, whose storage VECTOR-PUSH-EXTEND and ADJUST-ARRAY replace,
+   and anything that is not the declared array at all. FALL-INSTRS is the
+   per-element helper that ran before this path existed, so declining costs the
+   speed and nothing else. Only one arm runs, so a subscript with a side effect
+   is still evaluated exactly once."
+  (let ((back (third entry))
+        (kind (cdddr entry))
+        (fall (gen-label "ABFALL"))
+        (done (gen-label "ABDONE")))
+    (let ((fast (if (simple-expr-p idx)
+                    `((:ldloc ,back)
+                      ,@(compile-index-to-long idx)
+                      (:conv-i)
+                      (,(%backing-ldelem kind)))
+                    (let ((tk (gen-local "NAI")))
+                      `((:declare-local ,tk "Int64")
+                        ,@(compile-index-to-long idx)
+                        (:stloc ,tk)
+                        (:ldloc ,back)
+                        (:ldloc ,tk)
+                        (:conv-i)
+                        (,(%backing-ldelem kind)))))))
+      (ecase *backing-arm*
+        (:fast fast)
+        (:helper fall-instrs)
+        (:both `((:ldloc ,back)
+                 (:brfalse ,fall)
+                 ,@fast
+                 (:br ,done)
+                 (:label ,fall)
+                 ,@fall-instrs
+                 (:label ,done)))))))
+
+(defun compile-backing-aref-set (entry idx val fall-instrs)
+  "Emit (SETF (AREF V IDX) VAL) against V's hoisted buffer, with FALL-INSTRS as
+   the arm that runs when there is no buffer. The value is range-checked for the
+   narrow kinds first -- the opcode's narrowing would wrap an out-of-width value
+   where the boxed store path signals -- and left BOXED on the stack for the
+   general setf contract, as the helper path does and as FALL-INSTRS does.
+
+   Only one arm runs, so VAL is evaluated exactly once even though both arms
+   contain code to evaluate it."
   (let* ((back (third entry))
          (kind (cdddr entry))
          (chk (%backing-store-check kind))
          (tk (gen-local "NAI"))
-         (vk (gen-local "NAV")))
-    `((:declare-local ,tk "Int64")
-      (:declare-local ,vk "Int64")
-      ,@(compile-index-to-long idx)
-      (:stloc ,tk)
-      ,@(compile-expr-to-long val)
-      ,@(when chk `((:call ,chk)))
-      (:stloc ,vk)
-      (:ldloc ,back)
-      (:ldloc ,tk)
-      (:conv-i)
-      (:ldloc ,vk)
-      (,(%backing-stelem kind))
-      (:ldloc ,vk)
-      (:call "Fixnum.Make"))))
+         (vk (gen-local "NAV"))
+         (fall (gen-label "ABFALL"))
+         (done (gen-label "ABDONE"))
+         (fast `((:declare-local ,tk "Int64")
+                 (:declare-local ,vk "Int64")
+                 ,@(compile-index-to-long idx)
+                 (:stloc ,tk)
+                 ,@(compile-expr-to-long val)
+                 ,@(when chk `((:call ,chk)))
+                 (:stloc ,vk)
+                 (:ldloc ,back)
+                 (:ldloc ,tk)
+                 (:conv-i)
+                 (:ldloc ,vk)
+                 (,(%backing-stelem kind))
+                 (:ldloc ,vk)
+                 (:call "Fixnum.Make"))))
+    (ecase *backing-arm*
+      (:fast fast)
+      (:helper fall-instrs)
+      (:both `((:ldloc ,back)
+               (:brfalse ,fall)
+               ,@fast
+               (:br ,done)
+               (:label ,fall)
+               ,@fall-instrs
+               (:label ,done))))))
+
+
+(defun %backing-duplicable-p (form)
+  "T when FORM may be compiled twice. Compiling is not a pure function of the
+   source: LOAD-TIME-VALUE takes a slot, DEFMETHOD and DEFSTRUCT run at assembly
+   time whether or not their branch is taken, and EVAL-WHEN can do anything. A
+   body containing any of those would get two of whatever it does, so it keeps
+   the per-access test instead. Crude in the safe direction: an unfamiliar
+   operator is assumed unsafe only if it is on this list, and the list is of
+   things whose compile-time effect is known, so a false YES is possible and is
+   caught by the test suites rather than by this."
+  (cond ((not (consp form)) t)
+        ((and (symbolp (car form))
+              (member (symbol-name (car form))
+                      '("LOAD-TIME-VALUE" "DEFMETHOD" "DEFGENERIC" "DEFSTRUCT"
+                        "DEFCLASS" "EVAL-WHEN" "DEFCONSTANT" "DEFPACKAGE"
+                        "DEFINE-COMPILER-MACRO" "DEFSETF" "DEFINE-SETF-EXPANDER"
+                        "DEFMACRO" "IN-PACKAGE")
+                      :test #'string=))
+         nil)
+        (t (and (%backing-duplicable-p (car form))
+                (%backing-duplicable-p (cdr form))))))
+
+(defun unswitch-array-backing (entries body thunk)
+  "Emit BODY's instructions twice, once with every hoisted buffer known present
+   and once with none of them used, behind a single test per buffer.
+
+   The test a hoisted access would otherwise carry is loop-invariant, and
+   leaving it at the access is what costs. Measured on the array-walk kernel:
+   the per-access form turned the inner loop from a 7-instruction single block
+   with a fall-through back-edge into 11 instructions across 4 blocks, because
+   the test also stopped the JIT hoisting the data base and the element count
+   out of the loop. Both are consequences of where the test is, not of its
+   existence, so it moves here and the fast copy goes back to the original
+   block.
+
+   All buffers are tested together rather than one unswitch per buffer: n
+   buffers would otherwise want 2^n copies, and a body that hoists two arrays
+   and gets one of them is rare enough not to pay for that."
+  (if (or (null entries)
+          (not (%backing-duplicable-p body))
+          (notany (lambda (e)
+                    (%var-iterated-access-p
+                     body (first e) nil
+                     (if (eq (cdddr e) :char)
+                         (function %tree-finds-schar-p)
+                         (function %tree-finds-aref-p))))
+                  entries))
+      (funcall thunk)
+      (let ((slow (gen-label "ABUSLOW"))
+            (done (gen-label "ABUDONE")))
+        `(,@(loop for e in entries
+                  append `((:ldloc ,(third e)) (:brfalse ,slow)))
+          ,@(let ((*backing-arm* :fast)) (funcall thunk))
+          (:br ,done)
+          (:label ,slow)
+          ,@(let ((*backing-arm* :helper)) (funcall thunk))
+          (:label ,done)))))
 
 (defun array-backing-prologue (entries)
   "Instructions that fetch each hoisted element buffer once, right after the
-   variables are bound. The fetch checks the declaration and signals a
-   TYPE-ERROR when it is false; that is one check per binding, not per element,
-   so it is kept at every safety level -- skipping it would leave a false
-   declaration to reach the ldelem as a null buffer."
+   variables are bound. At (safety 0) the fetch answers NIL when it declines --
+   a fill-pointered or adjustable vector, whose storage VECTOR-PUSH-EXTEND and
+   ADJUST-ARRAY replace, a displaced one -- and every access carries an arm that
+   runs the per-element helper for exactly that case, so a declaration this
+   cannot honour costs the speed and never the answer. Above (safety 0) such a
+   value is a TYPE-ERROR from the fetch itself (see %BACKING-FETCH-CALL)."
   (loop for e in entries
         for kind = (cdddr e)
         append `((:declare-local ,(third e) ,(%backing-slot-type kind))
@@ -4504,16 +5534,46 @@ the literal and the next compilation inherits it."
                  (:call ,(%backing-fetch-call kind))
                  (:stloc ,(third e)))))
 
+(defun %aref-arr-temp (arr)
+  "Split the array operand of a numeric AREF into three instruction lists:
+   what to DECLARE, what to evaluate UP FRONT, and how to LOAD it where the
+   call wants it.
+
+   A plain lexical local is pure, so it declares nothing, costs nothing up
+   front and is simply loaded in place. A structure accessor call is not pure
+   and must be evaluated FIRST, into a temp: the emitters below lower
+   non-simple subscripts into temps before they load the array, and moving a
+   call past a subscript would evaluate the two in the wrong order."
+  (if (simple-expr-p arr)
+      (values '() '()
+              (let ((*in-tail-position* nil) (*in-mv-context* nil))
+                (compile-expr arr)))
+      (let ((tmp (gen-local "NAA")))
+        (values `((:declare-local ,tmp "LispObject"))
+                `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
+                      (compile-expr arr))
+                  (:stloc ,tmp))
+                `((:ldloc ,tmp))))))
+
 (defun compile-numeric-aref-as-long (arr idxs rank)
-  "Emit (aref ARR IDX...) on a proven numeric-backed local as a raw int64 on
-   the stack (Runtime.ArefNum*L). ARR is a plain lexical local (guaranteed by
-   numeric-array-aref-info), so loading it is pure and can be reordered around
-   the index temps; non-simple indices are evaluated to Int64 temps first so
-   the stack is empty whenever a non-simple subexpression compiles."
-  (let ((back (and (= rank 1) (array-backing-entry (list* 'aref arr idxs)))))
-    (when back
-      (return-from compile-numeric-aref-as-long
-        (compile-backing-aref-as-long back (first idxs)))))
+  "Emit (aref ARR IDX...) on a numeric-backed array as a raw int64.
+
+   When the variable has a hoisted element buffer, the read is a bare ldelem
+   against it with the per-element helper as the other arm: the buffer slot is
+   NIL whenever the fetch declined, and declining has to cost speed rather than
+   correctness. Everything else compiles to the helper alone."
+  (let ((helper (%numeric-aref-helper-as-long arr idxs rank))
+        (back (and (= rank 1) (array-backing-entry (list* 'aref arr idxs)))))
+    (if back
+        (compile-backing-aref-as-long back (first idxs) helper)
+        helper)))
+
+(defun %numeric-aref-helper-as-long (arr idxs rank)
+  "Emit (aref ARR IDX...) on a proven numeric-backed array as a raw int64 on
+   the stack (Runtime.ArefNum*L). ARR is a plain lexical local or a structure
+   accessor call (numeric-array-aref-info); non-simple indices are evaluated to
+   Int64 temps first so the stack is empty whenever a non-simple subexpression
+   compiles, and ARR goes into a temp ahead of them when it is not a local."
   (let ((method (ecase rank
                   (1 "Runtime.ArefNumL")
                   (2 "Runtime.ArefNum2DL")
@@ -4523,26 +5583,33 @@ the literal and the next compilation inherits it."
               (compile-expr arr))
           ,@(loop for idx in idxs append (compile-index-to-long idx))
           (:call ,method))
-        (let ((idx-tmps (mapcar (lambda (i) (declare (ignore i)) (gen-local "NAI"))
-                                idxs)))
-          `(,@(mapcar (lambda (tk) `(:declare-local ,tk "Int64")) idx-tmps)
-            ,@(loop for idx in idxs
-                    for tk in idx-tmps
-                    append `(,@(compile-index-to-long idx) (:stloc ,tk)))
-            ,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
-                (compile-expr arr))
-            ,@(mapcar (lambda (tk) `(:ldloc ,tk)) idx-tmps)
-            (:call ,method))))))
+        (multiple-value-bind (arr-decl arr-pre arr-load) (%aref-arr-temp arr)
+          (let ((idx-tmps (mapcar (lambda (i) (declare (ignore i)) (gen-local "NAI"))
+                                  idxs)))
+            `(,@arr-decl
+              ,@(mapcar (lambda (tk) `(:declare-local ,tk "Int64")) idx-tmps)
+              ,@arr-pre
+              ,@(loop for idx in idxs
+                      for tk in idx-tmps
+                      append `(,@(compile-index-to-long idx) (:stloc ,tk)))
+              ,@arr-load
+              ,@(mapcar (lambda (tk) `(:ldloc ,tk)) idx-tmps)
+              (:call ,method)))))))
 
 (defun compile-numeric-aref-set (arr idxs val rank)
-  "Emit (setf (aref ARR IDX...) VAL) on a numeric-backed local with the value
+  "Emit (setf (aref ARR IDX...) VAL) on a numeric-backed array, boxed value on
+   the stack. Hoisted buffer with a helper arm, exactly as the read is."
+  (let ((helper (%numeric-aref-helper-set arr idxs val rank))
+        (back (and (= rank 1) (array-backing-entry (list* 'aref arr idxs)))))
+    (if back
+        (compile-backing-aref-set back (first idxs) val helper)
+        helper)))
+
+(defun %numeric-aref-helper-set (arr idxs val rank)
+  "Emit (setf (aref ARR IDX...) VAL) on a numeric-backed array with the value
    lowered to a raw int64 (Runtime.ArefSetNum*L; range-checked store, returns
    the stored long). Leaves the value BOXED on the stack for the general setf
    contract; in statement position the peephole (P5+P2 family) deletes the box."
-  (let ((back (and (= rank 1) (array-backing-entry (list* 'aref arr idxs)))))
-    (when back
-      (return-from compile-numeric-aref-set
-        (compile-backing-aref-set back (first idxs) val))))
   (let ((method (ecase rank
                   (1 "Runtime.ArefSetNumL")
                   (2 "Runtime.ArefSetNum2DL")
@@ -4554,25 +5621,27 @@ the literal and the next compilation inherits it."
           ,@(compile-expr-to-long val)
           (:call ,method)
           (:call "Fixnum.Make"))
-        (let ((idx-tmps (mapcar (lambda (i) (declare (ignore i)) (gen-local "NAI"))
-                                idxs))
-              (val-tmp (gen-local "NAV")))
-          `(,@(mapcar (lambda (tk) `(:declare-local ,tk "Int64")) idx-tmps)
-            (:declare-local ,val-tmp "Int64")
-            ,@(loop for idx in idxs
-                    for tk in idx-tmps
-                    append `(,@(compile-index-to-long idx) (:stloc ,tk)))
-            ,@(compile-expr-to-long val)
-            (:stloc ,val-tmp)
-            ,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
-                (compile-expr arr))
-            ,@(mapcar (lambda (tk) `(:ldloc ,tk)) idx-tmps)
-            (:ldloc ,val-tmp)
-            (:call ,method)
-            (:call "Fixnum.Make"))))))
+        (multiple-value-bind (arr-decl arr-pre arr-load) (%aref-arr-temp arr)
+          (let ((idx-tmps (mapcar (lambda (i) (declare (ignore i)) (gen-local "NAI"))
+                                  idxs))
+                (val-tmp (gen-local "NAV")))
+            `(,@arr-decl
+              ,@(mapcar (lambda (tk) `(:declare-local ,tk "Int64")) idx-tmps)
+              (:declare-local ,val-tmp "Int64")
+              ,@arr-pre
+              ,@(loop for idx in idxs
+                      for tk in idx-tmps
+                      append `(,@(compile-index-to-long idx) (:stloc ,tk)))
+              ,@(compile-expr-to-long val)
+              (:stloc ,val-tmp)
+              ,@arr-load
+              ,@(mapcar (lambda (tk) `(:ldloc ,tk)) idx-tmps)
+              (:ldloc ,val-tmp)
+              (:call ,method)
+              (:call "Fixnum.Make")))))))
 
 (defun compile-numeric-aref-float (arr idxs rank)
-  "Emit (aref ARR IDX...) on a proven float-backed numeric local as a native
+  "Emit (aref ARR IDX...) on a proven float-backed numeric array as a native
    r8 (double) on the stack (Runtime.ArefNum*D). Mirrors
    compile-numeric-aref-as-long but leaves a raw double and never boxes.
    single-float backing widens to double here; callers narrow with conv.r4."
@@ -4585,19 +5654,21 @@ the literal and the next compilation inherits it."
               (compile-expr arr))
           ,@(loop for idx in idxs append (compile-index-to-long idx))
           (:call ,method))
-        (let ((idx-tmps (mapcar (lambda (i) (declare (ignore i)) (gen-local "NAI"))
-                                idxs)))
-          `(,@(mapcar (lambda (tk) `(:declare-local ,tk "Int64")) idx-tmps)
-            ,@(loop for idx in idxs
-                    for tk in idx-tmps
-                    append `(,@(compile-index-to-long idx) (:stloc ,tk)))
-            ,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
-                (compile-expr arr))
-            ,@(mapcar (lambda (tk) `(:ldloc ,tk)) idx-tmps)
-            (:call ,method))))))
+        (multiple-value-bind (arr-decl arr-pre arr-load) (%aref-arr-temp arr)
+          (let ((idx-tmps (mapcar (lambda (i) (declare (ignore i)) (gen-local "NAI"))
+                                  idxs)))
+            `(,@arr-decl
+              ,@(mapcar (lambda (tk) `(:declare-local ,tk "Int64")) idx-tmps)
+              ,@arr-pre
+              ,@(loop for idx in idxs
+                      for tk in idx-tmps
+                      append `(,@(compile-index-to-long idx) (:stloc ,tk)))
+              ,@arr-load
+              ,@(mapcar (lambda (tk) `(:ldloc ,tk)) idx-tmps)
+              (:call ,method)))))))
 
 (defun compile-numeric-aref-set-float (arr idxs val rank kind)
-  "Emit (setf (aref ARR IDX...) VAL) on a float-backed numeric local. VAL is
+  "Emit (setf (aref ARR IDX...) VAL) on a float-backed numeric array. VAL is
    lowered to a native r8 (single-typed values widen with conv.r8) and stored
    via Runtime.ArefSetNum*D (narrows to float for single backing). Leaves the
    value BOXED for the setf contract; peephole removes it in statement position."
@@ -4619,22 +5690,24 @@ the literal and the next compilation inherits it."
             ,@(val-as-double)
             (:call ,method)
             ,@box)
-          (let ((idx-tmps (mapcar (lambda (i) (declare (ignore i)) (gen-local "NAI"))
-                                  idxs))
-                (val-tmp (gen-local "NAV")))
-            `(,@(mapcar (lambda (tk) `(:declare-local ,tk "Int64")) idx-tmps)
-              (:declare-local ,val-tmp "Double")
-              ,@(loop for idx in idxs
-                      for tk in idx-tmps
-                      append `(,@(compile-index-to-long idx) (:stloc ,tk)))
-              ,@(val-as-double)
-              (:stloc ,val-tmp)
-              ,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
-                  (compile-expr arr))
-              ,@(mapcar (lambda (tk) `(:ldloc ,tk)) idx-tmps)
-              (:ldloc ,val-tmp)
-              (:call ,method)
-              ,@box))))))
+          (multiple-value-bind (arr-decl arr-pre arr-load) (%aref-arr-temp arr)
+            (let ((idx-tmps (mapcar (lambda (i) (declare (ignore i)) (gen-local "NAI"))
+                                    idxs))
+                  (val-tmp (gen-local "NAV")))
+              `(,@arr-decl
+                ,@(mapcar (lambda (tk) `(:declare-local ,tk "Int64")) idx-tmps)
+                (:declare-local ,val-tmp "Double")
+                ,@arr-pre
+                ,@(loop for idx in idxs
+                        for tk in idx-tmps
+                        append `(,@(compile-index-to-long idx) (:stloc ,tk)))
+                ,@(val-as-double)
+                (:stloc ,val-tmp)
+                ,@arr-load
+                ,@(mapcar (lambda (tk) `(:ldloc ,tk)) idx-tmps)
+                (:ldloc ,val-tmp)
+                (:call ,method)
+                ,@box)))))))
 
 ;;; LIST / LIST* build their conses inline for a small, fixed argument count.
 ;;;

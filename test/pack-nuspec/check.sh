@@ -5,12 +5,17 @@
 #
 #   1. .asd metadata (:description / :homepage / :source-control / :author /
 #      :license) lands in the nuspec, and a README next to the .asd is packaged.
+#      :version does too, so a project with a version in its .asd can pack
+#      without --version, while an explicit --version still wins.
 #   2. Fields the app supplies neither in its .asd nor on the command line are
 #      DROPPED rather than inherited: a donor projectUrl / repository / tags /
 #      copyright under a different package id is wrong attribution, not stale.
 #   3. NuGet's required fields (description, authors) are refused rather than
 #      inherited: packing without them fails, with a message naming both ways
 #      to supply them.
+#   4. Nothing dotcl wrote at runtime rides along in the payload. A restamp
+#      copies the donor's files, so anything a dotcl run dropped into a publish
+#      directory ends up inside someone else's application package.
 #
 # Requires a directory of published dotcl packages (`make pack`). Skips -- does
 # not fail -- when they are absent, so the suite still runs on a fresh clone,
@@ -66,6 +71,7 @@ trap 'rm -rf "$WORK"' EXIT
 mkdir -p "$WORK/meta"
 cat > "$WORK/meta/packmeta.asd" <<'EOF'
 (defsystem "packmeta"
+  :version "0.9.2"
   :description "Fixture system for the pack nuspec check"
   :homepage "https://example.invalid/packmeta"
   :source-control (:git "https://github.com/example/packmeta.git")
@@ -160,6 +166,120 @@ else
   echo "$out" | grep -q ':description in the .asd' \
     || note "error message does not mention the .asd as a source"
 fi
+
+echo "=== [4] --r2r puts the ahead-of-time sibling beside the fasl ==="
+# A packed tool loads its own dotcl.user.fasl by path and prefers
+# dotcl.user.fasl.r2r-<rid> next to it. The producing half is checked here: the
+# name and the directory have to be exactly what the loader probes, and every
+# way this has gone wrong before -- a sibling under the wrong spelling of the
+# RID, or in the wrong directory -- looked like success from the outside.
+#
+# Needs a real RID: the any-RID package carries no runtime, so there is nothing
+# to compile against and --r2r has nothing to do there.
+#
+# Any RID the donor carries will do, because pack cross-compiles; it does not
+# have to be this machine's. Asking the host for its RID is wrong by
+# construction, not merely fragile: the process RID can be the distro-specific
+# spelling (ubuntu.24.04-x64), while everything that produces these files uses
+# the portable os-arch form, so the name would match no donor package and the
+# gate would go red for an environmental reason. Read the RID off the donor set
+# instead. "any" is skipped for the reason above.
+rid=""
+for p in "$FROM"/dotcl.*."$ver".nupkg; do
+  [ -e "$p" ] || continue
+  b="${p##*/}"; b="${b#dotcl.}"; b="${b%".$ver.nupkg"}"
+  case "$b" in [0-9]*|any|"") ;; *) rid="$b"; break ;; esac
+done
+if [ -z "$rid" ]; then
+  skip_or_fail "SKIP: no dotcl.<rid>.$ver.nupkg in $FROM (run 'make pack' first)"
+else
+  r2rout=$(dotnet run --project "$RT" -- --core "$CORE" --asd-search-path "$WORK/meta" pack \
+             --system packmeta --id packr2r --command packr2r --version 0.0.1 \
+             --dotcl-version "$ver" --from "$FROM" --rids "$rid" --r2r \
+             -o "$WORK/out" 2>&1) || note "pack --r2r failed: $r2rout"
+  pkg="$WORK/out/packr2r.$rid.0.0.1.nupkg"
+  if [ ! -f "$pkg" ]; then
+    note "pack --r2r produced no $pkg"
+  elif echo "$r2rout" | grep -q 'no ReadyToRun image'; then
+    # The package is still correct without it, only slower to start, so say what
+    # is untested rather than passing quietly.
+    skip_or_fail "SKIP: crossgen2 produced nothing here: $(echo "$r2rout" | grep 'no ReadyToRun image')"
+    unzip -Z1 "$pkg" | grep -q "/dotcl.user.fasl$" \
+      || note "a pack without a ReadyToRun image dropped the fasl too"
+  else
+    unzip -Z1 "$pkg" | grep -q "^tools/net10.0/$rid/dotcl.user.fasl.r2r-$rid$" \
+      || note "no tools/net10.0/$rid/dotcl.user.fasl.r2r-$rid in the package"
+    unzip -Z1 "$pkg" | grep -q "^tools/net10.0/$rid/dotcl.user.fasl$" \
+      || note "the fasl itself is missing beside its ReadyToRun sibling"
+    # One RID's images per package: the loader picks by name, and the other
+    # five are dead weight a restamp has shipped before.
+    if unzip -Z1 "$pkg" | grep 'r2r-' | grep -v "r2r-$rid" | grep -q .; then
+      note "the package carries ReadyToRun images for a RID other than $rid"
+    fi
+  fi
+fi
+
+echo "=== [5] --version defaults to the .asd's :version ==="
+# A project that states :version in its .asd should not have to repeat it on
+# the command line -- that repetition is the last line of shell a packed
+# project needed around `dotcl pack`. Three things decide this: the default
+# applies, an explicit --version still beats it (release paths pass versions of
+# their own and must keep them), and a system with no version anywhere is still
+# a usage error rather than a package stamped with a version nobody wrote.
+#
+# packmeta declares :version "0.9.2" and packbare declares none.
+
+# Default: no --version on the command line.
+verout=$(dotnet run --project "$RT" -- --core "$CORE" --asd-search-path "$WORK/meta" pack \
+           --system packmeta --id packver --command packver \
+           --dotcl-version "$ver" --from "$FROM" --rids any -o "$WORK/out" 2>&1) \
+  || note "pack without --version failed: $verout"
+if [ ! -f "$WORK/out/packver.0.9.2.nupkg" ]; then
+  note "no packver.0.9.2.nupkg: --version did not default to the .asd's :version"
+  ls "$WORK/out" | grep '^packver' || true
+else
+  rm -rf "$WORK/v"; mkdir -p "$WORK/v"
+  (cd "$WORK/v" && unzip -oq "$WORK/out/packver.0.9.2.nupkg")
+  grep -q '<version>0.9.2</version>' "$WORK/v/packver.nuspec" \
+    || note "<version> in the nuspec is not the .asd's 0.9.2"
+fi
+
+# Explicit: check [1] packed the same system with --version 0.0.1. The flag has
+# to win, or a nightly build would start publishing the .asd's version.
+grep -q '<version>0.0.1</version>' "$NUSPEC" \
+  || note "an explicit --version did not override the .asd's :version"
+
+# Neither: the usage error stays, and says where a version can come from.
+if out=$(dotnet run --project "$RT" -- --core "$CORE" --asd-search-path "$WORK/bare" pack \
+           --system packbare --id packbare --command packbare \
+           --dotcl-version "$ver" --from "$FROM" --rids any -o "$WORK/out" \
+           --description 'A bare fixture' --authors 'Someone' 2>&1); then
+  note "pack succeeded with no version in the .asd and no --version"
+else
+  echo "$out" | grep -q 'missing required option(s): --version' \
+    || note "the missing-version error changed wording: $out"
+  echo "$out" | grep -q ':version in the .asd' \
+    || note "the missing-version error does not name the .asd as a source: $out"
+fi
+
+echo "=== [6] no JIT profile rides along in the payload ==="
+# The multi-core JIT profile is written by every dotcl run. It used to land
+# beside the executing assembly, so a run against a publish directory left one
+# there, `dotnet pack` swept it into the dotcl package, and a restamp copied it
+# on into the application package: a file named after dotcl, carrying one
+# machine's method traces, shipped to that application's users.
+#
+# It now goes to the user's cache instead, which stops new ones appearing. This
+# is the other half: a developer tree that already has a stray, or anything
+# else that writes one, must not get it past here. Match the extension rather
+# than the old fixed name -- the file is named after the executable now, so
+# "dotcl.profile" alone would miss every future spelling. The fixtures ship no
+# .profile of their own, so any hit is contamination.
+for pkg in "$WORK"/out/*.nupkg; do
+  [ -e "$pkg" ] || continue
+  strays=$(unzip -Z1 "$pkg" | grep '\.profile$' || true)
+  [ -z "$strays" ] || note "${pkg##*/} carries a JIT profile: $strays"
+done
 
 if [ "$fail" -ne 0 ]; then
   echo "pack-nuspec: FAIL"

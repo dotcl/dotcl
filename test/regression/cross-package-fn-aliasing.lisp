@@ -96,7 +96,7 @@
 ;;; before its own definition ran would have reached the foreign one.
 (defun %xpa-fasl-collide-case ()
   (let* ((tmp (format nil "~a/dotcl-xpafasl-~a"
-                      (or (dotcl:getenv "TEMP") "/tmp")
+                      (regression-temp-dir)
                       (get-internal-real-time)))
          (src (format nil "~a/src.lisp" tmp))
          (warned nil))

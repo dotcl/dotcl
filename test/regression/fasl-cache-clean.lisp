@@ -1,4 +1,5 @@
-;;; `dotcl clean`: removing the shared ASDF compile cache.
+;;; `dotcl clean`: removing the caches dotcl writes. The shared ASDF compile
+;;; cache first, and the JIT startup profiles further down.
 ;;;
 ;;; ASDF writes every fasl it compiles under
 ;;; {cache-home}/common-lisp/{implementation-identifier}/, outside any project
@@ -24,9 +25,7 @@
 
 (defvar *fcc-tmp*
   (let ((dir (concatenate 'string
-                          (substitute #\/ #\\ (or (dotcl:getenv "TMPDIR")
-                                                  (dotcl:getenv "TEMP")
-                                                  "/tmp"))
+                          (regression-temp-dir)
                           "/dotcl-fasl-cache-test/")))
     (ensure-directories-exist dir)
     dir))
@@ -123,6 +122,117 @@
     (let ((result (%fcc-run root (list "clean"))))
       (list (first result) (and (search "nothing to remove" (second result)) t))))
   (0 t))
+
+;;; The JIT startup profiles: the other directory `clean` empties.
+;;;
+;;; One file per program under {cache-home}/dotcl/jit/, about 20 KB, and
+;;; nothing removed them either: an upgrade puts the new build in a new
+;;; directory and orphans the previous program's profile. Reported on its own
+;;; line, with its own count and its own path, because it is a second place
+;;; and the path is what a user asking "what is this file" came for.
+;;;
+;;; The file this very run is writing is the one thing clean leaves: the
+;;; runtime writes it again as the run ends, so removing it frees nothing and
+;;; costs the next start its head start. It is skipped, so it is not in the
+;;; count either.
+
+(defun %fcc-current-profile-name ()
+  "The profile file name this build writes, taken from the path itself so the
+   test never has to reproduce the naming rule."
+  (let* ((path (dotcl::%jit-profile-path))
+         (slash (position #\/ path :from-end t)))
+    (if slash (subseq path (1+ slash)) path)))
+
+(defun %fcc-populate-jit (root &key current)
+  "Fake profiles under ROOT's jit directory; returns that directory. With
+   CURRENT, one of them is named like the profile this build writes."
+  (let ((jit (concatenate 'string root "dotcl/jit/")))
+    (ensure-directories-exist jit)
+    (dolist (name (list* "oldapp-1111111111111111.profile"
+                         "myapp-2222222222222222.profile"
+                         ;; not a profile: clean must leave it where it is
+                         "README.txt"
+                         (when current (list (%fcc-current-profile-name)))))
+      (with-open-file (s (concatenate 'string jit name)
+                         :direction :output :if-exists :supersede)
+        (write-string "not really a profile" s)))
+    jit))
+
+(defun %fcc-jit-line (out)
+  "The report line naming the JIT profile directory, or an empty string when
+   the command printed none."
+  (or (find-if (lambda (line) (search "/dotcl/jit" line))
+               (uiop:split-string (substitute #\/ #\\ out) :separator '(#\Newline)))
+      ""))
+
+(defun %fcc-jit-present (jit names)
+  "Which of NAMES are still in the JIT directory."
+  (let ((entries (dotcl::%jit-profile-entries jit)))
+    (mapcar (lambda (n) (and (member n entries :test #'string=) t)) names)))
+
+;;; Selection: profile files, and nothing else the directory happens to hold.
+(deftest fasl-cache-clean.jit-selects-only-profile-files
+  (multiple-value-bind (root cl-dir) (%fcc-fresh "jit-select")
+    (declare (ignore cl-dir))
+    (sort (dotcl::%jit-profile-entries (%fcc-populate-jit root)) #'string<))
+  ("myapp-2222222222222222.profile" "oldapp-1111111111111111.profile"))
+
+(deftest fasl-cache-clean.jit-dry-run-removes-nothing
+  (multiple-value-bind (root cl-dir) (%fcc-fresh "jit-dry")
+    (declare (ignore cl-dir))
+    (let* ((jit (%fcc-populate-jit root))
+           (result (%fcc-run root (list "clean" "--dry-run"))))
+      (list (first result)
+            (and (search "would remove 2 JIT profiles" (%fcc-jit-line (second result))) t)
+            (%fcc-jit-present jit '("oldapp-1111111111111111.profile"
+                                    "myapp-2222222222222222.profile")))))
+  (0 t (t t)))
+
+(deftest fasl-cache-clean.jit-removes-profiles
+  (multiple-value-bind (root cl-dir) (%fcc-fresh "jit-remove")
+    (declare (ignore cl-dir))
+    (let* ((jit (%fcc-populate-jit root))
+           (result (%fcc-run root (list "clean"))))
+      (list (first result)
+            (and (search "removed 2 JIT profiles" (%fcc-jit-line (second result))) t)
+            (%fcc-jit-present jit '("oldapp-1111111111111111.profile"
+                                    "myapp-2222222222222222.profile"))
+            (and (probe-file (concatenate 'string jit "README.txt")) t))))
+  (0 t (nil nil) t))
+
+;;; An empty profile directory is reported, not passed over: the line names
+;;; the location, which is the answer someone running clean is looking for,
+;;; and the compile cache says the same thing when it is empty.
+(deftest fasl-cache-clean.jit-nothing-to-remove
+  (let ((root (concatenate 'string *fcc-tmp* "jit-empty/")))
+    (ignore-errors (uiop:delete-directory-tree (pathname root) :validate t))
+    (ensure-directories-exist (concatenate 'string root "common-lisp/"))
+    (let* ((result (%fcc-run root (list "clean")))
+           (out (second result)))
+      (list (first result)
+            (and (search "nothing to remove" (%fcc-jit-line out)) t)
+            ;; both locations, one line each
+            (count-if (lambda (line) (search "nothing to remove" line))
+                      (uiop:split-string out :separator '(#\Newline))))))
+  (0 t 2))
+
+;;; The profile of the run doing the cleaning stays, and is not counted as
+;;; removed. A second clean then finds nothing, rather than reporting the same
+;;; file gone again on every run.
+(deftest fasl-cache-clean.jit-keeps-the-profile-in-use
+  (multiple-value-bind (root cl-dir) (%fcc-fresh "jit-inuse")
+    (declare (ignore cl-dir))
+    (let* ((jit (%fcc-populate-jit root :current t))
+           (mine (%fcc-current-profile-name))
+           (first-run (%fcc-run root (list "clean")))
+           (left (dotcl::%jit-profile-entries jit))
+           (second-run (%fcc-run root (list "clean"))))
+      (list (first first-run)
+            (and (search "removed 2 JIT profiles" (%fcc-jit-line (second first-run))) t)
+            (and (member mine left :test #'string=) t)
+            (first second-run)
+            (and (search "nothing to remove" (%fcc-jit-line (second second-run))) t))))
+  (0 t t 0 t))
 
 ;;; A mistyped option must not be read as "remove everything".
 (deftest fasl-cache-clean.unknown-option-is-rejected

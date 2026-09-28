@@ -12,7 +12,7 @@
 
 (defun %fb-tmpdir ()
   (let ((dir (format nil "~a/dotcl-fasl-bundle-~a/"
-                     (or (dotcl:getenv "TEMP") "/tmp")
+                     (regression-temp-dir)
                      (get-internal-real-time))))
     (ensure-directories-exist dir)
     dir))

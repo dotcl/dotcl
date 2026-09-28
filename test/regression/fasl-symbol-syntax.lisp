@@ -15,7 +15,7 @@
 
 (defvar *fss-source*
   (concatenate 'string
-               (substitute #\/ #\\ (or (dotcl:getenv "TMPDIR") (dotcl:getenv "TEMP") "/tmp"))
+               (regression-temp-dir)
                "/dotcl-fasl-symbol-syntax.lisp"))
 
 ;;; Enough names that the literal goes through the print-and-read route rather
@@ -52,8 +52,7 @@
 ;;; are internal while the literal is written -- still works.
 (deftest fss-literal-when-compiled-cold
   (let ((source (%fss-write (concatenate 'string
-                                         (substitute #\/ #\\ (or (dotcl:getenv "TMPDIR")
-                                                                 (dotcl:getenv "TEMP") "/tmp"))
+                                         (regression-temp-dir)
                                          "/dotcl-fasl-symbol-syntax-cold.lisp")
                             "fasl-symbol-syntax-cold")))
     (load (compile-file source))

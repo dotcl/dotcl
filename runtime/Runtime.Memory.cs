@@ -13,14 +13,14 @@ public static partial class Runtime
     {
         if (args.Length < 1) throw ArgError("dotnet:alloc-mem", 1, args.Length);
         var size = (int)((Fixnum)args[0]).Value;
-        return Fixnum.Make(Marshal.AllocHGlobal(size).ToInt64());
+        return PointerToLisp(Marshal.AllocHGlobal(size));
     }
 
     // (dotnet:free-mem addr)
     public static LispObject FreeMem(LispObject[] args)
     {
         if (args.Length < 1) throw ArgError("dotnet:free-mem", 1, args.Length);
-        Marshal.FreeHGlobal(new IntPtr(((Fixnum)args[0]).Value));
+        Marshal.FreeHGlobal(new IntPtr(AddressArg(args[0], "dotnet:free-mem", "pointer")));
         return Nil.Instance;
     }
 
@@ -60,6 +60,32 @@ public static partial class Runtime
             throw new LispErrorException(new LispError($"{who}: {b} out of range for signed 64-bit"));
         return (long)b;
     }
+
+    /// Coerce a Lisp integer to the bits of a 64-bit pointer. A pointer has no
+    /// sign of its own, so both spellings of the same bits are accepted: the
+    /// signed one (-1) and the unsigned one (2^64-1, a Bignum). The accepted
+    /// range is the union -2^63 .. 2^64-1; anything outside is an error, never
+    /// a silent truncation.
+    internal static long ToPointerBits(LispObject v, string who)
+    {
+        if (v is Fixnum fx) return fx.Value;
+        if (v is not Bignum bn)
+            throw new LispErrorException(new LispError($"{who}: not an integer: {v}"));
+        var b = bn.Value;
+        if (b < long.MinValue || b > ulong.MaxValue)
+            throw new LispErrorException(new LispError($"{who}: {b} out of range for a 64-bit pointer"));
+        return b > long.MaxValue ? unchecked((long)(ulong)b) : (long)b;
+    }
+
+    /// A pointer value as a Lisp integer: always the unsigned spelling, so the
+    /// bits 0xFFFFFFFFFFFFFFFF come back as 2^64-1, not -1. Portable code builds
+    /// sentinels such as MAP_FAILED or SQLITE_TRANSIENT with
+    /// (make-pointer (mod -1 (expt 2 64))) and compares a returned pointer
+    /// against them with = or pointer-eq; a signed result never matched.
+    /// SBCL's sap-int is unsigned as well.
+    internal static LispObject PointerToLisp(IntPtr ip) =>
+        IntPtr.Size == 8 ? MakeUnsigned64(unchecked((ulong)ip.ToInt64()))
+                         : Fixnum.Make(unchecked((uint)ip.ToInt32()));
 
     /// Build a non-negative Lisp integer from a raw unsigned 64-bit value.
     internal static LispObject MakeUnsigned64(ulong u) =>
@@ -101,7 +127,7 @@ public static partial class Runtime
             "DOUBLE" =>
                 new DoubleFloat(BitConverter.Int64BitsToDouble(Marshal.ReadInt64(ptr))),
             "POINTER" or "PTR" =>
-                Fixnum.Make(Marshal.ReadIntPtr(ptr).ToInt64()),
+                PointerToLisp(Marshal.ReadIntPtr(ptr)),
             _ => throw new LispErrorException(new LispError($"dotnet:mem-read: unknown type {typeName}"))
         };
     }
@@ -143,7 +169,7 @@ public static partial class Runtime
                 Marshal.WriteInt64(ptr, BitConverter.DoubleToInt64Bits(dv));
                 break;
             case "POINTER": case "PTR":
-                Marshal.WriteIntPtr(ptr, new IntPtr(((Fixnum)value).Value)); break;
+                Marshal.WriteIntPtr(ptr, new IntPtr(ToPointerBits(value, "dotnet:mem-write"))); break;
             default:
                 throw new LispErrorException(new LispError($"dotnet:mem-write: unknown type {typeName}"));
         }
@@ -237,7 +263,7 @@ public static partial class Runtime
                        "dotnet:find-symbol: name must be a string", args[0], Startup.Sym("STRING")));
         var handle = new IntPtr(((Fixnum)args[1]).Value);
         if (NativeLibrary.TryGetExport(handle, name, out var ptr))
-            return Fixnum.Make(ptr.ToInt64());
+            return PointerToLisp(ptr);
         return Nil.Instance;
     }
 
@@ -254,7 +280,7 @@ public static partial class Runtime
             foreach (var h in _cffiLibHandles.Values)
             {
                 if (NativeLibrary.TryGetExport(h, name, out var ptr))
-                    return Fixnum.Make(ptr.ToInt64());
+                    return PointerToLisp(ptr);
             }
         }
         return Nil.Instance;
@@ -280,7 +306,7 @@ public static partial class Runtime
         if (args.Length < 2)
             throw new LispErrorException(new LispProgramError(
                 "dotnet:%ffi-call-ptr: requires at least func-ptr, arg-types, ret-type"));
-        var funcPtr = new IntPtr(((Fixnum)args[0]).Value);
+        var funcPtr = new IntPtr(AddressArg(args[0], "dotnet:%ffi-call-ptr", "function pointer"));
         var argTypesList = args[1];
         var retType = args[2];
         var nativeArgs = args.Skip(3).ToArray();
@@ -300,7 +326,8 @@ public static partial class Runtime
     static long AddressArg(LispObject arg, string fn, string what)
     {
         if (arg is Fixnum fx) return fx.Value;
-        if (arg is Bignum) return Runtime.ToLong(arg, fn);
+        // Same union as a :pointer value: -1 and 2^64-1 name the same address.
+        if (arg is Bignum) return Runtime.ToPointerBits(arg, fn);
         if (arg is Nil) return 0;
         throw new LispErrorException(new LispTypeError(
             $"{fn}: {what} must be an address (integer), got {arg}", arg, Startup.Sym("INTEGER")));

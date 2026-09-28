@@ -6,13 +6,15 @@ never hand-edited, so that keeping it current is a command rather than a
 judgement call.
 
 Three stages. Stage 1 and 3 are pure data handling and run on any Lisp; stage 2
-is the measurement and runs on dotcl.
+(loading, and 2b, the test suites) is the measurement and runs on dotcl.
 
 ```
   dist metadata            targets.txt              results.json + annotations.json
  (systems/releases)  -->   targets.tsv     -->     (one entry per   -->  docs/library-status.md
       rank.lisp                                     system tried)         render.lisp
                                                      stage 2
+                                                   tests.json
+                                                     stage 2b
 ```
 
 ## Stage 1 -- pick the targets (`rank.lisp`)
@@ -90,10 +92,10 @@ Write one JSON object per system tried:
 [
   {"system": "alexandria",
    "release": "alexandria-20241012-git",
-   "status": "ok",
+   "status": "load-only",
    "issue": null,
    "checked": "2026-09-14",
-   "note": "test suite run with fiveam"}
+   "note": ""}
 ]
 ```
 
@@ -101,7 +103,7 @@ Write one JSON object per system tried:
 | --- | --- |
 | `system` | the system named in `targets.txt` |
 | `release` | the dist release it came from (`targets.tsv` has it) |
-| `status` | `ok` (loads and its test suite passes), `load-only` (loads; tests not run), `patched` (loads from the patched release in the dotcl dist overlay), `fail` |
+| `status` | `load-only` (loads), `patched` (loads from the patched release in the dotcl dist overlay), `fail`. `ok` is not written here: the table shows a loading row as `ok` when stage 2b recorded a `pass` for it |
 | `issue` | the issue tracking the failure, or `null` |
 | `checked` | the date of the measurement, `YYYY-MM-DD` |
 | `note` | one short line: what failed, which test framework ran, why it is patched |
@@ -114,9 +116,76 @@ open it leaves the field `null` and explains itself in `note` instead.
 not put a worked-out reason there -- the next measurement erases it. Reasons go
 in `annotations.json` (below), which no run opens.
 
+Error text carries whatever path the failure happened under, which is the
+measuring machine's home directory and checkout. Both scripts replace absolute
+paths in a note with `<path>` before writing it (`scrub_paths`), because the note
+is published.
+
 A system with no entry is rendered as `not checked`, so a partial run is
 publishable: it says what has been measured rather than implying the rest is
 fine. `results.sample.json` is a three-row example of the shape, not data.
+
+## Stage 2b -- run the test suites (`run-tests.sh`)
+
+```
+make library-status-tests                  # stage 2b then stage 3
+sh bench/library-status/run-tests.sh       # stage 2b alone
+```
+
+Stage 2 says whether a system loads. Whether it *works* is what its own test
+suite says, and there is no one command for that across libraries: ASDF's
+`test-system` runs whatever the system's `test-op` does, and which framework
+that is, whether a failure signals, and whether anything runs at all is up to
+each library. So this stage is two parts:
+
+1. For each system that loads (`load-only` or `patched` in `results.json`, in
+   `targets.txt` order), a fresh dotcl quickloads it and the systems its
+   `test-op` depends on (Quicklisp fetches only through `quickload`), then calls
+   `(asdf:test-system SYS)`.
+2. The log is judged afterwards, outside the process, by one small recogniser
+   per framework reading the summary that framework prints: fiveam (`Did N
+   checks` / `Pass:` / `Fail:`), rt (`No tests failed.` / `K out of M total
+   tests failed`), rove and prove (`N tests completed` / `K of M tests
+   failed`), parachute (`;; Summary:` / `Passed:` / `Failed:`), stefil and
+   hu.dwim.stefil (`#<test-run: N tests, A assertions, F failures`; when a
+   test op runs the suite without printing that line, the driver prints the
+   library's `*LAST-TEST-RESULT*` after `LIBTEST-STEFIL-RESULT`, read only
+   when the output had no summary of its own), fiasco
+   (the per-test `[ OK ]` / `[FAIL]` lines and `Test run had N failures:`),
+   clunit and clunit2 (`Tested N assertions.` / `Passed: P/N` / `Failed:` /
+   `Errors:`), Try (the `#<TRY:TRIAL (NAME) OUTCOME 1.2s COUNTS>` line the test
+   op prints, whose per-category counts are read). Only output
+   after the driver's `LIBTEST-BEGIN` marker is read, so a summary printed
+   while loading is not a result.
+
+Each system gets one verdict in `tests.json`:
+
+| verdict | meaning |
+| --- | --- |
+| `pass` | a recognised summary counted at least one passing check and no failing one, and the run finished normally |
+| `fail` | a recognised summary counted at least one failure |
+| `error` | `test-system` signalled, the debugger was entered, or the process exited abnormally, with no recognised failure count |
+| `no-result` | the run finished but printed nothing a recogniser knows |
+| `timeout` | the bound (`LIBRARY_STATUS_TEST_TIMEOUT`, default 900 s) was hit |
+| `load-fail` | the system or one of its test systems did not load |
+
+**Only `pass` turns a row into `ok`.** `no-result` is the verdict this stage
+exists to keep separate: a `test-op` that runs nothing, or a framework with no
+recogniser yet, finishes cleanly and prints nothing that can be counted, and
+that is "nothing was looked at", not "nothing went wrong". A library whose
+framework is not recognised stays `load-only` until a recogniser is added --
+add one to `judge` in the script rather than special-casing the library.
+
+`tests.json` is kept apart from `results.json` so that load checks and test runs
+can be redone independently; `render.lisp` merges them and shows the verdict in
+the `tests` column. The same rules as stage 2 apply: one system per process,
+serial, each bounded, `LIBRARY_STATUS_RESUME=1` and `LIMIT=N` work the same way,
+and `LIBRARY_STATUS_TEST_TARGETS` names a file of systems to run instead of
+every loading row. Logs go to `out/library-status-tests/` in the checkout.
+
+A failing suite is not proof of a dotcl bug. Before reporting one, run the same
+`(asdf:test-system SYS)` on SBCL: a test that fails there too, or depends on the
+network or a native library the host lacks, belongs to the library or the host.
 
 ## The reasons (`annotations.json`)
 
@@ -170,8 +239,8 @@ library would break.
 
 ## Not automated yet
 
-- The test-suite column: stage 2 reports whether a system loads, so no row can
-  say `ok` yet. Telling `ok` from `load-only` needs a per-library way to run its
-  tests -- there is no one command that does it across libraries.
+- Test frameworks without a recogniser (lisp-unit, lisp-unit2, ptester, and
+  suites that print their own format) leave their rows at
+  `no-result`, which renders as `load-only`.
 - Stage 1 is still its own run: choosing targets needs a dist on disk and a new
   dist is rare, so `make library-status` deliberately does stages 2 and 3 only.

@@ -95,22 +95,62 @@ cat > "$WORK/handled.lisp" <<'EOF'
 EOF
 run_case handled zero ""
 
-# The REPL is the other half of the rule and must be untouched: there the
-# debugger has somebody to ask, so it still prompts. The `repl` subcommand takes
-# the default core rather than --asm, so this case needs that core to exist.
+# The *debugger-hook* a run starts with must not depend on whether the core was
+# given with --asm (the development path every Makefile test uses) or --core
+# (the path a shipped dotcl takes). They used to differ: --core installed the
+# print-and-exit hook for a script and --asm left it NIL, so a test that passed
+# under one could end the process under the other.
+cat > "$WORK/hook-state.lisp" <<'EOF'
+(format t "~&HOOK=~a~%" (if *debugger-hook* "SET" "NIL"))
+(finish-output)
+EOF
+hook_probe='(progn (format t "~&HOOK=~a~%" (if *debugger-hook* "SET" "NIL")) (finish-output))'
+hook_case() {
+  name="$1"; want="$2"; shift 2
+  for flag in --asm --core; do
+    set +e
+    hout=$("$exe" "$flag" "$core" "$@" 2>&1 < /dev/null)
+    set -e
+    got=$(printf '%s\n' "$hout" | sed -n 's/^HOOK=//p' | head -1)
+    if [ "$got" != "$want" ]; then
+      echo "  FAIL $name ($flag): *debugger-hook* ${got:-(no output)}, wanted $want"
+      printf '%s\n' "$hout" | sed 's/^/    /'
+      fails=$((fails + 1))
+      return
+    fi
+  done
+  echo "  ok   $name"
+}
+hook_case hook-script SET "$WORK/hook-state.lisp"
+hook_case hook-eval-then-script SET --eval '(setq cl-user::*x* 1)' "$WORK/hook-state.lisp"
+hook_case hook-eval-only NIL --eval "$hook_probe"
+
+# A REPL whose input is a pipe has nobody to ask either: the debugger must not
+# prompt, the rest of the input must not run, and the exit status must say so.
+# (A REPL at a terminal still prompts; that needs a console and is not checked
+# here.) The `repl` subcommand takes the default core rather than --asm, so
+# this case needs that core to exist.
 if [ -f "$ROOT/compiler/dotcl.core" ]; then
   set +e
-  repl_out=$(printf '(with-simple-restart (abort "x") (error "boom"))\n' | "$exe" repl 2>&1)
+  repl_out=$(printf '(with-simple-restart (abort "x") (error "boom"))\n(format t "~&REACHED~%%")\n' | "$exe" --no-init repl 2>&1)
+  repl_code=$?
   set -e
   if printf '%s' "$repl_out" | grep -q '^0\] '; then
-    echo "  ok   repl-still-prompts"
-  else
-    echo "  FAIL repl-still-prompts: no debugger prompt"
+    echo "  FAIL repl-piped-reports: debugger prompted"
     printf '%s\n' "$repl_out" | sed 's/^/    /'
     fails=$((fails + 1))
+  elif printf '%s' "$repl_out" | grep -q 'REACHED'; then
+    echo "  FAIL repl-piped-reports: the form after the error ran"
+    printf '%s\n' "$repl_out" | sed 's/^/    /'
+    fails=$((fails + 1))
+  elif [ "$repl_code" -eq 0 ]; then
+    echo "  FAIL repl-piped-reports: exit 0, wanted nonzero"
+    fails=$((fails + 1))
+  else
+    echo "  ok   repl-piped-reports"
   fi
 else
-  echo "  SKIP repl-still-prompts: compiler/dotcl.core not built"
+  echo "  SKIP repl-piped-reports: compiler/dotcl.core not built"
   if [ "${DOTCL_CI:-}" = "1" ]; then
     echo "  DOTCL_CI=1: a skipped check counts as a failure here" >&2
     fails=$((fails + 1))

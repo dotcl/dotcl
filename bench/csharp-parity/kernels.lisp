@@ -116,6 +116,30 @@
         (declare (fixnum i))
         (setq acc (the fixnum (+ acc (char-code (schar s i)))))))))
 
+
+;;; The same walk over the other representation a string can have. MAKE-STRING
+;;; above and MAKE-ARRAY here answer the same SIMPLE-STRING-P and the same
+;;; TYPE-OF, and both satisfy the SIMPLE-STRING declaration, but they are
+;;; different objects underneath and the character read reaches them by
+;;; different routes. Only one of the two was measured by anything in this file
+;;; until now, and the other one sat at fourteen times its cost without
+;;; anything noticing. The kernel is identical to K-STRING-WALK on purpose:
+;;; what differs is the argument, which is the whole point.
+(defun k-string-walk-vector (s passes)
+  (declare (simple-string s)
+           (fixnum passes)
+           (optimize (speed 3) (safety 0) (debug 0)))
+  (let ((acc 0)
+        (n (length s)))
+    (declare (fixnum acc n))
+    (do ((p 0 (the fixnum (1+ p))))
+        ((>= p passes) acc)
+      (declare (fixnum p))
+      (do ((i 0 (the fixnum (1+ i))))
+          ((>= i n))
+        (declare (fixnum i))
+        (setq acc (the fixnum (+ acc (char-code (schar s i)))))))))
+
 ;;; --- Harness -----------------------------------------------------------
 ;;;
 ;;; Minimum of 5, not mean: the minimum is the run least disturbed by whatever
@@ -131,6 +155,20 @@
 ;;; back runs of it disagreed by a factor of 1.9 -- more than the threshold the
 ;;; CI gate is supposed to detect. The same counts are used on the C# side, so
 ;;; the ratio is unaffected by them; only the absolute figures scale.
+;;;
+;;; DO NOT CUT A KERNEL OUT OF THIS FILE TO ITERATE ON IT. Five runs are enough
+;;; here only because the kernels ahead of a given one have already pushed the
+;;; process into its fully-tiered state; five runs are NOT enough to get there
+;;; from a cold start. Measured on struct-slots: 188 ms in this file, 496 ms in
+;;; a file containing that kernel and this harness and nothing else -- the same
+;;; code, 2.6x apart, and the slow number is the one you get while trying to
+;;; make it faster. Two consequences. A kernel's figure depends on its POSITION
+;;; here, so reordering this file is a change to the recorded ratios and not a
+;;; tidy-up. And to study one kernel on its own, raise *parity-runs* (12 was
+;;; enough for struct-slots) or set DOTNET_TieredCompilation=0, which gives a
+;;; slower but self-consistent number that variants can be compared against.
+;;; Why tiering on is worse here than tiering off is not understood.
+;;; bench/ablation is the harness for taking a kernel apart once you are there.
 
 (defparameter *parity-runs* 5)
 
@@ -174,6 +212,15 @@
     (dotimes (i *string-size* s)
       (setf (schar s i) (code-char (+ 32 (mod i 64)))))))
 
+
+;;; The MAKE-ARRAY spelling of the same content. Built with the same loop as
+;;; *K-STRING* so the two differ only in how the object was created.
+(defparameter *k-string-vector*
+  (let ((s (make-array *string-size* :element-type 'character
+                                     :initial-element #\a)))
+    (dotimes (i *string-size* s)
+      (setf (schar s i) (code-char (+ 32 (mod i 64)))))))
+
 (defparameter *k-point* (make-k-point 1 2))
 
 ;;; --- Main --------------------------------------------------------------
@@ -188,6 +235,9 @@
   (parity-report "struct-slots" 5
                  (lambda () (k-struct-loop *k-point* 10000000)))
   (parity-report "string-walk" 1
-                 (lambda () (k-string-walk *k-string* *string-passes*))))
+                 (lambda () (k-string-walk *k-string* *string-passes*)))
+  (parity-report "string-walk-vector" 1
+                 (lambda () (k-string-walk-vector *k-string-vector*
+                                                  *string-passes*))))
 
 (parity-main)

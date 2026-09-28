@@ -73,12 +73,12 @@
 ;;; Once DEFCONSTANT takes effect at compile time, a file compiled and loaded in
 ;;; one image evaluates it TWICE. For a number or a symbol the second value is
 ;;; EQL to the first and nothing happens. For a list or a string it is a fresh
-;;; object, so the check fires -- SBCL reports the same thing in the same
-;;; situation ("The constant X is being redefined (from (A B C) to (A B C))"),
-;;; so this is the behaviour to keep, not a difference to paper over.
-;;;
-;;; What was missing is the way out: SBCL offers a CONTINUE restart there, and
-;;; without one a program that means the new value has nowhere to go.
+;;; object. SBCL reports it ("The constant X is being redefined (from (A B C)
+;;; to (A B C))"), and libraries carry #+sbcl workarounds for exactly that.
+;;; dotcl is not in those feature lists, so when one of the two evaluations is
+;;; the compile-time one and the values are similar it keeps the first object
+;;; quietly (see the compile-file tests at the end). Every other non-EQL
+;;; redefinition still signals, with a CONTINUE restart as in SBCL.
 
 (defconstant dcr-eql-value 42)
 
@@ -110,25 +110,52 @@
   (new))
 
 ;; The shape that started this: a list constant in a file that is compiled and
-;; then loaded in the same image. It reports, and CONTINUE gets through it.
-(deftest-compiled-only defconstant-redefinition.compile-file-then-load-reports
+;; then loaded in the same image. The load-time evaluation meets the value the
+;; compile-time evaluation installed; the two lists are similar, so the load
+;; keeps the first object quietly. SBCL signals here (cl-who, clx and
+;; cl-environments carry #+sbcl workarounds for it); CCL and ECL do not.
+;; Loading the same fasl a second time is two load-time evaluations, and that
+;; is still refused, as in SBCL.
+(deftest-compiled-only defconstant-redefinition.compile-file-then-load-keeps-the-value
   (let ((src "dcr-tmp.lisp")
         (fasl "dcr-tmp.fasl"))
     (unwind-protect
         (progn
           (with-open-file (s src :direction :output :if-exists :supersede)
             (format s "(defconstant dcr-from-file '(a b c))~%")
+            (format s "(defconstant dcr-string-from-file (make-string 1 :initial-element #\\Newline))~%")
+            (format s "(defconstant dcr-vector-from-file #(1 (2 \"x\") #(3)))~%")
             (format s "(defun dcr-from-file-value () dcr-from-file)~%"))
           (compile-file src :output-file fasl)
-          (list (handler-case (progn (load fasl) :loaded)
-                  (error () :error))
-                (handler-bind ((error (lambda (c)
-                                        (declare (ignore c))
-                                        (let ((r (find-restart 'continue)))
-                                          (when r (invoke-restart r))))))
-                  (load fasl)
-                  (funcall (intern "DCR-FROM-FILE-VALUE")))))
+          (let ((ct-list (symbol-value (intern "DCR-FROM-FILE")))
+                (ct-string (symbol-value (intern "DCR-STRING-FROM-FILE"))))
+            (list (handler-case (progn (load fasl) :loaded)
+                    (error () :error))
+                  (eq ct-list (symbol-value (intern "DCR-FROM-FILE")))
+                  (eq ct-string (symbol-value (intern "DCR-STRING-FROM-FILE")))
+                  (funcall (intern "DCR-FROM-FILE-VALUE"))
+                  (handler-case (progn (load fasl) :loaded)
+                    (error () :error)))))
       (ignore-errors (delete-file src))
       (ignore-errors (delete-file fasl))
       (ignore-errors (fmakunbound (intern "DCR-FROM-FILE-VALUE")))))
-  (:error (a b c)))
+  (:loaded t t (a b c) :error))
+
+;; A value that differs between compile time and load time is a real
+;; redefinition and is still reported.
+(defvar *dcr-phase* :load)
+
+(deftest-compiled-only defconstant-redefinition.compile-file-then-load-different-value-reports
+  (let ((src "dcr2-tmp.lisp")
+        (fasl "dcr2-tmp.fasl"))
+    (unwind-protect
+        (progn
+          (with-open-file (s src :direction :output :if-exists :supersede)
+            (format s "(defconstant dcr2-phase (list cl-user::*dcr-phase*))~%"))
+          (let ((*dcr-phase* :compile))
+            (compile-file src :output-file fasl))
+          (handler-case (progn (load fasl) :loaded)
+            (error () :error)))
+      (ignore-errors (delete-file src))
+      (ignore-errors (delete-file fasl))))
+  :error)

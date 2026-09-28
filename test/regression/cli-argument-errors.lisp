@@ -58,11 +58,16 @@
 
 ;;; --- no action at all ------------------------------------------------------
 
-(deftest cli-argument-errors.no-arguments-reports-instead-of-repl
-  (let* ((r (%cli-ae-run (list "--core" *cli-ae-core*)))
-         (err (third r)))
-    (list (first r) (and (search "nothing to do" err) t)))
-  (2 t))
+;;; No arguments from a terminal still prints usage and exits 2. It is not
+;;; checked here: the child would inherit the suite's standard input, and when
+;;; that is not a terminal (a pipe, /dev/null) a plain `dotcl` reads its program
+;;; from it instead. That case is in cli-stdin-script.lisp; the terminal case
+;;; cannot be produced from a test. What still holds for any stdin is that an
+;;; empty action list does not start a REPL:
+(deftest cli-argument-errors.no-arguments-is-not-a-repl
+  (let* ((r (%cli-ae-run (list "--core" *cli-ae-core*))))
+    (and (search "dotcl REPL." (second r)) t))
+  nil)
 
 ;;; --- what must keep working ------------------------------------------------
 
@@ -74,9 +79,7 @@
 ;;; Flags after a script name are the script's arguments, not dotcl's.
 (deftest cli-argument-errors.script-arguments-pass-through
   (let* ((path (concatenate 'string
-                            (substitute #\/ #\\ (or (dotcl:getenv "TMPDIR")
-                                                    (dotcl:getenv "TEMP")
-                                                    "/tmp"))
+                            (regression-temp-dir)
                             "/dotcl-cli-ae.lisp")))
     (with-open-file (s path :direction :output :if-exists :supersede)
       (write-string "(format t \"~&ARGS=~s~%\" (length (dotcl:command-line-arguments)))" s))
@@ -99,9 +102,7 @@
 
 (defun %cli-ae-tmp (name)
   (concatenate 'string
-               (substitute #\/ #\\ (or (dotcl:getenv "TMPDIR")
-                                       (dotcl:getenv "TEMP")
-                                       "/tmp"))
+               (regression-temp-dir)
                "/" name))
 
 (deftest cli-argument-errors.pack-options-are-not-dotcl-options

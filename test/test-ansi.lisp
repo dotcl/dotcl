@@ -193,9 +193,24 @@
       (with-open-file (s name :direction :output :if-does-not-exist :create)
         (declare (ignore s))))))
 
-;;; Clean up scratch directory from previous test runs (needed by ensure-directories-exist.8)
+;;; ENSURE-DIRECTORIES-EXIST.8 (files) runs with *default-pathname-defaults* =
+;;; sandbox/ and needs sandbox/scratch/ to be either absent or to hold only
+;;; foo.txt: it deletes foo.txt and then the directory inside one IGNORE-ERRORS,
+;;; so when foo.txt is missing the delete of foo.txt signals, the directory
+;;; survives, and ENSURE-DIRECTORIES-EXIST correctly returns NIL as its second
+;;; value. The streams tests open scratch/foo.txt there and need the directory.
+;;; Reset it to exactly the state the test itself leaves behind (directory plus
+;;; foo.txt), whatever earlier runs left, and say so when that is not possible.
+;;; The project-root scratch/ is not used by any test (every test runs under the
+;;; sandbox/ default); older harnesses created it, so remove it.
 (ignore-errors (dotcl-delete-directory "scratch/"))
-(ignore-errors (delete-file "scratch/foo.txt"))
+(dotcl-delete-directory "sandbox/scratch/")
+(when (probe-file "sandbox/scratch/")
+  (format t "~&WARNING: could not delete sandbox/scratch/; ENSURE-DIRECTORIES-EXIST.8 may fail~%"))
+(ensure-directories-exist "sandbox/scratch/foo.txt")
+(with-open-file (s "sandbox/scratch/foo.txt" :direction :output
+                   :if-exists :supersede :if-does-not-exist :create)
+  (declare (ignore s)))
 
 ;;; Load files tests
 (format t "=== Loading files tests ===~%")
@@ -312,9 +327,8 @@
   (with-open-file (s "sandbox/class-precedence-lists.txt" :direction :output :if-does-not-exist :create)
     (declare (ignore s))))
 
-;;; Create scratch directories for streams tests (scratch/foo.txt is used by several tests)
-(ensure-directories-exist "scratch/foo.txt")
-(ensure-directories-exist "sandbox/scratch/foo.txt")
+;;; sandbox/scratch/ for the streams tests is prepared together with the files
+;;; tests above (see ENSURE-DIRECTORIES-EXIST.8).
 
 ;;; Create test data files expected by streams tests (in cwd AND sandbox/)
 (dolist (name '("file-position.txt" "file-length.txt" "input-stream-p.txt"

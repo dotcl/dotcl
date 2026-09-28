@@ -91,3 +91,54 @@
     (handler-case (setf (aet-typed-nums h) (vector 1 2 3))
       (type-error () :type-error)))
   :type-error)
+
+;;; ---- the array's own side: what MAKE-ARRAY records ----
+;;;
+;;; The fix above was about the TYPE being asked. The ARRAY had the same hole:
+;;; MAKE-ARRAY with an unspecialized element type kept the name it was given --
+;;; the class name for AET-ELEM, the bare head OR for (OR NULL AET-ELEM) -- as if
+;;; it were a specialization. ARRAY-ELEMENT-TYPE then reported it, SIMPLE-VECTOR-P
+;;; said no, and TYPEP against the very type the array was made with failed:
+;;;
+;;;   (make-array 32 :element-type '(or null viewport) :initial-element nil)
+;;;   ;; slot ... is declared (SIMPLE-ARRAY (OR NULL VIEWPORT) (32)), got #(NIL ...)
+
+(deftest array-element-type-upgrading.make-array-reports-upgraded-type
+  (list (array-element-type (make-array 3 :element-type 'aet-elem))
+        (array-element-type (make-array 3 :element-type '(or null aet-elem)))
+        (array-element-type (make-array 3 :element-type '(member :a :b)))
+        (equal (array-element-type (make-array 3 :element-type 'aet-elem))
+               (upgraded-array-element-type 'aet-elem)))
+  (t t t t))
+
+(deftest array-element-type-upgrading.make-array-is-simple-vector
+  (list (simple-vector-p (make-array 3 :element-type 'aet-elem))
+        (simple-vector-p (make-array 3 :element-type '(or null aet-elem))))
+  (t t))
+
+(deftest array-element-type-upgrading.make-array-satisfies-its-own-type
+  (let ((v (make-array 32 :element-type '(or null aet-elem) :initial-element nil)))
+    (list (typep v '(simple-array (or null aet-elem) (32)))
+          (typep v '(simple-array aet-elem (32)))
+          (typep v 'simple-vector)))
+  (t t t))
+
+(defstruct aet-scissors
+  (views (make-array 4 :element-type '(or null aet-elem) :initial-element nil)
+         :type (simple-array (or null aet-elem) (4))))
+
+;; The shape a library failed to load through: the slot's default is built with
+;; the same element type the slot is declared with.
+(deftest array-element-type-upgrading.slot-default-matches-declaration
+  (let ((s (make-aet-scissors)))
+    (setf (aet-scissors-views s)
+          (make-array 4 :element-type '(or null aet-elem) :initial-element nil))
+    (length (aet-scissors-views s)))
+  4)
+
+;; Specialized element types are still recorded as themselves.
+(deftest array-element-type-upgrading.make-array-specialized-unchanged
+  (list (array-element-type (make-array 3 :element-type 'double-float))
+        (array-element-type (make-array 3 :element-type '(unsigned-byte 8)))
+        (array-element-type (make-array 3 :element-type 'character)))
+  (double-float (unsigned-byte 8) character))

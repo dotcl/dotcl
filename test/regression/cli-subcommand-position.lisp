@@ -61,3 +61,44 @@
          (out (concatenate 'string (second result) (third result))))
     (and (search "dotcl clean:" out) t))
   nil)
+
+;;; --asm ran its own early path: boot the core, then LOAD every token that is
+;;; not --eval / --load / --asd-search-path, and return. A subcommand never
+;;; reached the code that parses subcommands, so `--asm x.sil repl` reported
+;;; "LOAD: file not found: .../repl" (same for build and pack) while the same
+;;; line with --core worked. The REPL is started with stdin at EOF: it prints
+;;; its banner and ends normally.
+(defun %cli-sp-repl-banner (args)
+  "First line the child writes to stdout, and its exit code."
+  (let* ((p (dotcl:launch-process *cli-sp-exe* args :input nil :error nil))
+         (line (read-line (dotcl:process-output p) nil "")))
+    (loop while (read-line (dotcl:process-output p) nil nil))
+    (list (and (search "dotcl REPL." line) t) (dotcl:process-wait p))))
+
+(deftest cli-subcommand-position.asm-then-repl
+  (%cli-sp-repl-banner (list "--asm" *cli-sp-core* "repl"))
+  (t 0))
+
+(deftest cli-subcommand-position.repl-then-asm
+  (%cli-sp-repl-banner (list "repl" "--asm" *cli-sp-core*))
+  (t 0))
+
+;;; build and pack reach their own argument checks instead of LOAD. Their
+;;; missing-argument messages are the evidence that the subcommand ran.
+(deftest cli-subcommand-position.asm-then-build
+  (let ((result (%cli-sp-run (list "--asm" *cli-sp-core* "build"))))
+    (list (first result) (and (search "build: missing <asd> path" (third result)) t)))
+  (2 t))
+
+(deftest cli-subcommand-position.asm-then-pack
+  (let ((result (%cli-sp-run (list "--asm" *cli-sp-core* "pack"))))
+    (list (and (search "pack: missing required option" (third result)) t)
+          (and (search "LOAD" (third result)) t)))
+  (t nil))
+
+;;; Without a subcommand the --asm path is used exactly as before.
+(deftest cli-subcommand-position.asm-eval-unchanged
+  (let ((result (%cli-sp-run (list "--asm" *cli-sp-core*
+                                   "--eval" "(princ :asm-eval-ok)"))))
+    (list (first result) (and (search "ASM-EVAL-OK" (second result)) t)))
+  (0 t))

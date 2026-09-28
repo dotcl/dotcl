@@ -44,6 +44,12 @@
 ;;; source-form collision the other sentinels have to guard against.
 (defvar *mscope-restore-sentinel* (list '#:restore-macroexpand-scope))
 
+;; Marks the "restore *lexical-operators*" sentinel, the same way. The walks
+;; extend *LEXICAL-OPERATORS* at a MACROLET, and at an FLET / LABELS that hides
+;; a macro, exactly where compile does, so a macro's &ENVIRONMENT (and the
+;; expansion cached for code-gen) is the same in both passes.
+(defvar *lexops-restore-sentinel* (list '#:restore-lexical-operators))
+
 ;; Per-top-level-form EQ memo: lambda form -> list of free-variable CANDIDATE
 ;; names (structurally free w.r.t. the lambda's own params, collected under
 ;; *ffv-assume-bound* so the set is *locals*-independent = a pure function of the
@@ -53,10 +59,37 @@
 ;; local-bound-p filter is applied at each enclosing merge, not baked into the memo.
 (defvar *ffv-free-cache* nil)
 
+(defun %walker-macroexpand (form expander bound)
+  "Macroexpand FORM for an analysis walk. Returns (values EXPANSION HITS):
+   EXPANSION is NIL when the expander signals, and HITS lists the global symbol
+   macros the expander resolved without knowing whether a binding in the
+   walked code shadows them (see *SM-GLOBAL-HITS*). BOUND is the free-variable
+   walk's BND, or :NONE for a walk that does not track bound names."
+  (let ((*sm-walker-context* t)
+        (*sm-walker-bound* bound)
+        (*sm-global-hits* nil))
+    (values (handler-case (cached-macroexpand form expander)
+              (error () nil))
+            *sm-global-hits*)))
+
+(defun %walker-macroexpand-for-mutation (form expander mutated-ht in-lambda mdepth push-fn)
+  "%WALKER-MACROEXPAND for the mutation / capture walk. Each global symbol macro
+   the expansion resolved is only ever looked up as a place (setf-family
+   expanders are the only macro-time callers of LOOKUP-SYMBOL-MACRO), so if the
+   name is in fact a shadowing variable it is being assigned: record it as
+   mutated, and hand it to PUSH-FN as a reference for the capture side.
+   Over-recording is safe (it can only box a variable that did not need it)."
+  (multiple-value-bind (exp hits) (%walker-macroexpand form expander :none)
+    (dolist (h hits)
+      (setf (gethash (var-name h) mutated-ht) t)
+      (funcall push-fn (cons h (cons in-lambda mdepth))))
+    exp))
+
 (defun find-free-vars-expr (expr bound free-ht)
   "Walk expr finding free variable references. Results accumulated in free-ht.
    Iterative worklist version; no recursion depth limit."
-  (let ((worklist (list (cons expr (cons bound 0)))))
+  (let ((worklist (list (cons expr (cons bound 0))))
+        (*lexical-operators* *lexical-operators*))
     (loop while worklist do
       (let* ((item (pop worklist))
              (e (car item)))
@@ -65,6 +98,8 @@
           ;; The marker is a unique private object, so no source form collides.
           ((eq e *mscope-restore-sentinel*)
            (setf *macroexpand-scope* (cdr item)))
+          ((eq e *lexops-restore-sentinel*)
+           (setf *lexical-operators* (cdr item)))
           ;; Restore-macro sentinel: restore *macros* entry after macrolet body.
           ;; Guard symbolp name so that a bare :restore-macro keyword from analyzed
           ;; source code (where cadr item is a bnd-list, not a symbol) is ignored.
@@ -115,6 +150,13 @@
                   (cond
                     ((and (symbolp head) (eq head 'quote)) nil)
                     ((and (symbolp head) (eq head 'defun)) nil)
+                    ;; The portable MULTIPLE-VALUE-BIND shape compiles as a LET*
+                    ;; (%MV-CALL-LAMBDA-BIND), not as a closure: walk it that way.
+                    ((let ((bind (and (eq head 'multiple-value-call)
+                                      (%mv-call-lambda-bind e))))
+                       (when bind
+                         (push (cons bind (cons bnd mdepth)) worklist)
+                         t)))
                     ;; cond: each clause is (test . body) and EVERY element is an
                     ;; evaluated expression. The generic walk below would treat a
                     ;; clause whose test is a symbol, e.g. (cond (start-anchored-p ...)),
@@ -316,6 +358,7 @@
                        ;; cached per scope and the analysis walk agrees with code-gen.
                        ;; Same source MACRO-DEFS cons as compile-macrolet.
                        (push (cons *mscope-restore-sentinel* *macroexpand-scope*) worklist)
+                       (push (cons *lexops-restore-sentinel* *lexical-operators*) worklist)
                        (setf *macroexpand-scope* (cons macro-defs *macroexpand-scope*))
                        ;; Register macros immediately (same as compile-macrolet)
                        (dolist (def macro-defs)
@@ -324,6 +367,7 @@
                                 (mbody (cddr def)))
                            (setf (gethash mname *macros*)
                                  (eval (%macrolet-expander-form mparams mbody)))))
+                       (setf *lexical-operators* (%macrolet-lexical-operators macro-defs))
                        ;; Push body forms (LIFO: processed BEFORE restore sentinels)
                        (dolist (form mlbody)
                          (push (cons form (cons bnd mdepth)) worklist))))
@@ -364,7 +408,19 @@
                             (lbody (cddr e))
                             (fn-names (loop for fd in fn-defs
                                             for name = (car fd)
-                                            when (symbolp name) collect (symbol-name name))))
+                                            when (symbolp name) collect (symbol-name name)))
+                            (shadows (%flet-macro-shadows fn-defs)))
+                       ;; Names that hide a macro: in scope for the body, and for
+                       ;; LABELS also for the definitions (as in compile-flet /
+                       ;; compile-labels). LIFO: an FLET enters after its
+                       ;; definitions are pushed, so they are walked after the
+                       ;; restore sentinels, outside the scope.
+                       (flet ((enter ()
+                                (push (cons *mscope-restore-sentinel* *macroexpand-scope*) worklist)
+                                (push (cons *lexops-restore-sentinel* *lexical-operators*) worklist)
+                                (setf *macroexpand-scope* (cons fn-defs *macroexpand-scope*)
+                                      *lexical-operators* (%flet-lexical-operators shadows))))
+                         (when (and shadows (eq head 'labels)) (enter))
                        ;; Function bodies see outer scope (flet) or same scope (labels)
                        ;; Labels fn-names are NOT added to fn body bound: they are captured
                        ;; as free vars via boxed variables in *locals*
@@ -384,10 +440,11 @@
                              ;; Push fn body forms
                              (dolist (form fn-body)
                                (push (cons form (cons inner-bound mdepth)) worklist)))))
+                       (when (and shadows (eq head 'flet)) (enter))
                        ;; Body sees all fn-names as bound
                        (let ((body-bound (append fn-names bnd)))
                          (dolist (form lbody)
-                           (push (cons form (cons body-bound mdepth)) worklist)))))
+                           (push (cons form (cons body-bound mdepth)) worklist))))))
                     ;; CLOS primitives: analyze sub-expressions normally
                     ((and (symbolp head) (member head '(%make-class %make-slot-def %register-class %set-class-default-initargs
                                                         find-class %find-class-or-nil class-of class-name
@@ -410,10 +467,18 @@
                        (when (and (symbolp head) head
                                   (< mdepth *macro-expand-depth-limit*)
                                   (%stack-space-available-p)
+                                  (not (%lexical-function-p head))
                                   (find-macro-expander head))
                          (let ((expander (find-macro-expander head)))
-                           (setf expanded (handler-case (cached-macroexpand e expander)
-                                            (error () nil)))))
+                           (multiple-value-bind (exp hits)
+                               (%walker-macroexpand e expander bnd)
+                             (setf expanded exp)
+                             ;; A place that is a global symbol macro may be a
+                             ;; LET-bound variable here: walk the name as a
+                             ;; reference so a binding outside this form is still
+                             ;; captured.
+                             (dolist (h hits)
+                               (push (cons h (cons bnd mdepth)) worklist)))))
                        (if expanded
                            (push (cons expanded (cons bnd (1+ mdepth))) worklist)
                            (progn
@@ -534,7 +599,8 @@
   "Per-top-level-form EQ memo: lambda form -> (mutated-names . ref-names).")
 
 (defun find-mutated-and-captured-vars-expr (expr var-names mutated-ht captured-ht inside-lambda)
-  (let ((worklist (list (cons expr (cons inside-lambda 0)))))
+  (let ((worklist (list (cons expr (cons inside-lambda 0))))
+        (*lexical-operators* *lexical-operators*))
     (loop while worklist do
       (let* ((item (pop worklist))
              (e (car item))
@@ -543,6 +609,8 @@
         (cond
           ((eq e *mscope-restore-sentinel*)
            (setf *macroexpand-scope* in-lambda))
+          ((eq e *lexops-restore-sentinel*)
+           (setf *lexical-operators* in-lambda))
           ((and (eq e :restore-symbol-macros) (not (eq in-lambda t)))
            (setf *symbol-macros* in-lambda))
           ((and (eq e :restore-macro) (consp in-lambda))
@@ -575,6 +643,13 @@
           ((consp e)
            (let ((head (car e)))
              (cond
+               ;; The portable MULTIPLE-VALUE-BIND shape compiles as a LET*
+               ;; (%MV-CALL-LAMBDA-BIND), not as a closure: walk it that way.
+               ((let ((bind (and (eq head 'multiple-value-call)
+                                 (%mv-call-lambda-bind e))))
+                  (when bind
+                    (push (cons bind (cons in-lambda mdepth)) worklist)
+                    t)))
                ;; --- mutation-recording place forms (from find-mutated-vars-expr) ---
                ;; Each records the target into mutated-ht AND pushes subforms/targets
                ;; so the capture walk still sees them.
@@ -596,9 +671,10 @@
                                        (find-macro-expander head))
                               (let* ((single-form `(,head ,var ,val))
                                      (expander (find-macro-expander head))
-                                     (expanded (handler-case
-                                                   (cached-macroexpand single-form expander)
-                                                 (error () nil))))
+                                     (expanded (%walker-macroexpand-for-mutation
+                                                single-form expander mutated-ht
+                                                in-lambda mdepth
+                                                (lambda (item) (push item worklist)))))
                                 (when expanded
                                   (push (cons expanded (cons in-lambda (1+ mdepth))) worklist))))
                             (push (cons var (cons in-lambda mdepth)) worklist)))
@@ -676,6 +752,15 @@
                     (when (and (consp b) (cadr b))
                       (push (cons (cadr b) (cons in-lambda mdepth)) worklist)))))
                ((and (symbolp head) (or (eq head 'flet) (eq head 'labels)) (listp (cadr e)))
+                (let ((shadows (%flet-macro-shadows (cadr e))))
+                ;; Names that hide a macro are in scope for the body, and for
+                ;; LABELS also for the definitions: as in the free-variable walk.
+                (flet ((enter ()
+                         (push (cons *mscope-restore-sentinel* (cons *macroexpand-scope* mdepth)) worklist)
+                         (push (cons *lexops-restore-sentinel* (cons *lexical-operators* mdepth)) worklist)
+                         (setf *macroexpand-scope* (cons (cadr e) *macroexpand-scope*)
+                               *lexical-operators* (%flet-lexical-operators shadows))))
+                (when (and shadows (eq head 'labels)) (enter))
                 (dolist (fdef (cadr e))
                   ;; Walk only the initializer forms of the lambda list (the
                   ;; default-value / supplied-p expressions of &optional/&key/&aux),
@@ -694,8 +779,9 @@
                         (push (cons (cadr p) (cons t mdepth)) worklist))))
                   (dolist (form (cddr fdef))
                     (push (cons form (cons t mdepth)) worklist)))
+                (when (and shadows (eq head 'flet)) (enter))
                 (dolist (form (cddr e))
-                  (push (cons form (cons in-lambda mdepth)) worklist)))
+                  (push (cons form (cons in-lambda mdepth)) worklist)))))
                ((and (symbolp head) (eq head 'handler-case))
                 (when (cadr e)
                   (push (cons (cadr e) (cons in-lambda mdepth)) worklist))
@@ -722,6 +808,7 @@
                            (old-entry (gethash mname *macros*)))
                       (push (cons :restore-macro (cons (cons mname old-entry) mdepth)) worklist)))
                   (push (cons *mscope-restore-sentinel* (cons *macroexpand-scope* mdepth)) worklist)
+                  (push (cons *lexops-restore-sentinel* (cons *lexical-operators* mdepth)) worklist)
                   (setf *macroexpand-scope* (cons macro-defs *macroexpand-scope*))
                   (dolist (def macro-defs)
                     (let* ((mname (car def))
@@ -729,6 +816,7 @@
                            (mbody (cddr def)))
                       (setf (gethash mname *macros*)
                             (eval (%macrolet-expander-form mparams mbody)))))
+                  (setf *lexical-operators* (%macrolet-lexical-operators macro-defs))
                   (dolist (form mlbody)
                     (push (cons form (cons in-lambda mdepth)) worklist))))
                ((and (symbolp head) (eq head 'symbol-macrolet))
@@ -745,10 +833,12 @@
                   (when (and (symbolp head) head
                              (< mdepth *macro-expand-depth-limit*)
                              (%stack-space-available-p)
+                             (not (%lexical-function-p head))
                              (find-macro-expander head))
                     (let ((expander (find-macro-expander head)))
-                      (setf expanded (handler-case (cached-macroexpand e expander)
-                                       (error () nil)))))
+                      (setf expanded (%walker-macroexpand-for-mutation
+                                      e expander mutated-ht in-lambda mdepth
+                                      (lambda (item) (push item worklist))))))
                   (if expanded
                       (push (cons expanded (cons in-lambda (1+ mdepth))) worklist)
                       (do-list-safe (sub e)

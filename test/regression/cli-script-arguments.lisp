@@ -17,7 +17,7 @@
       "compiler/cil-out.sil"))
 
 (defvar *csa-dir*
-  (substitute #\/ #\\ (or (dotcl:getenv "TMPDIR") (dotcl:getenv "TEMP") "/tmp")))
+  (regression-temp-dir))
 
 (defun %csa-script (name text)
   (let ((path (concatenate 'string *csa-dir* "/" name)))

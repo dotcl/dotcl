@@ -619,19 +619,7 @@ public static partial class Runtime
                 return ns;
             }
             case LispRestart restart:
-                if (!escape)
-                {
-                    if (restart.ReportFunction != null)
-                    {
-                        var sw = new System.IO.StringWriter();
-                        var stream = new LispStringOutputStream(sw);
-                        Runtime.Funcall(restart.ReportFunction, new LispObject[] { stream });
-                        return sw.ToString();
-                    }
-                    if (restart.Description != null)
-                        return restart.Description;
-                }
-                return restart.ToString();
+                return escape ? restart.ToString() : restart.Report();
             case LispRandomState rs:
             {
                 if (GetPrintReadably() || escape)
@@ -669,6 +657,22 @@ public static partial class Runtime
                     }
                     return FormatCompound(obj, escape);
                 }
+                // A funcallable instance (or an instance of a user subclass of
+                // STANDARD-GENERIC-FUNCTION) is a GenericFunction whose StoredClass
+                // is the user's class. PRINT-OBJECT dispatches on that class like
+                // on any other instance; without this every such object printed
+                // as the built-in #<GENERIC-FUNCTION ...>.
+                if (obj is GenericFunction ufgf && ufgf.StoredClass is { } ufCls)
+                {
+                    var poSym = Startup.Sym("PRINT-OBJECT");
+                    if (poSym?.Function is GenericFunction poGf
+                        && HasSpecializedPrintObjectMethodForClass(poGf, ufCls)
+                        && EnterPrintObject(ufgf))
+                    {
+                        try { return InvokePrintObjectBound(poGf, ufgf, escape); }
+                        finally { ExitPrintObject(ufgf); }
+                    }
+                }
                 return obj.ToString();
         }
     }
@@ -677,8 +681,25 @@ public static partial class Runtime
     /// Get the condition report string for use with ~a / princ.
     /// Uses :format-control/:format-arguments if available, otherwise the Message field.
     /// </summary>
+    private static LispObject? InstanceFormatControl(LispInstance inst)
+        => inst.Class.SlotIndex.TryGetValue("FORMAT-CONTROL", out int idx)
+           && idx < inst.Slots.Length ? inst.Slots[idx] : null;
+
+    private static LispObject[] InstanceFormatArguments(LispInstance inst)
+        => inst.Class.SlotIndex.TryGetValue("FORMAT-ARGUMENTS", out int idx)
+           && idx < inst.Slots.Length && inst.Slots[idx] is Cons args
+            ? Startup.ListToArray(args) : Array.Empty<LispObject>();
+
     private static string GetConditionReport(LispCondition cond)
     {
+        // An instance MAKE-INSTANCE made and ERROR / SIGNAL wrapped afterwards
+        // carries its format control in the slot only.
+        if (cond.FormatControl is Nil && cond is LispInstanceCondition lic
+            && InstanceFormatControl(lic.Instance) is LispString ifc)
+        {
+            try { return FormatString(ifc.Value, InstanceFormatArguments(lic.Instance)); }
+            catch { }
+        }
         if (cond.FormatControl is LispString fcs)
         {
             var fmtArgs = cond.FormatArguments is Cons fac
@@ -1077,7 +1098,9 @@ public static partial class Runtime
         return s;
     }
 
-    private static int _formatConsDepth;
+    // Per thread: it is bumped and restored around every nested print, and threads
+    // printing at the same time must not see (or lose) each other's updates.
+    [ThreadStatic] private static int _formatConsDepth;
     private const int MaxFormatConsDepth = 256;
 
     /// <summary>What to emit when the nesting guard trips. The guard exists to keep
@@ -1185,7 +1208,11 @@ public static partial class Runtime
             var fn = best.Value.Function as LispFunction
                      ?? (best.Value.Function is Symbol fsym ? fsym.Function as LispFunction : null);
             if (fn != null)
-                fn.Invoke(new LispObject[] { stream, obj });
+            {
+                PprintPushStaged(sw.GetStringBuilder());
+                try { fn.Invoke(new LispObject[] { stream, obj }); }
+                finally { PprintPopStaged(sw.GetStringBuilder()); }
+            }
             return sw.ToString();
         }
         finally { _pprintDispatchInProgress!.RemoveAt(_pprintDispatchInProgress.Count - 1); }
@@ -1598,7 +1625,9 @@ public static partial class Runtime
         {
             var sw = new System.IO.StringWriter();
             var stream = new LispStringOutputStream(sw);
-            gf.Invoke(new LispObject[] { obj, stream });
+            PprintPushStaged(sw.GetStringBuilder());
+            try { gf.Invoke(new LispObject[] { obj, stream }); }
+            finally { PprintPopStaged(sw.GetStringBuilder()); }
             return sw.ToString();
         }
         finally { DynamicBindings.Pop(peSym); }
@@ -1646,6 +1675,24 @@ public static partial class Runtime
                     try { return InvokePrintObjectBound(gfInst, inst, escape); }
                     finally { ExitPrintObject(inst); }
                 }
+                // A condition MAKE-INSTANCE made (MAKE-CONDITION wraps its instance
+                // instead) still reports under princ / ~A from its format control. Checked
+                // before *print-readably*: with escape off SBCL reports then too.
+                if (!escape && IsConditionClass(inst.Class)
+                    && InstanceFormatControl(inst) is LispString fcStr)
+                    return FormatString(fcStr.Value, InstanceFormatArguments(inst));
+                // The default method prints #<...>, which does not read back. Under
+                // *print-readably* CLHS (PRINT-UNREADABLE-OBJECT, 22.1.3) wants
+                // PRINT-NOT-READABLE instead. This is also where a user method's
+                // CALL-NEXT-METHOD lands.
+                if (GetPrintReadably())
+                {
+                    var err = new LispError(
+                        $"{inst} cannot be printed readably");
+                    err.ConditionTypeName = "PRINT-NOT-READABLE";
+                    err.PrintNotReadableObjectRef = inst;
+                    throw new LispErrorException(err);
+                }
                 return inst.ToString();
             }
             return obj.ToString();
@@ -1654,10 +1701,12 @@ public static partial class Runtime
     }
 
     private static bool HasSpecializedPrintObjectMethodForInstance(GenericFunction gf, LispInstance inst)
+        => HasSpecializedPrintObjectMethodForClass(gf, inst.Class);
+
+    private static bool HasSpecializedPrintObjectMethodForClass(GenericFunction gf, LispClass instClass)
     {
         var tClass = FindClass(Startup.Sym("T")) as LispClass;
         var soClass = FindClass(Startup.Sym("STANDARD-OBJECT")) as LispClass;
-        var instClass = inst.Class;
         foreach (var method in gf.Methods)
         {
             if (method.Qualifiers.Length == 0
@@ -1970,6 +2019,7 @@ public static partial class Runtime
         w.Write(FormatTop(obj, true));
         w.Write(' ');
         w.Flush();
+        UpdateAtLineStart(Nil.Instance, ' ');
         return obj;
     }
 
@@ -1980,14 +2030,26 @@ public static partial class Runtime
         w.Write(FormatTop(obj, true));
         w.Write(' ');
         w.Flush();
+        UpdateAtLineStart(stream, ' ');
         return obj;
+    }
+
+    /// <summary>Record on STREAM whether TEXT, just written to it, left it at the
+    /// start of a line. FRESH-LINE reads that flag, so every path that writes
+    /// printed output straight to the stream's TextWriter has to keep it current.
+    /// Empty text writes nothing and leaves the flag alone.</summary>
+    internal static void NoteWritten(LispObject stream, string text)
+    {
+        if (text.Length > 0) UpdateAtLineStart(stream, text[text.Length - 1]);
     }
 
     public static LispObject Prin1(LispObject obj)
     {
         var w = GetStandardOutputWriter();
-        w.Write(FormatTop(obj, true));
+        var text = FormatTop(obj, true);
+        w.Write(text);
         w.Flush();
+        NoteWritten(Nil.Instance, text);
         return obj;
     }
 
@@ -1998,6 +2060,7 @@ public static partial class Runtime
         w.Write(text);
         PprintTrackWrite(text);
         w.Flush();
+        NoteWritten(stream, text);
         return obj;
     }
 
@@ -2025,8 +2088,10 @@ public static partial class Runtime
         try
         {
             var w = GetStandardOutputWriter();
-            w.Write(FormatTop(obj, false));
+            var text = FormatTop(obj, false);
+            w.Write(text);
             w.Flush();
+            NoteWritten(Nil.Instance, text);
             return obj;
         }
         finally
@@ -2050,6 +2115,7 @@ public static partial class Runtime
             w.Write(text);
             PprintTrackWrite(text);
             w.Flush();
+            NoteWritten(stream, text);
             return obj;
         }
         finally
@@ -2274,6 +2340,11 @@ public static partial class Runtime
 
         var writer = GetTextWriter(stream);
         writer.Write('\n');
+        Runtime.UpdateAtLineStart(stream, '\n');
+        // Inside a logical block the new line starts with the per-line prefixes,
+        // as after TERPRI.
+        PprintTrackWriteChar('\n');
+        PprintAfterNewline(writer);
         return T.Instance;
     }
 
@@ -2348,6 +2419,7 @@ public static partial class Runtime
                 w1.Write(t1);
                 Runtime.PprintTrackWrite(t1);
                 w1.Flush();
+                Runtime.NoteWritten(Nil.Instance, t1);
                 return obj;
             }
             if ((args.Length - 1) % 2 != 0)
@@ -2410,6 +2482,7 @@ public static partial class Runtime
                 writer.Write(text);
                 Runtime.PprintTrackWrite(text);
                 writer.Flush();
+                Runtime.NoteWritten(streamArg ?? Nil.Instance, text);
                 return obj;
             } finally {
                 for (int i = bindings.Count - 1; i >= 0; i--) DynamicBindings.Pop(bindings[i].Item1);
@@ -2459,8 +2532,10 @@ public static partial class Runtime
             DynamicBindings.Push(Startup.Sym("*PRINT-PRETTY*"), T.Instance);
             try {
                 w.Write('\n');
-                w.Write(Runtime.FormatTop(obj, true));
+                var ptext = Runtime.FormatTop(obj, true);
+                w.Write(ptext);
                 w.Flush();
+                Runtime.UpdateAtLineStart(stream, ptext.Length > 0 ? ptext[ptext.Length - 1] : '\n');
             } finally {
                 DynamicBindings.Pop(Startup.Sym("*PRINT-PRETTY*"));
             }
@@ -2726,8 +2801,10 @@ public static partial class Runtime
             var fn = new LispFunction(args => {
                 if (args.Length < 2) throw new LispErrorException(new LispProgramError("PRINT-OBJECT: requires 2 arguments"));
                 var writer = Runtime.GetOutputWriter(args[1]);
-                writer.Write(Runtime.FormatTop(args[0], true));
+                var potext = Runtime.FormatTop(args[0], true);
+                writer.Write(potext);
                 writer.Flush();
+                Runtime.NoteWritten(args[1], potext);
                 return args[0];
             }, "PRINT-OBJECT", -1);
             Emitter.CilAssembler.RegisterFunction("PRINT-OBJECT", fn);

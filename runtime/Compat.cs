@@ -266,6 +266,20 @@ internal static class Compat
         => OperatingSystem.IsWindows();
 #endif
 
+    /// <summary>The running executable's path, or null where it cannot be had.
+    /// Environment.ProcessPath does not exist in netstandard2.0; the entry
+    /// assembly is the nearest thing there, and is empty for a single-file
+    /// publish, hence the nullable return either way.</summary>
+    public static string? ProcessPath()
+#if NETSTANDARD2_0
+    {
+        var loc = System.Reflection.Assembly.GetEntryAssembly()?.Location;
+        return string.IsNullOrEmpty(loc) ? null : loc;
+    }
+#else
+        => Environment.ProcessPath;
+#endif
+
     public static bool IsLinux()
 #if NETSTANDARD2_0
         => RuntimeInformation.IsOSPlatform(OSPlatform.Linux);

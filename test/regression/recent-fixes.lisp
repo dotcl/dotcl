@@ -588,7 +588,7 @@
 ;;; and verifies the output is a valid PE/FASL (starts with "MZ").
 (defun %d678-save-application-smoke ()
   (let* ((tmp (format nil "~a/dotcl-saveapp-~a"
-                      (or (dotcl:getenv "TEMP") "/tmp")
+                      (regression-temp-dir)
                       (get-internal-real-time)))
          (src (format nil "~a/main.lisp" tmp))
          (out (format nil "~a/out.fasl" tmp)))
@@ -755,7 +755,7 @@
 ;;; the compile-file source below.
 (defun %d713-setf-fn-fasl ()
   (let* ((tmp (format nil "~a/dotcl-d713-~a"
-                      (or (dotcl:getenv "TEMP") "/tmp")
+                      (regression-temp-dir)
                       (get-internal-real-time)))
          (src (format nil "~a/src.lisp" tmp)))
     (ensure-directories-exist (concatenate 'string tmp "/"))
@@ -819,7 +819,7 @@
 ;;; top-level, emit monolithically into the init method instead of splitting.
 (defun %d719-if-with-defun-fasl ()
   (let* ((tmp (format nil "~a/dotcl-d719-~a"
-                      (or (dotcl:getenv "TEMP") "/tmp")
+                      (regression-temp-dir)
                       (get-internal-real-time)))
          (src (format nil "~a/src.lisp" tmp)))
     (ensure-directories-exist (concatenate 'string tmp "/"))
@@ -848,7 +848,7 @@
 ;;; `*static-edge-table*` literal which was used as `(aref table i j)`.
 (defun %d-2darray-literal-fasl ()
   (let* ((tmp (format nil "~a/dotcl-2darr-~a"
-                      (or (dotcl:getenv "TEMP") "/tmp")
+                      (regression-temp-dir)
                       (get-internal-real-time)))
          (src (format nil "~a/src.lisp" tmp)))
     (ensure-directories-exist (concatenate 'string tmp "/"))
@@ -872,7 +872,7 @@
 ;;; element-type != T, dropping it (sibling of the multi-dimensional array fix above).
 (defun %d747-1d-specialized-vector-fasl ()
   (let* ((tmp (format nil "~a/dotcl-1dvec-~a"
-                      (or (dotcl:getenv "TEMP") "/tmp")
+                      (regression-temp-dir)
                       (get-internal-real-time)))
          (src (format nil "~a/src.lisp" tmp)))
     (ensure-directories-exist (concatenate 'string tmp "/"))
@@ -1162,7 +1162,7 @@
 ;;; handles these transparently. Works even when LongPathsEnabled=0.
 #+windows
 (deftest d850-windows-long-path
-  (let* ((tmp (dotnet:static "System.IO.Path" "GetTempPath"))
+  (let* ((tmp (concatenate 'string (regression-temp-dir) "/"))
          (root (concatenate 'string (substitute #\/ #\\ tmp)
                             "dotcl-longpath-regtest"))
          (deep (with-output-to-string (out)
@@ -1453,7 +1453,7 @@
   t)
 
 (deftest-compiled-only make-load-form-fasl-roundtrip
-  (let* ((tmp (uiop:temporary-directory))
+  (let* ((tmp (pathname (concatenate 'string (regression-temp-dir) "/")))
          (src (merge-pathnames "mlf-fasl-test.lisp" tmp))
          (out (merge-pathnames "mlf-fasl-test.fasl" tmp)))
     (with-open-file (f src :direction :output :if-exists :supersede)
@@ -1480,7 +1480,7 @@
           (make-instance '%mlf-cls :name ',(%mlf-name x))))
 
 (deftest-compiled-only make-load-form-creation-form-runs-at-load
-  (let* ((tmp (uiop:temporary-directory))
+  (let* ((tmp (pathname (concatenate 'string (regression-temp-dir) "/")))
          (src (merge-pathnames "mlf-creation-test.lisp" tmp))
          (out (merge-pathnames "mlf-creation-test.fasl" tmp)))
     (setf *mlf-creation-log* nil)
@@ -1640,7 +1640,7 @@
 ;;; FASL round-trip; a plain namestring round-trip dropped :newest to nil
 ;;; (ANSI COMPILE-FILE.16 via *compile-file-pathname*).
 (deftest-compiled-only fasl-pathname-preserves-version
-  (let* ((tmp (uiop:temporary-directory))
+  (let* ((tmp (pathname (concatenate 'string (regression-temp-dir) "/")))
          (src (merge-pathnames "rf-pathver.lisp" tmp))
          (out (merge-pathnames "rf-pathver.fasl" tmp)))
     (with-open-file (f src :direction :output :if-exists :supersede)
@@ -1815,6 +1815,33 @@
     (1+ (cadr leaf)))             ; arg0 of %bta-leaf is the number 30
   31)
 
+;;; Five to eight arguments are held inline in the frame (no args array), nine
+;;; or more still go through the array path. Every arity must show all args.
+(defun %bta5 (a b c d e) (declare (ignore a b c d e)) (dotcl:backtrace-with-args))
+(defun %bta6 (a b c d e f) (declare (ignore a b c d e f)) (dotcl:backtrace-with-args))
+(defun %bta7 (a b c d e f g) (declare (ignore a b c d e f g)) (dotcl:backtrace-with-args))
+(defun %bta8 (a b c d e f g h) (declare (ignore a b c d e f g h)) (dotcl:backtrace-with-args))
+(defun %bta9 (a b c d e f g h i) (declare (ignore a b c d e f g h i)) (dotcl:backtrace-with-args))
+(defun %bta-outer8 (a b c d e f g h)
+  (let ((bt (%bta5 a b c d e)))
+    (list (find "%BTA5" bt :key #'car :test #'string=)
+          (find "%BTA-OUTER8" bt :key #'car :test #'string=))))
+
+(deftest backtrace-with-args-5-to-9-args
+  (flet ((frame (name bt) (find name bt :key #'car :test #'string=)))
+    (list (frame "%BTA5" (%bta5 1 2 3 4 5))
+          (frame "%BTA6" (%bta6 1 2 3 4 5 6))
+          (frame "%BTA7" (%bta7 1 2 3 4 5 6 7))
+          (frame "%BTA8" (%bta8 1 2 3 4 5 6 7 :h))
+          (frame "%BTA9" (%bta9 1 2 3 4 5 6 7 8 9))
+          (%bta-outer8 'a 'b 'c 'd 'e 'f 'g 'h)))
+  (("%BTA5" 1 2 3 4 5)
+   ("%BTA6" 1 2 3 4 5 6)
+   ("%BTA7" 1 2 3 4 5 6 7)
+   ("%BTA8" 1 2 3 4 5 6 7 :h)
+   ("%BTA9" 1 2 3 4 5 6 7 8 9)
+   (("%BTA5" a b c d e) ("%BTA-OUTER8" a b c d e f g h))))
+
 (deftest d269-backtrace-with-args-self-excluded
   ;; registered without a Name, so it never appears in its own result.
   (member "BACKTRACE-WITH-ARGS" (%bta-leaf 1 2) :key #'car :test #'string=)
@@ -1831,8 +1858,11 @@
 (deftest d1121-user-doc-precedence
   (progn (setf (documentation 'dotcl:save-application 'function) "user override")
          (prog1 (documentation 'dotcl:save-application 'function)
-           ;; restore: clearing the table entry falls back to the [LispDoc] doc
-           (setf (documentation 'dotcl:save-application 'function) nil)))
+           ;; Restore. (SETF DOCUMENTATION) with NIL would record "cleared"
+           ;; on the function object, which hides the [LispDoc] docstring from
+           ;; every later test; drop the entry instead.
+           (remhash #'dotcl:save-application
+                    dotcl-internal::*function-object-documentation*)))
   "user override")
 
 ;;; #19: a leading ~ in a STRING file spec must expand to the user home
@@ -1885,7 +1915,7 @@
 ;;; first (cold-compile) install-dist run ("Not implemented").
 (defun %cf-modules-no-leak ()
   (let* ((tmp (format nil "~a/dotcl-cfmod-~a"
-                      (or (dotcl:getenv "TEMP") "/tmp")
+                      (regression-temp-dir)
                       (get-internal-real-time)))
          (src (format nil "~a/src.lisp" tmp)))
     (ensure-directories-exist (concatenate 'string tmp "/"))
@@ -1925,7 +1955,7 @@
 ;;; (The stable name itself is verified out of band via Reflection.AssemblyName.)
 (defun %d1263-module-name-fasl ()
   (let* ((tmp (format nil "~a/dotcl-d1263-~a"
-                      (or (dotcl:getenv "TEMP") "/tmp")
+                      (regression-temp-dir)
                       (get-internal-real-time)))
          (src (format nil "~a/src.lisp" tmp)))
     (ensure-directories-exist (concatenate 'string tmp "/"))
@@ -2337,7 +2367,7 @@
            (make-instance 'i353-lfo :name ',(i353-name x) :md ',(slot-value x 'md)))
    `(progn (push (list :init ',(i353-name x)) *i353-order*) ',x)))
 (defun %i353-order (text)
-  (let* ((tmp (format nil "~a/dotcl-i353-~a" (or (dotcl:getenv "TEMP") "/tmp")
+  (let* ((tmp (format nil "~a/dotcl-i353-~a" (regression-temp-dir)
                       (get-internal-real-time)))
          (src (format nil "~a/src.lisp" tmp)))
     (ensure-directories-exist (concatenate 'string tmp "/"))
@@ -2370,7 +2400,7 @@
 ;;; process-global cwd, or delete-file and ensure-directories-exist diverge and the
 ;;; created flag comes back NIL (ENSURE-DIRECTORIES-EXIST.8: Windows-only).
 (defun %i355-ede ()
-  (let* ((base (format nil "~a/dotcl-i355-~a/" (or (dotcl:getenv "TEMP") "/tmp")
+  (let* ((base (format nil "~a/dotcl-i355-~a/" (regression-temp-dir)
                        (get-internal-real-time)))
          (*default-pathname-defaults* (pathname base))
          (subdir (make-pathname :directory '(:relative "scratch")
@@ -2904,7 +2934,7 @@
   ;; system definitions normally (a synthetic in-memory system with a bogus pathname
   ;; makes find-system try to reload from a non-existent .asd and error).
   (let* ((dir (format nil "~a/dotcl-i390-~a/"
-                      (or (dotcl:getenv "TEMP") "/tmp") (get-internal-real-time)))
+                      (regression-temp-dir) (get-internal-real-time)))
          (dirp (substitute #\/ #\\ dir)))
     (ensure-directories-exist dirp)
     (with-open-file (s (concatenate 'string dirp "i390-dep.asd")
@@ -3975,7 +4005,7 @@
 ;;; so a list target read characters even from an (unsigned-byte 8) stream.
 (defun %read-sequence-binary-list ()
   (let ((tmp (format nil "~a/dotcl-rsbin-~a.bin"
-                     (or (dotcl:getenv "TEMP") "/tmp")
+                     (regression-temp-dir)
                      (get-internal-real-time))))
     (with-open-file (out tmp :direction :output :element-type '(unsigned-byte 8)
                              :if-exists :supersede)
@@ -3994,7 +4024,7 @@
 ;;; A character stream + list target still reads characters (no regression).
 (defun %read-sequence-char-list ()
   (let ((tmp (format nil "~a/dotcl-rschar-~a.txt"
-                     (or (dotcl:getenv "TEMP") "/tmp")
+                     (regression-temp-dir)
                      (get-internal-real-time))))
     (with-open-file (out tmp :direction :output :if-exists :supersede)
       (write-string "hello" out))
@@ -4106,7 +4136,7 @@
 (deftest-compiled-only share-labels-survive-lisp-read-list-compile-file
   (let ((rt (copy-readtable))
         (src (format nil "~a/dotcl-sharelbl-~a.lisp"
-                     (or (dotcl:getenv "TEMP") "/tmp")
+                     (regression-temp-dir)
                      (get-internal-real-time))))
     (set-macro-character #\( #'%rdr-suppress-read-list nil rt)
     (with-open-file (o src :direction :output :if-exists :supersede)

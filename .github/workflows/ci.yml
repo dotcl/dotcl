@@ -63,15 +63,16 @@ jobs:
     #   Pack path (nightly)                 0.0 -> 10.5 min
     #   Regression tests (emit-free build)  7.3 -> 15.7 min
     #
-    # The pack path is not a regression: it exited immediately on `unknown
-    # option` until `dotcl pack` itself was fixed, so this is the first time it has
-    # really run. The emit-free doubling is unexplained -- the corpus grew 11%
-    # over the same days, not 115% -- and is tracked separately.
-    #
+    # Neither line is a regression. The pack path is a NEW step this cycle, so
+    # 0.0 is "did not exist", not "ran instantly"; the step count went 31 -> 43
+    # between the two tags. The emit-free line is the 40 regression tests added
+    # this cycle: they exercise declarations reaching the representation, so
+    # they loop (one runs a 1e6-iteration tail self-call), and emit-free
+    # interprets rather than compiles, which is where the minutes go.
     # ANSI is not the cause: 9.6 min on 09-13, 9.7 on 09-18. The 09-18 nightly
     # spent 60.5 min and was cut 9.7 min into ANSI; finishing ANSI plus the
     # benchmarks (1.9 min) puts a full nightly near 73. 90 leaves room for the
-    # emit-free investigation to land either way.
+    # suite to keep growing, which on this evidence it will.
     #
     # Execution time is steady -- 36-39 min per push job across the period. The
     # spread in `gh run list` (39 to 128 min) is queue time on a single runner,
@@ -364,17 +365,19 @@ jobs:
       # failure must not fail this step), but everything else this command can
       # fail for -- the build, a missing runtime, the clone -- was being swallowed
       # too, which is how the run stayed green while reporting nothing.
+      # Outputs land in out/ansi inside the workspace (ANSI_OUT in the
+      # Makefile), not in /tmp, which a persistent runner shares across jobs.
       - name: ANSI tests
         if: env.RUN_FULL == 'true'
-        run: make test-ansi-all STDBUF="stdbuf -oL" 2>&1 | tee /tmp/ansi-summary.txt
+        run: mkdir -p out/ansi && make test-ansi-all STDBUF="stdbuf -oL" 2>&1 | tee out/ansi/summary.txt
 
       - name: Generate failure details
         if: ${{ always() && env.RUN_FULL == 'true' }}
         run: |
-          for f in /tmp/ansi-*.txt; do
+          for f in out/ansi/ansi-*.txt; do
             [ -f "$f" ] || continue
             grep -a -A 8 "^Test .* failed" "$f" 2>/dev/null | grep -a -E "^Test .* failed|^Form:|^Expected|^Actual|^          " | grep -v "^--$"
-          done > /tmp/ansi-failures.txt || true
+          done > out/ansi/failures.txt || true
 
       - name: Upload test outputs
         if: ${{ always() && env.RUN_FULL == 'true' }}
@@ -382,9 +385,9 @@ jobs:
         with:
           name: ansi-test-outputs
           path: |
-            /tmp/ansi-*.txt
-            /tmp/ansi-failures.txt
-            /tmp/ansi-summary.txt
+            out/ansi/ansi-*.txt
+            out/ansi/failures.txt
+            out/ansi/summary.txt
 
       # The gate: the set of failing test names must be the set ansi-state.json
       # records. Not a count -- ansi-test is an upstream clone whose total moves
@@ -407,8 +410,14 @@ jobs:
       # honestly reported as skipped elsewhere.
       # The `|| true` stays on purpose: benchmarks are data collection, not a
       # gate, and a slow or missing SBCL must not fail the build.
+      # Benchmarks do not run on GitHub-hosted runners. A time ratio depends on
+      # the CPU, and hosted runners hand out different CPUs from run to run
+      # (EPYC 7763, 9V74, 9V45 seen within a week), so a baseline recorded on
+      # one cannot judge another: the gate either misses real regressions or
+      # fails on the luck of the draw. The baselines in
+      # bench/ratio-baseline.json each belong to one fixed machine.
       - name: Benchmarks
-        if: env.RUN_FULL == 'true' && hashFiles('bench/run.lisp') != ''
+        if: env.RUN_FULL == 'true' && hashFiles('bench/run.lisp') != '' && runner.environment != 'github-hosted'
         run: make bench-state || true
 
       # Unlike the step above, this one is a gate and has no `|| true`. It can
@@ -421,17 +430,26 @@ jobs:
       # the same bench-state.json, so running it second means the cl-bench rows
       # are present and the median half of the check has something to work with.
       #
-      # A platform with no recorded baseline is reported as unbaselined and
-      # passes, printing its measured ratios in the format the baseline file
-      # wants. That is how a new runner gets its first numbers: read them out
-      # of this step's log and commit them.
+      # A measurement with no recorded baseline is printed in the format the
+      # baseline file wants. That is how a new runner gets its first numbers:
+      # read them out of this step's log and commit them.
+      #
+      # When nothing at all had a baseline, check-ratios.sh says UNJUDGED and
+      # exits 3 rather than ok. All 9 linux-x64 measurements (8 parity kernels
+      # plus the cl-bench median) now have a baseline in
+      # bench/ratio-baseline.json, so this gate judges every measurement it
+      # produces and CHECK_RATIOS_ALLOW_UNJUDGED is not needed here. If a new
+      # kernel is added to bench/csharp-parity/kernels.lisp without a matching
+      # linux-x64 entry, this step goes back to failing (exit 3) until one is
+      # recorded; that is intentional, not a regression to work around by
+      # re-adding the variable.
       - name: Benchmark ratio gate
-        if: env.RUN_FULL == 'true' && hashFiles('bench/csharp-parity/kernels.lisp') != ''
+        if: env.RUN_FULL == 'true' && hashFiles('bench/csharp-parity/kernels.lisp') != '' && runner.environment != 'github-hosted'
         run: make bench-parity
 
       - name: Disk usage (after)
         if: always()
-        run: df -h / && du -sh /tmp/ansi-*.txt 2>/dev/null || true
+        run: df -h / && du -sh out/ansi 2>/dev/null || true
 
       - name: Show results
         if: ${{ always() && env.RUN_FULL == 'true' }}
@@ -439,7 +457,7 @@ jobs:
           {
             echo "## ANSI Test Results"
             echo ""
-            if [ -f /tmp/ansi-summary.txt ]; then
+            if [ -f out/ansi/summary.txt ]; then
               echo '### Per-category (pass / elapsed / alloc)'
               echo '```'
               # Keep only result + TOTAL lines, drop build noise. The `|| echo`
@@ -448,7 +466,7 @@ jobs:
               # the job here: pointing at the summary formatter instead of at
               # whatever actually went wrong upstream. Reporting must never
               # decide the colour of the run.
-              grep -E '^(cons|strings|sequences|data-and-control-flow|hash-tables|symbols|arrays|types-and-classes|characters|pathnames|files|system-construction|iteration|eval-and-compile|conditions|printer|environment|structures|packages|objects|reader|numbers|streams|misc):|^TOTAL:|^GC TOTAL:' /tmp/ansi-summary.txt \
+              grep -E '^(cons|strings|sequences|data-and-control-flow|hash-tables|symbols|arrays|types-and-classes|characters|pathnames|files|system-construction|iteration|eval-and-compile|conditions|printer|environment|structures|packages|objects|reader|numbers|streams|misc):|^TOTAL:|^GC TOTAL:' out/ansi/summary.txt \
                 || echo '(no per-category lines; see the ANSI step output)'
               echo '```'
               echo ''
@@ -463,9 +481,9 @@ jobs:
             echo ""
             echo "## Failed Tests (details)"
             echo ""
-            if [ -s /tmp/ansi-failures.txt ]; then
+            if [ -s out/ansi/failures.txt ]; then
               echo '```'
-              head -1000 /tmp/ansi-failures.txt
+              head -1000 out/ansi/failures.txt
               echo '```'
             else
               echo "No failures found in output files"

@@ -19,6 +19,7 @@ namespace DotCL {
     /// Marks a C# method as the implementation of a Lisp built-in function.
     /// The generator extracts the &lt;lispdoc&gt; XML comment element and emits
     /// it as a Lisp function docstring (available via (documentation 'name 'function)).
+    /// LispName is package-qualified (PKG:NAME); the docstring belongs to that symbol only.
     /// </summary>
     [AttributeUsage(AttributeTargets.Method, AllowMultiple = false)]
     internal sealed class LispDocAttribute : Attribute {

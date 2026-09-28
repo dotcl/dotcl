@@ -55,13 +55,16 @@
 ;;; cross-process safe, not a per-process constant-pool reference. We can't spawn
 ;;; a second process here, but compiling to a fasl and loading it exercises the
 ;;; LispClass emission path; the class must round-trip to the same registry object.
+;;; The DEFCLASS is wrapped in EVAL-WHEN because a plain top-level DEFCLASS does
+;;; not create the class at compile time, so #. could not see it otherwise.
 (defun cc469-build-and-load ()
   (ensure-directories-exist *pc325-tmp-dir*)
   (let* ((src  (namestring (merge-pathnames "cc469-src.lisp" (truename *pc325-tmp-dir*))))
          (fasl (namestring (merge-pathnames "cc469.fasl"     (truename *pc325-tmp-dir*)))))
     (pc325-write-text src
       "(in-package :cl-user)
-       (defclass cc469-myc () ())
+       (eval-when (:compile-toplevel :load-toplevel :execute)
+         (defclass cc469-myc () ()))
        (defun cc469-builtin () #.(find-class 'cons))
        (defun cc469-user () #.(find-class 'cc469-myc))")
     (compile-file src :output-file fasl)

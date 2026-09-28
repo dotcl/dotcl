@@ -15,23 +15,42 @@ public static class Mop
 {
     public static Package MopPkg { get; private set; } = null!;
 
-    public static void Init()
+    // Metaobject class names that are not in CL. These symbols live in
+    // DOTCL-MOP (as they live in SB-MOP on SBCL) and DOTCL-INTERNAL imports
+    // them, so the classes the runtime builds under these names are named by
+    // the very symbols DOTCL-MOP exports: (make-instance
+    // 'dotcl-mop:funcallable-standard-object) finds the class, CLASS-NAME is
+    // EQ to the exported symbol, and TYPE-OF prints DOTCL-MOP:... . Code and
+    // fasls that spell the name DOTCL-INTERNAL::X still reach the same symbol
+    // through the import.
+    public static readonly string[] ClassNames = {
+        "DIRECT-SLOT-DEFINITION", "EFFECTIVE-SLOT-DEFINITION", "EQL-SPECIALIZER",
+        "FORWARD-REFERENCED-CLASS", "FUNCALLABLE-STANDARD-CLASS",
+        "FUNCALLABLE-STANDARD-OBJECT", "METAOBJECT", "SLOT-DEFINITION",
+        "SPECIALIZER", "STANDARD-ACCESSOR-METHOD", "STANDARD-DIRECT-SLOT-DEFINITION",
+        "STANDARD-EFFECTIVE-SLOT-DEFINITION", "STANDARD-READER-METHOD",
+        "STANDARD-SLOT-DEFINITION", "STANDARD-WRITER-METHOD",
+    };
+
+    // Must run right after DOTCL-INTERNAL is created, before anything interns
+    // one of ClassNames there (the import would then be a name conflict).
+    public static void CreatePackage(Package internalPkg)
     {
         MopPkg = new Package("DOTCL-MOP");
+        foreach (var name in ClassNames)
+        {
+            var (s, _) = MopPkg.Intern(name);
+            MopPkg.Export(s);
+            internalPkg.Import(s);
+        }
+    }
 
-        // -- Class symbols expected by closer-mop's :import-from ----------
-        // Intern + export the metaobject class names so closer-mop's defpackage
-        // succeeds. Symbols whose underlying class doesn't exist yet are still
-        // accessible but unbound as classes: actual usage will fail later
-        // (acceptable for libraries that only need import-from to work).
+    public static void Init()
+    {
+        // -- Symbols expected by closer-mop's :import-from ----------------
+        // Intern + export the names so closer-mop's defpackage succeeds.
+        // The class names were set up by CreatePackage.
         foreach (var name in new[] {
-            // Class symbols
-            "DIRECT-SLOT-DEFINITION", "EFFECTIVE-SLOT-DEFINITION", "EQL-SPECIALIZER",
-            "FORWARD-REFERENCED-CLASS", "FUNCALLABLE-STANDARD-CLASS",
-            "FUNCALLABLE-STANDARD-OBJECT", "METAOBJECT", "SLOT-DEFINITION",
-            "SPECIALIZER", "STANDARD-ACCESSOR-METHOD", "STANDARD-DIRECT-SLOT-DEFINITION",
-            "STANDARD-EFFECTIVE-SLOT-DEFINITION", "STANDARD-READER-METHOD",
-            "STANDARD-SLOT-DEFINITION", "STANDARD-WRITER-METHOD",
             // Protocol functions closer-mop wants to import. Many of these have
             // RegisterMop entries below; the duplicate Intern is harmless. Listed
             // here so the symbol is exported even when the function impl isn't.
@@ -549,10 +568,21 @@ public static class Mop
             RegisterMopGFMethod("VALIDATE-SUPERCLASS",
                 new LispClass[] { stdCls2, stdCls2 }, args => T.Instance);
         }
-        // FINALIZE-INHERITANCE: dotcl finalizes eagerly; default method is a no-op
+        // FINALIZE-INHERITANCE: dotcl finalizes eagerly at the end of DEFCLASS, so
+        // for a class that is already finalized the default method does nothing.
+        // A class that is not yet (a metaclass calling it from its own
+        // INITIALIZE-INSTANCE, where CLASS-FINALIZED-P is NIL) is finalized here,
+        // unless a superclass is still forward-referenced.
         RegisterMopGF("FINALIZE-INHERITANCE", 1,
             new LispClass[] { (LispClass)Runtime.FindClass(Startup.Sym("CLASS")) },
-            args => Nil.Instance);
+            args =>
+            {
+                if (args[0] is LispClass c && !Runtime.IsClassFinalized(c)
+                    && !c.IsForwardReferenced && !c.IsBuiltIn
+                    && c.DirectSuperclasses.All(Runtime.IsClassFinalized))
+                    c.FinalizeClass();
+                return Nil.Instance;
+            });
 
         // -- Slot-definition-class protocol (AMOP) ------------------------
         // These drive custom slot-definition classes (e.g. McCLIM's class-with-dynamic-slots).
@@ -649,7 +679,11 @@ public static class Mop
             if (options is not Nil)
                 throw new LispErrorException(new LispError(
                     $"COMPUTE-EFFECTIVE-METHOD-FUNCTION: method combination options are not supported: {options}"));
-            return new LispFunction(callArgs => Runtime.ApplyEffectiveMethodForm(form, callArgs),
+            // The form is Lisp code with CALL-METHOD / MAKE-METHOD as local macros;
+            // compile it on first use.
+            LispFunction? compiled = null;
+            return new LispFunction(callArgs =>
+                (compiled ??= Runtime.CompileEffectiveMethodForm(form, Nil.Instance)).Invoke(callArgs),
                 "DOTCL-MOP:COMPUTE-EFFECTIVE-METHOD-FUNCTION result", -1);
         });
 

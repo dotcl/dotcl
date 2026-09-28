@@ -107,9 +107,21 @@
 
 ;; The walk reads raw int64: no generic ArefL, and no box/unbox around the
 ;; element. The element buffer is fetched once, before the loop, so the read
-;; itself is a bare ldelem and not even the ArefNumL helper remains -- see
-;; array-backing-hoist for that path. The one Fixnum.Make is the box of the
-;; returned ACC.
+;; itself is a bare ldelem. The one Fixnum.Make in the fast copy is the box of
+;; the returned ACC.
+;;
+;; There are TWO copies of the body. The buffer is fetched once per binding and
+;; tested once, and the body is emitted for both answers: the fast copy with
+;; bare ldelems, and a copy that runs the per-element helper for the case where
+;; the fetch declined (an adjustable or fill-pointered vector, whose storage
+;; VECTOR-PUSH-EXTEND and ADJUST-ARRAY replace). So ArefNumL and a second
+;; Fixnum.Make appear, and they belong to the copy that a simple array never
+;; reaches.
+;;
+;; The counts that matter here are therefore: BackingI64 is 1 -- the fetch is
+;; NOT duplicated -- and LDELEM-I8 is 1, so the fast copy is still a bare
+;; element load. Testing per access instead would keep the helper out of the
+;; SIL but cost the loop its single basic block; see the decision record.
 (deftest-emitting-only declared-array-native-aref.walk-is-raw
   (let ((d (%dan-sil #'%dan-walk)))
     (list (%dan-count "Runtime.BackingI64" d)
@@ -117,7 +129,7 @@
           (%dan-count "Runtime.ArefNumL" d)
           (%dan-count "Runtime.ArefL" d)
           (%dan-count "Fixnum.Make" d)))
-  (1 1 0 0 1))
+  (1 1 1 0 2))
 
 (deftest-emitting-only declared-array-native-aref.unsigned-byte-is-raw
   (let ((d (%dan-sil #'%dan-u8)))
@@ -131,7 +143,7 @@
     (list (%dan-count "(STELEM-I8)" d)
           (%dan-count "Runtime.ArefSetNumL" d)
           (%dan-count "Runtime.ArefSetL" d)))
-  (1 0 0))
+  (1 1 0))
 
 (deftest-emitting-only declared-array-native-aref.rank-2-is-raw
   (let ((d (%dan-sil #'%dan-2d)))

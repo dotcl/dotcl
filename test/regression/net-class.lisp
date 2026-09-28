@@ -1609,9 +1609,9 @@
 ;;; test/save-class-lib/check.sh (make test-save-class-lib).
 
 (defun %savelib-temp-path (name)
-  "A unique temp .dll path for a save-library test (overwritten each run)."
+  "A temp .dll path for a save-library test, in this run's scratch directory."
   (concatenate 'string
-               (dotnet:static "System.IO.Path" "GetTempPath")
+               (regression-temp-dir) "/"
                name ".dll"))
 
 (defun %file-nonempty-p (path)

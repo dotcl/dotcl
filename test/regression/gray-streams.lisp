@@ -696,3 +696,59 @@ b")
     (get-output-stream-string (%gray-nocol-buf s)))
   "ab
 ")
+
+;;; Printing to a gray stream does not force its output.
+;;;
+;;; The printer flushed the TextWriter bridge after PRINC/PRIN1/WRITE, and the
+;;; bridge's Flush called STREAM-FORCE-OUTPUT. SBCL never calls it for printing
+;;; (CLHS: only FORCE-OUTPUT / FINISH-OUTPUT do), and a stream that forwards
+;;; force-output to a wrapped native stream (rove's indent stream) then failed.
+;;; Explicit FORCE-OUTPUT still reaches the generic, directly, through
+;;; *STANDARD-OUTPUT*, and through a synonym stream.
+
+(defclass %gray-fo (dotcl-gray:fundamental-character-output-stream)
+  ((calls :initform nil :accessor %gray-fo-calls)))
+(defmethod dotcl-gray:stream-write-char ((s %gray-fo) ch)
+  (declare (ignore ch))
+  (pushnew :write (%gray-fo-calls s)))
+(defmethod dotcl-gray:stream-line-column ((s %gray-fo)) nil)
+(defmethod dotcl-gray:stream-force-output ((s %gray-fo))
+  (push :force (%gray-fo-calls s)) nil)
+(defmethod dotcl-gray:stream-finish-output ((s %gray-fo))
+  (push :finish (%gray-fo-calls s)) nil)
+
+(defvar *%gray-fo-target* nil)
+
+(deftest gray-print-does-not-force-output
+  (loop for op in (list (lambda (s) (princ 'x s))
+                        (lambda (s) (prin1 "y" s))
+                        (lambda (s) (write 42 :stream s))
+                        (lambda (s) (print 1 s))
+                        (lambda (s) (format s "~a" 1))
+                        (lambda (s) (write-string "z" s)))
+        collect (let ((s (make-instance '%gray-fo)))
+                  (funcall op s)
+                  (and (member :force (%gray-fo-calls s)) t)))
+  (nil nil nil nil nil nil))
+
+(deftest gray-explicit-force-output-reaches-generic
+  (let ((s (make-instance '%gray-fo)))
+    (force-output s)
+    (finish-output s)
+    (%gray-fo-calls s))
+  (:finish :force))
+
+(deftest gray-force-output-via-standard-output
+  (let* ((s (make-instance '%gray-fo))
+         (*standard-output* s))
+    (force-output)
+    (finish-output)
+    (%gray-fo-calls s))
+  (:finish :force))
+
+(deftest gray-force-output-via-synonym-stream
+  (let* ((s (make-instance '%gray-fo)))
+    (setf *%gray-fo-target* s)
+    (force-output (make-synonym-stream '*%gray-fo-target*))
+    (%gray-fo-calls s))
+  (:force))

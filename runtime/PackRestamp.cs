@@ -64,6 +64,27 @@ static class PackRestamp
         !newId.Equals(DonorId, StringComparison.OrdinalIgnoreCase);
 
     /// <summary>
+    /// The nuspec &lt;authors&gt; for a system's :author. By Lisp convention
+    /// :author is often "Name &lt;mail&gt;", and nuget.org shows &lt;authors&gt;
+    /// as a list of names, so each "&lt;...@...&gt;" part is dropped:
+    /// "A &lt;a@x&gt;, B &lt;b@y&gt;" becomes "A, B". A value that is nothing
+    /// but an address is kept as the address, without the brackets, rather than
+    /// left empty. Only the .asd value goes through here; --authors is taken as
+    /// written.
+    /// </summary>
+    internal static string? AuthorsFromAsd(string? author)
+    {
+        if (string.IsNullOrWhiteSpace(author)) return author;
+        var mail = new System.Text.RegularExpressions.Regex(@"\s*<([^<>@\s]+@[^<>\s]+)>");
+        var names = mail.Replace(author, "");
+        names = System.Text.RegularExpressions.Regex.Replace(names, @"\s+", " ").Trim();
+        names = System.Text.RegularExpressions.Regex.Replace(names, @"\s*,\s*", ", ");
+        names = names.Trim(' ', ',');
+        if (names.Length > 0) return names;
+        return mail.Match(author).Groups[1].Value;
+    }
+
+    /// <summary>
     /// NuGet requires &lt;description&gt; and &lt;authors&gt;. When the package
     /// is rebranded away from dotcl we will not inherit dotcl's values for them,
     /// so they have to come from the .asd or the command line. Checked before
@@ -96,7 +117,8 @@ static class PackRestamp
         string sourceDir, string? dotclVersion, string newId, string command,
         string version, string faslPath, string? bundleDir,
         IReadOnlyList<string> rids, string outputDir, Meta? meta, bool dryRun,
-        Func<string, string?>? bundleForRid = null)
+        Func<string, string?>? bundleForRid = null,
+        IReadOnlyDictionary<string, string>? r2rForRid = null)
     {
         dotclVersion ??= InferDotclVersion(sourceDir);
 
@@ -136,7 +158,10 @@ static class PackRestamp
             produced.Add(RestampOne(path, $"dotcl.{rid}", $"{newId}.{rid}", version, command,
                                     ridMap: null, faslPath: faslPath,
                                     bundleDir: bundleForRid?.Invoke(rid) ?? bundleDir,
-                                    meta, outputDir));
+                                    meta, outputDir,
+                                    r2rPath: r2rForRid != null
+                                             && r2rForRid.TryGetValue(rid, out var r2r) ? r2r : null,
+                                    rid: rid));
         return produced;
     }
 
@@ -193,7 +218,7 @@ static class PackRestamp
     static string RestampOne(
         string srcPath, string oldId, string newId, string version, string command,
         IReadOnlyList<string>? ridMap, string? faslPath, string? bundleDir,
-        Meta? meta, string outputDir)
+        Meta? meta, string outputDir, string? r2rPath = null, string? rid = null)
     {
         Directory.CreateDirectory(outputDir);
         var dest = Path.Combine(outputDir, $"{newId}.{version}.nupkg");
@@ -292,6 +317,14 @@ static class PackRestamp
                     + "EntryPoint, so there is no runtime to place the fasl beside");
             WriteEntry(outZip, payloadDir + "dotcl.user.fasl",
                        File.ReadAllBytes(faslPath), SourceTimestamp(faslPath));
+
+            // The ahead-of-time sibling, which the launcher takes in place of the
+            // fasl while it is not older than it. Both entries are stamped from
+            // the fasl, so whatever the unpacker does with zip timestamps it
+            // cannot make the sibling look like the leftover of an earlier build.
+            if (r2rPath != null && rid != null)
+                WriteEntry(outZip, payloadDir + $"dotcl.user.fasl.r2r-{rid}",
+                           File.ReadAllBytes(r2rPath), SourceTimestamp(faslPath));
 
             if (bundleDir != null)
             {

@@ -188,7 +188,7 @@ public static partial class Runtime
     public static LispObject Stringp(LispObject obj)
     { obj = Primary(obj); return obj is LispString || (obj is LispVector v && v.IsCharVector && v.Rank == 1) ? T.Instance : Nil.Instance; }
     public static LispObject SimpleStringp(LispObject obj)
-    { obj = Primary(obj); return obj is LispString || (obj is LispVector sv && sv.IsCharVector && !sv.HasFillPointer && sv.Rank == 1) ? T.Instance : Nil.Instance; }
+    { obj = Primary(obj); return obj is LispString || (obj is LispVector sv && sv.IsCharVector && sv.IsSimple && sv.Rank == 1) ? T.Instance : Nil.Instance; }
     public static LispObject Characterp(LispObject obj) => Primary(obj) is LispChar ? T.Instance : Nil.Instance;
     public static LispObject Functionp(LispObject obj) => Primary(obj) is LispFunction ? T.Instance : Nil.Instance;
     public static LispObject Packagep(LispObject obj) => Primary(obj) is Package ? T.Instance : Nil.Instance;
@@ -207,9 +207,9 @@ public static partial class Runtime
     { obj = Primary(obj); return (obj is LispVector vp && vp.Rank == 1) || obj is LispString ? T.Instance : Nil.Instance; }
     public static LispObject BitVectorp(LispObject obj) => Primary(obj) is LispVector v && v.IsBitVector && v.Rank == 1 ? T.Instance : Nil.Instance;
     public static LispObject SimpleVectorp(LispObject obj) =>
-        Primary(obj) is LispVector sv && sv.Rank == 1 && !sv.IsCharVector && !sv.IsBitVector && !sv.HasFillPointer && sv.ElementTypeName == "T" ? T.Instance : Nil.Instance;
+        Primary(obj) is LispVector sv && sv.Rank == 1 && !sv.IsCharVector && !sv.IsBitVector && sv.IsSimple && sv.ElementTypeName == "T" ? T.Instance : Nil.Instance;
     public static LispObject SimpleBitVectorp(LispObject obj) =>
-        Primary(obj) is LispVector sbv && sbv.IsBitVector && sbv.Rank == 1 && !sbv.HasFillPointer ? T.Instance : Nil.Instance;
+        Primary(obj) is LispVector sbv && sbv.IsBitVector && sbv.Rank == 1 && sbv.IsSimple ? T.Instance : Nil.Instance;
     public static LispObject Arrayp(LispObject obj)
     { obj = Primary(obj); return obj is LispVector || obj is LispString ? T.Instance : Nil.Instance; }
     public static LispObject Hash_table_p(LispObject obj) => Primary(obj) is LispHashTable ? T.Instance : Nil.Instance;

@@ -24,7 +24,7 @@ Neither needs a build step: both work from a running image.
 (require "dotcl-kestrel")    ; HTTP server (ASP.NET Core's Kestrel), serves a Lack app
 (require "dotcl-thread")     ; threads (bordeaux-threads style)
 (require "dotcl-gray")       ; Gray streams
-(require "dotcl-repl")       ; a nicer REPL, with TAB completion
+(require "dotcl-repl")       ; a nicer REPL, with TAB completion and ,commands
 (require "dotcl-lsp-api")    ; completion candidates for an editor to ask for
 (require "dotcl-advice")     ; function advice
 (require "dotcl-clrmd")      ; inspect a .NET heap (ClrMD)

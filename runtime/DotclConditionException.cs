@@ -57,43 +57,10 @@ public class DotclConditionException : Exception
     /// condition's report string, so a host that logs the message alone sees
     /// what the debugger would have printed.</summary>
     public DotclConditionException(LispObject condition)
-        : base(ReportOf(condition))
+        : base(ConditionText.Report(condition))
     {
         Condition = condition;
-        ConditionType = TypeNameOf(condition);
+        ConditionType = ConditionText.TypeName(condition);
         ClrException = (condition as LispCondition)?.ClrException;
-    }
-
-    /// <summary>The report string. A runtime-signalled condition carries it
-    /// directly; a DEFINE-CONDITION instance is printed, which runs its report
-    /// through the Lisp printer.</summary>
-    private static string ReportOf(LispObject condition)
-    {
-        if (condition is LispCondition lc) return lc.Message;
-        try
-        {
-            return Runtime.PrincToString(condition) is LispString s
-                ? s.Value
-                : condition.ToString();
-        }
-        catch (Exception)
-        {
-            // Reporting must not replace the condition with a failure of its
-            // own: the host still needs the exception it is being handed.
-            return condition.ToString();
-        }
-    }
-
-    private static string TypeNameOf(LispObject condition)
-    {
-        if (condition is LispCondition lc) return lc.ConditionTypeName;
-        try
-        {
-            return Runtime.TypeOf(condition) is Symbol s ? s.Name : condition.GetType().Name;
-        }
-        catch (Exception)
-        {
-            return condition.GetType().Name;
-        }
     }
 }

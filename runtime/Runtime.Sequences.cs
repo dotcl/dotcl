@@ -564,14 +564,14 @@ public static partial class Runtime
             return new LispVector(items, elemTypeName);
         }
         // Try deftype expansion for compound or named sequence types
-        if (resultType is Symbol typeAlias && TypeExpanders.TryGetValue(typeAlias.Name, out var concatExpander))
+        if (resultType is Symbol typeAlias && TryGetTypeExpander(typeAlias, out var concatExpander))
         {
             var expanded = Funcall(concatExpander);
             if (expanded is not Symbol es || es.Name != typeAlias.Name)
                 return Concatenate(expanded, sequences);
         }
         if (resultType is Cons compAlias && compAlias.Car is Symbol compHead
-            && TypeExpanders.TryGetValue(compHead.Name, out var compConcatExpander))
+            && TryGetTypeExpander(compHead, out var compConcatExpander))
         {
             var compArgs = ToList(compAlias.Cdr).ToArray();
             var compExpanded = Funcall(compConcatExpander, compArgs);
@@ -681,78 +681,93 @@ public static partial class Runtime
         return SortImpl(seq, predicate, keyFn, stable);
     }
 
-    private static int SortCompare(LispFunction fn, LispFunction? keyFn, LispObject a, LispObject b)
-    {
-        var ka = ApplyKeyFn(keyFn, a);
-        var kb = ApplyKeyFn(keyFn, b);
-        if (IsTruthy(fn.Invoke2(ka, kb))) return -1;
-        if (IsTruthy(fn.Invoke2(kb, ka))) return 1;
-        return 0;
-    }
-
-    // .NET wraps comparator exceptions in InvalidOperationException or ArgumentException.
-    // Unwrap and rethrow Lisp control/error exceptions so they propagate correctly.
-    private static void UnwrapSortException(Exception ex)
-    {
-        var inner = ex.InnerException;
-        if (inner is LispErrorException or HandlerCaseInvocationException
-            or BlockReturnException or CatchThrowException or GoException or RestartInvocationException)
-            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(inner).Throw();
-        // Otherwise it's a genuine sort inconsistency (e.g. inconsistent comparator) - ignore
-    }
-
-    // Sort ITEMS in place. Array.Sort is introsort: fine for SORT, which ANSI
-    // leaves unstable, but STABLE-SORT must keep the original order of elements
-    // the predicate considers equal. Stability is obtained by sorting a
-    // permutation of indices and breaking ties on the index, so both modes share
-    // one comparator and one exception-unwrapping path.
-    /// <summary>Comparator for SORT. Passing a lambda here allocated a display class
-    /// for the captured predicate and key, a delegate over it, and the wrapper
-    /// Array.Sort puts around a Comparison -- three objects before the first
-    /// comparison ran. One object holding the two functions does the same work.</summary>
-    private sealed class LispComparer : System.Collections.Generic.IComparer<LispObject>
-    {
-        private readonly LispFunction _fn;
-        private readonly LispFunction? _keyFn;
-        public LispComparer(LispFunction fn, LispFunction? keyFn) { _fn = fn; _keyFn = keyFn; }
-        public int Compare(LispObject? a, LispObject? b) => SortCompare(_fn, _keyFn, a!, b!);
-    }
-
-    /// <summary>Comparator for STABLE-SORT: orders a permutation of indices and breaks
-    /// ties on the index, so elements the predicate calls equal keep their order.</summary>
-    private sealed class LispStableComparer : System.Collections.Generic.IComparer<int>
-    {
-        private readonly LispObject[] _src;
-        private readonly LispFunction _fn;
-        private readonly LispFunction? _keyFn;
-        public LispStableComparer(LispObject[] src, LispFunction fn, LispFunction? keyFn)
-        { _src = src; _fn = fn; _keyFn = keyFn; }
-        public int Compare(int i, int j)
-        {
-            int c = SortCompare(_fn, _keyFn, _src[i], _src[j]);
-            return c != 0 ? c : i.CompareTo(j);
-        }
-    }
-
+    // Sort ITEMS in place with a merge sort that asks one question of the
+    // predicate: "does the element on the right go before the one on the left?".
+    // Ties (the predicate false both ways) keep their original order, so the same
+    // sort serves SORT and STABLE-SORT.
+    //
+    // Array.Sort needs a consistent three-way comparator, which a Lisp predicate
+    // does not have to give: with a non-strict one such as #'>= or #'<= both
+    // (p a b) and (p b a) are true for equal keys, the comparator derived from it
+    // contradicted itself, and introsort gave up with an exception that was
+    // swallowed, leaving the sequence partly or entirely unsorted. A merge sort
+    // driven by the single question still produces a sorted result for such a
+    // predicate, as SBCL's does.
+    //
+    // Keys are computed once per element rather than once per comparison.
     private static void SortObjects(LispObject[] items, LispFunction fn, LispFunction? keyFn, bool stable)
     {
-        // .NET wraps comparator exceptions in InvalidOperationException or ArgumentException.
-        // Unwrap and rethrow Lisp errors/control exceptions.
-        try
+        int n = items.Length;
+        if (n < 2) return;
+        LispObject[] keys = items;
+        LispObject[] tmpItems = new LispObject[(n + 1) / 2];
+        LispObject[] tmpKeys = tmpItems;
+        if (keyFn != null)
         {
-            if (!stable)
-            {
-                Array.Sort(items, new LispComparer(fn, keyFn));
-                return;
-            }
-            var src = (LispObject[])items.Clone();
-            var order = new int[items.Length];
-            for (int i = 0; i < order.Length; i++) order[i] = i;
-            Array.Sort(order, new LispStableComparer(src, fn, keyFn));
-            for (int i = 0; i < items.Length; i++) items[i] = src[order[i]];
+            keys = new LispObject[n];
+            for (int i = 0; i < n; i++) keys[i] = ApplyKeyFn(keyFn, items[i]);
+            tmpKeys = new LispObject[tmpItems.Length];
         }
-        catch (InvalidOperationException ioe) { UnwrapSortException(ioe); }
-        catch (ArgumentException ae) { UnwrapSortException(ae); }
+        MergeSortRange(items, keys, tmpItems, tmpKeys, 0, n, fn);
+    }
+
+    private const int SortInsertionThreshold = 12;
+
+    /// <summary>Sort [lo, hi) of ITEMS, moving KEYS in step (KEYS may be ITEMS itself).
+    /// TMP arrays hold at least half the range.</summary>
+    private static void MergeSortRange(LispObject[] items, LispObject[] keys,
+        LispObject[] tmpItems, LispObject[] tmpKeys, int lo, int hi, LispFunction fn)
+    {
+        if (hi - lo <= SortInsertionThreshold)
+        {
+            for (int i = lo + 1; i < hi; i++)
+            {
+                var x = items[i];
+                var kx = keys[i];
+                int j = i;
+                while (j > lo && IsTruthy(fn.Invoke2(kx, keys[j - 1])))
+                {
+                    items[j] = items[j - 1];
+                    keys[j] = keys[j - 1];
+                    j--;
+                }
+                items[j] = x;
+                keys[j] = kx;
+            }
+            return;
+        }
+        int mid = lo + (hi - lo) / 2;
+        MergeSortRange(items, keys, tmpItems, tmpKeys, lo, mid, fn);
+        MergeSortRange(items, keys, tmpItems, tmpKeys, mid, hi, fn);
+        // Already in order across the boundary: nothing to merge.
+        if (!IsTruthy(fn.Invoke2(keys[mid], keys[mid - 1]))) return;
+        int nl = mid - lo;
+        Array.Copy(items, lo, tmpItems, 0, nl);
+        if (!ReferenceEquals(keys, items)) Array.Copy(keys, lo, tmpKeys, 0, nl);
+        int l = 0, r = mid, d = lo;
+        while (l < nl && r < hi)
+        {
+            if (IsTruthy(fn.Invoke2(keys[r], tmpKeys[l])))
+            {
+                items[d] = items[r];
+                keys[d] = keys[r];
+                r++;
+            }
+            else
+            {
+                items[d] = tmpItems[l];
+                keys[d] = tmpKeys[l];
+                l++;
+            }
+            d++;
+        }
+        while (l < nl)
+        {
+            items[d] = tmpItems[l];
+            keys[d] = tmpKeys[l];
+            l++;
+            d++;
+        }
     }
 
     private static LispObject SortImpl(LispObject seq, LispObject predicate, LispFunction? keyFn, bool stable = false)
@@ -891,7 +906,7 @@ public static partial class Runtime
                 return result;
             }
             // Try compound deftype expansion: (my-type args...) -> expanded type
-            if (TypeExpanders.TryGetValue(headSym.Name, out var compExpander))
+            if (TryGetTypeExpander(headSym, out var compExpander))
             {
                 var compArgs = ToList(compType.Cdr).ToArray();
                 var compExpanded = Funcall(compExpander, compArgs);
@@ -986,12 +1001,12 @@ public static partial class Runtime
                     // maybe-coerce-to-simple-string on parser-built adjustable strings.
                     bool wantSimple = typeName is "SIMPLE-STRING" or "SIMPLE-BASE-STRING";
                     // A char-vector already satisfies (BASE-)STRING. For a SIMPLE
-                    // target return it as-is only if it is already simple (matches
-                    // CheckSimpleType's SIMPLE-STRING criterion: no fill pointer,
-                    // rank 1): CLHS: coerce returns the object itself when it is
+                    // target return it as-is only if it is already simple (the
+                    // LispVector.IsSimple that CheckSimpleType's SIMPLE-STRING reads,
+                    // plus rank 1): CLHS: coerce returns the object itself when it is
                     // already of the type. Otherwise fall through and copy.
                     if (vec.IsCharVector
-                        && (!wantSimple || (!vec.HasFillPointer && vec.Rank == 1)))
+                        && (!wantSimple || (vec.IsSimple && vec.Rank == 1)))
                         return obj;
                     var sb = new System.Text.StringBuilder(vec.Length);
                     for (int i = 0; i < vec.Length; i++)
@@ -1064,8 +1079,11 @@ public static partial class Runtime
                 throw new LispErrorException(new LispTypeError("COERCE: cannot coerce to vector", obj));
 
             case "SIMPLE-VECTOR":
-                // Already a T-element-type vector (simple-vector)? return as-is
-                if (obj is LispVector sv2 && (sv2.ElementTypeName == null || sv2.ElementTypeName == "T"))
+                // Already a simple T-element-type vector? return as-is. A
+                // fill-pointered / adjustable / displaced one is not a SIMPLE-VECTOR
+                // and is copied below, as the SIMPLE-STRING case above does.
+                if (obj is LispVector sv2 && sv2.IsSimple
+                    && (sv2.ElementTypeName == null || sv2.ElementTypeName == "T"))
                     return obj;
                 if (obj is Nil) return new LispVector(Array.Empty<LispObject>());
                 if (obj is Cons) return new LispVector(ListToArray(obj));
@@ -1086,7 +1104,9 @@ public static partial class Runtime
                 throw new LispErrorException(new LispTypeError("COERCE: cannot coerce to vector", obj));
 
             case "BIT-VECTOR": case "SIMPLE-BIT-VECTOR":
-                if (obj is LispVector bv && bv.IsBitVector) return obj;
+                if (obj is LispVector bv && bv.IsBitVector
+                    && (typeName == "BIT-VECTOR" || (bv.IsSimple && bv.Rank == 1)))
+                    return obj;
                 {
                     if (obj is Nil) return new LispVector(Array.Empty<LispObject>(), "BIT");
                     if (obj is Cons) return new LispVector(ListToArray(obj), "BIT");
@@ -1120,7 +1140,7 @@ public static partial class Runtime
                 // If already of the target type, return as-is
                 if (IsTruthy(Typep(obj, resultType))) return obj;
                 // Try deftype expansion for named type aliases
-                if (TypeExpanders.TryGetValue(typeName, out var symExpander))
+                if (resultType is Symbol aliasSym && TryGetTypeExpander(aliasSym, out var symExpander))
                 {
                     var symExpanded = Funcall(symExpander);
                     if (symExpanded is not Symbol se || se.Name != typeName)

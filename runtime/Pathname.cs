@@ -307,27 +307,24 @@ public class LispLogicalPathname : LispPathname
         LispObject? version = null;
 
         var semiParts = rest.Split(';');
-        string filePart;
+        string filePart = semiParts[^1];
 
-        if (semiParts.Length > 1)
+        // CLHS 19.3.1: a logical directory is relative only when the namestring carries
+        // a relative-directory-marker (a leading semicolon); otherwise it is absolute,
+        // even when no directory component follows. So "HOST:NAME" has directory
+        // (:ABSOLUTE), not nil. That matters beyond the accessor: a nil directory makes
+        // MERGE-PATHNAMES splice the physical defaults' directory into the logical
+        // pathname, after which no translation rule matches it.
+        bool relative = rest.StartsWith(';');
+        var dirs = new List<LispObject> { Startup.Keyword(relative ? "RELATIVE" : "ABSOLUTE") };
+        for (int i = relative ? 1 : 0; i < semiParts.Length - 1; i++)
         {
-            // Has directory components
-            var dirs = new List<LispObject>();
-            dirs.Add(Startup.Keyword("ABSOLUTE"));
-            for (int i = 0; i < semiParts.Length - 1; i++)
-            {
-                var d = semiParts[i].ToUpperInvariant();
-                if (d == "**") dirs.Add(Startup.Keyword("WILD-INFERIORS"));
-                else if (d == "*") dirs.Add(Startup.Keyword("WILD"));
-                else if (d.Length > 0) dirs.Add(new LispString(d));
-            }
-            directory = Runtime.List(dirs.ToArray());
-            filePart = semiParts[^1];
+            var d = semiParts[i].ToUpperInvariant();
+            if (d == "**") dirs.Add(Startup.Keyword("WILD-INFERIORS"));
+            else if (d == "*") dirs.Add(Startup.Keyword("WILD"));
+            else if (d.Length > 0) dirs.Add(new LispString(d));
         }
-        else
-        {
-            filePart = rest;
-        }
+        directory = Runtime.List(dirs.ToArray());
 
         // Parse name.type.version
         if (!string.IsNullOrEmpty(filePart))
@@ -369,6 +366,11 @@ public class LispLogicalPathname : LispPathname
                 if (first)
                 {
                     first = false;
+                    // A relative logical directory is written with a leading semicolon;
+                    // an absolute one carries no marker (CLHS 19.3.1). Without this the
+                    // namestring of a relative logical pathname reads back as absolute.
+                    if (c.Car is Symbol relSym && relSym.Name == "RELATIVE")
+                        sb.Append(';');
                     cur = c.Cdr;
                     continue;
                 }
@@ -393,7 +395,10 @@ public class LispLogicalPathname : LispPathname
             else if (TypeComponent is LispString typeStr)
                 sb.Append(typeStr.Value);
         }
-        if (Version != null && Version is not Nil)
+        // Logical namestring syntax is name.type.version, so a version cannot be written
+        // without a type. MERGE-PATHNAMES leaves :newest on a typeless pathname; printing
+        // it anyway would produce "NAME.NEWEST", which reads back with type "NEWEST".
+        if (Version != null && Version is not Nil && TypeComponent != null && TypeComponent is not Nil)
         {
             sb.Append('.');
             if (Version is Symbol vs) sb.Append(vs.Name);
@@ -406,10 +411,19 @@ public class LispLogicalPathname : LispPathname
 
     public override LispPathname MergeWith(LispPathname defaults)
     {
+        // Host, device and directory live in the logical host's namespace, so they are
+        // only taken from defaults that are themselves logical. Merging against
+        // *default-pathname-defaults*, which is physical, would otherwise give the
+        // result a drive letter and the current directory, and
+        // TRANSLATE-LOGICAL-PATHNAME would find no rule that matches it. Name, type and
+        // version are plain components and merge as usual.
+        bool logicalDefaults = defaults is LispLogicalPathname;
         return new LispLogicalPathname(
-            Host ?? defaults.Host,
-            Device ?? defaults.Device,
-            MergeDirectories(DirectoryComponent, defaults.DirectoryComponent),
+            Host ?? (logicalDefaults ? defaults.Host : null),
+            Device ?? (logicalDefaults ? defaults.Device : null),
+            logicalDefaults
+                ? MergeDirectories(DirectoryComponent, defaults.DirectoryComponent)
+                : DirectoryComponent,
             NameComponent ?? defaults.NameComponent,
             TypeComponent ?? defaults.TypeComponent,
             Version ?? defaults.Version

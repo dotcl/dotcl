@@ -3,6 +3,130 @@
 User-facing release notes for dotcl. Each section corresponds to a tagged
 release on the public mirror (dotcl/dotcl).
 
+## v0.1.30 -- 2026-09-28
+
+The REPL is the headline. It is the first thing you meet after
+`dotnet tool install dotcl`, and it now behaves like an editor. A form can span
+lines: Enter sends it when its brackets balance and otherwise opens an indented
+line, and the up arrow brings the whole form back, in this session or the next.
+A line that starts with a comma is a command, and a comma on an empty line turns
+the prompt into `cmd>` with the commands in a menu. A `;` on an empty line runs
+one line of shell. Restarts, TAB completions and backtrace frames are menus you
+move through with the arrow keys. Prompts, values, warnings and errors have
+their own colours, and the bracket you just closed shows which one it matches.
+The editor also no longer asks the terminal where the cursor is, which is what
+garbled input under rlwrap and over ssh.
+
+A few fixes make code that used to pass quietly fail. They are listed first.
+
+### Upgrading
+
+- **A macro called with the wrong number of arguments signals PROGRAM-ERROR.**
+  This covers `defmacro`, `macrolet` and `destructuring-bind`. A missing argument
+  used to be NIL and an extra one was dropped. A compiler macro that does not fit
+  a call now gives a WARNING, and the call is compiled as an ordinary call.
+- **`y-or-n-p` and `yes-or-no-p` ask.** They used to return T without reading
+  anything. Now they read `*query-io*`, and with standard input closed that is
+  END-OF-FILE.
+- **A REPL fed from a pipe stops at the first unhandled error.**
+  `dotcl repl < file` reports the error and exits 1, like a script. It used to
+  take ABORT, carry on and exit 0.
+- **On macOS the init file is `~/.config/dotcl/init.lisp`**, as on Linux and as
+  the documentation said. A file at the old
+  `~/Library/Application Support/dotcl/init.lisp` is still loaded while there is
+  none at the new place.
+- **`compile-file` no longer creates the class for a top-level `defclass`.** The
+  class exists once the file is loaded, as in SBCL. Wrap the `defclass` in
+  `eval-when` if the same file needs the class object at compile time.
+- **Adjustable, displaced and fill-pointer arrays are not simple.** Declaring one
+  `simple-string`, `simple-vector` or `simple-array` signals TYPE-ERROR at safety
+  1 and above.
+- **`make-array` and `adjust-array` refuse a displaced array that does not fit
+  in its target.** It used to be created and fail later.
+- **On Windows, an argument to a `.bat` or `.cmd` file that contains a line
+  break or NUL is an error.** cmd.exe cannot receive such an argument as literal
+  text; see the Windows fix below.
+
+### The REPL
+
+**Multi-line forms.** Enter looks at the brackets, and a continuation line is
+indented under the form it belongs to. A paste arrives as one form, and Ctrl+C
+drops what you have typed and gives you a fresh prompt instead of a debugger.
+
+**History.** What you accept is kept in a file beside the init file, and Ctrl+R
+searches it. Alt+B and Alt+F move by Lisp token. The REPL also keeps `*`, `**`,
+`+`, `/` and the rest of the standard history variables.
+
+**Commands.** `,help` lists the comma commands, among them `,cd`,
+`,in-package`, `,doc`, `,describe`, `,apropos`, `,time`, `,load` and `,ql`, and
+`dotcl-repl:define-command` adds your own. A comma on an empty line switches to
+`cmd>`, where the command names are a menu that narrows as you type.
+
+**A line of shell.** A `;` on an empty line switches to `sh>`, and the line runs
+in your shell, in the REPL's directory.
+
+**Menus.** In the debugger the restarts are a menu under the prompt, and digits
+still choose by number. `:frames` offers the backtrace the same way. TAB with
+several candidates shows them as a menu. `:source` shows where a frame's function is defined, with the lines
+around it.
+
+**The debugger opens for runtime errors too**, such as a wrong type, an undefined
+function or a .NET exception, with the frames still there for `:bt`. Before, you
+got one line and the prompt.
+
+**Colour.** Prompt, values, warnings and errors are coloured, and so are strings,
+comments and keywords in the line you are typing. `--color=auto|always|never`
+chooses, and `NO_COLOR` or `TERM=dumb` turn colour off. Under `TERM=dumb`, as in
+Emacs `M-x shell`, the REPL reads plain lines.
+
+**You do not need rlwrap.** `rlwrap dotcl` still works and leaves dotcl's editor
+in charge.
+
+`docs/repl.md` is new and has all of it: keys, commands, the init file, history
+and the debugger.
+
+### Scripts
+
+`dotcl -` runs a script read from standard input, with the rest of the command
+line as its arguments, and so does plain `dotcl` when standard input is not a
+terminal: `echo '(print (+ 1 2))' | dotcl` prints 3. `dotcl repl` stays a REPL.
+
+### dotcl pack and dotcl build
+
+`dotcl pack` no longer writes a broken package and exits 0 when a dependency
+cannot be found. It names the missing system, exits non-zero and writes no
+package. `docs/dotcl-pack.md` now explains how to make dependencies visible to
+pack: `--asd-search-path`, `CL_SOURCE_REGISTRY`, `source-registry.conf.d`, a
+Quicklisp bundle or `qlot bundle`. `--version` and `--toplevel` default to the
+`.asd`'s `:version` and `:entry-point`, and `dotcl build` now compiles the files
+inside a `:module`. dotcl no longer writes a `dotcl.profile` file next to the
+executable, which used to land in installed tools, saved applications and
+packages; the JIT profile now lives in the cache directory.
+
+### Fixes
+
+Running the test suites of real libraries found a long list of correctness bugs
+in CLOS and the MOP, macros, LOOP, streams, arrays and the pretty printer. A few
+you may have hit: `sort` with a predicate such as `#'>=` could return a list that
+was not sorted; `fresh-line` after `prin1` or `princ` did not start a new line;
+`read` from a string stream after `file-position` did not read from the new
+position; and `loop with` did not accept a nested pattern such as `(a (b c))`.
+CHANGELOG.md has the rest.
+
+On Windows, arguments passed to a `.bat` or `.cmd` file through
+`uiop:run-program` or dotcl's own process functions are no longer reinterpreted
+by cmd.exe. Before, `a&b` ran `b` and `%PATH%` was expanded, so an argument
+could inject a command. Also on Windows: `uiop:native-namestring` returns
+backslash paths that cmd builtins such as `dir` accept, the console code page is
+restored when dotcl exits, and the REPL no longer fails with "The handle is
+invalid" when it runs without a console.
+
+### Thanks
+
+- Douglas P. Fields, Jr. -- for reporting that input was garbled under rlwrap,
+  which led to the new editor, and that Ctrl+C at the prompt could leave you in
+  a debugger with no restarts. Ctrl+C at the prompt now just clears the line.
+
 ## v0.1.29 -- 2026-09-19
 
 Two things carry this release: real libraries load, and the compiler acts on

@@ -53,7 +53,7 @@ public static partial class Runtime
                 case "DEFAULTS":
                     var dval = args[j + 1];
                     if (dval is LispPathname dp) defaults = dp;
-                    else if (dval is LispString dstr) defaults = LispPathname.FromString(dstr.Value);
+                    else if (dval is LispString dstr) defaults = FromNamestring(dstr.Value);
                     break;
             }
         }
@@ -69,9 +69,11 @@ public static partial class Runtime
             if (!versionSet) version = defaults.Version;
         }
 
-        // CLHS: if version not supplied and host not supplied, default to :newest
-        if (!versionSet && version == null && host == null && defaults == null)
-            version = Startup.Keyword("NEWEST");
+        // No :VERSION and no :DEFAULTS leaves the version NIL. The default
+        // :DEFAULTS is a pathname whose components other than the host are all
+        // NIL (CLHS MAKE-PATHNAME), so (make-pathname) has version NIL, as
+        // #P"" does. :NEWEST is what MERGE-PATHNAMES fills in later, not what
+        // MAKE-PATHNAME makes.
 
         // CLHS: if host is a known logical host, return a logical pathname
         bool isLogical = false;
@@ -388,17 +390,37 @@ public static partial class Runtime
             : new LispPathname(p.Host, p.Device, p.DirectoryComponent, p.NameComponent, fasl, p.Version);
     }
 
+    /// <summary>Parse a namestring the way PATHNAME does: a host prefix that names an
+    /// already defined logical host yields a logical pathname, anything else a physical
+    /// one. A single character before the colon is always a drive letter, never a host.
+    /// </summary>
+    internal static LispPathname FromNamestring(string str)
+        => IsLogicalPathnameString(str)
+            ? LispLogicalPathname.FromLogicalString(str)
+            : LispPathname.FromString(str);
+
+    /// <summary>Coerce a pathname designator to a pathname. CLHS specifies the pathname
+    /// accessors and MERGE-PATHNAMES in terms of PATHNAME, so a string designator has to
+    /// be parsed with the same logical-host rule everywhere: otherwise "HOST:NAME" reads
+    /// as a logical pathname through PATHNAME but as a file named "HOST:NAME" through
+    /// PATHNAME-NAME or MERGE-PATHNAMES.</summary>
+    internal static LispPathname ToPathnameDesignator(LispObject path, string who) => path switch
+    {
+        LispPathname p => p,
+        LispString s => FromNamestring(s.Value),
+        LispVector v when v.IsCharVector => FromNamestring(v.ToCharString()),
+        // A stream is coerced through its truename, as it was before: the string here is
+        // an already resolved physical path, not a namestring the user wrote.
+        LispFileStream fs => LispPathname.FromString(fs.FilePath),
+        _ => throw new LispErrorException(new LispTypeError($"{who}: not a pathname designator", path))
+    };
+
     public static LispObject Pathname(LispObject thing)
     {
         if (thing is LispPathname) return thing;
-        if (thing is LispString s)
-            return IsLogicalPathnameString(s.Value) ? LispLogicalPathname.FromLogicalString(s.Value) : LispPathname.FromString(s.Value);
+        if (thing is LispString s) return FromNamestring(s.Value);
         if (thing is LispFileStream fs) return fs.OriginalPathname ?? LispPathname.FromString(fs.FilePath);
-        if (thing is LispVector v && v.IsCharVector)
-        {
-            var str = v.ToCharString();
-            return IsLogicalPathnameString(str) ? LispLogicalPathname.FromLogicalString(str) : LispPathname.FromString(str);
-        }
+        if (thing is LispVector v && v.IsCharVector) return FromNamestring(v.ToCharString());
         throw new LispErrorException(new LispTypeError("PATHNAME: cannot convert to pathname", thing));
     }
 
@@ -412,85 +434,58 @@ public static partial class Runtime
     }
 
     public static LispObject PathnameDirectory(LispObject path)
-    {
-        if (path is LispPathname p) return p.DirectoryComponent ?? (LispObject)Nil.Instance;
-        if (path is LispString s) return LispPathname.FromString(s.Value) is LispPathname pp
-            ? pp.DirectoryComponent ?? (LispObject)Nil.Instance : Nil.Instance;
-        if (path is LispVector v && v.IsCharVector) return LispPathname.FromString(v.ToCharString()).DirectoryComponent ?? (LispObject)Nil.Instance;
-        if (path is LispFileStream fs) return LispPathname.FromString(fs.FilePath).DirectoryComponent ?? (LispObject)Nil.Instance;
-        throw new LispErrorException(new LispTypeError("PATHNAME-DIRECTORY: not a pathname designator", path));
-    }
+        => ToPathnameDesignator(path, "PATHNAME-DIRECTORY").DirectoryComponent ?? (LispObject)Nil.Instance;
 
     public static LispObject PathnameName(LispObject path)
-    {
-        if (path is LispPathname p) return p.NameComponent ?? (LispObject)Nil.Instance;
-        if (path is LispString s)
-        {
-            var pp = LispPathname.FromString(s.Value);
-            return pp.NameComponent ?? (LispObject)Nil.Instance;
-        }
-        if (path is LispVector v && v.IsCharVector) return LispPathname.FromString(v.ToCharString()).NameComponent ?? (LispObject)Nil.Instance;
-        if (path is LispFileStream fs) return LispPathname.FromString(fs.FilePath).NameComponent ?? (LispObject)Nil.Instance;
-        throw new LispErrorException(new LispTypeError("PATHNAME-NAME: not a pathname designator", path));
-    }
+        => ToPathnameDesignator(path, "PATHNAME-NAME").NameComponent ?? (LispObject)Nil.Instance;
 
     public static LispObject PathnameType(LispObject path)
-    {
-        if (path is LispPathname p) return p.TypeComponent ?? (LispObject)Nil.Instance;
-        if (path is LispString s)
-        {
-            var pp = LispPathname.FromString(s.Value);
-            return pp.TypeComponent ?? (LispObject)Nil.Instance;
-        }
-        if (path is LispVector v && v.IsCharVector) return LispPathname.FromString(v.ToCharString()).TypeComponent ?? (LispObject)Nil.Instance;
-        if (path is LispFileStream fs) return LispPathname.FromString(fs.FilePath).TypeComponent ?? (LispObject)Nil.Instance;
-        throw new LispErrorException(new LispTypeError("PATHNAME-TYPE: not a pathname designator", path));
-    }
+        => ToPathnameDesignator(path, "PATHNAME-TYPE").TypeComponent ?? (LispObject)Nil.Instance;
 
     public static LispObject PathnameHost(LispObject path)
-    {
-        var p = path is LispPathname pp ? pp
-            : path is LispString s ? LispPathname.FromString(s.Value)
-            : path is LispVector v && v.IsCharVector ? LispPathname.FromString(v.ToCharString())
-            : path is LispFileStream fs ? LispPathname.FromString(fs.FilePath)
-            : throw new LispErrorException(new LispTypeError("PATHNAME-HOST: not a pathname designator", path));
-        return p.Host ?? (LispObject)Nil.Instance;
-    }
+        => ToPathnameDesignator(path, "PATHNAME-HOST").Host ?? (LispObject)Nil.Instance;
 
     public static LispObject PathnameDevice(LispObject path)
     {
-        var p = path is LispPathname pp ? pp
-            : path is LispString s ? LispPathname.FromString(s.Value)
-            : path is LispVector v && v.IsCharVector ? LispPathname.FromString(v.ToCharString())
-            : path is LispFileStream fs ? LispPathname.FromString(fs.FilePath)
-            : throw new LispErrorException(new LispTypeError("PATHNAME-DEVICE: not a pathname designator", path));
+        var p = ToPathnameDesignator(path, "PATHNAME-DEVICE");
         if (p is LispLogicalPathname && (p.Device == null || p.Device is Nil))
             return Startup.Keyword("UNSPECIFIC");
         return p.Device ?? (LispObject)Nil.Instance;
     }
 
     public static LispObject PathnameVersion(LispObject path)
-    {
-        var p = path is LispPathname pp ? pp
-            : path is LispString s ? LispPathname.FromString(s.Value)
-            : path is LispVector v && v.IsCharVector ? LispPathname.FromString(v.ToCharString())
-            : path is LispFileStream fs ? LispPathname.FromString(fs.FilePath)
-            : throw new LispErrorException(new LispTypeError("PATHNAME-VERSION: not a pathname designator", path));
-        return p.Version ?? (LispObject)Nil.Instance;
-    }
+        => ToPathnameDesignator(path, "PATHNAME-VERSION").Version ?? (LispObject)Nil.Instance;
 
+    // :NEWEST the keyword, not a symbol of that name in the current package: CLHS
+    // gives MERGE-PATHNAMES the keyword as its default, and code that inspects a
+    // version compares with EQ against :NEWEST.
     public static LispObject MergePathnames(LispObject path, LispObject defaults)
-        => MergePathnames(path, defaults, Startup.Sym("NEWEST"));
+        => MergePathnames(path, defaults, Startup.Keyword("NEWEST"));
 
     public static LispObject MergePathnames(LispObject path, LispObject defaults, LispObject defaultVersion)
     {
-        var p = path is LispPathname pp ? pp : path is LispString ps ? LispPathname.FromString(ps.Value) : throw new LispErrorException(new LispTypeError("MERGE-PATHNAMES: invalid", path));
-        var d = defaults is LispPathname dp ? dp : defaults is LispString ds ? LispPathname.FromString(ds.Value) : throw new LispErrorException(new LispTypeError("MERGE-PATHNAMES: invalid", defaults));
+        var p = ToPathnameDesignator(path, "MERGE-PATHNAMES");
+        var d = ToPathnameDesignator(defaults, "MERGE-PATHNAMES");
         var merged = p.MergeWith(d);
-        // CLHS: if version is still nil after merge, apply default-version
+        // CLHS MERGE-PATHNAMES: a version PATHNAME does not supply comes from
+        // DEFAULT-PATHNAME only when the name came from there too; when
+        // PATHNAME has its own name, it is DEFAULT-VERSION. MergeWith takes the
+        // default's version unconditionally, so undo that for a named pathname.
+        bool ownVersion = p.Version != null && p.Version is not Nil;
+        bool ownName = p.NameComponent != null && p.NameComponent is not Nil;
+        if (!ownVersion && ownName)
+            return merged is LispLogicalPathname
+                ? new LispLogicalPathname(merged.Host, merged.Device, merged.DirectoryComponent,
+                    merged.NameComponent, merged.TypeComponent, defaultVersion)
+                : new LispPathname(merged.Host, merged.Device, merged.DirectoryComponent,
+                    merged.NameComponent, merged.TypeComponent, defaultVersion);
+        // Otherwise, if the version is still nil after merge, apply default-version
         if (merged.Version == null || merged.Version is Nil)
-            return new LispPathname(merged.Host, merged.Device, merged.DirectoryComponent,
-                merged.NameComponent, merged.TypeComponent, defaultVersion);
+            return merged is LispLogicalPathname
+                ? new LispLogicalPathname(merged.Host, merged.Device, merged.DirectoryComponent,
+                    merged.NameComponent, merged.TypeComponent, defaultVersion)
+                : new LispPathname(merged.Host, merged.Device, merged.DirectoryComponent,
+                    merged.NameComponent, merged.TypeComponent, defaultVersion);
         return merged;
     }
 
@@ -671,14 +666,11 @@ public static partial class Runtime
             var path = args[0];
             var defaults = args.Length > 1 ? args[1] : DynamicBindings.Get(Startup.Sym("*DEFAULT-PATHNAME-DEFAULTS*"));
             var defaultVersion = args.Length > 2 ? args[2] : (LispObject)Startup.Keyword("NEWEST");
-            var result = Runtime.MergePathnames(path, defaults);
-            if (result is LispPathname rp && (rp.Version == null || rp.Version is Nil)) {
-                if (defaultVersion != null && defaultVersion is not Nil) {
-                    result = new LispPathname(rp.Host, rp.Device, rp.DirectoryComponent,
-                                               rp.NameComponent, rp.TypeComponent, defaultVersion);
-                }
-            }
-            return result;
+            // Hand the default-version to the merge rather than patching the result
+            // afterwards. The two-argument overload fills the version slot itself, so
+            // a caller-supplied default could never be applied on top of it: the
+            // "still nil after merge" test was already false by the time it ran.
+            return Runtime.MergePathnames(path, defaults, defaultVersion);
         }));
 
         // WILD-PATHNAME-P: check if pathname has wildcard components
@@ -686,12 +678,7 @@ public static partial class Runtime
             if (args.Length < 1) throw new LispErrorException(new LispProgramError("WILD-PATHNAME-P: expected at least 1 argument"));
             if (args.Length > 2) throw new LispErrorException(new LispProgramError("WILD-PATHNAME-P: too many arguments"));
             var path = args[0];
-            LispPathname p;
-            if (path is LispPathname lp) p = lp;
-            else if (path is LispString ls) p = LispPathname.FromString(ls.Value);
-            else if (path is LispVector v && v.IsCharVector) p = LispPathname.FromString(v.ToCharString());
-            else if (path is LispFileStream fs) p = LispPathname.FromString(fs.FilePath);
-            else throw new LispErrorException(new LispTypeError("WILD-PATHNAME-P: not a pathname designator", path));
+            LispPathname p = Runtime.ToPathnameDesignator(path, "WILD-PATHNAME-P");
 
             Symbol? key = args.Length > 1 && args[1] is Symbol ks ? ks : null;
 

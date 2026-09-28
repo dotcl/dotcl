@@ -46,14 +46,23 @@ dotcl pack --system hello --id hello-tool --command hello --version 0.1.0 \
 - `--system` -- the ASDF system to compile.
 - `--id` -- NuGet id of the tool you produce.
 - `--command` -- the command your users will type.
-- `--version` -- your tool's version.
+- `--version` -- your tool's version. Optional: it defaults to the `:version` in
+  your `.asd`, so a project with a version there does not have to repeat it
+  here. Pass it to override that, as a nightly build would.
 - `-o` -- output directory.
 - `--from` -- the directory of dotcl runtime packages (above).
-- `--dotcl-version` -- which dotcl version in `--from` to build on.
+- `--dotcl-version` -- which dotcl version in `--from` to build on. Optional:
+  it defaults to the version of the single `dotcl.<version>.nupkg` found in
+  `--from`, and is required when `--from` holds more than one.
 - `--rids` -- target platforms (see Options).
-- `--toplevel` -- the exported function to call at startup.
+- `--toplevel` -- the exported function to call at startup. Optional: it
+  defaults to the `:entry-point` in your `.asd` (the same option ASDF's
+  `program-op` uses), and pack prints which one it picked. With neither, pack
+  warns and the tool only loads your system -- right for a system that runs
+  itself at load time, and otherwise a tool that does nothing.
 - `--asd-search-path` -- where your `.asd` lives, if not already on the ASDF
-  source registry.
+  source registry. See *Making a dependency visible* below for what this does
+  and does not reach.
 
 This writes `out/obj/hello.fasl`, a base package `out/hello-tool.0.1.0.nupkg`,
 and one `out/hello-tool.<rid>.0.1.0.nupkg` per RID.
@@ -71,6 +80,103 @@ Hello from a packed dotcl tool!
 
 On Windows the installed command is a `.cmd` shim named after `--command`.
 
+## Making a dependency visible
+
+`pack` compiles your system the same way any `dotcl` command does: by asking
+ASDF to find each system in `:depends-on`. Anything not already on the ASDF
+source registry has to be added, and there is more than one way to add it.
+The examples below use a `bundleapp` system that depends on `alexandria`, and
+were run against this doc.
+
+### `--asd-search-path <dir>` -- single directories only
+
+`--asd-search-path` (repeatable) pushes exactly the directory you name onto
+`asdf:*central-registry*`. ASDF's central registry never recurses: it looks
+for `<dir>/<system-name>.asd` in each entry, not in subdirectories of it. A
+tree of vendored libraries, one subdirectory per system, needs one
+`--asd-search-path` per subdirectory -- or one of the tree-aware mechanisms
+below.
+
+```
+dotcl pack --system myapp --asd-search-path . --asd-search-path vendor/alexandria \
+           ...
+```
+
+Confirmed: pointing `--asd-search-path` at the parent (`vendor/`, one level
+above `vendor/alexandria/alexandria.asd`) fails with `alexandria: not found`,
+and a trailing `vendor//` makes no difference -- `--asd-search-path` does not
+give `//` any special meaning. `//` is a `CL_SOURCE_REGISTRY` /
+`source-registry.conf.d` directive syntax (below), not a central-registry
+pathname convention.
+
+### `CL_SOURCE_REGISTRY` -- the standard ASDF environment variable
+
+`pack` runs as an ordinary `dotcl` process, so the standard ASDF source
+registry applies: setting `CL_SOURCE_REGISTRY` before running `pack` is
+enough, no dotcl-specific flag needed. A directory suffixed with `//` is
+searched recursively (ASDF's `:tree` shorthand); a single `/` is not.
+
+```
+CL_SOURCE_REGISTRY="/path/to/vendor//" \
+dotcl pack --system myapp --asd-search-path . ...
+```
+
+This also covers a directory of vendored libraries with one subdirectory per
+system, without listing each one.
+
+### `source-registry.conf.d` -- persistent, no environment variable
+
+For a setting that should not depend on how `pack` gets invoked, drop a
+`.conf` file under `$XDG_CONFIG_HOME/common-lisp/source-registry.conf.d/`
+(default `~/.config/...`) containing a `:tree` directive:
+
+```lisp
+;; ~/.config/common-lisp/source-registry.conf.d/myapp.conf
+(:tree "/path/to/vendor/")
+```
+
+`pack` picks this up the same way any ASDF program does, with no flag or
+environment variable at invocation time.
+
+### Quicklisp bundle (`ql:bundle-systems`)
+
+`ql:bundle-systems` copies a system and its dependency closure out of an
+existing Quicklisp installation into a self-contained `software/` directory,
+so a build does not depend on the machine's Quicklisp:
+
+```lisp
+(load "~/quicklisp/setup.lisp")   ; or ~/.roswell/lisp/quicklisp/setup.lisp
+(ql:quickload "alexandria")
+(ql:bundle-systems '("alexandria") :to #p"bundle/")
+```
+
+Point `pack` at the bundle's `software/` directory the same way as any other
+tree, with `CL_SOURCE_REGISTRY` (or a `source-registry.conf.d` entry):
+
+```
+CL_SOURCE_REGISTRY="$(pwd)/bundle/software//" \
+dotcl pack --system myapp --asd-search-path . ...
+```
+
+### qlot -- use `qlot bundle`, not `qlot exec`
+
+`qlot exec <command>` sets `QUICKLISP_HOME` to the project's `.qlot/`
+directory for `<command>` to read; that only helps a command that itself
+loads Quicklisp's `setup.lisp` and consults that variable. `dotcl` does not
+load Quicklisp, so `qlot exec dotcl pack ...` leaves your dependencies
+unreachable (confirmed: it fails the same way as running `pack` with nothing
+set at all).
+
+`qlot bundle` is the mechanism that works here: it writes the same kind of
+self-contained `software/` directory `ql:bundle-systems` does, at
+`.bundle-libs/` by default:
+
+```
+qlot bundle
+CL_SOURCE_REGISTRY="$(pwd)/.bundle-libs/software//" \
+dotcl pack --system myapp --asd-search-path . ...
+```
+
 ## Options for real projects
 
 - **`--rids`** -- comma-separated target platforms. Default:
@@ -79,15 +185,42 @@ On Windows the installed command is a `.cmd` shim named after `--command`.
 - **`--bundle <dir>`** -- extra files to ship alongside the FASL. The contents of
   `<dir>` land next to the installed executable. See *Shipping NuGet packages*
   below for the one layout dotcl looks for there by name.
+- **`--prelude <file>`** -- a source file compiled into the image ahead of your
+  system and everything it depends on, and loaded into the build itself before
+  the closure is collected. Repeatable. For whatever has to be in place before
+  any library code runs. The build needs it first because collecting the closure
+  builds any system that generates its own sources, and that build needs it too:
+  `trivial-gray-streams` names its Gray stream package with
+  `(:import-from #+dotcl :dotcl-gray ...)`, and the package has to exist when
+  that `defpackage` is *evaluated* at compile time, which happens inside
+  `cl-unicode`'s table generator before a line of your own closure is compiled.
+  So `(eval-when (:compile-toplevel :load-toplevel :execute) (require "dotcl-gray"))`
+  is the prelude you are most likely to need. `dotcl:save-application`'s
+  `:prelude` means the same thing and behaves the same way.
+- **`--r2r`** -- also compile the FASL ahead of time with crossgen2 and ship the
+  result beside it, one image per RID. The installed tool then maps native code
+  instead of running its own code through the JIT at every start: worth roughly
+  2x on a short run. It costs a crossgen2 run per RID and roughly doubles the
+  package, which is why it is opt-in. The packing host does not need to be the
+  target platform, but it does need the .NET SDK; the first use restores the
+  crossgen2 and runtime packs. If crossgen2 cannot produce an image, pack says so
+  and the package is produced without one, which is correct, only slower.
 - **`--dry-run`** -- print the planned FASL and packages without producing them.
   Note: dry-run does not compile, so it will not catch a build error such as an
   unexported entry point -- do a real run to validate the build.
 
 ### Package metadata for publishing
 
-Restamping reuses the dotcl runtime packages, so without these flags your tool
-inherits dotcl's nuspec metadata -- its description, project URL, repository,
-embedded README and tags. When you publish under your own id, override them:
+Your system definition already says most of this, so pack reads it: `:version`,
+`:description`, `:homepage`, `:source-control`, `:author` and `:license` become
+the corresponding nuspec fields, and a `README.md` next to the `.asd` is
+packaged as the embedded README. A field the `.asd` does not state and no flag
+supplies is left out of the nuspec rather than inherited from the dotcl packages
+being restamped, so your package never claims dotcl's URLs as its own. NuGet
+itself requires a description and an author; pack refuses to build a package
+missing either, naming both ways to supply it.
+
+The flags override the `.asd` where you want something else:
 
 - **`--description <text>`**, **`--project-url <url>`**, **`--tags <csv>`**
   (comma / semicolon / space separated), **`--authors <text>`**,
@@ -136,7 +269,10 @@ the cache.
 
 ## How it works
 
-Two steps. `dotcl pack` first compiles your system to a self-contained FASL, then
+Two steps. `dotcl pack` first compiles your system to a self-contained FASL --
+your system and its whole dependency closure, one source at a time in dependency
+order, the same way `dotcl:save-application :system` does, so read-time eval
+(`#.`) and readtable definitions behave as they do under a normal load -- then
 rewrites ("restamps") each `dotcl.<rid>` runtime package from `--from` into your
 tool -- your id, command, and version -- with the FASL injected, so the runtime
 runs your program instead of starting a REPL.

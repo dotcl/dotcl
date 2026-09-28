@@ -115,9 +115,12 @@
 ;;; The immediate travels as text through the SIL file, so these also pin that
 ;;; the literal survives print and read without losing a digit.
 
+;; Every iteration multiplies by the literal, so a literal that lost a digit
+;; moves this value after the first few; 10000 iterations are plenty, and the
+;; loop is interpreted on the emit-free build.
 (deftest float-literal-native-arith.double-loop-value
-  (%fln-double-loop 1000000)
-  951625.7743711884d0)
+  (%fln-double-loop 10000)
+  9995.001166746946d0)
 
 (deftest float-literal-native-arith.double-loop-small-agrees
   (list (%fln-double-loop 0) (%fln-double-loop 1) (%fln-double-loop 2))

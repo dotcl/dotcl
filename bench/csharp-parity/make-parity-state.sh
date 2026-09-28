@@ -6,7 +6,8 @@
 # Both input files are the benchmark's own stdout: one "name<TAB>milliseconds"
 # line per kernel. Each pair becomes one entry named "parity/<name>":
 #
-#     "parity/tak": {"csharp_ms": 4.498, "dotcl_ms": 11.186, "ratio": 2.49}
+#     "parity/tak": {"csharp_ms": 4.498, "dotcl_ms": 11.186, "ratio": 2.49,
+#                    "processes": 5, "csharp_split": null, "dotcl_split": null}
 #
 # Entries already in the existing file are carried through verbatim, in their
 # original order, with any previous "parity/*" row for a kernel measured now
@@ -37,27 +38,60 @@ done
 # below as a missing pair rather than silently dropped.
 #
 # A name may appear more than once: the caller runs each half of the benchmark
-# in several processes and concatenates their output. The minimum across them
-# is kept, because what is being estimated is a floor. Five samples inside one
-# process did not settle it -- the remaining spread was between processes, at
-# 1.3x on a kernel whose in-process samples agreed to a few percent -- and a
-# minimum over processes is the same one-sided filter applied one level up. It
-# can only remove noise, never hide a regression: making the code slower raises
-# the floor in every process.
+# in several processes and concatenates their output, so the k-th line for a
+# name is its value in the k-th process. The minimum across them is kept,
+# because what is being estimated is a floor. Five samples inside one process
+# did not settle it -- the remaining spread was between processes, at 1.3x on
+# a kernel whose in-process samples agreed to a few percent -- and a minimum
+# over processes is the same one-sided filter applied one level up. It can only
+# remove noise, never hide a regression: making the code slower raises the
+# floor in every process.
+#
+# The per-process values are also checked for falling into two groups
+# (bench/modes.awk). That happens without any noise at all: the same binary
+# can land a hot loop on either side of an alignment boundary depending on the
+# process, and then every process is either fast or slow. The minimum is then
+# the fast group's floor only if at least one process drew the fast group, so
+# the split is recorded next to it for bench/check-ratios.sh to report:
+#
+#     "dotcl_split": {"fast_n": 3, "fast_ms": 39.453, "slow_n": 4, "slow_ms": 57.608}
+#
+# or null when the values are one group (or fewer than 3, and not checked).
+#
+# Output, one line per name: name<TAB>min<TAB>processes<TAB>split-json
 read_pairs() {
-    awk -F'\t' 'NF >= 2 && $2 + 0 == $2 {
-                    if (!($1 in m) || $2 < m[$1]) { if (!($1 in m)) o[++n] = $1; m[$1] = $2 }
-                }
-                END { for (i = 1; i <= n; i++) print o[i] "\t" m[o[i]] }' "$1"
+    awk -F'\t' "$(cat "$modes_awk")"'
+        NF >= 2 && $2 + 0 == $2 {
+            if (!($1 in cnt)) o[++nk] = $1
+            cnt[$1]++
+            val[$1, cnt[$1]] = $2 + 0
+        }
+        END {
+            for (i = 1; i <= nk; i++) {
+                k = o[i]
+                n = cnt[k]
+                for (j = 1; j <= n; j++) v[j] = val[k, j]
+                split_modes(v, n)
+                if (M_split)
+                    s = sprintf("{\"fast_n\": %d, \"fast_ms\": %.3f, \"slow_n\": %d, \"slow_ms\": %.3f}", \
+                                M_fast_n, M_fast_med, M_slow_n, M_slow_med)
+                else
+                    s = "null"
+                printf "%s\t%.3f\t%d\t%s\n", k, M_min, n, s
+            }
+        }' "$1"
 }
+
+modes_awk="$(cd "$(dirname "$0")/.." && pwd)/modes.awk"
 
 csharp_pairs=$(read_pairs "$csharp_file")
 dotcl_pairs=$(read_pairs "$dotcl_file")
 
 names=$(echo "$dotcl_pairs" | cut -f1)
 
+# lookup <pairs> <name> <field>
 lookup() {
-    echo "$1" | awk -F'\t' -v n="$2" '$1 == n { print $2; exit }'
+    echo "$1" | awk -F'\t' -v n="$2" -v f="$3" '$1 == n { print $f; exit }'
 }
 
 # Build the new rows first, so a missing counterpart is reported before
@@ -67,8 +101,11 @@ new_rows=()
 missing=0
 while IFS= read -r name; do
     [ -z "$name" ] && continue
-    c=$(lookup "$csharp_pairs" "$name")
-    d=$(lookup "$dotcl_pairs" "$name")
+    c=$(lookup "$csharp_pairs" "$name" 2)
+    d=$(lookup "$dotcl_pairs" "$name" 2)
+    procs=$(lookup "$dotcl_pairs" "$name" 3)
+    c_split=$(lookup "$csharp_pairs" "$name" 4)
+    d_split=$(lookup "$dotcl_pairs" "$name" 4)
     if [ -z "$c" ]; then
         echo "$0: no C# result for kernel '$name'" >&2
         missing=1
@@ -79,7 +116,7 @@ while IFS= read -r name; do
         ratio=$(awk "BEGIN { printf \"%.2f\", $d / $c }")
     fi
     new_names+=("parity/$name")
-    new_rows+=("{\"csharp_ms\": $c, \"dotcl_ms\": $d, \"ratio\": $ratio}")
+    new_rows+=("{\"csharp_ms\": $c, \"dotcl_ms\": $d, \"ratio\": $ratio, \"processes\": $procs, \"csharp_split\": ${c_split:-null}, \"dotcl_split\": ${d_split:-null}}")
 done <<< "$names"
 
 if [ "$missing" -ne 0 ]; then

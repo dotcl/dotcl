@@ -32,6 +32,8 @@ public static class DotclBuild
         public string? Author;
         public string? License;
         public string? AsdDirectory;   // where to look for a sibling README
+        public string? Version;        // null unless the .asd states a string version
+        public string? EntryPoint;     // :entry-point, as a "pkg:name" string; null if none
     }
 
     /// <summary>
@@ -61,10 +63,27 @@ public static class DotclBuild
         => DotclHost.PackFaslCore(system, outputFasl, toplevel, buildInit, searchPaths);
 
     /// <summary>
+    /// As <see cref="PackFasl(string, string, string?, string[]?, string[]?)"/>,
+    /// with PRELUDE sources compiled ahead of the system's closure.
+    /// </summary>
+    public static void PackFasl(string system, string outputFasl, string? toplevel,
+                                string[]? buildInit, string[]? searchPaths,
+                                string[]? prelude)
+        => DotclHost.PackFaslCore(system, outputFasl, toplevel, buildInit, searchPaths, prelude);
+
+    /// <summary>
     /// Read the standard metadata slots off an ASDF system, as nuspec defaults.
     /// Fields are null where the .asd is silent; the result is null when the
     /// system cannot be found at all.
     /// </summary>
     public static SystemMeta? ReadSystemMeta(string system, string[]? searchPaths = null)
         => DotclHost.ReadSystemMetaCore(system, searchPaths);
+
+    /// <summary>
+    /// As <see cref="ReadSystemMeta(string, string[]?)"/>, and when the result is
+    /// null <paramref name="error"/> says why: the system is not visible to ASDF,
+    /// or loading its .asd signalled. Null error means the system was read.
+    /// </summary>
+    public static SystemMeta? ReadSystemMeta(string system, string[]? searchPaths, out string? error)
+        => DotclHost.ReadSystemMetaCore(system, searchPaths, out error);
 }

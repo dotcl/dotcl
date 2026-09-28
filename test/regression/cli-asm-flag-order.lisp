@@ -24,9 +24,7 @@
 
 (defvar *cli-lib-dir*
   (let ((dir (concatenate 'string
-                          (substitute #\/ #\\ (or (dotcl:getenv "TMPDIR")
-                                                  (dotcl:getenv "TEMP")
-                                                  "/tmp"))
+                          (regression-temp-dir)
                           "/dotcl-cli-asd/")))
     (ensure-directories-exist dir)
     (with-open-file (s (concatenate 'string dir "cliasd.asd")

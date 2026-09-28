@@ -143,3 +143,101 @@
   ("DEFPACKAGE: symbol ABSENT not found in package CR-SOURCE"
    "DEFPACKAGE: :IMPORT-FROM package CR-NO-SUCH-PACKAGE does not exist"
    "No package named \"CR-NO-SUCH-PACKAGE\" exists."))
+
+;;; The banner the debugger prints must be the report, not the class name.
+;;;
+;;; The banner read the condition's message field directly. For a condition
+;;; built from a DEFINE-CONDITION class that field holds "#<MY-ERROR>": the
+;;; report lives in a PRINT-OBJECT method that only fires under PRINC, and
+;;; nothing on that path ran the printer. So an unhandled error in a script
+;;; said "MY-ERROR: #<MY-ERROR>" while PRINC-TO-STRING of the same condition
+;;; said what had gone wrong. It was not only user-defined conditions:
+;;; SIMPLE-PACKAGE-ERROR and the SIMPLE-CONDITION + STYLE-WARNING pair that
+;;; libraries define are DEFINE-CONDITION classes too, so a build that failed
+;;; inside a library printed its condition class and nothing else.
+;;;
+;;; %CONDITION-REPORT-STRING is the text the banner prints. Asserting on it
+;;; rather than on captured process output keeps the test in-process; what it
+;;; has to satisfy is that it agrees with PRINC-TO-STRING.
+
+(define-condition cr-banner-lambda (error)
+  ((op :initarg :op :reader cr-banner-op))
+  (:report (lambda (c s) (format s "The operation ~a is not implemented."
+                                 (cr-banner-op c)))))
+
+(define-condition cr-banner-string (error) ()
+  (:report "a fixed report string"))
+
+;;; The shape a library gives a condition that carries its own message: a
+;;; SIMPLE-CONDITION mixin over the standard type. Both of the ones named in
+;;; the report are built this way.
+(define-condition cr-banner-package-error (simple-condition package-error) ())
+(define-condition cr-banner-style-warning (simple-condition style-warning) ())
+
+(define-condition cr-banner-silent (error) ((x :initarg :x)))
+
+(define-condition cr-banner-explodes (error) ()
+  (:report (lambda (c s) (declare (ignore s)) (error "report exploded for ~a" c))))
+
+(defun %cr-banner (c)
+  "The two strings that have to agree: what PRINC prints and what the banner
+   prints."
+  (list (princ-to-string c) (dotcl::%condition-report-string c)))
+
+(deftest condition-report.banner-report-lambda
+  (%cr-banner (make-condition 'cr-banner-lambda :op 'set-timeouts))
+  ("The operation SET-TIMEOUTS is not implemented."
+   "The operation SET-TIMEOUTS is not implemented."))
+
+(deftest condition-report.banner-report-string
+  (%cr-banner (make-condition 'cr-banner-string))
+  ("a fixed report string" "a fixed report string"))
+
+(deftest condition-report.banner-simple-error
+  (%cr-banner (make-condition 'simple-error
+                              :format-control "no component named ~a"
+                              :format-arguments '(mgl-pax-bootstrap)))
+  ("no component named MGL-PAX-BOOTSTRAP" "no component named MGL-PAX-BOOTSTRAP"))
+
+(deftest condition-report.banner-simple-package-error
+  (%cr-banner (make-condition 'cr-banner-package-error
+                              :package "CR-SOURCE"
+                              :format-control "symbol ~a not found in package ~a"
+                              :format-arguments '(absent cr-source)))
+  ("symbol ABSENT not found in package CR-SOURCE"
+   "symbol ABSENT not found in package CR-SOURCE"))
+
+(deftest condition-report.banner-simple-style-warning
+  (%cr-banner (make-condition 'cr-banner-style-warning
+                              :format-control "~a is deprecated"
+                              :format-arguments '(old-fn)))
+  ("OLD-FN is deprecated" "OLD-FN is deprecated"))
+
+;;; A condition with no report at all still has to print something, and must
+;;; not signal on the way.
+(deftest condition-report.banner-no-report
+  (%cr-banner (make-condition 'cr-banner-silent :x 1))
+  ("#<CR-BANNER-SILENT>" "#<CR-BANNER-SILENT>"))
+
+;;; A report that signals is how one error becomes an endless one: the report
+;;; runs while the debugger is being entered, and reaches the debugger again.
+;;; The banner drops back to the unreportable form instead, and returns.
+(deftest condition-report.banner-report-that-signals
+  (dotcl::%condition-report-string (make-condition 'cr-banner-explodes))
+  "#<CR-BANNER-EXPLODES>")
+
+;;; The type stays in the banner next to the report, so a reader who knows the
+;;; condition class still sees it.
+(deftest condition-report.banner-line-has-type-and-report
+  (dotcl::%condition-report-line (make-condition 'cr-banner-lambda :op 'set-timeouts))
+  "CR-BANNER-LAMBDA: The operation SET-TIMEOUTS is not implemented.")
+
+;;; End to end through the signalling machinery rather than MAKE-CONDITION:
+;;; this is the path that produced "#<SIMPLE-PACKAGE-ERROR>" when a build died
+;;; inside a library.
+(deftest condition-report.banner-matches-princ-when-signalled
+  (handler-case (eval '(in-package #:cr-banner-no-such-package))
+    (error (e) (list (dotcl::%condition-type-string e)
+                     (dotcl::%condition-report-string e)
+                     (string= (dotcl::%condition-report-string e) (princ-to-string e)))))
+  ("SIMPLE-PACKAGE-ERROR" "No package named \"CR-BANNER-NO-SUCH-PACKAGE\" exists." t))

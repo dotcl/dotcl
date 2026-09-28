@@ -136,6 +136,28 @@ namespace Parity
             return acc;
         }
 
+
+        // The char[] counterpart of StringWalk. On the dotcl side the two
+        // string spellings are two different objects reached by two different
+        // routes; on this side they are a string and a char[], which is the
+        // closest thing C# has to the same distinction. Same body as
+        // StringWalk on purpose: the argument is what differs.
+        [System.Runtime.CompilerServices.MethodImpl(
+            System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+        public static long StringWalkChars(char[] s, long passes)
+        {
+            long acc = 0;
+            long n = s.Length;
+            for (long p = 0; p < passes; p++)
+            {
+                for (long i = 0; i < n; i++)
+                {
+                    acc += (int)s[(int)i];
+                }
+            }
+            return acc;
+        }
+
         // --- Harness ---------------------------------------------------
 
         private const int Runs = 5;
@@ -208,6 +230,7 @@ namespace Parity
             Report("array-walk", 1, () => ArrayWalk(arr, ArrayPasses));
             Report("struct-slots", 5, () => StructLoop(point, 10000000L));
             Report("string-walk", 1, () => StringWalk(s, StringPasses));
+            Report("string-walk-vector", 1, () => StringWalkChars(chars, StringPasses));
 
             Console.Error.WriteLine("sink: {0}", _sink);
         }

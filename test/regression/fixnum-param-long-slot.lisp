@@ -160,14 +160,22 @@
   (list (%fpl-sum-do 0) (%fpl-sum-do 100) (%fpl-sum-hoisted 100))
   (0 4950 4950))
 
-;; Past the small-integer cache in the counter and in the result.
+;; Past the small-integer cache (-128..65535) in the bound, the counter and the
+;; result. 70000 is past it; a larger count adds nothing but interpreted
+;; iterations on the emit-free build.
 (deftest fixnum-param-long-slot.do-value-large
-  (list (%fpl-sum-do 1000000) (%fpl-sum-hoisted 1000000))
-  (127493856 127493856))
+  (list (%fpl-sum-do 70000) (%fpl-sum-hoisted 70000))
+  (8916936 8916936))
 
+;; A million tail calls where the rebinding goes through the raw slots. The
+;; emit-free build has no raw slots and interprets every call, so it takes
+;; 70000, which still carries the counter and the sum past the cache and the
+;; sum past 32 bits. The second element is the distance from n(n+1)/2.
 (deftest fixnum-param-long-slot.tco-values
-  (list (%fpl-tco 10 0) (%fpl-tco 1000000 0))
-  ((55) (500000500000)))
+  (let ((n (emit-free-scale 1000000 70000)))
+    (list (%fpl-tco 10 0)
+          (- (first (%fpl-tco n 0)) (/ (* n (1+ n)) 2))))
+  ((55) 0))
 
 (deftest fixnum-param-long-slot.excluded-shapes-still-work
   (list (funcall (first (%fpl-captured 3)))

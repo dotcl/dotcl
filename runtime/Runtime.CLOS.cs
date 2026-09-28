@@ -31,15 +31,48 @@ public static partial class Runtime
         public LispFunction? SpecFunction;
         /// <summary>The body function: called with (mc-args... method-groups...) -> effective-method form</summary>
         public LispFunction? BodyFunction;
+        /// <summary>(ARGS-VAR BINDINGS FRESH-VARS) for the :ARGUMENTS option, or null for
+        /// a combination registered by an older compiler, whose body function takes the
+        /// argument values and whose form is run by the private evaluator.</summary>
+        public LispObject? ArgumentsInfo;
+        /// <summary>Compiled effective methods, keyed by the method groups they were
+        /// computed from.</summary>
+        public readonly ConcurrentDictionary<EffectiveMethodKey, LispFunction> Cache = new();
+    }
+
+    /// <summary>Identity of an effective method: the generic function and the methods
+    /// of each group, in order. Compared by reference.</summary>
+    internal sealed class EffectiveMethodKey : IEquatable<EffectiveMethodKey>
+    {
+        private readonly object[] _items;
+        private readonly int _hash;
+        public EffectiveMethodKey(object[] items)
+        {
+            _items = items;
+            int h = 17;
+            foreach (var it in items)
+                h = h * 31 + (it == null ? 0 : System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(it));
+            _hash = h;
+        }
+        public bool Equals(EffectiveMethodKey? other)
+        {
+            if (other == null || other._items.Length != _items.Length) return false;
+            for (int i = 0; i < _items.Length; i++)
+                if (!ReferenceEquals(_items[i], other._items[i])) return false;
+            return true;
+        }
+        public override bool Equals(object? obj) => Equals(obj as EffectiveMethodKey);
+        public override int GetHashCode() => _hash;
     }
 
     internal class MethodGroupSpec
     {
         public string Name = "";
-        /// <summary>Qualifier pattern: null means match all (*), empty list means unqualified methods</summary>
-        public LispObject? QualifierPattern;
-        public bool MatchAll; // true for *
-        public bool MatchUnqualified; // true for NIL qualifier pattern
+        /// <summary>The group's qualifier patterns (CLHS DEFINE-METHOD-COMBINATION):
+        /// each is *, a list (NIL matches unqualified methods), or a symbol naming a
+        /// predicate on the qualifier list. A method belongs to the group when any
+        /// pattern matches.</summary>
+        public List<LispObject> Patterns = new();
         public string Order = "MOST-SPECIFIC-FIRST";
         public bool Required;
     }
@@ -79,6 +112,46 @@ public static partial class Runtime
         var sym = ToClassSymbol(name);
         if (_classRegistry.TryGetValue(sym, out var cls))
             return cls;
+        return Nil.Instance;
+    }
+
+    // Classes named by the top-level DEFCLASS forms of the files being compiled,
+    // innermost COMPILE-FILE last. COMPILE-FILE does not create those classes
+    // (they are made when the fasl is loaded), but CLHS DEFCLASS still asks that
+    // FIND-CLASS given a macro's environment return the class definition while
+    // the rest of the file is compiled. The entry is a bare placeholder carrying
+    // only the name: it is never registered, never finalized, and is dropped
+    // when that COMPILE-FILE returns.
+    [ThreadStatic]
+    private static Stack<Dictionary<Symbol, LispClass>>? s_compileTimeClassesTS;
+
+    internal static void PushCompileTimeClasses()
+        => (s_compileTimeClassesTS ??= new()).Push(new Dictionary<Symbol, LispClass>(SymbolIdentityComparer.Instance));
+
+    internal static void PopCompileTimeClasses()
+    {
+        var stack = s_compileTimeClassesTS;
+        if (stack != null && stack.Count > 0) stack.Pop();
+    }
+
+    /// <summary>%COMPILER-DEFCLASS (name): the compile-time effect of a top-level
+    /// DEFCLASS under COMPILE-FILE. Outside COMPILE-FILE it does nothing.</summary>
+    public static LispObject CompilerDefclass(LispObject name)
+    {
+        var stack = s_compileTimeClassesTS;
+        if (stack == null || stack.Count == 0 || name is not Symbol sym) return Nil.Instance;
+        var table = stack.Peek();
+        if (!table.ContainsKey(sym))
+            table[sym] = new LispClass(sym, Array.Empty<SlotDefinition>(), Array.Empty<LispClass>());
+        return Nil.Instance;
+    }
+
+    private static LispObject FindCompileTimeClass(LispObject name)
+    {
+        var stack = s_compileTimeClassesTS;
+        if (stack == null || stack.Count == 0 || name is not Symbol sym) return Nil.Instance;
+        foreach (var table in stack)
+            if (table.TryGetValue(sym, out var cls)) return cls;
         return Nil.Instance;
     }
 
@@ -154,6 +227,16 @@ public static partial class Runtime
     }
 
     public static LispObject RegisterClass(LispObject cls)
+    {
+        var registered = RegisterClassCore(cls);
+        // Readers and writers of slots that came through the metaobject protocol are
+        // defined once the class can be found by its name.
+        if (cls is LispClass lc && registered is LispClass target)
+            DefinePendingAccessors(lc, target);
+        return registered;
+    }
+
+    private static LispObject RegisterClassCore(LispObject cls)
     {
         if (cls is not LispClass lc)
             throw new LispErrorException(new LispTypeError("REGISTER-CLASS: not a class", cls));
@@ -255,14 +338,41 @@ public static partial class Runtime
         }
     }
 
-    /// <summary>Find a class by string name (linear scan). Used for subtypep fallback where
-    /// the caller only has a type name string without package context.</summary>
+    /// <summary>Find a class by string name (linear scan): the first registered class
+    /// whose name matches, from any package. Not used to resolve type specifiers (it
+    /// would answer for a symbol that names no class with some other package's class);
+    /// see FindSystemClassByName and ClassOfTypeSpecifier.</summary>
     public static LispClass? FindClassByName(string name)
     {
         foreach (var entry in _classRegistry)
             if (entry.Key.Name == name) return entry.Value;
         return null;
     }
+
+    /// <summary>A class named NAME by dotcl's own symbols (CL first, then
+    /// DOTCL-INTERNAL), for callers that only hold a type name string. Unlike
+    /// FindClassByName this never answers with a user class from some other package
+    /// that happens to share the name, and it does not intern anything.</summary>
+    public static LispClass? FindSystemClassByName(string name)
+    {
+        var (clSym, clStatus) = Startup.CL.FindSymbol(name);
+        if (clStatus != SymbolStatus.None && _classRegistry.TryGetValue(clSym, out var c1))
+            return c1;
+        var (inSym, inStatus) = Startup.Internal.FindSymbol(name);
+        if (inStatus != SymbolStatus.None && _classRegistry.TryGetValue(inSym, out var c2))
+            return c2;
+        return null;
+    }
+
+    /// <summary>The class a type specifier names as a class: a class object itself, or a
+    /// symbol that FIND-CLASS resolves. A symbol naming no class yields null even when a
+    /// same-named class exists in another package.</summary>
+    public static LispClass? ClassOfTypeSpecifier(LispObject spec) => spec switch
+    {
+        LispClass c => c,
+        Symbol s => FindClassOrNil(s) as LispClass,
+        _ => null,
+    };
 
     public static void SetClassByName(string name, LispClass cls) => _classRegistry[Startup.Sym(name)] = cls;
 
@@ -529,11 +639,16 @@ public static partial class Runtime
         return ToLispList(cpl);
     }
 
-    /// <summary>dotcl finalizes eagerly during DEFCLASS, so every class that exists
-    /// is finalized: except a forward-referenced one, which by definition is not.
-    /// The CL-side registration answered T even for those.</summary>
+    /// <summary>dotcl finalizes eagerly at the end of DEFCLASS, so a class that exists
+    /// is normally finalized. It is not while it is being made (a metaclass's
+    /// INITIALIZE-INSTANCE runs before finalization, and CLASS-SLOTS is still empty
+    /// there), when it is forward-referenced, or when one of its superclasses is:
+    /// in all of those the precedence list has not been computed yet.</summary>
     public static LispObject ClassFinalizedP(LispObject arg)
-        => RequireClass("CLASS-FINALIZED-P", arg).IsForwardReferenced ? Nil.Instance : T.Instance;
+        => IsClassFinalized(RequireClass("CLASS-FINALIZED-P", arg)) ? T.Instance : Nil.Instance;
+
+    internal static bool IsClassFinalized(LispClass c)
+        => !c.IsForwardReferenced && c.ClassPrecedenceList.Length > 0;
 
     /// <summary>The memoized prototype instance (stable identity, which EQL-method
     /// dispatch on a prototype depends on). Built-in classes have no instance to
@@ -555,7 +670,7 @@ public static partial class Runtime
         => ToLispList(RequireGf("GENERIC-FUNCTION-METHODS", arg).Methods.ToArray());
 
     public static LispObject GenericFunctionName(LispObject arg)
-        => RequireGf("GENERIC-FUNCTION-NAME", arg).Name;
+        => PublicFunctionName(RequireGf("GENERIC-FUNCTION-NAME", arg).Name);
 
     private static SlotDefinition RequireSlotDef(string who, LispObject arg)
         => arg as SlotDefinition ?? throw new LispErrorException(new LispTypeError(
@@ -602,8 +717,9 @@ public static partial class Runtime
         return m.Owner is { } gf ? gf : Nil.Instance;
     }
 
-    /// <summary>A method's lambda list. dotcl does not keep the source list, so
-    /// this rebuilds one of the right shape from the recorded arity. Shared by
+    /// <summary>A method's unspecialized lambda list: the one DEFMETHOD or
+    /// MAKE-INSTANCE recorded, else (a method from an older FASL) one of the
+    /// right shape rebuilt from the recorded arity. Shared by
     /// CL:METHOD-LAMBDA-LIST and the DOTCL-MOP one.</summary>
     public static LispObject MethodLambdaList(LispObject arg)
     {
@@ -649,6 +765,16 @@ public static partial class Runtime
                 gf.Name = ns;
                 ns.Function = gf;
                 Runtime.RegisterGF(ns, gf);
+            }
+            else if (ks.Name == "NAME" && args[i + 1] is Cons setfName
+                     && setfName.Car is Symbol setfKw && setfKw.Name == "SETF"
+                     && setfName.Cdr is Cons { Car: Symbol, Cdr: Nil }
+                     && (renaming || gf.Name.Name == "UNNAMED"))
+            {
+                // (SETF accessor): the name is kept the way DEFGENERIC keeps it
+                // for a generic function of the default class.
+                gf.Name = Runtime.ToFunctionNameSymbol(setfName, "GENERIC-FUNCTION-NAME");
+                Runtime.RegisterGF(setfName, gf);
             }
         }
     }
@@ -967,26 +1093,105 @@ public static partial class Runtime
             for (int i = resolved.Count - 1; i >= 0; i--) supersList = new Cons(resolved[i], supersList);
         }
         LispObject slotDefsList = Nil.Instance;
-        {
-            var sds = new List<LispObject>();
-            for (var c = slotsSpec; c is Cons cc; c = cc.Cdr)
-            {
-                if (cc.Car is not Cons) continue;
-                LispObject sName = Nil.Instance, sInitargs = Nil.Instance, sInitfn = Nil.Instance;
-                for (var p = cc.Car; p is Cons pc && pc.Cdr is Cons pv; p = pv.Cdr)
-                {
-                    if (pc.Car is Symbol pk)
-                    {
-                        if (pk == Startup.Keyword("NAME")) sName = pv.Car;
-                        else if (pk == Startup.Keyword("INITARGS")) sInitargs = pv.Car;
-                        else if (pk == Startup.Keyword("INITFUNCTION")) sInitfn = pv.Car;
-                    }
-                }
-                if (sName is Symbol) sds.Add(MakeSlotDef(sName, sInitargs, sInitfn));
-            }
-            for (int i = sds.Count - 1; i >= 0; i--) slotDefsList = new Cons(sds[i], slotDefsList);
-        }
+        var pairs = ParseDirectSlotPlists(slotsSpec);
+        for (int i = pairs.Count - 1; i >= 0; i--) slotDefsList = new Cons(pairs[i].Slot, slotDefsList);
         return (supersList, slotDefsList);
+    }
+
+    /// <summary>Each canonical direct slot plist of a :DIRECT-SLOTS value, paired with
+    /// the slot definition made from it. An element that is not a plist naming a slot
+    /// is skipped.</summary>
+    internal static List<(LispObject Plist, SlotDefinition Slot)> ParseDirectSlotPlists(LispObject slotsSpec)
+    {
+        var pairs = new List<(LispObject, SlotDefinition)>();
+        for (var c = slotsSpec; c is Cons cc; c = cc.Cdr)
+            if (SlotDefFromCanonicalPlist(cc.Car) is { } sd) pairs.Add((cc.Car, sd));
+        return pairs;
+    }
+
+    /// <summary>A direct slot definition from an AMOP canonical slot plist
+    /// (:NAME :INITFORM :INITFUNCTION :INITARGS :READERS :WRITERS :ALLOCATION :TYPE
+    /// :DOCUMENTATION and any other option). Options this does not know, and :TYPE,
+    /// become the slot's raw options, which is where DEFCLASS puts them for
+    /// DIRECT-SLOT-DEFINITION-CLASS. Null when the plist names no slot.</summary>
+    internal static SlotDefinition? SlotDefFromCanonicalPlist(LispObject plist)
+    {
+        if (plist is not Cons) return null;
+        LispObject? name = null, initargs = null, initfn = null, initform = null,
+            readers = null, writers = null, type = null, doc = null, alloc = null;
+        var raw = new List<LispObject>();
+        for (var p = plist; p is Cons pc && pc.Cdr is Cons pv; p = pv.Cdr)
+        {
+            var k = pc.Car;
+            var v = pv.Car;
+            // The first occurrence of a standard option wins, as for any plist.
+            if (k == Startup.Keyword("NAME")) name ??= v;
+            else if (k == Startup.Keyword("INITARGS")) initargs ??= v;
+            else if (k == Startup.Keyword("INITFUNCTION")) initfn ??= v;
+            else if (k == Startup.Keyword("INITFORM")) initform ??= v;
+            else if (k == Startup.Keyword("READERS")) readers ??= v;
+            else if (k == Startup.Keyword("WRITERS")) writers ??= v;
+            else if (k == Startup.Keyword("DOCUMENTATION")) doc ??= v;
+            else if (k == Startup.Keyword("TYPE"))
+            {
+                type ??= v;
+                raw.Add(k); raw.Add(v);
+            }
+            else if (k == Startup.Keyword("ALLOCATION"))
+            {
+                alloc ??= v;
+                if (v is not Symbol av || (av.Name != "INSTANCE" && av.Name != "CLASS"))
+                { raw.Add(k); raw.Add(v); }
+            }
+            else { raw.Add(k); raw.Add(v); }
+        }
+        if (name is not Symbol || name is Nil) return null;
+        var sd = alloc is Symbol a && a.Name == "CLASS"
+            ? (SlotDefinition)MakeSlotDefWithAllocation(name, initargs ?? Nil.Instance, initfn ?? Nil.Instance, Startup.Sym("CLASS"))
+            : (SlotDefinition)MakeSlotDef(name, initargs ?? Nil.Instance, initfn ?? Nil.Instance);
+        if (raw.Count > 0) SetSlotDefRawOptions(sd, List(raw.ToArray()));
+        SetSlotDefAttrs(sd, readers ?? Nil.Instance, writers ?? Nil.Instance,
+            type ?? Nil.Instance, initform ?? Nil.Instance);
+        if (doc != null) sd.Documentation = doc;
+        return sd;
+    }
+
+    /// <summary>The AMOP canonical plist for a direct slot definition, the shape
+    /// DEFCLASS hands a metaclass in :DIRECT-SLOTS: :NAME, :INITFORM and :INITFUNCTION
+    /// when there is an initform, :INITARGS, :READERS, :WRITERS, then :ALLOCATION,
+    /// :DOCUMENTATION and :TYPE when they say something, then the slot's other
+    /// options as written.</summary>
+    internal static LispObject CanonicalSlotPlist(SlotDefinition sd)
+    {
+        var items = new List<LispObject> { Startup.Keyword("NAME"), sd.Name };
+        if (sd.InitformThunk != null)
+        {
+            items.Add(Startup.Keyword("INITFORM")); items.Add(sd.Initform);
+            items.Add(Startup.Keyword("INITFUNCTION")); items.Add(sd.InitformThunk);
+        }
+        items.Add(Startup.Keyword("INITARGS")); items.Add(List(sd.Initargs.Cast<LispObject>().ToArray()));
+        items.Add(Startup.Keyword("READERS")); items.Add(List(sd.Readers));
+        items.Add(Startup.Keyword("WRITERS")); items.Add(List(sd.Writers));
+        if (sd.IsClassAllocation) { items.Add(Startup.Keyword("ALLOCATION")); items.Add(Startup.Keyword("CLASS")); }
+        if (sd.Documentation is not Nil) { items.Add(Startup.Keyword("DOCUMENTATION")); items.Add(sd.Documentation); }
+        bool rawHasType = false;
+        for (var c = sd.RawOptions; c is Cons rc && rc.Cdr is Cons rv; c = rv.Cdr)
+            if (rc.Car == Startup.Keyword("TYPE")) { rawHasType = true; break; }
+        if (!rawHasType && sd.SlotType is not T) { items.Add(Startup.Keyword("TYPE")); items.Add(sd.SlotType); }
+        for (var c = sd.RawOptions; c is Cons rc; c = rc.Cdr) items.Add(rc.Car);
+        return List(items.ToArray());
+    }
+
+    /// <summary>AMOP canonical default initargs, ((name form function) ...), as the
+    /// class stores them. Elements not of that shape are skipped.</summary>
+    internal static (Symbol Key, LispObject Form, LispFunction Thunk)[] ParseCanonicalDefaultInitargs(LispObject spec)
+    {
+        var result = new List<(Symbol, LispObject, LispFunction)>();
+        for (var c = spec; c is Cons cc; c = cc.Cdr)
+            if (cc.Car is Cons e && e.Car is Symbol k && e.Cdr is Cons fc
+                && fc.Cdr is Cons tc && tc.Car is LispFunction thunk)
+                result.Add((k, fc.Car, thunk));
+        return result.ToArray();
     }
 
     /// <summary>MAKE-INSTANCE on a class metaobject class makes a class (AMOP). The
@@ -995,31 +1200,36 @@ public static partial class Runtime
     /// but naming is what ENSURE-CLASS is for.</summary>
     internal static LispObject MakeClassMetaobject(LispClass metaclass, LispObject[] initargs)
     {
-        LispObject supersSpec = Nil.Instance, slotsSpec = Nil.Instance;
+        LispObject supersSpec = Nil.Instance;
         Symbol nameSym = Startup.Sym("NIL");
+        // Everything else is an initarg for the metaclass's own slots, the same
+        // thing DEFCLASS passes for a class option it does not handle itself.
+        // :DIRECT-SLOTS stays among them: MakeClassCore makes the slots from it and
+        // hands the plists to INITIALIZE-INSTANCE as they were given.
+        var extra = new List<LispObject>();
         for (int i = 0; i + 1 < initargs.Length; i += 2)
         {
             if (initargs[i] is not Symbol k) continue;
             if (k == Startup.Keyword("DIRECT-SUPERCLASSES")) supersSpec = initargs[i + 1];
-            else if (k == Startup.Keyword("DIRECT-SLOTS")) slotsSpec = initargs[i + 1];
             else if (k == Startup.Keyword("NAME") && initargs[i + 1] is Symbol ns) nameSym = ns;
+            else { extra.Add(k); extra.Add(initargs[i + 1]); }
         }
         // AMOP: with no direct superclasses, a standard class gets STANDARD-OBJECT.
         if (supersSpec is Nil && FindClassOrNil(Startup.Sym("STANDARD-OBJECT")) is LispClass stdObj)
             supersSpec = new Cons(stdObj, Nil.Instance);
-        var (supers, slotDefs) = ParseClassInitargs(supersSpec, slotsSpec);
-        return MakeClassFull(nameSym, supers, slotDefs, metaclass);
+        var (supers, _) = ParseClassInitargs(supersSpec, Nil.Instance);
+        return MakeClassCore(nameSym, supers, Nil.Instance, metaclass, extra.ToArray());
     }
 
     public static LispObject MakeClassFull(LispObject name, LispObject supersList, LispObject slotDefsList, LispObject metaclassObj)
-        => MakeClassCore(name, supersList, slotDefsList, metaclassObj as LispClass);
+        => MakeClassCore(name, supersList, slotDefsList, metaclassObj as LispClass, null, defining: true);
 
     // Variant carrying metaclass-slot initargs (e.g. :type-name) so the class object's
     // single initialize-instance applies them before inherited :after methods run.
     // Distinct name (not an overload) because builtins are reflected by method name and
     // two methods named MakeClassFull would make that lookup ambiguous.
     public static LispObject MakeClassFullWithInitargs(LispObject name, LispObject supersList, LispObject slotDefsList, LispObject metaclassObj, LispObject[] extraInitargs)
-        => MakeClassCore(name, supersList, slotDefsList, metaclassObj as LispClass, extraInitargs);
+        => MakeClassCore(name, supersList, slotDefsList, metaclassObj as LispClass, extraInitargs, defining: true);
 
     // The same thing for DEFCLASS, which has the initargs as a Lisp list rather than
     // an array: a class option that is not :METACLASS, :DEFAULT-INITARGS or
@@ -1031,10 +1241,10 @@ public static partial class Runtime
         var extra = new List<LispObject>();
         for (var cur = extraInitargs; cur is Cons c; cur = c.Cdr)
             extra.Add(c.Car);
-        return MakeClassCore(name, supersList, slotDefsList, metaclassObj as LispClass, extra.ToArray());
+        return MakeClassCore(name, supersList, slotDefsList, metaclassObj as LispClass, extra.ToArray(), defining: true);
     }
 
-    private static LispObject MakeClassCore(LispObject name, LispObject supersList, LispObject slotDefsList, LispClass? metaclass, LispObject[]? extraInitargs = null)
+    private static LispObject MakeClassCore(LispObject name, LispObject supersList, LispObject slotDefsList, LispClass? metaclass, LispObject[]? extraInitargs = null, bool defining = false)
     {
         if (name is not Symbol sym)
             throw new LispErrorException(new LispTypeError("MAKE-CLASS: name must be a symbol", name));
@@ -1051,15 +1261,9 @@ public static partial class Runtime
         // Default to STANDARD-OBJECT if no supers -- except under
         // FUNCALLABLE-STANDARD-CLASS, where AMOP names FUNCALLABLE-STANDARD-OBJECT.
         // A class whose instances are callable is not a STANDARD-OBJECT.
-        if (supers.Count == 0)
-        {
-            bool funcallable = metaclass != null
-                && metaclass.ClassPrecedenceList.Any(m => m.Name.Name == "FUNCALLABLE-STANDARD-CLASS");
-            var defaultSuper = Startup.Sym(funcallable ? "FUNCALLABLE-STANDARD-OBJECT"
-                                                       : "STANDARD-OBJECT");
-            if (_classRegistry.TryGetValue(defaultSuper, out var stdObj))
-                supers.Add(stdObj);
-        }
+        if (supers.Count == 0
+            && _classRegistry.TryGetValue(DefaultDirectSuperclassName(metaclass), out var stdObj))
+            supers.Add(stdObj);
 
         // Collect slot definitions
         var slots = new List<SlotDefinition>();
@@ -1071,32 +1275,64 @@ public static partial class Runtime
             cur = c2.Cdr;
         }
 
-        // Validate each superclass via validate-superclass GF (AMOP)
-        // Must be done before finalization. The new class being defined has a temporary LispClass
-        // for dispatch purposes; use a placeholder that has the right metaclass.
-        var validateGF = Startup.Sym("VALIDATE-SUPERCLASS").Function as LispFunction;
-        if (validateGF != null)
+        // ENSURE-CLASS and MAKE-INSTANCE of a metaclass give the direct slots as
+        // canonical plists (:DIRECT-SLOTS) and may give :DIRECT-DEFAULT-INITARGS;
+        // DEFCLASS under a custom metaclass gives the latter the same way. The slots
+        // are made from the plists, and the plists themselves are what
+        // INITIALIZE-INSTANCE sees.
+        List<(LispObject Plist, SlotDefinition Slot)>? slotPlists = null;
+        LispObject? givenSlotPlists = null, givenDefaultInitargs = null;
+        if (extraInitargs != null)
         {
-            var tempCls = new LispClass(sym, Array.Empty<SlotDefinition>(), supers.ToArray());
-            tempCls.Metaclass = metaclass; // needed for validate-superclass dispatch on (c mm)
-            foreach (var super in supers)
+            var rest = new List<LispObject>(extraInitargs.Length);
+            for (int i = 0; i + 1 < extraInitargs.Length; i += 2)
             {
-                // Skip T: always valid
-                if (super.Name.Name == "T") continue;
-                // A superclass that has not been defined yet is a placeholder, so there
-                // is no metaclass pair to validate: what its class will be is exactly
-                // what is not known. The class stays unfinalized until the real
-                // definition arrives, which is when the pair becomes a real question.
-                if (super.IsForwardReferenced) continue;
-                var result = validateGF.Invoke(new LispObject[] { tempCls, super });
-                if (result is Nil)
-                    throw new LispErrorException(new LispError(
-                        $"DEFCLASS {sym.Name}: validate-superclass rejected superclass {super.Name.Name}"));
+                var k = extraInitargs[i];
+                if (k == Startup.Keyword("DIRECT-SLOTS"))
+                {
+                    if (givenSlotPlists == null)
+                    {
+                        givenSlotPlists = extraInitargs[i + 1];
+                        slotPlists = ParseDirectSlotPlists(givenSlotPlists);
+                    }
+                    continue;
+                }
+                if (k == Startup.Keyword("DIRECT-DEFAULT-INITARGS"))
+                    givenDefaultInitargs ??= extraInitargs[i + 1];
+                rest.Add(k); rest.Add(extraInitargs[i + 1]);
+            }
+            extraInitargs = rest.ToArray();
+            if (slotPlists != null)
+            {
+                slots.Clear();
+                foreach (var (_, sd) in slotPlists) slots.Add(sd);
             }
         }
 
+        // Redefining a class (DEFCLASS / ENSURE-CLASS of a name whose class is
+        // already defined, under the same custom metaclass) reinitializes that class
+        // (CLHS 4.3.6, AMOP ENSURE-CLASS-USING-CLASS), so the metaclass's
+        // REINITIALIZE-INSTANCE methods run, not INITIALIZE-INSTANCE on a fresh
+        // object. A metaclass change, or a class that never got finalized, still
+        // takes the fresh-object path, which RegisterClass copies into place.
+        if (defining && metaclass != null
+            && _classRegistry.TryGetValue(sym, out var existing)
+            && ReferenceEquals(existing.Name, sym) && ReferenceEquals(existing.Metaclass, metaclass)
+            && !existing.IsBuiltIn && !existing.IsStructureClass && !existing.NameCleared
+            && !existing.IsForwardReferenced && existing.ClassPrecedenceList.Length > 0)
+            return RedefineByReinitialize(existing, supersList, slots, slotPlists, extraInitargs);
+
+        ValidateSuperclasses(sym, metaclass, supers);
+
         var cls = new LispClass(sym, slots.ToArray(), supers.ToArray());
         cls.Metaclass = metaclass;
+        // Slots given as plists (ENSURE-CLASS, MAKE-INSTANCE of a metaclass) have no
+        // DEFCLASS expansion behind them to define their readers and writers.
+        if (slotPlists != null)
+            NotePendingAccessors(cls, slots);
+        if (givenDefaultInitargs != null)
+            cls.DirectDefaultInitargs = ParseCanonicalDefaultInitargs(givenDefaultInitargs);
+        var supersBeforeInit = cls.DirectSuperclasses;
         // AMOP: for a custom metaclass, consult DIRECT-SLOT-DEFINITION-CLASS for each
         // direct slot. A non-standard return class becomes the slot's MetaClass and its
         // Lisp-level slots are initialized from the slot's options.
@@ -1108,6 +1344,35 @@ public static partial class Runtime
             // AND any inherited initialize-instance / shared-initialize :after
             // methods fire: e.g. a slot computed by an :after method. The
             // shared-initialize primary handles a LispClass's ExtraSlots above.
+            // The class is being made, so the metaclass's :DEFAULT-INITARGS are due
+            // (CLHS 7.1.3), as for any MAKE-INSTANCE: a metaclass that defaults one of
+            // its own initargs used to see NIL for it in INITIALIZE-INSTANCE and keep
+            // the slot's initform.
+            //
+            // AMOP also passes :NAME and :DIRECT-SUPERCLASSES (the superclasses as
+            // given, before the STANDARD-OBJECT default). A metaclass method may
+            // rewrite :DIRECT-SUPERCLASSES and call the next method with the new
+            // list; the SHARED-INITIALIZE primary for class metaobjects is what
+            // installs it, so the class is finalized with what arrived there.
+            //
+            // Likewise :DIRECT-SLOTS, as canonical slot plists, and whatever
+            // :DIRECT-DEFAULT-INITARGS the caller gave. The SHARED-INITIALIZE primary
+            // installs the values that reach it, so a method that rewrites either
+            // one (clsql's view classes read the slot plists) is honored.
+            if (slotPlists == null)
+            {
+                slotPlists = new List<(LispObject, SlotDefinition)>(cls.DirectSlots.Length);
+                foreach (var sd in cls.DirectSlots) slotPlists.Add((CanonicalSlotPlist(sd), sd));
+            }
+            var plistItems = new LispObject[slotPlists.Count];
+            for (int i = 0; i < plistItems.Length; i++) plistItems[i] = slotPlists[i].Plist;
+            var given = new List<LispObject> {
+                Startup.Keyword("NAME"), sym,
+                Startup.Keyword("DIRECT-SUPERCLASSES"), supersList,
+                Startup.Keyword("DIRECT-SLOTS"), List(plistItems),
+            };
+            if (extraInitargs != null) given.AddRange(extraInitargs);
+            extraInitargs = ApplyDefaultInitargs(metaclass, given.ToArray());
             if (Startup.Sym("INITIALIZE-INSTANCE").Function is LispFunction iiFn)
             {
                 // Pass the metaclass-slot initargs (e.g. :type-name from ensure-class) so
@@ -1115,15 +1380,18 @@ public static partial class Runtime
                 // inherited initialize-instance :after runs: matching the ordinary instance
                 // init order. Otherwise an :after that reads an initarg-filled slot sees it
                 // UNBOUND.
-                LispObject[] iiArgs;
-                if (extraInitargs is { Length: > 0 })
-                {
-                    iiArgs = new LispObject[1 + extraInitargs.Length];
-                    iiArgs[0] = cls;
-                    Array.Copy(extraInitargs, 0, iiArgs, 1, extraInitargs.Length);
-                }
-                else iiArgs = new LispObject[] { cls };
-                iiFn.Invoke(iiArgs);
+                var iiArgs = new LispObject[1 + extraInitargs.Length];
+                iiArgs[0] = cls;
+                Array.Copy(extraInitargs, 0, iiArgs, 1, extraInitargs.Length);
+                cls.PendingSlotPlists = slotPlists;
+                if (givenSlotPlists == null) cls.DefclassAccessors = AccessorKeys(slots);
+                try { iiFn.Invoke(iiArgs); }
+                finally { cls.PendingSlotPlists = null; cls.DefclassAccessors = null; }
+            }
+            if (!ReferenceEquals(cls.DirectSuperclasses, supersBeforeInit))
+            {
+                supers = new List<LispClass>(cls.DirectSuperclasses);
+                ValidateSuperclasses(sym, metaclass, supers);
             }
         }
         // Skip finalization if any superclass is forward-referenced
@@ -1132,9 +1400,91 @@ public static partial class Runtime
         {
             if (s.IsForwardReferenced) { hasForwardRef = true; break; }
         }
-        if (!hasForwardRef)
-            cls.FinalizeClass();
+        if (!hasForwardRef && !IsClassFinalized(cls))
+        {
+            // Under a custom metaclass the class is finalized through the
+            // FINALIZE-INHERITANCE generic function, as a redefinition already is,
+            // so a metaclass's methods on it run for a new class too (clsql computes
+            // its key slots in a FINALIZE-INHERITANCE :AFTER method). A class the
+            // metaclass already finalized from its INITIALIZE-INSTANCE is not
+            // finalized again.
+            if (metaclass != null && Startup.Sym("FINALIZE-INHERITANCE").Function is LispFunction fi)
+                fi.Invoke(new LispObject[] { cls });
+            if (!IsClassFinalized(cls))
+                cls.FinalizeClass();
+        }
         return cls;
+    }
+
+    /// <summary>The redefinition half of MakeClassCore: REINITIALIZE-INSTANCE on the
+    /// existing class with :DIRECT-SUPERCLASSES (as given), :DIRECT-SLOTS (canonical
+    /// plists) and the other initargs, the shape SBCL passes. :NAME is not passed
+    /// (the name is not changing) and the metaclass's default initargs do not apply,
+    /// as for any REINITIALIZE-INSTANCE.</summary>
+    private static LispClass RedefineByReinitialize(LispClass existing, LispObject supersList,
+        List<SlotDefinition> slots, List<(LispObject Plist, SlotDefinition Slot)>? slotPlists,
+        LispObject[]? extraInitargs)
+    {
+        // No plists means the slots are DEFCLASS's, whose expansion defines their
+        // readers and writers after this returns.
+        HashSet<(Symbol, LispObject)>? defclassAccessors = slotPlists == null ? AccessorKeys(slots) : null;
+        if (slotPlists == null)
+        {
+            slotPlists = new List<(LispObject, SlotDefinition)>(slots.Count);
+            foreach (var sd in slots) slotPlists.Add((CanonicalSlotPlist(sd), sd));
+        }
+        // DIRECT-SLOT-DEFINITION-CLASS is consulted for each new slot, as on first
+        // definition.
+        foreach (var (_, sd) in slotPlists) ApplyDirectSlotDefinitionClass(existing, sd);
+        var plistItems = new LispObject[slotPlists.Count];
+        for (int i = 0; i < plistItems.Length; i++) plistItems[i] = slotPlists[i].Plist;
+        var riArgs = new List<LispObject> {
+            existing,
+            Startup.Keyword("DIRECT-SUPERCLASSES"), supersList,
+            Startup.Keyword("DIRECT-SLOTS"), List(plistItems),
+        };
+        if (extraInitargs != null) riArgs.AddRange(extraInitargs);
+        var riFn = Startup.Sym("REINITIALIZE-INSTANCE").Function as LispFunction
+            ?? throw new LispErrorException(new LispError("REINITIALIZE-INSTANCE not defined"));
+        existing.PendingSlotPlists = slotPlists;
+        existing.DefclassAccessors = defclassAccessors;
+        try { riFn.Invoke(riArgs.ToArray()); }
+        finally { existing.PendingSlotPlists = null; existing.DefclassAccessors = null; }
+        return existing;
+    }
+
+    /// <summary>The superclass a class with no direct superclasses gets: STANDARD-OBJECT,
+    /// or FUNCALLABLE-STANDARD-OBJECT under FUNCALLABLE-STANDARD-CLASS (AMOP). A class
+    /// whose instances are callable is not a STANDARD-OBJECT.</summary>
+    private static Symbol DefaultDirectSuperclassName(LispClass? metaclass)
+    {
+        bool funcallable = metaclass != null
+            && metaclass.ClassPrecedenceList.Any(m => m.Name.Name == "FUNCALLABLE-STANDARD-CLASS");
+        return Startup.Sym(funcallable ? "FUNCALLABLE-STANDARD-OBJECT" : "STANDARD-OBJECT");
+    }
+
+    /// <summary>Validate each superclass via the VALIDATE-SUPERCLASS generic function
+    /// (AMOP), before finalization. The class being defined is represented by a
+    /// temporary LispClass with the right metaclass, which is what the GF dispatches on.</summary>
+    private static void ValidateSuperclasses(Symbol sym, LispClass? metaclass, IReadOnlyList<LispClass> supers)
+    {
+        if (Startup.Sym("VALIDATE-SUPERCLASS").Function is not LispFunction validateGF) return;
+        var tempCls = new LispClass(sym, Array.Empty<SlotDefinition>(), supers.ToArray());
+        tempCls.Metaclass = metaclass; // needed for validate-superclass dispatch on (c mm)
+        foreach (var super in supers)
+        {
+            // Skip T: always valid
+            if (super.Name.Name == "T") continue;
+            // A superclass that has not been defined yet is a placeholder, so there
+            // is no metaclass pair to validate: what its class will be is exactly
+            // what is not known. The class stays unfinalized until the real
+            // definition arrives, which is when the pair becomes a real question.
+            if (super.IsForwardReferenced) continue;
+            var result = validateGF.Invoke(new LispObject[] { tempCls, super });
+            if (result is Nil)
+                throw new LispErrorException(new LispError(
+                    $"DEFCLASS {sym.Name}: validate-superclass rejected superclass {super.Name.Name}"));
+        }
     }
 
     public static LispObject MakeSlotDef(LispObject name, LispObject initargs, LispObject initformThunk)
@@ -1244,12 +1594,148 @@ public static partial class Runtime
     /// with a custom metaclass, ask the GF which class the direct slot definition should be.
     /// A non-standard answer becomes the slot's MetaClass and its extra Lisp slots are
     /// initialized from the slot's options.</summary>
+    /// <summary>Install the class-structure initargs of a class metaobject
+    /// (:DIRECT-SUPERCLASSES, :DIRECT-SLOTS, :DIRECT-DEFAULT-INITARGS) from an initarg
+    /// span. Leftmost occurrence of each wins, as for any initarg; an absent one leaves
+    /// that part of the class alone. A slot plist that MakeClassCore or DEFCLASS
+    /// handed out (PendingSlotPlists) keeps its slot definition, and what
+    /// DIRECT-SLOT-DEFINITION-CLASS made of it; any other plist becomes a new slot
+    /// definition. The class is not finalized here.</summary>
+    private static void InstallClassInitargs(LispClass klass, LispObject[] initargs, int start)
+    {
+        bool supersSeen = false, slotsSeen = false, dfltSeen = false;
+        for (int i = start; i + 1 < initargs.Length; i += 2)
+        {
+            var key = initargs[i];
+            if (!supersSeen && key == Startup.Keyword("DIRECT-SUPERCLASSES"))
+            {
+                supersSeen = true;
+                var newSupers = new List<LispClass>();
+                for (var c = initargs[i + 1]; c is Cons cc; c = cc.Cdr)
+                {
+                    var sup = cc.Car is Symbol sn && cc.Car is not Nil ? FindClassOrNil(sn) : cc.Car;
+                    if (sup is LispClass sc) newSupers.Add(sc);
+                    else
+                        throw new LispErrorException(new LispTypeError(
+                            "SHARED-INITIALIZE: :DIRECT-SUPERCLASSES element is not a class", cc.Car));
+                }
+                if (newSupers.Count == 0
+                    && _classRegistry.TryGetValue(DefaultDirectSuperclassName(klass.Metaclass), out var dflt))
+                    newSupers.Add(dflt);
+                if (!newSupers.SequenceEqual(klass.DirectSuperclasses))
+                    klass.DirectSuperclasses = newSupers.ToArray();
+            }
+            else if (!slotsSeen && key == Startup.Keyword("DIRECT-SLOTS"))
+            {
+                slotsSeen = true;
+                var pending = klass.PendingSlotPlists;
+                var newSlots = new List<SlotDefinition>();
+                var fresh = new List<SlotDefinition>();
+                for (var c = initargs[i + 1]; c is Cons cc; c = cc.Cdr)
+                {
+                    SlotDefinition? sd = null;
+                    if (pending != null)
+                        foreach (var (pl, psd) in pending)
+                            if (ReferenceEquals(pl, cc.Car)) { sd = psd; break; }
+                    if (sd == null)
+                    {
+                        sd = SlotDefFromCanonicalPlist(cc.Car)
+                            ?? throw new LispErrorException(new LispTypeError(
+                                "SHARED-INITIALIZE: :DIRECT-SLOTS element is not a slot specification", cc.Car));
+                        fresh.Add(sd);
+                    }
+                    newSlots.Add(sd);
+                }
+                if (!newSlots.SequenceEqual(klass.DirectSlots))
+                    klass.DirectSlots = newSlots.ToArray();
+                if (klass.Metaclass != null)
+                    foreach (var sd in fresh) ApplyDirectSlotDefinitionClass(klass, sd);
+                NotePendingAccessors(klass, newSlots);
+            }
+            else if (!dfltSeen && key == Startup.Keyword("DIRECT-DEFAULT-INITARGS"))
+            {
+                dfltSeen = true;
+                klass.DirectDefaultInitargs = ParseCanonicalDefaultInitargs(initargs[i + 1]);
+            }
+        }
+    }
+
+    /// <summary>The (slot name, reader or writer) pairs of SLOTS, the key DEFCLASS's
+    /// own accessor methods are recognized by. A writer (SETF x) is keyed by the list
+    /// itself compared with EQUAL, which AccessorKeyComparer does.</summary>
+    private static HashSet<(Symbol Slot, LispObject Fn)> AccessorKeys(IEnumerable<SlotDefinition> slots)
+    {
+        var keys = new HashSet<(Symbol, LispObject)>(AccessorKeyComparer.Instance);
+        foreach (var sd in slots)
+        {
+            foreach (var r in sd.Readers) keys.Add((sd.Name, r));
+            foreach (var w in sd.Writers) keys.Add((sd.Name, w));
+        }
+        return keys;
+    }
+
+    private sealed class AccessorKeyComparer : IEqualityComparer<(Symbol Slot, LispObject Fn)>
+    {
+        internal static readonly AccessorKeyComparer Instance = new();
+        public bool Equals((Symbol Slot, LispObject Fn) a, (Symbol Slot, LispObject Fn) b)
+            => ReferenceEquals(a.Slot, b.Slot) && IsTrueEqual(a.Fn, b.Fn);
+        public int GetHashCode((Symbol Slot, LispObject Fn) k)
+            => System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(k.Slot)
+               ^ (k.Fn is Cons fc && fc.Cdr is Cons fn2
+                    ? System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(fn2.Car) * 31
+                    : System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(k.Fn));
+    }
+
+    /// <summary>AMOP has class initialization define the reader and writer methods
+    /// named in the direct slot definitions. DEFCLASS defines them in its expansion,
+    /// so only the ones its expansion does not know about are noted here: those of
+    /// slots a metaclass method added or rewrote, and all of them when the slots came
+    /// from ENSURE-CLASS or REINITIALIZE-INSTANCE.</summary>
+    private static void NotePendingAccessors(LispClass klass, IEnumerable<SlotDefinition> slots)
+    {
+        var known = klass.DefclassAccessors;
+        List<(Symbol, LispObject, LispObject)>? pending = null;
+        foreach (var sd in slots)
+        {
+            var readers = new List<LispObject>();
+            var writers = new List<LispObject>();
+            foreach (var r in sd.Readers)
+                if (known == null || !known.Contains((sd.Name, r))) readers.Add(r);
+            foreach (var w in sd.Writers)
+                if (known == null || !known.Contains((sd.Name, w))) writers.Add(w);
+            if (readers.Count == 0 && writers.Count == 0) continue;
+            (pending ??= new()).Add((sd.Name, List(readers.ToArray()), List(writers.ToArray())));
+        }
+        klass.PendingAccessors = pending;
+    }
+
+    /// <summary>Define the methods NotePendingAccessors left for SOURCE on TARGET, the
+    /// class registered under the name (the same object, or the existing class a
+    /// redefinition was copied into). A class that is not reachable by its name
+    /// (anonymous, or not registered) gets none: the methods are defined through
+    /// DEFMETHOD on the class name.</summary>
+    private static void DefinePendingAccessors(LispClass source, LispClass target)
+    {
+        var pending = source.PendingAccessors;
+        if (pending == null) return;
+        source.PendingAccessors = null;
+        if (FindClassOrNil(target.Name) != target) return;
+        var fn = DotCL.Emitter.CilAssembler.GetFunction("%DEFINE-SLOT-ACCESSORS");
+        foreach (var (slot, readers, writers) in pending)
+            fn.Invoke(new LispObject[] { target.Name, slot, readers, writers });
+    }
+
     private static void ApplyDirectSlotDefinitionClass(LispClass cls)
+    {
+        foreach (var slot in cls.DirectSlots)
+            ApplyDirectSlotDefinitionClass(cls, slot);
+    }
+
+    private static void ApplyDirectSlotDefinitionClass(LispClass cls, SlotDefinition slot)
     {
         if (Startup.Sym("DIRECT-SLOT-DEFINITION-CLASS").Function is not LispFunction gf)
             return;
         var stdDirect = FindClassOrNil(Startup.Sym("STANDARD-DIRECT-SLOT-DEFINITION")) as LispClass;
-        foreach (var slot in cls.DirectSlots)
         {
             // Build the &rest initargs: :name <name> :initargs (<ia>...) plus the captured
             // slot options. McCLIM only inspects keys (e.g. :dynamic), but pass a faithful set.
@@ -1899,6 +2385,13 @@ public static partial class Runtime
         if (obj is LispClass klass && klass.Metaclass != null)
             return klass.ExtraSlots != null && klass.ExtraSlots.TryGetValue(name, out var cbv) && cbv != null
                 ? T.Instance : Nil.Instance;
+        // A funcallable instance (a generic function under a user-defined
+        // funcallable class) keeps its slots in ExtraSlots, as SLOT-VALUE and
+        // (SETF SLOT-VALUE) already read and write them.
+        if (obj is GenericFunction gfb && gfb.StoredClass != null
+            && gfb.StoredClass.SlotIndex.ContainsKey(name))
+            return gfb.ExtraSlots != null && gfb.ExtraSlots.TryGetValue(name, out var gbv) && gbv != null
+                ? T.Instance : Nil.Instance;
         if (obj is LispMethod meth && meth.MetaClass != null)
             return meth.ExtraSlots != null && meth.ExtraSlots.TryGetValue(name, out var mbv) && mbv != null
                 ? T.Instance : Nil.Instance;
@@ -2038,17 +2531,50 @@ public static partial class Runtime
     public static LispObject ReinitializeInstance(LispObject[] args)
     {
         // args[0] = instance, args[1..] = initargs
-        // Class objects: re-finalize if :direct-superclasses or :direct-slots provided, else no-op.
+        // Class objects (AMOP): the new :DIRECT-SUPERCLASSES / :DIRECT-SLOTS /
+        // :DIRECT-DEFAULT-INITARGS replace the class's, and the class and its
+        // subclasses are finalized again. Under a custom metaclass this goes through
+        // SHARED-INITIALIZE with the initargs as they reached here, so metaclass
+        // methods see (and may rewrite) them and the metaclass's own slots take any
+        // initargs given; with no custom metaclass the class-structure initargs are
+        // installed directly.
         if (args[0] is LispClass lc)
         {
             bool hasRelevantArgs = false;
             for (int i = 1; i + 1 < args.Length; i += 2)
             {
                 if (args[i] is Symbol ks &&
-                    (ks.Name == "DIRECT-SUPERCLASSES" || ks.Name == "DIRECT-SLOTS"))
+                    (ks.Name == "DIRECT-SUPERCLASSES" || ks.Name == "DIRECT-SLOTS"
+                     || ks.Name == "DIRECT-DEFAULT-INITARGS"))
                 { hasRelevantArgs = true; break; }
             }
-            if (hasRelevantArgs) lc.FinalizeClass();
+            if (lc.IsBuiltIn || lc.IsStructureClass) return lc;
+            var oldSupers = lc.DirectSuperclasses;
+            if (lc.Metaclass != null && Startup.Sym("SHARED-INITIALIZE").Function is LispFunction siFn)
+            {
+                var siArgs = new LispObject[args.Length + 1];
+                siArgs[0] = lc;
+                siArgs[1] = Nil.Instance;
+                Array.Copy(args, 1, siArgs, 2, args.Length - 1);
+                bool was = lc.ReinitializingFromInitargs;
+                lc.ReinitializingFromInitargs = true;
+                try { siFn.Invoke(siArgs); }
+                finally { lc.ReinitializingFromInitargs = was; }
+            }
+            else if (hasRelevantArgs)
+                InstallClassInitargs(lc, args, 1);
+            if (!ReferenceEquals(oldSupers, lc.DirectSuperclasses))
+            {
+                ValidateSuperclasses(lc.Name, lc.Metaclass, lc.DirectSuperclasses);
+                NotifyDirectSubclasses(oldSupers, lc.DirectSuperclasses, lc);
+            }
+            if (hasRelevantArgs || !ReferenceEquals(oldSupers, lc.DirectSuperclasses))
+            {
+                if (!lc.DirectSuperclasses.Any(s => s.IsForwardReferenced))
+                    lc.FinalizeClass();
+                RefinalizeDependents(lc);
+            }
+            DefinePendingAccessors(lc, lc);
             return lc;
         }
         // Per CLHS 7.1.2: validate initargs against slots + applicable method &key params.
@@ -2232,6 +2758,13 @@ public static partial class Runtime
         if (obj is LispClass klass && klass.Metaclass != null)
         {
             var meta = klass.Metaclass;
+            // :DIRECT-SUPERCLASSES, :DIRECT-SLOTS and :DIRECT-DEFAULT-INITARGS as they
+            // reached this method (a metaclass INITIALIZE-INSTANCE or
+            // REINITIALIZE-INSTANCE method may have rewritten them). Installed only on a
+            // class being made or being reinitialized by REINITIALIZE-INSTANCE: the
+            // caller finalizes it afterwards.
+            if (klass.ClassPrecedenceList.Length == 0 || klass.ReinitializingFromInitargs)
+                InstallClassInitargs(klass, initargs, start);
             var stdNames = new HashSet<string>();
             if (_classRegistry.TryGetValue(Startup.Sym("STANDARD-CLASS"), out var scO) && scO is LispClass scC)
                 foreach (var es0 in scC.EffectiveSlots) stdNames.Add(es0.Name.Name);
@@ -2511,9 +3044,13 @@ public static partial class Runtime
                 var iiSym2 = Startup.Sym("INITIALIZE-INSTANCE");
                 if (iiSym2.Function is LispFunction iiFn2)
                 {
-                    var iiArgs2 = new LispObject[1 + initargs.Length];
+                    // Defaulted initargs are due here as well (CLHS 7.1.3). This branch
+                    // returns before the general path below reaches them, so it makes the
+                    // same call: one function, so one set of precedence rules.
+                    var effective2 = ApplyDefaultInitargs(cls, initargs);
+                    var iiArgs2 = new LispObject[1 + effective2.Length];
                     iiArgs2[0] = allocated2;
-                    Array.Copy(initargs, 0, iiArgs2, 1, initargs.Length);
+                    Array.Copy(effective2, 0, iiArgs2, 1, effective2.Length);
                     iiFn2.Invoke(iiArgs2);
                 }
                 return allocated2;
@@ -2607,40 +3144,7 @@ public static partial class Runtime
 
         // Slow path: default initargs present or custom methods defined.
         // Per CLHS 7.1.3: Apply default initargs before calling shared-initialize.
-        // For each default initarg, if the key is NOT already in user-supplied initargs,
-        // evaluate the thunk and append (key, result) to the effective initargs.
-        LispObject[] effectiveInitargs = initargs;
-        if (cls.DefaultInitargs.Length > 0)
-        {
-            // Collect user-supplied keys (every other element starting at 0)
-            var suppliedKeys = new HashSet<string>();
-            for (int i = 0; i < initargs.Length - 1; i += 2)
-            {
-                if (initargs[i] is Symbol keySym)
-                    suppliedKeys.Add(keySym.Name);
-            }
-
-            // Check if any defaults need to be added
-            var extras = new List<LispObject>();
-            foreach (var (key, initformSource, thunk) in cls.DefaultInitargs)
-            {
-                if (!suppliedKeys.Contains(key.Name))
-                {
-                    extras.Add(key);
-                    // Unwrap MvReturn: default-initarg thunks may return multiple values
-                    // (e.g. ensure-gethash returns (values value present-p)); use primary value only.
-                    extras.Add(UnwrapMv(thunk.Invoke(Array.Empty<LispObject>())));
-                }
-            }
-
-            if (extras.Count > 0)
-            {
-                effectiveInitargs = new LispObject[initargs.Length + extras.Count];
-                Array.Copy(initargs, effectiveInitargs, initargs.Length);
-                for (int i = 0; i < extras.Count; i++)
-                    effectiveInitargs[initargs.Length + i] = extras[i];
-            }
-        }
+        LispObject[] effectiveInitargs = ApplyDefaultInitargs(cls, initargs);
 
 
         // Per CLHS 7.1: make-instance calls initialize-instance with (instance . initargs)
@@ -2665,6 +3169,47 @@ public static partial class Runtime
         }
 
         return inst;
+    }
+
+    /// <summary>
+    /// CLHS 7.1.3: append a defaulted initarg for each default initarg of CLS whose key
+    /// the caller did not supply. The supplied initargs stay in front, so they keep
+    /// winning over the defaulted ones, which in turn win over slot initforms. The value
+    /// form is a function per the MOP, so it runs once per call and is not cached.
+    /// Returns INITARGS itself when there is nothing to add.
+    /// </summary>
+    private static LispObject[] ApplyDefaultInitargs(LispClass cls, LispObject[] initargs)
+    {
+        if (cls.DefaultInitargs.Length == 0) return initargs;
+
+        // Collect user-supplied keys (every other element starting at 0)
+        var suppliedKeys = new HashSet<string>();
+        for (int i = 0; i < initargs.Length - 1; i += 2)
+        {
+            if (initargs[i] is Symbol keySym)
+                suppliedKeys.Add(keySym.Name);
+        }
+
+        // Check if any defaults need to be added
+        var extras = new List<LispObject>();
+        foreach (var (key, initformSource, thunk) in cls.DefaultInitargs)
+        {
+            if (!suppliedKeys.Contains(key.Name))
+            {
+                extras.Add(key);
+                // Unwrap MvReturn: default-initarg thunks may return multiple values
+                // (e.g. ensure-gethash returns (values value present-p)); use primary value only.
+                extras.Add(UnwrapMv(thunk.Invoke(Array.Empty<LispObject>())));
+            }
+        }
+
+        if (extras.Count == 0) return initargs;
+
+        var effective = new LispObject[initargs.Length + extras.Count];
+        Array.Copy(initargs, effective, initargs.Length);
+        for (int i = 0; i < extras.Count; i++)
+            effective[initargs.Length + i] = extras[i];
+        return effective;
     }
 
     /// <summary>Check if a class is a condition class (CONDITION in its CPL).</summary>
@@ -2928,6 +3473,27 @@ public static partial class Runtime
         return $"(SETF {pkg.Name}:{accessor.Name})";
     }
 
+    /// <summary>Key symbol -> accessor, for every key symbol SetfKeySymbol has handed
+    /// out. The key symbol is what a (SETF accessor) generic function carries as its
+    /// name internally; this is how the name is turned back into the list the user
+    /// wrote wherever it leaves the runtime.</summary>
+    private static readonly ConcurrentDictionary<Symbol, Symbol> _setfKeyAccessors = new(SymbolIdentityComparer.Instance);
+
+    /// <summary>The key symbol for (SETF accessor), remembering which accessor it stands for.</summary>
+    internal static Symbol SetfKeySymbol(Symbol accessor)
+    {
+        var key = Startup.Sym(SetfKeyFor(accessor));
+        _setfKeyAccessors.TryAdd(key, accessor);
+        return key;
+    }
+
+    /// <summary>The function name as the user spells it: (SETF accessor) for a setf
+    /// key symbol, the symbol itself otherwise.</summary>
+    internal static LispObject PublicFunctionName(Symbol name)
+        => _setfKeyAccessors.TryGetValue(name, out var accessor)
+            ? new Cons(Startup.Sym("SETF"), new Cons(accessor, Nil.Instance))
+            : name;
+
     private static Symbol ToFunctionNameSymbol(LispObject name, string context)
     {
         if (name is Symbol sym) return sym;
@@ -2935,7 +3501,7 @@ public static partial class Runtime
         if (name is Cons c && c.Car is Symbol setfSym && setfSym.Name == "SETF"
             && c.Cdr is Cons c2 && c2.Car is Symbol accessor)
         {
-            return Startup.Sym(SetfKeyFor(accessor));
+            return SetfKeySymbol(accessor);
         }
         throw new LispErrorException(new LispTypeError($"{context}: invalid function name", name));
     }
@@ -2984,15 +3550,16 @@ public static partial class Runtime
         {
             _gfRegistry.TryRemove(sym, out _);
         }
-        // For setf GFs, the registry key is a cons (setf name), not the symbol itself.
-        // We can't easily look up the cons key, so scan for entries whose accessor matches.
-        // This is a rare cleanup path so linear scan is acceptable.
+        // A setf GF is registered under the key symbol SetfKeyFor builds (what
+        // FindGF looks up), not under the accessor symbol. The old loop here
+        // matched the accessor symbol itself, so stripping a compile-time
+        // (SETF ACC) removed the registry entry of the READER generic function
+        // ACC instead: compile-file of a DEFCLASS whose :accessor names an
+        // existing generic function made the later load create a fresh one, and
+        // every method defined before it was lost.
         else
         {
-            foreach (var kv in _gfRegistry)
-            {
-                if (kv.Key is Symbol s && s == sym) { _gfRegistry.TryRemove(kv.Key, out _); break; }
-            }
+            _gfRegistry.TryRemove(Startup.Sym(SetfKeyFor(sym)), out _);
         }
     }
 
@@ -3152,6 +3719,11 @@ public static partial class Runtime
                 cur = c.Cdr;
             }
         }
+        // Optional 8th argument: the unspecialized lambda list DEFMETHOD was
+        // written with. A FASL compiled before this argument existed leaves it
+        // out, and METHOD-LAMBDA-LIST then rebuilds a list from the arity.
+        if (args.Length > 7)
+            m.StoredLambdaList = args[7];
         return args[0];
     }
 
@@ -3782,6 +4354,40 @@ public static partial class Runtime
     /// Dispatch through a GF's methods if any are applicable, otherwise call the default function.
     /// Used for C#-created GFs that have a default behavior but also support defmethod.
     /// </summary>
+    /// <summary>A generic function was called and no method is applicable: call
+    /// NO-APPLICABLE-METHOD with the generic function and the arguments (CLHS 7.6.6),
+    /// so a method a program defines on it decides what happens. Its default method
+    /// signals NO-APPLICABLE-METHOD-ERROR.</summary>
+    internal static LispObject CallNoApplicableMethod(GenericFunction gf, LispObject[] args)
+    {
+        if (Startup.Sym("NO-APPLICABLE-METHOD").Function is LispFunction nam
+            && !ReferenceEquals(nam, gf))
+        {
+            var namArgs = new LispObject[args.Length + 1];
+            namArgs[0] = gf;
+            Array.Copy(args, 0, namArgs, 1, args.Length);
+            return nam.Invoke(namArgs);
+        }
+        throw NoApplicableMethodError(gf, args);
+    }
+
+    /// <summary>The error NO-APPLICABLE-METHOD's default method signals. Falls back to
+    /// a plain ERROR before the condition class is defined (early in startup).</summary>
+    internal static LispErrorException NoApplicableMethodError(LispObject gf, LispObject[] args)
+    {
+        var gfName = gf is GenericFunction g ? g.Name.ToString() : gf.ToString();
+        var message = $"No applicable method for generic function {gfName}";
+        var type = Startup.Sym("NO-APPLICABLE-METHOD-ERROR");
+        if (FindClassOrNil(type) is LispClass
+            && MakeConditionFromType(type, new LispObject[] {
+                   Startup.Keyword("FORMAT-CONTROL"),
+                   new LispString("No applicable method for generic function ~S when called with arguments ~S."),
+                   Startup.Keyword("FORMAT-ARGUMENTS"),
+                   new Cons(gf, new Cons(List(args), Nil.Instance)) }) is LispCondition cond)
+            return new LispErrorException(cond);
+        return new LispErrorException(new LispError(message));
+    }
+
     public static LispObject DispatchGFOrDefault(
         GenericFunction gf, LispObject[] args, Func<LispObject[], LispObject> defaultFn)
     {
@@ -4546,8 +5152,7 @@ public static partial class Runtime
                     {
                         if (gf.FallbackFunction != null)
                             return gf.FallbackFunction.Invoke(args);
-                        throw new LispErrorException(new LispError(
-                            $"No applicable method for generic function {gf.Name.Name}"));
+                        return CallNoApplicableMethod(gf, args);
                     }
                     throw new LispErrorException(new LispError(
                         $"No primary method for generic function {gf.Name.Name}"));
@@ -4605,8 +5210,7 @@ public static partial class Runtime
             // type that has no user-defined Gray-stream method).
             if (gf.FallbackFunction != null)
                 return gf.FallbackFunction.Invoke(args);
-            throw new LispErrorException(new LispError(
-                $"No applicable method for generic function {gf.Name.Name}"));
+            return CallNoApplicableMethod(gf, args);
         }
 
         // Keyword argument validation (CLHS 7.6.5)
@@ -4655,6 +5259,8 @@ public static partial class Runtime
         {
             if (m.Qualifiers.Length == 0)
                 primaryMethods.Add(m);
+            else if (m.Qualifiers.Length != 1)
+                continue;
             else if (m.Qualifiers[0].Name == "BEFORE")
                 beforeMethods.Add(m);
             else if (m.Qualifiers[0].Name == "AFTER")
@@ -4853,26 +5459,7 @@ public static partial class Runtime
             foreach (var m in applicable)
             {
                 if (assigned.Contains(m)) continue;
-                bool matches = false;
-                if (spec.MatchAll)
-                {
-                    matches = true;
-                }
-                else if (spec.MatchUnqualified)
-                {
-                    matches = m.Qualifiers.Length == 0;
-                }
-                else if (spec.QualifierPattern is Symbol qs)
-                {
-                    matches = m.Qualifiers.Length > 0 && m.Qualifiers[0].Name == qs.Name;
-                }
-                else if (spec.QualifierPattern is Cons qpCons)
-                {
-                    // Pattern is a list like (:around . *): match head qualifier
-                    if (qpCons.Car is Symbol headSym)
-                        matches = m.Qualifiers.Length > 0 && m.Qualifiers[0].Name == headSym.Name;
-                }
-                if (matches)
+                if (MethodGroupMatches(spec, m))
                 {
                     group.Add(m);
                     assigned.Add(m);
@@ -4912,13 +5499,124 @@ public static partial class Runtime
             groupsList = MakeCons(methodList, groupsList);
         }
 
-        // Build gf-args as a Lisp list for :arguments option
-        LispObject gfArgsList = Nil.Instance;
-        for (int i = args.Length - 1; i >= 0; i--)
-            gfArgsList = MakeCons(args[i], gfArgsList);
+        if (mc.ArgumentsInfo == null)
+        {
+            // Registered by an older compiler: the body function takes the argument
+            // values and the form is run by the private evaluator.
+            LispObject gfArgsList = Nil.Instance;
+            for (int i = args.Length - 1; i >= 0; i--)
+                gfArgsList = MakeCons(args[i], gfArgsList);
+            var legacyForm = mc.BodyFunction!.Invoke(new LispObject[] { mcArgsList, groupsList, gfArgsList });
+            return EvalEffectiveMethodForm(legacyForm, args);
+        }
 
-        var effectiveMethodForm = mc.BodyFunction!.Invoke(new LispObject[] { mcArgsList, groupsList, gfArgsList });
-        return EvalEffectiveMethodForm(effectiveMethodForm, args);
+        // The effective method form is Lisp code (CLHS 7.6.6.2). It depends only on
+        // the method groups, so it is compiled once per set of groups.
+        var keyItems = new List<object>();
+        keyItems.Add(gf);
+        foreach (var g in groups)
+        {
+            keyItems.Add(Nil.Instance);
+            foreach (var m in g) keyItems.Add(m);
+        }
+        var key = new EffectiveMethodKey(keyItems.ToArray());
+        if (!mc.Cache.TryGetValue(key, out var emFn))
+        {
+            var freshVars = (mc.ArgumentsInfo is Cons i1 && i1.Cdr is Cons i2 && i2.Cdr is Cons i3)
+                ? i3.Car : Nil.Instance;
+            var effectiveMethodForm = mc.BodyFunction!.Invoke(
+                new LispObject[] { mcArgsList, groupsList, gf, freshVars });
+            emFn = CompileEffectiveMethodForm(effectiveMethodForm, mc.ArgumentsInfo);
+            // Methods that were removed or redefined leave stale entries behind;
+            // bound the table rather than track them.
+            if (mc.Cache.Count > 512) mc.Cache.Clear();
+            mc.Cache[key] = emFn;
+        }
+        return emFn.Invoke(args);
+    }
+
+    /// <summary>Compile an effective method form into a function of the generic
+    /// function.s arguments, with CALL-METHOD and MAKE-METHOD as local macros.</summary>
+    internal static LispFunction CompileEffectiveMethodForm(LispObject form, LispObject argumentsInfo)
+    {
+        var compiler = Startup.Sym("%COMPILE-EFFECTIVE-METHOD").Function as LispFunction
+            ?? throw new LispErrorException(new LispError(
+                "effective method: %COMPILE-EFFECTIVE-METHOD is not defined"));
+        var fn = compiler.Invoke(new LispObject[] { form, argumentsInfo });
+        if (fn is MvReturn mv) fn = mv.PrimaryValue;
+        return fn as LispFunction
+            ?? throw new LispErrorException(new LispTypeError(
+                "effective method: compilation did not return a function", fn));
+    }
+
+    /// <summary>Runtime half of CALL-METHOD: run METHOD with NEXT as its next-method
+    /// list on the argument list ARGS.</summary>
+    internal static LispObject CallMethodRt(LispObject method, LispObject next, LispObject argList)
+    {
+        var args = new List<LispObject>();
+        for (var a = argList; a is Cons ac; a = ac.Cdr) args.Add(ac.Car);
+        if (method is LispMethod lm)
+        {
+            var chain = new List<LispMethod> { lm };
+            for (var rest = next; rest is Cons nc; rest = nc.Cdr)
+            {
+                if (nc.Car is LispMethod nm) chain.Add(nm);
+                else throw new LispErrorException(new LispTypeError(
+                    "CALL-METHOD: not a method in the next-method list", nc.Car));
+            }
+            return InvokeWithNextMethods(chain, 0, args.ToArray(), null);
+        }
+        if (method is LispFunction fn)
+            return fn.Invoke(args.ToArray());
+        throw new LispErrorException(new LispTypeError("CALL-METHOD: invalid method object", method));
+    }
+
+    private static bool IsMethodGroupOption(LispObject x)
+        => x is Symbol k && k.HomePackage?.Name == "KEYWORD"
+           && (k.Name == "DESCRIPTION" || k.Name == "ORDER" || k.Name == "REQUIRED");
+
+    private static bool MethodGroupMatches(MethodGroupSpec spec, LispMethod m)
+    {
+        foreach (var pat in spec.Patterns)
+        {
+            if (pat is Symbol ps && pat is not Nil)
+            {
+                if (ps.Name == "*") return true;
+                if (ps.Function is LispFunction pf)
+                {
+                    LispObject quals = Nil.Instance;
+                    for (int i = m.Qualifiers.Length - 1; i >= 0; i--)
+                        quals = new Cons(m.Qualifiers[i], quals);
+                    if (pf.Invoke(new[] { quals }) is not Nil) return true;
+                    continue;
+                }
+                // Not a predicate: read as the name of a single qualifier, as
+                // this runtime always has.
+                if (m.Qualifiers.Length == 1 && m.Qualifiers[0].Name == ps.Name) return true;
+                continue;
+            }
+            if (QualifierPatternMatches(pat, m.Qualifiers, 0)) return true;
+        }
+        return false;
+    }
+
+    /// <summary>CLHS 7.6.6.x qualifier pattern: a list matched element by element,
+    /// where * matches any one qualifier and a * tail matches any rest.</summary>
+    private static bool QualifierPatternMatches(LispObject pat, Symbol[] quals, int i)
+    {
+        while (true)
+        {
+            if (pat is Symbol tail && pat is not Nil && tail.Name == "*") return true;
+            if (pat is Nil) return i == quals.Length;
+            if (pat is not Cons pc || i >= quals.Length) return false;
+            if (!(pc.Car is Symbol el && el.Name == "*")
+                && !ReferenceEquals(pc.Car, quals[i])
+                && !(pc.Car is Symbol ps && ps.Name == quals[i].Name
+                     && ReferenceEquals(ps.HomePackage, quals[i].HomePackage)))
+                return false;
+            pat = pc.Cdr;
+            i++;
+        }
     }
 
     private static List<MethodGroupSpec> ParseMethodGroupSpecs(LispObject specList)
@@ -4934,15 +5632,14 @@ public static partial class Runtime
                 gs.Name = (specCons.Car is Symbol gsSym) ? gsSym.Name : specCons.Car.ToString();
                 if (specCons.Cdr is Cons r2)
                 {
-                    var qualPat = r2.Car;
-                    if (qualPat is Symbol qs && qs.Name == "*")
-                        gs.MatchAll = true;
-                    else if (qualPat is Nil)
-                        gs.MatchUnqualified = true;
-                    else
-                        gs.QualifierPattern = qualPat;
+                    // One or more patterns, up to the first option keyword.
+                    LispObject opts = r2;
+                    while (opts is Cons pc && !IsMethodGroupOption(pc.Car))
+                    {
+                        gs.Patterns.Add(pc.Car);
+                        opts = pc.Cdr;
+                    }
 
-                    var opts = r2.Cdr;
                     while (opts is Cons oc)
                     {
                         if (oc.Car is Symbol kw)
@@ -5831,6 +6528,10 @@ public static partial class Runtime
             return Nil.Instance;
         }
 
+        // A funcallable instance: its class's slots, as SLOT-VALUE sees them.
+        if (obj is GenericFunction gfe && gfe.StoredClass != null)
+            return gfe.StoredClass.SlotIndex.ContainsKey(name) ? T.Instance : Nil.Instance;
+
         if (obj is LispStruct ls)
         {
             var cls = FindClassOrNil(ls.TypeName) as LispClass;
@@ -5848,6 +6549,14 @@ public static partial class Runtime
         // Native (runtime-signaled) condition: consult its registered class's slots.
         if (obj is LispCondition cond)
             return ClassOf(cond) is LispClass ccls && ccls.SlotIndex.ContainsKey(name)
+                ? T.Instance : Nil.Instance;
+
+        // Metaobjects that are not LispInstances: a slot definition, a class and a
+        // method. Under a custom slot-definition class, metaclass or method class
+        // they hold that class's slots (SLOT-VALUE reads them from ExtraSlots), so
+        // SLOT-EXISTS-P has to answer from the same class.
+        if (obj is SlotDefinition || obj is LispClass || obj is LispMethod)
+            return ClassOf(obj) is LispClass mcls && mcls.SlotIndex.ContainsKey(name)
                 ? T.Instance : Nil.Instance;
 
         return Nil.Instance;
@@ -6005,9 +6714,21 @@ public static partial class Runtime
                 var name = ((LispString)args[0]).Value;
                 var specFn = (LispFunction)args[1];
                 var bodyFn = (LispFunction)args[2];
-                _longFormMCRegistry[name] = new LongFormMethodCombination { SpecFunction = specFn, BodyFunction = bodyFn };
+                // A fourth argument (possibly NIL) marks the current calling convention;
+                // three arguments come from code compiled by an older compiler.
+                _longFormMCRegistry[name] = new LongFormMethodCombination
+                {
+                    SpecFunction = specFn, BodyFunction = bodyFn,
+                    ArgumentsInfo = args.Length > 3 ? args[3] : null
+                };
                 return Nil.Instance;
             }));
+        Emitter.CilAssembler.RegisterFunction("%CALL-METHOD-RT",
+            new LispFunction(args => Runtime.CallMethodRt(args[0], args[1], args[2]),
+                "%CALL-METHOD-RT", 3));
+        Emitter.CilAssembler.RegisterFunction("%MAKE-METHOD-RT",
+            new LispFunction(args => Runtime.MakeMethod(Nil.Instance, Nil.Instance, args[0]),
+                "%MAKE-METHOD-RT", 1));
         // CLASS-NAME as a proper GF
         {
             var cnSym = Startup.Sym("CLASS-NAME");
@@ -6028,7 +6749,10 @@ public static partial class Runtime
         // (SETF CLASS-NAME) as a proper GF
         {
             var scnSym = Startup.Sym("(SETF CLASS-NAME)");
-            var scnGF = (GenericFunction)Runtime.MakeGF(Startup.Sym("CLASS-NAME"), new Fixnum(2));
+            // Named by its key symbol like every other (SETF accessor) generic
+            // function, so GENERIC-FUNCTION-NAME answers (SETF CLASS-NAME), not CLASS-NAME.
+            _setfKeyAccessors.TryAdd(scnSym, Startup.Sym("CLASS-NAME"));
+            var scnGF = (GenericFunction)Runtime.MakeGF(scnSym, new Fixnum(2));
             scnGF.RequiredCount = 2;
             scnGF.LambdaListInfoSet = true;
             Runtime.RegisterGF(scnSym, scnGF);
@@ -6234,6 +6958,13 @@ public static partial class Runtime
                 klass.ExtraSlots?.TryRemove(name, out _);
                 return klass;
             }
+            // Funcallable instance: its slots live in ExtraSlots (see SlotBoundp).
+            if (obj0 is GenericFunction gfm && gfm.StoredClass != null
+                && gfm.StoredClass.SlotIndex.ContainsKey(name))
+            {
+                gfm.ExtraSlots?.TryRemove(name, out _);
+                return gfm;
+            }
             if (obj0 is LispCondition cond)
             {
                 var ccls = Runtime.ClassOf(cond) as LispClass;
@@ -6351,11 +7082,10 @@ public static partial class Runtime
 
         // NO-APPLICABLE-METHOD
         var namSym = Startup.Sym("NO-APPLICABLE-METHOD");
-        Func<LispObject[], LispObject> namDefault = args => {
-            var gfName = args.Length > 0 ? args[0].ToString() : "unknown";
-            throw new LispErrorException(new LispError(
-                $"No applicable method for generic function {gfName}"));
-        };
+        Func<LispObject[], LispObject> namDefault = args =>
+            throw Runtime.NoApplicableMethodError(
+                args.Length > 0 ? args[0] : Nil.Instance,
+                args.Length > 1 ? args.AsSpan(1).ToArray() : Array.Empty<LispObject>());
         GenericFunction namGF = null!;
         namGF = new GenericFunction(namSym, -1,
             args => Runtime.DispatchGFOrDefault(namGF, args, namDefault));
@@ -6589,8 +7319,15 @@ public static partial class Runtime
             if (args.Length == 0) throw new LispErrorException(new LispProgramError("FIND-CLASS: too few arguments"));
             if (args.Length > 3) throw new LispErrorException(new LispProgramError($"FIND-CLASS: too many arguments: {args.Length} (expected 1-3)"));
             bool errorp = args.Length < 2 || Runtime.IsTruthy(args[1]);
+            // Given an environment argument, a class that a DEFCLASS earlier in
+            // the file being compiled names (see CompilerDefclass) is found too.
+            if (args.Length == 3 && Runtime.FindClassOrNil(args[0]) is Nil
+                && Runtime.FindCompileTimeClass(args[0]) is LispClass pending)
+                return pending;
             return errorp ? Runtime.FindClass(args[0]) : Runtime.FindClassOrNil(args[0]);
         }, "FIND-CLASS"));
+        Emitter.CilAssembler.RegisterFunction("%COMPILER-DEFCLASS",
+            new LispFunction(args => Runtime.CompilerDefclass(args[0]), "%COMPILER-DEFCLASS", 1));
         var findOrForward = new LispFunction(args => Runtime.FindOrForwardClass(args[0]),
                                              "%FIND-OR-FORWARD-CLASS", 1);
         // Typed 1-arg entry: DEFCLASS resolves every superclass through this.
@@ -6599,6 +7336,13 @@ public static partial class Runtime
         Emitter.CilAssembler.RegisterFunction("(SETF FIND-CLASS)", new LispFunction(args => {
             if (args.Length < 2) throw new Exception("(SETF FIND-CLASS): too few arguments");
             var newVal = args[0];
+            // A class name is a symbol (CLHS FIND-CLASS). ToClassSymbol would turn
+            // anything else into one by its printed name, so a class object or a
+            // string silently registered under a made-up symbol.
+            if (args[1] is not Symbol && args[1] is not Nil)
+                throw new LispErrorException(new LispTypeError(
+                    $"(SETF FIND-CLASS): {args[1]} is not a legal class name",
+                    args[1], Startup.Sym("SYMBOL")));
             // Key by the ORIGINAL package-qualified symbol, never the bare-name-normalized
             // one: otherwise (setf (find-class 'pa::seq) ...) and (setf (find-class 'pb::seq) ...)
             // both land on DOTCL-INTERNAL::SEQ and the second clobbers the first. fset's
@@ -7106,8 +7850,10 @@ public static partial class Runtime
                 new LispFunction(args => {
                     if (args.Length < 2) throw new LispErrorException(new LispProgramError("PRINT-OBJECT: requires 2 arguments"));
                     var writer = Runtime.GetOutputWriter(args[1]);
-                    writer.Write(Runtime.FormatTop(args[0], true));
+                    var potext = Runtime.FormatTop(args[0], true);
+                    writer.Write(potext);
                     writer.Flush();
+                    Runtime.NoteWritten(args[1], potext);
                     return args[0];
                 }, "PRINT-OBJECT-DEFAULT", 2));
             ((LispMethod)poDefaultMethod).RequiredCount = 2;
@@ -7218,7 +7964,7 @@ public static partial class Runtime
             return ClassPrecedenceListOf(args[0]);
         }, "CLASS-PRECEDENCE-LIST", 1));
 
-        // CLASS-FINALIZED-P: all dotcl classes are considered finalized
+        // CLASS-FINALIZED-P
         Emitter.CilAssembler.RegisterFunction("CLASS-FINALIZED-P", new LispFunction(args => {
             if (args.Length != 1) throw new LispErrorException(new LispProgramError("CLASS-FINALIZED-P: wrong arg count"));
             return ClassFinalizedP(args[0]);
@@ -7273,9 +8019,9 @@ public static partial class Runtime
             return MethodGenericFunction(args[0]);
         }, "METHOD-GENERIC-FUNCTION", 1));
 
-        // METHOD-LAMBDA-LIST: rebuilt from the recorded arity (dotcl does not
-        // keep the source lambda list). Used to return NIL for every method here
-        // while DOTCL-MOP returned the real shape.
+        // METHOD-LAMBDA-LIST: the recorded unspecialized lambda list (see
+        // MethodLambdaList). Used to return NIL for every method here while
+        // DOTCL-MOP returned the real shape.
         Emitter.CilAssembler.RegisterFunction("METHOD-LAMBDA-LIST", new LispFunction(args => {
             if (args.Length != 1) throw new LispErrorException(new LispProgramError("METHOD-LAMBDA-LIST: wrong arg count"));
             return MethodLambdaList(args[0]);
@@ -7298,14 +8044,15 @@ public static partial class Runtime
             var name = args[0];
             // Normalize name to a symbol (list names become their print-name symbol)
             Symbol nameSym = name is Symbol s ? s : Startup.Sym(name.ToString() ?? "");
-            LispObject metaclassSpec = Nil.Instance, supersSpec = Nil.Instance, slotsSpec = Nil.Instance;
-            var extra = new List<LispObject>();   // metaclass-slot initargs, e.g. :type-name
+            LispObject metaclassSpec = Nil.Instance, supersSpec = Nil.Instance;
+            // Metaclass-slot initargs (e.g. :type-name), plus :DIRECT-SLOTS and
+            // :DIRECT-DEFAULT-INITARGS, which MakeClassCore reads from here.
+            var extra = new List<LispObject>();
             for (int i = 1; i + 1 < args.Length; i += 2)
             {
                 if (args[i] is not Symbol k) continue;
                 if (k == Startup.Keyword("METACLASS")) metaclassSpec = args[i + 1];
                 else if (k == Startup.Keyword("DIRECT-SUPERCLASSES")) supersSpec = args[i + 1];
-                else if (k == Startup.Keyword("DIRECT-SLOTS")) slotsSpec = args[i + 1];
                 else { extra.Add(k); extra.Add(args[i + 1]); }
             }
             // Resolve the metaclass (a class object or a class name); null => STANDARD-CLASS.
@@ -7315,7 +8062,7 @@ public static partial class Runtime
                 Symbol ms => Runtime.FindClassOrNil(ms) as LispClass,
                 _ => null
             };
-            var (supersList, slotDefsList) = Runtime.ParseClassInitargs(supersSpec, slotsSpec);
+            var (supersList, slotDefsList) = Runtime.ParseClassInitargs(supersSpec, Nil.Instance);
             // Pass metaclass-slot initargs (e.g. :type-name) into the class object's single
             // init so shared-initialize applies them before inherited initialize-instance
             // :after runs. RegisterClass copies ExtraSlots to the existing/forward-ref class,

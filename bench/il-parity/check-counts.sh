@@ -12,6 +12,17 @@
 # Unlike a time ratio this is deterministic: the same compiler on the same
 # source gives the same counts on any machine, so a difference is a real
 # difference and the threshold is zero.
+#
+# One class of rise is NOT the compiler paying for something new: moving work
+# out of a runtime helper makes previously-invisible instructions visible. The
+# counter reads a method body and does not descend into the helpers it calls,
+# so lowering a call that took a boxed argument into one that takes a raw
+# argument relocates the unbox from inside the helper to the call site, where
+# it shows up as a castclass and a call that were not counted before. The
+# category rises while the same work -- or less of it -- is done. Before
+# rejecting a rise, read what the old helper did on that path: if every gained
+# instruction has a counterpart that used to run inside it, the rise is
+# bookkeeping and the baseline can be refreshed.
 
 set -u
 

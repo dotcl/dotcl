@@ -47,6 +47,7 @@ public static partial class Runtime
             _pprintPendingFillBreak, _pprintColumnAtLastFillCheck));
 
         bool wasActive = _pprintActive;
+        string? outerPerLinePrefix = wasActive ? _pprintPerLinePrefix : null;
         // If not already in a logical block, compute column from stream content
         if (!wasActive)
         {
@@ -76,7 +77,13 @@ public static partial class Runtime
 
         _pprintActive = true;
         _pprintStream = writer;
-        _pprintPerLinePrefix = perLinePrefix;
+        // Every line the block starts begins with the enclosing blocks' prefixes
+        // too, and this block's own per-line prefix sits at the column where it
+        // was printed on the first line (XP; SBCL agrees). The column is
+        // _pprintColumn - prefixLength here: every caller has the prefix counted
+        // in the column by now.
+        _pprintPerLinePrefix = EffectivePerLinePrefix(outerPerLinePrefix, perLinePrefix,
+            _pprintColumn - prefixLength);
         _pprintBlockColumn = _pprintColumn;
         // Default indent is right after the prefix
         _pprintIndent = _pprintBlockColumn;
@@ -97,8 +104,20 @@ public static partial class Runtime
         {
             _pprintBufferNestLevel++;
             // Record inner block start
-            _pprintDeferredNewlines?.Add((sw2.GetStringBuilder().Length, "BLOCK_START", _pprintBlockColumn, _pprintIndent, perLinePrefix, 0));
+            _pprintDeferredNewlines?.Add((sw2.GetStringBuilder().Length, "BLOCK_START", _pprintBlockColumn, _pprintIndent, _pprintPerLinePrefix, 0));
         }
+    }
+
+    /// <summary>The string a new line in a block starts with: OUTER (the enclosing
+    /// blocks' prefix, or null), then, when the block has a per-line prefix OWN of
+    /// its own, spaces up to START (the column OWN was printed at) and OWN.
+    /// Null when neither exists, so a line starts with indentation only.</summary>
+    private static string? EffectivePerLinePrefix(string? outer, string? own, int start)
+    {
+        if (own == null) return outer;
+        var head = outer ?? "";
+        if (start < head.Length) start = head.Length;
+        return start == 0 ? own : head + new string(' ', start - head.Length) + own;
     }
 
     /// <summary>Set the suffix length for the current block (used for fit/break calculations).</summary>
@@ -226,6 +245,11 @@ public static partial class Runtime
         if (_pprintIndent > col)
             writer.Write(new string(' ', _pprintIndent - col));
         _pprintColumn = Math.Max(col, _pprintIndent);
+        // Under XP buffering, mark where this newline ends so the block pass can
+        // tell it from a literal newline: a mandatory newline starts a new section,
+        // a literal one does not (a following fill newline must then break).
+        if (_pprintBuffering && writer is StringWriter sw)
+            _pprintDeferredNewlines?.Add((sw.GetStringBuilder().Length, "MANDATORY", _pprintBlockColumn, _pprintIndent, _pprintPerLinePrefix, 0));
     }
 
     /// <summary>Get *print-right-margin* value, defaulting to 72.</summary>
@@ -478,7 +502,11 @@ public static partial class Runtime
         // Output content with breaks at own-level tokens
         int col = blockCol;
         int lastPos = contentStart;
-        bool innerBlockBroke = false; // Set when an inner block produces multi-line output
+        // Set when output since this block's last own newline (conditional break or
+        // mandatory newline) spans lines: an inner block broke, or a literal newline
+        // was printed. The preceding section then did not fit on one line, so the
+        // next fill newline breaks (CLHS PPRINT-NEWLINE :FILL).
+        bool innerBlockBroke = false;
 
         for (int ti = 0; ti < ownTokens2.Count; ti++)
         {
@@ -488,7 +516,17 @@ public static partial class Runtime
             string segment = content[lastPos..adjPos];
             bool doBreak = false;
 
-            if (kind == "LINEAR")
+            if (kind == "MANDATORY")
+            {
+                // The segment ends just after a mandatory newline (and its prefix and
+                // indentation), which starts a new section.
+                result.Append(segment);
+                col = CountColumnAfter(segment, col);
+                innerBlockBroke = false;
+                lastPos = adjPos;
+                continue;
+            }
+            else if (kind == "LINEAR")
             {
                 doBreak = true;
             }
@@ -514,7 +552,7 @@ public static partial class Runtime
                     int tempCol = col + segWidth;
                     // If a preceding inner block produced multi-line output,
                     // break here to maintain visual grouping.
-                    if (innerBlockBroke)
+                    if (innerBlockBroke || segment.Contains('\n'))
                     {
                         doBreak = true;
                     }
@@ -541,6 +579,7 @@ public static partial class Runtime
                 // Inner block: output preceding segment, then process block recursively
                 result.Append(segment);
                 col = CountColumnAfter(segment, col);
+                if (segment.Contains('\n')) innerBlockBroke = true;
 
                 // Process inner block recursively with current actual column
                 var innerResult = new System.Text.StringBuilder();
@@ -591,6 +630,7 @@ public static partial class Runtime
             {
                 result.Append(segment);
                 col = CountColumnAfter(segment, col);
+                if (segment.Contains('\n')) innerBlockBroke = true;
             }
 
             lastPos = adjPos;
@@ -915,6 +955,20 @@ public static partial class Runtime
     private static StreamWriter MakeWriter(System.IO.Stream s, System.Text.Encoding? enc)
         => enc == null ? new StreamWriter(s) : new StreamWriter(s, enc);
 
+    /// <summary>The byte stream under an :IF-EXISTS :APPEND output stream. Where
+    /// the OS offers it, every write lands at the then-current end of file even
+    /// with other appenders (see AppendFileStream). Elsewhere, seek to the end
+    /// once, which is right only while this is the sole writer.</summary>
+    private static System.IO.Stream OpenForAppend(string filePath, bool create)
+    {
+        var s = AppendFileStream.TryOpen(filePath, create);
+        if (s != null) return s;
+        var fs = new FileStream(filePath, create ? FileMode.OpenOrCreate : FileMode.Open,
+                                FileAccess.Write, FileShare.ReadWrite);
+        fs.Seek(0, SeekOrigin.End);
+        return fs;
+    }
+
     public static LispObject OpenFile(LispObject path, LispObject[] options)
     {
         string filePath = ResolvePhysicalPath(path);
@@ -1047,9 +1101,7 @@ public static partial class Runtime
                         }
                         case "APPEND":
                         {
-                            var netFsApp = new FileStream(filePath, FileMode.Open, FileAccess.Write, FileShare.ReadWrite);
-                            netFsApp.Seek(0, SeekOrigin.End);
-                            var writer = MakeWriter(netFsApp, encoding);
+                            var writer = MakeWriter(OpenForAppend(filePath, create: false), encoding);
                             var ofs = new LispFileStream(writer, filePath);
                             ofs.ElementType = elementType;
                             ofs.ExternalFormat = externalFormat;
@@ -1080,7 +1132,12 @@ public static partial class Runtime
                     }
                 }
                 {
-                    var netFsOut = new FileStream(filePath, FileMode.Create, FileAccess.Write, FileShare.ReadWrite);
+                    // :IF-EXISTS :APPEND with a missing file: another appender may
+                    // create it between the check above and here, and FileMode.Create
+                    // would then truncate what it wrote. Open appending, creating.
+                    System.IO.Stream netFsOut = ifExists == "APPEND"
+                        ? OpenForAppend(filePath, create: true)
+                        : new FileStream(filePath, FileMode.Create, FileAccess.Write, FileShare.ReadWrite);
                     var writer = MakeWriter(netFsOut, encoding);
                     var fs = new LispFileStream(writer, filePath);
                     fs.ElementType = elementType;
@@ -3439,6 +3496,19 @@ public static partial class Runtime
     /// ship with the release. It forwards; there is no second implementation.</summary>
     public static LispObject LispDirectory(LispObject[] args) => DirectoryFunc(args);
 
+    // The order of DIRECTORY's result is not specified, but the file system's
+    // enumeration order differs between OSes and file systems (APFS, NTFS, ext4)
+    // and libraries come to depend on the order SBCL and CCL give, which is
+    // sorted by namestring. local-time, for one, builds its zone index by
+    // pushing files in DIRECTORY order and picks the first match. Sort the same
+    // way (by character code, like STRING<) so the order is stable everywhere.
+    static LispObject SortedDirectoryEntries(List<LispObject> entries)
+    {
+        var keyed = entries.Select(e => (Key: e is LispPathname pn ? pn.ToNamestring() : e.ToString() ?? "", Entry: e)).ToList();
+        keyed.Sort((a, b) => string.CompareOrdinal(a.Key, b.Key));
+        return Runtime.List(keyed.Select(k => k.Entry).ToArray());
+    }
+
     public static LispObject DirectoryFunc(LispObject[] args)
     {
         if (args.Length == 0)
@@ -3496,7 +3566,7 @@ public static partial class Runtime
                     foreach (var dir in ExpandWildDirectories(dirWildPath))
                         entries.Add(LispPathname.FromString(
                             Path.GetFullPath(dir) + Path.DirectorySeparatorChar));
-                    return Runtime.List(entries.ToArray());
+                    return SortedDirectoryEntries(entries);
                 }
 
                 if (!Directory.Exists(searchDir)) return Nil.Instance;
@@ -3506,7 +3576,7 @@ public static partial class Runtime
                     string fullDir = Path.GetFullPath(dir);
                     entries.Add(LispPathname.FromString(fullDir + Path.DirectorySeparatorChar));
                 }
-                return Runtime.List(entries.ToArray());
+                return SortedDirectoryEntries(entries);
             }
 
             string dirPath = Path.GetDirectoryName(namestring) ?? ".";
@@ -3522,7 +3592,7 @@ public static partial class Runtime
             {
                 foreach (var file in ExpandWildDirectory(dirPath, pattern))
                     entries.Add(EntryPathname(file));
-                return Runtime.List(entries.ToArray());
+                return SortedDirectoryEntries(entries);
             }
 
             // Check for ** (recursive) pattern
@@ -3542,7 +3612,7 @@ public static partial class Runtime
                 }
             }
 
-            return Runtime.List(entries.ToArray());
+            return SortedDirectoryEntries(entries);
         }
         catch
         {
@@ -4105,7 +4175,14 @@ public static partial class Runtime
                     // too: flexi-streams' classes are binary output streams, and
                     // testing only the character predicate rejected the very objects
                     // write-char and streamp had already accepted.
-                    if (args.Length > 0 && args[0] is LispInstance gi
+                    //
+                    // With no argument the stream is *STANDARD-OUTPUT*, which is as
+                    // likely to be a gray stream (a REPL or editor server binds it to
+                    // one) and gets the same trampoline.
+                    var target = args.Length > 0 && args[0] is not Nil
+                        ? args[0]
+                        : DynamicBindings.Get(Startup.Sym("*STANDARD-OUTPUT*"));
+                    if (target is LispInstance gi
                         && (IsGrayOutputStream(gi) || IsGrayBinaryOutputStream(gi)))
                     {
                         var gfn = GrayStreamLookup.GrayOrCl("STREAM-" + fn);
@@ -4157,6 +4234,15 @@ public static partial class Runtime
         else if (stream is LispBidirectionalStream bidi)
         {
             bidi.Writer.Flush();
+        }
+        else if (stream is LispInstance gi
+                 && (IsGrayOutputStream(gi) || IsGrayBinaryOutputStream(gi)))
+        {
+            // Reached through a synonym, two-way, echo or broadcast stream whose
+            // output side is a gray stream: an explicit FORCE-OUTPUT has to reach
+            // it. (The TextWriter bridge's Flush no longer does; see
+            // GrayStreamTextWriter.Flush.)
+            GrayStreamLookup.GrayOrCl("STREAM-FORCE-OUTPUT")?.Invoke(new LispObject[] { gi });
         }
         else
         {

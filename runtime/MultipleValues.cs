@@ -308,6 +308,26 @@ public static class MultipleValues
         // Don't null _values: Get() checks _count first, saves a ThreadStatic write
     }
 
+    /// <summary>
+    /// The values a call produced, given its primary result. Valid only
+    /// immediately after the call, and only when the channel was RESET just
+    /// before it -- otherwise a previous (VALUES) is still current and a
+    /// function that returned one value the ordinary way looks like it
+    /// returned none.
+    ///
+    /// Three shapes reach this. MvReturn is the boxed form the protocol uses
+    /// when values cross a boundary that cannot carry the channel. A negative
+    /// count means nobody published, which is how a function returning one
+    /// value the ordinary way looks. Otherwise the channel is what the callee
+    /// published, including the zero-length case for (VALUES).
+    /// </summary>
+    public static LispObject[] Of(LispObject primary)
+    {
+        if (primary is MvReturn mv) return mv.ToArray();
+        if (_count < 0) return new[] { primary };
+        return Get();
+    }
+
     // Save/restore for unwind-protect: preserve body's secondary values across cleanup
     public static int SaveCount() => _count;
     /// <summary>The values to restore after an unwind-protect cleanup. A pair published

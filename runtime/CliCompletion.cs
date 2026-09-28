@@ -9,7 +9,8 @@ public static class CliCompletion
     private static readonly string[] Flags = new[]
     {
         "--help", "--version", "--core", "--load", "--eval", "--no-init",
-        "--readline", "--no-readline", "--completion", "--asd-search-path",
+        "--readline", "--no-readline", "--color=auto", "--color=always",
+        "--color=never", "--completion", "--asd-search-path",
     };
 
     private static readonly string[] FilePathFlags = new[]

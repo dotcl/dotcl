@@ -238,8 +238,7 @@ public static class DotclHost
     /// <summary>Assemble and run SIL core text, restoring *PACKAGE* afterwards.</summary>
     private static void RunCoreSil(string source, string what)
     {
-        var reader = new Reader(new System.IO.StringReader(source));
-        if (!reader.TryRead(out var instrList))
+        if (!Reader.TryReadSilCore(source, out var instrList))
             throw new InvalidOperationException($"Empty core file: {what}");
 
         var packageSym = Startup.Sym("*PACKAGE*");
@@ -629,22 +628,12 @@ public static class DotclHost
     }
 
     /// <summary>
-    /// The values a call produced, given its primary result. Valid only
-    /// immediately after the call, and only when the channel was reset just
-    /// before it -- the callers here do both.
-    ///
-    /// Three shapes reach this. MvReturn is the boxed form the protocol uses
-    /// when values cross a boundary that cannot carry the channel. A negative
-    /// count means nobody published, which is how a function returning one value
-    /// the ordinary way looks. Otherwise the channel is what the callee
-    /// published, including the zero-length case for (VALUES).
+    /// The values a call produced, given its primary result. The rule lives in
+    /// <see cref="MultipleValues.Of"/>, which the REPL's history variables read
+    /// as well; the callers here supply the RESET it requires.
     /// </summary>
     private static LispObject[] ValuesOf(LispObject primary)
-    {
-        if (primary is MvReturn mv) return mv.ToArray();
-        if (MultipleValues.Count < 0) return new[] { primary };
-        return MultipleValues.Get();
-    }
+        => MultipleValues.Of(primary);
 
     /// <summary>
     /// The value of a special variable, by name. Resolution follows the same
@@ -897,9 +886,7 @@ public static class DotclHost
         {
             var cond = a.Length > 0 ? a[0] : Nil.Instance;
             if (typed) throw new DotclConditionException(cond);
-            var msg = cond is LispCondition lc ? lc.Message : cond.ToString();
-            var typeName = cond is LispCondition lc2 ? lc2.ConditionTypeName : "ERROR";
-            throw new InvalidOperationException($"{typeName}: {msg}");
+            throw new InvalidOperationException(ConditionText.Line(cond));
         }, "*NON-INTERACTIVE-DEBUGGER-HOOK*", 2));
     }
 
@@ -928,20 +915,7 @@ public static class DotclHost
     /// depending on the dev machine's paths. Called after (require "asdf").
     /// </summary>
     private static void LoadBuildInitScripts(string[]? scripts)
-    {
-        if (scripts == null) return;
-        foreach (var s in scripts)
-        {
-            if (string.IsNullOrWhiteSpace(s)) continue;
-            var abs = System.IO.Path.GetFullPath(s.Trim());
-            if (!System.IO.File.Exists(abs))
-                throw new System.IO.FileNotFoundException(
-                    $"DotclBuildInit script not found: {abs}", abs);
-            var lisp = abs.Replace("\\", "/");
-            Runtime.Eval(MultipleValues.Primary(
-                Runtime.ReadFromString(new LispObject[] { new LispString($"(load \"{lisp}\")") })));
-        }
-    }
+        => Runtime.LoadLispFiles(scripts, "DotclBuildInit script");
 
     /// <summary>Lisp preamble shared by the build forms: resolve the root system
     /// of the .asd the build was pointed at, and refuse to build a different one
@@ -960,6 +934,7 @@ public static class DotclHost
             Runtime.ReadFromString(new LispObject[] { new LispString(source) })));
 
     private const string RootSystemHelper = @"
+(progn
 (defun %root-system-of (asd)
   (flet ((norm (p) (and p (substitute #\/ #\\ (namestring p)))))
     (let* ((want (norm (truename (pathname asd))))
@@ -971,6 +946,16 @@ public static class DotclHost
                 rename one, or keep the other out of the search path.""
                want (asdf:component-name sys) (or got ""an unknown file"")))
       sys)))
+
+;; The Lisp source files of SYS itself, in the order ASDF would compile them.
+;; Components inside a :module are included: listing only the system's direct
+;; children dropped every file under a module and compiled the rest as if that
+;; were the whole system. Static files and file-less components (a :nuget
+;; declaration) have nothing to compile and are left out.
+(defun %system-source-files (sys)
+  (loop for c in (asdf:required-components sys :other-systems nil)
+        when (typep c 'asdf:cl-source-file)
+          collect c)))
 ";
 
     /// <summary>
@@ -1062,6 +1047,9 @@ public static class DotclHost
         // and side-effects *central-registry* with shipped contrib subdirs.
         Runtime.Eval(MultipleValues.Primary(
             Runtime.ReadFromString(new LispObject[] { new LispString("(require \"asdf\")") })));
+        // Before any .asd is read: a stock asdf.asd visible to the build would
+        // otherwise replace the running ASDF (see PinBundledAsdf).
+        PinBundledAsdf();
         EvalLisp(RootSystemHelper);
 
         // MSBuild path (manifest to a file): route ASDF's compile cache under
@@ -1177,9 +1165,8 @@ public static class DotclHost
       (let ((rstream {rootSourcesForm}))
         (when rstream
           (unwind-protect
-            (dolist (c (asdf:component-children root))
-              (let ((p (asdf:component-pathname c)))
-                (when p (format rstream ""~A~%"" (namestring p)))))
+            (dolist (c (%system-source-files root))
+              (format rstream ""~A~%"" (namestring (asdf:component-pathname c))))
             (close rstream)))))))";
         Runtime.Eval(MultipleValues.Primary(
             Runtime.ReadFromString(new LispObject[] { new LispString(form) })));
@@ -1222,6 +1209,7 @@ public static class DotclHost
 
         Runtime.Eval(MultipleValues.Primary(
             Runtime.ReadFromString(new LispObject[] { new LispString("(require \"asdf\")") })));
+        PinBundledAsdf();
 
         EvalLisp(RootSystemHelper);
         // Route ASDF's compile cache under obj/ so `dotnet clean` clears it and a
@@ -1255,9 +1243,7 @@ public static class DotclHost
          ;; file -- and its COMPONENT-PATHNAME is then the system's own directory,
          ;; which CONCATENATE-FILES tried to read and failed on: the whole build
          ;; died with ""File not found: <system dir>/"".
-         (sources (loop for c in (asdf:component-children root)
-                        when (asdf:input-files 'asdf:compile-op c)
-                          collect (asdf:component-pathname c)))
+         (sources (mapcar #'asdf:component-pathname (%system-source-files root)))
          ;; What those file-less components asked for, turned back into source:
          ;; the concatenated unit is not loaded through ASDF, so nothing else
          ;; would ever perform them (see DOTCL-NUGET-ASDF). Written as a file of
@@ -1361,22 +1347,33 @@ public static class DotclHost
     }
 
     /// <summary>
-    /// Build a single self-contained FASL for <c>dotcl pack</c>: monolithic-
-    /// concatenate the named ASDF system, its root sources AND all dependency
-    /// sources, via <c>asdf:monolithic-concatenate-source-op</c>, then
-    /// <c>compile-file-concatenated</c> the result into
-    /// <paramref name="outputFasl"/>. Unlike <see cref="CompileProject"/> (root
-    /// only, deps stay as separate fasls) the produced FASL loads standalone, so
-    /// the pack restamp can drop it into the tool package as a single
-    /// dotcl.user.fasl with no dep fasls to bundle.
+    /// Build a single self-contained FASL for <c>dotcl pack</c>: the named ASDF
+    /// system and its whole dependency closure, compiled one source at a time in
+    /// dependency order, into <paramref name="outputFasl"/>. Unlike
+    /// <see cref="CompileProject"/> (root only, deps stay as separate fasls) the
+    /// produced FASL loads standalone, so the pack restamp can drop it into the
+    /// tool package as a single dotcl.user.fasl with no dep fasls to bundle.
     ///
-    /// When <paramref name="toplevel"/> is non-null a call <c>(toplevel)</c> is
-    /// appended so the tool runs that entry point on launch. A system that
-    /// already invokes its entry at load time (e.g. a roswell <c>&lt;name&gt;/exe</c>
-    /// launcher) needs none.
+    /// This is the same collect-and-compile path SAVE-APPLICATION :SYSTEM uses.
+    /// pack used to concatenate the closure into one unit through ASDF's
+    /// MONOLITHIC-CONCATENATE-SOURCE-OP and compile that, which cannot work for a
+    /// system whose sources use #. at read time: read-time eval assumes the
+    /// earlier forms have been evaluated, and in one concatenated unit they have
+    /// only been compiled, so the first (declare #.*standard-optimize-settings*)
+    /// dies reading. cl-ppcre, flexi-streams, cl-unicode and cl-interpol all do
+    /// this, which between them covers a large part of Quicklisp.
+    ///
+    /// When <paramref name="toplevel"/> is non-null a call to it is appended so
+    /// the tool runs that entry point on launch. A system that already invokes
+    /// its entry at load time (e.g. a roswell <c>&lt;name&gt;/exe</c> launcher)
+    /// needs none.
+    ///
+    /// <paramref name="prelude"/> sources are compiled ahead of the closure, for
+    /// whatever a deployed image needs in place before any library code runs.
     /// </summary>
     internal static void PackFaslCore(string system, string outputFasl, string? toplevel = null,
-                                string[]? buildInit = null, string[]? searchPaths = null)
+                                string[]? buildInit = null, string[]? searchPaths = null,
+                                string[]? prelude = null)
     {
         var absOut = System.IO.Path.GetFullPath(outputFasl);
         var outDir = System.IO.Path.GetDirectoryName(absOut);
@@ -1396,52 +1393,75 @@ public static class DotclHost
 
         Runtime.Eval(MultipleValues.Primary(
             Runtime.ReadFromString(new LispObject[] { new LispString("(require \"asdf\")") })));
+        PinBundledAsdf();
         RegisterAsdSearchPaths(searchPaths);
         LoadBuildInitScripts(buildInit);
 
-        var outLisp = absOut.Replace("\\", "/");
         var sysEsc = system.Replace("\\", "\\\\").Replace("\"", "\\\"");
-        var workConcat = (outDir == null ? "" : outDir.Replace("\\", "/") + "/")
-                       + System.IO.Path.GetFileNameWithoutExtension(outputFasl) + ".pack.concat.lisp";
-        // Launcher appended only when --toplevel was given.
-        var appendForm = toplevel == null ? "" :
-            $@"(with-open-file (o work :direction :output :if-exists :append :if-does-not-exist :error)
-                 (terpri o) (write-line ""({toplevel})"" o))";
+        var preambleFile = (outDir == null ? "" : outDir.Replace("\\", "/") + "/")
+                         + System.IO.Path.GetFileNameWithoutExtension(outputFasl)
+                         + ".pack.nuget.lisp";
 
-        // monolithic-concatenate-source-op writes the concat into asdf's shared
-        // cache; copy it to a writable work file next to the output (keep the
-        // cached one pristine), append the optional launcher, then compile.
-        // A (:nuget ...) component is not a file, and ASDF's concatenation gathers
-        // files, so the declaration would be dropped here -- in the one direction
-        // that matters, since the artifact this builds is what runs where there is
-        // no .NET SDK. DOTCL-NUGET-ASDF turns the declarations back into source,
+        // The running ASDF and UIOP are pinned above (PinBundledAsdf). Beyond
+        // that, before the walk:
+        //
+        // FIND-SYSTEM, never LOAD-SYSTEM. The walk needs the dependency graph,
+        // not the code, and compiling a system's sources in an image that has
+        // already loaded them re-runs everything inside an EVAL-WHEN
+        // :COMPILE-TOPLEVEL a second time: cl-interpol's
+        // (defreadtable :interpol-syntax ...) answers that with
+        // READER-MACRO-CONFLICT.
+        //
+        // A (:nuget ...) component is not a file, and the walk gathers files, so
+        // the declaration would be dropped here -- in the one direction that
+        // matters, since the artifact this builds is what runs where there is no
+        // .NET SDK. DOTCL-NUGET-ASDF turns the declarations back into source,
         // which goes in front of the system's own code so the packages are
         // registered before anything names a type from them. The package exists
         // only when the .asd asked for it (:defsystem-depends-on), which
-        // FIND-SYSTEM above has by then loaded.
-        var form = $@"
-(let* ((sys (asdf:find-system ""{sysEsc}""))
-       (op 'asdf:monolithic-concatenate-source-op)
-       (nuget-asdf (find-package ""DOTCL-NUGET-ASDF""))
-       (preamble (when nuget-asdf
-                   (funcall (find-symbol ""SYSTEM-NUGET-PREAMBLE"" nuget-asdf) sys))))
-  (asdf:operate op sys)
-  (let ((concat (namestring (first (asdf:output-files op sys))))
-        (work ""{workConcat}""))
-    (with-open-file (o work :direction :output :if-exists :supersede :if-does-not-exist :create)
-      (when preamble (write-string preamble o))
-      (with-open-file (i concat)
-        (loop for line = (read-line i nil :eof) until (eq line :eof)
-              do (write-line line o))))
-    {appendForm}
-    (dotcl.cil-compiler:compile-file-concatenated work ""{outLisp}"")))";
+        // FIND-SYSTEM here has by then loaded.
+        var setupForm = $@"
+(progn
+  (let* ((sys (asdf:find-system ""{sysEsc}""))
+         (nuget-asdf (find-package ""DOTCL-NUGET-ASDF""))
+         (preamble (when nuget-asdf
+                     (funcall (find-symbol ""SYSTEM-NUGET-PREAMBLE"" nuget-asdf) sys))))
+    (when (and (stringp preamble) (plusp (length preamble)))
+      (with-open-file (o ""{preambleFile}"" :direction :output
+                         :if-exists :supersede :if-does-not-exist :create)
+        (write-string preamble o))
+      t)))";
 
+        var preSources = new System.Collections.Generic.List<string>();
         var prevEmit = Runtime.EmitBuildSourceLocations;
         Runtime.EmitBuildSourceLocations = true;
         try
         {
-            Runtime.Eval(MultipleValues.Primary(
-                Runtime.ReadFromString(new LispObject[] { new LispString(form) })));
+            // The prelude runs here as well as being compiled into the image. It
+            // says what has to be in place before anything else, and the builder
+            // is the first thing that needs it: systems that generate their own
+            // sources are built during the walk below, and those builds need
+            // whatever the prelude provides as much as the closure does.
+            //
+            // trivial-gray-streams is the case to keep in mind. It picks the Gray
+            // stream package with (:import-from #+dotcl :dotcl-gray ...), and
+            // DOTCL-GRAY has to exist when that DEFPACKAGE is EVALUATED, which
+            // happens at compile time inside cl-unicode's table generator, long
+            // before any source of the closure itself is compiled. Putting the
+            // prelude at the head of the compile list cannot help there, because
+            // the walk runs before anything is compiled at all.
+            Runtime.LoadLispFiles(prelude, "--prelude source");
+
+            var wrotePreamble = Runtime.Eval(MultipleValues.Primary(
+                Runtime.ReadFromString(new LispObject[] { new LispString(setupForm) })));
+
+            if (prelude != null)
+                foreach (var p in prelude)
+                    preSources.Add(System.IO.Path.GetFullPath(p));
+            if (wrotePreamble is not Nil)
+                preSources.Add(preambleFile);
+
+            Runtime.BuildSystemFasl(system, absOut, toplevel, preSources);
         }
         finally
         {
@@ -1452,38 +1472,84 @@ public static class DotclHost
 
 
     /// <summary>
-    /// Read the standard metadata slots off an ASDF system. `dotcl pack` uses
-    /// these as nuspec defaults so a packed tool describes itself rather than
-    /// inheriting the description and URLs of the dotcl packages it was
-    /// restamped from. Returns a SystemMeta whose fields are null where the .asd
+    /// Read the standard metadata slots off an ASDF system, its version among
+    /// them. `dotcl pack` uses these as nuspec defaults so a packed tool
+    /// describes itself rather than inheriting the description and URLs of the
+    /// dotcl packages it was restamped from, and so a project states its
+    /// version once, in the .asd, rather than again on every pack command
+    /// line. Returns a SystemMeta whose fields are null where the .asd
     /// is silent; returns null if the system cannot be found at all (packing
     /// proceeds: the fasl build reports a missing system with a better error).
     /// </summary>
     internal static DotclBuild.SystemMeta? ReadSystemMetaCore(string system, string[]? searchPaths = null)
+        => ReadSystemMetaCore(system, searchPaths, out _);
+
+    /// <summary>
+    /// As above, and says why when there is no metadata: ERROR is null when the
+    /// system was read, and otherwise names what went wrong -- the system is not
+    /// visible to ASDF, or loading its .asd signalled (the condition's text).
+    /// `dotcl pack` reports that and stops. Answering "no metadata" alone made
+    /// the missing :version the only thing pack could say, so a .asd that failed
+    /// to load surfaced as "missing required option(s): --version".
+    /// </summary>
+    internal static DotclBuild.SystemMeta? ReadSystemMetaCore(string system, string[]? searchPaths,
+                                                              out string? error)
     {
+        error = null;
         try
         {
             Runtime.Eval(MultipleValues.Primary(
                 Runtime.ReadFromString(new LispObject[] { new LispString("(require \"asdf\")") })));
+            PinBundledAsdf();
             RegisterAsdSearchPaths(searchPaths);
 
             var sysEsc = system.Replace("\\", "\\\\").Replace("\"", "\\\"");
             // :source-control is (:git "url") / (:github "url") / a bare string.
             // Normalize to the url alone here so the C# side stays shapeless.
+            //
+            // A failure comes back as (:error "text") rather than being signalled:
+            // nothing outside this form handles it, and unhandled it would enter
+            // the debugger on a closed stdin before anything could report it.
             var form = $@"
-(let* ((sys (asdf:find-system ""{sysEsc}""))
-       (sc (asdf:system-source-control sys))
-       (asd (asdf:system-source-file sys)))
-  (list (asdf:system-description sys)
-        (asdf:system-homepage sys)
-        (cond ((stringp sc) sc)
-              ((and (consp sc) (stringp (second sc))) (second sc))
-              ((and (consp sc) (stringp (cdr sc))) (cdr sc)))
-        (asdf:system-author sys)
-        (asdf:system-license sys)
-        (and asd (namestring (make-pathname :name nil :type nil :defaults asd)))))";
+(handler-case
+    (let ((sys (asdf:find-system ""{sysEsc}"" nil)))
+      (if (null sys)
+          (list :error (format nil ""system ~a not found; make it visible to ASDF ~
+                                     (--asd-search-path, CL_SOURCE_REGISTRY)""
+                               ""{sysEsc}""))
+          (let ((sc (asdf:system-source-control sys))
+                (asd (asdf:system-source-file sys)))
+            (list (asdf:system-description sys)
+                  (asdf:system-homepage sys)
+                  (cond ((stringp sc) sc)
+                        ((and (consp sc) (stringp (second sc))) (second sc))
+                        ((and (consp sc) (stringp (cdr sc))) (cdr sc)))
+                  (asdf:system-author sys)
+                  (asdf:system-license sys)
+                  (and asd (namestring (make-pathname :name nil :type nil :defaults asd)))
+                  ;; SYSTEM-VERSION, not COMPONENT-VERSION: a secondary
+                  ;; system (app/exe) that states no :version answers with its
+                  ;; primary system's, the way ASDF already answers author,
+                  ;; license and description.
+                  (asdf:system-version sys)
+                  ;; :entry-point is a string naming a function, or a symbol.
+                  (let ((e (asdf::component-entry-point sys)))
+                    (cond ((stringp e) e)
+                          ((and e (symbolp e) (symbol-package e))
+                           (format nil ""~a::~a""
+                                   (package-name (symbol-package e)) (symbol-name e)))))))))
+  (error (c)
+    (list :error (format nil ""loading the definition of system ~a failed: ~a""
+                         ""{sysEsc}"" c))))";
             var result = MultipleValues.Primary(Runtime.Eval(MultipleValues.Primary(
                 Runtime.ReadFromString(new LispObject[] { new LispString(form) }))));
+
+            if (result is Cons ec && ec.Car is Symbol k && k.Name == "ERROR"
+                && ec.Cdr is Cons msgCell && msgCell.Car is LispString msg)
+            {
+                error = msg.Value;
+                return null;
+            }
 
             var items = new List<string?>();
             var cur = result;
@@ -1492,7 +1558,7 @@ public static class DotclHost
                 items.Add(c.Car is LispString s && s.Value.Length > 0 ? s.Value : null);
                 cur = c.Cdr;
             }
-            while (items.Count < 6) items.Add(null);
+            while (items.Count < 8) items.Add(null);
             return new DotclBuild.SystemMeta
             {
                 Description = items[0],
@@ -1501,14 +1567,38 @@ public static class DotclHost
                 Author = items[3],
                 License = items[4],
                 AsdDirectory = items[5],
+                // A version ASDF hands back as anything other than a string
+                // (:version can be read from a file) lands here as null, which
+                // reads the same as a .asd that states no version at all: the
+                // command line has to supply one. Better than packing under a
+                // version nobody wrote.
+                Version = items[6],
+                EntryPoint = items[7],
             };
         }
-        catch
+        catch (Exception ex)
         {
-            // Metadata is best-effort: never fail a pack because a .asd omits
-            // slots or uses a shape we do not recognize.
+            // Metadata is best-effort for callers that only want the fields;
+            // ERROR carries the reason for the ones that have to explain it.
+            error = ex.Message;
             return null;
         }
+    }
+
+    /// <summary>
+    /// Pin the running ASDF and UIOP so a build never replaces them. dotcl
+    /// ships its own patched ASDF, and a dependency bundle (qlot, a Quicklisp
+    /// bundle) often carries stock asdf.asd / uiop.asd as well. ASDF loads a
+    /// registered asdf.asd of the same version "to allow loading from modified
+    /// source", so merely having the stock one visible made the first .asd load
+    /// rebuild ASDF from sources that do not know dotcl, which fails compiling
+    /// UIOP's RAW-COMMAND-LINE-ARGUMENTS. Immutable systems are answered from
+    /// the running image and never looked up on disk.
+    /// </summary>
+    internal static void PinBundledAsdf()
+    {
+        EvalLisp("(progn (asdf:register-immutable-system \"asdf\") "
+                 + "(asdf:register-immutable-system \"uiop\"))");
     }
 
     /// Walk a proper Lisp list of LispStrings into a C# string[].

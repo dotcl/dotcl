@@ -3,10 +3,16 @@ namespace DotCL;
 public static partial class Runtime
 {
     // --- Type expanders (registered by deftype) ---
-    // Keyed by plain name for COMMON-LISP-homed deftype names, and by
-    // "PKG::NAME" for other packages, so a non-CL deftype whose name matches
-    // a built-in type (e.g. SBCL's host-side SB-XC:COMPLEX -> COMPLEXNUM)
-    // shadows the built-in for ITS symbol only.
+    // A type is named by a symbol, not by a string. The key is the plain name
+    // for COMMON-LISP-homed symbols and "PKG::NAME" for every other package
+    // (TypeExpanderKey), so each DEFTYPE answers for its own symbol only:
+    // - a non-CL deftype whose name matches a built-in type (e.g. SBCL's
+    //   host-side SB-XC:COMPLEX -> COMPLEXNUM) shadows the built-in for ITS
+    //   symbol only;
+    // - a same-named deftype in another package (UIOP's
+    //   (deftype timestamp () '(or real boolean))) never answers for an
+    //   unrelated symbol such as a user's TIMESTAMP class.
+    // Always look up through TryGetTypeExpander(Symbol), never by sym.Name.
     // ConcurrentDictionary: runtime DEFTYPE writes this (TypeExpanders[key]=...) while
     // typep/subtypep/etc. read it (TryGetValue/ContainsKey). A concurrent DEFTYPE on
     // one thread and a type test on another otherwise corrupts a plain Dictionary.
@@ -25,6 +31,10 @@ public static partial class Runtime
             && TypeExpanders.TryGetValue(p.Name + "::" + sym.Name, out expander!);
     }
 
+    /// <summary>The DEFTYPE expander registered for exactly this symbol.</summary>
+    public static bool TryGetTypeExpander(Symbol sym, out LispObject expander)
+        => TypeExpanders.TryGetValue(TypeExpanderKey(sym), out expander!);
+
     /// <summary>
     /// Type names dotcl adds beyond CL, which the compiler gates on symbol
     /// identity (see the DOTCL package check in KnownTypeNameP).
@@ -38,14 +48,13 @@ public static partial class Runtime
     ///   :DEFTYPE  a DEFTYPE expander registered for this exact symbol
     ///   :BUILTIN  a built-in type name: matched by NAME, so a same-named
     ///             symbol from any package answers here
-    ///   :NAME     a DEFTYPE expander registered under this name in another package
     ///   :CLASS    a class
     ///
     /// Mirrors the order CType.ParseSymbol resolves a symbol specifier in, so a
     /// NIL answer means exactly "ParseSymbol falls back to an opaque NamedType";
     /// a declaration the compiler then drops on the floor without a word.
     ///
-    /// The distinction between :DEFTYPE/:CLASS (identity) and :BUILTIN/:NAME
+    /// The distinction between :DEFTYPE/:CLASS (identity) and :BUILTIN
     /// (name) is what lets a caller notice that e.g. CL-USER::DECIMAL satisfies
     /// TYPEP by name while the compiler's declaration-driven decimal
     /// arithmetic, which is keyed on the DOTCL symbol, will not fire.
@@ -69,8 +78,13 @@ public static partial class Runtime
                 ? Startup.Keyword("BUILTIN") : Nil.Instance;
         if (IsBuiltinTypeName(name) || name == "T" || name == "NIL" || name == "*")
             return Startup.Keyword("BUILTIN");
-        if (TypeExpanders.ContainsKey(name)) return Startup.Keyword("NAME");
-        if (FindClassOrNil(sym) is LispClass || FindClassByName(name) != null)
+        if (TryGetTypeExpander(sym, out _)) return Startup.Keyword("DEFTYPE");
+        if (FindClassOrNil(sym) is LispClass)
+            return Startup.Keyword("CLASS");
+        // A class a DEFCLASS earlier in the file being compiled names: COMPILE-FILE
+        // does not create it, but CLHS DEFCLASS has the name recognized as a type
+        // for the declarations after it.
+        if (FindCompileTimeClass(sym) is LispClass)
             return Startup.Keyword("CLASS");
         return Nil.Instance;
     }
@@ -94,6 +108,17 @@ public static partial class Runtime
     {
         if (typeSpec is Symbol || typeSpec is Nil || typeSpec is T)
         {
+            // A structure or CLOS instance is matched against its class precedence
+            // list by name further down. A symbol that names neither a class nor a
+            // type must not match a same-named class from another package that way.
+            // DOTCL-INTERNAL is exempt: fasls compiled by older cores load HANDLER-CASE
+            // clause types by bare name, which lands them there, and they rely on the
+            // name match.
+            if (typeSpec is Symbol unkSym
+                && (obj is LispStruct ls0 ? !ReferenceEquals(ls0.TypeName, unkSym)
+                    : obj is LispInstance || obj is LispInstanceCondition)
+                && IsUnknownTypeSymbol(unkSym))
+                return Nil.Instance;
             // Fast path: struct type check: avoid full switch when positive match
             if (typeSpec is Symbol typeSym && obj is LispStruct st)
             {
@@ -205,8 +230,11 @@ public static partial class Runtime
             if (typeSpec is Symbol qSym && TryGetQualifiedTypeExpander(qSym, out var qExp))
                 return Typep(obj, Funcall(qExp));
             if (CheckSimpleType(obj, name)) return T.Instance;
+            // A symbol that names a class means that class.
+            if (typeSpec is Symbol classNameSym && FindClassOrNil(classNameSym) is LispClass)
+                return Nil.Instance;
             // Try user-defined type expander
-            if (TypeExpanders.TryGetValue(name, out var expSymExpander))
+            if (typeSpec is Symbol expSym && TryGetTypeExpander(expSym, out var expSymExpander))
             {
                 var expanded = Funcall(expSymExpander);
                 return Typep(obj, expanded);
@@ -320,7 +348,7 @@ public static partial class Runtime
                     // (array element-type dimension-spec)
                     // First check if it's an array at all
                     if (!(obj is LispVector || obj is LispString)) return Nil.Instance;
-                    if (headName == "SIMPLE-ARRAY" && obj is LispVector av && av.HasFillPointer) return Nil.Instance;
+                    if (headName == "SIMPLE-ARRAY" && obj is LispVector av && !av.IsSimple) return Nil.Instance;
                     var rest2 = compound.Cdr;
                     // Element type check (skip if *)
                     if (rest2 is Cons etc)
@@ -588,7 +616,7 @@ public static partial class Runtime
                 }
             }
             // Unknown compound type: try user-defined type expander
-            if (!string.IsNullOrEmpty(headName) && TypeExpanders.TryGetValue(headName, out var expCompoundExpander))
+            if (head is Symbol expHead && TryGetTypeExpander(expHead, out var expCompoundExpander))
             {
                 var args2 = ToList(compound.Cdr).ToArray();
                 var expanded2 = Funcall(expCompoundExpander, args2);
@@ -625,9 +653,9 @@ public static partial class Runtime
         "DOUBLE-FLOAT" or "LONG-FLOAT" => obj is DoubleFloat,
         "COMPLEX" => obj is LispComplex,
         "STRING" => obj is LispString || (obj is LispVector sv && sv.IsCharVector && sv.Rank == 1),
-        "SIMPLE-STRING" => obj is LispString || (obj is LispVector ssv && ssv.IsCharVector && !ssv.HasFillPointer && ssv.Rank == 1),
+        "SIMPLE-STRING" => obj is LispString || (obj is LispVector ssv && ssv.IsCharVector && ssv.IsSimple && ssv.Rank == 1),
         "BASE-STRING" => obj is LispString || (obj is LispVector bsv && bsv.IsCharVector && bsv.ElementTypeName != "NIL" && bsv.Rank == 1),
-        "SIMPLE-BASE-STRING" => obj is LispString || (obj is LispVector sbsv && sbsv.IsCharVector && !sbsv.HasFillPointer && sbsv.ElementTypeName != "NIL" && sbsv.Rank == 1),
+        "SIMPLE-BASE-STRING" => obj is LispString || (obj is LispVector sbsv && sbsv.IsCharVector && sbsv.IsSimple && sbsv.ElementTypeName != "NIL" && sbsv.Rank == 1),
         "CHARACTER" => obj is LispChar,
         "BASE-CHAR" => obj is LispChar,
         "STANDARD-CHAR" => obj is LispChar lc && IsStandardChar(lc.Value),
@@ -642,10 +670,10 @@ public static partial class Runtime
         "COMPILED-FUNCTION" => obj is LispFunction && obj is not GenericFunction,
         "VECTOR" => (obj is LispVector vv && vv.Rank == 1) || obj is LispString,
         "BIT-VECTOR" => obj is LispVector bv && bv.IsBitVector && bv.Rank == 1,
-        "SIMPLE-BIT-VECTOR" => obj is LispVector sbv && sbv.IsBitVector && sbv.Rank == 1 && !sbv.HasFillPointer,
-        "SIMPLE-VECTOR" => obj is LispVector sv2 && sv2.Rank == 1 && !sv2.IsCharVector && !sv2.IsBitVector && !sv2.HasFillPointer && sv2.ElementTypeName == "T",
+        "SIMPLE-BIT-VECTOR" => obj is LispVector sbv && sbv.IsBitVector && sbv.Rank == 1 && sbv.IsSimple,
+        "SIMPLE-VECTOR" => obj is LispVector sv2 && sv2.Rank == 1 && !sv2.IsCharVector && !sv2.IsBitVector && sv2.IsSimple && sv2.ElementTypeName == "T",
         "ARRAY" => obj is LispVector || obj is LispString,
-        "SIMPLE-ARRAY" => obj is LispString || (obj is LispVector sav && !sav.HasFillPointer),
+        "SIMPLE-ARRAY" => obj is LispString || (obj is LispVector sav && sav.IsSimple),
         "SEQUENCE" => obj is Cons || obj is Nil || (obj is LispVector vsq && vsq.Rank == 1) || obj is LispString,
         "HASH-TABLE" => obj is LispHashTable,
         "PACKAGE" => obj is Package,
@@ -752,9 +780,9 @@ public static partial class Runtime
     private static bool ArrayElementTypeMatches(LispObject obj, LispObject elemType)
     {
         // Expand deftype aliases in element type before matching
-        if (elemType is Symbol etAS && TypeExpanders.TryGetValue(etAS.Name, out var etAE))
+        if (elemType is Symbol etAS && TryGetTypeExpander(etAS, out var etAE))
             return ArrayElementTypeMatches(obj, Funcall(etAE));
-        if (elemType is Cons etAC && etAC.Car is Symbol etAH && TypeExpanders.TryGetValue(etAH.Name, out var etAE2))
+        if (elemType is Cons etAC && etAC.Car is Symbol etAH && TryGetTypeExpander(etAH, out var etAE2))
         {
             var aa = ToList(etAC.Cdr).ToArray();
             return ArrayElementTypeMatches(obj, Funcall(etAE2, aa));
@@ -784,10 +812,10 @@ public static partial class Runtime
     private static bool MatchesElementType(LispObject elemTypeSpec, string storedET)
     {
         // Expand deftype aliases (e.g., unicode-char -> character) before matching
-        if (elemTypeSpec is Symbol etAliasSym && TypeExpanders.TryGetValue(etAliasSym.Name, out var etAliasExp))
+        if (elemTypeSpec is Symbol etAliasSym && TryGetTypeExpander(etAliasSym, out var etAliasExp))
             return MatchesElementType(Funcall(etAliasExp), storedET);
         if (elemTypeSpec is Cons etAliasCons && etAliasCons.Car is Symbol etAliasHead
-            && TypeExpanders.TryGetValue(etAliasHead.Name, out var etAliasExp2))
+            && TryGetTypeExpander(etAliasHead, out var etAliasExp2))
         {
             var aliasArgs = ToList(etAliasCons.Cdr).ToArray();
             return MatchesElementType(Funcall(etAliasExp2, aliasArgs), storedET);
@@ -1017,19 +1045,18 @@ public static partial class Runtime
     private static LispObject ExpandTypeSpecifier(LispObject typeSpec)
     {
         // Expand user-defined type specifiers (from deftype)
-        if (typeSpec is Symbol sym && TypeExpanders.TryGetValue(sym.Name, out var exp1))
+        if (typeSpec is Symbol sym && TryGetTypeExpander(sym, out var exp1))
         {
             var expanding = s_expandingTypes ??= new HashSet<string>();
-            if (!expanding.Add(sym.Name)) return typeSpec; // Already expanded in this chain
+            if (!expanding.Add(TypeExpanderKey(sym))) return typeSpec; // Already expanded in this chain
             return Funcall(exp1);
         }
         if (typeSpec is Cons cons)
         {
-            string hd = cons.Car is Symbol sh ? sh.Name : "";
-            if (!string.IsNullOrEmpty(hd) && TypeExpanders.TryGetValue(hd, out var exp2))
+            if (cons.Car is Symbol sh && TryGetTypeExpander(sh, out var exp2))
             {
                 var expanding = s_expandingTypes ??= new HashSet<string>();
-                if (!expanding.Add(hd)) return typeSpec; // Already expanded in this chain
+                if (!expanding.Add(TypeExpanderKey(sh))) return typeSpec; // Already expanded in this chain
                 var args2 = ToList(cons.Cdr).ToArray();
                 return Funcall(exp2, args2);
             }
@@ -1044,12 +1071,11 @@ public static partial class Runtime
         if (args.Length < 1) throw new LispErrorException(new LispProgramError("TYPEXPAND-1: requires 1 argument"));
         var typeSpec = args[0];
         LispObject expanded;
-        if (typeSpec is Symbol sym2 && TypeExpanders.TryGetValue(sym2.Name, out var exp3))
+        if (typeSpec is Symbol sym2 && TryGetTypeExpander(sym2, out var exp3))
             expanded = Funcall(exp3);
         else if (typeSpec is Cons cons2)
         {
-            string hd = cons2.Car is Symbol sh2 ? sh2.Name : "";
-            if (!string.IsNullOrEmpty(hd) && TypeExpanders.TryGetValue(hd, out var exp4))
+            if (cons2.Car is Symbol sh2 && TryGetTypeExpander(sh2, out var exp4))
             {
                 var args4 = ToList(cons2.Cdr).ToArray();
                 expanded = Funcall(exp4, args4);
@@ -1061,6 +1087,64 @@ public static partial class Runtime
             expanded = typeSpec;
         bool didExpand = !ReferenceEquals(expanded, typeSpec) && !expanded.Equals(typeSpec);
         return new Cons(expanded, didExpand ? T.Instance : Nil.Instance);
+    }
+
+    // One DEFTYPE step: the expansion of TYPESPEC when its name (the symbol, or
+    // the head of a compound specifier) has a DEFTYPE expander, else TYPESPEC.
+    // EXPANDED says whether an expander ran, the same way MACROEXPAND-1 reports
+    // that a macro function was called, so a DEFTYPE whose body returns an
+    // EQUAL form still counts as an expansion.
+    private static LispObject TypeExpandStep(LispObject typeSpec, out bool expanded)
+    {
+        if (typeSpec is Symbol sym && TryGetTypeExpander(sym, out var exp))
+        {
+            expanded = true;
+            return Funcall(exp);
+        }
+        if (typeSpec is Cons cons && cons.Car is Symbol head && TryGetTypeExpander(head, out var cexp))
+        {
+            expanded = true;
+            return Funcall(cexp, ToList(cons.Cdr).ToArray());
+        }
+        expanded = false;
+        return typeSpec;
+    }
+
+    private static void CheckTypexpandArgs(LispObject[] args, string name)
+    {
+        if (args.Length < 1 || args.Length > 2)
+            throw new LispErrorException(new LispProgramError(
+                $"{name}: wrong number of arguments: {args.Length} (expected 1 or 2)"));
+    }
+
+    // (dotcl:typexpand-1 type &optional env) => expansion, expandedp
+    // Like MACROEXPAND-1 for type specifiers (SBCL's SB-EXT:TYPEXPAND-1). ENV is
+    // accepted for the conventional signature; DEFTYPE expanders are global here,
+    // so it does not change the result.
+    public static LispObject TypexpandOne(LispObject[] args)
+    {
+        CheckTypexpandArgs(args, "TYPEXPAND-1");
+        var result = TypeExpandStep(args[0], out bool expanded);
+        return MultipleValues.Values2(result, expanded ? T.Instance : Nil.Instance);
+    }
+
+    // (dotcl:typexpand type &optional env) => expansion, expandedp
+    // Repeats TYPEXPAND-1 until the specifier is no longer a DEFTYPE form.
+    // EXPANDEDP is true when at least one step ran. Only the top level is
+    // expanded, as with MACROEXPAND: (or foo bar) is returned unchanged.
+    public static LispObject Typexpand(LispObject[] args)
+    {
+        CheckTypexpandArgs(args, "TYPEXPAND");
+        var type = args[0];
+        bool ever = false;
+        while (true)
+        {
+            var next = TypeExpandStep(type, out bool expanded);
+            if (!expanded) break;
+            ever = true;
+            type = next;
+        }
+        return MultipleValues.Values2(type, ever ? T.Instance : Nil.Instance);
     }
 
     // Extract (car-type, cdr-type) strings from CONS compound type or null if not applicable
@@ -1384,7 +1468,17 @@ public static partial class Runtime
 
         if (name1 != null && name2 != null)
         {
-            bool result = CheckSubtype(name1, name2);
+            // A symbol naming no type at all is compared by name below, which would
+            // match a same-named class or type of some other package. Nothing is
+            // known about it, so the answer is uncertain.
+            if (name2 != "T" && (IsUnknownTypeSymbol(type1) || IsUnknownTypeSymbol(type2)))
+            {
+                MultipleValues.SetPair(Nil.Instance, Nil.Instance);
+                return Nil.Instance;
+            }
+            bool result = CheckSubtype(name1, name2)
+                || (ClassOfTypeSpecifier(type1) is LispClass cls1
+                    && ClassSubtypeOfSpecifier(cls1, type2, name2));
             if (result)
             {
                 MultipleValues.SetPair(T.Instance, T.Instance);
@@ -1394,8 +1488,8 @@ public static partial class Runtime
             // and not a CLOS class, we cannot be certain it's not a subtype: return uncertain.
             // Per CLHS: subtypep may return (nil nil) when it cannot determine the relationship.
             bool type1Known = _typeAncestors.ContainsKey(name1)
-                || TypeExpanders.ContainsKey(name1)
-                || FindClassByName(name1) != null;
+                || (type1 is Symbol known1 && TryGetTypeExpander(known1, out _))
+                || ClassOfTypeSpecifier(type1) != null;
             if (!type1Known)
             {
                 MultipleValues.SetPair(Nil.Instance, Nil.Instance);
@@ -2020,16 +2114,45 @@ public static partial class Runtime
             return true;
         if (_typeAncestors.TryGetValue(sub, out var ancestors))
             return ancestors.Contains(super);
-        // Fall back to CLOS class precedence list for user-defined classes
-        // Search by name across all registered classes (string-based fallback
-        // for subtypep which operates on type names, not symbol identity)
-        if (FindClassByName(sub) is LispClass subClass)
-        {
-            foreach (var c in subClass.ClassPrecedenceList)
-                if (c.Name.Name == super) return true;
-        }
+        // Fall back to the class precedence list of dotcl's own classes. A name only
+        // reaches here as a string, so a user class is not looked up by it (a user
+        // class of the same name in an unrelated package would answer); callers
+        // holding the symbol use ClassOfTypeSpecifier instead.
+        if (FindSystemClassByName(sub) is LispClass subClass)
+            return ClassHasNameInCpl(subClass, super);
         return false;
     }
+
+    private static bool ClassHasNameInCpl(LispClass cls, string name)
+    {
+        foreach (var c in cls.ClassPrecedenceList)
+            if (c.Name.Name == name) return true;
+        return false;
+    }
+
+    /// <summary>Is CLS a subclass of the type SPEC (whose name is NAME)? A class
+    /// designator is compared by identity; a built-in name by name.</summary>
+    private static bool ClassSubtypeOfSpecifier(LispClass cls, LispObject spec, string name)
+    {
+        if (ClassOfTypeSpecifier(spec) is LispClass target)
+        {
+            foreach (var c in cls.ClassPrecedenceList)
+                if (ReferenceEquals(c, target)) return true;
+            return false;
+        }
+        if (IsUnknownTypeSymbol(spec)) return false;
+        return ClassHasNameInCpl(cls, name);
+    }
+
+    /// <summary>A symbol outside CL (and outside DOTCL-INTERNAL, where bare-name
+    /// placeholders live) that names no built-in type, class, or deftype.</summary>
+    private static bool IsUnknownTypeSymbol(LispObject spec) =>
+        spec is Symbol s
+        && s.HomePackage != Startup.CL
+        && s.HomePackage != Startup.Internal
+        && !IsBuiltinTypeName(s.Name)
+        && FindClassOrNil(s) is not LispClass
+        && !TryGetTypeExpander(s, out _);
 
     internal static readonly Dictionary<string, HashSet<string>> _typeAncestors = BuildTypeHierarchy();
 
@@ -2042,7 +2165,6 @@ public static partial class Runtime
     /// </summary>
     public static bool NamesAType(Symbol sym) =>
         TypeExpanders.ContainsKey(TypeExpanderKey(sym))
-        || TypeExpanders.ContainsKey(sym.Name)
         || IsBuiltinTypeName(sym.Name)
         || FindClassOrNil(sym) != Nil.Instance;
 

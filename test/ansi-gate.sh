@@ -22,13 +22,14 @@
 # test/host-api/check.sh treats a skip under DOTCL_CI=1 as a failure).
 #
 # Usage: ansi-gate.sh <ansi-state.json> <category>...
-#        ANSI_OUT_DIR=<dir> ansi-gate.sh ...   (where the run left its outputs)
+#        ANSI_OUT_DIR=<dir> ansi-gate.sh ...   (where the run left its outputs;
+#                                              default out/ansi, as the Makefile)
 set -eu
 
 state="$1"
 shift
 
-dir="${ANSI_OUT_DIR:-/tmp}"
+dir="${ANSI_OUT_DIR:-$(dirname "$0")/../out/ansi}"
 here=$(dirname "$0")
 
 [ -f "$state" ] || { echo "ansi-gate: no state file at $state" >&2; exit 1; }

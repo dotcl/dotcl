@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- A scratch harness, not a gate. Nothing in CI builds it; you build it by
+       hand when a benchmark is slow and you want to know which part of it is
+       slow. See README.md. -->
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <AssemblyName>ablation</AssemblyName>
+    <RootNamespace>Ablation</RootNamespace>
+    <Optimize>true</Optimize>
+  </PropertyGroup>
+
+  <!-- The point of the harness is to measure the real runtime, not a copy of
+       it, so one variant always calls the shipped assembly. A ProjectReference
+       rather than a HintPath to bin/: a stale DotCL.Runtime.dll is exactly the
+       way to spend an afternoon measuring a fix that is not in the binary. -->
+  <ItemGroup>
+    <ProjectReference Include="../../runtime/DotCL.Runtime.csproj" />
+  </ItemGroup>
+
+</Project>

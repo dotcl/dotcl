@@ -104,12 +104,24 @@
       (with-open-file (s name :direction :output :if-does-not-exist :create)
         (declare (ignore s))))))
 
-;;; Clean up scratch directory (needed by ensure-directories-exist.8)
+;;; ENSURE-DIRECTORIES-EXIST.8 (files) runs with *default-pathname-defaults* =
+;;; sandbox/ and needs sandbox/scratch/ to be either absent or to hold only
+;;; foo.txt: it deletes foo.txt and then the directory inside one IGNORE-ERRORS,
+;;; so when foo.txt is missing the delete of foo.txt signals, the directory
+;;; survives, and ENSURE-DIRECTORIES-EXIST correctly returns NIL as its second
+;;; value. The streams tests open scratch/foo.txt there and need the directory.
+;;; Reset it to exactly the state the test itself leaves behind (directory plus
+;;; foo.txt), whatever earlier runs left, and say so when that is not possible.
+;;; The project-root scratch/ is not used by any test (every test runs under the
+;;; sandbox/ default); older harnesses created it, so remove it.
 (ignore-errors (dotcl-delete-directory "scratch/"))
-(ignore-errors (delete-file "scratch/foo.txt"))
-
-;;; Re-create scratch directory (needed by streams tests that open scratch/foo.txt)
-(ensure-directories-exist "scratch/foo.txt")
+(dotcl-delete-directory "sandbox/scratch/")
+(when (probe-file "sandbox/scratch/")
+  (format t "~&WARNING: could not delete sandbox/scratch/; ENSURE-DIRECTORIES-EXIST.8 may fail~%"))
+(ensure-directories-exist "sandbox/scratch/foo.txt")
+(with-open-file (s "sandbox/scratch/foo.txt" :direction :output
+                   :if-exists :supersede :if-does-not-exist :create)
+  (declare (ignore s)))
 
 ;;; streams test data files (in project root AND sandbox/: do-tests rebinds DPD to sandbox/)
 (dolist (name '("file-position.txt" "file-length.txt" "input-stream-p.txt"

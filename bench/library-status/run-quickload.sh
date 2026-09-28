@@ -43,6 +43,13 @@ exe="$root/runtime/bin/Debug/net10.0/runtime.exe"
 [ -x "$exe" ] || exe="$root/runtime/bin/Debug/net10.0/runtime"
 [ -x "$exe" ] || { echo "run-quickload: no built runtime; run make build first" >&2; exit 1; }
 core="$root/compiler/cil-out.sil"
+# GNU timeout bounds each run. macOS has none by default; Homebrew coreutils
+# installs it as gtimeout. Without either, every run would fail with 127 and
+# be recorded as a library failure, so stop here instead.
+if command -v timeout >/dev/null 2>&1; then timeout=timeout
+elif command -v gtimeout >/dev/null 2>&1; then timeout=gtimeout
+else echo "run-quickload: needs GNU timeout (coreutils; gtimeout on macOS)" >&2; exit 1
+fi
 [ -f "$core" ] || { echo "run-quickload: no $core; run make cross-compile first" >&2; exit 1; }
 [ -f "$targets" ] || { echo "run-quickload: no targets at $targets" >&2; exit 1; }
 
@@ -59,7 +66,20 @@ jstr() {
   printf '%s' "$1" \
     | tr -d '"\\' | tr '\n\r\t' '   ' \
     | sed 's|^[. ]*||; s|^[^ ]*drv\.lisp:[0-9]*: ||; s|  *| |g; s| *$||' \
+    | scrub_paths \
     | cut -c1-160
+}
+
+# The note is published, and error text carries whatever path the failure
+# happened under: the measuring machine's home directory and checkout
+# ("working directory 'C:Usersmeworkdotcl'", with the backslashes already
+# gone). Replace any absolute path -- a drive letter followed by a path or a
+# name, optionally after #P, or a /home /Users /tmp /mnt path, also when glued
+# to a compiler flag such as -I/Users/... -- with <path>. A single letter before
+# a colon is only taken as a drive when nothing alphanumeric precedes it, so
+# package prefixes (ASDF/USER::X) are left alone.
+scrub_paths() {
+  sed -E 's@(^|[^A-Za-z0-9])(#P)?[A-Za-z]:[/A-Za-z][^ )"'"'"']*@\1<path>@g; s@(^|[^A-Za-z0-9]|-[A-Za-z]+)/(home|Users|tmp|mnt)/[^ )"'"'"']*@\1<path>@g'
 }
 
 : > "$work/entries"
@@ -136,7 +156,7 @@ DRVEOF
   log="$logdir/$sys.txt"
   t0=$(date +%s)
   set +e
-  timeout "$per" "$exe" --asm "$core" "$work/drv.lisp" > "$log" 2>&1 < /dev/null
+  "$timeout" "$per" "$exe" --asm "$core" "$work/drv.lisp" > "$log" 2>&1 < /dev/null
   code=$?
   set -e
   retried=""
@@ -148,7 +168,7 @@ DRVEOF
   if [ "$code" -eq 124 ]; then
     retried=" (retried)"
     set +e
-    timeout "$retry" "$exe" --asm "$core" "$work/drv.lisp" > "$log" 2>&1 < /dev/null
+    "$timeout" "$retry" "$exe" --asm "$core" "$work/drv.lisp" > "$log" 2>&1 < /dev/null
     code=$?
     set -e
   fi

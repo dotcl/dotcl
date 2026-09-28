@@ -889,12 +889,26 @@ collected result will be returned as the value of the LOOP."
 
 
 (defun subst-gensyms-for-nil (tree)
+  ;; Turn a LOOP destructuring pattern into a destructuring lambda list
+  ;; in which every element is optional (missing values become NIL) and
+  ;; extra values are ignored.  NIL in the pattern becomes an ignored
+  ;; gensym.  A nested pattern (a (b c)) becomes
+  ;; (&optional a ((&optional b c &rest #:g1)) &rest #:g2).
   (declare (special *ignores*))
   (cond
     ((null tree) (car (push (loop-gentemp) *ignores*)))
     ((atom tree) tree)
-    (t (cons (subst-gensyms-for-nil (car tree))
-	     (subst-gensyms-for-nil (cdr tree))))))
+    (t (let ((acc (list '&optional)))
+	 (do ((x tree (cdr x)))
+	     ((atom x)
+	      (push '&rest acc)
+	      (push (subst-gensyms-for-nil x) acc))
+	   (let ((e (car x)))
+	     (push (if (consp e)
+		       (list (subst-gensyms-for-nil e))
+		       (subst-gensyms-for-nil e))
+		   acc)))
+	 (nreverse acc)))))
  
 (defun loop-build-destructuring-bindings (crocks forms)
   (if crocks
@@ -903,7 +917,7 @@ collected result will be returned as the value of the LOOP."
 	;; Destructuring in loop doesn't require that the values be
 	;; available.  The missing elements are filled with NIL.  So,
 	;; make everything &optional
-	`((destructuring-bind (&optional ,@(subst-gensyms-for-nil (car crocks)))
+	`((destructuring-bind ,(subst-gensyms-for-nil (car crocks))
 	      ,(cadr crocks)
 	    (declare (ignore ,@*ignores*))
 	    ,@(loop-build-destructuring-bindings (cddr crocks) forms))))

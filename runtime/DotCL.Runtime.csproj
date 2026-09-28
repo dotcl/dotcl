@@ -155,6 +155,8 @@
          host). It belongs to the tool project alongside Program.cs, not in the
          runtime that ships to Unity/IL2CPP/WebGL. -->
     <Compile Remove="PackRestamp.cs" />
+    <!-- PackR2r.cs likewise: it drives crossgen2 on the packaging host. -->
+    <Compile Remove="PackR2r.cs" />
     <!-- build-tasks/ is a separate MSBuild-task assembly that lives under
          runtime/; keep its sources out of the runtime library's default glob. -->
     <Compile Remove="build-tasks/**/*.cs" />

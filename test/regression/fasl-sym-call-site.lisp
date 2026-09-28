@@ -22,9 +22,7 @@
 ;; leave behind is not something worth depending on here.
 (defvar *fscs-dir*
   (let ((dir (concatenate 'string
-                          (substitute #\/ #\\ (or (dotcl:getenv "TMPDIR")
-                                                  (dotcl:getenv "TEMP")
-                                                  "/tmp"))
+                          (regression-temp-dir)
                           "/dotcl-fscs-test/")))
     (ensure-directories-exist dir)
     dir))

@@ -703,8 +703,25 @@ public static partial class Runtime
     {
         if (symObj is not Symbol sym)
             throw new LispErrorException(new LispTypeError("DEFCONSTANT: not a symbol", symObj));
+        // COMPILE-FILE evaluates DEFCONSTANT at compile time so a macro later in
+        // the file can read the value; loading the fasl in the same image then
+        // evaluates the form again. For a list, string or vector value the second
+        // object is a fresh one, similar to the first but not EQL. CLHS leaves
+        // the redefinition undefined and also leaves it to the implementation
+        // whether the compiler evaluates the form at all, so the second
+        // evaluation is an artifact of dotcl's choice, not of the program. When
+        // one side of the pair is that compile-time evaluation and the values
+        // are similar, keep the first object and say nothing. Evaluating the
+        // same DEFCONSTANT twice outside COMPILE-FILE still signals as before.
+        bool compileTime = CompileFileInProgress;
         if (sym.IsConstant && DynamicBindings.TryGet(sym, out var old) && !IsTruthy(Eql(old, value)))
         {
+            if ((compileTime || s_compileTimeConstants.TryGetValue(sym, out _))
+                && SimilarConstantValues(old, value, 0))
+            {
+                MarkCompileTimeConstant(sym, compileTime);
+                return sym;
+            }
             // Correctable, as in SBCL: the writer may know the new value is the
             // one that counts. Without the restart there is no way past this
             // short of UNINTERN, and the commonest way to arrive here is a list
@@ -732,7 +749,55 @@ public static partial class Runtime
         }
         DynamicBindings.Set(sym, value);
         sym.IsConstant = true;
+        MarkCompileTimeConstant(sym, compileTime);
         return sym;
+    }
+
+    // Constants whose current value was installed (or last confirmed) by a
+    // DEFCONSTANT evaluated while COMPILE-FILE was running. The next load-time
+    // evaluation of the same constant clears the mark.
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<Symbol, Symbol>
+        s_compileTimeConstants = new();
+
+    private static void MarkCompileTimeConstant(Symbol sym, bool compileTime)
+    {
+        s_compileTimeConstants.Remove(sym);
+        if (compileTime)
+        {
+            try { s_compileTimeConstants.Add(sym, sym); }
+            catch (ArgumentException) { /* another thread marked it first */ }
+        }
+    }
+
+    /// <summary>
+    /// Whether two DEFCONSTANT values are the same literal as far as a fasl can
+    /// tell: EQUAL, extended into vectors and arrays element by element (a
+    /// vector read at compile time and the copy the fasl rebuilds are not EQUAL).
+    /// </summary>
+    private static bool SimilarConstantValues(LispObject a, LispObject b, int depth)
+    {
+        if (depth > 200) return false;
+        while (true)
+        {
+            if (IsTruthy(Equal(a, b))) return true;
+            if (a is Cons ca && b is Cons cb)
+            {
+                if (!SimilarConstantValues(ca.Car, cb.Car, depth + 1)) return false;
+                a = ca.Cdr; b = cb.Cdr;
+                continue;
+            }
+            if (a is LispVector va && b is LispVector vb
+                && !va.IsCharVector && !vb.IsCharVector
+                && va.ElementTypeName == vb.ElementTypeName
+                && System.Linq.Enumerable.SequenceEqual(va.Dimensions, vb.Dimensions)
+                && va.Length == vb.Length)
+            {
+                for (int i = 0; i < va.Length; i++)
+                    if (!SimilarConstantValues(va.ElementAt(i), vb.ElementAt(i), depth + 1)) return false;
+                return true;
+            }
+            return false;
+        }
     }
 
     public static LispObject SymbolConstantP(LispObject obj)
@@ -784,13 +849,17 @@ public static partial class Runtime
             };
             if (known != null) return known;
             // Try expanding via deftype (e.g. 'octet -> '(unsigned-byte 8))
-            if (Runtime.TypeExpanders.TryGetValue(ets.Name, out var expander))
+            if (Runtime.TryGetTypeExpander(ets, out var expander))
             {
                 var expanded = Funcall(expander);
                 if (expanded != typeSpec)
                     return ParseElementTypeName(expanded);
             }
-            return ets.Name;
+            // Not a type arrays are specialized on (a class name, say), so the
+            // storage is general and the element type upgrades to T (CLHS
+            // 15.1.2.1). Keeping the name instead made ARRAY-ELEMENT-TYPE report
+            // it and SIMPLE-VECTOR-P reject the array.
+            return "T";
         }
         if (typeSpec is Cons etCons && etCons.Car is Symbol etHead)
         {
@@ -851,14 +920,18 @@ public static partial class Runtime
             }
             if (hname == "COMPLEX") return etCons.Cdr is Cons cc && cc.Car is Symbol cs ? $"COMPLEX-{cs.Name}" : "COMPLEX";
             // Try expanding compound user-defined types
-            if (Runtime.TypeExpanders.TryGetValue(hname, out var compExpander))
+            if (Runtime.TryGetTypeExpander(etHead, out var compExpander))
             {
                 var compArgs = Runtime.ToList(etCons.Cdr).ToArray();
                 var expanded = Funcall(compExpander, compArgs);
                 if (expanded != typeSpec)
                     return ParseElementTypeName(expanded);
             }
-            return hname;
+            // Same for a compound specifier nothing above specializes:
+            // (or null viewport) is stored generally, so it upgrades to T. The
+            // head alone ("OR") is not a type the array could report, and TYPEP
+            // against (simple-array (or null viewport) (32)) then failed.
+            return "T";
         }
         return "T";
     }
@@ -1310,6 +1383,68 @@ public static partial class Runtime
         }
     }
 
+    /// <summary>
+    /// HANDLER-CASE for the tree-walk interpreter. Same arguments and the same
+    /// cluster as CallWithHandlerCluster: each handler function performs the
+    /// clause's non-local exit, so a condition that is SIGNALLED to a clause
+    /// never reaches this frame as an exception.
+    ///
+    /// What this adds is the other half of what a compiled HANDLER-CASE takes: a
+    /// LispErrorException that arrives here unsignalled, or signalled while this
+    /// cluster was not active, is matched by its condition's type against the
+    /// clause types, first match wins (ControlFlowFilters.HandlerCaseClause).
+    /// Without it the interpreter's HANDLER-CASE, a HANDLER-BIND underneath,
+    /// only ever saw signalled conditions, so an error that unwinds without a
+    /// signal (the debugger's own report once a returning *DEBUGGER-HOOK* has
+    /// had its turn) was caught by compiled code and escaped interpreted code.
+    ///
+    /// The clause runs after the cluster is popped, as the compiled clause body
+    /// runs after its finally.
+    /// </summary>
+    public static LispObject CallWithHandlerCase(LispObject[] args)
+    {
+        var alist = args[0];
+        var thunk = CoerceToFunction(args[1]);
+        var bindings = new System.Collections.Generic.List<HandlerBinding>();
+        for (var c = alist; c is Cons cc; c = cc.Cdr)
+        {
+            if (cc.Car is Cons pair)
+                bindings.Add(new HandlerBinding(pair.Car, CoerceToFunction(pair.Cdr)));
+        }
+        var cluster = bindings.ToArray();
+        int clause = -1;
+        LispCondition? caught = null;
+        HandlerClusterStack.PushCluster(cluster);
+        try
+        {
+            return thunk.Invoke();
+        }
+        catch (Exception e) when (NeedsRewrap(e))
+        {
+            RewrapNonLispException(e); // always throws
+            throw; // unreachable
+        }
+        catch (LispErrorException lee) when ((clause = UnsignalledClause(lee, cluster)) >= 0)
+        {
+            caught = lee.Condition;
+        }
+        finally
+        {
+            HandlerClusterStack.PopCluster();
+        }
+        return cluster[clause].Handler!.Invoke(new LispObject[] { caught! });
+    }
+
+    /// <summary>The first clause of CLUSTER whose type the condition LEE carries
+    /// satisfies, or -1. The type test a compiled HANDLER-CASE filter applies to a
+    /// LispErrorException.</summary>
+    private static int UnsignalledClause(LispErrorException lee, HandlerBinding[] cluster)
+    {
+        for (int i = 0; i < cluster.Length; i++)
+            if (IsTruthy(Typep(lee.Condition, cluster[i].TypeSpec))) return i;
+        return -1;
+    }
+
     /// <summary>Index of TAG in TAGS by identity, or -1. Used from an exception
     /// filter, so it must not allocate or signal.</summary>
     private static int IndexOfTag(System.Collections.Generic.List<object> tags, object tag)
@@ -1334,21 +1469,49 @@ public static partial class Runtime
     /// </summary>
     public static LispObject CallWithRestartCluster(LispObject[] args)
     {
-        var names = new System.Collections.Generic.List<Symbol>();
+        var names = new System.Collections.Generic.List<Symbol?>();
         var handlers = new System.Collections.Generic.List<LispFunction>();
         var tags = new System.Collections.Generic.List<object>();
+        var options = new System.Collections.Generic.List<LispObject[]?>();
         for (var c = args[0]; c is Cons cc; c = cc.Cdr)
         {
+            // Two spec shapes: (name . handler), and (name handler report
+            // interactive test) with each option NIL when absent.
             var pair = (Cons)cc.Car;
-            names.Add((Symbol)pair.Car);
-            handlers.Add(CoerceToFunction(pair.Cdr));
+            names.Add(pair.Car as Symbol);
+            if (pair.Cdr is Cons opts)
+            {
+                handlers.Add(CoerceToFunction(opts.Car));
+                var o = new LispObject[3];
+                var tail = opts.Cdr;
+                for (int k = 0; k < 3; k++)
+                {
+                    o[k] = tail is Cons t ? t.Car : Nil.Instance;
+                    tail = tail is Cons t2 ? t2.Cdr : Nil.Instance;
+                }
+                options.Add(o);
+            }
+            else
+            {
+                handlers.Add(CoerceToFunction(pair.Cdr));
+                options.Add(null);
+            }
             tags.Add(new object());
         }
         var thunk = CoerceToFunction(args[1]);
         var restarts = new LispRestart[names.Count];
         for (int i = 0; i < names.Count; i++)
-            restarts[i] = new LispRestart(names[i].Name, _ => Nil.Instance, null, tags[i], false)
+        {
+            var o = options[i];
+            var report = o?[0];
+            restarts[i] = new LispRestart(names[i]?.Name ?? "NIL", _ => Nil.Instance,
+                (report as LispString)?.Value, tags[i], false)
             { NameSymbol = names[i] };
+            if (o == null) continue;
+            if (report is not Nil && report is not LispString) restarts[i].ReportFunction = report;
+            if (o[1] is not Nil) restarts[i].InteractiveFunction = o[1];
+            if (o[2] is not Nil) restarts[i].TestFunction = o[2];
+        }
         RestartClusterStack.PushCluster(restarts);
         bool popped = false;
         try
@@ -1563,7 +1726,10 @@ public static partial class Runtime
         {
             var closureP = (obj is LispFunction lf && lf.Environment != null)
                 ? T.Instance : (LispObject)Nil.Instance;
-            LispObject name = (obj is LispFunction nf && !string.IsNullOrEmpty(nf.Name))
+            // A generic function answers the name GENERIC-FUNCTION-NAME answers:
+            // (SETF accessor) for a setf one, not its internal key symbol.
+            LispObject name = obj is GenericFunction gfn ? Runtime.PublicFunctionName(gfn.Name)
+                : (obj is LispFunction nf && !string.IsNullOrEmpty(nf.Name))
                 // netstandard2.0's IsNullOrEmpty carries no nullability annotation,
                 // so the guard above does not narrow Name there.
                 ? Startup.Sym(nf.Name!) : Nil.Instance;
@@ -1582,6 +1748,8 @@ public static partial class Runtime
         });
         // %GET-VARIABLE-DOCUMENTATION
         Startup.RegisterUnary("%GET-VARIABLE-DOCUMENTATION", Runtime.GetVariableDocumentation);
+        // %SET-VARIABLE-DOCUMENTATION symbol doc: NIL removes it
+        Startup.RegisterBinary("%SET-VARIABLE-DOCUMENTATION", Runtime.SetVariableDocumentation);
         // %GET-FUNCTION-DOCUMENTATION: bridge [LispDoc]/SetFunctionDoc to the DOCUMENTATION GF
         Startup.RegisterUnary("%GET-FUNCTION-DOCUMENTATION", Runtime.GetFunctionDocumentation);
 

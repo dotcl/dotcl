@@ -1,5 +1,9 @@
 using System.Runtime.CompilerServices;
 
+// Frame (a struct holding managed references) is addressed through pointers to
+// locals of the Invoke methods; see the comment on Frame.
+#pragma warning disable CS8500
+
 namespace DotCL;
 
 public class LispFunction : LispObject
@@ -201,54 +205,109 @@ public class LispFunction : LispObject
     }
 
     // Lisp-level call stack for debugger backtrace. Each frame keeps the callee
-    // name plus its arguments. To preserve the alloc-free push on the hot path,
-    // Frame is a struct stored inline in Stack<Frame>'s backing array, with up to
-    // four arguments inline; only 5+ argument calls (rare) reference an array.
-    internal readonly struct Frame
+    // name plus its arguments, up to four inline; 5+ argument calls reference
+    // an array.
+    //
+    // A frame lives in the native stack frame of the Invoke method that pushed
+    // it, and frames are linked through a thread-static pointer to the
+    // innermost one. Storing into a local costs no GC write barrier, where
+    // storing the same references into a heap-allocated stack (the previous
+    // Stack<Frame>) paid one per reference plus card marking whenever an
+    // argument was younger than the array, on every named call. The pointer is
+    // only ever followed while the frame it names is live: each push is paired
+    // with a finally that restores the previous head before the Invoke method
+    // returns or unwinds. The GC keeps reporting the references because the
+    // frame is an ordinary (address-taken) local of that method.
+    internal unsafe struct Frame
     {
-        public readonly string Name;
+        internal Frame* Prev;
+        internal int Depth;   // 1 for the outermost frame on this thread
         public readonly int Argc;
+        public readonly string Name;
         private readonly LispObject? _a0, _a1, _a2, _a3;
         private readonly LispObject[]? _rest; // non-null when args came as an array
+        // Arguments 5-8 of a fixed-arity call (Invoke5-8). They live in a
+        // separate struct next to the frame on the same native stack, so the
+        // 0-4 argument frames stay as small as before and no array is
+        // allocated. Only read while the frame is linked (see SnapshotFrames).
+        private readonly FrameExt* _ext;
 
         public Frame(string name)
-        { Name = name; Argc = 0; _a0 = _a1 = _a2 = _a3 = null; _rest = null; }
+        { Prev = null; Depth = 0; Name = name; Argc = 0; _a0 = _a1 = _a2 = _a3 = null; _rest = null; _ext = null; }
         public Frame(string name, LispObject a0)
-        { Name = name; Argc = 1; _a0 = a0; _a1 = _a2 = _a3 = null; _rest = null; }
+        { Prev = null; Depth = 0; Name = name; Argc = 1; _a0 = a0; _a1 = _a2 = _a3 = null; _rest = null; _ext = null; }
         public Frame(string name, LispObject a0, LispObject a1)
-        { Name = name; Argc = 2; _a0 = a0; _a1 = a1; _a2 = _a3 = null; _rest = null; }
+        { Prev = null; Depth = 0; Name = name; Argc = 2; _a0 = a0; _a1 = a1; _a2 = _a3 = null; _rest = null; _ext = null; }
         public Frame(string name, LispObject a0, LispObject a1, LispObject a2)
-        { Name = name; Argc = 3; _a0 = a0; _a1 = a1; _a2 = a2; _a3 = null; _rest = null; }
+        { Prev = null; Depth = 0; Name = name; Argc = 3; _a0 = a0; _a1 = a1; _a2 = a2; _a3 = null; _rest = null; _ext = null; }
         public Frame(string name, LispObject a0, LispObject a1, LispObject a2, LispObject a3)
-        { Name = name; Argc = 4; _a0 = a0; _a1 = a1; _a2 = a2; _a3 = a3; _rest = null; }
+        { Prev = null; Depth = 0; Name = name; Argc = 4; _a0 = a0; _a1 = a1; _a2 = a2; _a3 = a3; _rest = null; _ext = null; }
+        public Frame(string name, int argc, LispObject a0, LispObject a1, LispObject a2, LispObject a3, FrameExt* ext)
+        { Prev = null; Depth = 0; Name = name; Argc = argc; _a0 = a0; _a1 = a1; _a2 = a2; _a3 = a3; _rest = null; _ext = ext; }
         public Frame(string name, LispObject[] args)
-        { Name = name; Argc = args.Length; _a0 = _a1 = _a2 = _a3 = null; _rest = args; }
+        { Prev = null; Depth = 0; Name = name; Argc = args.Length; _a0 = _a1 = _a2 = _a3 = null; _rest = args; _ext = null; }
 
         public LispObject? Arg(int i)
         {
             if (_rest != null) return (uint)i < (uint)_rest.Length ? _rest[i] : null;
-            return i switch { 0 => _a0, 1 => _a1, 2 => _a2, 3 => _a3, _ => null };
+            if ((uint)i >= (uint)Argc) return null;
+            return i switch
+            {
+                0 => _a0, 1 => _a1, 2 => _a2, 3 => _a3,
+                4 => _ext->A4, 5 => _ext->A5, 6 => _ext->A6, 7 => _ext->A7,
+                _ => null
+            };
         }
     }
 
-    [ThreadStatic] private static Stack<Frame>? s_callStack;
+    /// <summary>Arguments 5-8 of a frame pushed by Invoke5-8.</summary>
+    internal struct FrameExt
+    {
+        internal LispObject? A4, A5, A6, A7;
+    }
+
+    [ThreadStatic] private static unsafe Frame* s_top;
+
+    /// <summary>Make F the innermost frame. The caller restores the previous head
+    /// (F->Prev) in a finally.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe void Link(Frame* f)
+    {
+        var p = s_top;
+        f->Prev = p;
+        f->Depth = p == null ? 1 : p->Depth + 1;
+        s_top = f;
+    }
 
     /// <summary>Number of Lisp frames on this thread's call stack. A body's own
     /// frame is already pushed while it runs, so this is that body's depth;
     /// DebugFrames uses it to tie a frame's locals to its backtrace position.</summary>
-    internal static int CallStackDepth => s_callStack?.Count ?? 0;
+    internal static unsafe int CallStackDepth => s_top == null ? 0 : s_top->Depth;
 
     /// <summary>Name of the innermost Lisp frame, or null when there is none
     /// (anonymous callee, or a body reached without going through Invoke).</summary>
-    internal static string? CurrentFrameName =>
-        s_callStack is { Count: > 0 } s ? s.Peek().Name : null;
+    internal static unsafe string? CurrentFrameName => s_top == null ? null : s_top->Name;
+
+    /// <summary>Copy of the live frames, innermost first. A copy of a frame
+    /// pushed by Invoke5-8 still points at that call's FrameExt, so the
+    /// snapshot is only valid while those frames are live: every caller
+    /// consumes it before returning.</summary>
+    private static unsafe Frame[] SnapshotFrames()
+    {
+        var top = s_top;
+        if (top == null) return Array.Empty<Frame>();
+        var frames = new Frame[top->Depth];
+        int i = 0;
+        for (var f = top; f != null && i < frames.Length; f = f->Prev) frames[i++] = *f;
+        return frames;
+    }
 
     /// <summary>Backtrace as callee-name strings, innermost first. Used by the
     /// programmatic DOTCL:BACKTRACE.</summary>
     internal static string[] GetCallStack()
     {
-        if (s_callStack is not { Count: > 0 } s) return Array.Empty<string>();
-        var frames = s.ToArray();
+        var frames = SnapshotFrames();
+        if (frames.Length == 0) return Array.Empty<string>();
         var result = new string[frames.Length];
         for (int i = 0; i < frames.Length; i++) result[i] = frames[i].Name;
         return result;
@@ -259,8 +318,8 @@ public class LispFunction : LispObject
     /// rendering happens here (off the call hot path) and is bounded/cycle-safe.</summary>
     internal static string[] GetCallStackForms()
     {
-        if (s_callStack is not { Count: > 0 } s) return Array.Empty<string>();
-        var frames = s.ToArray();
+        var frames = SnapshotFrames();
+        if (frames.Length == 0) return Array.Empty<string>();
         var result = new string[frames.Length];
         for (int i = 0; i < frames.Length; i++) result[i] = FormatFrame(frames[i]);
         return result;
@@ -272,8 +331,8 @@ public class LispFunction : LispObject
     /// arguments programmatically (cf. sb-debug:list-backtrace).</summary>
     internal static LispObject[] GetCallStackWithArgs()
     {
-        if (s_callStack is not { Count: > 0 } s) return Array.Empty<LispObject>();
-        var frames = s.ToArray();
+        var frames = SnapshotFrames();
+        if (frames.Length == 0) return Array.Empty<LispObject>();
         var result = new LispObject[frames.Length];
         for (int i = 0; i < frames.Length; i++)
         {
@@ -321,9 +380,19 @@ public class LispFunction : LispObject
         var f = _func;
         var n = _frameName;
         if (n == null) return f != null ? f(args) : CallDirectWithArray(args);
-        (s_callStack ??= new Stack<Frame>()).Push(new Frame(n, args));
-        try { return f != null ? f(args) : CallDirectWithArray(args); }
-        finally { s_callStack.TryPop(out _); }
+        return f != null ? CallFramed(f, n, args) : CallDirectFramed(n, args);
+    }
+
+    private unsafe LispObject CallFramed(Func<LispObject[], LispObject> f, string n, LispObject[] args)
+    {
+        var fr = new Frame(n, args); Link(&fr);
+        try { return f(args); } finally { s_top = fr.Prev; }
+    }
+
+    private unsafe LispObject CallDirectFramed(string n, LispObject[] args)
+    {
+        var fr = new Frame(n, args); Link(&fr);
+        try { return CallDirectWithArray(args); } finally { s_top = fr.Prev; }
     }
 
     /// <summary>Invoke without recording a debugger frame. Used where the callee
@@ -351,66 +420,6 @@ public class LispFunction : LispObject
                     $"Stack overflow in function {Name ?? "anonymous"}"));
             ConditionSystem.CheckInterrupt();
         }
-    }
-
-    // Push the current function name onto the debugger call stack and return a
-    // scope whose Dispose pops it. Struct + `using` keeps this alloc-free (no
-    // closure, no boxing); functions with no frame name skip the stack; that is
-    // anonymous functions, plus the tree-walk evaluator's own helpers.
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private FrameScope PushFrame()
-    {
-        var n = _frameName;
-        if (n == null) return default;
-        (s_callStack ??= new Stack<Frame>()).Push(new Frame(n));
-        return new FrameScope(true);
-    }
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private FrameScope PushFrame(LispObject a)
-    {
-        var n = _frameName;
-        if (n == null) return default;
-        (s_callStack ??= new Stack<Frame>()).Push(new Frame(n, a));
-        return new FrameScope(true);
-    }
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private FrameScope PushFrame(LispObject a, LispObject b)
-    {
-        var n = _frameName;
-        if (n == null) return default;
-        (s_callStack ??= new Stack<Frame>()).Push(new Frame(n, a, b));
-        return new FrameScope(true);
-    }
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private FrameScope PushFrame(LispObject a, LispObject b, LispObject c)
-    {
-        var n = _frameName;
-        if (n == null) return default;
-        (s_callStack ??= new Stack<Frame>()).Push(new Frame(n, a, b, c));
-        return new FrameScope(true);
-    }
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private FrameScope PushFrame(LispObject a, LispObject b, LispObject c, LispObject d)
-    {
-        var n = _frameName;
-        if (n == null) return default;
-        (s_callStack ??= new Stack<Frame>()).Push(new Frame(n, a, b, c, d));
-        return new FrameScope(true);
-    }
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private FrameScope PushFrame(LispObject[] args)
-    {
-        var n = _frameName;
-        if (n == null) return default;
-        (s_callStack ??= new Stack<Frame>()).Push(new Frame(n, args));
-        return new FrameScope(true);
-    }
-
-    private readonly struct FrameScope : IDisposable
-    {
-        private readonly bool _pushed;
-        public FrameScope(bool pushed) { _pushed = pushed; }
-        public void Dispose() { if (_pushed) s_callStack!.TryPop(out _); }
     }
 
     // Each InvokeN fast path calls PeriodicStackCheck before dispatching to
@@ -457,96 +466,172 @@ public class LispFunction : LispObject
             "internal: closure has no callable body"));
     }
 
-    public LispObject Invoke0()
+    public unsafe LispObject Invoke0()
     {
-        if (_func0 != null) { PeriodicStackCheck(); using (PushFrame()) return _func0(); }
+        var f0 = _func0;
+        if (f0 != null)
+        {
+            PeriodicStackCheck();
+            var n = _frameName;
+            if (n == null) return f0();
+            var fr = new Frame(n); Link(&fr);
+            try { return f0(); } finally { s_top = fr.Prev; }
+        }
         if (_directDel is Func<object[], LispObject> c0)
-        { PeriodicStackCheck(); using (PushFrame()) return c0(Environment!); }
+        {
+            PeriodicStackCheck();
+            var n = _frameName;
+            if (n == null) return c0(Environment!);
+            var fr = new Frame(n); Link(&fr);
+            try { return c0(Environment!); } finally { s_top = fr.Prev; }
+        }
         return InvokeSlow(Array.Empty<LispObject>());
     }
 
-    public LispObject Invoke1(LispObject a)
+    public unsafe LispObject Invoke1(LispObject a)
     {
-        if (_func1 != null) { PeriodicStackCheck(); using (PushFrame(a)) return _func1(a); }
+        var f1 = _func1;
+        if (f1 != null)
+        {
+            PeriodicStackCheck();
+            var n = _frameName;
+            if (n == null) return f1(a);
+            var fr = new Frame(n, a); Link(&fr);
+            try { return f1(a); } finally { s_top = fr.Prev; }
+        }
         if (_directDel is Func<object[], LispObject, LispObject> c1)
-        { PeriodicStackCheck(); using (PushFrame(a)) return c1(Environment!, a); }
+        {
+            PeriodicStackCheck();
+            var n = _frameName;
+            if (n == null) return c1(Environment!, a);
+            var fr = new Frame(n, a); Link(&fr);
+            try { return c1(Environment!, a); } finally { s_top = fr.Prev; }
+        }
         return InvokeSlow(new[] { a });
     }
 
-    public LispObject Invoke2(LispObject a, LispObject b)
+    public unsafe LispObject Invoke2(LispObject a, LispObject b)
     {
-        if (_func2 != null) { PeriodicStackCheck(); using (PushFrame(a, b)) return _func2(a, b); }
+        var f2 = _func2;
+        if (f2 != null)
+        {
+            PeriodicStackCheck();
+            var n = _frameName;
+            if (n == null) return f2(a, b);
+            var fr = new Frame(n, a, b); Link(&fr);
+            try { return f2(a, b); } finally { s_top = fr.Prev; }
+        }
         if (_directDel is Func<object[], LispObject, LispObject, LispObject> c2)
-        { PeriodicStackCheck(); using (PushFrame(a, b)) return c2(Environment!, a, b); }
+        {
+            PeriodicStackCheck();
+            var n = _frameName;
+            if (n == null) return c2(Environment!, a, b);
+            var fr = new Frame(n, a, b); Link(&fr);
+            try { return c2(Environment!, a, b); } finally { s_top = fr.Prev; }
+        }
         return InvokeSlow(new[] { a, b });
     }
 
-    public LispObject Invoke3(LispObject a, LispObject b, LispObject c)
+    public unsafe LispObject Invoke3(LispObject a, LispObject b, LispObject c)
     {
-        if (_func3 != null) { PeriodicStackCheck(); using (PushFrame(a, b, c)) return _func3(a, b, c); }
+        var f3 = _func3;
+        if (f3 != null)
+        {
+            PeriodicStackCheck();
+            var n = _frameName;
+            if (n == null) return f3(a, b, c);
+            var fr = new Frame(n, a, b, c); Link(&fr);
+            try { return f3(a, b, c); } finally { s_top = fr.Prev; }
+        }
         if (_directDel is Func<object[], LispObject, LispObject, LispObject, LispObject> c3)
-        { PeriodicStackCheck(); using (PushFrame(a, b, c)) return c3(Environment!, a, b, c); }
+        {
+            PeriodicStackCheck();
+            var n = _frameName;
+            if (n == null) return c3(Environment!, a, b, c);
+            var fr = new Frame(n, a, b, c); Link(&fr);
+            try { return c3(Environment!, a, b, c); } finally { s_top = fr.Prev; }
+        }
         return InvokeSlow(new[] { a, b, c });
     }
 
-    public LispObject Invoke4(LispObject a, LispObject b, LispObject c, LispObject d)
+    public unsafe LispObject Invoke4(LispObject a, LispObject b, LispObject c, LispObject d)
     {
-        if (_func4 != null) { PeriodicStackCheck(); using (PushFrame(a, b, c, d)) return _func4(a, b, c, d); }
+        var f4 = _func4;
+        if (f4 != null)
+        {
+            PeriodicStackCheck();
+            var n = _frameName;
+            if (n == null) return f4(a, b, c, d);
+            var fr = new Frame(n, a, b, c, d); Link(&fr);
+            try { return f4(a, b, c, d); } finally { s_top = fr.Prev; }
+        }
         if (_directDel is Func<object[], LispObject, LispObject, LispObject, LispObject, LispObject> c4)
-        { PeriodicStackCheck(); using (PushFrame(a, b, c, d)) return c4(Environment!, a, b, c, d); }
+        {
+            PeriodicStackCheck();
+            var n = _frameName;
+            if (n == null) return c4(Environment!, a, b, c, d);
+            var fr = new Frame(n, a, b, c, d); Link(&fr);
+            try { return c4(Environment!, a, b, c, d); } finally { s_top = fr.Prev; }
+        }
         return InvokeSlow(new[] { a, b, c, d });
     }
 
-    public LispObject Invoke5(LispObject a, LispObject b, LispObject c, LispObject d, LispObject e)
+    public unsafe LispObject Invoke5(LispObject a, LispObject b, LispObject c, LispObject d, LispObject e)
     {
-        if (_func5 != null)
+        var f5 = _func5;
+        if (f5 != null)
         {
             PeriodicStackCheck();
-            // Anonymous callee: skip the frame array (PushFrame is a no-op when
-            // Name == null, so allocating it just to discard it is pure waste).
-            if (_frameName == null) return _func5(a, b, c, d, e);
-            var args = new[] { a, b, c, d, e };
-            using (PushFrame(args)) return _func5(a, b, c, d, e);
+            var n = _frameName;
+            if (n == null) return f5(a, b, c, d, e);
+            FrameExt x = default; x.A4 = e;
+            var fr = new Frame(n, 5, a, b, c, d, &x); Link(&fr);
+            try { return f5(a, b, c, d, e); } finally { s_top = fr.Prev; }
         }
         return InvokeSlow(new[] { a, b, c, d, e });
     }
 
-    public LispObject Invoke6(LispObject a, LispObject b, LispObject c, LispObject d, LispObject e, LispObject f)
+    public unsafe LispObject Invoke6(LispObject a, LispObject b, LispObject c, LispObject d, LispObject e, LispObject f)
     {
-        if (_func6 != null)
+        var f6 = _func6;
+        if (f6 != null)
         {
             PeriodicStackCheck();
-            if (_frameName == null) return _func6(a, b, c, d, e, f);
-            var args = new[] { a, b, c, d, e, f };
-            using (PushFrame(args)) return _func6(a, b, c, d, e, f);
+            var n = _frameName;
+            if (n == null) return f6(a, b, c, d, e, f);
+            FrameExt x = default; x.A4 = e; x.A5 = f;
+            var fr = new Frame(n, 6, a, b, c, d, &x); Link(&fr);
+            try { return f6(a, b, c, d, e, f); } finally { s_top = fr.Prev; }
         }
         return InvokeSlow(new[] { a, b, c, d, e, f });
     }
 
-    public LispObject Invoke7(LispObject a, LispObject b, LispObject c, LispObject d, LispObject e, LispObject f, LispObject g)
+    public unsafe LispObject Invoke7(LispObject a, LispObject b, LispObject c, LispObject d, LispObject e, LispObject f, LispObject g)
     {
-        if (_func7 != null)
+        var f7 = _func7;
+        if (f7 != null)
         {
             PeriodicStackCheck();
-            // Same anonymous-callee skip as Invoke5/Invoke6. Without it these two
-            // arities allocated the frame array on every call even when nothing
-            // would ever read it, which is a per-CALL cost against the per-ENTRY
-            // saving the compiler's capture lifting is trying to buy.
-            if (_frameName == null) return _func7(a, b, c, d, e, f, g);
-            var args = new[] { a, b, c, d, e, f, g };
-            using (PushFrame(args)) return _func7(a, b, c, d, e, f, g);
+            var n = _frameName;
+            if (n == null) return f7(a, b, c, d, e, f, g);
+            FrameExt x = default; x.A4 = e; x.A5 = f; x.A6 = g;
+            var fr = new Frame(n, 7, a, b, c, d, &x); Link(&fr);
+            try { return f7(a, b, c, d, e, f, g); } finally { s_top = fr.Prev; }
         }
         return InvokeSlow(new[] { a, b, c, d, e, f, g });
     }
 
-    public LispObject Invoke8(LispObject a, LispObject b, LispObject c, LispObject d, LispObject e, LispObject f, LispObject g, LispObject h)
+    public unsafe LispObject Invoke8(LispObject a, LispObject b, LispObject c, LispObject d, LispObject e, LispObject f, LispObject g, LispObject h)
     {
-        if (_func8 != null)
+        var f8 = _func8;
+        if (f8 != null)
         {
             PeriodicStackCheck();
-            if (_frameName == null) return _func8(a, b, c, d, e, f, g, h);
-            var args = new[] { a, b, c, d, e, f, g, h };
-            using (PushFrame(args)) return _func8(a, b, c, d, e, f, g, h);
+            var n = _frameName;
+            if (n == null) return f8(a, b, c, d, e, f, g, h);
+            FrameExt x = default; x.A4 = e; x.A5 = f; x.A6 = g; x.A7 = h;
+            var fr = new Frame(n, 8, a, b, c, d, &x); Link(&fr);
+            try { return f8(a, b, c, d, e, f, g, h); } finally { s_top = fr.Prev; }
         }
         return InvokeSlow(new[] { a, b, c, d, e, f, g, h });
     }
@@ -658,9 +743,7 @@ public class LispFunction : LispObject
         var f = _func;
         var frameName = _frameName;
         if (frameName == null) return f != null ? f(args) : CallDirectWithArray(args);
-        (s_callStack ??= new Stack<Frame>()).Push(new Frame(frameName, args));
-        try { return f != null ? f(args) : CallDirectWithArray(args); }
-        finally { s_callStack.TryPop(out _); }
+        return f != null ? CallFramed(f, frameName, args) : CallDirectFramed(frameName, args);
     }
 
     // Origin tag for anonymous functions in the InvokeSlow statistics. The

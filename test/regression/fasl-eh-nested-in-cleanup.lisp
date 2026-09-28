@@ -15,7 +15,7 @@
 ;;; deletes temporary files and searches the central registry.
 
 (deftest-compiled-only fasl-eh-nested-in-cleanup
-  (let* ((tmp (uiop:temporary-directory))
+  (let* ((tmp (pathname (concatenate 'string (regression-temp-dir) "/")))
          (src (merge-pathnames "rf-ehorder.lisp" tmp))
          (out (merge-pathnames "rf-ehorder.fasl" tmp)))
     (with-open-file (f src :direction :output :if-exists :supersede)

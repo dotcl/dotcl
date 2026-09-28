@@ -159,14 +159,12 @@ public static partial class Runtime
             }
             else if (displacedTo is LispString srcStr)
             {
-                // Wrap LispString in a temporary LispVector for sharing
-                var strItems = new LispObject[srcStr.Length];
-                for (int j = 0; j < srcStr.Length; j++) strItems[j] = LispChar.Make(srcStr[j]);
-                srcVec = new LispVector(strItems, "CHARACTER");
+                srcVec = StringAsDisplacementTarget(srcStr);
                 if (elementType == "T") elementType = "CHARACTER";
             }
             else throw new LispErrorException(new LispTypeError(
                 "MAKE-ARRAY: :displaced-to must be an array", displacedTo, Startup.Sym("ARRAY")));
+            CheckDisplacement("MAKE-ARRAY", size, srcVec, displacedOffset);
             vec = new LispVector(size, srcVec, displacedOffset, elementType,
                                  dimArray ?? new[] { size });
         }
@@ -216,6 +214,29 @@ public static partial class Runtime
         if (isAdjustable || displacedTo != null)
             vec.IsAdjustable = true;
         return vec;
+    }
+
+    /// <summary>A displaced array has to fit in its target: the offset plus the
+    /// new array's total size may not exceed the target's total size (CLHS
+    /// MAKE-ARRAY). Without this the array is made, and the first access past the
+    /// target's end fails with a raw .NET index error.</summary>
+    private static void CheckDisplacement(string who, int size, LispVector target, int offset)
+    {
+        int targetSize = target.Capacity;
+        if (offset < 0 || offset > targetSize || size > targetSize - offset)
+            throw new LispErrorException(new LispError(
+                $"{who}: can't displace an array of total size {size} at offset {offset} into an array of total size {targetSize}"));
+    }
+
+    /// <summary>A LispString is not a LispVector, so it cannot be the target of a
+    /// displaced LispVector directly. Wrap its characters in a CHARACTER vector.
+    /// This copies: a later write through the string is not seen by the
+    /// displaced array.</summary>
+    private static LispVector StringAsDisplacementTarget(LispString str)
+    {
+        var strItems = new LispObject[str.Length];
+        for (int j = 0; j < str.Length; j++) strItems[j] = LispChar.Make(str[j]);
+        return new LispVector(strItems, "CHARACTER");
     }
 
     public static LispObject AdjustArray(LispObject[] args)
@@ -293,12 +314,21 @@ public static partial class Runtime
         int[]? newDims = dimArray.Length == 1 ? null : dimArray;
         string et = elementType ?? vec.ElementTypeName;
 
+        // :DISPLACED-TO a string used to fall through every branch below as if
+        // it had not been given, leaving the array filled with #\Nul.
+        if (displacedTo is LispString dstr)
+            displacedTo = StringAsDisplacementTarget(dstr);
+        else if (displacedTo != null && displacedTo is not Nil && displacedTo is not LispVector)
+            throw new LispErrorException(new LispTypeError(
+                "ADJUST-ARRAY: :displaced-to must be an array", displacedTo, Startup.Sym("ARRAY")));
+
         if (!vec.IsAdjustable)
         {
             // Non-adjustable: create a new array (original is unchanged)
             LispVector newVec;
             if (displacedTo is LispVector dv2)
             {
+                CheckDisplacement("ADJUST-ARRAY", size, dv2, displacedOffset);
                 newVec = new LispVector(size, dv2, displacedOffset, et, dimArray);
             }
             else
@@ -322,6 +352,7 @@ public static partial class Runtime
         // Adjustable: modify in-place
         if (displacedTo is LispVector dv)
         {
+            CheckDisplacement("ADJUST-ARRAY", size, dv, displacedOffset);
             vec.AdjustToDisplaced(size, dv, displacedOffset, et, newDims, fillPointer);
         }
         else if (initialContents != null)
@@ -973,23 +1004,38 @@ public static partial class Runtime
 
     // --- Hoisted element storage -----------------------------------------
     //
-    // A local declared (simple-array <integer type> (*)) names storage whose
-    // identity cannot change while the binding lives: CLHS says a simple array
-    // is neither displaced nor adjustable nor fill-pointered, and ADJUST-ARRAY
-    // on one produces a fresh array rather than rewriting this one. So the
-    // element buffer can be fetched ONCE, when the variable is bound, and every
-    // AREF in the body can then be a bare ldelem against it -- which is the
-    // whole difference between 2 ns and 0.2 ns per element, because the checks
-    // ArefNum*L repeats (is it a vector, which backing kind, is it displaced,
-    // is it rank 1) are the same answer on every iteration and the JIT will not
-    // hoist them on its own.
+    // Two different answers for two different situations, and conflating them
+    // costs one thing or the other:
     //
-    // The declaration is checked here, once, and a violation is reported as the
-    // TYPE-ERROR it is. That check is per binding, not per element, so it costs
-    // nothing measurable and it is kept at every safety level: without it a
-    // false declaration would reach the ldelem as a null buffer and surface as
-    // a NullReferenceException, which is worse than the boxed-path behavior it
-    // replaces.
+    //   the right element storage, but not pinnable (adjustable, fill-pointered,
+    //     displaced) -> answer NULL and let each access run the per-element
+    //     helper. Such a vector is not a SIMPLE-ARRAY (TYPEP says so too: it
+    //     reads LispVector.IsSimple), so the declaration is false. These entries
+    //     are what (safety 0) calls, and there the declaration is trusted rather
+    //     than checked, so they answer null and the helper reads correct values.
+    //     Above safety 0 the compiler calls the *Checked entries below, which
+    //     turn that null into a TYPE-ERROR. Measured before the null arm
+    //     existed: ADJUST-ARRAY replaced the buffer, the write inside the
+    //     function went to the replaced one and was lost, and a read inside
+    //     disagreed with a read outside about the same element.
+    //     VECTOR-PUSH-EXTEND does the same to a fill-pointered vector and is far
+    //     commoner.
+    //
+    //   declaration FALSE, not that array at all -> THROW, exactly as before.
+    //     That check moved here from the per-element path on purpose: it used to
+    //     be re-checked per element, which let a false declaration read the right
+    //     values off the boxed path and be quietly absorbed. Answering null for
+    //     this case too would walk that back, and it would have looked like an
+    //     improvement in the diff.
+    //
+    // CLHS says a simple array is neither displaced nor adjustable nor
+    // fill-pointered, so its storage cannot be replaced while the binding lives.
+    // BackingPinned is exactly that test.
+    private static string Typep2Name(LispObject o) =>
+        o is LispVector lv
+            ? (lv.IsDisplaced ? $"a displaced array of {lv.ElementTypeName}"
+               : $"an array of {lv.ElementTypeName}")
+            : o.ToString();
 
     private static Exception BackingTypeError(LispObject array, string elementType)
     {
@@ -1001,45 +1047,217 @@ public static partial class Runtime
             array, expected));
     }
 
-    private static string Typep2Name(LispObject o) =>
-        o is LispVector lv
-            ? (lv.IsDisplaced ? $"a displaced array of {lv.ElementTypeName}"
-               : $"an array of {lv.ElementTypeName}")
-            : o.ToString();
+    /// <summary>Whether V's element storage stays put for as long as a binding
+    /// lives. Not displaced because a displaced vector's elements are not its
+    /// own; not fill-pointered and not adjustable because VECTOR-PUSH-EXTEND and
+    /// ADJUST-ARRAY both REPLACE the buffer object (they assign _numData), which
+    /// leaves a hoisted reference reading storage nothing else can see. This is
+    /// the same test as CLHS simplicity, so it is LispVector.IsSimple.</summary>
+    [System.Runtime.CompilerServices.MethodImpl(
+        System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    private static bool BackingPinned(LispVector v) => v.IsSimple;
+
+
+    /// <summary>The char[] storage of a string declared SIMPLE-STRING, or null.
+    ///
+    /// NEVER signals, and that is not the array entries' contract. A declaration
+    /// this declines can be perfectly true: MAKE-ARRAY with :element-type
+    /// CHARACTER and no fill pointer builds a **LispVector**, not a LispString,
+    /// and it is a simple string under CLHS and under SIMPLE-STRING-P. So a
+    /// conforming program can pass one to a
+    /// SIMPLE-STRING parameter, and throwing here would break it.
+    ///
+    /// That LispVector's own char[] is taken too when the vector is simple and
+    /// rank 1. It is pinned by the same argument the integer entries above rest
+    /// on: after construction _numData is reassigned only by ADJUST-ARRAY on an
+    /// adjustable array (resizing, or leaving displaced storage) and by the
+    /// growth in VECTOR-PUSH / VECTOR-PUSH-EXTEND, which needs a fill pointer,
+    /// and IsSimple excludes both. None
+    /// of the operations that could make a simple vector non-simple later can
+    /// reach it either (SETF FILL-POINTER and VECTOR-POP require an existing
+    /// fill pointer). An adjustable, fill-pointered or displaced character
+    /// vector answers null, as before, and its reads take the typed call.
+    ///
+    /// Only the char[] backing is taken. A LispString holding a System.String
+    /// answers null rather than materializing: RAWCHARS would convert it
+    /// permanently, and from then on every VALUE read -- STRING=, STRING&lt;,
+    /// printing -- allocates a fresh System.String for the rest of the image's
+    /// life. Paying that at every binding of a declared parameter, to speed up
+    /// scans that may not happen, is not a trade this can make on the caller's
+    /// behalf.
+    ///
+    /// What makes the hoist sound once the buffer is in hand: _chars is
+    /// write-once. It is assigned in exactly two places, the char[] constructor
+    /// and EnsureMutable under a null guard, and ADJUST-ARRAY cannot reach a
+    /// LispString at all -- it rejects a non-LispVector outright. So unlike a
+    /// LispVector, whose _numData four paths reassign, the array this returns
+    /// cannot be swapped underneath the binding, and writes through SCHAR mutate
+    /// that same array in place where a hoisted reference sees them.</summary>
+    public static char[]? BackingChars(LispObject s)
+    {
+        if (s is LispString ls) return ls.CharsOrNull;
+        return SimpleCharVectorData(s);
+    }
+
+    /// <summary>The char[] of a simple rank-1 character LispVector, else null.
+    /// Shared by BackingChars and BackingCharsChecked; see BackingChars for why
+    /// the buffer cannot be swapped while a binding holds it.</summary>
+    private static char[]? SimpleCharVectorData(LispObject s)
+        => s is LispVector v && v._dimensions == null && v.IsSimple
+           && v._numData is char[] cv ? cv : null;
 
     /// <summary>The int64 element buffer of a vector declared
     /// (simple-array fixnum (*)) / (simple-array (signed-byte 64) (*)).</summary>
-    public static long[] BackingI64(LispObject array)
+    public static long[]? BackingI64(LispObject array)
     {
-        if (array is LispVector v && v._dimensions == null && v._displacedTo == null
-            && v._numData is long[] d)
-            return d;
+        if (array is LispVector v && v._dimensions == null)
+        {
+            if (!BackingPinned(v)) return null;
+            if (v._numData is long[] d) return d;
+        }
         throw BackingTypeError(array, "FIXNUM");
     }
 
-    public static int[] BackingI32(LispObject array)
+    public static int[]? BackingI32(LispObject array)
     {
-        if (array is LispVector v && v._dimensions == null && v._displacedTo == null
-            && v._numData is int[] d)
-            return d;
+        if (array is LispVector v && v._dimensions == null)
+        {
+            if (!BackingPinned(v)) return null;
+            if (v._numData is int[] d) return d;
+        }
         throw BackingTypeError(array, "SIGNED-BYTE-32");
     }
 
-    public static ushort[] BackingU16(LispObject array)
+    public static ushort[]? BackingU16(LispObject array)
     {
-        if (array is LispVector v && v._dimensions == null && v._displacedTo == null
-            && v._numData is ushort[] d)
-            return d;
+        if (array is LispVector v && v._dimensions == null)
+        {
+            if (!BackingPinned(v)) return null;
+            if (v._numData is ushort[] d) return d;
+        }
         throw BackingTypeError(array, "UNSIGNED-BYTE-16");
     }
 
-    public static byte[] BackingU8(LispObject array)
+    public static byte[]? BackingU8(LispObject array)
     {
-        if (array is LispVector v && v._dimensions == null && v._displacedTo == null
-            && v._numData is byte[] d)
-            return d;
+        if (array is LispVector v && v._dimensions == null)
+        {
+            if (!BackingPinned(v)) return null;
+            if (v._numData is byte[] d) return d;
+        }
         throw BackingTypeError(array, "UNSIGNED-BYTE-8");
     }
+
+    // --- The same fetches above SAFETY 0 ---------------------------------
+    //
+    // The entries above answer null for an array that is the declared kind but
+    // not simple (adjustable, fill-pointered, displaced), and each access then
+    // falls back to the per-element helper. (safety 0) keeps that. Above it the
+    // declaration is an assertion, so the compiler calls these instead, which
+    // turn exactly that null into a TYPE-ERROR. The branch sits on the path the
+    // plain fetch already takes when it declines, so a true declaration pays
+    // nothing extra.
+
+    private static string NotSimpleDescription(LispObject o)
+    {
+        if (o is not LispVector v) return o.ToString();
+        var what = new System.Collections.Generic.List<string>();
+        if (v.IsAdjustable) what.Add("adjustable");
+        if (v.HasFillPointer) what.Add("fill-pointered");
+        if (v.IsDisplaced) what.Add("displaced");
+        return $"a non-simple ({string.Join(", ", what)}) array of {v.ElementTypeName}";
+    }
+
+    private static Exception NotSimpleDeclError(LispObject datum, LispObject expected,
+                                                string? varName)
+    {
+        var who = varName == null ? "" : $"{varName} is ";
+        return new LispErrorException(new LispTypeError(
+            $"{who}declared {expected}, got {NotSimpleDescription(datum)}",
+            datum, expected));
+    }
+
+    private static LispObject SimpleVectorOf(LispObject elementType) =>
+        new Cons(Startup.Sym("SIMPLE-ARRAY"),
+            new Cons(elementType,
+                new Cons(new Cons(Startup.Sym("*"), Nil.Instance), Nil.Instance)));
+
+    private static LispObject SizedByte(string head, int width) =>
+        new Cons(Startup.Sym(head), new Cons(Fixnum.Make(width), Nil.Instance));
+
+    // Written out rather than wrapping the plain entries, so a true declaration
+    // runs exactly the tests the plain entry runs, with no extra call layer.
+
+    public static long[] BackingI64Checked(LispObject array)
+    {
+        if (array is LispVector v && v._dimensions == null)
+        {
+            if (!BackingPinned(v))
+                throw NotSimpleDeclError(array, SimpleVectorOf(SizedByte("SIGNED-BYTE", 64)), null);
+            if (v._numData is long[] d) return d;
+        }
+        throw BackingTypeError(array, "FIXNUM");
+    }
+
+    public static int[] BackingI32Checked(LispObject array)
+    {
+        if (array is LispVector v && v._dimensions == null)
+        {
+            if (!BackingPinned(v))
+                throw NotSimpleDeclError(array, SimpleVectorOf(SizedByte("SIGNED-BYTE", 32)), null);
+            if (v._numData is int[] d) return d;
+        }
+        throw BackingTypeError(array, "SIGNED-BYTE-32");
+    }
+
+    public static ushort[] BackingU16Checked(LispObject array)
+    {
+        if (array is LispVector v && v._dimensions == null)
+        {
+            if (!BackingPinned(v))
+                throw NotSimpleDeclError(array, SimpleVectorOf(SizedByte("UNSIGNED-BYTE", 16)), null);
+            if (v._numData is ushort[] d) return d;
+        }
+        throw BackingTypeError(array, "UNSIGNED-BYTE-16");
+    }
+
+    public static byte[] BackingU8Checked(LispObject array)
+    {
+        if (array is LispVector v && v._dimensions == null)
+        {
+            if (!BackingPinned(v))
+                throw NotSimpleDeclError(array, SimpleVectorOf(SizedByte("UNSIGNED-BYTE", 8)), null);
+            if (v._numData is byte[] d) return d;
+        }
+        throw BackingTypeError(array, "UNSIGNED-BYTE-8");
+    }
+
+    /// <summary>BackingChars above SAFETY 0. Still answers null for everything
+    /// BackingChars declines that can be a true SIMPLE-STRING (a LispString
+    /// holding a System.String), and for a value that is not a string at all,
+    /// which BackingChars never diagnosed. Only the case that is certainly a
+    /// false declaration, a non-simple array, signals.</summary>
+    public static char[]? BackingCharsChecked(LispObject s)
+    {
+        if (s is LispString ls) return ls.CharsOrNull;
+        if (s is LispVector v && !v.IsSimple)
+            throw NotSimpleDeclError(s, Startup.Sym("SIMPLE-STRING"), null);
+        return SimpleCharVectorData(s);
+    }
+
+    /// <summary>True when O is an array that is not simple: the test a binding
+    /// declared with a SIMPLE-* array type runs above SAFETY 0 when nothing
+    /// hoisted its storage (the fetches above answer the same question on their
+    /// own). A LispString is always simple.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static bool IsNonSimpleArray(LispObject o) => o is LispVector v && !v.IsSimple;
+
+    /// <summary>The TYPE-ERROR for a binding declared SPEC whose value DATUM is a
+    /// non-simple array. Reached only after IsNonSimpleArray answered true, so
+    /// the constant and the name it takes cost nothing on a true declaration.
+    /// </summary>
+    public static void SignalDeclaredNotSimple(LispObject datum, LispObject spec, string varName)
+        => throw NotSimpleDeclError(datum, spec, varName);
 
     /// <summary>The element-type violation an out-of-width store would commit,
     /// as the error NumSet raises for the same value on the boxed path. The
@@ -1472,6 +1690,63 @@ public static partial class Runtime
         return value;
     }
 
+    /// <summary>
+    /// The raw int64 array behind OBJ's slots, for a call site that is about to
+    /// read or write several of them and already knows where they are -- or null
+    /// when it cannot have it, which is every case the caller must then handle by
+    /// doing what it does today.
+    ///
+    /// This is fetched ONCE per binding, not per access, and that is the whole
+    /// point: StructRefL and StructSetL otherwise re-derive the array, the layout
+    /// entry and the position from the object on every single slot touch, about
+    /// twenty-five instructions where C# has one load. A caller holding this array
+    /// and a constant position emits the load and nothing else.
+    ///
+    /// Sound because a LispStruct's raw storage cannot move under the caller:
+    /// _longs and _layout are readonly and every assignment to either is in the
+    /// constructor, so for one instance the array and the position map are fixed
+    /// for its lifetime. That is what makes the version check a once-per-binding
+    /// question rather than a per-access one -- and the version is exactly what
+    /// says the caller's compiled-in positions still describe this instance.
+    ///
+    /// NAME and VERSION together are what say the caller's positions describe
+    /// this object. The name has to be checked and not just the version: a
+    /// position is read out of the DECLARED structure's layout, and a different
+    /// structure at the same version maps the same slot index to a different
+    /// raw position, so a false declaration would otherwise read a neighbouring
+    /// slot in silence. One reference compare, once per binding, removes that.
+    /// The check is exact, so a binding declared to hold a parent structure that
+    /// is handed an :INCLUDE child falls back rather than hoisting -- slower,
+    /// never wrong.
+    ///
+    /// Null is answered for a non-structure, for another structure, for the
+    /// wrong layout version, and for an instance with no raw storage --
+    /// including one that HAD raw slots but dropped them at construction because
+    /// a value contradicted its declared type. That last case is why this must
+    /// not signal: such an instance is perfectly usable and reads correctly
+    /// through the ordinary path. So a null here is never an error, only an
+    /// instruction to the caller to keep doing what it did before, which is also
+    /// what reports the errors it reported before.
+    /// </summary>
+    public static long[]? StructRawBacking(LispObject obj, LispObject name, int version)
+        => obj is LispStruct s
+           && ReferenceEquals(s.TypeName, name)
+           && s.LayoutVersion == version
+            ? s._longs
+            : null;
+
+    /// <summary>The double a raw slot holds, given the bits read out of the raw
+    /// array. A structure's double slots share the int64 array with its integer
+    /// ones, so a hoisted backing serves both and only the reinterpretation
+    /// differs.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static double RawBitsToDouble(long bits) => BitConverter.Int64BitsToDouble(bits);
+
+    /// <summary>The bits to store into a raw slot declared DOUBLE-FLOAT. Twin of
+    /// RawBitsToDouble.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static long RawDoubleToBits(double value) => BitConverter.DoubleToInt64Bits(value);
+
     /// <summary>Map SBCL's package struct slot indices to dotcl Package properties.</summary>
     private static LispObject PackageStructRef(Package pkg, int idx)
     {
@@ -1537,10 +1812,95 @@ public static partial class Runtime
     public static LispObject CheckSlotType(LispObject value, LispObject type,
                                            LispObject structName, LispObject slotName)
     {
-        if (Typep(value, type) is not Nil) return value;
+        if (Typep(value, SlotCheckType(type)) is not Nil) return value;
         throw new LispErrorException(new LispTypeError(
             $"{structName}: slot {slotName} is declared {type}, got {value}",
             value, type));
+    }
+
+    // Declared slot types, keyed by the (constant) specifier object a DEFSTRUCT
+    // expansion passes in, so the rewrite below runs once per slot, not per store.
+    private static readonly ConditionalWeakTable<LispObject, LispObject> _slotCheckTypes = new();
+
+    /// <summary>The type a slot store is actually checked against: TYPE itself,
+    /// or a supertype of it that TYPEP can decide.
+    ///
+    /// A declaration may use specifiers TYPEP rejects -- (FUNCTION (STRING)
+    /// BOOLEAN) is an ordinary slot :TYPE, and TYPEP of a FUNCTION compound is an
+    /// error (CLHS 4.2.3, TYPEP). Checking the store with TYPEP turned every such
+    /// slot into a load failure. The check only has to catch values that cannot
+    /// be of the declared type, so a supertype is enough: a FUNCTION compound
+    /// becomes FUNCTION (what SBCL checks too), and the rewrite is carried
+    /// through OR / AND and through DEFTYPE expansions. Under NOT a weakening
+    /// would narrow the set instead, so such a NOT is replaced by T.</summary>
+    internal static LispObject SlotCheckType(LispObject type)
+    {
+        if (type is not Cons && (type is not Symbol || type is Nil || type is T)) return type;
+        // GetValue rather than AddOrUpdate: the latter is not in netstandard2.0.
+        return _slotCheckTypes.GetValue(type, static t =>
+        {
+            try { return WeakenForTypep(t, 0); }
+            catch (LispErrorException) { return t; }
+        });
+    }
+
+    private static LispObject WeakenForTypep(LispObject type, int depth)
+    {
+        if (depth > 32) return T.Instance;
+        if (type is Symbol sym && type is not Nil && type is not T)
+        {
+            if (TryGetQualifiedTypeExpander(sym, out var qexp)
+                || TryGetTypeExpander(sym, out qexp))
+            {
+                var expanded = Funcall(qexp);
+                if (!ReferenceEquals(expanded, type))
+                {
+                    var w = WeakenForTypep(expanded, depth + 1);
+                    return ReferenceEquals(w, expanded) ? type : w;
+                }
+            }
+            return type;
+        }
+        if (type is Cons c && c.Car is Symbol head)
+        {
+            switch (head.Name)
+            {
+                case "FUNCTION": return Startup.Sym("FUNCTION");
+                case "VALUES": return T.Instance;
+                case "OR":
+                case "AND":
+                {
+                    var parts = new List<LispObject>();
+                    bool changed = false;
+                    for (var cur = c.Cdr; cur is Cons pc; cur = pc.Cdr)
+                    {
+                        var w = WeakenForTypep(pc.Car, depth + 1);
+                        if (!ReferenceEquals(w, pc.Car)) changed = true;
+                        parts.Add(w);
+                    }
+                    if (!changed) return type;
+                    LispObject list = Nil.Instance;
+                    for (int i = parts.Count - 1; i >= 0; i--) list = new Cons(parts[i], list);
+                    return new Cons(head, list);
+                }
+                case "NOT":
+                {
+                    var inner = c.Cdr is Cons nc ? nc.Car : Nil.Instance;
+                    return ReferenceEquals(WeakenForTypep(inner, depth + 1), inner) ? type : T.Instance;
+                }
+            }
+            if (TryGetQualifiedTypeExpander(head, out var cexp)
+                || TryGetTypeExpander(head, out cexp))
+            {
+                var expanded = Funcall(cexp, ToList(c.Cdr).ToArray());
+                if (!ReferenceEquals(expanded, type))
+                {
+                    var w = WeakenForTypep(expanded, depth + 1);
+                    return ReferenceEquals(w, expanded) ? type : w;
+                }
+            }
+        }
+        return type;
     }
 
     public static LispObject StructSetI(LispObject obj, int packed, LispObject value)

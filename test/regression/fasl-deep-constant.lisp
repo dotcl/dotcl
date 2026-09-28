@@ -43,7 +43,7 @@
 (defun %fasl-deep-constant-case ()
   (let* ((depth 1500)
          (tmp (format nil "~a/dotcl-deepconst-~a"
-                      (or (dotcl:getenv "TEMP") "/tmp")
+                      (regression-temp-dir)
                       (get-internal-real-time)))
          (src (format nil "~a/src.lisp" tmp))
          (fasl (format nil "~a/src.fasl" tmp)))
@@ -68,7 +68,7 @@
 (defun %fasl-chunked-list-case ()
   (let* ((n 3000)
          (tmp (format nil "~a/dotcl-chunklist-~a"
-                      (or (dotcl:getenv "TEMP") "/tmp")
+                      (regression-temp-dir)
                       (get-internal-real-time)))
          (src (format nil "~a/src.lisp" tmp))
          (fasl (format nil "~a/src.fasl" tmp)))
@@ -102,7 +102,7 @@
 (defun %fasl-chunked-vector-case ()
   (let* ((n 3000)
          (tmp (format nil "~a/dotcl-chunkvec-~a"
-                      (or (dotcl:getenv "TEMP") "/tmp")
+                      (regression-temp-dir)
                       (get-internal-real-time)))
          (src (format nil "~a/src.lisp" tmp))
          (fasl (format nil "~a/src.fasl" tmp)))
@@ -137,7 +137,7 @@
   (let* ((n 60)
          (per 40)
          (tmp (format nil "~a/dotcl-manylit-~a"
-                      (or (dotcl:getenv "TEMP") "/tmp")
+                      (regression-temp-dir)
                       (get-internal-real-time)))
          (src (format nil "~a/src.lisp" tmp))
          (fasl (format nil "~a/src.fasl" tmp)))
@@ -192,7 +192,7 @@
 (defun %fasl-gensym-holder-case ()
   (let* ((n 5000)                       ; enough to have overflowed the old cap
          (tmp (format nil "~a/dotcl-gsymhold-~a"
-                      (or (dotcl:getenv "TEMP") "/tmp")
+                      (regression-temp-dir)
                       (get-internal-real-time)))
          (src (format nil "~a/src.lisp" tmp))
          (fasl (format nil "~a/src.fasl" tmp)))

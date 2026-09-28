@@ -200,6 +200,16 @@ public static class Startup
     /// </summary>
     public static LispFunction? ReadlineHook { get; set; }
 
+    /// <summary>
+    /// When non-null, called by the debugger to read at its prompt instead of
+    /// Console.ReadLine(). Receives the prompt and either a list of the
+    /// restarts as the debugger lists them (offer them as a menu) or NIL.
+    /// Returns a restart index, a line, NIL for EOF, or :NO-MENU when it read
+    /// nothing because no menu could be offered or it was put away.
+    /// Set by (dotcl-repl:enable) via dotcl:%set-debugger-read-hook.
+    /// </summary>
+    public static LispFunction? DebuggerReadHook { get; set; }
+
     // Well-known symbols
     public static Symbol NIL_SYM = null!;
     public static Symbol T_SYM = null!;
@@ -296,6 +306,7 @@ public static class Startup
         KeywordPkg = new Package("KEYWORD");
 
         Internal = new Package("DOTCL-INTERNAL");
+        Mop.CreatePackage(Internal);
         new Package("DOTCL.CIL-COMPILER");  // for compiler-generated labels/locals
         DotclPkg = new Package("DOTCL");
         DotNetPkg = new Package("DOTNET");
@@ -850,6 +861,16 @@ public static class Startup
                 ? (LispObject)T.Instance : Nil.Instance;
         });
 
+        // The text the debugger banner and the non-interactive diagnostics print
+        // for a condition. Not exported: this exists so a test can assert that the
+        // banner and PRINC-TO-STRING agree without capturing process output.
+        RegisterUnaryOnSymbol("%CONDITION-REPORT-STRING", "DOTCL",
+            a => new LispString(ConditionText.Report(a)));
+        RegisterUnaryOnSymbol("%CONDITION-TYPE-STRING", "DOTCL",
+            a => new LispString(ConditionText.TypeName(a)));
+        RegisterUnaryOnSymbol("%CONDITION-REPORT-LINE", "DOTCL",
+            a => new LispString(ConditionText.Line(a)));
+
         // Float bit-level access. Non-standard, so these land in DOTCL-INTERNAL,
         // SymForRegistration's fallback, and are reached from other packages through
         // the bridge in Startup.SymFn, which is consulted only AFTER the caller's own
@@ -1105,11 +1126,7 @@ public static class Startup
     /// <summary>Convert a pathname designator to LispPathname.</summary>
     internal static LispPathname ToPathname(LispObject obj, string caller)
     {
-        if (obj is LispPathname p) return p;
-        if (obj is LispString s) return LispPathname.FromString(s.Value);
-        if (obj is LispFileStream fs) return LispPathname.FromString(fs.FilePath);
-        if (obj is LispVector v && v.IsCharVector) return LispPathname.FromString(v.ToCharString());
-        throw new LispErrorException(new LispTypeError($"{caller}: not a pathname designator", obj));
+        return Runtime.ToPathnameDesignator(obj, caller);
     }
 
     /// <summary>Compare two LispObjects for structural equality (for pathname components).</summary>
@@ -1244,6 +1261,34 @@ public static class Startup
         // Intern a fresh placeholder in DOTCL-INTERNAL, but DO NOT cache.
         var (newSym, _) = Internal.Intern(name);
         return newSym;
+    }
+
+    /// <summary>
+    /// Per-site cache for :load-sym (a bare COMMON-LISP / DOTCL-INTERNAL name,
+    /// e.g. the callee of a call to a Lisp-defined CL function). Without it every
+    /// execution of the site hashed the name into _symCache.
+    ///
+    /// A resolution is pinned only when Sym put it in _symCache: entries there
+    /// are never replaced or removed, so the site answers exactly what Sym would
+    /// answer on every later call. A miss (Sym interned an uncached placeholder)
+    /// is resolved again next time, as before.
+    /// </summary>
+    public sealed class SymSite
+    {
+        private readonly string _name;
+        private Symbol? _sym;
+
+        public SymSite(string name) { _name = name; }
+
+        public Symbol Resolve() => _sym ?? SlowResolve();
+
+        private Symbol SlowResolve()
+        {
+            var s = Sym(_name);
+            if (_symCache.TryGetValue(_name, out var cached) && ReferenceEquals(cached, s))
+                _sym = s;
+            return s;
+        }
     }
 
     /// <summary>
@@ -1767,6 +1812,22 @@ public static class Startup
             Emitter.CilAssembler.RegisterFunction("DOTCL::%FASL-CACHE-ENTRIES", fcEntriesFn);
         }
         {
+            // Where the multi-core JIT profile is written, and how its name is
+            // built. Internal: writing it is the startup path's business, and
+            // these exist so the regression suite can check that the profile
+            // stays out of the install directory and that two executables
+            // never end up sharing one.
+            var jpPathFn = new LispFunction(JitProfile.JitProfilePath, "DOTCL::%JIT-PROFILE-PATH", 0);
+            RegisterDotclInternal("%JIT-PROFILE-PATH", jpPathFn);
+            Emitter.CilAssembler.RegisterFunction("DOTCL::%JIT-PROFILE-PATH", jpPathFn);
+            var jpNameFn = new LispFunction(JitProfile.JitProfileNameFor, "DOTCL::%JIT-PROFILE-NAME-FOR", 2);
+            RegisterDotclInternal("%JIT-PROFILE-NAME-FOR", jpNameFn);
+            Emitter.CilAssembler.RegisterFunction("DOTCL::%JIT-PROFILE-NAME-FOR", jpNameFn);
+            var jpEntriesFn = new LispFunction(JitProfile.JitProfileEntries, "DOTCL::%JIT-PROFILE-ENTRIES", -1);
+            RegisterDotclInternal("%JIT-PROFILE-ENTRIES", jpEntriesFn);
+            Emitter.CilAssembler.RegisterFunction("DOTCL::%JIT-PROFILE-ENTRIES", jpEntriesFn);
+        }
+        {
             // Name omitted on purpose: a named fn would push its own frame onto
             // the call stack and appear in its own backtrace output.
             var btFn = new LispFunction(Runtime.Backtrace);
@@ -1805,6 +1866,10 @@ public static class Startup
             var rdsFn = new LispFunction(Runtime.RecordDefinitionSourcesForm, "DOTCL:RECORD-DEFINITION-SOURCES", -1);
             RegisterDotcl("RECORD-DEFINITION-SOURCES", rdsFn);
             Emitter.CilAssembler.RegisterFunction("DOTCL:RECORD-DEFINITION-SOURCES", rdsFn);
+            // The text the debugger's :source and :frame print about a frame's
+            // source, for the tests (the debugger itself needs a terminal).
+            RegisterDotclInternal("%DEBUGGER-SOURCE-LINES",
+                new LispFunction(Debugger.SourceLinesForLisp, "DOTCL::%DEBUGGER-SOURCE-LINES", -1));
         }
         {
             // Weak pointers: real GC weakness via System.WeakReference.
@@ -1885,13 +1950,36 @@ public static class Startup
     /// (unless --script). Single source of truth shared by Program's startup
     /// loader and the DOTCL:USER-INIT-FILE function, so tools that write to the
     /// init file (e.g. quicklisp's add-to-init-file) target the real location.
-    /// Resolves to %APPDATA%\dotcl\init.lisp on Windows and
+    /// Resolves to %APPDATA%\dotcl\init.lisp on Windows and to
     /// $XDG_CONFIG_HOME/dotcl/init.lisp (default ~/.config/dotcl/init.lisp) on
-    /// Unix: .NET maps SpecialFolder.ApplicationData to those per platform.</summary>
+    /// Linux and macOS alike. The Unix side is computed here rather than taken
+    /// from SpecialFolder.ApplicationData, which .NET maps to
+    /// ~/Library/Application Support on macOS.</summary>
     public static string UserInitFilePath()
     {
-        var configDir = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
-        return System.IO.Path.Combine(configDir, "dotcl", "init.lisp");
+        if (Compat.IsWindows())
+        {
+            var appData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+            return System.IO.Path.Combine(appData, "dotcl", "init.lisp");
+        }
+        var home = Environment.GetEnvironmentVariable("HOME");
+        if (string.IsNullOrEmpty(home))
+            home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        var xdg = Environment.GetEnvironmentVariable("XDG_CONFIG_HOME");
+        // A relative XDG_CONFIG_HOME is invalid by the spec and ignored, as uiop does.
+        var configHome = !string.IsNullOrEmpty(xdg) && System.IO.Path.IsPathRooted(xdg)
+            ? xdg
+            : System.IO.Path.Combine(home, ".config");
+        var path = System.IO.Path.Combine(configHome, "dotcl", "init.lisp");
+        if (Compat.IsMacOS() && !System.IO.File.Exists(path))
+        {
+            // Earlier builds used the .NET mapping above on macOS. An init file
+            // left there keeps working until one is created at the XDG path.
+            var legacy = System.IO.Path.Combine(home, "Library", "Application Support",
+                                                "dotcl", "init.lisp");
+            if (System.IO.File.Exists(legacy)) return legacy;
+        }
+        return path;
     }
 
     private static void RegisterDotclFunctions()
@@ -2507,13 +2595,13 @@ public static class Startup
                 argStrings.Add(c.Car is LispString ls2 ? ls2.Value : c.Car.ToString());
                 cur = c.Cdr;
             }
-            var psi = new System.Diagnostics.ProcessStartInfo(exe) {
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                UseShellExecute = false,
-                CreateNoWindow = true,
-            };
-            foreach (var a in argStrings) Compat.AddArg(psi, a);
+            // Built outside the try: an argument that cannot be passed safely to a
+            // Windows batch file signals an error rather than a failed exit.
+            var psi = LispProcess.MakeStartInfo(exe, argStrings);
+            psi.RedirectStandardOutput = true;
+            psi.RedirectStandardError = true;
+            psi.UseShellExecute = false;
+            psi.CreateNoWindow = true;
             try {
                 using var proc = System.Diagnostics.Process.Start(psi)!;
                 // Read stdout and stderr concurrently to avoid pipe buffer deadlock
@@ -2674,6 +2762,14 @@ public static class Startup
             new LispFunction(Runtime.InterruptThread, "INTERRUPT-THREAD", 2));
         RegisterDotcl("KNOWN-TYPE-NAME-P",
             new LispFunction(Runtime.KnownTypeNameP, "KNOWN-TYPE-NAME-P", 1));
+        // DEFTYPE expansion, the MACROEXPAND-1 / MACROEXPAND of type specifiers:
+        // (values expansion expandedp). Portability layers such as
+        // introspect-environment look for these in the implementation's
+        // extension package (SB-EXT on SBCL, EXT on Clasp).
+        RegisterDotcl("TYPEXPAND-1",
+            new LispFunction(Runtime.TypexpandOne, "TYPEXPAND-1", -1));
+        RegisterDotcl("TYPEXPAND",
+            new LispFunction(Runtime.Typexpand, "TYPEXPAND", -1));
         // Two predicates the compiler asks about a symbol's proclamations. They
         // live in DOTCL beside KNOWN-TYPE-NAME-P because the compiler reaches
         // them the same way: a load-time FIND-SYMBOL probe, so the source also
@@ -2798,6 +2894,82 @@ public static class Startup
             ReadlineHook = args[0] is Nil ? null : args[0] as LispFunction;
             return args[0];
         }, "DOTCL:%SET-REPL-READLINE-HOOK", 1));
+
+        // Debugger read hook: set by (dotcl-repl:enable)
+        RegisterDotclInternal("%SET-DEBUGGER-READ-HOOK", new LispFunction(args =>
+        {
+            if (args.Length != 1)
+                throw new LispErrorException(new LispProgramError(
+                    "DOTCL:%SET-DEBUGGER-READ-HOOK: requires 1 argument"));
+            DebuggerReadHook = args[0] is Nil ? null : args[0] as LispFunction;
+            return args[0];
+        }, "DOTCL:%SET-DEBUGGER-READ-HOOK", 1));
+
+        // REPL colour, for the line editor's own prompts and messages and for
+        // the tests. (%REPL-PAINT role text &optional target): ROLE a keyword
+        // (:prompt :debugger :shell :result :warning :error :selected
+        // :location :match :string :comment :keyword), TARGET :output
+        // (the default) or :error to paint as that stream is painted, a stream
+        // to paint as it is painted (never, unless it is the process's own
+        // standard output or error), or T / NIL to paint or not regardless.
+        RegisterDotclInternal("%REPL-PAINT", new LispFunction(args =>
+        {
+            if (args.Length < 2 || args.Length > 3)
+                throw new LispErrorException(new LispProgramError(
+                    "DOTCL:%REPL-PAINT: requires (role text &optional target)"));
+            var role = args[0] is Symbol rs ? rs.Name : Runtime.AsStringDesignator(args[0], "%REPL-PAINT");
+            var text = Runtime.AsStringDesignator(args[1], "%REPL-PAINT");
+            var target = args.Length > 2 ? args[2] : null;
+            role = role.ToUpperInvariant();
+            // A stream is painted only when it is the process's own standard
+            // output or standard error, so text going to a string or a file
+            // stays plain.
+            bool enabled;
+            if (target == null) enabled = ReplColor.Out;
+            else if (target is Nil) enabled = false;
+            else if (target is T) enabled = true;
+            else if (target is Symbol ts)
+                enabled = ts.Name == "ERROR" ? ReplColor.Err : ReplColor.Out;
+            else
+                return new LispString(ReplColor.ForStream(role, text, target));
+            return new LispString(ReplColor.Paint(role, text, enabled));
+        }, "DOTCL:%REPL-PAINT", -1));
+
+        // (%REPL-COLOR-DECISION mode no-color term terminal-p): the decision
+        // --color makes for one stream, as a pure function. MODE is "auto",
+        // "always" or "never"; NO-COLOR and TERM are the variables' values or
+        // NIL when unset.
+        RegisterDotclInternal("%REPL-COLOR-DECISION", new LispFunction(args =>
+        {
+            if (args.Length != 4)
+                throw new LispErrorException(new LispProgramError(
+                    "DOTCL:%REPL-COLOR-DECISION: requires (mode no-color term terminal-p)"));
+            var modeText = Runtime.AsStringDesignator(args[0], "%REPL-COLOR-DECISION");
+            var mode = ReplColor.ParseMode(modeText.ToLowerInvariant())
+                ?? throw new LispErrorException(new LispError(
+                    $"%REPL-COLOR-DECISION: not a colour mode: {modeText}"));
+            string? noColor = args[1] is Nil ? null : Runtime.AsStringDesignator(args[1], "%REPL-COLOR-DECISION");
+            string? term = args[2] is Nil ? null : Runtime.AsStringDesignator(args[2], "%REPL-COLOR-DECISION");
+            return ReplColor.Decide(mode, noColor, term, args[3] is not Nil) ? T.Instance : Nil.Instance;
+        }, "DOTCL:%REPL-COLOR-DECISION", 4));
+
+        // (%REPL-LINE-EDITING-DECISION pref term input-terminal-p output-terminal-p):
+        // whether the REPL reads through the line editor, as a pure function.
+        // PREF is :AUTO, T (--readline) or NIL (--no-readline); TERM is the
+        // variable's value or NIL when unset. The editor's menus ask it with
+        // :AUTO, so they are off wherever the editor would be.
+        RegisterDotclInternal("%REPL-LINE-EDITING-DECISION", new LispFunction(args =>
+        {
+            if (args.Length != 4)
+                throw new LispErrorException(new LispProgramError(
+                    "DOTCL:%REPL-LINE-EDITING-DECISION: requires (pref term input-terminal-p output-terminal-p)"));
+            bool? pref = args[0] is Nil ? false
+                : args[0] is Symbol ps && ps.Name == "AUTO" ? null
+                : true;
+            string? term = args[1] is Nil ? null : Runtime.AsStringDesignator(args[1], "%REPL-LINE-EDITING-DECISION");
+            return ReplTerminal.LineEditing(pref, term, args[2] is not Nil, args[3] is not Nil)
+                ? T.Instance : Nil.Instance;
+        }, "DOTCL:%REPL-LINE-EDITING-DECISION", 4));
 
         // HTTP(S) GET to a file. Transport only: the caller resolves any
         // credentials and passes them as headers, so nothing here knows about a

@@ -122,10 +122,12 @@
   (list (%dst-do 100) (%dst-dotimes 100))
   (4950 4950))
 
-;; Past the Fixnum cache in both the counter and the accumulator.
+;; Past the Fixnum cache (-128..65535) in both the counter and the accumulator.
+;; That is all the size is for: 70000 is past it, and a larger count only makes
+;; the emit-free build, where this loop is interpreted, slower.
 (deftest do-step-temp-types.value-large
-  (list (%dst-do 1000000) (%dst-dotimes 1000000))
-  (127493856 127493856))
+  (list (%dst-do 70000) (%dst-dotimes 70000))
+  (8916936 8916936))
 
 (deftest do-step-temp-types.value-zero-trips
   (list (%dst-do 0) (%dst-do-star 0) (%dst-do-undeclared 0))
@@ -134,8 +136,8 @@
 ;; DO* is sequential, so S sees the already-stepped I. Unchanged by this fix,
 ;; and different from DO on purpose.
 (deftest do-step-temp-types.do-star-is-sequential
-  (list (%dst-do 1000000) (%dst-do-star 1000000))
-  (127493856 127493920))
+  (list (%dst-do 70000) (%dst-do-star 70000))
+  (8916936 8917048))
 
 (deftest do-step-temp-types.undeclared-value
   (%dst-do-undeclared 1000)

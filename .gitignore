@@ -13,6 +13,8 @@ bench/il-parity/tool/bin/
 bench/il-parity/tool/obj/
 bench/csharp-parity/bin/
 bench/csharp-parity/obj/
+bench/ablation/bin/
+bench/ablation/obj/
 output/
 
 ## Generated
@@ -53,8 +55,12 @@ bench-state.json
 !bench/make-state.sh
 !bench/check-ratios.sh
 !bench/il-parity/check-counts.sh
+!bench/sil-shapes/count-sil.sh
 !bench/csharp-parity/make-parity-state.sh
+!bench/process-modes.sh
+!bench/test-modes.sh
 !bench/library-status/run-quickload.sh
+!bench/library-status/run-tests.sh
 !samples/**/*.sh
 !test/*/check.sh
 

@@ -41,3 +41,24 @@
     (list (file-position s 3)           ; past end -> NIL
           (read-char s)))               ; stream unmoved -> #\h
   (nil #\h))
+
+;; READ after FILE-POSITION moves a string stream back must read from the new
+;; position, even when an earlier READ on the same stream left a reader behind
+;; and the stream was then read to its end.
+(deftest string-stream-read-after-file-position-back
+  (with-input-from-string (s "(a)42")
+    (let ((first (read s)))
+      (read-line s nil nil)             ; consume "42" up to end of input
+      (file-position s 3)
+      (list first (read s nil :eof) (file-position s))))
+  ((a) 42 5))
+
+(deftest string-stream-read-preserving-whitespace-after-reposition
+  (with-input-from-string (s "(+ 1 2)42")
+    (read-line s nil nil)
+    (file-position s 0)
+    (let ((form (read-preserving-whitespace s nil :eof nil)))
+      (read-line s nil nil)
+      (file-position s 7)
+      (list form (read-preserving-whitespace s nil :eof nil))))
+  ((+ 1 2) 42))

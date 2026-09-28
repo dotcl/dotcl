@@ -58,6 +58,10 @@
 
 ;;; --- the value count must not leak out of a call ---------------------------
 
+;;; DOTNET:DEFINE-CLASS lives in contrib. Load it here rather than rely on an
+;;; earlier file having required it: that file does not run in every mode.
+(require :dotnet-class)
+
 ;;; A constructor body is Lisp and may end in a void setter. The instance is one
 ;;; value regardless, and so is anything computed from it: with the zero left
 ;;; standing, (dotnet:invoke (dotnet:new C) "get_N") returned no values at all.

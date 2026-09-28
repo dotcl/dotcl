@@ -430,12 +430,27 @@ public static partial class Runtime
         // right value with the wrong type, and no error anywhere.
         var rdffSym = Startup.Sym("*READ-DEFAULT-FLOAT-FORMAT*");
         DynamicBindings.Push(rdffSym, Startup.Sym("SINGLE-FLOAT"));
+        // A literal is reconstructed the first time the code that holds it runs,
+        // so the reader variables are whatever that caller has bound. Under
+        // *READ-SUPPRESS* T the read returns NIL, which the site then keeps for
+        // good (a reader macro function whose first call came from inside #+(or)
+        // saw NIL for its literal from then on); under another *READ-BASE* the
+        // digits of every integer change value. Pin both to the standard values
+        // the representation was printed for.
+        var rsSym = Startup.Sym("*READ-SUPPRESS*");
+        DynamicBindings.Push(rsSym, Nil.Instance);
+        var rbSym = Startup.Sym("*READ-BASE*");
+        DynamicBindings.Push(rbSym, Fixnum.Make(10));
         try
         {
             if (reader.TryRead(out var result))
                 return result;
         }
-        finally { DynamicBindings.Pop(rdffSym); DynamicBindings.Pop(rtSym); }
+        finally
+        {
+            DynamicBindings.Pop(rbSym); DynamicBindings.Pop(rsSym);
+            DynamicBindings.Pop(rdffSym); DynamicBindings.Pop(rtSym);
+        }
         throw new LispErrorException(new LispProgramError(
             "fasl: empty representation while reconstructing a constant literal"));
     }
@@ -657,9 +672,13 @@ public static partial class Runtime
         // prepended newest-first; iterating head->tail and prepending to the
         // result reverses to chronological order of the PROVIDE calls.
         LispObject added = Nil.Instance;
+        var compiling = s_compileFileRequired.Count > 0 ? s_compileFileRequired.Peek() : null;
         for (LispObject c = DynamicBindings.Get(modulesSym); c is Cons cc; c = cc.Cdr)
             if (cc.Car is LispString s && !before.Contains(s.Value))
+            {
                 added = new Cons(new LispString(s.Value), added);
+                compiling?.Add(s.Value);
+            }
         return added;
 
         }
@@ -792,8 +811,9 @@ public static partial class Runtime
     /// native separators, so user code feeding `Path.Combine`-style results
     /// straight into asdf:load-asd / asdf:load-system would otherwise hit
     /// "Expected an absolute pathname" because the UNIX parser sees `\` as
-    /// a filename character. Runtime patch (no asdf source change), so the
-    /// behavior stays scoped to dotcl-on-Windows.
+    /// a filename character. Also wraps uiop:native-namestring so that it
+    /// returns `\`-separated paths. Runtime patch (no asdf source change), so
+    /// the behavior stays scoped to dotcl-on-Windows.
     /// </summary>
     private static void PatchUiopWindowsPath()
     {
@@ -824,6 +844,28 @@ public static partial class Runtime
         {
             var read = MultipleValues.Primary(
                 Runtime.ReadFromString(new LispObject[] { new LispString(patch) }));
+            Runtime.Eval(read);
+        }
+        catch { /* ignore if uiop symbols missing */ }
+
+        // uiop:native-namestring falls back to NAMESTRING on implementations it
+        // has no native hook for, and dotcl's namestring uses `/` on every OS.
+        // A "native" namestring is what gets handed to the operating system, and
+        // cmd builtins (dir, del, copy) and many Windows tools read `/` as an
+        // option switch. Return the Windows spelling instead, as SBCL does:
+        // `C:\dir\file.txt`, `\\server\share\...` for UNC. dotcl's
+        // parse-namestring (which uiop:parse-native-namestring falls back to)
+        // already accepts `\`, so the result round-trips.
+        const string nativePatch = @"
+(let ((orig (fdefinition 'uiop:native-namestring)))
+  (setf (fdefinition 'uiop:native-namestring)
+        (lambda (x)
+          (let ((s (funcall orig x)))
+            (if (stringp s) (substitute #\\ #\/ s) s)))))";
+        try
+        {
+            var read = MultipleValues.Primary(
+                Runtime.ReadFromString(new LispObject[] { new LispString(nativePatch) }));
             Runtime.Eval(read);
         }
         catch { /* ignore if uiop symbols missing */ }
@@ -1943,6 +1985,21 @@ public static partial class Runtime
     private static Stack<(HashSet<Symbol> Fn, HashSet<Symbol> Setf)> s_compileFilePreSets
         => s_compileFilePreSetsTS ??= new();
 
+    // Per active COMPILE-FILE (innermost last): the module names a REQUIRE
+    // added to *MODULES* while that compile was running. The post-compile
+    // cleanup clears the ASDF registration of exactly these. Diffing *MODULES*
+    // instead would also catch a module the file itself PROVIDEs at compile
+    // time -- which is the name of the ASDF system being built when the file
+    // ends in (provide :system-name), so its registration vanished mid-build.
+    [ThreadStatic]
+    private static Stack<HashSet<string>>? s_compileFileRequiredTS;
+    private static Stack<HashSet<string>> s_compileFileRequired
+        => s_compileFileRequiredTS ??= new();
+
+    /// <summary>True while COMPILE-FILE is running on this thread, so any code
+    /// executing now is being evaluated at compile time.</summary>
+    internal static bool CompileFileInProgress => s_compileFilePreSetsTS is { Count: > 0 };
+
     private static void SnapshotFboundSymbols(HashSet<Symbol> fn, HashSet<Symbol> setf)
     {
         foreach (var pkg in Package.AllPackages.ToList())
@@ -1950,6 +2007,42 @@ public static partial class Runtime
             {
                 if (s.Function != null) fn.Add(s);
                 if (s.SetfFunction != null) setf.Add(s);
+            }
+    }
+
+    // The (function, setf function) of every symbol the post-COMPILE-FILE strip
+    // would currently remove, i.e. fbound now but not before COMPILE-FILE began.
+    private static Dictionary<Symbol, (LispObject? Fn, LispObject? Setf)> SnapshotStrippableDefinitions(
+        HashSet<Symbol> preFn, HashSet<Symbol> preSetf)
+    {
+        var d = new Dictionary<Symbol, (LispObject? Fn, LispObject? Setf)>();
+        foreach (var pkg in Package.AllPackages.ToList())
+            foreach (var s in pkg.ExternalSymbols.Concat(pkg.InternalSymbols).ToList())
+            {
+                var f = s.Function;
+                var sf = s.SetfFunction;
+                bool fs = f != null && !preFn.Contains(s);
+                bool ss = sf != null && !preSetf.Contains(s);
+                if (fs || ss) d[s] = (fs ? f : null, ss ? sf : null);
+            }
+        return d;
+    }
+
+    // Exempt from the strip every definition that is new or different since
+    // BEFORE was taken.
+    private static void KeepDefinitionsMadeSince(
+        Dictionary<Symbol, (LispObject? Fn, LispObject? Setf)> before,
+        HashSet<Symbol> preFn, HashSet<Symbol> preSetf)
+    {
+        foreach (var pkg in Package.AllPackages.ToList())
+            foreach (var s in pkg.ExternalSymbols.Concat(pkg.InternalSymbols).ToList())
+            {
+                var f = s.Function;
+                var sf = s.SetfFunction;
+                if (f == null && sf == null) continue;
+                before.TryGetValue(s, out var b);
+                if (f != null && !preFn.Contains(s) && !ReferenceEquals(b.Fn, f)) preFn.Add(s);
+                if (sf != null && !preSetf.Contains(s) && !ReferenceEquals(b.Setf, sf)) preSetf.Add(s);
             }
     }
 
@@ -1976,6 +2069,33 @@ public static partial class Runtime
                new Cons(new LispString(loc.File),
                new Cons(Startup.Keyword("LINE"),
                new Cons(Fixnum.Make(loc.Line), Nil.Instance))));
+    }
+
+    /// <summary>
+    /// The recorded definitions a debugger frame named NAME may belong to. A
+    /// frame keeps only the function's name as a string, without its package,
+    /// so this matches on the symbol name and keeps the fbound ones. When
+    /// several packages define a function of that name, the one accessible in
+    /// the current package comes first and alone if it is among them; the rest
+    /// are returned for the caller to list. Empty when nothing was recorded.
+    /// </summary>
+    internal static List<(Symbol Sym, string File, int Line)> DefinitionSourcesForFrame(string name)
+    {
+        var found = new List<(Symbol, string, int)>();
+        foreach (var kv in s_defSources)
+            if (kv.Key.Name == name && kv.Key.IsFBound)
+                found.Add((kv.Key, kv.Value.File, kv.Value.Line));
+        if (found.Count > 1
+            && DynamicBindings.Get(Startup.Sym("*PACKAGE*")) is Package pkg
+            && pkg.FindSymbol(name).symbol is Symbol visible)
+        {
+            foreach (var f in found)
+                if (ReferenceEquals(f.Item1, visible))
+                    return new List<(Symbol, string, int)> { f };
+        }
+        found.Sort((a, b) => string.CompareOrdinal(
+            a.Item1.HomePackage?.Name ?? "", b.Item1.HomePackage?.Name ?? ""));
+        return found;
     }
 
     /// <summary>
@@ -2104,7 +2224,16 @@ public static partial class Runtime
         or "DECLAIM" or "PROCLAIM" or "USE-PACKAGE" or "SHADOW"
         or "SHADOWING-IMPORT" or "EXPORT" or "IMPORT" or "REQUIRE" or "PROVIDE"
         or "DEFTYPE"  // CLHS: deftype has compile-time effects (type name available during compilation)
-        or "DEFCLASS" or "DEFINE-CONDITION"  // CLHS: defclass has compile-time effects (class name available for find-class during compilation)
+        // DEFCLASS is not here. CLHS 7.7 (DEFCLASS) asks the compiler only to
+        // recognize the name as a type and class name for later declarations,
+        // specializers and :METACLASS options; it does not ask for the class
+        // to exist. Running the whole form at compile time created the class
+        // (and its metaclass's INITIALIZE-INSTANCE ran) during COMPILE-FILE,
+        // so the LOAD that follows reinitialized it instead of creating it.
+        // dotcl resolves class names at load time, so leaving the form to be
+        // macroexpanded and emitted like any other is enough. SBCL does not
+        // create the class at compile time either.
+        or "DEFINE-CONDITION"  // CLHS: define-condition has compile-time effects (class name available for find-class during compilation)
         // CLHS 3.2.3.1: DEFCONSTANT's name must be recognized as a constant
         // variable while the rest of the file is compiled, and every
         // implementation makes the VALUE readable there too -- which is what a
@@ -2284,6 +2413,16 @@ public static partial class Runtime
             var thenForm = new Cons(PROGN, body);
             return new Cons(IF, new Cons(test, new Cons(thenForm, new Cons(restClauses, Nil.Instance))));
         }, "COND-MACRO-EXPANDER", 2));
+
+        // LAMBDA: (lambda . rest) -> (function (lambda . rest)), as CLHS specifies.
+        // The compiler handles LAMBDA forms directly, but MACROEXPAND-1 used to
+        // return the form unchanged, so code walkers (iterate, for one) saw a
+        // macro that "won't expand" and skipped its body.
+        Runtime.RegisterMacroFunction(Startup.Sym("LAMBDA"), new LispFunction(args => {
+            Runtime.CheckArityExact("LAMBDA-MACRO-EXPANDER", args, 2);
+            if (args[0] is not Cons) return args[0];
+            return new Cons(Startup.Sym("FUNCTION"), new Cons(args[0], Nil.Instance));
+        }, "LAMBDA-MACRO-EXPANDER", 2));
 
         // handler-bind / handler-case / restart-bind / restart-case are implemented as
         // compile-form handlers (the compiler dispatches them directly, before macro
@@ -2549,6 +2688,34 @@ public static partial class Runtime
                 Runtime.List(Runtime.List(avar, Nil.Instance)), tagbody);
             return Runtime.List(BLOCK, blk, letc);
         }, "RESTART-CASE-MACRO-EXPANDER", 2));
+
+        // MULTIPLE-VALUE-BIND, as MACROEXPAND-1 shows it:
+        //   (multiple-value-call #'(lambda (&optional v1 ... &rest #:ignore)
+        //                            (declare (ignore #:ignore)) . body)
+        //                        values-form)
+        // Every value travels through the special form, so a code walker that
+        // rewrites the expansion (cl-cont's CPS transform) keeps them all. The
+        // compiler's own expansion, in *MACROS*, is not consulted here: it binds
+        // from a per-thread snapshot of the last values, which is only sound when
+        // nothing runs between producing and reading them. The compiler lowers
+        // this shape to that same binding (%MV-CALL-LAMBDA-BIND).
+        Runtime.RegisterMacroFunction(Startup.Sym("MULTIPLE-VALUE-BIND"), new LispFunction(args => {
+            Runtime.CheckArityExact("MULTIPLE-VALUE-BIND-MACRO-EXPANDER", args, 2);
+            if (args[0] is not Cons form || form.Cdr is not Cons r1 || r1.Cdr is not Cons r2)
+                throw new LispErrorException(new LispProgramError(
+                    "MULTIPLE-VALUE-BIND: expected (multiple-value-bind (var*) values-form declaration* form*)"));
+            var vars = new System.Collections.Generic.List<LispObject> { Startup.Sym("&OPTIONAL") };
+            for (var v = r1.Car; v is Cons vc; v = vc.Cdr)
+                vars.Add(vc.Car);
+            var ignore = new Symbol("IGNORE");
+            vars.Add(Startup.Sym("&REST"));
+            vars.Add(ignore);
+            var decl = Runtime.List(Startup.Sym("DECLARE"), Runtime.List(Startup.Sym("IGNORE"), ignore));
+            var lambda = new Cons(Startup.Sym("LAMBDA"),
+                new Cons(Runtime.List(vars.ToArray()), new Cons(decl, r2.Cdr)));
+            return Runtime.List(Startup.Sym("MULTIPLE-VALUE-CALL"),
+                Runtime.List(Startup.Sym("FUNCTION"), lambda), r2.Car);
+        }, "MULTIPLE-VALUE-BIND-MACRO-EXPANDER", 2));
     }
 
     /// CLHS RESTART-CASE: when the protected form is a call to SIGNAL, ERROR,
@@ -2853,6 +3020,8 @@ public static partial class Runtime
         // systems independently, so the later fasl-load's (require ...) is a
         // no-op and the stripped functions would stay undefined.)
         s_compileFilePreSets.Push((preFn, preSetf));
+        s_compileFileRequired.Push(new HashSet<string>());
+        Runtime.PushCompileTimeClasses();
 
         // FASL module name must be computed before the module-ID binding (declared below).
         // :module-name pins it to a stable string (build-time-link / AOT); otherwise
@@ -2976,12 +3145,22 @@ public static partial class Runtime
                             out bool hasCT, out bool hasLT))
                         {
                             var prognForm = MakeProgn(ewBody);
+                            // What an explicit :COMPILE-TOPLEVEL evaluation defines is
+                            // a real definition (SBCL keeps it after COMPILE-FILE), not
+                            // the early evaluation of a plain DEFUN that the strip in
+                            // the finally below exists to undo. Note what is strippable
+                            // before compiling the body (compiling it may already
+                            // evaluate DEFUNs early) and keep whatever changed.
+                            var ctBefore = hasCT ? SnapshotStrippableDefinitions(preFn, preSetf) : null;
                             var bodyInstrList = DotCL.Diagnostics.PhaseTimer.Time(
                                 "compile", () => CompileTopLevel(prognForm));
 
                             if (hasCT)
+                            {
                                 DotCL.Diagnostics.PhaseTimer.Time("eval-ct",
                                     () => DotCL.Emitter.CilAssembler.AssembleAndRun(bodyInstrList));
+                                KeepDefinitionsMadeSince(ctBefore!, preFn, preSetf);
+                            }
 
                             if (hasLT)
                             {
@@ -3054,6 +3233,8 @@ public static partial class Runtime
         finally
         {
             s_compileFilePreSets.Pop();
+            var requiredHere = s_compileFileRequired.Pop();
+            Runtime.PopCompileTimeClasses();
             // Strip newly-defined Function / SetfFunction values that escaped
             // from compile-time defun/defmethod try-eval. Anything that was already
             // fbound before compile-file is left untouched: only WE clean up
@@ -3081,8 +3262,9 @@ public static partial class Runtime
                 }
             }
 
-            // For each module added to *modules* during compile (via a compile-time
-            // require that went through asdf:module-provide-asdf), clear the ASDF
+            // For each module a compile-time REQUIRE added to *modules* (one that
+            // went through asdf:module-provide-asdf; a module the file only PROVIDEs
+            // is left alone, see s_compileFileRequired), clear the ASDF
             // registry entry so a load-time re-require actually re-loads. module-provide-asdf
             // registers the system in *registered-systems* and sets the load-op stamp
             // (component-loaded-p -> T); without clear-system, the load-time require's
@@ -3101,7 +3283,8 @@ public static partial class Runtime
                 for (LispObject c = oldModules; c is Cons cc; c = cc.Cdr)
                     if (cc.Car is LispString s) beforeSet.Add(s.Value);
                 for (LispObject c = DynamicBindings.Get(modulesSym2); c is Cons cc; c = cc.Cdr)
-                    if (cc.Car is LispString s && !beforeSet.Contains(s.Value))
+                    if (cc.Car is LispString s && !beforeSet.Contains(s.Value)
+                        && requiredHere.Contains(s.Value))
                     {
                         try { clearSystem.Invoke(new LispObject[] { new LispString(s.Value.ToLowerInvariant()) }); }
                         catch { /* a module asdf does not own (plain provide/require); nothing to clear */ }
@@ -3143,9 +3326,10 @@ public static partial class Runtime
     ///   after the :system closure.
     /// </description></item>
     /// <item><term>:prelude</term><description>
-    ///   Pathname or list of pathnames, compiled <em>before</em> the :system closure.
-    ///   For what a bundled library needs to find already in place while it loads;
-    ///   typically ASDF answers about itself, which a bundle has no .asd files to give.
+    ///   Pathname or list of pathnames, compiled <em>before</em> the :system closure,
+    ///   and loaded into this image before the closure is collected. For what a
+    ///   bundled library needs to find already in place while it loads; typically
+    ///   ASDF answers about itself, which a bundle has no .asd files to give.
     ///   Its contents are the caller's to write: standing in for a system that is not
     ///   there is only safe where nothing will act on the answer.
     /// </description></item>
@@ -3177,7 +3361,7 @@ public static partial class Runtime
     /// the compiled sources are re-evaluated as part of the fasl's ModuleInit, so
     /// they are reconstructed naturally. Runtime-only state mutations are not captured.
     /// </summary>
-    [LispDoc("SAVE-APPLICATION")]
+    [LispDoc("DOTCL:SAVE-APPLICATION")]
     public static LispObject SaveApplication(LispObject[] args)
     {
 #if DOTCL_EMIT
@@ -3229,6 +3413,16 @@ public static partial class Runtime
             }
         }
 
+        // The prelude says what has to be in place before anything else, so the
+        // builder gets it first, not just the image being built. Collecting the
+        // closure runs the build steps of systems that generate their own
+        // sources (cl-unicode writes its character tables that way), and those
+        // steps need whatever the prelude provides as much as the closure does.
+        // Compiling it at the head of the source list is too late for them:
+        // collection happens before any source is compiled.
+        var preludeSources = NormalizeSourceList(preludeArg);
+        LoadLispFiles(preludeSources, "SAVE-APPLICATION :prelude source");
+
         // Collect ASDF system sources (transitive, topologically ordered) if :system given.
         // This requires ASDF to be loaded in the current session.
         var asdfsources = new List<string>();
@@ -3236,7 +3430,6 @@ public static partial class Runtime
         if (systemArg != null)
             asdfsources = CollectAsdfSystemSources(systemArg, out asdfSystems);
 
-        var preludeSources = NormalizeSourceList(preludeArg);
         var userSources = NormalizeSourceList(loadArg);
 
         // :prelude, then the ASDF closure (the deps), then :load.
@@ -3550,6 +3743,59 @@ public static partial class Runtime
     }
 #endif
 
+    /// <summary>
+    /// LOAD each of PATHS into this image, in order, resolved against the working
+    /// directory. Shared by the two build-time options that need it: the
+    /// build-init scripts, and a prelude, which has to be in place before the
+    /// closure is collected as well as being compiled into the image. WHAT names
+    /// the option in the not-found error, which is the caller's own spelling.
+    /// </summary>
+    internal static void LoadLispFiles(IEnumerable<string>? paths, string what)
+    {
+        if (paths == null) return;
+        foreach (var s in paths)
+        {
+            if (string.IsNullOrWhiteSpace(s)) continue;
+            var abs = Path.GetFullPath(s.Trim());
+            if (!File.Exists(abs))
+                throw new FileNotFoundException($"{what} not found: {abs}", abs);
+            var lisp = abs.Replace("\\", "/");
+            Eval(MultipleValues.Primary(
+                ReadFromString(new LispObject[] { new LispString($"(load \"{lisp}\")") })));
+        }
+    }
+
+    /// <summary>
+    /// Build one self-contained fasl from an ASDF system's whole closure, each
+    /// source compiled in turn in dependency order. This is what SAVE-APPLICATION
+    /// :SYSTEM does, and `dotcl pack` calls the same path so the two cannot drift.
+    /// PRESOURCES are compiled ahead of the closure: a caller-supplied prelude,
+    /// and any source generated for declarations that are not files and so are
+    /// not in the walk.
+    /// </summary>
+    internal static void BuildSystemFasl(
+        string systemName, string faslPath, string? toplevel, List<string> preSources)
+    {
+#if DOTCL_EMIT
+        var closure = CollectAsdfSystemSources(new LispString(systemName), out var systems);
+        // A fasl with none of the system's code in it still loads, and does
+        // nothing: refuse it here rather than ship it.
+        if (closure.Count == 0)
+            throw new LispErrorException(new LispError(
+                $"cannot build system {systemName}: its closure has no Lisp source files, "
+                + "so the fasl would contain none of its code"));
+        var sources = new List<string>(preSources.Count + closure.Count);
+        sources.AddRange(preSources);
+        sources.AddRange(closure);
+        LispObject? entry = string.IsNullOrEmpty(toplevel) ? null : new LispString(toplevel!);
+        BuildFaslFromSources(faslPath, sources, entry, systems);
+#else
+        throw new LispErrorException(new LispProgramError(
+            "Building a system fasl requires System.Reflection.Emit, "
+            + "which is unavailable in this runtime build"));
+#endif
+    }
+
     private static string? FindRuntimeCsproj()
     {
         var envPath = System.Environment.GetEnvironmentVariable("DOTCL_RUNTIME_CSPROJ");
@@ -3650,8 +3896,15 @@ public static partial class Runtime
         // (FEATURE WINDOWS winhttp) and (VERSION uiop "3.1.1") among others. A
         // :feature clause whose expression is false is not a dependency at all,
         // and :require names a module rather than a system.
+        //
+        // A dependency that cannot be found, or whose .asd fails to load, stops
+        // the build with the system named. Skipping it left a closure without
+        // that system's files -- and when the root's own dependencies were the
+        // ones missing, without the root's files too -- which compiled into an
+        // image that looked built and died at its first call.
         var exprStr = $@"(let ((seen (make-hash-table :test 'equal))
-                               (order '()))
+                               (order '())
+                               (problems '()))
                            (labels
                              ((dep-name (d)
                                 (cond ((stringp d) d)
@@ -3664,23 +3917,117 @@ public static partial class Runtime
                                                   (dep-name (third d))))
                                                (t nil))))
                                       (t nil)))
-                              (visit (name)
+                              (note-problem (key parent what)
+                                (push (if parent
+                                          (format nil ""~a: ~a (required by ~a)"" key what parent)
+                                          (format nil ""~a: ~a"" key what))
+                                      problems))
+                              (visit (name &optional parent)
                                 (let ((key (string-downcase name)))
                                   (unless (gethash key seen)
                                     (setf (gethash key seen) t)
-                                    (let ((sys (ignore-errors (asdf:find-system key))))
-                                      (when sys
-                                        (dolist (d (asdf:system-depends-on sys))
-                                          (let ((n (dep-name d))) (when n (visit n))))
-                                        (push sys order)))))))
-                             (visit ""{sysName}""))
+                                    (let* ((failed nil)
+                                           (sys (handler-case (asdf:find-system key nil)
+                                                  (error (c)
+                                                    (setf failed t)
+                                                    (note-problem
+                                                     key parent
+                                                     (format nil ""error loading its definition: ~a"" c))
+                                                    nil))))
+                                      (cond
+                                        (sys
+                                         (dolist (d (asdf:system-depends-on sys))
+                                           (let ((n (dep-name d))) (when n (visit n key))))
+                                         (push sys order))
+                                        ((not failed)
+                                         (note-problem key parent ""not found"")))))))
+                              ;; What a system asks ASDF to prepare beyond the
+                              ;; dependencies its .asd lists. cl-unicode ships
+                              ;; lists.lisp, hash-tables.lisp and methods.lisp as
+                              ;; generated files and adds (load-op cl-unicode/build)
+                              ;; here until they exist; a walk that never asks
+                              ;; reaches a source file that is not there.
+                              (generated-deps (sys)
+                                (let ((declared (remove nil (mapcar #'dep-name
+                                                                    (asdf:system-depends-on sys))))
+                                      (self (asdf:component-name sys))
+                                      (extra '()))
+                                  (dolist (entry
+                                            (or (ignore-errors
+                                                  (asdf:component-depends-on
+                                                    (asdf:make-operation 'asdf:prepare-op) sys))
+                                                '()))
+                                    (when (consp entry)
+                                      (dolist (d (rest entry))
+                                        (let ((n (dep-name d)))
+                                          (when (and n
+                                                     (not (string-equal n self))
+                                                     (not (member n declared :test #'string-equal)))
+                                            (push (cons (first entry) n) extra))))))
+                                  (nreverse extra)))
+                              ;; Only the extra entries are operated, never
+                              ;; prepare-op itself: prepare-op on a system also
+                              ;; load-ops everything it depends on, and this image
+                              ;; is about to compile those same sources. Running
+                              ;; their compile-time effects twice is how
+                              ;; cl-interpol's defreadtable ends in
+                              ;; reader-macro-conflict.
+                              ;;
+                              ;; A generator is upstream code run for its files,
+                              ;; and it can stop part way with the files that
+                              ;; matter already written, so a failure here is
+                              ;; reported rather than fatal. Whether the build has
+                              ;; what it needs is answered when each source is
+                              ;; compiled.
+                              (ensure-generated (sys)
+                                (dolist (e (generated-deps sys))
+                                  (handler-case
+                                      (handler-bind ((warning #'muffle-warning))
+                                        (asdf:operate (car e) (cdr e)))
+                                    (error (c)
+                                      (format *error-output*
+                                              ""~&; note: generating ~a for ~a stopped: ~a~%""
+                                              (cdr e) (asdf:component-name sys) c)
+                                      (let* ((outputs
+                                               (ignore-errors
+                                                 (asdf:output-files (car e) (cdr e))))
+                                             (missing (remove-if #'probe-file outputs)))
+                                        (cond
+                                          (missing
+                                           (format *error-output*
+                                                   "";        it had not written yet:~%"")
+                                           (dolist (m missing)
+                                             (format *error-output* "";          ~a~%"" m)))
+                                          ;; Stopped after its files were written
+                                          ;; (cl-unicode's generator can stop in its
+                                          ;; test-data step): say that the build has
+                                          ;; them, so the note does not read as the
+                                          ;; failure of this build.
+                                          (outputs
+                                           (format *error-output*
+                                                   "";        the files it generates are all present, so the build goes on~%"")))))))))
+                             (visit ""{sysName}"")
+                           (when problems
+                             (error ""~a""
+                                    (with-output-to-string (o)
+                                      (format o ""cannot build system ~a: ~
+                                                 systems in its closure could not be resolved:""
+                                              ""{sysName}"")
+                                      (dolist (p (reverse problems))
+                                        (format o ""~%  ~a"" p))
+                                      (format o ""~%Make them visible to ASDF ~
+                                                 (--asd-search-path, CL_SOURCE_REGISTRY).""))))
                            (let ((files '())
                                  (emitted (make-hash-table :test 'equal))
                                  (ordered (nreverse order)))
                              (dolist (sys ordered)
-                               (dolist (c (or (ignore-errors
-                                                (asdf:required-components sys :other-systems nil))
-                                              '()))
+                               (ensure-generated sys)
+                               (dolist (c (handler-case
+                                              (asdf:required-components sys :other-systems nil)
+                                            (error (e)
+                                              (error ""cannot build system ~a: ~
+                                                       listing the components of ~a failed: ~a""
+                                                     ""{sysName}"" (asdf:component-name sys) e))))
                                  (when (typep c 'asdf:cl-source-file)
                                    (let ((p (namestring (asdf:component-pathname c))))
                                      (unless (gethash p emitted)
@@ -3696,7 +4043,7 @@ public static partial class Runtime
                                                    (let ((v (ignore-errors
                                                               (asdf:component-version sys))))
                                                      (if (stringp v) v """"))))
-                                           ordered))))";
+                                           ordered)))))";
 
         LispObject result;
         try
@@ -3706,7 +4053,16 @@ public static partial class Runtime
                 throw new InvalidOperationException("failed to read ASDF query form");
             result = Runtime.Eval(form!);
         }
-        catch (Exception ex) when (ex is not LispErrorException)
+        // Only a genuine .NET failure is rewrapped. A Lisp error, and the
+        // exceptions that carry a non-local exit (a HANDLER-CASE, restart, THROW
+        // or RETURN-FROM around the build), pass through as they are: rewrapping
+        // one turned a caller's handler-case into this message.
+        catch (Exception ex) when (ex is not (LispErrorException
+                                               or HandlerCaseInvocationException
+                                               or RestartInvocationException
+                                               or CatchThrowException
+                                               or BlockReturnException
+                                               or GoException))
         {
             throw new LispErrorException(new LispProgramError(
                 $"SAVE-APPLICATION :system {sysName}: error querying ASDF: {ex.Message}. "
@@ -4057,8 +4413,19 @@ public static partial class Runtime
         bool releasedEvalLock = SerializeEval
                                 && System.Threading.Monitor.IsEntered(_evalLock);
         if (releasedEvalLock) System.Threading.Monitor.Exit(_evalLock);
+        // EVAL runs FORM in the null lexical environment, but the interpreter's
+        // SYMBOL-MACROLET carries its bindings in the special *SYMBOL-MACROS*.
+        // An EVAL reached from inside such a body must not see them, so the
+        // special is rebound to NIL for the call when it holds anything.
+        var smSym = Startup.Sym("*SYMBOL-MACROS*");
+        bool boundSm = DynamicBindings.TryGet(smSym, out var smVal) && smVal is not Nil;
+        if (boundSm) DynamicBindings.Push(smSym, Nil.Instance);
         try { return fn.Invoke(form, Nil.Instance); }
-        finally { if (releasedEvalLock) System.Threading.Monitor.Enter(_evalLock); }
+        finally
+        {
+            if (boundSm) DynamicBindings.Pop(smSym);
+            if (releasedEvalLock) System.Threading.Monitor.Enter(_evalLock);
+        }
     }
 
     /// <summary>
@@ -5485,6 +5852,11 @@ public static partial class Runtime
         // so it also carries a direct 1-arg delegate (Runtime.MacroFunction1).
         var macroFunctionFn = new LispFunction(args => {
             if (args.Length < 1 || args.Length > 2) throw new LispErrorException(new LispProgramError($"MACRO-FUNCTION: wrong number of arguments: {args.Length}"));
+            // A lexical binding in the environment decides first: a MACROLET's
+            // expander, or NIL under a local function of the same name.
+            if (args.Length == 2 && args[1] is Cons menv && menv.Car is Cons mops
+                && args[0] is Symbol msym && LexicalOperator(mops, msym) is Cons mb)
+                return mb.Cdr is LispFunction ? mb.Cdr : Nil.Instance;
             var result = Runtime.MacroFunction(args[0]);
             if (result != Nil.Instance) return result;
             var sym = Runtime.GetSymbol(args[0], "MACRO-FUNCTION");
@@ -5611,13 +5983,17 @@ public static partial class Runtime
                 if (!Compat.TryEnsureSufficientExecutionStack())
                     return form; // bail out: return unexpanded
                 // Extract macro table and symbol-macro table from env
-                // env can be: LispHashTable (macros only), Cons (macros-ht . symbol-macros-ht), or Nil
+                // env can be: LispHashTable (macros only), Cons (macros . symbol-macros-ht), or Nil.
+                // The macros part is a hash table keyed by name, or the alist of
+                // lexical operator bindings (see LexicalOperator).
                 LispHashTable? macroHt = null;
                 LispHashTable? symMacroHt = null;
+                Cons? lexOps = null;
                 if (env is LispHashTable ht) macroHt = ht;
                 else if (env is Cons envCons)
                 {
                     if (envCons.Car is LispHashTable mht) macroHt = mht;
+                    else if (envCons.Car is Cons ops) lexOps = ops;
                     if (envCons.Cdr is LispHashTable sht) symMacroHt = sht;
                 }
                 // Symbol-macro expansion: form is a symbol
@@ -5636,6 +6012,13 @@ public static partial class Runtime
                 // Macro expansion: form is a cons
                 if (form is Cons cons && cons.Car is Symbol sym)
                 {
+                    if (lexOps != null && LexicalOperator(lexOps, sym) is Cons binding)
+                    {
+                        // A local function hides every macro of its name.
+                        if (binding.Cdr is not LispFunction lfn)
+                            return form;
+                        return CallExpander(lfn, true, form, env);
+                    }
                     if (macroHt != null)
                     {
                         var key = new LispString(sym.Name);
@@ -5671,11 +6054,27 @@ public static partial class Runtime
                 return form;
         }
 
+        // The binding of SYM in the lexical operator alist of an environment
+        // (innermost first): (NAME . EXPANDER) for a MACROLET, (NAME) for an
+        // FLET / LABELS function that hides a macro of that name. Null when the
+        // alist does not bind SYM, so the global tables decide.
+        static Cons? LexicalOperator(Cons alist, Symbol sym)
+        {
+            for (LispObject o = alist; o is Cons c; o = c.Cdr)
+                if (c.Car is Cons e && ReferenceEquals(e.Car, sym))
+                    return e;
+            return null;
+        }
+
         // %CALL-WITH-HANDLER-CLUSTER: handler-bind primitive for the emit-free
         // tree-walk interpreter (%mini-eval). (alist thunk) -> establishes the
         // cluster, runs thunk under it. Mirrors compile-handler-bind.
         Emitter.CilAssembler.RegisterFunction("%CALL-WITH-HANDLER-CLUSTER",
             new LispFunction(Runtime.CallWithHandlerCluster, "%CALL-WITH-HANDLER-CLUSTER", 2));
+        // %CALL-WITH-HANDLER-CASE: the same for handler-case, which also takes an
+        // unsignalled LispErrorException by type, as compile-handler-case does.
+        Emitter.CilAssembler.RegisterFunction("%CALL-WITH-HANDLER-CASE",
+            new LispFunction(Runtime.CallWithHandlerCase, "%CALL-WITH-HANDLER-CASE", 2));
         Emitter.CilAssembler.RegisterFunction("%CALL-WITH-RESTART-CLUSTER",
             new LispFunction(Runtime.CallWithRestartCluster, "%CALL-WITH-RESTART-CLUSTER", 2));
         Emitter.CilAssembler.RegisterFunction("%CALL-WITH-RESTART-BIND",
@@ -5700,10 +6099,12 @@ public static partial class Runtime
                 // Extract macro table and symbol-macro table from env
                 LispHashTable? macroHt = null;
                 LispHashTable? symMacroHt = null;
+                Cons? lexOps = null;
                 if (env is LispHashTable ht) macroHt = ht;
                 else if (env is Cons envCons)
                 {
                     if (envCons.Car is LispHashTable mht) macroHt = mht;
+                    else if (envCons.Car is Cons ops) lexOps = ops;
                     if (envCons.Cdr is LispHashTable sht) symMacroHt = sht;
                 }
                 bool anyExpanded = false;
@@ -5736,7 +6137,15 @@ public static partial class Runtime
                     {
                         LispFunction? fn = null;
                         bool is2arg = false;
-                        if (macroHt != null)
+                        if (lexOps != null && LexicalOperator(lexOps, sym) is Cons binding)
+                        {
+                            // A local function hides every macro of its name.
+                            if (binding.Cdr is not LispFunction lfn)
+                                break;
+                            fn = lfn;
+                            is2arg = true;
+                        }
+                        if (fn == null && macroHt != null)
                         {
                             var key = new LispString(sym.Name);
                             if (macroHt.TryGet(key, out var expander) && expander is LispFunction f)
@@ -5786,26 +6195,52 @@ public static partial class Runtime
                 // test compilation relies on this side effect.
                 if (args.Length > 1 && args[1] is not Nil)
                 {
-                    var instrList = Runtime.CompileTopLevel(args[1]);
-                    var fn = Emitter.CilAssembler.AssembleAndRun(instrList);
+                    // Warnings-p / failure-p (CLHS COMPILE): a WARNING signaled while
+                    // compiling -- e.g. by a macro's expander -- makes warnings-p true,
+                    // and one that is not a STYLE-WARNING makes failure-p true too. The
+                    // handler only records it and declines, so the warning is still
+                    // reported as before.
+                    bool warningsP = false, failureP = false;
+                    var warningHandler = new LispFunction(hargs =>
+                    {
+                        warningsP = true;
+                        if (hargs[0] is LispCondition wc
+                            && !IsTruthy(Typep(wc, Startup.Sym("STYLE-WARNING"))))
+                            failureP = true;
+                        return Nil.Instance;
+                    });
+                    LispObject fn;
+                    HandlerClusterStack.PushCluster(new HandlerBinding[] {
+                        new HandlerBinding(Startup.Sym("WARNING"), warningHandler) });
+                    try
+                    {
+                        var instrList = Runtime.CompileTopLevel(args[1]);
+                        fn = Emitter.CilAssembler.AssembleAndRun(instrList);
+                    }
+                    finally
+                    {
+                        HandlerClusterStack.PopCluster();
+                    }
+                    LispObject wP = warningsP ? T.Instance : Nil.Instance;
+                    LispObject fP = failureP ? T.Instance : Nil.Instance;
                     if (args[0] is Nil)
-                        return MultipleValues.Values(fn, Nil.Instance, Nil.Instance);
+                        return MultipleValues.Values(fn, wP, fP);
                     if (fn is LispFunction lfn)
                     {
                         if (args[0] is Symbol nameSym)
                         {
                             Emitter.CilAssembler.RegisterFunctionOnSymbol(nameSym, lfn);
-                            return MultipleValues.Values(nameSym, Nil.Instance, Nil.Instance);
+                            return MultipleValues.Values(nameSym, wP, fP);
                         }
                         // (setf NAME) function-name
                         if (args[0] is Cons fc && fc.Car is Symbol setfSym && setfSym.Name == "SETF"
                             && fc.Cdr is Cons tc && tc.Car is Symbol target)
                         {
                             Emitter.CilAssembler.RegisterSetfFunctionOnSymbol(target, lfn);
-                            return MultipleValues.Values(args[0], Nil.Instance, Nil.Instance);
+                            return MultipleValues.Values(args[0], wP, fP);
                         }
                     }
-                    return MultipleValues.Values(args[0], Nil.Instance, Nil.Instance);
+                    return MultipleValues.Values(args[0], wP, fP);
                 }
                 // (compile name): NAME's existing definition is already compiled in dotcl;
                 // just return the designator.
@@ -5822,15 +6257,9 @@ public static partial class Runtime
         Emitter.CilAssembler.RegisterFunction("LOAD",
             new LispFunction(args => Runtime.Load(args)));
 
-        // Stubs: BREAK, Y-OR-N-P, YES-OR-NO-P
         // BREAK lives in Runtime.RegisterConditionsBuiltins, which runs later and
-        // owns it. The stub that used to sit here (args => NIL) was dead code:
-        // had the call order ever changed, BREAK would have quietly stopped
-        // entering the debugger.
-        Emitter.CilAssembler.RegisterFunction("Y-OR-N-P",
-            new LispFunction(args => T.Instance, "Y-OR-N-P", -1));
-        Emitter.CilAssembler.RegisterFunction("YES-OR-NO-P",
-            new LispFunction(args => T.Instance, "YES-OR-NO-P", -1));
+        // owns it. Y-OR-N-P and YES-OR-NO-P are defined in Lisp (cil-stdlib),
+        // where they read the answer from *QUERY-IO*.
 
         // INVALID-METHOD-ERROR, METHOD-COMBINATION-ERROR
         Emitter.CilAssembler.RegisterFunction("INVALID-METHOD-ERROR",
@@ -5974,6 +6403,16 @@ public static partial class Runtime
         // argument was already ignored by the wrapper).
         var cmfFn = new LispFunction(args => {
             if (args.Length < 1) return Nil.Instance;
+            // A local function or macro of the same name in the environment
+            // shadows the global compiler macro (CLHS 3.2.2.1): answer NIL, as
+            // MACRO-FUNCTION does for a name under a local function.
+            if (args.Length == 2 && args[1] is Cons cenv && cenv.Car is Cons cops
+                && args[0] is Symbol csym)
+            {
+                for (LispObject o = cops; o is Cons oc; o = oc.Cdr)
+                    if (oc.Car is Cons ce && ReferenceEquals(ce.Car, csym))
+                        return Nil.Instance;
+            }
             return CompilerMacroFunctionImpl(args[0]);
         }, "COMPILER-MACRO-FUNCTION", -1);
         cmfFn.SetDirectDelegate((Func<LispObject, LispObject>)CompilerMacroFunctionImpl);
@@ -6300,19 +6739,14 @@ public static partial class Runtime
         // %REGISTER-TYPE-EXPANDER
         Emitter.CilAssembler.RegisterFunction("%REGISTER-TYPE-EXPANDER",
             new LispFunction(args => {
-                // Package-aware key: a non-CL deftype (e.g. SBCL's host-side
-                // SB-XC:COMPLEX -> COMPLEXNUM) registers under "PKG::NAME" so it
-                // shadows a same-named built-in for its own symbol only, and
-                // never hijacks CL:COMPLEX for everyone.
+                // Keyed by the symbol (see Runtime.TypeExpanderKey): a deftype
+                // answers for its own symbol only. It must neither hijack a
+                // built-in (SB-XC:COMPLEX vs CL:COMPLEX) nor a same-named type
+                // in another package (UIOP::TIMESTAMP vs a user TIMESTAMP class).
                 if (args[0] is Symbol s)
                 {
                     Runtime.CheckTypeNameAvailable(s, "DEFTYPE");
                     Runtime.TypeExpanders[Runtime.TypeExpanderKey(s)] = args[1];
-                    // Plain-name alias for cross-package references: but never
-                    // for a built-in type name (that would hijack e.g. CL:COMPLEX
-                    // for every package; such deftypes work via their own symbol).
-                    if (!Runtime.IsBuiltinTypeName(s.Name))
-                        Runtime.TypeExpanders[s.Name] = args[1];
                     TypeParser.InvalidateCache(s.Name);
                 }
                 else

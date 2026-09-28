@@ -16,7 +16,7 @@
 
 (defun %ff-tmpdir (tag)
   (let ((dir (format nil "~a/dotcl-foreign-fasl-~a-~a/"
-                     (or (dotcl:getenv "TEMP") "/tmp") tag
+                     (regression-temp-dir) tag
                      (get-internal-real-time))))
     (ensure-directories-exist dir)
     dir))

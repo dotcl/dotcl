@@ -14,7 +14,7 @@
 ;;; Expected values are SBCL's.
 
 (defparameter *fpc-dir*
-  (substitute #\/ #\ (or (dotcl:getenv "TMPDIR") (dotcl:getenv "TEMP") "/tmp")))
+  (regression-temp-dir))
 (defun fpc-path (name) (concatenate 'string *fpc-dir* "/" name))
 
 (defparameter *fpc-ascii* (fpc-path "dotcl-fpc-ascii.txt"))

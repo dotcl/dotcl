@@ -629,7 +629,7 @@ condition と .NET 例外は同じ機構に乗っているので、境界を越�
 | --- | --- |
 | Lisp → .NET 呼び出しで .NET 例外 | `handler-case` が raw 例外をそのまま捕まえる。`dotnet:new` は `TargetInvocationException` の inner を剥がす。socket I/O のように意味が対応するものは `STREAM-ERROR` 等へ寄せてある |
 | .NET → Lisp コールバックから condition が脱出 | `LispErrorException` として C# 側へ透過する。境界でハンドラクラスタを積むので、対話デバッガに落ちることはない。`storage-condition` だけは境界で封じ込める |
-| REPL のトップレベル | デバッガと restart が出る |
+| REPL のトップレベル | `error` / `break` / `invoke-debugger` に加え、ランタイムが signal する condition (型違い・未定義関数・添字はみ出し・ゼロ割・.NET 例外の包み) も、誰も handle しなければデバッガに入る。入口は `LispErrorException` のコンストラクタ (ハンドラを走らせた直後、まだ何も巻き戻っていない時点) で、REPL が 1 フォームの評価と印字の間だけ立てるスレッドごとのスイッチ `ConditionSystem.UnhandledErrorsEnterDebugger` で有効になる。スクリプト・ライブラリの C# 側 `catch`・REPL の reader (未完のフォームは END-OF-FILE で続きを待つ) には効かない。デバッガ/`*debugger-hook*` の実行中はスイッチを切るので入れ子にならない |
 | Lisp が main の実行ファイル | 利用者が `handler-case` を書く。既定のトップレベルハンドラは置いていない |
 | 深い再帰・スタック枯渇 | 上記のとおり `storage-condition` 化 |
 | スレッド | ハンドラクラスタもリスタートもスレッドごと。ワーカースレッドには abort リスタートが無い |

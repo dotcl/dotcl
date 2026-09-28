@@ -651,7 +651,9 @@ public static partial class Runtime
                         }
                     }
                     Debugger.Enter(condition);
-                    throw new LispErrorException(condition);  // defensive; Debugger.Enter shouldn't return
+                    // Defensive: Debugger.Enter does not return. The handlers
+                    // have seen this condition already.
+                    throw LispErrorException.WithoutSignal(condition);
                 }
                 catch (RestartInvocationException rie) when (ReferenceEquals(rie.Tag, restart.Tag))
                 {

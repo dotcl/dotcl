@@ -842,8 +842,33 @@ public partial class CilAssembler
                 // a Function-less placeholder in the constants pool
                 // before the defun has run.
                 var symName = GetString(Cadr(c));
-                _il.Emit(OpCodes.Ldstr, _faslMode ? Track(symName) : symName);
-                _il.Emit(OpCodes.Call, _methodCache["Startup.Sym"]);
+                // Resolution is still at run time, through a per-site cell
+                // (Startup.SymSite) that remembers a hit Sym has cached. The
+                // bare `ldstr; call Startup.Sym` hashed the name on every
+                // execution, which a call to a Lisp-defined CL function (LDB,
+                // DPB, BYTE-SIZE, ...) pays once per call.
+                if (_faslMode)
+                {
+                    if (_faslStructMap?.SymFnSiteInitIl != null
+                        && _faslStructMap.UninternedTypeBuilder != null)
+                    {
+                        _il.Emit(OpCodes.Ldsfld, _faslStructMap.GetOrCreateSymSiteField(symName));
+                        _il.Emit(OpCodes.Call, _symSiteResolve);
+                    }
+                    else
+                    {
+                        _il.Emit(OpCodes.Ldstr, Track(symName));
+                        _il.Emit(OpCodes.Call, _methodCache["Startup.Sym"]);
+                    }
+                }
+                else
+                {
+                    int idx = AddConstant(new Startup.SymSite(symName));
+                    _il.Emit(OpCodes.Ldc_I4, idx);
+                    _il.Emit(OpCodes.Call, _getConstant);
+                    _il.Emit(OpCodes.Castclass, typeof(Startup.SymSite));
+                    _il.Emit(OpCodes.Call, _symSiteResolve);
+                }
                 // Startup.Sym returns Symbol, and a Symbol is usable wherever a
                 // LispObject is wanted, so the widening cast was never needed;
                 // and it forced the narrowing one that usually follows to be a
@@ -2437,9 +2462,11 @@ public partial class CilAssembler
     private MethodInfo? ResolveDirectTarget(string typeName, string methodName, Type[] paramTypes, out Type? type)
     {
         type = null;
-        Type t;
-        try { t = Runtime.ResolveDotNetType(typeName); }
-        catch { return null; }
+        // The non-signalling lookup: this is a guess, and a signalling one would
+        // be seen by the caller's handlers (and by the REPL debugger) as an error
+        // the user made.
+        var t = Runtime.TryResolveDotNetType(typeName);
+        if (t == null) return null;
         var m = t.GetMethod(methodName, paramTypes);
         if (m == null) return null;
         type = t;
@@ -2549,8 +2576,9 @@ public partial class CilAssembler
         bool paramsResolved = true;
         for (int i = 0; i < paramTypes.Length; i++)
         {
-            try { paramTypes[i] = Runtime.ResolveDotNetType(paramTypeNames[i]); }
-            catch { paramsResolved = false; break; }
+            var pt = Runtime.TryResolveDotNetType(paramTypeNames[i]);
+            if (pt == null) { paramsResolved = false; break; }
+            paramTypes[i] = pt;
         }
         Type? type = null;
         MethodInfo? method = null;
@@ -3016,6 +3044,28 @@ public partial class CilAssembler
             il.Emit(System.Reflection.Emit.OpCodes.Newobj, _symFnSiteCtor);
             il.Emit(System.Reflection.Emit.OpCodes.Stsfld, field);
             _symFnSiteFields[key] = field;
+            return field;
+        }
+
+        // Per-FASL SymSite cells for :load-sym, one per name, created by the
+        // type initializer like the SymFnSite cells above.
+        private readonly Dictionary<string, System.Reflection.Emit.FieldBuilder> _symSiteFields =
+            new(StringComparer.Ordinal);
+        private static readonly System.Reflection.ConstructorInfo _symSiteCtor =
+            typeof(Startup.SymSite).GetConstructor(new[] { typeof(string) })!;
+        private int _symSiteCounter;
+
+        public System.Reflection.Emit.FieldBuilder GetOrCreateSymSiteField(string name)
+        {
+            if (_symSiteFields.TryGetValue(name, out var existing)) return existing;
+            var (tb, il) = FieldHolder();
+            var field = tb.DefineField($"_sym_{_symSiteCounter++}",
+                typeof(Startup.SymSite),
+                System.Reflection.FieldAttributes.Public | System.Reflection.FieldAttributes.Static);
+            il.Emit(System.Reflection.Emit.OpCodes.Ldstr, TrackString(name));
+            il.Emit(System.Reflection.Emit.OpCodes.Newobj, _symSiteCtor);
+            il.Emit(System.Reflection.Emit.OpCodes.Stsfld, field);
+            _symSiteFields[name] = field;
             return field;
         }
 
@@ -4982,6 +5032,7 @@ public partial class CilAssembler
     private static readonly Dictionary<string, Type> _typeCache;
     private static readonly MethodInfo _getConstant;
     private static readonly MethodInfo _symFnSiteResolve;
+    private static readonly MethodInfo _symSiteResolve;
     private static readonly MethodInfo _getUnitConstant;
     private static readonly MethodInfo _makeFaslInstance;
     private static readonly MethodInfo _internViaEvalInstance;
@@ -5286,10 +5337,19 @@ public partial class CilAssembler
             // Raw-long-value variants for inferred numeric-backed array locals
             ["Runtime.IndexL"] = typeof(Runtime).GetMethod("IndexL")!,
             ["Runtime.ArefNumL"] = typeof(Runtime).GetMethod("ArefNumL")!,
+            ["Runtime.BackingChars"] = typeof(Runtime).GetMethod("BackingChars")!,
             ["Runtime.BackingI64"] = typeof(Runtime).GetMethod("BackingI64")!,
             ["Runtime.BackingI32"] = typeof(Runtime).GetMethod("BackingI32")!,
             ["Runtime.BackingU16"] = typeof(Runtime).GetMethod("BackingU16")!,
             ["Runtime.BackingU8"] = typeof(Runtime).GetMethod("BackingU8")!,
+            // Above (safety 0): the same fetches, signalling on a non-simple array
+            ["Runtime.BackingCharsChecked"] = typeof(Runtime).GetMethod("BackingCharsChecked")!,
+            ["Runtime.BackingI64Checked"] = typeof(Runtime).GetMethod("BackingI64Checked")!,
+            ["Runtime.BackingI32Checked"] = typeof(Runtime).GetMethod("BackingI32Checked")!,
+            ["Runtime.BackingU16Checked"] = typeof(Runtime).GetMethod("BackingU16Checked")!,
+            ["Runtime.BackingU8Checked"] = typeof(Runtime).GetMethod("BackingU8Checked")!,
+            ["Runtime.IsNonSimpleArray"] = typeof(Runtime).GetMethod("IsNonSimpleArray")!,
+            ["Runtime.SignalDeclaredNotSimple"] = typeof(Runtime).GetMethod("SignalDeclaredNotSimple")!,
             ["Runtime.CheckStoreI32"] = typeof(Runtime).GetMethod("CheckStoreI32")!,
             ["Runtime.CheckStoreU16"] = typeof(Runtime).GetMethod("CheckStoreU16")!,
             ["Runtime.CheckStoreU8"] = typeof(Runtime).GetMethod("CheckStoreU8")!,
@@ -5324,6 +5384,11 @@ public partial class CilAssembler
             // Raw-long slot read/write for fixnum-typed struct slots
             ["Runtime.StructRefL"] = typeof(Runtime).GetMethod("StructRefL")!,
             ["Runtime.StructSetL"] = typeof(Runtime).GetMethod("StructSetL")!,
+            // The raw slot array fetched once per binding, and the two
+            // reinterpretations a double slot needs on top of it
+            ["Runtime.StructRawBacking"] = typeof(Runtime).GetMethod("StructRawBacking")!,
+            ["Runtime.RawBitsToDouble"] = typeof(Runtime).GetMethod("RawBitsToDouble")!,
+            ["Runtime.RawDoubleToBits"] = typeof(Runtime).GetMethod("RawDoubleToBits")!,
             ["Runtime.StructSet"] = typeof(Runtime).GetMethod("StructSet")!,
             ["Runtime.StructSetI"] = typeof(Runtime).GetMethod("StructSetI")!,
             ["Runtime.CheckSlotType"] = typeof(Runtime).GetMethod("CheckSlotType")!,
@@ -5755,6 +5820,7 @@ public partial class CilAssembler
             ["Int64[]"] = typeof(long[]),
             ["Int32[]"] = typeof(int[]),
             ["UInt16[]"] = typeof(ushort[]),
+            ["Char[]"] = typeof(char[]),
             ["Byte[]"] = typeof(byte[]),
             ["Double"] = typeof(double),
             ["Single"] = typeof(float),
@@ -5786,6 +5852,7 @@ public partial class CilAssembler
 
         _getConstant = typeof(CilAssembler).GetMethod("GetConstant")!;
         _symFnSiteResolve = typeof(Startup.SymFnSite).GetMethod("Resolve")!;
+        _symSiteResolve = typeof(Startup.SymSite).GetMethod("Resolve")!;
         _getUnitConstant = typeof(CilAssembler).GetMethod("GetUnitConstant")!;
         _makeFaslInstance = typeof(Runtime).GetMethod("MakeFaslInstance",
             new[] { typeof(string), typeof(string), typeof(LispObject[]) })!;

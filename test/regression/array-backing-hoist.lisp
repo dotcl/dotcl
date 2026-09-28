@@ -162,14 +162,18 @@
           (list (%abh-count "Runtime.BackingI32" d) (%abh-count "(LDELEM-I4)" d))))
   ((1 1) (1 1) (1 1) (1 1)))
 
-;; One fetch for the whole binding, however many accesses it has.
+;; One fetch for the whole binding, however many accesses it has -- the
+;; BackingI64 count stays 1 even though the body is emitted twice, which is
+;; the property this test is named for. The ArefNumL count is 2 because the
+;; second copy, the one taken when the fetch declined, runs the per-element
+;; helper for both accesses.
 (deftest-emitting-only array-backing-hoist.let-binding-fetches-once
   (let ((d (%abh-sil #'%abh-let)))
     (list (%abh-count "Runtime.BackingI64" d)
           (%abh-count "(LDELEM-I8)" d)
           (%abh-count "(STELEM-I8)" d)
           (%abh-count "Runtime.ArefNumL" d)))
-  (1 2 2 0))
+  (1 2 2 2))
 
 ;; The narrow kinds keep the element-width check the boxed store path applies;
 ;; the full-width kind has nothing to check.
@@ -292,5 +296,81 @@
 (deftest array-backing-hoist.rank-2-and-float-values
   (list (%abh-2d *abh-2dv* 1 2) (%abh-double *abh-dv* 0) (%abh-double *abh-dv* 1))
   (12 1.5d0 -2.25d0))
+
+;;; ---- storage that can be replaced under the binding ----
+;;;
+;;; The hoist fetches the element buffer once and reads it for as long as the
+;;; binding lives, which is sound only while that buffer object cannot be
+;;; swapped. CLHS says a simple array is neither adjustable nor fill-pointered,
+;;; so it could not be. The declarations below are false (TYPEP answers NIL
+;;; for an adjustable or fill-pointered vector), but dotcl's TYPEP used to call
+;;; the adjustable one simple, so code written against that must keep reading
+;;; and writing the right elements rather than a stale buffer.
+;;;
+;;; Both of these silently lost the write before the fetch learned to decline:
+;;; ADJUST-ARRAY and VECTOR-PUSH-EXTEND each replace the buffer object, the
+;;; write inside went to the replaced one, and a read inside disagreed with a
+;;; read outside about the same element. Neither signalled.
+
+(defun %abh-adjust-mid-binding (v)
+  (declare (type (simple-array (unsigned-byte 8) (*)) v)
+           (optimize (speed 3) (safety 0) (debug 0)))
+  (let ((before (aref v 1)))
+    (adjust-array v 8)
+    (setf (aref v 1) 42)
+    (list before (aref v 1))))
+
+(deftest array-backing-hoist.adjustable-buffer-is-replaced
+  (let ((v (make-array 4 :element-type '(unsigned-byte 8)
+                         :adjustable t :initial-element 7)))
+    (let ((inside (%abh-adjust-mid-binding v)))
+      ;; The write must be visible outside: same object, same element.
+      (list inside (aref v 1) (length v))))
+  ((7 42) 42 8))
+
+(defun %abh-push-mid-binding (v)
+  (declare (type (simple-array (unsigned-byte 8) (*)) v)
+           (optimize (speed 3) (safety 0) (debug 0)))
+  (let ((before (aref v 0)))
+    (dotimes (i 6) (vector-push-extend 9 v))
+    (setf (aref v 0) 42)
+    (list before (aref v 0))))
+
+(deftest array-backing-hoist.fill-pointer-buffer-is-replaced
+  (let ((v (make-array 2 :element-type '(unsigned-byte 8)
+                         :fill-pointer 0 :adjustable t)))
+    (setf (aref v 0) 7)
+    (let ((inside (%abh-push-mid-binding v)))
+      (list inside (aref v 0) (fill-pointer v))))
+  ((7 42) 42 6))
+
+;; The control: the same shape on a vector whose storage really cannot move
+;; must be unaffected, which is what says the two tests above isolate the
+;; replacement and not the hoist itself.
+(defun %abh-simple-mid-binding (v)
+  (declare (type (simple-array (unsigned-byte 8) (*)) v)
+           (optimize (speed 3) (safety 0) (debug 0)))
+  (setf (aref v 1) 42)
+  (aref v 1))
+
+(deftest array-backing-hoist.simple-buffer-is-not-replaced
+  (let ((v (make-array 4 :element-type '(unsigned-byte 8) :initial-element 7)))
+    (list (%abh-simple-mid-binding v) (aref v 1)))
+  (42 42))
+
+;; A declaration that is simply false still signals, as it did before the fetch
+;; learned to decline: declining is for storage that cannot be pinned, not for
+;; a value that is not the declared array at all.
+;;
+;; DEFTEST-EMITTING-ONLY, like the other declaration-diagnostic tests: the
+;; signal comes from the prologue fetch, an interpreter is free to ignore
+;; declarations (CLHS 3.3.1), and the emit-free build does ignore them, so there
+;; is no fetch there to do the signalling. The three tests above are NOT
+;; emitting-only -- they assert values, which have to be right either way.
+(deftest-emitting-only array-backing-hoist.false-declaration-still-signals
+  (handler-case (progn (%abh-simple-mid-binding (make-array 4 :initial-element 7))
+                       :no-error)
+    (type-error () :type-error))
+  :type-error)
 
 (setf dotcl:*save-sil* nil)

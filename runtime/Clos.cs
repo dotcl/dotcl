@@ -106,6 +106,23 @@ public class LispClass : LispObject
     /// <summary>The metaclass of this class. Null means STANDARD-CLASS (default).</summary>
     public LispClass? Metaclass { get; set; }
     public SlotDefinition[] DirectSlots { get; set; }
+    /// <summary>While a class under a custom metaclass is being initialized: the
+    /// canonical :DIRECT-SLOTS plists handed to INITIALIZE-INSTANCE, each with the slot
+    /// definition it was made from. A plist that comes back unchanged keeps its slot
+    /// definition; any other plist becomes a new one. Null outside that window.</summary>
+    internal List<(LispObject Plist, SlotDefinition Slot)>? PendingSlotPlists { get; set; }
+    /// <summary>While DEFCLASS makes or redefines this class: the (slot name, reader or
+    /// writer) pairs its expansion defines methods for itself. Null otherwise.</summary>
+    internal HashSet<(Symbol Slot, LispObject Fn)>? DefclassAccessors { get; set; }
+    /// <summary>Reader and writer methods still to be defined for direct slots that
+    /// arrived through the class metaobject protocol (a metaclass rewriting
+    /// :DIRECT-SLOTS, ENSURE-CLASS, REINITIALIZE-INSTANCE) rather than from DEFCLASS,
+    /// whose expansion defines its own. Defined once the class is reachable by name.</summary>
+    internal List<(Symbol Slot, LispObject Readers, LispObject Writers)>? PendingAccessors { get; set; }
+    /// <summary>True while REINITIALIZE-INSTANCE's default method runs SHARED-INITIALIZE
+    /// on this class, so the class-metaobject SHARED-INITIALIZE installs the new
+    /// superclasses / slots / default initargs on an already finalized class.</summary>
+    internal bool ReinitializingFromInitargs { get; set; }
     public LispClass[] DirectSuperclasses { get; set; }
     public LispClass[] ClassPrecedenceList { get; set; }
     public SlotDefinition[] EffectiveSlots { get; set; }
@@ -665,9 +682,10 @@ public class LispMethod : LispObject
     public List<string> KeywordNames { get; set; } = new();
     public GenericFunction? Owner { get; set; }
 
-    /// <summary>The lambda list as given, when one was (AMOP MAKE-INSTANCE with
-    /// :lambda-list). Null for a method built by DEFMETHOD, where only the arity
-    /// is recorded and METHOD-LAMBDA-LIST rebuilds a list of the right shape.
+    /// <summary>The unspecialized lambda list as given: by AMOP MAKE-INSTANCE with
+    /// :lambda-list, or by DEFMETHOD through %SET-METHOD-LAMBDA-LIST-INFO. Null for
+    /// a method loaded from a FASL older than that, where only the arity is
+    /// recorded and METHOD-LAMBDA-LIST rebuilds a list of the right shape.
     /// Mirrors GenericFunction.StoredLambdaList.</summary>
     public LispObject? StoredLambdaList { get; set; }
     /// <summary>The rebuilt placeholder, kept so this method answers the same list

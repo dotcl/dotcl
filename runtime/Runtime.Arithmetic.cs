@@ -1163,9 +1163,31 @@ public static partial class Runtime
     // while documentation reads it: a plain Dictionary corrupts under concurrent write.
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<(string sym, string docType), LispObject> _docs = new();
 
-    // Called by GeneratedDocs.Register() (source-generated from [LispDoc] attributes).
-    internal static void SetFunctionDoc(string lispName, string docstring) =>
-        _docs[(lispName, "FUNCTION")] = new LispString(docstring);
+    // Function docstrings from [LispDoc] attributes, keyed by the symbol itself
+    // (Symbol does not override Equals, so this is an identity table). Keying by
+    // the bare name would hand the docstring to every same-named symbol in any
+    // other package, including shadowing and uninterned ones.
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<Symbol, LispObject> _functionDocs = new();
+
+    // Called by GeneratedDocs.Register() (source-generated from [LispDoc] attributes),
+    // after every built-in function has been registered. LISPNAME must be
+    // package-qualified ("PKG:NAME") and name an existing symbol: a name that does
+    // not resolve is a mistake in the attribute, so it fails startup rather than
+    // dropping the docstring without a word.
+    internal static void SetFunctionDoc(string lispName, string docstring)
+    {
+        int colon = lispName.IndexOf(':');
+        if (colon <= 0)
+            throw new InvalidOperationException($"[LispDoc(\"{lispName}\")]: the name must be package-qualified (PKG:NAME)");
+        var pkgName = lispName.Substring(0, colon);
+        var symName = lispName.Substring(colon + 1).TrimStart(':');
+        var pkg = Package.FindPackage(pkgName)
+            ?? throw new InvalidOperationException($"[LispDoc(\"{lispName}\")]: no package named {pkgName}");
+        var (sym, status) = pkg.FindSymbol(symName);
+        if (status == SymbolStatus.None)
+            throw new InvalidOperationException($"[LispDoc(\"{lispName}\")]: no symbol {symName} in package {pkgName}");
+        _functionDocs[sym] = new LispString(docstring);
+    }
 
     // Logical pathname translations: host name (uppercase) -> list of (from to) translation rules
     // ConcurrentDictionary: (setf logical-pathname-translations) writes this while
@@ -1426,15 +1448,20 @@ public static partial class Runtime
             dir = Runtime.List(resultDirs.ToArray());
         }
 
-        // Replace :wild name/type with logical's components (lowercased for physical)
-        if (name is Symbol ns && ns.Name == "WILD")
+        // Replace :wild name/type with logical's components (lowercased for physical).
+        // CLHS TRANSLATE-PATHNAME: a to-wildcard piece of nil also takes the source
+        // piece, so a translation whose right-hand side is a bare directory such as
+        // ("*.*.*" #P"/tmp/") keeps the file name instead of dropping it.
+        static bool TakesSource(LispObject? c)
+            => c is null || c is Nil || (c is Symbol s && s.Name == "WILD");
+        if (TakesSource(name))
         {
             if (logical.NameComponent is LispString logName)
                 name = new LispString(logName.Value.ToLowerInvariant());
             else
                 name = logical.NameComponent;
         }
-        if (type is Symbol ts && ts.Name == "WILD")
+        if (TakesSource(type))
         {
             if (logical.TypeComponent is LispString logType)
                 type = new LispString(logType.Value.ToLowerInvariant());
@@ -1445,26 +1472,38 @@ public static partial class Runtime
         return new LispPathname(toPattern.Host, toPattern.Device, dir, name, type, toPattern.Version);
     }
 
+    // Variable docstrings, keyed by the symbol itself (an identity table, like
+    // _functionDocs), so a same-named symbol of another package, or an uninterned
+    // one, does not answer them. This is the one store for them: a compiled
+    // DEFVAR/DEFPARAMETER/DEFCONSTANT writes it through SetVariableDocumentation,
+    // and (SETF DOCUMENTATION) of kind VARIABLE writes it through
+    // %SET-VARIABLE-DOCUMENTATION, so the last writer wins and NIL clears it.
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<Symbol, LispObject> _variableDocs = new();
+
+    // Called by compiled DEFVAR code (shipped fasls included): keep this signature.
     public static LispObject SetVariableDocumentation(LispObject sym, LispObject doc)
     {
         if (sym is Symbol s)
-            _docs[(s.Name, "VARIABLE")] = doc;
+        {
+            if (doc is Nil) _variableDocs.TryRemove(s, out _);
+            else _variableDocs[s] = doc;
+        }
         return doc;
     }
 
     public static LispObject GetVariableDocumentation(LispObject sym)
     {
-        if (sym is Symbol s && _docs.TryGetValue((s.Name, "VARIABLE"), out var doc))
+        if (sym is Symbol s && _variableDocs.TryGetValue(s, out var doc))
             return doc;
         return Nil.Instance;
     }
 
     /// <summary>Fallback used by the Lisp DOCUMENTATION GF (function method) to surface
     /// docstrings registered from [LispDoc] attributes / SetFunctionDoc, mirroring the
-    /// variable path. Keyed by the symbol's bare name (#25 follow-up).</summary>
+    /// variable path. Only the very symbol the attribute names answers.</summary>
     public static LispObject GetFunctionDocumentation(LispObject sym)
     {
-        if (sym is Symbol s && _docs.TryGetValue((s.Name, "FUNCTION"), out var doc))
+        if (sym is Symbol s && _functionDocs.TryGetValue(s, out var doc))
             return doc;
         return Nil.Instance;
     }
@@ -2064,10 +2103,46 @@ public static partial class Runtime
                 if (d == 0.0) {
                     return MultipleValues.Values(MakeF(0.0), new Fixnum(0), MakeF(signVal));
                 }
-                int exponent = (int)Math.Floor(Compat.Log2(d)) + 1;
-                double significand = d / Math.Pow(2.0, exponent);
+                // Exponent from the bits, significand by scaleB. Dividing by a
+                // separately built 2^exponent failed at the top of the range:
+                // 2^1024 is not a double, so every value >= 2^1023 decoded to a
+                // 0.0 significand.
+                long bits = BitConverter.DoubleToInt64Bits(d);
+                int biased = (int)((bits >> 52) & 0x7FF);
+                int exponent = biased != 0
+                    ? biased - 1022
+                    : BitLength(bits & 0xFFFFFFFFFFFFFL) - 1074;
+                double significand = Compat.ScaleB(d, -exponent);
                 return MultipleValues.Values(MakeF(significand), new Fixnum(exponent), MakeF(signVal));
             }, "DECODE-FLOAT", 1));
+
+        // SCALE-FLOAT: FLOAT * 2^SCALE with a single rounding. Multiplying by a
+        // separately built 2^SCALE loses the answer whenever that power of two is
+        // itself out of range (2^-149 as a single, 2^128, 2^1074 as a double) even
+        // though the product is representable, so the exponent is applied with
+        // scaleB. A single is scaled in double precision, which holds every single
+        // value exactly across the single range, and then rounded once to single.
+        Emitter.CilAssembler.RegisterFunction("SCALE-FLOAT",
+            new LispFunction(args => {
+                if (args[1] is not Fixnum && args[1] is not Bignum)
+                    throw new LispErrorException(new LispTypeError(
+                        "SCALE-FLOAT: scale is not an integer", args[1], Startup.Sym("INTEGER")));
+                // A bignum scale saturates: any |scale| beyond a few thousand
+                // already over- or underflows both formats.
+                int n = args[1] is Fixnum fx
+                    ? (int)Compat.Clamp(fx.Value, -100000L, 100000L)
+                    : (((Bignum)args[1]).Value.Sign < 0 ? -100000 : 100000);
+                switch (args[0])
+                {
+                    case SingleFloat sf:
+                        return new SingleFloat((float)Compat.ScaleB(sf.Value, n));
+                    case DoubleFloat df:
+                        return new DoubleFloat(Compat.ScaleB(df.Value, n));
+                    default:
+                        throw new LispErrorException(new LispTypeError(
+                            "SCALE-FLOAT: argument is not a float", args[0], Startup.Sym("FLOAT")));
+                }
+            }, "SCALE-FLOAT", 2));
 
         // FLOAT-RADIX: always 2 for IEEE floats
         Emitter.CilAssembler.RegisterFunction("FLOAT-RADIX",

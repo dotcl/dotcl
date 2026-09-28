@@ -1,6 +1,6 @@
 #!/bin/sh
 # The names of the ansi-test tests that failed, one per line, from the
-# per-category outputs `make test-ansi-all` leaves in /tmp/ansi-<category>.txt.
+# per-category outputs `make test-ansi-all` leaves in out/ansi/ansi-<category>.txt.
 #
 # Two callers need exactly this list and must agree on it: `make
 # update-ansi-state`, which records it as the known-failure set, and
@@ -8,7 +8,7 @@
 # one place is what keeps them from drifting apart.
 #
 # Usage: ansi-failures.sh <category>...
-#        ANSI_OUT_DIR=<dir> ansi-failures.sh <category>...   (default /tmp)
+#        ANSI_OUT_DIR=<dir> ansi-failures.sh <category>...   (default out/ansi)
 #
 # A category with no output file is skipped silently: "the suite did not run
 # there" is not "nothing failed there", and it is the caller that knows which of
@@ -16,7 +16,7 @@
 # refuses to pass a run with no outputs at all).
 set -eu
 
-dir="${ANSI_OUT_DIR:-/tmp}"
+dir="${ANSI_OUT_DIR:-$(dirname "$0")/../out/ansi}"
 
 for cat in "$@"; do
   f="$dir/ansi-$cat.txt"

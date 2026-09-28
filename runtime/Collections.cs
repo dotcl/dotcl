@@ -788,6 +788,12 @@ public sealed class LispVector : LispObject
     // Returns true if array was created with :adjustable t
     public bool IsAdjustable { get => _isAdjustable; set => _isAdjustable = value; }
 
+    // A simple array in the CLHS sense (1.4.4, glossary): not displaced, not
+    // actually adjustable, and no fill pointer. Every SIMPLE-* type test
+    // (SIMPLE-STRING-P, SIMPLE-VECTOR-P, TYPEP, TYPE-OF, COERCE) reads this one
+    // definition; if two of them disagree, TYPEP rejects what TYPE-OF returned.
+    public bool IsSimple => !_hasFillPointer && !_isAdjustable && _displacedTo == null;
+
     // Raw element get/set: handles displacement transparently
     private LispObject RawGet(int index)
     {

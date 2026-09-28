@@ -450,6 +450,10 @@ public class LispStringInputStream : LispInputStream
         Reader = newReader;
         TrackingReader = newReader;
         StartOffset = absolutePosition;
+        // A Lisp reader cached by an earlier READ wraps the old TextReader, which
+        // is now detached from the stream (and may sit at end of input). Drop it
+        // so the next READ builds one over the new position.
+        CachedReader = null;
         return true;
     }
 

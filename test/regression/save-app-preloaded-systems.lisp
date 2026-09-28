@@ -19,7 +19,7 @@
 (defun %sap-preloaded-system-case ()
   (require "asdf")
   (let* ((dir (format nil "~a/dotcl-sap-~a/"
-                      (or (dotcl:getenv "TEMP") "/tmp") (get-internal-real-time)))
+                      (regression-temp-dir) (get-internal-real-time)))
          (dirp (substitute #\/ #\\ dir))
          (core (concatenate 'string dirp "sapsys.core")))
     (ensure-directories-exist dirp)

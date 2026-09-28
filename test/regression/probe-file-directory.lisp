@@ -15,9 +15,7 @@
 (defun %pfd-dir ()
   "A directory that certainly exists, as a namestring without a trailing slash."
   (let ((d (concatenate 'string
-                        (substitute #\/ (code-char 92)
-                                    (or (dotcl:getenv "TMPDIR")
-                                        (dotcl:getenv "TEMP") "/tmp"))
+                        (regression-temp-dir)
                         "/dotcl-pfd-probe")))
     (ensure-directories-exist (concatenate 'string d "/"))
     d))

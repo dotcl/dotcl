@@ -27,7 +27,7 @@
 (defun %cfri-asdf-stale-registry ()
   (require "asdf")
   (let* ((tmp (format nil "~a/dotcl-cfri-~a/"
-                      (or (dotcl:getenv "TEMP") "/tmp")
+                      (regression-temp-dir)
                       (get-internal-real-time)))
          (dirp (substitute #\/ #\\ tmp))
          (mod-asd (concatenate 'string dirp "cfri-mod.asd"))

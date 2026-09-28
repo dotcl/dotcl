@@ -47,6 +47,42 @@ CL-USER> (+ 1 2)
 3
 ```
 
+A form does not have to fit on a line. Enter looks at the brackets: closed and
+the form goes to the reader, still open and it opens the next line and indents
+it for you. Pasting a definition of any length works the same way, and the up
+arrow brings the whole of it back.
+
+```console
+CL-USER> (defun add1 (x)
+           (+ x 1))
+ADD1
+```
+
+A line that starts with a comma is a command to the REPL rather than a form to
+evaluate: `,cd` and `,in-package` move where you are, `,doc` and `,args` and
+`,apropos` look things up, `,time` and `,load` and `,ql` do work. `,help` lists
+them all and `,help <command>` explains one. You can add your own with
+`dotcl-repl:define-command` in your init file; the
+[contrib README](../contrib/dotcl-repl/README.md) has the full table and an
+example.
+
+**You do not need `rlwrap`.** The editing above is dotcl's own, and `rlwrap`
+adds nothing to it. If you already reach for `rlwrap` with every Lisp, then
+`rlwrap -n dotcl` works and leaves dotcl's editor in charge; the `-n` silences
+a warning `rlwrap` prints because dotcl reads keypresses itself. You will still
+see your first input line echoed once more underneath itself, because `rlwrap`
+adds a line break that dotcl's redraw does not know about. It is cosmetic, and
+it happens once per session.
+
+What `rlwrap` still has that dotcl does not is your `~/.inputrc` and vi mode.
+To use either, turn dotcl's editor off with `rlwrap dotcl --no-readline` - but
+that is a real trade, because multi-line editing, the comma commands and TAB
+completion all live in the editor you just turned off.
+
+[The REPL](repl.md) is the page for the rest of it: the init file, where what
+you type is kept between sessions, what the debugger does and does not open
+for, and the parts that are not there yet.
+
 ### 2b. From a per-RID tarball
 
 Every release page carries one archive per runtime identifier, named

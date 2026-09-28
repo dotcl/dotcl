@@ -7,7 +7,7 @@ DOTCL_LISP ?= ros -L sbcl-bin run
 STDBUF ?=
 SETSID ?= $(shell which setsid 2>/dev/null)
 
-.PHONY: il-parity il-parity-accept all build build-ns2 check-contrib-freshness run clean repl test-fasl-shape test-core-bytes test-host-api test-cli-exit test-coverage test-ansi-all test-ansi-gate library-status test-ansi-full test-ansi-extra test-regression test-regression-interp test-regression-emitfree test-pack-nuspec test-save-class-lib test-project-compose test-project-core-build test-mop test-kestrel ilverify update-ansi-state commit-ansi-state cross-compile selfhost-check selfhost-test seed-install seed-check loc publish pack install setup-ansi-test setup-asdf setup-quicklisp setup-cl-bench bench bench-state bench-survey compile-asdf-fasl compile-asdf-fasls compile-quicklisp-fasl compile-core-fasl compile-contrib-fasls contrib-dotcl-cs contrib-dotcl-jitdisasm gen-char-names
+.PHONY: il-parity il-parity-accept all build build-ns2 check-contrib-freshness run clean repl test-fasl-shape test-core-bytes test-host-api test-cli-exit test-coverage test-ansi-all test-ansi-gate library-status library-status-tests test-ansi-full test-ansi-extra test-regression test-regression-interp test-regression-emitfree test-pack-nuspec test-save-class-lib test-project-compose test-project-core-build test-mop test-kestrel ilverify update-ansi-state commit-ansi-state cross-compile selfhost-check selfhost-test seed-install seed-check loc publish pack install setup-ansi-test setup-asdf setup-quicklisp setup-cl-bench bench bench-state bench-survey compile-asdf-fasl compile-asdf-fasls compile-quicklisp-fasl compile-core-fasl compile-contrib-fasls contrib-dotcl-cs contrib-dotcl-jitdisasm gen-char-names
 
 # Source files for cross-compile. Listed once; the recipe and dependency
 # tracking both reference this so adding a file is a single-edit change.
@@ -17,7 +17,8 @@ CIL_SOURCES := \
   $(DOTCL_ROOT)compiler/cil-macros.lisp \
   $(DOTCL_ROOT)compiler/loop.lisp \
   $(DOTCL_ROOT)compiler/cil-analysis.lisp \
-  $(DOTCL_ROOT)compiler/cil-forms.lisp
+  $(DOTCL_ROOT)compiler/cil-forms.lisp \
+  $(DOTCL_ROOT)compiler/cl-docstrings.lisp
 
 # Runtime (C#) sources. A compiled .fasl carries the code generation of the
 # RUNTIME that produced it as much as the compiler's: the emitter lives here, in
@@ -269,10 +270,22 @@ ANSI_CATEGORIES := symbols eval-and-compile data-and-control-flow iteration \
 	structures types-and-classes strings characters pathnames files \
 	streams printer reader system-construction environment misc
 
+# Where test-ansi-all leaves its per-category outputs (ansi-<category>.txt) for
+# test-ansi-gate and update-ansi-state to read. Inside the worktree for the same
+# reason as BENCH_TMP below: these outputs are copied into the tracked
+# ansi-state.json, and under a shared /tmp two lanes running the suite at once
+# read each other's results. test/ansi-failures.sh and test/ansi-gate.sh default
+# to the same directory when ANSI_OUT_DIR is not given.
+ANSI_OUT = $(DOTCL_ROOT)out/ansi
+
 test-ansi-all: build setup-ansi-test
-	@total_pass=0; total_fail=0; total_tests=0; total_alloc=0; total_gen0=0; total_gen1=0; total_gen2=0; \
+	@mkdir -p $(ANSI_OUT); \
+	: 'Drop the previous run first, so a category this run never reaches reads'; \
+	: 'as untested rather than as whatever an earlier run left there.'; \
+	for cat in $(ANSI_CATEGORIES); do rm -f $(ANSI_OUT)/ansi-$$cat.txt; done; \
+	total_pass=0; total_fail=0; total_tests=0; total_alloc=0; total_gen0=0; total_gen1=0; total_gen2=0; \
 	for cat in $(ANSI_CATEGORIES); do \
-		tmp=$$(mktemp /tmp/dotcl-ansi-XXXXXX.lisp); \
+		tmp=$$(mktemp $(ANSI_OUT)/run-XXXXXX.lisp); \
 		cat $(DOTCL_ROOT)test/test-ansi-cat.lisp > $$tmp; \
 		echo "(load \"ansi-test/$$cat/load.lsp\")" >> $$tmp; \
 		: 'The suite adjustments (test/ansi-exclusions.lisp) go AFTER the category'; \
@@ -290,7 +303,7 @@ test-ansi-all: build setup-ansi-test
 		echo "            (- (nth 2 s1) (nth 2 s0))" >> $$tmp; \
 		echo "            (- (nth 4 s1) (nth 4 s0)))))" >> $$tmp; \
 		t0=$$(date +%s); \
-		outfile=/tmp/ansi-$$cat.txt; \
+		outfile=$(ANSI_OUT)/ansi-$$cat.txt; \
 		$(STDBUF) $(SETSID) timeout 360 dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --asm $(DOTCL_ROOT)compiler/cil-out.sil $$tmp > $$outfile 2>&1; \
 		exitcode=$$?; \
 		t1=$$(date +%s); \
@@ -353,20 +366,28 @@ library-status: build $(DOTCL_ROOT)compiler/cil-out.sil
 	@DOTCL_VERSION="$$(git -C $(DOTCL_ROOT). describe --tags --always)" \
 	  $(DOTCL_LISP) --load $(DOTCL_ROOT)bench/library-status/render.lisp
 
+# Stage 2b: run the test suite of every row that loads and judge it per test
+# framework (bench/library-status/run-tests.sh), then re-render. Only a
+# recognised, all-passing summary makes a row ok; see the README.
+library-status-tests: build $(DOTCL_ROOT)compiler/cil-out.sil
+	@sh $(DOTCL_ROOT)bench/library-status/run-tests.sh $(DOTCL_ROOT).
+	@DOTCL_VERSION="$$(git -C $(DOTCL_ROOT). describe --tags --always)" \
+	  $(DOTCL_LISP) --load $(DOTCL_ROOT)bench/library-status/render.lisp
+
 # The gate over an ANSI run: the set of failing test names must be the set
 # ansi-state.json records. Runs against the outputs test-ansi-all left behind,
 # and BEFORE update-ansi-state -- which rewrites that record from the same run
 # and would make any comparison afterwards trivially true.
 test-ansi-gate:
-	@sh $(DOTCL_ROOT)test/ansi-gate.sh $(DOTCL_ROOT)ansi-state.json $(ANSI_CATEGORIES)
+	@ANSI_OUT_DIR=$(ANSI_OUT) sh $(DOTCL_ROOT)test/ansi-gate.sh $(DOTCL_ROOT)ansi-state.json $(ANSI_CATEGORIES)
 
 update-ansi-state:
 	@has_results=0; \
 	for cat in $(ANSI_CATEGORIES); do \
-		if [ -f "/tmp/ansi-$$cat.txt" ]; then has_results=1; break; fi; \
+		if [ -f "$(ANSI_OUT)/ansi-$$cat.txt" ]; then has_results=1; break; fi; \
 	done; \
 	if [ $$has_results -eq 0 ]; then \
-		echo "No /tmp/ansi-*.txt results found; keeping existing ansi-state.json"; \
+		echo "No $(ANSI_OUT)/ansi-*.txt results found; keeping existing ansi-state.json"; \
 	else \
 		: 'Capture the hand-written half of the file BEFORE the redirection below'; \
 		: 'truncates it. Everything between "source" and "total" is judgement no'; \
@@ -388,7 +409,7 @@ update-ansi-state:
 		: 'Totals, summed over the categories that produced output.'; \
 		sum_tests=0; sum_fail=0; \
 		for cat in $(ANSI_CATEGORIES); do \
-			outfile=/tmp/ansi-$$cat.txt; \
+			outfile=$(ANSI_OUT)/ansi-$$cat.txt; \
 			[ -f "$$outfile" ] || continue; \
 			t=$$(grep -a "" "$$outfile" | grep -o '[0-9]* tests total' | awk '{print $$1}' | tail -1); \
 			[ -n "$$t" ] || continue; \
@@ -405,14 +426,14 @@ update-ansi-state:
 		: 'in the hand-written half above.'; \
 		printf '  "known-failures": ['; \
 		kf_first=1; \
-		for n in $$(sh $(DOTCL_ROOT)test/ansi-failures.sh $(ANSI_CATEGORIES)); do \
+		for n in $$(ANSI_OUT_DIR=$(ANSI_OUT) sh $(DOTCL_ROOT)test/ansi-failures.sh $(ANSI_CATEGORIES)); do \
 			if [ $$kf_first -eq 0 ]; then printf ', '; fi; kf_first=0; \
 			printf '"%s"' "$$n"; \
 		done; \
 		printf '],\n'; \
 		completed=""; \
 		for cat in $(ANSI_CATEGORIES); do \
-			outfile=/tmp/ansi-$$cat.txt; \
+			outfile=$(ANSI_OUT)/ansi-$$cat.txt; \
 			if [ -f "$$outfile" ] && grep -a "" "$$outfile" | grep -q 'No tests failed'; then \
 				total=$$(grep -a "" "$$outfile" | grep -o '[0-9]* tests total' | awk '{print $$1}'); \
 				if [ -n "$$total" ] && [ "$$total" -gt 0 ] 2>/dev/null; then \
@@ -425,7 +446,7 @@ update-ansi-state:
 		echo '  "categories": {'; \
 		first=1; \
 		for cat in $(ANSI_CATEGORIES); do \
-			outfile=/tmp/ansi-$$cat.txt; \
+			outfile=$(ANSI_OUT)/ansi-$$cat.txt; \
 			if [ $$first -eq 0 ]; then echo ','; fi; first=0; \
 			if [ ! -f "$$outfile" ]; then \
 				printf '    %-30s {"tests": null, "pass": null, "status": "untested", "blocker": null}' "\"$$cat\":"; \
@@ -476,6 +497,19 @@ setup-ansi-test:
 ASDF_BRANCH ?= dotcl-0.1.21
 QUICKLISP_CLIENT_BRANCH ?= dotcl-support
 
+# The branch name alone is not enough: "right branch, months behind" passes it
+# in silence. asdf/ is a separate clone of another repository, so nothing done
+# to this tree updates it, and contrib/asdf/asdf.{lisp,fasl} are generated from
+# it and go stale with it. A bug already fixed upstream then keeps reproducing
+# here, and reads as a runtime bug rather than an old checkout. So setup-asdf
+# also fetches and compares against origin. Set ASDF_ALLOW_STALE=1 to build
+# against the checkout as it is (and to skip the fetch).
+ASDF_ALLOW_STALE ?=
+# quicklisp-client/ is the same arrangement one target down: a separate clone
+# that contrib/quicklisp/quicklisp.{lisp,fasl} are generated from, so setup-
+# quicklisp checks it the same way. QUICKLISP_ALLOW_STALE=1 is its escape.
+QUICKLISP_ALLOW_STALE ?=
+
 setup-asdf:
 	@# dotcl-0.1.21 is the compat-generation bundle branch: it pairs with the
 	@# launch-process keyword API, the run-time os-cond / single-FASL work, and
@@ -498,6 +532,22 @@ setup-asdf:
 			echo "  git -C $(DOTCL_ROOT)asdf switch $(ASDF_BRANCH)"; \
 			echo "If '$$cur' is deliberate, re-run with ASDF_BRANCH=$$cur."; \
 			exit 1; \
+		elif [ -n "$(ASDF_ALLOW_STALE)" ]; then \
+			echo "asdf/: ASDF_ALLOW_STALE set, not checking whether it is up to date"; \
+		elif ! GIT_TERMINAL_PROMPT=0 git -C $(DOTCL_ROOT)asdf fetch -q origin $(ASDF_BRANCH) 2>/dev/null; then \
+			echo "asdf/: cannot reach origin, skipping the up-to-date check (offline?)"; \
+		else \
+			behind=$$(git -C $(DOTCL_ROOT)asdf rev-list --count HEAD..FETCH_HEAD 2>/dev/null); \
+			if [ -n "$$behind" ] && [ "$$behind" != 0 ]; then \
+				echo "asdf/ is $$behind commit(s) behind origin/$(ASDF_BRANCH)."; \
+				echo "contrib/asdf/asdf.lisp and asdf.fasl are generated from it, so they are"; \
+				echo "stale too: a bug already fixed upstream will keep reproducing here."; \
+				echo "  git -C $(DOTCL_ROOT)asdf pull --ff-only origin $(ASDF_BRANCH)"; \
+				echo "  rm -f $(DOTCL_ROOT)contrib/asdf/asdf.fasl"; \
+				echo "Then re-run this target. To build against this checkout as it is,"; \
+				echo "re-run with ASDF_ALLOW_STALE=1."; \
+				exit 1; \
+			fi; \
 		fi; \
 	fi
 	@# Unconditionally, not only when build/asdf.lisp is missing: make-asdf.sh
@@ -533,6 +583,22 @@ setup-quicklisp:
 			echo "  git -C $(DOTCL_ROOT)quicklisp-client switch $(QUICKLISP_CLIENT_BRANCH)"; \
 			echo "If '$$cur' is deliberate, re-run with QUICKLISP_CLIENT_BRANCH=$$cur."; \
 			exit 1; \
+		elif [ -n "$(QUICKLISP_ALLOW_STALE)" ]; then \
+			echo "quicklisp-client/: QUICKLISP_ALLOW_STALE set, not checking whether it is up to date"; \
+		elif ! GIT_TERMINAL_PROMPT=0 git -C $(DOTCL_ROOT)quicklisp-client fetch -q origin $(QUICKLISP_CLIENT_BRANCH) 2>/dev/null; then \
+			echo "quicklisp-client/: cannot reach origin, skipping the up-to-date check (offline?)"; \
+		else \
+			behind=$$(git -C $(DOTCL_ROOT)quicklisp-client rev-list --count HEAD..FETCH_HEAD 2>/dev/null); \
+			if [ -n "$$behind" ] && [ "$$behind" != 0 ]; then \
+				echo "quicklisp-client/ is $$behind commit(s) behind origin/$(QUICKLISP_CLIENT_BRANCH)."; \
+				echo "contrib/quicklisp/quicklisp.lisp and quicklisp.fasl are generated from it,"; \
+				echo "so they are stale too: a bug already fixed upstream will keep reproducing here."; \
+				echo "  git -C $(DOTCL_ROOT)quicklisp-client pull --ff-only origin $(QUICKLISP_CLIENT_BRANCH)"; \
+				echo "  rm -f $(DOTCL_ROOT)contrib/quicklisp/quicklisp.fasl"; \
+				echo "Then re-run this target. To build against this checkout as it is,"; \
+				echo "re-run with QUICKLISP_ALLOW_STALE=1."; \
+				exit 1; \
+			fi; \
 		fi; \
 	fi
 	@mkdir -p $(DOTCL_ROOT)contrib/quicklisp
@@ -672,7 +738,14 @@ PARITY_EXE      = $(PARITY_DIR)/bin/Release/net10.0/$(PARITY_EXE_NAME)
 # Both halves already take the minimum of 5 samples inside one process; that
 # settled the in-process spread to a few percent but left up to 1.3x between
 # processes, which is more than the CI threshold is trying to detect.
-PARITY_PASSES  ?= 2
+#
+# Five, not two, because some kernels run at two distinct speeds depending on
+# the process (code placement; bench/modes.awk), and the minimum only reports
+# the fast one if some process drew it. In one recorded case 10 of 14 processes
+# drew the slow group: two processes then miss the fast group about half the
+# time, five about a fifth. Five is also enough for the split itself to be
+# detected and printed, which needs three. Raise it to study one kernel.
+PARITY_PASSES  ?= 5
 
 .PHONY: bench-parity
 
@@ -689,6 +762,7 @@ else
 bench-parity: cross-compile bench-build
 	@mkdir -p $(BENCH_TMP)
 	@echo "=== Building the C# side ==="
+	@bash $(DOTCL_ROOT)bench/test-modes.sh
 	@dotnet build $(PARITY_DIR)/Parity.csproj -c Release -v:q --nologo
 	@rm -f $(BENCH_TMP)/parity-csharp.txt $(BENCH_TMP)/parity-dotcl.txt
 	@for pass in $$(seq 1 $(PARITY_PASSES)); do \
@@ -697,6 +771,8 @@ bench-parity: cross-compile bench-build
 	    echo "=== pass $$pass/$(PARITY_PASSES): dotcl ==="; \
 	    DOTNET_gcServer=0 $(SETSID) timeout $(BENCH_TIMEOUT) $(BENCH_RUNTIME) --asm $(DOTCL_ROOT)compiler/cil-out.sil $(PARITY_DIR)/kernels.lisp < /dev/null | tee -a $(BENCH_TMP)/parity-dotcl.txt; \
 	done
+	@echo "=== per-process distribution ==="
+	@bash $(DOTCL_ROOT)bench/process-modes.sh --no-compare dotcl=$(BENCH_TMP)/parity-dotcl.txt csharp=$(BENCH_TMP)/parity-csharp.txt
 	@bash $(PARITY_DIR)/make-parity-state.sh $(BENCH_TMP)/parity-csharp.txt $(BENCH_TMP)/parity-dotcl.txt $(DOTCL_ROOT)bench-state.json > $(BENCH_TMP)/parity-state-new.json && mv $(BENCH_TMP)/parity-state-new.json $(DOTCL_ROOT)bench-state.json
 	@echo "Updated bench-state.json"
 	@bash $(DOTCL_ROOT)bench/check-ratios.sh $(DOTCL_ROOT)bench-state.json $(DOTCL_ROOT)bench/ratio-baseline.json $(HOST_RID)
@@ -755,8 +831,36 @@ setup-cl-bench:
 # cil-out.sil is the actual artifact; cross-compile is a phony alias kept
 # for backward compatibility. Dependencies on $(CIL_SOURCES) and
 # cil-compile.lisp let make skip rebuilds when no source has changed.
+# The exit status of the Lisp half is not evidence that this rule ran. A read or
+# compile error puts the host in the debugger, the closed stdin hands it EOF, and
+# it exits 0 -- so make records the rule as succeeded, cil-out.sil keeps whatever
+# it already held, and every later step measures a stale artifact while the build
+# reports success. The tree's written habit of "when a fix seems to have no
+# effect, check the artifact's date" is a human convention covering this hole.
+#
+# So the rule checks the ARTIFACT rather than the status: it must exist, and it
+# must be newer than every input. That holds for whatever new way the Lisp half
+# finds to fail, which an exit-code check would not. It cannot fire on a no-op
+# rebuild: make only runs this recipe when the target is already out of date
+# against these same inputs, so reaching here means it was supposed to be
+# rewritten.
 $(DOTCL_ROOT)compiler/cil-out.sil: $(CIL_SOURCES) $(DOTCL_ROOT)compiler/cil-compile.lisp
 	DOTCL_INPUTS="$(CIL_SOURCES)" DOTCL_OUTPUT="$@" $(DOTCL_LISP) --load $(DOTCL_ROOT)compiler/cil-compile.lisp
+	@if [ ! -f "$@" ]; then \
+	  echo "cross-compile: $@ was not produced." >&2; \
+	  echo "  The Lisp host exits 0 on a read or compile error, so its status says" >&2; \
+	  echo "  nothing. Look for the error above." >&2; \
+	  exit 1; \
+	fi
+	@for s in $^; do \
+	  if [ ! "$@" -nt "$$s" ]; then \
+	    echo "cross-compile: $@ is older than $$s -- it was not regenerated." >&2; \
+	    echo "  The Lisp host exits 0 on a read or compile error, so its status says" >&2; \
+	    echo "  nothing. Look for the error above; everything downstream would have" >&2; \
+	    echo "  measured the previous artifact." >&2; \
+	    exit 1; \
+	  fi; \
+	done
 
 cross-compile: $(DOTCL_ROOT)compiler/cil-out.sil
 
@@ -1162,8 +1266,13 @@ _PACK_VERSION_ARG := $(if $(PACK_VERSION),-p:Version=$(PACK_VERSION),)
 # Nuke runtime/contrib first so a contrib directory deleted from source
 # stops shipping in the nupkg (old dotcl-repl/ stayed in the
 # installed tool for at least one release after its source was removed).
+# Then drop any multi-core JIT profile left in the build output. Those now go
+# to the user's cache, but a tree that predates the change still has the ones
+# older runs wrote next to the published exe, and dotnet pack sweeps whatever
+# it finds there into the package. test/pack-nuspec/check.sh asserts the result.
 pack: compile-asdf-fasl compile-asdf-fasls compile-quicklisp-fasl compile-core-fasl compile-contrib-fasls contrib-dotcl-cs compile-core-fasl-r2r-all compile-asdf-fasl-r2r-all compile-contrib-fasls-r2r-all
 	rm -rf $(DOTCL_ROOT)runtime/contrib
+	@find $(DOTCL_ROOT)runtime/bin -name 'dotcl.profile' -delete 2>/dev/null || true
 	cp $(DOTCL_ROOT)compiler/dotcl.core $(DOTCL_ROOT)runtime/dotcl.core
 	@for rid in $(R2R_RIDS); do \
 		cp $(DOTCL_ROOT)compiler/dotcl.core.r2r-$$rid $(DOTCL_ROOT)runtime/dotcl.core.r2r-$$rid; \

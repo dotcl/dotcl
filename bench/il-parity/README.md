@@ -61,3 +61,27 @@ numbers agree before it reports on instructions:
   allocator instead of the code under comparison.
 - Add the pair to the self-check table above, and to `methods.txt` so the
   comparator knows which C# method answers which Lisp function.
+
+## What a count change means, and what it does not
+
+An instruction count is evidence about **emitted size**. It is not evidence
+about **time**, in either direction, and the two have come apart in both
+directions in practice.
+
+A count that went **up** while the program got **faster**: the array element
+buffer hoist used to read a buffer that a fill-pointered or adjustable vector
+could replace underneath it, which lost writes silently. The fix gives each
+access a path for the case where the buffer cannot be taken, and emits the body
+twice for loops so the test sits outside the loop rather than inside it. Totals
+here rose 1.3x to 1.8x -- `hash/ILP-HASH-PUT` 177 to 316, `heap/ILP-HEAP-POP`
+141 to 247, `stack/ILP-STACK-PUSH` 36 to 47 -- while the machine code of the
+inner loop came out **byte-identical** to what it had been, and the kernel it
+was measured on ran in the same time as before. Read as "the gap to C# grew",
+that would have been false in the only sense anyone cares about.
+
+A count that stayed **the same** while the program got faster has also happened,
+so the rule is not "up is bad, flat is good".
+
+So when a count moves, say what moved in the emitted code and check the machine
+code or the clock before concluding anything about speed. `DOTNET_JitDisasm` on
+the inner loop settles it in minutes and has settled it three times.

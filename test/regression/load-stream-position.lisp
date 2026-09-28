@@ -21,7 +21,7 @@
 
 (defun %lsp-case (op)
   (let* ((tmp (format nil "~a/dotcl-loadpos-~a"
-                      (or (dotcl:getenv "TEMP") "/tmp")
+                      (regression-temp-dir)
                       (get-internal-real-time)))
          (src (format nil "~a/src.lisp" tmp)))
     (ensure-directories-exist (concatenate 'string tmp "/"))

@@ -30,7 +30,6 @@ public class GrayStreamTextWriter : TextWriter
     private readonly LispInstance _stream;
     private LispFunction? _writeCharFn;
     private LispFunction? _writeStringFn;
-    private LispFunction? _forceOutputFn;
 
     public GrayStreamTextWriter(LispInstance stream) => _stream = stream;
 
@@ -71,13 +70,16 @@ public class GrayStreamTextWriter : TextWriter
         }
     }
 
+    // The printer flushes the TextWriter it wrote through after every PRINC,
+    // PRIN1, WRITE and the like, for the console's sake. On a gray stream that
+    // turned each of them into a STREAM-FORCE-OUTPUT call the user never asked
+    // for (CLHS: printing functions do not force output; SBCL does not call it),
+    // and a stream whose force-output method forwards to a wrapped native stream
+    // then failed with no applicable method. Explicit FORCE-OUTPUT and
+    // FINISH-OUTPUT reach the gray generics directly (Runtime.IO), so this bridge
+    // has nothing to flush.
     public override void Flush()
     {
-        if (_forceOutputFn == null)
-        {
-            _forceOutputFn = GrayStreamLookup.GrayOrCl("STREAM-FORCE-OUTPUT");
-        }
-        _forceOutputFn?.Invoke(new LispObject[] { _stream });
     }
 }
 

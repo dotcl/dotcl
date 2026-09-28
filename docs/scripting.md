@@ -60,8 +60,9 @@ Falling off the end of the file exits 0. `dotcl:quit` sets the code:
 An unhandled error also exits non-zero, after printing the condition, so a script
 that does nothing about failure still reports it to the shell.
 
-That holds even when a restart is available. In a REPL an unhandled error stops
-at the debugger and you pick a restart; a script run has nobody to ask, so the
+That holds even when a restart is available. In a REPL at a terminal an
+unhandled error stops at the debugger and you pick a restart; a script run, like
+a REPL whose input is piped in, has nobody to ask, so the
 debugger prints the condition and the restarts that were available and then
 unwinds, and the process exits non-zero. It does not choose a restart on the
 program's behalf -- the restarts in scope usually belong to a library rather than
@@ -83,6 +84,22 @@ Unix-like systems:
 $ chmod +x greet.lisp
 $ ./greet.lisp world
 ```
+
+## A script on standard input
+
+`-` in place of the file name reads the script from standard input, and the
+rest of the line is its arguments as for a file. With no program named at all
+and standard input not a terminal, plain `dotcl` does the same:
+
+```console
+$ echo '(print (+ 1 2))' | dotcl
+$ generate-code | dotcl - world twice
+```
+
+Standard input is the program only when nothing else is: with a file, `--load`
+or `--eval` on the line it is the program's data (`... | dotcl --eval
+'(print (read-line))'`), and `dotcl repl` stays a REPL. A file named `-` is run
+as `./-`.
 
 ## `--load` and `--eval`
 

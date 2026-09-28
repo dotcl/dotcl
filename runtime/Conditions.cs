@@ -173,7 +173,46 @@ public class LispErrorException : Exception
         // Per CL spec: error signals the condition through handler-bind before throwing.
         // If a handler does a non-local exit, this constructor never returns.
         HandlerClusterStack.Signal(condition);
+        // No handler took it. Where the REPL has asked for it, that is the
+        // point ERROR hands over to the debugger, and this constructor is the
+        // one place every runtime-signalled error passes through after its
+        // handlers have run: the frames that signalled are still on the stack.
+        if (ConditionSystem.UnhandledErrorsEnterDebugger)
+            ConditionSystem.InvokeDebugger(condition);
     }
+
+    /// <summary>Selects the constructor that does not signal.</summary>
+    protected readonly struct NoSignal { }
+
+    /// <summary>
+    /// For a condition whose handlers have already run (and whose debugger, if
+    /// any, has already been entered): wraps it for the unwind and nothing else.
+    /// </summary>
+    protected LispErrorException(LispCondition condition, NoSignal _)
+        : base(condition.Message)
+    {
+        Condition = condition;
+    }
+
+    /// <summary>
+    /// The exception that unwinds for CONDITION without signalling it again.
+    /// ERROR signals first and then calls INVOKE-DEBUGGER; the throw after that
+    /// is reached only if INVOKE-DEBUGGER returned, and building it with the
+    /// public constructor would run every handler a second time for the same
+    /// condition.
+    /// </summary>
+    public static LispErrorException WithoutSignal(LispCondition condition)
+        => new LispErrorException(condition, default(NoSignal));
+
+    /// <summary>
+    /// The condition's report, the way PRINC prints it. A condition built from
+    /// a DEFINE-CONDITION class knows only its class name until its report runs,
+    /// so the text captured by the base constructor is "#&lt;SIMPLE-PACKAGE-ERROR&gt;"
+    /// and any diagnostic that logs Message alone -- the pack and build
+    /// subcommands do -- said nothing about what went wrong. Rendering on read
+    /// runs the report; it falls back to the captured text if it cannot.
+    /// </summary>
+    public override string Message => ConditionText.Report(Condition);
 }
 
 /// <summary>
@@ -216,20 +255,26 @@ public class LispRestart : LispObject
         IsBindRestart = isBindRestart;
     }
 
-    public override string ToString()
+    /// <summary>What the restart prints as with *print-escape* nil (CLHS
+    /// RESTART-CASE :report): the report function's output, or the :report
+    /// string, or, with neither, the name as PRIN1 writes it. An anonymous
+    /// restart with no report falls back to the escaped form.</summary>
+    public string Report()
     {
+        if (ReportFunction is LispString rs) return rs.Value;
         if (ReportFunction != null)
         {
-            try
-            {
-                var stream = new LispStringOutputStream(new System.IO.StringWriter());
-                Runtime.Funcall(ReportFunction, stream);
-                return stream.GetString();
-            }
-            catch { }
+            var sw = new System.IO.StringWriter();
+            Runtime.Funcall(ReportFunction, new LispStringOutputStream(sw));
+            return sw.ToString();
         }
-        return $"#<RESTART {Name}>";
+        if (Description != null) return Description;
+        if (NameSymbol != null) return Runtime.FormatObject(NameSymbol, true);
+        if (Name != "NIL") return Name;
+        return ToString();
     }
+
+    public override string ToString() => $"#<RESTART {Name}>";
 }
 
 /// <summary>
@@ -602,12 +647,86 @@ public class RestartInvocationException : Exception
 
 public static class ConditionSystem
 {
+    [ThreadStatic]
+    private static bool t_unhandledErrorsEnterDebugger;
+
+    /// <summary>
+    /// When true, an error the runtime signals itself (a type error from CAR,
+    /// an undefined function, an index out of bounds, ...) that no handler
+    /// takes enters the debugger the way an unhandled ERROR does, instead of
+    /// only unwinding. Per thread; the REPL sets it for the evaluation of each
+    /// form it reads and nothing else does, so a script, a library's own
+    /// try/catch and the REPL's reader are unaffected. It is off while the
+    /// debugger (or *DEBUGGER-HOOK*) runs, so an error there unwinds as before
+    /// instead of opening a debugger inside the debugger.
+    /// </summary>
+    public static bool UnhandledErrorsEnterDebugger
+    {
+        get => t_unhandledErrorsEnterDebugger;
+        set => t_unhandledErrorsEnterDebugger = value;
+    }
+
+    /// <summary>
+    /// Hand an unhandled error to INVOKE-DEBUGGER, which runs *DEBUGGER-HOOK*
+    /// and then the debugger. Returns only when there is no INVOKE-DEBUGGER to
+    /// call or it returned; the caller then unwinds.
+    /// </summary>
+    internal static void InvokeDebugger(LispCondition condition)
+    {
+        if (Startup.Sym("INVOKE-DEBUGGER").Function is not LispFunction invDbgFn) return;
+        bool saved = t_unhandledErrorsEnterDebugger;
+        t_unhandledErrorsEnterDebugger = false;
+        try
+        {
+            // No debugger frame: this is ERROR handing control over, not a call
+            // the user made. Recording it would put INVOKE-DEBUGGER between
+            // *DEBUGGER-HOOK* and the frame that signalled, shifting every index
+            // the hook reads (a user (invoke-debugger c) still gets a frame: it
+            // goes through the ordinary compiled call path).
+            invDbgFn.InvokeNoFrame(condition);
+        }
+        finally
+        {
+            t_unhandledErrorsEnterDebugger = saved;
+        }
+    }
+
     // --- Ctrl-C interrupt delivery ---
 
     private static volatile bool _interruptRequested = false;
 
     /// <summary>Request interrupt delivery (called from Console.CancelKeyPress on another thread).</summary>
     public static void RequestInterrupt() => _interruptRequested = true;
+
+    /// <summary>
+    /// Drop a pending interrupt without delivering it; true when there was one.
+    /// For a caller that ran a child process on the same terminal: Ctrl+C
+    /// pressed while the child ran was meant for the child, which has had it.
+    /// </summary>
+    public static bool DiscardInterrupt()
+    {
+        var was = _interruptRequested;
+        _interruptRequested = false;
+        return was;
+    }
+
+    /// <summary>
+    /// For a line read on a Windows console that came back null: was that Ctrl+C
+    /// rather than the end of input? The console ends the pending read when the
+    /// key is pressed and runs the CancelKeyPress handler on another thread, so
+    /// the request may land a moment after the read returns; wait briefly for it.
+    /// Consumes the request when it is there, so it is not delivered again at the
+    /// next safepoint.
+    /// </summary>
+    public static bool TakeConsoleInterrupt()
+    {
+        if (!Compat.IsWindows() || Console.IsInputRedirected) return false;
+        for (int i = 0; i < 10 && !_interruptRequested; i++)
+            System.Threading.Thread.Sleep(10);
+        if (!_interruptRequested) return false;
+        _interruptRequested = false;
+        return true;
+    }
 
     /// <summary>
     /// Check and deliver a pending interrupt. Called periodically from hot paths (LispFunction.Invoke).
@@ -678,7 +797,7 @@ public static class ConditionSystem
                 {
                     var breakSym = Startup.Sym("BREAK");
                     if (breakSym.Function is LispFunction breakFn)
-                        breakFn.Invoke(new LispString(condition.Message));
+                        breakFn.Invoke(new LispString(ConditionText.Report(condition)));
                 }
             }
             finally
@@ -700,17 +819,10 @@ public static class ConditionSystem
         CheckBreakOnSignals(condition);
         HandlerClusterStack.Signal(condition);
         // Not handled -> invoke debugger (per CLHS)
-        var invokeDebugger = Startup.Sym("INVOKE-DEBUGGER");
-        if (invokeDebugger.Function is LispFunction invDbgFn)
-        {
-            // No debugger frame: this is ERROR handing control over, not a call
-            // the user made. Recording it would put INVOKE-DEBUGGER between
-            // *DEBUGGER-HOOK* and the frame that signalled, shifting every index
-            // the hook reads (a user (invoke-debugger c) still gets a frame: it
-            // goes through the ordinary compiled call path).
-            invDbgFn.InvokeNoFrame(condition);
-        }
-        throw new LispErrorException(condition);
+        InvokeDebugger(condition);
+        // Reached only if INVOKE-DEBUGGER returned. The handlers have seen this
+        // condition already.
+        throw LispErrorException.WithoutSignal(condition);
     }
 
     public static LispObject Warn(LispCondition condition)
@@ -751,15 +863,18 @@ public static class ConditionSystem
             // Not handled -> print warning to *error-output*
             try
             {
+                // Painted only where *ERROR-OUTPUT* is still the process's
+                // standard error and the REPL has turned colour on for it.
                 var errSym = Startup.Sym("*ERROR-OUTPUT*");
+                var text = $"WARNING: {ConditionText.Report(condition)}";
                 if (DynamicBindings.TryGet(errSym, out var errStream) && errStream is LispOutputStream los)
-                    los.Writer.WriteLine($"WARNING: {condition.Message}");
+                    los.Writer.WriteLine(ReplColor.ForStream("WARNING", text, los));
                 else
-                    Console.Error.WriteLine($"WARNING: {condition.Message}");
+                    Console.Error.WriteLine(ReplColor.ForErr("WARNING", text));
             }
             catch
             {
-                Console.Error.WriteLine($"WARNING: {condition.Message}");
+                Console.Error.WriteLine($"WARNING: {ConditionText.Report(condition)}");
             }
         }
         return Nil.Instance;

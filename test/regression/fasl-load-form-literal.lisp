@@ -19,7 +19,7 @@
 
 (defvar *fllf-source*
   (concatenate 'string
-               (substitute #\/ #\\ (or (dotcl:getenv "TMPDIR") (dotcl:getenv "TEMP") "/tmp"))
+               (regression-temp-dir)
                "/dotcl-fasl-load-form-literal.lisp"))
 
 (with-open-file (out *fllf-source* :direction :output :if-exists :supersede)

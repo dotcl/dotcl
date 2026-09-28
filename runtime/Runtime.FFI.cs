@@ -58,7 +58,9 @@ static class NativeFFI
     {
         if (targetType == typeof(IntPtr))
         {
-            if (arg is Fixnum fx) return new IntPtr(fx.Value);
+            // 2^63..2^64-1 arrive as Bignum; they are the same pointer bits as
+            // their negative spelling (e.g. SQLITE_TRANSIENT, (mod -1 (expt 2 64))).
+            if (arg is Fixnum or Bignum) return new IntPtr(Runtime.ToPointerBits(arg, "dotnet:ffi"));
             if (arg is LispDotNetObject dno && dno.Value is IntPtr ip) return ip;
             if (arg is Nil) return IntPtr.Zero;
             if (arg is LispString ls)
@@ -152,7 +154,7 @@ static class NativeFFI
         if (IsVoidType(retType) || result == null) return Nil.Instance;
         return result switch
         {
-            IntPtr ip => Fixnum.Make(ip.ToInt64()),
+            IntPtr ip => Runtime.PointerToLisp(ip),
             int i => Fixnum.Make(i),
             uint u => Fixnum.Make((long)u),
             long l => Fixnum.Make(l),
@@ -568,6 +570,6 @@ public static partial class Runtime
             throw new LispErrorException(new LispProgramError(
                 "dotnet:make-ffi-callback: requires (fn arg-types ret-type)"));
         var ptr = NativeFFI.MakeCallback(args[0], args[1], args[2]);
-        return Fixnum.Make(ptr.ToInt64());
+        return Runtime.PointerToLisp(ptr);
     }
 }

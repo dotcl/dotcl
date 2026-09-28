@@ -43,7 +43,13 @@ if [ ! -f "$ROOT/compiler/dotcl.core" ]; then
   exit 0
 fi
 
-WORK="$(mktemp -d)"
+# mktemp -d on macOS returns a path under /var/folders, which is itself a
+# symlink to /private/var/folders. MSBuild resolves relative ProjectReference
+# paths against the resolved (physical) directory, so a relative path counted
+# from the /var/folders spelling lands one directory level off and the
+# reference is reported missing. Resolving the physical path up front keeps
+# ROOT and WORK on the same footing.
+WORK="$(cd "$(mktemp -d)" && pwd -P)"
 trap 'rm -rf "$WORK"' EXIT
 
 fail=0

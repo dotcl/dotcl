@@ -101,7 +101,7 @@
 
 (defun nlk-temp-dir (tag)
   (let ((d (funcall (find-symbol "%COMBINE" "NUGET")
-                    (dotnet:static "System.IO.Path" "GetTempPath")
+                    (regression-temp-dir)
                     (format nil "dotcl-nlk-~a-~a" tag
                             (dotnet:invoke (dotnet:static "System.Guid" "NewGuid")
                                            "ToString" "N")))))

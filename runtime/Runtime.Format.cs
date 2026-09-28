@@ -61,8 +61,11 @@ public static partial class Runtime
 
         if (dest is Nil)
         {
-            var result = FormatStringTop(formatString, formatArgs2);
-            return new LispString(result);
+            if (!_fmtToPretty)
+                return new LispString(FormatStringTop(formatString, formatArgs2));
+            _fmtToPretty = false;
+            try { return new LispString(FormatStringTop(formatString, formatArgs2)); }
+            finally { _fmtToPretty = true; }
         }
 
         // Resolve the output stream to check AtLineStart
@@ -75,8 +78,15 @@ public static partial class Runtime
         while (resolved is LispSynonymStream syn2) resolved = DynamicBindings.Get(syn2.Symbol);
         bool atLineStart = resolved is LispStream ls2 ? ls2.AtLineStart : true;
 
-        var result2 = FormatStringTop(formatString, formatArgs2, atLineStart,
-                                   StreamInitialColumn(resolved));
+        bool savedToPretty2 = _fmtToPretty;
+        _fmtToPretty = IsStagedPrettyDest(resolved);
+        string result2;
+        try
+        {
+            result2 = FormatStringTop(formatString, formatArgs2, atLineStart,
+                                      StreamInitialColumn(resolved));
+        }
+        finally { _fmtToPretty = savedToPretty2; }
 
         // Write result and update AtLineStart
         if (dest is T)
@@ -1189,6 +1199,8 @@ public static partial class Runtime
 
         int argIdx = 0;
         string result;
+        bool savedToPretty = _fmtToPretty;
+        _fmtToPretty = IsStagedPrettyDest(resolved);
         try
         {
             result = FormatString(template, args, ref argIdx, atLineStart,
@@ -1200,6 +1212,7 @@ public static partial class Runtime
             // ends the operation here rather than escaping as an error.
             result = ex.PartialOutput;
         }
+        finally { _fmtToPretty = savedToPretty; }
 
         if (dest is T)
         {
@@ -1253,8 +1266,173 @@ public static partial class Runtime
     /// flushes first -> reordered output). Flushing the parent's staged content right
     /// before recursing preserves source order. No-op outside a
     /// pretty logical block (_pprintActive false), so non-pretty FORMAT is unaffected.
+    private static void AppendNewlineInBlock(System.Text.StringBuilder sb)
+    {
+        // A newline inside a pretty logical block starts the next line with the
+        // per-line prefixes of the enclosing blocks, as TERPRI there does
+        // (PprintAfterNewline). Indentation is not added: that belongs to
+        // conditional newlines (~_), not to a literal one, and SBCL agrees.
+        sb.Append('\n');
+        if (_pprintActive && _pprintPerLinePrefix != null)
+            sb.Append(_pprintPerLinePrefix);
+    }
+
+    // Builders of FORMAT calls that are waiting on user code (~/fn/, or the
+    // print-object / condition report behind ~A ~S ~W) while they hold staged
+    // output of a pretty logical block. When that code's own FORMAT flushes to the
+    // pretty stream at ~_, the waiting output was printed before it and has to
+    // reach the stream first. Flushed only then, so nothing changes for user code
+    // that never writes to the pretty stream (e.g. inside ~<...~> justification).
+    [ThreadStatic] private static List<(System.Text.StringBuilder sb, TextWriter stream)>? _pprintStaged;
+
+    private static void PprintPushStaged(System.Text.StringBuilder sb)
+    {
+        if (!_pprintActive || _pprintStream == null) return;
+        (_pprintStaged ??= new()).Add((sb, _pprintStream));
+    }
+
+    private static void PprintPopStaged(System.Text.StringBuilder sb)
+    {
+        var st = _pprintStaged;
+        if (st != null && st.Count > 0 && ReferenceEquals(st[st.Count - 1].sb, sb))
+            st.RemoveAt(st.Count - 1);
+    }
+
+    private static void PprintFlushStagedOuter()
+    {
+        var st = _pprintStaged;
+        if (st == null) return;
+        for (int k = 0; k < st.Count; k++)
+        {
+            var (osb, ostream) = st[k];
+            if (osb.Length == 0) continue;
+            var text = osb.ToString();
+            ostream.Write(text);
+            if (ReferenceEquals(ostream, _pprintStream)) PprintTrackWrite(text);
+            osb.Clear();
+        }
+    }
+
+    private static string FormatAestheticStaged(LispObject obj, System.Text.StringBuilder sb)
+    {
+        if (!_pprintActive || _pprintStream == null) return FormatAesthetic(obj);
+        PprintPushStaged(sb);
+        try { return FormatAesthetic(obj); }
+        finally { PprintPopStaged(sb); }
+    }
+
+    private static string FormatTopStaged(LispObject obj, bool escape, System.Text.StringBuilder sb)
+    {
+        if (!_pprintActive || _pprintStream == null) return FormatTop(obj, escape);
+        PprintPushStaged(sb);
+        try { return FormatTop(obj, escape); }
+        finally { PprintPopStaged(sb); }
+    }
+
+    // True while the FORMAT being run writes (possibly through staged buffers)
+    // into the stream of the innermost FORMAT logical block: its body, the
+    // directives nested in it, and user code FORMAT to a stream whose buffer is
+    // staged for that block. ~T then counts the column from what that block has
+    // printed, not from this FORMAT's own buffer alone.
+    [ThreadStatic] private static bool _fmtToPretty;
+    // Column at which the content of a FORMAT logical block's writer starts.
+    [ThreadStatic] private static Dictionary<TextWriter, int>? _fmtBlockStartCol;
+
+    /// <summary>Is DEST a stream whose buffer is staged for the current pretty stream
+    /// (the stream handed to ~/fn/ or to a print-object method inside a block)?</summary>
+    private static bool IsStagedPrettyDest(LispObject dest)
+    {
+        if (!_pprintActive || _pprintStream == null) return false;
+        var st = _pprintStaged;
+        if (st == null || st.Count == 0) return false;
+        if (dest is not LispOutputStream los || los.Writer is not System.IO.StringWriter sw) return false;
+        var b = sw.GetStringBuilder();
+        for (int k = 0; k < st.Count; k++)
+            if (ReferenceEquals(st[k].sb, b) && ReferenceEquals(st[k].stream, _pprintStream)) return true;
+        return false;
+    }
+
+    /// <summary>Count the characters after the last newline of B into COUNT;
+    /// true when B has a newline (COUNT is then the column).</summary>
+    private static bool TailAfterNewline(System.Text.StringBuilder b, ref int count)
+    {
+        for (int k = b.Length - 1; k >= 0; k--)
+        {
+            if (b[k] == '\n') return true;
+            count++;
+        }
+        return false;
+    }
+
+    /// <summary>The column after the text in SB, inside a FORMAT logical
+    /// block: what the block's writer holds, then the staged buffers bound for it,
+    /// then SB. False when not inside such a block.</summary>
+    private static bool TryPrettyColumn(System.Text.StringBuilder sb, out int col)
+    {
+        col = 0;
+        if (!_fmtToPretty || !_pprintActive || _pprintStream is not System.IO.StringWriter bw) return false;
+        if (_fmtBlockStartCol == null || !_fmtBlockStartCol.TryGetValue(bw, out int baseCol)) return false;
+        int count = 0;
+        if (TailAfterNewline(sb, ref count)) { col = count; return true; }
+        var st = _pprintStaged;
+        if (st != null)
+        {
+            for (int k = st.Count - 1; k >= 0; k--)
+            {
+                if (!ReferenceEquals(st[k].stream, bw)) continue;
+                if (TailAfterNewline(st[k].sb, ref count)) { col = count; return true; }
+            }
+        }
+        if (TailAfterNewline(bw.GetStringBuilder(), ref count)) { col = count; return true; }
+        col = baseCol + count;
+        return true;
+    }
+
+    /// <summary>Pretty printer state set aside while a ~mincol<...~> segment is
+    /// formatted. The segment is built as a string of its own (as in SBCL, a plain
+    /// string stream), so a ~_ reached from it must not write to the enclosing
+    /// logical block, nor flush the block's staged output.</summary>
+    private sealed class PprintSuspendedState
+    {
+        public int Column, BlockColumn, Indent, ColAtFillCheck, BufferNestLevel, BufferStart;
+        public bool Active, PendingFill, Buffering, ToPretty;
+        public TextWriter? Stream;
+        public string? PerLinePrefix;
+        public List<(int pos, string kind, int blockCol, int indent, string? plp, int suffixLen)>? Deferred;
+        public List<(System.Text.StringBuilder sb, TextWriter stream)>? Staged;
+    }
+
+    private static PprintSuspendedState? PprintSuspend()
+    {
+        if (!_pprintActive) return null;
+        var s = new PprintSuspendedState
+        {
+            Column = _pprintColumn, BlockColumn = _pprintBlockColumn, Indent = _pprintIndent,
+            ColAtFillCheck = _pprintColumnAtLastFillCheck, BufferNestLevel = _pprintBufferNestLevel,
+            BufferStart = _pprintBufferStart, Active = _pprintActive, PendingFill = _pprintPendingFillBreak,
+            Buffering = _pprintBuffering, ToPretty = _fmtToPretty, Stream = _pprintStream,
+            PerLinePrefix = _pprintPerLinePrefix, Deferred = _pprintDeferredNewlines, Staged = _pprintStaged,
+        };
+        _pprintColumn = 0; _pprintBlockColumn = 0; _pprintIndent = 0; _pprintColumnAtLastFillCheck = 0;
+        _pprintBufferNestLevel = 0; _pprintBufferStart = 0; _pprintActive = false; _pprintPendingFillBreak = false;
+        _pprintBuffering = false; _fmtToPretty = false; _pprintStream = null; _pprintPerLinePrefix = null;
+        _pprintDeferredNewlines = null; _pprintStaged = null;
+        return s;
+    }
+
+    private static void PprintResume(PprintSuspendedState? s)
+    {
+        if (s == null) return;
+        _pprintColumn = s.Column; _pprintBlockColumn = s.BlockColumn; _pprintIndent = s.Indent;
+        _pprintColumnAtLastFillCheck = s.ColAtFillCheck; _pprintBufferNestLevel = s.BufferNestLevel;
+        _pprintBufferStart = s.BufferStart; _pprintActive = s.Active; _pprintPendingFillBreak = s.PendingFill;
+        _pprintBuffering = s.Buffering; _fmtToPretty = s.ToPretty; _pprintStream = s.Stream;
+        _pprintPerLinePrefix = s.PerLinePrefix; _pprintDeferredNewlines = s.Deferred; _pprintStaged = s.Staged;
+    }
+
     private static void PprintStageFlush(System.Text.StringBuilder sb)
     {
+        if (_pprintActive && _pprintStream != null) PprintFlushStagedOuter();
         if (_pprintActive && _pprintStream != null && sb.Length > 0)
         {
             var flushed = sb.ToString();
@@ -1445,7 +1623,7 @@ public static partial class Runtime
                             // *print-circle* is nil or a scan is already in progress.
                             string s = (colonMod && args[argIdx] is Nil)
                                 ? "()"
-                                : FormatAesthetic(args[argIdx]);
+                                : FormatAestheticStaged(args[argIdx], sb);
                             // ~mincol,colinc,minpad,padcharA
                             int aMincol = GetIntParam(0, 0)!.Value;
                             int aColinc = GetIntParam(1, 1)!.Value;
@@ -1480,7 +1658,7 @@ public static partial class Runtime
                         {
                             string s = (colonMod && args[argIdx] is Nil)
                                 ? "()"
-                                : FormatTop(args[argIdx], true);
+                                : FormatTopStaged(args[argIdx], true, sb);
                             // ~mincol,colinc,minpad,padcharS
                             int sMincol = GetIntParam(0, 0)!.Value;
                             int sColinc = GetIntParam(1, 1)!.Value;
@@ -1961,7 +2139,7 @@ public static partial class Runtime
                     {
                         int count = prefixParam ?? 1;
                         for (int j = 0; j < count; j++)
-                            sb.Append('\n');
+                            AppendNewlineInBlock(sb);
                         break;
                     }
                     case '&': // fresh-line
@@ -1975,10 +2153,10 @@ public static partial class Runtime
                                 ? sb[sb.Length - 1] == '\n'
                                 : streamAtLineStart;
                             if (!atLineStart)
-                                sb.Append('\n');
+                                AppendNewlineInBlock(sb);
                             // Then output (count-1) additional newlines
                             for (int j = 1; j < count; j++)
-                                sb.Append('\n');
+                                AppendNewlineInBlock(sb);
                         }
                         break;
                     }
@@ -2401,6 +2579,7 @@ public static partial class Runtime
                             var ppValT = DynamicBindings.TryGet(Startup.Sym("*PRINT-PRETTY*"), out var ppvT) ? ppvT : Startup.Sym("*PRINT-PRETTY*").Value;
                             if (ppValT is not Nil && _pprintActive && _pprintStream != null)
                             {
+                                PprintFlushStagedOuter();
                                 if (sb.Length > 0)
                                 {
                                     var flushed = sb.ToString();
@@ -2416,8 +2595,12 @@ public static partial class Runtime
                         // Find current column (approximate: count from last newline;
                         // before any newline in this format run, everything is offset
                         // by the column the destination stream was already at)
-                        int lastNl = sb.ToString().LastIndexOf('\n');
-                        int col = lastNl < 0 ? initialColumn + sb.Length : sb.Length - lastNl - 1;
+                        int col;
+                        if (!TryPrettyColumn(sb, out col))
+                        {
+                            int lastNl = sb.ToString().LastIndexOf('\n');
+                            col = lastNl < 0 ? initialColumn + sb.Length : sb.Length - lastNl - 1;
+                        }
                         if (atMod)
                         {
                             // ~colnum,colinc@T: relative tabulation
@@ -2642,6 +2825,20 @@ public static partial class Runtime
                                             // ~:; or ~@; means first section is per-line-prefix
                                             perLinePrefix = prefixStr;
                                         }
+                                        // Nested in another block: the column tracking has not seen
+                                        // the text this body has staged in SB yet, nor this prefix.
+                                        // Count both, so the block starts after its prefix and its
+                                        // per-line prefix sits where it was printed. A staged
+                                        // newline settles the column outright.
+                                        if (_pprintActive)
+                                        {
+                                            int staged = sb.Length;
+                                            int nl = staged - 1;
+                                            while (nl >= 0 && sb[nl] != '\n') nl--;
+                                            if (nl >= 0) _pprintColumn = staged - nl - 1;
+                                            else _pprintColumn += staged;
+                                            PprintTrackWrite(prefixStr);
+                                        }
                                         // Use a real StringWriter so XP buffering works
                                         var blockWriter = new System.IO.StringWriter();
                                         blockWriter.Write(prefixStr);
@@ -2652,15 +2849,25 @@ public static partial class Runtime
                                             if (sb[k] == '\n') break;
                                             outerCol++;
                                         }
+                                        // Where the block's writer content starts, for ~T in its body.
+                                        // Inside an enclosing FORMAT block, count what that one has
+                                        // printed and staged too.
+                                        bool haveStartCol = TryPrettyColumn(sb, out int blockStartCol);
                                         Runtime.PprintStartBlock(blockWriter, prefixStr.Length, perLinePrefix, outerCol);
                                         if (suffixStr.Length > 0)
                                             Runtime.PprintSetBlockSuffix(suffixStr.Length);
+                                        (_fmtBlockStartCol ??= new())[blockWriter] =
+                                            haveStartCol ? blockStartCol : _pprintBlockColumn - prefixStr.Length;
+                                        bool savedToPretty = _fmtToPretty;
                                         try
                                         {
                                             int bodyArgIdx = 0;
                                             string effectiveBody = (closedAt && closedColon)
                                                 ? InsertFillNewlinesInBody(body) : body;
-                                            string formatted = FormatString(effectiveBody, bodyArgs, ref bodyArgIdx);
+                                            string formatted;
+                                            _fmtToPretty = true;
+                                            try { formatted = FormatString(effectiveBody, bodyArgs, ref bodyArgIdx); }
+                                            finally { _fmtToPretty = savedToPretty; }
                                             blockWriter.Write(formatted);
                                             PprintTrackWrite(formatted);
                                             if (dottedTail != null)
@@ -2672,6 +2879,7 @@ public static partial class Runtime
                                         }
                                         finally
                                         {
+                                            _fmtBlockStartCol?.Remove(blockWriter);
                                             Runtime.PprintEndBlock();
                                         }
                                         sb.Append(blockWriter.ToString());
@@ -2746,6 +2954,9 @@ public static partial class Runtime
                         // Format each section, handling ~^ (up-and-out)
                         var formattedSections = new List<string>();
                         int localArgIdx = argIdx;
+                        var segSuspended = PprintSuspend();
+                        try
+                        {
                         foreach (var sec in contentSections)
                         {
                             try
@@ -2761,6 +2972,8 @@ public static partial class Runtime
                                 break;
                             }
                         }
+                        }
+                        finally { PprintResume(segSuspended); }
                         argIdx = localArgIdx;
 
                         // Calculate justification
@@ -2934,8 +3147,9 @@ public static partial class Runtime
                         string funcName = template[slashStart..i];
                         if (i < template.Length) i++; // skip closing '/'
 
-                        // Get the argument
-                        var slashArg = argIdx < args.Length ? args[argIdx++] : Nil.Instance;
+                        // Get the argument: running out is an error, as for ~A
+                        if (argIdx >= args.Length) MissingFormatArg('/');
+                        var slashArg = args[argIdx++];
 
                         // Look up the function - handle package prefix
                         Symbol? slashSym = null;
@@ -2982,7 +3196,10 @@ public static partial class Runtime
                                 else callArgs.Add(Nil.Instance);
                             }
 
-                            slashFunc.Invoke(callArgs.ToArray());
+                            PprintPushStaged(sb);
+                            PprintPushStaged(sw.GetStringBuilder());
+                            try { slashFunc.Invoke(callArgs.ToArray()); }
+                            finally { PprintPopStaged(sw.GetStringBuilder()); PprintPopStaged(sb); }
                             sb.Append(sw.ToString());
                         }
                         break;
@@ -3021,6 +3238,7 @@ public static partial class Runtime
                         if (ppVal is not Nil && _pprintActive)
                         {
                             // Flush sb to the pprint stream so _pprintColumn is accurate
+                            if (_pprintStream != null) PprintFlushStagedOuter();
                             if (_pprintStream != null && sb.Length > 0)
                             {
                                 var flushed = sb.ToString();
@@ -3066,6 +3284,7 @@ public static partial class Runtime
                         if (ppVal2 is not Nil)
                         {
                             // Flush sb to the pprint stream so _pprintColumn is accurate
+                            if (_pprintActive && _pprintStream != null) PprintFlushStagedOuter();
                             if (_pprintActive && _pprintStream != null && sb.Length > 0)
                             {
                                 var flushed = sb.ToString();
@@ -3102,7 +3321,7 @@ public static partial class Runtime
                         if (argIdx >= args.Length)
                             MissingFormatArg(directive);
                         var obj = args[argIdx++];
-                        sb.Append(FormatTop(obj, GetPrintEscapePublic()));
+                        sb.Append(FormatTopStaged(obj, GetPrintEscapePublic(), sb));
                         break;
                     }
                     default:

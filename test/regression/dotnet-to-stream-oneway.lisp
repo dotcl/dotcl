@@ -11,7 +11,7 @@
 ;;; wrapper), so these tests dispose it themselves.
 
 (defvar *dtso-dir*
-  (substitute #\/ #\ (or (dotcl:getenv "TMPDIR") (dotcl:getenv "TEMP") "/tmp")))
+  (regression-temp-dir))
 
 (defun dtso-path (name) (concatenate 'string *dtso-dir* "/" name))
 

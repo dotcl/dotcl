@@ -16,9 +16,7 @@
 
 (defvar *fcd-dir*
   (let ((dir (concatenate 'string
-                          (substitute #\/ #\\ (or (dotcl:getenv "TMPDIR")
-                                                  (dotcl:getenv "TEMP")
-                                                  "/tmp"))
+                          (regression-temp-dir)
                           "/dotcl-fcd-test/")))
     (ensure-directories-exist dir)
     dir))

@@ -1,10 +1,10 @@
 [
   {"system": "alexandria",
    "release": "alexandria-20241012-git",
-   "status": "ok",
+   "status": "patched",
    "issue": null,
    "checked": "2026-09-14",
-   "note": "test suite run with fiveam"},
+   "note": "loaded from the dotcl dist overlay"},
   {"system": "cl-ppcre",
    "release": "cl-ppcre-20250622-git",
    "status": "load-only",

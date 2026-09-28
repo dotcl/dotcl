@@ -41,7 +41,7 @@
     (declare (fixnum a))
     (dotimes (i n)
       (declare (fixnum i))
-      (when (> i 1000000) (return-from %dtb-loop-return -1))
+      (when (> i 1000) (return-from %dtb-loop-return -1))
       (setq a (the fixnum (+ a i))))
     a))
 
@@ -51,7 +51,7 @@
     (declare (fixnum a))
     (dotimes (i n)
       (declare (fixnum i))
-      (when (> i 1000000) (return-from %dtb-loop-return-safe -1))
+      (when (> i 1000) (return-from %dtb-loop-return-safe -1))
       (setq a (the fixnum (+ a i))))
     a))
 
@@ -134,7 +134,7 @@
 ;; An early return still returns from the right place -- the block is still
 ;; there, only the declarations moved out of it.
 (deftest declarations-through-block.return-from-still-works
-  (list (%dtb-loop-return 2000000)
+  (list (%dtb-loop-return 2000)
         (%dtb-store-return (make-dtb-box) 5)
         (%dtb-store-return (make-dtb-box) -5))
   (-1 -1 nil))

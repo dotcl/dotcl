@@ -295,6 +295,39 @@ public class Reader
         }
     }
 
+    /// <summary>
+    /// Read the single instruction list of a SIL core (the text form of
+    /// compiler/cil-out.sil). Returns false when the text holds no form.
+    ///
+    /// A core names its locals and labels with plain symbols (BB_2974,
+    /// ELSE_1183, ...), and the assembler only ever looks at their names. Read
+    /// in the caller's package they would all be interned there: tens of
+    /// thousands of them landed in CL-USER, where DO-SYMBOLS, APROPOS and
+    /// WITH-PACKAGE-ITERATOR then walked them. So the text is read in a scratch
+    /// package that uses COMMON-LISP (CL symbols and lambda-list keywords
+    /// resolve exactly as before) and the package is deleted once the read is
+    /// done, which leaves those names uninterned. Symbols the core really
+    /// refers to reach it as strings (:LOAD-SYM "NAME" ...), not through the
+    /// reader's current package.
+    /// </summary>
+    public static bool TryReadSilCore(string source, out LispObject instrList)
+    {
+        var packageSym = Startup.Sym("*PACKAGE*");
+        var oldPackage = DynamicBindings.Get(packageSym);
+        var scratch = new Package("DOTCL.SIL-READ-" + Guid.NewGuid().ToString("N"));
+        scratch.UsePackage(Startup.CL);
+        try
+        {
+            DynamicBindings.Set(packageSym, scratch);
+            return new Reader(new System.IO.StringReader(source)).TryRead(out instrList);
+        }
+        finally
+        {
+            DynamicBindings.Set(packageSym, oldPackage);
+            scratch.PerformDelete();
+        }
+    }
+
     /// <summary>Read the following forms as part of an enclosing read (CLHS's
     /// recursive-p): #n= labels defined in one of them stay visible to the next,
     /// because the label tables are cleared on entering a TOP-level read only.

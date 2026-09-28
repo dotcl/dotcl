@@ -990,6 +990,20 @@ public static partial class Runtime
             if (targetType == typeof(object)) return ls.Value;
         }
 
+        // LispChar -> System.Char. A char-typed parameter otherwise had no
+        // conversion at all, so a character reached only an (object) overload and
+        // arrived as the Lisp object itself: Console.Write(#\a) printed the
+        // character's printed representation instead of the character, and
+        // Write(#\Newline) printed the name rather than moving the cursor.
+        // Deliberately char and object only: C# has an implicit char -> int /
+        // double, but taking it here would let a character bind to a numeric
+        // overload, which is what CHAR-CODE is for.
+        if (arg is LispChar lc)
+        {
+            if (targetType == typeof(char)) return lc.Value;
+            if (targetType == typeof(object)) return lc.Value;
+        }
+
         // Char-backed LispVector (BASE-STRING / fill-pointered string) -> string.
         // CL strings have two runtime representations (LispString and char
         // LispVector); both must marshal to System.String for .NET interop.
@@ -1046,6 +1060,7 @@ public static partial class Runtime
                 DoubleFloat ndf => ndf.Value,                // double
                 SingleFloat nsf => nsf.Value,                // float
                 LispString nls  => nls.Value,                // string
+                LispChar nlc    => nlc.Value,                // char
                 LispVector ncv when ncv.IsCharVector => ncv.ToCharString(),
                 _ => null
             };
@@ -1635,13 +1650,14 @@ public static partial class Runtime
                 else return Nil.Instance;
             }
 
-        Type t;
-        try { t = ResolveDotNetType(typeName); } catch { return Nil.Instance; }
+        var t = TryResolveDotNetType(typeName);
+        if (t == null) return Nil.Instance;
         var paramTypes = new Type[paramTypeNames.Count];
         for (int i = 0; i < paramTypes.Length; i++)
         {
-            try { paramTypes[i] = ResolveDotNetType(paramTypeNames[i]); }
-            catch { return Nil.Instance; }
+            var pt = TryResolveDotNetType(paramTypeNames[i]);
+            if (pt == null) return Nil.Instance;
+            paramTypes[i] = pt;
         }
 
         System.Reflection.MethodInfo? m;
@@ -1693,6 +1709,13 @@ public static partial class Runtime
             DoubleFloat df => df.Value,
             SingleFloat sf => sf.Value,
             LispString ls => ls.Value,
+            // A character is System.Char, the same way a string is System.String:
+            // the binder matches overloads on the runtime type of each argument,
+            // so without this a character only ever matched an (object) overload
+            // and the method received the Lisp object, not the character. Note a
+            // one-character string stays System.String and keeps picking the
+            // string overload.
+            LispChar lc => lc.Value,
             // Char-backed LispVector (BASE-STRING / fill-pointered string): CL
             // strings have two representations; marshal both to System.String so
             // overload resolution (e.g. Graphics.DrawString(string,...)) binds.
@@ -4290,7 +4313,7 @@ public static partial class Runtime
             var errOut = DynamicBindings.Get(Startup.SymInPkg("*ERROR-OUTPUT*", "COMMON-LISP"));
             var writer = (errOut as LispOutputStream)?.Writer
                          ?? (errOut as LispBidirectionalStream)?.Writer;
-            var msg = $";; Unhandled error in foreign callback: {condition}";
+            var msg = $";; Unhandled error in foreign callback: {ConditionText.Line(condition)}";
             if (writer != null) writer.WriteLine(msg);
             else Console.Error.WriteLine(msg);
         }

@@ -131,6 +131,50 @@
   (unless (and (integerp n) (>= n 0))
     (error 'type-error :datum n :expected-type '(integer 0 *))))
 
+(defun %check-key-list (tail)
+  "Signal PROGRAM-ERROR unless TAIL is a well-formed keyword argument list.
+   The part of an argument list that a destructuring lambda list's &KEY consumes
+   must be a proper list of even length whose keys are symbols (CLHS 3.4.1.4.1,
+   3.5.1.6). DESTRUCTURING-BIND used to look each key up with MEMBER and never
+   check the shape, so a malformed list quietly bound every key to its default:
+   with the pattern (&key pathname depends-on), the argument list
+
+     (:pathname :depends-on (\"a\" \"b\"))
+
+   -- what a component form reads as when a #+FEATURE datum before :DEPENDS-ON
+   is absent -- bound PATHNAME to :DEPENDS-ON and DEPENDS-ON to NIL, and the
+   mistake surfaced much later as a complaint about whatever the shifted value
+   was then passed to."
+  (do ((a tail (cddr a)))
+      ((null a) tail)
+    (unless (and (consp a) (consp (cdr a)))
+      (error 'program-error
+             :format-control "odd number of keyword arguments: ~s"
+             :format-arguments (list tail)))
+    (unless (symbolp (car a))
+      (error 'program-error
+             :format-control "keyword argument name is not a symbol: ~s"
+             :format-arguments (list (car a))))))
+
+(defun %db-count-message (nreq max)
+  (cond ((eql nreq max) (format nil "exactly ~D" nreq))
+        ((null max) (format nil "at least ~D" nreq))
+        (t (format nil "between ~D and ~D" nreq max))))
+
+(defun %db-too-few (list nreq max)
+  "Signal the PROGRAM-ERROR for a destructuring LIST that runs out before every
+   required element of its lambda list is bound (CLHS 3.4.4, 3.4.5)."
+  (error 'program-error
+         :format-control "too few elements in ~s to satisfy the lambda list: ~a expected"
+         :format-arguments (list list (%db-count-message nreq max))))
+
+(defun %db-too-many (list nreq max)
+  "Signal the PROGRAM-ERROR for a destructuring LIST with elements left over
+   once its lambda list, which has no &REST, &BODY or &KEY, is satisfied."
+  (error 'program-error
+         :format-control "too many elements in ~s to satisfy the lambda list: ~a expected"
+         :format-arguments (list list (%db-count-message nreq max))))
+
 (defun last (list &optional (n 1))
   (%check-index n "LAST")
   ;; A dotted list is fine here -- (last '(a b . c)) is (b . c) -- but a
@@ -1283,8 +1327,8 @@ Also expands element types within compound type specifiers like (VECTOR etype si
     ((typep n 'double-float) (cond ((plusp n) 1.0d0) ((minusp n) -1.0d0) (t 0.0d0)))
     (t (error "SIGNUM: not a number: ~S" n))))
 
-(defun scale-float (float integer)
-  (* float (expt 2 integer)))
+;; SCALE-FLOAT is registered in the runtime (Runtime.Arithmetic.cs): it needs
+;; scaleB so that the power of two is never built as a float of its own.
 
 (defun %simplest-rational-between (lo hi)
   "The smallest-denominator rational R with LO <= R <= HI, given 0 < LO <= HI.
@@ -1341,6 +1385,15 @@ Also expands element types within compound type specifiers like (VECTOR etype si
 
 (defvar *documentation-table* (make-hash-table :test #'equal :synchronized t))
 
+;; Function object -> docstring. The one place a function's docstring lives:
+;; DEFUN and DEFGENERIC reach it through (SETF DOCUMENTATION) on the name, a
+;; caller holding the object (#'f) sets it directly, and the name reader asks
+;; it before the name's own entry, so both spellings see the same docstring.
+;; Weak on the key so that a redefinition does not keep the old function alive
+;; just for its docstring.
+(defvar *function-object-documentation*
+  (make-hash-table :test 'eq :weakness :key :synchronized t))
+
 ;; Helper to make a key for the documentation table
 (defun %doc-key (obj doc-type)
   (cons obj doc-type))
@@ -1356,6 +1409,44 @@ Also expands element types within compound type specifiers like (VECTOR etype si
   (or (%slot-def-documentation-or-nil obj)
       (values (gethash (%doc-key obj doc-type) *documentation-table*))))
 
+;; Docstrings for the external functions, macros, special operators and
+;; variables of the COMMON-LISP package. The text lives in one data file,
+;; compiler/cl-docstrings.lisp, which is the only thing that sets
+;; *CL-BUILTIN-DOCSTRINGS*: a build that leaves that file out gets NIL here and
+;; every lookup below simply answers NIL.
+;;
+;; That file sets it to a function of no arguments returning a list of
+;; (KIND (SYMBOL-NAME DOCSTRING) ...) groups. The list is a literal inside the
+;; function's body, so loading the core only defines the function; the list is
+;; built, and turned into per-kind EQ tables, on the first lookup. An image
+;; that never asks for documentation never pays for any of it.
+(defvar *cl-builtin-docstrings* nil)
+(defvar *cl-builtin-doc-tables* nil)
+
+(defun %cl-builtin-doc-tables ()
+  (or *cl-builtin-doc-tables*
+      (let ((cl (find-package "COMMON-LISP"))
+            (tables '()))
+        (dolist (group (funcall *cl-builtin-docstrings*))
+          (let ((table (make-hash-table :test 'eq)))
+            (dolist (entry (cdr group))
+              (multiple-value-bind (sym status) (find-symbol (car entry) cl)
+                (when (eq status :external)
+                  (setf (gethash sym table) (cadr entry)))))
+            (push (cons (car group) table) tables)))
+        ;; Threads that race here each build the same tables; whichever store
+        ;; lands last is as good as the other.
+        (setq *cl-builtin-doc-tables* tables))))
+
+;; The built-in docstring of KIND ("function" or "variable") for SYMBOL, or NIL.
+;; Only external symbols of the COMMON-LISP package have one.
+(defun %cl-builtin-documentation (symbol kind)
+  (when (and (symbolp symbol)
+             *cl-builtin-docstrings*
+             (eq (symbol-package symbol) (find-package "COMMON-LISP")))
+    (let ((table (cdr (assoc kind (%cl-builtin-doc-tables) :test #'string=))))
+      (and table (values (gethash symbol table))))))
+
 ;; --- DOCUMENTATION methods ---
 
 (defgeneric documentation (x doc-type))
@@ -1364,9 +1455,40 @@ Also expands element types within compound type specifiers like (VECTOR etype si
 (defmethod documentation ((x t) (doc-type t))
   (%get-doc x doc-type))
 
+;; The function a function NAME denotes, when that function can carry a
+;; docstring: a macro's expander for a macro, NIL for an unbound name, a special
+;; operator, or a list that is not a (SETF symbol) name.
+(defun %documented-function-of (name)
+  (cond ((consp name)
+         (when (and (eq (car name) 'setf) (consp (cdr name))
+                    (symbolp (cadr name)) (null (cddr name))
+                    (fboundp name))
+           (fdefinition name)))
+        ((not (symbolp name)) nil)
+        ((special-operator-p name) nil)
+        ((macro-function name))
+        ((fboundp name) (fdefinition name))))
+
+;; (documentation <name> 'function). The docstring belongs to the function the
+;; name denotes (SBCL keeps one docstring per function), so that is asked first.
+;; An entry that is present with NIL means "cleared". The name's own entry only
+;; holds a docstring set while the name was unbound (SBCL keeps that one across
+;; a later DEFUN too): a docstring set on a bound name goes to the function
+;; alone, so a redefinition without one answers NIL, not the old definition's.
+;; Built-in docs come last.
+(defun %name-function-documentation (name)
+  (let ((fn (%documented-function-of name)))
+    (multiple-value-bind (doc present)
+        (if fn (gethash fn *function-object-documentation*) (values nil nil))
+      (if present
+          doc
+          (or (%get-doc name 'function)
+              (%cl-builtin-documentation name "function")
+              (and (symbolp name) (%get-function-documentation name)))))))
+
 ;; (documentation <function> 't): function object documentation
 (defmethod documentation ((x function) (doc-type (eql t)))
-  (%get-doc x t))
+  (values (gethash x *function-object-documentation*)))
 
 ;; (documentation <function> 'function)
 (defmethod documentation ((x function) (doc-type (eql 'function)))
@@ -1375,13 +1497,15 @@ Also expands element types within compound type specifiers like (VECTOR etype si
 ;; (documentation <symbol> 'function): user-set docs first, then built-in docs
 ;; registered via [LispDoc]/SetFunctionDoc (mirrors the variable path) (#25).
 (defmethod documentation ((x symbol) (doc-type (eql 'function)))
-  (or (%get-doc x 'function)
-      (%get-function-documentation x)))
+  (%name-function-documentation x))
 
-;; (documentation <symbol> 'variable)
+;; (documentation <symbol> 'variable). A docstring set with (SETF DOCUMENTATION)
+;; and one given by DEFVAR, DEFPARAMETER or DEFCONSTANT share one store in the
+;; runtime, keyed by the symbol, where the later of the two wins. Built-in docs
+;; come last.
 (defmethod documentation ((x symbol) (doc-type (eql 'variable)))
-  (or (%get-doc x 'variable)
-      (%get-variable-documentation x)))
+  (or (%get-variable-documentation x)
+      (%cl-builtin-documentation x "variable")))
 
 ;; (documentation <symbol> 'type)
 (defmethod documentation ((x symbol) (doc-type (eql 'type)))
@@ -1401,7 +1525,7 @@ Also expands element types within compound type specifiers like (VECTOR etype si
 
 ;; (documentation <list> 'function): for (setf foo)
 (defmethod documentation ((x list) (doc-type (eql 'function)))
-  (%get-doc x 'function))
+  (%name-function-documentation x))
 
 ;; (documentation <list> 'compiler-macro)
 (defmethod documentation ((x list) (doc-type (eql 'compiler-macro)))
@@ -1410,6 +1534,22 @@ Also expands element types within compound type specifiers like (VECTOR etype si
 ;; (documentation <package> 't)
 (defmethod documentation ((x package) (doc-type (eql t)))
   (%get-doc x t))
+
+;; Reader and writer methods for a direct slot that reached a class through the
+;; metaobject protocol: a metaclass's INITIALIZE-INSTANCE that added or rewrote
+;; :DIRECT-SLOTS, ENSURE-CLASS, or REINITIALIZE-INSTANCE of the class. AMOP has
+;; class initialization define these; DEFCLASS defines the ones it knows about in
+;; its own expansion, and the runtime calls this for the rest once the class is
+;; registered under CLASS-NAME. The methods are the ones that expansion makes.
+(defun %define-slot-accessors (class-name slot-name readers writers)
+  (dolist (r readers)
+    (eval `(defmethod ,r ((object ,class-name)) (slot-value object ',slot-name)))
+    (%register-accessor-method (fdefinition r) (find-class class-name) slot-name))
+  (dolist (w writers)
+    (eval `(defmethod ,w ((new-value t) (object ,class-name))
+             (setf (slot-value object ',slot-name) new-value)))
+    (%register-accessor-method (fdefinition w) (find-class class-name) slot-name))
+  nil)
 
 ;; (documentation <class> 'type) and (documentation <class> t).
 ;;
@@ -1442,10 +1582,12 @@ Also expands element types within compound type specifiers like (VECTOR etype si
   new-value)
 
 ;; (setf (documentation <function> 't) val)
+;;
+;; A NIL is stored rather than removed: the entry, present with NIL, is what
+;; tells the name reader above that the docstring was cleared, so a name that
+;; denotes this function answers NIL as well.
 (defmethod (setf documentation) ((new-value t) (x function) (doc-type (eql t)))
-  (if new-value
-      (setf (gethash (%doc-key x t) *documentation-table*) new-value)
-      (remhash (%doc-key x t) *documentation-table*))
+  (setf (gethash x *function-object-documentation*) new-value)
   new-value)
 
 ;; (setf (documentation <function> 'function) val)
@@ -1453,17 +1595,30 @@ Also expands element types within compound type specifiers like (VECTOR etype si
   (setf (documentation x t) new-value))
 
 ;; (setf (documentation <symbol> 'function) val)
-(defmethod (setf documentation) ((new-value t) (x symbol) (doc-type (eql 'function)))
-  (if new-value
-      (setf (gethash (%doc-key x 'function) *documentation-table*) new-value)
-      (remhash (%doc-key x 'function) *documentation-table*))
+;;
+;; A bound name's docstring goes onto the function (or macro expander) it
+;; currently denotes, and only there, so that it goes away with that definition,
+;; as in SBCL; any entry the name held from while it was unbound is dropped. An
+;; unbound name, or a special operator, keeps it under the name. DEFUN, DEFMACRO
+;; and DEFGENERIC store their docstring through here after the definition is
+;; installed.
+(defun %set-name-function-documentation (new-value name)
+  (let ((fn (%documented-function-of name)))
+    (cond (fn
+           (setf (gethash fn *function-object-documentation*) new-value)
+           (remhash (%doc-key name 'function) *documentation-table*))
+          (new-value
+           (setf (gethash (%doc-key name 'function) *documentation-table*) new-value))
+          (t (remhash (%doc-key name 'function) *documentation-table*))))
   new-value)
 
-;; (setf (documentation <symbol> 'variable) val)
+(defmethod (setf documentation) ((new-value t) (x symbol) (doc-type (eql 'function)))
+  (%set-name-function-documentation new-value x))
+
+;; (setf (documentation <symbol> 'variable) val): the store DEFVAR writes, so
+;; that NIL clears a docstring DEFVAR gave as well.
 (defmethod (setf documentation) ((new-value t) (x symbol) (doc-type (eql 'variable)))
-  (if new-value
-      (setf (gethash (%doc-key x 'variable) *documentation-table*) new-value)
-      (remhash (%doc-key x 'variable) *documentation-table*))
+  (%set-variable-documentation x new-value)
   new-value)
 
 ;; (setf (documentation <symbol> 'type) val)
@@ -1496,10 +1651,7 @@ Also expands element types within compound type specifiers like (VECTOR etype si
 
 ;; (setf (documentation <list> 'function) val)
 (defmethod (setf documentation) ((new-value t) (x list) (doc-type (eql 'function)))
-  (if new-value
-      (setf (gethash (%doc-key x 'function) *documentation-table*) new-value)
-      (remhash (%doc-key x 'function) *documentation-table*))
-  new-value)
+  (%set-name-function-documentation new-value x))
 
 ;; (setf (documentation <list> 'compiler-macro) val)
 (defmethod (setf documentation) ((new-value t) (x list) (doc-type (eql 'compiler-macro)))
@@ -1523,6 +1675,286 @@ Also expands element types within compound type specifiers like (VECTOR etype si
 ;; collects (symbol . docstring) pairs; apply them now that DOCUMENTATION is defined.
 (dolist (%dn-doc (%dotnet-doc-alist))
   (setf (documentation (car %dn-doc) 'function) (cdr %dn-doc)))
+
+;;; --- DESCRIBE-OBJECT: the default method ---
+;;;
+;;; One method on T that dispatches inside, rather than one method per type, so
+;;; that a user who defines DESCRIBE-OBJECT on T replaces all of it and a user
+;;; who defines it on a class of their own is more specific than every part of
+;;; it. The kinds of information follow what SBCL prints: for a symbol, what it
+;;; names as a function, a variable and a class; for a function, its lambda list
+;;; and documentation; for an instance, its slots.
+;;;
+;;; Each section is protected on its own. DESCRIBE is a development tool, and a
+;;; section that cannot be computed for some object must not take the ones that
+;;; could with it.
+;;;
+;;; The MOP and DOTCL functions are looked up by name when called: this file is
+;;; read by the host Lisp during the cross compile, where those packages do not
+;;; exist.
+
+(defun %describe-fn (name package)
+  (let ((sym (find-symbol name package)))
+    (and sym (fboundp sym) (symbol-function sym))))
+
+(defun %describe-call (name package &rest args)
+  "Call PACKAGE::NAME on ARGS, or answer NIL if it does not exist or fails."
+  (let ((fn (%describe-fn name package)))
+    (and fn (ignore-errors (apply fn args)))))
+
+(defmacro %describe-section (&body body)
+  `(handler-case (progn ,@body)
+     (error () nil)))
+
+(defun %describe-type-name (object)
+  (string-downcase
+   (princ-to-string
+    (typecase object
+      (fixnum 'fixnum)
+      (integer 'bignum)
+      (null 'null)
+      (symbol 'symbol)
+      (cons 'list)
+      (generic-function 'generic-function)
+      (compiled-function 'compiled-function)
+      (function 'function)
+      (condition 'condition)
+      (class (class-name (class-of object)))
+      (structure-object 'structure-object)
+      (standard-object 'standard-object)
+      (t (let ((type (type-of object)))
+           (if (consp type) (car type) type)))))))
+
+(defun %describe-value-string (value)
+  "VALUE printed the way a describe line shows it: readably marked, and cut
+short when it is long or deep."
+  ;; The declarations here and below are redundant: the cross compiler knows
+  ;; the standard special variables. They are harmless and were kept.
+  (let ((*print-length* (or *print-length* 20))
+        (*print-level* (or *print-level* 4)))
+    (declare (special *print-length* *print-level*))
+    (prin1-to-string value)))
+
+(defun %describe-doc (stream text indent)
+  (when (stringp text)
+    (format stream "~&~ADocumentation:~%" indent)
+    (with-input-from-string (in text)
+      (loop for line = (read-line in nil nil)
+            while line
+            do (format stream "~A~A~%" (concatenate 'string indent "  ") line)))))
+
+(defun %describe-lambda-list (stream fn-or-name indent)
+  (multiple-value-bind (lambda-list foundp)
+      (%describe-call "FUNCTION-LAMBDA-LIST" "DOTCL" fn-or-name)
+    (when foundp
+      (let ((*print-gensym* nil))
+        (declare (special *print-gensym*))
+        (format stream "~&~ALambda-list: ~A~%" indent
+                (%describe-value-string lambda-list))))))
+
+(defun %describe-specializer (specializer)
+  (cond ((typep specializer 'class) (class-name specializer))
+        ((%describe-call "EQL-SPECIALIZER-OBJECT" "DOTCL-MOP" specializer)
+         (list 'eql (%describe-call "EQL-SPECIALIZER-OBJECT" "DOTCL-MOP"
+                                    specializer)))
+        (t specializer)))
+
+(defun %describe-methods (stream gf indent)
+  (let ((methods (%describe-call "GENERIC-FUNCTION-METHODS" "DOTCL-MOP" gf)))
+    (when methods
+      (format stream "~&~AMethods:~%" indent)
+      (dolist (m methods)
+        (let ((qualifiers (ignore-errors (method-qualifiers m)))
+              (specializers
+                (mapcar #'%describe-specializer
+                        (%describe-call "METHOD-SPECIALIZERS" "DOTCL-MOP" m))))
+          (format stream "~A~{~S ~}~A~%" (concatenate 'string indent "  ") qualifiers
+                  (%describe-value-string specializers)))))))
+
+(defun %describe-function-body (stream fn indent)
+  "Lambda list, documentation and, for a generic function, its methods."
+  (%describe-section (%describe-lambda-list stream fn indent))
+  (%describe-section (%describe-doc stream (documentation fn t) indent))
+  (when (typep fn 'generic-function)
+    (%describe-section (%describe-methods stream fn indent))))
+
+(defun %describe-slot-names (slots)
+  (mapcar (lambda (s) (%describe-call "SLOT-DEFINITION-NAME" "DOTCL-MOP" s))
+          slots))
+
+(defun %describe-slots (stream object)
+  (let ((slots (%describe-call "CLASS-SLOTS" "DOTCL-MOP" (class-of object))))
+    (when slots
+      (format stream "~&Slots:~%")
+      (dolist (s slots)
+        (let* ((name (%describe-call "SLOT-DEFINITION-NAME" "DOTCL-MOP" s))
+               (allocation (%describe-call "SLOT-DEFINITION-ALLOCATION"
+                                           "DOTCL-MOP" s)))
+          (format stream "  ~30A = ~A~@[  (~(~S~) allocation)~]~%"
+                  (princ-to-string name)
+                  (handler-case
+                      (if (slot-boundp object name)
+                          (%describe-value-string (slot-value object name))
+                          "#<unbound slot>")
+                    (error () "#<unreadable slot>"))
+                  (and allocation (not (eq allocation :instance))
+                       allocation)))))))
+
+(defun %describe-class (stream class indent)
+  (%describe-section
+    (%describe-doc stream (documentation class t) indent))
+  (%describe-section
+    (let ((cpl (%describe-call "CLASS-PRECEDENCE-LIST" "DOTCL-MOP" class)))
+      (when cpl
+        (format stream "~&~AClass precedence-list: ~{~S~^, ~}~%" indent
+                (mapcar #'class-name cpl)))))
+  (%describe-section
+    (format stream "~&~ADirect superclasses: ~{~S~^, ~}~%" indent
+            (mapcar #'class-name
+                    (%describe-call "CLASS-DIRECT-SUPERCLASSES" "DOTCL-MOP"
+                                    class))))
+  (%describe-section
+    (let ((subs (%describe-call "CLASS-DIRECT-SUBCLASSES" "DOTCL-MOP" class)))
+      (if subs
+          (format stream "~&~ADirect subclasses: ~{~S~^, ~}~%" indent
+                  (mapcar #'class-name subs))
+          (format stream "~&~ANo subclasses.~%" indent))))
+  (%describe-section
+    (let ((names (%describe-slot-names
+                  (%describe-call "CLASS-DIRECT-SLOTS" "DOTCL-MOP" class))))
+      (if names
+          (format stream "~&~ADirect slots: ~{~S~^, ~}~%" indent names)
+          (format stream "~&~ANo direct slots.~%" indent)))))
+
+(defun %describe-symbol (stream sym)
+  ;; As a function, macro or special operator.
+  (%describe-section
+    (when (fboundp sym)
+      (let ((macro (macro-function sym))
+            (fn (unless (special-operator-p sym) (symbol-function sym))))
+        (format stream "~&~%~A names ~A:~%" sym
+                (cond ((special-operator-p sym) "a special operator")
+                      (macro "a macro")
+                      ((typep fn 'generic-function) "a generic function")
+                      (t "a compiled function")))
+        (%describe-section (%describe-lambda-list stream sym "  "))
+        (%describe-section
+          (%describe-doc stream (documentation sym 'function) "  "))
+        (when (typep fn 'generic-function)
+          (%describe-section (%describe-methods stream fn "  "))))))
+  ;; As a setf function.
+  (%describe-section
+    (let ((setf-name (list 'setf sym)))
+      (when (fboundp setf-name)
+        (let ((fn (fdefinition setf-name)))
+          (format stream "~&~%~S names a ~:[compiled~;generic~] function:~%"
+                  setf-name (typep fn 'generic-function))
+          (%describe-function-body stream fn "  ")))))
+  ;; As a variable.
+  (%describe-section
+    (let ((constant (and (constantp sym) (boundp sym)))
+          (special (%symbol-special-p sym)))
+      (when (or constant special (boundp sym))
+        (format stream "~&~%~A names ~A:~%" sym
+                (cond (constant "a constant variable")
+                      (special "a special variable")
+                      (t "an undeclared variable")))
+        (format stream "~&  Value: ~A~%"
+                (if (boundp sym)
+                    (%describe-value-string (symbol-value sym))
+                    "unbound"))
+        (%describe-section
+          (%describe-doc stream (documentation sym 'variable) "  ")))))
+  ;; As a class.
+  (%describe-section
+    (let ((class (find-class sym nil)))
+      (when class
+        (format stream "~&~%~A names the ~(~A~) ~S:~%" sym
+                (class-name (class-of class)) (class-name class))
+        (%describe-class stream class "  "))))
+  ;; Its property list.
+  (%describe-section
+    (when (symbol-plist sym)
+      (format stream "~&~%Symbol-plist:~%")
+      (loop for (key value) on (symbol-plist sym) by #'cddr
+            do (format stream "  ~S -> ~A~%" key
+                       (%describe-value-string value))))))
+
+(defun %describe-list (stream list)
+  ;; Walked by hand: LIST-LENGTH signals on a dotted list, and a circular one
+  ;; must stop.
+  (let ((length 0) (slow list) (fast list))
+    (loop
+      (cond ((null fast)
+             (return (format stream "~&Length: ~D~%" length)))
+            ((atom fast)
+             (return (format stream "~&A dotted list with ~D element~:P.~%"
+                             length length))))
+      (setf fast (cdr fast))
+      (incf length)
+      (when (evenp length)
+        (setf slow (cdr slow))
+        (when (eq fast slow)
+          (return (format stream "~&A circular list.~%")))))))
+
+(defun %describe-array (stream array)
+  (format stream "~&Element-type: ~S~%" (array-element-type array))
+  (if (vectorp array)
+      (format stream "~&Length: ~D~%" (length array))
+      (format stream "~&Dimensions: ~S~%" (array-dimensions array)))
+  (when (array-has-fill-pointer-p array)
+    (format stream "~&Fill-pointer: ~D~%" (fill-pointer array)))
+  (when (adjustable-array-p array)
+    (format stream "~&Adjustable.~%")))
+
+(defun %describe-hash-table (stream table)
+  (format stream "~&Test: ~S~%" (hash-table-test table))
+  (format stream "~&Count: ~D~%" (hash-table-count table))
+  (format stream "~&Size: ~D~%" (hash-table-size table))
+  (format stream "~&Rehash-size: ~S~%" (hash-table-rehash-size table))
+  (format stream "~&Rehash-threshold: ~S~%" (hash-table-rehash-threshold table)))
+
+(defun %describe-package (stream package)
+  (%describe-section (%describe-doc stream (documentation package t) ""))
+  (let ((nicknames (package-nicknames package))
+        (uses (mapcar #'package-name (package-use-list package)))
+        (used-by (mapcar #'package-name (package-used-by-list package)))
+        (external 0))
+    (do-external-symbols (s package) (declare (ignore s)) (incf external))
+    (when nicknames (format stream "~&Nicknames: ~{~A~^, ~}~%" nicknames))
+    (when uses (format stream "~&Use-list: ~{~A~^, ~}~%" uses))
+    (when used-by (format stream "~&Used-by-list: ~{~A~^, ~}~%" used-by))
+    (format stream "~&~D external symbol~:P.~%" external external)))
+
+(defun %describe-header (object)
+  "The first line of a description: the object itself. A symbol is written with
+its package, which is the one thing about it the name alone does not say."
+  (if (symbolp object)
+      (let ((*package* (find-package "KEYWORD")))
+        (declare (special *package*))
+        (prin1-to-string object))
+      (prin1-to-string object)))
+
+(defmethod describe-object ((object t) stream)
+  (format stream "~&~A~%  [~A]~%"
+          (%describe-header object)
+          (%describe-type-name object))
+  (%describe-section
+    (typecase object
+      (symbol (%describe-symbol stream object))
+      (function (terpri stream) (%describe-function-body stream object ""))
+      (class (terpri stream) (%describe-class stream object ""))
+      ((or structure-object standard-object condition)
+       (terpri stream) (%describe-slots stream object))
+      (character
+       (format stream "~&~%Char-code: ~D~%" (char-code object))
+       (let ((name (char-name object)))
+         (when name (format stream "~&Char-name: ~A~%" name))))
+      (cons (terpri stream) (%describe-list stream object))
+      (array (terpri stream) (%describe-array stream object))
+      (hash-table (terpri stream) (%describe-hash-table stream object))
+      (package (terpri stream) (%describe-package stream object))))
+  (values))
 
 ;;; --- ensure-generic-function ---
 (defun %ensure-gf-required-params (ll)
@@ -1573,7 +2005,10 @@ against existing methods and invalidates the dispatch cache (CLHS 7.6.4)."
   (let ((lambda-list-p nil)
         (lambda-list nil)
         (apo-p nil)
-        (apo-params nil))
+        (apo-params nil)
+        (doc-p nil)
+        (doc nil)
+        (gf-class nil))
     ;; Manual keyword parsing
     (do ((rest args (cddr rest)))
         ((null rest))
@@ -1581,24 +2016,48 @@ against existing methods and invalidates the dispatch cache (CLHS 7.6.4)."
         ((eq (car rest) :lambda-list)
          (setf lambda-list (cadr rest) lambda-list-p t))
         ((eq (car rest) :argument-precedence-order)
-         (setf apo-params (cadr rest) apo-p t))))
+         (setf apo-params (cadr rest) apo-p t))
+        ((and (eq (car rest) :documentation) (not doc-p))
+         (setf doc (cadr rest) doc-p t))
+        ((and (eq (car rest) :generic-function-class) (null gf-class))
+         (setf gf-class (let ((c (cadr rest)))
+                          (if (symbolp c) (find-class c) c))))))
+    ;; The standard class needs no MAKE-INSTANCE: %MAKE-GF builds exactly that.
+    (when (eq gf-class (find-class 'standard-generic-function))
+      (setf gf-class nil))
     ;; If already fbound: must be a GF; apply lambda-list / precedence updates
     ;; in place (CLHS: ensure-generic-function reinitializes the existing GF).
-    (if (fboundp name)
-        (let ((fn (fdefinition name)))
-          (unless (typep fn 'generic-function) (error 'program-error))
-          (when (or lambda-list-p apo-p)
-            (%ensure-gf-apply-lambda-list fn lambda-list apo-params))
-          fn)
-        ;; Create new GF
-        (let* ((ll (if lambda-list-p lambda-list '()))
-               (arity (length (%ensure-gf-required-params ll)))
-               (gf (%make-gf name arity)))
-          (%register-gf name gf)
-          (setf (fdefinition name) gf)
-          (when (or lambda-list-p apo-p)
-            (%ensure-gf-apply-lambda-list gf ll apo-params))
-          gf))))
+    ;; :documentation is stored once the GF is installed, the way DEFGENERIC
+    ;; stores its option, so the name and the GF object both answer it.
+    (let ((gf (if (fboundp name)
+                  (let ((fn (fdefinition name)))
+                    (unless (typep fn 'generic-function) (error 'program-error))
+                    ;; AMOP would CHANGE-CLASS the existing generic function, and a
+                    ;; generic function's class cannot be changed (SBCL signals too).
+                    ;; Keeping the old class silently is what hid the option before.
+                    (when (and gf-class (not (eq (class-of fn) gf-class)))
+                      (error "ENSURE-GENERIC-FUNCTION: ~S is already a generic function of class ~S; ~
+                              its class cannot be changed to ~S."
+                             name (class-name (class-of fn)) (class-name gf-class)))
+                    (when (or lambda-list-p apo-p)
+                      (%ensure-gf-apply-lambda-list fn lambda-list apo-params))
+                    fn)
+                  ;; Create new GF
+                  (let* ((ll (if lambda-list-p lambda-list '()))
+                         (arity (length (%ensure-gf-required-params ll)))
+                         ;; AMOP: the name and lambda list reach an instance of
+                         ;; the requested class as initargs, as with DEFGENERIC.
+                         (gf (if gf-class
+                                 (make-instance gf-class :name name :lambda-list ll)
+                                 (%make-gf name arity))))
+                    (%register-gf name gf)
+                    (setf (fdefinition name) gf)
+                    (when (or lambda-list-p apo-p)
+                      (%ensure-gf-apply-lambda-list gf ll apo-params))
+                    gf))))
+      (when doc-p
+        (setf (documentation name 'function) doc))
+      gf)))
 
 ;;; --- CLHS 3.2.4.2: make-load-form protocol ---
 
@@ -1942,7 +2401,11 @@ overload), so this never changes behaviour, only speed."
      (let ((head (car form)))
        ;; Expand macro calls first, but never a name shadowed by a local
        ;; function binding (FLET/LABELS beat a global macro of the same name).
-       (when (and (symbolp head) (not (member head fns)))
+       (when (and (symbolp head) (not (member head fns))
+                  ;; LAMBDA is a macro yielding #'(lambda ...), but a walker
+                  ;; keeps the LAMBDA form itself (SBCL's does too), and a
+                  ;; ((lambda ...) args) operator must stay a lambda expression.
+                  (not (eq head 'lambda)))
          (multiple-value-bind (exp expanded)
              (macroexpand-1 form (cons macros symbol-macros))
            (when expanded
@@ -2046,11 +2509,24 @@ and symbol-macro scope is used as the starting point."
   (let ((macros (cond ((consp env) (car env))
                       ((hash-table-p env) env)
                       (t nil)))
-        (symbol-macros (and (consp env) (cdr env))))
+        (symbol-macros (and (consp env) (cdr env)))
+        (fns '()))
+    ;; The CAR of a compiler / interpreter environment is the alist of lexical
+    ;; operator bindings, innermost first: (NAME . EXPANDER) for a MACROLET,
+    ;; (NAME) for a local function hiding a macro.
+    (when (consp macros)
+      (let ((ht (make-hash-table :test 'equal)) (seen '()))
+        (dolist (e macros)
+          (when (and (consp e) (symbolp (car e)) (not (member (car e) seen)))
+            (push (car e) seen)
+            (if (cdr e)
+                (setf (gethash (symbol-name (car e)) ht) (cdr e))
+                (push (car e) fns))))
+        (setq macros ht)))
     (%mea form
           (%mea-copy (and (hash-table-p macros) macros))
           (%mea-copy (and (hash-table-p symbol-macros) symbol-macros))
-          '())))
+          fns)))
 
 ;;; --- xref (who-calls) runtime tables ---
 ;;;
@@ -2174,6 +2650,11 @@ and symbol-macro scope is used as the starting point."
 ;;; (SB-INT:SIMPLE-PACKAGE-ERROR).
 (define-condition simple-package-error (simple-condition package-error) ())
 
+;;; What NO-APPLICABLE-METHOD's default method signals. CLHS only requires an
+;;; ERROR; a class of its own lets a handler tell this error from any other,
+;;; as SBCL's SB-PCL::NO-APPLICABLE-METHOD-ERROR does.
+(define-condition no-applicable-method-error (simple-error) ())
+
 (%define-condition-report (c file-error)
   (format stream "Error on file ~a." (file-error-pathname c)))
 
@@ -2183,3 +2664,28 @@ and symbol-macro scope is used as the starting point."
 (%define-condition-report (c print-not-readable)
   (format stream "The object ~a cannot be printed readably."
           (print-not-readable-object c)))
+
+;;; Y-OR-N-P and YES-OR-NO-P ask on *QUERY-IO* and read the answer from it.
+;;; They used to answer T without reading anything, so code that asks before
+;;; doing something optional went ahead unasked -- including when stdin is
+;;; closed, where every other implementation signals END-OF-FILE out of the
+;;; READ-LINE. Unrecognised answers repeat the question, as CLHS describes.
+(defun %query-yes-no (format-control arguments hint yes no)
+  (loop
+    (let ((io *query-io*))
+      (fresh-line io)
+      (when format-control
+        (apply #'format io format-control arguments))
+      (write-string hint io)
+      (finish-output io)
+      (let ((answer (string-trim '(#\Space #\Tab #\Return) (read-line io))))
+        (cond ((member answer yes :test #'string-equal) (return t))
+              ((member answer no :test #'string-equal) (return nil))
+              (t (format io "~&Please type ~a for yes or ~a for no.~%"
+                         (first yes) (first no))))))))
+
+(defun y-or-n-p (&optional format-control &rest arguments)
+  (%query-yes-no format-control arguments " (y or n) " '("y") '("n")))
+
+(defun yes-or-no-p (&optional format-control &rest arguments)
+  (%query-yes-no format-control arguments " (yes or no) " '("yes") '("no")))
