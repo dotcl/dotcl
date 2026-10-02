@@ -89,4 +89,5 @@
 
 (deftest fbr-compile-state-registry-unchanged
   (fbr-registered-state-names)
-  ("*CSTATE*" "*IN-FINALLY-BLOCK*" "*IN-TAIL-POSITION*" "*IN-TRY-BLOCK*"))
+  ("*CSTATE*" "*IN-FINALLY-BLOCK*" "*IN-TAIL-POSITION*" "*IN-TRY-BLOCK*"
+   "*MV-EXIT-CLEANUP*" "*MV-EXPECT-ARGS*" "*MV-MODE-LOCAL*"))

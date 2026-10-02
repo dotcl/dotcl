@@ -216,12 +216,106 @@ static class NativeFFI
     ///
     /// Not applied elsewhere: x64 passes variadic floats in the SSE registers the
     /// ordinary convention already uses, and ARM64 macOS puts the whole variadic
-    /// part on the stack, which this trick would not reproduce.
+    /// part on the stack, which PlanCall handles separately.
     /// </summary>
     static bool VariadicFloatsAsIntegerBits =>
         Compat.IsWindows()
         && System.Runtime.InteropServices.RuntimeInformation.ProcessArchitecture
            == System.Runtime.InteropServices.Architecture.Arm64;
+
+    /// <summary>
+    /// Apple's ARM64 ABI passes the whole variadic part on the stack, each
+    /// argument in its own 8-byte slot, while a CALLI can only describe the
+    /// ordinary (non-variadic) convention, which fills x0-x7 and v0-v7 first.
+    /// The two agree once the registers are used up: the call is made with
+    /// dummy arguments that fill the remaining general-purpose and FP argument
+    /// registers after the fixed part, and every variadic argument is declared
+    /// as a 64-bit integer (a double travels as its bit pattern). The ordinary
+    /// convention then lays the variadic part out on the stack in 8-byte slots,
+    /// in order, which is exactly where the variadic callee reads it.
+    /// </summary>
+    static bool AppleArm64Variadic =>
+        Compat.IsMacOS()
+        && System.Runtime.InteropServices.RuntimeInformation.ProcessArchitecture
+           == System.Runtime.InteropServices.Architecture.Arm64;
+
+    const int Arm64ArgRegs = 8;
+
+    /// <summary>The call shape: CLR types the calli is made with, and how many
+    /// register-filling dummies sit between the fixed and the variadic part.</summary>
+    sealed class CallPlan
+    {
+        public List<Type> CallTypes = null!;
+        public int PadGp, PadFp;
+        public bool StackSlots;   // variadic part passed as 8-byte integer slots
+    }
+
+    static bool IsFpType(Type t) => t == typeof(float) || t == typeof(double);
+
+    static CallPlan PlanCall(List<Type> argTypes, int fixedCount, string who)
+    {
+        var plan = new CallPlan();
+        if (AppleArm64Variadic && fixedCount < argTypes.Count)
+        {
+            int gp = 0, fp = 0;
+            for (int i = 0; i < fixedCount; i++)
+                if (IsFpType(argTypes[i])) fp++; else gp++;
+            if (gp > Arm64ArgRegs || fp > Arm64ArgRegs)
+                throw new LispErrorException(new LispError(
+                    $"{who}: a variadic call whose fixed part does not fit in the argument registers is not supported on Apple ARM64"));
+            plan.StackSlots = true;
+            plan.PadGp = Arm64ArgRegs - gp;
+            plan.PadFp = Arm64ArgRegs - fp;
+            var ct = new List<Type>(argTypes.Take(fixedCount));
+            for (int i = 0; i < plan.PadGp; i++) ct.Add(typeof(long));
+            for (int i = 0; i < plan.PadFp; i++) ct.Add(typeof(double));
+            for (int i = fixedCount; i < argTypes.Count; i++) ct.Add(typeof(long));
+            plan.CallTypes = ct;
+            return plan;
+        }
+        plan.CallTypes = argTypes.Select((t, i) => i < fixedCount ? t : VariadicCallType(t)).ToList();
+        return plan;
+    }
+
+    static object?[] BuildInvokeArgs(IntPtr funcPtr, List<Type> argTypes, int fixedCount,
+                                     CallPlan plan, LispObject[] nativeArgs)
+    {
+        var invokeArgs = new object?[plan.CallTypes.Count + 1];
+        invokeArgs[0] = funcPtr;
+        int k = 1;
+        for (int i = 0; i < fixedCount; i++)
+            invokeArgs[k++] = ConvertArg(nativeArgs[i], argTypes[i]);
+        for (int i = 0; i < plan.PadGp; i++) invokeArgs[k++] = 0L;
+        for (int i = 0; i < plan.PadFp; i++) invokeArgs[k++] = 0.0;
+        for (int i = fixedCount; i < argTypes.Count; i++)
+            invokeArgs[k++] = plan.StackSlots
+                ? VariadicSlot(nativeArgs[i], argTypes[i])
+                : ConvertVariadicArg(nativeArgs[i], argTypes[i]);
+        return invokeArgs;
+    }
+
+    /// <summary>A variadic argument as the 64-bit stack slot Apple ARM64 passes it
+    /// in: integers sign- or zero-extended per their declared type, floats promoted
+    /// to double and passed as its bits.</summary>
+    static long VariadicSlot(LispObject arg, Type declared)
+    {
+        if (IsFpType(declared))
+            return BitConverter.DoubleToInt64Bits((double)ConvertArg(arg, typeof(double))!);
+        return ConvertArg(arg, declared) switch
+        {
+            IntPtr ip => ip.ToInt64(),
+            int i => i,
+            uint u => u,
+            long l => l,
+            ulong ul => unchecked((long)ul),
+            short s => s,
+            ushort us => us,
+            sbyte sb => sb,
+            byte b => b,
+            var o => throw new LispErrorException(new LispError(
+                $"dotnet:ffi: cannot pass {o} as a variadic argument"))
+        };
+    }
 
     static Type VariadicCallType(Type t)
     {
@@ -258,8 +352,9 @@ static class NativeFFI
                 $"dotnet:ffi: {func} expects {argTypes.Count} args, got {nativeArgs.Length}"));
 
         // The types the call is MADE with: the variadic part may travel
-        // differently from how it is declared (see VariadicCallType).
-        var callTypes = argTypes.Select((t, i) => i < fixedCount ? t : VariadicCallType(t)).ToList();
+        // differently from how it is declared (see VariadicCallType, PlanCall).
+        var plan = PlanCall(argTypes, fixedCount, "dotnet:ffi");
+        var callTypes = plan.CallTypes;
 
         // Build or reuse DynamicMethod
         var sigKey = string.Join(",", callTypes.Select(t => t.Name)) + "->" + retType.Name
@@ -294,12 +389,7 @@ static class NativeFFI
         var funcPtr = NativeLibrary.GetExport(libHandle, func);
 
         // Build invoke args: [funcPtr, nativeArg0, nativeArg1, ...]
-        var invokeArgs = new object?[nativeArgs.Length + 1];
-        invokeArgs[0] = funcPtr;
-        for (int i = 0; i < nativeArgs.Length; i++)
-            invokeArgs[i + 1] = i < fixedCount
-                ? ConvertArg(nativeArgs[i], argTypes[i])
-                : ConvertVariadicArg(nativeArgs[i], argTypes[i]);
+        var invokeArgs = BuildInvokeArgs(funcPtr, argTypes, fixedCount, plan, nativeArgs);
 
         var result = dm.Invoke(null, invokeArgs);
         return ConvertReturn(result, retType);
@@ -324,7 +414,8 @@ static class NativeFFI
                 $"dotnet:%ffi-call-ptr: expects {argTypes.Count} args, got {nativeArgs.Length}"));
 
         // See Call: the variadic part may travel differently from how it is declared.
-        var callTypes = argTypes.Select((t, i) => i < fixedCount ? t : VariadicCallType(t)).ToList();
+        var plan = PlanCall(argTypes, fixedCount, "dotnet:%ffi-call-ptr");
+        var callTypes = plan.CallTypes;
         var sigKey = string.Join(",", callTypes.Select(t => t.Name)) + "->" + retType.Name
                      + "|fixed" + fixedCount;
         var cacheKey = ("*ptr*", "*ptr*", sigKey);
@@ -348,12 +439,7 @@ static class NativeFFI
             }
         }
 
-        var invokeArgs = new object?[nativeArgs.Length + 1];
-        invokeArgs[0] = funcPtr;
-        for (int i = 0; i < nativeArgs.Length; i++)
-            invokeArgs[i + 1] = i < fixedCount
-                ? ConvertArg(nativeArgs[i], argTypes[i])
-                : ConvertVariadicArg(nativeArgs[i], argTypes[i]);
+        var invokeArgs = BuildInvokeArgs(funcPtr, argTypes, fixedCount, plan, nativeArgs);
 
         var result = dm.Invoke(null, invokeArgs);
         return ConvertReturn(result, retType);

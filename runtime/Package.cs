@@ -226,6 +226,16 @@ public class Package : LispObject
         }
     }
 
+    /// <summary>Bumped whenever a package stops mapping a name to the symbol
+    /// it mapped it to before (UNINTERN, SHADOWING-IMPORT over a present
+    /// symbol, SHADOW over an inherited one, UNUSE-PACKAGE, RENAME-PACKAGE,
+    /// DELETE-PACKAGE). A cache of (name, package) -> symbol lookups is valid
+    /// only while this has not moved. Interning and exporting never change an
+    /// existing mapping, so they leave it alone.</summary>
+    public static int MappingEpoch => _mappingEpoch;
+    private static int _mappingEpoch;
+    private static void BumpMappingEpoch() => System.Threading.Interlocked.Increment(ref _mappingEpoch);
+
     public void Shadow(string name)
     {
         lock (_pkgLock)
@@ -235,6 +245,7 @@ public class Package : LispObject
             {
                 var sym = new Symbol(name, this);
                 _internalSymbols[name] = sym;
+                BumpMappingEpoch();
             }
             _shadowingSymbols.Add(name);
         }
@@ -272,6 +283,7 @@ public class Package : LispObject
         {
             _useList.Remove(pkg);
             _useSnapshot = _useList.ToArray();
+            BumpMappingEpoch();
         }
     }
 
@@ -303,7 +315,18 @@ public class Package : LispObject
     public bool RemoveLocalNickname(string nickname) =>
         _localNicknames.TryRemove(nickname, out _);
     public Package? FindLocalNickname(string nickname) =>
-        _localNicknames.TryGetValue(nickname, out var p) ? p : null;
+        !_localNicknames.IsEmpty && _localNicknames.TryGetValue(nickname, out var p) ? p : null;
+    public bool HasLocalNicknames => !_localNicknames.IsEmpty;
+    /// <summary>Drop every local nickname that names PKG; true if any was.</summary>
+    public bool RemoveLocalNicknamesFor(Package pkg)
+    {
+        bool any = false;
+        foreach (var kv in _localNicknames)
+            if (ReferenceEquals(kv.Value, pkg) && _localNicknames.TryRemove(kv.Key, out _))
+                any = true;
+        return any;
+    }
+    public void ClearLocalNicknames() => _localNicknames.Clear();
     public IEnumerable<(string Nick, Package Pkg)> LocalNicknames =>
         _localNicknames.Select(kv => (kv.Key, kv.Value));
 
@@ -383,6 +406,7 @@ public class Package : LispObject
                 _internalSymbols.TryRemove(name, out _);
             _shadowingSymbols.Remove(name);
             if (sym!.HomePackage == this) sym.HomePackage = null;
+            BumpMappingEpoch();
             return true;
         }
     }
@@ -392,8 +416,16 @@ public class Package : LispObject
         lock (_pkgLock)
         {
             // Preserve external status: if the replaced symbol was external, keep new one external
-            bool wasExternal = _externalSymbols.TryRemove(sym.Name, out _);
-            _internalSymbols.TryRemove(sym.Name, out _);
+            bool wasExternal = _externalSymbols.TryRemove(sym.Name, out var oldExt);
+            _internalSymbols.TryRemove(sym.Name, out var oldInt);
+            // The symbol it replaces is uninterned (CLHS SHADOWING-IMPORT), so it
+            // loses this package as its home, as UNINTERN does.
+            var old = oldExt ?? oldInt;
+            if (old != null && !ReferenceEquals(old, sym))
+            {
+                if (old.HomePackage == this) old.HomePackage = null;
+                BumpMappingEpoch();
+            }
             // Import the symbol and mark it as shadowing
             if (wasExternal)
                 _externalSymbols[sym.Name] = sym;
@@ -428,7 +460,8 @@ public class Package : LispObject
                 _allPackages.TryRemove(n, out _);
             _nicknames.Clear();
             Name = newName;
-            _nameString = null;   // PACKAGE-NAME must answer with the new name
+            _nameString = null;
+            BumpMappingEpoch();   // PACKAGE-NAME must answer with the new name
             _allPackages[newName] = this;
             if (newNicknames != null)
                 foreach (var n in newNicknames)
@@ -459,6 +492,7 @@ public class Package : LispObject
     {
         lock (_pkgLock)
         {
+            BumpMappingEpoch();
             // Unuse all packages that this package uses
             _useList.Clear();
             _useSnapshot = Array.Empty<Package>();

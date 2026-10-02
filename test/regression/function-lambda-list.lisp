@@ -67,3 +67,16 @@
         (equal (first r) '(a &optional b &key c))
         (equal r '(nil nil))))
   t)
+
+;;; A (SETF name) function name answers for the setf function, as a symbol does
+;;; for its function. It used to answer "unknown" for every such name.
+(defun (setf fll-setf-fn) (new obj &optional flag) (declare (ignore obj flag)) new)
+(defgeneric (setf fll-setf-gf) (new obj))
+
+(deftest function-lambda-list.setf-name
+  (list (%fll '(setf fll-setf-fn))
+        (%fll '(setf fll-setf-gf))
+        (%fll '(setf fll-no-such-setf-fn)))
+  (((new obj &optional flag) t)
+   ((new obj) t)
+   (nil nil)))

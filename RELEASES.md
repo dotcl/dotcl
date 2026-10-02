@@ -3,6 +3,93 @@
 User-facing release notes for dotcl. Each section corresponds to a tagged
 release on the public mirror (dotcl/dotcl).
 
+## v0.1.31 -- 2026-10-02
+
+Real libraries now run on dotcl and pass their own test suites. Those suites
+found bugs in CLOS and the MOP, macros, the compiler, the printer, streams and
+numbers, and this release fixes them. Large systems also compile far faster:
+a quickload that builds serapeum and its dependencies from source takes 25 s,
+against 167 s with 0.1.30 (median of three runs on one Linux machine).
+generic-cl, cl-environments, hu.dwim.def, spinneret and cl-who now pass their
+tests; cepl, cl-pdf and ContextL load.
+
+A few fixes make code that used to pass quietly fail. They are listed first.
+
+### Upgrading
+
+- **C# hosts must be rebuilt against 0.1.31.** `Symbol.Function` and
+  `Symbol.SetfFunction` are properties, `LispMethod.Qualifiers` is an array and
+  `LispProcess.Launch` takes different arguments; a host built against 0.1.30
+  fails with MissingFieldException. `docs/upgrading.md` shows each change. Lisp
+  code and fasls are not affected.
+- **With `DotclHost.SetThrowingDebuggerHook()`, runtime errors also reach C# as
+  `DotclConditionException`.** An error such as `(car 5)` or a failed
+  `dotnet:invoke` used to arrive as `LispErrorException`; a host that catches
+  that type no longer sees them. This compiles unchanged; see `docs/upgrading.md`.
+- **`DotclHost.Call` reads the name as the Lisp reader does, and returns the
+  primary value.** `Call("fact")` now reaches `(defun fact ...)`; a symbol whose
+  name is lowercase is written `Call("|lower|")`, and `"pkg::name"` qualifies.
+  The same holds for `CallMv`, `GetSpecial`, `SetSpecial` and `Register`. For a
+  function that returns several values, `Call` and `EvalString` return the first
+  one instead of an internal wrapper. Both compile unchanged; see
+  `docs/upgrading.md`.
+- **`typep` with an unknown type signals an error.** `(typep x 'no-such-type)`
+  used to return NIL, so a misspelled type in `typep`, `typecase` or
+  `check-type` behaved as an empty type.
+- **`make-hash-table` with a test other than `eq`, `eql`, `equal` or `equalp`
+  signals TYPE-ERROR** unless `:hash-function` is given (now supported, as in
+  SBCL). An anonymous test function used to make an EQL table that missed keys.
+- **`load` and `eval` of source no longer define anything inside an `eval-when`
+  without `:execute`** (CLHS 3.8).
+- **An array specialized to one integer type is no longer also of another.** A
+  `fixnum` array used to satisfy `(simple-array (unsigned-byte 8) (*))`.
+- **Slots of the same name from different packages are different slots**
+  (CLHS 7.5.3); they used to be merged.
+- **A binary input stream no longer skips a leading byte order mark.**
+- **The standard readtable no longer defines `#U` and `#K`.**
+- **`delete-file` no longer deletes a directory named by a file-form pathname.**
+  Use the new `dotcl:delete-directory` (as SBCL's `sb-ext:delete-directory`).
+
+### Libraries as NuGet packages (preview)
+
+`dotcl pack --library` packs an ASDF system, its compiled fasls and optionally
+ReadyToRun code into a NuGet package, and another system loads it with a
+`(:nuget ...)` component, without compiling it again on the same dotcl. This is
+a preview and may change; on Windows, `--r2r` stores the ReadyToRun files under
+wrong names for now. See `docs/dotcl-pack.md`.
+
+### Faster compile and load
+
+- A fasl has far fewer methods for the JIT to compile. A quickload of generic-cl
+  from ready fasls went from 10.0 s to 2.25 s on one Mac.
+- 64-bit modular arithmetic that stays in range runs in machine words:
+  ironclad's argon2i went from 24.9 s to 13.9 s.
+- Generic function dispatch and slot accessors cache per class: cl-bench's
+  clos/instantiate went from 1.26 s to 0.64 s.
+
+### Fixes
+
+Most fixes came from the test suites of real libraries. Among them:
+
+- CLOS and the MOP: redefining a class with existing instances, `defmethod` on
+  an aliased function, numeric and `t` method qualifiers, `make-instance` of
+  structure classes and ContextL's metaclass `:around` methods work as CLHS and
+  AMOP say.
+- The compiler: a `&key` default can refer to the `&rest` variable, local
+  `(setf name)` functions work from closures, and a circular literal no longer
+  makes compilation run forever. `compile-file` reports an error during
+  macroexpansion and goes on, as SBCL does.
+- Printing and streams: Gray streams get `fresh-line` and `terpri` (spinneret),
+  `with-output-to-string :element-type 'base-char` (cl-who), and pretty
+  printing in logical blocks behaves as in SBCL.
+- Numbers and hash tables: `floor`, `mod` and `rem` on floats and ratios and
+  `expt` of a ratio answer as SBCL does; `sxhash` of bignums and floats depends
+  on the value, and `equal` / `equalp` tables find pathname and structure keys.
+- Threads from `make-thread` get the main thread's 256 MB stack on 64-bit
+  systems, so code that compiles in the REPL also compiles from a SLIME worker.
+- Emacs `M-x slime` starts dotcl and connects; with SLY, use `sly-connect`.
+  `docs/editors.md` has the steps.
+
 ## v0.1.30 -- 2026-09-28
 
 The REPL is the headline. It is the first thing you meet after
@@ -111,7 +198,6 @@ you may have hit: `sort` with a predicate such as `#'>=` could return a list tha
 was not sorted; `fresh-line` after `prin1` or `princ` did not start a new line;
 `read` from a string stream after `file-position` did not read from the new
 position; and `loop with` did not accept a nested pattern such as `(a (b c))`.
-CHANGELOG.md has the rest.
 
 On Windows, arguments passed to a `.bat` or `.cmd` file through
 `uiop:run-program` or dotcl's own process functions are no longer reinterpreted

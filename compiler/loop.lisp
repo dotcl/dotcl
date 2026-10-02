@@ -2516,6 +2516,9 @@ collected result will be returned as the value of the LOOP."
    Preserves object identity: returns the original form if no expansion occurred."
   (cond
     ((atom form) form)
+    ;; Quoted data is not code: it may be circular (a literal read with #n=),
+    ;; and a list in it that looks like an internal macro call is still data.
+    ((eq (car form) 'quote) form)
     ((and (loop-internal-macro-p (car form))
           (dotcl.cil-compiler::find-macro-expander (car form)))
      ;; Expand internal loop macro via *macros* table and recurse

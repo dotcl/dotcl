@@ -13,6 +13,15 @@ public static class Startup
     // from Value on each call and a rebound *MACROS* is picked up as before.
     private static Symbol[]? _macroTableSyms;
 
+    /// <summary>The compiler's *macros* entry for SYM as MACRO-FUNCTION and
+    /// MACROEXPAND see it: null when SYM names a function. The compiler keeps
+    /// rewrites of some function calls in that table (MAKE-INSTANCE, a generic
+    /// function), which are compiler macros in CLHS terms (3.2.2.1), not macros:
+    /// MACRO-FUNCTION has to answer NIL for them and MACROEXPAND leave the call
+    /// alone.</summary>
+    internal static LispFunction? LookupCompilerMacroAsMacro(Symbol sym) =>
+        sym.Function is LispFunction ? null : LookupCompilerMacro(sym);
+
     /// <summary>Look up a macro expander in the compiler's *macros* hash table by symbol.
     /// Returns the LispFunction expander if found, null otherwise.</summary>
     internal static LispFunction? LookupCompilerMacro(Symbol sym)
@@ -238,6 +247,9 @@ public static class Startup
     public static Symbol UNQUOTE_SPLICING = null!;
     public static Symbol UNQUOTE_NSPLICING = null!;
     public static LispReadtable StandardReadtable = null!;
+    /// <summary>The standard syntax plus the fasl-literal extensions; read with
+    /// only while reconstructing a fasl literal.</summary>
+    public static LispReadtable FaslReadtable = null!;
 
     // Standard streams
     public static LispInputStream StandardInput = null!;
@@ -685,6 +697,8 @@ public static class Startup
         StandardReadtable = LispReadtable.CreateStandard();
         Reader.RegisterStandardMacros(StandardReadtable);
         readtable.Value = StandardReadtable.Clone(); // current readtable is a copy of standard
+        FaslReadtable = StandardReadtable.Clone();
+        Reader.RegisterFaslMacros(FaslReadtable);
 
         var readBase = InternExport("*READ-BASE*");
         readBase.IsSpecial = true;
@@ -1441,17 +1455,22 @@ public static class Startup
         SymInPkg(name, pkgName);
     }
 
-    private static readonly System.Collections.Concurrent.ConcurrentDictionary<(string, string), Symbol> _symInPkgCache = new();
+    // Valid for one Package.MappingEpoch: a name the package has since stopped
+    // mapping to the cached symbol (a SHADOWING-IMPORT swapping it for another
+    // package's symbol, say) must be looked up again, or fasl code that first
+    // runs after the swap gets the symbol the package no longer has.
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<(string, string), (Symbol Sym, int Epoch)> _symInPkgCache = new();
 
     public static Symbol SymInPkg(string name, string pkgName)
     {
         var key = (name, pkgName);
-        if (_symInPkgCache.TryGetValue(key, out var cached)) return cached;
+        int epoch = Package.MappingEpoch;
+        if (_symInPkgCache.TryGetValue(key, out var cached) && cached.Epoch == epoch) return cached.Sym;
         var pkg = Package.FindPackage(pkgName);
         if (pkg != null)
         {
             var (sym, status) = pkg.FindSymbol(name);
-            if (status != SymbolStatus.None) { _symInPkgCache[key] = sym; return sym; }
+            if (status != SymbolStatus.None) { _symInPkgCache[key] = (sym, epoch); return sym; }
             var (newSym, _) = pkg.Intern(name);
             // No cross-package Function copy here: interning PKG::NAME must not
             // give the fresh symbol another package's function. Unqualified
@@ -1461,7 +1480,7 @@ public static class Startup
             // Copying grafted e.g. ASDF/FOOTER::EMPTYP onto a user package's
             // freshly interned EMPTYP, making DEFGENERIC see a bogus ordinary
             // function (and any funcall of that symbol reach the wrong one).
-            _symInPkgCache[key] = newSym;
+            _symInPkgCache[key] = (newSym, epoch);
             return newSym;
         }
         // Fallback to CL: package doesn't exist yet
@@ -1623,7 +1642,11 @@ public static class Startup
         var vector_ = MakeClass("VECTOR", array_, sequence);  // VECTOR CPL: [VECTOR, ARRAY, SEQUENCE, T]
         MakeClass("SIMPLE-VECTOR", vector_, simpleArray);
         var string_ = MakeClass("STRING", vector_);    // STRING CPL: [STRING, VECTOR, ARRAY, SEQUENCE, T]
-        MakeClass("SIMPLE-STRING", string_, simpleArray);
+        var simpleString = MakeClass("SIMPLE-STRING", string_, simpleArray);
+        // A string made with element type BASE-CHAR (MAKE-ARRAY, a BASE-CHAR string
+        // output stream) is an instance of these, so methods can specialize on them.
+        var baseString = MakeClass("BASE-STRING", string_);
+        MakeClass("SIMPLE-BASE-STRING", baseString, simpleString);
         MakeClass("HASH-TABLE", tClass);
         var stream_ = MakeClass("STREAM", stdObj);
         stream_.IsBuiltIn = false; // Allow subclassing for Gray Streams (de-facto standard)
@@ -1781,7 +1804,7 @@ public static class Startup
                     try { taskResult = Runtime.Funcall(thunk); }
                     catch (Exception e) { taskEx = e; }
                     finally { done.Set(); }
-                });
+                }, Runtime.LispThreadStackSize);
                 t.IsBackground = true;
                 t.Start();
                 if (!done.Wait(timeoutMs))
@@ -1804,6 +1827,14 @@ public static class Startup
             // the cleaning itself is a CLI subcommand, and these exist so the
             // regression suite can check the location against uiop's own answer
             // and run the selection rule over a directory it builds itself.
+            // The generation of the running compiler (the stamp every fasl it writes
+            // carries), or NIL. Internal: a library package records it beside the
+            // fasls it ships, and the consumer uses them only when it matches.
+            var coreGenFn = new LispFunction(args =>
+                CoreGeneration() is string g ? new LispString(g) : (LispObject)Nil.Instance,
+                "DOTCL::%CORE-GENERATION", 0);
+            RegisterDotclInternal("%CORE-GENERATION", coreGenFn);
+            Emitter.CilAssembler.RegisterFunction("DOTCL::%CORE-GENERATION", coreGenFn);
             var fcRootFn = new LispFunction(FaslCache.FaslCacheRoot, "DOTCL::%FASL-CACHE-ROOT", 0);
             RegisterDotclInternal("%FASL-CACHE-ROOT", fcRootFn);
             Emitter.CilAssembler.RegisterFunction("DOTCL::%FASL-CACHE-ROOT", fcRootFn);
@@ -1931,11 +1962,12 @@ public static class Startup
     public static bool HasFeature(string name) => _features.Contains(name);
 
     /// <summary>Register a function in the DOTCL package (exported).</summary>
-    private static void RegisterDotcl(string name, LispFunction fn)
+    private static void RegisterDotcl(string name, LispFunction fn, string? doc = null)
     {
         var (sym, _) = DotclPkg.Intern(name);
         DotclPkg.Export(sym);
         sym.Function = fn;
+        if (doc != null) _dotnetDocs.Add((sym, doc));
     }
 
     /// <summary>Register a function in the DOTCL package WITHOUT exporting.
@@ -2030,6 +2062,12 @@ public static class Startup
         // location on every platform.
         RegisterDotcl("USER-INIT-FILE",
             new LispFunction(args => LispPathname.FromString(UserInitFilePath())));
+
+        // Pinned vectors: a specialized vector whose storage the GC does not move,
+        // so foreign code can use its address (the static-vectors backend).
+        RegisterDotcl("MAKE-PINNED-VECTOR", new LispFunction(Runtime.MakePinnedVector, "DOTCL:MAKE-PINNED-VECTOR", 2));
+        RegisterDotcl("PINNED-VECTOR-ADDRESS", new LispFunction(Runtime.PinnedVectorAddress, "DOTCL:PINNED-VECTOR-ADDRESS", 1));
+        RegisterDotcl("UNPIN-VECTOR", new LispFunction(Runtime.UnpinVector, "DOTCL:UNPIN-VECTOR", 1));
 
         // dotcl:function-sil: get SIL stored on a function (returns NIL if none)
         RegisterDotcl("FUNCTION-SIL", new LispFunction(args => {
@@ -2624,12 +2662,18 @@ public static class Startup
         // every output spec) can be built on UIOP's slurp-input-stream.
         //   (launch-process program arguments
         //      &key directory input output error environment
-        //           if-input-does-not-exist if-output-exists if-error-output-exists) -> #<PROCESS>
+        //           if-input-does-not-exist if-output-exists if-error-output-exists
+        //           external-format) -> #<PROCESS>
         // Each of input/output/error is :stream (default), a pathname (file
         // redirection), nil (EOF / discard), or t/:inherit (inherit parent handle).
         // :environment follows sb-ext:run-program: a list of "VAR=value" strings
         // that REPLACES the child's entire environment; omit the key to inherit
         // the parent's environment (an explicit nil means an empty environment).
+        // :external-format (any designator OPEN accepts, e.g. :cp932) is the
+        // encoding of all three pipes, and of the files they are redirected to, as
+        // in uiop:run-program. Omitted, nil or :default keeps the .NET default:
+        // the console output code page, which is UTF-8 once dotcl has set it at
+        // startup (and UTF-8 elsewhere).
         // All the file/null plumbing lives in LispProcess.Launch so the UIOP
         // #+dotcl branch stays small.
         RegisterDotcl("LAUNCH-PROCESS", new LispFunction(args => {
@@ -2649,15 +2693,20 @@ public static class Startup
             // normalized specs explicitly, then appends the original `keys` plist,
             // so the same keyword can appear twice: the first (normalized) must win.
             // Accept upstream's :error/:if-error-exists names and their
-            // :error-output/:if-error-output-exists aliases. :wait, :element-type,
-            // :external-format, :allow-other-keys, :search are tolerated and ignored.
+            // :error-output/:if-error-output-exists aliases. :element-type
+            // (unsigned-byte 8) makes the :stream targets byte streams; :wait,
+            // :allow-other-keys, :search are tolerated and ignored.
             bool haveIn = false, haveOut = false, haveErr = false, haveDir = false,
-                 haveIfIn = false, haveIfOut = false, haveIfErr = false, haveEnv = false;
+                 haveIfIn = false, haveIfOut = false, haveIfErr = false, haveEnv = false,
+                 haveEf = false, haveEt = false;
+            LispObject externalFormat = Nil.Instance, elementType = Nil.Instance;
             for (int i = 2; i + 1 < args.Length; i += 2) {
                 if (args[i] is not Symbol k) continue;
                 var v = args[i + 1];
                 if (!haveDir && k == Keyword("DIRECTORY")) { directory = v; haveDir = true; }
                 else if (!haveEnv && k == Keyword("ENVIRONMENT")) { environment = v; haveEnv = true; }
+                else if (!haveEf && k == Keyword("EXTERNAL-FORMAT")) { externalFormat = v; haveEf = true; }
+                else if (!haveEt && k == Keyword("ELEMENT-TYPE")) { elementType = v; haveEt = true; }
                 else if (!haveIn && k == Keyword("INPUT")) { input = v; haveIn = true; }
                 else if (!haveOut && k == Keyword("OUTPUT")) { output = v; haveOut = true; }
                 else if (!haveErr && (k == Keyword("ERROR") || k == Keyword("ERROR-OUTPUT"))) { error = v; haveErr = true; }
@@ -2680,8 +2729,14 @@ public static class Startup
                     ec = envCons.Cdr;
                 }
             }
+            var encoding = externalFormat is Nil
+                ? null : Runtime.ParseExternalFormat(externalFormat, "LAUNCH-PROCESS");
+            // Octets only: (unsigned-byte 8) or a type that means the same.
+            bool binary = elementType is Cons et && et.Car is Symbol etSym
+                && etSym.Name == "UNSIGNED-BYTE" && et.Cdr is Cons etArg
+                && etArg.Car is Fixnum etBits && etBits.Value == 8;
             return LispProcess.Launch(program, argStrings, dir, input, output, error,
-                                      ifInputDne, ifOutputExists, ifErrorExists, env);
+                                      ifInputDne, ifOutputExists, ifErrorExists, env, encoding, binary);
         }));
         RegisterDotcl("PROCESS-INPUT", new LispFunction(args =>
             args[0] is LispProcess p ? p.InputStream
@@ -2740,6 +2795,9 @@ public static class Startup
 
         // Threading primitives: public dotcl: API backed by Runtime.Thread.cs.
         // bordeaux-threads impl-dotcl.lisp delegates to these.
+        RegisterDotcl("DELETE-DIRECTORY",
+            new LispFunction(Runtime.DeleteDirectoryFn, "DELETE-DIRECTORY", -1),
+            "Delete the directory PATHSPEC names (in file or directory form). Unless RECURSIVE is true the directory must be empty. Signals FILE-ERROR when there is no directory there, when it is not empty, or when it cannot be deleted. Returns the directory's pathname in directory form.");
         RegisterDotcl("MAKE-THREAD",
             new LispFunction(Runtime.MakeThread, "MAKE-THREAD", -1));
         RegisterDotcl("CURRENT-THREAD",
@@ -2935,6 +2993,17 @@ public static class Startup
             return new LispString(ReplColor.Paint(role, text, enabled));
         }, "DOTCL:%REPL-PAINT", -1));
 
+        // (%REPL-SET-COLORS spec): apply SPEC, in the form of DOTCL_COLORS, on
+        // top of the colours in effect. Returns NIL.
+        RegisterDotclInternal("%REPL-SET-COLORS", new LispFunction(args =>
+        {
+            if (args.Length != 1)
+                throw new LispErrorException(new LispProgramError(
+                    "DOTCL:%REPL-SET-COLORS: requires 1 argument"));
+            ReplColor.SetColors(Runtime.AsStringDesignator(args[0], "%REPL-SET-COLORS"));
+            return Nil.Instance;
+        }, "DOTCL:%REPL-SET-COLORS", 1));
+
         // (%REPL-COLOR-DECISION mode no-color term terminal-p): the decision
         // --color makes for one stream, as a pure function. MODE is "auto",
         // "always" or "never"; NO-COLOR and TERM are the variables' values or
@@ -3071,6 +3140,7 @@ public static class Startup
             "(dotnet:new-array element-type &rest elements) => array\nCreate a typed .NET array (element-type[]) filled with the marshalled ELEMENTS.\nELEMENT-TYPE is a type-name string/symbol or a resolved System.Type. Build from\na Lisp list with (apply #'dotnet:new-array element-type list). A Lisp list or\nvector is also auto-marshalled to an array-typed parameter or property.");
         RegisterDotNet(DotNetPkg, "%DEFINE-CLASS", new LispFunction(Runtime.DotNetDefineClass, "DOTNET:%DEFINE-CLASS", -1));
         RegisterDotNet(DotNetPkg, "%SAVE-LIBRARY", new LispFunction(Runtime.DotNetSaveLibrary, "DOTNET:%SAVE-LIBRARY", -1));
+        RegisterDotNet(DotNetPkg, "%REGISTER-CLASS-HANDLERS", new LispFunction(Runtime.DotNetRegisterClassHandlers, "DOTNET:%REGISTER-CLASS-HANDLERS", -1));
         RegisterDotNet(DotNetPkg, "BOX", new LispFunction(Runtime.DotNetBox, "DOTNET:BOX", -1),
             "(dotnet:box value type-name) => boxed-value\nMarshal a Lisp VALUE to the named .NET type and keep it boxed at that static\ntype, so the right overload is chosen when it is passed to a subsequent call.");
         RegisterDotNet(DotNetPkg, "HINT-TYPE", new LispFunction(args => {
@@ -3090,7 +3160,7 @@ public static class Startup
         }, "DOTNET:OBJECT-TYPE", 1),
             "(dotnet:object-type obj) => type-or-nil\nReturn the actual runtime type of a .NET object as a System.Type; NIL if OBJ is\nnot a .NET object. For a dotnet:box value this may differ from dotnet:hint-type.");
         RegisterDotNet(DotNetPkg, "TO-STREAM", new LispFunction(Runtime.DotNetToStream, "DOTNET:TO-STREAM", -1),
-            "(dotnet:to-stream object) => stream\nAdapt OBJECT (a Lisp stream or an existing .NET stream object) to a\nSystem.IO.Stream usable by .NET APIs.");
+            "(dotnet:to-stream net-stream &key binary bivalent) => stream\nWrap a .NET System.IO.Stream as a Lisp stream: characters (UTF-8, no BOM),\nbytes with :BINARY, or both on one stream with :BIVALENT. CLOSE on the Lisp\nstream closes the .NET stream (for a socket, the connection).");
 #if DOTCL_EMIT
         // %FFI-CALL / FFI use DynamicMethod + calli (Runtime.FFI.cs): emit-only.
         RegisterDotNet(DotNetPkg, "%FFI-CALL", new LispFunction(Runtime.FfiCall, "DOTNET:%FFI-CALL", -1));

@@ -269,6 +269,11 @@ public static class Arithmetic
     }
 
     // --- Modular arithmetic ---
+    // |v| > 2^63, so |v| > |a| for every fixnum a (most-negative-fixnum is -2^63).
+    private static readonly System.Numerics.BigInteger TwoTo63 = System.Numerics.BigInteger.One << 63;
+    private static bool OutsideLong(System.Numerics.BigInteger v)
+        => v > TwoTo63 || v < -TwoTo63;
+
     public static Number Mod(Number a, Number b)
     {
         // Fast path: both Fixnum
@@ -280,16 +285,23 @@ public static class Arithmetic
             if (r != 0 && ((r ^ bv) < 0)) r += bv;
             return Fixnum.Make(r);
         }
-        // Float contagion: if either arg is float, use float arithmetic
-        if (a is SingleFloat || b is SingleFloat || a is DoubleFloat || b is DoubleFloat)
+        // A fixnum by a bignum: the bignum's magnitude is larger than any fixnum's,
+        // so the quotient's floor is 0 (same signs, or a = 0) or -1. No BigInteger
+        // division: (mod x (expt 2 64)) is how code keeps a value in 64 bits.
+        if (a is Fixnum sa && b is Bignum sb && OutsideLong(sb.Value))
         {
-            double ad = AsDouble(a), bd = AsDouble(b);
-            double q = Math.Floor(ad / bd);
-            double result = ad - q * bd;
-            if (a is DoubleFloat || b is DoubleFloat)
-                return new DoubleFloat(result);
-            return new SingleFloat((float)result);
+            long av = sa.Value;
+            if (av == 0 || (av > 0) == (sb.Value.Sign > 0)) return sa;
+            return (Number)Bignum.MakeInteger(sb.Value + av);
         }
+        // A float operand: MOD is the second value of FLOOR, computed the way
+        // FLOOR computes it (see FloatRound).
+        if (IsFloatNum(a) || IsFloatNum(b))
+            return Floor(a, b).remainder;
+        // A ratio operand: the same, exactly. The integer path below reads the
+        // numerators only, so (mod 7/2 1) came back as 0.
+        if (a is Ratio || b is Ratio)
+            return Floor(a, b).remainder;
         var (an, _) = AsRational(a);
         var (bn, _) = AsRational(b);
         var iresult = an % bn;
@@ -301,16 +313,11 @@ public static class Arithmetic
 
     public static Number Rem(Number a, Number b)
     {
-        // Float contagion: if either arg is float, use float arithmetic
-        if (a is SingleFloat || b is SingleFloat || a is DoubleFloat || b is DoubleFloat)
-        {
-            double ad = AsDouble(a), bd = AsDouble(b);
-            double q = Math.Truncate(ad / bd);
-            double result = ad - q * bd;
-            if (a is DoubleFloat || b is DoubleFloat)
-                return new DoubleFloat(result);
-            return new SingleFloat((float)result);
-        }
+        // A float operand: REM is the second value of TRUNCATE.
+        // A fixnum by a bignum: |a| < |b|, so the truncated quotient is 0.
+        if (a is Fixnum && b is Bignum rb && OutsideLong(rb.Value)) return a;
+        if (IsFloatNum(a) || IsFloatNum(b) || a is Ratio || b is Ratio)
+            return Truncate(a, b).remainder;
         var (an, _) = AsRational(a);
         var (bn, _) = AsRational(b);
         return (Number)Bignum.MakeInteger(an % bn);
@@ -613,6 +620,92 @@ public static class Arithmetic
     private static bool BothExact(Number a, Number b) =>
         a is Fixnum or Bignum or Ratio && b is Fixnum or Bignum or Ratio;
 
+    private static bool IsFloatNum(Number n) => n is SingleFloat || n is DoubleFloat;
+
+    private enum RoundMode { Floor, Ceiling, Truncate, Round }
+
+    /// <summary>
+    /// FLOOR / CEILING / TRUNCATE / ROUND and their F variants when an operand
+    /// is a float: divide in floating point, then round the float quotient.
+    ///
+    /// Both operands are first taken to the result format (double if either is
+    /// a double, else single). The quotient is x / f rounded in that format, and
+    /// the remainder is x - f * q, also in that format. So (floor 1d0 0.1d0) is
+    /// 10 and 0d0: 1d0 / 0.1d0 rounds to exactly 10d0 even though the true ratio
+    /// of the two binary values is a hair under 10. The alternative, rounding the
+    /// exact rational ratio, gives 9 and 0.09999999999999998d0, and its remainder
+    /// then disagrees with what MOD and REM must return (CLHS: MOD is the second
+    /// value of FLOOR, REM of TRUNCATE). This is also what SBCL computes.
+    ///
+    /// FLOATQUOTIENT selects the F variants: the quotient stays a float (so a
+    /// negative quotient that rounds to zero is -0.0). Otherwise the quotient is
+    /// the exact integer of the rounded float, and -0.0 does not leak into the
+    /// remainder. Returns false when the quotient is not finite (a zero divisor,
+    /// or overflow): the caller keeps its exact path for those, which reports a
+    /// zero divisor or a non-finite operand as it always has.
+    /// </summary>
+    private static bool FloatRound(Number a, Number b, RoundMode mode, bool floatQuotient,
+                                   out (Number quotient, Number remainder) result)
+    {
+        result = default;
+        if (a is DoubleFloat || b is DoubleFloat)
+        {
+            double x = ToDouble(a), f = ToDouble(b);
+            double div = x / f;
+            if (double.IsInfinity(div) || double.IsNaN(div)) return false;
+            double q = RoundDouble(div, mode);
+            if (floatQuotient)
+            {
+                result = (new DoubleFloat(q), new DoubleFloat(x - q * f));
+                return true;
+            }
+            result = (FloatToInteger(q), new DoubleFloat(x - f * (q + 0.0)));
+            return true;
+        }
+        else
+        {
+            float x = ToSingleRounded(a), f = ToSingleRounded(b);
+            float div = x / f;
+            if (float.IsInfinity(div) || float.IsNaN(div)) return false;
+            float q = (float)RoundDouble(div, mode);
+            if (floatQuotient)
+            {
+                float prod = q * f;
+                result = (new SingleFloat(q), new SingleFloat(x - prod));
+                return true;
+            }
+            float qz = q + 0.0f;
+            float p = f * qz;
+            result = (FloatToInteger(q), new SingleFloat(x - p));
+            return true;
+        }
+    }
+
+    // The value is a float already, so rounding it in double is exact, and a
+    // single-precision value comes back unchanged when narrowed again.
+    private static double RoundDouble(double d, RoundMode mode) => mode switch
+    {
+        RoundMode.Floor => Math.Floor(d),
+        RoundMode.Ceiling => Math.Ceiling(d),
+        RoundMode.Truncate => Math.Truncate(d),
+        _ => Math.Round(d, MidpointRounding.ToEven),
+    };
+
+    // A rational taken to single-float the way FLOAT takes it.
+    private static float ToSingleRounded(Number n) => n switch
+    {
+        SingleFloat sf => sf.Value,
+        Fixnum fx => (float)fx.Value,
+        _ => (float)ToDouble(n),
+    };
+
+    // The exact integer an integral float stands for.
+    private static Number FloatToInteger(double q)
+    {
+        if (q > -9.2e18 && q < 9.2e18) return Fixnum.Make((long)q);
+        return (Number)Bignum.MakeInteger(new BigInteger(q));
+    }
+
     public static (Number quotient, Number remainder) Floor(Number a, Number b)
     {
         // Fast path: both Fixnum: avoid BigInteger conversion
@@ -624,6 +717,8 @@ public static class Arithmetic
             if (r != 0 && ((r ^ bv) < 0)) { q--; r += bv; }
             return (Fixnum.Make(q), Fixnum.Make(r));
         }
+        if ((IsFloatNum(a) || IsFloatNum(b)) && FloatRound(a, b, RoundMode.Floor, false, out var fr))
+            return fr;
         var (an, ad) = AsRationalAny(a);
         var (bn, bd) = AsRationalAny(b);
         // a/b as rational = (an * bd) / (ad * bn)
@@ -651,6 +746,8 @@ public static class Arithmetic
             long q = Math.DivRem(av, bv, out long r);
             return (Fixnum.Make(q), Fixnum.Make(r));
         }
+        if ((IsFloatNum(a) || IsFloatNum(b)) && FloatRound(a, b, RoundMode.Truncate, false, out var fr))
+            return fr;
         var (an, ad) = AsRationalAny(a);
         var (bn, bd) = AsRationalAny(b);
         var num = an * bd;
@@ -677,6 +774,8 @@ public static class Arithmetic
             if (r != 0 && ((r ^ bv) >= 0)) { q++; r -= bv; }
             return (Fixnum.Make(q), Fixnum.Make(r));
         }
+        if ((IsFloatNum(a) || IsFloatNum(b)) && FloatRound(a, b, RoundMode.Ceiling, false, out var fr))
+            return fr;
         var (an, ad) = AsRationalAny(a);
         var (bn, bd) = AsRationalAny(b);
         var num = an * bd;
@@ -695,6 +794,8 @@ public static class Arithmetic
 
     public static (Number quotient, Number remainder) Round(Number a, Number b)
     {
+        if ((IsFloatNum(a) || IsFloatNum(b)) && FloatRound(a, b, RoundMode.Round, false, out var fr))
+            return fr;
         var (an, ad) = AsRationalAny(a);
         var (bn, bd) = AsRationalAny(b);
         var num = an * bd;
@@ -764,6 +865,8 @@ public static class Arithmetic
     public static (Number quotient, Number remainder) FFloor(Number a, Number b)
     {
         if (TryFNonFinite(a, b, out var nf)) return nf;
+        if ((IsFloatNum(a) || IsFloatNum(b)) && FloatRound(a, b, RoundMode.Floor, true, out var fr))
+            return fr;
         var (q, r) = Floor(a, b);
         return (QuotientToFloat(q, a, b), r);
     }
@@ -771,6 +874,8 @@ public static class Arithmetic
     public static (Number quotient, Number remainder) FTruncate(Number a, Number b)
     {
         if (TryFNonFinite(a, b, out var nf)) return nf;
+        if ((IsFloatNum(a) || IsFloatNum(b)) && FloatRound(a, b, RoundMode.Truncate, true, out var fr))
+            return fr;
         var (q, r) = Truncate(a, b);
         return (QuotientToFloat(q, a, b), r);
     }
@@ -778,6 +883,8 @@ public static class Arithmetic
     public static (Number quotient, Number remainder) FCeiling(Number a, Number b)
     {
         if (TryFNonFinite(a, b, out var nf)) return nf;
+        if ((IsFloatNum(a) || IsFloatNum(b)) && FloatRound(a, b, RoundMode.Ceiling, true, out var fr))
+            return fr;
         var (q, r) = Ceiling(a, b);
         return (QuotientToFloat(q, a, b), r);
     }
@@ -785,6 +892,8 @@ public static class Arithmetic
     public static (Number quotient, Number remainder) FRound(Number a, Number b)
     {
         if (TryFNonFinite(a, b, out var nf)) return nf;
+        if ((IsFloatNum(a) || IsFloatNum(b)) && FloatRound(a, b, RoundMode.Round, true, out var fr))
+            return fr;
         var (q, r) = Round(a, b);
         return (QuotientToFloat(q, a, b), r);
     }
@@ -812,7 +921,10 @@ public static class Arithmetic
         SingleFloat sf => sf.Value,
         Fixnum f => (float)f.Value,
         Bignum b => (float)b.Value,
-        Ratio r => (float)r.Numerator / (float)r.Denominator,
+        // Through the double quotient, as FLOAT does (ToSingleRounded): taking
+        // numerator and denominator to single-float separately overflows both to
+        // infinity once they pass 3.4e38, and infinity / infinity is NaN.
+        Ratio r => (float)RatioToDouble(r),
         DoubleFloat df => (float)df.Value,
         LispDecimal d => (float)d.Value,
         _ => throw new NotImplementedException($"ToSingle not implemented for {n.GetType().Name}")

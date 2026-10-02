@@ -43,6 +43,24 @@ if [ "$produced" -eq 0 ]; then
   exit 1
 fi
 
+# Every category has to have finished: a summary line saying how many tests it
+# ran and how many failed. A category that crashed, timed out or never ran
+# contributes no failure names, so without this check it would pass the set
+# comparison below exactly like a category whose tests all passed.
+unfinished=""
+for cat in "$@"; do
+  f="$dir/ansi-$cat.txt"
+  if [ ! -f "$f" ] || ! grep -aq 'tests total' "$f" \
+     || ! grep -aqE 'No tests failed|out of .* total tests failed' "$f"; then
+    unfinished="$unfinished $cat"
+  fi
+done
+if [ -n "$unfinished" ]; then
+  echo "ansi-gate: categories with no finished run in $dir:$unfinished" >&2
+  echo "  (crashed, timed out, or not run -- their tests were not looked at)" >&2
+  exit 1
+fi
+
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 

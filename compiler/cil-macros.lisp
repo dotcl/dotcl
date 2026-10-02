@@ -155,7 +155,7 @@
                    (default (cadr key-spec))
                    (supplied-p (caddr key-spec))
                    (found-var (gensym "KV")))
-              (push (list found-var `(member ,keyword ,rest-var)) bindings)
+              (push (list found-var `(%db-key-tail ,keyword ,rest-var)) bindings)
               (if (consp inner-var)
                   ;; Nested destructuring in key position: ((:A (B C)) default)
                   (let ((sub-var (gensym "KSUB")))
@@ -360,6 +360,26 @@ quietly took every typed slot back off the raw path."
               :base-offset base-offset
               :ctor-layout nil)))
 
+(defun %make-structure-instance (name initargs)
+  "MAKE-INSTANCE of the structure class NAME. Each slot takes the keyword of
+   its name as initarg, as in SBCL; a slot given none gets its DEFSTRUCT
+   default, evaluated as the keyword constructor would. INITARGS is the plist
+   MAKE-INSTANCE received, already checked to be of even length."
+  (let* ((info (or (gethash name *struct-info*)
+                   (error "MAKE-INSTANCE: ~S has no structure definition" name)))
+         (slots (getf info :slots))
+         (keys (mapcar (lambda (s) (intern (symbol-name (car s)) "KEYWORD")) slots)))
+    (unless (getf initargs :allow-other-keys)
+      (loop for k in initargs by #'cddr
+            unless (or (eq k :allow-other-keys) (member k keys))
+              do (error "Invalid initarg ~S for class ~S" k name)))
+    (apply #'%make-struct name
+           (mapcar (lambda (s key)
+                     (let ((tail (loop for tl on initargs by #'cddr
+                                       when (eq (car tl) key) return tl)))
+                       (if tail (cadr tail) (eval (cadr s)))))
+                   slots keys))))
+
 ;;; --- Cross-compile (make-host-2) SBCL classoid registration -------------
 ;;; When dotcl is used as the cross-compile host to build SBCL, SBCL's own
 ;;; bootstrap structs (TYPE-CLASS, META-INFO, VOP-PARSE, ...) must be
@@ -495,9 +515,23 @@ quietly took every typed slot back off the raw path."
         (symbol-name sym))))
 
 (defun %lookup-setf-expander (sym table)
-  "Try qualified key first, fall back to bare symbol-name for CL inheritance."
+  "Try qualified key first, fall back to bare symbol-name for CL inheritance.
+   The bare name is also the key of the built-in expanders of CL accessors, so
+   a symbol that shadows one of them (a package with its own ELT or GET) must
+   not fall back: its place is its own (SETF name) function or expander."
   (or (gethash (%setf-key sym) table)
-      (gethash (symbol-name sym) table)))
+      (and (not (%shadows-cl-symbol-p sym))
+           (gethash (symbol-name sym) table))))
+
+(defun %shadows-cl-symbol-p (sym)
+  "True when SYM is not a COMMON-LISP symbol but has the name of an external one."
+  (let ((pkg (symbol-package sym)))
+    (and pkg
+         (not (member (package-name pkg) '("COMMON-LISP" "CL") :test #'string=))
+         (let ((cl (find-package "COMMON-LISP")))
+           (and cl
+                (multiple-value-bind (s status) (find-symbol (symbol-name sym) cl)
+                  (and (eq status :external) (not (eq s sym)))))))))
 
 ;; (setf (documentation x doc-type) new-value)
 (setf (gethash "DOCUMENTATION" *setf-expanders*)
@@ -1207,109 +1241,83 @@ quietly took every typed slot back off the raw path."
                            (lambda (place value)
                              (let ((args (cdr place)))
                                (append (list ',updater) args (list value))))))
+                   ,@(when (stringp (cadr rest))
+                       `((funcall #'(setf documentation) ,(cadr rest) ',accessor 'setf)))
                    ',accessor))
               ;; Long form: (defsetf accessor (params...) (store-vars) body...)
               ;; CL spec: params are bound to gensyms; let* ensures left-to-right eval.
               ;; Multiple store-vars use multiple-value-bind.
               (let ((params (first rest))
                     (store-vars (second rest))
-                    (body (cddr rest)))
+                    (body (cddr rest))
+                    (doc nil))
                 ;; Skip docstring if present
                 (when (and (stringp (car body)) (cdr body))
+                  (setf doc (car body))
                   (setf body (cdr body)))
                 ;; Skip declarations
                 (loop while (and (consp (car body))
                                  (eq (caar body) 'declare))
                       do (setf body (cdr body)))
-                ;; Handle &rest in params: (defsetf acc (a &rest r) (sv) body)
-                ;; body-fn cannot have sv after &rest r, so we split.
-                ;; Also handle &optional in params: (defsetf acc (a &optional b) (sv) body)
-                (let* ((rest-pos (position '&rest params))
-                       (positional-params (if rest-pos
-                                              (subseq params 0 rest-pos)
-                                              params))
-                       (rest-var (if rest-pos (nth (1+ rest-pos) params) nil))
-                       ;; Split positional-params at &optional
-                       (opt-pos (position '&optional positional-params))
-                       (req-params (if opt-pos (subseq positional-params 0 opt-pos) positional-params))
-                       (opt-params (if opt-pos (subseq positional-params (1+ opt-pos)) nil)))
+                ;; The defsetf lambda list is an ordinary lambda list (CLHS 3.4.7):
+                ;; &optional with defaults, &rest and &key all occur (McCLIM's
+                ;; DEFMETHOD* expands to (defsetf f (p &optional r &key k) ...)).
+                ;; BODY-FN takes the store variables and then that lambda list, so
+                ;; the parameters are parsed by LAMBDA itself. The expander binds a
+                ;; temporary to each argument form of the place and passes the
+                ;; temporaries; a keyword in a keyword position is passed as itself
+                ;; so &key can match it. A missing optional or key parameter gets
+                ;; its default at expansion time. &environment is bound to NIL.
+                (let* ((env-pos (position '&environment params))
+                       (env-var (and env-pos (nth (1+ env-pos) params)))
+                       (lambda-list (if env-pos
+                                        (append (subseq params 0 env-pos)
+                                                (nthcdr (+ env-pos 2) params))
+                                        params))
+                       (n-positional (or (position-if (lambda (p) (member p '(&rest &key &allow-other-keys)))
+                                                      lambda-list)
+                                         (length lambda-list)))
+                       (n-positional (- n-positional (if (member '&optional (subseq lambda-list 0 n-positional)) 1 0)))
+                       (has-key (and (member '&key lambda-list) t)))
                   `(progn
                      (eval-when (:compile-toplevel :load-toplevel :execute)
                        (setf (gethash ,(%setf-key accessor) *setf-expanders*)
-                             ,(if rest-var
-                                  ;; &rest case: body-fn takes (positionals... rest-list store-vars...)
-                                  ;; rest-var gets a LIST of gensyms for remaining place args.
-                                  `(let ((body-fn (lambda (,@positional-params ,rest-var ,@store-vars)
-                                                    (block ,accessor ,@body)))
-                                         (pos-names ',(mapcar #'symbol-name positional-params)))
-                                     (lambda (place value)
-                                       (let* ((place-args (cdr place))
-                                              (pos-count ,(length positional-params))
-                                              (pos-args (subseq place-args 0 pos-count))
-                                              (rest-args (subseq place-args pos-count))
-                                              (pos-gensyms (mapcar #'gensym pos-names))
-                                              (rest-gensyms (loop repeat (length rest-args) collect (gensym)))
-                                              (store-gensyms (mapcar (lambda (sv) (gensym (string sv))) ',store-vars))
-                                              (body-form (apply body-fn
-                                                                (append pos-gensyms
-                                                                        (list rest-gensyms)
-                                                                        store-gensyms)))
-                                              (all-bindings (append (mapcar #'list pos-gensyms pos-args)
-                                                                    (mapcar #'list rest-gensyms rest-args))))
-                                         (if (= (length store-gensyms) 1)
-                                             (list* 'let*
-                                                    (append all-bindings
-                                                            (list (list (car store-gensyms) value)))
-                                                    (list body-form))
-                                             (list* 'let* all-bindings
-                                                    (list (list* 'multiple-value-bind
-                                                                 store-gensyms value
-                                                                 (list body-form))))))))
-                                  ;; No &rest: handle &optional in params
-                                  ;; body-fn takes (req-params... opt-params... store-vars...) all as required
-                                  `(let ((body-fn (lambda (,@req-params ,@opt-params ,@store-vars)
-                                                    (block ,accessor ,@body))))
-                                     (lambda (place value)
-                                       (let* ((req-gensyms
-                                               (mapcar (lambda (p) (gensym (string p))) ',req-params))
-                                              (opt-gensyms
-                                               (mapcar (lambda (p) (gensym (string p))) ',opt-params))
-                                              ;; How many optional args are actually provided in place
-                                              (n-opt-provided
-                                               (min (max 0 (- (length (cdr place)) ,(length req-params)))
-                                                    ,(length opt-params)))
-                                              (active-opt-gensyms (subseq opt-gensyms 0 n-opt-provided))
-                                              (store-gensyms
-                                               (mapcar (lambda (sv) (gensym (string sv))) ',store-vars))
-                                              ;; Call body-fn with all params; pass nil for missing optionals
-                                              (body-form
-                                               (apply body-fn
-                                                      (append req-gensyms
-                                                              active-opt-gensyms
-                                                              (make-list (- ,(length opt-params) n-opt-provided))
-                                                              store-gensyms)))
-                                              ;; Bindings only for args actually present in place
-                                              (param-bindings
-                                               (loop for g in (append req-gensyms active-opt-gensyms)
-                                                     for arg-form in (cdr place)
-                                                     collect (list g arg-form))))
-                                         (if (= (length store-gensyms) 1)
-                                             ;; Single store var
-                                             (list* 'let*
-                                                    (append param-bindings
-                                                            (list (list (car store-gensyms) value)))
-                                                    (list body-form))
-                                             ;; Multiple store vars: use multiple-value-bind
-                                             (list* 'let* param-bindings
-                                                    (list (list* 'multiple-value-bind
-                                                                 store-gensyms value
-                                                                 (list body-form))))))))))
+                             (let ((body-fn (lambda (,@store-vars ,@lambda-list)
+                                              (let (,@(when env-var `((,env-var nil))))
+                                                (block ,accessor ,@body)))))
+                               (lambda (place value)
+                                 (let ((bindings '())
+                                       (call-args '())
+                                       (store-gensyms
+                                         (mapcar (lambda (sv) (gensym (string sv))) ',store-vars)))
+                                   (loop for arg in (cdr place)
+                                         for i from 0
+                                         do (if (and ,has-key (>= i ,n-positional)
+                                                     (evenp (- i ,n-positional)) (keywordp arg))
+                                                (push arg call-args)
+                                                (let ((g (gensym "ARG")))
+                                                  (push (list g arg) bindings)
+                                                  (push g call-args))))
+                                   (let ((body-form (apply body-fn (append store-gensyms
+                                                                           (nreverse call-args))))
+                                         (bindings (nreverse bindings)))
+                                     (if (= (length store-gensyms) 1)
+                                         (list* 'let*
+                                                (append bindings
+                                                        (list (list (car store-gensyms) value)))
+                                                (list body-form))
+                                         (list* 'let* bindings
+                                                (list (list* 'multiple-value-bind
+                                                             store-gensyms value
+                                                             (list body-form)))))))))))
                      ;; Record how many store variables this place has, so
                      ;; GET-SETF-EXPANSION returns the right count (not always 1).
                      (eval-when (:compile-toplevel :load-toplevel :execute)
                        (setf (gethash ,(%setf-key accessor) *setf-expander-store-counts*)
                              ,(length store-vars)))
-                     ',accessor))))))))
+                     ,@(when doc
+                         `((funcall #'(setf documentation) ,doc ',accessor 'setf)))
+                     ',accessor)))))))
 
 ;;; --- define-setf-expander ---
 ;;; (define-setf-expander access-fn lambda-list body...)
@@ -1351,6 +1359,8 @@ quietly took every typed slot back off the raw path."
                                   (block ,accessor ,@real-body))))
                            (lambda (place)
                              (apply expander-fn nil place (cdr place))))))
+                 ,@(when docstring
+                     `((funcall #'(setf documentation) ,docstring ',accessor 'setf)))
                  ',accessor)
               ;; Without &whole: expander-fn takes (env arg1 arg2...) for args from (cdr place)
               `(progn
@@ -1362,6 +1372,8 @@ quietly took every typed slot back off the raw path."
                                   (block ,accessor ,@real-body))))
                            (lambda (place)
                              (apply expander-fn nil (cdr place))))))
+                 ,@(when docstring
+                     `((funcall #'(setf documentation) ,docstring ',accessor 'setf)))
                  ',accessor)))))
 
 ;;; --- %get-setf-expansion: helper for read-modify-write macros ---
@@ -1962,13 +1974,62 @@ quietly took every typed slot back off the raw path."
         (let* ((vars (cadr form))
                (value-form (caddr form))
                (body (cdddr form))
-               (primary-var (gensym "MVP")))
+               (primary-var (gensym "MVP"))
+               (split (%mv-split-floor vars value-form body)))
+          (if split
+              split
           `(let* ((,primary-var (%mv-capture ,value-form))
                   ,@(loop for v in vars
                           for i from 0
                           collect `(,v (%mv-nth ,i))))
              (declare (ignorable ,primary-var))
-             ,@body))))
+             ,@body)))))
+
+(defun %floor-split-operands-p (op-form vars)
+  "True when OP-FORM is (FLOOR A B) or (TRUNCATE A B) with A and B symbols or
+   integers that none of VARS (the variables the values go to) is, and the
+   operator and its remainder function are not locally rebound."
+  (and (consp op-form)
+       (member (car op-form) '(floor truncate))
+       (= (length op-form) 3)
+       (<= 1 (length vars) 2)
+       (every (lambda (v) (and (symbolp v) v)) vars)
+       (not (and (second vars) (eq (first vars) (second vars))))
+       (every (lambda (x) (or (integerp x) (and (symbolp x) x (not (keywordp x)))))
+              (cdr op-form))
+       (not (member (third op-form) vars))
+       (not (and (second vars) (member (second op-form) (cdr vars))))
+       (not (local-function-entry (car op-form)))
+       (not (local-function-entry (if (eq (car op-form) 'floor) 'mod 'rem)))))
+
+(defun %mv-setq-split-floor (vars value-form)
+  "(MULTIPLE-VALUE-SETQ (Q R) (FLOOR A B)) as (SETQ R (MOD A B)) and
+   (SETQ Q (FLOOR A B)): MOD and REM are defined as the second values of FLOOR
+   and TRUNCATE, so the pair is the same, and each is a single-value
+   computation -- for fixnums an int64 operation with nothing boxed, where the
+   two-value call built a multiple-value record and boxed both. The remainder
+   is stored first so that A, read again for the quotient, has not changed (it
+   is never R); no other code runs in between."
+  (when (and (%floor-split-operands-p value-form vars)
+             (every (lambda (v) (not (lookup-symbol-macro v))) vars))
+    (let ((op (car value-form)) (a (cadr value-form)) (b (caddr value-form)))
+      `(progn
+         ,@(when (second vars)
+             `((setq ,(second vars) (,(if (eq op 'floor) 'mod 'rem) ,a ,b))))
+         (setq ,(first vars) (,op ,a ,b))))))
+
+(defun %mv-split-floor (vars value-form body)
+  "(MULTIPLE-VALUE-BIND (Q R) (FLOOR A B) BODY...) as a LET* of (FLOOR A B)
+   and (MOD A B) -- TRUNCATE and REM likewise; see %MV-SETQ-SPLIT-FLOOR. With
+   Q and R declared FIXNUM nothing is boxed."
+  (when (%floor-split-operands-p value-form vars)
+    (let ((op (car value-form)) (a (cadr value-form)) (b (caddr value-form)))
+      ;; The remainder is bound first, so that A read for the quotient is
+      ;; still the outer binding when it has the quotient variable's name.
+      `(let* (,@(when (second vars)
+                  `((,(second vars) (,(if (eq op 'floor) 'mod 'rem) ,a ,b))))
+              (,(first vars) (,op ,a ,b)))
+         ,@body))))
 
 ;;; --- dotcl:async / dotcl:await (step B) ---------------------------
 ;;; (dotcl:async BODY...) CPS-transforms BODY into a chain of dotcl:%async-bind /
@@ -2826,7 +2887,7 @@ quietly took every typed slot back off the raw path."
                          (if ty
                              (setf (gethash acc *struct-accessor-types*) ty)
                              (remhash acc *struct-accessor-types*))))
-                     (setf (gethash (symbol-name acc) *setf-expanders*)
+                     (setf (gethash (%setf-key acc) *setf-expanders*)
                            (cond
                              ((null type-option)
                               ;; Standard struct: use %struct-set with raw index.
@@ -4089,15 +4150,16 @@ quietly took every typed slot back off the raw path."
 (setf (gethash 'defmethod *macros*)
       (lambda (form)
         ;; (defmethod name qualifier* ((param1 class1) param2 ...) body...)
-        ;; Qualifiers are the non-NIL symbols before the specialized lambda
+        ;; Qualifiers are the non-NIL atoms before the specialized lambda
         ;; list: none, one (:before, :after, :around, progn, ...) or several
         ;; (a user method combination may define patterns such as (:a :b)).
+        ;; T and numbers are qualifiers too (CLHS DEFMETHOD).
         (let* ((name (cadr form))
                (rest (cddr form))
                (qualifiers nil)
                (specialized-params nil)
                (body nil))
-          (loop while (and (consp rest) (car rest) (symbolp (car rest)))
+          (loop while (and (consp rest) (car rest) (atom (car rest)))
                 do (push (pop rest) qualifiers))
           (setf qualifiers (nreverse qualifiers))
           (setf specialized-params (car rest))
@@ -4109,6 +4171,9 @@ quietly took every typed slot back off the raw path."
           ;; Build: specializers list, plain parameter names
           ;; Only required params can be specialized; stop at &key/&optional/&rest/etc.
           (let* ((specializers nil)
+                 ;; The same specializers as names, while every one is a class
+                 ;; name symbol (or absent); :COMPLEX once one is not.
+                 (spec-names nil)
                  (plain-params nil)
                  (in-required t))
             (dolist (sp specialized-params)
@@ -4125,6 +4190,7 @@ quietly took every typed slot back off the raw path."
                             ;; Handle EQL specializers: (param (eql value))
                             (cond
                               ((and (consp spec) (eq (car spec) 'eql))
+                               (setf spec-names :complex)
                                (push `(%intern-eql-specializer ,(cadr spec)) specializers))
                               ;; A specializer may be a class object, not just a
                               ;; class-name symbol: e.g. (param #.(find-class 'foo)).
@@ -4132,6 +4198,7 @@ quietly took every typed slot back off the raw path."
                               ;; would fail. SBCL/CCL accept this and real libraries
                               ;; (serapeum) rely on it.
                               ((typep spec 'class)
+                               (setf spec-names :complex)
                                (push spec specializers))
                               ;; A .NET type designator: a type-name string, or a form
                               ;; that evaluates to a System.Type / class: e.g.
@@ -4141,18 +4208,22 @@ quietly took every typed slot back off the raw path."
                               ;; so no instance of the type need exist first, and a
                               ;; FullName disambiguates same-simple-name types.
                               ((or (stringp spec) (consp spec))
+                               (setf spec-names :complex)
                                (push `(%specializer-class ,spec) specializers))
                               (t
                                ;; Symbol: the known class wins; a symbol naming only a
                                ;; .NET type resolves to that type's class instead of
                                ;; failing (FIND-CLASS's error is still what surfaces
                                ;; when it is neither).
+                               (unless (eq spec-names :complex) (push spec spec-names))
                                (push `(%specializer-class ',spec) specializers))))
                           (progn
                             (push sp plain-params)
+                            (unless (eq spec-names :complex) (push t spec-names))
                             (push '(find-class 't) specializers)))
                       (push sp plain-params))))
             (setf specializers (nreverse specializers))
+            (unless (eq spec-names :complex) (setf spec-names (nreverse spec-names)))
             (setf plain-params (nreverse plain-params))
             ;; CLHS 7.6.5: The effective method accepts the union of all applicable
             ;; methods' keyword parameters. Individual methods must not reject keywords
@@ -4191,8 +4262,48 @@ quietly took every typed slot back off the raw path."
                                      m-keyword-names))
                          (otherwise nil))))))
               ;; Ensure GF exists (auto-create if not)
-              (let ((qual-list (if qualifiers `(list ,@(mapcar (lambda (q) `',q) qualifiers)) 'nil))
-                    (n-params (length plain-params)))
+              (let* ((qual-list (if qualifiers `(list ,@(mapcar (lambda (q) `',q) qualifiers)) 'nil))
+                     (n-params (length plain-params))
+                     (method-lambda
+                       (%method-lambda-via-protocol
+                        name
+                        (let* ((bn (if (and (consp name) (eq (car name) (quote setf)))
+                                       (cadr name)
+                                       name))
+                               (cv (gensym "CNM-"))
+                               (nv (gensym "NMP-")))
+                          (if (some #'%cnm-needs-capture-p body)
+                              `(lambda ,plain-params
+                                 ;; Capture THIS invocation's cnm/nmp closures from
+                                 ;; thread-local storage (not the global symbol-function,
+                                 ;; which a concurrent dispatch would clobber).
+                                 (let ((,cv (%captured-call-next-method))
+                                       (,nv (%captured-next-method-p)))
+                                   (block ,bn
+                                     ,@(mapcar (lambda (b)
+                                                 (%walk-replace-cnm b cv nv))
+                                               body))))
+                              `(lambda ,plain-params
+                                 (block ,bn ,@body))))))
+                     ;; The unspecialized lambda list, for METHOD-LAMBDA-LIST
+                     ;; (AMOP): the list as written with each specializer dropped.
+                     (unspec-ll (let ((req t))
+                                  (mapcar (lambda (sp)
+                                            (when (member sp lambda-list-keywords)
+                                              (setf req nil))
+                                            (if (and req (consp sp)) (car sp) sp))
+                                          specialized-params))))
+               (if (and (not *cross-compiling*) (listp spec-names))
+                ;; Every specializer is a class name: the method is data plus
+                ;; one call (%DEFMETHOD-RUN). Spelled out, the steps below cost
+                ;; about 150 instructions of top level code per DEFMETHOD, most of
+                ;; the top level code of a CLOS-heavy fasl, JITted at every load.
+                `(%defmethod-run ',name ',qualifiers ',spec-names ,method-lambda
+                                 ',(list n-params m-required-count m-optional-count
+                                         (if m-has-rest t nil) (if m-has-key t nil)
+                                         (if m-has-allow-other-keys t nil)
+                                         m-keyword-names unspec-ll)
+                                 ,(and (not *cross-compiling*) docstring))
                 `(progn
                    ;; Auto-create GF if it doesn't exist. %register-gf installs
                    ;; both the GF registry entry and sym.Function (so this also
@@ -4214,26 +4325,7 @@ quietly took every typed slot back off the raw path."
                    (let ((%m (%make-method
                                (list ,@specializers)
                                ,qual-list
-                               ,(%method-lambda-via-protocol
-                                 name
-                                 (let* ((bn (if (and (consp name) (eq (car name) (quote setf)))
-                                              (cadr name)
-                                              name))
-                                       (cv (gensym "CNM-"))
-                                       (nv (gensym "NMP-")))
-                                  (if (some #'%cnm-needs-capture-p body)
-                                      `(lambda ,plain-params
-                                         ;; Capture THIS invocation's cnm/nmp closures from
-                                         ;; thread-local storage (not the global symbol-function,
-                                         ;; which a concurrent dispatch would clobber).
-                                         (let ((,cv (%captured-call-next-method))
-                                               (,nv (%captured-next-method-p)))
-                                           (block ,bn
-                                             ,@(mapcar (lambda (b)
-                                                         (%walk-replace-cnm b cv nv))
-                                                       body))))
-                                      `(lambda ,plain-params
-                                         (block ,bn ,@body))))))))
+                               ,method-lambda)))
                      (%set-method-lambda-list-info %m ,m-required-count ,m-optional-count
                                                    ,(if m-has-rest t nil)
                                                    ,(if m-has-key t nil)
@@ -4242,19 +4334,42 @@ quietly took every typed slot back off the raw path."
                                                    ;; The unspecialized lambda list, for
                                                    ;; METHOD-LAMBDA-LIST (AMOP): the list as
                                                    ;; written with each specializer dropped.
-                                                   ',(let ((req t))
-                                                       (mapcar (lambda (sp)
-                                                                 (when (member sp lambda-list-keywords)
-                                                                   (setf req nil))
-                                                                 (if (and req (consp sp)) (car sp) sp))
-                                                               specialized-params)))
+                                                   ',unspec-ll)
                      ;; AMOP: defmethod asks the generic function what class its
                      ;; methods are, and the method is an instance of the answer.
                      (%note-method-class (%find-gf ',name) %m)
                      (%add-method (%find-gf ',name) %m)
                      ,@(when (and docstring (not *cross-compiling*))
                          `((funcall #'(setf documentation) ,docstring %m t)))
-                     %m)))))))))
+                     %m))))))))))
+
+;;; What a DEFMETHOD whose specializers are all class names expands to.
+;;; INFO is (n-params required optional rest-p key-p allow-other-keys-p
+;;; keyword-names unspecialized-lambda-list). The steps and their order are the
+;;; ones the spelled-out expansion takes.
+(defun %defmethod-run (name qualifiers spec-names fn info docstring)
+  (destructuring-bind (n-params req opt rest-p key-p aok-p keyword-names ll) info
+    ;; Auto-create the GF if it does not exist. %register-gf installs both the
+    ;; GF registry entry and the function (so this also extends CL generic
+    ;; functions while CL is locked). It takes &key/&rest from the method but
+    ;; not the keyword names: the GF accepts whatever each applicable method
+    ;; accepts.
+    (when (null (%find-gf name))
+      (let ((gf (%make-gf name n-params)))
+        (%register-gf name gf)
+        (%set-gf-lambda-list-info gf req opt rest-p key-p aok-p nil)))
+    (let ((m (%make-method (mapcar #'%specializer-class spec-names)
+                           (copy-list qualifiers)
+                           fn)))
+      (%set-method-lambda-list-info m req opt rest-p key-p aok-p
+                                    (copy-list keyword-names) ll)
+      ;; AMOP: defmethod asks the generic function what class its methods
+      ;; are, and the method is an instance of the answer.
+      (%note-method-class (%find-gf name) m)
+      (%add-method (%find-gf name) m)
+      (when docstring
+        (funcall #'(setf documentation) docstring m t))
+      m)))
 
 ;;; --- defpackage ---
 
@@ -4364,256 +4479,222 @@ quietly took every typed slot back off the raw path."
             ;; means something else in this one. What it buys is an abbreviation
             ;; in the same form that declares it -- convenience for a program,
             ;; not something a library should have to be written against.
+            ;; The expansion is data plus one call: %DEFPACKAGE-RUN does at load
+            ;; time what the clauses say, in the order below. Spelling each
+            ;; clause out as code made a package with a thousand exports a
+            ;; method of hundreds of kilobytes of IL, run once and JITted in
+            ;; full every time the form was evaluated.
             (flet ((local-nickname-clash (name clause)
                      (let ((hit (assoc name local-nicknames :test #'string=)))
-                       (when hit
-                         `(error 'simple-package-error
-                                 :package ,name
-                                 :format-control
-                                 "DEFPACKAGE ~A: ~A in ~A is a package-local nickname of ~
-~A declared by this very form, and a local nickname does not name a package in a ~
-DEFPACKAGE clause (it resolves against *PACKAGE*, which is not the package being ~
-defined). Write ~A here, or declare the nickname on the package this form is read in."
-                                 :format-arguments
-                                 (list ,pkg-name ,name ,clause ,(cdr hit) ,(cdr hit)))))))
-            (let ((use-forms nil) (export-forms nil)
-                  (import-forms nil) (shadow-forms nil)
-                  (nickname-forms nil) (intern-forms nil)
-                  (shadowing-import-forms nil)
-                  (nickname-check-forms nil)
-                  (local-nickname-forms nil)
-                  (doc-forms nil))
+                       (when hit (list :clash name clause (cdr hit)))))
+                   (import-clause (args clause)
+                     ;; (car args) might be a list like (error ...) when all #+impl
+                     ;; guards are stripped (metatilities-base pattern:
+                     ;; #-(or sbcl ecl ...) (error ...)). Then there is no source
+                     ;; package, and the names are imported from DOTCL-MOP.
+                     (let* ((pkg-name-raw (car args))
+                            ;; CLHS: a string designator is a string, symbol, OR
+                            ;; character (ANSI DEFPACKAGE.8).
+                            (pkg-name-valid (string-designator-p pkg-name-raw))
+                            (from-pkg (when pkg-name-valid (string pkg-name-raw)))
+                            (raw-syms (if pkg-name-valid (cdr args) args))
+                            (sym-names (mapcar #'string
+                                               (remove-if-not #'string-designator-p
+                                                              raw-syms))))
+                       (if pkg-name-valid
+                           (list :from from-pkg sym-names clause)
+                           (list :mop sym-names)))))
+            (let ((uses nil) (exports nil) (imports nil) (shadows nil)
+                  (nicknames nil) (interns nil) (shadowing-imports nil)
+                  (local-nickname-pairs nil) (docs nil))
               (dolist (option options)
                 (when (consp option)
                   (let ((key (car option))
                         (args (cdr option)))
                     (cond
-                      ((member key '(:documentation) :test #'eq)
+                      ((eq key :documentation)
                        ;; CLHS 11.2.13: the string becomes the package's
                        ;; documentation. SBCL's genesis copies each target
                        ;; package's docstring from the host package of the same
                        ;; name, so dropping it here loses it in the built image.
                        (when (stringp (car args))
-                         (push `(setf (documentation ,pkg-var t) ,(car args))
-                               doc-forms)))
-                      ((member key '(:use) :test #'eq)
-                       ;; Pass the name string directly so that the runtime
-                       ;; (Runtime.PackageUse -> ResolvePackage) reports the
-                       ;; missing package by its actual name instead of NIL
-                       ;; when find-package would fail.
+                         (push (car args) docs)))
+                      ((eq key :use)
+                       ;; The name string is passed as it is, so that the runtime
+                       ;; (Runtime.PackageUse -> ResolvePackage) reports a missing
+                       ;; package by its actual name.
                        (dolist (u args)
                          (push (or (local-nickname-clash (string u) ":USE")
-                                   `(%package-use ,pkg-var ,(string u)))
-                               use-forms)))
-                      ((member key '(:export) :test #'eq)
-                       (dolist (s args)
-                         (push `(%package-export ,pkg-var
-                                  (intern ,(string s) ,pkg-var))
-                               export-forms)))
-                      ((member key '(:import-from) :test #'eq)
-                       ;; (car args) might be a list like (error ...) when all #+impl guards
-                       ;; are stripped (metatilities-base pattern: #-(or sbcl ecl ...) (error ...)).
-                       ;; In that case treat it as "no source package" and fall to DOTCL-MOP.
-                       (let* ((pkg-name-raw (car args))
-                              ;; CLHS: a string designator is a string, symbol, OR character.
-                              ;; A character package/symbol name (e.g. (:import-from #\G #\B))
-                              ;; was dropped, importing the wrong symbols (ANSI DEFPACKAGE.8).
-                              (pkg-name-valid (string-designator-p pkg-name-raw))
-                              (from-pkg (when pkg-name-valid (string pkg-name-raw)))
-                              ;; symbol names: (cdr args) when pkg-name is valid, else filter from args
-                              (raw-syms (if pkg-name-valid (cdr args) args))
-                              (sym-names (mapcar #'string
-                                                 (remove-if-not #'string-designator-p
-                                                                raw-syms))))
-                         (let ((pkg-obj-var (gensym "FROMPKG")))
-                           ;; Generate a single group-level form so that when the source
-                           ;; package is missing (e.g. #+sbcl/#:sb-mop stripped by reader),
-                           ;; we can fall back to DOTCL-MOP and also import the "package
-                           ;; name" string as a symbol (it was a MOP fn, not a real pkg).
-                           (push
-                             (or (and pkg-name-valid
-                                      (local-nickname-clash from-pkg ":IMPORT-FROM"))
-                             (if pkg-name-valid
-                               `(let ((,pkg-obj-var (find-package ,from-pkg)))
-                                  (cond
-                                    (,pkg-obj-var
-                                     ,@(mapcar
-                                         (lambda (sym-name)
-                                           `(multiple-value-bind (sym status)
-                                                (find-symbol ,sym-name ,pkg-obj-var)
-                                              (if status
-                                                  (%package-import ,pkg-var sym)
-                                                  (restart-case
-                                                      (error 'simple-package-error
-                                                             :package ,from-pkg
-                                                             :format-control "DEFPACKAGE: symbol ~A not found in package ~A"
-                                                             :format-arguments (list ,sym-name ,from-pkg))
-                                                    (continue ()
-                                                      :report "Skip importing this symbol."
-                                                      nil)))))
-                                         sym-names))
-                                    ;; Source package missing, and the name in the
-                                    ;; package position is itself a MOP symbol:
-                                    ;; the real package name was a #+sbcl #:sb-mop
-                                    ;; / #+ecl #:clos guard that the reader
-                                    ;; stripped, so what is left is the first
-                                    ;; SYMBOL of the list standing in for it.
-                                    ;; Import it and the rest from DOTCL-MOP.
-                                    ((find-symbol ,from-pkg (find-package "DOTCL-MOP"))
-                                     (let ((mop (find-package "DOTCL-MOP")))
-                                       (multiple-value-bind (sym ok) (find-symbol ,from-pkg mop)
-                                         (when ok (%package-import ,pkg-var sym)))
-                                       ,@(mapcar
-                                           (lambda (sym-name)
-                                             `(multiple-value-bind (sym ok) (find-symbol ,sym-name mop)
-                                                (when ok (%package-import ,pkg-var sym))))
-                                           sym-names)))
-                                    (t
-                                     ;; A package that simply is not there. The
-                                     ;; MOP fallback used to swallow this too, so
-                                     ;; a typo -- or a package the user meant to
-                                     ;; load first -- produced a DEFPACKAGE that
-                                     ;; quietly imported nothing, or worse, a
-                                     ;; DOTCL-MOP symbol that happened to share a
-                                     ;; name with one of the requested ones.
-                                     (restart-case
-                                         (error 'simple-package-error
-                                                :package ,from-pkg
-                                                :format-control "DEFPACKAGE: :IMPORT-FROM package ~A does not exist"
-                                                :format-arguments (list ,from-pkg))
-                                       (continue ()
-                                         :report "Skip this :IMPORT-FROM clause."
-                                         nil)))))
-                               ;; Package name is not a string/symbol (e.g. (error ...) form):
-                               ;; skip it and import sym-names from DOTCL-MOP directly.
-                               `(let ((mop (find-package "DOTCL-MOP")))
-                                  (when mop
-                                    ,@(mapcar
-                                        (lambda (sym-name)
-                                          `(multiple-value-bind (sym ok) (find-symbol ,sym-name mop)
-                                             (when ok (%package-import ,pkg-var sym))))
-                                        sym-names))))
-                             )
-                             import-forms))))
-                      ((member key '(:shadow) :test #'eq)
-                       (dolist (s args)
-                         (push `(%package-shadow ,pkg-var ,(string s))
-                               shadow-forms)))
-                      ((member key '(:intern) :test #'eq)
-                       (dolist (s args)
-                         (push `(intern ,(string s) ,pkg-var)
-                               intern-forms)))
-                      ((member key '(:shadowing-import-from) :test #'eq)
-                       (let* ((pkg-name-raw (car args))
-                              ;; CLHS: string designator = string, symbol, or character.
-                              (pkg-name-valid (string-designator-p pkg-name-raw))
-                              (from-pkg (when pkg-name-valid (string pkg-name-raw)))
-                              (raw-syms (if pkg-name-valid (cdr args) args))
-                              (sym-names (mapcar #'string
-                                                 (remove-if-not #'string-designator-p
-                                                                raw-syms))))
-                         (let ((pkg-obj-var (gensym "FROMPKG")))
-                           (push
-                             (or (and pkg-name-valid
-                                      (local-nickname-clash from-pkg ":SHADOWING-IMPORT-FROM"))
-                             (if pkg-name-valid
-                               `(let ((,pkg-obj-var (find-package ,from-pkg)))
-                                  (cond
-                                    (,pkg-obj-var
-                                     ,@(mapcar
-                                         (lambda (sym-name)
-                                           `(multiple-value-bind (sym status)
-                                                (find-symbol ,sym-name ,pkg-obj-var)
-                                              (if status
-                                                  (%shadowing-import sym ,pkg-var)
-                                                  (restart-case
-                                                      (error 'simple-package-error
-                                                             :package ,from-pkg
-                                                             :format-control "DEFPACKAGE: symbol ~A not found in package ~A"
-                                                             :format-arguments (list ,sym-name ,from-pkg))
-                                                    (continue ()
-                                                      :report "Skip importing this symbol."
-                                                      nil)))))
-                                         sym-names))
-                                    ;; Same reader-stripped MOP shape as
-                                    ;; :IMPORT-FROM above.
-                                    ((find-symbol ,from-pkg (find-package "DOTCL-MOP"))
-                                     (let ((mop (find-package "DOTCL-MOP")))
-                                       (multiple-value-bind (sym ok) (find-symbol ,from-pkg mop)
-                                         (when ok (%shadowing-import sym ,pkg-var)))
-                                       ,@(mapcar
-                                           (lambda (sym-name)
-                                             `(multiple-value-bind (sym ok) (find-symbol ,sym-name mop)
-                                                (when ok (%shadowing-import sym ,pkg-var))))
-                                           sym-names)))
-                                    (t
-                                     (restart-case
-                                         (error 'simple-package-error
-                                                :package ,from-pkg
-                                                :format-control "DEFPACKAGE: :SHADOWING-IMPORT-FROM package ~A does not exist"
-                                                :format-arguments (list ,from-pkg))
-                                       (continue ()
-                                         :report "Skip this :SHADOWING-IMPORT-FROM clause."
-                                         nil)))))
-                               `(let ((mop (find-package "DOTCL-MOP")))
-                                  (when mop
-                                    ,@(mapcar
-                                        (lambda (sym-name)
-                                          `(multiple-value-bind (sym ok) (find-symbol ,sym-name mop)
-                                             (when ok (%shadowing-import sym ,pkg-var))))
-                                        sym-names))))
-                             )
-                             shadowing-import-forms))))
-                      ((member key '(:nicknames) :test #'eq)
-                       (dolist (n args)
-                         (push `(%package-nickname ,pkg-var ,(string n))
-                               nickname-forms)))
-                      ((member key '(:local-nicknames) :test #'eq)
+                                   (string u))
+                               uses)))
+                      ((eq key :export)
+                       (dolist (s args) (push (string s) exports)))
+                      ((eq key :import-from)
+                       (push (or (and (string-designator-p (car args))
+                                      (local-nickname-clash (string (car args))
+                                                            ":IMPORT-FROM"))
+                                 (import-clause args ":IMPORT-FROM"))
+                             imports))
+                      ((eq key :shadow)
+                       (dolist (s args) (push (string s) shadows)))
+                      ((eq key :intern)
+                       (dolist (s args) (push (string s) interns)))
+                      ((eq key :shadowing-import-from)
+                       (push (or (and (string-designator-p (car args))
+                                      (local-nickname-clash (string (car args))
+                                                            ":SHADOWING-IMPORT-FROM"))
+                                 (import-clause args ":SHADOWING-IMPORT-FROM"))
+                             shadowing-imports))
+                      ((eq key :nicknames)
+                       (dolist (n args) (push (string n) nicknames)))
+                      ((eq key :local-nicknames)
                        (dolist (pair args)
-                         (push `(%add-local-nickname ,(string (car pair))
-                                                     ,(string (cadr pair))
-                                                     ,pkg-var)
-                               local-nickname-forms)))))))
-              ;; 3. Emit runtime nickname conflict checks
-              (dolist (n nickname-strings)
-                (let ((nick-var (gensym "NICK")))
-                  (push `(let ((,nick-var (find-package ,n)))
-                           (when (and ,nick-var (not (eq ,nick-var ,pkg-var)))
-                             (error 'simple-package-error
-                                    :package ,n
-                                    :format-control "DEFPACKAGE ~A: nickname ~A conflicts with existing package"
-                                    :format-arguments (list ,pkg-name ,n))))
-                        nickname-check-forms)))
-              (let ((inner `(let ((,pkg-var (%make-package ,pkg-name)))
-                              ,@(nreverse nickname-check-forms)
-                              ,@(nreverse nickname-forms)
-                              ;; Local nicknames are installed before the clauses
-                              ;; that name packages. They belong to the package
-                              ;; being defined, but FIND-PACKAGE resolves
-                              ;; nicknames against *PACKAGE*, which during
-                              ;; DEFPACKAGE is whatever package the form is being
-                              ;; read in -- so a nickname declared here was not
-                              ;; visible to :USE / :IMPORT-FROM below, and the
-                              ;; clause silently did nothing. Installing them
-                              ;; first is not enough on its own (see the
-                              ;; nickname alist consulted at expansion time), but
-                              ;; it is what makes the package object carry them
-                              ;; while the rest of the form runs.
-                              ,@(nreverse local-nickname-forms)
-                              ,@(nreverse shadow-forms)
-                              ,@(nreverse shadowing-import-forms)
-                              ,@(nreverse use-forms)
-                              ,@(nreverse import-forms)
-                              ,@(nreverse intern-forms)
-                              ,@(nreverse export-forms)
-                              ,@(nreverse doc-forms)
-                              ,pkg-var)))
+                         (push (cons (string (car pair)) (string (cadr pair)))
+                               local-nickname-pairs)))))))
+              (let ((inner (%defpackage-expansion
+                            (list pkg-name
+                                     ;; Checked in this order: the reverse of
+                                     ;; the :NICKNAMES clauses, as before.
+                                     nickname-strings
+                                     (nreverse nicknames)
+                                     ;; Local nicknames are installed before the
+                                     ;; clauses that name packages: they belong
+                                     ;; to the package being defined, and the
+                                     ;; package object has to carry them while
+                                     ;; the rest of the form runs.
+                                     (nreverse local-nickname-pairs)
+                                     (nreverse shadows)
+                                     (nreverse shadowing-imports)
+                                     (nreverse uses)
+                                     (nreverse imports)
+                                     (nreverse interns)
+                                     (nreverse exports)
+                                     (nreverse docs)))))
                 ;; In compile-file mode, wrap with eval-when so macrolet-expanded
                 ;; defpackage forms are evaluated at compile time (CLHS 3.2.3.1).
-                ;; Skip during cross-compilation: %make-package is dotcl-internal.
                 (if *compile-file-mode*
                     `(eval-when (:compile-toplevel :load-toplevel :execute) ,inner)
                     inner))))))))
+
+;; While cross-compiling, the core's own DEFPACKAGE runs before %DEFPACKAGE-RUN
+;; is defined, so it is spelled out as code. Only the clauses the core uses are
+;; supported there.
+(defun %defpackage-expansion (spec)
+  (if (not *cross-compiling*)
+      `(%defpackage-run ',spec)
+      (destructuring-bind (pkg-name nickname-checks nicknames local-nicknames shadows
+                           shadowing-imports uses imports interns exports docs)
+          spec
+        (when (or nickname-checks nicknames local-nicknames shadowing-imports imports
+                  docs (some #'consp uses))
+          (error "DEFPACKAGE ~A: only :USE, :SHADOW, :INTERN and :EXPORT are supported ~
+while cross-compiling" pkg-name))
+        (let ((pkg-var (gensym "PKG")))
+          `(let ((,pkg-var (%make-package ,pkg-name)))
+             ,@(mapcar (lambda (s) `(%package-shadow ,pkg-var ,s)) shadows)
+             ,@(mapcar (lambda (u) `(%package-use ,pkg-var ,u)) uses)
+             ,@(mapcar (lambda (s) `(intern ,s ,pkg-var)) interns)
+             ,@(mapcar (lambda (s) `(%package-export ,pkg-var (intern ,s ,pkg-var))) exports)
+             ,pkg-var)))))
+
+(defun %defpackage-clash (pkg-name clash)
+  "Signal the error for a package named in a DEFPACKAGE clause that is one of the
+   form's own local nicknames. CLASH is (:CLASH name clause actual-package)."
+  (destructuring-bind (name clause actual) (cdr clash)
+    (error 'simple-package-error
+           :package name
+           :format-control
+           "DEFPACKAGE ~A: ~A in ~A is a package-local nickname of ~
+~A declared by this very form, and a local nickname does not name a package in a ~
+DEFPACKAGE clause (it resolves against *PACKAGE*, which is not the package being ~
+defined). Write ~A here, or declare the nickname on the package this form is read in."
+           :format-arguments (list pkg-name name clause actual actual))))
+
+(defun %defpackage-import-clause (pkg pkg-name clause shadowing)
+  "One :IMPORT-FROM (SHADOWING NIL) or :SHADOWING-IMPORT-FROM clause of a
+   DEFPACKAGE, as data: (:FROM package names clause-name), (:MOP names) when the
+   package position held no string designator, or (:CLASH ...)."
+  (flet ((take (sym)
+           (if shadowing
+               (%shadowing-import sym pkg)
+               (%package-import pkg sym))))
+    (case (car clause)
+      (:clash (%defpackage-clash pkg-name clause))
+      (:mop
+       (let ((mop (find-package "DOTCL-MOP")))
+         (when mop
+           (dolist (sym-name (cadr clause))
+             (multiple-value-bind (sym ok) (find-symbol sym-name mop)
+               (when ok (take sym)))))))
+      (t
+       (destructuring-bind (from-pkg sym-names clause-name) (cdr clause)
+         (let ((src (find-package from-pkg)))
+           (cond
+             (src
+              (dolist (sym-name sym-names)
+                (multiple-value-bind (sym status) (find-symbol sym-name src)
+                  (if status
+                      (take sym)
+                      (restart-case
+                          (error 'simple-package-error
+                                 :package from-pkg
+                                 :format-control "DEFPACKAGE: symbol ~A not found in package ~A"
+                                 :format-arguments (list sym-name from-pkg))
+                        (continue ()
+                          :report "Skip importing this symbol."
+                          nil))))))
+             ;; Source package missing, and the name in the package position is
+             ;; itself a MOP symbol: the real package name was a #+sbcl #:sb-mop
+             ;; / #+ecl #:clos guard that the reader stripped, so what is left is
+             ;; the first SYMBOL of the list standing in for it. Import it and
+             ;; the rest from DOTCL-MOP.
+             ((find-symbol from-pkg (find-package "DOTCL-MOP"))
+              (let ((mop (find-package "DOTCL-MOP")))
+                (multiple-value-bind (sym ok) (find-symbol from-pkg mop)
+                  (when ok (take sym)))
+                (dolist (sym-name sym-names)
+                  (multiple-value-bind (sym ok) (find-symbol sym-name mop)
+                    (when ok (take sym))))))
+             (t
+              ;; A package that simply is not there: a typo, or a package the
+              ;; user meant to load first.
+              (restart-case
+                  (error 'simple-package-error
+                         :package from-pkg
+                         :format-control "DEFPACKAGE: ~A package ~A does not exist"
+                         :format-arguments (list clause-name from-pkg))
+                (continue ()
+                  :report (lambda (s) (format s "Skip this ~A clause." clause-name))
+                  nil))))))))))
+
+(defun %defpackage-run (spec)
+  "Define the package SPEC describes: what a DEFPACKAGE form expands to. SPEC is
+   (name nickname-checks nicknames local-nicknames shadows shadowing-imports uses
+   imports interns exports docs), built by the DEFPACKAGE macro."
+  (destructuring-bind (pkg-name nickname-checks nicknames local-nicknames shadows
+                       shadowing-imports uses imports interns exports docs)
+      spec
+    (let ((pkg (%make-package pkg-name)))
+      (dolist (n nickname-checks)
+        (let ((other (find-package n)))
+          (when (and other (not (eq other pkg)))
+            (error 'simple-package-error
+                   :package n
+                   :format-control "DEFPACKAGE ~A: nickname ~A conflicts with existing package"
+                   :format-arguments (list pkg-name n)))))
+      (dolist (n nicknames) (%package-nickname pkg n))
+      (dolist (pair local-nicknames) (%add-local-nickname (car pair) (cdr pair) pkg))
+      (dolist (s shadows) (%package-shadow pkg s))
+      (dolist (c shadowing-imports) (%defpackage-import-clause pkg pkg-name c t))
+      (dolist (u uses)
+        (if (consp u)
+            (%defpackage-clash pkg-name u)
+            (%package-use pkg u)))
+      (dolist (c imports) (%defpackage-import-clause pkg pkg-name c nil))
+      (dolist (s interns) (intern s pkg))
+      (dolist (s exports) (%package-export pkg (intern s pkg)))
+      (dolist (d docs) (setf (documentation pkg t) d))
+      pkg)))
 
 ;;; --- do-symbols / do-external-symbols ---
 
@@ -4892,7 +4973,9 @@ defined). Write ~A here, or declare the nickname on the package this form is rea
                      ;; Skip declarations and :arguments/:generic-function options
                      (body nil)
                      (arguments-lambda-list nil)
-                     (gf-var nil))
+                     (gf-var nil)
+                     (doc (and (stringp (car body-and-options)) (cdr body-and-options)
+                               (pop body-and-options))))
                 ;; Parse body: skip (declare ...) and (:arguments ...) and (:generic-function ...)
                 (dolist (item body-and-options)
                   (cond
@@ -4972,10 +5055,13 @@ defined). Write ~A here, or declare the nickname on the package this form is rea
                                 (declare (ignorable ,@arguments-vars ,@(when gf-var (list gf-var))))
                                 ,@body))))
                         (%em-arguments-info ',arguments-lambda-list))
+                       ,@(when doc
+                           `((funcall #'(setf documentation) ,doc ',name 'method-combination)))
                        ',name))))
               ;; === Short form ===
               (let ((operator nil)
-                    (identity-with-one-arg nil))
+                    (identity-with-one-arg nil)
+                    (doc nil))
                 ;; Parse keyword arguments
                 (do ((args rest (cddr args)))
                     ((null args))
@@ -4984,11 +5070,13 @@ defined). Write ~A here, or declare the nickname on the package this form is rea
                     (cond
                       ((eq key :operator) (setf operator val))
                       ((eq key :identity-with-one-argument) (setf identity-with-one-arg val))
-                      ((eq key :documentation) nil)))) ;; ignore
+                      ((eq key :documentation) (setf doc val)))))
                 ;; Default operator is the name itself
                 (unless operator (setf operator name))
                 `(progn
-                   (%register-method-combination ,(string name) ,(string operator) ,identity-with-one-arg)
+                   (%register-method-combination ,(string name) ,(string operator) ,identity-with-one-arg ',operator)
+                   ,@(when doc
+                       `((funcall #'(setf documentation) ,doc ',name 'method-combination)))
                    ',name))))))
 
 ;;; --- in-package ---
@@ -5286,6 +5374,7 @@ defined). Write ~A here, or declare the nickname on the package this form is rea
         ;; then evaluate values-form, then store. This matches (setf (values ...) form).
         (let* ((vars (cadr form))
                (values-form (caddr form))
+               (split (%mv-setq-split-floor vars values-form))
                (let-bindings '())   ; place temp bindings (evaluated before values-form)
                (store-vars '())     ; store variables for multiple-value-bind
                (setters '()))       ; setters (in order)
@@ -5316,13 +5405,16 @@ defined). Write ~A here, or declare the nickname on the package this form is rea
           (let ((final-let-bindings (nreverse let-bindings))
                 (final-store-vars (nreverse store-vars))
                 (final-setters (nreverse setters)))
-            (if (null vars)
+            (cond
+              (split split)
+              ((null vars)
                 (let ((rv (gensym "MVSQ")))
-                  `(multiple-value-bind (,rv) ,values-form ,rv))
+                  `(multiple-value-bind (,rv) ,values-form ,rv)))
+              (t
                 `(let* ,final-let-bindings
                    (multiple-value-bind ,final-store-vars ,values-form
                      ,@final-setters
-                     ,(car final-store-vars))))))))
+                     ,(car final-store-vars)))))))))
 
 ;;; --- nth-value ---
 
@@ -5350,7 +5442,7 @@ defined). Write ~A here, or declare the nickname on the package this form is rea
                                           (cdr (assoc (symbol-name v) *symbol-macros*
                                                       :key (lambda (k) (if (and (symbolp k) (symbol-package k))
                                                                            (symbol-name k) nil))
-                                                      :test #'string=)))
+                                                      :test #'name-key=)))
                                      v))
                                vars)))
                   (if (some (lambda (v ev) (not (eq v ev))) vars expanded-vars)

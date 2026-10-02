@@ -571,12 +571,18 @@ public static class Mop
         // FINALIZE-INHERITANCE: dotcl finalizes eagerly at the end of DEFCLASS, so
         // for a class that is already finalized the default method does nothing.
         // A class that is not yet (a metaclass calling it from its own
-        // INITIALIZE-INSTANCE, where CLASS-FINALIZED-P is NIL) is finalized here,
-        // unless a superclass is still forward-referenced.
+        // INITIALIZE-INSTANCE, where CLASS-FINALIZED-P is NIL) is finalized here.
+        // A class that is itself forward-referenced, or has a forward-referenced
+        // superclass, cannot be finalized, and asking for it is an error (as in SBCL).
         RegisterMopGF("FINALIZE-INHERITANCE", 1,
             new LispClass[] { (LispClass)Runtime.FindClass(Startup.Sym("CLASS")) },
             args =>
             {
+                if (args[0] is LispClass fc && !Runtime.IsClassFinalized(fc)
+                    && Runtime.ForwardReferencedAncestor(fc) is { } fwd)
+                    throw new LispErrorException(new LispError(ReferenceEquals(fwd, fc)
+                        ? $"FINALIZE-INHERITANCE was called on the forward-referenced class {fc.Name.Name}"
+                        : $"FINALIZE-INHERITANCE: class {fc.Name.Name} has the forward-referenced superclass {fwd.Name.Name}"));
                 if (args[0] is LispClass c && !Runtime.IsClassFinalized(c)
                     && !c.IsForwardReferenced && !c.IsBuiltIn
                     && c.DirectSuperclasses.All(Runtime.IsClassFinalized))
@@ -862,18 +868,29 @@ public static class Mop
         // (matching Startup.SymForRegistration's lookup precedence) so
         // package-qualified dotcl-mop:<name> calls resolve (GetFunctionBySymbol
         // is authoritative).
+        // The setf function is adopted the same way: (SETF SLOT-VALUE-USING-CLASS)
+        // is registered on the DOTCL-INTERNAL symbol, and #'(setf
+        // dotcl-mop:slot-value-using-class) reads this one's. Compiled code found
+        // it anyway through a fallback to the generic-function registry, but
+        // FDEFINITION (and so the emit-free evaluator) has no such fallback.
         foreach (var sym in MopPkg.ExternalSymbols)
         {
-            if (sym.Function != null) continue;
             var (clSym, clSt) = Startup.CL.FindSymbol(sym.Name);
-            if (clSt != SymbolStatus.None && clSym.Function is LispFunction clFn)
-            {
-                sym.Function = clFn;
-                continue;
-            }
             var (internalSym, internalSt) = Startup.Internal.FindSymbol(sym.Name);
-            if (internalSt != SymbolStatus.None && internalSym.Function is LispFunction fn)
-                sym.Function = fn;
+            if (sym.Function == null)
+            {
+                if (clSt != SymbolStatus.None && clSym.Function is LispFunction clFn)
+                    sym.Function = clFn;
+                else if (internalSt != SymbolStatus.None && internalSym.Function is LispFunction fn)
+                    sym.Function = fn;
+            }
+            if (sym.SetfFunction == null)
+            {
+                if (clSt != SymbolStatus.None && clSym.SetfFunction is LispFunction clSetf)
+                    sym.SetfFunction = clSetf;
+                else if (internalSt != SymbolStatus.None && internalSym.SetfFunction is LispFunction setfFn)
+                    sym.SetfFunction = setfFn;
+            }
         }
     }
 
@@ -1009,6 +1026,7 @@ public static class Mop
             throw new LispErrorException(new LispTypeError(
                 $"{who}: location must be an integer", location));
         int index = (int)loc.Value;
+        instance.EnsureCurrent();
         if (index < 0 || index >= instance.Slots.Length)
             throw new LispErrorException(new LispProgramError(
                 $"{who}: location {index} out of range [0,{instance.Slots.Length})"));

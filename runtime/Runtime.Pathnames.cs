@@ -48,6 +48,10 @@ public static partial class Runtime
                     if (dirVal is Nil) directory = null;
                     else if (dirVal is Symbol dirSym && dirSym.Name == "WILD")
                         directory = Runtime.List(Startup.Keyword("ABSOLUTE"), Startup.Keyword("WILD-INFERIORS"));
+                    // CLHS 19.2.2.4.3: a string is (:ABSOLUTE string).
+                    else if (dirVal is LispString
+                             || (dirVal is LispVector dirVec && dirVec.IsCharVector && dirVec.Rank == 1))
+                        directory = Runtime.List(Startup.Keyword("ABSOLUTE"), dirVal);
                     else directory = dirVal;
                     break;
                 case "DEFAULTS":

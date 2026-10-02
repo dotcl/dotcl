@@ -79,7 +79,7 @@
 (deftest rsh-paint-roles
   (mapcar (lambda (role) (rsh-esc (dotcl::%repl-paint role "x" t)))
           '(:string :comment :keyword))
-  ("<E>[32mx<E>[0m" "<E>[90mx<E>[0m" "<E>[35mx<E>[0m"))
+  ("<E>[32mx<E>[0m" "<E>[2mx<E>[0m" "<E>[35mx<E>[0m"))
 
 ;;; Here standard output is not painted: no spans of either kind.
 (deftest rsh-no-spans-without-colour

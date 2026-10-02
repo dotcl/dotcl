@@ -28,8 +28,7 @@
       (error "cannot locate this process's executable")))
 
 (defvar *ccp-core*
-  (or (ignore-errors (namestring (truename "compiler/cil-out.sil")))
-      "compiler/cil-out.sil"))
+  (regression-child-core))
 
 (defun ccp-file (name contents)
   (let ((path (concatenate 'string *ccp-dir* name)))

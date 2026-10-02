@@ -11,9 +11,10 @@
           (dotcl:function-lambda-list (quote acons)))
   ("key" "datum" "alist"))
 
-;;; The names are uninterned, as a portable lambda list makes them: what a tool
-;;; shows is the name, and interning them would tie the list to a package the
-;;; loader happens to be in.
+;;; The FASL carries the names uninterned, as a portable lambda list makes
+;;; them. Reading it back gives each the symbol of that name accessible in the
+;;; package of the function's own name, and interns nothing: ACONS's parameter
+;;; names are not symbols of COMMON-LISP, so they stay uninterned.
 (deftest fll-names-are-uninterned
   (every (lambda (x) (or (member x lambda-list-keywords)
                          (and (symbolp x) (null (symbol-package x)))))

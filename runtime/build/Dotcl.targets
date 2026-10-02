@@ -92,6 +92,7 @@
            needs one it can name for itself. -->
       <DotclProjectManifest>$(DotclBundleDir)$(MSBuildProjectName).deps.txt</DotclProjectManifest>
       <DotclRootFasl>$(DotclBundleDir)$(MSBuildProjectName).fasl</DotclRootFasl>
+      <DotclTrimDescriptor>$(DotclBundleDir)$(MSBuildProjectName).trim.xml</DotclTrimDescriptor>
       <_DotclCmdPrefix Condition="'$(DotclTool)' != ''">&quot;$(DotclTool)&quot;</_DotclCmdPrefix>
       <_DotclCmdPrefix Condition="'$(DotclTool)' == '' and '$(DotclRuntimeProject)' != ''">dotnet run --project &quot;$(DotclRuntimeProject)&quot; --</_DotclCmdPrefix>
     </PropertyGroup>
@@ -176,10 +177,10 @@
           BeforeTargets="GetCopyToOutputDirectoryItems;_CollectAssetPackFiles;_GenerateAndroidAssetsDir;_CollectMauiAssetsTargetFramework;BeforeBuild"
           Condition="'$(DotclProjectAsd)' != ''"
           Inputs="@(_DotclRootSource);$(DotclProjectAsd);@(DotclBuildInit);@(DotclAsdSearchPath)"
-          Outputs="$(DotclRootFasl)">
+          Outputs="$(DotclRootFasl);$(DotclTrimDescriptor)">
 
     <Message Importance="high" Text="DotclCompileRoot: Inputs=@(_DotclRootSource);$(DotclProjectAsd) Outputs=$(DotclRootFasl)" />
-    <Exec Command="$(_DotclCmdPrefix) build &quot;$(DotclProjectAsd)&quot; --output &quot;$(DotclRootFasl)&quot;@(_DotclSearchPathArg->' --asd-search-path &quot;%(Arg)&quot;', '')@(DotclBuildInit->' --build-init &quot;%(FullPath)&quot;', '')" />
+    <Exec Command="$(_DotclCmdPrefix) build &quot;$(DotclProjectAsd)&quot; --output &quot;$(DotclRootFasl)&quot; --app-assembly &quot;$(AssemblyName)&quot;@(_DotclSearchPathArg->' --asd-search-path &quot;%(Arg)&quot;', '')@(DotclBuildInit->' --build-init &quot;%(FullPath)&quot;', '')" />
   </Target>
 
   <!--
@@ -259,6 +260,21 @@
         <Link>dotcl-fasl/%(Filename)%(Extension)</Link>
         <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       </None>
+    </ItemGroup>
+  </Target>
+
+  <!--
+    Step 7: a trimmed publish (PublishTrimmed / PublishAot). The fasl reaches the
+    .NET types it names only through reflection at run time, so the trimmer would
+    remove them. The root compile writes a descriptor listing those types (see
+    DotCL.Runtime.ProjectCore.targets for the details); hand it to the trimmer.
+  -->
+  <Target Name="DotclTrimmerRoots"
+          DependsOnTargets="_DotclSetupCommand"
+          BeforeTargets="PrepareForILLink"
+          Condition="'$(DotclProjectAsd)' != '' and '$(DotclTrimmerRoots)' != 'false'">
+    <ItemGroup>
+      <TrimmerRootDescriptor Include="$(DotclTrimDescriptor)" Condition="Exists('$(DotclTrimDescriptor)')" />
     </ItemGroup>
   </Target>
 

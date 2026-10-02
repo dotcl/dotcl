@@ -4,10 +4,9 @@
 ;;; wanted, although both are ordinary results of Lisp arithmetic ((/ 1 3),
 ;;; (expt 2 40)). The caller had to coerce by hand.
 ;;;
-;;; These go through sprintf, so they sit with the other variadic tests behind
-;;; the same platform guard (see ffi-varargs.lisp and the loader). The memory
-;;; round trips that need no C call live in ffi-memory-fidelity.lisp, which runs
-;;; everywhere.
+;;; These go through sprintf, so they sit with the other variadic tests (see
+;;; ffi-varargs.lisp). The memory round trips that need no C call live in
+;;; ffi-memory-fidelity.lisp.
 
 (defvar *fvf-libc*
   #+windows "msvcrt"

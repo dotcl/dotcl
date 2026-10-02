@@ -262,6 +262,33 @@ else
     || note "the missing-version error does not name the .asd as a source: $out"
 fi
 
+# A .asd version NuGet cannot serve (5 components): pack warns, names --version
+# as the way out, and still writes the package. An explicit --version of the
+# same shape is the user's own statement and is not second-guessed.
+mkdir -p "$WORK/odd"
+cat > "$WORK/odd/packodd.asd" <<'EOF'
+(defsystem "packodd" :version "1.2.3.4.5" :description "Odd version fixture"
+  :author "Someone" :components ((:file "packodd")))
+EOF
+cat > "$WORK/odd/packodd.lisp" <<'EOF'
+(defpackage :packodd (:use :cl))
+EOF
+oddout=$(dotnet run --project "$RT" -- --core "$CORE" --asd-search-path "$WORK/odd" pack \
+           --system packodd --id packodd --command packodd \
+           --dotcl-version "$ver" --from "$FROM" --rids any -o "$WORK/out" 2>&1) \
+  || note "pack refused a .asd version NuGet cannot serve: $oddout"
+echo "$oddout" | grep -q 'cannot be served by NuGet' \
+  || note "no warning for the .asd's 5-component :version: $oddout"
+echo "$oddout" | grep -q 'pass --version to override' \
+  || note "the version warning does not name --version: $oddout"
+[ -f "$WORK/out/packodd.1.2.3.4.5.nupkg" ] \
+  || note "the package was not written after the version warning"
+oddexp=$(dotnet run --project "$RT" -- --core "$CORE" --asd-search-path "$WORK/odd" pack \
+           --system packodd --id packodd2 --command packodd2 --version 1.2.3.4.5 \
+           --dotcl-version "$ver" --from "$FROM" --rids any -o "$WORK/out" 2>&1) || true
+echo "$oddexp" | grep -q 'cannot be served by NuGet' \
+  && note "an explicit --version was warned about: $oddexp"
+
 echo "=== [6] no JIT profile rides along in the payload ==="
 # The multi-core JIT profile is written by every dotcl run. It used to land
 # beside the executing assembly, so a run against a publish directory left one

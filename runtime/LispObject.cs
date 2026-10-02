@@ -25,6 +25,13 @@ public sealed class LispBox
     public LispBox(LispObject value) { Value = value; }
 }
 
+/// <summary>The value an (:ONCE ...) instruction computed, held by its
+/// compilation unit (see CilAssembler.HandleOnce). Not a LispObject: it holds one.</summary>
+public sealed class OnceCell
+{
+    public LispObject? Value;
+}
+
 public sealed class Cons : LispObject
 {
     public LispObject Car { get; set; }

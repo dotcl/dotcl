@@ -58,6 +58,7 @@ outside, use a package reference.
 | `DotclBuildInit` (item) | *(empty)* | Lisp files evaluated at build time before resolution. The escape hatch for anything a directory list cannot express (booting Quicklisp, computed paths). Build time only: nothing here reaches the shipped app. |
 | `DotclBaseCore` | the `dotcl.core` shipped in the package | The base image the build compiles against and copies into the output. Point it elsewhere to build against a core of your own. |
 | `DotclDebugInfo` | `true` when `Configuration=Debug`, else `false` | Emit a Portable PDB next to each FASL so a debugger binds breakpoints in the `.lisp` source. |
+| `DotclTrimmerRoots` | `true` | Hand the trimmer a descriptor for the .NET types your Lisp sources name, so a trimmed publish keeps them. See [Trimmed publish](#trimmed-publish). `false` turns it off. |
 | `DotCLRuntimeVersion` | the version the SDK shipped with | *(SDK wiring only)* Which `DotCL.Runtime` package version the SDK injects. |
 | `DisableImplicitDotCLRuntimeReference` | *(unset)* | *(SDK wiring only)* `true` stops the SDK injecting the package reference, so you can pin the runtime yourself. |
 | `DotclTool` | `dotcl` | *(repo import only)* The CLI to invoke. |
@@ -74,6 +75,7 @@ is not supported.
 | `DotclRootFasl` | `$(DotclBundleDir)$(MSBuildProjectName).fasl` -- your system, compiled |
 | `DotclDeployedManifest` | `$(DotclBundleDir)dotcl-deps.txt` -- the load order: base core, dependency FASLs, then your FASL |
 | `DotclProjectManifest` | `$(DotclBundleDir)$(MSBuildProjectName).deps.txt` -- the same list under a per-project name, so a referenced Lisp library has a manifest it can name for itself (only one file can be called `dotcl-deps.txt` in a shared output directory) |
+| `DotclTrimDescriptor` | `$(DotclBundleDir)$(MSBuildProjectName).trim.xml` -- the trimmer descriptor written by the compile of your system. Build input only; it is not copied to the output |
 
 Everything in the bundle directory is added to the build as `None` items
 linked under `dotcl-fasl/` (on Android/MAUI, as `MauiAsset` and
@@ -92,6 +94,43 @@ stability promise. `DotclBuild` is the public anchor:
 It runs once per build, after the FASL and the manifest exist, and only when
 `DotclProjectAsd` is set. It is intentionally empty -- it exists to be
 scheduled around.
+
+## Trimmed publish
+
+A FASL is loaded at run time and reaches .NET only through reflection, so the
+trimmer (`PublishTrimmed`, `PublishAot`) never sees what it uses and removes it.
+The runtime assembly protects itself. For the types your code names, the
+compile of your system writes `DotclTrimDescriptor`, and the build hands it to
+the trimmer as a `TrimmerRootDescriptor`.
+
+A type is picked up when its name is a literal string in a type position:
+
+```lisp
+(dotnet:new "System.Text.StringBuilder")
+(dotnet:static "System.Globalization.ISOWeek" "GetYear" date)
+(dotnet:make-generic-type "System.Collections.Generic.List" (list "MyApp.Item"))
+```
+
+The same goes for `dotnet:new-array`, `dotnet:make-array`, `dotnet:make-delegate`,
+`dotnet:resolve-type`, `dotnet:members`, `dotnet:class-for-type`, `dotnet:enum-or`,
+`dotnet:cast`, `dotnet:box`, `dotnet:is-instance-of`, `dotnet:exception-typep`
+and the type arguments of `dotnet:static-generic`, `dotnet:invoke-generic` and
+`dotnet:call-out-generic`. Each named type is kept whole (`preserve="all"`).
+
+The name is resolved at build time, against the framework and the project's
+references. A name that does not resolve there is taken to be a type of the
+project being built, which is not compiled yet, and is rooted in
+`$(AssemblyName)`; if it is not there either, the trimmer warns about it.
+
+Not covered, and rooted by hand with your own `TrimmerRootDescriptor` or
+`TrimmerRootAssembly`:
+
+- a type whose name is built at run time, or held in a variable;
+- a type reached only as the value of another call. In
+  `(dotnet:invoke (dotnet:static "System.IO.File" "OpenText" p) "ReadLine")`,
+  `File` is kept but `StreamReader.ReadLine` is not, unless something else
+  keeps it;
+- the dependency FASLs. Only your own system's sources are looked at.
 
 ## Adding a dependency: which knob
 

@@ -131,6 +131,15 @@
   (unless (and (integerp n) (>= n 0))
     (error 'type-error :datum n :expected-type '(integer 0 *))))
 
+;; The tail of the keyword argument list PLIST that starts at KEY, or NIL.
+;; Keys are looked for only in key positions: a keyword that is the VALUE of
+;; another key, (:export :accessor), is not the :ACCESSOR key (MEMBER took it
+;; for one).
+(defun %db-key-tail (key plist)
+  (do ((p plist (cddr p)))
+      ((atom p) nil)
+    (when (eq (car p) key) (return p))))
+
 (defun %check-key-list (tail)
   "Signal PROGRAM-ERROR unless TAIL is a well-formed keyword argument list.
    The part of an argument list that a destructuring lambda list's &KEY consumes
@@ -770,7 +779,33 @@
       (s tree))))
 
 (defun nsublis (alist tree &key (test #'eql) test-not (key #'identity))
-  (sublis alist tree :test test :test-not test-not :key key))
+  ;; Destructive, as SUBLIS's N-variant is allowed to be and as callers expect:
+  ;; series renames labels in a code fragment with NSUBLIS and discards the
+  ;; value, so a copying NSUBLIS left the old labels in place. The CAR of every
+  ;; cons is replaced in place; the CDR chain is walked iteratively so a long
+  ;; list does not nest one frame per element.
+  (let ((key (or key #'identity)))
+    (labels ((hit (node)
+               (let ((k (funcall key node)))
+                 (if test-not
+                     (assoc k alist :test-not test-not)
+                     (assoc k alist :test test))))
+             (s (node)
+               (let ((pair (hit node)))
+                 (cond (pair (cdr pair))
+                       ((atom node) node)
+                       (t (do ((last nil sub)
+                               (sub node (cdr sub)))
+                              ((atom sub)
+                               (let ((p (hit sub)))
+                                 (when p (rplacd last (cdr p)))))
+                            (let ((p (and last (hit sub))))
+                              (when p
+                                (rplacd last (cdr p))
+                                (return)))
+                            (rplaca sub (s (car sub))))
+                          node)))))
+      (s tree))))
 
 ;;; ============================================================
 ;;; Miscellaneous
@@ -802,6 +837,20 @@
       ((member name '("LIST" "CONS") :test #'string=) :list)
       ((string= name "NULL") :null)
       (t :unknown))))
+
+(defun %coerce-to-rt-vector (list rt)
+  "LIST as a vector of the element type the vector result type RT names:
+   (vector fixnum), (simple-array fixnum (*)) and the like. A bare VECTOR,
+   SIMPLE-VECTOR or an element type of * gives a general vector."
+  (let* ((base (if (consp rt) (symbol-name (car rt)) ""))
+         (etype (if (and (consp rt) (consp (cdr rt))
+                         (not (string= base "SIMPLE-VECTOR")))
+                    (cadr rt)
+                    t)))
+    (if (or (eq etype t)
+            (and (symbolp etype) (string= (symbol-name etype) "*")))
+        (coerce list 'vector)
+        (coerce list (list 'vector etype)))))
 
 (defun map (result-type function &rest sequences)
   (let* ((result-type (if result-type (%typexpand-full result-type) result-type))
@@ -875,7 +924,7 @@
              (error 'type-error :datum result :expected-type result-type))
            (when (and required-length (/= (length result) required-length))
              (error 'type-error :datum result :expected-type result-type))))
-       (coerce result 'vector))
+       (%coerce-to-rt-vector result result-type))
       ((eq cat :list) result)
       (t
        ;; Unknown/compound type (e.g. (or (vector t 5) (vector t 10)))
@@ -935,34 +984,50 @@
 (defun map-into (result function &rest sequences)
   "Destructively modify RESULT by applying FUNCTION to elements of SEQUENCES."
   (when (null result) (return-from map-into nil))
-  ;; For fill-pointer vectors, use total array capacity as bound
+  ;; For fill-pointer vectors, use total array capacity as bound.
+  ;; List arguments are walked with a cursor each, and a list RESULT with a
+  ;; tail: indexing them with NTHCDR / ELT made every call quadratic.
   (let* ((has-fp (and (vectorp result) (array-has-fill-pointer-p result)))
          (result-cap (if has-fp (array-total-size result) (length result)))
+         (rtail (if (listp result) result nil))
          (n 0))
-    ;; Walk all sequences simultaneously, stop at shortest or result capacity
-    (block outer
-      (loop
-        ;; Check bounds
-        (when (>= n result-cap) (return-from outer nil))
-        ;; Collect current args from each sequence
-        (let ((args nil)
-              (done nil))
-          (dolist (seq sequences)
-            (if (listp seq)
-                (let ((tail (nthcdr n seq)))
-                  (if (null tail)
-                      (progn (setq done t) (return))
-                      (push (car tail) args)))
-                (if (>= n (length seq))
-                    (progn (setq done t) (return))
-                    (push (elt seq n) args))))
-          (when done (return-from outer nil))
-          (let ((val (apply function (nreverse args))))
-            ;; Use aref to bypass fill-pointer check for write
-            (if has-fp
-                (setf (aref result n) val)
-                (setf (elt result n) val))))
-        (incf n)))
+    (macrolet ((store (val)
+                 `(let ((v ,val))
+                    (if rtail
+                        (progn (setf (car rtail) v) (setq rtail (cdr rtail)))
+                        ;; AREF, not ELT: it ignores the fill pointer.
+                        (setf (aref result n) v)))))
+      (if (and sequences (null (cdr sequences)))
+          ;; One source sequence: no argument list per element.
+          (let* ((seq (car sequences))
+                 (seq-list-p (listp seq))
+                 (tail seq)
+                 (limit (if seq-list-p result-cap (min result-cap (length seq)))))
+            (loop
+              (when (>= n limit) (return))
+              (when (and seq-list-p (null tail)) (return))
+              (store (funcall function (if seq-list-p (pop tail) (aref seq n))))
+              (incf n)))
+          ;; CURSORS holds the remaining tail of each list argument (vectors
+          ;; are indexed by N and keep their own entry unchanged).
+          (let ((cursors (copy-list sequences)))
+            (loop
+              (when (>= n result-cap) (return))
+              (let ((args nil)
+                    (done nil))
+                (do ((c cursors (cdr c)))
+                    ((null c))
+                  (let ((cur (car c)))
+                    (if (listp cur)
+                        (if (null cur)
+                            (progn (setq done t) (return))
+                            (progn (push (car cur) args) (setf (car c) (cdr cur))))
+                        (if (>= n (length cur))
+                            (progn (setq done t) (return))
+                            (push (aref cur n) args)))))
+                (when done (return))
+                (store (apply function (nreverse args))))
+              (incf n)))))
     ;; Update fill pointer to reflect number of elements written
     (when has-fp
       (setf (fill-pointer result) n))
@@ -1015,7 +1080,7 @@
                     (integerp (caddr result-type))
                     (/= (length result) (caddr result-type)))
            (error 'type-error :datum result :expected-type result-type))
-         (coerce result 'vector))
+         (%coerce-to-rt-vector result result-type))
         (t
          ;; Unknown/compound type (e.g. (or (vector t 5) (vector t 10)))
          (multiple-value-bind (sub-list ok1) (subtypep result-type 'list)
@@ -1108,11 +1173,28 @@ Also expands element types within compound type specifiers like (VECTOR etype si
        (make-array length :element-type 'bit :initial-element (or initial-element 0)))
       ;; Vector types (possibly with element type)
       ((member base-name '("VECTOR" "SIMPLE-VECTOR" "ARRAY" "SIMPLE-ARRAY") :test #'string=)
-       ;; Check size constraint: (vector * n) or (vector etype n)
-       (when (and (consp type) (consp (cdr type)) (consp (cddr type))
-                  (integerp (caddr type)) (/= length (caddr type)))
-         (error 'type-error :datum length :expected-type type))
-       (let ((etype (if (and (consp type) (consp (cdr type))) (cadr type) t)))
+       ;; Size constraint: (vector etype n) and (simple-vector n) give a length.
+       ;; For ARRAY / SIMPLE-ARRAY the third element is a dimension spec: an
+       ;; integer there is a rank, and (n) is a length.
+       (let* ((svp (string= base-name "SIMPLE-VECTOR"))
+              (spec (cond ((not (consp type)) '*)
+                          (svp (if (consp (cdr type)) (cadr type) '*))
+                          ((and (consp (cdr type)) (consp (cddr type))) (caddr type))
+                          (t '*)))
+              (required
+                (if (member base-name '("ARRAY" "SIMPLE-ARRAY") :test #'string=)
+                    (cond ((eq spec '*) nil)
+                          ((eql spec 1) nil)
+                          ((and (consp spec) (null (cdr spec)))
+                           (if (integerp (car spec)) (car spec) nil))
+                          (t (error 'type-error :datum type :expected-type 'sequence)))
+                    (if (integerp spec) spec nil))))
+         (when (and required (/= length required))
+           (error 'type-error :datum length :expected-type type)))
+       (let ((etype (if (and (consp type) (consp (cdr type))
+                             (not (string= base-name "SIMPLE-VECTOR")))
+                        (cadr type)
+                        t)))
          (if (or (eq etype t) (eq etype '*) (and (symbolp etype) (string= (symbol-name etype) "*")))
              (make-array length :initial-element initial-element)
              (make-array length :element-type etype :initial-element (or initial-element 0)))))
@@ -1182,15 +1264,6 @@ Also expands element types within compound type specifiers like (VECTOR etype si
              (if (evenp (length args)) (lognot r) r)))))
 (defun lognand (integer1 integer2) (lognot (logand integer1 integer2)))
 (defun lognor (integer1 integer2) (lognot (logior integer1 integer2)))
-(defun logcount (integer)
-  (if (minusp integer)
-      (logcount (lognot integer))
-      (let ((n integer) (count 0))
-        (loop while (not (zerop n)) do
-          (setq n (logand n (- n 1)))
-          (setq count (+ count 1)))
-        count)))
-
 (defun ldb (bytespec integer)
   "Extract SIZE bits of INTEGER at POSITION."
   (let ((size (byte-size bytespec))
@@ -2323,12 +2396,25 @@ overload), so this never changes behaviour, only speed."
     new))
 
 (defun %mea-shadow (ht names)
-  ;; Lexical bindings hide a symbol macro / macro of the same name.
+  ;; Local functions hide a macro of the same name (the macro table is keyed by
+  ;; name).
   (if (null names)
       ht
       (let ((new (%mea-copy ht)))
         (dolist (n names new)
           (when (symbolp n) (remhash (symbol-name n) new))))))
+
+(defun %mea-shadow-vars (ht names)
+  ;; Variables hide a symbol macro of the same name, a global one included: the
+  ;; symbol-macro table (keyed by symbol) gets a shadow entry for each, which
+  ;; MACROEXPAND-1 reads as "a variable here, do not expand".
+  (if (null names)
+      ht
+      (let ((new (%mea-copy ht)))
+        (dolist (n names new)
+          (when (and n (symbolp n))
+            ;; Replaces an outer SYMBOL-MACROLET binding of N: this one is inner.
+            (setf (gethash n new) (cons *symbol-macro-shadow-marker* n)))))))
 
 (defun %mea-ll-vars (ll)
   ;; Variables a lambda list binds, so they can shadow symbol macros.
@@ -2344,29 +2430,40 @@ overload), so this never changes behaviour, only speed."
                      ((and (consp head) (symbolp (cadr head))) (push (cadr head) vars))))
              (when (and (cddr x) (symbolp (caddr x))) (push (caddr x) vars)))))))
 
+;; The environment of the form being expanded, as the walker hands it to
+;; MACROEXPAND-1. A local expander is stored in a name-keyed table and so is
+;; called with the form only; it reads its &environment value from here.
+(defvar *%mea-env* nil)
+
+(defun %mea-macroexpand-1 (form env)
+  (let ((*%mea-env* env))
+    (macroexpand-1 form env)))
+
 (defun %mea-strip-env (ll)
-  ;; Drop &environment VAR from a macrolet lambda list; the walker has no
-  ;; compiler environment object to pass, and CLHS lets it be absent.
-  (let ((out '()) (rest ll))
+  ;; Split &environment VAR out of a macrolet lambda list: returns the list
+  ;; without it, and VAR (or NIL).
+  (let ((out '()) (rest ll) (var nil))
     (loop while rest do
       (if (eq (car rest) '&environment)
-          (setq rest (cddr rest))
+          (progn (setq var (cadr rest)) (setq rest (cddr rest)))
           (progn (push (car rest) out) (setq rest (cdr rest)))))
-    (nreverse out)))
+    (values (nreverse out) var)))
 
 (defun %mea-macrolet-expander (name ll body)
   ;; Build the expander MACROEXPAND-1 will call: it receives the whole form.
-  (let ((whole (gensym "WHOLE"))
-        (clean (%mea-strip-env ll)))
-    (declare (ignorable name))
-    (if (eq (car clean) '&whole)
-        (let ((wvar (cadr clean)))
-          (eval (list 'lambda (list whole)
-                      (list 'let (list (list wvar whole))
-                            (list* 'destructuring-bind (cddr clean)
-                                   (list 'cdr whole) body)))))
-        (eval (list 'lambda (list whole)
-                    (list* 'destructuring-bind clean (list 'cdr whole) body))))))
+  (declare (ignorable name))
+  (multiple-value-bind (clean env-var) (%mea-strip-env ll)
+    (let* ((whole (gensym "WHOLE"))
+           (binds (append (and env-var (list (list env-var '*%mea-env*)))
+                          (and (eq (car clean) '&whole)
+                               (list (list (cadr clean) whole)))))
+           (dll (if (eq (car clean) '&whole) (cddr clean) clean)))
+      (eval (list 'lambda (list whole)
+                  (list* 'let binds
+                         (append (and env-var
+                                      (list (list 'declare (list 'ignorable env-var))))
+                                 (list (list* 'destructuring-bind dll
+                                              (list 'cdr whole) body)))))))))
 
 (defun %mea-body (body macros symbol-macros fns)
   ;; Walk a body, leaving (declare ...) forms untouched.
@@ -2383,7 +2480,7 @@ overload), so this never changes behaviour, only speed."
   ;; (lambda-list . body) shared by LAMBDA, FLET/LABELS definitions.
   (let* ((ll (car rest))
          (vars (%mea-ll-vars ll))
-         (sm (%mea-shadow symbol-macros vars)))
+         (sm (%mea-shadow-vars symbol-macros vars)))
     (cons ll (%mea-body (cdr rest) macros sm fns))))
 
 (defun %mea (form macros symbol-macros fns)
@@ -2393,7 +2490,7 @@ overload), so this never changes behaviour, only speed."
     ((symbolp form)
      (if (and form (not (eq form t)) (not (keywordp form)))
          (multiple-value-bind (exp expanded)
-             (macroexpand-1 form (cons macros symbol-macros))
+             (%mea-macroexpand-1 form (cons macros symbol-macros))
            (if expanded (%mea exp macros symbol-macros fns) form))
          form))
     ((atom form) form)
@@ -2407,7 +2504,7 @@ overload), so this never changes behaviour, only speed."
                   ;; ((lambda ...) args) operator must stay a lambda expression.
                   (not (eq head 'lambda)))
          (multiple-value-bind (exp expanded)
-             (macroexpand-1 form (cons macros symbol-macros))
+             (%mea-macroexpand-1 form (cons macros symbol-macros))
            (when expanded
              (return-from %mea (%mea exp macros symbol-macros fns)))))
        (case head
@@ -2426,7 +2523,7 @@ overload), so this never changes behaviour, only speed."
                                        b))
                                  binds))
                  (vars (mapcar (lambda (b) (if (consp b) (car b) b)) binds))
-                 (sm (%mea-shadow symbol-macros vars)))
+                 (sm (%mea-shadow-vars symbol-macros vars)))
             (list* head walked (%mea-body (cddr form) macros sm fns))))
          ((flet labels)
           (let* ((defs (cadr form))
@@ -2454,7 +2551,7 @@ overload), so this never changes behaviour, only speed."
          ((symbol-macrolet)
           (let ((new (%mea-copy symbol-macros)))
             (dolist (d (cadr form))
-              (setf (gethash (symbol-name (car d)) new) (cadr d)))
+              (setf (gethash (car d) new) (cadr d)))
             (let ((walked (%mea-body (cddr form) macros new fns)))
               (if (= (length walked) 1) (car walked) (cons 'progn walked)))))
          ((setq)
@@ -2464,7 +2561,8 @@ overload), so this never changes behaviour, only speed."
               (let* ((place (car rest))
                      (value (%mea (cadr rest) macros symbol-macros fns))
                      (sm (and (symbolp place)
-                              (gethash (symbol-name place) symbol-macros))))
+                              (let ((e (gethash place symbol-macros)))
+                                (and e (not (%symbol-macro-shadow-entry-p e)) e)))))
                 (if sm
                     (push (%mea (list 'setf sm value) macros symbol-macros fns) out)
                     (progn (push place out) (push value out))))
@@ -2689,3 +2787,114 @@ and symbol-macro scope is used as the starting point."
 
 (defun yes-or-no-p (&optional format-control &rest arguments)
   (%query-yes-no format-control arguments " (yes or no) " '("yes") '("no")))
+
+;;; --- Native namestrings ---
+;;;
+;;; DOTCL:NATIVE-NAMESTRING and DOTCL:PARSE-NATIVE-NAMESTRING are the string a
+;;; pathname is handed to the operating system as, and back -- the counterparts
+;;; of SBCL's SB-EXT functions of the same names, and what UIOP's functions of
+;;; the same names call on dotcl. NAMESTRING uses / on every OS; on Windows the
+;;; native spelling uses \ (C:\dir\file.txt, \\server\share\... for UNC), since
+;;; cmd builtins and many tools read / as an option switch. On other systems the
+;;; native spelling is the Unix one, built and read component by component the
+;;; way UIOP's UNIX-NAMESTRING and PARSE-UNIX-NAMESTRING do, with no wildcard
+;;; syntax. The workers take the OS as an argument so either spelling can be
+;;; exercised on any host.
+
+(defun %native-unix-namestring (pathname)
+  (with-output-to-string (s)
+    (flet ((err () (error "NATIVE-NAMESTRING: ~S has no native namestring" pathname)))
+      (let* ((dir (let ((d (pathname-directory pathname)))
+                    (if (stringp d) (list :absolute d) d)))
+             (name (pathname-name pathname))
+             (name (and (not (eq name :unspecific)) name))
+             (type (pathname-type pathname))
+             (type (and (not (eq type :unspecific)) type)))
+        (cond ((member dir '(nil :unspecific)))
+              ((consp dir)
+               (unless (member (first dir) '(:relative :absolute)) (err))
+               (when (eq (first dir) :absolute) (write-char #\/ s))
+               (dolist (x (rest dir))
+                 (cond ((member x '(:back :up)) (write-string "../" s))
+                       ((equal x "") (err))
+                       ((stringp x) (write-string x s) (write-char #\/ s))
+                       (t (err)))))
+              (t (err)))
+        (cond (name
+               (unless (and (stringp name) (or (null type) (stringp type))) (err))
+               (write-string name s)
+               (when type (write-char #\. s) (write-string type s)))
+              (t (unless (null type) (err))))))))
+
+(defun %native-namestring (x windows-p)
+  (when x
+    (let ((p (pathname x)))
+      (if windows-p
+          (substitute #\\ #\/ (namestring p))
+          (%native-unix-namestring p)))))
+
+(defun %split-from-end (string separator max)
+  ;; At most MAX pieces, separated from the end: "a.b.c" with max 2 is ("a.b" "c").
+  (let ((list nil) (words 0) (end (length string)))
+    (if (zerop end)
+        nil
+        (loop
+          (let ((start (if (and max (>= words (1- max)))
+                           nil
+                           (position separator string :end end :from-end t))))
+            (when (null start) (return (cons (subseq string 0 end) list)))
+            (push (subseq string (1+ start) end) list)
+            (incf words)
+            (setf end start))))))
+
+(defun %parse-native-unix-namestring (string)
+  ;; As SBCL's SB-EXT:PARSE-NATIVE-NAMESTRING reads a Unix path: no wildcard
+  ;; syntax, empty components dropped, "." kept, ".." as :UP, and the type is
+  ;; what follows the last dot unless that dot starts the name (".bashrc" and
+  ;; "a" have type NIL; "foo." has type "").
+  (let* ((components (%split-from-end string #\/ nil))
+         (absolute (and (plusp (length string)) (char= (char string 0) #\/)))
+         (directory-only (and (plusp (length string))
+                              (char= (char string (1- (length string))) #\/)))
+         (filename (unless directory-only (car (last components))))
+         (dirs (remove "" (if directory-only components (butlast components))
+                       :test #'equal))
+         (dirs (substitute :up ".." dirs :test #'equal)))
+    (multiple-value-bind (name type)
+        (cond ((or (null filename) (equal filename "")) (values nil nil))
+              (t (let ((dot (position #\. filename :from-end t)))
+                   (if (or (null dot) (zerop dot))
+                       (values filename nil)
+                       (values (subseq filename 0 dot) (subseq filename (1+ dot)))))))
+      (make-pathname :host nil :device nil :version nil
+                     :directory (cond (absolute (cons :absolute dirs))
+                                      (dirs (cons :relative dirs))
+                                      (t nil))
+                     :name name :type type))))
+
+(defun %parse-native-namestring (string windows-p)
+  (when string
+    (if windows-p
+        (parse-namestring string)
+        (%parse-native-unix-namestring string))))
+
+(let ((pkg (find-package "DOTCL")))
+  (when pkg
+    (let ((ns (intern "NATIVE-NAMESTRING" pkg))
+          (pns (intern "PARSE-NATIVE-NAMESTRING" pkg)))
+      (setf (symbol-function ns)
+            (lambda (pathname) (%native-namestring pathname (member :windows *features*))))
+      (setf (documentation ns 'function)
+            "Return the namestring of PATHNAME in the form the operating system
+expects: with backslash separators on Windows (C:\\dir\\file.txt, and
+\\\\server\\share\\... for UNC paths), and in Unix syntax elsewhere. NIL gives NIL.
+NAMESTRING itself uses forward slashes on every OS.")
+      (setf (symbol-function pns)
+            (lambda (string) (%parse-native-namestring string (member :windows *features*))))
+      (setf (documentation pns 'function)
+            "Return the pathname for STRING, a namestring in the form the operating
+system uses, as produced by NATIVE-NAMESTRING. On Windows both separators are
+accepted. Elsewhere the string is read as a Unix path with no wildcard syntax:
+empty and \".\" directory components are dropped and \"..\" becomes :BACK.
+NIL gives NIL.")
+      (export (list ns pns) pkg))))

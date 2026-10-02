@@ -82,3 +82,40 @@
     (error () :caught-error)
     (storage-condition () :caught-storage-condition))
   :caught-storage-condition)
+
+;;; Stack exhaustion inside a callback reaches the code that called into .NET.
+;;; The callback boundary keeps Lisp ERRORs out of the host, answering it with the
+;;; return type's default. It also kept in a STORAGE-CONDITION, which is not an
+;;; error: the delegate returned 0 and whatever called it carried on as if nothing
+;;; had happened. A Lisp handler for the condition hides this -- it is found when
+;;; the condition is signalled, before the unwind reaches the boundary -- unless
+;;; the signalling itself runs out of stack, which is what made CALLBACK-CHAIN.
+;;; STACK-OVERFLOW-CATCHABLE answer :NO-OVERFLOW now and then (emit-free, where
+;;; the handler matching is interpreted and its frames are larger: about 1 in 120
+;;; when the same test is started at 120 different stack depths).
+;;;
+;;; Here the handler for STORAGE-CONDITION is made invisible to the signalling on
+;;; purpose: the callback runs inside a handler of another condition, and while a
+;;; handler runs only the handlers established outside it are active. So the
+;;; condition goes unhandled at the signal and travels as an unwind -- the same
+;;; path the flaky case took -- and the HANDLER-CASE meets it on the way out.
+(defun %in-callback-deep-rec (n) (if (zerop n) 0 (+ 1 (%in-callback-deep-rec (- n 1)))))
+
+(define-condition %run-callback (condition) ())
+
+(deftest callback-boundary.storage-condition-passes
+  (let ((d (dotnet:make-delegate "System.Func`1[System.Int32]"
+                                 (lambda () (%in-callback-deep-rec 10000000)))))
+    (handler-bind ((%run-callback (lambda (c) (declare (ignore c)) (dotnet:invoke d "Invoke"))))
+      (handler-case (progn (signal '%run-callback) :no-overflow)
+        (storage-condition () :caught-storage-condition))))
+  :caught-storage-condition)
+
+;;; An ERROR in a callback is still contained, as before.
+(deftest callback-boundary.error-still-contained
+  (let ((d (dotnet:make-delegate "System.Func`1[System.Int32]"
+                                 (lambda () (error "boom in callback"))))
+        (*error-output* (make-broadcast-stream)))
+    (handler-case (dotnet:invoke d "Invoke")
+      (error () :escaped)))
+  0)

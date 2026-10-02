@@ -128,16 +128,22 @@ public class LispFunction : LispObject
     internal Func<LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject>? _func7;
     internal Func<LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject>? _func8;
 
-    // Native delegates: (self, long args) -> LispObject return.
+    // Native delegate: (self, long args) -> LispObject return.
     // Avoids boxing of ARGUMENTS (the main allocation bottleneck in fixnum recursion).
     // Return is still LispObject so the body compiles unchanged.
     // The leading LispFunction is the function itself, threaded through so a native
     // self-call can reach the receiver from arg0 instead of re-resolving #'NAME from
     // its symbol on every recursive entry (the old per-call self-fn prelude).
-    internal Func<LispFunction, long, LispObject>? _nativeFunc1;
-    internal Func<LispFunction, long, long, LispObject>? _nativeFunc2;
-    internal Func<LispFunction, long, long, long, LispObject>? _nativeFunc3;
-    internal Func<LispFunction, long, long, long, long, LispObject>? _nativeFunc4;
+    //
+    // A function has one arity, so it has at most one native entry: one field for
+    // the delegate and its arity as the tag, instead of one typed field per arity.
+    // Every LispFunction carried all four, which is 24 bytes of every closure. The
+    // tag is what makes the reinterpretation below safe: _nativeDel is a
+    // Func<LispFunction, long x N, LispObject> exactly when _nativeArity is N (set
+    // together in SetNativeDelegate, the only writer), and a type test on a generic
+    // delegate type costs more than the call it guards.
+    private Delegate? _nativeDel;
+    private int _nativeArity;
 
     public LispFunction(Func<LispObject[], LispObject> func, string? name = null, int arity = -1)
     {
@@ -636,6 +642,210 @@ public class LispFunction : LispObject
         return InvokeSlow(new[] { a, b, c, d, e, f, g, h });
     }
 
+    // --- Invoke with a value mode (see MultipleValues.TakeMode) ---
+    //
+    // Bit N of _mvModeMask is set when the arity-N direct entry (_funcN, or the
+    // closure body for a closure of arity N) is a compiled body whose first
+    // instruction takes the mode. InvokeNM passes MODE on only to such an entry
+    // and only right before calling it, so a mode can never be left behind for
+    // some other body to pick up; any other entry is called exactly as InvokeN
+    // calls it.
+    private int _mvModeMask;
+
+    /// <summary>The arity-ARITY direct entry reads a value mode on entry.</summary>
+    public void MarkMvModeEntry(int arity)
+    {
+        if ((uint)arity < 32) _mvModeMask |= 1 << arity;
+    }
+
+    /// <summary>MARKMVMODEENTRY for a function just built on the stack: returns FN.</summary>
+    public static LispObject WithMvModeEntry(LispObject fn, int arity)
+    {
+        ((LispFunction)fn).MarkMvModeEntry(arity);
+        return fn;
+    }
+
+    internal bool MvModeEntry(int arity) => (uint)arity < 32 && (_mvModeMask & (1 << arity)) != 0;
+
+    public unsafe LispObject Invoke0M(int mode)
+    {
+        var f0 = _func0;
+        if (f0 != null)
+        {
+            PeriodicStackCheck();
+            var n = _frameName;
+            if (n == null) { if ((_mvModeMask & 1) != 0) MultipleValues.SetMode(mode); return f0(); }
+            var fr = new Frame(n); Link(&fr);
+            try { if ((_mvModeMask & 1) != 0) MultipleValues.SetMode(mode); return f0(); } finally { s_top = fr.Prev; }
+        }
+        if (_directDel is Func<object[], LispObject> c0)
+        {
+            PeriodicStackCheck();
+            var n = _frameName;
+            if (n == null) { if ((_mvModeMask & 1) != 0) MultipleValues.SetMode(mode); return c0(Environment!); }
+            var fr = new Frame(n); Link(&fr);
+            try { if ((_mvModeMask & 1) != 0) MultipleValues.SetMode(mode); return c0(Environment!); } finally { s_top = fr.Prev; }
+        }
+        return Invoke0();
+    }
+
+    public unsafe LispObject Invoke1M(LispObject a, int mode)
+    {
+        var f1 = _func1;
+        if (f1 != null)
+        {
+            PeriodicStackCheck();
+            var n = _frameName;
+            if (n == null) { if ((_mvModeMask & 2) != 0) MultipleValues.SetMode(mode); return f1(a); }
+            var fr = new Frame(n, a); Link(&fr);
+            try { if ((_mvModeMask & 2) != 0) MultipleValues.SetMode(mode); return f1(a); } finally { s_top = fr.Prev; }
+        }
+        if (_directDel is Func<object[], LispObject, LispObject> c1)
+        {
+            PeriodicStackCheck();
+            var n = _frameName;
+            if (n == null) { if ((_mvModeMask & 2) != 0) MultipleValues.SetMode(mode); return c1(Environment!, a); }
+            var fr = new Frame(n, a); Link(&fr);
+            try { if ((_mvModeMask & 2) != 0) MultipleValues.SetMode(mode); return c1(Environment!, a); } finally { s_top = fr.Prev; }
+        }
+        return Invoke1(a);
+    }
+
+    public unsafe LispObject Invoke2M(LispObject a, LispObject b, int mode)
+    {
+        var f2 = _func2;
+        if (f2 != null)
+        {
+            PeriodicStackCheck();
+            var n = _frameName;
+            if (n == null) { if ((_mvModeMask & 4) != 0) MultipleValues.SetMode(mode); return f2(a, b); }
+            var fr = new Frame(n, a, b); Link(&fr);
+            try { if ((_mvModeMask & 4) != 0) MultipleValues.SetMode(mode); return f2(a, b); } finally { s_top = fr.Prev; }
+        }
+        if (_directDel is Func<object[], LispObject, LispObject, LispObject> c2)
+        {
+            PeriodicStackCheck();
+            var n = _frameName;
+            if (n == null) { if ((_mvModeMask & 4) != 0) MultipleValues.SetMode(mode); return c2(Environment!, a, b); }
+            var fr = new Frame(n, a, b); Link(&fr);
+            try { if ((_mvModeMask & 4) != 0) MultipleValues.SetMode(mode); return c2(Environment!, a, b); } finally { s_top = fr.Prev; }
+        }
+        return Invoke2(a, b);
+    }
+
+    public unsafe LispObject Invoke3M(LispObject a, LispObject b, LispObject c, int mode)
+    {
+        var f3 = _func3;
+        if (f3 != null)
+        {
+            PeriodicStackCheck();
+            var n = _frameName;
+            if (n == null) { if ((_mvModeMask & 8) != 0) MultipleValues.SetMode(mode); return f3(a, b, c); }
+            var fr = new Frame(n, a, b, c); Link(&fr);
+            try { if ((_mvModeMask & 8) != 0) MultipleValues.SetMode(mode); return f3(a, b, c); } finally { s_top = fr.Prev; }
+        }
+        if (_directDel is Func<object[], LispObject, LispObject, LispObject, LispObject> c3)
+        {
+            PeriodicStackCheck();
+            var n = _frameName;
+            if (n == null) { if ((_mvModeMask & 8) != 0) MultipleValues.SetMode(mode); return c3(Environment!, a, b, c); }
+            var fr = new Frame(n, a, b, c); Link(&fr);
+            try { if ((_mvModeMask & 8) != 0) MultipleValues.SetMode(mode); return c3(Environment!, a, b, c); } finally { s_top = fr.Prev; }
+        }
+        return Invoke3(a, b, c);
+    }
+
+    public unsafe LispObject Invoke4M(LispObject a, LispObject b, LispObject c, LispObject d, int mode)
+    {
+        var f4 = _func4;
+        if (f4 != null)
+        {
+            PeriodicStackCheck();
+            var n = _frameName;
+            if (n == null) { if ((_mvModeMask & 16) != 0) MultipleValues.SetMode(mode); return f4(a, b, c, d); }
+            var fr = new Frame(n, a, b, c, d); Link(&fr);
+            try { if ((_mvModeMask & 16) != 0) MultipleValues.SetMode(mode); return f4(a, b, c, d); } finally { s_top = fr.Prev; }
+        }
+        if (_directDel is Func<object[], LispObject, LispObject, LispObject, LispObject, LispObject> c4)
+        {
+            PeriodicStackCheck();
+            var n = _frameName;
+            if (n == null) { if ((_mvModeMask & 16) != 0) MultipleValues.SetMode(mode); return c4(Environment!, a, b, c, d); }
+            var fr = new Frame(n, a, b, c, d); Link(&fr);
+            try { if ((_mvModeMask & 16) != 0) MultipleValues.SetMode(mode); return c4(Environment!, a, b, c, d); } finally { s_top = fr.Prev; }
+        }
+        return Invoke4(a, b, c, d);
+    }
+
+    public unsafe LispObject Invoke5M(LispObject a, LispObject b, LispObject c, LispObject d, LispObject e, int mode)
+    {
+        var f5 = _func5;
+        if (f5 != null)
+        {
+            PeriodicStackCheck();
+            var n = _frameName;
+            if (n == null) { if ((_mvModeMask & 32) != 0) MultipleValues.SetMode(mode); return f5(a, b, c, d, e); }
+            FrameExt x = default; x.A4 = e; var fr = new Frame(n, 5, a, b, c, d, &x); Link(&fr);
+            try { if ((_mvModeMask & 32) != 0) MultipleValues.SetMode(mode); return f5(a, b, c, d, e); } finally { s_top = fr.Prev; }
+        }
+        if (_directDel is Func<object[], LispObject, LispObject, LispObject, LispObject, LispObject, LispObject> c5)
+        {
+            PeriodicStackCheck();
+            var n = _frameName;
+            if (n == null) { if ((_mvModeMask & 32) != 0) MultipleValues.SetMode(mode); return c5(Environment!, a, b, c, d, e); }
+            FrameExt x = default; x.A4 = e; var fr = new Frame(n, 5, a, b, c, d, &x); Link(&fr);
+            try { if ((_mvModeMask & 32) != 0) MultipleValues.SetMode(mode); return c5(Environment!, a, b, c, d, e); } finally { s_top = fr.Prev; }
+        }
+        return Invoke5(a, b, c, d, e);
+    }
+
+    public unsafe LispObject Invoke6M(LispObject a, LispObject b, LispObject c, LispObject d, LispObject e, LispObject f, int mode)
+    {
+        var f6 = _func6;
+        if (f6 != null)
+        {
+            PeriodicStackCheck();
+            var n = _frameName;
+            if (n == null) { if ((_mvModeMask & 64) != 0) MultipleValues.SetMode(mode); return f6(a, b, c, d, e, f); }
+            FrameExt x = default; x.A4 = e; x.A5 = f; var fr = new Frame(n, 6, a, b, c, d, &x); Link(&fr);
+            try { if ((_mvModeMask & 64) != 0) MultipleValues.SetMode(mode); return f6(a, b, c, d, e, f); } finally { s_top = fr.Prev; }
+        }
+        if (_directDel is Func<object[], LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject> c6)
+        {
+            PeriodicStackCheck();
+            var n = _frameName;
+            if (n == null) { if ((_mvModeMask & 64) != 0) MultipleValues.SetMode(mode); return c6(Environment!, a, b, c, d, e, f); }
+            FrameExt x = default; x.A4 = e; x.A5 = f; var fr = new Frame(n, 6, a, b, c, d, &x); Link(&fr);
+            try { if ((_mvModeMask & 64) != 0) MultipleValues.SetMode(mode); return c6(Environment!, a, b, c, d, e, f); } finally { s_top = fr.Prev; }
+        }
+        return Invoke6(a, b, c, d, e, f);
+    }
+
+    // InvokeN for code that runs once: the method EVAL builds for a top level
+    // form with no loop. Such a method is JIT-compiled with full optimization,
+    // which inlines InvokeN (frame push, try/finally, the direct-delegate arms)
+    // into it and cost several times the JIT time of the rest of the method,
+    // to save one call that runs once. Code that can run more than once calls
+    // InvokeN itself.
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    public LispObject InvokeOnce0() => Invoke0();
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    public LispObject InvokeOnce1(LispObject a) => Invoke1(a);
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    public LispObject InvokeOnce2(LispObject a, LispObject b) => Invoke2(a, b);
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    public LispObject InvokeOnce3(LispObject a, LispObject b, LispObject c) => Invoke3(a, b, c);
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    public LispObject InvokeOnce4(LispObject a, LispObject b, LispObject c, LispObject d) => Invoke4(a, b, c, d);
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    public LispObject InvokeOnce5(LispObject a, LispObject b, LispObject c, LispObject d, LispObject e) => Invoke5(a, b, c, d, e);
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    public LispObject InvokeOnce6(LispObject a, LispObject b, LispObject c, LispObject d, LispObject e, LispObject f) => Invoke6(a, b, c, d, e, f);
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    public LispObject InvokeOnce7(LispObject a, LispObject b, LispObject c, LispObject d, LispObject e, LispObject f, LispObject g) => Invoke7(a, b, c, d, e, f, g);
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    public LispObject InvokeOnce8(LispObject a, LispObject b, LispObject c, LispObject d, LispObject e, LispObject f, LispObject g, LispObject h) => Invoke8(a, b, c, d, e, f, g, h);
+
     // Native fixnum invoke: long args avoid boxing, LispObject return is body result.
     //
     // The null arms matter as soon as a call site names a function other than the
@@ -648,17 +858,17 @@ public class LispFunction : LispObject
     // slower, which is the property that lets a call site assume a native entry
     // without the assumption being load-bearing for correctness.
     public LispObject InvokeNative1(long a) =>
-        _nativeFunc1 != null ? _nativeFunc1(this, a)
-                             : Invoke1(Fixnum.Make(a));
+        _nativeArity == 1 ? Unsafe.As<Func<LispFunction, long, LispObject>>(_nativeDel!)(this, a)
+                          : Invoke1(Fixnum.Make(a));
     public LispObject InvokeNative2(long a, long b) =>
-        _nativeFunc2 != null ? _nativeFunc2(this, a, b)
-                             : Invoke2(Fixnum.Make(a), Fixnum.Make(b));
+        _nativeArity == 2 ? Unsafe.As<Func<LispFunction, long, long, LispObject>>(_nativeDel!)(this, a, b)
+                          : Invoke2(Fixnum.Make(a), Fixnum.Make(b));
     public LispObject InvokeNative3(long a, long b, long c) =>
-        _nativeFunc3 != null ? _nativeFunc3(this, a, b, c)
-                             : Invoke3(Fixnum.Make(a), Fixnum.Make(b), Fixnum.Make(c));
+        _nativeArity == 3 ? Unsafe.As<Func<LispFunction, long, long, long, LispObject>>(_nativeDel!)(this, a, b, c)
+                          : Invoke3(Fixnum.Make(a), Fixnum.Make(b), Fixnum.Make(c));
     public LispObject InvokeNative4(long a, long b, long c, long d) =>
-        _nativeFunc4 != null ? _nativeFunc4(this, a, b, c, d)
-                             : Invoke4(Fixnum.Make(a), Fixnum.Make(b), Fixnum.Make(c), Fixnum.Make(d));
+        _nativeArity == 4 ? Unsafe.As<Func<LispFunction, long, long, long, long, LispObject>>(_nativeDel!)(this, a, b, c, d)
+                          : Invoke4(Fixnum.Make(a), Fixnum.Make(b), Fixnum.Make(c), Fixnum.Make(d));
 
     // Raw-return native invoke: long args in, long out. The callee-side entry
     // that would avoid boxing the result does not exist yet, so these go through
@@ -682,12 +892,15 @@ public class LispFunction : LispObject
     // Install a native long->LispObject delegate for the appropriate arity.
     public void SetNativeDelegate(Delegate del)
     {
+        // Clear the tag first so no reader pairs a new delegate with an old arity.
+        _nativeArity = 0;
+        _nativeDel = del;
         switch (del)
         {
-            case Func<LispFunction, long, LispObject> f1: _nativeFunc1 = f1; break;
-            case Func<LispFunction, long, long, LispObject> f2: _nativeFunc2 = f2; break;
-            case Func<LispFunction, long, long, long, LispObject> f3: _nativeFunc3 = f3; break;
-            case Func<LispFunction, long, long, long, long, LispObject> f4: _nativeFunc4 = f4; break;
+            case Func<LispFunction, long, LispObject>: Volatile.Write(ref _nativeArity, 1); break;
+            case Func<LispFunction, long, long, LispObject>: Volatile.Write(ref _nativeArity, 2); break;
+            case Func<LispFunction, long, long, long, LispObject>: Volatile.Write(ref _nativeArity, 3); break;
+            case Func<LispFunction, long, long, long, long, LispObject>: Volatile.Write(ref _nativeArity, 4); break;
             default: throw new ArgumentException($"SetNativeDelegate: unsupported type {del.GetType().Name}");
         }
     }
@@ -697,17 +910,19 @@ public class LispFunction : LispObject
     // internal field visibility without extra reflection hops.
     public void SetDirectDelegate(Delegate del)
     {
+        // A new entry has not been marked as taking a value mode: the caller
+        // marks it after installing it (MarkMvModeEntry).
         switch (del)
         {
-            case Func<LispObject> f0: _func0 = f0; break;
-            case Func<LispObject, LispObject> f1: _func1 = f1; break;
-            case Func<LispObject, LispObject, LispObject> f2: _func2 = f2; break;
-            case Func<LispObject, LispObject, LispObject, LispObject> f3: _func3 = f3; break;
-            case Func<LispObject, LispObject, LispObject, LispObject, LispObject> f4: _func4 = f4; break;
-            case Func<LispObject, LispObject, LispObject, LispObject, LispObject, LispObject> f5: _func5 = f5; break;
-            case Func<LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject> f6: _func6 = f6; break;
-            case Func<LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject> f7: _func7 = f7; break;
-            case Func<LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject> f8: _func8 = f8; break;
+            case Func<LispObject> f0: _func0 = f0; _mvModeMask &= ~1; break;
+            case Func<LispObject, LispObject> f1: _func1 = f1; _mvModeMask &= ~2; break;
+            case Func<LispObject, LispObject, LispObject> f2: _func2 = f2; _mvModeMask &= ~4; break;
+            case Func<LispObject, LispObject, LispObject, LispObject> f3: _func3 = f3; _mvModeMask &= ~8; break;
+            case Func<LispObject, LispObject, LispObject, LispObject, LispObject> f4: _func4 = f4; _mvModeMask &= ~16; break;
+            case Func<LispObject, LispObject, LispObject, LispObject, LispObject, LispObject> f5: _func5 = f5; _mvModeMask &= ~32; break;
+            case Func<LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject> f6: _func6 = f6; _mvModeMask &= ~64; break;
+            case Func<LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject> f7: _func7 = f7; _mvModeMask &= ~128; break;
+            case Func<LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject> f8: _func8 = f8; _mvModeMask &= ~256; break;
             default:
                 throw new ArgumentException($"SetDirectDelegate: unsupported delegate type {del.GetType().Name}");
         }
@@ -766,10 +981,7 @@ public class LispFunction : LispObject
 
     public (Delegate Delegate, string Label) GetJitDelegate()
     {
-        if (_nativeFunc1 != null) return (_nativeFunc1, "native-1");
-        if (_nativeFunc2 != null) return (_nativeFunc2, "native-2");
-        if (_nativeFunc3 != null) return (_nativeFunc3, "native-3");
-        if (_nativeFunc4 != null) return (_nativeFunc4, "native-4");
+        if (_nativeArity != 0) return (_nativeDel!, "native-" + _nativeArity);
         if (_func1 != null) return (_func1, "func-1");
         if (_func2 != null) return (_func2, "func-2");
         if (_func3 != null) return (_func3, "func-3");

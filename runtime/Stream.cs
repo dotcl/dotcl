@@ -62,6 +62,13 @@ public sealed class ByteTrackingReader : TextReader
     private readonly char[] _pending = new char[2];
     private int _pendingLen, _pendingPos; // chars decoded but not yet handed out
     private long _pendingBytes;           // bytes behind the pending characters
+    private long _fillEnd;                // where the underlying stream should be
+                                          // if only this reader has moved it
+
+    /// <summary>True when a writer shares the underlying stream (an :IO file
+    /// stream). A write then moves the stream under this reader, and whatever
+    /// the reader holds decoded belongs to the old position.</summary>
+    public bool SharesStreamWithWriter { get; set; }
 
     /// <summary>Byte offset of the next character. Bytes whose characters have been
     /// decoded but not yet handed out are not counted: a surrogate pair reports its
@@ -79,7 +86,19 @@ public sealed class ByteTrackingReader : TextReader
         CurrentEncoding = encoding;
         _decoder = encoding.GetDecoder();
         _utf8 = encoding.CodePage == 65001;
+        // A stream opened for appending starts at its end, not at 0.
+        if (_stream.CanSeek) BytePosition = _fillEnd = _stream.Position;
         if (skipPreamble) SkipPreamble();
+    }
+
+    /// <summary>For a reader that shares its stream with a writer: when a write
+    /// has moved the stream since this reader last read from it, drop what was
+    /// decoded and continue from where the stream now is, which is where the
+    /// write ended.</summary>
+    public void SyncWithWriter()
+    {
+        if (SharesStreamWithWriter && _stream.CanSeek && _stream.Position != _fillEnd)
+            ResetTo(_stream.Position);
     }
 
     /// <summary>A byte order mark is not part of the text, so the first character
@@ -94,7 +113,7 @@ public sealed class ByteTrackingReader : TextReader
         int got = _stream.Read(head, 0, head.Length);
         bool match = got == pre.Length;
         for (int i = 0; match && i < pre.Length; i++) if (head[i] != pre[i]) match = false;
-        if (match) BytePosition = _stream.Position;
+        if (match) BytePosition = _fillEnd = _stream.Position;
         else _stream.Position = at;
     }
 
@@ -106,7 +125,7 @@ public sealed class ByteTrackingReader : TextReader
         _byteLen = _bytePos = 0;
         _pendingLen = _pendingPos = 0;
         _pendingBytes = 0;
-        BytePosition = bytePosition;
+        BytePosition = _fillEnd = bytePosition;
     }
 
     /// <summary>Decode exactly one more character sequence into _pending.
@@ -119,6 +138,7 @@ public sealed class ByteTrackingReader : TextReader
             {
                 _byteLen = _stream.Read(_bytes, 0, _bytes.Length);
                 _bytePos = 0;
+                if (_byteLen > 0) _fillEnd += _byteLen;
                 if (_byteLen <= 0)
                 {
                     // Flush whatever the decoder still holds (an incomplete
@@ -161,6 +181,7 @@ public sealed class ByteTrackingReader : TextReader
 
     public override int Read()
     {
+        if (SharesStreamWithWriter) SyncWithWriter();
         if (_pendingPos >= _pendingLen && !FillPending()) return -1;
         char c = _pending[_pendingPos++];
         if (_pendingPos >= _pendingLen)
@@ -173,6 +194,7 @@ public sealed class ByteTrackingReader : TextReader
 
     public override int Peek()
     {
+        if (SharesStreamWithWriter) SyncWithWriter();
         if (_pendingPos >= _pendingLen && !FillPending()) return -1;
         return _pending[_pendingPos];
     }
@@ -318,6 +340,7 @@ public class LispFileStream : LispStream
         InputReader = reader;
         OutputWriter = writer;
         FilePath = path;
+        reader.SharesStreamWithWriter = ReferenceEquals(reader.BaseStream, writer.BaseStream);
     }
 
     // Probe (no reader or writer, just path)
@@ -350,6 +373,12 @@ public class LispStringOutputStream : LispOutputStream
 
     public string GetString() => _sw.ToString();
 
+    /// <summary>The column the text of this stream starts at on its first line.
+    /// Zero for a stream of its own; the column of the destination for the
+    /// buffer a PRINT-OBJECT method is handed while the printer builds the text
+    /// it writes there.</summary>
+    public int StartColumn { get; set; }
+
     /// <summary>Get the string and reset the stream (for GET-OUTPUT-STREAM-STRING).</summary>
     public string GetStringAndReset()
     {
@@ -366,8 +395,28 @@ public class LispStringOutputStream : LispOutputStream
 public class FillPointerStringWriter : TextWriter
 {
     private readonly LispVector _vector;
+    // Where this stream started writing: what the string held before belongs to
+    // the caller, and trimming never reaches into it.
+    private readonly int _start;
 
-    public FillPointerStringWriter(LispVector vector) => _vector = vector;
+    public FillPointerStringWriter(LispVector vector)
+    {
+        _vector = vector;
+        _start = vector.Length;
+    }
+
+    /// <summary>Remove spaces and tabs this stream wrote at the end of the
+    /// string, as the pretty printer does before a line break it emits.
+    /// Returns how many were removed.</summary>
+    public int TrimTrailingBlanks()
+    {
+        int fp = _vector.Length, n = fp;
+        while (n > _start && _vector.ElementAt(n - 1) is LispChar c
+               && (c.Value == ' ' || c.Value == '\t'))
+            n--;
+        if (n != fp) _vector.SetFillPointer(n);
+        return fp - n;
+    }
 
     public override System.Text.Encoding Encoding => System.Text.Encoding.Unicode;
 
@@ -459,6 +508,83 @@ public class LispStringInputStream : LispInputStream
 
     public override string? StreamTypeName => "STRING-STREAM";
     public override string ToString() => "#<STRING-INPUT-STREAM>";
+
+    // LOAD and COMPILE-FILE read a source file into a string and hand reader macros
+    // a stream over it. A reader macro that records where a form starts (eclector,
+    // and through it Coalton) asks FILE-POSITION, and expects what a stream opened
+    // on the file would answer: a byte offset, as every file stream in dotcl and in
+    // SBCL counts. Over a string the answer would be a character offset, which
+    // differs as soon as the file holds a character outside ASCII.
+    private bool _fileBytes;
+    private int _preambleBytes;
+    private int[]? _byteAt;
+
+    /// <summary>Make FILE-POSITION count bytes of the UTF-8 file the text came from,
+    /// PREAMBLEBYTES (a byte order mark the text no longer holds) included.</summary>
+    public void ReportFileBytes(int preambleBytes)
+    {
+        _fileBytes = true;
+        _preambleBytes = preambleBytes;
+    }
+
+    public bool ReportsFileBytes => _fileBytes && _fullString != null;
+
+    private int[] ByteTable()
+    {
+        if (_byteAt != null) return _byteAt;
+        var text = _fullString!;
+        var table = new int[text.Length + 1];
+        int b = _preambleBytes;
+        for (int i = 0; i < text.Length; i++)
+        {
+            table[i] = b;
+            char c = text[i];
+            if (c < 0x80) b += 1;
+            else if (c < 0x800) b += 2;
+            else if (char.IsHighSurrogate(c) && i + 1 < text.Length && char.IsLowSurrogate(text[i + 1]))
+            {
+                b += 4;
+                table[++i] = b;   // the low half: no byte boundary of its own
+            }
+            else b += 3;
+        }
+        table[text.Length] = b;
+        return _byteAt = table;
+    }
+
+    /// <summary>The file byte offset of character position CHARPOS.</summary>
+    public long FileByteOf(int charPos)
+    {
+        var t = ByteTable();
+        return t[charPos < 0 ? 0 : charPos >= t.Length ? t.Length - 1 : charPos];
+    }
+
+    /// <summary>The character position at file byte offset BYTEPOS, or -1 when BYTEPOS
+    /// is not the start of a character.</summary>
+    public int CharAtFileByte(long bytePos)
+    {
+        var t = ByteTable();
+        int i = Array.BinarySearch(t, (int)bytePos);
+        return i >= 0 ? i : -1;
+    }
+
+    /// <summary>The length of a UTF-8 byte order mark at the start of PATH, or 0. A
+    /// preamble of another encoding answers -1: those files are not counted in
+    /// UTF-8 bytes.</summary>
+    public static int Utf8Preamble(string path)
+    {
+        try
+        {
+            using var f = System.IO.File.OpenRead(path);
+            var head = new byte[3];
+            int n = f.Read(head, 0, 3);
+            if (n >= 3 && head[0] == 0xEF && head[1] == 0xBB && head[2] == 0xBF) return 3;
+            if (n >= 2 && ((head[0] == 0xFF && head[1] == 0xFE) || (head[0] == 0xFE && head[1] == 0xFF)))
+                return -1;
+            return 0;
+        }
+        catch { return -1; }
+    }
 }
 
 /// <summary>TextWriter that multiplexes writes to multiple writers (for broadcast streams).</summary>
@@ -611,10 +737,16 @@ public sealed class BivalentStreamReader : System.IO.TextReader
 
     public BivalentStreamReader(System.IO.Stream s) => _s = s;
     public System.IO.Stream BaseStream => _s;
+    /// <summary>The writer on the same .NET stream, when there is one. Its
+    /// buffered output is sent before this reader reads, so a program that
+    /// writes a request and reads the reply without FORCE-OUTPUT is not left
+    /// waiting for a reply to a request that was never sent.</summary>
+    internal BivalentStreamWriter? Partner { get; set; }
 
     private int NextByte()
     {
         if (_pbCount > 0) { int v = _pb[_pbHead]; _pbHead = (_pbHead + 1) % _pb.Length; _pbCount--; return v; }
+        if (Partner is { HasPending: true } w) w.Flush();
         return _s.ReadByte();
     }
     private void PushFront(int b)
@@ -667,6 +799,38 @@ public sealed class BivalentStreamReader : System.IO.TextReader
 
     public override int Read() => ReadCodepoint(true);
     public override int Peek() => ReadCodepoint(false);
+
+    // CLOSE on the Lisp stream closes the stream under it: for a socket that is
+    // what ends the connection, and the Lisp stream is all a caller may hold.
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing) _s.Dispose();
+        base.Dispose(disposing);
+    }
+
+    /// <summary>For LISTEN: false when reading now would wait for the peer. Peek
+    /// blocks on a socket until a byte arrives, which is what READ-CHAR does and
+    /// what LISTEN must not. Null when the source can not tell without reading.</summary>
+    public bool? DataReady()
+    {
+        if (_pbCount > 0) return true;
+        if (Partner is { HasPending: true } w) w.Flush();
+        if (_s is System.Net.Sockets.NetworkStream ns)
+        {
+            if (ns.DataAvailable) return true;
+#if !NETSTANDARD2_0
+            // Readable with nothing buffered means the peer has closed: Peek then
+            // answers end of file at once, so let it.
+            try
+            {
+                if (ns.Socket.Poll(0, System.Net.Sockets.SelectMode.SelectRead)) return null;
+            }
+            catch (System.ObjectDisposedException) { return null; }
+#endif
+            return false;
+        }
+        return null;
+    }
 }
 
 /// <summary>TextWriter over a raw byte Stream that writes UTF-8 directly (no buffering,
@@ -676,23 +840,87 @@ public sealed class BivalentStreamWriter : System.IO.TextWriter
 {
     private readonly System.IO.Stream _s;
     private static readonly System.Text.UTF8Encoding Utf8NoBom = new(false);
+    // Output is buffered, as SBCL's socket streams are, and goes out on
+    // FORCE-OUTPUT / FINISH-OUTPUT / CLOSE, when the buffer fills, or when the
+    // paired reader is about to wait for input. Unbuffered, every WRITE-BYTE
+    // and every piece of a protocol message was its own send: a reply went out
+    // in as many TCP segments as it had writes.
+    private readonly byte[] _buf = new byte[8192];
+    private int _len;
+    // The buffer is shared with the paired reader, which sends it before it
+    // reads, usually from another thread than the writer's (a server reading
+    // the next request while a worker writes the reply). Every touch of the
+    // buffer holds this lock; without it the two copied into and sent the
+    // same bytes at once and the output came out garbled.
+    private readonly object _lock = new();
 
     public BivalentStreamWriter(System.IO.Stream s) => _s = s;
     public System.IO.Stream BaseStream => _s;
     public override System.Text.Encoding Encoding => Utf8NoBom;
+    internal bool HasPending => System.Threading.Volatile.Read(ref _len) > 0;
+
+    private void Put(byte[] bytes, int offset, int count)
+    {
+        lock (_lock)
+        {
+            if (count > _buf.Length - _len)
+            {
+                FlushBuffer();
+                if (count > _buf.Length) { _s.Write(bytes, offset, count); return; }
+            }
+            System.Buffer.BlockCopy(bytes, offset, _buf, _len, count);
+            _len += count;
+        }
+    }
+
+    // Callers hold _lock.
+    private void FlushBuffer()
+    {
+        if (_len == 0) return;
+        int n = _len;
+        _len = 0;
+        _s.Write(_buf, 0, n);
+    }
 
     public override void Write(char c)
     {
         var bytes = Utf8NoBom.GetBytes(new[] { c });
-        _s.Write(bytes, 0, bytes.Length);
+        Put(bytes, 0, bytes.Length);
     }
     public override void Write(string? value)
     {
         if (string.IsNullOrEmpty(value)) return;
         var bytes = Utf8NoBom.GetBytes(value);
-        _s.Write(bytes, 0, bytes.Length);
+        Put(bytes, 0, bytes.Length);
     }
     /// <summary>Raw byte write (write-byte).</summary>
-    public void WriteRawByte(int b) => _s.WriteByte((byte)b);
-    public override void Flush() => _s.Flush();
+    public void WriteRawByte(int b)
+    {
+        lock (_lock)
+        {
+            if (_len == _buf.Length) FlushBuffer();
+            _buf[_len++] = (byte)b;
+        }
+    }
+    /// <summary>Raw octets (write-sequence of a byte vector).</summary>
+    public void WriteRawBytes(byte[] buffer, int offset, int count) => Put(buffer, offset, count);
+    public override void Flush()
+    {
+        lock (_lock)
+        {
+            FlushBuffer();
+            _s.Flush();
+        }
+    }
+
+    // See BivalentStreamReader.Dispose.
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            try { Flush(); } catch (System.IO.IOException) { } catch (System.ObjectDisposedException) { }
+            _s.Dispose();
+        }
+        base.Dispose(disposing);
+    }
 }

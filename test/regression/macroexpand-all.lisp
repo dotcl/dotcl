@@ -95,3 +95,21 @@
 (deftest mea-atoms
   (list (mea 5) (mea "s") (mea :k) (mea t) (mea nil))
   (5 "s" :k t nil))
+
+;;; A MACROLET expander with &environment gets the environment of the form it
+;;; expands, so it can expand local macros that are in scope there.
+(deftest mea-macrolet-environment-bound
+  (mea '(macrolet ((m (x &environment e) (list 'quote (list x (not (null e)))))) (m 1)))
+  '(1 t))
+
+(deftest mea-macrolet-whole-and-environment
+  (mea '(macrolet ((inner () 42)
+                   (m (&whole w x &environment e)
+                     (list 'quote (list x (macroexpand '(inner) e) (length w)))))
+          (m 1)))
+  '(1 42 2))
+
+(deftest mea-macrolet-environment-sees-inner-macrolet
+  (mea '(macrolet ((m (&environment e x) (macroexpand x e)))
+          (macrolet ((q () 7)) (m (q)))))
+  7)

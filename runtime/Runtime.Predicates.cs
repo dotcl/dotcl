@@ -71,6 +71,37 @@ public static partial class Runtime
         return Nil.Instance;
     }
 
+    /// <summary>EQUAL of two same-length bit vectors that both own packed
+    /// storage, a word at a time; null when either does not.</summary>
+    private static bool? PackedBitsEqual(LispVector a, LispVector b)
+    {
+        var wa = a._bitData; var wb = b._bitData;
+        if (wa == null || wb == null || a._displacedTo != null || b._displacedTo != null)
+            return null;
+        int n = a.Length;
+        int full = n >> 6;
+        for (int w = 0; w < full; w++)
+            if (wa[w] != wb[w]) return false;
+        int tail = n & 63;
+        if (tail != 0)
+        {
+            ulong mask = (1UL << tail) - 1;
+            if (((wa[full] ^ wb[full]) & mask) != 0) return false;
+        }
+        return true;
+    }
+
+    /// <summary>EQUAL of two pathname versions, where NIL and :NEWEST are the
+    /// same version: (pathname "a.txt") has NIL and (merge-pathnames "a.txt")
+    /// gets :NEWEST from the default version, and the two name the same file
+    /// (SBCL's EQUAL agrees).</summary>
+    internal static bool PathnameVersionsEqual(LispObject? a, LispObject? b)
+        => IsTruthy(Equal(NormalPathnameVersion(a), NormalPathnameVersion(b)));
+
+    internal static LispObject NormalPathnameVersion(LispObject? v)
+        => v == null || (v is Symbol s && s.Name == "NEWEST" && s.HomePackage?.Name == "KEYWORD")
+            ? Nil.Instance : v;
+
     public static LispObject Equal(LispObject a, LispObject b)
     {
         a = Primary(a); b = Primary(b);
@@ -82,6 +113,10 @@ public static partial class Runtime
         while (true)
         {
             if (IsTrueEql(a, b)) return T.Instance;
+            // Two strings: compare the characters where they are, without
+            // building a System.String of a char-array backed one.
+            if (a is LispString ls1 && b is LispString ls2)
+                return ls1.Chars.SequenceEqual(ls2.Chars) ? T.Instance : Nil.Instance;
             // String comparison: LispString or char-vector: compare by content
             bool aIsStr = a is LispString || (a is LispVector av && av.IsCharVector);
             bool bIsStr = b is LispString || (b is LispVector bv && bv.IsCharVector);
@@ -99,13 +134,15 @@ public static partial class Runtime
                     && IsTruthy(Equal(pa.DirectoryComponent ?? Nil.Instance, pb.DirectoryComponent ?? Nil.Instance))
                     && IsTruthy(Equal(pa.NameComponent ?? Nil.Instance, pb.NameComponent ?? Nil.Instance))
                     && IsTruthy(Equal(pa.TypeComponent ?? Nil.Instance, pb.TypeComponent ?? Nil.Instance))
-                    && IsTruthy(Equal(pa.Version ?? Nil.Instance, pb.Version ?? Nil.Instance))
+                    && PathnameVersionsEqual(pa.Version, pb.Version)
                     ? T.Instance : Nil.Instance;
             }
             // Bit-vector: compare element-by-element
             if (a is LispVector bva && bva.IsBitVector && b is LispVector bvb && bvb.IsBitVector)
             {
                 if (bva.Length != bvb.Length) return Nil.Instance;
+                if (PackedBitsEqual(bva, bvb) is bool packedEqual)
+                    return packedEqual ? T.Instance : Nil.Instance;
                 for (int i = 0; i < bva.Length; i++)
                     if (!IsTrueEql(bva.GetElement(i), bvb.GetElement(i))) return Nil.Instance;
                 return T.Instance;
@@ -199,6 +236,9 @@ public static partial class Runtime
     public static bool IsTrueListp(LispObject obj) { obj = Primary(obj); return obj is Cons || obj is Nil; }
     public static bool IsTrueNumberp(LispObject obj) => Primary(obj) is Number;
     public static bool IsTrueIntegerp(LispObject obj) { obj = Primary(obj); return obj is Fixnum || obj is Bignum; }
+    // For compiled code that unboxes with UNBOX-FIXNUM when this is true: the
+    // same test that cast makes, so no Primary() here.
+    public static bool IsFixnumObject(LispObject obj) => obj is Fixnum;
     public static bool IsTrueSymbolp(LispObject obj) { obj = Primary(obj); return obj is Symbol || obj is T || obj is Nil; }
     public static bool IsTrueStringp(LispObject obj) { obj = Primary(obj); return obj is LispString || (obj is LispVector v && v.IsCharVector && v.Rank == 1); }
     public static bool IsTrueCharacterp(LispObject obj) => Primary(obj) is LispChar;
@@ -231,8 +271,29 @@ public static partial class Runtime
             if (int.TryParse(et.Substring(dash + 1), out int n))
                 return new Cons(Startup.Sym(et[..dash]), new Cons(Fixnum.Make(n), Nil.Instance));
         }
+        // (complex X) is stored as "COMPLEX-X". Only the two float part types
+        // are reported as themselves, as SBCL does; every other complex element
+        // type is general storage and reports T. Handing the stored name to
+        // Startup.Sym made up a DOTCL-INTERNAL symbol that is not a type.
+        if (et == "COMPLEX" || et.StartsWith("COMPLEX-"))
+            return ComplexElementPartClass(et) switch
+            {
+                'S' => Runtime.List(Startup.Sym("COMPLEX"), Startup.Sym("SINGLE-FLOAT")),
+                'D' => Runtime.List(Startup.Sym("COMPLEX"), Startup.Sym("DOUBLE-FLOAT")),
+                _ => Startup.Sym("T")
+            };
         return Startup.Sym(et);
     }
+
+    /// <summary>Which complex array an element type name stands for: 'S' for
+    /// (complex single-float), 'D' for (complex double-float), 'O' for any other
+    /// complex element type (stored generally, like T).</summary>
+    internal static char ComplexElementPartClass(string et) => et switch
+    {
+        "COMPLEX-SINGLE-FLOAT" or "COMPLEX-SHORT-FLOAT" => 'S',
+        "COMPLEX-DOUBLE-FLOAT" or "COMPLEX-LONG-FLOAT" => 'D',
+        _ => 'O'
+    };
 
     public static LispObject ArrayElementType(LispObject array)
     {
@@ -259,7 +320,7 @@ public static partial class Runtime
     {
         if (array is LispVector v)
         {
-            if (v.IsDisplaced) return Values(v.DisplacedTo!, Fixnum.Make(v.DisplacedOffset));
+            if (v.IsDisplaced) return Values(DisplacementTargetObject(v.DisplacedTo!), Fixnum.Make(v.DisplacedOffset));
             return Values(Nil.Instance, Fixnum.Make(0));
         }
         if (array is LispString) return Values(Nil.Instance, Fixnum.Make(0));
@@ -285,7 +346,11 @@ public static partial class Runtime
         Startup.RegisterUnary("CHARACTER", obj => obj switch {
             LispChar lc => lc,
             LispString s when s.Value.Length == 1 => LispChar.Make(s.Value[0]),
+            // A string made by MAKE-ARRAY is a character vector, not a LispString.
+            LispVector cv when cv.IsCharVector && cv.Rank == 1 && cv.Length == 1
+                => LispChar.Make(cv.ToCharString()[0]),
             Symbol sym when sym.Name.Length == 1 => LispChar.Make(sym.Name[0]),
+            T => LispChar.Make('T'),
             _ => throw new LispErrorException(new LispTypeError("CHARACTER: not a character designator", obj))
         });
         Startup.RegisterUnary("FUNCTIONP", Runtime.Functionp);
@@ -334,11 +399,13 @@ public static partial class Runtime
         Startup.RegisterBinary("EQUALP", (a, b) => LispHashTable.Equalp(a, b) ? T.Instance : Nil.Instance);
 
         // TYPEP accepts optional 3rd env arg (ignored)
-        Emitter.CilAssembler.RegisterFunction("TYPEP",
-            new LispFunction(args => {
+        var typepFn = new LispFunction(args => {
                 if (args.Length < 2) throw new LispErrorException(new LispProgramError("TYPEP: too few arguments"));
                 return Runtime.Typep(args[0], args[1]);
-            }));
+            });
+        // Two arguments, the common call, without an argument array.
+        typepFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject>)Runtime.Typep);
+        Emitter.CilAssembler.RegisterFunction("TYPEP", typepFn);
 
         // TYPEXPAND-1: one step of deftype expansion, returns (expanded-type . expanded?)
         Emitter.CilAssembler.RegisterFunction("TYPEXPAND-1", new LispFunction(Runtime.TypeExpand1));

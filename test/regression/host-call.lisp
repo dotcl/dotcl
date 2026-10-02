@@ -1,20 +1,17 @@
 ;;; DotclHost.Call: the host API a C# program uses to call into Lisp.
 ;;;
-;;; The string it takes is a SYMBOL NAME, matched exactly, and an unqualified
-;;; one means the current package. Neither half is obvious, and each replaced a
-;;; rule that read as convenience and behaved as a surprise:
+;;; The string it takes is read the way the Lisp reader reads a symbol token:
+;;; unescaped letters follow the current readtable's case, |...| and \ escape,
+;;; and PKG:NAME / PKG::NAME qualify, the package name read the same way. That
+;;; is one rule, the reader's, so a string means one thing: "fact" calls what
+;;; (defun fact ...) defined, "|fact|" a symbol whose name is lowercase.
 ;;;
-;;;   * Case folding ("greet" finding GREET) would be a second naming rule
-;;;     beside the reader's. Whichever way it leaned, one of GREET and |greet|
-;;;     becomes unreachable, or changes meaning the day the other is defined.
-;;;   * Searching every package for an unqualified name made a working call
-;;;     start failing as ambiguous the day an unrelated library defined the same
-;;;     name, and hid which package had answered.
-;;;
-;;; Both survive as hints in the error instead: a miss says which spelling and
-;;; which package would have worked. Neither participates in resolution, so what
-;;; a host string means does not depend on what else is loaded -- nor on the
-;;; readtable, since no reader runs over it.
+;;; An unqualified name means the current package and nothing else: searching
+;;; every package made a working call start failing as ambiguous the day an
+;;; unrelated library defined the same name, and hid which package had
+;;; answered. That survives as a hint in the error instead: a miss names the
+;;; packages that do have the function, and a symbol whose name differs only in
+;;; case, with the spelling that reaches it.
 
 (defpackage :hostcall-a (:use :cl) (:export #:entry))
 (defpackage :hostcall-b (:use :cl))
@@ -30,18 +27,33 @@
   (handler-case (progn (apply #'%host-call name args) :no-error)
     (error (e) (princ-to-string e))))
 
-;;; A name is matched exactly: the reader upcased GREET, so that is its name.
-(deftest host-call-name-is-exact
-  (%host-call "STRING-UPCASE" "abc")
-  "ABC")
+;;; Lower and upper case both read as the reader reads them: STRING-UPCASE.
+(deftest host-call-name-is-read
+  (list (%host-call "STRING-UPCASE" "abc")
+        (%host-call "string-upcase" "abc")
+        (%host-call "String-Upcase" "abc"))
+  ("ABC" "ABC" "ABC"))
 
-;;; The source spelling does not resolve -- and the message names the one that
-;;; does, because that is nearly always what the caller meant.
-(deftest host-call-lowercase-spelling-is-told-what-to-write
-  (let ((msg (%host-call-error "string-upcase" "abc")))
-    (list (and (search "no function named string-upcase" msg) t)
-          (and (search "\"STRING-UPCASE\" does exist" msg) t)))
-  (t t))
+;;; |...| keeps the case, so a lowercase symbol and its upcased namesake are
+;;; both reachable, each by the spelling the reader gives it.
+(defun |hostcall-lower| () :lower)
+(defun hostcall-lower () :upper)
+(deftest host-call-bars-keep-case
+  (list (%host-call "|hostcall-lower|")
+        (%host-call "hostcall-lower")
+        (%host-call "HOSTCALL-LOWER")
+        (%host-call "|HOSTCALL-LOWER|")
+        (%host-call "\\h\\o\\s\\t\\c\\a\\l\\l-\\l\\o\\w\\e\\r"))
+  (:lower :upper :upper :upper :lower))
+
+;;; A miss on a symbol whose name differs only in case says how to write it.
+(defun |hostcallMixed| () :mixed)
+(deftest host-call-miss-names-the-spelling
+  (let ((msg (%host-call-error "hostcallmixed")))
+    (list (and (search "no function named HOSTCALLMIXED" msg) t)
+          (and (search "hostcallMixed is written \"|hostcallMixed|\"" msg) t)
+          (%host-call "|hostcallMixed|")))
+  (t t :mixed))
 
 ;;; An unqualified name means the current package and nothing else. ENTRY lives
 ;;; in HOSTCALL-A, which CL-USER does not use.
@@ -51,11 +63,39 @@
           (and (search "defined in HOSTCALL-A" msg) t)))
   (t t))
 
-;;; Qualified names work, and one colon means the exported surface.
+;;; Qualified names work, the package name read like the symbol name, and one
+;;; colon means the exported surface.
 (deftest host-call-qualified
   (list (%host-call "HOSTCALL-A:ENTRY" 1)
-        (%host-call "HOSTCALL-B::OTHER" 2))
-  ("a:1" "b:2"))
+        (%host-call "HOSTCALL-B::OTHER" 2)
+        (%host-call "hostcall-a:entry" 3)
+        (%host-call "hostcall-b::other" 4)
+        (%host-call "|HOSTCALL-A|:|ENTRY|" 5))
+  ("a:1" "b:2" "a:3" "b:4" "a:5"))
+
+;;; Under a readtable whose case is not :UPCASE, the host string is read by that
+;;; readtable, as source text would be.
+(deftest host-call-readtable-case
+  (flet ((with-case (case &rest names)
+           (let ((*readtable* (copy-readtable nil)))
+             (setf (readtable-case *readtable*) case)
+             (mapcar #'%host-call names))))
+    (list (with-case :preserve "hostcall-lower" "HOSTCALL-LOWER")
+          (with-case :invert "hostcall-lower" "HOSTCALL-LOWER")
+          (with-case :downcase "HOSTCALL-LOWER" "|HOSTCALL-LOWER|")))
+  ((:lower :upper) (:upper :lower) (:lower :upper)))
+
+;;; Text that is not a symbol token is refused as such.
+(deftest host-call-not-a-symbol-name
+  (mapcar (lambda (name) (and (search "is not a symbol name" (%host-call-error name)) t))
+          '("a:b:c" "|open" "pkg:" ""))
+  (t t t t))
+
+;;; GetSpecial reads the name the same way.
+(deftest host-call-get-special-is-read
+  (list (dotnet:static "DotCL.DotclHost" "GetSpecial" "*print-base*")
+        (dotnet:static "DotCL.DotclHost" "GetSpecial" "cl:*print-base*"))
+  (10 10))
 
 ;;; A single colon on an internal symbol is refused, with the spelling that
 ;;; reaches it anyway.
@@ -71,9 +111,9 @@
   (let ((before (dotnet:static "DotCL.DotclHost" "CurrentPackage")))
     (unwind-protect
          (progn
-           (setf (dotnet:static "DotCL.DotclHost" "CurrentPackage") "HOSTCALL-A")
+           (setf (dotnet:static "DotCL.DotclHost" "CurrentPackage") "hostcall-a")
            (list (dotnet:static "DotCL.DotclHost" "CurrentPackage")
-                 (%host-call "ENTRY" "x")))
+                 (%host-call "entry" "x")))
       (setf (dotnet:static "DotCL.DotclHost" "CurrentPackage") before)))
   ("HOSTCALL-A" "a:x"))
 

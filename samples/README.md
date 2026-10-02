@@ -39,6 +39,17 @@ what each one shows and what has to be installed to build it.
   next call with no restart and no forbidden-edit list.
   Needs .NET SDK 10+; runs on Windows, Linux and macOS.
 
+## Writing platform components in Lisp
+
+- **[AndroidServiceLispSpike](AndroidServiceLispSpike/)**: an Android
+  `[Service]` and a launcher `[Activity]` written in Lisp and saved with
+  `dotnet:library` to a .dll, which the Android build scans like any other
+  assembly: the Java wrappers and dex entries come out the same way they do for
+  C#. A spike that stops at the build output; running on a device is not
+  covered yet.
+  Needs .NET SDK 10+ with the `android` workload (the emitting side loads the
+  runtime pack's `Mono.Android.dll`) and a JDK to build the consumer app.
+
 ## Shipping with no run-time code generation
 
 All three precompile Lisp at build time, so they need `compiler/cil-out.sil`

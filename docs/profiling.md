@@ -152,7 +152,11 @@ recorded for this platform in `bench/ratio-baseline.json`: a ratio above
 **1.2x** its recorded value fails the build, and so does the median of the
 cl-bench dotcl/SBCL ratios once a baseline for it exists. Ratios are keyed by
 platform because they are only reproducible on the machine they were measured
-on. A measurement with no recorded baseline is not judged, and its measured
+on. Two machines of one platform can differ by more than the threshold, so a
+machine can also have entries of its own, keyed `<platform>@<cpu>` with the CPU
+model as the Makefile's `BENCH_CPU` spells it (`make -pn bench-parity | grep
+^BENCH_CPU`); `make bench-parity` uses them when they exist and the plain
+`<platform>` entries otherwise. A measurement with no recorded baseline is not judged, and its measured
 ratio is printed in the format the file wants so it can be pasted in; the last
 line of output says how many measurements were judged and how many were not. A
 platform with no recorded baseline at all is reported as `UNJUDGED` and exits

@@ -27,7 +27,11 @@
     ;; arguments the ordinary way would try to call it. %MINI-EVAL has a case.
     "%DOTNET-CALL-DIRECT"
     ;; Takes C# source text to splice; there is nothing to call at run time.
-    "%INLINE-CS-SPLICED")
+    "%INLINE-CS-SPLICED"
+    ;; These three appear only in the bodies the compiler generates for the
+    ;; entries of a &key function, which it compiles itself; no macro expands
+    ;; into them, so the interpreter never meets them.
+    "%ABSENT-KEY" "%KEY-ABSENT-P" "%KEY-VALUE" "%CALL-KEY-SHARED")
   "Intrinsics that must NOT have a function binding, with the reason each.")
 
 (defun %ifb-handler-table ()

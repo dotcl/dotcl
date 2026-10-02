@@ -17,5 +17,5 @@
 
   "reblocks-parenscript": "Fails while loading `reblocks`, for the reason given on that row.",
 
-  "generic-cl": "Reaches a list-valued `defconstant` in a file that is compiled and loaded in one image, so the form runs twice and the second value is a freshly consed list rather than the same one. SBCL refuses that too; it never gets there because the file is only built on implementations without native CLTL2 environment access."
+  "april": "The Quicklisp dist's april release ships cape/cape.asd in its tarball but does not index it, so `(ql:quickload \"april\")` fails with `System \"cape\" not found` on SBCL as well. Loaded from the unpacked release tree instead, `(april (test))` passes 1140 of 1140 here."
 }

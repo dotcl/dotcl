@@ -155,7 +155,9 @@ failure is something deeper:
   `:label` are passed in the activity sample.
 - **Running the overrides needs the Lisp loaded.** A saved library's method
   bodies dispatch by type name and signature into a table that the emitting
-  process fills but the saved .dll does not carry. On the device the same Lisp
-  definitions have to be loaded before the first callback arrives.
+  process fills but the saved .dll does not carry. On the device the bodies have
+  to be installed before the first callback arrives, with
+  `dotnet:register-class-handlers` (same clauses as `define-class`, no type is
+  emitted).
 - **Debug builds do not embed assemblies in the APK.** They are deployed
   alongside it; `-p:EmbedAssembliesIntoApk=true` puts them inside.

@@ -18,8 +18,7 @@
       (error "cannot locate this process's executable")))
 
 (defvar *uif-core*
-  (or (ignore-errors (namestring (truename "compiler/cil-out.sil")))
-      "compiler/cil-out.sil"))
+  (regression-child-core))
 
 (defvar *uif-dir*
   (concatenate 'string (regression-temp-dir) "/user-init-file/"))

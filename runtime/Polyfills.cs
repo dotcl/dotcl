@@ -203,6 +203,9 @@ namespace System.Runtime.InteropServices
             return address != IntPtr.Zero;
         }
 
+        public static IntPtr GetMainProgramHandle()
+            => IsWindows ? Win_GetModuleHandle(null) : Unix_dlopen(null, 2 /* RTLD_NOW */);
+
         private static bool IsWindows => RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
         private static IntPtr PlatformLoad(string p) => IsWindows ? Win_LoadLibrary(p) : Unix_dlopen(p, 2 /* RTLD_NOW */);
         private static void PlatformFree(IntPtr h) { if (IsWindows) Win_FreeLibrary(h); else Unix_dlclose(h); }
@@ -214,9 +217,11 @@ namespace System.Runtime.InteropServices
         private static extern bool Win_FreeLibrary(IntPtr handle);
         [DllImport("kernel32", EntryPoint = "GetProcAddress", SetLastError = true, CharSet = CharSet.Ansi)]
         private static extern IntPtr Win_GetProcAddress(IntPtr handle, string name);
+        [DllImport("kernel32", EntryPoint = "GetModuleHandleA", SetLastError = true, CharSet = CharSet.Ansi)]
+        private static extern IntPtr Win_GetModuleHandle(string? name);
 
         [DllImport("libdl", EntryPoint = "dlopen", CharSet = CharSet.Ansi)]
-        private static extern IntPtr Unix_dlopen(string path, int flags);
+        private static extern IntPtr Unix_dlopen(string? path, int flags);
         [DllImport("libdl", EntryPoint = "dlclose")]
         private static extern int Unix_dlclose(IntPtr handle);
         [DllImport("libdl", EntryPoint = "dlsym", CharSet = CharSet.Ansi)]

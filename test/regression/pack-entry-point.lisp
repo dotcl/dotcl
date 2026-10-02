@@ -22,8 +22,7 @@
       (error "cannot locate this process's executable")))
 
 (defvar *pep-core*
-  (or (ignore-errors (namestring (truename "compiler/cil-out.sil")))
-      "compiler/cil-out.sil"))
+  (regression-child-core))
 
 (defun pep-path (name)
   (namestring (merge-pathnames name (truename *pep-dir*))))

@@ -405,3 +405,64 @@ A name that does not parse is treated as alive, so it is never deleted."
                    (when (or (null best) (< used best)) (setq best used))))))))
     (funcall fn 1000)                   ; warm: first-call JIT is not the subject
     (/ (- (sample big) (sample small)) (float (- big small)))))
+
+;;; --- The core a child dotcl process starts from ---
+;;;
+;;; Tests about the command line, pack and build start this executable again
+;;; and hand it a core. They used compiler/cil-out.sil, which the child then
+;;; assembles on every start (about 1.9 s each on an M1, and some files start
+;;; dozens of children); compiler/dotcl.core, the FASL form of the same core,
+;;; starts in about 0.2 s and is also what a released dotcl ships. The parent
+;;; still starts from --asm cil-out.sil, so loading a .sil core stays covered.
+;;;
+;;; No fallback to the .sil: a missing core stops the suite here, by name,
+;;; instead of silently timing a different start path. `make test-regression'
+;;; builds it (make compile-core-fasl by hand).
+(defun regression-child-core ()
+  (or (ignore-errors (namestring (truename "compiler/dotcl.core")))
+      (error "compiler/dotcl.core is missing; the child-process tests start from it (make compile-core-fasl)")))
+
+;;; --- Files the push run leaves out ---
+;;;
+;;; CI runs the suite in two tiers. The run on every push (DOTCL_REGRESSION_TIER
+;;; = "push") leaves out a few files that are slow, start child processes, and
+;;; have no record of catching a defect on a push: the
+;;; `dotcl pack' / `dotcl build' tests (the full run walks the pack path itself)
+;;; and the REPL tests that drive a child REPL through a pipe. The full run,
+;;; twice a day, loads them ("full"). Unset means full, so a run by hand loads
+;;; every file. Any other value is refused rather than guessed at.
+;;;
+;;; LOAD-FULL-TIER-ONLY loads PATH in the full tier. With :SKIP-UNDER-INTERP T
+;;; it behaves as LOAD-SKIP-UNDER-INTERP there instead of LOAD. In the push tier
+;;; it loads nothing and counts the file, and REGRESSION-TIER-SUMMARY prints the
+;;; count at the end of the run, so the push run says what it did not run.
+
+(defvar *full-tier-loaded-files* 0)
+(defvar *full-tier-skipped-files* 0)
+(defvar *full-tier-skipped-source-tests* 0)
+
+(defun regression-tier ()
+  (let ((tier (dotcl:getenv "DOTCL_REGRESSION_TIER")))
+    (cond ((or (null tier) (string= tier "") (string-equal tier "full")) :full)
+          ((string-equal tier "push") :push)
+          (t (error "DOTCL_REGRESSION_TIER is ~s; expected \"push\", \"full\" or unset" tier)))))
+
+(defun load-full-tier-only (path &key skip-under-interp)
+  (if (eq (regression-tier) :push)
+      (progn
+        (incf *full-tier-skipped-files*)
+        (incf *full-tier-skipped-source-tests* (%count-source-deftests path)))
+      (progn
+        (unless (and skip-under-interp (interpret-mode-p))
+          (incf *full-tier-loaded-files*))
+        (if skip-under-interp
+            (load-skip-under-interp path)
+            (load path))))
+  t)
+
+(defun regression-tier-summary ()
+  (print (list 'REGRESSION-TIER (regression-tier)
+               'FULL-TIER-FILES-LOADED *full-tier-loaded-files*
+               'FULL-TIER-FILES-SKIPPED *full-tier-skipped-files*
+               'DEFTESTS-IN-SOURCE *full-tier-skipped-source-tests*))
+  t)

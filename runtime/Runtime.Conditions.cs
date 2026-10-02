@@ -14,6 +14,7 @@ public static partial class Runtime
     {
         if (obj is LispInstanceCondition lic) obj = lic.Instance;
         if (obj is not LispInstance inst) return Nil.Instance;
+        inst.EnsureCurrent();
         if (inst.Class.SlotIndex.TryGetValue(slotName, out int idx) && idx < inst.Slots.Length)
             return inst.Slots[idx] ?? Nil.Instance;
         // SlotIndex is the class's own layout; a slot inherited from a
@@ -35,6 +36,18 @@ public static partial class Runtime
         };
         return ConditionSystem.Error(new LispError(message));
     }
+
+    /// <summary>The text of a format control that is a string. A string is not only a
+    /// LispString: a character vector with a fill pointer, or a copy of one (COPY-SEQ
+    /// of an adjustable string, as a reader that collects characters returns), is a
+    /// string too, and must not be taken for some other object and printed as a
+    /// vector of characters. Null for anything else.</summary>
+    internal static string? FormatControlText(LispObject control) => control switch
+    {
+        LispString s => s.Value,
+        LispVector v when v.IsCharVector && v.Rank == 1 => v.ToCharString(),
+        _ => null
+    };
 
     public static LispObject LispErrorFormat(LispObject[] args)
     {
@@ -76,14 +89,29 @@ public static partial class Runtime
             simpleErr.FormatArguments = args.Length > 1 ? Runtime.List(args.SubArray(1)) : Nil.Instance;
             return ConditionSystem.Error(simpleErr);
         }
-        if (args[0] is not LispString fmt)
+        if (FormatControlText(args[0]) is not string fmtText)
             return ConditionSystem.Error(new LispError(args[0].ToString()));
         string message;
         try { message = ((LispString)Format(Nil.Instance, args)).Value; }
-        catch { message = fmt.Value; }
+        catch { message = fmtText; }
         var err = new LispError(message);
         err.ConditionTypeName = "SIMPLE-ERROR";
-        err.FormatControl = fmt;
+        err.FormatControl = args[0];
+        err.FormatArguments = Runtime.List(args.SubArray(1));
+        return ConditionSystem.Error(err);
+    }
+
+    /// <summary>Signal the SIMPLE-ERROR of METHOD-COMBINATION-ERROR / INVALID-METHOD-ERROR:
+    /// ARGS is (format-control . format-arguments), kept on the condition as given; the
+    /// rendered message is PREFIX followed by the formatted text.</summary>
+    internal static LispObject MethodCombinationSimpleError(string prefix, LispObject[] args)
+    {
+        string text;
+        try { text = ((LispString)Format(Nil.Instance, args)).Value; }
+        catch { text = FormatControlText(args[0]) ?? args[0].ToString(); }
+        var err = new LispError(prefix + text);
+        err.ConditionTypeName = "SIMPLE-ERROR";
+        err.FormatControl = args[0];
         err.FormatArguments = Runtime.List(args.SubArray(1));
         return ConditionSystem.Error(err);
     }
@@ -196,11 +224,11 @@ public static partial class Runtime
         if (condition is Symbol sym)
             return ConditionSystem.Signal(MakeConditionFromType(sym, Array.Empty<LispObject>()));
         // String format control => SIMPLE-CONDITION
-        if (condition is LispString fmtStr)
+        if (FormatControlText(condition) is string fmtText)
         {
-            var sc = new LispCondition(fmtStr.Value);
+            var sc = new LispCondition(fmtText);
             sc.ConditionTypeName = "SIMPLE-CONDITION";
-            sc.FormatControl = fmtStr;
+            sc.FormatControl = condition;
             sc.FormatArguments = Nil.Instance;
             return ConditionSystem.Signal(sc);
         }
@@ -221,11 +249,11 @@ public static partial class Runtime
             return ConditionSystem.Signal(MakeConditionFromType(sym, initargs));
         }
         // String message: preserve format control/arguments
-        var sc = new LispCondition(args[0].ToString());
+        var sc = new LispCondition(FormatControlText(args[0]) ?? args[0].ToString());
         sc.ConditionTypeName = "SIMPLE-CONDITION";
-        if (args[0] is LispString fmtStr)
+        if (FormatControlText(args[0]) != null)
         {
-            sc.FormatControl = fmtStr;
+            sc.FormatControl = args[0];
             sc.FormatArguments = Runtime.List(args.SubArray(1));
         }
         return ConditionSystem.Signal(sc);
@@ -381,8 +409,8 @@ public static partial class Runtime
                 if (k.Name == "FORMAT-CONTROL")
                 {
                     formatControl = initargs[i+1];
-                    if (initargs[i+1] is LispString fs)
-                        msg = fs.Value;
+                    if (FormatControlText(initargs[i+1]) is string fs)
+                        msg = fs;
                 }
                 else if (k.Name == "FORMAT-ARGUMENTS")
                 {
@@ -466,16 +494,12 @@ public static partial class Runtime
             return ConditionSystem.Warn(condObj);
         }
         // String format control => SIMPLE-WARNING
-        string message = msg switch
-        {
-            LispString s => s.Value,
-            _ => msg.ToString()
-        };
-        var warn = new LispWarning(message);
+        string? msgText = FormatControlText(msg);
+        var warn = new LispWarning(msgText ?? msg.ToString());
         warn.ConditionTypeName = "SIMPLE-WARNING";
-        if (msg is LispString fmtStr)
+        if (msgText != null)
         {
-            warn.FormatControl = fmtStr;
+            warn.FormatControl = msg;
             warn.FormatArguments = Nil.Instance;
         }
         return ConditionSystem.Warn(warn);
@@ -486,7 +510,7 @@ public static partial class Runtime
         SingleFloat sf => (double)sf.Value,
         Fixnum f => (double)f.Value,
         Bignum b => (double)b.Value,
-        Ratio r => (double)r.Numerator / (double)r.Denominator,
+        Ratio r => Arithmetic.RatioToDouble(r),
         _ => Convert.ToDouble(obj)
     };
 
@@ -523,7 +547,7 @@ public static partial class Runtime
                 throw new LispErrorException(new LispTypeError("WARN: condition type is not a subtype of WARNING", condObj, Startup.Sym("WARNING")));
             return ConditionSystem.Warn(condObj);
         }
-        if (args[0] is not LispString fmt)
+        if (FormatControlText(args[0]) is not string fmtText)
             return ConditionSystem.Warn(new LispWarning(args[0].ToString() ?? ""));
         // Render on demand, not here: the arguments are the caller's objects and
         // running the printer over them now would use the printer variables of the
@@ -531,10 +555,10 @@ public static partial class Runtime
         // must be the one whose bindings apply, or a cyclic argument prints forever.
         var warn = new LispWarning(() => {
             try { return ((LispString)Format(Nil.Instance, args)).Value; }
-            catch { return fmt.Value; }
+            catch { return fmtText; }
         });
         warn.ConditionTypeName = "SIMPLE-WARNING";
-        warn.FormatControl = fmt;
+        warn.FormatControl = args[0];
         warn.FormatArguments = Runtime.List(args.SubArray(1));
         return ConditionSystem.Warn(warn);
     }
@@ -552,17 +576,17 @@ public static partial class Runtime
                 var restArgs = args.Length > 2 ? args.SubArray(2) : Array.Empty<LispObject>();
 
                 string continueDescription;
-                if (continueFormatString is LispString cfs)
+                if (Runtime.FormatControlText(continueFormatString) is string cfsText)
                 {
                     try
                     {
                         var fmtResult = Runtime.Format(Nil.Instance,
-                            new LispObject[] { cfs }.Concat(restArgs).ToArray());
+                            new LispObject[] { continueFormatString }.Concat(restArgs).ToArray());
                         continueDescription = fmtResult is LispString ls ? ls.Value : fmtResult.ToString();
                     }
                     catch
                     {
-                        continueDescription = cfs.Value;
+                        continueDescription = cfsText;
                     }
                 }
                 else
@@ -583,9 +607,9 @@ public static partial class Runtime
                 {
                     condition = Runtime.MakeConditionFromType(sym, restArgs);
                 }
-                else if (datum is LispString errFmt)
+                else if (Runtime.FormatControlText(datum) is string template)
                 {
-                    string template = errFmt.Value;
+                    var errFmt = datum;
                     try
                     {
                         var fmtResult = Runtime.Format(Nil.Instance,
@@ -682,7 +706,10 @@ public static partial class Runtime
                 if (cond is LispInstanceCondition lic)
                     cond = lic.Instance;
                 if (cond is LispInstance inst && inst.Class.SlotIndex.TryGetValue("INSTANCE", out int idx))
+                {
+                    inst.EnsureCurrent();
                     return inst.Slots[idx] ?? Nil.Instance;
+                }
                 return Nil.Instance;
             }, "UNBOUND-SLOT-INSTANCE", -1));
 
@@ -715,6 +742,7 @@ public static partial class Runtime
         Startup.RegisterUnary("SIMPLE-CONDITION-FORMAT-CONTROL", obj => {
             if (obj is LispInstanceCondition lic)
             {
+                lic.Instance.EnsureCurrent();
                 if (lic.Instance.Class.SlotIndex.TryGetValue("FORMAT-CONTROL", out int idx)
                     && idx < lic.Instance.Slots.Length && lic.Instance.Slots[idx] != null)
                     return lic.Instance.Slots[idx]!;
@@ -723,6 +751,7 @@ public static partial class Runtime
             if (obj is LispCondition cond) return cond.FormatControl;
             if (obj is LispInstance inst)
             {
+                inst.EnsureCurrent();
                 if (inst.Class.SlotIndex.TryGetValue("FORMAT-CONTROL", out int idx)
                     && idx < inst.Slots.Length && inst.Slots[idx] != null)
                     return inst.Slots[idx]!;
@@ -733,6 +762,7 @@ public static partial class Runtime
         Startup.RegisterUnary("SIMPLE-CONDITION-FORMAT-ARGUMENTS", obj => {
             if (obj is LispInstanceCondition lic)
             {
+                lic.Instance.EnsureCurrent();
                 if (lic.Instance.Class.SlotIndex.TryGetValue("FORMAT-ARGUMENTS", out int idx)
                     && idx < lic.Instance.Slots.Length && lic.Instance.Slots[idx] != null)
                     return lic.Instance.Slots[idx]!;
@@ -741,6 +771,7 @@ public static partial class Runtime
             if (obj is LispCondition cond) return cond.FormatArguments;
             if (obj is LispInstance inst)
             {
+                inst.EnsureCurrent();
                 if (inst.Class.SlotIndex.TryGetValue("FORMAT-ARGUMENTS", out int idx)
                     && idx < inst.Slots.Length && inst.Slots[idx] != null)
                     return inst.Slots[idx]!;
@@ -934,6 +965,12 @@ public static partial class Runtime
             RestartClusterStack.DisassociateConditionRestarts(args[0], args[1]);
             return Nil.Instance;
         }, "%DISASSOCIATE-CONDITION-RESTARTS", 2));
+        Emitter.CilAssembler.RegisterFunction("%CONDITION-RESTARTS-MARK", new LispFunction(args =>
+            Fixnum.Make(RestartClusterStack.AssociationMark()), "%CONDITION-RESTARTS-MARK", 0));
+        Emitter.CilAssembler.RegisterFunction("%CONDITION-RESTARTS-RESTORE", new LispFunction(args => {
+            if (args[0] is Fixnum m) RestartClusterStack.TruncateAssociations((int)m.Value);
+            return Nil.Instance;
+        }, "%CONDITION-RESTARTS-RESTORE", 1));
         Emitter.CilAssembler.RegisterFunction("%TOP-CLUSTER-RESTARTS", new LispFunction(args => {
             return RestartClusterStack.GetTopClusterRestarts();
         }, "%TOP-CLUSTER-RESTARTS", 0));

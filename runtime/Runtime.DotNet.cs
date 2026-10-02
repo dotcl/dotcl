@@ -1362,6 +1362,14 @@ public static partial class Runtime
         }
     }
 
+    private static (Version version, bool prerelease) ParseFrameworkVersion(string dir)
+    {
+        var name = System.IO.Path.GetFileName(dir);
+        int dash = name.IndexOf('-');
+        var core = dash >= 0 ? name.Substring(0, dash) : name;
+        return (Version.TryParse(core, out var v) ? v : new Version(0, 0), dash >= 0);
+    }
+
     internal static string? FindSharedFrameworkDll(string assemblyName)
     {
         // RuntimeEnvironment.GetRuntimeDirectory() returns e.g.
@@ -1373,9 +1381,19 @@ public static partial class Runtime
                             System.IO.Path.GetDirectoryName(runtimeDir.TrimEnd('/', '\\')));
         if (sharedDir == null || !System.IO.Directory.Exists(sharedDir)) return null;
 
+        // Several versions of a framework can sit side by side, and the newest by
+        // string order is not the newest by version: "6.0.0-preview..." sorts
+        // after "10.0.12". Prefer the versions with the running runtime's major
+        // (what the framework resolver would bind), newest first, releases before
+        // prereleases of the same number.
+        int runtimeMajor = Environment.Version.Major;
         foreach (var fwDir in System.IO.Directory.GetDirectories(sharedDir))
         foreach (var verDir in System.IO.Directory.GetDirectories(fwDir)
-                                    .OrderByDescending(d => d))
+                                    .Select(d => (dir: d, ver: ParseFrameworkVersion(d)))
+                                    .OrderByDescending(x => x.ver.version.Major == runtimeMajor)
+                                    .ThenByDescending(x => x.ver.version)
+                                    .ThenBy(x => x.ver.prerelease)
+                                    .Select(x => x.dir))
         {
             var dll = System.IO.Path.Combine(verDir, assemblyName + ".dll");
             if (System.IO.File.Exists(dll)) return dll;
@@ -3540,6 +3558,93 @@ public static partial class Runtime
 #endif
     }
 
+    /// <summary>(dotnet:%register-class-handlers "Full.Name" &amp;optional ...)
+    /// Takes the same positional arguments as dotnet:%define-class (a trailing
+    /// save-to-path is ignored) but defines no type: it only installs the Lisp
+    /// bodies under the dispatch keys the type's methods and constructors call
+    /// with. This is how a saved facade assembly, emitted in another process and
+    /// loaded here, reaches its Lisp bodies. It needs no emit, so it works on the
+    /// emit-free runtime. Only the method specs (name, param types, body), the
+    /// single ctor body and the ctor specs are read; the other slots may be
+    /// anything %define-class accepts and are not resolved. Returns the full name.</summary>
+    public static LispObject DotNetRegisterClassHandlers(LispObject[] a)
+    {
+        if (a.Length < 1 || a.Length > 13)
+            throw new LispErrorException(new LispProgramError(
+                "DOTNET:%REGISTER-CLASS-HANDLERS: requires 1-13 arguments (the dotnet:%define-class arguments)"));
+        string fullName = NameArg(a[0]);
+        var handlers = new List<(string, LispObject)>();
+
+        List<Type> ParamTypes(LispObject list)
+        {
+            var types = new List<Type>();
+            var cur = list;
+            while (cur is Cons c)
+            {
+                types.Add(ResolveDotNetType(NameArg(c.Car)));
+                cur = c.Cdr;
+            }
+            return types;
+        }
+
+        // arg 4: method specs (name return-type (param-types) lambda ...).
+        if (a.Length >= 5)
+        {
+            var cur = a[4];
+            while (cur is Cons c)
+            {
+                if (c.Car is not Cons spec || spec.Cdr is not Cons r1
+                    || r1.Cdr is not Cons r2 || r2.Cdr is not Cons r3)
+                    throw new LispErrorException(new LispTypeError(
+                        "DOTNET:%REGISTER-CLASS-HANDLERS: each method spec must be a (name return-type (param-types) lambda) list",
+                        c.Car));
+                if (r3.Car is not LispFunction)
+                    throw new LispErrorException(new LispTypeError(
+                        "DOTNET:%REGISTER-CLASS-HANDLERS: method body must be a function", r3.Car));
+                handlers.Add((Emitter.DynamicClassBuilder.MethodDispatchKey(
+                    NameArg(spec.Car), ParamTypes(r2.Car)), r3.Car));
+                cur = c.Cdr;
+            }
+        }
+
+        // arg 5: single ctor body. The single-ctor path dispatches under the bare
+        // ctor key whatever its parameter types are.
+        if (a.Length >= 6 && a[5] != Nil.Instance)
+        {
+            if (a[5] is not LispFunction)
+                throw new LispErrorException(new LispTypeError(
+                    "DOTNET:%REGISTER-CLASS-HANDLERS: ctor-body must be a function", a[5]));
+            handlers.Add((Emitter.DynamicClassBuilder.CtorKey, a[5]));
+        }
+
+        // arg 11: ctor specs (lambda param-types base-arg-indices); a NIL lambda
+        // is a ctor that only forwards to base and dispatches nothing.
+        if (a.Length >= 12)
+        {
+            var cur = a[11];
+            while (cur is Cons c)
+            {
+                if (c.Car is not Cons spec)
+                    throw new LispErrorException(new LispTypeError(
+                        "DOTNET:%REGISTER-CLASS-HANDLERS: each ctor-spec must be a (lambda param-types base-arg-indices) list",
+                        c.Car));
+                if (spec.Car != Nil.Instance)
+                {
+                    if (spec.Car is not LispFunction)
+                        throw new LispErrorException(new LispTypeError(
+                            "DOTNET:%REGISTER-CLASS-HANDLERS: ctor-spec body must be a function or nil", spec.Car));
+                    var types = spec.Cdr is Cons r1 ? ParamTypes(r1.Car) : new List<Type>();
+                    handlers.Add((Emitter.DynamicClassBuilder.MethodDispatchKey(
+                        Emitter.DynamicClassBuilder.CtorKey, types), spec.Car));
+                }
+                cur = c.Cdr;
+            }
+        }
+
+        Emitter.DynamicClassBuilder.RegisterHandlers(fullName, handlers);
+        return new LispString(fullName);
+    }
+
     /// <summary>(dotnet:%save-library save-path assembly-name version member-spec-list)
     /// Emit a saved, C#-referenceable library .dll aggregating MANY types into
     /// one assembly (the aggregation unit a single %define-class cannot express).
@@ -4091,8 +4196,11 @@ public static partial class Runtime
         // works on a non-binary socket stream. No read-ahead, so char and byte reads
         // stay coordinated; UTF-8 with no BOM.
         if (bivalent)
+        {
+            var bw = new BivalentStreamWriter(netStream);
             return new LispBidirectionalStream(
-                new BivalentStreamReader(netStream), new BivalentStreamWriter(netStream));
+                new BivalentStreamReader(netStream) { Partner = bw }, bw);
+        }
 
         // BOM-less UTF-8 (encoderShouldEmitUTF8Identifier: false). Encoding.UTF8 emits a
         // BOM (EF BB BF) on the first write, which corrupts the head of a network/protocol
@@ -4108,14 +4216,14 @@ public static partial class Runtime
         // or close.
         if (!netStream.CanWrite)
             return new LispInputStream(
-                new System.IO.StreamReader(netStream, encoding, false, 4096, leaveOpen: true));
+                new System.IO.StreamReader(netStream, encoding, false, 4096, leaveOpen: false));
         if (!netStream.CanRead)
             return new LispOutputStream(
-                new System.IO.StreamWriter(netStream, encoding, 4096, leaveOpen: true)
+                new System.IO.StreamWriter(netStream, encoding, 4096, leaveOpen: false)
                 { AutoFlush = false });
 
-        var reader = new System.IO.StreamReader(netStream, encoding, false, 4096, leaveOpen: true);
-        var writer = new System.IO.StreamWriter(netStream, encoding, 4096, leaveOpen: true)
+        var reader = new System.IO.StreamReader(netStream, encoding, false, 4096, leaveOpen: false);
+        var writer = new System.IO.StreamWriter(netStream, encoding, 4096, leaveOpen: false)
         {
             AutoFlush = false
         };
@@ -4282,10 +4390,22 @@ public static partial class Runtime
             if (!ForeignCallbackPropagates()) return HandleForeignCallbackError(cond);
             propagate = cond;
         }
-        catch (LispErrorException ex)
+        catch (LispErrorException ex) when (ex.Condition is not LispStorageCondition)
         {
             // A LispErrorException that bypassed the handler-bind (e.g. signaled with
-            // no ERROR match, or thrown directly) is still handled at the boundary.
+            // no ERROR match, or thrown directly) is still handled at the boundary --
+            // unless it is stack exhaustion. This boundary keeps Lisp errors out of
+            // the host, and a STORAGE-CONDITION is not one (CLHS puts it beside ERROR
+            // under SERIOUS-CONDITION). Containing it answered the host with the
+            // return type's default and let the recursion that ran out of stack carry
+            // on as if nothing had happened.
+            //
+            // A filter, not a catch-and-rethrow: the condition may have to cross
+            // thousands of these boundaries on its way out (a recursion that goes
+            // through a delegate at every level), and catching and rethrowing at each
+            // restarts the dispatch every time -- which itself ran out of stack and
+            // took the process down. The filter is a type test, so it is safe to run
+            // where the stack is exhausted.
             if (!ForeignCallbackPropagates()) return HandleForeignCallbackError(ex.Condition);
             propagate = ex.Condition;
         }

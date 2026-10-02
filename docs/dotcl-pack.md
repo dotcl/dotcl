@@ -48,7 +48,11 @@ dotcl pack --system hello --id hello-tool --command hello --version 0.1.0 \
 - `--command` -- the command your users will type.
 - `--version` -- your tool's version. Optional: it defaults to the `:version` in
   your `.asd`, so a project with a version there does not have to repeat it
-  here. Pass it to override that, as a nightly build would.
+  here. Pass it to override that, as a nightly build would. ASDF accepts
+  versions NuGet cannot serve, such as `1.2.3.4.5` (NuGet takes at most four
+  numbers, each within a 32-bit integer). When the `.asd`'s version is one of
+  those, pack warns and still writes the package; installing it would then
+  report the package as not found, so pass `--version` instead.
 - `-o` -- output directory.
 - `--from` -- the directory of dotcl runtime packages (above).
 - `--dotcl-version` -- which dotcl version in `--from` to build on. Optional:
@@ -232,40 +236,130 @@ The flags override the `.asd` where you want something else:
 
 ## Shipping NuGet packages
 
-An application that calls `nuget:require` resolves by running `dotnet build` on a
+An application that calls `nuget:require` resolves by running `dotnet` on a
 throwaway project. That is fine while you develop and wrong for something you
 hand to someone else: it wants the .NET SDK and the network, and neither is
 promised on the machine your tool is installed on.
 
-Ship the packages instead. `nuget:cache-root` names the directory where a
-resolved package was laid out, one subdirectory per request:
+A system that declares its packages with `(:nuget ...)` components needs nothing
+more: `dotcl pack` lays out what the system declares for each platform it packs
+for, at the versions the project's lock file records, and carries the result
+beside the executable. See [.NET packages](libraries.md#net-packages).
+
+For packages your program asks for with `nuget:require`, stage them yourself:
+resolve them in an image, then `nuget:stage-bundle` copies what that image laid
+out into `<bundle>/nuget/`, and you pass `--bundle <bundle>`:
 
 ```lisp
 (require "dotcl-nuget")
-(nuget:resolve "Newtonsoft.Json" :version "13.0.3")
-(nuget:cache-root)
-;; => ".../cache/dotcl-nuget"    with "Newtonsoft.Json_13.0.3_win-arm64_net10.0" inside
+(nuget:require "Newtonsoft.Json" :version "13.0.3")
+(nuget:stage-bundle "mybundle")          ; or (nuget:stage-bundle "mybundle" "win-x64")
+;; => 1     mybundle/nuget/<rid>_<tfm>_<hash>/ now holds the layout
 ```
 
-Copy the subdirectories you need into `<bundle>/nuget/` and pass `--bundle
-<bundle>`. At run time dotcl looks beside the executable first, finds the layout,
-and registers it without building anything:
+At run time dotcl looks beside the executable first. Each bundled layout carries
+a `dotcl-nuget-complete` file listing the requests it answers, version specs as
+written; a request listed there is answered from the bundle without building
+anything. A bundled layout is used even when the program asks for a floating
+version (`"13.*"`, or no `:version` at all): a program that has been installed
+somewhere should not go and find out what is newest; what it shipped with is
+the answer.
 
+## Packaging a library (`--library`)
+
+`dotcl pack --library` packages an ASDF system for other dotcl programs to use,
+rather than as a command:
+
+```sh
+dotcl --asd-search-path . pack --library --system my-lib -o out/
+# pack: wrote  out/my-lib.1.0.0.nupkg
 ```
-mybundle/
-  nuget/
-    Newtonsoft.Json_13.0.3_win-arm64_net10.0/
+
+Only `--system` and `-o` are required. The id defaults to the system name
+(`--id` to change it), the version to the `.asd`'s `:version`, and the metadata
+options above apply as they do to a tool package: `:license` becomes the
+package's license expression, a `README.md` beside the `.asd` is embedded.
+
+The package carries the system and every system it depends on that dotcl does
+not supply itself, so it loads with nothing else installed. Each directory
+holding one of their `.asd` files goes in whole under `dotcl/<name>/` (dot
+files, compiled files and the output directory left out), together with the
+fasls compiled from the sources and a note of which dotcl compiled them. The
+`(:nuget ...)` components of the packed systems become the package's own
+dependencies, so their versions must be exact or ranges, not floating.
+
+`--r2r` adds a ReadyToRun image of every fasl for the platform you pack on,
+compiled against the running dotcl. With `--from <dir>` it adds the other
+platforms in `--rids` (default: the six desktop RIDs) as well, compiled against
+the dotcl packages in `<dir>` as for a tool -- pack with the same dotcl as those
+packages.
+
+Another system uses it by declaring it:
+
+```lisp
+(defsystem "my-app"
+  :defsystem-depends-on ("dotcl-nuget-asdf")
+  :serial t
+  :components ((:nuget "my-lib" :nuget-version "1.0.0")
+               (:file "app")))
 ```
 
-The name of each subdirectory identifies the request -- package, version, RID and
-target framework -- so ship the one for the RID you are packaging for.
+Loading `my-app` resolves the package (see [.NET packages](libraries.md#net-packages)
+for the lock file), puts its systems where ASDF finds them, and loads the
+system the package was made for before the components that come after the
+`:nuget` one, so `:depends-on ("my-lib")` is not needed. When the running dotcl
+is the one that compiled the package, its fasls and ReadyToRun images are used
+as they are; any other dotcl compiles the sources, which are always included,
+and says so once.
 
-A bundled layout is used even when the program asks for a floating version
-(`"13.*"`, or no `:version` at all). Floating means "whatever is newest", and a
-program that has been installed somewhere should not go and find out; what it
-shipped with is the answer. Outside a bundle the rule is the opposite: a floating
-request is resolved afresh every time, and only an exact version is reused from
-the cache.
+### Example: Coalton
+
+[Coalton](https://github.com/coalton-lang/coalton) is a large library (about 300
+files across 22 systems) that takes minutes to compile. Packaged once, it loads
+from a NuGet feed with no compiler run and no Quicklisp:
+
+1. Make Coalton and its dependencies visible to ASDF and package it with
+   `--r2r`, so that every file also gets its ahead-of-time compiled image. With
+   a Coalton checkout and the Quicklisp home dotcl sets up (see
+   [Making a dependency visible](#making-a-dependency-visible)):
+
+   ```sh
+   Q=~/.local/share/dotcl/quicklisp/dists
+   export CL_SOURCE_REGISTRY="(:source-registry (:tree \"$PWD/coalton/\") \
+     (:tree \"$Q/dotcl/software/\") (:tree \"$Q/quicklisp/software/\") \
+     :ignore-inherited-configuration)"
+   dotcl pack --library --system coalton --version 0.1.0 -o feed/ --r2r
+   ```
+
+   This compiles Coalton once (about three minutes) and writes
+   `feed/coalton.0.1.0.nupkg`.
+2. Put the `.nupkg` on a feed (a directory is enough).
+3. In the application, declare it:
+
+   ```lisp
+   (defsystem "coalton-app"
+     :defsystem-depends-on ("dotcl-nuget-asdf")
+     :serial t
+     :components ((:nuget "coalton" :nuget-version "<version>"
+                   :source "<feed>")
+                  (:file "app")))
+   ```
+
+`app.lisp` can then use Coalton right away. Measured numbers are in the table
+below.
+
+| Loading Coalton (`fib 20` afterwards) | wall time | peak memory |
+| --- | --- | --- |
+| compiled from source (Quicklisp, Coalton's own files) | 125 s | 0.93 GB |
+| from the package, ReadyToRun images used | 18-19 s | 0.62 GB |
+| from the package, `DOTCL_NO_R2R_FASL=1` | 33 s | 0.74 GB |
+
+(Apple M1, 16 GB, a Release build of dotcl. The first load from the
+package also resolves it and lays it out, which added about 5 seconds.
+The package is about 110 MB.)
+
+At the time of writing Coalton needs one small dotcl-specific change that is not
+yet upstream: its hash type and hash combination have no branch for dotcl.
 
 ## How it works
 

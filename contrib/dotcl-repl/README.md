@@ -114,7 +114,7 @@ form on every key anyway, so it asks the terminal nothing. It is shown only
 when the REPL paints (not with `--color=never`, `NO_COLOR` or `TERM=dumb`), and
 the line sent with Enter is left unpainted.
 
-The redraw also colours strings (green), comments (grey) and keywords
+The redraw also colours strings (green), comments (faint) and keywords
 (magenta) as you type, with the same scan: what it steps over as a string or a
 comment is what it colours as one. The colours stay on the line after Enter.
 `(setf dotcl-repl:*syntax-highlight* nil)` in the init file, after

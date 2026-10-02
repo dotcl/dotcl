@@ -279,12 +279,14 @@ public sealed class LispProcess : LispObject
     /// <summary>Spawn PROGRAM with ARGUMENTS, wiring stdin/stdout/stderr per the
     /// given redirection specs. File dispositions are validated up front so errors
     /// surface synchronously (before the child runs), as the other implementations rely on.
-    /// NOTE: character streams only: :element-type (unsigned-byte 8) is not yet handled.</summary>
+    /// With BINARY (:element-type (unsigned-byte 8)) a :stream target is a byte stream
+    /// on the pipe itself, for READ-BYTE / WRITE-BYTE / WRITE-SEQUENCE of octets.</summary>
     public static LispProcess Launch(
         string program, System.Collections.Generic.List<string> arguments, string? directory,
         LispObject input, LispObject output, LispObject error,
         LispObject ifInputDoesNotExist, LispObject ifOutputExists, LispObject ifErrorOutputExists,
-        System.Collections.Generic.List<string>? environment = null)
+        System.Collections.Generic.List<string>? environment = null,
+        System.Text.Encoding? encoding = null, bool binary = false)
     {
         // uiop normalizes :error-output :output to the :output keyword: send the
         // child's stderr to the same destination as its stdout (like shell 2>&1).
@@ -295,13 +297,31 @@ public sealed class LispProcess : LispObject
         if (FilePath(output) is string outPath0) CheckOutputExists(outPath0, ifOutputExists);
         if (!mergeErr && FilePath(error) is string errPath0) CheckOutputExists(errPath0, ifErrorOutputExists);
 
-        var psi = MakeStartInfo(program, arguments);
+        // On Unix a file or null target is given to the child as the descriptor
+        // itself (see UnixDirectStartInfo); only :stream targets use pipes. On
+        // Windows every redirected target goes through a pipe and a copy thread.
+        bool unixDirect = !Compat.IsWindows();
+        bool inDirect = unixDirect && IsFdTarget(input);
+        bool outDirect = unixDirect && IsFdTarget(output);
+        bool errDirect = unixDirect && (mergeErr ? outDirect : IsFdTarget(error));
+
+        var psi = (inDirect || outDirect || errDirect)
+            ? UnixDirectStartInfo(program, arguments, directory, environment,
+                                  input, output, error, mergeErr, ifOutputExists, ifErrorOutputExists)
+            : MakeStartInfo(program, arguments);
         psi.UseShellExecute = false;
         psi.CreateNoWindow = true;
-        psi.RedirectStandardInput = !IsInherit(input);
-        psi.RedirectStandardOutput = !outInherit;
-        psi.RedirectStandardError = mergeErr ? !outInherit : !IsInherit(error);
+        psi.RedirectStandardInput = !IsInherit(input) && !inDirect;
+        psi.RedirectStandardOutput = !outInherit && !outDirect;
+        psi.RedirectStandardError = !errDirect && (mergeErr ? !outInherit : !IsInherit(error));
         if (!string.IsNullOrEmpty(directory)) psi.WorkingDirectory = directory;
+        // The child's pipes use ENCODING when one was given (:external-format), else
+        // the .NET default. The setters are only legal on a redirected stream.
+        if (encoding != null)
+        {
+            if (psi.RedirectStandardOutput) psi.StandardOutputEncoding = encoding;
+            if (psi.RedirectStandardError) psi.StandardErrorEncoding = encoding;
+        }
         if (environment != null)
         {
             // sb-ext:run-program :environment semantics: the "VAR=value" list
@@ -321,8 +341,14 @@ public sealed class LispProcess : LispObject
         LispObject inStream = Nil.Instance, outStream = Nil.Instance, errStream = Nil.Instance;
 
         // --- stdin ---
-        if (IsKw(input, "STREAM"))
-            inStream = new LispOutputStream(proc.StandardInput);
+        if (IsKw(input, "STREAM") && binary)
+            inStream = new LispBinaryStream(proc.StandardInput.BaseStream);
+        else if (IsKw(input, "STREAM"))
+            // ProcessStartInfo.StandardInputEncoding is missing on netstandard2.0,
+            // so the encoding is applied by writing through our own writer.
+            inStream = new LispOutputStream(encoding == null ? proc.StandardInput
+                : new System.IO.StreamWriter(proc.StandardInput.BaseStream, encoding) { AutoFlush = true });
+        else if (inDirect) { }
         else if (FilePath(input) is string inPath)
             helpers.Add(Spawn("dotcl-feed-stdin", () => {
                 // Copy the file's bytes as they are, as SBCL does when it hands the
@@ -346,25 +372,192 @@ public sealed class LispProcess : LispObject
         {
             // stderr shares stdout's destination. When stdout is inherited, stderr is
             // inherited too (neither redirected), so there is nothing to wire.
-            if (!outInherit)
-                outStream = WireMergedOutput(output, ifOutputExists, proc, helpers,
+            if (!outInherit && !outDirect)
+                outStream = WireMergedOutput(output, ifOutputExists, encoding, proc, helpers,
                                              () => proc.StandardOutput, () => proc.StandardError);
         }
         else
         {
             // --- stdout ---
-            outStream = WireOutput(output, ifOutputExists, "dotcl-drain-stdout",
-                                   () => proc.StandardOutput, proc, helpers);
+            if (!outDirect)
+                outStream = binary && IsKw(output, "STREAM")
+                    ? new LispBinaryStream(proc.StandardOutput.BaseStream)
+                    : WireOutput(output, ifOutputExists, encoding, "dotcl-drain-stdout",
+                                 () => proc.StandardOutput, proc, helpers);
             // --- stderr ---
-            errStream = WireOutput(error, ifErrorOutputExists, "dotcl-drain-stderr",
-                                   () => proc.StandardError, proc, helpers);
+            if (!errDirect)
+                errStream = binary && IsKw(error, "STREAM")
+                    ? new LispBinaryStream(proc.StandardError.BaseStream)
+                    : WireOutput(error, ifErrorOutputExists, encoding, "dotcl-drain-stderr",
+                                 () => proc.StandardError, proc, helpers);
         }
 
         return new LispProcess(proc, inStream, outStream, errStream, helpers);
     }
 
+    /// <summary>A file or null (discard / no input) target, which on Unix the
+    /// child gets as the descriptor itself.</summary>
+    private static bool IsFdTarget(LispObject spec) => spec is Nil || FilePath(spec) != null;
+
+    /// <summary>Unix: a start info that runs PROGRAM through
+    /// <c>/bin/sh -c 'exec REDIRECTIONS; shift N; exec "$@"'</c>, so each file or
+    /// null target is opened by the shell and the program inherits that descriptor,
+    /// as with SBCL. With a pipe and a copy thread instead, waiting for the child
+    /// meant waiting for EOF on the pipe, which a backgrounded grandchild that
+    /// inherited it (<c>cmd &amp;</c>) could hold open indefinitely.
+    ///
+    /// What the caller sees is kept as it was with a direct start:
+    /// - the arguments reach the program unchanged: file names and the arguments
+    ///   are positional parameters, never parsed by the shell;
+    /// - the second exec replaces the shell, so the pid, the exit code and signals
+    ///   are the program's own;
+    /// - a program that cannot be started is reported here, before anything runs,
+    ///   with the error Process.Start gives, from the same resolution .NET uses;
+    /// - output files are created (or truncated / opened for append) here first,
+    ///   so a file that cannot be opened signals as before.
+    /// The program is named to the shell as it was given (so argv[0] is kept)
+    /// whenever the shell's PATH search finds the same file, else by full path.</summary>
+    private static System.Diagnostics.ProcessStartInfo UnixDirectStartInfo(
+        string program, System.Collections.Generic.IList<string> arguments,
+        string? directory, System.Collections.Generic.List<string>? environment,
+        LispObject input, LispObject output, LispObject error, bool mergeErr,
+        LispObject ifOutputExists, LispObject ifErrorOutputExists)
+    {
+        var execName = ResolveForExec(program, directory, environment);
+        var files = new System.Collections.Generic.List<string>();
+        var redirs = new System.Text.StringBuilder();
+        string Pos(string path) { files.Add(path); return "\"$" + files.Count + "\""; }
+        void Out(string fd, LispObject spec, LispObject ifExists)
+        {
+            if (FilePath(spec) is string path)
+            {
+                bool append = IsKw(ifExists, "APPEND");
+                new System.IO.FileStream(path, append ? System.IO.FileMode.Append : System.IO.FileMode.Create,
+                                         System.IO.FileAccess.Write, System.IO.FileShare.ReadWrite).Dispose();
+                redirs.Append(' ').Append(fd).Append(append ? ">>" : ">").Append(Pos(path));
+            }
+            else if (spec is Nil)
+                redirs.Append(' ').Append(fd).Append(">/dev/null");
+        }
+        if (FilePath(input) is string inPath)
+        {
+            // An input file that cannot be read gave the child EOF before: keep that.
+            bool readable;
+            try
+            {
+                new System.IO.FileStream(inPath, System.IO.FileMode.Open, System.IO.FileAccess.Read,
+                                         System.IO.FileShare.ReadWrite).Dispose();
+                readable = true;
+            }
+            catch (System.Exception) { readable = false; }
+            redirs.Append(readable ? " <" + Pos(inPath) : " </dev/null");
+        }
+        else if (input is Nil)
+            redirs.Append(" </dev/null");
+        Out("", output, ifOutputExists);
+        if (mergeErr)
+        {
+            if (IsFdTarget(output)) redirs.Append(" 2>&1");
+        }
+        else
+            Out("2", error, ifErrorOutputExists);
+
+        var script = "exec" + redirs + (files.Count > 0 ? "; shift " + files.Count : "") + "; exec \"$@\"";
+        var shArgs = new System.Collections.Generic.List<string> { "-c", script, "sh" };
+        shArgs.AddRange(files);
+        shArgs.Add(execName);
+        shArgs.AddRange(arguments);
+        return MakeStartInfo("/bin/sh", shArgs);
+    }
+
+    [System.Runtime.InteropServices.DllImport("libc", SetLastError = true, EntryPoint = "access")]
+    private static extern int access_(string path, int mode);
+
+    private static bool IsExecutableFile(string path)
+    {
+        if (!System.IO.File.Exists(path)) return false;
+        try { return access_(path, 1 /* X_OK */) == 0; }
+        catch (System.Exception) { return true; }
+    }
+
+    private static string? FindInPath(string name, string? pathVar)
+    {
+        if (pathVar == null) return null;
+        foreach (var dir in pathVar.Split(':'))
+        {
+            if (dir.Length == 0) continue;
+            string cand;
+            try { cand = System.IO.Path.Combine(dir, name); }
+            catch (System.ArgumentException) { continue; }
+            if (IsExecutableFile(cand)) return cand;
+        }
+        return null;
+    }
+
+    /// <summary>The name to hand the shell's exec for PROGRAM, after resolving it
+    /// the way Process.Start does on Unix (as given if rooted; else next to the
+    /// running executable, then in the current directory, then on PATH) and
+    /// failing the way it fails when execve would.</summary>
+    private static string ResolveForExec(string program, string? directory,
+                                         System.Collections.Generic.List<string>? environment)
+    {
+        var cwd = directory ?? System.IO.Directory.GetCurrentDirectory();
+        System.Exception Fail(int errno) => new System.ComponentModel.Win32Exception(errno,
+            $"An error occurred trying to start process '{program}' with working directory '{cwd}'. "
+            + new System.ComponentModel.Win32Exception(errno).Message);
+        const int ENOENT = 2, EACCES = 13;
+        if (directory != null && !System.IO.Directory.Exists(directory)) throw Fail(ENOENT);
+
+        string? resolved = null;
+        if (System.IO.Path.IsPathRooted(program)) resolved = program;
+        else
+        {
+            var exe = Compat.ProcessPath();
+            if (exe != null)
+            {
+                try
+                {
+                    var p = System.IO.Path.Combine(System.IO.Path.GetDirectoryName(exe)!, program);
+                    if (System.IO.File.Exists(p)) resolved = p;
+                }
+                catch (System.ArgumentException) { }
+            }
+            if (resolved == null)
+            {
+                var p = System.IO.Path.Combine(System.IO.Directory.GetCurrentDirectory(), program);
+                if (System.IO.File.Exists(p)) resolved = p;
+            }
+            resolved ??= FindInPath(program, System.Environment.GetEnvironmentVariable("PATH"));
+        }
+        if (resolved == null) throw Fail(ENOENT);
+        if (System.IO.Directory.Exists(resolved)) throw Fail(EACCES);
+        if (!System.IO.File.Exists(resolved)) throw Fail(ENOENT);
+        if (!IsExecutableFile(resolved)) throw Fail(EACCES);
+
+        // Does the shell's own lookup land on the same file?
+        string? shFinds;
+        if (System.IO.Path.IsPathRooted(program)) shFinds = program;
+        else if (program.IndexOf('/') >= 0)
+            shFinds = System.IO.Path.GetFullPath(System.IO.Path.Combine(cwd, program));
+        else
+        {
+            string? childPath = System.Environment.GetEnvironmentVariable("PATH");
+            if (environment != null)
+            {
+                childPath = null;
+                foreach (var kv in environment)
+                    if (kv.StartsWith("PATH=", System.StringComparison.Ordinal)) childPath = kv.Substring(5);
+            }
+            shFinds = FindInPath(program, childPath);
+        }
+        // A name starting with '-' would be taken as an option of exec.
+        return shFinds != null && !program.StartsWith("-", System.StringComparison.Ordinal)
+               && System.IO.Path.GetFullPath(shFinds) == System.IO.Path.GetFullPath(resolved)
+            ? program : System.IO.Path.GetFullPath(resolved);
+    }
+
     private static LispObject WireOutput(
-        LispObject spec, LispObject ifExists, string threadName,
+        LispObject spec, LispObject ifExists, System.Text.Encoding? encoding, string threadName,
         System.Func<System.IO.TextReader> source, System.Diagnostics.Process proc,
         System.Collections.Generic.List<System.Threading.Thread> helpers)
     {
@@ -372,7 +565,7 @@ public sealed class LispProcess : LispObject
             return new LispInputStream(new ProcessStreamReader(source(), proc));
         if (FilePath(spec) is string path)
         {
-            var w = new System.IO.StreamWriter(path, append: IsKw(ifExists, "APPEND"));
+            var w = OpenRedirectFile(path, IsKw(ifExists, "APPEND"), encoding);
             helpers.Add(Spawn(threadName, () => { using (w) Copy(source(), w); }));
         }
         else if (!IsInherit(spec))   // nil: drain & discard so a full pipe can't block the child
@@ -385,7 +578,7 @@ public sealed class LispProcess : LispObject
     /// pipes appended under a lock; nil drains both to null. Caller guarantees the
     /// destination (stdout spec) is redirected (not inherited).</summary>
     private static LispObject WireMergedOutput(
-        LispObject spec, LispObject ifExists, System.Diagnostics.Process proc,
+        LispObject spec, LispObject ifExists, System.Text.Encoding? encoding, System.Diagnostics.Process proc,
         System.Collections.Generic.List<System.Threading.Thread> helpers,
         System.Func<System.IO.TextReader> stdoutSrc, System.Func<System.IO.TextReader> stderrSrc)
     {
@@ -393,7 +586,7 @@ public sealed class LispProcess : LispObject
             return new LispInputStream(new ProcessStreamReader(proc, stdoutSrc(), stderrSrc()));
         if (FilePath(spec) is string path)
         {
-            var w = new System.IO.StreamWriter(path, append: IsKw(ifExists, "APPEND"));
+            var w = OpenRedirectFile(path, IsKw(ifExists, "APPEND"), encoding);
             var wlock = new object();
             int pending = 2;
             void addDrain(System.Func<System.IO.TextReader> src, string nm) =>
@@ -410,6 +603,13 @@ public sealed class LispProcess : LispObject
         helpers.Add(Spawn("dotcl-drain-stderr-merged", () => Copy(stderrSrc(), System.IO.TextWriter.Null)));
         return Nil.Instance;
     }
+
+    /// <summary>The file a child's output is redirected to. The pipe was decoded
+    /// with ENCODING, so the file is written in it too and ends up with the bytes
+    /// the child wrote. Without one, UTF-8 as before.</summary>
+    private static System.IO.StreamWriter OpenRedirectFile(string path, bool append, System.Text.Encoding? encoding)
+        => encoding == null ? new System.IO.StreamWriter(path, append)
+                            : new System.IO.StreamWriter(path, append, encoding);
 
     private static void CopyLocked(System.IO.TextReader r, System.IO.TextWriter w, object wlock)
     {

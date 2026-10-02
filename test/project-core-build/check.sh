@@ -18,10 +18,12 @@
 # packaging rather than the targets. The paths are the ones the targets compute
 # from MSBuildThisFileDirectory, so a change to that layout breaks this too.
 #
-# Two cases, and the second is the one worth having. A build that fails must say
-# what to do next: a dependency that cannot be found is the first wall a new user
-# hits, and the remedy (DotclAsdSearchPath) is a build property they have no
-# reason to know about.
+# Three cases. The first two go together, and the second is the one worth
+# having. A build that fails must say what to do next: a dependency that cannot
+# be found is the first wall a new user hits, and the remedy (DotclAsdSearchPath)
+# is a build property they have no reason to know about. The third publishes
+# trimmed and runs the result: the .NET types the Lisp sources name have to
+# survive the trimmer without the project listing them by hand.
 #
 # Usage: check.sh <repo-root>
 set -eu
@@ -134,6 +136,72 @@ if dotnet build "$(win "$WORK/app/app.csproj")" -c Debug --nologo > "$WORK/build
 else
   note "the project does not build even with DotclAsdSearchPath set"
   tail -20 "$WORK/build2.log"
+fi
+
+echo "=== [3] a trimmed publish keeps the .NET types the Lisp sources name ==="
+# The fasl reaches PcbTrim.Greeter and System.Globalization.ISOWeek only through
+# reflection, so the trimmer sees no use of either. Nothing in C# touches
+# Greeter, so without the descriptor the build writes it is removed outright.
+mkdir -p "$WORK/trim"
+cat > "$WORK/trim/trimapp.asd" <<'EOF'
+(defsystem "trimapp" :components ((:file "trimapp")))
+EOF
+cat > "$WORK/trim/trimapp.lisp" <<'EOF'
+(defpackage :trimapp (:use :cl) (:export #:run))
+(in-package :trimapp)
+(defun run ()
+  (format nil "~a / ~a"
+          (dotnet:invoke (dotnet:new "PcbTrim.Greeter") "Hello" "lisp")
+          (dotnet:static "System.Globalization.ISOWeek" "GetYear"
+                         (dotnet:new "System.DateTime" 2026 1 1))))
+EOF
+cat > "$WORK/trim/Program.cs" <<'EOF'
+namespace PcbTrim
+{
+    public class Greeter { public string Hello(string n) => "hello " + n; }
+    static class P
+    {
+        static void Main()
+        {
+            DotCL.DotclHost.Initialize();
+            DotCL.DotclHost.LoadFromManifest(System.IO.Path.Combine(
+                System.AppContext.BaseDirectory, "dotcl-fasl", "dotcl-deps.txt"));
+            System.Console.WriteLine("result: " + DotCL.DotclHost.Call("TRIMAPP:RUN"));
+        }
+    }
+}
+EOF
+# PublishTrimmed goes in the project, not on the command line: a global property
+# would reach the netstandard2.0 build of the runtime, which cannot be trimmed.
+cat > "$WORK/trim/trimapp.csproj" <<CSPROJEOF
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <AssemblyName>pcbtrim</AssemblyName>
+    <PublishTrimmed>true</PublishTrimmed>
+    <DotclProjectAsd>\$(MSBuildProjectDirectory)/trimapp.asd</DotclProjectAsd>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="$(win "$ROOT/runtime/DotCL.Runtime.csproj")" />
+  </ItemGroup>
+  <Import Project="$(win "$PKG/build/DotCL.Runtime.ProjectCore.targets")" />
+</Project>
+CSPROJEOF
+RID="$(dotnet --info | awk '/^ *RID:/{print $2; exit}')"
+if dotnet publish "$(win "$WORK/trim/trimapp.csproj")" -c Release -r "$RID" --self-contained \
+     -o "$(win "$WORK/trim/pub")" --nologo > "$WORK/publish3.log" 2>&1; then
+  exe="$WORK/trim/pub/pcbtrim"
+  [ -f "$exe.exe" ] && exe="$exe.exe"
+  out="$("$exe" < /dev/null 2>&1 || true)"
+  case "$out" in
+    *'result: "hello lisp / 2026"'*) echo "  PASS: the trimmed app calls both types" ;;
+    *) note "the trimmed app lost a type the Lisp sources name"; echo "$out" | head -5 ;;
+  esac
+else
+  note "the trimmed publish failed"
+  tail -20 "$WORK/publish3.log"
 fi
 
 if [ "$fail" -eq 0 ]; then

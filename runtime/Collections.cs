@@ -369,7 +369,8 @@ public sealed class LispStruct : LispObject
     {
         if (_internCache.TryGetValue(key, out var weakRef) && weakRef.TryGetTarget(out var existing))
             return existing;
-        var obj = Runtime.Eval(form);
+        var obj = Runtime.TryCallConstantForm(form, out var called)
+            ? Runtime.UnwrapMv(called) : Runtime.Eval(form);
         if (obj is LispStruct result)
         {
             _internCache[key] = new WeakReference<LispStruct>(result);
@@ -422,11 +423,14 @@ public sealed class LispVector : LispObject
     // 16) = 8MB of ushort vs 32MB of object references), removes the GC write
     // barrier per store and the Fixnum object per element. _numKind selects the
     // concrete array type of _numData.
-    internal Array? _numData;   // byte[] | ushort[] | int[] | long[] | float[] | double[] per _numKind
+    internal Array? _numData;   // byte[] | ushort[] | int[] | long[] | float[] | double[] | char[] | uint[] | sbyte[] | short[] per _numKind
     internal int _numLen;       // _numData.Length (Array.Length on the abstract
                                 // static type is a runtime call, not ldlen: hot
                                 // aref paths bounds-check against this instead)
-    internal byte _numKind;    // 0=none 1=u8 2=u16 3=i32 4=i64 5=f4(float[]) 6=f8(double[])
+    internal byte _numKind;    // 0=none 1=u8 2=u16 3=i32 4=i64 5=f4(float[]) 6=f8(double[]) 7=char[]
+                               // 8=u32(uint[]) 9=s8(sbyte[]) 10=s16(short[]): foreign-width
+                               // kinds, only made by DOTCL:MAKE-PINNED-VECTOR (see
+                               // ForeignWidthKind); MAKE-ARRAY never picks them.
 
     // Element type: "T" (general), "CHARACTER"/"BASE-CHAR"/"STANDARD-CHAR" (string-like), "NIL" (bit vector of nil), etc.
     public string ElementTypeName { get; private set; } = "T";
@@ -469,7 +473,62 @@ public sealed class LispVector : LispObject
             4 => new long[size],
             5 => new float[size],
             7 => new char[size],
+            8 => new uint[size],
+            9 => new sbyte[size],
+            10 => new short[size],
             _ => new double[size],
+        };
+    }
+
+    /// <summary>The storage kind whose element width is the one foreign code
+    /// expects for ELEMENTTYPE, when that differs from what MAKE-ARRAY picks:
+    /// (unsigned-byte 32) is kept in a long[] and (signed-byte 8/16) in an
+    /// int[], which is right for Lisp but not for a buffer whose address is
+    /// handed to C. 0 when NumKindForElementType's choice already has the
+    /// foreign width. Used only for pinned vectors.</summary>
+    internal static byte ForeignWidthKind(string et)
+    {
+        if (et == "UNSIGNED-BYTE-32") return 8;
+        const string sb = "SIGNED-BYTE-";
+        if (et.StartsWith(sb, StringComparison.Ordinal)
+            && int.TryParse(et.Substring(sb.Length), out int sn) && sn >= 1)
+            return sn <= 8 ? (byte)9 : sn <= 16 ? (byte)10 : (byte)0;
+        return 0;
+    }
+
+    /// <summary>A simple vector of ELEMENTTYPE whose numeric backing is STORAGE,
+    /// an array the caller allocated (a pinned one, for DOTCL:MAKE-PINNED-VECTOR).
+    /// STORAGE must be of StorageTypeFor(ELEMENTTYPE, FOREIGNWIDTH). Its contents
+    /// become the vector's contents.</summary>
+    internal static LispVector WithNumStorage(string elementType, Array storage, bool foreignWidth)
+    {
+        var v = new LispVector(0, Nil.Instance, elementType);
+        if (v._numData == null || storage.GetType() != StorageTypeFor(elementType, foreignWidth))
+            throw new InvalidOperationException(
+                $"WithNumStorage: {storage.GetType()} is not the storage of element type {elementType}");
+        byte fw = foreignWidth ? ForeignWidthKind(elementType) : (byte)0;
+        if (fw != 0) v._numKind = fw;
+        v._numData = storage;
+        v._numLen = storage.Length;
+        v._fillPointer = storage.Length;
+        v._declaredSize = storage.Length;
+        return v;
+    }
+
+    /// <summary>The concrete .NET array type a numeric vector of ELEMENTTYPE is
+    /// stored in (with FOREIGNWIDTH, the foreign-width kind where there is one),
+    /// or null when the element type has no numeric storage.</summary>
+    internal static Type? StorageTypeFor(string elementType, bool foreignWidth)
+    {
+        byte kind = foreignWidth ? ForeignWidthKind(elementType) : (byte)0;
+        if (kind == 0) kind = NumKindForElementType(elementType);
+        return kind switch
+        {
+            0 => null,
+            1 => typeof(byte[]), 2 => typeof(ushort[]), 3 => typeof(int[]),
+            4 => typeof(long[]), 5 => typeof(float[]), 6 => typeof(double[]),
+            7 => typeof(char[]), 8 => typeof(uint[]), 9 => typeof(sbyte[]),
+            _ => typeof(short[]),
         };
     }
 
@@ -483,6 +542,12 @@ public sealed class LispVector : LispObject
     // unboxed aref helpers must not touch them.
     internal bool IsRawNumKind => _numKind != 0 && _numKind != 7;
 
+    // A pinned vector whose storage is a foreign-width kind (8-10). The
+    // compiler's hoisted element buffers are typed per MAKE-ARRAY's storage
+    // (long[] for (unsigned-byte 32), int[] for (signed-byte 8)), so their
+    // fetches decline these and the per-element helpers serve them.
+    internal bool IsForeignWidthKind => _numKind >= 8;
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal char CharGet(int i) => ((char[])_numData!)[i];
 
@@ -495,8 +560,32 @@ public sealed class LispVector : LispObject
         1 => ((byte[])_numData!)[i],
         2 => ((ushort[])_numData!)[i],
         3 => ((int[])_numData!)[i],
-        _ => ((long[])_numData!)[i],
+        _ => _numData is long[] l ? l[i] : NumGetForeignWidth(i),
     };
+
+    // Kinds 8-10 (pinned vectors only), kept off the inlined NumGet/NumSet.
+    private long NumGetForeignWidth(int i) => _numKind switch
+    {
+        8 => ((uint[])_numData!)[i],
+        9 => ((sbyte[])_numData!)[i],
+        _ => ((short[])_numData!)[i],
+    };
+
+    private void NumSetForeignWidth(int i, long v)
+    {
+        switch (_numKind)
+        {
+            case 8:
+                if ((ulong)v > uint.MaxValue) throw NumRangeError(v);
+                ((uint[])_numData!)[i] = (uint)v; return;
+            case 9:
+                if (v < sbyte.MinValue || v > sbyte.MaxValue) throw NumRangeError(v);
+                ((sbyte[])_numData!)[i] = (sbyte)v; return;
+            default:
+                if (v < short.MinValue || v > short.MaxValue) throw NumRangeError(v);
+                ((short[])_numData!)[i] = (short)v; return;
+        }
+    }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal void NumSet(int i, long v)
@@ -516,7 +605,9 @@ public sealed class LispVector : LispObject
                 if (v < int.MinValue || v > int.MaxValue) throw NumRangeError(v);
                 ((int[])_numData!)[i] = (int)v; return;
             default:
-                ((long[])_numData!)[i] = v; return;
+                if (_numData is long[] l) l[i] = v;
+                else NumSetForeignWidth(i, v);
+                return;
         }
     }
 
@@ -604,6 +695,19 @@ public sealed class LispVector : LispObject
     {
         _dimensions = dimensions;
     }
+
+    /// <summary>What an element of general storage holds when no :initial-element
+    /// was given. A (complex single-float) or (complex double-float) array starts
+    /// out as complex zeros, the way a double-float array starts out as 0.0d0:
+    /// an array of that element type must never hold NIL, and code that hands
+    /// the storage to foreign routines as work space reads every element.</summary>
+    internal static LispObject DefaultElement(string elementType) =>
+        Runtime.ComplexElementPartClass(elementType) switch
+        {
+            'D' => LispComplex.OfDoubles(0.0, 0.0),
+            'S' => LispComplex.Of(SingleFloat.Box(0f), SingleFloat.Box(0f)),
+            _ => Nil.Instance
+        };
 
     public LispVector(int size, LispObject initialElement, string elementType)
     {
@@ -749,6 +853,21 @@ public sealed class LispVector : LispObject
                 data[i >> 6] |= 1UL << (i & 63);
         }
         return data;
+    }
+
+    /// <summary>A CHARACTER vector whose storage IS CHARS (no copy). This is how a
+    /// LispString becomes the target of a displaced array: the string's own char[]
+    /// backing is shared, so a write through either object is seen by the other.
+    /// The view itself is never handed to user code (ARRAY-DISPLACEMENT maps it
+    /// back to the string).</summary>
+    internal static LispVector CharView(char[] chars)
+    {
+        var v = new LispVector(0, Nil.Instance, "CHARACTER");
+        v._numData = chars;
+        v._numLen = chars.Length;
+        v._fillPointer = chars.Length;
+        v._declaredSize = chars.Length;
+        return v;
     }
 
     // Constructor for displaced arrays (no local element storage)
@@ -973,7 +1092,7 @@ public sealed class LispVector : LispObject
             {
                 var newElems = new LispObject[newSize];
                 var oldSize = _declaredSize;
-                LispObject fill = initialElement ?? Nil.Instance;
+                LispObject fill = initialElement ?? DefaultElement(ElementTypeName);
                 for (int i = 0; i < newSize; i++)
                     newElems[i] = i < oldSize ? RawGet(i) : fill;
                 _elements = newElems;
@@ -1019,7 +1138,7 @@ public sealed class LispVector : LispObject
             {
                 var newElems = new LispObject[newSize];
                 Array.Copy(_elements, newElems, Math.Min(oldSize, newSize));
-                LispObject fill = initialElement ?? Nil.Instance;
+                LispObject fill = initialElement ?? DefaultElement(ElementTypeName);
                 for (int i = oldSize; i < newSize; i++) newElems[i] = fill;
                 _elements = newElems;
             }
@@ -1246,6 +1365,14 @@ public sealed class LispHashTable : LispObject
     private readonly bool _keyOrValue;
     private readonly Func<LispObject, LispObject, bool> _test;
     private readonly string _testName;
+    // A table made with :HASH-FUNCTION and a test other than the four standard
+    // ones: what HASH-TABLE-TEST answers, and the hash function.
+    private readonly LispFunction? _userTestFn;
+    private readonly LispObject? _userTestName;
+    private readonly LispFunction? _userHash;
+
+    private static string UserTestName(LispObject? name)
+        => name is Symbol sym ? sym.Name : "USER-DEFINED";
     // When Synchronized, all mutating/reading operations take _lock.
     // Concurrent access without Synchronized is undefined per CLHS (mirrors
     // SBCL: make-hash-table :synchronized t opts in to thread-safety).
@@ -1269,9 +1396,27 @@ public sealed class LispHashTable : LispObject
     public LispHashTable() : this("EQL", false, null) { }
 
     public LispHashTable(string test, bool synchronized, string? weakness)
+        : this(test, synchronized, weakness, null, null, null) { }
+
+    /// <summary>A table with a :HASH-FUNCTION (SBCL extension). TEST is one of
+    /// the four standard tests by name, or null when TESTFN is any other
+    /// two-argument predicate; TESTDESIGNATOR is what HASH-TABLE-TEST answers
+    /// for it. HASHFN maps a key to an integer, and keys the test calls equal
+    /// must get the same one.</summary>
+    public LispHashTable(string? test, LispFunction? testFn, LispObject? testDesignator,
+                         LispFunction hashFn, bool synchronized, string? weakness)
+        : this(test ?? "", synchronized, weakness, testFn, testDesignator, hashFn) { }
+
+    private LispHashTable(string test, bool synchronized, string? weakness,
+                          LispFunction? userTest, LispObject? userTestName, LispFunction? userHash)
     {
-        _testName = test.ToUpperInvariant();
-        _test = _testName switch
+        _testName = userTest != null ? UserTestName(userTestName) : test.ToUpperInvariant();
+        _userTestFn = userTest;
+        _userTestName = userTestName;
+        _userHash = userHash;
+        _test = userTest != null
+            ? (a, b) => userTest.Invoke2(a, b) is not Nil
+            : _testName switch
         {
             "EQ" => (a, b) => Runtime.IsEqRef(a, b),
             "EQL" => Eql,
@@ -1308,7 +1453,7 @@ public sealed class LispHashTable : LispObject
         // Key-weak tables box the key in a WeakKeyBox so the dict doesn't root it;
         // the comparer resolves boxes (and bare live keys used for lookup) through
         // the test. Strong/value-only tables key on the LispObject directly.
-        var inner = new LispEqualityComparer(_test, _testName);
+        var inner = new LispEqualityComparer(_test, _testName, userHash);
         _dict = new Dictionary<object, object>(
             _weakKey ? new WeakKeyComparer(inner) : (IEqualityComparer<object>)new BoxedObjectComparer(inner));
         DotCL.Diagnostics.AllocCounter.Inc("LispHashTable");
@@ -1450,6 +1595,19 @@ public sealed class LispHashTable : LispObject
     // bare key removes the corresponding weak entry.
     private bool RemoveByLookup(LispObject key) => _dict.Remove(key);
 
+    /// <summary>A fresh table with the test and the entries of PROTO. A fasl
+    /// builds a large hash table literal once as a prototype it keeps to itself
+    /// and hands out copies, so literals that share most of their entries
+    /// (environment tables copied from a parent) share one builder.</summary>
+    public static LispHashTable CopyLiteral(LispHashTable proto)
+    {
+        var h = proto._userHash != null
+            ? new LispHashTable(proto._testName, false, null, proto._userTestFn, proto._userTestName, proto._userHash)
+            : new LispHashTable(proto._testName);
+        foreach (var kv in proto.Entries) h.Set(kv.Key, kv.Value);
+        return h;
+    }
+
     public void Clear()
     {
         if (Synchronized) lock (_lock) _dict.Clear();
@@ -1483,6 +1641,13 @@ public sealed class LispHashTable : LispObject
         return alive;
     }
     public string TestName => _testName;
+
+    /// <summary>What HASH-TABLE-TEST answers: the standard test's symbol, or
+    /// for a table made with :HASH-FUNCTION and another test, that test's name
+    /// (or the function itself when it has none).</summary>
+    public LispObject TestDesignator => _userTestFn != null
+        ? _userTestName ?? _userTestFn
+        : Startup.Sym(_testName);
 
     // Enumeration returns a snapshot under lock when Synchronized so the
     // iteration itself cannot race with concurrent mutation. Dead weak
@@ -1614,6 +1779,15 @@ public sealed class LispHashTable : LispObject
         }
         if (a is Cons ca && b is Cons cb)
             return LispEqual(ca.Car, cb.Car) && LispEqual(ca.Cdr, cb.Cdr);
+        // Pathnames are EQUAL when their components are (CLHS EQUAL), as
+        // Runtime.Equal answers; an EQUAL table has to agree with it.
+        if (a is LispPathname pa && b is LispPathname pb)
+            return LispEqual(pa.Host ?? Nil.Instance, pb.Host ?? Nil.Instance)
+                && LispEqual(pa.Device ?? Nil.Instance, pb.Device ?? Nil.Instance)
+                && LispEqual(pa.DirectoryComponent ?? Nil.Instance, pb.DirectoryComponent ?? Nil.Instance)
+                && LispEqual(pa.NameComponent ?? Nil.Instance, pb.NameComponent ?? Nil.Instance)
+                && LispEqual(pa.TypeComponent ?? Nil.Instance, pb.TypeComponent ?? Nil.Instance)
+                && LispEqual(Runtime.NormalPathnameVersion(pa.Version), Runtime.NormalPathnameVersion(pb.Version));
         // Bit-vector comparison
         if (a is LispVector bva && bva.IsBitVector && b is LispVector bvb && bvb.IsBitVector)
         {
@@ -1684,7 +1858,7 @@ public sealed class LispHashTable : LispObject
                     && Runtime.IsTruthy(Runtime.Equal(pa.DirectoryComponent ?? Nil.Instance, pb.DirectoryComponent ?? Nil.Instance))
                     && Runtime.IsTruthy(Runtime.Equal(pa.NameComponent ?? Nil.Instance, pb.NameComponent ?? Nil.Instance))
                     && Runtime.IsTruthy(Runtime.Equal(pa.TypeComponent ?? Nil.Instance, pb.TypeComponent ?? Nil.Instance))
-                    && Runtime.IsTruthy(Runtime.Equal(pa.Version ?? Nil.Instance, pb.Version ?? Nil.Instance));
+                    && Runtime.PathnameVersionsEqual(pa.Version, pb.Version);
             }
             // Struct comparison: same type, all slots equalp
             if (a is LispStruct sa && b is LispStruct sb)
@@ -1705,11 +1879,27 @@ public sealed class LispHashTable : LispObject
     {
         private readonly Func<LispObject, LispObject, bool> _test;
         private readonly string _testName;
+        private readonly LispFunction? _hash;
 
-        public LispEqualityComparer(Func<LispObject, LispObject, bool> test, string testName)
+        public LispEqualityComparer(Func<LispObject, LispObject, bool> test, string testName,
+                                    LispFunction? hash = null)
         {
             _test = test;
             _testName = testName;
+            _hash = hash;
+        }
+
+        private int UserHash(LispObject obj)
+        {
+            var h = _hash!.Invoke1(obj);
+            if (h is MvReturn mv) h = mv.PrimaryValue;
+            return h switch
+            {
+                Fixnum f => f.Value.GetHashCode(),
+                Bignum b => b.Value.GetHashCode(),
+                _ => throw new LispErrorException(new LispTypeError(
+                    "hash table :HASH-FUNCTION returned a non-integer", h, Startup.Sym("INTEGER")))
+            };
         }
 
         public bool Equals(LispObject? x, LispObject? y)
@@ -1727,6 +1917,7 @@ public sealed class LispHashTable : LispObject
 
         public int GetHashCode(LispObject obj)
         {
+            if (_hash != null) return UserHash(obj);
             return _testName switch
             {
                 "EQ" => System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(Canonical(obj)),
@@ -1772,10 +1963,14 @@ public sealed class LispHashTable : LispObject
             if (depth == 0) return 0;
             return obj switch
             {
-                LispString s => s.Value.GetHashCode(),
+                // From the characters: a string written into (SETF CHAR) is
+                // char-array backed, and VALUE would build a System.String of
+                // it on every lookup.
+                LispString s => Compat.StringHash(s.Chars),
                 LispVector v when v.IsCharVector => v.ToCharString().GetHashCode(),
                 Cons c => HashCode.Combine(GetEqualHash(c.Car, depth - 1), GetEqualHash(c.Cdr, depth - 1)),
                 LispVector bv when bv.IsBitVector => HashBitVector(bv),
+                LispPathname pn => PathnameHash(pn, depth),
                 // EQUAL falls back to EQL for numbers and characters, so they
                 // must hash by value here too: including inside a cons, which
                 // is how SBCL's inline-constant table keys its float constants.
@@ -1783,6 +1978,27 @@ public sealed class LispHashTable : LispObject
                      ?? System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(obj)
             };
         }
+
+        // A few slots are enough to spread the keys; the depth limit keeps a
+        // structure that refers to itself from recursing.
+        private static int StructEqualpHash(LispStruct st, int depth)
+        {
+            var h = new HashCode();
+            h.Add(st.TypeName.Name);
+            int n = Math.Min(st.SlotCount, 4);
+            for (int i = 0; i < n; i++) h.Add(GetEqualpHash(st.GetSlot(i), depth - 1));
+            return h.ToHashCode();
+        }
+
+        // By the components EQUAL and EQUALP compare.
+        private static int PathnameHash(LispPathname pn, int depth)
+            => HashCode.Combine(
+                GetEqualHash(pn.Host ?? Nil.Instance, depth - 1),
+                GetEqualHash(pn.Device ?? Nil.Instance, depth - 1),
+                GetEqualHash(pn.DirectoryComponent ?? Nil.Instance, depth - 1),
+                GetEqualHash(pn.NameComponent ?? Nil.Instance, depth - 1),
+                GetEqualHash(pn.TypeComponent ?? Nil.Instance, depth - 1),
+                GetEqualHash(Runtime.NormalPathnameVersion(pn.Version), depth - 1));
 
         private static int HashBitVector(LispVector bv)
         {
@@ -1816,6 +2032,13 @@ public sealed class LispHashTable : LispObject
                 Number n => Arithmetic.ToDouble(n).GetHashCode(),
                 Cons c => HashCode.Combine(GetEqualpHash(c.Car, depth - 1), GetEqualpHash(c.Cdr, depth - 1)),
                 LispVector v => v.Length == 0 ? 0 : GetEqualpHash(v.ElementAt(0), depth - 1),
+                // EQUALP compares structures slot by slot, hash tables by test,
+                // count and entries, and pathnames as EQUAL does, so none of them
+                // may hash by identity: two EQUALP keys landed in different
+                // buckets and GETHASH missed a key that was there.
+                LispStruct st => StructEqualpHash(st, depth),
+                LispHashTable ht => HashCode.Combine(ht.TestName, ht.Count),
+                LispPathname pn => PathnameHash(pn, depth),
                 _ => System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(obj)
             };
         }

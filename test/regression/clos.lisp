@@ -508,11 +508,12 @@
 ;; each parent keeps its OWN slots; make-instance with the other package's slot
 ;; was the reported failure ("Invalid initarg :ELEMENTS for class SEQ")
 (deftest i408-make-instance-pa-own-slot
-  (slot-value (make-instance 'i408-pa::node :aa 1) 'i408-pa::aa)
+  ;; The slot is named by the symbol AA of this file's package, not I408-PA::AA.
+  (slot-value (make-instance 'i408-pa::node :aa 1) 'aa)
   1)
 
 (deftest i408-make-instance-pb-own-slot
-  (slot-value (make-instance 'i408-pb::node :bb 2) 'i408-pb::bb)
+  (slot-value (make-instance 'i408-pb::node :bb 2) 'bb)
   2)
 
 ;; the forward-referenced subclass resolves to its OWN package's parent
@@ -1087,6 +1088,17 @@
     (handler-case (progn (setf (wic8x 5) 1) :no-error)
       (error () :error)))
   :error)
+
+;; The accessor's setf expander writes (FUNCALL #'(SETF ACC) V OBJ), and that
+;; form has to reach the writer inline cache too: otherwise every test above
+;; goes through the generic function and none of them checks the cache.
+(defclass %wic9 () ((x :initarg :x :accessor wic9x)))
+(deftest-emitting-only wic-setf-form-uses-writer-ic
+  (let* ((compile-toplevel (find-symbol "COMPILE-TOPLEVEL" "DOTCL.CIL-COMPILER"))
+         (sil (prin1-to-string
+               (funcall compile-toplevel '(defun %wic9-set (o v) (setf (wic9x o) v))))))
+    (and (search "WRITER-IC" sil) t))
+  t)
 
 ;;; The other side of the capture rule: a body whose only use of
 ;;; CALL-NEXT-METHOD is a plain call keeps no closure, and reads the

@@ -200,15 +200,36 @@ public static partial class Runtime
         return head;
     }
 
+    /// <summary>True when EQL with ITEM (already a primary value) is identity:
+    /// ITEM is neither a number nor a character, and not one of the two objects
+    /// (T, NIL) that have a second representation. MEMBER's compiler-side
+    /// callers look symbols up in constant lists, and going through the full
+    /// EQL for every element was a few percent of a COMPILE-FILE.</summary>
+    internal static bool EqlIsIdentity(LispObject item) =>
+        item is not (Number or LispChar or T or Nil)
+        && !ReferenceEquals(item, Startup.T_SYM) && !ReferenceEquals(item, Startup.NIL_SYM);
+
     public static LispObject Member(LispObject item, LispObject list)
     {
         if (list is not Nil && list is not Cons)
             throw new LispErrorException(new LispTypeError("MEMBER: not a list", list, Startup.Sym("LIST")));
         var current = list;
-        while (current is Cons c)
+        if (EqlIsIdentity(item = Primary(item)))
         {
-            if (IsTrueEql(item, c.Car)) return current;
-            current = c.Cdr;
+            while (current is Cons c)
+            {
+                if (ReferenceEquals(item, c.Car) || c.Car is MvReturn && ReferenceEquals(item, Primary(c.Car)))
+                    return current;
+                current = c.Cdr;
+            }
+        }
+        else
+        {
+            while (current is Cons c)
+            {
+                if (IsTrueEql(item, c.Car)) return current;
+                current = c.Cdr;
+            }
         }
         // Walking off a dotted list without finding the item is a type error --
         // this is where MEMBER learns the list was improper. MemberCore, which
@@ -413,23 +434,32 @@ public static partial class Runtime
             return list;
         }
 
-        // Fallback: thread-static path (backward compat during transition)
-        int count = MultipleValues.Count;
-        LispObject[] vals = count > 0 ? MultipleValues.Get() : Array.Empty<LispObject>();
-        // Consume MV state so it doesn't leak to outer multiple-value-list
-        MultipleValues.Reset();
+        // Values a capture-mode return put in the bind snapshot.
+        var snap = MultipleValues.TakeSnap(primary, out int sn);
+        if (snap != null)
+        {
+            LispObject list = Nil.Instance;
+            for (int i = sn - 1; i >= 0; i--) list = new Cons(snap[i], list);
+            return list;
+        }
+
+        // Thread-state path: the values a callee published without an MvReturn
+        // (a pair or an array), consed straight out of the state rather than
+        // copied into an array first.
+        int count = MultipleValues.OwnCount(primary);
+        LispObject result;
         if (count > 0)
         {
-            if (vals.Length > 0 && ReferenceEquals(vals[0], primary))
-                return List(vals);
-            return new Cons(primary, Nil.Instance);
+            result = Nil.Instance;
+            for (int i = count - 1; i >= 0; i--) result = new Cons(MultipleValues.OwnNth(i), result);
         }
-        if (count == 0)
-        {
-            return Nil.Instance;
-        }
-        // count < 0 (sentinel from Reset): non-values function, wrap primary
-        return new Cons(primary, Nil.Instance);
+        else if (count == 0)
+            result = Nil.Instance;
+        else
+            result = new Cons(primary, Nil.Instance); // not this call's state: one value
+        // Consume MV state so it doesn't leak to outer multiple-value-list
+        MultipleValues.Reset();
+        return result;
     }
 
     // --- Rest args ---
@@ -564,7 +594,7 @@ public static partial class Runtime
     }
 
     // CL special operators: fdefinition on these should not throw; they are fbound
-    public static readonly HashSet<string> _specialOperators = new(StringComparer.OrdinalIgnoreCase)
+    public static readonly HashSet<string> _specialOperators = new(StringComparer.Ordinal)
     {
         "BLOCK", "CATCH", "EVAL-WHEN", "FLET", "FUNCTION", "GO", "IF", "LABELS",
         "LET", "LET*", "LOAD-TIME-VALUE", "LOCALLY", "MACROLET", "MULTIPLE-VALUE-CALL",
@@ -572,11 +602,31 @@ public static partial class Runtime
         "SYMBOL-MACROLET", "TAGBODY", "THE", "THROW", "UNWIND-PROTECT"
     };
 
+    // A special operator is one of the 25 COMMON-LISP symbols above. A symbol
+    // that merely shares the name (a SHADOWed LABELS, say) is not one.
+    internal static bool IsSpecialOperator(Symbol sym)
+        => sym.HomePackage == Startup.CL && _specialOperators.Contains(sym.Name);
+
+    /// <summary>For a function name (SETF X) with X a symbol (NIL and T included,
+    /// which have their own classes), the symbol X; otherwise null.</summary>
+    internal static Symbol? SetfNameTarget(LispObject name)
+    {
+        if (name is Cons c && c.Car is Symbol setfKw && setfKw.Name == "SETF"
+            && c.Cdr is Cons rest && rest.Cdr is Nil)
+            return rest.Car switch
+            {
+                Symbol s => s,
+                Nil => Startup.NIL_SYM,
+                T => Startup.T_SYM,
+                _ => null
+            };
+        return null;
+    }
+
     public static LispObject Fdefinition(LispObject name)
     {
         // Handle (setf sym) names: sym.SetfFunction is authoritative.
-        if (name is Cons c2 && c2.Car is Symbol setfKw && setfKw.Name == "SETF"
-            && c2.Cdr is Cons rest2 && rest2.Car is Symbol setfTarget && rest2.Cdr is Nil)
+        if (SetfNameTarget(name) is Symbol setfTarget)
         {
             if (setfTarget.SetfFunction is LispFunction setfFn) return setfFn;
             throw new LispErrorException(new LispUndefinedFunction(name));
@@ -590,7 +640,7 @@ public static partial class Runtime
         // Check macro table before erroring
         if (_macroFunctions.TryGetValue(sym, out var mfn)) return mfn;
         // Special operators are fbound: return a stub rather than erroring
-        if (_specialOperators.Contains(sym.Name))
+        if (IsSpecialOperator(sym))
             return new LispFunction(_ => throw new LispErrorException(
                 new LispError($"Cannot call special operator {sym.Name} as a function")), sym.Name);
         throw new LispErrorException(new LispUndefinedFunction(sym));
@@ -599,13 +649,14 @@ public static partial class Runtime
     /// <summary>SYMBOL-FUNCTION: like FDEFINITION but only accepts symbols.</summary>
     public static LispObject SymbolFunction(LispObject name)
     {
-        if (name is not Symbol)
+        // NIL and T are symbols too; they are represented by their own classes.
+        if (name is not Symbol && name is not Nil && name is not T)
             throw new LispErrorException(new LispTypeError(
                 "SYMBOL-FUNCTION: argument must be a symbol", name));
-        var sym = (Symbol)name;
+        var sym = GetSymbol(name, "SYMBOL-FUNCTION");
         if (sym.Function is LispFunction fn) return fn;
         if (_macroFunctions.TryGetValue(sym, out var mfn)) return mfn;
-        if (_specialOperators.Contains(sym.Name))
+        if (IsSpecialOperator(sym))
             return new LispFunction(_ => throw new LispErrorException(
                 new LispError($"Cannot call special operator {sym.Name} as a function")), sym.Name);
         throw new LispErrorException(new LispUndefinedFunction(sym));
@@ -614,14 +665,14 @@ public static partial class Runtime
     public static LispObject SpecialOperatorP(LispObject name)
     {
         var sym = GetSymbol(name, "SPECIAL-OPERATOR-P");
-        return _specialOperators.Contains(sym.Name) ? T.Instance : Nil.Instance;
+        return IsSpecialOperator(sym) ? T.Instance : Nil.Instance;
     }
 
     // Get the canonical string key for a function name (symbol or (setf sym))
     internal static string GetFunctionNameKey(LispObject name, string fn)
     {
         if (name is Symbol sym) return sym.Name;
-        if (name is Cons c && c.Car is Symbol setfSym && setfSym.Name == "SETF" && c.Cdr is Cons rest && rest.Car is Symbol target && rest.Cdr is Nil)
+        if (SetfNameTarget(name) is Symbol target)
             return $"(SETF {target.Name})";
         throw new LispErrorException(new LispTypeError($"{fn}: not a valid function name", name));
     }
@@ -653,8 +704,7 @@ public static partial class Runtime
     public static LispObject Fmakunbound(LispObject name)
     {
         // (setf sym) form: clear SetfFunction on the target symbol.
-        if (name is Cons fc && fc.Car is Symbol fsetfKw && fsetfKw.Name == "SETF"
-            && fc.Cdr is Cons frest && frest.Car is Symbol ftarget && frest.Cdr is Nil)
+        if (SetfNameTarget(name) is Symbol ftarget)
         {
             ftarget.SetfFunction = null;
             return name;
@@ -927,6 +977,14 @@ public static partial class Runtime
                 if (expanded != typeSpec)
                     return ParseElementTypeName(expanded);
             }
+            // A compound specifier for characters only, such as
+            // (member #\0 #\1) or (eql #\a), is a subtype of CHARACTER, so it
+            // has to upgrade the way CHARACTER does (CLHS 15.1.2.1): the array
+            // is a string. The empty type is left out (it is a subtype of
+            // everything).
+            if (Runtime.Primary(Runtime.Subtypep(typeSpec, Startup.Sym("CHARACTER"))) is not Nil
+                && Runtime.Primary(Runtime.Subtypep(typeSpec, Nil.Instance)) is Nil)
+                return "CHARACTER";
             // Same for a compound specifier nothing above specializes:
             // (or null viewport) is stored generally, so it upgrades to T. The
             // head alone ("OR") is not a type the array could report, and TYPEP
@@ -1094,12 +1152,15 @@ public static partial class Runtime
             MultipleValues.Reset();
             return mv[n];
         }
-        int count = MultipleValues.Count;
-        LispObject[] vals = count > 0 ? MultipleValues.Get() : Array.Empty<LispObject>();
+        var snap = MultipleValues.TakeSnap(primary, out int sn);
+        if (snap != null)
+            return n >= 0 && n < sn ? snap[n] : Nil.Instance;
+        int count = MultipleValues.OwnCount(primary);
+        LispObject result = count > 0
+            ? (n >= 0 && n < count ? MultipleValues.OwnNth(n) : Nil.Instance)
+            : (n == 0 ? primary : Nil.Instance);
         MultipleValues.Reset();
-        if (count > 0 && vals.Length > 0 && ReferenceEquals(vals[0], primary))
-            return n >= 0 && n < vals.Length ? vals[n] : Nil.Instance;
-        return n == 0 ? primary : Nil.Instance;
+        return result;
     }
 
     public static LispObject Values2(LispObject a, LispObject b) =>
@@ -1220,6 +1281,18 @@ public static partial class Runtime
         // matches clause types with TYPEP, which asks what the object IS.
         // The subscript itself is not recoverable from the CLR exception, so
         // DATUM stays NIL where the helper paths can name the index.
+        // A failed cast in compiled code: a value of the wrong type reached code
+        // that assumed a type (safety 0 code handed NIL where it declared a
+        // fixnum, and the like). That is a TYPE-ERROR in CL terms, and HANDLER-BIND
+        // and HANDLER-CASE clauses for TYPE-ERROR have to see it as one. The
+        // offending object is not recoverable from the CLR exception; the target
+        // type in its message names the expected type where it is one of ours.
+        if (ex is InvalidCastException)
+        {
+            var (datum, expected) = CastFailureTypes(ex.Message);
+            return new LispTypeError(ex.Message, datum, expected)
+            { ClrExceptionType = ex.GetType(), ClrException = ex };
+        }
         if (ex is IndexOutOfRangeException)
             return new LispTypeError(ex.Message, Nil.Instance,
                                      new Cons(Startup.Sym("INTEGER"),
@@ -1227,6 +1300,42 @@ public static partial class Runtime
                                              new Cons(Startup.Sym("*"), Nil.Instance))))
             { ClrExceptionType = ex.GetType(), ClrException = ex };
         return null;
+    }
+
+    /// <summary>
+    /// DATUM and EXPECTED-TYPE for the TYPE-ERROR a failed cast becomes, read
+    /// from the CLR message "Unable to cast object of type 'A' to type 'B'."
+    /// The datum is known only when the source type is NIL's; the expected type
+    /// is known for the runtime types that stand for one Lisp type, else T.
+    /// </summary>
+    private static (LispObject datum, LispObject expected) CastFailureTypes(string message)
+    {
+        LispObject expected = T.Instance;
+        LispObject datum = Nil.Instance;
+        var m = System.Text.RegularExpressions.Regex.Match(
+            message ?? "", @"type '([^']+)' to type '([^']+)'");
+        if (m.Success)
+        {
+            var name = m.Groups[2].Value switch
+            {
+                "DotCL.Fixnum" => "FIXNUM",
+                "DotCL.Bignum" => "INTEGER",
+                "DotCL.Cons" => "CONS",
+                "DotCL.Symbol" => "SYMBOL",
+                "DotCL.LispString" => "STRING",
+                "DotCL.LispChar" => "CHARACTER",
+                "DotCL.LispVector" => "VECTOR",
+                "DotCL.SingleFloat" => "SINGLE-FLOAT",
+                "DotCL.DoubleFloat" => "DOUBLE-FLOAT",
+                "DotCL.Ratio" => "RATIO",
+                "DotCL.LispFunction" => "FUNCTION",
+                "DotCL.LispHashTable" => "HASH-TABLE",
+                "DotCL.Package" => "PACKAGE",
+                _ => null
+            };
+            if (name != null) expected = Startup.Sym(name);
+        }
+        return (datum, expected);
     }
 
     public static LispObject WrapDotNetExceptionObj(Exception ex)
@@ -1340,6 +1449,126 @@ public static partial class Runtime
         throw new LispErrorException(condition);
     }
 
+    /// <summary>What a HANDLER-BIND filter found for one raw .NET exception: the
+    /// condition it signalled, and the non-local exit a handler (or the debugger)
+    /// took, if any.</summary>
+    private sealed class HandlerBindOutcome
+    {
+        public LispCondition Condition = null!;
+        public Exception? Transfer;
+    }
+
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<Exception, HandlerBindOutcome>
+        _handlerBindOutcomes = new();
+
+    /// <summary>
+    /// Exception filter for HANDLER-BIND. A raw .NET exception (an
+    /// InvalidCastException from compiled code, say) is signalled here, during
+    /// the first pass of exception dispatch, while the frames that raised it are
+    /// still on the stack: its handlers run where the error happened, in its
+    /// dynamic environment, and can take a backtrace of it. Catching it first and
+    /// signalling from the catch block ran the handlers only after those frames
+    /// were gone.
+    ///
+    /// A filter cannot let an exception escape (the runtime swallows it and
+    /// treats the filter as declining), so a handler's non-local exit is recorded
+    /// and taken by HandlerBindRethrow from this HANDLER-BIND's catch block. A
+    /// transfer to a point between here and the raise point (a CATCH or a restart
+    /// established below this HANDLER-BIND) cannot be taken that way; those frames
+    /// are unwound by then, as they already were when this signalled from the
+    /// catch block.
+    ///
+    /// Lisp conditions and non-local exits are not taken (0): they were
+    /// signalled where they were raised, or are on their way elsewhere.
+    /// </summary>
+    public static int HandlerBindFilter(object exObj)
+    {
+        if (exObj is not Exception ex || !NeedsRewrap(ex)) return 0;
+        if (_handlerBindOutcomes.TryGetValue(ex, out _)) return 1;
+        var outcome = new HandlerBindOutcome { Condition = ClrExceptionCondition(ex) };
+        _handlerBindOutcomes.Add(ex, outcome);
+        try
+        {
+            HandlerClusterStack.Signal(outcome.Condition);
+            // No handler took it: this is where ERROR would enter the debugger,
+            // with the raising frames still there to look at.
+            if (ConditionSystem.UnhandledErrorsEnterDebugger)
+                ConditionSystem.InvokeDebugger(outcome.Condition);
+        }
+        catch (Exception transfer)
+        {
+            outcome.Transfer = transfer;
+        }
+        return 1;
+    }
+
+    /// <summary>
+    /// The catch block of HANDLER-BIND, after HandlerBindFilter took the
+    /// exception: continue the non-local exit a handler took, or unwind with the
+    /// already signalled condition. Always throws.
+    /// </summary>
+    public static void HandlerBindRethrow(object exObj)
+    {
+        var ex = (Exception)exObj;
+        if (_handlerBindOutcomes.TryGetValue(ex, out var outcome))
+        {
+            _handlerBindOutcomes.Remove(ex);
+            if (outcome.Transfer != null)
+            {
+                var stale = StaleTransferError(outcome.Transfer);
+                if (stale != null) throw stale;
+                System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(outcome.Transfer).Throw();
+            }
+            throw LispErrorException.WithoutSignal(outcome.Condition);
+        }
+        RewrapNonLispException(ex);
+    }
+
+    /// <summary>
+    /// The CONTROL-ERROR for a handler transfer whose target was established
+    /// inside this HANDLER-BIND (a restart or a CATCH between it and the raise
+    /// point), or null when the target is still there. Those frames have been
+    /// unwound by the time the transfer can be taken; rethrowing the transfer
+    /// would travel to the top of the thread with nothing to receive it. It is
+    /// signalled without this HANDLER-BIND's own cluster, the handlers that
+    /// were disabled while the handler that asked for the transfer ran.
+    /// </summary>
+    private static LispErrorException? StaleTransferError(Exception transfer)
+    {
+        string? what = transfer switch
+        {
+            RestartInvocationException rie when !RestartClusterStack.HasTag(rie.Tag) => "restart",
+            CatchThrowException cte when !CatchTagStack.HasMatchingCatch(cte.Tag) => "catch tag",
+            _ => null
+        };
+        if (what == null) return null;
+        var top = HandlerClusterStack.Top;
+        if (top != null) HandlerClusterStack.PopCluster();
+        try
+        {
+            return new LispErrorException(new LispControlError(
+                $"A HANDLER-BIND handler for a .NET exception transferred to a {what} established inside that HANDLER-BIND, which was unwound before the transfer could be taken"));
+        }
+        finally
+        {
+            if (top != null) HandlerClusterStack.PushCluster(top);
+        }
+    }
+
+    /// <summary>The condition a raw .NET exception becomes: the ANSI type for
+    /// the well-known ones, else a PROGRAM-ERROR carrying the CLR type. Same
+    /// conversion as RewrapNonLispException, without the throw.</summary>
+    private static LispCondition ClrExceptionCondition(Exception ex)
+    {
+        var mapped = MapWellKnownClrException(ex);
+        if (mapped != null) return mapped;
+        return new LispProgramError(
+            Startup.DebugStacktrace && !string.IsNullOrEmpty(ex.StackTrace)
+                ? ex.Message + "\n[.NET " + ex.GetType().Name + "]\n" + ex.StackTrace
+                : ex.Message)
+        { ClrExceptionType = ex.GetType(), ClrException = ex };
+    }
+
     /// <summary>
     /// Establish a handler-bind cluster and run a thunk under it. Mirrors what
     /// compile-handler-bind emits (PushCluster / try body / catch -> rewrap /
@@ -1372,9 +1601,11 @@ public static partial class Runtime
         // recursion (one of these frames per interpreted HANDLER-BIND / HANDLER-CASE)
         // cost stack proportional to the depth and died as an uncatchable .NET
         // StackOverflowException. Same defect the compiled HANDLER-CASE had.
-        catch (Exception e) when (NeedsRewrap(e))
+        // Raw .NET exceptions are signalled from the filter, before the frames
+        // that raised them unwind: see HandlerBindFilter.
+        catch (Exception e) when (HandlerBindFilter(e) != 0)
         {
-            RewrapNonLispException(e); // always throws
+            HandlerBindRethrow(e); // always throws
             throw; // unreachable
         }
         finally
@@ -1722,6 +1953,22 @@ public static partial class Runtime
         // nil. Always returning nil mislabelled real closures (ANSI
         // FUNCTION-LAMBDA-EXPRESSION.2). The third value (name) is returned when
         // the function carries one.
+        // The name is the symbol whose function cell holds the function. Failing
+        // that, a symbol of that name already visible from DOTCL-INTERNAL (the
+        // built-ins, which reach CL), and otherwise an uninterned symbol: the
+        // name must not be interned anywhere just to be returned.
+        static LispObject FunctionLambdaExpressionName(LispFunction nf)
+        {
+            if (Runtime.FunctionNameObject(nf) is { } found) return found;
+            var name = nf.Name!;
+            var internalPkg = Package.FindPackage("DOTCL-INTERNAL");
+            if (internalPkg != null)
+            {
+                var (sym, status) = internalPkg.FindSymbol(name);
+                if (sym != null && status != SymbolStatus.None) return sym;
+            }
+            return new Symbol(name, null);
+        }
         Startup.RegisterUnary("FUNCTION-LAMBDA-EXPRESSION", obj =>
         {
             var closureP = (obj is LispFunction lf && lf.Environment != null)
@@ -1730,9 +1977,7 @@ public static partial class Runtime
             // (SETF accessor) for a setf one, not its internal key symbol.
             LispObject name = obj is GenericFunction gfn ? Runtime.PublicFunctionName(gfn.Name)
                 : (obj is LispFunction nf && !string.IsNullOrEmpty(nf.Name))
-                // netstandard2.0's IsNullOrEmpty carries no nullability annotation,
-                // so the guard above does not narrow Name there.
-                ? Startup.Sym(nf.Name!) : Nil.Instance;
+                ? FunctionLambdaExpressionName(nf) : Nil.Instance;
             return MultipleValues.Values(Nil.Instance, closureP, name);
         });
 
@@ -2099,6 +2344,7 @@ public static partial class Runtime
             rt.SetMacroCharacter(ch, (reader, c) => {
                 LispObject stream = reader.LispStreamRef ?? new LispInputStream(reader.Input);
                 var result = Runtime.Funcall(lispFn, new LispObject[] { stream, LispChar.Make(c) });
+                reader.AbsorbStreamUnread(stream);
                 // CLHS: reader macro returning zero values means "skip" (like a comment).
                 // Returning NIL means the read object is NIL. Check MultipleValues.Count
                 // to distinguish (values) from returning nil.
@@ -2137,6 +2383,7 @@ public static partial class Runtime
                     stream, LispChar.Make(c),
                     n >= 0 ? (LispObject)Fixnum.Make(n) : Nil.Instance
                 });
+                reader.AbsorbStreamUnread(stream);
                 // Unwrap MvReturn: per CLHS, only the primary value of a reader macro matters.
                 if (result is MvReturn mv)
                     return mv.Count > 0 ? mv[0] : null;

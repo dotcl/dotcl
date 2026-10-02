@@ -73,7 +73,7 @@ be told from the others at a glance:
 | The marked row of the debugger's restart menu | reverse video |
 | The bracket that the one before the cursor closes | reverse video |
 | A string in the line you are typing | green |
-| A comment in the line you are typing | grey |
+| A comment in the line you are typing | faint (the terminal's own text colour, dimmed) |
 | A keyword in the line you are typing | magenta |
 
 What your program prints is left in the terminal's own colour. It is yours,
@@ -91,6 +91,27 @@ standard error are decided separately. `--color=always` paints even a pipe,
 and `--color=never` paints nothing. Two environment variables turn colour off
 whatever the flag says: `NO_COLOR` set to anything but the empty string (see
 [no-color.org](https://no-color.org/)), and `TERM=dumb`.
+
+The colours themselves can be changed with the `DOTCL_COLORS` environment
+variable, written like `GCC_COLORS`: `role=params` pairs separated by colons,
+where `params` is what goes between `ESC [` and `m`. The roles and their
+defaults:
+
+    DOTCL_COLORS='prompt=1;32:debugger=1;31:shell=1;35:command=1;36:result=36:warning=33:error=31:selected=7:location=1:match=7:string=32:comment=2:keyword=35'
+
+Only the roles you name change. An empty value (`comment=`) leaves that role
+unpainted. A role that is not in the list, or a value with anything but digits
+and semicolons, is skipped, and the REPL starts as usual. `DOTCL_COLORS` picks
+the colours only: whether to paint at all is still up to `--color`,
+`NO_COLOR` and `TERM`. For example, to show comments in dim italic and strings
+in yellow:
+
+    export DOTCL_COLORS='comment=2;3:string=33'
+
+The same form can be given from the init file:
+
+    (require "dotcl-repl")
+    (dotcl-repl:set-colors "comment=2;3:string=33")
 
 On Windows a console is painted when virtual terminal processing can be turned
 on for it, which it can on Windows 10 and later. A terminal that talks to

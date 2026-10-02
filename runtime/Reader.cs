@@ -221,6 +221,59 @@ public class Reader
         Position -= s.Length;
     }
 
+    /// <summary>Take back a character that a Lisp reader-macro function returned to
+    /// the stream with UNREAD-CHAR. That character sits in the stream's one-char
+    /// buffer, which this Reader never looks at, so without this the rest of the
+    /// enclosing read (e.g. the list reader looking for ')') skipped it and it only
+    /// came back on the next READ-CHAR. Called right after the macro function
+    /// returns. The character was consumed by READ-CHAR outside this Reader, so
+    /// Position never counted it; it is queued without adjusting Position.</summary>
+    internal void AbsorbStreamUnread(LispObject? streamRef)
+    {
+        // Only native streams: a Gray stream keeps its own unread state, and
+        // resolving a non-LispStream would fall back to *standard-input*.
+        if (streamRef is not LispStream) return;
+        var ls = Runtime.ResolveLispStreamForReader(streamRef);
+        int ch = ls.UnreadCharValue;
+        if (ch == -1) return;
+        ls.UnreadCharValue = -1;
+        // The macro function read past anything this Reader still holds in
+        // lookahead, so the returned character goes after it.
+        string pending = _inputPrefix.Substring(_inputPrefixPos);
+        if (_hasPushback) { pending += (char)_pushedBack; _hasPushback = false; }
+        _inputPrefix = pending + (char)ch;
+        _inputPrefixPos = 0;
+    }
+
+    /// <summary>The reverse of AbsorbStreamUnread, for the end of a READ called
+    /// through the stream API. A character this Reader still holds in lookahead
+    /// is invisible to READ-CHAR and PEEK-CHAR on the stream, which only see the
+    /// stream's one-char unread buffer. A reader macro that calls READ and then
+    /// READ-CHAR (a list reader written in Lisp, for instance) skipped over it:
+    /// when the nested READ ended in a macro that had given the ')' back with
+    /// UNREAD-CHAR, the ')' stayed here and the caller read past it. Only a
+    /// single held character fits the stream's buffer; more than one stays here,
+    /// where the next READ on this stream still finds it.</summary>
+    internal void ReturnLookaheadToStream(LispObject? streamRef)
+    {
+        if (streamRef is not LispStream) return;
+        var ls = Runtime.ResolveLispStreamForReader(streamRef);
+        if (ls.UnreadCharValue != -1) return;
+        int prefixLeft = _inputPrefix.Length - _inputPrefixPos;
+        if (prefixLeft == 1 && !_hasPushback)
+        {
+            ls.UnreadCharValue = _inputPrefix[_inputPrefixPos];
+            _inputPrefix = "";
+            _inputPrefixPos = 0;
+        }
+        else if (prefixLeft == 0 && _hasPushback)
+        {
+            ls.UnreadCharValue = _pushedBack;
+            _hasPushback = false;
+            if (_pushedBack != -1) Position++;
+        }
+    }
+
     internal void UnreadChar(int ch)
     {
         _pushedBack = ch;
@@ -917,14 +970,18 @@ public class Reader
         }
 
         // The tail of a dotted template is a value, not a list of elements:
-        // `(a . ,b) ends with B itself, `(a . b) with 'B.
+        // `(a . ,b) ends with B itself, `(a . b) with 'B. A vector tail is a
+        // template of its own: `(a . #(,x)) ends with a fresh vector holding X.
         LispObject? dottedTail = null;
         if (current is not Nil)
         {
-            dottedTail = current is Cons dc && dc.Car is Symbol dcs
-                         && ReferenceEquals(dcs, Startup.UNQUOTE)
-                ? ((Cons)dc.Cdr).Car
-                : MakeList(Startup.QUOTE, current);
+            if (current is Cons dc && dc.Car is Symbol dcs
+                && ReferenceEquals(dcs, Startup.UNQUOTE))
+                dottedTail = ((Cons)dc.Cdr).Car;
+            else if (IsBackquoteVector(current))
+                dottedTail = ExpandBackquote(current);
+            else
+                dottedTail = MakeList(Startup.QUOTE, current);
         }
 
         if (items.Count == 0)
@@ -2304,8 +2361,6 @@ public class Reader
         rt.SetDispatchMacroCharacter('#', '(', (r, c, n) => r.ReadVector(n));
         rt.SetDispatchMacroCharacter('#', '*', (r, c, n) => r.ReadBitVector(n));
         rt.SetDispatchMacroCharacter('#', ':', (r, c, n) => r.ReadUninterned());
-        rt.SetDispatchMacroCharacter('#', 'U', (r, c, n) => r.ReadFaslUninterned(n));
-        rt.SetDispatchMacroCharacter('#', 'K', (r, c, n) => r.ReadFaslStruct());
         rt.SetDispatchMacroCharacter('#', '=', (r, c, n) => r.ReadShareLabel(n));
         rt.SetDispatchMacroCharacter('#', '#', (r, c, n) => r.ReadShareRef(n));
         rt.SetDispatchMacroCharacter('#', '.', (r, c, n) => r.ReadReadTimeEval());
@@ -2327,6 +2382,19 @@ public class Reader
             throw r.MakeReaderError("Invalid # dispatch: #)"));
         rt.SetDispatchMacroCharacter('#', '<', (r, c, n) =>
             throw r.MakeReaderError("Invalid # dispatch: #<"));
+    }
+
+    /// <summary>
+    /// Add the fasl-literal syntax (#nU for an uninterned symbol of the fasl,
+    /// #K(...) for a structure) to a readtable. These are not part of the
+    /// standard syntax: they go on a private readtable that only the literal
+    /// reconstruction reads with, so that neither the standard readtable nor the
+    /// initial *READTABLE* claims #U or #K, which user code is free to define.
+    /// </summary>
+    public static void RegisterFaslMacros(LispReadtable rt)
+    {
+        rt.SetDispatchMacroCharacter('#', 'U', (r, c, n) => r.ReadFaslUninterned(n));
+        rt.SetDispatchMacroCharacter('#', 'K', (r, c, n) => r.ReadFaslStruct());
     }
 
     private static LispObject MakeList(params LispObject[] elements)

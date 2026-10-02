@@ -25,8 +25,21 @@
 ;;;;
 ;;;;   [{"system": "split-sequence", "checked": "2026-09-25",
 ;;;;     "verdict": "pass",          ; pass | fail | error | no-result |
-;;;;                                 ; timeout | load-fail
+;;;;                                 ; no-tests | timeout | load-fail
 ;;;;     "framework": "fiveam", "passed": 120, "failed": 0, ...}, ...]
+;;;;
+;;;; run-forks.sh (stage 2c) writes a fourth file, one entry per row that is
+;;;; not ok with the dists alone and whose dependency tree reaches a fork not in
+;;;; the dotcl dist yet, measured again with those forks:
+;;;;
+;;;;   [{"system": "static-vectors", "checked": "2026-10-01",
+;;;;     "forks": "static-vectors cffi",
+;;;;     "judgement": "pending-fork",  ; pending-fork | improved | same | worse
+;;;;     "load": "loads",              ; loads | fail
+;;;;     "verdict": "pass", "framework": "fiveam", "passed": 12, "failed": 0}, ...]
+;;;;
+;;;; It is shown in the "with forks" column and never changes the status, which
+;;;; stays what the dists give a user.
 ;;;;
 ;;;; It is merged here rather than written into the results, so that a load
 ;;;; check and a test run can be redone independently. A row that loads
@@ -46,10 +59,11 @@
 ;;;;   LIBRARY_STATUS_TARGETS      row order          (default targets.txt)
 ;;;;   LIBRARY_STATUS_ANNOTATIONS  the why column     (default annotations.json)
 ;;;;   LIBRARY_STATUS_TESTS_JSON   test verdicts      (default tests.json)
+;;;;   LIBRARY_STATUS_FORKS_JSON   runs with forks    (default forks.json)
 ;;;;   LIBRARY_STATUS_OUT          markdown to write  (default ../../docs/library-status.md)
 ;;;;   DOTCL_VERSION               version that was measured (default "unknown")
 ;;;;
-;;;; MAIN takes the same six as keyword arguments, for calling it by hand.
+;;;; MAIN takes the same seven as keyword arguments, for calling it by hand.
 ;;;;
 ;;;; The table is published, so the "issue" field must name an issue in the
 ;;;; public dotcl/dotcl repository, and an annotation sentence is published
@@ -342,6 +356,31 @@ file. Absent is not an error: no suite has been run, and every row says so."
           (when system (setf (gethash system table) entry)))))
     table))
 
+(defvar *forks* (make-hash-table :test #'equal)
+  "The stage 2c entries, system -> object (see the header).")
+
+(defun %forks-cell (row)
+  "What the run with the pending forks saw, or \"\" for a row it did not
+measure: one that is ok with the dists alone, or whose tree reaches no fork."
+  (let ((entry (gethash (%field row "system") *forks*)))
+    (if (null entry)
+        ""
+        (let* ((judgement (or (%field entry "judgement") "?"))
+               (forks (or (%field entry "forks") ""))
+               (verdict (or (%field entry "verdict") "-"))
+               (framework (or (%field entry "framework") "-"))
+               (passed (or (%field entry "passed") 0))
+               (failed (or (%field entry "failed") 0))
+               (seen (cond ((equal (%field entry "load") "fail") "does not load")
+                           ((string= verdict "pass")
+                            (format nil "ok, ~A: ~D passed" framework passed))
+                           ((string= verdict "fail")
+                            (format nil "~A: ~D of ~D failed" framework failed (+ passed failed)))
+                           ((string= verdict "load-fail") "test system did not load")
+                           ((string= verdict "-") "loads")
+                           (t verdict))))
+          (format nil "~A (~A): ~A" judgement forks seen)))))
+
 (defun %loads-p (row)
   (member (%field row "status") '("load-only" "patched") :test #'equal))
 
@@ -375,6 +414,7 @@ redone independently."
                            ((string= verdict "fail")
                             (format nil "~A: ~D of ~D failed" framework failed (+ passed failed)))
                            ((string= verdict "no-result") "ran; no recognised result")
+                           ((string= verdict "no-tests") "defines no tests")
                            ((string= verdict "error")
                             (if (string= framework "-")
                                 "error"
@@ -391,14 +431,15 @@ redone independently."
             (cons "status" "not checked"))))
 
 (defun %write-rows (out rows annotations tests)
-  (format out "~%| system | status | tests | issue | checked | why | note |~%")
-  (format out "| --- | --- | --- | --- | --- | --- | --- |~%")
+  (format out "~%| system | status | tests | with forks | issue | checked | why | note |~%")
+  (format out "| --- | --- | --- | --- | --- | --- | --- | --- |~%")
   (dolist (row rows)
     (let ((system (or (%field row "system") "?")))
-      (format out "| ~A | `~A` | ~A | ~A | ~A | ~A | ~A |~%"
+      (format out "| ~A | `~A` | ~A | ~A | ~A | ~A | ~A | ~A |~%"
               (%escape-cell system)
               (%status-for row tests)
               (%escape-cell (%tests-cell row tests))
+              (%escape-cell (%forks-cell row))
               (%issue-cell (%field row "issue"))
               (%escape-cell (or (%field row "checked") ""))
               ;; Prose a person wrote, so it is rendered as prose; only the cell
@@ -416,6 +457,14 @@ redone independently."
     ("test system did not load" . "the library loads but its test system does not")
     ("(blank)" . "the suite has not been run"))
   "The values of the tests column, in the order they are explained.")
+
+(defparameter *forks-legend*
+  '(("pending-fork (F): ..." . "loads, or passes, only with the forks F: the row waits on a fork reaching the dotcl dist")
+    ("improved (F): ..." . "better with the forks F (fewer failures, or an error that became a failure), but still not ok")
+    ("same (F): ..." . "no better with the forks F: they are not what the row waits on")
+    ("worse (F): ..." . "worse with the forks F")
+    ("(blank)" . "not measured with forks: the row is ok, or reaches no fork"))
+  "The values of the with forks column.")
 
 (defun %write-markdown (path rows dist dotcl-version extra annotations tests
                         &optional hand-picked-rows)
@@ -438,9 +487,19 @@ redone independently."
     (format out "~%The tests column is what running the library's own test suite~%")
     (format out "(`asdf:test-system`) printed, read by a recogniser for the test~%")
     (format out "framework (fiveam, rt, rove, prove, parachute, stefil, fiasco,~%")
-    (format out "clunit, Try).~%~%")
+    (format out "clunit, Try, 1am, lisp-unit2, lift, ptester, and cl-ppcre's own~%")
+    (format out "harness, counted per suite).~%~%")
     (format out "| tests | meaning |~%| --- | --- |~%")
     (loop for (value . meaning) in *tests-legend*
+          do (format out "| ~A | ~A |~%" value meaning))
+    (format out "~%Some libraries have a dotcl fork with the fix that the dotcl dist~%")
+    (format out "does not carry yet. The with forks column is filled for a row that~%")
+    (format out "is not ok and whose dependencies reach such a fork: the same row~%")
+    (format out "measured again with those forks ahead of the dists. It names the~%")
+    (format out "forks reached and what the run saw. It never changes the status,~%")
+    (format out "which is what the dists give you today.~%~%")
+    (format out "| with forks | meaning |~%| --- | --- |~%")
+    (loop for (value . meaning) in *forks-legend*
           do (format out "| ~A | ~A |~%" value meaning))
     (%write-rows out (append rows extra) annotations tests)
     (when hand-picked-rows
@@ -451,7 +510,7 @@ redone independently."
       (format out "ranks nowhere. The order in this table means nothing.~%")
       (%write-rows out hand-picked-rows annotations tests))))
 
-(defun main (&key json targets out dotcl-version annotations tests)
+(defun main (&key json targets out dotcl-version annotations tests forks)
   (let* ((here (directory-namestring
                 (or *load-truename* *default-pathname-defaults*)))
          (json (or json (%env "LIBRARY_STATUS_JSON"
@@ -462,6 +521,9 @@ redone independently."
          (tests (or tests
                     (%env "LIBRARY_STATUS_TESTS_JSON"
                           (namestring (merge-pathnames "tests.json" here)))))
+         (forks (or forks
+                    (%env "LIBRARY_STATUS_FORKS_JSON"
+                          (namestring (merge-pathnames "forks.json" here)))))
          (targets (or targets (%env "LIBRARY_STATUS_TARGETS"
                                     (namestring (merge-pathnames "targets.txt" here)))))
          (out (or out (%env "LIBRARY_STATUS_OUT"
@@ -472,6 +534,7 @@ redone independently."
       (let ((results (%parse-json (%read-file json)))
             (annotations (%read-annotations annotations))
             (tests (%read-tests tests))
+            (*forks* (%read-tests forks))
             (by-system (make-hash-table :test #'equal)))
         (dolist (result results)
           (let ((system (%field result "system")))

@@ -4,7 +4,24 @@
        library (DotCL.Runtime.csproj), inherit this <Version> via MSBuild's automatic
        Directory.Build.props import. Bump the release version HERE only. -->
   <PropertyGroup>
-    <Version>0.1.30</Version>
+    <Version>0.1.31</Version>
+  </PropertyGroup>
+
+  <!-- The two packed projects in this directory must not share restore output.
+       By default both write obj/project.assets.json and obj/project.nuget.cache,
+       and a restore of the tool (runtime.csproj) also restores the ProjectReference
+       DotCL.Runtime, so the two projects race to write the same file. When the
+       library wins, the tool is built and packed against the library's assets, and
+       every tool package (dotcl, dotcl.<rid>, dotcl.any) gets the library's
+       netstandard2.0 dependency group: System.Memory, System.Text.Json and friends.
+       A tool package should carry no dependencies. Measured: of six forced restores
+       of runtime.csproj, the library won two.
+       The tool's restore output moves to obj/tool/. The library keeps obj/, so
+       projects that reference DotCL.Runtime.csproj see no change, and the rest of
+       obj/ (per-configuration intermediates, whose file names already differ
+       between the two) stays where it was. -->
+  <PropertyGroup Condition="'$(MSBuildProjectName)' == 'runtime'">
+    <MSBuildProjectExtensionsPath>$(MSBuildThisFileDirectory)obj/tool/</MSBuildProjectExtensionsPath>
   </PropertyGroup>
 
   <!-- The build has no compiler warnings, and stays that way: a warning stops it.
@@ -30,7 +47,11 @@
                     the multi-targeted DotCL.Runtime puts a dependency group per
                     target framework in the nuspec. Nothing consumes those groups:
                     installing a tool does not resolve dependencies, and the
-                    produced nuspec carries none of them either (verified).
+                    produced nuspec carries no <dependency> in them; that is
+                    only true while the tool reads its own restore output (see
+                    the MSBuildProjectExtensionsPath split below), and
+                    test/pack-nuspec/tool-deps.sh fails the pack if it stops
+                    being true.
            NU5100; DotCL.Build.Tasks.dll ships under tasks/ because it is an
                     MSBuild task the .targets loads by path, not a reference. -->
     <WarningsNotAsErrors>$(WarningsNotAsErrors);NU5128;NU5100</WarningsNotAsErrors>

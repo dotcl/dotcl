@@ -46,6 +46,43 @@ for name in $components; do
 	[ -f "$src/$name.lisp" ] || { echo "missing component $name.lisp" >&2; exit 1; }
 done
 
+# bundle.lisp reads bundle-template.lisp from beside itself, finding it with
+# #.(merge-pathnames "bundle-template.lisp" (or *compile-file-truename*
+# *load-truename*)) inside a LOAD-TIME-VALUE. Concatenated, "beside itself" is
+# contrib/quicklisp/, which has no template, and compiled into the fasl it would
+# be the build machine's path anyway -- so ql:bundle-systems failed when it came
+# to write the bundle's loader. The template goes in as a literal list of lines
+# instead, the same lines the original would have read. The block replaced is
+# matched by its first and last lines, and the build stops if either is not
+# found exactly once: an upstream change there must be looked at, not guessed.
+inline_bundle_template() {
+	bundle="$1"
+	template="$2"
+	[ -f "$template" ] || { echo "missing $template" >&2; exit 1; }
+	first='	 (load-time-value'
+	last='                  while line collect line)))))'
+	[ "$(grep -cxF "$first" "$bundle")" = 1 ] || {
+		echo "bundle.lisp: the template's LOAD-TIME-VALUE block is not where expected" >&2; exit 1; }
+	[ "$(grep -cxF "$last" "$bundle")" = 1 ] || {
+		echo "bundle.lisp: the end of the template block is not where expected" >&2; exit 1; }
+	awk -v first="$first" -v last="$last" -v template="$template" '
+		$0 == first {
+			skipping = 1
+			print "\t '"'"'("
+			while ((getline line < template) > 0) {
+				gsub(/\\/, "\\\\", line)
+				gsub(/"/, "\\\"", line)
+				print "\t   \"" line "\""
+			}
+			print "\t   )))"
+			next
+		}
+		skipping && $0 == last { skipping = 0; next }
+		skipping { next }
+		{ print }
+	' "$bundle"
+}
+
 version=$(cat "$src/version.txt")
 tmp="$out.tmp"
 
@@ -66,7 +103,11 @@ tmp="$out.tmp"
 	echo ""
 	for name in $components; do
 		echo ";;;; ---------------- $name.lisp ----------------"
-		cat "$src/$name.lisp"
+		if [ "$name" = "bundle" ]; then
+			inline_bundle_template "$src/bundle.lisp" "$src/bundle-template.lisp"
+		else
+			cat "$src/$name.lisp"
+		fi
 		echo ""
 		# The shims need the client's packages to exist (they bind a variable in
 		# ql-impl) and must precede every component that macroexpands against

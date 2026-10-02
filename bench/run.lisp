@@ -243,7 +243,22 @@
   (:use :common-lisp)
   (:export #:run-slurp-lines #:hash-strings #:hash-integers))
 
+;; hash.lisp defines +DIGIT+ and +DIGITS-NEEDED+ inside
+;; (EVAL-WHEN (:COMPILE-TOPLEVEL :LOAD-TOPLEVEL) ...), which a source LOAD may
+;; skip (CLHS 3.8: only :EXECUTE applies there). On SBCL the constants stayed
+;; unbound and HASH-STRINGS failed, so the suite had no SBCL number to compare
+;; with. Define them after the file is loaded if the load did not, with the
+;; file's own values; the functions read them at run time.
+(defun ensure-hash-constants ()
+  (unless (boundp 'cl-bench.hash::+digit+)
+    (eval '(defconstant cl-bench.hash::+digit+ "0123456789ABCDEF")))
+  (unless (boundp 'cl-bench.hash::+digits-needed+)
+    (eval '(defconstant cl-bench.hash::+digits-needed+
+            #((10 100 1000 10000 100000 10000000 100000000 536870911)
+              (16 256 4096 65536 1048576 16777216 268435456 4294967296 536870911))))))
+
 (with-suite (:hash "cl-bench/files/hash.lisp")
+  (ensure-hash-constants)
   (bench "hash-strings"    2  (cl-bench.hash:hash-strings))
   (bench "hash-integers"  10  (cl-bench.hash:hash-integers)))
 

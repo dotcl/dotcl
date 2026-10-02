@@ -31,6 +31,8 @@
 set -eu
 
 root="${1:-.}"
+# Note filters (scrub_note), shared with the other stage.
+. "$(dirname "$0")/scrub.sh"
 targets="${LIBRARY_STATUS_TARGETS:-$root/bench/library-status/targets.txt}"
 out="${LIBRARY_STATUS_JSON:-$root/bench/library-status/results.json}"
 logdir="${LIBRARY_STATUS_LOGDIR:-/tmp/library-status-logs}"
@@ -66,20 +68,8 @@ jstr() {
   printf '%s' "$1" \
     | tr -d '"\\' | tr '\n\r\t' '   ' \
     | sed 's|^[. ]*||; s|^[^ ]*drv\.lisp:[0-9]*: ||; s|  *| |g; s| *$||' \
-    | scrub_paths \
+    | scrub_note \
     | cut -c1-160
-}
-
-# The note is published, and error text carries whatever path the failure
-# happened under: the measuring machine's home directory and checkout
-# ("working directory 'C:Usersmeworkdotcl'", with the backslashes already
-# gone). Replace any absolute path -- a drive letter followed by a path or a
-# name, optionally after #P, or a /home /Users /tmp /mnt path, also when glued
-# to a compiler flag such as -I/Users/... -- with <path>. A single letter before
-# a colon is only taken as a drive when nothing alphanumeric precedes it, so
-# package prefixes (ASDF/USER::X) are left alone.
-scrub_paths() {
-  sed -E 's@(^|[^A-Za-z0-9])(#P)?[A-Za-z]:[/A-Za-z][^ )"'"'"']*@\1<path>@g; s@(^|[^A-Za-z0-9]|-[A-Za-z]+)/(home|Users|tmp|mnt)/[^ )"'"'"']*@\1<path>@g'
 }
 
 : > "$work/entries"
@@ -153,7 +143,8 @@ for sys in $(grep -v '^#' "$targets" | grep -v '^[[:space:]]*$'); do
 (dotcl:quit 0)
 DRVEOF
 
-  log="$logdir/$sys.txt"
+  # A slash in a system name ("foo/test") is not a directory here.
+  log="$logdir/$(printf '%s' "$sys" | tr / _).txt"
   t0=$(date +%s)
   set +e
   "$timeout" "$per" "$exe" --asm "$core" "$work/drv.lisp" > "$log" 2>&1 < /dev/null

@@ -374,3 +374,31 @@
   :type-error)
 
 (setf dotcl:*save-sil* nil)
+
+;; A store in statement position outside a loop allocates nothing. The value a
+;; SETF would return was boxed in each arm of the buffer / helper choice, before
+;; the arms joined, so the box nobody reads survived there (24 B a store for a
+;; value past the small-integer cache); it is boxed once after the join now.
+(defun %abh-straight-stores (a)
+  (declare (type (simple-array (unsigned-byte 32) (*)) a))
+  (setf (aref a 0) (logxor (aref a 1) (aref a 2)))
+  (setf (aref a 3) (logxor (aref a 1) (aref a 3)))
+  nil)
+
+(deftest-emitting-only array-backing-hoist.straight-line-store-does-not-box
+  (let ((a (make-array 4 :element-type '(unsigned-byte 32)
+                         :initial-contents '(0 #xDEADBEEF #x12345678 #x9E3779B9))))
+    ;; The allocation counter is process-wide: a window can catch the runtime
+    ;; allocating for itself (tiering, the first calls). Warm up, then take the
+    ;; smallest of three windows. Each call flips (aref a 3), so the total
+    ;; number of calls is kept odd.
+    (dotimes (i 1001) (%abh-straight-stores a))
+    (let ((best nil))
+      (dotimes (w 3)
+        (let ((b0 (nth 4 (dotcl:gc-stats))))
+          (dotimes (i 1000) (%abh-straight-stores a))
+          (let ((d (- (nth 4 (dotcl:gc-stats)) b0)))
+            (setf best (if best (min best d) d)))))
+      (list (< best 4000)
+            (coerce a 'list))))
+  (t (3432638615 3735928559 305419896 1083885398)))

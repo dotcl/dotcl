@@ -341,16 +341,24 @@ DotclHost.EvalString(@"(setq *debugger-hook*
 var v = DotclHost.EvalString("(restart-case (error \"needs a value\") (use-value (x) x))");
 ```
 
-One asymmetry to know about: a failure raised by the runtime itself -- a .NET
-method that threw, reached through `dotnet:invoke` -- is thrown directly as a
-`LispErrorException` rather than routed through `*debugger-hook*`, so a host that
-wants to catch everything catches that type too. It carries the same condition
-(`e.Condition`), with the original .NET exception on
-`e.Condition.ClrException`.
+A failure the runtime raises itself -- a .NET method that threw, reached through
+`dotnet:invoke`, or a type error from `car` -- does not run `*debugger-hook*`: it
+unwinds as a `LispErrorException`. With the hook above installed, the
+`DotclHost` entry points (`EvalString`, `EvalStringMv`, `Call`, `CallMv`,
+`LoadLispFile`) turn such a failure into a `DotclConditionException` on its way
+out, so one `catch` covers both kinds. `ClrException` is the original .NET
+exception here too, and `InnerException` is the `LispErrorException` that carried
+it. Only the outermost entry converts: when Lisp code calls back into the host
+and the host calls into Lisp again, the inner failure stays a
+`LispErrorException` until it has passed the Lisp frames in between, whose
+handlers still see the original condition. A host that has bound
+`*debugger-hook*` to anything else gets the `LispErrorException` unchanged, as
+before.
 
 `SetThrowingDebuggerHook(false)` selects the older behaviour, where the hook
 throws an `InvalidOperationException` whose message is `"TYPE: report"` and which
-carries nothing else.
+carries nothing else, and a runtime-raised failure still arrives as a
+`LispErrorException`.
 
 ## Stack size when embedding
 

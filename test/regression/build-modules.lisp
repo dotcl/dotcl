@@ -22,8 +22,7 @@
       (error "cannot locate this process's executable")))
 
 (defvar *bmod-core*
-  (or (ignore-errors (namestring (truename "compiler/cil-out.sil")))
-      "compiler/cil-out.sil"))
+  (regression-child-core))
 
 (defun bmod-path (name)
   (namestring (merge-pathnames name (truename *bmod-dir*))))

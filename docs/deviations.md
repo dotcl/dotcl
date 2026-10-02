@@ -20,6 +20,26 @@ open and dotcl reads it differently.
 | `open :direction :output :if-exists :append`: moving the position | Every write goes to the end of the file as it is at that moment, so another appender's data is never overwritten. `file-position` reports that end; setting it to anything else returns `nil` | SBCL opens with `O_APPEND` too, but setting the position returns `t` and the next write still goes to the end | Answering `t` would promise a write position that the OS does not honour. The end-of-file guarantee comes from the OS: an append-only handle on Windows, `O_APPEND` on Linux and macOS. Elsewhere (other Unix systems, WebAssembly) the stream seeks to the end once, at open, which is right only while it is the sole writer. `:direction :io` with `:if-exists :append` also still seeks once | until a caller needs the other answer |
 | `~G`: how many digits a value with no short exact form gets, and which way an exact tie rounds | `(format nil "~g" 123456789.0)` gives `123456792.` (the exact single-float value); `(format nil "~,3g" 1234.5)` gives `1.234e+3` | SBCL gives `123456790.` (the shortest form that reads back) and `1.235e+3` | CLHS 22.3.3.3 decides neither, and dotcl's own format tests already record the direction of an exact tie as free. Every other `~G` form measured against SBCL agrees | until a caller needs one |
 
+## Library backends
+
+**CFFI foreign pointers are plain integers.** The CFFI-SYS backend that the
+dotcl dist ships represents a foreign pointer as the integer address itself:
+`null-pointer` is `0`, `inc-pointer` is `+`, and `foreign-pointer` is the type
+`integer`. So `pointerp` is true of every integer, including `42` and `0`, and
+`pointer-eq` and `null-pointer-p` accept any integer without signalling. On
+SBCL a pointer is a separate object (a SAP) and all three reject a bare
+integer. Four tests in CFFI's own suite check exactly that and fail on dotcl:
+`POINTERP.4`, `POINTERP.5`, `POINTER-EQ.NON-POINTERS.1` and
+`NULL-POINTER-P.NON-POINTER.2`. The integer form is what .NET interop hands
+over and accepts for an address (`IntPtr` converts to and from an integer), so
+every pointer crosses that boundary without a wrapper being allocated or
+unwrapped, and pointer arithmetic stays integer arithmetic. CFFI's Allegro
+backend makes the same choice for the null pointer, which is also the integer
+`0` there. A distinct pointer type would change every path through `mem-ref`,
+`inc-pointer` and the callbacks, and any existing code that passes an address
+it got from .NET straight to CFFI; it is not planned until a library needs to
+tell a pointer from an integer.
+
 Behaviour at the boundary between Lisp and .NET -- which exception is caught
 where, and what a condition escaping a callback does -- is a larger topic with
 its own table in [DESIGN.md](../DESIGN.md), section 3.11.

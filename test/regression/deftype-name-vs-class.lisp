@@ -74,10 +74,12 @@
         (multiple-value-list (subtypep 'dtnc-a::only-class-sub 'dtnc-a::only-class)))
   (nil :class (nil nil) (nil nil) (nil nil) (t t)))
 
+;; TYPEP on such a symbol is an unknown type specifier, which signals.
 (deftest deftype-name-vs-class.typep-unrelated-symbol-not-a-class
-  (list (typep (make-instance 'dtnc-a::only-class) 'dtnc-d::only-class)
-        (typep (make-instance 'dtnc-a::only-class-sub) 'dtnc-d::only-class)
-        (typep (dtnc-a::make-only-struct) 'dtnc-d::only-struct)
-        (typep (make-instance 'dtnc-a::only-class-sub) 'dtnc-a::only-class)
-        (typep (dtnc-a::make-only-struct) 'dtnc-a::only-struct))
-  (nil nil nil t t))
+  (flet ((ty (obj type) (handler-case (typep obj type) (error () :error))))
+    (list (ty (make-instance 'dtnc-a::only-class) 'dtnc-d::only-class)
+          (ty (make-instance 'dtnc-a::only-class-sub) 'dtnc-d::only-class)
+          (ty (dtnc-a::make-only-struct) 'dtnc-d::only-struct)
+          (ty (make-instance 'dtnc-a::only-class-sub) 'dtnc-a::only-class)
+          (ty (dtnc-a::make-only-struct) 'dtnc-a::only-struct)))
+  (:error :error :error t t))

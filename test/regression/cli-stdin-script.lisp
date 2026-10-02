@@ -16,8 +16,7 @@
       (error "cannot locate this process's executable")))
 
 (defvar *cli-si-core*
-  (or (ignore-errors (namestring (truename "compiler/cil-out.sil")))
-      "compiler/cil-out.sil"))
+  (regression-child-core))
 
 (defun %cli-si-run (args input)
   "Run the child with INPUT on a pipe as its standard input.

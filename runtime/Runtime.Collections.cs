@@ -627,6 +627,9 @@ public static partial class Runtime
         if (elemTypeName.StartsWith("SIGNED-BYTE-", StringComparison.Ordinal) &&
             long.TryParse(elemTypeName.Substring(12), out long sbits))
             return new Cons(Startup.Sym("SIGNED-BYTE"), new Cons(Fixnum.Make(sbits), Nil.Instance));
+        // Same answer ARRAY-ELEMENT-TYPE gives for a complex element type.
+        if (elemTypeName == "COMPLEX" || elemTypeName.StartsWith("COMPLEX-", StringComparison.Ordinal))
+            return Runtime.ElementTypeNameToType(elemTypeName);
         return Startup.Sym(elemTypeName);
     }
 
@@ -1598,8 +1601,11 @@ public static partial class Runtime
             if (junkAllowed) return MultipleValues.Values2(Nil.Instance, Fixnum.Make(i));
             throw new LispErrorException(new LispError($"PARSE-INTEGER: no integer in substring") { ConditionTypeName = "PARSE-ERROR" });
         }
-        // Skip trailing whitespace
-        while (i < end && char.IsWhiteSpace(str[i])) i++;
+        // Without :junk-allowed, trailing whitespace is allowed and skipped. With
+        // it, the index returned is the first character not part of the integer
+        // (as SBCL / CCL), so a caller can resume parsing right after the digits.
+        if (!junkAllowed)
+            while (i < end && char.IsWhiteSpace(str[i])) i++;
         if (i < end && !junkAllowed)
             throw new LispErrorException(new LispError($"PARSE-INTEGER: junk in string at position {i}") { ConditionTypeName = "PARSE-ERROR" });
         if (negative) result = -result;
@@ -1613,7 +1619,7 @@ public static partial class Runtime
         string testName = test switch
         {
             Symbol sym => sym.Name,
-            LispFunction fn => fn.Name ?? "EQL",
+            LispFunction fn => HashTestFunctionName(fn),
             _ => "EQL"
         };
         return new LispHashTable(testName);
@@ -1624,11 +1630,47 @@ public static partial class Runtime
         string testName = test switch
         {
             Symbol sym => sym.Name,
-            LispFunction fn => fn.Name ?? "EQL",
+            LispFunction fn => HashTestFunctionName(fn),
             _ => "EQL"
         };
         return new LispHashTable(testName, synchronized);
     }
+
+    /// <summary>The :TEST name of a function object given to MAKE-HASH-TABLE. An
+    /// anonymous function used to become EQL without a word, so a table meant to
+    /// compare with it silently missed keys; it is not one of the four standard
+    /// tests, so it is rejected like an unknown named test.</summary>
+    internal static string HashTestFunctionName(LispFunction fn)
+        => fn.Name ?? throw new LispErrorException(new LispTypeError(
+               "MAKE-HASH-TABLE: unknown :test (expected EQ, EQL, EQUAL or EQUALP)",
+               fn,
+               Runtime.List(Startup.Sym("MEMBER"), Startup.Sym("EQ"), Startup.Sym("EQL"),
+                            Startup.Sym("EQUAL"), Startup.Sym("EQUALP"))));
+
+    /// <summary>MAKE-HASH-TABLE with :HASH-FUNCTION (SBCL extension): any
+    /// two-argument predicate as :TEST, given as a function or its name, with
+    /// HASHFN to hash the keys. A standard test (EQ, EQL, EQUAL, EQUALP) keeps
+    /// its own comparison and uses HASHFN only to hash, as SBCL does.</summary>
+    internal static LispObject MakeHashTableWithHashFunction(LispObject? test, LispObject hashArg,
+                                                             bool synchronized, string? weakness)
+    {
+        var hashFn = Runtime.CoerceToFunction(hashArg);
+        test ??= Startup.Sym("EQL");
+        static string? Standard(LispObject? o)
+            => o is Symbol s && s.HomePackage == Startup.CL
+               && s.Name is "EQ" or "EQL" or "EQUAL" or "EQUALP" ? s.Name : null;
+        string? std = test is LispFunction tf ? Standard(Runtime.FunctionNameObject(tf)) : Standard(test);
+        if (std != null)
+            return new LispHashTable(std, null, null, hashFn, synchronized, weakness);
+        var testFn = Runtime.CoerceToFunction(test);
+        // HASH-TABLE-TEST answers the name the test was given by, or the name of
+        // a global function given as an object, as SBCL does; else the function.
+        LispObject designator = test is Symbol ? test : ProperFunctionName(testFn);
+        return new LispHashTable(null, testFn, designator, hashFn, synchronized, weakness);
+    }
+
+    private static LispObject ProperFunctionName(LispFunction fn)
+        => Runtime.FunctionNameObject(fn) is Symbol sym ? sym : fn;
 
     public static LispObject MakeHashTable0()
     {
@@ -1709,6 +1751,14 @@ public static partial class Runtime
             Nil => 0,
             T => 1,
             Fixnum f => f.Value.GetHashCode(),
+            // Every number hashes by its value: EQUAL compares numbers with EQL,
+            // and a constant hash put every bignum key of a table built on SXHASH
+            // (Coalton's hash maps) in one bucket.
+            Bignum b => b.Value.GetHashCode(),
+            SingleFloat sf => sf.Value.GetHashCode(),
+            DoubleFloat df => df.Value.GetHashCode(),
+            Ratio r => unchecked(r.Numerator.GetHashCode() * 31 + r.Denominator.GetHashCode()),
+            LispComplex cx => unchecked(SxhashCompute(cx.Real, depth - 1) * 31 + SxhashCompute(cx.Imaginary, depth - 1)),
             LispChar ch => ch.Value.GetHashCode(),
             Symbol s => s.Name.GetHashCode(StringComparison.Ordinal),
             LispString ls => ls.Value.GetHashCode(StringComparison.Ordinal),
@@ -1767,6 +1817,7 @@ public static partial class Runtime
             new LispFunction(args => {
                 if (args.Length == 0) return Runtime.MakeHashTable0();
                 LispObject? testArg = null;
+                LispObject? hashArg = null;
                 bool synchronized = false;
                 string? weakness = null;
                 for (int i = 0; i < args.Length - 1; i += 2)
@@ -1774,6 +1825,7 @@ public static partial class Runtime
                     if (args[i] is Symbol kw)
                     {
                         if (kw.Name == "TEST") testArg = args[i + 1];
+                        else if (kw.Name == "HASH-FUNCTION") hashArg = args[i + 1];
                         else if (kw.Name == "SYNCHRONIZED") synchronized = args[i + 1] is not Nil;
                         else if (kw.Name == "WEAKNESS")
                         {
@@ -1784,11 +1836,13 @@ public static partial class Runtime
                         }
                     }
                 }
+                if (hashArg != null && hashArg is not Nil)
+                    return Runtime.MakeHashTableWithHashFunction(testArg, hashArg, synchronized, weakness);
                 string testName = testArg switch
                 {
                     Symbol s => s.Name.ToUpperInvariant(),
                     LispString ls => ls.Value.ToUpperInvariant(),
-                    LispFunction fn => (fn.Name ?? "EQL").ToUpperInvariant(),
+                    LispFunction fn => Runtime.HashTestFunctionName(fn).ToUpperInvariant(),
                     null => "EQL",
                     _ => "EQL"
                 };
@@ -1835,21 +1889,24 @@ public static partial class Runtime
         }));
 
         // SBIT, (SETF SBIT)
-        Emitter.CilAssembler.RegisterFunction("SBIT",
-            new LispFunction(args => {
+        var sbitFn = new LispFunction(args => {
                 if (args.Length < 1)
                     throw new LispErrorException(new LispProgramError("SBIT: too few arguments"));
                 return Runtime.ArefMulti(args);
-            }));
+            });
+        // The one-subscript call without an argument array (see Runtime.Bit1).
+        sbitFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject>)Runtime.Bit1);
+        Emitter.CilAssembler.RegisterFunction("SBIT", sbitFn);
         Emitter.CilAssembler.RegisterFunction("(SETF SBIT)", new LispFunction(args => Runtime.ArefSetMulti(args)));
 
         // BIT, (SETF BIT)
-        Emitter.CilAssembler.RegisterFunction("BIT",
-            new LispFunction(args => {
+        var bitFn = new LispFunction(args => {
                 if (args.Length < 1)
                     throw new LispErrorException(new LispProgramError("BIT: too few arguments"));
                 return Runtime.ArefMulti(args);
-            }));
+            });
+        bitFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject>)Runtime.Bit1);
+        Emitter.CilAssembler.RegisterFunction("BIT", bitFn);
         Emitter.CilAssembler.RegisterFunction("(SETF BIT)", new LispFunction(args => Runtime.ArefSetMulti(args)));
 
         // MAKE-LIST
@@ -1942,7 +1999,10 @@ public static partial class Runtime
             // a name like EQL taken from the head of (eql 8) is neither.
             var name = Runtime.ParseElementTypeName(args[0]);
             bool specialized = name is "BIT" or "CHARACTER" or "BASE-CHAR" or "NIL" or "T"
-                               || LispVector.NumKindForElementType(name) != 0;
+                               || LispVector.NumKindForElementType(name) != 0
+                               // ARRAY-ELEMENT-TYPE reports (complex single-float) and
+                               // (complex double-float) as themselves; answer the same.
+                               || Runtime.ComplexElementPartClass(name) != 'O';
             return specialized ? Runtime.ElementTypeNameToType(name) : Startup.Sym("T");
         }));
 
@@ -2023,7 +2083,18 @@ public static partial class Runtime
                 v2.SetElement(idx, val);
                 return val;
             }
-            throw new LispErrorException(new LispTypeError("(SETF ROW-MAJOR-AREF): not a vector", arr));
+            if (arr is LispString s2)
+            {
+                if ((uint)idx >= (uint)s2.Length)
+                    throw Runtime.IndexError("(SETF ROW-MAJOR-AREF)", idx, s2.Length, "string");
+                if (val is not LispChar ch)
+                    throw new LispErrorException(new LispTypeError(
+                        "(SETF ROW-MAJOR-AREF): the new element of a string must be a character",
+                        val, Startup.Sym("CHARACTER")));
+                s2[idx] = ch.Value;
+                return val;
+            }
+            throw new LispErrorException(new LispTypeError("(SETF ROW-MAJOR-AREF): not an array", arr, Startup.Sym("ARRAY")));
         }, "%SET-ROW-MAJOR-AREF", 3));
 
         // VECTOR-PUSH / VECTOR-PUSH-EXTEND / VECTOR-POP
@@ -2128,7 +2199,7 @@ public static partial class Runtime
             obj is LispHashTable ht2 ? Fixnum.Make(Math.Max(ht2.Count, 16))
             : throw new LispErrorException(new LispTypeError("HASH-TABLE-SIZE: not a hash-table", obj)));
         Startup.RegisterUnary("HASH-TABLE-TEST", obj =>
-            obj is LispHashTable ht3 ? Startup.Sym(ht3.TestName)
+            obj is LispHashTable ht3 ? ht3.TestDesignator
             : throw new LispErrorException(new LispTypeError("HASH-TABLE-TEST: not a hash-table", obj)));
         // SBCL extension: hash-table-weakness returns the weakness keyword
         // (:key, :value, :key-and-value, :key-or-value) or NIL for strong tables.

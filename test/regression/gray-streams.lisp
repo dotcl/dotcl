@@ -752,3 +752,59 @@ b")
     (force-output (make-synonym-stream '*%gray-fo-target*))
     (%gray-fo-calls s))
   (:force))
+
+;;; FRESH-LINE and TERPRI reach STREAM-FRESH-LINE / STREAM-TERPRI on a Gray
+;;; stream, and FORMAT's ~& asks STREAM-START-LINE-P. They used to
+;;; write a newline through the STREAM-WRITE-CHAR bridge, so a stream that
+;;; tracks its own column (spinneret's HTML stream) never saw them.
+(defclass %gray-col (dotcl-gray:fundamental-character-output-stream)
+  ((col :initform 0 :accessor %gray-col-col)
+   (calls :initform nil :accessor %gray-col-calls)
+   (out :initform (make-string-output-stream) :reader %gray-col-out)))
+
+(defmethod dotcl-gray:stream-write-char ((s %gray-col) c)
+  (write-char c (%gray-col-out s))
+  (setf (%gray-col-col s) (if (char= c #\Newline) 0 (1+ (%gray-col-col s))))
+  c)
+(defmethod dotcl-gray:stream-line-column ((s %gray-col)) (%gray-col-col s))
+(defmethod dotcl-gray:stream-terpri ((s %gray-col))
+  (push :terpri (%gray-col-calls s))
+  (call-next-method))
+(defmethod dotcl-gray:stream-fresh-line ((s %gray-col))
+  (push :fresh-line (%gray-col-calls s))
+  (call-next-method))
+
+(defun %gray-col-result (s)
+  (list (get-output-stream-string (%gray-col-out s))
+        (reverse (%gray-col-calls s))))
+
+(deftest gray-fresh-line-calls-stream-fresh-line
+  (let ((s (make-instance '%gray-col)))
+    (list (fresh-line s)
+          (progn (write-char #\a s) (fresh-line s))
+          (%gray-col-result s)))
+  (nil t (#.(format nil "a~%") (:fresh-line :fresh-line :terpri))))
+
+(deftest gray-terpri-calls-stream-terpri
+  (let ((s (make-instance '%gray-col)))
+    (terpri s)
+    ;; WRITE-LINE ends the line with STREAM-WRITE-CHAR, as in SBCL.
+    (write-line "x" s)
+    (%gray-col-result s))
+  (#.(format nil "~%x~%") (:terpri)))
+
+(deftest gray-fresh-line-via-standard-output
+  (let* ((s (make-instance '%gray-col)))
+    (let ((*standard-output* s))
+      (write-char #\b)
+      (fresh-line)
+      (terpri))
+    (%gray-col-result s))
+  (#.(format nil "b~%~%") (:fresh-line :terpri :terpri)))
+
+(deftest gray-format-tilde-ampersand-uses-column
+  (let ((s (make-instance '%gray-col)))
+    (format s "~&a")
+    (format s "~&b~&")
+    (first (%gray-col-result s)))
+  #.(format nil "a~%b~%"))

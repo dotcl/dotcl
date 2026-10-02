@@ -31,6 +31,7 @@
            #:*history-file*
            #:*completer*
            #:*syntax-highlight*
+           #:set-colors
            #:enable
            #:disable
            #:define-command
@@ -121,6 +122,16 @@
 ;;; NO_COLOR and TERM, so the prompts and messages written here agree with the
 ;;; ones the read loop writes. An image without the runtime function paints
 ;;; nothing.
+
+(defun set-colors (spec)
+  "Change the colours the REPL paints with. SPEC has the form of the
+DOTCL_COLORS environment variable, \"role=params:role=params\", PARAMS being
+what goes between ESC [ and m (\"1;32\"), or nothing for no colour. Roles not
+named keep their colour. Whether to paint at all is not changed."
+  (let ((fn (find-symbol "%REPL-SET-COLORS" "DOTCL")))
+    (when (and fn (fboundp fn))
+      (funcall fn spec))
+    nil))
 
 (defun paint (role text &optional (target :output))
   "TEXT painted as ROLE (:prompt :shell :error ...) for TARGET, which is :output,

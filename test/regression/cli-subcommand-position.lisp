@@ -15,8 +15,7 @@
       (error "cannot locate this process's executable")))
 
 (defvar *cli-sp-core*
-  (or (ignore-errors (namestring (truename "compiler/cil-out.sil")))
-      "compiler/cil-out.sil"))
+  (regression-child-core))
 
 (defun %cli-sp-run (args) (dotcl:run-process *cli-sp-exe* args))
 

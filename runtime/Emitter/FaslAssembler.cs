@@ -248,8 +248,10 @@ public class FaslAssembler
     /// <summary>Process a SIL instruction list and append it to the .fasl</summary>
     public void AddTopLevelForm(LispObject instrList)
     {
+        _structInternMap.BeginFormLiterals(instrList);
         try { AddTopLevelFormImpl(instrList); }
         catch (Exception ex) { ThrowWithStringDiag(ex, _structInternMap, "AddTopLevelForm"); throw; }
+        finally { _structInternMap.EndFormLiterals(); }
     }
 
     /// <summary>As <see cref="AddTopLevelForm(LispObject)"/>, tagging any function
@@ -330,6 +332,7 @@ public class FaslAssembler
                         pendingHead = null;
                         pendingTail = null;
                     }
+                    CloseChunk();
                     var (name, paramNames, bodyInstrs, defPkg, selfArg0, noFrame, lambdaList, directDelegates) = ParseDefmethodForm(inner);
                     int id = _methodCount++;
                     var onBody = _emitDebug ? RecordBodyMethod : (Action<MethodBuilder, CilAssembler>?)null;
@@ -390,6 +393,7 @@ public class FaslAssembler
     /// </summary>
     public void AddMonolithicForm(LispObject instrList)
     {
+        CloseChunk();
         try
         {
             var innerAsm = new CilAssembler();
@@ -403,7 +407,127 @@ public class FaslAssembler
         catch (Exception ex) { ThrowWithStringDiag(ex, _structInternMap, "AddMonolithicForm"); throw; }
     }
 
+    // --- Merging top level helpers ---
+    //
+    // Every top level form used to get a helper method of its own, called once
+    // from ModuleInit. A fasl has thousands of them (asdf.fasl 3,233), each is
+    // JIT-compiled at load only to run once, and a small method's JIT has a fixed
+    // cost several times that of its few instructions. Consecutive forms are now
+    // assembled into one helper, up to MaxChunkInstrs SIL instructions, each with
+    // an assembler (labels, locals) of its own. The helper is called from
+    // ModuleInit when it is closed, which happens before anything else is
+    // written to ModuleInit, so the order of effects is unchanged.
+
+    private MethodBuilder? _chunkMethod;
+    private ILGenerator? _chunkIl;
+    private int _chunkInstrs;
+    private const int MaxChunkInstrs = 4000;
+
+    /// <summary>Finish the open merged helper, if any, and append its call to
+    /// ModuleInit. Everything that writes to ModuleInit calls this first.</summary>
+    private void CloseChunk()
+    {
+        if (_chunkIl == null) return;
+        _chunkIl.Emit(OpCodes.Ldsfld, typeof(Nil).GetField("Instance")!);
+        _chunkIl.Emit(OpCodes.Ret);
+        _initIl.Emit(OpCodes.Call, _chunkMethod!);
+        _initIl.Emit(OpCodes.Pop);
+        _chunkIl = null;
+        _chunkMethod = null;
+        _chunkInstrs = 0;
+    }
+
+    /// <summary>Whether a top level segment can share a helper with its
+    /// neighbours, and its instruction count. It cannot when it returns from
+    /// anywhere but its last instruction, when it has a tail call prefix (which
+    /// must be followed by the RET that merging removes), or when a literal in it
+    /// (at any depth, nested function bodies included) is anything but a symbol,
+    /// number, character, string, cons or general vector: an instance or a
+    /// structure literal may emit its make-load-form creation into ModuleInit
+    /// while the segment is assembled, and that has to stay behind the forms
+    /// before it.</summary>
+    private static bool MergeableSegment(LispObject instrList, out int count)
+    {
+        count = 0;
+        for (var cur = instrList; cur is Cons c; cur = c.Cdr)
+        {
+            count++;
+            if (c.Car is Cons ins && ins.Car is Symbol op)
+            {
+                if (op.Name == "TAIL-PREFIX") return false;
+                if (op.Name == "RET" && c.Cdr is not Nil) return false;
+            }
+        }
+        var stack = new Stack<LispObject>();
+        stack.Push(instrList);
+        int budget = 200000;
+        while (stack.Count > 0)
+        {
+            if (--budget < 0) return false;
+            switch (stack.Pop())
+            {
+                case Cons cc:
+                    stack.Push(cc.Cdr);
+                    stack.Push(cc.Car);
+                    break;
+                case LispVector v:
+                    if (v.ElementTypeName != "T") break;
+                    for (int i = 0; i < v.Length; i++) stack.Push(v.ElementAt(i));
+                    break;
+                case Symbol: case Number: case LispChar: case LispString:
+                case Nil: case T:
+                    break;
+                default:
+                    return false;
+            }
+        }
+        return true;
+    }
+
     private void EmitToplevelHelper(LispObject instrList)
+    {
+        if (!MergeableSegment(instrList, out int count) || count > MaxChunkInstrs)
+        {
+            CloseChunk();
+            EmitOwnToplevelHelper(instrList);
+            return;
+        }
+        if (_chunkIl != null && _chunkInstrs + count > MaxChunkInstrs) CloseChunk();
+        if (_chunkIl == null)
+        {
+            _chunkMethod = _tb.DefineMethod("_toplevel_" + _methodCount++,
+                MethodAttributes.Public | MethodAttributes.Static,
+                typeof(LispObject), Type.EmptyTypes);
+            _chunkIl = _chunkMethod.GetILGenerator();
+        }
+        bool endsWithRet = EndsWithRet(instrList);
+        LispObject body = instrList;
+        if (endsWithRet)
+        {
+            // The same instructions without the final RET: the value it would
+            // return is popped instead, as ModuleInit popped the helper's result.
+            var items = new List<LispObject>();
+            for (var cur = instrList; cur is Cons c && c.Cdr is Cons; cur = c.Cdr) items.Add(c.Car);
+            body = Nil.Instance;
+            for (int i = items.Count - 1; i >= 0; i--) body = new Cons(items[i], body);
+        }
+        var innerAsm = new CilAssembler();
+        innerAsm._il = _chunkIl;
+        innerAsm._faslMode = true;
+        innerAsm._faslTypeBuilder = _tb;
+        innerAsm._faslStructMap = _structInternMap;
+        innerAsm._runOnce = !CilAssembler.HasBackwardBranch(instrList);
+        int mlfBefore = _structInternMap.TopLevelMethodCount;
+        try { innerAsm.Assemble(body); }
+        catch (Exception ex) { ThrowWithStringDiag(ex, _structInternMap, _chunkMethod!.Name); throw; }
+        if (endsWithRet) _chunkIl.Emit(OpCodes.Pop);
+        if (_structInternMap.TopLevelMethodCount != mlfBefore)
+            throw new InvalidOperationException(
+                "fasl: a merged top level form emitted a make-load-form creation into ModuleInit");
+        _chunkInstrs += count;
+    }
+
+    private void EmitOwnToplevelHelper(LispObject instrList)
     {
         int id = _methodCount++;
         string methodName = "_toplevel_" + id;
@@ -422,6 +546,7 @@ public class FaslAssembler
         innerAsm._faslMode = true;
         innerAsm._faslTypeBuilder = _tb;
         innerAsm._faslStructMap = _structInternMap;
+        innerAsm._runOnce = !CilAssembler.HasBackwardBranch(instrList);
         try { innerAsm.Assemble(instrList); }
         catch (Exception ex) { ThrowWithStringDiag(ex, _structInternMap, methodName); throw; }
 
@@ -453,6 +578,7 @@ public class FaslAssembler
     /// Used to emit deferred make-load-form init forms after all creation forms.</summary>
     public void EmitEvalTopLevel(LispObject form)
     {
+        CloseChunk();
         int id = _methodCount++;
         string methodName = "_initform_" + id;
         var method = _tb.DefineMethod(methodName,
@@ -640,7 +766,8 @@ public class FaslAssembler
         // 3. Registration IL (includes _funcN for direct-call fast path). selfArg0 binds
         // the direct delegate's target to fn (open-instance, self bound).
         EmitRegistrationInto(initIl, name, wrapperMethod, paramCount, defPkg, bodyMethod, noFrame: noFrame,
-            selfBound: selfArg0, lambdaList: lambdaList);
+            selfBound: selfArg0, lambdaList: lambdaList,
+            directMv: CilAssembler.BodyReadsMvMode(bodyInstrs));
     }
 
     /// <summary>
@@ -663,11 +790,13 @@ public class FaslAssembler
         // than an unnamed "value" alongside the source-named parameters.
         method.DefineParameter(1, System.Reflection.ParameterAttributes.None, "args");
 
+        var keyShared = BuildKeySharedMethod(tb, structMap, methodName, directDelegates);
         var innerAsm = new CilAssembler();
         innerAsm._il = method.GetILGenerator();
         innerAsm._faslMode = true;
         innerAsm._faslTypeBuilder = tb;
         innerAsm._faslStructMap = structMap;
+        innerAsm._keyShared = keyShared;
         if (onBodyMethod != null) { innerAsm._seqPoints = new(); innerAsm._localVars = new(); innerAsm._completedScopes = new(); }
         innerAsm.Assemble(bodyInstrs);
         if (onBodyMethod != null) onBodyMethod(method, innerAsm);
@@ -678,7 +807,7 @@ public class FaslAssembler
         // delegate it installs at load is the same one. Without this every such
         // function loaded from a fasl fell back to the args-array entry -- and we
         // ship fasls, so that was the only shape a user ever ran.
-        var extraDirect = BuildDirectDelegateMethods(tb, structMap, methodName, directDelegates);
+        var extraDirect = BuildDirectDelegateMethods(tb, structMap, methodName, directDelegates, keyShared);
         // No _funcN for plain DEFMETHOD: body signature is LispObject[] -> LispObject.
         EmitRegistrationInto(initIl, name, method, paramCount, defPkg, directBodyMethod: null, noFrame: noFrame,
             lambdaList: lambdaList, extraDirect: extraDirect);
@@ -798,14 +927,43 @@ public class FaslAssembler
     /// <summary>One typed arity of an &amp;optional / &amp;key / &amp;rest function:
     /// the arity, whether the body wants the LispFunction threaded in as its
     /// leading argument, and the method holding it.</summary>
-    private readonly record struct DirectArity(int Arity, bool SelfP, MethodBuilder Method);
+    private readonly record struct DirectArity(int Arity, bool SelfP, MethodBuilder Method, bool Mv);
+
+    /// <summary>A &amp;key function keeps its body in one method taking the key
+    /// values as arguments: (:shared NPARAMS BODY) among the direct delegates. A
+    /// plain method, not a delegate; the array entry and the typed entries call it
+    /// (SIL :call-key-shared), so it is built before either.</summary>
+    private static MethodBuilder? BuildKeySharedMethod(
+        TypeBuilder tb, CilAssembler.FaslStructInternMap structMap,
+        string baseName, LispObject? directDelegates)
+    {
+        MethodBuilder? keyShared = null;
+        for (var dd = directDelegates; dd is Cons ddc; dd = ddc.Cdr)
+        {
+            if (ddc.Car is not Cons spec || Runtime.Car(spec) is Fixnum) continue;
+            int nShared = (int)((Fixnum)Runtime.Cadr(spec)).Value;
+            var sharedTypes = new Type[nShared];
+            for (int i = 0; i < nShared; i++) sharedTypes[i] = typeof(LispObject);
+            keyShared = tb.DefineMethod($"{baseName}_keybody",
+                MethodAttributes.Public | MethodAttributes.Static,
+                typeof(LispObject), sharedTypes);
+            new CilAssembler
+            {
+                _il = keyShared.GetILGenerator(),
+                _faslMode = true,
+                _faslTypeBuilder = tb,
+                _faslStructMap = structMap,
+            }.Assemble(Runtime.Caddr(spec));
+        }
+        return keyShared;
+    }
 
     /// <summary>Compile each ((arity self-p body) ...) spec into a method on the
     /// fasl's type. The JIT path builds the same thing with DynamicMethod; a fasl
     /// needs real methods, but the delegate installed at load is identical.</summary>
     private static List<DirectArity> BuildDirectDelegateMethods(
         TypeBuilder tb, CilAssembler.FaslStructInternMap structMap,
-        string baseName, LispObject? directDelegates)
+        string baseName, LispObject? directDelegates, MethodBuilder? keyShared)
     {
         var result = new List<DirectArity>();
         if (directDelegates is not Cons) return result;
@@ -834,9 +992,10 @@ public class FaslAssembler
                 _faslMode = true,
                 _faslTypeBuilder = tb,
                 _faslStructMap = structMap,
+                _keyShared = keyShared,
             };
             asm.Assemble(body);
-            result.Add(new DirectArity(arity, selfP, m));
+            result.Add(new DirectArity(arity, selfP, m, CilAssembler.BodyReadsMvMode(body)));
         }
         return result;
     }
@@ -851,11 +1010,23 @@ public class FaslAssembler
     /// For defPkg != null: RegisterFunctionOnSymbolGuarded (protects inherited CL symbols).
     /// For defPkg == null: RegisterFunction + RegisterFunctionOnSymbol(CL-USER).
     /// </summary>
+    internal static readonly MethodInfo MarkMvModeEntryMI =
+        typeof(LispFunction).GetMethod("MarkMvModeEntry")!;
+
+    /// <summary>fn.MarkMvModeEntry(ARITY): the arity's direct entry, just
+    /// installed, takes a value mode on entry.</summary>
+    internal static void EmitMarkMvModeEntry(ILGenerator il, LocalBuilder fnLocal, int arity)
+    {
+        il.Emit(OpCodes.Ldloc, fnLocal);
+        il.Emit(OpCodes.Ldc_I4, arity);
+        il.Emit(OpCodes.Callvirt, MarkMvModeEntryMI);
+    }
+
     private static void EmitRegistrationInto(
         ILGenerator il, string name, MethodBuilder wrapperMethod, int paramCount,
         string? defPkg, MethodBuilder? directBodyMethod, MethodBuilder? nativeBodyMethod = null,
         bool selfBound = false, bool noFrame = false, string? lambdaList = null,
-        List<DirectArity>? extraDirect = null)
+        List<DirectArity>? extraDirect = null, bool directMv = false)
     {
         var fnLocal = il.DeclareLocal(typeof(LispFunction));
 
@@ -899,6 +1070,7 @@ public class FaslAssembler
             il.Emit(OpCodes.Ldftn, directBodyMethod);
             il.Emit(OpCodes.Newobj, TypedFuncCtors[paramCount]);
             il.Emit(OpCodes.Callvirt, SetDirectDelegateMI);
+            if (directMv) EmitMarkMvModeEntry(il, fnLocal, paramCount);
         }
 
         // The extra typed arities, installed the same way: a self-taking body binds
@@ -912,6 +1084,7 @@ public class FaslAssembler
                 il.Emit(OpCodes.Ldftn, d.Method);
                 il.Emit(OpCodes.Newobj, TypedFuncCtors[d.Arity]);
                 il.Emit(OpCodes.Callvirt, SetDirectDelegateMI);
+                if (d.Mv) EmitMarkMvModeEntry(il, fnLocal, d.Arity);
             }
         }
 
@@ -969,35 +1142,22 @@ public class FaslAssembler
     /// defines is then interned in the right place, and one whose package is
     /// missing is skipped by the guard in PreinternSymbol.
     ///
-    /// The calls go into chunked helper methods rather than straight into
-    /// ModuleInit: a large source file names thousands of symbols, and ~11 IL
-    /// bytes each would push ModuleInit (which also carries the top-level forms)
-    /// toward the method-size limit.
+    /// The list is data (FaslData.Preintern reads it): it used to be code, three
+    /// instructions per symbol in helper methods that run once per load and
+    /// had to be JIT-compiled for that.
     /// </summary>
     private void EmitPreinternSymbols()
     {
-        const int chunkSize = 256;
         var syms = _structInternMap.PreinternSymbols;
         if (syms.Count == 0) return;
-        int index = 0, chunk = 0;
-        ILGenerator? chunkIl = null;
-        foreach (var (name, pkg) in syms)
-        {
-            if (index % chunkSize == 0)
-            {
-                if (chunkIl != null) chunkIl.Emit(OpCodes.Ret);
-                var m = _tb.DefineMethod($"PreinternSymbols_{chunk++}",
-                    MethodAttributes.Public | MethodAttributes.Static,
-                    typeof(void), Type.EmptyTypes);
-                chunkIl = m.GetILGenerator();
-                _initIl.Emit(OpCodes.Call, m);
-            }
-            chunkIl!.Emit(OpCodes.Ldstr, name);
-            chunkIl.Emit(OpCodes.Ldstr, pkg);
-            chunkIl.Emit(OpCodes.Call, PreinternSymbolMI);
-            index++;
-        }
-        chunkIl!.Emit(OpCodes.Ret);
+        var w = new FaslDataWriter();
+        w.Varint((ulong)syms.Count);
+        foreach (var (name, pkg) in syms) { w.Str(pkg); w.Str(name); }
+        int part = _structInternMap.AddDataPart(w.BodyToArray());
+        _initIl.Emit(OpCodes.Ldsfld, _structInternMap.DataPartsField());
+        _initIl.Emit(OpCodes.Ldc_I4, part);
+        _initIl.Emit(OpCodes.Ldelem_Ref);
+        _initIl.Emit(OpCodes.Call, typeof(FaslData).GetMethod("Preintern")!);
     }
 #endif
 
@@ -1011,10 +1171,14 @@ public class FaslAssembler
         throw new LispErrorException(new LispProgramError(
             "FASL emission (compile-file) requires .NET 9+; this runtime build runs precompiled .fasl only"));
 #else
+        CloseChunk();
+        CilAssembler.CloseMlfBatch(_structInternMap);
+        CilAssembler.ClearMakeLoadFormMemo();
         EmitPreinternSymbols();
         // Before the initializer is closed: the array every uninterned symbol is
         // indexed out of, built from a names blob rather than from per-symbol IL.
         _structInternMap.EmitUninternedTableInit(_cctorIl);
+        _structInternMap.EmitDataPartsInit(_cctorIl);
 
         // return Nil.Instance
         _initIl.Emit(OpCodes.Ldsfld,

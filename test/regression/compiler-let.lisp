@@ -100,3 +100,41 @@
       (ignore-errors (delete-file fasl))
       (fmakunbound 'clet-from-fasl)))
   ((:from-fasl :outer) :outer))
+
+;;; ---- a DEFUN body expands its macros only under the bindings ----
+
+;; Compiling a DEFUN first scans its body for a RETURN-FROM of the function's
+;; own block, expanding macros as it goes. That scan used to walk the
+;; COMPILER-LET body a second time as plain subforms, expanding the macros in it
+;; with the bindings gone. A macro with a compile-time side effect saw the
+;; global value too: series records a restriction warning that way, and the
+;; stale warning replaced the one the real expansion had recorded.
+(defvar *clet-seen* '())
+(defmacro clet-record-expansion ()
+  (push *clet-flag* *clet-seen*)
+  (list 'quote *clet-flag*))
+
+(deftest compiler-let.defun-body-expands-only-under-binding
+  (progn
+    (setq *clet-seen* '())
+    (eval '(defun clet-defun-body (x)
+            (dotcl-cltl2:compiler-let ((*clet-flag* :inner))
+              (list x (clet-record-expansion)))))
+    (prog1 (list (funcall 'clet-defun-body 1)
+                 (remove-duplicates *clet-seen*))
+      (fmakunbound 'clet-defun-body)))
+  ((1 :inner) (:inner)))
+
+;; The same with a RETURN-FROM inside, so the block the scan looks for is kept.
+(deftest compiler-let.defun-body-return-from-still-seen
+  (progn
+    (setq *clet-seen* '())
+    (eval '(defun clet-defun-return (x)
+            (dotcl-cltl2:compiler-let ((*clet-flag* :inner))
+              (when x (return-from clet-defun-return (clet-record-expansion)))
+              :fell-through)))
+    (prog1 (list (funcall 'clet-defun-return t)
+                 (funcall 'clet-defun-return nil)
+                 (remove-duplicates *clet-seen*))
+      (fmakunbound 'clet-defun-return)))
+  (:inner :fell-through (:inner)))

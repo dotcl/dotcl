@@ -30,7 +30,15 @@
 ;;; Free variable analysis (for lambda/closure)
 ;;; ============================================================
 
-(defvar *macro-expand-depth-limit* 50)
+;; Nesting of macro expansions an analysis walk follows before it gives up and
+;; walks the unexpanded form instead. Giving up is NOT conservative: a closure
+;; that only appears in a deeper expansion is missed, so a variable it assigns
+;; is not boxed and the assignment is lost. Keep this at the depth guard in
+;; COMPILE-FORM (500), which counts every nested form including each
+;; expansion: any form the compiler accepts is then walked completely. Code
+;; walkers that wrap each subform in their own macro (cl-environments'
+;; %WALK-FORM) reach more than 50 in ordinary code.
+(defvar *macro-expand-depth-limit* 500)
 
 ;; Stub for cross-compilation: always returns T (no stack limit during self-compile)
 (unless (fboundp '%stack-space-available-p)
@@ -58,6 +66,22 @@
 ;; per enclosing lambda = O(depth^2) on nested closures. The real
 ;; local-bound-p filter is applied at each enclosing merge, not baked into the memo.
 (defvar *ffv-free-cache* nil)
+
+;; Marker heading a (MARKER . TAG) free-var candidate: a GO to TAG seen while
+;; collecting candidates, resolved to the target tagbody's id variable at merge.
+(defvar *ffv-go-candidate* (list '#:go-candidate))
+
+(defun %ffv-note-go (tag bnd free-ht)
+  "A GO to TAG seen by the free-variable walk: when TAG names a tagbody outside
+   the lambda being analysed, that tagbody's id variable is captured."
+  (let ((entry (assoc tag (cstate-go-tags))))
+    (when entry
+      (let* ((tb-var-name (second entry))
+             (tb-sym (intern tb-var-name :dotcl.cil-compiler)))
+        (when (and (not (member tb-var-name bnd :test #'string=))
+                   (not (gethash tb-sym free-ht))
+                   (local-bound-p tb-sym))
+          (setf (gethash tb-sym free-ht) tb-sym))))))
 
 (defun %walker-macroexpand (form expander bound)
   "Macroexpand FORM for an analysis walk. Returns (values EXPANSION HITS):
@@ -201,10 +225,13 @@
                          ;; candidates for an outer lambda) local-bound-p is T, so
                          ;; this collects; otherwise it filters.
                         (dolist (sym (%lambda-free-candidates e))
-                          (when (and (not (bnd-member-p sym bnd))
-                                     (not (gethash sym free-ht))
-                                     (or *ffv-assume-bound* (local-bound-p sym)))
-                            (setf (gethash sym free-ht) sym)))))
+                          (cond ((not (and (consp sym) (eq (car sym) *ffv-go-candidate*)))
+                                 (when (and (not (bnd-member-p sym bnd))
+                                            (not (gethash sym free-ht))
+                                            (or *ffv-assume-bound* (local-bound-p sym)))
+                                   (setf (gethash sym free-ht) sym)))
+                                (*ffv-assume-bound* (setf (gethash sym free-ht) sym))
+                                (t (%ffv-note-go (cdr sym) bnd free-ht))))))
                     ;; Let/Let* introduces bindings
                     ((and (symbolp head) (member head '(let let*)) (listp (cadr e)))
                      (let* ((bindings (cadr e))
@@ -226,15 +253,16 @@
                               (when val (push (cons val (cons bnd mdepth)) worklist))))
                     ;; go: check if tagbody ID needs capture
                     ((and (symbolp head) (eq head 'go))
-                     (let* ((tag (cadr e))
-                            (entry (assoc tag (cstate-go-tags))))
-                       (when entry
-                         (let* ((tb-var-name (second entry))
-                                (tb-sym (intern tb-var-name :dotcl.cil-compiler)))
-                           (when (and (not (member tb-var-name bnd :test #'string=))
-                                      (not (gethash tb-sym free-ht))
-                                      (local-bound-p tb-sym))
-                             (setf (gethash tb-sym free-ht) tb-sym))))))
+                     (if *ffv-assume-bound*
+                         ;; Candidate collection: which tagbody the tag names
+                         ;; depends on the go tags in scope where the enclosing
+                         ;; lambda is compiled, and the candidate memo outlives
+                         ;; that scope (a walk made before the TAGBODY's tags
+                         ;; were known would cache "captures nothing"). Record
+                         ;; the tag itself; the merge resolves it.
+                         (let ((m (cons *ffv-go-candidate* (cadr e))))
+                           (setf (gethash m free-ht) m))
+                         (%ffv-note-go (cadr e) bnd free-ht)))
                     ;; Block introduces a synthetic block-tag variable
                     ((and (symbolp head) (eq head 'block))
                      (let* ((bname (cadr e))
@@ -269,6 +297,15 @@
                        (cond
                          ((and (consp arg) (eq (car arg) 'lambda))
                           (push (cons arg (cons bnd mdepth)) worklist))
+                         ;; #'(setf g): a LABELS (setf g) lives in a box like any
+                         ;; other LABELS function, under the mangled name.
+                         ((and (consp arg) (eq (car arg) 'setf) (symbolp (cadr arg)))
+                          (let* ((nm (concatenate 'string "__LABELFN_" (mangle-name arg)))
+                                 (nm-sym (intern nm :dotcl.cil-compiler)))
+                            (when (and (not (member nm bnd :test #'string=))
+                                       (not (gethash nm-sym free-ht))
+                                       (or *ffv-assume-bound* (local-bound-p nm-sym)))
+                              (setf (gethash nm-sym free-ht) nm-sym))))
                          ((symbolp arg)
                           (if *ffv-assume-bound*
                               ;; Candidate collection: local-bound-p is T for all,
@@ -366,7 +403,7 @@
                                 (mparams (cadr def))
                                 (mbody (cddr def)))
                            (setf (gethash mname *macros*)
-                                 (eval (%macrolet-expander-form mparams mbody)))))
+                                 (%eval-macrolet-expander mparams mbody))))
                        (setf *lexical-operators* (%macrolet-lexical-operators macro-defs))
                        ;; Push body forms (LIFO: processed BEFORE restore sentinels)
                        (dolist (form mlbody)
@@ -409,6 +446,11 @@
                             (fn-names (loop for fd in fn-defs
                                             for name = (car fd)
                                             when (symbolp name) collect (symbol-name name)))
+                            (fn-boxes (loop for fd in fn-defs
+                                            for name = (car fd)
+                                            when (local-fn-block-name name)
+                                              collect (concatenate 'string "__LABELFN_"
+                                                                   (mangle-name name))))
                             (shadows (%flet-macro-shadows fn-defs)))
                        ;; Names that hide a macro: in scope for the body, and for
                        ;; LABELS also for the definitions (as in compile-flet /
@@ -424,12 +466,28 @@
                        ;; Function bodies see outer scope (flet) or same scope (labels)
                        ;; Labels fn-names are NOT added to fn body bound: they are captured
                        ;; as free vars via boxed variables in *locals*
-                       (let ((fn-body-bound bnd))
+                       ;; The box of each function, as a closure would capture it
+                       ;; (see COMPILE-FLET / COMPILE-LABELS-BOXED). A call to the
+                       ;; function inside the form refers to this binding, not to
+                       ;; an outer local function of the same name, so for the
+                       ;; lambda being analyzed it is bound here: in the body, and
+                       ;; for LABELS also in the definitions.
+                       (let ((fn-body-bound (if (eq head 'labels)
+                                                (append fn-boxes bnd)
+                                                bnd)))
                          (dolist (fd fn-defs)
                            (let* ((params (cadr fd))
                                   (fn-body (cddr fd))
+                                  (fname (car fd))
+                                  (block-name (if (consp fname) (cadr fname) fname))
+                                  ;; The body is inside the function's implicit
+                                  ;; BLOCK, so a RETURN-FROM of that name there
+                                  ;; targets it, not an outer block of the same name.
                                   (inner-bound (append (extract-param-names params)
-                                                       fn-body-bound)))
+                                                       (if (symbolp block-name)
+                                                           (cons (block-tag-var-name block-name)
+                                                                 fn-body-bound)
+                                                           fn-body-bound))))
                              ;; Init forms of the fn's own params: same scoping
                              ;; rule as a lambda's (see MAP-LAMBDA-LIST-VARS).
                              (map-lambda-list-vars
@@ -442,7 +500,7 @@
                                (push (cons form (cons inner-bound mdepth)) worklist)))))
                        (when (and shadows (eq head 'flet)) (enter))
                        ;; Body sees all fn-names as bound
-                       (let ((body-bound (append fn-names bnd)))
+                       (let ((body-bound (append fn-names fn-boxes bnd)))
                          (dolist (form lbody)
                            (push (cons form (cons body-bound mdepth)) worklist))))))
                     ;; CLOS primitives: analyze sub-expressions normally
@@ -815,7 +873,7 @@
                            (mparams (cadr def))
                            (mbody (cddr def)))
                       (setf (gethash mname *macros*)
-                            (eval (%macrolet-expander-form mparams mbody)))))
+                            (%eval-macrolet-expander mparams mbody))))
                   (setf *lexical-operators* (%macrolet-lexical-operators macro-defs))
                   (dolist (form mlbody)
                     (push (cons form (cons in-lambda mdepth)) worklist))))
@@ -1327,7 +1385,33 @@
                (push i1 out)
                (setf cur (cdr cur))))))
         (setf instrs (nreverse out))))
-    instrs))
+    (box-native-float-locals-out-of-line instrs)))
+
+(defun box-native-float-locals-out-of-line (instrs)
+  "Rewrite (:ldloc K) (:newobj \"DoubleFloat\") to (:ldloc K) (:call
+   \"DoubleFloat.Box\"), and the same for SingleFloat. Runs once, after the
+   peephole fixpoint, so P6 / P7 / P10 have already seen the newobj form.
+
+   The pair is a generic read of a native float local, typically the value a
+   float loop returns. Under an inline newobj the local is live across the
+   allocation helper call; the System V x64 ABI has no callee-saved XMM
+   registers, so the JIT gives the local a stack home for its whole lifetime
+   and stores and reloads it on every loop iteration, on the loop-carried
+   chain. Passing it to an out-of-line helper ends the lifetime at the call."
+  (let ((out '()))
+    (loop with prev = nil
+          for i in instrs
+          do (push (if (and (consp i) (eq (car i) :newobj)
+                            (consp prev) (eq (car prev) :ldloc))
+                       (cond ((equal (cadr i) "DoubleFloat")
+                              (list :call "DoubleFloat.Box"))
+                             ((equal (cadr i) "SingleFloat")
+                              (list :call "SingleFloat.Box"))
+                             (t i))
+                       i)
+                   out)
+             (setf prev i))
+    (nreverse out)))
 
 (defun merge-disjoint-locals (instrs)
   "Linear-scan slot-share locals, then peephole-optimize. Thin wrapper so all
@@ -1521,17 +1605,34 @@
         (*label-counter* 0)
         (*specials* '())
         (*at-toplevel* t)
+        (*toplevel-segments-p* nil)
         (*macroexpand-scope* '())
         (*macroexpand-cache* (make-hash-table :test #'eq))
         (*bmr-cache* (make-hash-table :test #'eq))
-        (*ffv-free-cache* (make-hash-table :test #'eq)))
-    `(,@(peephole-optimize (compile-expr expr))
-      (:ret))))
+        (*ffv-free-cache* (make-hash-table :test #'eq))
+        (*ltv-hoisted* (and *compile-file-mode* *current-module-id* (list '()))))
+    (let ((body (compile-expr expr)))
+      `(,@(peephole-optimize (append (%compile-hoisted-ltvs) body))
+        (:ret)))))
+
+(defun %compile-hoisted-ltvs ()
+  "The instructions that run the LOAD-TIME-VALUE forms collected in
+   *LTV-HOISTED*, in the order they were met. A form compiled here may contain
+   LOAD-TIME-VALUE itself; those run before it."
+  (let ((out '()))
+    (loop
+      (let ((sets (and *ltv-hoisted* (reverse (car *ltv-hoisted*)))))
+        (when (null sets) (return out))
+        (setf (car *ltv-hoisted*) '())
+        (let ((instrs `(,@(compile-expr `(progn ,@sets nil)) (:pop))))
+          (setf out (append instrs out)))))))
 
 (defun compile-toplevel-eval (expr)
   "Compile a top-level expression for EVAL.
    Like compile-toplevel but preserves MvReturn at the tail so EVAL's
-   caller can observe the form's multiple values."
+   caller can observe the form's multiple values. An oversized top-level progn
+   comes back as several method bodies joined by (:TOPLEVEL-BOUNDARY), which
+   EVAL's assembler runs in sequence."
   (let ((*cstate* (cstate-with *cstate*
                                +cs-locals+ '() +cs-block-tags+ '() +cs-go-tags+ '()
                                +cs-boxed-vars+ '() +cs-local-functions+ '()))
@@ -1539,10 +1640,14 @@
         (*label-counter* 0)
         (*specials* '())
         (*at-toplevel* t)
+        (*toplevel-segments-p* t)
         (*in-tail-position* t)
         (*macroexpand-scope* '())
         (*macroexpand-cache* (make-hash-table :test #'eq))
         (*bmr-cache* (make-hash-table :test #'eq))
-        (*ffv-free-cache* (make-hash-table :test #'eq)))
-    `(,@(peephole-optimize (compile-expr expr))
-      (:ret))))
+        (*ffv-free-cache* (make-hash-table :test #'eq))
+        ;; Code EVAL (or COMPILE) runs now, also when a macro calls it while
+        ;; COMPILE-FILE compiles a top level form: its LOAD-TIME-VALUE forms
+        ;; belong to it, not to the fasl being written.
+        (*ltv-hoisted* nil))
+    (%close-toplevel-segments (compile-expr expr))))

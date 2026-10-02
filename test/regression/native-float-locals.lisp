@@ -122,4 +122,20 @@
   (%nfl-branch 5)
   6.0d0)
 
+;; A generic read of a native float local boxes through the out-of-line
+;; DoubleFloat.Box / SingleFloat.Box helper, not an inline newobj. With the
+;; newobj the local stays live across the allocation call, and on System V x64
+;; (no callee-saved XMM registers) the JIT then stores and reloads the loop
+;; accumulator on every iteration.
+(deftest-emitting-only nfl-return-box-helper-sil
+  (let ((d (princ-to-string (dotcl:function-sil #'%nfl-acc-value)))
+        (s (princ-to-string (dotcl:function-sil #'%nfl-single))))
+    (list (and (search "DoubleFloat.Box" d) t)
+          (and (search "SingleFloat.Box" s) t)))
+  (t t))
+
+(deftest nfl-return-box-helper-type
+  (list (type-of (%nfl-acc-value 3)) (type-of (%nfl-single 3)))
+  (double-float single-float))
+
 (setf dotcl:*save-sil* nil)

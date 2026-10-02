@@ -62,13 +62,20 @@ The shipped native binary then never emits.
 NativeAOT needs a C toolchain for the target platform: clang + zlib headers on
 Linux, Xcode command line tools on macOS, or Visual Studio with the "Desktop
 development with C++" workload on Windows (ILC finds MSVC via `vswhere`; no
-manual `vcvarsall` needed when the workload is installed). `publish.sh` picks the
-RID from the host and is the same on every OS:
+manual `vcvarsall` needed when the workload is installed). From Git Bash,
+`vswhere.exe` is usually not on `PATH` and the link step fails with
+"'vswhere.exe' is not recognized"; add its directory first:
+
+```sh
+export PATH="/c/Program Files (x86)/Microsoft Visual Studio/Installer:$PATH"
+```
+
+`publish.sh` picks the RID from the host and is the same on every OS:
 
 ```sh
 ./publish.sh            # Linux / macOS / Windows (git-bash)
 RID=linux-arm64 ./publish.sh   # cross-RID override
-# -> bin/<arch>/Release/net10.0/<rid>/publish/PrecompiledLispDemoAot(.exe)
+# -> bin/Release/net10.0/<rid>/publish/PrecompiledLispDemoAot(.exe)
 ```
 
 It runs the plain .NET command underneath, `dotnet publish -r <rid> -c Release

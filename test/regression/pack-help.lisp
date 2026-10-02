@@ -11,8 +11,7 @@
       (error "cannot locate this process's executable")))
 
 (defvar *ph-core*
-  (or (ignore-errors (namestring (truename "compiler/cil-out.sil")))
-      "compiler/cil-out.sil"))
+  (regression-child-core))
 
 (defun ph-run (&rest args)
   "Run this dotcl build with ARGS. Returns (exit-code stdout stderr)."
@@ -49,3 +48,25 @@
     (list (ph-says r "dotcl repl                   Start a REPL")
           (ph-says r "dotcl pack --system <name>")))
   (t nil))
+
+;;; Option descriptions line up in one column, continuation lines included.
+;;; A few options had their description one or two columns to the right of
+;;; the others. Returns the lines whose description starts anywhere else.
+(defun ph-description-column (line)
+  "Column where LINE's description text starts, or NIL if it has none."
+  (cond ((and (> (length line) 3) (string= "  -" line :end2 3))
+         (let ((gap (search "  " line :start2 2)))
+           (and gap (position #\Space line :start gap :test-not #'char=))))
+        ((and (> (length line) 20) (every (lambda (c) (char= c #\Space))
+                                          (subseq line 0 20)))
+         (position #\Space line :test-not #'char=))))
+
+(deftest-emitting-only pack-help.descriptions-aligned
+  (let ((r (ph-run "pack" "--help")))
+    (with-input-from-string (s (second r))
+      (loop for line = (read-line s nil)
+            while line
+            for col = (ph-description-column line)
+            when (and col (/= col 31))
+              collect line)))
+  nil)

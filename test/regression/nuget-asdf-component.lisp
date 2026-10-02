@@ -127,3 +127,57 @@
   (dotcl-nuget-asdf:system-nuget-preamble
    (asdf:defsystem "nac-none" :components ()))
   nil)
+
+;;; --- Declarations follow the project's lock file ---------------------------
+;;;
+;;; A load acts on a later day, maybe on another machine, so a declaration with a
+;;; floating version is not resolved by loading: it waits for NUGET:RESTORE to
+;;; record what it means. Packing for a platform resolves the same way a load
+;;; does, and a refusal there is reported for the set, not raised.
+
+(defun %nac-sandboxed (thunk)
+  (let ((nuget::*states* (make-hash-table :test #'equal))
+        (nuget:*project-directory* (regression-temp-dir))
+        (nuget::*cache-directory* (regression-temp-dir))
+        (nuget::*bundle-directory* nil))
+    (funcall thunk)))
+
+(deftest nuget-asdf.pack-reports-a-floating-declaration
+  (%nac-sandboxed
+   (lambda ()
+     (let ((failed (dotcl-nuget-asdf:resolve-system-for-rid *nac-system* "linux-x64")))
+       (list (length failed)
+             ;; the components that do not name their own RID, together
+             (car (first failed))
+             (and (search "(nuget:restore)" (cdr (first failed))) t)))))
+  (1 "Newtonsoft.Json, Plain.Package" t))
+
+;;; LOAD-OP refuses the same way, before anything goes to the network.
+(deftest nuget-asdf.load-op-refuses-a-floating-declaration
+  (%nac-sandboxed
+   (lambda ()
+     (handler-case
+         (progn (asdf:perform (asdf:make-operation 'asdf:load-op) (%nac "Newtonsoft.Json"))
+                :no-error)
+       (error (e) (and (search "(nuget:restore)" (princ-to-string e)) t)))))
+  t)
+
+;;; The preamble's REQUIRE names a module that loads. It said "nuget", the
+;;; contrib's name before it was renamed to "dotcl-nuget"; the old name is
+;;; refused with a message, so every built program that declared a package
+;;; failed on its first form. Reading the preamble does not show that, so each
+;;; REQUIRE is evaluated here.
+(deftest nuget-asdf.preamble-requires-a-module-that-loads
+  (let ((forms '())
+        (pos 0))
+    (loop (multiple-value-bind (form next)
+              (read-from-string *nac-preamble* nil :eof :start pos)
+            (when (eq form :eof) (return))
+            (push form forms)
+            (setq pos next)))
+    (loop for f in forms
+          for req = (find-if (lambda (x) (and (consp x) (eq (car x) 'require))) f)
+          collect (list (second req)
+                        (handler-case (progn (eval req) :loaded)
+                          (error (e) (princ-to-string e))))))
+  (("dotcl-nuget" :loaded) ("dotcl-nuget" :loaded) ("dotcl-nuget" :loaded)))

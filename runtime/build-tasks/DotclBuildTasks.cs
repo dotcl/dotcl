@@ -244,6 +244,10 @@ public sealed class DotclCompileProject : Task
     /// <summary>Emit a Portable PDB alongside the fasl (Debug build) so the
     /// project is source-debuggable in a .NET debugger.</summary>
     public bool DebugInfo { get; set; }
+    /// <summary>$(AssemblyName): the assembly this project builds. A .NET type the
+    /// sources name that cannot be resolved at build time is rooted there in the
+    /// trimmer descriptor written next to the fasl.</summary>
+    public string? AppAssemblyName { get; set; }
 
     public override bool Execute()
     {
@@ -261,6 +265,6 @@ public sealed class DotclCompileProject : Task
         DotclBoot.Boot(BaseCore, ContribDir, DotclBoot.ReferenceDirs(ReferencePath));
         DotclBuild.CompileProject(Asd, Output, BuildInit?.Select(i => i.GetMetadata("FullPath")).ToArray(),
                                  AsdSearchPath?.Select(i => i.GetMetadata("FullPath")).ToArray(),
-                                 DebugInfo);
+                                 DebugInfo, AppAssemblyName);
     }
 }

@@ -59,17 +59,9 @@ public sealed class ByRef
 /// assembly (the aggregation unit: a real library is more than one type);
 /// PopulateType is the shared per-type emitter both paths call.
 /// </summary>
-public static class DynamicClassBuilder
+public static partial class DynamicClassBuilder
 {
     private static int _assemblyCounter;
-
-    // Global dispatch table: Lisp lambda bodies keyed by (typeFullName, dispatchKey).
-    // dispatchKey = methodName for no-param methods; methodName + "#" + "|"-joined
-    // FullNames for parameterized methods. Populated at DefineClass time and
-    // consulted by DispatchLispMethod on every invocation. Keeping the lambda
-    // alive keeps its lexical closure alive.
-    private static readonly Dictionary<(string, string), LispObject> _methodHandlers
-        = new();
 
     // IsStatic maps a Lisp defun to a `public static` method (no `self`); the
     // shape a function library exports (System.Math-style). A static method
@@ -92,22 +84,10 @@ public static class DynamicClassBuilder
         IReadOnlyList<Type>? ParamTypes,
         IReadOnlyList<int>? BaseArgIndices);
 
-    // Build the runtime dispatch key for a method / ctor.
-    // No-param methods use just the name so existing single-overload code is unaffected.
-    internal static string MethodDispatchKey(string methodName, IReadOnlyList<Type> paramTypes)
-        => paramTypes.Count == 0
-           ? methodName
-           : methodName + "#" + string.Join("|", paramTypes.Select(t => t.FullName!));
-
     /// <summary>
     /// Define a public class. See roadmap in the type doc-comment for what
     /// each parameter maps to. Returns the materialized Type.
     /// </summary>
-    // Reserved method-table key for the ctor body dispatch. Chosen so it can
-    // never collide with a user-defined method (.ctor isn't a valid CLR method
-    // name that MethodBuilder would accept for DefineMethod).
-    private const string CtorKey = ".ctor";
-
     public static Type DefineMinimalClass(string fullName, Type? baseType = null,
         IReadOnlyList<(string Name, Type Type)>? fields = null,
         IReadOnlyList<CustomAttributeBuilder>? attributes = null,
@@ -1290,57 +1270,4 @@ public static class DynamicClassBuilder
     private static readonly MethodInfo DispatchStaticMI =
         typeof(DynamicClassBuilder).GetMethod(nameof(DispatchLispStatic),
             BindingFlags.Public | BindingFlags.Static)!;
-
-    /// <summary>
-    /// Runtime entry point called by the emitted method body. Looks up the
-    /// Lisp lambda registered for (typeFullName, methodName), marshals self
-    /// and args through DotNetToLisp, funcalls the lambda, and marshals the
-    /// result back through LispToDotNet for the declared <paramref name="returnType"/>.
-    /// </summary>
-    public static object? DispatchLispMethod(
-        string typeFullName, string methodName, Type returnType,
-        object? self, object?[] args)
-    {
-        if (!_methodHandlers.TryGetValue((typeFullName, methodName), out var lispFn))
-            throw new InvalidOperationException(
-                $"DispatchLispMethod: no Lisp handler registered for {typeFullName}.{methodName}");
-
-        var lispArgs = new LispObject[args.Length + 1];
-        lispArgs[0] = Runtime.DotNetToLisp(self);
-        for (int i = 0; i < args.Length; i++)
-            lispArgs[i + 1] = Runtime.DotNetToLisp(args[i]);
-
-        // Cross the C#->Lisp boundary through InvokeForeignCallback so a Lisp error
-        // in the override body is handled (dotcl:*foreign-callback-handler*) rather
-        // than escaping as TargetInvocationException and crashing the .NET caller.
-        var result = Runtime.InvokeForeignCallback(lispFn, lispArgs);
-
-        if (returnType == typeof(void)) return null;
-        return Runtime.LispToDotNet(result, returnType);
-    }
-
-    /// <summary>
-    /// Runtime entry point for an emitted <c>public static</c> method body.
-    /// Like <see cref="DispatchLispMethod"/> but with no <c>self</c>: looks up
-    /// the Lisp function registered for (typeFullName, methodName), marshals the
-    /// args, funcalls it through InvokeForeignCallback (so a Lisp error is
-    /// handled rather than crashing the .NET caller), and marshals the result
-    /// back for the declared <paramref name="returnType"/>.
-    /// </summary>
-    public static object? DispatchLispStatic(
-        string typeFullName, string methodName, Type returnType, object?[] args)
-    {
-        if (!_methodHandlers.TryGetValue((typeFullName, methodName), out var lispFn))
-            throw new InvalidOperationException(
-                $"DispatchLispStatic: no Lisp handler registered for {typeFullName}.{methodName}");
-
-        var lispArgs = new LispObject[args.Length];
-        for (int i = 0; i < args.Length; i++)
-            lispArgs[i] = Runtime.DotNetToLisp(args[i]);
-
-        var result = Runtime.InvokeForeignCallback(lispFn, lispArgs);
-
-        if (returnType == typeof(void)) return null;
-        return Runtime.LispToDotNet(result, returnType);
-    }
 }

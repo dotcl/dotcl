@@ -110,6 +110,7 @@ public static class MultipleValues
 
     public static LispObject[] Get()
     {
+        MaterializeSnap();
         if (_count <= 0) return Array.Empty<LispObject>();
         if (_values == null)
             return _count == 1 ? new[] { _pair0! } : new[] { _pair0!, _pair1! };
@@ -118,7 +119,7 @@ public static class MultipleValues
         return result;
     }
 
-    public static int Count => _count;
+    public static int Count { get { MaterializeSnap(); return _count; } }
 
     public static LispObject Primary(LispObject value)
     {
@@ -210,6 +211,12 @@ public static class MultipleValues
     /// call's when its count is set and its first value is the primary.</summary>
     public static LispObject CaptureForBind(LispObject primary)
     {
+        if (_count == CountSnap)
+        {
+            // A capture-mode return already put the values here.
+            if (ReferenceEquals(_bindSnap![0], primary)) { _count = -1; return primary; }
+            MaterializeSnap();
+        }
         LispObject[]? vals = null;
         MvReturn? mvSrc = null;
         bool fromPair = false;
@@ -324,16 +331,183 @@ public static class MultipleValues
     public static LispObject[] Of(LispObject primary)
     {
         if (primary is MvReturn mv) return mv.ToArray();
+        MaterializeSnap();
         if (_count < 0) return new[] { primary };
         return Get();
     }
 
+    // --- Call-site value modes (what the caller will do with the values) ---
+    //
+    // A compiled call whose result is consumed at once can say how: PRIMARY (the
+    // caller takes the primary value only, as RUNTIME.UNWRAPMV would) or CAPTURE
+    // (the caller reads the values out of the thread state straight away, as
+    // CAPTUREFORBIND does). It passes the mode to LispFunction.InvokeNM, which
+    // hands it on only when the entry it is about to call is a compiled body that
+    // reads it (the entry's bit in LispFunction's mode mask), immediately before
+    // calling that entry. The body takes the mode with TAKEMODE as its first
+    // instruction, so the slot is non-zero only between those two points: no
+    // other Lisp code can run there and see a mode meant for someone else. A
+    // body that read a mode returns its tail (VALUES ...) without an MvReturn:
+    // the primary value alone for PRIMARY, the values published in the thread
+    // state for CAPTURE.
+    [ThreadStatic] private static int s_mode;
+    public const int ModeNone = 0, ModePrimary = 1, ModeCapture = 2;
+
+    /// <summary>The mode the caller of the current body asked for, consumed.</summary>
+    public static int TakeMode()
+    {
+        int m = s_mode;
+        if (m != 0) s_mode = 0;
+        return m;
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    internal static void SetMode(int mode) => s_mode = mode;
+
+    /// <summary>Hand MODE on to the body called next, which must take it as its
+    /// first instruction: the typed entry of a &amp;key or &amp;optional function
+    /// passing its own caller's mode to the shared body it calls directly.</summary>
+    public static void PassMode(int mode) => s_mode = mode;
+
+    // A capture-mode return writes its values straight into the bind snapshot
+    // (see CAPTUREFORBIND) and says so with this count: the caller's capture is
+    // the very next thing that runs, so CAPTUREFORBIND then has nothing to copy,
+    // and the thread state needs no reference stores of its own. Every other
+    // reader of the state first turns it back into an ordinary array state
+    // (MATERIALIZESNAP), so it is never misread as "no values".
+    private const int CountSnap = -4;
+
+    private static LispObject[] SnapFor(int n)
+    {
+        var snap = _bindSnap;
+        if (snap == null || snap.Length < n) snap = _bindSnap = new LispObject[n < 8 ? 8 : n];
+        return snap;
+    }
+
+    private static void MaterializeSnap()
+    {
+        if (_count != CountSnap) return;
+        int n = _bindCount;
+        var vals = new LispObject[n];
+        Array.Copy(_bindSnap!, vals, n);
+        _values = vals;
+        _count = n;
+    }
+
+    /// <summary>The primary-mode return: A, with the state saying "no values
+    /// published", which every reader takes as the one value it is handed --
+    /// what UNWRAPMV's collapse to one value said before. Leaving the state as
+    /// it was would let values published earlier in the body, whose first
+    /// happens to be A, pass for this call's own further up.</summary>
+    private static LispObject PrimaryOnly(LispObject a)
+    {
+        _count = -1;
+        return a;
+    }
+
+    private static LispObject Capture2(LispObject a, LispObject b)
+    {
+        var snap = SnapFor(2);
+        snap[0] = a; snap[1] = b;
+        _bindCount = 2;
+        _count = CountSnap;
+        return a;
+    }
+
+    /// <summary>(VALUES A B) where a value mode applies (see TAKEMODE).</summary>
+    public static LispObject Values2Mode(LispObject a, LispObject b, int mode)
+    {
+        if (mode == ModePrimary) return PrimaryOnly(a);
+        if (mode == ModeCapture) return Capture2(a, b);
+        return Values2(a, b);
+    }
+
+    private static LispObject Capture3(LispObject a, LispObject b, LispObject c)
+    {
+        var snap = SnapFor(3);
+        snap[0] = a; snap[1] = b; snap[2] = c;
+        _bindCount = 3;
+        _count = CountSnap;
+        return a;
+    }
+
+    private static LispObject Capture4(LispObject a, LispObject b, LispObject c, LispObject d)
+    {
+        var snap = SnapFor(4);
+        snap[0] = a; snap[1] = b; snap[2] = c; snap[3] = d;
+        _bindCount = 4;
+        _count = CountSnap;
+        return a;
+    }
+
+    public static LispObject Values3Mode(LispObject a, LispObject b, LispObject c, int mode)
+    {
+        if (mode == ModePrimary) return PrimaryOnly(a);
+        if (mode == ModeCapture) return Capture3(a, b, c);
+        return Values(a, b, c);
+    }
+
+    public static LispObject Values4Mode(LispObject a, LispObject b, LispObject c, LispObject d, int mode)
+    {
+        if (mode == ModePrimary) return PrimaryOnly(a);
+        if (mode == ModeCapture) return Capture4(a, b, c, d);
+        return Values(a, b, c, d);
+    }
+
+    /// <summary>The bind snapshot and its count when a capture-mode return put
+    /// the values of the call whose primary value is PRIMARY there, consumed;
+    /// otherwise null (and the state is left as it was).</summary>
+    internal static LispObject[]? TakeSnap(LispObject primary, out int count)
+    {
+        if (_count == CountSnap)
+        {
+            var snap = _bindSnap!;
+            if (ReferenceEquals(snap[0], primary))
+            {
+                count = _bindCount;
+                _count = -1;
+                return snap;
+            }
+        }
+        count = 0;
+        return null;
+    }
+
+    /// <summary>How many values the thread state holds for a call whose primary
+    /// value is PRIMARY: the published count when the state is that call's (its
+    /// first value is PRIMARY), 0 after (VALUES), and -1 when the state is not
+    /// that call's -- the same test CAPTUREFORBIND makes. Read with OWNNTH,
+    /// which copies nothing.</summary>
+    internal static int OwnCount(LispObject primary)
+    {
+        MaterializeSnap();
+        int c = _count;
+        if (c > 0)
+        {
+            var vals = _values;
+            if (vals == null) return ReferenceEquals(_pair0, primary) ? c : -1;
+            return c <= vals.Length && ReferenceEquals(vals[0], primary) ? c : -1;
+        }
+        return c == 0 ? 0 : -1;
+    }
+
+    internal static LispObject OwnNth(int i)
+    {
+        var vals = _values;
+        if (vals == null) return (i == 0 ? _pair0 : _pair1) ?? Nil.Instance;
+        return vals[i] ?? Nil.Instance;
+    }
+
     // Save/restore for unwind-protect: preserve body's secondary values across cleanup
-    public static int SaveCount() => _count;
+    public static int SaveCount() { MaterializeSnap(); return _count; }
     /// <summary>The values to restore after an unwind-protect cleanup. A pair published
     /// without an array materialises one here: the cleanup can publish values of its own,
     /// and the fields would then hold those instead of the body.s.</summary>
-    public static LispObject[]? SaveValues() => _values ?? (_count > 0 ? Get() : null);
+    public static LispObject[]? SaveValues()
+    {
+        MaterializeSnap();
+        return _values ?? (_count > 0 ? Get() : null);
+    }
     public static void RestoreSaved(int savedCount, LispObject[]? savedValues)
     {
         _count = savedCount;

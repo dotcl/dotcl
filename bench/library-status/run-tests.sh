@@ -25,6 +25,10 @@
 #               "nothing was looked at", not "nothing went wrong": a library
 #               whose TEST-OP is empty, or whose framework has no recogniser
 #               yet, lands here, and it is never counted as a pass.
+#   no-tests    the run finished and there was nothing to run: TEST-OP has no
+#               test system among its dependencies and no PERFORM method of
+#               its own (only ASDF's empty default), or hu.dwim.asdf said "No
+#               tests were run". Like no-result, never counted as a pass.
 #   timeout     the bound was hit.
 #   load-fail   the system or one of its test systems did not load.
 #
@@ -48,6 +52,8 @@
 set -eu
 
 root="${1:-.}"
+# Note filters (scrub_note), shared with the other stage.
+. "$(dirname "$0")/scrub.sh"
 here="$root/bench/library-status"
 results="${LIBRARY_STATUS_JSON:-$here/results.json}"
 targets="$here/targets.txt"
@@ -79,14 +85,8 @@ jstr() {
   printf '%s' "$1" \
     | tr -d '"\\' | tr '\n\r\t' '   ' \
     | sed 's|^[. ]*||; s|  *| |g; s| *$||' \
-    | scrub_paths \
+    | scrub_note \
     | cut -c1-160
-}
-
-# Notes are published: replace absolute paths with <path>. Same rule as
-# run-quickload.sh, which explains it.
-scrub_paths() {
-  sed -E 's@(^|[^A-Za-z0-9])(#P)?[A-Za-z]:[/A-Za-z][^ )"'"'"']*@\1<path>@g; s@(^|[^A-Za-z0-9])/(home|Users|tmp|mnt)/[^ )"'"'"']*@\1<path>@g'
 }
 
 # The work list. Default: the rows that load, in the published order.
@@ -212,12 +212,62 @@ judge() {
         pass += tp; fail += tf
       }
       next }
+    # 1am (lparallel bundles a copy): "Success: N tests, M checks." after
+    # the run. A failing check signals an error instead of printing a
+    # summary, which the driver reports as LIBTEST-ERROR.
+    /^Success: [0-9]+ tests?, [0-9]+ checks?\./ { fw["1am"]=1; pass += $4; next }
+    # The cl-ppcre harness (its own DO-TESTS): one "Test: NAME" line per suite, then a
+    # "  NNN:" line per failing test in it, and at the end "All tests
+    # passed." or "Some tests failed.". It prints no counts (the dots are
+    # "one per ten tests"), so the unit here is the suite: a suite with a
+    # failing test is a failure. Read only when that closing line is seen.
+    /^Test: / { ppcre_suites++; ppcre_cur = 0; next }
+    ppcre_suites && /^ *[0-9]+:$/ { if (!ppcre_cur) { ppcre_bad++; ppcre_cur = 1 } next }
+    /^(All tests passed|Some tests failed)\.$/ {
+      if (ppcre_suites) {
+        fw["cl-ppcre"]=1; pass += ppcre_suites - ppcre_bad; fail += ppcre_bad
+        if ($1 == "Some" && ppcre_bad == 0) fail += 1
+        ppcre_suites = 0; ppcre_bad = 0 }
+      next }
+    # lisp-unit2: "Test Summary for :NAME (N tests 0.12 sec)" (or without the
+    # "for :NAME" part), then one "  | N WHAT" line per count. The counts read
+    # are "passed", "failed" and "execution errors" (a test that signalled,
+    # counted as a failure). "warnings", "empty" and "missing tests" are
+    # neither. The block ends at the first line that is not a "|" line.
+    /^[[:space:]]*Test Summary (for .* )?\([0-9]+ tests? [0-9.]+ sec\)/ { fw["lisp-unit2"]=1; in_lu2 = 1; next }
+    in_lu2 && /^[[:space:]]*\| [0-9]+ passed[[:space:]]*$/ { pass += $2; next }
+    in_lu2 && /^[[:space:]]*\| [0-9]+ failed[[:space:]]*$/ { fail += $2; next }
+    in_lu2 && /^[[:space:]]*\| [0-9]+ execution errors?[[:space:]]*$/ { fail += $2; next }
+    in_lu2 && /^[[:space:]]*\|/ { next }
+    in_lu2 { in_lu2 = 0 }
+    # lift: "Test Report for SUITE: N tests run, all passed!" or
+    # "...: N tests run, F Failures." (", E Errors." may follow). The unit is
+    # the test; a failure or an error is a failing test. Lift can print the
+    # same report more than once (the run, then DESCRIBE of its result), so
+    # the last report is the one counted, at END.
+    # The report can follow the "Start: SUITE" progress line without a newline.
+    /Test Report for .*: [0-9]+ tests? run, / {
+      s = $0; sub(/.*Test Report for /, "", s); sub(/.*: /, "", s); n = s; sub(/ .*/, "", n); f = 0
+      rest = s
+      while (match(rest, /[0-9]+ (Failures?|Errors?)/)) {
+        c = substr(rest, RSTART, RLENGTH); sub(/ .*/, "", c); f += c
+        rest = substr(rest, RSTART + RLENGTH) }
+      lift_seen = 1; lift_pass = n - f; lift_fail = f; next }
+    # ptester (cl-base64, puri): "Errors detected in this test: E" and
+    # "Successes this test:S" after each "Begin NAME test".
+    /^Errors detected in this test: *[0-9]+/ { fw["ptester"]=1; s = $0; sub(/.*: */, "", s); fail += s + 0; next }
+    /^Successes this test: *[0-9]+/ { fw["ptester"]=1; s = $0; sub(/.*: */, "", s); pass += s + 0; next }
+    # Nothing to run (see the driver), or hu.dwim.asdf naming a test system
+    # that does not exist.
+    /^LIBTEST-NO-TEST-OP/ { notests = 1; next }
+    /^WARNING: No tests were run; system: / { notests = 1; next }
     /^LIBTEST-ERROR/ { err = 1 }
     /^; Debugger entered on/ { err = 1 }
     /^LIBTEST-END/ { ended = 1 }
     END {
       if (fiasco_ok > 0 || fiasco_fail > 0) {
         fw["fiasco"]=1; pass += fiasco_ok; fail += fiasco_fail }
+      if (lift_seen) { fw["lift"]=1; pass += lift_pass; fail += lift_fail }
       if (last_seen && !("stefil" in fw)) {
         fw["stefil"]=1; pass += last_pass; fail += last_fail }
       names = ""
@@ -226,6 +276,7 @@ judge() {
       if (fail > 0) v = "fail"
       else if (names != "-" && pass > 0 && !err && ended) v = "pass"
       else if (err || !ended) v = "error"
+      else if (notests) v = "no-tests"
       else v = "no-result"
       printf "%s %s %d %d\n", v, names, pass, fail
     }'
@@ -291,9 +342,35 @@ for sys in $(cat "$work/list"); do
 ;; start of a line, and a FRESH-LINE that misjudges the column (after PRINT, on
 ;; some streams) would glue it to the test output and lose the result.
 (format t "~%LIBTEST-BEGIN~%")
+;; A TEST-OP with nothing to do: no test system among its dependencies and
+;; no PERFORM method of the library's own, only ASDF's empty default one.
+;; Marked so the judge can tell "defines no tests" from "ran, but printed
+;; nothing a recogniser knows". Printed after LIBTEST-BEGIN, since the judge
+;; reads nothing before it.
+(let* ((system (asdf:find-system "$sys"))
+       (specs (find-symbol "METHOD-SPECIALIZERS" "DOTCL-MOP"))
+       (op-class (find-class 'asdf:test-op))
+       (own (remove-if-not
+             (lambda (m)
+               (destructuring-bind (o c &rest r) (funcall specs m)
+                 (declare (ignore r))
+                 (and (or (not (typep o 'class)) (subtypep o op-class))
+                      (not (and (eq o op-class)
+                                (eq c (find-class 'asdf:component)))))))
+             (compute-applicable-methods
+              #'asdf:perform (list (asdf:make-operation 'asdf:test-op) system)))))
+  (when (and specs (null own) (null (libtest-test-systems "$sys")))
+    (format t "~%LIBTEST-NO-TEST-OP~%")))
 (finish-output)
-(handler-case (asdf:test-system "$sys")
-  (error (e) (libtest-die "LIBTEST-ERROR" e 2)))
+;; An error nothing handles ends the run through the debugger hook rather
+;; than a HANDLER-CASE around the call: a handler here would take every error
+;; before the debugger is reached, and a library that tests its own debugger
+;; handling (trivial-custom-debugger signals an error inside WITH-DEBUGGER and
+;; expects its hook to see it) could never pass.
+(let ((*debugger-hook* (lambda (c hook)
+                         (declare (ignore hook))
+                         (libtest-die "LIBTEST-ERROR" c 2))))
+  (asdf:test-system "$sys"))
 ;; stefil keeps the result of the last suite run in *LAST-TEST-RESULT*. A test
 ;; op that does not print it leaves only progress characters, so print it here.
 (dolist (p '("HU.DWIM.STEFIL" "STEFIL"))
@@ -305,7 +382,8 @@ for sys in $(cat "$work/list"); do
 (dotcl:quit 0)
 DRVEOF
 
-  log="$logdir/$sys.txt"
+  # A slash in a system name ("foo/test") is not a directory here.
+  log="$logdir/$(printf '%s' "$sys" | tr / _).txt"
   t0=$(date +%s)
   set +e
   "$timeout" "$per" "$exe" --asm "$core" "$work/drv.lisp" > "$log" 2>&1 < /dev/null
@@ -343,7 +421,7 @@ done
 finished=$(date +%s)
 echo ""
 echo "run-tests: $ran systems in $((finished - started))s ($skipped already recorded) -> $out"
-for s in pass fail error no-result timeout load-fail; do
+for s in pass fail error no-result no-tests timeout load-fail; do
   printf '  %-10s %s\n' "$s" "$(grep -c "\"verdict\": \"$s\"" "$work/entries" || true)"
 done
 echo "  logs       $logdir"

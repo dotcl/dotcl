@@ -242,6 +242,15 @@ internal static class Compat
         => BitConverter.Int32BitsToSingle(value);
 #endif
 
+    /// <summary>The hash String.GetHashCode gives the same characters, without
+    /// making a string of them.</summary>
+    public static int StringHash(ReadOnlySpan<char> chars)
+#if NETSTANDARD2_0
+        => new string(chars.ToArray()).GetHashCode();
+#else
+        => string.GetHashCode(chars);
+#endif
+
     public static bool IsNegative(double value)
         => BitConverter.DoubleToInt64Bits(value) < 0;
 
@@ -257,6 +266,77 @@ internal static class Compat
         => (dir.Attributes & System.IO.FileAttributes.ReparsePoint) != 0;
 #else
         => dir.LinkTarget != null;
+#endif
+
+    /// <summary>FULLPATH (absolute) with every symbolic link along it replaced by
+    /// what it points at, as realpath(3) answers: the truename of a file reached
+    /// through a link is the file's own name. A ".." steps back from wherever the
+    /// link before it led, as the file system walks it. A component that does not
+    /// exist, or a link to nothing, ends the resolution there and the rest is kept
+    /// as written. netstandard2.0 cannot read a link's target, and Windows links
+    /// and junctions are left alone, so there FULLPATH comes back as it is.</summary>
+    public static string ResolveSymlinks(string fullPath)
+#if NETSTANDARD2_0
+        => fullPath;
+#else
+    {
+        if (OperatingSystem.IsWindows() || fullPath.Length == 0 || fullPath[0] != '/')
+            return fullPath;
+        bool trailingSlash = fullPath.Length > 1 && fullPath.EndsWith('/');
+        // Components still to walk, the next one last.
+        var pending = new List<string>(fullPath.Split('/', StringSplitOptions.RemoveEmptyEntries));
+        pending.Reverse();
+        var done = new List<string>();
+        int links = 0;
+        bool exists = true;
+        while (pending.Count > 0)
+        {
+            var comp = pending[pending.Count - 1];
+            pending.RemoveAt(pending.Count - 1);
+            if (comp == ".") continue;
+            if (comp == "..")
+            {
+                if (done.Count > 0) done.RemoveAt(done.Count - 1);
+                continue;
+            }
+            done.Add(comp);
+            if (!exists) continue;
+            var cur = "/" + string.Join("/", done);
+            string? target = null;
+            try
+            {
+                var info = new System.IO.FileInfo(cur);
+                if (!info.Exists && !System.IO.Directory.Exists(cur) && info.LinkTarget == null)
+                {
+                    exists = false;
+                    continue;
+                }
+                target = info.LinkTarget;
+            }
+            catch (Exception) { exists = false; continue; }
+            if (target == null) continue;
+            // A link to nothing is its own truename, as SBCL answers.
+            try
+            {
+                if (!System.IO.Directory.Exists(cur)
+                    && new System.IO.FileInfo(cur).ResolveLinkTarget(true) is not { Exists: true })
+                {
+                    exists = false;
+                    continue;
+                }
+            }
+            catch (Exception) { exists = false; continue; }
+            // A cycle of links: give the path back as it was written.
+            if (++links > 40) return fullPath;
+            done.RemoveAt(done.Count - 1);
+            if (target.StartsWith('/')) done.Clear();
+            var parts = target.Split('/', StringSplitOptions.RemoveEmptyEntries);
+            for (int i = parts.Length - 1; i >= 0; i--) pending.Add(parts[i]);
+        }
+        var result = "/" + string.Join("/", done);
+        if (trailingSlash && result.Length > 1) result += "/";
+        return result;
+    }
 #endif
 
     public static bool IsWindows()
@@ -362,8 +442,23 @@ internal static class Compat
     private const int PadFrames = 16;   // 16 x 16KB = 256KB extra headroom
     private const int PadBytes = 16 * 1024;
 
-    public static bool TryEnsureSufficientExecutionStackWithMargin()
-        => ProbePadded(PadFrames);
+    // The lowest stack address on this thread at which the padded probe passed.
+    // Stacks grow down, so from any address at or above it at least that much
+    // room remains and the probe would pass again: a periodic check made at a
+    // depth already proven costs one comparison instead of seventeen frames of
+    // stack touching.
+    [ThreadStatic] private static ulong t_provenStackAddress;
+
+    public static unsafe bool TryEnsureSufficientExecutionStackWithMargin()
+    {
+        byte marker;
+        ulong here = (ulong)&marker;
+        ulong proven = t_provenStackAddress;
+        if (proven != 0 && here >= proven) return true;
+        if (!ProbePadded(PadFrames)) return false;
+        t_provenStackAddress = here;
+        return true;
+    }
 
     // The stackalloc below exists to MOVE the stack pointer, not to hold data:
     // only its first and last byte are written. Zero-initialising it (the C#
@@ -381,6 +476,19 @@ internal static class Compat
         pad[PadBytes - 1] = 1;
         return ProbePadded(depth - 1);
     }
+
+    /// <summary>Number of 1 bits (BitOperations.PopCount is net core 3.0+).</summary>
+    public static int PopCount(ulong v)
+#if NETSTANDARD2_0
+    {
+        v -= (v >> 1) & 0x5555555555555555UL;
+        v = (v & 0x3333333333333333UL) + ((v >> 2) & 0x3333333333333333UL);
+        v = (v + (v >> 4)) & 0x0F0F0F0F0F0F0F0FUL;
+        return (int)((v * 0x0101010101010101UL) >> 56);
+    }
+#else
+        => System.Numerics.BitOperations.PopCount(v);
+#endif
 
     /// <summary>GCCollectionMode.Aggressive is net5.0+; fall back to Forced on ns2.0.</summary>
     public static readonly GCCollectionMode AggressiveGCMode =

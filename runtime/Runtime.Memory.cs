@@ -283,7 +283,24 @@ public static partial class Runtime
                     return PointerToLisp(ptr);
             }
         }
+        // Then the process itself, as C's dlsym(RTLD_DEFAULT, name) or SBCL's
+        // foreign symbol lookup would: on Unix the main program handle reaches
+        // every library already loaded with global scope, the C library among
+        // them, so clock_gettime or strlen resolve with no LOAD-FOREIGN-LIBRARY.
+        if (NativeLibrary.TryGetExport(MainProgramHandle, name, out var own))
+            return PointerToLisp(own);
         return Nil.Instance;
+    }
+
+    static IntPtr _mainProgramHandle;
+    static IntPtr MainProgramHandle
+    {
+        get
+        {
+            if (_mainProgramHandle == IntPtr.Zero)
+                _mainProgramHandle = NativeLibrary.GetMainProgramHandle();
+            return _mainProgramHandle;
+        }
     }
 
     // (dotnet:library-path handle) -> string path or NIL
@@ -331,6 +348,120 @@ public static partial class Runtime
         if (arg is Nil) return 0;
         throw new LispErrorException(new LispTypeError(
             $"{fn}: {what} must be an address (integer), got {arg}", arg, Startup.Sym("INTEGER")));
+    }
+
+    // --- Pinned vectors (static-vectors support) ---
+    // A pinned vector is an ordinary specialized Lisp vector whose backing .NET
+    // array does not move, so its address can be handed to foreign code. On
+    // .NET 5+ the array lives on the pinned object heap and is reclaimed by the
+    // GC like any other once unreachable; on netstandard2.0 it is pinned with a
+    // GCHandle, which roots it until DOTCL:UNPIN-VECTOR.
+
+    sealed class PinnedStorage
+    {
+        public readonly Array Storage;
+        public GCHandle Handle;
+        public PinnedStorage(Array storage, GCHandle handle) { Storage = storage; Handle = handle; }
+    }
+
+    static readonly System.Runtime.CompilerServices.ConditionalWeakTable<LispVector, PinnedStorage>
+        _pinnedVectors = new();
+
+    /// Byte width of one element of a numeric storage array type, or 0 for a
+    /// type foreign code has no fixed-width counterpart for (char[]).
+    static int StorageElementWidth(Type t) =>
+        t == typeof(byte[]) || t == typeof(sbyte[]) ? 1
+        : t == typeof(ushort[]) || t == typeof(short[]) ? 2
+        : t == typeof(int[]) || t == typeof(uint[]) || t == typeof(float[]) ? 4
+        : t == typeof(long[]) || t == typeof(double[]) ? 8
+        : 0;
+
+    /// The byte width foreign code expects for an element type name, or 0 when
+    /// the type has no fixed-width foreign counterpart.
+    static int ForeignElementWidth(string et)
+    {
+        if (et == "SINGLE-FLOAT") return 4;
+        if (et == "DOUBLE-FLOAT") return 8;
+        int bits = 0;
+        if (et.StartsWith("UNSIGNED-BYTE-", StringComparison.Ordinal))
+            int.TryParse(et.Substring("UNSIGNED-BYTE-".Length), out bits);
+        else if (et.StartsWith("SIGNED-BYTE-", StringComparison.Ordinal))
+            int.TryParse(et.Substring("SIGNED-BYTE-".Length), out bits);
+        if (bits < 1 || bits > 64) return 0;
+        return bits <= 8 ? 1 : bits <= 16 ? 2 : bits <= 32 ? 4 : 8;
+    }
+
+#if NET5_0_OR_GREATER
+    static T[] AllocPinnedArray<T>(int n) => GC.AllocateArray<T>(n, pinned: true);
+#endif
+
+    static Array AllocPinned(Type t, int n, out GCHandle handle)
+    {
+#if NET5_0_OR_GREATER
+        handle = default;
+        if (t == typeof(byte[])) return AllocPinnedArray<byte>(n);
+        if (t == typeof(sbyte[])) return AllocPinnedArray<sbyte>(n);
+        if (t == typeof(ushort[])) return AllocPinnedArray<ushort>(n);
+        if (t == typeof(short[])) return AllocPinnedArray<short>(n);
+        if (t == typeof(int[])) return AllocPinnedArray<int>(n);
+        if (t == typeof(uint[])) return AllocPinnedArray<uint>(n);
+        if (t == typeof(long[])) return AllocPinnedArray<long>(n);
+        if (t == typeof(float[])) return AllocPinnedArray<float>(n);
+        return AllocPinnedArray<double>(n);
+#else
+        var a = Array.CreateInstance(t.GetElementType()!, n);
+        handle = GCHandle.Alloc(a, GCHandleType.Pinned);
+        return a;
+#endif
+    }
+
+    // (dotcl:make-pinned-vector length element-type) -> vector
+    public static LispObject MakePinnedVector(LispObject[] args)
+    {
+        const string fn = "DOTCL:MAKE-PINNED-VECTOR";
+        if (args.Length != 2) throw ArgError(fn, 2, args.Length);
+        if (args[0] is not Fixnum lenFx || lenFx.Value < 0 || lenFx.Value > int.MaxValue)
+            throw new LispErrorException(new LispTypeError(
+                $"{fn}: length must be a non-negative fixnum, got {args[0]}", args[0], Startup.Sym("FIXNUM")));
+        string et = ParseElementTypeName(args[1]);
+        var storageType = LispVector.StorageTypeFor(et, foreignWidth: true);
+        int width = storageType == null ? 0 : StorageElementWidth(storageType);
+        if (width == 0 || width != ForeignElementWidth(et))
+            throw new LispErrorException(new LispError(
+                $"{fn}: element type {args[1]} has no fixed-width storage. Supported: "
+                + "(unsigned-byte N) for N up to 63, (signed-byte N) for N up to 64, "
+                + "single-float and double-float."));
+        var storage = AllocPinned(storageType!, (int)lenFx.Value, out var handle);
+        var v = LispVector.WithNumStorage(et, storage, foreignWidth: true);
+        _pinnedVectors.Add(v, new PinnedStorage(storage, handle));
+        return v;
+    }
+
+    // (dotcl:pinned-vector-address vector) -> integer address of element 0
+    public static LispObject PinnedVectorAddress(LispObject[] args)
+    {
+        const string fn = "DOTCL:PINNED-VECTOR-ADDRESS";
+        if (args.Length != 1) throw ArgError(fn, 1, args.Length);
+        if (args[0] is not LispVector v || !_pinnedVectors.TryGetValue(v, out var ps))
+            throw new LispErrorException(new LispTypeError(
+                $"{fn}: {args[0]} is not a pinned vector (made by DOTCL:MAKE-PINNED-VECTOR and not unpinned)",
+                args[0], Startup.Sym("VECTOR")));
+        // ADJUST-ARRAY can give the vector new storage; that storage is not pinned.
+        if (!ReferenceEquals(v._numData, ps.Storage))
+            throw new LispErrorException(new LispError(
+                $"{fn}: the storage of {args[0]} was replaced (ADJUST-ARRAY?) and is no longer pinned"));
+        return PointerToLisp(Marshal.UnsafeAddrOfPinnedArrayElement(ps.Storage, 0));
+    }
+
+    // (dotcl:unpin-vector vector) -> T if VECTOR was pinned, else NIL
+    public static LispObject UnpinVector(LispObject[] args)
+    {
+        if (args.Length != 1) throw ArgError("DOTCL:UNPIN-VECTOR", 1, args.Length);
+        if (args[0] is not LispVector v || !_pinnedVectors.TryGetValue(v, out var ps))
+            return Nil.Instance;
+        _pinnedVectors.Remove(v);
+        if (ps.Handle.IsAllocated) ps.Handle.Free();
+        return T.Instance;
     }
 
     static LispErrorException ArgError(string fn, int expected, int got) =>

@@ -61,8 +61,12 @@ bench-state.json
 !bench/test-modes.sh
 !bench/library-status/run-quickload.sh
 !bench/library-status/run-tests.sh
+!bench/library-status/scrub.sh
+!bench/library-status/check-scrub.sh
+!bench/library-status/run-forks.sh
 !samples/**/*.sh
 !test/*/check.sh
+!test/pack-nuspec/tool-deps.sh
 
 ## qlot (dependency management)
 qlfile

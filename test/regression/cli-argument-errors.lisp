@@ -20,8 +20,7 @@
       (error "cannot locate this process's executable")))
 
 (defvar *cli-ae-core*
-  (or (ignore-errors (namestring (truename "compiler/cil-out.sil")))
-      "compiler/cil-out.sil"))
+  (regression-child-core))
 
 (defun %cli-ae-run (args) (dotcl:run-process *cli-ae-exe* args))
 

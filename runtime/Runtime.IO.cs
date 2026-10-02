@@ -193,6 +193,25 @@ public static partial class Runtime
         }
     }
 
+    /// <summary>True when WRITER is a string buffer that has nothing to do with the
+    /// current logical block: neither the block's stream nor a buffer staged for
+    /// it (the stream of a PRINT-OBJECT method or ~/fn/ inside the block). Text
+    /// written there, e.g. to a WITH-OUTPUT-TO-STRING stream opened inside the
+    /// block, must not move the block's column.</summary>
+    internal static bool PprintUnrelatedWriter(TextWriter writer)
+    {
+        if (!_pprintActive || _pprintStream == null || ReferenceEquals(writer, _pprintStream)) return false;
+        if (writer is not StringWriter sw) return false;
+        var st = _pprintStaged;
+        if (st != null)
+        {
+            var b = sw.GetStringBuilder();
+            for (int k = 0; k < st.Count; k++)
+                if (ReferenceEquals(st[k].sb, b)) return false;
+        }
+        return true;
+    }
+
     /// <summary>Update column position after writing a single character.</summary>
     public static void PprintTrackWriteChar(char c)
     {
@@ -227,6 +246,11 @@ public static partial class Runtime
                 removed++;
             }
             _pprintColumn = Math.Max(0, _pprintColumn - removed);
+        }
+        else if (writer is FillPointerStringWriter fw)
+        {
+            // WITH-OUTPUT-TO-STRING into a string with a fill pointer.
+            _pprintColumn = Math.Max(0, _pprintColumn - fw.TrimTrailingBlanks());
         }
     }
 
@@ -765,22 +789,97 @@ public static partial class Runtime
     // --- File I/O ---
 
     /// Get number of bytes per element for binary streams. Returns 1 for standard byte streams.
-    private static int GetBinaryByteWidth(LispObject stream)
+    private static int GetBinaryByteWidth(LispObject stream) => GetBinaryFormat(stream, out _);
+
+    /// <summary>Bytes per element of a binary stream, and whether its elements are
+    /// signed. (unsigned-byte N) and (signed-byte N) both take ceiling(N/8) bytes,
+    /// little-endian; a signed element is sign-extended from its top byte. Only
+    /// UNSIGNED-BYTE was recognized before, so a (signed-byte 32) stream moved one
+    /// byte per element and never produced a negative number.</summary>
+    private static int GetBinaryFormat(LispObject stream, out bool signed)
     {
         // Resolve through composite streams to find the underlying file stream's element-type
-        if (stream is LispTwoWayStream tw) return GetBinaryByteWidth(tw.InputStream);
-        if (stream is LispSynonymStream ss) return GetBinaryByteWidth(ss.Symbol.Value!);
-        if (stream is LispEchoStream es) return GetBinaryByteWidth(es.InputStream);
+        if (stream is LispTwoWayStream tw) return GetBinaryFormat(tw.InputStream, out signed);
+        if (stream is LispSynonymStream ss) return GetBinaryFormat(ss.Symbol.Value!, out signed);
+        if (stream is LispEchoStream es) return GetBinaryFormat(es.InputStream, out signed);
         if (stream is LispConcatenatedStream cs && cs.CurrentIndex < cs.Streams.Length)
-            return GetBinaryByteWidth(cs.Streams[cs.CurrentIndex]);
+            return GetBinaryFormat(cs.Streams[cs.CurrentIndex], out signed);
         if (stream is LispBroadcastStream bs && bs.Streams.Length > 0)
-            return GetBinaryByteWidth(bs.Streams[^1]);
+            return GetBinaryFormat(bs.Streams[^1], out signed);
+        signed = false;
         LispObject? et = null;
         if (stream is LispFileStream fs) et = fs.ElementType;
         else if (stream is LispStream ls) et = ls.ElementType;
-        if (et is Cons c && c.Car is Symbol sym && sym.Name == "UNSIGNED-BYTE" && c.Cdr is Cons c2 && c2.Car is Fixnum bits)
+        if (et is Cons c && c.Car is Symbol sym && sym.Name is "UNSIGNED-BYTE" or "SIGNED-BYTE"
+            && c.Cdr is Cons c2 && c2.Car is Fixnum bits && bits.Value > 0)
+        {
+            signed = sym.Name == "SIGNED-BYTE";
             return Math.Max(1, ((int)bits.Value + 7) / 8);
+        }
         return 1;
+    }
+
+    /// <summary>Read one element of WIDTH bytes (little-endian) from a binary
+    /// stream. Null at end of file; a partial last element is completed with zero
+    /// bytes, as before.</summary>
+    private static LispObject? ReadBinaryElement(LispObject stream, int width, bool signed)
+    {
+        if (width == 1)
+        {
+            int b1 = ReadStreamByte(stream);
+            if (b1 == -1) return null;
+            return Fixnum.Make(signed ? (sbyte)(byte)b1 : b1);
+        }
+        byte[] bytes = new byte[width];
+        int first = ReadStreamByte(stream);
+        if (first == -1) return null;
+        bytes[0] = (byte)first;
+        for (int j = 1; j < width; j++)
+        {
+            int b = ReadStreamByte(stream);
+            if (b == -1) break;
+            bytes[j] = (byte)b;
+        }
+        if (width <= 8)
+        {
+            ulong u = 0;
+            for (int j = width - 1; j >= 0; j--)
+                u = (u << 8) | bytes[j];
+            if (signed)
+            {
+                int shift = 64 - width * 8;
+                return Fixnum.Make((long)(u << shift) >> shift);
+            }
+            if (u <= long.MaxValue) return Fixnum.Make((long)u);
+            return Bignum.MakeInteger(new BigInteger(u));
+        }
+        var bigVal = Compat.MakeBigInteger(bytes, isUnsigned: !signed, isBigEndian: false);
+        return Bignum.MakeInteger(bigVal);
+    }
+
+    /// <summary>Write one integer element as WIDTH bytes, little-endian two's
+    /// complement (the low WIDTH bytes of the value).</summary>
+    private static void WriteBinaryElement(LispObject stream, LispObject elem, int width)
+    {
+        if (width == 1)
+        {
+            WriteStreamByte(stream, elem is Fixnum f1 ? (int)f1.Value & 0xFF : 0);
+            return;
+        }
+        byte[] bytes = new byte[width];
+        if (elem is Fixnum fi)
+        {
+            long val = fi.Value;
+            for (int j = 0; j < width; j++) { bytes[j] = (byte)(val & 0xFF); val >>= 8; }
+        }
+        else if (elem is Bignum bi)
+        {
+            var big = bi.Value;
+            var bigBytes = big.ToByteArray();              // two's complement, little-endian
+            byte fill = big.Sign < 0 ? (byte)0xFF : (byte)0;
+            for (int j = 0; j < width; j++) bytes[j] = j < bigBytes.Length ? bigBytes[j] : fill;
+        }
+        for (int j = 0; j < width; j++) WriteStreamByte(stream, bytes[j]);
     }
 
     /// <summary>True when the stream reads characters rather than bytes. Only there
@@ -886,10 +985,36 @@ public static partial class Runtime
     /// UTF-8 made (with-open-file ... :external-format :latin-1) look like it took
     /// effect while writing 1.5x the bytes, which breaks the faithful-octet-I/O idiom
     /// that libraries like rfc2388 rely on.
+    ///
+    /// Accepted designators:
+    /// - a name (keyword or string), optionally as the car of a list whose rest is
+    ///   options, e.g. (:utf-8 :replacement #\?). The options are accepted and ignored.
+    /// - the SBCL names in CodePageNames (Shift_JIS, EUC-JP, GBK, KOI8-R, ISO-8859-N,
+    ///   CPnnnn, ...), served by the code-page encodings of CodePagesEncodingProvider.
+    /// - any other name .NET's Encoding.GetEncoding knows ("x-mac-japanese",
+    ///   :windows-1251, ...), as an escape hatch for encodings not in the table.
+    /// - (:code-page N): the .NET / Windows code page numbered N.
+    ///
+    /// :shift_jis, :sjis and :cp932 all mean code page 932 (Microsoft's Shift_JIS),
+    /// not strict JIS X 0208 Shift_JIS: files written on Japanese Windows use the
+    /// cp932 extensions (circled digits, NEC/IBM kanji), and 932 round-trips them.
+    ///
+    /// Characters a code-page encoding cannot represent are written as "?", and bytes
+    /// it cannot decode read as U+FFFD, like the UTF-8 path; nothing signals. The
+    /// best-fit mapping .NET uses by default (e.g. writing "a" for an a-umlaut) is
+    /// turned off so a character is never silently replaced by a look-alike.
     /// Encodings are fetched by code page rather than the Encoding.Latin1 property so
     /// the netstandard2.0 target builds too.</summary>
-    private static System.Text.Encoding? ParseExternalFormat(LispObject spec)
+    internal static System.Text.Encoding? ParseExternalFormat(LispObject spec, string who = "OPEN")
     {
+        // (:code-page N) names a code page by number.
+        if (spec is Cons cp && cp.Car is Symbol cps && cps.Name == "CODE-PAGE")
+        {
+            if (cp.Cdr is Cons cpn && cpn.Car is Fixnum n && n.Value > 0 && n.Value <= 65535)
+                return CodePageEncoding((int)n.Value, $"(:CODE-PAGE {n.Value})", who);
+            throw new LispErrorException(new LispError(
+                $"{who}: (:CODE-PAGE N) needs a code page number, got {spec}"));
+        }
         // A list designator carries options after the name, e.g. (:utf-8 :replacement #\?).
         if (spec is Cons c) spec = c.Car;
         string name = spec switch
@@ -908,11 +1033,113 @@ public static partial class Runtime
             case "UTF-16": case "UTF16": case "UCS-2": case "UCS2":
                 return System.Text.Encoding.Unicode;
             case "UTF-16BE": case "UTF16BE": return System.Text.Encoding.BigEndianUnicode;
+            case "UTF-16LE": case "UTF16LE":
+                return new System.Text.UnicodeEncoding(bigEndian: false, byteOrderMark: false);
             case "UTF-32": case "UTF32": case "UCS-4": case "UCS4":
                 return System.Text.Encoding.UTF32;
-            default:
-                throw new LispErrorException(new LispError(
-                    $"OPEN: unsupported external format: {name}"));
+            case "UTF-32LE": case "UTF32LE":
+                return new System.Text.UTF32Encoding(bigEndian: false, byteOrderMark: false);
+            case "UTF-32BE": case "UTF32BE":
+                return new System.Text.UTF32Encoding(bigEndian: true, byteOrderMark: false);
+        }
+        if (CodePageOfName(name) is int page)
+            return CodePageEncoding(page, name, who);
+        // Escape hatch: a name .NET itself knows (IANA / Windows names).
+        EnsureCodePages();
+        try
+        {
+            var enc = System.Text.Encoding.GetEncoding(name);
+            return CodePageEncoding(enc.CodePage, name, who);
+        }
+        catch (ArgumentException) { }
+        catch (NotSupportedException) { }
+        throw new LispErrorException(new LispError(
+            $"{who}: unsupported external format: {name}"));
+    }
+
+    /// <summary>SBCL's external-format names (plus common aliases) and the code page
+    /// each one means. CPnnnn and WINDOWS-nnnn are read as the number itself.</summary>
+    private static readonly Dictionary<string, int> CodePageNames = new()
+    {
+        ["SHIFT_JIS"] = 932, ["SHIFT-JIS"] = 932, ["SJIS"] = 932,
+        ["WINDOWS-31J"] = 932, ["MS932"] = 932,
+        ["EUC-JP"] = 51932, ["EUCJP"] = 51932,
+        ["ISO-2022-JP"] = 50220,
+        ["GBK"] = 936,
+        ["BIG5"] = 950,
+        ["EUC-KR"] = 51949, ["EUCKR"] = 51949,
+        ["KOI8-R"] = 20866, ["KOI8R"] = 20866,
+        ["KOI8-U"] = 21866, ["KOI8U"] = 21866,
+        ["LATIN-2"] = 28592, ["LATIN2"] = 28592,
+        ["LATIN-3"] = 28593, ["LATIN3"] = 28593,
+        ["LATIN-4"] = 28594, ["LATIN4"] = 28594,
+        ["LATIN-5"] = 28599, ["LATIN5"] = 28599,
+        ["LATIN-7"] = 28603, ["LATIN7"] = 28603,
+        ["LATIN-9"] = 28605, ["LATIN9"] = 28605,
+    };
+
+    private static int? CodePageOfName(string name)
+    {
+        if (CodePageNames.TryGetValue(name, out int page)) return page;
+        string? digits =
+            name.StartsWith("CP", StringComparison.Ordinal) ? name.Substring(2)
+            : name.StartsWith("WINDOWS-", StringComparison.Ordinal) ? name.Substring(8)
+            : null;
+        if (digits != null && digits.Length > 0 && digits.Length <= 5
+            && digits.All(char.IsDigit))
+            return int.Parse(digits, System.Globalization.CultureInfo.InvariantCulture);
+        // ISO-8859-N / ISO8859-N: .NET provides N = 2..9, 13 and 15 as 28590 + N
+        // (13 and 15 are 28603 and 28605).
+        string? iso =
+            name.StartsWith("ISO-8859-", StringComparison.Ordinal) ? name.Substring(9)
+            : name.StartsWith("ISO8859-", StringComparison.Ordinal) ? name.Substring(8)
+            : null;
+        if (iso != null && int.TryParse(iso, System.Globalization.NumberStyles.None,
+                                        System.Globalization.CultureInfo.InvariantCulture,
+                                        out int part))
+        {
+            if (part >= 1 && part <= 9) return 28590 + part;
+            if (part == 13) return 28603;
+            if (part == 15) return 28605;
+        }
+        return null;
+    }
+
+    /// <summary>The encoding for code page <paramref name="page"/>, with replacement
+    /// fallbacks instead of best-fit (see ParseExternalFormat).</summary>
+    private static System.Text.Encoding CodePageEncoding(int page, string label, string who)
+    {
+        // 65001 through GetEncoding carries a BOM preamble that StreamWriter would
+        // write; :utf-8 never does.
+        if (page == 65001) return new System.Text.UTF8Encoding(false);
+        EnsureCodePages();
+        try
+        {
+            return System.Text.Encoding.GetEncoding(page,
+                new System.Text.EncoderReplacementFallback("?"),
+                new System.Text.DecoderReplacementFallback("\uFFFD"));
+        }
+        catch (Exception ex) when (ex is ArgumentException || ex is NotSupportedException)
+        {
+            throw new LispErrorException(new LispError(
+                $"{who}: unsupported external format: {label} (code page {page} is not available)"));
+        }
+    }
+
+    /// <summary>Makes the legacy code pages (932, 936, 1251, ...) visible to
+    /// Encoding.GetEncoding. Done on first use rather than at startup so a process
+    /// that never asks for one (including an application embedding the runtime) keeps
+    /// the framework's encoding set; registering changes what Console picks for a
+    /// non-UTF-8 console code page.</summary>
+    private static void EnsureCodePages() => _ = CodePagesRegistration.Done;
+
+    private static class CodePagesRegistration
+    {
+        internal static readonly bool Done = Register();
+        private static bool Register()
+        {
+            System.Text.Encoding.RegisterProvider(System.Text.CodePagesEncodingProvider.Instance);
+            return true;
         }
     }
 
@@ -925,9 +1152,29 @@ public static partial class Runtime
     // first bytes happen to look like a BOM would otherwise be decoded as UTF-8.
     // Without one, StreamReader's default sniffed the mark, so the same sniffing
     // happens here rather than silently losing it.
-    private static ByteTrackingReader MakeReader(System.IO.Stream s, System.Text.Encoding? enc)
-        => enc == null ? new ByteTrackingReader(s, SniffEncoding(s), skipPreamble: true)
-                       : new ByteTrackingReader(s, enc, skipPreamble: false);
+    //
+    // A binary stream has no text and so no byte order mark: its leading bytes
+    // are data, and READ-BYTE / READ-SEQUENCE / FILE-POSITION must see all of
+    // them. Only a character stream sniffs and skips the mark.
+    private static ByteTrackingReader MakeReader(System.IO.Stream s, System.Text.Encoding? enc,
+                                                 bool binary)
+    {
+        if (binary)
+            return new ByteTrackingReader(s, enc ?? new System.Text.UTF8Encoding(false),
+                                          skipPreamble: false);
+        return enc == null ? new ByteTrackingReader(s, SniffEncoding(s), skipPreamble: true)
+                           : new ByteTrackingReader(s, enc, skipPreamble: false);
+    }
+
+    /// <summary>True when an OPEN :ELEMENT-TYPE names a binary (non-character)
+    /// stream. Null is the default, CHARACTER. Matches IsBinaryStream.</summary>
+    private static bool IsBinaryElementType(LispObject? elementType)
+    {
+        if (elementType == null) return false;
+        if (elementType is Symbol sym)
+            return sym.Name is not ("CHARACTER" or "BASE-CHAR" or "STANDARD-CHAR");
+        return true;
+    }
 
     /// <summary>The encoding a byte order mark names, or UTF-8 when there is none --
     /// what StreamReader's default constructor decides. The mark itself is left in
@@ -970,6 +1217,26 @@ public static partial class Runtime
     }
 
     public static LispObject OpenFile(LispObject path, LispObject[] options)
+    {
+        try
+        {
+            return OpenFileCore(path, options);
+        }
+        catch (Exception ex) when (ex is System.IO.IOException or UnauthorizedAccessException)
+        {
+            // The file system refused (missing directory, permission, too many
+            // open files ...): OPEN signals FILE-ERROR for these, not a generic
+            // error, so that handlers for FILE-ERROR see them.
+            var err = new LispError($"OPEN: {ex.Message}");
+            err.ConditionTypeName = "FILE-ERROR";
+            err.FileErrorPathnameRef = path is LispPathname ? path
+                : path is LispFileStream pfs ? LispPathname.FromString(pfs.FilePath)
+                : LispPathname.FromString(ResolvePhysicalPath(path));
+            throw new LispErrorException(err);
+        }
+    }
+
+    private static LispObject OpenFileCore(LispObject path, LispObject[] options)
     {
         string filePath = ResolvePhysicalPath(path);
 
@@ -1058,6 +1325,7 @@ public static partial class Runtime
                 ifDoesNotExist = "NIL";
         }
 
+        bool binaryElement = IsBinaryElementType(elementType);
         switch (direction)
         {
             case "INPUT":
@@ -1071,7 +1339,7 @@ public static partial class Runtime
                     throw new LispErrorException(err);
                 }
                 var netFsIn = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-                var reader = MakeReader(netFsIn, encoding);
+                var reader = MakeReader(netFsIn, encoding, binaryElement);
                 var fs = new LispFileStream(reader, filePath);
                 fs.ElementType = elementType;
                 fs.ExternalFormat = externalFormat;
@@ -1168,7 +1436,7 @@ public static partial class Runtime
                         {
                             // Truncate instead of delete+recreate to avoid file lock issues on Windows
                             var netFsTrunc = new FileStream(filePath, FileMode.Truncate, FileAccess.ReadWrite, FileShare.ReadWrite);
-                            var readerTrunc = MakeReader(netFsTrunc, encoding);
+                            var readerTrunc = MakeReader(netFsTrunc, encoding, binaryElement);
                             var writerTrunc = MakeWriter(netFsTrunc, encoding); writerTrunc.AutoFlush = true;
                             var fsTrunc = new LispFileStream(readerTrunc, writerTrunc, filePath);
                             fsTrunc.ElementType = elementType;
@@ -1183,7 +1451,7 @@ public static partial class Runtime
                             // Open for append + read
                             var netFs = new FileStream(filePath, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite);
                             netFs.Seek(0, SeekOrigin.End); // Position at end for append
-                            var reader = MakeReader(netFs, encoding);
+                            var reader = MakeReader(netFs, encoding, binaryElement);
                             var writer = MakeWriter(netFs, encoding); writer.AutoFlush = true;
                             var afs = new LispFileStream(reader, writer, filePath);
                             afs.ElementType = elementType;
@@ -1211,7 +1479,7 @@ public static partial class Runtime
                 }
                 {
                     var netFs = new FileStream(filePath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.ReadWrite);
-                    var reader = MakeReader(netFs, encoding);
+                    var reader = MakeReader(netFs, encoding, binaryElement);
                     var writer = MakeWriter(netFs, encoding); writer.AutoFlush = true;
                     var fs = new LispFileStream(reader, writer, filePath);
                     fs.ElementType = elementType;
@@ -1264,8 +1532,18 @@ public static partial class Runtime
         if (stream is LispBidirectionalStream bidi)
         {
             bidi.IsClosed = true;
+            // Writer first: both halves may sit on one .NET stream, and closing
+            // the reader first would dispose it under unflushed output.
+            try { bidi.Writer.Close(); } catch (ObjectDisposedException) { } catch (IOException) { }
             try { bidi.Reader.Close(); } catch (ObjectDisposedException) { }
-            try { bidi.Writer.Close(); } catch (ObjectDisposedException) { }
+            return T.Instance;
+        }
+        if (stream is LispBinaryStream bin)
+        {
+            bin.IsClosed = true;
+            try { if (bin.BaseStream.CanWrite) bin.BaseStream.Flush(); }
+            catch (ObjectDisposedException) { } catch (IOException) { }
+            bin.BaseStream.Dispose();
             return T.Instance;
         }
         if (stream is LispStream ls2) ls2.IsClosed = true;
@@ -1298,6 +1576,10 @@ public static partial class Runtime
             return LispChar.Make(ch);
         }
         TextReader reader = GetTextReader(lispStream);
+        // Nothing has arrived on a socket yet: no character, and not end of file.
+        // Peek would wait for the peer (see LISTEN).
+        if (reader is BivalentStreamReader bsr && bsr.DataReady() == false)
+            return Nil.Instance;
         // For string streams and most .NET streams, Peek tells us if data is available
         int p = reader.Peek();
         if (p == -1)
@@ -1350,6 +1632,12 @@ public static partial class Runtime
             throw new LispErrorException(new LispError(
                 "LISTEN: synonym stream symbol has no value"));
         TextReader reader = GetTextReader(resolved);
+        // A socket has nothing to read yet more often than it is at end of file,
+        // and Peek would wait for the peer: ask the socket instead. Code that
+        // reads "what has arrived so far" loops on LISTEN (AllegroServe's
+        // buffered streams do), and hung on the first request.
+        if (reader is BivalentStreamReader bsr && bsr.DataReady() == false)
+            return Nil.Instance;
         int p = reader.Peek();
         return p == -1 ? Nil.Instance : T.Instance;
     }
@@ -1418,27 +1706,7 @@ public static partial class Runtime
             throw new LispErrorException(new LispTypeError("WRITE-BYTE: not a binary output stream", stream, Startup.Sym("STREAM")));
         if (byteObj is not (Fixnum or Bignum))
             throw new LispErrorException(new LispTypeError("WRITE-BYTE: not an integer", byteObj));
-        int byteWidth = GetBinaryByteWidth(stream);
-        if (byteWidth == 1)
-        {
-            int b = byteObj is Fixnum fi ? (int)fi.Value & 0xFF : 0;
-            WriteStreamByte(stream, b);
-        }
-        else
-        {
-            byte[] bytes = new byte[byteWidth];
-            if (byteObj is Fixnum fi2)
-            {
-                long val = fi2.Value;
-                for (int j = 0; j < byteWidth; j++) { bytes[j] = (byte)(val & 0xFF); val >>= 8; }
-            }
-            else if (byteObj is Bignum bi)
-            {
-                var bigBytes = bi.Value.ToByteArray(isUnsigned: true, isBigEndian: false);
-                Array.Copy(bigBytes, bytes, Math.Min(bigBytes.Length, byteWidth));
-            }
-            for (int j = 0; j < byteWidth; j++) WriteStreamByte(stream, bytes[j]);
-        }
+        WriteBinaryElement(stream, byteObj, GetBinaryByteWidth(stream));
         return byteObj;
     }
 
@@ -1471,48 +1739,15 @@ public static partial class Runtime
             throw new LispErrorException(new LispTypeError(
                 $"READ-BYTE: {ls} is not an input stream", stream, Startup.Sym("STREAM")));
 
-        int byteWidth = GetBinaryByteWidth(stream);
-        if (byteWidth == 1)
+        int byteWidth = GetBinaryFormat(stream, out bool signedElems);
+        var elem = ReadBinaryElement(stream, byteWidth, signedElems);
+        if (elem == null)
         {
-            int b = ReadStreamByte(stream);
-            if (b == -1)
-            {
-                if (eofErrorP)
-                    throw new LispErrorException(MakeEndOfFileError(stream));
-                return eofValue;
-            }
-            return Fixnum.Make(b);
+            if (eofErrorP)
+                throw new LispErrorException(MakeEndOfFileError(stream));
+            return eofValue;
         }
-        else
-        {
-            byte[] bytes = new byte[byteWidth];
-            int firstByte = ReadStreamByte(stream);
-            if (firstByte == -1)
-            {
-                if (eofErrorP)
-                    throw new LispErrorException(MakeEndOfFileError(stream));
-                return eofValue;
-            }
-            bytes[0] = (byte)firstByte;
-            for (int j = 1; j < byteWidth; j++)
-            {
-                int b = ReadStreamByte(stream);
-                if (b == -1) break;
-                bytes[j] = (byte)b;
-            }
-            if (byteWidth <= 8)
-            {
-                long val = 0;
-                for (int j = byteWidth - 1; j >= 0; j--)
-                    val = (val << 8) | bytes[j];
-                return Fixnum.Make(val);
-            }
-            else
-            {
-                var bigVal = Compat.MakeBigInteger(bytes, isUnsigned: true, isBigEndian: false);
-                return Bignum.MakeInteger(bigVal);
-            }
-        }
+        return elem;
     }
 
     public static LispObject FindAllSymbols(LispObject name)
@@ -1653,11 +1888,10 @@ public static partial class Runtime
             bsw.WriteRawByte(b);
             return;
         }
+        // No Flush per byte: the FileStream buffers like the character side
+        // does, and FINISH-OUTPUT / FORCE-OUTPUT / CLOSE / FILE-LENGTH flush it.
         if (stream is LispFileStream fs && fs.OutputWriter is StreamWriter sw)
-        {
             sw.BaseStream.WriteByte((byte)b);
-            sw.BaseStream.Flush();
-        }
         else if (stream is LispBroadcastStream bs)
         {
             foreach (var s in bs.Streams) WriteStreamByte(s, b);
@@ -1668,6 +1902,39 @@ public static partial class Runtime
             WriteStreamByte(ss.Symbol.Value!, b);
         else if (stream is LispTwoWayStream tw)
             WriteStreamByte(tw.OutputStream, b);
+    }
+
+    /// <summary>Bulk path of WRITE-SEQUENCE for an octet vector going to a
+    /// one-byte-per-element native stream: one Stream.Write for the whole range
+    /// instead of WriteStreamByte per element, which on a file stream also
+    /// flushed the FileStream (one write syscall) per byte. The file stream still
+    /// gets a single Flush at the end, so what reaches the OS by the time
+    /// WRITE-SEQUENCE returns is unchanged. Returns false when the vector or the
+    /// stream is not one this handles; the caller then takes the per-element loop.</summary>
+    private static bool TryWriteRawBytes(LispObject stream, LispVector vec, int start, int end)
+    {
+        if (vec._numKind != 1 || vec._displacedTo != null || vec._numData is not byte[] raw) return false;
+        if (start < 0 || end < start || end > raw.Length) return false;
+        if (stream is LispFileStream fs && fs.OutputWriter is StreamWriter sw)
+        {
+            sw.BaseStream.Write(raw, start, end - start);
+            sw.BaseStream.Flush();
+            return true;
+        }
+        if (stream is LispBinaryStream bin)
+        {
+            bin.BaseStream.Write(raw, start, end - start);
+            return true;
+        }
+        // A bivalent socket stream took the element-by-element path, one
+        // WriteByte per octet: on a socket that is a send per byte, so a
+        // buffered writer's flush left as many TCP segments as it had bytes.
+        if (stream is LispBidirectionalStream bvo && bvo.Writer is BivalentStreamWriter bsw)
+        {
+            bsw.WriteRawBytes(raw, start, end - start);
+            return true;
+        }
+        return false;
     }
 
     private static void ValidateSequenceKeywords(string funcName, LispObject[] args, int kwStart, ref int start, ref int end)
@@ -1801,40 +2068,12 @@ public static partial class Runtime
             int pos = start;
             if (binary)
             {
-                int byteWidth = GetBinaryByteWidth(stream);
+                int byteWidth = GetBinaryFormat(stream, out bool signedElems);
                 while (pos < end)
                 {
-                    if (byteWidth == 1)
-                    {
-                        int b = ReadStreamByte(stream);
-                        if (b == -1) break;
-                        vec.SetElement(pos++, Fixnum.Make(b));
-                    }
-                    else
-                    {
-                        byte[] bytes = new byte[byteWidth];
-                        int firstByte = ReadStreamByte(stream);
-                        if (firstByte == -1) break;
-                        bytes[0] = (byte)firstByte;
-                        for (int j = 1; j < byteWidth; j++)
-                        {
-                            int b = ReadStreamByte(stream);
-                            if (b == -1) break;
-                            bytes[j] = (byte)b;
-                        }
-                        if (byteWidth <= 8)
-                        {
-                            long val = 0;
-                            for (int j = byteWidth - 1; j >= 0; j--)
-                                val = (val << 8) | bytes[j];
-                            vec.SetElement(pos++, Fixnum.Make(val));
-                        }
-                        else
-                        {
-                            var bigVal = Compat.MakeBigInteger(bytes, isUnsigned: true, isBigEndian: false);
-                            vec.SetElement(pos++, Bignum.MakeInteger(bigVal));
-                        }
-                    }
+                    var elem = ReadBinaryElement(stream, byteWidth, signedElems);
+                    if (elem == null) break;
+                    vec.SetElement(pos++, elem);
                 }
             }
             else
@@ -1866,40 +2105,12 @@ public static partial class Runtime
             {
                 // A binary stream reads bytes/integers into the list, same as the
                 // vector branch above (the list branch previously always read chars).
-                int byteWidth = GetBinaryByteWidth(stream);
+                int byteWidth = GetBinaryFormat(stream, out bool signedElems);
                 while (pos < end && cell is Cons cc)
                 {
-                    if (byteWidth == 1)
-                    {
-                        int b = ReadStreamByte(stream);
-                        if (b == -1) break;
-                        cc.Car = Fixnum.Make(b);
-                    }
-                    else
-                    {
-                        byte[] bytes = new byte[byteWidth];
-                        int firstByte = ReadStreamByte(stream);
-                        if (firstByte == -1) break;
-                        bytes[0] = (byte)firstByte;
-                        for (int j = 1; j < byteWidth; j++)
-                        {
-                            int b = ReadStreamByte(stream);
-                            if (b == -1) break;
-                            bytes[j] = (byte)b;
-                        }
-                        if (byteWidth <= 8)
-                        {
-                            long val = 0;
-                            for (int j = byteWidth - 1; j >= 0; j--)
-                                val = (val << 8) | bytes[j];
-                            cc.Car = Fixnum.Make(val);
-                        }
-                        else
-                        {
-                            var bigVal = Compat.MakeBigInteger(bytes, isUnsigned: true, isBigEndian: false);
-                            cc.Car = Bignum.MakeInteger(bigVal);
-                        }
-                    }
+                    var elem = ReadBinaryElement(stream, byteWidth, signedElems);
+                    if (elem == null) break;
+                    cc.Car = elem;
                     cell = cc.Cdr;
                     pos++;
                 }
@@ -1986,30 +2197,9 @@ public static partial class Runtime
             if (seq is LispVector vec)
             {
                 if (end < 0) end = vec.Length;
+                if (byteWidth == 1 && TryWriteRawBytes(stream, vec, start, end)) return seq;
                 for (int i = start; i < end; i++)
-                {
-                    var elem = vec.GetElement(i);
-                    if (byteWidth == 1)
-                    {
-                        int b = elem is Fixnum fi ? (int)fi.Value & 0xFF : 0;
-                        WriteStreamByte(stream, b);
-                    }
-                    else
-                    {
-                        byte[] bytes = new byte[byteWidth];
-                        if (elem is Fixnum fi2)
-                        {
-                            long val = fi2.Value;
-                            for (int j = 0; j < byteWidth; j++) { bytes[j] = (byte)(val & 0xFF); val >>= 8; }
-                        }
-                        else if (elem is Bignum bi)
-                        {
-                            var bigBytes = bi.Value.ToByteArray(isUnsigned: true, isBigEndian: false);
-                            Array.Copy(bigBytes, bytes, Math.Min(bigBytes.Length, byteWidth));
-                        }
-                        for (int j = 0; j < byteWidth; j++) WriteStreamByte(stream, bytes[j]);
-                    }
-                }
+                    WriteBinaryElement(stream, vec.GetElement(i), byteWidth);
             }
             else if (seq is Cons)
             {
@@ -2018,21 +2208,7 @@ public static partial class Runtime
                 for (int i = 0; i < start && cell is Cons c; i++) cell = c.Cdr;
                 for (int i = start; i < end && cell is Cons cc; i++)
                 {
-                    if (byteWidth == 1)
-                    {
-                        int b = cc.Car is Fixnum fi ? (int)fi.Value & 0xFF : 0;
-                        WriteStreamByte(stream, b);
-                    }
-                    else
-                    {
-                        byte[] bytes = new byte[byteWidth];
-                        if (cc.Car is Fixnum fi2)
-                        {
-                            long val = fi2.Value;
-                            for (int j = 0; j < byteWidth; j++) { bytes[j] = (byte)(val & 0xFF); val >>= 8; }
-                        }
-                        for (int j = 0; j < byteWidth; j++) WriteStreamByte(stream, bytes[j]);
-                    }
+                    WriteBinaryElement(stream, cc.Car, byteWidth);
                     cell = cc.Cdr;
                 }
             }
@@ -2129,6 +2305,7 @@ public static partial class Runtime
             // string ones (test/regression/read-preserving-whitespace.lisp pins
             // all three). The note that used to sit here called it best-effort
             // and string-stream-only, which is no longer what it does.
+            lispReader.ReturnLookaheadToStream(stream);
             return result;
         }
         // As in READ: eof-error-p covers only an end of file before any form
@@ -2201,6 +2378,8 @@ public static partial class Runtime
     }
 
     /// <summary>Resolve a stream designator to its underlying LispStream, following synonym/two-way/echo chains.</summary>
+    internal static LispStream ResolveLispStreamForReader(LispObject streamObj) => ResolveLispStream(streamObj);
+
     private static LispStream ResolveLispStream(LispObject streamObj)
     {
         while (true)
@@ -2495,12 +2674,19 @@ public static partial class Runtime
                 // started, which is how code that peeks by read-then-unread --
                 // Eclector's whitespace skipping, for one -- reports where a form
                 // began.
-                return Fixnum.Make(sis.Position - (sis.UnreadCharValue != -1 ? 1 : 0));
+                var at = sis.Position - (sis.UnreadCharValue != -1 ? 1 : 0);
+                return Fixnum.Make(sis.ReportsFileBytes ? sis.FileByteOf(at) : at);
             }
             // Setf position: reposition the underlying StringReader
             if (args[1] is Fixnum pos)
             {
-                if (sis.SeekToPosition((int)pos.Value))
+                long target = pos.Value;
+                if (sis.ReportsFileBytes)
+                {
+                    target = sis.CharAtFileByte(pos.Value);
+                    if (target < 0) return Nil.Instance;
+                }
+                if (sis.SeekToPosition((int)target))
                 {
                     // The pushed-back character belonged to the old position.
                     sis.UnreadCharValue = -1;
@@ -2556,6 +2742,13 @@ public static partial class Runtime
                 int byteWidth = GetBinaryByteWidth(fs);
                 if (fs.InputReader is ByteTrackingReader sr && IsCharacterFileStream(fs))
                 {
+                    // On an :IO stream the last operation may have been a write,
+                    // which the reader has not seen.
+                    if (sr.SharesStreamWithWriter)
+                    {
+                        (fs.OutputWriter as StreamWriter)?.Flush();
+                        sr.SyncWithWriter();
+                    }
                     // The reader's own count, not BaseStream.Position: the latter is
                     // where the byte buffer was filled to, which is past every
                     // character not yet handed out. That is the whole bug -- one
@@ -2704,6 +2897,12 @@ public static partial class Runtime
             throw new LispErrorException(new LispTypeError("WRITE-CHAR: not a character", ch));
 
         var writer = ResolveOutputStreamDesignator(stream);
+        if (PprintUnrelatedWriter(writer))
+        {
+            writer.Write(lc.Value);
+            UpdateAtLineStart(stream, lc.Value);
+            return ch;
+        }
         PprintFlushPendingBreak(writer);
         writer.Write(lc.Value);
         PprintTrackWriteChar(lc.Value);
@@ -2750,6 +2949,11 @@ public static partial class Runtime
             writer.Write(s);
             writer.Write('\n');
             UpdateAtLineStart(stream, '\n');
+        }
+        else if (PprintUnrelatedWriter(writer))
+        {
+            writer.Write(s);
+            if (s.Length > 0) UpdateAtLineStart(stream, s[s.Length - 1]);
         }
         else
         {
@@ -2819,13 +3023,14 @@ public static partial class Runtime
         }
 
         var writer = ResolveOutputStreamDesignator(stream);
-        PprintFlushPendingBreak(writer);
+        bool unrelated = PprintUnrelatedWriter(writer);
+        if (!unrelated) PprintFlushPendingBreak(writer);
         // The whole-string case is the common one (no :start/:end), and copying
         // it out only to hand it straight to the writer costs one string per
         // WRITE-STRING call.
         var substr = (start == 0 && end == s.Length) ? s : s.Substring(start, end - start);
         writer.Write(substr);
-        PprintTrackWrite(substr);
+        if (!unrelated) PprintTrackWrite(substr);
         if (substr.Length > 0) UpdateAtLineStart(stream, substr[substr.Length - 1]);
         return str;
     }
@@ -2933,6 +3138,32 @@ public static partial class Runtime
     }
 
     /// <summary>
+    /// The directories a :WILD-INFERIORS ("**") segment matches under DIR: DIR
+    /// itself (zero levels) and every directory below it. Matching only one
+    /// level, as a plain "*" segment does, made "build/**/*.html" miss
+    /// build/index.html.
+    /// </summary>
+    private static IEnumerable<string> WildInferiorsOf(string dir)
+    {
+        yield return dir;
+        string[] below;
+        try { below = System.IO.Directory.GetDirectories(dir, "*", SearchOption.AllDirectories); }
+        catch { yield break; }
+        foreach (var d in below) yield return d;
+    }
+
+    /// <summary>Drop repeated paths (two "**" segments reach the same
+    /// directory by more than one route), keeping the first occurrence.</summary>
+    private static List<string> DistinctInOrder(List<string> paths)
+    {
+        var seen = new HashSet<string>();
+        var result = new List<string>(paths.Count);
+        foreach (var p in paths)
+            if (seen.Add(p)) result.Add(p);
+        return result;
+    }
+
+    /// <summary>
     /// Expand a directory path containing wildcards and find matching files.
     /// E.g. "/foo/*/bar" with pattern "*.txt" matches "/foo/x/bar/*.txt".
     /// </summary>
@@ -2976,12 +3207,15 @@ public static partial class Runtime
                 if (!System.IO.Directory.Exists(cand)) continue;
                 try
                 {
-                    foreach (var sub in System.IO.Directory.GetDirectories(cand, seg))
-                        nextCandidates.Add(sub);
+                    if (seg == "**")
+                        nextCandidates.AddRange(WildInferiorsOf(cand));
+                    else
+                        foreach (var sub in System.IO.Directory.GetDirectories(cand, seg))
+                            nextCandidates.Add(sub);
                 }
                 catch { }
             }
-            candidates = nextCandidates;
+            candidates = DistinctInOrder(nextCandidates);
         }
 
         // Now find files matching filePattern in each resolved directory
@@ -3035,12 +3269,15 @@ public static partial class Runtime
                 if (!System.IO.Directory.Exists(cand)) continue;
                 try
                 {
-                    foreach (var sub in System.IO.Directory.GetDirectories(cand, seg))
-                        nextCandidates.Add(sub);
+                    if (seg == "**")
+                        nextCandidates.AddRange(WildInferiorsOf(cand));
+                    else
+                        foreach (var sub in System.IO.Directory.GetDirectories(cand, seg))
+                            nextCandidates.Add(sub);
                 }
                 catch { }
             }
-            candidates = nextCandidates;
+            candidates = DistinctInOrder(nextCandidates);
         }
         return candidates.ToArray();
     }
@@ -3075,8 +3312,10 @@ public static partial class Runtime
                 filePath = Path.Combine(defaults, filePath);
         }
 
+        // Both answers are the TRUENAME (CLHS 20.1.3): links along the path are
+        // resolved, as TRUENAME does.
         if (File.Exists(filePath))
-            return LispPathname.FromString(Path.GetFullPath(filePath));
+            return LispPathname.FromString(Path.GetFullPath(Compat.ResolveSymlinks(filePath)));
         if (Directory.Exists(filePath))
         {
             // CLHS 21.4: probe-file answers the TRUENAME. A directory's truename
@@ -3087,7 +3326,7 @@ public static partial class Runtime
             // and looking at the shape of the answer read a directory as a file:
             // uiop:directory-exists-p said no for "/path/to/dir" written without
             // the slash, and uiop:file-exists-p said yes.
-            var full = Path.GetFullPath(filePath);
+            var full = Path.GetFullPath(Compat.ResolveSymlinks(filePath));
             if (!full.EndsWith('/')) full += "/";
             return LispPathname.FromString(full);
         }
@@ -3131,7 +3370,10 @@ public static partial class Runtime
 
         if (File.Exists(filePath) || Directory.Exists(filePath))
         {
-            var fullPath = Path.GetFullPath(filePath);
+            // The truename names the file itself: a symbolic link anywhere along
+            // the path (macOS /tmp -> /private/tmp) is replaced by its target,
+            // as SBCL, CCL and realpath(3) do.
+            var fullPath = Path.GetFullPath(Compat.ResolveSymlinks(filePath));
             // For directories, ensure trailing / so last component is in directory, not name
             if (Directory.Exists(fullPath) && !fullPath.EndsWith('/'))
                 fullPath += "/";
@@ -3283,6 +3525,51 @@ public static partial class Runtime
         return MultipleValues.Values2(resultPn, Nil.Instance);
     }
 
+    /// <summary>(dotcl:delete-directory pathspec &amp;key recursive): delete the
+    /// directory PATHSPEC names, which may be written in file form ("a/b") or
+    /// directory form ("a/b/"). Without RECURSIVE the directory has to be empty.
+    /// FILE-ERROR when there is no directory there (nothing, or a file), when it is
+    /// not empty, or when it cannot be deleted. Returns the directory's pathname in
+    /// directory form. The same contract as SBCL's SB-EXT:DELETE-DIRECTORY.</summary>
+    public static LispObject DeleteDirectoryFn(LispObject[] args)
+    {
+        if (args.Length < 1 || (args.Length - 1) % 2 != 0)
+            throw new LispErrorException(new LispProgramError(
+                "DELETE-DIRECTORY: expected a pathname designator and keyword arguments"));
+        bool recursive = false;
+        for (int i = 1; i + 1 < args.Length; i += 2)
+        {
+            if (args[i] is Symbol k && k.Name == "RECURSIVE") recursive = args[i + 1] is not Nil;
+            else throw new LispErrorException(new LispProgramError(
+                $"DELETE-DIRECTORY: unknown keyword argument {args[i]}"));
+        }
+        var path = args[0];
+        string dirPath = ResolvePhysicalPath(path);
+        if (!Path.IsPathRooted(dirPath))
+        {
+            var defaults = GetDefaultPathnameDefaults();
+            if (!string.IsNullOrEmpty(defaults))
+                dirPath = Path.Combine(defaults, dirPath);
+        }
+        if (dirPath.Length > 1)
+            dirPath = dirPath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+
+        LispErrorException Fail(string why)
+        {
+            var err = new LispError($"DELETE-DIRECTORY: could not delete directory {dirPath}: {why}");
+            err.ConditionTypeName = "FILE-ERROR";
+            err.FileErrorPathnameRef = path is LispPathname ? path : (LispObject)LispPathname.FromString(dirPath);
+            return new LispErrorException(err);
+        }
+
+        if (!Directory.Exists(dirPath))
+            throw Fail(File.Exists(dirPath) ? "not a directory" : "no such directory");
+        try { Directory.Delete(dirPath, recursive); }
+        catch (IOException e) { throw Fail(e.Message); }
+        catch (UnauthorizedAccessException e) { throw Fail(e.Message); }
+        return LispPathname.FromString(dirPath + Path.DirectorySeparatorChar);
+    }
+
     public static LispObject DeleteFile(LispObject path)
     {
         string filePath = ResolvePhysicalPath(path);
@@ -3301,11 +3588,16 @@ public static partial class Runtime
             return T.Instance;
         }
         // A directory pathname (no name/type) designates a directory. CLHS leaves
-        // delete-file on a directory implementation-defined; like SBCL, delete the
-        // directory (non-recursive: Directory.Delete throws if it is non-empty,
-        // which surfaces as the file-error below). Lets the ANSI suite delete a
-        // scratch subdirectory via delete-file (ENSURE-DIRECTORIES-EXIST.8).
-        if (Directory.Exists(filePath))
+        // delete-file on a directory implementation-defined; delete it here
+        // (non-recursive: Directory.Delete throws if it is non-empty, which
+        // surfaces as the file-error below). Lets the ANSI suite delete a scratch
+        // subdirectory via delete-file (ENSURE-DIRECTORIES-EXIST.8). Only the
+        // directory form does: a file-form pathname ("x.tmp") that happens to
+        // name a directory is not a file, so it signals, as SBCL does. tmpdir
+        // makes its directory where UIOP's temporary file was, and UIOP then
+        // deletes "the file" by its file-form name.
+        bool directoryForm = filePath.EndsWith("/") || filePath.EndsWith("\\");
+        if (directoryForm && Directory.Exists(filePath))
         {
             try
             {
@@ -3642,6 +3934,12 @@ public static partial class Runtime
             // When element-type is NIL, return a LispVector with element-type NIL
             if (sso.ElementTypeName == "NIL")
                 return new LispVector(str.Length, Nil.Instance, "NIL");
+            if (sso.ElementTypeName is "BASE-CHAR" or "STANDARD-CHAR")
+            {
+                var items = new LispObject[str.Length];
+                for (int i = 0; i < str.Length; i++) items[i] = LispChar.Make(str[i]);
+                return new LispVector(items, sso.ElementTypeName);
+            }
             return new LispString(str);
         }
         throw new LispErrorException(new LispTypeError("GET-OUTPUT-STREAM-STRING: not a string output stream", stream));
@@ -3747,10 +4045,36 @@ public static partial class Runtime
             // tables gives that for every call, recursive or not: a #n# inside the
             // delimited list resolves against a label defined outside it, which a
             // fresh Reader could not see.
-            System.IO.TextReader reader = Runtime.GetTextReader(streamObj);
-            var lispReader = new Reader(reader) { LispStreamRef = streamObj };
-            if (streamObj is LispStream shareStream)
-                lispReader.AdoptStreamShareTables(shareStream);
+            //
+            // The stream's live reader is used when it has one, as READ does. A
+            // reader macro that calls READ-DELIMITED-LIST runs inside a read on
+            // that reader, and the macro functions a copied readtable holds (what
+            // GET-MACRO-CHARACTER returns for a built-in one, as named-readtables
+            // copies them) read through it too. A separate Reader here read the
+            // elements on one object and the nested macros on the other: the
+            // look-ahead each kept was invisible to the other, so the closing
+            // delimiter could be taken by the wrong one and what followed it was
+            // read outside the enclosing #+ / #-, *READ-SUPPRESS* lost.
+            Reader lispReader;
+            if (streamObj is LispStream cachedStream && cachedStream.CachedReader != null)
+            {
+                lispReader = cachedStream.CachedReader;
+            }
+            else
+            {
+                System.IO.TextReader reader = Runtime.GetReaderTextReader(streamObj);
+                lispReader = new Reader(reader) { LispStreamRef = streamObj };
+                if (streamObj is LispStream shareStream)
+                {
+                    shareStream.CachedReader = lispReader;
+                    lispReader.AdoptStreamShareTables(shareStream);
+                }
+            }
+            if (streamObj is LispStream unreadStream && unreadStream.UnreadCharValue != -1)
+            {
+                lispReader.UnreadChar(unreadStream.UnreadCharValue);
+                unreadStream.UnreadCharValue = -1;
+            }
             var items = new System.Collections.Generic.List<LispObject>();
             // The elements are read recursively, so a #n= in one of them is still
             // in scope for a #n# in the next. Without this each element is a fresh
@@ -3977,6 +4301,14 @@ public static partial class Runtime
                     {
                         var val = args[i + 1];
                         if (val is Nil) elemType = "NIL";
+                        // BASE-CHAR and STANDARD-CHAR strings are arrays of their own
+                        // (MAKE-ARRAY keeps them); ARRAY-ELEMENT-TYPE of the string
+                        // handed back must agree with UPGRADED-ARRAY-ELEMENT-TYPE.
+                        else
+                        {
+                            var et = Runtime.ParseElementTypeName(val);
+                            if (et is "BASE-CHAR" or "STANDARD-CHAR") elemType = et;
+                        }
                     }
                 }
                 var stream = Runtime.MakeStringOutputStream();

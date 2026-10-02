@@ -62,26 +62,99 @@ public static class ReplColor
     public static volatile bool Err;
 
     /// <summary>
+    /// The SGR parameters each role is painted with unless DOTCL_COLORS or
+    /// <see cref="SetColors"/> says otherwise. Only the 16 basic colours and
+    /// attributes, so every terminal theme maps them to something it chose.
+    /// </summary>
+    static readonly Dictionary<string, string> Defaults = new()
+    {
+        ["PROMPT"] = "1;32",    // bold green: the package name
+        ["DEBUGGER"] = "1;31",  // bold red: the debugger depth
+        ["SHELL"] = "1;35",     // bold magenta: the shell mode prompt
+        ["COMMAND"] = "1;36",   // bold cyan: the comma command prompt
+        ["RESULT"] = "36",      // cyan: what a form returned
+        ["WARNING"] = "33",     // yellow
+        ["ERROR"] = "31",       // red
+        ["SELECTED"] = "7",     // reverse video: the marked row of a menu
+        ["LOCATION"] = "1",     // bold: a file:line the debugger points at
+        ["MATCH"] = "7",        // reverse video: the bracket the one before the cursor closes
+        ["STRING"] = "32",      // green: a string literal in the input line
+        // Faint: the terminal's own foreground, dimmed. Not bright black (90),
+        // which some themes (Solarized Dark) make the background colour, so
+        // the comment disappears.
+        ["COMMENT"] = "2",
+        ["KEYWORD"] = "35",     // magenta: a keyword in the input line
+    };
+
+    static readonly object OverridesLock = new();
+    // Role to SGR parameters, "" for a role asked to have no colour. Starts as
+    // what DOTCL_COLORS says.
+    static Dictionary<string, string>? _overrides;
+
+    static Dictionary<string, string> Overrides
+    {
+        get
+        {
+            lock (OverridesLock)
+                return _overrides ??= ParseColors(
+                    System.Environment.GetEnvironmentVariable("DOTCL_COLORS"));
+        }
+    }
+
+    /// <summary>
+    /// Read a colour specification in the form of GCC_COLORS:
+    /// <c>role=params:role=params...</c>, where PARAMS is what goes between
+    /// ESC [ and m (<c>1;32</c>). An empty PARAMS means no colour for that role.
+    /// A role that is not one of the roles, or PARAMS with anything but digits
+    /// and semicolons in it, is skipped without a word: a mistake in an
+    /// environment variable must not stop the REPL from starting. Role names
+    /// are compared without case; the result has them in upper case.
+    /// </summary>
+    public static Dictionary<string, string> ParseColors(string? spec)
+    {
+        var result = new Dictionary<string, string>();
+        if (spec == null || spec.Length == 0) return result;
+        foreach (var entry in spec.Split(':'))
+        {
+            int eq = entry.IndexOf('=');
+            if (eq <= 0) continue;
+            var role = entry.Substring(0, eq).Trim().ToUpperInvariant();
+            var value = entry.Substring(eq + 1).Trim();
+            if (!Defaults.ContainsKey(role)) continue;
+            bool ok = true;
+            foreach (var ch in value)
+                if (!(ch == ';' || (ch >= '0' && ch <= '9'))) { ok = false; break; }
+            if (!ok) continue;
+            result[role] = value;
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// Apply SPEC (the DOTCL_COLORS form) on top of the colours in effect:
+    /// the roles it names change, the others stay. For an init file.
+    /// </summary>
+    public static void SetColors(string? spec)
+    {
+        var parsed = ParseColors(spec);
+        lock (OverridesLock)
+        {
+            var next = new Dictionary<string, string>(Overrides);
+            foreach (var kv in parsed) next[kv.Key] = kv.Value;
+            _overrides = next;
+        }
+    }
+
+    /// <summary>
     /// The escape sequence that starts ROLE, or null for a role that has no
     /// colour. The roles are the kinds of text the REPL tells apart.
     /// </summary>
-    public static string? Sgr(string role) => role switch
+    public static string? Sgr(string role)
     {
-        "PROMPT" => "\u001b[1;32m",     // bold green: the package name
-        "DEBUGGER" => "\u001b[1;31m",   // bold red: the debugger depth
-        "SHELL" => "\u001b[1;35m",      // bold magenta: the shell mode prompt
-        "COMMAND" => "\u001b[1;36m",    // bold cyan: the comma command prompt
-        "RESULT" => "\u001b[36m",       // cyan: what a form returned
-        "WARNING" => "\u001b[33m",      // yellow
-        "ERROR" => "\u001b[31m",        // red
-        "SELECTED" => "\u001b[7m",      // reverse video: the marked row of a menu
-        "LOCATION" => "\u001b[1m",      // bold: a file:line the debugger points at
-        "MATCH" => "\u001b[7m",         // reverse video: the bracket the one before the cursor closes
-        "STRING" => "\u001b[32m",       // green: a string literal in the input line
-        "COMMENT" => "\u001b[90m",      // bright black (grey): a comment in the input line
-        "KEYWORD" => "\u001b[35m",      // magenta: a keyword in the input line
-        _ => null,
-    };
+        if (!Overrides.TryGetValue(role, out var sgr) && !Defaults.TryGetValue(role, out sgr))
+            return null;
+        return sgr.Length == 0 ? null : "\u001b[" + sgr + "m";
+    }
 
     /// <summary>
     /// Parse the value of <c>--color=</c>, or null when it is none of the three.

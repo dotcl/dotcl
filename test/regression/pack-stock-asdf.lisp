@@ -29,8 +29,7 @@
       (error "cannot locate this process's executable")))
 
 (defvar *psa-core*
-  (or (ignore-errors (namestring (truename "compiler/cil-out.sil")))
-      "compiler/cil-out.sil"))
+  (regression-child-core))
 
 (defun psa-path (name)
   (namestring (merge-pathnames name (truename *psa-dir*))))

@@ -284,6 +284,12 @@
     <PackageReference Include="System.Threading.Tasks.Extensions" Version="4.5.4" />
   </ItemGroup>
 
+  <!-- CodePagesEncodingProvider (Shift_JIS, GBK, KOI8-R, ... for :external-format)
+       is in-box on net5.0+ but a NuGet package on ns2.0. Pure IL. -->
+  <ItemGroup Condition="'$(TargetFramework)' == 'netstandard2.0'">
+    <PackageReference Include="System.Text.Encoding.CodePages" Version="8.0.0" />
+  </ItemGroup>
+
   <!-- Auto-generate UnicodeCharNames.g.cs if missing.
        Runs only when the output file does not exist (Condition on the target).
        Downloads UnicodeData.txt on first use, then generates the C# source. -->

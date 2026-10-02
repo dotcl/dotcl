@@ -379,6 +379,9 @@ public static partial class Runtime
             return new LispString(new string(str.Value.ToCharArray()));
         if (seq is LispVector v)
         {
+            if (v._displacedTo == null && v._dimensions == null
+                && CopyVectorStorage(v) is LispVector fast)
+                return fast;
             // Copy elements, preserve ElementTypeName (important for char/bit vectors)
             var items = new LispObject[v.Length];
             for (int i = 0; i < v.Length; i++) items[i] = v[i];
@@ -388,6 +391,37 @@ public static partial class Runtime
         if (seq is Cons)
             return CopyList(seq);
         throw new LispErrorException(new LispTypeError("COPY-SEQ: not a sequence", seq));
+    }
+
+    /// <summary>COPY-SEQ of a one-dimensional vector that owns its storage, as a
+    /// copy of that storage. The element-by-element path unpacked a bit or
+    /// numeric vector into a fresh object array (8 bytes an element, a boxed
+    /// value each) only for the new vector to pack it again. Null when the
+    /// storage is of a shape this does not cover.</summary>
+    private static LispVector? CopyVectorStorage(LispVector v)
+    {
+        int n = v.Length;
+        if (v._bitData != null)
+        {
+            var r = new LispVector(n, Nil.Instance, "BIT");
+            int words = (n + 63) >> 6;
+            Array.Copy(v._bitData, r._bitData!, words);
+            // Bits past the fill pointer are not part of the copy.
+            int tail = n & 63;
+            if (tail != 0) r._bitData![words - 1] &= (1UL << tail) - 1;
+            return r;
+        }
+        if (v._numData != null)
+        {
+            var r = new LispVector(n, Nil.Instance, v.ElementTypeName);
+            if (r._numData == null || r._numKind != v._numKind) return null;
+            Array.Copy(v._numData, r._numData, n);
+            return r;
+        }
+        if (v.IsBitVector || v.ElementTypeName != "T") return null;
+        var items = new LispObject[n];
+        Array.Copy(v._elements, items, n);
+        return new LispVector(items, "T");
     }
 
     private static void CollectSequenceElements(LispObject seq, List<LispObject> items)
@@ -434,6 +468,34 @@ public static partial class Runtime
             else if (seq is LispString s) { foreach (char ch in s.Value) items[k++] = LispChar.Make(ch); }
             else if (seq is LispVector v) { for (int i = 0; i < v.Length; i++) items[k++] = v.ElementAt(i); }
         }
+    }
+
+    /// <summary>The length a sequence result type with an array head requires, or
+    /// -1 when it leaves the length open. (VECTOR et N) and (SIMPLE-VECTOR N) give
+    /// a length; for ARRAY and SIMPLE-ARRAY the third element is a dimension spec,
+    /// where an integer is a RANK (CLHS 15.1.2.1 / the ARRAY type specifier), so
+    /// (simple-array (unsigned-byte 4) 1) is any rank-1 array, and (N) is a
+    /// length. An array type of any other rank is not a sequence type.</summary>
+    internal static int RequiredSequenceLength(Cons type, string who)
+    {
+        string head = type.Car is Symbol hs ? hs.Name : "";
+        var afterHead = type.Cdr as Cons;
+        LispObject? spec = head == "SIMPLE-VECTOR" ? afterHead?.Car : (afterHead?.Cdr as Cons)?.Car;
+        if (spec == null || spec is Symbol { Name: "*" } && spec is not Nil) return -1;
+        if (head is "ARRAY" or "SIMPLE-ARRAY")
+        {
+            bool rankOne = spec switch
+            {
+                Fixnum rank => rank.Value == 1,
+                Cons dims => dims.Cdr is Nil,
+                _ => false,   // NIL: rank 0
+            };
+            if (!rankOne)
+                throw new LispErrorException(new LispTypeError(
+                    $"{who}: {type} is not a sequence type (its rank is not 1)", type, Startup.Sym("SEQUENCE")));
+            return spec is Cons d1 && d1.Car is Fixnum n ? (int)n.Value : -1;
+        }
+        return spec is Fixnum len ? (int)len.Value : -1;
     }
 
     public static LispObject Concatenate(LispObject resultType, params LispObject[] sequences)
@@ -551,15 +613,9 @@ public static partial class Runtime
                 var etSpec = (rtc0.Cdr as Cons)?.Car;  // element-type arg
                 if (etSpec != null && !(etSpec is T) && !(etSpec is Symbol wtSym && wtSym.Name == "*"))
                     elemTypeName = ParseElementTypeName(etSpec);
-                // Check compound size constraint: (vector * N) where N is the required length
-                var dimsSpec = (rtc0.Cdr as Cons)?.Cdr as Cons;
-                var sizeArg = dimsSpec?.Car;
-                if (sizeArg is Fixnum sizeF)
-                    if (count != (int)sizeF.Value)
-                        throw new LispErrorException(new LispTypeError($"CONCATENATE: result has {count} elements, type requires {sizeF.Value}", resultType));
-                else if (sizeArg is Cons sizeList && sizeList.Car is Fixnum dimFix)
-                    if (count != (int)dimFix.Value)
-                        throw new LispErrorException(new LispTypeError($"CONCATENATE: result has {count} elements, type requires {dimFix.Value}", resultType));
+                int required = RequiredSequenceLength(rtc0, "CONCATENATE");
+                if (required >= 0 && count != required)
+                    throw new LispErrorException(new LispTypeError($"CONCATENATE: result has {count} elements, type requires {required}", resultType));
             }
             return new LispVector(items, elemTypeName);
         }
@@ -889,17 +945,10 @@ public static partial class Runtime
                 }
 
                 // Check size constraint if specified
-                if (sizeSpec is Fixnum sizeFix)
+                int expectedLen = RequiredSequenceLength(compType, "COERCE");
+                if (expectedLen >= 0)
                 {
-                    int expectedLen = (int)sizeFix.Value;
                     int actualLen = result is LispVector rv ? rv.Length : (result is LispString rs ? rs.Length : 0);
-                    if (actualLen != expectedLen)
-                        throw new LispErrorException(new LispTypeError($"COERCE: result length {actualLen} does not match required length {expectedLen}", obj));
-                }
-                else if (sizeSpec is Cons sizeList && sizeList.Car is Fixnum dimFix)
-                {
-                    int expectedLen = (int)dimFix.Value;
-                    int actualLen = result is LispVector rv2 ? rv2.Length : (result is LispString rs2 ? rs2.Length : 0);
                     if (actualLen != expectedLen)
                         throw new LispErrorException(new LispTypeError($"COERCE: result length {actualLen} does not match required length {expectedLen}", obj));
                 }
@@ -1790,8 +1839,17 @@ public static partial class Runtime
         if (kw.IsEqlTest)
         {
             var cur = list;
-            for (; cur is Cons c; cur = c.Cdr)
-                if (IsTrueEql(item, c.Car)) return c;
+            if (EqlIsIdentity(item = Primary(item)))
+            {
+                for (; cur is Cons c; cur = c.Cdr)
+                    if (ReferenceEquals(item, c.Car) || c.Car is MvReturn && ReferenceEquals(item, Primary(c.Car)))
+                        return c;
+            }
+            else
+            {
+                for (; cur is Cons c; cur = c.Cdr)
+                    if (IsTrueEql(item, c.Car)) return c;
+            }
             if (cur is not Nil) throw new LispErrorException(new LispTypeError("MEMBER: not a proper list", cur, Startup.Sym("LIST")));
             return Nil.Instance;
         }
@@ -3832,8 +3890,9 @@ public static partial class Runtime
         Emitter.CilAssembler.RegisterFunction("DELETE-DUPLICATES", deleteDupFn);
         Emitter.CilAssembler.RegisterFunction("REPLACE",
             new LispFunction(args => { Runtime.CheckArityMin("REPLACE", args, 2); return Runtime.Replace(args); }));
-        // MAKE-STRING
-        Emitter.CilAssembler.RegisterFunction("MAKE-STRING",
+        // MAKE-STRING. (make-string n) gets a one-argument entry, so the common
+        // call does not build an argument array.
+        var makeStringFn =
             new LispFunction(args =>
             {
                 // (make-string size &key initial-element element-type)
@@ -3867,7 +3926,9 @@ public static partial class Runtime
                 if (hasUnknown && allowOtherKeys != true)
                     throw new LispErrorException(new LispProgramError("MAKE-STRING: unknown keyword argument"));
                 return Runtime.MakeString(size, initChar);
-            }));
+            });
+        makeStringFn.SetDirectDelegate((Func<LispObject, LispObject>)(size => Runtime.MakeString(size, Nil.Instance)));
+        Emitter.CilAssembler.RegisterFunction("MAKE-STRING", makeStringFn);
 
         // String comparison functions. Each gets a 2-arg direct delegate
         // (the dominant no-keyword call shape; bypasses the args-array

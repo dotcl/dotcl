@@ -7,8 +7,8 @@
 ;;; ran: "Stream was not writable" / "Stream was not readable". The direction is
 ;;; now read off the stream, so each of those becomes the matching CL stream.
 ;;;
-;;; The wrapper leaves the underlying .NET stream open (a socket must outlive the
-;;; wrapper), so these tests dispose it themselves.
+;;; Closing the wrapper closes the .NET stream too; the tests still dispose it
+;;; themselves, which is harmless, so a failure before CLOSE does not leak it.
 
 (defvar *dtso-dir*
   (regression-temp-dir))

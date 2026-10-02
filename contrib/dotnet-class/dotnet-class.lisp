@@ -61,6 +61,7 @@
 
 (export 'dotnet::define-class (find-package :dotnet))
 (export 'dotnet::library (find-package :dotnet))
+(export 'dotnet::register-class-handlers (find-package :dotnet))
 (export 'dotnet::*type-aliases* (find-package :dotnet))
 
 (defvar dotnet::*type-aliases*
@@ -299,6 +300,21 @@
 
 (defmacro dotnet:define-class (full-name supers &body options)
   `(dotnet:%define-class ,@(dotnet::%class-spec-args full-name supers options)))
+
+;;; dotnet:register-class-handlers: the same syntax as define-class, but no type
+;;; is defined. The method and ctor bodies are installed under the keys the
+;;; type's IL dispatches with, which is what a facade saved by dotnet:library
+;;; (emitted in another process, loaded here) needs to reach its Lisp bodies.
+;;; Nothing is emitted, so this also works on the emit-free runtime, where
+;;; define-class cannot run.
+;;;
+;;;   (dotnet:register-class-handlers "MyPack.Calculator" ()
+;;;     (:methods ("Add" ((a Int32) (b Int32)) :returns Int32 (+ a b))))
+;;;
+;;; For a (:module ...) of a library, write its :functions option the same way.
+(defmacro dotnet:register-class-handlers (full-name supers &body options)
+  `(dotnet:%register-class-handlers
+    ,@(dotnet::%class-spec-args full-name supers options)))
 
 ;;; dotnet:library: aggregate several types into ONE C#-referenceable .dll.
 ;;;

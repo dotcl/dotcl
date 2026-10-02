@@ -186,6 +186,19 @@ public sealed class SingleFloat : Number
         DotCL.Diagnostics.AllocCounter.Inc("SingleFloat");
     }
 
+    /// <summary>
+    /// Boxes a raw float for compiled code that reads a native float local as a
+    /// Lisp object. Kept out of line on purpose. With an inline newobj the raw
+    /// value stays live across the allocation helper call, and the System V
+    /// x64 ABI has no callee-saved XMM registers, so the JIT keeps the local in
+    /// a stack slot for its whole lifetime: a float accumulator in a loop then
+    /// pays a store and a reload on every iteration, on its loop-carried
+    /// dependency chain. Passing the value as an argument ends its lifetime at
+    /// the call, and the loop keeps it in a register.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    public static SingleFloat Box(float value) => new SingleFloat(value);
+
     public override string ToString()
     {
         if (float.IsPositiveInfinity(Value)) return Runtime.NonFiniteFloatFormSafe("SINGLE-FLOAT-POSITIVE-INFINITY");
@@ -214,6 +227,19 @@ public sealed class DoubleFloat : Number
         Value = value;
         DotCL.Diagnostics.AllocCounter.Inc("DoubleFloat");
     }
+
+    /// <summary>
+    /// Boxes a raw double for compiled code that reads a native double local as a
+    /// Lisp object. Kept out of line on purpose. With an inline newobj the raw
+    /// value stays live across the allocation helper call, and the System V
+    /// x64 ABI has no callee-saved XMM registers, so the JIT keeps the local in
+    /// a stack slot for its whole lifetime: a float accumulator in a loop then
+    /// pays a store and a reload on every iteration, on its loop-carried
+    /// dependency chain. Passing the value as an argument ends its lifetime at
+    /// the call, and the loop keeps it in a register.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    public static DoubleFloat Box(double value) => new DoubleFloat(value);
 
     public override string ToString()
     {

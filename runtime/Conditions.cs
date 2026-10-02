@@ -67,7 +67,6 @@ public class LispCondition : LispObject
 public class LispError : LispCondition
 {
     public LispError(string message) : base(message) { ConditionTypeName = "ERROR"; }
-    public override string ToString() => $"#<ERROR: {Message}>";
 }
 
 public class LispTypeError : LispError
@@ -353,6 +352,10 @@ public static class HandlerClusterStack
     /// <summary>Current cluster-stack depth.</summary>
     public static int Depth => _clusters?.Count ?? 0;
 
+    /// <summary>The innermost cluster, or null.</summary>
+    internal static HandlerBinding[]? Top
+        => _clusters is { Count: > 0 } c ? c[c.Count - 1] : null;
+
     /// <summary>Shallow copy of the live cluster stack (bottom->top), or null if
     /// empty. Used to carry handler-bind clusters across an async await boundary,
     /// where the continuation runs on a different (ThreadStatic) thread.</summary>
@@ -513,6 +516,25 @@ public static class RestartClusterStack
         }
     }
 
+    /// <summary>How many condition-restart associations this thread holds. A
+    /// RESTART-CASE whose body signals takes this on entry and hands it back to
+    /// <see cref="TruncateAssociations"/> on every way out, so the associations
+    /// its handler made at signal time go when its restarts do. They used to stay
+    /// for the life of the thread, holding every condition signalled that way
+    /// and making each restart lookup scan all of them.</summary>
+    public static int AssociationMark() => _conditionRestarts?.Count ?? 0;
+
+    /// <summary>Drop the associations made since <see cref="AssociationMark"/>
+    /// returned MARK. Associations are made and dropped in dynamic-extent order
+    /// within a thread, so the ones above the mark are this extent's.</summary>
+    public static void TruncateAssociations(int mark)
+    {
+        var l = _conditionRestarts;
+        if (l == null || l.Count <= mark) return;
+        if (mark < 0) mark = 0;
+        l.RemoveRange(mark, l.Count - mark);
+    }
+
     private static bool IsAssociatedWith(LispRestart restart, LispObject condition)
     {
         if (_conditionRestarts == null) return false;
@@ -526,6 +548,16 @@ public static class RestartClusterStack
         if (_conditionRestarts == null) return false;
         return _conditionRestarts.Exists(pair =>
             ReferenceEquals(pair.Restart, restart));
+    }
+
+    /// <summary>Whether a restart invoked with TAG is still established.</summary>
+    internal static bool HasTag(object tag)
+    {
+        if (_clusters == null) return false;
+        foreach (var cluster in _clusters)
+            foreach (var r in cluster)
+                if (ReferenceEquals(r.Tag, tag)) return true;
+        return false;
     }
 
     public static LispRestart? FindRestartByName(string name, LispObject? condition = null)
@@ -742,9 +774,17 @@ public static class ConditionSystem
     }
 
     /// <summary>Diagnostic counter for PollInterrupt: how many loop back-edge
-    /// safepoints have executed. Read from Lisp via dotnet:static; regression
-    /// tests use the delta to prove a loop is (or is not) emitting polls.</summary>
+    /// safepoints have executed while <see cref="CountPolls"/> is set. Read from
+    /// Lisp via dotnet:static; regression tests use the delta to prove a loop is
+    /// (or is not) emitting polls.</summary>
     public static long PollCount;
+
+    /// <summary>When set, PollInterrupt counts in <see cref="PollCount"/>. Off
+    /// normally: the counter is one location shared by every thread, and a loop
+    /// writing it on each iteration made threads running loops at the same time
+    /// fight over its cache line (four threads ran three times slower than one).
+    /// Off, the poll only reads.</summary>
+    public static bool CountPolls;
 
     /// <summary>
     /// Loop back-edge safepoint. The compiler emits a call to this on the
@@ -764,7 +804,7 @@ public static class ConditionSystem
         System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
     public static void PollInterrupt()
     {
-        PollCount++;
+        if (CountPolls) PollCount++;
         // Tier 2: INTERRUPT-THREAD functions queued for this thread run here.
         // The counter gate keeps the common case to one volatile static read.
         if (System.Threading.Volatile.Read(ref Runtime.SafepointInterruptsPending) != 0

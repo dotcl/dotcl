@@ -3,34 +3,36 @@ name: CI
 on:
   push:
     branches: [master]
+    # Nothing a push run executes reads these: no step, test or build input
+    # opens docs/, bench/ (the benchmarks run in the full run only) or ci/ (lane
+    # tools), and README.md is read only by the pack path, which is in the full
+    # run as well. A commit that touches nothing else gets no push run and is
+    # checked by the next full run. When a commit touches both, it runs.
     paths-ignore:
       - 'ansi-state.json'
       - 'bench-state.json'
-      - 'docs/decisions/**'
+      - 'docs/**'
+      - 'bench/**'
+      - 'ci/**'
+      - '**.md'
   pull_request:
     branches: [master]
-  schedule:
-    # Nightly full ANSI + bench (03:00 JST = 18:00 UTC).
-    - cron: '0 18 * * *'
+  # The full run by hand, e.g. before cutting a release.
+  workflow_dispatch:
 
-# Two different policies, because the two kinds of ref want opposite things.
+# Branches and pull requests: cancel the superseded run. Only the tip needs to
+# be green.
 #
-# Branches and pull requests: cancel the superseded runs. A burst of pushes
-# should not each spawn a full ~29-min run, and verifying a commit that has
-# already been rewritten buys nothing -- only the tip needs to be green.
+# master: never cancel; queue. Every landed commit gets its own verdict, so a
+# red master can be bisected from the run list instead of by hand. The push run
+# is kept short (about 20 min, the rest is in the full run below) and landings
+# are batched, so the queue drains instead of growing.
 #
-# master: never cancel; queue instead. Every commit that lands has to be
-# verified on its own, because when master goes red the bisect is done by hand:
-# a cancelled run leaves a commit that is neither known-good nor known-bad, and
-# a stretch of those turns a one-commit search into a manual re-run of each.
-# On 2026-09-14 eleven pushes landed in six hours; three runs finished and the
-# other eight commits proved nothing. Putting the sha in the group key gives
-# every master run a group of its own, so they line up behind each other
-# instead of killing each other. One runner at ~29 min absorbs eleven pushes a
-# day, so the cost is that the answer arrives late -- not that it never comes.
+# The full run (schedule, workflow_dispatch) gets a group of its own per run,
+# so a push never cancels it and it never cancels a push.
 concurrency:
-  group: ${{ github.ref == 'refs/heads/master' && format('ci-{0}-{1}', github.ref, github.sha) || format('ci-{0}', github.ref) }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+  group: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && format('ci-full-{0}', github.run_id) || (github.ref == 'refs/heads/master' && format('ci-{0}-{1}', github.ref, github.sha) || format('ci-{0}', github.ref)) }}
+  cancel-in-progress: ${{ (github.event_name == 'push' || github.event_name == 'pull_request') && github.ref != 'refs/heads/master' }}
 
 defaults:
   run:
@@ -77,18 +79,39 @@ jobs:
     # Execution time is steady -- 36-39 min per push job across the period. The
     # spread in `gh run list` (39 to 128 min) is queue time on a single runner,
     # which this ceiling does not govern.
-    timeout-minutes: 90
-    # RUN_FULL now means one thing: the steps that cost ten minutes or more
-    # (ANSI and the benchmarks). It used to gate seven cheap gates as well, so
-    # those ran only on the public mirror and the nightly -- never on an
-    # internal push, never on a fork PR, which is where they were most needed.
-    # A gate that runs on one repository is not a gate.
     #
-    # Anything else that is nightly-only says so directly with
-    # `github.event_name == 'schedule'` (the pack path, and the nuspec check
-    # that consumes what it produces).
+    # Since 2026-09-29 the push set is about 12 min and the full run (below) is
+    # the old nightly with nothing taken out, ~65-70 min. The ceiling is set by
+    # the full run, so it stays at 90.
+    timeout-minutes: 90
+    # RUN_FULL selects the full run: the scheduled run, a run started by hand,
+    # and a push to the public mirror (which moves only at releases, so a push
+    # there IS the release gate). A push or pull request run is the push set:
+    # build, the ns2.0 tripwire, and the regression suite compiled and under the
+    # tree-walk interpreter, with its slowest child-process files left out
+    # (DOTCL_REGRESSION_TIER below). The full run is not the push run again: it
+    # adds every step guarded by RUN_FULL and loads the files the push set
+    # leaves out.
+    #
+    # What moved out of the push set on 2026-09-29, and why: the push run had
+    # reached ~44 min on one runner, against a target of about 12. Moved to the
+    # full run: the emit-free regression mode, the self-host fixpoint, the seed
+    # build, ilverify, fasl shape, and the MSBuild / C# host / core boot / CLI /
+    # PDB gates, plus the pack, build and REPL child-process regression files.
+    # The gates had not caught a real defect on a push in their whole record (0
+    # of 150 to 369 runs each; the two reds were test-side mistakes). The
+    # emit-free mode (3 real defects), self-host (1) and seed (1) had, over two
+    # months; moving them means such a defect now shows within 12 hours rather
+    # than on its own push, and is bisected over the commits of that half day.
+    # The ns2.0 tripwire (7 real defects) and the compiled and interpreted
+    # regression runs stay on every push.
     env:
-      RUN_FULL: ${{ github.repository == 'dotcl/dotcl' || github.event_name == 'schedule' }}
+      RUN_FULL: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.repository == 'dotcl/dotcl' && github.event_name == 'push') }}
+      # Read by test/regression/run.lisp. "push" leaves out the files that are
+      # slow and have never caught anything in the push run (see
+      # LOAD-FULL-TIER-ONLY in test/framework.lisp); "full" loads every file,
+      # which is also what a run by hand gets when the variable is unset.
+      DOTCL_REGRESSION_TIER: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.repository == 'dotcl/dotcl' && github.event_name == 'push')) && 'full' || 'push' }}
       # Read by the test/*/check.sh scripts. Each of them SKIPs (exit 0) when a
       # prerequisite is missing, which keeps them pleasant to run by hand on a
       # fresh clone -- and makes them useless here, because a skip and a pass
@@ -155,8 +178,10 @@ jobs:
       # a cross-compile flag that never reached the running compiler, and an
       # intrinsic table keyed on the other half of a split package, both passed
       # every other gate. ~1 min; the heavier selfhost-test (the suite on the
-      # self-hosting core) stays manual.
+      # self-hosting core) stays manual. Full run only since 2026-09-29, with
+      # the seed build below (3.7 min together, 2 real catches in two months).
       - name: Self-host fixpoint
+        if: env.RUN_FULL == 'true'
         run: make selfhost-check
 
       # The other half of the same property: can a RELEASED dotcl build this
@@ -167,11 +192,16 @@ jobs:
       # with "Undefined function: KEY", found by hand months later. ~1 min,
       # including fetching the pinned seed from nuget.
       - name: Seed build (a released dotcl builds this tree)
+        if: env.RUN_FULL == 'true'
         run: make seed-check
 
       - name: Compile asdf FASL (required by some regression tests)
         run: make compile-asdf-fasl
 
+      # DOTCL_REGRESSION_TIER (job env above) leaves the pack / build and piped
+      # REPL files out of this and the next step on a push; the full run loads
+      # them. The end of the run prints how many files it left out.
+      #
       # Gating: catches Linux-only regressions on every push. Previously only the
       # release workflow ran test-regression, so a Linux-only break (e.g. a
       # registration-order bug that left generic-function-lambda-list returning NIL
@@ -202,7 +232,12 @@ jobs:
       # table that is not synchronized. It has only ever been seen while another
       # heavy build shared the machine -- ten clean runs on a quiet one -- so a
       # red here is worth reading rather than re-running.
+      #
+      # Full run only since 2026-09-29 (10.5 min of a 44-min push run). Its three
+      # real catches on pushes are the price: such a defect now shows within 12
+      # hours instead of on its own push.
       - name: Regression tests (emit-free build)
+        if: env.RUN_FULL == 'true'
         run: make test-regression-emitfree
 
       # Assert the emitted CIL is VERIFIABLE, not merely JIT-acceptable: CoreCLR
@@ -213,6 +248,7 @@ jobs:
       # DEFUN, an i4 default radix in DIGIT-CHAR-P) until a real library was put
       # through it. It now verifies the core, the stress fixture, and asdf.
       - name: Verify emitted CIL (ilverify)
+        if: env.RUN_FULL == 'true'
         run: |
           dotnet tool install --global dotnet-ilverify >/dev/null 2>&1 || true
           export PATH="$PATH:$HOME/.dotnet/tools"
@@ -226,6 +262,7 @@ jobs:
       # named neither the file nor the cause. All four were found by a user
       # running out of memory, none by CI.
       - name: Check fasl shape
+        if: env.RUN_FULL == 'true'
         run: make test-fasl-shape
 
       # The only test that actually builds projects the way a user does; a Lisp
@@ -236,6 +273,7 @@ jobs:
       # somewhere else in the tree instead of the project's own sources. ~2 min.
       # Needs the fasl core, which the target builds if absent.
       - name: Project composition (MSBuild consumers)
+        if: env.RUN_FULL == 'true'
         run: make compile-core-fasl test-project-compose
 
       # The gates below were in the Makefile but in no workflow. That is not a
@@ -247,17 +285,22 @@ jobs:
       # Measured on the nightly of 2026-09-13, they cost 5m34s together
       # (project-compose 1m54 incl. compile-core-fasl, save-class-lib 1m35,
       # project-core-build 59s, core-bytes 30s, debug-pdb 23s, host-api 13s).
-      # That is the whole price of running them on every push.
+      # They ran on every push until 2026-09-29 and now run in the full run
+      # (RUN_FULL above): by then they cost ~7 min per push and none of them
+      # had ever caught a real defect on a push. They still run in both
+      # repositories; a breakage they catch shows within 12 hours.
 
       # CLHS-audit tests for behaviour ansi-test does not reach (the
       # with-standard-io-syntax variable table, pprint dispatch, read-sequence
       # bounds). ~10s.
       - name: CLHS audit extras
+        if: env.RUN_FULL == 'true'
         run: make test-ansi-extra
 
       # AMOP protocol conformance: the metaobject generic functions real
       # libraries call. ~10s.
       - name: MOP protocol tests
+        if: env.RUN_FULL == 'true'
         run: make test-mop
 
       # The embedding API a C# host meets: EnsureCore with no prior Initialize,
@@ -266,29 +309,34 @@ jobs:
       # PlatformNotSupportedException. Builds and runs a real C# host in both
       # configurations. ~20s.
       - name: Embedding API (C# host)
+        if: env.RUN_FULL == 'true'
         run: make test-host-api
 
       # Booting from a core held in memory -- the only way in for a host with no
       # filesystem, and the only way in at all for the emit-free runtime. ~25s.
       - name: In-memory core boot
+        if: env.RUN_FULL == 'true'
         run: make test-core-bytes
 
       # What a script run does with an error nothing handled: exit code, and
       # whether the forms after it ran. Process-level, so no regression test in
       # the image can see it. ~15s.
       - name: Script exit codes
+        if: env.RUN_FULL == 'true'
         run: make test-cli-exit
 
       # dotcl emits a .NET class library that a separate C# project references at
       # COMPILE time (interface implemented on the C# side, delegate invoked).
       # Nothing else here compiles C# against dotcl-emitted metadata. ~70s.
       - name: save-class-library (C# consumes emitted metadata)
+        if: env.RUN_FULL == 'true'
         run: make test-save-class-lib
 
       # DOTCL_EMIT_PDB: the .lisp must appear in the PDB with sequence points and
       # named locals, which is what makes the VS / VS Code debugger show Lisp
       # source and Locals. ~20s.
       - name: Debug info (PDB)
+        if: env.RUN_FULL == 'true'
         run: make test-debug-pdb
 
       # The other half of the MSBuild story: the step above builds with the legacy
@@ -299,6 +347,7 @@ jobs:
       # the first wall a new user hits, and the remedy is a build property they
       # have no reason to know about. ~90s.
       - name: Project-core MSBuild tasks
+        if: env.RUN_FULL == 'true'
         run: make test-project-core-build
 
       # -- Walk the release pack path without a tag -------------------------
@@ -308,19 +357,20 @@ jobs:
       # pushed, forcing a re-tag. v0.1.28 was cut twice for exactly that.
       #
       # One RID walks the whole chain: crossgen2, the runtime/ staging, both
-      # packs and the cleanup afterwards. ~5 min, which is why this is schedule
-      # only -- RUN_FULL would also fire it on every push to the public mirror.
+      # packs and the cleanup afterwards. ~11-14 min, so it is in the full run
+      # only. On the public mirror a push is a release, so it runs there too.
       # The two `test -f` lines are the point: a pack that exits 0 without
       # producing the base pointer or the per-RID package is the failure mode
-      # that reaches a release.
+      # that reaches a release. `make pack` itself also fails if a tool package
+      # (dotcl, dotcl.<rid>, dotcl.any) lists a dependency: test/pack-nuspec/tool-deps.sh.
       #
       # The version is throwaway but not arbitrary: `dotcl pack` refuses a --from
       # payload older than the first release whose runtime loads a loose user
       # fasl (PackRestamp.LoaderFloor), and it reads that off the version string,
       # so a 0.0.0 donor is refused however new the bits actually are. The step
       # below packs from this one.
-      - name: Pack path (nightly, one RID)
-        if: github.event_name == 'schedule'
+      - name: Pack path (full run, one RID)
+        if: env.RUN_FULL == 'true'
         run: |
           make pack \
             R2R_RIDS=linux-x64 \
@@ -339,17 +389,17 @@ jobs:
       # it was ever enabled for: it sat above the step that produces them, so
       # `out/` was always empty and the step finished in 4 seconds wearing a
       # passing face. It now runs directly after the pack above, on the same
-      # nightly condition, using those packages as the donor. That is also why
-      # it is not one of the every-push gates: the donor costs ~5 min to make.
-      - name: Pack nuspec rules (nightly; donor = the packages above)
-        if: github.event_name == 'schedule'
+      # condition, using those packages as the donor. That is also why it is not
+      # one of the every-push gates: the donor costs minutes to make.
+      - name: Pack nuspec rules (full run; donor = the packages above)
+        if: env.RUN_FULL == 'true'
         run: make test-pack-nuspec
 
       # Cleanup is its own step so it also runs when the two above fail: `out/`
       # and the staged runtime/contrib are hundreds of MB on a runner that keeps
       # its disk between runs.
       - name: Clean up pack artifacts
-        if: ${{ always() && github.event_name == 'schedule' }}
+        if: ${{ always() && env.RUN_FULL == 'true' }}
         run: rm -rf out runtime/contrib
 
       # Fetching ansi-test is its own step so a failure there is reported as
@@ -402,6 +452,23 @@ jobs:
       - name: Update ansi-state.json
         if: env.RUN_FULL == 'true'
         run: make update-ansi-state
+
+      # Random differential test (test/random/): 1000 fresh random integer
+      # forms, each checked inside dotcl (optimized against notinline) and
+      # replayed on SBCL (Roswell, installed above) with the results diffed.
+      # The forms differ on every run, so a red here is a new finding rather
+      # than a regression of a known case: the uploaded cases.lsp and
+      # self-discrepancies.lsp reproduce it. Full run only.
+      - name: Random differential test
+        if: env.RUN_FULL == 'true'
+        run: make test-random-forms RANDOM_N=1000
+
+      - name: Upload random differential test outputs
+        if: ${{ failure() && env.RUN_FULL == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: random-forms-outputs
+          path: out/random-forms/
 
       # A tree without bench/run.lisp gives this step no inputs, and it used to
       # run anyway on RUN_FULL alone and fail every time, kept green by the
@@ -564,10 +631,12 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY" 2>&1
           exit 0
 
-  # -- macOS, nightly only --------------------------------------------------
+  # -- macOS, public full run only -------------------------------------------
   # macOS has had no CI at all, while release.yml packs osx-x64 and osx-arm64 on
   # every tag: the platform ships without ever having run the suite. This is the
-  # smallest thing that changes that -- one regression run, nightly.
+  # smallest thing that changes that -- one regression run. It used to be
+  # nightly; the public mirror has no schedule any more (it moves only at
+  # releases), so it runs on a push there and on a run started by hand.
   #
   # Public repository only: GitHub-hosted macOS bills at 10x, Actions on a public
   # repository are free and unmetered, and the mirror is where the osx packages
@@ -578,7 +647,7 @@ jobs:
   # gets its host Lisp from roswell's install-for-ci.sh, which this does not use.
   # It must not be made a required check until it has been green for a while.
   macos:
-    if: github.event_name == 'schedule' && github.repository == 'dotcl/dotcl'
+    if: github.repository == 'dotcl/dotcl' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: macos-latest
     timeout-minutes: 40
     continue-on-error: true

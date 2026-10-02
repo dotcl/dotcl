@@ -144,6 +144,13 @@ The package identity has more axes than a name, so they are keywords:
 `nuget:resolve` is the same thing but returns the counts and the output
 directory, if you want to see what was laid down.
 
+Everything asked for in one image is resolved as one set, so packages that share
+a dependency get one version of it. A package registered earlier keeps its
+version: asking for something that needs it moved is an error naming the
+package, and the fix is a new image that asks for everything before using any of
+it. `nuget:require` neither reads nor writes the project's lock file; that is
+for declarations, below.
+
 [`examples/http-json.lisp`](../examples/http-json.lisp) puts this together in a
 script you can run: it resolves a package, awaits an async .NET method, and
 reads the JSON that comes back.
@@ -180,13 +187,35 @@ before the component is built, so a NuGet version written there would never
 reach NuGet. Writing `:version` on a `:nuget` component is therefore an error
 that tells you to use `:nuget-version`.
 
-**Pin the version.** Unlike `nuget:require` typed at the REPL -- which is you
-asking for something right now -- a `(:nuget ...)` component is a declaration
-that a later `load-system` acts on, possibly on someone else's machine. Give it
-an exact version. A floating spec (`"13.*"`) or no version at all means
-"whatever is newest when this happens to run", which is how the same source
-comes to load different code on different days; dotcl is moving to stop on one
-and ask you to pin instead, so an exact version is the spelling to write today.
+**Versions come from a lock file.** Unlike `nuget:require` typed at the REPL --
+which is you asking for something right now -- a `(:nuget ...)` component is a
+declaration that a later `load-system` acts on, possibly on someone else's
+machine. So loading a system resolves declared packages through
+`dotcl-nuget.lock.json` in the project directory (`nuget:*project-directory*`,
+by default the current directory). The file is NuGet's own lock-file format and
+records the version of every package in the closure:
+
+- What the lock file records is used as recorded, without asking NuGet. Once a
+  layout for those versions is in the cache, loading touches neither the network
+  nor the .NET SDK.
+- An exact version it does not record yet is resolved and recorded, and dotcl
+  says which packages it is fetching.
+- A floating version (`"13.*"`), a range, or no version at all, is **not**
+  resolved by loading: the answer would depend on the day it runs. Loading stops
+  and says so. Pin the version, or run `(nuget:restore)` once: it resolves what
+  the image has declared, writes the lock file, and from then on loading follows
+  it. Run it again to move a recorded floating version forward.
+
+Commit the lock file with the project, as you would `packages.lock.json`.
+
+Every `(:nuget ...)` a system reaches, through its own components and its
+dependencies', is resolved in one go when the system is loaded, so NuGet unifies
+a dependency they share. Within one image a registered version stays where it
+is: a later resolution that would move it is an error asking you to start a new
+image, since the old assembly may already be loaded.
+
+Set `DOTCL_NUGET_OFFLINE=1` to forbid the network entirely, for CI: only the lock
+file plus an already laid-out cache, or a bundled layout, can then answer.
 
 None of this runs in a packaged application. `dotcl pack` lays out the packages
 the system declares for each platform it builds a package for, and carries them

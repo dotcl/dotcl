@@ -190,7 +190,7 @@ public static partial class Runtime
             else if (elementType == "NIL")
                 fill = Nil.Instance;
             else
-                fill = Nil.Instance;
+                fill = LispVector.DefaultElement(elementType);
             // An element type with packed storage fills that storage directly. Going
             // through a boxed LispObject[SIZE] first, which the constructor then packs
             // and drops, costs 8 bytes an element in garbage, four times the array
@@ -229,15 +229,32 @@ public static partial class Runtime
     }
 
     /// <summary>A LispString is not a LispVector, so it cannot be the target of a
-    /// displaced LispVector directly. Wrap its characters in a CHARACTER vector.
-    /// This copies: a later write through the string is not seen by the
-    /// displaced array.</summary>
+    /// displaced LispVector directly. It is given a CHARACTER vector view that
+    /// shares the string's char[] backing (the string is materialized to char[]
+    /// once, which is permanent), so writes through the string and through the
+    /// displaced array see each other. One view per string, created on first
+    /// use; the reverse table lets ARRAY-DISPLACEMENT return the string itself.</summary>
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<LispString, LispVector> s_stringViews = new();
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<LispVector, LispString> s_viewOwners = new();
+    private static readonly object s_stringViewLock = new();
+
     private static LispVector StringAsDisplacementTarget(LispString str)
     {
-        var strItems = new LispObject[str.Length];
-        for (int j = 0; j < str.Length; j++) strItems[j] = LispChar.Make(str[j]);
-        return new LispVector(strItems, "CHARACTER");
+        if (s_stringViews.TryGetValue(str, out var view)) return view;
+        lock (s_stringViewLock)
+        {
+            if (s_stringViews.TryGetValue(str, out view)) return view;
+            view = LispVector.CharView(str.RawChars);
+            s_stringViews.Add(str, view);
+            s_viewOwners.Add(view, str);
+            return view;
+        }
     }
+
+    /// <summary>The object a displaced array reports as its target: the string
+    /// when TARGET is a string's view, otherwise TARGET.</summary>
+    internal static LispObject DisplacementTargetObject(LispVector target) =>
+        s_viewOwners.TryGetValue(target, out var str) ? str : target;
 
     public static LispObject AdjustArray(LispObject[] args)
     {
@@ -551,6 +568,21 @@ public static partial class Runtime
             return LispChar.Make(s[idx]);
         }
         throw new LispErrorException(new LispTypeError("AREF: not an array", array));
+    }
+
+    /// <summary>BIT / SBIT with one subscript: what ArefMulti answers for the
+    /// two-element argument list, without building it. A packed, undisplaced
+    /// bit vector is read directly; anything else takes ArefMulti as before.
+    /// Called through the function object, e.g. by code that names SBIT as a
+    /// global function: that call used to allocate the argument array and the
+    /// dimension list on every bit read.</summary>
+    public static LispObject Bit1(LispObject array, LispObject index)
+    {
+        if (array is LispVector v && index is Fixnum f && v._bitData is { } bits
+            && v._displacedTo == null && v._dimensions == null
+            && (ulong)f.Value < (ulong)v.Capacity)
+            return Fixnum.Make((long)((bits[(int)(f.Value >> 6)] >> (int)(f.Value & 63)) & 1));
+        return ArefMulti(new[] { array, index });
     }
 
     public static LispObject ArefMulti(LispObject[] args)
@@ -1114,6 +1146,7 @@ public static partial class Runtime
         {
             if (!BackingPinned(v)) return null;
             if (v._numData is long[] d) return d;
+            if (v.IsForeignWidthKind) return null;
         }
         throw BackingTypeError(array, "FIXNUM");
     }
@@ -1124,6 +1157,7 @@ public static partial class Runtime
         {
             if (!BackingPinned(v)) return null;
             if (v._numData is int[] d) return d;
+            if (v.IsForeignWidthKind) return null;
         }
         throw BackingTypeError(array, "SIGNED-BYTE-32");
     }
@@ -1188,24 +1222,26 @@ public static partial class Runtime
     // Written out rather than wrapping the plain entries, so a true declaration
     // runs exactly the tests the plain entry runs, with no extra call layer.
 
-    public static long[] BackingI64Checked(LispObject array)
+    public static long[]? BackingI64Checked(LispObject array)
     {
         if (array is LispVector v && v._dimensions == null)
         {
             if (!BackingPinned(v))
                 throw NotSimpleDeclError(array, SimpleVectorOf(SizedByte("SIGNED-BYTE", 64)), null);
             if (v._numData is long[] d) return d;
+            if (v.IsForeignWidthKind) return null;
         }
         throw BackingTypeError(array, "FIXNUM");
     }
 
-    public static int[] BackingI32Checked(LispObject array)
+    public static int[]? BackingI32Checked(LispObject array)
     {
         if (array is LispVector v && v._dimensions == null)
         {
             if (!BackingPinned(v))
                 throw NotSimpleDeclError(array, SimpleVectorOf(SizedByte("SIGNED-BYTE", 32)), null);
             if (v._numData is int[] d) return d;
+            if (v.IsForeignWidthKind) return null;
         }
         throw BackingTypeError(array, "SIGNED-BYTE-32");
     }
@@ -1812,7 +1848,7 @@ public static partial class Runtime
     public static LispObject CheckSlotType(LispObject value, LispObject type,
                                            LispObject structName, LispObject slotName)
     {
-        if (Typep(value, SlotCheckType(type)) is not Nil) return value;
+        if (SlotTypeTest(type).Test(value)) return value;
         throw new LispErrorException(new LispTypeError(
             $"{structName}: slot {slotName} is declared {type}, got {value}",
             value, type));
@@ -1842,6 +1878,36 @@ public static partial class Runtime
             try { return WeakenForTypep(t, 0); }
             catch (LispErrorException) { return t; }
         });
+    }
+
+    // The test each declared slot type is checked with, keyed like _slotCheckTypes.
+    private static readonly ConditionalWeakTable<LispObject, TypeTest> _slotTypeTests = new();
+
+    // A direct-mapped cache in front of _slotTypeTests: the declared types are a
+    // few hundred constants, and the table lookup (a hash and a dependent-handle
+    // read per probe) was most of what a slot store's check cost.
+    private sealed class SlotTestCacheEntry
+    {
+        internal readonly LispObject Type;
+        internal readonly TypeTest Test;
+        internal SlotTestCacheEntry(LispObject type, TypeTest test) { Type = type; Test = test; }
+    }
+    private static readonly SlotTestCacheEntry?[] _slotTestCache = new SlotTestCacheEntry?[1024];
+
+    private static TypeTest SlotTypeTest(LispObject type)
+    {
+        if (type is T) return ConstTypeTest.True;
+        int h = RuntimeHelpers.GetHashCode(type) & (1024 - 1);
+        var e = _slotTestCache[h];
+        if (e != null && ReferenceEquals(e.Type, type)) return e.Test;
+        var test = SlotTypeTestSlow(type);
+        _slotTestCache[h] = new SlotTestCacheEntry(type, test);
+        return test;
+    }
+
+    private static TypeTest SlotTypeTestSlow(LispObject type)
+    {
+        return _slotTypeTests.GetValue(type, static t => BuildTypeTest(SlotCheckType(t)));
     }
 
     private static LispObject WeakenForTypep(LispObject type, int depth)

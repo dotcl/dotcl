@@ -174,6 +174,17 @@ public partial class Runtime
     internal static LispObject AtomicLongDecf2(LispObject a, LispObject b)
         => AtomicLongResult(AtomicLong1(a, "ATOMIC-LONG-DECF").Add(-AtomicLongInt(b, "ATOMIC-LONG-DECF")));
 
+    /// <summary>The stack a thread that runs Lisp code is created with: the size
+    /// the main thread gets (Program.cs), on a 64-bit process. The compiler
+    /// recurses on the nesting of the code it compiles, and the much smaller
+    /// stack .NET gives a new thread by default is used up by a COND of a few
+    /// thousand clauses or a few hundred nested LETs. Those compile on the main thread, so the same
+    /// code failed only when a SLIME / SLY worker or a bordeaux-threads thread
+    /// compiled it. The size is a reservation; pages are committed as the stack
+    /// grows. 0 (the default size) on a 32-bit process, where address space for
+    /// many such reservations may not exist.</summary>
+    internal static int LispThreadStackSize => System.Environment.Is64BitProcess ? 256 * 1024 * 1024 : 0;
+
     /// <summary>
     /// (bt:make-thread function &key name)
     /// Creates and starts a new thread running FUNCTION.
@@ -253,7 +264,7 @@ public partial class Runtime
                     _threadRegistry.TryRemove(lispThread.Thread.ManagedThreadId, out _);
                 }
             }
-        })
+        }, LispThreadStackSize)
         {
             Name = name,
             IsBackground = true
@@ -271,10 +282,29 @@ public partial class Runtime
         if (_currentLispThread == null)
         {
             _currentLispThread = new LispThread(Thread.CurrentThread, Thread.CurrentThread.Name ?? "main");
+            PruneStoppedThreads();
             _threadRegistry[Thread.CurrentThread.ManagedThreadId] = _currentLispThread;
         }
         return _currentLispThread;
     }
+
+    /// <summary>Drop the entries of threads that have ended. A thread Lisp made
+    /// removes itself on the way out; a thread that came from outside (a host
+    /// thread that asked for its CURRENT-THREAD) has no such exit, so without
+    /// this its entry stayed for the life of the process. Only Stopped threads go:
+    /// a thread MAKE-THREAD registered but has not started yet is Unstarted, not
+    /// Stopped, and must stay.</summary>
+    private static void PruneStoppedThreads()
+    {
+        var entries = (ICollection<KeyValuePair<int, LispThread>>)_threadRegistry;
+        foreach (var kv in _threadRegistry)
+            if ((kv.Value.Thread.ThreadState & ThreadState.Stopped) != 0)
+                entries.Remove(kv);   // only if the id still maps to this entry
+    }
+
+    /// <summary>Number of entries in the thread registry. For tests.</summary>
+    public static LispObject ThreadRegistryCount(LispObject[] args)
+        => Fixnum.Make(_threadRegistry.Count);
 
     /// <summary>(bt:thread-alive-p thread) -> boolean</summary>
     public static LispObject ThreadAliveP(LispObject[] args)
@@ -476,7 +506,7 @@ public partial class Runtime
                 Fixnum f => (double)f.Value,
                 SingleFloat sf => sf.Value,
                 DoubleFloat df => df.Value,
-                Ratio r => (double)r.Numerator / (double)r.Denominator,
+                Ratio r => Arithmetic.RatioToDouble(r),
                 _ => 0.0
             };
             int timeoutMs = Math.Max(0, (int)(timeoutSec * 1000));
@@ -582,7 +612,7 @@ public partial class Runtime
                     Fixnum f => (double)f.Value,
                     SingleFloat sf => sf.Value,
                     DoubleFloat df => df.Value,
-                    Ratio r => (double)r.Numerator / (double)r.Denominator,
+                    Ratio r => Arithmetic.RatioToDouble(r),
                     _ => (double?)null
                 };
             }
@@ -694,7 +724,7 @@ public partial class Runtime
                     Fixnum f => (double)f.Value,
                     SingleFloat sf => sf.Value,
                     DoubleFloat df => df.Value,
-                    Ratio r => (double)r.Numerator / (double)r.Denominator,
+                    Ratio r => Arithmetic.RatioToDouble(r),
                     _ => (double?)null
                 };
             }
@@ -720,6 +750,7 @@ public partial class Runtime
     public static LispObject AllThreads(LispObject[] args)
     {
         CurrentThread([]);  // Ensure main thread is registered
+        PruneStoppedThreads();
         LispObject result = Nil.Instance;
         foreach (var lt in _threadRegistry.Values)
             if (lt.Thread.IsAlive)   // a finished thread may linger until its finally prunes
@@ -751,6 +782,8 @@ public partial class Runtime
             new LispFunction(Runtime.Threadp, "%THREADP"));
         Emitter.CilAssembler.RegisterFunction("%ALL-THREADS",
             new LispFunction(Runtime.AllThreads, "%ALL-THREADS"));
+        Emitter.CilAssembler.RegisterFunction("%THREAD-REGISTRY-COUNT",
+            new LispFunction(Runtime.ThreadRegistryCount, "%THREAD-REGISTRY-COUNT"));
         Emitter.CilAssembler.RegisterFunction("%LOCKP",
             new LispFunction(Runtime.Lockp, "%LOCKP"));
         Emitter.CilAssembler.RegisterFunction("%RECURSIVE-LOCK-P",

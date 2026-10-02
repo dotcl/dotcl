@@ -282,3 +282,14 @@ public class UnboundSentinel : LispObject
 {
     public override string ToString() => "#<UNBOUND>";
 }
+
+// The value a typed entry of a &key function passes to the function's shared
+// body for a keyword the call did not supply. The shared body replaces it with
+// the key's default before any user code runs, so Lisp code never sees it.
+public sealed class AbsentKey : LispObject
+{
+    public static readonly AbsentKey Instance = new();
+    private AbsentKey() { }
+    public static bool Is(LispObject o) => ReferenceEquals(o, Instance);
+    public override string ToString() => "#<ABSENT-KEY>";
+}

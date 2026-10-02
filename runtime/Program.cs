@@ -245,7 +245,7 @@ published dotcl runtime packages in --from with your system's fasl.
 Required:
   --system <name>              ASDF system to compile
   --id <pkgid>                 NuGet id of the produced tool
-  --command <cmd>               Command your users type after install
+  --command <cmd>              Command your users type after install
   -o, --output <dir>           Output directory for the nupkg(s)
   --from <dir>                 Directory holding the dotcl runtime packages
                                to build on (dotcl.<version>.nupkg plus one
@@ -253,12 +253,12 @@ Required:
                                platform)
 
 Optional:
-  --version <ver>               Tool version. Default: the .asd's :version
-  --dotcl-version <ver>         Which dotcl version in --from to build on.
+  --version <ver>              Tool version. Default: the .asd's :version
+  --dotcl-version <ver>        Which dotcl version in --from to build on.
                                Default: inferred, when --from holds exactly
                                one dotcl.<version>.nupkg. Required when it
                                holds more than one
-  --toplevel <fn>                Exported function to call at startup.
+  --toplevel <fn>              Exported function to call at startup.
                                Default: the .asd's :entry-point, if any;
                                with neither, pack warns and the tool only
                                loads the system
@@ -269,18 +269,25 @@ Optional:
                                whole dependency tree, use CL_SOURCE_REGISTRY
                                or a source-registry.conf.d file instead --
                                see docs/dotcl-pack.md
-  --rids <csv>                  Target platforms. Default:
+  --rids <csv>                 Target platforms. Default:
                                win-x64,win-arm64,linux-x64,linux-arm64,
                                osx-x64,osx-arm64,any
-  --bundle <dir>                 Extra files shipped next to the executable
-  --prelude <file>               Source file loaded before the closure is
+  --bundle <dir>               Extra files shipped next to the executable
+  --prelude <file>             Source file loaded before the closure is
                                collected and compiled ahead of it
                                (repeatable)
-  --r2r                          Also crossgen2-compile the fasl per RID
-  --dry-run                      Print the planned fasl and packages
+  --r2r                        Also crossgen2-compile the fasl per RID
+  --library                    Package the system, and the systems it needs
+                               that dotcl does not supply, as a library for
+                               other dotcl systems to declare with
+                               (:nuget ...), not as a tool: needs only
+                               --system and -o. --r2r adds ReadyToRun
+                               images for this platform, and with --from
+                               for the other --rids too
+  --dry-run                    Print the planned fasl and packages
                                without producing them (does not compile)
-  --description <text>          Override nuspec fields the .asd would
-  --project-url <url>            otherwise supply
+  --description <text>         Override nuspec fields the .asd would
+  --project-url <url>          otherwise supply
   --repository <url[#commit]>
   --readme <file>
   --tags <csv>
@@ -322,7 +329,9 @@ Options:
   --color=<when>               Colour the REPL's prompt, values, warnings
                                and errors: auto (default: only on a
                                terminal), always or never. NO_COLOR and
-                               TERM=dumb turn it off in every case
+                               TERM=dumb turn it off in every case;
+                               DOTCL_COLORS changes the colours (see
+                               docs/repl.md)
   --completion <shell>         Emit a shell completion script for
                                pwsh / bash / zsh / fish
   --asd-search-path <dir>      Append <dir> to asdf:*central-registry*
@@ -561,6 +570,9 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
         //       order to <p> (or stdout). With --root-sources-out, also emit the
         //       root system's component source paths (MSBuild Inputs).
         //       --target-rid prefers <dir>/<name>.fasl.r2r-<rid> when present.
+        //   --output also writes <fasl-base>.trim.xml, an ILLink descriptor for
+        //       the .NET types the sources name; --app-assembly <name> is where a
+        //       type the build cannot resolve yet is taken to live.
         // The flags below are build-internal and intentionally absent from
         // --help / completion.
         bool buildMode = !hasUserFasl && rest.Count > 0 && rest[0] == "build";
@@ -571,6 +583,7 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
         string? buildManifestOut = null;
         string? buildRootSourcesOut = null;
         string? buildTargetRid = null;
+        string? buildAppAssembly = null;
         var buildInit = new List<string>();
         var buildSearchPaths = new List<string>();
         if (buildMode)
@@ -585,6 +598,7 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
                 else if (a == "--manifest-out" && i + 1 < rest.Count) buildManifestOut = rest[++i];
                 else if (a == "--root-sources-out" && i + 1 < rest.Count) buildRootSourcesOut = rest[++i];
                 else if (a == "--target-rid" && i + 1 < rest.Count) buildTargetRid = rest[++i];
+                else if (a == "--app-assembly" && i + 1 < rest.Count) buildAppAssembly = rest[++i];
                 else if (a == "--build-init" && i + 1 < rest.Count) buildInit.Add(rest[++i]);
                 else if (a == "--asd-search-path" && i + 1 < rest.Count) buildSearchPaths.Add(rest[++i]);
                 else if (!a.StartsWith('-') && buildAsd == null) buildAsd = a;
@@ -601,6 +615,9 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
         //              [--description <text>] [--project-url <url>]
         //              [--repository <url[#commit]>] [--readme <file>]
         //              [--tags <csv>] [--authors <text>] [--copyright <text>]
+        //   dotcl pack --library --system <name> -o <dir> [--id <pkgid>]
+        //              [--version <ver>] [--r2r --from <dotcl-nupkg-dir> [--rids <csv>]]
+        //              [the metadata options above]
         // Compile the system and its whole closure into a single fasl, then
         // restamp the published dotcl tool packages in --from into the app's
         // own base pointer + per-RID packages with that fasl injected.
@@ -624,6 +641,7 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
                 else if (a == "--dotcl-version" && i + 1 < rest.Count) pack.DotclVersion = rest[++i];
                 else if (a == "--no-android") pack.NoAndroid = true;
                 else if (a == "--r2r") pack.ReadyToRun = true;
+                else if (a == "--library") pack.Library = true;
                 else if (a == "--dry-run") pack.DryRun = true;
                 else if (a == "--asd-search-path" && i + 1 < rest.Count) pack.SearchPaths.Add(rest[++i]);
                 else if (a == "--prelude" && i + 1 < rest.Count) pack.Prelude.Add(rest[++i]);
@@ -836,7 +854,7 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
                 if (buildResolveDeps)
                     RunResolveDeps(buildAsd, buildManifestOut, buildRootSourcesOut, buildTargetRid, buildInitArr, searchPathArr);
                 else if (buildOutput != null)
-                    RunCompileProject(buildAsd, buildOutput, buildInitArr, searchPathArr, buildDebugInfo);
+                    RunCompileProject(buildAsd, buildOutput, buildInitArr, searchPathArr, buildDebugInfo, buildAppAssembly);
                 else
                 {
                     Console.Error.WriteLine("build: requires --output <fasl> or --resolve-deps");
@@ -1249,6 +1267,176 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
         return map.Count == 0 ? null : (rid => map.TryGetValue(rid, out var d) ? d : null);
     }
 
+    /// <summary>
+    /// `dotcl pack --library`: write an ASDF system as a NuGet package that another
+    /// system names in a (:nuget ...) component. The .asd, the sources, their fasls
+    /// and a record of the compiler that made them go under dotcl/&lt;system&gt;/
+    /// (dotcl-nuget-asdf does the packing); the system's own (:nuget ...) components
+    /// become the package's dependencies. With --r2r, each fasl also gets a
+    /// ReadyToRun sibling per RID, compiled against the runtime images in the dotcl
+    /// packages in --from, as the tool path does for its one fasl.
+    /// </summary>
+    static int RunPackLibrary(PackOptions o, DotclBuild.SystemMeta? asd, string? version)
+    {
+        var missing = new List<string>();
+        if (string.IsNullOrEmpty(o.System)) missing.Add("--system");
+        if (string.IsNullOrEmpty(o.Output)) missing.Add("-o/--output");
+        if (string.IsNullOrEmpty(version)) missing.Add("--version");
+        if (missing.Count > 0)
+        {
+            Console.Error.WriteLine($"pack: missing required option(s): {string.Join(", ", missing)}");
+            Console.Error.WriteLine("usage: dotcl pack --library --system <name> -o <dir> [--id <pkgid>] [--version <ver>] [--r2r [--from <dotcl-nupkg-dir> --rids <csv>]]");
+            return 2;
+        }
+        var id = o.Id ?? o.System!;
+        if (id.IndexOfAny(new[] { '/', '\\', ' ' }) >= 0)
+        {
+            Console.Error.WriteLine($"pack: \"{id}\" cannot be a NuGet package id; pass --id");
+            return 2;
+        }
+        if (!string.IsNullOrEmpty(o.Readme) && !File.Exists(o.Readme))
+        {
+            Console.Error.WriteLine($"pack: --readme file not found: {o.Readme}");
+            return 1;
+        }
+
+        string? repoUrl = null, repoCommit = null;
+        if (!string.IsNullOrEmpty(o.Repository))
+        {
+            var hash = o.Repository!.IndexOf('#');
+            if (hash >= 0) { repoUrl = o.Repository[..hash]; repoCommit = o.Repository[(hash + 1)..]; }
+            else repoUrl = o.Repository;
+        }
+        string? readmePath = o.Readme;
+        if (readmePath == null && asd?.AsdDirectory != null)
+            foreach (var candidate in new[] { "README.md", "readme.md", "README.MD" })
+            {
+                var p = Path.Combine(asd.AsdDirectory, candidate);
+                if (File.Exists(p)) { readmePath = p; break; }
+            }
+        var meta = new PackRestamp.Meta
+        {
+            Description = o.Description ?? asd?.Description,
+            ProjectUrl = o.ProjectUrl ?? asd?.Homepage,
+            RepositoryUrl = repoUrl ?? asd?.SourceControlUrl,
+            RepositoryCommit = repoCommit,
+            ReadmePath = readmePath,
+            Tags = o.Tags,
+            Authors = o.Authors ?? PackRestamp.AuthorsFromAsd(asd?.Author),
+            Copyright = o.Copyright,
+            License = asd?.License,
+        };
+        try { PackRestamp.EnsureRequiredMetadata(id, meta); }
+        catch (Exception ex) { Console.Error.WriteLine($"pack: {ex.Message}"); return 1; }
+
+        if (o.DryRun)
+        {
+            Console.WriteLine($"pack: would write {Path.Combine(o.Output!, $"{id.ToLowerInvariant()}.{version}.nupkg")}");
+            return 0;
+        }
+
+        if (o.ReadyToRun && PackR2r.EnsureHostCrossgen2() == null)
+        {
+            Console.Error.WriteLine(
+                $"pack: --r2r needs crossgen2 for {PackR2r.HostRid() ?? "this platform"}, and "
+                + "restoring it (dotnet publish -p:PublishReadyToRun=true) did not bring it in");
+            return 1;
+        }
+
+        static string Lit(string s) => "\"" + s.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\"";
+        var form = $@"
+(handler-case
+    (progn
+      (require ""dotcl-nuget-asdf"")
+      (namestring
+       (funcall (find-symbol ""%PACK-LIBRARY"" ""DOTCL-NUGET-ASDF"")
+                {Lit(o.System!)} {Lit(Path.GetFullPath(o.Output!).Replace('\\', '/'))}
+                :id {Lit(id)} :version {Lit(version!)}
+                :authors {Lit(meta.Authors!)} :description {Lit(meta.Description!)}
+                :r2r {(o.ReadyToRun ? "t" : "nil")})))
+  (error (c) (list :error (princ-to-string c))))";
+        string nupkg;
+        try
+        {
+            var result = MultipleValues.Primary(Runtime.Eval(MultipleValues.Primary(
+                Runtime.ReadFromString(new LispObject[] { new LispString(form) }))));
+            if (result is Cons ec && ec.Cdr is Cons mc && mc.Car is LispString msg)
+            {
+                Console.Error.WriteLine($"pack: {msg.Value}");
+                return 1;
+            }
+            nupkg = ((LispString)result).Value;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"pack: {ex.Message}");
+            return 1;
+        }
+
+        // --r2r alone: the packing itself wrote this platform's siblings, against
+        // the running dotcl. With --from, the other platforms too, against the
+        // runtime images in the dotcl packages there.
+        if (o.ReadyToRun && !string.IsNullOrEmpty(o.From))
+        {
+            var host = PackR2r.HostRid();
+            var rids = (!string.IsNullOrEmpty(o.Rids)
+                    ? o.Rids!.Replace(';', ',')
+                    : "win-x64,win-arm64,linux-x64,linux-arm64,osx-x64,osx-arm64")
+                .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                .Where(r => r != "any" && r != host).ToList();
+            AddLibraryR2r(nupkg, rids, o.From!, o.DotclVersion);
+        }
+
+        try { PackRestamp.ApplyLibraryMeta(nupkg, meta); }
+        catch (Exception ex) { Console.Error.WriteLine($"pack: {ex.Message}"); return 1; }
+
+        Console.WriteLine($"pack: wrote  {nupkg}");
+        Console.WriteLine($"pack: library id={id} version={version}");
+        return 0;
+    }
+
+    /// <summary>Add a ReadyToRun sibling (x.fasl.r2r-&lt;rid&gt;) for every fasl in the
+    /// library package, per RID. A RID that will not compile is reported and
+    /// skipped: the fasl beside it is complete, only JIT-compiled at load.</summary>
+    static void AddLibraryR2r(string nupkg, IReadOnlyList<string> rids, string from, string? dotclVersion)
+    {
+        dotclVersion ??= PackRestamp.InferDotclVersion(from);
+        var work = Path.Combine(Path.GetTempPath(), "dotcl-libr2r-" + Guid.NewGuid().ToString("N"));
+        using var zip = System.IO.Compression.ZipFile.Open(nupkg, System.IO.Compression.ZipArchiveMode.Update);
+        var fasls = zip.Entries
+            .Where(e => e.FullName.StartsWith("dotcl/") && e.FullName.EndsWith(".fasl"))
+            .Select(e => e.FullName).ToList();
+        int i = 0;
+        foreach (var name in fasls)
+        {
+            var dir = Path.Combine(work, (i++).ToString());
+            Directory.CreateDirectory(dir);
+            var fasl = Path.Combine(dir, "x.fasl");
+            using (var s = zip.GetEntry(name)!.Open())
+            using (var f = File.Create(fasl))
+                s.CopyTo(f);
+            foreach (var rid in rids)
+            {
+                var ridPkg = Path.Combine(from, $"dotcl.{rid}.{dotclVersion}.nupkg");
+                var sibling = PackR2r.Compile(fasl, rid, ridPkg, Path.Combine(dir, rid), out var why);
+                if (sibling == null)
+                {
+                    Console.Error.WriteLine($"pack: no ReadyToRun image of {name} for {rid}: {why}");
+                    continue;
+                }
+                var entryName = $"{name}.r2r-{rid}";
+                zip.GetEntry(entryName)?.Delete();
+                var e = zip.CreateEntry(entryName, System.IO.Compression.CompressionLevel.Optimal);
+                e.LastWriteTime = new DateTimeOffset(DateTime.UtcNow, TimeSpan.Zero);
+                using (var es = e.Open())
+                using (var fs = File.OpenRead(sibling))
+                    fs.CopyTo(es);
+                Console.WriteLine($"pack: built ReadyToRun image of {name} for {rid}");
+            }
+        }
+        try { Directory.Delete(work, recursive: true); } catch { }
+    }
+
     static void CopyTree(string from, string to)
     {
         foreach (var f in Directory.GetFiles(from, "*", SearchOption.AllDirectories))
@@ -1259,9 +1447,10 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
         }
     }
 
-    static void RunCompileProject(string asdPath, string outputPath, string[]? buildInit = null, string[]? searchPaths = null, bool debugInfo = false)
+    static void RunCompileProject(string asdPath, string outputPath, string[]? buildInit = null, string[]? searchPaths = null, bool debugInfo = false,
+                                  string? appAssembly = null)
     {
-        try { DotclBuild.CompileProject(asdPath, outputPath, buildInit, searchPaths, debugInfo); }
+        try { DotclBuild.CompileProject(asdPath, outputPath, buildInit, searchPaths, debugInfo, appAssembly); }
         catch (System.IO.FileNotFoundException ex)
         {
             Console.Error.WriteLine(ex.Message);
@@ -1285,6 +1474,7 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
         public string? DotclVersion; // which dotcl version in --from (else inferred)
         public bool NoAndroid = true;   // desktop RIDs only (release default)
         public bool ReadyToRun;         // also compile the fasl's R2R sibling per RID
+        public bool Library;            // pack the system as a library nupkg (dotcl/<system>/)
         public bool DryRun;
         public readonly List<string> SearchPaths = new();
         public readonly List<string> Prelude = new();  // sources compiled ahead of the closure
@@ -1331,6 +1521,8 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
         // their own choosing and must not start getting the .asd's instead.
         var version = !string.IsNullOrEmpty(o.Version) ? o.Version : asd?.Version;
 
+        if (o.Library) return RunPackLibrary(o, asd, version);
+
         var missing = new List<string>();
         if (string.IsNullOrEmpty(o.System)) missing.Add("--system");
         if (string.IsNullOrEmpty(o.Id)) missing.Add("--id");
@@ -1345,6 +1537,18 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
             if (missing.Contains("--version"))
                 Console.Error.WriteLine("pack: --version defaults to :version in the .asd; supply one or the other");
             return 2;
+        }
+
+        // A version that came from the .asd went through ASDF's syntax, not
+        // NuGet's, and NuGet refuses some of what ASDF lets through. Warn rather
+        // than refuse: the package is still written, as it always was.
+        if (string.IsNullOrEmpty(o.Version)
+            && DotclBuild.AsdVersionNuGetProblem(version!) is string versionProblem)
+        {
+            Console.Error.WriteLine(
+                $"pack: warning: the .asd's :version \"{version}\" cannot be served by NuGet: {versionProblem}.");
+            Console.Error.WriteLine(
+                "pack: warning: the package is written anyway, but installing it will report it as not found; pass --version to override.");
         }
 
         // Fail fast, before building the fasl, if the --from payload predates the

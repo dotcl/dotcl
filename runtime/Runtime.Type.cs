@@ -27,13 +27,66 @@ public static partial class Runtime
     public static bool TryGetQualifiedTypeExpander(Symbol sym, out LispObject expander)
     {
         expander = Nil.Instance;
-        return sym.HomePackage is Package p && p.Name != "COMMON-LISP"
-            && TypeExpanders.TryGetValue(p.Name + "::" + sym.Name, out expander!);
+        if (sym.HomePackage is not Package p || p.Name == "COMMON-LISP") return false;
+        // For a symbol outside COMMON-LISP the qualified key is TypeExpanderKey's.
+        var found = TypeNameInfo(sym).Expander;
+        if (found == null) return false;
+        expander = found;
+        return true;
     }
 
     /// <summary>The DEFTYPE expander registered for exactly this symbol.</summary>
     public static bool TryGetTypeExpander(Symbol sym, out LispObject expander)
-        => TypeExpanders.TryGetValue(TypeExpanderKey(sym), out expander!);
+    {
+        var found = TypeNameInfo(sym).Expander;
+        expander = found ?? Nil.Instance;
+        return found != null;
+    }
+
+    /// <summary>Bumped by every DEFTYPE registration; invalidates Symbol.TypeMemo.</summary>
+    internal static int TypeExpanderEpoch;
+
+    /// <summary>What the type tables say about SYM as a type name, cached on the
+    /// symbol. TYPEP asks this for the same symbols on every call, and the
+    /// lookup key is a freshly concatenated "PKG::NAME" string. The cache is
+    /// dropped when a DEFTYPE is registered or the symbol's home package (or
+    /// that package's name) is no longer the one the key was built from.</summary>
+    internal static Symbol.TypeNameMemo TypeNameInfo(Symbol sym)
+    {
+        int epoch = System.Threading.Volatile.Read(ref TypeExpanderEpoch);
+        var pkg = sym.HomePackage;
+        var pkgName = pkg?.Name;
+        var memo = sym.TypeMemo;
+        if (memo != null && memo.Epoch == epoch && ReferenceEquals(memo.Package, pkg)
+            && ReferenceEquals(memo.PackageName, pkgName))
+            return memo;
+        TypeExpanders.TryGetValue(TypeExpanderKey(sym), out var expander);
+        memo = new Symbol.TypeNameMemo(epoch, pkg, pkgName, expander,
+                                       memo?.Builtin ?? IsBuiltinTypeName(sym.Name));
+        sym.TypeMemo = memo;
+        return memo;
+    }
+
+    /// <summary>The expansion of the bare symbol SYM as a type specifier, by its
+    /// DEFTYPE expander EXPANDER. Kept with the symbol's type-name memo, so it is
+    /// recomputed after any DEFTYPE, and after any change to the class table
+    /// (DEFCLASS, DEFSTRUCT, (SETF FIND-CLASS)): an expander may choose its
+    /// expansion by whether a class exists. TYPEP of a DEFTYPE'd name otherwise
+    /// calls the expander on every test.</summary>
+    internal static LispObject ExpandTypeSymbol(Symbol sym, LispObject expander)
+    {
+        var memo = TypeNameInfo(sym);
+        if (!ReferenceEquals(memo.Expander, expander)) return Funcall(expander);
+        int ce = System.Threading.Volatile.Read(ref ClassRegistry.Epoch);
+        var cached = memo.Expansion;
+        if (cached != null && cached.ClassEpoch == ce) return cached.Expansion;
+        var expansion = Funcall(expander);
+        memo.Expansion = new Symbol.ExpansionMemo(expansion, ce);
+        return expansion;
+    }
+
+    /// <summary>IsBuiltinTypeName of the symbol's name, cached on the symbol.</summary>
+    internal static bool IsBuiltinTypeSymbol(Symbol sym) => TypeNameInfo(sym).Builtin;
 
     /// <summary>
     /// Type names dotcl adds beyond CL, which the compiler gates on symbol
@@ -106,8 +159,35 @@ public static partial class Runtime
 
     public static LispObject Typep(LispObject obj, LispObject typeSpec)
     {
+        if (typeSpec is Symbol sym && SymbolTypeTest(sym) is { } test)
+            return test.Test(obj) ? T.Instance : Nil.Instance;
+        return TypepGeneral(obj, typeSpec);
+    }
+
+    /// <summary>TYPEP by interpreting the specifier. Typep answers a symbol
+    /// from the test built for it (Runtime.TypeTest.cs) when there is one.</summary>
+    private static LispObject TypepGeneral(LispObject obj, LispObject typeSpec)
+    {
         if (typeSpec is Symbol || typeSpec is Nil || typeSpec is T)
         {
+            // Structure instance against a symbol naming a structure class: the
+            // answer is the structure's class precedence list, which is what every
+            // path below arrives at for this pair, after a string-keyed built-in
+            // name lookup and up to three class registry lookups. A same-named
+            // symbol from another package, or a structure whose class is missing,
+            // still takes the general path below.
+            if (obj is LispStruct fst && typeSpec is Symbol fts)
+            {
+                if (ReferenceEquals(fst.TypeName, fts)) return T.Instance;
+                if (FindClassOrNil(fts) is LispClass ftc && ftc.IsStructureClass
+                    && FindClassOrNil(fst.TypeName) is LispClass fsc
+                    && fst.TypeName.Name != fts.Name)
+                {
+                    foreach (var a in fsc.ClassPrecedenceList)
+                        if (ReferenceEquals(a, ftc)) return T.Instance;
+                    return Nil.Instance;
+                }
+            }
             // A structure or CLOS instance is matched against its class precedence
             // list by name further down. A symbol that names neither a class nor a
             // type must not match a same-named class from another package that way.
@@ -118,11 +198,34 @@ public static partial class Runtime
                 && (obj is LispStruct ls0 ? !ReferenceEquals(ls0.TypeName, unkSym)
                     : obj is LispInstance || obj is LispInstanceCondition)
                 && IsUnknownTypeSymbol(unkSym))
+                throw UnknownTypeSpecifier(unkSym);
+            // A class whose name is a symbol outside COMMON-LISP that happens to
+            // share a built-in type's name (magicl shadows VECTOR and defines
+            // MAGICL:VECTOR as a class) is that class and nothing else. The
+            // name-based dispatch below would otherwise answer for CL:VECTOR, so
+            // every string and vector satisfied (typep x 'magicl:vector).
+            if (typeSpec is Symbol shadowSym
+                && shadowSym.HomePackage != Startup.CL
+                && shadowSym.HomePackage != Startup.Internal
+                && IsBuiltinTypeSymbol(shadowSym)
+                && FindClassOrNil(shadowSym) is LispClass shadowCls
+                && ReferenceEquals(shadowCls.Name, shadowSym)
+                && !TryGetTypeExpander(shadowSym, out _))
+            {
+                if (ClassOf(obj) is LispClass objCls)
+                    foreach (var c in objCls.ClassPrecedenceList)
+                        if (ReferenceEquals(c, shadowCls)) return T.Instance;
                 return Nil.Instance;
+            }
             // Fast path: struct type check: avoid full switch when positive match
             if (typeSpec is Symbol typeSym && obj is LispStruct st)
             {
-                if (ReferenceEquals(st.TypeName, typeSym) || st.TypeName.Name == typeSym.Name)
+                // The name match is for callers that name a structure by a bare
+                // symbol interned elsewhere. A COMMON-LISP symbol names the
+                // built-in type, not a structure that shadows it (a structure
+                // named FOO::ARRAY is not a CL:ARRAY).
+                if (ReferenceEquals(st.TypeName, typeSym)
+                    || (st.TypeName.Name == typeSym.Name && typeSym.HomePackage != Startup.CL))
                     return T.Instance;
                 // Check :include hierarchy
                 var stCls = FindClassOrNil(st.TypeName) as LispClass;
@@ -228,7 +331,7 @@ public static partial class Runtime
             }
             // A non-CL deftype shadows built-ins for its own symbol
             if (typeSpec is Symbol qSym && TryGetQualifiedTypeExpander(qSym, out var qExp))
-                return Typep(obj, Funcall(qExp));
+                return Typep(obj, ExpandTypeSymbol(qSym, qExp));
             if (CheckSimpleType(obj, name)) return T.Instance;
             // A symbol that names a class means that class.
             if (typeSpec is Symbol classNameSym && FindClassOrNil(classNameSym) is LispClass)
@@ -236,9 +339,10 @@ public static partial class Runtime
             // Try user-defined type expander
             if (typeSpec is Symbol expSym && TryGetTypeExpander(expSym, out var expSymExpander))
             {
-                var expanded = Funcall(expSymExpander);
+                var expanded = ExpandTypeSymbol(expSym, expSymExpander);
                 return Typep(obj, expanded);
             }
+            if (IsUnknownTypeSymbol(typeSpec)) throw UnknownTypeSpecifier(typeSpec);
             return Nil.Instance;
         }
         // LispClass as type specifier: check if obj is instance of this class
@@ -622,9 +726,17 @@ public static partial class Runtime
                 var expanded2 = Funcall(expCompoundExpander, args2);
                 return Typep(obj, expanded2);
             }
+            if (IsUnknownTypeSymbol(head)) throw UnknownTypeSpecifier(typeSpec);
         }
         return Nil.Instance;
     }
+
+    /// <summary>A type specifier that names nothing: neither a built-in type, a
+    /// class, nor a DEFTYPE. Signalled when TYPEP (and so THE, CHECK-TYPE and
+    /// TYPECASE) reaches it, rather than answering NIL, so a misspelt or not yet
+    /// defined type is not silently a type with no members.</summary>
+    private static LispErrorException UnknownTypeSpecifier(LispObject spec) =>
+        new LispErrorException(new LispError("unknown type specifier: " + FormatObject(spec, true)));
 
     private static bool CheckSimpleType(LispObject obj, string typeName) => typeName switch
     {
@@ -808,6 +920,11 @@ public static partial class Runtime
         return false;
     }
 
+    private static bool IsSpecializedIntegerElementType(string et) =>
+        (et == "FIXNUM" || et.StartsWith("UNSIGNED-BYTE-", StringComparison.Ordinal)
+                        || et.StartsWith("SIGNED-BYTE-", StringComparison.Ordinal))
+        && LispVector.NumKindForElementType(et) != 0;
+
     // Check if a LispVector's ElementTypeName matches a compound element-type specifier like (unsigned-byte 8)
     private static bool MatchesElementType(LispObject elemTypeSpec, string storedET)
     {
@@ -820,6 +937,14 @@ public static partial class Runtime
             var aliasArgs = ToList(etAliasCons.Cdr).ToArray();
             return MatchesElementType(Funcall(etAliasExp2, aliasArgs), storedET);
         }
+        // An array with specialized integer storage has exactly one element
+        // type, and (array X) names it only when X upgrades to that same type
+        // (CLHS 15.1.2.1): the specifier is asked what MAKE-ARRAY would build
+        // for it. The loose rules below let a FIXNUM array pass as
+        // (unsigned-byte 8) and an (unsigned-byte 8) array as FIXNUM, so a
+        // TYPECASE picking a byte-vector writer took a FIXNUM vector.
+        if (IsSpecializedIntegerElementType(storedET))
+            return ParseElementTypeName(elemTypeSpec) == storedET;
         // NIL reads as the empty list, not as a symbol named NIL, so it would
         // otherwise fall past every case below to the "generic vector accepts
         // anything" line. It upgrades to NIL: an array of element type NIL can
@@ -865,7 +990,18 @@ public static partial class Runtime
                     return storedET == $"SIGNED-BYTE-{nbF2.Value}" || storedET == "SIGNED-BYTE" || storedET == "INTEGER" || storedET == "FIXNUM";
                 return storedET.StartsWith("SIGNED-BYTE") || storedET == "INTEGER" || storedET == "FIXNUM";
             }
-            if (headN == "COMPLEX") return storedET.StartsWith("COMPLEX") || storedET == "T";
+            if (headN == "COMPLEX")
+            {
+                // Arrays of (complex single-float) and (complex double-float) are
+                // told apart (ARRAY-ELEMENT-TYPE reports each as itself); every
+                // other complex element type upgrades to T, like general storage.
+                string partName = etCons.Cdr is Cons pc && pc.Car is Symbol ps ? ps.Name : "*";
+                char want = Runtime.ComplexElementPartClass("COMPLEX-" + partName);
+                char have = storedET == "T" ? 'O'
+                          : storedET == "COMPLEX" || storedET.StartsWith("COMPLEX-") ? Runtime.ComplexElementPartClass(storedET)
+                          : '\0';
+                return want == have;
+            }
             if (headN is "INTEGER" or "FIXNUM" or "BIGNUM" or "RATIONAL")
             {
                 // (integer low high): matches if stored element type is an integer-compatible type
@@ -2145,13 +2281,15 @@ public static partial class Runtime
     }
 
     /// <summary>A symbol outside CL (and outside DOTCL-INTERNAL, where bare-name
-    /// placeholders live) that names no built-in type, class, or deftype.</summary>
+    /// placeholders live) that names no built-in type, class (including one a
+    /// DEFCLASS earlier in the file being compiled names), or deftype.</summary>
     private static bool IsUnknownTypeSymbol(LispObject spec) =>
         spec is Symbol s
         && s.HomePackage != Startup.CL
         && s.HomePackage != Startup.Internal
-        && !IsBuiltinTypeName(s.Name)
+        && !IsBuiltinTypeSymbol(s)
         && FindClassOrNil(s) is not LispClass
+        && FindCompileTimeClass(s) is not LispClass
         && !TryGetTypeExpander(s, out _);
 
     internal static readonly Dictionary<string, HashSet<string>> _typeAncestors = BuildTypeHierarchy();
@@ -2164,8 +2302,8 @@ public static partial class Runtime
     /// defstruct, define-condition all register one), or a built-in type name?
     /// </summary>
     public static bool NamesAType(Symbol sym) =>
-        TypeExpanders.ContainsKey(TypeExpanderKey(sym))
-        || IsBuiltinTypeName(sym.Name)
+        TryGetTypeExpander(sym, out _)
+        || IsBuiltinTypeSymbol(sym)
         || FindClassOrNil(sym) != Nil.Instance;
 
     /// <summary>

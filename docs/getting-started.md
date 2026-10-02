@@ -17,7 +17,17 @@ $ dotnet --version
 10.0.302
 ```
 
-See the install table in the [README](../README.md) if `dotnet` is missing.
+If `dotnet` is missing:
+
+| OS | Command |
+|----|---------|
+| macOS (Homebrew) | `brew install --cask dotnet-sdk` |
+| Ubuntu 24.04+ | `sudo apt install dotnet-sdk-10.0` |
+| Debian | add the Microsoft package repository, then `apt install dotnet-sdk-10.0`; see the [official guide](https://learn.microsoft.com/dotnet/core/install/linux-debian) |
+| Windows (winget) | `winget install Microsoft.DotNet.SDK.10` |
+| Windows (Scoop) | `scoop install dotnet-sdk` |
+| Cross-platform script | [`dotnet-install.sh` / `dotnet-install.ps1`](https://learn.microsoft.com/dotnet/core/tools/dotnet-install-script) |
+| Other | https://dotnet.microsoft.com/download |
 
 ## 2. Install dotcl
 
@@ -115,8 +125,32 @@ still wants the .NET 10 runtime installed (it does not carry its own).
 
 ### 2c. From source
 
-Only if you want to work on dotcl itself. It needs Roswell/SBCL to bootstrap
-the compiler; see [Building from source](../README.md#building-from-source).
+Only if you want to work on dotcl itself. Clone the repository and bootstrap
+the compiler with [Roswell](https://github.com/roswell/roswell)/SBCL:
+
+```bash
+make cross-compile        # uses Roswell/SBCL to bootstrap the compiler
+make compile-asdf-fasl    # pre-compiles ASDF (required by samples)
+make install              # builds and installs the local nupkg as `dotcl`
+```
+
+After the first cross-compile, dotcl can build itself:
+`DOTCL_LISP=dotcl make cross-compile` rebuilds the compiler with dotcl.
+
+On Windows:
+
+- **`make`**: the build needs GNU Make. Git Bash (bundled with
+  [Git for Windows](https://gitforwindows.org/)) ships GNU Make and works;
+  run the commands above from a Git Bash prompt. WSL works too.
+- **Path translation**: run the build from Git Bash (`/c/...` paths) rather
+  than a shell that rewrites paths to Cygwin form (`/cygdrive/c/...`). The
+  Roswell/SBCL bootstrap reads the paths verbatim, so `/cygdrive/...` paths
+  it can't open surface as a `SB-INT:SIMPLE-FILE-ERROR` during
+  `make cross-compile`.
+- **`dotcl` not found after `make install`**: `make install` registers
+  `dotcl` as a .NET global tool under `~/.dotnet/tools`, which is on `PATH`
+  in PowerShell but often not in Git Bash. Add it there with
+  `export PATH="$HOME/.dotnet/tools:$PATH"` (or run `dotcl` from PowerShell).
 
 ## 3. Your first project
 
@@ -286,6 +320,10 @@ in [ReadyToRun siblings](readytorun.md), and native AOT in
 
 ## Where to go next
 
+- [Embedding dotcl](embedding.md): the C# side of what the template's
+  `Program.cs` does, and what else a host can do
+- [dotcl for Lisp programmers](for-lispers.md): what differs from SBCL, and
+  the REPL and editors
 - [Using libraries](libraries.md): ASDF, Quicklisp, NuGet dependencies
 - [SDK and MSBuild properties](sdk.md): every property the build reads
 - [Writing scripts](scripting.md): no project at all, just a `.lisp` file

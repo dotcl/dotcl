@@ -21,8 +21,7 @@
       (error "cannot locate this process's executable")))
 
 (defvar *pau-core*
-  (or (ignore-errors (namestring (truename "compiler/cil-out.sil")))
-      "compiler/cil-out.sil"))
+  (regression-child-core))
 
 (defun pau-path (name)
   (ensure-directories-exist *pau-dir*)

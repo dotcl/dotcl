@@ -139,15 +139,16 @@
 (defun rcl-setenv (name value)
   (dotnet:static "System.Environment" "SetEnvironmentVariable" name value))
 
-(defun rcl-run (flags lines &key (no-color nil) (term "xterm"))
-  "Feed LINES to `dotcl FLAGS repl` on a pipe, with NO_COLOR and TERM set as
-given (NIL unsets). Returns standard output, standard error and the exit
-status. The two variables are set in this process for the child to inherit and
-put back afterwards, so the result does not depend on the terminal the suite
-was started from."
+(defun rcl-run (flags lines &key (no-color nil) (term "xterm") (colors nil))
+  "Feed LINES to `dotcl FLAGS repl` on a pipe, with NO_COLOR, TERM and
+DOTCL_COLORS set as given (NIL unsets). Returns standard output, standard error
+and the exit status. The variables are set in this process for the child to
+inherit and put back afterwards, so the result does not depend on the terminal
+the suite was started from."
   (let ((input (concatenate 'string *rcl-dir* "input.lisp"))
         (old-no-color (rcl-getenv "NO_COLOR"))
-        (old-term (rcl-getenv "TERM")))
+        (old-term (rcl-getenv "TERM"))
+        (old-colors (rcl-getenv "DOTCL_COLORS")))
     (with-open-file (out input :direction :output :if-exists :supersede)
       (dolist (line lines)
         (write-string line out)
@@ -156,6 +157,7 @@ was started from."
          (progn
            (rcl-setenv "NO_COLOR" no-color)
            (rcl-setenv "TERM" term)
+           (rcl-setenv "DOTCL_COLORS" colors)
            (multiple-value-bind (out err code)
                (ignore-errors
                 (uiop:run-program (append (list *rcl-exe*) (rcl-image)
@@ -166,7 +168,8 @@ was started from."
                                   :ignore-error-status t))
              (values (or out "") (or err "") code)))
       (rcl-setenv "NO_COLOR" old-no-color)
-      (rcl-setenv "TERM" old-term))))
+      (rcl-setenv "TERM" old-term)
+      (rcl-setenv "DOTCL_COLORS" old-colors))))
 
 (defvar *rcl-lines* '("(+ 1 2)" "(warn \"careful\")" "(princ \"plain\")"))
 
@@ -230,3 +233,37 @@ was started from."
   (multiple-value-bind (out err code) (rcl-run '("--color=sometimes") '("(+ 1 2)"))
     (list (search "CL-USER>" out) (and (search "--color" err) t) code))
   (nil t 2))
+
+;;; -- DOTCL_COLORS ---------------------------------------------------------------
+
+;;; The variable changes the roles it names and only those. An empty value is
+;;; no colour for that role; an unknown role or a value with anything but digits
+;;; and semicolons is skipped, and the REPL still starts.
+(deftest rcl-dotcl-colors-env
+  (multiple-value-bind (out err code)
+      (rcl-run '("--color=always") *rcl-lines*
+               :colors "prompt=4;34:result=:nosuch=1:warning=red:error=35")
+    (declare (ignore code))
+    (list (and (search "<ESC>[4;34mCL-USER><ESC>[0m 3" (rcl-show out)) t)
+          (and (search "<ESC>[33mWARNING: careful<ESC>[0m" (rcl-show err)) t)))
+  (t t))
+
+;;; DOTCL_COLORS picks colours, never whether to paint: NO_COLOR still wins.
+(deftest rcl-dotcl-colors-no-color-wins
+  (multiple-value-bind (out err)
+      (rcl-run '("--color=always") *rcl-lines* :no-color "1" :colors "prompt=4;34")
+    (list (rcl-has-escape out) (rcl-has-escape err)))
+  (nil nil))
+
+;;; The same form from Lisp, for an init file, on top of what is in effect.
+(deftest rcl-set-colors
+  (unwind-protect
+       (progn
+         (dotcl-repl:set-colors "comment=2;3:string=")
+         (dotcl-repl:set-colors "keyword=1;35:bogus=1:comment=x")
+         (list (rcl-show (dotcl::%repl-paint :comment "c" t))
+               (dotcl::%repl-paint :string "s" t)
+               (rcl-show (dotcl::%repl-paint :keyword "k" t))
+               (rcl-show (dotcl::%repl-paint :prompt "p" t))))
+    (dotcl-repl:set-colors "comment=2:string=32:keyword=35"))
+  ("<ESC>[2;3mc<ESC>[0m" "s" "<ESC>[1;35mk<ESC>[0m" "<ESC>[1;32mp<ESC>[0m"))

@@ -17,15 +17,10 @@
   #+darwin "libc"
   #-(or windows darwin) "libc.so.6")
 
-;;; Apple ARM64 is not covered yet. :VARARGS applies C's default argument
-;;; promotions, which is all Linux x86-64 needs because its variadic and fixed
-;;; conventions place arguments identically. Apple's ARM64 ABI does not: the
-;;; variadic part goes entirely on the stack, while the single non-variadic
-;;; CALLI this still emits puts it in registers. Measured there, 6 of the 8
-;;; tests below fail -- integers and strings as well as floats -- and only the
-;;; two with no variadic argument pass. Running them would assert an ABI the
-;;; implementation does not yet honour, so they are skipped rather than
-;;; weakened; see the ARM64 issue for what a real fix needs.
+;;; Apple ARM64 differs from both: the variadic part goes entirely on the
+;;; stack, one 8-byte slot per argument, integers and strings as well as floats.
+;;; Before that was handled, 6 of the 8 tests below failed there and only the two
+;;; with no variadic argument passed.
 
 (defun %va-cstring (p)
   "The NUL-terminated string at P."
@@ -92,3 +87,21 @@
   (handler-case (progn (%va-sprintf '(:varargs :int :varargs :int) "%d%d" 1 2) nil)
     (error () t))
   t)
+
+;;; Narrow and wide integers keep their sign and width. On Apple ARM64 each
+;;; variadic argument occupies an 8-byte stack slot, so a narrow one has to be
+;;; widened by its declared type.
+(deftest ffi-varargs.integer-widths-and-signs
+  (%va-sprintf '(:varargs :int8 :int16 :int :uint :int64 :int)
+               "%hhd %hd %d %u %lld %c" -3 -300 -5 4000000000 -123456789012 65)
+  "-3 -300 -5 4000000000 -123456789012 A")
+
+;;; More variadic arguments than there are argument registers: the tail goes
+;;; on the stack on every ABI, in order.
+(deftest ffi-varargs.more-than-the-argument-registers
+  (list (apply #'%va-sprintf (cons :varargs (make-list 11 :initial-element :int))
+               "%d %d %d %d %d %d %d %d %d %d %d" '(1 2 3 4 5 6 7 8 9 10 11))
+        (apply #'%va-sprintf (cons :varargs (make-list 10 :initial-element :double))
+               "%.0f %.0f %.0f %.0f %.0f %.0f %.0f %.0f %.0f %.0f"
+               '(1d0 2d0 3d0 4d0 5d0 6d0 7d0 8d0 9d0 10d0)))
+  ("1 2 3 4 5 6 7 8 9 10 11" "1 2 3 4 5 6 7 8 9 10"))

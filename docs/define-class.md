@@ -154,3 +154,19 @@ same clause syntax as `define-class`, plus `:module` (a static-function holder),
 Enums, constant holders and field-only structs come out **standalone**, pure
 metadata with no reference to `DotCL.Runtime`, so a consumer that only touches
 those needs nothing from dotcl at run time.
+
+Classes and modules are facades: their method bodies call back into Lisp, and
+saving the library does not carry the Lisp bodies with it. The process that
+uses the .dll installs them with `dotnet:register-class-handlers`, which takes
+the same clauses as `define-class` but defines no type:
+
+```lisp
+(dotnet:register-class-handlers "MyPack.Greeter" ()
+  (:methods ("Hello" ((who String)) :returns String
+    (concatenate 'string "Hi " who))))
+(dotnet:register-class-handlers "MyPack.MathOps" ()
+  (:functions ("Square" ((x Int32)) :returns Int32 (* x x))))
+```
+
+It emits nothing, so it also works on a runtime without code generation, where
+`define-class` is unavailable.

@@ -74,8 +74,73 @@ public static class Cltl2
         return Nil.Instance;
     }
 
-    // (variable-information variable &optional env): no lexical env, so no info.
-    public static LispObject VariableInformation(LispObject[] args) => NoInfo();
+    // (variable-information variable &optional env) => kind, local-p, decl-alist.
+    // dotcl's macro environments carry no lexical bindings, so this answers for
+    // the global environment only: :CONSTANT, :SPECIAL or :SYMBOL-MACRO from the
+    // symbol's global state, NIL when nothing is known. LOCAL-P is always NIL.
+    public static LispObject VariableInformation(LispObject[] args)
+    {
+        if (args.Length < 1 || args.Length > 2)
+            throw new LispErrorException(new LispProgramError(
+                $"VARIABLE-INFORMATION: wrong number of arguments: {args.Length} (expected 1-2)"));
+        LispObject kind = Nil.Instance;
+        var v = args[0];
+        if (v is Nil || v is T)
+            kind = Startup.Keyword("CONSTANT");
+        else if (v is Symbol sym)
+        {
+            if (sym.IsConstant || sym.HomePackage == Startup.KeywordPkg)
+                kind = Startup.Keyword("CONSTANT");
+            else if (sym.IsSpecial || IsCompilerGlobalSpecial(sym))
+                kind = Startup.Keyword("SPECIAL");
+            else if (IsGlobalSymbolMacro(sym))
+                kind = Startup.Keyword("SYMBOL-MACRO");
+        }
+        else
+            throw new LispErrorException(new LispTypeError(
+                "VARIABLE-INFORMATION: not a symbol", v, Startup.Sym("SYMBOL")));
+        MultipleValues.Set(kind, Nil.Instance, Nil.Instance);
+        return kind;
+    }
+
+    /// <summary>Whether the compiler holds SYM globally special without the
+    /// runtime flag being set yet: a DEFVAR or a (DECLAIM (SPECIAL ...)) earlier
+    /// in the file COMPILE-FILE is compiling takes effect in the compiler at
+    /// compile time, and the symbol is marked only when the fasl is loaded. A
+    /// walker asking about a binding of such a variable in the same file has to
+    /// hear :SPECIAL, as the compiler will bind it dynamically.</summary>
+    private static bool IsCompilerGlobalSpecial(Symbol sym)
+    {
+        foreach (var pkgName in new[] { "DOTCL-INTERNAL", "DOTCL.CIL-COMPILER" })
+        {
+            var pkg = Package.FindPackage(pkgName);
+            if (pkg == null) continue;
+            var (listSym, status) = pkg.FindSymbol("*GLOBAL-SPECIALS*");
+            if (listSym == null || status == SymbolStatus.None) continue;
+            for (var cur = DynamicBindings.Get(listSym); cur is Cons c; cur = c.Cdr)
+                if (ReferenceEquals(c.Car, sym)) return true;
+            return false;
+        }
+        return false;
+    }
+
+    /// <summary>Whether SYM names a global symbol macro, as DEFINE-SYMBOL-MACRO
+    /// records it: in the runtime's table once loaded, and in the compiler's
+    /// table while only compiled so far.</summary>
+    private static bool IsGlobalSymbolMacro(Symbol sym)
+    {
+        if (Runtime.TryGetGlobalSymbolMacro(sym, out _)) return true;
+        foreach (var pkgName in new[] { "DOTCL-INTERNAL", "DOTCL.CIL-COMPILER" })
+        {
+            var pkg = Package.FindPackage(pkgName);
+            if (pkg == null) continue;
+            var (tableSym, status) = pkg.FindSymbol("*GLOBAL-SYMBOL-MACROS*");
+            if (tableSym != null && status != SymbolStatus.None
+                && tableSym.Value is LispHashTable table)
+                return table.TryGet(sym, out _);
+        }
+        return false;
+    }
 
     // (function-information function &optional env): likewise.
     public static LispObject FunctionInformation(LispObject[] args) => NoInfo();

@@ -5,7 +5,8 @@ using System;
 /// <summary>
 /// A Lisp condition that reached the .NET host: thrown by the non-interactive
 /// debugger hook (<see cref="DotclHost.SetThrowingDebuggerHook()"/>) when no
-/// Lisp handler took the condition.
+/// Lisp handler took the condition, and by the DotclHost entry points for an
+/// error the runtime raised itself while that hook is installed.
 ///
 /// The point of the type is that the condition survives the trip. A host that
 /// only reads <see cref="Exception.Message"/> gets the report string it would
@@ -58,6 +59,17 @@ public class DotclConditionException : Exception
     /// what the debugger would have printed.</summary>
     public DotclConditionException(LispObject condition)
         : base(ConditionText.Report(condition))
+    {
+        Condition = condition;
+        ConditionType = ConditionText.TypeName(condition);
+        ClrException = (condition as LispCondition)?.ClrException;
+    }
+
+    /// <summary>Wrap CONDITION, recording the exception that carried it this far
+    /// (a <see cref="LispErrorException"/> the runtime threw without running the
+    /// debugger hook) as <see cref="Exception.InnerException"/>.</summary>
+    public DotclConditionException(LispObject condition, Exception inner)
+        : base(ConditionText.Report(condition), inner)
     {
         Condition = condition;
         ConditionType = ConditionText.TypeName(condition);

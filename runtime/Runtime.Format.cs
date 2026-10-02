@@ -61,11 +61,18 @@ public static partial class Runtime
 
         if (dest is Nil)
         {
-            if (!_fmtToPretty)
+            // (format nil ...) writes to a fresh string, never to an enclosing
+            // pretty logical block: set the block's state aside, as for a ~mincol<
+            // segment. Otherwise a nested ~? or ~{ inside it flushed the text
+            // gathered so far to the block's stream and it went missing from the
+            // returned string.
+            if (!_pprintActive && !_fmtToPretty)
                 return new LispString(FormatStringTop(formatString, formatArgs2));
+            var suspended = PprintSuspend();
+            bool savedToPretty = _fmtToPretty;
             _fmtToPretty = false;
             try { return new LispString(FormatStringTop(formatString, formatArgs2)); }
-            finally { _fmtToPretty = true; }
+            finally { _fmtToPretty = savedToPretty; PprintResume(suspended); }
         }
 
         // Resolve the output stream to check AtLineStart
@@ -76,17 +83,30 @@ public static partial class Runtime
         while (resolved is LispEchoStream es2) resolved = es2.OutputStream;
         while (resolved is LispTwoWayStream tw2) resolved = tw2.OutputStream;
         while (resolved is LispSynonymStream syn2) resolved = DynamicBindings.Get(syn2.Symbol);
-        bool atLineStart = resolved is LispStream ls2 ? ls2.AtLineStart : true;
+        // A Gray stream answers for itself (STREAM-START-LINE-P), so ~& at the
+        // start of the control string is a fresh line on it as on any stream.
+        // Only asked when the control string can contain ~&.
+        bool atLineStart = resolved is LispStream ls2 ? ls2.AtLineStart
+            : resolved is LispInstance gsl && IsGrayOutputStream(gsl) ? (formatString.IndexOf('&') < 0 || GrayStartLineP(gsl))
+            : true;
 
         bool savedToPretty2 = _fmtToPretty;
         _fmtToPretty = IsStagedPrettyDest(resolved);
+        // A string output stream that is neither the stream of the enclosing
+        // pretty logical block nor a buffer staged for it is unrelated to that
+        // block, like the string of (format nil ...): set the block's state aside
+        // so a nested ~? does not flush this FORMAT's text to the block's stream.
+        PprintSuspendedState? suspended2 = null;
+        if (_pprintActive && !_fmtToPretty && resolved is LispStringOutputStream sos
+            && !ReferenceEquals(sos.Writer, _pprintStream))
+            suspended2 = PprintSuspend();
         string result2;
         try
         {
             result2 = FormatStringTop(formatString, formatArgs2, atLineStart,
                                       StreamInitialColumn(resolved));
         }
-        finally { _fmtToPretty = savedToPretty2; }
+        finally { PprintResume(suspended2); _fmtToPretty = savedToPretty2; }
 
         // Write result and update AtLineStart
         if (dest is T)
@@ -426,7 +446,7 @@ public static partial class Runtime
 
             // Round to computedD digits, from the round-trip decimal (same reason
             // as the d-specified branch below).
-            string formatted = RoundShortestToFixed(RoundTripText(absVal, isSingle), computedD);
+            string formatted = RoundShortestToFixed(ScaledRoundTripText(value, k, isSingle), computedD, Math.Abs(value), k);
             if (!formatted.Contains('.'))
                 formatted += ".";
 
@@ -475,7 +495,7 @@ public static partial class Runtime
             // "0.10000000000000000555", both of them the exact binary value
             // where SBCL pads the shortest decimal with zeros. Only ~G's own
             // calls took this path before.
-            string formatted = RoundShortestToFixed(RoundTripText(absVal, isSingle), d.Value);
+            string formatted = RoundShortestToFixed(ScaledRoundTripText(value, k, isSingle), d.Value, Math.Abs(value), k);
             // CLHS requires a decimal point even when d=0
             if (d.Value == 0 && !formatted.Contains('.'))
                 formatted += ".";
@@ -549,7 +569,25 @@ public static partial class Runtime
             ? ((float)absVal).ToString("R", System.Globalization.CultureInfo.InvariantCulture)
             : absVal.ToString("R", System.Globalization.CultureInfo.InvariantCulture);
 
-    private static string RoundShortestToFixed(string raw, int d)
+    /// <summary>The shortest round-trip digits of |VALUE| with the decimal point
+    /// moved K places: the digits ~F prints for scale factor K. Moving the point in
+    /// the digit string keeps them exact; multiplying the float by 10^K first
+    /// rounds, and printed 1.2345678901234567d20 at k=1 as ...68e21 where the
+    /// digits are ...67.</summary>
+    private static string ScaledRoundTripText(double value, int k, bool isSingle)
+    {
+        string raw = RoundTripText(Math.Abs(value), isSingle);
+        if (k == 0 || double.IsInfinity(value) || double.IsNaN(value)) return raw;
+        ExtractScientificDigits(raw, out var digits, out int msdExp);
+        if (digits == "0") return raw;
+        return digits.Substring(0, 1) + "." + digits.Substring(1) + "E"
+            + (msdExp + k).ToString(System.Globalization.CultureInfo.InvariantCulture);
+    }
+
+    /// <param name="exactAbs">The float being printed, before any scaling: the
+    /// value whose exact binary expansion decides a rounding tie.</param>
+    /// <param name="k">The ~F scale factor RAW has already been shifted by.</param>
+    private static string RoundShortestToFixed(string raw, int d, double exactAbs, int k = 0)
     {
         var fixedStr = (raw.Contains('E') || raw.Contains('e'))
             ? ExpandScientificToFixed(raw)
@@ -560,9 +598,22 @@ public static partial class Runtime
         if (frac.Length <= d)
             return intPart + (d == 0 ? "" : "." + frac.PadRight(d, '0'));
 
-        // Round half-up at position d, carrying through the digit string.
+        // Round at position d, carrying through the digit string. The shortest
+        // digits decide every case but one: when what is dropped is exactly "5",
+        // the shortest decimal sits on the midpoint but the float itself usually
+        // does not. 2.675d0 is really 2.67499999999999982..., so ~,2F must give
+        // "2.67" (as SBCL does), not "2.68". Only then look at the exact binary
+        // value; a true tie (0.125 to 2 places) rounds up, as SBCL does.
         var kept = (intPart + frac.Substring(0, d)).ToCharArray();
-        if (frac[d] >= '5')
+        bool roundUp;
+        if (frac[d] == '5' && !HasNonZeroAfter(frac, d + 1))
+            roundUp = CompareExactToDecimal(exactAbs,
+                          System.Numerics.BigInteger.Parse(new string(kept) + "5",
+                              System.Globalization.CultureInfo.InvariantCulture),
+                          d + 1 + k) >= 0;
+        else
+            roundUp = frac[d] >= '5';
+        if (roundUp)
         {
             int i = kept.Length - 1;
             while (i >= 0)
@@ -575,6 +626,26 @@ public static partial class Runtime
         var all = new string(kept);
         int intLen = all.Length - d;
         return d == 0 ? all : all.Substring(0, intLen) + "." + all.Substring(intLen);
+    }
+
+    /// <summary>Compare the exact binary value of the finite, non-negative double X
+    /// with the decimal N x 10^-SCALE: negative, zero or positive as X is below, at
+    /// or above it.</summary>
+    private static int CompareExactToDecimal(double x, System.Numerics.BigInteger n, int scale)
+    {
+        long bits = BitConverter.DoubleToInt64Bits(x);
+        int biased = (int)((bits >> 52) & 0x7FF);
+        long mant = bits & 0xFFFFFFFFFFFFFL;
+        int e;
+        if (biased == 0) e = -1074;
+        else { mant |= 1L << 52; e = biased - 1075; }
+        // x = mant * 2^e; compare mant * 2^e * 10^scale with n.
+        var lhs = new System.Numerics.BigInteger(mant);
+        var rhs = n;
+        if (scale >= 0) lhs *= System.Numerics.BigInteger.Pow(10, scale);
+        else rhs *= System.Numerics.BigInteger.Pow(10, -scale);
+        if (e >= 0) lhs <<= e; else rhs <<= -e;
+        return lhs.CompareTo(rhs);
     }
 
     private static string ExpandScientificToFixed(string raw)
@@ -1178,6 +1249,16 @@ public static partial class Runtime
                 // no applicable method: column unknown
             }
         }
+        // A string output stream holds its line: the column is the length of
+        // its text after the last newline.
+        if (resolved is LispStringOutputStream sos)
+        {
+            var text = ((System.IO.StringWriter)sos.Writer).GetStringBuilder();
+            int col = 0;
+            int k = text.Length - 1;
+            for (; k >= 0 && text[k] != '\n'; k--) col++;
+            return k < 0 ? sos.StartColumn + col : col;
+        }
         return 0;
     }
 
@@ -1195,7 +1276,12 @@ public static partial class Runtime
         while (resolved is LispEchoStream es2) resolved = es2.OutputStream;
         while (resolved is LispTwoWayStream tw2) resolved = tw2.OutputStream;
         while (resolved is LispSynonymStream syn2) resolved = DynamicBindings.Get(syn2.Symbol);
-        bool atLineStart = resolved is LispStream ls2 ? ls2.AtLineStart : true;
+        // A Gray stream answers for itself (STREAM-START-LINE-P), so ~& at the
+        // start of the control string is a fresh line on it as on any stream.
+        // Only asked when the control string can contain ~&.
+        bool atLineStart = resolved is LispStream ls2 ? ls2.AtLineStart
+            : resolved is LispInstance gsl && IsGrayOutputStream(gsl) ? (template.IndexOf('&') < 0 || GrayStartLineP(gsl))
+            : true;
 
         int argIdx = 0;
         string result;
@@ -1315,7 +1401,15 @@ public static partial class Runtime
 
     private static string FormatAestheticStaged(LispObject obj, System.Text.StringBuilder sb)
     {
-        if (!_pprintActive || _pprintStream == null) return FormatAesthetic(obj);
+        if (!_pprintActive || _pprintStream == null)
+        {
+            int startCol = FormatObjectStartColumn(sb);
+            if (startCol < 0) return FormatAesthetic(obj);
+            int saved = _printStartColumn;
+            _printStartColumn = startCol;
+            try { return FormatAesthetic(obj); }
+            finally { _printStartColumn = saved; }
+        }
         PprintPushStaged(sb);
         try { return FormatAesthetic(obj); }
         finally { PprintPopStaged(sb); }
@@ -1323,7 +1417,15 @@ public static partial class Runtime
 
     private static string FormatTopStaged(LispObject obj, bool escape, System.Text.StringBuilder sb)
     {
-        if (!_pprintActive || _pprintStream == null) return FormatTop(obj, escape);
+        if (!_pprintActive || _pprintStream == null)
+        {
+            int startCol = FormatObjectStartColumn(sb);
+            if (startCol < 0) return FormatTop(obj, escape);
+            int saved = _printStartColumn;
+            _printStartColumn = startCol;
+            try { return FormatTop(obj, escape); }
+            finally { _printStartColumn = saved; }
+        }
         PprintPushStaged(sb);
         try { return FormatTop(obj, escape); }
         finally { PprintPopStaged(sb); }
@@ -1477,9 +1579,37 @@ public static partial class Runtime
         }
     }
 
+    // How deep FormatStringCore is nested within the current FORMAT call, and the
+    // column the outermost one's text starts at: what a ~S / ~A of an object with
+    // a PRINT-OBJECT method is told as its start column. A nested body (~{, ~?,
+    // a logical block) builds text of its own, so only the outermost one answers.
+    [ThreadStatic] private static int _fmtCoreDepth;
+    [ThreadStatic] private static int _fmtCoreInitialColumn;
+
     private static string FormatStringCore(string template, LispObject[] args, ref int argIdx,
                                            System.Text.StringBuilder sb, bool streamAtLineStart = true,
                                            int initialColumn = 0)
+    {
+        int savedDepth = _fmtCoreDepth, savedInitCol = _fmtCoreInitialColumn;
+        _fmtCoreDepth = savedDepth + 1;
+        _fmtCoreInitialColumn = initialColumn;
+        try { return FormatStringCoreBody(template, args, ref argIdx, sb, streamAtLineStart, initialColumn); }
+        finally { _fmtCoreDepth = savedDepth; _fmtCoreInitialColumn = savedInitCol; }
+    }
+
+    /// <summary>The start column to tell a top-level object printed next into SB,
+    /// or -1 when unknown.</summary>
+    private static int FormatObjectStartColumn(System.Text.StringBuilder sb)
+    {
+        if (_fmtCoreDepth != 1 || _pprintActive) return -1;
+        int count = 0;
+        if (TailAfterNewline(sb, ref count)) return count;
+        return _fmtCoreInitialColumn + count;
+    }
+
+    private static string FormatStringCoreBody(string template, LispObject[] args, ref int argIdx,
+                                           System.Text.StringBuilder sb, bool streamAtLineStart,
+                                           int initialColumn)
     {
         int i = 0;
         while (i < template.Length)
@@ -1928,7 +2058,7 @@ public static partial class Runtime
                                 SingleFloat sfD => (double)sfD.Value,
                                 DoubleFloat dfD => dfD.Value,
                                 Fixnum fiD => (double)fiD.Value,
-                                Ratio raD => (double)raD.Numerator / (double)raD.Denominator,
+                                Ratio raD => Arithmetic.RatioToDouble(raD),
                                 _ => double.NaN
                             };
                             int dDecimalDigits = GetIntParam(0) ?? 2;
@@ -1947,8 +2077,14 @@ public static partial class Runtime
                                 bool negative = dDv < 0;
                                 double absVal = Math.Abs(dDv);
                                 // Format fractional part
-                                string fracStr = absVal.ToString("F" + dDecimalDigits,
-                                    System.Globalization.CultureInfo.InvariantCulture);
+                                // Same digits and rounding as ~F with d: .NET's "F"
+                                // format printed the exact binary value of a single
+                                // (1.5e12 as 1500000026624.00) and rounded an exact tie
+                                // to even (0.125 as 0.12), where SBCL gives 0.13.
+                                string fracStr = double.IsInfinity(absVal) || double.IsNaN(absVal)
+                                    ? absVal.ToString("F" + dDecimalDigits, System.Globalization.CultureInfo.InvariantCulture)
+                                    : RoundShortestToFixed(
+                                        RoundTripText(absVal, dArg is SingleFloat), dDecimalDigits, absVal);
                                 // Split integer and fractional
                                 int dotIdx = fracStr.IndexOf('.');
                                 string intPart = dotIdx >= 0 ? fracStr[..dotIdx] : fracStr;
@@ -1983,7 +2119,7 @@ public static partial class Runtime
                                 DoubleFloat df2 => df2.Value,
                                 Fixnum fi2 => fi2.Value,
                                 Bignum bg => (double)bg.Value,
-                                Ratio r => (double)r.Numerator / (double)r.Denominator,
+                                Ratio r => Arithmetic.RatioToDouble(r),
                                 _ => 0.0
                             };
                             int? fW = GetIntParam(0);
@@ -2010,7 +2146,7 @@ public static partial class Runtime
                                 DoubleFloat df3 => df3.Value,
                                 Fixnum fi3 => fi3.Value,
                                 Bignum bg3 => (double)bg3.Value,
-                                Ratio r3 => (double)r3.Numerator / (double)r3.Denominator,
+                                Ratio r3 => Arithmetic.RatioToDouble(r3),
                                 _ => 0.0
                             };
                             int? eW = GetIntParam(0);
@@ -2039,7 +2175,7 @@ public static partial class Runtime
                                 DoubleFloat df4 => df4.Value,
                                 Fixnum fi4 => fi4.Value,
                                 Bignum bg4 => (double)bg4.Value,
-                                Ratio r4 => (double)r4.Numerator / (double)r4.Denominator,
+                                Ratio r4 => Arithmetic.RatioToDouble(r4),
                                 _ => 0.0
                             };
                             int? gW = GetIntParam(0);
@@ -2373,8 +2509,10 @@ public static partial class Runtime
                                 }
                                 argIdx += subIdx;
                                 iterCount++;
-                                // If no args consumed, avoid infinite loop
-                                if (subIdx == 0) break;
+                                // A body that consumes nothing would loop forever
+                                // without a count; with one (~3{...~}) it repeats
+                                // that many times, as the count says.
+                                if (subIdx == 0 && maxIter < 0) break;
                             }
                         }
                         else if (colonMod)
@@ -2452,8 +2590,9 @@ public static partial class Runtime
                                     }
                                     elemIdx += subIdx;
                                     iterCount++;
-                                    // If no args consumed, avoid infinite loop
-                                    if (subIdx == 0) break;
+                                    // As for ~@{ above: stop on no progress only
+                                    // when there is no count to stop at.
+                                    if (subIdx == 0 && maxIter < 0) break;
                                 }
                             }
                         }
@@ -2825,6 +2964,15 @@ public static partial class Runtime
                                             // ~:; or ~@; means first section is per-line-prefix
                                             perLinePrefix = prefixStr;
                                         }
+                                        // Nested in a block that is buffering its conditional
+                                        // newlines: they are recorded as positions in that block's
+                                        // writer, so this block writes there too (after the text
+                                        // staged so far), rather than into a writer of its own whose
+                                        // positions would not match the buffer they are applied to.
+                                        bool sharedWriter = _pprintActive && _pprintBuffering
+                                            && _pprintStream is System.IO.StringWriter;
+                                        if (sharedWriter)
+                                            PprintStageFlush(sb);
                                         // Nested in another block: the column tracking has not seen
                                         // the text this body has staged in SB yet, nor this prefix.
                                         // Count both, so the block starts after its prefix and its
@@ -2840,15 +2988,23 @@ public static partial class Runtime
                                             PprintTrackWrite(prefixStr);
                                         }
                                         // Use a real StringWriter so XP buffering works
-                                        var blockWriter = new System.IO.StringWriter();
+                                        var blockWriter = sharedWriter
+                                            ? (System.IO.StringWriter)_pprintStream!
+                                            : new System.IO.StringWriter();
                                         blockWriter.Write(prefixStr);
                                         // Compute column offset from outer sb context
                                         int outerCol = 0;
+                                        bool outerNewline = false;
                                         for (int k = sb.Length - 1; k >= 0; k--)
                                         {
-                                            if (sb[k] == '\n') break;
+                                            if (sb[k] == '\n') { outerNewline = true; break; }
                                             outerCol++;
                                         }
+                                        // Outside any logical block, the line may have begun on
+                                        // the destination before this FORMAT: the block starts
+                                        // after that text, and its continuation lines line up
+                                        // there.
+                                        if (!outerNewline && !_pprintActive) outerCol += initialColumn;
                                         // Where the block's writer content starts, for ~T in its body.
                                         // Inside an enclosing FORMAT block, count what that one has
                                         // printed and staged too.
@@ -2856,8 +3012,9 @@ public static partial class Runtime
                                         Runtime.PprintStartBlock(blockWriter, prefixStr.Length, perLinePrefix, outerCol);
                                         if (suffixStr.Length > 0)
                                             Runtime.PprintSetBlockSuffix(suffixStr.Length);
-                                        (_fmtBlockStartCol ??= new())[blockWriter] =
-                                            haveStartCol ? blockStartCol : _pprintBlockColumn - prefixStr.Length;
+                                        if (!sharedWriter)
+                                            (_fmtBlockStartCol ??= new())[blockWriter] =
+                                                haveStartCol ? blockStartCol : _pprintBlockColumn - prefixStr.Length;
                                         bool savedToPretty = _fmtToPretty;
                                         try
                                         {
@@ -2879,11 +3036,19 @@ public static partial class Runtime
                                         }
                                         finally
                                         {
-                                            _fmtBlockStartCol?.Remove(blockWriter);
+                                            if (!sharedWriter) _fmtBlockStartCol?.Remove(blockWriter);
                                             Runtime.PprintEndBlock();
                                         }
-                                        sb.Append(blockWriter.ToString());
-                                        sb.Append(suffixStr);
+                                        if (sharedWriter)
+                                        {
+                                            blockWriter.Write(suffixStr);
+                                            PprintTrackWrite(suffixStr);
+                                        }
+                                        else
+                                        {
+                                            sb.Append(blockWriter.ToString());
+                                            sb.Append(suffixStr);
+                                        }
                                     }
                                     else
                                     {
@@ -3903,7 +4068,7 @@ public static partial class Runtime
                 int consumed = iterArgs.Length - tailLen;
                 elemIdx += consumed;
                 iterCount++;
-                if (consumed == 0) break;
+                if (consumed == 0 && maxIter < 0) break;
             }
         }
         else
@@ -3925,7 +4090,7 @@ public static partial class Runtime
                 }
                 elemIdx += subIdx;
                 iterCount++;
-                if (subIdx == 0) break;
+                if (subIdx == 0 && maxIter < 0) break;
             }
         }
     }

@@ -359,6 +359,12 @@ public static partial class Runtime
             if (allDigits) return true;
         }
 
+        // A potential number never ends with a sign (CLHS 2.3.1.1), so 1+ and
+        // 1- read back as symbols and need no escape. The checks below only
+        // look at how the name starts.
+        char last = name[name.Length - 1];
+        if (last == '+' || last == '-') return false;
+
         // Check for float patterns (base 10 only): digits with decimal point and/or exponent
         char first = name[0];
         // Starts with digit (base 10)
@@ -403,10 +409,8 @@ public static partial class Runtime
                 char f = name[0];
                 if (IsDigitInBase(f, radix) || f == '+' || f == '-' || f == '.' || f == '^' || f == '_')
                 {
-                    // Doesn't end with sign
-                    char last = name[name.Length - 1];
-                    if (last != '+' && last != '-')
-                        return true;
+                    // Doesn't end with sign (checked above)
+                    return true;
                 }
             }
         }
@@ -446,7 +450,12 @@ public static partial class Runtime
     public static string FormatObject(LispObject obj, bool escape)
     {
         // *print-circle* label check for compound objects
-        if (_circleTable != null && (obj is Cons || (obj is LispVector lv && !lv.IsCharVector) || obj is LispStruct))
+        // An object inside its own PRINT-OBJECT method (CALL-NEXT-METHOD, or the
+        // method printing the object itself) already has its #n= label written
+        // in front of the method's output: what it prints now is that object's
+        // text, not another reference to it.
+        if (_circleTable != null && (obj is Cons || (obj is LispVector lv && !lv.IsCharVector) || obj is LispStruct)
+            && !InOwnPrintObject(obj))
         {
             if (_circleTable.TryGetValue(obj, out int circState))
             {
@@ -635,6 +644,7 @@ public static partial class Runtime
                     bool isAtomicPrint = obj is LispVector av && (av.IsCharVector || av.IsBitVector);
                     // *print-circle* check for vectors/structs/instances
                     if (_circleTable != null && !(obj is LispVector cv && cv.IsCharVector)
+                        && !InOwnPrintObject(obj)
                         && _circleTable.TryGetValue(obj, out int vState))
                     {
                         if (vState < 0) return $"#{-vState}#";
@@ -682,30 +692,37 @@ public static partial class Runtime
     /// Uses :format-control/:format-arguments if available, otherwise the Message field.
     /// </summary>
     private static LispObject? InstanceFormatControl(LispInstance inst)
-        => inst.Class.SlotIndex.TryGetValue("FORMAT-CONTROL", out int idx)
+    {
+        inst.EnsureCurrent();
+        return inst.Class.SlotIndex.TryGetValue("FORMAT-CONTROL", out int idx)
            && idx < inst.Slots.Length ? inst.Slots[idx] : null;
+    }
 
     private static LispObject[] InstanceFormatArguments(LispInstance inst)
-        => inst.Class.SlotIndex.TryGetValue("FORMAT-ARGUMENTS", out int idx)
+    {
+        inst.EnsureCurrent();
+        return inst.Class.SlotIndex.TryGetValue("FORMAT-ARGUMENTS", out int idx)
            && idx < inst.Slots.Length && inst.Slots[idx] is Cons args
             ? Startup.ListToArray(args) : Array.Empty<LispObject>();
+    }
 
     private static string GetConditionReport(LispCondition cond)
     {
         // An instance MAKE-INSTANCE made and ERROR / SIGNAL wrapped afterwards
         // carries its format control in the slot only.
         if (cond.FormatControl is Nil && cond is LispInstanceCondition lic
-            && InstanceFormatControl(lic.Instance) is LispString ifc)
+            && InstanceFormatControl(lic.Instance) is LispObject ifc
+            && FormatControlText(ifc) is string ifcText)
         {
-            try { return FormatString(ifc.Value, InstanceFormatArguments(lic.Instance)); }
+            try { return FormatString(ifcText, InstanceFormatArguments(lic.Instance)); }
             catch { }
         }
-        if (cond.FormatControl is LispString fcs)
+        if (FormatControlText(cond.FormatControl) is string fcs)
         {
             var fmtArgs = cond.FormatArguments is Cons fac
                 ? Startup.ListToArray(fac)
                 : Array.Empty<LispObject>();
-            try { return FormatString(fcs.Value, fmtArgs); }
+            try { return FormatString(fcs, fmtArgs); }
             catch { }
         }
         return cond.Message;
@@ -1127,6 +1144,9 @@ public static partial class Runtime
     // Table states: 1=seen once, 0=seen twice+ (shared), negative=assigned label
     [ThreadStatic] private static Dictionary<object, int>? _circleTable;
     [ThreadStatic] private static int _circleLabelCounter;
+    // Set while a PRINT-OBJECT method runs to find out what it prints: every
+    // object printed by a separate call on its stream is scanned into it.
+    [ThreadStatic] private static Dictionary<object, int>? _circleCollect;
 
     private static bool GetPrintCircle()
     {
@@ -1305,6 +1325,9 @@ public static partial class Runtime
                 return;
             }
             table[inst] = 1;
+            // While collecting what a PRINT-OBJECT method prints, the instance
+            // reports its own parts as it prints them.
+            if (_circleCollect != null) return;
             foreach (var slot in inst.Slots)
                 if (slot != null) ScanCircle(slot, table);  // null = unbound slot
         }
@@ -1318,6 +1341,11 @@ public static partial class Runtime
     public static bool PprintCircleScan(LispObject list)
     {
         if (!GetPrintCircle()) return false;
+        if (_circleCollect != null && _circleTable == null)
+        {
+            ScanCircle(list, _circleCollect);
+            return false;
+        }
         if (_circleTable != null) return false; // already scanning
         if (!(list is Cons)) return false;
 
@@ -1420,9 +1448,39 @@ public static partial class Runtime
     /// </summary>
     public static string FormatTop(LispObject obj, bool escape)
     {
+        // Collecting pass of an enclosing PRINT-OBJECT method (below): record
+        // what this call prints, and print it without labels.
+        if (_circleCollect != null && _circleTable == null)
+        {
+            if (GetPrintCircle()) ScanCircle(obj, _circleCollect);
+            return FormatObject(obj, escape);
+        }
         // If circle detection already active (recursive call) or disabled, delegate
         if (!GetPrintCircle() || _circleTable != null)
             return FormatObject(obj, escape);
+
+        // A standard object is printed by its PRINT-OBJECT method, which prints
+        // its parts with separate calls on the stream it is handed; those calls
+        // share the labels of the outermost one (CLHS 22.1.3). Run the method
+        // once to collect what the calls print, then, only when something was
+        // printed more than once, again with labels.
+        if (obj is LispInstance)
+        {
+            var ctable = new Dictionary<object, int>(ReferenceEqualityComparer.Instance);
+            ctable[obj] = 1;
+            string first;
+            _circleCollect = ctable;
+            try { first = FormatObject(obj, escape); }
+            finally { _circleCollect = null; }
+            bool shared = false;
+            foreach (var kv in ctable)
+                if (kv.Value == 0) { shared = true; break; }
+            if (!shared) return first;
+            _circleTable = ctable;
+            _circleLabelCounter = 0;
+            try { return FormatObject(obj, escape); }
+            finally { _circleTable = null; }
+        }
 
         // Only compound objects need circle detection
         if (!(obj is Cons || (obj is LispVector v && !v.IsCharVector) || obj is LispStruct))
@@ -1611,6 +1669,44 @@ public static partial class Runtime
         => (_printObjectActive ??= new HashSet<object>(
                 System.Collections.Generic.ReferenceEqualityComparer.Instance)).Add(obj);
     private static void ExitPrintObject(object obj) => _printObjectActive?.Remove(obj);
+    private static bool InOwnPrintObject(object obj) => _printObjectActive != null && _printObjectActive.Contains(obj);
+
+    // The column of the destination's line where the object being printed at
+    // top level starts, or -1 when not known (or when a pretty logical block
+    // tracks the column itself).
+    [System.ThreadStatic] private static int _printStartColumn = -1;
+
+    /// <summary>FormatTop for output to the stream designator DEST: a PRINT-OBJECT
+    /// method of the object is handed a buffer that knows the column the text
+    /// will start at.</summary>
+    internal static string FormatTopTo(LispObject obj, bool escape, LispObject dest)
+    {
+        if (_pprintActive) return FormatTop(obj, escape);
+        int saved = _printStartColumn;
+        _printStartColumn = DestinationColumn(dest);
+        try { return FormatTop(obj, escape); }
+        finally { _printStartColumn = saved; }
+    }
+
+    /// <summary>The current column of output stream designator DEST, as FORMAT
+    /// takes it (0 when unknown).</summary>
+    private static int DestinationColumn(LispObject dest)
+    {
+        LispObject s = dest;
+        if (s is Nil)
+            s = DynamicBindings.TryGet(Startup.Sym("*STANDARD-OUTPUT*"), out var so) ? so : Startup.Sym("*STANDARD-OUTPUT*").Value!;
+        else if (s is T)
+            s = DynamicBindings.TryGet(Startup.Sym("*TERMINAL-IO*"), out var tio) ? tio : Startup.Sym("*TERMINAL-IO*").Value!;
+        for (int guard = 0; guard < 16; guard++)
+        {
+            if (s is LispEchoStream es) s = es.OutputStream;
+            else if (s is LispTwoWayStream tw) s = tw.OutputStream;
+            else if (s is LispSynonymStream syn) s = DynamicBindings.Get(syn.Symbol);
+            else break;
+        }
+        try { return StreamInitialColumn(s); }
+        catch (LispErrorException) { return 0; }
+    }
 
     /// <summary>Invoke a user PRINT-OBJECT method, binding the Lisp dynamic *PRINT-ESCAPE*
     /// to the printer's current ESCAPE so the method sees the value princ/prin1/~A/~S
@@ -1625,6 +1721,10 @@ public static partial class Runtime
         {
             var sw = new System.IO.StringWriter();
             var stream = new LispStringOutputStream(sw);
+            // The object printed at top level starts where the destination's line
+            // is: a logical block the method opens there lines up with it.
+            if (_printStartColumn >= 0 && _formatConsDepth == 1)
+                stream.StartColumn = _printStartColumn;
             PprintPushStaged(sw.GetStringBuilder());
             try { gf.Invoke(new LispObject[] { obj, stream }); }
             finally { PprintPopStaged(sw.GetStringBuilder()); }
@@ -1679,8 +1779,9 @@ public static partial class Runtime
                 // instead) still reports under princ / ~A from its format control. Checked
                 // before *print-readably*: with escape off SBCL reports then too.
                 if (!escape && IsConditionClass(inst.Class)
-                    && InstanceFormatControl(inst) is LispString fcStr)
-                    return FormatString(fcStr.Value, InstanceFormatArguments(inst));
+                    && InstanceFormatControl(inst) is LispObject fcObj
+                    && FormatControlText(fcObj) is string fcStr)
+                    return FormatString(fcStr, InstanceFormatArguments(inst));
                 // The default method prints #<...>, which does not read back. Under
                 // *print-readably* CLHS (PRINT-UNREADABLE-OBJECT, 22.1.3) wants
                 // PRINT-NOT-READABLE instead. This is also where a user method's
@@ -1770,7 +1871,9 @@ public static partial class Runtime
         Symbol[]? slotNames = cls?.StructSlotNames;
 
         var sb = new System.Text.StringBuilder("#S(");
-        sb.Append(st.TypeName.Name);
+        // The type name prints as any symbol does: with its package prefix when
+        // it is not accessible in *PACKAGE*, so the #S form reads back.
+        sb.Append(FormatObject(st.TypeName, escape));
 
         int slotCount = st.SlotCount;
         int limit = printLength.HasValue ? Math.Min(printLength.Value, slotCount) : slotCount;
@@ -2056,7 +2159,7 @@ public static partial class Runtime
     public static LispObject Prin12(LispObject obj, LispObject stream)
     {
         var w = GetOutputWriter(stream);
-        var text = FormatTop(obj, true);
+        var text = FormatTopTo(obj, true, stream);
         w.Write(text);
         PprintTrackWrite(text);
         w.Flush();
@@ -2111,7 +2214,7 @@ public static partial class Runtime
         try
         {
             var w = GetOutputWriter(stream);
-            var text = FormatTop(obj, false);
+            var text = FormatTopTo(obj, false, stream);
             w.Write(text);
             PprintTrackWrite(text);
             w.Flush();
@@ -2301,12 +2404,67 @@ public static partial class Runtime
             stream = args[0] is T ? DynamicBindings.Get(Startup.Sym("*TERMINAL-IO*")) : args[0];
         else
             stream = DynamicBindings.Get(Startup.Sym("*STANDARD-OUTPUT*"));
+        if (GrayTerpri(stream)) return Nil.Instance;
         var writer = GetTextWriter(stream);
         writer.Write('\n');
-        PprintTrackWriteChar('\n');
         Runtime.UpdateAtLineStart(stream, '\n');
+        if (PprintUnrelatedWriter(writer)) return Nil.Instance;
+        PprintTrackWriteChar('\n');
         PprintAfterNewline(writer);
         return Nil.Instance;
+    }
+
+    /// <summary>
+    /// The Gray output stream a designator writes to, looking through synonym,
+    /// two-way and echo streams; null when the output side is not a Gray
+    /// character output stream.
+    /// </summary>
+    internal static LispInstance? ResolveGrayOutput(LispObject stream)
+    {
+        var s = stream;
+        for (int depth = 0; depth < 64; depth++)
+        {
+            switch (s)
+            {
+                case LispSynonymStream syn: s = DynamicBindings.Get(syn.Symbol); continue;
+                case LispTwoWayStream tw: s = tw.OutputStream; continue;
+                case LispEchoStream es: s = es.OutputStream; continue;
+                case LispInstance gi when IsGrayOutputStream(gi): return gi;
+                default: return null;
+            }
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// TERPRI on a Gray stream is STREAM-TERPRI, which a stream may specialize
+    /// (to track its column, or to write a different line ending). Returns
+    /// false when STREAM is not a Gray stream, so the caller writes the newline
+    /// itself.
+    /// </summary>
+    internal static bool GrayTerpri(LispObject stream)
+    {
+        var gi = ResolveGrayOutput(stream);
+        if (gi == null) return false;
+        var fn = GrayStreamLookup.GrayOrCl("STREAM-TERPRI");
+        if (fn == null) return false;
+        fn.Invoke(new LispObject[] { gi });
+        PprintTrackWriteChar('\n');
+        PprintAfterNewline(GetTextWriter(stream));
+        return true;
+    }
+
+    /// <summary>
+    /// Whether a Gray stream is at the start of a line, per STREAM-START-LINE-P.
+    /// A stream that cannot answer (no applicable method) counts as at the start,
+    /// which is what was assumed for every Gray stream before.
+    /// </summary>
+    internal static bool GrayStartLineP(LispInstance gi)
+    {
+        var fn = GrayStreamLookup.GrayOrCl("STREAM-START-LINE-P");
+        if (fn == null) return true;
+        try { return fn.Invoke(new LispObject[] { gi }) is not Nil; }
+        catch (LispErrorException) { return true; }
     }
 
     public static LispObject FreshLine(LispObject[] args)
@@ -2317,6 +2475,23 @@ public static partial class Runtime
             stream = args[0] is T ? DynamicBindings.Get(Startup.Sym("*TERMINAL-IO*")) : args[0];
         else
             stream = DynamicBindings.Get(Startup.Sym("*STANDARD-OUTPUT*"));
+
+        // A Gray stream decides for itself whether it is at the start of a
+        // line: FRESH-LINE is STREAM-FRESH-LINE there, whose default asks
+        // STREAM-START-LINE-P. Writing a newline through the TextWriter bridge
+        // instead ignored a stream that tracks its own column.
+        var grayOut = ResolveGrayOutput(stream);
+        if (grayOut != null)
+        {
+            var freshFn = GrayStreamLookup.GrayOrCl("STREAM-FRESH-LINE");
+            if (freshFn != null)
+            {
+                if (freshFn.Invoke(new LispObject[] { grayOut }) is Nil) return Nil.Instance;
+                PprintTrackWriteChar('\n');
+                PprintAfterNewline(GetTextWriter(stream));
+                return T.Instance;
+            }
+        }
 
         // Resolve to the actual output stream for AtLineStart check
         LispObject resolved = stream;
@@ -2341,6 +2516,7 @@ public static partial class Runtime
         var writer = GetTextWriter(stream);
         writer.Write('\n');
         Runtime.UpdateAtLineStart(stream, '\n');
+        if (PprintUnrelatedWriter(writer)) return T.Instance;
         // Inside a logical block the new line starts with the per-line prefixes,
         // as after TERPRI.
         PprintTrackWriteChar('\n');
@@ -2477,7 +2653,7 @@ public static partial class Runtime
             try {
                 // Use FormatTop which respects print variables including *print-circle*
                 bool escape = Runtime.GetPrintEscapePublic();
-                var text = Runtime.FormatTop(obj, escape);
+                var text = Runtime.FormatTopTo(obj, escape, streamArg ?? Nil.Instance);
                 Runtime.PprintFlushPendingBreak(writer);
                 writer.Write(text);
                 Runtime.PprintTrackWrite(text);
@@ -2606,7 +2782,19 @@ public static partial class Runtime
             var w = Runtime.GetOutputWriter(stream);
             int prefixLen = args[1] is Fixnum fx ? (int)fx.Value : 0;
             string? perLinePrefix = args.Length > 2 && args[2] is LispString plp ? plp.Value : null;
-            Runtime.PprintStartBlock(w, prefixLen, perLinePrefix);
+            // The buffer a PRINT-OBJECT method is handed knows the column its
+            // text starts at on the destination; a block opened on its first
+            // line starts that much further right.
+            int offset = 0;
+            if (!_pprintActive && stream is LispStringOutputStream sos
+                && sos.StartColumn > 0 && w is System.IO.StringWriter sw0)
+            {
+                var sb0 = sw0.GetStringBuilder();
+                int k = sb0.Length - 1;
+                while (k >= 0 && sb0[k] != '\n') k--;
+                if (k < 0) offset = sos.StartColumn;
+            }
+            Runtime.PprintStartBlock(w, prefixLen, perLinePrefix, offset);
             return Nil.Instance;
         }, "%PPRINT-START-BLOCK", -1));
         // %PPRINT-END-BLOCK: internal helper () -> NIL
@@ -2767,7 +2955,7 @@ public static partial class Runtime
                     Fixnum f => (double)f.Value,
                     SingleFloat sf => (double)sf.Value,
                     DoubleFloat df => df.Value,
-                    Ratio r => (double)r.Numerator / (double)r.Denominator,
+                    Ratio r => Arithmetic.RatioToDouble(r),
                     Bignum b => (double)b.Value,
                     _ => throw new LispErrorException(new LispTypeError(
                         $"SET-PPRINT-DISPATCH: priority must be a real number, got {prio}", prio, Startup.Sym("REAL")))

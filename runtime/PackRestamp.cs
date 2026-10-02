@@ -506,6 +506,43 @@ static class PackRestamp
         return SaveXml(doc);
     }
 
+    /// <summary>
+    /// Fill the nuspec of a library package (one written by `dotcl pack --library`)
+    /// with the metadata the tool path also writes: license expression, project and
+    /// repository urls, tags, copyright, and an embedded README. The package's own
+    /// id, version, authors, description and dependencies are already in place;
+    /// those given in META replace them where set.
+    /// </summary>
+    public static void ApplyLibraryMeta(string nupkgPath, Meta meta)
+    {
+        using var zip = ZipFile.Open(nupkgPath, ZipArchiveMode.Update);
+        var nuspecEntry = zip.Entries.FirstOrDefault(e =>
+            e.FullName.IndexOf('/') < 0 && e.FullName.EndsWith(".nuspec", StringComparison.OrdinalIgnoreCase))
+            ?? throw new InvalidOperationException("the package has no nuspec");
+        var doc = LoadXml(ReadAll(nuspecEntry));
+        var md = doc.Root?.Elements().FirstOrDefault(e => e.Name.LocalName == "metadata")
+            ?? throw new InvalidOperationException("nuspec has no <metadata>");
+        if (meta.Description != null) SetOrCreateChild(md, "description", meta.Description);
+        if (meta.ProjectUrl != null) SetOrCreateChild(md, "projectUrl", meta.ProjectUrl);
+        if (meta.Authors != null) SetOrCreateChild(md, "authors", meta.Authors);
+        if (meta.Copyright != null) SetOrCreateChild(md, "copyright", meta.Copyright);
+        if (meta.Tags != null) SetOrCreateChild(md, "tags", NormalizeTags(meta.Tags));
+        if (meta.License != null) SetLicenseExpression(md, meta.License);
+        if (meta.RepositoryUrl != null) SetRepository(md, meta.RepositoryUrl, meta.RepositoryCommit);
+        if (meta.ReadmePath != null)
+        {
+            const string readmeName = "README.md";
+            SetOrCreateChild(md, "readme", readmeName);
+            zip.GetEntry(readmeName)?.Delete();
+            WriteEntry(zip, readmeName, File.ReadAllBytes(meta.ReadmePath),
+                       SourceTimestamp(meta.ReadmePath));
+        }
+        var name = nuspecEntry.FullName;
+        var bytes = SaveXml(doc);
+        nuspecEntry.Delete();
+        WriteEntry(zip, name, bytes, new DateTimeOffset(DateTime.UtcNow, TimeSpan.Zero));
+    }
+
     static XDocument LoadXml(byte[] bytes)
     {
         using var ms = new MemoryStream(bytes);

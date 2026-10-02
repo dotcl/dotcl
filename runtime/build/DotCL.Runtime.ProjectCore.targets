@@ -35,6 +35,9 @@
          shared output directory. -->
     <DotclProjectManifest>$(DotclBundleDir)$(MSBuildProjectName).deps.txt</DotclProjectManifest>
     <DotclRootFasl>$(DotclBundleDir)$(MSBuildProjectName).fasl</DotclRootFasl>
+    <!-- Written by the root compile beside the fasl: an ILLink descriptor for the
+         .NET types the Lisp sources name (see _DotCLTrimmerRoots). -->
+    <DotclTrimDescriptor>$(DotclBundleDir)$(MSBuildProjectName).trim.xml</DotclTrimDescriptor>
 
     <!-- Emit a Portable PDB (source-debuggable .lisp) on a Debug build. Defaults
          from $(Configuration); a consumer can force it either way by setting
@@ -105,7 +108,7 @@
           BeforeTargets="GetCopyToOutputDirectoryItems;_CollectAssetPackFiles;_GenerateAndroidAssetsDir;_CollectMauiAssetsTargetFramework;BeforeBuild"
           Condition="'$(DotclProjectAsd)' != ''"
           Inputs="@(_DotclRootSource);$(DotclProjectAsd);@(DotclBuildInit);@(DotclAsdSearchPath)"
-          Outputs="$(DotclRootFasl)">
+          Outputs="$(DotclRootFasl);$(DotclTrimDescriptor)">
     <DotclCompileProject Asd="$(DotclProjectAsd)"
                          Output="$(DotclRootFasl)"
                          BaseCore="$(DotclBaseCore)"
@@ -114,7 +117,8 @@
                          AsdSearchPath="@(DotclAsdSearchPath)"
                          ReferencePath="@(ReferenceCopyLocalPaths)"
                          RuntimeAssemblyPath="$(_DotCLRuntimeAssembly)"
-                         DebugInfo="$(DotclDebugInfo)" />
+                         DebugInfo="$(DotclDebugInfo)"
+                         AppAssemblyName="$(AssemblyName)" />
   </Target>
 
   <!-- Step 5: write the deployment manifest (base core, deps, root fasl) using
@@ -175,6 +179,21 @@
         <Link>dotcl-fasl/%(Filename)%(Extension)</Link>
         <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       </None>
+    </ItemGroup>
+  </Target>
+
+  <!-- Step 7: a trimmed publish (PublishTrimmed / PublishAot). The fasl reaches
+       the .NET types it names (dotnet:new "T", dotnet:static "T" ...) only through
+       reflection at run time, so the trimmer sees no use of them and removes
+       them. The root compile writes a descriptor listing those types; hand it to
+       the trimmer. A type named by a string built at run time cannot be seen
+       here; root it yourself (TrimmerRootDescriptor / TrimmerRootAssembly).
+       Opt out with <DotclTrimmerRoots>false</DotclTrimmerRoots>. -->
+  <Target Name="_DotCLTrimmerRoots"
+          BeforeTargets="PrepareForILLink"
+          Condition="'$(DotclProjectAsd)' != '' and '$(DotclTrimmerRoots)' != 'false'">
+    <ItemGroup>
+      <TrimmerRootDescriptor Include="$(DotclTrimDescriptor)" Condition="Exists('$(DotclTrimDescriptor)')" />
     </ItemGroup>
   </Target>
 

@@ -161,6 +161,20 @@ public static partial class Runtime
             $"{context}: *PACKAGE* is not a package: {v}", v, Startup.Sym("PACKAGE")));
     }
 
+    /// <summary>The package a name designates: a local nickname of the current
+    /// package first, then the global names. Every package designator given as
+    /// a name resolves through here, so FIND-SYMBOL, INTERN and the rest see the
+    /// same package FIND-PACKAGE and the reader do.</summary>
+    internal static Package? FindPackageNamed(string name)
+    {
+        if (DynamicBindings.Get(Startup.Sym("*PACKAGE*")) is Package cur && cur.HasLocalNicknames)
+        {
+            var local = cur.FindLocalNickname(name);
+            if (local != null) return local;
+        }
+        return Package.FindPackage(name);
+    }
+
     private static Package ResolvePackage(LispObject pkg, string context)
     {
         if (pkg is Package pp) return pp;
@@ -170,7 +184,7 @@ public static partial class Runtime
         else if (pkg is LispChar lc) name = lc.Value.ToString();
         else if (pkg is LispVector v && v.IsCharVector) name = v.ToCharString();
         else name = pkg.ToString()!;
-        var found = Package.FindPackage(name);
+        var found = FindPackageNamed(name);
         if (found != null) return found;
         var err = new LispError($"{context}: no package named {name}");
         err.ConditionTypeName = "PACKAGE-ERROR";
@@ -248,9 +262,7 @@ public static partial class Runtime
         else if (name is LispVector v && v.IsCharVector) pkgName = v.ToCharString();
         else pkgName = name.ToString()!;
         // Check local nicknames of *package* first (SBCL compat: find-package resolves local nicknames)
-        var curPkg = DynamicBindings.Get(Startup.Sym("*PACKAGE*")) as Package;
-        var pkg = curPkg?.FindLocalNickname(pkgName) ?? Package.FindPackage(pkgName);
-        return pkg ?? (LispObject)Nil.Instance;
+        return FindPackageNamed(pkgName) ?? (LispObject)Nil.Instance;
     }
 
     public static LispObject PackageErrorPackage(LispObject condition)
@@ -334,26 +346,102 @@ public static partial class Runtime
                 Startup.Sym("CHARACTER"));
 
     // Local nickname API (CDR 5 / SBCL package-local-nicknames)
+    private static string LocalNicknameDesignator(LispObject nick, string context)
+    {
+        switch (nick)
+        {
+            case LispString ns: return ns.Value;
+            case Symbol nsym: return nsym.Name;
+            case LispChar nc: return nc.Value.ToString();
+            case LispVector nv when nv.IsCharVector: return nv.ToCharString();
+            default:
+                throw new LispErrorException(new LispTypeError(
+                    $"{context}: nickname must be a string designator",
+                    nick, StringDesignatorType()));
+        }
+    }
+
+    /// <summary>Signal a PACKAGE-ERROR with a CONTINUE restart. Returns true when
+    /// CONTINUE was taken; any other way out unwinds past the caller.</summary>
+    private static bool PackageCerror(Package pkg, string restartDescription,
+                                      string control, params LispObject[] formatArgs)
+    {
+        var restart = new LispRestart("CONTINUE", _ => Nil.Instance,
+                                      description: restartDescription);
+        RestartClusterStack.PushCluster(new[] { restart });
+        try
+        {
+            LispObject argList = Nil.Instance;
+            for (int i = formatArgs.Length - 1; i >= 0; i--)
+                argList = new Cons(formatArgs[i], argList);
+            var condition = MakeConditionFromType(
+                Startup.Sym("SIMPLE-PACKAGE-ERROR"),
+                new LispObject[] {
+                    Startup.Keyword("PACKAGE"), pkg,
+                    Startup.Keyword("FORMAT-CONTROL"), new LispString(control),
+                    Startup.Keyword("FORMAT-ARGUMENTS"), argList
+                });
+            ConditionSystem.Error(condition);
+            return false;
+        }
+        catch (RestartInvocationException rie) when (ReferenceEquals(rie.Tag, restart.Tag))
+        {
+            return true;
+        }
+        finally
+        {
+            RestartClusterStack.PopCluster();
+        }
+    }
+
+    // Local nickname API (CDR 5 / SBCL package-local-nicknames)
     public static LispObject AddPackageLocalNickname(LispObject nick, LispObject actual, LispObject pkg)
     {
-        var nickname = nick is LispString ns ? ns.Value : (nick is Symbol nsym ? nsym.Name : null);
-        if (nickname == null)
-            throw new LispErrorException(new LispTypeError(
-                "ADD-PACKAGE-LOCAL-NICKNAME: nickname must be a string designator",
-                nick, StringDesignatorType()));
-        var actualPkg = ResolvePackage(actual, "ADD-PACKAGE-LOCAL-NICKNAME");
-        var targetPkg = ResolvePackage(pkg, "ADD-PACKAGE-LOCAL-NICKNAME");
+        const string ctx = "ADD-PACKAGE-LOCAL-NICKNAME";
+        var nickname = LocalNicknameDesignator(nick, ctx);
+        var targetPkg = ResolvePackage(pkg, ctx);
+        // The actual package is named as TARGET would name it, so one of its
+        // own local nicknames may be used.
+        Package actualPkg;
+        if (actual is Package ap) actualPkg = ap;
+        else
+        {
+            var actualName = ToStringDesignator(actual);
+            actualPkg = targetPkg.FindLocalNickname(actualName)
+                        ?? ResolvePackage(actual, ctx);
+        }
+        var nickStr = new LispString(nickname);
+        var actualName2 = new LispString(actualPkg.Name);
+        if (nickname is "CL" or "COMMON-LISP" or "KEYWORD")
+            PackageCerror(targetPkg, "Use it as a local nickname anyway.",
+                "Attempt to use ~A as a package local nickname (for ~A).",
+                nickStr, actualName2);
+        if (nickname == targetPkg.Name)
+            PackageCerror(targetPkg, "Use it as a local nickname anyway.",
+                "Attempt to use ~A as a package local nickname (for ~A) in the package named globally ~A.",
+                nickStr, actualName2, nickStr);
+        if (targetPkg.Nicknames.Contains(nickname))
+            PackageCerror(targetPkg, "Use it as a local nickname anyway.",
+                "Attempt to use ~A as a package local nickname (for ~A) in the package nicknamed globally ~A.",
+                nickStr, actualName2, nickStr);
+        var existing = targetPkg.FindLocalNickname(nickname);
+        if (existing != null)
+        {
+            if (!ReferenceEquals(existing, actualPkg))
+                PackageCerror(targetPkg,
+                    $"Keep {nickname} as a local nickname for {existing.Name}.",
+                    "Cannot add ~A as a local nickname for ~A in ~A: already a nickname for ~A.",
+                    nickStr, actualName2, new LispString(targetPkg.Name),
+                    new LispString(existing.Name));
+            return targetPkg;
+        }
         targetPkg.AddLocalNickname(nickname, actualPkg);
         return targetPkg;
     }
 
     public static LispObject RemovePackageLocalNickname(LispObject nick, LispObject pkg)
     {
-        var nickname = nick is LispString ns ? ns.Value : (nick is Symbol nsym ? nsym.Name : null);
-        if (nickname == null)
-            throw new LispErrorException(new LispTypeError(
-                "REMOVE-PACKAGE-LOCAL-NICKNAME: nickname must be a string designator",
-                nick, StringDesignatorType()));
+        var nickname = LocalNicknameDesignator(nick, "REMOVE-PACKAGE-LOCAL-NICKNAME");
         var targetPkg = ResolvePackage(pkg, "REMOVE-PACKAGE-LOCAL-NICKNAME");
         return targetPkg.RemoveLocalNickname(nickname) ? T.Instance : Nil.Instance;
     }
@@ -414,10 +502,10 @@ public static partial class Runtime
         };
         Package p;
         if (pkg is Package pp) p = pp;
-        else if (pkg is LispString ps) p = Package.FindPackage(ps.Value) ?? throw new LispErrorException(new LispError($"Package not found: {ps.Value}"));
-        else if (pkg is Symbol psym) p = Package.FindPackage(psym.Name) ?? throw new LispErrorException(new LispError($"Package not found: {psym.Name}"));
-        else if (pkg is LispChar pc) { var pn = pc.Value.ToString(); p = Package.FindPackage(pn) ?? throw new LispErrorException(new LispError($"Package not found: {pn}")); }
-        else if (pkg is LispVector pv && pv.IsCharVector) { var pn = pv.ToCharString(); p = Package.FindPackage(pn) ?? throw new LispErrorException(new LispError($"Package not found: {pn}")); }
+        else if (pkg is LispString ps) p = FindPackageNamed(ps.Value) ?? throw new LispErrorException(new LispError($"Package not found: {ps.Value}"));
+        else if (pkg is Symbol psym) p = FindPackageNamed(psym.Name) ?? throw new LispErrorException(new LispError($"Package not found: {psym.Name}"));
+        else if (pkg is LispChar pc) { var pn = pc.Value.ToString(); p = FindPackageNamed(pn) ?? throw new LispErrorException(new LispError($"Package not found: {pn}")); }
+        else if (pkg is LispVector pv && pv.IsCharVector) { var pn = pv.ToCharString(); p = FindPackageNamed(pn) ?? throw new LispErrorException(new LispError($"Package not found: {pn}")); }
         else if (pkg is Nil) p = CurrentPackage("INTERN");
         else throw new LispErrorException(new LispTypeError("INTERN: invalid package designator", pkg));
 
@@ -616,7 +704,7 @@ public static partial class Runtime
         else
         {
             string n = ToPackageName(name);
-            pkg = Package.FindPackage(n);
+            pkg = FindPackageNamed(n);
             if (pkg == null)
             {
                 var restart = new LispRestart("CONTINUE",
@@ -691,6 +779,10 @@ public static partial class Runtime
 
         // 3-8. Perform the actual deletion
         pkg.PerformDelete();
+        // A deleted package neither has local nicknames nor is one.
+        pkg.ClearLocalNicknames();
+        foreach (var other in Package.AllPackages)
+            if (other.HasLocalNicknames) other.RemoveLocalNicknamesFor(pkg);
         return T.Instance;
     }
 

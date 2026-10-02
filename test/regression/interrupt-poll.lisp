@@ -7,7 +7,15 @@
 ;;; (declare (optimize (safety 0))) in the enclosing body opts the loops out.
 ;;; ConditionSystem.PollCount is a diagnostic counter; the tests read its
 ;;; delta, which is immune to some OTHER call consuming the pending-interrupt
-;;; flag first.
+;;; flag first. It counts only while ConditionSystem.CountPolls is set: it is
+;;; one location shared by every thread, and writing it on each iteration made
+;;; threads running loops at the same time slow each other down.
+
+(defmacro %with-poll-counting (&body body)
+  `(progn
+     (setf (dotnet:static "DotCL.ConditionSystem" "CountPolls") t)
+     (unwind-protect (progn ,@body)
+       (setf (dotnet:static "DotCL.ConditionSystem" "CountPolls") nil))))
 
 ;; A pending interrupt stops a call-free loop. If the poll is broken this
 ;; hangs the suite rather than passing silently: that is the point.
@@ -20,10 +28,11 @@
 
 ;; Every iteration of a call-free dotimes passes the safepoint.
 (deftest interrupt-poll.callfree-loop-polls
-  (let ((before (dotnet:static "DotCL.ConditionSystem" "PollCount"))
-        (s 0))
-    (dotimes (i 1000) (setq s (+ s 1)))
-    (>= (- (dotnet:static "DotCL.ConditionSystem" "PollCount") before) 1000))
+  (%with-poll-counting
+    (let ((before (dotnet:static "DotCL.ConditionSystem" "PollCount"))
+          (s 0))
+      (dotimes (i 1000) (setq s (+ s 1)))
+      (>= (- (dotnet:static "DotCL.ConditionSystem" "PollCount") before) 1000)))
   t)
 
 ;; (optimize (safety 0)) opts the body's loops out: the same shape adds
@@ -35,9 +44,10 @@
     s))
 
 (deftest-compiled-only interrupt-poll.safety0-opts-out
-  (let ((before (dotnet:static "DotCL.ConditionSystem" "PollCount")))
-    (%s575-nopoll-spin)
-    (< (- (dotnet:static "DotCL.ConditionSystem" "PollCount") before) 1000))
+  (%with-poll-counting
+    (let ((before (dotnet:static "DotCL.ConditionSystem" "PollCount")))
+      (%s575-nopoll-spin)
+      (< (- (dotnet:static "DotCL.ConditionSystem" "PollCount") before) 1000)))
   t)
 
 ;; A TCO'd self-call loop is a loop too: its back-branch polls.
@@ -45,9 +55,27 @@
   (if (>= i n) i (%s575-tco-count (+ i 1) n)))
 
 (deftest interrupt-poll.tco-loop-polls
-  (let ((before (dotnet:static "DotCL.ConditionSystem" "PollCount")))
-    (%s575-tco-count 0 1000)
-    (>= (- (dotnet:static "DotCL.ConditionSystem" "PollCount") before) 999))
+  (%with-poll-counting
+    (let ((before (dotnet:static "DotCL.ConditionSystem" "PollCount")))
+      (%s575-tco-count 0 1000)
+      (>= (- (dotnet:static "DotCL.ConditionSystem" "PollCount") before) 999)))
+  t)
+
+;; Normally the poll writes nothing shared: with counting off, loops on this
+;; thread and on two others leave PollCount where it was. (The poll still runs:
+;; the tests above and the interrupt tests below need it.)
+(defun %s1032-spin (n)
+  (let ((s 0)) (dotimes (i n s) (setq s (logand (+ s i) #xffff)))))
+
+(deftest interrupt-poll.no-shared-write-when-not-counting
+  (progn
+    (setf (dotnet:static "DotCL.ConditionSystem" "CountPolls") nil)
+    (let ((before (dotnet:static "DotCL.ConditionSystem" "PollCount")))
+      (%s1032-spin 100000)
+      (let ((ths (list (dotcl:make-thread (lambda () (%s1032-spin 100000)))
+                       (dotcl:make-thread (lambda () (%s1032-spin 100000))))))
+        (mapc #'dotcl:thread-join ths))
+      (= before (dotnet:static "DotCL.ConditionSystem" "PollCount"))))
   t)
 
 ;; Tier 2: INTERRUPT-THREAD reaches a thread that is COMPUTING (spinning in a

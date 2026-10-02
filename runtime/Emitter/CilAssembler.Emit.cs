@@ -27,6 +27,9 @@ public partial class CilAssembler
     internal bool _faslMode;
     // TypeBuilder for FASL mode: used to define closure body methods
     internal TypeBuilder? _faslTypeBuilder;
+    // The shared body of the &key function whose typed entry this assembler is
+    // building (SIL :call-key-shared). Null everywhere else.
+    internal MethodInfo? _keyShared;
     private static int _faslClosureCount;
 
     // Debug info: when non-null, a (:line SL SC EL EC) instruction records
@@ -101,7 +104,9 @@ public partial class CilAssembler
     private static LispObject AssembleAndRunSingle(LispObject instrList)
     {
         EnsureEmitAllowed("eval/compile of a compound form");
+        if (IsLoneFunctionForm(instrList)) return AssembleLoneFunction(instrList);
         var asm = new CilAssembler();
+        asm._runOnceInMemory = !HasBackwardBranch(instrList);
         var dm = new DynamicMethod("toplevel", typeof(LispObject),
             Type.EmptyTypes, typeof(CilAssembler).Module, true);
         asm._il = dm.GetILGenerator();
@@ -142,6 +147,40 @@ public partial class CilAssembler
         // keeps it alive (transient units become collectible here).
         GC.KeepAlive(holder);
         return result;
+    }
+
+    /// <summary>Whether the instructions only make a function and return it:
+    /// ((:MAKE-FUNCTION[-DIRECT] ...) (:CALL "Runtime.UnwrapMv") (:RET)), what
+    /// COMPILE of a lambda expression and EVAL of #'(LAMBDA ...) produce.</summary>
+    private static bool IsLoneFunctionForm(LispObject instrList) =>
+        instrList is Cons c1 && c1.Car is Cons mk && mk.Car is Symbol op
+        && (op.Name == "MAKE-FUNCTION" || op.Name == "MAKE-FUNCTION-DIRECT")
+        && c1.Cdr is Cons c2 && c2.Car is Cons call && call.Car is Symbol cop && cop.Name == "CALL"
+        && call.Cdr is Cons ca && ca.Car is LispString cs && cs.Value == "Runtime.UnwrapMv" && ca.Cdr is Nil
+        && c2.Cdr is Cons c3 && c3.Car is Cons ret && ret.Car is Symbol rop && rop.Name == "RET"
+        && ret.Cdr is Nil && c3.Cdr is Nil;
+
+    /// <summary>The function a lone MAKE-FUNCTION form makes. The function object
+    /// is built while its instruction is assembled; the one-shot method around
+    /// it would only load it from the unit and return it, and JIT-compiling that
+    /// method with full optimization cost about as much as the function body.
+    /// The load it emits goes into a method that is never compiled.</summary>
+    private static LispObject AssembleLoneFunction(LispObject instrList)
+    {
+        var asm = new CilAssembler();
+        var dm = new DynamicMethod("toplevel_unused", typeof(LispObject),
+            Type.EmptyTypes, typeof(CilAssembler).Module, true);
+        asm._il = dm.GetILGenerator();
+        int savedUnit = _currentUnitId;
+        var savedDms = _currentUnitDms;
+        int unitId = BeginUnit();
+        var holder = new List<object>();
+        _currentUnitId = unitId;
+        _currentUnitDms = holder;
+        try { asm.Assemble(new Cons(((Cons)instrList).Car, Nil.Instance)); }
+        finally { _currentUnitId = savedUnit; _currentUnitDms = savedDms; }
+        RegisterUnit(unitId, holder);
+        return (LispObject)holder[holder.Count - 1];
     }
 
     /// <summary>
@@ -229,6 +268,12 @@ public partial class CilAssembler
         return made;
     }
 
+    // MakeClosure and MakeClosureDirect are not inlined: their callers are
+    // in-memory methods (COMPILE, EVAL), JIT-compiled with full optimization on
+    // first call, and inlining the unit lookup, the delegate cache and the
+    // closure factory into each one made a closure-building COMPILE spend about
+    // 2 ms in the JIT.
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
     public static LispObject MakeClosure(object[] env, int unitId, int dmIndex, int arity)
     {
         var holder = TryGetUnitHolder(unitId)
@@ -264,6 +309,7 @@ public partial class CilAssembler
             $"internal: direct closure unsupported arity {arity}"))
     };
 
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
     public static LispObject MakeClosureDirect(object[] env, int unitId, int dmIndex, int arity, string fnName)
     {
         var holder = TryGetUnitHolder(unitId)
@@ -360,6 +406,23 @@ public partial class CilAssembler
     }
 
     // --- Assembly ---
+
+    /// <summary>Whether BODY's first instruction, past local declarations and
+    /// source markers, is the call that takes the caller's value mode. Only such
+    /// a body may be marked as a function's direct entry
+    /// (LispFunction.MarkMvModeEntry): the mode must be taken before any Lisp
+    /// code runs.</summary>
+    internal static bool BodyReadsMvMode(LispObject body)
+    {
+        for (var cur = body; cur is Cons c; cur = c.Cdr)
+        {
+            if (c.Car is not Cons ic || ic.Car is not Symbol op) return false;
+            if (op.Name == "DECLARE-LOCAL" || op.Name == "LINE") continue;
+            return op.Name == "CALL" && ic.Cdr is Cons a
+                && GetString(a.Car) == "MultipleValues.TakeMode";
+        }
+        return false;
+    }
 
     internal void Assemble(LispObject instructions)
     {
@@ -574,6 +637,13 @@ public partial class CilAssembler
                 break;
             case "DOTNET-CALL-DIRECT-LOCALS":
                 EmitDotnetCallDirectLocals(c);
+                break;
+            case "CALL-KEY-SHARED":
+                // A typed entry of a &key function calling the function's one
+                // shared body. The arguments are already on the stack.
+                if (_keyShared == null)
+                    throw new InvalidOperationException("CALL-KEY-SHARED outside a &key entry");
+                _il.Emit(OpCodes.Call, _keyShared);
                 break;
             case "TAIL-PREFIX":
                 // CIL tail-call prefix. Must be immediately followed by a call/callvirt/calli
@@ -923,9 +993,7 @@ public partial class CilAssembler
             }
             case "LOAD-SYM-KEYWORD":
             {
-                var kwName = GetString(Cadr(c));
-                _il.Emit(OpCodes.Ldstr, _faslMode ? Track(kwName) : kwName);
-                _il.Emit(OpCodes.Call, _methodCache["Startup.Keyword"]);
+                EmitKeyword(GetString(Cadr(c)));
                 _lastPushedType = typeof(Symbol);
                 break;
             }
@@ -952,13 +1020,12 @@ public partial class CilAssembler
                 var ricMethod = _methodCache["Runtime.ReaderIC"];
                 if (_faslMode)
                 {
-                    // The global constant pool is not serialized into a .fasl, so bake
-                    // a fresh cell per call (correct: it just always misses and
+                    // The global constant pool is not serialized into a .fasl, so the
+                    // cell lives in a static field of its own for this site (see
+                    // EmitFaslInlineCacheCell), or, with no type to hang one on, a
+                    // fresh cell per call (correct: it just always misses and
                     // re-resolves the accessor, i.e. no worse than a normal GF call).
-                    _il.Emit(OpCodes.Ldstr, Track(ricName));
-                    _il.Emit(OpCodes.Ldstr, Track(ricPkg));
-                    _il.Emit(OpCodes.Call, _methodCache["Startup.SymInPkg"]);
-                    _il.Emit(OpCodes.Newobj, typeof(ReaderCache).GetConstructor(new[] { typeof(Symbol) })!);
+                    EmitFaslInlineCacheCell(ricName, ricPkg, typeof(ReaderCache));
                     _il.Emit(OpCodes.Call, ricMethod);
                 }
                 else
@@ -979,17 +1046,14 @@ public partial class CilAssembler
                 // (setf (accessor obj) newval) inline-cached simple slot write. NEWVAL and
                 // OBJ are already on the stack in that order (the (SETF name) GF's own
                 // argument order). Call Runtime.WriterIC(newval, obj, cell). Cell handling
-                // matches READER-IC: a rooted constant-pool cell in JIT mode, a fresh
-                // always-missing cell per call in FASL mode.
+                // matches READER-IC: a rooted constant-pool cell in JIT mode, a static
+                // field per site in FASL mode.
                 var wicName = GetString(Cadr(c));
                 var wicPkg = GetString(Caddr(c));
                 var wicMethod = _methodCache["Runtime.WriterIC"];
                 if (_faslMode)
                 {
-                    _il.Emit(OpCodes.Ldstr, Track(wicName));
-                    _il.Emit(OpCodes.Ldstr, Track(wicPkg));
-                    _il.Emit(OpCodes.Call, _methodCache["Startup.SymInPkg"]);
-                    _il.Emit(OpCodes.Newobj, typeof(WriterCache).GetConstructor(new[] { typeof(Symbol) })!);
+                    EmitFaslInlineCacheCell(wicName, wicPkg, typeof(WriterCache));
                     _il.Emit(OpCodes.Call, wicMethod);
                 }
                 else
@@ -1040,6 +1104,9 @@ public partial class CilAssembler
                 break;
             case "MAKE-CLOSURE":
                 HandleMakeClosure(c);
+                break;
+            case "ONCE":
+                HandleOnce(c);
                 break;
 
             default:
@@ -1153,8 +1220,27 @@ public partial class CilAssembler
         // Compile the body as DynamicMethod(LispObject[] args) -> LispObject
         var dm = new DynamicMethod(name, typeof(LispObject),
             new[] { typeof(LispObject[]) }, typeof(CilAssembler).Module, true);
+        // A &key function keeps its body in one method that takes the key values
+        // as arguments: (:shared NPARAMS BODY) among the direct delegates. It is
+        // not a delegate of its own; the array entry and the typed entries call
+        // it (SIL :call-key-shared), so it is built first.
+        DynamicMethod? keyShared = null;
+        LispObject? sharedInstrs = null;
+        for (var dd = directDelegates; dd is Cons ddc; dd = ddc.Cdr)
+        {
+            if (ddc.Car is not Cons spec || Car(spec) is Fixnum) continue;
+            sharedInstrs = Caddr(spec);
+            int nShared = (int)((Fixnum)Cadr(spec)).Value;
+            var sharedTypes = new Type[nShared];
+            for (int i = 0; i < nShared; i++) sharedTypes[i] = typeof(LispObject);
+            keyShared = new DynamicMethod(name + "_keybody", typeof(LispObject),
+                sharedTypes, typeof(CilAssembler).Module, true);
+            new CilAssembler { _il = keyShared.GetILGenerator() }.Assemble(Caddr(spec));
+        }
+
         var innerAsm = new CilAssembler();
         innerAsm._il = dm.GetILGenerator();
+        innerAsm._keyShared = keyShared;
         innerAsm.Assemble(bodyInstrs);
 
         var del = (Func<LispObject[], LispObject>)dm.CreateDelegate(
@@ -1173,10 +1259,17 @@ public partial class CilAssembler
         {
             for (var dd = directDelegates; dd is Cons ddc; dd = ddc.Cdr)
             {
-                if (ddc.Car is not Cons spec) continue;
+                if (ddc.Car is not Cons spec || Car(spec) is not Fixnum) continue;
                 int arity = (int)((Fixnum)Car(spec)).Value;
                 bool selfP = Cadr(spec) is not Nil;
                 var ddBody = Caddr(spec);
+                // A &key function's required-only entry may carry a full copy of
+                // the body as a fourth element. A DynamicMethod is never inlined
+                // into its caller, so here the call to the shared body would stay
+                // a real call on the commonest shape; a fasl's entry calls it and
+                // lets the JIT inline it, and ignores the copy.
+                if (Cdr(Cdr(Cdr(spec))) is Cons { Car: Cons copy })
+                    ddBody = copy;
                 // A self-recursive body reads its params from ldarg 1.. with the
                 // function itself threaded in as arg0 (BuildSelfDirectFunction does
                 // the same); the _funcN delegate then binds `fn` as that leading
@@ -1189,13 +1282,14 @@ public partial class CilAssembler
                 for (int i = 0; i < arity; i++) directParamTypes[off + i] = typeof(LispObject);
                 var ddm = new DynamicMethod(name + "_opt" + arity, typeof(LispObject),
                     directParamTypes, typeof(CilAssembler).Module, true);
-                var ddAsm = new CilAssembler { _il = ddm.GetILGenerator() };
+                var ddAsm = new CilAssembler { _il = ddm.GetILGenerator(), _keyShared = keyShared };
                 ddAsm.Assemble(ddBody);
                 var ddFuncArgs = new Type[arity + 1];
                 for (int i = 0; i <= arity; i++) ddFuncArgs[i] = typeof(LispObject);
                 var ddType = System.Linq.Expressions.Expression.GetFuncType(ddFuncArgs);
                 fn.SetDirectDelegate(selfP ? ddm.CreateDelegate(ddType, fn)
                                            : ddm.CreateDelegate(ddType));
+                if (BodyReadsMvMode(ddBody)) fn.MarkMvModeEntry(arity);
             }
         }
 
@@ -1205,8 +1299,10 @@ public partial class CilAssembler
         try
         {
             var saveSilSym = Startup.SymInPkg("*SAVE-SIL*", "DOTCL");
+            // With a shared body the array entry only forwards to it, so the
+            // body worth inspecting is the shared one.
             if (DynamicBindings.Get(saveSilSym) is not Nil)
-                fn.Sil = bodyInstrs;
+                fn.Sil = sharedInstrs ?? bodyInstrs;
         }
         catch { }
 
@@ -1325,6 +1421,51 @@ public partial class CilAssembler
     {
         _il.Emit(OpCodes.Dup);
         _il.Emit(OpCodes.Stsfld, field);
+        _il.MarkLabel(done);
+    }
+
+    /// <summary>(:once INSTR...): run INSTR..., which leave one LispObject, the
+    /// first time this point is reached, and push that same object every time
+    /// after. The value lives in a static field of the FASL type, or in a cell
+    /// held by the compilation unit. INSTR... must not need an empty stack (no
+    /// exception blocks): the compiler emits a hoisted function and a call.</summary>
+    private void HandleOnce(Cons instr)
+    {
+        var body = instr.Cdr;
+        var done = _il.DefineLabel();
+        if (_faslMode && _faslTypeBuilder != null)
+        {
+            int id = Interlocked.Increment(ref _faslClosureCount);
+            var field = _faslTypeBuilder.DefineField($"once_{id}", typeof(LispObject),
+                FieldAttributes.Public | FieldAttributes.Static);
+            _il.Emit(OpCodes.Ldsfld, field);
+            _il.Emit(OpCodes.Dup);
+            _il.Emit(OpCodes.Brtrue, done);
+            _il.Emit(OpCodes.Pop);
+            Assemble(body);
+            _il.Emit(OpCodes.Dup);
+            _il.Emit(OpCodes.Stsfld, field);
+            _il.MarkLabel(done);
+            return;
+        }
+        var cellLocal = _il.DeclareLocal(typeof(OnceCell));
+        var valueLocal = _il.DeclareLocal(typeof(LispObject));
+        _il.Emit(OpCodes.Ldc_I4, _currentUnitId);
+        _il.Emit(OpCodes.Ldc_I4, AddUnitConstant(new OnceCell()));
+        _il.Emit(OpCodes.Call, _getUnitConstant);
+        _il.Emit(OpCodes.Castclass, typeof(OnceCell));
+        _il.Emit(OpCodes.Stloc, cellLocal);
+        _il.Emit(OpCodes.Ldloc, cellLocal);
+        _il.Emit(OpCodes.Ldfld, typeof(OnceCell).GetField(nameof(OnceCell.Value))!);
+        _il.Emit(OpCodes.Dup);
+        _il.Emit(OpCodes.Brtrue, done);
+        _il.Emit(OpCodes.Pop);
+        Assemble(body);
+        _il.Emit(OpCodes.Stloc, valueLocal);
+        _il.Emit(OpCodes.Ldloc, cellLocal);
+        _il.Emit(OpCodes.Ldloc, valueLocal);
+        _il.Emit(OpCodes.Stfld, typeof(OnceCell).GetField(nameof(OnceCell.Value))!);
+        _il.Emit(OpCodes.Ldloc, valueLocal);
         _il.MarkLabel(done);
     }
 
@@ -1496,6 +1637,12 @@ public partial class CilAssembler
                 _il.Emit(OpCodes.Ldftn, bodyMethod);
                 _il.Emit(OpCodes.Newobj, FaslAssembler.TypedFuncCtors[paramCount]);
                 _il.Emit(OpCodes.Callvirt, FaslAssembler.SetDirectDelegateMI);
+                if (BodyReadsMvMode(bodyInstrs))
+                {
+                    _il.Emit(OpCodes.Dup);
+                    _il.Emit(OpCodes.Ldc_I4, paramCount);
+                    _il.Emit(OpCodes.Callvirt, FaslAssembler.MarkMvModeEntryMI);
+                }
             }
             EndFaslFunctionCache(cacheField, cacheDone);
             return;
@@ -1511,6 +1658,7 @@ public partial class CilAssembler
         innerAsm2._il = directDm.GetILGenerator();
         int before = _currentUnitDms?.Count ?? 0;
         innerAsm2.Assemble(bodyInstrs);
+        bool mvEntry = BodyReadsMvMode(bodyInstrs);
 
         // Create array-based wrapper for backward compat (funcall, apply, etc.)
         // Wrapper includes arity check for proper error reporting
@@ -1526,6 +1674,7 @@ public partial class CilAssembler
                 var fn = new LispFunction(arrayDel, fnName, paramCount);
                 fn._func0 = d;
                 if (noFrame) fn.SuppressDebugFrame();
+                if (mvEntry) fn.MarkMvModeEntry(paramCount);
             PushUnitFunction(fn, before);
                 return;
             }
@@ -1538,6 +1687,7 @@ public partial class CilAssembler
                 var fn = new LispFunction(arrayDel, fnName, paramCount);
                 fn._func1 = d;
                 if (noFrame) fn.SuppressDebugFrame();
+                if (mvEntry) fn.MarkMvModeEntry(paramCount);
             PushUnitFunction(fn, before);
                 return;
             }
@@ -1550,6 +1700,7 @@ public partial class CilAssembler
                 var fn = new LispFunction(arrayDel, fnName, paramCount);
                 fn._func2 = d;
                 if (noFrame) fn.SuppressDebugFrame();
+                if (mvEntry) fn.MarkMvModeEntry(paramCount);
             PushUnitFunction(fn, before);
                 return;
             }
@@ -1562,6 +1713,7 @@ public partial class CilAssembler
                 var fn = new LispFunction(arrayDel, fnName, paramCount);
                 fn._func3 = d;
                 if (noFrame) fn.SuppressDebugFrame();
+                if (mvEntry) fn.MarkMvModeEntry(paramCount);
             PushUnitFunction(fn, before);
                 return;
             }
@@ -1574,6 +1726,7 @@ public partial class CilAssembler
                 var fn = new LispFunction(arrayDel, fnName, paramCount);
                 fn._func4 = d;
                 if (noFrame) fn.SuppressDebugFrame();
+                if (mvEntry) fn.MarkMvModeEntry(paramCount);
             PushUnitFunction(fn, before);
                 return;
             }
@@ -1610,6 +1763,7 @@ public partial class CilAssembler
                     case 8: fn._func8 = (Func<LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject>)d; break;
                 }
                 if (noFrame) fn.SuppressDebugFrame();
+                if (mvEntry) fn.MarkMvModeEntry(paramCount);
             PushUnitFunction(fn, before);
                 return;
             }
@@ -1797,6 +1951,7 @@ public partial class CilAssembler
         if (lambdaList != null)
             fn.StoredLambdaList = InternLambdaList(lambdaList, defPkg != null ? Package.FindPackage(defPkg) : null);
         if (noFrame) fn.SuppressDebugFrame();
+        if (BodyReadsMvMode(bodyInstrs)) fn.MarkMvModeEntry(paramCount);
 
         // Store SIL on function when dotcl:*save-sil* is true
         try
@@ -2056,7 +2211,7 @@ public partial class CilAssembler
                     name, 1);
                 fnRef = fn;
                 fn._func1 = a => d(fn, ((Fixnum)a).Value);
-                fn._nativeFunc1 = d;
+                fn.SetNativeDelegate(d);
                 break;
             }
             case 2:
@@ -2068,7 +2223,7 @@ public partial class CilAssembler
                     name, 2);
                 fnRef = fn;
                 fn._func2 = (a, b) => d(fn, ((Fixnum)a).Value, ((Fixnum)b).Value);
-                fn._nativeFunc2 = d;
+                fn.SetNativeDelegate(d);
                 break;
             }
             case 3:
@@ -2080,7 +2235,7 @@ public partial class CilAssembler
                     name, 3);
                 fnRef = fn;
                 fn._func3 = (a, b, c) => d(fn, ((Fixnum)a).Value, ((Fixnum)b).Value, ((Fixnum)c).Value);
-                fn._nativeFunc3 = d;
+                fn.SetNativeDelegate(d);
                 break;
             }
             case 4:
@@ -2092,7 +2247,7 @@ public partial class CilAssembler
                     name, 4);
                 fnRef = fn;
                 fn._func4 = (a, b, c, dd) => d(fn, ((Fixnum)a).Value, ((Fixnum)b).Value, ((Fixnum)c).Value, ((Fixnum)dd).Value);
-                fn._nativeFunc4 = d;
+                fn.SetNativeDelegate(d);
                 break;
             }
             default: throw new Exception("unreachable");
@@ -2307,6 +2462,7 @@ public partial class CilAssembler
                 _il.Emit(OpCodes.Ldstr, Track(fnName));
                 _il.Emit(OpCodes.Call, typeof(LispFunction).GetMethod("MakeDirectClosure",
                     new[] { typeof(Delegate), typeof(object[]), typeof(string) })!);
+                if (BodyReadsMvMode(bodyInstrs)) EmitWithMvModeEntry(_il, paramCount);
             }
             else
             {
@@ -2346,6 +2502,7 @@ public partial class CilAssembler
             _il.Emit(OpCodes.Ldc_I4, paramCount);
             _il.Emit(OpCodes.Ldstr, fnName);
             _il.Emit(OpCodes.Call, _makeClosureDirect);
+            if (BodyReadsMvMode(bodyInstrs)) EmitWithMvModeEntry(_il, paramCount);
         }
         else
         {
@@ -2376,6 +2533,17 @@ public partial class CilAssembler
             _il.Emit(OpCodes.Ldc_I4, paramCount);
             _il.Emit(OpCodes.Call, _makeClosure);
         }
+    }
+
+    private static readonly MethodInfo _withMvModeEntry =
+        typeof(LispFunction).GetMethod("WithMvModeEntry")!;
+
+    /// <summary>Mark the function on the stack: its ARITY entry, a body that
+    /// takes a value mode on entry (see BodyReadsMvMode).</summary>
+    private static void EmitWithMvModeEntry(ILGenerator il, int arity)
+    {
+        il.Emit(OpCodes.Ldc_I4, arity);
+        il.Emit(OpCodes.Call, _withMvModeEntry);
     }
 
     // A :direct closure body omits the compiler's arity-check prefix (the
@@ -2446,6 +2614,12 @@ public partial class CilAssembler
 
     private void EmitCallvirt(string name)
     {
+        if (_runOnceInMemory && name.StartsWith("LispFunction.Invoke", StringComparison.Ordinal)
+            && name.Length == "LispFunction.Invoke".Length + 1 && char.IsDigit(name[^1]))
+        {
+            _il.Emit(OpCodes.Callvirt, typeof(LispFunction).GetMethod("InvokeOnce" + name[^1])!);
+            return;
+        }
         if (_methodCache.TryGetValue(name, out var mi))
         {
             _il.Emit(OpCodes.Callvirt, mi);
@@ -2761,7 +2935,7 @@ public partial class CilAssembler
     /// level forms of the same file.</summary>
     private void EmitCachedConst(LispObject instrs)
     {
-        if (!_faslMode || _faslStructMap?.UninternedTypeBuilder == null)
+        if (!_faslMode || _faslStructMap?.UninternedTypeBuilder == null || _runOnce)
         {
             Assemble(instrs);   // JIT path: the constant pool already shares it
             return;
@@ -2772,7 +2946,9 @@ public partial class CilAssembler
         _il.Emit(OpCodes.Dup);
         _il.Emit(OpCodes.Brtrue, done);
         _il.Emit(OpCodes.Pop);
-        Assemble(instrs);
+        _cachedLiteralDepth++;
+        try { Assemble(instrs); }
+        finally { _cachedLiteralDepth--; }
         _il.Emit(OpCodes.Dup);
         _il.Emit(OpCodes.Stsfld, field);
         _il.MarkLabel(done);
@@ -2901,6 +3077,8 @@ public partial class CilAssembler
 
         public FaslStructInternMap(string modulePrefix)
         {
+            // A new file: MAKE-LOAD-FORM answers are remembered per file.
+            s_mlfMemo = new Dictionary<LispObject, LispObject>(ReferenceEqualityComparer.Instance);
             _prefix = modulePrefix;
         }
 
@@ -2917,17 +3095,17 @@ public partial class CilAssembler
 
         // --- LispInstance make-load-form registry ---
         private record InstanceEntry(string Key, LispObject? InitForm, List<LispInstance> InitDeps);
-        private readonly Dictionary<LispInstance, InstanceEntry> _instanceMap =
+        private readonly Dictionary<LispObject, InstanceEntry> _instanceMap =
             new(ReferenceEqualityComparer.Instance);
-        private readonly List<LispInstance> _instanceOrder = new();
+        private readonly List<LispObject> _instanceOrder = new();
 
-        public bool TryGetInstanceKey(LispInstance li, out string key)
+        public bool TryGetInstanceKey(LispObject li, out string key)
         {
             if (_instanceMap.TryGetValue(li, out var entry)) { key = entry.Key; return true; }
             key = ""; return false;
         }
 
-        public string RegisterInstance(LispInstance li, LispObject? initForm)
+        public string RegisterInstance(LispObject li, LispObject? initForm)
         {
             if (_instanceMap.TryGetValue(li, out var existing))
                 return existing.Key;
@@ -2937,7 +3115,7 @@ public partial class CilAssembler
                 CollectInstanceRefs(initForm, deps, new HashSet<LispInstance>(ReferenceEqualityComparer.Instance));
             _instanceMap[li] = new InstanceEntry(key, initForm, deps);
             _instanceOrder.Add(li);
-            LispInstance.PreRegisterIntern(key, li);
+            if (li is LispInstance inst) LispInstance.PreRegisterIntern(key, inst);
             return key;
         }
 
@@ -2949,17 +3127,27 @@ public partial class CilAssembler
         }
 
         // Track which instances are "created" (creation form emitted) and "initialized" (init form emitted)
-        private readonly HashSet<LispInstance> _created = new(ReferenceEqualityComparer.Instance);
-        private readonly HashSet<LispInstance> _initialized = new(ReferenceEqualityComparer.Instance);
+        private readonly HashSet<LispObject> _created = new(ReferenceEqualityComparer.Instance);
+        private readonly HashSet<LispObject> _initialized = new(ReferenceEqualityComparer.Instance);
 
-        public void MarkCreated(LispInstance li) => _created.Add(li);
+        public void MarkCreated(LispObject li) => _created.Add(li);
 
-        public bool IsCreated(LispInstance li) => _created.Contains(li);
+        public bool IsCreated(LispObject li) => _created.Contains(li);
 
         /// <summary>Counter for the per-instance creation/init top-level methods
         /// (_mlf_N) emitted so make-load-form creation and init forms interleave
         /// per object at load time (CLHS ordering, matching SBCL).</summary>
         internal int TopLevelMethodCount;
+
+        /// <summary>The open batch of MAKE-LOAD-FORM-SAVING-SLOTS creations, if
+        /// any. Consecutive such objects share one method instead of getting one
+        /// each: generic-cl's fasls hold about 7,500 of them, and a method that
+        /// runs once at load costs more to JIT-compile than its few instructions
+        /// take to run. The batch's call goes into the init sequence when it is
+        /// opened, and it takes further objects only while nothing else has been
+        /// written there since, so the order of effects is the same as one method
+        /// per object.</summary>
+        internal MlfBatch? OpenMlfBatch;
 
         /// <summary>Pop all init forms whose external dependencies are now fully initialized.
         /// Repeats until no more unblocked forms. Call after each creation form is emitted.</summary>
@@ -3069,6 +3257,34 @@ public partial class CilAssembler
             return field;
         }
 
+        private readonly Dictionary<string, System.Reflection.Emit.FieldBuilder> _keywordFields =
+            new(StringComparer.Ordinal);
+        private static readonly System.Reflection.MethodInfo _keywordMethod =
+            typeof(Startup).GetMethod("Keyword")!;
+        private int _keywordCounter;
+
+        /// <summary>
+        /// Static field holding the keyword NAME, filled by the type initializer
+        /// (see LOAD-SYM-KEYWORD). Unlike a symbol of another package (see
+        /// GetOrCreateSymPkgField) a keyword cannot be affected by the forms of
+        /// the file: the KEYWORD package always exists and its symbols are never
+        /// re-homed, so interning it before the top-level forms run is the same
+        /// as interning it at the site, and the site is then a single load.
+        /// </summary>
+        public System.Reflection.Emit.FieldBuilder GetOrCreateKeywordField(string name)
+        {
+            if (_keywordFields.TryGetValue(name, out var existing)) return existing;
+            var (tb, il) = FieldHolder();
+            var field = tb.DefineField($"_kw_{_keywordCounter++}",
+                typeof(Symbol),
+                System.Reflection.FieldAttributes.Public | System.Reflection.FieldAttributes.Static);
+            il.Emit(System.Reflection.Emit.OpCodes.Ldstr, TrackString(name));
+            il.Emit(System.Reflection.Emit.OpCodes.Call, _keywordMethod);
+            il.Emit(System.Reflection.Emit.OpCodes.Stsfld, field);
+            _keywordFields[name] = field;
+            return field;
+        }
+
         private readonly Dictionary<string, System.Reflection.Emit.FieldBuilder> _symPkgFields =
             new(StringComparer.Ordinal);
         private int _symPkgCounter;
@@ -3097,6 +3313,19 @@ public partial class CilAssembler
                 System.Reflection.FieldAttributes.Public | System.Reflection.FieldAttributes.Static);
             _symPkgFields[key] = field;
             return field;
+        }
+
+        private int _inlineCacheCounter;
+        /// <summary>A static field for one READER-IC / WRITER-IC site's cache cell
+        /// (see EmitFaslInlineCacheCell). Never shared between sites: each site
+        /// caches the class it sees, as the in-memory constant-pool cell does.
+        /// Left empty by the type initializer; the site fills it.</summary>
+        public System.Reflection.Emit.FieldBuilder CreateInlineCacheField(Type cellType)
+        {
+            var (tb, _) = FieldHolder();
+            return tb.DefineField($"_ic_{_inlineCacheCounter++}",
+                cellType,
+                System.Reflection.FieldAttributes.Public | System.Reflection.FieldAttributes.Static);
         }
 
         private readonly Dictionary<string, System.Reflection.Emit.FieldBuilder> _stringFields =
@@ -3168,6 +3397,85 @@ public partial class CilAssembler
         /// one, and a destructive change to it has to stick. Building it at each
         /// use gave a fresh copy every call, which also made every call allocate
         /// the whole graph.</summary>
+        /// <summary>Identity-carrying objects that occur in more than one
+        /// literal of the top level form being emitted (see
+        /// CollectCrossLiteralNodes), each with the static field that holds it
+        /// once built; null outside a form or when nothing is shared.</summary>
+        internal Dictionary<LispObject, System.Reflection.Emit.FieldBuilder?>? CrossLiteralShared;
+        /// <summary>The literals of the current form that contain one of them.</summary>
+        internal HashSet<LispObject>? CrossLiteralRoots;
+        internal readonly HashSet<LispObject> CrossLiteralBuilding =
+            new(ReferenceEqualityComparer.Instance);
+
+        /// <summary>A large hash table literal emitted as a prototype: its test,
+        /// the entries it was emitted with, and the method that returns it.</summary>
+        internal sealed class HtPrototype
+        {
+            public readonly string Test;
+            public readonly Dictionary<LispObject, LispObject> Entries;
+            /// <summary>The method that builds it, or null when it is built from
+            /// data part <see cref="Part"/> (FaslData.HtPrototype).</summary>
+            public readonly System.Reflection.Emit.MethodBuilder? Method;
+            public readonly int Part;
+            public HtPrototype(string test, Dictionary<LispObject, LispObject> entries,
+                System.Reflection.Emit.MethodBuilder? method, int part = -1)
+            { Test = test; Entries = entries; Method = method; Part = part; }
+        }
+        /// <summary>The hash table prototypes of this file, in emission order.</summary>
+        internal readonly List<HtPrototype> HtPrototypes = new();
+        /// <summary>The data part of each table that has a data prototype.</summary>
+        internal readonly Dictionary<LispHashTable, int> HtDataParts =
+            new(ReferenceEqualityComparer.Instance);
+        internal readonly HashSet<LispHashTable> HtDataBuilding =
+            new(ReferenceEqualityComparer.Instance);
+
+        /// <summary>Set up CrossLiteralShared for one top level form's
+        /// instructions. Paired with EndFormLiterals.</summary>
+        internal void BeginFormLiterals(LispObject instrList)
+        {
+            var shared = CollectCrossLiteralNodes(instrList, out var roots);
+            CrossLiteralShared = shared.Count > 0 ? shared : null;
+            CrossLiteralRoots = shared.Count > 0 ? roots : null;
+        }
+
+        internal void EndFormLiterals()
+        {
+            CrossLiteralShared = null;
+            CrossLiteralRoots = null;
+            CrossLiteralBuilding.Clear();
+            _crossLiteralSlots.Clear();
+        }
+
+        // Slots of the shared array (_fshared) for the objects of the current
+        // form that more than one of its literals contains. Slots are not
+        // reused: each form's objects get their own.
+        private readonly Dictionary<LispObject, int> _crossLiteralSlots =
+            new(ReferenceEqualityComparer.Instance);
+        private int _sharedSlotCount;
+        private System.Reflection.Emit.FieldBuilder? _sharedSlotsField;
+
+        public int CrossLiteralSlot(LispObject node)
+        {
+            if (!_crossLiteralSlots.TryGetValue(node, out int slot))
+            {
+                slot = _sharedSlotCount++;
+                _crossLiteralSlots[node] = slot;
+            }
+            return slot;
+        }
+
+        /// <summary>The slot of NODE when it is an object several literals of
+        /// the current form contain and no enclosing code is building it; else -1.</summary>
+        public int CrossLiteralSlotFor(LispObject node) =>
+            CrossLiteralShared != null && CrossLiteralShared.ContainsKey(node)
+                && !CrossLiteralBuilding.Contains(node)
+                ? CrossLiteralSlot(node) : -1;
+
+        public System.Reflection.Emit.FieldBuilder SharedSlotsField() =>
+            _sharedSlotsField ??= UninternedTypeBuilder!.DefineField(
+                "_fshared", typeof(LispObject[]),
+                System.Reflection.FieldAttributes.Public | System.Reflection.FieldAttributes.Static);
+
         public System.Reflection.Emit.FieldBuilder DefineLiteralCacheField()
         {
             var (tb, _) = FieldHolder();
@@ -3195,6 +3503,94 @@ public partial class CilAssembler
                 "_gsyms", typeof(Symbol[]),
                 System.Reflection.FieldAttributes.Public | System.Reflection.FieldAttributes.Static);
         }
+
+        // --- Payloads rebuilt at load by FaslData -------------------------------
+        private readonly List<byte[]?> _dataParts = new();
+        private System.Reflection.Emit.FieldBuilder? _dataPartsField;
+        private System.Reflection.Emit.FieldBuilder? _htCacheField;
+
+        /// <summary>The index of a new data part, whose bytes are given later
+        /// (<see cref="SetDataPart"/>): the call that reads it is emitted before
+        /// its content is complete.</summary>
+        public int ReserveDataPart() { _dataParts.Add(null); return _dataParts.Count - 1; }
+        public void SetDataPart(int index, byte[] data) => _dataParts[index] = data;
+        public int AddDataPart(byte[] data) { _dataParts.Add(data); return _dataParts.Count - 1; }
+
+        /// <summary>The byte[][] of this fasl's data parts, filled by the
+        /// primary holder's initializer (<see cref="EmitDataPartsInit"/>).</summary>
+        public System.Reflection.Emit.FieldBuilder DataPartsField() =>
+            _dataPartsField ??= UninternedTypeBuilder!.DefineField(
+                "_fdata", typeof(byte[][]),
+                System.Reflection.FieldAttributes.Public | System.Reflection.FieldAttributes.Static);
+
+        /// <summary>The cache of hash table prototypes built from data parts,
+        /// indexed like the parts.</summary>
+        public System.Reflection.Emit.FieldBuilder HtCacheField() =>
+            _htCacheField ??= UninternedTypeBuilder!.DefineField(
+                "_fhtp", typeof(LispObject[]),
+                System.Reflection.FieldAttributes.Public | System.Reflection.FieldAttributes.Static);
+
+        /// <summary>Fill the data parts field from one blob (in pieces when it is
+        /// larger than one data field may hold), and allocate the prototype
+        /// cache.</summary>
+        public void EmitDataPartsInit(System.Reflection.Emit.ILGenerator il)
+        {
+            if (_sharedSlotsField != null)
+            {
+                il.Emit(System.Reflection.Emit.OpCodes.Ldc_I4, _sharedSlotCount);
+                il.Emit(System.Reflection.Emit.OpCodes.Newarr, typeof(LispObject));
+                il.Emit(System.Reflection.Emit.OpCodes.Stsfld, _sharedSlotsField);
+            }
+            if (_dataPartsField == null) return;
+            var parts = new List<byte[]>(_dataParts.Count);
+            foreach (var p in _dataParts) parts.Add(p ?? FaslDataEmptyPart);
+            var blob = FaslDataWriter.JoinParts(parts);
+            var initArray = typeof(System.Runtime.CompilerServices.RuntimeHelpers)
+                .GetMethod("InitializeArray", new[] { typeof(System.Array), typeof(RuntimeFieldHandle) })!;
+            void EmitBlob(byte[] b)
+            {
+                var f = DefineLiteralData(b);
+                il.Emit(System.Reflection.Emit.OpCodes.Ldc_I4, b.Length);
+                il.Emit(System.Reflection.Emit.OpCodes.Newarr, typeof(byte));
+                il.Emit(System.Reflection.Emit.OpCodes.Dup);
+                il.Emit(System.Reflection.Emit.OpCodes.Ldtoken, f);
+                il.Emit(System.Reflection.Emit.OpCodes.Call, initArray);
+            }
+            if (blob.Length <= MaxLiteralDataChunk)
+            {
+                EmitBlob(blob);
+                il.Emit(System.Reflection.Emit.OpCodes.Call,
+                    typeof(FaslData).GetMethod("SplitParts", new[] { typeof(byte[]) })!);
+            }
+            else
+            {
+                int pieces = (blob.Length + MaxLiteralDataChunk - 1) / MaxLiteralDataChunk;
+                il.Emit(System.Reflection.Emit.OpCodes.Ldc_I4, pieces);
+                il.Emit(System.Reflection.Emit.OpCodes.Newarr, typeof(byte[]));
+                for (int i = 0; i < pieces; i++)
+                {
+                    int start = i * MaxLiteralDataChunk;
+                    int len = System.Math.Min(MaxLiteralDataChunk, blob.Length - start);
+                    var chunk = new byte[len];
+                    System.Array.Copy(blob, start, chunk, 0, len);
+                    il.Emit(System.Reflection.Emit.OpCodes.Dup);
+                    il.Emit(System.Reflection.Emit.OpCodes.Ldc_I4, i);
+                    EmitBlob(chunk);
+                    il.Emit(System.Reflection.Emit.OpCodes.Stelem_Ref);
+                }
+                il.Emit(System.Reflection.Emit.OpCodes.Call,
+                    typeof(FaslData).GetMethod("SplitParts", new[] { typeof(byte[][]) })!);
+            }
+            il.Emit(System.Reflection.Emit.OpCodes.Stsfld, _dataPartsField);
+            if (_htCacheField != null)
+            {
+                il.Emit(System.Reflection.Emit.OpCodes.Ldc_I4, _dataParts.Count);
+                il.Emit(System.Reflection.Emit.OpCodes.Newarr, typeof(LispObject));
+                il.Emit(System.Reflection.Emit.OpCodes.Stsfld, _htCacheField);
+            }
+        }
+
+        private static readonly byte[] FaslDataEmptyPart = { 0 };
 
         /// <summary>Fill the Symbol[] from a names blob, at the end of the primary
         /// holder's initializer. Nothing earlier in that initializer reads the
@@ -3315,6 +3711,58 @@ public partial class CilAssembler
     /// same graph again inside would only add a second field.</summary>
     private bool _suppressLiteralCache;
 
+    /// <summary>Nonzero while emitting the IL that builds a literal whose result
+    /// is kept in a literal cache field (EmitLoadConstInline, EmitCachedConst).
+    /// That IL runs once per field, so a symbol inside it gains nothing from a
+    /// per-site cache field of its own: EmitInternedSymbol then emits the plain
+    /// lookup, 3 instructions instead of 9 and no branch. The code is run once
+    /// and JIT-compiled at load, where its size is most of the cost.</summary>
+    private int _cachedLiteralDepth;
+
+    /// <summary>Set on the assembler of a fasl top level helper (_toplevel_N)
+    /// whose instructions have no backward branch. ModuleInit calls such a
+    /// helper once and nothing in it runs twice, so each literal and symbol site
+    /// in it executes at most once per load: a cache field for it would be
+    /// filled and never read again. The sites are then emitted uncached, which
+    /// is most of the IL of a typical top level form, and all of that IL is
+    /// JIT-compiled at load only to run once.</summary>
+    internal bool _runOnce;
+
+    /// <summary>Set on the assembler of an in-memory top level method (EVAL)
+    /// whose instructions have no backward branch, so each call in it runs at
+    /// most once: calls through LispFunction.InvokeN go to InvokeOnceN, which
+    /// the JIT does not inline.</summary>
+    private bool _runOnceInMemory;
+
+    /// <summary>Whether a flat SIL instruction list has a branch (or LEAVE /
+    /// SWITCH) to a label that appears before it, i.e. whether any of its code
+    /// can run more than once in one call.</summary>
+    internal static bool HasBackwardBranch(LispObject instrs)
+    {
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        for (var cur = instrs; cur is Cons c; cur = c.Cdr)
+        {
+            if (c.Car is not Cons ins || ins.Car is not Symbol op) continue;
+            switch (op.Name)
+            {
+                case "LABEL":
+                    if (ins.Cdr is Cons l && l.Car is Symbol ls) seen.Add(ls.Name);
+                    break;
+                case "BR": case "BRFALSE": case "BRTRUE": case "BEQ": case "BGT":
+                case "BLT": case "BGE": case "BLE": case "BNE": case "LEAVE":
+                    if (ins.Cdr is Cons t && t.Car is Symbol ts && seen.Contains(ts.Name))
+                        return true;
+                    break;
+                case "SWITCH":
+                    if (ins.Cdr is Cons sw)
+                        for (var lc = sw.Car; lc is Cons lcc; lc = lcc.Cdr)
+                            if (lcc.Car is Symbol s2 && seen.Contains(s2.Name)) return true;
+                    break;
+            }
+        }
+        return false;
+    }
+
     /// <summary>Emit IL to construct a constant value inline (for FASL mode).
     ///
     /// A top level literal is built once and kept in a static field. Without that
@@ -3329,7 +3777,7 @@ public partial class CilAssembler
     /// establishes, and the initializer runs before any of them.</summary>
     internal void EmitLoadConstInline(LispObject val)
     {
-        if (_inlineDepth == 0 && _faslMode && !_suppressLiteralCache
+        if (_inlineDepth == 0 && _faslMode && !_suppressLiteralCache && !_runOnce
             && _faslStructMap?.UninternedTypeBuilder != null)
         {
             var field = _faslStructMap.DefineLiteralCacheField();
@@ -3338,7 +3786,9 @@ public partial class CilAssembler
             _il.Emit(OpCodes.Dup);
             _il.Emit(OpCodes.Brtrue, done);
             _il.Emit(OpCodes.Pop);
-            EmitLoadConstInlineBody(val);
+            _cachedLiteralDepth++;
+            try { EmitLoadConstInlineBody(val); }
+            finally { _cachedLiteralDepth--; }
             _il.Emit(OpCodes.Dup);
             _il.Emit(OpCodes.Stsfld, field);
             _il.MarkLabel(done);
@@ -3347,7 +3797,234 @@ public partial class CilAssembler
         EmitLoadConstInlineBody(val);
     }
 
+    /// <summary>Objects that occur more than once in the literal being emitted,
+    /// and the static field each one is kept in once built. Inline emission
+    /// otherwise builds a fresh object for every occurrence, so
+    /// '(#1=#P"foo" #1#) came back as two pathnames (CLHS 3.2.4.4 requires one).
+    /// The first occurrence builds the object and stores it; later occurrences
+    /// load the field. Emission order is execution order (helper methods are
+    /// called where they are emitted), so a load never runs before its store.
+    /// Shared with the helper-method assemblers of the same literal.</summary>
+    private sealed class SharedLiteralMemo
+    {
+        public readonly HashSet<LispObject> Shared;
+        public readonly Dictionary<LispObject, FieldInfo> Fields =
+            new(ReferenceEqualityComparer.Instance);
+        public readonly HashSet<LispObject> Building =
+            new(ReferenceEqualityComparer.Instance);
+        public readonly LispObject Root;
+        public SharedLiteralMemo(LispObject root, HashSet<LispObject> shared) { Root = root; Shared = shared; }
+    }
+    private SharedLiteralMemo? _sharedMemo;
+
+    /// <summary>The identity-carrying objects that occur in more than one
+    /// literal (LOAD-CONST operand) of one top level form's instructions,
+    /// nested function bodies included. CLHS 3.2.4.4 asks for one object per
+    /// object in the source, but each literal is built by its own code, so
+    /// a macro that puts one subform into two quoted constants
+    /// (`(list '(wrap ,x) ',x)`) gave two copies of it once compiled to a
+    /// fasl. The literals of a form run in no fixed order (each is built at
+    /// first use), so these objects are built by whichever literal gets there
+    /// first and kept in a field the others read (see EmitLoadConstInlineBody).
+    ///
+    /// A walk stops at an object an earlier literal already reached: what is
+    /// below it comes with it. <paramref name="roots"/> gets the literals that
+    /// contain a shared object, on both sides.</summary>
+    internal static Dictionary<LispObject, System.Reflection.Emit.FieldBuilder?> CollectCrossLiteralNodes(
+        LispObject instrList, out HashSet<LispObject> roots)
+    {
+        var shared = new Dictionary<LispObject, System.Reflection.Emit.FieldBuilder?>(
+            ReferenceEqualityComparer.Instance);
+        roots = new HashSet<LispObject>(ReferenceEqualityComparer.Instance);
+        // The literals, in order. Instruction lists are walked without going
+        // into a literal itself.
+        var literals = new List<LispObject>();
+        var walked = new HashSet<LispObject>(ReferenceEqualityComparer.Instance);
+        var ist = new Stack<LispObject>();
+        ist.Push(instrList);
+        while (ist.Count > 0)
+        {
+            if (ist.Pop() is not Cons c || !walked.Add(c)) continue;
+            if (c.Car is Symbol op && op.Name == "LOAD-CONST" && c.Cdr is Cons arg)
+            {
+                if (HasLiteralIdentity(arg.Car)) literals.Add(arg.Car);
+                continue;
+            }
+            ist.Push(c.Cdr);
+            ist.Push(c.Car);
+        }
+        if (literals.Count < 2) return shared;
+
+        var owner = new Dictionary<LispObject, LispObject>(ReferenceEqualityComparer.Instance);
+        var st = new Stack<LispObject>();
+        foreach (var root in literals)
+        {
+            var seen = new HashSet<LispObject>(ReferenceEqualityComparer.Instance);
+            st.Push(root);
+            while (st.Count > 0)
+            {
+                var node = st.Pop();
+                if (!HasLiteralIdentity(node) || !seen.Add(node)) continue;
+                if (owner.TryGetValue(node, out var first))
+                {
+                    shared[node] = null;
+                    roots.Add(first);
+                    roots.Add(root);
+                    continue;
+                }
+                owner[node] = root;
+                switch (node)
+                {
+                    case Cons cc: st.Push(cc.Cdr); st.Push(cc.Car); break;
+                    case LispVector v:
+                        if (v.ElementTypeName == "T")
+                            for (int i = v.Length - 1; i >= 0; i--) st.Push(v.ElementAt(i));
+                        break;
+                    case LispStruct ls:
+                        foreach (var sl in ls.SlotsSnapshot()) if (sl is LispObject so) st.Push(so);
+                        break;
+                    case LispHashTable ht:
+                        foreach (var kv in ht.Entries) { st.Push(kv.Value); st.Push(kv.Key); }
+                        break;
+                    case LispInstance li:
+                        foreach (var sl in li.Slots) if (sl is LispObject so) st.Push(so);
+                        break;
+                }
+            }
+        }
+        return shared;
+    }
+
     private void EmitLoadConstInlineBody(LispObject val)
+    {
+        // An object another literal of this form also contains: build it only
+        // if no literal has yet, and keep it in its field.
+        var map = _faslStructMap;
+        var cross = map?.CrossLiteralShared;
+        if (cross != null && map!.UninternedTypeBuilder != null
+            && cross.ContainsKey(val) && !map.CrossLiteralBuilding.Contains(val))
+        {
+            // The object is kept in a slot of the fasl's shared array rather
+            // than a field of its own, so that a literal built from data (see
+            // FaslData) finds it in the same place.
+            int slot = map.CrossLiteralSlot(val);
+            var built = _il.DefineLabel();
+            _il.Emit(OpCodes.Ldsfld, map.SharedSlotsField());
+            _il.Emit(OpCodes.Ldc_I4, slot);
+            _il.Emit(OpCodes.Ldelem_Ref);
+            _il.Emit(OpCodes.Dup);
+            _il.Emit(OpCodes.Brtrue, built);
+            _il.Emit(OpCodes.Pop);
+            map.CrossLiteralBuilding.Add(val);
+            try { EmitLoadConstInlineBodyMemo(val); }
+            finally { map.CrossLiteralBuilding.Remove(val); }
+            _il.Emit(OpCodes.Ldsfld, map.SharedSlotsField());
+            _il.Emit(OpCodes.Ldc_I4, slot);
+            _il.Emit(OpCodes.Call, typeof(FaslData).GetMethod("Share")!);
+            _il.MarkLabel(built);
+            return;
+        }
+        EmitLoadConstInlineBodyMemo(val);
+    }
+
+    private void EmitLoadConstInlineBodyMemo(LispObject val)
+    {
+        bool ownsMemo = false;
+        if (_inlineDepth == 0 && _sharedMemo == null && _faslMode
+            && _faslStructMap?.UninternedTypeBuilder != null)
+        {
+            var shared = CollectSharedLiteralNodes(val);
+            if (shared.Count > 0) { _sharedMemo = new SharedLiteralMemo(val, shared); ownsMemo = true; }
+        }
+        try
+        {
+            var memo = _sharedMemo;
+            if (memo != null && memo.Shared.Contains(val) && !memo.Building.Contains(val))
+            {
+                if (memo.Fields.TryGetValue(val, out var f))
+                {
+                    _il.Emit(OpCodes.Ldsfld, f);
+                    return;
+                }
+                memo.Building.Add(val);
+                try { EmitLoadConstInlineBodyCore(val); }
+                finally { memo.Building.Remove(val); }
+                var field = _faslStructMap!.DefineLiteralCacheField();
+                _il.Emit(OpCodes.Dup);
+                _il.Emit(OpCodes.Stsfld, field);
+                memo.Fields[val] = field;
+                return;
+            }
+            EmitLoadConstInlineBodyCore(val);
+        }
+        finally { if (ownsMemo) _sharedMemo = null; }
+    }
+
+    /// <summary>Whether an object's identity has to be kept when it occurs
+    /// more than once in one literal. Numbers and characters have no identity
+    /// that EQ is required to see; symbols, packages, named classes and
+    /// functions are looked up by name, and strings are already coalesced by
+    /// value into one field per fasl.</summary>
+    private static bool HasLiteralIdentity(LispObject o) =>
+        o is Cons or LispVector or LispPathname or LispHashTable or LispStruct or LispInstance;
+
+    /// <summary>The identity-carrying nodes reachable more than once from
+    /// <paramref name="root"/>. Walks everything the inline emitter walks
+    /// (conses, vectors, structure slots, hash table entries, instance slots),
+    /// iteratively. Over-approximating is harmless: a node listed here that the
+    /// emitter reaches only once is built once and stored in a field nobody
+    /// reads.</summary>
+    private static HashSet<LispObject> CollectSharedLiteralNodes(LispObject root)
+    {
+        var shared = new HashSet<LispObject>(ReferenceEqualityComparer.Instance);
+        if (!HasLiteralIdentity(root)) return shared;
+        var seen = new HashSet<LispObject>(ReferenceEqualityComparer.Instance);
+        var st = new Stack<LispObject>();
+        st.Push(root);
+        while (st.Count > 0)
+        {
+            var node = st.Pop();
+            if (!HasLiteralIdentity(node)) continue;
+            if (!seen.Add(node)) { shared.Add(node); continue; }
+            switch (node)
+            {
+                case Cons c: st.Push(c.Cdr); st.Push(c.Car); break;
+                case LispVector v:
+                    if (v.ElementTypeName == "T")
+                        for (int i = v.Length - 1; i >= 0; i--) st.Push(v.ElementAt(i));
+                    break;
+                case LispStruct ls:
+                    foreach (var s in ls.SlotsSnapshot()) if (s is LispObject so) st.Push(so);
+                    break;
+                case LispHashTable ht:
+                    foreach (var kv in ht.Entries) { st.Push(kv.Value); st.Push(kv.Key); }
+                    break;
+                case LispInstance li:
+                    foreach (var s in li.Slots) if (s is LispObject so) st.Push(so);
+                    break;
+            }
+        }
+        return shared;
+    }
+
+    /// <summary>True when the literal shares an object that the print-and-read
+    /// route cannot give back as one object (anything but a cons or a general
+    /// vector): such a literal must be built inline, where the memo keeps it.
+    /// A part of the literal (a list chunk or a spilled subgraph, emitted by a
+    /// helper assembler) must not take that route either: its printed text
+    /// could not refer to the objects the rest of the literal shares.
+    private bool ReaderRouteLosesSharing(LispObject val) =>
+        (_faslStructMap?.CrossLiteralRoots?.Contains(val) ?? false)
+        || _sharedMemo != null
+        && (!ReferenceEquals(val, _sharedMemo.Root)
+            || _sharedMemo.Shared.Any(o => o is not Cons
+                                   && !(o is LispVector v && v.ElementTypeName == "T" && v._dimensions == null)));
+
+    // The atom and aggregate cases below leave a Symbol, Cons, LispString and
+    // so on on the stack without a CASTCLASS to LispObject: an upcast is a no-op
+    // the JIT still has to resolve, and fasl literals are most of the IL a
+    // load JIT-compiles.
+    private void EmitLoadConstInlineBodyCore(LispObject val)
     {
         _inlineDepth++;
         try
@@ -3375,6 +4052,7 @@ public partial class CilAssembler
         if (_inlineDepth == 1)
         {
             var kind = AnalyzeConstantGraph(val);
+            bool readerLosesSharing = ReaderRouteLosesSharing(val);
             if (LiteralCensus)
             {
                 // Every literal, whichever route it ends up on -- the question is
@@ -3391,10 +4069,21 @@ public partial class CilAssembler
                         "compile-file: cannot emit a circular constant that is not printably readable"));
                 return;
             }
-            if (kind == ConstGraphKind.Shared && TryEmitConstantViaReader(val))
+            // A literal of plain data is rebuilt from a data payload (see
+            // FaslData) instead of by IL that is JIT-compiled to run once.
+            // Unlike the reader route it takes instances (by their
+            // make-load-form key), uninterned symbols, and objects it shares
+            // with other literals of the form, which macro expansions that
+            // carry a code walker's state hold in quantity. A part of a larger
+            // literal is left to the code that builds the whole.
+            if (_faslMode && _faslTypeBuilder != null
+                && (_sharedMemo == null || ReferenceEquals(_sharedMemo.Root, val))
+                && TryEmitConstantAsData(val))
                 return;
-            // Shared-but-unprintable falls through to inline emission: it loses
-            // EQ identity across occurrences but reconstructs equal values.
+            if (kind == ConstGraphKind.Shared && !readerLosesSharing && TryEmitConstantViaReader(val))
+                return;
+            // Otherwise shared structure is built inline, and _sharedMemo keeps
+            // each shared object one object.
 
             // A large ordinary literal goes the same way, for size rather than
             // correctness. Building it inline emits IL proportional to the graph;
@@ -3407,7 +4096,8 @@ public partial class CilAssembler
             // Only for graphs the reader reconstructs with IDENTICAL semantics
             // (see ConstantIsReaderSafe) and only past a threshold, since a small
             // literal's inline IL is cheaper than the fixed cost of a read.
-            if (kind == ConstGraphKind.Simple && _faslMode && _faslTypeBuilder != null
+            if (kind == ConstGraphKind.Simple && !readerLosesSharing
+                && _faslMode && _faslTypeBuilder != null
                 && ConstantIsReaderSafe(val, out int nodeCount)
                 && nodeCount >= ReaderPathMinNodes
                 && TryEmitConstantViaReader(val))
@@ -3457,13 +4147,11 @@ public partial class CilAssembler
                     _il.Emit(OpCodes.Ldstr, Track(s.Value));
                     _il.Emit(OpCodes.Newobj, _ctorCache["LispString"]);
                 }
-                _il.Emit(OpCodes.Castclass, typeof(LispObject));
                 break;
             case Symbol sym:
                 if (sym.HomePackage?.Name == "KEYWORD")
                 {
-                    _il.Emit(OpCodes.Ldstr, Track(sym.Name));
-                    _il.Emit(OpCodes.Call, _methodCache["Startup.Keyword"]);
+                    EmitKeyword(sym.Name);
                 }
                 else if (sym.HomePackage != null)
                 {
@@ -3495,22 +4183,18 @@ public partial class CilAssembler
                     _il.Emit(OpCodes.Ldnull); // null for homePackage
                     _il.Emit(OpCodes.Newobj, typeof(Symbol).GetConstructor(new[] { typeof(string), typeof(Package) })!);
                 }
-                _il.Emit(OpCodes.Castclass, typeof(LispObject));
                 break;
             case LispChar lc:
                 _il.Emit(OpCodes.Ldc_I4, (int)lc.Value);
                 _il.Emit(OpCodes.Call, typeof(LispChar).GetMethod("Make")!);
-                _il.Emit(OpCodes.Castclass, typeof(LispObject));
                 break;
             case SingleFloat sf:
                 _il.Emit(OpCodes.Ldc_R4, sf.Value);
                 _il.Emit(OpCodes.Newobj, typeof(SingleFloat).GetConstructor(new[] { typeof(float) })!);
-                _il.Emit(OpCodes.Castclass, typeof(LispObject));
                 break;
             case DoubleFloat df:
                 _il.Emit(OpCodes.Ldc_R8, df.Value);
                 _il.Emit(OpCodes.Newobj, typeof(DoubleFloat).GetConstructor(new[] { typeof(double) })!);
-                _il.Emit(OpCodes.Castclass, typeof(LispObject));
                 break;
             case Cons cons:
             {
@@ -3542,7 +4226,6 @@ public partial class CilAssembler
                     _il.Emit(OpCodes.Ldloc, tmpLocal);   // push cdr
                     _il.Emit(OpCodes.Newobj, consCtor);
                 }
-                _il.Emit(OpCodes.Castclass, typeof(LispObject));
                 break;
             }
             case LispVector vec:
@@ -3603,7 +4286,6 @@ public partial class CilAssembler
                 {
                     _il.Emit(OpCodes.Newobj, _ctorCache["LispVector"]);
                 }
-                _il.Emit(OpCodes.Castclass, typeof(LispObject));
                 break;
             case Bignum bn:
                 // BigInteger.Parse(string) -> new Bignum(BigInteger)
@@ -3665,7 +4347,8 @@ public partial class CilAssembler
                 }
                 try
                 {
-                    if (_skipStructIntern)
+                    if (_skipStructIntern && !(_faslMode && _faslStructMap?.UninternedTypeBuilder != null
+                                               && TryEmitViaLoadForm(ls, "")))
                     {
                         // Inside hash table values: skip interning to save string space
                         EmitLoadConstInline(ls.TypeName);
@@ -3683,7 +4366,7 @@ public partial class CilAssembler
                             new[] { typeof(Symbol), typeof(LispObject[]) })!);
                         _il.Emit(OpCodes.Castclass, typeof(LispObject));
                     }
-                    else
+                    else if (!_skipStructIntern)
                     {
                         // Top-level: use intern cache for EQ preservation
                         // Use short reference-identity-based key if available (avoids huge keys
@@ -3732,7 +4415,6 @@ public partial class CilAssembler
                 // Small hash tables: inline construction (<=20 entries)
                 // Large ones: in FASL mode, emit as helper methods (self-contained, no _constants).
                 // In non-FASL (AssembleAndRun), fall back to constant pool (same-process, ok).
-                const int MaxHtInline = 20;
                 var htEntries = ht.Entries.ToList();
                 if (htEntries.Count > MaxHtInline)
                 {
@@ -4071,6 +4753,24 @@ public partial class CilAssembler
         return a;
     }
 
+    /// <summary>The values of (MAKE-LOAD-FORM OBJ), asked once per object per
+    /// file (CLHS 3.2.4.4 lets a method count on being called once for each
+    /// object a file names): several places look at the answer, the
+    /// reader-route check and the emitters among them.</summary>
+    [ThreadStatic] private static Dictionary<LispObject, LispObject>? s_mlfMemo;
+
+    /// <summary>Forget the answers when the file is done.</summary>
+    internal static void ClearMakeLoadFormMemo() => s_mlfMemo = null;
+
+    private static LispObject CallMakeLoadForm(LispObject mlfFn, LispObject obj)
+    {
+        var memo = s_mlfMemo;
+        if (memo != null && memo.TryGetValue(obj, out var known)) return known;
+        var raw = Runtime.Funcall(mlfFn, obj);
+        if (memo != null) memo[obj] = raw;
+        return raw;
+    }
+
     private static bool StructReadsBackAsPrinted(LispStruct ls)
     {
         if (Runtime.FindClassOrNil(ls.TypeName) is not LispClass cls
@@ -4087,7 +4787,7 @@ public partial class CilAssembler
         LispObject form;
         try
         {
-            var raw = Runtime.Funcall(mlfSym.Function, ls);
+            var raw = CallMakeLoadForm(mlfSym.Function, ls);
             form = raw is MvReturn mv && mv.Count > 0 ? mv[0] : raw;
         }
         catch { return true; }
@@ -4295,9 +4995,78 @@ public partial class CilAssembler
     /// symbols, so a symbol interned before the defining form has run is a
     /// different object from the one the later DEFUN attaches a function to --
     /// asdf died with "Undefined function: ENSURE-PACKAGE" loading itself.</summary>
-    private void EmitInternedSymbol(string name, string pkg)
+    /// <summary>Load the keyword NAME, resolved once rather than at every
+    /// evaluation (FASL: a static field the type initializer fills; in memory:
+    /// the constant pool). Every evaluated keyword literal used to pay the
+    /// string-keyed lookup in Startup.Keyword, including the keyword tests a
+    /// &amp;key parser runs on every call.</summary>
+    private void EmitKeyword(string name)
     {
         if (_faslMode && _faslStructMap?.UninternedTypeBuilder != null
+            && _faslStructMap.SymFnSiteInitIl != null)
+        {
+            _il.Emit(OpCodes.Ldsfld, _faslStructMap.GetOrCreateKeywordField(name));
+        }
+        else if (!_faslMode)
+        {
+            int idx = AddSymbolConstant(Startup.Keyword(name));
+            _il.Emit(OpCodes.Ldc_I4, idx);
+            _il.Emit(OpCodes.Call, _getConstant);
+            _il.Emit(OpCodes.Castclass, typeof(Symbol));
+        }
+        else
+        {
+            _il.Emit(OpCodes.Ldstr, Track(name));
+            _il.Emit(OpCodes.Call, _methodCache["Startup.Keyword"]);
+        }
+    }
+
+    /// <summary>FASL mode: push the inline cache cell (a ReaderCache or a
+    /// WriterCache, whose constructor takes the accessor's symbol) of this
+    /// READER-IC / WRITER-IC site. The cell is a static field of its own per
+    /// site, so the (class, slot index) a call fills stays for the next call, as
+    /// the constant-pool cell does in memory. It is made by the first execution
+    /// of the site, not by the type initializer: that runs before the file's
+    /// top-level forms, and the accessor's package may be one they define (see
+    /// GetOrCreateSymPkgField). Two threads that both find the field empty each
+    /// make a cell and one of them is kept; either is a valid empty cache.
+    /// Soundness does not depend on the cell's lifetime: every hit is checked
+    /// against the generic function's MethodEpoch.
+    ///
+    /// With no type to hang a field on (split/inner assemblers) a fresh cell
+    /// is made on every call, which always misses and resolves the accessor.</summary>
+    private void EmitFaslInlineCacheCell(string name, string pkg, Type cellType)
+    {
+        var ctor = cellType.GetConstructor(new[] { typeof(Symbol) })!;
+        if (_faslStructMap?.UninternedTypeBuilder != null
+            && _faslStructMap.SymFnSiteInitIl != null)
+        {
+            var field = _faslStructMap.CreateInlineCacheField(cellType);
+            var haveCell = _il.DefineLabel();
+            _il.Emit(OpCodes.Ldsfld, field);
+            _il.Emit(OpCodes.Dup);
+            _il.Emit(OpCodes.Brtrue, haveCell);
+            _il.Emit(OpCodes.Pop);
+            _il.Emit(OpCodes.Ldstr, Track(name));
+            _il.Emit(OpCodes.Ldstr, Track(pkg));
+            _il.Emit(OpCodes.Call, _methodCache["Startup.SymInPkg"]);
+            _il.Emit(OpCodes.Newobj, ctor);
+            _il.Emit(OpCodes.Dup);
+            _il.Emit(OpCodes.Stsfld, field);
+            _il.MarkLabel(haveCell);
+        }
+        else
+        {
+            _il.Emit(OpCodes.Ldstr, Track(name));
+            _il.Emit(OpCodes.Ldstr, Track(pkg));
+            _il.Emit(OpCodes.Call, _methodCache["Startup.SymInPkg"]);
+            _il.Emit(OpCodes.Newobj, ctor);
+        }
+    }
+
+    private void EmitInternedSymbol(string name, string pkg)
+    {
+        if (_faslMode && _cachedLiteralDepth == 0 && !_runOnce && _faslStructMap?.UninternedTypeBuilder != null
             && _faslStructMap.SymFnSiteInitIl != null)
         {
             var symPkgField = _faslStructMap.GetOrCreateSymPkgField(name, pkg);
@@ -4472,7 +5241,7 @@ public partial class CilAssembler
     /// Returns the intern key, or null if make-load-form is unusable here (errored, or
     /// an in-progress creation cycle) so the caller can fall back to inline emission.
     /// </summary>
-    private string? EnsureInstanceCreatedTopLevel(LispInstance li, LispObject mlfFn)
+    private string? EnsureInstanceCreatedTopLevel(LispObject li, LispObject mlfFn)
     {
         if (_faslStructMap!.TryGetInstanceKey(li, out var existing))
             // Registered but not yet created => we are inside its own dep recursion
@@ -4482,7 +5251,7 @@ public partial class CilAssembler
         LispObject creationForm, initForm;
         try
         {
-            var raw = Runtime.Funcall(mlfFn, li);
+            var raw = CallMakeLoadForm(mlfFn, li);
             if (raw is MvReturn mv && mv.Count >= 1)
             {
                 creationForm = mv[0];
@@ -4491,8 +5260,15 @@ public partial class CilAssembler
             else { creationForm = raw; initForm = Nil.Instance; }
         }
         catch { return null; }
+        return EnsureCreatedTopLevelWith(li, creationForm, initForm);
+    }
 
-        var key = _faslStructMap.RegisterInstance(li, initForm is Nil ? null : initForm);
+    /// <summary>EnsureInstanceCreatedTopLevel once the object's MAKE-LOAD-FORM
+    /// has been called: register it, emit its creation (dependencies first) into
+    /// ModuleInit, and the init forms that become runnable.</summary>
+    private string? EnsureCreatedTopLevelWith(LispObject li, LispObject creationForm, LispObject initForm)
+    {
+        var key = _faslStructMap!.RegisterInstance(li, initForm is Nil ? null : initForm);
 
         // Creation forms for instances referenced by THIS creation form must run first.
         var deps = new List<LispInstance>();
@@ -4523,6 +5299,12 @@ public partial class CilAssembler
     {
         var tb = _faslStructMap!.UninternedTypeBuilder!;
         var initIl = _faslStructMap.UninternedInitIl!;
+        if (intern && MatchSlotSavingCreationForm(form) is var (bClass, bSets) && bClass != null
+            && TryEmitMlfIntoBatch(key!, bClass, bSets!))
+            return;
+        if (intern && MatchSlotSavingCreationForm(form).Item1 == null
+            && TryEmitMlfEvalIntoBatch(key!, form))
+            return;
         int id = _faslStructMap.TopLevelMethodCount++;
         var m = tb.DefineMethod("_mlf_" + id,
             MethodAttributes.Public | MethodAttributes.Static,
@@ -4533,7 +5315,34 @@ public partial class CilAssembler
             _il = il, _faslMode = true,
             _faslTypeBuilder = tb, _faslStructMap = _faslStructMap,
         };
-        if (intern)
+        if (intern && MatchSlotSavingCreationForm(form) is var (className, sets) && className != null)
+        {
+            // The creation form MAKE-LOAD-FORM-SAVING-SLOTS returns:
+            // (LET ((v (ALLOCATE-INSTANCE (FIND-CLASS 'C)))) (SETF (SLOT-VALUE v 'S) 'X) ... v).
+            // Run it directly instead of handing the form to EVAL at load, which
+            // compiled and JIT-compiled it once per object. As with InternViaEval,
+            // nothing runs when the key is already interned.
+            inner._runOnce = true;
+            var skip = il.DefineLabel();
+            il.Emit(OpCodes.Ldstr, Track(key!));
+            il.Emit(OpCodes.Call, _isInterned);
+            il.Emit(OpCodes.Brtrue, skip);
+            il.Emit(OpCodes.Ldstr, Track(key!));
+            inner.EmitLoadConstInline(className);
+            il.Emit(OpCodes.Call, _internAllocateInstance);
+            foreach (var (slot, value) in sets!)
+            {
+                il.Emit(OpCodes.Dup);
+                inner.EmitLoadConstInline(slot);
+                inner.EmitLoadConstInline(value);
+                il.Emit(OpCodes.Call, _setSlotValue);
+                il.Emit(OpCodes.Pop);
+            }
+            il.Emit(OpCodes.Pop);
+            il.MarkLabel(skip);
+            il.Emit(OpCodes.Ldsfld, typeof(Nil).GetField("Instance")!);
+        }
+        else if (intern)
         {
             il.Emit(OpCodes.Ldstr, Track(key!));
             inner.EmitLoadConstInline(form);
@@ -4551,8 +5360,312 @@ public partial class CilAssembler
         initIl.Emit(OpCodes.Pop);
     }
 
+    internal sealed class MlfBatch
+    {
+        public required FaslDataWriter Writer;
+        public required int PartIndex;
+        /// <summary>True for a batch of creation forms to evaluate
+        /// (FaslData.RunMlfEvalBatch), false for slot-saving objects.</summary>
+        public required bool Eval;
+        public int Count;
+        public int InitOffset;
+    }
+
+    // Objects per batch. A batch is one payload read in one call, so this only
+    // bounds how much is decoded per call.
+    private const int MaxMlfBatchObjects = 256;
+
+    private FaslDataWriter NewFaslDataWriter()
+    {
+        var map = _faslStructMap!;
+        var w = new FaslDataWriter
+        {
+            UninternedIndex = map.GetOrCreateUninternedSymbolIndex,
+            InstanceKey = li => map.TryGetInstanceKey(li, out var k) ? k : null,
+            OnSymbol = map.RecordSymbolReference,
+            SharedSlot = map.CrossLiteralSlotFor,
+        };
+        // As the code route: a table past the inline size is a copy of a
+        // prototype the fasl keeps, unless it holds an object that has to
+        // stay one object with something outside it.
+        w.HtPrototypePart = ht => ht.Count > MaxHtInline && !ReachesSharedNode(ht, w.LocalShared)
+            ? HtPrototypeDataPart(ht) : -2;
+        return w;
+    }
+
+    private bool ReachesSharedNode(LispHashTable ht, HashSet<LispObject>? local)
+    {
+        var cross = _faslStructMap?.CrossLiteralShared;
+        if (cross == null && local == null) return false;
+        var seen = new HashSet<LispObject>(ReferenceEqualityComparer.Instance);
+        var st = new Stack<LispObject>();
+        st.Push(ht);
+        while (st.Count > 0)
+        {
+            var node = st.Pop();
+            if (!HasLiteralIdentity(node) || !seen.Add(node)) continue;
+            if (!ReferenceEquals(node, ht)
+                && ((cross?.ContainsKey(node) ?? false) || (local?.Contains(node) ?? false)))
+                return true;
+            switch (node)
+            {
+                case Cons c: st.Push(c.Cdr); st.Push(c.Car); break;
+                case LispVector v when v.ElementTypeName == "T":
+                    for (int i = 0; i < v.Length; i++) st.Push(v.ElementAt(i));
+                    break;
+                case LispHashTable h:
+                    foreach (var kv in h.Entries) { st.Push(kv.Value); st.Push(kv.Key); }
+                    break;
+            }
+        }
+        return false;
+    }
+
+    private static readonly int DataRouteMinNodes =
+        int.TryParse(Environment.GetEnvironmentVariable("DOTCL_LITERAL_DATA_MIN_NODES"),
+                     out var v) && v > 0 ? v : 6;
+
+    /// <summary>Emit an aggregate literal as a data part and a load of it
+    /// (FaslData.ReadValue). False, with nothing emitted, when the literal is
+    /// small (its IL is cheaper than the call) or holds anything that cannot
+    /// go as data.</summary>
+    private bool TryEmitConstantAsData(LispObject val)
+    {
+        var map = _faslStructMap;
+        if (map?.UninternedTypeBuilder == null || val is not (Cons or LispVector)) return false;
+        // A dry run first: no instance is created for a literal that then
+        // goes the IL route anyway (that route creates them in its own order).
+        var local = CollectSharedLiteralNodes(val);
+        var probe = NewFaslDataWriter();
+        probe.InstanceKey = _ => "";
+        probe.HtPrototypePart = _ => -2;
+        probe.SharedSlot = n => map.CrossLiteralShared != null && map.CrossLiteralShared.ContainsKey(n)
+            && !map.CrossLiteralBuilding.Contains(n) ? 0 : -1;
+        if (local.Count > 0) probe.LocalShared = local;
+        if (!probe.TryValue(val) || probe.Nodes < DataRouteMinNodes) return false;
+        if (!EnsureInstancesForData(val)) return false;
+        var w = NewFaslDataWriter();
+        if (local.Count > 0) w.LocalShared = local;
+        if (!w.TryValue(val)) return false;
+        int part = map.AddDataPart(w.ToArray());
+        _il.Emit(OpCodes.Ldsfld, map.DataPartsField());
+        _il.Emit(OpCodes.Ldc_I4, part);
+        _il.Emit(OpCodes.Ldsfld, map.HtCacheField());
+        _il.Emit(OpCodes.Ldsfld, map.UninternedTableField());
+        _il.Emit(OpCodes.Ldsfld, map.SharedSlotsField());
+        _il.Emit(OpCodes.Call, typeof(FaslData).GetMethod("ReadValue")!);
+        return true;
+    }
+
+    /// <summary>Have every instance under ROOT that this fasl has not yet
+    /// registered created by its MAKE-LOAD-FORM, in the order the IL route
+    /// would reach them (and with the same effect: the creation goes into
+    /// ModuleInit before the form being written). False when one cannot be,
+    /// which leaves the value to the IL route.</summary>
+    private bool EnsureInstancesForData(LispObject root)
+    {
+        var map = _faslStructMap!;
+        var seen = new HashSet<LispObject>(ReferenceEqualityComparer.Instance);
+        bool Walk(LispObject o, int depth)
+        {
+            if (depth > 1000) return false;
+            switch (o)
+            {
+                case Cons c:
+                    for (LispObject cur = c; ; )
+                    {
+                        if (cur is Cons cc)
+                        {
+                            if (!seen.Add(cc)) return true;
+                            if (!Walk(cc.Car, depth + 1)) return false;
+                            cur = cc.Cdr;
+                        }
+                        else return Walk(cur, depth + 1);
+                    }
+                case LispVector v when v.ElementTypeName == "T":
+                    if (!seen.Add(v)) return true;
+                    for (int i = 0; i < v.Length; i++)
+                        if (!Walk(v.ElementAt(i), depth + 1)) return false;
+                    return true;
+                case LispHashTable ht:
+                    if (!seen.Add(ht)) return true;
+                    foreach (var kv in ht.Entries)
+                        if (!Walk(kv.Key, depth + 1) || !Walk(kv.Value, depth + 1)) return false;
+                    return true;
+                case LispInstance li:
+                    if (map.TryGetInstanceKey(li, out _)) return true;
+                    var mlf = Startup.Sym("MAKE-LOAD-FORM");
+                    return mlf?.Function != null && EnsureInstanceCreatedTopLevel(li, mlf.Function) != null;
+                default:
+                    return true;
+            }
+        }
+        return Walk(root, 0);
+    }
+
+    /// <summary>Write one MAKE-LOAD-FORM-SAVING-SLOTS creation (key, class name,
+    /// then the slot count and the (slot, value) pairs, behind a length so the
+    /// loader can skip an object already interned). False, with nothing
+    /// written, when a value cannot go as data.</summary>
+    private static bool WriteMlfObject(FaslDataWriter w, string key, Symbol className,
+        List<(LispObject, LispObject)> sets)
+    {
+        int mark = w.Mark;
+        w.Str(key);
+        int len = w.ReserveLength();
+        bool ok = w.TryValue(className);
+        if (ok)
+        {
+            w.Varint((ulong)sets.Count);
+            foreach (var (slot, value) in sets)
+                if (!w.TryValue(slot) || !w.TryValue(value)) { ok = false; break; }
+        }
+        if (!ok) { w.Reset(mark); return false; }
+        w.PatchLength(len);
+        return true;
+    }
+
+    /// <summary>Append one MAKE-LOAD-FORM-SAVING-SLOTS creation to the open
+    /// batch, opening one if needed. The batch is data (see FaslData): the
+    /// objects are made at load by FaslData.RunMlfBatch, called from ModuleInit
+    /// where the batch was opened. Same effect as the one-method form: nothing
+    /// when KEY is already interned, else allocate, register and set the slots.
+    /// Returns false when the object cannot go as data.</summary>
+    private bool TryEmitMlfIntoBatch(string key, Symbol className, List<(LispObject, LispObject)> sets)
+    {
+        var map = _faslStructMap!;
+        foreach (var (_, value) in sets)
+            if (!EnsureInstancesForData(value)) return false;
+        // Try it on its own first, so that an object that cannot go as data
+        // does not open a batch.
+        if (!WriteMlfObject(NewFaslDataWriter(), key, className, sets)) return false;
+        var b = OpenMlfBatchFor(eval: false);
+        if (!WriteMlfObject(b.Writer, key, className, sets))
+            throw new InvalidOperationException("fasl: MLF object written once but not twice");
+        b.Count++;
+        return true;
+    }
+
+    /// <summary>Append one creation form that is evaluated at load (any
+    /// MAKE-LOAD-FORM other than the slot-saving shape) to the open batch of
+    /// such forms. Same effect as the one-method form: nothing when KEY is
+    /// already interned, else LispInstance.InternViaEval. False when the form
+    /// cannot go as data.</summary>
+    private bool TryEmitMlfEvalIntoBatch(string key, LispObject form)
+    {
+        if (!EnsureInstancesForData(form)) return false;
+        static bool Write(FaslDataWriter w, string key, LispObject form)
+        {
+            int mark = w.Mark;
+            w.Str(key);
+            if (w.TryValue(form)) return true;
+            w.Reset(mark);
+            return false;
+        }
+        if (!Write(NewFaslDataWriter(), key, form)) return false;
+        var b = OpenMlfBatchFor(eval: true);
+        if (!Write(b.Writer, key, form))
+            throw new InvalidOperationException("fasl: MLF form written once but not twice");
+        b.Count++;
+        return true;
+    }
+
+    /// <summary>The open MLF batch of the given kind that the next object can
+    /// join (nothing written to ModuleInit since it was opened), else a new
+    /// one whose call is placed in ModuleInit now. Counts the object.</summary>
+    private MlfBatch OpenMlfBatchFor(bool eval)
+    {
+        var map = _faslStructMap!;
+        var initIl = map.UninternedInitIl!;
+        var b = map.OpenMlfBatch;
+        if (b != null && (b.Eval != eval || b.Count >= MaxMlfBatchObjects || initIl.ILOffset != b.InitOffset))
+        {
+            CloseMlfBatch(map);
+            b = null;
+        }
+        if (b == null)
+        {
+            int part = map.ReserveDataPart();
+            initIl.Emit(OpCodes.Ldsfld, map.DataPartsField());
+            initIl.Emit(OpCodes.Ldc_I4, part);
+            initIl.Emit(OpCodes.Ldsfld, map.HtCacheField());
+            initIl.Emit(OpCodes.Ldsfld, map.UninternedTableField());
+            initIl.Emit(OpCodes.Ldsfld, map.SharedSlotsField());
+            initIl.Emit(OpCodes.Call, typeof(FaslData).GetMethod(eval ? "RunMlfEvalBatch" : "RunMlfBatch")!);
+            initIl.Emit(OpCodes.Pop);
+            b = new MlfBatch { Writer = NewFaslDataWriter(), PartIndex = part, InitOffset = initIl.ILOffset, Eval = eval };
+            map.OpenMlfBatch = b;
+        }
+        // Counted per object, like the one-method form: the merged top level
+        // helpers check this counter to see that no creation was emitted.
+        map.TopLevelMethodCount++;
+        return b;
+    }
+
+    /// <summary>Finish the open MLF batch, if any, into its data part. Called
+    /// before a new batch is opened and before the fasl's types are created.</summary>
+    internal static void CloseMlfBatch(FaslStructInternMap map)
+    {
+        var b = map.OpenMlfBatch;
+        if (b == null) return;
+        map.OpenMlfBatch = null;
+        map.SetDataPart(b.PartIndex, b.Writer.ToArray());
+    }
+
+    // A structure is interned as well as an instance, so the check asks for
+    // any object under the key (TryGetInterned answers instances only and is
+    // kept for fasls that already call it).
+    private static readonly MethodInfo _isInterned =
+        typeof(LispInstance).GetMethod("IsInterned", new[] { typeof(string) })!;
+    private static readonly MethodInfo _internAllocateInstance =
+        typeof(LispInstance).GetMethod("InternAllocateInstance", new[] { typeof(string), typeof(LispObject) })!;
+    private static readonly MethodInfo _setSlotValue =
+        typeof(Runtime).GetMethod("SetSlotValue", new[] { typeof(LispObject), typeof(LispObject), typeof(LispObject) })!;
+
+    private static bool IsClSymbol(LispObject o, string name) =>
+        o is Symbol s && s.Name == name && s.HomePackage?.Name == "COMMON-LISP";
+
+    /// <summary>(QUOTE x) -> x, else null.</summary>
+    private static LispObject? QuotedObject(LispObject o) =>
+        o is Cons q && IsClSymbol(q.Car, "QUOTE") && q.Cdr is Cons qa && qa.Cdr is Nil ? qa.Car : null;
+
+    /// <summary>The class name and the (slot name, value) pairs of
+    /// (LET ((v (ALLOCATE-INSTANCE (FIND-CLASS 'C)))) (SETF (SLOT-VALUE v 'S) 'X) ... v),
+    /// else (null, null).</summary>
+    private static (Symbol?, List<(LispObject, LispObject)>?) MatchSlotSavingCreationForm(LispObject form)
+    {
+        if (form is not Cons l || !IsClSymbol(l.Car, "LET") || l.Cdr is not Cons lb
+            || lb.Car is not Cons bindings || bindings.Cdr is not Nil
+            || bindings.Car is not Cons b || b.Car is not Symbol v
+            || b.Cdr is not Cons bi || bi.Cdr is not Nil
+            || bi.Car is not Cons ai || !IsClSymbol(ai.Car, "ALLOCATE-INSTANCE")
+            || ai.Cdr is not Cons aa || aa.Cdr is not Nil
+            || aa.Car is not Cons fc || !IsClSymbol(fc.Car, "FIND-CLASS")
+            || fc.Cdr is not Cons fa || fa.Cdr is not Nil
+            || QuotedObject(fa.Car) is not Symbol className)
+            return (null, null);
+        var sets = new List<(LispObject, LispObject)>();
+        for (var cur = lb.Cdr; cur is Cons cc; cur = cc.Cdr)
+        {
+            if (cc.Cdr is Nil)
+                return ReferenceEquals(cc.Car, v) ? (className, sets) : (null, null);
+            if (cc.Car is Cons sf && IsClSymbol(sf.Car, "SETF")
+                && sf.Cdr is Cons s1 && s1.Car is Cons place && s1.Cdr is Cons s2 && s2.Cdr is Nil
+                && IsClSymbol(place.Car, "SLOT-VALUE")
+                && place.Cdr is Cons p1 && ReferenceEquals(p1.Car, v)
+                && p1.Cdr is Cons p2 && p2.Cdr is Nil
+                && QuotedObject(p2.Car) is Symbol slot
+                && QuotedObject(s2.Car) is { } value)
+                sets.Add((slot, value));
+            else
+                return (null, null);
+        }
+        return (null, null);
+    }
+
     private void EmitFaslInstanceFallback(LispInstance li)
     {
+        li.EnsureCurrent();
         string pkgName = li.Class.Name.HomePackage?.Name ?? "COMMON-LISP";
         string symName = li.Class.Name.Name;
         _il.Emit(OpCodes.Ldstr, pkgName);
@@ -4606,7 +5719,7 @@ public partial class CilAssembler
             {
                 _il = il, _faslMode = true,
                 _faslTypeBuilder = _faslTypeBuilder, _faslStructMap = _faslStructMap,
-                _skipStructIntern = _skipStructIntern,
+                _skipStructIntern = _skipStructIntern, _sharedMemo = _sharedMemo,
             };
             var acc = il.DeclareLocal(typeof(LispObject));
             il.Emit(OpCodes.Ldarg_0);
@@ -4649,7 +5762,7 @@ public partial class CilAssembler
             {
                 _il = il, _faslMode = true,
                 _faslTypeBuilder = _faslTypeBuilder, _faslStructMap = _faslStructMap,
-                _skipStructIntern = _skipStructIntern,
+                _skipStructIntern = _skipStructIntern, _sharedMemo = _sharedMemo,
             };
             for (int i = start; i < end; i++)
             {
@@ -4688,12 +5801,14 @@ public partial class CilAssembler
         {
             _il = il, _faslMode = true,
             _faslTypeBuilder = _faslTypeBuilder, _faslStructMap = _faslStructMap,
-            _skipStructIntern = _skipStructIntern,
+            _skipStructIntern = _skipStructIntern, _sharedMemo = _sharedMemo,
             // The set of structs currently being emitted is what breaks cycles.
             // It has to cross into the helper, or a cyclic struct graph would
             // spill back and forth between methods forever.
             _inlineVisited = _inlineVisited,
             _suppressLiteralCache = true,
+            _cachedLiteralDepth = _cachedLiteralDepth,
+            _runOnce = _runOnce,
         };
         inner.EmitLoadConstInline(val);
         il.Emit(OpCodes.Ret);
@@ -4710,6 +5825,7 @@ public partial class CilAssembler
     /// </summary>
     private void EmitFaslLargeHashTable(LispHashTable ht, List<KeyValuePair<LispObject, LispObject>> entries)
     {
+        if (TryEmitFaslHashTableFromPrototype(ht, entries)) return;
         const int ChunkSize = 1500; // ~1500 entries x ~30 bytes/entry = ~45KB, safely under 64KB IL limit
         int htId = Interlocked.Increment(ref _faslClosureCount);
         var setMethod = typeof(LispHashTable).GetMethod("Set",
@@ -4737,6 +5853,7 @@ public partial class CilAssembler
             inner._faslTypeBuilder = _faslTypeBuilder;
             inner._faslStructMap = _faslStructMap;
             inner._skipStructIntern = true;
+            inner._sharedMemo = _sharedMemo;
 
             for (int i = chunkStart; i < chunkEnd; i++)
             {
@@ -4771,6 +5888,314 @@ public partial class CilAssembler
         _il.Emit(OpCodes.Castclass, typeof(LispObject));
     }
 
+    /// <summary>
+    /// FASL mode: a large hash table literal as a copy of a prototype table the
+    /// fasl builds once and keeps to itself. The prototype of a table that
+    /// shares most of its entries (same key and value objects) with a table
+    /// emitted earlier in the same file is built as a copy of that one plus the
+    /// differences. A code walker that copies its environment tables for every
+    /// nested scope otherwise puts the same thousand entries into the fasl as
+    /// IL once per scope, all of it JIT-compiled at load to run once.
+    ///
+    /// Each literal still gets its own table (a copy). Entries are shared only
+    /// where the compile-time tables held the very same objects. Declined (the
+    /// caller builds the table in place) when any object under the table also
+    /// occurs elsewhere in the literal being emitted: the per-literal memo
+    /// fields that keep such objects one object are not visible from a
+    /// prototype another literal may build first.
+    /// </summary>
+    private bool TryEmitFaslHashTableFromPrototype(LispHashTable ht,
+        List<KeyValuePair<LispObject, LispObject>> entries)
+    {
+        var map = _faslStructMap;
+        if (map == null || map.UninternedTypeBuilder == null || _faslTypeBuilder == null)
+            return false;
+        if (!HashTableIsSelfContained(ht)) return false;
+
+        // As data when every key and value can go that way: FaslData.HtPrototype
+        // builds it at first use.
+        int dataPart = HtPrototypeDataPart(ht);
+        if (dataPart >= 0)
+        {
+            EmitHtPrototypeDataUse(dataPart);
+            return true;
+        }
+
+        var (snapshot, baseProto, removed, added) = PlanHtPrototype(ht, entries, data: false);
+
+        int id = Interlocked.Increment(ref _faslClosureCount);
+        var field = map.DefineLiteralCacheField();
+        var protoMethod = _faslTypeBuilder.DefineMethod($"_htp_{id}",
+            MethodAttributes.Private | MethodAttributes.Static,
+            typeof(LispHashTable), Type.EmptyTypes);
+        var il = protoMethod.GetILGenerator();
+        var done = il.DefineLabel();
+        il.Emit(OpCodes.Ldsfld, field);
+        il.Emit(OpCodes.Castclass, typeof(LispHashTable));
+        il.Emit(OpCodes.Dup);
+        il.Emit(OpCodes.Brtrue, done);
+        il.Emit(OpCodes.Pop);
+        if (baseProto != null)
+        {
+            il.Emit(OpCodes.Call, baseProto.Method!);
+            il.Emit(OpCodes.Call, _htCopyLiteral);
+        }
+        else
+        {
+            il.Emit(OpCodes.Ldstr, ht.TestName);
+            il.Emit(OpCodes.Newobj, typeof(LispHashTable).GetConstructor(new[] { typeof(string) })!);
+        }
+        foreach (var chunk in EmitHtPrototypeChunks(id, "r", removed.Select(k => new KeyValuePair<LispObject, LispObject>(k, k)).ToList(), remove: true))
+        {
+            il.Emit(OpCodes.Dup);
+            il.Emit(OpCodes.Call, chunk);
+        }
+        foreach (var chunk in EmitHtPrototypeChunks(id, "s", added, remove: false))
+        {
+            il.Emit(OpCodes.Dup);
+            il.Emit(OpCodes.Call, chunk);
+        }
+        il.Emit(OpCodes.Dup);
+        il.Emit(OpCodes.Stsfld, field);
+        il.MarkLabel(done);
+        il.Emit(OpCodes.Ret);
+
+        map.HtPrototypes.Add(new FaslStructInternMap.HtPrototype(ht.TestName, snapshot, protoMethod));
+
+        _il.Emit(OpCodes.Call, protoMethod);
+        _il.Emit(OpCodes.Call, _htCopyLiteral);
+        _il.Emit(OpCodes.Castclass, typeof(LispObject));
+        return true;
+    }
+
+    /// <summary>What a prototype for HT is built from: the snapshot of its
+    /// entries, and the best earlier prototype of the same kind (data or
+    /// code) to start from, with the keys to remove from a copy of it and the
+    /// entries to set. The base is an earlier prototype of the same test
+    /// sharing the most (key, value) pairs, used only when it covers at least
+    /// half the entries.</summary>
+    private (Dictionary<LispObject, LispObject> snapshot, FaslStructInternMap.HtPrototype? baseProto,
+        List<LispObject> removed, List<KeyValuePair<LispObject, LispObject>> added)
+        PlanHtPrototype(LispHashTable ht, List<KeyValuePair<LispObject, LispObject>> entries, bool data)
+    {
+        var map = _faslStructMap!;
+        var snapshot = new Dictionary<LispObject, LispObject>(entries.Count, ReferenceEqualityComparer.Instance);
+        foreach (var kv in entries) snapshot[kv.Key] = kv.Value;
+
+        FaslStructInternMap.HtPrototype? baseProto = null;
+        int best = 0;
+        var protos = map.HtPrototypes;
+        for (int i = protos.Count - 1, seen = 0; i >= 0 && seen < 32; i--, seen++)
+        {
+            var p = protos[i];
+            if (p.Test != ht.TestName || (p.Method == null) != data) continue;
+            int match = 0;
+            foreach (var kv in entries)
+                if (p.Entries.TryGetValue(kv.Key, out var v) && SameLiteralObject(v, kv.Value)) match++;
+            if (match > best) { best = match; baseProto = p; }
+        }
+        if (best * 2 < entries.Count) baseProto = null;
+
+        var removed = new List<LispObject>();
+        var added = new List<KeyValuePair<LispObject, LispObject>>();
+        if (baseProto != null)
+        {
+            foreach (var kv in baseProto.Entries)
+                if (!snapshot.TryGetValue(kv.Key, out var v) || !SameLiteralObject(v, kv.Value))
+                    removed.Add(kv.Key);
+            // A removed key is emitted afresh to find the prototype's entry, which
+            // only works for a key the table's test matches by content.
+            if (removed.Any(k => !KeyFoundByContent(k, ht.TestName)))
+            {
+                baseProto = null;
+                removed.Clear();
+            }
+        }
+        if (baseProto != null)
+        {
+            foreach (var kv in entries)
+                if (!baseProto.Entries.TryGetValue(kv.Key, out var v) || !SameLiteralObject(v, kv.Value))
+                    added.Add(kv);
+        }
+        else added = entries;
+        return (snapshot, baseProto, removed, added);
+    }
+
+    /// <summary>The data part that holds the prototype of HT (see
+    /// FaslData.HtPrototype), written on first request; -1 when an entry
+    /// cannot go as data. Emits no code itself, other than the creation of
+    /// instances the entries name (EnsureInstancesForData), so a data payload
+    /// being written can refer to it.</summary>
+    private int HtPrototypeDataPart(LispHashTable ht)
+    {
+        var map = _faslStructMap!;
+        if (map.HtDataParts.TryGetValue(ht, out int known)) return known;
+        // A table that reaches itself has no prototype to refer to yet.
+        if (!map.HtDataBuilding.Add(ht)) return -1;
+        try { return HtPrototypeDataPartCore(ht); }
+        finally { map.HtDataBuilding.Remove(ht); }
+    }
+
+    private int HtPrototypeDataPartCore(LispHashTable ht)
+    {
+        var map = _faslStructMap!;
+        var entries = ht.Entries.ToList();
+        var (snapshot, baseProto, removed, added) = PlanHtPrototype(ht, entries, data: true);
+        foreach (var k in removed)
+            if (!EnsureInstancesForData(k)) return -1;
+        foreach (var kv in added)
+            if (!EnsureInstancesForData(kv.Key) || !EnsureInstancesForData(kv.Value)) return -1;
+        var w = NewFaslDataWriter();
+        w.Str(ht.TestName);
+        w.Varint((ulong)(baseProto == null ? 0 : baseProto.Part + 1));
+        w.Varint((ulong)removed.Count);
+        foreach (var k in removed)
+            if (!w.TryValue(k)) return -1;
+        w.Varint((ulong)added.Count);
+        foreach (var kv in added)
+            if (!w.TryValue(kv.Key) || !w.TryValue(kv.Value)) return -1;
+        int part = map.AddDataPart(w.ToArray());
+        map.HtPrototypes.Add(new FaslStructInternMap.HtPrototype(ht.TestName, snapshot, null, part));
+        map.HtDataParts[ht] = part;
+        return part;
+    }
+
+    /// <summary>A copy of the hash table prototype in data part PART.</summary>
+    private void EmitHtPrototypeDataUse(int part)
+    {
+        var map = _faslStructMap!;
+        _il.Emit(OpCodes.Ldsfld, map.DataPartsField());
+        _il.Emit(OpCodes.Ldc_I4, part);
+        _il.Emit(OpCodes.Ldsfld, map.HtCacheField());
+        _il.Emit(OpCodes.Ldsfld, map.UninternedTableField());
+        _il.Emit(OpCodes.Call, typeof(FaslData).GetMethod("HtPrototype")!);
+        _il.Emit(OpCodes.Call, _htCopyLiteral);
+    }
+
+    // Hash table literals with more entries than this are built from a
+    // prototype rather than inline.
+    private const int MaxHtInline = 20;
+
+    private static readonly MethodInfo _htCopyLiteral =
+        typeof(LispHashTable).GetMethod("CopyLiteral", new[] { typeof(LispHashTable) })!;
+
+    /// <summary>Methods (LispHashTable) -> void that Set, or Remove, the given
+    /// entries. The prototype runs once per load, so the keys and values are
+    /// emitted without per-site caches.</summary>
+    private List<MethodBuilder> EmitHtPrototypeChunks(int id, string tag,
+        List<KeyValuePair<LispObject, LispObject>> items, bool remove)
+    {
+        const int ChunkSize = 1500;
+        var result = new List<MethodBuilder>();
+        var setMethod = typeof(LispHashTable).GetMethod("Set", new[] { typeof(LispObject), typeof(LispObject) })!;
+        var removeMethod = typeof(LispHashTable).GetMethod("Remove", new[] { typeof(LispObject) })!;
+        for (int start = 0; start < items.Count; start += ChunkSize)
+        {
+            int end = Math.Min(start + ChunkSize, items.Count);
+            var m = _faslTypeBuilder!.DefineMethod($"_htp_{id}_{tag}{result.Count}",
+                MethodAttributes.Private | MethodAttributes.Static,
+                typeof(void), new[] { typeof(LispHashTable) });
+            result.Add(m);
+            var cil = m.GetILGenerator();
+            var inner = new CilAssembler
+            {
+                _il = cil, _faslMode = true,
+                _faslTypeBuilder = _faslTypeBuilder, _faslStructMap = _faslStructMap,
+                _skipStructIntern = true,
+                _suppressLiteralCache = true,
+                _cachedLiteralDepth = 1,
+            };
+            for (int i = start; i < end; i++)
+            {
+                cil.Emit(OpCodes.Ldarg_0);
+                inner.EmitLoadConstInline(items[i].Key);
+                if (remove)
+                {
+                    cil.Emit(OpCodes.Callvirt, removeMethod);
+                    cil.Emit(OpCodes.Pop);
+                }
+                else
+                {
+                    inner.EmitLoadConstInline(items[i].Value);
+                    cil.Emit(OpCodes.Callvirt, setMethod);
+                }
+            }
+            cil.Emit(OpCodes.Ret);
+        }
+        return result;
+    }
+
+    /// <summary>Whether a copy of KEY built from the literal is the same key to a
+    /// table with test TEST: symbols always, numbers and characters under EQL
+    /// and up, and under EQUAL and EQUALP also strings, pathnames and conses of
+    /// such.</summary>
+    private static bool KeyFoundByContent(LispObject key, string test)
+    {
+        switch (key)
+        {
+            case Symbol or Nil or T: return true;
+            case Number or LispChar: return test != "EQ";
+            case LispString or LispPathname: return test is "EQUAL" or "EQUALP";
+            case Cons:
+                if (test is not ("EQUAL" or "EQUALP")) return false;
+                for (LispObject cur = key; ; )
+                {
+                    if (cur is Cons c)
+                    {
+                        if (!KeyFoundByContent(c.Car, test)) return false;
+                        cur = c.Cdr;
+                    }
+                    else return KeyFoundByContent(cur, test);
+                }
+            default: return false;
+        }
+    }
+
+    /// <summary>EQ for objects with identity; EQL for numbers and characters,
+    /// which a literal rebuilds by value anyway.</summary>
+    private static bool SameLiteralObject(LispObject a, LispObject b) =>
+        ReferenceEquals(a, b)
+        || (a is Number || a is LispChar) && Runtime.IsTrueEql(a, b);
+
+    /// <summary>Whether no identity-carrying object under HT (HT included) is
+    /// one the current literal, or another literal of the current form,
+    /// reaches more than once.</summary>
+    private bool HashTableIsSelfContained(LispHashTable ht)
+    {
+        var memoShared = _sharedMemo?.Shared;
+        var cross = _faslStructMap?.CrossLiteralShared;
+        if (memoShared == null && cross == null) return true;
+        var seen = new HashSet<LispObject>(ReferenceEqualityComparer.Instance);
+        var st = new Stack<LispObject>();
+        st.Push(ht);
+        while (st.Count > 0)
+        {
+            var node = st.Pop();
+            if (!HasLiteralIdentity(node) || !seen.Add(node)) continue;
+            if ((memoShared != null && memoShared.Contains(node))
+                || (cross != null && cross.ContainsKey(node)))
+                return false;
+            switch (node)
+            {
+                case Cons c: st.Push(c.Cdr); st.Push(c.Car); break;
+                case LispVector v:
+                    if (v.ElementTypeName == "T")
+                        for (int i = v.Length - 1; i >= 0; i--) st.Push(v.ElementAt(i));
+                    break;
+                case LispStruct ls:
+                    foreach (var sl in ls.SlotsSnapshot()) if (sl is LispObject so) st.Push(so);
+                    break;
+                case LispHashTable h:
+                    foreach (var kv in h.Entries) { st.Push(kv.Value); st.Push(kv.Key); }
+                    break;
+                case LispInstance li:
+                    foreach (var sl in li.Slots) if (sl is LispObject so) st.Push(so);
+                    break;
+            }
+        }
+        return true;
+    }
+
     /// <summary>Compute a deterministic content key for LispStruct interning.</summary>
     /// <summary>
     /// Try to emit IL for a struct constant via the make-load-form protocol (CLHS 3.2.4.2).
@@ -4782,9 +6207,17 @@ public partial class CilAssembler
         var mlfSym = Startup.Sym("MAKE-LOAD-FORM");
         if (mlfSym?.Function == null)
             return false;
+        if (_faslStructMap != null && _faslStructMap.TryGetInstanceKey(ls, out var known))
+        {
+            // Already registered: created earlier in this file, or in progress
+            // (a cycle through its own creation form, which the lookup then
+            // reports at load as not yet created).
+            EmitInstanceLookup(known);
+            return true;
+        }
         try
         {
-            var raw = Runtime.Funcall(mlfSym.Function, ls);
+            var raw = CallMakeLoadForm(mlfSym.Function, ls);
             LispObject form = raw is MvReturn mv && mv.Count > 0 ? mv[0] : raw;
             if (form is Nil) return false;
             // A creation form that only allocates and fills slots says nothing the
@@ -4796,6 +6229,19 @@ public partial class CilAssembler
                 && cls2.StructSlotNames.Length == ls.SlotCount
                 && FormIsSlotSaving(ls, cls2, form))
                 return false;
+            // In a fasl the structure goes through the make-load-form registry,
+            // as an instance does: the creation form runs when the fasl is
+            // loaded, in ModuleInit (CLHS 3.2.4.4), not when the literal is first
+            // used, and the init form, if any, after it. The literal is then a
+            // lookup of the object by its key.
+            if (_faslStructMap?.UninternedTypeBuilder != null)
+            {
+                var initForm = raw is MvReturn mv2 && mv2.Count >= 2 ? mv2[1] : Nil.Instance;
+                var regKey = EnsureCreatedTopLevelWith(ls, form, initForm);
+                if (regKey == null) return false;
+                EmitInstanceLookup(regKey);
+                return true;
+            }
             _il.Emit(OpCodes.Ldstr, Track(internKey));
             EmitLoadConstInline(form);
             _il.Emit(OpCodes.Call, typeof(LispStruct).GetMethod("InternViaEval",
@@ -5049,6 +6495,8 @@ public partial class CilAssembler
         {
             // Fixnum
             ["Fixnum.Make"] = typeof(Fixnum).GetMethod("Make")!,
+            ["DoubleFloat.Box"] = typeof(DoubleFloat).GetMethod("Box")!,
+            ["SingleFloat.Box"] = typeof(SingleFloat).GetMethod("Box")!,
 
             // LispChar
             ["LispChar.Make"] = typeof(LispChar).GetMethod("Make")!,
@@ -5093,6 +6541,7 @@ public partial class CilAssembler
             ["Runtime.IsTrueLe"] = typeof(Runtime).GetMethod("IsTrueLe")!,
             ["Runtime.IsTrueNumEq"] = typeof(Runtime).GetMethod("IsTrueNumEq")!,
             ["Runtime.IsTrueZerop"] = typeof(Runtime).GetMethod("IsTrueZerop")!,
+            ["AbsentKey.Is"] = typeof(AbsentKey).GetMethod("Is")!,
             ["Runtime.IsTrueMinusp"] = typeof(Runtime).GetMethod("IsTrueMinusp")!,
             ["Runtime.IsTruePlusp"] = typeof(Runtime).GetMethod("IsTruePlusp")!,
             // Used by the inline symbol comparison the compiler emits in place of
@@ -5108,6 +6557,7 @@ public partial class CilAssembler
             ["Runtime.IsTrueListp"] = typeof(Runtime).GetMethod("IsTrueListp")!,
             ["Runtime.IsTrueNumberp"] = typeof(Runtime).GetMethod("IsTrueNumberp")!,
             ["Runtime.IsTrueIntegerp"] = typeof(Runtime).GetMethod("IsTrueIntegerp")!,
+            ["Runtime.IsFixnumObject"] = typeof(Runtime).GetMethod("IsFixnumObject")!,
             ["Runtime.IsTrueSymbolp"] = typeof(Runtime).GetMethod("IsTrueSymbolp")!,
             ["Runtime.IsTrueStringp"] = typeof(Runtime).GetMethod("IsTrueStringp")!,
             ["Runtime.IsTrueCharacterp"] = typeof(Runtime).GetMethod("IsTrueCharacterp")!,
@@ -5217,9 +6667,16 @@ public partial class CilAssembler
             ["Runtime.Logand"] = typeof(Runtime).GetMethod("Logand")!,
             ["Runtime.Logxor"] = typeof(Runtime).GetMethod("Logxor")!,
             ["Runtime.Logior2"] = typeof(Runtime).GetMethod("Logior2")!,
+            ["Runtime.Low64"] = typeof(Runtime).GetMethod("Low64")!,
+            ["Runtime.IsU64"] = typeof(Runtime).GetMethod("IsU64")!,
+            ["Runtime.BoxU64"] = typeof(Runtime).GetMethod("BoxU64")!,
+            ["Runtime.ShrU64"] = typeof(Runtime).GetMethod("ShrU64")!,
+            ["Runtime.ShlU64"] = typeof(Runtime).GetMethod("ShlU64")!,
             ["Runtime.Logand2"] = typeof(Runtime).GetMethod("Logand2")!,
             ["Runtime.Logxor2"] = typeof(Runtime).GetMethod("Logxor2")!,
             ["Runtime.Lognot"] = typeof(Runtime).GetMethod("Lognot")!,
+            ["Runtime.Logcount"] = typeof(Runtime).GetMethod("Logcount")!,
+            ["Runtime.Logtest"] = typeof(Runtime).GetMethod("Logtest")!,
             ["Runtime.Ash"] = typeof(Runtime).GetMethod("Ash")!,
             ["Runtime.AshLeftLong"] = typeof(Runtime).GetMethod("AshLeftLong")!,
             ["Runtime.IntegerLength"] = typeof(Runtime).GetMethod("IntegerLength")!,
@@ -5312,6 +6769,11 @@ public partial class CilAssembler
 
             // MultipleValues
             ["MultipleValues.Reset"] = typeof(MultipleValues).GetMethod("Reset")!,
+            ["MultipleValues.TakeMode"] = typeof(MultipleValues).GetMethod("TakeMode")!,
+            ["MultipleValues.PassMode"] = typeof(MultipleValues).GetMethod("PassMode")!,
+            ["MultipleValues.Values2Mode"] = typeof(MultipleValues).GetMethod("Values2Mode")!,
+            ["MultipleValues.Values3Mode"] = typeof(MultipleValues).GetMethod("Values3Mode")!,
+            ["MultipleValues.Values4Mode"] = typeof(MultipleValues).GetMethod("Values4Mode")!,
             ["MultipleValues.Primary"] = typeof(MultipleValues).GetMethod("Primary")!,
             ["MultipleValues.SaveCount"] = typeof(MultipleValues).GetMethod("SaveCount")!,
             ["MultipleValues.SaveValues"] = typeof(MultipleValues).GetMethod("SaveValues")!,
@@ -5428,6 +6890,13 @@ public partial class CilAssembler
             ["LispFunction.Invoke6"] = typeof(LispFunction).GetMethod("Invoke6")!,
             ["LispFunction.Invoke7"] = typeof(LispFunction).GetMethod("Invoke7")!,
             ["LispFunction.Invoke8"] = typeof(LispFunction).GetMethod("Invoke8")!,
+            ["LispFunction.Invoke0M"] = typeof(LispFunction).GetMethod("Invoke0M")!,
+            ["LispFunction.Invoke1M"] = typeof(LispFunction).GetMethod("Invoke1M")!,
+            ["LispFunction.Invoke2M"] = typeof(LispFunction).GetMethod("Invoke2M")!,
+            ["LispFunction.Invoke3M"] = typeof(LispFunction).GetMethod("Invoke3M")!,
+            ["LispFunction.Invoke4M"] = typeof(LispFunction).GetMethod("Invoke4M")!,
+            ["LispFunction.Invoke5M"] = typeof(LispFunction).GetMethod("Invoke5M")!,
+            ["LispFunction.Invoke6M"] = typeof(LispFunction).GetMethod("Invoke6M")!,
             ["LispFunction.InvokeNative1"] = typeof(LispFunction).GetMethod("InvokeNative1")!,
             ["LispFunction.InvokeNative2"] = typeof(LispFunction).GetMethod("InvokeNative2")!,
             ["LispFunction.InvokeNative3"] = typeof(LispFunction).GetMethod("InvokeNative3")!,
@@ -5607,6 +7076,10 @@ public partial class CilAssembler
             ["MultipleValues.CaptureForBind"] = typeof(MultipleValues).GetMethod("CaptureForBind")!,
             ["MultipleValues.BindNth"] = typeof(MultipleValues).GetMethod("BindNth")!,
             ["Runtime.ModFixnumL"] = typeof(Runtime).GetMethod("ModFixnumL")!,
+            ["Runtime.FloorFixnumL"] = typeof(Runtime).GetMethod("FloorFixnumL")!,
+            ["Runtime.TruncateFixnumL"] = typeof(Runtime).GetMethod("TruncateFixnumL")!,
+            ["Runtime.FloorFixnumBoxed"] = typeof(Runtime).GetMethod("FloorFixnumBoxed")!,
+            ["Runtime.TruncateFixnumBoxed"] = typeof(Runtime).GetMethod("TruncateFixnumBoxed")!,
             ["Runtime.RemFixnumL"] = typeof(Runtime).GetMethod("RemFixnumL")!,
             ["Runtime.WriteString1"] = typeof(Runtime).GetMethod("WriteString1")!,
             ["Runtime.WriteString2"] = typeof(Runtime).GetMethod("WriteString2")!,
@@ -5679,6 +7152,10 @@ public partial class CilAssembler
                 typeof(Runtime).GetMethod("WrapDotNetExceptionObj")!,
             ["Runtime.RewrapNonLispException"] =
                 typeof(Runtime).GetMethod("RewrapNonLispException")!,
+            ["Runtime.HandlerBindFilter"] =
+                typeof(Runtime).GetMethod("HandlerBindFilter")!,
+            ["Runtime.HandlerBindRethrow"] =
+                typeof(Runtime).GetMethod("HandlerBindRethrow")!,
             ["Runtime.IsLispControlFlowException"] =
                 typeof(Runtime).GetMethod("IsLispControlFlowException")!,
             ["Runtime.ThrowControlError"] =
@@ -5765,6 +7242,7 @@ public partial class CilAssembler
         {
             ["Nil.Instance"] = typeof(Nil).GetField("Instance")!,
             ["T.Instance"] = typeof(T).GetField("Instance")!,
+            ["AbsentKey.Instance"] = typeof(AbsentKey).GetField("Instance")!,
             // Debug-only boxed-variable cell (see LispBox); read/written via
             // ldfld/stfld in the debug codegen path.
             ["LispBox.Value"] = typeof(LispBox).GetField("Value")!,

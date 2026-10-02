@@ -19,7 +19,12 @@ namespace DotCL;
 public static class DotclHost
 {
     private static bool _initialized;
-    private static bool _coreLoaded;
+    // Volatile: EnsureCoreLoaded reads it outside the lock on its fast path.
+    private static volatile bool _coreLoaded;
+    // Held while EnsureCore finds and loads the core, so that threads calling it
+    // at the same time load it once. Separate from _initLock: a core load is long
+    // and has nothing to do with the bootstrap that lock protects.
+    private static readonly object _coreLock = new object();
     private static readonly object _initLock = new object();
     private static int _initializeCount;
 
@@ -329,12 +334,20 @@ public static class DotclHost
     private static void EnsureCoreLoaded()
     {
         if (_coreLoaded) return;
-        var core = FindCore()
-            ?? throw new InvalidOperationException(
-                "DotclHost.EnsureCore: no dotcl.core found next to the application. "
-                + "A project referencing DotCL.Runtime gets one copied to its output; "
-                + "otherwise pass an explicit path to LoadCore.");
-        LoadCore(core);
+        // Several components may make sure of the core from their own threads at
+        // once. Without the lock each saw no core yet and loaded one: the loads
+        // corrupted each other's collections, and a second load alone fails on the
+        // locked COMMON-LISP package.
+        lock (_coreLock)
+        {
+            if (_coreLoaded) return;
+            var core = FindCore()
+                ?? throw new InvalidOperationException(
+                    "DotclHost.EnsureCore: no dotcl.core found next to the application. "
+                    + "A project referencing DotCL.Runtime gets one copied to its output; "
+                    + "otherwise pass an explicit path to LoadCore.");
+            LoadCore(core);
+        }
     }
 
     /// <summary>
@@ -342,7 +355,7 @@ public static class DotclHost
     /// </summary>
     public static void LoadLispFile(string path)
     {
-        Runtime.Load(new LispObject[] { new LispString(path) });
+        HostEntry(() => Runtime.Load(new LispObject[] { new LispString(path) }));
     }
 
     /// <summary>
@@ -428,14 +441,20 @@ public static class DotclHost
 
     /// <summary>
     /// Read and evaluate a Lisp source expression given as a string.
+    /// The result is the primary value of the last form, as a single-value
+    /// position in Lisp sees it (NIL when the form returns no values); use
+    /// <see cref="EvalStringMv"/> for every value.
     /// </summary>
     public static LispObject EvalString(string source)
     {
-        var reader = new Reader(new System.IO.StringReader(source));
-        LispObject last = Nil.Instance;
-        while (reader.TryRead(out var form))
-            last = Runtime.Eval(form);
-        return last;
+        return HostEntry(() =>
+        {
+            var reader = new Reader(new System.IO.StringReader(source));
+            LispObject last = Nil.Instance;
+            while (reader.TryRead(out var form))
+                last = Runtime.Eval(form);
+            return PrimaryOf(last);
+        });
     }
 
     /// <summary>
@@ -455,121 +474,256 @@ public static class DotclHost
         set
         {
             Initialize();
-            var pkg = Package.FindPackage(value)
+            var name = ReadHostName(value, "CurrentPackage");
+            if (name.Package != null)
+                throw new InvalidOperationException(
+                    $"DotclHost.CurrentPackage: \"{value}\" is a qualified symbol, not a package name");
+            var pkg = Package.FindPackage(name.Name)
                 ?? throw new InvalidOperationException(
-                    $"DotclHost.CurrentPackage: no package named {value}"
-                    + $"{NameHint(value)}");
+                    $"DotclHost.CurrentPackage: no package named {name.Name}"
+                    + SpellingHint(value, name.Name, true));
             DynamicBindings.Set(Startup.Sym("*PACKAGE*"), pkg);
         }
     }
 
     /// <summary>
+    /// A name as a host wrote it, read the way the Lisp reader reads a symbol
+    /// token: PACKAGE is the package name (null when unqualified, "KEYWORD" for a
+    /// leading colon), NAME the symbol name, INTERNAL whether "::" was written.
+    /// </summary>
+    private readonly struct HostName
+    {
+        public readonly string? Package;
+        public readonly string Name;
+        public readonly bool Internal;
+        public HostName(string? package, string name, bool isInternal)
+        { Package = package; Name = name; Internal = isInternal; }
+    }
+
+    private static LispReadtable? CurrentReadtable()
+        => DynamicBindings.TryGet(Startup.Sym("*READTABLE*"), out var rt) ? rt as LispReadtable : null;
+
+    /// <summary>
+    /// Read TEXT as the reader reads a symbol token: unescaped characters follow
+    /// the current readtable's case (upcased under the standard readtable),
+    /// "|...|" and "\" escape, and "PKG:NAME" / "PKG::NAME" qualify, the
+    /// package name read by the same rules. The text is only parsed: nothing is
+    /// interned, and a token the reader would take as a number is still a name.
+    /// </summary>
+    private static HostName ReadHostName(string text, string api)
+    {
+        if (text is null) throw new ArgumentNullException(nameof(text));
+        var rt = CurrentReadtable();
+        var readCase = rt?.Case ?? ReadtableCase.Upcase;
+        var chars = new List<(char ch, bool escaped)>();
+        int split = -1;           // index into chars where the symbol name starts
+        int markers = 0;
+        bool lastWasMarker = false;
+        bool inBar = false;
+        Exception Bad(string why) => new InvalidOperationException(
+            $"DotclHost.{api}: \"{text}\" is not a symbol name: {why}");
+        for (int i = 0; i < text.Length; i++)
+        {
+            char c = text[i];
+            if (inBar)
+            {
+                if (c == '|') inBar = false;
+                else if (c == '\\')
+                {
+                    if (++i >= text.Length) throw Bad("it ends in an escape");
+                    chars.Add((text[i], true));
+                }
+                else chars.Add((c, true));
+                lastWasMarker = false;
+                continue;
+            }
+            if (c == '|') { inBar = true; lastWasMarker = false; continue; }
+            if (c == '\\')
+            {
+                if (++i >= text.Length) throw Bad("it ends in an escape");
+                chars.Add((text[i], true));
+                lastWasMarker = false;
+                continue;
+            }
+            if (c == ':')
+            {
+                if (markers == 0) { split = chars.Count; markers = 1; }
+                else if (markers == 1 && lastWasMarker) markers = 2;
+                else throw Bad("too many package markers");
+                lastWasMarker = true;
+                continue;
+            }
+            chars.Add((readCase == ReadtableCase.Invert || rt == null ? c : rt.ApplyCase(c), false));
+            if (rt == null && readCase == ReadtableCase.Upcase)
+                chars[^1] = (char.ToUpperInvariant(c), false);
+            lastWasMarker = false;
+        }
+        if (inBar) throw Bad("a \"|\" is not closed");
+        if (readCase == ReadtableCase.Invert)
+        {
+            bool upper = false, lower = false;
+            foreach (var (ch, esc) in chars)
+                if (!esc && char.IsLetter(ch)) { if (char.IsUpper(ch)) upper = true; else lower = true; }
+            if (upper != lower)
+                for (int i = 0; i < chars.Count; i++)
+                    if (!chars[i].escaped && char.IsLetter(chars[i].ch))
+                        chars[i] = (upper ? char.ToLowerInvariant(chars[i].ch)
+                                          : char.ToUpperInvariant(chars[i].ch), false);
+        }
+        string Text(int from, int to)
+        {
+            var sb = new System.Text.StringBuilder(to - from);
+            for (int i = from; i < to; i++) sb.Append(chars[i].ch);
+            return sb.ToString();
+        }
+        if (markers == 0)
+        {
+            if (chars.Count == 0) throw Bad("it is empty");
+            return new HostName(null, Text(0, chars.Count), false);
+        }
+        if (split == chars.Count) throw Bad("there is no name after the package marker");
+        var package = split == 0 ? "KEYWORD" : Text(0, split);
+        return new HostName(package, Text(split, chars.Count), markers == 2 || split == 0);
+    }
+
+    /// <summary>
+    /// How a host writes NAME so that <see cref="ReadHostName"/> reads it back
+    /// as exactly NAME: as is when the readtable leaves it alone, else in bars.
+    /// </summary>
+    private static string HostSpelling(string name)
+    {
+        bool plain = name.Length > 0;
+        foreach (var c in name)
+            if (c == '|' || c == '\\' || c == ':' || char.IsWhiteSpace(c)) { plain = false; break; }
+        if (plain)
+        {
+            try { if (ReadHostName(name, "").Name == name && ReadHostName(name, "").Package == null) return name; }
+            catch (InvalidOperationException) { }
+        }
+        return "|" + name.Replace("\\", "\\\\").Replace("|", "\\|") + "|";
+    }
+
+    /// <summary>
+    /// Appended to a "not found" message: what the host's text was read as, when
+    /// that differs from what was written, and a symbol or package whose name
+    /// differs from it only in case, with the spelling that reaches it.
+    /// </summary>
+    private static string SpellingHint(string written, string readName, bool isPackage)
+    {
+        var sb = new System.Text.StringBuilder();
+        if (written != readName) sb.Append($" (\"{written}\" reads as {readName})");
+        var alternatives = new List<string>();
+        if (isPackage)
+        {
+            foreach (var pkg in Package.AllPackages)
+                if (pkg.Name != readName && string.Equals(pkg.Name, readName, StringComparison.OrdinalIgnoreCase)
+                    && !alternatives.Contains(pkg.Name))
+                    alternatives.Add(pkg.Name);
+        }
+        else
+        {
+            foreach (var pkg in Package.AllPackages)
+                foreach (var sym in pkg.ExternalSymbols.Concat(pkg.InternalSymbols))
+                    if (sym.Name != readName
+                        && string.Equals(sym.Name, readName, StringComparison.OrdinalIgnoreCase)
+                        && !alternatives.Contains(sym.Name))
+                        alternatives.Add(sym.Name);
+        }
+        if (alternatives.Count > 0)
+            sb.Append(" -- names are read as the Lisp reader reads them; ")
+              .Append(string.Join(", ", alternatives.Select(n => $"{n} is written \"{HostSpelling(n)}\"")));
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// The package a host-written name is qualified with, or the error saying
+    /// which package it was read as.
+    /// </summary>
+    private static Package HostPackage(HostName name, string text, string api)
+        => Package.FindPackage(name.Package!)
+           ?? throw new InvalidOperationException(
+               $"DotclHost.{api}: no package named {name.Package} (in \"{text}\")"
+               + SpellingHint(text[..Math.Max(0, text.IndexOf(':'))], name.Package!, true));
+
+    /// <summary>
+    /// The symbol a qualified host name names: one colon reaches the exported
+    /// surface, two reach everything, as in the reader.
+    /// </summary>
+    private static Symbol QualifiedSymbol(HostName name, string text, string api)
+    {
+        var pkg = HostPackage(name, text, api);
+        var (sym, status) = pkg.FindSymbol(name.Name);
+        if (status == SymbolStatus.None)
+            throw new InvalidOperationException(
+                $"DotclHost.{api}: package {pkg.Name} has no symbol {name.Name} (in \"{text}\")"
+                + SpellingHint(text[(text.LastIndexOf(':') + 1)..], name.Name, false));
+        if (!name.Internal && status != SymbolStatus.External)
+            throw new InvalidOperationException(
+                $"DotclHost.{api}: {pkg.Name} does not export {name.Name}; "
+                + $"write \"{HostSpelling(pkg.Name)}::{HostSpelling(name.Name)}\" to reach it anyway");
+        return sym;
+    }
+
+    /// <summary>
     /// Resolve a function name a host passed in, for <see cref="Call"/>.
     ///
-    /// The string is a SYMBOL NAME, matched exactly -- it is not source text and
-    /// no reader runs over it. "GREET" names what (defun greet ...) defined, and
-    /// "greet" names what (defun |greet| ...) defined. Case folding here would be
-    /// a second, subtly different naming rule beside the reader's: whichever way
-    /// it leaned, one of those two symbols would become unreachable or would
-    /// change meaning the day the other was defined. What a host needs instead is
-    /// to be told what to write, which is what the error below does.
+    /// The string is read the way the Lisp reader reads a symbol (see
+    /// <see cref="ReadHostName"/>), so "fact" names what (defun fact ...)
+    /// defined, "|fact|" a lowercase symbol, and "mylib:entry" an external
+    /// symbol of MYLIB. One rule, the reader's, so a string has one meaning.
     ///
     /// An unqualified name is resolved in <see cref="CurrentPackage"/>, exactly
     /// as the reader would resolve it there -- inherited symbols included. It is
     /// NOT searched for across every package: that made a working call start
     /// failing as ambiguous the day an unrelated library defined the same name,
-    /// and hid which package had answered. A name from elsewhere is written
-    /// "PKG:NAME" (the package name is matched exactly too), or reached by
-    /// setting CurrentPackage. When resolution fails, the packages that do have
-    /// such a function are named in the error, so the convenience survives as a
-    /// diagnostic instead of as a rule.
+    /// and hid which package had answered. When resolution fails, the packages
+    /// that do have such a function are named in the error, so the convenience
+    /// survives as a diagnostic instead of as a rule.
     /// </summary>
-    private static Symbol ResolveCallable(string functionName)
+    private static Symbol ResolveCallable(string functionName, string api = "Call")
     {
-        var colon = functionName.IndexOf(':');
-        if (colon > 0)
-        {
-            var pkgName = functionName[..colon];
-            bool internalOk = colon + 1 < functionName.Length && functionName[colon + 1] == ':';
-            var symName = functionName[colon..].TrimStart(':');
-            var pkg = Package.FindPackage(pkgName)
-                ?? throw new InvalidOperationException(
-                    $"DotclHost.Call: no package named {pkgName} (in \"{functionName}\"){NameHint(pkgName)}");
-            var (qualified, qualifiedStatus) = pkg.FindSymbol(symName);
-            if (qualifiedStatus == SymbolStatus.None)
-                throw new InvalidOperationException(
-                    $"DotclHost.Call: package {pkgName} has no symbol {symName}{NameHint(symName)}");
-            // One colon reaches the exported surface, two reach everything --
-            // the same distinction the reader draws, for the same reason: a
-            // package's internals are not part of what it offers.
-            if (!internalOk && qualifiedStatus != SymbolStatus.External)
-                throw new InvalidOperationException(
-                    $"DotclHost.Call: {pkgName} does not export {symName}; "
-                    + $"write \"{pkgName}::{symName}\" to reach it anyway");
-            return qualified;
-        }
+        var name = ReadHostName(functionName, api);
+        if (name.Package != null) return QualifiedSymbol(name, functionName, api);
 
         var current = DynamicBindings.Get(Startup.Sym("*PACKAGE*")) as Package;
         if (current != null)
         {
-            var (sym, status) = current.FindSymbol(functionName);
+            var (sym, status) = current.FindSymbol(name.Name);
             if (status != SymbolStatus.None && sym.Function != null) return sym;
         }
         throw new InvalidOperationException(
-            $"DotclHost.Call: no function named {functionName} in "
-            + $"{current?.Name ?? "COMMON-LISP-USER"}{NameHint(functionName)}"
-            + ElsewhereHint(functionName));
-    }
-
-    /// <summary>
-    /// The sentence appended when the upcased spelling is the one that exists.
-    /// Nearly every miss here is a host writing the name as it appears in Lisp
-    /// source, where the reader upcased it; saying so costs a line and saves the
-    /// reader of the message a trip through the package system.
-    /// </summary>
-    private static string NameHint(string written)
-    {
-        var upcased = written.ToUpperInvariant();
-        if (upcased == written) return "";
-        bool exists = Package.FindPackage(upcased) != null;
-        if (!exists)
-            foreach (var pkg in Package.AllPackages)
-            {
-                var (_, status) = pkg.FindSymbol(upcased);
-                if (status == SymbolStatus.External || status == SymbolStatus.Internal)
-                { exists = true; break; }
-            }
-        return exists
-            ? $" -- names are matched exactly and \"{upcased}\" does exist "
-              + "(the reader upcases, so a name written lowercase in Lisp source is upcased here)"
-            : "";
+            $"DotclHost.{api}: no function named {name.Name} in "
+            + $"{current?.Name ?? "COMMON-LISP-USER"}{SpellingHint(functionName, name.Name, false)}"
+            + ElsewhereHint(name.Name));
     }
 
     /// <summary>Packages that do own a function of this exact name, for the
     /// "not found here" message. Resolution does not consult them.</summary>
-    private static string ElsewhereHint(string functionName)
+    private static string ElsewhereHint(string symbolName)
     {
         var owners = new List<string>();
         foreach (var pkg in Package.AllPackages)
         {
-            var (candidate, status) = pkg.FindSymbol(functionName);
+            var (candidate, status) = pkg.FindSymbol(symbolName);
             if (status != SymbolStatus.External && status != SymbolStatus.Internal) continue;
             if (candidate.Function == null) continue;
             var home = candidate.HomePackage?.Name ?? pkg.Name;
             if (!owners.Contains(home)) owners.Add(home);
         }
         if (owners.Count == 0) return "";
-        return $"; defined in {string.Join(", ", owners)} -- write \"PKG:{functionName}\" "
-             + "or set DotclHost.CurrentPackage";
+        return $"; defined in {string.Join(", ", owners)} -- write "
+             + $"\"{HostSpelling(owners[0])}:{HostSpelling(symbolName)}\" or set DotclHost.CurrentPackage";
     }
 
     /// <summary>
-    /// Call a Lisp function by name with .NET object arguments. The name is a
-    /// symbol name matched exactly and may be package-qualified ("MYLIB:ENTRY");
+    /// Call a Lisp function by name with .NET object arguments. The name is read
+    /// as the Lisp reader reads a symbol ("fact", "|lower|", "mylib:entry");
     /// an unqualified name resolves as described on <see cref="ResolveCallable"/>.
     /// Each arg is converted via <see cref="Runtime.DotNetToLisp"/>; the return is
-    /// a <see cref="LispObject"/>. Use <see cref="LispString.Value"/> etc. to
-    /// extract typed results.
+    /// the function's primary value as a <see cref="LispObject"/>, the way a
+    /// single-value position in Lisp receives it: (floor 7 2) gives the Fixnum 3,
+    /// and a function returning no values gives NIL. Use <see cref="CallMv"/> for
+    /// every value, and <see cref="LispString.Value"/> etc. to extract typed results.
     /// </summary>
     public static LispObject Call(string functionName, params object?[] args)
     {
@@ -580,7 +734,7 @@ public static class DotclHost
         var lispArgs = new LispObject[args.Length];
         for (int i = 0; i < args.Length; i++)
             lispArgs[i] = Runtime.DotNetToLisp(args[i]);
-        return fn.Invoke(lispArgs);
+        return HostEntry(() => PrimaryOf(fn.Invoke(lispArgs)));
     }
 
     /// <summary>
@@ -594,7 +748,7 @@ public static class DotclHost
     /// </summary>
     public static LispObject[] CallMv(string functionName, params object?[] args)
     {
-        var sym = ResolveCallable(functionName);
+        var sym = ResolveCallable(functionName, "CallMv");
         if (sym.Function is not LispFunction fn)
             throw new InvalidOperationException(
                 $"DotclHost.CallMv: symbol {functionName} has no function binding");
@@ -606,7 +760,7 @@ public static class DotclHost
         // function that returns one value the ordinary way looks like it returned
         // none -- the same trap the compiled call sequence avoids the same way.
         MultipleValues.Reset();
-        return ValuesOf(fn.Invoke(lispArgs));
+        return HostEntry(() => ValuesOf(fn.Invoke(lispArgs)));
     }
 
     /// <summary>
@@ -616,15 +770,18 @@ public static class DotclHost
     /// </summary>
     public static LispObject[] EvalStringMv(string source)
     {
-        var reader = new Reader(new System.IO.StringReader(source));
-        LispObject last = Nil.Instance;
-        MultipleValues.Reset();
-        while (reader.TryRead(out var form))
+        return HostEntry(() =>
         {
+            var reader = new Reader(new System.IO.StringReader(source));
+            LispObject last = Nil.Instance;
             MultipleValues.Reset();
-            last = Runtime.Eval(form);
-        }
-        return ValuesOf(last);
+            while (reader.TryRead(out var form))
+            {
+                MultipleValues.Reset();
+                last = Runtime.Eval(form);
+            }
+            return ValuesOf(last);
+        });
     }
 
     /// <summary>
@@ -636,11 +793,26 @@ public static class DotclHost
         => MultipleValues.Of(primary);
 
     /// <summary>
+    /// The value a single-value receiver takes from a call's result. A call that
+    /// returned several values (or none) hands back a wrapper for them, and that
+    /// wrapper is opened: its first value, or NIL when there are none. Anything
+    /// else IS the value. The thread's values channel is not read: after a
+    /// non-local exit (a HANDLER-CASE clause, under the interpreter) it can still
+    /// hold what an inner form published, and the clause's own value is the result.
+    /// </summary>
+    private static LispObject PrimaryOf(LispObject result)
+    {
+        if (result is not MvReturn mv) return result;
+        var values = mv.ToArray();
+        return values.Length > 0 ? values[0] : Nil.Instance;
+    }
+
+    /// <summary>
     /// The value of a special variable, by name. Resolution follows the same
     /// rule as <see cref="Call"/>: "*FOO*" in <see cref="CurrentPackage"/>,
     /// "PKG:*FOO*" for an exported one, "PKG::*FOO*" to reach an internal one.
-    /// The name is a SYMBOL NAME, so it is matched exactly -- write it the way
-    /// the reader would have produced it, in upper case.
+    /// The name is read as the Lisp reader reads a symbol, so "*foo*" and
+    /// "*FOO*" are the same variable under the standard readtable.
     ///
     /// This is the general form of <see cref="CurrentPackage"/>, which stays as
     /// the convenience for the one variable every host touches.
@@ -648,7 +820,7 @@ public static class DotclHost
     public static LispObject GetSpecial(string variableName)
     {
         Initialize();
-        var sym = ResolveVariable(variableName);
+        var sym = ResolveVariable(variableName, "GetSpecial");
         if (!DynamicBindings.TryGet(sym, out var value))
             throw new InvalidOperationException(
                 $"DotclHost.GetSpecial: {variableName} is unbound");
@@ -668,7 +840,7 @@ public static class DotclHost
     public static void SetSpecial(string variableName, object? value)
     {
         Initialize();
-        var sym = ResolveVariable(variableName);
+        var sym = ResolveVariable(variableName, "SetSpecial");
         DynamicBindings.Set(sym, value is LispObject lo ? lo : Runtime.DotNetToLisp(value));
     }
 
@@ -679,32 +851,13 @@ public static class DotclHost
     /// package, so SetSpecial can create a variable the Lisp side then reads --
     /// which is the point of having a setter at all.
     /// </summary>
-    private static Symbol ResolveVariable(string variableName)
+    private static Symbol ResolveVariable(string variableName, string api)
     {
-        var colon = variableName.IndexOf(':');
-        if (colon > 0)
-        {
-            var pkgName = variableName[..colon];
-            bool internalOk = colon + 1 < variableName.Length && variableName[colon + 1] == ':';
-            var symName = variableName[colon..].TrimStart(':');
-            var pkg = Package.FindPackage(pkgName)
-                ?? throw new InvalidOperationException(
-                    $"DotclHost.GetSpecial/SetSpecial: no package named {pkgName} "
-                    + $"(in \"{variableName}\"){NameHint(pkgName)}");
-            var (qualified, qualifiedStatus) = pkg.FindSymbol(symName);
-            if (qualifiedStatus == SymbolStatus.None)
-                throw new InvalidOperationException(
-                    $"DotclHost.GetSpecial/SetSpecial: package {pkgName} has no symbol "
-                    + $"{symName}{NameHint(symName)}");
-            if (!internalOk && qualifiedStatus != SymbolStatus.External)
-                throw new InvalidOperationException(
-                    $"DotclHost.GetSpecial/SetSpecial: {pkgName} does not export {symName}; "
-                    + $"write \"{pkgName}::{symName}\" to reach it anyway");
-            return qualified;
-        }
+        var name = ReadHostName(variableName, api);
+        if (name.Package != null) return QualifiedSymbol(name, variableName, api);
         var current = DynamicBindings.Get(Startup.Sym("*PACKAGE*")) as Package;
-        if (current != null) return current.Intern(variableName).symbol;
-        return Startup.Sym(variableName);
+        if (current != null) return current.Intern(name.Name).symbol;
+        return Startup.Sym(name.Name);
     }
 
     /// <summary>
@@ -835,16 +988,26 @@ public static class DotclHost
     /// <summary>
     /// Expose a host .NET function to Lisp under NAME, callable like any Lisp
     /// function (the counterpart of <see cref="Call"/>'s Lisp->C# direction).
-    /// The symbol is interned in CL-USER, so Lisp code reads <c>(name ...)</c>
-    /// without a package prefix. Arguments arrive as natural .NET values (same
+    /// NAME is read as the Lisp reader reads a symbol; an unqualified name is
+    /// interned in CL-USER, so Lisp code there reads <c>(name ...)</c> without a
+    /// package prefix. Arguments arrive as natural .NET values (same
     /// conversion as <see cref="ToClr"/>) and the return is converted back via
     /// <see cref="Runtime.DotNetToLisp"/>; return null for a Lisp NIL. Registering
     /// a function does not generate code, so it is allowed under PrecompiledOnly.
     /// </summary>
     public static void Register(string name, Func<object?[], object?> fn)
     {
-        var pkg = Package.FindPackage("CL-USER") ?? Startup.CLUser;
-        var (sym, _) = pkg.Intern(name.ToUpperInvariant());
+        // Read like any other host name. Unqualified, it is a symbol in CL-USER
+        // whatever CurrentPackage is; "PKG::NAME" makes it in PKG, and
+        // "PKG:NAME" names an existing external symbol of PKG.
+        var read = ReadHostName(name, "Register");
+        Symbol sym;
+        if (read.Package == null)
+            sym = (Package.FindPackage("CL-USER") ?? Startup.CLUser).Intern(read.Name).symbol;
+        else if (read.Internal)
+            sym = HostPackage(read, name, "Register").Intern(read.Name).symbol;
+        else
+            sym = QualifiedSymbol(read, name, "Register");
         sym.Function = new LispFunction(args =>
         {
             var clrArgs = new object?[args.Length];
@@ -882,141 +1045,68 @@ public static class DotclHost
     public static void SetThrowingDebuggerHook(bool typed)
     {
         var hookSym = Startup.Sym("*DEBUGGER-HOOK*");
-        DynamicBindings.Set(hookSym, new LispFunction(a =>
+        var hook = new LispFunction(a =>
         {
             var cond = a.Length > 0 ? a[0] : Nil.Instance;
             if (typed) throw new DotclConditionException(cond);
             throw new InvalidOperationException(ConditionText.Line(cond));
-        }, "*NON-INTERACTIVE-DEBUGGER-HOOK*", 2));
+        }, "*NON-INTERACTIVE-DEBUGGER-HOOK*", 2);
+        _typedThrowingHook = typed ? hook : null;
+        DynamicBindings.Set(hookSym, hook);
     }
 
-    // -- Project-core build (ASDF -> fasl) ------------------------------------
-    // Shared by the `dotcl build` CLI subcommand (runtime/Program.cs) and the
-    // MSBuild integration. Assumes Initialize() + LoadCore() have already run.
-    // These throw on error (FileNotFoundException for a missing .asd); callers
-    // map that to their own diagnostic (CLI: stderr+exit; MSBuild task: Log).
+    /// <summary>The hook the typed <see cref="SetThrowingDebuggerHook(bool)"/>
+    /// installed last, or null when the last one installed was the untyped form.</summary>
+    private static LispFunction? _typedThrowingHook;
 
     /// <summary>
-    /// Walk an ASDF system's <c>:depends-on</c> graph (dependency-first) and
-    /// emit one fasl path per line in load order, excluding the root system.
-    /// Output goes to <paramref name="manifestOut"/> (or stdout when null).
-    /// Dep systems without a pre-built <c>&lt;name&gt;.fasl</c> are compiled on
-    /// the fly via concatenate-source-op. When <paramref name="rootSourcesOut"/>
-    /// is non-null, also writes the root system's component source paths in
-    /// declared order (used by MSBuild as Inputs). <paramref name="targetRid"/>,
-    /// when given, prefers <c>&lt;name&gt;.fasl.r2r-&lt;rid&gt;</c> if present.
+    /// True when an error the runtime raised itself should reach the host as a
+    /// <see cref="DotclConditionException"/>: the typed throwing hook is what
+    /// <c>*debugger-hook*</c> holds right now. Such an error -- a .NET method that
+    /// threw under <c>dotnet:invoke</c>, a type error from CAR -- is thrown as a
+    /// <see cref="LispErrorException"/> without running the hook, so without this
+    /// a host catching DotclConditionException would miss it. A host that has
+    /// since bound <c>*debugger-hook*</c> to something else gets the exception
+    /// unchanged.
     /// </summary>
-    /// <summary>
-    /// Load each user-supplied build-init script (the &lt;DotclBuildInit&gt; items)
-    /// before dependency resolution. dotcl does NOT auto-scan ~/quicklisp etc.; a
-    /// build that needs external systems makes them discoverable here; e.g. the
-    /// script does (pushnew #p".../foo/" asdf:*central-registry*) or boots quicklisp.
-    /// Build-time only: the shipped runtime never runs these, so it can't end up
-    /// depending on the dev machine's paths. Called after (require "asdf").
-    /// </summary>
-    private static void LoadBuildInitScripts(string[]? scripts)
-        => Runtime.LoadLispFiles(scripts, "DotclBuildInit script");
-
-    /// <summary>Lisp preamble shared by the build forms: resolve the root system
-    /// of the .asd the build was pointed at, and refuse to build a different one
-    /// that merely shares its name.
-    ///
-    /// ASDF looks systems up by NAME. The build says "compile this file", loads
-    /// it with LOAD-ASD, and then asks FIND-SYSTEM for the name: at which point
-    /// any other .asd of the same name that ASDF can see (its source registry
-    /// scans whole trees) can answer instead, and the build compiles someone
-    /// else's sources without a word. That is not hypothetical: the in-tree
-    /// project-compose fixture is named DotclApp, so is templates/dotcl-app, and
-    /// the build silently produced the template's code.</summary>
-    /// <summary>Evaluate a Lisp source string for its side effects.</summary>
-    private static void EvalLisp(string source) =>
-        Runtime.Eval(MultipleValues.Primary(
-            Runtime.ReadFromString(new LispObject[] { new LispString(source) })));
-
-    private const string RootSystemHelper = @"
-(progn
-(defun %root-system-of (asd)
-  (flet ((norm (p) (and p (substitute #\/ #\\ (namestring p)))))
-    (let* ((want (norm (truename (pathname asd))))
-           (sys  (asdf:find-system (pathname-name (pathname asd))))
-           (got  (norm (ignore-errors (truename (asdf:system-source-file sys))))))
-      (unless (and got (string-equal got want))
-        (error ""~a defines system ~s, but that name resolves to ~a.~%~
-                Two .asd files in reach of this build define the same system; ~
-                rename one, or keep the other out of the search path.""
-               want (asdf:component-name sys) (or got ""an unknown file"")))
-      sys)))
-
-;; The Lisp source files of SYS itself, in the order ASDF would compile them.
-;; Components inside a :module are included: listing only the system's direct
-;; children dropped every file under a module and compiled the rest as if that
-;; were the whole system. Static files and file-less components (a :nuget
-;; declaration) have nothing to compile and are left out.
-(defun %system-source-files (sys)
-  (loop for c in (asdf:required-components sys :other-systems nil)
-        when (typep c 'asdf:cl-source-file)
-          collect c)))
-";
-
-    /// <summary>
-    /// Register each user-declared external system directory (the
-    /// &lt;DotclAsdSearchPath&gt; items) onto <c>asdf:*central-registry*</c> so the
-    /// project's <c>:depends-on</c> resolves systems that live outside the shipped
-    /// contrib: without dotcl auto-scanning the dev machine. This is the
-    /// declarative common case; &lt;DotclBuildInit&gt; remains the escape hatch for
-    /// anything a plain dir list can't express (booting quicklisp, etc.). Like
-    /// build-init, this runs at build time only and never in the shipped runtime.
-    /// Called after (require "asdf"), before the build-init scripts.
-    /// </summary>
-    private static void RegisterAsdSearchPaths(string[]? dirs)
+    private static bool ConvertsRuntimeErrors()
     {
-        if (dirs == null) return;
-        foreach (var d in dirs)
+        var hook = _typedThrowingHook;
+        return hook != null
+            && ReferenceEquals(DynamicBindings.Get(Startup.Sym("*DEBUGGER-HOOK*")), hook);
+    }
+
+    [ThreadStatic] private static int t_hostEntryDepth;
+
+    /// <summary>
+    /// Run BODY as a call from the host into Lisp. At the outermost such call on
+    /// the thread, a runtime-raised error on its way out becomes a
+    /// <see cref="DotclConditionException"/> (see <see cref="ConvertsRuntimeErrors"/>).
+    /// A nested call -- Lisp code that called back into the host, which called
+    /// into Lisp again -- leaves it alone, so the Lisp frames in between still
+    /// see the original condition and their handlers still apply.
+    /// </summary>
+    private static T HostEntry<T>(Func<T> body)
+    {
+        // The depth is captured rather than read in the filter: filters run in
+        // the first pass of exception dispatch, before the finally blocks of any
+        // nested entry have restored the counter.
+        int depth = ++t_hostEntryDepth;
+        try { return body(); }
+        catch (LispErrorException e) when (depth == 1 && ConvertsRuntimeErrors())
         {
-            if (string.IsNullOrWhiteSpace(d)) continue;
-            // A directory arg whose value ends in "\" gets a trailing quote
-            // glued on by Windows command-line escaping (\" -> literal "), since
-            // the MSBuild Exec passes %(FullPath) of a dir (...\extlib\) quoted.
-            // Strip the surrounding-quote artifact before resolving.
-            var t = d.Trim().Trim('"');
-            if (t.Length == 0) continue;
-            var abs = System.IO.Path.GetFullPath(t).Replace("\\", "/");
-            if (!abs.EndsWith("/")) abs += "/";
-            Runtime.Eval(MultipleValues.Primary(
-                Runtime.ReadFromString(new LispObject[] { new LispString(
-                    $"(pushnew #p\"{abs}\" asdf:*central-registry* :test #'equal)") })));
+            throw new DotclConditionException(e.Condition, e);
         }
+        finally { t_hostEntryDepth--; }
     }
 
-    /// <summary>
-    /// Route ASDF's compile output under <paramref name="cacheDir"/> (a dir
-    /// inside the project's obj/) instead of the default user cache
-    /// (~/.cache/common-lisp/...). ASDF caches each system's component fasls keyed
-    /// by source path; that cache lives outside the project and survives
-    /// `dotnet clean`, so a regenerated source can be shadowed by a stale cached
-    /// fasl (dotcl/dotcl#53). Sending it under obj/ makes `dotnet clean` (which
-    /// wipes obj/) clear it too: one project-local cache, no external trap. The
-    /// source tree is mirrored under the dir so distinct sources never collide.
-    /// Called after (require "asdf"), before any load/compile. MSBuild path only
-    /// (the CLI keeps ASDF's default shared cache).
-    /// </summary>
-    private static void RedirectAsdfOutput(string? cacheDir)
-    {
-        if (string.IsNullOrEmpty(cacheDir)) return;
-        var dir = System.IO.Path.GetFullPath(cacheDir).Replace("\\", "/").TrimEnd('/') + "/";
-        var form = $"(asdf:initialize-output-translations "
-                 + $"(list :output-translations "
-                 + $"(list t (list #p\"{dir}\" :**/ :*.*.*)) "
-                 + $":ignore-inherited-configuration))";
-        Runtime.Eval(MultipleValues.Primary(
-            Runtime.ReadFromString(new LispObject[] { new LispString(form) })));
-    }
+    private static void HostEntry(Action body) => HostEntry<object?>(() => { body(); return null; });
 
     // The build-tool entry points moved to DotclBuild, which is where a build
     // tool should look for them; these forward so code compiled against the old
     // names keeps working for one release. Removing a member is what breaks a
     // shipped fasl, so the names go out with a warning first rather than
-    // disappearing. The implementations below are unchanged.
+    // disappearing. The implementations are in DotclBuild.cs.
     [System.Obsolete("Moved to DotclBuild.ResolveDeps.")]
     public static void ResolveDeps(string asdPath, string? manifestOut, string? rootSourcesOut,
                                    string? targetRid = null, string[]? buildInit = null,
@@ -1037,632 +1127,4 @@ public static class DotclHost
     public static DotclBuild.SystemMeta? ReadSystemMeta(string system, string[]? searchPaths = null)
         => DotclBuild.ReadSystemMeta(system, searchPaths);
 
-    internal static void ResolveDepsCore(string asdPath, string? manifestOut, string? rootSourcesOut, string? targetRid = null, string[]? buildInit = null, string[]? searchPaths = null)
-    {
-        var absAsd = System.IO.Path.GetFullPath(asdPath);
-        if (!System.IO.File.Exists(absAsd))
-            throw new System.IO.FileNotFoundException($"resolve-deps: file not found: {absAsd}", absAsd);
-
-        // Bring asdf in. (require "asdf") goes through module-provide-contrib
-        // and side-effects *central-registry* with shipped contrib subdirs.
-        Runtime.Eval(MultipleValues.Primary(
-            Runtime.ReadFromString(new LispObject[] { new LispString("(require \"asdf\")") })));
-        // Before any .asd is read: a stock asdf.asd visible to the build would
-        // otherwise replace the running ASDF (see PinBundledAsdf).
-        PinBundledAsdf();
-        EvalLisp(RootSystemHelper);
-
-        // MSBuild path (manifest to a file): route ASDF's compile cache under
-        // obj/ so `dotnet clean` clears it (dotcl/dotcl#53). CLI resolve-deps to
-        // stdout keeps ASDF's default shared cache.
-        if (manifestOut != null)
-        {
-            var mDir = System.IO.Path.GetDirectoryName(System.IO.Path.GetFullPath(manifestOut));
-            RedirectAsdfOutput(System.IO.Path.Combine(mDir ?? ".", "asdf-cache"));
-        }
-
-        // Declarative external system dirs (<DotclAsdSearchPath>), then the
-        // build-init scripts (escape hatch, can override / do more).
-        RegisterAsdSearchPaths(searchPaths);
-        LoadBuildInitScripts(buildInit);
-
-        var asdLisp = absAsd.Replace("\\", "/");
-        var manifestForm = manifestOut == null
-            ? "*standard-output*"
-            : $"(open \"{manifestOut.Replace("\\", "/")}\" :direction :output :if-exists :supersede)";
-        // Progress lines ("[resolve-deps] compiling X...") go to stdout in the
-        // MSBuild path (manifest written to a file, so stdout is free), where
-        // <Exec> shows them as ordinary build messages. PowerShell 5.1 wraps any
-        // native-process *stderr* as a red NativeCommandError, so emitting
-        // progress on stderr made a successful build look broken. When the
-        // manifest itself goes to stdout (manifestOut == null), keep progress on
-        // stderr to avoid corrupting the manifest stream.
-        var progressStream = manifestOut == null ? "*error-output*" : "*standard-output*";
-        var rootSourcesForm = rootSourcesOut == null
-            ? "nil"
-            : $"(open \"{rootSourcesOut.Replace("\\", "/")}\" :direction :output :if-exists :supersede)";
-        // Project-based dep fasl cache (dotcl/dotcl#47): when a manifest path is given
-        // (the MSBuild build), put on-the-fly-compiled dep fasls in a "deps/" subdir
-        // next to the manifest, i.e. under obj/.../dotcl-fasl/, instead of polluting
-        // each dep's source dir. That makes them cleanable by `dotnet clean` (which wipes
-        // obj/), at the cost of recompiling deps per project (the .NET obj/ model). The
-        // CompileProject load step uses the same convention. A prebuilt .fasl.r2r-<rid> AOT
-        // fasl shipped next to the dep source is still preferred read-only. Direct CLI
-        // resolve-deps to stdout (manifestOut == null) keeps the old next-to-source cache.
-        string? depCacheDir = null;
-        if (manifestOut != null)
-        {
-            var manDir = System.IO.Path.GetDirectoryName(System.IO.Path.GetFullPath(manifestOut));
-            depCacheDir = System.IO.Path.Combine(manDir ?? ".", "deps");
-            System.IO.Directory.CreateDirectory(depCacheDir);
-        }
-        var depCacheLisp = depCacheDir == null ? null : depCacheDir.Replace("\\", "/").TrimEnd('/') + "/";
-        // FASL path for a dep's on-the-fly build: cache dir (if set) else next to source.
-        string DepFaslForm(string nameExpr) => depCacheLisp == null
-            ? $"(concatenate 'string dir {nameExpr} \".fasl\")"
-            : $"(concatenate 'string \"{depCacheLisp}\" {nameExpr} \".fasl\")";
-        // For each dep system, if its fasl exists, use it. Otherwise
-        // concatenate-source-op + compile-file the dep's :components into the dep
-        // fasl on the fly. Empty :components (marker systems) are skipped silently.
-        var form = $@"
-(let* ((seen '()) (order '()))
-  (labels ((walk (sys)
-             (unless (member sys seen :test #'eq)
-               (push sys seen)
-               (dolist (d (asdf:system-depends-on sys))
-                 ;; resolve-dependency-spec normalizes ASDF dependency specifiers
-                 ;; ((:feature :dotcl ""x""), (:version ...), plain names) to a
-                 ;; system, returning nil when a :feature condition is unmet. Using
-                 ;; asdf:find-system directly returned nil for (:feature ...) forms,
-                 ;; dropping those deps from the manifest (e.g. micros' dotcl-thread).
-                 ;;
-                 ;; NIL and an error mean different things and used to be handled
-                 ;; the same (ignore-errors, skip): NIL is ""this dependency does
-                 ;; not apply here"", an error is ""this dependency was declared and
-                 ;; cannot be found"". Swallowing the second wrote a manifest that
-                 ;; silently lacked the system, so the build succeeded and the
-                 ;; application failed later, where nothing points back here.
-                 (let ((ds (handler-case
-                               (asdf/find-component:resolve-dependency-spec sys d)
-                             (error (e)
-                               (error ""resolve-deps: ~a depends on ~s, which cannot be found: ~a""
-                                      (asdf:component-name sys) d e)))))
-                   (when ds (walk ds))))
-               (push sys order)))
-           (ensure-fasl (sys)
-             (let* ((src  (asdf:component-pathname sys))
-                    (dir  (directory-namestring src))
-                    (name (asdf:component-name sys))
-                    (r2r-fasl {(targetRid == null
-                        ? "nil"
-                        : $"(concatenate 'string dir name \".fasl.r2r-\" \"{targetRid}\")")})
-                    (fasl {DepFaslForm("name")}))
-               (when (and r2r-fasl (probe-file r2r-fasl))
-                 (return-from ensure-fasl r2r-fasl))
-               (unless (probe-file fasl)
-                 (when (asdf:component-children sys)
-                   (format {progressStream}
-                           ""[resolve-deps] compiling ~A...~%"" name)
-                   (asdf:operate 'asdf::concatenate-source-op sys)
-                   (let ((concat (first
-                                  (asdf:output-files
-                                   (asdf:make-operation 'asdf::concatenate-source-op)
-                                   sys))))
-                     ;; same concat compile-time-eval as CompileProject,
-                     ;; for dependency systems built on the fly.
-                     (dotcl.cil-compiler:compile-file-concatenated concat fasl))))
-               fasl)))
-    (asdf:load-asd ""{asdLisp}"")
-    (let* ((root (%root-system-of ""{asdLisp}""))
-           (deps (remove root (nreverse (progn (walk root) order)))))
-      (let ((stream {manifestForm}))
-        (unwind-protect
-          (dolist (sys deps)
-            (when (asdf:component-children sys)
-              (let ((fasl (ensure-fasl sys)))
-                (format stream ""~A~%"" fasl))))
-          (when {(manifestOut == null ? "nil" : "t")} (close stream))))
-      (let ((rstream {rootSourcesForm}))
-        (when rstream
-          (unwind-protect
-            (dolist (c (%system-source-files root))
-              (format rstream ""~A~%"" (namestring (asdf:component-pathname c))))
-            (close rstream)))))))";
-        Runtime.Eval(MultipleValues.Primary(
-            Runtime.ReadFromString(new LispObject[] { new LispString(form) })));
-    }
-
-    /// <summary>
-    /// Concatenate the root system's <c>:components</c> (declared order) via
-    /// <c>asdf::concatenate-files</c> and <c>compile-file</c> the result into
-    /// <paramref name="outputPath"/>. Only the root system is compiled;
-    /// dependencies stay as pre-built fasls resolved by <see cref="ResolveDeps"/>.
-    /// </summary>
-    internal static void CompileProjectCore(string asdPath, string outputPath, string[]? buildInit = null, string[]? searchPaths = null, bool debugInfo = false)
-    {
-        var absAsd = System.IO.Path.GetFullPath(asdPath);
-        if (!System.IO.File.Exists(absAsd))
-            throw new System.IO.FileNotFoundException($"compile-project: file not found: {absAsd}", absAsd);
-        var absOut = System.IO.Path.GetFullPath(outputPath);
-        var outDir = System.IO.Path.GetDirectoryName(absOut);
-        if (!string.IsNullOrEmpty(outDir) && !System.IO.Directory.Exists(outDir))
-            System.IO.Directory.CreateDirectory(outDir);
-
-        // Load dep fasls from the same project-based cache dir resolve-deps wrote them
-        // to (dotcl/dotcl#47): "deps/" next to the output fasl, i.e. under obj/. Must
-        // match ResolveDeps's DepFaslForm convention.
-        var depCacheDir = System.IO.Path.Combine(outDir ?? ".", "deps");
-        var depCacheLisp = depCacheDir.Replace("\\", "/").TrimEnd('/') + "/";
-
-        // Non-interactive build: a compile-time error must NOT drop into the
-        // interactive debugger (it loops on closed stdin and buries the message).
-        // Bind *debugger-hook* to re-raise the condition so it unwinds to the
-        // source-location wrap + MSBuild-canonical formatter (dotcl/dotcl#48).
-        var hookSym = Startup.Sym("*DEBUGGER-HOOK*");
-        var oldHook = DynamicBindings.Get(hookSym);
-        DynamicBindings.Set(hookSym, new LispFunction(hookArgs =>
-        {
-            var cond = hookArgs[0];
-            throw new LispErrorException(
-                cond is LispCondition lc ? lc : new LispError(cond.ToString()));
-        }, "*BUILD-DEBUGGER-HOOK*", 2));
-
-        Runtime.Eval(MultipleValues.Primary(
-            Runtime.ReadFromString(new LispObject[] { new LispString("(require \"asdf\")") })));
-        PinBundledAsdf();
-
-        EvalLisp(RootSystemHelper);
-        // Route ASDF's compile cache under obj/ so `dotnet clean` clears it and a
-        // stale user-cache fasl can't shadow a regenerated source (dotcl/dotcl#53).
-        RedirectAsdfOutput(System.IO.Path.Combine(outDir ?? ".", "asdf-cache"));
-
-        // Declarative external system dirs (<DotclAsdSearchPath>), then the
-        // build-init scripts (escape hatch, can override / do more).
-        RegisterAsdSearchPaths(searchPaths);
-        LoadBuildInitScripts(buildInit);
-
-        var asdLisp = absAsd.Replace("\\", "/");
-        var outLisp = absOut.Replace("\\", "/");
-        var concatLisp = (outDir == null ? "" : outDir.Replace("\\", "/") + "/")
-                       + System.IO.Path.GetFileNameWithoutExtension(outputPath)
-                       + ".concat.lisp";
-        // Beside the concat, under obj/: generated, and cleaned with everything else.
-        var preambleLisp = (outDir == null ? "" : outDir.Replace("\\", "/") + "/")
-                         + System.IO.Path.GetFileNameWithoutExtension(outputPath)
-                         + ".nuget-preamble.lisp";
-        // Phase 1: load the asd, load the resolved :depends-on fasls, and
-        // concatenate the root's sources into the concat file. Return the ordered
-        // source namestrings so we can build a concat-line -> (file, line) map for
-        // diagnostics (dotcl/dotcl#48).
-        var setupForm = $@"
-(progn
-  (asdf:load-asd ""{asdLisp}"")
-  (let* ((root (%root-system-of ""{asdLisp}""))
-         ;; Only the children that have a source to contribute. A component can
-         ;; legitimately have none -- (:nuget ...) declares a NuGet package, not a
-         ;; file -- and its COMPONENT-PATHNAME is then the system's own directory,
-         ;; which CONCATENATE-FILES tried to read and failed on: the whole build
-         ;; died with ""File not found: <system dir>/"".
-         (sources (mapcar #'asdf:component-pathname (%system-source-files root)))
-         ;; What those file-less components asked for, turned back into source:
-         ;; the concatenated unit is not loaded through ASDF, so nothing else
-         ;; would ever perform them (see DOTCL-NUGET-ASDF). Written as a file of
-         ;; its own and put first, rather than prepended to the concatenation, so
-         ;; that the concat-line -> source-line map stays exact.
-         (nuget-asdf (find-package ""DOTCL-NUGET-ASDF""))
-         (preamble (when nuget-asdf
-                     (funcall (find-symbol ""SYSTEM-NUGET-PREAMBLE"" nuget-asdf) root))))
-    (when preamble
-      (let ((path ""{preambleLisp}""))
-        (with-open-file (o path :direction :output :if-exists :supersede
-                                :if-does-not-exist :create)
-          (write-string preamble o))
-        (setf sources (cons (pathname path) sources))))
-    ;; Load the resolved :depends-on fasls into the image BEFORE compiling the
-    ;; root, so the deps' defpackage/macros are available at the root's compile
-    ;; time: same as a standard ASDF load-op-then-compile. Without this the
-    ;; root must itself (require :dep), because the concatenated unit holds only
-    ;; the root's own sources. The dep fasls are the
-    ;; ones resolve-deps built at the project deps/ cache dir, in topo order.
-    (let ((seen '()) (order '()))
-      (labels ((walk (sys)
-                 (unless (member sys seen :test #'eq)
-                   (push sys seen)
-                   (dolist (d (asdf:system-depends-on sys))
-                     ;; resolve-dependency-spec normalizes ASDF dependency specifiers
-                 ;; ((:feature :dotcl ""x""), (:version ...), plain names) to a
-                 ;; system, returning nil when a :feature condition is unmet. Using
-                 ;; asdf:find-system directly returned nil for (:feature ...) forms,
-                 ;; dropping those deps from the manifest (e.g. micros' dotcl-thread).
-                 (let ((ds (ignore-errors (asdf/find-component:resolve-dependency-spec sys d))))
-                       (when ds (walk ds))))
-                   (push sys order))))
-        (walk root))
-      (dolist (sys (remove root (nreverse order)))
-        (when (asdf:component-children sys)
-          (let* ((name (asdf:component-name sys))
-                 (fasl (concatenate 'string ""{depCacheLisp}"" name "".fasl"")))
-            (when (probe-file fasl) (load fasl))))))
-    (asdf::concatenate-files sources ""{concatLisp}"")
-    (mapcar #'namestring sources)))";
-        var sourcesResult = Runtime.Eval(MultipleValues.Primary(
-            Runtime.ReadFromString(new LispObject[] { new LispString(setupForm) })));
-        var sourcePaths = ListToStringArray(sourcesResult);
-        var lineMap = BuildConcatLineMap(sourcePaths);
-
-        // Progress trace (dotcl/dotcl#48 point 2): which files this build compiles,
-        // in order: so a failing build shows what was processed before the error.
-        System.Console.Error.WriteLine(
-            $"[build] {System.IO.Path.GetFileNameWithoutExtension(absAsd)}: compiling {sourcePaths.Length} source(s)");
-        foreach (var sp in sourcePaths)
-            System.Console.Error.WriteLine($"[build]   {sp}");
-
-        // Phase 2: compile the concatenated unit. compile-file-concatenated binds
-        // *concatenate-build* (cross-compiled, so the binding shares symbol identity
-        // with the compiler's read) so the compiler evaluates toplevel
-        // require/use-package/load at compile time within the single concatenated
-        // unit: restoring the compile+load interleaving a normal multi-file load-op
-        // would have given the original :components.
-        //
-        // EmitBuildSourceLocations makes COMPILE-FILE attach the concat file + form
-        // line to a compile error; we then remap that concat line back to the
-        // original source file:line via lineMap (dotcl/dotcl#48).
-        var compileForm =
-            $@"(dotcl.cil-compiler:compile-file-concatenated ""{concatLisp}"" ""{outLisp}"")";
-        var prevEmit = Runtime.EmitBuildSourceLocations;
-        Runtime.EmitBuildSourceLocations = true;
-        // Debug build: emit a Portable PDB from the project compile. For a
-        // single-source project point the PDB document at the real .lisp (so F5
-        // breaks in the user's source, not the generated concat unit); a
-        // multi-source project keeps the concat until per-document mapping lands.
-        var prevEmitPdb = Runtime.BuildEmitPdb;
-        var prevDebugSrc = Runtime.BuildDebugSourceOverride;
-        var prevLineMap = Runtime.BuildDebugLineMap;
-        Runtime.BuildEmitPdb = debugInfo;
-        // Single source: point the one document at the real .lisp. Multiple
-        // sources: hand COMPILE-FILE the concat line map so it emits one document
-        // per file and each .lisp gets its own breakpoints (lineMap already built
-        // above for error remapping).
-        Runtime.BuildDebugSourceOverride =
-            debugInfo && sourcePaths.Length == 1 ? sourcePaths[0] : null;
-        Runtime.BuildDebugLineMap =
-            debugInfo && sourcePaths.Length > 1 ? lineMap : null;
-        try
-        {
-            Runtime.Eval(MultipleValues.Primary(
-                Runtime.ReadFromString(new LispObject[] { new LispString(compileForm) })));
-        }
-        catch (LispSourceException lse)
-        {
-            throw RemapConcatException(lse, concatLisp, lineMap);
-        }
-        finally
-        {
-            Runtime.EmitBuildSourceLocations = prevEmit;
-            Runtime.BuildEmitPdb = prevEmitPdb;
-            Runtime.BuildDebugSourceOverride = prevDebugSrc;
-            Runtime.BuildDebugLineMap = prevLineMap;
-            DynamicBindings.Set(hookSym, oldHook);
-        }
-    }
-
-    /// <summary>
-    /// Build a single self-contained FASL for <c>dotcl pack</c>: the named ASDF
-    /// system and its whole dependency closure, compiled one source at a time in
-    /// dependency order, into <paramref name="outputFasl"/>. Unlike
-    /// <see cref="CompileProject"/> (root only, deps stay as separate fasls) the
-    /// produced FASL loads standalone, so the pack restamp can drop it into the
-    /// tool package as a single dotcl.user.fasl with no dep fasls to bundle.
-    ///
-    /// This is the same collect-and-compile path SAVE-APPLICATION :SYSTEM uses.
-    /// pack used to concatenate the closure into one unit through ASDF's
-    /// MONOLITHIC-CONCATENATE-SOURCE-OP and compile that, which cannot work for a
-    /// system whose sources use #. at read time: read-time eval assumes the
-    /// earlier forms have been evaluated, and in one concatenated unit they have
-    /// only been compiled, so the first (declare #.*standard-optimize-settings*)
-    /// dies reading. cl-ppcre, flexi-streams, cl-unicode and cl-interpol all do
-    /// this, which between them covers a large part of Quicklisp.
-    ///
-    /// When <paramref name="toplevel"/> is non-null a call to it is appended so
-    /// the tool runs that entry point on launch. A system that already invokes
-    /// its entry at load time (e.g. a roswell <c>&lt;name&gt;/exe</c> launcher)
-    /// needs none.
-    ///
-    /// <paramref name="prelude"/> sources are compiled ahead of the closure, for
-    /// whatever a deployed image needs in place before any library code runs.
-    /// </summary>
-    internal static void PackFaslCore(string system, string outputFasl, string? toplevel = null,
-                                string[]? buildInit = null, string[]? searchPaths = null,
-                                string[]? prelude = null)
-    {
-        var absOut = System.IO.Path.GetFullPath(outputFasl);
-        var outDir = System.IO.Path.GetDirectoryName(absOut);
-        if (!string.IsNullOrEmpty(outDir) && !System.IO.Directory.Exists(outDir))
-            System.IO.Directory.CreateDirectory(outDir);
-
-        // Non-interactive: a compile-time error must unwind, not drop into the
-        // debugger on closed stdin (same rationale as CompileProject).
-        var hookSym = Startup.Sym("*DEBUGGER-HOOK*");
-        var oldHook = DynamicBindings.Get(hookSym);
-        DynamicBindings.Set(hookSym, new LispFunction(hookArgs =>
-        {
-            var cond = hookArgs[0];
-            throw new LispErrorException(
-                cond is LispCondition lc ? lc : new LispError(cond.ToString()));
-        }, "*PACK-DEBUGGER-HOOK*", 2));
-
-        Runtime.Eval(MultipleValues.Primary(
-            Runtime.ReadFromString(new LispObject[] { new LispString("(require \"asdf\")") })));
-        PinBundledAsdf();
-        RegisterAsdSearchPaths(searchPaths);
-        LoadBuildInitScripts(buildInit);
-
-        var sysEsc = system.Replace("\\", "\\\\").Replace("\"", "\\\"");
-        var preambleFile = (outDir == null ? "" : outDir.Replace("\\", "/") + "/")
-                         + System.IO.Path.GetFileNameWithoutExtension(outputFasl)
-                         + ".pack.nuget.lisp";
-
-        // The running ASDF and UIOP are pinned above (PinBundledAsdf). Beyond
-        // that, before the walk:
-        //
-        // FIND-SYSTEM, never LOAD-SYSTEM. The walk needs the dependency graph,
-        // not the code, and compiling a system's sources in an image that has
-        // already loaded them re-runs everything inside an EVAL-WHEN
-        // :COMPILE-TOPLEVEL a second time: cl-interpol's
-        // (defreadtable :interpol-syntax ...) answers that with
-        // READER-MACRO-CONFLICT.
-        //
-        // A (:nuget ...) component is not a file, and the walk gathers files, so
-        // the declaration would be dropped here -- in the one direction that
-        // matters, since the artifact this builds is what runs where there is no
-        // .NET SDK. DOTCL-NUGET-ASDF turns the declarations back into source,
-        // which goes in front of the system's own code so the packages are
-        // registered before anything names a type from them. The package exists
-        // only when the .asd asked for it (:defsystem-depends-on), which
-        // FIND-SYSTEM here has by then loaded.
-        var setupForm = $@"
-(progn
-  (let* ((sys (asdf:find-system ""{sysEsc}""))
-         (nuget-asdf (find-package ""DOTCL-NUGET-ASDF""))
-         (preamble (when nuget-asdf
-                     (funcall (find-symbol ""SYSTEM-NUGET-PREAMBLE"" nuget-asdf) sys))))
-    (when (and (stringp preamble) (plusp (length preamble)))
-      (with-open-file (o ""{preambleFile}"" :direction :output
-                         :if-exists :supersede :if-does-not-exist :create)
-        (write-string preamble o))
-      t)))";
-
-        var preSources = new System.Collections.Generic.List<string>();
-        var prevEmit = Runtime.EmitBuildSourceLocations;
-        Runtime.EmitBuildSourceLocations = true;
-        try
-        {
-            // The prelude runs here as well as being compiled into the image. It
-            // says what has to be in place before anything else, and the builder
-            // is the first thing that needs it: systems that generate their own
-            // sources are built during the walk below, and those builds need
-            // whatever the prelude provides as much as the closure does.
-            //
-            // trivial-gray-streams is the case to keep in mind. It picks the Gray
-            // stream package with (:import-from #+dotcl :dotcl-gray ...), and
-            // DOTCL-GRAY has to exist when that DEFPACKAGE is EVALUATED, which
-            // happens at compile time inside cl-unicode's table generator, long
-            // before any source of the closure itself is compiled. Putting the
-            // prelude at the head of the compile list cannot help there, because
-            // the walk runs before anything is compiled at all.
-            Runtime.LoadLispFiles(prelude, "--prelude source");
-
-            var wrotePreamble = Runtime.Eval(MultipleValues.Primary(
-                Runtime.ReadFromString(new LispObject[] { new LispString(setupForm) })));
-
-            if (prelude != null)
-                foreach (var p in prelude)
-                    preSources.Add(System.IO.Path.GetFullPath(p));
-            if (wrotePreamble is not Nil)
-                preSources.Add(preambleFile);
-
-            Runtime.BuildSystemFasl(system, absOut, toplevel, preSources);
-        }
-        finally
-        {
-            Runtime.EmitBuildSourceLocations = prevEmit;
-            DynamicBindings.Set(hookSym, oldHook);
-        }
-    }
-
-
-    /// <summary>
-    /// Read the standard metadata slots off an ASDF system, its version among
-    /// them. `dotcl pack` uses these as nuspec defaults so a packed tool
-    /// describes itself rather than inheriting the description and URLs of the
-    /// dotcl packages it was restamped from, and so a project states its
-    /// version once, in the .asd, rather than again on every pack command
-    /// line. Returns a SystemMeta whose fields are null where the .asd
-    /// is silent; returns null if the system cannot be found at all (packing
-    /// proceeds: the fasl build reports a missing system with a better error).
-    /// </summary>
-    internal static DotclBuild.SystemMeta? ReadSystemMetaCore(string system, string[]? searchPaths = null)
-        => ReadSystemMetaCore(system, searchPaths, out _);
-
-    /// <summary>
-    /// As above, and says why when there is no metadata: ERROR is null when the
-    /// system was read, and otherwise names what went wrong -- the system is not
-    /// visible to ASDF, or loading its .asd signalled (the condition's text).
-    /// `dotcl pack` reports that and stops. Answering "no metadata" alone made
-    /// the missing :version the only thing pack could say, so a .asd that failed
-    /// to load surfaced as "missing required option(s): --version".
-    /// </summary>
-    internal static DotclBuild.SystemMeta? ReadSystemMetaCore(string system, string[]? searchPaths,
-                                                              out string? error)
-    {
-        error = null;
-        try
-        {
-            Runtime.Eval(MultipleValues.Primary(
-                Runtime.ReadFromString(new LispObject[] { new LispString("(require \"asdf\")") })));
-            PinBundledAsdf();
-            RegisterAsdSearchPaths(searchPaths);
-
-            var sysEsc = system.Replace("\\", "\\\\").Replace("\"", "\\\"");
-            // :source-control is (:git "url") / (:github "url") / a bare string.
-            // Normalize to the url alone here so the C# side stays shapeless.
-            //
-            // A failure comes back as (:error "text") rather than being signalled:
-            // nothing outside this form handles it, and unhandled it would enter
-            // the debugger on a closed stdin before anything could report it.
-            var form = $@"
-(handler-case
-    (let ((sys (asdf:find-system ""{sysEsc}"" nil)))
-      (if (null sys)
-          (list :error (format nil ""system ~a not found; make it visible to ASDF ~
-                                     (--asd-search-path, CL_SOURCE_REGISTRY)""
-                               ""{sysEsc}""))
-          (let ((sc (asdf:system-source-control sys))
-                (asd (asdf:system-source-file sys)))
-            (list (asdf:system-description sys)
-                  (asdf:system-homepage sys)
-                  (cond ((stringp sc) sc)
-                        ((and (consp sc) (stringp (second sc))) (second sc))
-                        ((and (consp sc) (stringp (cdr sc))) (cdr sc)))
-                  (asdf:system-author sys)
-                  (asdf:system-license sys)
-                  (and asd (namestring (make-pathname :name nil :type nil :defaults asd)))
-                  ;; SYSTEM-VERSION, not COMPONENT-VERSION: a secondary
-                  ;; system (app/exe) that states no :version answers with its
-                  ;; primary system's, the way ASDF already answers author,
-                  ;; license and description.
-                  (asdf:system-version sys)
-                  ;; :entry-point is a string naming a function, or a symbol.
-                  (let ((e (asdf::component-entry-point sys)))
-                    (cond ((stringp e) e)
-                          ((and e (symbolp e) (symbol-package e))
-                           (format nil ""~a::~a""
-                                   (package-name (symbol-package e)) (symbol-name e)))))))))
-  (error (c)
-    (list :error (format nil ""loading the definition of system ~a failed: ~a""
-                         ""{sysEsc}"" c))))";
-            var result = MultipleValues.Primary(Runtime.Eval(MultipleValues.Primary(
-                Runtime.ReadFromString(new LispObject[] { new LispString(form) }))));
-
-            if (result is Cons ec && ec.Car is Symbol k && k.Name == "ERROR"
-                && ec.Cdr is Cons msgCell && msgCell.Car is LispString msg)
-            {
-                error = msg.Value;
-                return null;
-            }
-
-            var items = new List<string?>();
-            var cur = result;
-            while (cur is Cons c)
-            {
-                items.Add(c.Car is LispString s && s.Value.Length > 0 ? s.Value : null);
-                cur = c.Cdr;
-            }
-            while (items.Count < 8) items.Add(null);
-            return new DotclBuild.SystemMeta
-            {
-                Description = items[0],
-                Homepage = items[1],
-                SourceControlUrl = items[2],
-                Author = items[3],
-                License = items[4],
-                AsdDirectory = items[5],
-                // A version ASDF hands back as anything other than a string
-                // (:version can be read from a file) lands here as null, which
-                // reads the same as a .asd that states no version at all: the
-                // command line has to supply one. Better than packing under a
-                // version nobody wrote.
-                Version = items[6],
-                EntryPoint = items[7],
-            };
-        }
-        catch (Exception ex)
-        {
-            // Metadata is best-effort for callers that only want the fields;
-            // ERROR carries the reason for the ones that have to explain it.
-            error = ex.Message;
-            return null;
-        }
-    }
-
-    /// <summary>
-    /// Pin the running ASDF and UIOP so a build never replaces them. dotcl
-    /// ships its own patched ASDF, and a dependency bundle (qlot, a Quicklisp
-    /// bundle) often carries stock asdf.asd / uiop.asd as well. ASDF loads a
-    /// registered asdf.asd of the same version "to allow loading from modified
-    /// source", so merely having the stock one visible made the first .asd load
-    /// rebuild ASDF from sources that do not know dotcl, which fails compiling
-    /// UIOP's RAW-COMMAND-LINE-ARGUMENTS. Immutable systems are answered from
-    /// the running image and never looked up on disk.
-    /// </summary>
-    internal static void PinBundledAsdf()
-    {
-        EvalLisp("(progn (asdf:register-immutable-system \"asdf\") "
-                 + "(asdf:register-immutable-system \"uiop\"))");
-    }
-
-    /// Walk a proper Lisp list of LispStrings into a C# string[].
-    private static string[] ListToStringArray(LispObject list)
-    {
-        var result = new System.Collections.Generic.List<string>();
-        var cur = list;
-        while (cur is Cons c)
-        {
-            if (c.Car is LispString s) result.Add(s.Value);
-            cur = c.Cdr;
-        }
-        return result.ToArray();
-    }
-
-    /// Build a concat-line -> source map. asdf::concatenate-files joins the raw
-    /// bytes of each source with no separators, so source file k begins at concat
-    /// line (1 + total newlines in files 0..k-1). Returns entries sorted by start
-    /// line so a concat line L maps to the last entry with startLine &lt;= L.
-    private static (int startLine, string path)[] BuildConcatLineMap(string[] sourcePaths)
-    {
-        var map = new (int, string)[sourcePaths.Length];
-        int start = 1;
-        for (int i = 0; i < sourcePaths.Length; i++)
-        {
-            map[i] = (start, sourcePaths[i]);
-            int newlines = 0;
-            try
-            {
-                foreach (var b in System.IO.File.ReadAllBytes(sourcePaths[i]))
-                    if (b == (byte)'\n') newlines++;
-            }
-            catch { /* unreadable source; leave start where it is */ }
-            start += newlines;
-        }
-        return map;
-    }
-
-    /// Remap a LispSourceException pointing into the concatenated unit back to the
-    /// original source file:line. Other (already-original) frames pass through.
-    private static LispSourceException RemapConcatException(
-        LispSourceException lse, string concatPath,
-        (int startLine, string path)[] lineMap)
-    {
-        string concatFull;
-        try { concatFull = System.IO.Path.GetFullPath(concatPath); }
-        catch { concatFull = concatPath; }
-
-        bool SameAsConcat(string f)
-        {
-            try { return string.Equals(System.IO.Path.GetFullPath(f), concatFull,
-                System.StringComparison.OrdinalIgnoreCase); }
-            catch { return false; }
-        }
-        if (!SameAsConcat(lse.FilePath) || lineMap.Length == 0)
-            return lse;
-
-        // Find the source file whose span contains the concat line.
-        int concatLine = lse.Line;
-        int idx = 0;
-        for (int i = 0; i < lineMap.Length; i++)
-            if (lineMap[i].startLine <= concatLine) idx = i; else break;
-        var origPath = lineMap[idx].path;
-        var origLine = concatLine - lineMap[idx].startLine + 1;
-        return new LispSourceException(origPath, origLine, lse.InnerException!);
-    }
 }

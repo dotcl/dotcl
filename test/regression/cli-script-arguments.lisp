@@ -13,8 +13,7 @@
       (error "cannot locate this process's executable")))
 
 (defvar *csa-core*
-  (or (ignore-errors (namestring (truename "compiler/cil-out.sil")))
-      "compiler/cil-out.sil"))
+  (regression-child-core))
 
 (defvar *csa-dir*
   (regression-temp-dir))

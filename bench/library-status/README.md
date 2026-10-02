@@ -117,9 +117,14 @@ not put a worked-out reason there -- the next measurement erases it. Reasons go
 in `annotations.json` (below), which no run opens.
 
 Error text carries whatever path the failure happened under, which is the
-measuring machine's home directory and checkout. Both scripts replace absolute
-paths in a note with `<path>` before writing it (`scrub_paths`), because the note
-is published.
+measuring machine's home directory and checkout, and sometimes the build that
+measured it: a library that refuses an implementation it does not know says
+`not yet implemented for dotcl 0.1.29+273.ge515cc0 on Arm64`. Both scripts pass
+a note through `scrub_note` (`scrub.sh`) before writing it, because the note is
+published: absolute paths become `<path>`, the version `<version>` and the
+machine type after it `<arch>`. `check-scrub.sh` tests those filters and fails
+if any of them has leaked into `results.json`, `tests.json` or the rendered
+table; the make targets run it after rendering.
 
 A system with no entry is rendered as `not checked`, so a partial run is
 publishable: it says what has been measured rather than implying the rest is
@@ -154,7 +159,16 @@ each library. So this stage is two parts:
    (the per-test `[ OK ]` / `[FAIL]` lines and `Test run had N failures:`),
    clunit and clunit2 (`Tested N assertions.` / `Passed: P/N` / `Failed:` /
    `Errors:`), Try (the `#<TRY:TRIAL (NAME) OUTCOME 1.2s COUNTS>` line the test
-   op prints, whose per-category counts are read). Only output
+   op prints, whose per-category counts are read), 1am (`Success: N tests, M
+   checks.`; a failing check signals, so a failure shows up as an error), and
+   cl-ppcre's own harness (`Test: NAME` per suite, `NNN:` per failing test,
+   then `All tests passed.` or `Some tests failed.`; it prints no counts, so
+   each suite counts as one), and lisp-unit2 (`Test Summary ... (N tests ...)`
+   then `| P passed`, `| F failed`, `| E execution errors`; an execution
+   error counts as a failure), lift (`Test Report for ...: N tests run, all
+   passed!` or `..., F Failures.`, possibly on the line of lift's `Start:`
+   progress; lift can print the same report twice, so the last one is counted), and ptester, the harness cl-base64 and puri use
+   (`Errors detected in this test: E` / `Successes this test:S`). Only output
    after the driver's `LIBTEST-BEGIN` marker is read, so a summary printed
    while loading is not a result.
 
@@ -166,13 +180,16 @@ Each system gets one verdict in `tests.json`:
 | `fail` | a recognised summary counted at least one failure |
 | `error` | `test-system` signalled, the debugger was entered, or the process exited abnormally, with no recognised failure count |
 | `no-result` | the run finished but printed nothing a recogniser knows |
+| `no-tests` | the run finished and there was nothing to run: `test-op` has no test system among its dependencies and no `perform` method of the library's own, or hu.dwim.asdf reported that no tests were run |
 | `timeout` | the bound (`LIBRARY_STATUS_TEST_TIMEOUT`, default 900 s) was hit |
 | `load-fail` | the system or one of its test systems did not load |
 
 **Only `pass` turns a row into `ok`.** `no-result` is the verdict this stage
 exists to keep separate: a `test-op` that runs nothing, or a framework with no
 recogniser yet, finishes cleanly and prints nothing that can be counted, and
-that is "nothing was looked at", not "nothing went wrong". A library whose
+that is "nothing was looked at", not "nothing went wrong". `no-tests` splits
+off the first of those when the driver can see it for itself (it asks ASDF what
+`test-op` would do before running it); it does not make a row `ok` either. A library whose
 framework is not recognised stays `load-only` until a recogniser is added --
 add one to `judge` in the script rather than special-casing the library.
 
@@ -186,6 +203,55 @@ every loading row. Logs go to `out/library-status-tests/` in the checkout.
 A failing suite is not proof of a dotcl bug. Before reporting one, run the same
 `(asdf:test-system SYS)` on SBCL: a test that fails there too, or depends on the
 network or a native library the host lacks, belongs to the library or the host.
+
+## Stage 2c -- rows waiting on a fork (`run-forks.sh`)
+
+```
+LIBRARY_STATUS_FORKS=path/to/forks sh bench/library-status/run-forks.sh
+LIBRARY_STATUS_FORKS=path/to/forks LIBRARY_STATUS_CANDIDATES=1 \
+  sh bench/library-status/run-forks.sh          # list the candidates only
+```
+
+The status column is what a user gets from the dists: Quicklisp plus the
+dotcl overlay. Some libraries already have a dotcl fork with the fix, waiting
+to be added to the overlay, and a row that fails only for want of it looks the
+same as one that fails for a dotcl bug. This stage tells the two apart without
+touching the status column:
+
+1. Every subdirectory of `LIBRARY_STATUS_FORKS` is a git checkout of a fork. A
+   fork whose HEAD is the commit the dotcl dist already ships (its release
+   names end in the commit) is left out; the rest are pending. Their systems
+   are the `defsystem` names in their `.asd` files.
+2. The candidates are the rows that are not ok with the dists alone (they do
+   not load, or their suite fails, errs, times out, or its test system does
+   not load) and whose dependency tree reaches a pending fork. The tree is
+   the depends-on lists the dists record in `systems.txt`, from the row's
+   system and its test systems; a Quicklisp project the dotcl dist carries is
+   read from the dotcl dist. `LIBRARY_STATUS_CANDIDATES=1` stops here.
+3. Only the candidates are measured again, by the same two scripts as stages
+   2 and 2b, with the pending forks put ahead of the dists through
+   `CL_SOURCE_REGISTRY` (ASDF searches its source registry before Quicklisp).
+4. `forks.json` gets one entry per candidate: the pending forks its tree
+   reaches, what the second run saw, and a judgement from comparing the two
+   runs, by load first ("does not load" < "loads"), then by test verdict
+   (`timeout`, `load-fail` < `error` < `no-result`, `no-tests` < `fail` <
+   `pass`), then, when both fail, by the number of failures:
+
+| judgement | meaning |
+| --- | --- |
+| `pending-fork` | loads only with the forks, or passes only with them: the row waits on a fork reaching the dotcl dist |
+| `improved` | better with the forks, but still not ok |
+| `same` | no better: the forks are not what the row waits on |
+| `worse` | worse with the forks |
+
+The forks named are the pending ones the tree reaches, not a proof of which
+one made the difference; when a row reaches several, removing them one at a
+time is the way to find out.
+
+The dists are read from the Quicklisp home the bundled client uses
+(`LIBRARY_STATUS_QL_HOME` overrides it), and should be the same home stages 2
+and 2b ran against, or the comparison is between two different dists.
+`render.lisp` shows the entries in the `with forks` column.
 
 ## The reasons (`annotations.json`)
 
@@ -230,8 +296,9 @@ beside it is the hand-written sentence from `annotations.json`.
 
 Inputs and outputs all have defaults relative to this directory and can be
 overridden: `LIBRARY_STATUS_JSON`, `LIBRARY_STATUS_TARGETS`,
-`LIBRARY_STATUS_ANNOTATIONS`, `LIBRARY_STATUS_OUT`, `DOTCL_VERSION`.
-`library-status/render:main` takes the same five as keyword arguments.
+`LIBRARY_STATUS_ANNOTATIONS`, `LIBRARY_STATUS_TESTS_JSON`,
+`LIBRARY_STATUS_FORKS_JSON`, `LIBRARY_STATUS_OUT`, `DOTCL_VERSION`.
+`library-status/render:main` takes the same seven as keyword arguments.
 
 The JSON reader is part of the script. Rendering the table has to work in a
 checkout where nothing has been installed yet, which a dependency on a JSON
@@ -239,7 +306,7 @@ library would break.
 
 ## Not automated yet
 
-- Test frameworks without a recogniser (lisp-unit, lisp-unit2, ptester, and
+- Test frameworks without a recogniser (lisp-unit, and
   suites that print their own format) leave their rows at
   `no-result`, which renders as `load-only`.
 - Stage 1 is still its own run: choosing targets needs a dist on disk and a new

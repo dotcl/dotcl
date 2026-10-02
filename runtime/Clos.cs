@@ -105,6 +105,8 @@ public class LispClass : LispObject
     public bool NameCleared { get; set; }
     /// <summary>The metaclass of this class. Null means STANDARD-CLASS (default).</summary>
     public LispClass? Metaclass { get; set; }
+    /// <summary>Cache for Runtime.UsesSlotProtocol: (method epoch &lt;&lt; 2) | valid | answer.</summary>
+    internal long SlotProtocolCache;
     public SlotDefinition[] DirectSlots { get; set; }
     /// <summary>While a class under a custom metaclass is being initialized: the
     /// canonical :DIRECT-SLOTS plists handed to INITIALIZE-INSTANCE, each with the slot
@@ -127,6 +129,133 @@ public class LispClass : LispObject
     public LispClass[] ClassPrecedenceList { get; set; }
     public SlotDefinition[] EffectiveSlots { get; set; }
     public Dictionary<string, int> SlotIndex { get; private set; }
+
+    /// <summary>Slot layout index keyed by the slot's symbol. Null unless two
+    /// effective slots share a name while being different symbols (CLHS 7.5.3:
+    /// slots are named by symbols, so A::X and B::X are two slots). SlotIndex,
+    /// keyed by the name string, then answers the first of them; paths that hold
+    /// the symbol consult this map first. Classes without such a collision keep
+    /// the string-only lookup, so their slot access costs one null check more.</summary>
+    public Dictionary<Symbol, int>? SlotIndexBySym { get; private set; }
+
+    /// <summary>True when this class has slots or initargs whose names collide
+    /// across packages, so name-string matching would conflate them. Paths that
+    /// match slots or initargs by name switch to symbol identity (see
+    /// SameSlotName) when this is set.</summary>
+    public bool HasSymbolCollision { get; private set; }
+
+    /// <summary>A symbol whose home is DOTCL-INTERNAL stands for any symbol of the
+    /// same name: the runtime builds the standard condition classes' slot names and
+    /// initargs with Startup.Sym, which lands there, and user code refers to those
+    /// slots (and passes their keyword initargs) with its own symbols.</summary>
+    internal static bool IsNameWildcard(Symbol s)
+        => s.HomePackage != null && ReferenceEquals(s.HomePackage, Startup.Internal);
+
+    /// <summary>Whether two slot names (or two initargs) denote the same slot
+    /// (initarg): the same symbol, or the same name where one side is a
+    /// runtime-internal wildcard.</summary>
+    public static bool SameSlotName(Symbol a, Symbol b)
+        => ReferenceEquals(a, b)
+           || (a.Name == b.Name && (IsNameWildcard(a) || IsNameWildcard(b)));
+
+    /// <summary>Whether initarg key KEY (as passed to MAKE-INSTANCE etc.) selects
+    /// the initarg IA. By name unless this class has a cross-package collision,
+    /// where it is by symbol.</summary>
+    public bool InitargMatches(Symbol ia, LispObject key)
+    {
+        if (!HasSymbolCollision)
+            return key switch
+            {
+                Symbol s => ia.Name == s.Name,
+                _ => ia.Name == key.ToString()
+            };
+        return key switch
+        {
+            Symbol s => SameSlotName(ia, s),
+            Nil => ia.Name == "NIL" && (IsNameWildcard(ia) || ia.HomePackage?.Name == "COMMON-LISP"),
+            T => ia.Name == "T" && (IsNameWildcard(ia) || ia.HomePackage?.Name == "COMMON-LISP"),
+            _ => false
+        };
+    }
+
+    /// <summary>Layout index of the slot named SLOTNAME (NAME is its name string,
+    /// which the caller has at hand). Consults the symbol-keyed index first when
+    /// the class has one.</summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    public bool TryGetSlotIndex(LispObject slotName, string name, out int idx)
+    {
+        var bySym = SlotIndexBySym;
+        if (bySym != null && slotName is Symbol s)
+            return TryGetSlotIndexBySymbol(bySym, s, name, out idx);
+        if (!SlotIndex.TryGetValue(name, out idx)) return false;
+        // The name matched; the symbol has to as well. Almost always the very
+        // same symbol, so this is one load and one compare.
+        if (slotName is Symbol s2)
+        {
+            var slots = EffectiveSlots;
+            if ((uint)idx < (uint)slots.Length && !ReferenceEquals(slots[idx].Name, s2)
+                && !SameSlotName(slots[idx].Name, s2))
+                return false;
+        }
+        return true;
+    }
+
+    /// <summary>The lookup for a class with a cross-package collision: by symbol,
+    /// except that a runtime-internal (wildcard) name on either side still matches
+    /// by name.</summary>
+    private bool TryGetSlotIndexBySymbol(Dictionary<Symbol, int> bySym, Symbol s, string name, out int idx)
+    {
+        if (bySym.TryGetValue(s, out idx)) return true;
+        if (SlotIndex.TryGetValue(name, out idx)
+            && (IsNameWildcard(s) || IsNameWildcard(EffectiveSlots[idx].Name)))
+            return true;
+        idx = -1;
+        return false;
+    }
+
+    /// <summary>Layout index of the slot that SLOTNAME names, by symbol
+    /// (SameSlotName) whether or not the class has a collision. For paths that
+    /// pair slots across two classes (CHANGE-CLASS, redefinition), where a name
+    /// match between A::X and B::X would carry a value into the wrong slot.</summary>
+    public bool TryGetSlotIndexExact(Symbol slotName, out int idx)
+    {
+        if (TryGetSlotIndex(slotName, out idx) && idx < EffectiveSlots.Length
+            && SameSlotName(EffectiveSlots[idx].Name, slotName))
+            return true;
+        for (int i = 0; i < EffectiveSlots.Length; i++)
+            if (SameSlotName(EffectiveSlots[i].Name, slotName)) { idx = i; return true; }
+        idx = -1;
+        return false;
+    }
+
+    /// <summary>Layout index of the effective slot definition SLOTD (as handed to
+    /// SLOT-VALUE-USING-CLASS and friends). Identity first, then its name.</summary>
+    public bool TryGetSlotIndex(SlotDefinition slotd, out int idx)
+    {
+        if (TryGetSlotIndex(slotd.Name, out idx) && idx < EffectiveSlots.Length
+            && ReferenceEquals(EffectiveSlots[idx], slotd))
+            return true;
+        for (int i = 0; i < EffectiveSlots.Length; i++)
+            if (ReferenceEquals(EffectiveSlots[i], slotd)) { idx = i; return true; }
+        return TryGetSlotIndexExact(slotd.Name, out idx) || TryGetSlotIndex(slotd.Name, out idx);
+    }
+
+    /// <summary>TryGetSlotIndex for a slot symbol.</summary>
+    public bool TryGetSlotIndex(Symbol slotName, out int idx)
+        => TryGetSlotIndex(slotName, slotName.Name, out idx);
+
+    /// <summary>The effective slot definition named SLOTNAME, or null.</summary>
+    public SlotDefinition? FindEffectiveSlot(Symbol slotName)
+    {
+        if (TryGetSlotIndex(slotName, out int idx) && idx < EffectiveSlots.Length
+            && EffectiveSlots[idx].Name.Name == slotName.Name)
+            return EffectiveSlots[idx];
+        foreach (var s in EffectiveSlots)
+            if (SameSlotName(s.Name, slotName)) return s;
+        foreach (var s in EffectiveSlots)
+            if (s.Name.Name == slotName.Name) return s;
+        return null;
+    }
 
     /// <summary>Serializes (re)definition of THIS class. FinalizeClass mutates the
     /// class's non-concurrent caches (SlotIndex, InitargToSlotIndex, EffectiveSlots,
@@ -264,6 +393,7 @@ public class LispClass : LispObject
                 }
             }
         }
+        if (HasSymbolCollision) canFast = false; // the map is keyed by name
         _canUseFastPath = canFast;
         _initargSlotMap = map;
     }
@@ -276,6 +406,79 @@ public class LispClass : LispObject
         ClassPrecedenceList = Array.Empty<LispClass>();
         EffectiveSlots = Array.Empty<SlotDefinition>();
         SlotIndex = new Dictionary<string, int>();
+        Layout = new ClassLayout(this);
+    }
+
+    /// <summary>The layout token of this class's current instances. An instance
+    /// records the token it was built with; FinalizeClass replaces the token when the
+    /// set of local and shared slots changes, and MAKE-INSTANCES-OBSOLETE replaces it
+    /// unconditionally. An instance whose token is not the class's current one is
+    /// obsolete and is brought up to date before its slots are next touched
+    /// (CLHS 4.3.6).</summary>
+    public ClassLayout Layout;
+
+    /// <summary>Mark every existing instance of this class obsolete: they keep the
+    /// old token and are updated the next time a slot of theirs is read or written.
+    /// OLDSLOTS is the effective slot list the old token's instances were laid out by;
+    /// SHARED is the old shared slot values, captured now because a redefinition may
+    /// drop the slot and with it the only way to read its value.</summary>
+    internal void SupersedeLayout(SlotDefinition[] oldSlots,
+        (Symbol Name, LispObject? Value)[] shared)
+    {
+        var old = Layout;
+        old.Superseded = new ClassLayout.OldShape(oldSlots, shared);
+        System.Threading.Volatile.Write(ref Layout, new ClassLayout(this));
+        // Call-site accessor caches hold a layout token: force them to refill with
+        // the new one, so an instance with the old token misses.
+        GenericFunction.BumpMethodEpoch();
+        // A generic function's dispatch cache can hold a reader or writer shortcut
+        // with this class's old slot index, which no layout token guards: the slot
+        // the index names now may be another one.
+        Runtime.InvalidateAllDispatchCaches();
+    }
+
+    /// <summary>The values of the shared slots among SLOTS, as seen through CPL.
+    /// A slot's value lives on the most specific class that declares it shared; when
+    /// that declaration is already gone (the class is being redefined), the first
+    /// class in CPL still holding a value under the name answers.</summary>
+    internal static (Symbol Name, LispObject? Value)[] CaptureSharedValues(
+        SlotDefinition[] slots, LispClass[] cpl)
+    {
+        var result = new List<(Symbol, LispObject?)>();
+        foreach (var s in slots)
+        {
+            if (!s.IsClassAllocation) continue;
+            string name = s.Name.Name;
+            LispObject? val = null;
+            LispClass? owner = null;
+            foreach (var c in cpl)
+            {
+                foreach (var ds in c.DirectSlots)
+                    if (ds.IsClassAllocation && ds.Name.Name == name) { owner = c; break; }
+                if (owner != null) break;
+            }
+            if (owner == null)
+                foreach (var c in cpl)
+                    if (c.ClassSlotValues.ContainsKey(name)) { owner = c; break; }
+            owner?.ClassSlotValues.TryGetValue(name, out val);
+            result.Add((s.Name, val));
+        }
+        return result.ToArray();
+    }
+
+    /// <summary>True when OLD and NEW lay out instances the same way: the same slot
+    /// names in the same positions with the same allocation. Then existing instances
+    /// need no update and keep their token.</summary>
+    private static bool SameInstanceShape(SlotDefinition[] old, SlotDefinition[] neu)
+    {
+        if (old.Length != neu.Length) return false;
+        for (int i = 0; i < old.Length; i++)
+        {
+            if (!ReferenceEquals(old[i].Name, neu[i].Name)) return false;
+            if (old[i].IsClassAllocation != neu[i].IsClassAllocation) return false;
+            if (!ReferenceEquals(old[i].Allocation, neu[i].Allocation)) return false;
+        }
+        return true;
     }
 
     /// <summary>
@@ -293,6 +496,8 @@ public class LispClass : LispObject
         // NOT take DefLock) always sees a complete map, never one mid-rebuild.
         lock (DefLock)
         {
+            var oldSlots = EffectiveSlots;
+            var oldCpl = ClassPrecedenceList;
             ClassPrecedenceList = ComputeCPL();
             EffectiveSlots = ComputeEffectiveSlots();
             // AMOP has finalization go through COMPUTE-SLOTS, and the list it hands
@@ -308,9 +513,13 @@ public class LispClass : LispObject
             CachedIsConditionClass = null;
             CachedValidInitargKeys = null;
             var slotIndex = new Dictionary<string, int>();
+            bool slotCollision = false;
             for (int i = 0; i < EffectiveSlots.Length; i++)
             {
-                slotIndex[EffectiveSlots[i].Name.Name] = i;
+                // First occurrence wins: with a cross-package collision the string
+                // key answers the most specific class's slot.
+                if (!slotIndex.TryAdd(EffectiveSlots[i].Name.Name, i))
+                    slotCollision = true;
                 // Instance-allocated slots get their layout index as location; :class
                 // allocation slots are not in the per-instance vector, and neither is
                 // one whose metaclass defined its own allocation -- that slot is the
@@ -319,6 +528,26 @@ public class LispClass : LispObject
                     (EffectiveSlots[i].IsClassAllocation || EffectiveSlots[i].Allocation != null)
                         ? -1 : i;
             }
+            Dictionary<Symbol, int>? bySym = null;
+            if (slotCollision)
+            {
+                bySym = new Dictionary<Symbol, int>(ReferenceEqualityComparer.Instance);
+                for (int i = 0; i < EffectiveSlots.Length; i++)
+                    bySym.TryAdd(EffectiveSlots[i].Name, i);
+            }
+            // Non-keyword initargs of the same name from different packages.
+            bool initargCollision = false;
+            {
+                var byName = new Dictionary<string, Symbol>();
+                foreach (var es in EffectiveSlots)
+                    foreach (var ia in es.Initargs)
+                    {
+                        if (!byName.TryGetValue(ia.Name, out var prev)) byName[ia.Name] = ia;
+                        else if (!SameSlotName(prev, ia)) initargCollision = true;
+                    }
+            }
+            HasSymbolCollision = slotCollision || initargCollision;
+            SlotIndexBySym = bySym;
             SlotIndex = slotIndex;
             ComputeEffectiveDefaultInitargs();
             // AMOP has finalization go through COMPUTE-DEFAULT-INITARGS. The hook runs
@@ -342,15 +571,38 @@ public class LispClass : LispObject
             InitargToSlotIndex = initargMap;
 
             // Fast path: no default initargs, no shared initargs, no :class allocation slots
+            // and no cross-package name collision (the fast paths match by name).
             HasSimpleInitialization = DefaultInitargs.Length == 0
                 && !hasSharedInitarg
+                && !HasSymbolCollision
                 && !Array.Exists(EffectiveSlots, s => s.IsClassAllocation);
             SimpleInitChecked = false;
             SharedInitSimpleChecked = false;
+            // CLHS 4.3.6: a redefinition that changes the local or shared slots makes
+            // the existing instances obsolete. The first finalization has no instances
+            // to update (EffectiveSlots was empty); a re-finalization that ends up with
+            // the same shape (a superclass redefined without touching our slots, an
+            // accessor-only change) keeps the token, so those instances stay current.
+            if (oldSlots.Length != 0 && !SameInstanceShape(oldSlots, EffectiveSlots))
+                SupersedeLayout(oldSlots, CaptureSharedValues(oldSlots, oldCpl));
+            // Which methods apply to an instance of this class follows its precedence
+            // list. Generic functions cache their dispatch per argument class, so a
+            // changed list (a superclass added, removed or reordered) makes those
+            // entries wrong for this class.
+            if (oldCpl.Length != 0 && !SameClassList(oldCpl, ClassPrecedenceList))
+                Runtime.InvalidateAllDispatchCaches();
         }
         // Slot layout may have changed: invalidate any call-site reader inline caches
         // that snapshotted this class's old (class, index) pair.
         GenericFunction.BumpMethodEpoch();
+    }
+
+    private static bool SameClassList(LispClass[] a, LispClass[] b)
+    {
+        if (a.Length != b.Length) return false;
+        for (int i = 0; i < a.Length; i++)
+            if (!ReferenceEquals(a[i], b[i])) return false;
+        return true;
     }
 
     /// <summary>
@@ -358,13 +610,16 @@ public class LispClass : LispObject
     /// </summary>
     public void ComputeEffectiveDefaultInitargs()
     {
-        var seen = new HashSet<string>();
+        // Keys are initarg symbols: A::X and B::X are two initargs (CLHS 7.1.3).
         var result = new List<(Symbol Key, LispObject Form, LispFunction Thunk)>();
         foreach (var cls in ClassPrecedenceList)
         {
             foreach (var (key, form, thunk) in cls.DirectDefaultInitargs)
             {
-                if (seen.Add(key.Name))
+                bool dup = false;
+                foreach (var r in result)
+                    if (SameSlotName(r.Key, key)) { dup = true; break; }
+                if (!dup)
                     result.Add((key, form, thunk));
             }
         }
@@ -492,11 +747,14 @@ public class LispClass : LispObject
 
         // Union of all initargs
         var allInitargs = new List<Symbol>();
-        var seenInitargs = new HashSet<string>();
         foreach (var d in defs)
             foreach (var ia in d.Initargs)
-                if (seenInitargs.Add(ia.Name))
-                    allInitargs.Add(ia);
+            {
+                bool dup = false;
+                foreach (var seen in allInitargs)
+                    if (LispClass.SameSlotName(seen, ia)) { dup = true; break; }
+                if (!dup) allInitargs.Add(ia);
+            }
 
         // Most specific initform (first one that has it): the thunk that runs and
         // the source form that AMOP reports come from the same slot definition.
@@ -512,17 +770,54 @@ public class LispClass : LispObject
             }
         }
 
-        // Most specific declared :type. CLHS 7.5.3 makes the effective type the
-        // conjunction of all of them; taking the most specific one is right
-        // whenever the subclass narrows (the usual case) and never claims a type
-        // the class did not declare.
-        LispObject slotType = T.Instance;
+        // The effective :type is the conjunction of every declared one (CLHS 7.5.3).
+        // A type that is a supertype of another one declared is dropped, so the
+        // usual case, a subclass narrowing the type, still reports just the narrow
+        // type; types that only overlap give (AND T1 T2 ...), most specific first.
+        var declaredTypes = new List<LispObject>();
         foreach (var d in defs)
         {
             // "No :type given" is T.Instance, which is not a Symbol: checking
             // only for the symbol T made every subclass slot look type-specific.
             if (d.SlotType is T || (d.SlotType is Symbol s && s.Name == "T")) continue;
-            slotType = d.SlotType;
+            bool seen = false;
+            foreach (var t in declaredTypes)
+                if (Runtime.IsTruthy(Runtime.Equal(t, d.SlotType))) { seen = true; break; }
+            if (!seen) declaredTypes.Add(d.SlotType);
+        }
+        var keptTypes = new List<LispObject>();
+        for (int i = 0; i < declaredTypes.Count; i++)
+        {
+            bool redundant = false;
+            for (int j = 0; j < declaredTypes.Count && !redundant; j++)
+            {
+                if (i == j) continue;
+                // TYPE[i] adds nothing when some other declared type is a subtype of
+                // it. Of two equivalent types the later one goes.
+                if (SubtypeCertain(declaredTypes[j], declaredTypes[i])
+                    && (j < i || !SubtypeCertain(declaredTypes[i], declaredTypes[j])))
+                    redundant = true;
+            }
+            if (!redundant) keptTypes.Add(declaredTypes[i]);
+        }
+        LispObject slotType;
+        if (keptTypes.Count == 0) slotType = T.Instance;
+        else if (keptTypes.Count == 1) slotType = keptTypes[0];
+        else
+        {
+            var andForm = new LispObject[keptTypes.Count + 1];
+            andForm[0] = Startup.Sym("AND");
+            for (int i = 0; i < keptTypes.Count; i++) andForm[i + 1] = keptTypes[i];
+            slotType = Runtime.List(andForm);
+        }
+
+        // The most specific :documentation given (CLHS 7.5.3): a subclass that
+        // restates the slot without one keeps the inherited string.
+        LispObject documentation = Nil.Instance;
+        foreach (var d in defs)
+        {
+            if (d.Documentation is Nil) continue;
+            documentation = d.Documentation;
             break;
         }
 
@@ -533,7 +828,15 @@ public class LispClass : LispObject
             primary.IsClassAllocation) { IsEffective = true, SlotType = slotType,
                                          Initform = initformSource,
                                          Allocation = primary.Allocation,
-                                         Documentation = primary.Documentation };
+                                         Documentation = documentation };
+    }
+
+    /// <summary>True only when SUBTYPEP answers yes for certain. A type that cannot
+    /// be decided yet (a class not defined at finalization time) counts as no.</summary>
+    private static bool SubtypeCertain(LispObject sub, LispObject super)
+    {
+        try { return Runtime.IsTruthy(Runtime.Subtypep(sub, super)); }
+        catch (LispErrorException) { return false; }
     }
 
     private SlotDefinition[] ComputeEffectiveSlots()
@@ -542,18 +845,27 @@ public class LispClass : LispObject
         // - Initargs: union of all initargs across CPL
         // - Initform: from the most specific class that provides one
         // - Allocation: from the most specific class (default :instance)
-        var slotOrder = new List<string>();
-        var slotDefs = new Dictionary<string, List<SlotDefinition>>();
+        //
+        // Slots are named by symbols: A::X and B::X are two slots. Grouping is by
+        // symbol (SameSlotName), with the name string only narrowing the search.
+        var slotOrder = new List<List<SlotDefinition>>();
+        var groupsByName = new Dictionary<string, List<List<SlotDefinition>>>();
         foreach (var cls in ClassPrecedenceList)
         {
             foreach (var slot in cls.DirectSlots)
             {
-                if (!slotDefs.ContainsKey(slot.Name.Name))
+                if (!groupsByName.TryGetValue(slot.Name.Name, out var groups))
+                    groupsByName[slot.Name.Name] = groups = new List<List<SlotDefinition>>(1);
+                List<SlotDefinition>? group = null;
+                foreach (var g in groups)
+                    if (SameSlotName(g[0].Name, slot.Name)) { group = g; break; }
+                if (group == null)
                 {
-                    slotOrder.Add(slot.Name.Name);
-                    slotDefs[slot.Name.Name] = new List<SlotDefinition>();
+                    group = new List<SlotDefinition>();
+                    groups.Add(group);
+                    slotOrder.Add(group);
                 }
-                slotDefs[slot.Name.Name].Add(slot);
+                group.Add(slot);
             }
         }
 
@@ -563,9 +875,8 @@ public class LispClass : LispObject
         bool useProtocol = Metaclass != null && ComputeEffectiveSlotHook != null;
 
         var slots = new List<SlotDefinition>();
-        foreach (var name in slotOrder)
+        foreach (var defs in slotOrder)
         {
-            var defs = slotDefs[name];
             SlotDefinition? effective = null;
             if (useProtocol)
                 effective = ComputeEffectiveSlotHook!(this, defs[0].Name, defs.ToArray());
@@ -578,6 +889,42 @@ public class LispClass : LispObject
     public override string ToString() => $"#<STANDARD-CLASS {Name.Name}>";
 }
 
+/// <summary>A class layout token (see LispClass.Layout). Carries nothing while it is
+/// current; when superseded it records the shape its instances were built with, which
+/// is what updating one of them needs.</summary>
+public sealed class ClassLayout
+{
+    public readonly LispClass Class;
+    public ClassLayout(LispClass cls) { Class = cls; }
+
+    internal sealed class OldShape
+    {
+        internal readonly SlotDefinition[] Slots;
+        internal readonly (Symbol Name, LispObject? Value)[] Shared;
+        internal OldShape(SlotDefinition[] slots, (Symbol Name, LispObject? Value)[] shared)
+        { Slots = slots; Shared = shared; }
+    }
+    internal volatile OldShape? Superseded;
+
+    /// <summary>The slot-access cache entries made for this layout, by slot index.
+    /// A call site that sees instances of several classes (an accessor in a method on
+    /// a superclass) refills its one-entry cache on each change of class; handing it
+    /// the entry made last time, rather than a new one, makes that refill allocate
+    /// nothing. Entries are immutable, so sharing them between call sites is safe.</summary>
+    private ReaderCache.Entry?[]? _slotEntries;
+
+    internal ReaderCache.Entry SlotEntry(int idx, int epoch)
+    {
+        var entries = _slotEntries;
+        if (entries == null || idx >= entries.Length)
+            _slotEntries = entries = new ReaderCache.Entry?[Math.Max(idx + 1, Class.EffectiveSlots.Length)];
+        var e = entries[idx];
+        if (e == null || e.Epoch != epoch)
+            entries[idx] = e = new ReaderCache.Entry(this, idx, epoch);
+        return e;
+    }
+}
+
 /// <summary>
 /// CLOS instance: class pointer + slot array.
 /// </summary>
@@ -585,16 +932,31 @@ public sealed class LispInstance : LispObject
 {
     public LispClass Class { get; set; }
     public LispObject?[] Slots { get; set; }
+    /// <summary>The class layout token this instance's Slots were built for. Not the
+    /// class's current token means the class was redefined (or its instances made
+    /// obsolete) since: see EnsureCurrent.</summary>
+    public ClassLayout Layout;
 
     public LispInstance(LispClass cls)
     {
         Class = cls;
+        Layout = cls.Layout;
         Slots = new LispObject?[cls.EffectiveSlots.Length];
         // null = unbound
         DotCL.Diagnostics.AllocCounter.Inc("LispInstance");
     }
 
     public override string ToString() => $"#<{Class.Name.Name}>";
+
+    /// <summary>Bring an obsolete instance up to its class's current layout
+    /// (CLHS 4.3.6) before its Slots are read or written. One reference compare
+    /// when the class was never redefined.</summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    public void EnsureCurrent()
+    {
+        if (!ReferenceEquals(Layout, Class.Layout))
+            Runtime.UpdateObsoleteInstance(this);
+    }
 
     // Strong, deliberately. A reference to a make-load-form literal compiles to a
     // lookup by key -- the creation form runs once, in its own top-level method,
@@ -604,7 +966,9 @@ public sealed class LispInstance : LispObject
     // (cffi's defcallback embeds a type object this way, so an argument stopped being
     // translated and a pointer reached Lisp code as an integer). Lifetime is now the
     // process; the bound is the number of distinct make-load-form literals loaded.
-    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, LispInstance>
+    // Holds any object a creation form returns, not only instances: a structure
+    // with its own MAKE-LOAD-FORM goes through the same registry.
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, LispObject>
         _internCache = new();
 
     // NOTE: deliberately does NOT populate _internCache. CLHS 3.2.4.2 requires the
@@ -622,6 +986,33 @@ public sealed class LispInstance : LispObject
         // intentionally empty: see note above
     }
 
+    /// <summary>FASL load-time: the make-load-form literal interned under KEY, or
+    /// null when its creation form has not run yet.</summary>
+    public static LispInstance? TryGetInterned(string key) =>
+        _internCache.TryGetValue(key, out var existing) ? existing as LispInstance : null;
+
+    /// <summary>FASL load-time: (ALLOCATE-INSTANCE (FIND-CLASS 'CLASS-NAME)), the
+    /// start of the creation form MAKE-LOAD-FORM-SAVING-SLOTS returns, interned
+    /// under KEY like InternViaEval. The emitter then fills the slots.</summary>
+    public static LispObject InternAllocateInstance(string key, LispObject className)
+    {
+        if (_internCache.TryGetValue(key, out var existing))
+            return existing;
+        var cls = Runtime.UnwrapMv(Runtime.FindClass(className));
+        var fn = Emitter.CilAssembler.GetFunctionBySymbol(Startup.Sym("ALLOCATE-INSTANCE"));
+        MultipleValues.Reset();
+        var obj = Runtime.UnwrapMv(fn.Invoke1(cls));
+        // Whatever ALLOCATE-INSTANCE made is the literal: a structure (its
+        // MAKE-LOAD-FORM-SAVING-SLOTS form has this shape too) has to be found
+        // by its key afterwards just as an instance is.
+        _internCache[key] = obj;
+        return obj;
+    }
+
+    /// <summary>FASL load-time: whether a make-load-form literal of any kind
+    /// has been interned under KEY.</summary>
+    public static bool IsInterned(string key) => _internCache.ContainsKey(key);
+
     /// <summary>FASL load-time: evaluate make-load-form creation form once and cache by key.</summary>
     public static LispObject InternViaEval(string key, LispObject creationForm)
     {
@@ -634,12 +1025,9 @@ public sealed class LispInstance : LispObject
         if (creationForm is Nil)
             throw new LispErrorException(new LispError(
                 $"FASL: load-form literal {key} was not created before it was referenced"));
-        var obj = Runtime.Eval(creationForm);
-        if (obj is LispInstance result)
-        {
-            _internCache[key] = result;
-            return result;
-        }
+        var obj = Runtime.TryCallConstantForm(creationForm, out var called)
+            ? Runtime.UnwrapMv(called) : Runtime.Eval(creationForm);
+        _internCache[key] = obj;
         return obj;
     }
 }
@@ -665,7 +1053,9 @@ public sealed class EqlSpecializer : LispObject
 public class LispMethod : LispObject
 {
     public LispObject[] Specializers { get; set; }  // LispClass, EqlSpecializer, or (eql value)
-    public Symbol[] Qualifiers { get; set; }         // :BEFORE, :AFTER, :AROUND, or empty
+    // :BEFORE, :AFTER, :AROUND, or empty. Any non-list atom may be a qualifier
+    // (CLHS DEFMETHOD), so T and numbers are kept too; T is not a Symbol here.
+    public LispObject[] Qualifiers { get; set; }
     public LispFunction Function { get; set; }
 
     /// <summary>The method function as AMOP defines it: called with a list of the
@@ -714,7 +1104,7 @@ public class LispMethod : LispObject
         => ExtraSlots ?? System.Threading.Interlocked.CompareExchange(
                ref ExtraSlots, new(), null) ?? ExtraSlots;
 
-    public LispMethod(LispObject[] specializers, Symbol[] qualifiers, LispFunction function)
+    public LispMethod(LispObject[] specializers, LispObject[] qualifiers, LispFunction function)
     {
         Specializers = specializers;
         Qualifiers = qualifiers;
@@ -723,11 +1113,26 @@ public class LispMethod : LispObject
 
     public LispMethod() {
         Specializers = Array.Empty<LispObject>();
-        Qualifiers = Array.Empty<Symbol>();
+        Qualifiers = Array.Empty<LispObject>();
         Function = null!;
     }
 
     public override string ToString() => "#<METHOD>";
+
+    /// <summary>The name a qualifier is compared by: a symbol's name, "T" for T,
+    /// null for any other atom (a number).</summary>
+    public static string? QualifierName(LispObject q)
+        => q is Symbol s ? s.Name : q is T ? "T" : null;
+
+    /// <summary>Two qualifiers agree: symbols (and T) by name, as method
+    /// identity has always compared them here, anything else by EQL.</summary>
+    public static bool QualifierSame(LispObject a, LispObject b)
+    {
+        var na = QualifierName(a);
+        var nb = QualifierName(b);
+        if (na != null || nb != null) return na == nb;
+        return Runtime.IsTrueEql(a, b);
+    }
 }
 
 /// <summary>
@@ -846,10 +1251,10 @@ public sealed class ReaderCache
 
     internal sealed class Entry
     {
-        internal readonly LispClass Cls;
+        internal readonly ClassLayout Layout;
         internal readonly int Idx;
         internal readonly int Epoch;
-        internal Entry(LispClass cls, int idx, int epoch) { Cls = cls; Idx = idx; Epoch = epoch; }
+        internal Entry(ClassLayout layout, int idx, int epoch) { Layout = layout; Idx = idx; Epoch = epoch; }
     }
 }
 
@@ -863,16 +1268,10 @@ public sealed class WriterCache
 {
     /// <summary>The accessor name: the (SETF name) function is re-resolved from it on a miss.</summary>
     internal readonly Symbol Sym;
-    internal volatile Entry? E;
+    /// <summary>Same shape as the reader's entry, and taken from the same per-layout
+    /// memo (<see cref="ClassLayout.SlotEntry"/>).</summary>
+    internal volatile ReaderCache.Entry? E;
     public WriterCache(Symbol sym) { Sym = sym; }
-
-    internal sealed class Entry
-    {
-        internal readonly LispClass Cls;
-        internal readonly int Idx;
-        internal readonly int Epoch;
-        internal Entry(LispClass cls, int idx, int epoch) { Cls = cls; Idx = idx; Epoch = epoch; }
-    }
 }
 
 /// <summary>A method combination metaobject. AMOP has FIND-METHOD-COMBINATION
@@ -993,8 +1392,25 @@ public class GenericFunction : LispFunction
     /// <summary>Max entries in the polymorphic dispatch cache.</summary>
     internal const int DispatchCacheWidth = 4;
 
+    /// <summary>Second level behind <see cref="DispatchCache"/>: every entry made for
+    /// one dispatch class, by that class. The cache belongs to the generic function,
+    /// not to a call site, so INITIALIZE-INSTANCE or PRINT-OBJECT in a program that
+    /// uses more classes than the front cache holds would otherwise recompute the
+    /// applicable methods on most calls. Valid only while <see cref="MethodEpoch"/>
+    /// is the one it was made under: a method change or a class (re)finalization
+    /// anywhere starts a new one.</summary>
+    internal volatile DispatchTable1? DispatchByClass;
+
+    internal sealed class DispatchTable1
+    {
+        internal readonly int Epoch;
+        internal readonly System.Collections.Concurrent.ConcurrentDictionary<LispClass, CachedDispatch> Map
+            = new(ReferenceEqualityComparer.Instance);
+        internal DispatchTable1(int epoch) { Epoch = epoch; }
+    }
+
     /// <summary>Invalidate dispatch cache when methods are added/removed.</summary>
-    internal void InvalidateCache() { DispatchCache = null; BumpMethodEpoch(); }
+    internal void InvalidateCache() { DispatchCache = null; DispatchByClass = null; BumpMethodEpoch(); }
 
     /// <summary>Global method-system epoch. Bumped on any method add/remove (via
     /// <see cref="InvalidateCache"/>) and on any class finalization (slot-layout change).
@@ -1031,7 +1447,7 @@ public class GenericFunction : LispFunction
             if (m.Qualifiers.Length != 0) return;              // :before/:after/:around
             if (m.AccessorSlot is not { } sd) return;          // user / non-accessor method
             if (slot == null) slot = sd.Name;
-            else if (slot.Name != sd.Name.Name) return;        // differing slot name
+            else if (!LispClass.SameSlotName(slot, sd.Name)) return; // differing slot
             if (arity == -1) arity = m.Specializers.Length;
             else if (arity != m.Specializers.Length) return;   // mixed reader/writer
         }
@@ -1044,6 +1460,40 @@ public class GenericFunction : LispFunction
         : base(dispatchFn, name.Name, arity)
     {
         Name = name;
+        Track(this);
+    }
+
+    // Every generic function ever made, named or not, held weakly: a class
+    // redefinition has to drop the dispatch caches of all of them (see
+    // InvalidateAllCaches), and one made with MAKE-INSTANCE is in no name table.
+    private static readonly List<WeakReference<GenericFunction>> _all = new();
+    private static int _pruneAt = 256;
+
+    private static void Track(GenericFunction gf)
+    {
+        lock (_all)
+        {
+            _all.Add(new WeakReference<GenericFunction>(gf));
+            if (_all.Count >= _pruneAt)
+            {
+                _all.RemoveAll(w => !w.TryGetTarget(out _));
+                _pruneAt = Math.Max(256, _all.Count * 2);
+            }
+        }
+    }
+
+    /// <summary>Drop the dispatch caches of every live generic function.</summary>
+    internal static void InvalidateAllCaches()
+    {
+        GenericFunction[] live;
+        lock (_all)
+        {
+            var list = new List<GenericFunction>(_all.Count);
+            foreach (var w in _all)
+                if (w.TryGetTarget(out var gf)) list.Add(gf);
+            live = list.ToArray();
+        }
+        foreach (var gf in live) gf.InvalidateCache();
     }
 
     public override string ToString() => $"#<GENERIC-FUNCTION {Name.Name}>";

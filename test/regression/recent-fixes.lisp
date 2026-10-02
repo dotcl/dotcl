@@ -4653,6 +4653,28 @@
 (deftest huge-lexical-mutation-form-chunks-and-matches
   (= (eval (%big488-lexical 4000)) (%big488-expected 4000))
   t)
+;; A macro that expands AT TOP LEVEL into thousands of forms (April's test suite:
+;; (with-april-context ... <2672 forms>) expands to a PROGN) cannot be chunked
+;; into closures, since top-level forms must stay top-level. Under EVAL the
+;; progn runs as consecutive methods instead of one oversized method. The last
+;; form's multiple values still come back.
+(defmacro %big488-toplevel-progn (n)
+  `(progn (setf %big488-acc 0)
+          ,@(loop for i below n collect (%big488-heavy i '%big488-acc))
+          (values %big488-acc :done)))
+(deftest huge-toplevel-macro-progn-evals
+  (multiple-value-bind (acc tag) (eval '(%big488-toplevel-progn 4000))
+    (list (= acc (%big488-expected 4000)) tag))
+  (t :done))
+(deftest huge-toplevel-macrolet-progn-evals
+  (let ((r (multiple-value-list
+            (eval '(macrolet ((m () `(progn (setf %big488-acc 0)
+                                           ,@(loop for i below 4000
+                                                   collect (%big488-heavy i '%big488-acc))
+                                           (values 1 %big488-acc))))
+                     (m))))))
+    (list (first r) (= (second r) (%big488-expected 4000))))
+  (1 t))
 ;; The clear-error fallback still holds where chunking is genuinely unsafe: a raw
 ;; native slot (here a declared fixnum) cannot be captured by a closure without
 ;; emitting invalid IL, so the body stays one method and the catchable "form too

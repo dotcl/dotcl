@@ -10,16 +10,15 @@
 ;;; depending on where it appeared.
 ;;;
 ;;; The behaviour under test is argument handling in main, so each case runs
-;;; this executable again. `compiler/cil-out.sil` is used as the core: RunCore
-;;; takes SIL text as well as a FASL, and the suite always has that file.
+;;; this executable again, started from REGRESSION-CHILD-CORE (the FASL core,
+;;; see test/framework.lisp).
 
 (defvar *cli-mf-exe*
   (or (ignore-errors (dotnet:static "System.Environment" "ProcessPath"))
       (error "cannot locate this process's executable")))
 
 (defvar *cli-mf-core*
-  (or (ignore-errors (namestring (truename "compiler/cil-out.sil")))
-      "compiler/cil-out.sil"))
+  (regression-child-core))
 
 (defvar *cli-mf-absent* "/no/such/directory/no-such-file.lisp")
 

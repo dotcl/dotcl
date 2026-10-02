@@ -60,20 +60,43 @@ static int CmdCharNames(string[] args)
     w.WriteLine("        internal static readonly System.Collections.Generic.Dictionary<string, char> NameToChar;");
     w.WriteLine("        internal static readonly System.Collections.Generic.Dictionary<char, string> CharToName;");
     w.WriteLine();
+    // The table is one string constant, one "XXXX NAME" line per entry, parsed
+    // by the type initializer. An array initializer of ~30k (string, char)
+    // tuples compiled to ~440 KB of IL in the type initializer, and JIT-compiling
+    // that took ~0.45 s the first time a character name missed the small table.
     w.WriteLine("        static Ucd()");
     w.WriteLine("        {");
-    w.WriteLine("            var data = Data;");
+    w.WriteLine("            var text = Data;");
+    w.WriteLine("            int count = 0;");
+    w.WriteLine("            foreach (char ch in text) if (ch == '\\n') count++;");
     w.WriteLine("            NameToChar = new System.Collections.Generic.Dictionary<string, char>(");
-    w.WriteLine("                data.Length, System.StringComparer.OrdinalIgnoreCase);");
-    w.WriteLine("            CharToName = new System.Collections.Generic.Dictionary<char, string>(data.Length);");
-    w.WriteLine("            foreach (var (n, c) in data) { NameToChar.TryAdd(n, c); CharToName.TryAdd(c, n); }");
+    w.WriteLine("                count, System.StringComparer.OrdinalIgnoreCase);");
+    w.WriteLine("            CharToName = new System.Collections.Generic.Dictionary<char, string>(count);");
+    w.WriteLine("            int pos = 0;");
+    w.WriteLine("            while (pos < text.Length)");
+    w.WriteLine("            {");
+    w.WriteLine("                int eol = text.IndexOf('\\n', pos);");
+    w.WriteLine("                if (eol < 0) eol = text.Length;");
+    w.WriteLine("                int end = eol;");
+    w.WriteLine("                if (end > pos && text[end - 1] == '\\r') end--;");
+    w.WriteLine("                if (end - pos > 5)");
+    w.WriteLine("                {");
+    w.WriteLine("                    int code = 0;");
+    w.WriteLine("                    for (int i = pos; i < pos + 4; i++)");
+    w.WriteLine("                        code = code * 16 + (text[i] <= '9' ? text[i] - '0' : text[i] - 'A' + 10);");
+    w.WriteLine("                    char c = (char)code;");
+    w.WriteLine("                    string n = text.Substring(pos + 5, end - pos - 5);");
+    w.WriteLine("                    NameToChar.TryAdd(n, c);");
+    w.WriteLine("                    CharToName.TryAdd(c, n);");
+    w.WriteLine("                }");
+    w.WriteLine("                pos = eol + 1;");
+    w.WriteLine("            }");
     w.WriteLine("        }");
     w.WriteLine();
-    w.WriteLine("        private static readonly (string, char)[] Data =");
-    w.WriteLine("        [");
+    w.WriteLine("        private const string Data = @\"");
     foreach (var (cp, name) in entries)
-        w.WriteLine($"            (\"{name}\", '\\x{cp:X4}'),");
-    w.WriteLine("        ];");
+        w.WriteLine($"{cp:X4} {name}");
+    w.WriteLine("\";");
     w.WriteLine("    }");
     w.WriteLine("}");
     Console.WriteLine($"Wrote {outPath}");

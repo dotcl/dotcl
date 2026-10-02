@@ -57,18 +57,27 @@ Console.WriteLine($"DYNCODE {System.Runtime.CompilerServices.RuntimeFeature.IsDy
 try
 {
     DotclHost.EvalString("(defun greet (who) (format nil \"hello ~a\" who))");
-    // A name is a symbol name, matched exactly. The reader upcased GREET.
-    Console.WriteLine($"CALL-EXACT {DotclHost.ToClr<string>(DotclHost.Call("GREET", "world"))}");
-    Console.WriteLine($"CALL-QUALIFIED {DotclHost.ToClr<string>(DotclHost.Call("COMMON-LISP-USER::GREET", "world"))}");
+    // A name is read as the Lisp reader reads a symbol, so the source spelling
+    // and the upcased one both name GREET.
+    Console.WriteLine($"CALL-READ {DotclHost.ToClr<string>(DotclHost.Call("greet", "world"))}");
+    Console.WriteLine($"CALL-UPPER {DotclHost.ToClr<string>(DotclHost.Call("GREET", "world"))}");
+    Console.WriteLine($"CALL-QUALIFIED {DotclHost.ToClr<string>(DotclHost.Call("common-lisp-user::greet", "world"))}");
 
-    // The source spelling does not resolve -- but the error says what to write.
-    try { DotclHost.Call("greet", "world"); Console.WriteLine("CASE-MISS none"); }
-    catch (InvalidOperationException e) { Console.WriteLine($"CASE-MISS {e.Message}"); }
-
-    // Exact matching is what makes both of these reachable at all.
+    // |...| keeps the case, so a lowercase symbol is reachable beside its
+    // upcased namesake.
     DotclHost.EvalString("(defun |lower| () :lowercase)");
     DotclHost.EvalString("(defun lower () :upcased)");
-    Console.WriteLine($"LOWER {DotclHost.Call("lower")} UPPER {DotclHost.Call("LOWER")}");
+    Console.WriteLine($"LOWER {DotclHost.Call("|lower|")} UPPER {DotclHost.Call("lower")}");
+
+    // A miss on a name that exists in another case says how to write it.
+    DotclHost.EvalString("(defun |mixedCase| () :mixed)");
+    try { DotclHost.Call("mixedcase"); Console.WriteLine("CASE-MISS none"); }
+    catch (InvalidOperationException e) { Console.WriteLine($"CASE-MISS {e.Message}"); }
+
+    // Register reads its name the same way.
+    DotclHost.Register("|hostLower|", _ => "registered-lower");
+    DotclHost.Register("host-upper", _ => "registered-upper");
+    Console.WriteLine($"REGISTER {DotclHost.ToClr(DotclHost.EvalString("(list (|hostLower|) (host-upper))"))}");
 
     // An unqualified name means the current package, nothing else.
     DotclHost.EvalString("(defpackage :mylib (:use :cl) (:export #:entry))");
@@ -77,8 +86,8 @@ try
     Console.WriteLine($"PACKAGE {DotclHost.CurrentPackage}");
     try { DotclHost.Call("ENTRY"); Console.WriteLine("ELSEWHERE none"); }
     catch (InvalidOperationException e) { Console.WriteLine($"ELSEWHERE {e.Message}"); }
-    Console.WriteLine($"QUALIFIED {DotclHost.Call("MYLIB:ENTRY")}");
-    DotclHost.CurrentPackage = "MYLIB";
+    Console.WriteLine($"QUALIFIED {DotclHost.Call("mylib:entry")}");
+    DotclHost.CurrentPackage = "mylib";
     Console.WriteLine($"AFTER-SET {DotclHost.CurrentPackage} {DotclHost.Call("ENTRY")}");
     DotclHost.CurrentPackage = "COMMON-LISP-USER";
 }
@@ -134,18 +143,19 @@ emit_csproj
 out="$(build_and_run "host")"
 want "host" "$out" "CORE ok"
 want "host" "$out" "DYNCODE True"
-want "host" "$out" "CALL-EXACT hello world"
+want "host" "$out" "CALL-READ hello world"
+want "host" "$out" "CALL-UPPER hello world"
 want "host" "$out" "CALL-QUALIFIED hello world"
-# The miss is the interesting half: it must name the spelling that works.
-want "host" "$out" "CASE-MISS"
-want "host" "$out" '"GREET" does exist'
 want "host" "$out" "LOWER :LOWERCASE UPPER :UPCASED"
+# The miss must name the spelling that works.
+want "host" "$out" 'mixedCase is written "|mixedCase|"'
+want "host" "$out" '"registered-lower" "registered-upper"' 
 want "host" "$out" "PACKAGE COMMON-LISP-USER"
 want "host" "$out" "ELSEWHERE"
 want "host" "$out" "defined in MYLIB"
 want "host" "$out" "QUALIFIED :FROM-MYLIB"
 want "host" "$out" "AFTER-SET MYLIB :FROM-MYLIB"
-echo "PASS (host): names match exactly, unqualified means the current package, and a miss says what to write"
+echo "PASS (host): names are read as the reader reads them, unqualified means the current package, and a miss says what to write"
 
 # -- lifecycle: initialization races and a failed core load -----------------
 # Its own directory and process: both facts below are about what a FRESH
@@ -206,6 +216,53 @@ want "lifecycle" "$out" "LC-AFTER-SUCCESS True"
 want "lifecycle" "$out" "LC-EVAL 3"
 echo "PASS (lifecycle): concurrent Initialize bootstraps once, a failed LoadCore leaves the host loadable"
 
+# -- concurrent EnsureCore -----------------------------------------------------
+# Several components that each make sure a core is there, called from their own
+# threads at once. The core must be loaded once: a second load signals "package
+# COMMON-LISP is locked", and two loads at the same time corrupted a collection.
+# A fresh process per round, since the core loads once per process; the race
+# did not show every time, so several rounds.
+echo "=== concurrent EnsureCore ==="
+ENS="$WORK2/ensurecore"
+mkdir -p "$ENS"
+cat > "$ENS/Program.cs" <<'CSEOF6'
+using DotCL;
+
+var start = new ManualResetEventSlim(false);
+var errors = new System.Collections.Concurrent.ConcurrentQueue<string>();
+var threads = new Thread[8];
+for (int i = 0; i < threads.Length; i++)
+{
+    threads[i] = new Thread(() =>
+    {
+        start.Wait();
+        try { DotclHost.EnsureCore(); }
+        catch (Exception e) { errors.Enqueue($"{e.GetType().Name}: {e.Message}"); }
+    });
+    threads[i].Start();
+}
+start.Set();
+foreach (var t in threads) t.Join();
+foreach (var e in errors) Console.WriteLine($"EC-ERROR {e}");
+Console.WriteLine($"EC-ERRORS {errors.Count}");
+Console.WriteLine($"EC-INIT-COUNT {DotclHost.InitializeCount}");
+Console.WriteLine($"EC-LOADED {DotclHost.CoreLoaded}");
+Console.WriteLine($"EC-EVAL {DotclHost.ToClr<string>(DotclHost.EvalString("(format nil \"~a\" (+ 1 2))"))}");
+CSEOF6
+emit_csproj "$ENS"
+out="$(build_and_run "ensurecore" "$ENS")"
+round=1
+while :; do
+  want "ensurecore round $round" "$out" "EC-ERRORS 0"
+  want "ensurecore round $round" "$out" "EC-INIT-COUNT 1"
+  want "ensurecore round $round" "$out" "EC-LOADED True"
+  want "ensurecore round $round" "$out" "EC-EVAL 3"
+  [ "$round" -ge 20 ] && break
+  round=$((round + 1))
+  out="$(dotnet "$ENS/bin/hostapi.dll" 2>&1)"
+done
+echo "PASS (ensurecore): 8 threads calling EnsureCore at once load the core once, 20 rounds"
+
 # -- what a condition looks like on the .NET side ---------------------------
 # Its own process for the same reason: the debugger hook is process-wide state.
 echo "=== conditions (typed exception, wrapped .NET exception, handled in Lisp) ==="
@@ -229,16 +286,29 @@ catch (DotclConditionException e)
 }
 
 // (d) A .NET exception raised through interop keeps the original exception.
-// The runtime throws such a failure directly (LispErrorException) rather than
-// running the debugger hook, so a host sees it as itself -- with the condition,
-// and the CLR exception, on it.
+// The runtime throws such a failure itself (a LispErrorException, without
+// running the debugger hook); with the typed hook installed the host entry point
+// hands it over as a DotclConditionException all the same, so one catch covers
+// both kinds of failure.
 const string clrBoom = "(dotnet:invoke (dotnet:new \"System.Collections.ArrayList\") \"RemoveAt\" 5)";
 try { DotclHost.EvalString(clrBoom); Console.WriteLine("CLR-RAW none"); }
-catch (LispErrorException e)
+catch (DotclConditionException e)
 {
-    var inner = e.Condition.ClrException;
-    Console.WriteLine($"CLR-RAW type={e.Condition.ConditionTypeName} clr={(inner == null ? "null" : inner.GetType().Name)}");
+    var inner = e.ClrException;
+    Console.WriteLine($"CLR-RAW type={e.ConditionType} clr={(inner == null ? "null" : inner.GetType().Name)} via={e.InnerException?.GetType().Name}");
 }
+catch (LispErrorException) { Console.WriteLine("CLR-RAW untyped"); }
+
+// The same through Call, and a runtime error that is not from .NET.
+DotclHost.EvalString("(defun host-car (x) (car x))");
+try { DotclHost.Call("HOST-CAR", 5); Console.WriteLine("CALL-RAW none"); }
+catch (DotclConditionException e) { Console.WriteLine($"CALL-RAW type={e.ConditionType}"); }
+
+// A host call nested inside Lisp (Lisp -> host -> Lisp) is not converted: the
+// Lisp frames in between still see the original condition and handle it.
+DotclHost.Register("host-nested", _ => DotclHost.EvalString(clrBoom));
+var nested = DotclHost.EvalString("(handler-case (host-nested) (error (c) (if (typep c 'error) :handled-in-lisp :other)))");
+Console.WriteLine($"NESTED {nested}");
 
 // Signalled as a condition (a Lisp handler re-signals it, or any code calls
 // ERROR on it), the same failure reaches the hook -- and the .NET exception is
@@ -266,18 +336,24 @@ catch (Exception e) { Console.WriteLine($"HANDLED escaped {e.GetType().Name}"); 
 DotclHost.SetThrowingDebuggerHook(false);
 try { DotclHost.EvalString("(error \"legacy ~a\" 7)"); Console.WriteLine("LEGACY none"); }
 catch (InvalidOperationException e) { Console.WriteLine($"LEGACY {e.Message}"); }
+// ... and there a runtime-raised failure arrives as it always did.
+try { DotclHost.EvalString(clrBoom); Console.WriteLine("LEGACY-CLR none"); }
+catch (LispErrorException e) { Console.WriteLine($"LEGACY-CLR {e.Condition.ConditionTypeName}"); }
 CSEOF4
 emit_csproj "$COND"
 out="$(build_and_run "conditions" "$COND")"
 want "conditions" "$out" "LISP-ERR type=SIMPLE-ERROR msg=boom 42 clr=null"
 want "conditions" "$out" "LISP-ERR-REPORT boom 42"
 want "conditions" "$out" "LISP-ERR-TYPEP T"
-want "conditions" "$out" "CLR-RAW type=ERROR clr=ArgumentOutOfRangeException"
+want "conditions" "$out" "CLR-RAW type=ERROR clr=ArgumentOutOfRangeException via=LispErrorException"
+want "conditions" "$out" "CALL-RAW type=TYPE-ERROR"
+want "conditions" "$out" "NESTED :HANDLED-IN-LISP"
 want "conditions" "$out" "CLR-ERR type=ERROR clr=ArgumentOutOfRangeException"
 want "conditions" "$out" "HANDLED handled:"
 printf '%s\n' "$out" | grep -q "HANDLED escaped" \
   && { echo "FAIL (conditions): a condition handled in Lisp still reached the host"; printf '%s\n' "$out"; exit 1; }
 want "conditions" "$out" "LEGACY SIMPLE-ERROR: legacy 7"
+want "conditions" "$out" "LEGACY-CLR ERROR"
 echo "PASS (conditions): the condition object reaches the host, a wrapped .NET exception survives, and Lisp-handled conditions do not escape"
 
 echo "=== values, specials, output streams ==="
@@ -304,6 +380,12 @@ Console.WriteLine($"MV-NONE {DotclHost.CallMv("NOTHING").Length}");
 // The ordinary single-value case is one element, never null.
 var one = DotclHost.CallMv("LIST", 1, 2);
 Console.WriteLine($"MV-ONE {one.Length} {one[0] is not null}");
+
+// Call and EvalString hand back the primary value itself, not a wrapper for
+// the values: a host that checks the type sees a Fixnum. No values at all is NIL.
+Console.WriteLine($"MV-CALL-TYPE {q is Fixnum fq && fq.Value == 3} {DotclHost.Call("NOTHING") is Nil}");
+Console.WriteLine($"MV-EVAL-TYPE {DotclHost.EvalString("(floor 7 2)") is Fixnum} "
+                  + $"{DotclHost.EvalString("(values)") is Nil}");
 
 // EvalStringMv keeps the values of the LAST form.
 var ev = DotclHost.EvalStringMv("(values :a :b :c)");
@@ -348,6 +430,8 @@ want "values" "$out" "MV-PRIMARY 3 MV-COUNT 2 MV-0 3 MV-1 1"
 want "values" "$out" "MV-NONE 0"
 want "values" "$out" "MV-ONE 1 True"
 want "values" "$out" "MV-EVAL 3 :C"
+want "values" "$out" "MV-CALL-TYPE True True"
+want "values" "$out" "MV-EVAL-TYPE True True"
 want "values" "$out" "SP-GET 41"
 want "values" "$out" "SP-SET 42"
 want "values" "$out" "SP-QUALIFIED 10"

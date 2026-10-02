@@ -111,7 +111,11 @@ public partial class CilAssembler
     /// from emitted IL: the per-unit, collectible counterpart of GetConstant.
     /// The holder is live whenever this runs: the loading code either runs once
     /// under AssembleAndRunSingle's GC.KeepAlive, or is a rooted function that
-    /// pins the holder via RetainUnit.</summary>
+    /// pins the holder via RetainUnit.
+    /// Not inlined: the callers are in-memory methods, JIT-compiled with full
+    /// optimization on first call, and inlining the unit table lookup into each
+    /// of them cost more JIT time than the call it saves.</summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
     public static object GetUnitConstant(int unitId, int index) =>
         (TryGetUnitHolder(unitId)
             ?? throw new LispErrorException(new LispProgramError(

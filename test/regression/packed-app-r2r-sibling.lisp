@@ -23,8 +23,7 @@
       (error "cannot locate this process's executable")))
 
 (defvar *par-core*
-  (or (ignore-errors (namestring (truename "compiler/cil-out.sil")))
-      "compiler/cil-out.sil"))
+  (regression-child-core))
 
 (defun %par-tmp (name)
   (concatenate 'string

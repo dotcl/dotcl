@@ -15,5 +15,10 @@ Named in `:defsystem-depends-on` rather than required directly. The component
 name is the package id, and the options are the ones `nuget:require` takes
 (`:nuget-version`, `:source`, `:prerelease`, `:rid`, `:tfm`) -- note
 `:nuget-version`, since ASDF takes `:version` for a component version of its
-own. Depends on `asdf` and the `nuget` contrib. See
+own. Versions follow the project's lock file: an exact version is resolved and
+recorded on first load, and a floating one waits for `(nuget:restore)`. Depends
+on `asdf` and the `dotcl-nuget` contrib. See
 [docs/libraries.md](../../docs/libraries.md).
+
+The other direction, packaging a system so that another one can declare it, is
+`dotcl pack --library`; see [docs/dotcl-pack.md](../../docs/dotcl-pack.md).

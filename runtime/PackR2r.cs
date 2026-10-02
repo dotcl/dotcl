@@ -212,6 +212,21 @@ static class PackR2r
         }
     }
 
+    /// <summary>The crossgen2 for this machine, restoring it first when it is
+    /// missing, or null when that did not bring it in. `pack --library --r2r`
+    /// asks before packing: the siblings are written inside the Lisp image, which
+    /// only notes a missing crossgen2 and goes on, and a package asked to carry
+    /// ReadyToRun images should not quietly come out without them.</summary>
+    internal static string? EnsureHostCrossgen2()
+    {
+        var host = HostRid();
+        if (host == null) return null;
+        var cg = FindCrossgen2(host);
+        if (cg != null) return cg;
+        Prime(host);
+        return FindCrossgen2(host);
+    }
+
     static string NuGetPackagesDir() =>
         Environment.GetEnvironmentVariable("NUGET_PACKAGES")
         ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
@@ -257,7 +272,7 @@ static class PackR2r
         return best;
     }
 
-    static string? HostRid()
+    internal static string? HostRid()
     {
         var os = OperatingSystem.IsWindows() ? "win"
                : OperatingSystem.IsMacOS() ? "osx"
