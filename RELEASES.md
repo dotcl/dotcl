@@ -3,6 +3,19 @@
 User-facing release notes for dotcl. Each section corresponds to a tagged
 release on the public mirror (dotcl/dotcl).
 
+## v0.1.32 -- 2026-10-03
+
+This release fixes a wrong result that 0.1.31 introduced. If you use 0.1.31,
+upgrade.
+
+- **Right shifts of large integers by 64 bits or more returned wrong values.**
+  In 0.1.31, `(ash x -k)` with a constant `k` of 64 or more and an `x` that does
+  not fit in 64 bits shifted by only 64, and so did `ldb` with a byte position
+  of 64 or more: `(ash (expt 2 127) -120)` returned 2^63 instead of 128. No
+  error was signalled. Libraries that work with 128-bit values, such as UUID
+  and serialization libraries, were affected. 0.1.30 and earlier are not
+  affected.
+
 ## v0.1.31 -- 2026-10-02
 
 Real libraries now run on dotcl and pass their own test suites. Those suites

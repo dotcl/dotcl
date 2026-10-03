@@ -4491,7 +4491,10 @@ the literal and the next compilation inherits it."
             (and (eq need :mod)
                  (let ((a (u64-plan x :mod))) (and a (list :shl a k)))))
            ((and (integerp k) (< k 0))
-            (let ((a (u64-plan x :exact))) (and a (list :shr a (min 64 (- k))))))
+            ;; The node keeps the real count: only the 64-bit path may cap it
+            ;; (anything from 64 up gives 0 there). The generic path, taken when
+            ;; X is outside [0, 2^64), shifts the bignum by the count as written.
+            (let ((a (u64-plan x :exact))) (and a (list :shr a (- k)))))
            ((integerp k) nil)
            ((%ash-count-range-within k 0 64)
             (and (eq need :mod)
@@ -4548,7 +4551,7 @@ the literal and the next compilation inherits it."
     (:not `(,@(%u64-fast (second node)) (:not)))
     (:shl `(,@(%u64-fast (second node)) (:ldc-i4 ,(third node)) (:shl)))
     (:shlv `(,@(%u64-fast (second node)) (:ldloc ,(second (third node))) (:call "Runtime.ShlU64")))
-    (:shr `(,@(%u64-fast (second node)) (:ldc-i8 ,(third node)) (:call "Runtime.ShrU64")))
+    (:shr `(,@(%u64-fast (second node)) (:ldc-i8 ,(min 64 (third node))) (:call "Runtime.ShrU64")))
     (:shrv `(,@(%u64-fast (second node)) (:ldloc ,(second (third node))) (:neg)
              (:call "Runtime.ShrU64")))))
 
@@ -4569,7 +4572,9 @@ the literal and the next compilation inherits it."
             (:call "Runtime.Ash")))
     (:shlv `(,@(%u64-generic (second node)) (:ldloc ,(second (third node))) (:call "Fixnum.Make")
              (:call "Runtime.Ash")))
-    (:shr `(,@(%u64-generic (second node)) (:ldc-i8 ,(- (third node))) (:call "Fixnum.Make")
+    (:shr `(,@(%u64-generic (second node))
+            ,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
+                (compile-expr (- (third node))))
             (:call "Runtime.Ash")))
     (:shrv `(,@(%u64-generic (second node)) (:ldloc ,(second (third node))) (:call "Fixnum.Make")
              (:call "Runtime.Ash")))))

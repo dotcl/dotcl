@@ -811,6 +811,7 @@
 (load "test/regression/mod-rem-fixnum-by-bignum.lisp")
 (load "test/regression/cf-toplevel-macrolet-body.lisp")
 (load "test/regression/restart-case-association-scope.lisp")
+(load "test/regression/u64-shift-past-64.lisp")
 (load "test/regression/delete-directory.lisp")
 
 (do-tests-summary)

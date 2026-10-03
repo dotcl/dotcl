@@ -4,7 +4,7 @@
        library (DotCL.Runtime.csproj), inherit this <Version> via MSBuild's automatic
        Directory.Build.props import. Bump the release version HERE only. -->
   <PropertyGroup>
-    <Version>0.1.31</Version>
+    <Version>0.1.32</Version>
   </PropertyGroup>
 
   <!-- The two packed projects in this directory must not share restore output.
