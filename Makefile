@@ -7,7 +7,7 @@ DOTCL_LISP ?= ros -L sbcl-bin run
 STDBUF ?=
 SETSID ?= $(shell which setsid 2>/dev/null)
 
-.PHONY: test-random-forms test-random-type-prop il-parity il-parity-accept all build build-ns2 check-contrib-freshness run clean repl test-fasl-shape test-core-bytes test-host-api test-cli-exit test-coverage test-ansi-all test-ansi-gate library-status library-status-tests test-ansi-full test-ansi-extra test-regression test-regression-interp test-regression-emitfree refresh-quicklisp-contrib test-pack-nuspec test-save-class-lib test-project-compose test-project-core-build test-mop test-kestrel ilverify update-ansi-state commit-ansi-state cross-compile selfhost-check selfhost-test seed-install seed-check loc publish pack install setup-ansi-test setup-asdf setup-quicklisp setup-cl-bench bench bench-state bench-survey compile-asdf-fasl compile-asdf-fasls compile-quicklisp-fasl compile-core-fasl compile-contrib-fasls contrib-dotcl-cs contrib-dotcl-jitdisasm gen-char-names
+.PHONY: test-random-forms test-random-type-prop il-parity il-parity-accept all build build-ns2 check-contrib-freshness run clean repl test-fasl-shape test-core-bytes test-host-api test-cli-exit test-coverage test-ansi-all test-ansi-gate library-status library-status-tests test-ansi-full test-ansi-extra test-regression test-regression-interp test-regression-emitfree refresh-quicklisp-contrib test-pack-nuspec test-pack-library-e2e test-pack-library-previous test-save-class-lib test-project-compose test-project-core-build test-mop ilverify update-ansi-state commit-ansi-state cross-compile selfhost-check selfhost-test seed-install seed-check loc publish pack install setup-ansi-test setup-asdf setup-quicklisp setup-cl-bench bench bench-state bench-survey compile-asdf-fasl compile-asdf-fasls compile-quicklisp-fasl compile-core-fasl compile-contrib-fasls contrib-dotnet-cs contrib-dotcl-jitdisasm gen-char-names
 
 # Source files for cross-compile. Listed once; the recipe and dependency
 # tracking both reference this so adding a file is a single-edit change.
@@ -170,6 +170,23 @@ test-pack-nuspec: build
 	@echo "=== Running pack nuspec checks ==="
 	sh $(DOTCL_ROOT)test/pack-nuspec/check.sh $(DOTCL_ROOT)
 
+# A library packed with `dotcl pack --library` onto a local feed, then loaded by
+# a separate project through a (:nuget ...) component: the library user's path,
+# no network. Uses the dotcl tool installed from the packages `make pack` wrote
+# when they are present, this tree's build otherwise (DOTCL_CI=1: a failure).
+test-pack-library-e2e: build $(DOTCL_ROOT)compiler/dotcl.core
+	@echo "=== Running library package end-to-end check ==="
+	sh $(DOTCL_ROOT)test/pack-library-e2e/check.sh $(DOTCL_ROOT)
+
+# The same, with the library packed by a released dotcl (installed from nuget.org)
+# and loaded by this one: the old fasls have to load and run here as they are.
+# Pinned like the seed; move it to the newest release when one ships.
+PREVIOUS_DOTCL_VERSION ?= 0.1.32
+
+test-pack-library-previous: build $(DOTCL_ROOT)compiler/dotcl.core
+	@echo "=== Running library package check (packed by dotcl $(PREVIOUS_DOTCL_VERSION)) ==="
+	PRODUCER_VERSION=$(PREVIOUS_DOTCL_VERSION) sh $(DOTCL_ROOT)test/pack-library-e2e/check.sh $(DOTCL_ROOT)
+
 # Asserts dotcl can emit a .NET DLL that a separate C# app references at compile
 # time (save-class-library stage 1). Round-trips via dotnet build; needs .NET 9+.
 test-save-class-lib: build
@@ -216,14 +233,6 @@ test-ansi-extra: build $(DOTCL_ROOT)compiler/cil-out.sil
 test-mop: build $(DOTCL_ROOT)compiler/cil-out.sil
 	@echo "=== Running AMOP protocol conformance tests ==="
 	$(SETSID) dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --asm $(DOTCL_ROOT)compiler/cil-out.sil $(DOTCL_ROOT)test/mop-protocol.lisp
-
-# The dotcl-kestrel contrib serving a Lack application. Separate from
-# test-regression on purpose: it needs the ASP.NET Core shared framework (present
-# wherever the .NET SDK is), and the Lack half quickloads, so it needs the network
-# on a machine that has not seen Lack before.
-test-kestrel: build $(DOTCL_ROOT)compiler/cil-out.sil
-	@echo "=== Running dotcl-kestrel HTTP checks ==="
-	$(SETSID) dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --asm $(DOTCL_ROOT)compiler/cil-out.sil $(DOTCL_ROOT)test/kestrel/app.lisp
 
 # Assert the emitter produces VERIFIABLE CIL (no covariant calls / stack-type
 # mismatches). Unverifiable IL runs on CoreCLR but is rejected by strict AOT C++
@@ -453,7 +462,7 @@ test-ansi-all: build setup-ansi-test
 #
 # Rendering runs on the host Lisp, not on dotcl: it is text handling over a JSON
 # file, and it has to work in a tree where nothing has been installed yet.
-library-status: build $(DOTCL_ROOT)compiler/cil-out.sil
+library-status: bench-build $(DOTCL_ROOT)compiler/cil-out.sil $(DOTCL_ROOT)compiler/dotcl.core
 	@sh $(DOTCL_ROOT)bench/library-status/run-quickload.sh $(DOTCL_ROOT).
 	@DOTCL_VERSION="$$(git -C $(DOTCL_ROOT). describe --tags --always)" \
 	  $(DOTCL_LISP) --load $(DOTCL_ROOT)bench/library-status/render.lisp
@@ -462,7 +471,7 @@ library-status: build $(DOTCL_ROOT)compiler/cil-out.sil
 # Stage 2b: run the test suite of every row that loads and judge it per test
 # framework (bench/library-status/run-tests.sh), then re-render. Only a
 # recognised, all-passing summary makes a row ok; see the README.
-library-status-tests: build $(DOTCL_ROOT)compiler/cil-out.sil
+library-status-tests: bench-build $(DOTCL_ROOT)compiler/cil-out.sil $(DOTCL_ROOT)compiler/dotcl.core
 	@sh $(DOTCL_ROOT)bench/library-status/run-tests.sh $(DOTCL_ROOT).
 	@DOTCL_VERSION="$$(git -C $(DOTCL_ROOT). describe --tags --always)" \
 	  $(DOTCL_LISP) --load $(DOTCL_ROOT)bench/library-status/render.lisp
@@ -1353,16 +1362,16 @@ $(foreach rid,$(R2R_RIDS),$(eval $(call R2R_CONTRIB_RULES,$(rid))))
 
 compile-contrib-fasls-r2r-all: $(addprefix compile-contrib-fasls-r2r-,$(R2R_RIDS))
 
-# Publish contrib/dotcl-cs helper DLL + Roslyn deps into
-# contrib/dotcl-cs/lib/. Invoked during `make pack` so the tool NuGet
-# bundles them under tools/net10.0/any/contrib/dotcl-cs/lib/.
-# Users who never (require "dotcl-cs") never pay for loading these
+# Publish contrib/dotnet-cs helper DLL + Roslyn deps into
+# contrib/dotnet-cs/lib/. Invoked during `make pack` so the tool NuGet
+# bundles them under tools/net10.0/any/contrib/dotnet-cs/lib/.
+# Users who never (require "dotnet-cs") never pay for loading these
 # (~9MB of Roslyn).
-contrib-dotcl-cs:
-	rm -rf $(DOTCL_ROOT)contrib/dotcl-cs/lib $(DOTCL_ROOT)contrib/dotcl-cs/bin $(DOTCL_ROOT)contrib/dotcl-cs/obj
-	dotnet publish $(DOTCL_ROOT)contrib/dotcl-cs/dotcl-cs.csproj -c Release -o $(DOTCL_ROOT)contrib/dotcl-cs/lib/ --self-contained false
-	rm -f $(DOTCL_ROOT)contrib/dotcl-cs/lib/*.pdb $(DOTCL_ROOT)contrib/dotcl-cs/lib/*.deps.json
-	rm -rf $(DOTCL_ROOT)contrib/dotcl-cs/bin $(DOTCL_ROOT)contrib/dotcl-cs/obj
+contrib-dotnet-cs:
+	rm -rf $(DOTCL_ROOT)contrib/dotnet-cs/lib $(DOTCL_ROOT)contrib/dotnet-cs/bin $(DOTCL_ROOT)contrib/dotnet-cs/obj
+	dotnet publish $(DOTCL_ROOT)contrib/dotnet-cs/dotnet-cs.csproj -c Release -o $(DOTCL_ROOT)contrib/dotnet-cs/lib/ --self-contained false
+	rm -f $(DOTCL_ROOT)contrib/dotnet-cs/lib/*.pdb $(DOTCL_ROOT)contrib/dotnet-cs/lib/*.deps.json
+	rm -rf $(DOTCL_ROOT)contrib/dotnet-cs/bin $(DOTCL_ROOT)contrib/dotnet-cs/obj
 
 # Build dotcl-jitdisasm contrib (dev tool; NOT included in make pack).
 # After building, use: (require "dotcl-jitdisasm") then (dotcl:jit-disassemble #'fn)
@@ -1407,7 +1416,7 @@ _PACK_VERSION_EFFECTIVE = $(or $(PACK_VERSION),$(shell sed -n 's/.*<Version>\([^
 # to the user's cache, but a tree that predates the change still has the ones
 # older runs wrote next to the published exe, and dotnet pack sweeps whatever
 # it finds there into the package. test/pack-nuspec/check.sh asserts the result.
-pack: compile-asdf-fasl compile-asdf-fasls compile-quicklisp-fasl compile-core-fasl compile-contrib-fasls contrib-dotcl-cs compile-core-fasl-r2r-all compile-asdf-fasl-r2r-all compile-contrib-fasls-r2r-all
+pack: compile-asdf-fasl compile-asdf-fasls compile-quicklisp-fasl compile-core-fasl compile-contrib-fasls contrib-dotnet-cs compile-core-fasl-r2r-all compile-asdf-fasl-r2r-all compile-contrib-fasls-r2r-all
 	rm -rf $(DOTCL_ROOT)runtime/contrib
 	@find $(DOTCL_ROOT)runtime/bin -name 'dotcl.profile' -delete 2>/dev/null || true
 	cp $(DOTCL_ROOT)compiler/dotcl.core $(DOTCL_ROOT)runtime/dotcl.core
@@ -1433,8 +1442,8 @@ pack: compile-asdf-fasl compile-asdf-fasls compile-quicklisp-fasl compile-core-f
 	# the contrib/** glob drops all *.fasl.r2r-* and the RID being packed is added
 	# back, so a package carries exactly one RID's set instead of all of them.
 	rm -f $(DOTCL_ROOT)runtime/contrib/asdf/asdf.fasl.r2r-*
-	rm -rf $(DOTCL_ROOT)runtime/contrib/dotcl-cs/bin $(DOTCL_ROOT)runtime/contrib/dotcl-cs/obj
-	rm -f $(DOTCL_ROOT)runtime/contrib/dotcl-cs/*.csproj $(DOTCL_ROOT)runtime/contrib/dotcl-cs/*.cs
+	rm -rf $(DOTCL_ROOT)runtime/contrib/dotnet-cs/bin $(DOTCL_ROOT)runtime/contrib/dotnet-cs/obj
+	rm -f $(DOTCL_ROOT)runtime/contrib/dotnet-cs/*.csproj $(DOTCL_ROOT)runtime/contrib/dotnet-cs/*.cs
 	cp $(DOTCL_ROOT)contrib/asdf/asdf.fasl $(DOTCL_ROOT)runtime/contrib/asdf/asdf.fasl
 	dotnet pack $(DOTCL_ROOT)runtime/runtime.csproj --configuration Release -o $(DOTCL_ROOT)out/ $(PACK_ARGS) $(_PACK_VERSION_ARG)
 	# A tool package must list no dependencies (runtime/Directory.Build.props

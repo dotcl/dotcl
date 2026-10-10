@@ -6,7 +6,7 @@
 ;;; a try nested inside an enclosing clause's HANDLER starts after that handler's
 ;;; try has already ended, so the enclosing clause is written first; and the CLR
 ;;; rejects the method with InvalidProgramException as soon as it is JITted.
-;;; dotcl reorders the clauses after saving the fasl.
+;;; dotcl reorders the clauses in the image before writing the fasl.
 ;;;
 ;;; The same code compiled in memory was always fine (the runtime ILGenerator
 ;;; orders the clauses correctly), so these tests must go through compile-file

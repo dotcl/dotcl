@@ -79,6 +79,14 @@ public sealed class LispStruct : LispObject
     /// Which of the two a slot holds is a bit of its layout entry.</summary>
     internal const byte RawLong = 0;
     internal const byte RawDouble = 1;
+    internal const byte RawSingle = 2;
+
+    /// <summary>The bit of a layout entry that marks a raw single-float: the
+    /// sign bit, which the version (15 bits from bit 16) never reaches. Its
+    /// bits sit in the low 32 bits of the long. A reader expecting another kind
+    /// XORs it into a negative number, which its unsigned range test rejects,
+    /// so it falls back to the boxed path the way a kind mismatch always has.</summary>
+    internal const int SlotKindSingle = unchecked((int)0x80000000);
 
     public int SlotCount => _slots.Length;
 
@@ -91,6 +99,8 @@ public sealed class LispStruct : LispObject
             if (pos != SlotBoxed)
                 return (entry & SlotKindDouble) != 0
                     ? new DoubleFloat(BitConverter.Int64BitsToDouble(_longs![pos]))
+                    : entry < 0
+                    ? new SingleFloat(Compat.Int32BitsToSingle((int)_longs![pos]))
                     : Fixnum.Make(_longs![pos]);
         }
         return _slots[index];
@@ -116,6 +126,15 @@ public sealed class LispStruct : LispObject
                             $"{TypeName}: slot {index} holds a raw double, got {value}",
                             value, Startup.Sym("DOUBLE-FLOAT")));
                     _longs![pos] = BitConverter.DoubleToInt64Bits(d.Value);
+                    return;
+                }
+                if (entry < 0)
+                {
+                    if (value is not SingleFloat sf)
+                        throw new LispErrorException(new LispTypeError(
+                            $"{TypeName}: slot {index} holds a raw single-float, got {value}",
+                            value, Startup.Sym("SINGLE-FLOAT")));
+                    _longs![pos] = Compat.SingleToInt32Bits(sf.Value);
                     return;
                 }
                 if (value is not Fixnum f)
@@ -171,9 +190,12 @@ public sealed class LispStruct : LispObject
         return false;
     }
 
-    /// <summary>RawLong / RawDouble for a slot the layout says is raw.</summary>
+    /// <summary>RawLong / RawDouble / RawSingle for a slot the layout says is raw.</summary>
     internal byte RawKind(int index)
-        => (LayoutEntry(index) & SlotKindDouble) != 0 ? RawDouble : RawLong;
+    {
+        int entry = LayoutEntry(index);
+        return (entry & SlotKindDouble) != 0 ? RawDouble : entry < 0 ? RawSingle : RawLong;
+    }
 
     /// <summary>Which definition of the structure built this instance. 0 for a
     /// structure whose DEFSTRUCT has never been re-evaluated with a different
@@ -182,7 +204,7 @@ public sealed class LispStruct : LispObject
     /// error path needs this, because the check itself compares the entry the
     /// reader already loaded.</summary>
     internal int LayoutVersion
-        => _layout == null || _layout.Length == 0 ? 0 : _layout[0] >> LayoutVersionShift;
+        => _layout == null || _layout.Length == 0 ? 0 : (_layout[0] >> LayoutVersionShift) & SlotPosMask;
 
     /// <summary>The slot values as one array, for the callers that need to hand
     /// the whole set somewhere: PRINT, COPY-STRUCTURE, the FASL literal writer.
@@ -245,7 +267,8 @@ public sealed class LispStruct : LispObject
             for (int i = 0; i < pos.Length; i++)
                 entries[i] = (ver << LayoutVersionShift)
                              | (pos[i] >= 0 && pos[i] < SlotBoxed
-                                ? pos[i] | (kind[i] == RawDouble ? SlotKindDouble : 0)
+                                ? pos[i] | (kind[i] == RawDouble ? SlotKindDouble
+                                            : kind[i] == RawSingle ? SlotKindSingle : 0)
                                 : SlotBoxed);
             _layouts[typeName] = entries;
         }
@@ -316,17 +339,27 @@ public sealed class LispStruct : LispObject
                         // and accessors compiled against it are still right
                         // about where its slots are.
                         _longs = null;
-                        _layout = BoxedMap(slots.Length, entry >> LayoutVersionShift);
+                        _layout = BoxedMap(slots.Length, (entry >> LayoutVersionShift) & SlotPosMask);
                         break;
                     }
                     _longs![pos] = BitConverter.DoubleToInt64Bits(d.Value);
+                }
+                else if (entry < 0)
+                {
+                    if (slots[i] is not SingleFloat sf)
+                    {
+                        _longs = null;
+                        _layout = BoxedMap(slots.Length, (entry >> LayoutVersionShift) & SlotPosMask);
+                        break;
+                    }
+                    _longs![pos] = Compat.SingleToInt32Bits(sf.Value);
                 }
                 else
                 {
                     if (slots[i] is not Fixnum f)
                     {
                         _longs = null;
-                        _layout = BoxedMap(slots.Length, entry >> LayoutVersionShift);
+                        _layout = BoxedMap(slots.Length, (entry >> LayoutVersionShift) & SlotPosMask);
                         break;
                     }
                     _longs![pos] = f.Value;
@@ -423,7 +456,7 @@ public sealed class LispVector : LispObject
     // 16) = 8MB of ushort vs 32MB of object references), removes the GC write
     // barrier per store and the Fixnum object per element. _numKind selects the
     // concrete array type of _numData.
-    internal Array? _numData;   // byte[] | ushort[] | int[] | long[] | float[] | double[] | char[] | uint[] | sbyte[] | short[] per _numKind
+    internal Array? _numData;   // byte[] | ushort[] | int[] | long[] | float[] | double[] | char[] | uint[] | sbyte[] | short[] | ulong[] per _numKind
     internal int _numLen;       // _numData.Length (Array.Length on the abstract
                                 // static type is a runtime call, not ldlen: hot
                                 // aref paths bounds-check against this instead)
@@ -431,14 +464,52 @@ public sealed class LispVector : LispObject
                                // 8=u32(uint[]) 9=s8(sbyte[]) 10=s16(short[]): foreign-width
                                // kinds, only made by DOTCL:MAKE-PINNED-VECTOR (see
                                // ForeignWidthKind); MAKE-ARRAY never picks them.
+                               // 11=u64(ulong[]): (unsigned-byte 64), the value's bits.
+                               // Not a raw kind (IsRawNumKind): a value at or above
+                               // 2^63 does not fit the int64 the raw paths carry, so
+                               // it has its own entries (U64Get/U64Set, Runtime.ArefU64*).
 
     // Element type: "T" (general), "CHARACTER"/"BASE-CHAR"/"STANDARD-CHAR" (string-like), "NIL" (bit vector of nil), etc.
-    public string ElementTypeName { get; private set; } = "T";
+    public string ElementTypeName
+    {
+        get => _elementTypeName;
+        private set { _elementTypeName = value; _numNarrow = NarrowWidthFor(value); }
+    }
+    private string _elementTypeName = "T";
+
+    // The element type's width when it is narrower than the storage it gets:
+    // +N for (unsigned-byte N), -N for (signed-byte N), 0 when the storage's own
+    // range is the element type's ((unsigned-byte 8) in a byte[], FIXNUM in a
+    // long[], ...). (unsigned-byte 32) lives in a long[] and (signed-byte 8) in
+    // an int[], so the storage alone would take values the element type does
+    // not admit; NumSet checks this width before it stores.
+    internal sbyte _numNarrow;
+
+    /// <summary>The _numNarrow of element type name ET (see there).</summary>
+    internal static sbyte NarrowWidthFor(string et)
+    {
+        const string ub = "UNSIGNED-BYTE-";
+        const string sb = "SIGNED-BYTE-";
+        if (et.StartsWith(ub, StringComparison.Ordinal)
+            && int.TryParse(et.Substring(ub.Length), out int un))
+            return un >= 1 && un <= 63 && un != 8 && un != 16 ? (sbyte)un : (sbyte)0;
+        if (et.StartsWith(sb, StringComparison.Ordinal)
+            && int.TryParse(et.Substring(sb.Length), out int sn))
+            return sn >= 1 && sn <= 63 && sn != 32 ? (sbyte)(-sn) : (sbyte)0;
+        return 0;
+    }
+
+    /// <summary>True when V is in the range of the narrow width W (+N unsigned,
+    /// -N signed; see _numNarrow).</summary>
+    internal static bool FitsNarrow(long v, sbyte w)
+        => w > 0 ? ((ulong)v >> w) == 0
+                 : (v >> (-w - 1)) is 0 or -1;
 
     /// <summary>Storage kind for a bounded-integer element type name, or 0 for
     /// none. Names arrive normalized from ParseElementTypeName ("UNSIGNED-BYTE-8",
-    /// "SIGNED-BYTE-32", "FIXNUM", ...). (unsigned-byte 64) does not fit a long
-    /// (and can legally hold dotcl bignums), so it stays on boxed storage.</summary>
+    /// "SIGNED-BYTE-32", "FIXNUM", ...). (unsigned-byte 64) is kept as its bits
+    /// in a ulong[] (kind 11); a value at or above 2^63 is boxed as a bignum when
+    /// it is read through the generic paths.</summary>
     internal static byte NumKindForElementType(string et)
     {
         // Characters pack into a char[]: 2 bytes per element instead of an
@@ -455,7 +526,7 @@ public sealed class LispVector : LispObject
         if (et.StartsWith(ub, StringComparison.Ordinal)
             && int.TryParse(et.Substring(ub.Length), out int un) && un >= 1)
             return un <= 8 ? (byte)1 : un <= 16 ? (byte)2 : un <= 31 ? (byte)3
-                 : un <= 63 ? (byte)4 : (byte)0;
+                 : un <= 63 ? (byte)4 : un == 64 ? (byte)11 : (byte)0;
         if (et.StartsWith(sb, StringComparison.Ordinal)
             && int.TryParse(et.Substring(sb.Length), out int sn) && sn >= 1)
             return sn <= 32 ? (byte)3 : sn <= 64 ? (byte)4 : (byte)0;
@@ -476,6 +547,7 @@ public sealed class LispVector : LispObject
             8 => new uint[size],
             9 => new sbyte[size],
             10 => new short[size],
+            11 => new ulong[size],
             _ => new double[size],
         };
     }
@@ -528,7 +600,7 @@ public sealed class LispVector : LispObject
             1 => typeof(byte[]), 2 => typeof(ushort[]), 3 => typeof(int[]),
             4 => typeof(long[]), 5 => typeof(float[]), 6 => typeof(double[]),
             7 => typeof(char[]), 8 => typeof(uint[]), 9 => typeof(sbyte[]),
-            _ => typeof(short[]),
+            10 => typeof(short[]), _ => typeof(ulong[]),
         };
     }
 
@@ -540,13 +612,20 @@ public sealed class LispVector : LispObject
     // True when the backing is one the raw long/double element paths understand.
     // Characters live in _numData too, but they are neither, so the compiler's
     // unboxed aref helpers must not touch them.
-    internal bool IsRawNumKind => _numKind != 0 && _numKind != 7;
+    // Kinds 1-10 except 7: as cheap as the test before kind 11 existed, which
+    // matters because the per-element helpers (ArefNumL ...) inline it.
+    internal bool IsRawNumKind => (uint)(_numKind - 1) < 10u && _numKind != 7;
+
+    // (unsigned-byte 64) kept as bits in a ulong[]. Note that the CLR lets a
+    // ulong[] pass an "is long[]" test, so code that picks the backing by its
+    // .NET array type has to ask this first.
+    internal bool IsU64Kind => _numKind == 11;
 
     // A pinned vector whose storage is a foreign-width kind (8-10). The
     // compiler's hoisted element buffers are typed per MAKE-ARRAY's storage
     // (long[] for (unsigned-byte 32), int[] for (signed-byte 8)), so their
     // fetches decline these and the per-element helpers serve them.
-    internal bool IsForeignWidthKind => _numKind >= 8;
+    internal bool IsForeignWidthKind => _numKind >= 8 && _numKind <= 10;
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal char CharGet(int i) => ((char[])_numData!)[i];
@@ -593,6 +672,7 @@ public sealed class LispVector : LispObject
         // Range-checked store: silently wrapping a value that exceeds the
         // storage width would corrupt data, so an element-type violation
         // (undefined behavior per CLHS) signals loudly instead.
+        if (_numNarrow != 0 && !FitsNarrow(v, _numNarrow)) throw NumRangeError(v);
         switch (_numKind)
         {
             case 1:
@@ -626,12 +706,20 @@ public sealed class LispVector : LispObject
         else ((double[])_numData!)[i] = v;
     }
 
+    // The bits of an (unsigned-byte 64) element (kind 11).
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal long U64Get(int i) => (long)((ulong[])_numData!)[i];
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal void U64Set(int i, long bits) => ((ulong[])_numData!)[i] = (ulong)bits;
+
     // Box the element at index i per the backing kind: Fixnum for integer
     // kinds, SingleFloat/DoubleFloat for float kinds.
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal LispObject NumBox(int i) => _numKind switch
     {
         7 => LispChar.Make(CharGet(i)),
+        11 => Runtime.BoxU64(U64Get(i)),
         5 => new SingleFloat((float)NumGetF(i)),
         6 => new DoubleFloat(NumGetF(i)),
         _ => Fixnum.Make(NumGet(i)),
@@ -650,16 +738,35 @@ public sealed class LispVector : LispObject
         }
         if (IsFloatNumKind)
         {
-            switch (val)
+            // Only a float of the array's own format is an element of it. An
+            // integer or the other format is a type error, as it is in SBCL;
+            // converting it would store a value the program never computed.
+            if (_numKind == 6)
             {
-                case DoubleFloat df: NumSetF(i, df.Value); return true;
-                case SingleFloat sf: NumSetF(i, sf.Value); return true;
-                case Fixnum fx: NumSetF(i, fx.Value); return true;
-                default: return false;
+                if (val is DoubleFloat df) { NumSetF(i, df.Value); return true; }
+                return false;
             }
+            if (val is SingleFloat sf) { NumSetF(i, sf.Value); return true; }
+            return false;
+        }
+        if (_numKind == 11)
+        {
+            if (!Runtime.IsU64(val)) return false;
+            U64Set(i, Runtime.Low64(val));
+            return true;
         }
         if (val is Fixnum nf) { NumSet(i, nf.Value); return true; }
         return false;
+    }
+
+    // TryNumStore for a store that has no other path to fall to: ADJUST-ARRAY's
+    // :INITIAL-ELEMENT used to leave the new elements 0 when it was not an
+    // element of the array.
+    private void NumStoreOrThrow(int i, LispObject val)
+    {
+        if (!TryNumStore(i, val))
+            throw new LispErrorException(new LispTypeError(
+                $"array of element-type {ElementTypeName}: cannot store", val));
     }
 
     private Exception NumRangeError(long v) =>
@@ -751,6 +858,18 @@ public sealed class LispVector : LispObject
                     double d = NumGetF(0);
                     if (d != 0.0)
                         for (int i = 1; i < size; i++) NumSetF(i, d);
+                }
+            }
+            else if (_numKind == 11)
+            {
+                if (size > 0 && initialElement is not Nil)
+                {
+                    if (!TryNumStore(0, initialElement))
+                        throw new LispErrorException(new LispTypeError(
+                            $"array of element-type {elementType}: cannot store", initialElement));
+                    long bits = U64Get(0);
+                    if (bits != 0)
+                        for (int i = 1; i < size; i++) U64Set(i, bits);
                 }
             }
             else if (initialElement is Fixnum nf)
@@ -904,8 +1023,11 @@ public sealed class LispVector : LispObject
     // Returns the displaced offset
     public int DisplacedOffset => _displacedOffset;
 
-    // Returns true if array was created with :adjustable t
-    public bool IsAdjustable { get => _isAdjustable; set => _isAdjustable = value; }
+    // ADJUSTABLE-ARRAY-P. Like SBCL, every array that is not simple answers
+    // true: one made with :adjustable t, one with a fill pointer, and a
+    // displaced one. ADJUST-ARRAY changes all of them in place (same object),
+    // so the answer is never a promise ADJUST-ARRAY cannot keep.
+    public bool IsAdjustable { get => _isAdjustable || _hasFillPointer || _displacedTo != null; set => _isAdjustable = value; }
 
     // A simple array in the CLHS sense (1.4.4, glossary): not displaced, not
     // actually adjustable, and no fill pointer. Every SIMPLE-* type test
@@ -1057,6 +1179,7 @@ public sealed class LispVector : LispObject
             byte kind = NumKindForElementType(ElementTypeName);
             if (ElementTypeName != "BIT" && kind != 0)
             {
+                byte oldKind = _numKind; var oldNum = _numData; int oldLen = _numLen;
                 _numKind = kind;
                 _numData = AllocNum(newSize);
                 var oldSizeN = _declaredSize;
@@ -1066,8 +1189,13 @@ public sealed class LispVector : LispObject
                     var e = _displacedTo.RawGet(_displacedOffset + i);
                     TryNumStore(i, e); // int and float kinds; incompatible leaves 0
                 }
-                if (initialElement is not null && initialElement is not Nil)
-                    for (int i = oldSizeN; i < newSize; i++) TryNumStore(i, initialElement);
+                // A rejected :INITIAL-ELEMENT leaves the array as it was.
+                try
+                {
+                    if (initialElement is not null && initialElement is not Nil)
+                        for (int i = oldSizeN; i < newSize; i++) NumStoreOrThrow(i, initialElement);
+                }
+                catch { _numKind = oldKind; _numData = oldNum; _numLen = oldLen; throw; }
                 _elements = Array.Empty<LispObject>();
             }
             else if (_bitData != null)
@@ -1111,11 +1239,13 @@ public sealed class LispVector : LispObject
                 // Clear excess bits in last copied word if shrinking
                 if (newSize < oldSize && newSize % 64 != 0)
                     newBits[newSize / 64] &= (1UL << (newSize % 64)) - 1;
-                // Fill new bits if expanding with 1
+                // New bits take the initial element. The last old word can hold
+                // set bits past the old size (a constructor that fills whole
+                // words), so each new bit is written, not only the 1s.
                 long fillBit = initialElement is Fixnum fi ? fi.Value : 0;
-                if (fillBit != 0)
-                    for (int i = oldSize; i < newSize; i++)
-                        newBits[i >> 6] |= 1UL << (i & 63);
+                for (int i = oldSize; i < newSize; i++)
+                    if (fillBit != 0) newBits[i >> 6] |= 1UL << (i & 63);
+                    else newBits[i >> 6] &= ~(1UL << (i & 63));
                 _bitData = newBits;
             }
         }
@@ -1125,10 +1255,16 @@ public sealed class LispVector : LispObject
             if (newSize != oldSize)
             {
                 var oldNum = _numData;
+                int oldLen = _numLen;
                 _numData = AllocNum(newSize);
                 Array.Copy(oldNum, _numData, Math.Min(oldSize, newSize));
-                if (initialElement is not null && initialElement is not Nil)
-                    for (int i = oldSize; i < newSize; i++) TryNumStore(i, initialElement);
+                // A rejected :INITIAL-ELEMENT leaves the array as it was.
+                try
+                {
+                    if (initialElement is not null && initialElement is not Nil)
+                        for (int i = oldSize; i < newSize; i++) NumStoreOrThrow(i, initialElement);
+                }
+                catch { _numData = oldNum; _numLen = oldLen; throw; }
             }
         }
         else
@@ -1178,7 +1314,7 @@ public sealed class LispVector : LispObject
         _declaredSize = newSize;
         if (newDimensions != null) _dimensions = newDimensions;
         if (newFillPointer.HasValue) { _hasFillPointer = true; _fillPointer = newFillPointer.Value; }
-        else _fillPointer = newSize;
+        else if (!_hasFillPointer) _fillPointer = newSize;
     }
 
     // Adjust to become a displaced array pointing at another vector
@@ -1194,7 +1330,7 @@ public sealed class LispVector : LispObject
         ElementTypeName = elementType;
         if (newDimensions != null) _dimensions = newDimensions;
         if (newFillPointer.HasValue) { _hasFillPointer = true; _fillPointer = newFillPointer.Value; }
-        else _fillPointer = newSize;
+        else if (!_hasFillPointer) _fillPointer = newSize;
     }
 
     // VECTOR-PUSH: push element, return fill-pointer before push (or NIL if no room)
@@ -1580,10 +1716,37 @@ public sealed class LispHashTable : LispObject
         if (_weakKey)
         {
             if (_dict.ContainsKey(key)) { _dict[key] = WrapValue(value); return; }
+            PruneBeforeInsert();
             _dict[new WeakKeyBox(key, ((WeakKeyComparer)_dict.Comparer).HashOf(key))] = WrapValue(value);
             return;
         }
+        if (_weakValue && !_dict.ContainsKey(key)) PruneBeforeInsert();
         _dict[key] = WrapValue(value);
+    }
+
+    // A weak entry whose key (or value) has been collected is only removed when
+    // something walks the table (COUNT, MAPHASH) or looks that key up, and a dead
+    // key is never looked up again. A table that only ever has new keys added
+    // (a cache keyed by objects that come and go) therefore kept every dead
+    // entry: its box, its weak handle and its value. Sweep before an insert once
+    // the table has doubled since the last sweep, so the work stays amortized
+    // constant per insert and the table holds at most about twice its live
+    // entries.
+    private int _pruneAt = 64;
+    private void PruneBeforeInsert()
+    {
+        if (_dict.Count < _pruneAt) return;
+        int alive = CountAlivePruning();
+        _pruneAt = Math.Max(64, alive * 2);
+    }
+
+    /// <summary>Entries TABLE is holding, dead weak ones included (COUNT
+    /// sweeps them first and answers only the live ones). Static so Lisp can
+    /// ask through DOTNET:STATIC.</summary>
+    public static int StoredCount(LispHashTable table)
+    {
+        if (table.Synchronized) lock (table._lock) return table._dict.Count;
+        return table._dict.Count;
     }
 
     public bool Remove(LispObject key)
@@ -1606,6 +1769,20 @@ public sealed class LispHashTable : LispObject
             : new LispHashTable(proto._testName);
         foreach (var kv in proto.Entries) h.Set(kv.Key, kv.Value);
         return h;
+    }
+
+    /// <summary>MAKE-HASH-TABLE's :SIZE: room for N entries up front, so a
+    /// table filled to a known size (COPY-HASH-TABLE passes the source's size)
+    /// is not rehashed on the way. Capped so a huge :SIZE cannot allocate at
+    /// once what it may never use.</summary>
+    public void EnsureCapacity(int n)
+    {
+        if (n <= 0) return;
+        if (n > 1 << 16) n = 1 << 16;
+#if !NETSTANDARD2_0
+        if (Synchronized) { lock (_lock) _dict.EnsureCapacity(n); }
+        else _dict.EnsureCapacity(n);
+#endif
     }
 
     public void Clear()
@@ -1880,6 +2057,10 @@ public sealed class LispHashTable : LispObject
         private readonly Func<LispObject, LispObject, bool> _test;
         private readonly string _testName;
         private readonly LispFunction? _hash;
+        // The test as a small integer, so hashing a key does not compare the
+        // test's name as a string on every lookup.
+        private const int KindEq = 0, KindEql = 1, KindEqual = 2, KindEqualp = 3, KindOther = 4;
+        private readonly int _kind;
 
         public LispEqualityComparer(Func<LispObject, LispObject, bool> test, string testName,
                                     LispFunction? hash = null)
@@ -1887,6 +2068,14 @@ public sealed class LispHashTable : LispObject
             _test = test;
             _testName = testName;
             _hash = hash;
+            _kind = testName switch
+            {
+                "EQ" => KindEq,
+                "EQL" => KindEql,
+                "EQUAL" => KindEqual,
+                "EQUALP" => KindEqualp,
+                _ => KindOther
+            };
         }
 
         private int UserHash(LispObject obj)
@@ -1906,6 +2095,8 @@ public sealed class LispHashTable : LispObject
         {
             if (x == null && y == null) return true;
             if (x == null || y == null) return false;
+            // All four standard tests hold for an object and itself.
+            if (_kind != KindOther && ReferenceEquals(x, y)) return true;
             return _test(x, y);
         }
 
@@ -1918,15 +2109,21 @@ public sealed class LispHashTable : LispObject
         public int GetHashCode(LispObject obj)
         {
             if (_hash != null) return UserHash(obj);
-            return _testName switch
+            switch (_kind)
             {
-                "EQ" => System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(Canonical(obj)),
-                "EQL" => NumericOrCharHash(obj)
-                         ?? System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(Canonical(obj)),
-                "EQUAL" => GetEqualHash(obj),
-                "EQUALP" => GetEqualpHash(obj),
-                _ => obj.GetHashCode()
-            };
+                case KindEq:
+                    return System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(Canonical(obj));
+                case KindEql:
+                    // Only numbers and characters hash by value; test for them
+                    // with two type checks before trying each number type.
+                    if (obj is Number || obj is LispChar)
+                        return NumericOrCharHash(obj)
+                               ?? System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(obj);
+                    return System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(Canonical(obj));
+                case KindEqual: return GetEqualHash(obj);
+                case KindEqualp: return GetEqualpHash(obj);
+                default: return obj.GetHashCode();
+            }
         }
 
         // EQL compares numbers by type and value, so every number must hash by
@@ -2130,20 +2327,27 @@ public class LispRandomState : LispObject
     }
 }
 
-/// <summary>Pprint dispatch table (stub for ANSI compliance).</summary>
+/// <summary>Pprint dispatch table: the entries set by SET-PPRINT-DISPATCH, and
+/// whether the standard entries (CLHS 22.2.1.4, printed by Runtime.PrettyStd)
+/// apply under them. The standard entries rank below every user entry.</summary>
 public class LispPprintDispatchTable : LispObject
 {
     /// <summary>Entries: type-specifier-key -> (type-specifier, function, priority)</summary>
     public Dictionary<string, (LispObject TypeSpec, LispObject Function, double Priority)> Entries { get; }
 
-    public LispPprintDispatchTable()
+    /// <summary>True for the initial table and copies of it.</summary>
+    public bool Standard { get; }
+
+    public LispPprintDispatchTable(bool standard = false)
     {
         Entries = new Dictionary<string, (LispObject, LispObject, double)>();
+        Standard = standard;
     }
 
     public LispPprintDispatchTable(LispPprintDispatchTable other)
     {
         Entries = new Dictionary<string, (LispObject, LispObject, double)>(other.Entries);
+        Standard = other.Standard;
     }
 
     public override string ToString() => "#<PPRINT-DISPATCH-TABLE>";

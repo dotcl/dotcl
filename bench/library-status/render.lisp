@@ -237,15 +237,18 @@
 (defparameter *hand-picked-marker* "# --- hand-picked (not ranked) ---"
   "Written by rank.lisp to separate the two halves of targets.txt. Everything
 after it was chosen by hand, so it is rendered as its own table -- putting rows
-ordered by referrer count and rows ordered by nothing in one list would claim a
+ordered by dependent count and rows ordered by nothing in one list would claim a
 ranking for the second half that does not exist.")
 
 (defun %read-targets (path)
-  "(values RANKED HAND-PICKED DIST-DESCRIPTION) from a stage 1 targets file."
+  "(values RANKED HAND-PICKED DIST-DESCRIPTION MIN-DEPENDENTS) from a stage 1
+targets file. MIN-DEPENDENTS is the cut-off rank.lisp used, as a string, or NIL
+for a file written before it was recorded."
   (let ((systems '())
         (hand-picked '())
         (in-hand-picked nil)
-        (dist "unknown"))
+        (dist "unknown")
+        (cut-off nil))
     (with-open-file (in path :direction :input :external-format :utf-8)
       (loop for line = (read-line in nil nil)
             while line
@@ -254,13 +257,17 @@ ranking for the second half that does not exist.")
                        ((string= trimmed *hand-picked-marker*)
                         (setf in-hand-picked t))
                        ((char= (char trimmed 0) #\#)
-                        (let ((tag "# dist:"))
-                          (when (and (>= (length trimmed) (length tag))
-                                     (string= tag trimmed :end2 (length tag)))
-                            (setf dist (string-trim " " (subseq trimmed (length tag)))))))
+                        (flet ((tagged (tag)
+                                 (when (and (>= (length trimmed) (length tag))
+                                            (string= tag trimmed :end2 (length tag)))
+                                   (string-trim " " (subseq trimmed (length tag))))))
+                          (let ((d (tagged "# dist:"))
+                                (c (tagged "# min-dependents:")))
+                            (when d (setf dist d))
+                            (when c (setf cut-off c)))))
                        (in-hand-picked (push trimmed hand-picked))
                        (t (push trimmed systems))))))
-    (values (nreverse systems) (nreverse hand-picked) dist)))
+    (values (nreverse systems) (nreverse hand-picked) dist cut-off)))
 
 ;;; --- markdown --------------------------------------------------------------
 
@@ -466,8 +473,71 @@ redone independently."
     ("(blank)" . "not measured with forks: the row is ok, or reaches no fork"))
   "The values of the with forks column.")
 
+(defun %dists-words (d)
+  "\"quicklisp=2026-01-01 dotcl=2026-10-06\" -> \"quicklisp 2026-01-01, dotcl 2026-10-06\"."
+  (with-output-to-string (o)
+    (let ((first t))
+      (loop for word in (%split-spaces d)
+            do (unless first (write-string ", " o))
+               (setf first nil)
+               (write-string (substitute #\Space #\= word) o)))))
+
+(defun %row-field (row tests forks field words)
+  "What ROW's entries record in FIELD, as one string, or NIL when the row was
+not measured. Each stage writes \"dists\" (\"quicklisp=2026-01-01
+dotcl=2026-10-04\") and \"runtime\" (\"Release\") into its entries; the row's
+load entry, its test entry when the tests column shows one, and its with-forks
+entry all count. WORDS turns a recorded value into the words shown. An entry
+from before the field existed is \"not recorded\", and a row whose entries
+disagree is \"differs between stages\"."
+  (let ((system (%field row "system"))
+        (seen '()))
+    (flet ((note (entry)
+             (when entry
+               (let ((d (%field entry field)))
+                 (pushnew (if (and (stringp d) (plusp (length d)))
+                              (funcall words d)
+                              "not recorded")
+                          seen :test #'string=)))))
+      (when (%field row "checked") (note row))
+      (when (%loads-p row) (note (gethash system tests)))
+      (note (gethash system forks)))
+    (cond ((null seen) nil)
+          ((null (rest seen)) (first seen))
+          (t "differs between stages"))))
+
+(defun %field-measured (rows tests forks field &optional (words #'identity))
+  "What the table was measured with, as one line, from FIELD (\"dists\" or
+\"runtime\") counted per row so that the line cannot claim more than the rows
+record. When every measured row agrees the line is that value; otherwise each
+value is listed with its number of rows, so a table that is partly an older
+measurement says so."
+  (let ((counts '()))
+    (dolist (row rows)
+      (let ((d (%row-field row tests forks field words)))
+        (when d
+          (let ((cell (assoc d counts :test #'string=)))
+            (if cell (incf (cdr cell)) (push (cons d 1) counts))))))
+    (setf counts (sort counts #'> :key #'cdr))
+    (cond ((null counts) "not recorded")
+          ((null (rest counts))
+           (format nil "~A (every measured row)" (car (first counts))))
+          (t (format nil "mixed: ~{~A~^; ~}"
+                     (mapcar (lambda (c) (format nil "~A (~D rows)" (car c) (cdr c)))
+                             counts))))))
+
+(defun %split-spaces (string)
+  (let ((words '()) (start nil))
+    (dotimes (i (length string))
+      (if (char= (char string i) #\Space)
+          (when start (push (subseq string start i) words) (setf start nil))
+          (unless start (setf start i))))
+    (when start (push (subseq string start) words))
+    (nreverse words)))
+
 (defun %write-markdown (path rows dist dotcl-version extra annotations tests
-                        &optional hand-picked-rows)
+                        &optional hand-picked-rows measured-dists cut-off
+                          measured-runtime)
   (with-open-file (out path :direction :output :if-exists :supersede
                             :if-does-not-exist :create :external-format :utf-8)
     (format out "# Library status~%~%")
@@ -475,20 +545,27 @@ redone independently."
     (format out "first. Generated by `bench/library-status/render.lisp` -- do not~%")
     (format out "edit this file by hand.~%~%")
     (format out "- Quicklisp dist: ~A~%" dist)
+    (format out "- Dists measured with: ~A~%" (or measured-dists "not recorded"))
+    (format out "- Runtime build measured with: ~A~%" (or measured-runtime "not recorded"))
     (format out "- dotcl: ~A~%" dotcl-version)
     (format out "- Rows: ~D~%~%" (+ (length rows) (length extra) (length hand-picked-rows)))
-    (format out "Order is how many other Quicklisp projects depend on a project,~%")
-    (format out "counted directly rather than transitively. One row per release:~%")
-    (format out "a library and its test system are one thing to install and one~%")
-    (format out "row here.~%~%")
+    (format out "Order is how many other Quicklisp projects are built on a~%")
+    (format out "project, directly or through others, not counting dependencies~%")
+    (format out "of test systems or projects with the same owner.~%")
+    (when cut-off
+      (format out "Every project with at least ~A is a row.~%" cut-off))
+    (format out "One row per release: a library and its test system are one~%")
+    (format out "thing to install and one row here. See~%")
+    (format out "`bench/library-status/README.md` (stage 1) for the exact rules.~%~%")
     (format out "| status | meaning |~%| --- | --- |~%")
     (loop for (status . meaning) in *status-legend*
           do (format out "| `~A` | ~A |~%" status meaning))
     (format out "~%The tests column is what running the library's own test suite~%")
     (format out "(`asdf:test-system`) printed, read by a recogniser for the test~%")
     (format out "framework (fiveam, rt, rove, prove, parachute, stefil, fiasco,~%")
-    (format out "clunit, Try, 1am, lisp-unit2, lift, ptester, and cl-ppcre's own~%")
-    (format out "harness, counted per suite).~%~%")
+    (format out "clunit, Try, 1am, lisp-unit, lisp-unit2, lift, ptester, unit-test,~%")
+    (format out "should-test, and the harnesses of cl-ppcre and flexi-streams,~%")
+    (format out "counted per suite).~%~%")
     (format out "| tests | meaning |~%| --- | --- |~%")
     (loop for (value . meaning) in *tests-legend*
           do (format out "| ~A | ~A |~%" value meaning))
@@ -504,7 +581,7 @@ redone independently."
     (%write-rows out (append rows extra) annotations tests)
     (when hand-picked-rows
       (format out "~%## Hand-picked~%~%")
-      (format out "Chosen by hand rather than by referrer count: an application,~%")
+      (format out "Chosen by hand rather than by dependent count: an application,~%")
       (format out "or a library whose value is that it stresses one part of the~%")
       (format out "compiler hard, sits at the end of the dependency graph and~%")
       (format out "ranks nowhere. The order in this table means nothing.~%")
@@ -530,7 +607,7 @@ redone independently."
                             (namestring (merge-pathnames "../../docs/library-status.md"
                                                          here)))))
          (dotcl-version (or dotcl-version (%env "DOTCL_VERSION" "unknown"))))
-    (multiple-value-bind (order hand-picked dist) (%read-targets targets)
+    (multiple-value-bind (order hand-picked dist cut-off) (%read-targets targets)
       (let ((results (%parse-json (%read-file json)))
             (annotations (%read-annotations annotations))
             (tests (%read-tests tests))
@@ -554,7 +631,10 @@ redone independently."
                                  results))
                (all (append rows extra hand-picked-rows)))
           (%write-markdown out rows dist dotcl-version extra annotations tests
-                           hand-picked-rows)
+                           hand-picked-rows
+                           (%field-measured all tests *forks* "dists" #'%dists-words)
+                           cut-off
+                           (%field-measured all tests *forks* "runtime"))
           (format t "~&wrote ~A~%" out)
           (format t "~D ranked rows (~D measured), ~D hand-picked, ~D extra, ~D annotated~%"
                   (length rows)

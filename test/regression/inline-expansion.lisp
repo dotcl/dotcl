@@ -18,7 +18,7 @@
 (defun %inl-calls-p (fn name)
   "True when FN's SIL still names NAME, i.e. still calls it instead of
    substituting its body."
-  (and (search name (princ-to-string (dotcl:function-sil fn))) t))
+  (and (search name (%flat-text (dotcl:function-sil fn))) t))
 
 ;;; ---- it substitutes, and the answer is unchanged ----
 

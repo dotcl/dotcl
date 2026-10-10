@@ -28,10 +28,12 @@ expect "built by 0.1.30+12.gabc1234-dirty here" "built by <version> here"
 expect "File not found: /Users/me/work/x.lisp" "File not found: <path>"
 expect "Component ASDF/USER::FOO-TEST not found" "Component ASDF/USER::FOO-TEST not found"
 expect "SB-EXT:*RUNTIME-PATHNAME* 1.2.3" "SB-EXT:*RUNTIME-PATHNAME* 1.2.3"
+expect "please contact me at someone@example.com." "please contact me at <email>."
 
 # What must not appear in a published note: a development build's version, a
-# release version after "dotcl ", an absolute path of the measuring machine.
-leaks='[0-9]+\.[0-9]+\.[0-9]+\+[0-9]+\.g[0-9a-f]|dotcl [0-9]+\.[0-9]+\.[0-9]|(^|[^A-Za-z0-9<])/(home|Users|tmp|mnt)/'
+# release version after "dotcl ", an absolute path of the measuring machine,
+# an email address.
+leaks='[0-9]+\.[0-9]+\.[0-9]+\+[0-9]+\.g[0-9a-f]|dotcl [0-9]+\.[0-9]+\.[0-9]|(^|[^A-Za-z0-9<])/(home|Users|tmp|mnt)/|[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}'
 for f in "$here/results.json" "$here/tests.json" "$here/forks.json" "$root/docs/library-status.md"; do
   [ -f "$f" ] || continue
   if grep -nE "$leaks" "$f" >&2; then

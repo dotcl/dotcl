@@ -251,14 +251,14 @@ resolve them in an image, then `nuget:stage-bundle` copies what that image laid
 out into `<bundle>/nuget/`, and you pass `--bundle <bundle>`:
 
 ```lisp
-(require "dotcl-nuget")
+(require "dotnet-nuget")
 (nuget:require "Newtonsoft.Json" :version "13.0.3")
 (nuget:stage-bundle "mybundle")          ; or (nuget:stage-bundle "mybundle" "win-x64")
 ;; => 1     mybundle/nuget/<rid>_<tfm>_<hash>/ now holds the layout
 ```
 
 At run time dotcl looks beside the executable first. Each bundled layout carries
-a `dotcl-nuget-complete` file listing the requests it answers, version specs as
+a `dotnet-nuget-complete` file listing the requests it answers, version specs as
 written; a request listed there is answered from the bundle without building
 anything. A bundled layout is used even when the program asks for a floating
 version (`"13.*"`, or no `:version` at all): a program that has been installed
@@ -268,49 +268,109 @@ the answer.
 ## Packaging a library (`--library`)
 
 `dotcl pack --library` packages an ASDF system for other dotcl programs to use,
-rather than as a command:
+rather than as a command. The steps below are the ones the test suite runs end to
+end: a library packed onto a feed, and a separate project, in a directory of its
+own, that loads it from there.
 
-```sh
-dotcl --asd-search-path . pack --library --system my-lib -o out/
-# pack: wrote  out/my-lib.1.0.0.nupkg
-```
+1. **Pack the library onto a feed.** A feed can be a plain directory. From the
+   library's directory:
 
-Only `--system` and `-o` are required. The id defaults to the system name
-(`--id` to change it), the version to the `.asd`'s `:version`, and the metadata
-options above apply as they do to a tool package: `:license` becomes the
-package's license expression, a `README.md` beside the `.asd` is embedded.
+   ```sh
+   dotcl --asd-search-path . pack --library --system my-lib -o /path/to/feed/
+   # pack: wrote  /path/to/feed/my-lib.1.0.0.nupkg
+   ```
 
-The package carries the system and every system it depends on that dotcl does
-not supply itself, so it loads with nothing else installed. Each directory
+   Only `--system` and `-o` are required. The id defaults to the system name
+   (`--id` to change it), the version to the `.asd`'s `:version`, and the
+   metadata options above apply as they do to a tool package: `:license` becomes
+   the package's license expression, a `README.md` beside the `.asd` is
+   embedded. If `my-lib` depends on systems in other directories, make them
+   visible the same way as for a tool (see
+   [Making a dependency visible](#making-a-dependency-visible)): they go into
+   the package too.
+
+2. **Declare it in the other project.** In that project's `.asd`, a
+   `(:nuget ...)` component names the package, its version and the feed:
+
+   ```lisp
+   (defsystem "my-app"
+     :defsystem-depends-on ("asdf-nuget")
+     :serial t
+     :components ((:nuget "my-lib" :nuget-version "1.0.0"
+                   :source "/path/to/feed/")
+                  (:file "app")))
+   ```
+
+   `:source` adds the feed to the ones NuGet already uses; leave it out for a
+   package on nuget.org or on a feed your NuGet configuration already lists.
+
+3. **Load the project** from its own directory:
+
+   ```sh
+   cd my-app
+   dotcl --asd-search-path . --eval '(require "asdf")' --eval '(asdf:load-system "my-app")'
+   # ; nuget: resolving my-lib 1.0.0 (recording in .../my-app/dotnet-nuget.lock.json)
+   ```
+
+   The first load resolves the package with `dotnet restore` and records its
+   version in `dotnet-nuget.lock.json` in the current directory; commit that
+   file with the project (see [.NET packages](libraries.md#net-packages)).
+   `app.lisp` can use `my-lib` right away: the system the package was made for
+   is loaded before the components that come after the `:nuget` one, so
+   `:depends-on ("my-lib")` is not needed.
+
+What the package holds: the system and every system it depends on that dotcl
+does not supply itself, so it loads with nothing else installed. Each directory
 holding one of their `.asd` files goes in whole under `dotcl/<name>/` (dot
 files, compiled files and the output directory left out), together with the
 fasls compiled from the sources and a note of which dotcl compiled them. The
 `(:nuget ...)` components of the packed systems become the package's own
 dependencies, so their versions must be exact or ranges, not floating.
 
+The note records the dotcl that compiled the fasls and the OS and CPU it ran on
+(its OS and CPU `*features*`). The sources are always included, and which of
+the two a consumer uses depends on that note:
+
+- **Same dotcl, same OS and CPU:** the fasls (and ReadyToRun images, below) are
+  used as they are, and nothing of the library is compiled again.
+- **Another dotcl, same OS and CPU:** the fasls are still used as they are, after
+  a one-line warning. The warning is the condition `nuget:fasl-version-mismatch`
+  (a subtype of `warning`), signalled with two restarts around it:
+  `nuget:use-shipped-fasls` (what happens when nothing handles it) and
+  `nuget:compile-from-source`, which ignores the fasls and lets ASDF compile the
+  sources. Functions of the same names invoke them, so a project that would
+  rather compile can say so around its load:
+
+  ```lisp
+  (handler-bind ((nuget:fasl-version-mismatch #'nuget:compile-from-source))
+    (asdf:load-system "my-app"))
+  ```
+
+  The choice is made once per package per image.
+- **Another OS or CPU, or a package that does not record them** (made by dotcl
+  0.1.32 or earlier): the sources are compiled, and a note says so once. Reading
+  a source decides `#+darwin`, `#+x86-64` and the like, so a fasl made on
+  another platform could be quietly wrong. [Portable fasls](portable-fasls.md) says
+  how to write a library whose fasls do not depend on the platform, and how to
+  check one.
+
+Before it writes the package, `pack --library` reads the sources of the packed
+systems for what would tie their fasls to the machine that compiled them (the
+check `asdf-nuget:check-portability-op` runs, described in
+[Portable fasls](portable-fasls.md#checking-a-library)). What it finds is
+printed as a warning, one line per place, and the package is written all the
+same.
+
+If a shipped fasl fails to load all the same (for example, it calls a runtime
+function this dotcl no longer has, or it was made by a newer dotcl than this
+one, whose runtime .NET refuses to bind), its source is compiled and loaded in
+its place, with a note naming the file and the error.
+
 `--r2r` adds a ReadyToRun image of every fasl for the platform you pack on,
 compiled against the running dotcl. With `--from <dir>` it adds the other
 platforms in `--rids` (default: the six desktop RIDs) as well, compiled against
 the dotcl packages in `<dir>` as for a tool -- pack with the same dotcl as those
 packages.
-
-Another system uses it by declaring it:
-
-```lisp
-(defsystem "my-app"
-  :defsystem-depends-on ("dotcl-nuget-asdf")
-  :serial t
-  :components ((:nuget "my-lib" :nuget-version "1.0.0")
-               (:file "app")))
-```
-
-Loading `my-app` resolves the package (see [.NET packages](libraries.md#net-packages)
-for the lock file), puts its systems where ASDF finds them, and loads the
-system the package was made for before the components that come after the
-`:nuget` one, so `:depends-on ("my-lib")` is not needed. When the running dotcl
-is the one that compiled the package, its fasls and ReadyToRun images are used
-as they are; any other dotcl compiles the sources, which are always included,
-and says so once.
 
 ### Example: Coalton
 
@@ -338,7 +398,7 @@ from a NuGet feed with no compiler run and no Quicklisp:
 
    ```lisp
    (defsystem "coalton-app"
-     :defsystem-depends-on ("dotcl-nuget-asdf")
+     :defsystem-depends-on ("asdf-nuget")
      :serial t
      :components ((:nuget "coalton" :nuget-version "<version>"
                    :source "<feed>")

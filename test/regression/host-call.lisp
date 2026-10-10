@@ -122,3 +122,29 @@
   (handler-case (progn (%host-call "NO-SUCH-HOST-ENTRY-POINT") :no-error)
     (error () :error))
   :error)
+
+;;; CallMv / EvalStringMv: every value of the call, and nothing an inner form
+;;; published. Under the interpreter (the emit-free build), a form that returns a
+;;; constant after other work -- a HANDLER-CASE clause after the non-local exit,
+;;; an IF arm after its test -- leaves the thread's values channel holding what
+;;; that work published. The host read the channel and answered (T); Lisp's own
+;;; MULTIPLE-VALUE-LIST answered (:CAUGHT).
+(defun %host-values (array)
+  (loop for i below (dotnet:invoke array "Length")
+        collect (dotnet:invoke array "GetValue" i)))
+
+(defun hostcall-a::caught () (handler-case (error "boom") (error () :caught)))
+(defun hostcall-a::if-arm () (if (find-symbol "CAR" "CL") :x :y))
+
+(deftest host-call-mv-ignores-stale-inner-values
+  (list (%host-values (dotnet:static "DotCL.DotclHost" "EvalStringMv"
+                                     "(handler-case (error \"boom\") (error () :caught))"))
+        (%host-values (dotnet:static "DotCL.DotclHost" "EvalStringMv" "(if t :x)"))
+        (%host-values (dotnet:static "DotCL.DotclHost" "EvalStringMv"
+                                     "(progn (find-symbol \"CAR\" \"CL\") :x)"))
+        (%host-values (dotnet:static "DotCL.DotclHost" "CallMv" "hostcall-a::caught"))
+        (%host-values (dotnet:static "DotCL.DotclHost" "CallMv" "hostcall-a::if-arm"))
+        ;; The values a form does return are still all there.
+        (%host-values (dotnet:static "DotCL.DotclHost" "EvalStringMv" "(floor 7 2)"))
+        (%host-values (dotnet:static "DotCL.DotclHost" "EvalStringMv" "(values)")))
+  ((:caught) (:x) (:x) (:caught) (:x) (3 1) ()))

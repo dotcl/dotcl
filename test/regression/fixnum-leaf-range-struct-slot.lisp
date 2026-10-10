@@ -23,7 +23,7 @@
 
 (setf dotcl:*save-sil* t)
 
-(defun %flr-sil (fn) (princ-to-string (dotcl:function-sil fn)))
+(defun %flr-sil (fn) (%flat-text (dotcl:function-sil fn)))
 
 (defun %flr-count (needle s)
   (let ((k 0) (p 0))

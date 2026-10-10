@@ -33,7 +33,7 @@
 
 ;;; The proven cases keep the raw shift: no generic ASH call in the code.
 (setf dotcl:*save-sil* t)
-(defun %afr-sil (fn) (princ-to-string (dotcl:function-sil fn)))
+(defun %afr-sil (fn) (%flat-text (dotcl:function-sil fn)))
 (defun %afr-small-sil (x y) (declare (type (signed-byte 32) x y)) (ash (* x y) -3))
 (defun %afr-leaf-sil (x) (declare (type (signed-byte 64) x)) (ldb (byte 32 32) x))
 (deftest-emitting-only ash-fast-path-range.proven-stays-native

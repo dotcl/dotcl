@@ -103,6 +103,10 @@ public sealed class Symbol : LispObject
     // would read past a live binding, so the flag is deliberately one-way.
     public bool EverDynamicallyBound;
 
+    // Slot of this symbol in each thread's per-symbol binding counts
+    // (DynamicBindings), assigned the first time it is bound. 0 = never bound.
+    public int BindIndex;
+
     public bool IsConstant { get; set; }
 
     /// <summary>
@@ -130,6 +134,14 @@ public sealed class Symbol : LispObject
     /// a NOTINLINE proclamation.
     /// </summary>
     public bool IsInlineProclaimed { get; set; }
+
+    /// <summary>
+    /// IsNotinlineProclaimed and IsInlineProclaimed for the function named
+    /// (SETF this-symbol). A setf function has no symbol of its own, so its
+    /// proclamations are kept on the symbol it is named after.
+    /// </summary>
+    public bool IsSetfNotinlineProclaimed { get; set; }
+    public bool IsSetfInlineProclaimed { get; set; }
 
     public Symbol(string name, Package? homePackage = null)
     {

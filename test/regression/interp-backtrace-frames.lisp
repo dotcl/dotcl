@@ -29,6 +29,11 @@
 ;;; evaluators are asserted against that same shape below, each under function
 ;;; names only its own mode ever defines: sharing names would let a stale
 ;;; compiled definition answer for the interpreted case.
+;;;
+;;; Where a compiled half calls one DEFUN from another, it does so as
+;;; (VALUES (f)), which is not a tail call: compiled code hands the caller's
+;;; frame to the callee of a tail call, as SBCL does, and the tree-walk
+;;; evaluator only does that for a call back into the same function.
 
 ;;; The -COMPILE halves are DEFTEST-COMPILED-ONLY: an emit-free build has no
 ;;; compiler, so :COMPILE there is the tree-walk evaluator under another name and
@@ -47,7 +52,7 @@
 
 (deftest-compiled-only interp-backtrace.defun-chain-compile
   (%ibt :compile '(progn (defun %ibt-c-leaf () (dotcl:backtrace))
-                         (defun %ibt-c-mid () (%ibt-c-leaf))
+                         (defun %ibt-c-mid () (values (%ibt-c-leaf)))
                          (%ibt-c-mid)))
   ("%IBT-C-LEAF" "%IBT-C-MID"))
 
@@ -74,7 +79,7 @@
 
 (defparameter %ibt-args-c
   '(progn (defun %ibt-c-al (a b) (declare (ignore a b)) (dotcl:backtrace-with-args))
-          (defun %ibt-c-am (q) (%ibt-c-al q 9))
+          (defun %ibt-c-am (q) (values (%ibt-c-al q 9)))
           (%ibt-c-am 5)))
 
 (defparameter %ibt-args-i
@@ -102,7 +107,7 @@
 (deftest-compiled-only interp-backtrace.defmethod-compile
   (%ibt :compile '(progn (defclass %ibt-c-k () ())
                          (defmethod %ibt-c-gf ((x %ibt-c-k)) (dotcl:backtrace))
-                         (defun %ibt-c-callgf () (%ibt-c-gf (make-instance '%ibt-c-k)))
+                         (defun %ibt-c-callgf () (values (%ibt-c-gf (make-instance '%ibt-c-k))))
                          (%ibt-c-callgf)))
   ("%IBT-C-GF" "%IBT-C-CALLGF"))
 

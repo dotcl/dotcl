@@ -41,6 +41,10 @@
 #   LIBRARY_STATUS_TESTS_JSON   dist-only test verdicts (default tests.json)
 #   LIBRARY_STATUS_FORKS_JSON   output (default forks.json)
 #   LIBRARY_STATUS_LOGDIR       logs (default out/library-status-forks)
+#   LIBRARY_STATUS_ALLOW_STALE_DIST=1  measure even if the dotcl dist is older
+#                               than the published one (see dists.sh)
+#   LIBRARY_STATUS_CONFIG       Release (default) or Debug: which build of the
+#                               runtime measures (see runtime.sh)
 #   LIBRARY_STATUS_CANDIDATES   only list the candidates, measure nothing, when 1
 set -eu
 
@@ -53,12 +57,18 @@ out="${LIBRARY_STATUS_FORKS_JSON:-$here/forks.json}"
 logdir="${LIBRARY_STATUS_LOGDIR:-$root/out/library-status-forks}"
 only_list="${LIBRARY_STATUS_CANDIDATES:-0}"
 
-# The home the bundled Quicklisp client uses (its prelude): an existing
-# ~/quicklisp, else $XDG_DATA_HOME/dotcl/quicklisp.
-if [ -n "${LIBRARY_STATUS_QL_HOME:-}" ]; then qlhome="$LIBRARY_STATUS_QL_HOME"
-elif [ -d "$HOME/quicklisp" ]; then qlhome="$HOME/quicklisp"
-else qlhome="${XDG_DATA_HOME:-$HOME/.local/share}/dotcl/quicklisp"
-fi
+# The home the bundled Quicklisp client uses (its prelude), and the dist
+# versions measured: see dists.sh. The scripts started below skip the check.
+. "$(dirname "$0")/dists.sh"
+check_dists run-forks
+LIBRARY_STATUS_DIST_CHECKED=1
+export LIBRARY_STATUS_DIST_CHECKED
+# The runtime build measuring, checked once here; the scripts started below
+# use the same one (LIBRARY_STATUS_CONFIG is passed on). See runtime.sh.
+. "$(dirname "$0")/runtime.sh"
+select_runtime run-forks
+LIBRARY_STATUS_CONFIG="$runtime_desc"
+export LIBRARY_STATUS_CONFIG
 dists="$qlhome/dists"
 for d in quicklisp dotcl; do
   [ -f "$dists/$d/systems.txt" ] || { echo "run-forks: no $dists/$d/systems.txt" >&2; exit 1; }
@@ -164,7 +174,7 @@ sed -En 's/^  [{]"system": "([^"]*)".*"status": "([^"]*)".*/\1 \2/p' "$work/resu
 sed -En 's/^  [{]"system": "([^"]*)".*"verdict": "([^"]*)", "framework": "([^"]*)", "passed": ([0-9]*), "failed": ([0-9]*).*/\1 \2 \3 \4 \5/p' \
   "$work/tests.json" > "$work/b-verdicts"
 checked=$(date +%Y-%m-%d)
-awk -v checked="$checked" '
+awk -v checked="$checked" -v dists="$dists_desc" -v runtime="$runtime_desc" '
   function trank(v) {
     if (v == "pass") return 4; if (v == "fail") return 3
     if (v == "no-result" || v == "no-tests" || v == "-") return 2
@@ -186,8 +196,8 @@ awk -v checked="$checked" '
     else if (b == "fail" && bf[sys] > af) j = "worse"
     else j = "same"
     v = (sys in bv) ? bv[sys] : "-"
-    printf "  {\"system\": \"%s\", \"checked\": \"%s\", \"forks\": \"%s\", \"judgement\": \"%s\", \"load\": \"%s\", \"verdict\": \"%s\", \"framework\": \"%s\", \"passed\": %d, \"failed\": %d}\n", \
-      sys, checked, forks, j, (bl == "fail" ? "fail" : "loads"), v, (sys in bfw ? bfw[sys] : "-"), bp[sys], bf[sys]
+    printf "  {\"system\": \"%s\", \"checked\": \"%s\", \"forks\": \"%s\", \"judgement\": \"%s\", \"load\": \"%s\", \"verdict\": \"%s\", \"framework\": \"%s\", \"passed\": %d, \"failed\": %d, \"dists\": \"%s\", \"runtime\": \"%s\"}\n", \
+      sys, checked, forks, j, (bl == "fail" ? "fail" : "loads"), v, (sys in bfw ? bfw[sys] : "-"), bp[sys], bf[sys], dists, runtime
   }' "$work/b-status" "$work/b-verdicts" "$work/candidates" > "$work/entries"
 {
   echo '['

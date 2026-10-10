@@ -92,3 +92,37 @@
   (list (%dtw-warned-p '(defun %dtw-8 (x) (declare (type dtw-repeated-type x)) x))
         (%dtw-warned-p '(defun %dtw-9 (x) (declare (type dtw-repeated-type x)) x)))
   (t nil))
+
+;;; The explicit (TYPE spec var) form is a STYLE-WARNING, as SBCL's "undefined
+;;; type" is: the type may be defined later in the file, and a full WARNING sets
+;;; COMPILE-FILE's failure-p, which ASDF can treat as a failed compile. The
+;;; shorthand (spec var) stays a full WARNING, as SBCL's "unrecognized
+;;; declaration" is.
+(defun %dtw-warning-kind (form)
+  "Evaluate FORM, answering :STYLE, :FULL or NIL for the warning it signalled."
+  (let ((kind nil))
+    (handler-bind ((warning (lambda (c)
+                              (setf kind (if (typep c 'style-warning) :style :full))
+                              (muffle-warning c))))
+      (eval form))
+    kind))
+
+(deftest-compiled-only declared-type-warning-type-form-is-style-warning
+  (list (%dtw-warning-kind '(defun %dtw-11 (x) (declare (type dtw-later-type x)) x))
+        (%dtw-warning-kind '(defun %dtw-12 () (let ((a 1)) (declare (dtw-later-shorthand a)) a))))
+  (:style :full))
+
+(deftest-compiled-only declared-type-warning-type-form-not-failure
+  (let ((src (regression-temp-file "declared-type-warning-later.lisp")))
+    (with-open-file (s src :direction :output :if-exists :supersede)
+      (write-string "(defun dtw-later (x) (declare (type dtw-defined-later x)) x)
+(defclass dtw-defined-later () ())
+" s))
+    (multiple-value-bind (out warnings-p failure-p)
+        (handler-bind ((warning #'muffle-warning))
+          (compile-file src))
+      (declare (ignore warnings-p))
+      (ignore-errors (delete-file out))
+      (ignore-errors (delete-file src))
+      failure-p))
+  nil)

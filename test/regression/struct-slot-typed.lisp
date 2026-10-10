@@ -22,13 +22,13 @@
   (tag nil))
 
 (defun %sst-typed-read-p (fn)
-  (and (search "StructRefL" (princ-to-string (dotcl:function-sil fn))) t))
+  (and (search "StructRefL" (%flat-text (dotcl:function-sil fn))) t))
 
 (defun %sst-typed-write-p (fn)
-  (and (search "StructSetL" (princ-to-string (dotcl:function-sil fn))) t))
+  (and (search "StructSetL" (%flat-text (dotcl:function-sil fn))) t))
 
 (defun %sst-generic-p (fn)
-  (let ((sil (princ-to-string (dotcl:function-sil fn))))
+  (let ((sil (%flat-text (dotcl:function-sil fn))))
     (and (or (search "StructRefI" sil) (search "StructSetI" sil)) t)))
 
 ;;; ---- what gets emitted ----
@@ -63,7 +63,7 @@
 
 (deftest-compiled-only struct-slot-typed.statement-store-has-no-box
   (list (%sst-typed-write-p #'%sst-store-only)
-        (and (search "Fixnum.Make" (princ-to-string (dotcl:function-sil #'%sst-store-only))) t))
+        (and (search "Fixnum.Make" (%flat-text (dotcl:function-sil #'%sst-store-only))) t))
   (t nil))
 
 ;; No fixnum context, no typed entry: the generic path is what still runs.
@@ -171,7 +171,7 @@
 
 (deftest-compiled-only struct-slot-typed.type-violation-safety0-emits-no-check
   (and (search "CheckSlotType"
-               (princ-to-string (dotcl:function-sil #'%sst-violate-safety0)))
+               (%flat-text (dotcl:function-sil #'%sst-violate-safety0)))
        t)
   nil)
 
@@ -243,10 +243,10 @@
   (s 0.0 :type single-float))
 
 (defun %sst-double-read-p (fn)
-  (and (search "StructRefD" (princ-to-string (dotcl:function-sil fn))) t))
+  (and (search "StructRefD" (%flat-text (dotcl:function-sil fn))) t))
 
 (defun %sst-double-write-p (fn)
-  (and (search "StructSetD" (princ-to-string (dotcl:function-sil fn))) t))
+  (and (search "StructSetD" (%flat-text (dotcl:function-sil fn))) t))
 
 (defun %sst-vec-loop (v n)
   (declare (type sst-vec v) (fixnum n)
@@ -278,16 +278,18 @@
     (list (type-of (sst-vec-x v)) (sst-vec-x v) (sst-vec-y v)))
   (double-float 1.5d0 -2.5d0))
 
-;; SINGLE-FLOAT stays on the generic path, and keeps working there.
+;; SINGLE-FLOAT is stored raw too (its bits in the low half of the long): a
+;; single-typed value goes in without the generic store, and not as a double.
 (defun %sst-sf-write (s v)
   (declare (type sst-sf s) (single-float v)
            (optimize (speed 3) (safety 0) (debug 0)))
   (setf (sst-sf-s s) v))
 
-(deftest-compiled-only struct-slot-typed.single-float-slot-stays-generic
+(deftest-compiled-only struct-slot-typed.single-float-slot-is-raw
   (list (%sst-double-write-p #'%sst-sf-write)
-        (%sst-generic-p #'%sst-sf-write))
-  (nil t))
+        (%sst-generic-p #'%sst-sf-write)
+        (and (search "StructSetF" (%flat-text (dotcl:function-sil #'%sst-sf-write))) t))
+  (nil nil t))
 
 (deftest struct-slot-typed.single-float-slot-value
   (let ((s (make-sst-sf)))
@@ -314,7 +316,7 @@
 
 (deftest-compiled-only struct-slot-typed.double-safety0-emits-no-check
   (and (search "CheckSlotType"
-               (princ-to-string (dotcl:function-sil #'%sst-double-violate-safety0)))
+               (%flat-text (dotcl:function-sil #'%sst-double-violate-safety0)))
        t)
   nil)
 
@@ -394,7 +396,7 @@
   (make-kct :n v))
 
 (deftest-compiled-only struct-slot-typed.keyword-ctor-safety0-emits-no-check
-  (and (search "CheckSlotType" (princ-to-string (dotcl:function-sil #'%kct-safety0))) t)
+  (and (search "CheckSlotType" (%flat-text (dotcl:function-sil #'%kct-safety0))) t)
   nil)
 
 (setf dotcl:*save-sil* nil)

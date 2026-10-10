@@ -508,6 +508,8 @@ public static partial class Runtime
                 return LispPathname.FromString(home);
             }));
 
+        Runtime.DefineSysLogicalHost();
+
         // LOGICAL-PATHNAME, LOGICAL-PATHNAME-TRANSLATIONS, TRANSLATE-LOGICAL-PATHNAME
         Emitter.CilAssembler.RegisterFunction("LOGICAL-PATHNAME",
             new LispFunction(args => Runtime.LogicalPathname(args[0])));

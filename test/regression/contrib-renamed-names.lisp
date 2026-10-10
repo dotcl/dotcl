@@ -24,7 +24,7 @@
 (deftest contrib-old-name-message-carries-the-replacement
   (let ((text (handler-case (progn (require "nuget") "")
                 (error (e) (format nil "~a" e)))))
-    (and (search "dotcl-nuget" text) t))
+    (and (search "dotnet-nuget" text) t))
   t)
 
 ;;; A name that was never one of ours still gets the plain message -- the hint

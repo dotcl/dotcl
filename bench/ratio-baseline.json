@@ -10,7 +10,8 @@
   "recorded": {
     "win-arm64": "2026-09-14, Snapdragon X Plus X1P42100 (Qualcomm Oryon), 8 cores, Windows 11 ARM64, .NET SDK 10.0.302, median of 3 make bench-parity runs (which agreed to within 5%)",
     "linux-x64": "Median of 4 nightly CI runs, 2026-09-22 through 2026-09-25 (schedule event, RUN_FULL), on the self-hosted GitHub Actions runners ci-runner-2 and ci-runner-3: 1 vCPU / 6 GB RAM KVM guest on a shared N100 host, Ubuntu 24.04, .NET SDK 10.0.401. Both runners are provisioned identically and a run can land on either one; the four source runs are not attributed to a specific runner. Per-kernel spread across the four runs was 0 to 13.5 percent of the median (widest: cl-bench/median at 13.5%, tak at 10.4%). Runs from 2026-09-20 and earlier are excluded from the median: struct-slots and string-walk moved several-fold on 2026-09-22 when compiler fixes landed, so those older runs are a different regime, not noise; the 2026-09-19 nightly was cancelled and produced no numbers.",
-    "linux-x64@intel-core-i5-8350u-cpu-1-70ghz": "2026-09-29, a Linux laptop used for A/B timing (Intel Core i5-8350U, 4 cores / 8 threads, 8 GB, Ubuntu 24.04, .NET SDK 10.0.112, powersave governor), median of 3 make bench-parity runs of 5 processes each. The three runs agreed to within 0.02 on every kernel. Recorded under its own key because the same commit gives ratios on this machine that differ from the CI runners by more than the threshold: on the commit the linux-x64 entries were measured on, this machine gave fib 4.51, fixnum-loop 1.91 and struct-slots 4.06 against the runners' 3.7, 1.0 and 2.87. cl-bench is not run by make bench-parity, so there is no cl-bench median here."
+    "linux-x64@intel-core-i5-8350u-cpu-1-70ghz": "2026-09-29, a Linux laptop used for A/B timing (Intel Core i5-8350U, 4 cores / 8 threads, 8 GB, Ubuntu 24.04, .NET SDK 10.0.112, powersave governor), median of 3 make bench-parity runs of 5 processes each. The three runs agreed to within 0.02 on every kernel. Recorded under its own key because the same commit gives ratios on this machine that differ from the CI runners by more than the threshold: on the commit the linux-x64 entries were measured on, this machine gave fib 4.51, fixnum-loop 1.91 and struct-slots 4.06 against the runners' 3.7, 1.0 and 2.87. The cl-bench median was added on 2026-10-07: six runs of make bench-state (each followed by the ratio check, the first three by make bench-parity), Release, DOTCL_NO_JIT_PROFILE=1, load average about 1.1, gave 3.80, 4.25, 4.00, 4.20, 3.95 and 4.00 over 56 or 57 benchmarks (puzzle drops out when SBCL rounds it to 0 ms), so 4.00 with a spread of 5 percent below and 6 percent above. A single make bench-state is one sample per benchmark, which is why the median moves more than the parity kernels do; the parity rows were not re-recorded.",
+    "osx-arm64@apple-m1": "2026-10-05, a Mac with Apple M1 (8 cores), macOS, .NET SDK 10.0, Release build, DOTCL_NO_JIT_PROFILE=1, median of 3 make bench-parity runs of 5 processes each, taken with a load average of about 3.5 (one other process was spinning on one core, so not a fully quiet machine). The three runs agreed to within 0.04 on every kernel (tak 2.82/2.86/2.82, all others identical to two decimals). Recorded under its own key, like the Linux laptop, because ratios move with the CPU. fixnum-loop, double-loop, string-walk and string-walk-vector are 1.00 because both sides run in about 65-68 ms (the loop is bound by something the language does not change). cl-bench is not run by make bench-parity, so there is no cl-bench median here."
   },
 
   "ratios": {
@@ -40,6 +41,15 @@
     "linux-x64@intel-core-i5-8350u-cpu-1-70ghz/parity/array-walk": 0.94,
     "linux-x64@intel-core-i5-8350u-cpu-1-70ghz/parity/struct-slots": 4.06,
     "linux-x64@intel-core-i5-8350u-cpu-1-70ghz/parity/string-walk": 0.48,
-    "linux-x64@intel-core-i5-8350u-cpu-1-70ghz/parity/string-walk-vector": 0.48
+    "linux-x64@intel-core-i5-8350u-cpu-1-70ghz/parity/string-walk-vector": 0.48,
+    "linux-x64@intel-core-i5-8350u-cpu-1-70ghz/cl-bench/median": 4.00,
+    "osx-arm64@apple-m1/parity/tak": 2.82,
+    "osx-arm64@apple-m1/parity/fib": 3.41,
+    "osx-arm64@apple-m1/parity/fixnum-loop": 1.00,
+    "osx-arm64@apple-m1/parity/double-loop": 1.00,
+    "osx-arm64@apple-m1/parity/array-walk": 0.82,
+    "osx-arm64@apple-m1/parity/struct-slots": 1.75,
+    "osx-arm64@apple-m1/parity/string-walk": 1.00,
+    "osx-arm64@apple-m1/parity/string-walk-vector": 1.00
   }
 }

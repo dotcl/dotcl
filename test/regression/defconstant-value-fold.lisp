@@ -21,7 +21,7 @@
 (defconstant +dvf-list+
   (if (boundp '+dvf-list+) (symbol-value '+dvf-list+) (list 1 2 3)))
 
-(defun %dvf-sil (fn) (princ-to-string (dotcl:function-sil fn)))
+(defun %dvf-sil (fn) (%flat-text (dotcl:function-sil fn)))
 
 (defun %dvf-count (needle s)
   (let ((k 0) (p 0))
@@ -62,15 +62,16 @@
 ;;; ---- shapes ----
 ;;; DEFTEST-EMITTING-ONLY: an emit-free build stores no SIL.
 
-;; The constant takes the literal's path: an immediate, the width check, and a
-;; bare STELEM against the hoisted buffer. No dynamic lookup, no ArefSetL.
+;; The constant takes the literal's path: an immediate and a bare STELEM against
+;; the hoisted buffer. No dynamic lookup, no ArefSetL, and no width check: the
+;; literal 1 is an octet.
 (deftest-emitting-only defconstant-value-fold.u8-store-is-raw
   (let ((d (%dvf-sil #'%dvf-set-u8)))
     (list (%dvf-count "DynamicBindings.Get" d)
           (%dvf-count "Runtime.ArefSetL" d)
           (%dvf-count "(STELEM-U1)" d)
           (%dvf-count "Runtime.CheckStoreU8" d)))
-  (0 0 1 1))
+  (0 0 1 0))
 
 ;; Same instructions as the literal written in place of the constant. Only the
 ;; opcodes are compared: local and label names carry per-function counters.

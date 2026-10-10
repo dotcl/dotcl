@@ -96,19 +96,6 @@
               (error () nil))
             *sm-global-hits*)))
 
-(defun %walker-macroexpand-for-mutation (form expander mutated-ht in-lambda mdepth push-fn)
-  "%WALKER-MACROEXPAND for the mutation / capture walk. Each global symbol macro
-   the expansion resolved is only ever looked up as a place (setf-family
-   expanders are the only macro-time callers of LOOKUP-SYMBOL-MACRO), so if the
-   name is in fact a shadowing variable it is being assigned: record it as
-   mutated, and hand it to PUSH-FN as a reference for the capture side.
-   Over-recording is safe (it can only box a variable that did not need it)."
-  (multiple-value-bind (exp hits) (%walker-macroexpand form expander :none)
-    (dolist (h hits)
-      (setf (gethash (var-name h) mutated-ht) t)
-      (funcall push-fn (cons h (cons in-lambda mdepth))))
-    exp))
-
 (defun find-free-vars-expr (expr bound free-ht)
   "Walk expr finding free variable references. Results accumulated in free-ht.
    Iterative worklist version; no recursion depth limit."
@@ -627,316 +614,503 @@
 ;;; Mutated/captured variable analysis (for boxing)
 ;;; ============================================================
 
-;;; find-mutated-and-captured-vars: single worklist walk that computes BOTH the
-;;; mutated-var set and the captured-var set in one pass over the expression
-;;; tree, avoiding two separate O(tree) walks per lambda/let.
+;;; find-mutated-and-captured-vars: which of a set of variables a body assigns,
+;;; and which it references from inside a closure. The two together decide
+;;; boxing.
 ;;;
-;;; Merges find-mutated-vars-expr + find-captured-vars-expr. The two passes are
-;;; walk-compatible: identical mdepth-incrementing symbol-macro expansion,
-;;; identical macrolet/symbol-macrolet register-restore discipline, identical
-;;; let shadow-narrowing, and the same cached-macroexpand / *macroexpand-scope*
-;;; contract. Worklist entry shape is captured's `(expr inside-lambda . mdepth)`.
+;;; The walk does not depend on the variables asked about, so it computes a
+;;; SUMMARY of a form once and keeps it: three lists of symbols, every symbol
+;;; assigned anywhere in the form (MUTATED), every symbol referenced under a
+;;; closure boundary inside the form (REF-IN), and every symbol referenced
+;;; outside one (REF-OUT). A query intersects a summary with its own names: a
+;;; form placed inside a closure contributes REF-IN and REF-OUT as captures, a
+;;; form outside one only REF-IN.
 ;;;
-;;; MUTATED side records setq/setf/incf/... targets (independent of inside-lambda,
-;;; matching find-mutated-vars). CAPTURED side marks a var-names reference seen
-;;; while inside-lambda. Crucially, a mutation target symbol is BOTH recorded
-;;; (mutated) AND pushed onto the worklist (so it can be capture-marked); the old
-;;; captured pass relied on its generic walk pushing the target; dropping that
-;;; push would lose the capture mark and silently skip boxing (the
-;;; mutation-loss class). Returns (values mutated-names captured-names).
+;;; The forms a later query asks about are the bodies of LET, LAMBDA, FLET and
+;;; the like, so those are where summaries are kept (in *BMR-CACHE*, keyed by
+;;; EQ). An outer LET is compiled first; its walk leaves a summary for every
+;;; body form nested in it, and the inner LETs, compiled afterwards, look them
+;;; up instead of walking their bodies again. Without the memo the work was the
+;;; size of a body times the depth of the LETs around it.
 ;;;
-;;; VAR-NAMES may be the sentinel :ALL, meaning "every referenced symbol is a
-;;; capture candidate": used by %boundary-mut-ref to collect the full mutated
-;;; and referenced sets of a nested lambda once, so the enclosing walks reuse
-;;; them instead of re-descending (O(depth^2) -> O(depth) on nested
-;;; closures). Sound to memoize because this walk never consults *locals*:
-;;; captures key off explicit references and mutations off setq/place targets,
-;;; both pure functions of the form within a top-level compile (unlike the
-;;; free-var walk, whose local-bound-p filter is *locals*-dependent).
+;;; An EQ form is not always in one lexical macro environment: a macro that
+;;; splices its body into two MACROLETs (proc-parse's WITH-VECTOR-PARSING does,
+;;; one per vector type) puts the same forms under two definitions of a local
+;;; macro, each assigning a different variable. So a summary is kept per macro
+;;; environment (*MACROEXPAND-SCOPE* and *SYMBOL-MACROS*), the key the macro
+;;; expansion cache uses. The walk never consults *LOCALS*. A summary whose walk met a macro
+;;; expansion that could not be cached (it depends on more than the lexical
+;;; macro environment) is not kept, and neither is any summary containing it.
+;;;
+;;; A mutation target is recorded AND walked as a reference, so a closure that
+;;; assigns a variable also marks it captured: dropping that would skip the
+;;; box and lose the assignment.
+;;;
+;;; The walk takes the forms in the same order as before the memo, and gives an
+;;; uninterned symbol its effective name (VAR-NAME, which carries a counter)
+;;; at the same points: when it is assigned or referenced inside a closure.
+;;; Those names show up in the generated code, so their order is part of the
+;;; output.
 (defvar *bmr-cache* nil
-  "Per-top-level-form EQ memo: lambda form -> (mutated-names . ref-names).")
+  "Per-top-level-form EQ memo of the mutation / capture walk. A form (a cons)
+   maps to its summaries, a list of (SCOPE SYMBOL-MACROS SIGNATURE . SUMMARY) with
+   SUMMARY (MUTATED REF-IN . REF-OUT) taken under that *MACROEXPAND-SCOPE* and
+   *SYMBOL-MACROS* (see %FMC-CACHED-SUMMARY); a symbol maps to the stamp
+   of the last de-duplication pass that saw it.")
 
-(defun find-mutated-and-captured-vars-expr (expr var-names mutated-ht captured-ht inside-lambda)
-  (let ((worklist (list (cons expr (cons inside-lambda 0))))
-        (*lexical-operators* *lexical-operators*))
-    (loop while worklist do
-      (let* ((item (pop worklist))
-             (e (car item))
-             (in-lambda (cadr item))
-             (mdepth (cddr item)))
+(defvar *fmc-set-step* (list '#:fmc-set-step)
+  "Heads a walk step that changes the walk's macro environment instead of
+   walking a form: (MARKER KIND . VALUE).")
+
+(defun %fmc-apply-set (kind-value)
+  (let ((v (cdr kind-value)))
+    (case (car kind-value)
+      (:symbol-macros (setf *symbol-macros* v))
+      (:mscope (setf *macroexpand-scope* v))
+      (:lexops (setf *lexical-operators* v))
+      (:macro (if (cdr v)
+                  (setf (gethash (car v) *macros*) (cdr v))
+                  (remhash (car v) *macros*))))))
+
+(defun %fmc-set-step (kind value)
+  (cons *fmc-set-step* (cons kind value)))
+
+(defun %fmc-dedupe (list)
+  "LIST without repeated symbols (order not kept). A short list is searched;
+   a longer one stamps each symbol in *BMR-CACHE*."
+  (cond
+    ((or (null list) (null (cdr list))) list)
+    ((null (nthcdr 12 list))
+     (let ((out '()))
+       (dolist (s list out)
+         (unless (member s out :test #'eq)
+           (push s out)))))
+    (t
+     (let ((cache *bmr-cache*)
+           (stamp (list nil))
+           (out '()))
+       (dolist (s list out)
+         (unless (eq (gethash s cache) stamp)
+           (setf (gethash s cache) stamp)
+           (push s out)))))))
+
+(defun %fmc-place-op (head)
+  "How the walk treats an operator named like a place modifier, matched by
+   SYMBOL-NAME across packages: :PUSH, :POP (also INCF / DECF), :ROTATE (also
+   SHIFTF), :MV-SETQ, or NIL. The length and first character rule out most
+   operators before any string comparison."
+  (let* ((n (symbol-name head))
+         (len (length n)))
+    (when (and (<= 3 len 19)
+               (member (char n 0) '(#\P #\I #\D #\R #\S #\M)))
+      (cond
+        ((or (string= n "PUSH") (string= n "PUSHNEW")) :push)
+        ((or (string= n "POP") (string= n "INCF") (string= n "DECF")) :pop)
+        ((or (string= n "ROTATEF") (string= n "SHIFTF")) :rotate)
+        ((string= n "MULTIPLE-VALUE-SETQ") :mv-setq)))))
+
+;; A form is kept once per macro environment it was walked in: the same (EQ)
+;; form can sit in two of them when a macro splices its body into two MACROLET
+;; or SYMBOL-MACROLET forms that give a local macro different expansions (one
+;; per branch, each assigning its own variable), and a summary taken in one is
+;; wrong in the other. A summary whose walk gave an expander an environment the
+;; walk could not be sure of (*EXPANSION-SM-DEPENDENT*) also keeps the
+;; resolution of the symbol macro names there, and is reused only where they
+;; resolve the same way.
+(defun %fmc-cached-summary (entries)
+  "The summary in ENTRIES, a list of (SCOPE SYMBOL-MACROS SIGNATURE . SUMMARY),
+   taken in the current macro environment, or NIL. SIGNATURE is :ANY, or an
+   %SM-SNAPSHOT the current position has to match."
+  (let ((sig :unset))
+    (dolist (e entries nil)
+      (when (and (%macroexpand-scope= (car e) *macroexpand-scope*)
+                 (let ((sm (cadr e)))
+                   (or (eq sm *symbol-macros*) (equal sm *symbol-macros*)))
+                 (let ((esig (caddr e)))
+                   (or (eq esig :any)
+                       (progn
+                         (when (eq sig :unset) (setf sig (%sm-snapshot)))
+                         (when (%sm-snapshot-match-p sig esig)
+                           (setf *expansion-sm-dependent* t)
+                           t)))))
+        (return (cdddr e))))))
+
+(defun %fmc-summary (form ctx mdepth)
+  "Summary (MUTATED REF-IN . REF-OUT) of FORM. CTX is true when FORM sits
+   inside a closure where it is met, and only decides when uninterned symbols
+   get their names."
+  (if (consp form)
+      (let* ((entries (gethash form *bmr-cache*))
+             (hit (%fmc-cached-summary entries)))
         (cond
-          ((eq e *mscope-restore-sentinel*)
-           (setf *macroexpand-scope* in-lambda))
-          ((eq e *lexops-restore-sentinel*)
-           (setf *lexical-operators* in-lambda))
-          ((and (eq e :restore-symbol-macros) (not (eq in-lambda t)))
-           (setf *symbol-macros* in-lambda))
-          ((and (eq e :restore-macro) (consp in-lambda))
-           (let ((name (car in-lambda))
-                 (old-entry (cdr in-lambda)))
-             (if old-entry
-                 (setf (gethash name *macros*) old-entry)
-                 (remhash name *macros*))))
-          ;; Bare symbol that is a symbol-macro: mark captured if applicable, and
-          ;; ALSO expand it so a mutation hidden in the expansion is still seen
-          ;; (fable pitfall #2: do both actions, not either).
-          ((and (symbolp e) e
-                (not (eq e :restore-symbol-macros)) (not (eq e :restore-macro))
-                (< mdepth *macro-expand-depth-limit*)
-                (assoc e *symbol-macros* :test #'eq))
-           ;; Capture side only expands when the symbol isn't a bound var-name.
-           ;; Mutation side always needs the expansion. So: if it IS a var-name,
-           ;; mark captured (when in-lambda) but still expand for the mutation walk;
-           ;; if it is NOT a var-name, just expand (matches both old passes).
-           (when (and in-lambda (or (eq var-names :all)
-                                    (member (var-name e) var-names :test #'string=)))
-             (setf (gethash (var-name e) captured-ht) t))
-           (push (cons (cdr (assoc e *symbol-macros* :test #'eq))
-                       (cons in-lambda (1+ mdepth)))
-                 worklist))
-          ((and (symbolp e) in-lambda)
-           (when (or (eq var-names :all)
-                     (member (var-name e) var-names :test #'string=))
-             (setf (gethash (var-name e) captured-ht) t)))
-          ((consp e)
-           (let ((head (car e)))
-             (cond
-               ;; The portable MULTIPLE-VALUE-BIND shape compiles as a LET*
-               ;; (%MV-CALL-LAMBDA-BIND), not as a closure: walk it that way.
-               ((let ((bind (and (eq head 'multiple-value-call)
-                                 (%mv-call-lambda-bind e))))
-                  (when bind
-                    (push (cons bind (cons in-lambda mdepth)) worklist)
-                    t)))
-               ;; --- mutation-recording place forms (from find-mutated-vars-expr) ---
-               ;; Each records the target into mutated-ht AND pushes subforms/targets
-               ;; so the capture walk still sees them.
-               ((and (symbolp head) (or (eq head 'setq) (eq head 'setf)
-                                        (eq head 'psetq) (eq head 'psetf)))
-                (loop for (var val) on (cdr e) by #'cddr
-                      do (cond
-                           ((and var (symbolp var))
-                            (setf (gethash (var-name var) mutated-ht) t)
-                            ;; push the target symbol so capture side can mark it
-                            (push (cons var (cons in-lambda mdepth)) worklist))
-                           ((and (consp var) (eq (car var) 'the) (symbolp (caddr var)))
-                            (setf (gethash (var-name (caddr var)) mutated-ht) t)
-                            (push (cons var (cons in-lambda mdepth)) worklist))
-                           ((consp var)
-                            (when (and (or (eq head 'setf) (eq head 'psetf))
-                                       (< mdepth *macro-expand-depth-limit*)
-                                       (%stack-space-available-p)
-                                       (find-macro-expander head))
-                              (let* ((single-form `(,head ,var ,val))
-                                     (expander (find-macro-expander head))
-                                     (expanded (%walker-macroexpand-for-mutation
-                                                single-form expander mutated-ht
-                                                in-lambda mdepth
-                                                (lambda (item) (push item worklist)))))
-                                (when expanded
-                                  (push (cons expanded (cons in-lambda (1+ mdepth))) worklist))))
-                            (push (cons var (cons in-lambda mdepth)) worklist)))
-                         (when val (push (cons val (cons in-lambda mdepth)) worklist))))
-               ((and (symbolp head) (string= (symbol-name head) "MULTIPLE-VALUE-SETQ"))
-                (let ((vars (cadr e)))
-                  (when (listp vars)
-                    (dolist (v vars)
-                      (when (symbolp v)
-                        (setf (gethash (var-name v) mutated-ht) t)
-                        (push (cons v (cons in-lambda mdepth)) worklist)))))
-                (when (caddr e)
-                  (push (cons (caddr e) (cons in-lambda mdepth)) worklist)))
-               ((and (symbolp head) (member (symbol-name head) '("PUSH" "PUSHNEW") :test #'string=))
-                (let ((place (caddr e)))
-                  (let ((sym (if (symbolp place) place
-                                 (and (consp place) (eq (car place) 'the) (caddr place)))))
-                    (when (and sym (symbolp sym) (not (eq sym t)))
-                      (setf (gethash (var-name sym) mutated-ht) t))))
-                (do-list-safe (sub (cdr e))
-                  (push (cons sub (cons in-lambda mdepth)) worklist)))
-               ((and (symbolp head) (member (symbol-name head) '("POP" "INCF" "DECF") :test #'string=))
-                (let ((place (cadr e)))
-                  (let ((sym (if (symbolp place) place
-                                 (and (consp place) (eq (car place) 'the) (caddr place)))))
-                    (when (and sym (symbolp sym) (not (eq sym t)))
-                      (setf (gethash (var-name sym) mutated-ht) t))))
-                (do-list-safe (sub (cdr e))
-                  (push (cons sub (cons in-lambda mdepth)) worklist)))
-               ((and (symbolp head) (member (symbol-name head) '("ROTATEF" "SHIFTF") :test #'string=))
-                (dolist (arg (cdr e))
-                  (when (and (symbolp arg) arg (not (eq arg t)))
-                    (setf (gethash (var-name arg) mutated-ht) t)
-                    (push (cons arg (cons in-lambda mdepth)) worklist))
-                  (when (consp arg)
-                    (push (cons arg (cons in-lambda mdepth)) worklist))))
-               ;; --- structural forms (from find-captured-vars-expr) ---
-               ((and (symbolp head) (eq head 'quote)) nil)
-               ((and (symbolp head) (eq head 'defun))
-                (dolist (form (cdddr e))
-                  (push (cons form (cons t mdepth)) worklist)))
-               ;; Nested lambda: its whole content is inside-lambda, so every
-               ;; mutation is a mutation and every reference is a capture
-               ;; candidate. Compute both sets once (memoized) and merge, instead
-               ;; of re-walking the body once per enclosing lambda.
-               ((and (symbolp head) (eq head 'lambda) (listp (cadr e)))
-                (multiple-value-bind (mut ref) (%boundary-mut-ref e)
-                  (dolist (n mut) (setf (gethash n mutated-ht) t))
-                  (dolist (n ref)
-                    (when (or (eq var-names :all)
-                              (member n var-names :test #'string=))
-                      (setf (gethash n captured-ht) t)))))
-               ((and (symbolp head) (member head '(let let*)) (listp (cadr e)))
-                (let ((bindings (cadr e))
-                      (lbody (cddr e))
-                      (shadowed nil))
-                  (when *symbol-macros*
-                    (do-list-safe (b bindings)
-                      (let ((name (if (consp b) (car b) b)))
-                        (when (and name (symbolp name)
-                                   (assoc name *symbol-macros* :test #'eq))
-                          (push name shadowed)))))
-                  (when shadowed
-                    (push (cons :restore-symbol-macros (cons *symbol-macros* mdepth)) worklist))
-                  (dolist (form lbody)
-                    (push (cons form (cons in-lambda mdepth)) worklist))
-                  (when shadowed
-                    (push (cons :restore-symbol-macros
-                                (cons (remove-if (lambda (sm)
-                                                   (member (car sm) shadowed :test #'eq))
-                                                 *symbol-macros*)
-                                      mdepth))
-                          worklist))
-                  (dolist (b bindings)
-                    (when (and (consp b) (cadr b))
-                      (push (cons (cadr b) (cons in-lambda mdepth)) worklist)))))
-               ((and (symbolp head) (or (eq head 'flet) (eq head 'labels)) (listp (cadr e)))
-                (let ((shadows (%flet-macro-shadows (cadr e))))
-                ;; Names that hide a macro are in scope for the body, and for
-                ;; LABELS also for the definitions: as in the free-variable walk.
-                (flet ((enter ()
-                         (push (cons *mscope-restore-sentinel* (cons *macroexpand-scope* mdepth)) worklist)
-                         (push (cons *lexops-restore-sentinel* (cons *lexical-operators* mdepth)) worklist)
-                         (setf *macroexpand-scope* (cons (cadr e) *macroexpand-scope*)
-                               *lexical-operators* (%flet-lexical-operators shadows))))
-                (when (and shadows (eq head 'labels)) (enter))
-                (dolist (fdef (cadr e))
-                  ;; Walk only the initializer forms of the lambda list (the
-                  ;; default-value / supplied-p expressions of &optional/&key/&aux),
-                  ;; not the raw lambda list. Pushing the lambda list itself as a
-                  ;; form macroexpands a param whose name happens to be a macro
-                  ;; (e.g. a required param named INST, which is a macro under
-                  ;; SBCL's assembler), firing that macro's compile-time side
-                  ;; effects. Param names are binding occurrences, not code.
-                  ;; Walked with a CONSP loop, not DOLIST: the walker also visits
-                  ;; unevaluated subforms, so the lambda-list position is not
-                  ;; guaranteed to hold a proper list.
-                  (do ((pl (cadr fdef) (cdr pl)))
-                      ((not (consp pl)))
-                    (let ((p (car pl)))
-                      (when (and (consp p) (cadr p))
-                        (push (cons (cadr p) (cons t mdepth)) worklist))))
-                  (dolist (form (cddr fdef))
-                    (push (cons form (cons t mdepth)) worklist)))
-                (when (and shadows (eq head 'flet)) (enter))
-                (dolist (form (cddr e))
-                  (push (cons form (cons in-lambda mdepth)) worklist)))))
-               ((and (symbolp head) (eq head 'handler-case))
-                (when (cadr e)
-                  (push (cons (cadr e) (cons in-lambda mdepth)) worklist))
-                (dolist (clause (cddr e))
-                  (dolist (form (cddr clause))
-                    (push (cons form (cons t mdepth)) worklist))))
-               ((and (symbolp head) (eq head 'handler-bind))
-                (dolist (binding (cadr e))
-                  (when (cadr binding)
-                    (push (cons (cadr binding) (cons t mdepth)) worklist)))
-                (dolist (form (cddr e))
-                  (push (cons form (cons in-lambda mdepth)) worklist)))
-               ((and (symbolp head) (eq head 'restart-case))
-                (when (cadr e)
-                  (push (cons (cadr e) (cons in-lambda mdepth)) worklist))
-                (dolist (clause (cddr e))
-                  (dolist (form (cddr clause))
-                    (push (cons form (cons t mdepth)) worklist))))
-               ((and (symbolp head) (eq head 'macrolet))
-                (let ((macro-defs (cadr e))
-                      (mlbody (cddr e)))
-                  (dolist (def macro-defs)
-                    (let* ((mname (car def))
-                           (old-entry (gethash mname *macros*)))
-                      (push (cons :restore-macro (cons (cons mname old-entry) mdepth)) worklist)))
-                  (push (cons *mscope-restore-sentinel* (cons *macroexpand-scope* mdepth)) worklist)
-                  (push (cons *lexops-restore-sentinel* (cons *lexical-operators* mdepth)) worklist)
-                  (setf *macroexpand-scope* (cons macro-defs *macroexpand-scope*))
-                  (dolist (def macro-defs)
-                    (let* ((mname (car def))
-                           (mparams (cadr def))
-                           (mbody (cddr def)))
-                      (setf (gethash mname *macros*)
-                            (%eval-macrolet-expander mparams mbody))))
-                  (setf *lexical-operators* (%macrolet-lexical-operators macro-defs))
-                  (dolist (form mlbody)
-                    (push (cons form (cons in-lambda mdepth)) worklist))))
-               ((and (symbolp head) (eq head 'symbol-macrolet))
-                (let ((sm-bindings (cadr e))
-                      (sm-body (cddr e)))
-                  (push (cons :restore-symbol-macros (cons *symbol-macros* mdepth)) worklist)
-                  (setf *symbol-macros*
-                        (append (mapcar (lambda (b) (cons (car b) (cadr b))) sm-bindings)
-                                *symbol-macros*))
-                  (dolist (form sm-body)
-                    (push (cons form (cons in-lambda mdepth)) worklist))))
-               (t
-                (let ((expanded nil))
-                  (when (and (symbolp head) head
-                             (< mdepth *macro-expand-depth-limit*)
-                             (%stack-space-available-p)
-                             (not (%lexical-function-p head))
-                             (find-macro-expander head))
-                    (let ((expander (find-macro-expander head)))
-                      (setf expanded (%walker-macroexpand-for-mutation
-                                      e expander mutated-ht in-lambda mdepth
-                                      (lambda (item) (push item worklist))))))
-                  (if expanded
-                      (push (cons expanded (cons in-lambda (1+ mdepth))) worklist)
-                      (do-list-safe (sub e)
-                        (push (cons sub (cons in-lambda mdepth)) worklist)))))))))))))
+          (hit
+           (when ctx
+             (dolist (s (cddr hit))
+               (unless (symbol-package s) (var-name s))))
+           hit)
+          (t
+           (let ((s nil) (unc nil) (dep nil))
+             (let ((*expansion-uncacheable* nil)
+                   (*expansion-sm-dependent* nil))
+               (setf s (%fmc-walk form ctx mdepth)
+                     unc *expansion-uncacheable*
+                     dep *expansion-sm-dependent*))
+             (when dep (setf *expansion-sm-dependent* t))
+             (if unc
+                 (setf *expansion-uncacheable* t)
+                 (setf (gethash form *bmr-cache*)
+                       (cons (list* *macroexpand-scope* *symbol-macros*
+                                    (if dep (%sm-snapshot) :any) s)
+                             entries)))
+             s))))
+      (%fmc-walk form ctx mdepth)))
 
-(defun %boundary-mut-ref (lam)
-  "Return (values MUT-NAMES REF-NAMES) for lambda form LAM: every symbol name
-   mutated anywhere in LAM, and every symbol name referenced anywhere in LAM
-   (all inside-lambda, hence all capture candidates). Both are independent of the
-   caller's var-names, so this is computed once and memoized by EQ(LAM) in
-   *bmr-cache*; the caller intersects REF with its own var-names. Walks (CDR LAM)
-   rather than LAM so a nested lambda re-enters through the memoized lambda case
-   instead of recursing on itself. NIL cache => uncached (identical result)."
-  (flet ((compute ()
-           (let ((mut (make-hash-table :test #'equal))
-                 (ref (make-hash-table :test #'equal)))
-             (dolist (sub (cdr lam))
-               (find-mutated-and-captured-vars-expr sub :all mut ref t))
-             (let ((ml '()) (rl '()))
-               (maphash (lambda (k v) (declare (ignore v)) (push k ml)) mut)
-               (maphash (lambda (k v) (declare (ignore v)) (push k rl)) ref)
-               (cons ml rl)))))
-    (let ((cell (if *bmr-cache*
-                    (multiple-value-bind (c present) (gethash lam *bmr-cache*)
-                      (if present c (setf (gethash lam *bmr-cache*) (compute))))
-                    (compute))))
-      (values (car cell) (cdr cell)))))
+(defun %fmc-symbol-macro-variable (s)
+  "When S names a local symbol macro whose expansion is a variable, possibly
+   through further symbol macros or THE, that variable; else NIL. SETQ, SETF,
+   INCF and the like of S store into it."
+  (let ((seen '()))
+    (loop
+      (let ((sm (and s (symbolp s)
+                     (not (member s seen :test #'eq))
+                     (assoc s *symbol-macros* :test #'eq))))
+        (unless sm
+          (return (and seen s (symbolp s) s)))
+        (push s seen)
+        (let ((e (cdr sm)))
+          (loop while (and (consp e) (eq (car e) 'the)
+                           (consp (cdr e)) (consp (cddr e)))
+                do (setf e (caddr e)))
+          (if (and e (symbolp e))
+              (setf s e)
+              (return nil)))))))
+
+(defun %fmc-walk (expr ctx mdepth0)
+  "Walk EXPR and return its summary. Worklist entries are (FORM IN-LAMBDA .
+   MDEPTH), IN-LAMBDA relative to EXPR, or a set step."
+  (let ((worklist (list (cons expr mdepth0)))
+        (mut '())
+        (rin '())
+        (rout '())
+        (marker *fmc-set-step*)
+        (limit *macro-expand-depth-limit*))
+    ;; Local macros, not local functions: this runs once per kept form, and
+    ;; closures over the accumulators would box every one of them. No expansion
+    ;; below calls another of these local macros: the released dotcl that
+    ;; seeds the build leaves a local macro met inside another local macro's
+    ;; expansion as a call to an undefined function, so EXPAND and RUN spell
+    ;; out what MUTATE, WALK and REF would have written.
+    (macrolet ((ref (s in-lambda)
+                 `(let ((s ,s))
+                    (cond (,in-lambda
+                           (unless (symbol-package s) (var-name s))
+                           (push s rin))
+                          (t
+                           (when (and ctx (not (symbol-package s))) (var-name s))
+                           (push s rout)))))
+               ;; Assigning a local symbol macro assigns the variable it
+               ;; stands for: record that variable too.
+               (mutate (s)
+                 `(let ((s ,s))
+                    (unless (symbol-package s) (var-name s))
+                    (push s mut)
+                    (when *symbol-macros*
+                      (let ((v (%fmc-symbol-macro-variable s)))
+                        (when v
+                          (unless (symbol-package v) (var-name v))
+                          (push v mut))))))
+               ;; One cons per entry: MDEPTH, negated (less one) inside a closure.
+               (walk (form in-lambda mdepth)
+                 `(push (cons ,form (if ,in-lambda (- -1 ,mdepth) ,mdepth)) worklist))
+               ;; A global symbol macro the expansion resolved is only looked
+               ;; up as a place (setf-family expanders are the only macro-time
+               ;; callers of LOOKUP-SYMBOL-MACRO), so if the name is in fact a
+               ;; shadowing variable it is being assigned. Over-recording is
+               ;; safe: it can only box a variable that did not need it.
+               (expand (form expander in-lambda mdepth)
+                 `(multiple-value-bind (exp hits) (%walker-macroexpand ,form ,expander :none)
+                    (dolist (h hits)
+                      (unless (symbol-package h) (var-name h))
+                      (push h mut)
+                      (push (cons h (if ,in-lambda (- -1 ,mdepth) ,mdepth)) worklist))
+                    exp))
+               ;; STEPS, in the order the walk takes them: (FORM . IN-LAMBDA)
+               ;; or a set step. A kept form is summarised (and remembered)
+               ;; now, a plain symbol is just a reference; without the stack
+               ;; for that, they go on the worklist.
+               (run (steps mdepth force)
+                 `(let ((steps ,steps) (mdepth ,mdepth))
+                    (if (or ,force (%stack-space-available-p))
+                        (dolist (st steps)
+                          (let ((f (car st)))
+                            (cond
+                              ((eq f marker) (%fmc-apply-set (cdr st)))
+                              ((and (symbolp f)
+                                    (not (and f (< mdepth limit)
+                                              (assoc f *symbol-macros* :test #'eq))))
+                               (cond ((cdr st)
+                                      (unless (symbol-package f) (var-name f))
+                                      (push f rin))
+                                     (t
+                                      (when (and ctx (not (symbol-package f))) (var-name f))
+                                      (push f rout))))
+                              ((and (atom f) (not (symbolp f))) nil)
+                              (t
+                               (let* ((in-lambda (cdr st))
+                                      (s (%fmc-summary f (or ctx in-lambda) mdepth)))
+                                 (dolist (x (car s)) (push x mut))
+                                 (dolist (x (cadr s)) (push x rin))
+                                 (if in-lambda
+                                     (dolist (x (cddr s)) (push x rin))
+                                     (dolist (x (cddr s)) (push x rout))))))))
+                        (dolist (st (reverse steps))
+                          (if (eq (car st) marker)
+                              (push st worklist)
+                              (push (cons (car st) (if (cdr st) (- -1 mdepth) mdepth))
+                                    worklist)))))))
+      (loop while worklist do
+        (let ((item (pop worklist)))
+          (if (eq (car item) marker)
+              (%fmc-apply-set (cdr item))
+              (let* ((e (car item))
+                     (code (cdr item))
+                     (in-lambda (< code 0))
+                     (mdepth (if in-lambda (- -1 code) code)))
+                (cond
+                  ;; A symbol macro is both a reference and an expansion to
+                  ;; walk: a mutation can hide in the expansion.
+                  ((symbolp e)
+                   (ref e in-lambda)
+                   (when (and e (< mdepth limit))
+                     (let ((sm (assoc e *symbol-macros* :test #'eq)))
+                       (when sm
+                         (walk (cdr sm) in-lambda (1+ mdepth))))))
+                  ((consp e)
+                   (let* ((head (car e))
+                          (place-op (and (symbolp head) (%fmc-place-op head))))
+                     (cond
+                       ;; The portable MULTIPLE-VALUE-BIND shape compiles as a
+                       ;; LET* (%MV-CALL-LAMBDA-BIND), not as a closure: walk
+                       ;; it that way.
+                       ((let ((bind (and (eq head 'multiple-value-call)
+                                         (%mv-call-lambda-bind e))))
+                          (when bind
+                            (walk bind in-lambda mdepth)
+                            t)))
+                       ;; --- assignments: record the target and walk it ---
+                       ((and (symbolp head) (or (eq head 'setq) (eq head 'setf)
+                                                (eq head 'psetq) (eq head 'psetf)))
+                        (loop for (var val) on (cdr e) by #'cddr
+                              do (cond
+                                   ((and var (symbolp var))
+                                    (mutate var)
+                                    (walk var in-lambda mdepth))
+                                   ((and (consp var) (eq (car var) 'the) (symbolp (caddr var)))
+                                    (mutate (caddr var))
+                                    (walk var in-lambda mdepth))
+                                   ((consp var)
+                                    (let ((expander nil))
+                                      (when (and (or (eq head 'setf) (eq head 'psetf))
+                                                 (< mdepth limit)
+                                                 (%stack-space-available-p)
+                                                 (setf expander (find-macro-expander head)))
+                                        (let ((expanded (expand `(,head ,var ,val)
+                                                                expander
+                                                                in-lambda mdepth)))
+                                          (when expanded
+                                            (walk expanded in-lambda (1+ mdepth))))))
+                                    (walk var in-lambda mdepth)))
+                                 (when val (walk val in-lambda mdepth))))
+                       ((eq place-op :mv-setq)
+                        (let ((vars (cadr e)))
+                          (when (listp vars)
+                            (dolist (v vars)
+                              (when (symbolp v)
+                                (mutate v)
+                                (walk v in-lambda mdepth)))))
+                        (when (caddr e)
+                          (walk (caddr e) in-lambda mdepth)))
+                       ((eq place-op :push)
+                        (let* ((place (caddr e))
+                               (sym (if (symbolp place) place
+                                        (and (consp place) (eq (car place) 'the) (caddr place)))))
+                          (when (and sym (symbolp sym) (not (eq sym t)))
+                            (mutate sym)))
+                        (do-list-safe (sub (cdr e))
+                          (walk sub in-lambda mdepth)))
+                       ((eq place-op :pop)
+                        (let* ((place (cadr e))
+                               (sym (if (symbolp place) place
+                                        (and (consp place) (eq (car place) 'the) (caddr place)))))
+                          (when (and sym (symbolp sym) (not (eq sym t)))
+                            (mutate sym)))
+                        (do-list-safe (sub (cdr e))
+                          (walk sub in-lambda mdepth)))
+                       ((eq place-op :rotate)
+                        (dolist (arg (cdr e))
+                          (when (and (symbolp arg) arg (not (eq arg t)))
+                            (mutate arg)
+                            (walk arg in-lambda mdepth))
+                          (when (consp arg)
+                            (walk arg in-lambda mdepth))))
+                       ;; --- structure ---
+                       ((and (symbolp head) (eq head 'quote)) nil)
+                       ((and (symbolp head) (eq head 'defun))
+                        (run (mapcar (lambda (f) (cons f t)) (reverse (cdddr e))) mdepth nil))
+                       ;; A nested lambda: all of it is inside a closure.
+                       ;; Only the initializer forms of the lambda list, as for
+                       ;; FLET: walking the list itself as a form expands
+                       ;; (PARAM ...) when a parameter is named after a macro,
+                       ;; firing that macro's compile-time side effects.
+                       ((and (symbolp head) (eq head 'lambda) (listp (cadr e)))
+                        (let ((steps '()))
+                          (do ((pl (cadr e) (cdr pl)))
+                              ((not (consp pl)))
+                            (let ((p (car pl)))
+                              (when (and (consp p) (cadr p))
+                                (push (cons (cadr p) t) steps))))
+                          (dolist (form (cddr e))
+                            (push (cons form t) steps))
+                          (run (nreverse steps) 0 t)))
+                       ((and (or (eq head 'let) (eq head 'let*)) (listp (cadr e)))
+                        (let ((bindings (cadr e))
+                              (steps '())
+                              (shadowed nil))
+                          (when *symbol-macros*
+                            (do-list-safe (b bindings)
+                              (let ((name (if (consp b) (car b) b)))
+                                (when (and name (symbolp name)
+                                           (assoc name *symbol-macros* :test #'eq))
+                                  (push name shadowed)))))
+                          ;; Built back to front: the init forms come first,
+                          ;; then the body with the bound names unshadowed.
+                          (when shadowed
+                            (push (%fmc-set-step :symbol-macros *symbol-macros*) steps))
+                          (dolist (form (cddr e))
+                            (push (cons form in-lambda) steps))
+                          (when shadowed
+                            (push (%fmc-set-step
+                                   :symbol-macros
+                                   (remove-if (lambda (sm) (member (car sm) shadowed :test #'eq))
+                                              *symbol-macros*))
+                                  steps))
+                          (dolist (b bindings)
+                            (when (and (consp b) (cadr b))
+                              (push (cons (cadr b) in-lambda) steps)))
+                          (run steps mdepth nil)))
+                       ((and (symbolp head) (or (eq head 'flet) (eq head 'labels)) (listp (cadr e)))
+                        (let ((shadows (%flet-macro-shadows (cadr e)))
+                              (steps '())
+                              (enter nil))
+                          ;; Names that hide a macro are in scope for the body,
+                          ;; and for LABELS also for the definitions: as in the
+                          ;; free-variable walk.
+                          (flet ((enter ()
+                                   (push (%fmc-set-step :mscope *macroexpand-scope*) steps)
+                                   (push (%fmc-set-step :lexops *lexical-operators*) steps)
+                                   (setf enter t)))
+                            (when (and shadows (eq head 'labels)) (enter))
+                            (dolist (fdef (cadr e))
+                              ;; Only the initializer forms of the lambda list,
+                              ;; not the list itself: a parameter whose name is
+                              ;; a macro must not be expanded. A CONSP loop: the
+                              ;; position is not guaranteed to be a proper list.
+                              (do ((pl (cadr fdef) (cdr pl)))
+                                  ((not (consp pl)))
+                                (let ((p (car pl)))
+                                  (when (and (consp p) (cadr p))
+                                    (push (cons (cadr p) t) steps))))
+                              (dolist (form (cddr fdef))
+                                (push (cons form t) steps)))
+                            (when (and shadows (eq head 'flet)) (enter))
+                            (dolist (form (cddr e))
+                              (push (cons form in-lambda) steps)))
+                          (when enter
+                            (setf *macroexpand-scope* (cons (cadr e) *macroexpand-scope*)
+                                  *lexical-operators* (%flet-lexical-operators shadows)))
+                          (run steps mdepth nil)))
+                       ((and (symbolp head) (eq head 'handler-case))
+                        (let ((steps '()))
+                          (when (cadr e)
+                            (push (cons (cadr e) in-lambda) steps))
+                          (dolist (clause (cddr e))
+                            (dolist (form (cddr clause))
+                              (push (cons form t) steps)))
+                          (run steps mdepth nil)))
+                       ((and (symbolp head) (eq head 'handler-bind))
+                        (let ((steps '()))
+                          (dolist (binding (cadr e))
+                            (when (cadr binding)
+                              (push (cons (cadr binding) t) steps)))
+                          (dolist (form (cddr e))
+                            (push (cons form in-lambda) steps))
+                          (run steps mdepth nil)))
+                       ((and (symbolp head) (eq head 'restart-case))
+                        (let ((steps '()))
+                          (when (cadr e)
+                            (push (cons (cadr e) in-lambda) steps))
+                          (dolist (clause (cddr e))
+                            (dolist (form (cddr clause))
+                              (push (cons form t) steps)))
+                          (run steps mdepth nil)))
+                       ((and (symbolp head) (eq head 'macrolet))
+                        (let ((macro-defs (cadr e))
+                              (steps '()))
+                          (dolist (def macro-defs)
+                            (let ((mname (car def)))
+                              (push (%fmc-set-step :macro (cons mname (gethash mname *macros*))) steps)))
+                          (push (%fmc-set-step :mscope *macroexpand-scope*) steps)
+                          (push (%fmc-set-step :lexops *lexical-operators*) steps)
+                          (setf *macroexpand-scope* (cons macro-defs *macroexpand-scope*))
+                          (dolist (def macro-defs)
+                            (setf (gethash (car def) *macros*)
+                                  (%eval-macrolet-expander (cadr def) (cddr def))))
+                          (setf *lexical-operators* (%macrolet-lexical-operators macro-defs))
+                          (dolist (form (cddr e))
+                            (push (cons form in-lambda) steps))
+                          (run steps mdepth nil)))
+                       ((and (symbolp head) (eq head 'symbol-macrolet))
+                        (let ((steps (list (%fmc-set-step :symbol-macros *symbol-macros*))))
+                          (setf *symbol-macros*
+                                (append (mapcar (lambda (b) (cons (car b) (cadr b))) (cadr e))
+                                        *symbol-macros*))
+                          (dolist (form (cddr e))
+                            (push (cons form in-lambda) steps))
+                          (run steps mdepth nil)))
+                       (t
+                        (let ((expanded nil)
+                              (expander nil))
+                          (when (and (symbolp head) head
+                                     (< mdepth limit)
+                                     (%stack-space-available-p)
+                                     (not (%lexical-function-p head))
+                                     (setf expander (find-macro-expander head)))
+                            (setf expanded (expand e expander in-lambda mdepth)))
+                          (if expanded
+                              (walk expanded in-lambda (1+ mdepth))
+                              (do-list-safe (sub e)
+                                (walk sub in-lambda mdepth)))))))))))))
+      (cons (%fmc-dedupe mut) (cons (%fmc-dedupe rin) (%fmc-dedupe rout))))))
 
 (defun find-mutated-and-captured-vars (body var-names)
-  "One walk computing both sets. Returns (values mutated-names captured-names),
-   each a list of variable-name strings. Replaces adjacent find-mutated-vars +
-   find-captured-vars calls on the same BODY."
-  (let ((mutated-ht (make-hash-table :test #'equal))
-        (captured-ht (make-hash-table :test #'equal)))
+  "Returns (values MUTATED CAPTURED): the names in VAR-NAMES (variable-name
+   strings) that BODY assigns, and those it references from inside a closure."
+  (let ((*bmr-cache* (or *bmr-cache* (make-hash-table :test #'eq)))
+        (mutated '())
+        (captured '()))
     (dolist (form body)
-      (find-mutated-and-captured-vars-expr form var-names mutated-ht captured-ht nil))
-    (let ((mut '()) (cap '()))
-      (maphash (lambda (k v) (declare (ignore v)) (push k mut)) mutated-ht)
-      (maphash (lambda (k v) (declare (ignore v)) (push k cap)) captured-ht)
-      (values mut cap))))
+      (let ((s (%fmc-summary form nil 0)))
+        (dolist (sym (car s))
+          (let ((n (var-name sym)))
+            (when (and (member n var-names :test #'string=)
+                       (not (member n mutated :test #'string=)))
+              (push n mutated))))
+        (dolist (sym (cadr s))
+          (let ((n (var-name sym)))
+            (when (and (member n var-names :test #'string=)
+                       (not (member n captured :test #'string=)))
+              (push n captured))))))
+    (values mutated captured)))
 
 ;;; ============================================================
 ;;; SIL local-reference enumeration (single source of truth)
@@ -1062,52 +1236,61 @@
      - type in the corresponding :declare-local is \"LispObject\" (not a box array)
      - (:stloc KEY) and (:ldloc KEY) are consecutive in the non-:declare-local
        instruction subsequence (only :declare-local instructions may appear between)
-   Preserves CIL stack semantics and evaluation order."
-  (let ((stloc-count (make-hash-table :test #'equal))
-        (ldloc-count (make-hash-table :test #'equal))
-        (local-type  (make-hash-table :test #'equal)))
+   Preserves CIL stack semantics and evaluation order.
+
+   Every LET runs this over its whole instruction list, its nested LETs'
+   instructions included, so the work is the size of the body times its nesting
+   depth. The pairs are found first, which takes no table; only the few keys that
+   form one are then counted and checked."
+  (let ((cands '())
+        (prev nil))
+    ;; A (:stloc KEY) whose next instruction other than a :declare-local is
+    ;; (:ldloc KEY). Anything that is not a list (none is emitted today) is
+    ;; skipped without breaking the pair, as before.
     (dolist (instr instrs)
-      (let ((decl (instr-declared-local instr)))
-        (when decl (setf (gethash (car decl) local-type) (cdr decl))))
-      ;; Count writes and reads via the central enumerator so locals embedded in
-      ;; nested operands (e.g. :dotnet-call-direct-locals) raise the read count and
-      ;; correctly disqualify a key from single-ref removal.
-      (do-instr-local-writes (k instr) (incf (gethash k stloc-count 0)))
-      (do-instr-local-reads (k instr)  (incf (gethash k ldloc-count 0))))
-    ;; Eligible keys: single stloc, single ldloc, LispObject type
-    (let ((single-ref (make-hash-table :test #'equal)))
-      (maphash (lambda (key sc)
-                 (when (and (= sc 1)
-                            (= (gethash key ldloc-count 0) 1)
-                            (string= (gethash key local-type "") "LispObject"))
-                   (setf (gethash key single-ref) t)))
-               stloc-count)
-      (when (zerop (hash-table-count single-ref))
-        (return-from eliminate-single-ref-locals instrs))
-      ;; Find consecutive (stloc KEY)(ldloc KEY) pairs skipping :declare-local
-      (let ((removable (make-hash-table :test #'equal))
-            (prev nil))
+      (when (consp instr)
+        (let ((op (car instr)))
+          (cond
+            ((eq op :declare-local))
+            ((eq op :stloc) (setf prev (cadr instr)))
+            ((eq op :ldloc)
+             (when (and prev (equal prev (cadr instr)))
+               (push (list prev 0 0 nil) cands))
+             (setf prev nil))
+            (t (setf prev nil))))))
+    (when (null cands)
+      (return-from eliminate-single-ref-locals instrs))
+    ;; Each candidate: (KEY STLOC-COUNT LDLOC-COUNT DECLARED-TYPE). Counted via
+    ;; the central enumerator so locals embedded in nested operands (e.g.
+    ;; :dotnet-call-direct-locals) raise the read count and correctly disqualify
+    ;; a key.
+    (let ((table (when (> (length cands) 8)
+                   (let ((h (make-hash-table :test #'equal)))
+                     (dolist (c cands h) (setf (gethash (car c) h) c))))))
+      (flet ((cand (k) (if table
+                           (gethash k table)
+                           (assoc k cands :test #'equal))))
         (dolist (instr instrs)
           (when (consp instr)
-            (let ((op (car instr)) (key (cadr instr)))
-              (cond
-                ((eq op :declare-local))        ; transparent: don't reset prev
-                ((eq op :stloc)
-                 (setf prev (and (gethash key single-ref) key)))
-                ((eq op :ldloc)
-                 (cond
-                   ((and prev (equal prev key))
-                    (setf (gethash key removable) t)
-                    (setf prev nil))
-                   (t (setf prev nil))))
-                (t (setf prev nil))))))
-        (if (zerop (hash-table-count removable))
-            instrs
-            (remove-if (lambda (instr)
-                         (and (consp instr)
-                              (gethash (cadr instr) removable)
-                              (member (car instr) '(:declare-local :stloc :ldloc))))
-                       instrs))))))
+            (when (eq (car instr) :declare-local)
+              (let ((c (cand (cadr instr))))
+                (when c (setf (fourth c) (caddr instr)))))
+            (do-instr-local-writes (k instr)
+              (let ((c (cand k))) (when c (incf (second c)))))
+            (do-instr-local-reads (k instr)
+              (let ((c (cand k))) (when c (incf (third c)))))))))
+    (let ((removable (loop for c in cands
+                           when (and (= (second c) 1)
+                                     (= (third c) 1)
+                                     (string= (or (fourth c) "") "LispObject"))
+                             collect (car c))))
+      (if (null removable)
+          instrs
+          (remove-if (lambda (instr)
+                       (and (consp instr)
+                            (member (car instr) '(:declare-local :stloc :ldloc))
+                            (member (cadr instr) removable :test #'equal)))
+                     instrs)))))
 
 ;;; ============================================================
 ;;; A &REST list nobody reads
@@ -1288,6 +1471,17 @@
                     (consp i2) (eq (car i2) :pop))
                (setf changed t)
                (push i2 out)
+               (setf cur (cddr cur)))
+              ;; P5 for an (unsigned-byte 64): BoxU64 is pure too (a Fixnum or a fresh
+              ;; Bignum from the bits).
+              ((and (consp i1) (eq (car i1) :call) (equal (cadr i1) "Runtime.BoxU64")
+                    (consp i2) (or (eq (car i2) :pop)
+                                   (and (eq (car i2) :call)
+                                        (equal (cadr i2) "Runtime.UnwrapMv"))))
+               (setf changed t)
+               (if (eq (car i2) :pop)
+                   (push i2 out)
+                   (push i1 out))
                (setf cur (cddr cur)))
               ;; P6: box a native float only to discard it. The DoubleFloat /
               ;; SingleFloat ctor is pure (stores value, bumps the alloc counter),
@@ -1606,6 +1800,9 @@
         (*specials* '())
         (*at-toplevel* t)
         (*toplevel-segments-p* nil)
+        (*mv-mode-local* nil)
+        (*mv-expect-args* nil)
+        (*mv-exit-cleanup* nil)
         (*macroexpand-scope* '())
         (*macroexpand-cache* (make-hash-table :test #'eq))
         (*bmr-cache* (make-hash-table :test #'eq))
@@ -1642,6 +1839,12 @@
         (*at-toplevel* t)
         (*toplevel-segments-p* t)
         (*in-tail-position* t)
+        ;; A macro's expander can call EVAL while a function body is being
+        ;; compiled. The value mode of that body is a local of its method, not
+        ;; of the method compiled here.
+        (*mv-mode-local* nil)
+        (*mv-expect-args* nil)
+        (*mv-exit-cleanup* nil)
         (*macroexpand-scope* '())
         (*macroexpand-cache* (make-hash-table :test #'eq))
         (*bmr-cache* (make-hash-table :test #'eq))

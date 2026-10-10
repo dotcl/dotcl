@@ -5,8 +5,10 @@
 ;;; site generator's example build with such a pattern. The values below are
 ;;; what SBCL returns for the same tree.
 
+;;; The root is a truename: DIRECTORY answers truenames, and the temporary
+;;; directory can be reached through a symbolic link (/var on macOS).
 (defun %dwi-root ()
-  (let ((root (merge-pathnames "dwi-tree/" (regression-temp-dir))))
+  (let ((root (merge-pathnames "dwi-tree/" (truename (regression-temp-dir)))))
     (dolist (f '("top.html" "a/mid.html" "a/b/deep.html" "a/b/note.txt"))
       (let ((p (merge-pathnames f root)))
         (ensure-directories-exist p)

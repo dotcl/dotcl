@@ -16,12 +16,11 @@ Neither needs a build step: both work from a running image.
 ```lisp
 (require "asdf")             ; ASDF 3.3.7.4
 (require "quicklisp")        ; the Quicklisp client
-(require "dotcl-nuget")      ; NuGet package resolution
-(require "dotcl-nuget-asdf") ; declare a NuGet package in a system definition
+(require "dotnet-nuget")     ; NuGet package resolution
+(require "asdf-nuget")       ; NuGet packages in a system definition; check a library's fasls
 (require "dotnet-class")     ; dotnet:define-class: subclass a .NET type
 (require "dotnet-ffi")       ; P/Invoke to native libraries
 (require "dotcl-socket")     ; sockets
-(require "dotcl-kestrel")    ; HTTP server (ASP.NET Core's Kestrel), serves a Lack app
 (require "dotcl-thread")     ; threads (bordeaux-threads style)
 (require "dotcl-gray")       ; Gray streams
 (require "dotcl-repl")       ; a nicer REPL, with TAB completion and ,commands
@@ -29,7 +28,7 @@ Neither needs a build step: both work from a running image.
 (require "dotcl-advice")     ; function advice
 (require "dotcl-clrmd")      ; inspect a .NET heap (ClrMD)
 (require "dotcl-decompiler") ; decompile .NET methods
-(require "dotcl-cs")         ; compile C# from Lisp
+(require "dotnet-cs")        ; compile C# from Lisp
 (require "dotcl-float")      ; float utilities
 ```
 
@@ -109,7 +108,7 @@ where the declaration lives, and that is what decides which one you want:
 | How | Where you write it | Use it when |
 | --- | --- | --- |
 | `(nuget:require "Id" :version "13.0.3")` | in a form you evaluate -- the REPL, a script | you are exploring, or the script *is* the project |
-| `(:nuget "Id" :nuget-version "13.0.3")` component | in the `.asd`, with `:defsystem-depends-on ("dotcl-nuget-asdf")` | an ASDF system needs the package, and the need should travel with the system |
+| `(:nuget "Id" :nuget-version "13.0.3")` component | in the `.asd`, with `:defsystem-depends-on ("asdf-nuget")` | an ASDF system needs the package, and the need should travel with the system |
 | `<PackageReference Include="Id" Version="13.0.3" />` | in the `.csproj` of a .NET project that hosts dotcl (`<Project Sdk="DotCL.Sdk">`, or your own project with a `DotCL.Runtime` package reference) | the application is a .NET application. Restore is then a build step like any other, and the Lisp side just uses the types |
 
 The third is not a dotcl mechanism at all -- it is how .NET projects have always
@@ -123,7 +122,7 @@ registers every managed assembly and RID-specific native library with dotcl's
 assembly resolver. After that the types are visible to `dotnet:`:
 
 ```lisp
-(require "dotcl-nuget")
+(require "dotnet-nuget")
 (nuget:require "Newtonsoft.Json")
 
 (dotnet:static "Newtonsoft.Json.JsonConvert" "SerializeObject"
@@ -163,7 +162,7 @@ somewhere in its own code. Load the component class through
 
 ```lisp
 (defsystem "my-app"
-  :defsystem-depends-on ("dotcl-nuget-asdf")
+  :defsystem-depends-on ("asdf-nuget")
   :serial t
   :components ((:nuget "Newtonsoft.Json" :nuget-version "13.0.3")
                (:file "app")))
@@ -191,7 +190,7 @@ that tells you to use `:nuget-version`.
 which is you asking for something right now -- a `(:nuget ...)` component is a
 declaration that a later `load-system` acts on, possibly on someone else's
 machine. So loading a system resolves declared packages through
-`dotcl-nuget.lock.json` in the project directory (`nuget:*project-directory*`,
+`dotnet-nuget.lock.json` in the project directory (`nuget:*project-directory*`,
 by default the current directory). The file is NuGet's own lock-file format and
 records the version of every package in the closure:
 

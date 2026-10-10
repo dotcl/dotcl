@@ -15,11 +15,11 @@
 
 (defun %scc-typed-p (fn)
   "True when FN's SIL reads character codes through the typed entry."
-  (and (search "CharCodeAtL" (princ-to-string (dotcl:function-sil fn))) t))
+  (and (search "CharCodeAtL" (%flat-text (dotcl:function-sil fn))) t))
 
 (defun %scc-generic-p (fn)
   "True when FN's SIL still calls SCHAR through the symbol."
-  (and (search "SCHAR" (princ-to-string (dotcl:function-sil fn))) t))
+  (and (search "SCHAR" (%flat-text (dotcl:function-sil fn))) t))
 
 ;;; ---- what gets emitted ----
 
@@ -324,7 +324,7 @@
 
 ;; The buffer is fetched once and the bare load is what the body uses.
 (deftest-emitting-only string-char-code-typed.hoist-is-emitted
-  (let ((d (princ-to-string (dotcl:function-sil #'%sbh-sum))))
+  (let ((d (%flat-text (dotcl:function-sil #'%sbh-sum))))
     (list (and (search "Runtime.BackingChars" d) t)
           (and (search "LDELEM-U2" d) t)
           ;; and the other arm is still there, for the strings it declines

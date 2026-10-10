@@ -365,57 +365,34 @@ public static partial class Runtime
         char last = name[name.Length - 1];
         if (last == '+' || last == '-') return false;
 
-        // Check for float patterns (base 10 only): digits with decimal point and/or exponent
+        // Potential number (CLHS 2.3.1.1): the token consists only of digits, signs,
+        // ratio markers, decimal points, extension characters (^ _) and number
+        // markers (letters that are not digits in the current base), contains at
+        // least one digit, starts with a digit, sign, decimal point or extension
+        // character, and does not end with a sign (checked above). No letter that is
+        // adjacent to another letter is a number marker, so 1AB or 3D-VECTORS is
+        // not a potential number and reads back as a symbol unescaped, while 1A,
+        // 1E5X and 1.2.3 are. A character outside these (1!3) makes it a plain
+        // symbol too. SBCL prints the same way.
+        bool hasDigit = false;
+        bool prevMarker = false;
+        foreach (char c in name)
+        {
+            if (IsDigitInBase(c, radix)) { hasDigit = true; prevMarker = false; continue; }
+            if (c == '+' || c == '-' || c == '/' || c == '.' || c == '^' || c == '_')
+            { prevMarker = false; continue; }
+            if (char.IsLetter(c))
+            {
+                if (prevMarker) return false;
+                prevMarker = true;
+                continue;
+            }
+            return false;
+        }
+        if (!hasDigit) return false;
         char first = name[0];
-        // Starts with digit (base 10)
-        if (first >= '0' && first <= '9') return true;
-        // Starts with +/- followed by digit or dot
-        if ((first == '+' || first == '-') && name.Length > 1)
-        {
-            char second = name[1];
-            if ((second >= '0' && second <= '9') || second == '.') return true;
-        }
-        // Starts with dot followed by digit
-        if (first == '.' && name.Length > 1 && name[1] >= '0' && name[1] <= '9') return true;
-
-        // Check for potential number per CLHS 2.3.1.1:
-        // A token is a potential number if it contains at least one digit (in current base),
-        // consists only of digits, signs, ratio markers, decimal points, extension chars,
-        // and number markers, starts with digit/sign/dot/extension, and doesn't end with sign.
-        if (radix > 10)
-        {
-            // Check if the name could be a potential number with mixed digits and number markers
-            // Number markers for floats: D, E, F, L, S (only if not ALL are digits in the base)
-            bool hasDigit = false;
-            bool allPotentialNumberChars = true;
-            bool hasNonDigitLetter = false;
-            foreach (char c in name)
-            {
-                char upper = char.ToUpperInvariant(c);
-                if (IsDigitInBase(c, radix)) { hasDigit = true; continue; }
-                if (c == '+' || c == '-' || c == '/' || c == '.' || c == '^' || c == '_') continue;
-                // Number markers: D E F L S: only count as number markers if they're NOT valid digits
-                if (!IsDigitInBase(c, radix) && "DEFLS".IndexOf(upper) >= 0)
-                {
-                    hasNonDigitLetter = true;
-                    continue;
-                }
-                allPotentialNumberChars = false;
-                break;
-            }
-            if (allPotentialNumberChars && hasDigit && hasNonDigitLetter)
-            {
-                // Starts with digit, sign, dot, or extension char
-                char f = name[0];
-                if (IsDigitInBase(f, radix) || f == '+' || f == '-' || f == '.' || f == '^' || f == '_')
-                {
-                    // Doesn't end with sign (checked above)
-                    return true;
-                }
-            }
-        }
-
-        return false;
+        return IsDigitInBase(first, radix) || first == '+' || first == '-' || first == '.'
+            || first == '^' || first == '_';
     }
 
     /// <summary>
@@ -464,7 +441,7 @@ public static partial class Runtime
                 {
                     int label = ++_circleLabelCounter;
                     _circleTable[obj] = -label;
-                    var dispatchResult0 = TryPprintDispatch(obj);
+                    var dispatchResult0 = TryPprintDispatch(obj, escape, $"#{label}=".Length);
                     string content;
                     if (dispatchResult0 != null)
                         content = dispatchResult0;
@@ -478,7 +455,7 @@ public static partial class Runtime
         }
 
         // Check pprint dispatch table when *print-pretty* is true
-        var dispatchResult = TryPprintDispatch(obj);
+        var dispatchResult = TryPprintDispatch(obj, escape, 0);
         if (dispatchResult != null) return dispatchResult;
 
         // For conditions when escape is false (princ/~a), print the condition report.
@@ -514,14 +491,15 @@ public static partial class Runtime
             case LispString s:
             {
                 bool effectiveEscape = escape || GetPrintReadably();
-                return effectiveEscape ? s.ToString() : s.Value;
+                return PprintPrefixLiteralNewlines(effectiveEscape ? s.ToString() : s.Value);
             }
             case LispVector vec when vec.IsCharVector && vec.Rank == 1:
             {
                 // Character vectors are strings
                 var str = vec.ToCharString();
                 bool effectiveEscape = escape || GetPrintReadably();
-                return effectiveEscape ? $"\"{str.Replace("\\", "\\\\").Replace("\"", "\\\"")}\"" : str;
+                return PprintPrefixLiteralNewlines(
+                    effectiveEscape ? $"\"{str.Replace("\\", "\\\\").Replace("\"", "\\\"")}\"" : str);
             }
             case LispChar c:
                 // When *print-readably* is T, characters must be printed readably
@@ -1174,8 +1152,10 @@ public static partial class Runtime
     /// so the guard is per object rather than global.</summary>
     [ThreadStatic] private static List<LispObject>? _pprintDispatchInProgress;
 
-    /// <summary>Try pprint dispatch table. Returns formatted string or null.</summary>
-    private static string? TryPprintDispatch(LispObject obj)
+    /// <summary>Try pprint dispatch table: a user entry, else a standard entry
+    /// (lists and vectors, printed starting COLBIAS columns after where the
+    /// object's text starts). Returns formatted string or null.</summary>
+    private static string? TryPprintDispatch(LispObject obj, bool escape, int colBias)
     {
         if (_inPprintDispatch) return null; // dispatch switched off outright
         if (_pprintDispatchInProgress != null)
@@ -1201,8 +1181,37 @@ public static partial class Runtime
         LispPprintDispatchTable? table = null;
         if (DynamicBindings.TryGet(Startup.Sym("*PRINT-PPRINT-DISPATCH*"), out tableVal))
             table = tableVal as LispPprintDispatchTable;
-        if (table == null || table.Entries.Count == 0) return null;
+        if (table == null) return null;
+        if (table.Entries.Count > 0)
+        {
+            var user = RunUserPprintDispatch(obj, table, escape);
+            if (user != null) return user;
+        }
+        // Standard entries. Only for an object printed on its own, or printed
+        // directly by the PRINT-OBJECT method of an object printed on its own
+        // (whose stream knows its column): one inside a logical block of FORMAT
+        // or PPRINT-LOGICAL-BLOCK, or inside the text of an element being built
+        // as a string, does not know the column it starts at.
+        if (table.Standard && !_pprintActive
+            && (_formatConsDepth == 0 || _formatConsDepth == _printObjectTopDepth)
+            && IsStdPprintObject(obj))
+            return StdPprintTop(obj, escape, (_printStartColumn >= 0 ? _printStartColumn : 0) + colBias, table);
+        return null;
+    }
 
+    /// <summary>The output of the highest-priority user entry of TABLE matching
+    /// OBJ, or null when none matches. ESCAPE is the printer's escape mode,
+    /// bound to *PRINT-ESCAPE* while the entry's function runs: the printer
+    /// carries it as a parameter, so under PRINC or ~A the variable would
+    /// otherwise still say T to a function that asks it.</summary>
+    private static string? RunUserPprintDispatch(LispObject obj, LispPprintDispatchTable table, bool escape)
+    {
+        if (_pprintDispatchInProgress != null)
+        {
+            for (int i = 0; i < _pprintDispatchInProgress.Count; i++)
+                if (ReferenceEquals(_pprintDispatchInProgress[i], obj))
+                    return null;
+        }
         // Find highest priority matching entry
         (LispObject TypeSpec, LispObject Function, double Priority)? best = null;
         foreach (var entry in table.Entries.Values)
@@ -1229,9 +1238,15 @@ public static partial class Runtime
                      ?? (best.Value.Function is Symbol fsym ? fsym.Function as LispFunction : null);
             if (fn != null)
             {
+                var peSym = Startup.Sym("*PRINT-ESCAPE*");
+                DynamicBindings.Push(peSym, escape ? (LispObject)T.Instance : Nil.Instance);
                 PprintPushStaged(sw.GetStringBuilder());
                 try { fn.Invoke(new LispObject[] { stream, obj }); }
-                finally { PprintPopStaged(sw.GetStringBuilder()); }
+                finally
+                {
+                    PprintPopStaged(sw.GetStringBuilder());
+                    DynamicBindings.Pop(peSym);
+                }
             }
             return sw.ToString();
         }
@@ -1560,7 +1575,7 @@ public static partial class Runtime
         // dispatch table can replace the whole rendering.
         if (obj is Cons c && _circleTable == null)
         {
-            var dispatched = TryPprintDispatch(obj);
+            var dispatched = TryPprintDispatch(obj, escape, 0);
             if (dispatched != null) { sb.Append(dispatched); return; }
             // *print-level*: the same cut FormatObject's cons case makes.
             var level = GetPrintLevel();
@@ -1676,12 +1691,25 @@ public static partial class Runtime
     // tracks the column itself).
     [System.ThreadStatic] private static int _printStartColumn = -1;
 
+    // The printing depth (_formatConsDepth) inside the PRINT-OBJECT method of an
+    // object printed on its own, while that method runs; -1 otherwise.
+    [System.ThreadStatic] private static int _printObjectTopDepth = -1;
+
     /// <summary>FormatTop for output to the stream designator DEST: a PRINT-OBJECT
     /// method of the object is handed a buffer that knows the column the text
     /// will start at.</summary>
     internal static string FormatTopTo(LispObject obj, bool escape, LispObject dest)
     {
-        if (_pprintActive) return FormatTop(obj, escape);
+        if (_pprintActive)
+        {
+            // A string stream that is not the enclosing logical block's (one
+            // opened inside it with WITH-OUTPUT-TO-STRING, say) starts output of
+            // its own: the block's per-line prefix and state do not apply there.
+            if (!PprintUnrelatedWriter(GetOutputWriter(dest))) return FormatTop(obj, escape);
+            var suspended = PprintSuspend();
+            try { return FormatTopTo(obj, escape, dest); }
+            finally { PprintResume(suspended); }
+        }
         int saved = _printStartColumn;
         _printStartColumn = DestinationColumn(dest);
         try { return FormatTop(obj, escape); }
@@ -1723,11 +1751,32 @@ public static partial class Runtime
             var stream = new LispStringOutputStream(sw);
             // The object printed at top level starts where the destination's line
             // is: a logical block the method opens there lines up with it.
-            if (_printStartColumn >= 0 && _formatConsDepth == 1)
+            if (_printStartColumn >= 0 && _formatConsDepth <= 1)
                 stream.StartColumn = _printStartColumn;
+            // For an object printed on its own, the method's stream knows its
+            // column, so what the method prints there directly (a list under ~S
+            // in a condition's report, say) is pretty printed as on its own.
+            // The method's FORMAT calls are outermost ones on their own stream.
+            // (A condition's report is invoked before the printer descends, at
+            // depth 0; any other object's method at depth 1.)
+            bool top = _formatConsDepth <= 1 && !_pprintActive;
+            int savedTopDepth = _printObjectTopDepth, savedStartCol = _printStartColumn;
+            int savedFmtDepth = _fmtCoreDepth;
+            if (top)
+            {
+                _printObjectTopDepth = _formatConsDepth;
+                _printStartColumn = -1;
+                _fmtCoreDepth = 0;
+            }
             PprintPushStaged(sw.GetStringBuilder());
             try { gf.Invoke(new LispObject[] { obj, stream }); }
-            finally { PprintPopStaged(sw.GetStringBuilder()); }
+            finally
+            {
+                PprintPopStaged(sw.GetStringBuilder());
+                _printObjectTopDepth = savedTopDepth;
+                _printStartColumn = savedStartCol;
+                _fmtCoreDepth = savedFmtDepth;
+            }
             return sw.ToString();
         }
         finally { DynamicBindings.Pop(peSym); }
@@ -2149,7 +2198,7 @@ public static partial class Runtime
     public static LispObject Prin1(LispObject obj)
     {
         var w = GetStandardOutputWriter();
-        var text = FormatTop(obj, true);
+        var text = FormatTopTo(obj, true, Nil.Instance);
         w.Write(text);
         w.Flush();
         NoteWritten(Nil.Instance, text);
@@ -2191,7 +2240,7 @@ public static partial class Runtime
         try
         {
             var w = GetStandardOutputWriter();
-            var text = FormatTop(obj, false);
+            var text = FormatTopTo(obj, false, Nil.Instance);
             w.Write(text);
             w.Flush();
             NoteWritten(Nil.Instance, text);
@@ -2231,12 +2280,24 @@ public static partial class Runtime
     public static LispObject WriteToString(LispObject obj)
     {
         // write-to-string: respects *print-escape* dynamic binding
-        return new LispString(FormatTop(obj, GetPrintEscape()));
+        return new LispString(FormatTopFresh(obj, GetPrintEscape()));
     }
 
     public static LispObject Prin1ToString(LispObject obj)
     {
-        return new LispString(FormatTop(obj, true));
+        return new LispString(FormatTopFresh(obj, true));
+    }
+
+    /// <summary>FormatTop for the *-TO-STRING functions. They print to a fresh
+    /// string stream, which is not part of an enclosing pretty logical block
+    /// (one a PRINT-OBJECT method may be running in): set the block's state aside,
+    /// as FORMAT NIL does, so its per-line prefix does not get into the string.</summary>
+    internal static string FormatTopFresh(LispObject obj, bool escape)
+    {
+        if (!_pprintActive) return FormatTop(obj, escape);
+        var suspended = PprintSuspend();
+        try { return FormatTop(obj, escape); }
+        finally { PprintResume(suspended); }
     }
 
     [ThreadStatic] private static bool _inBacktraceRender;
@@ -2279,7 +2340,7 @@ public static partial class Runtime
         DynamicBindings.Push(readablySym, Nil.Instance);
         try
         {
-            return new LispString(FormatTop(obj, false));
+            return new LispString(FormatTopFresh(obj, false));
         }
         finally
         {
@@ -2590,7 +2651,7 @@ public static partial class Runtime
             if (args.Length == 1)
             {
                 TextWriter w1 = Runtime.GetOutputWriter(Nil.Instance);
-                var t1 = Runtime.FormatTop(obj, Runtime.GetPrintEscapePublic());
+                var t1 = Runtime.FormatTopTo(obj, Runtime.GetPrintEscapePublic(), Nil.Instance);
                 Runtime.PprintFlushPendingBreak(w1);
                 w1.Write(t1);
                 Runtime.PprintTrackWrite(t1);
@@ -2900,7 +2961,7 @@ public static partial class Runtime
                 source = args[0];
 
             if (source is Nil)
-                return new LispPprintDispatchTable(); // fresh standard table
+                return new LispPprintDispatchTable(standard: true); // fresh standard table
             if (source is LispPprintDispatchTable table)
                 return new LispPprintDispatchTable(table);
             throw new LispErrorException(new LispTypeError(
@@ -2925,7 +2986,7 @@ public static partial class Runtime
                 else
                     table = Startup.Sym("*PRINT-PPRINT-DISPATCH*").Value as LispPprintDispatchTable;
             }
-            if (table == null || table.Entries.Count == 0)
+            if (table == null)
                 return MultipleValues.Values2(Nil.Instance, Nil.Instance);
             (LispObject TypeSpec, LispObject Function, double Priority)? best = null;
             foreach (var entry in table.Entries.Values)
@@ -2936,7 +2997,13 @@ public static partial class Runtime
                         best = entry;
                 }
             }
-            if (best == null) return MultipleValues.Values2(Nil.Instance, Nil.Instance);
+            if (best == null)
+            {
+                // The standard entries: lists and vectors.
+                if (table.Standard && Runtime.IsStdPprintObjectPublic(obj))
+                    return MultipleValues.Values2(Runtime.StdPprintFunction, T.Instance);
+                return MultipleValues.Values2(Nil.Instance, Nil.Instance);
+            }
             return MultipleValues.Values2(best.Value.Function, T.Instance);
         }, "PPRINT-DISPATCH", -1));
         // SET-PPRINT-DISPATCH: (type-specifier function &optional priority table)

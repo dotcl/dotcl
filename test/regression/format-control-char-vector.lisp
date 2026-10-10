@@ -49,3 +49,15 @@
                                    :format-control (fccv-string "made ~A")
                                    :format-arguments '(3)))
   "made 3")
+
+;;; The same holds for the control string ~? and ~@? take as an argument: one
+;;; that is not a simple string produced no output at all. Coalton's ASSERT
+;;; passes the user's format string (read by eclector) through ~?, so its
+;;; panic message lost everything after "failed: ".
+
+(deftest format-control-char-vector.recursive
+  (let ((s (fccv-string "x was ~A")))
+    (list (format nil "<~?>" s '(3))
+          (format nil "<~@?> ~A" s 3 4)
+          (format nil "<~?>" (copy-seq (fccv-string "copied ~A")) '(5))))
+  ("<x was 3>" "<x was 3> 4" "<copied 5>"))

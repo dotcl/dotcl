@@ -191,6 +191,53 @@ public static partial class Runtime
         return System.Math.Sqrt(x);
     }
 
+    static LispErrorException DeclaredDoubleLogOfNegative(double value)
+        => new LispErrorException(new LispTypeError(
+            $"(LOG {value}) is a COMPLEX, not the declared DOUBLE-FLOAT",
+            new DoubleFloat(value), Startup.Sym("DOUBLE-FLOAT")));
+
+    /// <summary>
+    /// LOG of a double where the program has declared the result a
+    /// DOUBLE-FLOAT: the SqrtDoubleChecked of LOG. A negative argument, whose
+    /// logarithm is a COMPLEX, means the declaration is false and signals a
+    /// TYPE-ERROR. Zero signals DIVISION-BY-ZERO and NaN gives NaN, as the
+    /// generic LOG does.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static double LogDoubleChecked(double x)
+    {
+        if (x < 0.0) throw DeclaredDoubleLogOfNegative(x);
+        return LogDouble(x);
+    }
+
+    /// <summary>LogDoubleChecked at (safety 0), where the declaration is
+    /// trusted: no test for a negative argument, but zero still signals
+    /// DIVISION-BY-ZERO as the generic LOG does, since that is not a
+    /// violation of the declaration.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static double LogDouble(double x)
+    {
+        if (x == 0.0) throw LogOfZero();
+        return System.Math.Log(x);
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    static LispErrorException LogOfZero()
+        => new LispErrorException(new LispError("LOG: division by zero") { ConditionTypeName = "DIVISION-BY-ZERO" });
+
+    /// <summary>
+    /// EXP of a raw double, for the compiler's double lane. Signals
+    /// FLOATING-POINT-OVERFLOW where the generic EXP does: a finite argument
+    /// whose result is infinite. Underflow gives 0.0, as there.
+    /// </summary>
+    public static double ExpDouble(double x)
+    {
+        double r = System.Math.Exp(x);
+        if (double.IsInfinity(r) && !double.IsInfinity(x))
+            throw new LispErrorException(new LispError("EXP: floating-point overflow") { ConditionTypeName = "FLOATING-POINT-OVERFLOW" });
+        return r;
+    }
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static long AddFixnumChecked(long a, long b)
     {
@@ -251,8 +298,9 @@ public static partial class Runtime
         if (a is Fixnum fa && b is Fixnum fb)
         {
             long bv = fb.Value;
-            if (bv == 0) throw new LispErrorException(new LispError("/: division by zero") { ConditionTypeName = "DIVISION-BY-ZERO" });
+            if (bv == 0) throw DivisionByZero("/", a, b);
             long av = fa.Value;
+            if (bv == -1) return Arithmetic.Negate(fa);
             if (av % bv == 0) return Fixnum.Make(av / bv);
             // Fall through to ratio creation via Arithmetic.Divide
         }
@@ -270,7 +318,23 @@ public static partial class Runtime
         if (a is SingleFloat sfa && b is SingleFloat sfb)
             return new SingleFloat(sfa.Value / sfb.Value);
         try { return Arithmetic.Divide(AsNumber(a), AsNumber(b)); }
-        catch (DivideByZeroException) { throw new LispErrorException(new LispError("/: division by zero") { ConditionTypeName = "DIVISION-BY-ZERO" }); }
+        catch (DivideByZeroException) { throw DivisionByZero("/", a, b); }
+    }
+
+    /// <summary>
+    /// A DIVISION-BY-ZERO error that carries the operation and its operands, so
+    /// ARITHMETIC-ERROR-OPERATION and ARITHMETIC-ERROR-OPERANDS answer them, and
+    /// whose report names the condition type and the operation, as SBCL's does.
+    /// </summary>
+    internal static LispErrorException DivisionByZero(string operation, params LispObject[] operands)
+    {
+        var op = Startup.Sym(operation);
+        LispObject args = Nil.Instance;
+        for (int i = operands.Length - 1; i >= 0; i--) args = new Cons(operands[i], args);
+        var message = "arithmetic error DIVISION-BY-ZERO signalled\nOperation was "
+            + FormatTop(new Cons(op, args), true) + ".";
+        return new LispErrorException(new LispError(message)
+        { ConditionTypeName = "DIVISION-BY-ZERO", OperationRef = op, OperandsRef = args });
     }
 
     // --- Comparison (backward compat) ---
@@ -313,6 +377,34 @@ public static partial class Runtime
         }
         { var na = AsNumber(a); var nb = AsNumber(b);
           return !Arithmetic.EitherNaN(na, nb) && Arithmetic.Compare(na, nb) < 0 ? T.Instance : Nil.Instance; }
+    }
+
+    /// <summary>The DOTIMES count, or the limit of a LOOP counting up exclusively
+    /// or down inclusively, as the int64 the counter is compared with, evaluated
+    /// once before the loop. A fixnum is itself. A bignum or a float infinity is
+    /// the int64 at that end: the counter starts at a small integer and moves by
+    /// a small step, so in any run that finishes it stops at the same place. Any
+    /// other real is its ceiling: the first integer a (>= counter limit) test
+    /// stops at, and the first a (< counter limit) test runs past.</summary>
+    public static long DotimesLimit(LispObject count) => IntegerLoopLimit(count, false);
+
+    /// <summary>The same for the limit of a LOOP counting up inclusively or down
+    /// exclusively, whose tests (> counter limit) and (<= counter limit) change
+    /// at the floor of a non-integer limit.</summary>
+    public static long LoopLimitFloor(LispObject limit) => IntegerLoopLimit(limit, true);
+
+    static long IntegerLoopLimit(LispObject x, bool floor)
+    {
+        if (x is Fixnum f) return f.Value;
+        if (x is Bignum b) return b.Value.Sign > 0 ? long.MaxValue : long.MinValue;
+        if (x is DoubleFloat d && double.IsInfinity(d.Value))
+            return d.Value > 0 ? long.MaxValue : long.MinValue;
+        if (x is SingleFloat sf && float.IsInfinity(sf.Value))
+            return sf.Value > 0 ? long.MaxValue : long.MinValue;
+        var n = AsNumber(x);
+        var (q, _) = floor ? Arithmetic.Floor(n, Fixnum.Make(1))
+                           : Arithmetic.Ceiling(n, Fixnum.Make(1));
+        return IntegerLoopLimit(q, floor);
     }
 
     /// <summary>(>= counter limit) where the counter is a raw Int64 and the limit
@@ -608,7 +700,7 @@ public static partial class Runtime
         if (args.Length == 1)
         {
             try { return Arithmetic.Divide(Fixnum.Make(1), AsNumber(args[0])); }
-            catch (DivideByZeroException) { throw new LispErrorException(new LispError("/: division by zero") { ConditionTypeName = "DIVISION-BY-ZERO" }); }
+            catch (DivideByZeroException) { throw DivisionByZero("/", args[0]); }
         }
         LispObject result = args[0];
         for (int i = 1; i < args.Length; i++)
@@ -907,13 +999,16 @@ public static partial class Runtime
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static long ModFixnumL(long a, long b)
     {
+        // A divisor of -1 leaves no remainder; the int64 % would overflow
+        // on most-negative-fixnum.
+        if (b == -1) return 0;
         long r = a % b;
         if (r != 0 && ((r ^ b) < 0)) r += b;
         return r;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static long RemFixnumL(long a, long b) => a % b;
+    public static long RemFixnumL(long a, long b) => b == -1 ? 0 : a % b;
 
     /// <summary>Raw int64 FLOOR / TRUNCATE quotient for the compiler's unboxed
     /// fixnum path, where the destination is an int64: the one quotient that
@@ -944,6 +1039,7 @@ public static partial class Runtime
         if (a is Fixnum fa && b is Fixnum fb)
         {
             long av = fa.Value, bv = fb.Value;
+            if (bv == -1) return Fixnum.Make(0);
             long r = av % bv;
             if (r != 0 && ((r ^ bv) < 0)) r += bv;
             return Fixnum.Make(r);
@@ -954,7 +1050,7 @@ public static partial class Runtime
     public static LispObject Rem(LispObject a, LispObject b)
     {
         if (a is Fixnum fa && b is Fixnum fb)
-            return Fixnum.Make(fa.Value % fb.Value);
+            return Fixnum.Make(fb.Value == -1 ? 0 : fa.Value % fb.Value);
         return Arithmetic.Rem(AsNumber(a), AsNumber(b));
     }
     public static LispObject Gcd(LispObject a, LispObject b) => Arithmetic.Gcd(AsNumber(a), AsNumber(b));
@@ -968,6 +1064,7 @@ public static partial class Runtime
         if (a is Fixnum fa && b is Fixnum fb)
         {
             long av = fa.Value, bv = fb.Value;
+            if (bv == -1) return (Arithmetic.Negate(fa), Fixnum.Make(0));
             long q = Math.DivRem(av, bv, out long r);
             if (r != 0 && ((r ^ bv) < 0)) { q--; r += bv; }
             return (Fixnum.Make(q), Fixnum.Make(r));
@@ -990,6 +1087,7 @@ public static partial class Runtime
         if (a is Fixnum fa && b is Fixnum fb)
         {
             long av = fa.Value, bv = fb.Value;
+            if (bv == -1) return (Arithmetic.Negate(fa), Fixnum.Make(0));
             long q = av / bv;
             long r = av - q * bv;
             return (Fixnum.Make(q), Fixnum.Make(r));
@@ -1351,6 +1449,29 @@ public static partial class Runtime
         return val;
     }
 
+    /// <summary>
+    /// The logical host SYS, which SBCL and other implementations predefine and
+    /// portable code probes for (e.g. (logical-pathname "SYS:SRC;")). It names
+    /// the dotcl installation: SYS:CONTRIB; is the contrib tree REQUIRE loads
+    /// from, and SYS:SRC; the directory above it (the source tree in a
+    /// development checkout, the package root when installed). Where no contrib
+    /// tree is found, the runtime's own directory stands in.
+    /// </summary>
+    internal static void DefineSysLogicalHost()
+    {
+        if (_logicalPathnameTranslations.ContainsKey("SYS")) return;
+        string root = ContribParent(Array.Empty<LispObject>()) is LispPathname rp
+            ? rp.ToNamestring()
+            : AppContext.BaseDirectory;
+        root = root.Replace('\\', '/');
+        if (!root.EndsWith('/')) root += "/";
+        LispObject Rule(string from, string to)
+            => List(new LispString(from), LispPathname.FromString(to));
+        _logicalPathnameTranslations["SYS"] = List(
+            Rule("SYS:CONTRIB;**;*.*.*", root + "contrib/**/*.*"),
+            Rule("SYS:SRC;**;*.*.*", root + "**/*.*"));
+    }
+
     public static LispObject SetLogicalPathnameTranslations(LispObject host, LispObject translations)
     {
         var hostName = host is LispString s ? s.Value : host is LispVector v && v.IsCharVector ? v.ToCharString() : host.ToString();
@@ -1484,7 +1605,7 @@ public static partial class Runtime
                     toPn = LispPathname.FromString(tStr.Value);
 
                 if (fromPn != null && toPn != null && LogicalPathnameMatchesWildcard(lp, fromPn))
-                    return TranslateWithPattern(lp, toPn);
+                    return TranslateWithPattern(lp, toPn, LiteralDirectoryPrefixLength(fromPn));
             }
             cur = c.Cdr;
         }
@@ -1548,7 +1669,24 @@ public static partial class Runtime
         return ai == ac.Count;
     }
 
-    private static LispPathname TranslateWithPattern(LispLogicalPathname logical, LispPathname toPattern)
+    /// <summary>How many directory components the from-wildcard of a
+    /// translation names literally before its first wild one: "SRC;**;" has 1.
+    /// Those components are what the rule matched on, so they are not part of
+    /// what the to-wildcard's ** stands for.</summary>
+    private static int LiteralDirectoryPrefixLength(LispLogicalPathname from)
+    {
+        int n = 0;
+        if (from.DirectoryComponent is Cons fd)
+            for (var cur = fd.Cdr; cur is Cons c; cur = c.Cdr)
+            {
+                if (c.Car is not LispString) break;
+                n++;
+            }
+        return n;
+    }
+
+    private static LispPathname TranslateWithPattern(LispLogicalPathname logical, LispPathname toPattern,
+                                                     int skipDirectories = 0)
     {
         // Replace wild components in toPattern with actual components from logical pathname
         // For the common case: **;*.*.* -> /abs/path/sandbox/**/*.*
@@ -1572,6 +1710,11 @@ public static partial class Runtime
                     if (logical.DirectoryComponent is Cons logDir)
                     {
                         var logCur = (LispObject)logDir.Cdr; // skip :absolute/:relative
+                        // ... and the components the from-wildcard spelled out:
+                        // FOO:SRC;A;B.LISP under ("FOO:SRC;**;*.*.*" "/x/**/*.*")
+                        // is /x/a/b.lisp, not /x/src/a/b.lisp.
+                        for (int k = 0; k < skipDirectories && logCur is Cons sk; k++)
+                            logCur = sk.Cdr;
                         while (logCur is Cons lc)
                         {
                             var comp = lc.Car is LispString ds

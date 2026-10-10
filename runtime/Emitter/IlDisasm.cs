@@ -1,3 +1,4 @@
+using System.Linq;
 using System.Reflection;
 using System.Reflection.Emit;
 
@@ -7,7 +8,7 @@ namespace DotCL.Emitter;
 /// Disassembles a .NET method's CIL byte stream into a dotcl-SIL-shaped
 /// S-expression list. The output uses the same instruction naming as the
 /// internal compiler (keyword symbols like :LDARG, :ADD, :RET) so that
-/// `(disassemble 'fn)` output and `(dotcl-cs:disassemble-cs ...)` output
+/// `(disassemble 'fn)` output and `(dotnet-cs:disassemble-cs ...)` output
 /// can be diffed directly.
 ///
 /// Primary use case: comparing C# compiler output against dotcl's own codegen
@@ -51,6 +52,16 @@ public static class IlDisasm
 
         // Pass 2: walk and emit instructions, interleaving labels.
         var sexps = new List<LispObject>();
+        // The local slots the body's ldloc / stloc indices refer to, as
+        // (:LOCALS ("System.Int64" ...)) in slot order. A reader that splices
+        // the body elsewhere needs their types to declare its own locals.
+        if (body.LocalVariables.Count > 0)
+        {
+            var types = new List<LispObject>();
+            foreach (var lv in body.LocalVariables.OrderBy(v => v.LocalIndex))
+                types.Add(new LispString(lv.LocalType.FullName ?? lv.LocalType.Name));
+            sexps.Add(MakeInstr("LOCALS", ListOf(types)));
+        }
         int pc = 0;
         while (pc < il.Length)
         {

@@ -20,7 +20,7 @@
 (setf dotcl:*save-sil* t)
 
 (defun %ims-calls-p (fn name)
-  (and (search name (princ-to-string (dotcl:function-sil fn))) t))
+  (and (search name (%flat-text (dotcl:function-sil fn))) t))
 
 (declaim (inline %ims-low-byte))
 (defun %ims-low-byte (x) (ldb (byte 8 0) x))

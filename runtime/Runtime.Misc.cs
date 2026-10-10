@@ -46,6 +46,23 @@ public static partial class Runtime
     /// Warn only; the fasl is still loadable and usually still correct. A fasl with
     /// no stamp (built before stamping existed, or by a core loaded from memory) is
     /// left alone rather than reported as suspect.</summary>
+    /// <summary>Count the fasl at PATH as already warned about: its caller has
+    /// said, once for many fasls, that they come from another compiler (a library
+    /// package's shipped fasls), and two lines per file would bury that.</summary>
+    public static LispObject NoteFaslGeneration(LispObject[] args)
+    {
+        if (args.Length != 1)
+            throw new LispErrorException(new LispProgramError(
+                $"DOTCL::%NOTE-FASL-GENERATION: wrong number of arguments: {args.Length} (expected 1)"));
+        if (args[0] is not LispString s)
+            throw new LispErrorException(new LispTypeError(
+                "DOTCL::%NOTE-FASL-GENERATION: not a string", args[0]));
+        var path = s.Value;
+        lock (_staleFaslWarned)
+            _staleFaslWarned.Add(Path.GetFullPath(path));
+        return T.Instance;
+    }
+
     private static void WarnOnStaleFaslGeneration(System.Reflection.Assembly asm, string faslPath)
     {
         try
@@ -138,10 +155,15 @@ public static partial class Runtime
                 case Nil:
                     stream = DynamicBindings.Get(Startup.Sym("*STANDARD-INPUT*"));
                     continue;
-                case LispInstance gi when IsGrayInputStream(gi):
+                // A binary Gray input stream too: character reads go to its
+                // STREAM-READ-CHAR, as on SBCL (the output side does the same).
+                case LispInstance gi when IsGrayInputStream(gi) || IsGrayBinaryInputStream(gi):
                     return new GrayStreamTextReader(gi);
-                default:
+                case LispStream:
+                case LispInstance:
                     return Console.In;
+                default:
+                    throw new LispErrorException(NotInputStreamDesignator(stream));
             }
         }
     }
@@ -203,6 +225,12 @@ public static partial class Runtime
     internal static bool IsGrayInputStream(LispInstance inst)
         => inst.Class.ClassPrecedenceList?.Any(
                c => c.Name?.Name == "FUNDAMENTAL-CHARACTER-INPUT-STREAM") == true;
+
+    /// <summary>A Gray input stream of either kind. Character reads (READ-CHAR,
+    /// PEEK-CHAR, UNREAD-CHAR, READ-CHAR-NO-HANG) go to the Gray generics for both,
+    /// as on SBCL.</summary>
+    internal static bool IsGrayAnyInputStream(LispInstance inst)
+        => IsGrayInputStream(inst) || IsGrayBinaryInputStream(inst);
 
     /// <summary>Check if a LispInstance is a Gray binary input stream (subclass of fundamental-binary-input-stream).
     /// read-byte/read-sequence dispatch to the stream-read-byte generic on these.</summary>
@@ -577,7 +605,7 @@ public static partial class Runtime
         "advice" => "this contrib was renamed to \"dotcl-advice\"",
         "clrmd" => "this contrib was renamed to \"dotcl-clrmd\"",
         "decompiler" => "this contrib was renamed to \"dotcl-decompiler\"",
-        "nuget" => "this contrib was renamed to \"dotcl-nuget\"",
+        "nuget" => "this contrib was renamed to \"dotnet-nuget\"",
         _ => null
     };
 
@@ -780,6 +808,7 @@ public static partial class Runtime
                         InstallAsdfModuleProvider();
                         UseAsdfSourceLoadingWithoutCompiler();
                         InstallAsdfR2rHook();
+                        UseErrorOnCompileFileFailure();
                     }
                     return T.Instance;
                 }
@@ -1009,6 +1038,24 @@ public static partial class Runtime
         catch { }
     }
 
+    /// <summary>A COMPILE-FILE that reports failure-p stops the ASDF build, as on
+    /// SBCL (UIOP's default is :error only for SBCL and MKCL, :warn elsewhere).
+    /// With :warn the build went on and the first error seen was a later one
+    /// (a package the failed file should have made), not the cause.</summary>
+    private static void UseErrorOnCompileFileFailure()
+    {
+        const string form = @"
+(let ((s (find-symbol ""*COMPILE-FILE-FAILURE-BEHAVIOUR*"" ""UIOP"")))
+  (when s (setf (symbol-value s) :error)))";
+        try
+        {
+            var read = MultipleValues.Primary(
+                Runtime.ReadFromString(new LispObject[] { new LispString(form) }));
+            Runtime.Eval(read);
+        }
+        catch { /* ignore if UIOP is not there */ }
+    }
+
     private static void UseAsdfSourceLoadingWithoutCompiler()
     {
         // A REQUIRE-SYSTEM is exempt: it has no source to load -- its LOAD-OP just
@@ -1032,7 +1079,15 @@ public static partial class Runtime
                 (apply (fdefinition op)
                        (if (and found (typep found reqsys)) load-op src)
                        system keys))
-              t)))))";
+              t))))
+  ;; OPERATE first calls UPGRADE-ASDF, which runs LOAD-OP on the system
+  ;; ""asdf"". When an asdf.asd is visible in the source registry (an ASDF
+  ;; checkout under a :tree), that system is the one from the .asd and its
+  ;; LOAD-OP compiles ASDF from source, so every OPERATE died on COMPILE-FILE.
+  ;; Without a compiler the running ASDF cannot be replaced: keep it.
+  (let ((up (find-symbol ""UPGRADE-ASDF"" ""ASDF"")))
+    (when (and up (fboundp up))
+      (setf (fdefinition up) (lambda () nil)))))";
         try
         {
             var read = MultipleValues.Primary(
@@ -1191,14 +1246,17 @@ public static partial class Runtime
             w.Flush();
         }
 
-        // Handle persisted .NET assembly: detect by PE header ("MZ"), not extension
-        if (IsPeAssembly(filePath))
+        // Handle persisted .NET assembly: detect by PE header ("MZ"), not extension.
+        // One open answers everything LOAD asks of the file before loading it: on
+        // Windows the first open of a freshly written PE is a full antivirus scan.
+        var peFile = ProbePeFile(filePath);
+        if (peFile != null)
         {
-            try { return LoadFasl(filePath, filespec, isVerbose, isPrint); }
+            try { return LoadFasl(filePath, peFile, filespec, isVerbose, isPrint); }
             finally { WhitelistLoadedDefinitionsForCompileFile(); }
         }
 
-        if (IsForeignFasl(filePath))
+        if (HasFaslExtension(filePath))
             throw FaslFileError(
                 $"LOAD: not a dotcl fasl (foreign Lisp fasl?): {filePath}", filespec);
 
@@ -1211,7 +1269,7 @@ public static partial class Runtime
         // very same file with COMPILE-FILE or WITH-OPEN-FILE reports a position,
         // so the failure looked like it belonged to the library.
         var loadTrackingReader = new PositionTrackingReader(loadStringReader);
-        var reader2 = new Reader(loadTrackingReader);
+        var reader2 = new Reader(loadTrackingReader) { LineSource = source };
         // Same live-reader/share-table link as CompileFile: a Lisp reader macro
         // reading elements via (read stream) must reuse THIS reader so per-form
         // share-table clearing doesn't run per element (see CompileFile).
@@ -1323,17 +1381,38 @@ public static partial class Runtime
         }
     }
 
-    /// <summary>Check if a file is a PE (.NET) assembly by reading the first two bytes.</summary>
-    private static bool IsPeAssembly(string filePath)
+    /// <summary>What LOAD learns about a PE file before loading it.</summary>
+    private sealed class PeFile
+    {
+        public bool ReadyToRun;
+#if NETSTANDARD2_0
+        /// <summary>The whole image: this build loads fasls from bytes.</summary>
+        public byte[]? Image;
+#endif
+    }
+
+    /// <summary>Null when the file is not a PE (.NET) image, judged by its first two
+    /// bytes ("MZ"), or cannot be read. Otherwise what loading it needs to know,
+    /// from this one open.</summary>
+    private static PeFile? ProbePeFile(string filePath)
     {
         try
         {
             using var fs = File.OpenRead(filePath);
-            var b1 = fs.ReadByte();
-            var b2 = fs.ReadByte();
-            return b1 == 'M' && b2 == 'Z'; // PE header
+            if (fs.ReadByte() != 'M' || fs.ReadByte() != 'Z') return null;
+            fs.Position = 0;
+#if NETSTANDARD2_0
+            // No AssemblyLoadContext here, so the fasl is loaded from bytes.
+            var image = new byte[fs.Length];
+            int n = 0, r;
+            while (n < image.Length && (r = fs.Read(image, n, image.Length - n)) > 0) n += r;
+            if (n != image.Length) return null;
+            return new PeFile { Image = image, ReadyToRun = IsReadyToRunImage(new MemoryStream(image, false)) };
+#else
+            return new PeFile { ReadyToRun = IsReadyToRunImage(fs) };
+#endif
         }
-        catch { return false; }
+        catch { return null; }
     }
 
     /// <summary>A .fasl that is not a PE image belongs to some other Lisp: the
@@ -1343,8 +1422,21 @@ public static partial class Runtime
     /// binary as source text (which reports a reader error about whatever byte
     /// came first).</summary>
     private static bool IsForeignFasl(string filePath) =>
-        string.Equals(Path.GetExtension(filePath), ".fasl", StringComparison.OrdinalIgnoreCase)
-        && !IsPeAssembly(filePath);
+        HasFaslExtension(filePath) && !HasPeSignature(filePath);
+
+    private static bool HasFaslExtension(string filePath) =>
+        string.Equals(Path.GetExtension(filePath), ".fasl", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>Whether the file starts with the PE signature "MZ".</summary>
+    private static bool HasPeSignature(string filePath)
+    {
+        try
+        {
+            using var fs = File.OpenRead(filePath);
+            return fs.ReadByte() == 'M' && fs.ReadByte() == 'Z';
+        }
+        catch { return false; }
+    }
 
     private static LispErrorException FaslFileError(string message, LispObject filespec)
     {
@@ -1695,6 +1787,17 @@ public static partial class Runtime
         try
         {
             using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            return IsReadyToRunImage(fs);
+        }
+        catch { return false; }
+    }
+
+    /// <summary>The same test on an open stream, read from its start.</summary>
+    private static bool IsReadyToRunImage(Stream fs)
+    {
+        try
+        {
+            fs.Seek(0, SeekOrigin.Begin);
             var head = new byte[4096];
             int n = 0, r;
             while (n < head.Length && (r = fs.Read(head, n, head.Length - n)) > 0) n += r;
@@ -1733,7 +1836,48 @@ public static partial class Runtime
         catch { return false; }
     }
 
-    private static LispObject LoadFasl(string filePath, LispObject filespec,
+#if !NETSTANDARD2_0
+    /// <summary>Fasl paths this process has loaded by path.</summary>
+    private static readonly HashSet<string> s_faslPathsLoaded = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>Load a fasl by path, the first time this process loads that path.
+    ///
+    /// By path because loading from a byte array costs a second antivirus scan on
+    /// Windows (AMSI inspects every image handed over in memory, on top of the
+    /// scan of the file when it is opened), and because a file-backed module is
+    /// what debuggers and coverage collectors see: they find the .pdb next to it.
+    ///
+    /// Only the first time: the runtime keeps the image it opened for a path and
+    /// hands it back to the next load of the same path, in any load context, even
+    /// after the file was replaced. So LOADing a fasl again after recompiling it
+    /// would run the old module. A path loaded before is read into memory and
+    /// loaded from the bytes, as every fasl used to be.
+    ///
+    /// A context of its own for each, as Assembly.Load(byte[]) gives each array:
+    /// the default context refuses a second assembly of the same name.</summary>
+    private static System.Reflection.Assembly LoadFaslFromPath(string faslFull)
+    {
+        bool first;
+        lock (s_faslPathsLoaded) first = s_faslPathsLoaded.Add(faslFull);
+        if (!first)
+        {
+            var bytes = File.ReadAllBytes(faslFull);
+            var pdbPath = Path.ChangeExtension(faslFull, ".pdb");
+            if (File.Exists(pdbPath))
+            {
+                try { return System.Reflection.Assembly.Load(bytes, File.ReadAllBytes(pdbPath)); }
+                catch (BadImageFormatException) { throw; }
+                catch { } // mismatched or unreadable pdb: load without it
+            }
+            return System.Reflection.Assembly.Load(bytes);
+        }
+        var context = new System.Runtime.Loader.AssemblyLoadContext(
+            "fasl " + Path.GetFileName(faslFull), isCollectible: false);
+        return context.LoadFromAssemblyPath(faslFull);
+    }
+#endif
+
+    private static LispObject LoadFasl(string filePath, PeFile peFile, LispObject filespec,
         bool isVerbose, bool isPrint)
     {
         var loadPathSym = Startup.Sym("*LOAD-PATHNAME*");
@@ -1758,15 +1902,7 @@ public static partial class Runtime
 
         try
         {
-            // Load the fasl bytes into the default context. When a matching .pdb
-            // sits next to the fasl, hand it to the symbol-store overload so a
-            // debugger has symbols for this in-memory module directly: an
-            // assembly loaded from bytes carries no file Location, so the
-            // debugger cannot otherwise discover a co-located pdb. This is what
-            // makes a deployed dotcl app, whose fasl LoadFromManifest loads from
-            // bin/dotcl-fasl/, break/step in its .lisp under a Debug build.
             var faslFull = Path.GetFullPath(filePath);
-            var pdbPath = Path.ChangeExtension(faslFull, ".pdb");
             System.Reflection.Assembly asm;
             try
             {
@@ -1789,7 +1925,7 @@ public static partial class Runtime
                     asm = System.Reflection.Assembly.LoadFrom(r2rPath);
                     R2rFaslsLoaded++;
                 }
-                else if (IsReadyToRunImage(faslFull))
+                else if (peFile.ReadyToRun)
                 {
                     // The fasl itself is the ahead-of-time image (a per-RID
                     // package ships asdf.fasl that way, under its own name).
@@ -1799,26 +1935,15 @@ public static partial class Runtime
                     asm = System.Reflection.Assembly.LoadFrom(faslFull);
                     R2rFaslsLoaded++;
                 }
-                else if (Environment.GetEnvironmentVariable("DOTCL_FASL_LOADFROM") == "1")
-                {
-                    // Load by path so the module is file-backed. A coverage profiler
-                    // picks its targets per loaded module and skips anything without a
-                    // Location, so an assembly loaded from bytes is invisible to it;
-                    // which is the whole reason this switch exists: with it set, an
-                    // off-the-shelf .NET coverage collector reports line coverage
-                    // against the .lisp itself, out of the PDB's document table.
-                    //
-                    // Not the default, because loading by path holds the file open and
-                    // caches the assembly against that path: recompiling a fasl and
-                    // LOADing it again in the same session would fail to write on
-                    // Windows, and elsewhere would return the assembly already loaded.
-                    // A coverage run does not do that, it is one process that compiles,
-                    // loads, runs and exits, so the switch costs it nothing.
-                    asm = System.Reflection.Assembly.LoadFrom(faslFull);
-                }
                 else
                 {
-                    var faslBytes = File.ReadAllBytes(faslFull);
+#if NETSTANDARD2_0
+                    // No AssemblyLoadContext on this target: load the bytes. When a
+                    // matching .pdb sits next to the fasl, hand it to the
+                    // symbol-store overload, since an assembly loaded from bytes has
+                    // no file Location for a debugger to find the pdb by.
+                    var faslBytes = peFile.Image!;
+                    var pdbPath = Path.ChangeExtension(faslFull, ".pdb");
                     if (File.Exists(pdbPath))
                     {
                         try { asm = System.Reflection.Assembly.Load(faslBytes, File.ReadAllBytes(pdbPath)); }
@@ -1828,6 +1953,9 @@ public static partial class Runtime
                     {
                         asm = System.Reflection.Assembly.Load(faslBytes);
                     }
+#else
+                    asm = LoadFaslFromPath(faslFull);
+#endif
                 }
             }
             catch (BadImageFormatException)
@@ -1950,7 +2078,11 @@ public static partial class Runtime
                 for (var t = lbody; t is Cons tc; t = tc.Cdr) bodyCount++;
                 // One body form is already one method; splitting it would only
                 // add a wrapper. Zero means the LOCALLY is declarations only.
-                if (bodyCount > 1)
+                // But one body form that is itself a PROGN, a LOCALLY or a
+                // (SYMBOL-)MACROLET holding several forms is split like any
+                // other: those are top level forms as well.
+                if (bodyCount > 1
+                    || (bodyCount == 1 && IsSplittableTopLevelScope(((Cons)lbody).Car)))
                 {
                     for (var t = lbody; t is Cons tc; t = tc.Cdr)
                     {
@@ -2046,6 +2178,24 @@ public static partial class Runtime
         yield return form;
     }
 
+    /// <summary>True when FORM is a PROGN, LOCALLY, MACROLET or SYMBOL-MACROLET
+    /// with more than one body form (after declarations), which FlattenTopLevel
+    /// splits into its body forms.</summary>
+    private static bool IsSplittableTopLevelScope(LispObject form)
+    {
+        if (form is not Cons c || c.Car is not Symbol sym) return false;
+        LispObject body;
+        if (sym.Name == "PROGN" || sym.Name == "LOCALLY") body = c.Cdr;
+        else if ((sym.Name == "MACROLET" || sym.Name == "SYMBOL-MACROLET")
+                 && c.Cdr is Cons mrest) body = mrest.Cdr;
+        else return false;
+        if (sym.Name != "PROGN")
+            while (body is Cons bc && bc.Car is Cons dc
+                   && dc.Car is Symbol dsym && dsym.Name == "DECLARE")
+                body = bc.Cdr;
+        return body is Cons first && first.Cdr is Cons;
+    }
+
     /// <summary>The names a MACROLET / SYMBOL-MACROLET binding list defines.</summary>
     private static HashSet<Symbol> LocalBindingNames(LispObject bindings)
     {
@@ -2125,8 +2275,21 @@ public static partial class Runtime
     // form is read, BEFORE macroexpansion (defun etc. are macros, so the form must
     // be inspected raw). Line granularity is the top-level form, matching what a
     // debugger needs to jump to the definition.
-    private static readonly System.Collections.Concurrent.ConcurrentDictionary<Symbol, (string File, int Line)>
+    // Seq orders the records: a later definition replaces an earlier one, also
+    // when the earlier one is a fasl's table resolved only at lookup (below).
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<Symbol, (string File, int Line, long Seq)>
         s_defSources = new();
+    private static long s_defSeq;
+
+    // Definition tables of loaded fasls not yet resolved to symbols, and the
+    // entries of earlier tables whose package or symbol did not exist yet when
+    // they were resolved. A fasl registers its table before its first
+    // definition runs; resolving it means one package and symbol lookup per
+    // definition, which is left to the first lookup of a location instead of
+    // every load.
+    private static readonly object s_faslSourcesLock = new();
+    private static List<(byte[] Data, long Seq)> s_pendingFaslSources = new();
+    private static List<(string Pkg, string Name, string File, int Line, long Seq)> s_unresolvedFaslSources = new();
 
     // Top-level operators whose second element names a thing worth locating.
     private static bool IsDefinerName(string name) => name switch
@@ -2145,17 +2308,27 @@ public static partial class Runtime
     /// appear after macroexpansion are not tracked (v1 = top-level form granularity).</summary>
     internal static void RecordDefinitionSources(LispObject form, string file, int line)
     {
+        var names = new List<Symbol>();
+        DefinitionNames(form, names);
+        foreach (var nameSym in names)
+            s_defSources[nameSym] = (file, line, System.Threading.Interlocked.Increment(ref s_defSeq));
+    }
+
+    /// <summary>The names <see cref="RecordDefinitionSources"/> records for FORM,
+    /// added to NAMES in the order they appear.</summary>
+    internal static void DefinitionNames(LispObject form, List<Symbol> names)
+    {
         if (form is not Cons c || c.Car is not Symbol head) return;
         switch (head.Name)
         {
             case "PROGN":
                 for (var b = c.Cdr; b is Cons bc; b = bc.Cdr)
-                    RecordDefinitionSources(bc.Car, file, line);
+                    DefinitionNames(bc.Car, names);
                 return;
             case "EVAL-WHEN":
                 if (c.Cdr is Cons ew)
                     for (var b = ew.Cdr; b is Cons bc; b = bc.Cdr)
-                        RecordDefinitionSources(bc.Car, file, line);
+                        DefinitionNames(bc.Car, names);
                 return;
         }
         if (!IsDefinerName(head.Name) || c.Cdr is not Cons nameCell) return;
@@ -2167,7 +2340,93 @@ public static partial class Runtime
             _ => null
         };
         if (nameSym != null)
-            s_defSources[nameSym] = (file, line);
+            names.Add(nameSym);
+    }
+
+#if DOTCL_EMIT
+    /// <summary>Write the definitions FORM names into the fasl's definition
+    /// table, with the absolute path of the source (or, for a project build that
+    /// compiles several sources as one unit, the source the line falls in).</summary>
+    private static void AddFaslDefinitionSources(DotCL.Emitter.FaslAssembler fasl,
+        LispObject form, string inputPath, int line)
+    {
+        var names = new List<Symbol>();
+        DefinitionNames(form, names);
+        if (names.Count == 0) return;
+        string file;
+        var map = BuildDebugLineMap;
+        if (map != null && map.Length > 0)
+        {
+            int idx = 0;
+            for (int i = 0; i < map.Length; i++)
+                if (map[i].startLine <= line) idx = i; else break;
+            file = map[idx].path;
+            line = System.Math.Max(1, line - map[idx].startLine + 1);
+        }
+        else
+            file = BuildDebugSourceOverride ?? inputPath;
+        file = Path.GetFullPath(file);
+        foreach (var s in names)
+            if (s.HomePackage is Package p)
+                fasl.AddDefinitionSource(file, p.Name, s.Name, line);
+    }
+#endif
+
+    /// <summary>Called by a fasl's ModuleInit before its first definition runs:
+    /// DATA is the table COMPILE-FILE wrote (see FaslAssembler.AddDefinitionSource).
+    /// Only queued here; <see cref="ResolveFaslDefinitionSources"/> reads it.</summary>
+    public static void RegisterFaslDefinitionSources(byte[] data)
+    {
+        lock (s_faslSourcesLock)
+            s_pendingFaslSources.Add((data, System.Threading.Interlocked.Increment(ref s_defSeq)));
+    }
+
+    /// <summary>Move the queued fasl tables into s_defSources. An entry keeps
+    /// the sequence number of its fasl's load, so a definition loaded later from
+    /// source (or another fasl) is not replaced by it. An entry whose package or
+    /// symbol does not exist yet is kept for the next call.</summary>
+    private static void ResolveFaslDefinitionSources()
+    {
+        if (s_pendingFaslSources.Count == 0 && s_unresolvedFaslSources.Count == 0) return;
+        lock (s_faslSourcesLock)
+        {
+            var pending = s_pendingFaslSources;
+            var retry = s_unresolvedFaslSources;
+            if (pending.Count == 0 && retry.Count == 0) return;
+            s_pendingFaslSources = new();
+            s_unresolvedFaslSources = new();
+            foreach (var e in retry)
+                ResolveFaslDefinitionSource(e.Pkg, e.Name, e.File, e.Line, e.Seq);
+            foreach (var (data, seq) in pending)
+            {
+                int pos = 0;
+                var files = new string[(int)FaslData.ReadVarint(data, ref pos)];
+                for (int i = 0; i < files.Length; i++) files[i] = FaslData.ReadStr(data, ref pos);
+                var pkgs = new string[(int)FaslData.ReadVarint(data, ref pos)];
+                for (int i = 0; i < pkgs.Length; i++) pkgs[i] = FaslData.ReadStr(data, ref pos);
+                int n = (int)FaslData.ReadVarint(data, ref pos);
+                for (int i = 0; i < n; i++)
+                {
+                    var file = files[(int)FaslData.ReadVarint(data, ref pos)];
+                    var pkg = pkgs[(int)FaslData.ReadVarint(data, ref pos)];
+                    var name = FaslData.ReadStr(data, ref pos);
+                    int line = (int)FaslData.ReadVarint(data, ref pos);
+                    ResolveFaslDefinitionSource(pkg, name, file, line, seq);
+                }
+            }
+        }
+    }
+
+    private static void ResolveFaslDefinitionSource(string pkg, string name, string file, int line, long seq)
+    {
+        var sym = Package.FindPackage(pkg)?.FindSymbol(name).symbol;
+        if (sym == null)
+        {
+            s_unresolvedFaslSources.Add((pkg, name, file, line, seq));
+            return;
+        }
+        if (s_defSources.TryGetValue(sym, out var had) && had.Seq > seq) return;
+        s_defSources[sym] = (file, line, seq);
     }
 
     // Active COMPILE-FILE "was fbound before" snapshots, innermost last.
@@ -2278,6 +2537,7 @@ public static partial class Runtime
     public static LispObject FunctionSourceLocation(LispObject[] args)
     {
         if (args.Length < 1 || args[0] is not Symbol name) return Nil.Instance;
+        ResolveFaslDefinitionSources();
         if (!s_defSources.TryGetValue(name, out var loc)) return Nil.Instance;
         return new Cons(Startup.Keyword("FILE"),
                new Cons(new LispString(loc.File),
@@ -2295,6 +2555,7 @@ public static partial class Runtime
     /// </summary>
     internal static List<(Symbol Sym, string File, int Line)> DefinitionSourcesForFrame(string name)
     {
+        ResolveFaslDefinitionSources();
         var found = new List<(Symbol, string, int)>();
         foreach (var kv in s_defSources)
             if (kv.Key.Name == name && kv.Key.IsFBound)
@@ -2494,11 +2755,71 @@ public static partial class Runtime
         form is Cons c && c.Car is Symbol s
         && s.Name is "EXPORT" or "IMPORT" or "SHADOW" or "SHADOWING-IMPORT" or "USE-PACKAGE";
 
+    /// <summary>Run a top-level DECLAIM, PROCLAIM or package operation whose
+    /// arguments are all constants by calling the function itself, and answer
+    /// true; answer false for anything else. What the compiled form would do is
+    /// exactly that call, and assembling and JIT-compiling a method to make one
+    /// call cost far more than the call: a file that defines many small inline
+    /// functions has several such forms per definition.
+    ///
+    /// DECLAIM runs PROCLAIM on the specs COMPILE-DECLAIM-FORM puts a load-time
+    /// PROCLAIM in for (SPECIAL, DECLARATION, INLINE, NOTINLINE, OPTIMIZE), in
+    /// order; the other specs have only their compile-time half, which the
+    /// compiler has already applied.</summary>
+    private static bool TryRunConstantCompileTimeForm(LispObject form)
+    {
+        if (form is not Cons c || c.Car is not Symbol op) return false;
+        if (ReferenceEquals(op, Startup.Sym("DECLAIM")))
+        {
+            if (Startup.Sym("PROCLAIM").Function is not LispFunction proclaim) return false;
+            for (var s = c.Cdr; s is Cons sc; s = sc.Cdr)
+            {
+                if (sc.Car is not Cons spec || spec.Car is not Symbol kind) continue;
+                if (ReferenceEquals(kind, Startup.Sym("SPECIAL"))
+                    || ReferenceEquals(kind, Startup.Sym("DECLARATION"))
+                    || ReferenceEquals(kind, Startup.Sym("INLINE"))
+                    || ReferenceEquals(kind, Startup.Sym("NOTINLINE"))
+                    || ReferenceEquals(kind, Startup.Sym("OPTIMIZE")))
+                    proclaim.Invoke(spec);
+            }
+            return true;
+        }
+        if (!(ReferenceEquals(op, Startup.Sym("PROCLAIM"))
+              || ReferenceEquals(op, Startup.Sym("EXPORT"))
+              || ReferenceEquals(op, Startup.Sym("IMPORT"))
+              || ReferenceEquals(op, Startup.Sym("SHADOW"))
+              || ReferenceEquals(op, Startup.Sym("SHADOWING-IMPORT"))
+              || ReferenceEquals(op, Startup.Sym("USE-PACKAGE"))))
+            return false;
+        if (op.Function is not LispFunction fn) return false;
+        var args = new List<LispObject>();
+        var quote = Startup.Sym("QUOTE");
+        for (var a = c.Cdr; ; a = ((Cons)a).Cdr)
+        {
+            if (a is Nil) break;
+            if (a is not Cons ac) return false;
+            var x = ac.Car;
+            if (x is Cons q)
+            {
+                if (!ReferenceEquals(q.Car, quote) || q.Cdr is not Cons qc || qc.Cdr is not Nil)
+                    return false;
+                args.Add(qc.Car);
+            }
+            else if (x is Symbol xs && xs.HomePackage?.Name != "KEYWORD")
+                return false;
+            else
+                args.Add(x);
+        }
+        fn.Invoke(args.ToArray());
+        return true;
+    }
+
     private static void RunCompileTimeSideEffect(LispObject form, LispObject instrList)
     {
         if (!IsCourtesyCompileTimeForm(form))
         {
-            DotCL.Emitter.CilAssembler.AssembleAndRun(instrList);
+            if (!TryRunConstantCompileTimeForm(form))
+                DotCL.Emitter.CilAssembler.AssembleAndRun(instrList);
             return;
         }
         // Intercept at the signal point, before any outer handler (ASDF's, the
@@ -2511,7 +2832,8 @@ public static partial class Runtime
         HandlerClusterStack.PushCluster(new[] { new HandlerBinding(Startup.Sym("ERROR"), handler) });
         try
         {
-            DotCL.Emitter.CilAssembler.AssembleAndRun(instrList);
+            if (!TryRunConstantCompileTimeForm(form))
+                DotCL.Emitter.CilAssembler.AssembleAndRun(instrList);
         }
         catch (HandlerCaseInvocationException ex) when (ReferenceEquals(ex.Tag, tag))
         {
@@ -2524,11 +2846,38 @@ public static partial class Runtime
 
     private static bool ShouldExecuteAtCompileTime(LispObject form)
     {
-        if (form is Cons c && c.Car is Symbol sym)
+        if (UnwrapTopLevelScope(form) is Cons c && c.Car is Symbol sym)
         {
             return IsCompileTimeSideEffectForm(sym.Name);
         }
         return false;
+    }
+
+    /// <summary>The one form inside a top level LOCALLY, MACROLET or
+    /// SYMBOL-MACROLET that holds a single body form, looking through nested
+    /// ones; FORM itself otherwise. FlattenTopLevel leaves each body form of such
+    /// a scope wrapped in its own copy of it, and the body form keeps its compile
+    /// time side effects there (CLHS 3.2.3.1): a DEFTYPE inside
+    /// (locally (declare ...) (symbol-macrolet (...) ...)) names a type for the
+    /// rest of the file. Running the wrapped form runs the definition under the
+    /// declarations and local macros it was written with.</summary>
+    private static LispObject UnwrapTopLevelScope(LispObject form)
+    {
+        for (int depth = 0; depth < 64; depth++)
+        {
+            if (form is not Cons c || c.Car is not Symbol sym) return form;
+            LispObject body;
+            if (sym.Name == "LOCALLY") body = c.Cdr;
+            else if ((sym.Name == "MACROLET" || sym.Name == "SYMBOL-MACROLET")
+                     && c.Cdr is Cons mrest) body = mrest.Cdr;
+            else return form;
+            while (body is Cons bc && bc.Car is Cons dc
+                   && dc.Car is Symbol dsym && dsym.Name == "DECLARE")
+                body = bc.Cdr;
+            if (body is not Cons only || only.Cdr is not Nil) return form;
+            form = only.Car;
+        }
+        return form;
     }
 
     /// <summary>
@@ -3352,7 +3701,7 @@ public static partial class Runtime
             // Read source, compile each form, and write instrList to .sil
             var source = File.ReadAllText(inputPath);
             var trackingReader = new PositionTrackingReader(new StringReader(source));
-            var reader = new Reader(trackingReader);
+            var reader = new Reader(trackingReader) { LineSource = source };
             var compileStream = new LispStringInputStream(trackingReader, 0, source, source.Length);
             if (LispStringInputStream.Utf8Preamble(inputPath) is int compilePre && compilePre >= 0)
                 compileStream.ReportFileBytes(compilePre);
@@ -3496,7 +3845,27 @@ public static partial class Runtime
                         // reports it once and goes on.
                         bool expansionFailed = !Runtime.IsTrueEql(failuresBefore, DynamicBindings.Get(failuresSym));
                         if (compileTimeToo && !expansionFailed)
+                        {
                             RunAtCompileTime(instrList, ctBefore!);
+                            // CLHS 3.2.3.1: in compile-time-too mode the form is
+                            // evaluated first and then compiled. Its own evaluation
+                            // can change what its macros expand to (lift's
+                            // DEFTESTSUITE records the suite's slot names in a form
+                            // whose later methods expand against them), so the code
+                            // for the fasl is compiled again after the run, as SBCL
+                            // does, instead of reusing what was run. The run made
+                            // the form's DEFUNs for real, so the early definitions
+                            // this compilation makes of them are put back to the
+                            // run's at once; left to the end of COMPILE-FILE they
+                            // would be undone to what was there before the file.
+                            s_earlyDefunsTS!.Push(new());
+                            try
+                            {
+                                instrList = DotCL.Diagnostics.PhaseTimer.Time(
+                                    "compile", () => CompileTopLevel(subForm));
+                            }
+                            finally { RestoreEarlyDefuns(s_earlyDefunsTS.Pop()); }
+                        }
                     }
                     finally { if (ctBefore != null) DefinitionJournal.Close(ctBefore); }
                     if (!compileTimeToo && ShouldExecuteAtCompileTime(subForm)
@@ -3547,6 +3916,7 @@ public static partial class Runtime
                     // and to record definition locations for frame-source-location.
                     formLine = reader.LastFormLine;
                     RecordDefinitionSources(form, inputPath, formLine);
+                    AddFaslDefinitionSources(faslAsm, form, inputPath, formLine);
                     try
                     {
                     foreach (var subForm in FlattenTopLevel(form))
@@ -4162,6 +4532,55 @@ public static partial class Runtime
 #endif
     }
 
+    /// <summary>
+    /// Build one dependency system's fasl from its own SOURCES, in the order
+    /// ASDF would compile them, the way ASDF builds it: each file is compiled
+    /// and loaded before the next one is read. A later file may read, at read
+    /// time or in a macro, what an earlier one defined or registered when it was
+    /// loaded (micros' #.(gray-package-name) needs its backend loaded). The
+    /// system is loaded in this image afterwards, as LOAD-SYSTEM would leave it.
+    ///
+    /// Each file starts with the *PACKAGE* and *READTABLE* the build started
+    /// with, as COMPILE-FILE binds them: an IN-PACKAGE does not carry over into
+    /// the next file. The fasl is written only when every file compiled.
+    /// </summary>
+    internal static void BuildDependencyFasl(string faslPath, IReadOnlyList<string> sources)
+    {
+#if DOTCL_EMIT
+        var moduleName = Path.GetFileNameWithoutExtension(faslPath)
+            + "_" + Guid.NewGuid().ToString("N").Substring(0, 8);
+        var faslAsm = new DotCL.Emitter.FaslAssembler(moduleName);
+
+        var compileFileModeSym = Startup.Sym("*COMPILE-FILE-MODE*");
+        var packageSym = Startup.Sym("*PACKAGE*");
+        var readtableSym = Startup.Sym("*READTABLE*");
+        var oldCompileFileMode = DynamicBindings.Get(compileFileModeSym);
+        var oldPackage = DynamicBindings.Get(packageSym);
+        var oldReadtable = DynamicBindings.Get(readtableSym);
+        DynamicBindings.Set(compileFileModeSym, Startup.Sym("T"));
+        try
+        {
+            foreach (var source in sources)
+            {
+                DynamicBindings.Set(packageSym, oldPackage);
+                DynamicBindings.Set(readtableSym, oldReadtable);
+                CompileSourceInto(source, faslAsm, "resolve-deps");
+            }
+            faslAsm.Save(faslPath);
+        }
+        finally
+        {
+            DynamicBindings.Set(compileFileModeSym, oldCompileFileMode);
+            DynamicBindings.Set(packageSym, oldPackage);
+            DynamicBindings.Set(readtableSym, oldReadtable);
+        }
+#else
+        throw new LispErrorException(new LispProgramError(
+            "Building a dependency fasl requires System.Reflection.Emit, "
+            + "which is unavailable in this runtime build"));
+#endif
+    }
+
     private static string? FindRuntimeCsproj()
     {
         var envPath = System.Environment.GetEnvironmentVariable("DOTCL_RUNTIME_CSPROJ");
@@ -4537,7 +4956,8 @@ public static partial class Runtime
     // that would restore them is emitted rather than run. Every later
     // macroexpansion reaching naming-option then fails, which is what log:info
     // does, which is what Lem uses.
-    private static void CompileSourceInto(string inputPath, DotCL.Emitter.FaslAssembler faslAsm)
+    private static void CompileSourceInto(string inputPath, DotCL.Emitter.FaslAssembler faslAsm,
+                                          string what = "SAVE-APPLICATION")
     {
         if (!File.Exists(inputPath))
             throw new LispErrorException(new LispProgramError(
@@ -4610,7 +5030,7 @@ public static partial class Runtime
             // Name the file. Without this the report is a bare condition and the
             // only way to find the source is to bisect the closure by hand.
             throw new LispErrorException(new LispProgramError(
-                $"SAVE-APPLICATION: while processing {full}: "
+                $"{what}: while processing {full}: "
                 + ((LispErrorException)e).Condition));
         }
         finally
@@ -5907,6 +6327,43 @@ public static partial class Runtime
     // Trace infrastructure: maps function name key -> original (unwrapped) function
     private static readonly ConcurrentDictionary<string, LispFunction> _tracedOriginals = new();
     private static readonly ConcurrentDictionary<string, LispObject> _tracedNames = new();
+    // Traced generic functions keep their identity: the trace wrapper is installed
+    // as the generic function's discriminating function, so #'NAME stays a generic
+    // function (what SBCL does). Key -> (wrapper, discriminating function it replaced).
+    private static readonly ConcurrentDictionary<string, (LispFunction Wrapper, LispFunction? Previous)> _tracedGfDispatch = new();
+    // Trace wrapper -> the function it wraps, so introspection on a traced name
+    // (DOCUMENTATION, the lambda list) answers about the traced function, not the
+    // wrapper.
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<LispFunction, LispFunction> _traceWrapperOriginals = new();
+
+    /// <summary>The function a trace wrapper stands for, or FN itself.</summary>
+    internal static LispObject UntracedFunction(LispObject fn)
+    {
+        while (fn is LispFunction lf && _traceWrapperOriginals.TryGetValue(lf, out var orig))
+            fn = orig;
+        return fn;
+    }
+
+    private static LispObject TraceCall(LispObject name, LispObject[] wrapArgs,
+        Func<LispObject[], LispObject> call)
+    {
+        var traceWriter = GetTraceOutputWriter();
+        traceWriter.Write("  Calling ");
+        traceWriter.Write(FormatObject(name, true));
+        traceWriter.Write(" with (");
+        for (int i = 0; i < wrapArgs.Length; i++)
+        {
+            if (i > 0) traceWriter.Write(" ");
+            traceWriter.Write(FormatObject(wrapArgs[i], true));
+        }
+        traceWriter.WriteLine(")");
+        traceWriter.Flush();
+        var result = call(wrapArgs);
+        traceWriter.Write("  => ");
+        traceWriter.WriteLine(FormatObject(result, true));
+        traceWriter.Flush();
+        return result;
+    }
 
     private static string TraceNameKey(LispObject name)
     {
@@ -5943,31 +6400,24 @@ public static partial class Runtime
             if (original == null) continue;
             _tracedOriginals[key] = original;
             _tracedNames[key] = name;
+            var capturedName = name;
+            if (original is GenericFunction tracedGf)
+            {
+                var previous = tracedGf.DispatchFunction;
+                var gfWrapper = new LispFunction(wrapArgs => TraceCall(capturedName, wrapArgs,
+                    a => previous != null ? previous.Invoke(a) : DispatchGFCore(tracedGf, a)),
+                    original.Name, -1);
+                _tracedGfDispatch[key] = (gfWrapper, previous);
+                tracedGf.DispatchFunction = gfWrapper;
+                tracedGf.InvalidateCache();
+                continue;
+            }
             // Create wrapper that prints to *trace-output*
             var capturedOriginal = original;
-            var capturedName = name;
             var wrapper = new LispFunction(wrapArgs =>
-            {
-                var traceWriter = GetTraceOutputWriter();
-                // Print entry
-                traceWriter.Write("  Calling ");
-                traceWriter.Write(FormatObject(capturedName, true));
-                traceWriter.Write(" with (");
-                for (int i = 0; i < wrapArgs.Length; i++)
-                {
-                    if (i > 0) traceWriter.Write(" ");
-                    traceWriter.Write(FormatObject(wrapArgs[i], true));
-                }
-                traceWriter.WriteLine(")");
-                traceWriter.Flush();
-                // Call original
-                var result = capturedOriginal.Invoke(wrapArgs);
-                // Print exit
-                traceWriter.Write("  => ");
-                traceWriter.WriteLine(FormatObject(result, true));
-                traceWriter.Flush();
-                return result;
-            }, original.Name, original.Arity);
+                TraceCall(capturedName, wrapArgs, capturedOriginal.Invoke),
+                original.Name, original.Arity);
+            _traceWrapperOriginals.Add(wrapper, original);
             // Replace the function
             if (name is Symbol symN)
             {
@@ -6023,6 +6473,17 @@ public static partial class Runtime
 
     private static void RestoreTracedFunction(string key, LispFunction original, LispObject? tracedName)
     {
+        if (original is GenericFunction tracedGf && _tracedGfDispatch.TryRemove(key, out var installed))
+        {
+            // Put back what the trace replaced, unless something installed a
+            // discriminating function of its own since.
+            if (ReferenceEquals(tracedGf.DispatchFunction, installed.Wrapper))
+            {
+                tracedGf.DispatchFunction = installed.Previous;
+                tracedGf.InvalidateCache();
+            }
+            return;
+        }
         // (setf SYM): restore on the ACTUAL target symbol's SetfFunction (mirror of
         // the package-correct install in Trace), not Startup.Sym(name-string)'s.
         if (tracedName is Cons setfC && setfC.Car is Symbol setfS && setfS.Name == "SETF"
@@ -6245,7 +6706,8 @@ public static partial class Runtime
                     for (int j = formatArgs.Length - 1; j >= consumed; j--)
                         tail = new Cons(formatArgs[j], tail);
                     return tail;
-                });
+                }) { StoredLambdaList = FormatterLambdaList ??= List(Startup.Sym("STREAM"),
+                        Startup.Sym("&REST"), Startup.SymInPkg("ARGS", "DOTCL-INTERNAL")) };
             }));
 
         // VALUES (variadic)
@@ -6444,6 +6906,11 @@ public static partial class Runtime
                             sym.IsNotinlineProclaimed = notinline;
                             sym.IsInlineProclaimed = !notinline;
                         }
+                        else if (SetfNameTarget(c.Car) is Symbol target)
+                        {
+                            target.IsSetfNotinlineProclaimed = notinline;
+                            target.IsSetfInlineProclaimed = !notinline;
+                        }
                         rest = c.Cdr;
                     }
                 }
@@ -6464,6 +6931,20 @@ public static partial class Runtime
                             sym.IsDeclarationName = true;
                         }
                         rest = c.Cdr;
+                    }
+                }
+                else
+                {
+                    // Declarations the compiler keeps tables for (FTYPE, and what
+                    // a compiled DEFUN or DEFSTRUCT leaves in its fasl for later
+                    // compilations) go to the compiler, when one is loaded. Anything it does not know
+                    // is ignored there, as it is here.
+                    var compilerPkg = Package.FindPackage("DOTCL.CIL-COMPILER");
+                    if (compilerPkg != null)
+                    {
+                        var (infoSym, status) = compilerPkg.FindSymbol("%PROCLAIM-COMPILER-INFO");
+                        if (status != SymbolStatus.None && infoSym.Function is LispFunction compilerInfo)
+                            compilerInfo.Invoke(new LispObject[] { decl });
                     }
                 }
                 return Nil.Instance;
@@ -7421,6 +7902,8 @@ public static partial class Runtime
             new LispFunction(Runtime.Trace, "%TRACE", -1));
         Emitter.CilAssembler.RegisterFunction("%UNTRACE",
             new LispFunction(Runtime.Untrace, "%UNTRACE", -1));
+        Emitter.CilAssembler.RegisterFunction("%UNTRACED-FUNCTION",
+            new LispFunction(args => Runtime.UntracedFunction(args[0]), "%UNTRACED-FUNCTION", 1));
         Emitter.CilAssembler.RegisterFunction("ED",
             new LispFunction(Runtime.Ed, "ED", -1));
         Emitter.CilAssembler.RegisterFunction("DRIBBLE",
@@ -7530,6 +8013,45 @@ public static partial class Runtime
         finally { if (home != null) DynamicBindings.Pop(pkgSym); }
     }
 
+    /// <summary>The lambda list recorded for the code an anonymous function runs:
+    /// an in-memory closure site's, or the one a FASL put on the method. Kept on
+    /// FN once found, so the metadata is read once per function.</summary>
+    private static LispObject? SiteLambdaList(LispFunction fn, Delegate body)
+    {
+#if DOTCL_EMIT
+        var ll = Emitter.CilAssembler.ClosureSiteLambdaList(body);
+#else
+        LispObject? ll = null;
+#endif
+        if (ll == null)
+        {
+            LispLambdaListAttribute? attr = null;
+            try
+            {
+                var found = body.Method.GetCustomAttributes(typeof(LispLambdaListAttribute), false);
+                if (found.Length > 0) attr = (LispLambdaListAttribute)found[0];
+            }
+            catch { }
+            if (attr == null) return null;
+            var home = attr.Package != null ? Package.FindPackage(attr.Package) : null;
+            var pkgSym = Startup.Sym("*PACKAGE*");
+            if (home != null) DynamicBindings.Push(pkgSym, home);
+            try
+            {
+                ll = UnwrapMv(ReadFromString(new LispObject[] { new LispString(attr.Text) }));
+                if (home != null) ll = ReinternLambdaListNames(ll, home);
+            }
+            catch { return null; }
+            finally { if (home != null) DynamicBindings.Pop(pkgSym); }
+        }
+        fn.StoredLambdaList = ll;
+        return ll;
+    }
+
+    // What a FORMATTER function takes, as its CLHS entry describes it: a stream and
+    // the format arguments.
+    private static LispObject? FormatterLambdaList;
+
     /// <summary>The symbol (or (SETF symbol)) a named function was defined
     /// under, found by looking for the symbol whose function cell holds FN: the
     /// current package first, then every package. A LispFunction keeps only the
@@ -7616,6 +8138,7 @@ public static partial class Runtime
         {
             target = accessor.SetfFunction ?? (LispObject)Nil.Instance;
         }
+        target = UntracedFunction(target);
         LispObject? ll = null;
         if (target is GenericFunction gf)
         {
@@ -7635,6 +8158,9 @@ public static partial class Runtime
             // An interpreted closure carries (params env specials k); PARAMS is
             // the lambda list the user wrote.
             if (ll == null && lf.InterpInfo is Cons info) ll = info.Car;
+            // An anonymous function keeps its lambda list with its compiled body
+            // rather than on itself (see LispLambdaListAttribute).
+            if (ll == null && lf.BodyDelegate is { } body) ll = SiteLambdaList(lf, body);
         }
         if (ll == null)
         {

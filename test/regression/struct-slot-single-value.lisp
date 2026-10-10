@@ -20,7 +20,7 @@
 
 (setf dotcl:*save-sil* t)
 
-(defun %svv-sil (fn) (princ-to-string (dotcl:function-sil fn)))
+(defun %svv-sil (fn) (%flat-text (dotcl:function-sil fn)))
 
 (defun %svv-count (needle s)
   (let ((k 0) (p 0))

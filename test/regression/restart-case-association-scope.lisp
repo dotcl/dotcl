@@ -25,10 +25,10 @@
   t)
 
 ;; 100,000 signals do not leave 100,000 conditions behind (about 80 MB before).
-;; Not on the emit-free build: there the interpreter expands RESTART-CASE afresh
-;; on every call, and a separate leak (a fresh lambda list per expansion) keeps
-;; memory of its own.
-(deftest-emitting-only restart-case-association-scope.no-leak
+;; On the emit-free build the interpreter expands RESTART-CASE afresh on every
+;; call, so this also covers the lambda lists each expansion makes: they must not
+;; stay behind either (about 50 MB before).
+(deftest restart-case-association-scope.no-leak
   (handler-bind ((rcas-signal (lambda (c) (declare (ignore c)) nil)))
     (dotimes (i 2000) (%rcas-parse-like))
     (let ((before (%rcas-heap)))

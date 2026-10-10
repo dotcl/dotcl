@@ -17,7 +17,7 @@
 ;;; as a single netstandard2.0 assembly and references no Reflection.Emit, so the
 ;;; decompiler itself is emit-free/AOT-safe. Two deployment notes for a locked-down
 ;;; emit-free host (IL2CPP / NativeAOT / iOS), where this contrib otherwise works:
-;;;   - `(require "dotcl-nuget")` can't run there (no SDK to shell `dotnet build` out to),
+;;;   - `(require "dotnet-nuget")` can't run there (no SDK to shell `dotnet build` out to),
 ;;;     so bundle ICSharpCode.Decompiler.dll alongside the runtime and let `ensure`
 ;;;     load it by name instead of resolving it at run time.
 ;;;   - precompile this file to a fasl ahead of time; an emit-free host can't
@@ -27,7 +27,7 @@
 
 ;; Load nuget before any `nuget:` symbol below is read (forms are read+evaluated
 ;; one at a time, so this must precede the defuns that reference the package).
-(require "dotcl-nuget")
+(require "dotnet-nuget")
 
 (defpackage :decompiler
   (:use :cl)

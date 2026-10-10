@@ -82,8 +82,10 @@ jobs:
     #
     # Since 2026-09-29 the push set is about 12 min and the full run (below) is
     # the old nightly with nothing taken out, ~65-70 min. The ceiling is set by
-    # the full run, so it stays at 90.
-    timeout-minutes: 90
+    # the full run. It was 90; the full run has grown past that as the
+    # compiler does more work (the compiled regression suite went from about
+    # 12 to 16 min), so it is 120 until the suite is brought back down.
+    timeout-minutes: 120
     # RUN_FULL selects the full run: the scheduled run, a run started by hand,
     # and a push to the public mirror (which moves only at releases, so a push
     # there IS the release gate). A push or pull request run is the push set:
@@ -197,6 +199,19 @@ jobs:
 
       - name: Compile asdf FASL (required by some regression tests)
         run: make compile-asdf-fasl
+
+      # contrib/dotnet-cs/lib/ (Roslyn and the helper DLL) for the inline-cs
+      # regression tests. Without it they skip, which looked like a pass; in the
+      # full run (DOTCL_CI=1, tier full) a missing lib/ now fails the suite
+      # instead (test/regression/inline-cs-short-opcodes.lisp). Full run only:
+      # it builds the runtime in Release for net10.0, which nothing else in the
+      # job has done by this point. Roslyn comes from the NuGet cache, which the
+      # pack step below has kept warm on a runner that keeps its home directory.
+      # ~10s on an M1 from a clean tree with a warm cache; about 1 min expected
+      # here, going by the Build step.
+      - name: Build contrib/dotnet-cs (full run; inline-cs regression tests)
+        if: env.RUN_FULL == 'true'
+        run: make contrib-dotnet-cs
 
       # DOTCL_REGRESSION_TIER (job env above) leaves the pack / build and piped
       # REPL files out of this and the next step on a push; the full run loads
@@ -395,7 +410,26 @@ jobs:
         if: env.RUN_FULL == 'true'
         run: make test-pack-nuspec
 
-      # Cleanup is its own step so it also runs when the two above fail: `out/`
+      # A library packed with `dotcl pack --library` onto a local feed and loaded
+      # by another project through (:nuget ...), using the dotcl tool installed
+      # from the packages above, as a user has it. It fails, rather than skips,
+      # without them (DOTCL_CI=1), and checks the consumer compiled only its own
+      # file: the library's fasls came from the package. No network. ~5s on an
+      # M1 with the tool install, so ~10s here.
+      - name: Library package end to end (full run; dotcl = the packages above)
+        if: env.RUN_FULL == 'true'
+        run: make test-pack-library-e2e
+
+      # The same library packed by the previous released dotcl (installed from
+      # nuget.org, PREVIOUS_DOTCL_VERSION in the Makefile) and loaded by the tool
+      # above: the old fasls have to be used as they are and run, after one
+      # warning line per package. Catches a runtime change that breaks fasls
+      # already published. ~7s on an M1 including the download, so ~20s here.
+      - name: Library package from the previous release (full run)
+        if: env.RUN_FULL == 'true'
+        run: make test-pack-library-previous
+
+      # Cleanup is its own step so it also runs when the steps above fail: `out/`
       # and the staged runtime/contrib are hundreds of MB on a runner that keeps
       # its disk between runs.
       - name: Clean up pack artifacts
@@ -501,8 +535,8 @@ jobs:
       # baseline file wants. That is how a new runner gets its first numbers:
       # read them out of this step's log and commit them.
       #
-      # When nothing at all had a baseline, check-ratios.sh says UNJUDGED and
-      # exits 3 rather than ok. All 9 linux-x64 measurements (8 parity kernels
+      # When any measurement it took had no baseline, check-ratios.sh says
+      # UNJUDGED and exits 3 rather than ok. All 9 linux-x64 measurements (8 parity kernels
       # plus the cl-bench median) now have a baseline in
       # bench/ratio-baseline.json, so this gate judges every measurement it
       # produces and CHECK_RATIOS_ALLOW_UNJUDGED is not needed here. If a new

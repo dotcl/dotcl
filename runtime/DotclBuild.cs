@@ -130,8 +130,9 @@ public static class DotclBuild
     /// Walk an ASDF system's <c>:depends-on</c> graph (dependency-first) and
     /// emit one fasl path per line in load order, excluding the root system.
     /// Output goes to <paramref name="manifestOut"/> (or stdout when null).
-    /// Dep systems without a pre-built <c>&lt;name&gt;.fasl</c> are compiled on
-    /// the fly via concatenate-source-op. When <paramref name="rootSourcesOut"/>
+    /// A dep system whose <c>&lt;name&gt;.fasl</c> is missing or older than its
+    /// .asd, its files or the fasls of its own dependencies is compiled on the
+    /// fly. When <paramref name="rootSourcesOut"/>
     /// is non-null, also writes the root system's component source paths in
     /// declared order (used by MSBuild as Inputs). <paramref name="targetRid"/>,
     /// when given, prefers <c>&lt;name&gt;.fasl.r2r-&lt;rid&gt;</c> if present.
@@ -306,11 +307,14 @@ public static class DotclBuild
         string DepFaslForm(string nameExpr) => depCacheLisp == null
             ? $"(concatenate 'string dir {nameExpr} \".fasl\")"
             : $"(concatenate 'string \"{depCacheLisp}\" {nameExpr} \".fasl\")";
-        // For each dep system, if its fasl exists, use it. Otherwise
-        // concatenate-source-op + compile-file the dep's :components into the dep
-        // fasl on the fly. Empty :components (marker systems) are skipped silently.
+        // The Lisp side walks the :depends-on graph and describes each dependency;
+        // deciding what to build, building it and writing the manifest happen
+        // below. One entry per dependency, dependencies first:
+        //   (name has-children fasl r2r-fasl (input-file ...) (dep-name ...))
+        // INPUT-FILEs are the system's .asd and every file component; DEP-NAMEs
+        // are its direct dependencies (the ones that apply here).
         var form = $@"
-(let* ((seen '()) (order '()))
+(let* ((seen '()) (order '()) (direct (make-hash-table :test 'eq)))
   (labels ((walk (sys)
              (unless (member sys seen :test #'eq)
                (push sys seen)
@@ -332,49 +336,209 @@ public static class DotclBuild
                              (error (e)
                                (error ""resolve-deps: ~a depends on ~s, which cannot be found: ~a""
                                       (asdf:component-name sys) d e)))))
-                   (when ds (walk ds))))
+                   (when ds
+                     (push (asdf:component-name ds) (gethash sys direct))
+                     (walk ds))))
                (push sys order)))
-           (ensure-fasl (sys)
+           (describe-dep (sys)
+             ;; A system with nothing to compile is described by name only, and
+             ;; by the module to REQUIRE when it stands for one: the contrib
+             ;; stubs (REQUIRE-SYSTEM) name their module, and ASDF and UIOP,
+             ;; which the build image already has, are both the ""asdf"" module.
+             (unless (asdf:component-children sys)
+               (return-from describe-dep
+                 (list (asdf:component-name sys) nil nil nil nil
+                       (reverse (gethash sys direct))
+                       (cond ((typep sys 'asdf/operate:require-system)
+                              (string (or (asdf/operate::required-module sys)
+                                          (asdf:component-name sys))))
+                             ((member (asdf:component-name sys) '(""asdf"" ""uiop"")
+                                      :test #'string-equal)
+                              ""asdf"")))))
              (let* ((src  (asdf:component-pathname sys))
                     (dir  (directory-namestring src))
                     (name (asdf:component-name sys))
-                    (r2r-fasl {(targetRid == null
+                    (asd  (asdf:system-source-file sys)))
+               (list name t
+                     {DepFaslForm("name")}
+                     {(targetRid == null
                         ? "nil"
-                        : $"(concatenate 'string dir name \".fasl.r2r-\" \"{targetRid}\")")})
-                    (fasl {DepFaslForm("name")}))
-               (when (and r2r-fasl (probe-file r2r-fasl))
-                 (return-from ensure-fasl r2r-fasl))
-               (unless (probe-file fasl)
-                 (when (asdf:component-children sys)
-                   (format {progressStream}
-                           ""[resolve-deps] compiling ~A...~%"" name)
-                   (asdf:operate 'asdf::concatenate-source-op sys)
-                   (let ((concat (first
-                                  (asdf:output-files
-                                   (asdf:make-operation 'asdf::concatenate-source-op)
-                                   sys))))
-                     ;; same concat compile-time-eval as CompileProject,
-                     ;; for dependency systems built on the fly.
-                     (dotcl.cil-compiler:compile-file-concatenated concat fasl))))
-               fasl)))
+                        : $"(concatenate 'string dir name \".fasl.r2r-\" \"{targetRid}\")")}
+                     (append (when asd (list (namestring asd)))
+                             (loop for c in (asdf:required-components sys :other-systems nil)
+                                   when (typep c 'asdf:source-file)
+                                     collect (namestring (asdf:component-pathname c))))
+                     (reverse (gethash sys direct))
+                     (mapcar (lambda (c) (namestring (asdf:component-pathname c)))
+                             (%system-source-files sys))))))
     (asdf:load-asd ""{asdLisp}"")
     (let* ((root (%root-system-of ""{asdLisp}""))
            (deps (remove root (nreverse (progn (walk root) order)))))
-      (let ((stream {manifestForm}))
-        (unwind-protect
-          (dolist (sys deps)
-            (when (asdf:component-children sys)
-              (let ((fasl (ensure-fasl sys)))
-                (format stream ""~A~%"" fasl))))
-          (when {(manifestOut == null ? "nil" : "t")} (close stream))))
       (let ((rstream {rootSourcesForm}))
         (when rstream
           (unwind-protect
             (dolist (c (%system-source-files root))
               (format rstream ""~A~%"" (namestring (asdf:component-pathname c))))
-            (close rstream)))))))";
-        Runtime.Eval(MultipleValues.Primary(
+            (close rstream))))
+      (mapcar #'describe-dep deps))))";
+        var plan = Runtime.Eval(MultipleValues.Primary(
             Runtime.ReadFromString(new LispObject[] { new LispString(form) })));
+
+        var progress = manifestOut == null
+            ? Runtime.GetOutputWriter(DynamicBindings.Get(Startup.Sym("*ERROR-OUTPUT*")))
+            : Runtime.GetStandardOutputWriter();
+        var lines = new List<string>();
+        // The fasl each dependency resolved to, so a dependent can compare itself
+        // against the fasls it was compiled against.
+        var faslOf = new Dictionary<string, string>(StringComparer.Ordinal);
+        // The dependency fasls so far, in order.
+        var built = new List<string>();
+        for (LispObject cur = plan; cur is Cons c; cur = c.Cdr)
+        {
+            var e = ListToArray(c.Car);
+            var name = ((LispString)e[0]).Value;
+            bool hasChildren = e[1] is not Nil;
+            if (!hasChildren)
+            {
+                // A module to REQUIRE (a contrib stub, or ASDF): load it now, so
+                // the dependencies compiled after it can read its packages, and
+                // say so in the manifest, so the application loads it before the
+                // fasls that need it. Its code is the contrib's own fasl, which
+                // ships beside the application, so there is nothing to copy.
+                if (e.Length > 6 && e[6] is LispString module)
+                {
+                    EvalLisp($"(require {LispStringLiteral(module.Value)})");
+                    var line = RequireLinePrefix + module.Value;
+                    if (!lines.Contains(line)) lines.Add(line);
+                }
+                continue;
+            }
+            var fasl = ((LispString)e[2]).Value;
+            var r2r = e[3] is LispString r ? r.Value : null;
+            var inputs = ListToStringArray(e[4]);
+            var depNames = ListToStringArray(e[5]);
+
+            if (r2r != null && System.IO.File.Exists(r2r))
+            {
+                faslOf[name] = r2r;
+                built.Add(r2r);
+                lines.Add(r2r);
+                continue;
+            }
+            var depFasls = depNames.Where(faslOf.ContainsKey).Select(d => faslOf[d]);
+            if (FaslIsStale(fasl, inputs.Concat(depFasls)))
+            {
+                // What this system is compiled against has to be loaded first:
+                // the fasls of the dependencies before it that were up to date
+                // and so have not been loaded into this image.
+                foreach (var f in built) EnsureDepFaslLoaded(f);
+                progress.WriteLine($"[resolve-deps] compiling {name}...");
+                progress.Flush();
+                Runtime.BuildDependencyFasl(fasl, ListToStringArray(e[6]));
+                NoteDepFaslLoaded(fasl);
+            }
+            faslOf[name] = fasl;
+            built.Add(fasl);
+            lines.Add(fasl);
+        }
+
+        if (manifestOut == null)
+        {
+            var w = Runtime.GetStandardOutputWriter();
+            foreach (var l in lines) w.WriteLine(l);
+            w.Flush();
+        }
+        else
+        {
+            WriteIfChanged(manifestOut, lines);
+        }
+    }
+
+    /// <summary>
+    /// Dependency fasls whose code is in this image, with the write time of the
+    /// fasl it came from. Building a dependency loads it (each file is loaded
+    /// before the next is compiled), and the project compile that follows in the
+    /// same process (the MSBuild tasks run in one) then loads the dependency
+    /// fasls again; a second load of the same code is not harmless
+    /// (DEFCONSTANT of a fresh list, a DEFPACKAGE that has since been extended).
+    /// A fasl rewritten since is not counted as loaded.
+    /// </summary>
+    private static readonly Dictionary<string, DateTime> _loadedDepFasls =
+        new(StringComparer.Ordinal);
+
+    private static void NoteDepFaslLoaded(string fasl)
+    {
+        var full = System.IO.Path.GetFullPath(fasl);
+        lock (_loadedDepFasls)
+            _loadedDepFasls[full] = System.IO.File.GetLastWriteTimeUtc(full);
+    }
+
+    private static bool DepFaslLoaded(string fasl)
+    {
+        var full = System.IO.Path.GetFullPath(fasl);
+        lock (_loadedDepFasls)
+            return _loadedDepFasls.TryGetValue(full, out var t)
+                && System.IO.File.Exists(full)
+                && System.IO.File.GetLastWriteTimeUtc(full) == t;
+    }
+
+    private static void EnsureDepFaslLoaded(string fasl)
+    {
+        if (DepFaslLoaded(fasl)) return;
+        Runtime.Load(new LispObject[] { new LispString(fasl.Replace("\\", "/")) });
+        NoteDepFaslLoaded(fasl);
+    }
+
+    /// <summary>
+    /// A manifest line that starts with this names a module to REQUIRE rather
+    /// than a fasl to load: <c>require dotcl-socket</c>. See
+    /// <see cref="DotclHost.LoadFromManifest"/>.
+    /// </summary>
+    internal const string RequireLinePrefix = "require ";
+
+    /// <summary>
+    /// True when <paramref name="fasl"/> has to be built: it is missing, or one of
+    /// <paramref name="inputs"/> (the system's .asd and files, and the fasls of
+    /// the systems it depends on) was written after it. Only the presence of the
+    /// fasl used to count, so a dependency whose source changed went on shipping
+    /// the fasl of the first build until someone deleted it by hand. Comparing
+    /// against the dependencies' fasls carries a rebuild down the graph, as ASDF
+    /// does: a dependent may have expanded a macro that has just changed.
+    /// </summary>
+    private static bool FaslIsStale(string fasl, IEnumerable<string> inputs)
+    {
+        if (!System.IO.File.Exists(fasl)) return true;
+        var built = System.IO.File.GetLastWriteTimeUtc(fasl);
+        foreach (var p in inputs)
+            if (System.IO.File.Exists(p) && System.IO.File.GetLastWriteTimeUtc(p) > built)
+                return true;
+        return false;
+    }
+
+    /// <summary>
+    /// Write LINES to PATH unless it already holds exactly them. The build runs
+    /// resolve-deps on every build and lets it decide what is out of date, so
+    /// the manifest is regenerated each time; leaving an unchanged one alone
+    /// keeps its timestamp, and with it every MSBuild target that lists it as
+    /// an input up to date.
+    /// </summary>
+    private static void WriteIfChanged(string path, List<string> lines)
+    {
+        var text = string.Concat(lines.Select(l => l + "\n"));
+        if (System.IO.File.Exists(path) && System.IO.File.ReadAllText(path) == text) return;
+        System.IO.File.WriteAllText(path, text);
+    }
+
+    /// <summary>A Lisp string literal for S.</summary>
+    private static string LispStringLiteral(string s)
+        => "\"" + s.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\"";
+
+    /// <summary>The elements of a proper Lisp list.</summary>
+    private static LispObject[] ListToArray(LispObject list)
+    {
+        var result = new List<LispObject>();
+        for (var cur = list; cur is Cons c; cur = c.Cdr) result.Add(c.Car);
+        return result.ToArray();
     }
 
     /// <summary>
@@ -445,6 +609,7 @@ public static class DotclBuild
 (progn
   (asdf:load-asd ""{asdLisp}"")
   (let* ((root (%root-system-of ""{asdLisp}""))
+         (dep-fasls nil)
          ;; Only the children that have a source to contribute. A component can
          ;; legitimately have none -- (:nuget ...) declares a NuGet package, not a
          ;; file -- and its COMPONENT-PATHNAME is then the system's own directory,
@@ -453,10 +618,10 @@ public static class DotclBuild
          (sources (mapcar #'asdf:component-pathname (%system-source-files root)))
          ;; What those file-less components asked for, turned back into source:
          ;; the concatenated unit is not loaded through ASDF, so nothing else
-         ;; would ever perform them (see DOTCL-NUGET-ASDF). Written as a file of
+         ;; would ever perform them (see ASDF-NUGET). Written as a file of
          ;; its own and put first, rather than prepended to the concatenation, so
          ;; that the concat-line -> source-line map stays exact.
-         (nuget-asdf (find-package ""DOTCL-NUGET-ASDF""))
+         (nuget-asdf (find-package ""ASDF-NUGET""))
          (preamble (when nuget-asdf
                      (funcall (find-symbol ""SYSTEM-NUGET-PREAMBLE"" nuget-asdf) root))))
     (when preamble
@@ -498,6 +663,13 @@ public static class DotclBuild
                        (when ds (walk ds))))
                    (push sys order))))
         (walk root))
+      ;; A dependency with nothing to compile that stands for a module (a
+      ;; contrib stub) is REQUIREd: there is no fasl of it in deps/, and the
+      ;; dependencies and the root may read its packages.
+      (dolist (sys (remove root order))
+        (when (and (null (asdf:component-children sys))
+                   (typep sys 'asdf/operate:require-system))
+          (require (string (or (asdf/operate::required-module sys) (asdf:component-name sys))))))
       (let* ((deps (remove-if-not #'asdf:component-children
                                   (remove root (nreverse order))))
              (fasls (mapcar (lambda (sys)
@@ -506,16 +678,20 @@ public static class DotclBuild
                                             (asdf:component-name sys) "".fasl"")))
                             deps)))
         (if (every #'identity fasls)
-            (mapc #'load fasls)
+            ;; Loaded by the caller, which skips a fasl whose code a
+            ;; resolve-deps in this process has already loaded.
+            (setf dep-fasls (mapcar #'namestring fasls))
             (progn
               (format *error-output*
                       ""[build] loading ~d dependenc~:@p through ASDF~%"" (length deps))
               (dolist (sys deps) (asdf:load-system sys))))))
     (asdf::concatenate-files sources ""{concatLisp}"")
-    (mapcar #'namestring sources)))";
+    (cons dep-fasls (mapcar #'namestring sources))))";
         var sourcesResult = Runtime.Eval(MultipleValues.Primary(
             Runtime.ReadFromString(new LispObject[] { new LispString(setupForm) })));
-        var sourcePaths = ListToStringArray(sourcesResult);
+        foreach (var f in ListToStringArray(((Cons)sourcesResult).Car))
+            EnsureDepFaslLoaded(f);
+        var sourcePaths = ListToStringArray(((Cons)sourcesResult).Cdr);
         var lineMap = BuildConcatLineMap(sourcePaths);
 
         // Progress trace (dotcl/dotcl#48 point 2): which files this build compiles,
@@ -723,7 +899,7 @@ public static class DotclBuild
         // A (:nuget ...) component is not a file, and the walk gathers files, so
         // the declaration would be dropped here -- in the one direction that
         // matters, since the artifact this builds is what runs where there is no
-        // .NET SDK. DOTCL-NUGET-ASDF turns the declarations back into source,
+        // .NET SDK. ASDF-NUGET turns the declarations back into source,
         // which goes in front of the system's own code so the packages are
         // registered before anything names a type from them. The package exists
         // only when the .asd asked for it (:defsystem-depends-on), which
@@ -731,7 +907,7 @@ public static class DotclBuild
         var setupForm = $@"
 (progn
   (let* ((sys (asdf:find-system ""{sysEsc}""))
-         (nuget-asdf (find-package ""DOTCL-NUGET-ASDF""))
+         (nuget-asdf (find-package ""ASDF-NUGET""))
          (preamble (when nuget-asdf
                      (funcall (find-symbol ""SYSTEM-NUGET-PREAMBLE"" nuget-asdf) sys))))
     (when (and (stringp preamble) (plusp (length preamble)))

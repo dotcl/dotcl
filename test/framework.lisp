@@ -4,6 +4,13 @@
 ;;;   test/regression/run.lisp   (make test-regression)
 ;;;   test/mop-protocol.lisp     (make test-mop)
 
+;;; The printed text of OBJECT on one line, for tests that search it for a
+;;; sequence of tokens (the SIL of a function, say). Under *PRINT-PRETTY* a
+;;; long list is broken at the right margin, and a line break can fall between
+;;; any two tokens.
+(defun %flat-text (object)
+  (let ((*print-pretty* nil)) (princ-to-string object)))
+
 (defvar *test-count* 0)
 (defvar *pass-count* 0)
 (defvar *fail-count* 0)

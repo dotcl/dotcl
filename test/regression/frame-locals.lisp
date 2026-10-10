@@ -231,7 +231,8 @@
     (get-output-stream-string s)))
 (defun fl-printed (a)
   (let ((w (list a)))
-    (fl-print-probe)))
+    ;; Not a tail call, which would hand this frame to the probe.
+    (values (fl-print-probe))))
 (setf dotcl:*emit-frame-locals* nil)
 
 (deftest-compiled-only frame-locals-print-frame-locals

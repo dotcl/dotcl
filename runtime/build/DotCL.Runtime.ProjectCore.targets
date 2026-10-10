@@ -63,9 +63,11 @@
   <Target Name="_DotCLResolveDeps"
           DependsOnTargets="ResolveReferences"
           BeforeTargets="GetCopyToOutputDirectoryItems;_CollectAssetPackFiles;_GenerateAndroidAssetsDir;_CollectMauiAssetsTargetFramework;BeforeBuild"
-          Condition="'$(DotclProjectAsd)' != ''"
-          Inputs="$(DotclProjectAsd);@(DotclBuildInit);@(DotclAsdSearchPath)"
-          Outputs="$(DotclSourceManifest);$(DotclRootSourcesList)">
+          Condition="'$(DotclProjectAsd)' != ''">
+    <!-- No Inputs/Outputs: runs on every build. Whether a dependency's fasl is
+         out of date depends on that dependency's own sources, which only the
+         task knows, so the task decides per dependency and leaves the manifest
+         untouched when nothing changed. -->
     <MakeDir Directories="$(DotclBundleDir)" />
     <DotclResolveDeps Asd="$(DotclProjectAsd)"
                       BaseCore="$(DotclBaseCore)"
@@ -84,8 +86,16 @@
           BeforeTargets="GetCopyToOutputDirectoryItems;_CollectAssetPackFiles;_GenerateAndroidAssetsDir;_CollectMauiAssetsTargetFramework;BeforeBuild"
           Condition="'$(DotclProjectAsd)' != '' and Exists('$(DotclSourceManifest)')">
     <ReadLinesFromFile File="$(DotclSourceManifest)">
-      <Output TaskParameter="Lines" ItemName="_DotclDepFasl" />
+      <Output TaskParameter="Lines" ItemName="_DotclDepLine" />
     </ReadLinesFromFile>
+    <!-- A line is a dependency fasl, or "require <module>" for a contrib the
+         fasls after it need (shipped in the contrib tree, nothing to copy).
+         The fasls alone are what gets copied and what the root compile
+         depends on; the manifest keeps every line, in order. -->
+    <ItemGroup>
+      <_DotclDepFasl Include="@(_DotclDepLine)"
+                     Condition="!$([System.String]::Copy('%(Identity)').StartsWith('require '))" />
+    </ItemGroup>
     <ReadLinesFromFile File="$(DotclRootSourcesList)" Condition="Exists('$(DotclRootSourcesList)')">
       <Output TaskParameter="Lines" ItemName="_DotclRootSource" />
     </ReadLinesFromFile>
@@ -102,12 +112,17 @@
   </Target>
 
   <!-- Step 4: compile the root system's components into one fasl. Inputs are
-       the .lisp sources + the .asd, so MSBuild owns the incremental decision. -->
+       the .lisp sources + the .asd, and the dependency fasls the root is
+       compiled against (a macro of theirs may have changed), so MSBuild owns
+       the incremental decision. The project file stands in for the
+       DotclAsdSearchPath items: those are directories, which MSBuild reports
+       as missing input files and so reran this target on every build. What a
+       search path resolves to already arrives as the dependency fasls. -->
   <Target Name="_DotCLCompileRoot"
           DependsOnTargets="_DotCLLoadItems;ResolveReferences"
           BeforeTargets="GetCopyToOutputDirectoryItems;_CollectAssetPackFiles;_GenerateAndroidAssetsDir;_CollectMauiAssetsTargetFramework;BeforeBuild"
           Condition="'$(DotclProjectAsd)' != ''"
-          Inputs="@(_DotclRootSource);$(DotclProjectAsd);@(DotclBuildInit);@(DotclAsdSearchPath)"
+          Inputs="@(_DotclRootSource);@(_DotclDepFasl);$(DotclProjectAsd);@(DotclBuildInit);$(MSBuildProjectFullPath)"
           Outputs="$(DotclRootFasl);$(DotclTrimDescriptor)">
     <DotclCompileProject Asd="$(DotclProjectAsd)"
                          Output="$(DotclRootFasl)"
@@ -133,7 +148,7 @@
           SkipUnchangedFiles="true" />
     <ItemGroup>
       <_DotclManifestLine Include="dotcl.core" Condition="'$(DotclBaseCore)' != '' and Exists('$(DotclBaseCore)')" />
-      <_DotclManifestLine Include="%(_DotclDepFasl.Filename)%(_DotclDepFasl.Extension)" />
+      <_DotclManifestLine Include="%(_DotclDepLine.Filename)%(_DotclDepLine.Extension)" />
       <_DotclManifestLine Include="$(MSBuildProjectName).fasl" />
     </ItemGroup>
     <WriteLinesToFile File="$(DotclDeployedManifest)"

@@ -1,6 +1,6 @@
 ;;; driver.lisp: compile lib.lisp to a fasl, load it, and call some of its
-;;; functions. Run under a .NET coverage collector (see check.sh): with
-;;; DOTCL_FASL_LOADFROM=1 the fasl is file-backed, so the collector attributes
+;;; functions. Run under a .NET coverage collector (see check.sh): LOAD reads
+;;; the fasl by path, so it is file-backed and the collector attributes
 ;;; the executed lines to lib.lisp through the PDB's document table.
 (in-package :cl-user)
 

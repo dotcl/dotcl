@@ -15,7 +15,7 @@
 
 (setf dotcl:*save-sil* t)
 
-(defun %sse-sil (fn) (princ-to-string (dotcl:function-sil fn)))
+(defun %sse-sil (fn) (%flat-text (dotcl:function-sil fn)))
 
 (defun %sse-has (needle fn) (and (search needle (%sse-sil fn)) t))
 

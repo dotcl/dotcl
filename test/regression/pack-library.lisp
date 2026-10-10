@@ -1,7 +1,7 @@
 ;;; `dotcl pack --library`: an ASDF system as a NuGet package that another system
 ;;; names in a (:nuget ...) component.
 ;;;
-;;; The packing itself is dotcl-nuget-asdf's (nuget-library-package.lisp checks
+;;; The packing itself is asdf-nuget's (nuget-library-package.lisp checks
 ;;; the package's shape); this checks the command line around it: the options it
 ;;; needs, and the nuspec metadata it fills in the same way the tool path does
 ;;; (:license as a license expression, a README beside the .asd embedded).

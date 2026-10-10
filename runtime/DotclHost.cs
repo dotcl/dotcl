@@ -360,10 +360,11 @@ public static class DotclHost
 
     /// <summary>
     /// Load every FASL listed in <paramref name="manifestPath"/>, in order.
-    /// Each non-blank line is "<name>\t<filename>" (matching the format
-    /// emitted by <c>--resolve-deps --manifest-out</c>); &lt;filename&gt; is
-    /// resolved against the manifest's own directory if relative, used as-is
-    /// if absolute.
+    /// Each non-blank line is "<name>\t<filename>" or a bare filename;
+    /// &lt;filename&gt; is resolved against the manifest's own directory if
+    /// relative, used as-is if absolute. A line "require &lt;module&gt;" REQUIREs
+    /// that module instead: a contrib the following fasls depend on, loaded
+    /// from the contrib tree beside the application.
     ///
     /// Intended for project-core deployments: the build target ships
     /// a manifest plus the listed FASLs into the app's asset directory; the
@@ -394,6 +395,20 @@ public static class DotclHost
         {
             var line = rawLine.Trim();
             if (line.Length == 0) continue;
+            // "require <module>": a module the fasls after it need, REQUIREd
+            // from the contrib tree that ships beside the application (a
+            // contrib with no code of its own beyond that, dotcl-socket and
+            // the like, or ASDF). REQUIRE already skips a provided module.
+            if (line.StartsWith(DotclBuild.RequireLinePrefix, StringComparison.Ordinal))
+            {
+                var module = line[DotclBuild.RequireLinePrefix.Length..].Trim();
+                if (module.Length == 0 || ModuleProvided(modulesSym, module.ToLowerInvariant()))
+                    continue;
+                Runtime.Eval(new Cons(Startup.Sym("REQUIRE"),
+                    new Cons(new LispString(module), Nil.Instance)));
+                count++;
+                continue;
+            }
             // Split on first tab; bare "<filename>" lines are also accepted.
             var tab = line.IndexOf('\t');
             var fileName = tab >= 0 ? line[(tab + 1)..] : line;

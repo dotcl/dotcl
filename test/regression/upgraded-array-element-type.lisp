@@ -29,7 +29,7 @@
 ;;; unboxed backing is chosen by.
 (deftest uaet-integer-range
   (upgraded-array-element-type '(integer 0 100))
-  (unsigned-byte 8))
+  (unsigned-byte 7))
 
 ;;; Exclusive bounds name the same range: (integer 0 (256)) is 0..255.
 (deftest uaet-exclusive-bound
@@ -45,11 +45,11 @@
 (deftest uaet-eql-integer
   (list (upgraded-array-element-type '(eql 1))
         (upgraded-array-element-type '(eql 8)))
-  (bit (unsigned-byte 8)))
+  (bit (unsigned-byte 4)))
 
 (deftest uaet-mod
   (upgraded-array-element-type '(mod 5))
-  (unsigned-byte 8))
+  (unsigned-byte 3))
 
 ;;; Types dotcl does not specialize upgrade to T, and that answer must be a
 ;;; supertype of the argument.
@@ -86,13 +86,14 @@
   nil)
 
 ;;; The specialization is real: stores are checked, and an integer stored into a
-;;; double-float array is coerced. This is why claiming T was wrong.
+;;; double-float array is rejected as well. This is why claiming T was wrong.
 (deftest uaet-specialization-is-real
   (list (handler-case (let ((a (make-array 1 :element-type '(unsigned-byte 8))))
                         (setf (aref a 0) 300)
                         :no-error)
           (type-error () :type-error))
-        (let ((a (make-array 1 :element-type 'double-float)))
-          (setf (aref a 0) 1)
-          (aref a 0)))
-  (:type-error 1.0d0))
+        (handler-case (let ((a (make-array 1 :element-type 'double-float)))
+                        (setf (aref a 0) 1)
+                        :no-error)
+          (type-error () :type-error)))
+  (:type-error :type-error))

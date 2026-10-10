@@ -1251,12 +1251,12 @@ public static partial class Runtime
         // LoadFrom (not Load(bytes)) so transitive references in the same
         // directory resolve automatically. Required for contribs that ship
         // their own lib/ directory with multiple interdependent DLLs (e.g.
-        // dotcl-cs loading Roslyn).
+        // dotnet-cs loading Roslyn).
         var asm = System.Reflection.Assembly.LoadFrom(System.IO.Path.GetFullPath(path));
         return new LispString(asm.FullName ?? path);
     }
 
-    // Registerable resolver tables, populated from Lisp (e.g. the nuget contrib
+    // Registerable resolver tables, populated from Lisp (e.g. the dotnet-nuget contrib
     // that reads project.assets.json after `dotnet restore`). The Default ALC's
     // Resolving / ResolvingUnmanagedDll hooks (Startup.cs) consult these so a managed
     // assembly resolves to the exact version-unified path and a native library resolves
@@ -2439,18 +2439,31 @@ public static partial class Runtime
     // Cache of public static methods marked [Extension] by simple name, scanned
     // lazily across loaded assemblies on first lookup. Fallback-only, so normal
     // instance-method calls pay nothing.
-    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, System.Reflection.MethodInfo[]>
+    // Not readonly: null is the state it is in while Runtime's static initializer
+    // runs (see ClearExtensionMethodCache), and a test puts it back in that state.
+    private static System.Collections.Concurrent.ConcurrentDictionary<string, System.Reflection.MethodInfo[]>?
         _extensionMethodsByName = new();
 
     /// <summary>Drop the extension-method index. Called when an assembly loads: the
     /// index is keyed by name and each entry records what was loaded at the moment
     /// that name was first asked for, so a name probed before its assembly arrived
     /// would otherwise stay empty for the rest of the session -- which is the normal
-    /// order for a nuget:require'd package.</summary>
-    public static void ClearExtensionMethodCache() => _extensionMethodsByName.Clear();
+    /// order for a nuget:require'd package.
+    ///
+    /// Safe to call before Runtime's static initializer has assigned the index: the
+    /// AssemblyLoad handler can run INSIDE that initializer on the same thread
+    /// (resolving the types it references loads assemblies such as
+    /// Microsoft.Win32.Primitives and System.Reflection.Emit.Lightweight, and the
+    /// handler itself is what first touches Runtime). The field is then still null,
+    /// and there is nothing cached to clear.</summary>
+    public static void ClearExtensionMethodCache()
+    {
+        var index = _extensionMethodsByName;
+        if (index is not null) index.Clear();
+    }
 
     private static System.Reflection.MethodInfo[] ExtensionMethodsNamed(string name)
-        => _extensionMethodsByName.GetOrAdd(name, n =>
+        => (_extensionMethodsByName ??= new()).GetOrAdd(name, n =>
         {
             var list = new System.Collections.Generic.List<System.Reflection.MethodInfo>();
             var extAttr = typeof(System.Runtime.CompilerServices.ExtensionAttribute);

@@ -287,18 +287,18 @@ public static class Mop
             args[0] is LispMethod ? Runtime.MethodFunction(args[0]) : Nil.Instance);
 
         // READER-METHOD-CLASS / WRITER-METHOD-CLASS (class slotd &rest initargs) ->
-        // the class of accessor methods. dotcl creates plain standard methods for
-        // accessors, so the metaobject class is STANDARD-METHOD.
-        // Generic, so a metaclass can answer with an accessor method class of its own.
-        // dotcl builds plain standard methods, which is what the default answers.
+        // the class of accessor methods: STANDARD-READER-METHOD and
+        // STANDARD-WRITER-METHOD, the classes DEFCLASS gives its accessor methods
+        // (RegisterAccessorMethod). Generic, so a metaclass can answer with an
+        // accessor method class of its own.
         {
             var classCls0 = (LispClass)Runtime.FindClass(Startup.Sym("CLASS"));
             var anyCls0 = (LispClass)Runtime.FindClass(Startup.Sym("T"));
             RegisterMopGF("READER-METHOD-CLASS", -1, new LispClass[] { classCls0, anyCls0 },
-                args => (LispObject?)Runtime.FindClassOrNil(Startup.Sym("STANDARD-METHOD"))
+                args => (LispObject?)Runtime.FindClassOrNil(Startup.Sym("STANDARD-READER-METHOD"))
                         ?? Nil.Instance);
             RegisterMopGF("WRITER-METHOD-CLASS", -1, new LispClass[] { classCls0, anyCls0 },
-                args => (LispObject?)Runtime.FindClassOrNil(Startup.Sym("STANDARD-METHOD"))
+                args => (LispObject?)Runtime.FindClassOrNil(Startup.Sym("STANDARD-WRITER-METHOD"))
                         ?? Nil.Instance);
         }
 

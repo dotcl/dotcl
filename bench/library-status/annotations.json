@@ -9,13 +9,26 @@
 
   "chanl": "The one failing check is `STUMBLERS` in `DEADLOCK`, and SBCL fails it the same way: it asks `yes-or-no-p`, and a test run with no terminal gets `END-OF-FILE` there instead of an answer.",
 
-  "sdl2": "Not a dotcl failure: after about 340 seconds of compiling, the SDL2 library this host finds is not an image this arm64 machine can load (`ERROR_BAD_EXE_FORMAT`).",
+  "sdl2": "Not a dotcl failure: this host has no SDL2 library, so the loader finds neither the framework nor libSDL2. SBCL 2.6.8 stops at the same place.",
 
-  "hu.dwim.logger": "Loads about two runs in three, and the failure mode follows the ASDF cache state rather than the code, so this row can differ between runs.",
+  "hunchentoot": "The failing checks are uploaded files coming back larger than they were sent: rfc2388, which parses the upload, writes the file as `latin-1` only on the implementations it lists and in the default external format (UTF-8) elsewhere, so every byte above 127 is written as two. With a fork of rfc2388 that adds dotcl to that list, the suite passes.",
 
-  "reblocks": "Now stops in `moptilities`: its `slot-names` calls `get-structure` on every implementation except SBCL, and `get-structure` has no branch for dotcl, so it signals `not yet implemented`.",
+  "spatial-trees": "The result varies from run to run: the suites build their trees from `random` rectangles and points, and of four runs with the same dotcl and dists, one failed 3 of 18 checks and three passed all of theirs (the run shown is one of these).",
 
-  "reblocks-parenscript": "Fails while loading `reblocks`, for the reason given on that row.",
+  "hu.dwim.logger": "Stops in its dependency hu.dwim.util, for hu.dwim.util's reason.",
 
-  "april": "The Quicklisp dist's april release ships cape/cape.asd in its tarball but does not index it, so `(ql:quickload \"april\")` fails with `System \"cape\" not found` on SBCL as well. Loaded from the unpacked release tree instead, `(april (test))` passes 1140 of 1140 here."
+  "april": "The Quicklisp dist's april release ships cape/cape.asd in its tarball but does not index it, so `(ql:quickload \"april\")` fails with `System \"cape\" not found` on SBCL as well. Loaded from the unpacked release tree instead, `(april (test))` passes 1140 of 1140 here.",
+
+  "hu.dwim.util": "`source/place.lisp` warns at read time (`#.(warn ...)`) that `symbol-global-value` has no implementation outside SBCL, and dotcl stops an ASDF build when a file's compilation reports failure, as SBCL does.",
+
+  "hu.dwim.walker": "Stops in its dependency hu.dwim.util, for hu.dwim.util's reason.",
+
+  "hu.dwim.serializer": "Stops in its dependency hu.dwim.util, for hu.dwim.util's reason.",
+
+
+  "clx": "`dependent.lisp` warns at compile time that `buffer-input-wait-default` falls back to polling on an implementation it has no code for; dotcl stops an ASDF build when a file's compilation reports failure, as SBCL does.",
+
+  "magicl": "`with-array-pointers` signals an error while expanding on an implementation it does not know, so the BLAS bindings of `magicl/ext-blas` fail to compile (and would signal it when called); dotcl stops an ASDF build when a file's compilation reports failure, as SBCL does.",
+
+  "coalton": "The released Coalton implements its hashing only for SBCL, Allegro and CCL and stops with `#.(error ...)` elsewhere, so it does not load. The dotcl fork loads in about 90 seconds, but building its test system takes about 1,100 seconds on dotcl (SBCL 2.6.8 on the same machine: about 130), over half of it in `tests/seq-tests.lisp` (650 seconds; SBCL: 63), so the test run hits the 900-second bound before any test runs."
 }

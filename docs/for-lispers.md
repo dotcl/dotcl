@@ -31,6 +31,38 @@ the dotcl dist; several widely used ones (cffi among them) are in the second
 group. [Using libraries](libraries.md) covers ASDF, Quicklisp, the dotcl dist and
 NuGet; [Library status](library-status.md) is the measured list.
 
+## Extensions
+
+What dotcl adds to the standard lives in a few packages and in modules that
+`require` loads. [Extensions](extensions.md) lists all of it, one line each,
+with a link to the page that explains it. In brief:
+
+- **.NET**: the `dotnet` package calls .NET objects, types, delegates and
+  tasks, and native libraries; `dotnet:define-class` (module `dotnet-class`)
+  emits a .NET class. See [Calling .NET from Lisp](dotnet-package.md).
+- **The runtime**: the `dotcl` package has threads and atomics, external
+  processes, environment variables, weak pointers and finalizers, package-local
+  nicknames and package locks, backtraces and cross references, and
+  `save-application`.
+- **Protocols other implementations also have**: the metaobject protocol in
+  `dotcl-mop`, Gray streams in `dotcl-gray`, the CLtL2 environment functions in
+  `dotcl-cltl2`. The portable libraries over these and over the `dotcl`
+  package (closer-mop, trivial-gray-streams, bordeaux-threads,
+  trivial-garbage) load, some from patched releases in the dotcl dist; see
+  [Library status](library-status.md).
+- **Modules**: NuGet resolution (`dotnet-nuget`), sockets, C# compiled with
+  Roslyn and spliced into a Lisp function (`dotnet-cs`), advice on .NET
+  methods, a heap walker and a decompiler.
+
+```lisp
+(dotcl:script-arguments)                ; => ("a" "b") under `dotcl script.lisp a b`
+(dotcl:thread-join (dotcl:make-thread (lambda () (+ 1 2))))   ; => 3
+(require "dotnet-cs")
+(defun add (a b)
+  (dotnet-cs:inline-cs ((x long a) (y long b)) :returns long :body "return x + y;"))
+(add 1 2)                               ; => 3
+```
+
 ## The REPL, scripts and editors
 
 - [The REPL](repl.md): `dotcl repl`, the line editor, completion (including
@@ -77,7 +109,7 @@ and their transitive dependencies at run time:
 ```lisp
 ;;;; hello-gui.lisp: run with:  dotcl --load hello-gui.lisp
 (require "dotnet-class")                         ; dotnet:define-class (ships with dotcl)
-(require "dotcl-nuget")                          ; NuGet resolver (ships with dotcl)
+(require "dotnet-nuget")                         ; NuGet resolver (ships with dotcl)
 (nuget:require "Avalonia.Desktop" :version "12.0.4")
 (nuget:require "Avalonia.Themes.Fluent" :version "12.0.4")
 (dotnet:load-assembly "Avalonia.Desktop")

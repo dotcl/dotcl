@@ -31,8 +31,9 @@
   (throw 'rred-out :hooked))
 
 (defun rred-inner (x) (car x))
-(defun rred-middle (x) (rred-inner x))
-(defun rred-outer (x) (rred-middle x))
+;; (VALUES (f)) is not a tail call, so each caller keeps its frame.
+(defun rred-middle (x) (values (rred-inner x)))
+(defun rred-outer (x) (values (rred-middle x)))
 
 ;;; DEFTEST's own HANDLER-CASE would take the error before the debugger could,
 ;;; which is the point of the second test but not of the others.

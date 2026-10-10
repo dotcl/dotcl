@@ -391,6 +391,27 @@ Console.WriteLine($"MV-EVAL-TYPE {DotclHost.EvalString("(floor 7 2)") is Fixnum}
 var ev = DotclHost.EvalStringMv("(values :a :b :c)");
 Console.WriteLine($"MV-EVAL {ev.Length} {DotclHost.ToClr(ev[2])}");
 
+// --- the AssemblyLoad handler before Runtime is initialized -----------------
+// The handler can run inside Runtime's static initializer (resolving the types it
+// references loads assemblies, on the same thread), before the extension-method
+// index is assigned. Put the index in that state and call what the handler calls.
+{
+    var flags = System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static;
+    var field = typeof(DotCL.Runtime).GetField("_extensionMethodsByName", flags)!;
+    var saved = field.GetValue(null);
+    string res;
+    field.SetValue(null, null);
+    try
+    {
+        DotCL.Runtime.ClearExtensionMethodCache();
+        typeof(DotCL.Runtime).GetMethod("MarkTypeCacheDirty", flags)!.Invoke(null, null);
+        res = "ok";
+    }
+    catch (Exception e) { res = (e.InnerException ?? e).GetType().Name; }
+    finally { field.SetValue(null, saved); }
+    Console.WriteLine($"PRE-INIT-HANDLER {res}");
+}
+
 // --- special variables -----------------------------------------------------
 DotclHost.EvalString("(defparameter *host-var* 41)");
 Console.WriteLine($"SP-GET {DotclHost.ToClr(DotclHost.GetSpecial("*HOST-VAR*"))}");
@@ -432,6 +453,7 @@ want "values" "$out" "MV-ONE 1 True"
 want "values" "$out" "MV-EVAL 3 :C"
 want "values" "$out" "MV-CALL-TYPE True True"
 want "values" "$out" "MV-EVAL-TYPE True True"
+want "values" "$out" "PRE-INIT-HANDLER ok"
 want "values" "$out" "SP-GET 41"
 want "values" "$out" "SP-SET 42"
 want "values" "$out" "SP-QUALIFIED 10"

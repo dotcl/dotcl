@@ -47,3 +47,51 @@
     (dotimes (i a) (dotimes (j b) (incf n)))
     n)
   12)
+
+;;; A count form whose name is rebound inside a DEFUN with a FIXNUM-declared
+;;; parameter of that name. The expansion must follow the inner binding: the
+;;; limit holds a bignum there, and treating it as a fixnum failed the unbox.
+(defun dotimes-shadowed-param-let (n)
+  (declare (fixnum n))
+  (let ((n (expt 2 70)) (c 0))
+    (dotimes (i n) (incf c) (when (> c 4) (return)))
+    c))
+
+(deftest dotimes-shadowed-fixnum-param-let
+  (dotimes-shadowed-param-let 1)
+  5)
+
+(defun dotimes-shadowed-param-negative (n)
+  (declare (fixnum n))
+  (let ((n (- (expt 2 70))) (c 0))
+    (dotimes (i n) (incf c))
+    c))
+
+(deftest dotimes-shadowed-fixnum-param-negative
+  (dotimes-shadowed-param-negative 1)
+  0)
+
+(defun dotimes-shadowed-param-flet (n)
+  (declare (fixnum n))
+  (flet ((count-up (n)
+           (let ((c 0)) (dotimes (i n) (incf c) (when (> c 4) (return))) c)))
+    (list (count-up n) (count-up (expt 2 70)))))
+
+(deftest dotimes-shadowed-fixnum-param-flet
+  (dotimes-shadowed-param-flet 3)
+  (3 5))
+
+;;; The same DOTIMES form placed once where N is the FIXNUM parameter and once
+;;; where it is rebound to a bignum.
+(defmacro dotimes-twice-in-defun (name &body body)
+  `(defun ,name (n)
+     (declare (fixnum n))
+     (list (let ((c 0)) ,@body c)
+           (let ((n (expt 2 70)) (c 0)) ,@body c))))
+
+(dotimes-twice-in-defun dotimes-same-form-two-bindings
+  (dotimes (i n) (incf c) (when (> c 4) (return))))
+
+(deftest dotimes-same-form-fixnum-and-bignum-binding
+  (dotimes-same-form-two-bindings 3)
+  (3 5))

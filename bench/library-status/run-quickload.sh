@@ -28,11 +28,18 @@
 #   LIBRARY_STATUS_TARGETS   targets.txt
 #   LIBRARY_STATUS_JSON      output results.json
 #   LIBRARY_STATUS_LOGDIR    per-system output, kept for diagnosis
+#   LIBRARY_STATUS_ALLOW_STALE_DIST=1  measure even if the dotcl dist is older
+#                            than the published one (see dists.sh); every entry
+#                            records the dist versions it was measured with
+#   LIBRARY_STATUS_CONFIG    Release (default) or Debug: which build of the
+#                            runtime measures (see runtime.sh); every entry
+#                            records it as "runtime"
 set -eu
 
 root="${1:-.}"
 # Note filters (scrub_note), shared with the other stage.
 . "$(dirname "$0")/scrub.sh"
+. "$(dirname "$0")/dists.sh"
 targets="${LIBRARY_STATUS_TARGETS:-$root/bench/library-status/targets.txt}"
 out="${LIBRARY_STATUS_JSON:-$root/bench/library-status/results.json}"
 logdir="${LIBRARY_STATUS_LOGDIR:-/tmp/library-status-logs}"
@@ -41,10 +48,10 @@ retry="${LIBRARY_STATUS_RETRY:-900}"
 limit="${LIMIT:-0}"
 resume="${LIBRARY_STATUS_RESUME:-0}"
 
-exe="$root/runtime/bin/Debug/net10.0/runtime.exe"
-[ -x "$exe" ] || exe="$root/runtime/bin/Debug/net10.0/runtime"
-[ -x "$exe" ] || { echo "run-quickload: no built runtime; run make build first" >&2; exit 1; }
-core="$root/compiler/cil-out.sil"
+# The Release build by default, and refused when older than the sources: see
+# runtime.sh.
+. "$(dirname "$0")/runtime.sh"
+select_runtime run-quickload
 # GNU timeout bounds each run. macOS has none by default; Homebrew coreutils
 # installs it as gtimeout. Without either, every run would fail with 127 and
 # be recorded as a library failure, so stop here instead.
@@ -52,9 +59,9 @@ if command -v timeout >/dev/null 2>&1; then timeout=timeout
 elif command -v gtimeout >/dev/null 2>&1; then timeout=gtimeout
 else echo "run-quickload: needs GNU timeout (coreutils; gtimeout on macOS)" >&2; exit 1
 fi
-[ -f "$core" ] || { echo "run-quickload: no $core; run make cross-compile first" >&2; exit 1; }
 [ -f "$targets" ] || { echo "run-quickload: no targets at $targets" >&2; exit 1; }
 
+check_dists run-quickload
 checked=$(date +%Y-%m-%d)
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
@@ -147,7 +154,7 @@ DRVEOF
   log="$logdir/$(printf '%s' "$sys" | tr / _).txt"
   t0=$(date +%s)
   set +e
-  "$timeout" "$per" "$exe" --asm "$core" "$work/drv.lisp" > "$log" 2>&1 < /dev/null
+  "$timeout" "$per" "$exe" --core "$core" "$work/drv.lisp" > "$log" 2>&1 < /dev/null
   code=$?
   set -e
   retried=""
@@ -159,7 +166,7 @@ DRVEOF
   if [ "$code" -eq 124 ]; then
     retried=" (retried)"
     set +e
-    "$timeout" "$retry" "$exe" --asm "$core" "$work/drv.lisp" > "$log" 2>&1 < /dev/null
+    "$timeout" "$retry" "$exe" --core "$core" "$work/drv.lisp" > "$log" 2>&1 < /dev/null
     code=$?
     set -e
   fi
@@ -208,8 +215,8 @@ DRVEOF
   release_json=null
   [ -n "$release" ] && [ "$release" != "?" ] && release_json="\"$(jstr "$release")\""
 
-  printf '  {"system": "%s", "release": %s, "status": "%s", "issue": null, "checked": "%s", "note": "%s"}\n' \
-    "$sys" "$release_json" "$status" "$checked" "$(jstr "${note:-}")" >> "$work/entries"
+  printf '  {"system": "%s", "release": %s, "status": "%s", "issue": null, "checked": "%s", "note": "%s", "dists": "%s", "runtime": "%s", "seconds": %d}\n' \
+    "$sys" "$release_json" "$status" "$checked" "$(jstr "${note:-}")" "$dists_desc" "$runtime_desc" "$elapsed" >> "$work/entries"
   write_json
   ran=$((ran + 1))
 

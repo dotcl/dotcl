@@ -1530,17 +1530,18 @@ Also expands element types within compound type specifiers like (VECTOR etype si
 
 ;; The function a function NAME denotes, when that function can carry a
 ;; docstring: a macro's expander for a macro, NIL for an unbound name, a special
-;; operator, or a list that is not a (SETF symbol) name.
+;; operator, or a list that is not a (SETF symbol) name. A traced name answers
+;; for the function TRACE wrapped, as on SBCL.
 (defun %documented-function-of (name)
   (cond ((consp name)
          (when (and (eq (car name) 'setf) (consp (cdr name))
                     (symbolp (cadr name)) (null (cddr name))
                     (fboundp name))
-           (fdefinition name)))
+           (%untraced-function (fdefinition name))))
         ((not (symbolp name)) nil)
         ((special-operator-p name) nil)
         ((macro-function name))
-        ((fboundp name) (fdefinition name))))
+        ((fboundp name) (%untraced-function (fdefinition name)))))
 
 ;; (documentation <name> 'function). The docstring belongs to the function the
 ;; name denotes (SBCL keeps one docstring per function), so that is asked first.
@@ -2752,6 +2753,11 @@ and symbol-macro scope is used as the starting point."
 ;;; ERROR; a class of its own lets a handler tell this error from any other,
 ;;; as SBCL's SB-PCL::NO-APPLICABLE-METHOD-ERROR does.
 (define-condition no-applicable-method-error (simple-error) ())
+
+;;; What a form signals when evaluated if a macro expansion in it failed while it
+;;; was compiled (see %MACROEXPANSION-FAILED). A PROGRAM-ERROR, as SBCL's
+;;; SB-INT:COMPILED-PROGRAM-ERROR is: the program is what is wrong.
+(define-condition compiled-program-error (simple-condition program-error) ())
 
 (%define-condition-report (c file-error)
   (format stream "Error on file ~a." (file-error-pathname c)))

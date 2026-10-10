@@ -33,12 +33,12 @@
 ;; The dotimes counter of a fixnum-declared &optional count must take the
 ;; native path: no boxed Runtime.Increment in the emitted code.
 (deftest opt-param-native-dotimes
-  (let ((sil (princ-to-string (dotcl:function-sil #'%opt-fx-sum))))
+  (let ((sil (%flat-text (dotcl:function-sil #'%opt-fx-sum))))
     (notnot (search "Runtime.Increment" sil)))
   nil)
 
 (deftest key-param-native-dotimes
-  (let ((sil (princ-to-string (dotcl:function-sil #'%key-fx-sum))))
+  (let ((sil (%flat-text (dotcl:function-sil #'%key-fx-sum))))
     (notnot (search "Runtime.Increment" sil)))
   nil)
 

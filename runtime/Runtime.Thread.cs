@@ -548,6 +548,12 @@ public partial class Runtime
     {
         if (a is not LispLock lk)
             throw new LispErrorException(new LispProgramError("RELEASE-LOCK: requires a lock"));
+        // A lock this thread does not hold is left alone, as SBCL's RELEASE-MUTEX
+        // does by default (:IF-NOT-OWNER :PUNT). Monitor.Exit would throw
+        // SynchronizationLockException; anypool releases its lock early inside an
+        // UNWIND-PROTECT whose cleanup releases it again.
+        if (!System.Threading.Monitor.IsEntered(lk.Monitor))
+            return Nil.Instance;
         System.Threading.Monitor.Exit(lk.Monitor);
         return T.Instance;
     }

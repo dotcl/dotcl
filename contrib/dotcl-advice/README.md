@@ -8,7 +8,7 @@ times calls, and `unwatch` / `unpatch` / `untrace` take them off again.
 
     (require "dotcl-advice")
 
-Depends on the `nuget` and `dotnet-class` contribs. The patching backend is the
+Depends on the `dotnet-nuget` and `dotnet-class` contribs. The patching backend is the
 HarmonyX NuGet package, resolved on first use -- so that first call wants the
 .NET SDK unless the package is already laid out beside the program.
 `advice:*harmony-package*` and `*harmony-version*` choose it (HarmonyX rather

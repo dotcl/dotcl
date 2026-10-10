@@ -110,7 +110,7 @@
 ;;; the other operand wrapped to, and a declared FIXNUM accumulator keeps its
 ;;; Int64 slot.
 (setf dotcl:*save-sil* t)
-(defun %fwc-sil (fn) (princ-to-string (dotcl:function-sil fn)))
+(defun %fwc-sil (fn) (%flat-text (dotcl:function-sil fn)))
 (defun %fwc-mask-sil (x y)
   (declare (fixnum x y) (optimize (speed 3) (safety 0)))
   (logand (+ x y) #xFFFFFFFF))

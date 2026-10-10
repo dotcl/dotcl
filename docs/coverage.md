@@ -17,33 +17,27 @@ Coverage is collected per process: the collector has to launch the program,
 because it installs a profiler before the runtime starts. It cannot be switched
 on inside a running REPL.
 
-Three things are required.
+Two things are required.
 
 1. **Compile the code you want measured.** Only compiled code has a PDB. Code
    evaluated straight from source, or typed at the REPL, is emitted dynamically
    and is invisible to the collector.
 2. **`DOTCL_EMIT_PDB=1`**: without it `compile-file` writes no PDB, and the
    collector has nothing tying IL back to your source.
-3. **`DOTCL_FASL_LOADFROM=1`**: `load` normally reads a fasl into memory, and an
-   assembly loaded from bytes has no file location, which is how the collector
-   picks what to instrument. This switch loads the fasl by path instead.
+
+`load` reads a fasl by path, so the loaded module has a file location, which is
+how the collector picks what to instrument.
 
 Given a `driver.lisp` that compiles your code, loads it, and exercises it:
 
 ```sh
-DOTCL_EMIT_PDB=1 DOTCL_FASL_LOADFROM=1 \
+DOTCL_EMIT_PDB=1 \
   dotnet-coverage collect --output coverage.cobertura.xml --output-format cobertura -- \
   dotcl driver.lisp
 ```
 
 The report is ordinary cobertura, so anything that reads cobertura works;
 including the VS Code coverage extensions, which will shade the `.lisp` directly.
-
-`DOTCL_FASL_LOADFROM` is not the default because loading by path holds the file
-open and caches the assembly against that path: recompiling a fasl and loading it
-again in the same session would fail to write on Windows, and elsewhere would
-hand back the assembly already loaded. A coverage run is one process that
-compiles, loads, runs and exits, so it never reaches that.
 
 ## What the numbers mean
 

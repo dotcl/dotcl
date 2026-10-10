@@ -382,6 +382,27 @@ public static partial class Runtime
                 var qArgs = ToList(compound.Cdr).ToArray();
                 return Typep(obj, Funcall(qCompExp, qArgs));
             }
+            // A COMMON-LISP symbol at the head of a list is a compound type only
+            // with the arguments its specifier takes (CLHS 4.2.3). (T), (SYMBOL),
+            // (INTEGER 0 1 2) and the like are not type specifiers and signal, as
+            // on SBCL. They used to answer NIL, so a library probing for valid
+            // specifiers by growing (T *...) never stopped (type-i).
+            if (head is T || head is Nil)
+                throw InvalidCompoundTypeSpecifier(typeSpec);
+            if (head is Symbol clHead && ReferenceEquals(clHead.HomePackage, Startup.CL))
+            {
+                int nargs = 0;
+                for (var a = compound.Cdr; a is Cons ac; a = ac.Cdr) nargs++;
+                if (CompoundTypeArgLimits.TryGetValue(clHead.Name, out var lim))
+                {
+                    if (nargs < lim.Min || nargs > lim.Max)
+                        throw InvalidCompoundTypeSpecifier(typeSpec);
+                    // (KEYWORD), (BOOLEAN) ...: the atomic type itself.
+                    if (lim.Max == 0) return Typep(obj, clHead);
+                }
+                else if (!TryGetTypeExpander(clHead, out _))
+                    throw InvalidCompoundTypeSpecifier(typeSpec);
+            }
             switch (headName)
             {
                 case "OR":
@@ -443,7 +464,7 @@ public static partial class Runtime
                     if (sizeSpec == null || (sizeSpec is Symbol ss && ss.Name == "*"))
                         return T.Instance;
                     int expectedLen = sizeSpec is Fixnum sf ? (int)sf.Value : -1;
-                    int actualLen = obj is LispString ls ? ls.Length : (obj is LispVector lv ? lv.Length : -1);
+                    int actualLen = obj is LispString ls ? ls.Length : (obj is LispVector lv ? VectorDimension(lv) : -1);
                     return actualLen == expectedLen ? T.Instance : Nil.Instance;
                 }
                 case "ARRAY":
@@ -522,7 +543,7 @@ public static partial class Runtime
                         if (!(sizeSpec is Symbol bvSS && bvSS.Name == "*"))
                         {
                             int expectedSize = sizeSpec is Fixnum sf2 ? (int)sf2.Value : -1;
-                            int actualSize = obj is LispVector sv3 ? sv3.Length : -1;
+                            int actualSize = obj is LispVector sv3 ? VectorDimension(sv3) : -1;
                             if (actualSize != expectedSize) return Nil.Instance;
                         }
                     }
@@ -534,6 +555,10 @@ public static partial class Runtime
                     // (vector element-type) or (vector element-type size) or (vector *)
                     if (!CheckSimpleType(obj, headName)) return Nil.Instance;
                     var vecRest = compound.Cdr;
+                    // (simple-vector size): the only argument is the size, the
+                    // element type is T.
+                    if (headName == "SIMPLE-VECTOR")
+                        vecRest = new Cons(T.Instance, vecRest);
                     if (vecRest is Cons vecEtCons)
                     {
                         var elemTypeSpec = vecEtCons.Car;
@@ -552,7 +577,7 @@ public static partial class Runtime
                             if (!(sizeSpec is Symbol ss2 && ss2.Name == "*"))
                             {
                                 int expectedSize = sizeSpec is Fixnum sf2 ? (int)sf2.Value : -1;
-                                int actualSize = obj is LispVector sv3 ? sv3.Length : (obj is LispString ls3 ? ls3.Length : -1);
+                                int actualSize = obj is LispVector sv3 ? VectorDimension(sv3) : (obj is LispString ls3 ? ls3.Length : -1);
                                 if (actualSize != expectedSize) return Nil.Instance;
                             }
                         }
@@ -656,11 +681,9 @@ public static partial class Runtime
                 }
                 case "COMPLEX":
                 {
-                    // (complex type): obj must be complex with both parts of 'type'
-                    if (obj is not LispComplex cx) return Nil.Instance;
-                    var partType = compound.Cdr is Cons pt ? pt.Car : T.Instance;
-                    if (partType is Symbol pts && pts.Name == "*") return T.Instance;
-                    return (IsTruthy(Typep(cx.Real, partType)) && IsTruthy(Typep(cx.Imaginary, partType)))
+                    // The parts are of the upgraded part type (CLHS 12.1.5.3):
+                    // #C(1/2 2) is a (COMPLEX INTEGER), #C(1.5 2.5) is not a (COMPLEX RATIONAL).
+                    return IsComplexOfParts(obj, compound.Cdr is Cons pt ? pt.Car : null)
                         ? T.Instance : Nil.Instance;
                 }
                 case "FLOAT":
@@ -735,6 +758,31 @@ public static partial class Runtime
     /// class, nor a DEFTYPE. Signalled when TYPEP (and so THE, CHECK-TYPE and
     /// TYPECASE) reaches it, rather than answering NIL, so a misspelt or not yet
     /// defined type is not silently a type with no members.</summary>
+    /// <summary>The argument counts each COMMON-LISP compound type specifier takes
+    /// (CLHS 4.2.3), and the atomic types SBCL also accepts as a one-element list.
+    /// A COMMON-LISP head missing here is not a compound type specifier.</summary>
+    private static readonly Dictionary<string, (int Min, int Max)> CompoundTypeArgLimits = new()
+    {
+        ["AND"] = (0, int.MaxValue), ["OR"] = (0, int.MaxValue), ["MEMBER"] = (0, int.MaxValue),
+        ["NOT"] = (1, 1), ["EQL"] = (1, 1), ["SATISFIES"] = (1, 1), ["MOD"] = (1, 1),
+        ["VALUES"] = (0, int.MaxValue), ["FUNCTION"] = (0, 2),
+        ["ARRAY"] = (0, 2), ["SIMPLE-ARRAY"] = (0, 2), ["VECTOR"] = (0, 2),
+        ["SIMPLE-VECTOR"] = (0, 1), ["STRING"] = (0, 1), ["SIMPLE-STRING"] = (0, 1),
+        ["BASE-STRING"] = (0, 1), ["SIMPLE-BASE-STRING"] = (0, 1),
+        ["BIT-VECTOR"] = (0, 1), ["SIMPLE-BIT-VECTOR"] = (0, 1),
+        ["INTEGER"] = (0, 2), ["RATIONAL"] = (0, 2), ["REAL"] = (0, 2), ["FLOAT"] = (0, 2),
+        ["SHORT-FLOAT"] = (0, 2), ["SINGLE-FLOAT"] = (0, 2), ["DOUBLE-FLOAT"] = (0, 2),
+        ["LONG-FLOAT"] = (0, 2),
+        ["UNSIGNED-BYTE"] = (0, 1), ["SIGNED-BYTE"] = (0, 1), ["COMPLEX"] = (0, 1),
+        ["CONS"] = (0, 2),
+        ["ATOM"] = (0, 0), ["BASE-CHAR"] = (0, 0), ["BIT"] = (0, 0), ["BOOLEAN"] = (0, 0),
+        ["COMPILED-FUNCTION"] = (0, 0), ["EXTENDED-CHAR"] = (0, 0), ["KEYWORD"] = (0, 0),
+        ["STANDARD-CHAR"] = (0, 0),
+    };
+
+    private static LispErrorException InvalidCompoundTypeSpecifier(LispObject spec) =>
+        new LispErrorException(new LispError("invalid type specifier: " + FormatObject(spec, true)));
+
     private static LispErrorException UnknownTypeSpecifier(LispObject spec) =>
         new LispErrorException(new LispError("unknown type specifier: " + FormatObject(spec, true)));
 
@@ -855,6 +903,7 @@ public static partial class Runtime
           || (obj is LispInstanceCondition lic && ClassMatchesCPL(lic.Instance.Class, typeName))
           || (obj is LispCondition cond && ConditionTypeMatches(cond.ConditionTypeName, typeName))
           || (obj is GenericFunction gf2 && gf2.StoredClass != null && ClassMatchesCPL(gf2.StoredClass, typeName))
+          || (obj is LispMethod lm2 && lm2.MetaClass != null && ClassMatchesCPL(lm2.MetaClass, typeName))
     };
 
     /// <summary>Check if obj is a LispStruct that satisfies FLOAT type (for cross-compilation target-float structs).</summary>
@@ -925,6 +974,10 @@ public static partial class Runtime
                         || et.StartsWith("SIGNED-BYTE-", StringComparison.Ordinal))
         && LispVector.NumKindForElementType(et) != 0;
 
+    /// <summary>The size a (VECTOR et SIZE) type speaks of: the dimension, not
+    /// the fill pointer (CLHS VECTOR: SIZE is the array's dimension).</summary>
+    private static int VectorDimension(LispVector v) => v.Rank == 1 ? v.Dimensions[0] : -1;
+
     // Check if a LispVector's ElementTypeName matches a compound element-type specifier like (unsigned-byte 8)
     private static bool MatchesElementType(LispObject elemTypeSpec, string storedET)
     {
@@ -959,10 +1012,14 @@ public static partial class Runtime
                 "CHARACTER" or "BASE-CHAR" or "STANDARD-CHAR" => storedET is "CHARACTER" or "BASE-CHAR" or "STANDARD-CHAR",
                 "BIT" => storedET == "BIT",
                 "NIL" => storedET == "NIL",
-                "FIXNUM" or "INTEGER" or "SIGNED-BYTE" or "UNSIGNED-BYTE" => storedET.StartsWith("INTEGER") || storedET.StartsWith("UNSIGNED-BYTE") || storedET.StartsWith("SIGNED-BYTE") || storedET is "FIXNUM" or "INTEGER",
-                "SINGLE-FLOAT" or "SHORT-FLOAT" => storedET is "SINGLE-FLOAT" or "SHORT-FLOAT" or "FLOAT",
+                // FIXNUM has storage of its own. INTEGER, SIGNED-BYTE,
+                // UNSIGNED-BYTE and FLOAT do not: they upgrade to T, so (array
+                // integer) is (array t) and names neither a FIXNUM nor an
+                // (unsigned-byte 8) array (SBCL answers the same).
+                "FIXNUM" => storedET == "FIXNUM",
+                "INTEGER" or "SIGNED-BYTE" or "UNSIGNED-BYTE" or "FLOAT" => storedET == "T",
+                "SINGLE-FLOAT" or "SHORT-FLOAT" => storedET is "SINGLE-FLOAT" or "SHORT-FLOAT",
                 "DOUBLE-FLOAT" or "LONG-FLOAT" => storedET is "DOUBLE-FLOAT" or "LONG-FLOAT",
-                "FLOAT" => storedET is "FLOAT" or "SINGLE-FLOAT" or "SHORT-FLOAT" or "DOUBLE-FLOAT" or "LONG-FLOAT",
                 // Everything above is an element type arrays are specialized on
                 // here, so what reaches this line is one that is not -- and an
                 // element type with no specialization upgrades to T (CLHS
@@ -977,19 +1034,11 @@ public static partial class Runtime
         if (elemTypeSpec is Cons etCons && etCons.Car is Symbol etHead)
         {
             string headN = etHead.Name;
-            if (headN == "UNSIGNED-BYTE")
-            {
-                // (unsigned-byte n): stored as "UNSIGNED-BYTE-n" or "UNSIGNED-BYTE" or "INTEGER"
-                if (etCons.Cdr is Cons nbC && nbC.Car is Fixnum nbF)
-                    return storedET == $"UNSIGNED-BYTE-{nbF.Value}" || storedET == "UNSIGNED-BYTE" || storedET == "INTEGER" || storedET == "FIXNUM";
-                return storedET.StartsWith("UNSIGNED-BYTE") || storedET == "INTEGER" || storedET == "FIXNUM";
-            }
-            if (headN == "SIGNED-BYTE")
-            {
-                if (etCons.Cdr is Cons nbC2 && nbC2.Car is Fixnum nbF2)
-                    return storedET == $"SIGNED-BYTE-{nbF2.Value}" || storedET == "SIGNED-BYTE" || storedET == "INTEGER" || storedET == "FIXNUM";
-                return storedET.StartsWith("SIGNED-BYTE") || storedET == "INTEGER" || storedET == "FIXNUM";
-            }
+            // Integer and float types: the array is of the type exactly when the
+            // specifier upgrades to the array's element type.
+            if (headN is "UNSIGNED-BYTE" or "SIGNED-BYTE" or "INTEGER" or "MOD" or "EQL"
+                or "FLOAT" or "SHORT-FLOAT" or "SINGLE-FLOAT" or "DOUBLE-FLOAT" or "LONG-FLOAT")
+                return ParseElementTypeName(elemTypeSpec) == storedET;
             if (headN == "COMPLEX")
             {
                 // Arrays of (complex single-float) and (complex double-float) are
@@ -1001,20 +1050,6 @@ public static partial class Runtime
                           : storedET == "COMPLEX" || storedET.StartsWith("COMPLEX-") ? Runtime.ComplexElementPartClass(storedET)
                           : '\0';
                 return want == have;
-            }
-            if (headN is "INTEGER" or "FIXNUM" or "BIGNUM" or "RATIONAL")
-            {
-                // (integer low high): matches if stored element type is an integer-compatible type
-                return storedET is "INTEGER" or "FIXNUM" or "BIGNUM"
-                    || storedET.StartsWith("UNSIGNED-BYTE") || storedET.StartsWith("SIGNED-BYTE");
-            }
-            if (headN is "FLOAT" or "SHORT-FLOAT" or "SINGLE-FLOAT" or "DOUBLE-FLOAT" or "LONG-FLOAT")
-            {
-                return headN switch {
-                    "SHORT-FLOAT" or "SINGLE-FLOAT" => storedET is "FLOAT" or "SINGLE-FLOAT" or "SHORT-FLOAT",
-                    "DOUBLE-FLOAT" or "LONG-FLOAT" => storedET is "FLOAT" or "DOUBLE-FLOAT" or "LONG-FLOAT",
-                    _ => storedET is "FLOAT" or "SINGLE-FLOAT" or "SHORT-FLOAT" or "DOUBLE-FLOAT" or "LONG-FLOAT"
-                };
             }
         }
         return storedET == "T"; // fallback: generic vector accepts anything
@@ -1246,6 +1281,49 @@ public static partial class Runtime
         return typeSpec;
     }
 
+    /// <summary>One step of DOTCL:TYPEXPAND-1: a DEFTYPE expansion, or else the
+    /// built-in types SBCL defines as abbreviations of others: (MOD n),
+    /// (UNSIGNED-BYTE n), (SIGNED-BYTE n) as INTEGER ranges and BOOLEAN as
+    /// (MEMBER T NIL), with SB-EXT:TYPEXPAND-1's answers. type-i infers
+    /// (INTEGER 0 4) from (MOD 5) this way.</summary>
+    private static LispObject PublicTypeExpandStep(LispObject typeSpec, out bool expanded)
+    {
+        var result = TypeExpandStep(typeSpec, out expanded);
+        if (expanded) return result;
+        string? name = typeSpec is Symbol s0 && ReferenceEquals(s0.HomePackage, Startup.CL) ? s0.Name
+                     : typeSpec is Cons c0 && c0.Car is Symbol h0 && ReferenceEquals(h0.HomePackage, Startup.CL) ? h0.Name
+                     : null;
+        LispObject? arg = typeSpec is Cons c1 && c1.Cdr is Cons a1 && a1.Cdr is Nil ? a1.Car : null;
+        bool noArg = typeSpec is Symbol || (typeSpec is Cons c2 && (c2.Cdr is Nil || (arg is Symbol st && st.Name == "*")));
+        LispObject? r = null;
+        switch (name)
+        {
+            case "BOOLEAN" when typeSpec is Symbol || (typeSpec is Cons cb && cb.Cdr is Nil):
+                r = List(Startup.Sym("MEMBER"), T.Instance, Nil.Instance);
+                break;
+            case "MOD" when arg is Fixnum mn && mn.Value > 0:
+                r = List(Startup.Sym("INTEGER"), Fixnum.Make(0), Subtract(arg!, Fixnum.Make(1)));
+                break;
+            case "UNSIGNED-BYTE" when noArg:
+                r = List(Startup.Sym("INTEGER"), Fixnum.Make(0));
+                break;
+            case "UNSIGNED-BYTE" when arg is Fixnum un && un.Value > 0:
+                r = List(Startup.Sym("INTEGER"), Fixnum.Make(0),
+                         Subtract(Ash(Fixnum.Make(1), un), Fixnum.Make(1)));
+                break;
+            case "SIGNED-BYTE" when noArg:
+                r = Startup.Sym("INTEGER");
+                break;
+            case "SIGNED-BYTE" when arg is Fixnum sn && sn.Value > 0:
+                var half = Ash(Fixnum.Make(1), Fixnum.Make(sn.Value - 1));
+                r = List(Startup.Sym("INTEGER"), Negate(half), Subtract(half, Fixnum.Make(1)));
+                break;
+        }
+        if (r == null) return typeSpec;
+        expanded = true;
+        return r;
+    }
+
     private static void CheckTypexpandArgs(LispObject[] args, string name)
     {
         if (args.Length < 1 || args.Length > 2)
@@ -1260,7 +1338,7 @@ public static partial class Runtime
     public static LispObject TypexpandOne(LispObject[] args)
     {
         CheckTypexpandArgs(args, "TYPEXPAND-1");
-        var result = TypeExpandStep(args[0], out bool expanded);
+        var result = PublicTypeExpandStep(args[0], out bool expanded);
         return MultipleValues.Values2(result, expanded ? T.Instance : Nil.Instance);
     }
 
@@ -1275,7 +1353,7 @@ public static partial class Runtime
         bool ever = false;
         while (true)
         {
-            var next = TypeExpandStep(type, out bool expanded);
+            var next = PublicTypeExpandStep(type, out bool expanded);
             if (!expanded) break;
             ever = true;
             type = next;
@@ -1324,17 +1402,165 @@ public static partial class Runtime
         return null;
     }
 
-    /// <summary>Compute the upgraded complex part type name for a given type name.</summary>
-    private static string UpgradeComplexPartTypeName(string typeName)
+    // The upgraded part types of complexes, as a set of the three representations a
+    // complex can have: rational parts, single-float parts, double-float parts.
+    // (COMPLEX T1) holds the complexes whose parts are of the upgraded part type of T1
+    // (CLHS 12.1.5.3, UPGRADED-COMPLEX-PART-TYPE), so (COMPLEX INTEGER) and
+    // (COMPLEX RATIONAL) are the same type, and (COMPLEX FLOAT) is disjoint from both.
+    //
+    // Rational parts always upgrade to RATIONAL, float parts do not upgrade at
+    // all: a part type that holds only some floats of a format, like
+    // (FLOAT 0.0 1.0) or (SINGLE-FLOAT 0.0 1.0), is "exact": (COMPLEX X) then holds
+    // the float complexes whose parts are both of type X (and every rational
+    // complex if X holds a rational). Upgrading (FLOAT 0.0 1.0) to FLOAT, as SBCL
+    // does, makes (COMPLEX SINGLE-FLOAT) a subtype of (COMPLEX (FLOAT 0.0 1.0)),
+    // which ANSI SUBTYPEP-COMPLEX.8 rejects; upgrading only some ranges breaks
+    // (COMPLEX T1) <: (COMPLEX T2) for T1 <: T2, which it requires too.
+    internal const int ComplexRationalParts = 1, ComplexSingleParts = 2, ComplexDoubleParts = 4,
+                       ComplexAllParts = 7;
+
+    /// <summary>
+    /// The set of complex representations that (COMPLEX PART-SPEC) holds. A part type
+    /// that is not a subtype of REAL (T, NUMBER, ...) holds every complex.
+    /// </summary>
+    internal static int ComplexPartMask(LispObject? partSpec) => ComplexPartMask(partSpec, out _);
+
+    /// <summary>
+    /// Like ComplexPartMask; EXACT is true when PART-SPEC holds some but not all
+    /// floats of a float format in the mask.
+    /// </summary>
+    internal static int ComplexPartMask(LispObject? partSpec, out bool exact)
     {
-        return typeName switch
+        exact = false;
+        if (partSpec == null || partSpec is Symbol { Name: "*" }) return ComplexAllParts;
+        if (partSpec is Nil) return 0;
+        if (partSpec is T) return ComplexAllParts;
+        string? head = partSpec is Symbol s ? s.Name
+                     : partSpec is Cons c && c.Car is Symbol h ? h.Name : null;
+        if (head != null && (partSpec is Symbol || IsBuiltinTypeName(head) || head is "MOD"))
         {
-            "NIL" => "NIL",
-            "SINGLE-FLOAT" or "SHORT-FLOAT" => "SINGLE-FLOAT",
-            "DOUBLE-FLOAT" or "LONG-FLOAT" => "DOUBLE-FLOAT",
-            "*" => "REAL", // wildcard means any part type -> REAL
-            _ => "REAL"
-        };
+            int? m = head switch
+            {
+                "INTEGER" or "FIXNUM" or "BIGNUM" or "RATIONAL" or "RATIO" or "BIT"
+                    or "SIGNED-BYTE" or "UNSIGNED-BYTE" or "MOD" => ComplexRationalParts,
+                "SINGLE-FLOAT" or "SHORT-FLOAT" => ComplexSingleParts,
+                "DOUBLE-FLOAT" or "LONG-FLOAT" => ComplexDoubleParts,
+                "FLOAT" => ComplexSingleParts | ComplexDoubleParts,
+                "REAL" => ComplexAllParts,
+                "NUMBER" => ComplexAllParts,
+                _ => null,
+            };
+            if (m is int known)
+            {
+                // (FLOAT 0.0 1.0), (SINGLE-FLOAT 0.0 1.0), (REAL 0 1): bounded, so
+                // not all floats of a format.
+                if (partSpec is Cons bc && (known & ~ComplexRationalParts) != 0 && HasNumericBound(bc.Cdr))
+                    exact = true;
+                return known;
+            }
+        }
+        if (partSpec is Cons mc && mc.Car is Symbol { Name: "EQL" or "MEMBER" })
+        {
+            int m = 0;
+            for (var p = mc.Cdr; p is Cons pc; p = pc.Cdr)
+            {
+                int part = ComplexPartClass(pc.Car);
+                if (part == 0) return ComplexAllParts;
+                m |= part;
+            }
+            exact = (m & ~ComplexRationalParts) != 0;
+            return m;
+        }
+        // Anything else: the smallest set whose part type contains it.
+        int found = ComplexAllParts;
+        foreach (var (mask, spec) in s_complexPartSpecs.Value)
+        {
+            try
+            {
+                if (Subtypep(partSpec, spec) != Nil.Instance) { found = mask; break; }
+            }
+            catch { }
+        }
+        if (found != ComplexAllParts || IsRealSubtype(partSpec))
+        {
+            foreach (int r in new[] { ComplexSingleParts, ComplexDoubleParts })
+            {
+                if ((found & r) == 0) continue;
+                try
+                {
+                    if (Subtypep(ComplexPartTypeSpec(r), partSpec) == Nil.Instance) exact = true;
+                }
+                catch { exact = true; }
+            }
+        }
+        // The SUBTYPEP calls above publish two values; TYPEP returns one.
+        MultipleValues.Reset();
+        return found;
+    }
+
+    private static bool IsRealSubtype(LispObject spec)
+    {
+        try { return Subtypep(spec, Startup.Sym("REAL")) != Nil.Instance; }
+        catch { return false; }
+    }
+
+    private static bool HasNumericBound(LispObject bounds)
+    {
+        for (var p = bounds; p is Cons pc; p = pc.Cdr)
+            if (pc.Car is not Symbol { Name: "*" }) return true;
+        return false;
+    }
+
+    private static readonly Lazy<(int, LispObject)[]> s_complexPartSpecs = new(() =>
+        new (int, LispObject)[]
+        {
+            (0, Nil.Instance),
+            (ComplexRationalParts, Startup.Sym("RATIONAL")),
+            (ComplexSingleParts, Startup.Sym("SINGLE-FLOAT")),
+            (ComplexDoubleParts, Startup.Sym("DOUBLE-FLOAT")),
+            (ComplexSingleParts | ComplexDoubleParts, Startup.Sym("FLOAT")),
+            (ComplexRationalParts | ComplexSingleParts, ComplexPartTypeSpec(ComplexRationalParts | ComplexSingleParts)),
+            (ComplexRationalParts | ComplexDoubleParts, ComplexPartTypeSpec(ComplexRationalParts | ComplexDoubleParts)),
+        });
+
+    /// <summary>The representation of a real number as a complex part, or 0 for none.</summary>
+    internal static int ComplexPartClass(LispObject part) => part switch
+    {
+        Fixnum or Bignum or Ratio => ComplexRationalParts,
+        SingleFloat => ComplexSingleParts,
+        DoubleFloat => ComplexDoubleParts,
+        _ => 0,
+    };
+
+    /// <summary>The upgraded complex part type that a set of representations names.</summary>
+    internal static LispObject ComplexPartTypeSpec(int mask) => mask switch
+    {
+        0 => Nil.Instance,
+        ComplexRationalParts => Startup.Sym("RATIONAL"),
+        ComplexSingleParts => Startup.Sym("SINGLE-FLOAT"),
+        ComplexDoubleParts => Startup.Sym("DOUBLE-FLOAT"),
+        ComplexSingleParts | ComplexDoubleParts => Startup.Sym("FLOAT"),
+        ComplexRationalParts | ComplexSingleParts =>
+            List(Startup.Sym("OR"), Startup.Sym("SINGLE-FLOAT"), Startup.Sym("RATIONAL")),
+        ComplexRationalParts | ComplexDoubleParts =>
+            List(Startup.Sym("OR"), Startup.Sym("DOUBLE-FLOAT"), Startup.Sym("RATIONAL")),
+        _ => Startup.Sym("REAL"),
+    };
+
+    /// <summary>TYPEP of (COMPLEX PART-SPEC).</summary>
+    internal static bool IsComplexOfParts(LispObject obj, LispObject? partSpec)
+    {
+        if (obj is not LispComplex cx) return false;
+        int mask = ComplexPartMask(partSpec, out bool exact);
+        if (exact)
+        {
+            if (ComplexPartClass(cx.Real) == ComplexRationalParts)
+                return (mask & ComplexRationalParts) != 0;
+            return IsTruthy(Typep(cx.Real, partSpec!)) && IsTruthy(Typep(cx.Imaginary, partSpec!));
+        }
+        if (mask == ComplexAllParts) return true;
+        int have = ComplexPartClass(cx.Real) | ComplexPartClass(cx.Imaginary);
+        return have != 0 && (have & ~mask) == 0;
     }
 
     // Extract raw LispObject car/cdr from CONS compound type
@@ -1579,11 +1805,36 @@ public static partial class Runtime
             var ct1 = TypeParser.Parse(type1);
             var ct2 = TypeParser.Parse(type2);
             var (result, certain) = CTypeOps.Subtypep(ct1, ct2);
+            // A symbol that names no type says nothing about which objects it
+            // holds, so only a YES is an answer (NIL <: X, X <: T, X <: X, ...).
+            // Like SBCL, any NO is uncertain then.
+            if (!result && (CTypeOps.ContainsUnknownName(ct1) || CTypeOps.ContainsUnknownName(ct2)))
+            {
+                if (!certain)
+                {
+                    try
+                    {
+                        if (SubtypepByName(type1, type2) != Nil.Instance)
+                        {
+                            MultipleValues.SetPair(T.Instance, T.Instance);
+                            return T.Instance;
+                        }
+                    }
+                    catch { }
+                }
+                MultipleValues.SetPair(Nil.Instance, Nil.Instance);
+                return Nil.Instance;
+            }
             if (certain)
             {
                 if (s_ctypeStatsOn) s_ctypeHits++;
                 MultipleValues.SetPair(result ? T.Instance : Nil.Instance, T.Instance);
                 return result ? T.Instance : Nil.Instance;
+            }
+            if (CTypeOps.HasMemberWitness(ct1, ct2, type1, type2))
+            {
+                MultipleValues.SetPair(Nil.Instance, T.Instance);
+                return Nil.Instance;
             }
             if (s_ctypeStatsOn) s_ctypeMisses++;
         }
@@ -1591,7 +1842,12 @@ public static partial class Runtime
         {
             if (s_ctypeStatsOn) s_ctypeErrors++;
         }
+        return SubtypepByName(type1, type2);
+    }
 
+    /// <summary>The rules on type specifiers that the CType algebra does not cover.</summary>
+    private static LispObject SubtypepByName(LispObject type1, LispObject type2)
+    {
         string? name1 = TypeSpecToName(type1);
         string? name2 = TypeSpecToName(type2);
 
@@ -1778,84 +2034,34 @@ public static partial class Runtime
             return res ? T.Instance : Nil.Instance;
         }
 
-        // Handle COMPLEX compound type specifiers
-        // (COMPLEX type1) <: (COMPLEX type2) iff upgraded-complex-part-type of both are same
-        // Since our implementation upgrades everything to REAL, all (COMPLEX type) are equivalent
+        // Handle COMPLEX type specifiers: (COMPLEX T1) <: (COMPLEX T2) iff the
+        // upgraded part type of T1 is a subtype of that of T2 (CLHS 12.1.5.3).
         {
             var cx1 = ExtractComplexPartType(type1, name1);
             var cx2 = ExtractComplexPartType(type2, name2);
-            if (cx1 != null && cx2 != null)
+            bool exact1 = false, exact2 = false;
+            int? m1 = cx1 == null ? null : ComplexPartMask(ExtractComplexPartTypeRaw(type1, name1), out exact1);
+            int? m2 = cx2 == null ? null : ComplexPartMask(ExtractComplexPartTypeRaw(type2, name2), out exact2);
+            // An exact part type is compared by the algebra (CType) or not at all.
+            if (exact1 || exact2) { m1 = null; m2 = null; cx1 = cx2 = null; }
+            if (m1 is int a1 && m2 is int a2)
             {
-                // Both are COMPLEX types
-                // cx="*" means bare COMPLEX = union of all complex subtypes
-                if (cx1 == "*" && cx2 == "*")
-                {
-                    // Both bare COMPLEX -> equivalent
-                    MultipleValues.SetPair(T.Instance, T.Instance); return T.Instance;
-                }
-                if (cx2 == "*")
-                {
-                    // (COMPLEX type) <: COMPLEX -> always true
-                    MultipleValues.SetPair(T.Instance, T.Instance); return T.Instance;
-                }
-                if (cx1 == "*")
-                {
-                    // COMPLEX <: (COMPLEX type) -> true only if all ucpt collapse to same
-                    // COMPLEX includes SF, DF, and REAL complex numbers, so false unless type->REAL
-                    // But actually bare COMPLEX = (COMPLEX *) which is all complex numbers
-                    // It's only a subtype of (COMPLEX type) if (COMPLEX type) covers everything
-                    // That only happens if all our upgraded types (REAL, SF, DF) equal ucpt(type)
-                    // which is impossible since they differ. So: false.
-                    MultipleValues.SetPair(Nil.Instance, T.Instance); return Nil.Instance;
-                }
-                // Both are specific compound types: compare upgraded part types.
-                // CLHS 12.1.5.3: (complex T1) <: (complex T2) if ucpt(T1) = ucpt(T2).
-                // Also: if T1 <: T2, then (complex T1) <: (complex T2) by set inclusion,
-                // because (complex T2) includes all specialized representations whose
-                // part types are subtypes of T2.
-                var up1 = UpgradeComplexPartTypeName(cx1);
-                var up2 = UpgradeComplexPartTypeName(cx2);
-                if (up1 == up2)
-                {
-                    MultipleValues.SetPair(T.Instance, T.Instance); return T.Instance;
-                }
-                // Fallback: check if part type T1 <: part type T2 via raw subtypep
-                var raw1 = ExtractComplexPartTypeRaw(type1, name1);
-                var raw2 = ExtractComplexPartTypeRaw(type2, name2);
-                if (raw1 != null && raw2 != null)
-                {
-                    var partSub = Subtypep(raw1, raw2);
-                    var mv = MultipleValues.Get();
-                    var partCertain = mv.Length > 1 ? mv[1] : Nil.Instance;
-                    if (partSub != Nil.Instance && partCertain != Nil.Instance)
-                    {
-                        MultipleValues.SetPair(T.Instance, T.Instance); return T.Instance;
-                    }
-                }
-                MultipleValues.SetPair(Nil.Instance, T.Instance);
-                return Nil.Instance;
+                bool res = (a1 & ~a2) == 0;
+                MultipleValues.SetPair(res ? T.Instance : Nil.Instance, T.Instance);
+                return res ? T.Instance : Nil.Instance;
             }
-            if (cx1 != null && name2 != null)
+            if (m1 is int b1 && name2 != null)
             {
                 // (COMPLEX type) <: COMPLEX, NUMBER, T
-                bool res = name2 is "COMPLEX" or "NUMBER" or "T" or "ATOM";
+                bool res = b1 == 0 || name2 is "COMPLEX" or "NUMBER" or "T" or "ATOM";
                 MultipleValues.SetPair(res ? T.Instance : Nil.Instance, T.Instance);
                 return res ? T.Instance : Nil.Instance;
             }
-            if (cx2 != null && name1 != null)
+            if (m2 is int && name1 != null && name1 is not ("NIL" or "EXTENDED-CHAR"))
             {
-                if (cx2 == "*")
-                {
-                    // name1 <: COMPLEX: true if name1 is COMPLEX
-                    bool res2 = name1 == "COMPLEX";
-                    MultipleValues.SetPair(res2 ? T.Instance : Nil.Instance, T.Instance);
-                    return res2 ? T.Instance : Nil.Instance;
-                }
-                // name1 <: (COMPLEX type): COMPLEX <: (COMPLEX type) only if all ucpts
-                // are subtypes of ucpt(type), which requires ucpt(type) = REAL
-                bool res = name1 == "COMPLEX" && UpgradeComplexPartTypeName(cx2) == "REAL";
-                MultipleValues.SetPair(res ? T.Instance : Nil.Instance, T.Instance);
-                return res ? T.Instance : Nil.Instance;
+                // A non-empty named type is not a subtype of a complex type smaller than COMPLEX.
+                MultipleValues.SetPair(Nil.Instance, T.Instance);
+                return Nil.Instance;
             }
         }
 

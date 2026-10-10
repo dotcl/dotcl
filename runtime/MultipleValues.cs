@@ -326,13 +326,16 @@ public static class MultipleValues
     /// when values cross a boundary that cannot carry the channel. A negative
     /// count means nobody published, which is how a function returning one
     /// value the ordinary way looks. Otherwise the channel is what the callee
-    /// published, including the zero-length case for (VALUES).
+    /// published, including the zero-length case for (VALUES), but only when its
+    /// first value IS the primary: values an inner form published before the
+    /// call returned something else (a constant after a non-local exit, under
+    /// the interpreter) are not this call's. That is the test
+    /// MULTIPLE-VALUE-LIST makes (OwnCount), so the host and Lisp agree.
     /// </summary>
     public static LispObject[] Of(LispObject primary)
     {
         if (primary is MvReturn mv) return mv.ToArray();
-        MaterializeSnap();
-        if (_count < 0) return new[] { primary };
+        if (OwnCount(primary) < 0) return new[] { primary };
         return Get();
     }
 

@@ -101,6 +101,14 @@ public class SlotDefinition : LispObject
 public class LispClass : LispObject
 {
     public Symbol Name { get; set; }
+    /// <summary>A fixed, well-spread number for this class, which the generic
+    /// function dispatch tables hash class vectors by. Assigned once, so it does not
+    /// change when the class is redefined (the tables are keyed by the class object,
+    /// and a redefinition starts a new method epoch anyway).</summary>
+    internal readonly int DispatchHash = NextDispatchHash();
+    private static int s_dispatchHashSeed;
+    private static int NextDispatchHash()
+        => unchecked(System.Threading.Interlocked.Increment(ref s_dispatchHashSeed) * (int)0x9E3779B1);
     /// <summary>True when (setf (class-name ...) nil) was called to clear the proper name.</summary>
     public bool NameCleared { get; set; }
     /// <summary>The metaclass of this class. Null means STANDARD-CLASS (default).</summary>
@@ -1056,7 +1064,24 @@ public class LispMethod : LispObject
     // :BEFORE, :AFTER, :AROUND, or empty. Any non-list atom may be a qualifier
     // (CLHS DEFMETHOD), so T and numbers are kept too; T is not a Symbol here.
     public LispObject[] Qualifiers { get; set; }
-    public LispFunction Function { get; set; }
+    public LispFunction Function
+    {
+        get => _function;
+        // A new function is not the body the flag below was decided for.
+        set { _function = value; IgnoresNextMethodState = false; }
+    }
+    private LispFunction _function = null!;
+
+    /// <summary>True when DEFMETHOD found that the body cannot reach the next-method
+    /// state of its invocation: it never mentions CALL-NEXT-METHOD or NEXT-METHOD-P,
+    /// uses no macro that could expand into them, and the method lambda is the one
+    /// DEFMETHOD wrote (not one a MAKE-METHOD-LAMBDA method returned). Such a method,
+    /// first in its chain, is called without publishing the chain, the arguments or
+    /// the CALL-NEXT-METHOD closures: nothing would read them, the next methods are
+    /// reachable only through CALL-NEXT-METHOD from this body. False for everything
+    /// else, which keeps the full protocol.</summary>
+    internal bool IgnoresNextMethodState;
+
 
     /// <summary>The method function as AMOP defines it: called with a list of the
     /// generic function's arguments and a list of the next methods. dotcl's own
@@ -1159,6 +1184,10 @@ internal class CachedDispatch
     public List<LispMethod> Primary = null!;
     public List<LispMethod> After = null!;
     public List<LispMethod>? Applicable; // for built-in method combination
+    /// <summary>For a built-in operator combination: the operator's methods and the
+    /// :around methods, already partitioned and sorted for these argument classes.</summary>
+    public List<LispMethod>? BuiltinCombined;
+    public List<LispMethod>? BuiltinAround;
     public bool HasEqlSpecializers;
     public bool IsBuiltinCombination;
     /// <summary>EQL-specialized methods to check on cache hit (only when HasEqlSpecializers).
@@ -1392,25 +1421,170 @@ public class GenericFunction : LispFunction
     /// <summary>Max entries in the polymorphic dispatch cache.</summary>
     internal const int DispatchCacheWidth = 4;
 
-    /// <summary>Second level behind <see cref="DispatchCache"/>: every entry made for
-    /// one dispatch class, by that class. The cache belongs to the generic function,
-    /// not to a call site, so INITIALIZE-INSTANCE or PRINT-OBJECT in a program that
-    /// uses more classes than the front cache holds would otherwise recompute the
-    /// applicable methods on most calls. Valid only while <see cref="MethodEpoch"/>
-    /// is the one it was made under: a method change or a class (re)finalization
-    /// anywhere starts a new one.</summary>
-    internal volatile DispatchTable1? DispatchByClass;
+    /// <summary>Second level behind <see cref="DispatchCache"/>: every entry this
+    /// generic function has made, keyed by its class vector. The front cache holds the
+    /// last few; a generic function called with more class combinations than that
+    /// (INITIALIZE-INSTANCE over a program's classes, a two-argument function that
+    /// specializes its second parameter on a handful of classes) would otherwise
+    /// recompute the applicable methods on most calls. Valid only while
+    /// <see cref="MethodEpoch"/> is the one it was made under: a method change or a
+    /// class (re)finalization anywhere starts a new one. Every key in one table has
+    /// <see cref="DispatchTable.Width"/> classes.</summary>
+    internal volatile DispatchTable? DispatchByClasses;
 
-    internal sealed class DispatchTable1
+    /// <summary>An open-addressing hash table from class vectors to cache entries,
+    /// read without locking and without allocating. The slot array and the slot
+    /// objects in it are never changed once published: an insert writes a new slot
+    /// object into an empty position (or replaces one with the same key) under the
+    /// table's lock, and a resize publishes a new array. A reader therefore sees each
+    /// position either empty or holding a complete slot.
+    ///
+    /// Up to four classes are kept in fields of the slot, so the loose-argument entry
+    /// points look up a call's classes without first putting them in an array; wider
+    /// keys compare the key array against the argument array.</summary>
+    internal sealed class DispatchTable
     {
         internal readonly int Epoch;
-        internal readonly System.Collections.Concurrent.ConcurrentDictionary<LispClass, CachedDispatch> Map
-            = new(ReferenceEqualityComparer.Instance);
-        internal DispatchTable1(int epoch) { Epoch = epoch; }
+        internal readonly int Width;
+        private volatile Slot?[] _slots = new Slot?[8];
+        private int _count;
+
+        internal sealed class Slot
+        {
+            internal readonly LispClass? C0, C1, C2, C3;
+            internal readonly LispClass?[] Key;
+            internal readonly CachedDispatch Entry;
+            internal Slot(LispClass?[] key, CachedDispatch entry)
+            {
+                Key = key; Entry = entry;
+                if (key.Length > 0) C0 = key[0];
+                if (key.Length > 1) C1 = key[1];
+                if (key.Length > 2) C2 = key[2];
+                if (key.Length > 3) C3 = key[3];
+            }
+        }
+
+        internal DispatchTable(int epoch, int width) { Epoch = epoch; Width = width; }
+
+        private static int H(LispClass? c) => c == null ? 0x5bd1e995 : c.DispatchHash;
+
+        private const int Golden = unchecked((int)0x9E3779B1);
+
+        private static int Mix(int h) { h = unchecked(h * Golden); return h ^ (int)((uint)h >> 15); }
+
+        internal static int Hash(LispClass? c0, LispClass? c1, LispClass? c2, LispClass? c3, int width)
+        {
+            int h = H(c0);
+            if (width > 1) h = h * 31 + H(c1);
+            if (width > 2) h = h * 31 + H(c2);
+            if (width > 3) h = h * 31 + H(c3);
+            return Mix(h);
+        }
+
+        private static int HashKey(LispClass?[] key)
+        {
+            if (key.Length <= 4)
+                return Hash(key.Length > 0 ? key[0] : null, key.Length > 1 ? key[1] : null,
+                            key.Length > 2 ? key[2] : null, key.Length > 3 ? key[3] : null, key.Length);
+            int h = H(key[0]);
+            for (int i = 1; i < key.Length; i++) h = h * 31 + H(key[i]);
+            return Mix(h);
+        }
+
+        /// <summary>The entry for one to four classes (WIDTH of them), or null.</summary>
+        internal CachedDispatch? Lookup(LispClass? c0, LispClass? c1, LispClass? c2, LispClass? c3)
+        {
+            var slots = _slots;
+            int mask = slots.Length - 1;
+            int i = Hash(c0, c1, c2, c3, Width) & mask;
+            while (true)
+            {
+                var sl = slots[i];
+                if (sl == null) return null;
+                if (ReferenceEquals(sl.C0, c0) && ReferenceEquals(sl.C1, c1)
+                    && ReferenceEquals(sl.C2, c2) && ReferenceEquals(sl.C3, c3))
+                    return sl.Entry;
+                i = (i + 1) & mask;
+            }
+        }
+
+        /// <summary>The entry for the classes of ARGS[0..WIDTH), or null. ARGS must
+        /// hold at least WIDTH arguments.</summary>
+        internal CachedDispatch? LookupArgs(LispObject[] args, Func<LispObject, LispClass?> classOf)
+        {
+            if (Width <= 4)
+                return Lookup(classOf(args[0]),
+                              Width > 1 ? classOf(args[1]) : null,
+                              Width > 2 ? classOf(args[2]) : null,
+                              Width > 3 ? classOf(args[3]) : null);
+            var key = new LispClass?[Width];
+            for (int k = 0; k < key.Length; k++) key[k] = classOf(args[k]);
+            var slots = _slots;
+            int mask = slots.Length - 1;
+            int i = HashKey(key) & mask;
+            while (true)
+            {
+                var sl = slots[i];
+                if (sl == null) return null;
+                if (SameKey(sl.Key, key)) return sl.Entry;
+                i = (i + 1) & mask;
+            }
+        }
+
+        private static bool SameKey(LispClass?[] a, LispClass?[] b)
+        {
+            if (a.Length != b.Length) return false;
+            for (int i = 0; i < a.Length; i++)
+                if (!ReferenceEquals(a[i], b[i])) return false;
+            return true;
+        }
+
+        internal void Add(LispClass?[] key, CachedDispatch entry)
+        {
+            lock (this)
+            {
+                var slots = _slots;
+                if ((_count + 1) * 2 > slots.Length)
+                {
+                    var bigger = new Slot?[slots.Length * 2];
+                    foreach (var old in slots)
+                        if (old != null) Place(bigger, old);
+                    slots = bigger;
+                    _slots = bigger;
+                }
+                if (Place(slots, new Slot(key, entry))) _count++;
+            }
+        }
+
+        /// <summary>Put SL at its position in SLOTS, replacing a slot with the same key.
+        /// True when it took an empty position.</summary>
+        private static bool Place(Slot?[] slots, Slot sl)
+        {
+            int mask = slots.Length - 1;
+            int i = HashKey(sl.Key) & mask;
+            while (true)
+            {
+                var cur = slots[i];
+                if (cur == null)
+                {
+                    System.Threading.Volatile.Write(ref slots[i], sl);
+                    return true;
+                }
+                if (SameKey(cur.Key, sl.Key))
+                {
+                    System.Threading.Volatile.Write(ref slots[i], sl);
+                    return false;
+                }
+                i = (i + 1) & mask;
+            }
+        }
     }
 
     /// <summary>Invalidate dispatch cache when methods are added/removed.</summary>
-    internal void InvalidateCache() { DispatchCache = null; DispatchByClass = null; BumpMethodEpoch(); }
+    internal void InvalidateCache()
+    {
+        DispatchCache = null; DispatchByClasses = null; BumpMethodEpoch();
+    }
 
     /// <summary>Global method-system epoch. Bumped on any method add/remove (via
     /// <see cref="InvalidateCache"/>) and on any class finalization (slot-layout change).

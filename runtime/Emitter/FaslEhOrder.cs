@@ -8,7 +8,7 @@ using System.Reflection.PortableExecutable;
 namespace DotCL.Emitter;
 
 /// <summary>
-/// Post-processes a freshly-saved .fasl so its exception-handling clauses are
+/// Post-processes a freshly-built .fasl image so its exception-handling clauses are
 /// ordered the way the CLR requires: a clause nested inside another clause's
 /// protected region, its try, its filter, or its handler, must be listed
 /// before the clause that encloses it.
@@ -27,7 +27,10 @@ namespace DotCL.Emitter;
 /// compile-file) is ordered correctly, so this only ever showed up in .fasl.
 ///
 /// The rewrite is in place and size-preserving: clause records are fixed width
-/// and only their order changes, so every offset in the file stays valid.
+/// and only their order changes, so every offset in the image stays valid.
+/// It runs on the image in memory, before the file is written: reading a
+/// just-written PE back costs a full antivirus scan on Windows (about 0.3 s a
+/// file under Defender), paid for every fasl compile-file produces.
 /// </summary>
 internal static class FaslEhOrder
 {
@@ -47,12 +50,12 @@ internal static class FaslEhOrder
     private const int SmallClauseSize = 12;
 
     /// <summary>
-    /// Reorder the exception clauses of every method in the fasl that needs it.
-    /// Returns the number of methods rewritten (0 leaves the file untouched).
+    /// Reorder, in <paramref name="bytes"/> (a whole PE image), the exception
+    /// clauses of every method that needs it. Returns the number of methods
+    /// rewritten (0 leaves the image untouched).
     /// </summary>
-    public static int Fix(string faslPath)
+    public static int Fix(byte[] bytes)
     {
-        byte[] bytes = File.ReadAllBytes(faslPath);
         int fixedMethods = 0;
 
         using (var ms = new MemoryStream(bytes, writable: false))
@@ -74,8 +77,6 @@ internal static class FaslEhOrder
             }
         }
 
-        if (fixedMethods > 0)
-            File.WriteAllBytes(faslPath, bytes);
         return fixedMethods;
     }
 

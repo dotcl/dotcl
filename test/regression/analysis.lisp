@@ -400,7 +400,17 @@
 (defun bindpos-let (x)
   (let ((bindpos-marker x)) (list bindpos-marker)))
 
-;; The three functions above were compiled at file-load time. The macro must
+;; lambda param named after the macro, the lambda passed as an argument
+;; (series has #'(lambda (alter &rest other-info) ...) with ALTER a macro).
+(defun bindpos-lambda (x)
+  (funcall (lambda (bindpos-marker &rest more) (list* bindpos-marker more)) x))
+
+(defun bindpos-function-lambda (x)
+  (funcall #'(lambda (bindpos-marker &optional (y (list bindpos-marker)))
+               (list bindpos-marker y))
+           x))
+
+;; The functions above were compiled at file-load time. The macro must
 ;; not have expanded during any of those compiles.
 (deftest bindpos-no-spurious-expansion
   *bindpos-expand-count*
@@ -410,6 +420,8 @@
 (deftest bindpos-labels-result (bindpos-labels 'a) (a))
 (deftest bindpos-flet-result (bindpos-flet 'b) (b))
 (deftest bindpos-let-result (bindpos-let 'c) (c))
+(deftest bindpos-lambda-result (bindpos-lambda 'd) (d))
+(deftest bindpos-function-lambda-result (bindpos-function-lambda 'e) (e (e)))
 
 ;; A form can LOOK like a binding special form without being one: a DOLIST
 ;; spec whose variable is named LET reads as (LET <list-form>), i.e. car LET

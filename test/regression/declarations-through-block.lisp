@@ -24,7 +24,7 @@
 (setf dotcl:*save-sil* t)
 
 (defun %dtb-has (needle fn)
-  (and (search needle (princ-to-string (dotcl:function-sil fn))) t))
+  (and (search needle (%flat-text (dotcl:function-sil fn))) t))
 
 ;;; ---- consumer 1: the loop back-edge safepoint ----
 

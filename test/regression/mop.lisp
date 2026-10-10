@@ -368,11 +368,11 @@
 
 (deftest mop-reader-method-class
   (class-name (dotcl-mop:reader-method-class (find-class 'mop-dog) nil))
-  standard-method)
+  dotcl-mop:standard-reader-method)
 
 (deftest mop-writer-method-class
   (class-name (dotcl-mop:writer-method-class (find-class 'mop-dog) nil))
-  standard-method)
+  dotcl-mop:standard-writer-method)
 
 ;;; specializer-direct-methods: every method specialized on mop-animal.
 ;;; mop-speak has one (the (mop-animal) method); accessor mop-animal-name adds a
@@ -1110,8 +1110,9 @@
 ;;; Class-side protocols: AMOP has class initialization ask the metaclass for the
 ;;; accessor method classes, finalization go through compute-default-initargs, and
 ;;; (setf class-name) be a reinitialization rather than a field write. dotcl does
-;;; not use the accessor method class for anything -- it builds plain standard
-;;; methods -- so what the protocol buys there is the call.
+;;; not use the accessor method class to build anything -- it picks
+;;; STANDARD-READER-METHOD / STANDARD-WRITER-METHOD itself -- so what the protocol
+;;; buys there is the call.
 
 (defvar *mop-class-protocol-seen* nil)
 

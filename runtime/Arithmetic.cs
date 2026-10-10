@@ -280,6 +280,7 @@ public static class Arithmetic
         if (a is Fixnum fa && b is Fixnum fb)
         {
             long av = fa.Value, bv = fb.Value;
+            if (bv == -1) return Fixnum.Make(0);
             long r = av % bv;
             // CL mod: result has same sign as divisor
             if (r != 0 && ((r ^ bv) < 0)) r += bv;
@@ -482,6 +483,12 @@ public static class Arithmetic
         // instead of rationalizing (which would throw "cannot be converted").
         if (IsNonFiniteFloat(a, aFloat) || IsNonFiniteFloat(b, bFloat))
             return ToDouble(a) == ToDouble(b);
+        // A float against a fixnum: the float equals it only when it is a whole
+        // number, and a whole double inside the long range converts exactly, so
+        // the comparison needs no rational at all. ZEROP on a float coefficient
+        // used to build one (and box it) on every call.
+        if (aFloat && b is Fixnum bfx) return FloatEqualsLong(ToDouble(a), bfx.Value);
+        if (bFloat && a is Fixnum afx) return FloatEqualsLong(ToDouble(b), afx.Value);
         if (aFloat && !bFloat) {
             // convert a (float) to rational, then compare as rationals
             var ar = FloatToRational(a);
@@ -507,6 +514,15 @@ public static class Arithmetic
         var (an, ad) = AsRational(a);
         var (bn, bd) = AsRational(b);
         return an * bd == bn * ad;
+    }
+
+    /// <summary>Exact = between a finite double and a long. -2^63 &lt;= d &lt; 2^63 is
+    /// the range in which (long)d is exact for a whole d.</summary>
+    private static bool FloatEqualsLong(double d, long v)
+    {
+        if (System.Math.Floor(d) != d) return false;
+        if (d < -9.2233720368547758E18 || d >= 9.2233720368547758E18) return false;
+        return (long)d == v;
     }
 
     public static int Compare(Number a, Number b)
@@ -712,6 +728,9 @@ public static class Arithmetic
         if (a is Fixnum fa && b is Fixnum fb)
         {
             long av = fa.Value, bv = fb.Value;
+            // A divisor of -1 divides exactly; negate instead, since
+            // most-negative-fixnum / -1 overflows the int64 division.
+            if (bv == -1) return (Negate(fa), Fixnum.Make(0));
             long q = Math.DivRem(av, bv, out long r);
             // Floor: round toward negative infinity: adjust if remainder has different sign from divisor
             if (r != 0 && ((r ^ bv) < 0)) { q--; r += bv; }
@@ -743,6 +762,9 @@ public static class Arithmetic
         if (a is Fixnum fa && b is Fixnum fb)
         {
             long av = fa.Value, bv = fb.Value;
+            // A divisor of -1 divides exactly; negate instead, since
+            // most-negative-fixnum / -1 overflows the int64 division.
+            if (bv == -1) return (Negate(fa), Fixnum.Make(0));
             long q = Math.DivRem(av, bv, out long r);
             return (Fixnum.Make(q), Fixnum.Make(r));
         }
@@ -769,6 +791,9 @@ public static class Arithmetic
         if (a is Fixnum fa && b is Fixnum fb)
         {
             long av = fa.Value, bv = fb.Value;
+            // A divisor of -1 divides exactly; negate instead, since
+            // most-negative-fixnum / -1 overflows the int64 division.
+            if (bv == -1) return (Negate(fa), Fixnum.Make(0));
             long q = Math.DivRem(av, bv, out long r);
             // Ceiling: round toward positive infinity: adjust if remainder has same sign as divisor
             if (r != 0 && ((r ^ bv) >= 0)) { q++; r -= bv; }

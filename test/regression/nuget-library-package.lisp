@@ -12,7 +12,7 @@
 ;;; file rather than defined in this file, because a DEFSYSTEM inside a file the
 ;;; suite LOADs makes ASDF treat this file as its definition.
 
-(require "dotcl-nuget-asdf")
+(require "asdf-nuget")
 
 (defun nlp-dir (tag)
   (let ((d (nuget::%combine (regression-temp-dir)
@@ -36,7 +36,7 @@ return the system."
     (nlp-write dir "src/nlp.lisp" "(defpackage :nlp-test (:use :cl))")
     (nlp-write dir (format nil "~a.asd" name)
                (format nil "(defsystem ~s :version \"1.2.3\" :author \"someone\"
-  :description \"a test library\" :defsystem-depends-on (\"dotcl-nuget-asdf\")
+  :description \"a test library\" :defsystem-depends-on (\"asdf-nuget\")
   :serial t :components (~a))" name components))
     (asdf:load-asd (nuget::%combine dir (format nil "~a.asd" name)))
     (asdf:find-system name)))
@@ -62,7 +62,7 @@ return the system."
 ;;; :FASL NIL: compiling would perform the (:nuget ...) component, which resolves
 ;;; a real package. The compiled shape is checked below on a system without one.
 (defparameter *nlp-package*
-  (dotcl-nuget-asdf::%pack-library
+  (asdf-nuget::%pack-library
    (nlp-system "nlp-lib" "(:nuget \"Newtonsoft.Json\" :nuget-version \"13.0.3\") (:file \"src/nlp\")")
    (nlp-dir "out")
    :fasl nil))
@@ -91,7 +91,7 @@ return the system."
 ;;; it, and which version it means is the consumer's lock file's business.
 (deftest nuget-library.floating-dependency-is-refused
   (handler-case
-      (progn (dotcl-nuget-asdf::%pack-library
+      (progn (asdf-nuget::%pack-library
               (nlp-system "nlp-float" "(:nuget \"Newtonsoft.Json\" :nuget-version \"13.*\")")
               (nlp-dir "out") :fasl nil)
              :no-error)
@@ -141,16 +141,15 @@ return the system."
 ;;; --- shipping the compiled code --------------------------------------------
 ;;;
 ;;; The fasls go in beside their sources, with dotcl-build.sexp naming the
-;;; compiler that made them. The consumer copies them to where ASDF looks (its
-;;; output translation of the source) when the compiler matches, and compiles
-;;; the sources otherwise.
+;;; dotcl that made them and its platform. The consumer copies them to where
+;;; ASDF looks (its output translation of the source).
 
 ;;; Packing compiles, which an emit-free build cannot: those tests are skipped there.
 (defparameter *nlp-compiled-system* (nlp-system "nlp-compiled" "(:file \"src/nlp\")"))
 
 (defparameter *nlp-compiled-package*
   (when (emitting-mode-p)
-    (dotcl-nuget-asdf::%pack-library *nlp-compiled-system* (nlp-dir "out"))))
+    (asdf-nuget::%pack-library *nlp-compiled-system* (nlp-dir "out"))))
 
 (deftest-emitting-only nuget-library.fasls-ship-beside-sources
   (nlp-zip-entries *nlp-compiled-package*)
@@ -200,7 +199,7 @@ return the system."
                      (dotnet:invoke (dotnet:static "System.IO.File" "GetLastWriteTimeUtc" fasl)
                                     "AddSeconds" (if older-p -60d0 60d0)))
       (remove-if-not (lambda (n) (search "r2r" n))
-                     (nlp-zip-entries (dotcl-nuget-asdf::%pack-library sys (nlp-dir "out")))))))
+                     (nlp-zip-entries (asdf-nuget::%pack-library sys (nlp-dir "out")))))))
 
 (deftest-emitting-only nuget-library.fresh-sibling-ships
   (nlp-pack-with-sibling nil)
@@ -215,22 +214,22 @@ return the system."
 ;;; plus only what the sibling's file name adds. Leaving the drive out searched the
 ;;; current drive and cut the sibling's name two characters short.
 (deftest nuget-library.sibling-directory-keeps-the-drive
-  (list (dotcl-nuget-asdf::%fasl-directory
+  (list (asdf-nuget::%fasl-directory
          (make-pathname :device "C" :directory '(:absolute "Users" "u" "src")
                         :name "nlp.lisp" :type "fasl"))
-        (dotcl-nuget-asdf::%fasl-directory "C:/Users/u/src/nlp.lisp.fasl")
-        (dotcl-nuget-asdf::%fasl-directory "/home/u/src/nlp.lisp.fasl"))
+        (asdf-nuget::%fasl-directory "C:/Users/u/src/nlp.lisp.fasl")
+        (asdf-nuget::%fasl-directory "/home/u/src/nlp.lisp.fasl"))
   ("C:/Users/u/src/" "C:/Users/u/src/" "/home/u/src/"))
 
 (deftest nuget-library.sibling-entry-name
-  (list (dotcl-nuget-asdf::%sibling-entry
+  (list (asdf-nuget::%sibling-entry
          "src/nlp.lisp.fasl" "C:/Users/u/src/nlp.lisp.fasl"
          "C:/Users/u/src/nlp.lisp.fasl.r2r-win-arm64")
         ;; the sibling as found without the drive: the name must not shift
-        (dotcl-nuget-asdf::%sibling-entry
+        (asdf-nuget::%sibling-entry
          "src/nlp.lisp.fasl" "C:/Users/u/src/nlp.lisp.fasl"
          "/Users/u/src/nlp.lisp.fasl.r2r-win-arm64")
-        (dotcl-nuget-asdf::%sibling-entry
+        (asdf-nuget::%sibling-entry
          "src/nlp.lisp.fasl" "/home/u/src/nlp.lisp.fasl"
          "/home/u/src/nlp.lisp.fasl.r2r-linux-x64"))
   ("src/nlp.lisp.fasl.r2r-win-arm64"
@@ -245,8 +244,8 @@ record naming CORE."
     (nlp-write dir "src/x.lisp.fasl" "pretend fasl")
     (nlp-write dir "src/x.lisp.fasl.r2r-test-rid" "pretend sibling")
     (nlp-write dir "dotcl-build.sexp"
-               (format nil "(:dotcl-version ~s :core ~s :fasls ((\"src/x.lisp.fasl\" . \"src/x.lisp\")))"
-                       (lisp-implementation-version) core))
+               (format nil "(:dotcl-version ~s :core ~s :platform ~s :fasls ((\"src/x.lisp.fasl\" . \"src/x.lisp\")))"
+                       (lisp-implementation-version) core (nuget::%platform-features)))
     dir))
 
 (defun nlp-mtime (path)
@@ -257,7 +256,7 @@ record naming CORE."
 (deftest nuget-library.fasls-placed-for-asdf
   (let* ((dir (nlp-shipped-tree (funcall (find-symbol "%CORE-GENERATION" "DOTCL"))))
          (n (nuget::%place-fasls dir))
-         (target (namestring (uiop:compile-file-pathname* (nuget::%combine dir "src/x.lisp"))))
+         (target (namestring (uiop:compile-file-pathname* (truename (nuget::%combine dir "src/x.lisp")))))
          (sib (concatenate 'string target ".r2r-test-rid")))
     (list n
           (dotnet:static "System.IO.File" "ReadAllText" target)
@@ -266,13 +265,8 @@ record naming CORE."
           (> (nlp-mtime sib) (nlp-mtime target))))
   (1 "pretend fasl" "pretend sibling" t t))
 
-;;; Another compiler: nothing is placed, and ASDF will compile the sources.
-(deftest nuget-library.other-compiler-compiles-sources
-  (let* ((dir (nlp-shipped-tree "not-this-core"))
-         (*error-output* (make-broadcast-stream))
-         (n (nuget::%place-fasls dir)))
-    (list n (probe-file (uiop:compile-file-pathname* (nuget::%combine dir "src/x.lisp")))))
-  (nil nil))
+
+;;; Another dotcl or another platform: see nuget-fasl-version-mismatch.lisp.
 
 ;;; NuGet extracts zip times as UTC, which dates files hours into the future east
 ;;; of Greenwich; ASDF would then find every source newer than any fasl. The copy
@@ -314,17 +308,17 @@ record naming CORE."
 (defparameter *nlp-two* (nlp-two-dir-system))
 
 (deftest nuget-library.closure-follows-dependencies
-  (mapcar #'asdf:component-name (dotcl-nuget-asdf::%closure (list *nlp-two*)))
+  (mapcar #'asdf:component-name (asdf-nuget::%closure (list *nlp-two*)))
   ("nlp-dep" "nlp-top"))
 
-;;; dotcl-nuget-asdf is dotcl's own (a REQUIRE contrib), so it is not carried.
+;;; asdf-nuget is dotcl's own (a REQUIRE contrib), so it is not carried.
 (deftest nuget-library.closure-leaves-out-dotcl-systems
   (mapcar #'asdf:component-name
-          (dotcl-nuget-asdf::%closure (list (asdf:find-system "nlp-lib"))))
+          (asdf-nuget::%closure (list (asdf:find-system "nlp-lib"))))
   ("nlp-lib"))
 
 (defparameter *nlp-two-package*
-  (dotcl-nuget-asdf::%pack-library *nlp-two* (nlp-dir "out") :fasl nil :version "1.0.0"))
+  (asdf-nuget::%pack-library *nlp-two* (nlp-dir "out") :fasl nil :version "1.0.0"))
 
 ;;; Each directory is a group of its own; a plain file beside a .asd (one a
 ;;; :read-file-form might read) comes along; the systems file names the root.
@@ -347,7 +341,7 @@ record naming CORE."
     (nlp-write layout "dotcl/some.lisp.lib.systems" "(:systems (\"nlp-top\"))")
     (setf (nuget::state-out-dir (nuget::%state (nuget::%current-rid) (nuget::%current-tfm)))
           layout)
-    (dotcl-nuget-asdf::%package-systems (first (asdf:component-children sys))))
+    (asdf-nuget::%package-systems (first (asdf:component-children sys))))
   ("nlp-top"))
 
 ;;; A placed fasl is dated one second after its source, not at the moment it was
@@ -363,7 +357,44 @@ record naming CORE."
                    (dotnet:new "System.DateTime" 2020 1 1 0 0 0
                                (dotnet:static "System.DateTimeKind" "Utc")))
     (nuget::%place-fasls dir)
-    (let ((target (namestring (uiop:compile-file-pathname* src))))
+    (let ((target (namestring (uiop:compile-file-pathname* (truename src)))))
       (list (- (nlp-mtime target) (nlp-mtime src))
             (- (nlp-mtime (concatenate 'string target ".r2r-test-rid")) (nlp-mtime src)))))
   (10000000 20000000))
+
+;;; A layout reached through a symbolic link (the cache under /var or /tmp on
+;;; macOS): the fasl goes to the output translation of the source's truename,
+;;; which is how ASDF names the component. Placed under the link's own path, it
+;;; sat where ASDF never looks, and every shipped system compiled again.
+;;; Creating a link on Windows needs a privilege, so there the answer is given.
+(deftest nuget-library.fasls-placed-under-the-truename
+  (if (dotnet:static "System.OperatingSystem" "IsWindows")
+      (list 1 t)
+      (let* ((dir (nlp-shipped-tree (funcall (find-symbol "%CORE-GENERATION" "DOTCL"))))
+             (link (nuget::%combine (nlp-dir "link") "via")))
+        (dotnet:static "System.IO.Directory" "CreateSymbolicLink" link
+                       (string-right-trim "/\\" dir))
+        (let* ((linked (concatenate 'string link "/"))
+               (n (nuget::%place-fasls linked))
+               (target (uiop:compile-file-pathname*
+                        (truename (nuget::%combine linked "src/x.lisp")))))
+          (list n (and (probe-file target) t)))))
+  (1 t))
+
+;;; A packed system whose sources tie its fasls to the machine that compiles
+;;; them: the pack runs the portability check, warns with a
+;;; FASL-PORTABILITY-WARNING naming the place, and writes the package anyway.
+(deftest nuget-library.pack-warns-about-unportable-sources
+  (let* ((sys (nlp-system "nlp-unport" "(:file \"src/nlp\") (:file \"src/plat\")"))
+         (dir (namestring (asdf:system-source-directory sys)))
+         (warnings '()))
+    (nlp-write dir "src/plat.lisp" "#+unix (defun nlp-plat () 1)")
+    (let ((nupkg (handler-bind ((asdf-nuget:fasl-portability-warning
+                                  (lambda (w) (push w warnings) (muffle-warning w))))
+                   (asdf-nuget::%pack-library sys (nlp-dir "out")))))
+      (list (length warnings)
+            (mapcar #'asdf-nuget:finding-kind
+                    (asdf-nuget:fasl-portability-warning-findings (first warnings)))
+            (and (search "plat.lisp:1: read-platform" (princ-to-string (first warnings))) t)
+            (and (probe-file nupkg) t))))
+  (1 (:read-platform) t t))

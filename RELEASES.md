@@ -3,6 +3,159 @@
 User-facing release notes for dotcl. Each section corresponds to a tagged
 release on the public mirror (dotcl/dotcl).
 
+## v0.1.33 -- 2026-10-09
+
+This is a performance release. For small kernels whose types are declared,
+dotcl now generates code close to what C# gets for the same code: on one
+Linux x86-64 machine (minimum of alternating runs), the ratio to C# for a
+`tak` kernel went from 2.70 to 0.96, for `fib` from 4.68 to 1.46, and for a
+loop over struct slots from 4.06 to 1.00.
+
+Real libraries, which mix typed and untyped code, are faster too but still
+behind SBCL. Compared with 0.1.32 on the same machine, ironclad's own test
+suite (470 tests) takes 35.8 s instead of 156.2 s (SBCL 2.6.8: 6.8 s), and
+compiling Coalton's `tests/seq-tests.lisp`, which mostly runs Coalton's own
+type checker, takes 411 s instead of 1,112 s (SBCL 2.6.8: 76 s).
+
+### Upgrading
+
+Some code that used to pass quietly now signals an error, as it does in SBCL.
+
+- **Storing a value outside the element type of a specialized array signals
+  TYPE-ERROR.** `(setf (aref a i) #x1ffffffff)` on an `(unsigned-byte 32)`
+  array used to store the value without an error. This covers
+  `(unsigned-byte 32)`, `(signed-byte 8)`, `(signed-byte 16)` and the other
+  integer arrays whose element type is narrower than their storage.
+- **Storing an integer or a float of another width into a `double-float` or
+  `single-float` array signals TYPE-ERROR.** It used to be converted. The
+  `:initial-element` of `adjust-array` is checked the same way.
+- **With safety 1 or higher, a variable declared as one array type that
+  receives an array of a different element type signals TYPE-ERROR.**
+- **`upgraded-array-element-type` of a range type such as
+  `(integer 0 4294967295)` is now `(unsigned-byte 32)`, the specialized type of
+  matching width.** It used to be `(signed-byte 64)`.
+- **`write-byte` and `write-sequence` to a binary stream signal TYPE-ERROR for
+  an integer that does not fit the element size.** They used to write the low
+  bits.
+- **Wide writes that run past the end of a vector, such as ironclad's
+  `(setf ub32ref/le)`, signal TYPE-ERROR and write nothing.**
+- **ASDF stops with COMPILE-FILE-ERROR when `compile-file` fails**, as in SBCL
+  (`uiop:*compile-file-failure-behaviour*` is `:error` after
+  `(require "asdf")`).
+- **`(defun "name" ...)` signals TYPE-ERROR**, in compiled and interpreted code.
+  `read-char` and the other input functions signal TYPE-ERROR when given a
+  string or a number instead of a stream.
+- **`dolist` makes a fresh binding of the variable for each element**, so a
+  closure made in the body sees its own element.
+- **`directory` returns truenames** (symbolic links resolved), as in SBCL; pass
+  `:resolve-symlinks nil` to keep the names as found.
+- **FFI `long` and `unsigned long` have the size of the running OS's ABI**: 4
+  bytes on Windows, 8 on 64-bit Linux and macOS.
+
+The bundled modules are now named by kind, and docs/extensions.md lists them
+that way:
+
+- **`dotcl-cs`, `dotcl-nuget` and `dotcl-nuget-asdf` are now `dotnet-cs`,
+  `dotnet-nuget` and `asdf-nuget`.** Their `require` names, systems and
+  packages changed with them (`dotnet-cs:inline-cs`, `asdf-nuget:nuget-package`;
+  the `nuget` package keeps its name), and the lock file is now
+  `dotnet-nuget.lock.json`. `dotcl-kestrel` is no longer bundled.
+  `dotcl pack --library` now reads the sources it packs for what would tie
+  their fasls to one OS or CPU, and prints a warning for what it finds; the
+  same check is `(asdf:operate 'asdf-nuget:check-portability-op "my-lib")`.
+
+### Faster
+
+- **Functions with `ftype` declarations call each other with raw numbers.**
+  A global function whose arguments and result are integers that fit 64 bits or
+  `double-float`s is compiled to a typed body and called without boxing.
+  Self-recursive functions without an `ftype` get the same entry when their
+  argument types are declared.
+- **Calls in tail position are real tail calls.** Deep mutual recursion no
+  longer overflows the stack. `(debug 3)` turns this off, so backtraces keep
+  their frames.
+- **Integer arithmetic stays unboxed.** `(unsigned-byte 64)` variables and
+  array elements, `let` variables that are assigned, loop counters, `incf` and
+  `decf`, `floor` and `truncate` by a constant, and `dotimes` and `loop` bounds
+  that are not known fixnums are computed as raw 64-bit values. `(unsigned-byte
+  64)` arrays no longer create a bignum for values from 2^63 up.
+- **Array and struct access in loops is cheaper.** Reads and writes of
+  specialized arrays, including `double-float` and `single-float`, and of
+  declared struct slots (read-only slots too) compile to plain element
+  accesses, with the checks done once before the loop. `replace` between
+  vectors of the same element type is one copy. `make-array` with a constant
+  element type and `replace` with literal `:start`/`:end` keywords avoid the
+  generic path.
+- **Floating-point math in `double-float` code stays unboxed**, including
+  `sin`, `cos`, `tan`, `atan`, `exp`, `log` and the hyperbolic functions, and
+  conversions with `float` and `coerce`.
+- **`inline` functions expand better.** `(setf f)` functions declared inline are
+  expanded, the value range of the body is used at the call site, and
+  64-bit modular helpers such as `mod64+` and `rol64` are computed as one raw
+  expression. Reads and writes of 2-, 4- and 8-byte words in octet vectors
+  (ironclad's `ub32ref/le`, `(setf ub64ref/be)` and the rest) are one bounds
+  check and one wide access.
+- **Very large functions are no longer left unoptimized by the JIT.** Functions
+  with thousands of local variables, which ironclad's inlined hash and cipher
+  code produces, are compiled so that .NET still optimizes them: locals whose
+  lifetimes do not overlap share a slot and short-lived temporaries stay on the
+  evaluation stack.
+- **Compiling and loading libraries is faster.** Several steps that grew
+  quadratically or cubically with expression nesting are linear or nearly so;
+  tiered compilation starts counting calls sooner, so the compiler itself
+  reaches optimized code earlier; generic function dispatch caches
+  multi-argument methods. A quickload of generic-cl that compiles it and its
+  dependencies from source takes 30.7 s instead of 39.0 s.
+- **Generic function calls and closures cost less.** A call whose argument
+  classes miss the small per-function cache no longer allocates, methods that
+  never use `call-next-method` are called without saving the next-method
+  state, and read-only struct accessors are inlined. A `(lambda ...)` written
+  directly as the function argument of `mapcar`, `mapc`, `mapcan`, `some`,
+  `every`, `notany` or `notevery` becomes a loop instead of a closure.
+- **fasls remember struct accessors, `ftype` and `inline` declarations.** Code
+  compiled in another image after loading a fasl is as fast as code compiled
+  in the same image.
+
+Measured against 0.1.32 on the same machine: ironclad's SHA-512 over 1 MB
+takes 843 ms instead of 1,938 ms, scrypt (N=16384, r=8, p=1) 667 ms instead of
+16,176 ms, and BLAKE2S over 16 KB 0.34 ms instead of 22.0 ms.
+
+The compiler now does more work to get these results, and compiling has been
+observed to take more time, most visibly on large functions. Loading ironclad
+from source takes about as long as in 0.1.32; 3d-vectors and generic-cl still
+load faster than in 0.1.32.
+
+### Libraries as NuGet packages
+
+- **A library package made by a different version of dotcl is now used as
+  shipped.** Loading it prints one warning (condition
+  `NUGET:FASL-VERSION-MISMATCH`, with the restarts `USE-SHIPPED-FASLS` and
+  `COMPILE-FROM-SOURCE`). The package records the OS and CPU it was built on;
+  if they differ, or the record is missing, the library is compiled from its
+  sources. If loading a shipped fasl fails, it falls back to the sources.
+
+### Fixed
+
+- **`(floor most-negative-fixnum -1)`**, and `ceiling`, `truncate`, `mod`, `rem`
+  and `/` with a divisor of -1, raised an OverflowException.
+- **A macro in the body of an `inline` function could read the caller's
+  variable, and a `return` in the body could leave the caller's `dolist`.**
+  Names the body's macros expand to, and the `nil` block that `return` targets,
+  are now checked against where the function was defined.
+- **`some`, `every`, `notany` and `notevery` could return more than one
+  value** when the predicate did; they now return one value, as in SBCL.
+- **A `dotimes` whose count was a rebinding of a `fixnum`-declared argument
+  could signal TYPE-ERROR for a large count.** This was also in 0.1.32.
+- **Startup could end with a NullReferenceException.** When an assembly was
+  loaded while the runtime was still initializing, the handler that refreshes
+  the extension-method index ran before the index existed. Whether it happened
+  depended on timing; it was seen once, in the self-host build on a CI runner.
+- **A library package compiled again on every machine whose cache path ran
+  through a symbolic link.** The fasls inside a package made with
+  `dotcl pack --library` were placed under the link's path, where ASDF does not
+  look, so the library was compiled from its sources even on the dotcl that made
+  it. This happened whenever the cache was under `/var` or `/tmp` on macOS.
+
 ## v0.1.32 -- 2026-10-03
 
 This release fixes a wrong result that 0.1.31 introduced. If you use 0.1.31,

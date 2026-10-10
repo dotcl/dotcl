@@ -20,7 +20,7 @@
 
 (setf dotcl:*save-sil* t)
 
-(defun %irts-sil (fn) (princ-to-string (dotcl:function-sil fn)))
+(defun %irts-sil (fn) (%flat-text (dotcl:function-sil fn)))
 
 (defun %irts-count (needle s)
   (let ((k 0) (p 0))
@@ -128,13 +128,17 @@
           (%irts-fx-use 5)))
   (0 5))
 
-;; The recursive calls are compiled against the inferred type: both results
-;; are unboxed straight into int64 locals.
+;; The recursive calls are compiled against the inferred type: the function
+;; gets a typed entry, and both calls enter its typed body with raw arguments
+;; and a raw result, nothing boxed or unboxed.
 (deftest-emitting-only inferred-return-type-scope.recursive-call-is-native
-  (%irts-count "(UNBOX-FIXNUM) (STLOC" (%irts-sil #'%irts-fib))
-  2)
+  (let ((s (%irts-sil #'%irts-fib)))
+    (list (%irts-count "CALL-TYPED-SELF" s) (%irts-count "UNBOX-FIXNUM" s)))
+  (2 0))
 
-;; The declaimed type is used from the REPL.
+;; The declaimed type is used from the REPL: the FTYPE gives the callee a
+;; typed entry, which the call enters with a raw argument and a raw result.
 (deftest-emitting-only inferred-return-type-scope.declaimed-call-is-native
-  (%irts-count "Invoke1) (UNBOX-FIXNUM" (%irts-sil #'%irts-decl-use))
-  1)
+  (list (%irts-count "CALL-TYPED-ENTRY" (%irts-sil #'%irts-decl-use))
+        (%irts-count "Invoke1" (%irts-sil #'%irts-decl-use)))
+  (1 0))

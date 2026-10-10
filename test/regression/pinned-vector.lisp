@@ -85,10 +85,29 @@
   (4000000000 4000000000 0 -100 -100 -30000 t (1 2 3) (-100 0) :type-error))
 
 (deftest pinned-vector.unsupported-element-types-signal
-  ;; (unsigned-byte 64) and T have no raw fixed-width storage: refuse rather
-  ;; than hand out an address with the wrong layout.
+  ;; T and FIXNUM have no raw fixed-width storage: refuse rather than hand
+  ;; out an address with the wrong layout. (unsigned-byte 64) is kept as its
+  ;; bits, 8 bytes each, like (signed-byte 64).
   (mapcar (lambda (et)
             (handler-case (progn (dotcl:make-pinned-vector 3 et) :made)
               (error () :error)))
           '((unsigned-byte 64) t fixnum (unsigned-byte 8)))
-  (:error :error :error :made))
+  (:made :error :error :made))
+
+(deftest pinned-vector.pinned-vector-p
+  ;; A pinned vector is simple, so ADJUST-ARRAY gives back a fresh vector
+  ;; with ordinary storage and leaves the pinned one as it was.
+  (let* ((v (dotcl:make-pinned-vector 4 '(unsigned-byte 8)))
+         (w (dotcl:make-pinned-vector 4 'double-float))
+         (w2 (adjust-array w 16)))
+    (list (dotcl:pinned-vector-p v)
+          (progn (dotcl:unpin-vector v) (dotcl:pinned-vector-p v))
+          (dotcl:pinned-vector-p (make-array 4 :element-type '(unsigned-byte 8)))
+          (dotcl:pinned-vector-p (vector 1 2))
+          (dotcl:pinned-vector-p 42)
+          (eq w w2)
+          (dotcl:pinned-vector-p w2)
+          (handler-case (progn (dotcl:pinned-vector-address w2) :no-error)
+            (error () :error))
+          (prog1 (dotcl:pinned-vector-p w) (dotcl:unpin-vector w))))
+  (t nil nil nil nil nil nil :error t))

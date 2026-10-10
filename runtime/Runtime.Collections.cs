@@ -573,13 +573,16 @@ public static partial class Runtime
         GenericFunction gf when gf.StoredClass != null => gf.StoredClass.Name,
         GenericFunction => Startup.Sym("STANDARD-GENERIC-FUNCTION"),
         LispFunction => Startup.Sym("COMPILED-FUNCTION"),
-        LispVector v when v.IsBitVector && v.IsSimple && v.Rank == 1 => Startup.Sym("SIMPLE-BIT-VECTOR"),
+        // The vector types carry the length, as SBCL's do: (SIMPLE-VECTOR 3) is
+        // the more specific answer, and code compares TYPE-OF against it.
+        LispVector v when v.IsBitVector && v.IsSimple && v.Rank == 1 => Runtime.List(Startup.Sym("SIMPLE-BIT-VECTOR"), Fixnum.Make(v.Dimensions[0])),
         LispVector v when v.IsBitVector && v.Rank == 1 => Startup.Sym("BIT-VECTOR"),
         LispVector v when v.IsCharVector && v.ElementTypeName != "NIL" && v.IsSimple && v.Rank == 1 => Startup.Sym("SIMPLE-BASE-STRING"),
         LispVector v when v.IsCharVector && v.ElementTypeName != "NIL" && v.Rank == 1 => Startup.Sym("BASE-STRING"),
         LispVector v when v.IsCharVector && v.ElementTypeName == "NIL" => VectorTypeOf(v),
-        LispVector v when !v.IsCharVector && !v.IsBitVector && v.IsSimple && v.ElementTypeName == "T" && v.Rank == 1 => Startup.Sym("SIMPLE-VECTOR"),
+        LispVector v when !v.IsCharVector && !v.IsBitVector && v.IsSimple && v.ElementTypeName == "T" && v.Rank == 1 => Runtime.List(Startup.Sym("SIMPLE-VECTOR"), Fixnum.Make(v.Dimensions[0])),
         LispVector v when v.Rank == 1 && v.IsSimple => VectorTypeOf(v), // (SIMPLE-ARRAY et (n))
+        LispVector v when v.Rank == 1 && !v.IsCharVector && !v.IsBitVector && v.ElementTypeName == "T" => Runtime.List(Startup.Sym("VECTOR"), Startup.Sym("T"), Fixnum.Make(v.Dimensions[0])),
         LispVector v when v.Rank == 1 => Startup.Sym("VECTOR"),
         LispVector v => VectorTypeOf(v),
         LispReadtable => Startup.Sym("READTABLE"),
@@ -1358,6 +1361,33 @@ public static partial class Runtime
                     break;
             }
         }
+        return ReplaceCore(target, source, start1, end1, start2, end2);
+    }
+
+    /// <summary>(REPLACE target source :START1 s1 :END1 e1 :START2 s2 :END2 e2)
+    /// with the keywords resolved by the compiler: each start is the value given
+    /// or 0, each end the value given or NIL. The generic entry takes the
+    /// arguments as an array and reads the keywords out of it on every call.</summary>
+    public static LispObject ReplaceKeys(LispObject target, LispObject source,
+        LispObject start1, LispObject end1, LispObject start2, LispObject end2)
+    {
+        return ReplaceCore(target, source,
+            ReplaceIndexArg(start1), end1 is Nil ? -1 : ReplaceIndexArg(end1),
+            ReplaceIndexArg(start2), end2 is Nil ? -1 : ReplaceIndexArg(end2));
+    }
+
+    private static int ReplaceIndexArg(LispObject o)
+    {
+        if (o is Fixnum f && f.Value >= 0 && f.Value <= int.MaxValue) return (int)f.Value;
+        throw new LispErrorException(new LispTypeError(
+            "REPLACE: a bounding index must be a non-negative integer", o,
+            new Cons(Startup.Sym("INTEGER"),
+                new Cons(Fixnum.Make(0), new Cons(Startup.Sym("*"), Nil.Instance)))));
+    }
+
+    private static LispObject ReplaceCore(LispObject target, LispObject source,
+        int start1, int end1, int start2, int end2)
+    {
         int len1 = ReplaceSeqLength(target);
         int len2 = ReplaceSeqLength(source);
         int e1 = end1 >= 0 ? end1 : len1;
@@ -1377,6 +1407,9 @@ public static partial class Runtime
             ss.Chars.Slice(start2, copyLen).CopyTo(dest);
             return target;
         }
+        if (target is LispVector tv && source is LispVector sv
+            && ReplaceVectorStorage(tv, start1, sv, start2, copyLen))
+            return target;
         // When target == source and ranges overlap, buffer source elements first to avoid clobbering
         bool selfOverlap = ReferenceEquals(target, source) &&
                            !(start1 + copyLen <= start2 || start2 + copyLen <= start1);
@@ -1395,6 +1428,35 @@ public static partial class Runtime
             }
         }
         return target;
+    }
+
+    /// <summary>REPLACE between two one-dimensional vectors that own storage of
+    /// the same shape and the same element type: copy the storage itself. The
+    /// element-by-element path boxed every element of a numeric vector only to
+    /// unbox it again on the store (an (UNSIGNED-BYTE 32) value past the small
+    /// integer cache is an allocation each). The element types being the same,
+    /// every source element is already a valid target element, so there is
+    /// nothing to check. Array.Copy has memmove semantics, which is what REPLACE
+    /// asks of overlapping regions of one vector. False when the shapes differ;
+    /// the caller then copies element by element.</summary>
+    private static bool ReplaceVectorStorage(LispVector tv, int start1, LispVector sv, int start2, int count)
+    {
+        if (tv._displacedTo != null || sv._displacedTo != null
+            || tv._dimensions != null || sv._dimensions != null
+            || tv._bitData != null || sv._bitData != null
+            || !string.Equals(tv.ElementTypeName, sv.ElementTypeName, StringComparison.Ordinal))
+            return false;
+        if (tv._numData != null || sv._numData != null)
+        {
+            if (tv._numData == null || sv._numData == null || tv._numKind != sv._numKind
+                || tv._numData.GetType() != sv._numData.GetType())
+                return false;
+            Array.Copy(sv._numData, start2, tv._numData, start1, count);
+            return true;
+        }
+        if (tv._elements == null || sv._elements == null) return false;
+        Array.Copy(sv._elements, start2, tv._elements, start1, count);
+        return true;
     }
 
     private static int ReplaceSeqLength(LispObject seq) => seq switch
@@ -1820,11 +1882,13 @@ public static partial class Runtime
                 LispObject? hashArg = null;
                 bool synchronized = false;
                 string? weakness = null;
+                int size = 0;
                 for (int i = 0; i < args.Length - 1; i += 2)
                 {
                     if (args[i] is Symbol kw)
                     {
-                        if (kw.Name == "TEST") testArg = args[i + 1];
+                        if (kw.Name == "SIZE") { if (args[i + 1] is Fixnum sz && sz.Value > 0) size = (int)Math.Min(sz.Value, int.MaxValue); }
+                        else if (kw.Name == "TEST") testArg = args[i + 1];
                         else if (kw.Name == "HASH-FUNCTION") hashArg = args[i + 1];
                         else if (kw.Name == "SYNCHRONIZED") synchronized = args[i + 1] is not Nil;
                         else if (kw.Name == "WEAKNESS")
@@ -1837,7 +1901,11 @@ public static partial class Runtime
                     }
                 }
                 if (hashArg != null && hashArg is not Nil)
-                    return Runtime.MakeHashTableWithHashFunction(testArg, hashArg, synchronized, weakness);
+                {
+                    var hf = Runtime.MakeHashTableWithHashFunction(testArg, hashArg, synchronized, weakness);
+                    if (hf is LispHashTable hft) hft.EnsureCapacity(size);
+                    return hf;
+                }
                 string testName = testArg switch
                 {
                     Symbol s => s.Name.ToUpperInvariant(),
@@ -1846,7 +1914,9 @@ public static partial class Runtime
                     null => "EQL",
                     _ => "EQL"
                 };
-                return new LispHashTable(testName, synchronized, weakness);
+                var made = new LispHashTable(testName, synchronized, weakness);
+                made.EnsureCapacity(size);
+                return made;
             }, "MAKE-HASH-TABLE", -1));
 
         // APPEND as variadic symbol-function
@@ -1997,13 +2067,8 @@ public static partial class Runtime
             // answer has to be T: the upgraded type must be a supertype of the
             // argument and must preserve subtype relations (CLHS 15.1.2.1), and
             // a name like EQL taken from the head of (eql 8) is neither.
-            var name = Runtime.ParseElementTypeName(args[0]);
-            bool specialized = name is "BIT" or "CHARACTER" or "BASE-CHAR" or "NIL" or "T"
-                               || LispVector.NumKindForElementType(name) != 0
-                               // ARRAY-ELEMENT-TYPE reports (complex single-float) and
-                               // (complex double-float) as themselves; answer the same.
-                               || Runtime.ComplexElementPartClass(name) != 'O';
-            return specialized ? Runtime.ElementTypeNameToType(name) : Startup.Sym("T");
+            // ParseElementTypeName already upgrades (IsSpecializedElementTypeName).
+            return Runtime.ElementTypeNameToType(Runtime.ParseElementTypeName(args[0]));
         }));
 
         // ARRAY-DIMENSION

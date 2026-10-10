@@ -1230,7 +1230,7 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
         var stage = pkg.FindSymbol("STAGE-BUNDLE");
         if (stage.status == SymbolStatus.None || stage.symbol.Function == null) return null;
 
-        var asdf = Package.FindPackage("DOTCL-NUGET-ASDF");
+        var asdf = Package.FindPackage("ASDF-NUGET");
         var resolveForRid = asdf?.FindSymbol("RESOLVE-SYSTEM-FOR-RID");
 
         var root = Path.Combine(Path.GetDirectoryName(Path.GetFullPath(faslPath))!, "pack-bundle");
@@ -1271,7 +1271,7 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
     /// `dotcl pack --library`: write an ASDF system as a NuGet package that another
     /// system names in a (:nuget ...) component. The .asd, the sources, their fasls
     /// and a record of the compiler that made them go under dotcl/&lt;system&gt;/
-    /// (dotcl-nuget-asdf does the packing); the system's own (:nuget ...) components
+    /// (asdf-nuget does the packing); the system's own (:nuget ...) components
     /// become the package's dependencies. With --r2r, each fasl also gets a
     /// ReadyToRun sibling per RID, compiled against the runtime images in the dotcl
     /// packages in --from, as the tool path does for its one fasl.
@@ -1347,9 +1347,9 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
         var form = $@"
 (handler-case
     (progn
-      (require ""dotcl-nuget-asdf"")
+      (require ""asdf-nuget"")
       (namestring
-       (funcall (find-symbol ""%PACK-LIBRARY"" ""DOTCL-NUGET-ASDF"")
+       (funcall (find-symbol ""%PACK-LIBRARY"" ""ASDF-NUGET"")
                 {Lit(o.System!)} {Lit(Path.GetFullPath(o.Output!).Replace('\\', '/'))}
                 :id {Lit(id)} :version {Lit(version!)}
                 :authors {Lit(meta.Authors!)} :description {Lit(meta.Description!)}
@@ -1817,7 +1817,9 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
             }
             else
             {
-                RunUserFaslBytes(System.IO.File.ReadAllBytes(loosePath), loosePath);
+                // By path, like LOAD: no second (in-memory) antivirus scan on
+                // Windows, and a file-backed module.
+                RunUserFaslAssembly(System.Reflection.Assembly.LoadFrom(loosePath), loosePath);
             }
             return true;
         }

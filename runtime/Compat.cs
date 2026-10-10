@@ -594,8 +594,31 @@ internal static class Compat
         => c == System.IO.Path.DirectorySeparatorChar || c == System.IO.Path.AltDirectorySeparatorChar;
 #endif
 
-    /// <summary>File.Move(src, dest, overwrite): the overwrite overload is net core 3.0+.</summary>
+    /// <summary>File.Move(src, dest, overwrite): the overwrite overload is net core 3.0+.
+    ///
+    /// When DEST is held by a loaded assembly (a fasl LOAD read by path) Windows
+    /// will not replace or delete it, but it does let it be renamed: the loader
+    /// opens the file with FILE_SHARE_DELETE. So on that failure the old file is
+    /// moved aside and the move retried. The loaded code keeps the old file;
+    /// everyone who opens DEST by name from then on gets the new one, which is
+    /// what POSIX rename gives elsewhere.</summary>
     public static void MoveFile(string sourceFileName, string destFileName, bool overwrite)
+    {
+        try
+        {
+            MoveFileOnce(sourceFileName, destFileName, overwrite);
+        }
+        catch (Exception e) when (overwrite && IsWindows()
+                                  && (e is System.IO.IOException || e is UnauthorizedAccessException)
+                                  && System.IO.File.Exists(sourceFileName)
+                                  && System.IO.File.Exists(destFileName))
+        {
+            MoveAside(destFileName);
+            MoveFileOnce(sourceFileName, destFileName, false);
+        }
+    }
+
+    private static void MoveFileOnce(string sourceFileName, string destFileName, bool overwrite)
     {
 #if NETSTANDARD2_0
         if (overwrite && System.IO.File.Exists(destFileName)) System.IO.File.Delete(destFileName);
@@ -603,6 +626,51 @@ internal static class Compat
 #else
         System.IO.File.Move(sourceFileName, destFileName, overwrite);
 #endif
+    }
+
+    private const string InUseMarker = ".in-use-";
+
+    /// <summary>Rename PATH out of the way so its name is free, then try to delete
+    /// the renamed file. For a file Windows will not delete or overwrite because
+    /// a loaded assembly maps it. The delete fails while that process still has it
+    /// loaded; such a file is removed by the next move-aside of the same name, once
+    /// the process that held it has exited.</summary>
+    public static void MoveAside(string path)
+    {
+        var full = System.IO.Path.GetFullPath(path);
+        var dir = System.IO.Path.GetDirectoryName(full) ?? ".";
+        var name = System.IO.Path.GetFileName(full);
+        try
+        {
+            foreach (var old in System.IO.Directory.GetFiles(dir, name + InUseMarker + "*"))
+                try { System.IO.File.Delete(old); } catch { }
+        }
+        catch { }
+        var aside = System.IO.Path.Combine(dir,
+            name + InUseMarker + Guid.NewGuid().ToString("N").Substring(0, 8));
+        System.IO.File.Move(full, aside);
+        try { System.IO.File.Delete(aside); } catch { }
+    }
+
+    /// <summary>Write BYTES to PATH as a new file: into a temporary name in the same
+    /// directory, then renamed over PATH. Never rewrites the old file in place:
+    /// Windows refuses that for a fasl a process has loaded by path, while the
+    /// rename goes through (see MoveFile). A reader also never sees a half
+    /// written file.</summary>
+    public static void WriteAllBytesReplacing(string path, byte[] bytes)
+    {
+        var full = System.IO.Path.GetFullPath(path);
+        var tmp = full + ".tmp-" + Guid.NewGuid().ToString("N").Substring(0, 8);
+        try
+        {
+            System.IO.File.WriteAllBytes(tmp, bytes);
+            MoveFile(tmp, full, overwrite: true);
+        }
+        catch
+        {
+            try { System.IO.File.Delete(tmp); } catch { }
+            throw;
+        }
     }
 
     /// <summary>BigInteger(byte[], isUnsigned, isBigEndian) ctor (net5.0+).</summary>

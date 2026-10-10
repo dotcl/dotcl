@@ -2211,7 +2211,7 @@ public static partial class Runtime
             int count = end - start;
             elems = new LispObject[count];
             for (int i = 0; i < count; i++)
-                elems[i] = ApplyKeyFn(keyFn, vec[start + i]);
+                elems[i] = vec[start + i];
         }
         else if (seq is LispString str)
         {
@@ -2223,8 +2223,7 @@ public static partial class Runtime
             elems = new LispObject[count];
             for (int i = 0; i < count; i++)
             {
-                var ch = LispChar.Make(str[start + i]);
-                elems[i] = ApplyKeyFn(keyFn, ch);
+                elems[i] = LispChar.Make(str[start + i]);
             }
         }
         else
@@ -2235,7 +2234,7 @@ public static partial class Runtime
             int start = startOpt ?? 0;
             for (var cur = seq; cur is Cons c; cur = c.Cdr, idx++)
             {
-                if (idx >= start) list.Add(ApplyKeyFn(keyFn, c.Car));
+                if (idx >= start) list.Add(c.Car);
             }
             len = idx;
             int end = endOpt ?? len;
@@ -2253,20 +2252,24 @@ public static partial class Runtime
             return UnwrapMv(fn.Invoke(Array.Empty<LispObject>()));
         }
 
+        // KEY is called on each element just before FN takes it, in the order the
+        // fold visits them: from the end under :FROM-END. SBCL does the same, and
+        // a key with side effects sees it (bit-smasher numbers a bit vector's
+        // places with (incf place) in its key).
         if (fromEnd)
         {
-            var result = hasIV ? iv : elems[elems.Length - 1];
+            var result = hasIV ? iv : ApplyKeyFn(keyFn, elems[elems.Length - 1]);
             int startIdx = hasIV ? elems.Length - 1 : elems.Length - 2;
             for (int i = startIdx; i >= 0; i--)
-                result = UnwrapMv(fn.Invoke2(elems[i], result));
+                result = UnwrapMv(fn.Invoke2(ApplyKeyFn(keyFn, elems[i]), result));
             return result;
         }
         else
         {
-            var result = hasIV ? iv : elems[0];
+            var result = hasIV ? iv : ApplyKeyFn(keyFn, elems[0]);
             int startIdx = hasIV ? 0 : 1;
             for (int i = startIdx; i < elems.Length; i++)
-                result = UnwrapMv(fn.Invoke2(result, elems[i]));
+                result = UnwrapMv(fn.Invoke2(result, ApplyKeyFn(keyFn, elems[i])));
             return result;
         }
     }
@@ -2569,6 +2572,24 @@ public static partial class Runtime
             }
 
             if (removed == 0) return origSeq;
+
+            // DELETE on a vector with a fill pointer works in place, as on SBCL: the
+            // survivors move down, the fill pointer drops by the number removed,
+            // and the vector itself is the result. event-emitter keeps its
+            // listeners in such a vector and goes on calling VECTOR-PUSH-EXTEND on
+            // what DELETE returned.
+            if (destructive && origSeq is LispVector fpv && fpv.HasFillPointer)
+            {
+                int w = 0;
+                for (int i = 0; i < len; i++)
+                    if ((drop[i >> 6] & (1UL << (i & 63))) == 0)
+                    {
+                        if (w != i) fpv[w] = fpv[i];
+                        w++;
+                    }
+                fpv.SetFillPointer(len - removed);
+                return fpv;
+            }
 
             if (origSeq is LispString ostr)
             {
@@ -3098,11 +3119,16 @@ public static partial class Runtime
             throw new LispErrorException(new LispProgramError("EVERY: too few arguments"));
         if (args.Length == 2) return Every2(args[0], args[1]);
         // Multiple sequences: parallel iteration
-        return EveryMulti(CoerceToFunction(args[0]), args);
+        return MultipleValues.Primary(EveryMulti(CoerceToFunction(args[0]), args));
     }
 
-    // 2-arg direct entry: single-sequence fast path, extracted verbatim.
-    public static LispObject Every2(LispObject pred, LispObject seq)
+    // 2-arg direct entry: single-sequence fast path. The answer is one value: the
+    // walk returns right after a predicate call, whose values are still the
+    // current ones (SOME, EVERY, NOTANY and NOTEVERY all passed them on).
+    public static LispObject Every2(LispObject pred, LispObject seq) =>
+        MultipleValues.Primary(Every2Walk(pred, seq));
+
+    private static LispObject Every2Walk(LispObject pred, LispObject seq)
     {
         var predFn = CoerceToFunction(pred);
         if (seq is Cons || seq is Nil)
@@ -3175,11 +3201,14 @@ public static partial class Runtime
             throw new LispErrorException(new LispProgramError("SOME: too few arguments"));
         if (args.Length == 2) return Some2(args[0], args[1]);
         // Multiple sequences
-        return SomeMulti(CoerceToFunction(args[0]), args);
+        return MultipleValues.Primary(SomeMulti(CoerceToFunction(args[0]), args));
     }
 
-    // 2-arg direct entry: single-sequence fast path, extracted verbatim.
-    public static LispObject Some2(LispObject pred, LispObject seq)
+    // 2-arg direct entry: single-sequence fast path. One value, as Every2.
+    public static LispObject Some2(LispObject pred, LispObject seq) =>
+        MultipleValues.Primary(Some2Walk(pred, seq));
+
+    private static LispObject Some2Walk(LispObject pred, LispObject seq)
     {
         var predFn = CoerceToFunction(pred);
         if (seq is Cons || seq is Nil)
@@ -3875,9 +3904,9 @@ public static partial class Runtime
         someFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject>)Runtime.Some2);
         Emitter.CilAssembler.RegisterFunction("SOME", someFn);
         Emitter.CilAssembler.RegisterFunction("NOTEVERY",
-            new LispFunction(args => Runtime.IsTruthy(Runtime.Every(args)) ? Nil.Instance : T.Instance));
+            new LispFunction(args => MultipleValues.Primary(Runtime.IsTruthy(Runtime.Every(args)) ? Nil.Instance : T.Instance)));
         Emitter.CilAssembler.RegisterFunction("NOTANY",
-            new LispFunction(args => Runtime.IsTruthy(Runtime.Some(args)) ? Nil.Instance : T.Instance));
+            new LispFunction(args => MultipleValues.Primary(Runtime.IsTruthy(Runtime.Some(args)) ? Nil.Instance : T.Instance)));
         // MISMATCH, REMOVE-DUPLICATES, DELETE-DUPLICATES, REPLACE
         var mismatchFn = new LispFunction(args => Runtime.MismatchFull(args));
         mismatchFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject>)Runtime.Mismatch2);

@@ -8,7 +8,7 @@ using System.Reflection.PortableExecutable;
 namespace DotCL.Emitter;
 
 /// <summary>
-/// Post-processes a freshly-saved .fasl so its corlib assembly reference points at
+/// Post-processes a freshly-built .fasl image so its corlib assembly reference points at
 /// the portable <c>netstandard</c> facade instead of <c>System.Private.CoreLib</c>.
 ///
 /// Why: the dev compiler runs on CoreCLR, so <see cref="System.Reflection.Emit.PersistedAssemblyBuilder"/>
@@ -23,7 +23,7 @@ namespace DotCL.Emitter;
 /// name string (<c>System.Private.CoreLib</c> -> <c>netstandard</c>, shorter so it fits),
 /// version (-> 2.1.0.0) and public-key token (-> the netstandard facade token). Offsets are
 /// located with the public <see cref="MetadataReader"/> table/heap-offset APIs, so no
-/// hand-rolled metadata-header parsing. The patched file is re-read and verified.
+/// hand-rolled metadata-header parsing. The patched image is re-read and verified.
 /// </summary>
 internal static class FaslCorlibRetarget
 {
@@ -41,17 +41,16 @@ internal static class FaslCorlibRetarget
     private const uint AssemblyRefPublicKeyFlag = 0x0001;
 
     /// <summary>
-    /// Retarget the corlib reference of the fasl at <paramref name="faslPath"/>.
-    /// Only "netstandard" is supported. A no-op (returns false) if the fasl has no
+    /// Retarget, in place, the corlib reference of the PE image in
+    /// <paramref name="bytes"/>, before it is written out. Only "netstandard" is
+    /// supported. A no-op (returns false) if the image has no
     /// System.Private.CoreLib reference.
     /// </summary>
-    public static bool RetargetCorlib(string faslPath, string corlibName)
+    public static bool RetargetCorlib(byte[] bytes, string corlibName)
     {
         if (!string.Equals(corlibName, NetstandardName, StringComparison.OrdinalIgnoreCase))
             throw new NotSupportedException(
                 $"corlib retarget target '{corlibName}' not supported (only \"netstandard\")");
-
-        byte[] bytes = File.ReadAllBytes(faslPath);
 
         int mdStart, nameFileOffset = -1, rowFileOffset = -1, blobFileOffset = -1, oldBlobCapacity = 0;
         bool found = false;
@@ -118,15 +117,14 @@ internal static class FaslCorlibRetarget
         bytes[blobFileOffset] = (byte)NetstandardToken.Length; // compressed length 8 = one byte
         Array.Copy(NetstandardToken, 0, bytes, blobFileOffset + 1, NetstandardToken.Length);
 
-        File.WriteAllBytes(faslPath, bytes);
-        Verify(faslPath);
+        Verify(bytes);
         return true;
     }
 
-    private static void Verify(string faslPath)
+    private static void Verify(byte[] bytes)
     {
-        using var fs = File.OpenRead(faslPath);
-        using var pe = new PEReader(fs);
+        using var ms = new MemoryStream(bytes, writable: false);
+        using var pe = new PEReader(ms);
         var md = pe.GetMetadataReader();
         foreach (var h in md.AssemblyReferences)
         {

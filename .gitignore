@@ -64,6 +64,11 @@ bench-state.json
 !bench/library-status/scrub.sh
 !bench/library-status/check-scrub.sh
 !bench/library-status/run-forks.sh
+!bench/jit-minopts/run.sh
+!bench/library-status/fetch-ql-projects.sh
+!bench/library-status/dists.sh
+!bench/library-status/runtime.sh
+!bench/library-status/ffi/run.sh
 !samples/**/*.sh
 !test/*/check.sh
 !test/pack-nuspec/tool-deps.sh

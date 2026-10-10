@@ -871,9 +871,39 @@ public static partial class Runtime
         return obj;
     }
 
-    // Convert element-type specifier to an ElementTypeName string for LispVector.
+    // Convert element-type specifier to an ElementTypeName string for LispVector:
+    // the UPGRADED element type (CLHS 15.1.2.1), so an array made from it reports
+    // the same element type UPGRADED-ARRAY-ELEMENT-TYPE answers, and an element
+    // type with no specialized storage (INTEGER, NUMBER, FLOAT, (unsigned-byte
+    // 128), ...) makes an ordinary general array, which SIMPLE-VECTOR-P accepts.
     // Expands user-defined types (deftype) before parsing.
     internal static string ParseElementTypeName(LispObject typeSpec)
+        => UpgradeElementTypeName(ParseRequestedElementTypeName(typeSpec));
+
+    /// <summary>INTEGER-LENGTH of X: the bits X needs, sign bit excluded.</summary>
+    private static int IntegerLength(long x)
+    {
+        ulong u = (ulong)(x < 0 ? ~x : x);
+        int n = 0;
+        while (u != 0) { u >>= 1; n++; }
+        return n;
+    }
+
+    /// <summary>NAME if arrays are specialized on it, otherwise "T".</summary>
+    internal static string UpgradeElementTypeName(string name)
+        => IsSpecializedElementTypeName(name) ? name : "T";
+
+    /// <summary>True for the element type names that have storage of their own:
+    /// only these may come back from UPGRADED-ARRAY-ELEMENT-TYPE as themselves.</summary>
+    internal static bool IsSpecializedElementTypeName(string name)
+        => name is "BIT" or "CHARACTER" or "BASE-CHAR" or "STANDARD-CHAR" or "NIL" or "T"
+           || LispVector.NumKindForElementType(name) != 0
+           || ComplexElementPartClass(name) != 'O';
+
+    /// <summary>The element type name for TYPESPEC before upgrading. MAKE-ARRAY
+    /// uses it only to pick the default fill: (make-array n :element-type
+    /// 'integer) is a general array, but its elements start as 0, not NIL.</summary>
+    internal static string ParseRequestedElementTypeName(LispObject typeSpec)
     {
         if (typeSpec is Nil) return "NIL";
         if (typeSpec is T) return "T";
@@ -914,10 +944,17 @@ public static partial class Runtime
         if (typeSpec is Cons etCons && etCons.Car is Symbol etHead)
         {
             string hname = etHead.Name;
+            // (signed-byte 1) is [-1, 0]: its upgrade has to hold BIT too,
+            // since (eql 0) is in it and upgrades to BIT (CLHS 15.1.2.1), so
+            // the narrowest signed element type is (signed-byte 2).
+            if (hname == "SIGNED-BYTE" && etCons.Cdr is Cons sb1C && sb1C.Car is Fixnum { Value: 1 })
+                return "SIGNED-BYTE-2";
             if ((hname == "UNSIGNED-BYTE" || hname == "SIGNED-BYTE") && etCons.Cdr is Cons nbC && nbC.Car is Fixnum nbF)
                 return $"{hname}-{nbF.Value}";
             if (hname == "UNSIGNED-BYTE" || hname == "SIGNED-BYTE") return hname;
-            if (hname is "SINGLE-FLOAT" or "DOUBLE-FLOAT" or "SHORT-FLOAT" or "LONG-FLOAT" or "FLOAT") return hname;
+            if (hname is "SINGLE-FLOAT" or "SHORT-FLOAT") return "SINGLE-FLOAT";
+            if (hname is "DOUBLE-FLOAT" or "LONG-FLOAT") return "DOUBLE-FLOAT";
+            if (hname == "FLOAT") return "FLOAT";
             // Narrow integer types have to land in the same lattice as the wide
             // ones: (eql 1) is a subtype of BIT, so upgrading it to T while BIT
             // upgrades to BIT would break the rule that upgrading preserves
@@ -931,6 +968,9 @@ public static partial class Runtime
                 return ParseElementTypeName(
                     Runtime.List(Startup.Sym("INTEGER"), Fixnum.Make(0),
                                  Fixnum.Make(modF.Value - 1)));
+            if (hname == "MOD" && etCons.Cdr is Cons modBC && modBC.Car is Bignum modB
+                && modB.Value <= System.Numerics.BigInteger.One << 64)
+                return "UNSIGNED-BYTE-64";
             if (hname == "INTEGER")
             {
                 // Exclusive bounds are written as a one-element list: (integer 0 (256))
@@ -951,21 +991,29 @@ public static partial class Runtime
             }
             if (hname == "INTEGER")
             {
-                // (integer LO HI) with constant bounds upgrades to the canonical
-                // fixed-width element type (CLHS upgraded-array-element-type):
-                // this is what routes e.g. (integer 0 2000) onto the unboxed
-                // ushort array backing instead of boxed general storage.
+                // (integer LO HI) with constant bounds upgrades to the narrowest
+                // (unsigned-byte N) / (signed-byte N) that holds the range, the
+                // same element type that spelling of the range gets: arrays are
+                // specialized on every such N, and (integer 0 4294967295) is
+                // the same type as (unsigned-byte 32), so the two have to
+                // upgrade alike (CLHS 15.1.2.1). The storage follows from N
+                // (NumKindForElementType), so (integer 0 2000) still lands on
+                // the unboxed ushort backing.
                 if (etCons.Cdr is Cons loC && loC.Car is Fixnum loF
                     && loC.Cdr is Cons hiC && hiC.Car is Fixnum hiF
                     && loF.Value <= hiF.Value)
                 {
                     long lo = loF.Value, hi = hiF.Value;
                     if (lo >= 0 && hi <= 1) return "BIT";
-                    if (lo >= 0 && hi <= byte.MaxValue) return "UNSIGNED-BYTE-8";
-                    if (lo >= 0 && hi <= ushort.MaxValue) return "UNSIGNED-BYTE-16";
-                    if (lo >= int.MinValue && hi <= int.MaxValue) return "SIGNED-BYTE-32";
-                    return "SIGNED-BYTE-64";
+                    if (lo >= 0) return $"UNSIGNED-BYTE-{IntegerLength(hi)}";
+                    return $"SIGNED-BYTE-{System.Math.Max(2, System.Math.Max(IntegerLength(lo), IntegerLength(hi)) + 1)}";
                 }
+                // A non-negative range whose upper bound needs the 64th bit is an
+                // (unsigned-byte 64), which has storage of its own.
+                if (etCons.Cdr is Cons ulC && ulC.Cdr is Cons uhC
+                    && IsU64(ulC.Car) && uhC.Car is Bignum uhB && IsU64(uhB)
+                    && (ulC.Car is Fixnum || ((Bignum)ulC.Car).Value <= uhB.Value))
+                    return "UNSIGNED-BYTE-64";
                 return "INTEGER";
             }
             if (hname == "COMPLEX") return etCons.Cdr is Cons cc && cc.Car is Symbol cs ? $"COMPLEX-{cs.Name}" : "COMPLEX";
@@ -1975,7 +2023,10 @@ public static partial class Runtime
                 ? T.Instance : (LispObject)Nil.Instance;
             // A generic function answers the name GENERIC-FUNCTION-NAME answers:
             // (SETF accessor) for a setf one, not its internal key symbol.
+            // A macro's expander is named (MACRO-FUNCTION name), as on SBCL.
             LispObject name = obj is GenericFunction gfn ? Runtime.PublicFunctionName(gfn.Name)
+                : (obj is LispFunction mf && Runtime.MacroFunctionName(mf) is { } macroName)
+                ? new Cons(Startup.Sym("MACRO-FUNCTION"), new Cons(macroName, Nil.Instance))
                 : (obj is LispFunction nf && !string.IsNullOrEmpty(nf.Name))
                 ? FunctionLambdaExpressionName(nf) : Nil.Instance;
             return MultipleValues.Values(Nil.Instance, closureP, name);

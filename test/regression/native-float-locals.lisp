@@ -19,7 +19,7 @@
     (if (> acc 0d0) n 0)))
 
 (deftest nfl-acc-boxfree-sil
-  (let ((sil (princ-to-string (dotcl:function-sil #'%nfl-acc))))
+  (let ((sil (%flat-text (dotcl:function-sil #'%nfl-acc))))
     (search "DoubleFloat" sil))
   nil)
 
@@ -128,8 +128,8 @@
 ;; (no callee-saved XMM registers) the JIT then stores and reloads the loop
 ;; accumulator on every iteration.
 (deftest-emitting-only nfl-return-box-helper-sil
-  (let ((d (princ-to-string (dotcl:function-sil #'%nfl-acc-value)))
-        (s (princ-to-string (dotcl:function-sil #'%nfl-single))))
+  (let ((d (%flat-text (dotcl:function-sil #'%nfl-acc-value)))
+        (s (%flat-text (dotcl:function-sil #'%nfl-single))))
     (list (and (search "DoubleFloat.Box" d) t)
           (and (search "SingleFloat.Box" s) t)))
   (t t))

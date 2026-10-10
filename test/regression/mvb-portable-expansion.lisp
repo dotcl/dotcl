@@ -70,7 +70,7 @@
   (multiple-value-call #'(lambda (&optional q r &rest ig) (declare (ignore ig)) (+ q r))
     (floor x 3)))
 (deftest-emitting-only mvbp-portable-is-snapshot-bind
-  (let ((sil (princ-to-string (dotcl:function-sil #'mvbp-portable-sil))))
+  (let ((sil (%flat-text (dotcl:function-sil #'mvbp-portable-sil))))
     (list (and (search "CaptureForBind" sil) t)
           (and (search "MultipleValuesList" sil) t)))
   (t nil))

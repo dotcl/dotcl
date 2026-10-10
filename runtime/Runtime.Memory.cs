@@ -110,10 +110,16 @@ public static partial class Runtime
                 Fixnum.Make(Marshal.ReadInt16(ptr)),
             "UNSIGNED_SHORT" or "UINT16" =>
                 Fixnum.Make((ushort)Marshal.ReadInt16(ptr)),
-            "INT" or "INT32" or "LONG" or "BOOL" or "BOOLEAN" =>
+            "INT" or "INT32" or "BOOL" or "BOOLEAN" =>
                 Fixnum.Make(Marshal.ReadInt32(ptr)),
-            "UNSIGNED_INT" or "UINT32" or "UNSIGNED_LONG" =>
+            "UNSIGNED_INT" or "UINT32" =>
                 Fixnum.Make((uint)Marshal.ReadInt32(ptr)),
+            "LONG" =>
+                CLongSize == 8 ? Fixnum.Make(Marshal.ReadInt64(ptr))
+                               : Fixnum.Make(Marshal.ReadInt32(ptr)),
+            "UNSIGNED_LONG" or "ULONG" =>
+                CLongSize == 8 ? MakeUnsigned64((ulong)Marshal.ReadInt64(ptr))
+                               : Fixnum.Make((uint)Marshal.ReadInt32(ptr)),
             "LONG_LONG" or "INT64" =>
                 Fixnum.Make(Marshal.ReadInt64(ptr)),
             "UNSIGNED_LONG_LONG" or "UINT64" =>
@@ -149,9 +155,18 @@ public static partial class Runtime
             case "SHORT": case "INT16":
             case "UNSIGNED_SHORT": case "UINT16":
                 Marshal.WriteInt16(ptr, (short)((Fixnum)value).Value); break;
-            case "INT": case "INT32": case "LONG": case "BOOL": case "BOOLEAN":
-            case "UNSIGNED_INT": case "UINT32": case "UNSIGNED_LONG":
+            case "INT": case "INT32": case "BOOL": case "BOOLEAN":
+            case "UNSIGNED_INT": case "UINT32":
                 Marshal.WriteInt32(ptr, (int)((Fixnum)value).Value); break;
+            case "LONG":
+                if (CLongSize == 8) Marshal.WriteInt64(ptr, ToLong(value, "dotnet:mem-write"));
+                else Marshal.WriteInt32(ptr, (int)((Fixnum)value).Value);
+                break;
+            case "UNSIGNED_LONG": case "ULONG":
+                if (CLongSize == 8)
+                    Marshal.WriteInt64(ptr, unchecked((long)ToULong(value, "dotnet:mem-write")));
+                else Marshal.WriteInt32(ptr, (int)((Fixnum)value).Value);
+                break;
             case "LONG_LONG": case "INT64":
                 Marshal.WriteInt64(ptr, ToLong(value, "dotnet:mem-write")); break;
             case "UNSIGNED_LONG_LONG": case "UINT64":
@@ -176,6 +191,14 @@ public static partial class Runtime
         return value;
     }
 
+    /// The size of C `long' and `unsigned long' in the running process: 4 on
+    /// Windows (LLP64, also on 64-bit), the pointer size elsewhere (LP64 on
+    /// 64-bit Linux and macOS). Decided at run time, never at build time, as
+    /// one build of the runtime and of a fasl serves every OS.
+    /// System.Runtime.InteropServices.CLong encodes the same rule, but it is
+    /// .NET 6+ and absent from the netstandard2.0 build.
+    internal static readonly int CLongSize = Compat.IsWindows() ? 4 : IntPtr.Size;
+
     static readonly Dictionary<string, int> _typeSizes = new()
     {
         ["CHAR"] = 1, ["INT8"] = 1,
@@ -184,8 +207,8 @@ public static partial class Runtime
         ["UNSIGNED_SHORT"] = 2, ["UINT16"] = 2,
         ["INT"] = 4, ["INT32"] = 4,
         ["UNSIGNED_INT"] = 4, ["UINT32"] = 4,
-        // Windows: long = 32-bit even on x64
-        ["LONG"] = 4, ["UNSIGNED_LONG"] = 4,
+        // C long: 32-bit on Windows even on x64, 64-bit on LP64 Unix.
+        ["LONG"] = CLongSize, ["UNSIGNED_LONG"] = CLongSize, ["ULONG"] = CLongSize,
         ["LONG_LONG"] = 8, ["INT64"] = 8,
         ["UNSIGNED_LONG_LONG"] = 8, ["UINT64"] = 8,
         ["FLOAT"] = 4, ["DOUBLE"] = 8,
@@ -373,7 +396,7 @@ public static partial class Runtime
         t == typeof(byte[]) || t == typeof(sbyte[]) ? 1
         : t == typeof(ushort[]) || t == typeof(short[]) ? 2
         : t == typeof(int[]) || t == typeof(uint[]) || t == typeof(float[]) ? 4
-        : t == typeof(long[]) || t == typeof(double[]) ? 8
+        : t == typeof(long[]) || t == typeof(ulong[]) || t == typeof(double[]) ? 8
         : 0;
 
     /// The byte width foreign code expects for an element type name, or 0 when
@@ -406,6 +429,7 @@ public static partial class Runtime
         if (t == typeof(int[])) return AllocPinnedArray<int>(n);
         if (t == typeof(uint[])) return AllocPinnedArray<uint>(n);
         if (t == typeof(long[])) return AllocPinnedArray<long>(n);
+        if (t == typeof(ulong[])) return AllocPinnedArray<ulong>(n);
         if (t == typeof(float[])) return AllocPinnedArray<float>(n);
         return AllocPinnedArray<double>(n);
 #else
@@ -429,7 +453,7 @@ public static partial class Runtime
         if (width == 0 || width != ForeignElementWidth(et))
             throw new LispErrorException(new LispError(
                 $"{fn}: element type {args[1]} has no fixed-width storage. Supported: "
-                + "(unsigned-byte N) for N up to 63, (signed-byte N) for N up to 64, "
+                + "(unsigned-byte N) and (signed-byte N) for N up to 64, "
                 + "single-float and double-float."));
         var storage = AllocPinned(storageType!, (int)lenFx.Value, out var handle);
         var v = LispVector.WithNumStorage(et, storage, foreignWidth: true);
@@ -451,6 +475,16 @@ public static partial class Runtime
             throw new LispErrorException(new LispError(
                 $"{fn}: the storage of {args[0]} was replaced (ADJUST-ARRAY?) and is no longer pinned"));
         return PointerToLisp(Marshal.UnsafeAddrOfPinnedArrayElement(ps.Storage, 0));
+    }
+
+    // (dotcl:pinned-vector-p object) -> T if OBJECT is a pinned vector whose
+    // storage is still the pinned one, else NIL. Never signals.
+    public static LispObject PinnedVectorP(LispObject[] args)
+    {
+        if (args.Length != 1) throw ArgError("DOTCL:PINNED-VECTOR-P", 1, args.Length);
+        return args[0] is LispVector v && _pinnedVectors.TryGetValue(v, out var ps)
+               && ReferenceEquals(v._numData, ps.Storage)
+            ? T.Instance : Nil.Instance;
     }
 
     // (dotcl:unpin-vector vector) -> T if VECTOR was pinned, else NIL

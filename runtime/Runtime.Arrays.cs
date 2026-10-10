@@ -61,6 +61,20 @@ public static partial class Runtime
         return MakeArray(new[] { dims, k, v });
     }
 
+    /// <summary>(MAKE-ARRAY dims :ELEMENT-TYPE 'spec) where the compiler has
+    /// resolved the constant SPEC to the element type name NAME (one that does not
+    /// depend on a DEFTYPE: (unsigned-byte N), (signed-byte N), FIXNUM, the float
+    /// and character types). A one-dimensional array is built straight; anything
+    /// else (a dimension list, a bad dimension) goes to the shared body with the
+    /// spec as written. With no :INITIAL-ELEMENT every one of these starts out as
+    /// the zero of its storage, which is what the shared body fills it with.</summary>
+    public static LispObject MakeArrayOfType(LispObject dims, LispObject spec, string name)
+    {
+        if (dims is Fixnum f && f.Value >= 0 && f.Value <= int.MaxValue)
+            return new LispVector((int)f.Value, Nil.Instance, name);
+        return MakeArray(new[] { dims, Startup.Keyword("ELEMENT-TYPE"), spec });
+    }
+
     public static LispObject MakeArray(LispObject[] args)
     {
         // (make-array dimensions &key element-type initial-element initial-contents adjustable fill-pointer)
@@ -99,6 +113,9 @@ public static partial class Runtime
         LispObject? initialElement = null;
         LispObject? initialContents = null;
         string elementType = "T";
+        // The element type as written, before upgrading: only the default fill
+        // looks at it (an INTEGER array is general storage but starts out as 0s).
+        string requestedType = "T";
         int? fillPointer = null;
         LispObject? displacedTo = null;
         int displacedOffset = 0;
@@ -123,7 +140,12 @@ public static partial class Runtime
                     case "INITIAL-ELEMENT": if (!ieSet) { initialElement = args[i + 1]; ieSet = true; } break;
                     case "INITIAL-CONTENTS": if (!icSet) { initialContents = args[i + 1]; icSet = true; } break;
                     case "ELEMENT-TYPE":
-                        if (!etSet) { elementType = ParseElementTypeName(args[i + 1]); etSet = true; }
+                        if (!etSet)
+                        {
+                            requestedType = ParseRequestedElementTypeName(args[i + 1]);
+                            elementType = UpgradeElementTypeName(requestedType);
+                            etSet = true;
+                        }
                         break;
                     case "FILL-POINTER":
                         if (!fpSet) {
@@ -184,8 +206,14 @@ public static partial class Runtime
                 fill = LispChar.Make('\0');
             else if (elementType == "BIT")
                 fill = Fixnum.Make(0);
-            else if (elementType.StartsWith("UNSIGNED-BYTE") || elementType.StartsWith("SIGNED-BYTE") ||
-                     elementType is "INTEGER" or "FIXNUM" or "FLOAT" or "SINGLE-FLOAT" or "SHORT-FLOAT" or "DOUBLE-FLOAT" or "LONG-FLOAT" or "RATIONAL" or "REAL" or "NUMBER")
+            // A float array starts out as zeros of its own format: the integer 0 is
+            // not an element of a float array, and storing it is a type error.
+            else if (elementType == "DOUBLE-FLOAT")
+                fill = DoubleFloat.Box(0.0);
+            else if (elementType == "SINGLE-FLOAT")
+                fill = SingleFloat.Box(0f);
+            else if (requestedType.StartsWith("UNSIGNED-BYTE") || requestedType.StartsWith("SIGNED-BYTE") ||
+                     requestedType is "INTEGER" or "FIXNUM" or "FLOAT" or "SINGLE-FLOAT" or "SHORT-FLOAT" or "DOUBLE-FLOAT" or "LONG-FLOAT" or "RATIONAL" or "REAL" or "NUMBER")
                 fill = Fixnum.Make(0);
             else if (elementType == "NIL")
                 fill = Nil.Instance;
@@ -339,9 +367,18 @@ public static partial class Runtime
             throw new LispErrorException(new LispTypeError(
                 "ADJUST-ARRAY: :displaced-to must be an array", displacedTo, Startup.Sym("ARRAY")));
 
+        // CLHS ADJUST-ARRAY: a non-nil :FILL-POINTER needs an array that has one.
+        if (fillPointer.HasValue && !vec.HasFillPointer)
+            throw new LispErrorException(new LispError(
+                $"ADJUST-ARRAY: {vec} is not an array with a fill pointer"));
+        // A kept fill pointer has to stay valid for the new size (SBCL errors too).
+        if (!fillPointer.HasValue && vec.HasFillPointer && vec.Length > size)
+            throw new LispErrorException(new LispError(
+                $"ADJUST-ARRAY: can't adjust a vector to a size ({size}) smaller than its fill pointer ({vec.Length})"));
+
         if (!vec.IsAdjustable)
         {
-            // Non-adjustable: create a new array (original is unchanged)
+            // Non-adjustable (a simple array): create a new array, original unchanged
             LispVector newVec;
             if (displacedTo is LispVector dv2)
             {
@@ -358,11 +395,6 @@ public static partial class Runtime
                     CopyWithDimResize(vec, newItems, dimArray, fill);
                 newVec = newDims == null ? new LispVector(newItems, et) : new LispVector(newItems, newDims, et);
             }
-            // Set fill pointer: use explicit value, or preserve original, or none
-            if (fillPointer.HasValue)
-                newVec.SetFillPointer(fillPointer.Value);
-            else if (vec.HasFillPointer)
-                newVec.SetFillPointer(Math.Min(vec.Length, size));
             return newVec;
         }
 
@@ -1145,10 +1177,25 @@ public static partial class Runtime
         if (array is LispVector v && v._dimensions == null)
         {
             if (!BackingPinned(v)) return null;
-            if (v._numData is long[] d) return d;
+            if (v._numKind == 4 && v._numData is long[] d) return d;
             if (v.IsForeignWidthKind) return null;
         }
         throw BackingTypeError(array, "FIXNUM");
+    }
+
+    /// <summary>The element buffer of a vector declared
+    /// (simple-array (unsigned-byte 64) (*)), as a long[] over the same
+    /// storage: the elements are the values' bits, read and written with
+    /// ldelem.i8 / stelem.i8. The CLR treats ulong[] and long[] as the same
+    /// array type for that purpose.</summary>
+    public static long[]? BackingU64(LispObject array)
+    {
+        if (array is LispVector v && v._dimensions == null)
+        {
+            if (!BackingPinned(v)) return null;
+            if (v.IsU64Kind) return (long[])(Array)v._numData!;
+        }
+        throw BackingTypeError(array, "UNSIGNED-BYTE-64");
     }
 
     public static int[]? BackingI32(LispObject array)
@@ -1180,6 +1227,36 @@ public static partial class Runtime
             if (v._numData is byte[] d) return d;
         }
         throw BackingTypeError(array, "UNSIGNED-BYTE-8");
+    }
+
+    /// <summary>The double[] element buffer of a vector declared
+    /// (simple-array double-float (*)). Any other rank-1 vector answers null and
+    /// its accesses take the per-element helper, which reads it the way it did
+    /// before the buffer was hoisted: a T vector holding doubles, or a vector of
+    /// the other float format, under a false declaration is read, not
+    /// rejected. Unlike the integer kinds, whose helper has no such path.</summary>
+    public static double[]? BackingF64(LispObject array)
+    {
+        if (array is LispVector v && v._dimensions == null)
+        {
+            if (!BackingPinned(v)) return null;
+            if (v._numData is double[] d) return d;
+            return null;
+        }
+        throw BackingTypeError(array, "DOUBLE-FLOAT");
+    }
+
+    /// <summary>The float[] element buffer of a vector declared
+    /// (simple-array single-float (*)). See BackingF64.</summary>
+    public static float[]? BackingF32(LispObject array)
+    {
+        if (array is LispVector v && v._dimensions == null)
+        {
+            if (!BackingPinned(v)) return null;
+            if (v._numData is float[] d) return d;
+            return null;
+        }
+        throw BackingTypeError(array, "SINGLE-FLOAT");
     }
 
     // --- The same fetches above SAFETY 0 ---------------------------------
@@ -1228,10 +1305,21 @@ public static partial class Runtime
         {
             if (!BackingPinned(v))
                 throw NotSimpleDeclError(array, SimpleVectorOf(SizedByte("SIGNED-BYTE", 64)), null);
-            if (v._numData is long[] d) return d;
+            if (v._numKind == 4 && v._numData is long[] d) return d;
             if (v.IsForeignWidthKind) return null;
         }
         throw BackingTypeError(array, "FIXNUM");
+    }
+
+    public static long[] BackingU64Checked(LispObject array)
+    {
+        if (array is LispVector v && v._dimensions == null)
+        {
+            if (!BackingPinned(v))
+                throw NotSimpleDeclError(array, SimpleVectorOf(SizedByte("UNSIGNED-BYTE", 64)), null);
+            if (v.IsU64Kind) return (long[])(Array)v._numData!;
+        }
+        throw BackingTypeError(array, "UNSIGNED-BYTE-64");
     }
 
     public static int[]? BackingI32Checked(LispObject array)
@@ -1244,6 +1332,30 @@ public static partial class Runtime
             if (v.IsForeignWidthKind) return null;
         }
         throw BackingTypeError(array, "SIGNED-BYTE-32");
+    }
+
+    public static double[]? BackingF64Checked(LispObject array)
+    {
+        if (array is LispVector v && v._dimensions == null)
+        {
+            if (!BackingPinned(v))
+                throw NotSimpleDeclError(array, SimpleVectorOf(Startup.Sym("DOUBLE-FLOAT")), null);
+            if (v._numData is double[] d) return d;
+            return null;
+        }
+        throw BackingTypeError(array, "DOUBLE-FLOAT");
+    }
+
+    public static float[]? BackingF32Checked(LispObject array)
+    {
+        if (array is LispVector v && v._dimensions == null)
+        {
+            if (!BackingPinned(v))
+                throw NotSimpleDeclError(array, SimpleVectorOf(Startup.Sym("SINGLE-FLOAT")), null);
+            if (v._numData is float[] d) return d;
+            return null;
+        }
+        throw BackingTypeError(array, "SINGLE-FLOAT");
     }
 
     public static ushort[] BackingU16Checked(LispObject array)
@@ -1266,6 +1378,70 @@ public static partial class Runtime
             if (v._numData is byte[] d) return d;
         }
         throw BackingTypeError(array, "UNSIGNED-BYTE-8");
+    }
+
+    // --- The checked fetches that also match the element type -------------
+    //
+    // The *Checked entries above match only the .NET storage, so a FIXNUM
+    // vector passes for one declared (unsigned-byte 32) (both are long[]) and
+    // an (unsigned-byte 5) vector for an (unsigned-byte 8) one (both byte[]).
+    // These also require the vector's narrow width (LispVector._numNarrow) to
+    // be NARROW, the width the compiler derived from the declaration (0 when
+    // the element type is the storage's own). With that matched, every element
+    // the buffer holds is in the declared element type and a value proven to
+    // be in it can be stored without a check. A pinned vector of the
+    // foreign-width storage answers null (its accesses take the per-element
+    // helper) only when its element type matches as well.
+
+    // FULLWIDTH is the element type a NARROW of 0 stands for, as a specifier.
+    private static Exception NarrowDeclError(LispObject array, int narrow, LispObject fullWidth)
+    {
+        var expected = SimpleVectorOf(
+            narrow > 0 ? SizedByte("UNSIGNED-BYTE", narrow)
+            : narrow < 0 ? SizedByte("SIGNED-BYTE", -narrow)
+            : fullWidth);
+        if (array is LispVector v && v._dimensions == null && !BackingPinned(v))
+            return NotSimpleDeclError(array, expected, null);
+        return new LispErrorException(new LispTypeError(
+            $"declared {expected}, got {Typep2Name(array)}", array, expected));
+    }
+
+    public static long[]? BackingI64Narrow(LispObject array, int narrow)
+    {
+        if (array is LispVector v && v._dimensions == null && v._numNarrow == narrow
+            && BackingPinned(v))
+        {
+            if (v._numKind == 4 && v._numData is long[] d) return d;
+            if (v.IsForeignWidthKind) return null;
+        }
+        throw NarrowDeclError(array, narrow, Startup.Sym("FIXNUM"));
+    }
+
+    public static int[]? BackingI32Narrow(LispObject array, int narrow)
+    {
+        if (array is LispVector v && v._dimensions == null && v._numNarrow == narrow
+            && BackingPinned(v))
+        {
+            if (v._numData is int[] d) return d;
+            if (v.IsForeignWidthKind) return null;
+        }
+        throw NarrowDeclError(array, narrow, SizedByte("SIGNED-BYTE", 32));
+    }
+
+    public static ushort[] BackingU16Narrow(LispObject array, int narrow)
+    {
+        if (array is LispVector v && v._dimensions == null && v._numNarrow == narrow
+            && BackingPinned(v) && v._numData is ushort[] d)
+            return d;
+        throw NarrowDeclError(array, narrow, SizedByte("UNSIGNED-BYTE", 16));
+    }
+
+    public static byte[] BackingU8Narrow(LispObject array, int narrow)
+    {
+        if (array is LispVector v && v._dimensions == null && v._numNarrow == narrow
+            && BackingPinned(v) && v._numData is byte[] d)
+            return d;
+        throw NarrowDeclError(array, narrow, SizedByte("UNSIGNED-BYTE", 8));
     }
 
     /// <summary>BackingChars above SAFETY 0. Still answers null for everything
@@ -1312,6 +1488,69 @@ public static partial class Runtime
         => v >= int.MinValue && v <= int.MaxValue ? v
            : throw new LispErrorException(new LispTypeError(
                $"element value {v} does not fit (SIGNED-BYTE 32)", Fixnum.Make(v)));
+
+    /// <summary>The store into a hoisted buffer whose element type is
+    /// (UNSIGNED-BYTE BITS) narrower than the buffer ((unsigned-byte 32) in a
+    /// long[], (unsigned-byte 12) in a ushort[]): the opcode would store any
+    /// value the buffer holds, where the per-element path signals.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static long CheckStoreUnsigned(long v, int bits)
+        => ((ulong)v >> bits) == 0 ? v : throw NarrowStoreError(v, "UNSIGNED-BYTE", bits);
+
+    /// <summary>CheckStoreUnsigned for (SIGNED-BYTE BITS).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static long CheckStoreSigned(long v, int bits)
+        => (v >> (bits - 1)) is 0 or -1 ? v : throw NarrowStoreError(v, "SIGNED-BYTE", bits);
+
+    private static Exception NarrowStoreError(long v, string head, int bits) =>
+        new LispErrorException(new LispTypeError(
+            $"element value {v} does not fit ({head} {bits})", Fixnum.Make(v),
+            SizedByte(head, bits)));
+
+    /// <summary>The bits of an (unsigned-byte 64) value: VALUE must be an
+    /// integer in [0, 2^64). The store into an (unsigned-byte 64) element
+    /// whose value was computed boxed.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static long U64Bits(LispObject value)
+        => IsU64(value) ? Low64(value) : throw NotU64Error(value);
+
+    private static Exception NotU64Error(LispObject value) =>
+        new LispErrorException(new LispTypeError(
+            $"element value {value} does not fit (UNSIGNED-BYTE 64)", value,
+            SizedByte("UNSIGNED-BYTE", 64)));
+
+    /// <summary>An int64 stored into an (unsigned-byte 64) element: its bits
+    /// are its value only when it is not negative.</summary>
+    public static long CheckStoreU64(long v)
+        => v >= 0 ? v : throw NotU64Error(Fixnum.Make(v));
+
+    /// <summary>(AREF ARRAY INDEX) on a vector declared to hold (unsigned-byte
+    /// 64), as the element's bits. Any other array (a declaration that does not
+    /// hold, or a non-simple vector) is read through AREF, and the value has to
+    /// be an (unsigned-byte 64).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static long ArefU64Bits(LispObject array, long index)
+    {
+        if (array is LispVector v && v.IsU64Kind && v._displacedTo == null
+            && v._dimensions == null && (ulong)index < (ulong)v._numLen)
+            return v.U64Get((int)index);
+        return U64Bits(Aref(array, Fixnum.Make(index)));
+    }
+
+    /// <summary>(SETF (AREF ARRAY INDEX) value) on a vector declared to hold
+    /// (unsigned-byte 64), with the value's BITS. Returns BITS.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static long ArefSetU64Bits(LispObject array, long index, long bits)
+    {
+        if (array is LispVector v && v.IsU64Kind && v._displacedTo == null
+            && v._dimensions == null && (ulong)index < (ulong)v._numLen)
+        {
+            v.U64Set((int)index, bits);
+            return bits;
+        }
+        ArefSet(array, Fixnum.Make(index), BoxU64(bits));
+        return bits;
+    }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static long ArefNumL(LispObject array, long index)
@@ -1605,7 +1844,8 @@ public static partial class Runtime
     private static int SlotEntry(LispStruct s, int packed)
     {
         int entry = s.LayoutEntry(packed & SlotIndexMask);
-        if (((entry ^ packed) >> SlotVersionShift) != 0)
+        // The sign bit of an entry is the single-float kind, not version.
+        if ((((entry ^ packed) >> SlotVersionShift) & LispStruct.SlotPosMask) != 0)
             throw StaleSlotAccess(s, packed >> SlotVersionShift);
         return entry;
     }
@@ -1679,6 +1919,29 @@ public static partial class Runtime
                            BitConverter.DoubleToInt64Bits(value)))
             return value;
         StructSetI(obj, packed, new DoubleFloat(value));
+        return value;
+    }
+
+    /// <summary>A structure slot declared SINGLE-FLOAT, read as a raw float.
+    /// Its bits are the low 32 of the slot's long.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static float StructRefF(LispObject obj, int packed)
+    {
+        if (obj is LispStruct s && (uint)(packed & SlotIndexMask) < (uint)s.SlotCount
+            && s.TryRawLong(RawPosOf(s, packed, LispStruct.SlotKindSingle), out long bits))
+            return Compat.Int32BitsToSingle((int)bits);
+        return ((SingleFloat)StructRefI(obj, packed)).Value;
+    }
+
+    /// <summary>A single-float stored into a structure slot without boxing it.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static float StructSetF(LispObject obj, int packed, float value)
+    {
+        if (obj is LispStruct s && (uint)(packed & SlotIndexMask) < (uint)s.SlotCount
+            && s.TrySetRaw(RawPosOf(s, packed, LispStruct.SlotKindSingle),
+                           Compat.SingleToInt32Bits(value)))
+            return value;
+        StructSetI(obj, packed, new SingleFloat(value));
         return value;
     }
 
@@ -1783,6 +2046,16 @@ public static partial class Runtime
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static long RawDoubleToBits(double value) => BitConverter.DoubleToInt64Bits(value);
 
+    /// <summary>The single-float a raw slot holds, given the long read out of
+    /// the raw array: its low 32 bits.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static float RawBitsToSingle(long bits) => Compat.Int32BitsToSingle((int)bits);
+
+    /// <summary>The long to store into a raw slot declared SINGLE-FLOAT. Twin
+    /// of RawBitsToSingle.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static long RawSingleToBits(float value) => Compat.SingleToInt32Bits(value);
+
     /// <summary>Map SBCL's package struct slot indices to dotcl Package properties.</summary>
     private static LispObject PackageStructRef(Package pkg, int idx)
     {
@@ -1827,8 +2100,8 @@ public static partial class Runtime
         if (typeName is not Symbol sym)
             throw new LispErrorException(new LispTypeError(
                 "%STRUCT-REGISTER-LAYOUT: type name must be a symbol", typeName));
-        // Each entry is (POSITION . KIND); KIND is 0 for a raw integer and 1 for
-        // a raw double. A boxed slot has position -1.
+        // Each entry is (POSITION . KIND); KIND is 0 for a raw integer, 1 for a
+        // raw double and 2 for a raw single-float. A boxed slot has position -1.
         var pos = new List<int>();
         var kind = new List<byte>();
         for (var cur = positions; cur is Cons c; cur = c.Cdr)
@@ -2073,4 +2346,275 @@ public static partial class Runtime
     }
 
 
+
+    // --- Words read from adjacent octets ---
+    //
+    // (dpb (aref v (1+ i)) (byte 8 8) (aref v i)) and the 32- and 64-bit words
+    // built from it, as ironclad's UB16REF/LE .. UB64REF/BE are, read K octets
+    // at I..I+K-1 and put them together little- or big-endian. The compiler
+    // recognizes that shape and calls these instead: one range check and one
+    // wide load where the octet reads did a check and a load each. A 64-bit
+    // word comes back as its bits in an int64, as the (unsigned-byte 64) lane
+    // holds it; the narrower ones are the value itself.
+    //
+    // A subscript range outside the array raises what an out-of-range element
+    // load does (IndexOutOfRangeException, which surfaces as a TYPE-ERROR).
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static void ThrowOctetWordIndex(byte[] b, long i, int width) =>
+        throw new IndexOutOfRangeException(
+            $"Index {i} with {width} octets out of bounds for vector of length {b.Length}");
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void CheckOctetWord(byte[] b, long i, int width)
+    {
+        if (i < 0 || i > (long)b.Length - width) ThrowOctetWordIndex(b, i, width);
+    }
+
+#if NET
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static ref byte OctetAt(byte[] b, long i) =>
+        ref Unsafe.Add(ref System.Runtime.InteropServices.MemoryMarshal.GetArrayDataReference(b), (nint)i);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static long ReadU16LE(byte[] b, long i)
+    {
+        CheckOctetWord(b, i, 2);
+        ushort v = Unsafe.ReadUnaligned<ushort>(ref OctetAt(b, i));
+        return BitConverter.IsLittleEndian ? v : System.Buffers.Binary.BinaryPrimitives.ReverseEndianness(v);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static long ReadU16BE(byte[] b, long i)
+    {
+        CheckOctetWord(b, i, 2);
+        ushort v = Unsafe.ReadUnaligned<ushort>(ref OctetAt(b, i));
+        return BitConverter.IsLittleEndian ? System.Buffers.Binary.BinaryPrimitives.ReverseEndianness(v) : v;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static long ReadU32LE(byte[] b, long i)
+    {
+        CheckOctetWord(b, i, 4);
+        uint v = Unsafe.ReadUnaligned<uint>(ref OctetAt(b, i));
+        return BitConverter.IsLittleEndian ? v : System.Buffers.Binary.BinaryPrimitives.ReverseEndianness(v);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static long ReadU32BE(byte[] b, long i)
+    {
+        CheckOctetWord(b, i, 4);
+        uint v = Unsafe.ReadUnaligned<uint>(ref OctetAt(b, i));
+        return BitConverter.IsLittleEndian ? System.Buffers.Binary.BinaryPrimitives.ReverseEndianness(v) : v;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static long ReadU64LE(byte[] b, long i)
+    {
+        CheckOctetWord(b, i, 8);
+        long v = Unsafe.ReadUnaligned<long>(ref OctetAt(b, i));
+        return BitConverter.IsLittleEndian ? v : System.Buffers.Binary.BinaryPrimitives.ReverseEndianness(v);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static long ReadU64BE(byte[] b, long i)
+    {
+        CheckOctetWord(b, i, 8);
+        long v = Unsafe.ReadUnaligned<long>(ref OctetAt(b, i));
+        return BitConverter.IsLittleEndian ? System.Buffers.Binary.BinaryPrimitives.ReverseEndianness(v) : v;
+    }
+#else
+    public static long ReadU16LE(byte[] b, long i)
+    {
+        CheckOctetWord(b, i, 2);
+        return System.Buffers.Binary.BinaryPrimitives.ReadUInt16LittleEndian(new ReadOnlySpan<byte>(b, (int)i, 2));
+    }
+
+    public static long ReadU16BE(byte[] b, long i)
+    {
+        CheckOctetWord(b, i, 2);
+        return System.Buffers.Binary.BinaryPrimitives.ReadUInt16BigEndian(new ReadOnlySpan<byte>(b, (int)i, 2));
+    }
+
+    public static long ReadU32LE(byte[] b, long i)
+    {
+        CheckOctetWord(b, i, 4);
+        return System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(new ReadOnlySpan<byte>(b, (int)i, 4));
+    }
+
+    public static long ReadU32BE(byte[] b, long i)
+    {
+        CheckOctetWord(b, i, 4);
+        return System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(new ReadOnlySpan<byte>(b, (int)i, 4));
+    }
+
+    public static long ReadU64LE(byte[] b, long i)
+    {
+        CheckOctetWord(b, i, 8);
+        return System.Buffers.Binary.BinaryPrimitives.ReadInt64LittleEndian(new ReadOnlySpan<byte>(b, (int)i, 8));
+    }
+
+    public static long ReadU64BE(byte[] b, long i)
+    {
+        CheckOctetWord(b, i, 8);
+        return System.Buffers.Binary.BinaryPrimitives.ReadInt64BigEndian(new ReadOnlySpan<byte>(b, (int)i, 8));
+    }
+#endif
+
+    private static long ReadOctetWord(byte[] b, long i, int width, bool bigEndian) =>
+        (width, bigEndian) switch
+        {
+            (2, false) => ReadU16LE(b, i),
+            (2, true) => ReadU16BE(b, i),
+            (4, false) => ReadU32LE(b, i),
+            (4, true) => ReadU32BE(b, i),
+            (8, false) => ReadU64LE(b, i),
+            _ => ReadU64BE(b, i),
+        };
+
+    /// <summary>The octet word of WIDTH (2, 4 or 8) at I of ARRAY, for an array
+    /// whose element buffer was not hoisted. A simple octet vector is read
+    /// through its buffer. Any other vector with octet elements (adjustable,
+    /// fill-pointered, displaced; reachable under a false declaration at safety
+    /// 0) is read an element at a time, as the octet reads would have. Anything
+    /// else signals the TYPE-ERROR the octet vector declaration does.</summary>
+    public static long OctetWordRef(LispObject array, long i, int width, int bigEndian)
+    {
+        var b = BackingU8(array);
+        if (b != null) return ReadOctetWord(b, i, width, bigEndian != 0);
+        long w = 0;
+        for (int k = 0; k < width; k++)
+        {
+            var e = ArefL(array, i + k);
+            if (e is not Fixnum f || f.Value < 0 || f.Value > 255)
+                throw new LispErrorException(new LispTypeError(
+                    "octet word: element is not an (UNSIGNED-BYTE 8)", e,
+                    SizedByte("UNSIGNED-BYTE", 8)));
+            int shift = bigEndian != 0 ? 8 * (width - 1 - k) : 8 * k;
+            w |= f.Value << shift;
+        }
+        return w;
+    }
+
+    // The stores of such a word: one range check and one wide store. V holds
+    // the word's bits; the caller has checked the value against the width.
+#if NET
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void WriteU16LE(byte[] b, long i, long v)
+    {
+        CheckOctetWord(b, i, 2);
+        ushort w = (ushort)v;
+        Unsafe.WriteUnaligned(ref OctetAt(b, i), BitConverter.IsLittleEndian ? w : System.Buffers.Binary.BinaryPrimitives.ReverseEndianness(w));
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void WriteU16BE(byte[] b, long i, long v)
+    {
+        CheckOctetWord(b, i, 2);
+        ushort w = (ushort)v;
+        Unsafe.WriteUnaligned(ref OctetAt(b, i), BitConverter.IsLittleEndian ? System.Buffers.Binary.BinaryPrimitives.ReverseEndianness(w) : w);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void WriteU32LE(byte[] b, long i, long v)
+    {
+        CheckOctetWord(b, i, 4);
+        uint w = (uint)v;
+        Unsafe.WriteUnaligned(ref OctetAt(b, i), BitConverter.IsLittleEndian ? w : System.Buffers.Binary.BinaryPrimitives.ReverseEndianness(w));
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void WriteU32BE(byte[] b, long i, long v)
+    {
+        CheckOctetWord(b, i, 4);
+        uint w = (uint)v;
+        Unsafe.WriteUnaligned(ref OctetAt(b, i), BitConverter.IsLittleEndian ? System.Buffers.Binary.BinaryPrimitives.ReverseEndianness(w) : w);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void WriteU64LE(byte[] b, long i, long v)
+    {
+        CheckOctetWord(b, i, 8);
+        Unsafe.WriteUnaligned(ref OctetAt(b, i), BitConverter.IsLittleEndian ? v : System.Buffers.Binary.BinaryPrimitives.ReverseEndianness(v));
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void WriteU64BE(byte[] b, long i, long v)
+    {
+        CheckOctetWord(b, i, 8);
+        Unsafe.WriteUnaligned(ref OctetAt(b, i), BitConverter.IsLittleEndian ? System.Buffers.Binary.BinaryPrimitives.ReverseEndianness(v) : v);
+    }
+#else
+    public static void WriteU16LE(byte[] b, long i, long v)
+    {
+        CheckOctetWord(b, i, 2);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt16LittleEndian(new Span<byte>(b, (int)i, 2), (ushort)v);
+    }
+
+    public static void WriteU16BE(byte[] b, long i, long v)
+    {
+        CheckOctetWord(b, i, 2);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(new Span<byte>(b, (int)i, 2), (ushort)v);
+    }
+
+    public static void WriteU32LE(byte[] b, long i, long v)
+    {
+        CheckOctetWord(b, i, 4);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(new Span<byte>(b, (int)i, 4), (uint)v);
+    }
+
+    public static void WriteU32BE(byte[] b, long i, long v)
+    {
+        CheckOctetWord(b, i, 4);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(new Span<byte>(b, (int)i, 4), (uint)v);
+    }
+
+    public static void WriteU64LE(byte[] b, long i, long v)
+    {
+        CheckOctetWord(b, i, 8);
+        System.Buffers.Binary.BinaryPrimitives.WriteInt64LittleEndian(new Span<byte>(b, (int)i, 8), v);
+    }
+
+    public static void WriteU64BE(byte[] b, long i, long v)
+    {
+        CheckOctetWord(b, i, 8);
+        System.Buffers.Binary.BinaryPrimitives.WriteInt64BigEndian(new Span<byte>(b, (int)i, 8), v);
+    }
+#endif
+
+    private static void WriteOctetWord(byte[] b, long i, long v, int width, bool bigEndian)
+    {
+        switch (width, bigEndian)
+        {
+            case (2, false): WriteU16LE(b, i, v); break;
+            case (2, true): WriteU16BE(b, i, v); break;
+            case (4, false): WriteU32LE(b, i, v); break;
+            case (4, true): WriteU32BE(b, i, v); break;
+            case (8, false): WriteU64LE(b, i, v); break;
+            default: WriteU64BE(b, i, v); break;
+        }
+    }
+
+    /// <summary>The store of an octet word of WIDTH at I of ARRAY whose element
+    /// buffer was not hoisted; see OctetWordRef. A vector that is not one of
+    /// octets is left for the element store, which signals.</summary>
+    public static void OctetWordSet(LispObject array, long i, long v, int width, int bigEndian)
+    {
+        var b = BackingU8(array);
+        if (b != null) { WriteOctetWord(b, i, v, width, bigEndian != 0); return; }
+        for (int k = 0; k < width; k++)
+        {
+            int shift = bigEndian != 0 ? 8 * (width - 1 - k) : 8 * k;
+            ArefSetL(array, i + k, Fixnum.Make((v >> shift) & 0xff));
+        }
+    }
+
+    /// <summary>OctetWordSet above (safety 0): a non-simple array signals.</summary>
+    public static void OctetWordSetChecked(LispObject array, long i, long v, int width, int bigEndian) =>
+        WriteOctetWord(BackingU8Checked(array), i, v, width, bigEndian != 0);
+
+    /// <summary>OctetWordRef above (safety 0): a non-simple array signals, as
+    /// the SIMPLE-ARRAY declaration it was read under does there.</summary>
+    public static long OctetWordRefChecked(LispObject array, long i, int width, int bigEndian) =>
+        ReadOctetWord(BackingU8Checked(array), i, width, bigEndian != 0);
 }

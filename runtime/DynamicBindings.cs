@@ -6,46 +6,89 @@ public static class DynamicBindings
 
     private const int InitialCapacity = 64;
 
-    [ThreadStatic] private static Symbol?[]? _syms;
-    [ThreadStatic] private static LispObject?[]? _vals;
-    [ThreadStatic] private static int _top;
-
-    private static void Grow()
+    // One object per thread holds the whole binding stack, so an operation
+    // reads one thread-static instead of three (on macOS each thread-static
+    // read is a call into the TLS resolver, which showed in compile profiles).
+    //
+    // COUNTS[sym.BindIndex] is how many entries for that symbol this thread's
+    // stack holds. A read of a symbol that has been bound somewhere but is not
+    // bound on this thread right now -- most reads of the compiler's own
+    // specials, which outer code bound once or not at all -- answers from the
+    // global value without scanning. The stack is deep while compiling (about
+    // 160 entries on average for a library load), and those reads scanned all
+    // of it.
+    private sealed class BindingStack
     {
-        var newSize = _syms == null ? InitialCapacity : _syms.Length * 2;
+        public Symbol?[] Syms = new Symbol?[InitialCapacity];
+        public LispObject?[] Vals = new LispObject?[InitialCapacity];
+        public int Top;
+        public int[] Counts = new int[256];
+    }
+
+    [ThreadStatic] private static BindingStack? _stack;
+
+    private static int _nextBindIndex;
+
+    private static BindingStack Current => _stack ??= new BindingStack();
+
+    private static int BindIndexOf(Symbol sym)
+    {
+        int idx = sym.BindIndex;
+        if (idx != 0) return idx;
+        int fresh = Interlocked.Increment(ref _nextBindIndex);
+        int prior = Interlocked.CompareExchange(ref sym.BindIndex, fresh, 0);
+        return prior == 0 ? fresh : prior;
+    }
+
+    /// <summary>The binding stack of this thread when SYM may be bound on it,
+    /// else null (the symbol's global value is the one in effect).</summary>
+    private static BindingStack? StackBinding(Symbol sym)
+    {
+        if (!sym.EverDynamicallyBound) return null;
+        var st = _stack;
+        if (st == null) return null;
+        int idx = sym.BindIndex;
+        var counts = st.Counts;
+        if ((uint)idx >= (uint)counts.Length || counts[idx] == 0) return null;
+        return st;
+    }
+
+    private static void Grow(BindingStack st)
+    {
+        var newSize = st.Syms.Length * 2;
         var newSyms = new Symbol?[newSize];
         var newVals = new LispObject?[newSize];
-        if (_syms != null)
-        {
-            Array.Copy(_syms, newSyms, _top);
-            Array.Copy(_vals!, newVals, _top);
-        }
-        _syms = newSyms;
-        _vals = newVals;
+        Array.Copy(st.Syms, newSyms, st.Top);
+        Array.Copy(st.Vals, newVals, st.Top);
+        st.Syms = newSyms;
+        st.Vals = newVals;
+    }
+
+    private static void Uncount(BindingStack st, Symbol sym)
+    {
+        int idx = sym.BindIndex;
+        if ((uint)idx < (uint)st.Counts.Length && st.Counts[idx] > 0) st.Counts[idx]--;
     }
 
     public static LispObject Get(Symbol sym)
     {
-        // Never dynamically bound: the value is the symbol's own.
-        if (!sym.EverDynamicallyBound)
+        var st = StackBinding(sym);
+        if (st == null)
         {
             var v = sym.Value;
             if (v == null) throw new LispErrorException(new LispUnboundVariable(sym));
             return v;
         }
-        var syms = _syms;
-        if (syms != null)
+        var syms = st.Syms;
+        var vals = st.Vals;
+        for (int i = st.Top - 1; i >= 0; i--)
         {
-            var vals = _vals!;
-            for (int i = _top - 1; i >= 0; i--)
+            if (ReferenceEquals(syms[i], sym))
             {
-                if (ReferenceEquals(syms[i], sym))
-                {
-                    var val = vals[i];
-                    if (val == null)
-                        throw new LispErrorException(new LispUnboundVariable(sym));
-                    return val;
-                }
+                var val = vals[i];
+                if (val == null)
+                    throw new LispErrorException(new LispUnboundVariable(sym));
+                return val;
             }
         }
         if (sym.Value == null)
@@ -55,17 +98,12 @@ public static class DynamicBindings
 
     public static bool TryGet(Symbol sym, out LispObject value)
     {
-        if (!sym.EverDynamicallyBound)
+        var st = StackBinding(sym);
+        if (st != null)
         {
-            if (sym.Value != null) { value = sym.Value; return true; }
-            value = null!;
-            return false;
-        }
-        var syms = _syms;
-        if (syms != null)
-        {
-            var vals = _vals!;
-            for (int i = _top - 1; i >= 0; i--)
+            var syms = st.Syms;
+            var vals = st.Vals;
+            for (int i = st.Top - 1; i >= 0; i--)
             {
                 if (ReferenceEquals(syms[i], sym))
                 {
@@ -82,34 +120,46 @@ public static class DynamicBindings
 
     public static void Push(Symbol sym, LispObject value)
     {
-        // Before the entry is visible: from here on, reads of SYM must scan.
+        var st = Current;
+        int idx = BindIndexOf(sym);
+        if (idx >= st.Counts.Length)
+        {
+            var bigger = new int[Math.Max(idx + 1, st.Counts.Length * 2)];
+            Array.Copy(st.Counts, bigger, st.Counts.Length);
+            st.Counts = bigger;
+        }
+        // Counted before the flag is set, both before the entry is visible:
+        // from here on, reads of SYM on this thread must scan.
+        st.Counts[idx]++;
         sym.EverDynamicallyBound = true;
-        if (_syms == null || _top >= _syms.Length) Grow();
-        _syms![_top] = sym;
-        _vals![_top] = value is UnboundSentinel ? null : value;
-        _top++;
+        if (st.Top >= st.Syms.Length) Grow(st);
+        st.Syms[st.Top] = sym;
+        st.Vals[st.Top] = value is UnboundSentinel ? null : value;
+        st.Top++;
     }
 
     public static void Pop(Symbol sym)
     {
-        var syms = _syms;
-        if (syms == null || _top == 0) return;
-        var vals = _vals!;
-        for (int i = _top - 1; i >= 0; i--)
+        var st = _stack;
+        if (st == null || st.Top == 0) return;
+        var syms = st.Syms;
+        var vals = st.Vals;
+        for (int i = st.Top - 1; i >= 0; i--)
         {
             if (ReferenceEquals(syms[i], sym))
             {
-                // Swap with top entry so we can decrement _top without a shift
-                int last = _top - 1;
+                // Swap with top entry so we can decrement Top without a shift
+                int last = st.Top - 1;
                 if (i < last)
                 {
                     syms[i] = syms[last];
                     vals[i] = vals[last];
                 }
-                _top--;
+                st.Top--;
                 // Clear freed slot to prevent GC rooting
-                syms[_top] = null;
-                vals[_top] = null;
+                syms[st.Top] = null;
+                vals[st.Top] = null;
+                Uncount(st, sym);
                 return;
             }
         }
@@ -118,12 +168,12 @@ public static class DynamicBindings
 
     public static LispObject Set(Symbol sym, LispObject value)
     {
-        if (!sym.EverDynamicallyBound) { sym.Value = value; return value; }
-        var syms = _syms;
-        if (syms != null)
+        var st = StackBinding(sym);
+        if (st != null)
         {
-            var vals = _vals!;
-            for (int i = _top - 1; i >= 0; i--)
+            var syms = st.Syms;
+            var vals = st.Vals;
+            for (int i = st.Top - 1; i >= 0; i--)
             {
                 if (ReferenceEquals(syms[i], sym))
                 {
@@ -158,12 +208,12 @@ public static class DynamicBindings
 
     public static LispObject Makunbound(Symbol sym)
     {
-        if (!sym.EverDynamicallyBound) { sym.Value = null; return sym; }
-        var syms = _syms;
-        if (syms != null)
+        var st = StackBinding(sym);
+        if (st != null)
         {
-            var vals = _vals!;
-            for (int i = _top - 1; i >= 0; i--)
+            var syms = st.Syms;
+            var vals = st.Vals;
+            for (int i = st.Top - 1; i >= 0; i--)
             {
                 if (ReferenceEquals(syms[i], sym))
                 {
@@ -200,11 +250,12 @@ public static class DynamicBindings
     /// </summary>
     public static Dictionary<Symbol, LispObject>? Snapshot()
     {
-        if (_top == 0) return null;
+        var st = _stack;
+        if (st == null || st.Top == 0) return null;
         var snap = new Dictionary<Symbol, LispObject>();
-        var syms = _syms!;
-        var vals = _vals!;
-        for (int i = _top - 1; i >= 0; i--)
+        var syms = st.Syms;
+        var vals = st.Vals;
+        for (int i = st.Top - 1; i >= 0; i--)
         {
             var sym = syms[i];
             if (sym != null && !snap.ContainsKey(sym))
@@ -226,7 +277,7 @@ public static class DynamicBindings
     /// <summary>Current binding-stack depth. Pair with <see cref="TruncateTo"/> to
     /// install a snapshot temporarily (e.g. around an async continuation that runs
     /// on a different thread) and unwind it afterwards.</summary>
-    public static int Depth => _top;
+    public static int Depth => _stack?.Top ?? 0;
 
     /// <summary>
     /// The bindings currently on this thread's stack, innermost first, as
@@ -241,10 +292,11 @@ public static class DynamicBindings
     public static List<(Symbol Symbol, LispObject Value, int Depth)> CurrentBindings()
     {
         var result = new List<(Symbol, LispObject, int)>();
-        var syms = _syms;
-        if (syms == null) return result;
-        var vals = _vals!;
-        for (int i = _top - 1; i >= 0; i--)
+        var st = _stack;
+        if (st == null) return result;
+        var syms = st.Syms;
+        var vals = st.Vals;
+        for (int i = st.Top - 1; i >= 0; i--)
         {
             var sym = syms[i];
             if (sym != null) result.Add((sym, vals[i] ?? Unbound, i));
@@ -256,12 +308,17 @@ public static class DynamicBindings
     public static void TruncateTo(int depth)
     {
         if (depth < 0) depth = 0;
-        var syms = _syms;
-        var vals = _vals;
-        while (_top > depth)
+        var st = _stack;
+        if (st == null) return;
+        var syms = st.Syms;
+        var vals = st.Vals;
+        while (st.Top > depth)
         {
-            _top--;
-            if (syms != null) { syms[_top] = null; vals![_top] = null; }
+            st.Top--;
+            var sym = syms[st.Top];
+            if (sym != null) Uncount(st, sym);
+            syms[st.Top] = null;
+            vals[st.Top] = null;
         }
     }
 

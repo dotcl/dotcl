@@ -158,15 +158,23 @@ model as the Makefile's `BENCH_CPU` spells it (`make -pn bench-parity | grep
 ^BENCH_CPU`); `make bench-parity` uses them when they exist and the plain
 `<platform>` entries otherwise. A measurement with no recorded baseline is not judged, and its measured
 ratio is printed in the format the file wants so it can be pasted in; the last
-line of output says how many measurements were judged and how many were not. A
-platform with no recorded baseline at all is reported as `UNJUDGED` and exits
-with status 3 instead of passing, because a run that compared nothing cannot
-say that nothing got slower. On such a machine,
-`CHECK_RATIOS_ALLOW_UNJUDGED=1 make bench-parity` accepts that and exits 0,
-still printing `UNJUDGED`. To refresh the recorded numbers after a change that is genuinely meant to
-move them, run `make bench-parity` a few times on a quiet machine, take the
-median per kernel, and edit `bench/ratio-baseline.json`, updating the matching
-`recorded` entry with the date and the machine. Do not refresh it to turn a red
+line of output says how many measurements were judged and names the ones that
+were not. A run in which any measurement was taken without a baseline, whether
+that is all of them or only the cl-bench median next to eight judged kernels,
+is reported as `UNJUDGED` and exits with status 3 instead of passing, because a
+check that compared nothing for a number cannot say that number did not get
+slower. On such a machine, `CHECK_RATIOS_ALLOW_UNJUDGED=1 make bench-parity`
+accepts that and exits 0, still printing `UNJUDGED`. The one thing that stays
+`ok` while not judged is the cl-bench median when cl-bench did not run at all
+(`make bench-parity` alone does not run it); the last line names it.
+
+The cl-bench median is only there when `make bench-state` ran first in the same
+tree: `make bench-parity` merges into the `bench-state.json` that left. To
+refresh the recorded numbers after a change that is genuinely meant to move
+them, run `make bench-state` and then `make bench-parity`, three times on a
+quiet machine, take the median per kernel and of the three cl-bench medians,
+and edit `bench/ratio-baseline.json`, updating the matching `recorded` entry
+with the date and the machine. Do not refresh it to turn a red
 build green without first establishing which of the two the number describes:
 the code got slower, or the baseline was measured somewhere else.
 

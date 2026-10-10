@@ -10,6 +10,6 @@ snapshot of the current process, so it never sees a half-mutated heap.
 
     (require "dotcl-clrmd")
 
-Depends on the `nuget` contrib: the ClrMD package is resolved on first use, at
+Depends on the `dotnet-nuget` contrib: the ClrMD package is resolved on first use, at
 the version in `clrmd:*package-version*` (`"*"`, latest stable, by default --
 bind it to pin).

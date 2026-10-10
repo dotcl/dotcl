@@ -519,6 +519,11 @@ public static class Startup
         catch (PlatformNotSupportedException) { hostStdout = TextWriter.Null; }
         try { hostStderr = Console.Error; }
         catch (PlatformNotSupportedException) { hostStderr = TextWriter.Null; }
+        // Count the column of what Lisp writes to the console, for ~T and the
+        // pretty printer. *STANDARD-OUTPUT* and *TERMINAL-IO* share one writer,
+        // and so one column, as they share the terminal.
+        hostStdout = new ColumnTrackingWriter(hostStdout);
+        hostStderr = new ColumnTrackingWriter(hostStderr);
 
         var starStdin = InternExport("*STANDARD-INPUT*");
         starStdin.IsSpecial = true;
@@ -684,7 +689,7 @@ public static class Startup
         // Print pprint dispatch: use a proper table object
         var printPprintDispatch = InternExport("*PRINT-PPRINT-DISPATCH*");
         printPprintDispatch.IsSpecial = true;
-        printPprintDispatch.Value = new LispPprintDispatchTable();
+        printPprintDispatch.Value = new LispPprintDispatchTable(standard: true);
 
         // Default pathname defaults
         var defaultPathDefaults = InternExport("*DEFAULT-PATHNAME-DEFAULTS*");
@@ -1835,6 +1840,9 @@ public static class Startup
                 "DOTCL::%CORE-GENERATION", 0);
             RegisterDotclInternal("%CORE-GENERATION", coreGenFn);
             Emitter.CilAssembler.RegisterFunction("DOTCL::%CORE-GENERATION", coreGenFn);
+            var noteGenFn = new LispFunction(Runtime.NoteFaslGeneration, "DOTCL::%NOTE-FASL-GENERATION", 1);
+            RegisterDotclInternal("%NOTE-FASL-GENERATION", noteGenFn);
+            Emitter.CilAssembler.RegisterFunction("DOTCL::%NOTE-FASL-GENERATION", noteGenFn);
             var fcRootFn = new LispFunction(FaslCache.FaslCacheRoot, "DOTCL::%FASL-CACHE-ROOT", 0);
             RegisterDotclInternal("%FASL-CACHE-ROOT", fcRootFn);
             Emitter.CilAssembler.RegisterFunction("DOTCL::%FASL-CACHE-ROOT", fcRootFn);
@@ -2067,6 +2075,7 @@ public static class Startup
         // so foreign code can use its address (the static-vectors backend).
         RegisterDotcl("MAKE-PINNED-VECTOR", new LispFunction(Runtime.MakePinnedVector, "DOTCL:MAKE-PINNED-VECTOR", 2));
         RegisterDotcl("PINNED-VECTOR-ADDRESS", new LispFunction(Runtime.PinnedVectorAddress, "DOTCL:PINNED-VECTOR-ADDRESS", 1));
+        RegisterDotcl("PINNED-VECTOR-P", new LispFunction(Runtime.PinnedVectorP, "DOTCL:PINNED-VECTOR-P", 1));
         RegisterDotcl("UNPIN-VECTOR", new LispFunction(Runtime.UnpinVector, "DOTCL:UNPIN-VECTOR", 1));
 
         // dotcl:function-sil: get SIL stored on a function (returns NIL if none)
@@ -2099,6 +2108,46 @@ public static class Startup
             }
             return LispPathname.FromString(Directory.GetCurrentDirectory() + "/");
         }));
+
+        // dotcl:charpos: the column an output stream is at, the number of
+        // characters written since the last newline, or NIL when it is not known
+        // (like sb-kernel:charpos on SBCL). The stream designator defaults to
+        // *standard-output*; T means *terminal-io*.
+        RegisterDotcl("CHARPOS", new LispFunction(args => {
+            if (args.Length > 1)
+                throw new LispErrorException(new LispProgramError("CHARPOS: too many arguments"));
+            LispObject stream = args.Length > 0 ? args[0] : Nil.Instance;
+            if (stream is Nil) stream = DynamicBindings.Get(Sym("*STANDARD-OUTPUT*"));
+            else if (stream is T) stream = DynamicBindings.Get(Sym("*TERMINAL-IO*"));
+            if (stream is not LispStream && !(stream is LispInstance gi && Runtime.IsGrayOutputStream(gi)))
+                throw new LispErrorException(new LispTypeError("CHARPOS: not a stream", stream, Sym("STREAM")));
+            return Runtime.StreamColumn(stream) is int col ? Fixnum.Make(col) : Nil.Instance;
+        }, "CHARPOS", -1));
+
+        // dotcl:symbol-global-value: the global value of a symbol, ignoring any
+        // dynamic binding in effect on this thread (like sb-ext:symbol-global-value
+        // on SBCL). Signals UNBOUND-VARIABLE when the symbol has no global value.
+        // SETF of it sets the global value, leaving dynamic bindings alone.
+        {
+            RegisterDotcl("SYMBOL-GLOBAL-VALUE", new LispFunction(args => {
+                if (args.Length != 1)
+                    throw new LispErrorException(new LispProgramError(
+                        "SYMBOL-GLOBAL-VALUE: requires exactly 1 argument"));
+                var sym = Runtime.GetSymbol(args[0], "SYMBOL-GLOBAL-VALUE");
+                return sym.Value ?? throw new LispErrorException(new LispUnboundVariable(sym));
+            }, "SYMBOL-GLOBAL-VALUE", 1));
+            var (sgv, _) = DotclPkg.Intern("SYMBOL-GLOBAL-VALUE");
+            sgv.SetfFunction = new LispFunction(args => {
+                if (args.Length != 2)
+                    throw new LispErrorException(new LispProgramError(
+                        "(SETF SYMBOL-GLOBAL-VALUE): requires exactly 2 arguments"));
+                var sym = Runtime.GetSymbol(args[1], "(SETF SYMBOL-GLOBAL-VALUE)");
+                if (sym.IsConstant)
+                    throw Runtime.ConstantAssignmentError(sym, "(SETF SYMBOL-GLOBAL-VALUE)");
+                sym.Value = args[0];
+                return args[0];
+            }, "(SETF SYMBOL-GLOBAL-VALUE)", 2);
+        }
 
         // dotcl:getenv: get environment variable (like sb-posix:getenv on SBCL)
         RegisterDotcl("GETENV", new LispFunction(args => {
@@ -2246,6 +2295,15 @@ public static class Startup
             new LispFunction(args => Runtime.GreaterEqual(args[0], args[1]),
                              "%FIXNUM-GE-OBJECT", 2));
 
+        // The other DOTIMES intrinsic, for the same reason: the count clamped
+        // into int64 once before the loop (Runtime.DotimesLimit).
+        Emitter.CilAssembler.RegisterFunction("%DOTIMES-LIMIT",
+            new LispFunction(args => Fixnum.Make(Runtime.DotimesLimit(args[0])),
+                             "%DOTIMES-LIMIT", 1));
+        Emitter.CilAssembler.RegisterFunction("%LOOP-LIMIT-FLOOR",
+            new LispFunction(args => Fixnum.Make(Runtime.LoopLimitFloor(args[0])),
+                             "%LOOP-LIMIT-FLOOR", 1));
+
         // Same shape: the compiler lowers (%getenv "X") to a direct call, and the
         // compiler's own source uses it (reading DOTCL_DUMP_SIL_FOR), so an
         // interpreted compiler hit "Undefined function: %GETENV".
@@ -2365,7 +2423,7 @@ public static class Startup
         RegisterDotcl("SAVE-APPLICATION", new LispFunction(
             Runtime.SaveApplication, "SAVE-APPLICATION"));
 
-        // (dotcl-cs lives entirely in contrib/dotcl-cs/;
+        // (dotnet-cs lives entirely in contrib/dotnet-cs/;
         // no runtime registration here. IlDisasm.cs stays in runtime as a
         // reusable primitive.)
 
@@ -2612,6 +2670,34 @@ public static class Startup
             };
         }, "DOTCL::%INVOKE-NATIVE", -1));
 
+        // dotcl::%typed-entry-signature: the signature of a function's typed entry
+        // ("LD>L": argument and result kinds, see TypedEntrySig), or NIL when it
+        // has none. dotcl::%invoke-typed: call a function through that entry with
+        // boxed arguments, or through its ordinary entry when it has none. Both
+        // diagnostic, for tests that check the two entries agree.
+        RegisterDotclInternal("%TYPED-ENTRY-SIGNATURE", new LispFunction(args => {
+            if (args.Length != 1 || args[0] is not LispFunction fn)
+                throw new LispErrorException(new LispProgramError(
+                    "DOTCL::%TYPED-ENTRY-SIGNATURE: requires (function)"));
+            int code = fn.TypedEntryCode;
+            return code == 0 ? Nil.Instance : new LispString(Emitter.TypedEntrySig.FromCode(code));
+        }, "DOTCL::%TYPED-ENTRY-SIGNATURE", 1));
+        RegisterDotclInternal("%INVOKE-TYPED", new LispFunction(args => {
+            if (args.Length < 1 || args[0] is not LispFunction fn)
+                throw new LispErrorException(new LispProgramError(
+                    "DOTCL::%INVOKE-TYPED: requires (function arg...)"));
+            var rest = new LispObject[args.Length - 1];
+            Array.Copy(args, 1, rest, 0, rest.Length);
+            int code = fn.TypedEntryCode;
+            var del = code == 0 ? null : fn.TypedEntryFor(code);
+            if (del == null) return fn.Invoke(rest);
+            var sig = Emitter.TypedEntrySig.FromCode(code);
+            if (rest.Length != sig.Length - 2)
+                throw new LispErrorException(new LispProgramError(
+                    $"DOTCL::%INVOKE-TYPED: {sig} takes {sig.Length - 2} arguments"));
+            return Emitter.TypedEntrySig.InvokeBoxed(fn, del, sig, rest);
+        }, "DOTCL::%INVOKE-TYPED", -1));
+
         RegisterDotclInternal("%PHASE-TIME", new LispFunction(args => {
             if (args.Length != 2 || args[1] is not LispFunction thunk)
                 throw new LispErrorException(new LispProgramError(
@@ -2838,11 +2924,15 @@ public static class Startup
                 "DECLARATION-NAME-P", 1));
         RegisterDotcl("GLOBAL-NOTINLINE-P",
             new LispFunction(args =>
-                args[0] is Symbol s && s.IsNotinlineProclaimed ? (LispObject)T.Instance : Nil.Instance,
+                (args[0] is Symbol s ? s.IsNotinlineProclaimed
+                 : Runtime.SetfNameTarget(args[0]) is Symbol t && t.IsSetfNotinlineProclaimed)
+                    ? (LispObject)T.Instance : Nil.Instance,
                 "GLOBAL-NOTINLINE-P", 1));
         RegisterDotcl("GLOBAL-INLINE-P",
             new LispFunction(args =>
-                args[0] is Symbol s && s.IsInlineProclaimed ? (LispObject)T.Instance : Nil.Instance,
+                (args[0] is Symbol s ? s.IsInlineProclaimed
+                 : Runtime.SetfNameTarget(args[0]) is Symbol t && t.IsSetfInlineProclaimed)
+                    ? (LispObject)T.Instance : Nil.Instance,
                 "GLOBAL-INLINE-P", 1));
         RegisterDotcl("FUNCTION-LAMBDA-LIST",
             new LispFunction(args => Runtime.FunctionLambdaList(args[0]),
@@ -2923,7 +3013,7 @@ public static class Startup
 
         // Assembly/native resolver registration. The Default ALC's Resolving /
         // ResolvingUnmanagedDll hooks consult these tables, so a contrib (e.g.
-        // the nuget contrib, reading project.assets.json after `dotnet restore`) can teach
+        // the dotnet-nuget contrib, reading project.assets.json after `dotnet restore`) can teach
         // the runtime exact version-unified managed paths and RID-specific native
         // paths without baking NuGet logic into the runtime. (name path) -> path.
         RegisterDotcl("REGISTER-ASSEMBLY-PATH", new LispFunction(args =>

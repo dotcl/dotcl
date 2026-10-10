@@ -5,7 +5,7 @@
 #
 # Two things have to hold, and this script asserts both:
 #   1. the report names lib.lisp at all: it only does when the fasl is loaded
-#      file-backed, hence DOTCL_FASL_LOADFROM=1
+#      file-backed (LOAD reads fasls by path)
 #   2. a function the driver never calls shows as uncovered: otherwise the
 #      numbers are not measuring anything
 #
@@ -31,7 +31,7 @@ REPORT="$WORK/coverage.cobertura.xml"
 
 echo "=== collecting coverage ==="
 ( cd "$WORK" \
-  && DOTCL_EMIT_PDB=1 DOTCL_FASL_LOADFROM=1 COVERAGE_SRC=lib.lisp \
+  && DOTCL_EMIT_PDB=1 COVERAGE_SRC=lib.lisp \
      dotnet-coverage collect --output "$REPORT" --output-format cobertura -- \
      dotnet run --project "$RT" -- --asm "$SIL" driver.lisp ) > "$WORK/run.log" 2>&1 \
   || { echo "FAIL: the collected run itself failed"; cat "$WORK/run.log"; exit 1; }

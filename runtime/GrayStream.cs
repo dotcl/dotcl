@@ -32,6 +32,7 @@ public class GrayStreamTextWriter : TextWriter
     private LispFunction? _writeStringFn;
 
     public GrayStreamTextWriter(LispInstance stream) => _stream = stream;
+    public LispInstance Stream => _stream;
 
     public override Encoding Encoding => Encoding.UTF8;
 

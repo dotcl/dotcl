@@ -49,11 +49,24 @@
 #   LIBRARY_STATUS_JSON            results.json to take the default list from
 #   LIBRARY_STATUS_TESTS_JSON      output tests.json
 #   LIBRARY_STATUS_LOGDIR          per-system output, kept for diagnosis
+#   LIBRARY_STATUS_ALLOW_STALE_DIST=1  measure even if the dotcl dist is older
+#                                  than the published one (see dists.sh)
+#   LIBRARY_STATUS_CONFIG          Release (default) or Debug: which build of
+#                                  the runtime measures (see runtime.sh)
+#
+#        run-tests.sh --judge LOG...
+#                                  judge logs already written (by this script,
+#                                  or by the same driver on another Lisp) and
+#                                  print "LOG VERDICT FRAMEWORK PASSED FAILED"
+#                                  per log; nothing is run
 set -eu
 
+mode=run
+if [ "${1:-}" = "--judge" ]; then mode=judge; shift; fi
 root="${1:-.}"
 # Note filters (scrub_note), shared with the other stage.
 . "$(dirname "$0")/scrub.sh"
+. "$(dirname "$0")/dists.sh"
 here="$root/bench/library-status"
 results="${LIBRARY_STATUS_JSON:-$here/results.json}"
 targets="$here/targets.txt"
@@ -62,60 +75,6 @@ logdir="${LIBRARY_STATUS_LOGDIR:-$root/out/library-status-tests}"
 per="${LIBRARY_STATUS_TEST_TIMEOUT:-900}"
 limit="${LIMIT:-0}"
 resume="${LIBRARY_STATUS_RESUME:-0}"
-
-exe="$root/runtime/bin/Debug/net10.0/runtime.exe"
-[ -x "$exe" ] || exe="$root/runtime/bin/Debug/net10.0/runtime"
-[ -x "$exe" ] || { echo "run-tests: no built runtime; run make build first" >&2; exit 1; }
-core="$root/compiler/cil-out.sil"
-# GNU timeout bounds each run. macOS has none by default; Homebrew coreutils
-# installs it as gtimeout. Without either, every run would fail with 127 and
-# be recorded as a library failure, so stop here instead.
-if command -v timeout >/dev/null 2>&1; then timeout=timeout
-elif command -v gtimeout >/dev/null 2>&1; then timeout=gtimeout
-else echo "run-tests: needs GNU timeout (coreutils; gtimeout on macOS)" >&2; exit 1
-fi
-[ -f "$core" ] || { echo "run-tests: no $core; run make cross-compile first" >&2; exit 1; }
-
-checked=$(date +%Y-%m-%d)
-work=$(mktemp -d)
-trap 'rm -rf "$work"' EXIT
-mkdir -p "$logdir"
-
-jstr() {
-  printf '%s' "$1" \
-    | tr -d '"\\' | tr '\n\r\t' '   ' \
-    | sed 's|^[. ]*||; s|  *| |g; s| *$||' \
-    | scrub_note \
-    | cut -c1-160
-}
-
-# The work list. Default: the rows that load, in the published order.
-if [ -n "${LIBRARY_STATUS_TEST_TARGETS:-}" ]; then
-  grep -v '^#' "$LIBRARY_STATUS_TEST_TARGETS" | grep -v '^[[:space:]]*$' > "$work/list"
-else
-  # POSIX ERE: alternation in a BRE (\|) is a GNU extension that BSD sed
-  # (macOS) treats as a literal and so matches nothing. [{] because a bare {
-  # after an atom starts an interval in an ERE.
-  sed -En 's/^  [{]"system": "([^"]*)".*"status": "(load-only|patched)".*/\1/p' "$results" \
-    | sort -u > "$work/loads"
-  grep -v '^#' "$targets" | grep -v '^[[:space:]]*$' | grep -Fxf "$work/loads" > "$work/list" || true
-fi
-
-: > "$work/entries"
-if [ "$resume" = "1" ] && [ -f "$out" ]; then
-  grep '^  {"system"' "$out" | sed 's/,*$//' > "$work/entries" || true
-  sed -n 's/^  {"system": "\([^"]*\)".*/\1/p' "$work/entries" | sort -u > "$work/done"
-else
-  : > "$work/done"
-fi
-
-write_json() {
-  {
-    echo '['
-    sed '$!s/$/,/' "$work/entries"
-    echo ']'
-  } > "$out"
-}
 
 # judge LOG -> prints "VERDICT FRAMEWORK PASSED FAILED"
 #
@@ -128,6 +87,21 @@ write_json() {
 esc=$(printf '\033')
 judge() {
   sed -n '/^LIBTEST-BEGIN/,$p' "$1" | sed "s/${esc}\[[0-9;]*m//g" | LC_ALL=C awk '
+    # Fold what is counted only at the end of a region (per-test lines,
+    # last-result lines) into the totals, and clear it.
+    function settle(  k) {
+      if (fiasco_ok > 0 || fiasco_fail > 0) {
+        fw["fiasco"]=1; pass += fiasco_ok; fail += fiasco_fail }
+      if (lift_seen) { fw["lift"]=1; pass += lift_pass; fail += lift_fail }
+      if (fp_seen && !("fiveam" in fw)) { fw["fiveam"]=1; pass += fp_pass; fail += fp_fail }
+      for (k in lr_seen) if (!(k in fw)) { fw[k]=1; pass += lr_pass[k]; fail += lr_fail[k] }
+      if (last_seen && !("stefil" in fw)) {
+        fw["stefil"]=1; pass += last_pass; fail += last_fail }
+      fiasco_ok = fiasco_fail = lift_seen = fp_seen = fp_pass = fp_fail = last_seen = 0
+      for (k in lr_seen) delete lr_seen[k]
+      for (k in lr_pass) delete lr_pass[k]
+      for (k in lr_fail) delete lr_fail[k]
+    }
     # fiveam: "Did N checks." then "Pass: P (..%)" and "Fail: F (..%)".
     # Nested suites print one block each, indented; they are summed.
     /^[[:space:]]*Did [0-9]+ checks?\./ { fw["fiveam"]=1; next }
@@ -221,13 +195,24 @@ judge() {
     # passed." or "Some tests failed.". It prints no counts (the dots are
     # "one per ten tests"), so the unit here is the suite: a suite with a
     # failing test is a failure. Read only when that closing line is seen.
+    # The WITH-TEST-SUITE harness of flexi-streams (and other libraries by
+    # the same author) has the same shape with "Test suite: NAME" lines, and
+    # reports a failing check as "Test FORM failed." (maybe with "signalling
+    # error ..."), or "Expected condition TYPE not signalled.".
     /^Test: / { ppcre_suites++; ppcre_cur = 0; next }
     ppcre_suites && /^ *[0-9]+:$/ { if (!ppcre_cur) { ppcre_bad++; ppcre_cur = 1 } next }
+    /^Test suite: / { wts_suites++; wts_cur = 0; next }
+    wts_suites && (/^Test .* failed/ || /^Expected condition .* not signalled\.$/) {
+      if (!wts_cur) { wts_bad++; wts_cur = 1 } next }
     /^(All tests passed|Some tests failed)\.$/ {
       if (ppcre_suites) {
         fw["cl-ppcre"]=1; pass += ppcre_suites - ppcre_bad; fail += ppcre_bad
         if ($1 == "Some" && ppcre_bad == 0) fail += 1
         ppcre_suites = 0; ppcre_bad = 0 }
+      if (wts_suites) {
+        fw["with-test-suite"]=1; pass += wts_suites - wts_bad; fail += wts_bad
+        if ($1 == "Some" && wts_bad == 0) fail += 1
+        wts_suites = 0; wts_bad = 0 }
       next }
     # lisp-unit2: "Test Summary for :NAME (N tests 0.12 sec)" (or without the
     # "for :NAME" part), then one "  | N WHAT" line per count. The counts read
@@ -240,6 +225,17 @@ judge() {
     in_lu2 && /^[[:space:]]*\| [0-9]+ execution errors?[[:space:]]*$/ { fail += $2; next }
     in_lu2 && /^[[:space:]]*\|/ { next }
     in_lu2 { in_lu2 = 0 }
+    # lisp-unit (the first one): "Unit Test Summary", then " | N assertions
+    # total", " | P passed", " | F failed", " | E execution errors" and
+    # " | M missing tests". The unit is the assertion; an execution error is
+    # a test that signalled, counted as a failure. A missing test is a name
+    # asked for that has no test, which is neither.
+    /^[[:space:]]*Unit Test Summary[[:space:]]*$/ { fw["lisp-unit"]=1; in_lu1 = 1; next }
+    in_lu1 && /^[[:space:]]*\| [0-9]+ passed[[:space:]]*$/ { pass += $2; next }
+    in_lu1 && /^[[:space:]]*\| [0-9]+ failed[[:space:]]*$/ { fail += $2; next }
+    in_lu1 && /^[[:space:]]*\| [0-9]+ execution errors?[[:space:]]*$/ { fail += $2; next }
+    in_lu1 && /^[[:space:]]*\|/ { next }
+    in_lu1 { in_lu1 = 0 }
     # lift: "Test Report for SUITE: N tests run, all passed!" or
     # "...: N tests run, F Failures." (", E Errors." may follow). The unit is
     # the test; a failure or an error is a failing test. Lift can print the
@@ -257,6 +253,39 @@ judge() {
     # "Successes this test:S" after each "Begin NAME test".
     /^Errors detected in this test: *[0-9]+/ { fw["ptester"]=1; s = $0; sub(/.*: */, "", s); fail += s + 0; next }
     /^Successes this test: *[0-9]+/ { fw["ptester"]=1; s = $0; sub(/.*: */, "", s); pass += s + 0; next }
+    # hunchentoot: its confidence script (WITH-SCRIPT-CONTEXT) prints one line when
+    # it is done, ";; all tests PASSED" or ";; N assertion(s) FAILED". It counts
+    # no passing checks, so a pass is counted as 1: the script, not a check.
+    /^;; all tests PASSED$/ { fw["hunchentoot"]=1; pass += 1; next }
+    /^;; [0-9]+ assertions? FAILED$/ { fw["hunchentoot"]=1; fail += $2; next }
+    # unit-test (cl-fad, yason): "Running "NAME" ..." and "=> P passed." per
+    # test, then a line of "=" and "N tests total." with one indented line
+    # for each non-zero count: "P passed.", "F failed.", "C crashed.". The
+    # unit is the test; a crash is a test that signalled, counted as a
+    # failure.
+    /^[0-9]+ tests? total\.$/ { fw["unit-test"]=1; in_ut = 1; next }
+    in_ut && /^[[:space:]]+[0-9]+ passed\.$/ { pass += $1; next }
+    in_ut && /^[[:space:]]+[0-9]+ (failed|crashed)\.$/ { fail += $1; next }
+    in_ut { in_ut = 0 }
+    # should-test (rutils): "Test NAME: " when a test starts, then "  OK" or
+    # "  FAILED" at the end of a line when it is done (output of the test,
+    # such as a failure report, can come in between). No summary is printed.
+    /^Test [^ :]+: / { st_open = 1 }
+    st_open && /  OK$/ { fw["should-test"]=1; pass++; st_open = 0; next }
+    st_open && /  FAILED$/ { fw["should-test"]=1; fail++; st_open = 0; next }
+    # fiveam without a summary: RUN (rather than RUN!) prints only progress,
+    # "Running test NAME " followed by one character per check: "." passed,
+    # "f" failed, "X" signalled, "s" skipped. Counted at END, and only when no
+    # "Did N checks." summary was printed. A line where the test printed
+    # something of its own after the name is not read.
+    /^[[:space:]]*Running test [^ ]+ [.fXs]*[[:space:]]*$/ {
+      s = $NF; if (s !~ /^[.fXs]+$/) next
+      fp_seen = 1; fp_pass += gsub(/\./, "", s); fp_fail += gsub(/[fX]/, "", s); next }
+    # What the driver printed from the result a framework keeps (LIFT,
+    # clunit): "LIBTEST-LAST-RESULT FRAMEWORK PASSED FAILED". Used at END
+    # only when the output had no summary of that framework.
+    /^LIBTEST-LAST-RESULT [a-z0-9]+ [0-9]+ [0-9]+$/ {
+      lr_seen[$2] = 1; lr_pass[$2] += $3; lr_fail[$2] += $4; next }
     # Nothing to run (see the driver), or hu.dwim.asdf naming a test system
     # that does not exist.
     /^LIBTEST-NO-TEST-OP/ { notests = 1; next }
@@ -264,12 +293,22 @@ judge() {
     /^LIBTEST-ERROR/ { err = 1 }
     /^; Debugger entered on/ { err = 1 }
     /^LIBTEST-END/ { ended = 1 }
+    # The driver loads the test systems after LIBTEST-BEGIN and prints
+    # LIBTEST-TEST-OP before it runs the test op. A suite that runs while its
+    # system loads and again from the test op would otherwise be counted
+    # twice, so what was recognised while loading is set aside here and used
+    # only when the test op itself printed nothing a recogniser knows.
+    /^LIBTEST-TEST-OP$/ {
+      settle()
+      for (k in fw) { lfw[k] = 1; delete fw[k] }
+      lpass = pass; lfail = fail; pass = 0; fail = 0
+      in_para = in_clunit = in_lu2 = in_lu1 = in_ut = st_open = 0
+      ppcre_suites = ppcre_bad = wts_suites = wts_bad = 0
+      next }
     END {
-      if (fiasco_ok > 0 || fiasco_fail > 0) {
-        fw["fiasco"]=1; pass += fiasco_ok; fail += fiasco_fail }
-      if (lift_seen) { fw["lift"]=1; pass += lift_pass; fail += lift_fail }
-      if (last_seen && !("stefil" in fw)) {
-        fw["stefil"]=1; pass += last_pass; fail += last_fail }
+      settle()
+      n = 0; for (k in fw) n++
+      if (n == 0) { for (k in lfw) fw[k] = 1; pass = lpass; fail = lfail }
       names = ""
       for (k in fw) names = names (names == "" ? "" : "+") k
       if (names == "") names = "-"
@@ -281,6 +320,66 @@ judge() {
       printf "%s %s %d %d\n", v, names, pass, fail
     }'
 }
+
+if [ "$mode" = judge ]; then
+  for log in "$@"; do printf '%s %s\n' "$log" "$(judge "$log")"; done
+  exit 0
+fi
+
+# The Release build by default, and refused when older than the sources: see
+# runtime.sh.
+. "$(dirname "$0")/runtime.sh"
+select_runtime run-tests
+# GNU timeout bounds each run. macOS has none by default; Homebrew coreutils
+# installs it as gtimeout. Without either, every run would fail with 127 and
+# be recorded as a library failure, so stop here instead.
+if command -v timeout >/dev/null 2>&1; then timeout=timeout
+elif command -v gtimeout >/dev/null 2>&1; then timeout=gtimeout
+else echo "run-tests: needs GNU timeout (coreutils; gtimeout on macOS)" >&2; exit 1
+fi
+
+check_dists run-tests
+checked=$(date +%Y-%m-%d)
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+mkdir -p "$logdir"
+
+jstr() {
+  printf '%s' "$1" \
+    | tr -d '"\\' | tr '\n\r\t' '   ' \
+    | sed 's|^[. ]*||; s|  *| |g; s| *$||' \
+    | scrub_note \
+    | cut -c1-160
+}
+
+# The work list. Default: the rows that load, in the published order.
+if [ -n "${LIBRARY_STATUS_TEST_TARGETS:-}" ]; then
+  grep -v '^#' "$LIBRARY_STATUS_TEST_TARGETS" | grep -v '^[[:space:]]*$' > "$work/list"
+else
+  # POSIX ERE: alternation in a BRE (\|) is a GNU extension that BSD sed
+  # (macOS) treats as a literal and so matches nothing. [{] because a bare {
+  # after an atom starts an interval in an ERE.
+  sed -En 's/^  [{]"system": "([^"]*)".*"status": "(load-only|patched)".*/\1/p' "$results" \
+    | sort -u > "$work/loads"
+  grep -v '^#' "$targets" | grep -v '^[[:space:]]*$' | grep -Fxf "$work/loads" > "$work/list" || true
+fi
+
+: > "$work/entries"
+if [ "$resume" = "1" ] && [ -f "$out" ]; then
+  grep '^  {"system"' "$out" | sed 's/,*$//' > "$work/entries" || true
+  sed -n 's/^  {"system": "\([^"]*\)".*/\1/p' "$work/entries" | sort -u > "$work/done"
+else
+  : > "$work/done"
+fi
+
+write_json() {
+  {
+    echo '['
+    sed '$!s/$/,/' "$work/entries"
+    echo ']'
+  } > "$out"
+}
+
 
 n=0
 ran=0
@@ -321,11 +420,38 @@ for sys in $(cat "$work/list"); do
           (when (and s (not (eq s system)))
             (pushnew (asdf:component-name s) names :test #'string=)))))
     (nreverse names)))
+;; A test system's own files are loaded after LIBTEST-BEGIN, not here: many
+;; test systems run their suite while loading (a RUN! at top level), and the
+;; judge reads nothing printed before the marker. Here only what the test
+;; system depends on is fetched and loaded, so that what follows the marker is
+;; the test system and its tests. A test system whose definition cannot be
+;; read before its dependencies are on disk is loaded whole here, as before.
+(defun libtest-load-dependencies (name)
+  "Quickload what system NAME depends on. True if that worked."
+  (ignore-errors
+   (let ((ql (ql-dist:find-system name)))
+     (when ql (ql-dist:ensure-installed ql)))
+   (let ((system (asdf:find-system name nil)))
+     (when system
+       (dolist (dep (asdf:system-depends-on system) t)
+         (let ((d (ignore-errors (asdf/find-component:resolve-dependency-spec system dep))))
+           (when d (ql:quickload (asdf:component-name d)))))))))
+;; Each entry is (NAME . REQUIRED): a test system TEST-OP depends on is
+;; required, a guessed one (below) is not.
+(defvar *libtest-deferred* '())
+(defun libtest-prepare (name required)
+  "Load NAME now if its dependencies cannot be loaded apart from it, else
+remember it to load after LIBTEST-BEGIN."
+  (cond ((assoc name *libtest-deferred* :test #'string=))
+        ((libtest-load-dependencies name)
+         (setf *libtest-deferred*
+               (append *libtest-deferred* (list (cons name required)))))
+        (t (ql:quickload name))))
 (let ((names (handler-case (libtest-test-systems "$sys")
                (error (e) (libtest-die "LIBTEST-LOAD-FAIL" e 3)))))
   (format t "~&LIBTEST-TEST-SYSTEMS ~{~a~^ ~}~%" names)
   (dolist (name names)
-    (handler-case (ql:quickload name)
+    (handler-case (libtest-prepare name t)
       (error (e) (libtest-die "LIBTEST-LOAD-FAIL" e 3)))))
 ;; Some TEST-OPs load their test system by calling OPERATE from inside the
 ;; PERFORM method instead of naming it as a dependency (babel does), which
@@ -335,13 +461,19 @@ for sys in $(cat "$work/list"); do
 ;; system, the run fails on its own.
 (dolist (name '("$sys/test" "$sys/tests" "$sys-test" "$sys-tests"))
   (when (ql-dist:find-system name)
-    (handler-case (progn (ql:quickload name)
+    (handler-case (progn (libtest-prepare name nil)
                          (format t "~&LIBTEST-EXTRA-SYSTEM ~a~%" name))
       (error (e) (format t "~&LIBTEST-NOTE ~a did not load: ~a~%" name e)))))
 ;; The markers start with ~% rather than ~&: the judge only reads a marker at the
 ;; start of a line, and a FRESH-LINE that misjudges the column (after PRINT, on
 ;; some streams) would glue it to the test output and lose the result.
 (format t "~%LIBTEST-BEGIN~%")
+(loop for (name . required) in *libtest-deferred*
+      do (handler-case (ql:quickload name)
+           (error (e)
+             (if required
+                 (libtest-die "LIBTEST-LOAD-FAIL" e 3)
+                 (format t "~&LIBTEST-NOTE ~a did not load: ~a~%" name e)))))
 ;; A TEST-OP with nothing to do: no test system among its dependencies and
 ;; no PERFORM method of the library's own, only ASDF's empty default one.
 ;; Marked so the judge can tell "defines no tests" from "ran, but printed
@@ -367,6 +499,8 @@ for sys in $(cat "$work/list"); do
 ;; before the debugger is reached, and a library that tests its own debugger
 ;; handling (trivial-custom-debugger signals an error inside WITH-DEBUGGER and
 ;; expects its hook to see it) could never pass.
+(format t "~%LIBTEST-TEST-OP~%")
+(finish-output)
 (let ((*debugger-hook* (lambda (c hook)
                          (declare (ignore hook))
                          (libtest-die "LIBTEST-ERROR" c 2))))
@@ -377,6 +511,32 @@ for sys in $(cat "$work/list"); do
   (let ((s (and (find-package p) (find-symbol "*LAST-TEST-RESULT*" p))))
     (when (and s (boundp s) (symbol-value s))
       (format t "~%LIBTEST-STEFIL-RESULT ~a~%" (symbol-value s)))))
+;; LIFT, clunit and clunit2 also keep the last result, and a suite run while
+;; loading or from a test op that drops the result prints only progress. Print
+;; the counts it holds as "LIBTEST-LAST-RESULT FRAMEWORK PASSED FAILED"; the
+;; judge uses them only when the output had no summary of that framework. A
+;; LIFT error, and a clunit error (an assertion that signalled), is a failure.
+(flet ((sym (name package)
+         (let ((p (find-package package)))
+           (and p (find-symbol name p))))
+       (len (x) (if (listp x) (length x) 0)))
+  (let* ((s (sym "*TEST-RESULT*" "LIFT"))
+         (r (and s (boundp s) (symbol-value s))))
+    (when r
+      (ignore-errors
+       (let ((run (len (funcall (sym "TESTS-RUN" "LIFT") r)))
+             (bad (+ (len (funcall (sym "FAILURES" "LIFT") r))
+                     (len (funcall (sym "ERRORS" "LIFT") r)))))
+         (format t "~%LIBTEST-LAST-RESULT lift ~d ~d~%" (max 0 (- run bad)) bad)))))
+  (dolist (p '("CLUNIT" "CLUNIT2"))
+    (let* ((s (sym "*LAST-CLUNIT-REPORT*" p))
+           (r (and s (boundp s) (symbol-value s))))
+      (when r
+        (ignore-errors
+         (format t "~%LIBTEST-LAST-RESULT clunit ~d ~d~%"
+                 (slot-value r (sym "PASSED" p))
+                 (+ (slot-value r (sym "FAILED" p))
+                    (slot-value r (sym "ERRORS" p)))))))))
 (format t "~%LIBTEST-END~%")
 (finish-output)
 (dotcl:quit 0)
@@ -386,7 +546,7 @@ DRVEOF
   log="$logdir/$(printf '%s' "$sys" | tr / _).txt"
   t0=$(date +%s)
   set +e
-  "$timeout" "$per" "$exe" --asm "$core" "$work/drv.lisp" > "$log" 2>&1 < /dev/null
+  "$timeout" "$per" "$exe" --core "$core" "$work/drv.lisp" > "$log" 2>&1 < /dev/null
   code=$?
   set -e
   t1=$(date +%s)
@@ -409,8 +569,8 @@ DRVEOF
   verdict=$1; framework=$2; passed=$3; failed=$4
   tsys=$(sed -n 's/^LIBTEST-TEST-SYSTEMS *//p; s/^LIBTEST-EXTRA-SYSTEM //p' "$log" | tr '\n' ' ')
 
-  printf '  {"system": "%s", "checked": "%s", "verdict": "%s", "framework": "%s", "passed": %d, "failed": %d, "test-systems": "%s", "note": "%s"}\n' \
-    "$sys" "$checked" "$verdict" "$framework" "$passed" "$failed" "$(jstr "$tsys")" "$(jstr "${note:-}")" >> "$work/entries"
+  printf '  {"system": "%s", "checked": "%s", "verdict": "%s", "framework": "%s", "passed": %d, "failed": %d, "test-systems": "%s", "note": "%s", "dists": "%s", "runtime": "%s", "seconds": %d}\n' \
+    "$sys" "$checked" "$verdict" "$framework" "$passed" "$failed" "$(jstr "$tsys")" "$(jstr "${note:-}")" "$dists_desc" "$runtime_desc" "$elapsed" >> "$work/entries"
   write_json
   ran=$((ran + 1))
 

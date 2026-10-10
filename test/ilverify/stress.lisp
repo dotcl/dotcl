@@ -117,3 +117,12 @@
 (defun invoke-with-branching-arg (r list)
   (restart-case (invoke-restart r (loop :for e :in list :collect e))
     (continue () :ok)))
+
+;; An (unsigned-byte 64) local keeps its bits in an Int64 slot. When it is also
+;; known to be a fixnum (here from its init's range), a fixnum operation on it
+;; must read the slot as the int64 it is, not unbox it as a Fixnum object.
+(defun u64-local-with-fixnum-range (k)
+  (declare (type (integer 0 10) k))
+  (let ((n k))
+    (declare (type (unsigned-byte 64) n))
+    (ldb (byte 64 0) (ash (logxor #x70 (logand n #xff)) 56))))

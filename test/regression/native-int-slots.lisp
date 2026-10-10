@@ -15,9 +15,17 @@
 
 (setf dotcl:*save-sil* t)
 
-(defun %nis-int64-slot-p (fn)
-  "True when FN's SIL declares at least one Int64 local."
-  (and (search "Int64" (princ-to-string (dotcl:function-sil fn))) t))
+(defun %nis-int64-slot-p (fn &optional (var "V"))
+  "True when FN's SIL declares a slot of the LET variable named VAR as Int64.
+   Asked of the variable and not of the whole function: a declared parameter
+   read natively has a raw slot of its own."
+  (let ((s (%flat-text (dotcl:function-sil fn)))
+        (needle (concatenate 'string "DECLARE-LOCAL " var "_")))
+    (loop for p = (search needle s) then (search needle s :start2 (1+ p))
+          while p
+          thereis (let* ((q (position #\Space s :start (+ p 14)))
+                         (e (position #\) s :start q)))
+                    (string= (subseq s (1+ q) e) "Int64")))))
 
 ;;; ---- 1. the crc shape: promoted, and box-free at the store ----
 
@@ -39,13 +47,13 @@
 ;;; the ordinary boxed value, so these ask a question that build cannot answer.
 
 (deftest-compiled-only nis-crc-step-native-slot
-  (%nis-int64-slot-p #'%nis-crc-step)
+  (%nis-int64-slot-p #'%nis-crc-step "NEW-RMDR")
   t)
 
 ;; The store into the slot no longer boxes: the only Fixnum.Make left is the one
 ;; that hands the result back to the caller.
 (deftest-compiled-only nis-crc-step-one-box
-  (let ((sil (princ-to-string (dotcl:function-sil #'%nis-crc-step)))
+  (let ((sil (%flat-text (dotcl:function-sil #'%nis-crc-step)))
         (n 0)
         (start 0))
     (loop for p = (search "Fixnum.Make" sil :start2 start)
@@ -158,7 +166,7 @@
     (logand *nis-special* 255)))
 
 (deftest nis-special-not-promoted
-  (%nis-int64-slot-p #'%nis-special)
+  (%nis-int64-slot-p #'%nis-special "*NIS-SPECIAL*")
   nil)
 
 (deftest nis-special-value

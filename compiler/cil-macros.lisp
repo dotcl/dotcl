@@ -240,17 +240,13 @@ before.")
 ;;; -1 for a slot that stays boxed. NIL when no slot qualifies, which is the
 ;;; signal not to emit a registration at all.
 (defun %slot-raw-kind (slot)
-  "0 when SLOT is stored as a raw int64, 1 when as a raw double, NIL when it
-   stays boxed.
-
-   DOUBLE-FLOAT only, not SINGLE-FLOAT. A single would have to remember that it
-   is one so a generic read boxes a SINGLE-FLOAT and not a DOUBLE-FLOAT, which
-   is a third piece of per-slot metadata for a slot type that is rare in the
-   code this is meant to speed up. Nothing stops it being added when something
-   actually wants it."
+  "0 when SLOT is stored as a raw int64, 1 when as a raw double, 2 when as a
+   raw single-float (its bits in the low half of the long), NIL when it stays
+   boxed."
   (let ((ty (getf (cddr slot) :type)))
     (cond ((null ty) nil)
           ((member ty (quote (double-float long-float))) 1)
+          ((member ty (quote (single-float short-float))) 2)
           (t (let ((r (if (eq ty (quote fixnum))
                           (cons +int64-min+ +int64-max+)
                           (integer-type-range ty))))
@@ -458,6 +454,88 @@ quietly took every typed slot back off the raw path."
    the table never outlives the definition it describes. The VERSION is what a
    consumer checks before trusting a position, and it is the whole of the
    soundness argument.")
+
+;;; The compiler's view of a standard structure's accessors: the slot index a
+;;; call site emits for each one, the slot's declared type, and the SETF
+;;; expansion of a store. DEFSTRUCT records it while it is macroexpanded; the
+;;; fasl carries a PROCLAIM of the same data (%STRUCT-ACCESSORS-PROCLAMATION)
+;;; so that code compiled in an image that only LOADed the fasl inlines the
+;;; accessors too.
+
+(defun %standard-struct-setf-expander (raw-index slot sname)
+  "The SETF expander of the accessor of SLOT (a parsed DEFSTRUCT slot) of the
+   standard structure SNAME, whose call sites address the slot as RAW-INDEX.
+   The slot's declared type is checked at the store, where the writer's own
+   SAFETY applies -- the check compiles away entirely under (safety 0).
+   %STRUCT-SET already answers the value it stored, so a value that is a
+   variable or a constant needs no temporary -- and the temporary is what
+   forced the value into a LispObject local, which is where a fixnum store got
+   its box. Anything else keeps the LET: it has to be evaluated exactly once."
+  (lambda (place value)
+    (if (or (symbolp value) (constantp value))
+        (%with-slot-checks
+         (list (%slot-check-stmt value slot sname))
+         `(%struct-set ,(cadr place) ,raw-index ,value))
+        (let ((tmp (gensym "V")))
+          `(let ((,tmp ,value))
+             ;; A raw slot holds an int64, so the temporary holds one too.
+             ;; Without the declaration it is a LispObject local, and the value
+             ;; is boxed into it only to be unboxed again for the store -- one
+             ;; allocation per store, which is the whole cost the raw storage
+             ;; exists to remove.
+             ,@(let ((k (%slot-raw-kind slot)))
+                 (cond ((eql k 0) `((declare (fixnum ,tmp))))
+                       ((eql k 1) `((declare (double-float ,tmp))))
+                       ((eql k 2) `((declare (single-float ,tmp))))))
+             ,@(remove nil
+                       (list (%slot-check-stmt tmp slot sname)))
+             (%struct-set ,(cadr place) ,raw-index ,tmp)
+             ,tmp)))))
+
+(defun %register-standard-struct-accessor (acc raw-index slot sname)
+  "Record ACC, the accessor of SLOT of the standard structure SNAME, for
+   inlining at call sites (as RAW-INDEX) and, unless the slot is :READ-ONLY,
+   for SETF. A read-only slot is read like any other, so its reads inline too;
+   it only has no SETF expansion."
+  (setf (gethash acc *struct-accessors*) raw-index)
+  (let ((ty (getf (cddr slot) :type)))
+    (if ty
+        (setf (gethash acc *struct-accessor-types*) ty)
+        (remhash acc *struct-accessor-types*)))
+  (unless (getf (cddr slot) :read-only)
+    (setf (gethash (%setf-key acc) *setf-expanders*)
+          (%standard-struct-setf-expander raw-index slot sname))))
+
+(defun %struct-accessors-proclamation (name version accessor-names slots)
+  "For a standard structure NAME expanded by COMPILE-FILE at layout VERSION:
+   the form that, when the fasl is loaded, records what this expansion recorded
+   for the compiler (%LOAD-STRUCT-ACCESSORS). NIL outside COMPILE-FILE, and when
+   a slot's type cannot be written into a fasl. SLOTS are the parsed slots, in
+   the order ACCESSOR-NAMES names them; their initforms are left out."
+  (when (and *compile-file-mode* (not *cross-compiling*))
+    (let ((slots (mapcar (lambda (s)
+                           (list (car s) nil
+                                 :read-only (getf (cddr s) :read-only)
+                                 :type (getf (cddr s) :type)))
+                         slots)))
+      (when (and (%fasl-dumpable-source-p slots)
+                 (%fasl-dumpable-source-p accessor-names))
+        `(proclaim '(%struct-accessors ,name ,version ,accessor-names ,slots))))))
+
+(defun %load-struct-accessors (name version accessor-names slots)
+  "The load-time half of %STRUCT-ACCESSORS-PROCLAMATION: what the DEFSTRUCT
+   expansion records about NAME's layout and accessors."
+  (setf (gethash name *struct-layout-versions*)
+        (cons version (%struct-layout-signature slots)))
+  (let ((raw (%struct-raw-layout slots)))
+    (if raw
+        (setf (gethash name *struct-raw-layouts*) (cons version raw))
+        (remhash name *struct-raw-layouts*)))
+  (loop for acc in accessor-names
+        for s in slots
+        for i from 0
+        do (%register-standard-struct-accessor
+            acc (%pack-slot-index i version) s name)))
 
 (defvar *struct-keyword-ctors* (make-hash-table :test #'eq :synchronized t)
   "Maps a DEFSTRUCT keyword-constructor symbol to (STRUCT-NAME KEYWORDS INITFORMS).
@@ -790,6 +868,18 @@ quietly took every typed slot back off the raw path."
 ;;; setf for car/cdr and compound cXXXr forms.
 ;;; CLHS 5.1.1.1: the cons subform is evaluated once, before the value form,
 ;;; and the value form is evaluated exactly once.
+(defun %setf-arg-constant-p (form)
+  "Is FORM, an argument of a SETF place, a constant whose value no other form
+   can change, so the SETF expansion may use it as is instead of binding it to a
+   temp first: a self-evaluating object other than a symbol, a keyword, T, NIL,
+   or a QUOTE form."
+  (or (and (atom form) (not (symbolp form)))
+      (keywordp form)
+      (eq form t)
+      (null form)
+      (and (consp form) (eq (car form) 'quote)
+           (consp (cdr form)) (null (cddr form)))))
+
 (defun %setf-cons-cell (setter obj-form value)
   (let ((obj (gensym "OBJ")) (v (gensym "V")))
     `(let* ((,obj ,obj-form)
@@ -1179,10 +1269,11 @@ quietly took every typed slot back off the raw path."
                                    (,(car stores) ,value))
                               ,setter
                               ,(car stores))
+                           ;; The storing form returns the values of the
+                           ;; store variables, so its values are the result.
                            `(let* (,@(mapcar #'list temps vals))
                               (multiple-value-bind ,stores ,value
-                                ,setter)
-                              (values ,@stores))))))
+                                ,setter))))))
                   ;; Custom setf expander lookup (package-aware)
                   ((and (consp place)
                         (symbolp (car place))
@@ -1205,15 +1296,25 @@ quietly took every typed slot back off the raw path."
                   ;; Emit the funcall form (not the bare ((setf f) val args) operator
                   ;; form): the funcall form is the de-facto standard (SBCL/CCL/ECL/ABCL)
                   ;; that code walkers handle, and the bare operator-list form trips
-                  ;; them up (iterate minimize). Bind the place args left-to-right
-                  ;; then value into temps so evaluation order is CLHS 5.1.1.1-correct.
+                  ;; them up (iterate minimize). The place args are bound
+                  ;; left-to-right into temps and the value is evaluated after
+                  ;; them, as the first argument of the FUNCALL, so evaluation
+                  ;; order is CLHS 5.1.1.1-correct: the remaining arguments are
+                  ;; only temps (or constants, which need no temp). Passing the
+                  ;; value form itself rather than a temp keeps what is known
+                  ;; about it (its type, its range) when the call is
+                  ;; substituted for an INLINE (SETF F).
                   ((and (consp place) (symbolp (car place)))
-                   (let ((arg-temps (mapcar (lambda (a) (declare (ignore a)) (gensym "SETF-ARG"))
-                                            (cdr place)))
-                         (val-temp (gensym "SETF-VAL")))
-                     `(let* (,@(mapcar #'list arg-temps (cdr place))
-                             (,val-temp ,value))
-                        (funcall (function (setf ,(car place))) ,val-temp ,@arg-temps))))
+                   (let* ((arg-temps (mapcar (lambda (a)
+                                               (if (%setf-arg-constant-p a) a (gensym "SETF-ARG")))
+                                             (cdr place)))
+                          (bindings (loop for tmp in arg-temps
+                                          for a in (cdr place)
+                                          unless (eq tmp a) collect (list tmp a)))
+                          (call `(funcall (function (setf ,(car place))) ,value ,@arg-temps)))
+                     (if bindings
+                         `(let* ,bindings ,call)
+                         call)))
                   (t (error "SETF: unsupported place ~s" place))))
               ;; Multi-pair
               (let ((result '()))
@@ -1704,39 +1805,73 @@ quietly took every typed slot back off the raw path."
              ,@assignments
              ,(car save-vars)))))
 
+;;; The temporary that holds INCF's / DECF's delta (kept so the delta is
+;;; evaluated after the place's subforms and before the place is read) was an
+;;; undeclared binding, so the typed paths could not see the type of the delta
+;;; through it: (incf acc (aref v i)) on a FIXNUM or DOUBLE-FLOAT ACC boxed the
+;;; delta and added generically, 24 B a step, where (setq acc (+ acc (aref v
+;;; i))) was 0 B. When the delta is statically a fixnum, a double-float or a
+;;; single-float, the temporary is declared so. The answer depends on the
+;;; declarations in scope, so such an expansion is not reused elsewhere (as
+;;; DOTIMES does for its limit).
+(defun %typed-delta-declaration (delta tmp)
+  "A list of the DECLARE for TMP, bound to the INCF / DECF delta form DELTA,
+   when DELTA is statically of a type the typed paths keep unboxed; else NIL."
+  (if (or (numberp delta) (not (and (boundp '*cstate*) *cstate*)))
+      nil
+      (let ((ty (cond ((let ((*fixnum-wrap-licensed* nil)) (fixnum-typed-p delta))
+                       'fixnum)
+                      ((double-float-typed-p delta) 'double-float)
+                      ((single-float-typed-p delta) 'single-float))))
+        (setf *expansion-unreusable* t)
+        (and ty `((declare (type ,ty ,tmp)))))))
+
+;;; A literal number delta needs no temporary: evaluating it has no effect, so
+;;; reading it after the place is the same as before. Kept in the arithmetic, a
+;;; constant gives the range proof of (+ I 1) a bound to work with, where the
+;;; temporary was a boxed slot read back for every step.
+;;;
+;;; A variable place is updated by a SETQ of the sum itself, not through the
+;;; store temporary of its setf expansion: the SETQ of a variable whose slot
+;;; holds a raw int64 (a declared parameter or LET binding) lowers the sum it
+;;; is given natively, but a store temporary in between is a boxed binding, so
+;;; the sum went through the generic promoting add and was unboxed again.
+(defun %incf-expansion (form op tmp-name)
+  "The expansion of INCF (OP +) or DECF (OP -) FORM."
+  (let* ((place (cadr form))
+         (delta (if (cddr form) (caddr form) 1))
+         (exp (multiple-value-list (%get-setf-expansion place)))
+         (temps (first exp))
+         (vals  (second exp))
+         (stores (third exp))
+         (setter (fourth exp))
+         (getter (fifth exp))
+         (literal (numberp delta))
+         (delta-tmp (gensym tmp-name)))
+    (if (and (symbolp place) (null temps)
+             (equal setter `(setq ,place ,(car stores))))
+        (if literal
+            `(setq ,place (,op ,place ,delta))
+            `(let ((,delta-tmp ,delta))
+               ,@(%typed-delta-declaration delta delta-tmp)
+               (setq ,place (,op ,place ,delta-tmp))))
+        (if literal
+            `(let* (,@(mapcar #'list temps vals)
+                    (,(car stores) (,op ,getter ,delta)))
+               ,setter)
+            `(let* (,@(mapcar #'list temps vals)
+                    (,delta-tmp ,delta)
+                    (,(car stores) (,op ,getter ,delta-tmp)))
+               ,@(%typed-delta-declaration delta delta-tmp)
+               ,setter)))))
+
 ;;; --- incf ---
 (setf (gethash 'incf *macros*)
-      (lambda (form)
-        (let* ((place (cadr form))
-               (delta (if (cddr form) (caddr form) 1))
-               (exp (multiple-value-list (%get-setf-expansion place)))
-               (temps (first exp))
-               (vals  (second exp))
-               (stores (third exp))
-               (setter (fourth exp))
-               (getter (fifth exp))
-               (delta-tmp (gensym "INCF-DELTA")))
-          `(let* (,@(mapcar #'list temps vals)
-                  (,delta-tmp ,delta)
-                  (,(car stores) (+ ,getter ,delta-tmp)))
-             ,setter))))
+      (lambda (form) (%incf-expansion form '+ "INCF-DELTA")))
 
 ;;; --- decf ---
 (setf (gethash 'decf *macros*)
-      (lambda (form)
-        (let* ((place (cadr form))
-               (delta (if (cddr form) (caddr form) 1))
-               (exp (multiple-value-list (%get-setf-expansion place)))
-               (temps (first exp))
-               (vals  (second exp))
-               (stores (third exp))
-               (setter (fourth exp))
-               (getter (fifth exp))
-               (delta-tmp (gensym "DECF-DELTA")))
-          `(let* (,@(mapcar #'list temps vals)
-                  (,delta-tmp ,delta)
-                  (,(car stores) (- ,getter ,delta-tmp)))
-             ,setter))))
+      (lambda (form) (%incf-expansion form '- "DECF-DELTA")))
 
 ;;; --- prog1 ---
 (setf (gethash 'prog1 *macros*)
@@ -1804,6 +1939,50 @@ quietly took every typed slot back off the raw path."
                        (member var vars :test #'eq))
               (push (list 'type type temp) out))))))))
 
+;;; --- %induction-next ---
+;;; The step of a counting loop's variable, (%INDUCTION-NEXT VAR DELTA): VAR plus
+;;; DELTA. It is an ordinary addition; the name is what lets the compiler tell
+;;; the macro's own step from any other assignment of VAR when it checks an
+;;; %INDUCTION declaration (see %INDUCTION-RANGE).
+(setf (gethash '%induction-next *macros*)
+      (lambda (form)
+        (let ((var (cadr form)) (delta (caddr form)))
+          (cond ((eql delta 1) `(1+ ,var))
+                ((eql delta -1) `(1- ,var))
+                (t `(+ ,var ,delta))))))
+
+(defun %do-induction (var step end-test)
+  "The (%INDUCTION ...) declaration and step form for a DO variable VAR stepped
+   by STEP and ended by END-TEST, as two values, or NIL when the shape is not a
+   counting one: STEP adds or subtracts a positive integer literal to VAR, and
+   END-TEST compares VAR against an integer literal or a variable in the
+   direction that ends the loop ((>= VAR L) or (> VAR L) going up, (<= VAR L) or
+   (< VAR L) going down). DO tests before every step, which is what the
+   declaration claims."
+  (let ((delta (and (consp step)
+                    (cond ((and (eq (car step) '1+) (eq (cadr step) var) (null (cddr step))) 1)
+                          ((and (eq (car step) '1-) (eq (cadr step) var) (null (cddr step))) -1)
+                          ((and (member (car step) '(+ -)) (= (length step) 3)
+                                (eq (cadr step) var)
+                                (integerp (caddr step)) (plusp (caddr step)))
+                           (if (eq (car step) '+) (caddr step) (- (caddr step))))
+                          ((and (eq (car step) '+) (= (length step) 3)
+                                (eq (caddr step) var)
+                                (integerp (cadr step)) (plusp (cadr step)))
+                           (cadr step))))))
+    (when (and delta
+               (consp end-test) (= (length end-test) 3)
+               (eq (cadr end-test) var)
+               (let ((l (caddr end-test)))
+                 (or (integerp l)
+                     (and l (symbolp l) (not (eq l t)) (not (keywordp l)) (not (eq l var)))))
+               (if (plusp delta)
+                   (member (car end-test) '(>= >))
+                   (member (car end-test) '(<= <))))
+      (values `(%induction ,var ,delta ,(caddr end-test)
+                           ,(if (member (car end-test) '(> <)) t nil))
+              `(%induction-next ,var ,delta)))))
+
 ;;; --- do ---
 (setf (gethash 'do *macros*)
       (lambda (form)
@@ -1824,10 +2003,22 @@ quietly took every typed slot back off the raw path."
                (temps (mapcar (lambda (v) (if (find v var-clauses :key #'car :test #'eq)
                                               (gensym (symbol-name v))
                                               nil))
-                              vars)))
+                              vars))
+               ;; A counting variable (see %DO-INDUCTION): declared for the
+               ;; compiler to bound, and stepped by its own marked form. Its
+               ;; step reads only itself, so it needs no temporary.
+               (ind-decl nil)
+               (ind-var nil))
+          (loop for v in vars for s in steps for hs in has-step
+                when (and hs (not ind-var))
+                  do (multiple-value-bind (decl next) (%do-induction v s end-test)
+                       (when decl
+                         (setq ind-decl decl ind-var v)
+                         (setq steps (substitute next s steps :count 1 :test #'eq)))))
           (multiple-value-bind (decls real-body) (extract-declarations body)
             `(block nil
                (let ,(loop for v in vars for i in inits collect (list v i))
+                 ,@(when ind-decl `((declare ,ind-decl)))
                  ,@decls
                  (tagbody
                   ,loop-tag
@@ -1848,11 +2039,12 @@ quietly took every typed slot back off the raw path."
                                          for s in steps
                                          for hs in has-step
                                          for tmp in temps
-                                         when hs collect `(,tmp ,s))
+                                         when (and hs (not (eq v ind-var)))
+                                           collect `(,tmp ,s))
                                ,@(let ((tds (loop for v in vars
                                                   for hs in has-step
                                                   for tmp in temps
-                                                  when hs
+                                                  when (and hs (not (eq v ind-var)))
                                                   append (%step-temp-type-decls
                                                           decls v tmp))))
                                    (when tds `((declare ,@tds))))
@@ -1860,7 +2052,10 @@ quietly took every typed slot back off the raw path."
                                         for s in steps
                                         for hs in has-step
                                         for tmp in temps
-                                        when hs collect `(setq ,v ,tmp)))))))
+                                        when hs
+                                          collect (if (eq v ind-var)
+                                                      `(setq ,v ,s)
+                                                      `(setq ,v ,tmp))))))))
                   (go ,loop-tag))))))))
 
 ;;; --- do* ---
@@ -1899,20 +2094,44 @@ quietly took every typed slot back off the raw path."
                (result-form (if (cddr var-clause) (caddr var-clause) nil))
                (body (cddr form))
                (list-var (gensym "LIST"))
+               (elt-var (gensym "ELT"))
                (loop-tag (gensym "DOLIST-LOOP")))
+          ;; VAR is bound afresh for each element, as SBCL, CCL and ECL do
+          ;; (CLHS leaves it to the implementation). A closure made in the body
+          ;; keeps the element it was made for; with one binding assigned on
+          ;; every iteration it would see NIL once the loop ends.
           (multiple-value-bind (decls real-body) (extract-declarations body)
             `(block nil
                (let ((,list-var ,list-form)
-                     (,var nil))
-                 ,@decls
+                     (,elt-var nil))
                  (tagbody
                   ,loop-tag
                   (if (null ,list-var)
-                      (progn (setq ,var nil)
-                             (return ,(or result-form nil))))
-                  (setq ,var (car ,list-var))
+                      (return
+                        ,(if result-form
+                             ;; VAR is NIL here, which a type declared for
+                             ;; the elements need not include: only SPECIAL
+                             ;; carries over.
+                             `(let ((,var nil))
+                                (declare (ignorable ,var))
+                                ,@(loop for d in decls
+                                        append (loop for spec in (cdr d)
+                                                     when (and (consp spec)
+                                                               (eq (car spec) 'special))
+                                                       collect `(declare ,spec)))
+                                ,result-form)
+                             nil)))
+                  ;; Stepped here, as TAGBODY statements: as the first form
+                  ;; of the LET body the SETQ costs a values reset per element.
+                  (setq ,elt-var (car ,list-var))
                   (setq ,list-var (cdr ,list-var))
-                  ,@real-body
+                  (let ((,var ,elt-var))
+                    ,@decls
+                    ;; The body is a TAGBODY only when it has tags: an
+                    ;; empty one still costs a dispatch on every iteration.
+                    ,@(if (some #'atom real-body)
+                          `((tagbody ,@real-body))
+                          real-body))
                   (go ,loop-tag))))))))
 
 ;;; --- dotimes ---
@@ -1930,29 +2149,39 @@ quietly took every typed slot back off the raw path."
                ;; declared too, so the loop test is a raw int64 compare. A
                ;; bignum count would InvalidCastException on that unbox, hence
                ;; the guard.
-               (fx-count (fixnum-typed-p count-form))
+               (fx-count (progn
+                           ;; The answer depends on the declarations in scope,
+                           ;; so the expansion is not reused elsewhere.
+                           (unless (integerp count-form)
+                             (setf *expansion-unreusable* t))
+                           (fixnum-typed-p count-form)))
                ;; The COUNTER is a fixnum whatever the count form is: it starts
                ;; at 0 and gains 1 per iteration, so it cannot leave fixnum range
                ;; in any run that finishes. Declaring it puts it in an Int64 slot
-               ;; and removes the Fixnum allocated per iteration -- which every
-               ;; loop over a non-constant bound was paying (22.4 B/iteration).
-               ;; The LIMIT keeps its declaration only when it is statically a
-               ;; fixnum; otherwise it stays boxed and the loop test compares
-               ;; through %fixnum-ge-object, which still handles a bignum count.
-               (fx-decl (if fx-count
-                            `((declare (fixnum ,limit-var ,var)))
-                            `((declare (fixnum ,var))))))
+               ;; and removes the Fixnum allocated per iteration.
+               ;; The LIMIT is a fixnum too. A count form not statically a
+               ;; fixnum goes through %DOTIMES-LIMIT once, before the loop: a
+               ;; fixnum count is itself, a count beyond int64 becomes the
+               ;; largest (the counter cannot get there in any run that
+               ;; finishes), and a non-integer real its ceiling, the first
+               ;; counter value the old (>= counter count) test stopped at. The
+               ;; loop test is then a raw int64 compare instead of a call that
+               ;; compares a raw counter with a boxed limit on every iteration.
+               ;; The counter is also a counting variable bounded by the
+               ;; limit (see %INDUCTION-RANGE): with a literal count, or one
+               ;; whose range is known, it gets that range, which is what
+               ;; lets (* I 16) stay native where FIXNUM alone cannot.
+               (fx-decl `((declare (fixnum ,limit-var ,var)
+                                   (%induction ,var 1 ,limit-var nil)))))
           (multiple-value-bind (decls real-body) (extract-declarations body)
             `(block nil
-               (let ((,limit-var ,count-form)
+               (let ((,limit-var ,(if fx-count count-form `(%dotimes-limit ,count-form)))
                      (,var 0))
                  ,@fx-decl
                  ,@decls
                  (tagbody
                   ,loop-tag
-                  (if ,(if fx-count
-                           `(>= ,var ,limit-var)
-                           `(%fixnum-ge-object ,var ,limit-var))
+                  (if (>= ,var ,limit-var)
                       (return ,(or result-form nil)))
                   ,@real-body
                   ;; Fixnum counter: %dotimes-1+ asserts the incremented value
@@ -2429,18 +2658,25 @@ quietly took every typed slot back off the raw path."
         (let ((place (cadr form))
               (type (caddr form))
               (type-string (cadddr form))
-              (tag (gensym "CHECK-TYPE-")))
+              (tag (gensym "CHECK-TYPE-"))
+              (value (gensym "VALUE")))
           `(block nil
              (tagbody ,tag
                (when (typep ,place ',type) (return nil))
-               (restart-case
-                 (error 'type-error :datum ,place :expected-type ',type)
-                 (store-value (value)
-                   :report ,(if type-string
-                                `(lambda (s) (format s "Supply a new value of type ~A." ,type-string))
-                                `(lambda (s) (format s "Supply a new value of type ~S." ',type)))
-                   :interactive (lambda () (list (eval (read))))
-                   (setf ,place value)))
+               ;; SIMPLE-TYPE-ERROR with SBCL's report, as SBCL signals: a
+               ;; handler for SIMPLE-TYPE-ERROR (translate's tests) sees it.
+               (let ((,value ,place))
+                 (restart-case
+                   (error 'simple-type-error
+                          :datum ,value :expected-type ',type
+                          :format-control "The value of ~S is ~S, which is not ~:[of type ~S~;~:*~A~]."
+                          :format-arguments (list ',place ,value ,type-string ',type))
+                   (store-value (value)
+                     :report ,(if type-string
+                                  `(lambda (s) (format s "Supply a new value of type ~A." ,type-string))
+                                  `(lambda (s) (format s "Supply a new value of type ~S." ',type)))
+                     :interactive (lambda () (list (eval (read))))
+                     (setf ,place value))))
                (go ,tag))))))
 
 ;;; --- defstruct ---
@@ -2867,77 +3103,35 @@ quietly took every typed slot back off the raw path."
             (let ((et (cadr type-option)))
               (unless (or (null et) (eq et t) (eq et 'character))
                 (error "DEFSTRUCT: :NAMED requires element-type to hold a symbol, but got ~S" et))))
-          ;; Register setf expanders as side-effect of macro expansion
+          ;; Register the accessors (and the setf expanders of the writable
+          ;; slots) as side-effect of macro expansion
           (loop for acc in accessor-names
                 for idx in slot-indices
                 for s in all-slots
                 for i from 0
-                unless (getf (cddr s) :read-only)
-                do (let ((index idx)
-                         ;; The index a call site emits carries the layout
-                         ;; version with it, so a caller compiled against an
-                         ;; older definition is told so instead of reading
-                         ;; whatever slot now sits at this position.
-                         (raw-index (%pack-slot-index i struct-version)))
-                     ;; Register for compile-time struct accessor inlining (non-typed structs only)
-                     (when (null type-option)
-                       (setf (gethash acc *struct-accessors*) raw-index))
-                     (when (null type-option)
-                       (let ((ty (getf (cddr s) :type)))
-                         (if ty
-                             (setf (gethash acc *struct-accessor-types*) ty)
-                             (remhash acc *struct-accessor-types*))))
-                     (setf (gethash (%setf-key acc) *setf-expanders*)
-                           (cond
-                             ((null type-option)
-                              ;; Standard struct: use %struct-set with raw index.
-                              ;; The slot's declared type is checked here, at the
-                              ;; store, where the writer's own SAFETY applies --
-                              ;; the check compiles away entirely under
-                              ;; (safety 0).
-                              ;; %STRUCT-SET already answers the value it stored,
-                              ;; so a value that is a variable or a constant needs
-                              ;; no temporary -- and the temporary is what forced
-                              ;; the value into a LispObject local, which is where
-                              ;; a fixnum store got its box. Anything else keeps
-                              ;; the LET: it has to be evaluated exactly once.
-                              (let ((slot s) (sname name))
-                                (lambda (place value)
-                                  (if (or (symbolp value) (constantp value))
-                                      (%with-slot-checks
-                                       (list (%slot-check-stmt value slot sname))
-                                       `(%struct-set ,(cadr place) ,raw-index ,value))
-                                      (let ((tmp (gensym "V")))
-                                        `(let ((,tmp ,value))
-                                           ;; A raw slot holds an int64, so the
-                                           ;; temporary holds one too. Without
-                                           ;; the declaration it is a LispObject
-                                           ;; local, and the value is boxed into
-                                           ;; it only to be unboxed again for
-                                           ;; the store -- one allocation per
-                                           ;; store, which is the whole cost the
-                                           ;; raw storage exists to remove.
-                                           ,@(let ((k (%slot-raw-kind slot)))
-                                               (cond ((eql k 0) `((declare (fixnum ,tmp))))
-                                                     ((eql k 1) `((declare (double-float ,tmp))))))
-                                           ,@(remove nil
-                                                     (list (%slot-check-stmt tmp slot sname)))
-                                           (%struct-set ,(cadr place) ,raw-index ,tmp)
-                                           ,tmp))))))
-                             ((eq type-option 'list)
-                              ;; List-typed struct: use (setf (nth index obj) val)
-                              (lambda (place value)
-                                (let ((tmp (gensym "V")))
-                                  `(let ((,tmp ,value))
-                                     (setf (nth ,index ,(cadr place)) ,tmp)
-                                     ,tmp))))
-                             (t
-                              ;; Vector-typed struct: use (setf (aref obj index) val)
-                              (lambda (place value)
-                                (let ((tmp (gensym "V")))
-                                  `(let ((,tmp ,value))
-                                     (setf (aref ,(cadr place) ,index) ,tmp)
-                                     ,tmp))))))))
+                unless (and type-option (getf (cddr s) :read-only))
+                do (if (null type-option)
+                       ;; The index a call site emits carries the layout
+                       ;; version with it, so a caller compiled against an
+                       ;; older definition is told so instead of reading
+                       ;; whatever slot now sits at this position.
+                       (%register-standard-struct-accessor
+                        acc (%pack-slot-index i struct-version) s name)
+                       (let ((index idx))
+                         (setf (gethash (%setf-key acc) *setf-expanders*)
+                               (if (eq type-option 'list)
+                                   ;; List-typed struct: use (setf (nth index obj) val)
+                                   (lambda (place value)
+                                     (let ((tmp (gensym "V")))
+                                       `(let ((,tmp ,value))
+                                          (setf (nth ,index ,(cadr place)) ,tmp)
+                                          ,tmp)))
+                                   ;; Vector-typed struct: use (setf (aref obj index) val)
+                                   (lambda (place value)
+                                     (let ((tmp (gensym "V")))
+                                       `(let ((,tmp ,value))
+                                          (setf (aref ,(cadr place) ,index) ,tmp)
+                                          ,tmp))))))))
           ;; Store struct info for :include lookups (at macro-expansion time)
           (setf (gethash name *struct-info*)
                 (list :slots (mapcar #'copy-list all-slots)
@@ -2981,6 +3175,12 @@ quietly took every typed slot back off the raw path."
                        ',name ',(or include-name nil) ',conc-prefix ',base-offset
                        ',(mapcar #'copy-list all-slots))
                      )
+                   ;; Load time only: what this expansion recorded about the
+                   ;; accessors, for an image that loads the fasl without
+                   ;; having expanded the DEFSTRUCT.
+                   ,@(let ((form (%struct-accessors-proclamation
+                                  name struct-version accessor-names all-slots)))
+                       (when form (list form)))
                    ;; Which slots are stored raw. Emitted only when at least
                    ;; one qualifies, so a structure that never used :TYPE
                    ;; produces exactly the forms it produced before. :INCLUDE
@@ -3121,6 +3321,12 @@ quietly took every typed slot back off the raw path."
                                 `(defun ,acc (obj) (nth ,idx obj)))
                                (t
                                 `(defun ,acc (obj) (aref obj ,idx)))))
+             ;; A call to a vector reader is compiled as the AREF it is. After
+             ;; the DEFUNs above: a DEFUN of the name drops the entry.
+             ,@(when (and type-option (not (eq type-option 'list)) accessor-names)
+                 `((eval-when (:compile-toplevel :load-toplevel :execute)
+                     (dotcl.cil-compiler::%register-typed-vector-struct-accessors
+                      ',accessor-names ',slot-indices))))
              ;; Setf accessor functions (skip :read-only slots)
              ,@(loop for s in all-slots
                      for acc in accessor-names
@@ -3919,8 +4125,10 @@ quietly took every typed slot back off the raw path."
               (when (and (or m-rest m-key) (not (or gf-has-rest gf-has-key)))
                 (error 'program-error :format-control "DEFGENERIC ~S: generic function must accept &rest or &key because the inline method does"
                        :format-arguments (list name)))
-              ;; Rule 4: if GF has &key with names, method must accept all of them
+              ;; Rule 4: if GF has &key with names, method must accept all of them.
+              ;; Not applied when the GF has &allow-other-keys (as in SBCL).
               (when (and gf-has-key gf-keyword-names (not m-allow-other-keys)
+                         (not gf-has-allow-other-keys)
                          (not (and m-rest (not m-key))))
                 (dolist (kw gf-keyword-names)
                   (unless (member (symbol-name kw) (mapcar #'symbol-name m-keyword-names) :test #'string=)
@@ -4038,6 +4246,43 @@ quietly took every typed slot back off the raw path."
         (t (do ((x form (cdr x)))
                ((not (consp x)) nil)
              (when (%has-cnm-p (car x)) (return t))))))
+
+;;; Whether a method body might reach the next-method state of its invocation,
+;;; answered conservatively: any mention of CALL-NEXT-METHOD or NEXT-METHOD-P, in
+;;; any position (quoted, as data, as a function name), any local macro or
+;;; symbol macro definition, any call of a macro outside the CL package (a user
+;;; macro may expand into CALL-NEXT-METHOD), and any symbol macro all count as
+;;; "might". A body that answers no is called by dispatch without the
+;;; next-method state published.
+(defun %method-body-may-use-next-methods-p (form)
+  (cond ((consp form)
+         (let ((head (car form)))
+           (or (and (symbolp head)
+                    head
+                    (not (eq (symbol-package head) (find-package "COMMON-LISP")))
+                    (or (macro-function head)
+                        (nth-value 1 (gethash head *macros*))))
+               (do ((x form (cdr x)))
+                   ((not (consp x))
+                    (and x (%method-body-may-use-next-methods-p x)))
+                 (when (%method-body-may-use-next-methods-p (car x)) (return t))))))
+        ((symbolp form)
+         (or (member form '(call-next-method next-method-p macrolet symbol-macrolet)
+                     :test #'eq)
+             (and form (%symbol-macro-name-p form) t)))
+        (t nil)))
+
+;;; Whether DEFMETHOD, expanding now, may tell dispatch that the method body
+;;; ignores its next-method state. Only outside any MACROLET or SYMBOL-MACROLET,
+;;; whose local definitions the body walk cannot see: the compiler lists the
+;;; enclosing local macros in *MACROLET-SHADOWED*, the interpreter hands them to
+;;; the expansion in *INTERP-EXPANSION-MACROS*, and both keep symbol macros in
+;;; *SYMBOL-MACROS*.
+(defun %method-body-ignores-next-methods-p (form)
+  (and (null *macrolet-shadowed*)
+       (null *interp-expansion-macros*)
+       (null *symbol-macros*)
+       (not (%method-body-may-use-next-methods-p form))))
 
 (defun %walk-replace-cnm (form cv nv)
   "Replace CNM/NMP occurrences in FORM with funcall of CV/NV (local variables)."
@@ -4264,9 +4509,7 @@ quietly took every typed slot back off the raw path."
               ;; Ensure GF exists (auto-create if not)
               (let* ((qual-list (if qualifiers `(list ,@(mapcar (lambda (q) `',q) qualifiers)) 'nil))
                      (n-params (length plain-params))
-                     (method-lambda
-                       (%method-lambda-via-protocol
-                        name
+                     (raw-method-lambda
                         (let* ((bn (if (and (consp name) (eq (car name) (quote setf)))
                                        (cadr name)
                                        name))
@@ -4284,7 +4527,15 @@ quietly took every typed slot back off the raw path."
                                                  (%walk-replace-cnm b cv nv))
                                                body))))
                               `(lambda ,plain-params
-                                 (block ,bn ,@body))))))
+                                 (block ,bn ,@body)))))
+                     (method-lambda (%method-lambda-via-protocol name raw-method-lambda))
+                     ;; The body cannot reach its next-method state, and the lambda
+                     ;; is DEFMETHOD's own: dispatch may call it without publishing
+                     ;; that state.
+                     (ignores-next-methods
+                       (and (eq method-lambda raw-method-lambda)
+                            (%method-body-ignores-next-methods-p
+                             (cons specialized-params body))))
                      ;; The unspecialized lambda list, for METHOD-LAMBDA-LIST
                      ;; (AMOP): the list as written with each specializer dropped.
                      (unspec-ll (let ((req t))
@@ -4302,7 +4553,8 @@ quietly took every typed slot back off the raw path."
                                  ',(list n-params m-required-count m-optional-count
                                          (if m-has-rest t nil) (if m-has-key t nil)
                                          (if m-has-allow-other-keys t nil)
-                                         m-keyword-names unspec-ll)
+                                         m-keyword-names unspec-ll
+                                         (if ignores-next-methods t nil))
                                  ,(and (not *cross-compiling*) docstring))
                 `(progn
                    ;; Auto-create GF if it doesn't exist. %register-gf installs
@@ -4345,10 +4597,13 @@ quietly took every typed slot back off the raw path."
 
 ;;; What a DEFMETHOD whose specializers are all class names expands to.
 ;;; INFO is (n-params required optional rest-p key-p allow-other-keys-p
-;;; keyword-names unspecialized-lambda-list). The steps and their order are the
+;;; keyword-names unspecialized-lambda-list [ignores-next-methods]); the last is
+;;; absent from a FASL compiled before it existed. The steps and their order are the
 ;;; ones the spelled-out expansion takes.
 (defun %defmethod-run (name qualifiers spec-names fn info docstring)
-  (destructuring-bind (n-params req opt rest-p key-p aok-p keyword-names ll) info
+  (destructuring-bind (n-params req opt rest-p key-p aok-p keyword-names ll
+                       &optional ignores-next-methods)
+      info
     ;; Auto-create the GF if it does not exist. %register-gf installs both the
     ;; GF registry entry and the function (so this also extends CL generic
     ;; functions while CL is locked). It takes &key/&rest from the method but
@@ -4362,7 +4617,7 @@ quietly took every typed slot back off the raw path."
                            (copy-list qualifiers)
                            fn)))
       (%set-method-lambda-list-info m req opt rest-p key-p aok-p
-                                    (copy-list keyword-names) ll)
+                                    (copy-list keyword-names) ll ignores-next-methods)
       ;; AMOP: defmethod asks the generic function what class its methods
       ;; are, and the method is an instance of the answer.
       (%note-method-class (%find-gf name) m)

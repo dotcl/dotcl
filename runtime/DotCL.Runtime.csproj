@@ -244,6 +244,10 @@
     <Compile Remove="Emitter/CompilerEnv.cs" />
     <Compile Remove="Emitter/IlDisasm.cs" />
     <Compile Remove="Emitter/CilAssembler.Emit.cs" />
+    <Compile Remove="Emitter/CilAssembler.Tail.cs" />
+    <Compile Remove="Emitter/IlLocalAccess.cs" />
+    <Compile Remove="Emitter/CilAssembler.LocalSlots.cs" />
+    <Compile Remove="Emitter/CilAssembler.StackTemps.cs" />
     <!-- Runtime .NET class generation (AssemblyBuilder/TypeBuilder); emit-only;
          dotnet:define-class throws on this target (guarded in Runtime.DotNet.cs). -->
     <Compile Remove="Emitter/DynamicClassBuilder.cs" />

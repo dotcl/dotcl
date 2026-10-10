@@ -7,7 +7,7 @@
 ;;; stands for exactly those versions, so a later process reuses them.
 ;;;
 ;;; Declared requests (a system definition's) follow the project's lock file,
-;;; dotcl-nuget.lock.json: what it records is used without asking NuGet, an exact
+;;; dotnet-nuget.lock.json: what it records is used without asking NuGet, an exact
 ;;; version it does not record is resolved and recorded, and a floating version it
 ;;; does not record is refused with a pointer to NUGET:RESTORE.
 ;;;
@@ -16,7 +16,7 @@
 ;;; reach for either runs with DOTCL_NUGET_OFFLINE=1 -- which turns any attempt
 ;;; into an error, so a test that passes did not start `dotnet'.
 
-(require "dotcl-nuget")
+(require "dotnet-nuget")
 
 (defun nlk-new-dir (tag)
   (let ((d (nuget::%combine (regression-temp-dir)
@@ -56,7 +56,7 @@ directories, so nothing here reads or writes the real ones."
 (defun nlk-lock (directs transitives &optional (tfm (nuget::%current-tfm)))
   "Write a lock file into the sandbox project. DIRECTS are (id requested resolved),
 TRANSITIVES (id resolved)."
-  (nlk-file (namestring nuget::*project-directory*) "dotcl-nuget.lock.json"
+  (nlk-file (namestring nuget::*project-directory*) "dotnet-nuget.lock.json"
             (format nil "{\"version\":1,\"dependencies\":{\"~A\":{~{~A~^,~}}}}"
                     tfm
                     (append
@@ -144,7 +144,7 @@ TRANSITIVES (id resolved)."
   (let ((nuget-root (nuget:cache-root))
         (fasl-root (funcall (find-symbol "%FASL-CACHE-ROOT" "DOTCL"))))
     (list (equal (nlk-parent nuget-root) (nlk-parent fasl-root))
-          (and (search "dotcl-nuget" (substitute #\/ #\\ nuget-root)) t)))
+          (and (search "dotnet-nuget" (substitute #\/ #\\ nuget-root)) t)))
   (t t))
 
 ;;; The project's record is named for dotcl, not packages.lock.json: a dotcl
@@ -152,7 +152,7 @@ TRANSITIVES (id resolved)."
 (deftest nlk-lock-file-is-in-the-project-directory
   (let ((nuget:*project-directory* "/some/project/"))
     (substitute #\/ #\\ (nuget::%lock-path)))
-  "/some/project/dotcl-nuget.lock.json")
+  "/some/project/dotnet-nuget.lock.json")
 
 ;;; --- reading a lock file ---------------------------------------------------
 

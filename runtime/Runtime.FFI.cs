@@ -2,6 +2,7 @@ namespace DotCL;
 
 using System.Reflection;
 using System.Reflection.Emit;
+using DotCL.Emitter;
 using System.Runtime.InteropServices;
 
 /// <summary>
@@ -41,8 +42,12 @@ static class NativeFFI
             "UINT8" or ":UINT8" or "CHAR" or ":CHAR" => typeof(byte),
             "INT16" or "SHORT" or ":INT16" or ":SHORT" => typeof(short),
             "UINT16" or "USHORT" or ":UINT16" or ":USHORT" => typeof(ushort),
-            "INT64" or "LONG" or ":INT64" or ":LONG" => typeof(long),
-            "UINT64" or "ULONG" or ":UINT64" or ":ULONG" => typeof(ulong),
+            "INT64" or ":INT64" => typeof(long),
+            "UINT64" or ":UINT64" => typeof(ulong),
+            // C long follows the running OS: 32-bit on Windows, 64-bit on LP64.
+            "LONG" or ":LONG" => Runtime.CLongSize == 8 ? typeof(long) : typeof(int),
+            "ULONG" or ":ULONG" or "UNSIGNED-LONG" or ":UNSIGNED-LONG" or "UNSIGNED_LONG" =>
+                Runtime.CLongSize == 8 ? typeof(ulong) : typeof(uint),
             "FLOAT" or ":FLOAT" => typeof(float),
             "DOUBLE" or ":DOUBLE" => typeof(double),
             "BOOL" or "BOOLEAN" or ":BOOL" or ":BOOLEAN" => typeof(int), // Win32 BOOL = int
@@ -550,17 +555,17 @@ static class NativeFFI
         var arr = il.DeclareLocal(typeof(object[]));
         il.Emit(OpCodes.Ldc_I4, argTypes.Count);
         il.Emit(OpCodes.Newarr, typeof(object));
-        il.Emit(OpCodes.Stloc, arr);
+        il.EmitLoc(OpCodes.Stloc, arr);
         for (int i = 0; i < argTypes.Count; i++)
         {
-            il.Emit(OpCodes.Ldloc, arr);
+            il.EmitLoc(OpCodes.Ldloc, arr);
             il.Emit(OpCodes.Ldc_I4, i);
             il.Emit(OpCodes.Ldarg, i);
             il.Emit(OpCodes.Box, argTypes[i]);
             il.Emit(OpCodes.Stelem_Ref);
         }
         il.Emit(OpCodes.Ldc_I4, id);
-        il.Emit(OpCodes.Ldloc, arr);
+        il.EmitLoc(OpCodes.Ldloc, arr);
         il.Emit(OpCodes.Call, _trampolineMI);
         if (actualRet == null) il.Emit(OpCodes.Pop);
         else il.Emit(OpCodes.Unbox_Any, retType);

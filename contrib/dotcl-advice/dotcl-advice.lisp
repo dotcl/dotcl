@@ -16,7 +16,7 @@
 ;;; `patch`).
 ;;;
 ;;; The backend is HarmonyX (BepInEx's fork of Harmony) resolved from NuGet via
-;;; (require "dotcl-nuget"). It is a drop-in of Lib.Harmony (same HarmonyLib namespace,
+;;; (require "dotnet-nuget"). It is a drop-in of Lib.Harmony (same HarmonyLib namespace,
 ;;; same 0Harmony.dll) but references MonoMod as external packages rather than
 ;;; ILMerging an old copy, so it picks up the MonoMod version whose detour
 ;;; backend supports ARM64 on .NET 10: Lib.Harmony 2.4.2's bundled MonoMod
@@ -27,7 +27,7 @@
 
 ;; Load nuget before any `nuget:` symbol below is read (forms are read+evaluated
 ;; one at a time, so this must precede the defun that references the package).
-(require "dotcl-nuget")
+(require "dotnet-nuget")
 ;; dotnet:define-class / dotnet:deref are read below, so the contrib that
 ;; exports them has to be loaded before those forms are read.
 (require "dotnet-class")

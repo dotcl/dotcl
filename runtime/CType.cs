@@ -2,6 +2,8 @@
 // Type specifiers (Lisp forms) are parsed into CType objects once,
 // then all comparisons are done on CType objects (no re-parsing).
 
+using System.Numerics;
+
 namespace DotCL;
 
 // ============================================================
@@ -60,16 +62,40 @@ public class NumericType : CType
     }
 }
 
+/// <summary>
+/// (COMPLEX part-type) narrower than COMPLEX: the complexes of the representations
+/// in Mask (Runtime.ComplexRationalParts / ComplexSingleParts / ComplexDoubleParts).
+/// Every (COMPLEX X) is one of these, COMPLEX itself, or NIL.
+/// </summary>
+public class ComplexType : CType
+{
+    public int Mask { get; }
+    /// <summary>The part type when it is its own upgraded part type (see
+    /// Runtime.ComplexPartMask): the complexes whose parts are both of it. Null
+    /// when the type is every complex of the representations in Mask.</summary>
+    public LispObject? Exact { get; }
+    public ComplexType(int mask, LispObject? exact = null) { Mask = mask; Exact = exact; }
+
+    public LispObject PartSpec => Exact ?? Runtime.ComplexPartTypeSpec(Mask);
+
+    public override string ToSpecifier() => $"(COMPLEX {PartSpec})";
+}
+
 /// <summary>Array type: (ARRAY element-type dimensions), (SIMPLE-ARRAY ...), etc.</summary>
 public class ArrayType : CType
 {
     public CType ElementType { get; }   // element type (NamedType("*") for wildcard)
     public LispObject? Dimensions { get; }  // null=*, Fixnum=rank, Cons=dimension list
     public bool? SimpleP { get; }       // true=simple, false=not-simple, null=either
+    /// <summary>The element type as written, when parsed from a specifier
+    /// (null otherwise): SUBTYPEP compares its upgraded element type.</summary>
+    public LispObject? ElementSpec { get; }
 
-    public ArrayType(CType elementType, LispObject? dimensions = null, bool? simpleP = null)
+    public ArrayType(CType elementType, LispObject? dimensions = null, bool? simpleP = null,
+                     LispObject? elementSpec = null)
     {
         ElementType = elementType; Dimensions = dimensions; SimpleP = simpleP;
+        ElementSpec = elementSpec;
     }
 
     public override string ToSpecifier()
@@ -325,10 +351,15 @@ public static class TypeParser
                 or "BIT-VECTOR" or "SIMPLE-BIT-VECTOR":
                 return ParseSpecializedVector(headName, cons.Cdr);
 
-            // Complex compound types: throw to bypass CType and fall through to
-            // manual subtypep which handles upgraded-complex-part-type correctly
             case "COMPLEX":
-                throw new NotSupportedException("complex compound type");
+            {
+                var part = cons.Cdr is Cons pc ? pc.Car : null;
+                int mask = Runtime.ComplexPartMask(part, out bool exact);
+                return exact ? new ComplexType(mask, part)
+                     : mask == 0 ? NamedType.NIL_TYPE
+                     : mask == Runtime.ComplexAllParts ? NamedType.Get("COMPLEX")
+                     : new ComplexType(mask);
+            }
 
             // Function / Values: stub for now
             case "FUNCTION" or "VALUES":
@@ -456,20 +487,20 @@ public static class TypeParser
             // (MOD n) = (INTEGER 0 (n-1))
             var hi = n.Value <= 1 ? (LispObject)new Fixnum(0)
                 : n.Value - 1 <= long.MaxValue ? new Fixnum(n.Value - 1)
-                : (LispObject)new Bignum(new System.Numerics.BigInteger(n.Value - 1));
+                : (LispObject)new Bignum(new BigInteger(n.Value - 1));
             return new NumericType("INTEGER", new Fixnum(0), false, hi, false);
         }
         if (headName == "UNSIGNED-BYTE")
         {
             // (UNSIGNED-BYTE n) = (INTEGER 0 (2^n - 1))
-            var hiVal = System.Numerics.BigInteger.Pow(2, (int)n.Value) - 1;
+            var hiVal = BigInteger.Pow(2, (int)n.Value) - 1;
             LispObject hi = hiVal <= long.MaxValue ? new Fixnum((long)hiVal) : (LispObject)new Bignum(hiVal);
             return new NumericType("INTEGER", new Fixnum(0), false, hi, false);
         }
         // SIGNED-BYTE
         {
             // (SIGNED-BYTE n) = (INTEGER -(2^(n-1)) (2^(n-1) - 1))
-            var halfPow = System.Numerics.BigInteger.Pow(2, (int)(n.Value - 1));
+            var halfPow = BigInteger.Pow(2, (int)(n.Value - 1));
             var loVal = -halfPow;
             var hiVal = halfPow - 1;
             LispObject lo = loVal >= long.MinValue ? new Fixnum((long)loVal) : (LispObject)new Bignum(loVal);
@@ -484,22 +515,27 @@ public static class TypeParser
     {
         var et = NamedType.Get("*") as CType;
         LispObject? dims = null;
+        LispObject? etSpec = null;
 
         if (args is Cons c1)
         {
             if (c1.Car is not Symbol s1 || s1.Name != "*")
+            {
                 et = Parse(c1.Car, expanding);
+                etSpec = c1.Car;
+            }
             if (c1.Cdr is Cons c2)
                 dims = c2.Car is Symbol s2 && s2.Name == "*" ? null : c2.Car;
         }
 
-        return new ArrayType(et, dims, simple ? true : null);
+        return new ArrayType(et, dims, simple ? true : null, etSpec);
     }
 
     private static CType ParseVector(bool simple, LispObject? args, HashSet<string>? expanding)
     {
         CType et;
         LispObject? size = null;
+        LispObject? etSpec = null;
 
         if (simple)
         {
@@ -515,7 +551,10 @@ public static class TypeParser
             if (args is Cons c1)
             {
                 if (c1.Car is not Symbol s1 || s1.Name != "*")
+                {
                     et = Parse(c1.Car, expanding);
+                    etSpec = c1.Car;
+                }
                 if (c1.Cdr is Cons c2 && c2.Car is not (Symbol { Name: "*" }))
                     size = c2.Car;
             }
@@ -526,7 +565,7 @@ public static class TypeParser
             ? (LispObject)new Cons(size, Nil.Instance)
             : new Cons(Startup.Sym("*"), Nil.Instance);
 
-        return new ArrayType(et, dimSpec, simple ? true : null);
+        return new ArrayType(et, dimSpec, simple ? true : null, etSpec);
     }
 
     private static CType ParseSpecializedVector(string headName, LispObject? args)
@@ -602,7 +641,7 @@ public static class CTypeOps
             ct2 = NamedType.Get(cls2n.Class.Name.Name);
 
         // === Identity ===
-        if (ReferenceEquals(ct1, ct2)) return (true, true);
+        if (ReferenceEquals(ct1, ct2) || StructurallyEqual(ct1, ct2)) return (true, true);
 
         // === Universal / Empty ===
         if (ct2 is NamedType nt2)
@@ -611,6 +650,9 @@ public static class CTypeOps
             if (nt2.Name == "NIL")
             {
                 if (ct1 is NamedType nt1nil && nt1nil.Name == "NIL") return (true, true);
+                // An intersection of disjoint types is empty: (AND INTEGER RATIO),
+                // (AND (COMPLEX RATIONAL) (COMPLEX FLOAT)).
+                if (ct1 is IntersectionType interNil && IsEmptyIntersection(interNil)) return (true, true);
                 // Complex ct1 might be empty (e.g., (AND X (NOT X))): can't be sure
                 return (false, false);
             }
@@ -625,6 +667,34 @@ public static class CTypeOps
                 return (false, false);
             }
         }
+
+        // === Exact decompositions first ===
+        // (OR a b) <: X iff a <: X and b <: X; X <: (AND a b) iff X <: a and X <: b.
+        // Both are exact, so they go before the rules below that only find
+        // sufficient conditions (X <: (OR ...) tried member by member would miss
+        // (OR a b) <: (OR a b), and (NOT ...) on the right would hide the ct1 split).
+        if (ct1 is UnionType union1x)
+            return SubtypepUnion1(union1x, ct2);
+        if (ct2 is IntersectionType inter2x)
+            return SubtypepIntersection2(ct1, inter2x);
+
+        // (AND a b) <: X holds as soon as one conjunct is a subtype of X, whatever
+        // the shape of X: (AND SYMBOL (NOT (MEMBER T NIL))) <: (NOT (MEMBER T NIL)).
+        if (ct1 is IntersectionType inter1x)
+        {
+            foreach (var member in inter1x.Types)
+            {
+                var (sub, _) = Subtypep(member, ct2);
+                if (sub) return (true, true);
+            }
+        }
+
+        // (MEMBER a b) <: X is decided object by object, whatever the shape of X,
+        // so it goes before the rules on X that only find sufficient conditions:
+        // (MEMBER :X :Y) <: (OR (EQL :X) (EQL :Y)) holds though neither member of
+        // the union alone covers it.
+        if (ct1 is MemberType mem1x)
+            return SubtypepMember(mem1x, ct2);
 
         // === Dispatch on type2 (target type) ===
 
@@ -648,6 +718,65 @@ public static class CTypeOps
         }
 
         // === Same-class comparisons ===
+
+        if (ComplexMask(ct1) is int cm1 && ComplexMask(ct2) is int cm2)
+            return ((cm1 & ~cm2) == 0, true);
+        if (ct1 is ComplexType { Exact: not null } || ct2 is ComplexType { Exact: not null })
+        {
+            // Some part type is exact: the rational complexes go by the mask, the
+            // float complexes by the part types.
+            if ((ct1 is ComplexType || ComplexMask(ct1) != null)
+                && (ct2 is ComplexType || ComplexMask(ct2) != null))
+            {
+                int x1 = ct1 is ComplexType c1x ? c1x.Mask : Runtime.ComplexAllParts;
+                int x2 = ct2 is ComplexType c2x ? c2x.Mask : Runtime.ComplexAllParts;
+                if ((x1 & Runtime.ComplexRationalParts) != 0 && (x2 & Runtime.ComplexRationalParts) == 0)
+                    return (false, true);
+                const int R = Runtime.ComplexRationalParts;
+                // The floats of ct1's parts, which must be floats of ct2's parts.
+                // An exact part type holds some floats, so none on the right is NO.
+                LispObject floats1;
+                if (ct1 is ComplexType { Exact: not null } e1)
+                {
+                    if (ct2 is not ComplexType { Exact: not null } && (x2 & ~R) == 0) return (false, true);
+                    floats1 = (x1 & R) == 0 ? e1.Exact!
+                        : Runtime.List(Startup.Sym("AND"), e1.Exact!, Startup.Sym("FLOAT"));
+                }
+                else
+                {
+                    if ((x1 & ~R) == 0) return (true, true);
+                    floats1 = Runtime.ComplexPartTypeSpec(x1 & ~R);
+                }
+                var p2 = ct2 is ComplexType { Exact: not null } y2 ? y2.Exact!
+                    : Runtime.ComplexPartTypeSpec(x2 & ~R);
+                // The whole SUBTYPEP: the algebra alone leaves FLOAT <: (FLOAT 0.0 3.0) open.
+                bool ps = Runtime.Subtypep(floats1, p2) != Nil.Instance;
+                var mv = MultipleValues.Get();
+                bool pc = mv.Length > 1 && mv[1] != Nil.Instance;
+                if (ps) return (true, true);
+                return (false, pc);
+            }
+        }
+        if (ct1 is ComplexType)
+        {
+            // Some but not all complexes: a subtype of what holds every complex,
+            // not of what holds none.
+            var complexAll = NamedType.Get("COMPLEX");
+            if (Subtypep(complexAll, ct2).result) return (true, true);
+            if (AreDisjoint(complexAll, ct2)) return (false, true);
+            return (false, false);
+        }
+        if (ct2 is ComplexType)
+        {
+            // Only COMPLEX (handled above) or NIL among the named types is not
+            // wider than or disjoint from some complexes; both mean NO when non-empty.
+            if (ct1 is NamedType ne && ne.Name is not ("NIL" or "EXTENDED-CHAR" or "*")
+                && Runtime.IsBuiltinTypeName(ne.Name))
+                return (false, true);
+            if (ct1 is NumericType nr && (nr.Low == null || nr.High == null))
+                return (false, true);
+            if (ct1 is ConsType or ArrayType) return (false, true);
+        }
 
         if (ct1 is NamedType n1 && ct2 is NamedType n2)
             return SubtypepNamed(n1, n2);
@@ -692,6 +821,59 @@ public static class CTypeOps
         return (false, false);
     }
 
+    // --- Structural equality ---
+
+    /// <summary>
+    /// True when the two CTypes were parsed from equivalent specifiers. Only a
+    /// sufficient test for type equality; false means "not shown equal".
+    /// </summary>
+    private static bool StructurallyEqual(CType a, CType b)
+    {
+        if (ReferenceEquals(a, b)) return true;
+        switch (a)
+        {
+            case NamedType na:
+                return b is NamedType nb && na.Name == nb.Name;
+            case ClassCType ca:
+                return b is ClassCType cb && ReferenceEquals(ca.Class, cb.Class);
+            case SatisfiesType sa:
+                return b is SatisfiesType sb && ReferenceEquals(sa.Predicate, sb.Predicate);
+            case NegationType ga:
+                return b is NegationType gb && StructurallyEqual(ga.Inner, gb.Inner);
+            case ConsType ka:
+                return b is ConsType kb && StructurallyEqual(ka.CarType, kb.CarType)
+                    && StructurallyEqual(ka.CdrType, kb.CdrType);
+            case UnionType ua:
+                return b is UnionType ub && SameElements(ua.Types, ub.Types);
+            case IntersectionType ia:
+                return b is IntersectionType ib && SameElements(ia.Types, ib.Types);
+            case NumericType ma:
+                return b is NumericType mb && ma.NumClass == mb.NumClass
+                    && SameBound(ma.Low, mb.Low) && ma.LowExclusiveP == mb.LowExclusiveP
+                    && SameBound(ma.High, mb.High) && ma.HighExclusiveP == mb.HighExclusiveP;
+            case MemberType ea:
+                if (b is not MemberType eb) return false;
+                foreach (var o in ea.Members)
+                    if (!System.Array.Exists(eb.Members, o2 => Runtime.IsTrueEql(o, o2))) return false;
+                foreach (var o in eb.Members)
+                    if (!System.Array.Exists(ea.Members, o2 => Runtime.IsTrueEql(o, o2))) return false;
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    private static bool SameElements(CType[] xs, CType[] ys)
+    {
+        if (xs.Length != ys.Length) return false;
+        for (int i = 0; i < xs.Length; i++)
+            if (!StructurallyEqual(xs[i], ys[i])) return false;
+        return true;
+    }
+
+    private static bool SameBound(LispObject? x, LispObject? y) =>
+        x == null ? y == null : y != null && Runtime.IsTrueEql(x, y);
+
     // --- NOT ---
 
     private static (bool, bool) SubtypepNot(CType ct1, NegationType neg2)
@@ -722,7 +904,273 @@ public static class CTypeOps
         // Check if union is universal: (OR X (NOT X)) = T, everything is a subtype
         if (IsUniversalUnion(union2))
             return (true, true);
+        // Complexes: the representations the members hold together must cover
+        // ct1's. COMPLEX <: (OR (COMPLEX RATIONAL) (COMPLEX FLOAT)), but not
+        // <: (OR REAL (COMPLEX RATIONAL)).
+        if (ComplexMask(ct1) is int needParts)
+        {
+            int haveParts = 0;
+            bool exactParts = true;
+            var complexAll = NamedType.Get("COMPLEX");
+            foreach (var m in union2.Types)
+            {
+                if (ComplexMask(m) is int mm) haveParts |= mm;
+                else if (m is ComplexType { Exact: not null } me)
+                {
+                    haveParts |= me.Mask & Runtime.ComplexRationalParts;
+                    exactParts = false;
+                }
+                else if (Subtypep(complexAll, m).result) haveParts = Runtime.ComplexAllParts;
+                else if (!AreDisjoint(complexAll, m)) exactParts = false;
+            }
+            if ((needParts & ~haveParts) == 0) return (true, true);
+            if (exactParts) return (false, true);
+        }
+        // An integer type is a subtype of a union iff the integers in the union
+        // cover it. INTEGER <: (OR (INTEGER 0 *) (INTEGER * -1)); (INTEGER 0 10) is
+        // not a subtype of (OR (INTEGER 0 4) (INTEGER 6 10)) nor of (OR RATIO FLOAT).
+        var need = new List<(BigInteger? lo, BigInteger? hi)>();
+        if ((IsIntegerOnly(ct1) || ct1 is NamedType { Name: "BIGNUM" }) && IntegerPieces(ct1, need))
+        {
+            var have = new List<(BigInteger? lo, BigInteger? hi)>();
+            bool exact = true;
+            foreach (var m in union2.Types)
+                if (!IntegerPieces(m, have) && !AreDisjoint(NamedType.Get("INTEGER"), m)) exact = false;
+            if (need.TrueForAll(r => RangesCover(r.lo, r.hi, have))) return (true, true);
+            if (exact) return (false, true);
+        }
+        // X <: (OR A rest) iff (AND X (NOT A)) <: rest. Only the YES is taken. Tried
+        // for a MEMBER, and for a member whose complement another member names:
+        // SYMBOL <: (OR (MEMBER T NIL) (AND SYMBOL (NOT (MEMBER T NIL)))),
+        // STRING <: (OR SIMPLE-STRING (AND STRING (NOT SIMPLE-STRING))).
+        for (int i = 0; i < union2.Types.Length; i++)
+        {
+            var mem = union2.Types[i];
+            if (mem is not MemberType && !OtherMemberNegates(union2.Types, i)) continue;
+            var rest = union2.Types.Where((_, j) => j != i).ToArray();
+            CType restType = rest.Length == 1 ? rest[0] : new UnionType(rest);
+            var conj = (ct1 is IntersectionType ci ? ci.Types : new[] { ct1 })
+                .Append(new NegationType(mem)).ToArray();
+            var (sub, cert) = Subtypep(new IntersectionType(conj), restType);
+            if (sub && cert) return (true, true);
+        }
+        // A type that is the disjoint union of its parts is a subtype iff every part
+        // is: REAL <: (OR INTEGER RATIO FLOAT), LIST <: (OR CONS NULL). Exact, so a
+        // certain NO for one part is a certain NO for the whole.
+        if (ct1 is NamedType pn && TypePartition(pn.Name) is string[] parts)
+        {
+            bool allCert = true;
+            foreach (var part in parts)
+            {
+                var (sub, cert) = Subtypep(NamedType.Get(part), union2);
+                if (!sub)
+                {
+                    if (cert) return (false, true);
+                    allCert = false;
+                }
+            }
+            if (allCert) return (true, true);
+        }
+        // A non-empty built-in type disjoint from every member is not a subtype:
+        // INTEGER is not a subtype of (OR RATIO FLOAT).
+        if (ct1 is NamedType ne && ne.Name is not ("NIL" or "*") && Runtime.IsBuiltinTypeName(ne.Name)
+            && System.Array.TrueForAll(union2.Types, m => AreDisjoint(ct1, m)))
+            return (false, true);
         return (false, false);
+    }
+
+    /// <summary>A NumericType INTEGER or an integer type name, so every element is an integer.</summary>
+    private static bool IsIntegerOnly(CType ct) =>
+        ct is NumericType { NumClass: "INTEGER" }
+        || ct is NamedType { Name: "INTEGER" or "SIGNED-BYTE" or "FIXNUM" or "BIT" or "UNSIGNED-BYTE" };
+
+    /// <summary>
+    /// Add to INTO the integers of ct as inclusive ranges (null = unbounded).
+    /// False when they cannot be told exactly; then INTO may hold some of them.
+    /// </summary>
+    private static bool IntegerPieces(CType ct, List<(BigInteger? lo, BigInteger? hi)> into)
+    {
+        switch (ct)
+        {
+            case NamedType n:
+                switch (n.Name)
+                {
+                    case "INTEGER" or "SIGNED-BYTE" or "RATIONAL" or "REAL" or "NUMBER" or "T":
+                        into.Add((null, null)); return true;
+                    case "FIXNUM": into.Add((long.MinValue, long.MaxValue)); return true;
+                    case "BIT": into.Add((0, 1)); return true;
+                    case "UNSIGNED-BYTE": into.Add((0, null)); return true;
+                    case "BIGNUM":
+                        into.Add((null, (BigInteger)long.MinValue - 1));
+                        into.Add(((BigInteger)long.MaxValue + 1, null));
+                        return true;
+                }
+                break;
+            case NumericType { NumClass: "INTEGER" or "RATIONAL" or "REAL" } num:
+            {
+                BigInteger? lo = null, hi = null;
+                if (num.Low != null)
+                {
+                    if (CeilingOf(num.Low, num.LowExclusiveP) is not BigInteger l) return false;
+                    lo = l;
+                }
+                if (num.High != null)
+                {
+                    if (FloorOf(num.High, num.HighExclusiveP) is not BigInteger h) return false;
+                    hi = h;
+                }
+                into.Add((lo, hi));
+                return true;
+            }
+            case MemberType mem:
+                foreach (var o in mem.Members)
+                    if (AsBig(o) is BigInteger v) into.Add((v, v));
+                return true;
+        }
+        // Classes of numbers that hold no integer (RATIO, FLOAT, COMPLEX, ...).
+        if (NumericNode(ct) is string node
+            && !NumericAncestorOrSelf(node, "INTEGER") && !NumericAncestorOrSelf("INTEGER", node))
+            return true;
+        return false;
+    }
+
+    private static BigInteger? AsBig(LispObject x) => x switch
+    {
+        Fixnum f => f.Value,
+        Bignum b => b.Value,
+        _ => null,
+    };
+
+    /// <summary>The least integer above (or at, when inclusive) a rational bound; null for a float.</summary>
+    private static BigInteger? CeilingOf(LispObject x, bool exclusive)
+    {
+        if (AsBig(x) is BigInteger v) return exclusive ? v + 1 : v;
+        if (x is Ratio r)
+        {
+            var q = BigInteger.Divide(r.Numerator, r.Denominator);  // truncates toward zero
+            return r.Numerator > 0 ? q + 1 : q;
+        }
+        return null;
+    }
+
+    /// <summary>The greatest integer below (or at, when inclusive) a rational bound; null for a float.</summary>
+    private static BigInteger? FloorOf(LispObject x, bool exclusive)
+    {
+        if (AsBig(x) is BigInteger v) return exclusive ? v - 1 : v;
+        if (x is Ratio r)
+        {
+            var q = BigInteger.Divide(r.Numerator, r.Denominator);
+            return r.Numerator < 0 ? q - 1 : q;
+        }
+        return null;
+    }
+
+    /// <summary>Do the inclusive ranges PIECES cover every integer in [lo, hi]?</summary>
+    private static bool RangesCover(BigInteger? lo, BigInteger? hi,
+        List<(BigInteger? lo, BigInteger? hi)> pieces)
+    {
+        var cur = lo;  // first integer not yet covered; null = minus infinity
+        for (int step = 0; step <= pieces.Count; step++)
+        {
+            if (cur != null && hi != null && cur > hi) return true;
+            bool found = false;
+            BigInteger? reach = null;
+            foreach (var (plo, phi) in pieces)
+            {
+                bool starts = plo == null || (cur != null && plo <= cur);
+                bool spans = phi == null || cur == null || phi >= cur;
+                if (!starts || !spans) continue;
+                if (phi == null) return true;
+                if (!found || phi > reach) { reach = phi; found = true; }
+            }
+            if (!found) return false;
+            cur = reach + 1;
+        }
+        return cur != null && hi != null && cur > hi;
+    }
+
+    /// <summary>
+    /// Does a member other than the I-th one have (NOT the I-th) as itself or as
+    /// a conjunct?
+    /// </summary>
+    private static bool OtherMemberNegates(CType[] types, int i)
+    {
+        for (int j = 0; j < types.Length; j++)
+        {
+            if (j == i) continue;
+            var parts = types[j] is IntersectionType it ? it.Types : new[] { types[j] };
+            foreach (var p in parts)
+                if (p is NegationType neg && StructurallyEqual(neg.Inner, types[i])) return true;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Types that partition a built-in type, or null. SHORT-FLOAT is SINGLE-FLOAT
+    /// and LONG-FLOAT is DOUBLE-FLOAT here. A SEQUENCE is a list or a vector: no
+    /// other object is one (TYPEP), and a class cannot have SEQUENCE as a superclass.
+    /// </summary>
+    private static string[]? TypePartition(string name) => name switch
+    {
+        "LIST" => new[] { "CONS", "NULL" },
+        "SEQUENCE" => new[] { "LIST", "VECTOR" },
+        "NUMBER" => new[] { "REAL", "COMPLEX" },
+        "REAL" => new[] { "RATIONAL", "FLOAT" },
+        "RATIONAL" => new[] { "INTEGER", "RATIO" },
+        "INTEGER" or "SIGNED-BYTE" => new[] { "FIXNUM", "BIGNUM" },
+        "FLOAT" => new[] { "SINGLE-FLOAT", "DOUBLE-FLOAT" },
+        _ => null,
+    };
+
+    /// <summary>The complex representations a type holds, if it holds only complexes.</summary>
+    private static int? ComplexMask(CType ct) => ct switch
+    {
+        ComplexType { Exact: null } c => c.Mask,
+        NamedType { Name: "COMPLEX" } => Runtime.ComplexAllParts,
+        _ => null,
+    };
+
+    /// <summary>
+    /// The node of a numeric type in the class tree NUMBER > REAL, COMPLEX;
+    /// REAL > RATIONAL, FLOAT; RATIONAL > INTEGER, RATIO; INTEGER > FIXNUM, BIGNUM;
+    /// FLOAT > SINGLE-FLOAT, DOUBLE-FLOAT. Null for anything else. Ranges of
+    /// integers sit at INTEGER, so they are never called disjoint from FIXNUM.
+    /// </summary>
+    private static string? NumericNode(CType ct)
+    {
+        string? name = ct switch
+        {
+            NamedType n => n.Name,
+            NumericType num => num.NumClass,
+            ComplexType => "COMPLEX",
+            _ => null,
+        };
+        return name switch
+        {
+            "NUMBER" or "REAL" or "COMPLEX" or "RATIONAL" or "FLOAT" or "INTEGER"
+                or "RATIO" or "FIXNUM" or "BIGNUM" => name,
+            "SIGNED-BYTE" or "UNSIGNED-BYTE" or "BIT" => "INTEGER",
+            "SINGLE-FLOAT" or "SHORT-FLOAT" => "SINGLE-FLOAT",
+            "DOUBLE-FLOAT" or "LONG-FLOAT" => "DOUBLE-FLOAT",
+            _ => null,
+        };
+    }
+
+    private static string? NumericParent(string node) => node switch
+    {
+        "REAL" or "COMPLEX" => "NUMBER",
+        "RATIONAL" or "FLOAT" => "REAL",
+        "INTEGER" or "RATIO" => "RATIONAL",
+        "FIXNUM" or "BIGNUM" => "INTEGER",
+        "SINGLE-FLOAT" or "DOUBLE-FLOAT" => "FLOAT",
+        _ => null,
+    };
+
+    private static bool NumericAncestorOrSelf(string anc, string node)
+    {
+        for (string? n = node; n != null; n = NumericParent(n))
+            if (n == anc) return true;
+        return false;
     }
 
     /// <summary>
@@ -1087,6 +1535,18 @@ public static class CTypeOps
 
     // --- Array types ---
 
+    /// <summary>True when element types E1 and E2 upgrade to the same
+    /// specialized (not T) array element type.</summary>
+    private static bool SameSpecializedUpgrade(LispObject e1, LispObject e2)
+    {
+        try
+        {
+            var u1 = Runtime.ParseElementTypeName(e1);
+            return u1 != "T" && u1 == Runtime.ParseElementTypeName(e2);
+        }
+        catch (LispErrorException) { return false; }
+    }
+
     private static (bool, bool) SubtypepArray(ArrayType a1, ArrayType a2)
     {
         // Simple constraint
@@ -1100,6 +1560,14 @@ public static class CTypeOps
             // Element types must match (after upgrading)
             var (sub1, _) = Subtypep(a1.ElementType, a2.ElementType);
             var (sub2, _) = Subtypep(a2.ElementType, a1.ElementType);
+            // Two element types that are not the same type can still upgrade
+            // to the same specialized one: (integer 0 100) and (unsigned-byte 7)
+            // both make (unsigned-byte 7) arrays, so the array types are the
+            // same (CLHS 15.1.2.1). Only specialized element types are compared
+            // this way: T is also what an unknown type name upgrades to.
+            if ((!sub1 || !sub2) && a1.ElementSpec != null && a2.ElementSpec != null
+                && SameSpecializedUpgrade(a1.ElementSpec, a2.ElementSpec))
+                sub1 = sub2 = true;
             if (!sub1 || !sub2) return (false, true);  // element types differ
         }
 
@@ -1241,13 +1709,130 @@ public static class CTypeOps
         // case incorrectly claims certainty.  Use uncertain (false, false) instead
         // when the type involves SATISFIES, per CLHS permission to return NIL NIL
         // for satisfies-involving types.
-        bool hasSatisfies = ContainsSatisfies(ct2);
+        // A type name that names no type gives no answer either: TYPEP on it is
+        // not a fact about the objects.
+        bool uncertainNo = ContainsSatisfies(ct2) || ContainsUnknownName(ct2);
         foreach (var obj in mem.Members)
         {
             if (!CTypeOps.IsTypep(obj, ct2))
-                return (false, hasSatisfies ? false : true);
+                return (false, !uncertainNo);
         }
         return (true, true);
+    }
+
+    /// <summary>
+    /// True if ct (or any nested type) is a name that is neither a built-in type
+    /// nor one of dotcl's own classes: a symbol that names no type at all, or a
+    /// DEFTYPE whose expansion failed or was circular.
+    /// </summary>
+    internal static bool ContainsUnknownName(CType ct) => ct switch
+    {
+        NamedType n => n.Name is not ("T" or "NIL" or "*")
+            && !Runtime.IsBuiltinTypeName(n.Name)
+            && Runtime.FindSystemClassByName(n.Name) == null,
+        NegationType neg => ContainsUnknownName(neg.Inner),
+        UnionType u => System.Array.Exists(u.Types, ContainsUnknownName),
+        IntersectionType i => System.Array.Exists(i.Types, ContainsUnknownName),
+        ConsType c => ContainsUnknownName(c.CarType) || ContainsUnknownName(c.CdrType),
+        _ => false,
+    };
+
+    /// <summary>
+    /// An object that is of TYPE1 but not of TYPE2 shows TYPE1 is not a subtype of
+    /// TYPE2. Tried: the objects named by a MEMBER or EQL in either type, then
+    /// objects of many built-in kinds (s_witnesses): VECTOR is not a subtype of
+    /// (OR STRING BIT-VECTOR) because #(1 2) is neither. Types with SATISFIES are
+    /// not tried (the predicate could do anything), nor are objects whose TYPEP fails.
+    /// </summary>
+    public static bool HasMemberWitness(CType ct1, CType ct2, LispObject type1, LispObject type2)
+    {
+        if (ContainsSatisfies(ct1) || ContainsSatisfies(ct2)) return false;
+        if (ContainsUnknownName(ct1) || ContainsUnknownName(ct2)) return false;
+        var objs = new List<LispObject>();
+        CollectMembers(ct1, objs);
+        CollectMembers(ct2, objs);
+        foreach (var o in objs)
+        {
+            try
+            {
+                if (Runtime.Typep(o, type1) != Nil.Instance && Runtime.Typep(o, type2) == Nil.Instance)
+                    return true;
+            }
+            catch { }
+        }
+        // The built-in objects only where TYPEP cannot signal (a handler of the
+        // caller would see it) and agrees with this algebra: no array type with an
+        // element type (TYPEP looks at the elements' types where the algebra looks
+        // at the upgraded element type), no VALUES. Asked of the parsed types, so
+        // (FUNCTION (T) T) is tested as FUNCTION, as everywhere here.
+        if (!WitnessSafe(ct1) || !WitnessSafe(ct2)) return false;
+        foreach (var o in s_witnesses.Value)
+        {
+            if (IsTypep(o, ct1) && !IsTypep(o, ct2))
+                return true;
+        }
+        return false;
+    }
+
+    private static bool WitnessSafe(CType ct) => ct switch
+    {
+        NamedType n => n.Name is not ("VALUES" or "*"),
+        NumericType or MemberType or ClassCType or ComplexType => true,
+        ConsType c => WitnessSafe(c.CarType) && WitnessSafe(c.CdrType),
+        NegationType neg => WitnessSafe(neg.Inner),
+        UnionType u => System.Array.TrueForAll(u.Types, WitnessSafe),
+        IntersectionType i => System.Array.TrueForAll(i.Types, WitnessSafe),
+        _ => false,
+    };
+
+    /// <summary>
+    /// One object of each of many built-in kinds: numbers of every class and both
+    /// signs, symbols, conses, strings and other vectors simple or not, arrays of
+    /// rank 0 and 2, characters, a hash table, a package, a function. Read once
+    /// under the standard syntax.
+    /// </summary>
+    private static readonly Lazy<LispObject[]> s_witnesses = new(() =>
+    {
+        const string src =
+            "(0 1 -1 2 100000000000000000000000 -100000000000000000000000 1/2 -1/2" +
+            " 1.5f0 -1.5f0 1.5d0 #c(1 2) #c(1.5f0 2.5f0) #c(1.5d0 2.5d0)" +
+            " cl:nil cl:t #:w :w #\\a (:w) (1 . 2) \"abc\" #(1 2) #() #*101 #2a((1 2)) #0a1" +
+            " #.(cl:make-array 3 :element-type 'cl:character :adjustable cl:t :fill-pointer 1)" +
+            " #.(cl:make-array 3 :adjustable cl:t :fill-pointer 1)" +
+            " #.(cl:make-array 3 :element-type 'cl:bit :adjustable cl:t)" +
+            " #.(cl:make-array 2 :element-type 'cl:fixnum :initial-element 0)" +
+            " #.(cl:make-array 2 :element-type 'cl:double-float :initial-element 0d0)" +
+            " #.(cl:make-hash-table) #.(cl:find-package \"COMMON-LISP\") #.(cl:function cl:car))";
+        var syms = new[] { "*READTABLE*", "*READ-BASE*", "*READ-SUPPRESS*", "*READ-EVAL*",
+                           "*READ-DEFAULT-FLOAT-FORMAT*" };
+        var vals = new LispObject[] { Startup.FaslReadtable, Fixnum.Make(10), Nil.Instance, T.Instance,
+                                      Startup.Sym("SINGLE-FLOAT") };
+        for (int i = 0; i < syms.Length; i++) DynamicBindings.Push(Startup.Sym(syms[i]), vals[i]);
+        try
+        {
+            var list = Runtime.ReadFromString(new LispObject[] { new LispString(src) });
+            if (list is MvReturn mv) list = mv.PrimaryValue;
+            var objs = new List<LispObject>();
+            for (var p = list; p is Cons c; p = c.Cdr) objs.Add(c.Car);
+            return objs.ToArray();
+        }
+        catch { return System.Array.Empty<LispObject>(); }
+        finally
+        {
+            for (int i = syms.Length - 1; i >= 0; i--) DynamicBindings.Pop(Startup.Sym(syms[i]));
+        }
+    });
+
+    private static void CollectMembers(CType ct, List<LispObject> into)
+    {
+        switch (ct)
+        {
+            case MemberType m: into.AddRange(m.Members); break;
+            case NegationType n: CollectMembers(n.Inner, into); break;
+            case UnionType u: foreach (var t in u.Types) CollectMembers(t, into); break;
+            case IntersectionType i: foreach (var t in i.Types) CollectMembers(t, into); break;
+            case ConsType: break;
+        }
     }
 
     /// <summary>Returns true if ct (or any nested type) is a SatisfiesType.</summary>
@@ -1255,7 +1840,9 @@ public static class CTypeOps
         ct is SatisfiesType ||
         (ct is NegationType neg && ContainsSatisfies(neg.Inner)) ||
         (ct is UnionType u && System.Array.Exists(u.Types, ContainsSatisfies)) ||
-        (ct is IntersectionType i && System.Array.Exists(i.Types, ContainsSatisfies));
+        (ct is IntersectionType i && System.Array.Exists(i.Types, ContainsSatisfies)) ||
+        (ct is ConsType c && (ContainsSatisfies(c.CarType) || ContainsSatisfies(c.CdrType))) ||
+        (ct is ArrayType a && ContainsSatisfies(a.ElementType));
 
     // --- IsTypep: check if a value is of a CType (for MemberType) ---
 
@@ -1298,6 +1885,8 @@ public static class CTypeOps
                 LispObject high = num.High != null ? (num.HighExclusiveP ? (LispObject)new Cons(num.High, Nil.Instance) : num.High) : Startup.Sym("*");
                 return new Cons(head, new Cons(low, new Cons(high, Nil.Instance)));
             }
+            case ComplexType cx:
+                return Runtime.List(Startup.Sym("COMPLEX"), cx.PartSpec);
             case NegationType neg:
                 return new Cons(Startup.Sym("NOT"), new Cons(CTypeToSpecifier(neg.Inner), Nil.Instance));
             case UnionType union:
@@ -1314,6 +1903,8 @@ public static class CTypeOps
                     result = new Cons(CTypeToSpecifier(inter.Types[i]), result);
                 return new Cons(Startup.Sym("AND"), result);
             }
+            case SatisfiesType sat:
+                return new Cons(Startup.Sym("SATISFIES"), new Cons(sat.Predicate, Nil.Instance));
             case ConsType cons:
                 return new Cons(Startup.Sym("CONS"),
                     new Cons(CTypeToSpecifier(cons.CarType),
@@ -1339,12 +1930,26 @@ public static class CTypeOps
         if (a is NamedType { Name: "T" } || b is NamedType { Name: "T" }) return false;
         // NIL is disjoint with everything (it's the empty type)
         if (a is NamedType { Name: "NIL" } || b is NamedType { Name: "NIL" }) return true;
+        if (ComplexMask(a) is int ma && ComplexMask(b) is int mb) return (ma & mb) == 0;
+        if (a is ComplexType ca && b is ComplexType cb && (ca.Mask & cb.Mask) == 0) return true;
+        if (a is ComplexType ca2 && ComplexMask(b) is int mb2 && (ca2.Mask & mb2) == 0) return true;
+        if (b is ComplexType cb2 && ComplexMask(a) is int ma2 && (cb2.Mask & ma2) == 0) return true;
+        if ((a is ComplexType || ComplexMask(a) != null) && (b is ComplexType || ComplexMask(b) != null))
+            return false;
+        if (a is ComplexType) return AreDisjoint(NamedType.Get("COMPLEX"), b);
+        if (b is ComplexType) return AreDisjoint(a, NamedType.Get("COMPLEX"));
 
         // If either is a subtype of the other, not disjoint
         var (sub1, cert1) = Subtypep(a, b);
         if (sub1) return false;
         var (sub2, cert2) = Subtypep(b, a);
         if (sub2) return false;
+
+        // Two numeric classes neither of which contains the other: INTEGER and RATIO,
+        // (INTEGER 0 *) and FLOAT.
+        if (NumericNode(a) is string na && NumericNode(b) is string nb
+            && !NumericAncestorOrSelf(na, nb) && !NumericAncestorOrSelf(nb, na))
+            return true;
 
         // Get disjoint groups for named/class types
         var groupA = GetDisjointGroup(a);
@@ -1397,7 +2002,7 @@ public static class CTypeOps
     {
         if (ct is NamedType nt && _disjointGroups.TryGetValue(nt.Name, out var group))
             return group;
-        if (ct is NumericType) return "NUMBER";
+        if (ct is NumericType or ComplexType) return "NUMBER";
         if (ct is ArrayType) return "ARRAY";
         if (ct is ConsType) return "CONS";
         if (ct is ClassCType cls)

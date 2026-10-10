@@ -60,3 +60,22 @@
        "  (defparameter *ewctt3-seen* (ewctt3-use)))"))
     (list (symbol-value (intern "*EWCTT3-SEEN*")) (get 'ewctt3-key 'ewctt3-mark)))
   (nil :loaded))
+
+;; In compile-time-too mode a form is evaluated first and then compiled
+;; (CLHS 3.2.3.1), so what the form itself does at compile time is seen by the
+;; macros in it when it is compiled for the fasl. The code that was run at
+;; compile time used to be reused for the fasl, expanded before the run. lift's
+;; DEFTESTSUITE has this shape: one form records the suite's slot names and
+;; defines the :SETUP method, whose body expands against those names. SBCL:
+;; (:SET).
+(deftest-compiled-only eval-when-compile-time-too.evaluate-then-compile
+  (progn
+    (setf (get 'ewctt4-key 'ewctt4-mark) nil)
+    (%ewctt-compile-and-load
+     '("(defmacro ewctt4-use () `',(get 'ewctt4-key 'ewctt4-mark))"
+       "(eval-when (:compile-toplevel :load-toplevel :execute)"
+       "  (let ()"
+       "    (setf (get 'ewctt4-key 'ewctt4-mark) '(:set))"
+       "    (defun ewctt4-seen () (ewctt4-use))))"))
+    (funcall (intern "EWCTT4-SEEN")))
+  (:set))

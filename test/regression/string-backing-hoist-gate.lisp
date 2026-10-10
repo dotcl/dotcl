@@ -17,7 +17,7 @@
 
 (setf dotcl:*save-sil* t)
 
-(defun %sbg-sil (fn) (princ-to-string (dotcl:function-sil fn)))
+(defun %sbg-sil (fn) (%flat-text (dotcl:function-sil fn)))
 
 (defun %sbg-count (needle s)
   (let ((k 0) (p 0))

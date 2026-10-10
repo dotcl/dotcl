@@ -37,7 +37,7 @@
 
 (setf dotcl:*save-sil* t)
 
-(defun %srh-sil (fn) (princ-to-string (dotcl:function-sil fn)))
+(defun %srh-sil (fn) (%flat-text (dotcl:function-sil fn)))
 
 (defun %srh-count (needle s)
   (let ((k 0) (p 0))
@@ -319,13 +319,15 @@
 
 ;;; ---- emitted code ----
 
-;; The fetch happens once, and the per-access calls are gone.
+;; The fetch happens once. The loop body is emitted twice, a fast copy and a
+;; copy for a missing array (struct-raw-backing-unswitch.lisp), so each access
+;; appears twice.
 (deftest-emitting-only struct-raw-backing-hoist.fetched-once
   (let ((r (%srh-sil #'%srh-rmw)))
     (list (%srh-count "Runtime.StructRawBacking" r)
           (%srh-count "LDELEM-I8" r)
           (%srh-count "STELEM-I8" r)))
-  (1 2 1))
+  (1 4 2))
 
 ;; The excluded shapes emit no fetch at all.
 (deftest-emitting-only struct-raw-backing-hoist.exclusions-emit-no-fetch
@@ -336,13 +338,14 @@
 
 ;; The boxed slot of a mixed structure keeps the ordinary path; only the raw
 ;; ones become element accesses. %SRH-MIX-RAW reads the three raw slots in a
-;; fixnum context and the boxed one generically.
+;; fixnum context and the boxed one generically. The function body holds a
+;; loop over the raw slots, so it is emitted twice, and every count doubles.
 (deftest-emitting-only struct-raw-backing-hoist.boxed-slot-keeps-the-old-path
   (let ((r (%srh-sil #'%srh-mix-raw)))
     (list (%srh-count "Runtime.StructRawBacking" r)
           (%srh-count "LDELEM-I8" r)
           (%srh-count "Runtime.StructRefI" r)))
-  (1 3 1))
+  (1 6 2))
 
 ;;; ---- the scope this does NOT cover ----
 ;;;

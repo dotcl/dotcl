@@ -15,7 +15,7 @@
 ;;;; queries api.github.com.
 
 (require "dotnet-class")                ; dotnet:using and dotnet:ref live here
-(require "dotcl-nuget")                 ; NuGet resolution (ships with dotcl)
+(require "dotnet-nuget")                ; NuGet resolution (ships with dotcl)
 
 ;;; Resolves the package and its dependencies, then registers the assemblies
 ;;; with dotcl's resolver -- after this the types are simply visible.

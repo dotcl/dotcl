@@ -634,19 +634,19 @@
 ;;; file forgot to call (provide ...).
 (deftest d688-require-first-returns-non-nil
   ;; Use a contrib that doesn't call (provide ...) itself;
-  ;; dotcl-cs is such a module (intentionally). Require should
+  ;; dotnet-cs is such a module (intentionally). Require should
   ;; auto-push its name so the set-difference is non-nil.
-  (consp (require "dotcl-cs"))
+  (consp (require "dotnet-cs"))
   t)
 
 (deftest d688-require-second-returns-nil
-  (progn (require "dotcl-cs")
-         (require "dotcl-cs"))
+  (progn (require "dotnet-cs")
+         (require "dotnet-cs"))
   nil)
 
 (deftest d688-require-records-in-modules
-  (progn (require "dotcl-cs")
-         (not (null (member "dotcl-cs" *modules* :test #'equal))))
+  (progn (require "dotnet-cs")
+         (not (null (member "dotnet-cs" *modules* :test #'equal))))
   t)
 
 ;;; (defun (setf name) ...) use-direct path: self-fn-prelude must use
@@ -1663,10 +1663,12 @@
     (not (null (find-package "DOTCL-THREAD"))))
   t)
 
-;;; dotcl:backtrace: named-function call stack, innermost first
+;;; dotcl:backtrace: named-function call stack, innermost first. (VALUES (f))
+;;; is not a tail call: a tail call hands the caller's frame to the callee, as
+;;; SBCL does (see tail-calls.lisp).
 (defun %bt-c () (dotcl:backtrace))
-(defun %bt-b () (%bt-c))
-(defun %bt-a () (%bt-b))
+(defun %bt-b () (values (%bt-c)))
+(defun %bt-a () (values (%bt-b)))
 
 (deftest d1108-backtrace-chain
   (%bt-a)
@@ -1783,7 +1785,7 @@
   (let ((s (make-string-output-stream)))
     (dotcl:print-backtrace s)
     (get-output-stream-string s)))
-(defun %d1118-bt-mid (x) (%d1118-bt-leaf x (list x)))
+(defun %d1118-bt-mid (x) (values (%d1118-bt-leaf x (list x))))
 
 (deftest d1118-backtrace-shows-args
   (let ((out (%d1118-bt-mid 7)))
@@ -1800,7 +1802,7 @@
 ;;; dotcl:backtrace-with-args exposes each frame as (NAME arg0 arg1 ...)
 ;;; with the actual captured argument objects, innermost first.
 (defun %bta-leaf (n s) (declare (ignore s)) (dotcl:backtrace-with-args))
-(defun %bta-mid (a b) (%bta-leaf (+ a b) "x"))
+(defun %bta-mid (a b) (values (%bta-leaf (+ a b) "x")))
 
 (deftest d269-backtrace-with-args-frames
   (let ((bt (%bta-mid 3 4)))
@@ -3270,9 +3272,10 @@
   (t 3))
 
 (deftest native-condition-slot-boundp-unbound
-  ;; (/ 1 0) signals division-by-zero without capturing operands -> unbound slot,
-  ;; reported as NIL (not an error), so cl-store skips it cleanly.
-  (handler-case (/ 1 0)
+  ;; (truncate 1 0) signals division-by-zero without capturing operands -> unbound
+  ;; slot, reported as NIL (not an error), so cl-store skips it cleanly. (/ now
+  ;; captures them; see division-by-zero-operands.lisp.)
+  (handler-case (truncate 1 0)
     (division-by-zero (c) (slot-boundp c 'operands)))
   nil)
 
@@ -4683,17 +4686,35 @@
 ;; unchanged.)
 ;; Compiled-only: "form too large" is a limit of the IL a method can hold. The
 ;; interpreter has no such ceiling, so evaluating this is simply not an error.
+;; The body sits inside a HANDLER-CASE: the assembler shares IL local slots
+;; between locals that are never live at once, but not in a method with an
+;; exception block, so this one keeps a local per temporary and stays too large.
 (deftest-compiled-only huge-unchunkable-form-signals-clear-error
   (handler-case
       (progn (eval `(let ((acc 0))
                       (declare (type fixnum acc))
-                      ,@(loop for i below 4000 collect (%big488-heavy i 'acc))
+                      (handler-case (progn ,@(loop for i below 4000
+                                                   collect (%big488-heavy i 'acc)))
+                        (error () nil))
                       acc))
              :no-error)
     (program-error (e)
       (if (search "too large" (princ-to-string e)) :clear-error :other-prog-error))
     (error () :other-error))
   :clear-error)
+;; Without the exception block the same body shares its local slots, which takes
+;; it back under the limit: it compiles and runs.
+(deftest-compiled-only huge-unchunkable-form-shares-local-slots
+  (handler-case
+      (= (eval `(let ((acc 0))
+                  (declare (type fixnum acc))
+                  ,@(loop for i below 4000 collect (%big488-heavy i 'acc))
+                  acc))
+         (let ((acc 0))
+           (dotimes (i 4000 acc)
+             (incf acc (+ (- i 1) (* 2 (+ i i)) (length (format nil "~a-~a" i i)))))))
+    (error () :error))
+  t)
 
 ;; A MACROLET-local macro that expands to (return-from <enclosing-defun> ...) must
 ;; resolve the defun's implicit block. The return-from is hidden in the macrolet's

@@ -15,7 +15,7 @@
 
 (setf dotcl:*save-sil* t)
 
-(defun %ersv-sil (fn) (princ-to-string (dotcl:function-sil fn)))
+(defun %ersv-sil (fn) (%flat-text (dotcl:function-sil fn)))
 
 (defun %ersv-count (needle s)
   (let ((k 0) (p 0))

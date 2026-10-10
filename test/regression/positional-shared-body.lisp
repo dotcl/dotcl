@@ -127,3 +127,61 @@
         (rest (%psb-compile-string '(defun %psb-sil-d (a &rest xs) (cons a xs)))))
     (list (%psb-count ":SHARED" opt) (%psb-count ":SHARED" rest)))
   (0 0))
+
+;; Under COMPILE-FILE the shared body is compiled first. A large one gets no
+;; copy for the required-only entry (a fasl never uses it); a small one keeps
+;; its per-arity copies, and the array entry calls the shared body instead of
+;; carrying a copy of its own.
+(defun %psb-cf-compile-string (form)
+  (let ((mode (find-symbol "*COMPILE-FILE-MODE*" "DOTCL-INTERNAL")))
+    (progv (list mode) (list t)
+      (%psb-compile-string form))))
+
+(deftest-emitting-only positional-shared-body.compile-file-large-has-no-copy
+  (let ((normal (%psb-compile-string
+                 '(defun %psb-sil-e (a &optional (b 1)) (%psb-big (list a b)))))
+        (cf (%psb-cf-compile-string
+             '(defun %psb-sil-f (a &optional (b 1)) (%psb-big (list a b))))))
+    ;; -61 is a constant of the body (%PSB-BIG's last clause): one per copy.
+    (list (%psb-count " -61)" normal) (%psb-count " -61)" cf)
+          (%psb-count "(:CALL-KEY-SHARED)" cf)))
+  (2 1 3))
+
+(deftest-emitting-only positional-shared-body.compile-file-small-array-entry
+  (let ((opt (%psb-cf-compile-string '(defun %psb-sil-g (a &optional (b 1)) (+ a b))))
+        (rest (%psb-cf-compile-string '(defun %psb-sil-h (a &rest xs) (cons a xs)))))
+    (list (%psb-count ":SHARED" opt) (%psb-count "(:CALL-KEY-SHARED)" opt)
+          (%psb-count ":SHARED" rest) (%psb-count "(:CALL-KEY-SHARED)" rest)))
+  (1 1 1 1))
+
+(defun %psb-cf-load (name lines)
+  (let* ((dir (regression-temp-dir))
+         (src (merge-pathnames (format nil "~a.lisp" name) dir))
+         (fasl (merge-pathnames (format nil "~a.fasl" name) dir)))
+    (with-open-file (s src :direction :output :if-exists :supersede)
+      (dolist (l lines) (write-line l s)))
+    (let* ((*error-output* (make-broadcast-stream))
+           (out (compile-file src :output-file fasl)))
+      (and out (load out) t))))
+
+(deftest-emitting-only positional-shared-body.compile-file-calls
+  (progn
+    (%psb-cf-load
+     "psb-cf"
+     '("(defun psb-cf-small-opt (a &optional (b 1) (c (+ a b))) (list a b c))"
+       "(defun psb-cf-small-rest (a &rest xs) (cons a xs))"
+       "(defun psb-cf-big-opt (a &optional (b 1) (c (+ a b)))"
+       "  (cl-user::%psb-big (list a b c)))"
+       "(defun psb-cf-big-rest (a &rest xs) (cl-user::%psb-big (cons a xs)))"
+       "(defun psb-cf-small-loop (n &optional (acc 0))"
+       "  (if (= n 0) acc (psb-cf-small-loop (1- n) (+ acc 1))))"))
+    (list (funcall 'psb-cf-small-opt 1) (funcall 'psb-cf-small-opt 1 2)
+          (apply 'psb-cf-small-opt 1 '(2 3))
+          (funcall 'psb-cf-small-rest 1) (apply 'psb-cf-small-rest 1 '(2 3 4 5 6))
+          (funcall 'psb-cf-big-opt 1) (apply 'psb-cf-big-opt 1 '(2 3))
+          (funcall 'psb-cf-big-rest 1 2) (apply 'psb-cf-big-rest 1 '(2 3 4 5 6))
+          (apply 'psb-cf-small-loop '(100000))
+          (handler-case (progn (apply 'psb-cf-small-opt '(1 2 3 4)) :no-error)
+            (program-error () :error))))
+  ((1 1 2) (1 2 3) (1 2 3) (1) (1 2 3 4 5 6) (1 1 2) (1 2 3) (1 2) (1 2 3 4 5 6)
+   100000 :error))

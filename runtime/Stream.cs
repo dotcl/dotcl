@@ -33,6 +33,12 @@ public class PositionTrackingReader : TextReader
 }
 
 
+/// <summary>What #\Newline is in a character file: the external format's line
+/// end. Lf is the single LF byte, unchanged, and the default on every OS. Crlf
+/// writes CR LF and reads CR LF as #\Newline (a CR or LF on its own is read as
+/// itself, as SBCL does); Cr writes CR and reads CR as #\Newline.</summary>
+public enum NewlineStyle { Lf, Crlf, Cr }
+
 /// <summary>Character file input that knows its byte offset.
 ///
 /// FILE-POSITION on a character file stream reports where the next character
@@ -62,6 +68,15 @@ public sealed class ByteTrackingReader : TextReader
     private readonly char[] _pending = new char[2];
     private int _pendingLen, _pendingPos; // chars decoded but not yet handed out
     private long _pendingBytes;           // bytes behind the pending characters
+    // A :CRLF reader that looked past a CR and did not find LF keeps what it
+    // decoded here, to hand out after the CR.
+    private readonly char[] _carry = new char[2];
+    private int _carryLen;
+    private long _carryBytes;
+
+    /// <summary>The line end of the external format. Anything but Lf makes the
+    /// reader translate it to #\Newline (see NewlineStyle).</summary>
+    public NewlineStyle Newline { get; set; }
     private long _fillEnd;                // where the underlying stream should be
                                           // if only this reader has moved it
 
@@ -125,7 +140,62 @@ public sealed class ByteTrackingReader : TextReader
         _byteLen = _bytePos = 0;
         _pendingLen = _pendingPos = 0;
         _pendingBytes = 0;
+        _carryLen = 0;
+        _carryBytes = 0;
         BytePosition = _fillEnd = bytePosition;
+    }
+
+    /// <summary>How many bytes character <paramref name="c"/> took in the file,
+    /// for backing up over a character pushed back with UNREAD-CHAR.</summary>
+    public int ByteCountOf(char c) =>
+        c == '\n' && Newline == NewlineStyle.Crlf ? CurrentEncoding.GetByteCount("\r\n")
+        : CurrentEncoding.GetByteCount(new[] { c == '\n' && Newline == NewlineStyle.Cr ? '\r' : c });
+
+    [System.Runtime.CompilerServices.MethodImpl(
+        System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    private bool Fill() => Newline == NewlineStyle.Lf ? FillPending() : FillTranslated();
+
+    /// <summary>FillPending for a reader whose line end is not LF: the line end
+    /// comes out as the single character #\Newline, and its bytes are counted
+    /// together, so FILE-POSITION never lands inside it.</summary>
+    private bool FillTranslated()
+    {
+        if (_carryLen > 0)
+        {
+            System.Array.Copy(_carry, _pending, _carryLen);
+            _pendingLen = _carryLen;
+            _pendingPos = 0;
+            _pendingBytes = _carryBytes;
+            _carryLen = 0;
+            _carryBytes = 0;
+        }
+        else if (!FillPending()) return false;
+        if (_pending[0] != '\r' || _pendingLen != 1) return true;
+        if (Newline == NewlineStyle.Cr)
+        {
+            _pending[0] = '\n';
+            return true;
+        }
+        // CRLF: look at the next character. LF joins the CR as one newline;
+        // anything else is kept for after the CR, which stays a CR.
+        long crBytes = _pendingBytes;
+        _pendingBytes = 0;
+        if (FillPending())
+        {
+            if (_pendingLen == 1 && _pending[0] == '\n')
+            {
+                _pendingBytes += crBytes;
+                return true;
+            }
+            System.Array.Copy(_pending, _carry, _pendingLen);
+            _carryLen = _pendingLen;
+            _carryBytes = _pendingBytes;
+        }
+        _pending[0] = '\r';
+        _pendingLen = 1;
+        _pendingPos = 0;
+        _pendingBytes = crBytes;
+        return true;
     }
 
     /// <summary>Decode exactly one more character sequence into _pending.
@@ -182,7 +252,7 @@ public sealed class ByteTrackingReader : TextReader
     public override int Read()
     {
         if (SharesStreamWithWriter) SyncWithWriter();
-        if (_pendingPos >= _pendingLen && !FillPending()) return -1;
+        if (_pendingPos >= _pendingLen && !Fill()) return -1;
         char c = _pending[_pendingPos++];
         if (_pendingPos >= _pendingLen)
         {
@@ -195,7 +265,7 @@ public sealed class ByteTrackingReader : TextReader
     public override int Peek()
     {
         if (SharesStreamWithWriter) SyncWithWriter();
-        if (_pendingPos >= _pendingLen && !FillPending()) return -1;
+        if (_pendingPos >= _pendingLen && !Fill()) return -1;
         return _pending[_pendingPos];
     }
 
@@ -241,6 +311,150 @@ public sealed class ByteTrackingReader : TextReader
     protected override void Dispose(bool disposing)
     {
         if (disposing) _stream.Dispose();
+        base.Dispose(disposing);
+    }
+}
+
+/// <summary>A character writer that knows the column it is at: the number of
+/// characters written since the last newline. FORMAT ~T, the pretty printer and
+/// DOTCL:CHARPOS ask it, so text that started earlier on the line is counted.</summary>
+public interface IColumnWriter
+{
+    int Column { get; }
+}
+
+/// <summary>Column bookkeeping shared by the column-tracking writers.</summary>
+internal static class ColumnCount
+{
+    public static int After(int col, ReadOnlySpan<char> text)
+    {
+        int nl = text.LastIndexOf('\n');
+        return nl < 0 ? col + text.Length : text.Length - nl - 1;
+    }
+}
+
+/// <summary>StreamWriter of an output file stream that counts its column.
+/// A subclass, so the code that flushes or repositions a file stream through
+/// its StreamWriter keeps working.</summary>
+public sealed class ColumnStreamWriter : StreamWriter, IColumnWriter
+{
+    private int _col;
+    public int Column => _col;
+    // What #\Newline is written as; null while the line end is LF, so the
+    // default path does no more than test it.
+    private string? _eol;
+
+    public ColumnStreamWriter(System.IO.Stream s) : base(s) { }
+    public ColumnStreamWriter(System.IO.Stream s, System.Text.Encoding enc) : base(s, enc) { }
+
+    /// <summary>The line end of the external format (see NewlineStyle).</summary>
+    public NewlineStyle Newline
+    {
+        get => _eol == null ? NewlineStyle.Lf : _eol.Length == 2 ? NewlineStyle.Crlf : NewlineStyle.Cr;
+        set
+        {
+            _eol = value switch { NewlineStyle.Crlf => "\r\n", NewlineStyle.Cr => "\r", _ => null };
+            if (_eol != null) NewLine = _eol;
+        }
+    }
+
+    private string Translate(string text) =>
+        text.IndexOf('\n') < 0 ? text : text.Replace("\n", _eol!);
+
+    public override void Write(char value)
+    {
+        if (value == '\n' && _eol != null) base.Write(_eol);
+        else base.Write(value);
+        _col = value == '\n' ? 0 : _col + 1;
+    }
+    public override void Write(string? value)
+    {
+        base.Write(_eol != null && value != null ? Translate(value) : value);
+        if (value != null) _col = ColumnCount.After(_col, value.AsSpan());
+    }
+    public override void Write(char[] buffer, int index, int count)
+    {
+        if (_eol != null) base.Write(Translate(new string(buffer, index, count)));
+        else base.Write(buffer, index, count);
+        _col = ColumnCount.After(_col, new ReadOnlySpan<char>(buffer, index, count));
+    }
+    public override void Write(char[]? buffer)
+    {
+        if (buffer == null) return;
+        Write(buffer, 0, buffer.Length);
+    }
+#if !NETSTANDARD2_0
+    public override void Write(ReadOnlySpan<char> buffer)
+    {
+        if (_eol != null) base.Write(Translate(new string(buffer)));
+        else base.Write(buffer);
+        _col = ColumnCount.After(_col, buffer);
+    }
+    public override void WriteLine(ReadOnlySpan<char> buffer)
+    {
+        if (_eol != null) { Write(buffer); Write('\n'); }
+        else { base.WriteLine(buffer); _col = 0; }
+    }
+#endif
+    // NewLine is the line end when one is set, and the base writes it as is.
+    public override void WriteLine(string? value)
+    {
+        if (_eol != null) { Write(value); Write('\n'); }
+        else { base.WriteLine(value); _col = 0; }
+    }
+    public override void WriteLine() { if (_eol != null) Write('\n'); else { base.WriteLine(); _col = 0; } }
+}
+
+/// <summary>Writer in front of the console (or any host writer) that counts its
+/// column, for *STANDARD-OUTPUT* / *TERMINAL-IO* / *ERROR-OUTPUT*.</summary>
+public sealed class ColumnTrackingWriter : TextWriter, IColumnWriter
+{
+    private readonly TextWriter _inner;
+    private int _col;
+    public int Column => _col;
+    public TextWriter Inner => _inner;
+
+    public ColumnTrackingWriter(TextWriter inner) : base(inner.FormatProvider)
+    {
+        _inner = inner;
+        CoreNewLine = inner.NewLine.ToCharArray();
+    }
+
+    public override System.Text.Encoding Encoding => _inner.Encoding;
+    public override void Write(char value)
+    {
+        _inner.Write(value);
+        _col = value == '\n' ? 0 : _col + 1;
+    }
+    public override void Write(string? value)
+    {
+        _inner.Write(value);
+        if (value != null) _col = ColumnCount.After(_col, value.AsSpan());
+    }
+    public override void Write(char[] buffer, int index, int count)
+    {
+        _inner.Write(buffer, index, count);
+        _col = ColumnCount.After(_col, new ReadOnlySpan<char>(buffer, index, count));
+    }
+    public override void Write(char[]? buffer)
+    {
+        _inner.Write(buffer);
+        if (buffer != null) _col = ColumnCount.After(_col, buffer.AsSpan());
+    }
+#if !NETSTANDARD2_0
+    public override void Write(ReadOnlySpan<char> buffer)
+    {
+        _inner.Write(buffer);
+        _col = ColumnCount.After(_col, buffer);
+    }
+    public override void WriteLine(ReadOnlySpan<char> buffer) { _inner.WriteLine(buffer); _col = 0; }
+#endif
+    public override void WriteLine(string? value) { _inner.WriteLine(value); _col = 0; }
+    public override void WriteLine() { _inner.WriteLine(); _col = 0; }
+    public override void Flush() => _inner.Flush();
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing) _inner.Dispose();
         base.Dispose(disposing);
     }
 }
@@ -392,7 +606,7 @@ public class LispStringOutputStream : LispOutputStream
 }
 
 /// <summary>TextWriter that appends characters to a LispVector with fill-pointer using VECTOR-PUSH-EXTEND.</summary>
-public class FillPointerStringWriter : TextWriter
+public class FillPointerStringWriter : TextWriter, IColumnWriter
 {
     private readonly LispVector _vector;
     // Where this stream started writing: what the string held before belongs to
@@ -419,6 +633,18 @@ public class FillPointerStringWriter : TextWriter
     }
 
     public override System.Text.Encoding Encoding => System.Text.Encoding.Unicode;
+
+    /// <summary>Characters after the last newline in the string, counting what
+    /// it held before this stream started writing.</summary>
+    public int Column
+    {
+        get
+        {
+            int n = _vector.Length, k = n - 1;
+            while (k >= 0 && !(_vector.ElementAt(k) is LispChar c && c.Value == '\n')) k--;
+            return n - k - 1;
+        }
+    }
 
     public override void Write(char value)
     {
@@ -598,6 +824,16 @@ public class BroadcastTextWriter : TextWriter
     public override void Write(char[] buffer, int index, int count) { foreach (var w in _writers) w.Write(buffer, index, count); }
     public override void WriteLine(string? value) { foreach (var w in _writers) w.WriteLine(value); }
     public override void Flush() { foreach (var w in _writers) w.Flush(); }
+    /// <summary>The column of the first component that knows it.</summary>
+    public int? Column
+    {
+        get
+        {
+            foreach (var w in _writers)
+                if (Runtime.WriterColumn(w) is int c) return c;
+            return null;
+        }
+    }
 }
 
 /// <summary>Broadcast stream: output goes to all component streams.</summary>

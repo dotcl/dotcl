@@ -1,5 +1,6 @@
-;;; The tail. prefix on a function's final call is kept for small bodies and
-;;; dropped for large ones.
+;;; Tail calls (the (:tail-self ...) marker that lets the assembler make the
+;;; calls in tail position tail calls) are kept for small bodies and dropped for
+;;; large ones.
 ;;;
 ;;; The CLR JIT compiles a method containing an explicit tail call with full
 ;;; optimization on its first call, skipping tier 0. For a large body that is
@@ -10,7 +11,7 @@
 
 (setf dotcl:*save-sil* t)
 
-(defun %tpsg-sil (fn) (princ-to-string (dotcl:function-sil fn)))
+(defun %tpsg-sil (fn) (%flat-text (dotcl:function-sil fn)))
 
 (defun %tpsg-callee (x) x)
 
@@ -28,11 +29,11 @@
   (def))
 
 (deftest-emitting-only tail-prefix-size-gate.small-keeps-prefix
-  (and (search "TAIL-PREFIX" (%tpsg-sil #'%tpsg-small)) t)
+  (and (search "TAIL-SELF" (%tpsg-sil #'%tpsg-small)) t)
   t)
 
 (deftest-emitting-only tail-prefix-size-gate.large-drops-prefix
-  (search "TAIL-PREFIX" (%tpsg-sil #'%tpsg-large))
+  (search "TAIL-SELF" (%tpsg-sil #'%tpsg-large))
   nil)
 
 (deftest tail-prefix-size-gate.large-still-returns-the-call-value

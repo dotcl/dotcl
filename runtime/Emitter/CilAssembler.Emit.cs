@@ -254,6 +254,51 @@ public partial class CilAssembler
         List<object>, System.Collections.Concurrent.ConcurrentDictionary<int, Delegate>>
         _closureDelegates = new();
 
+    // The lambda list of an in-memory closure site. A closure's body delegate is
+    // shared by every closure its site makes (see GetClosureDelegate), so the list
+    // is kept per delegate rather than stored on each closure as it is made: the
+    // creation path stays as it was. The DynamicMethod table carries the list from
+    // assembly until the delegate exists. Both are weak, so a collected unit takes
+    // its entries with it.
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<
+        DynamicMethod, LispObject> _closureDmLambdaLists = new();
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<
+        Delegate, LispObject> _closureLambdaLists = new();
+
+    private static void RecordClosureLambdaList(DynamicMethod dm, LispObject? lambdaList)
+    {
+        if (lambdaList == null) return;
+        var ll = InternLambdaList(lambdaList, null);
+        _closureDmLambdaLists.GetValue(dm, _ => ll);
+    }
+
+    // A method of its own: a lambda capturing a local of GetClosureDelegate would
+    // make the compiler allocate its display class on every call there, which is
+    // every closure creation, not only the first of a site.
+    private static void CarryClosureLambdaList(DynamicMethod dm, Delegate made)
+    {
+        if (_closureDmLambdaLists.TryGetValue(dm, out var ll))
+            _closureLambdaLists.GetValue(made, _ => ll);
+    }
+
+    /// <summary>The lambda list of the in-memory closure site whose body delegate
+    /// is DEL, or null.</summary>
+    internal static LispObject? ClosureSiteLambdaList(Delegate del)
+        => _closureLambdaLists.TryGetValue(del, out var ll) ? ll : null;
+
+    private static readonly ConstructorInfo _lambdaListAttrCtor =
+        typeof(LispLambdaListAttribute).GetConstructor(new[] { typeof(string), typeof(string) })!;
+
+    /// <summary>Put an anonymous function's lambda list on the FASL method its
+    /// delegate calls, as text (see LispLambdaListAttribute).</summary>
+    private static void SetFaslLambdaList(MethodBuilder method, LispObject? lambdaList)
+    {
+        if (lambdaList == null) return;
+        var pkg = DynamicBindings.Get(Startup.Sym("*PACKAGE*")) as Package;
+        method.SetCustomAttribute(new CustomAttributeBuilder(_lambdaListAttrCtor,
+            new object?[] { Runtime.FormatObject(lambdaList, true), pkg?.Name }));
+    }
+
     private static Delegate GetClosureDelegate(List<object> holder, int dmIndex, Type delType)
     {
         var cache = _closureDelegates.GetValue(
@@ -262,7 +307,9 @@ public partial class CilAssembler
         // so a mismatch cannot normally happen, and returning a wrong-typed
         // delegate would be far worse than rebuilding one.
         if (cache.TryGetValue(dmIndex, out var cached) && cached.GetType() == delType) return cached;
-        var made = ((DynamicMethod)holder[dmIndex]).CreateDelegate(delType);
+        var dm = (DynamicMethod)holder[dmIndex];
+        var made = dm.CreateDelegate(delType);
+        CarryClosureLambdaList(dm, made);
         // Racing threads just build two equivalent delegates; either is correct.
         cache[dmIndex] = made;
         return made;
@@ -426,6 +473,32 @@ public partial class CilAssembler
 
     internal void Assemble(LispObject instructions)
     {
+        if (_assembleDepth == 0)
+        {
+            if (!_localSlotsPlanned)
+            {
+                _localSlotsPlanned = true;
+                try { instructions = ElideStackTemps(instructions); }
+                catch { /* keep the instructions as they are */ }
+                try { PlanLocalSlots(instructions); }
+                catch { _localSlotOf = null; _localSlotBuilders = null; }
+            }
+            else
+            {
+                // A second body on the same assembler: the plan only knew the
+                // first one, so declare everything new on its own from here.
+                _localSlotOf = null;
+            }
+        }
+        _assembleDepth++;
+        try { AssembleBody(instructions); }
+        finally { _assembleDepth--; }
+    }
+
+    private void AssembleBody(LispObject instructions)
+    {
+        FindTailSites(instructions);
+        if (_typedSelfMethod != null) FindTypedTailSites(instructions);
         var cur = instructions;
         bool dead = false;
         while (cur is Cons c)
@@ -474,6 +547,40 @@ public partial class CilAssembler
             {
                 cur = nextCell.Cdr;
                 continue;
+            }
+            if (_typedTailSites != null && _typedTailSites.Contains(c))
+            {
+                // A typed body's call whose result is the body's result: to
+                // itself, or to another function's typed entry.
+                if (instr is Cons tc0 && tc0.Car is Symbol ts0 && ts0.Name == "CALL-TYPED-ENTRY")
+                    EmitTypedTailInvoke(GetString(Cadr(tc0)));
+                else
+                {
+                    _il.Emit(OpCodes.Tailcall);
+                    _il.Emit(OpCodes.Call, _typedSelfMethod!);
+                    _il.Emit(OpCodes.Ret);
+                }
+                dead = true;
+                cur = c.Cdr;
+                continue;
+            }
+            if (_tailSites != null)
+            {
+                if (_tailSites.Contains(c))
+                {
+                    EmitTailInvoke(instr);
+                    dead = true;   // it ends in RET
+                    cur = c.Cdr;
+                    continue;
+                }
+                // An older compiler marked the last call itself: the site
+                // above emits its own prefix.
+                if (instr is Cons pc && pc.Car is Symbol ps && ps.Name == "TAIL-PREFIX"
+                    && c.Cdr is Cons nc && _tailSites.Contains(nc))
+                {
+                    cur = c.Cdr;
+                    continue;
+                }
             }
             AssembleOne(instr);
             // Check if this instruction makes subsequent code unreachable
@@ -645,11 +752,17 @@ public partial class CilAssembler
                     throw new InvalidOperationException("CALL-KEY-SHARED outside a &key entry");
                 _il.Emit(OpCodes.Call, _keyShared);
                 break;
+            case "TAIL-SELF":
+                // Read by FindTailSites; no code of its own.
+                break;
+            case "TYPED-TAIL-SELF":
+                // Read by FindTypedTailSites; no code of its own.
+                break;
             case "TAIL-PREFIX":
                 // CIL tail-call prefix. Must be immediately followed by a call/callvirt/calli
-                // whose next instruction is `ret`. CLR JIT may or may not honor it, but it's
-                // a safe hint. The compiler only emits this when *in-tail-position* is T and
-                // the call site isn't inside a try/finally region.
+                // whose next instruction is `ret`. The compiler no longer emits it (calls in
+                // tail position are found by FindTailSites); .sil written by an older one
+                // still has it before a function body's final call.
                 _il.Emit(OpCodes.Tailcall);
                 break;
             case "NEWOBJ":
@@ -662,10 +775,10 @@ public partial class CilAssembler
                 DeclareLocal(GetSymbolName(Cadr(c)), GetString(Caddr(c)));
                 break;
             case "LDLOC":
-                _il.Emit(OpCodes.Ldloc, GetLocal(GetSymbolName(Cadr(c))));
+                _il.EmitLoc(OpCodes.Ldloc, GetLocal(GetSymbolName(Cadr(c))));
                 break;
             case "STLOC":
-                _il.Emit(OpCodes.Stloc, GetLocal(GetSymbolName(Cadr(c))));
+                _il.EmitLoc(OpCodes.Stloc, GetLocal(GetSymbolName(Cadr(c))));
                 break;
             case "LDARG":
                 EmitLdarg(GetInt(Cadr(c)));
@@ -699,6 +812,49 @@ public partial class CilAssembler
                 break;
             case "BNE":
                 _il.Emit(OpCodes.Bne_Un, GetOrDefineLabel(GetSymbolName(Cadr(c))));
+                break;
+            // Unsigned (integer) / unordered (float) branches and the unsigned
+            // arithmetic and narrowing conversions. The compiler does not emit
+            // these; they come from C# spliced in by dotnet-cs:inline-cs, whose
+            // IL Roslyn writes.
+            case "BGE-UN":
+                _il.Emit(OpCodes.Bge_Un, GetOrDefineLabel(GetSymbolName(Cadr(c))));
+                break;
+            case "BGT-UN":
+                _il.Emit(OpCodes.Bgt_Un, GetOrDefineLabel(GetSymbolName(Cadr(c))));
+                break;
+            case "BLE-UN":
+                _il.Emit(OpCodes.Ble_Un, GetOrDefineLabel(GetSymbolName(Cadr(c))));
+                break;
+            case "BLT-UN":
+                _il.Emit(OpCodes.Blt_Un, GetOrDefineLabel(GetSymbolName(Cadr(c))));
+                break;
+            case "SHR-UN":
+                _il.Emit(OpCodes.Shr_Un);
+                break;
+            case "DIV-UN":
+                _il.Emit(OpCodes.Div_Un);
+                break;
+            case "REM-UN":
+                _il.Emit(OpCodes.Rem_Un);
+                break;
+            case "CONV-I1":
+                _il.Emit(OpCodes.Conv_I1);
+                break;
+            case "CONV-I2":
+                _il.Emit(OpCodes.Conv_I2);
+                break;
+            case "CONV-U1":
+                _il.Emit(OpCodes.Conv_U1);
+                break;
+            case "CONV-U2":
+                _il.Emit(OpCodes.Conv_U2);
+                break;
+            case "CONV-U4":
+                _il.Emit(OpCodes.Conv_U4);
+                break;
+            case "CONV-U8":
+                _il.Emit(OpCodes.Conv_U8);
                 break;
             case "ADD":
                 _il.Emit(OpCodes.Add);
@@ -820,6 +976,25 @@ public partial class CilAssembler
                 break;
             case "STELEM-I8":
                 _il.Emit(OpCodes.Stelem_I8);
+                break;
+            // The same against a double[] / float[] buffer, for a local declared
+            // (simple-array double-float (*)) / (simple-array single-float (*)).
+            // The value travels as an r8 either way, as it does through the
+            // per-element helpers: a float element is widened on the way out
+            // and narrowed on the way in.
+            case "LDELEM-R8":
+                _il.Emit(OpCodes.Ldelem_R8);
+                break;
+            case "LDELEM-R4":
+                _il.Emit(OpCodes.Ldelem_R4);
+                _il.Emit(OpCodes.Conv_R8);
+                break;
+            case "STELEM-R8":
+                _il.Emit(OpCodes.Stelem_R8);
+                break;
+            case "STELEM-R4":
+                _il.Emit(OpCodes.Conv_R4);
+                _il.Emit(OpCodes.Stelem_R4);
                 break;
             case "STELEM-I4":
                 _il.Emit(OpCodes.Conv_I4);
@@ -1096,6 +1271,26 @@ public partial class CilAssembler
             case "DEFMETHOD-NATIVE":
                 HandleDefmethodNative(c);
                 break;
+            case "DEFMETHOD-TYPED":
+                HandleDefmethodTyped(c);
+                break;
+            case "CALL-TYPED-SELF":
+                // A non-tail self-call in a typed entry's body: the receiver and
+                // the raw arguments are on the stack; the method being assembled
+                // is the callee.
+                _il.Emit(OpCodes.Call, _typedSelfMethod
+                    ?? throw new Exception("CALL-TYPED-SELF outside a typed entry body"));
+                break;
+            case "CALL-TYPED-ENTRY":
+            {
+                // (:call-typed-entry "LD>L"): a call to a global function through
+                // its typed entry. The LispFunction and the raw arguments are on
+                // the stack; the raw result is left.
+                var sig = GetString(Cadr(c));
+                _il.Emit(OpCodes.Ldc_I4, TypedEntrySig.Code(sig));
+                _il.Emit(OpCodes.Call, LispFunction.TypedInvokeMethod(sig));
+                break;
+            }
             case "MAKE-FUNCTION":
                 HandleMakeFunction(c);
                 break;
@@ -1454,18 +1649,18 @@ public partial class CilAssembler
         _il.Emit(OpCodes.Ldc_I4, AddUnitConstant(new OnceCell()));
         _il.Emit(OpCodes.Call, _getUnitConstant);
         _il.Emit(OpCodes.Castclass, typeof(OnceCell));
-        _il.Emit(OpCodes.Stloc, cellLocal);
-        _il.Emit(OpCodes.Ldloc, cellLocal);
+        _il.EmitLoc(OpCodes.Stloc, cellLocal);
+        _il.EmitLoc(OpCodes.Ldloc, cellLocal);
         _il.Emit(OpCodes.Ldfld, typeof(OnceCell).GetField(nameof(OnceCell.Value))!);
         _il.Emit(OpCodes.Dup);
         _il.Emit(OpCodes.Brtrue, done);
         _il.Emit(OpCodes.Pop);
         Assemble(body);
-        _il.Emit(OpCodes.Stloc, valueLocal);
-        _il.Emit(OpCodes.Ldloc, cellLocal);
-        _il.Emit(OpCodes.Ldloc, valueLocal);
+        _il.EmitLoc(OpCodes.Stloc, valueLocal);
+        _il.EmitLoc(OpCodes.Ldloc, cellLocal);
+        _il.EmitLoc(OpCodes.Ldloc, valueLocal);
         _il.Emit(OpCodes.Stfld, typeof(OnceCell).GetField(nameof(OnceCell.Value))!);
-        _il.Emit(OpCodes.Ldloc, valueLocal);
+        _il.EmitLoc(OpCodes.Ldloc, valueLocal);
         _il.MarkLabel(done);
     }
 
@@ -1481,6 +1676,7 @@ public partial class CilAssembler
         string? fnName = null;
         bool noFrame = false;
         string llShape = "";
+        LispObject? lambdaList = null;   // development info; see SetFaslLambdaList
 
         while (plist is Cons pc)
         {
@@ -1493,6 +1689,7 @@ public partial class CilAssembler
                 case "NAME": fnName = val is LispString s ? s.Value : null; break;
                 case "NO-FRAME": noFrame = true; break;
                 case "LL-SHAPE": llShape = val is LispString ls ? ls.Value : ""; break;
+                case "LAMBDA-LIST": lambdaList = val; break;
             }
             plist = Cddr(pc);
         }
@@ -1513,6 +1710,7 @@ public partial class CilAssembler
             innerAsm._faslTypeBuilder = _faslTypeBuilder;
             innerAsm._faslStructMap = _faslStructMap;
             AssembleFaslBody(method, innerAsm, bodyInstrs);
+            SetFaslLambdaList(method, lambdaList);
 
             // Push new LispFunction(delegate, name, arity)
             _il.Emit(OpCodes.Ldnull);
@@ -1541,6 +1739,7 @@ public partial class CilAssembler
             var del = (Func<LispObject[], LispObject>)dm.CreateDelegate(
                 typeof(Func<LispObject[], LispObject>));
             var fn = new LispFunction(del, fnName, paramCount);
+            if (lambdaList != null) fn.StoredLambdaList = InternLambdaList(lambdaList, null);
 
             // Push the function onto the stack (unit-scoped so a dropped compile
             // result is collectible: S5).
@@ -1558,6 +1757,7 @@ public partial class CilAssembler
         LispObject? bodyInstrs = null;
         string? fnName = null;
         bool noFrame = false;
+        LispObject? lambdaList = null;   // development info; see SetFaslLambdaList
 
         while (plist is Cons pc)
         {
@@ -1569,6 +1769,7 @@ public partial class CilAssembler
                 case "BODY": bodyInstrs = val; break;
                 case "NAME": fnName = val is LispString s ? s.Value : null; break;
                 case "NO-FRAME": noFrame = true; break;
+                case "LAMBDA-LIST": lambdaList = val; break;
             }
             plist = Cddr(pc);
         }
@@ -1613,6 +1814,7 @@ public partial class CilAssembler
             }
             wil.Emit(OpCodes.Call, bodyMethod);
             wil.Emit(OpCodes.Ret);
+            SetFaslLambdaList(wrapperMethod, lambdaList);
 
             // Push new LispFunction(delegate, name, arity)
             _il.Emit(OpCodes.Ldnull);
@@ -1659,6 +1861,7 @@ public partial class CilAssembler
         int before = _currentUnitDms?.Count ?? 0;
         innerAsm2.Assemble(bodyInstrs);
         bool mvEntry = BodyReadsMvMode(bodyInstrs);
+        var storedLambdaList = lambdaList != null ? InternLambdaList(lambdaList, null) : null;
 
         // Create array-based wrapper for backward compat (funcall, apply, etc.)
         // Wrapper includes arity check for proper error reporting
@@ -1675,6 +1878,7 @@ public partial class CilAssembler
                 fn._func0 = d;
                 if (noFrame) fn.SuppressDebugFrame();
                 if (mvEntry) fn.MarkMvModeEntry(paramCount);
+                fn.StoredLambdaList = storedLambdaList;
             PushUnitFunction(fn, before);
                 return;
             }
@@ -1688,6 +1892,7 @@ public partial class CilAssembler
                 fn._func1 = d;
                 if (noFrame) fn.SuppressDebugFrame();
                 if (mvEntry) fn.MarkMvModeEntry(paramCount);
+                fn.StoredLambdaList = storedLambdaList;
             PushUnitFunction(fn, before);
                 return;
             }
@@ -1701,6 +1906,7 @@ public partial class CilAssembler
                 fn._func2 = d;
                 if (noFrame) fn.SuppressDebugFrame();
                 if (mvEntry) fn.MarkMvModeEntry(paramCount);
+                fn.StoredLambdaList = storedLambdaList;
             PushUnitFunction(fn, before);
                 return;
             }
@@ -1714,6 +1920,7 @@ public partial class CilAssembler
                 fn._func3 = d;
                 if (noFrame) fn.SuppressDebugFrame();
                 if (mvEntry) fn.MarkMvModeEntry(paramCount);
+                fn.StoredLambdaList = storedLambdaList;
             PushUnitFunction(fn, before);
                 return;
             }
@@ -1727,6 +1934,7 @@ public partial class CilAssembler
                 fn._func4 = d;
                 if (noFrame) fn.SuppressDebugFrame();
                 if (mvEntry) fn.MarkMvModeEntry(paramCount);
+                fn.StoredLambdaList = storedLambdaList;
             PushUnitFunction(fn, before);
                 return;
             }
@@ -1764,6 +1972,7 @@ public partial class CilAssembler
                 }
                 if (noFrame) fn.SuppressDebugFrame();
                 if (mvEntry) fn.MarkMvModeEntry(paramCount);
+                fn.StoredLambdaList = storedLambdaList;
             PushUnitFunction(fn, before);
                 return;
             }
@@ -2253,6 +2462,15 @@ public partial class CilAssembler
             default: throw new Exception("unreachable");
         }
 
+        FinishInMemoryDefmethod(fn, name, defPkg, lambdaList, noFrame, bodyInstrs);
+    }
+
+    // The part of a DEFMETHOD-NATIVE / DEFMETHOD-TYPED in memory that comes after the
+    // LispFunction is built: development info, the debugger-frame policy, the saved
+    // SIL and the registration on the name.
+    private void FinishInMemoryDefmethod(LispFunction fn, string name, string? defPkg,
+        LispObject? lambdaList, bool noFrame, LispObject bodyInstrs)
+    {
         if (lambdaList != null)
             fn.StoredLambdaList = InternLambdaList(lambdaList, defPkg != null ? Package.FindPackage(defPkg) : null);
         if (noFrame) fn.SuppressDebugFrame();
@@ -2339,6 +2557,7 @@ public partial class CilAssembler
         LispObject? envMap = null;
         bool direct = false;
         string fnName = "";
+        LispObject? lambdaList = null;   // development info; see SetFaslLambdaList
 
         while (plist is Cons pc)
         {
@@ -2346,6 +2565,7 @@ public partial class CilAssembler
             var val = Cadr(pc);
             switch (key)
             {
+                case "LAMBDA-LIST": lambdaList = val; break;
                 case "PARAM-COUNT": paramCount = GetInt(val); break;
                 case "ENV-SIZE": envSize = GetInt(val); break;
                 case "ENV-MAP": envMap = val; break;
@@ -2438,21 +2658,38 @@ public partial class CilAssembler
             if (faslDirect) innerAsm._directParams = true;
             else if (direct) EmitDirectFallbackArityCheck(innerAsm._il, fnName, paramCount);
             AssembleFaslBody(closureMethod, innerAsm, bodyInstrs);
+            SetFaslLambdaList(closureMethod, lambdaList);
 
             // Stack has: object[] env
             // First store env in a local, then build delegate
             var envLocal = _il.DeclareLocal(typeof(object[]));
-            _il.Emit(OpCodes.Stloc, envLocal);
+            _il.EmitLoc(OpCodes.Stloc, envLocal);
 
             var closureDelType = faslDirect
                 ? DirectClosureDelegateType(paramCount)
                 : typeof(Func<object[], LispObject[], LispObject>);
+            // The body delegate is over a static method with no target, so one
+            // per code site serves every closure the site makes: it is kept in a
+            // static field of the FASL type and built the first time. Building it
+            // per closure was a 64-byte delegate on top of every closure. Racing
+            // threads may build two and store either; both are equivalent, as for
+            // the in-process closure-delegate cache.
+            var delField = _faslTypeBuilder.DefineField($"closure_del_{closureId}",
+                closureDelType, FieldAttributes.Public | FieldAttributes.Static);
+            var haveDel = _il.DefineLabel();
+            _il.Emit(OpCodes.Ldsfld, delField);
+            _il.Emit(OpCodes.Dup);
+            _il.Emit(OpCodes.Brtrue, haveDel);
+            _il.Emit(OpCodes.Pop);
             _il.Emit(OpCodes.Ldnull);
             _il.Emit(OpCodes.Ldftn, closureMethod);
             _il.Emit(OpCodes.Newobj,
                 closureDelType.GetConstructor(new[] { typeof(object), typeof(IntPtr) })!);
+            _il.Emit(OpCodes.Dup);
+            _il.Emit(OpCodes.Stsfld, delField);
+            _il.MarkLabel(haveDel);
 
-            _il.Emit(OpCodes.Ldloc, envLocal);
+            _il.EmitLoc(OpCodes.Ldloc, envLocal);
             if (faslDirect)
             {
                 // LispFunction.MakeDirectClosure(del, env, fnName): the same
@@ -2492,6 +2729,7 @@ public partial class CilAssembler
             innerAsm._lispboxEnvSlots = lispboxSlots;
             innerAsm._directParams = true;
             innerAsm.Assemble(bodyInstrs);
+            RecordClosureLambdaList(dm, lambdaList);
 
             int dmIdx = AddUnitConstant(dm);
 
@@ -2520,6 +2758,7 @@ public partial class CilAssembler
             // ever disagree) must get its omitted arity check back.
             if (direct) EmitDirectFallbackArityCheck(innerAsm._il, fnName, paramCount);
             innerAsm.Assemble(bodyInstrs);
+            RecordClosureLambdaList(dm, lambdaList);
 
             // Store DynamicMethod in this compilation unit's holder rather
             // than the global constant pool, so the closure body DM is reclaimed
@@ -2652,12 +2891,24 @@ public partial class CilAssembler
     // to the unboxed value for value types (via `unbox`). For value types the
     // caller must prefix the call with `constrained. type` so both the value type's
     // own methods and inherited virtuals (ToString, ...) dispatch correctly.
-    private bool EmitDirectReceiver(LocalBuilder recv, Type type)
+    // The exception is a non-virtual method declared on a reference type
+    // (Object.GetType, Enum.HasFlag): its `this` is an object reference, and the
+    // receiver's value is already one (the boxed value), so it is passed as is.
+    private bool EmitDirectReceiver(LocalBuilder recv, Type type, MethodInfo method)
     {
-        _il.Emit(OpCodes.Ldloc, recv);
+        _il.EmitLoc(OpCodes.Ldloc, recv);
         _il.Emit(OpCodes.Castclass, typeof(LispDotNetObject));
         _il.Emit(OpCodes.Callvirt, typeof(LispDotNetObject).GetMethod("get_Value")!);
-        if (type.IsValueType) { _il.Emit(OpCodes.Unbox, type); return true; }
+        if (type.IsValueType)
+        {
+            if (!method.IsVirtual && method.DeclaringType is { IsValueType: false } declaring)
+            {
+                _il.Emit(OpCodes.Castclass, declaring);
+                return false;
+            }
+            _il.Emit(OpCodes.Unbox, type);
+            return true;
+        }
         _il.Emit(OpCodes.Castclass, type);
         return false;
     }
@@ -2686,7 +2937,7 @@ public partial class CilAssembler
         _il.Emit(OpCodes.Ldc_I4, 2 + args.Count);
         _il.Emit(OpCodes.Newarr, typeof(LispObject));
         _il.Emit(OpCodes.Dup); _il.Emit(OpCodes.Ldc_I4, 0);
-        _il.Emit(OpCodes.Ldloc, recv); _il.Emit(OpCodes.Stelem_Ref);
+        _il.EmitLoc(OpCodes.Ldloc, recv); _il.Emit(OpCodes.Stelem_Ref);
         _il.Emit(OpCodes.Dup); _il.Emit(OpCodes.Ldc_I4, 1);
         _il.Emit(OpCodes.Ldstr, methodName);
         _il.Emit(OpCodes.Newobj, typeof(LispString).GetConstructor(new[] { typeof(string) })!);
@@ -2694,7 +2945,7 @@ public partial class CilAssembler
         for (int i = 0; i < args.Count; i++)
         {
             _il.Emit(OpCodes.Dup); _il.Emit(OpCodes.Ldc_I4, 2 + i);
-            _il.Emit(OpCodes.Ldloc, args[i]); _il.Emit(OpCodes.Stelem_Ref);
+            _il.EmitLoc(OpCodes.Ldloc, args[i]); _il.Emit(OpCodes.Stelem_Ref);
         }
         _il.Emit(OpCodes.Call, typeof(Runtime).GetMethod("DotNetInvoke", new[] { typeof(LispObject[]) })!);
     }
@@ -2707,7 +2958,7 @@ public partial class CilAssembler
         // lookup / InvokeMember. Falls back to the dynamic path when the target
         // can't be resolved directly (see ResolveDirectTarget).
         var recvTmp = _il.DeclareLocal(typeof(LispObject));
-        _il.Emit(OpCodes.Stloc, recvTmp);
+        _il.EmitLoc(OpCodes.Stloc, recvTmp);
 
         var method = ResolveDirectTarget(typeName, methodName, Type.EmptyTypes, out var type);
         if (method == null || type == null)
@@ -2716,7 +2967,7 @@ public partial class CilAssembler
             return;
         }
 
-        bool valueRecv = EmitDirectReceiver(recvTmp, type);
+        bool valueRecv = EmitDirectReceiver(recvTmp, type, method);
         EmitTypedInstanceCall(method, valueRecv, type);
         EmitDotnetResultMarshal(method);
     }
@@ -2765,19 +3016,25 @@ public partial class CilAssembler
         }
 
         // Typed receiver (reference: cast; value type: unbox + constrained. call).
-        bool valueRecv = EmitDirectReceiver(GetLocal(recvLocal), type);
+        bool valueRecv = EmitDirectReceiver(GetLocal(recvLocal), type, method);
 
-        // Each argument straight from its local: Runtime.LispToDotNet(arg, paramTypes[i]).
+        // Each argument straight from its local, marshalled to the type the
+        // resolved method declares: Runtime.LispToDotNet(arg, declared). The
+        // argument's own static type can differ -- a value passed to an Object /
+        // Enum / interface parameter, or an Int16 to an Int64 one -- and the
+        // value on the stack has to be what the parameter takes.
         var lispToDotNet = typeof(Runtime).GetMethod("LispToDotNet", new[] { typeof(LispObject), typeof(Type) })!;
         var getTypeFromHandle = typeof(Type).GetMethod("GetTypeFromHandle", new[] { typeof(RuntimeTypeHandle) })!;
+        var declaredParams = method.GetParameters();
         for (int i = 0; i < paramTypes.Length; i++)
         {
-            _il.Emit(OpCodes.Ldloc, GetLocal(argLocalNames[i]));
-            _il.Emit(OpCodes.Ldtoken, paramTypes[i]);
+            var declared = declaredParams[i].ParameterType;
+            _il.EmitLoc(OpCodes.Ldloc, GetLocal(argLocalNames[i]));
+            _il.Emit(OpCodes.Ldtoken, declared);
             _il.Emit(OpCodes.Call, getTypeFromHandle);
             _il.Emit(OpCodes.Call, lispToDotNet);
-            if (paramTypes[i].IsValueType) _il.Emit(OpCodes.Unbox_Any, paramTypes[i]);
-            else _il.Emit(OpCodes.Castclass, paramTypes[i]);
+            if (declared.IsValueType) _il.Emit(OpCodes.Unbox_Any, declared);
+            else _il.Emit(OpCodes.Castclass, declared);
         }
         EmitTypedInstanceCall(method, valueRecv, type);
         EmitDotnetResultMarshal(method);
@@ -3750,6 +4007,7 @@ public partial class CilAssembler
                     break;
                 case "BR": case "BRFALSE": case "BRTRUE": case "BEQ": case "BGT":
                 case "BLT": case "BGE": case "BLE": case "BNE": case "LEAVE":
+                case "BGE-UN": case "BGT-UN": case "BLE-UN": case "BLT-UN":
                     if (ins.Cdr is Cons t && t.Car is Symbol ts && seen.Contains(ts.Name))
                         return true;
                     break;
@@ -4221,9 +4479,9 @@ public partial class CilAssembler
                         tmpLocal = _il.DeclareLocal(typeof(LispObject));
                         _locals[tmpName] = tmpLocal;
                     }
-                    _il.Emit(OpCodes.Stloc, tmpLocal); // save cdr
+                    _il.EmitLoc(OpCodes.Stloc, tmpLocal); // save cdr
                     EmitLoadConstInline(cars[ci]);       // push car
-                    _il.Emit(OpCodes.Ldloc, tmpLocal);   // push cdr
+                    _il.EmitLoc(OpCodes.Ldloc, tmpLocal);   // push cdr
                     _il.Emit(OpCodes.Newobj, consCtor);
                 }
                 break;
@@ -5723,15 +5981,15 @@ public partial class CilAssembler
             };
             var acc = il.DeclareLocal(typeof(LispObject));
             il.Emit(OpCodes.Ldarg_0);
-            il.Emit(OpCodes.Stloc, acc);
+            il.EmitLoc(OpCodes.Stloc, acc);
             for (int i = end - 1; i >= start; i--)
             {
                 inner.EmitLoadConstInline(cars[i]);   // car
-                il.Emit(OpCodes.Ldloc, acc);          // cdr
+                il.EmitLoc(OpCodes.Ldloc, acc);          // cdr
                 il.Emit(OpCodes.Newobj, consCtor);
-                il.Emit(OpCodes.Stloc, acc);
+                il.EmitLoc(OpCodes.Stloc, acc);
             }
-            il.Emit(OpCodes.Ldloc, acc);
+            il.EmitLoc(OpCodes.Ldloc, acc);
             il.Emit(OpCodes.Ret);
             _il.Emit(OpCodes.Call, m);
         }
@@ -5748,7 +6006,7 @@ public partial class CilAssembler
     {
         int id = Interlocked.Increment(ref _faslClosureCount);
         var arrLocal = _il.DeclareLocal(typeof(LispObject[]));
-        _il.Emit(OpCodes.Stloc, arrLocal);
+        _il.EmitLoc(OpCodes.Stloc, arrLocal);
         int chunkId = 0;
         for (int start = 0; start < vecLen; start += MaxInlineListChunk, chunkId++)
         {
@@ -5772,10 +6030,10 @@ public partial class CilAssembler
                 il.Emit(OpCodes.Stelem_Ref);
             }
             il.Emit(OpCodes.Ret);
-            _il.Emit(OpCodes.Ldloc, arrLocal);
+            _il.EmitLoc(OpCodes.Ldloc, arrLocal);
             _il.Emit(OpCodes.Call, m);
         }
-        _il.Emit(OpCodes.Ldloc, arrLocal);
+        _il.EmitLoc(OpCodes.Ldloc, arrLocal);
     }
 
     /// <summary>
@@ -5874,13 +6132,13 @@ public partial class CilAssembler
         builderIl.Emit(OpCodes.Ldstr, ht.TestName);
         builderIl.Emit(OpCodes.Newobj, htCtor);
         var htLocal = builderIl.DeclareLocal(typeof(LispHashTable));
-        builderIl.Emit(OpCodes.Stloc, htLocal);
+        builderIl.EmitLoc(OpCodes.Stloc, htLocal);
         foreach (var chunkMethod in chunkMethods)
         {
-            builderIl.Emit(OpCodes.Ldloc, htLocal);
+            builderIl.EmitLoc(OpCodes.Ldloc, htLocal);
             builderIl.Emit(OpCodes.Call, chunkMethod);
         }
-        builderIl.Emit(OpCodes.Ldloc, htLocal);
+        builderIl.EmitLoc(OpCodes.Ldloc, htLocal);
         builderIl.Emit(OpCodes.Ret);
 
         // Call the builder method from the current context
@@ -6346,15 +6604,15 @@ public partial class CilAssembler
         if (ownName == null) _il.Emit(OpCodes.Ldnull);
         else _il.Emit(OpCodes.Ldstr, Track(ownName));
         EmitCall("DebugFrames.Enter");
-        _il.Emit(OpCodes.Stloc, _dbgFrame);
+        _il.EmitLoc(OpCodes.Stloc, _dbgFrame);
     }
 
     private void EmitFrameSet(string sourceName, string localName, string method)
     {
         if (_dbgFrame == null || !_locals.TryGetValue(localName, out var slot)) return;
-        _il.Emit(OpCodes.Ldloc, _dbgFrame);
+        _il.EmitLoc(OpCodes.Ldloc, _dbgFrame);
         _il.Emit(OpCodes.Ldstr, Track(sourceName));
-        _il.Emit(OpCodes.Ldloc, slot);
+        _il.EmitLoc(OpCodes.Ldloc, slot);
         EmitCall(method);
     }
 
@@ -6365,9 +6623,9 @@ public partial class CilAssembler
                                     bool convI4 = false)
     {
         if (_dbgFrame == null || !_locals.TryGetValue(localName, out var slot)) return;
-        _il.Emit(OpCodes.Ldloc, _dbgFrame);
+        _il.EmitLoc(OpCodes.Ldloc, _dbgFrame);
         _il.Emit(OpCodes.Ldstr, Track(sourceName));
-        _il.Emit(OpCodes.Ldloc, slot);
+        _il.EmitLoc(OpCodes.Ldloc, slot);
         // A character-code slot is an int64 (the width the comparison path
         // wants) and LispChar.Make takes a char, so it narrows first.
         if (convI4) _il.Emit(OpCodes.Conv_I4);
@@ -6385,6 +6643,7 @@ public partial class CilAssembler
     {
         if (_locals.ContainsKey(name)) return; // already declared
         var t = ResolveType(typeName);
+        if (TryDeclareSharedLocal(name, t)) return;
         var local = _il.DeclareLocal(t);
         _locals[name] = local;
     }
@@ -6511,6 +6770,12 @@ public partial class CilAssembler
             ["Runtime.MultiplyFixnum"] = typeof(Runtime).GetMethod("MultiplyFixnum")!,
             ["Runtime.AddFixnum"] = typeof(Runtime).GetMethod("AddFixnum")!,
             ["Runtime.AddFixnumChecked"] = typeof(Runtime).GetMethod("AddFixnumChecked")!,
+            ["Runtime.TypedArgL"] = typeof(Runtime).GetMethod("TypedArgL")!,
+            ["Runtime.TypedArgLR"] = typeof(Runtime).GetMethod("TypedArgLR")!,
+            ["Runtime.TypedArgD"] = typeof(Runtime).GetMethod("TypedArgD")!,
+            ["Runtime.TypedRetL"] = typeof(Runtime).GetMethod("TypedRetL")!,
+            ["Runtime.TypedRetD"] = typeof(Runtime).GetMethod("TypedRetD")!,
+            ["Runtime.CheckLongRange"] = typeof(Runtime).GetMethod("CheckLongRange")!,
             ["Runtime.SubtractFixnumChecked"] = typeof(Runtime).GetMethod("SubtractFixnumChecked")!,
             ["Runtime.MultiplyFixnumChecked"] = typeof(Runtime).GetMethod("MultiplyFixnumChecked")!,
             ["Runtime.SubtractFixnum"] = typeof(Runtime).GetMethod("SubtractFixnum")!,
@@ -6646,6 +6911,19 @@ public partial class CilAssembler
             // a negative argument means the declared type is wrong.
             ["Math.SqrtDouble"] = typeof(System.Math).GetMethod("Sqrt", new[] { typeof(double) })!,
             ["Runtime.SqrtDoubleChecked"] = typeof(Runtime).GetMethod("SqrtDoubleChecked")!,
+            // LOG of a declared double, under the same rule as SQRT.
+            ["Runtime.LogDouble"] = typeof(Runtime).GetMethod("LogDouble")!,
+            ["Runtime.LogDoubleChecked"] = typeof(Runtime).GetMethod("LogDoubleChecked")!,
+            // SIN, COS, ... of a declared double: a double for every double
+            // argument, the same System.Math call the generic entries make.
+            ["Math.SinDouble"] = typeof(System.Math).GetMethod("Sin", new[] { typeof(double) })!,
+            ["Math.CosDouble"] = typeof(System.Math).GetMethod("Cos", new[] { typeof(double) })!,
+            ["Math.TanDouble"] = typeof(System.Math).GetMethod("Tan", new[] { typeof(double) })!,
+            ["Math.AtanDouble"] = typeof(System.Math).GetMethod("Atan", new[] { typeof(double) })!,
+            ["Math.SinhDouble"] = typeof(System.Math).GetMethod("Sinh", new[] { typeof(double) })!,
+            ["Math.CoshDouble"] = typeof(System.Math).GetMethod("Cosh", new[] { typeof(double) })!,
+            ["Math.TanhDouble"] = typeof(System.Math).GetMethod("Tanh", new[] { typeof(double) })!,
+            ["Runtime.ExpDouble"] = typeof(Runtime).GetMethod("ExpDouble")!,
             ["Runtime.Mod"] = typeof(Runtime).GetMethod("Mod")!,
             ["Runtime.Rem"] = typeof(Runtime).GetMethod("Rem")!,
             ["Runtime.FloorOp"] = typeof(Runtime).GetMethod("FloorOp")!,
@@ -6671,6 +6949,22 @@ public partial class CilAssembler
             ["Runtime.IsU64"] = typeof(Runtime).GetMethod("IsU64")!,
             ["Runtime.BoxU64"] = typeof(Runtime).GetMethod("BoxU64")!,
             ["Runtime.ShrU64"] = typeof(Runtime).GetMethod("ShrU64")!,
+            ["Runtime.ReadU16LE"] = typeof(Runtime).GetMethod("ReadU16LE")!,
+            ["Runtime.ReadU16BE"] = typeof(Runtime).GetMethod("ReadU16BE")!,
+            ["Runtime.ReadU32LE"] = typeof(Runtime).GetMethod("ReadU32LE")!,
+            ["Runtime.ReadU32BE"] = typeof(Runtime).GetMethod("ReadU32BE")!,
+            ["Runtime.ReadU64LE"] = typeof(Runtime).GetMethod("ReadU64LE")!,
+            ["Runtime.ReadU64BE"] = typeof(Runtime).GetMethod("ReadU64BE")!,
+            ["Runtime.OctetWordRef"] = typeof(Runtime).GetMethod("OctetWordRef")!,
+            ["Runtime.OctetWordRefChecked"] = typeof(Runtime).GetMethod("OctetWordRefChecked")!,
+            ["Runtime.WriteU16LE"] = typeof(Runtime).GetMethod("WriteU16LE")!,
+            ["Runtime.WriteU16BE"] = typeof(Runtime).GetMethod("WriteU16BE")!,
+            ["Runtime.WriteU32LE"] = typeof(Runtime).GetMethod("WriteU32LE")!,
+            ["Runtime.WriteU32BE"] = typeof(Runtime).GetMethod("WriteU32BE")!,
+            ["Runtime.WriteU64LE"] = typeof(Runtime).GetMethod("WriteU64LE")!,
+            ["Runtime.WriteU64BE"] = typeof(Runtime).GetMethod("WriteU64BE")!,
+            ["Runtime.OctetWordSet"] = typeof(Runtime).GetMethod("OctetWordSet")!,
+            ["Runtime.OctetWordSetChecked"] = typeof(Runtime).GetMethod("OctetWordSetChecked")!,
             ["Runtime.ShlU64"] = typeof(Runtime).GetMethod("ShlU64")!,
             ["Runtime.Logand2"] = typeof(Runtime).GetMethod("Logand2")!,
             ["Runtime.Logxor2"] = typeof(Runtime).GetMethod("Logxor2")!,
@@ -6724,6 +7018,8 @@ public partial class CilAssembler
             // Runtime - sequence operations
             ["Runtime.Elt"] = typeof(Runtime).GetMethod("Elt")!,
             ["Runtime.Subseq"] = typeof(Runtime).GetMethod("Subseq")!,
+            ["Runtime.MakeArrayOfType"] = typeof(Runtime).GetMethod("MakeArrayOfType")!,
+            ["Runtime.ReplaceKeys"] = typeof(Runtime).GetMethod("ReplaceKeys")!,
             ["Runtime.Concatenate"] = typeof(Runtime).GetMethod("Concatenate")!,
             ["Runtime.Sort"] = typeof(Runtime).GetMethod("Sort")!,
             ["Runtime.StableSort"] = typeof(Runtime).GetMethod("StableSort")!,
@@ -6804,17 +7100,35 @@ public partial class CilAssembler
             ["Runtime.BackingI32"] = typeof(Runtime).GetMethod("BackingI32")!,
             ["Runtime.BackingU16"] = typeof(Runtime).GetMethod("BackingU16")!,
             ["Runtime.BackingU8"] = typeof(Runtime).GetMethod("BackingU8")!,
+            ["Runtime.BackingF64"] = typeof(Runtime).GetMethod("BackingF64")!,
+            ["Runtime.BackingF32"] = typeof(Runtime).GetMethod("BackingF32")!,
             // Above (safety 0): the same fetches, signalling on a non-simple array
             ["Runtime.BackingCharsChecked"] = typeof(Runtime).GetMethod("BackingCharsChecked")!,
             ["Runtime.BackingI64Checked"] = typeof(Runtime).GetMethod("BackingI64Checked")!,
             ["Runtime.BackingI32Checked"] = typeof(Runtime).GetMethod("BackingI32Checked")!,
             ["Runtime.BackingU16Checked"] = typeof(Runtime).GetMethod("BackingU16Checked")!,
             ["Runtime.BackingU8Checked"] = typeof(Runtime).GetMethod("BackingU8Checked")!,
+            ["Runtime.BackingF64Checked"] = typeof(Runtime).GetMethod("BackingF64Checked")!,
+            ["Runtime.BackingF32Checked"] = typeof(Runtime).GetMethod("BackingF32Checked")!,
+            // Above (safety 0), matching the element type's width as well
+            ["Runtime.BackingI64Narrow"] = typeof(Runtime).GetMethod("BackingI64Narrow")!,
+            ["Runtime.BackingI32Narrow"] = typeof(Runtime).GetMethod("BackingI32Narrow")!,
+            ["Runtime.BackingU16Narrow"] = typeof(Runtime).GetMethod("BackingU16Narrow")!,
+            ["Runtime.BackingU8Narrow"] = typeof(Runtime).GetMethod("BackingU8Narrow")!,
             ["Runtime.IsNonSimpleArray"] = typeof(Runtime).GetMethod("IsNonSimpleArray")!,
             ["Runtime.SignalDeclaredNotSimple"] = typeof(Runtime).GetMethod("SignalDeclaredNotSimple")!,
             ["Runtime.CheckStoreI32"] = typeof(Runtime).GetMethod("CheckStoreI32")!,
             ["Runtime.CheckStoreU16"] = typeof(Runtime).GetMethod("CheckStoreU16")!,
             ["Runtime.CheckStoreU8"] = typeof(Runtime).GetMethod("CheckStoreU8")!,
+            ["Runtime.CheckStoreUnsigned"] = typeof(Runtime).GetMethod("CheckStoreUnsigned")!,
+            ["Runtime.CheckStoreSigned"] = typeof(Runtime).GetMethod("CheckStoreSigned")!,
+            // (unsigned-byte 64) elements as their bits (kind 11)
+            ["Runtime.BackingU64"] = typeof(Runtime).GetMethod("BackingU64")!,
+            ["Runtime.BackingU64Checked"] = typeof(Runtime).GetMethod("BackingU64Checked")!,
+            ["Runtime.ArefU64Bits"] = typeof(Runtime).GetMethod("ArefU64Bits")!,
+            ["Runtime.ArefSetU64Bits"] = typeof(Runtime).GetMethod("ArefSetU64Bits")!,
+            ["Runtime.U64Bits"] = typeof(Runtime).GetMethod("U64Bits")!,
+            ["Runtime.CheckStoreU64"] = typeof(Runtime).GetMethod("CheckStoreU64")!,
             ["Runtime.ArefSetNumL"] = typeof(Runtime).GetMethod("ArefSetNumL")!,
             ["Runtime.ArefNum2DL"] = typeof(Runtime).GetMethod("ArefNum2DL")!,
             ["Runtime.ArefSetNum2DL"] = typeof(Runtime).GetMethod("ArefSetNum2DL")!,
@@ -6851,6 +7165,10 @@ public partial class CilAssembler
             ["Runtime.StructRawBacking"] = typeof(Runtime).GetMethod("StructRawBacking")!,
             ["Runtime.RawBitsToDouble"] = typeof(Runtime).GetMethod("RawBitsToDouble")!,
             ["Runtime.RawDoubleToBits"] = typeof(Runtime).GetMethod("RawDoubleToBits")!,
+            ["Runtime.RawBitsToSingle"] = typeof(Runtime).GetMethod("RawBitsToSingle")!,
+            ["Runtime.RawSingleToBits"] = typeof(Runtime).GetMethod("RawSingleToBits")!,
+            ["Runtime.StructRefF"] = typeof(Runtime).GetMethod("StructRefF")!,
+            ["Runtime.StructSetF"] = typeof(Runtime).GetMethod("StructSetF")!,
             ["Runtime.StructSet"] = typeof(Runtime).GetMethod("StructSet")!,
             ["Runtime.StructSetI"] = typeof(Runtime).GetMethod("StructSetI")!,
             ["Runtime.CheckSlotType"] = typeof(Runtime).GetMethod("CheckSlotType")!,
@@ -7072,6 +7390,8 @@ public partial class CilAssembler
             ["Runtime.WriteString"] = typeof(Runtime).GetMethod("WriteString", new[] { typeof(LispObject[]) })!,
             ["Runtime.WriteLine"] = typeof(Runtime).GetMethod("WriteLine", new[] { typeof(LispObject[]) })!,
             ["Runtime.FixnumGeObject"] = typeof(Runtime).GetMethod("FixnumGeObject")!,
+            ["Runtime.DotimesLimit"] = typeof(Runtime).GetMethod("DotimesLimit")!,
+            ["Runtime.LoopLimitFloor"] = typeof(Runtime).GetMethod("LoopLimitFloor")!,
             ["MultipleValues.Values0"] = typeof(MultipleValues).GetMethod("Values0")!,
             ["MultipleValues.CaptureForBind"] = typeof(MultipleValues).GetMethod("CaptureForBind")!,
             ["MultipleValues.BindNth"] = typeof(MultipleValues).GetMethod("BindNth")!,
@@ -7300,6 +7620,8 @@ public partial class CilAssembler
             ["UInt16[]"] = typeof(ushort[]),
             ["Char[]"] = typeof(char[]),
             ["Byte[]"] = typeof(byte[]),
+            ["Double[]"] = typeof(double[]),
+            ["Single[]"] = typeof(float[]),
             ["Double"] = typeof(double),
             ["Single"] = typeof(float),
             // A local slot holding a raw System.Decimal, for the declared-decimal

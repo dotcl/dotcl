@@ -22,7 +22,7 @@
 
 (setf dotcl:*save-sil* t)
 
-(defun %fpn-sil (fn) (princ-to-string (dotcl:function-sil fn)))
+(defun %fpn-sil (fn) (%flat-text (dotcl:function-sil fn)))
 
 (defun %fpn-count (needle s)
   (let ((k 0) (p 0))
@@ -69,15 +69,15 @@
 ;;; values below are the part that is a statement about the language, and they
 ;;; keep running everywhere.
 
-;; Both subtractions are native now, and the only box left is the one the
-;; function has to pay to return N from the base case.
+;; Both subtractions are native, and nothing is boxed: the FTYPE gives the
+;; function a typed entry, whose body returns N from the base case raw.
 (deftest-emitting-only fixnum-param-native-arith.ftype-fib-is-native
   (let ((d (%fpn-sil #'%fpn-fib-ftype)))
     (list (%fpn-count "Fixnum.Make" d)
           (%fpn-count "Runtime.Decrement" d)
           (%fpn-count "Runtime.Subtract)" d)
           (%fpn-count "Runtime.SubtractFixnum" d)))
-  (1 0 0 2))
+  (0 0 0 2))
 
 ;; A body declaration without the FTYPE reaches the same native subtractions:
 ;; the declaration is what makes the slot raw, and the FTYPE only adds the
@@ -130,11 +130,24 @@
 
 ;; The promoting helper is the whole reason the proof can be skipped: an int64
 ;; overflow must become a bignum, never a wrapped negative.
+(defun %fpn-sub2-nf (a b) (declare (fixnum a b)) (- a b))
+(defun %fpn-add2-nf (a b) (declare (fixnum a b)) (+ a b))
+(defun %fpn-mul2-nf (a b) (declare (fixnum a b)) (* a b))
+
 (deftest fixnum-param-native-arith.overflow-promotes-not-wraps
-  (list (%fpn-add2 9223372036854775807 1)
-        (%fpn-sub2 -9223372036854775808 1)
-        (%fpn-mul2 4611686018427387904 4))
+  (list (%fpn-add2-nf 9223372036854775807 1)
+        (%fpn-sub2-nf -9223372036854775808 1)
+        (%fpn-mul2-nf 4611686018427387904 4))
   (9223372036854775808 -9223372036854775809 18446744073709551616))
+
+;; With the FTYPE the result is declared FIXNUM, and at the default safety a
+;; result outside it is a TYPE-ERROR -- still never a wrapped value.
+(deftest-compiled-only fixnum-param-native-arith.ftype-overflow-signals-not-wraps
+  (mapcar (lambda (thunk) (handler-case (funcall thunk) (type-error () :type-error)))
+          (list (lambda () (%fpn-add2 9223372036854775807 1))
+                (lambda () (%fpn-sub2 -9223372036854775808 1))
+                (lambda () (%fpn-mul2 4611686018427387904 4))))
+  (:type-error :type-error :type-error))
 
 (deftest fixnum-param-native-arith.nested-value
   (list (%fpn-nested 3 4) (%fpn-nested 1000000007 1000000009))

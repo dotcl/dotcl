@@ -18,7 +18,7 @@
   "True when FN's SIL still declares the self-fn local, i.e. still looks the self
    LispFunction up on entry. Keyed on the SELF-FN local rather than on
    GetFunctionBySymbol, which any ordinary call to another function also emits."
-  (and (search "SELF-FN" (princ-to-string (dotcl:function-sil fn))) t))
+  (and (search "SELF-FN" (%flat-text (dotcl:function-sil fn))) t))
 
 ;;; ---- the prelude is gone where nothing reads it ----
 

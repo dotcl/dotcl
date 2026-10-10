@@ -1229,37 +1229,84 @@ public static partial class Runtime
 
     /// <summary>
     /// Column the destination stream is currently at, for ~T tabulation.
-    /// A gray output stream answers via the stream-line-column generic
-    /// (NIL / no method / non-integer all mean "unknown" = 0). Built-in
-    /// streams don't track columns, so they report 0 (CLHS 22.3.6.1 allows
-    /// assuming column 0 when it cannot be determined).
+    /// 0 when it cannot be determined (CLHS 22.3.6.1 allows assuming column 0).
     /// </summary>
-    private static int StreamInitialColumn(LispObject resolved)
+    private static int StreamInitialColumn(LispObject resolved) => StreamColumn(resolved) ?? 0;
+
+    /// <summary>
+    /// The column STREAM is at: the number of characters written since the
+    /// last newline, or null when it is not known. A composite stream asks the
+    /// stream it writes to; a broadcast stream answers for its first component
+    /// that knows (as SBCL). A gray output stream answers via STREAM-LINE-COLUMN
+    /// (NIL / no method / non-integer all mean unknown).
+    /// </summary>
+    internal static int? StreamColumn(LispObject stream)
     {
-        if (resolved is LispInstance gi && IsGrayOutputStream(gi))
+        for (int depth = 0; depth < 64; depth++)
         {
-            try
+            switch (stream)
             {
-                var fn = GrayStreamLookup.GrayOrCl("STREAM-LINE-COLUMN");
-                if (fn != null && fn.Invoke(new LispObject[] { gi }) is Fixnum col && col.Value >= 0)
-                    return (int)col.Value;
-            }
-            catch (LispErrorException)
-            {
-                // no applicable method: column unknown
+                // A string output stream holds its line: the column is the length
+                // of its text after the last newline.
+                case LispStringOutputStream sos:
+                {
+                    var text = ((System.IO.StringWriter)sos.Writer).GetStringBuilder();
+                    int col = 0;
+                    int k = text.Length - 1;
+                    for (; k >= 0 && text[k] != '\n'; k--) col++;
+                    return k < 0 ? sos.StartColumn + col : col;
+                }
+                case LispOutputStream os: return WriterColumn(os.Writer);
+                case LispFileStream fs: return fs.OutputWriter is IColumnWriter fcw ? fcw.Column : null;
+                case LispBidirectionalStream bidi: return WriterColumn(bidi.Writer);
+                case LispTwoWayStream tws: stream = tws.OutputStream; continue;
+                case LispEchoStream es: stream = es.OutputStream; continue;
+                case LispSynonymStream syn: stream = DynamicBindings.Get(syn.Symbol); continue;
+                case LispBroadcastStream bc:
+                    if (bc.Streams.Length == 0) return 0;
+                    foreach (var c in bc.Streams)
+                        if (StreamColumn(c) is int bcol) return bcol;
+                    return null;
+                case LispInstance gi when IsGrayOutputStream(gi):
+                    return GrayLineColumn(gi);
+                default: return null;
             }
         }
-        // A string output stream holds its line: the column is the length of
-        // its text after the last newline.
-        if (resolved is LispStringOutputStream sos)
+        return null;
+    }
+
+    /// <summary>The column a writer is at, when it knows (see StreamColumn).</summary>
+    internal static int? WriterColumn(System.IO.TextWriter? w)
+    {
+        switch (w)
         {
-            var text = ((System.IO.StringWriter)sos.Writer).GetStringBuilder();
-            int col = 0;
-            int k = text.Length - 1;
-            for (; k >= 0 && text[k] != '\n'; k--) col++;
-            return k < 0 ? sos.StartColumn + col : col;
+            case IColumnWriter cw: return cw.Column;
+            case System.IO.StringWriter sw:
+            {
+                var sb = sw.GetStringBuilder();
+                int k = sb.Length - 1;
+                while (k >= 0 && sb[k] != '\n') k--;
+                return sb.Length - k - 1;
+            }
+            case BroadcastTextWriter bw: return bw.Column;
+            case GrayStreamTextWriter gw: return GrayLineColumn(gw.Stream);
+            default: return null;
         }
-        return 0;
+    }
+
+    private static int? GrayLineColumn(LispInstance gi)
+    {
+        try
+        {
+            var fn = GrayStreamLookup.GrayOrCl("STREAM-LINE-COLUMN");
+            if (fn != null && fn.Invoke(new LispObject[] { gi }) is Fixnum col && col.Value >= 0)
+                return (int)col.Value;
+        }
+        catch (LispErrorException)
+        {
+            // no applicable method: column unknown
+        }
+        return null;
     }
 
     /// <summary>
@@ -2626,7 +2673,18 @@ public static partial class Runtime
                         // ~? needs the control string; ~? also needs the argument list
                         // after it. Neither was checked, so (format nil "~?") printed nothing.
                         if (argIdx >= args.Length) MissingFormatArg(directive);
-                        if (argIdx < args.Length && args[argIdx] is LispString fmtStr)
+                        // The control string may be any string, including one
+                        // with a fill pointer (as a reader builds), not only a
+                        // simple string.
+                        string? subControl = argIdx < args.Length
+                            ? args[argIdx] switch
+                            {
+                                LispString s => s.Value,
+                                LispVector v when v.IsCharVector => v.ToCharString(),
+                                _ => null
+                            }
+                            : null;
+                        if (subControl != null)
                         {
                             argIdx++;
                             if (atMod)
@@ -2635,7 +2693,7 @@ public static partial class Runtime
                                 // ~^ inside ~@? terminates the recursive processing only
                                 try
                                 {
-                                    PprintStageFlush(sb); sb.Append(FormatString(fmtStr.Value, args, ref argIdx));
+                                    PprintStageFlush(sb); sb.Append(FormatString(subControl, args, ref argIdx));
                                 }
                                 catch (FormatUpAndOutException ex) { sb.Append(ex.PartialOutput); }
                             }
@@ -2652,7 +2710,7 @@ public static partial class Runtime
                                 }
                                 try
                                 {
-                                    PprintStageFlush(sb); sb.Append(FormatString(fmtStr.Value, subArgs.ToArray()));
+                                    PprintStageFlush(sb); sb.Append(FormatString(subControl, subArgs.ToArray()));
                                 }
                                 catch (FormatUpAndOutException ex) { sb.Append(ex.PartialOutput); }
                             }

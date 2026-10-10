@@ -18,12 +18,14 @@
 # packaging rather than the targets. The paths are the ones the targets compute
 # from MSBuildThisFileDirectory, so a change to that layout breaks this too.
 #
-# Three cases. The first two go together, and the second is the one worth
+# Four cases. The first two go together, and the second is the one worth
 # having. A build that fails must say what to do next: a dependency that cannot
 # be found is the first wall a new user hits, and the remedy (DotclAsdSearchPath)
-# is a build property they have no reason to know about. The third publishes
+# is a build property they have no reason to know about. [2b] rebuilds that
+# project unchanged and then edited: only the edit recompiles the root. The third publishes
 # trimmed and runs the result: the .NET types the Lisp sources name have to
-# survive the trimmer without the project listing them by hand.
+# survive the trimmer without the project listing them by hand. The fourth
+# depends on a contrib stub (dotcl-thread) and runs the result.
 #
 # Usage: check.sh <repo-root>
 set -eu
@@ -133,6 +135,36 @@ echo "=== [2] the remedy the message names ==="
 emit_csproj "<DotclAsdSearchPath Include=\"$(win "$WORK/ext")\" />"
 if dotnet build "$(win "$WORK/app/app.csproj")" -c Debug --nologo > "$WORK/build2.log" 2>&1; then
   echo "  PASS: adding DotclAsdSearchPath builds the project"
+
+  echo "=== [2b] a second build with nothing changed does not recompile the root ==="
+  # The root compile is incremental on its Inputs. A directory among them (the
+  # search path) counts as a missing input file to MSBuild, which then runs the
+  # target on every build. A source edit must still recompile it.
+  # Where the bundle dir lands depends on how the targets are imported (this
+  # layout imports them before IntermediateOutputPath is set), so look for it.
+  root_fasl="$(find "$WORK/app" -name app.fasl ! -path '*/bin/*' | head -1)"
+  stamp="$WORK/stamp2"
+  sleep 1; touch "$stamp"
+  if dotnet build "$(win "$WORK/app/app.csproj")" -c Debug --nologo > "$WORK/build2b.log" 2>&1; then
+    if [ -z "$root_fasl" ] || [ ! -f "$root_fasl" ]; then
+      note "no root fasl after the first build"
+    elif [ -n "$(find "$root_fasl" -newer "$stamp")" ]; then
+      note "the root was recompiled although nothing changed"
+    else
+      echo "  PASS: the unchanged root is not recompiled"
+    fi
+    sleep 1; touch "$stamp"; sleep 1
+    echo '(defun run2 () (run))' >> "$WORK/app/app.lisp"
+    if dotnet build "$(win "$WORK/app/app.csproj")" -c Debug --nologo > "$WORK/build2c.log" 2>&1 \
+       && [ -n "$(find "$root_fasl" -newer "$stamp")" ]; then
+      echo "  PASS: editing a root source recompiles the root"
+    else
+      note "editing a root source did not recompile the root"
+    fi
+  else
+    note "the second build failed"
+    tail -20 "$WORK/build2b.log"
+  fi
 else
   note "the project does not build even with DotclAsdSearchPath set"
   tail -20 "$WORK/build2.log"
@@ -202,6 +234,74 @@ if dotnet publish "$(win "$WORK/trim/trimapp.csproj")" -c Release -r "$RID" --se
 else
   note "the trimmed publish failed"
   tail -20 "$WORK/publish3.log"
+fi
+
+echo "=== [4] a dependency on a contrib stub is loaded at build time and at start ==="
+# dotcl-thread's .asd is a REQUIRE-SYSTEM stub with no components. The dependency
+# reads its package, so the build has to REQUIRE it before compiling that, and
+# the manifest has to say "require dotcl-thread" ahead of the dependency's fasl,
+# or the application fails to start with Package "DOTCL-THREAD" not found.
+mkdir -p "$WORK/ctr/ext" "$WORK/ctr/app"
+cat > "$WORK/ctr/ext/ctrext.asd" <<'EOF'
+(defsystem "ctrext" :depends-on ("dotcl-thread") :components ((:file "ctrext")))
+EOF
+cat > "$WORK/ctr/ext/ctrext.lisp" <<'EOF'
+(defpackage :ctrext (:use :cl) (:export #:probe))
+(in-package :ctrext)
+(defun probe () (if (fboundp 'dotcl-thread:make-thread) "threads" "none"))
+EOF
+cat > "$WORK/ctr/app/ctrapp.asd" <<'EOF'
+(defsystem "ctrapp" :depends-on ("ctrext") :components ((:file "ctrapp")))
+EOF
+cat > "$WORK/ctr/app/ctrapp.lisp" <<'EOF'
+(defpackage :ctrapp (:use :cl) (:export #:run))
+(in-package :ctrapp)
+(defun run () (ctrext:probe))
+EOF
+cat > "$WORK/ctr/app/Program.cs" <<'EOF'
+static class P
+{
+    static void Main()
+    {
+        DotCL.DotclHost.Initialize();
+        DotCL.DotclHost.LoadFromManifest(System.IO.Path.Combine(
+            System.AppContext.BaseDirectory, "dotcl-fasl", "dotcl-deps.txt"));
+        System.Console.WriteLine("result: " + DotCL.DotclHost.Call("CTRAPP:RUN"));
+    }
+}
+EOF
+# The contrib tree beside the application is what DotCL.Runtime.targets copies
+# for a package consumer; this layout imports only the project-core targets.
+cat > "$WORK/ctr/app/ctrapp.csproj" <<CSPROJEOF
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <AssemblyName>pcbctr</AssemblyName>
+    <DotclProjectAsd>\$(MSBuildProjectDirectory)/ctrapp.asd</DotclProjectAsd>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="$(win "$ROOT/runtime/DotCL.Runtime.csproj")" />
+    <DotclAsdSearchPath Include="$(win "$WORK/ctr/ext")" />
+    <None Include="$(win "$PKG/dotclassets/contrib")/**/*"
+          Link="contrib/%(RecursiveDir)%(Filename)%(Extension)"
+          CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+  <Import Project="$(win "$PKG/build/DotCL.Runtime.ProjectCore.targets")" />
+</Project>
+CSPROJEOF
+if dotnet build "$(win "$WORK/ctr/app/ctrapp.csproj")" -c Debug --nologo > "$WORK/build4.log" 2>&1; then
+  exe="$WORK/ctr/app/bin/Debug/net10.0/pcbctr"
+  [ -f "$exe.exe" ] && exe="$exe.exe"
+  out="$("$exe" < /dev/null 2>&1 || true)"
+  case "$out" in
+    *'result: "threads"'*) echo "  PASS: the contrib is required at build time and at start" ;;
+    *) note "the application did not start with the contrib loaded"; echo "$out" | head -5 ;;
+  esac
+else
+  note "the project with a contrib dependency did not build"
+  tail -20 "$WORK/build4.log"
 fi
 
 if [ "$fail" -eq 0 ]; then

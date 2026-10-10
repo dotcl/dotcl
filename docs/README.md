@@ -47,8 +47,12 @@ Guides and reference for dotcl: Common Lisp for .NET applications.
 - [Writing scripts](scripting.md): arguments, exit codes, shebang, and how
   `--load` differs from a positional file
 - [Packaging an app](dotcl-pack.md): turn an ASDF system into a dotnet tool
+- [Portable fasls](portable-fasls.md): writing a library whose packaged fasls
+  are correct on every OS and CPU, and a check that finds where they might not be
 - [Deliberate deviations](deviations.md): where dotcl knowingly differs from
   the standard or from SBCL, and why
+- [Extensions](extensions.md): everything beyond the standard, one line each:
+  the `dotnet` and `dotcl` packages and the modules `require` loads
 
 ## Examples
 

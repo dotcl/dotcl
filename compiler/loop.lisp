@@ -1862,6 +1862,7 @@ collected result will be returned as the value of the LOOP."
 	 (limit-given nil)			;T when prep phrase has specified end
 	 (limit-constantp nil)
 	 (limit-value nil)
+	 (limit-form nil)			;dotcl: the limit form, when bound to a variable.
 	 )
      (when variable (loop-make-iteration-variable variable nil variable-type))
      (do ((l prep-phrases (cdr l)) (prep) (form) (odir)) ((null l))
@@ -1886,10 +1887,13 @@ collected result will be returned as the value of the LOOP."
 	  (setq limit-given t)
 	  (multiple-value-setq (form limit-constantp limit-value)
 	    (loop-constant-fold-if-possible form indexv-type))
+	  ;; dotcl: a number is written as itself, not quoted, so the end
+	  ;; test is a comparison with a literal the compiler can type.
 	  (setq endform (if limit-constantp
-			    `',limit-value
-			    (loop-make-variable
-			      (loop-gentemp 'loop-limit-) form indexv-type))))
+			    (if (numberp limit-value) limit-value `',limit-value)
+			    (progn (setq limit-form form)
+				   (loop-make-variable
+				     (loop-gentemp 'loop-limit-) form indexv-type)))))
 	 (:by
 	   (multiple-value-setq (form stepby-constantp stepby)
 	     (loop-constant-fold-if-possible form indexv-type))
@@ -1926,6 +1930,48 @@ collected result will be returned as the value of the LOOP."
 		(setq endform (loop-typed-init indexv-type) inclusive-iteration t))
 	      (when endform (setq testfn (if inclusive-iteration  '< '<=)))
 	      (setq step (if (eql stepby 1) `(1- ,indexv) `(- ,indexv ,stepby)))))
+     ;; dotcl: an integer counter with a limit is a counting variable. The
+     ;; declaration lets the compiler bound it by the start and the limit
+     ;; (%INDUCTION-RANGE in the compiler), which it does only when nothing
+     ;; but this step, written with the marker, assigns the variable.
+     (when (and indexv (symbolp indexv) testfn limit-given
+		stepby-constantp (integerp stepby) (plusp stepby)
+		(if limit-constantp (integerp limit-value) (symbolp endform)))
+       (let ((delta (if (member dir '(nil :up)) stepby (- stepby))))
+	 (setq step `(dotcl.cil-compiler::%induction-next ,indexv ,delta))
+	 (push `(dotcl.cil-compiler::%induction ,indexv ,delta ,(if limit-constantp limit-value endform)
+			    ,(if inclusive-iteration t nil))
+	       *loop-declarations*)))
+     ;; dotcl: an integer counter starting at a constant and moving by a small
+     ;; constant step towards a limit computed at run time is a fixnum, and
+     ;; the limit can be one too: it is evaluated once, into the int64 at
+     ;; which the integer test changes (the ceiling or the floor of a
+     ;; non-integer, the int64 at that end for a bignum or an infinity), the
+     ;; way DOTIMES treats its count. The counter needs at least 2^56 steps
+     ;; to leave int64, so in any run that finishes it stops where the test on
+     ;; the original limit would have stopped it, and holds the same value
+     ;; afterwards. Without this the counter and the limit were boxed NUMBERs
+     ;; and every iteration called a generic comparison and a generic 1+.
+     (when (and limit-form indexv (symbolp indexv) testfn (symbolp endform)
+		(not default-top)
+		stepby-constantp (integerp stepby) (plusp stepby)
+		start-constantp (integerp start-value)
+		indexv-type
+		(or (subtypep indexv-type 'integer) (subtypep 'integer indexv-type))
+		(>= (floor (if (member dir '(nil :up))
+			       (- (1- (expt 2 63)) start-value)
+			       (+ start-value (expt 2 63)))
+			   stepby)
+		    (expt 2 56)))
+       (let ((binding (assoc endform *loop-variables*)))
+	 (when binding
+	   ;; The test changes at the ceiling of a non-integer for >= and <,
+	   ;; at the floor for > and <=.
+	   (setf (second binding)
+		 (if (member testfn '(>= <))
+		     `(dotcl.cil-compiler::%dotimes-limit ,limit-form)
+		     `(dotcl.cil-compiler::%loop-limit-floor ,limit-form)))
+	   (push `(type fixnum ,endform ,indexv) *loop-declarations*))))
      (when testfn (setq test (hide-variable-reference t indexv `(,testfn ,indexv ,endform))))
      (when step-hack
        (setq step-hack `(,variable ,(hide-variable-reference indexv-user-specified-p indexv step-hack))))

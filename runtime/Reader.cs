@@ -124,8 +124,34 @@ public class Reader
     /// concatenated wrap), which bypasses this Reader's own Position counter.</summary>
     public int PendingLookahead => (_hasPushback ? 1 : 0) + (_inputPrefix.Length - _inputPrefixPos);
 
-    /// <summary>Line number where the most recently read form started.</summary>
+    /// <summary>Line number where the most recently read top-level form started.
+    /// Set by the outermost READ only: a reader macro that reads a subform (the
+    /// comma inside a backquote, for one) must not move it to the subform's line.</summary>
     public int LastFormLine { get; private set; } = 1;
+
+    /// <summary>The whole text this reader reads, when the caller has it (LOAD and
+    /// COMPILE-FILE of a source file). With it, and the input being a
+    /// PositionTrackingReader, LastFormLine is counted from the character offset
+    /// in that text instead of from this reader's own newline count, which misses
+    /// every newline a Lisp reader macro consumed through the stream (a
+    /// docstring read by a readtable's own string reader, for one).</summary>
+    public string? LineSource { get; set; }
+    private int _lineScanPos;
+    private int _lineScanLine = 1;
+
+    private int CurrentFormLine()
+    {
+        if (LineSource is not string text || _input is not PositionTrackingReader tracking)
+            return _line;
+        int offset = tracking.Position - PendingLookahead;
+        if (LispStreamRef is LispStream ls && ls.UnreadCharValue != -1) offset--;
+        if (offset < 0) offset = 0;
+        if (offset > text.Length) offset = text.Length;
+        if (offset < _lineScanPos) { _lineScanPos = 0; _lineScanLine = 1; }
+        for (; _lineScanPos < offset; _lineScanPos++)
+            if (text[_lineScanPos] == '\n') _lineScanLine++;
+        return _lineScanLine;
+    }
 
     /// <summary>Lisp stream reference for stream-error-stream in error conditions.</summary>
     public LispObject? LispStreamRef { get; set; }
@@ -327,12 +353,13 @@ public class Reader
         var savedSuppress = _readSuppress;
         if (dynSuppress) _readSuppress = true;
         WhitespaceTerminated = false;
+        bool outermost = _topLevelReadDepth == 0;
         if (_topLevelReadDepth++ == 0) { _shareLabels?.Clear(); _sharePlaceholders?.Clear(); }
         try
         {
             while (true)
             {
-                LastFormLine = _line;
+                if (outermost) LastFormLine = CurrentFormLine();
                 var obj = ReadStep1();
                 if (obj != null)
                 {
@@ -396,6 +423,7 @@ public class Reader
         bool dynSuppress = DynamicBindings.Get(suppressSym) is not Nil;
         var savedSuppress = _readSuppress;
         if (dynSuppress) _readSuppress = true;
+        bool outermost = _topLevelReadDepth == 0;
         if (_topLevelReadDepth++ == 0) { _shareLabels?.Clear(); _sharePlaceholders?.Clear(); }
         try
         {
@@ -406,7 +434,7 @@ public class Reader
                     result = Nil.Instance;
                     return false;
                 }
-                LastFormLine = _line;
+                if (outermost) LastFormLine = CurrentFormLine();
                 var obj = ReadStep1();
                 if (obj != null)
                 {

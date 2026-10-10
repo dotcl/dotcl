@@ -685,14 +685,20 @@ public static partial class DynamicClassBuilder
             _saved = true;
             var dir = System.IO.Path.GetDirectoryName(System.IO.Path.GetFullPath(_savePath));
             if (!string.IsNullOrEmpty(dir)) System.IO.Directory.CreateDirectory(dir);
-            _pab.Save(_savePath);
+            byte[] image;
+            using (var ms = new System.IO.MemoryStream())
+            {
+                _pab.Save(ms);
+                image = ms.ToArray();
+            }
             // PersistedAssemblyBuilder references System.Private.CoreLib (the
             // implementation corlib) for Object etc. A C# consumer references
             // System.Runtime / netstandard facades, so without retargeting it
             // gets CS0012 ("Object is defined in an assembly that is not
             // referenced"). Retarget to the netstandard facade, same as
             // FaslAssembler does for its fasls.
-            FaslCorlibRetarget.RetargetCorlib(_savePath, _corlibProfile);
+            FaslCorlibRetarget.RetargetCorlib(image, _corlibProfile);
+            System.IO.File.WriteAllBytes(_savePath, image);
             WriteXmlDoc();
         }
 
@@ -944,9 +950,9 @@ public static partial class DynamicClassBuilder
         }
 
         var result = il.DeclareLocal(typeof(object));
-        il.Emit(OpCodes.Stloc, result);
+        il.EmitLoc(OpCodes.Stloc, result);
         EmitByRefWriteBack(il, paramArr, argOffset, cells);
-        il.Emit(OpCodes.Ldloc, result);
+        il.EmitLoc(OpCodes.Ldloc, result);
         EmitReturnConversion(il, returnType);
     }
 
@@ -1201,14 +1207,14 @@ public static partial class DynamicClassBuilder
                 EmitLoadIndirect(il, elem);
                 if (elem.IsValueType) il.Emit(OpCodes.Box, elem);
                 il.Emit(OpCodes.Newobj, ByRefCtor);
-                il.Emit(OpCodes.Stloc, cell);
+                il.EmitLoc(OpCodes.Stloc, cell);
             }
 
             il.Emit(OpCodes.Dup);
             il.Emit(OpCodes.Ldc_I4, i);
             if (pt.IsByRef)
             {
-                il.Emit(OpCodes.Ldloc, cells[i]!);
+                il.EmitLoc(OpCodes.Ldloc, cells[i]!);
             }
             else
             {
@@ -1234,7 +1240,7 @@ public static partial class DynamicClassBuilder
             if (cells[i] == null) continue;
             var elem = paramArr[i].GetElementType()!;
             il.Emit(OpCodes.Ldarg, i + argOffset);
-            il.Emit(OpCodes.Ldloc, cells[i]!);
+            il.EmitLoc(OpCodes.Ldloc, cells[i]!);
             il.Emit(OpCodes.Ldfld, ByRefValueField);
             if (elem.IsValueType) il.Emit(OpCodes.Unbox_Any, elem);
             else if (elem != typeof(object)) il.Emit(OpCodes.Castclass, elem);

@@ -1,15 +1,18 @@
 ;;; Regression tests for unboxed numeric array storage: bounded integer
 ;;; element types map to byte[]/ushort[]/int[]/long[] backings (with
-;;; (integer LO HI) upgraded to the canonical fixed-width type), mirroring
+;;; (integer LO HI) upgraded to the (unsigned-byte N) / (signed-byte N) of its
+;;; width), mirroring
 ;;; the bit-vector _bitData pattern. Contract: identical observable behavior
 ;;; to general storage, aref/setf, adjust-array, fill-pointer growth,
 ;;; displacement, sequence functions, plus loud errors on element-type
 ;;; violations (never a silent wrap).
 
-;; (integer LO HI) upgrades to the canonical fixed-width element type.
+;; (integer LO HI) upgrades to the (unsigned-byte N) / (signed-byte N) of its
+;; width, the same type that spelling of the range gets (SBCL agrees where it
+;; has that width).
 (deftest nas-upgrade-u16
   (array-element-type (make-array 3 :element-type '(integer 0 2000)))
-  (unsigned-byte 16))
+  (unsigned-byte 11))
 
 (deftest nas-upgrade-u8
   (array-element-type (make-array 3 :element-type '(integer 0 255)))
@@ -21,11 +24,13 @@
 
 (deftest nas-upgrade-signed
   (array-element-type (make-array 3 :element-type '(integer -10 10)))
-  (signed-byte 32))
+  (signed-byte 5))
 
 (deftest nas-upgrade-unbounded-stays-integer
+  ;; No storage holds an unbounded integer range other than the general one,
+  ;; so it upgrades to T (UPGRADED-ARRAY-ELEMENT-TYPE says so too; SBCL: T).
   (array-element-type (make-array 3 :element-type '(integer 0)))
-  integer)
+  t)
 
 ;; Basic read/write across the storage kinds.
 (defun %nas-rw (etype vals)
@@ -82,9 +87,10 @@
 (deftest nas-typep
   (let ((v (make-array 3 :element-type '(integer 0 2000))))
     (list (notnot (typep v '(array (integer 0 2000))))
-          (notnot (typep v '(array (unsigned-byte 16))))
+          (notnot (typep v '(array (unsigned-byte 11))))
+          (notnot (typep v '(vector (unsigned-byte 11) 3)))
           (notnot (typep v '(vector (unsigned-byte 16) 3)))))
-  (t t t))
+  (t t t nil))
 
 ;; 2D / 3D typed arrays.
 (defun %nas-2d (n)

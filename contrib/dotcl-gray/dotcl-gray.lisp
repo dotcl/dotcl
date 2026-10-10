@@ -224,6 +224,14 @@ of the first element not updated (i.e. START + number of elements read)."))
 (defmethod stream-listen ((stream fundamental-input-stream))
   nil)
 
+;;; A character stream listens by reading a character without waiting and
+;;; putting it back (the Gray protocol's default, as on SBCL).
+(defmethod stream-listen ((stream fundamental-character-input-stream))
+  (let ((char (stream-read-char-no-hang stream)))
+    (and (not (null char))
+         (not (eq char :eof))
+         (progn (stream-unread-char stream char) t))))
+
 (defmethod stream-read-char-no-hang ((stream fundamental-input-stream))
   (stream-read-char stream))
 

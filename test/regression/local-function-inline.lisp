@@ -128,6 +128,36 @@
       :not-reached))
   :from-definition)
 
+;;; A variable the body reads only through a macro's expansion, rebound at the
+;;; call site. The text of the body never spells the name.
+(defmacro %li-read-v () 'li-v)
+
+(deftest local-inline.shadowed-variable-through-macro
+  (let ((li-v 1))
+    (flet ((f () (%li-read-v)))
+      (declare (inline f))
+      (list (f)
+            (let ((li-v 2)) (declare (ignorable li-v)) (f)))))
+  (1 1))
+
+;;; RETURN leaves the block named NIL, which the body does not spell either. A
+;;; DOLIST at the call site establishes a nearer one.
+(deftest local-inline.return-past-call-site-block
+  (block nil
+    (flet ((f () (return 1)))
+      (declare (inline f))
+      (dolist (x '(a)) (declare (ignore x)) (f))
+      2))
+  1)
+
+(deftest local-inline.return-from-nil-past-call-site-block
+  (block nil
+    (flet ((f () (return-from nil 1)))
+      (declare (inline f))
+      (dolist (x '(a)) (declare (ignore x)) (f))
+      2))
+  1)
+
 ;;; A LABELS function that calls itself is not substitutable at all: inside the
 ;;; body the name means the binding, and where the body was written it did not.
 (deftest local-inline.recursive

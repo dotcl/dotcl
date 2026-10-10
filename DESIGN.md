@@ -851,7 +851,7 @@ FullName specializer を焼けば常に正しく解決する。`dotnet:class-for
 この登録クラスを型 (`System.Type` or 型名) から直接引く公開 API で、閉じた
 ジェネリック型の長い assembly-qualified 名を綴らずに specializer を得られる。
 
-**NuGet 依存の宣言と解決 (contrib `nuget` / `dotcl-nuget-asdf`)**:
+**NuGet 依存の宣言と解決 (contrib `dotnet-nuget` / `asdf-nuget`)**:
 `dotnet:require` (上記、nuget.org から直接 DL) とは別に、依存グラフごと
 解決する経路がある。`nuget:require` は 1 パッケージだけを
 `<PackageReference>` した使い捨て csproj に `dotnet build` を回し、
@@ -945,11 +945,11 @@ dotcl/
                assembler (Emitter/CilAssembler.cs と FaslAssembler.cs)、
                組み込み関数。機能別に Runtime.*.cs と LispObject 由来
                クラスに分割
-  contrib/     同梱モジュール 16 本 (nuget / dotcl-nuget-asdf /
+  contrib/     同梱モジュール 15 本 (dotnet-nuget / asdf-nuget /
                dotnet-class / dotnet-ffi / dotcl-thread / dotcl-socket /
-               dotcl-kestrel / dotcl-gray / dotcl-repl / dotcl-lsp-api /
-               advice / clrmd / decompiler / dotcl-cs / dotcl-float /
-               dotcl-jitdisasm)。1 ディレクトリ 1 モジュールで、
+               dotcl-gray / dotcl-repl / dotcl-lsp-api /
+               dotcl-advice / dotcl-clrmd / dotcl-decompiler / dotnet-cs /
+               dotcl-float / dotcl-jitdisasm)。1 ディレクトリ 1 モジュールで、
                それぞれに README.md がある。`.asd` は require-system の
                スタブなので、ASDF 経由と `require` 経由が同じ経路に
                落ちる。ビルドが取り込む asdf/ と quicklisp/ もここに

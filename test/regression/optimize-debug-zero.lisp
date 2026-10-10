@@ -8,8 +8,10 @@
 ;;; must be unchanged.
 
 (defun odz-inner () (dotcl:backtrace))
-(defun odz-default () (odz-inner))
-(defun odz-declared () (declare (optimize (debug 0))) (odz-inner))
+;; (VALUES (f)) is not a tail call: a tail call would hand the caller's frame to
+;; ODZ-INNER, as SBCL does, whatever the caller's DEBUG.
+(defun odz-default () (values (odz-inner)))
+(defun odz-declared () (declare (optimize (debug 0))) (values (odz-inner)))
 
 (deftest optimize-debug.default-records-a-frame
   (and (member "ODZ-DEFAULT" (odz-default) :test #'equal) t)

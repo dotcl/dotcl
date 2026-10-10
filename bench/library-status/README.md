@@ -20,24 +20,57 @@ Three stages. Stage 1 and 3 are pure data handling and run on any Lisp; stage 2
 ## Stage 1 -- pick the targets (`rank.lisp`)
 
 ```
-sbcl --non-interactive --load bench/library-status/rank.lisp
+sh bench/library-status/fetch-ql-projects.sh out/quicklisp-projects
+DOTCL_QL_PROJECTS=out/quicklisp-projects \
+  sbcl --non-interactive --load bench/library-status/rank.lisp
 ```
 
 Reads `distinfo.txt`, `systems.txt` and `releases.txt` from a Quicklisp dist
-already on disk (`DOTCL_QL_DIST` overrides the search) and writes:
+already on disk (`DOTCL_QL_DIST` overrides the search), and the
+`projects/<name>/source.txt` files of a
+[quicklisp-projects](https://github.com/quicklisp/quicklisp-projects) checkout
+(`DOTCL_QL_PROJECTS`, required), and writes:
 
 - `targets.txt` -- one system name per line, most depended upon first. This is
   the row order of the published table and the work list for stage 2.
-- `targets.tsv` -- the same rows with rank, release and referrer count, so the
-  order can be checked without rerunning anything.
+- `targets.tsv` -- the same rows with rank, release, the dependent count the
+  order comes from and the direct referrer count beside it, so the order can be
+  checked without rerunning anything. Its header records the dist and the
+  quicklisp-projects commit.
 
-What is counted is how many **other projects** name a project in a
-`depends-on`, directly rather than transitively. One row per release: a library
-and its test system are one thing to install, so they are one row. Nothing is
-downloaded; with no dist on disk the script prints the three URLs to fetch.
+The unit is the project (one release): a library and its test system are one
+thing to install, so they are one row. What is counted for a project P is its
+**dependents**: every other project that is built on P, directly or through
+other projects, and is owned by someone other than P's owner. Every project
+with at least 4 dependents is a target (`THRESHOLD=N` changes the cut-off).
+Three rules make that precise:
 
-Re-run it when a new dist comes out. The dist version is written into both files
-and travels through to the published table.
+- **Transitive.** A library most of Quicklisp reaches through one popular
+  intermediary is as load-bearing as one they name directly; counting direct
+  referrers alone ranked it near the bottom.
+- **Test systems are not followed.** A dependency written by a system whose
+  name contains `test` or `bench` is left out: a library that only test suites
+  pull in (a test framework's own helpers, say) is not something the ecosystem
+  is built on. The rule is a name match, so it errs on the side of leaving an
+  edge out; `rank.lisp` (`%TEST-SYSTEM-P`) is the definition.
+- **Not the same owner.** An author who splits one program into twenty projects
+  would otherwise put each of them at the top. The owner is read from where
+  Quicklisp fetches the project (the first data line of its `source.txt`): the
+  user or organisation on a shared host (github.com, gitlab.com, codeberg.org,
+  ...), otherwise the host, with `kmr-git` and `ediware-http` mapped to the
+  hosts they stand for. Different accounts are different owners even when one
+  person runs both. A project with no `source.txt` shares an owner with nothing,
+  and the run prints how many there were.
+
+`fetch-ql-projects.sh DIR [COMMIT]` makes a detached checkout at the commit
+matching the dist (the default is the last commit before quicklisp
+2026-01-01); `rank.lisp` reads the commit back from `.git/HEAD` and writes it
+into `targets.tsv`. Nothing else is downloaded; with no dist on disk the script
+prints the three URLs to fetch.
+
+Re-run it when a new dist comes out, with the quicklisp-projects commit for
+that dist. The dist version is written into both files and travels through to
+the published table.
 
 The first rows include systems dotcl already bundles (`uiop`, for instance);
 they are left in rather than special-cased, so the list stays a plain function of
@@ -62,15 +95,48 @@ make library-status LIMIT=1 \
   LIBRARY_STATUS_JSON=/tmp/smoke.json LIBRARY_STATUS_OUT=/tmp/smoke.md
 ```
 
-The run takes roughly half an hour for 150 systems on a warm cache. What it does
+The run takes roughly half an hour for 150 systems on a warm cache, so a few
+hours for the whole list. What it does
 and why, since each rule below came from something that went wrong:
 
 - **Use a checkout dedicated to the run.** dotcl keeps a separate worktree for
   library bring-up precisely so that a build in the main tree cannot fight it
-  over the same runtime DLLs. Build it first (`make cross-compile build`) so
-  that the FASLs and the runtime come from the same commit -- a stale
-  `cil-out.sil` against a fresh `runtime.dll` produces failures that belong to
-  neither.
+  over the same runtime DLLs. Build it first (`make cross-compile build
+  bench-build compile-core-fasl compile-contrib-fasls`) so that the FASLs and the runtime come
+  from the same commit -- a stale `cil-out.sil` against a fresh `runtime.dll`
+  produces failures that belong to neither.
+- **Measure the Release runtime.** That is the build a user runs, and a Debug
+  build of the runtime is several times slower on the same work (the JIT
+  treats a Debug assembly as debuggable), enough to turn a library that loads
+  into one that times out. All three measuring scripts take
+  `runtime/bin/Release/net10.0` (`runtime.sh`; `make bench-build` builds it,
+  `LIBRARY_STATUS_CONFIG=Debug` measures the Debug build instead) and stop when
+  it is older than any C# source under `runtime/`. The core is
+  `compiler/dotcl.core`, the one the packs ship (`make compile-core-fasl`; the
+  scripts stop when it is older than `compiler/cil-out.sil`), which starts
+  about 1.5 seconds sooner per system than assembling `cil-out.sil`. The core
+  and the fasls are IL written by dotcl's compiler and are the same for either
+  build. Each entry
+  records the build as `"runtime"`, and `render.lisp` prints it at the top of
+  the table counted per row, the same way as the dists below. The load and
+  test entries also record the wall-clock time of their run as `"seconds"`
+  (a load that timed out and was retried counts both runs), so two
+  measurements can be compared row by row.
+- **Know which dists were measured.** All three measuring scripts read the
+  versions of the `quicklisp` and `dotcl` dists in the Quicklisp home
+  (`dists.sh`) and write them into every entry as `"dists"`; `render.lisp`
+  prints them at the top of the table, counted per row: a row's load entry,
+  its test entry and its with-forks entry together give the row's versions
+  (an entry from before the field existed counts as not recorded, and entries
+  that disagree make the row "differs between stages"). One version for every
+  row is printed as that version; anything else is printed as `mixed:` with
+  the number of rows behind each version, so a table that is partly an older
+  measurement cannot read as a new one. Before measuring, the installed dotcl dist is
+  compared with the published one (`https://dotcl.github.io/dist/dotcl.txt`,
+  `LIBRARY_STATUS_DOTCL_DIST_URL` overrides it); an older one stops the run
+  with the command that updates it. `LIBRARY_STATUS_ALLOW_STALE_DIST=1` goes on
+  anyway, and the entries then record the stale version. With no network the
+  check is a warning only.
 - **One at a time.** Never run two dotcl processes in parallel for this: the
   results stop being comparable and the machine stops being usable.
 - **Bound each system, not the whole run.** 120 seconds per system
@@ -144,9 +210,14 @@ that is, whether a failure signals, and whether anything runs at all is up to
 each library. So this stage is two parts:
 
 1. For each system that loads (`load-only` or `patched` in `results.json`, in
-   `targets.txt` order), a fresh dotcl quickloads it and the systems its
-   `test-op` depends on (Quicklisp fetches only through `quickload`), then calls
-   `(asdf:test-system SYS)`.
+   `targets.txt` order), a fresh dotcl quickloads it and what the systems its
+   `test-op` depends on depend on (Quicklisp fetches only through `quickload`).
+   The test systems themselves are loaded after the `LIBTEST-BEGIN` marker,
+   because many run their suite while loading (a `run!` at top level); then the
+   driver prints `LIBTEST-TEST-OP` and calls `(asdf:test-system SYS)`. What was
+   recognised while the test systems loaded counts only when the test op itself
+   printed nothing a recogniser knows, so a suite that runs at load time and
+   again from the test op is counted once.
 2. The log is judged afterwards, outside the process, by one small recogniser
    per framework reading the summary that framework prints: fiveam (`Did N
    checks` / `Pass:` / `Fail:`), rt (`No tests failed.` / `K out of M total
@@ -167,10 +238,28 @@ each library. So this stage is two parts:
    then `| P passed`, `| F failed`, `| E execution errors`; an execution
    error counts as a failure), lift (`Test Report for ...: N tests run, all
    passed!` or `..., F Failures.`, possibly on the line of lift's `Start:`
-   progress; lift can print the same report twice, so the last one is counted), and ptester, the harness cl-base64 and puri use
-   (`Errors detected in this test: E` / `Successes this test:S`). Only output
-   after the driver's `LIBTEST-BEGIN` marker is read, so a summary printed
-   while loading is not a result.
+   progress; lift can print the same report twice, so the last one is counted), ptester, the harness cl-base64 and puri use
+   (`Errors detected in this test: E` / `Successes this test:S`), lisp-unit
+   (`Unit Test Summary` then `| P passed`, `| F failed`, `| E execution
+   errors`), unit-test, used by cl-fad and yason (`N tests total.` then
+   `P passed.`, `F failed.`, `C crashed.`; a crash counts as a failure), the
+   `with-test-suite` harness of flexi-streams (cl-ppcre's shape with `Test
+   suite: NAME` lines and `Test FORM failed.` per failing check), and
+   should-test (one `Test NAME: ... OK` or `FAILED` per test, no summary).
+   fiveam's `run` (rather than `run!`) prints only progress, `Running test
+   NAME` followed by one character per check; those are counted when no `Did N
+   checks.` summary was printed. LIFT, clunit and clunit2 keep their last
+   result, and a test op that drops it prints only `Start:` or `PROGRESS:`
+   lines, so the driver prints its counts as `LIBTEST-LAST-RESULT FRAMEWORK
+   PASSED FAILED`, read only when the output had no summary of that
+   framework. Only output after the driver's `LIBTEST-BEGIN` marker is read,
+   so a summary printed while the library or its dependencies load is not a
+   result.
+
+   `run-tests.sh --judge LOG...` judges logs already written, without running
+   anything. The driver is plain Common Lisp apart from loading Quicklisp,
+   quitting and the MOP package, so the same driver run on SBCL gives a log
+   to compare a recogniser against.
 
 Each system gets one verdict in `tests.json`:
 

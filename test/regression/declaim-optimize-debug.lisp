@@ -18,9 +18,13 @@
 
 (defun %dod-probe () (dotcl:backtrace))
 
+;;; Every caller below calls the probe as (VALUES (%DOD-PROBE)), which keeps
+;;; only the first value and so is not a tail call: a tail call hands the
+;;; caller's frame over to the callee, as SBCL does (see tail-calls.lisp).
+
 ;;; ---- with nothing in force, a function has its frame ----
 
-(defun %dod-default () (%dod-probe))
+(defun %dod-default () (values (%dod-probe)))
 
 (deftest-compiled-only declaim-optimize-debug.default-has-frame
   (and (member "%DOD-DEFAULT" (%dod-default) :test #'string=) t)
@@ -30,7 +34,7 @@
 
 (declaim (optimize (debug 0)))
 
-(defun %dod-after-declaim () (%dod-probe))
+(defun %dod-after-declaim () (values (%dod-probe)))
 
 (deftest-compiled-only declaim-optimize-debug.declaim-removes-frame
   (and (member "%DOD-AFTER-DECLAIM" (%dod-after-declaim) :test #'string=) t)
@@ -40,7 +44,7 @@
 
 (defun %dod-body-debug-3 ()
   (declare (optimize (debug 3)))
-  (%dod-probe))
+  (values (%dod-probe)))
 
 (deftest-compiled-only declaim-optimize-debug.body-declaration-wins
   (and (member "%DOD-BODY-DEBUG-3" (%dod-body-debug-3) :test #'string=) t)
@@ -49,7 +53,7 @@
 ;; A bare DEBUG (no value) means 3, so it puts the frame back too.
 (defun %dod-body-bare-debug ()
   (declare (optimize debug))
-  (%dod-probe))
+  (values (%dod-probe)))
 
 (deftest-compiled-only declaim-optimize-debug.bare-debug-wins
   (and (member "%DOD-BODY-BARE-DEBUG" (%dod-body-bare-debug) :test #'string=) t)
@@ -59,7 +63,7 @@
 
 (declaim (optimize (debug 1)))
 
-(defun %dod-after-restore () (%dod-probe))
+(defun %dod-after-restore () (values (%dod-probe)))
 
 (deftest-compiled-only declaim-optimize-debug.later-declaim-restores
   (and (member "%DOD-AFTER-RESTORE" (%dod-after-restore) :test #'string=) t)
@@ -69,7 +73,7 @@
 
 (defun %dod-body-debug-0 ()
   (declare (optimize (debug 0)))
-  (%dod-probe))
+  (values (%dod-probe)))
 
 (deftest-compiled-only declaim-optimize-debug.body-debug-0-still-opts-out
   (and (member "%DOD-BODY-DEBUG-0" (%dod-body-debug-0) :test #'string=) t)
@@ -79,7 +83,7 @@
 (defun %dod-docstring ()
   "Frames off, declared after the docstring."
   (declare (optimize (debug 0)))
-  (%dod-probe))
+  (values (%dod-probe)))
 
 (deftest-compiled-only declaim-optimize-debug.docstring-then-declaration
   (and (member "%DOD-DOCSTRING" (%dod-docstring) :test #'string=) t)

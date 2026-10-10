@@ -32,3 +32,25 @@
 (deftest return-from-scan.shadowing-block
   (rfs-shadow)
   7)
+
+;; Only the expansion of a macro call is code. An argument the macro drops is
+;; never compiled, so the scan must not expand the macro calls inside it either:
+;; their expanders can have compile-time side effects. serapeum's dispatch-case
+;; drops the clauses that an earlier clause shadows, and expanding them anyway
+;; made its exhaustiveness check warn about branches that do not exist.
+(defvar *rfs-dropped-expansions* 0)
+(defmacro rfs-counted () (incf *rfs-dropped-expansions*) nil)
+(defmacro rfs-drop-first (&rest forms) `(progn ,@(rest forms)))
+
+(deftest-compiled-only return-from-scan.dropped-argument-not-expanded
+  (let* ((dir (regression-temp-dir))
+         (src (merge-pathnames "rfs-drop.lisp" dir))
+         (fasl (merge-pathnames "rfs-drop.fasl" dir)))
+    (with-open-file (s src :direction :output :if-exists :supersede)
+      (write-line "(defun rfs-drop-f1 () (cl-user::rfs-drop-first (cl-user::rfs-counted) 1))" s)
+      (write-line "(defun rfs-drop-f2 (x) (let ((y x)) (lambda () (cl-user::rfs-drop-first (cl-user::rfs-counted) y))))" s))
+    (setf *rfs-dropped-expansions* 0)
+    (let ((*error-output* (make-broadcast-stream)))
+      (compile-file src :output-file fasl))
+    *rfs-dropped-expansions*)
+  0)

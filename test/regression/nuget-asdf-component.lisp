@@ -11,7 +11,7 @@
 ;;; LOADs makes ASDF treat that file as the system's definition and try to read it
 ;;; again.
 
-(require "dotcl-nuget-asdf")
+(require "asdf-nuget")
 
 (defparameter *nac-system*
   (asdf:defsystem "nac-basic"
@@ -29,37 +29,37 @@
 (deftest nuget-asdf.component-type-is-registered
   (let ((class (find-class 'asdf::nuget nil)))
     (list (notnot class)
-          (notnot (eq class (find-class 'dotcl-nuget-asdf:nuget-package)))))
+          (notnot (eq class (find-class 'asdf-nuget:nuget-package)))))
   (t t))
 
 (deftest nuget-asdf.declaration-is-parsed
   (let ((c (%nac "SkiaSharp")))
     (list (asdf:component-name c)
-          (dotcl-nuget-asdf:nuget-version c)
-          (dotcl-nuget-asdf:nuget-rid c)
-          (notnot (dotcl-nuget-asdf:nuget-prerelease c))
-          (dotcl-nuget-asdf:nuget-tfm c)))
+          (asdf-nuget:nuget-version c)
+          (asdf-nuget:nuget-rid c)
+          (notnot (asdf-nuget:nuget-prerelease c))
+          (asdf-nuget:nuget-tfm c)))
   ("SkiaSharp" "2.88.7" "win-arm64" t nil))
 
 ;;; A floating spec has to survive parsing. This is the case ASDF's own :VERSION
 ;;; silently drops, which is the reason for a keyword of our own.
 (deftest nuget-asdf.floating-version-survives
-  (dotcl-nuget-asdf:nuget-version (%nac "Newtonsoft.Json"))
+  (asdf-nuget:nuget-version (%nac "Newtonsoft.Json"))
   "13.*")
 
 (deftest nuget-asdf.no-keywords-is-all-defaults
   (let ((c (%nac "Plain.Package")))
-    (list (dotcl-nuget-asdf:nuget-version c)
-          (dotcl-nuget-asdf:nuget-source c)
-          (dotcl-nuget-asdf:nuget-rid c)))
+    (list (asdf-nuget:nuget-version c)
+          (asdf-nuget:nuget-source c)
+          (asdf-nuget:nuget-rid c)))
   (nil nil nil))
 
 ;;; What reaches NUGET:REQUIRE: the keywords that were written and no others, so
 ;;; the defaults in NUGET:RESOLVE apply to the rest.
 (deftest nuget-asdf.require-arguments
-  (list (dotcl-nuget-asdf::%require-arguments (%nac "Plain.Package"))
-        (dotcl-nuget-asdf::%require-arguments (%nac "Newtonsoft.Json"))
-        (dotcl-nuget-asdf::%require-arguments (%nac "SkiaSharp")))
+  (list (asdf-nuget::%require-arguments (%nac "Plain.Package"))
+        (asdf-nuget::%require-arguments (%nac "Newtonsoft.Json"))
+        (asdf-nuget::%require-arguments (%nac "SkiaSharp")))
   (nil
    (:version "13.*")
    (:version "2.88.7" :prerelease t :rid "win-arm64")))
@@ -74,7 +74,7 @@
 
 (deftest nuget-asdf.version-keyword-does-not-reach-nuget
   (let ((c (first (asdf:component-children *nac-misuse*))))
-    (list (dotcl-nuget-asdf:nuget-version c)
+    (list (asdf-nuget:nuget-version c)
           (notnot (asdf:component-version c))))
   (nil t))
 
@@ -90,11 +90,11 @@
 
 (deftest nuget-asdf.components-of-a-system
   (mapcar #'asdf:component-name
-          (dotcl-nuget-asdf:system-nuget-components *nac-system*))
+          (asdf-nuget:system-nuget-components *nac-system*))
   ("Newtonsoft.Json" "SkiaSharp" "Plain.Package"))
 
 (defparameter *nac-preamble*
-  (dotcl-nuget-asdf:system-nuget-preamble *nac-system*))
+  (asdf-nuget:system-nuget-preamble *nac-system*))
 
 ;;; Every declaration is asked for, in the order it was written.
 (deftest nuget-asdf.preamble-names-every-package
@@ -106,7 +106,7 @@
             (push form forms)
             (setq pos next)))
     (mapcar (lambda (f)
-              ;; (eval-when (...) (cl:require "dotcl-nuget") (funcall (find-symbol ...) NAME . args))
+              ;; (eval-when (...) (cl:require "dotnet-nuget") (funcall (find-symbol ...) NAME . args))
               (let ((call (car (last f))))
                 (cons (third call) (nthcdr 3 call))))
             (reverse forms)))
@@ -124,7 +124,7 @@
 
 ;;; A system that declares none gets none: the build must not prepend anything.
 (deftest nuget-asdf.no-declarations-no-preamble
-  (dotcl-nuget-asdf:system-nuget-preamble
+  (asdf-nuget:system-nuget-preamble
    (asdf:defsystem "nac-none" :components ()))
   nil)
 
@@ -145,7 +145,7 @@
 (deftest nuget-asdf.pack-reports-a-floating-declaration
   (%nac-sandboxed
    (lambda ()
-     (let ((failed (dotcl-nuget-asdf:resolve-system-for-rid *nac-system* "linux-x64")))
+     (let ((failed (asdf-nuget:resolve-system-for-rid *nac-system* "linux-x64")))
        (list (length failed)
              ;; the components that do not name their own RID, together
              (car (first failed))
@@ -163,7 +163,7 @@
   t)
 
 ;;; The preamble's REQUIRE names a module that loads. It said "nuget", the
-;;; contrib's name before it was renamed to "dotcl-nuget"; the old name is
+;;; contrib's name before it was renamed to "dotnet-nuget"; the old name is
 ;;; refused with a message, so every built program that declared a package
 ;;; failed on its first form. Reading the preamble does not show that, so each
 ;;; REQUIRE is evaluated here.
@@ -180,4 +180,4 @@
           collect (list (second req)
                         (handler-case (progn (eval req) :loaded)
                           (error (e) (princ-to-string e))))))
-  (("dotcl-nuget" :loaded) ("dotcl-nuget" :loaded) ("dotcl-nuget" :loaded)))
+  (("dotnet-nuget" :loaded) ("dotnet-nuget" :loaded) ("dotnet-nuget" :loaded)))

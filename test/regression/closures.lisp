@@ -264,6 +264,56 @@
     (funcall f 6))
   42)
 
+;; A function compiled in memory and called without being kept anywhere
+;; (FUNCALL of a fresh COERCE result, the way lisp-unit runs each test) is the
+;; only owner of its unit. A GC in the middle of its body must not collect the
+;; unit before the body builds its closures. Only an optimized runtime whose
+;; call path has been warmed up dropped the function there; in a Debug runtime
+;; this passes either way.
+(defun s4-run-coerced (body) (funcall (coerce `(lambda () ,@body) 'function)))
+(defun s4-take-two (a b) (+ (funcall a) (funcall b)))
+
+(deftest s4-running-transient-function-keeps-unit
+  (let ((sum 0))
+    (dotimes (i 3 sum)
+      (incf sum (s4-run-coerced '((let ((x (length (make-list 3))))
+                                    (dotcl:gc)
+                                    (s4-take-two (lambda () x) (lambda () x))))))))
+  18)
+
+;; The FUNCALL in S4-RUN-COERCED is a tail call, so the coerced function runs
+;; with no native frame holding it. Its unit has to outlive a GC while it waits
+;; for a call that itself tail-calls another fresh function, and then build its
+;; closures.
+(defun s4-tail-to-fresh (body) (funcall (coerce `(lambda () ,@body) 'function)))
+
+(deftest s4-tail-called-transient-function-keeps-unit-while-waiting
+  (s4-run-coerced '((let* ((x (length (make-list 2)))
+                           (y (s4-tail-to-fresh '((dotcl:gc) 5))))
+                      (dotcl:gc)
+                      (s4-take-two (lambda () x) (lambda () y)))))
+  7)
+
+;; A named function whose name stops pointing at it while it runs: only the
+;; call it is in still holds its unit.
+(defun s4-redefines-itself ()
+  (setf (symbol-function 's4-redefines-itself) (lambda () :gone))
+  (dotcl:gc)
+  (let ((x (length (make-list 4))))
+    (+ (funcall (lambda () x)) (funcall (lambda () x)))))
+
+(deftest s4-running-function-keeps-unit-after-redefinition
+  (list (s4-redefines-itself))
+  (8))
+
+;; The same chain entered from a lambda rather than a named function.
+(deftest s4-tail-called-transient-function-keeps-unit-from-a-lambda
+  (funcall (lambda (body) (funcall (coerce `(lambda () ,@body) 'function)))
+           '((let ((x (length (make-list 3))))
+               (dotcl:gc)
+               (s4-take-two (lambda () x) (lambda () x)))))
+  6)
+
 ;; S5: non-capturing lambdas (MAKE-FUNCTION / MAKE-FUNCTION-DIRECT) are now
 ;; stored per compilation unit and reclaimed with it, instead of pinned in the
 ;; global constant pool forever. Correctness: a non-capturing lambda returned by

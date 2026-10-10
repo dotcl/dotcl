@@ -15,7 +15,7 @@
 ;;; version matching, no second process) and walks that frozen copy, so the walk
 ;;; never sees a half-mutated heap. A dump-file mode is a later addition.
 
-(require "dotcl-nuget")
+(require "dotnet-nuget")
 
 (defpackage :clrmd
   (:use :cl)

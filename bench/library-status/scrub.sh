@@ -26,6 +26,14 @@ scrub_build() {
   sed -E 's@[0-9]+\.[0-9]+\.[0-9]+\+[0-9]+\.g[0-9a-f]+([.-]dirty)?@<version>@g; s@(dotcl )[0-9]+\.[0-9]+\.[0-9]+@\1<version>@g; s@(dotcl <version>) on [A-Za-z0-9_]+@\1 on <arch>@g'
 }
 
+# Some libraries name their author in the error they raise ("please contact me
+# at someone@example.com"). The address is in the library's own source, but the
+# published table has no need to copy it, so replace any email address with
+# <email>.
+scrub_emails() {
+  sed -E 's|[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}|<email>|g'
+}
+
 scrub_note() {
-  scrub_paths | scrub_build
+  scrub_paths | scrub_build | scrub_emails
 }

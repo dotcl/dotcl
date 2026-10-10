@@ -19,7 +19,7 @@
 
 (defun %dos-polls-p (fn)
   "True when FN's SIL still carries a loop back-edge interrupt poll."
-  (and (search "PollInterrupt" (princ-to-string (dotcl:function-sil fn))) t))
+  (and (search "PollInterrupt" (%flat-text (dotcl:function-sil fn))) t))
 
 ;;; ---- with nothing in force, the loop polls ----
 
